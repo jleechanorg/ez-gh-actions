@@ -1,0 +1,10 @@
+  Installing ez-gh-actions v0.1.0 (/home/jleechan/projects/ez-gh-actions)
+    Updating crates.io index
+     Locking 66 packages to latest compatible versions
+      Adding directories v5.0.1 (available: v6.0.0)
+      Adding toml v0.8.23 (available: v1.1.2+spec-1.1.0)
+      Adding which v7.0.3 (available: v8.0.4)
+    Finished `release` profile [optimized] target(s) in 0.31s
+  Installing /home/jleechan/.cargo/bin/ezgha
+   Installed package `ez-gh-actions v0.1.0 (/home/jleechan/projects/ez-gh-actions)` (executable `ezgha`)
+---EXIT: 0---

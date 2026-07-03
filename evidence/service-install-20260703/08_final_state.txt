@@ -1,0 +1,20 @@
+=== final service state (leaving RUNNING) ===
+active
+enabled
+=== evidence dir listing ===
+total 60
+drwxrwxr-x 2 jleechan jleechan 4096 Jul  3 15:47 .
+drwxrwxr-x 4 jleechan jleechan 4096 Jul  3 15:45 ..
+-rw-rw-r-- 1 jleechan jleechan  999 Jul  3 15:45 01b_verify_binary.txt
+-rw-rw-r-- 1 jleechan jleechan  539 Jul  3 15:45 01_install.txt
+-rw-rw-r-- 1 jleechan jleechan  300 Jul  3 15:45 02_doctor.txt
+-rw-rw-r-- 1 jleechan jleechan  907 Jul  3 15:45 03b_service_status.txt
+-rw-rw-r-- 1 jleechan jleechan  398 Jul  3 15:45 03c_journal.txt
+-rw-rw-r-- 1 jleechan jleechan  125 Jul  3 15:45 03_install_service.txt
+-rw-rw-r-- 1 jleechan jleechan  284 Jul  3 15:45 04_status_poll.txt
+-rw-rw-r-- 1 jleechan jleechan  256 Jul  3 15:46 05a_dispatch.txt
+-rw-rw-r-- 1 jleechan jleechan  354 Jul  3 15:46 05b_run_result.txt
+-rw-rw-r-- 1 jleechan jleechan  726 Jul  3 15:46 05c_runner_confirm.txt
+-rw-rw-r-- 1 jleechan jleechan  927 Jul  3 15:47 06_respawn.txt
+-rw-rw-r-- 1 jleechan jleechan  492 Jul  3 15:47 07_journal_respawn.txt
+-rw-rw-r-- 1 jleechan jleechan   90 Jul  3 15:47 08_final_state.txt

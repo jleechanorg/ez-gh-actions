@@ -1,0 +1,5 @@
+=== journalctl respawn log (n 40) ===
+Jul 03 15:45:30 Jeff-Ubuntu systemd[3353]: Started ezgha.service - ez-gh-actions ephemeral GitHub Actions runners.
+Jul 03 15:45:30 Jeff-Ubuntu ezgha[696951]: supervising 1 ephemeral runner(s) for jleechanorg/ez-gh-actions on docker (container)
+Jul 03 15:45:31 Jeff-Ubuntu ezgha[696951]: respawned ephemeral runner ezgha-Jeff-Ubuntu-6a483b8a11692f6d
+Jul 03 15:46:02 Jeff-Ubuntu ezgha[696951]: respawned ephemeral runner ezgha-Jeff-Ubuntu-6a483ba916dca716

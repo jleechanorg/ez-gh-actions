@@ -1,0 +1,22 @@
+=== RESPAWN EVIDENCE ===
+PRE-JOB runner (ran the job): ezgha-Jeff-Ubuntu-6a483b8a11692f6d (GH #5, container c722413dde1f)
+
+--- confirming steady-state respawned runner over 3 polls ---
+### poll 1 (15:46:36)
+managed containers: 1
+  9f015d394224 ezgha-Jeff-Ubuntu-6a483ba916dca716 (running, up 34 seconds ago)
+registered ezgha runners on jleechanorg/ez-gh-actions: 1
+  #6 ezgha-Jeff-Ubuntu-6a483ba916dca716 status=online busy=false
+
+### poll 2 (15:46:56)
+managed containers: 1
+  9f015d394224 ezgha-Jeff-Ubuntu-6a483ba916dca716 (running, up 54 seconds ago)
+registered ezgha runners on jleechanorg/ez-gh-actions: 1
+  #6 ezgha-Jeff-Ubuntu-6a483ba916dca716 status=online busy=false
+
+### poll 3 (15:47:17)
+managed containers: 1
+  9f015d394224 ezgha-Jeff-Ubuntu-6a483ba916dca716 (running, up About a minute ago)
+registered ezgha runners on jleechanorg/ez-gh-actions: 1
+  #6 ezgha-Jeff-Ubuntu-6a483ba916dca716 status=online busy=false
+

@@ -1,0 +1,10 @@
+=== job log runner line ===
+selftest	Set up job	2026-07-03T22:45:56.5417020Z Runner name: 'ezgha-Jeff-Ubuntu-6a483b8a11692f6d'
+selftest	Prove execution environment	﻿2026-07-03T22:45:56.6025492Z ##[group]Run echo "runner name: $RUNNER_NAME"
+selftest	Prove execution environment	2026-07-03T22:45:56.6025929Z ^[[36;1mecho "runner name: $RUNNER_NAME"^[[0m
+selftest	Prove execution environment	2026-07-03T22:45:56.6200159Z runner name: ezgha-Jeff-Ubuntu-6a483b8a11692f6d
+=== immediate status after job ===
+managed containers: 1
+  9f015d394224 ezgha-Jeff-Ubuntu-6a483ba916dca716 (running, up 21 seconds ago)
+registered ezgha runners on jleechanorg/ez-gh-actions: 1
+  #6 ezgha-Jeff-Ubuntu-6a483ba916dca716 status=online busy=false

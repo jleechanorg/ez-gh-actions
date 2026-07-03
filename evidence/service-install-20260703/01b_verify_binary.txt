@@ -1,0 +1,23 @@
+=== which ezgha ===
+/home/jleechan/.cargo/bin/ezgha
+=== ezgha --version ===
+ezgha 0.1.0
+=== ezgha --help ===
+Easy isolated self-hosted GitHub Actions runners (VM-preferred, container fallback with hard limits)
+
+Usage: ezgha [OPTIONS] <COMMAND>
+
+Commands:
+  init             Detect this machine and write a starter config
+  doctor           Check prerequisites and show what backend would be used
+  start            Start ephemeral runner(s) now (one job each, then exit)
+  serve            Supervise: keep the configured number of ephemeral runners available
+  stop             Stop all managed runners and deregister idle ones
+  status           Show managed containers and registered runners
+  install-service  Install as a user service (systemd --user / launchd)
+  help             Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <CONFIG>  Path to config file (default: XDG config dir)
+  -h, --help             Print help
+  -V, --version          Print version

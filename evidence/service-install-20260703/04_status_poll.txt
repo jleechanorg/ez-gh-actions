@@ -1,0 +1,7 @@
+===== poll 1 (15:45:43) =====
+managed containers: 1
+  c722413dde1f ezgha-Jeff-Ubuntu-6a483b8a11692f6d (running, up 12 seconds ago)
+registered ezgha runners on jleechanorg/ez-gh-actions: 1
+  #5 ezgha-Jeff-Ubuntu-6a483b8a11692f6d status=online busy=false
+
+>>> ONLINE detected on poll 1

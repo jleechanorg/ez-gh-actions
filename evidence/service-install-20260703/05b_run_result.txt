@@ -1,0 +1,5 @@
+=== gh run watch (exit-status) ===
+Run ezgha-selftest (28686539267) has already completed with 'success'
+watch_exit=0
+=== run view ===
+{"conclusion":"success","databaseId":28686539267,"jobs":[{"conclusion":"success","name":"selftest","runnerName":null}],"status":"completed","url":"https://github.com/jleechanorg/ez-gh-actions/actions/runs/28686539267"}

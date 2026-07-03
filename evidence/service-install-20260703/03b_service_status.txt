@@ -1,0 +1,15 @@
+=== systemctl --user status ezgha.service ===
+● ezgha.service - ez-gh-actions ephemeral GitHub Actions runners
+     Loaded: loaded (/home/jleechan/.config/systemd/user/ezgha.service; enabled; preset: enabled)
+     Active: active (running) since Fri 2026-07-03 15:45:30 PDT; 5s ago
+   Main PID: 696951 (ezgha)
+      Tasks: 1 (limit: 76504)
+     Memory: 872.0K (peak: 45.9M)
+        CPU: 195ms
+     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/ezgha.service
+             └─696951 /home/jleechan/.cargo/bin/ezgha serve
+
+Jul 03 15:45:30 Jeff-Ubuntu systemd[3353]: Started ezgha.service - ez-gh-actions ephemeral GitHub Actions runners.
+Jul 03 15:45:30 Jeff-Ubuntu ezgha[696951]: supervising 1 ephemeral runner(s) for jleechanorg/ez-gh-actions on docker (container)
+Jul 03 15:45:31 Jeff-Ubuntu ezgha[696951]: respawned ephemeral runner ezgha-Jeff-Ubuntu-6a483b8a11692f6d
+=== EXIT: 0 ===

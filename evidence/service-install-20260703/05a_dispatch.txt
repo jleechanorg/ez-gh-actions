@@ -1,0 +1,5 @@
+=== dispatch ezgha-selftest ===
+https://github.com/jleechanorg/ez-gh-actions/actions/runs/28686539267
+exit=0
+=== get run id ===
+[{"databaseId":28686539267,"status":"completed","url":"https://github.com/jleechanorg/ez-gh-actions/actions/runs/28686539267"}]

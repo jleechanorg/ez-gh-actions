@@ -1,0 +1,3 @@
+wrote /home/jleechan/.config/systemd/user/ezgha.service
+service enabled: systemctl --user status ezgha.service
+---EXIT: 0---
