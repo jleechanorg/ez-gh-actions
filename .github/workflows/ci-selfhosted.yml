@@ -26,10 +26,17 @@ jobs:
           echo "runner: $RUNNER_NAME on $(hostname)"
           echo "memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
           echo "pids.max: $(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo n/a)"
+      - name: Install system build dependencies
+        # The default runner image (ghcr.io/actions/actions-runner:latest)
+        # ships without a C compiler, so cargo cannot build proc-macro2/quote
+        # build scripts. Install build-essential before bringing up rustup.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
       - name: Build and test
         run: |
           . "$HOME/.cargo/env"
-          cargo test
+          cargo test --locked
