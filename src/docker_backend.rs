@@ -137,17 +137,25 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
     Ok(containers)
 }
 
+/// Runner names embed this host's name; only ever deregister our own.
+/// Deregistering by bare "ezgha-" prefix would tear down every other host's
+/// idle runners on a shared repo/org — a fleet-wide outage button.
+pub fn our_runner_prefix() -> String {
+    format!("ezgha-{}-", hostname())
+}
+
 /// Kill all managed runner containers. Returns how many were removed.
 pub fn stop_all(cfg: &Config) -> Result<usize> {
     let containers = managed_containers()?;
     for c in &containers {
         let _ = Command::new("docker").args(["rm", "-f", &c.id]).output();
     }
-    // Deregister runners that never picked up a job (JIT runners that ran a
-    // job already removed themselves).
+    // Deregister THIS HOST's runners that never picked up a job (JIT runners
+    // that ran a job already removed themselves).
+    let prefix = our_runner_prefix();
     if let Ok(runners) = github::list_runners(&cfg.github) {
         for r in runners {
-            if r.name.starts_with("ezgha-") && !r.busy {
+            if r.name.starts_with(&prefix) && !r.busy {
                 let _ = github::remove_runner(&cfg.github, r.id);
             }
         }
@@ -155,20 +163,16 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
     Ok(containers.len())
 }
 
-/// Free disk in GB on the filesystem holding docker's data (falls back to /).
-pub fn free_disk_gb() -> Option<u64> {
-    let path = Command::new("docker")
-        .args(["info", "--format", "{{.DockerRootDir}}"])
+/// Free disk in GB as seen by the docker DAEMON, measured from inside a
+/// container: the container's root overlay lives on the daemon's storage, so
+/// this is the disk runner jobs will actually fill. A host-side `df` would
+/// read the wrong filesystem whenever the daemon is a VM (Colima/Lima/Desktop).
+pub fn free_disk_gb(image: &str) -> Option<u64> {
+    let out = Command::new("docker")
+        .args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"])
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/".into());
-    let out = Command::new("df").args(["-Pk", &path]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
+        .filter(|o| o.status.success())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let avail_kb: u64 = stdout
         .lines()
@@ -181,22 +185,26 @@ pub fn free_disk_gb() -> Option<u64> {
 }
 
 /// Ensure `count` managed runner containers are alive; start the shortfall.
-/// Refuses to spawn when host disk is below the configured floor — disk
-/// exhaustion is the dominant self-hosted runner failure mode, and spawning
-/// more work onto a full disk makes the incident worse.
+/// Refuses to spawn when the daemon's disk is below the configured floor —
+/// disk exhaustion is the dominant self-hosted runner failure mode, and
+/// spawning more work onto a full disk makes the incident worse.
 pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     let alive = managed_containers()?.len() as u32;
     if alive >= cfg.runner.count {
         return Ok(Vec::new());
     }
-    if let Some(free) = free_disk_gb() {
-        if free < cfg.limits.min_free_disk_gb {
+    match free_disk_gb(&cfg.runner.image) {
+        Some(free) if free < cfg.limits.min_free_disk_gb => {
             bail!(
                 "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
                  reclaim space (e.g. `docker system prune`) first",
                 cfg.limits.min_free_disk_gb
             );
         }
+        Some(_) => {}
+        None => eprintln!(
+            "warning: could not measure daemon free disk — disk floor guard is NOT active this cycle"
+        ),
     }
     let mut started = Vec::new();
     for _ in alive..cfg.runner.count {
@@ -204,4 +212,21 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
         started.push(name);
     }
     Ok(started)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_prefix_is_host_scoped() {
+        let prefix = our_runner_prefix();
+        assert!(prefix.starts_with("ezgha-"));
+        assert!(prefix.ends_with('-'));
+        // Must embed a hostname, not just be the bare "ezgha-" prefix that
+        // would match every host's runners.
+        assert_eq!(prefix, format!("ezgha-{}-", hostname()));
+        assert!(prefix.len() > "ezgha--".len());
+        assert!(format!("{prefix}abc123").starts_with(&prefix));
+    }
 }

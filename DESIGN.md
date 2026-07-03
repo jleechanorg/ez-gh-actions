@@ -94,9 +94,29 @@ policy violation is a hard error (fail closed).
 
 ## Known limitations (v1)
 
+From the post-implementation adversarial /er + code review (15-agent workflow; two
+confirmed criticals were fixed immediately — daemon-side disk measurement, host-scoped
+runner deregistration). Confirmed-major items deferred, in priority order:
+
+- **Crash-looping runner containers leak JIT registrations**: a container that starts
+  then dies (`--rm`) is invisible to `managed_containers()`, so `serve` respawns with a
+  new JIT config each cycle and never cleans the orphaned registration; no backoff.
+  Mitigation planned: reconcile GitHub's runner list (host-scoped prefix) each serve
+  cycle + exponential backoff on repeated immediate exits.
+- **`ezgha stop` does not stop the installed service**: with `install-service` active,
+  `serve` respawns runners within 30s of `stop`. Stop should also `systemctl --user stop`
+  / `launchctl unload` (or take a run lock shared with serve/start).
+- **`docker ps --format json` requires Docker CLI ≥ 23**: older CLIs (Ubuntu 22.04
+  `docker.io`) print the literal template. Needs a version probe or `--format '{{json .}}'`.
+- **Managed label is not target-scoped**: two configs on one host sharing the daemon
+  would miscount each other's capacity; label should include the target.
+- **Container hardening gaps**: no `--cap-drop ALL`, no egress restriction, no read-only
+  rootfs. `no-new-privileges` + cgroup limits + no docker.sock are accurate but partial.
+- **JIT config visible in argv/docker inspect** on the runner host (single-use,
+  short-lived; treat the host as single-tenant until delivered via file/env).
 - Requires the `gh` CLI to be authenticated; no GitHub App auth yet.
 - Tart/libvirt are detect-only; VM isolation is not yet delivered (the ladder and policy
   are wired so it lands without config changes).
 - No per-job disk quota (docker storage-opt needs specific storage drivers); the floor
-  guard bounds host-level damage instead.
+  guard bounds daemon-level damage instead.
 - `serve` is a foreground loop under systemd/launchd; no HTTP health endpoint yet.
