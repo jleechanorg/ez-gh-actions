@@ -184,6 +184,30 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+/// Apply the disk-floor guard given a (possibly-missing) free-disk measurement.
+///
+/// The disk floor is the flagship safety invariant of this tool: disk
+/// exhaustion is the dominant self-hosted runner failure mode and spawning
+/// more work onto a full disk makes the incident worse. We therefore fail
+/// CLOSED on every uncertain outcome — including a `None` measurement from a
+/// failed `docker run --entrypoint df` probe — rather than only when the probe
+/// returns a number below the floor. A failed probe could mean the daemon has
+/// lost its storage entirely; proceeding would be reckless.
+fn check_disk_floor(free: Option<u64>, floor_gb: u64) -> Result<()> {
+    match free {
+        Some(free) if free < floor_gb => bail!(
+            "only {free} GB free on docker's filesystem (floor: {floor_gb} GB) — refusing to spawn runners; \
+             reclaim space (e.g. `docker system prune`) first"
+        ),
+        Some(_) => Ok(()),
+        None => bail!(
+            "could not measure daemon free disk (probe failed) — refusing to spawn runners \
+             because the disk floor ({floor_gb} GB) is the flagship safety invariant and we \
+             cannot confirm it; run `ezgha doctor` or verify your docker setup, then retry"
+        ),
+    }
+}
+
 /// Ensure `count` managed runner containers are alive; start the shortfall.
 /// Refuses to spawn when the daemon's disk is below the configured floor —
 /// disk exhaustion is the dominant self-hosted runner failure mode, and
@@ -193,19 +217,7 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     if alive >= cfg.runner.count {
         return Ok(Vec::new());
     }
-    match free_disk_gb(&cfg.runner.image) {
-        Some(free) if free < cfg.limits.min_free_disk_gb => {
-            bail!(
-                "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
-                 reclaim space (e.g. `docker system prune`) first",
-                cfg.limits.min_free_disk_gb
-            );
-        }
-        Some(_) => {}
-        None => eprintln!(
-            "warning: could not measure daemon free disk — disk floor guard is NOT active this cycle"
-        ),
-    }
+    check_disk_floor(free_disk_gb(&cfg.runner.image), cfg.limits.min_free_disk_gb)?;
     let mut started = Vec::new();
     for _ in alive..cfg.runner.count {
         let (_, name) = start_one(cfg, backend)?;
@@ -228,5 +240,56 @@ mod tests {
         assert_eq!(prefix, format!("ezgha-{}-", hostname()));
         assert!(prefix.len() > "ezgha--".len());
         assert!(format!("{prefix}abc123").starts_with(&prefix));
+    }
+
+    #[test]
+    fn disk_floor_fails_closed_when_probe_returns_none() {
+        // A `None` from free_disk_gb() simulates a failed probe — e.g. an
+        // image that doesn't exist, a docker daemon that can't run the
+        // container, or an `df` output we can't parse. The disk floor is the
+        // flagship safety invariant, so the guard must REFUSE to spawn rather
+        // than silently downgrade to "no measurement, no protection".
+        let err = check_disk_floor(None, 10).expect_err("None must fail closed");
+        let msg = format!("{err:#}");
+
+        // Error message must explain the failure mode, name the assumed floor,
+        // and point the operator at the recovery path.
+        assert!(
+            msg.contains("could not measure daemon free disk"),
+            "error should explain the probe failure, got: {msg}"
+        );
+        assert!(
+            msg.contains("10"),
+            "error should name the assumed minimum floor (10 GB), got: {msg}"
+        );
+        assert!(
+            msg.contains("ezgha doctor"),
+            "error should point at `ezgha doctor`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn disk_floor_admits_when_probe_meets_floor() {
+        // Sanity check: passing measurement >= floor lets the caller proceed.
+        // Guards against the fail-closed patch accidentally closing on the
+        // happy path too.
+        check_disk_floor(Some(50), 10).expect("ample disk must be admitted");
+        check_disk_floor(Some(10), 10).expect("disk exactly at floor must be admitted");
+    }
+
+    #[test]
+    fn disk_floor_bails_when_probe_below_floor() {
+        // Existing fail-closed behavior on measured shortfalls must be
+        // preserved — the new None arm is additive, not a replacement.
+        let err = check_disk_floor(Some(3), 10).expect_err("3 GB below 10 GB floor must bail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("3 GB"),
+            "error should report measured free, got: {msg}"
+        );
+        assert!(
+            msg.contains("10"),
+            "error should name the floor, got: {msg}"
+        );
     }
 }
