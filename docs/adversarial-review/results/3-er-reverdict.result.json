@@ -1,0 +1,148 @@
+{
+  "summary": "Re-run /er verdict after integrity + critical fixes",
+  "agentCount": 3,
+  "logs": [
+    "2/2 re-audits done; 1 findings"
+  ],
+  "result": {
+    "er": {
+      "verdict": "PASS",
+      "reasoning": "The previous FAIL verdict rested solely on evidence-bundle integrity (git_sha.txt missing despite being listed in the manifest). That defect is now resolved and independently re-verified by this judge: `sha256sum -c checksums.sha256` run from /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703 returns 13/13 OK with exit 0, including git_sha.txt and the new 09/10 post-fix regression artifacts. Per the /er direct-assessment mandatory steps: (1) checksum verification passed with zero failures; (2) no verification_report.json exists in the bundle, so no WARN ceiling applies; (3) EVIDENCE.md contains no scope note excluding any claimed domain, so all claims are in scope. The five substantive claims were already PROVEN by live GitHub re-verification in the prior round and remain standing — I additionally spot-confirmed memory.max=6267338752 and pids.max=512 printed inside job run 28685531107's log (07_job_log.txt, timestamps 2026-07-03T22:12:27Z) and cleanup state of 0 containers / 0 registered runners in artifact 10, with reaudit-0's live `gh api .../actions/runners` returning total_count=0. Both critical-bug fixes were verified as real and sound by reaudit-1 at HEAD 3f04937 (== origin/main): the disk floor guard measures free space inside the Docker daemon via `docker run --rm --entrypoint df` (docker_backend.rs:170-185) with a loud non-silent warning path when measurement fails, proven meaningful by a ~20x host-vs-daemon df divergence on this Lima-style host; and stop_all is host-scoped via the `ezgha-<hostname>-` prefix with busy-runner exclusion (lines 143-161), covered by the runner_prefix_is_host_scoped unit test — cargo test 10/10 passed, clippy 0 warnings. The single remaining finding is minor and disclosed: git_sha.txt pins the fix commit c27d389 rather than the commit-under-test 5ef5406; I verified c27d389 is a real commit and 5ef5406 is its direct ancestor (`git merge-base --is-ancestor` passes), and EVIDENCE.md explicitly discloses the mid-run fix and both SHAs. This weakens commit-pinning only mildly (artifacts 01-08 vs 09-10 span two adjacent commits) and is noted as a known limitation, not a blocker. Under the stated rules — integrity clean + fixes verified = PASS — the verdict is PASS.",
+      "claim_table": [
+        {
+          "claim": "Evidence bundle integrity: all files verify against checksums.sha256 (prior FAIL cause resolved)",
+          "status": "PROVEN",
+          "evidence": "Independently re-run by this judge: sha256sum -c checksums.sha256 from /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703 → 13/13 OK (including git_sha.txt, 09_start_after_fix.txt, 10_stop_after_fix.txt), exit 0. No verification_report.json present (no WARN ceiling); no scope note in EVIDENCE.md."
+        },
+        {
+          "claim": "Real ephemeral JIT runner with hard cgroup limits was provisioned",
+          "status": "PROVEN",
+          "evidence": "Prior live GitHub re-verification PROVEN; reaudit-0 confirms runner ezgha-Jeff-Ubuntu-6a4837d823130641 started with 1 container (f75b44af6016) and 1 JIT-registered runner (#4) in artifacts 03/09, internally consistent with stop artifacts."
+        },
+        {
+          "claim": "Real GitHub Actions job run 28685531107 executed on the runner",
+          "status": "PROVEN",
+          "evidence": "Prior live re-verification PROVEN; 07_job_log.txt contains the selftest job transcript with real Actions timestamps (2026-07-03T22:12:27Z) proving execution environment inside the container."
+        },
+        {
+          "claim": "Full ephemeral cleanup after the job (no leftover containers or registered runners)",
+          "status": "PROVEN",
+          "evidence": "Artifacts 08 and 10 show 'managed containers: 0 / registered ezgha runners: 0'; reaudit-0 live check `gh api repos/jleechanorg/ez-gh-actions/actions/runners` returned total_count=0, matching artifact 10."
+        },
+        {
+          "claim": "memory.max=6267338752 and pids.max=512 enforced inside the job",
+          "status": "PROVEN",
+          "evidence": "Spot-verified by this judge in 07_job_log.txt: `cat /sys/fs/cgroup/memory.max` output 6267338752 and `cat /sys/fs/cgroup/pids.max` output 512 within the job's 'Prove execution environment' step."
+        },
+        {
+          "claim": "CI green",
+          "status": "PROVEN",
+          "evidence": "Prior live GitHub re-verification PROVEN; reaudit-1 additionally confirms cargo test 10/10 passed and cargo clippy --all-targets emits 0 warnings at HEAD 3f04937 == origin/main."
+        },
+        {
+          "claim": "Fix 1 verified: disk floor guard measures free disk inside the Docker daemon, with loud non-silent failure path",
+          "status": "PROVEN",
+          "evidence": "reaudit-1: src/docker_backend.rs:170-185 free_disk_gb() runs `docker run --rm --entrypoint df <image> -Pk /` and parses the POSIX Available column; ensure_count (196-208) bails below floor and eprintlns a loud warning when measurement returns None. Live proof: daemon df shows 120GB total/~25GB free vs host 926GB/~494GB (~20x divergence), confirming daemon-side measurement is the correct signal."
+        },
+        {
+          "claim": "Fix 2 verified: stop_all is host-scoped (deregisters only ezgha-<hostname>- prefixed, non-busy runners)",
+          "status": "PROVEN",
+          "evidence": "reaudit-1: our_runner_prefix() returns \"ezgha-<hostname>-\" (docker_backend.rs:143-145); stop_all filters on that prefix AND !busy (155-161); the sole bare \"ezgha-\" match is read-only Status display (main.rs:229), not deregistration. Unit test runner_prefix_is_host_scoped passes (10/10 cargo tests)."
+        },
+        {
+          "claim": "git_sha.txt pins the exact commit-under-test for all artifacts",
+          "status": "PARTIAL",
+          "evidence": "Known limitation (minor, disclosed, non-blocking): git_sha.txt contains fix commit c27d389 while artifacts 01-08 were generated at its direct parent 5ef5406; this judge verified c27d389 is a real commit and 5ef5406 is its ancestor via git merge-base --is-ancestor. EVIDENCE.md explicitly discloses both SHAs and the mid-run fix, so provenance is traceable across the two adjacent commits."
+        }
+      ]
+    },
+    "reaudit_summaries": [
+      "Re-audit PASSES. (1) sha256sum -c checksums.sha256 from /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703 verifies all 13 files OK (including git_sha.txt and new 09/10 regression artifacts) with zero failures, exit 0 — the prior FAIL cause is resolved. (2) git_sha.txt = c27d38970ef4f8f46f5754b9f64b54b9d1f8a227, a real commit in the repo; it is the LATER FIX commit, not the 5ef5406 commit-under-test, but 5ef5406 is its direct parent and EVIDENCE.md explicitly discloses both ('fix c27d389 applied mid-run'), so pinning is only mildly weakened (one minor finding, disclosed). (3) 09_start_after_fix.txt / 10_stop_after_fix.txt are internally consistent: runner ezgha-Jeff-Ubuntu-6a4837d823130641 started with 1 container (f75b44af6016) and 1 registered runner (#4, offline immediately after JIT registration as expected), then stop shows 0 containers / 0 registered; live check gh api repos/jleechanorg/ez-gh-actions/actions/runners returns total_count=0, matching artifact 10. No critical or major findings.",
+      "Both critical-bug fixes verified as real and sound at /home/jleechan/projects/ez-gh-actions (HEAD 3f04937 == origin/main). (1) Disk floor guard: src/docker_backend.rs:170-185 free_disk_gb() measures inside the daemon via `docker run --rm --entrypoint df <image> -Pk /` and parses the POSIX Available column; ensure_count (lines 196-208) bails when below floor and emits a loud eprintln warning (\"disk floor guard is NOT active this cycle\") when measurement returns None — no silent skip. Live proof on this Colima/Lima-style host: daemon-side df shows overlay 120GB total / ~25GB available (78% used) while host df shows nvme0n1p6 926GB total / ~494GB available (42% used) — ~20x divergence, confirming daemon-side measurement is meaningful and host-side df would miss VM disk pressure. (2) Host-scoped stop: our_runner_prefix() returns \"ezgha-<hostname>-\" (line 143-145); stop_all deregisters only runners matching that prefix AND !busy (lines 155-161). The only bare \"ezgha-\" match remaining is main.rs:229 in the read-only Status display (fleet visibility listing, no deregistration) — not a defect. Unit test runner_prefix_is_host_scoped covers the prefix (asserts hostname embedded, longer than bare \"ezgha--\"). cargo test: 10/10 passed including runner_prefix_is_host_scoped. cargo clippy --all-targets: 0 warnings. No incomplete or cosmetic aspects found."
+    ],
+    "reaudit_findings": [
+      {
+        "title": "git_sha.txt pins the fix commit (c27d389), not the commit-under-test (5ef5406) — single pin covers two artifact generations",
+        "severity": "minor",
+        "detail": "git_sha.txt contains c27d38970ef4f8f46f5754b9f64b54b9d1f8a227, verified as a real commit in /home/jleechan/projects/ez-gh-actions (git cat-file -t -> commit). It is the later fix commit ('fix: derive resource limits from docker daemon capacity, not host'), whose direct parent is the EVIDENCE.md commit-under-test 5ef5406779925598565c8d277d13b865db78947a (verified via merge-base --is-ancestor). This is coherent for the post-fix regression artifacts 09/10, and EVIDENCE.md explicitly discloses both SHAs and the mid-run fix, so commit-pinning is only mildly weakened: artifacts 01-08 were generated against 5ef5406 (fix applied mid-run) while the single git_sha.txt pin reflects c27d389. Disclosed and explainable; not a blocker."
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Reaudit"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Verdict"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "reaudit:integrity",
+      "phaseIndex": 1,
+      "phaseTitle": "Reaudit",
+      "agentId": "ace0e64b840e794c9",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783117828375,
+      "queuedAt": 1783117828364,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Re-audit PASSES. (1) sha256sum -c checksums.sha256 from /ho…",
+      "promptPreview": "Skeptical evidence integrity re-audit of /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703 (previous /er FAILED solely because git_sha.txt was in checksums.sha256 but missing; it has since been restored and checksums regenerated to cover new regression artifacts 09/10). Verify: (1) `cd /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703 && sha256sum -c checksums.sha256` passes fo…",
+      "lastProgressAt": 1783117915632,
+      "tokens": 60907,
+      "toolCalls": 9,
+      "durationMs": 87257,
+      "resultPreview": "{\"findings\":[{\"title\":\"git_sha.txt pins the fix commit (c27d389), not the commit-under-test (5ef5406) — single pin covers two artifact generations\",\"severity\":\"minor\",\"detail\":\"git_sha.txt contains c27d38970ef4f8f46f5754b9f64b54b9d1f8a227, verified as a real commit in /home/jleechan/projects/ez-gh-actions (git cat-file -t -> commit). It is the later fix commit ('fix: derive resource limits from do…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "reaudit:fixes",
+      "phaseIndex": 1,
+      "phaseTitle": "Reaudit",
+      "agentId": "a11788b81d9a67040",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783117828378,
+      "queuedAt": 1783117828364,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Both critical-bug fixes verified as real and sound at /home…",
+      "promptPreview": "Verify two critical-bug fixes are real in the code at /home/jleechan/projects/ez-gh-actions (commit on main, also check github.com/jleechanorg/ez-gh-actions main via gh if needed):\n(1) Disk floor guard: src/docker_backend.rs free_disk_gb() must now measure INSIDE the daemon (docker run --rm --entrypoint df <image> -Pk /) not host-side df, and ensure_count must warn loudly (not silently skip) when …",
+      "lastProgressAt": 1783117936747,
+      "tokens": 64100,
+      "toolCalls": 12,
+      "durationMs": 108369,
+      "resultPreview": "{\"findings\":[],\"summary\":\"Both critical-bug fixes verified as real and sound at /home/jleechan/projects/ez-gh-actions (HEAD 3f04937 == origin/main). (1) Disk floor guard: src/docker_backend.rs:170-185 free_disk_gb() measures inside the daemon via `docker run --rm --entrypoint df <image> -Pk /` and parses the POSIX Available column; ensure_count (lines 196-208) bails when below floor and emits a lo…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "er-reverdict",
+      "phaseIndex": 2,
+      "phaseTitle": "Verdict",
+      "agentId": "ae0dcc5c82bdf5a28",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783117938038,
+      "queuedAt": 1783117938026,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "PASS",
+      "promptPreview": "You are the final /er judge, re-issuing the verdict for ez-gh-actions v1 after fixes (repo /home/jleechan/projects/ez-gh-actions, evidence /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703).\nPrevious verdict was FAIL solely on evidence integrity (git_sha.txt missing from bundle though listed in manifest); all 5 substantive claims were PROVEN by live GitHub re-verification: (1) real ephem…",
+      "lastProgressAt": 1783118013754,
+      "tokens": 61876,
+      "toolCalls": 7,
+      "durationMs": 75716,
+      "resultPreview": "{\"verdict\":\"PASS\",\"reasoning\":\"The previous FAIL verdict rested solely on evidence-bundle integrity (git_sha.txt missing despite being listed in the manifest). That defect is now resolved and independently re-verified by this judge: `sha256sum -c checksums.sha256` run from /home/jleechan/projects/ez-gh-actions/evidence/e2e-20260703 returns 13/13 OK with exit 0, including git_sha.txt and the new 09…"
+    }
+  ],
+  "totalTokens": 186883,
+  "totalToolCalls": 28
+}

@@ -1,0 +1,1105 @@
+{
+  "summary": "Multi-agent review of the gha-isolated Rust CLI design gist",
+  "agentCount": 32,
+  "logs": [
+    "4/4 reviewers completed; 39 raw findings",
+    "26 confirmed, 2 refuted, 11 minor (unverified)"
+  ],
+  "result": {
+    "summaries": [
+      {
+        "reviewer": "facts",
+        "summary": "Fact-checked all 7 external assumptions in the gha-isolated design with live web evidence. Headline results: (1) gha-outrunner DOES exist (https://github.com/NetwindHQ/gha-outrunner) and matches the design's functional assumptions exactly (Go, MIT, Docker/libvirt/Tart backends, GitHub scaleset API, no k8s, v1.2.0 Apr 2026) — but it has 3 stars, 0 forks, and one maintainer, so the design's foundation is a bus-factor-1 dependency (flagged critical per instructions). (2) The design's assumed interface is wrong in detail: real config is config.yml (not outrunner.yml) with docker:/libvirt:/tart: blocks, max_runners (no count:), integer-MiB memory, no pids_limit, PAT-only auth, and the CLI is a single foreground process with NO start/stop/status subcommands. (3) The 'GCE has no strong KVM' claim is false — GCE supports nested virtualization on Intel Haswell+ machine types (not E2/AMD/Arm), so libvirt works on GCE. (4) Scale sets without Kubernetes are now officially supported via GitHub's standalone actions/scaleset Go client (public preview Feb 2026), so the design's scale-set wording is valid. (5) Tart licensing resolved favorably: after Cirrus Labs joined OpenAI (Apr 2026), fees were dropped and the license is now FSL-1.1-ALv2 (internal use free, no core limits, Apache-2.0 after 2 years) — though the original team has moved on. (6) Sysbox-CE is maintained (v0.7.0, Mar 2026, Docker-sponsored community project); Sysbox-EE is dead. (7) serde_yaml is deprecated/archived with no official successor. Prior art is substantial (GARM, actions/scaleset, RunsOn, actuated, Ubicloud, WarpBuild, ARC): gha-isolated's unique value is only a thin auto-detect + service-install layer, which would arguably be better contributed upstream to gha-outrunner. Could not verify one item first-hand: the tart.run/licensing page fetch was permission-denied, so Tart's historical 100-core free tier is sourced from search results and GitHub discussion #433 rather than the page itself; the current license was verified directly from the repo's LICENSE file."
+      },
+      {
+        "reviewer": "architecture",
+        "summary": "Reviewed the gha-isolated design doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt). The skeleton's CLI/module decomposition is reasonable, but the design is missing every hard part of a self-hosted runner manager. Four critical gaps: (1) no GitHub registration/auth story whatsoever — no PAT/App tokens, JIT config, token lifecycle, or repo/org scoping, so the generated config can never produce a working runner; (2) no VM image management — source, versioning, disk budget, clone strategy, and guest bootstrap for Tart/libvirt are all unaddressed; (3) no ephemeral lifecycle — nothing destroys VMs post-job, no state store, no crash recovery, no orphan reaper, and zero disk reclamation despite disk-fill being the dominant runner failure mode; (4) the responsibility boundary with the wrapped gha-outrunner is never specified, so every other gap is unassignable. Major flaws: backend selection fails open (silent downgrade to plain Docker, 'assume Sysbox is installed' without checks, unpersisted backend choice that can silently change isolation class — should fail closed with explicit opt-in for downgrades); hardcoded 4G/2cpu/count:2 ignoring host capacity with no disk limits at all; config written to CWD with no schema version, no validation, and no secrets handling; no security threat model (docker.sock exposure in the fallback tier, guest network/metadata-endpoint egress, secrets in env, fork-PR policy); service management stubbed despite being essential for unattended operation; observability limited to an unimplemented status command. Minor: the 'Scale Sets + ephemeral by default' principle has no supporting mechanism, and platform detection mishandles Intel Macs/unknown OSes while discarding the sysinfo data it collects. Net: the doc designs the wrapper's shell but none of the runner-management substance; it needs an auth section, image pipeline, lifecycle/state/GC model, fail-closed backend policy, and an explicit contract with gha-outrunner before implementation proceeds."
+      },
+      {
+        "reviewer": "rust",
+        "summary": "Reviewed the gha-isolated design + Rust skeleton at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt. Three critical issues: (1) serde_yaml is archived/deprecated (0.9.34+deprecated, repo archived March 2024) and is the foundation of the tool's core job; (2) config is generated via format! string templating while serde/serde_yaml sit completely unused in the skeleton — typed config structs are deferred to 'future work' when they must be v1 (whitespace-fragile, unvalidatable, YAML-injection-prone otherwise); (3) the module table promises 7 files but main.rs declares only 4 mods — service.rs and limits.rs (the module that would own the headline 'resource limits' principle) don't exist, and install-service exits 0 while doing nothing. Major issues: /dev/kvm existence check ignores kvm-group permissions so libvirt gets selected then fails at runtime; 'assume Sysbox is installed' with no docker/sysbox validation and a plain-Docker fallback that is unreachable on Linux (only unknown OSes get it); sysinfo's System::new_all()+refresh_all() result is discarded (dead heavyweight init) while resource limits that could use it are hardcoded; fs::write(\"outrunner.yml\") writes to cwd and silently clobbers; stringly-typed Platform.os instead of enums (would also pick Tart on Intel Macs despite the Apple-Silicon-only design); and no Backend trait — proposed a concrete v1 layout with `trait Backend { detect/validate/render_config/start/stop/status }`, one impl file per backend, directories-based config paths, and sysinfo-derived limits. Minor: duct/colored unnecessary (std::process suffices; tokio is correctly NOT needed and should stay out), missing tracing/directories deps, outdated pins (sysinfo 0.30, which 6.0), missing license/rust-version/Cargo.lock discipline, and fixed count:2/4G/2cpu limits that contradict the tool's own resource-protection principle."
+      },
+      {
+        "reviewer": "infra-fit",
+        "summary": "(1) Existing setup: two battle-tested bash/compose stacks in git. self-hosted-oss/ runs org-scope runners on the myoung34/github-runner OSS image — on macOS via Colima VM + launchd agent (install.sh copies scripts to stable ~/.local/share/worldarchitect-runners/, managed colima.yaml template with SHA sentinel, preflight checks for memory pressure/disk/fseventsd-runaway, heal-runners.sh self-heal, 5-min mac-runner-health monitor, severity-coded Slack alerts), and on Linux via root-owned /opt install + systemd Type=oneshot/RemainAfterExit + Docker restart=on-failure:3 with an explicit no-supervisor, no-respawn-storm policy (LINUX_HOST_POLICY.md) and an EPHEMERAL=true install guard. self-hosted-colima/ runs 16 ephemeral runners (1 CPU/1.5G each) in a 4CPU/12GiB/120GiB Lima VM on Jeff-Ubuntu — VM isolation chosen because kernel 6.17 + RTX 4090 host freezes were killing the bare fleet — with per-runner named volumes, a pre-job disk-cleanup hook (5 GB threshold), daily git-gc cleanup cron, weekly hard-cleanup cron, and a 15-min monitor with zombie-runner force-recreate and queue-depth checks. Isolation today is container-in-VM, not per-job VM. (2) gha-isolated's genuinely valuable ideas: per-job VM isolation (Tart/libvirt) would eliminate the disk-cleanup/workdir-collision/zombie/cache-corruption problem classes at the root, and a unified layer would end the real drift between the two duplicated stacks; on macOS it would also retire the fragile Colima/fseventsd layer. (3) But the design as written is missing essentially all the hard-won operational machinery: disk sizing and pre-job cleanup hooks, health monitoring/zombie detection/queue-depth checks, debounced Slack/email alerting, CPU-aware load thresholds, cache-integrity monitoring, stable-install-path discipline, the ephemeral-pool-drain trap, and label/name-registration hygiene — its service management and runner lifecycle are literally 'not yet implemented' and delegated to an unverified dependency (gha-outrunner). (4) Verdict: a new Rust binary is NOT justified at the current scale of two hosts; the skeleton contains ~30 lines of real logic. Recommended path: pilot Tart (macOS) or libvirt (Linux) per-job VMs as a bounded experiment inside self-hosted-oss/, wired through install.sh per the repo CLAUDE.md rule that all runner changes must be in git, PR-reviewed, and reproducible via install.sh; deduplicate the two bash stacks separately; revisit a compiled orchestrator only if the fleet grows to many hosts."
+      }
+    ],
+    "confirmed": [
+      {
+        "title": "gha-outrunner exists but is an extremely obscure single-maintainer project (3 stars, 0 forks)",
+        "severity": "critical",
+        "detail": "VERIFIED: The project exists at https://github.com/NetwindHQ/gha-outrunner ('Ephemeral VM and container runners for GitHub Actions — no Kubernetes required'). It genuinely matches the design's assumptions: written in Go, MIT licensed, supports exactly the three backends the design names (Docker, libvirt/KVM qcow2, Tart on Apple Silicon), and registers via GitHub's scaleset API as an autoscaling runner group without Kubernetes. It is actively maintained — latest release v1.2.0 on April 20, 2026, 5 total releases, built by Pawel Subocz at Netwind. HOWEVER, at fetch time it has 3 stars, 0 forks, 17 open issues, and a single author. The entire gha-isolated design wraps this project as its execution engine, so the design inherits a severe bus-factor and abandonment risk from a project with essentially no community. The author did NOT confuse it with actions-runner-controller, rust-lang/gha-runner, omsf/gha-runner, or runs-on.com — those are distinct projects. Evidence: https://github.com/NetwindHQ/gha-outrunner",
+        "recommendation": "Acknowledge the dependency risk explicitly in the design. Options: (a) vendor/fork gha-outrunner since it is MIT, (b) build on GitHub's official standalone scale set client (https://github.com/actions/scaleset, public preview Feb 2026) as the durable API layer with gha-outrunner as reference code, or (c) contribute the wrapper features upstream to gha-outrunner instead of wrapping it.",
+        "from": "facts",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "I attempted to refute the finding by independently verifying every factual claim against the GitHub API and the design doc; the finding survives. Verified via `gh api repos/NetwindHQ/gha-outrunner`: the repo exists with the exact description quoted ('Ephemeral VM and container runners for GitHub Actions — no Kubernetes required'), language Go, license MIT, 3 stars, 0 forks, not archived. Releases API confirms exactly 5 releases with latest v1.2.0 published 2026-04-20. Contributors API confirms a single human author (psubocz, 81 commits; only other contributor is dependabot[bot]) — the bus-factor claim is accurate. The README confirms exactly the three backends the design assumes (Docker; libvirt = 'KVM VM from qcow2 golden image with CoW overlays'; Tart on 'macOS (Apple Silicon)') and confirms registration via GitHub's scaleset API (https://github.com/actions/scaleset) as an autoscaling runner group without Kubernetes. The design doc at the given scratchpad path is indeed a 'wrapper CLI around gha-outrunner' (line 2) whose runner lifecycle is 'start/stop/status via gha-outrunner' (line 25) — so the design does inherit the dependency risk wholesale. The recommendation's factual basis also holds: actions/scaleset exists ('Go client for GitHub Actions Runner Scale Set APIs - build custom autoscaling solutions', 152 stars, actively pushed), and MIT licensing makes vendoring/forking legal, so all three recommended options are viable. Two trivial discrepancies that do not undermine the finding: (1) open issues are now 20, not 17 — the GitHub open_issues_count includes PRs and drifts over time; (2) the 'public preview Feb 2026' date for actions/scaleset could not be independently confirmed (the repo was created 2025-10-29), but this is not load-bearing. Severity 'critical' is defensible for a design review: the entire execution engine of the proposed design is a 3-star, 0-fork, single-maintainer, 3-month-old project, and the design doc nowhere acknowledges this risk."
+        }
+      },
+      {
+        "title": "Design's assumed gha-outrunner interface (outrunner.yml, start/stop/status, count/backend/pids_limit keys) does not match the real tool",
+        "severity": "major",
+        "detail": "VERIFIED against the actual docs (https://raw.githubusercontent.com/NetwindHQ/gha-outrunner/main/docs/reference/configuration.md and .../cli.md): (1) The config file is `config.yml` (default `/etc/outrunner/config.yml`), NOT `outrunner.yml` as src/config.rs writes. (2) There is no `backend:` key — each runner in the `runners:` map specifies exactly one of `docker:`, `libvirt:`, or `tart:` sub-blocks. (3) There is no `count:` key — concurrency is `max_runners` (default 2). (4) `memory` is an integer in MiB (default 8192), not '4G'/'4g' strings; there is no `resources:` block and no `pids_limit` option at all. (5) The CLI is a single foreground command with only --config/--url/--token/--max-runners flags — there are NO start/stop/status subcommands, so src/runner.rs's lifecycle model ('start/stop/status via gha-outrunner') is wrong; gha-isolated would have to manage the process itself (spawn/signal/pidfile or systemd unit). (6) Auth is PAT-only (token_file, --token, GITHUB_TOKEN, systemd-creds); no GitHub App auth is documented. (7) gha-outrunner has no built-in service installer, so the design's service.rs must write systemd/launchd units itself — consistent with the design but worth stating.",
+        "recommendation": "Rewrite src/config.rs to emit the real schema (config.yml with url, token_file, runners.<name>.{labels, docker|libvirt|tart, max_runners}, integer MiB memory) and redesign runner.rs as a process supervisor (spawn foreground outrunner, SIGINT for clean shutdown) rather than assuming subcommands. Drop pids_limit from the config or file an upstream feature request.",
+        "from": "facts",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Attempted refutation failed on every point. I independently fetched the upstream docs (configuration.md and cli.md from NetwindHQ/gha-outrunner) and read the design doc. All seven claims verified: (1) real config is config.yml at /etc/outrunner/config.yml, not outrunner.yml as design's src/config.rs writes (line 248); (2) no backend: key — runners take exactly one docker:/libvirt:/tart: sub-block; (3) no count: key — max_runners/--max-runners (default 2) governs concurrency; (4) memory is integer MiB, no resources: block, no pids_limit anywhere (design emits 'memory: 4G', 'resources:', and 'pids_limit: 100' at lines 223-242); (5) CLI is a single foreground command with only --config/--url/--token/--max-runners — no start/stop/status subcommands, contradicting design lines 25/74 ('start/stop/status via gha-outrunner'); (6) auth is PAT-only (token_file/--token/GITHUB_TOKEN/systemd-creds), no GitHub App auth; (7) no built-in service installer. Web search confirms NetwindHQ/gha-outrunner is the only tool with this name, so the design cannot be referring to some other tool with the assumed interface. Severity 'major' is appropriate: the design's entire integration surface (config schema and lifecycle model) does not match the real tool and would fail at first run. The recommendation (emit the real schema, redesign runner.rs as a process supervisor with signal-based shutdown, drop pids_limit or file upstream) is technically sound. Only trivial imprecision found: the finding calls 8192 MiB the 'default' memory where docs present it as the default/example value — immaterial to the conclusion."
+        }
+      },
+      {
+        "title": "GCE 'no strong KVM' claim is factually wrong — Compute Engine supports nested virtualization on most Intel x86 machine types",
+        "severity": "major",
+        "detail": "VERIFIED FALSE: Google Cloud docs (https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview) state Compute Engine adds Intel VT-x to VMs so an L1 VM can run KVM. Requirements: Intel Haswell or later CPU platform; enabled per-VM with `--enable-nested-virtualization`; NOT supported on E2, memory-optimized, AMD-based, Arm-based, or H4D machine types. So on a correctly chosen GCE machine type (e.g. N1/N2/C2/C3 Intel), /dev/kvm exists and the design's libvirt backend works — the backend-selection table row 'Linux / GCE → No/weak KVM → Docker+Sysbox' is wrong as a blanket statement. Caveats that partially support the design's instinct: nested KVM has a real performance penalty (see https://piware.de/post/2026-02-13-google-cloud-platform-nested-virtualization-revisited/, Feb 2026), and Arm/AMD GCE instances genuinely have no nested virt. Note the design's own detection code (checking /dev/kvm) would actually pick libvirt on such GCE VMs, contradicting its own table.",
+        "recommendation": "Change the design text: GCE with Intel machine types + --enable-nested-virtualization is a first-class libvirt/KVM target; Docker+Sysbox is the fallback for E2/AMD/Arm instances or where nested-virt performance is unacceptable. Add a GCE helper that provisions VMs with the nested-virt flag and documents the machine-type constraint.",
+        "from": "facts",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "The finding is factually correct and could not be refuted. (1) Google's official nested-virtualization docs confirm Compute Engine exposes Intel VT-x to L1 VMs so they can run Linux KVM, enabled per-VM, with exclusions exactly as the finding states (E2, memory-optimized, AMD, Arm, H4D) — so on Intel N1/N2/C2/C3 machine types /dev/kvm exists and the design's libvirt backend works, making the doc's blanket 'Linux / GCE (no strong KVM) → Docker + Sysbox' row (gistfile1.txt lines 16, 51-55) factually wrong as a categorical claim. (2) The internal-contradiction claim is verified: the doc's own detection code (lines 179, 199-201) checks Path::new(\"/dev/kvm\").exists() and returns Backend::Libvirt on any Linux with KVM, so on a nested-virt-enabled GCE VM the code contradicts the doc's table. (3) The finding's caveats are also accurate — Google's docs themselves state a 10%+ performance decrease for nested VMs, and AMD/Arm GCE genuinely lack nested virt. (4) Severity 'major' is proportionate: the backend-selection matrix is the central design decision and GCE is one of three named target platforms. The recommendation is sensible and fits the doc's existing 'Optional GCE helpers' module. Only minor nuance: preferring Docker+Sysbox on GCE could be a defensible deliberate performance tradeoff, but the doc frames it as a capability limitation ('no strong KVM'), which is false as stated."
+        }
+      },
+      {
+        "title": "The design largely reinvents existing wheels — gha-outrunner itself plus GARM, GitHub's official scaleset client, RunsOn, actuated, Ubicloud, WarpBuild",
+        "severity": "major",
+        "detail": "VERIFIED: The proposed gha-isolated adds only platform detection, backend selection, config generation, and service install on top of gha-outrunner — which already does the hard part (ephemeral runners, scaleset registration, Docker/libvirt/Tart isolation, no k8s: https://github.com/NetwindHQ/gha-outrunner). Established alternatives covering the same space: (1) GARM — Cloudbase's multi-cloud auto-scaling manager for GitHub Actions/Gitea self-hosted runners with pluggable providers, mature and widely used (https://github.com/cloudbase/garm). (2) GitHub's official standalone Runner Scale Set Client, actions/scaleset, public preview Feb 5 2026 — a Go module for building custom autoscalers on VMs/containers/bare metal WITHOUT Kubernetes (https://github.com/actions/scaleset, https://github.com/orgs/community/discussions/186265). (3) Commercial/hosted: RunsOn (runs in your AWS account), actuated (microVMs on your hardware), Ubicloud, WarpBuild, Namespace, Blacksmith (https://runs-on.com/alternatives-to/github-actions-runners/, https://betterstack.com/community/comparisons/actuated-alternatives/). (4) ARC remains the k8s reference implementation (https://github.com/actions/actions-runner-controller). Cirrus Labs' own runner products are shutting down after the OpenAI acquisition (Cirrus CI ends June 1, 2026: https://www.warpbuild.com/blog/cirrus-ci-shutting-down). The unique value of gha-isolated is only the thin cross-platform 'pick the best backend automatically + install as a service' UX.",
+        "recommendation": "Before building, evaluate GARM (with libvirt/LXD providers) and gha-outrunner-as-is with a small install script. If proceeding, scope gha-isolated as a thin installer/supervisor and consider upstreaming auto-detection and service install to gha-outrunner (MIT, would likely welcome contributions) instead of a separate binary.",
+        "from": "facts",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Adversarial verification FAILED to refute the finding — every material factual claim checks out. (1) gha-outrunner (NetwindHQ/gha-outrunner, MIT) verified: ephemeral runners via GitHub's scaleset API with Docker/libvirt/Tart backends, no Kubernetes — it already does everything hard in the design. The design doc itself describes gha-isolated as 'a wrapper CLI around gha-outrunner,' and its skeleton confirms the thin-layer characterization: runner.rs is a placeholder that shells out to gha-outrunner; the only real logic is platform detection, backend selection, YAML config generation, and (unimplemented) service install. (2) GARM (cloudbase/garm) verified: active (v0.2.1 May 2026), auto-scaling ephemeral runners with pluggable providers (LXD, Incus, AWS, Azure, GCP, k8s). (3) actions/scaleset verified: GitHub's official standalone Go Runner Scale Set Client, public preview, explicitly for custom autoscalers on VMs/containers/bare metal without Kubernetes — only error is the date: announced Feb 3, 2026 (community discussion #186265), not Feb 5. (4) Cirrus Labs → OpenAI acquisition verified (announced April 7, 2026); Cirrus CI shuts down June 1, 2026, Cirrus Runners closed to new customers — the finding's 'runner products shutting down' is accurate (nuance: Tart the tool is being relicensed more permissively, not killed, but the finding didn't claim otherwise). (5) Commercial alternatives (RunsOn, actuated, Ubicloud, WarpBuild, Namespace, Blacksmith) and ARC-as-k8s-reference are all real and correctly characterized. The recommendation (evaluate GARM/gha-outrunner-as-is; scope gha-isolated as a thin installer or upstream auto-detection to MIT-licensed gha-outrunner) is sound and proportionate. Severity 'major' is justified for a build-vs-reuse design question. Only correction needed: the scaleset public-preview announcement date.",
+          "corrected_claim": "The finding stands as written with one trivial date correction: GitHub's standalone Runner Scale Set Client (actions/scaleset) public preview was announced February 3, 2026 (community discussion #186265), not February 5, 2026. All other facts verified: gha-outrunner already provides ephemeral scaleset runners with Docker/libvirt/Tart isolation and no k8s (MIT); GARM is a mature pluggable-provider autoscaling manager; RunsOn/actuated/Ubicloud/WarpBuild cover the commercial space; ARC remains the k8s reference; Cirrus Labs' runner products are winding down after the OpenAI acquisition (Cirrus CI ends June 1, 2026; Tart itself continues under a more permissive license). gha-isolated's unique value is indeed only the thin cross-platform backend auto-detection + service-install UX on top of gha-outrunner."
+        }
+      },
+      {
+        "title": "No runner registration/authentication design at all",
+        "severity": "critical",
+        "detail": "The design never mentions how a runner becomes known to GitHub. There is no GitHub PAT or GitHub App credential flow, no JIT runner config, no registration-token acquisition or expiry handling (registration tokens are short-lived), and no repo/org/enterprise scoping decision. The generated outrunner.yml (src/config.rs, lines 212-251 of the doc) contains only backend/labels/count/resources — no `github:` section, no URL, no auth reference. Core Principle 3 says 'Use GitHub Scale Sets + ephemeral runners by default', which implies an auth-heavy control-plane integration, yet nothing in the module structure (section 4) owns credentials or registration. As written, `gha-isolated init && gha-isolated start` cannot produce a runner that ever appears in GitHub. This may be delegated to gha-outrunner, but the design never says so (see the 'unspecified responsibility boundary' finding) — a design for a runner tool that never utters the word 'token' is incomplete at its core.",
+        "recommendation": "Add an explicit auth section: choose GitHub App (installation token) as primary with PAT fallback; specify JIT runner config for ephemeral runners (per-job token, no persistent credential in the guest); define scoping (repo vs org) as a first-class `init` question; document token lifecycle (who mints registration tokens, how refresh works under a long-lived service); and define where the credential is stored (OS keychain / file with 0600 in the config dir — never in outrunner.yml or process env visible to jobs).",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "I attempted to refute the finding and failed on every factual axis; independent evidence actually strengthens it.\n\nVerification against the doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt):\n(1) The words \"token\", \"PAT\", \"auth\", \"credential\", \"registration\", and \"URL\" (in the GitHub-target sense) appear nowhere in the 292-line doc. (2) The generated outrunner.yml in src/config.rs (doc lines 212-251) contains exactly backend/labels/count/resources(/docker limits) — no github section, no url, no token reference; the line citation in the finding is accurate. (3) \"Use GitHub Scale Sets + ephemeral runners by default\" is indeed Core Principle 3 (doc line 10). (4) The module table (section 4, lines 62-78) has no module owning credentials or registration. (5) `init` (main.rs lines 131-137) asks no repo/org/URL/token question, and runner::start is a placeholder that would invoke `gha-outrunner --config outrunner.yml` with no --url/--token flags.\n\nStrongest refutation candidate — \"auth is implicitly delegated to gha-outrunner\" — fails on external evidence. gha-outrunner is a real tool (github.com/NetwindHQ/gha-outrunner), and its configuration reference (docs/reference/configuration.md) states: \"Every runner must have a URL reachable via the resolution chain: per-runner url, --url flag, or this global field,\" plus a token resolution chain (per-runner token_file → --token → GITHUB_TOKEN env → systemd-creds → global token_file). The wrapper's whole job includes generating outrunner.yml, and the config it generates omits the mandatory url and any token_file, and the design never instructs the user to set GITHUB_TOKEN or pass flags. So the finding's sharpest claim — that `gha-isolated init && gha-isolated start` as designed cannot produce a runner that appears in GitHub — is confirmed by the upstream tool's own docs, not merely plausible. The severity (critical) is proportionate: for a turnkey runner-provisioning CLI whose init/config-generation is a first-class module, omitting the only fields that connect it to GitHub is a core-functionality gap, not a nitpick, and the doc itself claims \"This skeleton is runnable today.\"\n\nOne minor caveat on the recommendation (not enough to refute): gha-outrunner currently supports PAT-file/env/token-flag auth only — there is no native GitHub App option per its configuration reference. \"GitHub App as primary\" is still implementable (the wrapper can mint installation tokens and write them to token_file, refreshing on expiry), but the recommendation should be framed as wrapper-side token minting against gha-outrunner's token_file mechanism rather than a config option that exists upstream. Similarly, since gha-outrunner uses the scaleset API for registration, the \"JIT runner config\" suggestion is one option among several rather than the obvious fit. The rest of the recommendation (scoping as an init question, token lifecycle, 0600 credential storage outside outrunner.yml/env) aligns directly with gha-outrunner's actual token_file design and is sound.\n\nSources: [NetwindHQ/gha-outrunner](https://github.com/NetwindHQ/gha-outrunner), [gha-outrunner configuration reference](https://github.com/NetwindHQ/gha-outrunner/blob/main/docs/reference/configuration.md)",
+          "corrected_claim": "The finding stands as written, with one refinement to the recommendation: gha-outrunner natively supports only PAT-style tokens (token_file / --token / GITHUB_TOKEN / systemd-creds) and a mandatory runner URL — it has no built-in GitHub App auth. The design should therefore specify (a) collecting the target URL and scope at `gha-isolated init`, (b) writing url + token_file into the generated outrunner.yml (or documenting the env/flag path), and (c) if GitHub App auth is desired as primary, wrapper-side installation-token minting/refresh into the token_file path rather than assuming an upstream github: config section."
+        }
+      },
+      {
+        "title": "VM image management is entirely absent",
+        "severity": "critical",
+        "detail": "For the two preferred backends (Tart on macOS, libvirt on Linux) the design never says where guest images come from, what is inside them (the Actions runner agent must be present or bootstrapped), how they are versioned or updated, how much disk they consume, or how per-image toolchain caches work. VM backends live or die on the image pipeline: a 50-90GB macOS Tart image per runner, base-image pulls on first start, staleness (runner agent versions are force-deprecated by GitHub within weeks), and clone strategy (CoW clone per ephemeral job vs full copy) all materially change disk sizing and job start latency. None of section 2's architecture boxes or section 4's modules own images. The libvirt path additionally needs a cloud-init/ignition or template story to inject the runner registration into the guest — completely unaddressed.",
+        "recommendation": "Add an `images` module and config section: pinned image references with digests, an update/pull policy (`gha-isolated update-images`), CoW clone-per-job for ephemerality, a documented disk budget per backend, and a statement of what the image guarantees (runner agent version, preinstalled toolchains vs bring-your-own). Define how registration material gets into the guest (cloud-init for libvirt, Tart's mechanism on macOS).",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "The core factual claim is verified TRUE: the 292-line design doc contains zero mentions of images, image sources, versioning, pull/update policy, disk budgets, or guest provisioning (grep for image/tart-image/cloud-init/ignition/qcow/clone returns nothing relevant), and no section-2 box or section-4 module owns images. Stronger than the finding even states: the wrapped tool gha-outrunner (real project, NetwindHQ/gha-outrunner) REQUIRES an `image:` field for the tart provisioner and a `path:` to a base qcow2 for libvirt, so the design's generated outrunner.yml (doc lines 217-229, only backend/labels/count/resources) is invalid for both preferred VM backends — the \"Config Generation\" module the design explicitly owns produces a non-functional config, and the golden image must be pre-baked with the runner agent (default runner_cmd /actions-runner/run.sh), which nothing in the design provides. Image staleness is also real (GitHub refuses outdated runner agents ~30 days after release, and ephemeral VM images freeze the agent version). So the finding is NOT refuted; severity critical is defensible because the two preferred backends cannot start a single job as designed. However, three supporting details are factually wrong and should be corrected: (1) clone strategy is not an open decision — gha-outrunner already does CoW qcow2 overlays per job (libvirt) and clone-per-job (tart); (2) libvirt registration does NOT need a cloud-init/ignition story — gha-outrunner delivers JIT config via `runner_cmd --jitconfig` executed in the guest; the actual gap is preparing a golden qcow2 with the runner agent installed; (3) the \"50-90GB macOS Tart image per runner\" figure is contradicted by gha-outrunner's own docs (15-25 GB, disk = image size x max concurrent clones). The recommendation is sound for pinned image refs, pull/update policy, disk budget, and image-guarantee statement, but the CoW-clone-per-job and cloud-init-registration items are redundant with what gha-outrunner already implements.",
+          "corrected_claim": "VM image management is entirely absent from the design, and this is critical: the wrapped tool gha-outrunner requires an `image:` (Tart, OCI ref e.g. ghcr.io/cirruslabs/macos-sequoia-base) or `path:` (libvirt, base qcow2) in outrunner.yml, so the design's generated config is invalid for both preferred VM backends, and no module owns obtaining, pinning, updating, or budgeting disk for images. The golden images must contain the Actions runner agent (default runner_cmd /actions-runner/run.sh), which goes stale as GitHub deprecates old agent versions. Corrections to the original detail: clone strategy and registration injection are NOT open gaps — gha-outrunner already does CoW/clone-per-job and delivers JIT registration via runner_cmd inside the guest (no cloud-init needed); and macOS Tart images are ~15-25 GB per gha-outrunner's docs, not 50-90 GB per runner. Recommendation stands minus those two redundant items: add an images module/config section with pinned digests, a pull/update policy, a per-backend disk budget (image size x max concurrent runners), and a statement of what each image guarantees (runner agent version, preinstalled toolchains, runner_cmd path)."
+        }
+      },
+      {
+        "title": "Responsibility boundary with gha-outrunner is never specified",
+        "severity": "critical",
+        "detail": "The entire design delegates execution to gha-outrunner ('Start gha-outrunner with correct flags/backend', src/runner.rs), but never states which responsibilities outrunner owns versus the wrapper: registration tokens? image pulls? post-job VM destruction? restart on failure? status reporting? Every other gap in this review is either a real gap or outrunner's job — and the design doesn't say which. A wrapper design must enumerate the wrapped tool's contract (config schema it accepts, exit/restart behavior, what it cleans up) or the wrapper's own scope is undefined. The generated YAML is also invented ad-hoc (format! strings) with no reference to outrunner's actual schema, no schema version, and no validation that outrunner accepts it.",
+        "recommendation": "Add a 'Contract with gha-outrunner' section: exact config schema (with a version field), which lifecycle phases outrunner owns, its failure/restart semantics, and how the wrapper observes it (exit codes, status API, log format). Every gap in this review should be explicitly assigned to one side of the boundary.",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "I attempted to refute the finding and instead found additional confirming evidence.\n\n1. The doc genuinely never specifies the boundary. Read in full (292 lines, /tmp/.../scratchpad/gistfile1.txt): the only statements about gha-outrunner are \"Start gha-outrunner with correct flags/backend\" (line 33), the module table entry \"src/runner.rs — Start/stop/status of gha-outrunner\" (line 73-74), and \"Ensure prerequisites (gha-outrunner binary...)\". There is no section on registration tokens, GitHub auth, image management, post-job cleanup, restart/failure semantics, exit codes, or status observation. The closest counter-evidence is the module table (which defines the wrapper's modules) and the core principle \"Use GitHub Scale Sets + ephemeral runners by default\" — but neither assigns that behavior to either side, so the finding stands.\n\n2. gha-outrunner is a real tool (github.com/NetwindHQ/gha-outrunner) and its actual documented config schema (docs/reference/configuration.md) contradicts the doc's generated YAML on nearly every field, which makes the \"invented ad-hoc\" claim not just correct but understated. Real schema: top-level `url` and `token_file` are how registration happens (both ABSENT from the generated config — the runner could not register at all); backends are specified as a map key (`docker:`/`libvirt:`/`tart:` block), not a `backend:` scalar field as the doc generates; concurrency is `max_runners`, not `count`; `cpus`/`memory` (MiB) live inside the libvirt/tart block, not a `resources:` block with \"4G\"; docker requires an `image` field (missing); no documented `pids_limit` or docker memory/cpus resource block. The doc's config.rs format! strings would produce a config outrunner rejects or cannot use.\n\n3. The doc also invents a `DockerSysbox` backend variant that has no counterpart in outrunner's documented backends (docker/libvirt/tart only), and outrunner itself owns exactly the lifecycle phases the finding lists (scaleset registration, per-job provision/destroy, image expectations per its docs) — none of which the design acknowledges, and one of which (\"Scale Sets + ephemeral\") the design implicitly claims as its own principle.\n\nSeverity \"critical\" is not inflated: the wrapper's entire purpose is generating config for and driving outrunner, and the demonstrated schema divergence plus total absence of auth (url/token_file) means the design as written produces a non-functional system. The recommendation (add a \"Contract with gha-outrunner\" section, enumerate lifecycle ownership, validate against the real schema) is directly actionable. One minor quibble: the recommendation asks for a config \"version field,\" but outrunner's real schema has no version field, so that sub-point should be \"pin/reference the outrunner version and its documented schema\" rather than inventing a version field outrunner won't read — this does not change the verdict. Sources: https://github.com/NetwindHQ/gha-outrunner and https://raw.githubusercontent.com/NetwindHQ/gha-outrunner/main/docs/reference/configuration.md.",
+          "corrected_claim": "Finding is correct as stated; only refinement: instead of demanding a schema \"version field\" in the generated YAML (gha-outrunner's real schema has none), the contract section should pin the targeted gha-outrunner release and mirror its documented schema (top-level url/token_file, backend-name map keys, max_runners, backend-scoped cpus/memory) — the doc's generated YAML currently matches none of these."
+        }
+      },
+      {
+        "title": "Backend selection fails open on isolation — silent fallback to weakest backend",
+        "severity": "major",
+        "detail": "src/backend.rs `select()` silently degrades: macOS without Tart falls all the way through to plain `Backend::Docker`; Linux without KVM returns `DockerSysbox` with the comment 'assume Sysbox is installed or will be' — an assumption, not a check — and nothing verifies Docker itself, sysbox-runc, or libvirtd exist. `has_kvm` (a bare /dev/kvm stat) is also an insufficient proxy for 'libvirt is a sane default': libvirt requires a daemon, storage pools, networks, and images — a large setup burden on a typical Linux box where Docker is already running — yet the design auto-selects it with no prerequisite validation and no user confirmation. Worst, the selection isn't persisted-and-pinned: since `select()` is derived from live probes at init time, an environment change (tart uninstalled, /dev/kvm missing after a kernel update) would silently change the isolation class of a security-sensitive system. A tool whose stated purpose is 'strongest practical isolation' must fail closed: refuse to run with weaker isolation than configured unless the operator explicitly opts in.",
+        "recommendation": "Persist the chosen backend in config at init; at start, validate full prerequisites for that backend (daemon reachable, image available, sysbox runtime registered) and hard-fail with actionable instructions if missing. Fallback to a weaker isolation class must require an explicit flag/config (`isolation: allow-downgrade: true` or `--allow-container-isolation`), and plain Docker (no Sysbox) should arguably not be auto-selectable at all. Also reconsider libvirt-by-default vs Docker+Sysbox-by-default on Linux given the setup burden, or make `init` interactive about it.",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Verified against the design doc's actual skeleton code. Core claims are factually correct: (1) select() on macOS without Tart does fall through to plain Backend::Docker (lines 195-206); (2) Linux without KVM returns DockerSysbox with the literal comment \"assume Sysbox is installed or will be\" (line 203); (3) the skeleton's only capability probes are a bare /dev/kvm existence check and `which tart` (platform.rs, lines 179-180) — no verification of Docker daemon, sysbox-runc, or libvirtd; (4) /dev/kvm existence is genuinely an insufficient proxy for libvirt readiness (daemon, storage pools, networks, images all required). The doc's Core Principles state \"strongest practical isolation\" while the selection logic fails open to the weakest backend, so the fail-closed recommendation (persist+validate prerequisites at start, explicit opt-in flag for isolation downgrade) is sound and severity=major is justified for a security-isolation tool. Two sub-claims are overstated but do not invalidate the finding: (a) the \"selection isn't persisted\" claim is partially wrong — select() runs only at Init and config::generate() writes the chosen backend into outrunner.yml, which start consumes, so the backend IS persisted; the real gap is only that start never re-validates prerequisites and re-running init silently re-selects; (b) \"nothing verifies prerequisites\" ignores that the design's Data Flow step 4 explicitly lists \"Ensure prerequisites (gha-outrunner binary, Sysbox/Tart, etc.)\" and Next Steps item 4 is prerequisite installation logic — the design contemplates it, the skeleton just doesn't implement it.",
+          "corrected_claim": "Backend selection fails open on isolation: select() silently degrades (macOS without Tart → plain Docker; Linux without KVM → DockerSysbox on an unchecked assumption), and the only capability probes are a /dev/kvm stat and `which tart` — insufficient proxies for libvirt/Sysbox/Docker readiness. Correction to two sub-claims: the chosen backend IS persisted (init writes it into outrunner.yml, which start consumes), so post-init environment drift would more likely cause a loud start failure than a silent isolation-class change — the actual gaps are that `start` never validates the pinned backend's prerequisites and re-running `init` silently re-selects; also, the design's Data Flow does list \"Ensure prerequisites\" as a planned start step (unimplemented in the skeleton), so prerequisite checking is missing from the code, not from the design intent. The recommendation stands: validate full prerequisites for the pinned backend at start, hard-fail with actionable instructions, and require an explicit flag/config to run with a weaker isolation class than configured."
+        }
+      },
+      {
+        "title": "Hardcoded resource limits (4G/2cpu/count:2) ignore host capacity; no disk limits anywhere",
+        "severity": "major",
+        "detail": "src/config.rs hardcodes memory: 4G, cpus: 2, count: 2 for every host. On an 8GB laptop that is 100% of RAM committed to guests; on a 128-core GCE box it wastes the machine. Ironically src/platform.rs constructs `System::new_all()` and refreshes it, then discards all the data — host RAM/CPU are available and unused. More seriously, there are no disk limits of any kind: no per-VM disk size, no docker storage quota, no host free-space floor. Disk exhaustion is the most common self-hosted runner failure mode (and per this machine's own incident history, has taken hosts down), yet 'Resource Limits' in the section 3 table covers only memory/CPU. pids_limit: 100 for the Docker path is also likely too low for real build jobs (parallel make/npm easily exceeds it) — a hardcoded guess with no rationale.",
+        "recommendation": "Derive defaults from sysinfo: e.g. count = min(2, floor(host_cpus/2 / cpus_per_runner)), memory per runner capped so total guest RAM ≤ ~60-70% of host RAM. Add per-runner disk size for VM backends and docker storage-opt/quota for container backends, plus a host free-disk floor below which new jobs are refused. Make all of it overridable in config, and document the overcommit policy.",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "I attempted to refute the finding but every factual claim checks out against the design doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt):\n\n1. Hardcoded limits — CONFIRMED. `src/config.rs::generate` (doc lines 212-251) emits literal `count: 2`, `memory: 4G`, `cpus: 2` in the VM branch and `memory: 4g, cpus: 2, pids_limit: 100` in the Docker branch. Neither branch reads anything from `plat` except the OS label string. The 8GB-laptop arithmetic is correct: 2 runners x 4G = 8G = 100% of host RAM committed to guests.\n\n2. Discarded sysinfo data — CONFIRMED. `src/platform.rs::detect` (doc lines 165-183) constructs `System::new_all()` and calls `sys.refresh_all()`, then never touches `sys` again; all four Platform fields come from `cfg!`, `env::consts::ARCH`, `Path::exists(\"/dev/kvm\")`, and `which(\"tart\")`. The irony claim is accurate — host RAM/CPU data is gathered and thrown away.\n\n3. No disk limits — CONFIRMED. The doc contains zero disk provisions: no per-VM disk size, no docker `storage-opt`, no host free-space floor. The section 3 table's \"Resource Limits\" column lists only \"Per-VM\"/\"Docker limits\", and the generated YAML has only memory/cpus/pids. The \"Next Steps\" list (items 1-4) also omits disk, so this is a design gap, not merely deferred skeleton work — despite the doc's stated core principle \"Apply consistent resource protection everywhere.\"\n\n4. Incident-history relevance — CONFIRMED. This repo's two most recent commits (0794779451, b2c58658cd) add pre-job-hook disk cleanup to the Linux colima runners, and self-hosted-colima/scripts/ contains cleanup.sh, hard-cleanup.sh, cleanup-inner.sh, resize-disk.sh, and pre-job-hook.sh — plus the recorded 2026-06-14 disk-fill incident (limactl cron no-op). Disk exhaustion is demonstrably this environment's dominant runner failure mode, so calling its omission major is not inflated severity.\n\n5. pids_limit: 100 — the weakest claim (a judgment call, no doc rationale exists either way), but it is defensible: cgroup pids counts threads, not just processes; Docker's default is unlimited; a parallel `make -j`/npm build with multithreaded compilers can plausibly exceed 100. The finding hedges appropriately (\"likely too low\").\n\nMinor nitpicks that do not rise to refutation: the doc is an explicit skeleton with placeholder code, and VM backends may not commit guest RAM upfront (ballooning) — but the finding critiques the design's resource-limit model (section 3 table + config generation), which is presented as the design, not a placeholder. The recommendation (sysinfo-derived defaults — the dependency is already declared in Cargo.toml — per-runner disk size, docker storage quota, free-disk floor, config overrides) is proportionate and directly actionable. Finding stands."
+        }
+      },
+      {
+        "title": "Config written to CWD with no versioning, validation, or secrets story",
+        "severity": "major",
+        "detail": "src/config.rs does `std::fs::write(\"outrunner.yml\", config)` — relative to whatever directory the user happens to be in. This breaks immediately under service management (systemd/launchd have their own working directories), makes `start` from a different directory silently fail or pick up a different machine's config, clobbers any existing file without confirmation (re-running `init` destroys user edits), and scatters config across the filesystem. There is no schema `version:` field for future migration, `runner::start()` never reads or validates the config before launching, and there is no stated location or handling for the secret material (tokens) the system will inevitably need — with YAML-in-cwd the path of least resistance is a token committed to a repo.",
+        "recommendation": "Use platform config dirs ($XDG_CONFIG_HOME/gha-isolated/ on Linux, ~/Library/Application Support/gha-isolated/ on macOS), add `version: 1` to the schema with a migration policy, make `init` refuse to overwrite without --force, validate config (deserialize into structs, not format! strings) at start, and add an explicit secrets section: credentials referenced by path/keychain entry, never inlined in the YAML, file mode 0600.",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Every factual claim checks out against the doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt). Line 248 shows `std::fs::write(\"outrunner.yml\", config)` with no path resolution — CWD-relative. The overwrite-without-confirmation claim is correct (fs::write truncates unconditionally, no existence check or --force). No `version:` field exists in either generated YAML variant. `runner::start()` (lines 256-260) is a println placeholder that never reads or validates config, contradicting the doc's own Data Flow step 3 (\"Generate/validate outrunner.yml\"); serde is declared but unused, config built via format! strings. The secrets claim is correct: the doc mandates \"GitHub Scale Sets + ephemeral runners by default,\" which requires PAT/App/registration-token credentials, yet tokens are never mentioned anywhere. Severity \"major\" is justified rather than inflated because service management (src/service.rs, InstallService) is explicitly in v1 scope, and systemd/launchd working directories make CWD-relative config break a stated feature of the same document. The only partial mitigation is Next Steps item 3 (\"Better config model (proper structs + serialization)\"), which anticipates the struct-validation recommendation but not the location, versioning, overwrite, or secrets gaps. One trivial nit: \"silently fail\" is slightly speculative (gha-outrunner would likely error loudly on missing config), but the alternative failure mode (\"pick up a different directory's config\" silently) is accurate. The recommendation is standard, proportionate best practice."
+        }
+      },
+      {
+        "title": "No security/threat model: per-backend escape surface, docker.sock, egress, fork-PR policy all unaddressed",
+        "severity": "major",
+        "detail": "For a tool whose entire value proposition is isolation, the design contains no threat model. Unstated: (1) what jobs can reach on the host per backend — in the plain-Docker fallback, jobs needing docker-in-docker conventionally get /var/run/docker.sock mounted, which is root-equivalent host access, exactly what the tool exists to prevent; the design neither forbids nor addresses it (Sysbox exists to solve this, but the fallback tier skips Sysbox). (2) Network policy: guests presumably get unrestricted egress and, worse, host-LAN access (libvirt default NAT network reaches the host and local network — metadata endpoints on GCE included, a credential-theft vector). (3) What env/secrets the runner process exposes to jobs. (4) The classic self-hosted footgun: whether these runners may serve public repos / fork PRs, where any drive-by PR gets code execution. Ephemerality mitigates persistence but not exfiltration or lateral movement.",
+        "recommendation": "Add a security section with a per-backend isolation matrix (what an escaped job reaches). Explicitly: never mount docker.sock in the fallback tier; define guest network policy (block host/LAN/metadata-IP 169.254.169.254 by default, optional egress allowlist); document env hygiene (registration credentials must not be in the job-visible environment — another argument for JIT config); and make `init` refuse or loudly warn when pointing at a public repo.",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "The finding is factually correct on every point. (1) The design doc (/tmp/.../scratchpad/gistfile1.txt) contains no security section or threat model — its only security-relevant content is \"ephemeral runners by default\", VM preference, and resource limits. (2) The docker.sock concern is corroborated by the repo itself: self-hosted-oss/docker-compose.docker-sock.yml mounts /var/run/docker.sock into runner containers and self-hosted-oss/README.md line 236 documents it as the supported DinD path — so the convention the reviewer warns about is established practice in this repo, unaddressed by the design. The finding even understates the Sysbox gap: backend.rs \"assume Sysbox is installed or will be\" does no verification, and config.rs's docker-path config omits runtime: sysbox-runc entirely, so even the \"Docker+Sysbox\" tier doesn't actually engage Sysbox as written. The fallback tier is plain docker, as claimed. (3) The network claim is properly hedged and technically sound: libvirt default NAT gives guests host/LAN reachability, and the GCE tier (Docker) reaches 169.254.169.254 metadata by default — a documented credential-theft vector. (4) The fork-PR/public-repo risk is GitHub-documented, and the init flow has no visibility check or warning. (5) Severity \"major\" is proportionate given the tool's stated value proposition is isolation. The recommendation (per-backend isolation matrix, forbid docker.sock in fallback, block metadata/host/LAN by default, env hygiene/JIT config, public-repo warning in init) is concrete and standard practice for self-hosted runner hardening."
+        }
+      },
+      {
+        "title": "Service management is 'not yet implemented' but is a prerequisite for real use",
+        "severity": "major",
+        "detail": "A runner host is by definition a long-lived unattended service, but the design's entire launchd/systemd story is a stub printing 'Service installation not yet implemented' (src/main.rs InstallService arm), with src/service.rs listed in the module table but given zero design content. Undesigned: restart-on-crash policy for gha-outrunner, start-on-boot, whether it runs as a dedicated user or the login user (launchd LaunchAgent vs LaunchDaemon matters for Tart, which needs a user session on macOS), log routing (journald vs files), environment/credential injection into the service, and clean shutdown ordering (drain running jobs vs kill). Without this, the tool is a foreground toy; with it done wrong, you get zombie runners after reboots.",
+        "recommendation": "Design service management now even if implemented later: unit/plist templates checked into the repo, KeepAlive/Restart=on-failure with backoff, an explicit drain-then-stop sequence, dedicated user on Linux, documented decision on LaunchAgent (user session, required for Tart) for macOS, and credential delivery via the service manager's mechanism (systemd Environment=/credentials, launchd wrapper) rather than .env files.",
+        "from": "architecture",
+        "verdict": {
+          "reasoning": "Every factual claim verified against the doc: the InstallService arm in the src/main.rs skeleton is literally `println!(\"Service installation not yet implemented\")` (doc line 148); src/service.rs appears only as a one-line module-table entry with no skeleton code (main.rs doesn't even declare `mod service;`); a full-doc grep confirms zero content on restart policy, boot start, run-as user, LaunchAgent vs LaunchDaemon, log routing, credential injection, or drain-vs-kill shutdown. The doc's own architecture diagram (line 26) lists 'Service Management (systemd / launchd)' as a core component, so the gap is within the doc's stated scope. The Tart claim is correct: Tart uses Virtualization.framework, which requires a user session, making LaunchAgent-vs-LaunchDaemon a real design-constraining decision. The recommendation mirrors this repo's existing hard-won conventions (self-hosted-oss/launchd/ plist templates, install.sh as source of truth, no .env credentials), so it is grounded, not speculative. The only counterargument — that the doc already lists service installation as a Next Step — doesn't refute the finding, because acknowledging an implementation TODO is not a design, and severity 'major' (not critical) appropriately allows deferred implementation while demanding the design decisions now.",
+          "refuted": false
+        }
+      },
+      {
+        "title": "Observability limited to a stub status command — no logs, health, or alerting design",
+        "severity": "major",
+        "detail": "src/runner.rs `status()` prints 'Not yet implemented' and nothing in the architecture defines what status even means: is the runner process alive, is it registered with GitHub, is it idle vs executing a job, how many VMs exist vs expected? There is no `logs` command (where do outrunner logs, per-VM console logs, and job logs go?), no health-check endpoint or exit-code contract for external monitors, no metrics (jobs run, failures, queue latency, disk headroom), and no alerting hook for the failure modes that matter (runner offline, registration expired, disk full). For an unattended service this means failures are discovered when CI queues stall.",
+        "recommendation": "Define a status model with explicit states per runner (provisioning / registered-idle / busy / offline / orphaned) sourced from both local state and the GitHub API; add `gha-isolated logs [--follow]` with documented log locations; add `gha-isolated health` returning a machine-readable exit code suitable for cron/monitoring; and provide an alerting hook (exec-a-command or webhook on state transitions) so operators can wire it to their notifier.",
+        "from": "architecture",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Every factual claim verified against the doc: (1) src/runner.rs status() prints exactly \"Status: Not yet implemented\" (doc lines 267-270); (2) no status semantics are defined anywhere — sections 2 and 4 only say \"start/stop/status\" with no state model; (3) the CLI has only Init/Start/Stop/Status/InstallService — no logs command, and no log locations documented; (4) the words health, metric, alert, monitor, webhook appear nowhere in the doc; (5) the unattended-service framing is the doc's own (it designs systemd/launchd install-service). The strongest refutation angle — \"it's a self-declared skeleton, so a stub is expected\" — fails because the doc titles itself a \"Full Self-Contained Design\" and its Next Steps roadmap (runner.rs impl, service install, config model, prerequisite install) also omits observability entirely, so the gap exists in the design and the plan, not just the placeholder code. Major severity is appropriate for a persistent daemon managing CI runners with zero observability design. The recommendation (status state model from local state + GitHub API, logs --follow, health with machine-readable exit codes, alerting hook) matches standard practice for runner managers (e.g., actions-runner-controller) and is feasible within the doc's architecture; at most the webhook alerting piece could be deferred past v1, which does not undermine the finding."
+        }
+      },
+      {
+        "title": "serde_yaml is deprecated/archived — do not build a new tool on it",
+        "severity": "critical",
+        "detail": "Cargo.toml (gistfile1.txt line 91) declares `serde_yaml = \"0.9\"`. dtolnay archived the serde_yaml repo in March 2024; the final release is 0.9.34+deprecated and it receives no fixes. A brand-new v1 tool whose core job is generating/validating YAML config should not start life on an archived parser. Worse, the skeleton never actually calls serde_yaml — see the next finding — so right now it is a dead dependency on an unmaintained crate.",
+        "recommendation": "Pick a maintained YAML path before any code lands: `serde_yaml_ng` or `serde_norway` (maintained forks with the same API), or sidestep YAML entirely if gha-outrunner accepts JSON (`serde_json` is first-party maintained). Decide once in v1; migrating serializers later touches every config test.",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "All factual claims verified against primary sources. (1) The design doc's Cargo.toml at line 91 of gistfile1.txt declares serde_yaml = \"0.9\". (2) GitHub API confirms dtolnay/serde-yaml is archived (archived: true, last push 2024-03-25). (3) crates.io API confirms the final release is 0.9.34+deprecated (2024-03-25), matching the finding exactly. (4) The dead-dependency claim is correct: serde_yaml appears only in the Cargo.toml; the skeleton's src/config.rs generates outrunner.yml via format!/raw string literals + std::fs::write and never imports serde_yaml. (5) The recommended alternatives are real and maintained: serde_yaml_ng (0.10.0, ~5.7M downloads) and serde_norway (0.9.42, updated Dec 2024, ~7.6M downloads) both exist on crates.io as API-compatible forks; serde_json is first-party maintained. Severity is not inflated for a design-stage review: the dependency sits on the tool's core responsibility (YAML config generation/validation), and choosing the serialization path before v1 code lands is exactly when the decision is cheapest. The only nuance is that 0.9.34+deprecated still compiles and works today — the risk is unmaintained-dependency/supply-chain, not immediate breakage — but the finding claims only that it \"receives no fixes,\" which is accurate. The recommendation is sound and actionable."
+        }
+      },
+      {
+        "title": "Config generated via format!/string templates while serde+serde_yaml sit unused — typed config must be v1, not 'future work'",
+        "severity": "critical",
+        "detail": "src/config.rs (lines 212–251) builds outrunner.yml by string interpolation (`format!(r#\"...\"#, ...)`) and a raw string literal, then the design's own 'Next Steps' item 3 (line 290) defers 'Better config model (proper structs + serialization)' to later. Meanwhile Cargo.toml pulls serde with derive and serde_yaml, and neither is imported anywhere in the skeleton. String-templated YAML is whitespace-fragile (the leading newline in the r#\" block already produces a file starting with a blank line), cannot be validated, cannot round-trip for `status`/`validate` subcommands, and any user-influenced value (labels, counts, future runner names) becomes a YAML-injection vector. This is the single cheapest thing to get right on day one and the most expensive to retrofit.",
+        "recommendation": "Define `#[derive(Serialize, Deserialize)] struct OutrunnerConfig { runners: BTreeMap<String, RunnerSpec> }` with `RunnerSpec { backend: BackendKind, labels: Vec<String>, count: u32, resources: Resources }` and emit via the chosen serde YAML backend. Delete the format! templates. This also gives you `init --dry-run` (print serialized config) and config re-reading for free.",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "All factual claims verified against the doc: (1) config.rs generate() spans exactly lines 212-251 and builds outrunner.yml via format!(r#\"...\"#) plus a raw string literal, written with std::fs::write; (2) Next Steps item 3 at line 290 defers 'Better config model (proper structs + serialization)'; (3) Cargo.toml (lines 90-91) declares serde with derive and serde_yaml 0.9, and no use statement in any skeleton module imports either; (4) both raw strings open with a newline after r#\", so the emitted file genuinely starts with a blank line; (5) no deserialization path exists, so status/validate cannot round-trip config. The recommendation (serde-derived OutrunnerConfig/RunnerSpec structs, serialize via a serde YAML backend, delete format! templates) is standard practice and uses dependencies the doc already declares — the doc's own dependency list contradicts its deferral. Two minor overstatements do not rise to refutation: the leading blank line is cosmetic (valid YAML), and the YAML-injection claim is prospective (current interpolated values — backend literal and plat.os from cfg! — are program-controlled, not user-influenced), but the finding itself frames injection as a future-input risk ('labels, counts, future runner names'), which is fair for a design review. Severity 'critical' is at the aggressive end for a skeleton, but the retrofit-cost argument is coherent and the factual basis is fully correct, so the finding stands."
+        }
+      },
+      {
+        "title": "/dev/kvm existence check ignores permissions — libvirt backend gets selected, then fails at runtime for users not in the kvm group",
+        "severity": "major",
+        "detail": "src/platform.rs line 179: `let has_kvm = std::path::Path::new(\"/dev/kvm\").exists();`. On virtually every Linux distro /dev/kvm exists whenever the kvm module is loaded, but it is `crw-rw---- root:kvm` — a user not in the `kvm` group cannot open it. backend::select (lines 199–201) will pick Libvirt, config::generate will write a libvirt config, and the actual runner start will fail with EACCES much later, far from the decision point. libvirt adds a second layer: the user typically also needs the `libvirt` group and a running libvirtd, none of which is checked.",
+        "recommendation": "Probe access, not existence: attempt `std::fs::OpenOptions::new().read(true).write(true).open(\"/dev/kvm\")` and treat EACCES as 'present but unusable' with an actionable message ('add yourself to the kvm group: sudo usermod -aG kvm $USER, then re-login'). Also check `which(\"virsh\")`/libvirtd socket before committing to the Libvirt backend. This belongs in a per-backend `validate()` (see trait finding).",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "The finding is factually correct on every load-bearing point. Verified against the doc: line 179 is exactly `let has_kvm = std::path::Path::new(\"/dev/kvm\").exists();`, and backend::select (lines 195-201) picks Backend::Libvirt for linux+has_kvm with no access, virsh, or libvirtd checks anywhere in the doc (grep confirms zero occurrences of virsh/libvirtd/permission handling). Verified on a real Ubuntu host: /dev/kvm is crw-rw---- root:kvm (0660) and the user is not in the kvm or libvirt groups, matching the described distro default. The recommendation (open-probe treating EACCES as present-but-unusable, checking virsh/libvirtd before committing to the backend, per-backend validate()) is standard and sound. One minor overstatement: \"virtually every Linux distro\" ignores that (a) systemd-logind uaccess ACLs grant locally-logged-in desktop users rw on /dev/kvm even without kvm group membership — a live open() probe on this host succeeded via the ACL despite no group membership — and (b) Fedora/Arch follow systemd's v240+ default of mode 0666. However, this tool manages headless CI runner services, where logind session ACLs do not apply, so the EACCES failure mode is real in the actual deployment context on Debian/Ubuntu. Severity \"major\" is justified: the design commits to a backend at detect time and fails with a confusing error far from the decision point on the tool's mainline Linux path.",
+          "corrected_claim": "The existence-only check on /dev/kvm (src/platform.rs line 179) and unconditional Libvirt selection (backend.rs lines 199-201) are correct as described, and the doc has no libvirtd/virsh/permission validation. One caveat: the claim that a non-kvm-group user \"cannot open it\" on virtually every distro is overstated — Fedora/Arch default /dev/kvm to mode 0666 (systemd v240+), and on desktop sessions systemd-logind uaccess ACLs grant the logged-in user access without kvm group membership. The failure mode is real specifically for headless service users on 0660 root:kvm distros (Debian/Ubuntu servers) — which is precisely the deployment context of a self-hosted runner manager, so the recommendation (access probe + virsh/libvirtd check in a per-backend validate()) stands."
+        }
+      },
+      {
+        "title": "backend.rs 'assume Sysbox is installed' is a landmine, and the plain-Docker fallback is unreachable on Linux",
+        "severity": "major",
+        "detail": "src/backend.rs line 203: `return Backend::DockerSysbox; // assume Sysbox is installed or will be`. Nothing verifies that the docker daemon is running, that `sysbox-runc` exists, or that Docker's runtimes include sysbox (`docker info --format '{{json .Runtimes}}'`). The selection-logic table (lines 56–60) explicitly documents a 'Fallback → docker' row, but the code can never return `Backend::Docker` on Linux — that arm (line 205) is only reachable when os is neither macos nor linux, i.e. an unknown OS gets handed the Docker backend with zero capability checks (Windows would 'select' Docker too). Failure scenario: fresh GCE VM without Sysbox → init happily selects DockerSysbox → start fails with 'unknown runtime: sysbox-runc'.",
+        "recommendation": "Selection must be capability-driven: check docker daemon reachability, then sysbox runtime presence; fall back DockerSysbox → Docker → hard error with install instructions. Unknown OS must be an error (`bail!(\"unsupported platform: {os}\")`), never a silent Docker default.",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "All factual assertions verified against the design doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt). (1) Line 203 is exactly `return Backend::DockerSysbox; // assume Sysbox is installed or will be`. (2) platform.rs only checks /dev/kvm and `which tart`; nothing verifies docker daemon, sysbox-runc, or Docker runtimes — config.rs's DockerSysbox arm doesn't even emit sysbox config. (3) The selection table (doc lines 56–60) does document a 'Fallback → docker' row. (4) Tracing select(): on Linux, has_kvm → Libvirt, else unconditionally DockerSysbox, so Backend::Docker is genuinely unreachable on Linux — the documented fallback is dead code on its target platform. (5) The GCE failure scenario is realistic: GCE VMs lack /dev/kvm unless nested virt is explicitly enabled, so a fresh VM without sysbox selects DockerSysbox and `docker run --runtime=sysbox-runc` would fail with 'unknown runtime'. The doc claims the skeleton is 'runnable today' and its Data Flow step 4 promises prerequisite checks the design never specifies, so this is a design gap, not merely an unimplemented stub. The recommendation (capability-driven selection, bail on unknown OS) is standard and sound; 'major' severity is proportionate since the function's sole job is backend selection and it contradicts the design's own table. One minor inaccuracy: the Docker arm is reachable not only on unknown OSes but also on macOS without Tart (line 196 requires os=='macos' && has_tart) — this understates the problem and strengthens, not weakens, the finding.",
+          "corrected_claim": "The finding stands as written, with one correction: the `Backend::Docker` arm (line 205) is reachable not only when os is neither macos nor linux, but also on macOS when Tart is not installed — so the silent, capability-unchecked Docker default covers unknown OSes AND Tart-less Macs, while remaining unreachable on Linux where the table documents it as the fallback."
+        }
+      },
+      {
+        "title": "sysinfo pulled in only to run System::new_all()+refresh_all() whose result is thrown away",
+        "severity": "major",
+        "detail": "src/platform.rs lines 166–167 create `let mut sys = System::new_all(); sys.refresh_all();` and then never read `sys` — the compiler will even warn about the unused variable. `System::new_all()` enumerates every process, CPU, and memory stat on the host (hundreds of syscalls / procfs reads) purely as dead weight in a function whose actual work is `cfg!`, `env::consts::ARCH`, a Path::exists, and a `which` lookup. OS detection needs no crate at all — `std::env::consts::OS` is free and compile-time-truthful.",
+        "recommendation": "Two honest options: (a) drop sysinfo from Cargo.toml entirely for v1; or (b) actually use it — read total memory/CPU count to derive the resource limits that config.rs currently hardcodes (`memory: 4G, cpus: 2, count: 2` regardless of whether the host has 8 or 128 GB). Option (b) turns the dep from waste into the feature the tool claims to provide ('consistent resource protection everywhere'). If you keep it, use targeted refreshes (`System::new_with_specifics(RefreshKind::new().with_memory(...))`), never new_all.",
+        "from": "rust",
+        "verdict": {
+          "reasoning": "Verified directly against the design doc: sysinfo = \"0.30\" is in the Cargo.toml skeleton (line 93); platform.rs's detect() creates `let mut sys = System::new_all(); sys.refresh_all();` (lines 166-167) and never reads sys — all actual detection uses cfg!/env::consts/Path::exists/which. sysinfo appears nowhere else in the skeleton, so the dep is dead weight. config.rs hardcodes memory: 4G, cpus: 2, count: 2, and doc line 11 states the goal 'Apply consistent resource protection everywhere', validating recommendation (b). The only factual error is the claim that 'the compiler will even warn about the unused variable' — it will not, because sys.refresh_all() is a use of the variable and mut is required by refresh_all(&mut self); the code compiles warning-free. That detail error slightly strengthens the finding (the dead work is silent) and does not change the verdict. Severity major is reasonable for a design doc whose skeleton contradicts its own stated goal.",
+          "refuted": false,
+          "corrected_claim": "The finding is correct except one detail: rustc will NOT emit an unused-variable warning, because `sys.refresh_all()` is a use of `sys` (and `mut` is required by `refresh_all(&mut self)`). The dead System::new_all()/refresh_all() work compiles silently — the results are still thrown away, sysinfo is otherwise unused in the skeleton, and the recommendation (drop the dep, or use it with targeted RefreshKind refreshes to derive the resource limits config.rs hardcodes as memory: 4G / cpus: 2 / count: 2) stands."
+        }
+      },
+      {
+        "title": "std::fs::write(\"outrunner.yml\") writes to whatever cwd happens to be and silently clobbers existing config",
+        "severity": "major",
+        "detail": "src/config.rs line 248: `std::fs::write(\"outrunner.yml\", config)?`. Relative path means `gha-isolated init` run from $HOME, from /, or from a systemd unit (cwd=/) scatters config files unpredictably — and the very next feature on the roadmap is `install-service`, where a service's cwd is not the user's shell cwd. It also overwrites an existing outrunner.yml with no prompt, no backup, no --force. There is no `.context()` on the write, so a permission failure reports a bare OS error with no path context.",
+        "recommendation": "Add the `directories` crate and write to `ProjectDirs::from(\"\", \"\", \"gha-isolated\").config_dir()/outrunner.yml` (Linux: ~/.config/gha-isolated/, macOS: ~/Library/Application Support/). Refuse to overwrite unless --force. Wrap IO in `.with_context(|| format!(\"writing {}\", path.display()))`. Store the resolved path so start/stop/status read the same file the init wrote.",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Every factual element of the finding verifies against the doc: line 248 is exactly `std::fs::write(\"outrunner.yml\", config)?;` with a cwd-relative path, no overwrite guard (Init takes no flags, fs::write truncates unconditionally), and no .context() (anyhow::Context is never imported despite anyhow being a dependency). The relative-path concern is not speculative: runner.rs line 258 reads the same relative \"outrunner.yml\", and the doc itself defines an InstallService subcommand (line 124) and lists systemd/launchd service installation as next-step item 2 (line 289) — systemd units default to cwd=/, so a service would miss config written to the operator's shell cwd. The recommendation is sound and consistent with the doc's own framing: Init is described as \"Initialize configuration for this machine\" (machine-scoped, not per-project docker-compose-style), making an XDG/ProjectDirs config location the correct contract; --force gating and .with_context() are standard, low-cost fixes. The \"it's only a skeleton\" objection does not refute severity — design review is precisely where a config-location contract spanning config.rs, runner.rs, and the planned service.rs should be fixed, and silent clobber of existing config is a data-loss-class defect. Major severity is proportionate. No implementation exists in /home/jleechan/projects/worktree_runner that supersedes or fixes the skeleton."
+        }
+      },
+      {
+        "title": "Stringly-typed Platform (os: String) with runtime string comparisons instead of an enum",
+        "severity": "major",
+        "detail": "src/platform.rs lines 157–183 model the OS as `String` (\"macos\"/\"linux\"/\"unknown\") and backend.rs compares with `plat.os == \"macos\"` (line 196). The cfg! macro is compile-time constant, so this whole if/else chain collapses to a single known string per build — the runtime representation adds typo risk (no compiler help if backend.rs checks \"macOS\") and an 'unknown' state that then flows into backend selection (see the unreachable-Docker finding). The design targets exactly two OSes for v1; that is an enum, not a string.",
+        "recommendation": "`enum Os { MacOs, Linux }` and make `detect()` return `Result<Platform>` that errors on unsupported targets. Alternatively use conditional compilation (`#[cfg(target_os = ...)]` modules) so the macOS build doesn't even contain libvirt selection code. Keep `arch` as `std::env::consts::ARCH` but consider an `enum Arch { Aarch64, X86_64 }` since Tart is Apple-Silicon-only per the design (line 14) — the current code would happily pick Tart on an Intel Mac if tart is on PATH.",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Every factual claim checks out against the doc. (1) Platform struct at doc lines 158–163 models os as String; detect() (lines 165–183) assigns \"macos\"/\"linux\"/\"unknown\" via a cfg! chain, and cfg! is indeed compile-time constant, so the runtime string encodes only build-time information. (2) backend.rs line 196 compares `plat.os == \"macos\"` exactly as quoted, with no compiler protection against typos. (3) The \"unknown\" value does flow into select(), falling through to Backend::Docker (line 205), tying into the unreachable-Docker finding. (4) The design's v1 scope (doc lines 13–17) is exactly macOS + Linux, so an enum is the natural model. (5) Doc line 14 restricts Tart to Apple Silicon, and select() never consults plat.arch — the arch field is collected (line 177) but unused — so the code would select Tart on any macOS with tart on PATH. The only weakness is practical: Tart cannot actually run on Intel Macs, so that specific scenario is nearly impossible in the field, but the code-level observation (arch unchecked) remains true. The recommendation (enum Os, Result-returning detect, or cfg-gated modules, plus an Arch enum) is idiomatic Rust and consistent with the design's stated scope. Severity \"major\" is defensible for a design doc since the stringly-typed Platform is the foundational data model for backend selection and directly creates the undefined \"unknown\" path. No concrete contrary evidence found."
+        }
+      },
+      {
+        "title": "No backend abstraction — select() returns a bare enum and every future module will match on it; v1 needs a Backend trait",
+        "severity": "major",
+        "detail": "backend.rs returns `enum Backend` and nothing else. As runner.rs, config.rs, service.rs, and limits.rs get implemented, each will grow a `match backend { Tart => ..., Libvirt => ..., DockerSysbox => ..., Docker => ... }` — 4-way branching duplicated across 4+ files. The skeleton already shows the smell: config.rs matches on backend and does string-level branching inside (line 227's inline `if *backend == Backend::Tart` ternary inside a format! argument). There is also no `validate()` step anywhere, which is exactly where the /dev/kvm-permissions and sysbox-presence checks belong.",
+        "recommendation": "Credible v1 layout:\n  src/main.rs — clap CLI, dispatch only\n  src/platform.rs — Os/Arch enums + capability probes (kvm_usable(), tart_version(), docker_info())\n  src/backend/mod.rs — `trait Backend { fn name(&self) -> &str; fn detect(plat: &Platform) -> Option<Self>; fn validate(&self) -> Result<()>; fn render_config(&self, limits: &Limits) -> OutrunnerConfig; fn start/stop/status(&self, cfg: &Paths) -> Result<...>; }` plus a `select(plat) -> Result<Box<dyn Backend>>` that tries Tart → Libvirt → DockerSysbox → Docker in order, calling validate() on each\n  src/backend/{tart.rs, libvirt.rs, docker.rs} — one impl per backend (sysbox = docker with a runtime field)\n  src/config.rs — serde structs + path resolution (directories crate)\n  src/limits.rs — derive Limits from sysinfo host stats\n  src/service.rs — systemd unit / launchd plist generation\nThis makes 'add a backend' a one-file change and gives the fallback chain a single home.",
+        "from": "rust",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "All factual claims verify against the doc at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt: (1) backend.rs (doc lines 184-206) contains only a bare 4-variant enum and select() with no methods or validation; (2) the cited line 227 is exactly the inline `if *backend == Backend::Tart { \"tart\" } else { \"libvirt\" }` ternary inside a format! argument, nested inside a match on backend in config.rs; (3) no validate() exists anywhere — worse, the doc contradicts itself: its module table says backend.rs owns 'selection + validation' and data-flow step 4 says 'Ensure prerequisites (Sysbox/Tart)', yet select() literally comments '// assume Sysbox is installed or will be' and platform.rs checks only /dev/kvm existence, not permissions; (4) the 4-way-match-proliferation projection is grounded — config.rs already branches, and the doc's data flow ('Start gha-outrunner with correct flags/backend') guarantees runner.rs and service.rs will too. The repo contains no Rust code that changes this. Severity 'major' is appropriate for a design review since the doc promises validation twice and delivers none. Minor recommendation flaws exist but don't refute: the proposed `fn detect(plat) -> Option<Self>` is not object-safe and can't live in the same trait used as Box<dyn Backend>, and for a closed set of 4 backends an enum with inherent impl methods is an equally idiomatic alternative to a trait — the finding is right about the problem (scattered per-backend branching, missing validate()) but over-prescriptive that a trait specifically is the only fix.",
+          "corrected_claim": "The finding is factually correct: backend.rs exposes only a bare enum, config.rs already shows nested backend branching (line 227), and no validate() step exists despite the doc's own module table and data flow promising 'selection + validation' and prerequisite checks. However, the recommendation should say v1 needs backend-specific behavior centralized behind ONE abstraction with a validate() step — either a Backend trait (noting `detect() -> Option<Self>` as written is not object-safe and must be a separate constructor, not a method on a Box<dyn Backend>-compatible trait) or, equally idiomatic for a closed set of 4 backends, the existing enum with inherent impl methods (validate/render_config/start/stop/status) so all per-backend matches live in one file."
+        }
+      },
+      {
+        "title": "gha-isolated design has zero disk-management story — the single largest incident class in the existing fleet",
+        "severity": "critical",
+        "detail": "The proposal's generated config (src/config.rs in /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt) sets only memory/cpus (4G/2 CPU) — no VM disk size, no disk-pressure threshold, no cleanup hooks. The existing repo's history shows disk exhaustion is THE recurring incident: /home/jleechan/projects/worktree_runner/self-hosted-colima/README.md documents a 60 GiB VM that 'filled up under normal use' and the 120 GiB sizing table (~50 GB overlay diffs, ~20 GB workdirs, ~30 GB headroom); the fleet needed three layers of mitigation — a per-job pre-job hook that clears pip cache + workspace below 5 GB free (self-hosted-colima/scripts/pre-job-hook.sh and self-hosted-oss/pre-job-hook.sh, DISK_MIN_KB=5242880), a daily cron (scripts/cleanup.sh: git gc, diag prune, docker prune), and a weekly hard-cleanup (scripts/hard-cleanup.sh: down → prune -af → up, auto-skip below 70%, bails if a runner is mid-job). The 2026-06-14 disk-fill incident (memory: limactl-shell cron silent no-op, PR #7582) came from exactly this class. Note: true per-job ephemeral VMs (the proposal's Tart/libvirt path) would eliminate most of this class by giving each job a fresh disk image — but only if the design actually says so and sizes the base image; the skeleton does neither.",
+        "recommendation": "Any adoption must carry over: explicit VM/volume disk sizing (120 GiB rationale), the ACTIONS_RUNNER_HOOK_JOB_STARTED pre-job disk-cleanup hook (5 GB threshold + chmod -R u+w on _actions for the read-only-tar bug), and scheduled cleanup for any persistent state. If ephemeral VMs are used, document that base-image freshness replaces the cleanup crons and size the image ≥ per-job peak (checkout + toolchains + artifacts).",
+        "from": "infra-fit",
+        "verdict": {
+          "reasoning": "Every factual claim in the finding was verified against the design doc and the repo, and I found no basis to refute it.\n\n(1) Design doc has zero disk story — CONFIRMED. I read all 292 lines of /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt. The generated config (src/config.rs, lines 212-251) sets only `memory: 4G` / `cpus: 2` (plus `pids_limit: 100` on the Docker path). There is no VM disk size, no base-image sizing, no disk-pressure threshold, no cleanup hook, no ACTIONS_RUNNER_HOOK_JOB_STARTED, and no scheduled cleanup anywhere in the doc. Line 10 says \"Use GitHub Scale Sets + ephemeral runners by default\" but never states that ephemeral VMs replace cleanup, nor sizes the image — exactly as the finding says (\"the skeleton does neither\").\n\n(2) Disk exhaustion is the documented recurring incident class — CONFIRMED. /home/jleechan/projects/worktree_runner/self-hosted-colima/README.md line 200: \"The previous default of 60 GiB filled up under normal use\"; lines 186-198 contain the \"Why 120 GiB\" table with ~50 GB overlay diffs (line 193), ~20 GB workdirs (line 194), ~30+ GB headroom (line 197); line 173: workdir artifacts are \"enough to fill the 120 GB VM in a few hours of active CI.\"\n\n(3) Three mitigation layers exist exactly as described: (a) pre-job hooks — both /home/jleechan/projects/worktree_runner/self-hosted-colima/scripts/pre-job-hook.sh (line 12) and /home/jleechan/projects/worktree_runner/self-hosted-oss/pre-job-hook.sh (line 26) have `DISK_MIN_KB=\"${DISK_MIN_KB:-5242880}\"` (5 GB) plus `chmod -R u+w \"${RUNNER_WORKDIR}/_actions\"` for the read-only-tar bug; (b) daily cleanup — cleanup-inner.sh does `git gc --prune=now --aggressive` on all workdirs, prunes _diag/ files >1 day, and runs `docker system prune`; (c) weekly hard-cleanup — hard-cleanup.sh has SKIP_THRESHOLD_PCT=70 auto-skip (line 45/67), bails if any runner has an in-flight job (UUID-subdir check, lines 72-86), and does compose down → `docker system prune -af` → up (lines 100-115).\n\n(4) The 2026-06-14 disk-fill incident and PR #7582 are documented in the user's persistent memory (feedback_2026-06-15_limactl_shell_cron_silent_noop: \"Root cause of 2026-06-14 disk-fill incident; fixed in PR #7582\").\n\nSeverity assessment: \"critical\" is defensible, not inflated. The proposal would replace a fleet whose single most documented, most-mitigated failure mode is disk exhaustion (three independent mitigation layers plus a real incident), and the replacement design carries over none of it. The one counterargument — that ephemeral per-job VMs would inherently solve it — is preemptively and correctly handled by the finding itself: the doc neither commits to per-job-fresh disk images nor sizes them, and \"ephemeral runner\" (GitHub's one-job-per-registration semantics) does not by itself imply a fresh disk. The recommendation (carry over 120 GiB sizing rationale, the 5 GB pre-job hook with the _actions chmod, scheduled cleanup for persistent state, or explicitly document that base-image freshness replaces crons and size the image for per-job peak) is technically sound and matches the repo's own hard-won practices.",
+          "refuted": false
+        }
+      },
+      {
+        "title": "gha-outrunner is an unverified load-bearing dependency; the Rust skeleton itself does almost nothing",
+        "severity": "critical",
+        "detail": "The entire proposal wraps 'gha-outrunner', but the skeleton's runner.rs is placeholders ('Starting gha-outrunner (placeholder)...'), service install is 'not yet implemented', and backend.rs assumes 'Sysbox is installed or will be'. All the hard parts — runner registration, ephemeral lifecycle, VM image management, scale sets — are delegated to a tool whose existence, maturity, and maintenance status the proposal never establishes. The actual novel code in the skeleton is ~30 lines of platform detection (/dev/kvm exists, `which tart`) and a YAML heredoc — trivially expressible in bash. Compare: the existing stack's value is not its topology but ~2 years of encoded failure knowledge across self-hosted-oss/heal-runners.sh, preflight.sh, launchd-start.sh, linux/install.sh, and self-hosted-colima/scripts/monitor.sh.",
+        "recommendation": "Before any further design work, verify gha-outrunner exists, supports org-scope runners + GitHub Scale Sets, and is maintained. If it does not, the proposal collapses to 'write a runner orchestrator from scratch in Rust', which is a very different (and much larger) decision. Evaluate established alternatives first: actions-runner-controller (k8s), cirruslabs Tart-based runner tooling on macOS, or GitHub's official ephemeral-runner APIs driven from the existing scripts.",
+        "from": "infra-fit",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "The finding's core factual claims all verify against the doc and repo. (1) The skeleton quotes are verbatim accurate: runner.rs prints \"Starting gha-outrunner (placeholder)...\" with the real invocation commented out, InstallService prints \"Service installation not yet implemented\", and backend.rs contains the comment \"assume Sysbox is installed or will be\". (2) The doc genuinely never establishes gha-outrunner's existence, repo, author, maturity, or maintenance status — it is treated as a given. (3) The novel code really is ~30 lines of platform detection (/dev/kvm check, which::which(\"tart\")) plus a YAML heredoc. (4) All five cited existing-stack files exist in the repo (1,475 lines total, 88 commits). Adversarial web verification of the recommendation's key question: gha-outrunner DOES exist (github.com/NetwindHQ/gha-outrunner, Go, v1.2.0 released 2026-04-20, 5 releases, Docker/libvirt/Tart backends, GitHub scale sets API) — so the worst-case \"proposal collapses to writing an orchestrator from scratch\" branch does not fire. However, the tool has 3 stars, 0 forks, a single author, and 17 open issues — near-zero adoption — which substantiates rather than refutes the \"unverified load-bearing dependency\" concern for critical CI infrastructure. Severity 'critical' is defensible for an infra-fit review: the design bets the entire runner fleet on an unevaluated single-maintainer project while the wrapper itself adds almost nothing. Two supporting details are wrong: the existing stack's git history in this repo starts 2026-03-02 (~4 months, not \"~2 years\" of encoded failure knowledge), and the recommendation's existence question is now answered affirmatively. These errors do not overturn the finding's substance, so it is not refuted; a corrected version is provided.",
+          "corrected_claim": "gha-outrunner IS a real, recently maintained project (github.com/NetwindHQ/gha-outrunner — Go, v1.2.0 April 2026, Docker/libvirt/Tart backends, GitHub scale sets API), so the proposal does not collapse outright — but it has essentially zero adoption (3 stars, 0 forks, single author, 17 open issues), so treating it as the load-bearing dependency for all CI runners without any evaluation remains a critical infra-fit risk. The rest of the finding stands as written: the Rust skeleton is placeholders (runner start, service install) plus ~30 lines of platform detection and a YAML heredoc, and all hard parts (registration, ephemeral lifecycle, VM images, scale sets) are delegated to the unevaluated tool. One correction: the existing stack (self-hosted-oss/*.sh + self-hosted-colima/scripts/monitor.sh, 1,475 lines, 88 commits) encodes roughly 4 months of operational failure knowledge (first commit 2026-03-02), not ~2 years. The recommendation should be updated from \"verify it exists\" to \"evaluate its production-readiness and bus-factor against alternatives (actions-runner-controller, cirruslabs Tart tooling, GitHub's ephemeral-runner APIs driven from the existing scripts) before adopting it.\""
+        }
+      },
+      {
+        "title": "No health monitoring, self-healing, or alerting anywhere in the gha-isolated design",
+        "severity": "major",
+        "detail": "The existing setup runs a dense monitoring mesh that the proposal entirely omits: (a) self-hosted-colima/scripts/monitor.sh — 15-min cron, flock-locked, checks VM state, container health, disk ≥75%, GitHub registration, queue depth ≥50 pending/queued, and ZOMBIE detection (container Up locally but deregistered on GitHub ≥5 min → force-recreate; this closes a real silent-failure mode of Runner.Listener). (b) self-hosted-oss/preflight.sh — memory_pressure ≥80%, disk free <5 GB on ~/.colima, fseventsd RSS >2048 MB → immediate colima restart (root cause of silent dockerd hangs, Colima issue #1569). (c) self-hosted-oss/heal-runners.sh — stale offline registration cleanup, flapping-container recycle on error patterns ('Error: Conflict|Runner not found|signature is not valid'), restart-count threshold 6, gh busy-check before recreate. (d) mac-runner-health.sh / ubuntu-runner-health.sh — 5-min monitors with debounced Slack+email alerts (fire on OK→FAIL transition, 1h sustained-fail cooldown, recovery message), and a CPU-aware load threshold (70% of nproc — commit e9084fb365 fixed false positives where a 32-core box tripped a flat load1=4.99 threshold at 15% utilization). (e) self-hosted-oss/slack-alert.sh — severity-coded (info/warning/critical) webhook posts with silent no-op when unconfigured.",
+        "recommendation": "Treat monitoring/healing/alerting as a first-class module in any replacement, not a 'future step'. Minimum carry-over: zombie-runner detection against the GitHub API, queue-depth alerting, disk thresholds, debounced Slack alerts with severity, and CPU-relative (not absolute) load thresholds.",
+        "from": "infra-fit",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "I attempted to refute the finding and could not — every factual claim checks out against the repo, and the design doc genuinely contains zero monitoring content.\n\nDESIGN DOC OMISSION (confirmed): grep of /tmp/claude-1000/.../scratchpad/gistfile1.txt for monitor|health|heal|alert|zombie|slack|watchdog|observ returns zero hits across all 292 lines. The doc's only nod to observability is a `status()` stub that prints \"Status: Not yet implemented\" (line 269), and the \"Next Steps\" list (lines 288-291) covers runner.rs, service install, config model, and prerequisite installation — monitoring is not even listed as future work.\n\nFACTUAL SPOT-CHECKS (all confirmed in repo):\n(a) /home/jleechan/projects/worktree_runner/self-hosted-colima/scripts/monitor.sh — \"Runs every 15 minutes via the user crontab\" (line 6), flock re-exec with -w 60 (lines 88-92), DISK_THRESHOLD_PCT=75 (line 53), PENDING_THRESHOLD=50 / QUEUED_THRESHOLD=50 (lines 54-55), ZOMBIE_GRACE_SEC=300 with force-recreate of runners \"Up locally but not online on GitHub\" (lines 64, 290-340). Exactly as described.\n(b) self-hosted-oss/preflight.sh — MEMORY_PRESSURE_CRITICAL=80 (line 29), DISK_FREE_MIN_GB=5 (line 30), FS_EVENTSD_RSS_KILL_MB=2048 (line 31), short-circuit to colima restart (lines 10-11, 130, 146). Confirmed.\n(c) self-hosted-oss/heal-runners.sh + defaults.sh — RUNNER_SELF_HEAL_RESTART_THRESHOLD=6 (defaults.sh:141), RUNNER_SELF_HEAL_ERROR_PATTERNS=\"Error: Conflict|Runner not found|signature is not valid\" (defaults.sh:145, verbatim match to the finding), clean_stale_offline() (heal-runners.sh:100), gh busy check via GH_BUSY map (line 131). Confirmed.\n(d) self-hosted-oss/ubuntu-runner-health.sh — debounced alerts firing on OK→FAIL transition with recovery message on FAIL→OK (header lines 14-17), HEALTH_CHECK_INTERVAL_SEC=3600 sustained-fail cooldown (line 56), LOAD_THRESHOLD_PCT_OF_NPROC=70 with the exact motivating example \"32-core host tripping on load1=4.99 while only 15% utilized\" (lines 28-34, 54); commit e9084fb365 exists (\"fix(self-hosted-oss): make ubuntu-runner-health load threshold CPU-aware (#7773)\"); both health plist templates specify 5-min StartInterval (launchd templates line 28). Confirmed.\n(e) self-hosted-oss/slack-alert.sh — severity info/warning/critical with per-severity colors (lines 18-20, 52-54) and \"SILENT NO-OP\" when SLACK_WEBHOOK_URL unset (lines 11, 37-40). Confirmed.\n\nSEVERITY NOT INFLATED: The strongest counterargument is that the proposal's ephemeral runners + Scale Sets structurally reduce some failure modes (persistent zombie registrations, flapping long-lived containers). But this only mitigates part of one item: host-level failure modes the current mesh guards against — disk fill, silent dockerd/VM hangs, queue backlog from dead capacity, and any alerting at all — are orthogonal to ephemerality, and the doc neither claims gha-outrunner provides monitoring nor mentions the topic. For an \"infra-fit\" review of a replacement for a production setup whose monitoring exists because of real incidents (fseventsd runaway, zombie Runner.Listener, false-positive load alerts), \"major\" is a fair severity and the recommended minimum carry-over list is sensible. One nuance: zombie-detection semantics would need adapting for ephemeral Scale Set runners (stuck listener/scale-set lag rather than deregistered persistent runners), but that refines the recommendation rather than refuting it."
+        }
+      },
+      {
+        "title": "Service management and install-path discipline are unimplemented in the proposal but encode hard-won anti-patterns in the existing setup",
+        "severity": "major",
+        "detail": "The skeleton prints 'Service installation not yet implemented' and config.rs writes outrunner.yml to the process CWD. The existing setup learned the opposite lessons the hard way: (a) scripts must live at a STABLE path outside any git worktree — self-hosted-oss/install.sh copies to ~/.local/share/worldarchitect-runners/ (macOS) and linux/install.sh to root-owned /opt/jleechanorg-org-runners/ (.env mode 0640 root:runner-user so the service can read the PAT but not rewrite it); the most recent commit on this branch (b2c58658cd 'install pre-job-hook to stable local path, not repo bind-mount') is this exact lesson re-learned for the colima stack. (b) LINUX_HOST_POLICY.md: systemd Type=oneshot + RemainAfterExit=yes + bounded StartLimitBurst — no bash supervisor on the hot path, no respawn storms; container restart is Docker's restart=on-failure:3. (c) The EPHEMERAL trap: linux/install.sh REFUSES to install with EPHEMERAL=true because ephemeral runners exit cleanly (status 0) and on-failure never restarts them — the pool silently drains. The proposal defaults to ephemeral runners without addressing who re-provisions them. (d) Repo CLAUDE.md 'Self-Hosted Runner Changes' section is explicit: every runner change must update install.sh (source of truth), commit plist/unit templates, go through PR, and be reproducible on a fresh machine — a `cargo install gha-isolated` + CWD-written YAML flow violates all four unless the binary is version-pinned, built/installed BY install.sh, and its config templates are committed.",
+        "recommendation": "If gha-isolated proceeds: config to a stable XDG path, launchd/systemd templates committed to the repo, installation wired through the existing install.sh, and an explicit answer to 'who restarts an ephemeral runner after its clean exit'. Otherwise it will be lost on reinstall and violates the repo's runner-change policy.",
+        "from": "infra-fit",
+        "verdict": {
+          "reasoning": "Every factual claim verified against the doc and repo. Doc: line 148 prints 'Service installation not yet implemented'; line 248 writes outrunner.yml via bare relative path (CWD); line 10 defaults to ephemeral/Scale Sets with runner lifecycle left as placeholder; line 284 proposes unpinned cargo install. Repo: self-hosted-oss/install.sh installs to ~/.local/share/worldarchitect-runners (line 12); linux/install.sh installs to /opt/jleechanorg-org-runners (line 50) with .env 0640 root:$RUNNER_USER (lines 230-244); the EPHEMERAL=true guard exists (lines 146-166) with the exact clean-exit/pool-drain rationale, also documented in LINUX_HOST_POLICY.md lines 42-44; LINUX_HOST_POLICY.md confirms Type=oneshot + RemainAfterExit=yes + StartLimitBurst=3 + docker restart=on-failure:3; commit b2c58658cd exists and is precisely the stable-path lesson cited; CLAUDE.md's 'Self-Hosted Runner Changes' policy requires install.sh integration, committed templates, and PR flow. Two immaterial nuances: linux/install.sh has an explicit --allow-ephemeral override (refuse-by-default, not absolute), and if gha-outrunner truly implements Scale Sets the listener would re-provision ephemeral runners — but the doc is silent on this, so the finding's demand for an explicit answer stands. Severity 'major' is proportionate given the doc contradicts written repo policy and a lesson re-learned in this branch's HEAD commit. The recommendation is actionable and correct.",
+          "refuted": false
+        }
+      },
+      {
+        "title": "A new Rust binary is not justified at current scale — extend the existing setup or pilot Tart/libvirt incrementally",
+        "severity": "major",
+        "detail": "Honest assessment: the fleet is two hosts (one Mac via self-hosted-oss + Colima/launchd, one Jeff-Ubuntu via self-hosted-colima Lima VM + 16-runner compose + systemd --user). The proposal's unified-CLI value proposition targets a multi-host, multi-backend problem this repo does not yet have. The genuinely valuable ideas are (1) per-job VM isolation (would delete the disk-cleanup, cache-integrity, workdir-collision, and zombie-runner problem classes at the root — very aligned with the repo's root-cause-first principle) and (2) deduplicating the two stacks (the same pre-job-hook fix was applied twice, commits 0794779451 and the oss variant — real drift cost). But neither requires a Rust abstraction layer: (1) can be piloted by adding a couple of Tart-backed runners on the Mac alongside the existing fleet, and (2) is a bash refactor (shared hook/monitor library sourced by both stacks). The Rust skeleton adds a compile/distribute/version toolchain for ~30 lines of real logic while deferring 100% of the operationally hard code. Rust becomes justified only if/when the fleet grows to many heterogeneous hosts needing a typed state machine with tests — not before.",
+        "recommendation": "Reject gha-isolated as a rewrite. Extract its one good idea as a bounded experiment: a Tart (macOS) or libvirt (Linux) per-job-VM runner pilot managed by a new script in self-hosted-oss/, installed via install.sh, with the existing monitor/alert/cleanup mesh pointed at it. Deduplicate the two bash stacks into a shared lib as a separate PR. Revisit a compiled orchestrator only if host count grows beyond what install.sh-per-host can manage.",
+        "from": "infra-fit",
+        "verdict": {
+          "refuted": false,
+          "reasoning": "Every factual claim in the finding checks out against the repo and git history. (1) Fleet is two hosts: self-hosted-oss README/launchd files = Mac Colima stack; self-hosted-colima README/install.sh = Jeff-Ubuntu with systemd --user colima-runners.service + Lima VM + 16-runner compose (org-runner-16 present in docker-compose.yml; README's '10' is stale). No GCE setup exists in either stack. (2) Duplicate pre-job-hook fix confirmed: oss disk-cleanup added in 8c34a4f1bf (PR #7770), colima copy in 0794779451 ('mirrors self-hosted-oss/ version'); diff shows near-identical logic with drift, and b2c58658cd was a third fix needed for the colima copy — real drift cost. (3) The Rust skeleton in the design doc has ~30-45 lines of real logic (platform detect, backend select, hardcoded YAML template); runner.rs is all placeholders and service install 'not yet implemented' — 100% of operationally hard code deferred, and the design merely wraps NetwindHQ/gha-outrunner, a real existing tool that already implements Tart/libvirt/Docker per-job ephemeral runners, so no custom Rust binary is needed even for the pilot (a static outrunner.yml per host + bash install script suffices at 2 hosts). (4) The recommendation matches repo policy (CLAUDE.md 'Self-Hosted Runner Changes — must be in git and portable', install.sh as source of truth) and the existing monitor/alert/cleanup mesh (monitor.sh, slack-alert.sh, heal-runners.sh, cleanup scripts). Severity 'major' is proportionate since the finding rejects the doc's core deliverable with sound factual basis. Only cosmetic quibbles found (stale README runner count, 'rewrite' vs 'wrapper' wording), neither of which undermines the finding."
+        }
+      }
+    ],
+    "refuted": [
+      {
+        "title": "No ephemeral lifecycle, crash recovery, or orphan/disk cleanup",
+        "from": "architecture",
+        "why_refuted": "The finding's factual basis collapses because it ignores that the design is explicitly a thin wrapper around gha-outrunner (doc lines 2, 25: \"Runner Lifecycle (start/stop/status via gha-outrunner)\"), and gha-outrunner (real tool, NetwindHQ/gha-outrunner) already implements the lifecycle the finding claims is absent: (1) its README states it \"provisions fresh Docker containers or VMs for each GitHub Actions job, then destroys them when the job completes\" — so post-job destroy semantics exist and are owned by outrunner, answering the recommendation's open question; (2) its provisioners doc documents startup reconciliation that reaps orphans after a crash — libvirt lists all domains and destroys any matching the scale-set prefix plus overlay files, Tart does `tart list` + `tart stop`/`tart delete` on matching VMs — so a crash mid-job does NOT \"permanently leak a VM with no mechanism to notice\" once the service manager (which the design includes) restarts the process; (3) guests are already tagged at the hypervisor level (Docker labels outrunner=true/outrunner.name, scale-set name prefixes for libvirt/Tart VMs), which is exactly the finding's own recommended mitigation, making the \"no state store, stop cannot enumerate\" claim a misdiagnosis — enumeration is label/prefix-based by design. (4) stop() being a stub is true but the doc self-identifies as skeleton code with \"Full runner.rs implementation\" as explicit next step #1; stub-ness of admitted placeholder code cannot carry a critical architecture finding. Residual valid points are real but medium severity at most: the doc should state the delegation assumption explicitly; Docker-backend orphans after unclean outrunner death need manual label-filtered cleanup; and neither layer has disk high-water-mark checks or quota gc (though per-job guest destruction is itself the primary disk reclamation mechanism, contradicting \"zero disk reclamation\"). Severity \"critical\" is inflated and three of the four core factual claims are contradicted by the wrapped tool's documentation.",
+        "corrected": "The design delegates ephemeral lifecycle to gha-outrunner, which already destroys each VM/container after its job, tags guests at the hypervisor level (Docker labels, scale-set name prefixes), and reaps orphaned libvirt/Tart VMs via startup reconciliation — so post-job destroy, orphan cleanup, and crash recovery are not absent, just externally owned. Remaining gaps (medium severity): the design doc never states this delegation assumption explicitly; Docker-backend containers orphaned by an unclean outrunner death require manual `docker ps --filter label=outrunner` cleanup; the wrapper's stop()/status() are unimplemented skeleton stubs; and neither layer has disk high-water-mark checks or quota-based garbage collection of base images/overlays, so a disk-pressure gate before accepting jobs is a worthwhile v1 hardening addition."
+      },
+      {
+        "title": "Module table promises 7 files; main.rs declares 4 — service.rs and limits.rs don't exist and `install-service` silently succeeds while doing nothing",
+        "from": "rust",
+        "why_refuted": "Every factual citation in the finding is accurate: the Section 4 table (doc lines 62-78) lists 7 files including src/service.rs and src/limits.rs; main.rs (lines 101-104) declares only 4 modules; InstallService (lines 147-149) prints a message and returns Ok(()) with exit code 0; line 11 lists resource protection as a core principle. However, the finding is refuted on severity and framing: (1) the doc discloses the gap twice — line 283 marks install-service \"(future)\" and Next Steps item 2 explicitly lists service installation as unbuilt — so the \"broken contract discovered mid-build\" scenario is contradicted by the doc's own text; (2) \"silently succeeds\" is wrong — it prints \"not yet implemented\", and the identical println+Ok(()) placeholder pattern is used by start/stop/status too (runner.rs is all placeholders), so this is skeleton-wide style, not a unique defect; (3) \"limits.rs missing leaves Resource Limits with no owner\" is overstated — config.rs generates memory/cpus/pids_limit inline for both backend paths; (4) no code exists in the repo (rg/find confirm zero Rust files), so this is a proposal doc with no deployment surface — \"critical\" severity presumes production scripting of code the doc labels future. The residual valid core is a low/medium doc-consistency issue: the 7-file table vs 4-module skeleton mismatch clashes with the doc's \"Full Self-Contained\" / \"runnable today\" claims. The recommendation (trim table or add stubs; bail! on unimplemented subcommands) is sound engineering advice worth adopting if the doc becomes an implementation contract.",
+        "corrected": "Severity low/medium (doc consistency), not critical: the Section 4 module table lists src/service.rs and src/limits.rs but the skeleton's main.rs declares only platform/backend/config/runner, which clashes with the doc's \"Full Self-Contained\" and \"runnable today\" claims. However, the service gap is explicitly disclosed twice (usage comment \"Install as service (future)\" and Next Steps item 2), install-service prints \"not yet implemented\" rather than failing silently, the same placeholder println+Ok(()) pattern applies to start/stop/status as well, and resource limits are already owned by config.rs inline. Recommended fix stands: reconcile the table with the skeleton (stubs or trim to 4-5 files with an explicit future-work section) and make unimplemented subcommands exit non-zero via anyhow::bail!."
+      }
+    ],
+    "minors": [
+      {
+        "title": "'GitHub Scale Sets' without Kubernetes is now legitimate — but the design should cite the official actions/scaleset client, not ARC concepts",
+        "severity": "minor",
+        "detail": "VERIFIED FEASIBLE: Runner scale sets were historically an ARC/Kubernetes concept, but two things make the design's 'Scale Sets + ephemeral runners by default' claim valid without k8s as of 2026: (1) gha-outrunner already registers via the scaleset API as an autoscaling runner group (https://github.com/NetwindHQ/gha-outrunner), and (2) GitHub shipped an official standalone Go client for the Runner Scale Set APIs in public preview on Feb 5, 2026 (https://github.com/actions/scaleset; announcement https://github.blog/changelog/2026-02-05-github-actions-early-february-2026-updates/ and https://github.com/orgs/community/discussions/186265). GitHub explicitly positions it for VMs, bare metal, and non-k8s infrastructure; ARC remains the reference implementation. So no need to fall back to 'ephemeral runners + JIT config' wording — scale sets are correct — though JIT-config ephemeral runners remain a simpler alternative registration path.",
+        "recommendation": "Update the design to name the actual mechanism: 'runner scale set APIs via gha-outrunner (see GitHub's standalone actions/scaleset client)'. Note the scaleset client is public preview, so API stability caveats apply.",
+        "from": "facts"
+      },
+      {
+        "title": "Tart licensing resolved favorably: fees dropped after OpenAI acquisition, now FSL-1.1-ALv2 — but maintainer team has moved on",
+        "severity": "minor",
+        "detail": "VERIFIED: Historically Tart was Fair Source with a free tier limited to 100 CPU cores per organization on server installations (personal workstations royalty-free; https://tart.run/licensing/, https://github.com/cirruslabs/tart/discussions/433). On April 7, 2026 Cirrus Labs announced it is joining OpenAI (https://cirruslabs.org/, https://macstadium.com/blog/cirrus-labs-is-joining-openai): they stopped charging licensing fees and promised to relicense Tart/Vetu/Orchard more permissively. I fetched the current LICENSE file (https://raw.githubusercontent.com/cirruslabs/tart/main/LICENSE): it is now the Functional Source License FSL-1.1-ALv2, copyright 2022-2026 OpenAI — internal use (which self-hosted CI runners are) is fully permitted with NO core limits; only 'Competing Use' (selling a substitute product) is restricted; each release auto-converts to Apache 2.0 after two years. So licensing is a non-issue for gha-isolated. The real risk is maintenance: the team that built Tart moved to other OpenAI projects, Cirrus CI shut down June 1 2026, and Cirrus Runners closed to new customers — Tart's future cadence is uncertain community maintenance.",
+        "recommendation": "Design can rely on Tart license-wise (FSL internal use, no fees, no core limits). Add a note that Tart is now community/OpenAI-orphan maintained post-acquisition and pin known-good Tart versions; keep libvirt-on-macOS or Apple Virtualization.framework alternatives on the radar.",
+        "from": "facts"
+      },
+      {
+        "title": "Sysbox-CE is maintained in 2026, but 'assume Sysbox is installed' plus distro/kernel friction is hand-wavy",
+        "severity": "minor",
+        "detail": "VERIFIED: Docker acquired Nestybox (2022); Sysbox remains a community open-source project with Docker as main sponsor, support best-effort via GitHub/Slack (https://github.com/nestybox/sysbox). It is NOT EOL: v0.7.0 was released/deployed around March 2026 (https://github.com/nestybox/sysbox/releases). Sysbox-EE is dead as a standalone product (archived at https://github.com/docker-archive/nestybox.sysbox-ee; features folded into Docker Desktop). Friction points: distro/kernel sensitivity is real — e.g. open issue 'Sysbox 0.7.0 not working on ubuntu 26.04' (https://github.com/nestybox/sysbox/issues/1005); packaged installs target specific Ubuntu/Debian/kernel combos (https://github.com/nestybox/sysbox/blob/master/docs/user-guide/install-package.md). Note Sysbox requires no KVM, so it is a coherent fallback where nested virt is unavailable — but the skeleton's backend.rs comment 'assume Sysbox is installed or will be' contradicts the design's own 'Ensure prerequisites' step. Also note gha-outrunner's docker backend does not document Sysbox integration, so wiring runtime=sysbox-runc would need upstream support or docker default-runtime configuration outside gha-outrunner.",
+        "recommendation": "Make Sysbox presence an explicit detected capability (check for sysbox-runc runtime in `docker info`), fall back to plain Docker with limits when absent, and document supported distro/kernel matrix. Verify gha-outrunner can actually launch containers under the sysbox-runc runtime before promising it.",
+        "from": "facts"
+      },
+      {
+        "title": "serde_yaml = \"0.9\" pins a deprecated, archived crate",
+        "severity": "minor",
+        "detail": "VERIFIED: dtolnay released serde_yaml 0.9.34+deprecated as the final version and archived the repo in March 2024 (https://github.com/dtolnay/serde-yaml/releases/tag/0.9.34, https://docs.rs/crate/serde_yaml/latest, https://users.rust-lang.org/t/serde-yaml-deprecation-alternatives/108868). There is no officially designated successor — the author points users at crates.io alternatives. Community options include serde_yaml_ng and serde_norway (saphyr-based forks); note that the 'serde_yml' fork has had community concerns about maintenance quality, so vet before adopting. The crate still compiles and works, so this is a hygiene issue, not a blocker — but a brand-new 2026 project should not start on an archived dependency. Given the tiny config surface, even hand-writing the YAML (as config.rs's format! string already does) or emitting JSON-compatible YAML via serde_json would avoid the dependency entirely.",
+        "recommendation": "Replace serde_yaml with a maintained YAML crate (serde_yaml_ng or serde_norway) for parsing gha-outrunner config, or avoid a YAML dependency altogether since the tool mostly generates (not parses) a small config file.",
+        "from": "facts"
+      },
+      {
+        "title": "Core principle 'GitHub Scale Sets + ephemeral runners by default' has no supporting architecture",
+        "severity": "minor",
+        "detail": "Section 1 lists Scale Sets + ephemeral as a core principle, but nothing downstream implements or even mentions either again: the config has a static `count: 2` (the opposite of scaling), there is no autoscaling trigger (webhook/poll for queued jobs), and no ephemeral (`--ephemeral`/JIT) flag anywhere in the flow. Runner scale sets are also a specific GitHub concept with its own protocol/controller model; asserting it as a default without any design leaves the principle unbacked and misleads readers about what v1 delivers.",
+        "recommendation": "Either descope: state that v1 is a fixed pool of N ephemeral runners (and design the ephemeral re-registration loop), moving scale sets to a future-work section; or design the scaling loop (job-queue signal → provision → run → destroy) explicitly. Don't leave a load-bearing principle with zero mechanism.",
+        "from": "architecture"
+      },
+      {
+        "title": "Platform detection gaps: arch unused, macOS Intel and unknown-OS paths incoherent",
+        "severity": "minor",
+        "detail": "src/platform.rs detects `arch` but nothing consumes it — relevant because Tart is Apple-Silicon-only (the v1 target says Apple Silicon, but the code doesn't enforce it): an Intel Mac, or an Apple Silicon Mac without tart installed, falls through both Linux branches in backend.rs and lands on plain `Backend::Docker` with no message about what was skipped or why. `System::new_all()/refresh_all()` is dead weight (see resource-limits finding). 'unknown' OS (e.g. Windows) also silently gets Backend::Docker rather than an unsupported-platform error.",
+        "recommendation": "Make selection exhaustive and loud: macOS + aarch64 + no tart → error with install instructions (or explicit container opt-in per the fail-closed finding); non-macOS/Linux → hard error 'unsupported platform'; use the detected arch to gate Tart; drop or actually use the sysinfo call.",
+        "from": "architecture"
+      },
+      {
+        "title": "Dependency set mismatched to stated scope: duct is overkill for one subprocess, while tracing/directories/thiserror are absent",
+        "severity": "minor",
+        "detail": "duct = \"0.13\" (line 94) exists to support a single commented-out `cmd!(\"gha-outrunner\", ...)` in runner.rs (line 258) — std::process::Command with `.status()` covers everything shown, and duct's shell-pipeline features aren't needed for spawn/kill/status of one child. Meanwhile the stated scope (long-running runner lifecycle, service management, multi-backend diagnostics) has no logging story (`tracing` + tracing-subscriber, or at minimum `env_logger`), no platform-path story (`directories`/`xdg` — see the cwd-write finding), and no typed-error story if any of this is ever split into a lib crate (`thiserror`; anyhow alone is fine while it stays a binary). Notably tokio is NOT missing: nothing in v1 needs async — process spawning and status polling are fine synchronously, and adding tokio would be scope creep. colored = \"2\" for a CLI this small is also take-it-or-leave-it; clap already colors help output.",
+        "recommendation": "Drop duct and colored; add directories and tracing (+ tracing-subscriber with env-filter). Keep anyhow at the binary edge; introduce thiserror only if/when a lib target appears. Explicitly document the no-tokio decision in the design so a future contributor doesn't bolt it on reflexively.",
+        "from": "rust"
+      },
+      {
+        "title": "Version hygiene: outdated pins, bare-major pin, and missing package metadata",
+        "severity": "minor",
+        "detail": "sysinfo = \"0.30\" is several breaking releases behind (0.33+ current in 2025; the System API changed across 0.30→0.31). which = \"6.0\" is a major behind (7.x current). colored = \"2\" is a bare major with no minor floor. The [package] section (lines 82–86) lacks `license`, `repository`, and `rust-version` (MSRV) — the design says users will `cargo install gha-isolated` (line 284), which implies publishing to crates.io, where a missing license field is a hard publish error. No mention of committing Cargo.lock, which a binary crate should do.",
+        "recommendation": "Bump to current majors at write-time (or drop the crates per earlier findings), add `license = \"MIT OR Apache-2.0\"`, `repository`, and `rust-version`, commit Cargo.lock, and add a CI job running `cargo deny check advisories` — which would also have flagged the archived serde_yaml automatically.",
+        "from": "rust"
+      },
+      {
+        "title": "Hardcoded resource limits (count: 2, memory: 4G, cpus: 2) contradict the 'consistent resource protection' principle",
+        "severity": "minor",
+        "detail": "config.rs bakes `count: 2 / memory: 4G / cpus: 2` into both template branches (lines 218–243) with no relation to host capacity. On a 4-core/8GB GCE e2-standard-2 this overcommits (2 runners × 2 cpus + host = starvation, the exact failure mode the tool exists to prevent per line 6); on a 128GB workstation it wastes the machine. The design's Core Principles (line 11) promise 'consistent resource protection everywhere' but v1 ships fixed numbers.",
+        "recommendation": "Derive defaults in limits.rs from actual host stats (this is where sysinfo earns its place): e.g. count = max(1, cores/4), per-runner cpus = 2, per-runner memory = min(4G, total*0.35), always reserving headroom for the host. Allow user override via CLI flags on init, and print the computed limits so the operator can sanity-check them.",
+        "from": "rust"
+      },
+      {
+        "title": "Proposal's hardcoded resource defaults conflict with measured fleet sizing",
+        "severity": "minor",
+        "detail": "config.rs hardcodes count=2, 4G RAM, 2 CPU, and pids_limit=100 per runner. The real fleet runs 16 runners at 1 CPU / 1536M each inside a 4-CPU/12 GiB/120 GiB Lima VM (self-hosted-colima/docker-compose.yml x-runner-base), deliberately oversubscribed for queue throughput. pids_limit=100 is dangerously low for real CI (a pytest/npm job easily exceeds 100 processes) and the existing compose intentionally sets no pids cap. Separately, minor doc drift observed while reviewing: self-hosted-colima/README.md and the compose header comment say '10 runners' but docker-compose.yml defines 16 services/volumes and monitor.sh sets EXPECTED_RUNNERS=16.",
+        "recommendation": "Any config generator must take counts/limits from measured workload (or the existing .env/bashrc exports), not hardcoded guesses; drop or greatly raise pids_limit. Also update self-hosted-colima/README.md's '10 runners' references to 16 to match docker-compose.yml and monitor.sh.",
+        "from": "infra-fit"
+      },
+      {
+        "title": "Colima/Lima-specific operational knowledge must survive any migration",
+        "severity": "minor",
+        "detail": "Several lessons are invisible unless you read the scripts: (a) managed colima.yaml template with SHA-256 sentinel (~/.local/share/worldarchitect-runners/.colima_yaml_applied) that mounts only install-dir + ~/.cache — mounting $HOME triggers the fseventsd 7.5 GB RSS runaway that silently hangs dockerd (self-hosted-oss/README.md 'Colima config management'); (b) cache-integrity.sh launchd monitor with hang timeout (PR #7823) and skipping actions/cache on self-hosted macOS (PR #7744); (c) per-runner NAMED volumes, not a shared host bind mount — concurrent jobs collide on /_work/_actions/_temp_*/<guid>.tar.gz (docker-compose.yml header comment); (d) host-side dispatcher scripts must NOT be wrapped in `limactl shell` in cron (silent no-op, $HOME differs in VM — 2026-06-14 incident); (e) disk grow = qemu-img resize + lima.yaml sync, NOT `limactl disk create` (adds a second disk); (f) don't put ARM64/X64 in the SELF_HOSTED_RUNNER_LABELS org variable (starves the other architecture); (g) Mac and Ubuntu fleets fighting over org-runner-N names (GitHub first-registered-wins).",
+        "recommendation": "If the Tart/libvirt path replaces Colima these specific bugs disappear, but the general patterns (managed-config sentinel, per-job workdir isolation, label hygiene, name-prefix separation per host, host-vs-guest execution context in cron) must be ported into whatever replaces them. Keep LINUX_HOST_POLICY.md-style docs for the new backend.",
+        "from": "infra-fit"
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Review"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "review:facts",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "a7ca433949ae64b70",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783115744922,
+      "queuedAt": 1783115744905,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Fact-checked all 7 external assumptions in the gha-isolated…",
+      "promptPreview": "You are a technical fact-checker with web access. Read the design document at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt (a design for \"gha-isolated\", a Rust CLI wrapping \"gha-outrunner\" for isolated self-hosted GitHub Actions runners). Use WebSearch/WebFetch extensively to verify EVERY external factual assumption in the d…",
+      "lastProgressAt": 1783116027940,
+      "tokens": 80944,
+      "toolCalls": 18,
+      "durationMs": 283018,
+      "resultPreview": "{\"findings\":[{\"title\":\"gha-outrunner exists but is an extremely obscure single-maintainer project (3 stars, 0 forks)\",\"severity\":\"critical\",\"detail\":\"VERIFIED: The project exists at https://github.com/NetwindHQ/gha-outrunner ('Ephemeral VM and container runners for GitHub Actions — no Kubernetes required'). It genuinely matches the design's assumptions: written in Go, MIT licensed, supports exactl…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "review:architecture",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "aa9d259cf163218df",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783115744926,
+      "queuedAt": 1783115744905,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Reviewed the gha-isolated design doc (/tmp/claude-1000/-hom…",
+      "promptPreview": "You are a senior infrastructure architect reviewing a design doc. Read /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt — a design for \"gha-isolated\", a Rust CLI that wraps \"gha-outrunner\" to run isolated self-hosted GitHub Actions runners (Tart VMs on macOS, libvirt on Linux, Docker+Sysbox fallback). Review the ARCHITECTURE for…",
+      "lastProgressAt": 1783115875344,
+      "tokens": 61716,
+      "toolCalls": 2,
+      "durationMs": 130418,
+      "resultPreview": "{\"findings\":[{\"title\":\"No runner registration/authentication design at all\",\"severity\":\"critical\",\"detail\":\"The design never mentions how a runner becomes known to GitHub. There is no GitHub PAT or GitHub App credential flow, no JIT runner config, no registration-token acquisition or expiry handling (registration tokens are short-lived), and no repo/org/enterprise scoping decision. The generated o…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "review:rust",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "a84518835e0456ae1",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783115744930,
+      "queuedAt": 1783115744905,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Reviewed the gha-isolated design + Rust skeleton at /tmp/cl…",
+      "promptPreview": "You are a Rust reviewer. Read the design + skeleton code at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt. Review the Cargo.toml and skeleton Rust code for concrete issues:\n- Dependency choices: serde_yaml (archived?), sysinfo pulled in but barely used (System::new_all + refresh_all just to detect OS — wasteful), duct vs std:…",
+      "lastProgressAt": 1783115885880,
+      "tokens": 64099,
+      "toolCalls": 3,
+      "durationMs": 140950,
+      "resultPreview": "{\"findings\":[{\"title\":\"serde_yaml is deprecated/archived — do not build a new tool on it\",\"severity\":\"critical\",\"detail\":\"Cargo.toml (gistfile1.txt line 91) declares `serde_yaml = \\\"0.9\\\"`. dtolnay archived the serde_yaml repo in March 2024; the final release is 0.9.34+deprecated and it receives no fixes. A brand-new v1 tool whose core job is generating/validating YAML config should not start life…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "review:infra-fit",
+      "phaseIndex": 1,
+      "phaseTitle": "Review",
+      "agentId": "aed0c4f1900a97568",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783115744934,
+      "queuedAt": 1783115744905,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "(1) Existing setup: two battle-tested bash/compose stacks i…",
+      "promptPreview": "You are reviewing how a proposed new tool fits an existing codebase. The proposal (read it at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt) is \"gha-isolated\": a Rust CLI for isolated self-hosted GitHub Actions runners (Tart on macOS, libvirt on Linux, Docker+Sysbox fallback), wrapping a tool called gha-outrunner.\nThe repo at…",
+      "lastProgressAt": 1783115921347,
+      "tokens": 102081,
+      "toolCalls": 15,
+      "durationMs": 176413,
+      "resultPreview": "{\"findings\":[{\"title\":\"gha-isolated design has zero disk-management story — the single largest incident class in the existing fleet\",\"severity\":\"critical\",\"detail\":\"The proposal's generated config (src/config.rs in /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt) sets only memory/cpus (4G/2 CPU) — no VM disk size, no disk-press…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "verify:gha-outrunner exists but is an extremely",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "aadea7500d3465cd2",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027957,
+      "queuedAt": 1783116027942,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I attempted to refute the finding by independently verifyin…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"facts\" reviewer, severity critical:\nTITLE: gha-outrunner exists but is an e…",
+      "lastProgressAt": 1783116080588,
+      "tokens": 62535,
+      "toolCalls": 7,
+      "durationMs": 52631,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"I attempted to refute the finding by independently verifying every factual claim against the GitHub API and the design doc; the finding survives. Verified via `gh api repos/NetwindHQ/gha-outrunner`: the repo exists with the exact description quoted ('Ephemeral VM and container runners for GitHub Actions — no Kubernetes required'), language Go, license MIT, 3 stars, 0 …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "verify:Design's assumed gha-outrunner interface",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a4da5d6ba26078faf",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027961,
+      "queuedAt": 1783116027942,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Attempted refutation failed on every point. I independently…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"facts\" reviewer, severity major:\nTITLE: Design's assumed gha-outrunner inte…",
+      "lastProgressAt": 1783116104364,
+      "tokens": 66763,
+      "toolCalls": 7,
+      "durationMs": 76403,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Attempted refutation failed on every point. I independently fetched the upstream docs (configuration.md and cli.md from NetwindHQ/gha-outrunner) and read the design doc. All seven claims verified: (1) real config is config.yml at /etc/outrunner/config.yml, not outrunner.yml as design's src/config.rs writes (line 248); (2) no backend: key — runners take exactly one doc…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "verify:GCE 'no strong KVM' claim is factually w",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a975ce8c87ff99190",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027964,
+      "queuedAt": 1783116027942,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "The finding is factually correct and could not be refuted. …",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"facts\" reviewer, severity major:\nTITLE: GCE 'no strong KVM' claim is factua…",
+      "lastProgressAt": 1783116121559,
+      "tokens": 64621,
+      "toolCalls": 6,
+      "durationMs": 93594,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"The finding is factually correct and could not be refuted. (1) Google's official nested-virtualization docs confirm Compute Engine exposes Intel VT-x to L1 VMs so they can run Linux KVM, enabled per-VM, with exclusions exactly as the finding states (E2, memory-optimized, AMD, Arm, H4D) — so on Intel N1/N2/C2/C3 machine types /dev/kvm exists and the design's libvirt ba…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "verify:The design largely reinvents existing wh",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a194b2bc7311726f6",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027968,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Adversarial verification FAILED to refute the finding — eve…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"facts\" reviewer, severity major:\nTITLE: The design largely reinvents existi…",
+      "lastProgressAt": 1783116116927,
+      "tokens": 67278,
+      "toolCalls": 8,
+      "durationMs": 88959,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Adversarial verification FAILED to refute the finding — every material factual claim checks out. (1) gha-outrunner (NetwindHQ/gha-outrunner, MIT) verified: ephemeral runners via GitHub's scaleset API with Docker/libvirt/Tart backends, no Kubernetes — it already does everything hard in the design. The design doc itself describes gha-isolated as 'a wrapper CLI around gh…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "verify:No runner registration/authentication de",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "ab79ab7c57d1eba45",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027972,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I attempted to refute the finding and failed on every factu…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity critical:\nTITLE: No runner registration/au…",
+      "lastProgressAt": 1783116133160,
+      "tokens": 66393,
+      "toolCalls": 8,
+      "durationMs": 105188,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"I attempted to refute the finding and failed on every factual axis; independent evidence actually strengthens it.\\n\\nVerification against the doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt):\\n(1) The words \\\"token\\\", \\\"PAT\\\", \\\"auth\\\", \\\"credential\\\", \\\"registration\\\", and \\\"URL\\\" (in the Git…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "verify:VM image management is entirely absent",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a0f9d2b7747454b13",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027976,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "The core factual claim is verified TRUE: the 292-line desig…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity critical:\nTITLE: VM image management is en…",
+      "lastProgressAt": 1783116162978,
+      "tokens": 68914,
+      "toolCalls": 8,
+      "durationMs": 135002,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"The core factual claim is verified TRUE: the 292-line design doc contains zero mentions of images, image sources, versioning, pull/update policy, disk budgets, or guest provisioning (grep for image/tart-image/cloud-init/ignition/qcow/clone returns nothing relevant), and no section-2 box or section-4 module owns images. Stronger than the finding even states: the wrappe…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 11,
+      "label": "verify:No ephemeral lifecycle, crash recovery,",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a7e6498d88bcd8b0b",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027980,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "The finding's factual basis collapses because it ignores th…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity critical:\nTITLE: No ephemeral lifecycle, c…",
+      "lastProgressAt": 1783116160078,
+      "tokens": 68350,
+      "toolCalls": 8,
+      "durationMs": 132098,
+      "resultPreview": "{\"refuted\":true,\"reasoning\":\"The finding's factual basis collapses because it ignores that the design is explicitly a thin wrapper around gha-outrunner (doc lines 2, 25: \\\"Runner Lifecycle (start/stop/status via gha-outrunner)\\\"), and gha-outrunner (real tool, NetwindHQ/gha-outrunner) already implements the lifecycle the finding claims is absent: (1) its README states it \\\"provisions fresh Docker …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 12,
+      "label": "verify:Responsibility boundary with gha-outrunn",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "ac43b98e0d6837aac",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027984,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I attempted to refute the finding and instead found additio…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity critical:\nTITLE: Responsibility boundary w…",
+      "lastProgressAt": 1783116155403,
+      "tokens": 67947,
+      "toolCalls": 10,
+      "durationMs": 127419,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"I attempted to refute the finding and instead found additional confirming evidence.\\n\\n1. The doc genuinely never specifies the boundary. Read in full (292 lines, /tmp/.../scratchpad/gistfile1.txt): the only statements about gha-outrunner are \\\"Start gha-outrunner with correct flags/backend\\\" (line 33), the module table entry \\\"src/runner.rs — Start/stop/status of gha…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 13,
+      "label": "verify:Backend selection fails open on isolatio",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a3e0f393680ace7e4",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027988,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Verified against the design doc's actual skeleton code. Cor…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity major:\nTITLE: Backend selection fails open…",
+      "lastProgressAt": 1783116091695,
+      "tokens": 63938,
+      "toolCalls": 4,
+      "durationMs": 63707,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Verified against the design doc's actual skeleton code. Core claims are factually correct: (1) select() on macOS without Tart does fall through to plain Backend::Docker (lines 195-206); (2) Linux without KVM returns DockerSysbox with the literal comment \\\"assume Sysbox is installed or will be\\\" (line 203); (3) the skeleton's only capability probes are a bare /dev/kvm …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 14,
+      "label": "verify:Hardcoded resource limits (4G/2cpu/count",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a91bc43553e066578",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027991,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I attempted to refute the finding but every factual claim c…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity major:\nTITLE: Hardcoded resource limits (4…",
+      "lastProgressAt": 1783116094124,
+      "tokens": 65290,
+      "toolCalls": 5,
+      "durationMs": 66133,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"I attempted to refute the finding but every factual claim checks out against the design doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt):\\n\\n1. Hardcoded limits — CONFIRMED. `src/config.rs::generate` (doc lines 212-251) emits literal `count: 2`, `memory: 4G`, `cpus: 2` in the VM branch and `me…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 15,
+      "label": "verify:Config written to CWD with no versioning",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "abe66f3b250803060",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027995,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim checks out against the doc (/tmp/claude…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity major:\nTITLE: Config written to CWD with n…",
+      "lastProgressAt": 1783116084395,
+      "tokens": 62221,
+      "toolCalls": 3,
+      "durationMs": 56400,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Every factual claim checks out against the doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt). Line 248 shows `std::fs::write(\\\"outrunner.yml\\\", config)` with no path resolution — CWD-relative. The overwrite-without-confirmation claim is correct (fs::write truncates unconditionally, no existence…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 16,
+      "label": "verify:No security/threat model: per-backend es",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a1895741286ecf216",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116027999,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "The finding is factually correct on every point. (1) The de…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity major:\nTITLE: No security/threat model: pe…",
+      "lastProgressAt": 1783116096295,
+      "tokens": 63677,
+      "toolCalls": 4,
+      "durationMs": 68296,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"The finding is factually correct on every point. (1) The design doc (/tmp/.../scratchpad/gistfile1.txt) contains no security section or threat model — its only security-relevant content is \\\"ephemeral runners by default\\\", VM preference, and resource limits. (2) The docker.sock concern is corroborated by the repo itself: self-hosted-oss/docker-compose.docker-sock.yml …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 17,
+      "label": "verify:Service management is 'not yet implement",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a553ce6aa6f3b5090",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116028002,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim verified against the doc: the InstallSe…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity major:\nTITLE: Service management is 'not y…",
+      "lastProgressAt": 1783116095940,
+      "tokens": 63946,
+      "toolCalls": 5,
+      "durationMs": 67938,
+      "resultPreview": "{\"reasoning\":\"Every factual claim verified against the doc: the InstallService arm in the src/main.rs skeleton is literally `println!(\\\"Service installation not yet implemented\\\")` (doc line 148); src/service.rs appears only as a one-line module-table entry with no skeleton code (main.rs doesn't even declare `mod service;`); a full-doc grep confirms zero content on restart policy, boot start, run-…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 18,
+      "label": "verify:Observability limited to a stub status c",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "ac30974ad9d631d3e",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116028006,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim verified against the doc: (1) src/runne…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"architecture\" reviewer, severity major:\nTITLE: Observability limited to a s…",
+      "lastProgressAt": 1783116078941,
+      "tokens": 63293,
+      "toolCalls": 4,
+      "durationMs": 50935,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Every factual claim verified against the doc: (1) src/runner.rs status() prints exactly \\\"Status: Not yet implemented\\\" (doc lines 267-270); (2) no status semantics are defined anywhere — sections 2 and 4 only say \\\"start/stop/status\\\" with no state model; (3) the CLI has only Init/Start/Stop/Status/InstallService — no logs command, and no log locations documented; (4…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 19,
+      "label": "verify:serde_yaml is deprecated/archived — do n",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "aef98f0130a236535",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116028009,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All factual claims verified against primary sources. (1) Th…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity critical:\nTITLE: serde_yaml is deprecated/archived…",
+      "lastProgressAt": 1783116108799,
+      "tokens": 61668,
+      "toolCalls": 9,
+      "durationMs": 80790,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"All factual claims verified against primary sources. (1) The design doc's Cargo.toml at line 91 of gistfile1.txt declares serde_yaml = \\\"0.9\\\". (2) GitHub API confirms dtolnay/serde-yaml is archived (archived: true, last push 2024-03-25). (3) crates.io API confirms the final release is 0.9.34+deprecated (2024-03-25), matching the finding exactly. (4) The dead-dependen…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 20,
+      "label": "verify:Config generated via format!/string temp",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a4a7e7d14e29e4e56",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116028013,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All factual claims verified against the doc: (1) config.rs …",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity critical:\nTITLE: Config generated via format!/stri…",
+      "lastProgressAt": 1783116084182,
+      "tokens": 61916,
+      "toolCalls": 3,
+      "durationMs": 56169,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"All factual claims verified against the doc: (1) config.rs generate() spans exactly lines 212-251 and builds outrunner.yml via format!(r#\\\"...\\\"#) plus a raw string literal, written with std::fs::write; (2) Next Steps item 3 at line 290 defers 'Better config model (proper structs + serialization)'; (3) Cargo.toml (lines 90-91) declares serde with derive and serde_yaml…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 21,
+      "label": "verify:Module table promises 7 files; main.rs d",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a93ab849b08b7e266",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116080398,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual citation in the finding is accurate: the Sect…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity critical:\nTITLE: Module table promises 7 files; ma…",
+      "lastProgressAt": 1783116146632,
+      "tokens": 63362,
+      "toolCalls": 4,
+      "durationMs": 66234,
+      "resultPreview": "{\"reasoning\":\"Every factual citation in the finding is accurate: the Section 4 table (doc lines 62-78) lists 7 files including src/service.rs and src/limits.rs; main.rs (lines 101-104) declares only 4 modules; InstallService (lines 147-149) prints a message and returns Ok(()) with exit code 0; line 11 lists resource protection as a core principle. However, the finding is refuted on severity and fr…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 22,
+      "label": "verify:/dev/kvm existence check ignores permiss",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a8bdfc72d1f506cf7",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116081755,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "The finding is factually correct on every load-bearing poin…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity major:\nTITLE: /dev/kvm existence check ignores per…",
+      "lastProgressAt": 1783116171339,
+      "tokens": 62938,
+      "toolCalls": 6,
+      "durationMs": 89584,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"The finding is factually correct on every load-bearing point. Verified against the doc: line 179 is exactly `let has_kvm = std::path::Path::new(\\\"/dev/kvm\\\").exists();`, and backend::select (lines 195-201) picks Backend::Libvirt for linux+has_kvm with no access, virsh, or libvirtd checks anywhere in the doc (grep confirms zero occurrences of virsh/libvirtd/permission …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 23,
+      "label": "verify:backend.rs 'assume Sysbox is installed'",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "af7e8ff43175e7896",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116085603,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All factual assertions verified against the design doc (/tm…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity major:\nTITLE: backend.rs 'assume Sysbox is install…",
+      "lastProgressAt": 1783116138703,
+      "tokens": 62009,
+      "toolCalls": 3,
+      "durationMs": 53100,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"All factual assertions verified against the design doc (/tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt). (1) Line 203 is exactly `return Backend::DockerSysbox; // assume Sysbox is installed or will be`. (2) platform.rs only checks /dev/kvm and `which tart`; nothing verifies docker daemon, sysbox-r…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 24,
+      "label": "verify:sysinfo pulled in only to run System::ne",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a6dcd14d9aca72f9b",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116085905,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Verified directly against the design doc: sysinfo = \"0.30\" …",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity major:\nTITLE: sysinfo pulled in only to run System…",
+      "lastProgressAt": 1783116142205,
+      "tokens": 62078,
+      "toolCalls": 5,
+      "durationMs": 56300,
+      "resultPreview": "{\"reasoning\":\"Verified directly against the design doc: sysinfo = \\\"0.30\\\" is in the Cargo.toml skeleton (line 93); platform.rs's detect() creates `let mut sys = System::new_all(); sys.refresh_all();` (lines 166-167) and never reads sys — all actual detection uses cfg!/env::consts/Path::exists/which. sysinfo appears nowhere else in the skeleton, so the dep is dead weight. config.rs hardcodes memor…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 25,
+      "label": "verify:std::fs::write(\"outrunner.yml\") writes t",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a7452bbc252b8e53d",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116092906,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual element of the finding verifies against the d…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity major:\nTITLE: std::fs::write(\"outrunner.yml\") writ…",
+      "lastProgressAt": 1783116153398,
+      "tokens": 64590,
+      "toolCalls": 5,
+      "durationMs": 60492,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Every factual element of the finding verifies against the doc: line 248 is exactly `std::fs::write(\\\"outrunner.yml\\\", config)?;` with a cwd-relative path, no overwrite guard (Init takes no flags, fs::write truncates unconditionally), and no .context() (anyhow::Context is never imported despite anyhow being a dependency). The relative-path concern is not speculative: r…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 26,
+      "label": "verify:Stringly-typed Platform (os: String) wit",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a8aa1981ba0830db7",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116095367,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim checks out against the doc. (1) Platfor…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity major:\nTITLE: Stringly-typed Platform (os: String)…",
+      "lastProgressAt": 1783116147221,
+      "tokens": 61972,
+      "toolCalls": 3,
+      "durationMs": 51854,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Every factual claim checks out against the doc. (1) Platform struct at doc lines 158–163 models os as String; detect() (lines 165–183) assigns \\\"macos\\\"/\\\"linux\\\"/\\\"unknown\\\" via a cfg! chain, and cfg! is indeed compile-time constant, so the runtime string encodes only build-time information. (2) backend.rs line 196 compares `plat.os == \\\"macos\\\"` exactly as quoted, w…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 27,
+      "label": "verify:No backend abstraction — select() return",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a5d337b0f4c024d08",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116097090,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "All factual claims verify against the doc at /tmp/claude-10…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"rust\" reviewer, severity major:\nTITLE: No backend abstraction — select() re…",
+      "lastProgressAt": 1783116163976,
+      "tokens": 64639,
+      "toolCalls": 3,
+      "durationMs": 66886,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"All factual claims verify against the doc at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt: (1) backend.rs (doc lines 184-206) contains only a bare 4-variant enum and select() with no methods or validation; (2) the cited line 227 is exactly the inline `if *backend == Backend::Tart { \\\"tart\\\" } el…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 28,
+      "label": "verify:gha-isolated design has zero disk-manage",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a2b47695283199c4f",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116100264,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim in the finding was verified against the…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"infra-fit\" reviewer, severity critical:\nTITLE: gha-isolated design has zero…",
+      "lastProgressAt": 1783116177057,
+      "tokens": 69474,
+      "toolCalls": 8,
+      "durationMs": 76793,
+      "resultPreview": "{\"reasoning\":\"Every factual claim in the finding was verified against the design doc and the repo, and I found no basis to refute it.\\n\\n(1) Design doc has zero disk story — CONFIRMED. I read all 292 lines of /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt. The generated config (src/config.rs, lines 212-251) sets only `memory: …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 29,
+      "label": "verify:gha-outrunner is an unverified load-bear",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "a8c1ba9ce8374e2ef",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116105562,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "The finding's core factual claims all verify against the do…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"infra-fit\" reviewer, severity critical:\nTITLE: gha-outrunner is an unverifi…",
+      "lastProgressAt": 1783116203750,
+      "tokens": 67580,
+      "toolCalls": 8,
+      "durationMs": 98188,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"The finding's core factual claims all verify against the doc and repo. (1) The skeleton quotes are verbatim accurate: runner.rs prints \\\"Starting gha-outrunner (placeholder)...\\\" with the real invocation commented out, InstallService prints \\\"Service installation not yet implemented\\\", and backend.rs contains the comment \\\"assume Sysbox is installed or will be\\\". (2) …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 30,
+      "label": "verify:No health monitoring, self-healing, or a",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "abe51805e241bf3f2",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116110037,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "I attempted to refute the finding and could not — every fac…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"infra-fit\" reviewer, severity major:\nTITLE: No health monitoring, self-heal…",
+      "lastProgressAt": 1783116194704,
+      "tokens": 72020,
+      "toolCalls": 10,
+      "durationMs": 84667,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"I attempted to refute the finding and could not — every factual claim checks out against the repo, and the design doc genuinely contains zero monitoring content.\\n\\nDESIGN DOC OMISSION (confirmed): grep of /tmp/claude-1000/.../scratchpad/gistfile1.txt for monitor|health|heal|alert|zombie|slack|watchdog|observ returns zero hits across all 292 lines. The doc's only nod …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 31,
+      "label": "verify:Service management and install-path disc",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "ad9aaaa02d83f0d25",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116118229,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim verified against the doc and repo. Doc:…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"infra-fit\" reviewer, severity major:\nTITLE: Service management and install-…",
+      "lastProgressAt": 1783116188549,
+      "tokens": 67475,
+      "toolCalls": 8,
+      "durationMs": 70320,
+      "resultPreview": "{\"reasoning\":\"Every factual claim verified against the doc and repo. Doc: line 148 prints 'Service installation not yet implemented'; line 248 writes outrunner.yml via bare relative path (CWD); line 10 defaults to ephemeral/Scale Sets with runner lifecycle left as placeholder; line 284 proposes unpinned cargo install. Repo: self-hosted-oss/install.sh installs to ~/.local/share/worldarchitect-runne…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 32,
+      "label": "verify:A new Rust binary is not justified at cu",
+      "phaseIndex": 2,
+      "phaseTitle": "Verify",
+      "agentId": "acf7401e6e23af096",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1783116122723,
+      "queuedAt": 1783116027943,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Every factual claim in the finding checks out against the r…",
+      "promptPreview": "Adversarially verify this finding about a design doc (the doc is at /tmp/claude-1000/-home-jleechan-projects-worktree-runner/8ca589dd-8422-44b1-a543-52bd7b71f14b/scratchpad/gistfile1.txt; the repo is /home/jleechan/projects/worktree_runner; you may use WebSearch/WebFetch and read files). Try to REFUTE it. Finding from the \"infra-fit\" reviewer, severity major:\nTITLE: A new Rust binary is not justif…",
+      "lastProgressAt": 1783116259602,
+      "tokens": 74504,
+      "toolCalls": 13,
+      "durationMs": 136879,
+      "resultPreview": "{\"refuted\":false,\"reasoning\":\"Every factual claim in the finding checks out against the repo and git history. (1) Fleet is two hosts: self-hosted-oss README/launchd files = Mac Colima stack; self-hosted-colima README/install.sh = Jeff-Ubuntu with systemd --user colima-runners.service + Lima VM + 16-runner compose (org-runner-16 present in docker-compose.yml; README's '10' is stale). No GCE setup e…"
+    }
+  ],
+  "totalTokens": 2140231,
+  "totalToolCalls": 213
+}

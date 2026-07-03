@@ -1,0 +1,292 @@
+✅ Full Self-Contained Design + Skeleton Code
+Here is a complete, standalone design and Rust skeleton for gha-isolated — a wrapper CLI around gha-outrunner that gives you unified, reliable, VM-preferring GitHub Actions runners across macOS, Linux, and GCE.
+
+1. Project Overview
+Tool Name: gha-isolated
+Purpose: Provide a single, easy-to-use CLI that runs self-hosted GitHub Actions runners with the strongest practical isolation available on the current platform, while keeping operational overhead low.
+Core Principles
+	•	Prefer VM-level isolation when possible (Tart on macOS, libvirt on Linux).
+	•	Fall back gracefully to container isolation with hard resource limits.
+	•	Use GitHub Scale Sets + ephemeral runners by default.
+	•	Apply consistent resource protection everywhere.
+	•	Work the same way on a developer laptop and inside a GCE VM.
+Supported Platforms (v1 target)
+	•	macOS (Apple Silicon) → Tart backend (VMs)
+	•	Linux with KVM → libvirt backend (VMs)
+	•	Linux / GCE (no strong KVM) → Docker + Sysbox (with strict limits)
+	•	GCE → Same as Linux (run inside a GCE VM)
+
+2. High-Level Architecture
+gha-isolated (Rust binary)
+├── CLI (clap)
+├── Platform Detection
+├── Backend Selection (Tart / libvirt / Docker+Sysbox)
+├── Config Generation (outrunner.yml + resource limits)
+├── Runner Lifecycle (start/stop/status via gha-outrunner)
+├── Service Management (systemd / launchd)
+└── Optional GCE helpers
+Data Flow (start command)
+	1	Detect platform + capabilities
+	2	Choose best backend
+	3	Generate/validate outrunner.yml with resource limits
+	4	Ensure prerequisites (gha-outrunner binary, Sysbox/Tart, etc.)
+	5	Start gha-outrunner with correct flags/backend
+
+3. Backend Selection Logic
+Platform
+KVM/Tart?
+Chosen Backend
+Isolation
+Resource Limits
+macOS Apple Silicon
+Tart available
+Tart
+VM
+Per-VM
+Linux + /dev/kvm
+Yes
+libvirt
+VM
+Per-VM
+Linux / GCE
+No / weak
+docker + Sysbox
+Container
+Docker limits
+Fallback
+—
+docker
+Container
+Docker limits
+
+4. Module Structure
+File
+Responsibility
+src/main.rs
+CLI entrypoint + command routing
+src/platform.rs
+OS/arch detection + capability checks
+src/backend.rs
+Backend selection + validation
+src/config.rs
+Generate outrunner.yml + resource limits
+src/runner.rs
+Start/stop/status of gha-outrunner
+src/service.rs
+Install as systemd/launchd service
+src/limits.rs
+Resource limit helpers
+
+5. Skeleton Code (Self-Contained)
+`Cargo.toml`
+[package]
+name = "gha-isolated"
+version = "0.1.0"
+edition = "2021"
+description = "Unified isolated GitHub Actions runners (VM preferred)"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+which = "6.0"
+sysinfo = "0.30"
+duct = "0.13"
+colored = "2"
+anyhow = "1.0"
+`src/main.rs`
+use clap::{Parser, Subcommand};
+use anyhow::Result;
+
+mod platform;
+mod backend;
+mod config;
+mod runner;
+
+#[derive(Parser)]
+#[command(name = "gha-isolated", about = "Isolated GitHub Actions runners with VM preference")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize configuration for this machine
+    Init,
+    /// Start the runner(s)
+    Start,
+    /// Stop the runner(s)
+    Stop,
+    /// Show current status
+    Status,
+    /// Install as a persistent system service
+    InstallService,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Init => {
+            println!("Initializing gha-isolated...");
+            let plat = platform::detect();
+            let back = backend::select(&plat);
+            println!("Detected: {} | Best backend: {:?}", plat.os, back);
+            config::generate(&plat, &back)?;
+        }
+        Commands::Start => {
+            runner::start()?;
+        }
+        Commands::Stop => {
+            runner::stop()?;
+        }
+        Commands::Status => {
+            runner::status()?;
+        }
+        Commands::InstallService => {
+            println!("Service installation not yet implemented");
+        }
+    }
+
+    Ok(())
+}
+`src/platform.rs`
+use sysinfo::System;
+
+#[derive(Debug, Clone)]
+pub struct Platform {
+    pub os: String,
+    pub arch: String,
+    pub has_kvm: bool,
+    pub has_tart: bool,
+}
+
+pub fn detect() -> Platform {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let os = if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else if cfg!(target_os = "linux") {
+        "linux".to_string()
+    } else {
+        "unknown".to_string()
+    };
+
+    let arch = std::env::consts::ARCH.to_string();
+
+    let has_kvm = std::path::Path::new("/dev/kvm").exists();
+    let has_tart = which::which("tart").is_ok();
+
+    Platform { os, arch, has_kvm, has_tart }
+}
+`src/backend.rs`
+use crate::platform::Platform;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Backend {
+    Tart,
+    Libvirt,
+    DockerSysbox,
+    Docker,
+}
+
+pub fn select(plat: &Platform) -> Backend {
+    if plat.os == "macos" && plat.has_tart {
+        return Backend::Tart;
+    }
+    if plat.os == "linux" && plat.has_kvm {
+        return Backend::Libvirt;
+    }
+    if plat.os == "linux" {
+        return Backend::DockerSysbox; // assume Sysbox is installed or will be
+    }
+    Backend::Docker
+}
+`src/config.rs`
+use crate::platform::Platform;
+use crate::backend::Backend;
+use anyhow::Result;
+
+pub fn generate(plat: &Platform, backend: &Backend) -> Result<()> {
+    let config = match backend {
+        Backend::Tart | Backend::Libvirt => {
+            // VM backends get per-VM resource limits
+            format!(
+                r#"
+runners:
+  default:
+    backend: {}
+    labels: [self-hosted, {}]
+    count: 2
+    resources:
+      memory: 4G
+      cpus: 2
+"#,
+                if *backend == Backend::Tart { "tart" } else { "libvirt" },
+                plat.os
+            )
+        }
+        _ => {
+            // Docker path with resource limits
+            r#"
+runners:
+  default:
+    backend: docker
+    labels: [self-hosted, docker]
+    count: 2
+    docker:
+      memory: 4g
+      cpus: 2
+      pids_limit: 100
+"#
+            .to_string()
+        }
+    };
+
+    std::fs::write("outrunner.yml", config)?;
+    println!("Generated outrunner.yml");
+    Ok(())
+}
+`src/runner.rs` (Skeleton)
+use duct::cmd;
+use anyhow::Result;
+
+pub fn start() -> Result<()> {
+    println!("Starting gha-outrunner (placeholder)...");
+    // Example: cmd!("gha-outrunner", "--config", "outrunner.yml").run()?;
+    Ok(())
+}
+
+pub fn stop() -> Result<()> {
+    println!("Stopping runners...");
+    Ok(())
+}
+
+pub fn status() -> Result<()> {
+    println!("Status: Not yet implemented");
+    Ok(())
+}
+
+6. How to Use (Planned Flow)
+# First time
+gha-isolated init
+
+# Start runners
+gha-isolated start
+
+# Check status
+gha-isolated status
+
+# Install as service (future)
+gha-isolated install-service
+On GCE: Create a Linux VM → cargo install gha-isolated (or copy binary) → run the same commands.
+
+Next Steps
+This skeleton is runnable today. Would you like me to expand any of these next?
+	1	Full runner.rs implementation (actually calling gha-outrunner)
+	2	Service installation (systemd + launchd)
+	3	Better config model (proper structs + serialization)
+	4	Prerequisite installation logic (install Sysbox/Tart automatically where possible)
+Just say which part to flesh out first (or “all of them in order”), and I’ll continue building it out.
