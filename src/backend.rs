@@ -14,10 +14,21 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub fn isolation(self) -> IsolationLevel {
+    /// Host-blast-radius containment this backend provides on THIS host.
+    /// Docker counts as VM-grade when the daemon itself runs inside a VM
+    /// (Colima/Lima/Docker Desktop): per-job isolation is still container-
+    /// grade, but a runaway job cannot take the host down — which is what
+    /// the `minimum_isolation` policy guards.
+    pub fn isolation(self, daemon_in_vm: bool) -> IsolationLevel {
         match self {
             Backend::Tart | Backend::Libvirt => IsolationLevel::Vm,
-            Backend::DockerSysbox | Backend::Docker => IsolationLevel::Container,
+            Backend::DockerSysbox | Backend::Docker => {
+                if daemon_in_vm {
+                    IsolationLevel::Vm
+                } else {
+                    IsolationLevel::Container
+                }
+            }
         }
     }
 
@@ -80,7 +91,7 @@ pub fn select(plat: &Platform, minimum: IsolationLevel) -> Selection {
             skipped.push(*backend);
             continue;
         }
-        if backend.isolation() < minimum {
+        if backend.isolation(plat.daemon_in_vm) < minimum {
             return Selection::PolicyBlocked {
                 best_available: *backend,
                 required: minimum,
@@ -114,6 +125,7 @@ mod tests {
             has_virsh: virsh,
             docker_ok: docker,
             sysbox_runtime: sysbox,
+            daemon_in_vm: false,
             total_mem_mb: 8192,
             cpus: 8,
         }
@@ -179,6 +191,25 @@ mod tests {
                 IsolationLevel::Container
             ),
             Selection::None
+        ));
+    }
+
+    #[test]
+    fn docker_in_vm_daemon_satisfies_vm_policy() {
+        let mut p = plat("linux", false, false, false, true, false);
+        p.daemon_in_vm = true;
+        match select(&p, IsolationLevel::Vm) {
+            Selection::Chosen { backend, .. } => assert_eq!(backend, Backend::Docker),
+            _ => panic!("VM-contained daemon must satisfy vm policy"),
+        }
+    }
+
+    #[test]
+    fn bare_metal_daemon_refused_under_vm_policy() {
+        let p = plat("linux", false, false, false, true, false);
+        assert!(matches!(
+            select(&p, IsolationLevel::Vm),
+            Selection::PolicyBlocked { .. }
         ));
     }
 }

@@ -142,6 +142,15 @@ fn main() -> Result<()> {
             println!("os: {} ({})", plat.os, plat.arch);
             println!("ram: {} MB | cpus: {}", plat.total_mem_mb, plat.cpus);
             println!("docker daemon: {}", ok(plat.docker_ok));
+            println!(
+                "daemon in VM: {} {}",
+                ok(plat.daemon_in_vm),
+                if plat.daemon_in_vm {
+                    "(containers are VM-contained; satisfies minimum_isolation=\"vm\")"
+                } else {
+                    "(bare-metal daemon; docker backend counts as container isolation)"
+                }
+            );
             println!("sysbox runtime: {}", ok(plat.sysbox_runtime));
             println!("kvm usable: {}", ok(plat.kvm_usable));
             println!("virsh: {}", ok(plat.has_virsh));

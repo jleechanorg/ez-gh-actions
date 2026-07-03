@@ -14,11 +14,26 @@ Easy **isolated** self-hosted GitHub Actions runners. One binary that:
 See [DESIGN.md](DESIGN.md) for the architecture and the adversarial design review that
 shaped it.
 
+## Install
+
+```bash
+git clone https://github.com/jleechanorg/ez-gh-actions
+cd ez-gh-actions && ./install.sh
+```
+
+`install.sh` is idempotent and needs no sudo: it checks prerequisites (git, Rust,
+a reachable docker daemon, an authenticated `gh`), builds and installs the `ezgha`
+binary, and prints the guided next steps below. Re-run it any time to upgrade.
+Uninstall with `./install.sh --uninstall` (your config is left in place).
+
+Claude Code users get an install + diagnosis walkthrough from the
+[`ezgha-install`](.claude/skills/ezgha-install/SKILL.md) skill.
+
 ## Quick start
 
 ```bash
 # prerequisites: docker daemon, gh CLI authenticated (gh auth login)
-cargo install --path .
+cargo install --path .              # or: ./install.sh
 
 ezgha init --target owner/repo        # detect host, write ~/.config/ezgha/config.toml
 ezgha doctor                          # see backends, limits, auth status
@@ -56,7 +71,11 @@ pids = 512
 min_free_disk_gb = 10           # refuse to spawn below this floor
 
 [policy]
-minimum_isolation = "container" # "vm" = fail closed until a VM backend is available
+minimum_isolation = "container" # "vm" = refuse to run jobs unless execution is
+                                # VM-contained: a VM backend, OR a docker daemon that
+                                # itself runs inside a VM (Colima/Lima/Docker Desktop),
+                                # detected via daemon-vs-host kernel mismatch. A
+                                # bare-metal docker daemon is refused under this policy.
 ```
 
 ## Security notes
@@ -64,6 +83,11 @@ minimum_isolation = "container" # "vm" = fail closed until a VM backend is avail
 - Runner containers get `--security-opt no-new-privileges`, no docker.sock, no
   privileged mode, and hard cgroup limits.
 - JIT runners are single-use; nothing long-lived is stored on disk.
+- `minimum_isolation = "vm"` means **VM-or-refuse**: jobs run only when execution is
+  VM-contained — either a VM backend (M2) or a docker daemon running inside a VM
+  (Colima/Lima/Docker Desktop), detected by a daemon-vs-host kernel mismatch.
+  Per-job isolation inside that VM is still container-grade; the guarantee is
+  **host blast-radius**. A bare-metal docker daemon fails closed under this policy.
 - On **public repos**: keep self-hosted workflows on `workflow_dispatch` / protected
   branches. Do not run fork PRs on self-hosted runners.
 

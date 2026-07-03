@@ -62,6 +62,17 @@ by construction rather than by cleanup scripts.
 `policy.minimum_isolation`; anything stronger-but-unimplemented produces a warning, and a
 policy violation is a hard error (fail closed).
 
+**Daemon-in-VM reclassification.** For the `minimum_isolation = "vm"` policy, a Docker
+backend counts as VM-grade containment when the daemon itself runs inside a VM — the
+common desktop/dev setups (Colima, Lima, Docker Desktop) — because the host blast-radius
+is then bounded by the VM, not just the cgroup. We detect this by comparing the daemon's
+kernel (`docker info`) against the host kernel (`uname`): a mismatch means containers
+execute against a different kernel, i.e. inside a VM. Per-job isolation is still
+container-grade in this case; the guarantee the policy makes is host blast-radius. A
+bare-metal docker daemon (kernels match) stays container-tier and is **refused** under a
+`vm` policy, so the fail-closed contract holds on Linux servers where docker shares the
+host kernel.
+
 ## Module map
 
 | File | Responsibility |

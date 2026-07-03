@@ -139,6 +139,7 @@ mod tests {
             has_virsh: false,
             docker_ok: true,
             sysbox_runtime: false,
+            daemon_in_vm: false,
             total_mem_mb: mem_mb,
             cpus,
         }

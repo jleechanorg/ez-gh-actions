@@ -14,6 +14,9 @@ pub struct Platform {
     pub docker_ok: bool,
     /// sysbox-runc registered as a Docker runtime.
     pub sysbox_runtime: bool,
+    /// The docker daemon runs inside a VM (Colima/Lima/Docker Desktop/remote),
+    /// so containers are VM-contained even though the backend is "docker".
+    pub daemon_in_vm: bool,
     pub total_mem_mb: u64,
     pub cpus: u32,
 }
@@ -27,18 +30,50 @@ pub fn detect() -> Platform {
         "unsupported"
     };
 
+    let docker_ok = docker_daemon_ok();
     Platform {
         os,
         arch: std::env::consts::ARCH,
         kvm_usable: kvm_usable(),
         has_tart: which::which("tart").is_ok(),
         has_virsh: which::which("virsh").is_ok(),
-        docker_ok: docker_daemon_ok(),
+        docker_ok,
         sysbox_runtime: sysbox_runtime_present(),
+        daemon_in_vm: docker_ok && daemon_in_vm(),
         total_mem_mb: total_mem_mb(),
         cpus: std::thread::available_parallelism()
             .map(|n| n.get() as u32)
             .unwrap_or(1),
+    }
+}
+
+/// A daemon kernel different from the host kernel proves the daemon runs on a
+/// different machine — in practice a local VM (Colima/Lima/Docker Desktop) or
+/// a remote host. On macOS the daemon is always in a VM (macOS has no native
+/// Linux containers), so any Linux daemon kernel counts.
+fn daemon_in_vm() -> bool {
+    let daemon_kernel = Command::new("docker")
+        .args(["info", "--format", "{{.KernelVersion}}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    let Some(daemon_kernel) = daemon_kernel else {
+        return false;
+    };
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    let host_kernel = Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match host_kernel {
+        Some(h) => !h.is_empty() && h != daemon_kernel,
+        None => false,
     }
 }
 

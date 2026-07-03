@@ -1,0 +1,35 @@
+# Runs the test suite on an ezgha-managed ephemeral runner so the self-hosted
+# fleet does real work on every push. Deliberately push-to-main only: fork PRs
+# must never reach a self-hosted runner on a public repo.
+name: CI (self-hosted ezgha)
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-selfhosted
+  cancel-in-progress: false
+
+jobs:
+  test-on-ezgha:
+    runs-on: [self-hosted, ezgha]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Prove execution environment
+        run: |
+          echo "runner: $RUNNER_NAME on $(hostname)"
+          echo "memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+          echo "pids.max: $(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo n/a)"
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - name: Build and test
+        run: |
+          . "$HOME/.cargo/env"
+          cargo test
