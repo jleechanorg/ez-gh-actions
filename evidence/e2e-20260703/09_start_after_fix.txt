@@ -1,0 +1,5 @@
+started ephemeral runner ezgha-Jeff-Ubuntu-6a4837d823130641 [docker (container)]
+managed containers: 1
+  f75b44af6016 ezgha-Jeff-Ubuntu-6a4837d823130641 (running, up Less than a second ago)
+registered ezgha runners on jleechanorg/ez-gh-actions: 1
+  #4 ezgha-Jeff-Ubuntu-6a4837d823130641 status=offline busy=false
