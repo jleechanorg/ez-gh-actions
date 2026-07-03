@@ -1,0 +1,5 @@
+docker daemon capacity: 4 cpus, 11955 MB
+wrote /home/jleechan/.config/ezgha/config.toml
+host: linux x86_64 | 63976 MB RAM, 32 cpus
+limits per runner: 5977 MB RAM, 2 cpus, 512 pids
+backend: docker (container)

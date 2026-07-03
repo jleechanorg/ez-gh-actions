@@ -1,0 +1,22 @@
+version = 1
+
+[github]
+scope = "repo"
+target = "jleechanorg/ez-gh-actions"
+
+[runner]
+labels = [
+    "self-hosted",
+    "ezgha",
+]
+count = 1
+image = "ghcr.io/actions/actions-runner:latest"
+
+[limits]
+memory_mb = 5977
+cpus = 2.0
+pids = 512
+min_free_disk_gb = 10
+
+[policy]
+minimum_isolation = "container"

@@ -1,0 +1,30 @@
+selftest	Set up job	﻿2026-07-03T22:12:26.7273042Z Current runner version: '2.335.1'
+selftest	Set up job	2026-07-03T22:12:26.7278624Z Runner name: 'ezgha-Jeff-Ubuntu-6a4833a11c652b'
+selftest	Set up job	2026-07-03T22:12:26.7279165Z Runner group name: 'Default'
+selftest	Set up job	2026-07-03T22:12:26.7279753Z Machine name: '1143cf62e74f'
+selftest	Set up job	2026-07-03T22:12:26.7281214Z ##[group]GITHUB_TOKEN Permissions
+selftest	Set up job	2026-07-03T22:12:26.7364980Z Contents: read
+selftest	Set up job	2026-07-03T22:12:26.7365619Z Metadata: read
+selftest	Set up job	2026-07-03T22:12:26.7365935Z ##[endgroup]
+selftest	Set up job	2026-07-03T22:12:26.7368134Z Secret source: Actions
+selftest	Set up job	2026-07-03T22:12:26.7368747Z Prepare workflow directory
+selftest	Set up job	2026-07-03T22:12:26.9544942Z Prepare all required actions
+selftest	Set up job	2026-07-03T22:12:26.9980176Z Complete job name: selftest
+selftest	Prove execution environment	﻿2026-07-03T22:12:27.4580622Z ##[group]Run echo "runner name: $RUNNER_NAME"
+selftest	Prove execution environment	2026-07-03T22:12:27.4581802Z ^[[36;1mecho "runner name: $RUNNER_NAME"^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.4582266Z ^[[36;1mecho "hostname: $(hostname)"^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.4582611Z ^[[36;1muname -a^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.4582878Z ^[[36;1mnproc^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.4583473Z ^[[36;1mcat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "no cgroup file"^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.4584234Z ^[[36;1mcat /sys/fs/cgroup/pids.max 2>/dev/null || true^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.4584754Z ^[[36;1mecho "ephemeral runner proof: this job ran, the runner will now deregister"^[[0m
+selftest	Prove execution environment	2026-07-03T22:12:27.5092677Z shell: /usr/bin/bash -e {0}
+selftest	Prove execution environment	2026-07-03T22:12:27.5093412Z ##[endgroup]
+selftest	Prove execution environment	2026-07-03T22:12:27.6823404Z runner name: ezgha-Jeff-Ubuntu-6a4833a11c652b
+selftest	Prove execution environment	2026-07-03T22:12:27.6863859Z hostname: 1143cf62e74f
+selftest	Prove execution environment	2026-07-03T22:12:27.6883071Z Linux 1143cf62e74f 6.8.0-134-generic #134-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+selftest	Prove execution environment	2026-07-03T22:12:27.6884128Z 4
+selftest	Prove execution environment	2026-07-03T22:12:27.6884638Z 6267338752
+selftest	Prove execution environment	2026-07-03T22:12:27.6885057Z 512
+selftest	Prove execution environment	2026-07-03T22:12:27.6885514Z ephemeral runner proof: this job ran, the runner will now deregister
+selftest	Complete job	﻿2026-07-03T22:12:27.7198387Z Cleaning up orphan processes

@@ -1,0 +1,11 @@
+os: linux (x86_64)
+ram: 63976 MB | cpus: 32
+docker daemon: ok
+sysbox runtime: missing
+kvm usable: ok
+virsh: missing
+tart: missing
+gh auth: ok
+backends (strongest first):
+  - docker (container)
+config: /home/jleechan/.config/ezgha/config.toml (target jleechanorg/ez-gh-actions, count 1)
