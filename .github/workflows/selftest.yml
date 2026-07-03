@@ -1,0 +1,23 @@
+# E2E self-test: runs on an ezgha-managed ephemeral runner.
+# Dispatch-only on purpose — never triggered by fork PRs (self-hosted safety).
+name: ezgha-selftest
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: [self-hosted, ezgha]
+    timeout-minutes: 10
+    steps:
+      - name: Prove execution environment
+        run: |
+          echo "runner name: $RUNNER_NAME"
+          echo "hostname: $(hostname)"
+          uname -a
+          nproc
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "no cgroup file"
+          cat /sys/fs/cgroup/pids.max 2>/dev/null || true
+          echo "ephemeral runner proof: this job ran, the runner will now deregister"
