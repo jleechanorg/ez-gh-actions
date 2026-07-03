@@ -30,9 +30,42 @@ fn hostname() -> String {
         .unwrap_or_else(|| "host".into())
 }
 
+/// CPU and memory capacity of the docker DAEMON, which may be smaller than
+/// the local host when docker runs inside a VM (Colima/Lima/Docker Desktop)
+/// or on a remote context. Limits must respect the daemon, not the host.
+pub fn daemon_capacity() -> Option<(f64, u64)> {
+    let out = Command::new("docker")
+        .args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut parts = stdout.split_whitespace();
+    let ncpu: f64 = parts.next()?.parse().ok()?;
+    let mem_bytes: u64 = parts.next()?.parse().ok()?;
+    Some((ncpu, mem_bytes / 1024 / 1024))
+}
+
+/// Clamp configured limits to what the daemon can actually provide.
+pub fn effective_limits(cfg: &Config) -> (f64, u64) {
+    let (mut cpus, mut mem) = (cfg.limits.cpus, cfg.limits.memory_mb);
+    if let Some((ncpu, daemon_mem)) = daemon_capacity() {
+        if cpus > ncpu {
+            eprintln!("note: clamping cpus {cpus} -> {ncpu} (docker daemon capacity)");
+            cpus = ncpu;
+        }
+        if mem > daemon_mem {
+            eprintln!("note: clamping memory {mem} MB -> {daemon_mem} MB (docker daemon capacity)");
+            mem = daemon_mem;
+        }
+    }
+    (cpus, mem)
+}
+
 /// Start one ephemeral JIT runner container. Returns (container_id, runner_name).
 pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
     let runner_name = format!("ezgha-{}-{}", hostname(), unique_suffix());
+    let (cpus, memory_mb) = effective_limits(cfg);
     let (jit, runner_id) =
         github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels)?;
 
@@ -43,9 +76,9 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
     cmd.args(["--label", &format!("ezgha.runner_id={runner_id}")]);
     // Hard resource limits: the reason this tool exists. A runaway job dies
     // inside its cgroup instead of taking the host down.
-    cmd.args(["--memory", &format!("{}m", cfg.limits.memory_mb)]);
-    cmd.args(["--memory-swap", &format!("{}m", cfg.limits.memory_mb)]);
-    cmd.args(["--cpus", &format!("{}", cfg.limits.cpus)]);
+    cmd.args(["--memory", &format!("{memory_mb}m")]);
+    cmd.args(["--memory-swap", &format!("{memory_mb}m")]);
+    cmd.args(["--cpus", &format!("{cpus}")]);
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
     if backend == Backend::DockerSysbox {

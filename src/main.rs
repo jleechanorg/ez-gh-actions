@@ -115,6 +115,13 @@ fn main() -> Result<()> {
             let plat = platform::detect();
             let mut cfg = Config::defaults_for(&plat, target.clone(), scope);
             cfg.runner.count = *count;
+            // The docker daemon may be a VM (Colima/Lima/Desktop) smaller than
+            // the host; size limits to the environment containers run in.
+            if let Some((ncpu, daemon_mem)) = docker_backend::daemon_capacity() {
+                cfg.limits.cpus = cfg.limits.cpus.min((ncpu / 2.0).max(1.0));
+                cfg.limits.memory_mb = cfg.limits.memory_mb.min((daemon_mem / 2).max(1024));
+                println!("docker daemon capacity: {ncpu} cpus, {daemon_mem} MB");
+            }
             cfg.save(&path)?;
             println!("wrote {}", path.display());
             println!(
