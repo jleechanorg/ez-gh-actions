@@ -122,6 +122,19 @@ fn main() -> Result<()> {
                 cfg.limits.memory_mb = cfg.limits.memory_mb.min((daemon_mem / 2).max(1024));
                 println!("docker daemon capacity: {ncpu} cpus, {daemon_mem} MB");
             }
+            // Persist a per-install host id so runner-name prefixes stay
+            // stable across re-runs and across hostname changes. Without
+            // this, two hosts with `hostname` returning the same value
+            // (or both failing) would emit identical runner names and
+            // either host's `stop` would tear down the other's idle
+            // runners — the fleet-wide outage the host-scoped deregistration
+            // fix was added to prevent.
+            if let Some(host_id) = docker_backend::load_or_mint_host_id() {
+                println!(
+                    "host id: {} (persisted at init)",
+                    &host_id[..8.min(host_id.len())]
+                );
+            }
             cfg.save(&path)?;
             println!("wrote {}", path.display());
             println!(
