@@ -66,10 +66,31 @@ pub fn generate_jitconfig(
         .output()
         .context("failed to run `gh api` — is the gh CLI installed?")?;
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("Already exists") || stderr.contains("already exists") {
+            if let Ok(runners) = list_runners(gh) {
+                if let Some(conflicting) = runners.iter().find(|r| r.name == name) {
+                    eprintln!("note: runner {} already exists (id {}), removing it first", name, conflicting.id);
+                    if remove_runner(gh, conflicting.id).is_ok() {
+                        let mut retry_cmd = Command::new("gh");
+                        retry_cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
+                        retry_cmd.args(["-F", "runner_group_id=1"]);
+                        for label in labels {
+                            retry_cmd.args(["-f", &format!("labels[]={label}")]);
+                        }
+                        let retry_out = retry_cmd.output()?;
+                        if retry_out.status.success() {
+                            let parsed: JitConfigResponse = serde_json::from_slice(&retry_out.stdout)?;
+                            return Ok((parsed.encoded_jit_config, parsed.runner.id));
+                        }
+                    }
+                }
+            }
+        }
         bail!(
             "gh api generate-jitconfig failed for {}: {}",
             gh.target,
-            String::from_utf8_lossy(&out.stderr)
+            stderr
         );
     }
     let parsed: JitConfigResponse =
