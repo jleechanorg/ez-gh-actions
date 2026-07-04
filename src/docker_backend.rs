@@ -235,7 +235,6 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
         match github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels) {
             Ok(pair) => pair,
             Err(e) => {
-                let _ = release_slot(slot);
                 return Err(e);
             }
         };
@@ -263,7 +262,6 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
         // The JIT registration exists server-side but no runner will ever
         // connect; clean it up so the repo runner list stays tidy.
         let _ = github::remove_runner(&cfg.github, runner_id);
-        let _ = release_slot(slot);
         bail!(
             "docker run failed: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -417,9 +415,23 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
         ),
     }
     let mut started = Vec::new();
+    let mut last_err = None;
     for _ in alive..cfg.runner.count {
-        let (_, name) = start_one(cfg, backend)?;
-        started.push(name);
+        match start_one(cfg, backend) {
+            Ok((_, name)) => started.push(name),
+            Err(e) => {
+                eprintln!("warning: failed to start runner: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    // Release any failed reservations from this cycle
+    let _ = release_stale_slots(cfg);
+
+    if started.is_empty() {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
     }
     Ok(started)
 }
