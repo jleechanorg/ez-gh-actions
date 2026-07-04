@@ -1,0 +1,73 @@
+
+=== 1. ezgha service ===
+  [OK]   ezgha.service = active
+  [..]   ezgha.service enabled=enabled
+
+=== 2. docker daemon ===
+  [OK]   docker daemon reachable (version/cpu/mem: 29.5.3 4 12535848960)
+
+=== 3. colima VM (the daemon's host) ===
+  [OK]   colima VM running
+
+=== 4. ezgha runtime state ===
+  [..]   binary PID RSS=? KB
+  [..]   ensure_count failed occurrences in last 3 min: 0
+  [..]   most recent journal line: Jul 04 12:24:32 Jeff-Ubuntu ezgha[278409
+  [OK]   slot_assignments.toml present (16 slots reserved)
+
+=== 5. GitHub org runner fleet (jleechanorg) ===
+  total=22 online=22 offline=0 busy=0
+  [OK]   ezgha: ez-org-runner-1 online
+  [OK]   ezgha: ez-org-runner-10 online
+  [OK]   ezgha: ez-org-runner-11 online
+  [OK]   ezgha: ez-org-runner-12 online
+  [OK]   ezgha: ez-org-runner-13 online
+  [OK]   ezgha: ez-org-runner-14 online
+  [OK]   ezgha: ez-org-runner-15 online
+  [OK]   ezgha: ez-org-runner-16 online
+  [OK]   ezgha: ez-org-runner-2 online
+  [OK]   ezgha: ez-org-runner-3 online
+  [OK]   ezgha: ez-org-runner-4 online
+  [OK]   ezgha: ez-org-runner-5 online
+  [OK]   ezgha: ez-org-runner-6 online
+  [OK]   ezgha: ez-org-runner-7 online
+  [OK]   ezgha: ez-org-runner-8 online
+  [OK]   ezgha: ez-org-runner-9 online
+  (colima leftovers still present, not auto-cleaned by ezgha):
+  [WARN] colima: org-runner-mac-1 online
+  [WARN] colima: org-runner-mac-2 online
+  [WARN] colima: org-runner-mac-3 online
+  [WARN] colima: org-runner-mac-4 online
+  [WARN] colima: org-runner-mac-5 online
+  [WARN] colima: org-runner-mac-6 online
+
+=== 6. live docker containers (ezgha-managed) ===
+  [..]   managed containers running: 16 (expected: configured runner.count)
+ez-org-runner-13 Up 26 seconds
+ez-org-runner-1 Up About a minute
+ez-org-runner-4 Up 9 minutes
+ez-org-runner-6 Up 12 minutes
+ez-org-runner-16 Up 13 minutes
+ez-org-runner-14 Up 13 minutes
+ez-org-runner-9 Up 14 minutes
+ez-org-runner-2 Up 14 minutes
+ez-org-runner-15 Up 15 minutes
+ez-org-runner-12 Up 17 minutes
+ez-org-runner-11 Up 18 minutes
+ez-org-runner-10 Up 18 minutes
+ez-org-runner-8 Up 18 minutes
+ez-org-runner-7 Up 18 minutes
+ez-org-runner-5 Up 18 minutes
+ez-org-runner-3 Up 18 minutes
+
+=== 7. real job-execution proof (last 6 ezgha-selftest runs) ===
+  [OK]   run 28703983289: success on ez-org-runner-16 (our fleet)
+  [OK]   run 28703982618: success on ez-org-runner-10 (our fleet)
+  [OK]   run 28703981939: success on ez-org-runner-12 (our fleet)
+  [OK]   run 28703945368: success on ez-org-runner-6 (our fleet)
+  [OK]   run 28703944342: success on ez-org-runner-5 (our fleet)
+  [OK]   run 28703943434: success on ez-org-runner-4 (our fleet)
+  [..]   real jobs succeeded on our fleet: 6 / 6
+
+=== verdict ===
+  [OK]   fleet healthy: 22/22 runners online, 0 busy, 16 containers up, 0 loop errors
