@@ -62,9 +62,14 @@ fi
 section "4. ezgha runtime state"
 SERVICE_RSS=$(ps -o rss= -p $(pgrep -f '^target/release/ezgha' 2>/dev/null | head -1) 2>/dev/null || echo "?")
 info "binary PID RSS=${SERVICE_RSS} KB"
-LOOP_FAILS=$(journalctl --user -u ezgha.service --no-pager -n 200 2>/dev/null | grep -c 'ensure_count failed' || true)
+# Count ensure_count failures in a TIME window, not a line window. ezgha logs
+# roughly one line per 30s, so `-n 200` spans ~100 minutes and keeps stale
+# errors from a since-recovered incident red long after the fleet is healthy.
+# Health means CURRENT health: only the last LOOP_WINDOW minutes count.
+LOOP_WINDOW="${LOOP_WINDOW:-3}"
+LOOP_FAILS=$(journalctl --user -u ezgha.service --since "${LOOP_WINDOW} minutes ago" --no-pager 2>/dev/null | grep -c 'ensure_count failed' || true)
 LAST_LOOP=$(journalctl --user -u ezgha.service --no-pager -n 1 2>/dev/null | sed -n '1p' | cut -c1-40 || true)
-info "ensure_count failed occurrences in last 200 journal lines: $LOOP_FAILS"
+info "ensure_count failed occurrences in last ${LOOP_WINDOW} min: $LOOP_FAILS"
 info "most recent journal line: $LAST_LOOP"
 SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
 if [ -f "$SLOT_FILE" ]; then
