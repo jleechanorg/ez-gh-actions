@@ -5,7 +5,13 @@ use std::path::PathBuf;
 
 use crate::platform::Platform;
 
+/// The only config schema version this binary understands. Bump when the
+/// on-disk format changes incompatibly; `load()` refuses anything else rather
+/// than silently mis-reading fields.
+const CURRENT_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
     pub github: GithubConfig,
@@ -15,6 +21,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct GithubConfig {
     /// "repo" or "org"
     pub scope: Scope,
@@ -30,6 +37,7 @@ pub enum Scope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     pub labels: Vec<String>,
     /// How many concurrent ephemeral runners to keep available.
@@ -50,6 +58,7 @@ fn default_runner_name_prefix() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub memory_mb: u64,
     pub cpus: f64,
@@ -65,6 +74,7 @@ fn default_min_free_disk_gb() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Refuse to start when the best available backend is weaker than this.
     /// "vm" > "container". Fail closed instead of silently degrading.
@@ -121,10 +131,61 @@ impl Config {
         Ok(dirs.config_dir().join("config.toml"))
     }
 
+    /// Reject configs that parse syntactically but are semantically unsafe.
+    /// The whole point of this tool is bounding runaway jobs, so a `memory_mb`
+    /// or `cpus` of 0 (which Docker treats as "unlimited") is a fail-open hole
+    /// in the core safety guarantee. We bail rather than clamp: a nonsensical
+    /// limit is an operator mistake that should be seen, not silently rewritten.
+    pub fn validate(&self) -> Result<()> {
+        if self.version != CURRENT_VERSION {
+            anyhow::bail!(
+                "unsupported config version {} (this binary understands version {}); \
+                 re-run `ezgha init` or migrate the config",
+                self.version,
+                CURRENT_VERSION
+            );
+        }
+        if self.limits.memory_mb < 512 {
+            anyhow::bail!(
+                "limits.memory_mb must be at least 512 (got {}); 0 means \
+                 'unlimited' to Docker and defeats the resource cap",
+                self.limits.memory_mb
+            );
+        }
+        if !self.limits.cpus.is_finite() || self.limits.cpus < 0.5 {
+            anyhow::bail!(
+                "limits.cpus must be a finite value >= 0.5 (got {}); 0 means \
+                 'unlimited' to Docker and defeats the resource cap",
+                self.limits.cpus
+            );
+        }
+        if self.limits.pids < 1 {
+            anyhow::bail!("limits.pids must be at least 1 (got {})", self.limits.pids);
+        }
+        if self.runner.count < 1 {
+            anyhow::bail!(
+                "runner.count must be at least 1 (got {})",
+                self.runner.count
+            );
+        }
+        if self.github.target.trim().is_empty() {
+            anyhow::bail!("github.target must not be empty");
+        }
+        if self.github.scope == Scope::Repo && self.github.target.matches('/').count() != 1 {
+            anyhow::bail!(
+                "github.target must be exactly \"owner/repo\" for repo scope (got {:?})",
+                self.github.target
+            );
+        }
+        Ok(())
+    }
+
     pub fn load(path: &PathBuf) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("no config at {} — run `ezgha init` first", path.display()))?;
         let cfg: Config = toml::from_str(&raw)
+            .with_context(|| format!("invalid config at {}", path.display()))?;
+        cfg.validate()
             .with_context(|| format!("invalid config at {}", path.display()))?;
         Ok(cfg)
     }
@@ -185,5 +246,187 @@ mod tests {
     #[test]
     fn isolation_ordering_fail_closed() {
         assert!(IsolationLevel::Vm > IsolationLevel::Container);
+    }
+
+    fn valid_config() -> Config {
+        Config::defaults_for(&fake_platform(8192, 8), "owner/repo".into(), Scope::Repo)
+    }
+
+    /// Write `raw` to a unique temp file and attempt to load it, returning the
+    /// result so tests can assert on the (in)validity.
+    fn load_from_str(raw: &str, tag: &str) -> Result<Config> {
+        let path = std::env::temp_dir().join(format!(
+            "ezgha-test-{}-{}-{:?}.toml",
+            std::process::id(),
+            tag,
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, raw).unwrap();
+        let out = Config::load(&path);
+        std::fs::remove_file(&path).ok();
+        out
+    }
+
+    #[test]
+    fn valid_config_passes_validation() {
+        valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn reject_zero_memory() {
+        let mut cfg = valid_config();
+        cfg.limits.memory_mb = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_memory_below_floor() {
+        let mut cfg = valid_config();
+        cfg.limits.memory_mb = 511;
+        assert!(cfg.validate().is_err());
+        cfg.limits.memory_mb = 512;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn reject_zero_cpus() {
+        let mut cfg = valid_config();
+        cfg.limits.cpus = 0.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_subminimum_cpus() {
+        let mut cfg = valid_config();
+        cfg.limits.cpus = 0.25;
+        assert!(cfg.validate().is_err());
+        cfg.limits.cpus = 0.5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn reject_non_finite_cpus() {
+        let mut cfg = valid_config();
+        cfg.limits.cpus = f64::NAN;
+        assert!(cfg.validate().is_err());
+        cfg.limits.cpus = f64::INFINITY;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_zero_pids() {
+        let mut cfg = valid_config();
+        cfg.limits.pids = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_zero_count() {
+        let mut cfg = valid_config();
+        cfg.runner.count = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_empty_target() {
+        let mut cfg = valid_config();
+        cfg.github.target = "   ".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_repo_target_without_single_slash() {
+        let mut cfg = valid_config();
+        cfg.github.scope = Scope::Repo;
+        cfg.github.target = "justowner".into();
+        assert!(cfg.validate().is_err());
+        cfg.github.target = "owner/repo/extra".into();
+        assert!(cfg.validate().is_err());
+        cfg.github.target = "owner/repo".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn org_scope_allows_bare_target() {
+        let mut cfg = valid_config();
+        cfg.github.scope = Scope::Org;
+        cfg.github.target = "myorg".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn reject_wrong_version() {
+        let mut cfg = valid_config();
+        cfg.version = CURRENT_VERSION + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn load_rejects_unknown_field() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+typo_min_free_disk_gb = 10
+[policy]
+minimum_isolation = "container"
+"#;
+        let err = load_from_str(raw, "unknown").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("typo_min_free_disk_gb")
+                || format!("{err:#}").to_lowercase().contains("unknown"),
+            "expected unknown-field error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_zero_memory_from_disk() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 0
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        assert!(load_from_str(raw, "zeromem").is_err());
+    }
+
+    #[test]
+    fn load_rejects_wrong_version_from_disk() {
+        let raw = r#"
+version = 999
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        assert!(load_from_str(raw, "ver").is_err());
     }
 }

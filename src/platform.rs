@@ -1,5 +1,53 @@
 use std::fs::OpenOptions;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// Hard ceiling on how long any external capability probe may run. A wedged
+/// docker daemon (the common failure mode this tool exists to contain) would
+/// otherwise hang `detect()` — and therefore every ezgha command — forever.
+/// On expiry we kill the probe and treat the capability as absent.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Run `cmd` capturing stdout, but never block longer than `timeout`. Returns
+/// `Some((exit_success, stdout_bytes))` if the child finished in time, or
+/// `None` if it errored or was killed for exceeding the deadline.
+///
+/// The child is spawned and its stdout drained on a helper thread; the caller
+/// blocks on `recv_timeout`. On expiry we `kill()` the child (which unblocks
+/// the reader thread via EOF) and reap it so nothing leaks.
+fn capture_with_timeout(mut cmd: Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(buf) => {
+            let status = child.wait().ok()?;
+            Some((status.success(), buf))
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+/// Convenience wrapper applying the standard [`PROBE_TIMEOUT`].
+fn capture(cmd: Command) -> Option<(bool, Vec<u8>)> {
+    capture_with_timeout(cmd, PROBE_TIMEOUT)
+}
 
 /// What this host can offer, detected at runtime.
 #[derive(Debug, Clone)]
@@ -52,12 +100,11 @@ pub fn detect() -> Platform {
 /// a remote host. On macOS the daemon is always in a VM (macOS has no native
 /// Linux containers), so any Linux daemon kernel counts.
 fn daemon_in_vm() -> bool {
-    let daemon_kernel = Command::new("docker")
-        .args(["info", "--format", "{{.KernelVersion}}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    let mut docker_info = Command::new("docker");
+    docker_info.args(["info", "--format", "{{.KernelVersion}}"]);
+    let daemon_kernel = capture(docker_info)
+        .filter(|(ok, _)| *ok)
+        .map(|(_, out)| String::from_utf8_lossy(&out).trim().to_string())
         .filter(|s| !s.is_empty());
     let Some(daemon_kernel) = daemon_kernel else {
         return false;
@@ -65,12 +112,11 @@ fn daemon_in_vm() -> bool {
     if cfg!(target_os = "macos") {
         return true;
     }
-    let host_kernel = Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let mut uname = Command::new("uname");
+    uname.arg("-r");
+    let host_kernel = capture(uname)
+        .filter(|(ok, _)| *ok)
+        .map(|(_, out)| String::from_utf8_lossy(&out).trim().to_string());
     match host_kernel {
         Some(h) => !h.is_empty() && h != daemon_kernel,
         None => false,
@@ -88,18 +134,16 @@ fn kvm_usable() -> bool {
 }
 
 fn docker_daemon_ok() -> bool {
-    Command::new("docker")
-        .args(["version", "--format", "{{.Server.Version}}"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut cmd = Command::new("docker");
+    cmd.args(["version", "--format", "{{.Server.Version}}"]);
+    capture(cmd).map(|(ok, _)| ok).unwrap_or(false)
 }
 
 fn sysbox_runtime_present() -> bool {
-    Command::new("docker")
-        .args(["info", "--format", "{{json .Runtimes}}"])
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("sysbox-runc"))
+    let mut cmd = Command::new("docker");
+    cmd.args(["info", "--format", "{{json .Runtimes}}"]);
+    capture(cmd)
+        .map(|(ok, out)| ok && String::from_utf8_lossy(&out).contains("sysbox-runc"))
         .unwrap_or(false)
 }
 
@@ -123,21 +167,55 @@ fn total_mem_mb() -> u64 {
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-            })
+        let mut cmd = Command::new("sysctl");
+        cmd.args(["-n", "hw.memsize"]);
+        capture(cmd)
+            .and_then(|(_, out)| String::from_utf8_lossy(&out).trim().parse::<u64>().ok())
             .map(|b| b / 1024 / 1024)
             .unwrap_or(0)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn capture_returns_output_for_fast_command() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("hello");
+        let (ok, out) = capture_with_timeout(cmd, Duration::from_secs(4))
+            .expect("fast command should complete");
+        assert!(ok);
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "hello");
+    }
+
+    #[test]
+    fn capture_reports_nonzero_exit() {
+        // `false` exits 1: the probe ran, but did not succeed.
+        let cmd = Command::new("false");
+        let (ok, _out) = capture_with_timeout(cmd, Duration::from_secs(4))
+            .expect("false should complete quickly");
+        assert!(!ok);
+    }
+
+    #[test]
+    fn capture_kills_wedged_command_and_returns_none() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let result = capture_with_timeout(cmd, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert!(result.is_none(), "wedged command must time out to None");
+        // Must return promptly after the deadline, not wait out the full sleep.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout should fire near the deadline, took {elapsed:?}"
+        );
     }
 }
