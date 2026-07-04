@@ -1,13 +1,15 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Once;
 
 use crate::backend::Backend;
 use crate::config::Config;
 use crate::github;
+use crate::platform::Platform;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
 
@@ -119,6 +121,71 @@ pub fn release_slot(slot: u32) -> Result<()> {
     assignments.assignments.remove(&slot.to_string());
     write_slot_assignments(&assignments)
 }
+
+/// Release slots whose recorded `runner_id` no longer corresponds to a live
+/// GitHub-registered runner. Slots can get stuck if the docker daemon dies,
+/// the container exits abruptly, or GitHub reaps the registration server-side:
+/// `release_slot` never fires, so the slot file grows stale and `next_slot`
+/// eventually refuses to allocate even though no real runner is consuming
+/// the slot. Called at the start of `ensure_count` so `serve` self-heals
+/// without operator intervention.
+///
+/// Returns the number of slots reclaimed.
+pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
+    let live_runners = github::list_runners(&cfg.github).unwrap_or_default();
+    release_stale_slots_from(&read_slot_assignments()?, &live_runners)
+}
+
+/// Inner reconciliation routine that operates on a caller-provided live-runner
+/// snapshot. Split out so tests can drive it without a live `gh` auth context;
+/// `release_stale_slots` is the production entry point that fetches the live
+/// list via `github::list_runners`.
+fn release_stale_slots_from(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+) -> Result<usize> {
+    if assignments.assignments.is_empty() {
+        return Ok(0);
+    }
+    let live_ids: HashSet<u64> = live_runners.iter().map(|r| r.id).collect();
+    let mut reclaimed = 0;
+    for (slot, id_str) in &assignments.assignments {
+        if id_str.is_empty() {
+            // Reserved by `next_slot` but `record_slot_runner_id` never ran
+            // (JIT registration failed mid-flight, or the daemon died before
+            // the container came up). Free the slot immediately so the next
+            // allocation cycle can claim it.
+            release_slot(slot.parse().unwrap())?;
+            reclaimed += 1;
+        } else if let Ok(rid) = id_str.parse::<u64>() {
+            if !live_ids.contains(&rid) {
+                // The recorded runner_id is no longer registered on GitHub
+                // (server-side reap, manual removal, or a stale entry from a
+                // prior host). Treat the slot as free.
+                release_slot(slot.parse().unwrap())?;
+                reclaimed += 1;
+            }
+        }
+    }
+    Ok(reclaimed)
+}
+
+/// Print the `ezgha doctor`-style diagnostics for the current host. Today this
+/// is a single warning that fires only when the docker daemon is sharing the
+/// host kernel on Linux — i.e. bare-metal docker, no VM containment — so
+/// callers know their jobs run with `HOST-BLAST-RADIUS` isolation only.
+pub fn print_doctor(plat: &Platform) {
+    if plat.docker_ok && !plat.daemon_in_vm && plat.os == "linux" {
+        println!(
+            "WARNING: daemon shares host kernel — ezgha jobs run in HOST-BLAST-RADIUS container isolation only"
+        );
+    }
+}
+
+/// Process-wide guard so `print_doctor`'s warning prints at most once per
+/// `serve` process — otherwise the 30s reconciliation loop would re-emit the
+/// same diagnostic forever.
+static DOCTOR_PRINTED: Once = Once::new();
 
 /// Build the runner container name for a given slot.
 fn runner_name_for(cfg: &Config, slot: u32) -> String {
@@ -323,6 +390,15 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
 /// disk exhaustion is the dominant self-hosted runner failure mode, and
 /// spawning more work onto a full disk makes the incident worse.
 pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
+    // Reconcile stale slot assignments before we look at container counts:
+    // a daemon crash between `next_slot` and the container coming up leaves a
+    // reservation that would otherwise wedge `next_slot` forever ("all N
+    // runner slot(s) are currently in use"). `serve` calls this on a 30s
+    // loop, so the host self-heals on the next tick.
+    let _ = release_stale_slots(cfg);
+    // Print the host-kernel warning at most once per process — `serve` would
+    // otherwise re-emit it every 30s.
+    DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let alive = managed_containers()?.len() as u32;
     if alive >= cfg.runner.count {
         return Ok(Vec::new());
@@ -497,5 +573,83 @@ mod tests {
         let mut custom = cfg.clone();
         custom.runner.name_prefix = "lab-runner".into();
         assert_eq!(runner_name_for(&custom, 7), "lab-runner-7");
+    }
+
+    fn runner_info(id: u64, name: &str) -> github::RunnerInfo {
+        github::RunnerInfo {
+            id,
+            name: name.into(),
+            status: "online".into(),
+            busy: false,
+        }
+    }
+
+    #[test]
+    fn release_stale_slots_releases_slot_when_runner_id_not_in_live() {
+        let _env = TestEnv::new("stale_releases");
+        let cfg = cfg_with(2, "ez-org-runner");
+        // Slot 1 was reserved AND has a recorded runner_id that is NOT in
+        // the live GitHub list (server-side reap, or daemon died mid-flight).
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
+
+        assert_eq!(reclaimed, 1, "the stale slot must be reclaimed");
+        let a = read_slot_assignments().unwrap();
+        assert!(
+            !a.assignments.contains_key("1"),
+            "slot 1 must be removed; got: {:?}",
+            a.assignments
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_slot_when_runner_id_in_live() {
+        let _env = TestEnv::new("stale_keeps");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap();
+
+        // Live list DOES contain the recorded id — this slot is healthy.
+        let live = vec![runner_info(1234, "ez-org-runner-1")];
+        let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
+
+        assert_eq!(reclaimed, 0, "live slots must not be reclaimed");
+        let a = read_slot_assignments().unwrap();
+        assert_eq!(
+            a.assignments.get("1").map(String::as_str),
+            Some("1234"),
+            "slot 1 must remain recorded"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_handles_empty_runner_id() {
+        let _env = TestEnv::new("stale_empty");
+        let cfg = cfg_with(2, "ez-org-runner");
+        // Reserved (`next_slot`) but `record_slot_runner_id` never ran — this
+        // is the "JIT in flight, daemon crashed" wedge case.
+        let _slot = next_slot(&cfg).unwrap();
+
+        let live: Vec<github::RunnerInfo> = vec![];
+        let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
+
+        assert_eq!(reclaimed, 1, "empty-id reservations must be released");
+        assert!(
+            read_slot_assignments().unwrap().assignments.is_empty(),
+            "all reservations must be cleared when none have runner_ids"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_returns_zero_when_no_assignments() {
+        let _env = TestEnv::new("stale_empty_file");
+        let _cfg = cfg_with(2, "ez-org-runner");
+        // No slots reserved yet — file is empty.
+        let live = vec![runner_info(1, "ez-org-runner-1")];
+        let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
+        assert_eq!(reclaimed, 0);
     }
 }
