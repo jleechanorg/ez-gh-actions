@@ -74,8 +74,15 @@ fn write_slot_assignments(assignments: &SlotAssignments) -> Result<()> {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let raw = toml::to_string_pretty(assignments).context("serialize slot assignments")?;
-    std::fs::write(&path, raw)
-        .with_context(|| format!("write slot assignments {}", path.display()))?;
+    // Atomic write: a crash between truncate and full write would leave a torn
+    // file that fails to parse, wedging every future next_slot/release until a
+    // human deletes it — the exact "daemon died mid-flight" scenario this
+    // machinery exists to survive. Write a sibling temp then rename(2), which
+    // is atomic within a directory on POSIX: readers see old-or-new, never torn.
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, raw).with_context(|| format!("write temp {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -132,7 +139,24 @@ pub fn release_slot(slot: u32) -> Result<()> {
 ///
 /// Returns the number of slots reclaimed.
 pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
-    let live_runners = github::list_runners(&cfg.github).unwrap_or_default();
+    // CRITICAL: reconcile ONLY against an authoritative runner list. If the
+    // GitHub API call fails (network blip, rate limit, expired token), an
+    // `unwrap_or_default()` would yield an EMPTY list — making every recorded
+    // slot look stale, releasing them all, and wiping the slot file while N
+    // containers are still alive. next_slot then hands out slot names that
+    // collide with the live containers (`docker run --name` conflict), wedging
+    // replacement every cycle. This exact fail-open was the root cause of the
+    // fleet decaying to zero. When the source of truth is unreachable, skip
+    // reconciliation this cycle and keep the slot file intact.
+    let live_runners = match github::list_runners(&cfg.github) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "warning: skipping stale-slot reconciliation (GitHub unreachable): {e:#}"
+            );
+            return Ok(0);
+        }
+    };
     release_stale_slots_from(&read_slot_assignments()?, &live_runners)
 }
 
@@ -150,19 +174,26 @@ fn release_stale_slots_from(
     let live_ids: HashSet<u64> = live_runners.iter().map(|r| r.id).collect();
     let mut reclaimed = 0;
     for (slot, id_str) in &assignments.assignments {
+        // The slot file is external, user-editable, and can be corrupted by a
+        // partial write. Never panic on its contents: a non-numeric key would
+        // crash the serve loop's reconciliation on every 30s tick (self-DoS).
+        let Ok(slot_n) = slot.parse::<u32>() else {
+            eprintln!("warning: skipping unparseable slot key {slot:?} in slot file");
+            continue;
+        };
         if id_str.is_empty() {
             // Reserved by `next_slot` but `record_slot_runner_id` never ran
             // (JIT registration failed mid-flight, or the daemon died before
             // the container came up). Free the slot immediately so the next
             // allocation cycle can claim it.
-            release_slot(slot.parse().unwrap())?;
+            release_slot(slot_n)?;
             reclaimed += 1;
         } else if let Ok(rid) = id_str.parse::<u64>() {
             if !live_ids.contains(&rid) {
                 // The recorded runner_id is no longer registered on GitHub
                 // (server-side reap, manual removal, or a stale entry from a
                 // prior host). Treat the slot as free.
-                release_slot(slot.parse().unwrap())?;
+                release_slot(slot_n)?;
                 reclaimed += 1;
             }
         }
