@@ -23,8 +23,9 @@ pub fn jitconfig_path(gh: &GithubConfig) -> String {
 }
 
 /// Path for GET …/actions/runners?per_page=100, used to enumerate registered
-/// runners. Pagination is the caller's responsibility — `gh api` paginates by
-/// default and we keep that behavior.
+/// runners. `gh api` does NOT paginate by default; `list_runners` drives
+/// pagination explicitly with `--paginate --slurp` (see there), and this path
+/// only sets the max per-page size.
 pub fn runners_list_path(gh: &GithubConfig) -> String {
     format!("{}/actions/runners?per_page=100", api_base(gh))
 }
@@ -70,8 +71,30 @@ pub fn generate_jitconfig(
         if stderr.contains("Already exists") || stderr.contains("already exists") {
             if let Ok(runners) = list_runners(gh) {
                 if let Some(conflicting) = runners.iter().find(|r| r.name == name) {
+                    // Runner names are global across every host registered to
+                    // this org/repo, so a name collision may belong to a live
+                    // SIBLING host — blind-deleting it would deregister another
+                    // machine's runner. Only self-heal a collision we can prove
+                    // is dead: offline AND not running a job. An online or busy
+                    // runner is presumed to be an active sibling and is left
+                    // untouched. (A future revision may instead take an
+                    // `owned_ids: &HashSet<u64>` from the caller so ownership,
+                    // not liveness, gates the delete; that requires a
+                    // docker_backend change and is out of scope here.)
+                    if !runner_is_reclaimable(conflicting) {
+                        bail!(
+                            "gh api generate-jitconfig failed for {}: runner name '{}' is already \
+                             in use by an online/busy runner (id {}, status {}, busy {}) — it is \
+                             presumed to belong to a live sibling host and will not be deleted",
+                            gh.target,
+                            name,
+                            conflicting.id,
+                            conflicting.status,
+                            conflicting.busy
+                        );
+                    }
                     eprintln!(
-                        "note: runner {} already exists (id {}), removing it first",
+                        "note: runner {} already exists (id {}) and is offline/idle, removing it first",
                         name, conflicting.id
                     );
                     if remove_runner(gh, conflicting.id).is_ok() {
@@ -83,8 +106,10 @@ pub fn generate_jitconfig(
                         }
                         let retry_out = retry_cmd.output()?;
                         if retry_out.status.success() {
-                            let parsed: JitConfigResponse =
-                                serde_json::from_slice(&retry_out.stdout)?;
+                            let parsed: JitConfigResponse = serde_json::from_slice(
+                                &retry_out.stdout,
+                            )
+                            .context("unexpected generate-jitconfig response on self-heal retry")?;
                             return Ok((parsed.encoded_jit_config, parsed.runner.id));
                         }
                     }
@@ -116,10 +141,26 @@ struct RunnerList {
     runners: Vec<RunnerInfo>,
 }
 
+/// A name-colliding runner may belong to a live sibling host (runner names are
+/// global across every host registered to an org/repo). It is only safe for the
+/// 409 self-heal to deregister it when we can prove it is dead: reported
+/// `offline` and not currently running a job. Anything online or busy is
+/// presumed to be an active sibling and must be left alone.
+fn runner_is_reclaimable(runner: &RunnerInfo) -> bool {
+    runner.status.eq_ignore_ascii_case("offline") && !runner.busy
+}
+
 pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     let path = runners_list_path(gh);
+    // `gh api` does NOT paginate on its own, so on an org with >100 runners a
+    // plain call returns only page 1 and the 409 self-heal below would miss a
+    // conflicting runner living on a later page. `--paginate` walks every page,
+    // but this endpoint wraps each page in `{ "total_count": N, "runners": [...] }`
+    // and plain `--paginate` concatenates those objects into invalid JSON.
+    // `--slurp` collects the pages into a single top-level JSON array instead,
+    // which we deserialize as `Vec<RunnerList>` and flatten.
     let out = Command::new("gh")
-        .args(["api", &path])
+        .args(["api", "--paginate", "--slurp", &path])
         .output()
         .context("failed to run `gh api`")?;
     if !out.status.success() {
@@ -128,8 +169,9 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let parsed: RunnerList = serde_json::from_slice(&out.stdout)?;
-    Ok(parsed.runners)
+    let pages: Vec<RunnerList> = serde_json::from_slice(&out.stdout)
+        .context("unexpected list-runners response (expected array of pages from --slurp)")?;
+    Ok(pages.into_iter().flat_map(|page| page.runners).collect())
 }
 
 /// Best-effort removal of a registered runner (used when we kill a runner
@@ -271,5 +313,57 @@ mod tests {
             runner_remove_path(&repo, 7),
             "repos/jleechanorg/ez-gh-actions/actions/runners/7"
         );
+    }
+
+    fn runner(id: u64, name: &str, status: &str, busy: bool) -> RunnerInfo {
+        RunnerInfo {
+            id,
+            name: name.into(),
+            status: status.into(),
+            busy,
+        }
+    }
+
+    #[test]
+    fn only_offline_idle_runners_are_reclaimable() {
+        // Safe to self-heal: dead runner, no live job.
+        assert!(runner_is_reclaimable(&runner(1, "r", "offline", false)));
+        // Status match is case-insensitive (GitHub has returned "Offline").
+        assert!(runner_is_reclaimable(&runner(1, "r", "Offline", false)));
+
+        // Never delete a runner that might be a live sibling host.
+        assert!(!runner_is_reclaimable(&runner(1, "r", "online", false)));
+        assert!(!runner_is_reclaimable(&runner(1, "r", "online", true)));
+        // Offline-but-busy is contradictory; treat as live and refuse to delete.
+        assert!(!runner_is_reclaimable(&runner(1, "r", "offline", true)));
+    }
+
+    #[test]
+    fn slurped_pages_flatten_into_one_runner_list() {
+        // `gh api --paginate --slurp` yields a top-level JSON array with one
+        // `{ total_count, runners }` object per page. Every page's runners must
+        // be flattened; page 2+ must not be dropped (the >100-runner bug).
+        let slurped = r#"[
+            {"total_count": 3, "runners": [
+                {"id": 1, "name": "a", "status": "online", "busy": false},
+                {"id": 2, "name": "b", "status": "offline", "busy": false}
+            ]},
+            {"total_count": 3, "runners": [
+                {"id": 3, "name": "c", "status": "online", "busy": true}
+            ]}
+        ]"#;
+        let pages: Vec<RunnerList> = serde_json::from_slice(slurped.as_bytes()).unwrap();
+        let flattened: Vec<RunnerInfo> = pages.into_iter().flat_map(|p| p.runners).collect();
+        let ids: Vec<u64> = flattened.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn empty_slurp_yields_no_runners() {
+        // A --slurp of zero pages (or empty pages) must deserialize cleanly to
+        // an empty runner list rather than erroring.
+        let pages: Vec<RunnerList> = serde_json::from_slice(b"[]").unwrap();
+        let flattened: Vec<RunnerInfo> = pages.into_iter().flat_map(|p| p.runners).collect();
+        assert!(flattened.is_empty());
     }
 }
