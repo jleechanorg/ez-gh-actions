@@ -50,6 +50,37 @@ Point a workflow at it:
 runs-on: [self-hosted, ezgha]
 ```
 
+
+## Architecture
+
+`ezgha` is built around a supervisor loop that maintains a target count of isolated, ephemeral GitHub Actions runners.
+
+```mermaid
+graph TD
+    A[ezgha serve] --> B{Shortfall?}
+    B -- No --> C[Sleep 30s]
+    B -- Yes --> D[Allocate Numeric Slot]
+    D --> E[JIT Registration on GitHub]
+    E -- Success --> F[docker run --rm ...]
+    E -- HTTP 409 Conflict --> G[Fetch Conflicting ID]
+    G --> H[DELETE Stale Runner]
+    H -- Success --> E
+    H -- HTTP 422 Busy --> I[Log Warning & Skip Slot]
+    F --> J[Execute exactly 1 job]
+    J --> K[Runner Deregisters & Exits]
+    K --> L[Container Auto-removed]
+```
+
+### Key Components
+
+1. **Supervisor Loop (`ezgha serve`)**: Run as a user-level service (systemd or launchd). Every 30 seconds, it reconciles active Docker containers against the target runner count and spawns shortfalls.
+2. **Resilient Spawning & Graceful Degradation**: Spawning is decoupled and slot-independent. If JIT registration or container spawning fails for slot $N$ (e.g., because a runner with that name is still busy on GitHub), the error is logged, the slot is skipped for the rest of the spawn cycle to prevent thrashing, and the daemon continues spawning subsequent slots.
+3. **Self-Healing Conflict Resolution**: If `generate-jitconfig` fails with an `HTTP 409 (Already Exists)` conflict due to a stale runner registration, the daemon automatically queries the GitHub API, deletes the conflicting offline runner, and retries the registration.
+4. **Hard Security & Isolation Gates**:
+   * **Cgroup Constraints**: Limits are derived dynamically from host capacity or set explicitly in the config (clamping memory, swap, CPUs, and PIDs).
+   * **No-New-Privileges**: Containers are started with `--security-opt no-new-privileges`. This blocks privilege escalation (e.g. `sudo` is disabled inside the runner container).
+   * **Disk Floor Guard**: Measures disk space on the Docker daemon's volume before spawning and refuses to launch new runners if free space falls below `min_free_disk_gb` (preventing runner disk-exhaustion deaths).
+
 ## Config (`~/.config/ezgha/config.toml`)
 
 ```toml
