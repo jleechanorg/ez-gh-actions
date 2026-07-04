@@ -36,6 +36,17 @@ pub struct RunnerConfig {
     pub count: u32,
     /// Container image used by the docker backend.
     pub image: String,
+    /// Stable prefix for ephemeral runner names. The docker backend appends
+    /// `-{slot}` (slot in `1..=count`) so the full name is
+    /// `{name_prefix}-{slot}` (e.g. `ez-org-runner-3`). The prefix is global
+    /// across hosts; per-host ownership is tracked via the locally persisted
+    /// slot assignment file.
+    #[serde(default = "default_runner_name_prefix")]
+    pub name_prefix: String,
+}
+
+fn default_runner_name_prefix() -> String {
+    "ez-org-runner".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +101,7 @@ impl Config {
                 labels: vec!["self-hosted".into(), "ezgha".into()],
                 count: 1,
                 image: "ghcr.io/actions/actions-runner:latest".into(),
+                name_prefix: default_runner_name_prefix(),
             },
             limits: Limits {
                 memory_mb: mem,
