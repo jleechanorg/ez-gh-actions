@@ -14,7 +14,7 @@ use config::{Config, Scope};
 #[derive(Parser)]
 #[command(
     name = "ezgha",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("GIT_SHA")),
     about = "Easy isolated self-hosted GitHub Actions runners (VM-preferred, container fallback with hard limits)"
 )]
 struct Cli {

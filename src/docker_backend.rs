@@ -151,9 +151,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     let live_runners = match github::list_runners(&cfg.github) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
-                "warning: skipping stale-slot reconciliation (GitHub unreachable): {e:#}"
-            );
+            eprintln!("warning: skipping stale-slot reconciliation (GitHub unreachable): {e:#}");
             return Ok(0);
         }
     };

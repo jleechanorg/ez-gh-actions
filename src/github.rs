@@ -70,7 +70,10 @@ pub fn generate_jitconfig(
         if stderr.contains("Already exists") || stderr.contains("already exists") {
             if let Ok(runners) = list_runners(gh) {
                 if let Some(conflicting) = runners.iter().find(|r| r.name == name) {
-                    eprintln!("note: runner {} already exists (id {}), removing it first", name, conflicting.id);
+                    eprintln!(
+                        "note: runner {} already exists (id {}), removing it first",
+                        name, conflicting.id
+                    );
                     if remove_runner(gh, conflicting.id).is_ok() {
                         let mut retry_cmd = Command::new("gh");
                         retry_cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
@@ -80,7 +83,8 @@ pub fn generate_jitconfig(
                         }
                         let retry_out = retry_cmd.output()?;
                         if retry_out.status.success() {
-                            let parsed: JitConfigResponse = serde_json::from_slice(&retry_out.stdout)?;
+                            let parsed: JitConfigResponse =
+                                serde_json::from_slice(&retry_out.stdout)?;
                             return Ok((parsed.encoded_jit_config, parsed.runner.id));
                         }
                     }
