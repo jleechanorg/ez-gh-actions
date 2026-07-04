@@ -1,0 +1,136 @@
+test-on-ezgha	Set up job	﻿2026-07-04T19:11:23.2621595Z Current runner version: '2.335.1'
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2626267Z Runner name: 'ez-org-runner-16'
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2626729Z Runner group name: 'default'
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2627269Z Machine name: '85436641225b'
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2628815Z ##[group]GITHUB_TOKEN Permissions
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2630792Z Contents: read
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2631126Z Metadata: read
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2631416Z ##[endgroup]
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2632858Z Secret source: Actions
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2633399Z Prepare workflow directory
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2826181Z Prepare all required actions
+test-on-ezgha	Set up job	2026-07-04T19:11:23.2848733Z Getting action download info
+test-on-ezgha	Set up job	2026-07-04T19:11:23.6446291Z Download action repository 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' (SHA:08c6903cd8c0fde910a37f88322edcfb5dd907a8)
+test-on-ezgha	Set up job	2026-07-04T19:11:24.2453628Z Complete job name: test-on-ezgha
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	﻿2026-07-04T19:11:24.2789776Z ##[group]Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2790445Z with:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2790701Z   persist-credentials: false
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2791046Z   repository: jleechanorg/ez-gh-actions
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2793243Z   token: ***
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2793486Z   ssh-strict: true
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2793738Z   ssh-user: git
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2793974Z   clean: true
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2794229Z   sparse-checkout-cone-mode: true
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2794526Z   fetch-depth: 1
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2794767Z   fetch-tags: false
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2795020Z   show-progress: true
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2795273Z   lfs: false
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2795577Z   submodules: false
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2795846Z   set-safe-directory: true
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.2796230Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3355654Z Syncing repository: jleechanorg/ez-gh-actions
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3356729Z ##[group]Getting Git version info
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3357153Z Working directory is '/home/runner/_work/ez-gh-actions/ez-gh-actions'
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3360823Z [command]/usr/bin/git version
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3361197Z git version 2.54.0
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3362176Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3364930Z Temporarily overriding HOME='/home/runner/_work/_temp/6b4997e5-ac05-43f6-80b2-a445eaf5814c' before making global git config changes
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3365755Z Adding repository directory to the temporary git global config as a safe directory
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3366404Z [command]/usr/bin/git config --global --add safe.directory /home/runner/_work/ez-gh-actions/ez-gh-actions
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3373396Z Deleting the contents of '/home/runner/_work/ez-gh-actions/ez-gh-actions'
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3378122Z ##[group]Initializing the repository
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3378703Z [command]/usr/bin/git init /home/runner/_work/ez-gh-actions/ez-gh-actions
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3404987Z hint: Using 'master' as the name for the initial branch. This default branch name
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3405702Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3406304Z hint: to use in all of your new repositories, which will suppress this warning,
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3406756Z hint: call:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3406999Z hint:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3407367Z hint: 	git config --global init.defaultBranch <name>
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3431192Z hint:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3431560Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3432104Z hint: 'development'. The just-created branch can be renamed via this command:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3432541Z hint:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3432795Z hint: 	git branch -m <name>
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3433070Z hint:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3433426Z hint: Disable this message with "git config set advice.defaultBranchName false"
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3434013Z Initialized empty Git repository in /home/runner/_work/ez-gh-actions/ez-gh-actions/.git/
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3435449Z [command]/usr/bin/git remote add origin https://github.com/jleechanorg/ez-gh-actions
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3439570Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3440076Z ##[group]Disabling automatic garbage collection
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3440707Z [command]/usr/bin/git config --local gc.auto 0
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3441698Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3442155Z ##[group]Setting up auth
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3443807Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3458645Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3574464Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3591287Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3706986Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3724557Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3725126Z ##[group]Fetching the repository
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:24.3728902Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +2ffafd0881df4929b7cea4de1367a2257975b0fa:refs/remotes/pull/5/merge
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2650804Z From https://github.com/jleechanorg/ez-gh-actions
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2651534Z  * [new ref]         2ffafd0881df4929b7cea4de1367a2257975b0fa -> pull/5/merge
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2672500Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2673811Z ##[group]Determining the checkout info
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2675204Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2676187Z [command]/usr/bin/git sparse-checkout disable
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2702264Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2724870Z ##[group]Checking out the ref
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2726273Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/5/merge
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2892761Z Note: switching to 'refs/remotes/pull/5/merge'.
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2893492Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2894043Z You are in 'detached HEAD' state. You can look around, make experimental
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2895393Z changes and commit them, and you can discard any commits you make in this
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2896861Z state without impacting any branches by switching back to a branch.
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2897658Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2898287Z If you want to create a new branch to retain commits you create, you may
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2899669Z do so (now or later) by using -c with the switch command. Example:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2900403Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2901565Z   git switch -c <new-branch-name>
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2902144Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2902544Z Or undo this operation with:
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2903085Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2903460Z   git switch -
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2903934Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2904677Z Turn off this advice by setting config variable advice.detachedHead to false
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2905671Z 
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2906685Z HEAD is now at 2ffafd0 Merge d9389b2dc374790c14292e520826aef2e43438da into 84247d99ce71520e65da2fa6e6a593ff31e3bbda
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2910193Z ##[endgroup]
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2947929Z [command]/usr/bin/git log -1 --format=%H
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2959915Z 2ffafd0881df4929b7cea4de1367a2257975b0fa
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2964738Z ##[group]Removing auth
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2966026Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.2986584Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.3161328Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.3178726Z http.https://github.com/.extraheader
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.3183103Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.3205550Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-on-ezgha	Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.3378795Z ##[endgroup]
+test-on-ezgha	Prove execution environment	﻿2026-07-04T19:11:25.3554822Z ##[group]Run echo "runner: $RUNNER_NAME on $(hostname)"
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3555679Z ^[[36;1mecho "runner: $RUNNER_NAME on $(hostname)"^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3556468Z ^[[36;1mecho "memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3557337Z ^[[36;1mecho "pids.max: $(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo n/a)"^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3558102Z ^[[36;1mecho "Verify operating system and CPU context:"^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3558703Z ^[[36;1muname -a^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3559142Z ^[[36;1mnproc^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3559809Z ^[[36;1mecho "Self-hosted runner execution verified successfully!"^[[0m
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3566500Z shell: /usr/bin/bash -e {0}
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3567043Z ##[endgroup]
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3610374Z runner: ez-org-runner-16 on 85436641225b
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3618060Z memory.max: 6267338752
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3624772Z pids.max: 512
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3625281Z Verify operating system and CPU context:
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3631602Z Linux 85436641225b 6.8.0-134-generic #134-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3639023Z 4
+test-on-ezgha	Prove execution environment	2026-07-04T19:11:25.3640101Z Self-hosted runner execution verified successfully!
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	﻿2026-07-04T19:11:25.3756983Z Post job cleanup.
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4220277Z [command]/usr/bin/git version
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4273126Z git version 2.54.0
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4294402Z Temporarily overriding HOME='/home/runner/_work/_temp/ab83873a-6e53-45ff-9997-a5a674afc9f2' before making global git config changes
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4296212Z Adding repository directory to the temporary git global config as a safe directory
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4297785Z [command]/usr/bin/git config --global --add safe.directory /home/runner/_work/ez-gh-actions/ez-gh-actions
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4319832Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4345127Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4472761Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+test-on-ezgha	Post Run actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8	2026-07-04T19:11:25.4483145Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+test-on-ezgha	Complete job	﻿2026-07-04T19:11:25.4737090Z Cleaning up orphan processes

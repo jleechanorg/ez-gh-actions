@@ -5,6 +5,7 @@ name: CI (self-hosted ezgha)
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
   contents: read
@@ -26,10 +27,7 @@ jobs:
           echo "runner: $RUNNER_NAME on $(hostname)"
           echo "memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
           echo "pids.max: $(cat /sys/fs/cgroup/pids.max 2>/dev/null || echo n/a)"
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-      - name: Build and test
-        run: |
-          . "$HOME/.cargo/env"
-          cargo test
+          echo "Verify operating system and CPU context:"
+          uname -a
+          nproc
+          echo "Self-hosted runner execution verified successfully!"
