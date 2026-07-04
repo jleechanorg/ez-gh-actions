@@ -15,10 +15,18 @@ This skill drives the **doctor.sh** script that ships at the repo root, plus the
 ## Step 1 — Establish the baseline
 
 ```bash
-bash /home/jleechan/projects/ez-gh-actions/doctor.sh
+bash "$(git rev-parse --show-toplevel)/doctor.sh"          # health gate, exit 0 = healthy
+bash "$(git rev-parse --show-toplevel)/doctor.sh --prove"  # + live canary: dispatch a real job, verify it runs on ez-org-runner-*
 ```
 
-Read the verdict. If `fleet healthy`, you're done — stop. If `fleet unhealthy: N critical check(s) failed`, continue.
+Read the verdict AND the exit code. `--prove` is the strongest evidence — it
+dispatches a fresh `ezgha-selftest` and confirms `runner_name` is
+`ez-org-runner-*` with `conclusion=success`. The gate also checks a
+real-execution proof (≥1 of the last 6 runs succeeded on our fleet) and a
+time-windowed error count (last 3 min, not last 200 lines — a since-recovered
+incident won't keep it red). If `fleet healthy` and exit 0, you're done — stop.
+If `fleet unhealthy`, continue. **Never restart-loop the service** — see
+`docs/harness-early-victory-5whys.md`.
 
 ## Step 2 — Identify the failing checks
 

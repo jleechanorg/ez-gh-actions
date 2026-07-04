@@ -9,12 +9,18 @@ set -euo pipefail
 # --- arg parsing ---------------------------------------------------------
 JSON=0
 DETAIL=0
-GH_FLAGS=()
+PROVE=0
 for a in "$@"; do
   case "$a" in
     --json) JSON=1 ;;
     --detail|-v|--verbose) DETAIL=1 ;;
-    --gh=*) GH_FLAGS=("-X" "gh"); echo "(note: --gh= not used in this build)"; ;;
+    --prove) PROVE=1 ;;   # dispatch a live canary job and verify it runs on our fleet
+    -h|--help)
+      echo "usage: doctor.sh [--prove] [--detail]"
+      echo "  --prove   dispatch a live ezgha-selftest and verify it runs on ez-org-runner-* (adds ~1-2 min)"
+      echo "  --detail  verbose output"
+      echo "env: LOOP_WINDOW (min, default 3), ROUTING_N (runs, default 6), ORG, EZGHA_REPO"
+      exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -114,9 +120,66 @@ CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 info "managed containers running: $CONTAINER_COUNT (expected: configured runner.count)"
 echo "$CONTAINER_NAMES" | head -20
 
-# --- E. recent routing proof ---------------------------------------------
-section "7. recent routing (last 8 ezgha-selftest runs)"
-/usr/bin/gh run list -R "$EZGHA_REPO" -w ezgha-selftest -L 8 --json databaseId,conclusion,status --jq '.[] | "\(.databaseId) \(.conclusion)/\(.status)"' 2>/dev/null | head -8
+# --- E. recent routing proof: jobs REALLY ran on ez-org-runner-* ---------
+# "online" is not "working". This section proves recent GitHub Actions jobs
+# were actually EXECUTED by ez-org-runner-* runners by reading each run's
+# jobs API and confirming the runner_name that handled it belongs to our
+# fleet. A completed run whose runner_name is NOT ez-org-runner-* means the
+# job went to colima / GitHub-hosted / somewhere else.
+section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
+ROUTING_N="${ROUTING_N:-6}"
+REAL_ON_FLEET=0
+REAL_TOTAL=0
+while read -r rid; do
+  [ -z "$rid" ] && continue
+  REAL_TOTAL=$((REAL_TOTAL+1))
+  jobs=$(/usr/bin/gh api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
+  rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
+  conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
+  if [[ "$rn" == ez-org-runner-* ]]; then
+    ok "run $rid: $conc on $rn (our fleet)"
+    [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
+  else
+    warn "run $rid: $conc on $rn (NOT an ez-org-runner)"
+  fi
+done < <(/usr/bin/gh run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
+info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+
+# --- E2. optional live canary: dispatch a job and prove it runs NOW ------
+# `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
+# then confirms the runner_name is ez-org-runner-* and conclusion=success.
+# This is the strongest "handled for real, right now" proof.
+CANARY_OK=""
+if [ "$PROVE" = "1" ]; then
+  section "7b. live canary (dispatch + verify a job runs on our fleet NOW)"
+  before=$(/usr/bin/gh run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)
+  /usr/bin/gh workflow run ezgha-selftest -R "$EZGHA_REPO" >/dev/null 2>&1
+  info "dispatched canary; waiting for a new run to appear + complete (up to 180s)..."
+  cid=""
+  for _ in $(seq 1 18); do
+    sleep 10
+    latest=$(/usr/bin/gh run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)
+    [ "$latest" != "$before" ] && [ "$latest" != "0" ] && { cid="$latest"; break; }
+  done
+  if [ -z "$cid" ]; then
+    bad "canary never appeared — dispatch failed or no runner picked it up"
+  else
+    for _ in $(seq 1 18); do
+      st=$(/usr/bin/gh run view "$cid" -R "$EZGHA_REPO" --json status,conclusion --jq '.status' 2>/dev/null)
+      [ "$st" = "completed" ] && break
+      sleep 10
+    done
+    jobs=$(/usr/bin/gh api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
+    rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
+    conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
+    if [[ "$rn" == ez-org-runner-* ]] && [ "$conc" = "success" ]; then
+      ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
+      CANARY_OK=1
+    else
+      bad "canary run $cid: $conc on $rn (expected success on ez-org-runner-*)"
+    fi
+  fi
+fi
 
 # --- F. verdict ----------------------------------------------------------
 section "verdict"
@@ -127,6 +190,10 @@ CRITICAL=0
                                           CRITICAL=$((CRITICAL+1))
 [ "${CONTAINER_COUNT:-0}" -lt 14 ]         && CRITICAL=$((CRITICAL+1))
 [ "$LOOP_FAILS" -gt 3 ]                    && CRITICAL=$((CRITICAL+1))
+# real-execution gate: at least one recent job must have succeeded on our fleet
+[ "${REAL_ON_FLEET:-0}" -lt 1 ]            && CRITICAL=$((CRITICAL+1))
+# canary gate (only when --prove): the live job must have run on our fleet
+[ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]  && CRITICAL=$((CRITICAL+1))
 
 if [ "$CRITICAL" -gt 0 ]; then
   bad "fleet unhealthy: $CRITICAL critical check(s) failed"
