@@ -1,0 +1,63 @@
+
+=== 1. ezgha service ===
+  [OK]   ezgha.service = active
+  [..]   ezgha.service enabled=enabled
+
+=== 2. docker daemon ===
+  [OK]   docker daemon reachable (version/cpu/mem: 29.5.3 4 12535848960)
+
+=== 3. colima VM (the daemon's host) ===
+  [OK]   colima VM running
+
+=== 4. ezgha runtime state ===
+  [..]   binary PID RSS=? KB
+  [..]   ensure_count failed occurrences in last 200 journal lines: 37
+  [..]   most recent journal line: Jul 04 12:05:33 Jeff-Ubuntu ezgha[276635
+  [OK]   slot_assignments.toml present (0
+0 slots reserved)
+
+=== 5. GitHub org runner fleet (jleechanorg) ===
+  total=19 online=6 offline=13 busy=2
+  [BAD]  ezgha: ez-org-runner-1 offline
+  [BAD]  ezgha: ez-org-runner-10 offline
+  [BAD]  ezgha: ez-org-runner-11 offline
+  [BAD]  ezgha: ez-org-runner-12 offline
+  [BAD]  ezgha: ez-org-runner-13 offline
+  [BAD]  ezgha: ez-org-runner-2 offline
+  [BAD]  ezgha: ez-org-runner-3 offline
+  [BAD]  ezgha: ez-org-runner-4 offline
+  [BAD]  ezgha: ez-org-runner-5 offline
+  [BAD]  ezgha: ez-org-runner-6 offline
+  [BAD]  ezgha: ez-org-runner-7 offline
+  [BAD]  ezgha: ez-org-runner-8 offline
+  [BAD]  ezgha: ez-org-runner-9 offline
+  (colima leftovers still present, not auto-cleaned by ezgha):
+  [WARN] colima: org-runner-mac-1 online
+  [WARN] colima: org-runner-mac-2 online
+  [WARN] colima: org-runner-mac-3 online
+  [WARN] colima: org-runner-mac-4 online
+  [WARN] colima: org-runner-mac-5 online
+  [WARN] colima: org-runner-mac-6 online
+
+=== 6. live docker containers (ezgha-managed) ===
+  [..]   managed containers running: 0 (expected: configured runner.count)
+
+
+=== 7. recent routing (last 8 ezgha-selftest runs) ===
+28703983289 success/completed
+28703982618 success/completed
+28703981939 success/completed
+28703945368 success/completed
+28703944342 success/completed
+28703943434 success/completed
+28703942449 success/completed
+28692499021 success/completed
+
+=== verdict ===
+  [BAD]  fleet unhealthy: 3 critical check(s) failed
+
+Suggested remediation:
+  1. Stop and restart ezgha: systemctl --user restart ezgha.service
+  2. Reset slot file:       rm ~/.config/ezgha/slot_assignments.toml
+  3. Start colima if down:  limactl start colima
+  4. Re-run ./doctor.sh --detail after each step
