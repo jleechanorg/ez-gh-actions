@@ -1,0 +1,40 @@
+Jul 04 12:06:43 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-6 already exists (id 121796), removing it first
+Jul 04 12:06:45 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-7 already exists (id 121797), removing it first
+Jul 04 12:06:48 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-8 already exists (id 121798), removing it first
+Jul 04 12:06:51 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-9 already exists (id 121799), removing it first
+Jul 04 12:06:54 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-10 already exists (id 121800), removing it first
+Jul 04 12:06:56 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-11 already exists (id 121801), removing it first
+Jul 04 12:06:58 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-12 already exists (id 121802), removing it first
+Jul 04 12:07:01 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:07:01 Jeff-Ubuntu ezgha[2774185]: ensure_count failed (will retry): gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:07:36 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:07:36 Jeff-Ubuntu ezgha[2774185]: ensure_count failed (will retry): gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:08:08 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:08:08 Jeff-Ubuntu ezgha[2774185]: ensure_count failed (will retry): gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:08:40 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:08:40 Jeff-Ubuntu ezgha[2774185]: ensure_count failed (will retry): gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:09:12 Jeff-Ubuntu ezgha[2774185]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:09:12 Jeff-Ubuntu ezgha[2774185]: ensure_count failed (will retry): gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:09:21 Jeff-Ubuntu systemd[3353]: Stopping ezgha.service - ez-gh-actions ephemeral GitHub Actions runners...
+Jul 04 12:09:21 Jeff-Ubuntu systemd[3353]: Stopped ezgha.service - ez-gh-actions ephemeral GitHub Actions runners.
+Jul 04 12:09:21 Jeff-Ubuntu systemd[3353]: ezgha.service: Consumed 5.260s CPU time, 42.1M memory peak, 0B memory swap peak.
+Jul 04 12:09:21 Jeff-Ubuntu systemd[3353]: Started ezgha.service - ez-gh-actions ephemeral GitHub Actions runners.
+Jul 04 12:09:21 Jeff-Ubuntu ezgha[2784096]: supervising 16 ephemeral runner(s) for jleechanorg on docker (container)
+Jul 04 12:09:23 Jeff-Ubuntu ezgha[2784096]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:09:24 Jeff-Ubuntu ezgha[2784096]: warning: failed to start runner: gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:09:26 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-14
+Jul 04 12:09:26 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-15
+Jul 04 12:09:26 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-16
+Jul 04 12:09:58 Jeff-Ubuntu ezgha[2784096]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:09:59 Jeff-Ubuntu ezgha[2784096]: warning: failed to start runner: gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:09:59 Jeff-Ubuntu ezgha[2784096]: ensure_count failed (will retry): gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:10:33 Jeff-Ubuntu ezgha[2784096]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:10:33 Jeff-Ubuntu ezgha[2784096]: warning: failed to start runner: gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:10:34 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-2
+Jul 04 12:10:34 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-9
+Jul 04 12:11:05 Jeff-Ubuntu ezgha[2784096]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:11:05 Jeff-Ubuntu ezgha[2784096]: warning: failed to start runner: gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:11:07 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-14
+Jul 04 12:11:38 Jeff-Ubuntu ezgha[2784096]: note: runner ez-org-runner-13 already exists (id 121759), removing it first
+Jul 04 12:11:39 Jeff-Ubuntu ezgha[2784096]: warning: failed to start runner: gh api generate-jitconfig failed for jleechanorg: gh: Already exists - A runner with the name *** already exists. (HTTP 409)
+Jul 04 12:11:40 Jeff-Ubuntu ezgha[2784096]: respawned ephemeral runner ez-org-runner-16
