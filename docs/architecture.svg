@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 600" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="13">
+  <title>ez-gh-actions (ezgha) architecture — VM-within-VM isolation (container → VM → host)</title>
+  <desc>Supervisor loop on the host picks the strongest isolation backend and spawns one ephemeral Docker container per GitHub Actions job via JIT registration. Default deployed topology on Mac = container → Docker daemon → Colima Lima VM → Darwin host (3 layers, VM-within-VM); on jeff-ubuntu = container → Docker daemon → QEMU microVM → Ubuntu host (3 layers).</desc>
+
+  <!-- Background -->
+  <rect width="880" height="600" fill="#fafafa"/>
+
+  <!-- Legend -->
+  <g transform="translate(20, 20)">
+    <rect x="0" y="0" width="840" height="34" rx="6" fill="#ffffff" stroke="#d0d7de"/>
+    <g transform="translate(12, 17)">
+      <rect x="0" y="-8" width="14" height="14" fill="#ddf4ff" stroke="#0969da" rx="2"/>
+      <text x="22" y="3" fill="#1f2328">host component</text>
+    </g>
+    <g transform="translate(150, 17)">
+      <rect x="0" y="-8" width="14" height="14" fill="#fff8c5" stroke="#9a6700" rx="2"/>
+      <text x="22" y="3" fill="#1f2328">runner container (ephemeral)</text>
+    </g>
+    <g transform="translate(360, 17)">
+      <rect x="0" y="-8" width="14" height="14" fill="#dafbe1" stroke="#1a7f37" rx="2"/>
+      <text x="22" y="3" fill="#1f2328">external (GitHub)</text>
+    </g>
+    <g transform="translate(520, 17)">
+      <line x1="0" y1="0" x2="22" y2="0" stroke="#57606a" stroke-width="1.5"/>
+      <polygon points="22,-4 30,0 22,4" fill="#57606a"/>
+      <text x="38" y="3" fill="#1f2328">direction of control / data</text>
+    </g>
+    <g transform="translate(720, 17)">
+      <line x1="0" y1="0" x2="22" y2="0" stroke="#57606a" stroke-width="1.5" stroke-dasharray="3 3"/>
+      <text x="30" y="3" fill="#1f2328">policy / control plane</text>
+    </g>
+  </g>
+
+  <!-- HOST BOUNDARY -->
+  <rect x="20" y="70" width="600" height="510" rx="10" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+  <text x="40" y="92" font-weight="700" fill="#1f2328">YOUR HOST</text>
+  <text x="40" y="108" font-size="11" fill="#57606a">laptop · CI box · bare-metal server</text>
+
+  <!-- Optional VM wrapper (Colima/Lima/Docker Desktop) — VM containment -->
+  <rect x="50" y="125" width="555" height="200" rx="8" fill="#f6f8fa" stroke="#9a6700" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <text x="64" y="145" font-weight="700" fill="#9a6700">VM-within-VM isolation (3-layer stack)</text>
+  <text x="64" y="160" font-size="11" fill="#57606a">container → Docker daemon → Colima/Lima/QEMU microVM → host kernel</text>
+  <text x="64" y="173" font-size="10" fill="#57606a">runner process can never reach the host kernel directly</text>
+
+  <!-- Docker daemon inside VM -->
+  <rect x="75" y="175" width="160" height="60" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text x="155" y="197" text-anchor="middle" font-weight="600" fill="#1f2328">Docker daemon</text>
+  <text x="155" y="215" text-anchor="middle" font-size="11" fill="#57606a">docker info / sysbox-runc</text>
+
+  <!-- Backend ladder -->
+  <rect x="260" y="175" width="325" height="60" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text x="422" y="194" text-anchor="middle" font-weight="600" fill="#1f2328">Backend ladder (strongest first)</text>
+  <text x="280" y="215" font-size="11" fill="#1f2328">① Tart VM (macOS) — M2</text>
+  <text x="280" y="228" font-size="11" fill="#1f2328">② libvirt/KVM (Linux) — M2</text>
+  <text x="455" y="215" font-size="11" fill="#1f2328">③ Docker + sysbox-runc</text>
+  <text x="455" y="228" font-size="11" fill="#1f2328">④ Docker (bare)</text>
+
+  <!-- Policy gate -->
+  <rect x="75" y="260" width="510" height="50" rx="6" fill="#fff8c5" stroke="#9a6700"/>
+  <text x="330" y="282" text-anchor="middle" font-weight="600" fill="#1f2328">policy.minimum_isolation</text>
+  <text x="330" y="300" text-anchor="middle" font-size="11" fill="#57606a">select() picks strongest *implemented* backend that satisfies policy · fail-closed otherwise</text>
+
+  <!-- ezgha serve supervisor -->
+  <rect x="75" y="345" width="510" height="80" rx="6" fill="#ddf4ff" stroke="#0969da" stroke-width="1.5"/>
+  <text x="330" y="370" text-anchor="middle" font-weight="700" font-size="14" fill="#1f2328">ezgha serve  (user systemd / launchd service)</text>
+  <text x="330" y="390" text-anchor="middle" font-size="11" fill="#1f2328">every 30s: reconcile managed containers vs target count</text>
+  <text x="330" y="406" text-anchor="middle" font-size="11" fill="#1f2328">disk floor guard · cgroup limits · no-new-privileges · self-heal HTTP 409</text>
+
+  <!-- Runner slots -->
+  <text x="40" y="455" font-weight="600" fill="#1f2328">EPHEMERAL RUNNER CONTAINERS</text>
+  <g>
+    <rect x="75" y="465" width="155" height="95" rx="6" fill="#fff8c5" stroke="#9a6700"/>
+    <text x="152" y="485" text-anchor="middle" font-weight="600" fill="#1f2328">runner slot 1</text>
+    <text x="152" y="503" text-anchor="middle" font-size="11" fill="#57606a">--memory 4G</text>
+    <text x="152" y="518" text-anchor="middle" font-size="11" fill="#57606a">--cpus 2.0</text>
+    <text x="152" y="533" text-anchor="middle" font-size="11" fill="#57606a">--pids-limit 512</text>
+    <text x="152" y="548" text-anchor="middle" font-size="11" fill="#57606a">--security-opt</text>
+    <text x="152" y="561" text-anchor="middle" font-size="11" fill="#57606a">no-new-privileges</text>
+  </g>
+  <g>
+    <rect x="245" y="465" width="155" height="95" rx="6" fill="#fff8c5" stroke="#9a6700"/>
+    <text x="322" y="485" text-anchor="middle" font-weight="600" fill="#1f2328">runner slot 2</text>
+    <text x="322" y="503" text-anchor="middle" font-size="11" fill="#57606a">same cgroup +</text>
+    <text x="322" y="518" text-anchor="middle" font-size="11" fill="#57606a">no-new-priv</text>
+    <text x="322" y="533" text-anchor="middle" font-size="11" fill="#57606a">profile, fresh</text>
+    <text x="322" y="548" text-anchor="middle" font-size="11" fill="#57606a">image, --rm</text>
+    <text x="322" y="561" text-anchor="middle" font-size="11" fill="#57606a">on exit</text>
+  </g>
+  <g>
+    <rect x="415" y="465" width="170" height="95" rx="6" fill="#f6f8fa" stroke="#57606a" stroke-dasharray="4 3"/>
+    <text x="500" y="498" text-anchor="middle" font-size="11" fill="#57606a">slot N …</text>
+    <text x="500" y="515" text-anchor="middle" font-size="11" fill="#57606a">[self-hosted, ezgha]</text>
+    <text x="500" y="532" text-anchor="middle" font-size="11" fill="#57606a">exactly 1 job</text>
+    <text x="500" y="549" text-anchor="middle" font-size="11" fill="#57606a">then deregister +</text>
+    <text x="500" y="563" text-anchor="middle" font-size="11" fill="#57606a">exit + container</text>
+    <text x="500" y="577" text-anchor="middle" font-size="11" fill="#57606a">auto-removed</text>
+  </g>
+
+  <!-- gh CLI box -->
+  <rect x="640" y="345" width="220" height="80" rx="6" fill="#ddf4ff" stroke="#0969da"/>
+  <text x="750" y="370" text-anchor="middle" font-weight="600" fill="#1f2328">gh CLI</text>
+  <text x="750" y="388" text-anchor="middle" font-size="11" fill="#57606a">(user auth)</text>
+  <text x="750" y="405" text-anchor="middle" font-size="11" fill="#57606a">gh api ... — all GitHub</text>
+  <text x="750" y="420" text-anchor="middle" font-size="11" fill="#57606a">calls routed through here</text>
+
+  <!-- GitHub external box -->
+  <rect x="640" y="70" width="220" height="240" rx="10" fill="#dafbe1" stroke="#1a7f37" stroke-width="1.5"/>
+  <text x="750" y="98" text-anchor="middle" font-weight="700" font-size="14" fill="#1f2328">GitHub</text>
+  <text x="750" y="116" text-anchor="middle" font-size="11" fill="#1a7f37">Actions API</text>
+
+  <text x="750" y="148" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">generate-jitconfig</text>
+  <text x="750" y="162" text-anchor="middle" font-size="11" fill="#57606a">(per spawn, single-use)</text>
+
+  <text x="750" y="190" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">runner fleet</text>
+  <text x="750" y="204" text-anchor="middle" font-size="11" fill="#57606a">[self-hosted, ezgha]</text>
+  <text x="750" y="218" text-anchor="middle" font-size="11" fill="#57606a">match job → runner</text>
+
+  <text x="750" y="246" text-anchor="middle" font-size="11" font-weight="600" fill="#1f2328">workflow job</text>
+  <text x="750" y="260" text-anchor="middle" font-size="11" fill="#57606a">checkout · build · test</text>
+  <text x="750" y="274" text-anchor="middle" font-size="11" fill="#57606a">results returned</text>
+
+  <text x="750" y="297" text-anchor="middle" font-size="11" fill="#57606a">runner deregisters</text>
+
+  <!-- Arrows -->
+  <!-- supervisor -> backend ladder (selects) -->
+  <line x1="330" y1="345" x2="422" y2="235" stroke="#57606a" stroke-width="1.5"/>
+  <polygon points="422,235 416,242 422,242" fill="#57606a" transform="rotate(-30 422 235)"/>
+  <text x="350" y="295" font-size="10" fill="#57606a">selects</text>
+
+  <!-- backend ladder -> docker daemon (drives) -->
+  <line x1="260" y1="220" x2="235" y2="220" stroke="#57606a" stroke-width="1.5"/>
+  <polygon points="235,220 241,216 241,224" fill="#57606a"/>
+  <text x="246" y="212" font-size="10" fill="#57606a">drives</text>
+
+  <!-- docker daemon -> runners -->
+  <path d="M 155 235 C 155 350, 152 380, 152 465" stroke="#57606a" stroke-width="1.5" fill="none"/>
+  <polygon points="152,465 148,459 156,459" fill="#57606a"/>
+
+  <!-- supervisor -> runners (spawn) -->
+  <line x1="330" y1="425" x2="152" y2="465" stroke="#57606a" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <polygon points="152,465 156,460 158,468" fill="#57606a"/>
+  <text x="240" y="448" font-size="10" fill="#57606a">docker run --rm …</text>
+
+  <!-- supervisor -> GitHub (jitconfig) -->
+  <path d="M 585 380 C 620 380, 620 220, 640 200" stroke="#0969da" stroke-width="1.5" fill="none"/>
+  <polygon points="640,200 634,206 634,194" fill="#0969da"/>
+  <text x="600" y="295" font-size="10" fill="#0969da">POST generate-jitconfig</text>
+
+  <!-- runners -> GitHub (register) -->
+  <path d="M 585 510 C 615 510, 615 230, 640 220" stroke="#1a7f37" stroke-width="1.5" fill="none"/>
+  <polygon points="640,220 634,226 634,214" fill="#1a7f37"/>
+  <text x="595" y="365" font-size="10" fill="#1a7f37">register [self-hosted, ezgha]</text>
+
+  <!-- runners -> GitHub (job done / deregister) -->
+  <path d="M 585 530 C 610 530, 610 250, 640 270" stroke="#1a7f37" stroke-width="1.2" stroke-dasharray="3 3" fill="none"/>
+  <polygon points="640,270 634,276 634,264" fill="#1a7f37"/>
+  <text x="595" y="490" font-size="10" fill="#1a7f37">job done · deregister</text>
+
+  <!-- gh CLI -> GitHub -->
+  <path d="M 750 345 L 750 310" stroke="#57606a" stroke-width="1.5"/>
+  <polygon points="750,310 746,316 754,316" fill="#57606a"/>
+  <text x="757" y="328" font-size="10" fill="#57606a">gh api ...</text>
+
+  <!-- policy gate -> backend ladder (dashed) -->
+  <path d="M 422 310 L 422 235" stroke="#9a6700" stroke-width="1.2" stroke-dasharray="3 3"/>
+  <text x="430" y="295" font-size="10" fill="#9a6700">policy gate</text>
+
+  <!-- VM containment label callout -->
+  <text x="600" y="138" font-size="10" fill="#9a6700" text-anchor="end">↖ only if Docker daemon is VM-contained</text>
+</svg>

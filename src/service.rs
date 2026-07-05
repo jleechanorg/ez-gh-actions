@@ -25,7 +25,8 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     let unit_dir = home()?.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join("ezgha.service");
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+    let path_env =
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let home_dir = home()?;
     let unit = format!(
         "[Unit]\n\
@@ -80,7 +81,8 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
     let agents = home()?.join("Library/LaunchAgents");
     std::fs::create_dir_all(&agents)?;
     let plist_path = agents.join("org.jleechanorg.ezgha.plist");
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+    let path_env =
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let home_dir = home()?;
     // Wrap ezgha in a generated shell script that unsets env vars known to
     // mask GitHub CLI keyring auth. The script is written next to the binary
@@ -195,7 +197,7 @@ mod tests {
                     // false-positive on `GH_TOKEN_AGENTF` matching `GH_TOKEN`.
                     let pattern = format!(" {} ", var);
                     let pattern_start = format!(" {} ", var); // leading space (after `unset `)
-                    let pattern_end = format!(" {}", var);   // trailing space (before space)
+                    let pattern_end = format!(" {}", var); // trailing space (before space)
                     s.contains(&pattern) || s.contains(&pattern_start) || s.contains(&pattern_end)
                 })
                 .unwrap_or(false);
