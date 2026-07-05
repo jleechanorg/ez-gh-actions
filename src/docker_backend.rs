@@ -418,6 +418,41 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+/// Reconcile slot assignments with currently running containers.
+/// Any slot that is in the assignments file but has no corresponding running
+/// container is released.
+fn reconcile_slots_with_containers(cfg: &Config, containers: &[ManagedContainer]) -> Result<()> {
+    let active_names: std::collections::HashSet<&str> = containers
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+
+    let mut assignments = read_slot_assignments()?;
+    let mut to_remove = Vec::new();
+
+    for slot_str in assignments.assignments.keys() {
+        if let Ok(slot) = slot_str.parse::<u32>() {
+            let name = runner_name_for(cfg, slot);
+            if !active_names.contains(name.as_str()) {
+                // If it is in assignments with a non-empty runner_id, but the container
+                // is not running, it means the container has exited and should be released.
+                let val = assignments.assignments.get(slot_str).unwrap();
+                if !val.is_empty() {
+                    to_remove.push(slot_str.clone());
+                }
+            }
+        }
+    }
+
+    if !to_remove.is_empty() {
+        for key in to_remove {
+            assignments.assignments.remove(&key);
+        }
+        write_slot_assignments(&assignments)?;
+    }
+    Ok(())
+}
+
 /// Ensure `count` managed runner containers are alive; start the shortfall.
 /// Refuses to spawn when the daemon's disk is below the configured floor —
 /// disk exhaustion is the dominant self-hosted runner failure mode, and
