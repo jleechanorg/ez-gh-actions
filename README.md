@@ -122,6 +122,62 @@ minimum_isolation = "container" # "vm" = refuse to run jobs unless execution is
 - On **public repos**: keep self-hosted workflows on `workflow_dispatch` / protected
   branches. Do not run fork PRs on self-hosted runners.
 
+## Diagnostics & Self-Healing
+
+### Fleet health check
+
+```bash
+./doctor.sh                      # full fleet health check
+./docs/verify-exit-criteria.sh   # ironclad exit criteria (Gates 0–10)
+```
+
+`doctor.sh` checks: service liveness, Docker daemon, Colima VM, slot assignments, GitHub runner fleet status (online/offline/busy), live managed containers, and recent job execution proof.
+
+`verify-exit-criteria.sh` machine-checks 7 ironclad gates:
+
+| Gate | What it checks |
+|------|----------------|
+| 0 | Deployed binary SHA matches HEAD commit |
+| 1 | Code builds, tests, clippy, fmt all pass |
+| 2 | Service active + Docker/Colima daemon up |
+| 3 | Fleet capacity meets targets (online + busy ≥ N−1, containers ≥ N−1) |
+| 4 | Recent jobs executed successfully on the ezgha fleet |
+| 7 | Automated monitoring scheduled and active |
+| 10 | GitHub API rate limit budget is healthy |
+
+### Custom runner image
+
+The default `ghcr.io/actions/actions-runner:latest` image lacks `gh` and `jq`, causing
+workflows that use these tools to fail with exit code 127. Build and use the custom image:
+
+```bash
+docker build -f Dockerfile.runner -t ezgha-runner:latest .
+```
+
+Then set in `~/.config/ezgha/config.toml`:
+```toml
+[runner]
+image = "ezgha-runner:latest"
+```
+
+### Stale container name-collision fix
+
+If the daemon logs `docker run failed: Conflict. The container name ... is already in use`
+in a loop, a stale container is occupying the slot name. Fix:
+
+```bash
+docker rm -f ez-org-runner-N   # replace N with the stuck slot number
+```
+
+The daemon (`≥ commit c6defc7`) includes a built-in failsafe that runs `docker rm -f`
+before each `docker run` to prevent this loop.
+
+### /doctor slash command
+
+This repo registers a `/doctor` slash command (`.claude/commands/doctor.md`,
+`.codex/commands/doctor.md`) that runs the diagnostic skill and auto-repairs common
+failures.
+
 ## Status
 
 v1 (M1): Docker backend end-to-end. Tart (macOS) and libvirt/KVM (Linux) are detected and

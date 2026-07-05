@@ -96,3 +96,31 @@ Always run `bash /home/jleechan/projects/ez-gh-actions/doctor.sh` (no flags) fir
 - The colima VM (4-cpu/12GB) is the docker daemon host. Restarting it kills all 16 ezgha containers. Only restart if the VM is in `Stopped` state.
 - mac ARM64 `org-runner-mac-*` runners persist independently of this Linux host. WARN-level only; deleting them via API does not stop their macOS hosts from re-registering.
 - For jobs that show `runner_name: "GitHub Actions NNNNNNNN"` (a 10-digit id), that's GitHub-hosted — not ezgha's problem.
+
+## Known Failure Modes & Fixes
+
+### Container name-collision loop (stale slot)
+**Symptom**: Journal shows repeated `docker run failed: Conflict. The container name "/ez-org-runner-N" is already in use` and Gate 3 fails with `Local managed container count (N) is lower than COUNT-1`.
+
+**Root cause**: A previous container from the same slot exited but was not removed (e.g., due to daemon crash or service restart), leaving a stopped container occupying the name. The daemon's `docker run --name ez-org-runner-N` then fails on every cycle.
+
+**Fix** (manual):
+```bash
+docker rm -f ez-org-runner-N   # unblock the slot
+```
+
+**Permanent fix**: As of commit `c6defc7`, `start_one()` in `docker_backend.rs` runs `docker rm -f <name>` before each `docker run`, so the daemon is self-healing by default.
+
+### Custom runner image missing gh/jq (exit 127)
+**Symptom**: Workflow steps that call `gh api` or `jq` fail with `command not found` (exit code 127). The Green Gate workflow shows `Fetch PR details failed (rc=127)` in its annotations.
+
+**Root cause**: The upstream `ghcr.io/actions/actions-runner:latest` image does not include `gh` or `jq`.
+
+**Fix**: Build and use `ezgha-runner:latest`:
+```bash
+docker build -f Dockerfile.runner -t ezgha-runner:latest .
+```
+Update `~/.config/ezgha/config.toml` → `image = "ezgha-runner:latest"`, then restart:
+```bash
+systemctl --user restart ezgha.service
+```
