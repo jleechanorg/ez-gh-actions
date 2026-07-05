@@ -29,9 +29,12 @@ Then update `~/.config/ezgha/config.toml`:
 image = "ezgha-runner:latest"
 ```
 
-## After any src/ change
+## After any commit (IMPORTANT — Gate 0)
+Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
+**Every commit — even docs-only — advances HEAD**, so you must always rebuild after committing:
+
 1. `cargo test` — verify all tests pass
-2. `cargo install --path .` — install updated binary
+2. `cargo install --path .` — install updated binary (embeds new HEAD SHA)
 3. `systemctl --user restart ezgha.service` — restart daemon
 4. `./docs/verify-exit-criteria.sh` — verify all gates pass
 
