@@ -94,25 +94,37 @@ except Exception:
     print(c['runner']['count'])
 " 2>/dev/null || grep -E 'count\s*=\s*' "$CONFIG_FILE" | head -1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
 
+# Read name_prefix from config (default: ez-org-runner)
+NAME_PREFIX=$(python3 -c "
+import toml
+try:
+    c = toml.load(open('$CONFIG_FILE'))
+    print(c['runner'].get('name_prefix', 'ez-org-runner'))
+except Exception:
+    import tomllib
+    c = tomllib.load(open('$CONFIG_FILE', 'rb'))
+    print(c['runner'].get('name_prefix', 'ez-org-runner'))
+" 2>/dev/null || echo 'ez-org-runner')
+
 if [ -z "$COUNT" ]; then
     fail "Could not parse runner.count from $CONFIG_FILE"
 fi
 
 RAW_RUNNERS=$(gh api orgs/jleechanorg/actions/runners --paginate 2>/dev/null || echo '{"runners":[]}')
-ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r '.runners[] | select(.name | startswith("ez-org-")) | select(.status == "online") | .name')
-ONLINE_COUNT=$(echo "$ONLINE_RUNNERS" | grep -c 'ez-org-' || echo 0)
-BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r '[.runners[] | select(.name | startswith("ez-org-")) | select(.busy == true)] | length')
+ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.runners[] | select(.name | startswith($p)) | select(.status == "online") | .name')
+ONLINE_COUNT=$(echo "$ONLINE_RUNNERS" | grep -c . || echo 0)
+BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.busy == true)] | length')
 EFFECTIVE_CAPACITY=$((ONLINE_COUNT + BUSY_COUNT))
 
 # Check offline runners
-OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r '[.runners[] | select(.name | startswith("ez-org-")) | select(.status == "offline")] | length')
+OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.status == "offline")] | length')
 
 # Local container check
 CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null | wc -l)
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 
-# Validate runner names match format exactly
-INVALID_NAMES=$(echo "$RAW_RUNNERS" | jq -r '.runners[] | select(.name | startswith("ez-org-")) | .name' | grep -vE "^ez-org-runner-[0-9]+$" || true)
+# Validate runner names match expected format (prefix-N)
+INVALID_NAMES=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.runners[] | select(.name | startswith($p)) | .name' | grep -vE "^.+-[0-9]+$" || true)
 if [ -n "$INVALID_NAMES" ]; then
     fail "Invalid runner names registered on GitHub:\n$INVALID_NAMES"
 fi
