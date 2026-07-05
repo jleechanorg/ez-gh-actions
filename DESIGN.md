@@ -1,29 +1,39 @@
 # ez-gh-actions — Design (v1)
 
-Easy isolated self-hosted GitHub Actions runners: VM-preferred, container fallback with
-hard resource limits.
+Easy isolated self-hosted GitHub Actions runners: VM-within-VM isolation (container-in-VM-in-host 3-layer stack) with VM-preferred backend selection.
 
 > **Visual**: a static architecture diagram lives at
 > [`docs/architecture.svg`](docs/architecture.svg) (also rendered inline in the
 > README). The rest of this document is the prose version of that diagram + the
 > adversarial review that produced v1.
 
-## Isolation model — not VM-in-VM
+## Isolation model — VM-within-VM (container-in-VM-in-host)
 
-`ezgha` does **not** nest VM backends inside other VM backends. It picks exactly one
-isolation boundary per host, chosen from the backend ladder below, and refuses to
-start work if the host can't satisfy `policy.minimum_isolation`. The three valid
-topologies are:
+`ezgha` uses a **VM-within-VM isolation** strategy: each runner workload executes
+inside a container, which itself runs inside a VM (Colima / Lima / Docker Desktop on
+macOS; QEMU microVM on Linux per `policy.minimum_isolation = "vm"`), which itself runs
+on the host OS. The host kernel can never be reached directly by the runner process.
 
-1. **Container on host** — Docker daemon on bare metal. Container boundary only.
-2. **Container inside VM** *(most common dev setup)* — Docker daemon already runs
-   inside a Colima / Lima / Docker Desktop VM. Container boundary + VM host
-   blast-radius. Detected via `docker info` kernel ≠ host `uname` kernel.
-3. **Container inside dedicated VM** *(M2 roadmap)* — Tart (macOS) or libvirt/KVM
-   (Linux) per job. Hardware virtualization, no shared kernel.
+Three valid topologies, chosen automatically by `select()` from the backend ladder
+below based on what the host offers and what `policy.minimum_isolation` requires:
 
-A "VM-in-VM" topology (e.g. running libvirt inside a Colima VM) is not a goal of this
-project and is not implemented.
+1. **Container on host** — Docker daemon on bare metal. Container boundary only
+   (cgroup + namespaces + `no-new-privileges`). The host kernel is the only boundary.
+2. **Container inside VM** *(VM-within-VM, Mac dev setup, also Linux with QEMU)* —
+   Docker daemon already runs inside a Colima / Lima / Docker Desktop VM (macOS) or a
+   QEMU microVM (Linux). Two boundaries: container → VM hypervisor → host kernel.
+   Detected via `docker info` kernel ≠ host `uname` kernel. This is the deployed
+   reality on Mac (Colima) and jeff-ubuntu (QEMU).
+3. **Container inside dedicated VM** *(M2 roadmap)* — Each job in its own Tart (macOS)
+   or libvirt/KVM (Linux) VM. Hardware virtualization; no shared kernel with the host.
+
+**What "VM-within-VM" does NOT mean.** It does **not** mean nesting one VM backend
+inside another VM backend (e.g. running libvirt inside a Colima VM, or KVM inside
+QEMU). That topology is an explicit non-goal — `select()` picks exactly one isolation
+boundary per host and refuses to start work if the host can't satisfy the policy. When
+this document, the wiki (`vm-within-vm-isolation.md`), the roadmap, and the README say
+"VM-in-VM", they all mean the **3-layer container-in-VM-in-host stack** described in
+topology #2 — never nested VM backends.
 
 This design is the **adjusted** version of the original `gha-isolated` proposal
 ([gist](https://gist.github.com/jleechan2015/f487a9773f650719680d27d0f8ad6c07)), rewritten

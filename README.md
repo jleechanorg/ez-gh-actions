@@ -23,23 +23,28 @@ JIT-registered with GitHub, executes exactly one workflow job, then deregisters 
 container is removed (`--rm`). Each job starts from a clean filesystem — workspace
 pollution, zombie runners, and cache corruption are eliminated by construction.
 
-`ezgha` does **not** run a VM inside a VM. The isolation model is **one of these three
-topologies**, chosen automatically based on what your host offers and what your policy
-requires:
+`ezgha` uses a **VM-within-VM isolation** strategy: each runner workload executes
+inside a container, which itself runs inside a VM (Colima / Lima / Docker Desktop on
+macOS; QEMU microVM on Linux per `policy.minimum_isolation = "vm"`), which itself runs
+on the host OS. The host kernel can never be reached directly by the runner process.
 
-| Topology | Where the container runs | What's between the job and your host kernel | When `ezgha` picks it |
-|----------|--------------------------|---------------------------------------------|-----------------------|
+> **Terminology note.** "VM-within-VM" here means *container-in-VM-in-host*, the
+> 3-layer deployed stack (container → VM → host), where the host kernel is one VM
+> boundary away from the runner. It does **not** mean nesting one VM backend inside
+> another VM backend (e.g. running libvirt inside a Colima VM) — that topology is
+> not implemented and is a non-goal. When we say "VM-in-VM" in [DESIGN.md](DESIGN.md),
+> the wiki, and the roadmap, this is what we mean.
+
+The isolation model has three valid topologies, chosen automatically based on what
+your host offers and what your policy requires:
+
+| Topology | Where the container runs | Layers between job and host kernel | When `ezgha` picks it |
+|----------|--------------------------|-------------------------------------|-----------------------|
 | **Container on host** | Docker daemon on bare metal / Linux server | cgroup + namespaces + `no-new-privileges` | Default; `policy.minimum_isolation = "container"` |
-| **Container inside VM** *(most common dev/laptop setup)* | Docker daemon running inside a Colima / Lima / Docker Desktop VM | Same container boundary, but the **host blast-radius** is bounded by the VM | Detected via `docker info` kernel ≠ host kernel; satisfies `policy.minimum_isolation = "vm"` |
+| **Container inside VM** *(VM-within-VM, Mac dev setup)* | Docker daemon running inside a Colima / Lima / Docker Desktop VM | Container → VM hypervisor → host kernel | Detected via `docker info` kernel ≠ host kernel; satisfies `policy.minimum_isolation = "vm"` |
 | **Container inside dedicated VM** *(roadmap — M2)* | Each job in its own Tart (macOS) or libvirt/KVM (Linux) VM | Hardware virtualization; no shared kernel | Roadmap; detected and reported by `ezgha doctor` today, drivers land in M2 |
 
-A **VM-in-VM strategy** would mean nesting a VM backend inside another VM backend (e.g.
-running libvirt inside a Colima VM). `ezgha` does not do this — it picks one isolation
-boundary per host and refuses to start work if the host can't satisfy the policy. The
-"VM" tier in the policy means *VM-contained execution*, which can be a real VM backend
-(M2) **or** a Docker daemon already running inside a VM (today), but never both stacked.
-
-See [DESIGN.md §"Backend ladder (strongest first)"](DESIGN.md#backend-ladder-strongest-first)
+See [DESIGN.md §"Isolation model"](DESIGN.md#isolation-model--vm-within-vm-container-in-vm-in-host)
 and the [architecture diagram](docs/architecture.svg) for the full picture.
 
 ## Install
