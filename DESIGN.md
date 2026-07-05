@@ -3,6 +3,28 @@
 Easy isolated self-hosted GitHub Actions runners: VM-preferred, container fallback with
 hard resource limits.
 
+> **Visual**: a static architecture diagram lives at
+> [`docs/architecture.svg`](docs/architecture.svg) (also rendered inline in the
+> README). The rest of this document is the prose version of that diagram + the
+> adversarial review that produced v1.
+
+## Isolation model — not VM-in-VM
+
+`ezgha` does **not** nest VM backends inside other VM backends. It picks exactly one
+isolation boundary per host, chosen from the backend ladder below, and refuses to
+start work if the host can't satisfy `policy.minimum_isolation`. The three valid
+topologies are:
+
+1. **Container on host** — Docker daemon on bare metal. Container boundary only.
+2. **Container inside VM** *(most common dev setup)* — Docker daemon already runs
+   inside a Colima / Lima / Docker Desktop VM. Container boundary + VM host
+   blast-radius. Detected via `docker info` kernel ≠ host `uname` kernel.
+3. **Container inside dedicated VM** *(M2 roadmap)* — Tart (macOS) or libvirt/KVM
+   (Linux) per job. Hardware virtualization, no shared kernel.
+
+A "VM-in-VM" topology (e.g. running libvirt inside a Colima VM) is not a goal of this
+project and is not implemented.
+
 This design is the **adjusted** version of the original `gha-isolated` proposal
 ([gist](https://gist.github.com/jleechan2015/f487a9773f650719680d27d0f8ad6c07)), rewritten
 after a 32-agent adversarial review (4 independent reviewers — facts/web, architecture,
