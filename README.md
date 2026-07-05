@@ -47,6 +47,134 @@ your host offers and what your policy requires:
 See [DESIGN.md §"Isolation model"](DESIGN.md#isolation-model--vm-within-vm-container-in-vm-in-host)
 and the [architecture diagram](docs/architecture.svg) for the full picture.
 
+## What each layer is (and what each one enforces)
+
+The VM-within-VM stack has **four layers**. From the runner process outward:
+
+### Layer 1 — Runner container (inner-most)
+
+- **What it is**: an OCI/Docker container running
+  [`ghcr.io/actions/actions-runner`](https://github.com/actions/runner) (or
+  `ezgha-runner:latest` if you build the [custom image](#custom-runner-image)).
+- **Lifecycle**: created by `ezgha serve` via `docker run --rm …`, JIT-registers with
+  GitHub, runs **exactly one workflow job**, deregisters, exits. The container is
+  removed by `--rm` on exit.
+- **What enforces isolation**:
+  - **Linux cgroups** — hard ceilings on memory (`--memory` + `--memory-swap`),
+    CPU (`--cpus`), and process count (`--pids-limit`). A runaway job dies inside
+    its cgroup; the host can't be OOM-killed by a single job.
+  - **Linux namespaces** — PID, mount, network, UTS, IPC, user. The runner sees
+    only its own processes, mounts, hostname, network namespace.
+  - **`--security-opt no-new-privileges`** — blocks setuid binaries and capability
+    escalation. `sudo` is disabled inside the container; even if a job runs
+    `apt install sudo && sudo su`, the kernel refuses the privilege change.
+- **What it does NOT enforce**: it does not stop a kernel-level exploit (CVE in the
+  shared kernel) from escaping into the host's user-space. That is what the next
+  layer is for.
+- **Configuration knobs** (in `~/.config/ezgha/config.toml` `[runner]` /
+  `[limits]`): `image`, `count`, `memory_mb`, `cpus`, `pids`, `min_free_disk_gb`.
+
+### Layer 2 — Docker daemon (manages the containers)
+
+- **What it is**: `dockerd` running on the host. On Mac and on jeff-ubuntu this
+  daemon runs **inside the VM** (Layer 3), not on the bare host kernel.
+- **Lifecycle**: long-lived; started by the VM (Colima/QEMU) on boot, restarted by
+  the VM's init system if it crashes. Independent of `ezgha serve`.
+- **What enforces isolation**:
+  - **Container image isolation** — runners start from a clean image every time
+    (no `RUNNER_TOKEN` baked in, no shared mutable layers between jobs).
+  - **Docker API authentication** — `ezgha` talks to the daemon over its Unix
+    socket (or TCP if configured) using standard `docker run` flags.
+  - **Docker storage driver** — `overlay2` (Linux) or `vfs` (Mac via Colima).
+    Stops one container's filesystem from reading another's.
+- **What it does NOT enforce**: it is a userspace process. A kernel exploit in the
+  container's syscall surface can reach the daemon, and then the daemon's host
+  (which is the VM's userspace, not your laptop's kernel).
+- **Configuration knobs**: standard `daemon.json`; `ezgha` detects sysbox-runc
+  runtime when present and uses it for stronger container isolation (see [Backend
+  ladder](#backends-isolation-ladder)).
+
+### Layer 3 — VM (the isolation boundary that satisfies `policy.minimum_isolation = "vm"`)
+
+- **What it is**: on macOS — Colima / Lima / Docker Desktop, a Linux VM
+  (typically a recent Ubuntu or Debian cloud image) running on the macOS
+  hypervisor (`vz` on Apple Silicon, `qemu` on Intel). On Linux — a QEMU
+  microVM (or, for M2, libvirt/KVM) running on the Linux host's hardware
+  virtualization (`/dev/kvm`).
+- **Lifecycle**: started at host boot (or via `limactl start colima` /
+  `systemctl --user start ezgha.service`'s prereq). Independent of `ezgha serve`
+  and of any individual runner container.
+- **What enforces isolation**:
+  - **Hardware virtualization** — the VM's kernel is fully separate from the
+    host kernel. The container's kernel exploits cannot reach the host kernel
+    directly; they would first need to break out of the VM (a much harder,
+    rarer, and more-researched class of bug).
+  - **VM resource limits** — the hypervisor can cap VM RAM, vCPUs, and disk.
+    The container cannot exhaust the host's resources; it can only exhaust
+    the VM's quota.
+  - **VM network isolation** — the VM's network is bridged or NAT'd through
+    the host. A container cannot bind to the host's IP directly.
+- **Detection by `ezgha`**: `ezgha doctor` (and `init`) compares the daemon's
+  kernel version (`docker info --format '{{.KernelVersion}}'`) against the host
+  kernel (`uname -r`). A mismatch means the daemon is running inside a VM.
+  This is how `ezgha` automatically satisfies `policy.minimum_isolation = "vm"`
+  without you having to wire it up manually.
+- **What it does NOT enforce**: VM escape is a real (rare) attack class.
+  `ezgha` does not claim VM-escape immunity; it claims the **host blast-radius**
+  is bounded by the VM.
+- **Configuration knobs**: standard Colima/Lima/QEMU config; `ezgha` only needs
+  the docker daemon reachable.
+
+### Layer 4 — Host OS / host kernel (outer-most)
+
+- **What it is**: your physical machine's OS — macOS (Darwin) on the Mac fleet,
+  Ubuntu on jeff-ubuntu. The host kernel sees only the hypervisor process
+  (Colima/QEMU/libvirt), never the containers directly.
+- **What it enforces**:
+  - **Hypervisor sandboxing** — modern hypervisors (Apple Virtualization
+    framework `vz`, KVM) run the guest with a minimal device model. The host
+    kernel refuses most cross-boundary syscalls.
+  - **Standard OS hardening** — filevault, SIP, secure boot, etc.
+- **What `ezgha` enforces on this layer**:
+  - **`ezgha serve` runs as a user service** (`systemd --user` or `launchd`
+    LaunchAgent), not as root, not as a system service. Compromise of
+    `ezgha` itself cannot escalate to root without an additional exploit.
+  - **Disk floor guard** — `ezgha serve` refuses to spawn new runners when
+    the Docker volume drops below `min_free_disk_gb` (default 10 GB).
+  - **No docker.sock mounted into runners**, no privileged mode, no
+    `--cap-add` beyond the defaults.
+- **What it does NOT enforce**: nothing in `ezgha` is a substitute for keeping
+  the host OS patched (Apple security updates, Ubuntu `unattended-upgrades`).
+
+### How the layers compose
+
+Read the layers from the outside in:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 4 — Host OS / host kernel                             │
+│   sees: hypervisor process (Colima/QEMU), nothing else      │
+│   ┌───────────────────────────────────────────────────────┐ │
+│   │ Layer 3 — VM (Apple vz / QEMU / KVM)                  │ │
+│   │   sees: VM kernel + userspace, isolated from host     │ │
+│   │   ┌─────────────────────────────────────────────────┐ │ │
+│   │   │ Layer 2 — Docker daemon                         │ │ │
+│   │   │   sees: container processes, image storage      │ │ │
+│   │   │   ┌───────────────────────────────────────────┐ │ │ │
+│   │   │   │ Layer 1 — Runner container                │ │ │ │
+│   │   │   │   sees: only its own PID/mount/net ns     │ │ │ │
+│   │   │   │   runs: actions/runner, 1 job, then exits │ │ │ │
+│   │   │   └───────────────────────────────────────────┘ │ │ │
+│   │   └─────────────────────────────────────────────────┘ │ │
+│   └───────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+A malicious workflow job would need to break **all four** boundaries (container
+cgroup/namespace → Docker daemon → VM hypervisor → host kernel) to reach your
+data. The first three are mitigated by Layer 3's hardware virtualization;
+the fourth is your OS hardening job.
+
 ## Install
 
 ```bash
