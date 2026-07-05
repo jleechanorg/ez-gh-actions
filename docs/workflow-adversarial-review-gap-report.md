@@ -367,3 +367,413 @@ Concrete, adoptable additions to the Workflow tool's documented patterns:
 - Key commits: `5ef5406` (v1), `c27d389` (daemon-capacity fix), `537e1e5` (E2E
   evidence), `2e3ac2b` (critical fixes C1+C2), `3f04937` (post-fix evidence, audited
   HEAD).
+
+---
+
+# Part II — Blinded reproduction protocol (designed and executed 2026-07-03)
+
+The §7 repro has contamination problems: the answer key (this report, the expanded
+`DESIGN.md` limitations, public PR #1) lives in the same repo a fresh reviewer would
+read, and any web-enabled agent can find it. §9–§13 define and execute a blinded
+version.
+
+## 9. Blinding design
+
+**Blind target**: https://github.com/jleechanorg/ezgha-blind-review (private), whose
+`main` is the original repo's history **truncated at `537e1e5`** — the exact tree the
+original Workflow 2 audited. At that commit:
+
+- Both criticals (C1 host-vs-daemon measurement, C2 fleet-wide stop) are unfixed.
+- `DESIGN.md` has only the 3 pre-review limitations (gh-CLI auth, detect-only VMs, no
+  per-job quota) — none of the review's findings.
+- No `docs/` directory, no transcripts, no gap report, no fix commits.
+- The evidence bundle has the original integrity defect (`git_sha.txt` listed in
+  `checksums.sha256` but absent) — the original FAIL condition is reproducible.
+
+Anthropic can reconstruct the identical tree from the public repo with
+`git checkout 537e1e5`; the private fork exists so blinded sessions have a clean clone
+URL that carries no answer key and is not web-discoverable.
+
+**Contamination controls**:
+
+1. Arm A reuses the original workflow **prompts byte-for-byte** (Appendix A), with
+   exactly three mechanical edits, all path/name swaps: `meta.name`, the `REPO`
+   constant → the blind checkout path, and the verify-stage prompt's public-repo
+   pointer → the blind fork (so no verifier browses the original repo, where PR #1
+   contains the answer key). The full diff is 3 lines and is reproduced in §11.
+2. Arm B (human-driven single-context session) must be opened **in the blind clone
+   directory**. Rationale: project-scoped auto-memory in the operator's usual project
+   directory contains an ez-gh-actions entry that leaks the daemon-vs-host lesson
+   (C1). A session rooted in the blind clone loads no such memory.
+3. Arm B's prompt (Appendix C) is deliberately **neutral** — it does not include the
+   mode lenses from §6.2, so it tests "fresh single context, generic adversarial
+   prompt" rather than "single context told where to look."
+4. The answer key (§13) lives only in the original repo, never in the blind fork.
+
+## 10. Arms
+
+| Arm | What | Tests |
+|---|---|---|
+| **A** | Original Workflow 2 script, prompts verbatim, run against the blind checkout (executed by this session; results in §12) | Do the false negatives reproduce with the same prompts on the same code? (Variance check on the original run) |
+| **B** | Fresh interactive session in the blind clone dir, neutral single-context adversarial prompt (Appendix C), run by the human operator | Does an uninformed single context catch what the workflow missed? (The original single-context audit was prompted only with "review this adversarial and see if anything was missed" — Arm B approximates that, minus this session's accumulated context) |
+| **A′** (optional) | Workflow 2 + the four mode lenses and invariant-anchored prompts from §6 | Measures the delta the §6 recommendations buy |
+
+Score every arm against the §13 answer key.
+
+## 11. Arm A mechanical diff (original script → blind run)
+
+```diff
+2c2
+< name: 'er-ez-gh-actions',
+---
+> name: 'er-ezgha-blind-repro',
+11c11
+< const REPO = '/home/jleechan/projects/ez-gh-actions'
+---
+> const REPO = '<local blind checkout of ezgha-blind-review @ 537e1e5>'
+107c107 (verify-stage prompt only)
+< (public: github.com/jleechanorg/ez-gh-actions, ...)
+---
+> (public: github.com/jleechanorg/ezgha-blind-review, ...)
+```
+
+## 12. Arm A results
+
+*(Executed 2026-07-03; this section records the blind re-run's findings scored against
+§13. Filled in from the workflow's structured output — see the run transcript
+directory referenced in the PR.)*
+
+**PENDING AT WRITE TIME — populated in a follow-up commit once the workflow
+completes.**
+
+## 13. Answer key at `537e1e5` (keep OUT of the blind fork)
+
+"Caught" = appeared in the original workflow's confirmed output. "Missed" = absent
+from all 50 subagents' output, found by the post-hoc single-context audit.
+
+| ID | Finding (at `537e1e5`) | Original run | Applies at blind commit |
+|---|---|---|---|
+| INT-1 | `git_sha.txt` in `checksums.sha256` but missing from bundle → integrity FAIL | caught | yes |
+| C1 | Disk floor guard + limits measure the HOST fs/capacity, not the docker daemon's | caught | yes |
+| C2 | `stop` deregisters ALL idle `ezgha-*` runners incl. other hosts' | caught | yes |
+| J1 | Crash-looping containers leak JIT registrations, no backoff | caught | yes |
+| J2 | `stop` vs installed service race (serve respawns in 30s) | caught | yes |
+| J3 | `docker ps --format json` breaks on Docker CLI < 23 | caught | yes |
+| J4 | Managed label not target-scoped (two configs miscount) | caught | yes |
+| J5 | Hardening gaps: no cap-drop/egress/read-only rootfs | caught | yes |
+| J6 | JIT config visible in argv / docker inspect | caught | yes |
+| M1 | Disk guard fails open when measurement fails (`if let Some` silently skips — at this commit there is not even a warning) | **missed** | yes |
+| M2 | No aggregate check: `count × limits` can exceed daemon capacity | **missed** | yes |
+| M3 | Hostname-prefix residual collision + `"host"` fallback | **missed** | no — post-fix only (subsumed by C2 here) |
+| M4 | `list_runners` silently truncates at `per_page=100`, no pagination | **missed** | yes |
+| M5 | `install-service` PATH-broken under launchd; `After=docker.service` no-op in user unit; `launchctl load -w` re-run failure | **missed** | yes |
+| M6 | `runner_group_id=1` hardcoded | **missed** | yes |
+| M7 | Default image unpinned `:latest` | **missed** | yes |
+| M8 | `init` silently overwrites existing config | **missed** | yes |
+| M9 | Evidence bundle mixes two code states under one SHA pin | **missed** | no — post-fix artifact |
+
+Scoring: catch rate over {M1, M2, M4–M8} is the false-negative metric; {INT-1, C1, C2,
+J1–J6} is the regression floor (an arm that loses these is strictly worse, not just
+differently focused).
+
+---
+
+# Appendix A — Original workflow prompts (verbatim)
+
+Complete scripts (including schemas and orchestration) are committed at
+`docs/adversarial-review/workflows/*.workflow.js`. The prompts below are the exact
+strings from those scripts. `${GIST}`/`${REPO}`/`${EV}` are path constants defined at
+the top of each script.
+
+## A.1 Workflow 1 — design review finder lenses (4 reviewers)
+
+**`facts`**:
+
+> You are a technical fact-checker with web access. Read the design document at
+> ${GIST} (a design for "gha-isolated", a Rust CLI wrapping "gha-outrunner" for
+> isolated self-hosted GitHub Actions runners). Use WebSearch/WebFetch extensively to
+> verify EVERY external factual assumption in the design. Specifically investigate:
+> 1. Does a project called "gha-outrunner" actually exist? Search GitHub, crates.io,
+> web. If it does not exist or is obscure/unmaintained, that is a CRITICAL finding —
+> the whole design wraps it. Check if the author may have meant something else (e.g.
+> actions-runner-controller, github-runner projects, "runs-on", ...).
+> 2. Tart (tart.run / cirruslabs/tart) licensing: is it free for this use? (Fair
+> Source / paid tiers — what are the actual limits as of 2026?)
+> 3. GitHub "Scale Sets": runner scale sets are an Actions Runner Controller (ARC /
+> Kubernetes) concept — can a standalone CLI use scale sets without k8s? Or should the
+> design say "ephemeral runners + JIT config" instead?
+> 4. GCE nested virtualization: the design claims GCE has "no strong KVM" — but GCE
+> supports nested virtualization on most x86 machine types. Verify.
+> 5. Sysbox status in 2026: Docker acquired Nestybox; is Sysbox CE maintained?
+> Kernel/distro requirements?
+> 6. serde_yaml crate: deprecated/archived? What's the recommended replacement?
+> 7. Any well-established existing tools that already do what gha-isolated proposes
+> (e.g. cirruslabs gitlab/github runner tart executors, RunsOn, actuated, garm
+> (Cloudbase GitHub Actions Runner Manager), ARC, ubicloud, warpbuild, etc.) — is this
+> reinventing an existing wheel?
+> Report each as a finding with evidence URLs. Be precise about what you could and
+> could not verify.
+
+**`architecture`**:
+
+> You are a senior infrastructure architect reviewing a design doc. Read ${GIST} — a
+> design for "gha-isolated", a Rust CLI that wraps "gha-outrunner" to run isolated
+> self-hosted GitHub Actions runners (Tart VMs on macOS, libvirt on Linux,
+> Docker+Sysbox fallback). Review the ARCHITECTURE for gaps and design flaws. Consider
+> at minimum:
+> - Runner registration/auth: the design never mentions GitHub PAT/GitHub App tokens,
+> JIT runner config, registration token lifecycle, or repo/org scoping. How do runners
+> actually register?
+> - VM image management: where do Tart/libvirt guest images come from? Versioning,
+> updates, disk usage, caching of toolchains inside images?
+> - Ephemeral lifecycle: who destroys VMs after a job? Crash recovery, orphan cleanup,
+> disk-space reclamation?
+> - Backend selection: is 'has_kvm => libvirt' a sane default? libvirt setup burden vs
+> docker on a typical Linux box. Is silent fallback to plain Docker (weakest
+> isolation) acceptable, or should it require explicit opt-in ("fail closed vs fail
+> open" on isolation)?
+> - Resource limits: hardcoded 4G/2cpu/count:2 — how should host capacity be
+> reflected? What about disk limits (the most common runner failure mode)?
+> - Config: written to cwd as outrunner.yml — should be XDG/user config dir; no schema
+> versioning; no secrets handling story.
+> - Observability: status, logs, health checks, alerting hooks.
+> - Security: job-to-host escape surface per backend, docker.sock exposure, network
+> egress policy, secrets in env.
+> - Service management: launchd/systemd story is 'not yet implemented' but is
+> essential for real use.
+> Rate each gap by severity. Do NOT fact-check external tools (another reviewer does
+> that); focus on the design's internal completeness and soundness.
+
+**`rust`**:
+
+> You are a Rust reviewer. Read the design + skeleton code at ${GIST}. Review the
+> Cargo.toml and skeleton Rust code for concrete issues:
+> - Dependency choices: serde_yaml (archived?), sysinfo pulled in but barely used
+> (System::new_all + refresh_all just to detect OS — wasteful), duct vs std::process,
+> missing deps for the stated scope (e.g. tokio? tracing? directories/xdg?
+> thiserror?), version pinning.
+> - Code issues: config generation via format! string templating vs typed structs +
+> serde (the design itself lists 'better config model' as future work — should be v1);
+> Platform detection via cfg! at runtime vs compile time; /dev/kvm existence check
+> doesn't verify permissions (user must be in kvm group); backend.rs 'assume Sysbox is
+> installed' comment is a landmine; std::fs::write("outrunner.yml") writes to cwd;
+> error handling; missing service.rs and limits.rs despite being in the module table
+> (module table lists 7 files, main.rs declares only 4 mods).
+> - Structure: suggest what a credible v1 module layout and trait design would be
+> (e.g. a Backend trait with detect/validate/start/stop implemented per backend).
+> Report concrete findings with severity.
+
+**`infra-fit`**:
+
+> You are reviewing how a proposed new tool fits an existing codebase. The proposal
+> (read it at ${GIST}) is "gha-isolated": a Rust CLI for isolated self-hosted GitHub
+> Actions runners (Tart on macOS, libvirt on Linux, Docker+Sysbox fallback), wrapping
+> a tool called gha-outrunner.
+> The repo at ${REPO} ALREADY runs self-hosted GitHub Actions runners. Explore:
+> - ${REPO}/self-hosted-oss/ (read README.md, install.sh header comments,
+> docker-compose.yml, pre-job-hook.sh, heal-runners.sh, mac-runner-health.sh,
+> LINUX_HOST_POLICY.md, linux/ subdir)
+> - ${REPO}/self-hosted-colima/ (README.md, docker-compose.yml, scripts/)
+> - Recent git log in that repo mentioning runners (git -C ${REPO} log --oneline -20)
+> Summarize: (1) what the existing runner setup does today (platforms, isolation
+> level, resource limits, health/healing, disk cleanup, launchd/systemd wiring); (2)
+> which pain points the existing setup has that gha-isolated would genuinely solve;
+> (3) which hard-won operational lessons in the existing scripts (disk cleanup pre-job
+> hooks, health thresholds, colima VM sizing, cache integrity checks, Slack alerting)
+> are MISSING from the gha-isolated design and must be carried over; (4) whether a new
+> Rust binary is justified vs extending the existing bash/compose setup — give an
+> honest assessment. Also note the repo CLAUDE.md rule that self-hosted runner changes
+> must be in git and reproducible via install.sh.
+
+**Workflow 1 verifier template** (one per critical/major finding):
+
+> Adversarially verify this finding about a design doc (the doc is at ${GIST}; the
+> repo is ${REPO}; you may use WebSearch/WebFetch and read files). Try to REFUTE it.
+> Finding from the "${f.from}" reviewer, severity ${f.severity}:
+> TITLE: ${f.title}
+> DETAIL: ${f.detail}
+> RECOMMENDATION: ${f.recommendation}
+> Is the finding factually correct and does the recommendation make sense? If the
+> factual basis is wrong or the severity is inflated, refute it. Default to
+> refuted=true only if you have concrete contrary evidence or the claim is unsupported
+> after checking.
+
+## A.2 Workflow 2 — /er audit lenses (4 auditors) — **the run that missed M1–M9**
+
+**`evidence-provenance`**:
+
+> You are a skeptical evidence auditor (/er style — zero tolerance for assertions
+> without raw proof). Audit the evidence bundle at ${EV} (files: EVIDENCE.md,
+> 01_init.txt..08_status_after_job.txt, config.toml, checksums.sha256).
+> Checks: (1) run `cd ${EV} && sha256sum -c checksums.sha256` — any failure is a
+> critical finding. (2) Circular provenance: is any claim supported only by an
+> artifact the claim itself generated, or do independent artifacts corroborate (e.g.
+> container ID in 04_status_before_job.txt vs hostname in 07_job_log.txt — these come
+> from different systems: local docker vs GitHub's job log)? (3) Internal consistency:
+> runner name, container id, limits (5977MB=6267338752 bytes? do the math), timestamps
+> ordering. (4) Do the artifacts actually show what EVIDENCE.md claims, line by line?
+> (5) Anything that smells fabricated or copy-pasted. Report findings with severity;
+> if the bundle is sound say so explicitly in the summary.
+
+**`live-reverify`**:
+
+> You are an independent verifier with live access. Re-verify the E2E claims of
+> ${EV}/EVIDENCE.md against LIVE GitHub state — do not trust the bundle:
+> (1) `gh run view 28685531107 -R jleechanorg/ez-gh-actions --json
+> status,conclusion,headSha,event,workflowName` — confirm success, workflow_dispatch,
+> workflow name ezgha-selftest.
+> (2) `gh run view 28685531107 -R jleechanorg/ez-gh-actions --log | grep -E 'runner
+> name|hostname|6267338752|pids'` — confirm the runner name
+> ezgha-Jeff-Ubuntu-6a4833a11c652b and cgroup values appear in GitHub's own logs.
+> (3) `gh api repos/jleechanorg/ez-gh-actions/actions/runners` — confirm 0 lingering
+> runners (ephemeral cleanup claim).
+> (4) `gh api
+> repos/jleechanorg/ez-gh-actions/commits/5ef5406779925598565c8d277d13b865db78947a
+> --jq .sha` and confirm the repo at github.com/jleechanorg/ez-gh-actions has the
+> claimed code (spot-check src/docker_backend.rs on main for
+> --memory/--cpus/--pids-limit flags via gh api or git -C ${REPO} show).
+> (5) Check the CI workflow runs on main: `gh run list -R jleechanorg/ez-gh-actions -w
+> CI --json conclusion,headSha -L 3` — all green?
+> Any mismatch between bundle claims and live state is a critical finding. Report
+> PROVEN/mismatch per claim in your summary.
+
+**`code-bugs`** (the lens that owned M1–M4, M6–M8's territory):
+
+> You are a hostile Rust code reviewer. Review ALL source at ${REPO}/src/ (main.rs,
+> platform.rs, backend.rs, config.rs, github.rs, docker_backend.rs, service.rs) plus
+> Cargo.toml for REAL bugs that would bite in production: incorrect error handling,
+> race conditions (e.g. serve loop vs stop, ensure_count counting
+> exited-but-not-removed containers), wrong docker/gh CLI usage (flag syntax, output
+> parsing fragility — docker ps --format json availability, df parsing), edge cases
+> (count>1, org scope, config with cpus exceeding daemon after VM resize, memory-swap
+> semantics), the unique_suffix collision risk, stop_all deregistering OTHER hosts'
+> ezgha-* runners (org/multi-host hazard), managed_containers missing exited
+> containers still holding registrations. Only report defects with a concrete failure
+> scenario. Severity by impact.
+
+**`security`**:
+
+> You are a security reviewer. Review ${REPO}/src/ and the workflows in
+> ${REPO}/.github/workflows/ for security issues: (1) command construction — can
+> config values (target, labels, image) inject arguments into gh/docker invocations?
+> Note std::process::Command passes args as vectors (no shell), but leading-dash
+> argument injection into docker/gh flags is still possible — check each. (2) JIT
+> config exposure via docker inspect / process listing — evaluate the documented
+> tradeoff honestly. (3) Runner container hardening: what's missing (network egress,
+> read-only rootfs, seccomp)? Is no-new-privileges + cgroup limits + no docker.sock
+> accurate per the code? (4) Public-repo self-hosted runner risk: selftest.yml is
+> workflow_dispatch-only — is anything else triggerable by forks? Is CI (ci.yml) on
+> ubuntu-latest (safe)? (5) service.rs: unit/plist content injection via exe path?
+> Report findings with severity and concrete attack scenarios.
+
+**Workflow 2 verifier template**:
+
+> Adversarially verify this finding about the repo at ${REPO} (public:
+> github.com/jleechanorg/ez-gh-actions, evidence at ${EV}, run ${RUN_URL}). Try to
+> REFUTE it by reading the actual code/evidence and, where relevant, live gh queries.
+> Finding from "${f.from}" (${f.severity}): ${f.title}
+> ${f.detail}
+> Refute if the factual basis is wrong, the scenario cannot occur, or severity is
+> inflated (severity inflation alone -> not refuted, but say so).
+
+**Workflow 2 judge prompt**:
+
+> You are the final /er evidence-review judge for ez-gh-actions v1 (repo ${REPO},
+> evidence ${EV}, live run ${RUN_URL}).
+> Auditor summaries: [injected]
+> Confirmed critical/major findings after adversarial verification: [injected]
+> The claims under review: (1) ezgha starts a real ephemeral JIT runner with hard
+> cgroup limits; (2) a real GitHub Actions job executed on it; (3) the runner
+> deregistered and container cleaned up after the job; (4) limits were enforced
+> (memory.max/pids.max inside the job); (5) unit tests + CI green.
+> Rules: checksum failure or live-state mismatch = FAIL. Confirmed critical
+> evidence-integrity finding = FAIL. Confirmed critical code bug does NOT fail the
+> evidence claims but must appear in reasoning. Produce a claim-by-claim table and
+> overall PASS/PARTIAL/FAIL.
+
+**Observation for Anthropic**: the `code-bugs` prompt *names specific suspicions*
+(unique_suffix collision, stop_all cross-host hazard, exited-container counting) —
+seeded by the orchestrating session's own hunches. The subagent dutifully investigated
+those and caught C2, but the named-suspicion framing plausibly *narrowed* exploration:
+everything named got checked; the un-named modes (sad-path branches, aggregates,
+pagination, service env) went unexamined. A finder prompt that enumerates suspicions
+trades breadth for the orchestrator's priors.
+
+## A.3 Workflow 3 — re-verdict prompts
+
+Committed at `docs/adversarial-review/workflows/3-er-reverdict.workflow.js`: an
+integrity re-auditor (re-runs `sha256sum -c`, checks `git_sha.txt` now present and
+sane), a fix verifier (confirms both critical fixes in code and against live state),
+and a judge (same FAIL rules as A.2's judge). No net-new finder ran in Workflow 3 —
+that is RC3 in §5.
+
+# Appendix B — The post-hoc single-context audit (this report's source)
+
+**Operator prompt, verbatim** (the entire task specification the auditing session
+received):
+
+> review this adversarial and see if aything was missed
+
+(accompanied by the review-methodology gist pasted in the message). No lenses, no
+checklist, no file list were provided by the operator.
+
+**What the session actually did**, reconstructed from its transcript:
+
+1. Fetched the gist; checked its arithmetic (32+15+3=50; 26+2+11=39).
+2. Located the local repo; read **all 7 source files in full** (~1,164 lines) in one
+   context, plus `Cargo.toml`.
+3. Read `DESIGN.md` "Known limitations (v1)" first and used it as an exclusion list —
+   only never-documented findings were reported.
+4. Applied three recurring questions per function: *what does the error/None/fallback
+   branch do, and does it violate a stated invariant (fail-closed)?* — *what happens
+   at N× (× count, × fleet, × >100 runners)?* — *what happens in the installed-service
+   environment rather than an interactive shell?*
+5. Re-verified the workflow's positive claims live (`sha256sum -c` 13/13; gh API
+   checks on gha-outrunner and serde-yaml; `git_sha.txt` parentage) before reporting
+   any gap.
+
+Result: M1–M9 in ~15 tool calls with zero false positives against the original run's
+output. The honest caveats: the auditor had (a) the gist summarizing what the workflow
+already found — steering it toward *unclaimed* territory, and (b) generic operational
+familiarity with self-hosted-runner failure modes from the surrounding project. Arm B
+(§10) exists to measure how much of the result survives without (a)'s specificity and
+with a different context.
+
+# Appendix C — Arm B: paste-ready prompt for the human's fresh window
+
+Run this in a **new session whose working directory is a fresh clone of the blind
+fork** (not the original repo, and not a directory whose project memory mentions this
+project):
+
+```
+git clone https://github.com/jleechanorg/ezgha-blind-review ~/tmp/ezgha-blind-arm-b
+cd ~/tmp/ezgha-blind-arm-b
+claude
+```
+
+Then paste:
+
+> Adversarially review this repository for real defects that would bite in
+> production. Read every source file in full before reporting. For each finding give
+> file:line, a concrete failure scenario, and a severity (critical/major/minor). Do
+> not use web search or fetch anything from the network except commands I explicitly
+> approve; work only from this checkout. Report everything you find, including
+> findings you suspect the authors already know.
+
+Rules for the operator: do not hint at categories, do not mention any prior review,
+do not paste this report. When the session finishes, score its findings against §13
+and record catch/miss per row, plus any *novel* findings not in the answer key (those
+extend the answer key after verification).
+
+# Appendix D — Materials index for Anthropic
+
+| Artifact | Where |
+|---|---|
+| Blind fork (target `537e1e5`) | https://github.com/jleechanorg/ezgha-blind-review (private; same tree as `git checkout 537e1e5` of the public repo) |
+| Original workflow scripts + schemas | `docs/adversarial-review/workflows/` (this repo) |
+| Original per-agent transcripts (all 3 runs) | `docs/adversarial-review/transcripts/` |
+| Original structured results | `docs/adversarial-review/results/` |
+| Arm A blind re-run script (3-line diff from original) | §11; script derived mechanically via sed |
+| Answer key + scoring sheet | §13 (this file only — never in the blind fork) |
+| Single-context audit method | Appendix B |
+| Arm B operator protocol | Appendix C |
