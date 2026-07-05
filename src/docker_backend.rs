@@ -259,6 +259,12 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
     // registration that never gets a container still gets cleaned up.
     let slot = next_slot(cfg)?;
     let runner_name = runner_name_for(cfg, slot);
+
+    // Clean up any stale container left behind in this slot (failsafe against name conflicts)
+    let _ = std::process::Command::new("docker")
+        .args(["rm", "-f", &runner_name])
+        .output();
+
     let (cpus, memory_mb) = effective_limits(cfg);
     let (jit, runner_id) =
         match github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels) {
