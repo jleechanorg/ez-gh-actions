@@ -62,6 +62,7 @@ if command -v limactl >/dev/null 2>&1; then
   esac
 else
   info "limactl not installed (this host uses Docker Desktop or a remote daemon)"
+  COLIMA_STATUS="NotInstalled"
 fi
 
 # --- B. ezgha runtime state ---------------------------------------------
