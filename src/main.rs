@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::time::{Duration, Instant};
 
@@ -275,6 +275,11 @@ fn main() -> Result<()> {
         }
         Commands::Serve => {
             let cfg = Config::load(&path)?;
+            // Single-instance guard (bead 6gw): flock serve.lock so a second
+            // `ezgha serve` refuses immediately instead of racing next_slot's
+            // read-modify-write. Auto-released on process death; opt-out via
+            // EZGHA_SKIP_LOCK=1 for tests.
+            let _serve_lock = acquire_serve_lock().context("acquire serve.lock")?;
             // Use wait_for_backend (bead 3z5): retry up to 120s for the Docker
             // daemon to become reachable. This handles the boot-time race where
             // Lima/Colima is still starting when this service unit fires — even
@@ -287,6 +292,10 @@ fn main() -> Result<()> {
                 cfg.github.target,
                 backend.name()
             );
+            // systemd notify (bead drg): Tell systemd we're ready so Type=notify
+            // stops blocking the start. No-op when NOTIFY_SOCKET is unset (macOS
+            // launchd path / interactive `ezgha serve`).
+            let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
             loop {
                 match docker_backend::ensure_count(&cfg, backend) {
                     Ok(started) => {
@@ -296,6 +305,9 @@ fn main() -> Result<()> {
                     }
                     Err(e) => eprintln!("ensure_count failed (will retry): {e:#}"),
                 }
+                // Watchdog ping (bead drg): notify systemd we're alive. The 30s
+                // loop cadence is well inside WatchdogSec=60.
+                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
                 std::thread::sleep(std::time::Duration::from_secs(30));
             }
         }
@@ -344,4 +356,65 @@ fn ok(b: bool) -> &'static str {
     } else {
         "missing"
     }
+}
+
+/// Acquire an advisory `flock(2)` on `<config_dir>/ezgha/serve.lock` to
+/// prevent two `ezgha serve` instances from racing on the slot file. The
+/// helper returns a `ServeLock` guard whose `Drop` releases the lock;
+/// release also happens automatically when the process dies. Tests opt
+/// out with `EZGHA_SKIP_LOCK=1`.
+struct ServeLock(Option<std::fs::File>);
+
+impl Drop for ServeLock {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            // Lock release on fd close is automatic; nothing to do here.
+            let _ = f;
+        }
+    }
+}
+
+fn acquire_serve_lock() -> Result<ServeLock> {
+    if std::env::var_os("EZGHA_SKIP_LOCK").is_some() {
+        return Ok(ServeLock(None));
+    }
+    use std::io::ErrorKind;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
+    let config_home =
+        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+    let path = std::path::PathBuf::from(config_home)
+        .join("ezgha")
+        .join("serve.lock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o644)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // flock(LOCK_EX | LOCK_NB): non-blocking exclusive. Refused if another
+    // instance holds it. Auto-released on fd close (process death).
+    // NOTE: std::fs::File::lock_exclusive() is not yet stable on this
+    // toolchain; `libc::flock` is the portable escape hatch and adds zero
+    // new transitive crates because libc is already in the dep tree.
+    let fd = f.as_raw_fd();
+    let op = libc::LOCK_EX | libc::LOCK_NB;
+    let rc = unsafe { libc::flock(fd, op) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            ErrorKind::WouldBlock => bail!(
+                "another ezgha serve is running (lock held at {}); \
+                 refusing to start. Set EZGHA_SKIP_LOCK=1 to bypass (tests only).",
+                path.display()
+            ),
+            _ => return Err(e.into()),
+        }
+    }
+    Ok(ServeLock(Some(f)))
 }
