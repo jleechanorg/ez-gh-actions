@@ -131,9 +131,16 @@ if [ -n "$INVALID_NAMES" ]; then
     fail "Invalid runner names registered on GitHub:\n$INVALID_NAMES"
 fi
 
-if [ "$EFFECTIVE_CAPACITY" -lt "$((COUNT - 1))" ]; then
-    fail "Effective capacity ($EFFECTIVE_CAPACITY) is lower than target COUNT-1 ($((COUNT - 1)))"
+# EFFECTIVE_CAPACITY is only a reliable signal when the fleet is quiescent.
+# When runners are actively cycling through jobs, GitHub de-registers a runner
+# the instant its container exits (--rm) and doesn't show the replacement until
+# the new container connects — there is always a respawn-gap window where
+# ONLINE_COUNT < COUNT. Only enforce the threshold when no runners are busy.
+# The quiescent block below (BUSY_COUNT=0) already checks the strict threshold.
+if [ "$BUSY_COUNT" -eq 0 ] && [ "$EFFECTIVE_CAPACITY" -lt "$((COUNT - 1))" ]; then
+    fail "Effective capacity ($EFFECTIVE_CAPACITY) is lower than target COUNT-1 ($((COUNT - 1))) [quiescent fleet]"
 fi
+
 
 # Quiescent sample check: if no busy runners, online count must equal target count, and offline count must be zero
 if [ "$BUSY_COUNT" -eq 0 ]; then
