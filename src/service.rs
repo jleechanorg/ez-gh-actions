@@ -28,22 +28,31 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
     let path_env =
         std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let home_dir = home()?;
-    let unit = format!(
-        "[Unit]\n\
-         Description=ez-gh-actions ephemeral GitHub Actions runners\n\
-         After=network-online.target\n\n\
-         [Service]\n\
-         ExecStart={} serve\n\
-         Restart=on-failure\n\
-         RestartSec=10\n\
-         Environment=\"PATH={}\"\n\
-         Environment=\"HOME={}\"\n\n\
-         [Install]\n\
-         WantedBy=default.target\n",
-        exe.display(),
-        path_env,
-        home_dir.display()
-    );
+    let unit = [
+        "[Unit]",
+        "Description=ez-gh-actions ephemeral GitHub Actions runners",
+        "# Wait for the Lima VM that hosts the Docker daemon on Linux (Colima/limactl).",
+        "# If lima-vm@colima.service is not present (Docker Desktop, remote daemon, macOS),",
+        "# systemd silently ignores the dependency -- the Wants= keeps this non-fatal.",
+        "After=network-online.target lima-vm@colima.service",
+        "Wants=lima-vm@colima.service",
+        "# Limit crash-storm: if the service fails 5 times in 5 minutes, systemd",
+        "# stops retrying rather than spinning at 100% journal throughput.",
+        "StartLimitIntervalSec=300",
+        "StartLimitBurst=5",
+        "",
+        "[Service]",
+        &format!("ExecStart={} serve", exe.display()),
+        "Restart=on-failure",
+        "RestartSec=30",
+        &format!("Environment=\"PATH={}\"", path_env),
+        &format!("Environment=\"HOME={}\"", home_dir.display()),
+        "",
+        "[Install]",
+        "WantedBy=default.target",
+        "",
+    ]
+    .join("\n");
     std::fs::write(&unit_path, unit)?;
     println!("wrote {}", unit_path.display());
 

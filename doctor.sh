@@ -126,8 +126,36 @@ if command -v colima >/dev/null 2>&1; then
     ok "colima VM running (at least one profile)"
     COLIMA_STATUS="Running"
   elif [ -n "$any_stopped" ]; then
-    bad "colima VM stopped — start with: colima start"
-    COLIMA_STATUS="Stopped"
+    # Before declaring BAD: the stopped profile may be the old 'default' colima
+    # profile while the actual Docker daemon runs via a limactl VM named 'colima'.
+    # Check limactl first, then fall back to whether Docker is actually reachable.
+    lima_running_fallback=""
+    if command -v limactl > /dev/null 2>&1; then
+      lima_running_fallback=$(limactl list 2>/dev/null | awk 'NR>1 && $2 == "Running" {print; exit}')
+    fi
+    if [ -n "$lima_running_fallback" ]; then
+      ok "colima VM running via limactl (colima 'default' profile stopped but limactl VM active)"
+      COLIMA_STATUS="Running"
+    elif DOCKER_VER=$(docker info --format '{{.ServerVersion}}' 2>/dev/null) && [ -n "$DOCKER_VER" ]; then
+      warn "colima profile stopped but docker daemon reachable (v$DOCKER_VER) — non-Lima backend in use"
+      COLIMA_STATUS="Running"
+    else
+      bad "colima VM stopped — start with: colima start"
+      COLIMA_STATUS="Stopped"
+    fi
+  elif command -v limactl >/dev/null 2>&1; then
+    # Fallback to limactl if colima list has no running/stopped profiles (e.g. named 'colima')
+    lima_running=$(limactl list 2>/dev/null | awk 'NR>1 && $2 == "Running" {print; exit}')
+    lima_stopped=$(limactl list 2>/dev/null | awk 'NR>1 && $2 == "Stopped" {print; exit}')
+    if [ -n "$lima_running" ]; then
+      ok "lima VM running"
+      COLIMA_STATUS="Running"
+    elif [ -n "$lima_stopped" ]; then
+      bad "lima VM stopped — start with: limactl start <name>"
+      COLIMA_STATUS="Stopped"
+    else
+      info "colima installed but no profiles, and limactl installed but no running VMs (host uses Docker or remote daemon)"
+    fi
   else
     info "colima installed but no profiles (host uses Docker Desktop or a remote daemon)"
   fi
