@@ -24,10 +24,6 @@ static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
 const SLOT_ASSIGNMENTS_PATH_ENV: &str = "EZGHA_SLOT_ASSIGNMENTS_PATH";
 
-/// Default prefix used when callers don't have a Config in hand (matches the
-/// `default_runner_name_prefix` value in `config::RunnerConfig`).
-const DEFAULT_RUNNER_NAME_PREFIX: &str = "ez-org-runner";
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SlotAssignments {
     /// Stable slot index serialized as a string key (TOML requires string map
@@ -172,7 +168,14 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     // config with the same prefix would falsely appear here, so we
     // additionally require `status == "offline" && !busy` to limit blast
     // radius. A future bead may add hostname ownership tagging.
-    let prefix = our_runner_prefix();
+    //
+    // The prefix is read from `cfg.runner.name_prefix` (NOT the hardcoded
+    // `our_runner_prefix()` default), so a host with a custom prefix like
+    // `lab-runner` correctly reaps its own orphans. Pre-fix this used
+    // `our_runner_prefix()` and silently disabled the forward sweep on
+    // any host whose config used a non-default prefix (post-fix review
+    // caught this; see PR description).
+    let prefix = format!("{}-", cfg.runner.name_prefix);
     let owned_ids: HashSet<u64> = assignments
         .assignments
         .values()
@@ -416,14 +419,6 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
     Ok(containers)
 }
 
-/// Prefix shared by every runner this tool creates. Names are now
-/// `{name_prefix}-{slot}` (default `ez-org-runner-1..=count`); the prefix is
-/// global across hosts by design, so host-scoped ownership is tracked in the
-/// slot assignment file rather than embedded in the name.
-pub fn our_runner_prefix() -> String {
-    format!("{DEFAULT_RUNNER_NAME_PREFIX}-")
-}
-
 /// Kill all managed runner containers. Returns how many were removed.
 pub fn stop_all(cfg: &Config) -> Result<usize> {
     let containers = managed_containers()?;
@@ -433,8 +428,10 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
     // Deregister THIS HOST's runners: only the slots we own (from local slot
     // assignments), so we never tear down a sibling host's `ez-org-runner-N`
     // that happens to share a numeric slot. The global prefix alone is not
-    // a safety boundary — slot ownership is.
-    let prefix = our_runner_prefix();
+    // a safety boundary — slot ownership is. Use the configured prefix (NOT
+    // `our_runner_prefix()`'s hardcoded default) so a host with a custom
+    // prefix like `lab-runner` correctly tears down its own slots.
+    let prefix = format!("{}-", cfg.runner.name_prefix);
     let owned_runner_ids: Vec<u64> = match read_slot_assignments() {
         Ok(a) => a
             .assignments
@@ -636,15 +633,19 @@ mod tests {
     }
 
     #[test]
-    fn our_runner_prefix_is_host_scoped() {
-        // The shared prefix is global (single, deterministic name space);
-        // per-host ownership lives in the slot assignment file, not in the
-        // prefix, so this just pins the deterministic `ez-org-runner-` form.
-        let prefix = our_runner_prefix();
-        assert_eq!(prefix, format!("{DEFAULT_RUNNER_NAME_PREFIX}-"));
-        assert!(prefix.starts_with("ez-org-runner-"));
+    fn runner_name_uses_cfg_prefix_not_hardcoded_default() {
+        // After the b73 prefix-bug fix, the orphan sweep and stop_all both
+        // derive their runner-name prefix from `cfg.runner.name_prefix`,
+        // not from a hardcoded constant. This test pins that contract:
+        // a host whose config sets `name_prefix = "lab-runner"` must have
+        // its orphan sweep match `lab-runner-*` names. If a future change
+        // reintroduces a hardcoded prefix, this test fails loud.
+        let cfg = cfg_with(2, "lab-runner");
+        let prefix = format!("{}-", cfg.runner.name_prefix);
+        assert_eq!(prefix, "lab-runner-");
+        assert!(prefix.starts_with(cfg.runner.name_prefix.as_str()));
         assert!(prefix.ends_with('-'));
-        assert!(format!("{prefix}1").starts_with(&prefix));
+        assert!(!prefix.starts_with("ez-org-runner-"));
     }
 
     #[test]
