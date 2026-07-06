@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use std::time::{Duration, Instant};
 
 mod backend;
 mod config;
@@ -65,7 +66,7 @@ fn config_path(cli: &Cli) -> Result<std::path::PathBuf> {
     }
 }
 
-fn choose_backend(cfg: &Config) -> Result<backend::Backend> {
+fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
     let plat = platform::detect();
     match backend::select(&plat, cfg.policy.minimum_isolation) {
         Selection::Chosen {
@@ -90,7 +91,81 @@ fn choose_backend(cfg: &Config) -> Result<backend::Backend> {
             required,
             best_available.name()
         ),
-        Selection::None => bail!("no usable backend found — install docker (or tart/libvirt) and re-run `ezgha doctor`"),
+        Selection::None => {
+            // Improved diagnostic (bead jyy): probe docker directly so the
+            // operator gets an actionable error instead of a generic message.
+            let docker_reachable = std::process::Command::new("docker")
+                .args(["info", "--format", "{{.ServerVersion}}"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if docker_reachable {
+                bail!(
+                    "no usable backend found — docker is reachable but no suitable backend was selected \
+                     (check policy.minimum_isolation in config). Run `ezgha doctor` for details."
+                );
+            } else {
+                bail!(
+                    "no usable backend found — docker daemon is not reachable. \
+                     If using Lima/Colima, ensure the VM is running: `limactl list` / `colima status`. \
+                     Run `ezgha doctor` for the full diagnostic."
+                );
+            }
+        }
+    }
+}
+
+/// Like `choose_backend`, but retries for up to `timeout` when no backend is
+/// found (Selection::None). This handles the boot-time race where the Lima VM
+/// is still starting when ezgha.service begins (even with After=lima-vm@colima
+/// the socket may not be ready immediately). PolicyBlocked errors are permanent
+/// and are returned immediately without retrying.
+///
+/// Bead: ez-gh-actions-3z5
+fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::Backend> {
+    let deadline = Instant::now() + timeout;
+    let retry_interval = Duration::from_secs(5);
+    loop {
+        let plat = platform::detect();
+        match backend::select(&plat, cfg.policy.minimum_isolation) {
+            Selection::Chosen {
+                backend,
+                skipped_stronger,
+            } => {
+                for s in skipped_stronger {
+                    eprintln!(
+                        "note: {} offers stronger isolation but is not driven by ezgha yet; using {}",
+                        s.name(),
+                        backend.name()
+                    );
+                }
+                return Ok(backend);
+            }
+            Selection::PolicyBlocked {
+                best_available,
+                required,
+            } => bail!(
+                "policy requires {} isolation but best available backend is {} — refusing to start (fail closed). \
+                 Lower policy.minimum_isolation or provision a VM backend.",
+                required,
+                best_available.name()
+            ),
+            Selection::None => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    // Exhausted budget — surface the same rich diagnostic as choose_backend.
+                    return choose_backend(cfg);
+                }
+                let wait = retry_interval.min(remaining);
+                eprintln!(
+                    "no usable backend yet — docker daemon not reachable, retrying in {}s \
+                     ({}s remaining before giving up)",
+                    wait.as_secs(),
+                    remaining.as_secs()
+                );
+                std::thread::sleep(wait);
+            }
+        }
     }
 }
 
@@ -200,7 +275,12 @@ fn main() -> Result<()> {
         }
         Commands::Serve => {
             let cfg = Config::load(&path)?;
-            let backend = choose_backend(&cfg)?;
+            // Use wait_for_backend (bead 3z5): retry up to 120s for the Docker
+            // daemon to become reachable. This handles the boot-time race where
+            // Lima/Colima is still starting when this service unit fires — even
+            // with After=lima-vm@colima.service the Docker socket may not be
+            // ready for a few seconds after limactl start exits.
+            let backend = wait_for_backend(&cfg, Duration::from_secs(120))?;
             println!(
                 "supervising {} ephemeral runner(s) for {} on {}",
                 cfg.runner.count,
