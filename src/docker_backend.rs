@@ -162,7 +162,43 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             return Ok(0);
         }
     };
-    release_stale_slots_from(&read_slot_assignments()?, &live_runners)
+    let assignments = read_slot_assignments()?;
+    let reclaimed = release_stale_slots_from(&assignments, &live_runners)?;
+    // Forward sweep: GitHub has runners with our prefix that NO slot file
+    // entry owns. These are JIT registrations whose slot reservation was
+    // released (empty-id path above) before `record_slot_runner_id` could
+    // persist the runner_id, leaving the runner orphaned on GitHub.
+    // Only reap liveness-reclaimable orphans; siblings running their own
+    // config with the same prefix would falsely appear here, so we
+    // additionally require `status == "offline" && !busy` to limit blast
+    // radius. A future bead may add hostname ownership tagging.
+    let prefix = our_runner_prefix();
+    let owned_ids: HashSet<u64> = assignments
+        .assignments
+        .values()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+    let mut orphans_reaped = 0;
+    for r in &live_runners {
+        if r.name.starts_with(&prefix)
+            && !owned_ids.contains(&r.id)
+            && r.status.eq_ignore_ascii_case("offline")
+            && !r.busy
+        {
+            eprintln!(
+                "warning: orphaned runner {} (id {}, status {}) has no slot-file owner — \
+                 removing to prevent future 409 self-heal churn",
+                r.name, r.id, r.status
+            );
+            if github::remove_runner(&cfg.github, r.id).is_ok() {
+                orphans_reaped += 1;
+            }
+        }
+    }
+    if orphans_reaped > 0 {
+        eprintln!("info: reaped {orphans_reaped} orphaned runners with prefix {prefix}");
+    }
+    Ok(reclaimed + orphans_reaped)
 }
 
 /// Inner reconciliation routine that operates on a caller-provided live-runner
@@ -244,17 +280,34 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
     Some((ncpu, mem_bytes / 1024 / 1024))
 }
 
-/// Clamp configured limits to what the daemon can actually provide.
+/// Clamp configured limits to what the daemon can actually provide PER
+/// RUNNER. With `count` ephemeral runners, each runner must fit
+/// `daemon / count`; clamping to raw `daemon` would silently over-commit by
+/// `count×` (bug vmz — count=16 on a 4-CPU/12-GB daemon would issue per-runner
+/// requests summing to 32 CPU + 95 GB, triggering OOM-kills).
 pub fn effective_limits(cfg: &Config) -> (f64, u64) {
     let (mut cpus, mut mem) = (cfg.limits.cpus, cfg.limits.memory_mb);
     if let Some((ncpu, daemon_mem)) = daemon_capacity() {
-        if cpus > ncpu {
-            eprintln!("note: clamping cpus {cpus} -> {ncpu} (docker daemon capacity)");
-            cpus = ncpu;
+        let n_f = (cfg.runner.count as f64).max(1.0);
+        let n_u = (cfg.runner.count as u64).max(1);
+        // Per-runner share of the daemon, floored at validate() minimums so a
+        // hand-edited cfg that over-aggregates still gets a sane per-runner
+        // request rather than docker run exploding from over-memory.
+        let cpu_share = (ncpu / n_f).max(0.5);
+        let mem_share = (daemon_mem / n_u).max(512);
+        if cpus > cpu_share {
+            eprintln!(
+                "note: clamping cpus {cpus} -> {cpu_share} (daemon {ncpu} / {} runners)",
+                cfg.runner.count
+            );
+            cpus = cpu_share;
         }
-        if mem > daemon_mem {
-            eprintln!("note: clamping memory {mem} MB -> {daemon_mem} MB (docker daemon capacity)");
-            mem = daemon_mem;
+        if mem > mem_share {
+            eprintln!(
+                "note: clamping memory {mem} MB -> {mem_share} MB (daemon {daemon_mem} / {} runners)",
+                cfg.runner.count
+            );
+            mem = mem_share;
         }
     }
     (cpus, mem)
@@ -273,8 +326,19 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
         .output();
 
     let (cpus, memory_mb) = effective_limits(cfg);
+    // Build the set of GitHub runner_ids we own (slot file = host ownership).
+    // Pass it to generate_jitconfig so a name collision during the 409
+    // self-heal can be reclaimed as one of ours regardless of GitHub's
+    // reported status (handles same-host zombies whose heartbeat hasn't
+    // decayed yet).
+    let owned_ids: HashSet<u64> = read_slot_assignments()?
+        .assignments
+        .values()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
     let (jit, runner_id) =
-        match github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels) {
+        match github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels, &owned_ids)
+        {
             Ok(pair) => pair,
             Err(e) => {
                 return Err(e);
@@ -521,7 +585,7 @@ mod tests {
         dir.join("slot_assignments.toml")
     }
 
-    fn fake_platform() -> Platform {
+    fn fake_platform(mem_mb: u64, cpus: u32) -> Platform {
         Platform {
             os: "linux",
             arch: "x86_64",
@@ -531,13 +595,14 @@ mod tests {
             docker_ok: true,
             sysbox_runtime: false,
             daemon_in_vm: false,
-            total_mem_mb: 8192,
-            cpus: 4,
+            total_mem_mb: mem_mb,
+            cpus,
         }
     }
 
     fn cfg_with(count: u32, prefix: &str) -> Config {
-        let mut cfg = Config::defaults_for(&fake_platform(), "jleechanorg".into(), Scope::Org);
+        let mut cfg =
+            Config::defaults_for(&fake_platform(8192, 4), "jleechanorg".into(), Scope::Org);
         cfg.runner.count = count;
         cfg.runner.name_prefix = prefix.into();
         cfg
@@ -580,6 +645,59 @@ mod tests {
         assert!(prefix.starts_with("ez-org-runner-"));
         assert!(prefix.ends_with('-'));
         assert!(format!("{prefix}1").starts_with(&prefix));
+    }
+
+    #[test]
+    fn effective_limits_clamps_per_runner_to_daemon_share() {
+        // count=16, cfg.limits.cpus=2.0, cfg.limits.memory_mb=5977 against
+        // the real docker daemon — old behavior returned (2.0, 5977) without
+        // dividing by count, so aggregate over-committed by 8x. New behavior:
+        // clamp each runner to daemon/count (floored at the validate()
+        // minimums in config.rs).
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 16;
+        cfg.limits.cpus = 2.0;
+        cfg.limits.memory_mb = 5977;
+        // effective_limits reads from the LIVE daemon via `docker info`, not
+        // from the cfg, so the expected per-runner ceiling must be derived
+        // from the same live daemon the function will use.
+        let (ncpu, daemon_mem) =
+            daemon_capacity().expect("effective_limits test requires a reachable docker daemon");
+        let expected_cpu_share = (ncpu / 16.0).max(0.5);
+        let expected_mem_share = (daemon_mem / 16).max(512);
+        let (cpus, mem) = effective_limits(&cfg);
+        assert!(
+            cpus <= expected_cpu_share + f64::EPSILON,
+            "effective_limits must clamp cpus to daemon/count (got {cpus} > {expected_cpu_share})"
+        );
+        assert!(
+            mem <= expected_mem_share,
+            "effective_limits must clamp memory to daemon/count (got {mem} > {expected_mem_share})"
+        );
+    }
+
+    #[test]
+    fn effective_limits_aggregate_fits_daemon() {
+        // Stronger invariant: count * per_runner must fit daemon totals.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 4;
+        cfg.limits.cpus = 2.0;
+        cfg.limits.memory_mb = 4096;
+        let (ncpu, daemon_mem) =
+            daemon_capacity().expect("effective_limits test requires a reachable docker daemon");
+        let (cpus, mem) = effective_limits(&cfg);
+        let cpus_total = cpus * cfg.runner.count as f64;
+        let mem_total = mem * cfg.runner.count as u64;
+        assert!(
+            cpus_total <= ncpu + f64::EPSILON,
+            "per_runner * count must fit daemon cpus (got cpus={cpus}, count={}, product={cpus_total}, daemon={ncpu})",
+            cfg.runner.count
+        );
+        assert!(
+            mem_total <= daemon_mem,
+            "per_runner * count must fit daemon memory (got mem={mem}, count={}, product={mem_total}, daemon={daemon_mem})",
+            cfg.runner.count
+        );
     }
 
     #[test]

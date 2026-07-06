@@ -122,6 +122,7 @@ pub fn generate_jitconfig(
     gh: &GithubConfig,
     name: &str,
     labels: &[String],
+    owned_ids: &std::collections::HashSet<u64>,
 ) -> Result<(String, u64)> {
     let path = jitconfig_path(gh);
     let mut cmd = Command::new("gh");
@@ -139,14 +140,11 @@ pub fn generate_jitconfig(
                     // Runner names are global across every host registered to
                     // this org/repo, so a name collision may belong to a live
                     // SIBLING host — blind-deleting it would deregister another
-                    // machine's runner. Only self-heal a collision we can prove
-                    // is dead: offline AND not running a job. An online or busy
-                    // runner is presumed to be an active sibling and is left
-                    // untouched. (A future revision may instead take an
-                    // `owned_ids: &HashSet<u64>` from the caller so ownership,
-                    // not liveness, gates the delete; that requires a
-                    // docker_backend change and is out of scope here.)
-                    if !runner_is_reclaimable(conflicting) {
+                    // machine's runner. Distinguish same-host zombies (we own
+                    // the id via the slot file → reclaimable in any status) from
+                    // cross-host runners (only reclaimable when liveness proves
+                    // the runner is dead: offline AND not busy).
+                    if !runner_is_reclaimable(conflicting, owned_ids) {
                         bail!(
                             "gh api generate-jitconfig failed for {}: runner name '{}' is already \
                              in use by an online/busy runner (id {}, status {}, busy {}) — it is \
@@ -208,10 +206,20 @@ struct RunnerList {
 
 /// A name-colliding runner may belong to a live sibling host (runner names are
 /// global across every host registered to an org/repo). It is only safe for the
-/// 409 self-heal to deregister it when we can prove it is dead: reported
-/// `offline` and not currently running a job. Anything online or busy is
-/// presumed to be an active sibling and must be left alone.
-fn runner_is_reclaimable(runner: &RunnerInfo) -> bool {
+/// 409 self-heal to deregister it when we can prove it is one of OURS and dead:
+/// slot-file ownership (we created it on this host) overrides liveness, so a
+/// same-host zombie whose heartbeat has not decayed yet still gets reaped; a
+/// cross-host runner requires liveness proof (offline AND not busy) before
+/// we'll delete it.
+fn runner_is_reclaimable(runner: &RunnerInfo, owned_ids: &std::collections::HashSet<u64>) -> bool {
+    // Slot-file ownership is treated as host ownership: if we own this id,
+    // reclaim regardless of status (zombies with stale online/busy flag get
+    // reaped here; otherwise they'd hold the slot name hostage until
+    // GitHub's heartbeat decayed).
+    if owned_ids.contains(&runner.id) {
+        return true;
+    }
+    // Cross-host: only reclaim when liveness proves the runner is dead.
     runner.status.eq_ignore_ascii_case("offline") && !runner.busy
 }
 
@@ -437,17 +445,44 @@ mod tests {
     }
 
     #[test]
-    fn only_offline_idle_runners_are_reclaimable() {
-        // Safe to self-heal: dead runner, no live job.
-        assert!(runner_is_reclaimable(&runner(1, "r", "offline", false)));
-        // Status match is case-insensitive (GitHub has returned "Offline").
-        assert!(runner_is_reclaimable(&runner(1, "r", "Offline", false)));
+    fn owned_zombie_is_reclaimable_even_if_online_busy() {
+        use std::collections::HashSet;
+        let mut owned = HashSet::new();
+        owned.insert(42);
+        // We own the runner — reclaim even though it's online AND busy.
+        assert!(runner_is_reclaimable(
+            &runner(42, "ez-org-runner-3", "online", true),
+            &owned,
+        ));
+        // We own it — also reclaim when offline (existing case still passes).
+        assert!(runner_is_reclaimable(
+            &runner(42, "ez-org-runner-3", "offline", false),
+            &owned,
+        ));
+    }
 
-        // Never delete a runner that might be a live sibling host.
-        assert!(!runner_is_reclaimable(&runner(1, "r", "online", false)));
-        assert!(!runner_is_reclaimable(&runner(1, "r", "online", true)));
-        // Offline-but-busy is contradictory; treat as live and refuse to delete.
-        assert!(!runner_is_reclaimable(&runner(1, "r", "offline", true)));
+    #[test]
+    fn cross_host_live_runner_is_not_reclaimable() {
+        use std::collections::HashSet;
+        let owned = HashSet::new();
+        assert!(!runner_is_reclaimable(
+            &runner(99, "ez-org-runner-3", "online", false),
+            &owned,
+        ));
+        assert!(!runner_is_reclaimable(
+            &runner(99, "ez-org-runner-3", "online", true),
+            &owned,
+        ));
+        // Dead sibling — reclaim is allowed (liveness proof).
+        assert!(runner_is_reclaimable(
+            &runner(99, "ez-org-runner-3", "offline", false),
+            &owned,
+        ));
+        // Offline-but-busy: contradictory; refuse to be safe.
+        assert!(!runner_is_reclaimable(
+            &runner(99, "ez-org-runner-3", "offline", true),
+            &owned,
+        ));
     }
 
     #[test]

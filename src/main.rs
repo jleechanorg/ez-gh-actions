@@ -191,11 +191,32 @@ fn main() -> Result<()> {
             let mut cfg = Config::defaults_for(&plat, target.clone(), scope);
             cfg.runner.count = *count;
             // The docker daemon may be a VM (Colima/Lima/Desktop) smaller than
-            // the host; size limits to the environment containers run in.
+            // the host; size limits to the environment containers run in,
+            // divided by count so aggregate reservation does not silently
+            // over-commit (bugs gdy + vmz — count=16 on a 4-CPU/12-GB daemon
+            // would have reserved 32 CPU + 95 GB).
             if let Some((ncpu, daemon_mem)) = docker_backend::daemon_capacity() {
-                cfg.limits.cpus = cfg.limits.cpus.min((ncpu / 2.0).max(1.0));
-                cfg.limits.memory_mb = cfg.limits.memory_mb.min((daemon_mem / 2).max(1024));
-                println!("docker daemon capacity: {ncpu} cpus, {daemon_mem} MB");
+                let n_f = (*count as f64).max(1.0);
+                let n_u = (*count as u64).max(1);
+                // Per-runner share of the daemon, floored at the validate()
+                // minimums in config.rs (cpus >= 0.5, memory_mb >= 512). If
+                // even the floor would over-aggregate (count * 0.5 > ncpu),
+                // bail — running would over-commit regardless of cfg.limits.
+                let cpu_share = (ncpu / n_f).max(0.5);
+                let mem_share = (daemon_mem / n_u).max(512);
+                if (*count as f64) * cpu_share > ncpu {
+                    bail!(
+                        "refusing init: count={count} × per-runner floor cpus=0.5 would over-commit \
+                         {ncpu} daemon cpus; lower --count to {} or fewer",
+                        (ncpu / 0.5) as u32
+                    );
+                }
+                cfg.limits.cpus = cfg.limits.cpus.min(cpu_share);
+                cfg.limits.memory_mb = cfg.limits.memory_mb.min(mem_share);
+                println!(
+                    "docker daemon capacity: {ncpu} cpus, {daemon_mem} MB; \
+                     per-runner ceiling at count={count}: {cpu_share:.2} cpus, {mem_share} MB"
+                );
             }
             cfg.save(&path)?;
             println!("wrote {}", path.display());
