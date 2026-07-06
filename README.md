@@ -62,6 +62,38 @@ your host offers and what your policy requires:
 | **Container inside VM** | Docker daemon running inside a Colima / Lima / Docker Desktop VM | Container + VM hypervisor | Detected via `docker info` kernel ≠ host kernel; satisfies `policy.minimum_isolation = "vm"` |
 | **Container inside dedicated VM** *(roadmap — M2)* | Each job in its own Tart (macOS) or libvirt/KVM (Linux) VM | Hardware virtualization; no shared kernel | Roadmap; detected and reported by `ezgha doctor` today, drivers land in M2 |
 
+### Topology decision tree
+
+```mermaid
+flowchart TD
+    Start["ezgha detect"] --> Q1["kvm-usable AND has-tart on-macOS?"]
+    Q1 -- yes --> M2T["Tart VM backend M2-roadmap"]
+    Q1 -- no --> Q2["kvm-usable AND has-virsh on-Linux?"]
+    Q2 -- yes --> M2L["libvirt-KVM backend M2-roadmap"]
+    Q2 -- no --> Q3["docker-ok?"]
+    Q3 -- no --> NoneState["Selection-None no-usable-backend"]
+    Q3 -- yes --> Q4["sysbox-runtime?"]
+    Q4 -- yes --> DSys["Docker-sysbox container-plus-tier"]
+    Q4 -- no --> DDock["Docker container-tier"]
+    DSys --> Chk["policy check"]
+    DDock --> Chk
+    Chk --> Q5["daemon-in-vm?"]
+    Q5 -- yes --> OK1["isolation-Vm satisfies-vm-policy"]
+    Q5 -- no --> Q6["policy-equals-vm?"]
+    Q6 -- yes --> Block["Selection-PolicyBlocked fail-closed"]
+    Q6 -- no --> OK2["isolation-Container satisfies-container-policy"]
+    style M2T stroke-dasharray: 5 3
+    style M2L stroke-dasharray: 5 3
+    style Block fill:#ffebe9,stroke:#cf222e
+```
+
+Read the tree: on macOS every Docker daemon is automatically VM-contained (the
+`daemon_in_vm?` branch is unconditional per `src/platform.rs:112-113`), so a Mac
+running `policy.minimum_isolation = "vm"` always satisfies it. On Linux, a bare-metal
+Docker daemon fails closed under a `vm` policy — `ezgha` refuses to spawn and the
+operator either sets `minimum_isolation = "container"` or adds a VM (Colima on Mac,
+QEMU on Linux).
+
 See [DESIGN.md §"Isolation model"](DESIGN.md#isolation-model-multi-layer-stack)
 and the [architecture diagram](docs/architecture.svg) for the full picture.
 
