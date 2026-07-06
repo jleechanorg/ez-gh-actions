@@ -67,6 +67,24 @@ From the runner process outward, four layers compose the stack. Each layer enfor
 its own boundary and explicitly does not enforce the others — that is the point of
 composing them.
 
+### Layer matrix (who enforces what)
+
+| | **Layer 1** Runner container | **Layer 2** Docker daemon | **Layer 3** VM | **Layer 4** Host OS |
+|---|---|---|---|---|
+| **Lives where** | OCI container on the daemon | `dockerd` (in VM or on host) | Hypervisor guest | Physical machine |
+| **Lifecycle owner** | `ezgha serve` (created, --rm) | VM init / systemd | Host boot | Always on |
+| **Enforces — files / PIDs** | cgroups + namespaces | storage driver isolation | VM disk quota | OS file permissions |
+| **Enforces — privileges** | `--security-opt no-new-privileges` | daemon API auth | hypervisor sandboxing | SIP / filevault / secure boot |
+| **Enforces — network** | net namespace | bridge / NAT through VM | VM NIC isolation | host firewall |
+| **Enforces — resources** | `--memory`, `--cpus`, `--pids-limit` | (inherits from VM) | VM RAM/vCPU caps | host kernel cgroups |
+| **Detected by `ezgha`** | `docker ps` (managed label) | `docker version` | `kvm_usable`, `has_tart`, `daemon_in_vm` | n/a (always there) |
+| **`ezgha` config knobs** | `[runner]` image, count | n/a (uses daemon) | n/a (uses hypervisor) | `[limits] min_free_disk_gb` |
+| **Source file** | `src/docker_backend.rs` | `src/docker_backend.rs`, `src/platform.rs` | `src/platform.rs::daemon_in_vm` | `src/service.rs` |
+
+Reading the matrix: each layer enforces ONE class of boundary (files, privileges,
+network, resources) and the others are explicitly not its job. Composing them gives
+the full multi-layer guarantee.
+
 ### Layer 1 — Runner container (inner-most)
 
 - **Tech**: OCI/Docker container running
@@ -203,7 +221,92 @@ container; `serve` spawns a fresh one. Every job gets a pristine filesystem — 
 workspace-pollution / zombie-runner / cache-corruption class of incidents is eliminated
 by construction rather than by cleanup scripts.
 
+### One-job lifecycle (sequence)
+
+```mermaid
+sequenceDiagram
+    actor O as ezgha serve (supervisor)
+    participant G as gh CLI (auth)
+    participant H as GitHub Actions API
+    participant D as Docker daemon (L2, often in VM L3)
+    participant R as Runner container (L1)
+
+    O->>O: tick (every 30s)
+    O->>O: disk floor check (bail if free < min_free_disk_gb)
+    O->>D: allocate next numeric slot N
+    O->>G: gh api POST .../actions/runners/generate-jitconfig
+    G->>H: POST generate-jitconfig
+    H-->>G: { jitconfig, runner_id }
+    G-->>O: jitconfig + runner_id
+
+    alt HTTP 409 (stale runner name)
+        O->>H: GET .../actions/runners (find stale ID)
+        O->>H: DELETE .../actions/runners/{stale_id}
+        O->>G: retry POST generate-jitconfig
+    end
+
+    O->>D: docker run -d --rm --name ez-org-runner-N --label ezgha=managed
+    D->>R: spawn container (cgroup limits + no-new-privileges)
+    R->>H: POST /actions/runner/register (with JIT config)
+    H-->>R: OK
+    H-->>R: assign job (1 of 1)
+    R->>R: checkout, build, test, report
+    R->>H: POST /actions/runner/deregister
+    R->>D: exit
+    D->>D: --rm removes container
+
+    O->>O: record_slot_runner_id(N, runner_id) for next-tick reconcile
+```
+
+The two arrows into GitHub (`generate-jitconfig` and `runner/register`) are the only
+places where `ezgha`-controlled bytes cross the host-kernel boundary — both go through
+the user's authenticated `gh` session.
+
+## Backend selection (`select()`)
+
+`select(platform, minimum_isolation)` returns one of three outcomes:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Detect: platform::detect() (os, kvm_usable, has_tart, has_virsh, docker_ok, sysbox_runtime, daemon_in_vm)
+    Detect --> Candidates: build candidates() strongest-first
+    Candidates --> Iterate: for each backend
+    Iterate --> Skip: backend.implemented() == false
+    Skip --> Iterate: continue, push to skipped_stronger
+    Iterate --> PolicyBlocked: backend.isolation(daemon_in_vm) < minimum
+    Iterate --> Chosen: backend.isolation(daemon_in_vm) >= minimum
+    Iterate --> None: candidates exhausted
+    Chosen --> [*]: warn on skipped_stronger, start runner
+    PolicyBlocked --> [*]: fail-closed; refuse to spawn
+    None --> [*]: nothing usable on this host
+```
+
+- **`Chosen{backend, skipped_stronger}`** — strongest implemented backend satisfying
+  policy. `skipped_stronger` carries the unimplemented VM backends so the caller can
+  warn the operator (we don't silently downgrade).
+- **`PolicyBlocked{best_available, required}`** — host offers a usable backend but
+  policy demands stronger isolation. Hard error; `serve` keeps running so a config
+  edit takes effect.
+- **`None`** — host has nothing usable at all.
+
 ## Backend ladder (strongest first)
+
+```mermaid
+flowchart LR
+    subgraph V1["v1 implemented (drivers ready)"]
+        D0["Docker<br/>container tier<br/>implemented"]
+        D1["Docker + sysbox-runc<br/>container+ tier<br/>implemented"]
+    end
+    subgraph M2["M2 (detected, drivers roadmap)"]
+        L0["libvirt / KVM<br/>VM tier<br/>detected only"]
+        T0["Tart (macOS M-series)<br/>VM tier<br/>detected only"]
+    end
+    T0 --> L0 --> D1 --> D0
+    style T0 stroke-dasharray: 5 3
+    style L0 stroke-dasharray: 5 3
+    style D0 fill:#dafbe1,stroke:#1a7f37
+    style D1 fill:#dafbe1,stroke:#1a7f37
+```
 
 | Backend | Isolation | v1 status |
 |---|---|---|

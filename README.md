@@ -62,6 +62,38 @@ your host offers and what your policy requires:
 | **Container inside VM** | Docker daemon running inside a Colima / Lima / Docker Desktop VM | Container + VM hypervisor | Detected via `docker info` kernel ≠ host kernel; satisfies `policy.minimum_isolation = "vm"` |
 | **Container inside dedicated VM** *(roadmap — M2)* | Each job in its own Tart (macOS) or libvirt/KVM (Linux) VM | Hardware virtualization; no shared kernel | Roadmap; detected and reported by `ezgha doctor` today, drivers land in M2 |
 
+### Topology decision tree
+
+```mermaid
+flowchart TD
+    Start["ezgha detect()"] --> Q1{"kvm_usable<br/>AND has_tart<br/>(macOS)?"}
+    Q1 -- yes --> M2T["Tart VM backend<br/>M2 roadmap"]
+    Q1 -- no --> Q2{"kvm_usable<br/>AND has_virsh<br/>(Linux)?"}
+    Q2 -- yes --> M2L["libvirt/KVM backend<br/>M2 roadmap"]
+    Q2 -- no --> Q3{"docker_ok?"}
+    Q3 -- no --> None["Selection::None<br/>no usable backend"]
+    Q3 -- yes --> Q4{"sysbox_runtime?"}
+    Q4 -- yes --> DSys["Docker + sysbox-runc<br/>container+ tier"]
+    Q4 -- no --> DDock["Docker<br/>container tier"]
+    DSys --> Chk{"policy.minimum_isolation"}
+    DDock --> Chk
+    Chk --> Q5{"daemon_in_vm?"}
+    Q5 -- yes --> OK1["isolation = Vm (VM tier)<br/>satisfies vm policy"]
+    Q5 -- no --> Q6{"policy == 'vm'?"}
+    Q6 -- yes --> Block["Selection::PolicyBlocked<br/>fail-closed"]
+    Q6 -- no --> OK2["isolation = Container<br/>satisfies container policy"]
+    style M2T stroke-dasharray: 5 3
+    style M2L stroke-dasharray: 5 3
+    style Block fill:#ffebe9,stroke:#cf222e
+```
+
+Read the tree: on macOS every Docker daemon is automatically VM-contained (the
+`daemon_in_vm?` branch is unconditional per `src/platform.rs:112-113`), so a Mac
+running `policy.minimum_isolation = "vm"` always satisfies it. On Linux, a bare-metal
+Docker daemon fails closed under a `vm` policy — `ezgha` refuses to spawn and the
+operator either sets `minimum_isolation = "container"` or adds a VM (Colima on Mac,
+QEMU on Linux).
+
 See [DESIGN.md §"Isolation model"](DESIGN.md#isolation-model-multi-layer-stack)
 and the [architecture diagram](docs/architecture.svg) for the full picture.
 
