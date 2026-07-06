@@ -194,7 +194,15 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        let raw = toml::to_string_pretty(self).context("serialize config")?;
+        // Atomic write: a crash between truncate and full write would leave a
+        // torn config.toml that fails to parse, wedging all subsequent `ezgha`
+        // commands until the operator re-runs `init`. Write a sibling temp file
+        // then rename(2), which is atomic within a directory on POSIX.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, raw).with_context(|| format!("write temp {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 }

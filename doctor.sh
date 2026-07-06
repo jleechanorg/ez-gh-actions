@@ -228,7 +228,7 @@ if [ -n "$EZ_RUNNERS" ]; then
     esac
   done
 else
-  bad "no ez-org-runner-* registrations on GitHub"
+  bad "no ${RUNNER_NAME_PREFIX}-* registrations on GitHub"
 fi
 COLIMA_RUNNERS=$(echo "$RAW" | jq -r '.runners[] | select(.name | startswith("org-runner-")) | "\(.name) \(.status)"')
 if [ -n "$COLIMA_RUNNERS" ]; then
@@ -262,7 +262,7 @@ while read -r rid; do
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  if [[ "$rn" == ez-org-runner-* ]]; then
+  if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]]; then
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
   else
