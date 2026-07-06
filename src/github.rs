@@ -1,8 +1,75 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::config::{GithubConfig, Scope};
+
+/// Hard ceiling on how long any `gh` CLI invocation may run. A hung `gh`
+/// process (keychain prompt, GraphQL rate-limit, network stall) would
+/// otherwise block the entire serve loop — preventing runner respawning
+/// while the daemon appears healthy to systemd.
+///
+/// 45 s is generous: normal JIT config calls complete in <5 s; paginated
+/// list-runners calls can take 10-15 s on a large org. Anything longer is
+/// hung and should be killed so the 30 s serve loop can retry.
+const GH_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Run `cmd`, capturing stdout and stderr, but never block longer than
+/// `GH_TIMEOUT`. Returns `Ok((stdout, stderr))` if the child exited (success
+/// or failure) within the deadline; returns `Err` if the deadline expired
+/// (the child is killed) or if the process could not be spawned.
+///
+/// Unlike `platform::capture_with_timeout`, this captures *both* streams so
+/// callers can inspect stderr on non-zero exits.
+fn run_gh(mut cmd: Command) -> Result<std::process::Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn gh CLI")?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+
+    let (tx_out, rx_out) = mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = mpsc::channel::<Vec<u8>>();
+
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        let _ = tx_out.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        let _ = tx_err.send(buf);
+    });
+
+    // Wait for stdout first (the larger payload); stderr is typically small.
+    let stdout = match rx_out.recv_timeout(GH_TIMEOUT) {
+        Ok(b) => b,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("gh CLI timed out after {}s", GH_TIMEOUT.as_secs());
+        }
+    };
+    // Stderr may still be draining; give it a short extra window.
+    let stderr = rx_err
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+
+    let status = child.wait().context("wait on gh child")?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
 
 /// All GitHub API access goes through the `gh` CLI so we inherit its auth
 /// (keyring/oauth) instead of handling tokens ourselves. v1 requirement:
@@ -63,9 +130,7 @@ pub fn generate_jitconfig(
     for label in labels {
         cmd.args(["-f", &format!("labels[]={label}")]);
     }
-    let out = cmd
-        .output()
-        .context("failed to run `gh api` — is the gh CLI installed?")?;
+    let out = run_gh(cmd).context("failed to run `gh api` — is the gh CLI installed?")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("Already exists") || stderr.contains("already exists") {
@@ -104,7 +169,7 @@ pub fn generate_jitconfig(
                         for label in labels {
                             retry_cmd.args(["-f", &format!("labels[]={label}")]);
                         }
-                        let retry_out = retry_cmd.output()?;
+                        let retry_out = run_gh(retry_cmd)?;
                         if retry_out.status.success() {
                             let parsed: JitConfigResponse = serde_json::from_slice(
                                 &retry_out.stdout,
@@ -159,10 +224,9 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     // and plain `--paginate` concatenates those objects into invalid JSON.
     // `--slurp` collects the pages into a single top-level JSON array instead,
     // which we deserialize as `Vec<RunnerList>` and flatten.
-    let out = Command::new("gh")
-        .args(["api", "--paginate", "--slurp", &path])
-        .output()
-        .context("failed to run `gh api`")?;
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", "--paginate", "--slurp", &path]);
+    let out = run_gh(cmd).context("failed to run `gh api`")?;
     if !out.status.success() {
         bail!(
             "gh api list runners failed: {}",
@@ -178,10 +242,9 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
 /// container before it ever picked up a job).
 pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
     let path = runner_remove_path(gh, id);
-    let out = Command::new("gh")
-        .args(["api", "-X", "DELETE", &path])
-        .output()
-        .context("failed to run `gh api`")?;
+    let mut cmd = Command::new("gh");
+    cmd.args(["api", "-X", "DELETE", &path]);
+    let out = run_gh(cmd).context("failed to run `gh api`")?;
     if !out.status.success() {
         bail!(
             "gh api remove runner {id} failed: {}",
@@ -215,7 +278,9 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
 /// still works for `gh api` even when a non-active account is in an error
 /// state.
 pub fn gh_auth_ok() -> bool {
-    let out = match Command::new("gh").args(["auth", "status"]).output() {
+    let mut status_cmd = Command::new("gh");
+    status_cmd.args(["auth", "status"]);
+    let out = match run_gh(status_cmd) {
         Ok(o) => o,
         Err(_) => return false,
     };
@@ -235,8 +300,9 @@ pub fn gh_auth_ok() -> bool {
     // Last-resort: try the active account via `gh auth token`. This bypasses
     // `gh auth status`'s exit-code semantics entirely. If it prints a token,
     // the active account works.
-    let token_out = Command::new("gh").args(["auth", "token"]).output();
-    match token_out {
+    let mut token_cmd = Command::new("gh");
+    token_cmd.args(["auth", "token"]);
+    match run_gh(token_cmd) {
         Ok(o) if o.status.success() => {
             let token = String::from_utf8_lossy(&o.stdout);
             !token.trim().is_empty()
