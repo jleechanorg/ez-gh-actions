@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 600" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="13">
-  <title>ez-gh-actions (ezgha) architecture — VM-within-VM isolation (container → VM → host)</title>
-  <desc>Supervisor loop on the host picks the strongest isolation backend and spawns one ephemeral Docker container per GitHub Actions job via JIT registration. Default deployed topology on Mac = container → Docker daemon → Colima Lima VM → Darwin host (3 layers, VM-within-VM); on jeff-ubuntu = container → Docker daemon → QEMU microVM → Ubuntu host (3 layers).</desc>
+  <title>ez-gh-actions (ezgha) architecture — multi-layer isolation (container → Docker daemon → VM → host)</title>
+  <desc>Supervisor loop on the host picks the strongest isolation backend and spawns one ephemeral Docker container per GitHub Actions job via JIT registration. Default deployed topology on Mac = container → Docker daemon → Colima Lima VM → Darwin host; on jeff-ubuntu = container → Docker daemon → QEMU microVM → Ubuntu host.</desc>
 
   <!-- Background -->
   <rect width="880" height="600" fill="#fafafa"/>
@@ -39,7 +39,7 @@
 
   <!-- Optional VM wrapper (Colima/Lima/Docker Desktop) — VM containment -->
   <rect x="50" y="125" width="555" height="200" rx="8" fill="#f6f8fa" stroke="#9a6700" stroke-width="1.2" stroke-dasharray="6 4"/>
-  <text x="64" y="145" font-weight="700" fill="#9a6700">VM-within-VM isolation (3-layer stack)</text>
+  <text x="64" y="145" font-weight="700" fill="#9a6700">Multi-layer isolation (container → daemon → VM → host)</text>
   <text x="64" y="160" font-size="11" fill="#57606a">container → Docker daemon → Colima/Lima/QEMU microVM → host kernel</text>
   <text x="64" y="173" font-size="10" fill="#57606a">runner process can never reach the host kernel directly</text>
 

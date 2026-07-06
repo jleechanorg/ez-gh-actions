@@ -1,120 +1,23 @@
 # ez-gh-actions — Design (v1)
 
-Easy isolated self-hosted GitHub Actions runners: VM-within-VM isolation (container-in-VM-in-host 3-layer stack) with VM-preferred backend selection.
+Easy isolated self-hosted GitHub Actions runners: multi-layer isolation (container-in-VM-in-host stack) with VM-preferred backend selection.
 
 > **Visual**: a static architecture diagram lives at
 > [`docs/architecture.svg`](docs/architecture.svg) (also rendered inline in the
 > README). The rest of this document is the prose version of that diagram + the
 > adversarial review that produced v1.
 
-## Isolation model — VM-within-VM (container-in-VM-in-host)
+## Isolation model — multi-layer stack (container-in-VM-in-host)
 
-`ezgha` uses a **VM-within-VM isolation** strategy: each runner workload executes
+`ezgha` uses a **multi-layer isolation** strategy. Each runner workload executes
 inside a container, which itself runs inside a VM (Colima / Lima / Docker Desktop on
-macOS; QEMU microVM on Linux per `policy.minimum_isolation = "vm"`), which itself runs
-on the host OS. The host kernel can never be reached directly by the runner process.
+macOS; QEMU microVM on Linux per `policy.minimum_isolation = "vm"`), which itself
+runs on the host OS. The host kernel can never be reached directly by the runner
+process.
 
-Three valid topologies, chosen automatically by `select()` from the backend ladder
-below based on what the host offers and what `policy.minimum_isolation` requires:
-
-1. **Container on host** — Docker daemon on bare metal. Container boundary only
-   (cgroup + namespaces + `no-new-privileges`). The host kernel is the only boundary.
-2. **Container inside VM** *(VM-within-VM, Mac dev setup, also Linux with QEMU)* —
-   Docker daemon already runs inside a Colima / Lima / Docker Desktop VM (macOS) or a
-   QEMU microVM (Linux). Two boundaries: container → VM hypervisor → host kernel.
-   Detected via `docker info` kernel ≠ host `uname` kernel. This is the deployed
-   reality on Mac (Colima) and jeff-ubuntu (QEMU).
-3. **Container inside dedicated VM** *(M2 roadmap)* — Each job in its own Tart (macOS)
-   or libvirt/KVM (Linux) VM. Hardware virtualization; no shared kernel with the host.
-
-**What "VM-within-VM" does NOT mean.** It does **not** mean nesting one VM backend
-inside another VM backend (e.g. running libvirt inside a Colima VM, or KVM inside
-QEMU). That topology is an explicit non-goal — `select()` picks exactly one isolation
-boundary per host and refuses to start work if the host can't satisfy the policy. When
-this document, the wiki (`vm-within-vm-isolation.md`), the roadmap, and the README say
-"VM-in-VM", they all mean the **3-layer container-in-VM-in-host stack** described in
-topology #2 — never nested VM backends.
-
-## Per-layer breakdown (what each layer is and what it enforces)
-
-From the runner process outward, four layers compose the stack. Each layer enforces
-its own boundary and explicitly does not enforce the others — that is the point of
-composing them.
-
-### Layer 1 — Runner container (inner-most)
-
-- **Tech**: OCI/Docker container running
-  [`ghcr.io/actions/actions-runner`](https://github.com/actions/runner) (or
-  `ezgha-runner:latest` from `Dockerfile.runner`).
-- **Lifecycle**: created by `ezgha serve` via `docker run --rm …`, JIT-registers with
-  GitHub, runs **exactly one workflow job**, deregisters, exits; `--rm` removes the
-  container on exit.
-- **Enforces**: Linux cgroups (hard memory / CPU / PID ceilings),
-  Linux namespaces (PID / mount / network / UTS / IPC / user),
-  `--security-opt no-new-privileges` (blocks setuid + capability escalation;
-  `sudo` is dead inside the container).
-- **Does NOT enforce**: kernel-level exploits. A container kernel CVE (e.g. CVE
-  in the shared cgroup/namespace surface) escapes into the host userspace — the
-  VM's userspace, in the deployed topology, not your laptop's kernel.
-- **Config knobs**: `[runner]` (image, count) + `[limits]` (memory_mb, cpus, pids,
-  min_free_disk_gb) in `~/.config/ezgha/config.toml`.
-- **Source**: `src/docker_backend.rs`.
-
-### Layer 2 — Docker daemon
-
-- **Tech**: `dockerd` running inside the VM (Layer 3) on both Mac and jeff-ubuntu.
-- **Lifecycle**: long-lived; started by the VM's init system on boot, restarted by
-  the VM if it crashes. Independent of `ezgha serve` and of any individual runner
-  container.
-- **Enforces**: container image isolation (clean image per job, no `RUNNER_TOKEN`
-  baked in), Docker API authentication (Unix socket / TCP), storage driver isolation
-  (`overlay2` on Linux, `vfs` on Mac via Colima) so one container's filesystem
-  cannot read another's.
-- **Does NOT enforce**: it is a userspace process. A kernel exploit that reaches
-  the daemon is now inside the VM, not on the host kernel — but it is also no longer
-  confined to a single container.
-- **Config knobs**: standard `daemon.json`; `ezgha` detects sysbox-runc runtime when
-  present and prefers it for stronger container isolation (see Backend ladder below).
-- **Source**: `src/docker_backend.rs` (talks to daemon), `src/platform.rs`
-  (capability detection).
-
-### Layer 3 — VM (the boundary that satisfies `policy.minimum_isolation = "vm"`)
-
-- **Tech**: on macOS — Colima / Lima / Docker Desktop, a Linux VM (typically Ubuntu
-  or Debian cloud image) running on the macOS hypervisor (`vz` on Apple Silicon,
-  `qemu` on Intel). On Linux — a QEMU microVM (or, for M2, libvirt/KVM) on the
-  Linux host's `/dev/kvm`.
-- **Lifecycle**: started at host boot (or via `limactl start colima`,
-  `systemctl --user start ezgha.service` prereqs). Independent of `ezgha serve`.
-- **Enforces**: hardware virtualization (separate kernel from host), VM resource
-  limits (the hypervisor caps RAM/vCPUs/disk; the container cannot exhaust host
-  resources, only VM quota), VM network isolation (bridged or NAT'd).
-- **Detection by `ezgha`**: `src/platform.rs` compares `docker info
-  --format '{{.KernelVersion}}'` against host `uname -r`. A mismatch means the
-  daemon is inside a VM. `select()` in `src/backend.rs` uses this signal to satisfy
-  `policy.minimum_isolation = "vm"` automatically — no manual wiring required.
-- **Does NOT enforce**: VM escape. That is a real (rare) attack class. `ezgha` does
-  not claim VM-escape immunity; it claims the **host blast-radius** is bounded by
-  the VM.
-- **Config knobs**: standard Colima/Lima/QEMU configuration; `ezgha` only needs
-  the daemon reachable.
-
-### Layer 4 — Host OS / host kernel (outer-most)
-
-- **Tech**: physical machine's OS — macOS (Darwin) on the Mac fleet, Ubuntu on
-  jeff-ubuntu.
-- **Enforces**: hypervisor sandboxing (Apple Virtualization framework `vz`, KVM)
-  with a minimal device model; standard OS hardening (filevault, SIP, secure boot).
-- **`ezgha`'s contribution on this layer**: `ezgha serve` runs as a **user
-  service** (`systemd --user` or `launchd` LaunchAgent), not as root, not as a
-  system service. Compromise of `ezgha` itself does not grant root without an
-  additional exploit. Disk floor guard (`min_free_disk_gb`) lives here. No
-  docker.sock, no privileged mode, no extra `--cap-add`.
-- **Does NOT enforce**: this layer is **your** job to keep patched — Apple
-  security updates, Ubuntu `unattended-upgrades`. `ezgha` is not a substitute.
-- **Source**: `src/service.rs` (user-level systemd / launchd install).
-
-### Composition
+There are four entities in the stack — the runner container, the Docker daemon,
+the VM (when present), and the host OS — composing three boundaries between the
+runner process and your host kernel: container → VM → host.
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
@@ -136,9 +39,121 @@ composing them.
 └────────────────────────────────────────────────────────────────┘
 ```
 
-A malicious job would need to break **all four** boundaries (cgroup/namespace →
-Docker daemon → VM hypervisor → host kernel). Layers 1–3 are mitigated by Layer 3's
-hardware virtualization; Layer 4 is OS hardening.
+Three valid topologies, chosen automatically by `select()` from the backend ladder
+below based on what the host offers and what `policy.minimum_isolation` requires:
+
+1. **Container on host** — Docker daemon on bare metal. Container boundary only
+   (cgroup + namespaces + `no-new-privileges`). The host kernel is the only boundary.
+2. **Container inside VM** *(Mac dev setup, also Linux with QEMU)* — Docker daemon
+   already runs inside a Colima / Lima / Docker Desktop VM (macOS) or a QEMU
+   microVM (Linux). Two boundaries: container → VM hypervisor → host kernel.
+   Detected via `docker info` kernel ≠ host `uname` kernel on Linux; on macOS the
+   check is unconditional (every Mac Docker daemon runs in a VM since macOS has
+   no native Linux kernel). This is the deployed reality on Mac (Colima) and
+   jeff-ubuntu (QEMU).
+3. **Container inside dedicated VM** *(M2 roadmap)* — Each job in its own Tart (macOS)
+   or libvirt/KVM (Linux) VM. Hardware virtualization; no shared kernel with the host.
+
+The stack has no nested VM backends. `select()` picks exactly one isolation
+boundary per host and refuses to start work if the host can't satisfy the policy.
+The earlier "VM-within-VM" terminology referred to this same 3-layer container-in-
+VM-in-host stack and was retired in favor of the simpler "multi-layer isolation"
+framing to avoid confusion with nested-VM-backend topologies (libvirt inside
+Colima, KVM inside QEMU) that are not implemented.
+
+## Per-layer breakdown (what each layer is and what it enforces)
+
+From the runner process outward, four layers compose the stack. Each layer enforces
+its own boundary and explicitly does not enforce the others — that is the point of
+composing them.
+
+### Layer 1 — Runner container (inner-most)
+
+- **Tech**: OCI/Docker container running
+  [`ghcr.io/actions/actions-runner`](https://github.com/actions/runner) (or
+  `ezgha-runner:latest` from `Dockerfile.runner`).
+- **Lifecycle**: created by `ezgha serve` via `docker run --rm …`, JIT-registers with
+  GitHub, runs **exactly one workflow job**, deregisters, exits; `--rm` removes the
+  container on exit.
+- **Enforces**: Linux cgroups (hard memory / CPU / PID ceilings),
+  Linux namespaces (PID / mount / network / UTS / IPC / user),
+  `--security-opt no-new-privileges` (blocks setuid + capability escalation;
+  sudo cannot gain root — `no_new_privs` is set on the container's init process).
+- **Does NOT enforce**: kernel-level exploits. A container kernel CVE (e.g. CVE
+  in the shared cgroup/namespace surface) escapes into the host userspace — the
+  VM's userspace, in the deployed topology, not your laptop's kernel.
+- **Config knobs**: `[runner]` (image, count) + `[limits]` (memory_mb, cpus, pids,
+  min_free_disk_gb) in `~/.config/ezgha/config.toml`.
+- **Source**: `src/docker_backend.rs`.
+
+### Layer 2 — Docker daemon
+
+- **Tech**: `dockerd` running inside the VM (Layer 3) on both Mac and jeff-ubuntu;
+  on bare-metal Linux servers it runs directly on the host kernel.
+- **Lifecycle**: long-lived; started by the VM's init system on boot, restarted by
+  the VM if it crashes. Independent of `ezgha serve` and of any individual runner
+  container.
+- **Enforces**: container image isolation (clean image per job, no `RUNNER_TOKEN`
+  baked in), Docker API authentication (Unix socket / TCP), storage driver isolation
+  (`overlay2` on Linux, `vfs` on Mac via Colima) so one container's filesystem
+  cannot read another's.
+- **Does NOT enforce**: it is a userspace process. A kernel exploit that reaches
+  the daemon is now inside the VM, not on the host kernel — but it is also no longer
+  confined to a single container.
+- **Config knobs**: standard `daemon.json`; `ezgha` detects sysbox-runc runtime when
+  present and prefers it for stronger container isolation (see Backend ladder below).
+- **Source**: `src/docker_backend.rs` (talks to daemon), `src/platform.rs`
+  (capability detection).
+
+### Layer 3 — VM (the optional hardware-virtualization boundary)
+
+- **Tech**: on macOS — Colima / Lima / Docker Desktop, a Linux VM (typically Ubuntu
+  or Debian cloud image) running on the macOS hypervisor (Apple Virtualization
+  framework `vz` on Apple Silicon, `qemu` on Intel). On Linux — a QEMU microVM
+  (or, for M2, libvirt/KVM) on the Linux host's `/dev/kvm`.
+- **Lifecycle**: started at host boot (or via `limactl start colima`,
+  `systemctl --user start ezgha.service` prereqs). Independent of `ezgha serve`.
+- **Enforces**: hardware virtualization (separate kernel from host), VM resource
+  limits (the hypervisor caps RAM/vCPUs/disk; the container cannot exhaust host
+  resources, only VM quota), VM network isolation (bridged or NAT'd).
+- **Detection by `ezgha`**: `src/platform.rs::daemon_in_vm()` compares
+  `docker info --format '{{.KernelVersion}}'` against host `uname -r`. A mismatch
+  means the daemon is inside a VM. `select()` in `src/backend.rs` uses this signal
+  to satisfy `policy.minimum_isolation = "vm"` automatically — no manual wiring
+  required. On macOS this comparison is short-circuited (every Mac Docker daemon
+  is VM-contained by construction).
+- **Does NOT enforce**: VM escape. That is a real (rare) attack class. `ezgha` does
+  not claim VM-escape immunity; it claims the **host blast-radius** is bounded by
+  the VM (at worst, the attacker reaches the VM's userspace, not your host kernel).
+- **Config knobs**: standard Colima/Lima/QEMU configuration; `ezgha` only needs
+  the daemon reachable.
+
+### Layer 4 — Host OS / host kernel (outer-most)
+
+- **Tech**: physical machine's OS — macOS (Darwin) on the Mac fleet, Ubuntu on
+  jeff-ubuntu.
+- **Enforces**: hypervisor sandboxing (Apple Virtualization framework `vz`, KVM)
+  with a minimal device model; standard OS hardening (filevault, SIP, secure boot).
+- **`ezgha`'s contribution on this layer**: `ezgha serve` runs as a **user
+  service** (`systemd --user` or `launchd` LaunchAgent), not as root, not as a
+  system service. Compromise of `ezgha` itself does not grant root without an
+  additional exploit. Disk floor guard (`min_free_disk_gb`) lives here. No
+  docker.sock, no privileged mode, no extra `--cap-add`.
+- **Does NOT enforce**: this layer is **your** job to keep patched — Apple
+  security updates, Ubuntu `unattended-upgrades`. `ezgha` is not a substitute.
+- **Source**: `src/service.rs` (user-level systemd / launchd install).
+
+### Composition
+
+The four-entity / three-boundary stack is shown at the top of this section. The
+runner container sits inside the Docker daemon, which sits inside the VM (when
+present), which sits on the host OS. Each layer is enforced by a different
+mechanism — the container by cgroups/namespaces/no-new-priv, the VM by hardware
+virtualization, the host by OS hardening.
+
+A malicious job would need to break **all three boundaries** (cgroup/namespace →
+VM hypervisor → host kernel). Layers 1–3 are mitigated by Layer 3's hardware
+virtualization; Layer 4 is OS hardening.
 
 ## Origin of this design
 
