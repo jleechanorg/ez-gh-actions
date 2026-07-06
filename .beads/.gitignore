@@ -1,0 +1,6 @@
+beads.db
+beads.db-wal
+beads.db-shm
+last-touched
+.br_history/
+.sync.lock
