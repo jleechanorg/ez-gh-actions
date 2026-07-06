@@ -1,0 +1,46 @@
+[Unit]
+Description=Lima VM — %i (managed by limactl start-at-login)
+Documentation=man:lima(1)
+# This unit is created by 'limactl start-at-login <vm-name>'.
+# It is patched here (bead ez-gh-actions-617) to fix three bugs in the
+# default limactl-generated unit that prevent boot-time reliability:
+#
+# Bug 1 — Type=simple + --foreground hangs 'After=' dependency satisfaction:
+#   With Type=simple, systemd marks the unit active as soon as the process
+#   starts — BEFORE the Lima VM is ready to accept Docker connections.
+#   Downstream services (ezgha.service) that list this unit in After= start
+#   immediately and find no Docker socket, causing them to fail/crash-loop.
+#   Fix: Type=forking + drop --foreground so limactl backgrounds itself and
+#   systemd waits for the process to exit (= VM is up) before marking active.
+#
+# Bug 2 — TimeoutSec=10 kills the VM before it finishes booting:
+#   Lima VM cold-boot typically takes 20-60 seconds. The 10s timeout fires
+#   first, systemd kills limactl, the VM never comes up.
+#   Fix: TimeoutStartSec=300 gives the VM 5 minutes to boot.
+#
+# Bug 3 — Restart=on-failure at boot can fight with downstream services:
+#   If lima fails at boot (e.g. VM image not found), Restart=on-failure
+#   relaunches indefinitely, consuming resources. Downstream services that
+#   depend on this unit need it to fail cleanly so their own restart policies
+#   trigger correctly.
+#   Fix: Restart=no (limactl start-at-login owns the lifecycle; do not
+#   auto-restart a fundamentally broken VM setup).
+
+[Service]
+# Drop --foreground so limactl daemonizes the VM process.
+# Type=forking waits for the child to exit before declaring the unit active,
+# which means Docker socket is available when After= is satisfied downstream.
+ExecStart=/home/jleechan/.local/bin/limactl start %i
+WorkingDirectory=%h
+Type=forking
+TimeoutStartSec=300
+TimeoutStopSec=60
+Restart=no
+# RemainAfterExit=yes keeps the unit in 'active' state after limactl exits
+# (limactl start exits 0 once the VM is up). Without this the unit would
+# immediately transition to 'inactive' even though the VM is running.
+RemainAfterExit=yes
+ExecStop=/home/jleechan/.local/bin/limactl stop %i
+
+[Install]
+WantedBy=default.target
