@@ -235,7 +235,7 @@ fn main() -> Result<()> {
                 Ok(runners) => {
                     let ours: Vec<_> = runners
                         .iter()
-                        .filter(|r| r.name.starts_with("ezgha-"))
+                        .filter(|r| r.name.starts_with(&cfg.runner.name_prefix))
                         .collect();
                     println!(
                         "registered ezgha runners on {}: {}",

@@ -109,10 +109,45 @@ case ":${PATH}:" in
     ;;
 esac
 
+# ── Clean up legacy com.worldarchitect.* launchd agents ───────────────────────
+if [ "$(uname -s)" = "Darwin" ]; then
+  info "Cleaning up legacy worldarchitect.ai launchd agents..."
+  for label in \
+    com.worldarchitect.org-runners \
+    com.worldarchitect.mac-runner-disk-cleanup \
+    com.worldarchitect.mac-runner-health \
+    com.worldarchitect.ubuntu-runner-health \
+    com.worldarchitect.runner-capacity-failover \
+    com.worldarchitect.cache-integrity; do
+    plist="${HOME}/Library/LaunchAgents/${label}.plist"
+    if launchctl list 2>/dev/null | grep -q "${label}"; then
+      launchctl unload "${plist}" 2>/dev/null || true
+    fi
+    if [ -f "${plist}" ]; then
+      rm -f "${plist}"
+      ok "Removed legacy agent plist: ${label}"
+    fi
+  done
+fi
+
+# ── Auto-install ezgha service if config exists ────────────────────────────────
+CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
+if [ -f "${CONFIG_PATH}" ]; then
+  info "Installing ezgha service..."
+  if [ "$(uname -s)" = "Darwin" ]; then
+    "${CARGO_BIN}/${BIN}" install-service
+    ok "ezgha service installed and started via launchd"
+  elif command -v systemctl >/dev/null 2>&1; then
+    "${CARGO_BIN}/${BIN}" install-service
+    ok "ezgha service installed and started via systemd"
+  fi
+fi
+
 info "Next steps"
 cat <<'EOF'
-  ezgha init --target <owner/repo>   # detect host, write ~/.config/ezgha/config.toml
+  ezgha init --target <owner/repo>   # detect host, write ~/.config/ezgha/config.toml (if not done)
   ezgha doctor                       # verify backends, limits, gh auth
   ezgha start                        # launch one ephemeral runner now
-  ezgha install-service              # keep runners supervised at login
+  ezgha install-service              # keep runners supervised at login (if not auto-installed)
 EOF
+
