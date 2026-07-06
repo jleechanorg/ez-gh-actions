@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Once;
 
 use crate::backend::Backend;
@@ -12,6 +13,12 @@ use crate::github;
 use crate::platform::Platform;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
+
+/// Consecutive-`None` counter for `free_disk_gb`. After this many in a
+/// row we treat the disk floor as exceeded and refuse to spawn, since a
+/// sustained inability to measure is itself a degraded-daemon signal.
+const DISK_MEASURE_STRIKES: u32 = 2;
+static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 
 /// Env var that overrides the slot assignments file path. Used by tests to
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
@@ -438,16 +445,30 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     }
     match free_disk_gb(&cfg.runner.image) {
         Some(free) if free < cfg.limits.min_free_disk_gb => {
+            CONSECUTIVE_DISK_NONE.store(0, Ordering::Relaxed);
             bail!(
                 "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
                  reclaim space (e.g. `docker system prune`) first",
                 cfg.limits.min_free_disk_gb
             );
         }
-        Some(_) => {}
-        None => eprintln!(
-            "warning: could not measure daemon free disk — disk floor guard is NOT active this cycle"
-        ),
+        Some(_) => {
+            CONSECUTIVE_DISK_NONE.store(0, Ordering::Relaxed);
+        }
+        None => {
+            let n = CONSECUTIVE_DISK_NONE.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= DISK_MEASURE_STRIKES {
+                bail!(
+                    "could not measure daemon free disk for {n} cycles in a row — \
+                     refusing to spawn runners until disk measurement recovers \
+                     (image missing? df broken? daemon wedged?)"
+                );
+            }
+            eprintln!(
+                "warning: could not measure daemon free disk ({n}/{DISK_MEASURE_STRIKES} strikes) \
+                 — disk floor guard is NOT active this cycle"
+            );
+        }
     }
     let mut started = Vec::new();
     let mut last_err = None;
@@ -698,5 +719,41 @@ mod tests {
         let live = vec![runner_info(1, "ez-org-runner-1")];
         let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
         assert_eq!(reclaimed, 0);
+    }
+
+    #[test]
+    fn disk_measure_strike_counter_bails_after_threshold() {
+        use std::sync::atomic::Ordering;
+        // Reset before and after to be hermetic.
+        CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
+        // First miss is tolerated (warn, no bail).
+        let n1 = CONSECUTIVE_DISK_NONE.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            n1 < DISK_MEASURE_STRIKES,
+            "first missed measurement must not bail (got n={n1}, threshold={DISK_MEASURE_STRIKES})"
+        );
+        // Second miss hits the threshold and bails.
+        let n2 = CONSECUTIVE_DISK_NONE.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(
+            n2 >= DISK_MEASURE_STRIKES,
+            "second consecutive missed measurement must reach the bail threshold (got n={n2})"
+        );
+        // Reset for the next test.
+        CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn disk_measure_strike_counter_resets_on_success() {
+        use std::sync::atomic::Ordering;
+        CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
+        // Drive a miss then a "Some" (modeled as the reset the production path
+        // performs after a successful read).
+        CONSECUTIVE_DISK_NONE.fetch_add(1, Ordering::SeqCst);
+        CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
+        assert_eq!(
+            CONSECUTIVE_DISK_NONE.load(Ordering::SeqCst),
+            0,
+            "any Some(_) result must reset the strike counter"
+        );
     }
 }
