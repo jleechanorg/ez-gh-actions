@@ -225,37 +225,37 @@ by construction rather than by cleanup scripts.
 
 ```mermaid
 sequenceDiagram
-    actor O as ezgha serve (supervisor)
-    participant G as gh CLI (auth)
-    participant H as GitHub Actions API
-    participant D as Docker daemon (L2, often in VM L3)
-    participant R as Runner container (L1)
+    actor O as Supervisor-ezgha-serve
+    participant G as gh-CLI
+    participant H as GitHub-Actions-API
+    participant D as Docker-daemon
+    participant R as Runner-container
 
-    O->>O: tick (every 30s)
-    O->>O: disk floor check (bail if free < min_free_disk_gb)
-    O->>D: allocate next numeric slot N
-    O->>G: gh api POST .../actions/runners/generate-jitconfig
+    O->>O: tick every-30s
+    O->>O: disk-floor-check bail-if-low
+    O->>D: allocate-next-numeric-slot-N
+    O->>G: gh-api generate-jitconfig
     G->>H: POST generate-jitconfig
-    H-->>G: { jitconfig, runner_id }
-    G-->>O: jitconfig + runner_id
+    H-->>G: jitconfig-plus-runner-id
+    G-->>O: jitconfig-plus-runner-id
 
-    alt HTTP 409 (stale runner name)
-        O->>H: GET .../actions/runners (find stale ID)
-        O->>H: DELETE .../actions/runners/{stale_id}
-        O->>G: retry POST generate-jitconfig
+    alt HTTP-409-stale-runner-name
+        O->>H: GET runners-list
+        O->>H: DELETE stale-runner-id
+        O->>G: retry-POST-generate-jitconfig
     end
 
-    O->>D: docker run -d --rm --name ez-org-runner-N --label ezgha=managed
-    D->>R: spawn container (cgroup limits + no-new-privileges)
-    R->>H: POST /actions/runner/register (with JIT config)
+    O->>D: docker-run -d --rm --name ez-org-runner-N --label ezgha=managed
+    D->>R: spawn-container cgroup-limits no-new-priv
+    R->>H: POST runner-register with-JIT-config
     H-->>R: OK
-    H-->>R: assign job (1 of 1)
-    R->>R: checkout, build, test, report
-    R->>H: POST /actions/runner/deregister
+    H-->>R: assign-one-job
+    R->>R: checkout build test report
+    R->>H: POST runner-deregister
     R->>D: exit
-    D->>D: --rm removes container
+    D->>D: --rm-removes-container
 
-    O->>O: record_slot_runner_id(N, runner_id) for next-tick reconcile
+    O->>O: record-slot-runner-id-for-next-tick
 ```
 
 The two arrows into GitHub (`generate-jitconfig` and `runner/register`) are the only
@@ -268,17 +268,17 @@ the user's authenticated `gh` session.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Detect: platform::detect() (os, kvm_usable, has_tart, has_virsh, docker_ok, sysbox_runtime, daemon_in_vm)
-    Detect --> Candidates: build candidates() strongest-first
-    Candidates --> Iterate: for each backend
-    Iterate --> Skip: backend.implemented() == false
-    Skip --> Iterate: continue, push to skipped_stronger
-    Iterate --> PolicyBlocked: backend.isolation(daemon_in_vm) < minimum
-    Iterate --> Chosen: backend.isolation(daemon_in_vm) >= minimum
-    Iterate --> None: candidates exhausted
-    Chosen --> [*]: warn on skipped_stronger, start runner
-    PolicyBlocked --> [*]: fail-closed; refuse to spawn
-    None --> [*]: nothing usable on this host
+    [*] --> Detect: detect-platform-capabilities
+    Detect --> Candidates: build-candidates-strongest-first
+    Candidates --> Iterate: for-each-backend
+    Iterate --> Skip: backend-not-implemented
+    Skip --> Iterate: continue-push-to-skipped
+    Iterate --> PolicyBlocked: isolation-below-minimum
+    Iterate --> Chosen: isolation-meets-minimum
+    Iterate --> NoneLocal: candidates-exhausted
+    Chosen --> [*]: warn-on-skipped-start-runner
+    PolicyBlocked --> [*]: fail-closed-refuse-to-spawn
+    NoneLocal --> [*]: nothing-usable-on-this-host
 ```
 
 - **`Chosen{backend, skipped_stronger}`** — strongest implemented backend satisfying
@@ -293,14 +293,10 @@ stateDiagram-v2
 
 ```mermaid
 flowchart LR
-    subgraph V1["v1 implemented (drivers ready)"]
-        D0["Docker<br/>container tier<br/>implemented"]
-        D1["Docker + sysbox-runc<br/>container+ tier<br/>implemented"]
-    end
-    subgraph M2["M2 (detected, drivers roadmap)"]
-        L0["libvirt / KVM<br/>VM tier<br/>detected only"]
-        T0["Tart (macOS M-series)<br/>VM tier<br/>detected only"]
-    end
+    T0["Tart on macOS M-series - VM tier - detected only"]
+    L0["libvirt or KVM on Linux - VM tier - detected only"]
+    D1["Docker + sysbox-runc - container+ tier - implemented"]
+    D0["Docker - container tier - implemented"]
     T0 --> L0 --> D1 --> D0
     style T0 stroke-dasharray: 5 3
     style L0 stroke-dasharray: 5 3

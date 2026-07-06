@@ -66,22 +66,22 @@ your host offers and what your policy requires:
 
 ```mermaid
 flowchart TD
-    Start["ezgha detect()"] --> Q1{"kvm_usable<br/>AND has_tart<br/>(macOS)?"}
-    Q1 -- yes --> M2T["Tart VM backend<br/>M2 roadmap"]
-    Q1 -- no --> Q2{"kvm_usable<br/>AND has_virsh<br/>(Linux)?"}
-    Q2 -- yes --> M2L["libvirt/KVM backend<br/>M2 roadmap"]
-    Q2 -- no --> Q3{"docker_ok?"}
-    Q3 -- no --> None["Selection::None<br/>no usable backend"]
-    Q3 -- yes --> Q4{"sysbox_runtime?"}
-    Q4 -- yes --> DSys["Docker + sysbox-runc<br/>container+ tier"]
-    Q4 -- no --> DDock["Docker<br/>container tier"]
-    DSys --> Chk{"policy.minimum_isolation"}
+    Start["ezgha detect"] --> Q1["kvm-usable AND has-tart on-macOS?"]
+    Q1 -- yes --> M2T["Tart VM backend M2-roadmap"]
+    Q1 -- no --> Q2["kvm-usable AND has-virsh on-Linux?"]
+    Q2 -- yes --> M2L["libvirt-KVM backend M2-roadmap"]
+    Q2 -- no --> Q3["docker-ok?"]
+    Q3 -- no --> NoneState["Selection-None no-usable-backend"]
+    Q3 -- yes --> Q4["sysbox-runtime?"]
+    Q4 -- yes --> DSys["Docker-sysbox container-plus-tier"]
+    Q4 -- no --> DDock["Docker container-tier"]
+    DSys --> Chk["policy check"]
     DDock --> Chk
-    Chk --> Q5{"daemon_in_vm?"}
-    Q5 -- yes --> OK1["isolation = Vm (VM tier)<br/>satisfies vm policy"]
-    Q5 -- no --> Q6{"policy == 'vm'?"}
-    Q6 -- yes --> Block["Selection::PolicyBlocked<br/>fail-closed"]
-    Q6 -- no --> OK2["isolation = Container<br/>satisfies container policy"]
+    Chk --> Q5["daemon-in-vm?"]
+    Q5 -- yes --> OK1["isolation-Vm satisfies-vm-policy"]
+    Q5 -- no --> Q6["policy-equals-vm?"]
+    Q6 -- yes --> Block["Selection-PolicyBlocked fail-closed"]
+    Q6 -- no --> OK2["isolation-Container satisfies-container-policy"]
     style M2T stroke-dasharray: 5 3
     style M2L stroke-dasharray: 5 3
     style Block fill:#ffebe9,stroke:#cf222e
