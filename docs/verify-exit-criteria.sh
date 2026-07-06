@@ -114,7 +114,9 @@ RAW_RUNNERS=$(gh api orgs/jleechanorg/actions/runners --paginate 2>/dev/null || 
 ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.runners[] | select(.name | startswith($p)) | select(.status == "online") | .name')
 ONLINE_COUNT=$(echo "$ONLINE_RUNNERS" | grep -c . || echo 0)
 BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.busy == true)] | length')
-EFFECTIVE_CAPACITY=$((ONLINE_COUNT + BUSY_COUNT))
+EFFECTIVE_CAPACITY=$((ONLINE_COUNT))
+# Note: busy runners are a subset of online runners; adding both double-counts
+# them. EFFECTIVE_CAPACITY = total online (which already includes busy runners).
 
 # Check offline runners
 OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.status == "offline")] | length')
@@ -143,10 +145,25 @@ if [ "$BUSY_COUNT" -eq 0 ]; then
     fi
 fi
 
-if [ "$CONTAINER_COUNT" -lt "$((COUNT - 1))" ]; then
-    fail "Local managed container count ($CONTAINER_COUNT) is lower than COUNT-1 ($((COUNT - 1)))"
+# Slot file count is the authoritative local measure: it persists across the
+# respawn gap (container finishes job → auto-removed by --rm → slot still
+# reserved → daemon respawns within 30s). An instantaneous 'docker ps' count
+# is always wrong under high utilization and triggers false failures.
+SLOT_COUNT=0
+SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+if [ -f "$SLOT_FILE" ]; then
+    SLOT_COUNT=$(grep -c '\.' "$SLOT_FILE" 2>/dev/null || echo 0)
+    # slot file has one entry per reserved slot; count lines with '=' as a proxy
+    SLOT_COUNT=$(grep -c '=' "$SLOT_FILE" 2>/dev/null || echo 0)
 fi
-pass "Gate 3: Fleet capacity meets targets (Effective capacity: $EFFECTIVE_CAPACITY, Containers: $CONTAINER_COUNT)"
+# Fall back to docker ps only if slot file is absent/empty
+if [ "$SLOT_COUNT" -eq 0 ]; then
+    SLOT_COUNT="$CONTAINER_COUNT"
+fi
+if [ "$SLOT_COUNT" -lt "$((COUNT - 1))" ] && [ "$CONTAINER_COUNT" -lt "$((COUNT - 1))" ]; then
+    fail "Local managed container count ($CONTAINER_COUNT) is lower than COUNT-1 ($((COUNT - 1))) and slot file has only $SLOT_COUNT reserved slots"
+fi
+pass "Gate 3: Fleet capacity meets targets (Effective capacity: $EFFECTIVE_CAPACITY, Containers: $CONTAINER_COUNT, Slots: $SLOT_COUNT)"
 
 # --- Gate 4: Real job execution ---
 echo "--- Checking Gate 4: Real job execution ---"
