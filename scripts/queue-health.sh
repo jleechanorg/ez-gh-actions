@@ -136,6 +136,7 @@ if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
   info "oldest fresh queued: id=$QUEUE_OLDEST_FRESH_ID name=$QUEUE_OLDEST_FRESH_NAME branch=$QUEUE_OLDEST_FRESH_BRANCH age=${QUEUE_OLDEST_FRESH_AGE_MIN}m"
   if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
     bad "queue tail ${QUEUE_MAX_FRESH_MIN}m exceeds ${QUEUE_TAIL_WARN_MIN}m — runners saturated or mis-routing"
+    info "superseded dry-run: QUEUE_REPO=$QUEUE_REPO ./scripts/queue-backlog-drain.sh --min-age-min ${QUEUE_TAIL_WARN_MIN}"
   else
     ok "queue tail ${QUEUE_MAX_FRESH_MIN}m within ${QUEUE_TAIL_WARN_MIN}m threshold"
   fi
@@ -144,8 +145,9 @@ else
 fi
 
 if [ "${QUEUE_QUEUED_STALE:-0}" -gt 0 ]; then
-  warn "stale queued zombies: $QUEUE_QUEUED_STALE runs older than ${STALE_HOURS}h (GitHub artifact — use: ./scripts/cleanup-stuck-runs.sh --zombies)"
-  info "cleanup: ./scripts/cleanup-stuck-runs.sh --zombies  # gh run delete (cancel fails on zombies)"
+  warn "stale queued zombies: $QUEUE_QUEUED_STALE runs older than ${STALE_HOURS}h (GitHub artifact — inspect with: ./scripts/cleanup-stuck-runs.sh --zombies)"
+  info "cleanup dry-run: ./scripts/cleanup-stuck-runs.sh --zombies"
+  info "cleanup apply: ./scripts/cleanup-stuck-runs.sh --zombies --apply  # gh run delete (cancel fails on zombies)"
   info "oldest stale: id=$QUEUE_OLDEST_STALE_ID name=$QUEUE_OLDEST_STALE_NAME branch=$QUEUE_OLDEST_STALE_BRANCH age=${QUEUE_OLDEST_STALE_AGE_DAYS}d created=$QUEUE_OLDEST_STALE_CREATED"
 fi
 

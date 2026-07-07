@@ -46,6 +46,16 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 ## Recent activity (rolling)
 
+### 2026-07-07 (Codex continuation) — saturation investigation + `/nextsteps` tracker sync
+
+- Investigated reported runs older than 30 minutes. Current evidence points to `jleechanorg/worldarchitect.ai` saturation, not label mismatch: roughly 90+ queued runs, 20 in-progress runs, oldest fresh queued run >200m, and the `ez-runner-c-*` fleet online/busy.
+- Found one real runner-health contributor during the same investigation: `ez-runner-c-16` / runner id `133301` was offline+busy with no local container and pinned to run `28879329099`; cancelling that run allowed deleting the stale runner registration and repopulating slot 16.
+- Stale queued zombie cleanup is not complete: `scripts/cleanup-stuck-runs.sh --zombies` found `28845560622`, but `gh run delete` returned HTTP 403 with current auth. Tracked as `ez-gh-actions-nq0`.
+- External watchdog was hot-patched out-of-repo to run locally on Linux and avoid false restarts during ephemeral churn when all configured slots are reserved. It still violates the committed-config rule until versioned or removed; tracked as `ez-gh-actions-2ik`.
+- Tracker sync: created `ez-gh-actions-6ah` for queue backlog drain/superseded-run cleanup policy and `ez-gh-actions-nq0` for stale zombie cleanup permissions; updated `ez-gh-actions-142` with canary-capacity proof blocker evidence.
+- Implemented `ez-gh-actions-6ah`: `scripts/queue-backlog-drain.sh` gives a read-only tail/superseded report with exact run URLs; `scripts/cleanup-stuck-runs.sh` is now dry-run by default, supports `--superseded`, requires `--apply` for mutation, and keeps broad fresh-tail cancellation behind explicit `--tail --apply`.
+- Current blockers before claiming healthy throughput: reserve canary capacity (`ez-gh-actions-142`), fix zombie delete permissions (`ez-gh-actions-nq0`), and version or remove the external watchdog (`ez-gh-actions-2ik`). Backlog tooling (`ez-gh-actions-6ah`) is implemented, and the latest dry-run found zero superseded candidates, so broad cancellation is not evidence-backed.
+
 ### 2026-07-06 (eve) — 53-agent adversarial goal-gap review + zombie-registration incident
 
 - Ran ultracode workflow (7 reviewers + 1 adversarial skeptic per finding): **45 findings, 33 confirmed, 12 partial, 0 refuted**. Scorecard vs user goals: hardened 5/10, self-healing 4/10, throughput 4/10, trimming 1/10, **alerting 0/10**.
