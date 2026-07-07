@@ -779,6 +779,119 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+fn parse_loadavg_1m(raw: &str) -> Option<f64> {
+    raw.split_whitespace().next()?.parse().ok()
+}
+
+fn read_host_loadavg_1m() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|raw| parse_loadavg_1m(&raw))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn wait_for_respawn_load_window<Load, Sleep>(cfg: &Config, loadavg_1m: &mut Load, sleep: &mut Sleep)
+where
+    Load: FnMut() -> Option<f64>,
+    Sleep: FnMut(Duration),
+{
+    let threshold = cfg.runner.respawn_load_threshold;
+    let retry = Duration::from_secs(cfg.runner.respawn_load_retry_seconds);
+    let max_wait = Duration::from_secs(cfg.runner.respawn_load_max_wait_seconds);
+    let mut waited = Duration::ZERO;
+    let mut warned = false;
+
+    while let Some(load) = loadavg_1m() {
+        if load < threshold {
+            return;
+        }
+        if waited >= max_wait {
+            eprintln!(
+                "warning: host 1-minute load average {load:.2} is still >= respawn threshold {threshold:.2} after {waited:?}; proceeding with next runner batch"
+            );
+            return;
+        }
+        if !warned {
+            eprintln!(
+                "warning: host 1-minute load average {load:.2} is >= respawn threshold {threshold:.2}; delaying runner respawn batch"
+            );
+            warned = true;
+        }
+        watchdog::ping();
+        sleep(retry);
+        watchdog::ping();
+        waited += retry;
+    }
+}
+
+fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
+    start_missing_runners_with(
+        cfg,
+        missing,
+        || start_one(cfg, backend),
+        std::thread::sleep,
+        read_host_loadavg_1m,
+    )
+}
+
+fn start_missing_runners_with<Start, Sleep, Load>(
+    cfg: &Config,
+    missing: u32,
+    mut start_runner: Start,
+    mut sleep: Sleep,
+    mut loadavg_1m: Load,
+) -> Result<Vec<String>>
+where
+    Start: FnMut() -> Result<(String, String)>,
+    Sleep: FnMut(Duration),
+    Load: FnMut() -> Option<f64>,
+{
+    let mut started = Vec::new();
+    let mut last_err = None;
+    let batch_size = cfg.runner.respawn_batch_size.max(1);
+    // Four-at-a-time with a five-second pause is intentionally conservative:
+    // the incident burst was 16 cold starts back-to-back, and the real
+    // watchdog ceiling is loadavg 24. A threshold of 12 and a short inter-batch
+    // pause give already-started containers time to absorb their CPU-heavy
+    // startup work before we add more pressure, while the bounded wait below
+    // keeps this as pacing rather than a hard capacity circuit breaker.
+    let inter_batch_sleep = Duration::from_secs(cfg.runner.respawn_batch_sleep_seconds);
+
+    for i in 0..missing {
+        if i % batch_size == 0 {
+            wait_for_respawn_load_window(cfg, &mut loadavg_1m, &mut sleep);
+        }
+        watchdog::ping();
+        match start_runner() {
+            Ok((_, name)) => started.push(name),
+            Err(e) => {
+                eprintln!("warning: failed to start runner: {e:#}");
+                last_err = Some(e);
+            }
+        }
+        let batch_finished = (i + 1) % batch_size == 0;
+        let more_to_start = i + 1 < missing;
+        if batch_finished && more_to_start {
+            watchdog::ping();
+            sleep(inter_batch_sleep);
+            watchdog::ping();
+        }
+    }
+
+    if started.is_empty() {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(started)
+}
+
 /// Ensure `count` managed runner containers are alive; start the shortfall.
 /// Refuses to spawn when the daemon's disk is below the configured floor —
 /// disk exhaustion is the dominant self-hosted runner failure mode, and
@@ -846,27 +959,11 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
             );
         }
     }
-    let mut started = Vec::new();
-    let mut last_err = None;
-    for _ in alive..cfg.runner.count {
-        watchdog::ping();
-        match start_one(cfg, backend) {
-            Ok((_, name)) => started.push(name),
-            Err(e) => {
-                eprintln!("warning: failed to start runner: {e:#}");
-                last_err = Some(e);
-            }
-        }
-    }
+    let started = start_missing_runners(cfg, backend, cfg.runner.count - alive);
     // Release any failed reservations from this cycle
     let _ = release_stale_slots(cfg);
 
-    if started.is_empty() {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
-    }
-    Ok(started)
+    Ok(started?)
 }
 
 #[cfg(test)]
@@ -874,6 +971,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -1121,6 +1219,100 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "timeout should fire promptly, got {:?}",
             elapsed
+        );
+    }
+
+    #[test]
+    fn parse_loadavg_reads_first_field() {
+        assert_eq!(parse_loadavg_1m("12.34 5.67 8.90 1/2 345"), Some(12.34));
+        assert_eq!(parse_loadavg_1m("not-a-number 5.67 8.90"), None);
+        assert_eq!(parse_loadavg_1m(""), None);
+    }
+
+    #[test]
+    fn respawn_pacing_batches_start_calls_with_sleep_between_batches() {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 4;
+        cfg.runner.respawn_batch_sleep_seconds = 5;
+        cfg.runner.respawn_load_threshold = 12.0;
+        let events = RefCell::new(Vec::<String>::new());
+        let mut seq = 0;
+
+        let started = start_missing_runners_with(
+            &cfg,
+            16,
+            || {
+                seq += 1;
+                events.borrow_mut().push(format!("start-{seq}"));
+                Ok((format!("container-{seq}"), format!("runner-{seq}")))
+            },
+            |duration| {
+                events
+                    .borrow_mut()
+                    .push(format!("sleep-{}", duration.as_secs()));
+            },
+            || Some(0.0),
+        )
+        .unwrap();
+
+        assert_eq!(started.len(), 16);
+        let events = events.borrow();
+        let sleeps: Vec<_> = events
+            .iter()
+            .filter(|e| e.starts_with("sleep-"))
+            .map(|e| e.as_str())
+            .collect();
+        assert_eq!(
+            sleeps,
+            vec!["sleep-5", "sleep-5", "sleep-5"],
+            "16 starts with batch_size=4 must pause between the 4 batches"
+        );
+        let max_consecutive_starts = events
+            .split(|event| event.starts_with("sleep-"))
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .filter(|event| event.starts_with("start-"))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_consecutive_starts, 4,
+            "start calls must be bounded by respawn_batch_size instead of firing all 16 back-to-back; events={events:?}"
+        );
+    }
+
+    #[test]
+    fn respawn_load_backoff_is_bounded_and_then_proceeds() {
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 4;
+        cfg.runner.respawn_load_threshold = 12.0;
+        cfg.runner.respawn_load_retry_seconds = 5;
+        cfg.runner.respawn_load_max_wait_seconds = 10;
+        let events = RefCell::new(Vec::<String>::new());
+
+        let started = start_missing_runners_with(
+            &cfg,
+            1,
+            || {
+                events.borrow_mut().push("start".into());
+                Ok(("container".into(), "runner".into()))
+            },
+            |duration| {
+                events
+                    .borrow_mut()
+                    .push(format!("sleep-{}", duration.as_secs()));
+            },
+            || Some(20.0),
+        )
+        .unwrap();
+
+        assert_eq!(started, vec!["runner"]);
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["sleep-5", "sleep-5", "start"],
+            "high load should delay only up to respawn_load_max_wait_seconds, then spawn"
         );
     }
 
