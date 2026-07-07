@@ -213,7 +213,7 @@ fn minimum_queue_check_interval_seconds() -> u64 {
 }
 
 fn default_queue_stale_hours() -> u64 {
-    24
+    8
 }
 
 fn default_queue_consecutive_alert_threshold() -> u32 {
@@ -392,6 +392,13 @@ impl Config {
         if self.queue_monitor.stale_hours == 0 {
             anyhow::bail!("queue_monitor.stale_hours must be at least 1");
         }
+        if self.queue_monitor.stale_hours > default_queue_stale_hours() {
+            anyhow::bail!(
+                "queue_monitor.stale_hours must be at most {} (got {})",
+                default_queue_stale_hours(),
+                self.queue_monitor.stale_hours
+            );
+        }
         if self.queue_monitor.consecutive_alert_threshold == 0 {
             anyhow::bail!("queue_monitor.consecutive_alert_threshold must be at least 1");
         }
@@ -522,7 +529,7 @@ mod tests {
         assert!(!tiny.queue_monitor.enabled);
         assert_eq!(tiny.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
-        assert_eq!(tiny.queue_monitor.stale_hours, 24);
+        assert_eq!(tiny.queue_monitor.stale_hours, 8);
         assert_eq!(tiny.queue_monitor.consecutive_alert_threshold, 2);
         assert!(!tiny.canary.enabled);
         assert_eq!(tiny.canary.workflow, "selftest.yml");
@@ -682,7 +689,9 @@ mod tests {
         cfg.queue_monitor.check_interval_seconds = 300;
         cfg.queue_monitor.stale_hours = 0;
         assert!(cfg.validate().is_err());
-        cfg.queue_monitor.stale_hours = 24;
+        cfg.queue_monitor.stale_hours = 9;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.stale_hours = 8;
         cfg.queue_monitor.consecutive_alert_threshold = 0;
         assert!(cfg.validate().is_err());
         cfg.queue_monitor.consecutive_alert_threshold = 2;

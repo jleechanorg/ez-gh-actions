@@ -274,6 +274,31 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
         &cfg.runner.name_prefix,
         local_container_names.as_ref(),
     )?;
+    let mut reclaimed = reclaimed;
+    if let Some(local_names) = local_container_names.as_ref() {
+        for (slot_n, runner_id, runner_name) in offline_busy_owned_missing_container_slots(
+            &assignments,
+            &live_runners,
+            &cfg.runner.name_prefix,
+            local_names,
+        ) {
+            eprintln!(
+                "warning: removing offline/busy runner {runner_name} (id {runner_id}) with no local container before releasing slot {slot_n}"
+            );
+            match github::remove_runner(&cfg.github, runner_id) {
+                Ok(()) => {
+                    release_slot(slot_n)?;
+                    reclaimed += 1;
+                    watchdog::ping();
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: keeping slot {slot_n}: failed to remove offline/busy runner {runner_name} (id {runner_id}): {err:#}"
+                    );
+                }
+            }
+        }
+    }
     watchdog::ping();
     // Forward sweep: GitHub has runners with our prefix that NO slot file
     // entry owns. These are JIT registrations whose slot reservation was
@@ -385,6 +410,34 @@ fn release_stale_slots_from_with_containers(
         }
     }
     Ok(reclaimed)
+}
+
+fn offline_busy_owned_missing_container_slots(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: &HashSet<String>,
+) -> Vec<(u32, u64, String)> {
+    let mut slots = Vec::new();
+    for (slot, id_str) in &assignments.assignments {
+        let (Ok(slot_n), Ok(rid)) = (slot.parse::<u32>(), id_str.parse::<u64>()) else {
+            continue;
+        };
+        let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
+        if local_container_names.contains(&expected_name) {
+            continue;
+        }
+        let Some(runner) = live_runners.iter().find(|r| r.id == rid) else {
+            continue;
+        };
+        if runner.name == expected_name
+            && runner.status.eq_ignore_ascii_case("offline")
+            && runner.busy
+        {
+            slots.push((slot_n, rid, expected_name));
+        }
+    }
+    slots
 }
 
 fn runner_name_from_prefix(prefix: &str, slot: u32) -> String {
@@ -1141,6 +1194,73 @@ mod tests {
             read_slot_assignments().unwrap().assignments.is_empty(),
             "slot 1 must be released"
         );
+    }
+
+    #[test]
+    fn offline_busy_owned_missing_container_slot_requires_runner_removal() {
+        let _env = TestEnv::new("offline_busy_missing_container");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap();
+
+        let live = vec![github::RunnerInfo {
+            id: 1234,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: true,
+        }];
+        let local_names = HashSet::from(["ez-org-runner-2".to_string()]);
+        let candidates = offline_busy_owned_missing_container_slots(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            &local_names,
+        );
+
+        assert_eq!(candidates, vec![(1, 1234, "ez-org-runner-1".into())]);
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "offline/busy runners must not be released by the dry reconciler before GitHub removal"
+        );
+    }
+
+    #[test]
+    fn online_busy_missing_container_is_not_reclaimable() {
+        let _env = TestEnv::new("online_busy_missing_container");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap();
+
+        let live = vec![github::RunnerInfo {
+            id: 1234,
+            name: "ez-org-runner-1".into(),
+            status: "online".into(),
+            busy: true,
+        }];
+        let local_names = HashSet::from(["ez-org-runner-2".to_string()]);
+        let candidates = offline_busy_owned_missing_container_slots(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            &local_names,
+        );
+
+        assert!(candidates.is_empty());
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+        assert_eq!(reclaimed, 0);
     }
 
     #[test]

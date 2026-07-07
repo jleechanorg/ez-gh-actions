@@ -16,7 +16,7 @@ _qh_finish() {
 
 QUEUE_REPO="${QUEUE_REPO:-jleechanorg/worldarchitect.ai}"
 QUEUE_TAIL_WARN_MIN="${QUEUE_TAIL_WARN_MIN:-20}"
-STALE_HOURS="${STALE_HOURS:-24}"
+STALE_HOURS="${STALE_HOURS:-8}"
 
 section() { printf '\n=== %s ===\n' "$*"; }
 ok() { printf '  [OK]   %s\n' "$*"; }

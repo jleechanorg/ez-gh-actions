@@ -452,7 +452,7 @@ mod tests {
             ],
         };
 
-        let stats = queue_stats(&snapshot, now, 24, 20);
+        let stats = queue_stats(&snapshot, now, 8, 20);
 
         assert_eq!(stats.queued_total, 3);
         assert_eq!(stats.fresh_queued, 2);
@@ -472,7 +472,7 @@ mod tests {
             queued: vec![run(1, "Quick", "main", "2026-07-07T08:20:00Z")],
         };
 
-        let stats = queue_stats(&snapshot, now, 24, 20);
+        let stats = queue_stats(&snapshot, now, 8, 20);
 
         assert!(!stats.tail_bad);
         assert_eq!(stats.p50_wait_minutes, 10.0);
@@ -487,12 +487,12 @@ mod tests {
             queued: vec![
                 run(1, "Exact threshold", "main", "2026-07-07T08:10:00Z"),
                 run(2, "Future", "main", "2026-07-07T08:35:00Z"),
-                run(3, "Exact stale cutoff", "main", "2026-07-06T08:30:00Z"),
+                run(3, "Exact stale cutoff", "main", "2026-07-07T00:30:00Z"),
                 run(4, "Invalid", "main", "not-a-timestamp"),
             ],
         };
 
-        let stats = queue_stats(&snapshot, now, 24, 20);
+        let stats = queue_stats(&snapshot, now, 8, 20);
 
         assert_eq!(stats.queued_total, 4);
         assert_eq!(stats.fresh_queued, 2);
@@ -555,7 +555,7 @@ mod tests {
             p90_wait_minutes: 0.0,
             max_fresh_wait_minutes: 0.0,
             tail_warn_minutes: 20,
-            stale_cutoff_hours: 24,
+            stale_cutoff_hours: 8,
             tail_bad: false,
             oldest_fresh: None,
             oldest_stale: Some(AgedQueueRun {
@@ -585,7 +585,7 @@ mod tests {
             p90_wait_minutes: 45.0,
             max_fresh_wait_minutes: 45.0,
             tail_warn_minutes: 20,
-            stale_cutoff_hours: 24,
+            stale_cutoff_hours: 8,
             tail_bad: true,
             oldest_fresh: Some(AgedQueueRun {
                 id: 2,
