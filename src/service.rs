@@ -305,6 +305,21 @@ mod tests {
     }
 
     #[test]
+    fn systemd_service_uses_long_watchdog_budget() {
+        let unit = systemd_service_unit(
+            std::path::Path::new("/home/jleechan/.cargo/bin/ezgha"),
+            std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/home/jleechan"),
+        );
+
+        assert!(
+            unit.contains("WatchdogSec=300"),
+            "WatchdogSec must exceed stacked GitHub/Docker timeout budgets; serve has an internal heartbeat for liveness"
+        );
+    }
+
+    #[test]
     fn systemd_alert_unit_invokes_failure_alert_command() {
         let unit = systemd_alert_unit(
             std::path::Path::new("/home/jleechan/.cargo/bin/ezgha"),

@@ -111,6 +111,14 @@ fn config_path(cli: &Cli) -> Result<std::path::PathBuf> {
     }
 }
 
+fn mark_service_ready_and_start_watchdog() -> watchdog::Heartbeat {
+    // systemd notify (bead drg): Tell systemd we're ready so Type=notify
+    // stops blocking the start. No-op when NOTIFY_SOCKET is unset (macOS
+    // launchd path / interactive `ezgha serve`).
+    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+    watchdog::start_background()
+}
+
 fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
     let plat = platform::detect();
     match backend::select(&plat, cfg.policy.minimum_isolation) {
@@ -652,10 +660,7 @@ fn main() -> Result<()> {
                 cfg.github.target,
                 backend.name()
             );
-            // systemd notify (bead drg): Tell systemd we're ready so Type=notify
-            // stops blocking the start. No-op when NOTIFY_SOCKET is unset (macOS
-            // launchd path / interactive `ezgha serve`).
-            let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+            let _watchdog_heartbeat = mark_service_ready_and_start_watchdog();
             let mut backend_recovery = BackendRecoveryState::new();
             let mut queue_monitor = queue_monitor::QueueMonitorState::new();
             let mut ensure_fail_streak = 0u32;
@@ -967,6 +972,12 @@ mod tests {
             best_available: backend::Backend::Docker,
             required: config::IsolationLevel::Vm,
         }));
+    }
+
+    #[test]
+    fn service_ready_helper_returns_background_watchdog_guard() {
+        let heartbeat: watchdog::Heartbeat = mark_service_ready_and_start_watchdog();
+        drop(heartbeat);
     }
 
     #[test]
