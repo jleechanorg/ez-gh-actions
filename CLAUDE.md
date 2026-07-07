@@ -35,8 +35,9 @@ Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD
 
 1. `cargo test` — verify all tests pass
 2. `cargo install --path .` — install updated binary (embeds new HEAD SHA)
-3. `systemctl --user restart ezgha.service` — restart daemon
-4. `./docs/verify-exit-criteria.sh` — verify all gates pass
+3. **Before `systemctl --user restart ezgha.service`, check `uptime` (1-min load average) and `docker ps --filter label=ezgha=managed | wc -l` (running container count). If load_1min > 12 or containers < 12, DO NOT restart — wait for reconciliation and recheck.** Mass cold respawns of many runners at once have tripped the host watchdog (`/etc/watchdog.conf` `max-load-1 = 24` on this 32-thread box) and rebooted the box twice on 2026-07-07, once killing an in-progress agent session outright. This check protects the fleet regardless of which agent/session is running Gate 0 — see bead `ez-gh-actions-po2` for the durable fix (load-aware respawn pacing inside the daemon itself) that will make this manual check unnecessary once it lands.
+4. `systemctl --user restart ezgha.service` — restart daemon
+5. `./docs/verify-exit-criteria.sh` — verify all gates pass
 
 ## Commit conventions
 Every commit subject must be prefixed with the runtime that produced it:

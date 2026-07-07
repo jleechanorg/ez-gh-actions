@@ -299,6 +299,36 @@ by this session (no new commits, no systemctl call from here) -- reset the
 sampler's tick timer, next sample now expected ~14:00:52 PT. Persistent
 Monitor (task b0cjx61fg) watching for new lines in invariant_history.jsonl.
 
+**Main's decisions on both flags (2026-07-07 14:01 PT):**
+1. Sampler cost — approved as a targeted (not speculative) fix: cap job
+   enumeration to the oldest ~50 queued runs per repo (INV-2 stays exact since
+   the oldest job lives among the oldest runs; add `queued_jobs_capped` to the
+   schema), and share one snapshot per repo per tick between queue_monitor and
+   the invariant sampler instead of independent fetches. Bead created:
+   ez-gh-actions-wms. Dispatch to codex at quota return (~14:52 PT) alongside
+   ez-gh-actions-po2 -- both attack the same GitHub-API-rate-limit pressure
+   from different angles (this one: sampler-induced load; po2: JIT-registration
+   burst that trips the watchdog). Not hand-optimizing before then.
+2. 13:56 restart root-caused: clean deliberate systemd stop/start by ANOTHER
+   agent session (Gate 0 habit after a pull; HEAD was unchanged so it wasn't
+   commit-triggered) -- not watchdog, not a crash. Durable fix landed NOW
+   (docs-only): added a load/container check before `systemctl --user restart
+   ezgha.service` to CLAUDE.md's Gate 0 section (step 3, new) and one line to
+   `.claude/skills/ezgha-doctor/SKILL.md` -- "if load_1min > 12 or containers
+   < 12, DO NOT restart, wait for reconciliation." This protects every
+   session, not just this one, until po2 lands.
+
+**Dogfooding the new rule while deploying it (14:01-14:0x PT)**: container
+count was at 4 (well below the new 12 threshold) when I went to deploy this
+very docs commit -- correctly did NOT restart, waited instead. Investigated
+whether this was a new problem: doctor.sh shows `ensure_count failed
+occurrences in last 3 min: 0` (not failing/retry-looping) and 5/6 recent
+selftest runs succeeded on our fleet, consistent with known slot-reconciliation
+churn under heavy queue load (offline/busy slots that can't be safely
+released yet) rather than a new crisis -- matches this repo's own documented
+Gate-3-low recipe. Waiting for reconciliation in the background before
+completing this deploy's Gate 0 loop.
+
 ## Other task check-ins (2026-07-07 13:45 PT, PR #8214 re-checked 14:00 PT: 14 SUCCESS / 5 PENDING, nearly green)
 
 - Task #4 (PR #8214): incremental progress, 7 checks SUCCESS now (was 3),

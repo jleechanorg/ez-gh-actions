@@ -26,7 +26,11 @@ real-execution proof (≥1 of the last 6 runs succeeded on our fleet) and a
 time-windowed error count (last 3 min, not last 200 lines — a since-recovered
 incident won't keep it red). If `fleet healthy` and exit 0, you're done — stop.
 If `fleet unhealthy`, continue. **Never restart-loop the service** — see
-`docs/harness-early-victory-5whys.md`.
+`docs/harness-early-victory-5whys.md`. **Before any `systemctl --user restart
+ezgha.service`, check `uptime` (1-min load) and `docker ps --filter
+label=ezgha=managed | wc -l` (container count) — skip the restart if load_1min
+> 12 or containers < 12, since a mass cold respawn has twice tripped this
+host's watchdog (`max-load-1 = 24`) into a full reboot on 2026-07-07.**
 
 
 
