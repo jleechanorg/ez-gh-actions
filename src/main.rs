@@ -11,6 +11,7 @@ mod docker_backend;
 mod github;
 mod platform;
 mod queue_monitor;
+mod reaper;
 mod service;
 mod watchdog;
 
@@ -81,6 +82,18 @@ enum Commands {
         #[arg(long)]
         nonce: Option<String>,
     },
+    /// Dry-run zombie reaper planning. Prints cancel-then-delete candidates; does not mutate GitHub.
+    ReaperPlan {
+        /// Repository to inspect as owner/repo. Can be repeated; defaults to configured canary/queue repos.
+        #[arg(long = "repo")]
+        repos: Vec<String>,
+        /// Additional retired runner name prefix allowed for planning.
+        #[arg(long = "retired-prefix")]
+        retired_prefixes: Vec<String>,
+        /// Minimum in-progress job age before a runner can be planned for reaping.
+        #[arg(long, default_value_t = 60)]
+        min_age_minutes: u64,
+    },
     /// Internal systemd failure hook installed by `install-service`
     #[command(hide = true)]
     SystemdAlertHook {
@@ -112,11 +125,12 @@ fn config_path(cli: &Cli) -> Result<std::path::PathBuf> {
 }
 
 fn mark_service_ready_and_start_watchdog() -> watchdog::Heartbeat {
+    let heartbeat = watchdog::start_background();
     // systemd notify (bead drg): Tell systemd we're ready so Type=notify
     // stops blocking the start. No-op when NOTIFY_SOCKET is unset (macOS
     // launchd path / interactive `ezgha serve`).
-    let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
-    watchdog::start_background()
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    heartbeat
 }
 
 fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
@@ -798,12 +812,64 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Commands::ReaperPlan {
+            repos,
+            retired_prefixes,
+            min_age_minutes,
+        } => {
+            let cfg = Config::load(&path)?;
+            let plans = run_reaper_plan(&cfg, repos, retired_prefixes, *min_age_minutes)?;
+            println!("{}", serde_json::to_string_pretty(&plans)?);
+        }
         Commands::SystemdAlertHook { source, unit } => {
             let cfg = Config::load(&path)?;
             run_systemd_alert_hook(&cfg, *source, unit)?;
         }
     }
     Ok(())
+}
+
+fn run_reaper_plan(
+    cfg: &Config,
+    repos: &[String],
+    retired_prefixes: &[String],
+    min_age_minutes: u64,
+) -> Result<Vec<reaper::ReaperPlan>> {
+    let selected_repos = if repos.is_empty() {
+        reaper::default_reaper_repos(cfg)
+    } else {
+        repos.to_vec()
+    };
+    if selected_repos.is_empty() {
+        bail!("no repos configured for reaper planning; pass --repo owner/repo");
+    }
+    let mut allowed_prefixes = vec![cfg.runner.name_prefix.clone()];
+    allowed_prefixes.extend(retired_prefixes.iter().cloned());
+    let runners = github::list_runners(&cfg.github)?;
+    let mut repo_runs = Vec::new();
+    for repo in selected_repos {
+        let mut runs_with_jobs = Vec::new();
+        for run in github::list_repo_in_progress_runs(&repo)? {
+            let jobs = github::list_workflow_jobs(&repo, run.id)?;
+            runs_with_jobs.push((run, jobs));
+        }
+        repo_runs.push((repo, runs_with_jobs));
+    }
+    Ok(reaper::plan_reaper_actions(
+        &runners,
+        &repo_runs,
+        &allowed_prefixes,
+        &cfg.runner.labels,
+        min_age_minutes.saturating_mul(60),
+        unix_now_secs(),
+    ))
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn ok(b: bool) -> &'static str {

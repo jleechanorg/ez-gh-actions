@@ -271,6 +271,21 @@ pub fn workflow_run_jobs_path(repo: &str, run_id: u64) -> String {
     format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
 }
 
+pub fn repo_in_progress_runs_path(repo: &str, page: u32) -> String {
+    format!(
+        "repos/{repo}/actions/runs?status=in_progress&per_page=100&page={}",
+        page.max(1)
+    )
+}
+
+pub fn workflow_run_cancel_path(repo: &str, run_id: u64) -> String {
+    format!("repos/{repo}/actions/runs/{run_id}/cancel")
+}
+
+pub fn workflow_run_force_cancel_path(repo: &str, run_id: u64) -> String {
+    format!("repos/{repo}/actions/runs/{run_id}/force-cancel")
+}
+
 pub fn dispatch_workflow(repo: &str, workflow: &str, ref_name: &str, nonce: &str) -> Result<()> {
     api_post_empty(
         &workflow_dispatch_path(repo, workflow),
@@ -292,6 +307,32 @@ pub fn list_workflow_jobs(repo: &str, run_id: u64) -> Result<Vec<WorkflowJob>> {
     let parsed: WorkflowJobsResponse = serde_json::from_slice(&body)
         .with_context(|| format!("unexpected workflow-jobs response for run {run_id}"))?;
     Ok(parsed.jobs)
+}
+
+pub fn list_repo_in_progress_runs(repo: &str) -> Result<Vec<WorkflowRun>> {
+    let mut runs = Vec::new();
+    for page in 1.. {
+        let path = repo_in_progress_runs_path(repo, page);
+        let body = api_json(&path)?;
+        let parsed: WorkflowRunsResponse = serde_json::from_slice(&body)
+            .with_context(|| format!("unexpected in-progress runs response for {repo}"))?;
+        let done = parsed.workflow_runs.len() < 100;
+        runs.extend(parsed.workflow_runs);
+        if done {
+            break;
+        }
+    }
+    Ok(runs)
+}
+
+#[allow(dead_code)]
+pub fn cancel_workflow_run(repo: &str, run_id: u64) -> Result<()> {
+    api_post_empty(&workflow_run_cancel_path(repo, run_id), &[])
+}
+
+#[allow(dead_code)]
+pub fn force_cancel_workflow_run(repo: &str, run_id: u64) -> Result<()> {
+    api_post_empty(&workflow_run_force_cancel_path(repo, run_id), &[])
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +754,22 @@ mod tests {
         assert_eq!(
             workflow_run_jobs_path("jleechanorg/ez-gh-actions", 123),
             "repos/jleechanorg/ez-gh-actions/actions/runs/123/jobs?per_page=100"
+        );
+        assert_eq!(
+            repo_in_progress_runs_path("jleechanorg/ez-gh-actions", 0),
+            "repos/jleechanorg/ez-gh-actions/actions/runs?status=in_progress&per_page=100&page=1"
+        );
+        assert_eq!(
+            repo_in_progress_runs_path("jleechanorg/ez-gh-actions", 3),
+            "repos/jleechanorg/ez-gh-actions/actions/runs?status=in_progress&per_page=100&page=3"
+        );
+        assert_eq!(
+            workflow_run_cancel_path("jleechanorg/ez-gh-actions", 123),
+            "repos/jleechanorg/ez-gh-actions/actions/runs/123/cancel"
+        );
+        assert_eq!(
+            workflow_run_force_cancel_path("jleechanorg/ez-gh-actions", 123),
+            "repos/jleechanorg/ez-gh-actions/actions/runs/123/force-cancel"
         );
     }
 
