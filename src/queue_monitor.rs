@@ -29,6 +29,16 @@ pub const MONITORED_INVARIANT_REPOS: &[&str] =
 /// convention (`max_current > tail_warn_minutes as f64`).
 const INVARIANT_DURATION_THRESHOLD_MINUTES: f64 = 20.0;
 
+/// Emergency fix, 2026-07-07 14:xx PT: the uncapped per-tick job enumeration
+/// (one `gh api` call per queued run) took long enough with queued_jobs~1290
+/// that it starved the daemon's `ensure_count` refill step for minutes at a
+/// time, draining the live fleet to 0 containers -- observed directly, not
+/// theoretical. Cap job enumeration to the oldest ~N queued runs per repo:
+/// INV-2 stays exact (the oldest job necessarily lives among the oldest
+/// runs), and `queued_jobs` becomes an explicit LOWER BOUND when the cap
+/// bites (signaled via `queued_jobs_capped` in the schema).
+const INVARIANT_JOB_ENUMERATION_CAP: usize = 50;
+
 #[derive(Debug, Default)]
 pub struct QueueMonitorState {
     last_check: Option<Instant>,
@@ -59,7 +69,17 @@ impl QueueMonitorState {
         let Some(repo) = queue_repo(cfg) else {
             return Ok(None);
         };
-        let snapshot = fetch_queue_snapshot(repo)?;
+        // Same job-enumeration cap as the E1 invariant sampler (see
+        // INVARIANT_JOB_ENUMERATION_CAP's doc comment): this tick shares the
+        // identical per-run gh api cost, and at the current queue size
+        // (queued_jobs ~1290) it independently starved ensure_count's refill
+        // step even with the sampler disabled -- confirmed live in production
+        // 2026-07-07. tail_bad/max_current_job_age_minutes stay exact (the
+        // oldest job lives among the oldest runs); only the raw queued/
+        // in-progress *counts* become a lower bound when capped, which this
+        // starvation-alerting path doesn't otherwise report as an exact number.
+        let (snapshot, _capped) =
+            fetch_capped_queue_snapshot(repo, None, INVARIANT_JOB_ENUMERATION_CAP)?;
         let now = unix_now_secs();
         let stats = queue_stats(
             &snapshot,
@@ -134,8 +154,10 @@ impl InvariantSamplerState {
 /// one JSON line to the invariant-history JSONL file. Field names and set are
 /// exactly the E1 exit-criterion schema
 /// `{ts, busy, registered, queued_jobs, oldest_queued_job_min,
-/// oldest_running_job_min, inv1, inv2, inv1_fail_class}` -- do not rename
-/// fields without updating the exit-criteria doc and any downstream reader.
+/// oldest_running_job_min, inv1, inv2, inv1_fail_class}` plus
+/// `queued_jobs_capped` (added 2026-07-07 for the job-enumeration cap fix,
+/// see `INVARIANT_JOB_ENUMERATION_CAP`) -- do not rename fields without
+/// updating the exit-criteria doc and any downstream reader.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InvariantSample {
     /// Unix epoch seconds, matching this codebase's existing `ts_unix`
@@ -147,6 +169,13 @@ pub struct InvariantSample {
     pub busy: usize,
     pub registered: usize,
     pub queued_jobs: usize,
+    /// True if any monitored repo had more than `INVARIANT_JOB_ENUMERATION_CAP`
+    /// queued runs, meaning `queued_jobs` only reflects the oldest-run subset
+    /// that was actually enumerated -- an explicit LOWER BOUND on the true
+    /// count, not an exact total. `inv1`'s `queued_jobs == 0` check and
+    /// `oldest_queued_job_min` both stay exact regardless (a capped fetch
+    /// still contains the true oldest runs).
+    pub queued_jobs_capped: bool,
     pub oldest_queued_job_min: f64,
     pub oldest_running_job_min: f64,
     pub inv1: bool,
@@ -164,8 +193,11 @@ fn sample_invariants(cfg: &Config) -> Result<InvariantSample> {
     let fleet = fetch_fleet_runner_stats()?;
     let now = unix_now_secs();
     let mut repo_stats = Vec::with_capacity(MONITORED_INVARIANT_REPOS.len());
+    let mut any_capped = false;
     for repo in MONITORED_INVARIANT_REPOS {
-        let snapshot = fetch_queue_snapshot_with_fleet(repo, Some(fleet.clone()))?;
+        let (snapshot, capped) =
+            fetch_capped_queue_snapshot(repo, Some(fleet.clone()), INVARIANT_JOB_ENUMERATION_CAP)?;
+        any_capped |= capped;
         repo_stats.push(queue_stats(
             &snapshot,
             now,
@@ -173,17 +205,23 @@ fn sample_invariants(cfg: &Config) -> Result<InvariantSample> {
             cfg.queue_monitor.tail_warn_minutes,
         ));
     }
-    Ok(combine_invariant_sample(&fleet, &repo_stats, now))
+    Ok(combine_invariant_sample(
+        &fleet,
+        &repo_stats,
+        now,
+        any_capped,
+    ))
 }
 
 /// Pure combination logic, kept separate from `sample_invariants`'s network
 /// calls so the classifier + threshold math are unit-testable without a live
 /// GitHub API (mirrors how `queue_stats` above is unit-tested against
-/// hand-built `QueueSnapshot`s rather than through `fetch_queue_snapshot`).
+/// hand-built `QueueSnapshot`s rather than through `fetch_capped_queue_snapshot`).
 fn combine_invariant_sample(
     fleet: &FleetRunnerStats,
     repo_stats: &[QueueStats],
     now_secs: i64,
+    queued_jobs_capped: bool,
 ) -> InvariantSample {
     let queued_jobs: usize = repo_stats.iter().map(|s| s.queued_total).sum();
 
@@ -224,6 +262,7 @@ fn combine_invariant_sample(
         busy: fleet.busy_count,
         registered: fleet.registered_count,
         queued_jobs,
+        queued_jobs_capped,
         oldest_queued_job_min,
         oldest_running_job_min,
         inv1,
@@ -402,34 +441,61 @@ fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
     Ok(fleet_runner_stats(github::list_runners(&gh)?))
 }
 
-fn fetch_queue_snapshot(repo: &str) -> Result<QueueSnapshot> {
-    fetch_queue_snapshot_with_fleet(repo, None)
-}
-
-/// Same as `fetch_queue_snapshot`, but accepts an already-fetched
-/// `FleetRunnerStats` to avoid an extra `list_runners` API call when the
-/// caller is sampling multiple repos against the same org fleet in one tick
-/// (see `sample_invariants` below) -- API-rate-limit hygiene given how many
-/// concurrent agents hit this org's GitHub API.
-fn fetch_queue_snapshot_with_fleet(
+/// Fetches a repo's queued/in-progress self-hosted job snapshot, capping
+/// expensive per-run job enumeration to the oldest `cap` queued runs when the
+/// repo has more than `cap` queued -- see `INVARIANT_JOB_ENUMERATION_CAP` for
+/// why (this replaced an uncapped fetch that independently starved the
+/// daemon's ensure_count refill step at the current queue size, both via the
+/// E1 sampler and this module's own starvation-alert tick). GitHub's
+/// workflow-runs API returns newest-first, so the oldest runs live on the
+/// LAST page; we read page 1 first (cheap, gives `total_count`), and only
+/// walk backward from the last page when the total exceeds the cap, instead
+/// of fetching every page from the front. In-progress jobs are NOT capped
+/// (typically far fewer than queued, and INV-2's running-job age doesn't
+/// have a "queue tail" shape that benefits from an oldest-first cap).
+fn fetch_capped_queue_snapshot(
     repo: &str,
     fleet: Option<FleetRunnerStats>,
-) -> Result<QueueSnapshot> {
+    cap: usize,
+) -> Result<(QueueSnapshot, bool)> {
+    let first_path = format!("repos/{repo}/actions/runs?status=queued&per_page=100&page=1");
+    let first_body = github::api_json(&first_path)?;
+    let first_parsed: RunsResponse = serde_json::from_slice(&first_body)
+        .with_context(|| format!("parse queued runs response for {repo} page 1"))?;
+    let total_count = first_parsed.total_count as usize;
+
+    let (queued_runs, capped) = if total_count <= cap {
+        (first_parsed.workflow_runs, false)
+    } else {
+        let last_page = total_count.div_ceil(100) as u32;
+        let mut oldest_runs: Vec<ApiWorkflowRun> = Vec::with_capacity(cap);
+        let mut first_page_runs = Some(first_parsed.workflow_runs);
+        let mut page = last_page;
+        loop {
+            let runs = if page == 1 {
+                first_page_runs.take().unwrap_or_default()
+            } else {
+                let path =
+                    format!("repos/{repo}/actions/runs?status=queued&per_page=100&page={page}");
+                let body = github::api_json(&path)?;
+                let parsed: RunsResponse = serde_json::from_slice(&body).with_context(|| {
+                    format!("parse queued runs response for {repo} page {page}")
+                })?;
+                parsed.workflow_runs
+            };
+            oldest_runs.extend(runs);
+            if oldest_runs.len() >= cap || page == 1 {
+                break;
+            }
+            page -= 1;
+        }
+        oldest_runs.truncate(cap);
+        (oldest_runs, true)
+    };
+
     let mut queued = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let path = format!("repos/{repo}/actions/runs?status=queued&per_page=100&page={page}");
-        let body = github::api_json(&path)?;
-        let parsed: RunsResponse = serde_json::from_slice(&body)
-            .with_context(|| format!("parse queued runs response for {repo} page {page}"))?;
-        let len = parsed.workflow_runs.len();
-        for run in parsed.workflow_runs {
-            queued.extend(fetch_self_hosted_jobs(repo, &run, "queued")?);
-        }
-        if len < 100 {
-            break;
-        }
-        page = page.saturating_add(1);
+    for run in queued_runs {
+        queued.extend(fetch_self_hosted_jobs(repo, &run, "queued")?);
     }
 
     let mut in_progress = Vec::new();
@@ -437,11 +503,14 @@ fn fetch_queue_snapshot_with_fleet(
         in_progress.extend(fetch_self_hosted_jobs(repo, &run, "in_progress")?);
     }
 
-    Ok(QueueSnapshot {
-        queued,
-        in_progress,
-        fleet: fleet.or_else(|| fetch_fleet_runner_stats().ok()),
-    })
+    Ok((
+        QueueSnapshot {
+            queued,
+            in_progress,
+            fleet: fleet.or_else(|| fetch_fleet_runner_stats().ok()),
+        },
+        capped,
+    ))
 }
 
 fn report_queue_health(
@@ -1257,16 +1326,34 @@ mod tests {
     fn invariant_inv1_true_when_fleet_fully_busy_regardless_of_queue() {
         let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
         let stats = vec![stats_with_ages(Some(5.0), None)];
-        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        let sample = combine_invariant_sample(&fleet, &stats, 1000, false);
         assert!(sample.inv1);
         assert_eq!(sample.inv1_fail_class, None);
+    }
+
+    #[test]
+    fn invariant_queued_jobs_capped_flag_propagates_verbatim() {
+        // combine_invariant_sample doesn't compute this itself -- it just
+        // carries through whatever sample_invariants determined during
+        // fetching (any monitored repo's queued-run count exceeded
+        // INVARIANT_JOB_ENUMERATION_CAP). Verify both states pass through
+        // unchanged and independently of INV-1/INV-2's own outcome.
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let stats = vec![stats_with_ages(Some(5.0), None)];
+        let uncapped = combine_invariant_sample(&fleet, &stats, 1000, false);
+        let capped = combine_invariant_sample(&fleet, &stats, 1000, true);
+        assert!(!uncapped.queued_jobs_capped);
+        assert!(capped.queued_jobs_capped);
+        // Capping doesn't change what was actually measured -- only whether
+        // it's an exact count or a lower bound.
+        assert_eq!(uncapped.queued_jobs, capped.queued_jobs);
     }
 
     #[test]
     fn invariant_inv1_true_when_queue_is_empty_regardless_of_busy_count() {
         let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
         let stats = vec![stats_with_ages(None, None)];
-        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        let sample = combine_invariant_sample(&fleet, &stats, 1000, false);
         assert_eq!(sample.queued_jobs, 0);
         assert!(sample.inv1);
         assert_eq!(sample.inv1_fail_class, None);
@@ -1276,7 +1363,7 @@ mod tests {
     fn invariant_inv1_false_when_fleet_short_one_and_queue_nonempty() {
         let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
         let stats = vec![stats_with_ages(Some(5.0), None)];
-        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        let sample = combine_invariant_sample(&fleet, &stats, 1000, false);
         assert_eq!(sample.queued_jobs, 1);
         assert!(!sample.inv1);
         assert_eq!(sample.inv1_fail_class.as_deref(), Some("genuinely-idle"));
@@ -1285,19 +1372,23 @@ mod tests {
     #[test]
     fn invariant_inv2_boundary_is_inclusive_of_exactly_20_minutes() {
         let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
-        let at_threshold =
-            combine_invariant_sample(&fleet, &[stats_with_ages(Some(20.0), Some(20.0))], 1000);
+        let at_threshold = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(Some(20.0), Some(20.0))],
+            1000,
+            false,
+        );
         assert!(at_threshold.inv2, "exactly 20.0m must satisfy INV-2");
 
         let over_threshold_queued =
-            combine_invariant_sample(&fleet, &[stats_with_ages(Some(20.01), None)], 1000);
+            combine_invariant_sample(&fleet, &[stats_with_ages(Some(20.01), None)], 1000, false);
         assert!(
             !over_threshold_queued.inv2,
             "20.01m queued must violate INV-2"
         );
 
         let over_threshold_running =
-            combine_invariant_sample(&fleet, &[stats_with_ages(None, Some(20.01))], 1000);
+            combine_invariant_sample(&fleet, &[stats_with_ages(None, Some(20.01))], 1000, false);
         assert!(
             !over_threshold_running.inv2,
             "20.01m in-progress must violate INV-2"
@@ -1321,7 +1412,7 @@ mod tests {
         });
         let ezgha_stats = stats_with_ages(Some(3.0), Some(45.0));
 
-        let sample = combine_invariant_sample(&fleet, &[worldai_stats, ezgha_stats], 1000);
+        let sample = combine_invariant_sample(&fleet, &[worldai_stats, ezgha_stats], 1000, false);
 
         assert_eq!(sample.oldest_queued_job_min, 500.0);
         assert_eq!(sample.oldest_running_job_min, 45.0);
@@ -1383,6 +1474,7 @@ mod tests {
             busy: 20,
             registered: 22,
             queued_jobs: 3,
+            queued_jobs_capped: false,
             oldest_queued_job_min: 12.5,
             oldest_running_job_min: 4.0,
             inv1: false,
@@ -1403,6 +1495,7 @@ mod tests {
             "busy",
             "registered",
             "queued_jobs",
+            "queued_jobs_capped",
             "oldest_queued_job_min",
             "oldest_running_job_min",
             "inv1",
@@ -1411,7 +1504,7 @@ mod tests {
         ] {
             assert!(obj.contains_key(key), "missing schema field {key}");
         }
-        assert_eq!(obj.len(), 9, "no extra fields beyond the E1 schema");
+        assert_eq!(obj.len(), 10, "no extra fields beyond the E1 schema");
         assert_eq!(obj["busy"], 20);
         assert_eq!(obj["inv1"], false);
         assert_eq!(obj["inv1_fail_class"], "genuinely-idle");
@@ -1436,6 +1529,7 @@ mod tests {
             busy: 18,
             registered: 20,
             queued_jobs: 5,
+            queued_jobs_capped: false,
             oldest_queued_job_min: 45.0,
             oldest_running_job_min: 25.0,
             inv1: false,
