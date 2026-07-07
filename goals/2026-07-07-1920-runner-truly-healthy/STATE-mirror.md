@@ -287,7 +287,19 @@ must prevent alert spam on the same event_key). Codex quota returns ~14:52 PT
 for closing the missing-registration/offline-respawning share of INV-1
 failures.
 
-## Other task check-ins (2026-07-07 13:45 PT)
+**Design finding flagged to main (13:59 PT)**: a single invariant-sampler tick
+can take minutes (observed: alert fired 263s after the sample's own `ts`)
+because `fetch_queue_snapshot_with_fleet` makes one `gh api` call per queued
+run to fetch job-level data -- with queued_jobs=1290 this is expensive and
+likely contributes to the ongoing GitHub secondary rate limit. Real-world
+cadence may run closer to back-to-back than the nominal 240s during
+high-queue periods. Not fixing preemptively; flagged for main's call on
+priority. Also: ezgha.service restarted again 13:56:51-52 PT, not initiated
+by this session (no new commits, no systemctl call from here) -- reset the
+sampler's tick timer, next sample now expected ~14:00:52 PT. Persistent
+Monitor (task b0cjx61fg) watching for new lines in invariant_history.jsonl.
+
+## Other task check-ins (2026-07-07 13:45 PT, PR #8214 re-checked 14:00 PT: 14 SUCCESS / 5 PENDING, nearly green)
 
 - Task #4 (PR #8214): incremental progress, 7 checks SUCCESS now (was 3),
   11 still PENDING (was 15) -- queue slowly processing it. Still not
