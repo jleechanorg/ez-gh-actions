@@ -29,7 +29,7 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 7. ~~`zmk` (P1)~~ — DONE: alert contract, durable file channel, Slack/email transports, systemd failure hooks, and Gate 7 live test-send proof
 8. `ozk` (P2) — 403/429 detection + exponential backoff in run_gh; REQUIRED before any exit-after-N escalation (otherwise degraded-state restarts recreate incident-A restart storms against the API)
 9. `9yt` (P1) — Colima/Lima VM auto-restart on backend failure (cooldown + attempt cap); the 4h crash-loop class from incident A
-10. `juv` (P1) — build as a reusable GitHub run↔job↔runner correlation layer; canary dispatch + SLO alert is its first consumer (manual canary is live; daemon scheduler/ring buffer still open)
+10. `juv` (P1) — build as a reusable GitHub run↔job↔runner correlation layer; canary dispatch + SLO alert is its first consumer (manual canary live; daemon scheduler/ring buffer landed pending live scheduled proof)
 11. Degraded-state escalation (consecutive-failure counter → sd_notify STATUS → exit-after-N) — only after ozk + 9yt bound the restart loop
 
 **Phase 3 — reap + trim on the correlation layer (M–L)**
@@ -103,7 +103,9 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 - Closed `ez-gh-actions-zmk`: alerting now has a runtime durable channel, bounded Slack/sendmail transports, `test-alert`, and systemd watchdog/start-limit hooks; residual notification transport expansion should be tracked separately if needed.
 - Advanced `ez-gh-actions-qbl` without enabling live mutation: added `reaper-plan` dry-run planner, then a fake `ReaperApi` execution seam that enforces cancel -> poll -> optional force-cancel -> poll -> delete, exact job/runner revalidation, duplicate-runner-plan rejection, and fail-closed tests for every refusal path.
 - Advanced `jleechan-0q9` with a Linux-side Mac-stability fix: backend restart commands are now bounded by a 30s spawn/poll/kill timeout instead of bare `Command::status()`, with tests for success, nonzero, missing command, and hung command. `/mac` still needs install + launchd/Colima/socket/6-runner soak proof before closing.
-- Current next hardening focus: `ez-gh-actions-juv` remains open for daemon-side scheduled canary/ring-buffer behavior; Mac stability still requires `/mac` soak for `jleechan-5rv` and `jleechan-0q9`.
+- Advanced `ez-gh-actions-juv`: added daemon-side background canary scheduler, `[canary].check_interval_seconds` defaulting to 10 minutes, bounded in-memory recent-result ring buffer, early SLO timeout for canaries that never start, and alerting for successful workflows that completed outside the configured runner prefix. Post-deploy Gate 4 found GitHub can expose provisional job `started_at` before `runner_name`; canary timing now requires a matching configured runner, and scheduled canaries wait one interval after service startup to avoid colliding with manual verifier canaries. A second live failure showed generic `[self-hosted, ezgha]` selftests can run on sibling Mac runners; selftest dispatch now passes `cfg.runner.labels` through `runs_on_json` so the canary targets the active host fleet.
+- Fixed a test-harness flake exposed by the quality lane: Docker limit unit tests now inject daemon capacity instead of reading `docker` while alert tests mutate process `PATH`.
+- Current next hardening focus: deploy and prove scheduled canary telemetry live, then continue Mac `/mac` soak for `jleechan-5rv` and `jleechan-0q9`.
 
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 

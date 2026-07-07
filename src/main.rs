@@ -555,6 +555,13 @@ where
     }
 }
 
+fn run_canary_scheduler_tick<F>(run: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    run()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli)?;
@@ -702,6 +709,7 @@ fn main() -> Result<()> {
             let _watchdog_heartbeat = mark_service_ready_and_start_watchdog();
             let mut backend_recovery = BackendRecoveryState::new();
             let mut queue_monitor = queue_monitor::QueueMonitorState::new();
+            let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             loop {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
@@ -768,6 +776,8 @@ fn main() -> Result<()> {
                 if ensure_succeeded {
                     watchdog::ping();
                     let _ = run_queue_monitor_tick(|| queue_monitor.maybe_check(&cfg));
+                    watchdog::ping();
+                    let _ = run_canary_scheduler_tick(|| canary_scheduler.maybe_check(&cfg));
                 }
                 watchdog::ping();
                 std::thread::sleep(sleep);
@@ -1151,5 +1161,11 @@ mod tests {
             anyhow::bail!("synthetic queue monitor failure")
         }));
         assert!(run_queue_monitor_tick(|| Ok(None)));
+    }
+
+    #[test]
+    fn canary_scheduler_tick_is_non_fatal_to_serve_loop() {
+        assert!(run_canary_scheduler_tick(|| true));
+        assert!(!run_canary_scheduler_tick(|| false));
     }
 }

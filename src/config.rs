@@ -96,9 +96,12 @@ impl Default for QueueMonitorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CanaryConfig {
-    /// Enable future daemon-side canary scheduling. `canary-check` can still run manually.
+    /// Enable daemon-side canary scheduling. `canary-once` can still run manually.
     #[serde(default)]
     pub enabled: bool,
+    /// Minimum seconds between daemon-scheduled canary dispatches.
+    #[serde(default = "default_canary_check_interval_seconds")]
+    pub check_interval_seconds: u64,
     /// Repository containing the canary workflow as `owner/repo`. Defaults to `github.target` for repo-scoped configs.
     pub repo: Option<String>,
     /// Workflow file name or workflow id accepted by GitHub's workflow dispatch API.
@@ -124,6 +127,7 @@ impl Default for CanaryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            check_interval_seconds: default_canary_check_interval_seconds(),
             repo: None,
             workflow: default_canary_workflow(),
             ref_name: default_canary_ref(),
@@ -226,6 +230,14 @@ fn default_canary_ref() -> String {
 
 fn default_canary_slo_start_seconds() -> u64 {
     90
+}
+
+fn default_canary_check_interval_seconds() -> u64 {
+    600
+}
+
+fn minimum_canary_check_interval_seconds() -> u64 {
+    60
 }
 
 fn default_canary_poll_timeout_seconds() -> u64 {
@@ -416,6 +428,13 @@ impl Config {
         if self.canary.slo_start_seconds == 0 {
             anyhow::bail!("canary.slo_start_seconds must be at least 1");
         }
+        if self.canary.check_interval_seconds < minimum_canary_check_interval_seconds() {
+            anyhow::bail!(
+                "canary.check_interval_seconds must be at least {} (got {})",
+                minimum_canary_check_interval_seconds(),
+                self.canary.check_interval_seconds
+            );
+        }
         if self.canary.poll_timeout_seconds == 0 {
             anyhow::bail!("canary.poll_timeout_seconds must be at least 1");
         }
@@ -509,6 +528,7 @@ mod tests {
         assert_eq!(tiny.canary.workflow, "selftest.yml");
         assert_eq!(tiny.canary.ref_name, "main");
         assert_eq!(tiny.canary.slo_start_seconds, 90);
+        assert_eq!(tiny.canary.check_interval_seconds, 600);
 
         let huge = Config::defaults_for(&fake_platform(128 * 1024, 32), "o/r".into(), Scope::Repo);
         assert_eq!(huge.limits.memory_mb, 16384); // ceiling
@@ -706,6 +726,9 @@ mod tests {
         cfg.canary.slo_start_seconds = 0;
         assert!(cfg.validate().is_err());
         cfg.canary.slo_start_seconds = 90;
+        cfg.canary.check_interval_seconds = 59;
+        assert!(cfg.validate().is_err());
+        cfg.canary.check_interval_seconds = 600;
         cfg.canary.poll_timeout_seconds = 0;
         assert!(cfg.validate().is_err());
         cfg.canary.poll_timeout_seconds = 10;
@@ -739,6 +762,7 @@ minimum_isolation = "container"
         assert_eq!(cfg.queue_monitor.check_interval_seconds, 300);
         assert!(!cfg.canary.enabled);
         assert_eq!(cfg.canary.workflow, "selftest.yml");
+        assert_eq!(cfg.canary.check_interval_seconds, 600);
     }
 
     #[test]

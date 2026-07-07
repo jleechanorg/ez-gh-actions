@@ -286,11 +286,32 @@ pub fn workflow_run_force_cancel_path(repo: &str, run_id: u64) -> String {
     format!("repos/{repo}/actions/runs/{run_id}/force-cancel")
 }
 
-pub fn dispatch_workflow(repo: &str, workflow: &str, ref_name: &str, nonce: &str) -> Result<()> {
-    api_post_empty(
-        &workflow_dispatch_path(repo, workflow),
-        &[("ref", ref_name), ("inputs[nonce]", nonce)],
-    )
+pub fn dispatch_workflow(
+    repo: &str,
+    workflow: &str,
+    ref_name: &str,
+    nonce: &str,
+    runs_on_labels: &[String],
+) -> Result<()> {
+    let fields = workflow_dispatch_fields(ref_name, nonce, runs_on_labels)?;
+    let field_refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    api_post_empty(&workflow_dispatch_path(repo, workflow), &field_refs)
+}
+
+fn workflow_dispatch_fields(
+    ref_name: &str,
+    nonce: &str,
+    runs_on_labels: &[String],
+) -> Result<Vec<(String, String)>> {
+    let runs_on_json = serde_json::to_string(runs_on_labels).context("serialize canary labels")?;
+    Ok(vec![
+        ("ref".into(), ref_name.into()),
+        ("inputs[nonce]".into(), nonce.into()),
+        ("inputs[runs_on_json]".into(), runs_on_json),
+    ])
 }
 
 pub fn list_workflow_runs(repo: &str, workflow: &str, limit: u32) -> Result<Vec<WorkflowRun>> {
@@ -770,6 +791,33 @@ mod tests {
         assert_eq!(
             workflow_run_force_cancel_path("jleechanorg/ez-gh-actions", 123),
             "repos/jleechanorg/ez-gh-actions/actions/runs/123/force-cancel"
+        );
+    }
+
+    #[test]
+    fn workflow_dispatch_includes_host_specific_runner_labels() {
+        let fields = workflow_dispatch_fields(
+            "main",
+            "nonce-123",
+            &[
+                "self-hosted".into(),
+                "ezgha".into(),
+                "Linux".into(),
+                "X64".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fields,
+            vec![
+                ("ref".into(), "main".into()),
+                ("inputs[nonce]".into(), "nonce-123".into()),
+                (
+                    "inputs[runs_on_json]".into(),
+                    "[\"self-hosted\",\"ezgha\",\"Linux\",\"X64\"]".into()
+                ),
+            ]
         );
     }
 

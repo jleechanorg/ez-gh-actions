@@ -437,8 +437,12 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
 /// `count×` (bug vmz — count=16 on a 4-CPU/12-GB daemon would issue per-runner
 /// requests summing to 32 CPU + 95 GB, triggering OOM-kills).
 pub fn effective_limits(cfg: &Config) -> (f64, u64) {
+    effective_limits_with_capacity(cfg, daemon_capacity())
+}
+
+fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) -> (f64, u64) {
     let (mut cpus, mut mem) = (cfg.limits.cpus, cfg.limits.memory_mb);
-    if let Some((ncpu, daemon_mem)) = daemon_capacity() {
+    if let Some((ncpu, daemon_mem)) = capacity {
         let n_f = (cfg.runner.count as f64).max(1.0);
         let n_u = (cfg.runner.count as u64).max(1);
         // Per-runner share of the daemon, floored at validate() minimums so a
@@ -865,18 +869,10 @@ mod tests {
         cfg.runner.count = 16;
         cfg.limits.cpus = 2.0;
         cfg.limits.memory_mb = 5977;
-        // In CI/dev environments without Docker, treat this as a skip to avoid
-        // false reds; this test validates host-liveness behavior we also exercise
-        // in integration paths.
-        let Some((ncpu, daemon_mem)) = daemon_capacity() else {
-            eprintln!(
-                "effective_limits_clamps_per_runner_to_daemon_share skipped: docker daemon unavailable"
-            );
-            return;
-        };
+        let (ncpu, daemon_mem): (f64, u64) = (4.0, 12288);
         let expected_cpu_share = (ncpu / 16.0).max(0.5);
         let expected_mem_share = (daemon_mem / 16).max(512);
-        let (cpus, mem) = effective_limits(&cfg);
+        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)));
         assert!(
             cpus <= expected_cpu_share + f64::EPSILON,
             "effective_limits must clamp cpus to daemon/count (got {cpus} > {expected_cpu_share})"
@@ -894,11 +890,8 @@ mod tests {
         cfg.runner.count = 4;
         cfg.limits.cpus = 2.0;
         cfg.limits.memory_mb = 4096;
-        let Some((ncpu, daemon_mem)) = daemon_capacity() else {
-            eprintln!("effective_limits_aggregate_fits_daemon skipped: docker daemon unavailable");
-            return;
-        };
-        let (cpus, mem) = effective_limits(&cfg);
+        let (ncpu, daemon_mem): (f64, u64) = (4.0, 8192);
+        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)));
         let cpus_total = cpus * cfg.runner.count as f64;
         let mem_total = mem * cfg.runner.count as u64;
         assert!(

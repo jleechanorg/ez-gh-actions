@@ -9,13 +9,18 @@ on:
         description: "Unique dispatch nonce for ezgha canary correlation"
         required: false
         type: string
+      runs_on_json:
+        description: "JSON array of runner labels for this host's canary"
+        required: false
+        default: '["self-hosted","ezgha"]'
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   selftest:
-    runs-on: [self-hosted, ezgha]
+    runs-on: ${{ fromJSON(inputs.runs_on_json) }}
     timeout-minutes: 10
     steps:
       - name: Prove execution environment
