@@ -28,6 +28,8 @@ pub struct Config {
     pub queue_monitor: QueueMonitorConfig,
     #[serde(default)]
     pub canary: CanaryConfig,
+    #[serde(default)]
+    pub invariant_sampler: InvariantSamplerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -141,6 +143,53 @@ impl Default for CanaryConfig {
             history_path: None,
         }
     }
+}
+
+/// E1 ironclad exit-criterion sampler (goals/2026-07-07-1920-runner-truly-healthy/
+/// 02-exit-criteria-ironclad.md): evaluates INV-1 (fleet utilization) and INV-2
+/// (job duration) once per tick across the hardcoded monitored-repo list in
+/// `queue_monitor::MONITORED_INVARIANT_REPOS`, and appends one JSON line per
+/// sample to `history_path`. This is deliberately separate from
+/// `QueueMonitorConfig`, which drives a different, single-repo alerting concern.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InvariantSamplerConfig {
+    /// Enable the invariant sampler in the daemon serve loop. Defaults on
+    /// (unlike `queue_monitor.enabled`) because E1 requires this running
+    /// automatically without extra config-file surgery.
+    #[serde(default = "default_invariant_sampler_enabled")]
+    pub enabled: bool,
+    /// Minimum seconds between invariant samples. Must stay <= 300 (5 min) to
+    /// satisfy E1's sampling-cadence requirement; enforced in `validate()`.
+    #[serde(default = "default_invariant_check_interval_seconds")]
+    pub check_interval_seconds: u64,
+    /// Optional override for the durable JSONL invariant-history path.
+    /// Defaults to `$XDG_STATE_HOME/ezgha/invariant_history.jsonl`
+    /// (`~/.local/state/ezgha/...` when XDG_STATE_HOME is unset), matching
+    /// this repo's existing alerts.jsonl/canary_history.jsonl convention.
+    pub history_path: Option<PathBuf>,
+}
+
+impl Default for InvariantSamplerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_invariant_sampler_enabled(),
+            check_interval_seconds: default_invariant_check_interval_seconds(),
+            history_path: None,
+        }
+    }
+}
+
+fn default_invariant_sampler_enabled() -> bool {
+    true
+}
+
+fn default_invariant_check_interval_seconds() -> u64 {
+    240
+}
+
+fn maximum_invariant_check_interval_seconds() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -312,6 +361,7 @@ impl Config {
             },
             queue_monitor: QueueMonitorConfig::default(),
             canary: CanaryConfig::default(),
+            invariant_sampler: InvariantSamplerConfig::default(),
         }
     }
 
@@ -464,6 +514,22 @@ impl Config {
         if let Some(path) = &self.canary.history_path {
             if path.as_os_str().is_empty() {
                 anyhow::bail!("canary.history_path must not be empty when configured");
+            }
+        }
+        if self.invariant_sampler.check_interval_seconds == 0
+            || self.invariant_sampler.check_interval_seconds
+                > maximum_invariant_check_interval_seconds()
+        {
+            anyhow::bail!(
+                "invariant_sampler.check_interval_seconds must be in 1..={} to satisfy \
+                 the E1 <=5min sampling-cadence exit criterion (got {})",
+                maximum_invariant_check_interval_seconds(),
+                self.invariant_sampler.check_interval_seconds
+            );
+        }
+        if let Some(path) = &self.invariant_sampler.history_path {
+            if path.as_os_str().is_empty() {
+                anyhow::bail!("invariant_sampler.history_path must not be empty when configured");
             }
         }
         Ok(())

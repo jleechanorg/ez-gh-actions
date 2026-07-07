@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -12,6 +14,20 @@ const MAC_FLEET_PREFIX: &str = "ez-mac-runner-b-";
 const LINUX_FLEET_COUNT: u32 = 16;
 const MAC_FLEET_COUNT: u32 = 6;
 const EXPECTED_FLEET_RUNNERS: usize = (LINUX_FLEET_COUNT + MAC_FLEET_COUNT) as usize;
+
+/// Repos the E1 ironclad exit criterion requires watching for INV-1/INV-2,
+/// independent of whatever single repo `cfg.github.target`/`queue_monitor.repo`
+/// point at. Hardcoded (like `FLEET_ORG` above) rather than config-driven: this
+/// is a fixed mission requirement (goals/2026-07-07-1920-runner-truly-healthy/
+/// 02-exit-criteria-ironclad.md), not a per-deployment setting.
+pub const MONITORED_INVARIANT_REPOS: &[&str] =
+    &["jleechanorg/worldarchitect.ai", "jleechanorg/ez-gh-actions"];
+
+/// INV-2's "no job queued or in_progress > 20 min" boundary. A job at exactly
+/// 20.0 minutes satisfies the invariant (`<=`, not `<`); only strictly over 20
+/// minutes counts as a violation, matching this file's existing `tail_bad`
+/// convention (`max_current > tail_warn_minutes as f64`).
+const INVARIANT_DURATION_THRESHOLD_MINUTES: f64 = 20.0;
 
 #[derive(Debug, Default)]
 pub struct QueueMonitorState {
@@ -64,6 +80,235 @@ impl QueueMonitorState {
         }
         self.consecutive_bad
     }
+}
+
+/// E1 ironclad exit-criterion sampler. Deliberately separate from
+/// `QueueMonitorState` above: that state drives a single-repo starvation/
+/// idle-mismatch alerting concern tied to `cfg.queue_monitor`/`queue_repo(cfg)`,
+/// while this one evaluates INV-1/INV-2 across the fixed
+/// `MONITORED_INVARIANT_REPOS` list + whole fleet and is durably logged for
+/// E2's 3-hour zero-violation window, regardless of what `cfg.github.target`
+/// or `queue_monitor.repo` happen to point at.
+#[derive(Debug, Default)]
+pub struct InvariantSamplerState {
+    last_check: Option<Instant>,
+}
+
+impl InvariantSamplerState {
+    pub fn new() -> Self {
+        Self { last_check: None }
+    }
+
+    pub fn maybe_sample(&mut self, cfg: &Config) -> Result<Option<InvariantSample>> {
+        if !cfg.invariant_sampler.enabled {
+            return Ok(None);
+        }
+        let interval = Duration::from_secs(cfg.invariant_sampler.check_interval_seconds);
+        if self
+            .last_check
+            .is_some_and(|last| last.elapsed() < interval)
+        {
+            return Ok(None);
+        }
+        self.last_check = Some(Instant::now());
+
+        let sample = sample_invariants(cfg)?;
+        append_invariant_sample(cfg, &sample)?;
+        if !sample.inv1 || !sample.inv2 {
+            alert_invariant_violation(cfg, &sample)?;
+        }
+        Ok(Some(sample))
+    }
+}
+
+/// One INV-1/INV-2 sample, appended verbatim (via `serde_json::to_string`) as
+/// one JSON line to the invariant-history JSONL file. Field names and set are
+/// exactly the E1 exit-criterion schema
+/// `{ts, busy, registered, queued_jobs, oldest_queued_job_min,
+/// oldest_running_job_min, inv1, inv2, inv1_fail_class}` -- do not rename
+/// fields without updating the exit-criteria doc and any downstream reader.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InvariantSample {
+    /// Unix epoch seconds, matching this codebase's existing `ts_unix`
+    /// convention in alerts.jsonl (renamed to the exit-criterion's literal
+    /// field name `ts`; value format is still an integer, not RFC3339 --
+    /// this repo has no date-formatting dependency and every other JSONL
+    /// history file here already uses unix seconds).
+    pub ts: i64,
+    pub busy: usize,
+    pub registered: usize,
+    pub queued_jobs: usize,
+    pub oldest_queued_job_min: f64,
+    pub oldest_running_job_min: f64,
+    pub inv1: bool,
+    pub inv2: bool,
+    /// Populated only when `inv1` is false. One of "missing-registration"
+    /// (fewer than the expected 22 runners are registered at all),
+    /// "offline-respawning" (registered but not all online -- JIT
+    /// deregister/respawn churn, see docs/ed8-fleet-churn-root-cause-*.md),
+    /// or "genuinely-idle" (fully registered and online, but not picking up
+    /// queued work).
+    pub inv1_fail_class: Option<String>,
+}
+
+fn sample_invariants(cfg: &Config) -> Result<InvariantSample> {
+    let fleet = fetch_fleet_runner_stats()?;
+    let now = unix_now_secs();
+    let mut repo_stats = Vec::with_capacity(MONITORED_INVARIANT_REPOS.len());
+    for repo in MONITORED_INVARIANT_REPOS {
+        let snapshot = fetch_queue_snapshot_with_fleet(repo, Some(fleet.clone()))?;
+        repo_stats.push(queue_stats(
+            &snapshot,
+            now,
+            cfg.queue_monitor.stale_hours,
+            cfg.queue_monitor.tail_warn_minutes,
+        ));
+    }
+    Ok(combine_invariant_sample(&fleet, &repo_stats, now))
+}
+
+/// Pure combination logic, kept separate from `sample_invariants`'s network
+/// calls so the classifier + threshold math are unit-testable without a live
+/// GitHub API (mirrors how `queue_stats` above is unit-tested against
+/// hand-built `QueueSnapshot`s rather than through `fetch_queue_snapshot`).
+fn combine_invariant_sample(
+    fleet: &FleetRunnerStats,
+    repo_stats: &[QueueStats],
+    now_secs: i64,
+) -> InvariantSample {
+    let queued_jobs: usize = repo_stats.iter().map(|s| s.queued_total).sum();
+
+    // A stale (>8h) queued job is still "queued > 20 min" for INV-2's purposes
+    // even though `queue_stats` excludes it from `max_current_job_age_minutes`
+    // (that field backs a different, zombie-aware alerting concern). E1's
+    // ironclad duration invariant makes no such exception, so combine both
+    // `oldest_fresh` and `oldest_stale` here.
+    let oldest_queued_job_min = repo_stats
+        .iter()
+        .flat_map(|s| {
+            s.oldest_fresh
+                .as_ref()
+                .map(|j| j.age_minutes)
+                .into_iter()
+                .chain(s.oldest_stale.as_ref().map(|j| j.age_minutes))
+        })
+        .fold(0.0_f64, f64::max);
+    let oldest_running_job_min = repo_stats
+        .iter()
+        .map(|s| s.max_in_progress_age_minutes)
+        .fold(0.0_f64, f64::max);
+
+    // busy_count can never exceed EXPECTED_FLEET_RUNNERS (fleet_runner_stats
+    // filters to the 22 expected names only), so `>=` and `==` are
+    // operationally identical; `>=` is the defensive form.
+    let inv1 = fleet.busy_count >= EXPECTED_FLEET_RUNNERS || queued_jobs == 0;
+    let inv2 = oldest_queued_job_min <= INVARIANT_DURATION_THRESHOLD_MINUTES
+        && oldest_running_job_min <= INVARIANT_DURATION_THRESHOLD_MINUTES;
+    let inv1_fail_class = if inv1 {
+        None
+    } else {
+        Some(classify_inv1_failure(fleet).to_string())
+    };
+
+    InvariantSample {
+        ts: now_secs,
+        busy: fleet.busy_count,
+        registered: fleet.registered_count,
+        queued_jobs,
+        oldest_queued_job_min,
+        oldest_running_job_min,
+        inv1,
+        inv2,
+        inv1_fail_class,
+    }
+}
+
+/// Classify why INV-1 failed, in priority order from most to least severe:
+/// a runner that never registered at all is a bigger problem than one that
+/// registered but is offline, which is a bigger problem than one that is
+/// online but simply idle.
+fn classify_inv1_failure(fleet: &FleetRunnerStats) -> &'static str {
+    if !fleet.missing_names.is_empty() {
+        "missing-registration"
+    } else if fleet.runners.iter().any(|r| r.status != "online") {
+        "offline-respawning"
+    } else {
+        "genuinely-idle"
+    }
+}
+
+fn alert_invariant_violation(cfg: &Config, sample: &InvariantSample) -> Result<()> {
+    let mut reasons = Vec::new();
+    if !sample.inv1 {
+        reasons.push(format!(
+            "INV-1 utilization violated: busy={}/{} registered={} queued_jobs={} fail_class={}",
+            sample.busy,
+            EXPECTED_FLEET_RUNNERS,
+            sample.registered,
+            sample.queued_jobs,
+            sample.inv1_fail_class.as_deref().unwrap_or("unknown"),
+        ));
+    }
+    if !sample.inv2 {
+        reasons.push(format!(
+            "INV-2 duration violated: oldest_queued={:.1}m oldest_running={:.1}m threshold={:.0}m",
+            sample.oldest_queued_job_min,
+            sample.oldest_running_job_min,
+            INVARIANT_DURATION_THRESHOLD_MINUTES,
+        ));
+    }
+    let body = reasons.join("; ");
+    alert::notify(
+        cfg,
+        "invariant.violation",
+        Severity::Critical,
+        "ezgha fleet invariant violation (E1)",
+        &body,
+    )?;
+    eprintln!("warning: {body}");
+    Ok(())
+}
+
+fn append_invariant_sample(cfg: &Config, sample: &InvariantSample) -> Result<()> {
+    let path = invariant_history_path(cfg);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create invariant history dir {}", parent.display()))?;
+    }
+    let line =
+        serde_json::to_string(sample).context("serialize invariant sample to JSON line")?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open invariant history file {}", path.display()))?;
+    writeln!(file, "{line}")
+        .with_context(|| format!("append invariant history file {}", path.display()))?;
+    Ok(())
+}
+
+fn invariant_history_path(cfg: &Config) -> PathBuf {
+    cfg.invariant_sampler
+        .history_path
+        .clone()
+        .unwrap_or_else(default_invariant_history_path)
+}
+
+/// `$XDG_STATE_HOME/ezgha/invariant_history.jsonl`, falling back to
+/// `~/.local/state` per the XDG Base Directory spec -- mirrors
+/// `docker_backend.rs`'s `default_state_dir()` pattern (env-var driven, no
+/// `directories` crate) but targets the *state* dir, not the *config* dir,
+/// matching where this repo's alerts.jsonl/canary_history.jsonl actually live
+/// on disk today (`~/.local/state/ezgha/...`, set explicitly in
+/// `~/.config/ezgha/config.toml`'s `alert.log_path`/`canary.history_path`).
+fn default_invariant_history_path() -> PathBuf {
+    let state_home = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
+        format!("{home}/.local/state")
+    });
+    PathBuf::from(state_home)
+        .join("ezgha")
+        .join("invariant_history.jsonl")
 }
 
 fn queue_repo(cfg: &Config) -> Option<&str> {
@@ -150,6 +395,18 @@ fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
 }
 
 fn fetch_queue_snapshot(repo: &str) -> Result<QueueSnapshot> {
+    fetch_queue_snapshot_with_fleet(repo, None)
+}
+
+/// Same as `fetch_queue_snapshot`, but accepts an already-fetched
+/// `FleetRunnerStats` to avoid an extra `list_runners` API call when the
+/// caller is sampling multiple repos against the same org fleet in one tick
+/// (see `sample_invariants` below) -- API-rate-limit hygiene given how many
+/// concurrent agents hit this org's GitHub API.
+fn fetch_queue_snapshot_with_fleet(
+    repo: &str,
+    fleet: Option<FleetRunnerStats>,
+) -> Result<QueueSnapshot> {
     let mut queued = Vec::new();
     let mut page = 1u32;
     loop {
@@ -175,7 +432,7 @@ fn fetch_queue_snapshot(repo: &str) -> Result<QueueSnapshot> {
     Ok(QueueSnapshot {
         queued,
         in_progress,
-        fleet: fetch_fleet_runner_stats().ok(),
+        fleet: fleet.or_else(|| fetch_fleet_runner_stats().ok()),
     })
 }
 
@@ -930,6 +1187,269 @@ mod tests {
             .runners
             .iter()
             .any(|runner| runner.name == "ez-canary-runner-b-1"));
+    }
+
+    fn fleet_runner(name: &str, status: &str, busy: bool) -> FleetRunner {
+        FleetRunner {
+            name: name.into(),
+            status: status.into(),
+            busy,
+        }
+    }
+
+    fn full_fleet(busy_count: usize, idle_count: usize) -> FleetRunnerStats {
+        FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS,
+            busy_count,
+            idle_count,
+            missing_names: vec![],
+            runners: vec![],
+        }
+    }
+
+    fn stats_with_ages(oldest_queued: Option<f64>, oldest_in_progress: Option<f64>) -> QueueStats {
+        QueueStats {
+            queued_total: usize::from(oldest_queued.is_some()),
+            fresh_queued: usize::from(oldest_queued.is_some()),
+            stale_queued: 0,
+            in_progress_total: usize::from(oldest_in_progress.is_some()),
+            p50_wait_minutes: 0.0,
+            p90_wait_minutes: 0.0,
+            max_fresh_wait_minutes: oldest_queued.unwrap_or(0.0),
+            max_in_progress_age_minutes: oldest_in_progress.unwrap_or(0.0),
+            max_current_job_age_minutes: oldest_queued
+                .unwrap_or(0.0)
+                .max(oldest_in_progress.unwrap_or(0.0)),
+            tail_warn_minutes: 20,
+            stale_cutoff_hours: 8,
+            tail_bad: false,
+            oldest_fresh: oldest_queued.map(|age_minutes| AgedQueueJob {
+                run_id: 1,
+                job_id: 1,
+                name: "job".into(),
+                head_branch: "main".into(),
+                url: "https://github.example/runs/1".into(),
+                age_minutes,
+            }),
+            oldest_stale: None,
+            oldest_in_progress: oldest_in_progress.map(|age_minutes| AgedQueueJob {
+                run_id: 2,
+                job_id: 2,
+                name: "job".into(),
+                head_branch: "main".into(),
+                url: "https://github.example/runs/2".into(),
+                age_minutes,
+            }),
+            fleet: None,
+        }
+    }
+
+    #[test]
+    fn invariant_inv1_true_when_fleet_fully_busy_regardless_of_queue() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let stats = vec![stats_with_ages(Some(5.0), None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        assert!(sample.inv1);
+        assert_eq!(sample.inv1_fail_class, None);
+    }
+
+    #[test]
+    fn invariant_inv1_true_when_queue_is_empty_regardless_of_busy_count() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
+        let stats = vec![stats_with_ages(None, None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        assert_eq!(sample.queued_jobs, 0);
+        assert!(sample.inv1);
+        assert_eq!(sample.inv1_fail_class, None);
+    }
+
+    #[test]
+    fn invariant_inv1_false_when_fleet_short_one_and_queue_nonempty() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
+        let stats = vec![stats_with_ages(Some(5.0), None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        assert_eq!(sample.queued_jobs, 1);
+        assert!(!sample.inv1);
+        assert_eq!(sample.inv1_fail_class.as_deref(), Some("genuinely-idle"));
+    }
+
+    #[test]
+    fn invariant_inv2_boundary_is_inclusive_of_exactly_20_minutes() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let at_threshold = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(Some(20.0), Some(20.0))],
+            1000,
+        );
+        assert!(at_threshold.inv2, "exactly 20.0m must satisfy INV-2");
+
+        let over_threshold_queued = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(Some(20.01), None)],
+            1000,
+        );
+        assert!(!over_threshold_queued.inv2, "20.01m queued must violate INV-2");
+
+        let over_threshold_running = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(None, Some(20.01))],
+            1000,
+        );
+        assert!(
+            !over_threshold_running.inv2,
+            "20.01m in-progress must violate INV-2"
+        );
+    }
+
+    #[test]
+    fn invariant_oldest_ages_combine_stale_and_fresh_across_repos_via_max() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let mut worldai_stats = stats_with_ages(Some(5.0), None);
+        // A stale (>8h) zombie is still "queued > 20min" for E1's ironclad
+        // duration invariant even though queue_stats() excludes it from
+        // max_current_job_age_minutes for the unrelated starvation-alert path.
+        worldai_stats.oldest_stale = Some(AgedQueueJob {
+            run_id: 9,
+            job_id: 9,
+            name: "zombie".into(),
+            head_branch: "main".into(),
+            url: "https://github.example/runs/9".into(),
+            age_minutes: 500.0,
+        });
+        let ezgha_stats = stats_with_ages(Some(3.0), Some(45.0));
+
+        let sample = combine_invariant_sample(&fleet, &[worldai_stats, ezgha_stats], 1000);
+
+        assert_eq!(sample.oldest_queued_job_min, 500.0);
+        assert_eq!(sample.oldest_running_job_min, 45.0);
+        assert!(!sample.inv2);
+    }
+
+    #[test]
+    fn classify_inv1_failure_prioritizes_missing_registration() {
+        let fleet = FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS - 1,
+            busy_count: EXPECTED_FLEET_RUNNERS - 1,
+            idle_count: 0,
+            missing_names: vec!["ez-runner-c-16".into()],
+            runners: vec![fleet_runner("ez-mac-runner-b-1", "offline", false)],
+        };
+        assert_eq!(classify_inv1_failure(&fleet), "missing-registration");
+    }
+
+    #[test]
+    fn classify_inv1_failure_detects_offline_respawning_when_fully_registered() {
+        let fleet = FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS,
+            busy_count: EXPECTED_FLEET_RUNNERS - 1,
+            idle_count: 0,
+            missing_names: vec![],
+            runners: vec![
+                fleet_runner("ez-runner-c-1", "online", true),
+                fleet_runner("ez-runner-c-2", "offline", false),
+            ],
+        };
+        assert_eq!(classify_inv1_failure(&fleet), "offline-respawning");
+    }
+
+    #[test]
+    fn classify_inv1_failure_falls_back_to_genuinely_idle() {
+        let fleet = FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS,
+            busy_count: EXPECTED_FLEET_RUNNERS - 1,
+            idle_count: 1,
+            missing_names: vec![],
+            runners: vec![
+                fleet_runner("ez-runner-c-1", "online", true),
+                fleet_runner("ez-runner-c-2", "online", false),
+            ],
+        };
+        assert_eq!(classify_inv1_failure(&fleet), "genuinely-idle");
+    }
+
+    #[test]
+    fn append_invariant_sample_writes_exact_schema_fields() {
+        let (mut cfg, dir, _log) = test_config_with_log();
+        let history = dir.join("invariant_history.jsonl");
+        cfg.invariant_sampler.history_path = Some(history.clone());
+        let sample = InvariantSample {
+            ts: 1_700_000_000,
+            busy: 20,
+            registered: 22,
+            queued_jobs: 3,
+            oldest_queued_job_min: 12.5,
+            oldest_running_job_min: 4.0,
+            inv1: false,
+            inv2: true,
+            inv1_fail_class: Some("genuinely-idle".into()),
+        };
+
+        append_invariant_sample(&cfg, &sample).unwrap();
+        append_invariant_sample(&cfg, &sample).unwrap();
+
+        let raw = fs::read_to_string(&history).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "one JSON line appended per sample");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        for key in [
+            "ts",
+            "busy",
+            "registered",
+            "queued_jobs",
+            "oldest_queued_job_min",
+            "oldest_running_job_min",
+            "inv1",
+            "inv2",
+            "inv1_fail_class",
+        ] {
+            assert!(obj.contains_key(key), "missing schema field {key}");
+        }
+        assert_eq!(obj.len(), 9, "no extra fields beyond the E1 schema");
+        assert_eq!(obj["busy"], 20);
+        assert_eq!(obj["inv1"], false);
+        assert_eq!(obj["inv1_fail_class"], "genuinely-idle");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invariant_history_path_honors_config_override() {
+        let (mut cfg, dir, _log) = test_config_with_log();
+        let custom = dir.join("custom-invariant-history.jsonl");
+        cfg.invariant_sampler.history_path = Some(custom.clone());
+        assert_eq!(invariant_history_path(&cfg), custom);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn alert_invariant_violation_reports_both_invariants_when_both_fail() {
+        alert::clear_alert_state();
+        let (cfg, dir, log) = test_config_with_log();
+        let sample = InvariantSample {
+            ts: 1_700_000_000,
+            busy: 18,
+            registered: 20,
+            queued_jobs: 5,
+            oldest_queued_job_min: 45.0,
+            oldest_running_job_min: 25.0,
+            inv1: false,
+            inv2: false,
+            inv1_fail_class: Some("missing-registration".into()),
+        };
+
+        alert_invariant_violation(&cfg, &sample).unwrap();
+
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("\"event_key\":\"invariant.violation\""));
+        assert!(raw.contains("\"severity\":\"CRITICAL\""));
+        assert!(raw.contains("INV-1 utilization violated"));
+        assert!(raw.contains("INV-2 duration violated"));
+        assert!(raw.contains("fail_class=missing-registration"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn bad_stats() -> QueueStats {
