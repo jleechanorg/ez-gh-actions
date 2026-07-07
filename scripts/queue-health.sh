@@ -87,7 +87,7 @@ p90 = pct(fresh_ages_min, 0.9)
 mx = max(fresh_ages_min) if fresh_ages_min else 0.0
 
 oldest_fresh = min(fresh, key=lambda x: x[1]["created_at"])[1] if fresh else None
-oldest_stale = max(stale, key=lambda x: x[1]["created_at"])[1] if stale else None
+oldest_stale = max(stale, key=lambda x: x[0])[1] if stale else None
 
 print(f'export QUEUE_QUEUED_TOTAL={len(runs)}')
 print(f'export QUEUE_QUEUED_FRESH={len(fresh)}')

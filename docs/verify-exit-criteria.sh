@@ -27,23 +27,67 @@ count_nonempty_lines() {
 }
 
 is_rate_limit_text() {
-    echo "$1" | grep -Eiq 'rate limit|secondary rate limit|abuse|HTTP 403|HTTP 429|Retry-After'
+    echo "$1" | grep -Eiq 'rate limit|secondary rate limit|abuse|HTTP 429|Retry-After'
+}
+
+is_transient_gh_text() {
+    echo "$1" | grep -Eiq 'unexpected end of JSON input|HTTP/2[.]0 500|HTTP 500|internal server error'
+}
+
+retry_after_seconds() {
+    echo "$1" | grep -Eio 'Retry-After:[[:space:]]*[0-9]+|retry after[[:space:]]+[0-9]+' | grep -Eo '[0-9]+' | head -1
 }
 
 gh_checked() {
-    local out status
-    if out=$(gh "$@" 2>&1); then
-        printf '%s' "$out"
-        return 0
-    fi
-    status=$?
-    if is_rate_limit_text "$out"; then
-        echo "GitHub API rate-limited while running: gh $*" >&2
-    else
-        echo "GitHub API command failed while running: gh $*" >&2
-    fi
-    echo "$out" >&2
-    return "$status"
+    local out err combined status attempt delay retry_after err_file
+    delay=2
+    err_file=$(mktemp) || return 1
+    for attempt in 1 2 3 4 5; do
+        : > "$err_file"
+        if out=$(gh "$@" 2>"$err_file"); then
+            err=$(cat "$err_file")
+            if [ -n "$err" ] && { is_rate_limit_text "$err" || is_transient_gh_text "$err"; }; then
+                status=1
+                combined="${err}
+${out}"
+            else
+                if [ -n "$err" ]; then
+                    echo "$err" >&2
+                fi
+                rm -f "$err_file"
+                printf '%s' "$out"
+                return 0
+            fi
+        else
+            status=$?
+            err=$(cat "$err_file")
+            combined="${err}
+${out}"
+        fi
+        if [ "$attempt" -lt 5 ] && { is_rate_limit_text "$combined" || is_transient_gh_text "$combined"; }; then
+            retry_after=$(retry_after_seconds "$combined" || true)
+            if [ -n "$retry_after" ] && [ "$retry_after" -le 60 ]; then
+                delay="$retry_after"
+            elif [ -n "$retry_after" ]; then
+                echo "GitHub API rate-limited while running: gh $*; Retry-After=${retry_after}s exceeds verifier retry budget" >&2
+                echo "$combined" >&2
+                rm -f "$err_file"
+                return "$status"
+            fi
+            echo "GitHub API retryable failure while running: gh $*; retrying in ${delay}s (attempt ${attempt}/5)" >&2
+            sleep "$delay"
+            if [ "$delay" -lt 16 ]; then delay=$((delay * 2)); fi
+            continue
+        fi
+        if is_rate_limit_text "$combined"; then
+            echo "GitHub API rate-limited while running: gh $*" >&2
+        else
+            echo "GitHub API command failed while running: gh $*" >&2
+        fi
+        echo "$combined" >&2
+        rm -f "$err_file"
+        return "$status"
+    done
 }
 
 toml_get_runner() {
@@ -172,23 +216,24 @@ if [ -z "$COUNT" ]; then
     fail "Could not parse runner.count from $CONFIG_FILE"
 fi
 
-RAW_RUNNERS=$(gh api orgs/jleechanorg/actions/runners --paginate 2>/dev/null || echo '{"runners":[]}')
-ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.runners[] | select(.name | startswith($p)) | select(.status == "online") | .name')
+RAW_RUNNERS=$(gh_checked api orgs/jleechanorg/actions/runners --paginate --slurp) || fail "Unable to list GitHub runners after retries"
+ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.[]?.runners[]? | select(.name | startswith($p)) | select(.status == "online") | .name') || fail "Gate 3: Unable to parse GitHub runner list"
 ONLINE_COUNT=$(count_nonempty_lines "$ONLINE_RUNNERS")
-BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.busy == true)] | length')
+BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.[]?.runners[]? | select(.name | startswith($p)) | select(.busy == true)] | length') || fail "Gate 3: Unable to parse busy runner count"
 EFFECTIVE_CAPACITY=$((ONLINE_COUNT))
 # Note: busy runners are a subset of online runners; adding both double-counts
 # them. EFFECTIVE_CAPACITY = total online (which already includes busy runners).
 
 # Check offline runners
-OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.status == "offline")] | length')
+OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.[]?.runners[]? | select(.name | startswith($p)) | select(.status == "offline")] | length') || fail "Gate 3: Unable to parse offline runner count"
 
 # Local container check
 CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null | wc -l)
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 
 # Validate runner names match expected format (prefix-N)
-INVALID_NAMES=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.runners[] | select(.name | startswith($p)) | .name' | grep -vE "^.+-[0-9]+$" || true)
+INVALID_NAMES=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.[]?.runners[]? | select(.name | startswith($p)) | .name') || fail "Gate 3: Unable to parse runner names"
+INVALID_NAMES=$(echo "$INVALID_NAMES" | grep -vE "^.+-[0-9]+$" || true)
 if [ -n "$INVALID_NAMES" ]; then
     fail "Invalid runner names registered on GitHub:\n$INVALID_NAMES"
 fi
@@ -279,15 +324,16 @@ if ! echo "$ALERT_TEST_OUT" | grep -q "test alert delivered"; then
     fail "Gate 7: Alert test-send did not report delivery: $ALERT_TEST_OUT"
 fi
 
-if ! gh api rate_limit >/dev/null 2>&1; then
+if ! gh_checked api rate_limit >/dev/null; then
     fail "Gate 7: Unable to query rate limit (GitHub API down)"
 fi
 pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
 
 # --- Gate 10: GitHub API budget ---
 echo "--- Checking Gate 10: GitHub API budget ---"
-REMAINING_API=$(gh api rate_limit --jq '.resources.core.remaining')
-LIMIT_API=$(gh api rate_limit --jq '.resources.core.limit')
+RATE_LIMIT_JSON=$(gh_checked api rate_limit) || fail "Gate 10: Unable to query rate limit (GitHub API down)"
+REMAINING_API=$(echo "$RATE_LIMIT_JSON" | jq -r '.resources.core.remaining')
+LIMIT_API=$(echo "$RATE_LIMIT_JSON" | jq -r '.resources.core.limit')
 MIN_API=$((LIMIT_API / 5)) # 20%
 if [ "$REMAINING_API" -lt "$MIN_API" ]; then
     fail "GitHub API core budget remaining ($REMAINING_API) is less than 20% of limit ($LIMIT_API)"

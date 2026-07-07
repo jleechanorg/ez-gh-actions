@@ -33,7 +33,7 @@ If `fleet unhealthy`, continue. **Never restart-loop the service** — see
 ### Stuck queue cleanup
 
 ```bash
-./scripts/cleanup-stuck-runs.sh              # zombies (>24h, gh run delete) + fresh tail (>45m, cancel)
+./scripts/cleanup-stuck-runs.sh              # zombies (>8h by default, gh run delete) + fresh tail (>45m, cancel)
 ./scripts/cleanup-stuck-runs.sh --zombies    # delete only ancient queued artifacts
 ./scripts/cleanup-stuck-runs.sh --tail       # cancel only fresh runs waiting >45m
 ./scripts/cleanup-stuck-runs.sh --dry-run    # preview
@@ -50,10 +50,10 @@ Fresh tail: cancels real PR CI — only run when queue tail > `QUEUE_TAIL_WARN_M
 |--------|---------|-----------|
 | Fresh queue max wait | ≤ 20 min | > 20 min → **BAD** (saturation or mis-routing) |
 | Fresh queued count | low / draining | growing while all runners `busy=true` |
-| Stale queued (>24h) | 0 ideal | zombies inflate counts — cancel with `gh run cancel` |
+| Stale queued (>8h default) | 0 ideal | zombies inflate counts — delete with `gh run delete` |
 | `in_progress` | matches busy runner count | stuck with 0 progress |
 
-Env overrides: `QUEUE_REPO`, `QUEUE_TAIL_WARN_MIN` (default 20), `STALE_HOURS` (default 24).
+Env overrides: `QUEUE_REPO`, `QUEUE_TAIL_WARN_MIN` (default 20), `STALE_HOURS` (default 8).
 
 Standalone:
 ```bash

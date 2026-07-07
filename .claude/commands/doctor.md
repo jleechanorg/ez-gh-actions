@@ -19,7 +19,7 @@ When this command is invoked, immediately execute the following steps:
    - `in_progress` / `queued` counts on `QUEUE_REPO` (default `jleechanorg/worldarchitect.ai`)
    - Fresh queue p50 / p90 / max wait (minutes)
    - Oldest fresh queued run (actionable backlog)
-   - Stale queued zombies (>24h — GitHub artifacts, not waiting for runners)
+   - Stale queued zombies (>8h by default — GitHub artifacts, not waiting for runners)
    - **BAD if max fresh wait > 20 min** (`QUEUE_TAIL_WARN_MIN`, default 20)
 
 2. **If unhealthy OR queue tail > 20 min, run `/harness`** (mandatory):
@@ -39,9 +39,9 @@ When this command is invoked, immediately execute the following steps:
    * **Service inactive**: `ezgha install-service` then restart supervisor
    * **Docker/Colima down**: `colima start` or `limactl start colima`
    * **Slot file wedge**: stop service → `rm -f ~/.config/ezgha/slot_assignments.toml` → restart
-   * **Queue tail > 20m**: verify runners busy (saturation) vs offline; cancel stale zombies:
+   * **Queue tail > 20m**: verify runners busy (saturation) vs offline; delete stale zombies:
      ```bash
-     gh run cancel <stale_run_id> -R jleechanorg/worldarchitect.ai
+     gh run delete <stale_run_id> -R jleechanorg/worldarchitect.ai
      ```
    * **Offline runners**: prune only when not busy (use configured `name_prefix` from config.toml)
 

@@ -7,13 +7,13 @@
 #
 # Usage:
 #   ./scripts/cleanup-stuck-runs.sh              # zombies + fresh tail
-#   ./scripts/cleanup-stuck-runs.sh --zombies    # delete only >24h artifacts
+#   ./scripts/cleanup-stuck-runs.sh --zombies    # delete only >STALE_HOURS artifacts
 #   ./scripts/cleanup-stuck-runs.sh --tail       # cancel only fresh tail >45m
 #   ./scripts/cleanup-stuck-runs.sh --dry-run    # report only
 set -euo pipefail
 
 QUEUE_REPO="${QUEUE_REPO:-jleechanorg/worldarchitect.ai}"
-STALE_HOURS="${STALE_HOURS:-24}"
+STALE_HOURS="${STALE_HOURS:-8}"
 FRESH_TAIL_MIN="${FRESH_TAIL_MIN:-45}"
 DRY_RUN=0
 DO_ZOMBIES=1
