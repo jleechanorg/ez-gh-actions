@@ -84,3 +84,22 @@ sanctioned levers alone — they were already run and only reclaim ~1% of backlo
 The right framing for E2/E5 sign-off is: INV-1 will very likely keep failing during
 periods of high concurrent-agent activity on this box, for capacity reasons outside
 ez-gh-actions' own code, not because the daemon or monitor is broken.
+
+## Update: measured JOB-level demand is much higher than the run-level estimate
+
+The E1 daemon-native sampler's first real sample (ts=1783457458, ~13:51 PT,
+`~/.local/state/ezgha/invariant_history.jsonl`) measured
+**`queued_jobs: 1290`** — the actual count of queued self-hosted JOBS across
+both monitored repos, not run objects. This is the ground-truth number the
+goal doc's own opening caution warned about ("run-object counts are FORBIDDEN
+as a measurement... proven misleading"): the ~509-520 run-level figure used
+above undercounts true demand. 1290 jobs / ~509 runs ≈ 2.5 self-hosted jobs
+per run, which is in the same ballpark as this doc's earlier "~2-4 jobs per
+run" assumption, but now measured rather than assumed, and the absolute
+number (1290 queued jobs against 22 runner-equivalents) makes the gap far
+starker: oldest_queued_job_min was 72.05 at that sample (3.6x the 20-min
+threshold), and INV-1 failed with `inv1_fail_class: "missing-registration"`
+(only 19 of 22 expected runners registered at sample time — see
+ez-gh-actions-po2, the durable respawn-pacing fix bead, for that half of the
+gap). Going forward, `queued_jobs` from invariant_history.jsonl (not run
+counts) is the authoritative demand metric for this finding.

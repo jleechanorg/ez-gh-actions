@@ -258,6 +258,35 @@ Rust rather than waiting for the Codex usage-limit reset:
 - Daemon restarted again at 13:47:49 PT for the above fix -- next tick
   expected ~13:51:49 PT. Verification in progress (Monitor task bd7pfq3zj).
 
+**TASK #6 COMPLETE (2026-07-07 13:56 PT).** First real sample confirmed landed
+and verified directly (not just via main's relay):
+`{"ts":1783457458,"busy":19,"registered":19,"queued_jobs":1290,"oldest_queued_job_min":72.05,"oldest_running_job_min":0.0,"inv1":false,"inv2":false,"inv1_fail_class":"missing-registration"}`.
+Classifier correctly identified missing-registration (19/22 registered) as the
+INV-1 failure mode -- matches the ed8 churn pattern this mission already
+root-caused. Updated goals/.../03-capacity-finding-queue-growth.md with the
+corrected JOB-level demand number (1290 queued self-hosted jobs, not the
+~509-520 run-level figure used in the original analysis) -- this is now the
+authoritative demand metric going forward, superseding run counts per the
+goal doc's own original warning about run-object counts being misleading.
+
+**E2 window status**: cannot start accumulating a green streak yet -- this
+first sample already violates both INV-1 and INV-2. E2 requires 3 CONTINUOUS
+hours with ZERO violated samples; the window start timestamp will be logged
+here the moment a qualifying all-clear run begins, not before. Given the
+capacity finding (task #5) already established organic demand structurally
+exceeds fleet capacity much of the time, a clean 3-hour window may only be
+achievable during a genuine demand lull -- this is expected, not a bug in the
+sampler.
+
+**Ongoing per main's direction**: watching samples over the coming hour for
+cadence (~240s), confirming UNKNOWN handling holds on any further rate-limit
+hits (no spurious pass/fail rows), and Slack alert delivery + cooldown
+behavior now that essentially every sample is currently a violation (cooldown
+must prevent alert spam on the same event_key). Codex quota returns ~14:52 PT
+-- dispatch ez-gh-actions-po2 (respawn-pacing) then, it's the biggest lever
+for closing the missing-registration/offline-respawning share of INV-1
+failures.
+
 ## Other task check-ins (2026-07-07 13:45 PT)
 
 - Task #4 (PR #8214): incremental progress, 7 checks SUCCESS now (was 3),
