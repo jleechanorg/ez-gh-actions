@@ -694,3 +694,70 @@ Host load has been drifting up somewhat during this window (up to 9.09 most
 recently) -- still well under the 24 watchdog ceiling and my 15
 degradation-alert threshold, but worth watching; if it keeps climbing, po2
 landing sooner rather than later becomes more valuable, not just nice-to-have.
+
+**MILESTONE**: sample ts=1783464699 (~15:31 PT) recorded the mission's FIRST
+all-clear: `{"busy":16,"registered":16,"queued_jobs":0,"inv1":true,"inv2":true,
+"inv1_fail_class":null}`. Queue genuinely drained to 0 at that moment. Brief
+(next sample already back to inv1=false), not a sustained window, but proves
+the daemon and E2 sampler both correctly recognize and record a clean state
+when one occurs -- confirms the invariant math end-to-end, not just the
+violation path.
+
+## Ultracode BLOCK verdict on po2 + demand-cut plan (2026-07-07 15:54-15:57 PT)
+
+Full review committed (goals/.../05-ultracode-po2-review-and-demand-plan.md,
+commit 546d6aa, pushed). **VERDICT: BLOCK** -- 1 confirmed CRITICAL + 13
+major/minor findings. The critical: batch-boundary load checks race a
+lagging 1-min loadavg EMA -- quantified, with the shipped defaults (batch=4,
+sleep=5s), all 4 batches clear the gate within ~30-55s of a cold start
+because the EMA has only captured ~8-22% of the true load delta by each
+check, so **the exact loadavg-71 incident this diff exists to prevent can
+still reproduce, just delayed 30-90s**. Also confirmed: pacing runs inside
+`ensure_count` BEFORE `loop_start`-relative monitor deadlines are computed,
+so a paced respawn (up to ~255s under sustained load) can blow past
+`SERVE_LOOP_TIME_BUDGET` and silently degrade monitor fetches -- an almost
+exact mirror of the original starvation bug, reintroduced by the fix meant
+to prevent a DIFFERENT failure mode. My own review missed both of these.
+
+**Dispatched 3 codex workers in parallel** (all confirmed alive):
+1. **po2 redesign** (same branch, `~/projects/ez-gh-actions-wt-po2`,
+   `sidekick/po2-respawn-pacing`): 6-point brief -- fixed conservative
+   schedule as PRIMARY safety (new defaults batch_size=2/sleep=30s, sized
+   from the incident's own ~4.4 load-units/runner ratio), loadavg becomes a
+   secondary brake only; max-wait-timeout proceeds with batch-of-1 not a full
+   batch; fix SERVE_LOOP_TIME_BUDGET starvation (fresh Instant for monitor
+   deadlines captured AFTER ensure_count returns); partial-success
+   visibility (don't reset ensure_fail_streak on <50% success); non-Linux
+   warn-once; and a REAL safety-property test (simulated lagging EMA fed by
+   actual start events, asserting it never exceeds threshold during a
+   16-runner cold start -- must fail against the OLD defaults as a sanity
+   check). STILL HELD pending another review pass before merge -- this
+   redesign itself needs re-review, not an automatic pass.
+2. **demand-cut PR-1** (worldarchitect.ai, `~/projects/worldarchitect.ai-wt-demand-pr1`,
+   `sidekick/demand-cut-pr1-quickwins`): all 13 quick-win items from the
+   review's table (green-gate.yml drop `edited` trigger + job-level
+   cancel-in-progress, design-doc-gate.yml drop `edited`, auto-deploy paths-
+   ignore, presubmit/test.yml job consolidations, resolve-context jobs to
+   ubuntu-latest, codex-skill-sync to ubuntu-latest, delete redundant
+   test-self-hosted-runner.yml, beads paths filters, cost-report + janitor
+   merges).
+3. **demand-cut PR-2** (worldarchitect.ai, `~/projects/worldarchitect.ai-wt-demand-pr2`,
+   `sidekick/demand-cut-pr2-timeouts`): full E4 timeout-cap lint table -- 8
+   jobs needing a documented E4 EXCEPTION (>20min genuinely justified), 6
+   jobs to tighten with no exception needed, 14 jobs with zero timeout today
+   getting one added.
+
+**NOT dispatching PR-3** (needs-user-judgment cuts: draft-skip conditions on
+test.yml/presubmit.yml/coverage.yml self-hosted jobs, a paths: filter on
+self-hosted-mvp-shard1.yml) -- per main, these are value tradeoffs going to
+the user directly, not lane-F implementation.
+
+**Live confirmation the risk is real**: while writing this, another session's
+service restart triggered an 8-runner respawn burst (not paced -- the
+currently-deployed binary predates po2 entirely) and host load spiked to
+12.44 within seconds, then subsided to ~9-11 without reaching the watchdog
+ceiling this time. A smaller-scale, live example of exactly the failure mode
+po2 (once fixed) is meant to prevent.
+
+Will message main READY TO MERGE per PR (po2 redesign, demand PR-1, demand
+PR-2) as each clears its own review/checks, matching the PR #8214 pattern.
