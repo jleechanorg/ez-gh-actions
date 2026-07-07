@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod alert;
 mod backend;
+mod canary;
 mod config;
 mod docker_backend;
 mod github;
@@ -67,6 +68,18 @@ enum Commands {
         /// Event key used for cooldown tracking
         #[arg(long, default_value = "operator.test")]
         event_key: String,
+    },
+    /// Dispatch one nonce-tracked canary workflow and verify the exact run/job/runner.
+    CanaryOnce {
+        /// Override [canary].poll_timeout_seconds for this one-shot proof
+        #[arg(long)]
+        timeout_seconds: Option<u64>,
+        /// Do not send configured alerts even if the canary breaches SLO
+        #[arg(long)]
+        no_alert: bool,
+        /// Override generated nonce, useful for deterministic manual tests
+        #[arg(long)]
+        nonce: Option<String>,
     },
     /// Internal systemd failure hook installed by `install-service`
     #[command(hide = true)]
@@ -754,6 +767,31 @@ fn main() -> Result<()> {
         Commands::TestAlert { event_key } => {
             let cfg = Config::load(&path)?;
             run_test_alert(&cfg, event_key)?;
+        }
+        Commands::CanaryOnce {
+            timeout_seconds,
+            no_alert,
+            nonce,
+        } => {
+            let cfg = Config::load(&path)?;
+            let result = canary::run_once(&cfg, *timeout_seconds, nonce.clone(), !no_alert)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if result.status != "completed" {
+                bail!("canary did not complete: status={}", result.status);
+            }
+            if result.runner_name.is_none() {
+                bail!("canary completed without a matching configured runner prefix");
+            }
+            if result.conclusion.as_deref() != Some("success") {
+                bail!("canary conclusion was not success: {:?}", result.conclusion);
+            }
+            if result.slo_breached {
+                bail!(
+                    "canary breached start SLO: time_to_start={:?}s threshold={}s",
+                    result.time_to_start_seconds,
+                    result.slo_start_seconds
+                );
+            }
         }
         Commands::SystemdAlertHook { source, unit } => {
             let cfg = Config::load(&path)?;

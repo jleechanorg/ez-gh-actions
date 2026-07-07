@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Regression test for Gate 4: a transient/rate-limited jobs lookup for one
-# selftest run must not abort the whole verifier when a later run proves
-# prefix-aligned execution.
+# Regression test for Gate 4: the verifier must use a fresh nonce-tracked
+# canary proof from `ezgha canary-once`, not stale historical selftest runs.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
@@ -14,6 +13,29 @@ cat >"$TMP/home/.cargo/bin/ezgha" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = "--config" ] && [ "\${3:-}" = "test-alert" ]; then
   echo "test alert delivered for event_key=\${5:-test}"
+  exit 0
+fi
+if [ "\${1:-}" = "--config" ] && [ "\${3:-}" = "canary-once" ]; then
+  cat <<'JSON'
+{
+  "nonce": "ezgha-canary-test",
+  "repo": "jleechanorg/ez-gh-actions",
+  "workflow": "selftest.yml",
+  "run_id": 777,
+  "job_id": 888,
+  "runner_name": "ez-runner-test-2",
+  "status": "completed",
+  "conclusion": "success",
+  "queued_at": "2026-07-07T08:00:00Z",
+  "started_at": "2026-07-07T08:00:10Z",
+  "completed_at": "2026-07-07T08:00:20Z",
+  "time_to_start_seconds": 10,
+  "time_to_complete_seconds": 20,
+  "slo_start_seconds": 90,
+  "slo_breached": false,
+  "url": "https://github.example/runs/777"
+}
+JSON
   exit 0
 fi
 echo "ezgha 0.1.0-$(git -C "$ROOT" rev-parse --short HEAD)"
@@ -81,31 +103,6 @@ EOF
 
 cat >"$TMP/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-if [ "$1" = "run" ] && [ "$2" = "list" ]; then
-  cat <<'JSON'
-[
-  {"databaseId":111,"status":"completed","conclusion":"success"},
-  {"databaseId":222,"status":"completed","conclusion":"success"},
-  {"databaseId":333,"status":"completed","conclusion":"success"},
-  {"databaseId":444,"status":"completed","conclusion":"success"},
-  {"databaseId":555,"status":"completed","conclusion":"success"},
-  {"databaseId":666,"status":"completed","conclusion":"success"}
-]
-JSON
-  exit 0
-fi
-
-if [ "$1" = "api" ] && [[ "$2" == *"/actions/runs/111/jobs" ]]; then
-  echo "HTTP 403: You have exceeded a secondary rate limit" >&2
-  exit 1
-fi
-
-if [ "$1" = "api" ] && [[ "$2" =~ /actions/runs/(222|333|444|555|666)/jobs ]]; then
-  rid="${BASH_REMATCH[1]}"
-  printf '{"jobs":[{"runner_name":"ez-runner-test-%d"}]}\n' "$((rid / 111))"
-  exit 0
-fi
-
 if [ "$1" = "api" ] && [ "$2" = "orgs/jleechanorg/actions/runners" ]; then
   cat <<'JSON'
 {"runners":[
@@ -132,5 +129,5 @@ EOF
 chmod +x "$TMP/bin/"*
 
 PATH="$TMP/bin:$PATH" HOME="$TMP/home" "$ROOT/docs/verify-exit-criteria.sh" >/tmp/ezgha-gate4-test.out
-rg -q "Prefix-aligned selftest run: 222 on ez-runner-test-2" /tmp/ezgha-gate4-test.out
-rg -q "Prefix-aligned selftest run: 666 on ez-runner-test-6" /tmp/ezgha-gate4-test.out
+rg -q "Fresh canary run 777 started on ez-runner-test-2 in 10s" /tmp/ezgha-gate4-test.out
+rg -q "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet" /tmp/ezgha-gate4-test.out

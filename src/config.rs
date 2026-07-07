@@ -22,6 +22,8 @@ pub struct Config {
     pub alert: AlertConfig,
     #[serde(default)]
     pub queue_monitor: QueueMonitorConfig,
+    #[serde(default)]
+    pub canary: CanaryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,6 +89,48 @@ impl Default for QueueMonitorConfig {
             check_interval_seconds: default_queue_check_interval_seconds(),
             stale_hours: default_queue_stale_hours(),
             consecutive_alert_threshold: default_queue_consecutive_alert_threshold(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryConfig {
+    /// Enable future daemon-side canary scheduling. `canary-check` can still run manually.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Repository containing the canary workflow as `owner/repo`. Defaults to `github.target` for repo-scoped configs.
+    pub repo: Option<String>,
+    /// Workflow file name or workflow id accepted by GitHub's workflow dispatch API.
+    #[serde(default = "default_canary_workflow")]
+    pub workflow: String,
+    /// Git ref used for workflow_dispatch.
+    #[serde(default = "default_canary_ref")]
+    pub ref_name: String,
+    /// Warn/alert when dispatch-to-runner-start exceeds this many seconds.
+    #[serde(default = "default_canary_slo_start_seconds")]
+    pub slo_start_seconds: u64,
+    /// Maximum seconds a one-shot canary check waits for completion.
+    #[serde(default = "default_canary_poll_timeout_seconds")]
+    pub poll_timeout_seconds: u64,
+    /// Seconds between canary run/job polls.
+    #[serde(default = "default_canary_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// Optional durable JSONL canary history path.
+    pub history_path: Option<PathBuf>,
+}
+
+impl Default for CanaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: None,
+            workflow: default_canary_workflow(),
+            ref_name: default_canary_ref(),
+            slo_start_seconds: default_canary_slo_start_seconds(),
+            poll_timeout_seconds: default_canary_poll_timeout_seconds(),
+            poll_interval_seconds: default_canary_poll_interval_seconds(),
+            history_path: None,
         }
     }
 }
@@ -172,6 +216,26 @@ fn default_queue_consecutive_alert_threshold() -> u32 {
     2
 }
 
+fn default_canary_workflow() -> String {
+    "selftest.yml".into()
+}
+
+fn default_canary_ref() -> String {
+    "main".into()
+}
+
+fn default_canary_slo_start_seconds() -> u64 {
+    90
+}
+
+fn default_canary_poll_timeout_seconds() -> u64 {
+    600
+}
+
+fn default_canary_poll_interval_seconds() -> u64 {
+    15
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -230,6 +294,7 @@ impl Config {
                 log_path: None,
             },
             queue_monitor: QueueMonitorConfig::default(),
+            canary: CanaryConfig::default(),
         }
     }
 
@@ -330,6 +395,41 @@ impl Config {
                 "queue_monitor.repo is required when queue_monitor.enabled=true and github.scope is org"
             );
         }
+        if let Some(repo) = &self.canary.repo {
+            if !is_owner_repo(repo) {
+                anyhow::bail!(
+                    "canary.repo must be exactly \"owner/repo\" when configured (got {:?})",
+                    repo
+                );
+            }
+        } else if self.canary.enabled && self.github.scope != Scope::Repo {
+            anyhow::bail!(
+                "canary.repo is required when canary.enabled=true and github.scope is org"
+            );
+        }
+        if self.canary.workflow.trim().is_empty() {
+            anyhow::bail!("canary.workflow must not be empty");
+        }
+        if self.canary.ref_name.trim().is_empty() {
+            anyhow::bail!("canary.ref_name must not be empty");
+        }
+        if self.canary.slo_start_seconds == 0 {
+            anyhow::bail!("canary.slo_start_seconds must be at least 1");
+        }
+        if self.canary.poll_timeout_seconds == 0 {
+            anyhow::bail!("canary.poll_timeout_seconds must be at least 1");
+        }
+        if self.canary.poll_interval_seconds == 0 {
+            anyhow::bail!("canary.poll_interval_seconds must be at least 1");
+        }
+        if self.canary.poll_interval_seconds > self.canary.poll_timeout_seconds {
+            anyhow::bail!("canary.poll_interval_seconds must be <= canary.poll_timeout_seconds");
+        }
+        if let Some(path) = &self.canary.history_path {
+            if path.as_os_str().is_empty() {
+                anyhow::bail!("canary.history_path must not be empty when configured");
+            }
+        }
         Ok(())
     }
 
@@ -405,6 +505,10 @@ mod tests {
         assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
         assert_eq!(tiny.queue_monitor.stale_hours, 24);
         assert_eq!(tiny.queue_monitor.consecutive_alert_threshold, 2);
+        assert!(!tiny.canary.enabled);
+        assert_eq!(tiny.canary.workflow, "selftest.yml");
+        assert_eq!(tiny.canary.ref_name, "main");
+        assert_eq!(tiny.canary.slo_start_seconds, 90);
 
         let huge = Config::defaults_for(&fake_platform(128 * 1024, 32), "o/r".into(), Scope::Repo);
         assert_eq!(huge.limits.memory_mb, 16384); // ceiling
@@ -577,6 +681,41 @@ mod tests {
     }
 
     #[test]
+    fn canary_requires_repo_for_org_scope_when_enabled() {
+        let mut cfg = valid_config();
+        cfg.github.scope = Scope::Org;
+        cfg.github.target = "myorg".into();
+        cfg.canary.enabled = true;
+        assert!(cfg.validate().is_err());
+        cfg.canary.repo = Some("owner/repo".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn reject_invalid_canary_values() {
+        let mut cfg = valid_config();
+        cfg.canary.repo = Some("owner/".into());
+        assert!(cfg.validate().is_err());
+        cfg.canary.repo = Some("owner/repo".into());
+        cfg.canary.workflow = " ".into();
+        assert!(cfg.validate().is_err());
+        cfg.canary.workflow = "selftest.yml".into();
+        cfg.canary.ref_name = "".into();
+        assert!(cfg.validate().is_err());
+        cfg.canary.ref_name = "main".into();
+        cfg.canary.slo_start_seconds = 0;
+        assert!(cfg.validate().is_err());
+        cfg.canary.slo_start_seconds = 90;
+        cfg.canary.poll_timeout_seconds = 0;
+        assert!(cfg.validate().is_err());
+        cfg.canary.poll_timeout_seconds = 10;
+        cfg.canary.poll_interval_seconds = 11;
+        assert!(cfg.validate().is_err());
+        cfg.canary.poll_interval_seconds = 5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn load_legacy_config_without_queue_monitor_defaults_disabled() {
         let raw = r#"
 version = 1
@@ -598,6 +737,8 @@ minimum_isolation = "container"
         assert!(!cfg.queue_monitor.enabled);
         assert_eq!(cfg.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(cfg.queue_monitor.check_interval_seconds, 300);
+        assert!(!cfg.canary.enabled);
+        assert_eq!(cfg.canary.workflow, "selftest.yml");
     }
 
     #[test]

@@ -236,55 +236,20 @@ pass "Gate 3: Fleet capacity meets targets (Effective capacity: $EFFECTIVE_CAPAC
 
 # --- Gate 4: Real job execution ---
 echo "--- Checking Gate 4: Real job execution ---"
-WORKFLOW="ezgha-selftest"
-REPO="jleechanorg/ez-gh-actions"
-
-if ! SELFTEST_RUNS=$(gh_checked run list -R "$REPO" -w "$WORKFLOW" -L 20 --json databaseId,status,conclusion); then
-    fail "Gate 4: unable to list ezgha-selftest runs"
+CANARY_TIMEOUT_SECONDS="${CANARY_TIMEOUT_SECONDS:-600}"
+if ! CANARY_OUT=$(~/.cargo/bin/ezgha --config "$CONFIG_FILE" canary-once --timeout-seconds "$CANARY_TIMEOUT_SECONDS" 2>&1); then
+    echo "$CANARY_OUT"
+    fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${NAME_PREFIX}-*"
 fi
-COMPLETED_RUNS=$(echo "$SELFTEST_RUNS" | jq -r '[.[] | select(.status=="completed")]')
-COMPLETED_COUNT=$(echo "$COMPLETED_RUNS" | jq 'length')
-if [ "$COMPLETED_COUNT" -lt 1 ]; then
-    fail "No completed ezgha-selftest runs found"
+echo "$CANARY_OUT"
+CANARY_RUN_ID=$(echo "$CANARY_OUT" | jq -r '.run_id // empty' 2>/dev/null || true)
+CANARY_RUNNER=$(echo "$CANARY_OUT" | jq -r '.runner_name // empty' 2>/dev/null || true)
+CANARY_TTS=$(echo "$CANARY_OUT" | jq -r '.time_to_start_seconds // empty' 2>/dev/null || true)
+if [ -z "$CANARY_RUN_ID" ] || [ -z "$CANARY_RUNNER" ]; then
+    fail "Gate 4: canary output lacked run_id or runner_name"
 fi
-
-# Validate recent completed runs executed on the configured runner prefix.
-# Prefer configured-prefix telemetry over stale historical runs from retired fleets.
-MATCH_PREFIX_COUNT=0
-JOB_LOOKUP_FAILURES=0
-while IFS=' ' read -r rid conc; do
-    if [ -z "$rid" ] || [ -z "$conc" ]; then
-        continue
-    fi
-    if ! jobs=$(gh_checked api "repos/$REPO/actions/runs/$rid/jobs"); then
-        JOB_LOOKUP_FAILURES=$((JOB_LOOKUP_FAILURES + 1))
-        echo "    [WARN] Skipping selftest run $rid because job lookup failed"
-        continue
-    fi
-    rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
-    if [[ "$rn" == "${NAME_PREFIX}-"* ]]; then
-        if [ "$conc" != "success" ]; then
-            fail "Recent selftest run $rid on $rn failed or did not conclude successfully (conclusion: $conc)"
-        fi
-        MATCH_PREFIX_COUNT=$((MATCH_PREFIX_COUNT + 1))
-        echo "    [INFO] Prefix-aligned selftest run: $rid on $rn"
-        if [ "$MATCH_PREFIX_COUNT" -ge 5 ]; then
-            break
-        fi
-    fi
-done <<< "$(echo "$COMPLETED_RUNS" | jq -r '.[] | "\(.databaseId) \(.conclusion)"')"
-
-if [ "$MATCH_PREFIX_COUNT" -eq 0 ]; then
-    if [ "$JOB_LOOKUP_FAILURES" -gt 0 ]; then
-        fail "No completed selftest runs could be verified on ${NAME_PREFIX}-*; $JOB_LOOKUP_FAILURES job lookup(s) failed"
-    fi
-    fail "No completed selftest runs found on configured runner prefix (${NAME_PREFIX}-*)"
-fi
-
-if [ "$MATCH_PREFIX_COUNT" -lt 5 ]; then
-    fail "Only $MATCH_PREFIX_COUNT completed selftest run(s) matched ${NAME_PREFIX}-*; Gate 4 requires at least 5"
-fi
-pass "Gate 4: Recent jobs successfully ran on the ezgha fleet"
+echo "    [INFO] Fresh canary run $CANARY_RUN_ID started on $CANARY_RUNNER in ${CANARY_TTS:-?}s"
+pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet"
 
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"

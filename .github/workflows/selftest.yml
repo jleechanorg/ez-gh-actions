@@ -1,8 +1,14 @@
 # E2E self-test: runs on an ezgha-managed ephemeral runner.
 # Dispatch-only on purpose — never triggered by fork PRs (self-hosted safety).
 name: ezgha-selftest
+run-name: ezgha-selftest ${{ inputs.nonce || github.run_id }}
 on:
   workflow_dispatch:
+    inputs:
+      nonce:
+        description: "Unique dispatch nonce for ezgha canary correlation"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +20,7 @@ jobs:
     steps:
       - name: Prove execution environment
         run: |
+          echo "canary nonce: ${{ inputs.nonce }}"
           echo "runner name: $RUNNER_NAME"
           echo "hostname: $(hostname)"
           uname -a

@@ -151,6 +151,25 @@ pub(crate) fn api_json(path: &str) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+pub(crate) fn api_post_empty(path: &str, fields: &[(&str, &str)]) -> Result<()> {
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = Command::new(gh_executable());
+        cmd.args(["api", "-X", "POST", path]);
+        for (key, value) in fields {
+            cmd.args(["-f", &format!("{key}={value}")]);
+        }
+        cmd
+    })
+    .with_context(|| format!("failed to run `gh api -X POST {path}`"))?;
+    if !out.status.success() {
+        bail!(
+            "gh api POST {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
 /// Run `cmd`, capturing stdout and stderr, but never block longer than
 /// `GH_TIMEOUT`. Returns `Ok((stdout, stderr))` if the child exited (success
 /// or failure) within the deadline; returns `Err` if the deadline expired
@@ -235,6 +254,44 @@ pub fn runners_list_path(gh: &GithubConfig) -> String {
 /// never picked up a job.
 pub fn runner_remove_path(gh: &GithubConfig, id: u64) -> String {
     format!("{}/actions/runners/{id}", api_base(gh))
+}
+
+pub fn workflow_dispatch_path(repo: &str, workflow: &str) -> String {
+    format!("repos/{repo}/actions/workflows/{workflow}/dispatches")
+}
+
+pub fn workflow_runs_path(repo: &str, workflow: &str, limit: u32) -> String {
+    format!(
+        "repos/{repo}/actions/workflows/{workflow}/runs?event=workflow_dispatch&per_page={}",
+        limit.clamp(1, 100)
+    )
+}
+
+pub fn workflow_run_jobs_path(repo: &str, run_id: u64) -> String {
+    format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
+}
+
+pub fn dispatch_workflow(repo: &str, workflow: &str, ref_name: &str, nonce: &str) -> Result<()> {
+    api_post_empty(
+        &workflow_dispatch_path(repo, workflow),
+        &[("ref", ref_name), ("inputs[nonce]", nonce)],
+    )
+}
+
+pub fn list_workflow_runs(repo: &str, workflow: &str, limit: u32) -> Result<Vec<WorkflowRun>> {
+    let path = workflow_runs_path(repo, workflow, limit);
+    let body = api_json(&path)?;
+    let parsed: WorkflowRunsResponse = serde_json::from_slice(&body)
+        .with_context(|| format!("unexpected workflow-runs response for {repo}/{workflow}"))?;
+    Ok(parsed.workflow_runs)
+}
+
+pub fn list_workflow_jobs(repo: &str, run_id: u64) -> Result<Vec<WorkflowJob>> {
+    let path = workflow_run_jobs_path(repo, run_id);
+    let body = api_json(&path)?;
+    let parsed: WorkflowJobsResponse = serde_json::from_slice(&body)
+        .with_context(|| format!("unexpected workflow-jobs response for run {run_id}"))?;
+    Ok(parsed.jobs)
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,6 +410,55 @@ pub struct RunnerInfo {
 #[derive(Debug, Deserialize)]
 struct RunnerList {
     runners: Vec<RunnerInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct WorkflowRun {
+    pub id: u64,
+    pub name: String,
+    #[serde(default)]
+    pub display_title: String,
+    pub event: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub created_at: String,
+    pub run_started_at: Option<String>,
+    pub updated_at: String,
+    pub html_url: String,
+    pub head_branch: Option<String>,
+    pub head_sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowRunsResponse {
+    #[allow(dead_code)]
+    total_count: u64,
+    workflow_runs: Vec<WorkflowRun>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct WorkflowJob {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub runner_id: Option<u64>,
+    pub runner_name: Option<String>,
+    pub runner_group_id: Option<u64>,
+    pub runner_group_name: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    pub html_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkflowJobsResponse {
+    #[allow(dead_code)]
+    total_count: u64,
+    jobs: Vec<WorkflowJob>,
 }
 
 /// A name-colliding runner may belong to a live sibling host (runner names are
@@ -596,6 +702,77 @@ mod tests {
             runner_remove_path(&repo, 7),
             "repos/jleechanorg/ez-gh-actions/actions/runners/7"
         );
+        assert_eq!(
+            workflow_dispatch_path("jleechanorg/ez-gh-actions", "selftest.yml"),
+            "repos/jleechanorg/ez-gh-actions/actions/workflows/selftest.yml/dispatches"
+        );
+        assert_eq!(
+            workflow_runs_path("jleechanorg/ez-gh-actions", "selftest.yml", 250),
+            "repos/jleechanorg/ez-gh-actions/actions/workflows/selftest.yml/runs?event=workflow_dispatch&per_page=100"
+        );
+        assert_eq!(
+            workflow_run_jobs_path("jleechanorg/ez-gh-actions", 123),
+            "repos/jleechanorg/ez-gh-actions/actions/runs/123/jobs?per_page=100"
+        );
+    }
+
+    #[test]
+    fn workflow_run_fixture_deserializes() {
+        let raw = r#"{
+            "total_count": 1,
+            "workflow_runs": [{
+                "id": 123,
+                "name": "ezgha-selftest",
+                "display_title": "ezgha-selftest ezgha-canary-123",
+                "event": "workflow_dispatch",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-07-07T08:00:00Z",
+                "run_started_at": "2026-07-07T08:01:00Z",
+                "updated_at": "2026-07-07T08:02:00Z",
+                "html_url": "https://github.example/runs/123",
+                "head_branch": "main",
+                "head_sha": "abc123"
+            }]
+        }"#;
+
+        let parsed: WorkflowRunsResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.total_count, 1);
+        assert_eq!(parsed.workflow_runs[0].id, 123);
+        assert_eq!(
+            parsed.workflow_runs[0].display_title,
+            "ezgha-selftest ezgha-canary-123"
+        );
+    }
+
+    #[test]
+    fn workflow_jobs_fixture_deserializes() {
+        let raw = r#"{
+            "total_count": 1,
+            "jobs": [{
+                "id": 456,
+                "name": "selftest",
+                "status": "completed",
+                "conclusion": "success",
+                "created_at": "2026-07-07T08:00:00Z",
+                "started_at": "2026-07-07T08:01:00Z",
+                "completed_at": "2026-07-07T08:02:00Z",
+                "runner_id": 99,
+                "runner_name": "ez-runner-c-9",
+                "runner_group_id": 1,
+                "runner_group_name": "Default",
+                "labels": ["self-hosted", "ezgha"],
+                "html_url": "https://github.example/jobs/456"
+            }]
+        }"#;
+
+        let parsed: WorkflowJobsResponse = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(parsed.total_count, 1);
+        assert_eq!(parsed.jobs[0].id, 456);
+        assert_eq!(parsed.jobs[0].runner_name.as_deref(), Some("ez-runner-c-9"));
+        assert_eq!(parsed.jobs[0].labels, vec!["self-hosted", "ezgha"]);
     }
 
     fn runner(id: u64, name: &str, status: &str, busy: bool) -> RunnerInfo {

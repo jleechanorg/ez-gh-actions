@@ -339,7 +339,7 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn parse_github_timestamp_secs(raw: &str) -> Option<i64> {
+pub(crate) fn parse_github_timestamp_secs(raw: &str) -> Option<i64> {
     if raw.len() != 20 || !raw.ends_with('Z') {
         return None;
     }
