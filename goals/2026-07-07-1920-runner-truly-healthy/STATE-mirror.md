@@ -583,3 +583,25 @@ window specifically, the fleet-drain itself.
   evidence favors successful delivery to a channel outside this session's
   visibility, but this is NOT independently confirmed by me -- flagging the
   gap rather than asserting proof I don't have.
+
+## 30-min doctor.sh resample (2026-07-07 14:41 PT) -- healthiest reading this session
+
+- Fleet: 16/16 containers running, 20/20 registered runners ONLINE (0 offline)
+  -- best SC6 fleet-integrity reading of the entire mission so far.
+- Real job-execution proof (Gate 7): **6/6** last selftest runs succeeded on
+  our own fleet (ez-runner-c-*) -- first perfect 6/6 reading; earlier samples
+  this session ranged 2/6-5/6 with some landing on canary/mac runners instead.
+- `ensure_count failed occurrences in last 3 min: 0` -- confirms the
+  time-budget + cap fixes are not interfering with normal refill.
+- Queue (SC4): 412 queued total (down from ~500+ earlier, still far above
+  healthy), 0 stale zombies currently flagged, fresh queue tail
+  p50=116.3m p90=116.9m **max=278.2m** -- still badly exceeds the 20m
+  threshold. Oldest offender unchanged from earlier samples: run
+  28884233335 "Green Gate" on branch integrate-after-runnner-hardening-
+  2026-07-05, now 278.2m old -- this looks like a genuinely stuck/abandoned
+  branch run rather than fresh organic queue pressure, worth a
+  targeted look (individually-logged stuck-run cancel, per sanctioned levers)
+  separate from the broad capacity finding.
+- PR #8214 (task #4) re-checked: **17 of 19 checks SUCCESS, only 2 PENDING**
+  (Green Gate Precheck, Directory core-tests) -- up from 14/19 at last check.
+  Very close to mergeable-green; will merge once fully clean.
