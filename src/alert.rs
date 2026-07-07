@@ -628,7 +628,7 @@ mod tests {
     fn command_timeout_kills_hung_process() {
         let start = Instant::now();
         let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "sleep 30"]);
+        cmd.args(["-c", "/bin/sleep 30"]);
         let err = run_command_with_timeout(cmd, Duration::from_millis(200))
             .expect_err("hung alert command should time out");
         assert!(err.to_string().contains("timed out"));

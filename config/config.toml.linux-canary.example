@@ -1,0 +1,36 @@
+# jeff-ubuntu canary fleet — repo-scoped reserved canary capacity.
+# Install separately from the main fleet config, for example:
+# cp config/config.toml.linux-canary.example ~/.config/ezgha/canary.toml
+# CANARY_CONFIG_FILE=~/.config/ezgha/canary.toml ./docs/verify-exit-criteria.sh
+version = 1
+state_dir = "/home/jleechan/.config/ezgha-canary"
+
+[github]
+scope = "repo"
+target = "jleechanorg/ez-gh-actions"
+
+[runner]
+name_prefix = "ez-canary-runner-b"
+labels = ["self-hosted", "self-hosted-mikey", "ezgha-canary", "Linux", "X64"]
+count = 1
+image = "ezgha-runner:latest"
+
+[limits]
+memory_mb = 5977
+cpus = 2.0
+pids = 512
+min_free_disk_gb = 10
+
+[policy]
+# Native linux docker = container isolation. Keep the canary fleet isolated by
+# state_dir/name_prefix/labels so reserved capacity is not consumed by the main fleet.
+minimum_isolation = "container"
+
+[canary]
+enabled = true
+workflow = "selftest.yml"
+ref_name = "main"
+slo_start_seconds = 90
+poll_timeout_seconds = 600
+poll_interval_seconds = 15
+history_path = "/home/jleechan/.config/ezgha-canary/canary-history.jsonl"

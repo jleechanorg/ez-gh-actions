@@ -693,7 +693,7 @@ fn main() -> Result<()> {
             // `ezgha serve` refuses immediately instead of racing next_slot's
             // read-modify-write. Auto-released on process death; opt-out via
             // EZGHA_SKIP_LOCK=1 for tests.
-            let _serve_lock = acquire_serve_lock().context("acquire serve.lock")?;
+            let _serve_lock = acquire_serve_lock(&cfg).context("acquire serve.lock")?;
             // Use wait_for_backend (bead 3z5): retry up to 120s for the Docker
             // daemon to become reachable. This handles the boot-time race where
             // Lima/Colima is still starting when this service unit fires — even
@@ -931,19 +931,25 @@ impl Drop for ServeLock {
     }
 }
 
-fn acquire_serve_lock() -> Result<ServeLock> {
+fn default_state_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
+    let config_home =
+        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+    std::path::PathBuf::from(config_home).join("ezgha")
+}
+
+fn state_dir_for(cfg: &config::Config) -> std::path::PathBuf {
+    cfg.state_dir.clone().unwrap_or_else(default_state_dir)
+}
+
+fn acquire_serve_lock(cfg: &config::Config) -> Result<ServeLock> {
     if std::env::var_os("EZGHA_SKIP_LOCK").is_some() {
         return Ok(ServeLock(None));
     }
     use std::io::ErrorKind;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
-    let config_home =
-        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
-    let path = std::path::PathBuf::from(config_home)
-        .join("ezgha")
-        .join("serve.lock");
+    let path = state_dir_for(cfg).join("serve.lock");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -998,6 +1004,26 @@ mod tests {
             "jleechanorg".into(),
             Scope::Org,
         )
+    }
+
+    #[test]
+    fn state_dir_isolates_serve_locks_between_configs() {
+        let base =
+            std::env::temp_dir().join(format!("ezgha-serve-lock-isolation-{}", std::process::id()));
+        let mut prod = test_config();
+        prod.state_dir = Some(base.join("prod"));
+        let mut canary = test_config();
+        canary.state_dir = Some(base.join("canary"));
+
+        let prod_lock = acquire_serve_lock(&prod).expect("prod lock");
+        let canary_lock = acquire_serve_lock(&canary).expect("canary lock");
+
+        assert!(base.join("prod").join("serve.lock").exists());
+        assert!(base.join("canary").join("serve.lock").exists());
+
+        drop(canary_lock);
+        drop(prod_lock);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {

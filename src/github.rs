@@ -49,13 +49,15 @@ pub(crate) fn with_gh_exe(path: &str) -> GhExeOverrideGuard {
     GhExeOverrideGuard { previous }
 }
 
-fn gh_executable() -> String {
+fn gh_command() -> Command {
     #[cfg(test)]
     if let Some(path) = GH_EXE_OVERRIDE.with(|cell| cell.borrow().clone()) {
-        return path;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(path);
+        return cmd;
     }
 
-    "gh".to_string()
+    Command::new("gh")
 }
 
 fn extract_retry_after_secs(text: &str) -> Option<u64> {
@@ -145,7 +147,7 @@ fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::pro
 
 pub(crate) fn api_json(path: &str) -> Result<Vec<u8>> {
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new(gh_executable());
+        let mut cmd = gh_command();
         cmd.args(["api", path]);
         cmd
     })
@@ -161,7 +163,7 @@ pub(crate) fn api_json(path: &str) -> Result<Vec<u8>> {
 
 pub(crate) fn api_post_empty(path: &str, fields: &[(&str, &str)]) -> Result<()> {
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new(gh_executable());
+        let mut cmd = gh_command();
         cmd.args(["api", "-X", "POST", path]);
         for (key, value) in fields {
             cmd.args(["-f", &format!("{key}={value}")]);
@@ -387,7 +389,7 @@ pub fn generate_jitconfig(
 ) -> Result<(String, u64)> {
     let path = jitconfig_path(gh);
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new(gh_executable());
+        let mut cmd = gh_command();
         cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
         cmd.args(["-F", "runner_group_id=1"]);
         for label in labels {
@@ -429,7 +431,7 @@ pub fn generate_jitconfig(
                     if remove_runner(gh, conflicting.id).is_ok() {
                         watchdog::ping();
                         let retry_out = run_gh_with_backoff(|| {
-                            let mut retry_cmd = Command::new(gh_executable());
+                            let mut retry_cmd = gh_command();
                             retry_cmd.args([
                                 "api",
                                 "-X",
@@ -560,7 +562,7 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     // `--slurp` collects the pages into a single top-level JSON array instead,
     // which we deserialize as `Vec<RunnerList>` and flatten.
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new(gh_executable());
+        let mut cmd = gh_command();
         cmd.args(["api", "--paginate", "--slurp", &path]);
         cmd
     })
@@ -582,7 +584,7 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
 pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
     let path = runner_remove_path(gh, id);
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new(gh_executable());
+        let mut cmd = gh_command();
         cmd.args(["api", "-X", "DELETE", &path]);
         cmd
     })
@@ -622,7 +624,7 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
 /// state.
 pub fn gh_auth_ok() -> bool {
     let out = match run_gh_with_backoff(|| {
-        let mut status_cmd = Command::new(gh_executable());
+        let mut status_cmd = gh_command();
         status_cmd.args(["auth", "status"]);
         status_cmd
     }) {
@@ -646,7 +648,7 @@ pub fn gh_auth_ok() -> bool {
     // `gh auth status`'s exit-code semantics entirely. If it prints a token,
     // the active account works.
     match run_gh_with_backoff(|| {
-        let mut token_cmd = Command::new(gh_executable());
+        let mut token_cmd = gh_command();
         token_cmd.args(["auth", "token"]);
         token_cmd
     }) {

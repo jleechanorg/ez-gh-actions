@@ -44,7 +44,15 @@ struct SlotAssignments {
 /// Resolve the path of the slot assignment file. Honors `EZGHA_SLOT_ASSIGNMENTS_PATH`
 /// (test escape hatch) and `XDG_CONFIG_HOME` (per XDG Base Directory spec),
 /// falling back to `~/.config`.
-fn slot_assignments_path() -> PathBuf {
+fn default_state_dir() -> PathBuf {
+    let config_home = env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        let home = env::var("HOME").unwrap_or_else(|_| "~".into());
+        format!("{home}/.config")
+    });
+    PathBuf::from(config_home).join("ezgha")
+}
+
+fn slot_assignments_path_for(cfg: Option<&Config>) -> PathBuf {
     #[cfg(test)]
     {
         if let Some(p) = crate::docker_backend::tests::test_slot_path() {
@@ -54,17 +62,13 @@ fn slot_assignments_path() -> PathBuf {
     if let Ok(p) = env::var(SLOT_ASSIGNMENTS_PATH_ENV) {
         return PathBuf::from(p);
     }
-    let config_home = env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = env::var("HOME").unwrap_or_else(|_| "~".into());
-        format!("{home}/.config")
-    });
-    PathBuf::from(config_home)
-        .join("ezgha")
+    cfg.and_then(|cfg| cfg.state_dir.clone())
+        .unwrap_or_else(default_state_dir)
         .join("slot_assignments.toml")
 }
 
-fn read_slot_assignments() -> Result<SlotAssignments> {
-    let path = slot_assignments_path();
+fn read_slot_assignments_for(cfg: Option<&Config>) -> Result<SlotAssignments> {
+    let path = slot_assignments_path_for(cfg);
     if !path.exists() {
         return Ok(SlotAssignments::default());
     }
@@ -85,6 +89,11 @@ fn read_slot_assignments() -> Result<SlotAssignments> {
         }
     };
     Ok(parsed)
+}
+
+#[cfg(test)]
+fn read_slot_assignments() -> Result<SlotAssignments> {
+    read_slot_assignments_for(None)
 }
 
 fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
@@ -164,8 +173,8 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     })
 }
 
-fn write_slot_assignments(assignments: &SlotAssignments) -> Result<()> {
-    let path = slot_assignments_path();
+fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config>) -> Result<()> {
+    let path = slot_assignments_path_for(cfg);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -191,12 +200,12 @@ pub fn next_slot(cfg: &Config) -> Result<u32> {
     if cfg.runner.count == 0 {
         bail!("cfg.runner.count is 0; nothing to allocate");
     }
-    let mut assignments = read_slot_assignments()?;
+    let mut assignments = read_slot_assignments_for(Some(cfg))?;
     for slot in 1..=cfg.runner.count {
         let key = slot.to_string();
         if let std::collections::btree_map::Entry::Vacant(e) = assignments.assignments.entry(key) {
             e.insert(String::new());
-            write_slot_assignments(&assignments)?;
+            write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(slot);
         }
     }
@@ -209,20 +218,30 @@ pub fn next_slot(cfg: &Config) -> Result<u32> {
 
 /// Record the GitHub runner_id returned by `generate_jitconfig` for a slot
 /// that was previously reserved by `next_slot`.
+#[cfg(test)]
 pub fn record_slot_runner_id(slot: u32, runner_id: u64) -> Result<()> {
-    let mut assignments = read_slot_assignments()?;
+    record_slot_runner_id_for(None, slot, runner_id)
+}
+
+fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) -> Result<()> {
+    let mut assignments = read_slot_assignments_for(cfg)?;
     assignments
         .assignments
         .insert(slot.to_string(), runner_id.to_string());
-    write_slot_assignments(&assignments)
+    write_slot_assignments_for(&assignments, cfg)
 }
 
 /// Release a slot previously acquired by `next_slot`. The slot becomes
 /// available for the next call.
+#[cfg(test)]
 pub fn release_slot(slot: u32) -> Result<()> {
-    let mut assignments = read_slot_assignments()?;
+    release_slot_for(None, slot)
+}
+
+fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
+    let mut assignments = read_slot_assignments_for(cfg)?;
     assignments.assignments.remove(&slot.to_string());
-    write_slot_assignments(&assignments)
+    write_slot_assignments_for(&assignments, cfg)
 }
 
 /// Release slots whose recorded `runner_id` no longer corresponds to a live
@@ -253,7 +272,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
         }
     };
     watchdog::ping();
-    let assignments = read_slot_assignments()?;
+    let assignments = read_slot_assignments_for(Some(cfg))?;
     let local_container_names = match managed_containers() {
         Ok(containers) => Some(
             containers
@@ -268,7 +287,8 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             None
         }
     };
-    let reclaimed = release_stale_slots_from_with_containers(
+    let reclaimed = release_stale_slots_from_with_containers_for(
+        Some(cfg),
         &assignments,
         &live_runners,
         &cfg.runner.name_prefix,
@@ -287,7 +307,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             );
             match github::remove_runner(&cfg.github, runner_id) {
                 Ok(()) => {
-                    release_slot(slot_n)?;
+                    release_slot_for(Some(cfg), slot_n)?;
                     reclaimed += 1;
                     watchdog::ping();
                 }
@@ -358,7 +378,24 @@ fn release_stale_slots_from(
     release_stale_slots_from_with_containers(assignments, live_runners, "", None)
 }
 
+#[cfg(test)]
 fn release_stale_slots_from_with_containers(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+) -> Result<usize> {
+    release_stale_slots_from_with_containers_for(
+        None,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+    )
+}
+
+fn release_stale_slots_from_with_containers_for(
+    cfg: Option<&Config>,
     assignments: &SlotAssignments,
     live_runners: &[github::RunnerInfo],
     runner_prefix: &str,
@@ -382,14 +419,14 @@ fn release_stale_slots_from_with_containers(
             // (JIT registration failed mid-flight, or the daemon died before
             // the container came up). Free the slot immediately so the next
             // allocation cycle can claim it.
-            release_slot(slot_n)?;
+            release_slot_for(cfg, slot_n)?;
             reclaimed += 1;
         } else if let Ok(rid) = id_str.parse::<u64>() {
             if !live_ids.contains(&rid) {
                 // The recorded runner_id is no longer registered on GitHub
                 // (server-side reap, manual removal, or a stale entry from a
                 // prior host). Treat the slot as free.
-                release_slot(slot_n)?;
+                release_slot_for(cfg, slot_n)?;
                 reclaimed += 1;
             } else if let Some(local_names) = local_container_names {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
@@ -402,7 +439,7 @@ fn release_stale_slots_from_with_containers(
                         eprintln!(
                             "warning: releasing slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle and has no local container"
                         );
-                        release_slot(slot_n)?;
+                        release_slot_for(cfg, slot_n)?;
                         reclaimed += 1;
                     }
                 }
@@ -552,7 +589,7 @@ fn start_one_with_generate(
     // self-heal can be reclaimed as one of ours regardless of GitHub's
     // reported status (handles same-host zombies whose heartbeat hasn't
     // decayed yet).
-    let owned_ids: HashSet<u64> = read_slot_assignments()?
+    let owned_ids: HashSet<u64> = read_slot_assignments_for(Some(cfg))?
         .assignments
         .values()
         .filter_map(|s| s.parse::<u64>().ok())
@@ -562,7 +599,7 @@ fn start_one_with_generate(
         match generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels, &owned_ids) {
             Ok(pair) => pair,
             Err(e) => {
-                let _ = release_slot(slot);
+                let _ = release_slot_for(Some(cfg), slot);
                 return Err(e);
             }
         };
@@ -599,7 +636,7 @@ fn start_one_with_generate(
     }
     // Record the runner_id now that the container is up so the slot can be
     // reclaimed if the JIT registration is later removed server-side.
-    record_slot_runner_id(slot, runner_id)?;
+    record_slot_runner_id_for(Some(cfg), slot, runner_id)?;
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
     Ok((container_id, runner_name))
 }
@@ -646,6 +683,16 @@ fn count_current_prefix_containers(containers: &[ManagedContainer], cfg: &Config
         .count() as u32
 }
 
+fn current_prefix_containers<'a>(
+    containers: &'a [ManagedContainer],
+    cfg: &Config,
+) -> Vec<&'a ManagedContainer> {
+    containers
+        .iter()
+        .filter(|c| runner_name_matches_prefix(&c.name, &cfg.runner.name_prefix))
+        .collect()
+}
+
 fn runner_name_matches_prefix(name: &str, prefix: &str) -> bool {
     let Some(suffix) = name
         .strip_prefix(prefix)
@@ -659,7 +706,8 @@ fn runner_name_matches_prefix(name: &str, prefix: &str) -> bool {
 /// Kill all managed runner containers. Returns how many were removed.
 pub fn stop_all(cfg: &Config) -> Result<usize> {
     let containers = managed_containers()?;
-    for c in &containers {
+    let owned_containers = current_prefix_containers(&containers, cfg);
+    for c in &owned_containers {
         let mut cmd = Command::new("docker");
         cmd.args(["rm", "-f", &c.id]);
         let _ = run_docker(cmd, "stop_all rm -f").ok();
@@ -671,7 +719,7 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
     // `our_runner_prefix()`'s hardcoded default) so a host with a custom
     // prefix like `lab-runner` correctly tears down its own slots.
     let prefix = format!("{}-", cfg.runner.name_prefix);
-    let owned_runner_ids: Vec<u64> = match read_slot_assignments() {
+    let owned_runner_ids: Vec<u64> = match read_slot_assignments_for(Some(cfg)) {
         Ok(a) => a
             .assignments
             .values()
@@ -690,7 +738,7 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
     // Release every slot we held. Even if the container died ungracefully, the
     // JIT registration may still be idle on the server; the next start_one
     // call will claim the next free slot.
-    let slots_to_release: Vec<u32> = match read_slot_assignments() {
+    let slots_to_release: Vec<u32> = match read_slot_assignments_for(Some(cfg)) {
         Ok(a) => a
             .assignments
             .keys()
@@ -699,9 +747,9 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
         Err(_) => Vec::new(),
     };
     for slot in slots_to_release {
-        let _ = release_slot(slot);
+        let _ = release_slot_for(Some(cfg), slot);
     }
-    Ok(containers.len())
+    Ok(owned_containers.len())
 }
 
 /// Free disk in GB as seen by the docker DAEMON, measured from inside a
@@ -996,6 +1044,34 @@ mod tests {
     }
 
     #[test]
+    fn state_dir_isolates_slot_assignments_between_configs() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *TEST_SLOT_PATH.lock().unwrap() = None;
+        let base =
+            env::temp_dir().join(format!("ezgha-state-dir-isolation-{}", std::process::id()));
+        let dir_a = base.join("prod");
+        let dir_b = base.join("canary");
+        let mut prod = cfg_with(1, "ez-prod");
+        prod.state_dir = Some(dir_a.clone());
+        let mut canary = cfg_with(1, "ez-canary");
+        canary.state_dir = Some(dir_b.clone());
+
+        assert_eq!(next_slot(&prod).unwrap(), 1);
+        record_slot_runner_id_for(Some(&prod), 1, 101).unwrap();
+        assert_eq!(next_slot(&canary).unwrap(), 1);
+        record_slot_runner_id_for(Some(&canary), 1, 202).unwrap();
+
+        let prod_slots = std::fs::read_to_string(dir_a.join("slot_assignments.toml")).unwrap();
+        let canary_slots = std::fs::read_to_string(dir_b.join("slot_assignments.toml")).unwrap();
+        assert!(prod_slots.contains("\"101\""));
+        assert!(!prod_slots.contains("\"202\""));
+        assert!(canary_slots.contains("\"202\""));
+        assert!(!canary_slots.contains("\"101\""));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn read_slot_assignments_quarantines_corrupt_file_and_returns_empty() {
         let env = TestEnv::new("corrupt_slot_file");
         let path = env.path.clone();
@@ -1112,6 +1188,23 @@ mod tests {
             count_current_prefix_containers(&containers, &current_cfg),
             2
         );
+    }
+
+    #[test]
+    fn current_prefix_containers_excludes_canary_prefix() {
+        let containers = vec![
+            managed_container("ez-runner-c-1"),
+            managed_container("ez-runner-c-2"),
+            managed_container("ez-canary-runner-b-1"),
+        ];
+        let cfg = cfg_with(2, "ez-runner-c");
+
+        let owned: Vec<_> = current_prefix_containers(&containers, &cfg)
+            .into_iter()
+            .map(|c| c.name.as_str())
+            .collect();
+
+        assert_eq!(owned, vec!["ez-runner-c-1", "ez-runner-c-2"]);
     }
 
     fn runner_info(id: u64, name: &str) -> github::RunnerInfo {

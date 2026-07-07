@@ -115,6 +115,31 @@ print(value)
 PY
 }
 
+toml_get_top() {
+    local key="$1"
+    local default="${2:-}"
+    python3 - "$CONFIG_FILE" "$key" "$default" <<'PY'
+import sys
+
+path, key, default = sys.argv[1:]
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import toml
+    except ModuleNotFoundError:
+        raise SystemExit(2)
+    data = toml.load(path)
+else:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+value = data.get(key, default)
+print(value)
+PY
+}
+
 # --- Gate 0: Deployed code == committed code ---
 echo "--- Checking Gate 0: Deployed code == committed code ---"
 DEPLOYED_SHA=$(~/.cargo/bin/ezgha --version 2>/dev/null | cut -d'-' -f2 || echo "none")
@@ -227,8 +252,14 @@ EFFECTIVE_CAPACITY=$((ONLINE_COUNT))
 # Check offline runners
 OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.[]?.runners[]? | select(.name | startswith($p)) | select(.status == "offline")] | length') || fail "Gate 3: Unable to parse offline runner count"
 
-# Local container check
-CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null | wc -l)
+# Local container check for the configured runner prefix. The ezgha label is
+# shared by isolated canary daemons, so raw managed-container count can mask
+# missing production capacity.
+CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null | awk -v p="$NAME_PREFIX" '
+index($0, p "-") == 1 {
+    suffix = substr($0, length(p) + 2)
+    if (suffix ~ /^[0-9]+$/) print
+}' | wc -l)
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 
 # Validate runner names match expected format (prefix-N)
@@ -264,7 +295,12 @@ fi
 # reserved → daemon respawns within 30s). An instantaneous 'docker ps' count
 # is always wrong under high utilization and triggers false failures.
 SLOT_COUNT=0
-SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+STATE_DIR=$(toml_get_top state_dir "" 2>/dev/null || echo "")
+if [ -n "$STATE_DIR" ]; then
+    SLOT_FILE="$STATE_DIR/slot_assignments.toml"
+else
+    SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+fi
 if [ -f "$SLOT_FILE" ]; then
     SLOT_COUNT=$(grep -c '\.' "$SLOT_FILE" 2>/dev/null || echo 0)
     # slot file has one entry per reserved slot; count lines with '=' as a proxy
@@ -282,9 +318,14 @@ pass "Gate 3: Fleet capacity meets targets (Effective capacity: $EFFECTIVE_CAPAC
 # --- Gate 4: Real job execution ---
 echo "--- Checking Gate 4: Real job execution ---"
 CANARY_TIMEOUT_SECONDS="${CANARY_TIMEOUT_SECONDS:-600}"
-if ! CANARY_OUT=$(~/.cargo/bin/ezgha --config "$CONFIG_FILE" canary-once --timeout-seconds "$CANARY_TIMEOUT_SECONDS" 2>&1); then
+CANARY_CONFIG="${CANARY_CONFIG_FILE:-$CONFIG_FILE}"
+if [ ! -f "$CANARY_CONFIG" ]; then
+    fail "Gate 4: canary config file not found at $CANARY_CONFIG"
+fi
+CANARY_NAME_PREFIX=$(CONFIG_FILE="$CANARY_CONFIG" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
+if ! CANARY_OUT=$(~/.cargo/bin/ezgha --config "$CANARY_CONFIG" canary-once --timeout-seconds "$CANARY_TIMEOUT_SECONDS" 2>&1); then
     echo "$CANARY_OUT"
-    fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${NAME_PREFIX}-*"
+    fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${CANARY_NAME_PREFIX}-* using $CANARY_CONFIG"
 fi
 echo "$CANARY_OUT"
 CANARY_RUN_ID=$(echo "$CANARY_OUT" | jq -r '.run_id // empty' 2>/dev/null || true)
@@ -294,7 +335,7 @@ if [ -z "$CANARY_RUN_ID" ] || [ -z "$CANARY_RUNNER" ]; then
     fail "Gate 4: canary output lacked run_id or runner_name"
 fi
 echo "    [INFO] Fresh canary run $CANARY_RUN_ID started on $CANARY_RUNNER in ${CANARY_TTS:-?}s"
-pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet"
+pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $CANARY_CONFIG"
 
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"

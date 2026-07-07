@@ -14,6 +14,10 @@ const CURRENT_VERSION: u32 = 1;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    /// Optional directory for mutable daemon state such as serve.lock and
+    /// slot_assignments.toml. Defaults to the standard ezgha config dir.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
     pub github: GithubConfig,
     pub runner: RunnerConfig,
     pub limits: Limits,
@@ -281,6 +285,7 @@ impl Config {
         let cpus = ((plat.cpus / 2).max(1)) as f64;
         Config {
             version: 1,
+            state_dir: None,
             github: GithubConfig { scope, target },
             runner: RunnerConfig {
                 labels: vec!["self-hosted".into(), "ezgha".into()],
@@ -355,6 +360,11 @@ impl Config {
         }
         if self.github.target.trim().is_empty() {
             anyhow::bail!("github.target must not be empty");
+        }
+        if let Some(path) = &self.state_dir {
+            if path.as_os_str().is_empty() {
+                anyhow::bail!("state_dir must not be empty when configured");
+            }
         }
         if self.github.scope == Scope::Repo && self.github.target.matches('/').count() != 1 {
             anyhow::bail!(
@@ -544,11 +554,12 @@ mod tests {
 
     #[test]
     fn config_roundtrip() {
-        let cfg = Config::defaults_for(
+        let mut cfg = Config::defaults_for(
             &fake_platform(8192, 8),
             "jleechanorg/ez-gh-actions".into(),
             Scope::Repo,
         );
+        cfg.state_dir = Some(std::env::temp_dir().join("ezgha-state-roundtrip"));
         let path = std::env::temp_dir().join(format!("ezgha-test-{}.toml", std::process::id()));
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
