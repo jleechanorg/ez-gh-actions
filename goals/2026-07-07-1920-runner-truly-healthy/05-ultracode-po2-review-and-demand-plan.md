@@ -85,3 +85,68 @@ One confirmed **critical** finding survives (batch-boundary load checks racing a
 | presubmit.yml | Same draft-skip condition, 8 self-hosted job legs | #3 offender, 41 queued runs, widest fan-out workflow — largest per-run waste reduction if drafts are truly not actionable | medium — same tradeoff, amplified by fan-out |
 | self-hosted-mvp-shard1.yml | Add `paths:` filter to `on.push.branches:[main,dev]` matching the existing PR-trigger filter | #4 offender, 29 queued runs, 4 job legs — risk of silently skipping legitimate main/dev CI if the paths list is later incomplete or a new test-relevant path is added outside it | medium — requires owner sign-off on the exact path list and a process for keeping it in sync |
 | coverage.yml | Add draft-skip condition to the self-hosted `coverage` job only | Tied #5 offender, 24 queued runs — but some teams want coverage trend visibility even pre-review | medium — value tradeoff on WIP coverage visibility |
+
+---
+
+## APPENDIX: Round-2 ultracode review on po2-v2 (dc86a325) -- 2026-07-07 ~16:20 PT
+
+**VERDICT: BLOCK** (6 confirmed findings: 1 critical, 2 major, 3 minor/not itemized here).
+
+**THE CRITICAL** (arithmetic, verified numerically by the reviewer): the v2
+design's framing -- "fixed schedule is the primary safety, the loadavg gate
+is a secondary brake" -- is FALSE on this specific box. The fixed schedule
+alone (batch=2, sleep=30s) peaks at **+17.32 respawn load**. This box's own
+baseline load runs **9-15** (not near-zero, as an idealized "safe with zero
+feedback" design implicitly assumed). Combined: **26.3-32.3, BREACHING the
+24 watchdog ceiling** whenever the load gate isn't functioning for any
+reason. v2's own safety test used a 20.0 ceiling with NO baseline load
+offset added -- it validated an easier claim than the code comment actually
+asserted. A composite simulation WITH the gate active stays at 15.7-18.6 --
+meaning **the gate is load-bearing, not cosmetic** -- directly inverting
+v2's design principle (main's v2 brief said the fixed schedule should be
+primary and the gate secondary; the numbers say the opposite is true on
+this box).
+
+**Supporting majors**:
+(a) On Linux, a failed `/proc/loadavg` read is silently swallowed via
+    `.ok()` with no warning -- the daemon can silently regress into the
+    unsafe no-gate regime with zero operator visibility.
+(b) Pacing has no OVERALL budget across the whole `ensure_count` call --
+    under sustained load, a full 16-runner refill can take 16+ minutes
+    inside ONE `ensure_count` invocation, starving monitors/canary (they
+    only run AFTER `ensure_count` returns; v2's deadline-rebasing fix
+    doesn't help if they never get a turn to run at all).
+
+## V3 BRIEF (dispatched to codex, same branch sidekick/po2-respawn-pacing)
+
+1. **Incremental refill**: give the respawn loop a per-`ensure_count`-call
+   budget (~90-120s max). Start whatever fits safely within that budget,
+   then RETURN -- let the NEXT serve-loop iteration continue the refill.
+   Monitors run in between iterations naturally; starts-per-minute become
+   inherently bounded. Ephemeral refill does not need to complete in one
+   call; `ensure_count` runs every loop anyway. This structurally kills the
+   monitor-starvation major and simplifies the batch-schedule arithmetic.
+2. **Gate-primary, honestly**: the loadavg gate becomes the PRIMARY safety
+   mechanism (matching what the numbers actually showed, not the v2
+   framing). Compute allowed concurrent starts from headroom:
+   `allowed = floor((safety_ceiling(default 20) - current_load) / 4.4)`,
+   clamped to `[0, batch_size]`. When no load signal is available (non-Linux,
+   OR a Linux read/parse failure), fall back to MAX-CONSERVATIVE: 1 start
+   per iteration (15 baseline + 4.4 = 19.4, stays under 24 even in this
+   box's worst-case baseline) + warn-once AND fire a real `alert::` alert
+   that the safety gate is dark (not just a log line).
+3. Fix the silent Linux `.ok()` swallow -- route it through the same
+   warn-once + alert path as the non-Linux case.
+4. **Tests**: the safety-property test must add the worst-case baseline
+   load offset (15) and assert the simulated total stays under 24 for BOTH
+   the gate-active path AND the gate-dark (no-signal) fallback path; keep
+   the existing must-fail-against-old-defaults sanity check; add a
+   `main.rs` match-arm wiring test for the partial-success streak logic
+   (a round-2 minor finding).
+5. Update the design comment in the code to match reality: gate-primary,
+   not schedule-primary.
+
+Round-3 review will re-run the same arithmetic against the new diff --
+codex was told to derive and document the actual numbers (headroom formula,
+worst-case totals) directly in the diff/commit message this time, not just
+assert a comment. Still holding: nothing deploys until a SHIP verdict.
