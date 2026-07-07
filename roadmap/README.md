@@ -35,7 +35,7 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 **Phase 3 — reap + trim on the correlation layer (M–L)**
 12. `qbl` (P2) — zombie-runner reaper on juv's layer; MUST cancel the stuck run first, then delete registration (HTTP 422 lock, incident C)
 13. `ftw` (P3) — max-job-duration config + cancel enforcement (first actual Goal 4 code; same layer)
-14. `len` (P3) — queued-job starvation detection (integrate scripts/queue-health.sh into daemon + alert)
+14. ~~`len` (P3)~~ — DONE: queued-job starvation detection integrated into daemon + alert log proof captured; real throughput still blocked by saturated queue/juv correlation work
 
 **Phase 4 — hygiene tail**
 15. `2ik` (P3) — commit or delete external ~/.local/bin/ezgha-fleet-watchdog.sh (Gate 7 committed-config rule)
@@ -90,10 +90,11 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 ### 2026-07-07 (Codex continuation) — daemon queue starvation monitor
 
-- Implemented `ez-gh-actions-len` WIP: optional `[queue_monitor]` config with legacy-config compatibility, daemon-side GitHub Actions queued/in_progress REST checks, fresh-vs-stale queue tail stats, consecutive starvation alerts, and independent stale queued zombie alerts.
+- Implemented and closed `ez-gh-actions-len`: optional `[queue_monitor]` config with legacy-config compatibility, daemon-side GitHub Actions queued/in_progress REST checks, fresh-vs-stale queue tail stats, consecutive starvation alerts, and independent stale queued zombie alerts.
 - Integrated queue monitoring into `ezgha serve` as a non-fatal check after successful `ensure_count`; it is skipped after runner reconciliation failures to avoid compounding API pressure, and the loop pings the watchdog immediately before queue polling.
 - Added focused tests for config compatibility, example configs, invalid repo/interval values, timestamp/stat boundaries, alert-log delivery after consecutive bad samples, critical escalation cooldown separation, stale zombie warnings, and non-fatal monitor errors.
-- Verification before deploy: `cargo test` 100/100, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` pass. Live proof is still detection-only while the real `worldarchitect.ai` queue is saturated; do not claim Gate 4 recovery unless fresh selftests complete.
+- Verification: `cargo test` 100/100, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` pass. After Linux deploy at `fc17ed0`, Gate 0/1/2/3 passed; the daemon logged queue bad sample 1/2 and then wrote durable alert `queue.starvation.tail` to `/home/jleechan/.local/state/ezgha/alerts.jsonl` on sample 2.
+- Current live state remains detection-only: `docs/verify-exit-criteria.sh` Gate 4 still fails because only 1 completed `ez-runner-c-*` selftest exists, and `doctor.sh` still marks `worldarchitect.ai` queue health BAD with >100m fresh tail. Do not claim queue recovery until fresh selftests complete.
 
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 
