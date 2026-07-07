@@ -136,13 +136,44 @@ Deadline 2026-07-08 07:20 PT.
 9. [NOT STARTED] codex/hardening-bxy-fl0 merge (separate track, ez-gh-actions-jyb)
    — flagged, not yet actioned.
 
+## URGENT SECURITY FINDING (2026-07-07 13:20 PT, flagged to main immediately)
+
+lane-h's gitleaks sweep found a REAL, live-looking GCP service-account private key
+checked into jleechanorg/worldarchitect.ai:roadmap/agent_001_command_frequency.json
+(50 occurrences, first committed 2025-09-22 commit 6e4aa9a #1711 — exposed ~10
+months). project_id=worldarchitecture-ai, full PEM private key present. Verified
+independently (grep, not just trusting the sub-agent), NOT reproduced here, NOT
+rotated, NOT history-rewritten. lane-h is redacting the tracked-file occurrences
+going forward (new commit). Escalated to main via SendMessage — needs a human
+decision on GCP key rotation, which is outside any agent's mandate here. This is
+the highest-priority open item; do not let it get buried under routine lane work.
+
+## E1 sampler status (2026-07-07 13:19 PT)
+
+Confirmed via code review lane-cg's merged queue_monitor.rs work does NOT satisfy
+E1: it writes to the existing alerts.jsonl mechanism (idle-runner mismatch alert),
+not the required ~/.local/state/ezgha/invariant_history.jsonl with the
+{ts,busy,queued_jobs,oldest_queued_job_min,oldest_running_job_min,inv1,inv2} schema.
+Real gap remains. Dispatched a codex background worker in worktree
+~/projects/ez-gh-actions-wt-e1 (branch sidekick/e1-sampler) with a detailed brief
+reusing existing QueueStats/FleetRunnerStats infra -- FAILED IMMEDIATELY on launch:
+Codex CLI usage limit exhausted ("try again at 2:52 PM PT", ~90 min from now as of
+this writing). No partial commits landed (clean worktree). RETRY after 2:52 PM PT —
+worktree + prompt file preserved at /tmp/.../scratchpad/e1-sampler-prompt.txt (also
+worth copying that prompt into the repo/STATE so it survives another /tmp wipe).
+
 ## Next actions (in order)
 
-1. Review lane-cg's merged queue_monitor.rs changes against the E1 criteria
-   (automatic caller, ≤5min cadence, appends to ~/.local/state/ezgha/
-   invariant_history.jsonl with the exact schema) — determine remaining gap.
-2. Build/finish the E1 sampler if lane-cg didn't fully cover it.
-3. Re-check PR #8214 CI status.
-4. Re-run doctor.sh / verify-exit-criteria.sh for a clean baseline sample.
-5. Continue monitoring lane-h in the background; check back periodically via
-   Read on its output file.
+1. WAIT for Codex usage limit reset (~2:52 PM PT) then relaunch the E1 sampler
+   worker in ~/projects/ez-gh-actions-wt-e1 (branch already created, prompt file
+   preserved).
+2. Continue monitoring lane-h in the background (still has quota, actively
+   redacting the GCP key exposure + building gitleaks config/CI wiring); check
+   its output file periodically, review its branch/PR before merging.
+3. Re-check PR #8214 CI status (task #4, not yet re-checked since initial recovery
+   scan).
+4. Re-run doctor.sh / verify-exit-criteria.sh for a clean baseline sample once
+   fleet settles.
+5. Given Codex quota is now a scarce/limited resource until 2:52 PM, avoid
+   launching further codex background workers in the meantime unless truly
+   necessary; use direct investigation/scripting instead where possible.
