@@ -1082,7 +1082,7 @@ exit 0
         }
 
         let out = run_gh_with_backoff(|| {
-            let mut cmd = Command::new("/usr/bin/bash");
+            let mut cmd = Command::new("/bin/sh");
             cmd.arg(&script);
             cmd
         })
