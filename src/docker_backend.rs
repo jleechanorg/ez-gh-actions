@@ -534,6 +534,14 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
     Ok(containers)
 }
 
+fn count_current_prefix_containers(containers: &[ManagedContainer], cfg: &Config) -> u32 {
+    let prefix = format!("{}-", cfg.runner.name_prefix);
+    containers
+        .iter()
+        .filter(|c| c.name.starts_with(&prefix))
+        .count() as u32
+}
+
 /// Kill all managed runner containers. Returns how many were removed.
 pub fn stop_all(cfg: &Config) -> Result<usize> {
     let containers = managed_containers()?;
@@ -617,7 +625,8 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     // Print the host-kernel warning at most once per process — `serve` would
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
-    let alive = managed_containers()?.len() as u32;
+    let containers = managed_containers()?;
+    let alive = count_current_prefix_containers(&containers, cfg);
     if alive >= cfg.runner.count {
         return Ok(Vec::new());
     }
@@ -969,6 +978,33 @@ mod tests {
         let mut custom = cfg.clone();
         custom.runner.name_prefix = "lab-runner".into();
         assert_eq!(runner_name_for(&custom, 7), "lab-runner-7");
+    }
+
+    fn managed_container(name: &str) -> ManagedContainer {
+        ManagedContainer {
+            id: name.into(),
+            name: name.into(),
+            state: "running".into(),
+            running_for: "1s".into(),
+        }
+    }
+
+    #[test]
+    fn current_prefix_container_count_ignores_retired_prefixes() {
+        let containers = vec![
+            managed_container("ez-runner-b-1"),
+            managed_container("ez-runner-c-1"),
+            managed_container("ez-runner-c-2"),
+        ];
+
+        let old_cfg = cfg_with(3, "ez-runner-b");
+        assert_eq!(count_current_prefix_containers(&containers, &old_cfg), 1);
+
+        let current_cfg = cfg_with(3, "ez-runner-c");
+        assert_eq!(
+            count_current_prefix_containers(&containers, &current_cfg),
+            2
+        );
     }
 
     fn runner_info(id: u64, name: &str) -> github::RunnerInfo {
