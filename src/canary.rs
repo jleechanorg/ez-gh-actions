@@ -147,7 +147,7 @@ pub fn correlate_run_job(
     let job = jobs.iter().find(|job| {
         job.runner_name
             .as_deref()
-            .is_some_and(|name| name.starts_with(&format!("{runner_prefix}-")))
+            .is_some_and(|name| runner_matches_prefix(name, runner_prefix))
     })?;
     Some(RunJobRunnerCorrelation {
         run_id: run.id,
@@ -177,6 +177,9 @@ pub fn result_from_run_jobs(
     let correlation = correlate_run_job(run, jobs, runner_prefix);
     let correlated_job = correlation.as_ref();
     let fallback_job = jobs.first();
+    let fallback_runner_name = fallback_job
+        .and_then(|job| job.runner_name.as_deref())
+        .filter(|name| runner_matches_prefix(name, runner_prefix));
     let queued_at = run.created_at.clone();
     let started_at = correlated_job
         .and_then(|corr| corr.started_at.clone())
@@ -213,7 +216,7 @@ pub fn result_from_run_jobs(
             .or_else(|| fallback_job.map(|job| job.id)),
         runner_name: correlated_job
             .and_then(|corr| corr.runner_name.clone())
-            .or_else(|| fallback_job.and_then(|job| job.runner_name.clone())),
+            .or_else(|| fallback_runner_name.map(str::to_string)),
         status,
         conclusion,
         queued_at: Some(queued_at),
@@ -235,6 +238,10 @@ fn duration_between(start: &str, end: Option<&str>) -> Option<i64> {
     let start = parse_github_timestamp_secs(start)?;
     let end = parse_github_timestamp_secs(end?)?;
     Some((end - start).max(0))
+}
+
+fn runner_matches_prefix(runner_name: &str, runner_prefix: &str) -> bool {
+    runner_name.starts_with(&format!("{runner_prefix}-"))
 }
 
 fn append_history(path: &Path, result: &CanaryResult) -> Result<()> {
@@ -367,6 +374,28 @@ mod tests {
         assert_eq!(result.runner_name, None);
         assert_eq!(result.status, "queued");
         assert_eq!(result.time_to_start_seconds, None);
+    }
+
+    #[test]
+    fn result_does_not_accept_wrong_runner_prefix_from_fallback_job() {
+        let run = run(7, "ezgha-selftest nonce", "workflow_dispatch", "completed");
+        let jobs = vec![job(2, Some("other-runner-1"), "completed", Some("success"))];
+
+        let result = result_from_run_jobs(
+            "owner/repo",
+            "selftest.yml",
+            "nonce",
+            &run,
+            &jobs,
+            "ez-runner-c",
+            90,
+        );
+
+        assert_eq!(result.run_id, Some(7));
+        assert_eq!(result.job_id, Some(2));
+        assert_eq!(result.runner_name, None);
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.conclusion.as_deref(), Some("success"));
     }
 
     #[test]
