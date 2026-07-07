@@ -44,6 +44,10 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 **Cross-host (Mac)**: jleechan-5rv (P2, re-test after new binary + bxy), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
 
+## Recent activity (by day)
+
+- [2026-07-07](activity/2026-07-07.md) — Fleet doctor session + macOS deadlock recovery + `--cpus` float precision fix
+
 ## Recent activity (rolling)
 
 ### 2026-07-07 (Codex continuation) — saturation investigation + `/nextsteps` tracker sync

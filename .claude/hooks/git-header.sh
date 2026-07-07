@@ -1,0 +1,1 @@
+/Users/jleechan/.claude/hooks/git-header.sh
