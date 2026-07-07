@@ -141,12 +141,41 @@ Deadline 2026-07-08 07:20 PT.
 lane-h's gitleaks sweep found a REAL, live-looking GCP service-account private key
 checked into jleechanorg/worldarchitect.ai:roadmap/agent_001_command_frequency.json
 (50 occurrences, first committed 2025-09-22 commit 6e4aa9a #1711 — exposed ~10
-months). project_id=worldarchitecture-ai, full PEM private key present. Verified
-independently (grep, not just trusting the sub-agent), NOT reproduced here, NOT
-rotated, NOT history-rewritten. lane-h is redacting the tracked-file occurrences
-going forward (new commit). Escalated to main via SendMessage — needs a human
-decision on GCP key rotation, which is outside any agent's mandate here. This is
-the highest-priority open item; do not let it get buried under routine lane work.
+months). project_id=worldarchitecture-ai, key ID prefix `052f6b1a94...` (full PEM
+private key NOT reproduced anywhere in this log). Verified independently (grep,
+not just trusting the sub-agent), NOT reproduced, NOT rotated, NOT history-
+rewritten. lane-h redacted the tracked-file occurrences in a new commit (verified:
+0 remaining occurrences of the key material in the working tree, replaced with
+`[REDACTED: captured service account credential removed 2026-07-07]`).
+
+Main independently verified the key is live: service account
+dev-runner@worldarchitecture-ai.iam.gserviceaccount.com, roles include
+resourcemanager.projectIamAdmin, firebase.admin, run.admin, storage.admin
+(takeover-class). 30-day admin-activity logs show ZERO use of this specific key
+(serviceAccountKeyName filter) — no misuse evidence, disable is low-risk. User
+notified (terminal + mobile push) with a one-command disable option; the
+disable/rotate decision correctly stays with the user, not any agent.
+
+**Follow-up sweep (2026-07-07, this session, per main's instruction) — scope now
+closed:** grepped the exact key-ID prefix across all ~50+ local repo clones under
+~/projects: every hit besides the one already-fixed tracked file is either (a) the
+SAME tracked file in another worktree checkout of the identical worldarchitect.ai
+repo (resolves automatically once those worktrees sync with the fixed main), or
+(b) 6 UNTRACKED local files under docs/genesis/processing/... (final_analysis.json,
+progress_020/023.json, extraction_progress_008/010.json, chunk_001.json) —
+confirmed via `git ls-files --error-unmatch` NOT tracked by git, so out of the
+"tracked-file secret cleanup" scope and not a repo-hygiene issue (though still
+plaintext-on-disk locally; moot once the key is rotated). Also ran a broader
+`private_key_id`/`BEGIN PRIVATE KEY` sweep across all OTHER distinct (non-
+worldarchitect.ai-duplicate) local repos (ez-gh-actions, beads-rs, dark-factory,
+mcp_mail, orch_cmux_ubuntu, orch_llm-wiki, orch_worldai_claw, user_scope,
+worldarchitect-2step-wizard) — three hits, all confirmed FALSE POSITIVES on
+inspection: dark-factory's collect_repro.py (redaction-scrubbing code itself, a
+pattern tuple used to detect/scrub secrets, not an embedded key), orch_llm-wiki's
+service_account_loader.py (legitimate app code reading GOOGLE_PRIVATE_KEY from an
+env var, with truncated example text in comments), and worldarchitect-2step-
+wizard's .env.example (a template with `YOUR_PRIVATE_KEY_CONTENT_HERE` placeholder
+and a truncated example value). **No additional distinct secret exposure found.**
 
 ## E1 sampler status (2026-07-07 13:19 PT)
 
