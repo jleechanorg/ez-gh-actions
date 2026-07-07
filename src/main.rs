@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 mod backend;
@@ -170,6 +171,126 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
     }
 }
 
+const BACKEND_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
+const BACKEND_RESTART_WINDOW: Duration = Duration::from_secs(600);
+const BACKEND_RESTART_MAX_ATTEMPTS: u32 = 3;
+
+#[derive(Debug)]
+struct BackendRecoveryState {
+    window_started: Instant,
+    attempts_in_window: u32,
+    last_restart_at: Option<Instant>,
+}
+
+impl BackendRecoveryState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            window_started: now,
+            attempts_in_window: 0,
+            last_restart_at: None,
+        }
+    }
+
+    fn allow_restart(&mut self) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.window_started) > BACKEND_RESTART_WINDOW {
+            self.window_started = now;
+            self.attempts_in_window = 0;
+        }
+
+        if let Some(last) = self.last_restart_at {
+            if now.duration_since(last) < BACKEND_RESTART_COOLDOWN {
+                eprintln!(
+                    "backend restart suppressed: cooldown window active ({:?} since last)",
+                    now.duration_since(last)
+                );
+                return false;
+            }
+        }
+
+        if self.attempts_in_window >= BACKEND_RESTART_MAX_ATTEMPTS {
+            eprintln!(
+                "backend restart suppressed: {} attempts in last {:?} reached cap {}",
+                self.attempts_in_window, BACKEND_RESTART_WINDOW, BACKEND_RESTART_MAX_ATTEMPTS
+            );
+            return false;
+        }
+
+        self.attempts_in_window += 1;
+        self.last_restart_at = Some(now);
+        true
+    }
+}
+
+fn run_restart_command(cmd: &str, args: &[&str]) -> Result<bool> {
+    let status = Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to execute {cmd}"))?;
+    Ok(status.success())
+}
+
+fn attempt_backend_restart() -> Result<bool> {
+    // Keep host bootstrap logic portable: prefer the project-local tooling (`colima`),
+    // then the underlying VM launcher (`limactl`), then systemd's native unit.
+    let attempts = [
+        ("colima", ["start"].as_ref()),
+        ("limactl", ["start", "colima"].as_ref()),
+        (
+            "systemctl",
+            ["--user", "start", "lima-vm@colima.service"].as_ref(),
+        ),
+    ];
+    for (cmd, args) in attempts {
+        match run_restart_command(cmd, args) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {
+                eprintln!("{cmd} exists but restart returned non-zero ({:?})", args);
+            }
+            Err(err) => {
+                if let Some(io) = err.downcast_ref::<std::io::Error>() {
+                    if io.kind() == std::io::ErrorKind::NotFound {
+                        continue;
+                    }
+                }
+                eprintln!("{cmd} restart command failed: {err:#}");
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn should_attempt_backend_restart(backend: &backend::Backend) -> bool {
+    matches!(
+        backend,
+        backend::Backend::Docker | backend::Backend::DockerSysbox
+    ) && !platform::detect().docker_ok
+}
+
+fn maybe_restart_backend(backend: &backend::Backend, recovery: &mut BackendRecoveryState) -> bool {
+    if !should_attempt_backend_restart(backend) {
+        return false;
+    }
+    if !recovery.allow_restart() {
+        return false;
+    }
+    match attempt_backend_restart() {
+        Ok(true) => {
+            eprintln!("restarted backend runtime and will retry quickly");
+            true
+        }
+        Ok(false) => {
+            eprintln!("backend restart command paths were unavailable or returned non-zero");
+            false
+        }
+        Err(err) => {
+            eprintln!("backend restart command failed: {err:#}");
+            false
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli)?;
@@ -318,20 +439,29 @@ fn main() -> Result<()> {
             // stops blocking the start. No-op when NOTIFY_SOCKET is unset (macOS
             // launchd path / interactive `ezgha serve`).
             let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
+            let mut backend_recovery = BackendRecoveryState::new();
             loop {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
-                match docker_backend::ensure_count(&cfg, backend) {
+                let sleep = match docker_backend::ensure_count(&cfg, backend) {
                     Ok(started) => {
                         for name in started {
                             println!("respawned ephemeral runner {name}");
                         }
+                        Duration::from_secs(30)
                     }
-                    Err(e) => eprintln!("ensure_count failed (will retry): {e:#}"),
-                }
+                    Err(e) => {
+                        eprintln!("ensure_count failed (will retry): {e:#}");
+                        if maybe_restart_backend(&backend, &mut backend_recovery) {
+                            Duration::from_secs(8)
+                        } else {
+                            Duration::from_secs(30)
+                        }
+                    }
+                };
                 watchdog::ping();
-                std::thread::sleep(std::time::Duration::from_secs(30));
+                std::thread::sleep(sleep);
             }
         }
         Commands::Stop => {

@@ -1,0 +1,1 @@
+dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/hello.dot --goal 'Verify status and hardening state on Linux after docker_backend and verify-exit-criteria updates' --backend codex --cxdb /home/jleechan/.dark-factory/cxdb.sqlite
