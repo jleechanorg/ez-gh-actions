@@ -306,10 +306,18 @@ else
     fail "Gate 7: Unsupported platform $PLATFORM for monitoring check"
 fi
 
+ALERT_EVENT_KEY="gate7.verify.$(date +%s).$$"
+if ! ALERT_TEST_OUT=$(~/.cargo/bin/ezgha --config "$CONFIG_FILE" test-alert --event-key "$ALERT_EVENT_KEY" 2>&1); then
+    fail "Gate 7: Alert test-send failed: $ALERT_TEST_OUT"
+fi
+if ! echo "$ALERT_TEST_OUT" | grep -q "test alert delivered"; then
+    fail "Gate 7: Alert test-send did not report delivery: $ALERT_TEST_OUT"
+fi
+
 if ! gh api rate_limit >/dev/null 2>&1; then
     fail "Gate 7: Unable to query rate limit (GitHub API down)"
 fi
-pass "Gate 7: Automated monitoring scheduled and active"
+pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
 
 # --- Gate 10: GitHub API budget ---
 echo "--- Checking Gate 10: GitHub API budget ---"

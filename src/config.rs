@@ -37,6 +37,8 @@ pub struct AlertConfig {
     pub email_to: Option<String>,
     /// Optional sender address for `sendmail`.
     pub email_from: Option<String>,
+    /// Optional durable local JSONL alert log path.
+    pub log_path: Option<PathBuf>,
 }
 
 impl Default for AlertConfig {
@@ -47,6 +49,7 @@ impl Default for AlertConfig {
             slack_webhook_url: None,
             email_to: None,
             email_from: None,
+            log_path: None,
         }
     }
 }
@@ -167,6 +170,7 @@ impl Config {
                 slack_webhook_url: None,
                 email_to: None,
                 email_from: None,
+                log_path: None,
             },
         }
     }
@@ -234,6 +238,11 @@ impl Config {
                 "alert.alert_cooldown_secs must be at least 1 second (got {})",
                 self.alert.alert_cooldown_secs
             );
+        }
+        if let Some(path) = &self.alert.log_path {
+            if path.as_os_str().is_empty() {
+                anyhow::bail!("alert.log_path must not be empty when configured");
+            }
         }
         Ok(())
     }

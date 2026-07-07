@@ -12,6 +12,10 @@ mkdir -p "$TMP/home/.cargo/bin" "$TMP/home/.config/ezgha" "$TMP/bin"
 
 cat >"$TMP/home/.cargo/bin/ezgha" <<EOF
 #!/usr/bin/env bash
+if [ "\${1:-}" = "--config" ] && [ "\${3:-}" = "test-alert" ]; then
+  echo "test alert delivered for event_key=\${5:-test}"
+  exit 0
+fi
 echo "ezgha 0.1.0-$(git -C "$ROOT" rev-parse --short HEAD)"
 EOF
 chmod +x "$TMP/home/.cargo/bin/ezgha"

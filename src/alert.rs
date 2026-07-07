@@ -1,10 +1,12 @@
 use crate::config::{AlertConfig, Config};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ALERT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const ALERT_CONNECT_TIMEOUT_SECS: &str = "5";
@@ -154,10 +156,10 @@ fn send_slack(url: &str, subject: &str, body: &str, severity: Severity) -> Resul
     let mut cmd = Command::new("curl");
     cmd.args(slack_curl_args(url, &payload));
     let out = run_command_with_timeout(cmd, ALERT_COMMAND_TIMEOUT)
-        .with_context(|| format!("failed to invoke curl for slack alert {url}"))?;
+        .context("failed to invoke curl for slack alert")?;
     if !out.status.success() {
         anyhow::bail!(
-            "slack webhook call failed for {url} with status {}: {}",
+            "slack webhook call failed with status {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -216,27 +218,58 @@ fn send_email(
     Ok(())
 }
 
-fn configured_channels(cfg: &AlertConfig) -> bool {
-    cfg.slack_webhook_url.is_some() || cfg.email_to.is_some()
+fn send_log(
+    path: &Path,
+    event_key: &str,
+    subject: &str,
+    body: &str,
+    severity: Severity,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create alert log directory {}", parent.display()))?;
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let line = serde_json::json!({
+        "ts_unix": ts,
+        "event_key": event_key,
+        "severity": severity.to_string(),
+        "subject": subject,
+        "body": body,
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open alert log {}", path.display()))?;
+    writeln!(file, "{line}").with_context(|| format!("write alert log {}", path.display()))?;
+    Ok(())
 }
 
-/// Send an alert if at least one channel is configured and the event is not
-/// within the per-event cooldown window. Returns `Ok(())` even when no channels
-/// are configured so alerting is non-fatal for serve loop reliability.
-pub fn notify(
+pub fn configured_channels(cfg: &AlertConfig) -> bool {
+    cfg.slack_webhook_url.is_some() || cfg.email_to.is_some() || cfg.log_path.is_some()
+}
+
+/// Send an alert and return whether any configured transport delivered it.
+/// No-channel and cooldown-suppressed events return `Ok(false)`.
+pub fn notify_delivery(
     cfg: &Config,
     event_key: &str,
     severity: Severity,
     subject: &str,
     body: &str,
-) -> Result<()> {
+) -> Result<bool> {
     if !configured_channels(&cfg.alert) {
-        return Ok(());
+        return Ok(false);
     }
 
     let cooldown = Duration::from_secs(cfg.alert.alert_cooldown_secs.max(1));
     if !should_send(event_key, cooldown) {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut delivered = false;
@@ -263,10 +296,31 @@ pub fn notify(
             }
         }
     }
+    if let Some(log_path) = cfg.alert.log_path.as_deref() {
+        match send_log(log_path, event_key, subject, body, severity) {
+            Ok(()) => delivered = true,
+            Err(err) => {
+                eprintln!("WARN: file alert send failed: {err:#}");
+            }
+        }
+    }
     if delivered {
         record_sent(event_key);
     }
-    Ok(())
+    Ok(delivered)
+}
+
+/// Send an alert if at least one channel is configured and the event is not
+/// within the per-event cooldown window. Returns `Ok(())` even when no channels
+/// are configured so alerting is non-fatal for serve loop reliability.
+pub fn notify(
+    cfg: &Config,
+    event_key: &str,
+    severity: Severity,
+    subject: &str,
+    body: &str,
+) -> Result<()> {
+    notify_delivery(cfg, event_key, severity, subject, body).map(|_| ())
 }
 
 #[cfg(test)]
@@ -458,6 +512,44 @@ mod tests {
             !should_send_now_for_test("partial-success", Duration::from_secs(60)),
             "one successful transport must record cooldown"
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_log_channel_writes_jsonl_and_consumes_cooldown() {
+        let _guard = test_lock();
+        clear_alert_state();
+        let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
+        cfg.alert.alert_cooldown_secs = 60;
+        let dir = unique_temp_dir("file-log");
+        let log = dir.join("alerts.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+
+        let first = notify_delivery(
+            &cfg,
+            "gate7.test",
+            Severity::Critical,
+            "test alert",
+            "durable body",
+        )
+        .unwrap();
+        let second = notify_delivery(
+            &cfg,
+            "gate7.test",
+            Severity::Critical,
+            "test alert",
+            "durable body",
+        )
+        .unwrap();
+
+        assert!(first, "configured file log should count as delivery");
+        assert!(!second, "second event should be cooldown-suppressed");
+        let raw = fs::read_to_string(&log).unwrap();
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"event_key\":\"gate7.test\""));
+        assert!(lines[0].contains("\"severity\":\"CRITICAL\""));
+        assert!(lines[0].contains("\"subject\":\"test alert\""));
         let _ = fs::remove_dir_all(dir);
     }
 

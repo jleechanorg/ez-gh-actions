@@ -61,6 +61,12 @@ enum Commands {
     Status,
     /// Install as a user service (systemd --user / launchd)
     InstallService,
+    /// Send a test alert to the configured alert channel(s)
+    TestAlert {
+        /// Event key used for cooldown tracking
+        #[arg(long, default_value = "operator.test")]
+        event_key: String,
+    },
     /// Internal systemd failure hook installed by `install-service`
     #[command(hide = true)]
     SystemdAlertHook {
@@ -455,6 +461,26 @@ fn run_systemd_alert_hook(
     Ok(())
 }
 
+fn run_test_alert(cfg: &config::Config, event_key: &str) -> Result<()> {
+    if !alert::configured_channels(&cfg.alert) {
+        bail!("no alert channels configured; set alert.log_path, alert.slack_webhook_url, or alert.email_to");
+    }
+    let delivered = alert::notify_delivery(
+        cfg,
+        event_key,
+        Severity::Info,
+        "ezgha test alert",
+        "operator-requested test alert delivery proof",
+    )?;
+    if !delivered {
+        bail!(
+            "test alert was not delivered; event may be in cooldown or every configured transport failed"
+        );
+    }
+    println!("test alert delivered for event_key={event_key}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli)?;
@@ -706,6 +732,10 @@ fn main() -> Result<()> {
             Config::load(&path)?;
             service::install(&path)?;
         }
+        Commands::TestAlert { event_key } => {
+            let cfg = Config::load(&path)?;
+            run_test_alert(&cfg, event_key)?;
+        }
         Commands::SystemdAlertHook { source, unit } => {
             let cfg = Config::load(&path)?;
             run_systemd_alert_hook(&cfg, *source, unit)?;
@@ -786,6 +816,34 @@ fn acquire_serve_lock() -> Result<ServeLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_config() -> config::Config {
+        config::Config::defaults_for(
+            &platform::Platform {
+                os: "linux",
+                arch: "x86_64",
+                kvm_usable: false,
+                has_tart: false,
+                has_virsh: false,
+                docker_ok: true,
+                sysbox_runtime: false,
+                daemon_in_vm: false,
+                total_mem_mb: 8192,
+                cpus: 4,
+            },
+            "jleechanorg".into(),
+            Scope::Org,
+        )
+    }
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ezgha-main-{name}-{nanos}"))
+    }
 
     #[test]
     fn systemd_exec_stop_post_watchdog_emits_critical_event() {
@@ -852,5 +910,28 @@ mod tests {
             best_available: backend::Backend::Docker,
             required: config::IsolationLevel::Vm,
         }));
+    }
+
+    #[test]
+    fn test_alert_requires_configured_channel() {
+        let cfg = test_config();
+        let err = run_test_alert(&cfg, "unit.no_channel").unwrap_err();
+        assert!(err.to_string().contains("no alert channels configured"));
+    }
+
+    #[test]
+    fn test_alert_writes_configured_log_channel() {
+        alert::clear_alert_state();
+        let mut cfg = test_config();
+        let dir = unique_temp_dir("alert-test");
+        let log = dir.join("alerts.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+
+        run_test_alert(&cfg, "unit.alert_test").unwrap();
+
+        let raw = std::fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("\"event_key\":\"unit.alert_test\""));
+        assert!(raw.contains("\"subject\":\"ezgha test alert\""));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
