@@ -17,6 +17,82 @@ use crate::watchdog;
 /// list-runners calls can take 10-15 s on a large org. Anything longer is
 /// hung and should be killed so the 30 s serve loop can retry.
 const GH_TIMEOUT: Duration = Duration::from_secs(45);
+const GH_MAX_RETRIES: u32 = 5;
+const GH_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+const GH_RETRY_MAX_DELAY: Duration = Duration::from_secs(32);
+
+fn extract_retry_after_secs(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("retry") {
+            continue;
+        }
+        for token in lower
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .filter(|p| !p.is_empty())
+        {
+            if let Ok(v) = token.parse::<u64>() {
+                return Some(v);
+            }
+            if let Some((_, raw)) = token.split_once(':') {
+                if let Ok(v) = raw.trim().parse::<u64>() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_rate_limit_response(stdout: &str, stderr: &str, status: Option<i32>) -> bool {
+    let lower = format!("{stdout} {stderr}").to_ascii_lowercase();
+    if !(lower.contains("rate") || lower.contains("secondary") || lower.contains("abuse")) {
+        return false;
+    }
+    if status == Some(403) || status == Some(429) {
+        return true;
+    }
+    lower.contains("http 403") || lower.contains("http 429")
+}
+
+fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
+    let code = out.status.code();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !is_rate_limit_response(&stdout, &stderr, code) {
+        return None;
+    }
+    extract_retry_after_secs(&format!("{stderr} {stdout}"))
+        .map(Duration::from_secs)
+        .map(|d| d.min(GH_RETRY_MAX_DELAY).max(Duration::from_secs(1)))
+}
+
+fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::process::Output> {
+    let mut delay = GH_RETRY_BASE_DELAY;
+    for attempt in 1..=GH_MAX_RETRIES {
+        let out = run_gh(make_cmd())?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        if let Some(wait) = classify_retry_delay(&out) {
+            if attempt >= GH_MAX_RETRIES {
+                return Ok(out);
+            }
+            eprintln!(
+                "gh API rate-limited; retrying in {}s (attempt {}/{})",
+                wait.as_secs(),
+                attempt,
+                GH_MAX_RETRIES
+            );
+            let sleep_for = std::cmp::max(wait, delay);
+            std::thread::sleep(sleep_for);
+            delay = (delay * 2).min(GH_RETRY_MAX_DELAY);
+            continue;
+        }
+        return Ok(out);
+    }
+    unreachable!("backoff loop must return before exit");
+}
 
 /// Run `cmd`, capturing stdout and stderr, but never block longer than
 /// `GH_TIMEOUT`. Returns `Ok((stdout, stderr))` if the child exited (success
@@ -126,13 +202,16 @@ pub fn generate_jitconfig(
     owned_ids: &std::collections::HashSet<u64>,
 ) -> Result<(String, u64)> {
     let path = jitconfig_path(gh);
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
-    cmd.args(["-F", "runner_group_id=1"]);
-    for label in labels {
-        cmd.args(["-f", &format!("labels[]={label}")]);
-    }
-    let out = run_gh(cmd).context("failed to run `gh api` — is the gh CLI installed?")?;
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = Command::new("gh");
+        cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
+        cmd.args(["-F", "runner_group_id=1"]);
+        for label in labels {
+            cmd.args(["-f", &format!("labels[]={label}")]);
+        }
+        cmd
+    })
+    .context("failed to run `gh api` — is the gh CLI installed?")?;
     watchdog::ping();
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -165,13 +244,22 @@ pub fn generate_jitconfig(
                     );
                     if remove_runner(gh, conflicting.id).is_ok() {
                         watchdog::ping();
-                        let mut retry_cmd = Command::new("gh");
-                        retry_cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
-                        retry_cmd.args(["-F", "runner_group_id=1"]);
-                        for label in labels {
-                            retry_cmd.args(["-f", &format!("labels[]={label}")]);
-                        }
-                        let retry_out = run_gh(retry_cmd)?;
+                        let retry_out = run_gh_with_backoff(|| {
+                            let mut retry_cmd = Command::new("gh");
+                            retry_cmd.args([
+                                "api",
+                                "-X",
+                                "POST",
+                                &path,
+                                "-f",
+                                &format!("name={name}"),
+                            ]);
+                            retry_cmd.args(["-F", "runner_group_id=1"]);
+                            for label in labels {
+                                retry_cmd.args(["-f", &format!("labels[]={label}")]);
+                            }
+                            retry_cmd
+                        })?;
                         if retry_out.status.success() {
                             let parsed: JitConfigResponse = serde_json::from_slice(
                                 &retry_out.stdout,
@@ -238,9 +326,12 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     // and plain `--paginate` concatenates those objects into invalid JSON.
     // `--slurp` collects the pages into a single top-level JSON array instead,
     // which we deserialize as `Vec<RunnerList>` and flatten.
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", "--paginate", "--slurp", &path]);
-    let out = run_gh(cmd).context("failed to run `gh api`")?;
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = Command::new("gh");
+        cmd.args(["api", "--paginate", "--slurp", &path]);
+        cmd
+    })
+    .context("failed to run `gh api`")?;
     if !out.status.success() {
         bail!(
             "gh api list runners failed: {}",
@@ -259,7 +350,12 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
     let path = runner_remove_path(gh, id);
     let mut cmd = Command::new("gh");
     cmd.args(["api", "-X", "DELETE", &path]);
-    let out = run_gh(cmd).context("failed to run `gh api`")?;
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = Command::new("gh");
+        cmd.args(["api", "-X", "DELETE", &path]);
+        cmd
+    })
+    .context("failed to run `gh api`")?;
     if !out.status.success() {
         bail!(
             "gh api remove runner {id} failed: {}",
@@ -294,9 +390,11 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
 /// still works for `gh api` even when a non-active account is in an error
 /// state.
 pub fn gh_auth_ok() -> bool {
-    let mut status_cmd = Command::new("gh");
-    status_cmd.args(["auth", "status"]);
-    let out = match run_gh(status_cmd) {
+    let out = match run_gh_with_backoff(|| {
+        let mut status_cmd = Command::new("gh");
+        status_cmd.args(["auth", "status"]);
+        status_cmd
+    }) {
         Ok(o) => o,
         Err(_) => return false,
     };
@@ -316,9 +414,11 @@ pub fn gh_auth_ok() -> bool {
     // Last-resort: try the active account via `gh auth token`. This bypasses
     // `gh auth status`'s exit-code semantics entirely. If it prints a token,
     // the active account works.
-    let mut token_cmd = Command::new("gh");
-    token_cmd.args(["auth", "token"]);
-    match run_gh(token_cmd) {
+    match run_gh_with_backoff(|| {
+        let mut token_cmd = Command::new("gh");
+        token_cmd.args(["auth", "token"]);
+        token_cmd
+    }) {
         Ok(o) if o.status.success() => {
             let token = String::from_utf8_lossy(&o.stdout);
             !token.trim().is_empty()
@@ -549,5 +649,34 @@ github.com
         // Sanity: confirm the parsing logic we wrote above would treat this
         // stdout as success. We don't exec `gh` here — just validate the
         // string search the function depends on.
+    }
+
+    #[test]
+    fn detect_rate_limit_output() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(403 << 8),
+            stdout: Vec::new(),
+            stderr: b"HTTP 403: You have exceeded a secondary rate limit\nRetry-After: 7\n"
+                .to_vec(),
+        };
+        let delay =
+            classify_retry_delay(&out).expect("secondary rate limit response should be classified");
+        assert_eq!(delay, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn retry_after_parser_prefers_any_digit_token() {
+        let text = "Retry-After: 31\nX-Ratelimit-Reset: 1700000000\n";
+        assert_eq!(extract_retry_after_secs(text), Some(31));
+    }
+
+    #[test]
+    fn non_rate_limit_response_is_not_retried() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"gh: runner already exists and cannot be removed\n".to_vec(),
+        };
+        assert!(classify_retry_delay(&out).is_none());
     }
 }

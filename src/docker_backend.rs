@@ -679,6 +679,28 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
+    struct EnvVarRestore {
+        key: &'static str,
+        val: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarRestore {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, val: prev }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            match &self.val {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     /// Process-wide test lock: `slot_assignments_path()` reads from a static
     /// when running tests, so the slot file location and contents are
     /// effectively global state. Serializing tests around this static keeps
@@ -1019,6 +1041,28 @@ mod tests {
         let live = vec![runner_info(1, "ez-org-runner-1")];
         let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
         assert_eq!(reclaimed, 0);
+    }
+
+    #[test]
+    fn release_stale_slots_does_not_mutate_slot_file_on_list_runners_error() {
+        let _env = TestEnv::new("list_runners_error_does_not_mutate_slots");
+        let _cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&_cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let before = std::fs::read_to_string(_env.path.clone()).unwrap_or_else(|_| String::new());
+        let _path_guard = EnvVarRestore::set("PATH", "/nonexistent");
+        let reclaimed = release_stale_slots(&_cfg).unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "github API errors should not trigger slot reclamation"
+        );
+        let after = std::fs::read_to_string(_env.path.clone()).unwrap_or_else(|_| String::new());
+        assert_eq!(
+            before, after,
+            "slot file must remain unchanged when list_runners fails"
+        );
     }
 
     #[test]

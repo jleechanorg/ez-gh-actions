@@ -70,6 +70,13 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 - Rebuilt and restarted service with `cargo install --path .` and verified `systemctl --user status ezgha.service` active.
 - Re-ran `./docs/verify-exit-criteria.sh`: **ALL AUTO GATES PASS** after reinstall; Gate 10 only passed once GitHub API budget recovered (4950 remaining).
 
+### 2026-07-07 (hardening follow-up)
+
+- Landed `ez-gh-actions-ozk`: added `run_gh` exponential backoff + 403/429 parser with retry-after support in `src/github.rs`; added unit tests in `src/github.rs`.
+- Landed `ez-gh-actions-n5p`: updated `build.rs` to embed `-dirty` when git worktree has uncommitted changes instead of `unknown`; verified Gate 0 after reinstall.
+- Landed `ez-gh-actions-twp`: added regression unit coverage in `src/docker_backend.rs` ensuring `list_runners` failure does not mutate `slot_assignments.toml`.
+- Closed `ez-gh-actions-bn0` with a `/nextsteps` synchronization pass and synchronized issue states.
+
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 
 - Fleet functional but AMBER: external `ezgha-fleet-watchdog.sh` restarts every ~120s when count < configured.
