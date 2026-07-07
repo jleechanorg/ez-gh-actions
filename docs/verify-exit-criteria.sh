@@ -18,6 +18,59 @@ pass() {
     echo -e "${GREEN}[PASS] $1${NC}"
 }
 
+count_nonempty_lines() {
+    if [ -z "$1" ]; then
+        echo 0
+    else
+        printf '%s\n' "$1" | grep -c .
+    fi
+}
+
+is_rate_limit_text() {
+    echo "$1" | grep -Eiq 'rate limit|secondary rate limit|abuse|HTTP 403|HTTP 429|Retry-After'
+}
+
+gh_checked() {
+    local out status
+    if out=$(gh "$@" 2>&1); then
+        printf '%s' "$out"
+        return 0
+    fi
+    status=$?
+    if is_rate_limit_text "$out"; then
+        echo "GitHub API rate-limited while running: gh $*" >&2
+    else
+        echo "GitHub API command failed while running: gh $*" >&2
+    fi
+    echo "$out" >&2
+    return "$status"
+}
+
+toml_get_runner() {
+    local key="$1"
+    local default="${2:-}"
+    python3 - "$CONFIG_FILE" "$key" "$default" <<'PY'
+import sys
+
+path, key, default = sys.argv[1:]
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import toml
+    except ModuleNotFoundError:
+        raise SystemExit(2)
+    data = toml.load(path)
+else:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+value = data["runner"].get(key, default)
+print(value)
+PY
+}
+
 # --- Gate 0: Deployed code == committed code ---
 echo "--- Checking Gate 0: Deployed code == committed code ---"
 DEPLOYED_SHA=$(~/.cargo/bin/ezgha --version 2>/dev/null | cut -d'-' -f2 || echo "none")
@@ -110,28 +163,10 @@ CONFIG_FILE="$HOME/.config/ezgha/config.toml"
 if [ ! -f "$CONFIG_FILE" ]; then
     fail "Config file not found at $CONFIG_FILE"
 fi
-COUNT=$(python3 -c "
-import toml
-try:
-    c = toml.load(open('$CONFIG_FILE'))
-    print(c['runner']['count'])
-except Exception:
-    import tomllib
-    c = tomllib.load(open('$CONFIG_FILE', 'rb'))
-    print(c['runner']['count'])
-" 2>/dev/null || grep -E 'count\s*=\s*' "$CONFIG_FILE" | head -1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
+COUNT=$(toml_get_runner count 2>/dev/null || grep -E 'count\s*=\s*' "$CONFIG_FILE" | head -1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
 
 # Read name_prefix from config (default: ez-org-runner)
-NAME_PREFIX=$(python3 -c "
-import toml
-try:
-    c = toml.load(open('$CONFIG_FILE'))
-    print(c['runner'].get('name_prefix', 'ez-org-runner'))
-except Exception:
-    import tomllib
-    c = tomllib.load(open('$CONFIG_FILE', 'rb'))
-    print(c['runner'].get('name_prefix', 'ez-org-runner'))
-" 2>/dev/null || echo 'ez-org-runner')
+NAME_PREFIX=$(toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
 
 if [ -z "$COUNT" ]; then
     fail "Could not parse runner.count from $CONFIG_FILE"
@@ -139,7 +174,7 @@ fi
 
 RAW_RUNNERS=$(gh api orgs/jleechanorg/actions/runners --paginate 2>/dev/null || echo '{"runners":[]}')
 ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.runners[] | select(.name | startswith($p)) | select(.status == "online") | .name')
-ONLINE_COUNT=$(echo "$ONLINE_RUNNERS" | grep -c . || echo 0)
+ONLINE_COUNT=$(count_nonempty_lines "$ONLINE_RUNNERS")
 BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.runners[] | select(.name | startswith($p)) | select(.busy == true)] | length')
 EFFECTIVE_CAPACITY=$((ONLINE_COUNT))
 # Note: busy runners are a subset of online runners; adding both double-counts
@@ -204,7 +239,9 @@ echo "--- Checking Gate 4: Real job execution ---"
 WORKFLOW="ezgha-selftest"
 REPO="jleechanorg/ez-gh-actions"
 
-SELFTEST_RUNS=$(gh run list -R "$REPO" -w "$WORKFLOW" -L 20 --json databaseId,status,conclusion 2>/dev/null || true)
+if ! SELFTEST_RUNS=$(gh_checked run list -R "$REPO" -w "$WORKFLOW" -L 20 --json databaseId,status,conclusion); then
+    fail "Gate 4: unable to list ezgha-selftest runs"
+fi
 COMPLETED_RUNS=$(echo "$SELFTEST_RUNS" | jq -r '[.[] | select(.status=="completed")]')
 COMPLETED_COUNT=$(echo "$COMPLETED_RUNS" | jq 'length')
 if [ "$COMPLETED_COUNT" -lt 1 ]; then
@@ -214,11 +251,16 @@ fi
 # Validate recent completed runs executed on the configured runner prefix.
 # Prefer configured-prefix telemetry over stale historical runs from retired fleets.
 MATCH_PREFIX_COUNT=0
+JOB_LOOKUP_FAILURES=0
 while IFS=' ' read -r rid conc; do
     if [ -z "$rid" ] || [ -z "$conc" ]; then
         continue
     fi
-    jobs=$(gh api "repos/$REPO/actions/runs/$rid/jobs" 2>/dev/null)
+    if ! jobs=$(gh_checked api "repos/$REPO/actions/runs/$rid/jobs"); then
+        JOB_LOOKUP_FAILURES=$((JOB_LOOKUP_FAILURES + 1))
+        echo "    [WARN] Skipping selftest run $rid because job lookup failed"
+        continue
+    fi
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
     if [[ "$rn" == "${NAME_PREFIX}-"* ]]; then
         if [ "$conc" != "success" ]; then
@@ -233,11 +275,14 @@ while IFS=' ' read -r rid conc; do
 done <<< "$(echo "$COMPLETED_RUNS" | jq -r '.[] | "\(.databaseId) \(.conclusion)"')"
 
 if [ "$MATCH_PREFIX_COUNT" -eq 0 ]; then
+    if [ "$JOB_LOOKUP_FAILURES" -gt 0 ]; then
+        fail "No completed selftest runs could be verified on ${NAME_PREFIX}-*; $JOB_LOOKUP_FAILURES job lookup(s) failed"
+    fi
     fail "No completed selftest runs found on configured runner prefix (${NAME_PREFIX}-*)"
 fi
 
 if [ "$MATCH_PREFIX_COUNT" -lt 5 ]; then
-    echo "    [INFO] Only $MATCH_PREFIX_COUNT completed selftest runs matched ${NAME_PREFIX}-*; canary sample is below the 5-run target."
+    fail "Only $MATCH_PREFIX_COUNT completed selftest run(s) matched ${NAME_PREFIX}-*; Gate 4 requires at least 5"
 fi
 pass "Gate 4: Recent jobs successfully ran on the ezgha fleet"
 

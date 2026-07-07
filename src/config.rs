@@ -18,6 +18,37 @@ pub struct Config {
     pub runner: RunnerConfig,
     pub limits: Limits,
     pub policy: Policy,
+    #[serde(default)]
+    pub alert: AlertConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AlertConfig {
+    /// How many consecutive `ensure_count` failures should trigger an alert.
+    #[serde(default = "default_failure_alert_threshold")]
+    pub failure_alert_threshold: u32,
+    /// Re-alert cooldown in seconds for the same event class.
+    #[serde(default = "default_alert_cooldown_seconds")]
+    pub alert_cooldown_secs: u64,
+    /// Optional Slack Incoming Webhook URL.
+    pub slack_webhook_url: Option<String>,
+    /// Optional email destination; requires `sendmail` in PATH.
+    pub email_to: Option<String>,
+    /// Optional sender address for `sendmail`.
+    pub email_from: Option<String>,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            failure_alert_threshold: default_failure_alert_threshold(),
+            alert_cooldown_secs: default_alert_cooldown_seconds(),
+            slack_webhook_url: None,
+            email_to: None,
+            email_from: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -73,6 +104,14 @@ fn default_min_free_disk_gb() -> u64 {
     10
 }
 
+fn default_failure_alert_threshold() -> u32 {
+    3
+}
+
+fn default_alert_cooldown_seconds() -> u64 {
+    900
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -121,6 +160,13 @@ impl Config {
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
+            },
+            alert: AlertConfig {
+                failure_alert_threshold: default_failure_alert_threshold(),
+                alert_cooldown_secs: default_alert_cooldown_seconds(),
+                slack_webhook_url: None,
+                email_to: None,
+                email_from: None,
             },
         }
     }
@@ -177,6 +223,18 @@ impl Config {
                 self.github.target
             );
         }
+        if self.alert.failure_alert_threshold == 0 {
+            anyhow::bail!(
+                "alert.failure_alert_threshold must be at least 1 (got {})",
+                self.alert.failure_alert_threshold
+            );
+        }
+        if self.alert.alert_cooldown_secs == 0 {
+            anyhow::bail!(
+                "alert.alert_cooldown_secs must be at least 1 second (got {})",
+                self.alert.alert_cooldown_secs
+            );
+        }
         Ok(())
     }
 
@@ -231,6 +289,8 @@ mod tests {
         let tiny = Config::defaults_for(&fake_platform(1024, 1), "o/r".into(), Scope::Repo);
         assert_eq!(tiny.limits.memory_mb, 2048); // floor
         assert_eq!(tiny.limits.cpus, 1.0);
+        assert_eq!(tiny.alert.failure_alert_threshold, 3);
+        assert_eq!(tiny.alert.alert_cooldown_secs, 900);
 
         let huge = Config::defaults_for(&fake_platform(128 * 1024, 32), "o/r".into(), Scope::Repo);
         assert_eq!(huge.limits.memory_mb, 16384); // ceiling

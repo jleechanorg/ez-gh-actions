@@ -17,7 +17,7 @@ for a in "$@"; do
     --prove) PROVE=1 ;;   # dispatch a live canary job and verify it runs on our fleet
     -h|--help)
       echo "usage: doctor.sh [--prove] [--detail]"
-      echo "  --prove   dispatch a live ezgha-selftest and verify it runs on ez-org-runner-* (adds ~1-2 min)"
+      echo "  --prove   dispatch a live ezgha-selftest and verify it runs on the configured runner prefix (adds ~1-2 min)"
       echo "  --detail  verbose output"
       echo "env: LOOP_WINDOW (min, default 3), ROUTING_N (runs, default 6), ORG, EZGHA_REPO"
       exit 0 ;;
@@ -264,12 +264,12 @@ CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 info "managed containers running: $CONTAINER_COUNT (expected: configured runner.count)"
 echo "$CONTAINER_NAMES" | head -20
 
-# --- E. recent routing proof: jobs REALLY ran on ez-org-runner-* ---------
+# --- E. recent routing proof: jobs REALLY ran on the configured fleet -----
 # "online" is not "working". This section proves recent GitHub Actions jobs
-# were actually EXECUTED by ez-org-runner-* runners by reading each run's
+# were actually EXECUTED by configured-prefix runners by reading each run's
 # jobs API and confirming the runner_name that handled it belongs to our
-# fleet. A completed run whose runner_name is NOT ez-org-runner-* means the
-# job went to colima / GitHub-hosted / somewhere else.
+# fleet. A completed run whose runner_name does not match RUNNER_NAME_PREFIX
+# means the job went to a retired fleet / GitHub-hosted / somewhere else.
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
@@ -284,14 +284,14 @@ while read -r rid; do
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
   else
-    warn "run $rid: $conc on $rn (NOT an ez-org-runner)"
+    warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-*)"
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
 info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
 
 # --- E2. optional live canary: dispatch a job and prove it runs NOW ------
 # `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
-# then confirms the runner_name is ez-org-runner-* and conclusion=success.
+# then confirms the runner_name matches the configured prefix and conclusion=success.
 # This is the strongest "handled for real, right now" proof.
 CANARY_OK=""
 if [ "$PROVE" = "1" ]; then
@@ -316,11 +316,11 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    if [[ "$rn" == ez-org-runner-* ]] && [ "$conc" = "success" ]; then
+    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}" ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]]; } && [ "$conc" = "success" ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
     else
-      bad "canary run $cid: $conc on $rn (expected success on ez-org-runner-*)"
+      bad "canary run $cid: $conc on $rn (expected success on ${RUNNER_NAME_PREFIX}-*)"
     fi
   fi
 fi

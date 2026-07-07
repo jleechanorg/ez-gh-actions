@@ -4,12 +4,12 @@ use std::process::Command;
 
 /// Install a user-level service that runs `ezgha serve` at login and keeps
 /// it running: systemd --user on Linux, launchd on macOS.
-pub fn install() -> Result<()> {
+pub fn install(config_path: &std::path::Path) -> Result<()> {
     let exe = std::env::current_exe().context("cannot resolve ezgha binary path")?;
     if cfg!(target_os = "linux") {
-        install_systemd(&exe)
+        install_systemd(&exe, config_path)
     } else if cfg!(target_os = "macos") {
-        install_launchd(&exe)
+        install_launchd(&exe, config_path)
     } else {
         bail!("service install is only supported on linux (systemd --user) and macos (launchd)")
     }
@@ -21,48 +21,98 @@ fn home() -> Result<PathBuf> {
         .context("HOME not set")
 }
 
-fn install_systemd(exe: &std::path::Path) -> Result<()> {
+fn systemd_service_unit(
+    exe: &std::path::Path,
+    config_path: &std::path::Path,
+    path_env: &str,
+    home_dir: &std::path::Path,
+) -> String {
+    [
+        "[Unit]".to_string(),
+        "Description=ez-gh-actions ephemeral GitHub Actions runners".to_string(),
+        "# Wait for the Lima VM that hosts the Docker daemon on Linux (Colima/limactl)."
+            .to_string(),
+        "# If lima-vm@colima.service is not present (Docker Desktop, remote daemon, macOS),"
+            .to_string(),
+        "# systemd silently ignores the dependency -- the Wants= keeps this non-fatal.".to_string(),
+        "After=network-online.target lima-vm@colima.service".to_string(),
+        "Wants=lima-vm@colima.service".to_string(),
+        "# Limit crash-storm: if the service fails 5 times in 5 minutes, systemd".to_string(),
+        "# stops retrying rather than spinning at 100% journal throughput.".to_string(),
+        "StartLimitIntervalSec=300".to_string(),
+        "StartLimitBurst=5".to_string(),
+        "OnFailure=ezgha-alert@%N.service".to_string(),
+        "".to_string(),
+        "[Service]".to_string(),
+        "# Type=notify required so WatchdogSec= takes effect and so systemd only".to_string(),
+        "# considers the unit 'active' after wait_for_backend succeeds and we".to_string(),
+        "# send READY=1. TimeoutStartSec is set past wait_for_backend's 120s".to_string(),
+        "# budget so systemd never hangs forever if READY=1 never arrives.".to_string(),
+        "Type=notify".to_string(),
+        format!(
+            "ExecStart={} --config {} serve",
+            exe.display(),
+            config_path.display()
+        ),
+        format!(
+            "ExecStopPost=-{} --config {} systemd-alert-hook --source exec-stop-post --unit %n",
+            exe.display(),
+            config_path.display()
+        ),
+        "WatchdogSec=300".to_string(),
+        "NotifyAccess=main".to_string(),
+        "Restart=on-failure".to_string(),
+        "RestartSec=30".to_string(),
+        "TimeoutStartSec=130".to_string(),
+        format!("Environment=\"PATH={}\"", path_env),
+        format!("Environment=\"HOME={}\"", home_dir.display()),
+        "".to_string(),
+        "[Install]".to_string(),
+        "WantedBy=default.target".to_string(),
+        "".to_string(),
+    ]
+    .join("\n")
+}
+
+fn systemd_alert_unit(
+    exe: &std::path::Path,
+    config_path: &std::path::Path,
+    path_env: &str,
+    home_dir: &std::path::Path,
+) -> String {
+    [
+        "[Unit]".to_string(),
+        "Description=ez-gh-actions service failure alert hook for %i".to_string(),
+        "".to_string(),
+        "[Service]".to_string(),
+        "Type=oneshot".to_string(),
+        format!(
+            "ExecStart={} --config {} systemd-alert-hook --source on-failure --unit %i",
+            exe.display(),
+            config_path.display()
+        ),
+        "TimeoutStartSec=30".to_string(),
+        format!("Environment=\"PATH={}\"", path_env),
+        format!("Environment=\"HOME={}\"", home_dir.display()),
+        "".to_string(),
+    ]
+    .join("\n")
+}
+
+fn install_systemd(exe: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
     let unit_dir = home()?.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join("ezgha.service");
+    let alert_unit_path = unit_dir.join("ezgha-alert@.service");
     let path_env =
         std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let home_dir = home()?;
-    let unit = [
-        "[Unit]",
-        "Description=ez-gh-actions ephemeral GitHub Actions runners",
-        "# Wait for the Lima VM that hosts the Docker daemon on Linux (Colima/limactl).",
-        "# If lima-vm@colima.service is not present (Docker Desktop, remote daemon, macOS),",
-        "# systemd silently ignores the dependency -- the Wants= keeps this non-fatal.",
-        "After=network-online.target lima-vm@colima.service",
-        "Wants=lima-vm@colima.service",
-        "# Limit crash-storm: if the service fails 5 times in 5 minutes, systemd",
-        "# stops retrying rather than spinning at 100% journal throughput.",
-        "StartLimitIntervalSec=300",
-        "StartLimitBurst=5",
-        "",
-        "[Service]",
-        "# Type=notify required so WatchdogSec= takes effect and so systemd only",
-        "# considers the unit 'active' after wait_for_backend succeeds and we",
-        "# send READY=1. TimeoutStartSec is set past wait_for_backend's 120s",
-        "# budget so systemd never hangs forever if READY=1 never arrives.",
-        "Type=notify",
-        &format!("ExecStart={} serve", exe.display()),
-        "WatchdogSec=300",
-        "NotifyAccess=main",
-        "Restart=on-failure",
-        "RestartSec=30",
-        "TimeoutStartSec=130",
-        &format!("Environment=\"PATH={}\"", path_env),
-        &format!("Environment=\"HOME={}\"", home_dir.display()),
-        "",
-        "[Install]",
-        "WantedBy=default.target",
-        "",
-    ]
-    .join("\n");
+    let unit = systemd_service_unit(exe, config_path, &path_env, &home_dir);
+    let alert_unit = systemd_alert_unit(exe, config_path, &path_env, &home_dir);
     std::fs::write(&unit_path, unit)?;
     println!("wrote {}", unit_path.display());
+    std::fs::write(&alert_unit_path, alert_unit)?;
+    println!("wrote {}", alert_unit_path.display());
 
     for args in [
         vec!["--user", "daemon-reload"],
@@ -94,7 +144,7 @@ unset GH_TOKEN GITHUB_TOKEN GH_TOKEN_AGENTF AO_BOT_GH_TOKEN \
 exec "$(dirname "$0")/ezgha" "$@"
 "#;
 
-fn install_launchd(exe: &std::path::Path) -> Result<()> {
+fn install_launchd(exe: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
     let agents = home()?.join("Library/LaunchAgents");
     std::fs::create_dir_all(&agents)?;
     let plist_path = agents.join("org.jleechanorg.ezgha.plist");
@@ -130,7 +180,7 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
 <dict>
     <key>Label</key><string>org.jleechanorg.ezgha</string>
     <key>ProgramArguments</key>
-    <array><string>{}</string><string>serve</string></array>
+    <array><string>{}</string><string>--config</string><string>{}</string><string>serve</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>EnvironmentVariables</key>
@@ -144,6 +194,7 @@ fn install_launchd(exe: &std::path::Path) -> Result<()> {
 </plist>
 "#,
         wrapper_path.display(),
+        config_path.display(),
         path_env,
         home_dir.display()
     );
@@ -236,5 +287,35 @@ mod tests {
             LAUNCHD_WRAPPER.contains("exec \"$(dirname \"$0\")/ezgha\""),
             "LAUNCHD_WRAPPER must exec the real binary in-place"
         );
+    }
+
+    #[test]
+    fn systemd_service_wires_failure_alert_unit() {
+        let unit = systemd_service_unit(
+            std::path::Path::new("/home/jleechan/.cargo/bin/ezgha"),
+            std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/home/jleechan"),
+        );
+        assert!(
+            unit.contains("OnFailure=ezgha-alert@%N.service"),
+            "ezgha.service must invoke an alert unit when watchdog/start-limit failures put it into failed state"
+        );
+        assert!(unit.contains("ExecStopPost=-/home/jleechan/.cargo/bin/ezgha --config /home/jleechan/.config/ezgha/config.toml systemd-alert-hook --source exec-stop-post --unit %n"));
+    }
+
+    #[test]
+    fn systemd_alert_unit_invokes_failure_alert_command() {
+        let unit = systemd_alert_unit(
+            std::path::Path::new("/home/jleechan/.cargo/bin/ezgha"),
+            std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/home/jleechan"),
+        );
+        assert!(unit.contains("Type=oneshot"));
+        assert!(unit.contains("systemd-alert-hook"));
+        assert!(unit.contains("--source on-failure"));
+        assert!(unit.contains("--unit %i"));
+        assert!(unit.contains("TimeoutStartSec=30"));
     }
 }

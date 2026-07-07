@@ -21,6 +21,43 @@ const GH_MAX_RETRIES: u32 = 5;
 const GH_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const GH_RETRY_MAX_DELAY: Duration = Duration::from_secs(32);
 
+#[cfg(test)]
+thread_local! {
+    static GH_EXE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct GhExeOverrideGuard {
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl Drop for GhExeOverrideGuard {
+    fn drop(&mut self) {
+        GH_EXE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_gh_exe(path: &str) -> GhExeOverrideGuard {
+    let previous = GH_EXE_OVERRIDE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        slot.replace(path.to_string())
+    });
+    GhExeOverrideGuard { previous }
+}
+
+fn gh_executable() -> String {
+    #[cfg(test)]
+    if let Some(path) = GH_EXE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return path;
+    }
+
+    "gh".to_string()
+}
+
 fn extract_retry_after_secs(text: &str) -> Option<u64> {
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
@@ -62,9 +99,13 @@ fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
     if !is_rate_limit_response(&stdout, &stderr, code) {
         return None;
     }
-    extract_retry_after_secs(&format!("{stderr} {stdout}"))
-        .map(Duration::from_secs)
-        .map(|d| d.min(GH_RETRY_MAX_DELAY).max(Duration::from_secs(1)))
+    Some(
+        extract_retry_after_secs(&format!("{stderr} {stdout}"))
+            .map(Duration::from_secs)
+            .unwrap_or(GH_RETRY_BASE_DELAY)
+            .min(GH_RETRY_MAX_DELAY)
+            .max(Duration::from_secs(1)),
+    )
 }
 
 fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::process::Output> {
@@ -203,7 +244,7 @@ pub fn generate_jitconfig(
 ) -> Result<(String, u64)> {
     let path = jitconfig_path(gh);
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(gh_executable());
         cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
         cmd.args(["-F", "runner_group_id=1"]);
         for label in labels {
@@ -245,7 +286,7 @@ pub fn generate_jitconfig(
                     if remove_runner(gh, conflicting.id).is_ok() {
                         watchdog::ping();
                         let retry_out = run_gh_with_backoff(|| {
-                            let mut retry_cmd = Command::new("gh");
+                            let mut retry_cmd = Command::new(gh_executable());
                             retry_cmd.args([
                                 "api",
                                 "-X",
@@ -327,7 +368,7 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     // `--slurp` collects the pages into a single top-level JSON array instead,
     // which we deserialize as `Vec<RunnerList>` and flatten.
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(gh_executable());
         cmd.args(["api", "--paginate", "--slurp", &path]);
         cmd
     })
@@ -348,10 +389,8 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
 /// container before it ever picked up a job).
 pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
     let path = runner_remove_path(gh, id);
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", "-X", "DELETE", &path]);
     let out = run_gh_with_backoff(|| {
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(gh_executable());
         cmd.args(["api", "-X", "DELETE", &path]);
         cmd
     })
@@ -391,7 +430,7 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
 /// state.
 pub fn gh_auth_ok() -> bool {
     let out = match run_gh_with_backoff(|| {
-        let mut status_cmd = Command::new("gh");
+        let mut status_cmd = Command::new(gh_executable());
         status_cmd.args(["auth", "status"]);
         status_cmd
     }) {
@@ -415,7 +454,7 @@ pub fn gh_auth_ok() -> bool {
     // `gh auth status`'s exit-code semantics entirely. If it prints a token,
     // the active account works.
     match run_gh_with_backoff(|| {
-        let mut token_cmd = Command::new("gh");
+        let mut token_cmd = Command::new(gh_executable());
         token_cmd.args(["auth", "token"]);
         token_cmd
     }) {
@@ -665,6 +704,30 @@ github.com
     }
 
     #[test]
+    fn detect_rate_limit_output_from_gh_exit_one() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"gh: API rate limit exceeded (HTTP 403)\nRetry-After: 4\n".to_vec(),
+        };
+        let delay = classify_retry_delay(&out)
+            .expect("gh exit-1 HTTP 403 rate limit response should be classified");
+        assert_eq!(delay, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn rate_limit_without_retry_after_uses_default_backoff() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"gh: secondary rate limit exceeded (HTTP 429)\n".to_vec(),
+        };
+        let delay = classify_retry_delay(&out)
+            .expect("rate-limit response without Retry-After should still be retried");
+        assert_eq!(delay, GH_RETRY_BASE_DELAY);
+    }
+
+    #[test]
     fn retry_after_parser_prefers_any_digit_token() {
         let text = "Retry-After: 31\nX-Ratelimit-Reset: 1700000000\n";
         assert_eq!(extract_retry_after_secs(text), Some(31));
@@ -678,5 +741,56 @@ github.com
             stderr: b"gh: runner already exists and cannot be removed\n".to_vec(),
         };
         assert!(classify_retry_delay(&out).is_none());
+    }
+
+    #[test]
+    fn run_gh_with_backoff_retries_fake_gh_after_rate_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter");
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/usr/bin/env bash
+counter={counter}
+n=0
+if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+n=$((n + 1))
+echo "$n" > "$counter"
+if [ "$n" -eq 1 ]; then
+  echo "gh: secondary rate limit exceeded (HTTP 403)" >&2
+  echo "Retry-After: 1" >&2
+  exit 1
+fi
+echo '{{"ok":true}}'
+exit 0
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let out = run_gh_with_backoff(|| {
+            let mut cmd = Command::new("/usr/bin/bash");
+            cmd.arg(&script);
+            cmd
+        })
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

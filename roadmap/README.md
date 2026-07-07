@@ -77,6 +77,17 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 - Landed `ez-gh-actions-twp`: added regression unit coverage in `src/docker_backend.rs` ensuring `list_runners` failure does not mutate `slot_assignments.toml`.
 - Closed `ez-gh-actions-bn0` with a `/nextsteps` synchronization pass and synchronized issue states.
 
+### 2026-07-07 (Codex continuation) — Gate 4 rate-limit hardening + current blockers
+
+- Confirmed current open queue has **no P0**; `ez-gh-actions-nq6` is tracking the P0/P1 hardening alignment pass.
+- Added realistic `gh` rate-limit regression coverage in `src/github.rs`: `gh` exit-code 1 with HTTP 403/429, missing `Retry-After` fallback to default backoff, and a fake-`gh` retry-count proof.
+- Hardened `docs/verify-exit-criteria.sh` Gate 4: checked `gh` calls now report API/rate-limit failures explicitly, one failed job lookup is skipped with a warning, TOML parsing uses stdlib `tomllib` before external `toml`, and the gate now fails unless 5 completed selftests prove the configured runner prefix.
+- Added `docs/test-verify-exit-criteria-gate4.sh`, a shell regression for the exact Gate 4 failure mode where the newest job lookup is rate-limited but later completed selftests prove the configured fleet.
+- Hardened `ez-gh-actions-zmk`: bounded Slack/sendmail alert transport, Slack HTTP failures fail delivery, cooldown is recorded only after at least one transport succeeds, email subjects include severity, and Linux systemd units now wire watchdog/start-limit alert hooks.
+- Verification: `cargo test` (81/81), `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `docs/test-verify-exit-criteria-gate4.sh`, and `doctor.sh` prefix-honesty checks pass. Live `docs/verify-exit-criteria.sh` passes Gates 0/1/2/3/4/7/10 after five completed `ez-runner-b-*` selftests: 28849106680, 28849103583, 28845059991, 28844964976, and 28843056881.
+- Remaining health blockers: `doctor.sh` still fails queue health (`worldarchitect.ai` fresh queue tail >100m), zmk lacks a runtime durable alert channel/test-send gate, and `juv`/`len` remain required before claiming truly healthy throughput.
+- `/f` binary run: `dark-factory` run `1a5a794f5e02`, evidence `/tmp/ezgha-dark-factory-zmk-20260707001325`, final outcome `exhausted`; `df-healer` points at `sandbox-exec unavailable` and missing holdout evaluator issues in the factory harness.
+
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 
 - Fleet functional but AMBER: external `ezgha-fleet-watchdog.sh` restarts every ~120s when count < configured.

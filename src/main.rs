@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+mod alert;
 mod backend;
 mod config;
 mod docker_backend;
@@ -11,6 +12,7 @@ mod platform;
 mod service;
 mod watchdog;
 
+use alert::Severity;
 use backend::Selection;
 use config::{Config, Scope};
 
@@ -59,6 +61,27 @@ enum Commands {
     Status,
     /// Install as a user service (systemd --user / launchd)
     InstallService,
+    /// Internal systemd failure hook installed by `install-service`
+    #[command(hide = true)]
+    SystemdAlertHook {
+        #[arg(long, value_enum)]
+        source: SystemdAlertSource,
+        #[arg(long)]
+        unit: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SystemdAlertSource {
+    ExecStopPost,
+    OnFailure,
+}
+
+struct SystemdAlertEvent {
+    event_key: &'static str,
+    severity: Severity,
+    subject: String,
+    body: String,
 }
 
 fn config_path(cli: &Cli) -> Result<std::path::PathBuf> {
@@ -200,7 +223,7 @@ impl BackendRecoveryState {
         }
     }
 
-    fn allow_restart(&mut self) -> bool {
+    fn allow_restart(&mut self, cfg: &config::Config) -> bool {
         let now = Instant::now();
         if now.duration_since(self.window_started) > BACKEND_RESTART_WINDOW {
             self.window_started = now;
@@ -209,6 +232,21 @@ impl BackendRecoveryState {
 
         if let Some(last) = self.last_restart_at {
             if now.duration_since(last) < BACKEND_RESTART_COOLDOWN {
+                let subject = "Backend restart suppressed: cooldown window active";
+                let body = format!(
+                    "saw too-frequent backend restart attempts for {} ({} since last); backing off",
+                    cfg.github.target,
+                    now.duration_since(last).as_secs()
+                );
+                if let Err(err) = alert::notify(
+                    cfg,
+                    "serve.backend.restart.suppressed.cooldown",
+                    Severity::Warning,
+                    subject,
+                    &body,
+                ) {
+                    eprintln!("WARN: alert send error: {err:#}");
+                }
                 eprintln!(
                     "backend restart suppressed: cooldown window active ({:?} since last)",
                     now.duration_since(last)
@@ -218,6 +256,20 @@ impl BackendRecoveryState {
         }
 
         if self.attempts_in_window >= BACKEND_RESTART_MAX_ATTEMPTS {
+            let subject = "Backend restart suppressed: rate limit hit";
+            let body = format!(
+                "saw {} restart attempts in last {:?} for {}; suppressing to avoid start-limit",
+                self.attempts_in_window, BACKEND_RESTART_WINDOW, cfg.github.target
+            );
+            if let Err(err) = alert::notify(
+                cfg,
+                "serve.backend.restart.suppressed.limit",
+                Severity::Critical,
+                subject,
+                &body,
+            ) {
+                eprintln!("WARN: alert send error: {err:#}");
+            }
             eprintln!(
                 "backend restart suppressed: {} attempts in last {:?} reached cap {}",
                 self.attempts_in_window, BACKEND_RESTART_WINDOW, BACKEND_RESTART_MAX_ATTEMPTS
@@ -269,23 +321,41 @@ fn attempt_backend_restart() -> Result<bool> {
     Ok(false)
 }
 
+fn backend_restart_can_help(selection: &Selection) -> bool {
+    matches!(
+        selection,
+        Selection::None
+            | Selection::Chosen {
+                backend: backend::Backend::Docker | backend::Backend::DockerSysbox,
+                ..
+            }
+    )
+}
+
 fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoveryState) -> bool {
-    let backend = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
-    let selected = match backend {
-        Selection::Chosen { backend, .. } => Some(backend),
-        _ => None,
-    };
-    if !matches!(
-        selected,
-        Some(backend::Backend::Docker | backend::Backend::DockerSysbox)
-    ) {
+    let selection = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
+    if !backend_restart_can_help(&selection) {
         return false;
     }
-    if !recovery.allow_restart() {
+    if !recovery.allow_restart(cfg) {
         return false;
     }
     match attempt_backend_restart() {
         Ok(true) => {
+            let subject = "Backend restart attempted";
+            let body = format!(
+                "attempted backend runtime restart for {} after backend selection/reachability failure",
+                cfg.github.target
+            );
+            if let Err(err) = alert::notify(
+                cfg,
+                "serve.backend.restart.attempted",
+                Severity::Info,
+                subject,
+                &body,
+            ) {
+                eprintln!("WARN: alert send error: {err:#}");
+            }
             eprintln!("restarted backend runtime and will retry quickly");
             true
         }
@@ -298,6 +368,91 @@ fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoverySta
             false
         }
     }
+}
+
+fn systemd_alert_decision(
+    source: SystemdAlertSource,
+    unit: &str,
+    service_result: Option<&str>,
+    exit_code: Option<&str>,
+    exit_status: Option<&str>,
+) -> Option<SystemdAlertEvent> {
+    let result = service_result.unwrap_or("");
+    let subject = match source {
+        SystemdAlertSource::ExecStopPost if result == "watchdog" => "ezgha service watchdog kill",
+        SystemdAlertSource::OnFailure if result == "start-limit-hit" => {
+            "ezgha service start-limit hit"
+        }
+        _ => return None,
+    };
+    Some(SystemdAlertEvent {
+        event_key: match source {
+            SystemdAlertSource::ExecStopPost => "service.watchdog_kill",
+            SystemdAlertSource::OnFailure => "service.start_limit_hit",
+        },
+        severity: Severity::Critical,
+        subject: subject.to_string(),
+        body: format!(
+            "systemd reported unit={unit} source={source:?} SERVICE_RESULT={result} EXIT_CODE={} EXIT_STATUS={}",
+            exit_code.unwrap_or(""),
+            exit_status.unwrap_or("")
+        ),
+    })
+}
+
+fn systemctl_unit_result(unit: &str) -> Option<String> {
+    let out = Command::new("systemctl")
+        .args(["--user", "show", unit, "-p", "Result", "--value"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn run_systemd_alert_hook(
+    cfg: &config::Config,
+    source: SystemdAlertSource,
+    unit: &str,
+) -> Result<()> {
+    let result = match source {
+        SystemdAlertSource::ExecStopPost => std::env::var("SERVICE_RESULT").ok(),
+        SystemdAlertSource::OnFailure => std::env::var("MONITOR_SERVICE_RESULT")
+            .ok()
+            .or_else(|| systemctl_unit_result(unit)),
+    };
+    let exit_code = match source {
+        SystemdAlertSource::ExecStopPost => std::env::var("EXIT_CODE").ok(),
+        SystemdAlertSource::OnFailure => std::env::var("MONITOR_EXIT_CODE").ok(),
+    };
+    let exit_status = match source {
+        SystemdAlertSource::ExecStopPost => std::env::var("EXIT_STATUS").ok(),
+        SystemdAlertSource::OnFailure => std::env::var("MONITOR_EXIT_STATUS").ok(),
+    };
+
+    if let Some(event) = systemd_alert_decision(
+        source,
+        unit,
+        result.as_deref(),
+        exit_code.as_deref(),
+        exit_status.as_deref(),
+    ) {
+        alert::notify(
+            cfg,
+            event.event_key,
+            event.severity,
+            &event.subject,
+            &event.body,
+        )?;
+        println!("{}", event.subject);
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -449,20 +604,63 @@ fn main() -> Result<()> {
             // launchd path / interactive `ezgha serve`).
             let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
             let mut backend_recovery = BackendRecoveryState::new();
+            let mut ensure_fail_streak = 0u32;
             loop {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
                 let sleep = match docker_backend::ensure_count(&cfg, backend) {
                     Ok(started) => {
+                        ensure_fail_streak = 0;
                         for name in started {
                             println!("respawned ephemeral runner {name}");
                         }
                         Duration::from_secs(30)
                     }
                     Err(e) => {
+                        ensure_fail_streak += 1;
                         eprintln!("ensure_count failed (will retry): {e:#}");
+                        if ensure_fail_streak >= cfg.alert.failure_alert_threshold {
+                            let subject = "Runner pool ensure_count failures";
+                            let body = format!(
+                                "ensure_count failed {} consecutive time(s) for target {} on {}. Last error: {e:#}",
+                                ensure_fail_streak,
+                                cfg.github.target,
+                                backend.name()
+                            );
+                            let severity =
+                                if ensure_fail_streak >= cfg.alert.failure_alert_threshold * 2 {
+                                    Severity::Critical
+                                } else {
+                                    Severity::Warning
+                                };
+                            if let Err(err) = alert::notify(
+                                &cfg,
+                                "serve.ensure_count.failure",
+                                severity,
+                                subject,
+                                &body,
+                            ) {
+                                eprintln!("WARN: alert send error: {err:#}");
+                            }
+                        }
                         if maybe_restart_backend(&cfg, &mut backend_recovery) {
+                            let subject = "Backend restart attempted after ensure_count failures";
+                            let body = format!(
+                                "serve loop attempted backend restart after {} failures for {} on {}",
+                                ensure_fail_streak,
+                                cfg.github.target,
+                                backend.name()
+                            );
+                            if let Err(err) = alert::notify(
+                                &cfg,
+                                "serve.backend.restart.attempted",
+                                Severity::Info,
+                                subject,
+                                &body,
+                            ) {
+                                eprintln!("WARN: alert send error: {err:#}");
+                            }
                             Duration::from_secs(8)
                         } else {
                             Duration::from_secs(30)
@@ -506,7 +704,11 @@ fn main() -> Result<()> {
         Commands::InstallService => {
             // Validate config exists before installing a service that needs it.
             Config::load(&path)?;
-            service::install()?;
+            service::install(&path)?;
+        }
+        Commands::SystemdAlertHook { source, unit } => {
+            let cfg = Config::load(&path)?;
+            run_systemd_alert_hook(&cfg, *source, unit)?;
         }
     }
     Ok(())
@@ -579,4 +781,76 @@ fn acquire_serve_lock() -> Result<ServeLock> {
         }
     }
     Ok(ServeLock(Some(f)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_exec_stop_post_watchdog_emits_critical_event() {
+        let event = systemd_alert_decision(
+            SystemdAlertSource::ExecStopPost,
+            "ezgha.service",
+            Some("watchdog"),
+            Some("killed"),
+            Some("6"),
+        )
+        .expect("watchdog result should alert");
+        assert_eq!(event.event_key, "service.watchdog_kill");
+        assert_eq!(event.severity, Severity::Critical);
+        assert!(event.body.contains("SERVICE_RESULT=watchdog"));
+    }
+
+    #[test]
+    fn systemd_exec_stop_post_success_noops() {
+        assert!(systemd_alert_decision(
+            SystemdAlertSource::ExecStopPost,
+            "ezgha.service",
+            Some("success"),
+            Some("exited"),
+            Some("0"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn systemd_on_failure_start_limit_emits_critical_event() {
+        let event = systemd_alert_decision(
+            SystemdAlertSource::OnFailure,
+            "ezgha.service",
+            Some("start-limit-hit"),
+            None,
+            None,
+        )
+        .expect("start-limit-hit should alert");
+        assert_eq!(event.event_key, "service.start_limit_hit");
+        assert_eq!(event.severity, Severity::Critical);
+        assert!(event.subject.contains("start-limit"));
+    }
+
+    #[test]
+    fn systemd_on_failure_exit_code_noops() {
+        assert!(systemd_alert_decision(
+            SystemdAlertSource::OnFailure,
+            "ezgha.service",
+            Some("exit-code"),
+            Some("exited"),
+            Some("1"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn backend_restart_is_allowed_when_backend_selection_is_none() {
+        assert!(backend_restart_can_help(&Selection::None));
+    }
+
+    #[test]
+    fn backend_restart_is_not_allowed_for_policy_blocked_selection() {
+        assert!(!backend_restart_can_help(&Selection::PolicyBlocked {
+            best_available: backend::Backend::Docker,
+            required: config::IsolationLevel::Vm,
+        }));
+    }
 }
