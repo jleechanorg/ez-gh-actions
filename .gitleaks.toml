@@ -1,0 +1,6 @@
+title = "ez-gh-actions gitleaks configuration"
+
+[extend]
+# Keep gitleaks' built-in rules and add repo-specific allowlists here only
+# after a finding has been confirmed as a false positive.
+useDefault = true
