@@ -1552,7 +1552,7 @@ mod tests {
         let stats = vec![stats_with_ages(None, None)];
         let sample = combine_invariant_sample(&fleet, &stats, 1000, true);
         assert_eq!(sample.queued_jobs, 0);
-        assert_eq!(sample.queued_jobs_capped, true);
+        assert!(sample.queued_jobs_capped);
         assert!(
             !sample.inv1,
             "a capped fetch that happened to find 0 queued jobs must not be \
