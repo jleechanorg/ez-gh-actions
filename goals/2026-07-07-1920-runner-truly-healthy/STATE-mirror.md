@@ -459,3 +459,54 @@ future per-tick GitHub API work in this daemon should be sized against the
 CURRENT live queue depth (`doctor.sh` section 8 / the capacity finding doc)
 before merging, not just unit-tested in isolation -- worth adding as a
 CLAUDE.md reminder if this pattern recurs.
+
+## Follow-up: structural time-budget fix (per main's directive, 2026-07-07 14:2x-14:33 PT)
+
+Main correctly flagged that the job-enumeration cap only bounds TODAY's known
+queue size (1290 jobs) -- it doesn't stop the failure CLASS: any future
+expensive per-tick monitor work (a new checker, a bigger queue, a slower API
+day) could reintroduce the identical starvation silently. Implemented the
+requested structural fix: `queue_monitor::SERVE_LOOP_TIME_BUDGET` (75s),
+computed from a `loop_start: Instant` captured once at the top of main.rs's
+serve loop and threaded down to both `QueueMonitorState::maybe_check` and
+`InvariantSamplerState::maybe_sample` (sharing ONE budget across both ticks
+in the same iteration, not 75s each). `enumerate_jobs_within_budget` -- a new
+generic, network-agnostic helper -- bails out of per-run job enumeration
+(queued AND in-progress) the moment `Instant::now() >= deadline`, marking the
+result `capped=true` (reusing the existing lower-bound signal rather than
+inventing a separate "unknown" state, since budget-triggered partial
+enumeration has identical semantics to size-triggered capping). Guarantees
+`ensure_count` is reachable at least once per serve-loop iteration regardless
+of queue depth or API latency.
+
+4 new regression tests: (1) deadline already in the past -> zero fetches,
+zero real time; (2) **the literal "fake a slow fetch" test main asked for**
+-- 1000 synthetic items at 5ms each (5s total) against a 30ms budget, asserts
+it does NOT process all 1000 (this is the actual regression guard: if
+someone removes the deadline check, this test starts taking ~5s instead of
+~30ms and failing the "must not process all" assertion); (3) normal
+completion when the deadline is far off. 171/171 tests pass total. Merged
+(051a7a2 -> merge 3429819), pushed. Also added the EXCEPTION language main
+requested to CLAUDE.md's Gate 0 rule: "low load + a draining fleet with a
+live in-flight gh api call means the loop is stuck, restart IS the
+remediation."
+
+**Confirmed both of main's checks**: (1) config.toml stopgaps
+(`invariant_sampler.enabled`/`queue_monitor.enabled`) were both restored to
+`true` when the cap fix redeployed earlier -- verified directly, no stale
+disable flags left behind. (2) `invariant_history.jsonl` captures the full
+drain-and-recovery arc in E1's own data, worth keeping as a case study:
+```
+ts=1783457458 busy=19 registered=19 queued_jobs=1290                  (healthy, pre-incident)
+ts=1783458054 busy=8  registered=8  queued_jobs=1246                  (DRAIN CAUGHT LIVE)
+ts=1783459044 busy=21 registered=21 queued_jobs=78  capped=true       (recovering, cap fix live)
+ts=1783459210 busy=18 registered=18 queued_jobs=87  capped=true
+ts=1783459328 busy=16 registered=16 queued_jobs=88  capped=true
+ts=1783459606 busy=19 registered=19 queued_jobs=97  capped=true
+ts=1783459902 busy=16 registered=16 queued_jobs=83  capped=true       (stable, time-budget fix live)
+```
+`inv1_fail_class="missing-registration"` throughout (correctly classified --
+demand exceeds the 22-runner capacity per the earlier finding, independent of
+the incident). This is E1 catching and characterizing a real production
+incident in its own designed-for-this-purpose data, which is itself a form
+of validation that the sampler works as intended.
