@@ -275,8 +275,7 @@ fn append_invariant_sample(cfg: &Config, sample: &InvariantSample) -> Result<()>
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create invariant history dir {}", parent.display()))?;
     }
-    let line =
-        serde_json::to_string(sample).context("serialize invariant sample to JSON line")?;
+    let line = serde_json::to_string(sample).context("serialize invariant sample to JSON line")?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1277,25 +1276,19 @@ mod tests {
     #[test]
     fn invariant_inv2_boundary_is_inclusive_of_exactly_20_minutes() {
         let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
-        let at_threshold = combine_invariant_sample(
-            &fleet,
-            &[stats_with_ages(Some(20.0), Some(20.0))],
-            1000,
-        );
+        let at_threshold =
+            combine_invariant_sample(&fleet, &[stats_with_ages(Some(20.0), Some(20.0))], 1000);
         assert!(at_threshold.inv2, "exactly 20.0m must satisfy INV-2");
 
-        let over_threshold_queued = combine_invariant_sample(
-            &fleet,
-            &[stats_with_ages(Some(20.01), None)],
-            1000,
+        let over_threshold_queued =
+            combine_invariant_sample(&fleet, &[stats_with_ages(Some(20.01), None)], 1000);
+        assert!(
+            !over_threshold_queued.inv2,
+            "20.01m queued must violate INV-2"
         );
-        assert!(!over_threshold_queued.inv2, "20.01m queued must violate INV-2");
 
-        let over_threshold_running = combine_invariant_sample(
-            &fleet,
-            &[stats_with_ages(None, Some(20.01))],
-            1000,
-        );
+        let over_threshold_running =
+            combine_invariant_sample(&fleet, &[stats_with_ages(None, Some(20.01))], 1000);
         assert!(
             !over_threshold_running.inv2,
             "20.01m in-progress must violate INV-2"
