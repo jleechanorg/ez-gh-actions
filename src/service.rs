@@ -48,7 +48,7 @@ fn install_systemd(exe: &std::path::Path) -> Result<()> {
         "# budget so systemd never hangs forever if READY=1 never arrives.",
         "Type=notify",
         &format!("ExecStart={} serve", exe.display()),
-        "WatchdogSec=180",
+        "WatchdogSec=300",
         "NotifyAccess=main",
         "Restart=on-failure",
         "RestartSec=30",

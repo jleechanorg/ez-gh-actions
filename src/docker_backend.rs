@@ -143,6 +143,7 @@ pub fn release_slot(slot: u32) -> Result<()> {
 ///
 /// Returns the number of slots reclaimed.
 pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
+    watchdog::ping();
     // CRITICAL: reconcile ONLY against an authoritative runner list. If the
     // GitHub API call fails (network blip, rate limit, expired token), an
     // `unwrap_or_default()` would yield an EMPTY list — making every recorded
@@ -159,8 +160,10 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             return Ok(0);
         }
     };
+    watchdog::ping();
     let assignments = read_slot_assignments()?;
     let reclaimed = release_stale_slots_from(&assignments, &live_runners)?;
+    watchdog::ping();
     // Forward sweep: GitHub has runners with our prefix that NO slot file
     // entry owns. These are JIT registrations whose slot reservation was
     // released (empty-id path above) before `record_slot_runner_id` could
@@ -196,12 +199,14 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             );
             if github::remove_runner(&cfg.github, r.id).is_ok() {
                 orphans_reaped += 1;
+                watchdog::ping();
             }
         }
     }
     if orphans_reaped > 0 {
         eprintln!("info: reaped {orphans_reaped} orphaned runners with prefix {prefix}");
     }
+    watchdog::ping();
     Ok(reclaimed + orphans_reaped)
 }
 
@@ -340,6 +345,7 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
         .values()
         .filter_map(|s| s.parse::<u64>().ok())
         .collect();
+    watchdog::ping();
     let (jit, runner_id) =
         match github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels, &owned_ids)
         {
@@ -348,6 +354,7 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
                 return Err(e);
             }
         };
+    watchdog::ping();
 
     let mut cmd = Command::new("docker");
     cmd.args(["run", "-d", "--rm"]);
@@ -368,6 +375,7 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
     cmd.args(["./run.sh", "--jitconfig", &jit]);
 
     let out = cmd.output().context("failed to run docker")?;
+    watchdog::ping();
     if !out.status.success() {
         // The JIT registration exists server-side but no runner will ever
         // connect; clean it up so the repo runner list stays tidy.

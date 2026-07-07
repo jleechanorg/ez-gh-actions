@@ -320,7 +320,7 @@ fn main() -> Result<()> {
             let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
             loop {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
-                // WatchdogSec=60; a post-work-only ping lets systemd SIGABRT mid-spawn.
+                // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
                 match docker_backend::ensure_count(&cfg, backend) {
                     Ok(started) => {

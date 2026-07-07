@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::config::{GithubConfig, Scope};
+use crate::watchdog;
 
 /// Hard ceiling on how long any `gh` CLI invocation may run. A hung `gh`
 /// process (keychain prompt, GraphQL rate-limit, network stall) would
@@ -132,9 +133,11 @@ pub fn generate_jitconfig(
         cmd.args(["-f", &format!("labels[]={label}")]);
     }
     let out = run_gh(cmd).context("failed to run `gh api` — is the gh CLI installed?")?;
+    watchdog::ping();
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("Already exists") || stderr.contains("already exists") {
+            watchdog::ping();
             if let Ok(runners) = list_runners(gh) {
                 if let Some(conflicting) = runners.iter().find(|r| r.name == name) {
                     // Runner names are global across every host registered to
@@ -161,6 +164,7 @@ pub fn generate_jitconfig(
                         name, conflicting.id
                     );
                     if remove_runner(gh, conflicting.id).is_ok() {
+                        watchdog::ping();
                         let mut retry_cmd = Command::new("gh");
                         retry_cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
                         retry_cmd.args(["-F", "runner_group_id=1"]);
@@ -173,6 +177,7 @@ pub fn generate_jitconfig(
                                 &retry_out.stdout,
                             )
                             .context("unexpected generate-jitconfig response on self-heal retry")?;
+                            watchdog::ping();
                             return Ok((parsed.encoded_jit_config, parsed.runner.id));
                         }
                     }
@@ -188,6 +193,7 @@ pub fn generate_jitconfig(
     let parsed: JitConfigResponse =
         serde_json::from_slice(&out.stdout).context("unexpected generate-jitconfig response")?;
     let _ = parsed.runner.name;
+    watchdog::ping();
     Ok((parsed.encoded_jit_config, parsed.runner.id))
 }
 
@@ -243,6 +249,7 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     }
     let pages: Vec<RunnerList> = serde_json::from_slice(&out.stdout)
         .context("unexpected list-runners response (expected array of pages from --slurp)")?;
+    watchdog::ping();
     Ok(pages.into_iter().flat_map(|page| page.runners).collect())
 }
 
@@ -259,6 +266,7 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    watchdog::ping();
     Ok(())
 }
 
