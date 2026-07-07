@@ -1206,6 +1206,19 @@ mod tests {
     }
 
     #[test]
+    fn invariant_sampler_tick_errors_are_non_fatal_and_write_no_sample() {
+        // Mirrors queue_monitor_tick_errors_are_non_fatal: a failed API call
+        // (e.g. a GitHub rate limit) must not crash the serve loop, and --
+        // critically for E1/E2 -- must not be recorded as a pass or a fail.
+        // The `Err` case here never reaches `append_invariant_sample`, so
+        // this tick simply contributes no line to invariant_history.jsonl.
+        assert!(!run_invariant_sampler_tick(|| {
+            anyhow::bail!("synthetic invariant sampler failure (e.g. GitHub API rate limit)")
+        }));
+        assert!(run_invariant_sampler_tick(|| Ok(None)));
+    }
+
+    #[test]
     fn canary_scheduler_tick_is_non_fatal_to_serve_loop() {
         assert!(run_canary_scheduler_tick(|| true));
         assert!(!run_canary_scheduler_tick(|| false));

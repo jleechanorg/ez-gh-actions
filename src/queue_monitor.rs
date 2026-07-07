@@ -112,6 +112,15 @@ impl InvariantSamplerState {
         }
         self.last_check = Some(Instant::now());
 
+        // Deliberate design property: if `sample_invariants` fails (e.g. a
+        // GitHub API rate limit -- already observed live on this box), `?`
+        // propagates the error here BEFORE `append_invariant_sample` runs, so
+        // NO line is written for this tick. A failed API call is UNKNOWN, not
+        // a violation: it must never be recorded as either pass or fail, or
+        // burst rate-limit windows would silently poison E2's 3-hour
+        // zero-violation count. The caller (`run_invariant_sampler_tick` in
+        // main.rs) logs the error and moves on; the next tick simply retries
+        // after the normal interval.
         let sample = sample_invariants(cfg)?;
         append_invariant_sample(cfg, &sample)?;
         if !sample.inv1 || !sample.inv2 {
