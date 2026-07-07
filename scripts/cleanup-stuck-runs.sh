@@ -2,7 +2,8 @@
 # cleanup-stuck-runs.sh — report or remove GitHub Actions queue artifacts.
 #
 # Three classes of "stuck" runs on worldarchitect.ai (and QUEUE_REPO):
-#   1. Zombies (>STALE_HOURS old, status=queued) — gh run cancel fails; use gh run delete.
+#   1. Zombies (>STALE_HOURS old, status=queued) — GitHub rejects DELETE on a
+#      queued run (HTTP 403); cancel first (-> completed/cancelled), then delete.
 #   2. Superseded queued runs — same branch + workflow, keeping the newest queued run.
 #   3. Fresh tail (>FRESH_TAIL_MIN old, still queued) — cancel via API (drops CI for that PR).
 #
@@ -136,13 +137,22 @@ print(
 )
 print("safety: only status=queued runs are candidates; in_progress runs are ignored")
 
-def delete_run(rid):
-    subprocess.check_output(["gh", "run", "delete", str(rid), "-R", repo], stderr=subprocess.STDOUT)
-
 def cancel_run(rid):
     subprocess.check_output([
         "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/cancel"
     ], stderr=subprocess.STDOUT)
+
+def delete_run(rid):
+    # GitHub rejects DELETE on status=queued runs (HTTP 403) — a queued run must
+    # first transition to completed/cancelled via the cancel endpoint before
+    # gh run delete succeeds. Ignore cancel failures (e.g. already completed);
+    # the delete call below surfaces any real problem.
+    try:
+        cancel_run(rid)
+        time.sleep(1.5)
+    except subprocess.CalledProcessError:
+        pass
+    subprocess.check_output(["gh", "run", "delete", str(rid), "-R", repo], stderr=subprocess.STDOUT)
 
 stats = {"zombie_deleted": 0, "zombie_failed": 0, "tail_cancelled": 0, "tail_failed": 0}
 stats.update({"superseded_cancelled": 0, "superseded_failed": 0})
