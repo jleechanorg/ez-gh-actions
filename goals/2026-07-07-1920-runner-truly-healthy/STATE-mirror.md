@@ -812,3 +812,41 @@ BOTH monitored repos simultaneously) -- meaning `capped=true` samples can
 only pass INV-1 via the busy==22 branch going forward. This makes E2's clean
 3-hour window measurably harder to achieve at current demand, which is the
 CORRECT and honest reflection of reality, not an artificial tightening.
+
+## po2 redesign COMPLETE, PR-3 resolved by data, new PR-1b dispatched (2026-07-07 16:05-16:08 PT)
+
+**po2 redesign**: codex finished addressing all 6 items from main's brief.
+Pushed to `sidekick/po2-respawn-pacing` (commit dc86a325). New defaults
+confirmed exactly matching main's directive: `respawn_batch_size=2`,
+`respawn_batch_sleep_seconds=30`, `respawn_load_threshold=12.0`,
+`respawn_load_max_wait_seconds=60`. 179 tests pass. **This redesign has NOT
+been re-reviewed by ultracode yet** -- still holding merge/deploy until
+main runs (or approves skipping) another adversarial pass, since the first
+design looked equally reasonable to me on read-through and still had a
+confirmed critical bug.
+
+**PR-3 resolved with live data, not implemented**: main measured the actual
+draft-PR share of the queue (1/15 sampled branches, ~7%) -- draft-skip cuts
+are dead, near-zero savings for real signal loss. Correctly NOT dispatched.
+
+**New finding from the same measurement**: 4/15 (~27%) of queued-run
+branches have NO open PR at all -- self-hosted CI gating nothing (pure
+agent-WIP push noise). **Dispatched PR-1b** (worldarchitect.ai,
+`~/projects/worldarchitect.ai-wt-demand-pr1b`,
+`sidekick/demand-cut-pr1b-push-triggers`, confirmed alive): two-phase brief
+-- Phase 1 verifies the 27% number on a 60+ branch sample (with an explicit
+decision gate: stop and report if the bigger sample doesn't confirm a
+sizeable, roughly double-digit-percent finding) before touching any YAML;
+Phase 2 (only if confirmed) converts heavy self-hosted `push`-triggered
+workflows to `pull_request` where the push trigger isn't genuinely needed
+(e.g. not a main/dev-only deploy trigger), explicitly folding in the
+`self-hosted-mvp-shard1.yml` paths-filter question from the original PR-3
+table (a pull_request conversion makes that filter moot; told it to say so
+explicitly either way rather than silently dropping the question).
+
+Four codex workers now in flight: po2 redesign (held, awaiting re-review),
+demand PR-1 (quick wins, still mid-edit last checked), demand PR-2
+(timeout-lint, just completed per notification -- reviewing next), demand
+PR-1b (push-trigger audit, just started). Also committed main's cleaned
+review doc (962->87 lines / 12.7KB pure markdown, commit 1886ef0) on top of
+my original full commit.
