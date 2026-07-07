@@ -240,10 +240,23 @@ Rust rather than waiting for the Codex usage-limit reset:
   0-3 verified PASS after deploy (Gate 3: 16/16 containers, full capacity).
   Gate 4 fails on the GitHub API secondary rate limit noted earlier, not a
   regression from this change.
-- Daemon restarted at 13:42:58 PT with check_interval_seconds=240 --
-  first real sample expected ~13:46:58 PT. Verification of the first
-  daemon-native sample landing in ~/.local/state/ezgha/invariant_history.jsonl
-  is in progress (Monitor task bd7pfq3zj, 7min timeout).
+- Daemon restarted at 13:42:58 PT with check_interval_seconds=240 -- first
+  tick fired ~13:46:58 PT but the sample never landed (checked directly);
+  journal showed the tick was mid gh-API-transient-failure retries at that
+  moment, most likely the same secondary rate limit affecting Gate 4.
+  Confirmed by design (and now also unit-tested,
+  `invariant_sampler_tick_errors_are_non_fatal_and_write_no_sample`) that a
+  failed tick writes NO line at all -- UNKNOWN, not a violation -- per main's
+  explicit design requirement (burst rate limits must never poison E2's
+  3-hour zero-violation count). Added a code comment explaining this
+  property at the `?` in `maybe_sample`. 167/167 tests pass; merged
+  (37700d6), redeployed with load/container check before each restart
+  (stayed 3.5-5.5 throughout, no watchdog risk). Also created P1 bead
+  ez-gh-actions-po2 (durable respawn-pacing fix in docker_backend.rs, per
+  main's directive) so this doesn't rely on session-level operator
+  discipline.
+- Daemon restarted again at 13:47:49 PT for the above fix -- next tick
+  expected ~13:51:49 PT. Verification in progress (Monitor task bd7pfq3zj).
 
 ## Other task check-ins (2026-07-07 13:45 PT)
 
