@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod alert;
@@ -247,6 +247,7 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
 const BACKEND_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 const BACKEND_RESTART_WINDOW: Duration = Duration::from_secs(600);
 const BACKEND_RESTART_MAX_ATTEMPTS: u32 = 3;
+const BACKEND_RESTART_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct BackendRecoveryState {
@@ -325,12 +326,36 @@ impl BackendRecoveryState {
     }
 }
 
-fn run_restart_command(cmd: &str, args: &[&str]) -> Result<bool> {
-    let status = Command::new(cmd)
+fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<bool> {
+    let mut child = Command::new(cmd)
         .args(args)
-        .status()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .with_context(|| format!("failed to execute {cmd}"))?;
-    Ok(status.success())
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to poll {cmd}"))?
+        {
+            return Ok(status.success());
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "{cmd} restart command timed out after {}s",
+                timeout.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_restart_command(cmd: &str, args: &[&str]) -> Result<bool> {
+    run_restart_command_with_timeout(cmd, args, BACKEND_RESTART_COMMAND_TIMEOUT)
 }
 
 fn attempt_backend_restart() -> Result<bool> {
@@ -1038,6 +1063,57 @@ mod tests {
             best_available: backend::Backend::Docker,
             required: config::IsolationLevel::Vm,
         }));
+    }
+
+    #[test]
+    fn restart_command_reports_success() {
+        assert!(run_restart_command_with_timeout(
+            "/bin/sh",
+            &["-c", "exit 0"],
+            Duration::from_secs(1)
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn restart_command_reports_nonzero() {
+        assert!(!run_restart_command_with_timeout(
+            "/bin/sh",
+            &["-c", "exit 17"],
+            Duration::from_secs(1)
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn restart_command_reports_missing_binary() {
+        let err = run_restart_command_with_timeout(
+            "definitely-not-an-ezgha-command",
+            &[],
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed to execute"));
+    }
+
+    #[test]
+    fn restart_command_times_out_and_kills_hung_process() {
+        let start = Instant::now();
+        let err = run_restart_command_with_timeout(
+            "/bin/sh",
+            &["-c", "/bin/sleep 2"],
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "timeout should fire promptly, took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

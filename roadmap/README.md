@@ -26,14 +26,14 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 6. `n5p` (P2) — build.rs: fail loudly / append `-dirty` instead of silently embedding "unknown" (Gate 0 provenance)
 
 **Phase 2 — eyes, then self-healing (S–M)**
-7. `zmk` (P1) — minimal Slack-webhook alert contract first; Goal 5 is 0/10 and a silent canary is just telemetry
+7. ~~`zmk` (P1)~~ — DONE: alert contract, durable file channel, Slack/email transports, systemd failure hooks, and Gate 7 live test-send proof
 8. `ozk` (P2) — 403/429 detection + exponential backoff in run_gh; REQUIRED before any exit-after-N escalation (otherwise degraded-state restarts recreate incident-A restart storms against the API)
 9. `9yt` (P1) — Colima/Lima VM auto-restart on backend failure (cooldown + attempt cap); the 4h crash-loop class from incident A
-10. `juv` (P1) — build as a reusable GitHub run↔job↔runner correlation layer; canary dispatch + SLO alert is its first consumer
+10. `juv` (P1) — build as a reusable GitHub run↔job↔runner correlation layer; canary dispatch + SLO alert is its first consumer (manual canary is live; daemon scheduler/ring buffer still open)
 11. Degraded-state escalation (consecutive-failure counter → sd_notify STATUS → exit-after-N) — only after ozk + 9yt bound the restart loop
 
 **Phase 3 — reap + trim on the correlation layer (M–L)**
-12. `qbl` (P2) — zombie-runner reaper on juv's layer; MUST cancel the stuck run first, then delete registration (HTTP 422 lock, incident C)
+12. `qbl` (P2) — zombie-runner reaper on juv's layer; MUST cancel the stuck run first, then delete registration (planner + fake executor landed; live mutation still gated)
 13. `ftw` (P3) — max-job-duration config + cancel enforcement (first actual Goal 4 code; same layer)
 14. ~~`len` (P3)~~ — DONE: queued-job starvation detection integrated into daemon + alert log proof captured; real throughput still blocked by saturated queue/juv correlation work
 
@@ -95,6 +95,15 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 - Added focused tests for config compatibility, example configs, invalid repo/interval values, timestamp/stat boundaries, alert-log delivery after consecutive bad samples, critical escalation cooldown separation, stale zombie warnings, and non-fatal monitor errors.
 - Verification: `cargo test` 100/100, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` pass. After Linux deploy at `fc17ed0`, Gate 0/1/2/3 passed; the daemon logged queue bad sample 1/2 and then wrote durable alert `queue.starvation.tail` to `/home/jleechan/.local/state/ezgha/alerts.jsonl` on sample 2.
 - Current live state remains detection-only: `docs/verify-exit-criteria.sh` Gate 4 still fails because only 1 completed `ez-runner-c-*` selftest exists, and `doctor.sh` still marks `worldarchitect.ai` queue health BAD with >100m fresh tail. Do not claim queue recovery until fresh selftests complete.
+
+### 2026-07-07 (Codex continuation) — watchdog stability, canary proof, and reaper safety seam
+
+- Landed Linux watchdog stabilization through `7b6b262`: background systemd heartbeat, `NotifyAccess=all`, READY notification order preserving `WATCHDOG_USEC`, and a saturated-load soak with `NRestarts=0`.
+- Revalidated exit criteria after reinstalling `7b6b262`: Gates 0/1/2/3/4/7/10 all pass; fresh canary run 28858122814 completed on `ez-runner-c-14` in 19s total, and Gate 7 wrote a fresh durable test alert to `/home/jleechan/.local/state/ezgha/alerts.jsonl`.
+- Closed `ez-gh-actions-zmk`: alerting now has a runtime durable channel, bounded Slack/sendmail transports, `test-alert`, and systemd watchdog/start-limit hooks; residual notification transport expansion should be tracked separately if needed.
+- Advanced `ez-gh-actions-qbl` without enabling live mutation: added `reaper-plan` dry-run planner, then a fake `ReaperApi` execution seam that enforces cancel -> poll -> optional force-cancel -> poll -> delete, exact job/runner revalidation, duplicate-runner-plan rejection, and fail-closed tests for every refusal path.
+- Advanced `jleechan-0q9` with a Linux-side Mac-stability fix: backend restart commands are now bounded by a 30s spawn/poll/kill timeout instead of bare `Command::status()`, with tests for success, nonzero, missing command, and hung command. `/mac` still needs install + launchd/Colima/socket/6-runner soak proof before closing.
+- Current next hardening focus: `ez-gh-actions-juv` remains open for daemon-side scheduled canary/ring-buffer behavior; Mac stability still requires `/mac` soak for `jleechan-5rv` and `jleechan-0q9`.
 
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 
