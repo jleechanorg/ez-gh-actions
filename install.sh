@@ -145,7 +145,8 @@ fi
 
 info "Next steps"
 cat <<'EOF'
-  ezgha init --target <owner/repo>   # detect host, write ~/.config/ezgha/config.toml (if not done)
+  cp config/config.toml.{mac,linux}.example ~/.config/ezgha/config.toml  # fleet templates (see config/README.md)
+  ezgha init --target <owner/repo>   # or auto-detect host and write starter config
   ezgha doctor                       # verify backends, limits, gh auth
   ezgha start                        # launch one ephemeral runner now
   ezgha install-service              # keep runners supervised at login (if not auto-installed)

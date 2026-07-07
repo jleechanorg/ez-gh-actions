@@ -62,19 +62,46 @@ pass "Gate 1: Code builds, tests, clippy, fmt, and beads checks pass"
 
 # --- Gate 2: Service + daemon up ---
 echo "--- Checking Gate 2: Service + daemon up ---"
-SERVICE_STATE=$(systemctl --user is-active ezgha.service 2>&1 || echo "inactive")
-[ "$SERVICE_STATE" = "active" ] || fail "ezgha.service is inactive (status: $SERVICE_STATE)"
+case "$(uname -s)" in
+  Linux)  PLATFORM="linux" ;;
+  Darwin) PLATFORM="macos" ;;
+  *)      PLATFORM="other" ;;
+esac
 
-SERVICE_ENABLED=$(systemctl --user is-enabled ezgha.service 2>&1 || echo "disabled")
-[ "$SERVICE_ENABLED" = "enabled" ] || fail "ezgha.service is not enabled (status: $SERVICE_ENABLED)"
+probe_service_state() {
+  if [ "$PLATFORM" = "linux" ]; then
+    systemctl --user is-active ezgha.service 2>/dev/null || echo "inactive"
+  elif [ "$PLATFORM" = "macos" ]; then
+    local line pid status
+    line=$(launchctl list 2>/dev/null | awk '$3 == "org.jleechanorg.ezgha" {print; exit}')
+    if [ -z "$line" ]; then echo "not-loaded"; return; fi
+    pid=$(echo "$line" | awk '{print $1}')
+    status=$(echo "$line" | awk '{print $2}')
+    if [ -n "$pid" ] && [ "$pid" != "-" ]; then echo "active"
+    elif [ "$status" = "0" ]; then echo "inactive"
+    else echo "failed"; fi
+  else echo "unsupported"; fi
+}
+
+SERVICE_STATE=$(probe_service_state)
+[ "$SERVICE_STATE" = "active" ] || fail "ezgha supervisor is not active (platform=$PLATFORM status: $SERVICE_STATE)"
+
+if [ "$PLATFORM" = "linux" ]; then
+  SERVICE_ENABLED=$(systemctl --user is-enabled ezgha.service 2>&1 || echo "disabled")
+  [ "$SERVICE_ENABLED" = "enabled" ] || fail "ezgha.service is not enabled (status: $SERVICE_ENABLED)"
+elif [ "$PLATFORM" = "macos" ]; then
+  [ -f "${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist" ]     || fail "launchd plist missing at ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
+fi
 
 docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unreachable"
 
-if command -v limactl >/dev/null 2>&1; then
-    COLIMA_STATUS=$(limactl list 2>/dev/null | awk 'NR==2 {print $2}')
-    [ "$COLIMA_STATUS" = "Running" ] || fail "Colima VM is stopped or not running (status: $COLIMA_STATUS)"
+if [ "$PLATFORM" = "macos" ] && command -v colima >/dev/null 2>&1; then
+  colima status 2>&1 | grep -qi "is running"     || fail "Colima VM is not running (run: colima start)"
+elif command -v limactl >/dev/null 2>&1; then
+  COLIMA_STATUS=$(limactl list 2>/dev/null | awk 'NR==2 {print $2}')
+  [ "$COLIMA_STATUS" = "Running" ] || fail "Colima/Lima VM is stopped (status: $COLIMA_STATUS)"
 fi
-pass "Gate 2: Service active/enabled and Docker/Colima daemon up"
+pass "Gate 2: Service active and Docker/Colima daemon up (platform=$PLATFORM)"
 
 # --- Gate 3: Fleet capacity ---
 echo "--- Checking Gate 3: Fleet capacity ---"

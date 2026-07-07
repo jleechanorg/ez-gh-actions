@@ -1,0 +1,24 @@
+# jeff-ubuntu fleet — 16 runners, native docker.
+# Install: cp config/config.toml.linux.example ~/.config/ezgha/config.toml
+version = 1
+
+[github]
+scope = "org"
+target = "jleechanorg"
+
+[runner]
+name_prefix = "ez-runner-b"
+labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64"]
+count = 16
+image = "ezgha-runner:latest"
+
+[limits]
+memory_mb = 5977
+cpus = 2.0
+pids = 512
+min_free_disk_gb = 10
+
+[policy]
+# Native linux docker = container isolation. "vm" only if daemon is VM-contained
+# and you want fail-closed enforcement when backend drops below vm.
+minimum_isolation = "container"

@@ -1,0 +1,24 @@
+# MacBook fleet — 6 runners, Colima-backed docker.
+# Install: cp config/config.toml.mac.example ~/.config/ezgha/config.toml
+version = 1
+
+[github]
+scope = "org"
+target = "jleechanorg"
+
+[runner]
+labels = ["self-hosted", "self-hosted-mikey", "ezgha", "macOS", "ARM64"]
+count = 6
+image = "ezgha-runner:latest"
+name_prefix = "ez-mac-runner-b"
+
+[limits]
+memory_mb = 8192
+cpus = 4.0
+pids = 512
+min_free_disk_gb = 5
+
+[policy]
+# Colima = docker-in-VM, but backend isolation is still "container".
+# Do NOT set "vm" here — serve fail-closes on daemon blips.
+minimum_isolation = "container"
