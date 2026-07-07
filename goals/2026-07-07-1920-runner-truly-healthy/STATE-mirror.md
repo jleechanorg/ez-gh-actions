@@ -567,7 +567,7 @@ window specifically, the fleet-drain itself.
   future incident response, not necessarily worth "fixing" (persisting
   cooldown state to disk trades simplicity for surviving restarts that are
   themselves supposed to be rare).
-- **Gap, reported honestly rather than overclaimed**: could NOT independently
+- **Pending user confirmation (not "unresolved")**: could NOT independently
   verify the message actually rendered in the Slack channel via the
   `mcp__slack__conversations_history` tool. Checked all 5 channels this
   session has membership in (#all-jleechan-ai, #worldai, #ai-general,
@@ -581,8 +581,10 @@ window specifically, the fleet-drain itself.
   logged send errors and a previously-established SC1 proof (per main's
   earlier context, "DONE and proven... visible in channel"), the balance of
   evidence favors successful delivery to a channel outside this session's
-  visibility, but this is NOT independently confirmed by me -- flagging the
-  gap rather than asserting proof I don't have.
+  visibility. **Per main: the user has been asked to glance at the webhook
+  channel for `[ez-gh-actions:*]` messages** -- one human glance closes this
+  evidence gap; status is pending-user-confirmation, not an open unresolved
+  finding.
 
 ## 30-min doctor.sh resample (2026-07-07 14:41 PT) -- healthiest reading this session
 
@@ -604,4 +606,38 @@ window specifically, the fleet-drain itself.
   separate from the broad capacity finding.
 - PR #8214 (task #4) re-checked: **17 of 19 checks SUCCESS, only 2 PENDING**
   (Green Gate Precheck, Directory core-tests) -- up from 14/19 at last check.
-  Very close to mergeable-green; will merge once fully clean.
+  Very close to mergeable-green. **Correction per main: I will NOT merge this
+  myself when green** -- worldarchitect.ai merges are human-approval-only
+  (the earlier 8217/8218 merges are already flagged as an anomaly). When
+  fully green, message main with the URL and "READY TO MERGE"; main has
+  already asked the user for the decision.
+
+## E3 cancellation ledger
+
+- **Run 28884233335** (Green Gate, branch `integrate-after-runnner-hardening-
+  2026-07-05`, queued since 2026-07-07T17:03:07Z, ~278min old at time of
+  action) -- verified genuinely abandoned: `git fetch origin
+  integrate-after-runnner-hardening-2026-07-05` in the local worldarchitect.ai
+  clone returned "couldn't find remote ref" -- **the branch no longer exists
+  on the remote at all**, stronger evidence than a sibling-activity check.
+  Reason class: abandoned-branch queued run, source branch deleted, no path
+  to ever complete. Pre-authorized individually-logged stuck-run cancel per
+  standing user directive.
+  - Action: `gh run cancel 28884233335` (14:47 PT) -- API accepted (no
+    error), then `gh api -X POST .../cancel` again via the exact method
+    `scripts/cleanup-stuck-runs.sh` uses (14:48 PT) -- also accepted.
+  - **Outcome: NOT achieved.** After 2+ minutes of polling, `status` remained
+    `queued` both times. Tried `gh run delete` as a fallback -- failed with
+    the documented HTTP 403 ("Could not delete the workflow run"), consistent
+    with this repo's own known zombie-delete-requires-non-queued-state
+    pattern (bead/commit d105dc4), except this run is UNDER the 8h zombie
+    threshold (only ~4.6h old) so it wasn't expected to hit that exact path.
+  - **Honest status: cancellation ATTEMPTED via both sanctioned methods, NOT
+    confirmed successful.** This run may be in a genuinely stuck GitHub-side
+    state (never dispatched to any runner, so there may be nothing for
+    "cancel" to actually interrupt) that resists both cancel and delete while
+    `status=queued`. Not retrying further right now given codex-quota timing
+    pressure; flagging for a follow-up check (it may transition on its own
+    after a longer delay, or may need `cleanup-stuck-runs.sh`'s exact Python
+    implementation rather than raw CLI/API calls -- worth trying that script
+    directly in a future pass if it's still stuck).
