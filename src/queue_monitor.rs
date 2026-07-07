@@ -280,7 +280,28 @@ fn combine_invariant_sample(
     // busy_count can never exceed EXPECTED_FLEET_RUNNERS (fleet_runner_stats
     // filters to the 22 expected names only), so `>=` and `==` are
     // operationally identical; `>=` is the defensive form.
-    let inv1 = fleet.busy_count >= EXPECTED_FLEET_RUNNERS || queued_jobs == 0;
+    //
+    // Correctness fix, 2026-07-07 (found while verifying the mission's first
+    // all-clear sample): `queued_jobs == 0` must NOT satisfy INV-1 when the
+    // fetch was capped. `queued_jobs_capped=true` means only the OLDEST
+    // `INVARIANT_JOB_ENUMERATION_CAP` queued runs were actually enumerated
+    // (per repo) -- with the live queue depth (400+ runs, far above the
+    // 50-run cap) this is true on EVERY sample right now, confirmed via
+    // invariant_history.jsonl. A capped fetch finding 0 self-hosted queued
+    // jobs among the examined subset does NOT prove the true total is 0 --
+    // there may be self-hosted queued jobs beyond the cap window that were
+    // never checked. Treating a capped-zero as "queue confirmed empty" would
+    // fabricate an INV-1 pass from incomplete data -- the inverse of the
+    // UNKNOWN-on-API-error problem (there we guard against poisoning E2 with
+    // a false FAIL from missing data; here the same missing-data situation
+    // could poison E2 with a false PASS, which is more dangerous since it's
+    // silently accepted rather than alerted on). Only an UNCAPPED zero (a
+    // fetch that genuinely enumerated everything and found nothing queued)
+    // can satisfy this branch of the OR. The busy_count branch is unaffected
+    // -- fleet stats are never capped, so `busy >= 22` remains fully reliable
+    // regardless of `queued_jobs_capped`.
+    let inv1 =
+        fleet.busy_count >= EXPECTED_FLEET_RUNNERS || (queued_jobs == 0 && !queued_jobs_capped);
     let inv2 = oldest_queued_job_min <= INVARIANT_DURATION_THRESHOLD_MINUTES
         && oldest_running_job_min <= INVARIANT_DURATION_THRESHOLD_MINUTES;
     let inv1_fail_class = if inv1 {
@@ -1515,6 +1536,45 @@ mod tests {
         assert_eq!(sample.queued_jobs, 0);
         assert!(sample.inv1);
         assert_eq!(sample.inv1_fail_class, None);
+    }
+
+    #[test]
+    fn invariant_inv1_false_when_zero_queued_is_capped_not_confirmed_empty() {
+        // Regression test for a real production near-miss (2026-07-07): with
+        // the live queue depth (400+ runs) always exceeding
+        // INVARIANT_JOB_ENUMERATION_CAP, every sample was `capped=true`, and
+        // one sample happened to find 0 self-hosted queued jobs among the 50
+        // oldest runs it examined -- but that does NOT mean the true total
+        // across all queued runs was 0. A capped zero must not fabricate an
+        // INV-1 pass; only an UNCAPPED zero (this file's other test, above)
+        // may.
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
+        let stats = vec![stats_with_ages(None, None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000, true);
+        assert_eq!(sample.queued_jobs, 0);
+        assert_eq!(sample.queued_jobs_capped, true);
+        assert!(
+            !sample.inv1,
+            "a capped fetch that happened to find 0 queued jobs must not be \
+             treated as a confirmed-empty queue"
+        );
+        assert_eq!(
+            sample.inv1_fail_class.as_deref(),
+            Some("genuinely-idle"),
+            "busy < 22 with the fleet fully registered+online and no confirmed \
+             queued work classifies as genuinely-idle, not a fabricated pass"
+        );
+    }
+
+    #[test]
+    fn invariant_inv1_true_when_busy_full_even_if_queue_read_is_capped() {
+        // The busy_count branch of INV-1's OR must stay reliable regardless
+        // of queued_jobs_capped -- fleet stats are never subject to the
+        // job-enumeration cap.
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let stats = vec![stats_with_ages(Some(5.0), None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000, true);
+        assert!(sample.inv1);
     }
 
     #[test]
