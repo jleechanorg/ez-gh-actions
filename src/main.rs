@@ -562,6 +562,19 @@ where
     run()
 }
 
+fn run_invariant_sampler_tick<F>(run: F) -> bool
+where
+    F: FnOnce() -> Result<Option<queue_monitor::InvariantSample>>,
+{
+    match run() {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("WARN: invariant sampler tick failed: {err:#}");
+            false
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli)?;
@@ -709,6 +722,7 @@ fn main() -> Result<()> {
             let _watchdog_heartbeat = mark_service_ready_and_start_watchdog();
             let mut backend_recovery = BackendRecoveryState::new();
             let mut queue_monitor = queue_monitor::QueueMonitorState::new();
+            let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             loop {
@@ -776,6 +790,8 @@ fn main() -> Result<()> {
                 if ensure_succeeded {
                     watchdog::ping();
                     let _ = run_queue_monitor_tick(|| queue_monitor.maybe_check(&cfg));
+                    watchdog::ping();
+                    let _ = run_invariant_sampler_tick(|| invariant_sampler.maybe_sample(&cfg));
                     watchdog::ping();
                     let _ = run_canary_scheduler_tick(|| canary_scheduler.maybe_check(&cfg));
                 }
