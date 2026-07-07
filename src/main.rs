@@ -726,6 +726,15 @@ fn main() -> Result<()> {
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             loop {
+                // Start-of-iteration timestamp for the monitoring ticks'
+                // SERVE_LOOP_TIME_BUDGET: no matter how expensive queue_monitor
+                // or invariant_sampler's GitHub API enumeration gets, both bail
+                // out relative to THIS instant, guaranteeing ensure_count is
+                // reachable again within the budget regardless of queue depth
+                // (see queue_monitor::SERVE_LOOP_TIME_BUDGET's doc comment --
+                // this is the structural fix for the 2026-07-07 fleet-drain
+                // incident, layered on top of the per-tick job-enumeration cap).
+                let loop_start = Instant::now();
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
@@ -789,9 +798,11 @@ fn main() -> Result<()> {
                 };
                 if ensure_succeeded {
                     watchdog::ping();
-                    let _ = run_queue_monitor_tick(|| queue_monitor.maybe_check(&cfg));
+                    let _ = run_queue_monitor_tick(|| queue_monitor.maybe_check(&cfg, loop_start));
                     watchdog::ping();
-                    let _ = run_invariant_sampler_tick(|| invariant_sampler.maybe_sample(&cfg));
+                    let _ = run_invariant_sampler_tick(|| {
+                        invariant_sampler.maybe_sample(&cfg, loop_start)
+                    });
                     watchdog::ping();
                     let _ = run_canary_scheduler_tick(|| canary_scheduler.maybe_check(&cfg));
                 }
