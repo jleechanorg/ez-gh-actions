@@ -223,10 +223,45 @@ pub struct RunnerConfig {
     /// slot assignment file.
     #[serde(default = "default_runner_name_prefix")]
     pub name_prefix: String,
+    /// Maximum runners to start back-to-back during one respawn refill batch.
+    #[serde(default = "default_respawn_batch_size")]
+    pub respawn_batch_size: u32,
+    /// Seconds to wait between respawn batches.
+    #[serde(default = "default_respawn_batch_sleep_seconds")]
+    pub respawn_batch_sleep_seconds: u64,
+    /// 1-minute host load average at or above this value delays the next batch.
+    #[serde(default = "default_respawn_load_threshold")]
+    pub respawn_load_threshold: f64,
+    /// Seconds between load-average rechecks while delaying a batch.
+    #[serde(default = "default_respawn_load_retry_seconds")]
+    pub respawn_load_retry_seconds: u64,
+    /// Maximum seconds to delay a batch for high load before proceeding anyway.
+    #[serde(default = "default_respawn_load_max_wait_seconds")]
+    pub respawn_load_max_wait_seconds: u64,
 }
 
 fn default_runner_name_prefix() -> String {
     "ez-org-runner".into()
+}
+
+pub fn default_respawn_batch_size() -> u32 {
+    4
+}
+
+pub fn default_respawn_batch_sleep_seconds() -> u64 {
+    5
+}
+
+pub fn default_respawn_load_threshold() -> f64 {
+    12.0
+}
+
+pub fn default_respawn_load_retry_seconds() -> u64 {
+    5
+}
+
+pub fn default_respawn_load_max_wait_seconds() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -341,6 +376,11 @@ impl Config {
                 count: 1,
                 image: "ghcr.io/actions/actions-runner:latest".into(),
                 name_prefix: default_runner_name_prefix(),
+                respawn_batch_size: default_respawn_batch_size(),
+                respawn_batch_sleep_seconds: default_respawn_batch_sleep_seconds(),
+                respawn_load_threshold: default_respawn_load_threshold(),
+                respawn_load_retry_seconds: default_respawn_load_retry_seconds(),
+                respawn_load_max_wait_seconds: default_respawn_load_max_wait_seconds(),
             },
             limits: Limits {
                 memory_mb: mem,
@@ -406,6 +446,49 @@ impl Config {
             anyhow::bail!(
                 "runner.count must be at least 1 (got {})",
                 self.runner.count
+            );
+        }
+        if self.runner.respawn_batch_size < 1 {
+            anyhow::bail!(
+                "runner.respawn_batch_size must be at least 1 (got {})",
+                self.runner.respawn_batch_size
+            );
+        }
+        if self.runner.respawn_batch_size > 64 {
+            anyhow::bail!(
+                "runner.respawn_batch_size must be at most 64 (got {})",
+                self.runner.respawn_batch_size
+            );
+        }
+        if self.runner.respawn_batch_sleep_seconds == 0
+            || self.runner.respawn_batch_sleep_seconds > 60
+        {
+            anyhow::bail!(
+                "runner.respawn_batch_sleep_seconds must be in 1..=60 (got {})",
+                self.runner.respawn_batch_sleep_seconds
+            );
+        }
+        if !self.runner.respawn_load_threshold.is_finite()
+            || self.runner.respawn_load_threshold < 1.0
+        {
+            anyhow::bail!(
+                "runner.respawn_load_threshold must be a finite value >= 1.0 (got {})",
+                self.runner.respawn_load_threshold
+            );
+        }
+        if self.runner.respawn_load_retry_seconds == 0
+            || self.runner.respawn_load_retry_seconds > self.runner.respawn_load_max_wait_seconds
+        {
+            anyhow::bail!(
+                "runner.respawn_load_retry_seconds must be in 1..={} (got {})",
+                self.runner.respawn_load_max_wait_seconds,
+                self.runner.respawn_load_retry_seconds
+            );
+        }
+        if self.runner.respawn_load_max_wait_seconds > 600 {
+            anyhow::bail!(
+                "runner.respawn_load_max_wait_seconds must be at most 600 (got {})",
+                self.runner.respawn_load_max_wait_seconds
             );
         }
         if self.github.target.trim().is_empty() {
@@ -612,6 +695,11 @@ mod tests {
         assert_eq!(tiny.canary.ref_name, "main");
         assert_eq!(tiny.canary.slo_start_seconds, 90);
         assert_eq!(tiny.canary.check_interval_seconds, 600);
+        assert_eq!(tiny.runner.respawn_batch_size, 4);
+        assert_eq!(tiny.runner.respawn_batch_sleep_seconds, 5);
+        assert_eq!(tiny.runner.respawn_load_threshold, 12.0);
+        assert_eq!(tiny.runner.respawn_load_retry_seconds, 5);
+        assert_eq!(tiny.runner.respawn_load_max_wait_seconds, 60);
 
         let huge = Config::defaults_for(&fake_platform(128 * 1024, 32), "o/r".into(), Scope::Repo);
         assert_eq!(huge.limits.memory_mb, 16384); // ceiling
@@ -714,6 +802,38 @@ mod tests {
     fn reject_zero_count() {
         let mut cfg = valid_config();
         cfg.runner.count = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_invalid_respawn_pacing_values() {
+        let mut cfg = valid_config();
+        cfg.runner.respawn_batch_size = 0;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_batch_size = 65;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_batch_size = 4;
+
+        cfg.runner.respawn_batch_sleep_seconds = 0;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_batch_sleep_seconds = 61;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_batch_sleep_seconds = 5;
+
+        cfg.runner.respawn_load_threshold = 0.5;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_load_threshold = f64::NAN;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_load_threshold = 12.0;
+
+        cfg.runner.respawn_load_retry_seconds = 0;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_load_retry_seconds = 61;
+        cfg.runner.respawn_load_max_wait_seconds = 60;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_load_retry_seconds = 5;
+
+        cfg.runner.respawn_load_max_wait_seconds = 601;
         assert!(cfg.validate().is_err());
     }
 
