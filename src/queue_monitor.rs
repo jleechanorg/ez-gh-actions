@@ -1189,6 +1189,269 @@ mod tests {
             .any(|runner| runner.name == "ez-canary-runner-b-1"));
     }
 
+    fn fleet_runner(name: &str, status: &str, busy: bool) -> FleetRunner {
+        FleetRunner {
+            name: name.into(),
+            status: status.into(),
+            busy,
+        }
+    }
+
+    fn full_fleet(busy_count: usize, idle_count: usize) -> FleetRunnerStats {
+        FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS,
+            busy_count,
+            idle_count,
+            missing_names: vec![],
+            runners: vec![],
+        }
+    }
+
+    fn stats_with_ages(oldest_queued: Option<f64>, oldest_in_progress: Option<f64>) -> QueueStats {
+        QueueStats {
+            queued_total: usize::from(oldest_queued.is_some()),
+            fresh_queued: usize::from(oldest_queued.is_some()),
+            stale_queued: 0,
+            in_progress_total: usize::from(oldest_in_progress.is_some()),
+            p50_wait_minutes: 0.0,
+            p90_wait_minutes: 0.0,
+            max_fresh_wait_minutes: oldest_queued.unwrap_or(0.0),
+            max_in_progress_age_minutes: oldest_in_progress.unwrap_or(0.0),
+            max_current_job_age_minutes: oldest_queued
+                .unwrap_or(0.0)
+                .max(oldest_in_progress.unwrap_or(0.0)),
+            tail_warn_minutes: 20,
+            stale_cutoff_hours: 8,
+            tail_bad: false,
+            oldest_fresh: oldest_queued.map(|age_minutes| AgedQueueJob {
+                run_id: 1,
+                job_id: 1,
+                name: "job".into(),
+                head_branch: "main".into(),
+                url: "https://github.example/runs/1".into(),
+                age_minutes,
+            }),
+            oldest_stale: None,
+            oldest_in_progress: oldest_in_progress.map(|age_minutes| AgedQueueJob {
+                run_id: 2,
+                job_id: 2,
+                name: "job".into(),
+                head_branch: "main".into(),
+                url: "https://github.example/runs/2".into(),
+                age_minutes,
+            }),
+            fleet: None,
+        }
+    }
+
+    #[test]
+    fn invariant_inv1_true_when_fleet_fully_busy_regardless_of_queue() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let stats = vec![stats_with_ages(Some(5.0), None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        assert!(sample.inv1);
+        assert_eq!(sample.inv1_fail_class, None);
+    }
+
+    #[test]
+    fn invariant_inv1_true_when_queue_is_empty_regardless_of_busy_count() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
+        let stats = vec![stats_with_ages(None, None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        assert_eq!(sample.queued_jobs, 0);
+        assert!(sample.inv1);
+        assert_eq!(sample.inv1_fail_class, None);
+    }
+
+    #[test]
+    fn invariant_inv1_false_when_fleet_short_one_and_queue_nonempty() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS - 1, 1);
+        let stats = vec![stats_with_ages(Some(5.0), None)];
+        let sample = combine_invariant_sample(&fleet, &stats, 1000);
+        assert_eq!(sample.queued_jobs, 1);
+        assert!(!sample.inv1);
+        assert_eq!(sample.inv1_fail_class.as_deref(), Some("genuinely-idle"));
+    }
+
+    #[test]
+    fn invariant_inv2_boundary_is_inclusive_of_exactly_20_minutes() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let at_threshold = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(Some(20.0), Some(20.0))],
+            1000,
+        );
+        assert!(at_threshold.inv2, "exactly 20.0m must satisfy INV-2");
+
+        let over_threshold_queued = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(Some(20.01), None)],
+            1000,
+        );
+        assert!(!over_threshold_queued.inv2, "20.01m queued must violate INV-2");
+
+        let over_threshold_running = combine_invariant_sample(
+            &fleet,
+            &[stats_with_ages(None, Some(20.01))],
+            1000,
+        );
+        assert!(
+            !over_threshold_running.inv2,
+            "20.01m in-progress must violate INV-2"
+        );
+    }
+
+    #[test]
+    fn invariant_oldest_ages_combine_stale_and_fresh_across_repos_via_max() {
+        let fleet = full_fleet(EXPECTED_FLEET_RUNNERS, 0);
+        let mut worldai_stats = stats_with_ages(Some(5.0), None);
+        // A stale (>8h) zombie is still "queued > 20min" for E1's ironclad
+        // duration invariant even though queue_stats() excludes it from
+        // max_current_job_age_minutes for the unrelated starvation-alert path.
+        worldai_stats.oldest_stale = Some(AgedQueueJob {
+            run_id: 9,
+            job_id: 9,
+            name: "zombie".into(),
+            head_branch: "main".into(),
+            url: "https://github.example/runs/9".into(),
+            age_minutes: 500.0,
+        });
+        let ezgha_stats = stats_with_ages(Some(3.0), Some(45.0));
+
+        let sample = combine_invariant_sample(&fleet, &[worldai_stats, ezgha_stats], 1000);
+
+        assert_eq!(sample.oldest_queued_job_min, 500.0);
+        assert_eq!(sample.oldest_running_job_min, 45.0);
+        assert!(!sample.inv2);
+    }
+
+    #[test]
+    fn classify_inv1_failure_prioritizes_missing_registration() {
+        let fleet = FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS - 1,
+            busy_count: EXPECTED_FLEET_RUNNERS - 1,
+            idle_count: 0,
+            missing_names: vec!["ez-runner-c-16".into()],
+            runners: vec![fleet_runner("ez-mac-runner-b-1", "offline", false)],
+        };
+        assert_eq!(classify_inv1_failure(&fleet), "missing-registration");
+    }
+
+    #[test]
+    fn classify_inv1_failure_detects_offline_respawning_when_fully_registered() {
+        let fleet = FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS,
+            busy_count: EXPECTED_FLEET_RUNNERS - 1,
+            idle_count: 0,
+            missing_names: vec![],
+            runners: vec![
+                fleet_runner("ez-runner-c-1", "online", true),
+                fleet_runner("ez-runner-c-2", "offline", false),
+            ],
+        };
+        assert_eq!(classify_inv1_failure(&fleet), "offline-respawning");
+    }
+
+    #[test]
+    fn classify_inv1_failure_falls_back_to_genuinely_idle() {
+        let fleet = FleetRunnerStats {
+            expected_total: EXPECTED_FLEET_RUNNERS,
+            registered_count: EXPECTED_FLEET_RUNNERS,
+            busy_count: EXPECTED_FLEET_RUNNERS - 1,
+            idle_count: 1,
+            missing_names: vec![],
+            runners: vec![
+                fleet_runner("ez-runner-c-1", "online", true),
+                fleet_runner("ez-runner-c-2", "online", false),
+            ],
+        };
+        assert_eq!(classify_inv1_failure(&fleet), "genuinely-idle");
+    }
+
+    #[test]
+    fn append_invariant_sample_writes_exact_schema_fields() {
+        let (mut cfg, dir, _log) = test_config_with_log();
+        let history = dir.join("invariant_history.jsonl");
+        cfg.invariant_sampler.history_path = Some(history.clone());
+        let sample = InvariantSample {
+            ts: 1_700_000_000,
+            busy: 20,
+            registered: 22,
+            queued_jobs: 3,
+            oldest_queued_job_min: 12.5,
+            oldest_running_job_min: 4.0,
+            inv1: false,
+            inv2: true,
+            inv1_fail_class: Some("genuinely-idle".into()),
+        };
+
+        append_invariant_sample(&cfg, &sample).unwrap();
+        append_invariant_sample(&cfg, &sample).unwrap();
+
+        let raw = fs::read_to_string(&history).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "one JSON line appended per sample");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let obj = parsed.as_object().unwrap();
+        for key in [
+            "ts",
+            "busy",
+            "registered",
+            "queued_jobs",
+            "oldest_queued_job_min",
+            "oldest_running_job_min",
+            "inv1",
+            "inv2",
+            "inv1_fail_class",
+        ] {
+            assert!(obj.contains_key(key), "missing schema field {key}");
+        }
+        assert_eq!(obj.len(), 9, "no extra fields beyond the E1 schema");
+        assert_eq!(obj["busy"], 20);
+        assert_eq!(obj["inv1"], false);
+        assert_eq!(obj["inv1_fail_class"], "genuinely-idle");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invariant_history_path_honors_config_override() {
+        let (mut cfg, dir, _log) = test_config_with_log();
+        let custom = dir.join("custom-invariant-history.jsonl");
+        cfg.invariant_sampler.history_path = Some(custom.clone());
+        assert_eq!(invariant_history_path(&cfg), custom);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn alert_invariant_violation_reports_both_invariants_when_both_fail() {
+        alert::clear_alert_state();
+        let (cfg, dir, log) = test_config_with_log();
+        let sample = InvariantSample {
+            ts: 1_700_000_000,
+            busy: 18,
+            registered: 20,
+            queued_jobs: 5,
+            oldest_queued_job_min: 45.0,
+            oldest_running_job_min: 25.0,
+            inv1: false,
+            inv2: false,
+            inv1_fail_class: Some("missing-registration".into()),
+        };
+
+        alert_invariant_violation(&cfg, &sample).unwrap();
+
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("\"event_key\":\"invariant.violation\""));
+        assert!(raw.contains("\"severity\":\"CRITICAL\""));
+        assert!(raw.contains("INV-1 utilization violated"));
+        assert!(raw.contains("INV-2 duration violated"));
+        assert!(raw.contains("fail_class=missing-registration"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn bad_stats() -> QueueStats {
         QueueStats {
             queued_total: 1,
