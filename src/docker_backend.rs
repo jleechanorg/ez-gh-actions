@@ -614,7 +614,7 @@ fn start_one_with_generate(
     // inside its cgroup instead of taking the host down.
     cmd.args(["--memory", &format!("{memory_mb}m")]);
     cmd.args(["--memory-swap", &format!("{memory_mb}m")]);
-    cmd.args(["--cpus", &format!("{cpus}")]);
+    cmd.args(["--cpus", &format!("{:.2}", cpus)]);
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
     if backend == Backend::DockerSysbox {
