@@ -137,10 +137,25 @@ print(
 )
 print("safety: only status=queued runs are candidates; in_progress runs are ignored")
 
+def run_status(rid):
+    out = subprocess.check_output([
+        "gh", "api", f"repos/{repo}/actions/runs/{rid}", "--jq", ".status"
+    ], stderr=subprocess.STDOUT)
+    return out.decode().strip()
+
 def cancel_run(rid):
+    # POST .../cancel returns 202 but queued runs frequently STAY queued
+    # (observed live 2026-07-07 on runs 28884233335 / 28892581952) — the
+    # force-cancel endpoint is what actually transitions them to completed.
+    # Same cancel -> poll -> force-cancel ordering as the reaper (bead qbl).
     subprocess.check_output([
         "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/cancel"
     ], stderr=subprocess.STDOUT)
+    time.sleep(2)
+    if run_status(rid) == "queued":
+        subprocess.check_output([
+            "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/force-cancel"
+        ], stderr=subprocess.STDOUT)
 
 def delete_run(rid):
     # GitHub rejects DELETE on status=queued runs (HTTP 403) — a queued run must
