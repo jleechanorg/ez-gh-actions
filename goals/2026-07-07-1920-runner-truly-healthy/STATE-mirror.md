@@ -96,16 +96,53 @@ Adversarial verify (codex skeptic, evidence-only) before any SC sign-off. No tok
 webhook rotation. Never touch ~/.bashrc or ~/.config/ezgha/config.toml casually.
 Deadline 2026-07-08 07:20 PT.
 
+## Progress update (2026-07-07 13:17 PT)
+
+1. [DONE] TaskList recreated (tasks #1-#8, tracker was empty on respawn).
+2. [DONE] lane-cg salvaged: worktree at ~/projects/ez-gh-actions-wt-lane-cg (now
+   removed after merge), cargo test 154 passed, merged to main (540b715), Gate 0
+   loop run, pushed.
+3. [DONE] lane-d salvaged: worktree at ~/projects/ez-gh-actions-wt-lane-d (now
+   removed after merge), docker_backend.rs line confirmed unchanged relative to
+   merge-base (main's --cpus .2 fix preserved), merged to main (655d645), pushed.
+4. [DONE] Sibling gemini/gemini-3.5-flash session pushed 3 commits concurrently
+   (a8bd3df: docker_backend reaper fix for mismatched runner names) while I was
+   merging — caught via `git push` rejection, merged cleanly (docker_backend.rs
+   auto-merged, only .beads binary conflicts, resolved via --ours + br sync
+   --import-only --force, the established pattern from c0cc81d). 155 tests pass
+   post-merge. Pushed as 73e275d.
+5. [DONE] lane-h respawned: fresh codex exec background worker launched in a
+   STABLE worktree (~/projects/ez-gh-actions-wt-lane-h, NOT /tmp this time) via
+   Bash run_in_background — first two attempts using manual nohup/disown died
+   when the parent tool call completed (exit 144), tool-native backgrounding is
+   what actually survives. PID 161628 confirmed alive after launch. Scope: gitleaks
+   sweep of ez-gh-actions + worldarchitect.ai, tracked-file secret cleanup only (no
+   history rewrite), add .gitleaks.toml + CI wiring to both repos. Full prompt with
+   standing rules at /tmp/.../scratchpad/lane-h-prompt.txt (also worth copying into
+   the repo if this needs to survive another /tmp wipe — TODO for next update).
+6. [DONE] Queue-growth root cause (task #5): NOT a runaway loop. 503/507 queued
+   runs are in distinct branch+workflow groups (only 4 superseded-dupes). 53
+   concurrent worktree_* AI-agent dirs on this box explain the organic demand.
+   Estimated 3-10x gap between arrival rate (~16-32 self-hosted jobs/min) and fleet
+   completion capacity (~2.3-4.6 jobs/min). Written up as a capacity finding, NOT a
+   fixable bug, per E5 failure-honesty clause: goals/.../03-capacity-finding-queue-
+   growth.md, commit 25c9c97, pushed.
+7. [NOT STARTED] E1 daemon-native sampler (task #6) — lane-cg's queue_monitor.rs
+   changes need review to determine if they already implement E1's automatic-
+   caller requirement, or if that's still outstanding. THIS IS NOW THE TOP PRIORITY
+   — E2's 3hr window can't start counting without it.
+8. [NOT STARTED] PR #8214 (lane-f) monitoring — still open, still pending CI, not
+   re-checked since initial recovery scan.
+9. [NOT STARTED] codex/hardening-bxy-fl0 merge (separate track, ez-gh-actions-jyb)
+   — flagged, not yet actioned.
+
 ## Next actions (in order)
 
-1. [in progress] Recreate TaskList tasks (#1-#8 equivalents) since tracker was empty.
-2. Salvage lane-cg: worktree + build/test + merge queue_monitor.rs work → main.
-3. Salvage lane-d: worktree + review + merge ed8 doc + docker_backend.rs line → main.
-4. Respawn lane-h (gitleaks across repos) as a fresh codex background task.
-5. Investigate why queue is STILL CLIMBING (520, was 267 at mission start) — is this
-   organic demand or something runaway (matrix/loop)? This is the single biggest
-   threat to E2 (3hr zero-violation window) and needs root-causing before more drain
-   cycles are wasted on a refilling bucket.
-6. Monitor PR #8214 (lane-f) for CI to clear once queue drains; merge when green.
-7. Re-run doctor.sh / verify-exit-criteria.sh once fleet fully settles post-restart to
-   get a clean baseline sample for the E1 sampler once it lands.
+1. Review lane-cg's merged queue_monitor.rs changes against the E1 criteria
+   (automatic caller, ≤5min cadence, appends to ~/.local/state/ezgha/
+   invariant_history.jsonl with the exact schema) — determine remaining gap.
+2. Build/finish the E1 sampler if lane-cg didn't fully cover it.
+3. Re-check PR #8214 CI status.
+4. Re-run doctor.sh / verify-exit-criteria.sh for a clean baseline sample.
+5. Continue monitoring lane-h in the background; check back periodically via
+   Read on its output file.
