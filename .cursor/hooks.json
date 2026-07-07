@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "bash /home/jleechan/.local/bin/conflict-warn-pre-tool.sh"
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "bash -c 'echo \"merge_train: cursor subagent (fanout) starting \u2014 conflict hook active\" >&2'"
+      }
+    ]
+  },
+  "version": 1
+}

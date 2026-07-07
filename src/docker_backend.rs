@@ -2,10 +2,14 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::io::Read;
+use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::Once;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend::Backend;
 use crate::config::Config;
@@ -20,6 +24,7 @@ const MANAGED_LABEL: &str = "ezgha=managed";
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
+const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Env var that overrides the slot assignments file path. Used by tests to
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
@@ -67,9 +72,95 @@ fn read_slot_assignments() -> Result<SlotAssignments> {
     if raw.trim().is_empty() {
         return Ok(SlotAssignments::default());
     }
-    let parsed: SlotAssignments = toml::from_str(&raw)
-        .with_context(|| format!("parse slot assignments {}", path.display()))?;
+    let parsed: SlotAssignments = match toml::from_str(&raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            quarantine_corrupt_slot_file(&path, &err);
+            eprintln!(
+                "warning: slot_assignments.toml is corrupt ({}), continuing with empty slot table",
+                err
+            );
+            return Ok(SlotAssignments::default());
+        }
+    };
     Ok(parsed)
+}
+
+fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut corrupted = path.to_path_buf();
+    corrupted.set_extension(format!("toml.corrupt.{ts}"));
+    if let Err(err) = std::fs::rename(path, &corrupted) {
+        eprintln!(
+            "warning: failed to quarantine corrupt slot file {} ({cause}): {err}",
+            path.display()
+        );
+        return;
+    }
+    eprintln!(
+        "warning: quarantined corrupt slot file {} -> {}",
+        path.display(),
+        corrupted.display()
+    );
+}
+
+fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn docker CLI for {detail}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to capture docker stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("failed to capture docker stderr")?;
+    let (tx_out, rx_out) = mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx_out.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        let _ = tx_err.send(buf);
+    });
+
+    let stdout = match rx_out.recv_timeout(timeout) {
+        Ok(buf) => buf,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "docker CLI timed out after {}ms while {detail}",
+                timeout.as_millis()
+            );
+        }
+    };
+    let stderr = rx_err
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for docker CLI during {detail}"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn write_slot_assignments(assignments: &SlotAssignments) -> Result<()> {
@@ -263,6 +354,10 @@ pub fn print_doctor(plat: &Platform) {
     }
 }
 
+fn run_docker(cmd: Command, detail: &str) -> Result<Output> {
+    run_docker_with_timeout(cmd, detail, DOCKER_TIMEOUT)
+}
+
 /// Process-wide guard so `print_doctor`'s warning prints at most once per
 /// `serve` process — otherwise the 30s reconciliation loop would re-emit the
 /// same diagnostic forever.
@@ -277,11 +372,9 @@ fn runner_name_for(cfg: &Config, slot: u32) -> String {
 /// the local host when docker runs inside a VM (Colima/Lima/Docker Desktop)
 /// or on a remote context. Limits must respect the daemon, not the host.
 pub fn daemon_capacity() -> Option<(f64, u64)> {
-    let out = Command::new("docker")
-        .args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+    let mut cmd = Command::new("docker");
+    cmd.args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"]);
+    let out = run_docker(cmd, "reading docker daemon capacity").ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut parts = stdout.split_whitespace();
     let ncpu: f64 = parts.next()?.parse().ok()?;
@@ -324,15 +417,28 @@ pub fn effective_limits(cfg: &Config) -> (f64, u64) {
 
 /// Start one ephemeral JIT runner container. Returns (container_id, runner_name).
 pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
+    start_one_with_generate(cfg, backend, github::generate_jitconfig)
+}
+
+fn start_one_with_generate(
+    cfg: &Config,
+    backend: Backend,
+    generate_jitconfig: impl FnOnce(
+        &crate::config::GithubConfig,
+        &str,
+        &[String],
+        &HashSet<u64>,
+    ) -> Result<(String, u64)>,
+) -> Result<(String, String)> {
     // Acquire a stable numeric slot BEFORE calling GitHub so a JIT
     // registration that never gets a container still gets cleaned up.
     let slot = next_slot(cfg)?;
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
-    let _ = std::process::Command::new("docker")
-        .args(["rm", "-f", &runner_name])
-        .output();
+    let mut pre_rm = Command::new("docker");
+    pre_rm.args(["rm", "-f", &runner_name]);
+    let _ = run_docker(pre_rm, "pre-start rm -f").ok();
 
     let (cpus, memory_mb) = effective_limits(cfg);
     // Build the set of GitHub runner_ids we own (slot file = host ownership).
@@ -347,10 +453,10 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
         .collect();
     watchdog::ping();
     let (jit, runner_id) =
-        match github::generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels, &owned_ids)
-        {
+        match generate_jitconfig(&cfg.github, &runner_name, &cfg.runner.labels, &owned_ids) {
             Ok(pair) => pair,
             Err(e) => {
+                let _ = release_slot(slot);
                 return Err(e);
             }
         };
@@ -374,7 +480,7 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
     cmd.arg(&cfg.runner.image);
     cmd.args(["./run.sh", "--jitconfig", &jit]);
 
-    let out = cmd.output().context("failed to run docker")?;
+    let out = run_docker(cmd, "docker run start_one")?;
     watchdog::ping();
     if !out.status.success() {
         // The JIT registration exists server-side but no runner will ever
@@ -405,16 +511,15 @@ pub struct ManagedContainer {
 }
 
 pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
-    let out = Command::new("docker")
-        .args([
-            "ps",
-            "--filter",
-            &format!("label={MANAGED_LABEL}"),
-            "--format",
-            "json",
-        ])
-        .output()
-        .context("failed to run docker ps")?;
+    let mut cmd = Command::new("docker");
+    cmd.args([
+        "ps",
+        "--filter",
+        &format!("label={MANAGED_LABEL}"),
+        "--format",
+        "json",
+    ]);
+    let out = run_docker(cmd, "listing managed containers")?;
     if !out.status.success() {
         bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -432,7 +537,9 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
 pub fn stop_all(cfg: &Config) -> Result<usize> {
     let containers = managed_containers()?;
     for c in &containers {
-        let _ = Command::new("docker").args(["rm", "-f", &c.id]).output();
+        let mut cmd = Command::new("docker");
+        cmd.args(["rm", "-f", &c.id]);
+        let _ = run_docker(cmd, "stop_all rm -f").ok();
     }
     // Deregister THIS HOST's runners: only the slots we own (from local slot
     // assignments), so we never tear down a sibling host's `ez-org-runner-N`
@@ -479,9 +586,9 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
 /// this is the disk runner jobs will actually fill. A host-side `df` would
 /// read the wrong filesystem whenever the daemon is a VM (Colima/Lima/Desktop).
 pub fn free_disk_gb(image: &str) -> Option<u64> {
-    let out = Command::new("docker")
-        .args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"])
-        .output()
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
+    let out = run_docker(cmd, "measuring docker daemon free disk")
         .ok()
         .filter(|o| o.status.success())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -570,6 +677,7 @@ mod tests {
     use crate::platform::Platform;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     /// Process-wide test lock: `slot_assignments_path()` reads from a static
     /// when running tests, so the slot file location and contents are
@@ -745,6 +853,69 @@ mod tests {
         release_slot(s1).unwrap();
         let reused = next_slot(&cfg).unwrap();
         assert_eq!(reused, s1, "released slot must be the first one reissued");
+    }
+
+    #[test]
+    fn read_slot_assignments_quarantines_corrupt_file_and_returns_empty() {
+        let env = TestEnv::new("corrupt_slot_file");
+        let path = env.path.clone();
+        std::fs::write(&path, b"this is not toml data").unwrap();
+
+        let assignments = read_slot_assignments().unwrap();
+        assert!(assignments.assignments.is_empty());
+        assert!(
+            !path.exists(),
+            "corrupt file should be removed from original location"
+        );
+
+        let parent = path
+            .parent()
+            .expect("slot file path should have a parent directory");
+        let quarantined: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("slot_assignments.toml.corrupt."))
+            .collect();
+        assert!(
+            !quarantined.is_empty(),
+            "corrupt file should be renamed to a toml.corrupt.* sibling"
+        );
+    }
+
+    #[test]
+    fn run_docker_times_out() {
+        let start = Instant::now();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let result = run_docker_with_timeout(
+            cmd,
+            "hung docker command simulation",
+            Duration::from_millis(200),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "hung command should timeout");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout should fire promptly, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn start_one_releases_slot_on_jit_generation_failure() {
+        let _env = TestEnv::new("jit_failure_releases_slot");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Err(anyhow::anyhow!("forced test failure in JIT generation"))
+        })
+        .expect_err("start_one should fail when jit generation fails");
+        assert!(err.to_string().contains("forced test failure"));
+        let assignments = read_slot_assignments().unwrap();
+        assert!(
+            assignments.assignments.is_empty(),
+            "slot reserved by start_one should be released on JIT failure"
+        );
     }
 
     #[test]

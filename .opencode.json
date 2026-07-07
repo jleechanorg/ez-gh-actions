@@ -1,0 +1,4 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": "IMPORTANT: Before starting any coding task, run: predict-conflicts --from-prs <PR_NUMBER> to check for symbol-level conflicts with other open PRs. If conflicts are detected, pick a different task or coordinate with the conflicting PR's author."
+}

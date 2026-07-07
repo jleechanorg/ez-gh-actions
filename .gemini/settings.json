@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /home/jleechan/.local/bin/conflict-warn-pre-tool.sh",
+            "timeoutSec": 15,
+            "statusMessage": "merge_train: checking conflicts..."
+          }
+        ]
+      }
+    ]
+  }
+}

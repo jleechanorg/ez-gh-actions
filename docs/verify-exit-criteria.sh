@@ -201,31 +201,66 @@ pass "Gate 3: Fleet capacity meets targets (Effective capacity: $EFFECTIVE_CAPAC
 
 # --- Gate 4: Real job execution ---
 echo "--- Checking Gate 4: Real job execution ---"
-# Verify recent runs succeeded on the fleet
-SELFTES_RUNS=$(gh run list -R jleechanorg/ez-gh-actions -w ezgha-selftest -L 5 --json conclusion,databaseId --jq '.[] | "\(.databaseId) \(.conclusion)"' 2>/dev/null || true)
-if [ -z "$SELFTES_RUNS" ]; then
-    fail "No recent ezgha-selftest runs found"
+WORKFLOW="ezgha-selftest"
+REPO="jleechanorg/ez-gh-actions"
+
+SELFTEST_RUNS=$(gh run list -R "$REPO" -w "$WORKFLOW" -L 20 --json databaseId,status,conclusion 2>/dev/null || true)
+COMPLETED_RUNS=$(echo "$SELFTEST_RUNS" | jq -r '[.[] | select(.status=="completed")]')
+COMPLETED_COUNT=$(echo "$COMPLETED_RUNS" | jq 'length')
+if [ "$COMPLETED_COUNT" -lt 1 ]; then
+    fail "No completed ezgha-selftest runs found"
 fi
 
-while read -r rid conc; do
-    [ -z "$rid" ] && continue
-    if [ "$conc" != "success" ]; then
-        fail "Recent selftest run $rid failed or did not conclude successfully (conclusion: $conc)"
+# Validate recent completed runs executed on the configured runner prefix.
+# Prefer configured-prefix telemetry over stale historical runs from retired fleets.
+MATCH_PREFIX_COUNT=0
+while IFS=' ' read -r rid conc; do
+    if [ -z "$rid" ] || [ -z "$conc" ]; then
+        continue
     fi
-    # Check that it ran on our fleet
-    jobs=$(gh api "repos/jleechanorg/ez-gh-actions/actions/runs/$rid/jobs" 2>/dev/null)
+    jobs=$(gh api "repos/$REPO/actions/runs/$rid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
-    if [[ "$rn" != ez-org-runner-* ]]; then
-        fail "Recent selftest run $rid executed on non-ezgha runner: $rn"
+    if [[ "$rn" == "${NAME_PREFIX}-"* ]]; then
+        if [ "$conc" != "success" ]; then
+            fail "Recent selftest run $rid on $rn failed or did not conclude successfully (conclusion: $conc)"
+        fi
+        MATCH_PREFIX_COUNT=$((MATCH_PREFIX_COUNT + 1))
+        echo "    [INFO] Prefix-aligned selftest run: $rid on $rn"
+        if [ "$MATCH_PREFIX_COUNT" -ge 5 ]; then
+            break
+        fi
     fi
-done <<< "$SELFTES_RUNS"
+done <<< "$(echo "$COMPLETED_RUNS" | jq -r '.[] | "\(.databaseId) \(.conclusion)"')"
+
+if [ "$MATCH_PREFIX_COUNT" -eq 0 ]; then
+    fail "No completed selftest runs found on configured runner prefix (${NAME_PREFIX}-*)"
+fi
+
+if [ "$MATCH_PREFIX_COUNT" -lt 5 ]; then
+    echo "    [INFO] Only $MATCH_PREFIX_COUNT completed selftest runs matched ${NAME_PREFIX}-*; canary sample is below the 5-run target."
+fi
 pass "Gate 4: Recent jobs successfully ran on the ezgha fleet"
 
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"
-MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | grep -i 'ezgha' || true)
-CRON_SCHED=$(systemctl --user status ezgha.service 2>/dev/null | grep -i 'timer' || true)
-# Check for task-350 scheduled via prompt CLI
+if [ "$PLATFORM" = "linux" ]; then
+    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-watchdog/ || $2 ~ /ezgha-watchdog/ || $3 ~ /ezgha-watchdog/ || $0 ~ /ezgha-watchdog/' || true)
+    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-watchdog.timer 2>/dev/null || true)
+    TIMER_ACTIVE=$(systemctl --user is-active ezgha-watchdog.timer 2>/dev/null || true)
+    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-watchdog.service 2>/dev/null || true)
+    if [ -z "$MONITOR_TASKS" ] || [ "$TIMER_ENABLED" != "enabled" ] || [ "$TIMER_ACTIVE" != "active" ]; then
+        fail "Gate 7: Monitoring timer not properly installed/enabled/active (timers: '$MONITOR_TASKS', enabled: '$TIMER_ENABLED', active: '$TIMER_ACTIVE', service: '$SERVICE_ACTIVE')"
+    fi
+elif [ "$PLATFORM" = "macos" ]; then
+    # Mac monitoring can be launchd-based; pass only if any health-related launchd
+    # task is currently loaded.
+    if ! launchctl list | grep -Ei 'worldarchitect|ezgha|runner-health' >/dev/null 2>&1; then
+        fail "Gate 7: No active launchd monitoring/health item found for ezgha on macOS"
+    fi
+else
+    fail "Gate 7: Unsupported platform $PLATFORM for monitoring check"
+fi
+
 if ! gh api rate_limit >/dev/null 2>&1; then
     fail "Gate 7: Unable to query rate limit (GitHub API down)"
 fi
