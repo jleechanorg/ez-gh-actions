@@ -382,3 +382,80 @@ worth copying that prompt into the repo/STATE so it survives another /tmp wipe).
 5. Given Codex quota is now a scarce/limited resource until 2:52 PM, avoid
    launching further codex background workers in the meantime unless truly
    necessary; use direct investigation/scripting instead where possible.
+
+## INCIDENT: E1 sampler starved ensure_count, fleet drained to 0 -- fixed live (2026-07-07 14:05-14:18 PT)
+
+**What happened**: while dogfooding the new restart-safety rule (containers at
+4, correctly did not restart), containers kept draining 4->1->0 with a live
+`gh api .../actions/runs/.../jobs` call actively in-flight (not hung). Root
+cause: the daemon's serve loop is single-threaded and sequential (ensure_count
+-> queue_monitor tick -> invariant_sampler tick -> canary tick -> sleep). Both
+the E1 sampler AND the pre-existing (lane-cg) queue_monitor tick made one gh
+api call per queued run to fetch job-level data; at queued_jobs~1290 this took
+long enough that ensure_count never got back to the top of the loop to refill
+missing runner slots. Ephemeral runners exit after one job by design, so with
+no refill, the fleet silently drained toward zero. This was a REAL production
+incident, not a theoretical concern -- confirmed via `registered` dropping
+19->8 between consecutive samples.
+
+**Immediate response** (not waiting for codex quota return at ~14:52 PT, since
+this was active harm, not speculative optimization):
+1. Restarted the service (load was low, 1.5-2.3, safe exception to the new
+   load-check rule -- that rule's intent is "don't trigger unnecessary mass
+   respawns when things are fine," not "let the fleet decay to zero while
+   something is actively broken").
+2. Added `[invariant_sampler] enabled = false` to the live config.toml as an
+   immediate stopgap, restarted again (load still safe) -- fleet recovered to
+   14-15/16.
+3. Discovered the SAME starvation recurred with only queue_monitor's
+   pre-existing (unmodified by my earlier work) tick active -- confirmed via
+   `ps` showing the gh api call's parent PID was the ezgha daemon. Added
+   `[queue_monitor] enabled = false` too as a second stopgap, restarted,
+   fleet recovered to 15/16.
+4. Implemented the real fix myself (not codex, given the urgency) in worktree
+   `sidekick/sampler-cap`: new `fetch_capped_queue_snapshot(repo, fleet, cap)`
+   reads page 1 for `total_count`, and only walks backward from the LAST page
+   (GitHub's default order is newest-first, so oldest runs are on the last
+   page) when total exceeds `INVARIANT_JOB_ENUMERATION_CAP=50`, instead of
+   fetching every page from the front. INV-2 stays exact since the oldest job
+   necessarily lives among the oldest runs. Added `queued_jobs_capped: bool`
+   to the schema so a capped `queued_jobs` reads honestly as a lower bound.
+   **Extended the same fix to queue_monitor.maybe_check()** once the second
+   starvation was confirmed -- removed the now-fully-dead uncapped
+   `fetch_queue_snapshot`/`fetch_queue_snapshot_with_fleet` (0 remaining
+   callers, 0 warnings). 168 tests pass (1 new: capped-flag propagation).
+5. Merged to main (commits 1a97b28, ec8127c -> merge b0a29ae, pushed), Gates
+   0-3 verified PASS, re-enabled both monitors in config.toml, redeployed.
+
+**Verified fixed, live**: samples now land ~166s apart (vs the single-tick
+263s+ delay observed before the fix, on TOP of the 240s interval) with
+`queued_jobs_capped: true` and a correctly-preserved `oldest_queued_job_min`
+(93-95min, matching the real oldest outlier). Fleet recovered to 18-21/22
+registered across the post-fix samples -- healthier than any pre-incident
+reading. Background Monitor (task bdo79oji3) watching for containers<10 or
+load>15 as an ongoing safety net.
+
+**Scope note for bead ez-gh-actions-wms**: originally scoped by main to "the
+E1 sampler," but the SAME mechanism in the pre-existing queue_monitor tick was
+independently causing the identical failure at the current queue size --
+already fixed for both in this pass; the bead's remaining scope (sharing one
+snapshot per repo per tick between the two monitors, to avoid double-fetching
+worldarchitect.ai) is now a pure efficiency follow-up, not an urgency item,
+since both paths are already individually capped and safe. Can still go to
+codex at quota return as originally planned.
+
+**5 Whys** (why did this reach production before being caught): (1) the E1
+sampler was designed and unit-tested against small hand-built fixtures, never
+against the live queue's actual size: (2) because the queue size (1290 jobs)
+grew organically during the same session the sampler was built in, so there
+was no "before" baseline at that scale to test against; (3) because the
+capacity finding (task #5, ~13:14 PT) that first measured a large queue
+predates the sampler (~13:50 PT) but its implication for a NEW per-tick
+fetch's cost wasn't cross-referenced during design; (4) because the design
+brief (mine, to codex, then adapted for direct implementation) focused on
+INV-1/INV-2 correctness and didn't ask "what does this cost at the queue
+sizes we already know exist"; (5) root fix beyond the immediate cap: any
+future per-tick GitHub API work in this daemon should be sized against the
+CURRENT live queue depth (`doctor.sh` section 8 / the capacity finding doc)
+before merging, not just unit-tested in isolation -- worth adding as a
+CLAUDE.md reminder if this pattern recurs.
