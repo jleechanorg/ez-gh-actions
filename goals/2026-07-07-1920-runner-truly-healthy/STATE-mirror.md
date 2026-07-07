@@ -761,3 +761,54 @@ po2 (once fixed) is meant to prevent.
 
 Will message main READY TO MERGE per PR (po2 redesign, demand PR-1, demand
 PR-2) as each clears its own review/checks, matching the PR #8214 pattern.
+
+## CORRECTNESS FIX: capped-zero was fabricating INV-1 passes (2026-07-07 16:00-16:04 PT)
+
+Main skeptically re-checked the "first all-clear sample" milestone rather than
+letting it stand. Verified: `queued_jobs_capped: true` on that exact sample.
+Broader check found this is UNIVERSAL -- **27/27 samples since the cap fix
+landed show `capped=true`**, because the live queue depth (400+ runs across
+both monitored repos, per doctor.sh) always exceeds
+`INVARIANT_JOB_ENUMERATION_CAP=50`. The all-clear sample's `queued_jobs=0`
+meant "0 self-hosted queued jobs among the oldest 50 runs examined," NOT "0
+queued jobs total" -- a genuine false zero. `combine_invariant_sample`'s
+`inv1 = busy>=22 || queued_jobs==0` treated ANY zero as confirmed-empty
+regardless of capping, so a partial/capped fetch could fabricate an INV-1
+PASS. This is the dangerous inverse of the UNKNOWN-on-API-error guard: there
+we protect against a false FAIL poisoning E2 with noise; here the same
+missing-data situation could poison E2 with a false GREEN sample that gets
+silently accepted into the "zero violations" count rather than alerted on.
+
+**Fixed immediately** (not deferred): `inv1 = busy>=22 || (queued_jobs==0 &&
+!queued_jobs_capped)`. Only an uncapped zero can now satisfy the queue-empty
+branch; busy_count's branch is unaffected (fleet stats are never capped, so
+`busy>=22` alone remains fully reliable). 2 new regression tests (capped-zero
+must yield inv1=false with fail_class="genuinely-idle"; busy-full branch
+stays reliable regardless of capping). 173/173 tests pass. Merged (commit
+03026f9 -> merge 1e7222a), deployed (Gate 0 SHA verified matching), pushed.
+
+**Retroactive correction**: the "MILESTONE" all-clear entry logged above
+(sample ts=1783464699) is NOT a genuine all-clear under the corrected logic
+-- it would now compute as `inv1=false` (capped, so the zero doesn't count).
+No genuine all-clear sample has occurred yet in this mission as of 16:04 PT.
+Leaving the original milestone note above uncorrected-in-place (not deleted)
+for an honest audit trail of what was believed at the time vs. corrected
+after main's skeptical check -- this note is the correction.
+
+**Side note**: while merging this fix, found `goals/.../05-ultracode-po2-
+review-and-demand-plan.md` had been independently trimmed from 962 to 87
+lines by another concurrent session in the shared main checkout (timestamp
+16:00:55, ends cleanly right after the PR-3 table, before the ~800 lines of
+raw agent telemetry) -- left this untouched per the multi-session-repo rule
+rather than overwriting it with my merge's version; whoever is editing it
+will commit in their own time.
+
+**Implication for E2/E5**: given demand structurally exceeds capacity most of
+the time (task #5's finding) AND the job-enumeration cap means most samples
+will legitimately show `queued_jobs_capped=true`, a genuine INV-1 pass will
+now require EITHER busy==22 (full utilization) OR an uncapped confirmed-empty
+queue (rare at current demand levels, requires total queued runs <=50 across
+BOTH monitored repos simultaneously) -- meaning `capped=true` samples can
+only pass INV-1 via the busy==22 branch going forward. This makes E2's clean
+3-hour window measurably harder to achieve at current demand, which is the
+CORRECT and honest reflection of reality, not an artificial tightening.
