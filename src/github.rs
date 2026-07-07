@@ -92,20 +92,28 @@ fn is_rate_limit_response(stdout: &str, stderr: &str, status: Option<i32>) -> bo
     lower.contains("http 403") || lower.contains("http 429")
 }
 
+fn is_transient_json_parse_response(stdout: &str, stderr: &str) -> bool {
+    let stderr_lower = stderr.to_ascii_lowercase();
+    stderr_lower.contains("unexpected end of json input") && matches!(stdout.trim(), "" | "[]")
+}
+
 fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
     let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !is_rate_limit_response(&stdout, &stderr, code) {
-        return None;
+    if is_rate_limit_response(&stdout, &stderr, code) {
+        return Some(
+            extract_retry_after_secs(&format!("{stderr} {stdout}"))
+                .map(Duration::from_secs)
+                .unwrap_or(GH_RETRY_BASE_DELAY)
+                .min(GH_RETRY_MAX_DELAY)
+                .max(Duration::from_secs(1)),
+        );
     }
-    Some(
-        extract_retry_after_secs(&format!("{stderr} {stdout}"))
-            .map(Duration::from_secs)
-            .unwrap_or(GH_RETRY_BASE_DELAY)
-            .min(GH_RETRY_MAX_DELAY)
-            .max(Duration::from_secs(1)),
-    )
+    if is_transient_json_parse_response(&stdout, &stderr) {
+        return Some(GH_RETRY_BASE_DELAY);
+    }
+    None
 }
 
 fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::process::Output> {
@@ -120,7 +128,7 @@ fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::pro
                 return Ok(out);
             }
             eprintln!(
-                "gh API rate-limited; retrying in {}s (attempt {}/{})",
+                "gh API transient failure; retrying in {}s (attempt {}/{})",
                 wait.as_secs(),
                 attempt,
                 GH_MAX_RETRIES
@@ -1026,6 +1034,30 @@ github.com
     }
 
     #[test]
+    fn transient_gh_json_parse_failure_uses_default_backoff() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: b"[]\n".to_vec(),
+            stderr: b"unexpected end of JSON input\n".to_vec(),
+        };
+        let delay =
+            classify_retry_delay(&out).expect("gh transient JSON parse failures should be retried");
+        assert_eq!(delay, GH_RETRY_BASE_DELAY);
+    }
+
+    #[test]
+    fn transient_gh_json_parse_failure_retries_empty_stdout() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"unexpected end of JSON input\n".to_vec(),
+        };
+        let delay = classify_retry_delay(&out)
+            .expect("empty-body gh JSON parse failures should be retried");
+        assert_eq!(delay, GH_RETRY_BASE_DELAY);
+    }
+
+    #[test]
     fn retry_after_parser_prefers_any_digit_token() {
         let text = "Retry-After: 31\nX-Ratelimit-Reset: 1700000000\n";
         assert_eq!(extract_retry_after_secs(text), Some(31));
@@ -1055,7 +1087,7 @@ github.com
         std::fs::write(
             &script,
             format!(
-                r#"#!/usr/bin/env bash
+                r#"#!/bin/sh
 counter={counter}
 n=0
 if [ -f "$counter" ]; then n=$(cat "$counter"); fi
@@ -1088,6 +1120,155 @@ exit 0
         })
         .unwrap();
         assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_gh_with_backoff_retries_fake_gh_after_json_parse_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-json-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter");
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+counter={counter}
+n=0
+if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+n=$((n + 1))
+echo "$n" > "$counter"
+if [ "$n" -eq 1 ]; then
+  echo '[]'
+  echo 'unexpected end of JSON input' >&2
+  exit 1
+fi
+echo '{{"ok":true}}'
+exit 0
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let out = run_gh_with_backoff(|| {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg(&script);
+            cmd
+        })
+        .unwrap();
+        assert!(out.status.success());
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_runners_retries_transient_gh_json_parse_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-list-json-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter");
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+counter={counter}
+n=0
+if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+n=$((n + 1))
+echo "$n" > "$counter"
+if [ "$n" -eq 1 ]; then
+  echo '[]'
+  echo 'unexpected end of JSON input' >&2
+  exit 1
+fi
+echo '[{{"total_count":1,"runners":[{{"id":123,"name":"ez-runner-c-1","status":"online","busy":false}}]}}]'
+exit 0
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let runners = list_runners(&org_cfg()).unwrap();
+        assert_eq!(runners.len(), 1);
+        assert_eq!(runners[0].id, 123);
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generate_jitconfig_retries_transient_empty_json_parse_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-jit-json-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter");
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+counter={counter}
+n=0
+if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+n=$((n + 1))
+echo "$n" > "$counter"
+if [ "$n" -eq 1 ]; then
+  echo 'unexpected end of JSON input' >&2
+  exit 1
+fi
+echo '{{"encoded_jit_config":"abc123","runner":{{"id":456,"name":"ez-runner-c-1"}}}}'
+exit 0
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let owned = std::collections::HashSet::new();
+        let (jit, runner_id) =
+            generate_jitconfig(&org_cfg(), "ez-runner-c-1", &["self-hosted".into()], &owned)
+                .unwrap();
+        assert_eq!(jit, "abc123");
+        assert_eq!(runner_id, 456);
         assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
         let _ = std::fs::remove_dir_all(dir);
     }
