@@ -19,9 +19,9 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 **Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
-2. `bxy` (P1) — release_slot on JIT failure (start_one leaks reservation at docker_backend.rs error path) + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)
-3. `k4h` (P1, promoted) — verify-exit-criteria.sh honesty: Gate 7 rubber stamp (:225-232 computes MONITOR_TASKS/CRON_SCHED, never inspects them), "ALL AUTO GATES PASS" at :245 while Gates 5/6/8 silently absent, Gate 3 missing --paginate --slurp + empty-input arithmetic
-4. `fl0` (P1) — Docker CLI timeout wrapper on all `Command::output()` calls (github.rs:18-72 pattern) — permanent-hang mode on macOS, watchdog churn on Linux
+2. ~~`bxy` (P1)~~ — DONE: release_slot on JIT failure + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)
+3. ~~`k4h` (P1, promoted)~~ — DONE: verify-exit-criteria.sh honesty updated (Gate 3 pagination/empty-edge checks, Gate 7 real monitor checks)
+4. ~~`fl0` (P1)~~ — DONE: Docker CLI timeout wrapper on all `Command::output()` calls used by serve/status/stop/init
 5. `twp` (P2) — regression test: list_runners Err must not mutate slot file (EXIT-CRITERIA's "single most important regression test")
 6. `n5p` (P2) — build.rs: fail loudly / append `-dirty` instead of silently embedding "unknown" (Gate 0 provenance)
 
@@ -62,6 +62,13 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 - Scanned last 20 open PRs: **0 runner failures in completed job logs**; saturation = stuck `queued`, not infra crash.
 - [PR #8193](https://github.com/jleechanorg/worldarchitect.ai/pull/8193) (worldarchitect.ai): CodeRabbit APPROVED on `ce269044`; checks pending on saturated fleet.
 - **Next:** commit/push local watchdog fix → `cargo install` both hosts → re-enable stable `WatchdogSec=180`.
+
+### 2026-07-07 (second pass) — hardening reconciliation + exit criteria revalidation
+
+- Ran `/nextsteps` equivalent and synced `roadmap/README.md` + beads for implemented P1 items `bxy`, `k4h`, and `fl0`.
+- Ran targeted Rust test ladder on `src/docker_backend` and full suite (`cargo test`, `cargo clippy`, `cargo check` all passing).
+- Rebuilt and restarted service with `cargo install --path .` and verified `systemctl --user status ezgha.service` active.
+- Re-ran `./docs/verify-exit-criteria.sh`: **ALL AUTO GATES PASS** after reinstall; Gate 10 only passed once GitHub API budget recovered (4950 remaining).
 
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 

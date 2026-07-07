@@ -1,0 +1,1 @@
+dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'Run hardening verification loop for ez-gh-actions P1 status, ensure no P0 remains, and revalidate exit criteria' --backend codex --cxdb /home/jleechan/.dark-factory/cxdb.sqlite

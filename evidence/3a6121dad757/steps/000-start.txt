@@ -1,0 +1,1 @@
+start: 'Run hardening verification loop for ez-gh-actions P1 status, ensure no P0 remains, and revalidate exit criteria'
