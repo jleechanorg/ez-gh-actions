@@ -177,6 +177,21 @@ env var, with truncated example text in comments), and worldarchitect-2step-
 wizard's .env.example (a template with `YOUR_PRIVATE_KEY_CONTENT_HERE` placeholder
 and a truncated example value). **No additional distinct secret exposure found.**
 
+**lane-h task #3: COMPLETE.** Final state: ez-gh-actions branch `sidekick/lane-h`
+merged to main (commit 91d9289) and pushed — adds `.gitleaks.toml` (extends default
+rules) + `.github/workflows/gitleaks.yml` (current-tree scan on every PR + push to
+main, self-hosted runner, 10min timeout), 0 findings on this repo's current tree and
+full history. worldarchitect.ai side: branch `sidekick/lane-h-gitleaks` pushed, PR
+jleechanorg/worldarchitect.ai#8226 opened (not merged — human merges PRs in other
+repos per standing rules) with the tracked-file redaction + `.gitleaks.toml` +
+gitleaks wired into the existing `bead-jsonl-sort-check.yml` (renamed
+`repository-hygiene`) workflow so it runs on every PR without adding a new job.
+lane-h's own report: `docs/gitleaks-sweep-20260707.md` (merged into ez-gh-actions
+main). Ambiguous item lane-h flagged for human review: Firebase web API keys in
+worldarchitect.ai were allowlisted as public client config rather than redacted
+(standard/correct treatment, but a human may want to double check GCP/Firebase key
+restrictions). Worktrees cleaned up post-merge.
+
 ## E1 sampler status (2026-07-07 13:19 PT)
 
 Confirmed via code review lane-cg's merged queue_monitor.rs work does NOT satisfy
