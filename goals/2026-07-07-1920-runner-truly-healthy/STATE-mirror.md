@@ -641,3 +641,56 @@ window specifically, the fleet-drain itself.
     after a longer delay, or may need `cleanup-stuck-runs.sh`'s exact Python
     implementation rather than raw CLI/API calls -- worth trying that script
     directly in a future pass if it's still stuck).
+
+## po2 (respawn pacing) — implemented, PUSHED, HELD pending ultracode review (2026-07-07 15:41 PT)
+
+Codex worker completed cleanly: branch `sidekick/po2-respawn-pacing` (commits
+b8735b7, 5e3514d), 175/175 tests pass, did NOT run `cargo install`/restart
+(honored the single-writer lock). Reviewed the diff myself (read-only, not
+merged/deployed):
+- `src/config.rs`: new `RunnerConfig` fields --
+  `respawn_batch_size` (default 4), `respawn_batch_sleep_seconds` (default 5),
+  `respawn_load_threshold` (default 12.0 -- matches the manual CLAUDE.md rule's
+  threshold), `respawn_load_retry_seconds` (default 5),
+  `respawn_load_max_wait_seconds` (default 60, bounded -- never blocks
+  ensure_count forever even under sustained high load).
+- `src/docker_backend.rs`: `read_host_loadavg_1m()` parses `/proc/loadavg`
+  (Linux only, `None` no-op fallback elsewhere); `start_missing_runners_with`
+  (closure-injected Start/Sleep/Load for testability, mirrors this file's
+  existing `TestEnv` pattern) batches respawns 4-at-a-time with a 5s pause
+  between batches, checking the load window before each batch and pinging
+  the watchdog during any pacing delay (important -- avoids the pacing
+  mechanism itself starving the systemd watchdog). Wired into `ensure_count`
+  replacing the old unbatched `for _ in alive..count { start_one(...) }`
+  loop, preserving original error semantics.
+- Regression tests confirm actual batching behavior (not just final count):
+  16 starts at batch_size=4 produces exactly 3 inter-batch sleeps with max 4
+  consecutive starts per batch; a forced-high-load scenario shows the
+  load-backoff retrying up to `respawn_load_max_wait_seconds` then proceeding
+  anyway rather than hanging.
+- **My assessment: this looks correct and matches the brief closely** --
+  matches E4/INV-1's needs (gentler respawn waves) and the exact watchdog
+  ceiling (24) with a conservative 12 threshold and bounded wait.
+
+**HOLDING per main's explicit instruction**: user invoked ultracode, main is
+running a 4-lens adversarial review of this diff (this touches the exact
+respawn path that caused today's watchdog reboots) plus a separate 4-miner
+demand-cut sweep over worldai's workflow files. NOT merging or deploying
+po2 until main relays the verdict (~10-20 min from 15:41 PT). Continuing
+cadence watch + resamples in the meantime.
+
+## Continued cadence watch (2026-07-07 14:52-15:42 PT, 25 samples total now)
+
+E1 sampler kept flowing steadily through the whole window (roughly every
+2-5 min, consistent with the post-fix cadence already established) while
+po2 was being built. Queue depth has been trending DOWN nicely: queued_jobs
+ranged 116->23 across this window (peak early, steady decline), and
+`oldest_queued_job_min` has been slowly climbing (up to 161min at one point)
+since the one severely-stuck run (28884233335, see cancellation ledger above)
+is still sitting in the data until its cancellation actually lands. Fleet
+`busy`/`registered` fluctuated 14-21 throughout (never fully clean, but
+consistently in a healthy band, no repeat of the drain-to-0 incident).
+Host load has been drifting up somewhat during this window (up to 9.09 most
+recently) -- still well under the 24 watchdog ceiling and my 15
+degradation-alert threshold, but worth watching; if it keeps climbing, po2
+landing sooner rather than later becomes more valuable, not just nice-to-have.
