@@ -510,3 +510,76 @@ demand exceeds the 22-runner capacity per the earlier finding, independent of
 the incident). This is E1 catching and characterizing a real production
 incident in its own designed-for-this-purpose data, which is itself a form
 of validation that the sampler works as intended.
+
+## E2/SC4 status readout (2026-07-07 14:35-14:40 PT) -- baseline for the final validator
+
+Per main's request, a full readout of `~/.local/state/ezgha/invariant_history.jsonl`
+as it stands right now (9 samples, spanning the incident + both fixes):
+
+**Sample count**: 9 total.
+
+**Cadence (delta between consecutive samples, seconds)**: 596, 990, 166, 118,
+278, 296, 262, 172. The first two large gaps (596s, 990s) are NOT missed
+ticks -- they correspond exactly to the incident window (drain + the several
+deliberate restarts while isolating/fixing it via config stopgaps). Excluding
+those two, the remaining 6 deltas (118-296s, avg ~215s) are consistent with
+the nominal 240s `check_interval_seconds`, with variance explained by
+external restarts (from other concurrent sessions running their own Gate 0
+loops) resetting the in-process tick timer, not by the sampler itself being
+slow post-fix. **Verdict: cadence is healthy post-fix.**
+
+**INV-1/INV-2 pass/fail/UNKNOWN breakdown**: INV-1 fail=9/9, INV-2 fail=9/9,
+0 samples with both passing (no all-clear sample yet -- expected, since the
+mission's own capacity finding (task #5) already established organic demand
+structurally exceeds the 22-runner fleet much of the time). UNKNOWN (API
+error, no line written) count cannot be directly measured from the JSONL by
+definition -- absence of a row IS the unknown state -- but the two large
+inter-sample gaps above are the observable proxy, and both are attributable
+to known restarts, not silent API failures. `queued_jobs_capped=true` on 7/9
+samples (the two `false` samples are the two pre-cap-fix incident samples,
+where the queue was small enough at THAT queue depth reading to not need
+capping, or predate the cap existing at all).
+
+**inv1_fail_class histogram**: `missing-registration`: 9/9, 0 other classes
+observed. This tracks the mission's ed8 finding (JIT deregister/respawn
+churn keeps a few runners perpetually unregistered) plus, for the incident
+window specifically, the fleet-drain itself.
+
+**Slack delivery verification** (per main's ask, "like you did for SC1"):
+- alerts.jsonl: 8 of 9 violated samples produced an `invariant.violation`
+  CRITICAL entry (one, ts=1783459606, was correctly cooldown-suppressed --
+  see below). journalctl shows ZERO `slack alert send failed` errors across
+  the entire window (45+ min, 8 send attempts) -- the delivery ATTEMPT is
+  clean.
+- Cooldown mechanism verified working correctly in the one case where a
+  no-restart window existed: sample ts=1783459606 (14:26:46 PT) got no
+  alert because the prior successful alert was at 14:22:49 PT, only 237s
+  earlier -- well inside the 900s `alert_cooldown_secs` default, and
+  journalctl confirms no service restart happened in that window (so the
+  in-memory cooldown tracker was intact). All the OTHER cases where alerts
+  fired despite short gaps are explained by intervening restarts resetting
+  the in-memory `alert_state()` HashMap (a `OnceLock` inside the process --
+  does not persist across restarts). **Finding, not a bug**: cooldown works
+  correctly within a continuous process lifetime; a restart-heavy session
+  (like today's) will see more alerts than the configured cooldown alone
+  would suggest, since each restart forgets the last-sent timestamp for
+  every event_key. Worth knowing for interpreting alert volume during any
+  future incident response, not necessarily worth "fixing" (persisting
+  cooldown state to disk trades simplicity for surviving restarts that are
+  themselves supposed to be rare).
+- **Gap, reported honestly rather than overclaimed**: could NOT independently
+  verify the message actually rendered in the Slack channel via the
+  `mcp__slack__conversations_history` tool. Checked all 5 channels this
+  session has membership in (#all-jleechan-ai, #worldai, #ai-general,
+  #ai-slack-test, #hermes-pc) plus a channel-list search for
+  ezgha/gate/runner/alert-named channels -- none show any ezgha-originated
+  message (they're all hermes/agento/AO gateway traffic, unrelated). This
+  means either the webhook posts to a channel this MCP session isn't a
+  member of (most likely, since incoming webhooks bind to a fixed channel
+  chosen at creation time, independent of app/bot channel membership), or
+  delivery is silently failing despite no error being logged. Given zero
+  logged send errors and a previously-established SC1 proof (per main's
+  earlier context, "DONE and proven... visible in channel"), the balance of
+  evidence favors successful delivery to a channel outside this session's
+  visibility, but this is NOT independently confirmed by me -- flagging the
+  gap rather than asserting proof I don't have.
