@@ -27,6 +27,9 @@ done
 
 ORG="${ORG:-jleechanorg}"
 EZGHA_REPO="${EZGHA_REPO:-jleechanorg/ez-gh-actions}"
+QUEUE_REPO="${QUEUE_REPO:-jleechanorg/worldarchitect.ai}"
+QUEUE_TAIL_WARN_MIN="${QUEUE_TAIL_WARN_MIN:-20}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- helpers -------------------------------------------------------------
 section() { printf '\n=== %s ===\n' "$*"; }
@@ -211,6 +214,21 @@ if [ -z "$RUNNER_NAME_PREFIX" ]; then
 fi
 info "configured runner name prefix: $RUNNER_NAME_PREFIX"
 
+
+# Policy vs backend: catch minimum_isolation=vm on hosts where docker blips
+# leave backend at container-only (Mac colima socket flake → serve fail-closed).
+POLICY_MIN=$(awk -F'"' '/^minimum_isolation/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+if [ -n "$POLICY_MIN" ]; then
+  info "configured minimum_isolation: $POLICY_MIN"
+  if recent_logs 10 | grep -q 'policy requires vm isolation but best available backend is docker'; then
+    bad "serve fail-closed: minimum_isolation=$POLICY_MIN but docker backend is container-only (daemon blip or misconfig)"
+  elif [ "$POLICY_MIN" = "vm" ] && [ "$PLATFORM" = "macos" ] && ! docker info --format '{{.KernelVersion}}' >/dev/null 2>&1; then
+    bad "minimum_isolation=vm but docker daemon/kernel probe failed — serve will refuse to spawn"
+  else
+    ok "isolation policy $POLICY_MIN compatible with current docker backend"
+  fi
+fi
+
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
 RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
@@ -307,7 +325,23 @@ if [ "$PROVE" = "1" ]; then
   fi
 fi
 
-# --- F. verdict ----------------------------------------------------------
+
+# --- F2. GitHub Actions queue health (saturation / tail latency) ----------
+QUEUE_TAIL_BAD=0
+QUEUE_QUEUED_STALE=0
+if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
+  set +e
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/scripts/queue-health.sh"
+  QUEUE_RC=$?
+  set -e
+  [ "$QUEUE_RC" -eq 1 ] && QUEUE_TAIL_BAD=1
+else
+  section "8. GitHub Actions queue health"
+  warn "scripts/queue-health.sh missing — queue metrics skipped"
+fi
+
+# --- G. verdict ----------------------------------------------------------
 section "verdict"
 CRITICAL=0
 [ "$SERVICE_STATE" != "active" ]            && CRITICAL=$((CRITICAL+1))
@@ -341,6 +375,8 @@ fi
 [ "${REAL_ON_FLEET:-0}" -lt 1 ]            && CRITICAL=$((CRITICAL+1))
 # canary gate (only when --prove): the live job must have run on our fleet
 [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]  && CRITICAL=$((CRITICAL+1))
+# queue tail gate: fresh backlog waiting > QUEUE_TAIL_WARN_MIN means saturated/mis-routing
+[ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && CRITICAL=$((CRITICAL+1))
 
 if [ "$CRITICAL" -gt 0 ]; then
   bad "fleet unhealthy: $CRITICAL critical check(s) failed"

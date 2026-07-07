@@ -8,6 +8,7 @@ mod docker_backend;
 mod github;
 mod platform;
 mod service;
+mod watchdog;
 
 use backend::Selection;
 use config::{Config, Scope};
@@ -318,6 +319,9 @@ fn main() -> Result<()> {
             // launchd path / interactive `ezgha serve`).
             let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
             loop {
+                // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
+                // WatchdogSec=60; a post-work-only ping lets systemd SIGABRT mid-spawn.
+                watchdog::ping();
                 match docker_backend::ensure_count(&cfg, backend) {
                     Ok(started) => {
                         for name in started {
@@ -326,9 +330,7 @@ fn main() -> Result<()> {
                     }
                     Err(e) => eprintln!("ensure_count failed (will retry): {e:#}"),
                 }
-                // Watchdog ping (bead drg): notify systemd we're alive. The 30s
-                // loop cadence is well inside WatchdogSec=60.
-                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+                watchdog::ping();
                 std::thread::sleep(std::time::Duration::from_secs(30));
             }
         }

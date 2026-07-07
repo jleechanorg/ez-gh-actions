@@ -11,6 +11,7 @@ use crate::backend::Backend;
 use crate::config::Config;
 use crate::github;
 use crate::platform::Platform;
+use crate::watchdog;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
 
@@ -534,6 +535,7 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     let mut started = Vec::new();
     let mut last_err = None;
     for _ in alive..cfg.runner.count {
+        watchdog::ping();
         match start_one(cfg, backend) {
             Ok((_, name)) => started.push(name),
             Err(e) => {
@@ -558,6 +560,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
+use crate::watchdog;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 

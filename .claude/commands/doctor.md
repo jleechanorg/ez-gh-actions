@@ -1,42 +1,50 @@
 # /doctor — diagnose and self-heal the ezgha runner fleet
 
-Repo-level command for ez-gh-actions. Runs the `doctor.sh` health check script, analyzes errors, and performs self-healing steps to restore fleet health.
+Repo-level command for ez-gh-actions. Runs `doctor.sh` (fleet + queue health), self-heals when safe, and **always** runs `/harness` when unhealthy or queue tail exceeds threshold.
 
 ## Skill Reference
-* **Diagnostic Skill**: [ezgha-doctor](file:///home/jleechan/projects/ez-gh-actions/.claude/skills/ezgha-doctor/SKILL.md)
+* **Diagnostic Skill**: [ezgha-doctor](file:///Users/jleechan/projects_other/ez-gh-actions/.claude/skills/ezgha-doctor/SKILL.md)
 
 ## Action Instructions for LLM
 
 When this command is invoked, immediately execute the following steps:
 
-1. **Run the health check**:
+1. **Run the health check** (always includes queue metrics):
    ```bash
    bash "$(git rev-parse --show-toplevel)/doctor.sh"
    ```
    Read the output, exit code, and verdict. Exit 0 = healthy; exit 1 = unhealthy.
 
-2. **If unhealthy, perform diagnostics**:
-   * Inspect which of the 6 critical checks failed.
-   * Check systemd service status: `systemctl --user status ezgha.service`
-   * Check docker daemon: `docker ps` and `docker info`
-   * Check recent journalctl logs: `journalctl --user -u ezgha.service --no-pager -n 50`
+   **Section 8 — queue health** (from `scripts/queue-health.sh`):
+   - `in_progress` / `queued` counts on `QUEUE_REPO` (default `jleechanorg/worldarchitect.ai`)
+   - Fresh queue p50 / p90 / max wait (minutes)
+   - Oldest fresh queued run (actionable backlog)
+   - Stale queued zombies (>24h — GitHub artifacts, not waiting for runners)
+   - **BAD if max fresh wait > 20 min** (`QUEUE_TAIL_WARN_MIN`, default 20)
 
-3. **Execute named remediation**:
-   * **Service inactive**: Run `systemctl --user restart ezgha.service`
-   * **Docker daemon down / Colima stopped**: Run `limactl start colima`
-   * **Slot file desync / permanent 409 loops**: 
-     ```bash
-     systemctl --user stop ezgha.service
-     rm -f ~/.config/ezgha/slot_assignments.toml
-     systemctl --user start ezgha.service
-     ```
-   * **Offline runners on GitHub**: Retrieve the auth token and prune offline registrations via:
-     ```bash
-     TOKEN=$(gh auth token)
-     for id in $(gh api orgs/jleechanorg/actions/runners --paginate | jq -r '.runners[] | select(.name|startswith("ez-org-")) | select(.status=="offline") | .id'); do
-       gh api -X DELETE "orgs/jleechanorg/actions/runners/$id"
-     done
-     ```
+2. **If unhealthy OR queue tail > 20 min, run `/harness`** (mandatory):
+   * Read `~/.claude/commands/harness.md` and `~/.claude/skills/harness-engineering/SKILL.md`
+   * Produce full harness analysis (5 Whys technical + agent path)
+   * Classify failure: silent degradation | missing validation | repeated manual fix | etc.
+   * Propose durable fixes (doctor.sh, skill, verify-exit-criteria gate, watchdog script)
 
-4. **Verify repair**:
-   * Re-run `doctor.sh` to confirm the exit status is now 0.
+3. **If unhealthy, perform diagnostics**:
+   * Inspect which critical checks failed (sections 1–8)
+   * Check supervisor: `systemctl --user status ezgha.service` (Linux) or `launchctl print gui/$(id -u)/org.jleechanorg.ezgha` (macOS)
+   * Check docker: `docker ps --filter label=ezgha=managed`
+   * Check logs: `journalctl --user -n 50 -u ezgha.service` or `/tmp/ezgha-launchd-stderr.log`
+   * Check external watchdog: `tail -20 /tmp/ezgha-watchdog-stdout.log`
+
+4. **Execute named remediation** (only when safe — do not restart-loop):
+   * **Service inactive**: `ezgha install-service` then restart supervisor
+   * **Docker/Colima down**: `colima start` or `limactl start colima`
+   * **Slot file wedge**: stop service → `rm -f ~/.config/ezgha/slot_assignments.toml` → restart
+   * **Queue tail > 20m**: verify runners busy (saturation) vs offline; cancel stale zombies:
+     ```bash
+     gh run cancel <stale_run_id> -R jleechanorg/worldarchitect.ai
+     ```
+   * **Offline runners**: prune only when not busy (use configured `name_prefix` from config.toml)
+
+5. **Verify repair**:
+   * Re-run `doctor.sh` until exit 0 AND queue tail ≤ 20m
+   * Optionally: `doctor.sh --prove` for live canary dispatch

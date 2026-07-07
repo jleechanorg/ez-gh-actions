@@ -21,16 +21,51 @@ bash "$(git rev-parse --show-toplevel)/doctor.sh --prove"  # + live canary: disp
 
 Read the verdict AND the exit code. `--prove` is the strongest evidence — it
 dispatches a fresh `ezgha-selftest` and confirms `runner_name` is
-`ez-org-runner-*` with `conclusion=success`. The gate also checks a
+`configured prefix (e.g. `ez-mac-runner-b-*`, `ez-runner-b-*`) with `conclusion=success`. The gate also checks a
 real-execution proof (≥1 of the last 6 runs succeeded on our fleet) and a
 time-windowed error count (last 3 min, not last 200 lines — a since-recovered
 incident won't keep it red). If `fleet healthy` and exit 0, you're done — stop.
 If `fleet unhealthy`, continue. **Never restart-loop the service** — see
 `docs/harness-early-victory-5whys.md`.
 
+
+
+### Stuck queue cleanup
+
+```bash
+./scripts/cleanup-stuck-runs.sh              # zombies (>24h, gh run delete) + fresh tail (>45m, cancel)
+./scripts/cleanup-stuck-runs.sh --zombies    # delete only ancient queued artifacts
+./scripts/cleanup-stuck-runs.sh --tail       # cancel only fresh runs waiting >45m
+./scripts/cleanup-stuck-runs.sh --dry-run    # preview
+```
+
+Zombies: `gh run cancel` fails with 409 — always use `gh run delete`.
+Fresh tail: cancels real PR CI — only run when queue tail > `QUEUE_TAIL_WARN_MIN` and saturation confirmed.
+
+## Step 1b — Queue health metrics (always shown in section 8)
+
+`doctor.sh` sources `scripts/queue-health.sh` on every run. Key metrics:
+
+| Metric | Healthy | Unhealthy |
+|--------|---------|-----------|
+| Fresh queue max wait | ≤ 20 min | > 20 min → **BAD** (saturation or mis-routing) |
+| Fresh queued count | low / draining | growing while all runners `busy=true` |
+| Stale queued (>24h) | 0 ideal | zombies inflate counts — cancel with `gh run cancel` |
+| `in_progress` | matches busy runner count | stuck with 0 progress |
+
+Env overrides: `QUEUE_REPO`, `QUEUE_TAIL_WARN_MIN` (default 20), `STALE_HOURS` (default 24).
+
+Standalone:
+```bash
+./scripts/queue-health.sh
+```
+
+When section 8 is **BAD** or doctor exit ≠ 0, **mandatory**: run `/harness` per `~/.claude/commands/harness.md`.
+
+
 ## Step 2 — Identify the failing checks
 
-The doctor groups failures into 6 sections:
+The doctor groups failures into 8 sections:
 
 1. **ezgha service** — `ezgha.service` should be `active`. If not: `systemctl --user restart ezgha.service`.
 2. **docker daemon** — `docker info` must succeed. If not, the daemon's host is the problem; for Colima: `limactl start colima`.
@@ -89,6 +124,18 @@ Run doctor again. Repeat until it returns 0. If it stays 1 for 10+ minutes despi
 ## Output format
 
 Always run `bash /home/jleechan/projects/ez-gh-actions/doctor.sh` (no flags) first. The human-readable output is the audit trail. `--json` is available for scripted checks but not enabled by default.
+
+
+## Step 5 — Harness diagnosis (mandatory on failure)
+
+When `doctor.sh` exits 1 **or** queue tail > `QUEUE_TAIL_WARN_MIN` (20m):
+
+1. Invoke `/harness` (read `~/.claude/skills/harness-engineering/SKILL.md`)
+2. Classify: silent degradation | missing validation | repeated manual fix
+3. Check: Is external watchdog masking slot drift? Is systemd unit stale? Are zombie queued runs polluting metrics?
+4. Propose durable harness fixes — not just `systemctl restart`
+
+See `docs/harness-early-victory-5whys.md` for why restart-looping is forbidden.
 
 ## Important context
 
