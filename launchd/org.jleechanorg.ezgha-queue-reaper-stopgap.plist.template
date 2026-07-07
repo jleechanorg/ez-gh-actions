@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  STOPGAP ONLY — org.jleechanorg.ezgha-queue-reaper-stopgap
+
+  Purpose:
+    Runs scripts/queue-reaper-stopgap.sh every 900s (15 min) to cancel
+    fresh-tail queued GitHub Actions runs on jleechanorg/worldarchitect.ai
+    older than FRESH_TAIL_MIN=20 minutes, keeping the self-hosted queue tail
+    near the 20-minute health threshold between manual/agent cleanup passes.
+
+  Why "stopgap": this duplicates functionality planned for the Rust-native
+  reaper (bead ez-gh-actions-qbl) and periodic-reaper design (bead
+  ez-gh-actions-7ap), owned by a parallel mission on jeff-ubuntu. Remove this
+  launchd job (`launchctl unload` + delete the installed plist) once that
+  reaper lands and is deployed on both machines — do not let both run
+  concurrently long-term (redundant API calls, doubled audit-log noise).
+
+  Mac-owned only: this plist and its target script are single-writer to this
+  machine (see ez-gh-actions runner-queue-healthy-mac mission STATE.md).
+
+  Install (placeholders substituted at install time):
+    @HOME@       -> install user's $HOME
+    @REPO_PATH@  -> absolute path to this repo checkout
+
+    sed -e "s|@HOME@|$HOME|g" \
+        -e "s|@REPO_PATH@|<absolute-path-to-ez-gh-actions-checkout>|g" \
+      launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template \
+      > ~/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist
+    launchctl load ~/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist
+
+  Remove:
+    launchctl unload ~/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist
+    rm ~/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist
+
+  Or use launchd/install-launchagents.sh (handles install/remove/cleanup of
+  orphans for all plists templated in this directory).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.jleechanorg.ezgha-queue-reaper-stopgap</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>@REPO_PATH@/scripts/queue-reaper-stopgap.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@REPO_PATH@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@HOME@</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/ezgha-queue-reaper-stopgap-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/ezgha-queue-reaper-stopgap-launchd.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+</dict>
+</plist>
