@@ -20,6 +20,8 @@ pub struct Config {
     pub policy: Policy,
     #[serde(default)]
     pub alert: AlertConfig,
+    #[serde(default)]
+    pub queue_monitor: QueueMonitorConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,6 +52,41 @@ impl Default for AlertConfig {
             email_to: None,
             email_from: None,
             log_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct QueueMonitorConfig {
+    /// Enable daemon-side queued GitHub Actions run monitoring.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Repository to monitor as `owner/repo`. Defaults to `github.target` for repo-scoped configs.
+    pub repo: Option<String>,
+    /// Alert when the oldest fresh queued run is older than this many minutes.
+    #[serde(default = "default_queue_tail_warn_minutes")]
+    pub tail_warn_minutes: u64,
+    /// Minimum seconds between queue health checks in the serve loop.
+    #[serde(default = "default_queue_check_interval_seconds")]
+    pub check_interval_seconds: u64,
+    /// Treat queued runs older than this many hours as stale GitHub artifacts.
+    #[serde(default = "default_queue_stale_hours")]
+    pub stale_hours: u64,
+    /// Require this many consecutive bad samples before alerting.
+    #[serde(default = "default_queue_consecutive_alert_threshold")]
+    pub consecutive_alert_threshold: u32,
+}
+
+impl Default for QueueMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: None,
+            tail_warn_minutes: default_queue_tail_warn_minutes(),
+            check_interval_seconds: default_queue_check_interval_seconds(),
+            stale_hours: default_queue_stale_hours(),
+            consecutive_alert_threshold: default_queue_consecutive_alert_threshold(),
         }
     }
 }
@@ -115,6 +152,26 @@ fn default_alert_cooldown_seconds() -> u64 {
     900
 }
 
+fn default_queue_tail_warn_minutes() -> u64 {
+    20
+}
+
+fn default_queue_check_interval_seconds() -> u64 {
+    300
+}
+
+fn minimum_queue_check_interval_seconds() -> u64 {
+    60
+}
+
+fn default_queue_stale_hours() -> u64 {
+    24
+}
+
+fn default_queue_consecutive_alert_threshold() -> u32 {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -172,6 +229,7 @@ impl Config {
                 email_from: None,
                 log_path: None,
             },
+            queue_monitor: QueueMonitorConfig::default(),
         }
     }
 
@@ -244,6 +302,34 @@ impl Config {
                 anyhow::bail!("alert.log_path must not be empty when configured");
             }
         }
+        if self.queue_monitor.tail_warn_minutes == 0 {
+            anyhow::bail!("queue_monitor.tail_warn_minutes must be at least 1");
+        }
+        if self.queue_monitor.check_interval_seconds < minimum_queue_check_interval_seconds() {
+            anyhow::bail!(
+                "queue_monitor.check_interval_seconds must be at least {} (got {})",
+                minimum_queue_check_interval_seconds(),
+                self.queue_monitor.check_interval_seconds
+            );
+        }
+        if self.queue_monitor.stale_hours == 0 {
+            anyhow::bail!("queue_monitor.stale_hours must be at least 1");
+        }
+        if self.queue_monitor.consecutive_alert_threshold == 0 {
+            anyhow::bail!("queue_monitor.consecutive_alert_threshold must be at least 1");
+        }
+        if let Some(repo) = &self.queue_monitor.repo {
+            if !is_owner_repo(repo) {
+                anyhow::bail!(
+                    "queue_monitor.repo must be exactly \"owner/repo\" when configured (got {:?})",
+                    repo
+                );
+            }
+        } else if self.queue_monitor.enabled && self.github.scope != Scope::Repo {
+            anyhow::bail!(
+                "queue_monitor.repo is required when queue_monitor.enabled=true and github.scope is org"
+            );
+        }
         Ok(())
     }
 
@@ -274,6 +360,20 @@ impl Config {
     }
 }
 
+fn is_owner_repo(value: &str) -> bool {
+    if value.trim() != value {
+        return false;
+    }
+    let mut parts = value.split('/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(repo) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none() && !owner.is_empty() && !repo.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +400,11 @@ mod tests {
         assert_eq!(tiny.limits.cpus, 1.0);
         assert_eq!(tiny.alert.failure_alert_threshold, 3);
         assert_eq!(tiny.alert.alert_cooldown_secs, 900);
+        assert!(!tiny.queue_monitor.enabled);
+        assert_eq!(tiny.queue_monitor.tail_warn_minutes, 20);
+        assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
+        assert_eq!(tiny.queue_monitor.stale_hours, 24);
+        assert_eq!(tiny.queue_monitor.consecutive_alert_threshold, 2);
 
         let huge = Config::defaults_for(&fake_platform(128 * 1024, 32), "o/r".into(), Scope::Repo);
         assert_eq!(huge.limits.memory_mb, 16384); // ceiling
@@ -429,6 +534,84 @@ mod tests {
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn queue_monitor_requires_repo_for_org_scope_when_enabled() {
+        let mut cfg = valid_config();
+        cfg.github.scope = Scope::Org;
+        cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = true;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.repo = Some("owner/repo".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn reject_invalid_queue_monitor_values() {
+        let mut cfg = valid_config();
+        cfg.queue_monitor.tail_warn_minutes = 0;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.tail_warn_minutes = 20;
+        cfg.queue_monitor.check_interval_seconds = 59;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.check_interval_seconds = 300;
+        cfg.queue_monitor.stale_hours = 0;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.stale_hours = 24;
+        cfg.queue_monitor.consecutive_alert_threshold = 0;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.consecutive_alert_threshold = 2;
+        for repo in [
+            "owner-only",
+            "owner/",
+            "/repo",
+            " owner/repo",
+            "owner/repo ",
+        ] {
+            cfg.queue_monitor.repo = Some(repo.into());
+            assert!(cfg.validate().is_err(), "{repo:?} should be invalid");
+        }
+        cfg.queue_monitor.repo = Some("owner/repo".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn load_legacy_config_without_queue_monitor_defaults_disabled() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg = load_from_str(raw, "legacy-no-queue-monitor").unwrap();
+        assert!(!cfg.queue_monitor.enabled);
+        assert_eq!(cfg.queue_monitor.tail_warn_minutes, 20);
+        assert_eq!(cfg.queue_monitor.check_interval_seconds, 300);
+    }
+
+    #[test]
+    fn example_configs_load_without_queue_monitor_block() {
+        load_from_str(
+            include_str!("../config/config.toml.linux.example"),
+            "linux-example",
+        )
+        .unwrap();
+        load_from_str(
+            include_str!("../config/config.toml.mac.example"),
+            "mac-example",
+        )
+        .unwrap();
     }
 
     #[test]

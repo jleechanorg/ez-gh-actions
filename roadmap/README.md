@@ -88,6 +88,13 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 - Remaining health blockers: `doctor.sh` still fails queue health (`worldarchitect.ai` fresh queue tail >100m), zmk lacks a runtime durable alert channel/test-send gate, and `juv`/`len` remain required before claiming truly healthy throughput.
 - `/f` binary run: `dark-factory` run `1a5a794f5e02`, evidence `/tmp/ezgha-dark-factory-zmk-20260707001325`, final outcome `exhausted`; `df-healer` points at `sandbox-exec unavailable` and missing holdout evaluator issues in the factory harness.
 
+### 2026-07-07 (Codex continuation) — daemon queue starvation monitor
+
+- Implemented `ez-gh-actions-len` WIP: optional `[queue_monitor]` config with legacy-config compatibility, daemon-side GitHub Actions queued/in_progress REST checks, fresh-vs-stale queue tail stats, consecutive starvation alerts, and independent stale queued zombie alerts.
+- Integrated queue monitoring into `ezgha serve` as a non-fatal check after successful `ensure_count`; it is skipped after runner reconciliation failures to avoid compounding API pressure, and the loop pings the watchdog immediately before queue polling.
+- Added focused tests for config compatibility, example configs, invalid repo/interval values, timestamp/stat boundaries, alert-log delivery after consecutive bad samples, critical escalation cooldown separation, stale zombie warnings, and non-fatal monitor errors.
+- Verification before deploy: `cargo test` 100/100, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` pass. Live proof is still detection-only while the real `worldarchitect.ai` queue is saturated; do not claim Gate 4 recovery unless fresh selftests complete.
+
 ### 2026-07-06 — Binary at 51a5b35, external fleet-watchdog band-aid
 
 - Fleet functional but AMBER: external `ezgha-fleet-watchdog.sh` restarts every ~120s when count < configured.

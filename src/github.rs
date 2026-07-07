@@ -135,6 +135,22 @@ fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::pro
     unreachable!("backoff loop must return before exit");
 }
 
+pub(crate) fn api_json(path: &str) -> Result<Vec<u8>> {
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = Command::new(gh_executable());
+        cmd.args(["api", path]);
+        cmd
+    })
+    .with_context(|| format!("failed to run `gh api {path}`"))?;
+    if !out.status.success() {
+        bail!(
+            "gh api {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
 /// Run `cmd`, capturing stdout and stderr, but never block longer than
 /// `GH_TIMEOUT`. Returns `Ok((stdout, stderr))` if the child exited (success
 /// or failure) within the deadline; returns `Err` if the deadline expired

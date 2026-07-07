@@ -9,6 +9,7 @@ mod config;
 mod docker_backend;
 mod github;
 mod platform;
+mod queue_monitor;
 mod service;
 mod watchdog;
 
@@ -481,6 +482,19 @@ fn run_test_alert(cfg: &config::Config, event_key: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_queue_monitor_tick<F>(run: F) -> bool
+where
+    F: FnOnce() -> Result<Option<queue_monitor::QueueStats>>,
+{
+    match run() {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("WARN: queue monitor check failed: {err:#}");
+            false
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = config_path(&cli)?;
@@ -630,18 +644,19 @@ fn main() -> Result<()> {
             // launchd path / interactive `ezgha serve`).
             let _ = sd_notify::notify(true, &[sd_notify::NotifyState::Ready]);
             let mut backend_recovery = BackendRecoveryState::new();
+            let mut queue_monitor = queue_monitor::QueueMonitorState::new();
             let mut ensure_fail_streak = 0u32;
             loop {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
-                let sleep = match docker_backend::ensure_count(&cfg, backend) {
+                let (sleep, ensure_succeeded) = match docker_backend::ensure_count(&cfg, backend) {
                     Ok(started) => {
                         ensure_fail_streak = 0;
                         for name in started {
                             println!("respawned ephemeral runner {name}");
                         }
-                        Duration::from_secs(30)
+                        (Duration::from_secs(30), true)
                     }
                     Err(e) => {
                         ensure_fail_streak += 1;
@@ -687,12 +702,16 @@ fn main() -> Result<()> {
                             ) {
                                 eprintln!("WARN: alert send error: {err:#}");
                             }
-                            Duration::from_secs(8)
+                            (Duration::from_secs(8), false)
                         } else {
-                            Duration::from_secs(30)
+                            (Duration::from_secs(30), false)
                         }
                     }
                 };
+                if ensure_succeeded {
+                    watchdog::ping();
+                    let _ = run_queue_monitor_tick(|| queue_monitor.maybe_check(&cfg));
+                }
                 watchdog::ping();
                 std::thread::sleep(sleep);
             }
@@ -933,5 +952,13 @@ mod tests {
         assert!(raw.contains("\"event_key\":\"unit.alert_test\""));
         assert!(raw.contains("\"subject\":\"ezgha test alert\""));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queue_monitor_tick_errors_are_non_fatal() {
+        assert!(!run_queue_monitor_tick(|| {
+            anyhow::bail!("synthetic queue monitor failure")
+        }));
+        assert!(run_queue_monitor_tick(|| Ok(None)));
     }
 }
