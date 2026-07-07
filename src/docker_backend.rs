@@ -1272,7 +1272,13 @@ mod tests {
 
         // Runner id 1234 is in live, but its name is "ez-org-runner-2" (expected "ez-org-runner-1")
         let live = vec![runner_info(1234, "ez-org-runner-2")];
-        let reclaimed = release_stale_slots_from_with_containers(&read_slot_assignments().unwrap(), &live, "ez-org-runner", None).unwrap();
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            "ez-org-runner",
+            None,
+        )
+        .unwrap();
 
         assert_eq!(reclaimed, 1, "mismatched slot must be reclaimed");
         let a = read_slot_assignments().unwrap();
