@@ -428,11 +428,17 @@ fn release_stale_slots_from_with_containers_for(
                 // prior host). Treat the slot as free.
                 release_slot_for(cfg, slot_n)?;
                 reclaimed += 1;
-            } else if let Some(local_names) = local_container_names {
+            } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
-                if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
-                    if runner.name == expected_name
-                        && runner.status.eq_ignore_ascii_case("offline")
+                if !runner_prefix.is_empty() && runner.name != expected_name {
+                    eprintln!(
+                        "warning: releasing slot {slot_n}: runner name mismatch (expected {expected_name}, got {} on GitHub for id {rid})",
+                        runner.name
+                    );
+                    release_slot_for(cfg, slot_n)?;
+                    reclaimed += 1;
+                } else if let Some(local_names) = local_container_names {
+                    if runner.status.eq_ignore_ascii_case("offline")
                         && !runner.busy
                         && !local_names.contains(&expected_name)
                     {
@@ -1254,6 +1260,32 @@ mod tests {
             a.assignments.get("1").map(String::as_str),
             Some("1234"),
             "slot 1 must remain recorded"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_releases_slot_when_runner_name_mismatches() {
+        let _env = TestEnv::new("name_mismatch");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap();
+
+        // Runner id 1234 is in live, but its name is "ez-org-runner-2" (expected "ez-org-runner-1")
+        let live = vec![runner_info(1234, "ez-org-runner-2")];
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            "ez-org-runner",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 1, "mismatched slot must be reclaimed");
+        let a = read_slot_assignments().unwrap();
+        assert!(
+            !a.assignments.contains_key("1"),
+            "slot 1 must be removed; got: {:?}",
+            a.assignments
         );
     }
 
