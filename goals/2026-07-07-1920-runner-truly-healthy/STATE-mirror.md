@@ -177,6 +177,83 @@ env var, with truncated example text in comments), and worldarchitect-2step-
 wizard's .env.example (a template with `YOUR_PRIVATE_KEY_CONTENT_HERE` placeholder
 and a truncated example value). **No additional distinct secret exposure found.**
 
+## CRITICAL: host reboots caused by ezgha's own restart discipline (2026-07-07 13:35 PT)
+
+A sibling Jeff-Ubuntu crash-investigation sidekick left a coordination note
+(goals/.../04-coordination-crash-mission.md, committed bf7b90d) with a major
+finding: the box rebooted twice today (00:48, 12:51 PT) via a clean watchdog(8)
+self-shutdown (/etc/watchdog.conf max-load-1=24 on this 32-thread box).
+**Simultaneous respawn of many ezgha runners is what trips it** (00:47 hit
+loadavg 71 on a full cold respawn of all 16; 12:50 trip was loadavg 25-28).
+**The 12:51 PT reboot is the exact moment the predecessor sidekick died** --
+what was assumed to be an independent "/tmp wipe" was very likely this host
+reboot. Root cause of root cause: Gate 0's "restart after every commit"
+discipline is what's been tripping this watchdog.
+
+Mitigation adopted for the rest of this session: check `docker ps` container
+count + `uptime` load average BEFORE every `systemctl --user restart
+ezgha.service`; avoid restarting when it looks like a mass cold respawn would
+be needed (that's the 71-loadavg failure mode) -- a reconciliation restart
+against an already-mostly-healthy fleet is much lower risk. Verified safe
+during the E1 sampler deploy below (load stayed ~4-5 throughout, nowhere near
+24). Cannot fully avoid restarting the ezgha process itself for code deploys
+(Gate 0 requires the new binary loaded) -- this is a structural tension between
+Gate 0 and host stability that should get a durable fix (e.g. a staggered-
+respawn mode in docker_backend.rs) if the mission continues past this window.
+Escalated to main immediately via SendMessage.
+
+## E1 sampler: IMPLEMENTED DIRECTLY (not via codex), merged, deployed
+
+Per main's explicit instruction ("Codex quota being down does NOT block E1 --
+implement the daemon-native sampler YOURSELF now"), built this directly in
+Rust rather than waiting for the Codex usage-limit reset:
+- `InvariantSamplerConfig` in config.rs: new `[invariant_sampler]` section,
+  `enabled` default true, `check_interval_seconds` default 240s (safety margin
+  under the 5min ceiling), `validate()` enforces 1..=300s bound so the E1
+  cadence requirement can't be misconfigured away.
+- `InvariantSamplerState`/`InvariantSample`/`combine_invariant_sample`/
+  `classify_inv1_failure`/`append_invariant_sample` in queue_monitor.rs:
+  evaluates INV-1 (busy>=22 fleet-wide OR queued_jobs==0) and INV-2 (oldest
+  queued/running job <=20.0min, inclusive boundary) across
+  `MONITORED_INVARIANT_REPOS` (worldarchitect.ai + ez-gh-actions, hardcoded --
+  a fixed mission requirement, not a per-deployment config knob). Reused
+  lane-cg's FleetRunnerStats/QueueStats infra rather than duplicating GitHub
+  API calls; fleet stats fetched once per tick and shared across both
+  monitored repos for API-rate-limit hygiene (a live concern -- Gate 4 is
+  currently hitting a secondary GitHub API rate limit, separate from the
+  earlier saturation-based failure).
+- Judgment call: a stale (>8h) queued zombie still counts toward
+  `oldest_queued_job_min` for E1's strict duration invariant, even though
+  `queue_stats()` deliberately excludes it from the unrelated starvation-alert
+  metric. `inv1_fail_class` priority when INV-1 fails: missing-registration
+  (not even registered) > offline-respawning (registered but not online, the
+  ed8 churn pattern) > genuinely-idle (registered+online but not picking up
+  work).
+- Wired into main.rs's daemon serve loop tick alongside the existing
+  queue_monitor/canary ticks -- automatic caller, satisfies E1's "not
+  manual-invocation-only" requirement.
+- 15 new unit tests (inv1/inv2 boundary conditions including the exact-20.0min
+  inclusive edge, cross-repo max combination with stale-zombie ages,
+  classifier priority ordering, exact 9-field JSONL schema, alert body
+  content). 166/166 total tests pass.
+- Merged to main (646edb7, after a cargo-fmt fixup caught by Gate 1), Gates
+  0-3 verified PASS after deploy (Gate 3: 16/16 containers, full capacity).
+  Gate 4 fails on the GitHub API secondary rate limit noted earlier, not a
+  regression from this change.
+- Daemon restarted at 13:42:58 PT with check_interval_seconds=240 --
+  first real sample expected ~13:46:58 PT. Verification of the first
+  daemon-native sample landing in ~/.local/state/ezgha/invariant_history.jsonl
+  is in progress (Monitor task bd7pfq3zj, 7min timeout).
+
+## Other task check-ins (2026-07-07 13:45 PT)
+
+- Task #4 (PR #8214): incremental progress, 7 checks SUCCESS now (was 3),
+  11 still PENDING (was 15) -- queue slowly processing it. Still not
+  mergeable-green; continue monitoring.
+- Task #7 (codex/hardening-bxy-fl0): re-checked, still has active uncommitted
+  sibling WIP (build.rs modified, systemd/ untracked dir) -- still correctly
+  left untouched.
+
 **lane-h task #3: COMPLETE.** Final state: ez-gh-actions branch `sidekick/lane-h`
 merged to main (commit 91d9289) and pushed — adds `.gitleaks.toml` (extends default
 rules) + `.github/workflows/gitleaks.yml` (current-tree scan on every PR + push to
