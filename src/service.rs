@@ -60,7 +60,7 @@ fn systemd_service_unit(
             config_path.display()
         ),
         "WatchdogSec=300".to_string(),
-        "NotifyAccess=main".to_string(),
+        "NotifyAccess=all".to_string(),
         "Restart=on-failure".to_string(),
         "RestartSec=30".to_string(),
         "TimeoutStartSec=130".to_string(),
@@ -316,6 +316,10 @@ mod tests {
         assert!(
             unit.contains("WatchdogSec=300"),
             "WatchdogSec must exceed stacked GitHub/Docker timeout budgets; serve has an internal heartbeat for liveness"
+        );
+        assert!(
+            unit.contains("NotifyAccess=all"),
+            "background heartbeat thread watchdog notifications must be accepted by systemd"
         );
     }
 
