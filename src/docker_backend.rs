@@ -535,11 +535,20 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
 }
 
 fn count_current_prefix_containers(containers: &[ManagedContainer], cfg: &Config) -> u32 {
-    let prefix = format!("{}-", cfg.runner.name_prefix);
     containers
         .iter()
-        .filter(|c| c.name.starts_with(&prefix))
+        .filter(|c| runner_name_matches_prefix(&c.name, &cfg.runner.name_prefix))
         .count() as u32
+}
+
+fn runner_name_matches_prefix(name: &str, prefix: &str) -> bool {
+    let Some(suffix) = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Kill all managed runner containers. Returns how many were removed.
@@ -992,10 +1001,14 @@ mod tests {
     #[test]
     fn current_prefix_container_count_ignores_retired_prefixes() {
         let containers = vec![
+            managed_container("ez-runner-1"),
             managed_container("ez-runner-b-1"),
             managed_container("ez-runner-c-1"),
             managed_container("ez-runner-c-2"),
         ];
+
+        let base_cfg = cfg_with(3, "ez-runner");
+        assert_eq!(count_current_prefix_containers(&containers, &base_cfg), 1);
 
         let old_cfg = cfg_with(3, "ez-runner-b");
         assert_eq!(count_current_prefix_containers(&containers, &old_cfg), 1);

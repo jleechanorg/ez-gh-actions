@@ -149,7 +149,7 @@ fn send_slack(url: &str, subject: &str, body: &str, severity: Severity) -> Resul
     let payload = slack_payload(subject, body, severity);
 
     if is_dry_run() {
-        eprintln!("[dry-run] would send slack alert to {}: {}", url, payload);
+        eprintln!("{}", slack_dry_run_message(url, &payload));
         return Ok(());
     }
 
@@ -165,6 +165,10 @@ fn send_slack(url: &str, subject: &str, body: &str, severity: Severity) -> Resul
         );
     }
     Ok(())
+}
+
+fn slack_dry_run_message(_url: &str, payload: &str) -> String {
+    format!("[dry-run] would send slack alert to configured webhook: {payload}")
 }
 
 fn email_message(
@@ -581,6 +585,20 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--fail"));
         assert!(args.windows(2).any(|w| w == ["--connect-timeout", "5"]));
         assert!(args.windows(2).any(|w| w == ["--max-time", "15"]));
+    }
+
+    #[test]
+    fn slack_dry_run_message_does_not_include_webhook_url() {
+        let secret_url = "https://hooks.slack.test/T/SECRET";
+        let payload = slack_payload("pool low", "body", Severity::Warning);
+        let message = slack_dry_run_message(secret_url, &payload);
+
+        assert!(
+            !message.contains(secret_url),
+            "dry-run output must not expose webhook URLs"
+        );
+        assert!(message.contains("configured webhook"));
+        assert!(message.contains("pool low"));
     }
 
     #[test]
