@@ -3,10 +3,15 @@ FROM ghcr.io/actions/actions-runner:latest
 USER root
 
 # Install dependencies and jq
+# python3-venv/python3-pip: CI jobs create venvs; without ensurepip every
+# `python3 -m venv` fails ("ensurepip is not available") and the pip
+# fallback hits PEP 668 externally-managed-environment.
 RUN apt-get update && apt-get install -y \
     jq \
     curl \
     git \
+    python3-venv \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh)
