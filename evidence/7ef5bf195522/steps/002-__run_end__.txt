@@ -1,0 +1,1 @@
+{"ended_at_exit": false, "final_outcome": "exhausted", "steps": 1, "uncommitted_deletions": "59", "uncommitted_files": "5", "uncommitted_insertions": "", "uncommitted_staged_files": "3"}

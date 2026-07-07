@@ -1,0 +1,1 @@
+dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'verify status and hardening closure' --backend codex --cxdb /home/jleechan/.dark-factory/cxdb.sqlite --max-steps 1

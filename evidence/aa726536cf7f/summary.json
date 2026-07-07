@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'Stabilize ezgha runner hardening after ozk/n5p/twp work' --backend echo --cxdb /home/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_path": "/home/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_sha256": "d45d84bf6013f381073e68cbbf93c6862f01a6bc18be2079218833446ec29bcc",
+  "ended_ts": 1783405305.8044682,
+  "events_path": "/home/jleechan/projects/ez-gh-actions/evidence/aa726536cf7f/events.jsonl",
+  "exit_reached": false,
+  "extract_path": "/home/jleechan/projects/ez-gh-actions/evidence/aa726536cf7f/cxdb-aa726536cf7f.sqlite",
+  "extract_sha256": "c85e9bed07768423358670528425f28a12e1de97a15576c1e34de61f389f7520",
+  "final_outcome": "exhausted",
+  "goal": "Stabilize ezgha runner hardening after ozk/n5p/twp work",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "gates",
+  "pipeline_path": "/home/jleechan/projects/dark-factory/pipelines/factory/gates.dot",
+  "run_id": "aa726536cf7f",
+  "started_ts": 1783405305.0192356,
+  "steps": 10,
+  "wall_clock_ms": 785
+}

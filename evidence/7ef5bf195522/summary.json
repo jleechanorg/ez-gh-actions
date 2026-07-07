@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'verify status and hardening closure' --backend codex --cxdb /home/jleechan/.dark-factory/cxdb.sqlite --max-steps 1",
+  "cxdb_path": "/home/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_sha256": "85e7105444d5cb1ebbaaf8cade40527971dfe70f36ac73a83a5e1348ca22e7ce",
+  "ended_ts": 1783405548.9787924,
+  "events_path": "/home/jleechan/projects/ez-gh-actions/evidence/7ef5bf195522/events.jsonl",
+  "exit_reached": false,
+  "extract_path": "/home/jleechan/projects/ez-gh-actions/evidence/7ef5bf195522/cxdb-7ef5bf195522.sqlite",
+  "extract_sha256": "7f4bf06279f00b539329a36e594a4ae059ef1e3971c60b37d3c97bfc8921b35e",
+  "final_outcome": "exhausted",
+  "goal": "verify status and hardening closure",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "gates",
+  "pipeline_path": "/home/jleechan/projects/dark-factory/pipelines/factory/gates.dot",
+  "run_id": "7ef5bf195522",
+  "started_ts": 1783405548.9592936,
+  "steps": 2,
+  "wall_clock_ms": 19
+}

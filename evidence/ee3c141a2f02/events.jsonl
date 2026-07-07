@@ -1,0 +1,4 @@
+{"backend": "codex", "event": "run_start", "goal": "Reach exit-criteria pass on Linux and validate mac path blockers for remaining hardening", "pipeline": "gates", "run_id": "ee3c141a2f02", "seq": 0, "ts": 1783405404.768222}
+{"event": "checkpoint", "node": "__cross_run_circuit__", "path": "/home/jleechan/.dark-factory/runs/ee3c141a2f02/checkpoint.json", "run_id": "ee3c141a2f02", "seq": 0, "ts": 1783405404.7685058}
+{"event": "step", "node": "__cross_run_circuit__", "outcome": "failure", "preview": "cross_run_circuit_breaker: last 3 runs of pipeline 'gates' all ended exhausted; skipping run", "run_id": "ee3c141a2f02", "seq": 0, "ts": 1783405404.768579}
+{"ended_at_exit": "False", "event": "run_end", "final_outcome": "exhausted", "pipeline": "gates", "run_id": "ee3c141a2f02", "seq": 1, "steps": "1", "ts": 1783405404.7804444, "uncommitted_deletions": "59", "uncommitted_files": "4", "uncommitted_insertions": "", "uncommitted_staged_files": "2"}

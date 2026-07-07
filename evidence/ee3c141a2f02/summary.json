@@ -1,0 +1,19 @@
+{
+  "command": "dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'Reach exit-criteria pass on Linux and validate mac path blockers for remaining hardening' --backend codex --cxdb /home/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_path": "/home/jleechan/.dark-factory/cxdb.sqlite",
+  "cxdb_sha256": "519523bf670e94c4ce1dd550cb9c8b2ee06ce0687d5ad267bd65493b1df19131",
+  "ended_ts": 1783405404.7814155,
+  "events_path": "/home/jleechan/projects/ez-gh-actions/evidence/ee3c141a2f02/events.jsonl",
+  "exit_reached": false,
+  "extract_path": "/home/jleechan/projects/ez-gh-actions/evidence/ee3c141a2f02/cxdb-ee3c141a2f02.sqlite",
+  "extract_sha256": "bfb7a92b6616dba206b4e8940eb5963fcdb0b235d74d867dc9342440571ff5f6",
+  "final_outcome": "exhausted",
+  "goal": "Reach exit-criteria pass on Linux and validate mac path blockers for remaining hardening",
+  "node_io_path": "node_io.jsonl",
+  "pipeline_name": "gates",
+  "pipeline_path": "/home/jleechan/projects/dark-factory/pipelines/factory/gates.dot",
+  "run_id": "ee3c141a2f02",
+  "started_ts": 1783405404.761355,
+  "steps": 2,
+  "wall_clock_ms": 20
+}

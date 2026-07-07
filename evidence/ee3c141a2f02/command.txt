@@ -1,0 +1,1 @@
+dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'Reach exit-criteria pass on Linux and validate mac path blockers for remaining hardening' --backend codex --cxdb /home/jleechan/.dark-factory/cxdb.sqlite

@@ -1,0 +1,1 @@
+dark-factory --workdir /home/jleechan/projects/ez-gh-actions --pipeline pipelines/factory/gates.dot --goal 'Stabilize ezgha runner hardening after ozk/n5p/twp work' --backend echo --cxdb /home/jleechan/.dark-factory/cxdb.sqlite

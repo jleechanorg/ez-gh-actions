@@ -1,0 +1,4 @@
+{"backend": "codex", "event": "run_start", "goal": "verify status and hardening closure", "pipeline": "gates", "run_id": "7ef5bf195522", "seq": 0, "ts": 1783405548.9659529}
+{"event": "checkpoint", "node": "__cross_run_circuit__", "path": "/home/jleechan/.dark-factory/runs/7ef5bf195522/checkpoint.json", "run_id": "7ef5bf195522", "seq": 0, "ts": 1783405548.9662154}
+{"event": "step", "node": "__cross_run_circuit__", "outcome": "failure", "preview": "cross_run_circuit_breaker: last 3 runs of pipeline 'gates' all ended exhausted; skipping run", "run_id": "7ef5bf195522", "seq": 0, "ts": 1783405548.9662874}
+{"ended_at_exit": "False", "event": "run_end", "final_outcome": "exhausted", "pipeline": "gates", "run_id": "7ef5bf195522", "seq": 1, "steps": "1", "ts": 1783405548.9776974, "uncommitted_deletions": "59", "uncommitted_files": "5", "uncommitted_insertions": "", "uncommitted_staged_files": "3"}

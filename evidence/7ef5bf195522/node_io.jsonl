@@ -1,0 +1,2 @@
+{"io_refs": {}, "log_refs": {"events": "/home/jleechan/projects/ez-gh-actions/evidence/7ef5bf195522/events.jsonl", "run_log": "/home/jleechan/.dark-factory/logs/7ef5bf195522.log"}, "node": "__cross_run_circuit__", "outcome": "exhausted", "seq": 0, "ts": 1783405548.9661164}
+{"io_refs": {}, "log_refs": {"events": "/home/jleechan/projects/ez-gh-actions/evidence/7ef5bf195522/events.jsonl", "run_log": "/home/jleechan/.dark-factory/logs/7ef5bf195522.log"}, "node": "__run_end__", "outcome": "exhausted", "seq": 2, "ts": 1783405548.9781563}
