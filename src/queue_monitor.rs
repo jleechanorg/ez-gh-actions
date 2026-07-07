@@ -39,6 +39,21 @@ const INVARIANT_DURATION_THRESHOLD_MINUTES: f64 = 20.0;
 /// bites (signaled via `queued_jobs_capped` in the schema).
 const INVARIANT_JOB_ENUMERATION_CAP: usize = 50;
 
+/// The cap above bounds TODAY's known queue size, but only a hard time
+/// budget kills the whole failure CLASS: any future expensive per-tick work
+/// (a new monitor, a bigger queue, a slower API day) could reintroduce the
+/// same ensure_count-starvation drain silently. Every monitoring tick that
+/// does per-run GitHub API enumeration must stop enumerating and return
+/// (marking its result partial/capped) once this much wall-clock time has
+/// elapsed since the CURRENT serve-loop iteration started -- guaranteeing
+/// `ensure_count` is reachable at least once per loop iteration regardless
+/// of queue depth or API latency. Threaded down from `main.rs`'s serve loop
+/// as a shared `Instant` deadline, not re-derived per monitor, so multiple
+/// ticks in the same iteration (queue_monitor + invariant_sampler) share one
+/// budget rather than each getting their own 75s (which would still allow
+/// ~150s of monitor time before ensure_count runs again).
+pub const SERVE_LOOP_TIME_BUDGET: Duration = Duration::from_secs(75);
+
 #[derive(Debug, Default)]
 pub struct QueueMonitorState {
     last_check: Option<Instant>,
@@ -53,7 +68,11 @@ impl QueueMonitorState {
         }
     }
 
-    pub fn maybe_check(&mut self, cfg: &Config) -> Result<Option<QueueStats>> {
+    /// `loop_start` is this serve-loop iteration's start time (see
+    /// `SERVE_LOOP_TIME_BUDGET`) -- passed down from `main.rs` rather than
+    /// captured internally, so this tick and the invariant sampler's tick in
+    /// the SAME iteration share one budget instead of each getting their own.
+    pub fn maybe_check(&mut self, cfg: &Config, loop_start: Instant) -> Result<Option<QueueStats>> {
         if !cfg.queue_monitor.enabled {
             return Ok(None);
         }
@@ -78,8 +97,9 @@ impl QueueMonitorState {
         // oldest job lives among the oldest runs); only the raw queued/
         // in-progress *counts* become a lower bound when capped, which this
         // starvation-alerting path doesn't otherwise report as an exact number.
+        let deadline = loop_start + SERVE_LOOP_TIME_BUDGET;
         let (snapshot, _capped) =
-            fetch_capped_queue_snapshot(repo, None, INVARIANT_JOB_ENUMERATION_CAP)?;
+            fetch_capped_queue_snapshot(repo, None, INVARIANT_JOB_ENUMERATION_CAP, deadline)?;
         let now = unix_now_secs();
         let stats = queue_stats(
             &snapshot,
@@ -119,7 +139,14 @@ impl InvariantSamplerState {
         Self { last_check: None }
     }
 
-    pub fn maybe_sample(&mut self, cfg: &Config) -> Result<Option<InvariantSample>> {
+    /// `loop_start` is this serve-loop iteration's start time (see
+    /// `SERVE_LOOP_TIME_BUDGET`) -- passed down from `main.rs`, shared with
+    /// `QueueMonitorState::maybe_check`'s budget in the same iteration.
+    pub fn maybe_sample(
+        &mut self,
+        cfg: &Config,
+        loop_start: Instant,
+    ) -> Result<Option<InvariantSample>> {
         if !cfg.invariant_sampler.enabled {
             return Ok(None);
         }
@@ -141,7 +168,7 @@ impl InvariantSamplerState {
         // zero-violation count. The caller (`run_invariant_sampler_tick` in
         // main.rs) logs the error and moves on; the next tick simply retries
         // after the normal interval.
-        let sample = sample_invariants(cfg)?;
+        let sample = sample_invariants(cfg, loop_start)?;
         append_invariant_sample(cfg, &sample)?;
         if !sample.inv1 || !sample.inv2 {
             alert_invariant_violation(cfg, &sample)?;
@@ -189,14 +216,19 @@ pub struct InvariantSample {
     pub inv1_fail_class: Option<String>,
 }
 
-fn sample_invariants(cfg: &Config) -> Result<InvariantSample> {
+fn sample_invariants(cfg: &Config, loop_start: Instant) -> Result<InvariantSample> {
+    let deadline = loop_start + SERVE_LOOP_TIME_BUDGET;
     let fleet = fetch_fleet_runner_stats()?;
     let now = unix_now_secs();
     let mut repo_stats = Vec::with_capacity(MONITORED_INVARIANT_REPOS.len());
     let mut any_capped = false;
     for repo in MONITORED_INVARIANT_REPOS {
-        let (snapshot, capped) =
-            fetch_capped_queue_snapshot(repo, Some(fleet.clone()), INVARIANT_JOB_ENUMERATION_CAP)?;
+        let (snapshot, capped) = fetch_capped_queue_snapshot(
+            repo,
+            Some(fleet.clone()),
+            INVARIANT_JOB_ENUMERATION_CAP,
+            deadline,
+        )?;
         any_capped |= capped;
         repo_stats.push(queue_stats(
             &snapshot,
@@ -441,6 +473,33 @@ fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
     Ok(fleet_runner_stats(github::list_runners(&gh)?))
 }
 
+/// Enumerates self-hosted jobs for `runs` via caller-supplied `fetch_jobs`,
+/// bailing out (returning `bailed=true` with whatever was collected so far)
+/// the moment `Instant::now() >= deadline`, rather than starting another
+/// run's fetch. This is the `SERVE_LOOP_TIME_BUDGET` guarantee in its most
+/// literal form -- a pure control-flow wrapper around a fetch closure, kept
+/// generic and network-agnostic specifically so it's unit-testable with a
+/// synthetic deadline and a fake in-memory closure (see
+/// `enumerate_jobs_within_budget_bails_before_first_fetch_past_deadline`),
+/// without a live GitHub API or a real `sleep`.
+fn enumerate_jobs_within_budget<R, F>(
+    runs: &[R],
+    deadline: Instant,
+    mut fetch_jobs: F,
+) -> Result<(Vec<QueueJob>, bool)>
+where
+    F: FnMut(&R) -> Result<Vec<QueueJob>>,
+{
+    let mut collected = Vec::new();
+    for run in runs {
+        if Instant::now() >= deadline {
+            return Ok((collected, true));
+        }
+        collected.extend(fetch_jobs(run)?);
+    }
+    Ok((collected, false))
+}
+
 /// Fetches a repo's queued/in-progress self-hosted job snapshot, capping
 /// expensive per-run job enumeration to the oldest `cap` queued runs when the
 /// repo has more than `cap` queued -- see `INVARIANT_JOB_ENUMERATION_CAP` for
@@ -450,13 +509,20 @@ fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
 /// workflow-runs API returns newest-first, so the oldest runs live on the
 /// LAST page; we read page 1 first (cheap, gives `total_count`), and only
 /// walk backward from the last page when the total exceeds the cap, instead
-/// of fetching every page from the front. In-progress jobs are NOT capped
-/// (typically far fewer than queued, and INV-2's running-job age doesn't
-/// have a "queue tail" shape that benefits from an oldest-first cap).
+/// of fetching every page from the front.
+///
+/// `deadline` is the harder guarantee layered on top of the size-based cap
+/// (see `SERVE_LOOP_TIME_BUDGET`): even a queue that fits under `cap`, or a
+/// slow GitHub API day, cannot block past `deadline` -- job enumeration for
+/// both queued and in-progress runs bails early via
+/// `enumerate_jobs_within_budget`, and the resulting snapshot is marked
+/// `capped=true` (an honest partial result) rather than silently returning
+/// incomplete data as if it were exact.
 fn fetch_capped_queue_snapshot(
     repo: &str,
     fleet: Option<FleetRunnerStats>,
     cap: usize,
+    deadline: Instant,
 ) -> Result<(QueueSnapshot, bool)> {
     let first_path = format!("repos/{repo}/actions/runs?status=queued&per_page=100&page=1");
     let first_body = github::api_json(&first_path)?;
@@ -464,7 +530,7 @@ fn fetch_capped_queue_snapshot(
         .with_context(|| format!("parse queued runs response for {repo} page 1"))?;
     let total_count = first_parsed.total_count as usize;
 
-    let (queued_runs, capped) = if total_count <= cap {
+    let (queued_runs, mut capped) = if total_count <= cap {
         (first_parsed.workflow_runs, false)
     } else {
         let last_page = total_count.div_ceil(100) as u32;
@@ -472,6 +538,9 @@ fn fetch_capped_queue_snapshot(
         let mut first_page_runs = Some(first_parsed.workflow_runs);
         let mut page = last_page;
         loop {
+            if Instant::now() >= deadline {
+                break;
+            }
             let runs = if page == 1 {
                 first_page_runs.take().unwrap_or_default()
             } else {
@@ -493,15 +562,20 @@ fn fetch_capped_queue_snapshot(
         (oldest_runs, true)
     };
 
-    let mut queued = Vec::new();
-    for run in queued_runs {
-        queued.extend(fetch_self_hosted_jobs(repo, &run, "queued")?);
-    }
+    let (queued, queued_bailed) = enumerate_jobs_within_budget(&queued_runs, deadline, |run| {
+        fetch_self_hosted_jobs(repo, run, "queued")
+    })?;
+    capped |= queued_bailed;
 
-    let mut in_progress = Vec::new();
-    for run in github::list_repo_in_progress_runs(repo)? {
-        in_progress.extend(fetch_self_hosted_jobs(repo, &run, "in_progress")?);
-    }
+    let (in_progress, in_progress_bailed) = if Instant::now() >= deadline {
+        (Vec::new(), true)
+    } else {
+        let runs = github::list_repo_in_progress_runs(repo)?;
+        enumerate_jobs_within_budget(&runs, deadline, |run| {
+            fetch_self_hosted_jobs(repo, run, "in_progress")
+        })?
+    };
+    capped |= in_progress_bailed;
 
     Ok((
         QueueSnapshot {
@@ -1347,6 +1421,90 @@ mod tests {
         // Capping doesn't change what was actually measured -- only whether
         // it's an exact count or a lower bound.
         assert_eq!(uncapped.queued_jobs, capped.queued_jobs);
+    }
+
+    #[test]
+    fn enumerate_jobs_within_budget_bails_before_first_fetch_past_deadline() {
+        // Deterministic, zero-sleep case: deadline already in the past, so
+        // NOTHING gets fetched -- proves the check happens before the first
+        // item, not just between items (matters if even the first fetch in
+        // a tick is already the one that's slow).
+        let runs = vec![1u32, 2, 3];
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let mut calls = 0u32;
+        let (collected, bailed) = enumerate_jobs_within_budget(&runs, deadline, |_run| {
+            calls += 1;
+            Ok(Vec::<QueueJob>::new())
+        })
+        .unwrap();
+        assert!(bailed);
+        assert!(collected.is_empty());
+        assert_eq!(
+            calls, 0,
+            "must not fetch anything once already past deadline"
+        );
+    }
+
+    #[test]
+    fn enumerate_jobs_within_budget_stops_a_slow_fetch_within_the_budget() {
+        // Regression test for the 2026-07-07 fleet-drain incident: simulate a
+        // "slow fetch" (a few ms per item, standing in for a real gh api
+        // round-trip) against a short budget, and assert this function
+        // returns control well before processing every item -- i.e. the
+        // serve loop's ensure_count cadence is preserved regardless of how
+        // many items are queued, not just bounded by the size-based cap.
+        let runs: Vec<u32> = (0..1000).collect();
+        let budget = Duration::from_millis(30);
+        let deadline = Instant::now() + budget;
+        let mut calls = 0u32;
+        let (collected, bailed) = enumerate_jobs_within_budget(&runs, deadline, |_run| {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(vec![QueueJob {
+                run_id: 1,
+                job_id: 1,
+                name: "job".into(),
+                head_branch: "main".into(),
+                created_at: "2026-07-07T00:00:00Z".into(),
+                started_at: None,
+                url: "https://github.example/runs/1".into(),
+            }])
+        })
+        .unwrap();
+        assert!(
+            bailed,
+            "1000 items at 5ms each (5s total) must bail within a 30ms budget"
+        );
+        assert!(
+            calls < runs.len() as u32,
+            "must not process all {} items within a {budget:?} budget (processed {calls})",
+            runs.len()
+        );
+        assert_eq!(
+            collected.len(),
+            calls as usize,
+            "collected jobs must match how many runs were actually processed before bailing"
+        );
+    }
+
+    #[test]
+    fn enumerate_jobs_within_budget_completes_normally_when_deadline_is_far_off() {
+        let runs = vec![1u32, 2, 3];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (collected, bailed) = enumerate_jobs_within_budget(&runs, deadline, |_run| {
+            Ok(vec![QueueJob {
+                run_id: 1,
+                job_id: 1,
+                name: "job".into(),
+                head_branch: "main".into(),
+                created_at: "2026-07-07T00:00:00Z".into(),
+                started_at: None,
+                url: "https://github.example/runs/1".into(),
+            }])
+        })
+        .unwrap();
+        assert!(!bailed);
+        assert_eq!(collected.len(), 3);
     }
 
     #[test]
