@@ -1,0 +1,37 @@
+name: Gitleaks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Secret scan
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","ezgha"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          version="8.30.0"
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) asset="gitleaks_${version}_linux_x64.tar.gz" ;;
+            Linux-aarch64|Linux-arm64) asset="gitleaks_${version}_linux_arm64.tar.gz" ;;
+            Darwin-x86_64) asset="gitleaks_${version}_darwin_x64.tar.gz" ;;
+            Darwin-arm64) asset="gitleaks_${version}_darwin_arm64.tar.gz" ;;
+            *) echo "::error::Unsupported runner platform $(uname -s)-$(uname -m)"; exit 2 ;;
+          esac
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${asset}" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks version
+
+      - name: Run gitleaks
+        run: /tmp/gitleaks detect --source . --no-git --redact=100 --no-banner -v
