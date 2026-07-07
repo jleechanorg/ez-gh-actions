@@ -175,20 +175,29 @@ pub fn result_from_run_jobs(
     slo_start_seconds: u64,
 ) -> CanaryResult {
     let correlation = correlate_run_job(run, jobs, runner_prefix);
-    let job = correlation.as_ref();
-    let time_to_start_seconds =
-        job.and_then(|corr| duration_between(&corr.queued_at, corr.started_at.as_deref()));
-    let time_to_complete_seconds =
-        job.and_then(|corr| duration_between(&corr.queued_at, corr.completed_at.as_deref()));
+    let correlated_job = correlation.as_ref();
+    let fallback_job = jobs.first();
+    let queued_at = run.created_at.clone();
+    let started_at = correlated_job
+        .and_then(|corr| corr.started_at.clone())
+        .or_else(|| fallback_job.and_then(|job| job.started_at.clone()));
+    let completed_at = correlated_job
+        .and_then(|corr| corr.completed_at.clone())
+        .or_else(|| fallback_job.and_then(|job| job.completed_at.clone()));
+    let time_to_start_seconds = duration_between(&queued_at, started_at.as_deref());
+    let time_to_complete_seconds = duration_between(&queued_at, completed_at.as_deref());
     let status = if run.status == "completed" {
         "completed".to_string()
     } else if correlation.is_some() {
         "started".to_string()
+    } else if let Some(job) = fallback_job {
+        job.status.clone()
     } else {
         run.status.clone()
     };
-    let conclusion = job
+    let conclusion = correlated_job
         .and_then(|corr| corr.job_conclusion.clone())
+        .or_else(|| fallback_job.and_then(|job| job.conclusion.clone()))
         .or_else(|| run.conclusion.clone());
     let slo_breached = time_to_start_seconds
         .map(|secs| secs > slo_start_seconds as i64)
@@ -199,13 +208,17 @@ pub fn result_from_run_jobs(
         repo: repo.to_string(),
         workflow: workflow.to_string(),
         run_id: Some(run.id),
-        job_id: job.map(|corr| corr.job_id),
-        runner_name: job.and_then(|corr| corr.runner_name.clone()),
+        job_id: correlated_job
+            .map(|corr| corr.job_id)
+            .or_else(|| fallback_job.map(|job| job.id)),
+        runner_name: correlated_job
+            .and_then(|corr| corr.runner_name.clone())
+            .or_else(|| fallback_job.and_then(|job| job.runner_name.clone())),
         status,
         conclusion,
-        queued_at: Some(run.created_at.clone()),
-        started_at: job.and_then(|corr| corr.started_at.clone()),
-        completed_at: job.and_then(|corr| corr.completed_at.clone()),
+        queued_at: Some(queued_at),
+        started_at,
+        completed_at,
         time_to_start_seconds,
         time_to_complete_seconds,
         slo_start_seconds,
@@ -332,6 +345,28 @@ mod tests {
         assert_eq!(result.time_to_complete_seconds, Some(240));
         assert!(result.slo_breached);
         assert!(should_alert(&result));
+    }
+
+    #[test]
+    fn result_preserves_queued_job_before_runner_assignment() {
+        let run = run(7, "ezgha-selftest nonce", "workflow_dispatch", "queued");
+        let jobs = vec![job(2, None, "queued", None)];
+
+        let result = result_from_run_jobs(
+            "owner/repo",
+            "selftest.yml",
+            "nonce",
+            &run,
+            &jobs,
+            "ez-runner-c",
+            90,
+        );
+
+        assert_eq!(result.run_id, Some(7));
+        assert_eq!(result.job_id, Some(2));
+        assert_eq!(result.runner_name, None);
+        assert_eq!(result.status, "queued");
+        assert_eq!(result.time_to_start_seconds, None);
     }
 
     #[test]
