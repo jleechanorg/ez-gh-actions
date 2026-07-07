@@ -850,3 +850,41 @@ demand PR-1 (quick wins, still mid-edit last checked), demand PR-2
 PR-1b (push-trigger audit, just started). Also committed main's cleaned
 review doc (962->87 lines / 12.7KB pure markdown, commit 1886ef0) on top of
 my original full commit.
+
+## Round-2 BLOCK + V3 dispatched, PR-1 complete (2026-07-07 16:20-16:28 PT)
+
+**po2 round-2**: BLOCKED again. Critical: v2's "fixed schedule primary,
+gate secondary" design was numerically inverted -- fixed schedule alone
+peaks +17.32 load, this box's baseline runs 9-15, combined 26.3-32.3
+breaches the 24 ceiling whenever the gate is dark; WITH the gate active
+stays 15.7-18.6, proving the gate is load-bearing not cosmetic. Plus a
+silent Linux `.ok()` swallow on loadavg read failure, and no overall
+pacing budget (16-runner refill could take 16+ min in one `ensure_count`
+call, starving monitors that only run after it returns). Full findings +
+V3 brief appended to goals/.../05-ultracode-po2-review-and-demand-plan.md
+as an appendix (commit d9d0847, merged with a concurrent session's commits
+at 2b1cf96 -- that session landed a queue-tail reaper launchd stopgap +
+force-cancel fallback for queued runs that ignore plain cancel, which is
+directly relevant to my earlier stuck-run-28884233335 cancellation
+near-miss, worth re-trying that cancel with the new fallback later).
+
+**Dispatched V3** (same branch/worktree, confirmed alive): incremental
+refill with a per-`ensure_count`-call time budget (~90-120s, monitors get
+a turn every loop iteration by construction instead of only after a full
+refill completes), gate-PRIMARY headroom formula
+(`allowed = floor((20-load)/4.4)`), max-conservative 1-start fallback when
+no load signal (covers both non-Linux and Linux read-failure, routed
+through the SAME warn-once+real-alert path, fixing the silent swallow),
+and tests with the worst-case baseline offset for BOTH gate-active and
+gate-dark paths. Told it round-3 will re-run the arithmetic against
+whatever it derives and documents in the diff itself.
+
+**demand-cut PR-1 (quick wins) COMPLETE**: worldarchitect.ai#8235, OPEN,
+MERGEABLE, all 17 expected files present (verified against the original
+brief's file list). Codex noted it had to repair a branch-history issue
+mid-work (backed up the pre-repair tip locally) -- verified the final PR
+is clean and correctly scoped regardless.
+
+Status: po2 still held (round 3 in flight). demand PR-1 (#8235) and PR-2
+(#8232) both open/mergeable, awaiting checks + human merge decision. PR-1b
+(push-trigger audit) still in progress.
