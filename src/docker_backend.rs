@@ -254,7 +254,26 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     };
     watchdog::ping();
     let assignments = read_slot_assignments()?;
-    let reclaimed = release_stale_slots_from(&assignments, &live_runners)?;
+    let local_container_names = match managed_containers() {
+        Ok(containers) => Some(
+            containers
+                .into_iter()
+                .map(|container| container.name)
+                .collect::<HashSet<_>>(),
+        ),
+        Err(err) => {
+            eprintln!(
+                "warning: skipping container-aware stale-slot reconciliation (docker unreachable): {err:#}"
+            );
+            None
+        }
+    };
+    let reclaimed = release_stale_slots_from_with_containers(
+        &assignments,
+        &live_runners,
+        &cfg.runner.name_prefix,
+        local_container_names.as_ref(),
+    )?;
     watchdog::ping();
     // Forward sweep: GitHub has runners with our prefix that NO slot file
     // entry owns. These are JIT registrations whose slot reservation was
@@ -306,9 +325,19 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
 /// snapshot. Split out so tests can drive it without a live `gh` auth context;
 /// `release_stale_slots` is the production entry point that fetches the live
 /// list via `github::list_runners`.
+#[cfg(test)]
 fn release_stale_slots_from(
     assignments: &SlotAssignments,
     live_runners: &[github::RunnerInfo],
+) -> Result<usize> {
+    release_stale_slots_from_with_containers(assignments, live_runners, "", None)
+}
+
+fn release_stale_slots_from_with_containers(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
 ) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
@@ -337,10 +366,29 @@ fn release_stale_slots_from(
                 // prior host). Treat the slot as free.
                 release_slot(slot_n)?;
                 reclaimed += 1;
+            } else if let Some(local_names) = local_container_names {
+                let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
+                if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
+                    if runner.name == expected_name
+                        && runner.status.eq_ignore_ascii_case("offline")
+                        && !runner.busy
+                        && !local_names.contains(&expected_name)
+                    {
+                        eprintln!(
+                            "warning: releasing slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle and has no local container"
+                        );
+                        release_slot(slot_n)?;
+                        reclaimed += 1;
+                    }
+                }
             }
         }
     }
     Ok(reclaimed)
+}
+
+fn runner_name_from_prefix(prefix: &str, slot: u32) -> String {
+    format!("{prefix}-{slot}")
 }
 
 /// Print the `ezgha doctor`-style diagnostics for the current host. Today this
@@ -1067,6 +1115,38 @@ mod tests {
             a.assignments.get("1").map(String::as_str),
             Some("1234"),
             "slot 1 must remain recorded"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_releases_offline_runner_when_container_missing() {
+        let _env = TestEnv::new("offline_missing_container");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap();
+
+        let live = vec![github::RunnerInfo {
+            id: 1234,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: false,
+        }];
+        let local_names = HashSet::from(["ez-org-runner-2".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "offline idle runner without a local container should not hold its slot"
+        );
+        assert!(
+            read_slot_assignments().unwrap().assignments.is_empty(),
+            "slot 1 must be released"
         );
     }
 
