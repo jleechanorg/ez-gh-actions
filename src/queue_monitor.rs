@@ -69,7 +69,17 @@ impl QueueMonitorState {
         let Some(repo) = queue_repo(cfg) else {
             return Ok(None);
         };
-        let snapshot = fetch_queue_snapshot(repo)?;
+        // Same job-enumeration cap as the E1 invariant sampler (see
+        // INVARIANT_JOB_ENUMERATION_CAP's doc comment): this tick shares the
+        // identical per-run gh api cost, and at the current queue size
+        // (queued_jobs ~1290) it independently starved ensure_count's refill
+        // step even with the sampler disabled -- confirmed live in production
+        // 2026-07-07. tail_bad/max_current_job_age_minutes stay exact (the
+        // oldest job lives among the oldest runs); only the raw queued/
+        // in-progress *counts* become a lower bound when capped, which this
+        // starvation-alerting path doesn't otherwise report as an exact number.
+        let (snapshot, _capped) =
+            fetch_capped_queue_snapshot(repo, None, INVARIANT_JOB_ENUMERATION_CAP)?;
         let now = unix_now_secs();
         let stats = queue_stats(
             &snapshot,
@@ -206,7 +216,7 @@ fn sample_invariants(cfg: &Config) -> Result<InvariantSample> {
 /// Pure combination logic, kept separate from `sample_invariants`'s network
 /// calls so the classifier + threshold math are unit-testable without a live
 /// GitHub API (mirrors how `queue_stats` above is unit-tested against
-/// hand-built `QueueSnapshot`s rather than through `fetch_queue_snapshot`).
+/// hand-built `QueueSnapshot`s rather than through `fetch_capped_queue_snapshot`).
 fn combine_invariant_sample(
     fleet: &FleetRunnerStats,
     repo_stats: &[QueueStats],
@@ -431,51 +441,12 @@ fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
     Ok(fleet_runner_stats(github::list_runners(&gh)?))
 }
 
-fn fetch_queue_snapshot(repo: &str) -> Result<QueueSnapshot> {
-    fetch_queue_snapshot_with_fleet(repo, None)
-}
-
-/// Same as `fetch_queue_snapshot`, but accepts an already-fetched
-/// `FleetRunnerStats` to avoid an extra `list_runners` API call when the
-/// caller is sampling multiple repos against the same org fleet in one tick
-/// (see `sample_invariants` below) -- API-rate-limit hygiene given how many
-/// concurrent agents hit this org's GitHub API.
-fn fetch_queue_snapshot_with_fleet(
-    repo: &str,
-    fleet: Option<FleetRunnerStats>,
-) -> Result<QueueSnapshot> {
-    let mut queued = Vec::new();
-    let mut page = 1u32;
-    loop {
-        let path = format!("repos/{repo}/actions/runs?status=queued&per_page=100&page={page}");
-        let body = github::api_json(&path)?;
-        let parsed: RunsResponse = serde_json::from_slice(&body)
-            .with_context(|| format!("parse queued runs response for {repo} page {page}"))?;
-        let len = parsed.workflow_runs.len();
-        for run in parsed.workflow_runs {
-            queued.extend(fetch_self_hosted_jobs(repo, &run, "queued")?);
-        }
-        if len < 100 {
-            break;
-        }
-        page = page.saturating_add(1);
-    }
-
-    let mut in_progress = Vec::new();
-    for run in github::list_repo_in_progress_runs(repo)? {
-        in_progress.extend(fetch_self_hosted_jobs(repo, &run, "in_progress")?);
-    }
-
-    Ok(QueueSnapshot {
-        queued,
-        in_progress,
-        fleet: fleet.or_else(|| fetch_fleet_runner_stats().ok()),
-    })
-}
-
-/// Like `fetch_queue_snapshot_with_fleet`, but caps expensive per-run job
-/// enumeration to the oldest `cap` queued runs when the repo has more than
-/// `cap` queued -- see `INVARIANT_JOB_ENUMERATION_CAP` for why. GitHub's
+/// Fetches a repo's queued/in-progress self-hosted job snapshot, capping
+/// expensive per-run job enumeration to the oldest `cap` queued runs when the
+/// repo has more than `cap` queued -- see `INVARIANT_JOB_ENUMERATION_CAP` for
+/// why (this replaced an uncapped fetch that independently starved the
+/// daemon's ensure_count refill step at the current queue size, both via the
+/// E1 sampler and this module's own starvation-alert tick). GitHub's
 /// workflow-runs API returns newest-first, so the oldest runs live on the
 /// LAST page; we read page 1 first (cheap, gives `total_count`), and only
 /// walk backward from the last page when the total exceeds the cap, instead
