@@ -560,7 +560,6 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
-use crate::watchdog;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
