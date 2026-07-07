@@ -463,6 +463,27 @@ fn notify_ensure_failure(
     }
 }
 
+fn apply_ensure_outcome_to_failure_streak(
+    cfg: &config::Config,
+    backend: backend::Backend,
+    ensure_fail_streak: &mut u32,
+    outcome: &docker_backend::EnsureCountOutcome,
+) -> bool {
+    let partial_failure = outcome.is_partial_failure();
+    if partial_failure {
+        *ensure_fail_streak += 1;
+        let detail = format!(
+            "partial success: started {} of {} missing runner(s)",
+            outcome.started.len(),
+            outcome.missing
+        );
+        notify_ensure_failure(cfg, backend, *ensure_fail_streak, &detail);
+    } else {
+        *ensure_fail_streak = 0;
+    }
+    partial_failure
+}
+
 fn systemd_alert_decision(
     source: SystemdAlertSource,
     unit: &str,
@@ -759,18 +780,12 @@ fn main() -> Result<()> {
                     &cfg, backend,
                 ) {
                     Ok(outcome) => {
-                        let partial_failure = outcome.is_partial_failure();
-                        if partial_failure {
-                            ensure_fail_streak += 1;
-                            let detail = format!(
-                                "partial success: started {} of {} missing runner(s)",
-                                outcome.started.len(),
-                                outcome.missing
-                            );
-                            notify_ensure_failure(&cfg, backend, ensure_fail_streak, &detail);
-                        } else {
-                            ensure_fail_streak = 0;
-                        }
+                        apply_ensure_outcome_to_failure_streak(
+                            &cfg,
+                            backend,
+                            &mut ensure_fail_streak,
+                            &outcome,
+                        );
                         for name in outcome.started {
                             println!("respawned ephemeral runner {name}");
                         }
@@ -1072,6 +1087,46 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ezgha-main-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn serve_match_arm_counts_partial_ensure_success_as_failure_streak() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 99;
+        let backend = backend::Backend::Docker;
+        let mut ensure_fail_streak = 0;
+
+        let partial = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-org-runner-1".into()],
+            missing: 4,
+        };
+        let was_partial = apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend,
+            &mut ensure_fail_streak,
+            &partial,
+        );
+        assert!(was_partial);
+        assert_eq!(
+            ensure_fail_streak, 1,
+            "serve loop must keep the alert streak alive when ensure_count returns only a partial refill"
+        );
+
+        let recovered = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-org-runner-2".into(), "ez-org-runner-3".into()],
+            missing: 2,
+        };
+        let was_partial = apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend,
+            &mut ensure_fail_streak,
+            &recovered,
+        );
+        assert!(!was_partial);
+        assert_eq!(
+            ensure_fail_streak, 0,
+            "non-partial ensure_count success resets the serve alert streak"
+        );
     }
 
     #[test]

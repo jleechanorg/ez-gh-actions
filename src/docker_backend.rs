@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
@@ -26,8 +26,7 @@ const MANAGED_LABEL: &str = "ezgha=managed";
 const DISK_MEASURE_STRIKES: u32 = 2;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
-#[cfg(not(target_os = "linux"))]
-static LOADAVG_INERT_WARNING: Once = Once::new();
+static LOAD_GATE_DARK_WARNING: Once = Once::new();
 
 #[cfg(test)]
 static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
@@ -824,61 +823,65 @@ fn parse_loadavg_1m(raw: &str) -> Option<f64> {
     raw.split_whitespace().next()?.parse().ok()
 }
 
-fn read_host_loadavg_1m() -> Option<f64> {
+#[derive(Debug, Clone, PartialEq)]
+enum LoadGateSignal {
+    Available(f64),
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Unsupported(&'static str),
+    Unavailable(String),
+}
+
+fn read_host_loadavg_1m() -> LoadGateSignal {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_to_string("/proc/loadavg")
-            .ok()
-            .and_then(|raw| parse_loadavg_1m(&raw))
+        match std::fs::read_to_string("/proc/loadavg") {
+            Ok(raw) => parse_loadavg_1m(&raw).map_or_else(
+                || LoadGateSignal::Unavailable("could not parse /proc/loadavg".into()),
+                LoadGateSignal::Available,
+            ),
+            Err(err) => LoadGateSignal::Unavailable(format!("could not read /proc/loadavg: {err}")),
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        LOADAVG_INERT_WARNING.call_once(|| {
-            eprintln!(
-                "warning: host load-average respawn backoff is inert on this platform; fixed respawn pacing is the only cold-start safety mechanism in effect"
-            );
-        });
-        None
+        LoadGateSignal::Unsupported("host load average is unavailable on this platform")
     }
 }
 
-fn wait_for_respawn_load_window<Load, Sleep>(
-    cfg: &Config,
-    loadavg_1m: &mut Load,
-    sleep: &mut Sleep,
-) -> bool
-where
-    Load: FnMut() -> Option<f64>,
-    Sleep: FnMut(Duration),
-{
-    let threshold = cfg.runner.respawn_load_threshold;
-    let retry = Duration::from_secs(cfg.runner.respawn_load_retry_seconds);
-    let max_wait = Duration::from_secs(cfg.runner.respawn_load_max_wait_seconds);
-    let mut waited = Duration::ZERO;
-    let mut warned = false;
+fn notify_load_gate_dark_once(cfg: &Config, signal: &LoadGateSignal) {
+    let (severity, detail) = match signal {
+        LoadGateSignal::Available(_) => return,
+        LoadGateSignal::Unsupported(reason) => (Severity::Warning, (*reason).to_string()),
+        LoadGateSignal::Unavailable(reason) => (Severity::Critical, reason.clone()),
+    };
 
-    while let Some(load) = loadavg_1m() {
-        if load < threshold {
-            return false;
-        }
-        if waited >= max_wait {
-            eprintln!(
-                "warning: host 1-minute load average {load:.2} is still >= respawn threshold {threshold:.2} after {waited:?}; proceeding with one runner only"
-            );
-            return true;
-        }
-        if !warned {
-            eprintln!(
-                "warning: host 1-minute load average {load:.2} is >= respawn threshold {threshold:.2}; delaying runner respawn batch"
-            );
-            warned = true;
-        }
-        watchdog::ping();
-        sleep(retry);
-        watchdog::ping();
-        waited += retry;
+    LOAD_GATE_DARK_WARNING.call_once(|| {
+        eprintln!(
+            "warning: runner respawn load gate is unavailable ({detail}); falling back to one runner this ensure_count iteration"
+        );
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.respawn_load_gate_dark",
+            severity,
+            "Runner respawn load gate unavailable",
+            &format!(
+                "The respawn load gate is unavailable for {} ({detail}). \
+                 ezgha is falling back to one runner per ensure_count iteration until load feedback recovers.",
+                cfg.github.target
+            ),
+        );
+    });
+}
+
+fn allowed_respawn_starts_for_load(cfg: &Config, measured_load: f64, committed_starts: u32) -> u32 {
+    let effective_load =
+        measured_load + (committed_starts as f64 * cfg.runner.respawn_load_per_runner);
+    let headroom = cfg.runner.respawn_load_safety_ceiling - effective_load;
+    if headroom <= 0.0 {
+        return 0;
     }
-    false
+    ((headroom / cfg.runner.respawn_load_per_runner).floor() as u32)
+        .min(cfg.runner.respawn_batch_size)
 }
 
 fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
@@ -901,27 +904,70 @@ fn start_missing_runners_with<Start, Sleep, Load>(
 where
     Start: FnMut() -> Result<(String, String)>,
     Sleep: FnMut(Duration),
-    Load: FnMut() -> Option<f64>,
+    Load: FnMut() -> LoadGateSignal,
 {
     let mut started = Vec::new();
     let mut last_err = None;
-    let batch_size = cfg.runner.respawn_batch_size.max(1);
-    // Fixed pacing is the primary safety property: it must remain conservative
-    // even when loadavg feedback is absent or lagging. The load gate below is
-    // only a secondary brake and may shrink a timed-out batch to one runner.
-    let inter_batch_sleep = Duration::from_secs(cfg.runner.respawn_batch_sleep_seconds);
+    // Gate-primary safety model, derived from the 2026-07-07 incident docs:
+    // `/etc/watchdog.conf` reboots this host at max-load-1=24, and one cold
+    // 16-runner respawn burst was observed around loadavg 71. That gives
+    // 71 / 16 = 4.4375 load per cold runner, represented by the configurable
+    // default `respawn_load_per_runner = 4.4`. The live shared-host baseline
+    // observed during the mission was 9-15, so fixed v2 pacing alone was not
+    // safe: 15 + 17.32 simulated respawn load = 32.32 > 24. The load gate is
+    // therefore load-bearing. At each decision point we allow only:
+    // floor((safety_ceiling - (measured_load + committed_starts * per_runner))
+    //       / per_runner), clamped to respawn_batch_size. With the defaults,
+    // a dark gate falls back to exactly one runner per ensure_count iteration:
+    // 15 baseline + 4.4 = 19.4, below both the 20 soft ceiling and the 24
+    // watchdog ceiling. The 105s per-call budget is 3.5 serve-loop cadences:
+    // long enough for several 5s load rechecks, but bounded so queue_monitor
+    // and invariant_sampler run between incremental refill calls.
     let mut remaining = missing;
+    let retry = Duration::from_secs(cfg.runner.respawn_load_retry_seconds);
+    let budget = Duration::from_secs(cfg.runner.respawn_refill_time_budget_seconds);
+    let started_at = Instant::now();
+    let mut budget_spent = Duration::ZERO;
+    let mut high_load_warned = false;
 
     while remaining > 0 {
-        let load_timeout_forced_single =
-            wait_for_respawn_load_window(cfg, &mut loadavg_1m, &mut sleep);
-        let this_batch = if load_timeout_forced_single {
-            1
-        } else {
-            batch_size.min(remaining)
+        if started_at.elapsed().max(budget_spent) >= budget {
+            break;
+        }
+
+        let (this_batch, stop_after_batch) = match loadavg_1m() {
+            LoadGateSignal::Available(load) => {
+                let allowed =
+                    allowed_respawn_starts_for_load(cfg, load, started.len() as u32).min(remaining);
+                if allowed == 0 {
+                    if !high_load_warned {
+                        eprintln!(
+                            "warning: host 1-minute load average {load:.2} leaves no safe respawn headroom below ceiling {:.2}; delaying runner respawn",
+                            cfg.runner.respawn_load_safety_ceiling
+                        );
+                        high_load_warned = true;
+                    }
+                    if started_at.elapsed().max(budget_spent) + retry > budget {
+                        break;
+                    }
+                    watchdog::ping();
+                    sleep(retry);
+                    watchdog::ping();
+                    budget_spent += retry;
+                    continue;
+                }
+                (allowed, false)
+            }
+            signal @ (LoadGateSignal::Unsupported(_) | LoadGateSignal::Unavailable(_)) => {
+                notify_load_gate_dark_once(cfg, &signal);
+                (1.min(remaining), true)
+            }
         };
 
         for _ in 0..this_batch {
+            if started_at.elapsed().max(budget_spent) >= budget {
+                break;
+            }
             watchdog::ping();
             match start_runner() {
                 Ok((_, name)) => started.push(name),
@@ -930,12 +976,10 @@ where
                     last_err = Some(e);
                 }
             }
+            remaining -= 1;
         }
-        remaining -= this_batch;
-        if remaining > 0 {
-            watchdog::ping();
-            sleep(inter_batch_sleep);
-            watchdog::ping();
+        if stop_after_batch {
+            break;
         }
     }
 
@@ -1320,11 +1364,11 @@ mod tests {
     }
 
     #[test]
-    fn respawn_pacing_batches_start_calls_with_sleep_between_batches() {
+    fn respawn_gate_limits_start_calls_by_load_headroom() {
         let mut cfg = cfg_with(16, "ez-org-runner");
         cfg.runner.respawn_batch_size = 2;
-        cfg.runner.respawn_batch_sleep_seconds = 30;
-        cfg.runner.respawn_load_threshold = 12.0;
+        cfg.runner.respawn_load_safety_ceiling = 20.0;
+        cfg.runner.respawn_load_per_runner = 4.4;
         let events = RefCell::new(Vec::<String>::new());
         let mut seq = 0;
 
@@ -1341,24 +1385,12 @@ mod tests {
                     .borrow_mut()
                     .push(format!("sleep-{}", duration.as_secs()));
             },
-            || Some(0.0),
+            || LoadGateSignal::Available(15.0),
         )
         .unwrap();
 
-        assert_eq!(started.len(), 16);
+        assert_eq!(started.len(), 1);
         let events = events.borrow();
-        let sleeps: Vec<_> = events
-            .iter()
-            .filter(|e| e.starts_with("sleep-"))
-            .map(|e| e.as_str())
-            .collect();
-        assert_eq!(
-            sleeps,
-            vec![
-                "sleep-30", "sleep-30", "sleep-30", "sleep-30", "sleep-30", "sleep-30", "sleep-30"
-            ],
-            "16 starts with batch_size=2 must pause between the 8 batches"
-        );
         let max_consecutive_starts = events
             .split(|event| event.starts_with("sleep-"))
             .map(|chunk| {
@@ -1370,8 +1402,8 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert_eq!(
-            max_consecutive_starts, 2,
-            "start calls must be bounded by respawn_batch_size instead of firing all 16 back-to-back; events={events:?}"
+            max_consecutive_starts, 1,
+            "15.0 baseline leaves floor((20.0 - 15.0) / 4.4) = 1 safe start; events={events:?}"
         );
     }
 
@@ -1426,10 +1458,49 @@ mod tests {
         }
     }
 
-    fn simulated_peak_load_for_schedule(batch_size: u32, batch_sleep_secs: u64) -> f64 {
+    fn simulated_peak_for_fixed_schedule(batch_size: u32, batch_sleep_secs: u64) -> f64 {
+        let mut sim = LaggingLoadSim::new();
+        let mut remaining = 16;
+        while remaining > 0 {
+            let this_batch = batch_size.min(remaining);
+            for _ in 0..this_batch {
+                sim.record_start();
+            }
+            remaining -= this_batch;
+            if remaining > 0 {
+                sim.advance(Duration::from_secs(batch_sleep_secs));
+            }
+        }
+        sim.advance(Duration::from_secs(180));
+        sim.peak_ema_1m
+    }
+
+    #[test]
+    fn fixed_respawn_schedule_without_load_gate_breaches_watchdog_with_busy_host_baseline() {
+        const BUSY_HOST_BASELINE_LOAD: f64 = 15.0;
+        const WATCHDOG_LOAD_CEILING: f64 = 24.0;
+
+        let new_peak = simulated_peak_for_fixed_schedule(
+            crate::config::default_respawn_batch_size(),
+            crate::config::default_respawn_batch_sleep_seconds(),
+        );
+        let total_peak = BUSY_HOST_BASELINE_LOAD + new_peak;
+        assert!(
+            total_peak > WATCHDOG_LOAD_CEILING,
+            "v2's fixed 2/30 schedule is not a standalone safety property on this host: 15.0 baseline + {new_peak:.2} respawn load = {total_peak:.2}, above watchdog ceiling {WATCHDOG_LOAD_CEILING}"
+        );
+    }
+
+    #[test]
+    fn gate_active_incremental_refill_stays_below_watchdog_with_busy_host_baseline() {
+        const BUSY_HOST_BASELINE_LOAD: f64 = 15.0;
+        const WATCHDOG_LOAD_CEILING: f64 = 24.0;
         let mut cfg = cfg_with(16, "ez-org-runner");
-        cfg.runner.respawn_batch_size = batch_size;
-        cfg.runner.respawn_batch_sleep_seconds = batch_sleep_secs;
+        cfg.runner.respawn_batch_size = 2;
+        cfg.runner.respawn_load_safety_ceiling = 20.0;
+        cfg.runner.respawn_load_per_runner = 4.4;
+        cfg.runner.respawn_load_retry_seconds = 5;
+        cfg.runner.respawn_refill_time_budget_seconds = 105;
         let sim = RefCell::new(LaggingLoadSim::new());
         let mut seq = 0;
 
@@ -1442,83 +1513,38 @@ mod tests {
                 Ok((format!("container-{seq}"), format!("runner-{seq}")))
             },
             |duration| sim.borrow_mut().advance(duration),
-            || None,
+            || LoadGateSignal::Available(BUSY_HOST_BASELINE_LOAD + sim.borrow().ema_1m),
         )
         .unwrap();
-        assert_eq!(started.len(), 16);
 
         sim.borrow_mut().advance(Duration::from_secs(180));
-        let peak = sim.borrow().peak_ema_1m;
-        peak
-    }
-
-    #[test]
-    fn fixed_respawn_schedule_is_safe_without_load_feedback() {
-        const SAFETY_LOAD_CEILING: f64 = 20.0;
-
-        let old_peak = simulated_peak_load_for_schedule(4, 5);
-        assert!(
-            old_peak > SAFETY_LOAD_CEILING,
-            "old 4/5s defaults should breach the simulated safety ceiling so this regression test proves the original critical finding; peak={old_peak:.2}"
-        );
-
-        let new_peak = simulated_peak_load_for_schedule(
-            crate::config::default_respawn_batch_size(),
-            crate::config::default_respawn_batch_sleep_seconds(),
-        );
-        assert!(
-            new_peak < SAFETY_LOAD_CEILING,
-            "new defaults must stay below safety ceiling without any load feedback; peak={new_peak:.2}"
-        );
-    }
-
-    #[test]
-    fn respawn_load_backoff_is_bounded_and_then_proceeds() {
-        let mut cfg = cfg_with(1, "ez-org-runner");
-        cfg.runner.respawn_batch_size = 4;
-        cfg.runner.respawn_load_threshold = 12.0;
-        cfg.runner.respawn_load_retry_seconds = 5;
-        cfg.runner.respawn_load_max_wait_seconds = 10;
-        let events = RefCell::new(Vec::<String>::new());
-
-        let started = start_missing_runners_with(
-            &cfg,
-            1,
-            || {
-                events.borrow_mut().push("start".into());
-                Ok(("container".into(), "runner".into()))
-            },
-            |duration| {
-                events
-                    .borrow_mut()
-                    .push(format!("sleep-{}", duration.as_secs()));
-            },
-            || Some(20.0),
-        )
-        .unwrap();
-
-        assert_eq!(started, vec!["runner"]);
+        let respawn_peak = sim.borrow().peak_ema_1m;
+        let total_peak = BUSY_HOST_BASELINE_LOAD + respawn_peak;
         assert_eq!(
-            events.borrow().as_slice(),
-            ["sleep-5", "sleep-5", "start"],
-            "high load should delay only up to respawn_load_max_wait_seconds, then spawn"
+            started.len(),
+            1,
+            "15.0 baseline leaves room for one 4.4-load start per 105s ensure_count budget"
+        );
+        assert!(
+            total_peak < WATCHDOG_LOAD_CEILING,
+            "gate-active path must include the host baseline in its safety proof: 15.0 + {respawn_peak:.2} = {total_peak:.2}, below watchdog ceiling {WATCHDOG_LOAD_CEILING}"
         );
     }
 
     #[test]
-    fn respawn_load_timeout_proceeds_with_single_runner_batches() {
-        let mut cfg = cfg_with(4, "ez-org-runner");
+    fn gate_dark_fallback_starts_one_runner_and_stays_below_watchdog_with_busy_host_baseline() {
+        const BUSY_HOST_BASELINE_LOAD: f64 = 15.0;
+        const WATCHDOG_LOAD_CEILING: f64 = 24.0;
+        const INCIDENT_LOAD_PER_RUNNER: f64 = 71.0 / 16.0;
+        let mut cfg = cfg_with(16, "ez-org-runner");
         cfg.runner.respawn_batch_size = 4;
-        cfg.runner.respawn_batch_sleep_seconds = 30;
-        cfg.runner.respawn_load_threshold = 12.0;
-        cfg.runner.respawn_load_retry_seconds = 5;
-        cfg.runner.respawn_load_max_wait_seconds = 10;
+        cfg.runner.respawn_load_per_runner = 4.4;
         let events = RefCell::new(Vec::<String>::new());
         let mut seq = 0;
 
         let started = start_missing_runners_with(
             &cfg,
-            4,
+            16,
             || {
                 seq += 1;
                 events.borrow_mut().push(format!("start-{seq}"));
@@ -1529,25 +1555,20 @@ mod tests {
                     .borrow_mut()
                     .push(format!("sleep-{}", duration.as_secs()));
             },
-            || Some(20.0),
+            || LoadGateSignal::Unavailable("forced test loadavg read failure".into()),
         )
         .unwrap();
 
-        assert_eq!(started.len(), 4);
-        let events = events.borrow();
-        let max_consecutive_starts = events
-            .split(|event| event.starts_with("sleep-"))
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .filter(|event| event.starts_with("start-"))
-                    .count()
-            })
-            .max()
-            .unwrap_or(0);
         assert_eq!(
-            max_consecutive_starts, 1,
-            "timed-out high-load backoff must degrade to one runner per batch; events={events:?}"
+            started.len(),
+            1,
+            "dark load gate must not fall back to the old permissive full refill"
+        );
+        assert_eq!(events.borrow().as_slice(), ["start-1"]);
+        let fallback_total = BUSY_HOST_BASELINE_LOAD + INCIDENT_LOAD_PER_RUNNER;
+        assert!(
+            fallback_total < WATCHDOG_LOAD_CEILING,
+            "dark-gate fallback proof: 15.0 baseline + 71/16 ({INCIDENT_LOAD_PER_RUNNER:.4}) = {fallback_total:.4}, below watchdog ceiling {WATCHDOG_LOAD_CEILING}"
         );
     }
 
@@ -1556,7 +1577,7 @@ mod tests {
         let _env = TestEnv::new("ensure_count_wiring");
         let mut cfg = cfg_with(5, "ez-org-runner");
         cfg.runner.respawn_batch_size = 2;
-        cfg.runner.respawn_load_threshold = 999.0;
+        cfg.runner.respawn_load_safety_ceiling = 999.0;
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
@@ -1591,7 +1612,7 @@ mod tests {
         let _env = TestEnv::new("ensure_count_partial");
         let mut cfg = cfg_with(4, "ez-org-runner");
         cfg.runner.respawn_batch_size = 4;
-        cfg.runner.respawn_load_threshold = 999.0;
+        cfg.runner.respawn_load_safety_ceiling = 999.0;
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
