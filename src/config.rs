@@ -245,11 +245,11 @@ fn default_runner_name_prefix() -> String {
 }
 
 pub fn default_respawn_batch_size() -> u32 {
-    4
+    2
 }
 
 pub fn default_respawn_batch_sleep_seconds() -> u64 {
-    5
+    30
 }
 
 pub fn default_respawn_load_threshold() -> f64 {
@@ -695,8 +695,8 @@ mod tests {
         assert_eq!(tiny.canary.ref_name, "main");
         assert_eq!(tiny.canary.slo_start_seconds, 90);
         assert_eq!(tiny.canary.check_interval_seconds, 600);
-        assert_eq!(tiny.runner.respawn_batch_size, 4);
-        assert_eq!(tiny.runner.respawn_batch_sleep_seconds, 5);
+        assert_eq!(tiny.runner.respawn_batch_size, 2);
+        assert_eq!(tiny.runner.respawn_batch_sleep_seconds, 30);
         assert_eq!(tiny.runner.respawn_load_threshold, 12.0);
         assert_eq!(tiny.runner.respawn_load_retry_seconds, 5);
         assert_eq!(tiny.runner.respawn_load_max_wait_seconds, 60);

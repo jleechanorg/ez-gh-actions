@@ -26,6 +26,16 @@ const MANAGED_LABEL: &str = "ezgha=managed";
 const DISK_MEASURE_STRIKES: u32 = 2;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(not(target_os = "linux"))]
+static LOADAVG_INERT_WARNING: Once = Once::new();
+
+#[cfg(test)]
+static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 /// Env var that overrides the slot assignments file path. Used by tests to
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
@@ -254,6 +264,11 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
 ///
 /// Returns the number of slots reclaimed.
 pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
+    #[cfg(test)]
+    if let Some(reclaimed) = *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() {
+        return Ok(reclaimed);
+    }
+
     watchdog::ping();
     // CRITICAL: reconcile ONLY against an authoritative runner list. If the
     // GitHub API call fails (network blip, rate limit, expired token), an
@@ -566,6 +581,18 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
 
 /// Start one ephemeral JIT runner container. Returns (container_id, runner_name).
 pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
+    #[cfg(test)]
+    {
+        let mut hook = TEST_START_ONE_NAMES.lock().unwrap();
+        if let Some(names) = hook.as_mut() {
+            if names.is_empty() {
+                bail!("test start_one hook exhausted");
+            }
+            let name = names.remove(0);
+            return Ok((format!("container-{name}"), name));
+        }
+    }
+
     start_one_with_generate(cfg, backend, github::generate_jitconfig)
 }
 
@@ -647,7 +674,7 @@ fn start_one_with_generate(
     Ok((container_id, runner_name))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ManagedContainer {
     #[serde(rename = "ID")]
     pub id: String,
@@ -659,7 +686,16 @@ pub struct ManagedContainer {
     pub running_for: String,
 }
 
+#[cfg(test)]
+static TEST_MANAGED_CONTAINERS: std::sync::Mutex<Option<Vec<ManagedContainer>>> =
+    std::sync::Mutex::new(None);
+
 pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+    #[cfg(test)]
+    if let Some(containers) = TEST_MANAGED_CONTAINERS.lock().unwrap().clone() {
+        return Ok(containers);
+    }
+
     let mut cmd = Command::new("docker");
     cmd.args([
         "ps",
@@ -763,6 +799,11 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
 /// this is the disk runner jobs will actually fill. A host-side `df` would
 /// read the wrong filesystem whenever the daemon is a VM (Colima/Lima/Desktop).
 pub fn free_disk_gb(image: &str) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = *TEST_FREE_DISK_GB.lock().unwrap() {
+        return free;
+    }
+
     let mut cmd = Command::new("docker");
     cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
     let out = run_docker(cmd, "measuring docker daemon free disk")
@@ -792,11 +833,20 @@ fn read_host_loadavg_1m() -> Option<f64> {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        LOADAVG_INERT_WARNING.call_once(|| {
+            eprintln!(
+                "warning: host load-average respawn backoff is inert on this platform; fixed respawn pacing is the only cold-start safety mechanism in effect"
+            );
+        });
         None
     }
 }
 
-fn wait_for_respawn_load_window<Load, Sleep>(cfg: &Config, loadavg_1m: &mut Load, sleep: &mut Sleep)
+fn wait_for_respawn_load_window<Load, Sleep>(
+    cfg: &Config,
+    loadavg_1m: &mut Load,
+    sleep: &mut Sleep,
+) -> bool
 where
     Load: FnMut() -> Option<f64>,
     Sleep: FnMut(Duration),
@@ -809,13 +859,13 @@ where
 
     while let Some(load) = loadavg_1m() {
         if load < threshold {
-            return;
+            return false;
         }
         if waited >= max_wait {
             eprintln!(
-                "warning: host 1-minute load average {load:.2} is still >= respawn threshold {threshold:.2} after {waited:?}; proceeding with next runner batch"
+                "warning: host 1-minute load average {load:.2} is still >= respawn threshold {threshold:.2} after {waited:?}; proceeding with one runner only"
             );
-            return;
+            return true;
         }
         if !warned {
             eprintln!(
@@ -828,6 +878,7 @@ where
         watchdog::ping();
         waited += retry;
     }
+    false
 }
 
 fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
@@ -855,29 +906,33 @@ where
     let mut started = Vec::new();
     let mut last_err = None;
     let batch_size = cfg.runner.respawn_batch_size.max(1);
-    // Four-at-a-time with a five-second pause is intentionally conservative:
-    // the incident burst was 16 cold starts back-to-back, and the real
-    // watchdog ceiling is loadavg 24. A threshold of 12 and a short inter-batch
-    // pause give already-started containers time to absorb their CPU-heavy
-    // startup work before we add more pressure, while the bounded wait below
-    // keeps this as pacing rather than a hard capacity circuit breaker.
+    // Fixed pacing is the primary safety property: it must remain conservative
+    // even when loadavg feedback is absent or lagging. The load gate below is
+    // only a secondary brake and may shrink a timed-out batch to one runner.
     let inter_batch_sleep = Duration::from_secs(cfg.runner.respawn_batch_sleep_seconds);
+    let mut remaining = missing;
 
-    for i in 0..missing {
-        if i % batch_size == 0 {
+    while remaining > 0 {
+        let load_timeout_forced_single =
             wait_for_respawn_load_window(cfg, &mut loadavg_1m, &mut sleep);
-        }
-        watchdog::ping();
-        match start_runner() {
-            Ok((_, name)) => started.push(name),
-            Err(e) => {
-                eprintln!("warning: failed to start runner: {e:#}");
-                last_err = Some(e);
+        let this_batch = if load_timeout_forced_single {
+            1
+        } else {
+            batch_size.min(remaining)
+        };
+
+        for _ in 0..this_batch {
+            watchdog::ping();
+            match start_runner() {
+                Ok((_, name)) => started.push(name),
+                Err(e) => {
+                    eprintln!("warning: failed to start runner: {e:#}");
+                    last_err = Some(e);
+                }
             }
         }
-        let batch_finished = (i + 1) % batch_size == 0;
-        let more_to_start = i + 1 < missing;
-        if batch_finished && more_to_start {
+        remaining -= this_batch;
+        if remaining > 0 {
             watchdog::ping();
             sleep(inter_batch_sleep);
             watchdog::ping();
@@ -892,11 +947,27 @@ where
     Ok(started)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsureCountOutcome {
+    pub started: Vec<String>,
+    pub missing: u32,
+}
+
+impl EnsureCountOutcome {
+    pub fn is_partial_failure(&self) -> bool {
+        (self.started.len() as u32) * 2 < self.missing
+    }
+}
+
 /// Ensure `count` managed runner containers are alive; start the shortfall.
 /// Refuses to spawn when the daemon's disk is below the configured floor —
 /// disk exhaustion is the dominant self-hosted runner failure mode, and
 /// spawning more work onto a full disk makes the incident worse.
 pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
+    Ok(ensure_count_outcome(cfg, backend)?.started)
+}
+
+pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
     // Reconcile stale slot assignments before we look at container counts:
     // a daemon crash between `next_slot` and the container coming up leaves a
     // reservation that would otherwise wedge `next_slot` forever ("all N
@@ -909,7 +980,10 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     let containers = managed_containers()?;
     let alive = count_current_prefix_containers(&containers, cfg);
     if alive >= cfg.runner.count {
-        return Ok(Vec::new());
+        return Ok(EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 0,
+        });
     }
     match free_disk_gb(&cfg.runner.image) {
         Some(free) if free < cfg.limits.min_free_disk_gb => {
@@ -959,11 +1033,23 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
             );
         }
     }
-    let started = start_missing_runners(cfg, backend, cfg.runner.count - alive);
+    let missing = cfg.runner.count - alive;
+    let started = start_missing_runners(cfg, backend, missing);
     // Release any failed reservations from this cycle
     let _ = release_stale_slots(cfg);
 
-    Ok(started?)
+    let outcome = EnsureCountOutcome {
+        started: started?,
+        missing,
+    };
+    if outcome.is_partial_failure() {
+        eprintln!(
+            "warning: ensure_count started only {} of {} missing runner(s); treating as partial failure for alert streak accounting",
+            outcome.started.len(),
+            outcome.missing
+        );
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1040,6 +1126,10 @@ mod tests {
     impl Drop for TestEnv {
         fn drop(&mut self) {
             *TEST_SLOT_PATH.lock().unwrap() = None;
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
+            *TEST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
+            *TEST_START_ONE_NAMES.lock().unwrap() = None;
             let _ = std::fs::remove_file(&self.path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
@@ -1232,8 +1322,8 @@ mod tests {
     #[test]
     fn respawn_pacing_batches_start_calls_with_sleep_between_batches() {
         let mut cfg = cfg_with(16, "ez-org-runner");
-        cfg.runner.respawn_batch_size = 4;
-        cfg.runner.respawn_batch_sleep_seconds = 5;
+        cfg.runner.respawn_batch_size = 2;
+        cfg.runner.respawn_batch_sleep_seconds = 30;
         cfg.runner.respawn_load_threshold = 12.0;
         let events = RefCell::new(Vec::<String>::new());
         let mut seq = 0;
@@ -1264,8 +1354,10 @@ mod tests {
             .collect();
         assert_eq!(
             sleeps,
-            vec!["sleep-5", "sleep-5", "sleep-5"],
-            "16 starts with batch_size=4 must pause between the 4 batches"
+            vec![
+                "sleep-30", "sleep-30", "sleep-30", "sleep-30", "sleep-30", "sleep-30", "sleep-30"
+            ],
+            "16 starts with batch_size=2 must pause between the 8 batches"
         );
         let max_consecutive_starts = events
             .split(|event| event.starts_with("sleep-"))
@@ -1278,8 +1370,105 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert_eq!(
-            max_consecutive_starts, 4,
+            max_consecutive_starts, 2,
             "start calls must be bounded by respawn_batch_size instead of firing all 16 back-to-back; events={events:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct LaggingLoadSim {
+        now_secs: u64,
+        starts: Vec<u64>,
+        ema_1m: f64,
+        peak_ema_1m: f64,
+    }
+
+    impl LaggingLoadSim {
+        fn new() -> Self {
+            Self {
+                now_secs: 0,
+                starts: Vec::new(),
+                ema_1m: 0.0,
+                peak_ema_1m: 0.0,
+            }
+        }
+
+        fn record_start(&mut self) {
+            self.starts.push(self.now_secs);
+        }
+
+        fn advance(&mut self, duration: Duration) {
+            let mut remaining = duration.as_secs();
+            while remaining > 0 {
+                let step = remaining.min(5);
+                let active = self.true_startup_load();
+                // Linux loadavg is updated every 5 seconds as an exponential
+                // moving average. This test uses the continuous equivalent
+                // exp(-dt/60s) for the 1-minute average and models each cold
+                // runner start as contributing 71/16 load units for 60 seconds,
+                // based on the documented loadavg-71 / 16-runner incident.
+                let decay = (-(step as f64) / 60.0).exp();
+                self.ema_1m = self.ema_1m * decay + active * (1.0 - decay);
+                self.now_secs += step;
+                self.peak_ema_1m = self.peak_ema_1m.max(self.ema_1m);
+                remaining -= step;
+            }
+        }
+
+        fn true_startup_load(&self) -> f64 {
+            const RUNNER_START_LOAD: f64 = 71.0 / 16.0;
+            let active = self
+                .starts
+                .iter()
+                .filter(|started_at| self.now_secs.saturating_sub(**started_at) < 60)
+                .count();
+            active as f64 * RUNNER_START_LOAD
+        }
+    }
+
+    fn simulated_peak_load_for_schedule(batch_size: u32, batch_sleep_secs: u64) -> f64 {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.respawn_batch_size = batch_size;
+        cfg.runner.respawn_batch_sleep_seconds = batch_sleep_secs;
+        let sim = RefCell::new(LaggingLoadSim::new());
+        let mut seq = 0;
+
+        let started = start_missing_runners_with(
+            &cfg,
+            16,
+            || {
+                seq += 1;
+                sim.borrow_mut().record_start();
+                Ok((format!("container-{seq}"), format!("runner-{seq}")))
+            },
+            |duration| sim.borrow_mut().advance(duration),
+            || None,
+        )
+        .unwrap();
+        assert_eq!(started.len(), 16);
+
+        sim.borrow_mut().advance(Duration::from_secs(180));
+        let peak = sim.borrow().peak_ema_1m;
+        peak
+    }
+
+    #[test]
+    fn fixed_respawn_schedule_is_safe_without_load_feedback() {
+        const SAFETY_LOAD_CEILING: f64 = 20.0;
+
+        let old_peak = simulated_peak_load_for_schedule(4, 5);
+        assert!(
+            old_peak > SAFETY_LOAD_CEILING,
+            "old 4/5s defaults should breach the simulated safety ceiling so this regression test proves the original critical finding; peak={old_peak:.2}"
+        );
+
+        let new_peak = simulated_peak_load_for_schedule(
+            crate::config::default_respawn_batch_size(),
+            crate::config::default_respawn_batch_sleep_seconds(),
+        );
+        assert!(
+            new_peak < SAFETY_LOAD_CEILING,
+            "new defaults must stay below safety ceiling without any load feedback; peak={new_peak:.2}"
         );
     }
 
@@ -1313,6 +1502,108 @@ mod tests {
             events.borrow().as_slice(),
             ["sleep-5", "sleep-5", "start"],
             "high load should delay only up to respawn_load_max_wait_seconds, then spawn"
+        );
+    }
+
+    #[test]
+    fn respawn_load_timeout_proceeds_with_single_runner_batches() {
+        let mut cfg = cfg_with(4, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 4;
+        cfg.runner.respawn_batch_sleep_seconds = 30;
+        cfg.runner.respawn_load_threshold = 12.0;
+        cfg.runner.respawn_load_retry_seconds = 5;
+        cfg.runner.respawn_load_max_wait_seconds = 10;
+        let events = RefCell::new(Vec::<String>::new());
+        let mut seq = 0;
+
+        let started = start_missing_runners_with(
+            &cfg,
+            4,
+            || {
+                seq += 1;
+                events.borrow_mut().push(format!("start-{seq}"));
+                Ok((format!("container-{seq}"), format!("runner-{seq}")))
+            },
+            |duration| {
+                events
+                    .borrow_mut()
+                    .push(format!("sleep-{}", duration.as_secs()));
+            },
+            || Some(20.0),
+        )
+        .unwrap();
+
+        assert_eq!(started.len(), 4);
+        let events = events.borrow();
+        let max_consecutive_starts = events
+            .split(|event| event.starts_with("sleep-"))
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .filter(|event| event.starts_with("start-"))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_consecutive_starts, 1,
+            "timed-out high-load backoff must degrade to one runner per batch; events={events:?}"
+        );
+    }
+
+    #[test]
+    fn ensure_count_real_wiring_computes_missing_before_start_missing() {
+        let _env = TestEnv::new("ensure_count_wiring");
+        let mut cfg = cfg_with(5, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 2;
+        cfg.runner.respawn_load_threshold = 999.0;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
+            managed_container("ez-org-runner-1"),
+            managed_container("ez-org-runner-2"),
+            managed_container("ez-org-runner-3"),
+            managed_container("ez-canary-runner-1"),
+        ]);
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
+
+        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            started,
+            vec!["ez-org-runner-4", "ez-org-runner-5"],
+            "ensure_count must compute missing=count-alive using only current-prefix containers"
+        );
+        assert!(
+            TEST_START_ONE_NAMES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "real start_missing_runners path should consume exactly two start_one calls"
+        );
+    }
+
+    #[test]
+    fn ensure_count_outcome_flags_fewer_than_half_started() {
+        let _env = TestEnv::new("ensure_count_partial");
+        let mut cfg = cfg_with(4, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 4;
+        cfg.runner.respawn_load_threshold = 999.0;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.missing, 4);
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert!(
+            outcome.is_partial_failure(),
+            "one successful start out of four missing runners is fewer than half and must keep the serve alert streak alive"
         );
     }
 
