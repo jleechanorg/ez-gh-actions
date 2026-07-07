@@ -7,32 +7,38 @@ Rolling operational notes for the `ezgha` self-hosted runner daemon.
 Source: docs/goal-gap-review-20260706.md (53-agent adversarial review, 45 findings, 0 refuted;
 scorecard: hardened 5/10, self-healing 4/10, throughput 4/10, trimming 1/10, alerting 0/10)
 plus docs/innovation-canary-slo-20260706.md. Track live status with `br list --status open`.
+Reordered 2026-07-06 (late eve) per external cold review: k4h promoted (don't build green
+features on dishonest gates), ozk/9yt precede exit-after-N escalation (restart-storm risk),
+juv reframed as a reusable run↔job↔runner correlation layer. Stale beads audited: 5rz closed
+(Rust pagination fixed at github.rs:226), gdy closed (init capacity bail at main.rs:190-210),
+jleechan-5rv downgraded P0→P2 (watchdog landed; residual suspicion is the bxy slot leak).
 
-**Phase 1 — stop the bleeding (S each)**
+**Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
-2. `bxy` (P2) — release_slot on JIT failure + quarantine corrupt slot_assignments.toml (two documented manual-recovery wedges)
-3. Docker CLI timeout wrapper on all `Command::output()` calls (github.rs:18-72 pattern) — permanent-hang mode on macOS, watchdog churn on Linux
-4. `twp` (P2) — regression test: list_runners Err must not mutate slot file (EXIT-CRITERIA's "single most important regression test")
-5. `n5p` (P2) — build.rs: fail loudly / append `-dirty` instead of silently embedding "unknown" (Gate 0 provenance)
+2. `bxy` (P2) — release_slot on JIT failure (start_one leaks reservation at docker_backend.rs error path) + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)
+3. `k4h` (P1, promoted) — verify-exit-criteria.sh honesty: Gate 7 rubber stamp (:225-232 computes MONITOR_TASKS/CRON_SCHED, never inspects them), "ALL AUTO GATES PASS" at :245 while Gates 5/6/8 silently absent, Gate 3 missing --paginate --slurp + empty-input arithmetic
+4. Docker CLI timeout wrapper on all `Command::output()` calls (github.rs:18-72 pattern) — permanent-hang mode on macOS, watchdog churn on Linux
+5. `twp` (P2) — regression test: list_runners Err must not mutate slot file (EXIT-CRITERIA's "single most important regression test")
+6. `n5p` (P2) — build.rs: fail loudly / append `-dirty` instead of silently embedding "unknown" (Gate 0 provenance)
 
-**Phase 2 — real self-healing + eyes (S–M)**
-6. `zmk` (P1) — Slack webhook + email alerting module; Goal 5 is 0/10, every other gap fails silently without this
-7. `9yt` (P1) — Colima/Lima VM auto-restart on backend failure (cooldown + attempt cap); the 4h crash-loop class from 2026-07-06 incident A
-8. `juv` (P1) — end-to-end canary workflow + SLO alert + deep-reconcile trigger (/innovate pick; universal ground-truth sensor)
-9. `qbl` (P2) — zombie-runner reaper; MUST cancel the stuck run first, then delete registration (HTTP 422 lock, incident C)
-10. Degraded-state escalation: consecutive-failure counter → sd_notify STATUS → exit-after-N so systemd machinery engages
+**Phase 2 — eyes, then self-healing (S–M)**
+7. `zmk` (P1) — minimal Slack-webhook alert contract first; Goal 5 is 0/10 and a silent canary is just telemetry
+8. `ozk` (P3→with this phase) — 403/429 detection + exponential backoff in run_gh; REQUIRED before any exit-after-N escalation (otherwise degraded-state restarts recreate incident-A restart storms against the API)
+9. `9yt` (P1) — Colima/Lima VM auto-restart on backend failure (cooldown + attempt cap); the 4h crash-loop class from incident A
+10. `juv` (P1) — build as a reusable GitHub run↔job↔runner correlation layer; canary dispatch + SLO alert is its first consumer
+11. Degraded-state escalation (consecutive-failure counter → sd_notify STATUS → exit-after-N) — only after ozk + 9yt bound the restart loop
 
-**Phase 3 — harness honesty (M)**
-11. `k4h` (P2) — verify-exit-criteria.sh: implement Gate 6, real Gate 7, fix Gate 3 empty-input/--slurp bugs; stop printing "ALL AUTO GATES PASS" while skipping gates
-12. `2ik` (P3) — commit or delete external ~/.local/bin/ezgha-fleet-watchdog.sh (Gate 7 committed-config rule)
-
-**Phase 4 — Goal 4 + remaining throughput (M–L)**
-13. `ftw` (P3) — max-job-duration config + cancel enforcement (first actual Goal 4 code; reuses juv's run↔runner correlation)
+**Phase 3 — reap + trim on the correlation layer (M–L)**
+12. `qbl` (P2) — zombie-runner reaper on juv's layer; MUST cancel the stuck run first, then delete registration (HTTP 422 lock, incident C)
+13. `ftw` (P3) — max-job-duration config + cancel enforcement (first actual Goal 4 code; same layer)
 14. `len` (P3) — queued-job starvation detection (integrate scripts/queue-health.sh into daemon + alert)
-15. `ozk` (P3) — 403/429 detection + exponential backoff in run_gh
-16. `5rz`/`1fu`/`gdy`/`zkn`/`zyb` — pagination >100, hostname-scoped dereg residual, init count clamp, runner_group_id config, minor review gaps
 
-**Cross-host (Mac)**: jleechan-5rv (P0 ensure_count wedge), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
+**Phase 4 — hygiene tail**
+15. `2ik` (P3) — commit or delete external ~/.local/bin/ezgha-fleet-watchdog.sh (Gate 7 committed-config rule)
+16. `1fu`/`zkn`/`zyb` — hostname-scoped dereg residual, runner_group_id config, minor review gaps
+17. Add `.claude/hooks/git-header.sh` or drop the footer convention for this repo (hook referenced by global CLAUDE.md is absent here)
+
+**Cross-host (Mac)**: jleechan-5rv (P2, re-test after new binary + bxy), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
 
 ## Recent activity (rolling)
 
