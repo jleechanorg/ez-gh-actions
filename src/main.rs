@@ -127,6 +127,7 @@ fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
 fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::Backend> {
     let deadline = Instant::now() + timeout;
     let retry_interval = Duration::from_secs(5);
+    let mut recovery = BackendRecoveryState::new();
     loop {
         let plat = platform::detect();
         match backend::select(&plat, cfg.policy.minimum_isolation) {
@@ -157,6 +158,13 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                 if remaining.is_zero() {
                     // Exhausted budget — surface the same rich diagnostic as choose_backend.
                     return choose_backend(cfg);
+                }
+                if maybe_restart_backend(cfg, &mut recovery) {
+                    eprintln!(
+                        "backend restart attempted while waiting for service readiness; retrying quickly"
+                    );
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
                 let wait = retry_interval.min(remaining);
                 eprintln!(
@@ -261,15 +269,16 @@ fn attempt_backend_restart() -> Result<bool> {
     Ok(false)
 }
 
-fn should_attempt_backend_restart(backend: &backend::Backend) -> bool {
-    matches!(
-        backend,
-        backend::Backend::Docker | backend::Backend::DockerSysbox
-    ) && !platform::detect().docker_ok
-}
-
-fn maybe_restart_backend(backend: &backend::Backend, recovery: &mut BackendRecoveryState) -> bool {
-    if !should_attempt_backend_restart(backend) {
+fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoveryState) -> bool {
+    let backend = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
+    let selected = match backend {
+        Selection::Chosen { backend, .. } => Some(backend),
+        _ => None,
+    };
+    if !matches!(
+        selected,
+        Some(backend::Backend::Docker | backend::Backend::DockerSysbox)
+    ) {
         return false;
     }
     if !recovery.allow_restart() {
@@ -453,7 +462,7 @@ fn main() -> Result<()> {
                     }
                     Err(e) => {
                         eprintln!("ensure_count failed (will retry): {e:#}");
-                        if maybe_restart_backend(&backend, &mut backend_recovery) {
+                        if maybe_restart_backend(&cfg, &mut backend_recovery) {
                             Duration::from_secs(8)
                         } else {
                             Duration::from_secs(30)
