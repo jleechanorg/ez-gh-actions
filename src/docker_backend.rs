@@ -884,7 +884,11 @@ fn allowed_respawn_starts_for_load(cfg: &Config, measured_load: f64, committed_s
         .min(cfg.runner.respawn_batch_size)
 }
 
-fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
+fn start_missing_runners(
+    cfg: &Config,
+    backend: Backend,
+    missing: u32,
+) -> Result<(Vec<String>, u32)> {
     start_missing_runners_with(
         cfg,
         missing,
@@ -900,13 +904,22 @@ fn start_missing_runners_with<Start, Sleep, Load>(
     mut start_runner: Start,
     mut sleep: Sleep,
     mut loadavg_1m: Load,
-) -> Result<Vec<String>>
+) -> Result<(Vec<String>, u32)>
 where
     Start: FnMut() -> Result<(String, String)>,
     Sleep: FnMut(Duration),
     Load: FnMut() -> LoadGateSignal,
 {
     let mut started = Vec::new();
+    // Count of actual `start_runner()` invocations this call. This is NOT
+    // `missing`: the gate-primary pacing (load headroom / batch size / time
+    // budget) intentionally caps how many starts we ATTEMPT per iteration, so
+    // a cold-start recovery legitimately attempts far fewer than `missing`.
+    // `is_partial_failure` compares started-vs-attempted so that intentional
+    // throttling is not mistaken for start failures (which would fire false
+    // Critical alerts during exactly the disaster-recovery this pacing exists
+    // to handle safely).
+    let mut attempted = 0u32;
     let mut last_err = None;
     // Gate-primary safety model, derived from the 2026-07-07 incident docs:
     // `/etc/watchdog.conf` reboots this host at max-load-1=24, and one cold
@@ -969,6 +982,7 @@ where
                 break;
             }
             watchdog::ping();
+            attempted += 1;
             match start_runner() {
                 Ok((_, name)) => started.push(name),
                 Err(e) => {
@@ -988,18 +1002,29 @@ where
             return Err(e);
         }
     }
-    Ok(started)
+    Ok((started, attempted))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsureCountOutcome {
     pub started: Vec<String>,
     pub missing: u32,
+    /// How many runner starts were actually ATTEMPTED this cycle — i.e. how
+    /// many `start_runner()` calls the gate-primary pacing permitted. This is
+    /// `<= missing`: intentional throttling under load means we deliberately
+    /// attempt fewer than the full shortfall per call and finish the refill
+    /// across later serve-loop iterations.
+    pub attempted: u32,
 }
 
 impl EnsureCountOutcome {
+    /// A partial failure is when some ATTEMPTED start actually errored — NOT
+    /// when the gate intentionally throttled the number of attempts. Comparing
+    /// against `attempted` (rather than `missing`) prevents a false Critical
+    /// alert storm during a full-fleet cold start, where the gate correctly
+    /// permits only 1-2 attempts per iteration by design.
     pub fn is_partial_failure(&self) -> bool {
-        (self.started.len() as u32) * 2 < self.missing
+        (self.started.len() as u32) < self.attempted
     }
 }
 
@@ -1027,6 +1052,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
             missing: 0,
+            attempted: 0,
         });
     }
     match free_disk_gb(&cfg.runner.image) {
@@ -1078,19 +1104,22 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         }
     }
     let missing = cfg.runner.count - alive;
-    let started = start_missing_runners(cfg, backend, missing);
+    let refill = start_missing_runners(cfg, backend, missing);
     // Release any failed reservations from this cycle
     let _ = release_stale_slots(cfg);
 
+    let (started, attempted) = refill?;
     let outcome = EnsureCountOutcome {
-        started: started?,
+        started,
         missing,
+        attempted,
     };
     if outcome.is_partial_failure() {
         eprintln!(
-            "warning: ensure_count started only {} of {} missing runner(s); treating as partial failure for alert streak accounting",
+            "warning: ensure_count started only {} of {} attempted runner(s) ({} still missing); treating as partial failure for alert streak accounting",
             outcome.started.len(),
-            outcome.missing
+            outcome.attempted,
+            outcome.missing.saturating_sub(outcome.started.len() as u32)
         );
     }
     Ok(outcome)
@@ -1372,7 +1401,7 @@ mod tests {
         let events = RefCell::new(Vec::<String>::new());
         let mut seq = 0;
 
-        let started = start_missing_runners_with(
+        let (started, _attempted) = start_missing_runners_with(
             &cfg,
             16,
             || {
@@ -1504,7 +1533,7 @@ mod tests {
         let sim = RefCell::new(LaggingLoadSim::new());
         let mut seq = 0;
 
-        let started = start_missing_runners_with(
+        let (started, _attempted) = start_missing_runners_with(
             &cfg,
             16,
             || {
@@ -1542,7 +1571,7 @@ mod tests {
         let events = RefCell::new(Vec::<String>::new());
         let mut seq = 0;
 
-        let started = start_missing_runners_with(
+        let (started, _attempted) = start_missing_runners_with(
             &cfg,
             16,
             || {
@@ -1621,10 +1650,46 @@ mod tests {
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
         assert_eq!(outcome.missing, 4);
+        // ceiling=999 lets the gate permit the full batch of 4 attempts; only
+        // one runner name is available, so 3 attempts error → real failure.
+        assert_eq!(outcome.attempted, 4);
         assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
         assert!(
             outcome.is_partial_failure(),
-            "one successful start out of four missing runners is fewer than half and must keep the serve alert streak alive"
+            "one successful start out of four ATTEMPTED starts is a real partial failure and must keep the serve alert streak alive"
+        );
+    }
+
+    #[test]
+    fn gate_throttled_full_success_is_not_a_partial_failure() {
+        // THE round-3 critical regression: on a full-fleet cold start the gate
+        // permits only 1-2 attempts per ensure_count call BY DESIGN. When every
+        // permitted attempt succeeds, that is a healthy incremental refill — it
+        // must NOT be flagged as a partial failure (the old `started*2 < missing`
+        // rule flagged it, firing a false Critical alert storm during recovery).
+        let outcome = EnsureCountOutcome {
+            started: vec!["runner-1".into(), "runner-2".into()],
+            missing: 16,
+            attempted: 2,
+        };
+        assert!(
+            !outcome.is_partial_failure(),
+            "2 successful starts out of 2 gate-permitted attempts (16 still missing) is healthy pacing, not a failure"
+        );
+    }
+
+    #[test]
+    fn attempted_start_that_errors_is_a_partial_failure() {
+        // The other side: if the gate permitted 2 attempts and one errored,
+        // that IS a real failure regardless of how many runners remain missing.
+        let outcome = EnsureCountOutcome {
+            started: vec!["runner-1".into()],
+            missing: 16,
+            attempted: 2,
+        };
+        assert!(
+            outcome.is_partial_failure(),
+            "1 success out of 2 attempted starts is a real partial failure even with many still missing"
         );
     }
 

@@ -511,6 +511,17 @@ impl Config {
                 self.runner.respawn_load_safety_ceiling
             );
         }
+        // The host watchdog (`/etc/watchdog.conf` max-load-1) reboots the box at
+        // 1-minute loadavg 24. The respawn safety ceiling MUST stay strictly
+        // below that — a ceiling at or above 24 would let the load gate keep
+        // dispatching cold starts right up to the reboot threshold, silently
+        // defeating the entire gate-primary pacing design.
+        if self.runner.respawn_load_safety_ceiling >= 24.0 {
+            anyhow::bail!(
+                "runner.respawn_load_safety_ceiling ({}) must be < 24.0, the host watchdog max-load-1 reboot threshold",
+                self.runner.respawn_load_safety_ceiling
+            );
+        }
         if !self.runner.respawn_load_per_runner.is_finite()
             || self.runner.respawn_load_per_runner <= 0.0
         {
@@ -890,6 +901,11 @@ mod tests {
         cfg.runner.respawn_load_safety_ceiling = 0.5;
         assert!(cfg.validate().is_err());
         cfg.runner.respawn_load_safety_ceiling = f64::NAN;
+        assert!(cfg.validate().is_err());
+        // Must stay strictly below the host watchdog max-load-1 reboot threshold (24).
+        cfg.runner.respawn_load_safety_ceiling = 24.0;
+        assert!(cfg.validate().is_err());
+        cfg.runner.respawn_load_safety_ceiling = 30.0;
         assert!(cfg.validate().is_err());
         cfg.runner.respawn_load_safety_ceiling = 20.0;
 

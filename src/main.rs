@@ -1099,6 +1099,8 @@ mod tests {
         let partial = docker_backend::EnsureCountOutcome {
             started: vec!["ez-org-runner-1".into()],
             missing: 4,
+            // 4 starts attempted, only 1 succeeded → real partial failure.
+            attempted: 4,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1115,6 +1117,8 @@ mod tests {
         let recovered = docker_backend::EnsureCountOutcome {
             started: vec!["ez-org-runner-2".into(), "ez-org-runner-3".into()],
             missing: 2,
+            // 2 attempted, 2 succeeded → healthy, resets the streak.
+            attempted: 2,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
