@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::VecDeque;
 use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,8 +8,6 @@ use crate::alert::{self, Severity};
 use crate::config::{Config, Scope};
 use crate::github::{self, WorkflowJob, WorkflowRun};
 use crate::queue_monitor::parse_github_timestamp_secs;
-
-const RECENT_CANARY_RESULTS_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CanaryResult {
@@ -52,7 +49,6 @@ pub struct RunJobRunnerCorrelation {
 pub struct CanaryDaemonState {
     last_started_at: Option<Instant>,
     in_flight: Option<JoinHandle<Result<CanaryResult>>>,
-    recent_results: VecDeque<CanaryResult>,
 }
 
 impl CanaryDaemonState {
@@ -60,7 +56,6 @@ impl CanaryDaemonState {
         Self {
             last_started_at: Some(Instant::now()),
             in_flight: None,
-            recent_results: VecDeque::with_capacity(RECENT_CANARY_RESULTS_LIMIT),
         }
     }
 
@@ -113,7 +108,6 @@ impl CanaryDaemonState {
                     result.runner_name,
                     result.time_to_start_seconds
                 );
-                self.push_recent(result);
                 true
             }
             Ok(Err(err)) => {
@@ -127,12 +121,6 @@ impl CanaryDaemonState {
         }
     }
 
-    fn push_recent(&mut self, result: CanaryResult) {
-        while self.recent_results.len() >= RECENT_CANARY_RESULTS_LIMIT {
-            self.recent_results.pop_front();
-        }
-        self.recent_results.push_back(result);
-    }
 }
 
 impl Default for CanaryDaemonState {
@@ -580,8 +568,6 @@ mod tests {
         assert!(state.in_flight.is_some());
         std::thread::sleep(Duration::from_millis(10));
         assert!(state.collect_finished());
-        assert_eq!(state.recent_results.len(), 1);
-        assert_eq!(state.recent_results[0].nonce, "first");
     }
 
     #[test]
@@ -615,19 +601,6 @@ mod tests {
                 thread::spawn(move || Ok(result(&cfg, "second")))
             })
         );
-    }
-
-    #[test]
-    fn daemon_scheduler_drops_old_recent_results() {
-        let mut state = CanaryDaemonState::new();
-        let cfg = test_config();
-
-        for index in 0..(RECENT_CANARY_RESULTS_LIMIT + 2) {
-            state.push_recent(result(&cfg, &format!("nonce-{index}")));
-        }
-
-        assert_eq!(state.recent_results.len(), RECENT_CANARY_RESULTS_LIMIT);
-        assert_eq!(state.recent_results[0].nonce, "nonce-2");
     }
 
     #[test]
@@ -703,7 +676,6 @@ mod tests {
         CanaryDaemonState {
             last_started_at: None,
             in_flight: None,
-            recent_results: VecDeque::with_capacity(RECENT_CANARY_RESULTS_LIMIT),
         }
     }
 
