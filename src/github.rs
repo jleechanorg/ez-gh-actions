@@ -432,10 +432,7 @@ pub fn list_repo_in_progress_runs(repo: &str) -> Result<Vec<WorkflowRun>> {
 /// `queue_monitor`'s budget-tracked tick -- see `run_gh_with_backoff_until`.
 /// Bails between pages (in addition to within each `gh` call) once
 /// `deadline` has passed, returning whatever pages were already collected.
-pub fn list_repo_in_progress_runs_until(
-    repo: &str,
-    deadline: Instant,
-) -> Result<Vec<WorkflowRun>> {
+pub fn list_repo_in_progress_runs_until(repo: &str, deadline: Instant) -> Result<Vec<WorkflowRun>> {
     let mut runs = Vec::new();
     for page in 1.. {
         if Instant::now() >= deadline {

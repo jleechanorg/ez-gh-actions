@@ -492,7 +492,9 @@ fn fetch_fleet_runner_stats(deadline: Instant) -> Result<FleetRunnerStats> {
         scope: Scope::Org,
         target: FLEET_ORG.into(),
     };
-    Ok(fleet_runner_stats(github::list_runners_until(&gh, deadline)?))
+    Ok(fleet_runner_stats(github::list_runners_until(
+        &gh, deadline,
+    )?))
 }
 
 /// Enumerates self-hosted jobs for `runs` via caller-supplied `fetch_jobs`,
