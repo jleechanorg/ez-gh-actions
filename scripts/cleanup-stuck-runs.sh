@@ -77,8 +77,20 @@ while True:
         break
     page += 1
 
-runs = [r for r in raw_runs if r.get("status", "queued") == "queued"]
-skipped_non_queued = len(raw_runs) - len(runs)
+# Deploy workflows are NEVER candidates for any cancel lever (zombie/superseded/
+# tail), even if queued past every threshold below. A cancelled deploy
+# mid-flight is worse than a slow queue -- FIXPLAN §5 risk #1
+# (docs/FIXPLAN-gh-actions-systemic-20260707.md). Match on workflow `path`
+# (exact, unambiguous) rather than display `name` (can be renamed/localized).
+NEVER_CANCEL_PATHS = {
+    ".github/workflows/deploy-production.yml",
+    ".github/workflows/auto-deploy-dev.yml",
+}
+
+all_queued = [r for r in raw_runs if r.get("status", "queued") == "queued"]
+runs = [r for r in all_queued if r.get("path") not in NEVER_CANCEL_PATHS]
+protected_deploy_count = len(all_queued) - len(runs)
+skipped_non_queued = len(raw_runs) - len(all_queued)
 
 now = datetime.datetime.now(datetime.timezone.utc)
 zombies, tail = [], []
@@ -136,6 +148,7 @@ print(
     f" mode={'dry-run' if dry else 'apply'}"
 )
 print("safety: only status=queued runs are candidates; in_progress runs are ignored")
+print(f"safety: deploy workflows excluded from all cancel levers; protected_deploy_queued={protected_deploy_count}")
 
 def run_status(rid):
     out = subprocess.check_output([
