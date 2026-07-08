@@ -114,19 +114,30 @@ step after a real deploy.
   (mint+refresh+wired+active+proven). Mac-side restart is NOT mine — never restart the Mac
   daemon per hard rules; that's main/mac session's call.
 
+- 2026-07-08 09:38 — capacity-proof confirmed directly (fix #2 CLOSED): burst run
+  28931890600, peak 21/22 (linux 15 + mac 6) at t=278s, evidence at
+  scratchpad/capacity-proof-samples.jsonl. Verified via `gh api` the burst window was
+  09:21:36Z-09:31:32Z UTC (02:21:36-02:31:32 PDT) — my App-token restart at 02:32:21 PDT
+  was 49s AFTER, no overlap/disruption. team-lead independently flagged the same
+  shared-tree collision risk I'd already routed around (clean worktree build) and directed
+  reaper-wiring to checkpoint-commit its WIP to a branch immediately, even incomplete.
+  Re-pinged reaper-wiring (2nd ping, no reply to 1st) with that ask + a debugging hint on
+  its failing test (looks like a job_batches/revalidation-guard mismatch, not a design
+  flaw). src/github.rs now dirty too (new file touched) — still actively working, last
+  touch 02:35:59, ~1 min old at ping time.
+
 ## Next Actions (rewritten every step)
 
-1. Poll reaper-wiring for the docker_backend.rs zombie-slot fix. It is NOT on a separate
-   branch yet — editing directly in shared main workdir. Asked it to land on a branch/commit
-   when done so we don't collide. When ready: build+test (can reuse
-   scratchpad/ezgha-clean-build worktree, or test in-place once WIP is committed), spawn an
-   ADVERSARIAL verifier (probe: legit-job-vs-zombie false positive risk, repo lookup
-   correctness, fail-first tests), merge to origin/main + Gate 0 only on clean/dismissed
-   verdict. TOP PRIORITY — durable fix for the exact bug that capped the Mac at 5/6.
-2. capacity-proof: shared task list now shows #10 completed — confirm with the subagent
-   what the peak-executing evidence showed and log it here.
-3. App token (fix #3): jeff-ubuntu side fully done+proven (see log above). Ask main whether
-   to coordinate a Gate-0-safe Mac-side restart (main/mac session must do it, not me), and
-   whether app-wiring should close out bead nuk / task #11.
+1. Wait for reaper-wiring to checkpoint-commit (branch or commit) — asked twice now. Do NOT
+   touch its files. When it lands (done or WIP-incomplete-but-committed): if incomplete,
+   just confirm it's durable and keep waiting for a green/complete state before review; if
+   complete, build+test (reuse scratchpad/ezgha-clean-build worktree — fetch+checkout the
+   branch there for a clean build), spawn an ADVERSARIAL verifier (probe: legit-job-vs-zombie
+   false positive risk, repo lookup correctness, fail-first tests), merge to origin/main +
+   Gate 0 only on clean/dismissed verdict. TOP PRIORITY.
+2. capacity-proof (fix #2): CLOSED, no further action.
+3. App token (fix #3): jeff-ubuntu side fully done+proven. Mac-side restart is main/mac
+   session's call, not mine — flagged to main already. bead nuk left OPEN with status
+   comment pending Mac confirmation.
 4. After reaper fix lands: re-verify sustained 16/16 + 6/6 (or queue-drained) with the app
    token active on both machines.
