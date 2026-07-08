@@ -215,24 +215,43 @@ step after a real deploy.
   instead of blind-sleeping or proceeding into an elevated window. Reported status to
   team-lead. cargo install/systemctl restart NOT yet run.
 
+- 2026-07-08 10:04 — team-lead nudged to proceed (9.15 flat + 14 containers, soft "~9"
+  guidance not a hard threshold). My own poll loop had already independently cleared moments
+  earlier (load dropped to 8.74/containers 14). Proceeded: `cargo install --path .` from the
+  clean bfddf83 worktree, final safety recheck (load 7.57, containers 12) — restarted
+  ezgha.service (03:04:31). Ran verify-exit-criteria.sh: Gate 0 PASS at that instant
+  (deployed==HEAD bfddf83... except HEAD had already moved to 5f0374a from my own prior
+  STATE-mirror commit — see CLAUDE.md "every commit advances HEAD, must rebuild"). Rebuilt
+  from true current HEAD (5f0374a, doc-only diff vs bfddf83, confirmed via `git diff --stat`),
+  reinstalled, waited briefly for containers to recover from the first restart's dip
+  (10->16 over ~40s, load stayed <8), restarted AGAIN (03:06:42) onto 5f0374a. Gate 0 PASS
+  cleanly this time. Gate 1 (cargo fmt --check) FAILED — same pre-existing rustfmt drift
+  (canary.rs/main.rs) already confirmed unrelated/pre-existing via earlier A/B check. Applied
+  `cargo fmt` (pure whitespace/line-wrap, zero logic change, diffed to confirm), 188/188 still
+  green, committed+pushed (0a4c8e1). DECISION: did NOT do a 3rd restart just to re-sync
+  deployed-SHA to this cosmetic formatting-only commit — per the reactive-cascade/
+  complexity-budget principle (don't stack another restart to compensate for a fix I just
+  made), and per team-lead's own restart-cost caution. Instead directly verified the
+  CURRENTLY RUNNING daemon (5f0374a, PID 236775) has everything that matters: (a) reaper
+  self-heal symbol ("currently running a job" string) present in the live binary; (b) a live
+  gh subprocess (PID 264454, child of 236775) has GH_TOKEN set — App token confirmed ACTIVE
+  post-restart, not just installed; (c) fleet at 15/16 containers, load settled ~11 and
+  falling; (d) journalctl since-5-min shows ZERO cancel/force-cancel/zombie log lines — quiet
+  log, expected (no zombies to heal right now), not a red flag. Reporting to team-lead with
+  full transparency on the Gate0/Gate1 sequencing and asking whether they want one more
+  restart for exact SHA parity (0a4c8e1) or accept the current state (functionally identical,
+  cosmetic 1-commit gap only).
+
 ## Next Actions (rewritten every step)
 
-1. reaper fix (fix #1) DEPLOY: waiting on the background poll loop to confirm
-   load_1min<9 AND containers>=12. On signal: `cargo install --path .` from
-   scratchpad/ezgha-deploy-bfddf83 (clean bfddf83 checkout, already tested), re-check
-   load/containers one more time immediately before restart, `systemctl --user restart
-   ezgha.service`, then `./docs/verify-exit-criteria.sh` as final step. Then confirm:
-   deployed binary SHA == bfddf83 (Gate 0 — also clears the lingering
-   "10a544c-dirty"/whatever-was-live mismatch), reaper symbols present in the NOW-DEPLOYED
-   binary (not just the build), App token still active post-restart (GH_TOKEN env + isolated
-   bucket check, same method as the earlier App-token deploy). Watch first several daemon
-   cycles' logs for cancel/force-cancel lines — flag team-lead INSTANTLY if one fires against
-   a runner not confirmed offline+busy+containerless. This is the LAST action for the mission.
-2. capacity-proof (fix #2): CLOSED — its 22/22 evidence commit (bfddf83) is what's being
-   deployed as part of fix #1's HEAD.
-3. App token (fix #3): jeff-ubuntu side fully done+proven pre-restart; re-confirm post-restart
-   per step 1. Mac-side restart is main/mac session's call, not mine.
-4. After deploy verification passes: run the final sustained-capacity re-verification (all 3
-   fixes live together: reaper self-heal + app token + capacity-proof harness), report
-   Gate-0 result + symbols + App-token-active + fleet-holding + cancel-log observations to
-   team-lead. That closes the entire 3-fix mission end-to-end.
+1. reaper fix (fix #1) DEPLOY: FUNCTIONALLY COMPLETE. Deployed+running binary is 5f0374a
+   (contains reaper self-heal + App token + capacity-proof code in full). HEAD has since
+   advanced by ONE purely-cosmetic formatting commit (0a4c8e1) that I chose not to chase with
+   a 3rd restart. Awaiting team-lead's call: leave as-is (documented gap) or do one more
+   Gate-0-safe restart for exact SHA parity. NOT doing anything further without that input.
+2. capacity-proof (fix #2): CLOSED.
+3. App token (fix #3): CLOSED — confirmed active on the post-reaper-deploy restart too (GH_TOKEN
+   live in a real gh subprocess of the current daemon PID).
+4. Once team-lead responds on the SHA-parity question (or is silent long enough that "leave
+   as-is" is clearly fine): do a final sustained-capacity check (16/16 + queue-drain observed
+   over a few minutes) and declare the entire 3-fix mission done end-to-end.
