@@ -1002,3 +1002,53 @@ main). Claimed TaskList #7 (track hardening-bxy-fl0, don't touch) and #8
 copy) and bead ez-gh-actions-9je — doing next. Have not touched cargo
 install/systemctl restart (single-writer lock respected, nothing to deploy yet
 since fix isn't committed).
+
+---
+
+## sidekick3 — po2 fix VERIFIED, holding for SHIP (2026-07-07 22:40 PT)
+
+Main's dispatched codex fix HUNG (71min, 0% CPU, zero src edits) and was killed
+by main, who implemented the fix directly instead. Landed as **072025d**
+"fix is_partial_failure to count attempted-not-missing (round-3 critical)" on
+`origin/sidekick/po2-respawn-pacing`.
+
+**Independently verified (not just trusting main's numbers)**:
+- Confirmed 072025d present on `origin/sidekick/po2-respawn-pacing` via fresh
+  `git fetch` (no local trust assumption).
+- Worktree `~/projects/ez-gh-actions-wt-po2` already at 072025d (main committed
+  there directly) — ran `cargo test --bin ezgha` myself: **182 passed, 0 failed**,
+  matches main's claim exactly.
+- Read the actual diff, not just the commit message:
+  - `docker_backend.rs`: `EnsureCountOutcome` gained `attempted: u32`;
+    `is_partial_failure()` is now `(self.started.len() as u32) < self.attempted`
+    (was `started.len()*2 < missing`). Gate-throttled-by-design starts (attempted=2,
+    started=2) no longer trip the failure path; only genuine start_runner() errors
+    (attempted=2, started=1) do. Two new named tests confirm both branches:
+    `gate_throttled_full_success_is_not_a_partial_failure` and
+    `attempted_start_that_errors_is_a_partial_failure`.
+  - `config.rs`: validate() now rejects `respawn_load_safety_ceiling >= 24.0` with
+    a comment explaining the host watchdog max-load-1 reboot threshold — closes
+    the round-3 minor (operator can no longer configure the ceiling up to/past the
+    reboot line). Test asserts 24.0 and 30.0 both fail validation, 20.0 (default)
+    passes.
+- No discrepancies between main's description and the actual landed diff.
+
+**Still NOT deploying**: per main's explicit instruction, the round-3 arithmetic
+lens + final SHIP verdict has not run yet (rate-limit pressure killed both prior
+attempts). Holding here until main sends SHIP. When it lands: merge branch→main,
+Gate 0 loop with careful-restart (verify load<12 AND containers>=12 immediately
+before `systemctl --user restart ezgha.service` — mass cold respawn tripped the
+host watchdog twice already today).
+
+**Housekeeping this block**: stopped the stale Monitor (bkf1cboe9, was watching
+the now-killed codex PID 562582 — timed out cleanly, no action needed since main
+superseded it directly). Noted the po2 worktree has uncommitted noise in
+`.beads/beads.db`/`.beads/beads.db-wal` (leftover from the killed codex session)
+— left untouched, not my job to clean up mid-verification and it doesn't affect
+src/ or tests.
+
+**Rate-limit directive from main (in effect)**: reduce gh API pressure — Mac
+session running a parallel redundant goal on the same GH account hit the same
+conclusion independently. My Monitor/checks are all local-only (git, ps, cargo) —
+zero gh calls, already compliant. Holding to ~20-30min consolidated check cadence
+per main's directive rather than continuous polling.
