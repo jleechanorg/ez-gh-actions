@@ -716,10 +716,6 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
     Ok(containers)
 }
 
-fn count_current_prefix_containers(containers: &[ManagedContainer], cfg: &Config) -> u32 {
-    current_prefix_containers(containers, cfg).len() as u32
-}
-
 fn current_prefix_containers<'a>(
     containers: &'a [ManagedContainer],
     cfg: &Config,
@@ -869,7 +865,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let containers = managed_containers()?;
-    let alive = count_current_prefix_containers(&containers, cfg);
+    let alive = current_prefix_containers(&containers, cfg).len() as u32;
     if alive >= cfg.runner.count {
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
@@ -1368,14 +1364,14 @@ mod tests {
         ];
 
         let base_cfg = cfg_with(3, "ez-runner");
-        assert_eq!(count_current_prefix_containers(&containers, &base_cfg), 1);
+        assert_eq!(current_prefix_containers(&containers, &base_cfg).len(), 1);
 
         let old_cfg = cfg_with(3, "ez-runner-b");
-        assert_eq!(count_current_prefix_containers(&containers, &old_cfg), 1);
+        assert_eq!(current_prefix_containers(&containers, &old_cfg).len(), 1);
 
         let current_cfg = cfg_with(3, "ez-runner-c");
         assert_eq!(
-            count_current_prefix_containers(&containers, &current_cfg),
+            current_prefix_containers(&containers, &current_cfg).len(),
             2
         );
     }
