@@ -22,4 +22,19 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Bake Playwright browser system dependencies (webkit + chromium) into the image.
+# worldarchitect.ai's self-hosted Playwright jobs (auth-browser-tests.yml,
+# mobile-auth-regression.yml) otherwise fall back to a runtime
+# `apt-get download libavif16 libgav1-1 libwoff1 libyuv0` step that fails
+# repo-wide with "Can't find a source to download version ... exit 100" on apt
+# mirror/version-pin drift (bead jleechan-mw9). Installing via
+# `playwright install-deps` AT BUILD TIME resolves the release-correct package
+# names against a fresh apt index, so the fragile runtime apt path is never
+# taken. `playwright` is pip-installed only to drive install-deps (system libs
+# are shared; CI jobs still create their own venv with the repo-pinned version).
+RUN apt-get update \
+    && pip3 install --no-cache-dir --break-system-packages playwright \
+    && python3 -m playwright install-deps \
+    && rm -rf /var/lib/apt/lists/*
+
 USER runner
