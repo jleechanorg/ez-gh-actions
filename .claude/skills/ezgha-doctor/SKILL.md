@@ -1,11 +1,13 @@
 ---
 name: ezgha-doctor
-description: Diagnose ez-gh-actions (ezgha) fleet health using the repo's doctor.sh and named remediation steps. Use when ezgha.service is misbehaving, the runner fleet is degraded, or "GitHub Actions not running" complaints land on ezgha.
+description: Diagnose ez-gh-actions (ezgha) fleet health using the repo's doctor-runner script and named remediation steps. Use when ezgha.service is misbehaving, the runner fleet is degraded, or "GitHub Actions not running" complaints land on ezgha.
 ---
 
 # ezgha doctor — diagnose + repair ezgha fleet health
 
-This skill drives the **doctor.sh** script that ships at the repo root, plus the named remediation actions the script recommends. Use it whenever the user reports any of:
+> **Use `doctor-runner`, not `doctor.sh` — the latter is broken on docker 27+ (see bead ez-gh-actions-91r + memory ezgha-doctor-idle-bug).** `doctor.sh` is kept only as a back-reference; the new authoritative file is `doctor-runner` (shipped 2026-07-08, with per-slot explicit-work inventory section 10).
+
+This skill drives the **doctor-runner** script that ships at the repo root, plus the named remediation actions the script recommends. Use it whenever the user reports any of:
 
 - "the runners are not up" / "ezgha is broken" / "GitHub Actions isn't taking tasks"
 - service showing `failed (Result 'exit-code')`
@@ -15,8 +17,8 @@ This skill drives the **doctor.sh** script that ships at the repo root, plus the
 ## Step 1 — Establish the baseline
 
 ```bash
-bash "$(git rev-parse --show-toplevel)/doctor.sh"          # health gate, exit 0 = healthy
-bash "$(git rev-parse --show-toplevel)/doctor.sh --prove"  # + live canary: dispatch a real job, verify it runs on ez-org-runner-*
+bash "$(git rev-parse --show-toplevel)/doctor-runner"          # health gate, exit 0 = healthy
+bash "$(git rev-parse --show-toplevel)/doctor-runner --prove"  # + live canary: dispatch a real job, verify it runs on ez-org-runner-*
 ```
 
 Read the verdict AND the exit code. `--prove` is the strongest evidence — it
@@ -48,7 +50,7 @@ Fresh tail: cancels real PR CI — only run when queue tail > `QUEUE_TAIL_WARN_M
 
 ## Step 1b — Queue health metrics (always shown in section 8)
 
-`doctor.sh` sources `scripts/queue-health.sh` on every run. Key metrics:
+`doctor-runner` sources `scripts/queue-health.sh` on every run. Key metrics:
 
 | Metric | Healthy | Unhealthy |
 |--------|---------|-----------|
@@ -69,7 +71,7 @@ When section 8 is **BAD** or doctor exit ≠ 0, **mandatory**: run `/harness` pe
 
 ## Step 2 — Identify the failing checks
 
-The doctor groups failures into 9 sections:
+The doctor groups failures into 10 sections (9 legacy + section 10 explicit-work inventory added in `doctor-runner` 2026-07-08):
 
 1. **ezgha service** — `ezgha.service` should be `active`. If not: `systemctl --user restart ezgha.service`.
 2. **docker daemon** — `docker info` must succeed. If not, the daemon's host is the problem; for Colima: `limactl start colima`.
@@ -131,7 +133,7 @@ This is the most common degraded state. Two safe approaches:
 
 ```bash
 systemctl --user restart ezgha.service
-bash /home/jleechan/projects/ez-gh-actions/doctor.sh
+bash /home/jleechan/projects/ez-gh-actions/doctor-runner
 ```
 
 After restart, slot-recon calls `release_stale_slots` at the top of `ensure_count`, freeing slots whose runner_id is gone from `github::list_runners`. Then the next call to `next_slot` will mint a fresh slot for each missing daemon.
@@ -156,7 +158,7 @@ ezgha v0.1.x: this used to be permanent. With slot-recon merged, the loop self-h
 
 ### "All 16 are busy and I can't delete them"
 
-This is the GOOD state during a CI wave. Wait for worldarchitect's jobs to drain. doctor.sh exit code 1 here is misleading; the real signal is in section 5 (all 16 `ez-org-runner-N` listed as `online`).
+This is the GOOD state during a CI wave. Wait for worldarchitect's jobs to drain. doctor-runner exit code 1 here is misleading; the real signal is in section 5 (all 16 `ez-org-runner-N` listed as `online`).
 
 ## Step 4 — Verify health
 
@@ -164,12 +166,12 @@ Run doctor again. Repeat until it returns 0. If it stays 1 for 10+ minutes despi
 
 ## Output format
 
-Always run `bash /home/jleechan/projects/ez-gh-actions/doctor.sh` (no flags) first. The human-readable output is the audit trail. `--json` is available for scripted checks but not enabled by default.
+Always run `bash /home/jleechan/projects/ez-gh-actions/doctor-runner` (no flags) first. The human-readable output is the audit trail. `--json` is available for scripted checks but not enabled by default.
 
 
 ## Step 5 — Harness diagnosis (mandatory on failure)
 
-When `doctor.sh` exits 1 **or** queue tail > `QUEUE_TAIL_WARN_MIN` (20m):
+When `doctor-runner` exits 1 **or** queue tail > `QUEUE_TAIL_WARN_MIN` (20m):
 
 1. Invoke `/harness` (read `~/.claude/skills/harness-engineering/SKILL.md`)
 2. Classify: silent degradation | missing validation | repeated manual fix

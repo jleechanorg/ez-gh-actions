@@ -1,6 +1,8 @@
 # /doctor — diagnose and self-heal the ezgha runner fleet
 
-Repo-level command for ez-gh-actions. Runs `doctor.sh` (fleet + queue health), self-heals when safe, and **always** runs `/harness` when unhealthy or queue tail exceeds threshold.
+> **Use `doctor-runner`, not `doctor.sh` — the latter is broken on docker 27+ (see bead ez-gh-actions-91r + memory ezgha-doctor-idle-bug).** `doctor.sh` is kept only as a back-reference; the new authoritative file is `doctor-runner` (shipped 2026-07-08, with per-slot explicit-work inventory section 10).
+
+Repo-level command for ez-gh-actions. Runs `doctor-runner` (fleet + queue health), self-heals when safe, and **always** runs `/harness` when unhealthy or queue tail exceeds threshold.
 
 ## Skill Reference
 * **Diagnostic Skill**: [ezgha-doctor](file:///Users/jleechan/projects_other/ez-gh-actions/.claude/skills/ezgha-doctor/SKILL.md)
@@ -11,7 +13,7 @@ When this command is invoked, immediately execute the following steps:
 
 1. **Run the health check** (always includes queue metrics):
    ```bash
-   bash "$(git rev-parse --show-toplevel)/doctor.sh"
+   bash "$(git rev-parse --show-toplevel)/doctor-runner"
    ```
    Read the output, exit code, and verdict. Exit 0 = healthy; exit 1 = unhealthy.
 
@@ -36,7 +38,7 @@ When this command is invoked, immediately execute the following steps:
    * Read `~/.claude/commands/harness.md` and `~/.claude/skills/harness-engineering/SKILL.md`
    * Produce full harness analysis (5 Whys technical + agent path)
    * Classify failure: silent degradation | missing validation | repeated manual fix | etc.
-   * Propose durable fixes (doctor.sh, skill, verify-exit-criteria gate, watchdog script)
+   * Propose durable fixes (doctor-runner, skill, verify-exit-criteria gate, watchdog script)
 
 3. **If unhealthy, perform diagnostics**:
    * Inspect which critical checks failed (sections 1–9)
@@ -56,5 +58,5 @@ When this command is invoked, immediately execute the following steps:
    * **Offline runners**: prune only when not busy (use configured `name_prefix` from config.toml)
 
 5. **Verify repair**:
-   * Re-run `doctor.sh` until exit 0 AND queue tail ≤ 20m
-   * Optionally: `doctor.sh --prove` for live canary dispatch
+   * Re-run `doctor-runner` until exit 0 AND queue tail ≤ 20m
+   * Optionally: `doctor-runner --prove` for live canary dispatch

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# doctor.sh — ez-gh-actions fleet health check. Read-only.
+# doctor.sh — ez-gh-actions fleet health check (LEGACY).
+# DEPRECATED on docker 27+: silently misclassifies every working runner as
+# IDLE because `docker top <container> -eo cmd` fails with
+# "Couldn't find PID field" — see bead ez-gh-actions-91r and memory
+# ezgha-doctor-idle-bug. Kept as a back-reference only.
+# USE doctor-runner INSTEAD (shipped 2026-07-08, with per-slot
+# explicit-work inventory section 10).
 # Outputs a one-shot human-readable report; --json emits machine-parseable
 # status for the loop agent (or a follow-up Claude Code session) to drive
 # iteration. Designed to fail loudly on the things that previously caused
