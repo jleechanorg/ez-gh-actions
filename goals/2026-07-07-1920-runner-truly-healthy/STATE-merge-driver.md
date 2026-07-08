@@ -126,15 +126,36 @@ step after a real deploy.
   flaw). src/github.rs now dirty too (new file touched) — still actively working, last
   touch 02:35:59, ~1 min old at ping time.
 
+- 2026-07-08 09:39-09:42 — reaper-wiring RELOCATED its work to the dedicated worktree
+  (ez-gh-actions-wt-qbl, branch claude/qbl-zombie-slot-selfheal) and committed: e977002
+  "wire cancel-then-delete into offline-busy slot reclaim", pushed to origin. Shared main
+  workdir is now clean. Verified independently: 184/184 tests pass in the qbl worktree
+  (including the previously-red reclaim_zombie_locked_runner_cancels_then_deletes_on_success).
+  Reviewed the diff myself first (reaper.rs change is a pure refactor — extracts
+  collect_repo_runs + LiveReaperApi, reuses existing plan_reaper_actions/
+  execute_reaper_plan_with_api rather than new correlation logic). Spawned a codex-consultant
+  ADVERSARIAL reviewer against commit e977002. VERDICT: FINDINGS, not clean:
+  (1) is_runner_busy_lock_error's bare `contains("422")` substring check can false-positive
+  on any remove_runner error whose interpolated runner ID contains "422" (422/1422/4220/...)
+  — bounded blast radius (outer offline+busy+missing-container gate still applies before
+  this ever fires) but imprecise, real, and easily triggered given continuous runner-id
+  churn; (2) the "keeps_slot_when_job_never_leaves_in_progress" test passes for the WRONG
+  reason (correlation mismatch on poll 1 via FakeReaperApi::default()'s unrelated fallback
+  job, not genuine force-cancel+poll-timeout) — currently ZERO test coverage of the
+  force-cancel escalation path. Deprioritized to a bead follow-up (not live under current
+  org-scoped config): job correlation by bare runner_id assumes a global ID namespace.
+  Logged both fixable issues on bead qbl + sent reaper-wiring a detailed fix request for
+  #1 and #2. HOLDING THE MERGE — not dismissing these findings, they're real and
+  actionable, not just nitpicks.
+
 ## Next Actions (rewritten every step)
 
-1. Wait for reaper-wiring to checkpoint-commit (branch or commit) — asked twice now. Do NOT
-   touch its files. When it lands (done or WIP-incomplete-but-committed): if incomplete,
-   just confirm it's durable and keep waiting for a green/complete state before review; if
-   complete, build+test (reuse scratchpad/ezgha-clean-build worktree — fetch+checkout the
-   branch there for a clean build), spawn an ADVERSARIAL verifier (probe: legit-job-vs-zombie
-   false positive risk, repo lookup correctness, fail-first tests), merge to origin/main +
-   Gate 0 only on clean/dismissed verdict. TOP PRIORITY.
+1. Wait for reaper-wiring to push a fix for the 2 findings (422 substring false-positive;
+   force-cancel test doesn't test what it claims) to claude/qbl-zombie-slot-selfheal. When
+   it lands: build+test in ez-gh-actions-wt-qbl, spot-check the 2 specific fixes, and if
+   genuinely resolved, merge to origin/main + Gate 0 (rebuild via clean worktree method,
+   pre-restart load/container check, restart, verify-exit-criteria.sh). TOP PRIORITY —
+   still the last open mission item.
 2. capacity-proof (fix #2): CLOSED, no further action.
 3. App token (fix #3): jeff-ubuntu side fully done+proven. Mac-side restart is main/mac
    session's call, not mine — flagged to main already. bead nuk left OPEN with status
