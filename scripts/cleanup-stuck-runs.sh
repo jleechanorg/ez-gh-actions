@@ -63,12 +63,40 @@ do_zombies = os.environ.get("DO_ZOMBIES") == "1"
 do_superseded = os.environ.get("DO_SUPERSEDED") == "1"
 do_tail = os.environ.get("DO_TAIL") == "1"
 
+# Rate-limit resilience (bead jleechan-me9): GitHub applies a SECONDARY
+# throttle to the /actions/* REST family that is invisible in the primary
+# rate_limit numbers (core can read ~4000 remaining while /actions/runs
+# 403s). An unhandled 403 here crash-loops the reaper tick and leaves the
+# queue unswept — observed live 2026-07-08 02:41-03:42Z while >20m runs
+# accumulated. On a rate-limit 403: back off once (60s), retry, and if
+# still throttled skip the tick GRACEFULLY (exit 0 with a log line) so
+# launchd cadence resumes next interval instead of logging a crash.
+def list_queued_page(page):
+    return json.loads(subprocess.check_output([
+        "gh", "api", f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}"
+    ], stderr=subprocess.STDOUT))
+
+def is_rate_limited(err):
+    return b"rate limit" in (err.output or b"").lower() or b"403" in (err.output or b"")
+
 raw_runs = []
 page = 1
 while True:
-    data = json.loads(subprocess.check_output([
-        "gh", "api", f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}"
-    ]))
+    try:
+        data = list_queued_page(page)
+    except subprocess.CalledProcessError as e:
+        if not is_rate_limited(e):
+            raise
+        print("rate-limited on /actions/runs listing; backing off 60s and retrying once")
+        time.sleep(60)
+        try:
+            data = list_queued_page(page)
+        except subprocess.CalledProcessError as e2:
+            if not is_rate_limited(e2):
+                raise
+            print("SKIP TICK: /actions/runs still rate-limited after backoff — "
+                  "leaving queue for next scheduled tick (graceful, not a failure)")
+            sys.exit(0)
     batch = data.get("workflow_runs", [])
     if not batch:
         break
@@ -156,34 +184,42 @@ def run_status(rid):
     ], stderr=subprocess.STDOUT)
     return out.decode().strip()
 
+def force_cancel_run(rid):
+    subprocess.check_output([
+        "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/force-cancel"
+    ], stderr=subprocess.STDOUT)
+
+# Plain cancel only. POST .../cancel returns 202 but queued runs frequently
+# STAY queued (observed live 2026-07-07 on runs 28884233335 / 28892581952);
+# the force-cancel endpoint is what actually transitions them. Rather than
+# poll status per run (1-2 extra API calls x N cancels — a real contributor
+# to the secondary throttle, bead jleechan-me9), callers batch-verify: the
+# tail pass re-lists queued runs ONCE after all cancels and force-cancels
+# only the ids that survived. The rare zombie-delete path keeps its own
+# per-run poll (delete requires the transition to have completed).
 def cancel_run(rid):
-    # POST .../cancel returns 202 but queued runs frequently STAY queued
-    # (observed live 2026-07-07 on runs 28884233335 / 28892581952) — the
-    # force-cancel endpoint is what actually transitions them to completed.
-    # Same cancel -> poll -> force-cancel ordering as the reaper (bead qbl).
     subprocess.check_output([
         "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/cancel"
     ], stderr=subprocess.STDOUT)
-    time.sleep(2)
-    if run_status(rid) == "queued":
-        subprocess.check_output([
-            "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/force-cancel"
-        ], stderr=subprocess.STDOUT)
 
 def delete_run(rid):
     # GitHub rejects DELETE on status=queued runs (HTTP 403) — a queued run must
     # first transition to completed/cancelled via the cancel endpoint before
     # gh run delete succeeds. Ignore cancel failures (e.g. already completed);
-    # the delete call below surfaces any real problem.
+    # the delete call below surfaces any real problem. Zombies are rare, so a
+    # per-run poll + force-cancel here is cheap and keeps delete reliable.
     try:
         cancel_run(rid)
-        time.sleep(1.5)
+        time.sleep(2)
+        if run_status(rid) == "queued":
+            force_cancel_run(rid)
+            time.sleep(2)
     except subprocess.CalledProcessError:
         pass
     subprocess.check_output(["gh", "run", "delete", str(rid), "-R", repo], stderr=subprocess.STDOUT)
 
 stats = {"zombie_deleted": 0, "zombie_failed": 0, "tail_cancelled": 0, "tail_failed": 0}
-stats.update({"superseded_cancelled": 0, "superseded_failed": 0})
+stats.update({"superseded_cancelled": 0, "superseded_failed": 0, "tail_force_cancelled": 0})
 
 if do_zombies:
     for age_m, r in sorted(zombies, key=lambda x: x[0], reverse=True):
@@ -231,6 +267,7 @@ if do_superseded:
             time.sleep(0.35)
 
 if do_tail:
+    tail_cancelled_ids = []
     for age_m, r in sorted(tail, key=lambda x: x[0], reverse=True):
         if do_superseded and r["id"] in superseded_ids:
             continue
@@ -241,12 +278,44 @@ if do_tail:
             continue
         try:
             cancel_run(rid)
+            tail_cancelled_ids.append(rid)
             stats["tail_cancelled"] += 1
             print(f"cancelled tail {rid} {age_m:.0f}m workflow={name!r} branch={b!r} url={url}")
         except subprocess.CalledProcessError as e:
             stats["tail_failed"] += 1
             print(f"FAIL tail {rid} url={url}: {(e.output or b'').decode()[:160]}")
         time.sleep(0.35)
+
+    # Batched force-cancel verification: ONE re-listing instead of a status
+    # poll per cancelled run. Any cancelled id still present as queued did
+    # not transition (the 202-but-still-queued behavior) — force-cancel it.
+    if tail_cancelled_ids:
+        time.sleep(8)
+        still_queued = set()
+        try:
+            page = 1
+            while True:
+                data = list_queued_page(page)
+                batch = data.get("workflow_runs", [])
+                still_queued.update(r["id"] for r in batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+        except subprocess.CalledProcessError:
+            still_queued = None  # verification listing throttled; skip quietly
+        if still_queued is None:
+            print("force-cancel verification skipped: re-listing rate-limited")
+        else:
+            stuck = [rid for rid in tail_cancelled_ids if rid in still_queued]
+            for rid in stuck:
+                try:
+                    force_cancel_run(rid)
+                    stats["tail_force_cancelled"] += 1
+                    print(f"force-cancelled stuck tail {rid} (survived plain cancel)")
+                except subprocess.CalledProcessError as e:
+                    stats["tail_failed"] += 1
+                    print(f"FAIL force-cancel {rid}: {(e.output or b'').decode()[:120]}")
+                time.sleep(0.35)
 
 print("summary:", stats)
 if stats["zombie_failed"] or stats["superseded_failed"] or stats["tail_failed"]:
