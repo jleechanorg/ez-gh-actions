@@ -218,7 +218,7 @@ pub struct InvariantSample {
 
 fn sample_invariants(cfg: &Config, loop_start: Instant) -> Result<InvariantSample> {
     let deadline = loop_start + SERVE_LOOP_TIME_BUDGET;
-    let fleet = fetch_fleet_runner_stats()?;
+    let fleet = fetch_fleet_runner_stats(deadline)?;
     let now = unix_now_secs();
     let mut repo_stats = Vec::with_capacity(MONITORED_INVARIANT_REPOS.len());
     let mut any_capped = false;
@@ -425,8 +425,9 @@ fn fetch_self_hosted_jobs(
     repo: &str,
     run: &impl RunLike,
     expected_status: &str,
+    deadline: Instant,
 ) -> Result<Vec<QueueJob>> {
-    let jobs = github::list_workflow_jobs(repo, run.run_id())
+    let jobs = github::list_workflow_jobs_until(repo, run.run_id(), deadline)
         .with_context(|| format!("list jobs for queued monitor run {}", run.run_id()))?;
     Ok(jobs
         .into_iter()
@@ -486,12 +487,12 @@ fn is_self_hosted_job(labels: &[String]) -> bool {
         .any(|label| label.eq_ignore_ascii_case("self-hosted"))
 }
 
-fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
+fn fetch_fleet_runner_stats(deadline: Instant) -> Result<FleetRunnerStats> {
     let gh = GithubConfig {
         scope: Scope::Org,
         target: FLEET_ORG.into(),
     };
-    Ok(fleet_runner_stats(github::list_runners(&gh)?))
+    Ok(fleet_runner_stats(github::list_runners_until(&gh, deadline)?))
 }
 
 /// Enumerates self-hosted jobs for `runs` via caller-supplied `fetch_jobs`,
@@ -546,7 +547,7 @@ fn fetch_capped_queue_snapshot(
     deadline: Instant,
 ) -> Result<(QueueSnapshot, bool)> {
     let first_path = format!("repos/{repo}/actions/runs?status=queued&per_page=100&page=1");
-    let first_body = github::api_json(&first_path)?;
+    let first_body = github::api_json_until(&first_path, deadline)?;
     let first_parsed: RunsResponse = serde_json::from_slice(&first_body)
         .with_context(|| format!("parse queued runs response for {repo} page 1"))?;
     let total_count = first_parsed.total_count as usize;
@@ -567,7 +568,7 @@ fn fetch_capped_queue_snapshot(
             } else {
                 let path =
                     format!("repos/{repo}/actions/runs?status=queued&per_page=100&page={page}");
-                let body = github::api_json(&path)?;
+                let body = github::api_json_until(&path, deadline)?;
                 let parsed: RunsResponse = serde_json::from_slice(&body).with_context(|| {
                     format!("parse queued runs response for {repo} page {page}")
                 })?;
@@ -584,16 +585,16 @@ fn fetch_capped_queue_snapshot(
     };
 
     let (queued, queued_bailed) = enumerate_jobs_within_budget(&queued_runs, deadline, |run| {
-        fetch_self_hosted_jobs(repo, run, "queued")
+        fetch_self_hosted_jobs(repo, run, "queued", deadline)
     })?;
     capped |= queued_bailed;
 
     let (in_progress, in_progress_bailed) = if Instant::now() >= deadline {
         (Vec::new(), true)
     } else {
-        let runs = github::list_repo_in_progress_runs(repo)?;
+        let runs = github::list_repo_in_progress_runs_until(repo, deadline)?;
         enumerate_jobs_within_budget(&runs, deadline, |run| {
-            fetch_self_hosted_jobs(repo, run, "in_progress")
+            fetch_self_hosted_jobs(repo, run, "in_progress", deadline)
         })?
     };
     capped |= in_progress_bailed;
@@ -602,7 +603,7 @@ fn fetch_capped_queue_snapshot(
         QueueSnapshot {
             queued,
             in_progress,
-            fleet: fleet.or_else(|| fetch_fleet_runner_stats().ok()),
+            fleet: fleet.or_else(|| fetch_fleet_runner_stats(deadline).ok()),
         },
         capped,
     ))
@@ -1526,6 +1527,65 @@ mod tests {
         .unwrap();
         assert!(!bailed);
         assert_eq!(collected.len(), 3);
+    }
+
+    /// Regression for bead ez-gh-actions-yrt / the ez-gh-actions-g3o fix:
+    /// a monitor tick whose FIRST gh call hits a persistent secondary rate
+    /// limit must still return within `SERVE_LOOP_TIME_BUDGET`-scale time so
+    /// the single-threaded serve loop gets back to `ensure_count` promptly,
+    /// instead of blocking through gh's internal retry-with-backoff (which
+    /// alone could burn minutes -- the live-observed 67s respawn gap). This
+    /// exercises the real code path (`fetch_capped_queue_snapshot` ->
+    /// `github::api_json_until`) via a fake `gh` binary, not just the pure
+    /// `enumerate_jobs_within_budget` wrapper above.
+    #[test]
+    fn fetch_capped_queue_snapshot_bails_within_budget_under_persistent_rate_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-monitor-starvation-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        // ALWAYS returns a secondary rate limit with a large Retry-After
+        // (60s) -- an unbounded caller would sleep at least 60s on the very
+        // first retry attempt alone.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo "gh: secondary rate limit exceeded (HTTP 403)" >&2
+echo "Retry-After: 60" >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = github::with_gh_exe(script.to_str().unwrap());
+        // A short deadline stands in for "budget nearly exhausted when this
+        // tick started" -- the exact scenario that starved ensure_count live.
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let started = Instant::now();
+        let result = fetch_capped_queue_snapshot("owner/repo", None, 50, deadline);
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_err(),
+            "persistent rate limit must surface as an error, not fabricate an empty snapshot"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a monitor tick must bail near its deadline rather than blocking through gh's \
+             internal 60s Retry-After backoff; took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

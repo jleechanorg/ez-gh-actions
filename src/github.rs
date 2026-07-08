@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{GithubConfig, Scope};
 use crate::watchdog;
@@ -118,7 +118,35 @@ fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
     None
 }
 
-fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::process::Output> {
+fn run_gh_with_backoff(make_cmd: impl FnMut() -> Command) -> Result<std::process::Output> {
+    run_gh_with_backoff_core(None, make_cmd)
+}
+
+/// Like `run_gh_with_backoff`, but bounded by `deadline`: if honoring the
+/// classified retry delay (Retry-After / exponential backoff) would sleep
+/// past `deadline`, the loop bails immediately with the last failed attempt
+/// instead of sleeping -- it never retries past the caller's time budget.
+///
+/// This exists because `run_gh_with_backoff` alone let a single gh
+/// invocation block the (single-threaded) serve loop for up to
+/// `GH_MAX_RETRIES` x `GH_RETRY_MAX_DELAY` (~128s) when GitHub's secondary
+/// rate limit persisted across every attempt -- long enough to starve
+/// `ensure_count` well past `queue_monitor::SERVE_LOOP_TIME_BUDGET` even
+/// though every OTHER fetch in that module already threads a `deadline`
+/// through. Every gh call reachable from the monitor/sampler tick must use
+/// this variant (or a wrapper built on it) so the budget is real, not
+/// aspirational.
+pub(crate) fn run_gh_with_backoff_until(
+    deadline: Instant,
+    make_cmd: impl FnMut() -> Command,
+) -> Result<std::process::Output> {
+    run_gh_with_backoff_core(Some(deadline), make_cmd)
+}
+
+fn run_gh_with_backoff_core(
+    deadline: Option<Instant>,
+    mut make_cmd: impl FnMut() -> Command,
+) -> Result<std::process::Output> {
     let mut delay = GH_RETRY_BASE_DELAY;
     for attempt in 1..=GH_MAX_RETRIES {
         let out = run_gh(make_cmd())?;
@@ -129,13 +157,23 @@ fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::pro
             if attempt >= GH_MAX_RETRIES {
                 return Ok(out);
             }
+            let sleep_for = std::cmp::max(wait, delay);
+            if let Some(dl) = deadline {
+                if Instant::now() + sleep_for >= dl {
+                    eprintln!(
+                        "gh API transient failure; time budget exhausted, bailing after \
+                         attempt {attempt}/{GH_MAX_RETRIES} instead of sleeping {}s",
+                        sleep_for.as_secs()
+                    );
+                    return Ok(out);
+                }
+            }
             eprintln!(
                 "gh API transient failure; retrying in {}s (attempt {}/{})",
-                wait.as_secs(),
+                sleep_for.as_secs(),
                 attempt,
                 GH_MAX_RETRIES
             );
-            let sleep_for = std::cmp::max(wait, delay);
             std::thread::sleep(sleep_for);
             delay = (delay * 2).min(GH_RETRY_MAX_DELAY);
             continue;
@@ -147,6 +185,26 @@ fn run_gh_with_backoff(mut make_cmd: impl FnMut() -> Command) -> Result<std::pro
 
 pub(crate) fn api_json(path: &str) -> Result<Vec<u8>> {
     let out = run_gh_with_backoff(|| {
+        let mut cmd = gh_command();
+        cmd.args(["api", path]);
+        cmd
+    })
+    .with_context(|| format!("failed to run `gh api {path}`"))?;
+    if !out.status.success() {
+        bail!(
+            "gh api {path} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// Deadline-bounded twin of `api_json` -- see `run_gh_with_backoff_until`.
+/// Every call site reachable from `queue_monitor`'s budget-tracked
+/// monitor/sampler tick must use this (or a wrapper built on it), not
+/// `api_json`, so a persistent rate limit can never starve `ensure_count`.
+pub(crate) fn api_json_until(path: &str, deadline: Instant) -> Result<Vec<u8>> {
+    let out = run_gh_with_backoff_until(deadline, || {
         let mut cmd = gh_command();
         cmd.args(["api", path]);
         cmd
@@ -340,11 +398,51 @@ pub fn list_workflow_jobs(repo: &str, run_id: u64) -> Result<Vec<WorkflowJob>> {
     Ok(parsed.jobs)
 }
 
+/// Deadline-bounded twin of `list_workflow_jobs` for `queue_monitor`'s
+/// budget-tracked tick -- see `run_gh_with_backoff_until`.
+pub fn list_workflow_jobs_until(
+    repo: &str,
+    run_id: u64,
+    deadline: Instant,
+) -> Result<Vec<WorkflowJob>> {
+    let path = workflow_run_jobs_path(repo, run_id);
+    let body = api_json_until(&path, deadline)?;
+    let parsed: WorkflowJobsResponse = serde_json::from_slice(&body)
+        .with_context(|| format!("unexpected workflow-jobs response for run {run_id}"))?;
+    Ok(parsed.jobs)
+}
+
 pub fn list_repo_in_progress_runs(repo: &str) -> Result<Vec<WorkflowRun>> {
     let mut runs = Vec::new();
     for page in 1.. {
         let path = repo_in_progress_runs_path(repo, page);
         let body = api_json(&path)?;
+        let parsed: WorkflowRunsResponse = serde_json::from_slice(&body)
+            .with_context(|| format!("unexpected in-progress runs response for {repo}"))?;
+        let done = parsed.workflow_runs.len() < 100;
+        runs.extend(parsed.workflow_runs);
+        if done {
+            break;
+        }
+    }
+    Ok(runs)
+}
+
+/// Deadline-bounded twin of `list_repo_in_progress_runs` for
+/// `queue_monitor`'s budget-tracked tick -- see `run_gh_with_backoff_until`.
+/// Bails between pages (in addition to within each `gh` call) once
+/// `deadline` has passed, returning whatever pages were already collected.
+pub fn list_repo_in_progress_runs_until(
+    repo: &str,
+    deadline: Instant,
+) -> Result<Vec<WorkflowRun>> {
+    let mut runs = Vec::new();
+    for page in 1.. {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let path = repo_in_progress_runs_path(repo, page);
+        let body = api_json_until(&path, deadline)?;
         let parsed: WorkflowRunsResponse = serde_json::from_slice(&body)
             .with_context(|| format!("unexpected in-progress runs response for {repo}"))?;
         let done = parsed.workflow_runs.len() < 100;
@@ -544,6 +642,16 @@ fn runner_is_reclaimable(runner: &RunnerInfo, owned_ids: &std::collections::Hash
 }
 
 pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
+    list_runners_core(gh, None)
+}
+
+/// Deadline-bounded twin of `list_runners` for `queue_monitor`'s
+/// budget-tracked tick -- see `run_gh_with_backoff_until`.
+pub fn list_runners_until(gh: &GithubConfig, deadline: Instant) -> Result<Vec<RunnerInfo>> {
+    list_runners_core(gh, Some(deadline))
+}
+
+fn list_runners_core(gh: &GithubConfig, deadline: Option<Instant>) -> Result<Vec<RunnerInfo>> {
     let path = runners_list_path(gh);
     // `gh api` does NOT paginate on its own, so on an org with >100 runners a
     // plain call returns only page 1 and the 409 self-heal below would miss a
@@ -552,11 +660,15 @@ pub fn list_runners(gh: &GithubConfig) -> Result<Vec<RunnerInfo>> {
     // and plain `--paginate` concatenates those objects into invalid JSON.
     // `--slurp` collects the pages into a single top-level JSON array instead,
     // which we deserialize as `Vec<RunnerList>` and flatten.
-    let out = run_gh_with_backoff(|| {
+    let make_cmd = || {
         let mut cmd = gh_command();
         cmd.args(["api", "--paginate", "--slurp", &path]);
         cmd
-    })
+    };
+    let out = match deadline {
+        Some(dl) => run_gh_with_backoff_until(dl, make_cmd),
+        None => run_gh_with_backoff(make_cmd),
+    }
     .context("failed to run `gh api`")?;
     if !out.status.success() {
         bail!(
@@ -1114,6 +1226,81 @@ exit 0
         .unwrap();
         assert!(out.status.success());
         assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression for the ez-gh-actions-yrt fleet-starvation bug: a monitor
+    /// tick that hits a persistent secondary rate limit must never block past
+    /// its caller-supplied deadline (`SERVE_LOOP_TIME_BUDGET` in
+    /// `queue_monitor.rs`). Before this fix, `run_gh_with_backoff` had no
+    /// concept of a deadline at all -- it always slept through up to
+    /// `GH_MAX_RETRIES` attempts at up to `GH_RETRY_MAX_DELAY` (32s) each,
+    /// which could keep the single-threaded serve loop away from
+    /// `ensure_count` for well over a minute per tick, live-observed as a 67s
+    /// gap between respawn bursts. The fake `gh` here ALWAYS returns a
+    /// secondary-rate-limit response with a 30s `Retry-After`, so an
+    /// unbounded caller would sleep at least 30s on the very first retry;
+    /// with a deadline just a few hundred ms out, `run_gh_with_backoff_until`
+    /// must instead bail immediately after the first failed attempt.
+    #[test]
+    fn run_gh_with_backoff_until_bails_when_deadline_is_exhausted_instead_of_sleeping() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-deadline-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let counter = dir.join("counter");
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+counter={counter}
+n=0
+if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+n=$((n + 1))
+echo "$n" > "$counter"
+echo "gh: secondary rate limit exceeded (HTTP 403)" >&2
+echo "Retry-After: 30" >&2
+exit 1
+"#,
+                counter = counter.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let out = run_gh_with_backoff_until(deadline, || {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg(&script);
+            cmd
+        })
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            !out.status.success(),
+            "gh never succeeds in this test; the returned output must be the last failed attempt"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run_gh_with_backoff_until must bail once the deadline is exhausted rather than \
+             sleeping through the full 30s Retry-After; took {elapsed:?}"
+        );
+        // Exactly one attempt: the deadline (200ms) is exhausted before the
+        // first retry sleep (which would wait max(30s Retry-After, 2s base)),
+        // so the loop must bail after attempt 1 without retrying at all.
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "1");
         let _ = std::fs::remove_dir_all(dir);
     }
 
