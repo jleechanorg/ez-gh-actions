@@ -914,15 +914,7 @@ fn run_reaper_plan(
     let mut allowed_prefixes = vec![cfg.runner.name_prefix.clone()];
     allowed_prefixes.extend(retired_prefixes.iter().cloned());
     let runners = github::list_runners(&cfg.github)?;
-    let mut repo_runs = Vec::new();
-    for repo in selected_repos {
-        let mut runs_with_jobs = Vec::new();
-        for run in github::list_repo_in_progress_runs(&repo)? {
-            let jobs = github::list_workflow_jobs(&repo, run.id)?;
-            runs_with_jobs.push((run, jobs));
-        }
-        repo_runs.push((repo, runs_with_jobs));
-    }
+    let repo_runs = reaper::collect_repo_runs(&selected_repos)?;
     Ok(reaper::plan_reaper_actions(
         &runners,
         &repo_runs,

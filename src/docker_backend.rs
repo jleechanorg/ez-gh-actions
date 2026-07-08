@@ -16,6 +16,7 @@ use crate::backend::Backend;
 use crate::config::Config;
 use crate::github;
 use crate::platform::Platform;
+use crate::reaper;
 use crate::watchdog;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
@@ -324,6 +325,27 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
                     reclaimed += 1;
                     watchdog::ping();
                 }
+                Err(err) if is_runner_busy_lock_error(&err) => {
+                    // GitHub's DELETE-runner lock is job-side, not
+                    // runner-side (see memory gh-zombie-runner-422-delete-lock):
+                    // cancel the phantom run pinned to this runner first,
+                    // which is what actually holds the 422 lock, then retry
+                    // the delete. `live_runners` already has this runner's
+                    // `RunnerInfo` from the reconciliation fetch above.
+                    let healed = live_runners
+                        .iter()
+                        .find(|r| r.id == runner_id)
+                        .is_some_and(|r| reclaim_zombie_locked_runner(cfg, r));
+                    if healed {
+                        release_slot_for(Some(cfg), slot_n)?;
+                        reclaimed += 1;
+                        watchdog::ping();
+                    } else {
+                        eprintln!(
+                            "warning: keeping slot {slot_n}: failed to remove offline/busy runner {runner_name} (id {runner_id}) even after zombie-slot self-heal: {err:#}"
+                        );
+                    }
+                }
                 Err(err) => {
                     eprintln!(
                         "warning: keeping slot {slot_n}: failed to remove offline/busy runner {runner_name} (id {runner_id}): {err:#}"
@@ -498,6 +520,127 @@ fn offline_busy_owned_missing_container_slots(
 
 fn runner_name_from_prefix(prefix: &str, slot: u32) -> String {
     format!("{prefix}-{slot}")
+}
+
+/// Poll/force-cancel attempts given to the reaper executor before this tick
+/// gives up on a zombie-locked runner. Deliberately short: `release_stale_slots`
+/// re-runs every reconciliation cycle, so a failed attempt here just retries
+/// from scratch next tick rather than blocking this one on a long poll.
+const ZOMBIE_RECLAIM_POLL_ATTEMPTS: u32 = 3;
+
+/// Does `err` look like GitHub's "runner is currently running a job and
+/// cannot be deleted" (HTTP 422) lock, as opposed to some other failure
+/// (network blip, auth, rate limit)? Only the job-lock case is safe to
+/// self-heal by cancelling a run; any other error must keep falling back to
+/// the existing "keep slot, warn" behavior untouched.
+fn is_runner_busy_lock_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_lowercase();
+    text.contains("422") || text.contains("currently running a job")
+}
+
+/// Given a runner already confirmed offline+busy+missing-container (i.e. a
+/// zombie: its container is dead but GitHub still thinks a job is running on
+/// it), find the phantom run pinned to it and cancel-then-delete it. Pure
+/// w.r.t. IO: `repo_runs` is pre-fetched and `api` is injected, so this is
+/// exercised in tests via `reaper::test_support::FakeReaperApi` without
+/// touching the network. Mirrors the known-good remediation order from
+/// `docs/incident-20260706-fleet-outage.md` / memory
+/// `gh-zombie-runner-422-delete-lock` (bead ez-gh-actions-qbl): cancel the
+/// run that holds the lock FIRST, then delete the runner registration.
+/// Returns `None` when no matching in-progress job was found in `repo_runs`
+/// (nothing to cancel); returns `Some(execution)` otherwise, whose
+/// `status` tells the caller whether the runner was actually removed.
+fn reclaim_zombie_locked_runner_with_api(
+    runner: &github::RunnerInfo,
+    repo_runs: &[(String, reaper::RepoRunsWithJobs)],
+    allowed_prefixes: &[String],
+    required_labels: &[String],
+    poll_attempts: u32,
+    api: &mut impl reaper::ReaperApi,
+) -> Option<reaper::ReaperExecution> {
+    // min_age_seconds=0: unlike the periodic reaper sweep (which only reaps
+    // jobs old enough to be suspicious), this path already knows the runner
+    // is a confirmed zombie (missing container) — age is irrelevant.
+    let plans = reaper::plan_reaper_actions(
+        std::slice::from_ref(runner),
+        repo_runs,
+        allowed_prefixes,
+        required_labels,
+        0,
+        unix_now_secs(),
+    );
+    let plan = plans.first()?;
+    Some(reaper::execute_reaper_plan_with_api(
+        api,
+        plan,
+        poll_attempts,
+    ))
+}
+
+/// Production wrapper around [`reclaim_zombie_locked_runner_with_api`]: does
+/// the real IO (repo discovery + run/job listing) and wires in
+/// `reaper::LiveReaperApi` against real GitHub. Only the repos configured on
+/// this host (`reaper::default_reaper_repos`) are searched — a job pinned to
+/// this runner in some other, unconfigured repo would not be found here.
+fn reclaim_zombie_locked_runner(cfg: &Config, runner: &github::RunnerInfo) -> bool {
+    let repos = reaper::default_reaper_repos(cfg);
+    if repos.is_empty() {
+        eprintln!(
+            "warning: zombie-slot self-heal for {} (id {}): no repos configured to search for its phantom run",
+            runner.name, runner.id
+        );
+        return false;
+    }
+    let repo_runs = match reaper::collect_repo_runs(&repos) {
+        Ok(repo_runs) => repo_runs,
+        Err(err) => {
+            eprintln!(
+                "warning: zombie-slot self-heal for {} (id {}): failed to list in-progress runs in {repos:?}: {err:#}",
+                runner.name, runner.id
+            );
+            return false;
+        }
+    };
+    let allowed_prefixes = vec![cfg.runner.name_prefix.clone()];
+    let mut api = reaper::LiveReaperApi::new(&cfg.github);
+    let execution = reclaim_zombie_locked_runner_with_api(
+        runner,
+        &repo_runs,
+        &allowed_prefixes,
+        &cfg.runner.labels,
+        ZOMBIE_RECLAIM_POLL_ATTEMPTS,
+        &mut api,
+    );
+    match execution {
+        Some(execution) if execution.status == reaper::ReaperExecutionStatus::Completed => {
+            eprintln!(
+                "info: zombie-slot self-heal cancelled run {} and removed runner {} (id {})",
+                execution.run_id, runner.name, runner.id
+            );
+            true
+        }
+        Some(execution) => {
+            eprintln!(
+                "warning: zombie-slot self-heal for {} (id {}) did not complete (status {:?}); keeping slot",
+                runner.name, runner.id, execution.status
+            );
+            false
+        }
+        None => {
+            eprintln!(
+                "warning: zombie-slot self-heal for {} (id {}): no in-progress job found in {repos:?}; keeping slot",
+                runner.name, runner.id
+            );
+            false
+        }
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Print the `ezgha doctor`-style diagnostics for the current host. Today this
@@ -1651,6 +1794,133 @@ mod tests {
             CONSECUTIVE_DISK_NONE.load(Ordering::SeqCst),
             0,
             "any Some(_) result must reset the strike counter"
+        );
+    }
+
+    // --- bead ez-gh-actions-qbl: zombie-slot self-heal ------------------
+
+    #[test]
+    fn is_runner_busy_lock_error_detects_422_job_lock() {
+        let err = anyhow::anyhow!(
+            "gh api remove runner 1234 failed: gh: Runner \"ez-org-runner-1\" is currently running a job and cannot be deleted. (HTTP 422)"
+        );
+        assert!(is_runner_busy_lock_error(&err));
+    }
+
+    #[test]
+    fn is_runner_busy_lock_error_ignores_unrelated_errors() {
+        let network = anyhow::anyhow!("gh api remove runner 1234 failed: connection reset");
+        let auth = anyhow::anyhow!("gh api remove runner 1234 failed: HTTP 401 bad credentials");
+        assert!(!is_runner_busy_lock_error(&network));
+        assert!(!is_runner_busy_lock_error(&auth));
+    }
+
+    #[test]
+    fn reclaim_zombie_locked_runner_cancels_then_deletes_on_success() {
+        use crate::reaper::test_support::{job, run, runner, FakeReaperApi};
+        use std::collections::VecDeque;
+
+        let zombie = runner(1234, "ez-org-runner-1");
+        let in_progress_job = job(2, Some(1234), Some("ez-org-runner-1"));
+        let mut completed = in_progress_job.clone();
+        completed.status = "completed".into();
+        completed.conclusion = Some("cancelled".into());
+        let repo_runs = vec![(
+            "owner/repo".to_string(),
+            vec![(run(7, "in_progress"), vec![in_progress_job.clone()])],
+        )];
+        let mut api = FakeReaperApi {
+            job_batches: VecDeque::from([Ok(vec![in_progress_job]), Ok(vec![completed])]),
+            ..Default::default()
+        };
+
+        let execution = reclaim_zombie_locked_runner_with_api(
+            &zombie,
+            &repo_runs,
+            &["ez-org-runner".to_string()],
+            &["self-hosted".to_string(), "ezgha".to_string()],
+            3,
+            &mut api,
+        )
+        .expect("a matching in-progress job must produce a reaper plan");
+
+        assert_eq!(execution.status, reaper::ReaperExecutionStatus::Completed);
+        assert_eq!(
+            api.calls,
+            [
+                "cancel:owner/repo:7",
+                "jobs:owner/repo:7",
+                "jobs:owner/repo:7",
+                "delete:1234",
+            ],
+            "must cancel the phantom run BEFORE retrying the runner delete"
+        );
+    }
+
+    #[test]
+    fn reclaim_zombie_locked_runner_keeps_slot_when_job_never_leaves_in_progress() {
+        use crate::reaper::test_support::{job, run, runner, FakeReaperApi};
+
+        let zombie = runner(1234, "ez-org-runner-1");
+        let repo_runs = vec![(
+            "owner/repo".to_string(),
+            vec![(
+                run(7, "in_progress"),
+                vec![job(2, Some(1234), Some("ez-org-runner-1"))],
+            )],
+        )];
+        // Default FakeReaperApi has no seeded job_batches, so every poll
+        // (post-cancel AND post-force-cancel) keeps reporting the job as
+        // still in_progress -- simulating a job GitHub never releases.
+        let mut api = FakeReaperApi::default();
+
+        let execution = reclaim_zombie_locked_runner_with_api(
+            &zombie,
+            &repo_runs,
+            &["ez-org-runner".to_string()],
+            &["self-hosted".to_string(), "ezgha".to_string()],
+            2,
+            &mut api,
+        )
+        .expect("a matching in-progress job must produce a reaper plan");
+
+        assert_ne!(
+            execution.status,
+            reaper::ReaperExecutionStatus::Completed,
+            "a job stuck in_progress through force-cancel must not be treated as reclaimed"
+        );
+        assert!(
+            !api.calls.iter().any(|c| c.starts_with("delete:")),
+            "must never delete the runner registration while its job is still in_progress: {:?}",
+            api.calls
+        );
+    }
+
+    #[test]
+    fn reclaim_zombie_locked_runner_returns_none_when_no_matching_job() {
+        use crate::reaper::test_support::{runner, FakeReaperApi};
+
+        let zombie = runner(1234, "ez-org-runner-1");
+        // No repos own an in-progress job for this runner.
+        let repo_runs: Vec<(String, reaper::RepoRunsWithJobs)> = vec![];
+        let mut api = FakeReaperApi::default();
+
+        let execution = reclaim_zombie_locked_runner_with_api(
+            &zombie,
+            &repo_runs,
+            &["ez-org-runner".to_string()],
+            &["self-hosted".to_string(), "ezgha".to_string()],
+            3,
+            &mut api,
+        );
+
+        assert!(
+            execution.is_none(),
+            "no candidate repo/run means nothing to cancel"
+        );
+        assert!(
+            api.calls.is_empty(),
+            "must not call the GitHub API at all when no plan was found"
         );
     }
 }

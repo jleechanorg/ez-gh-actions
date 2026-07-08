@@ -1,8 +1,8 @@
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::config::{Config, Scope};
-use crate::github::{RunnerInfo, WorkflowJob, WorkflowRun};
+use crate::config::{Config, GithubConfig, Scope};
+use crate::github::{self, RunnerInfo, WorkflowJob, WorkflowRun};
 use crate::queue_monitor::parse_github_timestamp_secs;
 
 pub type RepoRunsWithJobs = Vec<(WorkflowRun, Vec<WorkflowJob>)>;
@@ -322,6 +322,57 @@ pub fn default_reaper_repos(cfg: &Config) -> Vec<String> {
     repos
 }
 
+/// Fetch in-progress runs (and their jobs) for each repo, in the shape
+/// `plan_reaper_actions` expects. Shared by the CLI `reaper-plan` command
+/// (`main::run_reaper_plan`) and the docker_backend zombie-slot self-heal
+/// path (bead ez-gh-actions-qbl) so both correlate a busy runner to its
+/// phantom run/job through the exact same GitHub calls — no divergent
+/// duplicate lookups.
+pub fn collect_repo_runs(repos: &[String]) -> Result<Vec<(String, RepoRunsWithJobs)>> {
+    let mut repo_runs = Vec::new();
+    for repo in repos {
+        let mut runs_with_jobs = Vec::new();
+        for run in github::list_repo_in_progress_runs(repo)? {
+            let jobs = github::list_workflow_jobs(repo, run.id)?;
+            runs_with_jobs.push((run, jobs));
+        }
+        repo_runs.push((repo.clone(), runs_with_jobs));
+    }
+    Ok(repo_runs)
+}
+
+/// `ReaperApi` implementation that calls real GitHub via `crate::github`.
+/// Used to wire `execute_reaper_plan_with_api` into production self-heal
+/// paths (see `docker_backend::reclaim_zombie_locked_runner`); tests use
+/// `test_support::FakeReaperApi` instead.
+pub struct LiveReaperApi<'a> {
+    gh: &'a GithubConfig,
+}
+
+impl<'a> LiveReaperApi<'a> {
+    pub fn new(gh: &'a GithubConfig) -> Self {
+        Self { gh }
+    }
+}
+
+impl ReaperApi for LiveReaperApi<'_> {
+    fn cancel_workflow_run(&mut self, repo: &str, run_id: u64) -> Result<()> {
+        github::cancel_workflow_run(repo, run_id)
+    }
+
+    fn force_cancel_workflow_run(&mut self, repo: &str, run_id: u64) -> Result<()> {
+        github::force_cancel_workflow_run(repo, run_id)
+    }
+
+    fn list_workflow_jobs(&mut self, repo: &str, run_id: u64) -> Result<Vec<WorkflowJob>> {
+        github::list_workflow_jobs(repo, run_id)
+    }
+
+    fn remove_runner(&mut self, runner_id: u64) -> Result<()> {
+        github::remove_runner(self.gh, runner_id)
+    }
+}
+
 pub fn plan_reaper_actions(
     runners: &[RunnerInfo],
     repo_runs: &[(String, RepoRunsWithJobs)],
@@ -407,13 +458,18 @@ fn has_required_labels(job: &WorkflowJob, required_labels: &[String]) -> bool {
         .all(|required| job.labels.iter().any(|label| label == required))
 }
 
+/// Test-only fixtures and a `ReaperApi` fake shared across `reaper`'s own
+/// tests and `docker_backend`'s zombie-slot self-heal tests (bead
+/// ez-gh-actions-qbl) so both exercise the cancel-then-delete sequencing
+/// through the identical `cancel:{repo}:{run_id}` / `force-cancel:...` /
+/// `delete:{runner_id}` call log, rather than two divergent mocks.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use anyhow::bail;
     use std::collections::VecDeque;
 
-    fn run(id: u64, status: &str) -> WorkflowRun {
+    pub(crate) fn run(id: u64, status: &str) -> WorkflowRun {
         WorkflowRun {
             id,
             name: "CI".into(),
@@ -430,7 +486,7 @@ mod tests {
         }
     }
 
-    fn job(id: u64, runner_id: Option<u64>, runner_name: Option<&str>) -> WorkflowJob {
+    pub(crate) fn job(id: u64, runner_id: Option<u64>, runner_name: Option<&str>) -> WorkflowJob {
         WorkflowJob {
             id,
             name: "test".into(),
@@ -448,7 +504,7 @@ mod tests {
         }
     }
 
-    fn runner(id: u64, name: &str) -> RunnerInfo {
+    pub(crate) fn runner(id: u64, name: &str) -> RunnerInfo {
         RunnerInfo {
             id,
             name: name.into(),
@@ -457,27 +513,13 @@ mod tests {
         }
     }
 
-    fn plan() -> ReaperPlan {
-        ReaperPlan {
-            runner_id: 42,
-            runner_name: "ez-runner-c-1".into(),
-            repo: "owner/repo".into(),
-            run_id: 7,
-            run_url: "https://github.example/runs/7".into(),
-            job_id: 2,
-            job_url: Some("https://github.example/jobs/2".into()),
-            age_seconds: 3600,
-            sequence: vec![],
-        }
-    }
-
     #[derive(Default)]
-    struct FakeReaperApi {
-        calls: Vec<String>,
-        cancel_error: Option<String>,
-        force_cancel_error: Option<String>,
-        job_batches: VecDeque<Result<Vec<WorkflowJob>, String>>,
-        delete_error: Option<String>,
+    pub(crate) struct FakeReaperApi {
+        pub(crate) calls: Vec<String>,
+        pub(crate) cancel_error: Option<String>,
+        pub(crate) force_cancel_error: Option<String>,
+        pub(crate) job_batches: VecDeque<Result<Vec<WorkflowJob>, String>>,
+        pub(crate) delete_error: Option<String>,
     }
 
     impl ReaperApi for FakeReaperApi {
@@ -515,12 +557,33 @@ mod tests {
         }
     }
 
-    fn completed_job() -> WorkflowJob {
+    pub(crate) fn completed_job() -> WorkflowJob {
         let mut completed = job(2, Some(42), Some("ez-runner-c-1"));
         completed.status = "completed".into();
         completed.conclusion = Some("cancelled".into());
         completed.completed_at = Some("2026-07-07T09:00:00Z".into());
         completed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{completed_job, job, run, runner, FakeReaperApi};
+    use super::*;
+    use std::collections::VecDeque;
+
+    fn plan() -> ReaperPlan {
+        ReaperPlan {
+            runner_id: 42,
+            runner_name: "ez-runner-c-1".into(),
+            repo: "owner/repo".into(),
+            run_id: 7,
+            run_url: "https://github.example/runs/7".into(),
+            job_id: 2,
+            job_url: Some("https://github.example/jobs/2".into()),
+            age_seconds: 3600,
+            sequence: vec![],
+        }
     }
 
     fn completed_unrelated_job() -> WorkflowJob {
