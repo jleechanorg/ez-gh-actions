@@ -1,3 +1,66 @@
+FROM ghcr.io/actions/actions-runner:latest AS wheelhouse
+
+USER root
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3-dev \
+    python3-venv \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /tmp/wheel-venv \
+    && /tmp/wheel-venv/bin/pip install --no-cache-dir --upgrade pip wheel \
+    && mkdir -p /ezgha/wheelhouse \
+    && printf '%s\n' \
+        'ruff==0.8.4' \
+        'mypy==1.13.0' \
+        'Flask==3.1.3' \
+        'gunicorn==23.0.0' \
+        'firebase-admin==6.5.0' \
+        'google-cloud-firestore==2.16.0' \
+        'google-api-core>=2.19.0' \
+        'google-auth>=2.35.0' \
+        'cachetools>=5.3.0' \
+        'google-genai' \
+        'protobuf>=4.25.3,<6.0.0' \
+        'grpcio>=1.62.0,<2.0.0' \
+        'grpcio-status>=1.62.0,<2.0.0' \
+        'flask-compress>=1.15' \
+        'Flask-Cors==6.0.0' \
+        'Flask-Limiter>=3.5.0' \
+        'fpdf2' \
+        'python-docx' \
+        'google-cloud-secret-manager>=2.20.2' \
+        'google-cloud-storage>=2.16.2' \
+        'selenium' \
+        'pydantic' \
+        'jsonschema>=4.21.0' \
+        'requests>=2.31.0' \
+        'playwright>=1.40.0' \
+        'beautifulsoup4>=4.12.0' \
+        'psutil>=5.9.0' \
+        'PyJWT>=2.8.0' \
+        'isort>=5.13.0' \
+        'bandit>=1.7.0' \
+        'types-flask>=1.1.6' \
+        'types-requests>=2.31.0' \
+        'mcp>=1.0.0' \
+        'pytest>=7.4.0' \
+        'pytest-timeout>=2.4.0' \
+        'pytest-testmon>=2.2.0,<3.0.0' \
+        'pytest-cov>=4.1.0' \
+        'pytest-mock>=3.11.0' \
+        'fastembed==0.7.4' \
+        'numpy>=1.24.0,<2.2.0; python_version < "3.14"' \
+        'numpy>=2.3.0,<3; python_version >= "3.14"' \
+        'black>=23.0.0' \
+        'flake8>=6.0.0' \
+        'colorama>=0.4.6' \
+        > /tmp/ezgha-wheelhouse-requirements.txt
+
+RUN /tmp/wheel-venv/bin/pip wheel --no-cache-dir --prefer-binary --wheel-dir /ezgha/wheelhouse -r /tmp/ezgha-wheelhouse-requirements.txt
+
 FROM ghcr.io/actions/actions-runner:latest
 
 USER root
@@ -21,5 +84,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get update \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=wheelhouse /ezgha/wheelhouse /ezgha/wheelhouse
+
+ENV PIP_FIND_LINKS=/ezgha/wheelhouse
 
 USER runner
