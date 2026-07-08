@@ -1,0 +1,11 @@
+[Unit]
+Description=Clean up stale and superseded GitHub Actions queue runs every 6 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=ezgha-queue-reaper.service
+
+[Install]
+WantedBy=timers.target

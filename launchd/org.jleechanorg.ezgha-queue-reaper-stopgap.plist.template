@@ -4,7 +4,7 @@
   STOPGAP ONLY — org.jleechanorg.ezgha-queue-reaper-stopgap
 
   Purpose:
-    Runs scripts/queue-reaper-stopgap.sh every 900s (15 min) to cancel
+    Runs scripts/queue-reaper-stopgap.sh every 21600s (6 hours) to cancel
     fresh-tail queued GitHub Actions runs on jleechanorg/worldarchitect.ai
     older than FRESH_TAIL_MIN=20 minutes, keeping the self-hosted queue tail
     near the 20-minute health threshold between manual/agent cleanup passes.
@@ -59,7 +59,7 @@
   </dict>
 
   <key>StartInterval</key>
-  <integer>900</integer>
+  <integer>21600</integer>
 
   <key>RunAtLoad</key>
   <false/>

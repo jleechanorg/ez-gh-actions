@@ -1,1 +1,6 @@
 /target
+/.ao
+/.claude
+/config/daemon.toml
+/doctor-runner
+goals/*/22-of-22-proof.jsonl

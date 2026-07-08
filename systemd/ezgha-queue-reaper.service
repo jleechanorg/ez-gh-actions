@@ -1,0 +1,9 @@
+[Unit]
+Description=Clean up stale and superseded GitHub Actions queue runs
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@REPO_PATH@/scripts/cleanup-stuck-runs.sh --apply
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin
