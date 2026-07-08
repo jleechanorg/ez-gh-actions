@@ -133,10 +133,7 @@ fn mark_service_ready_and_start_watchdog() -> watchdog::Heartbeat {
     heartbeat
 }
 
-fn log_skipped_stronger_backends(
-    skipped_stronger: &[backend::Backend],
-    backend: backend::Backend,
-) {
+fn log_skipped_stronger_backends(skipped_stronger: &[backend::Backend], backend: backend::Backend) {
     for s in skipped_stronger {
         eprintln!(
             "note: {} offers stronger isolation but is not driven by ezgha yet; using {}",
@@ -1239,9 +1236,10 @@ mod tests {
 
     #[test]
     fn queue_monitor_tick_errors_are_non_fatal() {
-        assert!(!run_tick::<queue_monitor::QueueStats>("queue monitor check", || {
-            anyhow::bail!("synthetic queue monitor failure")
-        }));
+        assert!(!run_tick::<queue_monitor::QueueStats>(
+            "queue monitor check",
+            || { anyhow::bail!("synthetic queue monitor failure") }
+        ));
         assert!(run_tick::<queue_monitor::QueueStats>(
             "queue monitor check",
             || Ok(None)

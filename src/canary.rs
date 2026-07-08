@@ -120,7 +120,6 @@ impl CanaryDaemonState {
             }
         }
     }
-
 }
 
 impl Default for CanaryDaemonState {
