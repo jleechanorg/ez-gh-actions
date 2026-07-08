@@ -242,16 +242,22 @@ step after a real deploy.
   restart for exact SHA parity (0a4c8e1) or accept the current state (functionally identical,
   cosmetic 1-commit gap only).
 
+- 2026-07-08 10:12 — team-lead ENDORSED the stop-at-live-verification decision explicitly:
+  leave the cosmetic SHA gap, no 3rd restart. Root-caused as Gate 0 being over-sensitive
+  (reds on ANY head advance incl. docs/fmt-only, structurally guaranteeing this false-red
+  after every non-functional commit). Filed bead ez-gh-actions-eqx (P2): "Gate 0 should
+  ignore docs/fmt-only HEAD advances" with the full incident tied to it. Final health check:
+  containers 15, load 5.93/8.26/8.95 (falling), journalctl since-10-min still shows ZERO
+  cancel/force-cancel/zombie log lines (quiet log, expected, no zombies present right now).
+  MISSION COMPLETE: all 3 key fixes (reaper zombie-slot self-heal, capacity-proof harness,
+  App-token isolated rate-limit bucket) are MERGED to origin/main AND LIVE on jeff-ubuntu,
+  independently live-verified (not just build-verified). Sent final one-line confirmation to
+  team-lead.
+
 ## Next Actions (rewritten every step)
 
-1. reaper fix (fix #1) DEPLOY: FUNCTIONALLY COMPLETE. Deployed+running binary is 5f0374a
-   (contains reaper self-heal + App token + capacity-proof code in full). HEAD has since
-   advanced by ONE purely-cosmetic formatting commit (0a4c8e1) that I chose not to chase with
-   a 3rd restart. Awaiting team-lead's call: leave as-is (documented gap) or do one more
-   Gate-0-safe restart for exact SHA parity. NOT doing anything further without that input.
-2. capacity-proof (fix #2): CLOSED.
-3. App token (fix #3): CLOSED — confirmed active on the post-reaper-deploy restart too (GH_TOKEN
-   live in a real gh subprocess of the current daemon PID).
-4. Once team-lead responds on the SHA-parity question (or is silent long enough that "leave
-   as-is" is clearly fine): do a final sustained-capacity check (16/16 + queue-drain observed
-   over a few minutes) and declare the entire 3-fix mission done end-to-end.
+MISSION COMPLETE — no further action needed on the 3 key fixes. If resumed: re-check
+`git branch -r | grep -iE 'reaper|qbl|zombie'` is gone/merged (it is, adafa19+ on main),
+confirm bead ez-gh-actions-eqx (Gate 0 docs/fmt-only false-red) still needs an owner/fix,
+and check whether Mac-side daemon has since been restarted onto the App-token code (that
+restart was always main/mac-session's call, not mine).
