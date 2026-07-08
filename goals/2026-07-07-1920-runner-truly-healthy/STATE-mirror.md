@@ -1291,3 +1291,32 @@ this worktree every 30s, local-only (git rev-parse + pgrep, no gh calls).
 Fleet watch continues unchanged: last sample containers=2, load 7.74(1m) --
 still low but stable, consistent with the ongoing rate-limit incident already
 reported to main, not a new escalation.
+
+---
+
+## sidekick3 — REST+GraphQL round PAUSED per directive, fleet recovered (2026-07-07 23:25 PT)
+
+**Fleet recovered independently confirmed**: fleet-restore's fix landed -- own
+Monitor samples show containers climbing 2 -> 4 -> 16 -> settling ~9, load
+staying safe (6-13 range) through the transition. Matches main's report
+(throttle layer deleted, binary c46fa7e, fleet healthy 10-13/16). Bead
+ez-gh-actions-rfk (po2 ceiling tuning) is now MOOT -- no more gate to tune,
+noting this but not closing the bead myself (main/fleet-restore's call).
+
+**REST+GraphQL split PAUSED per main's directive** ("err on the side of
+deleting things", upcoming adversarial review will judge if this split is
+worth keeping): stopped the in-flight codex process (was 26+ min into TASK 2
+GraphQL schema migration, no commits from that step) rather than let it keep
+expanding scope. Landed and pushed to origin: TASK 1a (`8f2e80c`, REST-quota
+gate) + TASK 1b (`9db281d`, the mid-loop quota-awareness fix -- the genuinely
+useful part per main). Final state confirmed clean: `git status -s` clean
+(after reverting an incidental beads.jsonl touch), 187/187 tests pass on
+branch `sidekick/rest-graphql-split` @ 9db281d, matches origin exactly.
+NOT merged to main, NOT deployed -- stays on its branch pending the
+adversarial review's verdict per instruction. My staged TASK 3 (secondary
+rate-limit backoff fix, prompt already written) is NOT dispatched --
+holding per the "no new rounds" directive.
+
+**Standing by** for the adversarial /swarm review of ez-gh-actions +
+worldarchitect.ai + CI usage (err-toward-deletion, max 4h) -- available to
+help orchestrate per main's offer.
