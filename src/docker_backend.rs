@@ -368,6 +368,62 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
         }
     }
     watchdog::ping();
+    // 4th sub-pass (bead ez-gh-actions-u3w): Path 1 already released the slot
+    // entry for offline+!busy+no-container runners but left the GitHub
+    // registration in place. The next JIT-config attempt with the same slot
+    // name collides with this orphan (`in use by an online/busy runner` /
+    // 422). Reap it directly here — no cancel/poll needed because the runner
+    // is NOT busy (qbl's lane handles busy via Path 2's cancel-then-delete).
+    // Mirrors the qbl helper signature but iterates `live_runners` directly
+    // keyed on `runner.name` prefix (Path 1 has already wiped the slot-file
+    // row, so the runner_id is no longer reachable from `assignments`).
+    if let Some(local_names) = local_container_names.as_ref() {
+        for (runner_id, runner_name) in
+            offline_not_busy_owned_missing_container_registrations(
+                &live_runners,
+                &cfg.runner.name_prefix,
+                local_names,
+            )
+        {
+            eprintln!(
+                "warning: removing stale offline/idle registration {runner_name} (id {runner_id}) with no local container — slot entry was already released by Path 1"
+            );
+            match github::remove_runner(&cfg.github, runner_id) {
+                Ok(()) => {
+                    reclaimed += 1;
+                    watchdog::ping();
+                }
+                Err(err) if is_runner_busy_lock_error(&err) => {
+                    // Defensive: the API snapshot we read at the top of this
+                    // call could lie about busy (the same lie the s9d
+                    // synthesis warned about). If GitHub now reports the
+                    // runner as holding a job, hand off to the qbl zombie
+                    // self-heal which cancels the run first, then deletes.
+                    // This keeps the blast radius bounded to runners we
+                    // already believed were reapable and avoids widening
+                    // plan_reaper_actions' surface.
+                    let healed = live_runners
+                        .iter()
+                        .find(|r| r.id == runner_id)
+                        .is_some_and(|r| reclaim_zombie_locked_runner(cfg, r));
+                    if healed {
+                        reclaimed += 1;
+                        watchdog::ping();
+                    } else {
+                        eprintln!(
+                            "warning: failed to remove stale registration {runner_name} (id {runner_id}) — 422 lock detected at delete time and zombie self-heal did not complete: {err:#}"
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to remove stale registration {runner_name} (id {runner_id}): {err:#}"
+                    );
+                }
+            }
+        }
+    }
+    watchdog::ping();
     // Forward sweep: GitHub has runners with our prefix that NO slot file
     // entry owns. These are JIT registrations whose slot reservation was
     // released (empty-id path above) before `record_slot_runner_id` could
@@ -537,6 +593,70 @@ fn offline_busy_owned_missing_container_slots(
         }
     }
     slots
+}
+
+/// 4th sub-pass of `release_stale_slots` (bead ez-gh-actions-u3w). Returns the
+/// `(runner_id, runner_name)` pairs of live GitHub registrations that match
+/// ALL of the following — the s9d latent-gap signature:
+///
+/// 1. `runner.name` starts with `{runner_prefix}-` (strictly owned-by-this-host;
+///    sibling-host blast radius is excluded by the prefix gate, the same
+///    defense Path 3's forward sweep uses).
+/// 2. `runner.status` is `offline` (per a fresh API call — `live_runners` was
+///    just fetched this tick; the API is the only authoritative source even
+///    when it lies about counts).
+/// 3. `runner.busy == false` (a busy runner holds a real job lock and MUST
+///    go through Path 2's cancel-then-delete sequencing — calling
+///    `remove_runner` on it would 422 just like the qbl 422-zombie class).
+/// 4. No local docker container exists with `runner.name` (the container
+///    really is dead; an API-snapshot lag or a parent-process mid-restart
+///    would otherwise let us delete a registration a live container is
+///    about to claim).
+///
+/// Why a separate helper (and not extending `plan_reaper_actions`): the
+/// planner only emits plans for **busy** runners, because every existing
+/// caller assumes `cancel a run first, then delete`. Widening it to accept
+/// `!busy` plans would re-introduce the "delete another host's registration"
+/// risk on every call site. Keeping the new lane local to `release_stale_slots`
+/// preserves the prefix-gated blast radius without touching the reaper's
+/// public surface.
+///
+/// Why keyed on `live_runners` (not the slot file like the qbl helper): Path 1
+/// has already released the slot entry by the time we get here, so the
+/// runner_id is no longer in `assignments` — we have to key on the name prefix
+/// against the live runner list directly. See synthesis
+/// `mac-stalereg-s9d-investigation-20260708.md` §2 and §6.
+fn offline_not_busy_owned_missing_container_registrations(
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: &HashSet<String>,
+) -> Vec<(u64, String)> {
+    if runner_prefix.is_empty() {
+        // Without a prefix there is no ownership gate — refuse to enumerate
+        // candidates rather than risk reaping someone else's runner.
+        return Vec::new();
+    }
+    let prefix = format!("{runner_prefix}-");
+    let mut reapable = Vec::new();
+    for runner in live_runners {
+        if !runner.name.starts_with(&prefix) {
+            continue;
+        }
+        if !runner.status.eq_ignore_ascii_case("offline") {
+            continue;
+        }
+        if runner.busy {
+            // 422-zombie class is Path 2's job; never delete without cancelling.
+            continue;
+        }
+        if local_container_names.contains(&runner.name) {
+            // Local container present — could be parent mid-restart or
+            // API snapshot lag. Leave the registration alone.
+            continue;
+        }
+        reapable.push((runner.id, runner.name.clone()));
+    }
+    reapable
 }
 
 fn runner_name_from_prefix(prefix: &str, slot: u32) -> String {
@@ -1982,6 +2102,150 @@ mod tests {
         assert!(
             api.calls.is_empty(),
             "must not call the GitHub API at all when no plan was found"
+        );
+    }
+
+    // --- bead ez-gh-actions-u3w: 4th sub-pass (offline-not-busy stale reg) ---
+
+    fn s9d_runner(id: u64, name: &str, status: &str, busy: bool) -> github::RunnerInfo {
+        github::RunnerInfo {
+            id,
+            name: name.into(),
+            status: status.into(),
+            busy,
+        }
+    }
+
+    #[test]
+    fn offline_not_busy_owned_missing_container_registration_is_reapable() {
+        // happy_path: offline + !busy + our prefix + no local container
+        // → id is eligible for direct github::remove_runner.
+        let live = vec![s9d_runner(140294, "ez-org-runner-2", "offline", false)];
+        let local_names = HashSet::new();
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert_eq!(
+            reapable,
+            vec![(140294, "ez-org-runner-2".to_string())],
+            "offline idle runner with our prefix and no local container must be returned for direct removal"
+        );
+    }
+
+    #[test]
+    fn offline_busy_runner_is_not_returned_by_u3w_helper() {
+        // negative_busy: status=offline but busy=true (qbl/422-zombie class).
+        // Must NOT appear here — u3w is the offline+!busy lane. Path 2 owns
+        // the busy case via offline_busy_owned_missing_container_slots +
+        // reclaim_zombie_locked_runner_with_api.
+        let live = vec![s9d_runner(1234, "ez-org-runner-1", "offline", true)];
+        let local_names = HashSet::new();
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert!(
+            reapable.is_empty(),
+            "busy runners must NEVER be returned by the offline+!busy sub-pass; \
+             a 422-style delete on this lane would attempt to remove a runner \
+             holding a real job lock. Got: {reapable:?}"
+        );
+    }
+
+    #[test]
+    fn online_runner_is_not_returned_by_u3w_helper() {
+        // negative_online: status=online (still serving jobs). Even if no
+        // local container exists, a live online runner is sibling-host state
+        // we must not touch.
+        let live = vec![s9d_runner(1234, "ez-org-runner-1", "online", false)];
+        let local_names = HashSet::new();
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert!(
+            reapable.is_empty(),
+            "online runners are actively serving or alive and must never be removed by the orphan sweep; got: {reapable:?}"
+        );
+    }
+
+    #[test]
+    fn offline_not_busy_with_local_container_present_is_not_returned() {
+        // negative_local_container_present: offline + !busy BUT a local
+        // container still exists with this name → could be the parent process
+        // mid-restart, or a race where the API snapshot lags the container.
+        // MUST NOT delete — would race with the live container.
+        let live = vec![s9d_runner(1234, "ez-org-runner-1", "offline", false)];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert!(
+            reapable.is_empty(),
+            "when a local container exists with this name, the helper must NOT return the id; \
+             a parent process mid-restart or API-snapshot lag could be the explanation. Got: {reapable:?}"
+        );
+    }
+
+    #[test]
+    fn runner_name_not_matching_our_prefix_is_not_returned() {
+        // negative_name_not_our_prefix: id 1234 belongs to a DIFFERENT host
+        // (e.g. ez-runner-c-2 from a sibling with a different prefix). The
+        // helper must key strictly on `prefix` to avoid sibling-host blast
+        // radius — extending plan_reaper_actions to accept !busy plans would
+        // re-introduce exactly this risk per s9d synthesis §2.
+        let live = vec![s9d_runner(1234, "ez-runner-c-2", "offline", false)];
+        let local_names = HashSet::new();
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert!(
+            reapable.is_empty(),
+            "a runner whose name does not match our prefix is sibling-host state and MUST NOT be reaped; got: {reapable:?}"
+        );
+    }
+
+    #[test]
+    fn offline_busy_owned_missing_container_still_uses_qbl_path2() {
+        // Regression for bead ez-gh-actions-qbl (Path 2): when a runner is
+        // offline + busy + no local container (the 422-zombie class), Path 2
+        // (offline_busy_owned_missing_container_slots) MUST still return it,
+        // and the new u3w helper MUST NOT. This pins both helpers'
+        // non-overlapping contracts so neither shadows the other in a future
+        // refactor — the exact failure mode synthesis §2 warned about.
+        let live = vec![s9d_runner(1234, "ez-org-runner-1", "offline", true)];
+        let local_names = HashSet::from(["ez-org-runner-2".to_string()]); // not the zombie's name
+        let qbl_candidates = offline_busy_owned_missing_container_slots(
+            &SlotAssignments {
+                assignments: BTreeMap::from([("1".to_string(), "1234".to_string())]),
+            },
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        let u3w_reapable = offline_not_busy_owned_missing_container_registrations(
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert_eq!(
+            qbl_candidates,
+            vec![(1u32, 1234u64, "ez-org-runner-1".to_string())],
+            "Path 2 (qbl) MUST still own the offline+busy class — its cancellation \
+             sequencing is required to release the 422 lock before the runner delete."
+        );
+        assert!(
+            u3w_reapable.is_empty(),
+            "Path 4 (u3w) MUST NOT take the offline+busy case — that would attempt to \
+             delete a runner whose job lock has not been cancelled. Got: {u3w_reapable:?}"
         );
     }
 }
