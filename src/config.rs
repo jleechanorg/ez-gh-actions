@@ -269,6 +269,12 @@ fn default_queue_stale_hours() -> u64 {
     8
 }
 
+/// Independent of the default so retuning the default (as happened
+/// 2026-07-07, 24 -> 8) doesn't silently move the validation ceiling too.
+fn maximum_queue_stale_hours() -> u64 {
+    8
+}
+
 fn default_queue_consecutive_alert_threshold() -> u32 {
     2
 }
@@ -323,6 +329,50 @@ impl std::fmt::Display for IsolationLevel {
             IsolationLevel::Vm => write!(f, "vm"),
         }
     }
+}
+
+/// Shared `validate()` guard: an optional path, if configured, must be non-empty.
+/// An empty `PathBuf` (e.g. `path = ""` in TOML) is a config typo that would
+/// otherwise surface later as a confusing filesystem error.
+fn require_non_empty_path(field: &str, path: &Option<PathBuf>) -> Result<()> {
+    if let Some(p) = path {
+        if p.as_os_str().is_empty() {
+            anyhow::bail!("{field} must not be empty when configured");
+        }
+    }
+    Ok(())
+}
+
+/// Shared `validate()` guard: an unsigned field must be at least 1.
+fn require_at_least_one(field: &str, value: u64) -> Result<()> {
+    if value == 0 {
+        anyhow::bail!("{field} must be at least 1 (got {value})");
+    }
+    Ok(())
+}
+
+/// Shared `validate()` guard for `queue_monitor.repo` / `canary.repo`: when
+/// configured it must be `owner/repo`; when absent, it's only required if the
+/// feature is enabled against an org-scoped target (repo scope already
+/// implies a single unambiguous repo).
+fn require_scoped_repo(
+    prefix: &str,
+    repo: &Option<String>,
+    enabled: bool,
+    scope: Scope,
+) -> Result<()> {
+    if let Some(r) = repo {
+        if !is_owner_repo(r) {
+            anyhow::bail!(
+                "{prefix}.repo must be exactly \"owner/repo\" when configured (got {r:?})"
+            );
+        }
+    } else if enabled && scope != Scope::Repo {
+        anyhow::bail!(
+            "{prefix}.repo is required when {prefix}.enabled=true and github.scope is org"
+        );
+    }
+    Ok(())
 }
 
 impl Config {
@@ -411,37 +461,23 @@ impl Config {
         if self.github.target.trim().is_empty() {
             anyhow::bail!("github.target must not be empty");
         }
-        if let Some(path) = &self.state_dir {
-            if path.as_os_str().is_empty() {
-                anyhow::bail!("state_dir must not be empty when configured");
-            }
-        }
+        require_non_empty_path("state_dir", &self.state_dir)?;
         if self.github.scope == Scope::Repo && self.github.target.matches('/').count() != 1 {
             anyhow::bail!(
                 "github.target must be exactly \"owner/repo\" for repo scope (got {:?})",
                 self.github.target
             );
         }
-        if self.alert.failure_alert_threshold == 0 {
-            anyhow::bail!(
-                "alert.failure_alert_threshold must be at least 1 (got {})",
-                self.alert.failure_alert_threshold
-            );
-        }
-        if self.alert.alert_cooldown_secs == 0 {
-            anyhow::bail!(
-                "alert.alert_cooldown_secs must be at least 1 second (got {})",
-                self.alert.alert_cooldown_secs
-            );
-        }
-        if let Some(path) = &self.alert.log_path {
-            if path.as_os_str().is_empty() {
-                anyhow::bail!("alert.log_path must not be empty when configured");
-            }
-        }
-        if self.queue_monitor.tail_warn_minutes == 0 {
-            anyhow::bail!("queue_monitor.tail_warn_minutes must be at least 1");
-        }
+        require_at_least_one(
+            "alert.failure_alert_threshold",
+            self.alert.failure_alert_threshold as u64,
+        )?;
+        require_at_least_one("alert.alert_cooldown_secs", self.alert.alert_cooldown_secs)?;
+        require_non_empty_path("alert.log_path", &self.alert.log_path)?;
+        require_at_least_one(
+            "queue_monitor.tail_warn_minutes",
+            self.queue_monitor.tail_warn_minutes,
+        )?;
         if self.queue_monitor.check_interval_seconds < minimum_queue_check_interval_seconds() {
             anyhow::bail!(
                 "queue_monitor.check_interval_seconds must be at least {} (got {})",
@@ -449,52 +485,37 @@ impl Config {
                 self.queue_monitor.check_interval_seconds
             );
         }
-        if self.queue_monitor.stale_hours == 0 {
-            anyhow::bail!("queue_monitor.stale_hours must be at least 1");
-        }
-        if self.queue_monitor.stale_hours > default_queue_stale_hours() {
+        require_at_least_one("queue_monitor.stale_hours", self.queue_monitor.stale_hours)?;
+        if self.queue_monitor.stale_hours > maximum_queue_stale_hours() {
             anyhow::bail!(
                 "queue_monitor.stale_hours must be at most {} (got {})",
-                default_queue_stale_hours(),
+                maximum_queue_stale_hours(),
                 self.queue_monitor.stale_hours
             );
         }
-        if self.queue_monitor.consecutive_alert_threshold == 0 {
-            anyhow::bail!("queue_monitor.consecutive_alert_threshold must be at least 1");
-        }
-        if let Some(repo) = &self.queue_monitor.repo {
-            if !is_owner_repo(repo) {
-                anyhow::bail!(
-                    "queue_monitor.repo must be exactly \"owner/repo\" when configured (got {:?})",
-                    repo
-                );
-            }
-        } else if self.queue_monitor.enabled && self.github.scope != Scope::Repo {
-            anyhow::bail!(
-                "queue_monitor.repo is required when queue_monitor.enabled=true and github.scope is org"
-            );
-        }
-        if let Some(repo) = &self.canary.repo {
-            if !is_owner_repo(repo) {
-                anyhow::bail!(
-                    "canary.repo must be exactly \"owner/repo\" when configured (got {:?})",
-                    repo
-                );
-            }
-        } else if self.canary.enabled && self.github.scope != Scope::Repo {
-            anyhow::bail!(
-                "canary.repo is required when canary.enabled=true and github.scope is org"
-            );
-        }
+        require_at_least_one(
+            "queue_monitor.consecutive_alert_threshold",
+            self.queue_monitor.consecutive_alert_threshold as u64,
+        )?;
+        require_scoped_repo(
+            "queue_monitor",
+            &self.queue_monitor.repo,
+            self.queue_monitor.enabled,
+            self.github.scope,
+        )?;
+        require_scoped_repo(
+            "canary",
+            &self.canary.repo,
+            self.canary.enabled,
+            self.github.scope,
+        )?;
         if self.canary.workflow.trim().is_empty() {
             anyhow::bail!("canary.workflow must not be empty");
         }
         if self.canary.ref_name.trim().is_empty() {
             anyhow::bail!("canary.ref_name must not be empty");
         }
-        if self.canary.slo_start_seconds == 0 {
-            anyhow::bail!("canary.slo_start_seconds must be at least 1");
-        }
+        require_at_least_one("canary.slo_start_seconds", self.canary.slo_start_seconds)?;
         if self.canary.check_interval_seconds < minimum_canary_check_interval_seconds() {
             anyhow::bail!(
                 "canary.check_interval_seconds must be at least {} (got {})",
@@ -502,20 +523,18 @@ impl Config {
                 self.canary.check_interval_seconds
             );
         }
-        if self.canary.poll_timeout_seconds == 0 {
-            anyhow::bail!("canary.poll_timeout_seconds must be at least 1");
-        }
-        if self.canary.poll_interval_seconds == 0 {
-            anyhow::bail!("canary.poll_interval_seconds must be at least 1");
-        }
+        require_at_least_one(
+            "canary.poll_timeout_seconds",
+            self.canary.poll_timeout_seconds,
+        )?;
+        require_at_least_one(
+            "canary.poll_interval_seconds",
+            self.canary.poll_interval_seconds,
+        )?;
         if self.canary.poll_interval_seconds > self.canary.poll_timeout_seconds {
             anyhow::bail!("canary.poll_interval_seconds must be <= canary.poll_timeout_seconds");
         }
-        if let Some(path) = &self.canary.history_path {
-            if path.as_os_str().is_empty() {
-                anyhow::bail!("canary.history_path must not be empty when configured");
-            }
-        }
+        require_non_empty_path("canary.history_path", &self.canary.history_path)?;
         if self.invariant_sampler.check_interval_seconds == 0
             || self.invariant_sampler.check_interval_seconds
                 > maximum_invariant_check_interval_seconds()
@@ -527,11 +546,10 @@ impl Config {
                 self.invariant_sampler.check_interval_seconds
             );
         }
-        if let Some(path) = &self.invariant_sampler.history_path {
-            if path.as_os_str().is_empty() {
-                anyhow::bail!("invariant_sampler.history_path must not be empty when configured");
-            }
-        }
+        require_non_empty_path(
+            "invariant_sampler.history_path",
+            &self.invariant_sampler.history_path,
+        )?;
         Ok(())
     }
 
