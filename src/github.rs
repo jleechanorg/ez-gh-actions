@@ -22,6 +22,16 @@ const GH_MAX_RETRIES: u32 = 5;
 const GH_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const GH_RETRY_MAX_DELAY: Duration = Duration::from_secs(32);
 
+/// Documented floor for SECONDARY rate-limit responses that lack a
+/// `Retry-After` header. GitHub's docs say: when the secondary limit is
+/// hit and no `Retry-After` is returned, wait at least 60s then back off
+/// exponentially — repeated fast retries (the previous default of 2s)
+/// extend the limit and may result in integration banning.
+///
+/// See <https://docs.github.com/en/rest/overview/rate-limits-for-the-rest-api>
+/// "Secondary rate limits" section.
+const GH_SECONDARY_MIN_DELAY: Duration = Duration::from_secs(60);
+
 #[cfg(test)]
 thread_local! {
     static GH_EXE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -153,9 +163,31 @@ fn extract_retry_after_secs(text: &str) -> Option<u64> {
     None
 }
 
-fn is_rate_limit_response(stdout: &str, stderr: &str, status: Option<i32>) -> bool {
+/// A PRIMARY rate-limit signal: GitHub returned 403/429 against the
+/// standard `x-ratelimit-*` REST budget. Subject to the documented
+/// `Retry-After` header (or 1s minimum) but NEVER the secondary-limit
+/// 60s floor.
+fn is_primary_rate_limit_response(stdout: &str, stderr: &str, status: Option<i32>) -> bool {
     let lower = format!("{stdout} {stderr}").to_ascii_lowercase();
-    if !(lower.contains("rate") || lower.contains("secondary") || lower.contains("abuse")) {
+    if lower.contains("secondary") {
+        return false;
+    }
+    if !(lower.contains("rate limit") || lower.contains("abuse")) {
+        return false;
+    }
+    if status == Some(403) || status == Some(429) {
+        return true;
+    }
+    lower.contains("http 403") || lower.contains("http 429")
+}
+
+/// A SECONDARY rate-limit signal: burst/abuse/concurrency limit separate
+/// from the primary REST budget. Triggers the 60s minimum retry floor
+/// (see `GH_SECONDARY_MIN_DELAY`) and is the primary cause of the
+/// 2026-07-07 ~2/16 fleet drain.
+fn is_secondary_rate_limit_response(stdout: &str, stderr: &str, status: Option<i32>) -> bool {
+    let lower = format!("{stdout} {stderr}").to_ascii_lowercase();
+    if !(lower.contains("secondary") || lower.contains("abuse")) {
         return false;
     }
     if status == Some(403) || status == Some(429) {
@@ -173,9 +205,23 @@ fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
     let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if is_rate_limit_response(&stdout, &stderr, code) {
+    let combined = format!("{stderr} {stdout}");
+    if is_secondary_rate_limit_response(&stdout, &stderr, code) {
+        // Secondary limits have a documented >=60s floor only when the
+        // server OMITS Retry-After. When Retry-After is present we honor
+        // it directly (no GH_RETRY_MAX_DELAY ceiling — secondary-limit
+        // Retry-After values routinely exceed 32s for hot limits and
+        // mis-truncating was the bug on which today's outage was
+        // diagnosed). Server's instruction is authoritative when given.
         return Some(
-            extract_retry_after_secs(&format!("{stderr} {stdout}"))
+            extract_retry_after_secs(&combined)
+                .map(Duration::from_secs)
+                .unwrap_or(GH_SECONDARY_MIN_DELAY),
+        );
+    }
+    if is_primary_rate_limit_response(&stdout, &stderr, code) {
+        return Some(
+            extract_retry_after_secs(&combined)
                 .map(Duration::from_secs)
                 .unwrap_or(GH_RETRY_BASE_DELAY)
                 .min(GH_RETRY_MAX_DELAY)
@@ -1277,14 +1323,80 @@ github.com
 
     #[test]
     fn rate_limit_without_retry_after_uses_default_backoff() {
+        // Primary rate limit (x-ratelimit-remaining=0) has a documented floor of
+        // 1s and is fine to retry with the base delay when no Retry-After is set.
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"gh: API rate limit exceeded (HTTP 403)\n".to_vec(),
+        };
+        let delay = classify_retry_delay(&out)
+            .expect("primary rate-limit response without Retry-After should still be retried");
+        assert_eq!(delay, GH_RETRY_BASE_DELAY);
+    }
+
+    #[test]
+    fn secondary_rate_limit_without_retry_after_uses_documented_floor() {
+        // GitHub's documented floor for SECONDARY-rate-limit responses without
+        // a Retry-After header is >=60s. Our pre-fix code coerced those to
+        // GH_RETRY_BASE_DELAY (2s), which is a direct cause of extending
+        // secondary limits (the doc warns repeated fast retries may result
+        // in integration banning).
         let out = std::process::Output {
             status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
             stdout: Vec::new(),
             stderr: b"gh: secondary rate limit exceeded (HTTP 429)\n".to_vec(),
         };
         let delay = classify_retry_delay(&out)
-            .expect("rate-limit response without Retry-After should still be retried");
-        assert_eq!(delay, GH_RETRY_BASE_DELAY);
+            .expect("secondary rate-limit response without Retry-After should still be retried");
+        assert!(
+            delay >= Duration::from_secs(60),
+            "secondary rate-limit without Retry-After must wait >=60s \
+             (got {:?}, GH_SECONDARY_MIN_DELAY expected)",
+            delay
+        );
+    }
+
+    #[test]
+    fn secondary_rate_limit_with_retry_after_honors_header_value() {
+        let out = std::process::Output {
+            status: std::os::unix::process::ExitStatusExt::from_raw(403 << 8),
+            stdout: Vec::new(),
+            stderr: b"HTTP 403: secondary rate limit\nRetry-After: 90\n".to_vec(),
+        };
+        let delay = classify_retry_delay(&out)
+            .expect("secondary rate-limit with Retry-After should be classified");
+        assert_eq!(delay, Duration::from_secs(90));
+    }
+
+    #[test]
+    fn primary_and_secondary_classifiers_are_distinct() {
+        // The two classes must NOT be conflated: a primary limit can fire
+        // after only a handful of REST calls and is bounded by primary
+        // budget; a secondary limit is a SEPARATE burst/concurrency limit
+        // and must trigger the >=60s retry floor. Shared detection means
+        // we treat (cheap) primary limits like (expensive) secondary ones,
+        // wasting 60s of daemon time on a primary that Retry-After could
+        // have released in 1s.
+        let primary = std::str::from_utf8(b"gh: API rate limit exceeded (HTTP 403)\n").unwrap();
+        let secondary =
+            std::str::from_utf8(b"gh: secondary rate limit exceeded (HTTP 429)\n").unwrap();
+        assert!(
+            is_primary_rate_limit_response(primary, "", Some(1)),
+            "primary-limit message must be classified as primary"
+        );
+        assert!(
+            !is_primary_rate_limit_response(secondary, "", Some(1)),
+            "secondary-limit message must NOT be classified as primary"
+        );
+        assert!(
+            is_secondary_rate_limit_response(secondary, "", Some(1)),
+            "secondary-limit message must be classified as secondary"
+        );
+        assert!(
+            !is_secondary_rate_limit_response(primary, "", Some(1)),
+            "primary-limit message must NOT be classified as secondary"
+        );
     }
 
     #[test]
