@@ -533,9 +533,17 @@ const ZOMBIE_RECLAIM_POLL_ATTEMPTS: u32 = 3;
 /// (network blip, auth, rate limit)? Only the job-lock case is safe to
 /// self-heal by cancelling a run; any other error must keep falling back to
 /// the existing "keep slot, warn" behavior untouched.
+///
+/// Deliberately does NOT match on a bare "422" substring: `err`'s text is
+/// the fully-formatted `gh api remove runner {id} failed: ...` message, and
+/// `{id}` is an ever-churning numeric runner ID (422, 1422, 4220, ... are
+/// all real IDs this fleet will eventually mint) — a bare "422" check would
+/// false-positive on an unrelated failure (network blip, auth) for any
+/// runner whose ID happens to contain that substring. GitHub's literal API
+/// message text is the only reliable signal here.
 fn is_runner_busy_lock_error(err: &anyhow::Error) -> bool {
     let text = format!("{err:#}").to_lowercase();
-    text.contains("422") || text.contains("currently running a job")
+    text.contains("currently running a job")
 }
 
 /// Given a runner already confirmed offline+busy+missing-container (i.e. a
@@ -1816,6 +1824,22 @@ mod tests {
     }
 
     #[test]
+    fn is_runner_busy_lock_error_does_not_false_positive_on_runner_id_containing_422() {
+        // Regression: runner_id 422 (or 1422, 4220, ...) is a real, eventually
+        // occurring value in this fleet's ever-churning ID counter. The
+        // formatted error text interpolates the ID directly
+        // ("...remove runner 422 failed: ..."), so a bare "422" substring
+        // check would misclassify an unrelated network/auth failure on THAT
+        // runner as the job-lock case and wrongly attempt a cancel.
+        let network_error_on_runner_422 =
+            anyhow::anyhow!("gh api remove runner 422 failed: connection reset");
+        let auth_error_on_runner_1422 =
+            anyhow::anyhow!("gh api remove runner 1422 failed: HTTP 401 bad credentials");
+        assert!(!is_runner_busy_lock_error(&network_error_on_runner_422));
+        assert!(!is_runner_busy_lock_error(&auth_error_on_runner_1422));
+    }
+
+    #[test]
     fn reclaim_zombie_locked_runner_cancels_then_deletes_on_success() {
         use crate::reaper::test_support::{job, run, runner, FakeReaperApi};
         use std::collections::VecDeque;
@@ -1860,34 +1884,50 @@ mod tests {
     #[test]
     fn reclaim_zombie_locked_runner_keeps_slot_when_job_never_leaves_in_progress() {
         use crate::reaper::test_support::{job, run, runner, FakeReaperApi};
+        use std::collections::VecDeque;
 
         let zombie = runner(1234, "ez-org-runner-1");
+        let in_progress_job = job(2, Some(1234), Some("ez-org-runner-1"));
         let repo_runs = vec![(
             "owner/repo".to_string(),
-            vec![(
-                run(7, "in_progress"),
-                vec![job(2, Some(1234), Some("ez-org-runner-1"))],
-            )],
+            vec![(run(7, "in_progress"), vec![in_progress_job.clone()])],
         )];
-        // Default FakeReaperApi has no seeded job_batches, so every poll
-        // (post-cancel AND post-force-cancel) keeps reporting the job as
-        // still in_progress -- simulating a job GitHub never releases.
-        let mut api = FakeReaperApi::default();
+        let poll_attempts = 2;
+        // Every poll -- both post-cancel AND post-force-cancel -- must keep
+        // returning the SAME correlated in_progress job, so this genuinely
+        // drives cancel -> poll(x2) -> force-cancel -> poll(x2) -> give up,
+        // rather than tripping FakeReaperApi::default()'s mismatched
+        // fallback job (runner_id=42) on the very first poll, which
+        // previously produced a JobCorrelationChanged short-circuit instead
+        // of exercising force-cancel at all (bug caught in adversarial
+        // review of the first version of this test).
+        let mut api = FakeReaperApi {
+            job_batches: VecDeque::from(
+                std::iter::repeat_n(Ok(vec![in_progress_job]), 2 * poll_attempts as usize)
+                    .collect::<Vec<_>>(),
+            ),
+            ..Default::default()
+        };
 
         let execution = reclaim_zombie_locked_runner_with_api(
             &zombie,
             &repo_runs,
             &["ez-org-runner".to_string()],
             &["self-hosted".to_string(), "ezgha".to_string()],
-            2,
+            poll_attempts,
             &mut api,
         )
         .expect("a matching in-progress job must produce a reaper plan");
 
-        assert_ne!(
+        assert_eq!(
             execution.status,
-            reaper::ReaperExecutionStatus::Completed,
-            "a job stuck in_progress through force-cancel must not be treated as reclaimed"
+            reaper::ReaperExecutionStatus::PollTimedOut,
+            "a job stuck in_progress through force-cancel must time out, not be treated as reclaimed"
+        );
+        assert!(
+            api.calls.iter().any(|c| c.starts_with("force-cancel:")),
+            "must actually escalate to force-cancel when the job outlives the poll budget: {:?}",
+            api.calls
         );
         assert!(
             !api.calls.iter().any(|c| c.starts_with("delete:")),
