@@ -148,10 +148,28 @@ if [ "$DEPLOYED_SHA" != "$CURRENT_SHA" ]; then
     fail "Deployed binary SHA ($DEPLOYED_SHA) does not match current HEAD Git SHA ($CURRENT_SHA). Run cargo install --path ."
 fi
 
-if [ -n "$(git status --porcelain | grep -v 'docs/observe' || true)" ]; then
-    echo "Warning: local uncommitted changes exist outside docs/observe:"
-    git status --porcelain | grep -v 'docs/observe' || true
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
+UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -vE 'docs/observe|docs/goals|goals/|.beads/' || true)
+
+if [ "$CURRENT_BRANCH" = "main" ]; then
+    if [ -n "$UNCOMMITTED" ]; then
+        fail "Deploying on main but local uncommitted changes exist outside allowed paths (docs/observe, goals, .beads):\n$UNCOMMITTED"
+    fi
+    # Verify we are in sync with remote main
+    git fetch origin main >/dev/null 2>&1 || true
+    REMOTE_SHA=$(git rev-parse origin/main 2>/dev/null || echo "")
+    LOCAL_SHA=$(git rev-parse HEAD)
+    if [ -n "$REMOTE_SHA" ] && [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+        fail "Local main branch is out of sync with origin/main (local: $LOCAL_SHA, remote: $REMOTE_SHA)"
+    fi
+else
+    if [ -n "$UNCOMMITTED" ]; then
+        echo "Warning: local uncommitted changes exist outside docs/observe:"
+        echo "$UNCOMMITTED"
+    fi
+    echo "Info: running on feature branch '$CURRENT_BRANCH' (Gate 0 strict main check bypassed)"
 fi
+
 pass "Gate 0: Deployed binary matches HEAD SHA ($CURRENT_SHA)"
 
 # --- Gate 1: Code quality ---

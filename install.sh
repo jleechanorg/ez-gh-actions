@@ -41,8 +41,59 @@ uninstall() {
   exit 0
 }
 
+DEV_MODE=0
 if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
   uninstall
+elif [ "${1:-}" = "--dev" ] || [ "${1:-}" = "-d" ]; then
+  DEV_MODE=1
+fi
+
+# ── Acquire deploy lock ───────────────────────────────────────────────────────
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
+mkdir -p "${CONFIG_DIR}"
+LOCK_FILE="${CONFIG_DIR}/deploy.lock"
+
+exec 9>"${LOCK_FILE}"
+info "Acquiring single-owner deploy lock..."
+if ! flock -n 9; then
+  bad "Another deploy or installation is currently in progress (unable to acquire lock on ${LOCK_FILE})."
+  exit 1
+fi
+ok "Deploy lock acquired"
+
+# ── Validate Git state for production ─────────────────────────────────────────
+if [ "${DEV_MODE}" -eq 0 ]; then
+  info "Validating repository state for production deployment"
+  
+  # 1. Must be on main branch
+  current_branch=$(git branch --show-current 2>/dev/null || echo "detached")
+  if [ "${current_branch}" != "main" ]; then
+    bad "Cannot deploy from branch '${current_branch}'. Production deploys must be from 'main'."
+    bad "Use './install.sh --dev' to bypass this check for local development."
+    exit 1
+  fi
+  ok "On branch main"
+
+  # 2. Must not have uncommitted changes
+  uncommitted=$(git status --porcelain 2>/dev/null | grep -vE 'docs/observe|docs/goals|goals/|.beads/' || true)
+  if [ -n "${uncommitted}" ]; then
+    bad "Cannot deploy with local uncommitted changes outside allowed directories:\n${uncommitted}"
+    bad "Use './install.sh --dev' to bypass this check for local development."
+    exit 1
+  fi
+  ok "Working directory clean"
+
+  # 3. Must be up to date with origin/main
+  info "Fetching origin main..."
+  git fetch origin main >/dev/null 2>&1 || true
+  local_sha=$(git rev-parse HEAD)
+  remote_sha=$(git rev-parse origin/main 2>/dev/null || echo "")
+  if [ -n "${remote_sha}" ] && [ "${local_sha}" != "${remote_sha}" ]; then
+    bad "Local main branch is out of sync with origin/main (local: ${local_sha}, remote: ${remote_sha})."
+    bad "Please pull the latest changes first."
+    exit 1
+  fi
+  ok "Up to date with origin/main"
 fi
 
 info "Checking prerequisites"
@@ -91,6 +142,14 @@ if [ "${missing}" -ne 0 ]; then
   exit 1
 fi
 
+# ── Run pre-deployment tests ───────────────────────────────────────────────
+info "Running unit tests"
+if ! cargo test >/dev/null 2>&1; then
+  bad "Cargo tests failed. Deploy aborted."
+  exit 1
+fi
+ok "All tests passed"
+
 info "Installing ${BIN}"
 if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
   cargo install --path "${SCRIPT_DIR}"
@@ -130,17 +189,42 @@ if [ "$(uname -s)" = "Darwin" ]; then
   done
 fi
 
-# ── Auto-install ezgha service if config exists ────────────────────────────────
+# ── Auto-install or restart ezgha service if config exists ────────────────────
 CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
 if [ -f "${CONFIG_PATH}" ]; then
-  info "Installing ezgha service..."
   if [ "$(uname -s)" = "Darwin" ]; then
-    "${CARGO_BIN}/${BIN}" install-service
-    ok "ezgha service installed and started via launchd"
+    plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
+    if [ -f "${plist}" ] && launchctl list 2>/dev/null | grep -q "org.jleechanorg.ezgha"; then
+      info "Restarting launchd agent..."
+      launchctl unload "${plist}" 2>/dev/null || true
+      launchctl load "${plist}"
+      ok "ezgha service restarted via launchd"
+    else
+      info "Installing ezgha service..."
+      "${CARGO_BIN}/${BIN}" install-service
+      ok "ezgha service installed and started via launchd"
+    fi
   elif command -v systemctl >/dev/null 2>&1; then
-    "${CARGO_BIN}/${BIN}" install-service
-    ok "ezgha service installed and started via systemd"
+    if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+      info "Restarting systemd service..."
+      systemctl --user restart ezgha.service
+      ok "ezgha service restarted via systemd"
+    else
+      info "Installing ezgha service..."
+      "${CARGO_BIN}/${BIN}" install-service
+      ok "ezgha service installed and started via systemd"
+    fi
   fi
+fi
+
+# ── Run post-deployment exit criteria checks ─────────────────────────────────
+if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/docs/verify-exit-criteria.sh" ]; then
+  info "Running post-deployment exit criteria checks"
+  if ! "${SCRIPT_DIR}/docs/verify-exit-criteria.sh"; then
+    bad "Post-deployment exit criteria checks failed! Please review doctor.sh and logs."
+    exit 1
+  fi
+  ok "Post-deployment checks passed"
 fi
 
 info "Next steps"
