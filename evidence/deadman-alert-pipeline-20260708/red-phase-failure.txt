@@ -1,0 +1,52 @@
+Captured: 2026-07-08 from the cargo test invocation that ran *before*
+any implementation of DeadManState or deadman_threshold_seconds existed.
+This is the original Red phase output proving the tests were written
+first and the API did not yet exist.
+
+$ cargo test --bin ezgha alert::tests::deadman
+   Compiling ez-gh-actions v0.1.0 (/home/jleechan/.worktrees/ez-gh-actions/ez-1)
+error[E0609]: no field `deadman_threshold_seconds` on type `AlertConfig`
+   --> src/alert.rs:652:19
+    |
+652 |         cfg.alert.deadman_threshold_seconds = threshold_secs;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^ unknown field
+    |
+    = note: available fields are: `failure_alert_threshold`, `alert_cooldown_secs`, `slack_webhook_url`, `email_to`, `email_from`, `log_path`
+
+error[E0433]: failed to resolve: use of undeclared type `DeadManState`
+   --> src/alert.rs:660:25
+    |
+660 |         let mut state = DeadManState::new(Instant::now());
+    |                         ^^^^^^^^^^^^ use of undeclared type `DeadManState`
+
+error[E0433]: failed to resolve: use of undeclared type `DeadManState`
+   --> src/alert.rs:673:25
+    |
+673 |         let mut state = DeadManState::new(start);
+    |                         ^^^^^^^^^^^^ use of undeclared type `DeadManState`
+
+error[E0433]: failed to resolve: use of undeclared type `DeadManState`
+   --> src/alert.rs:694:25
+    |
+694 |         let mut state = DeadManState::new(start);
+    |                         ^^^^^^^^^^^^ use of undeclared type `DeadManState`
+
+error[E0433]: failed to resolve: use of undeclared type `DeadManState`
+   --> src/alert.rs:726:25
+    |
+726 |         let mut state = DeadManState::new(start);
+    |                         ^^^^^^^^^^^^ use of undeclared type `DeadManState`
+
+error[E0433]: failed to resolve: use of undeclared type `DeadManState`
+   --> src/alert.rs:757:25
+    |
+757 |         let mut state = DeadManState::new(start);
+    |                         ^^^^^^^^^^^^ use of undeclared type `DeadManState`
+
+error[E0433]: failed to resolve: use of undeclared type `DeadManState`
+   --> src/alert.rs:786:25
+    |
+786 |         let mut state = DeadManState::new(start);
+    |                         ^^^^^^^^^^^^ use of undeclared type `DeadManState`
+
+error: could not compile `ez-gh-actions` (bin "ezgha" test) due to 7 previous errors

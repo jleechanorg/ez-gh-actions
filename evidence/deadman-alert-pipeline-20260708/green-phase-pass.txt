@@ -1,0 +1,14 @@
+   Compiling ez-gh-actions v0.1.0 (/home/jleechan/.worktrees/ez-gh-actions/ez-1)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running unittests src/main.rs (target/debug/deps/ezgha-e2af4fa1d282c105)
+
+running 6 tests
+test alert::tests::deadman_disabled_when_threshold_is_zero ... ok
+test alert::tests::deadman_does_not_fire_when_recent_alert_was_delivered ... ok
+test alert::tests::deadman_failed_self_test_keeps_pipeline_dead ... ok
+test alert::tests::deadman_fires_after_threshold_with_no_delivery ... ok
+test alert::tests::deadman_no_channels_configured_is_noop ... ok
+test alert::tests::deadman_successful_self_test_resets_pipeline_alive_timer ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 188 filtered out; finished in 0.08s
+
