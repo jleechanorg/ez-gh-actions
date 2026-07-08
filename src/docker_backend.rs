@@ -378,13 +378,11 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     // keyed on `runner.name` prefix (Path 1 has already wiped the slot-file
     // row, so the runner_id is no longer reachable from `assignments`).
     if let Some(local_names) = local_container_names.as_ref() {
-        for (runner_id, runner_name) in
-            offline_not_busy_owned_missing_container_registrations(
-                &live_runners,
-                &cfg.runner.name_prefix,
-                local_names,
-            )
-        {
+        for (runner_id, runner_name) in offline_not_busy_owned_missing_container_registrations(
+            &live_runners,
+            &cfg.runner.name_prefix,
+            local_names,
+        ) {
             eprintln!(
                 "warning: removing stale offline/idle registration {runner_name} (id {runner_id}) with no local container — slot entry was already released by Path 1"
             );
