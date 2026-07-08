@@ -1137,3 +1137,53 @@ systemctl --user restart ezgha.service -> verify SHA matches d612ad7 and
 containers/load recover) -- I hold the single-writer lock on this, no
 sub-agent needed for a restart. Will report first post-deploy samples
 immediately.
+
+---
+
+## sidekick3 — po2 DEPLOYED and confirmed working (2026-07-07 22:45 PT)
+
+Main did the Gate 0 careful-restart directly (single-writer, to avoid two
+writers on the same restart while I was mid-verification-report) at load 8.38,
+deliberately AT 6 containers -- below the old >=12 sub-gate, reasoned as safe
+because po2's pacing makes the old container-count precondition unnecessary
+for a binary that paces its own refill. Watched live: load stayed 7-9.5 through
+the 6->13 refill.
+
+**Independently confirmed post-deploy** (own checks, not just trusting the
+report):
+- `ezgha --version` = `0.1.0-6a3138d` -- new binary running, matches HEAD
+  (6a3138d, one commit past the d612ad7 merge point).
+- `systemctl --user is-active` = active.
+- Journal has the gate literally firing: `Jul 07 22:42:03 ... warning: host
+  1-minute load average 8.19 leaves no safe respawn headroom below ceiling
+  20.00; delaying runner respawn` -- direct proof the load-aware pacing is
+  live in production, not just in tests.
+- Load at my check: 6.49(1m)/9.00(5m)/10.39(15m), containers refilling
+  (4 at time of check, climbing as expected from the paced restart).
+- My independent load Monitor (task bxtcf63nf) corroborates: sample sequence
+  showed load1 dropping 10.07 -> 7.18 with below12_streak reaching 2 --
+  consistent timeline with main's restart, second set of eyes confirms no
+  discrepancy.
+
+**Created follow-up bead `ez-gh-actions-ktq`** (P2, capture-only, do NOT
+implement yet) per main's request: graceful `ezgha reload` daemon re-exec so
+future code rollouts re-adopt the running container fleet in-place instead of
+a full kill+restart respawn wave -- combined with po2 pacing this would
+eliminate the restart-driven watchdog-reboot risk entirely. User's idea via
+main. Implementation routes through sidekick3/swarm when picked up later, not
+direct main-coding, per the delegation directive already on file.
+
+**Flagged for later** (not acting now): CLAUDE.md careful-restart rule
+refinement -- the `containers>=12` sub-condition should be relaxed to
+"OR the binary being deployed includes po2 pacing" since po2 makes low-container
+restarts safe. Main's note, deferred to a future edit pass.
+
+**Resuming normal cadence**: back to the ~20-30min consolidated load/health
+watch (local-only, no gh) plus tracking invariant_history.jsonl for the
+post-deploy INV-1 trend -- watching specifically for missing-registration
+churn frequency dropping now that respawns are paced. Last 8 samples
+pre/at-deploy still show the old churn pattern (busy oscillating 12-22,
+inv1_fail_class alternating missing-registration/none) since those samples
+predate the restart finishing its refill; next samples should start showing
+the improvement if po2 works as designed. Will report the trend at next
+consolidated check.
