@@ -38,6 +38,7 @@ const INVARIANT_DURATION_THRESHOLD_MINUTES: f64 = 20.0;
 /// runs), and `queued_jobs` becomes an explicit LOWER BOUND when the cap
 /// bites (signaled via `queued_jobs_capped` in the schema).
 const INVARIANT_JOB_ENUMERATION_CAP: usize = 50;
+const JOB_ENUMERATION_QUOTA_CHECK_INTERVAL: usize = 10;
 
 /// The cap above bounds TODAY's known queue size, but only a hard time
 /// budget kills the whole failure CLASS: any future expensive per-tick work
@@ -541,17 +542,22 @@ fn rest_quota_available_for_monitoring(threshold: u64, operation: &str) -> bool 
 /// synthetic deadline and a fake in-memory closure (see
 /// `enumerate_jobs_within_budget_bails_before_first_fetch_past_deadline`),
 /// without a live GitHub API or a real `sleep`.
-fn enumerate_jobs_within_budget<R, F>(
+fn enumerate_jobs_within_budget<R, Q, F>(
     runs: &[R],
     deadline: Instant,
+    mut quota_available: Q,
     mut fetch_jobs: F,
 ) -> Result<(Vec<QueueJob>, bool)>
 where
+    Q: FnMut() -> bool,
     F: FnMut(&R) -> Result<Vec<QueueJob>>,
 {
     let mut collected = Vec::new();
-    for run in runs {
+    for (idx, run) in runs.iter().enumerate() {
         if Instant::now() >= deadline {
+            return Ok((collected, true));
+        }
+        if idx % JOB_ENUMERATION_QUOTA_CHECK_INTERVAL == 0 && !quota_available() {
             return Ok((collected, true));
         }
         collected.extend(fetch_jobs(run)?);
@@ -622,18 +628,29 @@ fn fetch_capped_queue_snapshot(
         (oldest_runs, true)
     };
 
-    let (queued, queued_bailed) = enumerate_jobs_within_budget(&queued_runs, deadline, |run| {
-        fetch_self_hosted_jobs(repo, run, "queued")
-    })?;
+    let (queued, queued_bailed) = enumerate_jobs_within_budget(
+        &queued_runs,
+        deadline,
+        || rest_quota_available_for_monitoring(rest_reserve_threshold, "queued job enumeration"),
+        |run| fetch_self_hosted_jobs(repo, run, "queued"),
+    )?;
     capped |= queued_bailed;
 
     let (in_progress, in_progress_bailed) = if Instant::now() >= deadline {
         (Vec::new(), true)
     } else {
         let runs = github::list_repo_in_progress_runs(repo)?;
-        enumerate_jobs_within_budget(&runs, deadline, |run| {
-            fetch_self_hosted_jobs(repo, run, "in_progress")
-        })?
+        enumerate_jobs_within_budget(
+            &runs,
+            deadline,
+            || {
+                rest_quota_available_for_monitoring(
+                    rest_reserve_threshold,
+                    "in-progress job enumeration",
+                )
+            },
+            |run| fetch_self_hosted_jobs(repo, run, "in_progress"),
+        )?
     };
     capped |= in_progress_bailed;
 
@@ -1501,10 +1518,15 @@ mod tests {
         let runs = vec![1u32, 2, 3];
         let deadline = Instant::now() - Duration::from_millis(1);
         let mut calls = 0u32;
-        let (collected, bailed) = enumerate_jobs_within_budget(&runs, deadline, |_run| {
-            calls += 1;
-            Ok(Vec::<QueueJob>::new())
-        })
+        let (collected, bailed) = enumerate_jobs_within_budget(
+            &runs,
+            deadline,
+            || true,
+            |_run| {
+                calls += 1;
+                Ok(Vec::<QueueJob>::new())
+            },
+        )
         .unwrap();
         assert!(bailed);
         assert!(collected.is_empty());
@@ -1526,19 +1548,24 @@ mod tests {
         let budget = Duration::from_millis(30);
         let deadline = Instant::now() + budget;
         let mut calls = 0u32;
-        let (collected, bailed) = enumerate_jobs_within_budget(&runs, deadline, |_run| {
-            calls += 1;
-            std::thread::sleep(Duration::from_millis(5));
-            Ok(vec![QueueJob {
-                run_id: 1,
-                job_id: 1,
-                name: "job".into(),
-                head_branch: "main".into(),
-                created_at: "2026-07-07T00:00:00Z".into(),
-                started_at: None,
-                url: "https://github.example/runs/1".into(),
-            }])
-        })
+        let (collected, bailed) = enumerate_jobs_within_budget(
+            &runs,
+            deadline,
+            || true,
+            |_run| {
+                calls += 1;
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(vec![QueueJob {
+                    run_id: 1,
+                    job_id: 1,
+                    name: "job".into(),
+                    head_branch: "main".into(),
+                    created_at: "2026-07-07T00:00:00Z".into(),
+                    started_at: None,
+                    url: "https://github.example/runs/1".into(),
+                }])
+            },
+        )
         .unwrap();
         assert!(
             bailed,
@@ -1560,20 +1587,63 @@ mod tests {
     fn enumerate_jobs_within_budget_completes_normally_when_deadline_is_far_off() {
         let runs = vec![1u32, 2, 3];
         let deadline = Instant::now() + Duration::from_secs(60);
-        let (collected, bailed) = enumerate_jobs_within_budget(&runs, deadline, |_run| {
-            Ok(vec![QueueJob {
-                run_id: 1,
-                job_id: 1,
-                name: "job".into(),
-                head_branch: "main".into(),
-                created_at: "2026-07-07T00:00:00Z".into(),
-                started_at: None,
-                url: "https://github.example/runs/1".into(),
-            }])
-        })
+        let (collected, bailed) = enumerate_jobs_within_budget(
+            &runs,
+            deadline,
+            || true,
+            |_run| {
+                Ok(vec![QueueJob {
+                    run_id: 1,
+                    job_id: 1,
+                    name: "job".into(),
+                    head_branch: "main".into(),
+                    created_at: "2026-07-07T00:00:00Z".into(),
+                    started_at: None,
+                    url: "https://github.example/runs/1".into(),
+                }])
+            },
+        )
         .unwrap();
         assert!(!bailed);
         assert_eq!(collected.len(), 3);
+    }
+
+    #[test]
+    fn enumerate_jobs_within_budget_bails_when_rest_quota_is_reserved_mid_loop() {
+        let runs: Vec<u32> = (0..25).collect();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut quota_checks = 0u32;
+        let mut fetches = 0u32;
+
+        let (collected, bailed) = enumerate_jobs_within_budget(
+            &runs,
+            deadline,
+            || {
+                quota_checks += 1;
+                quota_checks < 3
+            },
+            |_run| {
+                fetches += 1;
+                Ok(vec![QueueJob {
+                    run_id: fetches as u64,
+                    job_id: fetches as u64,
+                    name: "job".into(),
+                    head_branch: "main".into(),
+                    created_at: "2026-07-07T00:00:00Z".into(),
+                    started_at: None,
+                    url: format!("https://github.example/runs/{fetches}"),
+                }])
+            },
+        )
+        .unwrap();
+
+        assert!(bailed);
+        assert_eq!(fetches, JOB_ENUMERATION_QUOTA_CHECK_INTERVAL as u32 * 2);
+        assert_eq!(collected.len(), fetches as usize);
+        assert!(
+            (fetches as usize) < runs.len(),
+            "must leave unprocessed runs once the REST reserve is reached"
+        );
     }
 
     #[test]
