@@ -1226,3 +1226,68 @@ local-only evidence:
 Escalated to main immediately per the "hits 0 AND jobs stranded" trigger,
 noting the immediate recovery to 2 so main has the accurate trend, not just
 the alarming single reading.
+
+---
+
+## sidekick3 — watchdog relaxed, driving REST+GraphQL split (2026-07-07 23:00 PT)
+
+**Watchdog relaxation acknowledged**: main/user raised /etc/watchdog.conf max-load-1
+40->96 (max-load-5 32->72, max-load-15 24->48), daemon restarted, backup saved.
+Reboot risk from normal respawns is essentially gone. Created follow-up bead
+**ez-gh-actions-rfk** (P2, tune po2's respawn_load_safety_ceiling upward toward
+~40 given the new 96 ceiling) -- explicitly NOT implementing/restarting mid-incident,
+capture-only per main's instruction.
+
+**Driving the REST+GraphQL split** (user directive via main, THE fix for the
+fleet-low problem): created bead **ez-gh-actions-4jv** (P1). Root cause: all gh
+calls in src/github.rs go through REST (`gh api`); REST and GraphQL are separate
+5000/hr buckets; queue_monitor's N+1 per-run job enumeration
+(fetch_self_hosted_jobs -> list_workflow_jobs, once per queued+in_progress run,
+100+ calls/tick under load) exhausts the REST bucket and starves
+generate_jitconfig (registration, also REST) -> runners can't register -> fleet
+bleeds.
+
+**Process note (own mistake, caught and fixed, worth recording)**: my first two
+codex dispatch attempts for this branch had a real bug -- I nested `bash -c
+'...'` with backtick-wrapped code snippets (`` `cargo test` ``, `` `gh api
+rate_limit` ``, `` `gh api graphql -f query=...` ``) inside a double-quoted
+prompt string. The inner bash -c re-parse treated those backticks as command
+substitution, actually EXECUTING cargo test/fmt/gh-api-rate_limit for real and
+splicing their live output into the prompt text before codex ever saw it --
+corrupting the instructions main-strength in the middle of TASK 1's description
+(confirmed by reading /proc/<pid>/cmdline directly, not just trusting ps).
+First attempt crashed early (rmcp MCP transport error + garbage prompt,
+produced nothing). Second attempt (still corrupted, verified via /proc/cmdline)
+nonetheless produced a partially-correct, tested TASK 1 implementation (codex
+was robust enough to infer the intact ROOT CAUSE section's intent despite the
+mid-sentence JSON splice) -- reviewed the diff myself before deciding to keep
+it: `RateLimitQuotas`/`rate_limit_quotas()` in github.rs, `gh_rest_reserve_threshold`
+config field (default 200, validated <=5000), `rest_quota_available_for_monitoring`
+gate wired into maybe_check/maybe_sample and the fleet-listing call -- clean,
+tested (186 pass), genuinely useful. BUT found a real gap on my own review: the
+gate only does a single top-of-tick pre-check + guards fleet-listing; it does
+NOT make the actual N+1 per-run job-enumeration loop (the biggest REST
+consumer) quota-aware mid-loop -- quota can still be exhausted DURING that loop
+even if healthy at tick-start, which is the literal production failure mode
+observed. Also found and killed a stray leftover child process from the
+corrupted second attempt that I'd only half-killed (killed the wrapper PID but
+not a forked child, both still alive with the OLD corrupted prompt) -- would
+have kept working from bad instructions if left running.
+
+**Fix**: wrote a third prompt to a plain file (zero backticks/$(), grepped to
+confirm) and dispatched codex with a SHORT literal CLI argument telling it to
+read that file itself -- eliminates all shell-quoting risk since no large
+string ever passes through shell substitution. Confirmed via direct
+/proc/<pid>/cmdline read that the argument is exactly the short literal string,
+clean. This v3 dispatch: (1) commits the existing good TASK-1a work as its own
+commit, (2) fixes the N+1-loop quota-awareness gap as TASK 1b with its own
+test, (3) then proceeds to the GraphQL migration (TASK 2) with explicit
+instructions to introspect the REAL GitHub GraphQL schema rather than
+hallucinate field names, and to leave a REST call in place with a comment if no
+clean GraphQL equivalent exists.
+
+Started a Monitor (task btwhbvh96) polling for new commits / process exit on
+this worktree every 30s, local-only (git rev-parse + pgrep, no gh calls).
+Fleet watch continues unchanged: last sample containers=2, load 7.74(1m) --
+still low but stable, consistent with the ongoing rate-limit incident already
+reported to main, not a new escalation.
