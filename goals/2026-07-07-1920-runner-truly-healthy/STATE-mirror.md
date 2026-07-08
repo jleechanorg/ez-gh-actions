@@ -1088,3 +1088,52 @@ correct lever, not a wasted effort.
 
 Holding: no restart action taken or contemplated while load>12. Will alert main
 immediately on any DANGER event, and report DEPLOY_WINDOW the moment it fires.
+
+---
+
+## sidekick3 — po2 SHIP + merge complete, load dropping fast (2026-07-07 22:39 PT)
+
+**STEP 1 (arithmetic re-verify) — DONE, SHIP confirmed myself** (main routed the
+verification to me directly per the delegation rule, since the round-3 lens kept
+dying on rate limits): re-derived the gate formula in
+`allowed_respawn_starts_for_load` (docker_backend.rs:876) --
+`allowed = floor((ceiling - (measured_load + committed_starts*per_runner)) / per_runner)`
+clamped to batch_size -- this is a closed-form guarantee that
+`baseline + allowed*per_runner <= ceiling` at every decision point, not a
+heuristic. Ran the two named safety tests standalone (not just trusting the
+182-count): `gate_active_incremental_refill_stays_below_watchdog_with_busy_host_baseline`
+(drives the real code through a LaggingLoadSim, proves started.len()==1 and
+15.0+4.4=19.4<24) and `gate_dark_fallback_starts_one_runner_and_stays_below_watchdog_with_busy_host_baseline`
+(proves exactly 1 start, no retries, using the incident-derived worst-case
+71/16=4.4375 per-runner load: 15.0+4.4375=19.4375<24 -- stricter than the
+configured 4.4 default). Both pass. Round-3 regression test
+`gate_throttled_full_success_is_not_a_partial_failure` passes. No hole found --
+SHIP confirmed.
+
+**STEP 2 (merge, no restart) — DONE**: squash-merged `origin/sidekick/po2-respawn-pacing`
+(b8735b7..072025d, 5 commits) into main as **d612ad7**, pushed to origin. Only
+conflict was `.beads/beads.db`/`.beads/beads.db-wal`/`.beads/last-touched` --
+the branch predates main's untrack decision (3edff6b); resolved by keeping them
+deleted (git rm) per that decision, no code conflicts (branch only touched
+config.rs/docker_backend.rs/main.rs; main's concurrent work only touched
+queue_monitor.rs). Ran the full suite on main post-merge: **184/184 passing**
+(182 from the branch + 2 from main's own queue_monitor additions). Confirmed
+Gate 0 transient mismatch as expected: installed binary still embeds old SHA
+`00122ca`, current HEAD is `d612ad7` -- po2 is on main, service NOT restarted,
+exactly per main's instruction.
+
+**STEP 3 (deploy window) — IN PROGRESS, load dropping faster than expected**:
+checked immediately after merge -- load average now **9.17 (1m) / 11.47 (5m) /
+11.38 (15m)**, 12 containers. The 1-minute figure is already comfortably below
+the load<12 gate; 5m/15m are right at the edge. My background Monitor (task
+bxtcf63nf) is still ticking every 5 min tracking a below-12 streak (needs 2
+consecutive) -- will fire DEPLOY_WINDOW very soon if this trend holds. Alerting
+main now rather than waiting for the Monitor event, since the window may open
+faster than the 5-min poll cadence implies.
+
+**Next**: the instant the Monitor confirms 2 consecutive sub-12 samples with
+containers>=12, run the Gate 0 careful-restart myself (cargo install --path . ->
+systemctl --user restart ezgha.service -> verify SHA matches d612ad7 and
+containers/load recover) -- I hold the single-writer lock on this, no
+sub-agent needed for a restart. Will report first post-deploy samples
+immediately.
