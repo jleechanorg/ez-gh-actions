@@ -189,17 +189,35 @@ step after a real deploy.
   CLOSES the mission's top-priority code item; only the deploy step remains, gated on
   team-lead.
 
+- 2026-07-08 09:56 — team-lead confirmed: adafa19 = ALL 3 key fixes now on origin/main
+  (reaper + App token 7f476ac + capacity-proof harness + Gate-0 guardrail 68aab6b). User's
+  "merge all key fixes to main" ask is COMPLETE at the code level. team-lead designated me
+  explicit SINGLE DEPLOY-OWNER for jeff (fleet-ironclad stays watch-only, nobody else
+  restarts jeff) and set a HARD HOLD on the reaper deploy until BOTH: (1) the running
+  capacity-proof re-run burst completes, AND (2) load_1min<12 AND containers>=12. Will send
+  "GO reaper deploy" explicitly. Post-deploy safety ask: watch first few daemon cycles for
+  any cancel/force-cancel log lines against a runner that ISN'T offline+busy+containerless,
+  flag immediately if seen (wrongful-cancel risk is low post-review but not zero). ACKED to
+  team-lead with current read: burst still queued/running (started 09:52:46Z UTC), load
+  7.4-9.7, containers momentarily 11 (just under floor) — neither condition met yet, holding
+  as instructed. Created task #12 to track the deploy step; NOT acting until GO received.
+
 ## Next Actions (rewritten every step)
 
-1. reaper fix (fix #1): MERGED to origin/main (adafa19). Nothing further to do on the code
-   side. Wait for team-lead to signal load has settled, then: rebuild via clean worktree
-   method (or straight `cargo install --path .` now that main IS clean — reaper-wiring's
-   files are merged, no dirty WIP), pre-restart load/container check, restart jeff,
-   verify-exit-criteria.sh. This is the LAST remaining action for the whole 3-fix mission.
-2. capacity-proof (fix #2): CLOSED, no further action.
+1. reaper fix (fix #1): MERGED to origin/main (adafa19). BLOCKED on team-lead's explicit
+   "GO reaper deploy" signal (gated on burst-complete + load_1min<12 + containers>=12) — do
+   NOT restart jeff without it, I am the sole deploy-owner. On GO: build from a fresh
+   detached worktree at origin/main (verify `git status` clean first), `cargo install`,
+   Gate-0-safe restart check immediately before restarting, restart ezgha.service,
+   verify-exit-criteria.sh as final step. Post-deploy: watch first daemon cycles' logs for
+   any cancel/force-cancel against a non-zombie-confirmed runner, flag team-lead instantly
+   if seen. This is the LAST remaining action for the whole 3-fix mission.
+2. capacity-proof (fix #2): CLOSED, no further action (a re-run burst is in flight for the
+   "after" clean 22/22 proof, per team-lead — not mine to drive, just don't restart jeff
+   until it completes).
 3. App token (fix #3): jeff-ubuntu side fully done+proven. Mac-side restart is main/mac
    session's call, not mine — flagged to main already. bead nuk left OPEN with status
    comment pending Mac confirmation.
-4. Once team-lead clears the deploy AND jeff is restarted onto adafa19 (or later): re-verify
-   sustained 16/16 + 6/6 (or queue-drained) with reaper self-heal + app token both active,
-   then this mission's 3 key fixes are fully done end-to-end.
+4. Once team-lead sends GO and jeff is restarted onto adafa19: re-verify sustained 16/16 +
+   6/6 (or queue-drained) with reaper self-heal + app token both active — then this
+   mission's 3 key fixes are fully done end-to-end.
