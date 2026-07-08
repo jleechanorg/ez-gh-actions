@@ -602,13 +602,6 @@ where
     }
 }
 
-fn run_canary_scheduler_tick<F>(run: F) -> bool
-where
-    F: FnOnce() -> bool,
-{
-    run()
-}
-
 fn run_invariant_sampler_tick<F>(run: F) -> bool
 where
     F: FnOnce() -> Result<Option<queue_monitor::InvariantSample>>,
@@ -832,7 +825,7 @@ fn main() -> Result<()> {
                         invariant_sampler.maybe_sample(&cfg, monitor_loop_start)
                     });
                     watchdog::ping();
-                    let _ = run_canary_scheduler_tick(|| canary_scheduler.maybe_check(&cfg));
+                    let _ = canary_scheduler.maybe_check(&cfg);
                 }
                 watchdog::ping();
                 std::thread::sleep(sleep);
@@ -972,19 +965,10 @@ fn ok(b: bool) -> &'static str {
 
 /// Acquire an advisory `flock(2)` on `<config_dir>/ezgha/serve.lock` to
 /// prevent two `ezgha serve` instances from racing on the slot file. The
-/// helper returns a `ServeLock` guard whose `Drop` releases the lock;
-/// release also happens automatically when the process dies. Tests opt
-/// out with `EZGHA_SKIP_LOCK=1`.
-struct ServeLock(Option<std::fs::File>);
-
-impl Drop for ServeLock {
-    fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
-            // Lock release on fd close is automatic; nothing to do here.
-            let _ = f;
-        }
-    }
-}
+/// helper returns a `ServeLock` guard; dropping the `Option<File>` inside
+/// closes the fd and releases the flock automatically (also happens when
+/// the process dies). Tests opt out with `EZGHA_SKIP_LOCK=1`.
+struct ServeLock(#[allow(dead_code)] Option<std::fs::File>);
 
 fn default_state_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
@@ -1295,11 +1279,5 @@ mod tests {
             anyhow::bail!("synthetic invariant sampler failure (e.g. GitHub API rate limit)")
         }));
         assert!(run_invariant_sampler_tick(|| Ok(None)));
-    }
-
-    #[test]
-    fn canary_scheduler_tick_is_non_fatal_to_serve_loop() {
-        assert!(run_canary_scheduler_tick(|| true));
-        assert!(!run_canary_scheduler_tick(|| false));
     }
 }

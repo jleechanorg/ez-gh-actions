@@ -523,7 +523,7 @@ static DOCTOR_PRINTED: Once = Once::new();
 
 /// Build the runner container name for a given slot.
 fn runner_name_for(cfg: &Config, slot: u32) -> String {
-    format!("{}-{}", cfg.runner.name_prefix, slot)
+    runner_name_from_prefix(&cfg.runner.name_prefix, slot)
 }
 
 /// CPU and memory capacity of the docker DAEMON, which may be smaller than
@@ -717,10 +717,7 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
 }
 
 fn count_current_prefix_containers(containers: &[ManagedContainer], cfg: &Config) -> u32 {
-    containers
-        .iter()
-        .filter(|c| runner_name_matches_prefix(&c.name, &cfg.runner.name_prefix))
-        .count() as u32
+    current_prefix_containers(containers, cfg).len() as u32
 }
 
 fn current_prefix_containers<'a>(
