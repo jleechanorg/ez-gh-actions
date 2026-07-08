@@ -888,3 +888,71 @@ is clean and correctly scoped regardless.
 Status: po2 still held (round 3 in flight). demand PR-1 (#8235) and PR-2
 (#8232) both open/mergeable, awaiting checks + human merge decision. PR-1b
 (push-trigger audit) still in progress.
+
+## 2026-07-07 20:35-20:45 PT [sidekick] Resume after Claude-side rate-limit gap + Mac-coordination reconciliation
+
+**Gap event**: ~20:17-20:40 PT gap in my activity was a Claude-side provider 429
+(secondary rate limit on the Claude API itself, per main), NOT a GitHub quota or
+task-blocking issue. Fleet was unattended by me during this window but the daemon
+kept running autonomously (systemd service, no manual intervention needed).
+Confirmed on resume: `ezgha.service` active, 14 containers up, `uptime` load average
+7.17/6.97/6.40 (well under the 24 watchdog ceiling) — no incident occurred during
+the gap. Monitor tasks `bdo79oji3` (fleet degradation) and `b0cjx61fg` (new E1
+samples) kept firing throughout, confirming demand-cut work landed: INV-2 now
+passing in most samples (oldest_queued_job_min dropped to single digits in several
+ticks vs. the earlier 72-min reading), INV-1 still blocked mostly by
+`missing-registration` class plus the Mac's runner shortfall.
+
+**#8232 (demand-cut PR-2, timeout-lint) reconciliation — RESOLVED, no conflict**:
+PR #8232 "ci: enforce self-hosted workflow timeout caps" is **already MERGED**.
+Verified the live `daily-campaign-report.yml` on `main` via `gh api
+repos/.../contents/...`: `timeout-minutes: 120`, with a comment noting a
+follow-up optimization is tracked separately. This is an **exact match** to the
+Mac session's measured requirement (120min, not the originally-flagged unsafe
+15min cap). No action needed — the concern main raised was already resolved
+before I got to it, most likely by the same round of FIXPLAN re-measurement
+work referenced in commit 886dbe6 ("campaign-report cap genuinely unsafe (fix in
+flight)") landing correctly.
+
+**#8235 (demand-cut PR-1, quick wins) vs Mac's #8243/#8244 — file overlap confirmed,
+no active conflict**: #8235 is still OPEN, `mergeable: MERGEABLE` (GitHub's own
+computed status against current main, which already includes both Mac PRs merged).
+File-level overlap:
+- `green-gate.yml`: #8235 removes `edited` from `pull_request.types` and scopes
+  `cancel-in-progress` to the self-hosted precheck job. Mac's #8244 (MERGED) splits
+  the Gate-4 Bugbot poll to `ubuntu-latest`. Different concerns within the same
+  file — trigger/concurrency vs. runner assignment for one job — no line-range
+  collision expected.
+- `levelup-tests.yml`: #8235 moves `resolve-pr-context`/`resolve-self-hosted-pr-context`
+  to `ubuntu-latest`. Mac's #8243 (MERGED) adds a FIXPLAN paths filter + per-PR
+  levelup concurrency group. Also different concerns — job runner vs. trigger
+  paths/concurrency.
+- GitHub's live mergeability check is authoritative for textual conflicts and
+  reports clean. Residual risk is purely semantic (two PRs touching the same
+  workflow's behavior in the same review window) — recommend a human glance at
+  final diff before merge, not a blocker.
+- Could not pull full diff hunks to eyeball line-by-line: GitHub API returned a
+  **hard rate limit (HTTP 403, primary quota, not the usual secondary/abuse
+  block)** mid-check. Backed off per "keep Claude usage light" directive rather
+  than retrying.
+
+**PR-1b (push→pull_request trigger audit) — correctly conservative, no YAML
+shipped**: codex's dispatch (branch `sidekick/demand-cut-pr1b-push-triggers`,
+opened as worldarchitect.ai PR **#8236**) did NOT implement the trigger change.
+It attempted the required ≥60-distinct-branch verification sample main mandated
+before implementing, but GitHub secondary-rate-limited the Actions endpoint after
+only 31 branches accumulated across 12 snapshots. The original 4/22 (18.2%)
+no-open-PR finding stands directionally but is **unconfirmed at the required
+scale**. Per main's explicit gate ("verify the 27% number on 60+ branches before
+implementing"), codex correctly stopped at Phase 1 (data collection + writeup)
+and shipped zero workflow changes. This is the right outcome, not a stall.
+
+**Division of labor reaffirmed**: Lane L3 (CPU-resize / 1-cpu-clamp) is
+Mac-owned — not touched, not duplicated. worldai_claw PR #253 is the Mac's
+separate mission — not touched. Mac fleet context for SC6 interpretation: 4/6
+mac runners up, mac loadavg 18-23 at last relay from main — treated as an
+external dependency on the INV-1 busy==22 branch, not a Linux-side bug to chase.
+
+**Next**: doctor.sh resample for SC6 (fleet integrity), then report consolidated
+findings to main. Continuing to HOLD po2 V3 deploy pending main's own round-3
+SHIP verdict — not independently reviewing or acting on it.
