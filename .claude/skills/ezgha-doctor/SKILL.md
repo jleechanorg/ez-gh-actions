@@ -69,7 +69,7 @@ When section 8 is **BAD** or doctor exit ≠ 0, **mandatory**: run `/harness` pe
 
 ## Step 2 — Identify the failing checks
 
-The doctor groups failures into 8 sections:
+The doctor groups failures into 9 sections:
 
 1. **ezgha service** — `ezgha.service` should be `active`. If not: `systemctl --user restart ezgha.service`.
 2. **docker daemon** — `docker info` must succeed. If not, the daemon's host is the problem; for Colima: `limactl start colima`.
@@ -83,6 +83,43 @@ The doctor groups failures into 8 sections:
    (This is the standard reset; slot-recon PR shipped with v0.1.x makes the loop self-heal.)
 5. **GitHub org runner fleet** — `ez-org-runner-N` should all be `online` at GitHub. If only some: see "Missing daemon, runner alive" below.
 6. **live docker containers** — at least 14/16 containers should be running locally with `ezgha=managed` label.
+9. **per-slot local execution proof** — see "Step 2b" below. This is the ironclad, GitHub-API-independent enforcement of "N/N runners actually executing."
+
+### Step 2b — Per-slot local execution proof (section 9, ironclad gate)
+
+Sections 5/6 ("online" at GitHub, container count) can both be **fooled by a
+GitHub API rate limit** — "online"/"busy" flags go stale or the query itself
+fails, and container *count* alone can't tell IDLE apart from EXECUTING.
+Section 9 fixes this by proving state from **docker only, never GitHub**:
+for every CONFIGURED slot (`${RUNNER_NAME_PREFIX}-1..count`, plus the Mac
+fleet over SSH to `macbook` if reachable), it runs `docker inspect` +
+`docker top <container> -eo cmd | grep Runner.Worker` and classifies each
+slot as:
+
+- **DOWN** — no running container at all. Always a defect.
+- **IDLE** — container up, `Runner.Listener` present, no `Runner.Worker`. A
+  defect **only when there's a queue backlog** (`QUEUE_QUEUED_FRESH > 0`,
+  reused from section 8) — idle with an empty queue is healthy, not starved.
+- **EXECUTING** — `Runner.Worker` present. This is the actual per-slot proof
+  the mission's "22/22 executing" standard requires.
+
+It also surfaces the **serve-loop-starvation signal**: the largest gap (in
+seconds, Linux-only — journalctl has per-line timestamps, macOS's redirected
+launchd logs do not) between `respawned ephemeral runner` bursts in the last
+10 minutes, plus how many rate-limit occurrences showed up in the same
+window. A gap over `STARVE_GAP_WARN_SECONDS` (default 150s) means
+`ensure_count` is being starved by a rate-limited monitor tick again — the
+exact ez-gh-actions-yrt/g3o regression (see `src/queue_monitor.rs`'s
+`SERVE_LOOP_TIME_BUDGET` and `src/github.rs`'s `run_gh_with_backoff_until`).
+If this fires, re-check that both files still thread a `deadline` through
+every `gh` call reachable from the monitor/sampler tick — a future change
+that adds a new `github::api_json(...)` call in that path (instead of
+`api_json_until`) would silently reopen the starvation hole.
+
+Env overrides: `MAC_HOST` (default `macbook`), `MAC_RUNNER_NAME_PREFIX`
+(default `ez-mac-runner-b`), `MAC_RUNNER_COUNT` (default `6`),
+`STARVE_WINDOW` (minutes, default `10`), `STARVE_GAP_WARN_SECONDS`
+(default `150`).
 
 ## Step 3 — Special cases
 

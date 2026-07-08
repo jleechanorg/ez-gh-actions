@@ -22,6 +22,16 @@ When this command is invoked, immediately execute the following steps:
    - Stale queued zombies (>8h by default — GitHub artifacts, not waiting for runners)
    - **BAD if max fresh wait > 20 min** (`QUEUE_TAIL_WARN_MIN`, default 20)
 
+   **Section 9 — per-slot local execution proof** (LOCAL-ONLY, no GitHub API — the
+   API lies under rate limit): every configured Linux slot (+ Mac slots over
+   SSH if reachable) is classified DOWN / IDLE / EXECUTING via `docker top
+   <container> | grep Runner.Worker`. DOWN is always a defect; IDLE is only a
+   defect when there's a queue backlog. Also surfaces the serve-loop-
+   starvation signal (max gap between respawn bursts, rate-limit occurrence
+   count) — a gap over 150s means `ensure_count` is being starved by a
+   rate-limited monitor tick (see `.claude/skills/ezgha-doctor/SKILL.md`
+   Step 2b and bead ez-gh-actions-yrt/g3o).
+
 2. **If unhealthy OR queue tail > 20 min, run `/harness`** (mandatory):
    * Read `~/.claude/commands/harness.md` and `~/.claude/skills/harness-engineering/SKILL.md`
    * Produce full harness analysis (5 Whys technical + agent path)
@@ -29,7 +39,7 @@ When this command is invoked, immediately execute the following steps:
    * Propose durable fixes (doctor.sh, skill, verify-exit-criteria gate, watchdog script)
 
 3. **If unhealthy, perform diagnostics**:
-   * Inspect which critical checks failed (sections 1–8)
+   * Inspect which critical checks failed (sections 1–9)
    * Check supervisor: `systemctl --user status ezgha.service` (Linux) or `launchctl print gui/$(id -u)/org.jleechanorg.ezgha` (macOS)
    * Check docker: `docker ps --filter label=ezgha=managed`
    * Check logs: `journalctl --user -n 50 -u ezgha.service` or `/tmp/ezgha-launchd-stderr.log`

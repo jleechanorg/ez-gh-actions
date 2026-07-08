@@ -341,6 +341,141 @@ else
   warn "scripts/queue-health.sh missing — queue metrics skipped"
 fi
 
+# --- F3. per-slot LOCAL execution proof (no GitHub API — the API lies under
+# rate limit; see ez-gh-actions-yrt/g3o) --------------------------------
+# "online" and "busy" per the GitHub API can be stale or simply unreachable
+# during a rate-limit window (exactly the condition this doctor gate exists
+# to catch). The only ground truth that cannot lie is the local docker
+# daemon: a container is either running or it isn't, and inside a running
+# container the GitHub Actions runner either has a `Runner.Worker` process
+# (EXECUTING a job right now) or it doesn't (`Runner.Listener` only ->
+# IDLE, waiting for work). This section enumerates every CONFIGURED slot —
+# not just however many containers happen to exist — so a slot that never
+# got a container at all (DOWN) is reported by name, not silently absent.
+section "9. per-slot local execution proof (docker top, LOCAL-ONLY)"
+CONFIGURED_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+CONFIGURED_COUNT="${CONFIGURED_COUNT:-16}"
+
+classify_local_slot() {
+  # Echoes one of: DOWN | IDLE | EXECUTING for container name "$1".
+  local name="$1" running
+  running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo "false")
+  if [ "$running" != "true" ]; then
+    echo "DOWN"
+    return
+  fi
+  if docker top "$name" -eo cmd 2>/dev/null | grep -q 'Runner\.Worker'; then
+    echo "EXECUTING"
+  else
+    echo "IDLE"
+  fi
+}
+
+DOWN_SLOTS=()
+IDLE_SLOTS=()
+EXECUTING_SLOTS=()
+for _i in $(seq 1 "$CONFIGURED_COUNT"); do
+  _name="${RUNNER_NAME_PREFIX}-${_i}"
+  case "$(classify_local_slot "$_name")" in
+    DOWN)      DOWN_SLOTS+=("$_name") ;;
+    IDLE)      IDLE_SLOTS+=("$_name") ;;
+    EXECUTING) EXECUTING_SLOTS+=("$_name") ;;
+  esac
+done
+info "Linux slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
+
+# IDLE is only a defect when there is a backlog of queued self-hosted work
+# (reuses QUEUE_QUEUED_FRESH from section 8 above) — an idle fleet with an
+# empty queue is healthy, not starved. DOWN is always a defect regardless.
+BACKLOG_PRESENT=0
+[ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ] && BACKLOG_PRESENT=1
+
+SLOT_PROOF_CRITICAL=0
+if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
+  bad "DOWN (no container) — ${#DOWN_SLOTS[@]} slot(s): ${DOWN_SLOTS[*]}"
+  SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#DOWN_SLOTS[@]}))
+fi
+if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
+  if [ "$BACKLOG_PRESENT" -eq 1 ]; then
+    bad "IDLE-with-backlog (${QUEUE_QUEUED_FRESH} jobs queued) — ${#IDLE_SLOTS[@]} slot(s): ${IDLE_SLOTS[*]}"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#IDLE_SLOTS[@]}))
+  else
+    info "idle (no queue backlog, expected): ${IDLE_SLOTS[*]}"
+  fi
+fi
+[ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "executing right now: ${EXECUTING_SLOTS[*]}"
+
+# Optional Mac fleet probe via SSH — best-effort, never fatal if unreachable
+# (the mission's fleet is "16 Linux + 6 Mac"; the Mac half is proven the
+# same way, over SSH, when the host is reachable).
+MAC_HOST="${MAC_HOST:-macbook}"
+MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
+MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-6}"
+if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/null 2>&1; then
+  MAC_DOWN_SLOTS=()
+  MAC_IDLE_SLOTS=()
+  MAC_EXECUTING_SLOTS=()
+  MAC_REPORT=$(timeout 20 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" "
+    for i in \$(seq 1 $MAC_RUNNER_COUNT); do
+      name=\"${MAC_RUNNER_NAME_PREFIX}-\${i}\"
+      running=\$(docker inspect -f '{{.State.Running}}' \"\$name\" 2>/dev/null || echo false)
+      if [ \"\$running\" != true ]; then echo \"\$name DOWN\"; continue; fi
+      if docker top \"\$name\" -eo cmd 2>/dev/null | grep -q 'Runner\.Worker'; then
+        echo \"\$name EXECUTING\"
+      else
+        echo \"\$name IDLE\"
+      fi
+    done
+  " 2>/dev/null || true)
+  while read -r _name _state; do
+    [ -z "$_name" ] && continue
+    case "$_state" in
+      DOWN)      MAC_DOWN_SLOTS+=("$_name") ;;
+      IDLE)      MAC_IDLE_SLOTS+=("$_name") ;;
+      EXECUTING) MAC_EXECUTING_SLOTS+=("$_name") ;;
+    esac
+  done <<< "$MAC_REPORT"
+  info "Mac slots (local proof via ssh): ${#MAC_EXECUTING_SLOTS[@]} executing, ${#MAC_IDLE_SLOTS[@]} idle, ${#MAC_DOWN_SLOTS[@]} down (of $MAC_RUNNER_COUNT configured)"
+  if [ "${#MAC_DOWN_SLOTS[@]}" -gt 0 ]; then
+    bad "Mac DOWN (no container) — ${#MAC_DOWN_SLOTS[@]} slot(s): ${MAC_DOWN_SLOTS[*]}"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#MAC_DOWN_SLOTS[@]}))
+  fi
+  if [ "${#MAC_IDLE_SLOTS[@]}" -gt 0 ] && [ "$BACKLOG_PRESENT" -eq 1 ]; then
+    bad "Mac IDLE-with-backlog — ${#MAC_IDLE_SLOTS[@]} slot(s): ${MAC_IDLE_SLOTS[*]}"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#MAC_IDLE_SLOTS[@]}))
+  fi
+else
+  warn "Mac ($MAC_HOST) not reachable via SSH — skipping Mac per-slot proof"
+fi
+
+# Serve-loop-starvation signal: the largest gap between respawn bursts, plus
+# how often the monitor tick is hitting a rate limit. This is the direct
+# observable for the ez-gh-actions-yrt/g3o starvation bug (a 60-90s+ gap
+# here means ensure_count is being starved by a rate-limited monitor tick
+# again, regardless of what the per-slot proof above shows this instant).
+# Linux-only: journalctl timestamps every line; macOS's redirected launchd
+# log files carry no per-line timestamp to diff.
+STARVE_WINDOW="${STARVE_WINDOW:-10}"
+STARVE_GAP_WARN_SECONDS="${STARVE_GAP_WARN_SECONDS:-150}"
+if [ "$PLATFORM" = "linux" ]; then
+  # `-o short-unix` timestamps carry sub-second precision (epoch.usec);
+  # truncate to whole seconds before the arithmetic gap check below, or a
+  # gap like "109.13" fails bash's integer-only `-gt` with a syntax error.
+  MAX_RESPAWN_GAP=$(journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
+    | grep 'respawned ephemeral runner' \
+    | awk '{split($1, t, "."); print t[1]}' \
+    | sort -n -u \
+    | awk 'NR>1{gap=$1-prev; if (gap>max) max=gap} {prev=$1} END{print max+0}')
+  RATE_LIMIT_COUNT=$(recent_logs "$STARVE_WINDOW" | grep -c -i 'rate limit' || true)
+  info "serve-loop starvation signal (last ${STARVE_WINDOW}m): max respawn-burst gap=${MAX_RESPAWN_GAP:-0}s, rate-limit occurrences=$RATE_LIMIT_COUNT"
+  if [ "${MAX_RESPAWN_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
+    bad "serve-loop starvation: respawn gap ${MAX_RESPAWN_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s — ensure_count is being starved (see ez-gh-actions-yrt/g3o)"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
+  fi
+else
+  warn "serve-loop starvation signal skipped on $PLATFORM (no per-line timestamps in launchd log redirect)"
+fi
+
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
 CRITICAL=0
@@ -377,6 +512,11 @@ fi
 [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]  && CRITICAL=$((CRITICAL+1))
 # queue tail gate: fresh backlog waiting > QUEUE_TAIL_WARN_MIN means saturated/mis-routing
 [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && CRITICAL=$((CRITICAL+1))
+# per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
+# backlog slots, and serve-loop starvation are the durable enforcement of
+# the "22/22 executing" standard — ground truth from docker, not the
+# GitHub API, so it cannot be fooled by a rate-limited fleet-state query.
+[ "${SLOT_PROOF_CRITICAL:-0}" -gt 0 ] && CRITICAL=$((CRITICAL + SLOT_PROOF_CRITICAL))
 
 if [ "$CRITICAL" -gt 0 ]; then
   bad "fleet unhealthy: $CRITICAL critical check(s) failed"
