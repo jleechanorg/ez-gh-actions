@@ -476,9 +476,53 @@ else
   warn "serve-loop starvation signal skipped on $PLATFORM (no per-line timestamps in launchd log redirect)"
 fi
 
+# === 10. host watchdog configuration ===
+WATCHDOG_CRITICAL=0
+if [ "$PLATFORM" = "linux" ]; then
+  section "10. host watchdog configuration"
+  if [ -f "/etc/watchdog.conf" ]; then
+    # Extract watchdog parameters, stripping leading/trailing whitespace
+    max_load_1=$(grep -E '^\s*max-load-1\s*=' /etc/watchdog.conf | awk -F= '{print $2}' | tr -d '[:space:]')
+    repair_bin=$(grep -E '^\s*repair-binary\s*=' /etc/watchdog.conf | awk -F= '{print $2}' | tr -d '[:space:]')
+    
+    if [ -n "$max_load_1" ]; then
+      info "watchdog max-load-1 set to: $max_load_1"
+      if [ "$max_load_1" -lt 96 ]; then
+        warn "watchdog max-load-1 ($max_load_1) is below recommended safety ceiling of 96 (danger of reboot during mass respawn)."
+      else
+        ok "watchdog max-load-1 ($max_load_1) has safe headroom (>=96)"
+      fi
+    else
+      warn "watchdog max-load-1 not configured in /etc/watchdog.conf (default host limits apply)."
+    fi
+
+    if [ -n "$repair_bin" ]; then
+      info "watchdog repair-binary set to: $repair_bin"
+      # resolve ~ or env vars in path if any
+      resolved_repair_bin="${repair_bin/#\~/$HOME}"
+      if [ -f "$resolved_repair_bin" ]; then
+        if [ -x "$resolved_repair_bin" ]; then
+          ok "watchdog repair-binary is present and executable: $resolved_repair_bin"
+        else
+          bad "watchdog repair-binary exists but is not executable: $resolved_repair_bin"
+          WATCHDOG_CRITICAL=$((WATCHDOG_CRITICAL+1))
+        fi
+      else
+        bad "watchdog repair-binary file does not exist: $resolved_repair_bin"
+        WATCHDOG_CRITICAL=$((WATCHDOG_CRITICAL+1))
+      fi
+    else
+      warn "watchdog repair-binary not configured in /etc/watchdog.conf."
+    fi
+  else
+    warn "/etc/watchdog.conf not found."
+  fi
+fi
+
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
 CRITICAL=0
+[ "${WATCHDOG_CRITICAL:-0}" -gt 0 ]         && CRITICAL=$((CRITICAL + WATCHDOG_CRITICAL))
 [ "$SERVICE_STATE" != "active" ]            && CRITICAL=$((CRITICAL+1))
 [ "$COLIMA_STATUS" = "Stopped" ]            && CRITICAL=$((CRITICAL+1))
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
