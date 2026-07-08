@@ -202,22 +202,37 @@ step after a real deploy.
   7.4-9.7, containers momentarily 11 (just under floor) — neither condition met yet, holding
   as instructed. Created task #12 to track the deploy step; NOT acting until GO received.
 
+- 2026-07-08 10:01 — team-lead sent GO: burst done (capacity-proof captured true 22/22,
+  evidence bfddf83), Gate-0 window was load 11.35/containers 13 at send-time. Started the
+  deploy: confirmed shared tree clean, origin/main HEAD = bfddf83 (capacity-proof's 22/22
+  evidence commit on top of adafa19). Built from a fresh detached worktree
+  (scratchpad/ezgha-deploy-bfddf83): 188/188 tests green. Verified the reaper symbols are
+  actually IN the release binary (grepped for the literal "currently running a job" string
+  from is_runner_busy_lock_error — present). Re-checked load right before restart per
+  team-lead's judgment call: 12.02, then spiked to 13.14 (likely my own `cargo build
+  --release` competing for CPU). Per team-lead's "wait a few min if >10" guidance, did NOT
+  restart — started a background poll loop (load_1min<9 AND containers>=12, 15s interval)
+  instead of blind-sleeping or proceeding into an elevated window. Reported status to
+  team-lead. cargo install/systemctl restart NOT yet run.
+
 ## Next Actions (rewritten every step)
 
-1. reaper fix (fix #1): MERGED to origin/main (adafa19). BLOCKED on team-lead's explicit
-   "GO reaper deploy" signal (gated on burst-complete + load_1min<12 + containers>=12) — do
-   NOT restart jeff without it, I am the sole deploy-owner. On GO: build from a fresh
-   detached worktree at origin/main (verify `git status` clean first), `cargo install`,
-   Gate-0-safe restart check immediately before restarting, restart ezgha.service,
-   verify-exit-criteria.sh as final step. Post-deploy: watch first daemon cycles' logs for
-   any cancel/force-cancel against a non-zombie-confirmed runner, flag team-lead instantly
-   if seen. This is the LAST remaining action for the whole 3-fix mission.
-2. capacity-proof (fix #2): CLOSED, no further action (a re-run burst is in flight for the
-   "after" clean 22/22 proof, per team-lead — not mine to drive, just don't restart jeff
-   until it completes).
-3. App token (fix #3): jeff-ubuntu side fully done+proven. Mac-side restart is main/mac
-   session's call, not mine — flagged to main already. bead nuk left OPEN with status
-   comment pending Mac confirmation.
-4. Once team-lead sends GO and jeff is restarted onto adafa19: re-verify sustained 16/16 +
-   6/6 (or queue-drained) with reaper self-heal + app token both active — then this
-   mission's 3 key fixes are fully done end-to-end.
+1. reaper fix (fix #1) DEPLOY: waiting on the background poll loop to confirm
+   load_1min<9 AND containers>=12. On signal: `cargo install --path .` from
+   scratchpad/ezgha-deploy-bfddf83 (clean bfddf83 checkout, already tested), re-check
+   load/containers one more time immediately before restart, `systemctl --user restart
+   ezgha.service`, then `./docs/verify-exit-criteria.sh` as final step. Then confirm:
+   deployed binary SHA == bfddf83 (Gate 0 — also clears the lingering
+   "10a544c-dirty"/whatever-was-live mismatch), reaper symbols present in the NOW-DEPLOYED
+   binary (not just the build), App token still active post-restart (GH_TOKEN env + isolated
+   bucket check, same method as the earlier App-token deploy). Watch first several daemon
+   cycles' logs for cancel/force-cancel lines — flag team-lead INSTANTLY if one fires against
+   a runner not confirmed offline+busy+containerless. This is the LAST action for the mission.
+2. capacity-proof (fix #2): CLOSED — its 22/22 evidence commit (bfddf83) is what's being
+   deployed as part of fix #1's HEAD.
+3. App token (fix #3): jeff-ubuntu side fully done+proven pre-restart; re-confirm post-restart
+   per step 1. Mac-side restart is main/mac session's call, not mine.
+4. After deploy verification passes: run the final sustained-capacity re-verification (all 3
+   fixes live together: reaper self-heal + app token + capacity-proof harness), report
+   Gate-0 result + symbols + App-token-active + fleet-holding + cancel-log observations to
+   team-lead. That closes the entire 3-fix mission end-to-end.
