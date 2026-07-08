@@ -378,6 +378,19 @@ struct JitRunner {
     name: String,
 }
 
+/// Build the `gh api -X POST <path>` command that registers a JIT runner.
+/// Shared by `generate_jitconfig`'s first attempt and its 409-conflict
+/// self-heal retry, which otherwise built byte-identical argv independently.
+fn build_jitconfig_cmd(path: &str, name: &str, labels: &[String]) -> Command {
+    let mut cmd = gh_command();
+    cmd.args(["api", "-X", "POST", path, "-f", &format!("name={name}")]);
+    cmd.args(["-F", "runner_group_id=1"]);
+    for label in labels {
+        cmd.args(["-f", &format!("labels[]={label}")]);
+    }
+    cmd
+}
+
 /// Ask GitHub for a just-in-time runner registration. A JIT runner accepts
 /// exactly one job and then deregisters itself — ephemeral by construction,
 /// no registration token to store or clean up.
@@ -388,16 +401,8 @@ pub fn generate_jitconfig(
     owned_ids: &std::collections::HashSet<u64>,
 ) -> Result<(String, u64)> {
     let path = jitconfig_path(gh);
-    let out = run_gh_with_backoff(|| {
-        let mut cmd = gh_command();
-        cmd.args(["api", "-X", "POST", &path, "-f", &format!("name={name}")]);
-        cmd.args(["-F", "runner_group_id=1"]);
-        for label in labels {
-            cmd.args(["-f", &format!("labels[]={label}")]);
-        }
-        cmd
-    })
-    .context("failed to run `gh api` — is the gh CLI installed?")?;
+    let out = run_gh_with_backoff(|| build_jitconfig_cmd(&path, name, labels))
+        .context("failed to run `gh api` — is the gh CLI installed?")?;
     watchdog::ping();
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -430,22 +435,8 @@ pub fn generate_jitconfig(
                     );
                     if remove_runner(gh, conflicting.id).is_ok() {
                         watchdog::ping();
-                        let retry_out = run_gh_with_backoff(|| {
-                            let mut retry_cmd = gh_command();
-                            retry_cmd.args([
-                                "api",
-                                "-X",
-                                "POST",
-                                &path,
-                                "-f",
-                                &format!("name={name}"),
-                            ]);
-                            retry_cmd.args(["-F", "runner_group_id=1"]);
-                            for label in labels {
-                                retry_cmd.args(["-f", &format!("labels[]={label}")]);
-                            }
-                            retry_cmd
-                        })?;
+                        let retry_out =
+                            run_gh_with_backoff(|| build_jitconfig_cmd(&path, name, labels))?;
                         if retry_out.status.success() {
                             let parsed: JitConfigResponse = serde_json::from_slice(
                                 &retry_out.stdout,
