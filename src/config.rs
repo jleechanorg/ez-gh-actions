@@ -49,6 +49,11 @@ pub struct AlertConfig {
     pub email_from: Option<String>,
     /// Optional durable local JSONL alert log path.
     pub log_path: Option<PathBuf>,
+    /// Dead-man's switch: if no alert has been delivered within this many
+    /// seconds, the daemon fires a CRITICAL self-test to prove the alert
+    /// pipeline is still alive. Set to 0 to disable.
+    #[serde(default = "default_deadman_threshold_seconds")]
+    pub deadman_threshold_seconds: u64,
 }
 
 impl Default for AlertConfig {
@@ -60,6 +65,7 @@ impl Default for AlertConfig {
             email_to: None,
             email_from: None,
             log_path: None,
+            deadman_threshold_seconds: default_deadman_threshold_seconds(),
         }
     }
 }
@@ -253,6 +259,10 @@ fn default_alert_cooldown_seconds() -> u64 {
     900
 }
 
+fn default_deadman_threshold_seconds() -> u64 {
+    3600
+}
+
 fn default_queue_tail_warn_minutes() -> u64 {
     20
 }
@@ -408,6 +418,7 @@ impl Config {
                 email_to: None,
                 email_from: None,
                 log_path: None,
+                deadman_threshold_seconds: default_deadman_threshold_seconds(),
             },
             queue_monitor: QueueMonitorConfig::default(),
             canary: CanaryConfig::default(),
