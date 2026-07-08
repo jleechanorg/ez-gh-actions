@@ -103,6 +103,8 @@ A single 6-hour hang exceeds the entire observed queue tail (275.6m, `capacity_m
 
 ### 3.3 Timeout family — 7 jobs across 6 files
 
+> **CORRECTION (2026-07-07 ~17:30 PT, post-verification by sidekick during PR implementation — DO NOT implement the minute values below as written).** Independent measurement of actual historical durations (n=10 per workflow via gh api, vs this section's n=2-or-unsupported samples) shows the proposed caps would kill real successful runs: codex-skill-sync measured p50=21.1min/max=57.7min (proposed 10min cap would have killed 8 of last 10 successful runs); daily-campaign-report max=178.5min vs proposed 15min (6/10 runs exceed); daily-gcp/gh-cost-report max=469min/397min. Working hypothesis: these durations are inflated by the 1-cpu-clamped runner fleet (Lane L3 finding), not genuine hangs. **Revised plan:** (1) the STRUCTURAL rule stands — every self-hosted job must declare `timeout-minutes` (§4.4 lint enforces presence, not specific values); (2) re-measure these workflows AFTER the VM CPU resizes land, using JOB-level `started_at→completed_at` (not run-level created→updated, which conflates queue wait with execution), then set caps at post-fix p95 + margin. Timeout items were deliberately DROPPED from PR #8243 pending that re-measurement.
+
 ```yaml
 # codex-skill-sync.yml — job `check` (after runs-on, line 29)
      runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted"]') }}
