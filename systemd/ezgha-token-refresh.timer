@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh ezgha GitHub App installation token every 45 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=45min
+Persistent=true
+Unit=ezgha-token-refresh.service
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ const GH_RETRY_MAX_DELAY: Duration = Duration::from_secs(32);
 #[cfg(test)]
 thread_local! {
     static GH_EXE_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static GH_TOKEN_FILE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -49,15 +51,83 @@ pub(crate) fn with_gh_exe(path: &str) -> GhExeOverrideGuard {
     GhExeOverrideGuard { previous }
 }
 
+#[cfg(test)]
+pub(crate) struct GhTokenFileOverrideGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl Drop for GhTokenFileOverrideGuard {
+    fn drop(&mut self) {
+        GH_TOKEN_FILE_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn with_gh_token_file(path: PathBuf) -> GhTokenFileOverrideGuard {
+    let previous = GH_TOKEN_FILE_OVERRIDE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        slot.replace(path)
+    });
+    GhTokenFileOverrideGuard { previous }
+}
+
 fn gh_command() -> Command {
     #[cfg(test)]
     if let Some(path) = GH_EXE_OVERRIDE.with(|cell| cell.borrow().clone()) {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg(path);
+        apply_gh_token_file(&mut cmd);
         return cmd;
     }
 
-    Command::new("gh")
+    let mut cmd = Command::new("gh");
+    apply_gh_token_file(&mut cmd);
+    cmd
+}
+
+fn gh_token_file_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = GH_TOKEN_FILE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Some(path);
+    }
+
+    std::env::var_os("EZGHA_GH_TOKEN_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/ezgha/gh_token"))
+        })
+}
+
+fn read_gh_token_file() -> Option<Result<String, String>> {
+    let path = gh_token_file_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => {
+            let token = raw.trim().to_string();
+            (!token.is_empty()).then_some(Ok(token))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(Err(format!("{}: {err}", path.display()))),
+    }
+}
+
+fn apply_gh_token_file(cmd: &mut Command) {
+    match read_gh_token_file() {
+        Some(Ok(token)) => {
+            cmd.env("GH_TOKEN", token);
+            cmd.env_remove("GITHUB_TOKEN");
+        }
+        Some(Err(message)) => {
+            eprintln!(
+                "warning: failed to read GitHub token file {message}; refusing to fall back to default gh auth"
+            );
+            cmd.env("GH_TOKEN", "ezgha-token-file-read-failed");
+            cmd.env_remove("GITHUB_TOKEN");
+        }
+        None => {}
+    }
 }
 
 fn extract_retry_after_secs(text: &str) -> Option<u64> {
@@ -774,6 +844,36 @@ mod tests {
             scope: Scope::Org,
             target: "jleechanorg".into(),
         }
+    }
+
+    #[test]
+    fn gh_command_reads_installation_token_file_for_child_env() {
+        let token_path = std::env::temp_dir().join(format!(
+            "ezgha-gh-token-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&token_path, "installation-token-value\n").unwrap();
+        let _guard = with_gh_token_file(token_path.clone());
+
+        let cmd = gh_command();
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            envs.get("GH_TOKEN").and_then(|v| v.as_deref()),
+            Some("installation-token-value")
+        );
+        assert_eq!(envs.get("GITHUB_TOKEN"), Some(&None));
+
+        std::fs::remove_file(token_path).unwrap();
     }
 
     #[test]
