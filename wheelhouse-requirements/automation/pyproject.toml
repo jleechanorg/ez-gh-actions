@@ -1,0 +1,176 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jleechanorg-pr-automation"
+version = "0.2.179"
+description = "GitHub PR automation system with safety limits and actionable counting"
+authors = [
+    { name = "jleechan", email = "jlee@jleechan.org" },
+]
+readme = "README.md"
+license = "MIT"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+keywords = [
+    "github",
+    "automation",
+    "pr",
+    "pull-request",
+    "monitoring",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.25.0",
+    "jleechanorg-orchestration>=0.1.88",
+    "playwright>=1.40.0",
+    "playwright-stealth>=2.0.0",
+    "aiohttp>=3.8.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+email = [
+    "keyring>=23.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.0.0",
+    "black>=22.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jleechanorg/worldarchitect.ai"
+Repository = "https://github.com/jleechanorg/worldarchitect.ai"
+Issues = "https://github.com/jleechanorg/worldarchitect.ai/issues"
+
+[project.scripts]
+jleechanorg-pr-monitor = "jleechanorg_pr_automation.jleechanorg_pr_monitor:main"
+automation-safety-cli = "jleechanorg_pr_automation.automation_safety_manager:main"
+
+[tool.setuptools.packages.find]
+where = [
+    ".",
+]
+include = [
+    "jleechanorg_pr_automation*",
+]
+
+[tool.setuptools.package-data]
+jleechanorg_pr_automation = [
+    "*.md",
+    "*.txt",
+]
+
+[tool.black]
+line-length = 120
+target-version = [
+    "py311",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "N",
+    "UP",
+    "YTT",
+    "ANN",
+    "S",
+    "BLE",
+    "FBT",
+    "B",
+    "A",
+    "COM",
+    "C4",
+    "DTZ",
+    "T10",
+    "EM",
+    "EXE",
+    "FA",
+    "ISC",
+    "ICN",
+    "G",
+    "INP",
+    "PIE",
+    "T20",
+    "PYI",
+    "PT",
+    "Q",
+    "RSE",
+    "RET",
+    "SLF",
+    "SLOT",
+    "SIM",
+    "TID",
+    "TCH",
+    "INT",
+    "ARG",
+    "PTH",
+    "ERA",
+    "PD",
+    "PGH",
+    "PL",
+    "TRY",
+    "FLY",
+    "NPY",
+    "RUF",
+]
+ignore = [
+    "ANN101",
+    "ANN102",
+    "PGH004",
+    "S101",
+    "PLR0913",
+    "PLR0912",
+    "PLR0915",
+    "COM812",
+    "ISC001",
+]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "jleechanorg_pr_automation/tests",
+    "tests",
+]
+python_files = [
+    "test_*.py",
+    "*_test.py",
+]
+python_classes = [
+    "Test*",
+]
+python_functions = [
+    "test_*",
+]
+addopts = [
+    "--cov=jleechanorg_pr_automation",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+    "--cov-fail-under=20",
+]
+markers = [
+    "comprehensive: Run comprehensive, slower coverage tests",
+    "automation: Critical automation infrastructure tests",
+    "fast: Fast tests for every commit",
+    "smoke: Basic functionality checks",
+]

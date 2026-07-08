@@ -15,13 +15,32 @@ actions/cache / checkout blob-filter tuning were never A/B'd at all.
 
 ## New phased plan
 
-### PHASE 1 (ship now — passed review, low risk, no daemon change): C2 wheelhouse
-- Dockerfile.runner: bake ABI-matched wheelhouse (ruff/mypy/pinned reqs),
-  PIP_FIND_LINKS. Repo requirements stay authoritative, PyPI fallback.
+### PHASE 1 (amended after artifact review): C2 complete offline wheelhouse
+- Dockerfile.runner: bake an ABI-matched, complete offline wheelhouse from
+  worldarchitect.ai's real requirements files:
+  `mvp_site/requirements.txt`, `automation/requirements.txt`,
+  `testing_mcp/infra/requirements-infra.txt`, and
+  `text_processor/requirements.txt`, plus explicit tool pins
+  `ruff==0.8.4` and `mypy==1.13.0`.
+- The final image carries both `/ezgha/wheelhouse` and the requirements snapshot.
+  CI dependency install steps must use the explicit offline pattern:
+  `pip install --no-index --find-links=/ezgha/wheelhouse -r <requirements file>`.
+  `PIP_FIND_LINKS` alone is not the correctness mechanism.
+- Missing wheels are intentional loud failures. If worldarchitect.ai requirements
+  drift without rebuilding the image, the offline install fails instead of
+  silently fetching from PyPI; that makes drift visible at CI time.
 - ezgha repo change only (image); config already points at ezgha-runner:latest.
 - Rollback: revert Dockerfile, rebuild. No flag needed (image is the unit).
 - Measure: presubmit deps-install step before/after (job-level timing).
 - This is bead jleechan-yov PHASE 1. Dispatch to sidekick NOW.
+
+#### Phase 1 correction note
+The original Phase 1 design claimed passive `PIP_FIND_LINKS=/ezgha/wheelhouse`
+would give "local-first install, PyPI fallback." Artifact-level adversarial
+testing disproved that premise: a plain `pip install ruff==0.8.4` still consulted
+PyPI even when the matching wheel existed locally. The earlier design-level swarm
+review missed this because it reviewed the plan, not the built image. The
+correct design is an offline mirror plus explicit `--no-index` verification.
 
 ### PHASE 2 (cheap experiment, worldai-side, parallel): checkout tuning
 - Audit which workflows already use fetch-depth:1; add --filter=blob:none where

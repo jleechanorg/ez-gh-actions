@@ -1,0 +1,9 @@
+# System dependency (non-pip): `flock` binary is required by
+# automation/openclaw_mission_control_entry.sh lock handling.
+# - macOS: `brew install flock`
+# - Linux: install via util-linux package manager.
+#
+# Install the jleechanorg-pr-automation package in editable mode
+# This allows tests to import from jleechanorg_pr_automation.*
+# Use relative path from project root since CI runs pip from root directory
+-e ./automation

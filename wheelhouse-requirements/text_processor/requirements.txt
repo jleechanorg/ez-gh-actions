@@ -1,0 +1,16 @@
+# Text Processor Dependencies
+
+# Core dependencies (none required - uses only standard library)
+
+# Development and testing dependencies
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.0
+
+# Code quality
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# Optional: for enhanced CLI experience
+colorama>=0.4.6  # Cross-platform colored terminal text
