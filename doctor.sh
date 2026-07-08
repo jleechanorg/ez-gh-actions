@@ -330,11 +330,8 @@ fi
 QUEUE_TAIL_BAD=0
 QUEUE_QUEUED_STALE=0
 if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
-  set +e
-  # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/scripts/queue-health.sh"
-  QUEUE_RC=$?
-  set -e
+  QUEUE_RC=0
+  source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   [ "$QUEUE_RC" -eq 1 ] && QUEUE_TAIL_BAD=1
 else
   section "8. GitHub Actions queue health"
@@ -364,7 +361,7 @@ classify_local_slot() {
     echo "DOWN"
     return
   fi
-  if docker top "$name" -eo cmd 2>/dev/null | grep -q 'Runner\.Worker'; then
+  if docker top "$name" 2>/dev/null | grep -q 'Runner\.Worker'; then
     echo "EXECUTING"
   else
     echo "IDLE"
@@ -420,10 +417,10 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/nul
       name=\"${MAC_RUNNER_NAME_PREFIX}-\${i}\"
       running=\$(docker inspect -f '{{.State.Running}}' \"\$name\" 2>/dev/null || echo false)
       if [ \"\$running\" != true ]; then echo \"\$name DOWN\"; continue; fi
-      if docker top \"\$name\" -eo cmd 2>/dev/null | grep -q 'Runner\.Worker'; then
-        echo \"\$name EXECUTING\"
+      if docker top "\$name" 2>/dev/null | grep -q 'Runner\.Worker'; then
+        echo "\$name EXECUTING"
       else
-        echo \"\$name IDLE\"
+        echo "\$name IDLE"
       fi
     done
   " 2>/dev/null || true)
