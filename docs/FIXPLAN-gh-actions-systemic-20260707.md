@@ -159,7 +159,9 @@ Spec (already partially deployed as `scripts/queue-reaper-stopgap.sh`, keep/veri
 
 ### 4.1 Green Gate Gate-4 split (RC1) — the single biggest structural win
 
-Apply the exact pattern already proven twice in the same file (Gate 7 `verdict_poll`, Gate 8 `smoke_gate_wait`):
+Apply the exact pattern already proven in the same file (Gate 8 `smoke_gate_wait`). *(Correction 2026-07-07: this doc originally also cited Gate 7 `verdict_poll` as split precedent — wrong; Gate 7 was fully REMOVED (bead rev-p0cc4), not split. Gate 8 is the only split-job precedent. Caught by gate4-splitter during implementation.)*
+
+> **STATUS: IMPLEMENTED as [PR #8244](https://github.com/jleechanorg/worldarchitect.ai/pull/8244)** (2026-07-07, codex adversarial PASS on silent-bypass / lost-env / gate-weakening checks; includes a `gh_api_degraded` job output added for degraded-mode fidelity). Awaiting human merge.
 
 - Extract the Bugbot poll (green-gate.yml lines 331-369 + final re-check 370-389) into a new job `bugbot_gate_wait`, `runs-on: ubuntu-latest`, `needs: green_gate_precheck` (or parallel, feeding the final `green_gate` aggregator via `needs:`).
 - The poll only calls `gh api .../check-runs` — no self-hosted tooling required. All `BUGBOT_*` variables are self-contained within the Gate-4 block (grep-verified); Gates 5/6 read nothing from them, so extraction has zero shared-state coupling.
