@@ -1052,3 +1052,39 @@ session running a parallel redundant goal on the same GH account hit the same
 conclusion independently. My Monitor/checks are all local-only (git, ps, cargo) —
 zero gh calls, already compliant. Holding to ~20-30min consolidated check cadence
 per main's directive rather than continuous polling.
+
+---
+
+## sidekick3 — load watch armed, evidence logged (2026-07-07 22:35 PT)
+
+Main reported live load 18.28 climbing, 9/16 linux containers, pre-reboot danger
+zone (watchdog=24, box rebooted twice today). Bind: po2 deploy fixes the churn
+but needs a service restart, which itself spikes load right when load is already
+high.
+
+**Checked immediately**: load had already eased to 15.39 (1m)/13.40(5m)/11.65(15m),
+12 ezgha containers — better than main's report but still above the load<12
+careful-restart gate, not yet a deploy window.
+
+**Started a persistent local-only Monitor** (task bxtcf63nf, 5-min cadence,
+`/proc/loadavg` + `docker ps --filter label=ezgha=managed`, zero gh calls):
+- Emits DANGER if load1 >= 22 (approaching the 24 reboot ceiling) — for immediate
+  main alert per directive.
+- Emits SAMPLE every tick otherwise.
+- Emits DEPLOY_WINDOW and stops once load1 < 12 for 2+ consecutive checks AND
+  containers >= 12 — the exact signal main asked me to report, at which point
+  main does the final arithmetic re-verify and I deploy immediately in the
+  window if SHIP.
+
+**Evidence logged per main's ask** (22:22 sample, the "target is reachable" proof):
+`{"ts":1783488179 (22:22:59 PT), "busy":22, "registered":22, "queued_jobs":111,
+"inv1":true, "inv2":false, "oldest_queued_job_min":20.92}` — fleet hit 22/22 busy
+(INV-1 momentarily satisfied) but INV-2 broke in the same instant (oldest queued
+already 20.9min, just over the 20min line) because the churn that got it to 22
+also delayed the queue past the threshold. Four minutes later (22:27:21) it
+dropped back to 17/19 busy. This is exactly main's point: 22/22 is reachable, the
+fleet just can't hold it without pacing — direct evidence the po2 deploy is the
+correct lever, not a wasted effort.
+
+Holding: no restart action taken or contemplated while load>12. Will alert main
+immediately on any DANGER event, and report DEPLOY_WINDOW the moment it fires.
