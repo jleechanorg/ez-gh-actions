@@ -589,27 +589,11 @@ fn run_test_alert(cfg: &config::Config, event_key: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_queue_monitor_tick<F>(run: F) -> bool
-where
-    F: FnOnce() -> Result<Option<queue_monitor::QueueStats>>,
-{
+fn run_tick<T>(label: &str, run: impl FnOnce() -> Result<Option<T>>) -> bool {
     match run() {
         Ok(_) => true,
         Err(err) => {
-            eprintln!("WARN: queue monitor check failed: {err:#}");
-            false
-        }
-    }
-}
-
-fn run_invariant_sampler_tick<F>(run: F) -> bool
-where
-    F: FnOnce() -> Result<Option<queue_monitor::InvariantSample>>,
-{
-    match run() {
-        Ok(_) => true,
-        Err(err) => {
-            eprintln!("WARN: invariant sampler tick failed: {err:#}");
+            eprintln!("WARN: {label} failed: {err:#}");
             false
         }
     }
@@ -817,11 +801,11 @@ fn main() -> Result<()> {
                     // legitimately spend minutes before this point, and that
                     // time must not count against SERVE_LOOP_TIME_BUDGET.
                     let monitor_loop_start = Instant::now();
-                    let _ = run_queue_monitor_tick(|| {
+                    let _ = run_tick("queue monitor check", || {
                         queue_monitor.maybe_check(&cfg, monitor_loop_start)
                     });
                     watchdog::ping();
-                    let _ = run_invariant_sampler_tick(|| {
+                    let _ = run_tick("invariant sampler tick", || {
                         invariant_sampler.maybe_sample(&cfg, monitor_loop_start)
                     });
                     watchdog::ping();
@@ -1262,10 +1246,13 @@ mod tests {
 
     #[test]
     fn queue_monitor_tick_errors_are_non_fatal() {
-        assert!(!run_queue_monitor_tick(|| {
+        assert!(!run_tick::<queue_monitor::QueueStats>("queue monitor check", || {
             anyhow::bail!("synthetic queue monitor failure")
         }));
-        assert!(run_queue_monitor_tick(|| Ok(None)));
+        assert!(run_tick::<queue_monitor::QueueStats>(
+            "queue monitor check",
+            || Ok(None)
+        ));
     }
 
     #[test]
@@ -1275,9 +1262,15 @@ mod tests {
         // critically for E1/E2 -- must not be recorded as a pass or a fail.
         // The `Err` case here never reaches `append_invariant_sample`, so
         // this tick simply contributes no line to invariant_history.jsonl.
-        assert!(!run_invariant_sampler_tick(|| {
-            anyhow::bail!("synthetic invariant sampler failure (e.g. GitHub API rate limit)")
-        }));
-        assert!(run_invariant_sampler_tick(|| Ok(None)));
+        assert!(!run_tick::<queue_monitor::InvariantSample>(
+            "invariant sampler tick",
+            || {
+                anyhow::bail!("synthetic invariant sampler failure (e.g. GitHub API rate limit)")
+            }
+        ));
+        assert!(run_tick::<queue_monitor::InvariantSample>(
+            "invariant sampler tick",
+            || Ok(None)
+        ));
     }
 }
