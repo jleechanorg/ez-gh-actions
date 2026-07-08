@@ -84,14 +84,49 @@ step after a real deploy.
   confirmed on origin/main (54424d9). Mac zombie fixed live (Mac now reaches 6/6). Linux
   16/16 at last check but oscillates under rate limit.
 
+- 2026-07-08 09:27 — Startup protocol done: STATE.md mirrored to
+  goals/2026-07-07-1920-runner-truly-healthy/STATE-merge-driver.md, committed f6f1a84,
+  pushed. Read bead qbl. Found: (a) reaper-wiring is editing directly in the SHARED main
+  working directory (not the dedicated worktree at ez-gh-actions-wt-qbl, which is clean) —
+  src/reaper.rs already has collect_repo_runs()+LiveReaperApi, docker_backend.rs wiring +
+  a new failing test (TDD red) in progress; (b) app-token wiring (fix #3) was ALREADY
+  merged to origin/main at 7f476ac before I was spawned, no secret values committed.
+
+- 2026-07-08 09:31 — app-wiring confirmed: live mint verified both machines (App bucket
+  9350/9350 vs shared 5000/4884), refresh timers installed+enabled both machines
+  (jeff-ubuntu systemd timer active, Mac launchd loaded), only gap was daemon restart to
+  pick up the binary. Did Gate 0 the RIGHT way: since main workdir has reaper-wiring's
+  uncommitted/incomplete WIP, built from a throwaway clean worktree
+  (scratchpad/ezgha-clean-build, detached at origin/main f6f1a84) instead of `cargo install
+  --path .` in the shared dirty tree — avoids deploying unreviewed WIP. 180/180 tests green
+  there. Pre-restart check: containers dipped 15->9->12->15 with load 6.6-9.2 over ~90s
+  (active respawn churn + queue_monitor logging queued_jobs=95, NOT a stuck loop) —
+  confirmed safe (load never >12, containers back >=12) before restarting. Restarted
+  ezgha.service (new PID, ExecMainStartTimestamp 02:32:21, binary f6f1a84). PROVED the
+  App-token wiring is actually ACTIVE (not just installed): the daemon's live `gh api`
+  child process has GH_TOKEN set in its environ, and that token's rate_limit shows
+  9346/9350 remaining — isolated App bucket, confirmed in production use, not just minted.
+  Ran ./docs/verify-exit-criteria.sh: Gate 0 PASS (deployed binary == f6f1a84 HEAD). Gate 1
+  (cargo test in the shared workdir, which still has reaper-wiring's WIP) shows 184
+  passed/1 failed — the 1 failure is reaper-wiring's own new TDD-red test
+  (reclaim_zombie_locked_runner_cancels_then_deletes_on_success, expected mid-implementation,
+  not a regression I introduced). Fix #3 (app token) is now DONE on jeff-ubuntu end-to-end
+  (mint+refresh+wired+active+proven). Mac-side restart is NOT mine — never restart the Mac
+  daemon per hard rules; that's main/mac session's call.
+
 ## Next Actions (rewritten every step)
 
-1. Poll for reaper-wiring's pushed branch (`git branch -r | grep -iE 'reaper|qbl|zombie'`).
-   When present: build+test it, spawn adversarial verifier, and on PASS merge to origin/main
-   + Gate 0. This is the top priority — it's the durable fix for the exact bug that capped
-   the Mac.
-2. Collect capacity-proof's peak-executing result when it reports; log it here + to main.
-3. Chase app-wiring's status; review + merge any committable refresh-helper/systemd-unit
-   code (never the token value). Confirm separate-bucket proof.
-4. After reaper fix lands + app token wired: request main coordinate a Gate-0-safe jeff
-   restart if needed, then re-verify sustained 16/16 + 6/6 (or queue-drained).
+1. Poll reaper-wiring for the docker_backend.rs zombie-slot fix. It is NOT on a separate
+   branch yet — editing directly in shared main workdir. Asked it to land on a branch/commit
+   when done so we don't collide. When ready: build+test (can reuse
+   scratchpad/ezgha-clean-build worktree, or test in-place once WIP is committed), spawn an
+   ADVERSARIAL verifier (probe: legit-job-vs-zombie false positive risk, repo lookup
+   correctness, fail-first tests), merge to origin/main + Gate 0 only on clean/dismissed
+   verdict. TOP PRIORITY — durable fix for the exact bug that capped the Mac at 5/6.
+2. capacity-proof: shared task list now shows #10 completed — confirm with the subagent
+   what the peak-executing evidence showed and log it here.
+3. App token (fix #3): jeff-ubuntu side fully done+proven (see log above). Ask main whether
+   to coordinate a Gate-0-safe Mac-side restart (main/mac session must do it, not me), and
+   whether app-wiring should close out bead nuk / task #11.
+4. After reaper fix lands: re-verify sustained 16/16 + 6/6 (or queue-drained) with the app
+   token active on both machines.
