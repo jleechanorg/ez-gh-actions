@@ -133,6 +133,19 @@ fn mark_service_ready_and_start_watchdog() -> watchdog::Heartbeat {
     heartbeat
 }
 
+fn log_skipped_stronger_backends(
+    skipped_stronger: &[backend::Backend],
+    backend: backend::Backend,
+) {
+    for s in skipped_stronger {
+        eprintln!(
+            "note: {} offers stronger isolation but is not driven by ezgha yet; using {}",
+            s.name(),
+            backend.name()
+        );
+    }
+}
+
 fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
     let plat = platform::detect();
     match backend::select(&plat, cfg.policy.minimum_isolation) {
@@ -140,13 +153,7 @@ fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
             backend,
             skipped_stronger,
         } => {
-            for s in skipped_stronger {
-                eprintln!(
-                    "note: {} offers stronger isolation but is not driven by ezgha yet; using {}",
-                    s.name(),
-                    backend.name()
-                );
-            }
+            log_skipped_stronger_backends(&skipped_stronger, backend);
             Ok(backend)
         }
         Selection::PolicyBlocked {
@@ -200,13 +207,7 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                 backend,
                 skipped_stronger,
             } => {
-                for s in skipped_stronger {
-                    eprintln!(
-                        "note: {} offers stronger isolation but is not driven by ezgha yet; using {}",
-                        s.name(),
-                        backend.name()
-                    );
-                }
+                log_skipped_stronger_backends(&skipped_stronger, backend);
                 return Ok(backend);
             }
             Selection::PolicyBlocked {
