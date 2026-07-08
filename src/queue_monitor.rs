@@ -317,8 +317,8 @@ impl QueueMonitorState {
             cfg,
             loop_start,
             invariant_sampler,
-            |deadline| fetch_fleet_runner_stats(deadline),
-            |repo, fleet, cap, deadline| fetch_capped_queue_snapshot(repo, fleet, cap, deadline),
+            fetch_fleet_runner_stats,
+            fetch_capped_queue_snapshot,
         )
     }
 }
