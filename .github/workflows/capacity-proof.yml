@@ -15,6 +15,6 @@ jobs:
       - name: Identify runner
         run: echo "job ${{ matrix.n }} on runner $(hostname) RUNNER_NAME=$RUNNER_NAME"
       - name: Hold slot to saturate fleet
-        run: sleep 120
+        run: sleep 240
       - name: Done
         run: echo "job ${{ matrix.n }} done"
