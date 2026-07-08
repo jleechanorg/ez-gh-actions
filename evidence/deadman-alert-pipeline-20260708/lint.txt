@@ -1,0 +1,3 @@
+FMT_OK
+   Compiling ez-gh-actions v0.1.0 (/home/jleechan/.worktrees/ez-gh-actions/ez-1)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.66s

@@ -747,6 +747,7 @@ fn main() -> Result<()> {
             let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
+            let mut deadman = alert::DeadManState::new(Instant::now());
             loop {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
@@ -764,6 +765,12 @@ fn main() -> Result<()> {
                         for name in outcome.started {
                             println!("respawned ephemeral runner {name}");
                         }
+                        // A successful ensure_count is itself a "pipeline is
+                        // alive" signal — a healthy fleet should not need to
+                        // fire alerts to prove liveness. Bump the dead-man
+                        // clock so the threshold counts overall daemon
+                        // liveness, not just alert throughput.
+                        deadman.record_delivery(Instant::now());
                         (Duration::from_secs(30), true)
                     }
                     Err(e) => {
@@ -810,6 +817,12 @@ fn main() -> Result<()> {
                     let _ = canary_scheduler.maybe_check(&cfg);
                 }
                 watchdog::ping();
+                // Dead-man's switch: prove the alert pipeline is alive.
+                // Runs once per serve-loop tick regardless of ensure success
+                // — even a stuck ensure_count loop should still emit alerts.
+                let _ = run_tick("deadman alert self-test", || {
+                    Ok(Some(deadman.check(&cfg, Instant::now())))
+                });
                 std::thread::sleep(sleep);
             }
         }

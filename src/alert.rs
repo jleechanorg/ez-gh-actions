@@ -310,8 +310,124 @@ pub fn notify_delivery(
     }
     if delivered {
         record_sent(event_key);
+        bump_deadman_clock(Instant::now());
     }
     Ok(delivered)
+}
+
+// =============================================================================
+// Dead-man's switch
+//
+// Proves the alert pipeline is actually alive. If no configured channel has
+// delivered ANY alert (production event OR a prior self-test) within the
+// configured threshold, the next serve-loop tick fires a CRITICAL self-test
+// alert. A successful self-test delivery resets the alive clock, which is the
+// "proof of life" — no separate heartbeat file, no sidecar, no `git rev-parse`
+// round trip. We deliberately reuse the existing notify_delivery path so the
+// self-test exercises the EXACT same Slack/email/log transports production
+// events use; a delivery success in that path is the only thing that
+// constitutes "the pipeline is alive" in this codebase.
+// =============================================================================
+
+/// Default dead-man's switch event key. Public so callers and tests agree.
+pub const DEADMAN_EVENT_KEY: &str = "alert.pipeline.deadman";
+/// Default threshold (seconds) before the dead-man fires if no alert
+/// has been delivered. Operators can override via `[alert]
+/// deadman_threshold_seconds`; setting 0 disables the switch.
+///
+/// The constant is exported as a public API contract even though the
+/// `Config::defaults_for` initializer in `src/config.rs` mirrors the value
+/// literally (to keep the config layer free of a module dependency on the
+/// alert layer). Tests and external integrations can rely on this value.
+#[allow(dead_code)]
+pub const DEFAULT_DEADMAN_THRESHOLD_SECS: u64 = 3600;
+
+fn deadman_clock() -> &'static Mutex<Option<Instant>> {
+    static CLOCK: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    CLOCK.get_or_init(|| Mutex::new(None))
+}
+
+fn bump_deadman_clock(when: Instant) {
+    // Recover from poison: a previous test that panicked while holding the
+    // lock should not break the production alert path. The clock is a
+    // monotonically-advancing timestamp, so the stale value is still safe.
+    let mut guard = match deadman_clock().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(when);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_deadman_clock() {
+    if let Ok(mut guard) = deadman_clock().lock() {
+        *guard = None;
+    }
+}
+
+/// Per-instance dead-man tracker used by the serve loop. `now` is supplied by
+/// the caller so tests stay deterministic.
+#[derive(Debug)]
+pub struct DeadManState {
+    last_successful: Option<Instant>,
+}
+
+impl DeadManState {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            last_successful: Some(now),
+        }
+    }
+
+    /// Record a successful delivery at `when`. The serve loop also calls this
+    /// for non-alert ops (e.g. a successful `ensure_count`) so the alive clock
+    /// tracks overall daemon liveness, not just alert throughput.
+    pub fn record_delivery(&mut self, when: Instant) {
+        self.last_successful = Some(when);
+        bump_deadman_clock(when);
+    }
+
+    /// Returns `true` if a self-test was successfully delivered. The caller
+    /// only needs to inspect the return value to log/observe; successful
+    /// self-tests reset the alive clock as a side effect.
+    pub fn check(&mut self, cfg: &Config, now: Instant) -> bool {
+        let threshold = cfg.alert.deadman_threshold_seconds;
+        if threshold == 0 {
+            return false;
+        }
+        if !configured_channels(&cfg.alert) {
+            return false;
+        }
+        let stale = self
+            .last_successful
+            .map(|last| now.saturating_duration_since(last) >= Duration::from_secs(threshold))
+            .unwrap_or(true);
+        if !stale {
+            return false;
+        }
+
+        let subject = "ezgha alert pipeline dead-man self-test";
+        let body = format!(
+            "no alert delivered in >= {}s; firing self-test to prove pipeline is alive",
+            threshold
+        );
+        match notify_delivery(cfg, DEADMAN_EVENT_KEY, Severity::Critical, subject, &body) {
+            Ok(true) => {
+                // The successful self-test IS the proof of life.
+                self.record_delivery(now);
+                true
+            }
+            Ok(false) => {
+                // Cooldown-suppressed or every transport failed. The pipeline
+                // is still presumed dead; the next tick will retry.
+                false
+            }
+            Err(err) => {
+                eprintln!("WARN: dead-man self-test invocation error: {err:#}");
+                false
+            }
+        }
+    }
 }
 
 /// Send an alert if at least one channel is configured and the event is not
@@ -636,5 +752,168 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "timeout helper must return promptly"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Dead-man's switch — proves the alert pipeline is actually alive.
+    //
+    // A self-test alert must fire when the alert pipeline has gone silent
+    // for longer than the configured threshold. The self-test itself, when
+    // it successfully delivers, is what proves the pipeline is alive again.
+    // -------------------------------------------------------------------
+
+    fn deadman_test_config(threshold_secs: u64) -> Config {
+        let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
+        cfg.alert.alert_cooldown_secs = 1;
+        cfg.alert.deadman_threshold_seconds = threshold_secs;
+        cfg
+    }
+
+    #[test]
+    fn deadman_disabled_when_threshold_is_zero() {
+        let _guard = test_lock();
+        clear_alert_state();
+        clear_deadman_clock();
+        let mut state = DeadManState::new(Instant::now());
+        let cfg = deadman_test_config(0);
+
+        let fired = state.check(&cfg, Instant::now() + Duration::from_secs(86_400));
+
+        assert!(!fired, "threshold=0 must be treated as disabled");
+    }
+
+    #[test]
+    fn deadman_does_not_fire_when_recent_alert_was_delivered() {
+        let _guard = test_lock();
+        clear_alert_state();
+        clear_deadman_clock();
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        state.record_delivery(start);
+        let cfg = deadman_test_config(600);
+
+        let fired = state.check(&cfg, start + Duration::from_secs(30));
+
+        assert!(!fired, "fresh delivery must silence the dead-man");
+    }
+
+    #[test]
+    fn deadman_fires_after_threshold_with_no_delivery() {
+        let _guard = test_lock();
+        clear_alert_state();
+        clear_deadman_clock();
+        let dir = unique_temp_dir("deadman-fire");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("alerts.jsonl");
+
+        let mut cfg = deadman_test_config(60);
+        cfg.alert.log_path = Some(log.clone());
+
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        // Silence the pipeline for >threshold before checking.
+        let later = start + Duration::from_secs(120);
+
+        let fired = state.check(&cfg, later);
+
+        assert!(
+            fired,
+            "silence longer than threshold must fire the dead-man"
+        );
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(
+            raw.contains("\"event_key\":\"alert.pipeline.deadman\""),
+            "dead-man self-test must use the deadman event_key so it has its own cooldown: {raw}"
+        );
+        assert!(
+            raw.contains("\"severity\":\"CRITICAL\""),
+            "dead-man self-test must be CRITICAL"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deadman_successful_self_test_resets_pipeline_alive_timer() {
+        let _guard = test_lock();
+        clear_alert_state();
+        clear_deadman_clock();
+        let dir = unique_temp_dir("deadman-reset");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("alerts.jsonl");
+
+        let mut cfg = deadman_test_config(60);
+        cfg.alert.alert_cooldown_secs = 0; // never suppress; we only call check() twice
+        cfg.alert.log_path = Some(log.clone());
+
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        let later = start + Duration::from_secs(120);
+
+        assert!(state.check(&cfg, later), "first check should fire");
+        // A successful self-test delivery resets last_successful to `now`,
+        // so the very next check at the same instant must NOT fire again.
+        assert!(
+            !state.check(&cfg, later),
+            "successful self-test delivery must reset the alive timer"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deadman_failed_self_test_keeps_pipeline_dead() {
+        let _guard = test_lock();
+        clear_alert_state();
+        clear_deadman_clock();
+        let dir = unique_temp_dir("deadman-keep-dead");
+        fs::create_dir_all(&dir).unwrap();
+        // Configure ONLY a Slack channel with a curl shim that always fails.
+        // No other transport is configured, so notify_delivery returns
+        // Ok(false). The dead-man must therefore keep firing on subsequent
+        // checks because the pipeline is still presumed dead.
+        let mut cfg = deadman_test_config(60);
+        cfg.alert.slack_webhook_url = Some("https://hooks.slack.test/T/fail".into());
+        write_executable(&dir.join("curl"), "#!/bin/sh\nexit 22\n");
+
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        let later = start + Duration::from_secs(120);
+
+        with_fake_path(&dir, || {
+            let fired_first = state.check(&cfg, later);
+            let fired_second = state.check(&cfg, later + Duration::from_secs(1));
+            assert!(
+                !fired_first,
+                "a self-test whose transport fails must not report success"
+            );
+            assert!(
+                !fired_second,
+                "a still-dead pipeline must keep reporting failure (no clock reset happened)"
+            );
+            // The clock was never bumped, so a THIRD check well past the
+            // original start time still considers itself stale and tries to
+            // fire — proving the failure path preserves the dead-man state.
+            assert!(
+                !state.check(&cfg, later + Duration::from_secs(2)),
+                "dead-man must keep trying while delivery keeps failing"
+            );
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deadman_no_channels_configured_is_noop() {
+        let _guard = test_lock();
+        clear_alert_state();
+        clear_deadman_clock();
+        let mut cfg = deadman_test_config(60);
+        cfg.alert.slack_webhook_url = None;
+        cfg.alert.email_to = None;
+        cfg.alert.log_path = None;
+
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        let fired = state.check(&cfg, start + Duration::from_secs(86_400));
+
+        assert!(!fired, "no channels = no self-test attempt");
     }
 }
