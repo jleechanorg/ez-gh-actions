@@ -1187,3 +1187,42 @@ inv1_fail_class alternating missing-registration/none) since those samples
 predate the restart finishing its refill; next samples should start showing
 the improvement if po2 works as designed. Will report the trend at next
 consolidated check.
+
+---
+
+## sidekick3 — fleet hit 0 briefly, recovering, gh rate-limit confirmed root cause (2026-07-07 22:52 PT)
+
+Main's correction (gh 403 rate-limit exhaustion, not po2) confirmed by my own
+local-only evidence:
+
+- Journal shows the daemon's own gh calls actively failing: `WARN: queue
+  monitor check failed: ... gh: API rate limit exceeded for user ID 13840161
+  ... (HTTP 403)` at 22:47:33 and 22:50:22, and `WARN: invariant sampler tick
+  failed: ... rate limit exceeded` at 22:50:54 -- the sampler itself is now
+  blind, matching main's report that samples have stalled.
+- Container count genuinely hit **0** (checked twice via `docker ps` and
+  `docker ps -a --filter label=ezgha=managed` -- zero, not even exited
+  containers lingering, consistent with ephemeral `--rm` runners that fail
+  GitHub JIT registration under the 403 and self-remove within the same
+  cycle -- exactly the "runners exit faster than the daemon can register
+  replacements" mechanism main described, not a new failure mode).
+- Journal shows the daemon IS attempting respawns (`respawned ephemeral
+  runner ez-runner-c-1/2/3` at 22:47:01 and 22:49:47) and the po2 load gate
+  is correctly gating them (`load average 6.91/5.09 leaves no safe respawn
+  headroom below ceiling 20.00; delaying runner respawn`) -- po2 itself is
+  working exactly as designed; the bottleneck is purely gh-side.
+- Rechecked 2 min later: containers back up to 2 (from 0), load 6.03(1m) --
+  bouncing near-zero rather than a sustained flatline, consistent with
+  degraded-but-recovering rather than a dead fleet.
+- Cannot get a fresh local queued_jobs count (invariant sampler itself is
+  gh-rate-limited right now); last known sample (18+ min stale) showed 100
+  queued jobs, busy=19 -- no reason to believe queued work vanished, so
+  stranded work is likely but not freshly confirmed (would require a gh call
+  I'm avoiding per directive).
+- Took NO restart action -- per main's explicit instruction this is not
+  restart-fixable (rate limit needs to clear on its own), and load is safe
+  regardless (6-9 range).
+
+Escalated to main immediately per the "hits 0 AND jobs stranded" trigger,
+noting the immediate recovery to 2 so main has the accurate trend, not just
+the alarming single reading.
