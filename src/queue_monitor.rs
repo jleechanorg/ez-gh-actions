@@ -72,6 +72,15 @@ impl QueueMonitorState {
     /// `SERVE_LOOP_TIME_BUDGET`) -- passed down from `main.rs` rather than
     /// captured internally, so this tick and the invariant sampler's tick in
     /// the SAME iteration share one budget instead of each getting their own.
+    ///
+    /// Production now goes through `drive_serve_loop_ticks` (or
+    /// `drive_with_fetcher` for tests) to dedup fleet + per-repo fetches
+    /// across both ticks in the same iteration. `maybe_check` is preserved
+    /// as a public API for tests and any future caller that wants to run the
+    /// starvation/idle-mismatch tick in isolation -- it still does its own
+    /// fetch, by design, because that's the only way to test it without
+    /// dragging the invariant sampler along.
+    #[allow(dead_code)]
     pub fn maybe_check(&mut self, cfg: &Config, loop_start: Instant) -> Result<Option<QueueStats>> {
         if !cfg.queue_monitor.enabled {
             return Ok(None);
@@ -120,6 +129,198 @@ impl QueueMonitorState {
         }
         self.consecutive_bad
     }
+
+    /// Drive one serve-loop iteration for both the queue monitor and the
+    /// invariant sampler, deduplicating their network fetches. The previous
+    /// shape called `maybe_check` and `maybe_sample` independently, each of
+    /// which fetched fleet stats and (overlapping) repo queue snapshots on
+    /// its own -- at the live queue depth (~1290 queued runs) this doubled
+    /// the per-tick GitHub API cost on every iteration where both ticks were
+    /// due, and in the common case where `cfg.queue_monitor.repo` overlaps
+    /// with `MONITORED_INVARIANT_REPOS` it also duplicated the per-repo
+    /// paginated queue enumeration. This driver fixes both: the fleet is
+    /// fetched at most once and each distinct repo at most once per
+    /// iteration, regardless of which ticks are due.
+    ///
+    /// The closure-based fetcher seam (`FFleet`, `FRepo`) is the unit-test
+    /// seam that makes the dedup contract assertable -- the production path
+    /// (`drive_serve_loop_ticks`) passes the real `fetch_fleet_runner_stats`
+    /// and `fetch_capped_queue_snapshot` while the red-phase tests pass
+    /// counting closures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn drive_with_fetcher<FFleet, FRepo>(
+        &mut self,
+        cfg: &Config,
+        loop_start: Instant,
+        invariant_sampler: &mut InvariantSamplerState,
+        mut fetch_fleet: FFleet,
+        mut fetch_repo: FRepo,
+    ) -> Result<(Option<QueueStats>, Option<InvariantSample>)>
+    where
+        FFleet: FnMut(Instant) -> Result<FleetRunnerStats>,
+        FRepo:
+            FnMut(&str, Option<FleetRunnerStats>, usize, Instant) -> Result<(QueueSnapshot, bool)>,
+    {
+        // Compute which ticks are due. Mirrors the gating inside
+        // `maybe_check` / `maybe_sample` exactly so a "due" decision here
+        // matches what the individual methods would have done -- callers
+        // never get a different answer depending on which entry point they
+        // use. Both intervals are computed from `cfg`; we do NOT mutate
+        // `last_check` until we know the tick will actually run.
+        let qm_due = if cfg.queue_monitor.enabled {
+            let interval = Duration::from_secs(cfg.queue_monitor.check_interval_seconds);
+            self.last_check
+                .is_none_or(|last| last.elapsed() >= interval)
+        } else {
+            false
+        };
+        let is_due = if cfg.invariant_sampler.enabled {
+            let interval = Duration::from_secs(cfg.invariant_sampler.check_interval_seconds);
+            invariant_sampler
+                .last_check
+                .is_none_or(|last| last.elapsed() >= interval)
+        } else {
+            false
+        };
+
+        if !qm_due && !is_due {
+            return Ok((None, None));
+        }
+
+        // Union of repos needed by the due ticks. `cfg.queue_monitor.repo`
+        // may be absent (no per-repo fetch on its side); the invariant
+        // sampler always needs every `MONITORED_INVARIANT_REPOS`. We dedup
+        // -- overlap between the two sets is the common case in production
+        // (the daemon's own repo is in MONITORED_INVARIANT_REPOS).
+        let qm_repo = queue_repo(cfg);
+        let mut repos: Vec<String> = Vec::new();
+        if qm_due {
+            if let Some(r) = qm_repo {
+                repos.push(r.to_string());
+            }
+        }
+        if is_due {
+            for r in MONITORED_INVARIANT_REPOS {
+                repos.push((*r).to_string());
+            }
+        }
+        repos.sort();
+        repos.dedup();
+
+        // One fleet fetch per iteration that drives at least one consumer.
+        // Any consumer that needed fleet stats gets the same value -- the
+        // invariant sampler's `fleet.busy_count >= EXPECTED_FLEET_RUNNERS`
+        // branch (INV-1) and the queue monitor's idle-runner-mismatch path
+        // agree on the exact same fleet snapshot.
+        let deadline = loop_start + SERVE_LOOP_TIME_BUDGET;
+        let fleet = fetch_fleet(deadline)?;
+
+        let mut snapshots: std::collections::HashMap<String, (QueueSnapshot, bool)> =
+            std::collections::HashMap::with_capacity(repos.len());
+        for repo in &repos {
+            let (mut snapshot, capped) = fetch_repo(
+                repo,
+                Some(fleet.clone()),
+                INVARIANT_JOB_ENUMERATION_CAP,
+                deadline,
+            )?;
+            // Backfill the fleet onto each snapshot if the fetcher didn't
+            // already attach one -- the invariant sampler expects the fleet
+            // to be present on at least one of the snapshots it receives
+            // (or it gets its own separately, which is now this same
+            // shared value).
+            if snapshot.fleet.is_none() {
+                snapshot.fleet = Some(fleet.clone());
+            }
+            snapshots.insert(repo.clone(), (snapshot, capped));
+        }
+
+        // Now run the actual consumer logic against the cached snapshots,
+        // mirroring what `maybe_check` / `maybe_sample` would have done.
+        // `last_check` is bumped here only after the snapshot for the tick
+        // is known to exist -- if the fetcher errored, neither `last_check`
+        // advances and both ticks will retry on the next iteration (which
+        // is the right cadence anyway because a failed fetch is a
+        // transient GitHub API problem, not a "we ran this tick" signal).
+        let mut qm_result: Option<QueueStats> = None;
+        let mut is_result: Option<InvariantSample> = None;
+
+        if qm_due {
+            self.last_check = Some(Instant::now());
+            if let Some(repo) = qm_repo {
+                if let Some((snapshot, _capped)) = snapshots.get(repo) {
+                    let now = unix_now_secs();
+                    let stats = queue_stats(
+                        snapshot,
+                        now,
+                        cfg.queue_monitor.stale_hours,
+                        cfg.queue_monitor.tail_warn_minutes,
+                    );
+                    self.record_tail_sample(stats.tail_bad);
+                    report_queue_health(cfg, repo, &stats, self.consecutive_bad)?;
+                    qm_result = Some(stats);
+                }
+            }
+        }
+
+        if is_due {
+            invariant_sampler.last_check = Some(Instant::now());
+            // Reproduce the invariant sampler's repo iteration in a way
+            // that consumes the shared snapshots directly (rather than
+            // re-fetching) -- the result is byte-identical to
+            // `sample_invariants`/`combine_invariant_sample` since we
+            // share the same `queue_stats`/cap arithmetic. We do this
+            // here (vs calling sample_invariants) precisely because
+            // sample_invariants owns its own fleet + repo fetches.
+            let now = unix_now_secs();
+            let mut repo_stats = Vec::with_capacity(MONITORED_INVARIANT_REPOS.len());
+            let mut any_capped = false;
+            for repo in MONITORED_INVARIANT_REPOS {
+                let (snapshot, capped) = match snapshots.get(*repo) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                any_capped |= capped;
+                repo_stats.push(queue_stats(
+                    &snapshot,
+                    now,
+                    cfg.queue_monitor.stale_hours,
+                    cfg.queue_monitor.tail_warn_minutes,
+                ));
+            }
+            let sample = combine_invariant_sample(&fleet, &repo_stats, now, any_capped);
+            append_invariant_sample(cfg, &sample)?;
+            if !sample.inv1 || !sample.inv2 {
+                alert_invariant_violation(cfg, &sample)?;
+            }
+            is_result = Some(sample);
+        }
+
+        Ok((qm_result, is_result))
+    }
+
+    /// Production wrapper around `drive_with_fetcher` that plugs in the real
+    /// `fetch_fleet_runner_stats` and `fetch_capped_queue_snapshot`. This
+    /// is what `main.rs`'s serve loop calls once per iteration; calling
+    /// `maybe_check` and `maybe_sample` separately (the previous shape) is
+    /// preserved as a public API for tests and any future caller that wants
+    /// to run the ticks in isolation, but it will fetch the fleet twice and
+    /// the per-repo queue snapshots twice when both ticks fire in the same
+    /// iteration -- so production should always go through here.
+    pub fn drive_serve_loop_ticks(
+        &mut self,
+        cfg: &Config,
+        loop_start: Instant,
+        invariant_sampler: &mut InvariantSamplerState,
+    ) -> Result<(Option<QueueStats>, Option<InvariantSample>)> {
+        self.drive_with_fetcher(
+            cfg,
+            loop_start,
+            invariant_sampler,
+            fetch_fleet_runner_stats,
+            fetch_capped_queue_snapshot,
+        )
+    }
 }
 
 /// E1 ironclad exit-criterion sampler. Deliberately separate from
@@ -142,6 +343,13 @@ impl InvariantSamplerState {
     /// `loop_start` is this serve-loop iteration's start time (see
     /// `SERVE_LOOP_TIME_BUDGET`) -- passed down from `main.rs`, shared with
     /// `QueueMonitorState::maybe_check`'s budget in the same iteration.
+    ///
+    /// Production now goes through `QueueMonitorState::drive_serve_loop_ticks`,
+    /// which calls both this method's logic AND the queue monitor's logic
+    /// using one shared fleet + per-repo fetch. `maybe_sample` is preserved
+    /// for tests that want to exercise the sampler in isolation; the dedup
+    /// is opt-in via the driver.
+    #[allow(dead_code)]
     pub fn maybe_sample(
         &mut self,
         cfg: &Config,
@@ -216,6 +424,13 @@ pub struct InvariantSample {
     pub inv1_fail_class: Option<String>,
 }
 
+/// Standalone version of the invariant sampler's logic: fetches fleet +
+/// per-repo queue snapshots and returns the combined `InvariantSample`.
+/// Production now inlines this work into `drive_with_fetcher` so it can
+/// share fetches with the queue monitor's tick in the same iteration; this
+/// function is preserved for tests that want to exercise the sampler in
+/// isolation.
+#[allow(dead_code)]
 fn sample_invariants(cfg: &Config, loop_start: Instant) -> Result<InvariantSample> {
     let deadline = loop_start + SERVE_LOOP_TIME_BUDGET;
     let fleet = fetch_fleet_runner_stats(deadline)?;
@@ -1910,5 +2125,260 @@ exit 1
             status: status.into(),
             busy,
         }
+    }
+
+    /// Red-phase tests for the unified `ServeLoopSnapshots` driver (TDD
+    /// target): one serve-loop iteration must fetch the fleet exactly once
+    /// and each repo's queue snapshot exactly once, regardless of whether the
+    /// queue monitor and the invariant sampler both fire in the same
+    /// iteration or whether `cfg.queue_monitor.repo` overlaps with
+    /// `MONITORED_INVARIANT_REPOS`. These tests pin down the dedup contract
+    /// so the consolidation refactor can't silently regress to two fetches.
+    ///
+    /// The tests use injected counting closures rather than `with_gh_exe`:
+    /// `with_gh_exe` is thread-local and a single fake-gh script can't
+    /// distinguish fleet-list calls from run-list calls from job-list calls,
+    /// whereas the closure seam lets the test count each fetch kind
+    /// independently with `Arc<AtomicUsize>`.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Drives one serve-loop iteration with injected counting fetches.
+    /// Verifies: fleet fetched once, each distinct repo fetched once.
+    #[test]
+    fn serve_loop_snapshots_fetches_fleet_and_repos_exactly_once() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        // Force both ticks to be due immediately.
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+        let repo_calls = Arc::new(AtomicUsize::new(0));
+        let repos_seen = std::sync::Mutex::new(Vec::<String>::new());
+
+        let loop_start = Instant::now();
+        let _ = queue_monitor.drive_with_fetcher(
+            &cfg,
+            loop_start,
+            &mut invariant_sampler,
+            |_deadline| {
+                fleet_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+            },
+            |repo, _fleet, _cap, _deadline| {
+                repo_calls.fetch_add(1, Ordering::SeqCst);
+                repos_seen.lock().unwrap().push(repo.to_string());
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+        );
+
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            1,
+            "fleet must be fetched exactly once per serve-loop iteration even when \
+             both queue_monitor and invariant_sampler fire"
+        );
+        let mut seen = repos_seen.lock().unwrap().clone();
+        seen.sort();
+        seen.dedup();
+        let expected: Vec<String> = {
+            let mut v = vec!["jleechanorg/some-other-repo".to_string()];
+            v.extend(MONITORED_INVARIANT_REPOS.iter().map(|s| s.to_string()));
+            v.sort();
+            v.dedup();
+            v
+        };
+        assert_eq!(
+            seen, expected,
+            "every distinct repo needed by either tick must be fetched exactly once"
+        );
+        assert_eq!(
+            repo_calls.load(Ordering::SeqCst),
+            expected.len(),
+            "no repo must be fetched twice in one iteration"
+        );
+    }
+
+    /// When `cfg.queue_monitor.repo` is itself one of the
+    /// `MONITORED_INVARIANT_REPOS`, the union collapses and that repo must
+    /// only be fetched once.
+    #[test]
+    fn serve_loop_snapshots_dedupes_repo_overlap_between_ticks() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        // Exact match to one of the monitored-invariant repos:
+        cfg.queue_monitor.repo = Some(MONITORED_INVARIANT_REPOS[0].into());
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+
+        let repo_calls = Arc::new(AtomicUsize::new(0));
+        let repos_seen = std::sync::Mutex::new(Vec::<String>::new());
+
+        let _ = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0)),
+            |repo, _fleet, _cap, _deadline| {
+                repo_calls.fetch_add(1, Ordering::SeqCst);
+                repos_seen.lock().unwrap().push(repo.to_string());
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+        );
+
+        let mut seen = repos_seen.lock().unwrap().clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            MONITORED_INVARIANT_REPOS.len(),
+            "repo overlap with MONITORED_INVARIANT_REPOS must not cause a duplicate fetch"
+        );
+        assert_eq!(
+            repo_calls.load(Ordering::SeqCst),
+            MONITORED_INVARIANT_REPOS.len(),
+            "each distinct repo fetched exactly once even on overlap"
+        );
+    }
+
+    /// When neither tick is due (both within their interval), no fetches
+    /// happen at all -- the driver's dedup is conditional on at least one
+    /// tick being due.
+    #[test]
+    fn serve_loop_snapshots_skips_fetches_when_no_tick_is_due() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.check_interval_seconds = 3600;
+        cfg.invariant_sampler.check_interval_seconds = 3600;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        // Mark both as having JUST checked, so neither is due.
+        queue_monitor.last_check = Some(Instant::now());
+        invariant_sampler.last_check = Some(Instant::now());
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+        let repo_calls = Arc::new(AtomicUsize::new(0));
+
+        let _ = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| {
+                fleet_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+            },
+            |_repo, _fleet, _cap, _deadline| {
+                repo_calls.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+        );
+
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            0,
+            "no fleet fetch when neither tick is due"
+        );
+        assert_eq!(
+            repo_calls.load(Ordering::SeqCst),
+            0,
+            "no repo fetch when neither tick is due"
+        );
+    }
+
+    /// When only ONE tick is due (queue_monitor enabled and due, but
+    /// invariant_sampler not due), the fleet and repos needed by that ONE
+    /// tick are fetched -- no over-fetch for the not-due tick.
+    #[test]
+    fn serve_loop_snapshots_fetches_only_for_due_ticks() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.check_interval_seconds = 1;
+        cfg.invariant_sampler.check_interval_seconds = 3600;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = Some(Instant::now() - Duration::from_secs(10));
+        invariant_sampler.last_check = Some(Instant::now());
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+        let repo_calls = Arc::new(AtomicUsize::new(0));
+        let repos_seen = std::sync::Mutex::new(Vec::<String>::new());
+
+        let _ = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| {
+                fleet_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+            },
+            |repo, _fleet, _cap, _deadline| {
+                repo_calls.fetch_add(1, Ordering::SeqCst);
+                repos_seen.lock().unwrap().push(repo.to_string());
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+        );
+
+        assert_eq!(fleet_calls.load(Ordering::SeqCst), 1);
+        // base_test_config() uses Scope::Repo with target "owner/repo", so
+        // queue_repo() resolves to "owner/repo" even though
+        // cfg.queue_monitor.repo is None -- the queue monitor tick fetches
+        // exactly that one repo. The invariant sampler is NOT due, so its
+        // MONITORED_INVARIANT_REPOS repos must NOT be fetched. Total = 1.
+        let seen = repos_seen.lock().unwrap().clone();
+        assert_eq!(
+            repo_calls.load(Ordering::SeqCst),
+            1,
+            "only the queue monitor's repo should be fetched; invariant sampler's \
+             MONITORED_INVARIANT_REPOS must not be touched when it's not due"
+        );
+        assert_eq!(seen, vec!["owner/repo".to_string()]);
+    }
+
+    /// Pure helper: a Config with `enabled` toggled per-test. Reuses the
+    /// existing `test_config_with_log` shape so we don't duplicate platform
+    /// construction logic -- but here we only need the in-memory parts.
+    fn base_test_config() -> Config {
+        let (cfg, _dir, _log) = test_config_with_log();
+        cfg
     }
 }

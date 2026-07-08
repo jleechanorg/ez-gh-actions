@@ -806,12 +806,23 @@ fn main() -> Result<()> {
                     // legitimately spend minutes before this point, and that
                     // time must not count against SERVE_LOOP_TIME_BUDGET.
                     let monitor_loop_start = Instant::now();
-                    let _ = run_tick("queue monitor check", || {
-                        queue_monitor.maybe_check(&cfg, monitor_loop_start)
-                    });
-                    watchdog::ping();
-                    let _ = run_tick("invariant sampler tick", || {
-                        invariant_sampler.maybe_sample(&cfg, monitor_loop_start)
+                    // Drive both ticks through the unified fetch dedup path
+                    // (see `QueueMonitorState::drive_serve_loop_ticks`):
+                    // the queue monitor's starvation/idle-mismatch alerting
+                    // and the invariant sampler's INV-1/INV-2 sampling share
+                    // one fleet fetch and one fetch per distinct repo per
+                    // iteration, instead of doubling both. Calling
+                    // `maybe_check` + `maybe_sample` independently (the
+                    // previous shape) is preserved as a public API but the
+                    // serve loop no longer uses it.
+                    let _ = run_tick("queue monitor + invariant sampler drive", || {
+                        queue_monitor
+                            .drive_serve_loop_ticks(
+                                &cfg,
+                                monitor_loop_start,
+                                &mut invariant_sampler,
+                            )
+                            .map(|_results| None::<()>)
                     });
                     watchdog::ping();
                     let _ = canary_scheduler.maybe_check(&cfg);
