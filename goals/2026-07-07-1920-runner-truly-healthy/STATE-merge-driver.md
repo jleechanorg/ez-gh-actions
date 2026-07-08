@@ -162,19 +162,44 @@ step after a real deploy.
   hold until team-lead coordinates post-load-settle (jeff just had a double-restart, load
   spiked ~18). Confirmed compliance explicitly.
 
+- 2026-07-08 09:55 — reaper-wiring pushed 664cae2 fixing BOTH findings: (1) is_runner_busy_
+  lock_error now only matches "currently running a job" (bare "422" check dropped entirely,
+  reaper-wiring's own choice over tightening the pattern — safer, since gh's exact error
+  formatting isn't guaranteed stable), new regression test with runner IDs 422/1422 on
+  network/auth errors; (2) force-cancel test rewritten to seed FakeReaperApi.job_batches
+  with 2*poll_attempts identical matching in-progress jobs, now asserts PollTimedOut status
+  AND a real "force-cancel:" call in api.calls. team-lead independently sent the same
+  probe-and-fix framing, arrived after I'd already gotten reaper-wiring's fix — consistent,
+  no rework needed. INDEPENDENTLY RE-VERIFIED (not just trusted the report), per team-lead's
+  explicit "don't just trust the fix" instruction: (a) built a THROWAWAY scratch worktree at
+  664cae2, reinstated the OLD bare-"422"-substring logic just in that copy, reran ONLY the
+  new regression test, watched it genuinely FAIL (assertion failed on network_error_on_
+  runner_422) — proves the test is a real fail-first regression, not decorative; discarded
+  the scratch copy after. (b) cargo test/clippy/rustfmt in ez-gh-actions-wt-qbl: 188/188
+  pass, clippy clean; rustfmt showed drift (canary.rs:120, main.rs:~133/1239) but confirmed
+  via A/B against a clean pre-fix checkout (scratchpad/ezgha-clean-build) that the IDENTICAL
+  drift already exists on origin/main before this branch — pre-existing/toolchain-version
+  drift, unrelated to this change, NOT a blocker. Checked file-overlap vs origin/main since
+  branch point 54424d9: ZERO commits touched docker_backend.rs/reaper.rs/main.rs on main in
+  the interim. Rebased claude/qbl-zombie-slot-selfheal onto origin/main (9e44d67) cleanly
+  (adafa19 replaces 664cae2), force-pushed the feature branch, retested (188/188 green),
+  fast-forward MERGED to origin/main at adafa19, retested again on main (188/188 green),
+  pushed. Bead qbl updated with full verification notes. NOT DEPLOYED — no cargo install/
+  restart on jeff, per team-lead's explicit hold pending load-settle coordination. This
+  CLOSES the mission's top-priority code item; only the deploy step remains, gated on
+  team-lead.
+
 ## Next Actions (rewritten every step)
 
-1. Wait for reaper-wiring to push a fix for the 2 findings (422 substring false-positive;
-   force-cancel test doesn't test what it claims) to claude/qbl-zombie-slot-selfheal. When
-   it lands: build+test in ez-gh-actions-wt-qbl, spot-check the 2 specific fixes, and if
-   genuinely resolved, MERGE to origin/main (rebase/ff onto current main first — team-lead
-   confirmed no file overlap with the ~10 commits main has advanced) — but do NOT deploy
-   (no cargo install/restart jeff) until team-lead explicitly says load has settled and
-   coordinates the restart. TOP PRIORITY — still the last open mission item.
+1. reaper fix (fix #1): MERGED to origin/main (adafa19). Nothing further to do on the code
+   side. Wait for team-lead to signal load has settled, then: rebuild via clean worktree
+   method (or straight `cargo install --path .` now that main IS clean — reaper-wiring's
+   files are merged, no dirty WIP), pre-restart load/container check, restart jeff,
+   verify-exit-criteria.sh. This is the LAST remaining action for the whole 3-fix mission.
 2. capacity-proof (fix #2): CLOSED, no further action.
 3. App token (fix #3): jeff-ubuntu side fully done+proven. Mac-side restart is main/mac
    session's call, not mine — flagged to main already. bead nuk left OPEN with status
    comment pending Mac confirmation.
-4. After reaper fix merges AND team-lead clears the deploy: rebuild via clean worktree
-   method, pre-restart load/container check, restart jeff, verify-exit-criteria.sh, then
-   re-verify sustained 16/16 + 6/6 (or queue-drained) with both fixes + app token active.
+4. Once team-lead clears the deploy AND jeff is restarted onto adafa19 (or later): re-verify
+   sustained 16/16 + 6/6 (or queue-drained) with reaper self-heal + app token both active,
+   then this mission's 3 key fixes are fully done end-to-end.
