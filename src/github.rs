@@ -877,6 +877,60 @@ mod tests {
     }
 
     #[test]
+    fn gh_command_falls_back_to_ambient_auth_when_token_file_missing() {
+        let token_path = std::env::temp_dir().join(format!(
+            "ezgha-gh-token-missing-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = std::fs::remove_file(&token_path);
+        let _guard = with_gh_token_file(token_path.clone());
+
+        let cmd = gh_command();
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert!(!envs.contains_key("GH_TOKEN"));
+        assert!(!envs.contains_key("GITHUB_TOKEN"));
+
+        let _ = std::fs::remove_file(token_path);
+    }
+
+    #[test]
+    fn gh_command_falls_back_to_ambient_auth_when_token_file_empty() {
+        let token_path = std::env::temp_dir().join(format!(
+            "ezgha-gh-token-empty-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::write(&token_path, "   \n").unwrap();
+        let _guard = with_gh_token_file(token_path.clone());
+
+        let cmd = gh_command();
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+
+        assert!(!envs.contains_key("GH_TOKEN"));
+        assert!(!envs.contains_key("GITHUB_TOKEN"));
+
+        std::fs::remove_file(token_path).unwrap();
+    }
+
+    #[test]
     fn api_base_repo_yields_repos_target() {
         let gh = repo_cfg();
         assert_eq!(api_base(&gh), "repos/jleechanorg/ez-gh-actions");
