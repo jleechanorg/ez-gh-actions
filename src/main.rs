@@ -437,6 +437,53 @@ fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoverySta
     }
 }
 
+fn notify_ensure_failure(
+    cfg: &config::Config,
+    backend: backend::Backend,
+    ensure_fail_streak: u32,
+    detail: &str,
+) {
+    if ensure_fail_streak < cfg.alert.failure_alert_threshold {
+        return;
+    }
+    let subject = "Runner pool ensure_count failures";
+    let body = format!(
+        "ensure_count failed {} consecutive time(s) for target {} on {}. Last detail: {detail}",
+        ensure_fail_streak,
+        cfg.github.target,
+        backend.name()
+    );
+    let severity = if ensure_fail_streak >= cfg.alert.failure_alert_threshold * 2 {
+        Severity::Critical
+    } else {
+        Severity::Warning
+    };
+    if let Err(err) = alert::notify(cfg, "serve.ensure_count.failure", severity, subject, &body) {
+        eprintln!("WARN: alert send error: {err:#}");
+    }
+}
+
+fn apply_ensure_outcome_to_failure_streak(
+    cfg: &config::Config,
+    backend: backend::Backend,
+    ensure_fail_streak: &mut u32,
+    outcome: &docker_backend::EnsureCountOutcome,
+) -> bool {
+    let partial_failure = outcome.is_partial_failure();
+    if partial_failure {
+        *ensure_fail_streak += 1;
+        let detail = format!(
+            "partial success: started {} of {} missing runner(s)",
+            outcome.started.len(),
+            outcome.missing
+        );
+        notify_ensure_failure(cfg, backend, *ensure_fail_streak, &detail);
+    } else {
+        *ensure_fail_streak = 0;
+    }
+    partial_failure
+}
+
 fn systemd_alert_decision(
     source: SystemdAlertSource,
     unit: &str,
@@ -726,22 +773,20 @@ fn main() -> Result<()> {
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             loop {
-                // Start-of-iteration timestamp for the monitoring ticks'
-                // SERVE_LOOP_TIME_BUDGET: no matter how expensive queue_monitor
-                // or invariant_sampler's GitHub API enumeration gets, both bail
-                // out relative to THIS instant, guaranteeing ensure_count is
-                // reachable again within the budget regardless of queue depth
-                // (see queue_monitor::SERVE_LOOP_TIME_BUDGET's doc comment --
-                // this is the structural fix for the 2026-07-07 fleet-drain
-                // incident, layered on top of the per-tick job-enumeration cap).
-                let loop_start = Instant::now();
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
-                let (sleep, ensure_succeeded) = match docker_backend::ensure_count(&cfg, backend) {
-                    Ok(started) => {
-                        ensure_fail_streak = 0;
-                        for name in started {
+                let (sleep, ensure_succeeded) = match docker_backend::ensure_count_outcome(
+                    &cfg, backend,
+                ) {
+                    Ok(outcome) => {
+                        apply_ensure_outcome_to_failure_streak(
+                            &cfg,
+                            backend,
+                            &mut ensure_fail_streak,
+                            &outcome,
+                        );
+                        for name in outcome.started {
                             println!("respawned ephemeral runner {name}");
                         }
                         (Duration::from_secs(30), true)
@@ -749,30 +794,7 @@ fn main() -> Result<()> {
                     Err(e) => {
                         ensure_fail_streak += 1;
                         eprintln!("ensure_count failed (will retry): {e:#}");
-                        if ensure_fail_streak >= cfg.alert.failure_alert_threshold {
-                            let subject = "Runner pool ensure_count failures";
-                            let body = format!(
-                                "ensure_count failed {} consecutive time(s) for target {} on {}. Last error: {e:#}",
-                                ensure_fail_streak,
-                                cfg.github.target,
-                                backend.name()
-                            );
-                            let severity =
-                                if ensure_fail_streak >= cfg.alert.failure_alert_threshold * 2 {
-                                    Severity::Critical
-                                } else {
-                                    Severity::Warning
-                                };
-                            if let Err(err) = alert::notify(
-                                &cfg,
-                                "serve.ensure_count.failure",
-                                severity,
-                                subject,
-                                &body,
-                            ) {
-                                eprintln!("WARN: alert send error: {err:#}");
-                            }
-                        }
+                        notify_ensure_failure(&cfg, backend, ensure_fail_streak, &format!("{e:#}"));
                         if maybe_restart_backend(&cfg, &mut backend_recovery) {
                             let subject = "Backend restart attempted after ensure_count failures";
                             let body = format!(
@@ -798,10 +820,16 @@ fn main() -> Result<()> {
                 };
                 if ensure_succeeded {
                     watchdog::ping();
-                    let _ = run_queue_monitor_tick(|| queue_monitor.maybe_check(&cfg, loop_start));
+                    // Fresh budget base for monitor ticks: respawn pacing may
+                    // legitimately spend minutes before this point, and that
+                    // time must not count against SERVE_LOOP_TIME_BUDGET.
+                    let monitor_loop_start = Instant::now();
+                    let _ = run_queue_monitor_tick(|| {
+                        queue_monitor.maybe_check(&cfg, monitor_loop_start)
+                    });
                     watchdog::ping();
                     let _ = run_invariant_sampler_tick(|| {
-                        invariant_sampler.maybe_sample(&cfg, loop_start)
+                        invariant_sampler.maybe_sample(&cfg, monitor_loop_start)
                     });
                     watchdog::ping();
                     let _ = run_canary_scheduler_tick(|| canary_scheduler.maybe_check(&cfg));
@@ -1059,6 +1087,50 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ezgha-main-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn serve_match_arm_counts_partial_ensure_success_as_failure_streak() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 99;
+        let backend = backend::Backend::Docker;
+        let mut ensure_fail_streak = 0;
+
+        let partial = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-org-runner-1".into()],
+            missing: 4,
+            // 4 starts attempted, only 1 succeeded → real partial failure.
+            attempted: 4,
+        };
+        let was_partial = apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend,
+            &mut ensure_fail_streak,
+            &partial,
+        );
+        assert!(was_partial);
+        assert_eq!(
+            ensure_fail_streak, 1,
+            "serve loop must keep the alert streak alive when ensure_count returns only a partial refill"
+        );
+
+        let recovered = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-org-runner-2".into(), "ez-org-runner-3".into()],
+            missing: 2,
+            // 2 attempted, 2 succeeded → healthy, resets the streak.
+            attempted: 2,
+        };
+        let was_partial = apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend,
+            &mut ensure_fail_streak,
+            &recovered,
+        );
+        assert!(!was_partial);
+        assert_eq!(
+            ensure_fail_streak, 0,
+            "non-partial ensure_count success resets the serve alert streak"
+        );
     }
 
     #[test]

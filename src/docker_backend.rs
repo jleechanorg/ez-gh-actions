@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
@@ -26,6 +26,15 @@ const MANAGED_LABEL: &str = "ezgha=managed";
 const DISK_MEASURE_STRIKES: u32 = 2;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
+static LOAD_GATE_DARK_WARNING: Once = Once::new();
+
+#[cfg(test)]
+static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 /// Env var that overrides the slot assignments file path. Used by tests to
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
@@ -254,6 +263,11 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
 ///
 /// Returns the number of slots reclaimed.
 pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
+    #[cfg(test)]
+    if let Some(reclaimed) = *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() {
+        return Ok(reclaimed);
+    }
+
     watchdog::ping();
     // CRITICAL: reconcile ONLY against an authoritative runner list. If the
     // GitHub API call fails (network blip, rate limit, expired token), an
@@ -566,6 +580,18 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
 
 /// Start one ephemeral JIT runner container. Returns (container_id, runner_name).
 pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
+    #[cfg(test)]
+    {
+        let mut hook = TEST_START_ONE_NAMES.lock().unwrap();
+        if let Some(names) = hook.as_mut() {
+            if names.is_empty() {
+                bail!("test start_one hook exhausted");
+            }
+            let name = names.remove(0);
+            return Ok((format!("container-{name}"), name));
+        }
+    }
+
     start_one_with_generate(cfg, backend, github::generate_jitconfig)
 }
 
@@ -647,7 +673,7 @@ fn start_one_with_generate(
     Ok((container_id, runner_name))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ManagedContainer {
     #[serde(rename = "ID")]
     pub id: String,
@@ -659,7 +685,16 @@ pub struct ManagedContainer {
     pub running_for: String,
 }
 
+#[cfg(test)]
+static TEST_MANAGED_CONTAINERS: std::sync::Mutex<Option<Vec<ManagedContainer>>> =
+    std::sync::Mutex::new(None);
+
 pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+    #[cfg(test)]
+    if let Some(containers) = TEST_MANAGED_CONTAINERS.lock().unwrap().clone() {
+        return Ok(containers);
+    }
+
     let mut cmd = Command::new("docker");
     cmd.args([
         "ps",
@@ -763,6 +798,11 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
 /// this is the disk runner jobs will actually fill. A host-side `df` would
 /// read the wrong filesystem whenever the daemon is a VM (Colima/Lima/Desktop).
 pub fn free_disk_gb(image: &str) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = *TEST_FREE_DISK_GB.lock().unwrap() {
+        return free;
+    }
+
     let mut cmd = Command::new("docker");
     cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
     let out = run_docker(cmd, "measuring docker daemon free disk")
@@ -779,11 +819,224 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+fn parse_loadavg_1m(raw: &str) -> Option<f64> {
+    raw.split_whitespace().next()?.parse().ok()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LoadGateSignal {
+    Available(f64),
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Unsupported(&'static str),
+    Unavailable(String),
+}
+
+fn read_host_loadavg_1m() -> LoadGateSignal {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/loadavg") {
+            Ok(raw) => parse_loadavg_1m(&raw).map_or_else(
+                || LoadGateSignal::Unavailable("could not parse /proc/loadavg".into()),
+                LoadGateSignal::Available,
+            ),
+            Err(err) => LoadGateSignal::Unavailable(format!("could not read /proc/loadavg: {err}")),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        LoadGateSignal::Unsupported("host load average is unavailable on this platform")
+    }
+}
+
+fn notify_load_gate_dark_once(cfg: &Config, signal: &LoadGateSignal) {
+    let (severity, detail) = match signal {
+        LoadGateSignal::Available(_) => return,
+        LoadGateSignal::Unsupported(reason) => (Severity::Warning, (*reason).to_string()),
+        LoadGateSignal::Unavailable(reason) => (Severity::Critical, reason.clone()),
+    };
+
+    LOAD_GATE_DARK_WARNING.call_once(|| {
+        eprintln!(
+            "warning: runner respawn load gate is unavailable ({detail}); falling back to one runner this ensure_count iteration"
+        );
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.respawn_load_gate_dark",
+            severity,
+            "Runner respawn load gate unavailable",
+            &format!(
+                "The respawn load gate is unavailable for {} ({detail}). \
+                 ezgha is falling back to one runner per ensure_count iteration until load feedback recovers.",
+                cfg.github.target
+            ),
+        );
+    });
+}
+
+fn allowed_respawn_starts_for_load(cfg: &Config, measured_load: f64, committed_starts: u32) -> u32 {
+    let effective_load =
+        measured_load + (committed_starts as f64 * cfg.runner.respawn_load_per_runner);
+    let headroom = cfg.runner.respawn_load_safety_ceiling - effective_load;
+    if headroom <= 0.0 {
+        return 0;
+    }
+    ((headroom / cfg.runner.respawn_load_per_runner).floor() as u32)
+        .min(cfg.runner.respawn_batch_size)
+}
+
+fn start_missing_runners(
+    cfg: &Config,
+    backend: Backend,
+    missing: u32,
+) -> Result<(Vec<String>, u32)> {
+    start_missing_runners_with(
+        cfg,
+        missing,
+        || start_one(cfg, backend),
+        std::thread::sleep,
+        read_host_loadavg_1m,
+    )
+}
+
+fn start_missing_runners_with<Start, Sleep, Load>(
+    cfg: &Config,
+    missing: u32,
+    mut start_runner: Start,
+    mut sleep: Sleep,
+    mut loadavg_1m: Load,
+) -> Result<(Vec<String>, u32)>
+where
+    Start: FnMut() -> Result<(String, String)>,
+    Sleep: FnMut(Duration),
+    Load: FnMut() -> LoadGateSignal,
+{
+    let mut started = Vec::new();
+    // Count of actual `start_runner()` invocations this call. This is NOT
+    // `missing`: the gate-primary pacing (load headroom / batch size / time
+    // budget) intentionally caps how many starts we ATTEMPT per iteration, so
+    // a cold-start recovery legitimately attempts far fewer than `missing`.
+    // `is_partial_failure` compares started-vs-attempted so that intentional
+    // throttling is not mistaken for start failures (which would fire false
+    // Critical alerts during exactly the disaster-recovery this pacing exists
+    // to handle safely).
+    let mut attempted = 0u32;
+    let mut last_err = None;
+    // Gate-primary safety model, derived from the 2026-07-07 incident docs:
+    // `/etc/watchdog.conf` reboots this host at max-load-1=24, and one cold
+    // 16-runner respawn burst was observed around loadavg 71. That gives
+    // 71 / 16 = 4.4375 load per cold runner, represented by the configurable
+    // default `respawn_load_per_runner = 4.4`. The live shared-host baseline
+    // observed during the mission was 9-15, so fixed v2 pacing alone was not
+    // safe: 15 + 17.32 simulated respawn load = 32.32 > 24. The load gate is
+    // therefore load-bearing. At each decision point we allow only:
+    // floor((safety_ceiling - (measured_load + committed_starts * per_runner))
+    //       / per_runner), clamped to respawn_batch_size. With the defaults,
+    // a dark gate falls back to exactly one runner per ensure_count iteration:
+    // 15 baseline + 4.4 = 19.4, below both the 20 soft ceiling and the 24
+    // watchdog ceiling. The 105s per-call budget is 3.5 serve-loop cadences:
+    // long enough for several 5s load rechecks, but bounded so queue_monitor
+    // and invariant_sampler run between incremental refill calls.
+    let mut remaining = missing;
+    let retry = Duration::from_secs(cfg.runner.respawn_load_retry_seconds);
+    let budget = Duration::from_secs(cfg.runner.respawn_refill_time_budget_seconds);
+    let started_at = Instant::now();
+    let mut budget_spent = Duration::ZERO;
+    let mut high_load_warned = false;
+
+    while remaining > 0 {
+        if started_at.elapsed().max(budget_spent) >= budget {
+            break;
+        }
+
+        let (this_batch, stop_after_batch) = match loadavg_1m() {
+            LoadGateSignal::Available(load) => {
+                let allowed =
+                    allowed_respawn_starts_for_load(cfg, load, started.len() as u32).min(remaining);
+                if allowed == 0 {
+                    if !high_load_warned {
+                        eprintln!(
+                            "warning: host 1-minute load average {load:.2} leaves no safe respawn headroom below ceiling {:.2}; delaying runner respawn",
+                            cfg.runner.respawn_load_safety_ceiling
+                        );
+                        high_load_warned = true;
+                    }
+                    if started_at.elapsed().max(budget_spent) + retry > budget {
+                        break;
+                    }
+                    watchdog::ping();
+                    sleep(retry);
+                    watchdog::ping();
+                    budget_spent += retry;
+                    continue;
+                }
+                (allowed, false)
+            }
+            signal @ (LoadGateSignal::Unsupported(_) | LoadGateSignal::Unavailable(_)) => {
+                notify_load_gate_dark_once(cfg, &signal);
+                (1.min(remaining), true)
+            }
+        };
+
+        for _ in 0..this_batch {
+            if started_at.elapsed().max(budget_spent) >= budget {
+                break;
+            }
+            watchdog::ping();
+            attempted += 1;
+            match start_runner() {
+                Ok((_, name)) => started.push(name),
+                Err(e) => {
+                    eprintln!("warning: failed to start runner: {e:#}");
+                    last_err = Some(e);
+                }
+            }
+            remaining -= 1;
+        }
+        if stop_after_batch {
+            break;
+        }
+    }
+
+    if started.is_empty() {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok((started, attempted))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsureCountOutcome {
+    pub started: Vec<String>,
+    pub missing: u32,
+    /// How many runner starts were actually ATTEMPTED this cycle — i.e. how
+    /// many `start_runner()` calls the gate-primary pacing permitted. This is
+    /// `<= missing`: intentional throttling under load means we deliberately
+    /// attempt fewer than the full shortfall per call and finish the refill
+    /// across later serve-loop iterations.
+    pub attempted: u32,
+}
+
+impl EnsureCountOutcome {
+    /// A partial failure is when some ATTEMPTED start actually errored — NOT
+    /// when the gate intentionally throttled the number of attempts. Comparing
+    /// against `attempted` (rather than `missing`) prevents a false Critical
+    /// alert storm during a full-fleet cold start, where the gate correctly
+    /// permits only 1-2 attempts per iteration by design.
+    pub fn is_partial_failure(&self) -> bool {
+        (self.started.len() as u32) < self.attempted
+    }
+}
+
 /// Ensure `count` managed runner containers are alive; start the shortfall.
 /// Refuses to spawn when the daemon's disk is below the configured floor —
 /// disk exhaustion is the dominant self-hosted runner failure mode, and
 /// spawning more work onto a full disk makes the incident worse.
 pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
+    Ok(ensure_count_outcome(cfg, backend)?.started)
+}
+
+pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
     // Reconcile stale slot assignments before we look at container counts:
     // a daemon crash between `next_slot` and the container coming up leaves a
     // reservation that would otherwise wedge `next_slot` forever ("all N
@@ -796,7 +1049,11 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     let containers = managed_containers()?;
     let alive = count_current_prefix_containers(&containers, cfg);
     if alive >= cfg.runner.count {
-        return Ok(Vec::new());
+        return Ok(EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 0,
+            attempted: 0,
+        });
     }
     match free_disk_gb(&cfg.runner.image) {
         Some(free) if free < cfg.limits.min_free_disk_gb => {
@@ -846,27 +1103,26 @@ pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
             );
         }
     }
-    let mut started = Vec::new();
-    let mut last_err = None;
-    for _ in alive..cfg.runner.count {
-        watchdog::ping();
-        match start_one(cfg, backend) {
-            Ok((_, name)) => started.push(name),
-            Err(e) => {
-                eprintln!("warning: failed to start runner: {e:#}");
-                last_err = Some(e);
-            }
-        }
-    }
+    let missing = cfg.runner.count - alive;
+    let refill = start_missing_runners(cfg, backend, missing);
     // Release any failed reservations from this cycle
     let _ = release_stale_slots(cfg);
 
-    if started.is_empty() {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
+    let (started, attempted) = refill?;
+    let outcome = EnsureCountOutcome {
+        started,
+        missing,
+        attempted,
+    };
+    if outcome.is_partial_failure() {
+        eprintln!(
+            "warning: ensure_count started only {} of {} attempted runner(s) ({} still missing); treating as partial failure for alert streak accounting",
+            outcome.started.len(),
+            outcome.attempted,
+            outcome.missing.saturating_sub(outcome.started.len() as u32)
+        );
     }
-    Ok(started)
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -874,6 +1130,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -942,6 +1199,10 @@ mod tests {
     impl Drop for TestEnv {
         fn drop(&mut self) {
             *TEST_SLOT_PATH.lock().unwrap() = None;
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
+            *TEST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
+            *TEST_START_ONE_NAMES.lock().unwrap() = None;
             let _ = std::fs::remove_file(&self.path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
@@ -1121,6 +1382,314 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "timeout should fire promptly, got {:?}",
             elapsed
+        );
+    }
+
+    #[test]
+    fn parse_loadavg_reads_first_field() {
+        assert_eq!(parse_loadavg_1m("12.34 5.67 8.90 1/2 345"), Some(12.34));
+        assert_eq!(parse_loadavg_1m("not-a-number 5.67 8.90"), None);
+        assert_eq!(parse_loadavg_1m(""), None);
+    }
+
+    #[test]
+    fn respawn_gate_limits_start_calls_by_load_headroom() {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 2;
+        cfg.runner.respawn_load_safety_ceiling = 20.0;
+        cfg.runner.respawn_load_per_runner = 4.4;
+        let events = RefCell::new(Vec::<String>::new());
+        let mut seq = 0;
+
+        let (started, _attempted) = start_missing_runners_with(
+            &cfg,
+            16,
+            || {
+                seq += 1;
+                events.borrow_mut().push(format!("start-{seq}"));
+                Ok((format!("container-{seq}"), format!("runner-{seq}")))
+            },
+            |duration| {
+                events
+                    .borrow_mut()
+                    .push(format!("sleep-{}", duration.as_secs()));
+            },
+            || LoadGateSignal::Available(15.0),
+        )
+        .unwrap();
+
+        assert_eq!(started.len(), 1);
+        let events = events.borrow();
+        let max_consecutive_starts = events
+            .split(|event| event.starts_with("sleep-"))
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .filter(|event| event.starts_with("start-"))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            max_consecutive_starts, 1,
+            "15.0 baseline leaves floor((20.0 - 15.0) / 4.4) = 1 safe start; events={events:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct LaggingLoadSim {
+        now_secs: u64,
+        starts: Vec<u64>,
+        ema_1m: f64,
+        peak_ema_1m: f64,
+    }
+
+    impl LaggingLoadSim {
+        fn new() -> Self {
+            Self {
+                now_secs: 0,
+                starts: Vec::new(),
+                ema_1m: 0.0,
+                peak_ema_1m: 0.0,
+            }
+        }
+
+        fn record_start(&mut self) {
+            self.starts.push(self.now_secs);
+        }
+
+        fn advance(&mut self, duration: Duration) {
+            let mut remaining = duration.as_secs();
+            while remaining > 0 {
+                let step = remaining.min(5);
+                let active = self.true_startup_load();
+                // Linux loadavg is updated every 5 seconds as an exponential
+                // moving average. This test uses the continuous equivalent
+                // exp(-dt/60s) for the 1-minute average and models each cold
+                // runner start as contributing 71/16 load units for 60 seconds,
+                // based on the documented loadavg-71 / 16-runner incident.
+                let decay = (-(step as f64) / 60.0).exp();
+                self.ema_1m = self.ema_1m * decay + active * (1.0 - decay);
+                self.now_secs += step;
+                self.peak_ema_1m = self.peak_ema_1m.max(self.ema_1m);
+                remaining -= step;
+            }
+        }
+
+        fn true_startup_load(&self) -> f64 {
+            const RUNNER_START_LOAD: f64 = 71.0 / 16.0;
+            let active = self
+                .starts
+                .iter()
+                .filter(|started_at| self.now_secs.saturating_sub(**started_at) < 60)
+                .count();
+            active as f64 * RUNNER_START_LOAD
+        }
+    }
+
+    fn simulated_peak_for_fixed_schedule(batch_size: u32, batch_sleep_secs: u64) -> f64 {
+        let mut sim = LaggingLoadSim::new();
+        let mut remaining = 16;
+        while remaining > 0 {
+            let this_batch = batch_size.min(remaining);
+            for _ in 0..this_batch {
+                sim.record_start();
+            }
+            remaining -= this_batch;
+            if remaining > 0 {
+                sim.advance(Duration::from_secs(batch_sleep_secs));
+            }
+        }
+        sim.advance(Duration::from_secs(180));
+        sim.peak_ema_1m
+    }
+
+    #[test]
+    fn fixed_respawn_schedule_without_load_gate_breaches_watchdog_with_busy_host_baseline() {
+        const BUSY_HOST_BASELINE_LOAD: f64 = 15.0;
+        const WATCHDOG_LOAD_CEILING: f64 = 24.0;
+
+        let new_peak = simulated_peak_for_fixed_schedule(
+            crate::config::default_respawn_batch_size(),
+            crate::config::default_respawn_batch_sleep_seconds(),
+        );
+        let total_peak = BUSY_HOST_BASELINE_LOAD + new_peak;
+        assert!(
+            total_peak > WATCHDOG_LOAD_CEILING,
+            "v2's fixed 2/30 schedule is not a standalone safety property on this host: 15.0 baseline + {new_peak:.2} respawn load = {total_peak:.2}, above watchdog ceiling {WATCHDOG_LOAD_CEILING}"
+        );
+    }
+
+    #[test]
+    fn gate_active_incremental_refill_stays_below_watchdog_with_busy_host_baseline() {
+        const BUSY_HOST_BASELINE_LOAD: f64 = 15.0;
+        const WATCHDOG_LOAD_CEILING: f64 = 24.0;
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 2;
+        cfg.runner.respawn_load_safety_ceiling = 20.0;
+        cfg.runner.respawn_load_per_runner = 4.4;
+        cfg.runner.respawn_load_retry_seconds = 5;
+        cfg.runner.respawn_refill_time_budget_seconds = 105;
+        let sim = RefCell::new(LaggingLoadSim::new());
+        let mut seq = 0;
+
+        let (started, _attempted) = start_missing_runners_with(
+            &cfg,
+            16,
+            || {
+                seq += 1;
+                sim.borrow_mut().record_start();
+                Ok((format!("container-{seq}"), format!("runner-{seq}")))
+            },
+            |duration| sim.borrow_mut().advance(duration),
+            || LoadGateSignal::Available(BUSY_HOST_BASELINE_LOAD + sim.borrow().ema_1m),
+        )
+        .unwrap();
+
+        sim.borrow_mut().advance(Duration::from_secs(180));
+        let respawn_peak = sim.borrow().peak_ema_1m;
+        let total_peak = BUSY_HOST_BASELINE_LOAD + respawn_peak;
+        assert_eq!(
+            started.len(),
+            1,
+            "15.0 baseline leaves room for one 4.4-load start per 105s ensure_count budget"
+        );
+        assert!(
+            total_peak < WATCHDOG_LOAD_CEILING,
+            "gate-active path must include the host baseline in its safety proof: 15.0 + {respawn_peak:.2} = {total_peak:.2}, below watchdog ceiling {WATCHDOG_LOAD_CEILING}"
+        );
+    }
+
+    #[test]
+    fn gate_dark_fallback_starts_one_runner_and_stays_below_watchdog_with_busy_host_baseline() {
+        const BUSY_HOST_BASELINE_LOAD: f64 = 15.0;
+        const WATCHDOG_LOAD_CEILING: f64 = 24.0;
+        const INCIDENT_LOAD_PER_RUNNER: f64 = 71.0 / 16.0;
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 4;
+        cfg.runner.respawn_load_per_runner = 4.4;
+        let events = RefCell::new(Vec::<String>::new());
+        let mut seq = 0;
+
+        let (started, _attempted) = start_missing_runners_with(
+            &cfg,
+            16,
+            || {
+                seq += 1;
+                events.borrow_mut().push(format!("start-{seq}"));
+                Ok((format!("container-{seq}"), format!("runner-{seq}")))
+            },
+            |duration| {
+                events
+                    .borrow_mut()
+                    .push(format!("sleep-{}", duration.as_secs()));
+            },
+            || LoadGateSignal::Unavailable("forced test loadavg read failure".into()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            started.len(),
+            1,
+            "dark load gate must not fall back to the old permissive full refill"
+        );
+        assert_eq!(events.borrow().as_slice(), ["start-1"]);
+        let fallback_total = BUSY_HOST_BASELINE_LOAD + INCIDENT_LOAD_PER_RUNNER;
+        assert!(
+            fallback_total < WATCHDOG_LOAD_CEILING,
+            "dark-gate fallback proof: 15.0 baseline + 71/16 ({INCIDENT_LOAD_PER_RUNNER:.4}) = {fallback_total:.4}, below watchdog ceiling {WATCHDOG_LOAD_CEILING}"
+        );
+    }
+
+    #[test]
+    fn ensure_count_real_wiring_computes_missing_before_start_missing() {
+        let _env = TestEnv::new("ensure_count_wiring");
+        let mut cfg = cfg_with(5, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 2;
+        cfg.runner.respawn_load_safety_ceiling = 999.0;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
+            managed_container("ez-org-runner-1"),
+            managed_container("ez-org-runner-2"),
+            managed_container("ez-org-runner-3"),
+            managed_container("ez-canary-runner-1"),
+        ]);
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
+
+        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            started,
+            vec!["ez-org-runner-4", "ez-org-runner-5"],
+            "ensure_count must compute missing=count-alive using only current-prefix containers"
+        );
+        assert!(
+            TEST_START_ONE_NAMES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "real start_missing_runners path should consume exactly two start_one calls"
+        );
+    }
+
+    #[test]
+    fn ensure_count_outcome_flags_fewer_than_half_started() {
+        let _env = TestEnv::new("ensure_count_partial");
+        let mut cfg = cfg_with(4, "ez-org-runner");
+        cfg.runner.respawn_batch_size = 4;
+        cfg.runner.respawn_load_safety_ceiling = 999.0;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.missing, 4);
+        // ceiling=999 lets the gate permit the full batch of 4 attempts; only
+        // one runner name is available, so 3 attempts error → real failure.
+        assert_eq!(outcome.attempted, 4);
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert!(
+            outcome.is_partial_failure(),
+            "one successful start out of four ATTEMPTED starts is a real partial failure and must keep the serve alert streak alive"
+        );
+    }
+
+    #[test]
+    fn gate_throttled_full_success_is_not_a_partial_failure() {
+        // THE round-3 critical regression: on a full-fleet cold start the gate
+        // permits only 1-2 attempts per ensure_count call BY DESIGN. When every
+        // permitted attempt succeeds, that is a healthy incremental refill — it
+        // must NOT be flagged as a partial failure (the old `started*2 < missing`
+        // rule flagged it, firing a false Critical alert storm during recovery).
+        let outcome = EnsureCountOutcome {
+            started: vec!["runner-1".into(), "runner-2".into()],
+            missing: 16,
+            attempted: 2,
+        };
+        assert!(
+            !outcome.is_partial_failure(),
+            "2 successful starts out of 2 gate-permitted attempts (16 still missing) is healthy pacing, not a failure"
+        );
+    }
+
+    #[test]
+    fn attempted_start_that_errors_is_a_partial_failure() {
+        // The other side: if the gate permitted 2 attempts and one errored,
+        // that IS a real failure regardless of how many runners remain missing.
+        let outcome = EnsureCountOutcome {
+            started: vec!["runner-1".into()],
+            missing: 16,
+            attempted: 2,
+        };
+        assert!(
+            outcome.is_partial_failure(),
+            "1 success out of 2 attempted starts is a real partial failure even with many still missing"
         );
     }
 
