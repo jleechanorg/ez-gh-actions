@@ -470,7 +470,6 @@ struct JitConfigResponse {
 #[derive(Debug, Deserialize)]
 struct JitRunner {
     id: u64,
-    name: String,
 }
 
 /// Build the `gh api -X POST <path>` command that registers a JIT runner.
@@ -552,7 +551,6 @@ pub fn generate_jitconfig(
     }
     let parsed: JitConfigResponse =
         serde_json::from_slice(&out.stdout).context("unexpected generate-jitconfig response")?;
-    let _ = parsed.runner.name;
     watchdog::ping();
     Ok((parsed.encoded_jit_config, parsed.runner.id))
 }
