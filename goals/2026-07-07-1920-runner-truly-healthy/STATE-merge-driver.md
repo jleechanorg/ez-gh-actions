@@ -148,17 +148,33 @@ step after a real deploy.
   #1 and #2. HOLDING THE MERGE — not dismissing these findings, they're real and
   actionable, not just nitpicks.
 
+- 2026-07-08 09:45 — reaper-wiring reported "done, ready for review" (crossed in transit
+  with my findings message — it addressed the ORIGINAL red test via a fixture fix, runner_id
+  42 vs 1234 mismatch in the shared completed_job() helper, confirmed genuinely good by the
+  reviewer). Clarified to reaper-wiring that the 2 findings from the adversarial review are
+  SEPARATE, still-open issues in e977002 (not the same bug it already fixed). team-lead
+  independently sent its own adversarial-review dispatch instruction, which crossed with my
+  completed review — confirmed to team-lead the review was already done, findings already
+  sent to reaper-wiring, matched team-lead's own 4 probe angles 1-for-1 (gate airtightness
+  CLEAN, min_age=0 CLEAN, repo-coverage-limitation CLEAN/graceful-degradation, test-quality
+  FINDING) plus 1 extra finding (422 substring) team-lead's list didn't include. NEW HARD
+  CONSTRAINT from team-lead: even once merged, do NOT deploy (cargo install/restart jeff) —
+  hold until team-lead coordinates post-load-settle (jeff just had a double-restart, load
+  spiked ~18). Confirmed compliance explicitly.
+
 ## Next Actions (rewritten every step)
 
 1. Wait for reaper-wiring to push a fix for the 2 findings (422 substring false-positive;
    force-cancel test doesn't test what it claims) to claude/qbl-zombie-slot-selfheal. When
    it lands: build+test in ez-gh-actions-wt-qbl, spot-check the 2 specific fixes, and if
-   genuinely resolved, merge to origin/main + Gate 0 (rebuild via clean worktree method,
-   pre-restart load/container check, restart, verify-exit-criteria.sh). TOP PRIORITY —
-   still the last open mission item.
+   genuinely resolved, MERGE to origin/main (rebase/ff onto current main first — team-lead
+   confirmed no file overlap with the ~10 commits main has advanced) — but do NOT deploy
+   (no cargo install/restart jeff) until team-lead explicitly says load has settled and
+   coordinates the restart. TOP PRIORITY — still the last open mission item.
 2. capacity-proof (fix #2): CLOSED, no further action.
 3. App token (fix #3): jeff-ubuntu side fully done+proven. Mac-side restart is main/mac
    session's call, not mine — flagged to main already. bead nuk left OPEN with status
    comment pending Mac confirmation.
-4. After reaper fix lands: re-verify sustained 16/16 + 6/6 (or queue-drained) with the app
-   token active on both machines.
+4. After reaper fix merges AND team-lead clears the deploy: rebuild via clean worktree
+   method, pre-restart load/container check, restart jeff, verify-exit-criteria.sh, then
+   re-verify sustained 16/16 + 6/6 (or queue-drained) with both fixes + app token active.
