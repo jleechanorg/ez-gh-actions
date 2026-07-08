@@ -956,3 +956,49 @@ external dependency on the INV-1 busy==22 branch, not a Linux-side bug to chase.
 **Next**: doctor.sh resample for SC6 (fleet integrity), then report consolidated
 findings to main. Continuing to HOLD po2 V3 deploy pending main's own round-3
 SHIP verdict — not independently reviewing or acting on it.
+
+---
+
+## sidekick3 RESPAWN — recovery entry (2026-07-07 21:38 PT)
+
+Predecessor sidekick2 died on API session-limit/rate-limit. Recovered via the
+respawn protocol (STATE.md + main's 06-main-autonomous-progress.md + goal docs +
+beads + git). No redo — resuming from exactly where sidekick2/main left off.
+
+**Confirmed since handoff**:
+- Both demand-cut PRs (worldai#8214, #8235) MERGED — confirmed via main's
+  06-main-autonomous-progress.md, consistent with git log (main HEAD 8abd2f2,
+  beads db/wal untrack commit 3edff6b already landed).
+- po2 branch `sidekick/po2-respawn-pacing` fetched fresh: still at 153d1b8
+  (4 codex commits: b8735b7 config, 5e3514d pacing, dc86a32 fixed-schedule-safe,
+  153d1b8 gate-primary). The round-3 CRITICAL fix (is_partial_failure
+  misclassifying gate-throttled starts as failures) is **NOT YET on the branch**
+  — grepped src/ for `partial_failure`/`is_partial_failure`, only found in
+  main.rs/docker_backend.rs unchanged from round-3 state; `respawn_load_safety_ceiling`
+  default is still 20.0 (not yet capped <24 per the fix brief, though 20<24 already
+  satisfies the numeric ask — the validation-rule addition is what's pending).
+- **Codex is actively running** the fix: PID 562582, `codex exec --yolo
+  --skip-git-repo-check` in `~/projects/ez-gh-actions-wt-po2`, elapsed 24+ min as
+  of this check (started ~21:14 PT). Full prompt confirmed matches main's
+  described brief (attempted-vs-missing partial-failure redefinition + tests +
+  ceiling<24 validation cap). Worktree git status is clean (no uncommitted diff
+  yet) — codex hasn't written anything to disk yet or is mid-edit not yet saved.
+- Live invariant sampler tail (last 5 samples): INV-2 passing (oldest queued
+  4.8-16.5min, all <20min threshold). INV-1 failing every sample, busy 17-20/22,
+  fail_class alternating `missing-registration`/`offline-respawning` — matches
+  main's description exactly, no drift.
+- Host load 9.09 (1-min), 13 ezgha-managed containers running, ezgha.service
+  active. Both comfortably under the careful-restart gate (load<12, containers>=12)
+  main specified for when SHIP lands.
+
+**Action taken**: started a background Monitor polling PID 562582 + worktree HEAD
+sha every 15s (task bkf1cboe9, 30min timeout) instead of manually polling —
+will get an event the moment codex finishes or dies, then verify the diff/tests
+per main's instruction (read-only, do NOT merge/deploy without explicit SHIP from
+main). Claimed TaskList #7 (track hardening-bxy-fl0, don't touch) and #8
+(STATE-mirror + bead cadence) as sidekick3.
+
+**Not yet done this block**: mirroring this entry to STATE-mirror.md (committed
+copy) and bead ez-gh-actions-9je — doing next. Have not touched cargo
+install/systemctl restart (single-writer lock respected, nothing to deploy yet
+since fix isn't committed).
