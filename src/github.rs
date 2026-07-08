@@ -281,6 +281,10 @@ pub fn workflow_run_jobs_path(repo: &str, run_id: u64) -> String {
     format!("repos/{repo}/actions/runs/{run_id}/jobs?per_page=100")
 }
 
+pub fn rate_limit_path() -> &'static str {
+    "rate_limit"
+}
+
 pub fn repo_in_progress_runs_path(repo: &str, page: u32) -> String {
     format!(
         "repos/{repo}/actions/runs?status=in_progress&per_page=100&page={}",
@@ -338,6 +342,38 @@ pub fn list_workflow_jobs(repo: &str, run_id: u64) -> Result<Vec<WorkflowJob>> {
     let parsed: WorkflowJobsResponse = serde_json::from_slice(&body)
         .with_context(|| format!("unexpected workflow-jobs response for run {run_id}"))?;
     Ok(parsed.jobs)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitQuotas {
+    pub rest_remaining: u64,
+    pub graphql_remaining: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResponse {
+    resources: RateLimitResources,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResources {
+    core: RateLimitBucket,
+    graphql: RateLimitBucket,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitBucket {
+    remaining: u64,
+}
+
+pub fn rate_limit_quotas() -> Result<RateLimitQuotas> {
+    let body = api_json(rate_limit_path())?;
+    let parsed: RateLimitResponse =
+        serde_json::from_slice(&body).context("unexpected gh rate_limit response")?;
+    Ok(RateLimitQuotas {
+        rest_remaining: parsed.resources.core.remaining,
+        graphql_remaining: parsed.resources.graphql.remaining,
+    })
 }
 
 pub fn list_repo_in_progress_runs(repo: &str) -> Result<Vec<WorkflowRun>> {

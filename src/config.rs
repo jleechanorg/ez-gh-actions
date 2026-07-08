@@ -84,6 +84,9 @@ pub struct QueueMonitorConfig {
     /// Require this many consecutive bad samples before alerting.
     #[serde(default = "default_queue_consecutive_alert_threshold")]
     pub consecutive_alert_threshold: u32,
+    /// Preserve this many GitHub REST core requests for registration-critical writes.
+    #[serde(default = "default_queue_gh_rest_reserve_threshold")]
+    pub gh_rest_reserve_threshold: u64,
 }
 
 impl Default for QueueMonitorConfig {
@@ -95,6 +98,7 @@ impl Default for QueueMonitorConfig {
             check_interval_seconds: default_queue_check_interval_seconds(),
             stale_hours: default_queue_stale_hours(),
             consecutive_alert_threshold: default_queue_consecutive_alert_threshold(),
+            gh_rest_reserve_threshold: default_queue_gh_rest_reserve_threshold(),
         }
     }
 }
@@ -330,6 +334,10 @@ fn default_queue_stale_hours() -> u64 {
 
 fn default_queue_consecutive_alert_threshold() -> u32 {
     2
+}
+
+fn default_queue_gh_rest_reserve_threshold() -> u64 {
+    200
 }
 
 fn default_canary_workflow() -> String {
@@ -614,6 +622,12 @@ impl Config {
         if self.queue_monitor.consecutive_alert_threshold == 0 {
             anyhow::bail!("queue_monitor.consecutive_alert_threshold must be at least 1");
         }
+        if self.queue_monitor.gh_rest_reserve_threshold > 5_000 {
+            anyhow::bail!(
+                "queue_monitor.gh_rest_reserve_threshold must be at most 5000 (got {})",
+                self.queue_monitor.gh_rest_reserve_threshold
+            );
+        }
         if let Some(repo) = &self.queue_monitor.repo {
             if !is_owner_repo(repo) {
                 anyhow::bail!(
@@ -759,6 +773,7 @@ mod tests {
         assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
         assert_eq!(tiny.queue_monitor.stale_hours, 8);
         assert_eq!(tiny.queue_monitor.consecutive_alert_threshold, 2);
+        assert_eq!(tiny.queue_monitor.gh_rest_reserve_threshold, 200);
         assert!(!tiny.canary.enabled);
         assert_eq!(tiny.canary.workflow, "selftest.yml");
         assert_eq!(tiny.canary.ref_name, "main");
@@ -989,6 +1004,9 @@ mod tests {
         cfg.queue_monitor.consecutive_alert_threshold = 0;
         assert!(cfg.validate().is_err());
         cfg.queue_monitor.consecutive_alert_threshold = 2;
+        cfg.queue_monitor.gh_rest_reserve_threshold = 5_001;
+        assert!(cfg.validate().is_err());
+        cfg.queue_monitor.gh_rest_reserve_threshold = 200;
         for repo in [
             "owner-only",
             "owner/",

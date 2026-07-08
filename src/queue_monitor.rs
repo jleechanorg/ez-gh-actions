@@ -98,8 +98,19 @@ impl QueueMonitorState {
         // in-progress *counts* become a lower bound when capped, which this
         // starvation-alerting path doesn't otherwise report as an exact number.
         let deadline = loop_start + SERVE_LOOP_TIME_BUDGET;
-        let (snapshot, _capped) =
-            fetch_capped_queue_snapshot(repo, None, INVARIANT_JOB_ENUMERATION_CAP, deadline)?;
+        if !rest_quota_available_for_monitoring(
+            cfg.queue_monitor.gh_rest_reserve_threshold,
+            "queue monitor snapshot",
+        ) {
+            return Ok(None);
+        }
+        let (snapshot, _capped) = fetch_capped_queue_snapshot(
+            repo,
+            None,
+            INVARIANT_JOB_ENUMERATION_CAP,
+            deadline,
+            cfg.queue_monitor.gh_rest_reserve_threshold,
+        )?;
         let now = unix_now_secs();
         let stats = queue_stats(
             &snapshot,
@@ -158,6 +169,13 @@ impl InvariantSamplerState {
             return Ok(None);
         }
         self.last_check = Some(Instant::now());
+
+        if !rest_quota_available_for_monitoring(
+            cfg.queue_monitor.gh_rest_reserve_threshold,
+            "invariant sampler",
+        ) {
+            return Ok(None);
+        }
 
         // Deliberate design property: if `sample_invariants` fails (e.g. a
         // GitHub API rate limit -- already observed live on this box), `?`
@@ -228,6 +246,7 @@ fn sample_invariants(cfg: &Config, loop_start: Instant) -> Result<InvariantSampl
             Some(fleet.clone()),
             INVARIANT_JOB_ENUMERATION_CAP,
             deadline,
+            cfg.queue_monitor.gh_rest_reserve_threshold,
         )?;
         any_capped |= capped;
         repo_stats.push(queue_stats(
@@ -494,6 +513,25 @@ fn fetch_fleet_runner_stats() -> Result<FleetRunnerStats> {
     Ok(fleet_runner_stats(github::list_runners(&gh)?))
 }
 
+fn rest_quota_available_for_monitoring(threshold: u64, operation: &str) -> bool {
+    match github::rate_limit_quotas() {
+        Ok(quotas) if quotas.rest_remaining < threshold => {
+            eprintln!(
+                "queue monitor: skipping {operation}; GitHub REST core remaining {} is below reserve threshold {} (graphql remaining {})",
+                quotas.rest_remaining, threshold, quotas.graphql_remaining
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!(
+                "queue monitor: skipping {operation}; could not read GitHub rate_limit quota: {err:#}"
+            );
+            false
+        }
+    }
+}
+
 /// Enumerates self-hosted jobs for `runs` via caller-supplied `fetch_jobs`,
 /// bailing out (returning `bailed=true` with whatever was collected so far)
 /// the moment `Instant::now() >= deadline`, rather than starting another
@@ -544,6 +582,7 @@ fn fetch_capped_queue_snapshot(
     fleet: Option<FleetRunnerStats>,
     cap: usize,
     deadline: Instant,
+    rest_reserve_threshold: u64,
 ) -> Result<(QueueSnapshot, bool)> {
     let first_path = format!("repos/{repo}/actions/runs?status=queued&per_page=100&page=1");
     let first_body = github::api_json(&first_path)?;
@@ -602,7 +641,16 @@ fn fetch_capped_queue_snapshot(
         QueueSnapshot {
             queued,
             in_progress,
-            fleet: fleet.or_else(|| fetch_fleet_runner_stats().ok()),
+            fleet: fleet.or_else(|| {
+                if rest_quota_available_for_monitoring(
+                    rest_reserve_threshold,
+                    "fleet runner listing",
+                ) {
+                    fetch_fleet_runner_stats().ok()
+                } else {
+                    None
+                }
+            }),
         },
         capped,
     ))
@@ -1820,6 +1868,94 @@ mod tests {
         let log = dir.join("alerts.jsonl");
         cfg.alert.log_path = Some(log.clone());
         (cfg, dir, log)
+    }
+
+    #[test]
+    fn queue_monitor_skips_noncritical_reads_when_rest_quota_is_reserved() {
+        let (mut cfg, dir, _log) = test_config_with_log();
+        cfg.queue_monitor.enabled = true;
+        cfg.queue_monitor.gh_rest_reserve_threshold = 200;
+        fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("gh-calls");
+        let script = dir.join("fake-gh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{calls}"
+case "$*" in
+  "api rate_limit")
+    echo '{{"resources":{{"core":{{"limit":5000,"used":4851,"remaining":149,"reset":1783490842}},"graphql":{{"limit":5000,"used":1,"remaining":4999,"reset":1783490842}}}},"rate":{{"limit":5000,"used":4851,"remaining":149,"reset":1783490842}}}}'
+    ;;
+  *)
+    echo "unexpected noncritical REST read: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+                calls = calls.display()
+            ),
+        )
+        .unwrap();
+
+        let _guard = crate::github::with_gh_exe(script.to_str().unwrap());
+        let mut state = QueueMonitorState::new();
+        let stats = state.maybe_check(&cfg, Instant::now()).unwrap();
+
+        assert!(stats.is_none());
+        let call_log = fs::read_to_string(&calls).unwrap();
+        assert_eq!(call_log.trim(), "api rate_limit");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn queue_monitor_reads_normally_when_rest_quota_is_healthy() {
+        let (mut cfg, dir, _log) = test_config_with_log();
+        cfg.queue_monitor.enabled = true;
+        cfg.queue_monitor.gh_rest_reserve_threshold = 200;
+        fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("gh-calls");
+        let script = dir.join("fake-gh");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{calls}"
+case "$*" in
+  "api rate_limit")
+    echo '{{"resources":{{"core":{{"limit":5000,"used":100,"remaining":4900,"reset":1783490842}},"graphql":{{"limit":5000,"used":1,"remaining":4999,"reset":1783490842}}}},"rate":{{"limit":5000,"used":100,"remaining":4900,"reset":1783490842}}}}'
+    ;;
+  "api repos/owner/repo/actions/runs?status=queued&per_page=100&page=1")
+    echo '{{"total_count":0,"workflow_runs":[]}}'
+    ;;
+  "api repos/owner/repo/actions/runs?status=in_progress&per_page=100&page=1")
+    echo '{{"total_count":0,"workflow_runs":[]}}'
+    ;;
+  "api --paginate --slurp orgs/jleechanorg/actions/runners?per_page=100")
+    echo '[{{"total_count":0,"runners":[]}}]'
+    ;;
+  *)
+    echo "unexpected gh call: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+                calls = calls.display()
+            ),
+        )
+        .unwrap();
+
+        let _guard = crate::github::with_gh_exe(script.to_str().unwrap());
+        let mut state = QueueMonitorState::new();
+        let stats = state.maybe_check(&cfg, Instant::now()).unwrap().unwrap();
+
+        assert_eq!(stats.queued_total, 0);
+        let call_log = fs::read_to_string(&calls).unwrap();
+        assert!(call_log.contains("api rate_limit"));
+        assert!(call_log.contains("status=queued"));
+        assert!(call_log.contains("status=in_progress"));
+        assert!(call_log.contains("actions/runners"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn job(id: u64, name: &str, branch: &str, created_at: &str) -> QueueJob {
