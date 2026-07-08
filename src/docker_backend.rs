@@ -39,6 +39,7 @@ static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::
 /// Env var that overrides the slot assignments file path. Used by tests to
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
 const SLOT_ASSIGNMENTS_PATH_ENV: &str = "EZGHA_SLOT_ASSIGNMENTS_PATH";
+static SLOT_ASSIGNMENTS_MISSING_WARNED: Once = Once::new();
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SlotAssignments {
@@ -79,6 +80,12 @@ fn slot_assignments_path_for(cfg: Option<&Config>) -> PathBuf {
 fn read_slot_assignments_for(cfg: Option<&Config>) -> Result<SlotAssignments> {
     let path = slot_assignments_path_for(cfg);
     if !path.exists() {
+        SLOT_ASSIGNMENTS_MISSING_WARNED.call_once(|| {
+            eprintln!(
+                "warning: slot_assignments.toml is missing at {}; continuing with empty slot table",
+                path.display()
+            );
+        });
         return Ok(SlotAssignments::default());
     }
     let raw = std::fs::read_to_string(&path)
@@ -281,7 +288,13 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     let live_runners = match github::list_runners(&cfg.github) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("warning: skipping stale-slot reconciliation (GitHub unreachable): {e:#}");
+            let assignments_len = match read_slot_assignments_for(Some(cfg)) {
+                Ok(assignments) => assignments.assignments.len(),
+                Err(_) => 0,
+            };
+            eprintln!(
+                "warning: skipping stale-slot reconciliation (GitHub unreachable): {e:#}; slot table currently has {assignments_len} entries"
+            );
             return Ok(0);
         }
     };
@@ -396,6 +409,14 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     }
     if orphans_reaped > 0 {
         eprintln!("info: reaped {orphans_reaped} orphaned runners with prefix {prefix}");
+    }
+    if reclaimed > 0 {
+        eprintln!(
+            "info: release_stale_slots reclaimed {reclaimed} stale slot(s) for prefix {} (live GH runners: {}, local containers tracked: {})",
+            cfg.runner.name_prefix,
+            live_runners.len(),
+            local_container_names.as_ref().map_or(0, |names| names.len())
+        );
     }
     watchdog::ping();
     Ok(reclaimed + orphans_reaped)

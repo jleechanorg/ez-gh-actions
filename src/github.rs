@@ -21,6 +21,39 @@ const GH_TIMEOUT: Duration = Duration::from_secs(45);
 const GH_MAX_RETRIES: u32 = 5;
 const GH_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const GH_RETRY_MAX_DELAY: Duration = Duration::from_secs(32);
+const GH_RESPONSE_PREVIEW_CHARS: usize = 900;
+
+fn preview_response(bytes: &[u8], max_chars: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn log_gh_response(label: &str, out: &std::process::Output) {
+    let status = out.status.code().unwrap_or(-1);
+    eprintln!(
+        "{label}: exit={status} stdout_bytes={} stderr_bytes={}",
+        out.stdout.len(),
+        out.stderr.len()
+    );
+    let stdout_preview = preview_response(&out.stdout, GH_RESPONSE_PREVIEW_CHARS);
+    if !stdout_preview.is_empty() {
+        eprintln!("{label}: stdout preview: {stdout_preview}");
+    } else {
+        eprintln!("{label}: stdout preview is empty");
+    }
+    let stderr_preview = preview_response(&out.stderr, GH_RESPONSE_PREVIEW_CHARS);
+    if !stderr_preview.is_empty() {
+        eprintln!("{label}: stderr preview: {stderr_preview}");
+    } else {
+        eprintln!("{label}: stderr preview is empty");
+    }
+}
 
 /// Documented floor for SECONDARY rate-limit responses that lack a
 /// `Retry-After` header. GitHub's docs say: when the secondary limit is
@@ -307,6 +340,7 @@ pub(crate) fn api_json(path: &str) -> Result<Vec<u8>> {
     })
     .with_context(|| format!("failed to run `gh api {path}`"))?;
     if !out.status.success() {
+        log_gh_response(&format!("gh api {path}"), &out);
         bail!(
             "gh api {path} failed: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -327,6 +361,7 @@ pub(crate) fn api_json_until(path: &str, deadline: Instant) -> Result<Vec<u8>> {
     })
     .with_context(|| format!("failed to run `gh api {path}`"))?;
     if !out.status.success() {
+        log_gh_response(&format!("gh api {path}"), &out);
         bail!(
             "gh api {path} failed: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -346,6 +381,7 @@ pub(crate) fn api_post_empty(path: &str, fields: &[(&str, &str)]) -> Result<()> 
     })
     .with_context(|| format!("failed to run `gh api -X POST {path}`"))?;
     if !out.status.success() {
+        log_gh_response(&format!("gh api POST {path}"), &out);
         bail!(
             "gh api POST {path} failed: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -615,6 +651,7 @@ pub fn generate_jitconfig(
         .context("failed to run `gh api` — is the gh CLI installed?")?;
     watchdog::ping();
     if !out.status.success() {
+        log_gh_response(&format!("gh api generate-jitconfig for {name}"), &out);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("Already exists") || stderr.contains("already exists") {
             watchdog::ping();
@@ -648,10 +685,16 @@ pub fn generate_jitconfig(
                         let retry_out =
                             run_gh_with_backoff(|| build_jitconfig_cmd(&path, name, labels))?;
                         if retry_out.status.success() {
-                            let parsed: JitConfigResponse = serde_json::from_slice(
-                                &retry_out.stdout,
-                            )
-                            .context("unexpected generate-jitconfig response on self-heal retry")?;
+                            let parsed: JitConfigResponse = serde_json::from_slice(&retry_out.stdout)
+                                .map_err(|err| {
+                                    log_gh_response(
+                                        "gh api generate-jitconfig retry response",
+                                        &retry_out
+                                    );
+                                    anyhow::anyhow!(
+                                        "unexpected generate-jitconfig response on self-heal retry: {err}"
+                                    )
+                                })?;
                             watchdog::ping();
                             return Ok((parsed.encoded_jit_config, parsed.runner.id));
                         }
@@ -665,8 +708,10 @@ pub fn generate_jitconfig(
             stderr
         );
     }
-    let parsed: JitConfigResponse =
-        serde_json::from_slice(&out.stdout).context("unexpected generate-jitconfig response")?;
+    let parsed: JitConfigResponse = serde_json::from_slice(&out.stdout).map_err(|err| {
+        log_gh_response("gh api generate-jitconfig", &out);
+        anyhow::anyhow!("unexpected generate-jitconfig response: {err}")
+    })?;
     watchdog::ping();
     Ok((parsed.encoded_jit_config, parsed.runner.id))
 }
@@ -782,13 +827,18 @@ fn list_runners_core(gh: &GithubConfig, deadline: Option<Instant>) -> Result<Vec
     }
     .context("failed to run `gh api`")?;
     if !out.status.success() {
+        log_gh_response("gh api list runners", &out);
         bail!(
             "gh api list runners failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let pages: Vec<RunnerList> = serde_json::from_slice(&out.stdout)
-        .context("unexpected list-runners response (expected array of pages from --slurp)")?;
+    let pages: Vec<RunnerList> = serde_json::from_slice(&out.stdout).map_err(|err| {
+        log_gh_response("gh api list runners payload", &out);
+        anyhow::anyhow!(
+            "unexpected list-runners response (expected array of pages from --slurp): {err}"
+        )
+    })?;
     watchdog::ping();
     Ok(pages.into_iter().flat_map(|page| page.runners).collect())
 }
