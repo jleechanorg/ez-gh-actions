@@ -3,6 +3,12 @@
 ## Project overview
 `ezgha` is a Rust CLI that manages ephemeral self-hosted GitHub Actions runners using Docker JIT registration. One binary; installs as a user systemd service.
 
+## Fleet capacity standard — no excuses, prove per-slot execution
+The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16 on jeff-ubuntu) + **6 Mac** (ez-mac-runner-b-1..6) = **22 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 22/22 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
+- **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returns TRUNCATED/partial data — the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
+- `./doctor.sh` enforces this with a per-slot executing gate. Run it; fix any DOWN (no container) or IDLE (container up, no Runner.Worker) slot before declaring the fleet healthy.
+- Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 16). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
+
 ## Key files
 - `src/docker_backend.rs` — core runner lifecycle (slot allocation, container management)
 - `src/github.rs` — GitHub API calls (JIT config, runner registration, conflict resolution)
