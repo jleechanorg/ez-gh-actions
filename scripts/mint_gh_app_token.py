@@ -56,6 +56,19 @@ def response_error(response: requests.Response) -> str:
     return response.reason
 
 
+def post_with_retry(url: str, headers: dict[str, str], timeout: int) -> requests.Response:
+    try:
+        resp = requests.post(url, headers=headers, timeout=timeout)
+        if resp.status_code < 500:
+            return resp
+    except requests.RequestException:
+        pass
+
+    # Retry exactly once on transient failure (exception or 5xx)
+    time.sleep(2.5)
+    return requests.post(url, headers=headers, timeout=timeout)
+
+
 def main() -> int:
     args = parse_args()
     key_path = Path(args.key_path).expanduser()
@@ -87,7 +100,7 @@ def main() -> int:
     }
 
     try:
-        response = requests.post(url, headers=headers, timeout=30)
+        response = post_with_retry(url, headers=headers, timeout=30)
     except requests.RequestException as exc:
         fail(f"GitHub App token request failed: {exc}")
 
