@@ -171,13 +171,18 @@ esac
 # ── Clean up legacy com.worldarchitect.* launchd agents ───────────────────────
 if [ "$(uname -s)" = "Darwin" ]; then
   info "Cleaning up legacy worldarchitect.ai launchd agents..."
+  # org.jleechanorg.ezgha-queue-reaper-stopgap: 15-min interim reaper from the
+  # 2026-07-07 queue-zombie incident, superseded by the repo-declared 6h
+  # ezgha-queue-reaper unit installed below (bead jleechan-1aq — the drift
+  # between the live 900s stopgap and the declared 21600s job).
   for label in \
     com.worldarchitect.org-runners \
     com.worldarchitect.mac-runner-disk-cleanup \
     com.worldarchitect.mac-runner-health \
     com.worldarchitect.ubuntu-runner-health \
     com.worldarchitect.runner-capacity-failover \
-    com.worldarchitect.cache-integrity; do
+    com.worldarchitect.cache-integrity \
+    org.jleechanorg.ezgha-queue-reaper-stopgap; do
     plist="${HOME}/Library/LaunchAgents/${label}.plist"
     if launchctl list 2>/dev/null | grep -q "${label}"; then
       launchctl unload "${plist}" 2>/dev/null || true

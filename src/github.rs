@@ -173,6 +173,111 @@ fn apply_gh_token_file(cmd: &mut Command) {
     }
 }
 
+/// True when a failed gh invocation indicates the installation token itself
+/// is invalid — gh prints `gh: Bad credentials (HTTP 401)`. Deliberately
+/// narrower than matching "401": a 403 "Resource not accessible by
+/// integration" (permission scope) or a rate-limit 403/429 must NOT count,
+/// only a dead/rotated/revoked token.
+fn is_bad_credentials_response(stdout: &str, stderr: &str) -> bool {
+    let lower = format!("{stdout} {stderr}").to_ascii_lowercase();
+    lower.contains("bad credentials")
+}
+
+/// Minimum spacing between event-driven token-refresh kicks. A fleet-wide
+/// 401 storm (each serve tick makes several gh calls) must collapse into a
+/// single supervisor kick; the refresh job itself finishes in seconds.
+const TOKEN_REFRESH_TRIGGER_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Pure cooldown predicate for [`maybe_trigger_token_refresh`], split out so
+/// the gating logic is unit-testable without touching process-global state.
+fn token_refresh_due(last_epoch_secs: u64, now_epoch_secs: u64) -> bool {
+    now_epoch_secs.saturating_sub(last_epoch_secs) >= TOKEN_REFRESH_TRIGGER_COOLDOWN.as_secs()
+}
+
+/// Event-driven complement to the 45-minute token-refresh timer (bead
+/// jleechan-wzk): when gh reports 401 Bad credentials — e.g. after an
+/// `app_private_key.pem` rotation invalidates every token minted with the
+/// old key, as in the 2026-07-08 fleet-dark incident — kick the
+/// already-installed refresh job (launchd on macOS, systemd --user on
+/// Linux) so the token file is re-minted within seconds instead of waiting
+/// out the timer. The daemon re-reads the token file on every gh call
+/// (`apply_gh_token_file`), so no restart is needed once the file is fresh;
+/// the next serve tick recovers naturally. Fire-and-forget + cooldown: a
+/// failed kick only means waiting for the timer, which was the old behavior.
+fn maybe_trigger_token_refresh() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_TRIGGER_EPOCH: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_TRIGGER_EPOCH.load(Ordering::Relaxed);
+    if !token_refresh_due(last, now) {
+        return;
+    }
+    if LAST_TRIGGER_EPOCH
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // another thread won the race; one kick is enough
+    }
+    #[cfg(test)]
+    {
+        // Never shell out to the host supervisor from unit tests.
+        eprintln!("(test) token-refresh trigger suppressed");
+    }
+    #[cfg(not(test))]
+    spawn_token_refresh_job();
+}
+
+#[cfg(not(test))]
+fn spawn_token_refresh_job() {
+    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        (
+            "/bin/sh",
+            &[
+                "-c",
+                "launchctl kickstart \"gui/$(id -u)/org.jleechanorg.ezgha-token-refresh\"",
+            ],
+        )
+    } else {
+        (
+            "systemctl",
+            &[
+                "--user",
+                "start",
+                "--no-block",
+                "ezgha-token-refresh.service",
+            ],
+        )
+    };
+    match Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap on a detached thread so the short-lived supervisor call
+            // never accumulates zombies under the long-lived daemon.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            eprintln!(
+                "warning: gh returned 401 Bad credentials — kicked the token-refresh job to \
+                 re-mint the installation token now (instead of waiting for the next timer tick)"
+            );
+        }
+        Err(err) => {
+            eprintln!(
+                "warning: gh returned 401 Bad credentials and the token-refresh kick failed: \
+                 {err}; the token will refresh on the next timer tick"
+            );
+        }
+    }
+}
+
 fn extract_retry_after_secs(text: &str) -> Option<u64> {
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
@@ -437,6 +542,16 @@ fn run_gh(mut cmd: Command) -> Result<std::process::Output> {
         .unwrap_or_default();
 
     let status = child.wait().context("wait on gh child")?;
+    if !status.success()
+        && is_bad_credentials_response(
+            &String::from_utf8_lossy(&stdout),
+            &String::from_utf8_lossy(&stderr),
+        )
+    {
+        // Dead/rotated installation token: kick the refresh job now rather
+        // than staying 401-dark until the next 45-min timer tick (wzk).
+        maybe_trigger_token_refresh();
+    }
     Ok(std::process::Output {
         status,
         stdout,
@@ -933,6 +1048,58 @@ mod tests {
             scope: Scope::Repo,
             target: "jleechanorg/ez-gh-actions".into(),
         }
+    }
+
+    #[test]
+    fn bad_credentials_detected_in_gh_stderr() {
+        // Exact shape gh prints for a dead/rotated installation token
+        // (observed verbatim in the 2026-07-08 fleet-dark incident).
+        assert!(is_bad_credentials_response(
+            "",
+            "gh: Bad credentials (HTTP 401)"
+        ));
+        // Also present in the JSON body on stdout for `gh api` calls.
+        assert!(is_bad_credentials_response(
+            r#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rest","status":"401"}"#,
+            ""
+        ));
+    }
+
+    #[test]
+    fn bad_credentials_not_confused_with_permission_or_rate_limit() {
+        // 403 permission-scope failure from a valid installation token
+        // (e.g. installation token probing /user) must NOT trigger a re-mint.
+        assert!(!is_bad_credentials_response(
+            r#"{"message":"Resource not accessible by integration"}"#,
+            "gh: Resource not accessible by integration (HTTP 403)"
+        ));
+        // Rate limits are handled by classify_retry_delay, not the token path.
+        assert!(!is_bad_credentials_response(
+            "",
+            "gh: You have exceeded a secondary rate limit. Please retry your request again later. (HTTP 403)"
+        ));
+        // A clean success obviously must not trigger.
+        assert!(!is_bad_credentials_response(r#"{"total_count":22}"#, ""));
+    }
+
+    #[test]
+    fn token_refresh_cooldown_gates_repeat_triggers() {
+        // First-ever trigger (last=0) is always due.
+        assert!(token_refresh_due(0, 1_783_600_000));
+        // Within the cooldown window: suppressed.
+        let now = 1_783_600_000_u64;
+        assert!(!token_refresh_due(now, now + 1));
+        assert!(!token_refresh_due(
+            now,
+            now + TOKEN_REFRESH_TRIGGER_COOLDOWN.as_secs() - 1
+        ));
+        // At/after the window: due again.
+        assert!(token_refresh_due(
+            now,
+            now + TOKEN_REFRESH_TRIGGER_COOLDOWN.as_secs()
+        ));
+        // Clock skew (now < last) must not underflow or spuriously fire.
+        assert!(!token_refresh_due(now, now - 10));
     }
 
     fn org_cfg() -> GithubConfig {

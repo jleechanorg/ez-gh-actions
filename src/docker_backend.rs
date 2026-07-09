@@ -1679,28 +1679,29 @@ mod tests {
         let attempts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let attempts_for_closure = std::sync::Arc::clone(&attempts);
-        let starter = move |_cfg: &Config, _backend: Backend, slot: u32| -> Result<(String, String)> {
-            *attempts_for_closure
-                .lock()
-                .unwrap()
-                .entry(slot)
-                .or_insert(0) += 1;
-            if slot == BROKEN_SLOT {
-                // Mirror the REAL failure path in
-                // `start_one_with_generate_at_slot`: on error, it releases the
-                // slot's reservation (`release_slot_for`) so the slot becomes
-                // free again. That release is exactly what makes the slot
-                // re-pickable as "the lowest free slot" on the very next
-                // `next_slot`/`next_slot_excluding` call — the mechanism this
-                // test must exercise to prove the exclusion set (not just
-                // "the slot happens to still be reserved") is what prevents
-                // the retry-pileup bug.
-                release_slot(BROKEN_SLOT).unwrap();
-                bail!("simulated permanent JIT-generation failure for slot {slot}");
-            }
-            let name = format!("ez-org-runner-{slot}");
-            Ok((format!("container-{name}"), name))
-        };
+        let starter =
+            move |_cfg: &Config, _backend: Backend, slot: u32| -> Result<(String, String)> {
+                *attempts_for_closure
+                    .lock()
+                    .unwrap()
+                    .entry(slot)
+                    .or_insert(0) += 1;
+                if slot == BROKEN_SLOT {
+                    // Mirror the REAL failure path in
+                    // `start_one_with_generate_at_slot`: on error, it releases the
+                    // slot's reservation (`release_slot_for`) so the slot becomes
+                    // free again. That release is exactly what makes the slot
+                    // re-pickable as "the lowest free slot" on the very next
+                    // `next_slot`/`next_slot_excluding` call — the mechanism this
+                    // test must exercise to prove the exclusion set (not just
+                    // "the slot happens to still be reserved") is what prevents
+                    // the retry-pileup bug.
+                    release_slot(BROKEN_SLOT).unwrap();
+                    bail!("simulated permanent JIT-generation failure for slot {slot}");
+                }
+                let name = format!("ez-org-runner-{slot}");
+                Ok((format!("container-{name}"), name))
+            };
 
         let started = start_missing_runners_with_starter(&cfg, Backend::Docker, 5, starter)
             .expect("4 of 5 slots succeed, so overall call must return Ok with those 4");
