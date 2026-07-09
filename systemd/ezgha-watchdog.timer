@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ezgha fleet watchdog every 2 minutes (enforce configured runner count)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=120s
+Persistent=true
+Unit=ezgha-watchdog.service
+
+[Install]
+WantedBy=timers.target

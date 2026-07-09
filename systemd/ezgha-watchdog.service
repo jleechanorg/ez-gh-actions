@@ -1,0 +1,11 @@
+[Unit]
+Description=ezgha fleet size watchdog (enforce configured runner count, N-miss threshold + load gate + cooldown)
+After=network.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=@REPO_PATH@/scripts/ezgha-fleet-watchdog.sh --host linux
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
+StandardOutput=append:%h/.local/state/ezgha/watchdog.log
+StandardError=append:%h/.local/state/ezgha/watchdog.log
