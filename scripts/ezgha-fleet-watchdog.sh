@@ -46,6 +46,50 @@
 #      The old external script used `tee -a` INSIDE `log()` while the
 #      systemd unit ALSO captured stdout via StandardOutput=append to the
 #      SAME file — every line was written twice.
+#   5. State freshness — miss_count and last_restart state files are
+#      treated as stale (reset to 0 on read) if their mtime is older than
+#      $EZGHA_WATCHDOG_STATE_STALE_SECONDS (default 480s / 8min — 4x the
+#      systemd timer's 120s tick interval, tolerating up to 3 skipped/slow
+#      ticks; inside the 6-10min band that keeps genuinely-consecutive
+#      misses in a live run from ever being mistaken for stale). ONE
+#      mtime-age check, applied uniformly by both get_miss_count() and
+#      get_last_restart(), covers two distinct failure modes that would
+#      otherwise need separate handling:
+#        a) REBOOT-STALE-STATE — state files are plain files under
+#           ~/.local/state, not tmpfs, so they persist across a host
+#           reboot. The systemd timer fires 30s after boot (OnBootSec=30s).
+#           A stale miss_count>=threshold left over from before a reboot
+#           could otherwise trigger an immediate restart of a daemon that
+#           hasn't finished starting; a stale-but-recent last_restart could
+#           wrongly block a genuinely-needed post-reboot restart for the
+#           full cooldown window.
+#        b) General staleness — e.g. the watchdog itself was stopped for an
+#           extended period, or a timer tick was skipped/delayed (system
+#           load, or a hung probe before the C#2 timeout fix landed),
+#           leaving old counters to linger.
+#      Because the check applies on READ, a stale miss_count is normalized
+#      to 0 BEFORE the current tick's increment/comparison in
+#      evaluate_host() — a stale count can never combine with a fresh miss
+#      to reach the threshold early.
+#   6. Host-mismatch guard (both hosts) — check_mac() and check_linux()
+#      each skip (log only) when invoked bare (no explicit --host filter)
+#      on a host that doesn't match, rather than silently reading/acting on
+#      the OTHER host's state via ssh. Without this, a bare invocation on
+#      the Mac would run check_linux() over ssh using the Mac's own local
+#      state files — a second, uncoordinated watchdog instance racing
+#      against jeff-ubuntu's own systemd-timer-driven instance (separate
+#      miss counters, separate cooldowns) against the SAME remote daemon.
+#      Use `--host mac` / `--host linux` explicitly to force a cross-host
+#      check.
+#   7. Probe timeouts — every ezgha status probe and ssh invocation is
+#      wrapped in `timeout 30 ...`. A hung probe (or a hung remote command —
+#      ssh's own -o ConnectTimeout=5 only bounds the TCP handshake, not a
+#      stuck remote process) would otherwise wedge this script's
+#      `Type=oneshot` systemd unit indefinitely; since OnUnitActiveSec never
+#      re-fires while the unit is still running, a single hang would
+#      silently disable the watchdog exactly when the fleet needs it.
+#      systemd/ezgha-watchdog.service also sets TimeoutStartSec=90 as an
+#      independent backstop.
 #
 # Usage:
 #   ./ezgha-fleet-watchdog.sh                  # check both hosts, fix if needed
@@ -57,17 +101,18 @@
 #   0 = both checked hosts at or above configured count (or a restart fired)
 #   1 = one or more hosts below count and no restart was performed this tick
 #       (waiting for miss threshold, in cooldown, load gate tripped, or dry-run)
-#   2 = supervisor not installed / state unreadable on one or more hosts
+#   2 = supervisor not installed / state unreadable on one or more hosts /
+#       bad CLI arguments
 #
 # Env overrides (mainly for testing):
-#   EZGHA_BIN                     ezgha binary path (default: $HOME/.cargo/bin/ezgha)
-#   EZGHA_WATCHDOG_STATE_DIR      state dir (default: $HOME/.local/state/ezgha/watchdog)
-#   EZGHA_WATCHDOG_MISS_THRESHOLD consecutive misses before restart (default: 3)
-#   EZGHA_WATCHDOG_LOAD_THRESHOLD 1-min load ceiling for restart (default: 12)
+#   EZGHA_BIN                       ezgha binary path (default: $HOME/.cargo/bin/ezgha)
+#   EZGHA_WATCHDOG_STATE_DIR        state dir (default: $HOME/.local/state/ezgha/watchdog)
+#   EZGHA_WATCHDOG_MISS_THRESHOLD   consecutive misses before restart (default: 3)
+#   EZGHA_WATCHDOG_LOAD_THRESHOLD   1-min load ceiling for restart (default: 12)
 #   EZGHA_WATCHDOG_COOLDOWN_SECONDS minimum seconds between restarts per host (default: 1800)
-#   EZGHA_WATCHDOG_MISS_STALE_SECONDS discard miss_count older than this many
-#                                  seconds, independent of reboot detection
-#                                  (default: 480 = 4x the 120s timer tick)
+#   EZGHA_WATCHDOG_STATE_STALE_SECONDS
+#                                   max state-file age before miss_count/last_restart
+#                                   are treated as stale and reset to 0 (default: 480)
 
 set -uo pipefail
 
@@ -80,6 +125,9 @@ STATE_DIR="${EZGHA_WATCHDOG_STATE_DIR:-$HOME/.local/state/ezgha/watchdog}"
 MISS_THRESHOLD="${EZGHA_WATCHDOG_MISS_THRESHOLD:-3}"
 LOAD_THRESHOLD="${EZGHA_WATCHDOG_LOAD_THRESHOLD:-12}"
 COOLDOWN_SECONDS="${EZGHA_WATCHDOG_COOLDOWN_SECONDS:-1800}"
+# See guardrail 5 in the header comment above for the full rationale on this
+# default (4x the 120s timer tick interval, inside the 6-10min band).
+STATE_STALE_SECONDS="${EZGHA_WATCHDOG_STATE_STALE_SECONDS:-480}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -91,7 +139,7 @@ while [[ $# -gt 0 ]]; do
       HOST_FILTER="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,70p' "$0"
+      sed -n '2,115p' "$0"
       exit 0
       ;;
     *) shift ;;
@@ -102,62 +150,39 @@ log() { echo "[$TS] $*"; }
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
-boot_time() {
-  if [[ -n "${EZGHA_WATCHDOG_BOOT_TIME_OVERRIDE:-}" ]]; then
-    echo "$EZGHA_WATCHDOG_BOOT_TIME_OVERRIDE"
-    return
+# read_fresh_state prints the value stored in state file $1, unless the
+# file's mtime is older than $STATE_STALE_SECONDS, in which case it is
+# treated as stale/absent and "0" is printed instead (guardrail 5). Used by
+# BOTH get_miss_count() and get_last_restart() so a single age check covers
+# the reboot-stale-state scenario and general (non-reboot) staleness alike
+# — there is deliberately no separate boot-time-comparison mechanism; an
+# earlier version of this fix used one, but a plain mtime-age check
+# subsumes it (a reboot is just one way a state file's mtime can predate
+# "now" by more than the staleness window) while being simpler and
+# portable without any OS-specific boot-time lookup. Fails safe: missing
+# file -> "0" (unchanged base case); unreadable mtime -> NOT treated as
+# stale (falls through to the file's stored value) rather than crashing or
+# guessing.
+read_fresh_state() { # $1=state file path -> stored value, or 0 if missing/stale
+  local file="$1"
+  [[ -f "$file" ]] || { echo 0; return; }
+
+  local mtime
+  mtime="$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || true)"
+  if [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    local now
+    now="$(date +%s)"
+    if (( now - mtime > STATE_STALE_SECONDS )); then
+      echo 0
+      return
+    fi
   fi
 
-  if [[ "$(uname -s)" == "Linux" ]]; then
-    local bt=""
-    if [[ -f /proc/stat ]]; then
-      bt=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null || true)
-    fi
-    if [[ -n "$bt" && "$bt" =~ ^[0-9]+$ ]]; then
-      echo "$bt"
-    else
-      date -d "$(uptime -s)" +%s 2>/dev/null || echo 0
-    fi
-  else
-    # macOS: "{ sec = 1735689600, usec = 0 } ..."
-    local bt=""
-    bt=$(sysctl -n kern.boottime 2>/dev/null | sed -En 's/.*sec = ([0-9]+).*/\1/p' || true)
-    if [[ -n "$bt" && "$bt" =~ ^[0-9]+$ ]]; then
-      echo "$bt"
-    else
-      echo 0
-    fi
-  fi
+  cat "$file" 2>/dev/null || echo 0
 }
 
-# Tick-gap staleness threshold for get_miss_count(), in seconds. This is
-# ADDITIONAL to (not a replacement for) the boot_time()-based reboot guard
-# below — it fires even WITHOUT a reboot, e.g. when the systemd timer itself
-# has a gap between firings (delayed by system load, or a single tick
-# hanging without a C#2-style timeout). The shipped timer's
-# OnUnitActiveSec is 120s (systemd/ezgha-watchdog.timer); 480s is 4x that
-# interval, i.e. tolerates up to 3 fully-skipped ticks (360s) plus one
-# tick's worth of slop for the probe/restart work itself, before treating a
-# leftover miss_count as too old to combine with a fresh miss.
-MISS_COUNT_STALE_SECONDS="${EZGHA_WATCHDOG_MISS_STALE_SECONDS:-480}"
-
 get_miss_count() { # $1=host
-  local file="$STATE_DIR/$1.miss_count"
-  if [[ -f "$file" ]]; then
-    local mtime bt now
-    mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
-    bt=$(boot_time)
-    if [[ "$bt" != "0" && "$mtime" != "0" && "$mtime" -lt "$bt" ]]; then
-      echo 0
-      return
-    fi
-    now=$(date +%s)
-    if [[ "$mtime" != "0" && "$now" -ge "$mtime" && $((now - mtime)) -ge "$MISS_COUNT_STALE_SECONDS" ]]; then
-      echo 0
-      return
-    fi
-  fi
-  cat "$file" 2>/dev/null || echo 0
+  read_fresh_state "$STATE_DIR/$1.miss_count"
 }
 
 set_miss_count() { # $1=host $2=count
@@ -166,17 +191,7 @@ set_miss_count() { # $1=host $2=count
 }
 
 get_last_restart() { # $1=host -> epoch seconds, 0 if never
-  local file="$STATE_DIR/$1.last_restart"
-  if [[ -f "$file" ]]; then
-    local mtime bt
-    mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
-    bt=$(boot_time)
-    if [[ "$bt" != "0" && "$mtime" != "0" && "$mtime" -lt "$bt" ]]; then
-      echo 0
-      return
-    fi
-  fi
-  cat "$file" 2>/dev/null || echo 0
+  read_fresh_state "$STATE_DIR/$1.last_restart"
 }
 
 set_last_restart() { # $1=host $2=epoch
