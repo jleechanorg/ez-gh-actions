@@ -287,7 +287,9 @@ fi
 # validity; explicitly override GH_TOKEN for this one call so it tests what
 # section 4b claims to test.
 if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
-  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | head -1 | awk '{print $2}')
+  # awk NR==1 (no exit) consumes gh's full output — `| head -1` here made gh
+  # take SIGPIPE under pipefail and killed the whole script with exit 141.
+  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}')
   if [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
     ok "gh_token live-check: 200 against orgs/$ORG/actions/runners (mtime freshness confirmed by a real call, not just a clock)"
   else
@@ -538,108 +540,177 @@ EXPLICIT_WORK_HOST="${EXPLICIT_WORK_HOST:-macbook}"
 # implementation joined on `.runner_id` against run objects, which does not
 # exist, so the join silently never matched and every EXECUTING slot fell
 # through to the "no run mapped" placeholder regardless of real activity.
-# We enumerate in-progress runs on the repos our fleet actually serves, then
-# each run's jobs, and index by runner_name so EXECUTING slots get real job
-# name + repo + elapsed + run URL. The set +e / set -e sandwich prevents
-# `set -euo pipefail` from killing the script on a transiently-empty result.
+# We enumerate runs with status in_progress AND queued (queued runs can hold
+# in-progress jobs and vice versa) on the repos our fleet actually serves,
+# then each fresh run's jobs, into ONE temp-file job map indexed by
+# runner_name — joined per-slot below, never one API call per slot. The
+# set +e / set -e sandwich prevents `set -euo pipefail` from killing the
+# script on a transiently-empty result.
 EXPLICIT_WORK_REPOS="${EXPLICIT_WORK_REPOS:-jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions}"
-build_runner_job_index() {
-  local repo run_ids rid runs_json jobs_json
-  for repo in $EXPLICIT_WORK_REPOS; do
-    runs_json=$(gh api "repos/$repo/actions/runs?status=in_progress&per_page=50" 2>/dev/null) || continue
-    run_ids=$(printf '%s' "$runs_json" | jq -r '.workflow_runs[]?.id // empty' 2>/dev/null)
-    for rid in $run_ids; do
-      jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || continue
-      printf '%s' "$jobs_json" | jq -c --arg repo "$repo" \
-        '.jobs[]? | select(.status=="in_progress") | {runner_name, job_name: .name, repo: $repo, html_url, started_at}' 2>/dev/null
-    done
-  done
-}
-set +e
-RUNNER_JOB_INDEX_JSON=$(build_runner_job_index | jq -s '.' 2>/dev/null)
-set -e
-[ -z "$RUNNER_JOB_INDEX_JSON" ] && RUNNER_JOB_INDEX_JSON='[]'
-job_evidence_for_runner() {
-  # Prints "job=<name> repo=<repo> elapsed=<X>m url=<url>" or empty if this
-  # runner has no matching in-progress job in the index right now.
-  local name="$1" rec job_name repo html_url started_at elapsed_min
-  rec=$(printf '%s' "$RUNNER_JOB_INDEX_JSON" | jq -c --arg n "$name" '.[] | select(.runner_name==$n)' 2>/dev/null | head -1)
-  [ -z "$rec" ] && return 0
-  job_name=$(printf '%s' "$rec" | jq -r '.job_name')
-  repo=$(printf '%s' "$rec" | jq -r '.repo')
-  html_url=$(printf '%s' "$rec" | jq -r '.html_url')
-  started_at=$(printf '%s' "$rec" | jq -r '.started_at')
-  elapsed_min=$(python3 -c "
-import datetime
+SECTION10_DOWN_RESAMPLE_SECONDS="${SECTION10_DOWN_RESAMPLE_SECONDS:-25}"
+RUNNER_JOB_INDEX_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-doctor-jobmap.XXXXXX" 2>/dev/null || echo "/tmp/ezgha-doctor-jobmap.$$")
+trap 'rm -f "$RUNNER_JOB_INDEX_FILE"' EXIT
+
+iso_elapsed_min() {
+  # Minutes elapsed since an ISO-8601 timestamp ("?" on parse failure).
+  python3 -c "
+import sys, datetime
 try:
-    s = datetime.datetime.fromisoformat('$started_at'.replace('Z', '+00:00'))
+    s = datetime.datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00'))
     now = datetime.datetime.now(datetime.timezone.utc)
     print(f'{(now - s).total_seconds() / 60:.1f}')
 except Exception:
     print('?')
-" 2>/dev/null)
-  printf 'job=%s repo=%s elapsed=%sm url=%s' "$job_name" "$repo" "${elapsed_min:-?}" "$html_url"
+" "$1" 2>/dev/null
 }
+
+build_runner_job_index() {
+  # Emits one JSON object per queued/in-progress job across all
+  # EXPLICIT_WORK_REPOS. Fresh-only: runs older than STALE_HOURS (section
+  # 8's freshness rule, default 8h) are queue zombies, not live work —
+  # skipping them ALSO bounds the per-run jobs-API fan-out.
+  local repo status runs_json jobs_json rid run_url fresh_cutoff
+  if [ "$PLATFORM" = "macos" ]; then
+    fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  else
+    fresh_cutoff=$(date -u -d "${STALE_HOURS:-8} hours ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  fi
+  for repo in $EXPLICIT_WORK_REPOS; do
+    for status in in_progress queued; do
+      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || continue
+      while IFS=$'\t' read -r rid run_url; do
+        [ -z "$rid" ] && continue
+        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || continue
+        printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
+          '.jobs[]? | select(.status=="in_progress" or .status=="queued")
+           | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
+      done < <(printf '%s' "$runs_json" | jq -r --arg cutoff "${fresh_cutoff:-}" \
+        '.workflow_runs[]? | select($cutoff == "" or .created_at > $cutoff) | [.id, .html_url] | @tsv' 2>/dev/null)
+    done
+  done
+}
+set +e
+build_runner_job_index | jq -s 'unique_by(.html_url)' > "$RUNNER_JOB_INDEX_FILE" 2>/dev/null
+set -e
+[ -s "$RUNNER_JOB_INDEX_FILE" ] || echo '[]' > "$RUNNER_JOB_INDEX_FILE"
+
+# Job-level queue counts for the verdict line — computed from the SAME
+# single fetch above (fresh-only), never a second API sweep. Section 8's
+# QUEUE_* variables are run-level and single-repo; these are job-level
+# across every repo the fleet serves.
+set +e
+JOBLEVEL_QUEUED_COUNT=$(jq '[.[] | select(.status=="queued")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_INPROG_COUNT=$(jq '[.[] | select(.status=="in_progress")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_OLDEST_QUEUED_AT=$(jq -r '[.[] | select(.status=="queued")] | sort_by(.created_at) | first | .created_at // empty' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+set -e
+JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
+JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
+JOBLEVEL_OLDEST_QUEUED_MIN="0"
+[ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ] && JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT")
+info "job map: ${JOBLEVEL_INPROG_COUNT} in-progress + ${JOBLEVEL_QUEUED_COUNT} queued fresh job(s) across: $EXPLICIT_WORK_REPOS"
+
+job_evidence_for_runner() {
+  # Prints "<job name> | started <ISO time> (<elapsed>m ago) | <run html_url>"
+  # or nothing if no in-progress job in the map matches this runner_name.
+  local name="$1" rec job_name run_url started_at elapsed_min
+  rec=$(jq -c --arg n "$name" 'first(.[] | select(.runner_name==$n and .status=="in_progress")) // empty' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+  [ -z "$rec" ] && return 0
+  job_name=$(printf '%s' "$rec" | jq -r '.job_name')
+  run_url=$(printf '%s' "$rec" | jq -r '.run_url // .html_url')
+  started_at=$(printf '%s' "$rec" | jq -r '.started_at // .created_at')
+  elapsed_min=$(iso_elapsed_min "$started_at")
+  printf '%s | started %s (%sm ago) | %s' "$job_name" "$started_at" "${elapsed_min:-?}" "$run_url"
+}
+probe_slot_state() {
+  # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1"
+  # (localhost = local docker, anything else = ssh).
+  local host="$1" name="$2" running work
+  if [ "$host" = "localhost" ]; then
+    running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
+  else
+    running=$(ssh -o ConnectTimeout=4 "$host" "docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
+  fi
+  if [ "$running" != "true" ]; then
+    echo "DOWN"
+    return
+  fi
+  if [ "$host" = "localhost" ]; then
+    set +e; docker top "$name" -eo pid,comm 2>/dev/null | grep -qw Worker; work=$?; set -e
+  else
+    set +e; ssh -o ConnectTimeout=4 "$host" "docker top '$name' -eo pid,comm 2>/dev/null | grep -qw Worker" >/dev/null 2>&1; work=$?; set -e
+  fi
+  if [ "$work" -eq 0 ]; then echo "EXECUTING"; else echo "IDLE"; fi
+}
+
 list_slot_work() {
+  # Aligned table, one row per configured slot:
+  #   <slot>  <STATE>  <job name> | started <ISO time> (<elapsed>m ago) | <run html_url>
+  # Two passes so the single 25s DOWN re-sample (bead ez-gh-actions-b895)
+  # happens ONCE per host, and rows still print in slot order: pass 1
+  # classifies every slot; first-pass DOWN candidates are re-probed after
+  # SECTION10_DOWN_RESAMPLE_SECONDS — a slot that is back Up on the second
+  # sample is CYCLING (normal ephemeral respawn, NOT a critical defect);
+  # only a DOWN that persists both samples prints as DOWN. Pass 2 renders.
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
   printf "\n  %s (%d configured):\n" "$label" "$count"
-  local ok=0 idl=0 dn=0 busy=0
+  local -a slot_state=()
+  local i name jobline has_down=0
   for i in $(seq 1 "$count"); do
-    local name="${prefix}-${i}"
-    local running work jobline
-    if [ "$host" = "localhost" ]; then
-      running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
-    else
-      running=$(ssh -o ConnectTimeout=4 "$host" "docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
-    fi
-    if [ "$running" != "true" ]; then
-      # Display defers to section 9's PERSISTENT verdict for local slots so
-      # sections 9 and 10 can never contradict each other on DOWN (observed
-      # 2026-07-09: c-8 shown EXECUTING in one section, DOWN in the other,
-      # from independent probes seconds apart on a recycling fleet).
-      if [ "$host" = "localhost" ] && ! printf ' %s ' "${DOWN_SLOTS[*]:-}" | grep -q " $name "; then
-        printf "    %-22s %s\n" "$name" "RECYCLING — blinked between samples (not a defect per 2-sample rule; section 9 verdict governs)"
-      else
-        printf "    %-22s %s\n" "$name" "DOWN — no container"
-        dn=$((dn+1))
-      fi
-      continue
-    fi
-    if [ "$host" = "localhost" ]; then
-      set +e; docker top "$name" -eo pid,comm 2>/dev/null | grep -qw Worker; work=$?; set -e
-    else
-      set +e; ssh -o ConnectTimeout=4 "$host" "docker top '$name' -eo pid,comm 2>/dev/null | grep -qw Worker" >/dev/null 2>&1; work=$?; set -e
-    fi
-    if [ "$work" -eq 0 ]; then
-      busy=$((busy+1))
-      ok=$((ok+1))
-      set +e
-      jobline=$(job_evidence_for_runner "$name")
-      set -e
-      if [ -z "$jobline" ]; then
-        # Runner.Worker process is running (local ground truth) but no
-        # in-progress job in the index matched this runner_name yet — a
-        # race window (job just dispatched, GH hasn't recorded it) or the
-        # job is on a repo not in EXPLICIT_WORK_REPOS. Never hide EXECUTING
-        # behind this; the process is the ground truth.
-        jobline="(no in-progress job matched runner_name=$name in $EXPLICIT_WORK_REPOS yet — likely a 2-8s dispatch race; Runner.Worker pid is the ground truth)"
-      fi
-      printf "    %-22s EXECUTING → %s\n" "$name" "$jobline"
-    else
-      idl=$((idl+1))
-      # 4-state model: IDLE-OK (nothing queued, or queued but under the
-      # sustained-starvation threshold) vs IDLE-STARVED (queue has been
-      # non-empty for >= IDLE_STARVED_THRESHOLD_MIN minutes — see section 9).
-      if [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
-        printf "    %-22s IDLE-STARVED — %d fresh queued jobs, oldest waiting %sm >= %sm threshold\n" "$name" "$QUEUE_QUEUED_FRESH" "$QUEUE_OLDEST_FRESH_AGE_MIN" "$IDLE_STARVED_THRESHOLD_MIN"
-      elif [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
-        printf "    %-22s IDLE-OK — %d job(s) queued %sm < %sm threshold (not yet starved)\n" "$name" "$QUEUE_QUEUED_FRESH" "$QUEUE_OLDEST_FRESH_AGE_MIN" "$IDLE_STARVED_THRESHOLD_MIN"
-      else
-        printf "    %-22s IDLE-OK — nothing queued\n" "$name"
-      fi
-    fi
+    slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+    [ "${slot_state[i]}" = "DOWN" ] && has_down=1
   done
-  printf "  %s totals: %d executing, %d idle, %d down  (of %d configured)\n" "$label" "$busy" "$idl" "$dn" "$count"
+  if [ "$has_down" -eq 1 ]; then
+    info "$label: first-pass DOWN candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895)"
+    sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
+    for i in $(seq 1 "$count"); do
+      [ "${slot_state[i]}" != "DOWN" ] && continue
+      case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+        DOWN) : ;;                                # persisted both samples — stays DOWN
+        *)    slot_state[i]="CYCLING" ;;          # back Up — normal respawn, not a defect
+      esac
+    done
+  fi
+  local exec_n=0 idl=0 dn=0 cyc=0
+  printf "    %-22s %-13s %s\n" "SLOT" "STATE" "EVIDENCE"
+  for i in $(seq 1 "$count"); do
+    name="${prefix}-${i}"
+    case "${slot_state[i]:-DOWN}" in
+      EXECUTING)
+        exec_n=$((exec_n+1))
+        set +e
+        jobline=$(job_evidence_for_runner "$name")
+        set -e
+        if [ -z "$jobline" ]; then
+          # Runner.Worker process is running (local ground truth) but no
+          # in-progress job in the map matched this runner_name yet.
+          jobline="picked up in last ~60s (job-map lag or API truncation; Runner.Worker pid is ground truth)"
+        fi
+        printf "    %-22s %-13s %s\n" "$name" "EXECUTING" "$jobline"
+        ;;
+      IDLE)
+        idl=$((idl+1))
+        # 4-state model: IDLE-OK (nothing queued, or queued but under the
+        # sustained-starvation threshold) vs IDLE-STARVED (queue has been
+        # non-empty for >= IDLE_STARVED_THRESHOLD_MIN minutes — see section 9).
+        if [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
+          printf "    %-22s %-13s %s\n" "$name" "IDLE-STARVED" "${QUEUE_QUEUED_FRESH} fresh queued jobs, oldest waiting ${QUEUE_OLDEST_FRESH_AGE_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold"
+        elif [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
+          printf "    %-22s %-13s %s\n" "$name" "IDLE-OK" "${QUEUE_QUEUED_FRESH} job(s) queued ${QUEUE_OLDEST_FRESH_AGE_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold (not yet starved)"
+        else
+          printf "    %-22s %-13s %s\n" "$name" "IDLE-OK" "nothing queued"
+        fi
+        ;;
+      CYCLING)
+        cyc=$((cyc+1))
+        printf "    %-22s %-13s %s\n" "$name" "CYCLING" "respawned within one tick (blinked between samples ${SECTION10_DOWN_RESAMPLE_SECONDS}s apart — not a defect; bead ez-gh-actions-b895)"
+        ;;
+      DOWN)
+        dn=$((dn+1))
+        printf "    %-22s %-13s %s\n" "$name" "DOWN" "no container (persisted both samples ${SECTION10_DOWN_RESAMPLE_SECONDS}s apart — critical)"
+        ;;
+    esac
+  done
+  printf "  %s totals: %d executing, %d idle, %d cycling, %d down  (of %d configured)\n" "$label" "$exec_n" "$idl" "$cyc" "$dn" "$count"
 }
 
 # Local fleet — whichever host this script is actually running on (was
@@ -772,6 +843,14 @@ fi
 
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
+# Job-level queue counts (fresh-only, from section 10's single job-map
+# fetch) — printed for BOTH healthy and unhealthy verdicts so the queue
+# state is never hidden behind a green light.
+if [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
+  echo "  queue: ${JOBLEVEL_QUEUED_COUNT} queued job(s) (oldest ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
+else
+  echo "  queue: 0 queued job(s) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
+fi
 CRITICAL=0
 [ "$SERVICE_STATE" != "active" ]            && CRITICAL=$((CRITICAL+1))
 [ "$COLIMA_STATUS" = "Stopped" ]            && CRITICAL=$((CRITICAL+1))
