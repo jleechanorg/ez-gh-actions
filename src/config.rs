@@ -229,6 +229,34 @@ pub struct RunnerConfig {
     /// slot assignment file.
     #[serde(default = "default_runner_name_prefix")]
     pub name_prefix: String,
+    /// Seconds the serve loop sleeps after a SUCCESSFUL ensure_count tick.
+    /// This is the respawn cadence for finished ephemeral slots: a completed
+    /// short job leaves its slot dead for up to `serve_tick_seconds` +
+    /// container-startup (~30s) before the next runner is listening. Lowering
+    /// it raises effective fleet duty cycle at the cost of proportionally
+    /// more GitHub API traffic per hour (each tick lists runners / talks to
+    /// gh) — the 2026-07-09 jeff-ubuntu incident measured ~30-50% duty loss
+    /// at a 60s cadence with short jobs. Clamped to a 5s floor at read time
+    /// so a typo'd 0 cannot hot-loop the daemon against the GitHub API.
+    #[serde(default = "default_serve_tick_seconds")]
+    pub serve_tick_seconds: u64,
+}
+
+impl RunnerConfig {
+    /// The effective post-success serve-loop sleep, with the safety floor
+    /// applied. Use this instead of reading `serve_tick_seconds` directly.
+    pub fn serve_tick(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.serve_tick_seconds.max(MIN_SERVE_TICK_SECONDS))
+    }
+}
+
+/// Floor for `serve_tick_seconds`: below this the serve loop degenerates
+/// into a GitHub-API hot loop (rate-limit pressure was the root cause of the
+/// 2026-07-07 fleet drain).
+pub const MIN_SERVE_TICK_SECONDS: u64 = 5;
+
+fn default_serve_tick_seconds() -> u64 {
+    30
 }
 
 fn default_runner_name_prefix() -> String {
@@ -401,6 +429,7 @@ impl Config {
                 count: 1,
                 image: "ghcr.io/actions/actions-runner:latest".into(),
                 name_prefix: default_runner_name_prefix(),
+                serve_tick_seconds: default_serve_tick_seconds(),
             },
             limits: Limits {
                 memory_mb: mem,
@@ -608,6 +637,48 @@ fn is_owner_repo(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_tick_defaults_to_30s_when_absent() {
+        let raw = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 6
+image = "ezgha-runner:latest"
+[limits]
+memory_mb = 8192
+cpus = 4.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg: Config = toml::from_str(raw).expect("config without serve_tick_seconds parses");
+        assert_eq!(cfg.runner.serve_tick_seconds, 30);
+        assert_eq!(cfg.runner.serve_tick(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn serve_tick_honors_configured_value_and_clamps_floor() {
+        let mut cfg_runner = RunnerConfig {
+            labels: vec!["self-hosted".into()],
+            count: 6,
+            image: "ezgha-runner:latest".into(),
+            name_prefix: default_runner_name_prefix(),
+            serve_tick_seconds: 20,
+        };
+        assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
+        // A typo'd 0 (or anything under the floor) must not hot-loop the
+        // daemon against the GitHub API.
+        cfg_runner.serve_tick_seconds = 0;
+        assert_eq!(
+            cfg_runner.serve_tick(),
+            std::time::Duration::from_secs(MIN_SERVE_TICK_SECONDS)
+        );
+    }
 
     fn fake_platform(mem_mb: u64, cpus: u32) -> Platform {
         Platform {

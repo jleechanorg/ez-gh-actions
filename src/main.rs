@@ -783,7 +783,13 @@ fn main() -> Result<()> {
                         // clock so the threshold counts overall daemon
                         // liveness, not just alert throughput.
                         deadman.record_delivery(Instant::now());
-                        (Duration::from_secs(30), true)
+                        // Respawn cadence: configurable via [runner]
+                        // serve_tick_seconds (default 30, 5s floor) — a
+                        // finished short job leaves its slot dead for up to
+                        // one tick + container startup, so hosts chasing
+                        // duty cycle can lower this (2026-07-09 coordination
+                        // with jeff-ubuntu's 60->20 change).
+                        (cfg.runner.serve_tick(), true)
                     }
                     Err(e) => {
                         ensure_fail_streak += 1;
@@ -808,7 +814,10 @@ fn main() -> Result<()> {
                             }
                             (Duration::from_secs(8), false)
                         } else {
-                            (Duration::from_secs(30), false)
+                            // Failure retry uses the same configured cadence
+                            // as success — the existing 8s fast-path above
+                            // already covers the post-backend-restart case.
+                            (cfg.runner.serve_tick(), false)
                         }
                     }
                 };
