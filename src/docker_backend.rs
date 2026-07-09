@@ -1642,14 +1642,17 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(
             &script,
-            b"#!/usr/bin/env sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
+            b"#!/bin/sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
         )
         .unwrap();
-        std::process::Command::new("chmod")
-            .arg("+x")
-            .arg(&script)
-            .status()
-            .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_readonly(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(&script, perms).unwrap();
         let old_path = env::var("PATH").unwrap_or_default();
         env::set_var("PATH", &temp_dir);
         let err = start_one_with_generate(
