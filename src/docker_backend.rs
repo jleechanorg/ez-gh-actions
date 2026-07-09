@@ -537,11 +537,21 @@ fn release_stale_slots_from_with_containers_for(
             reclaimed += 1;
         } else if let Ok(rid) = id_str.parse::<u64>() {
             if !live_ids.contains(&rid) {
-                // The recorded runner_id is no longer registered on GitHub
-                // (server-side reap, manual removal, or a stale entry from a
-                // prior host). Treat the slot as free.
-                release_slot_for(cfg, slot_n)?;
-                reclaimed += 1;
+                let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
+                if local_container_names
+                    .as_ref()
+                    .is_some_and(|local_names| local_names.contains(&expected_name))
+                {
+                    eprintln!(
+                        "warning: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (treating as in-flight / eventual consistency)"
+                    );
+                } else {
+                    // The recorded runner_id is no longer registered on GitHub
+                    // (server-side reap, manual removal, or a stale entry from a
+                    // prior host) and no local container exists, so reclaim.
+                    release_slot_for(cfg, slot_n)?;
+                    reclaimed += 1;
+                }
             } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 if !runner_prefix.is_empty() && runner.name != expected_name {
@@ -928,6 +938,10 @@ fn start_one_with_generate(
                 return Err(e);
             }
         };
+    // Store the runner_id immediately after JIT success so stale-slot
+    // reconciliation and crash-recovery can see this slot as owned even if the
+    // container never starts.
+    record_slot_runner_id_for(Some(cfg), slot, runner_id)?;
     watchdog::ping();
 
     let mut cmd = Command::new("docker");
@@ -948,20 +962,25 @@ fn start_one_with_generate(
     cmd.arg(&cfg.runner.image);
     cmd.args(["./run.sh", "--jitconfig", &jit]);
 
-    let out = run_docker(cmd, "docker run start_one")?;
+    let out = match run_docker(cmd, "docker run start_one") {
+        Ok(out) => out,
+        Err(err) => {
+            let _ = github::remove_runner(&cfg.github, runner_id);
+            let _ = release_slot_for(Some(cfg), slot);
+            return Err(err);
+        }
+    };
     watchdog::ping();
     if !out.status.success() {
         // The JIT registration exists server-side but no runner will ever
         // connect; clean it up so the repo runner list stays tidy.
         let _ = github::remove_runner(&cfg.github, runner_id);
+        let _ = release_slot_for(Some(cfg), slot);
         bail!(
             "docker run failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    // Record the runner_id now that the container is up so the slot can be
-    // reclaimed if the JIT registration is later removed server-side.
-    record_slot_runner_id_for(Some(cfg), slot, runner_id)?;
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
     Ok((container_id, runner_name))
 }
@@ -1611,6 +1630,72 @@ mod tests {
         assert!(
             assignments.assignments.is_empty(),
             "slot reserved by start_one should be released on JIT failure"
+        );
+    }
+
+    #[test]
+    fn start_one_releases_slot_on_docker_run_failure() {
+        let _env = TestEnv::new("docker_run_failure");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir = env::temp_dir().join("ezgha-docker-fake-run");
+        let script = temp_dir.join("docker");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            &script,
+            b"#!/usr/bin/env sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&script)
+            .status()
+            .unwrap();
+        let old_path = env::var("PATH").unwrap_or_default();
+        env::set_var("PATH", &temp_dir);
+        let err = start_one_with_generate(
+            &cfg,
+            Backend::Docker,
+            |_gh, _name, _labels, _owned| Ok(("jit".into(), 9876)),
+        )
+        .expect_err("start_one should fail when docker run exits non-zero");
+        env::set_var("PATH", old_path);
+        assert!(
+            err.to_string().contains("docker run failed") && err.to_string().contains("simulation"),
+            "docker run failure should be surfaced"
+        );
+        let assignments = read_slot_assignments().unwrap();
+        assert!(
+            assignments.assignments.is_empty(),
+            "slot reserved by start_one should be cleaned up when docker run fails"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_slot_when_runner_id_not_in_live_but_container_exists() {
+        let _env = TestEnv::new("stale_running_container_stay_reserved");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "slot must be kept if container still exists locally despite missing GH registration"
+        );
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(
+            assignments.assignments.get("1").map(String::as_str),
+            Some("4242"),
+            "slot 1 should remain recorded"
         );
     }
 
