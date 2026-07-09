@@ -91,3 +91,9 @@ and never restarts anything, so it is safe to run repeatedly against a live
 host. There is no existing shell-test harness in this repo (tests are
 `cargo test` Rust tests); `shellcheck` is run as the lint gate for this
 script instead — see the PR description for output.
+
+## Future work
+
+- Consider jittered/exponential backoff instead of a flat 30-minute cooldown, to avoid synchronized restart waves if the fleet ever grows beyond today's 2 hosts.
+- Consider cross-host jitter (stagger mac vs linux checks) for the same reason — currently low priority with only 2 hosts.
+- Consider layering StartLimitBurst/StartLimitIntervalSec directly on ezgha.service itself (the daemon's own systemd unit, NOT this watchdog's unit) as an independent second rate-limit beneath this watchdog script — note this as a separate follow-up touching a different file (systemd/ezgha.service if it exists in this repo, otherwise note it lives outside this repo) and out of scope for this PR.

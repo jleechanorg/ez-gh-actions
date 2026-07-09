@@ -94,8 +94,46 @@ log() { echo "[$TS] $*"; }
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
+boot_time() {
+  if [[ -n "${EZGHA_WATCHDOG_BOOT_TIME_OVERRIDE:-}" ]]; then
+    echo "$EZGHA_WATCHDOG_BOOT_TIME_OVERRIDE"
+    return
+  fi
+
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    local bt=""
+    if [[ -f /proc/stat ]]; then
+      bt=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null || true)
+    fi
+    if [[ -n "$bt" && "$bt" =~ ^[0-9]+$ ]]; then
+      echo "$bt"
+    else
+      date -d "$(uptime -s)" +%s 2>/dev/null || echo 0
+    fi
+  else
+    # macOS: "{ sec = 1735689600, usec = 0 } ..."
+    local bt=""
+    bt=$(sysctl -n kern.boottime 2>/dev/null | sed -En 's/.*sec = ([0-9]+).*/\1/p' || true)
+    if [[ -n "$bt" && "$bt" =~ ^[0-9]+$ ]]; then
+      echo "$bt"
+    else
+      echo 0
+    fi
+  fi
+}
+
 get_miss_count() { # $1=host
-  cat "$STATE_DIR/$1.miss_count" 2>/dev/null || echo 0
+  local file="$STATE_DIR/$1.miss_count"
+  if [[ -f "$file" ]]; then
+    local mtime bt
+    mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
+    bt=$(boot_time)
+    if [[ "$bt" != "0" && "$mtime" != "0" && "$mtime" -lt "$bt" ]]; then
+      echo 0
+      return
+    fi
+  fi
+  cat "$file" 2>/dev/null || echo 0
 }
 
 set_miss_count() { # $1=host $2=count
@@ -104,7 +142,17 @@ set_miss_count() { # $1=host $2=count
 }
 
 get_last_restart() { # $1=host -> epoch seconds, 0 if never
-  cat "$STATE_DIR/$1.last_restart" 2>/dev/null || echo 0
+  local file="$STATE_DIR/$1.last_restart"
+  if [[ -f "$file" ]]; then
+    local mtime bt
+    mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
+    bt=$(boot_time)
+    if [[ "$bt" != "0" && "$mtime" != "0" && "$mtime" -lt "$bt" ]]; then
+      echo 0
+      return
+    fi
+  fi
+  cat "$file" 2>/dev/null || echo 0
 }
 
 set_last_restart() { # $1=host $2=epoch
