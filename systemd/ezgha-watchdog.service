@@ -4,6 +4,14 @@ After=network.target docker.service
 
 [Service]
 Type=oneshot
+# Script-level `timeout 30` wraps every status/ssh probe (see
+# ezgha-fleet-watchdog.sh C#2 fix); this is the systemd-level backstop in
+# case those don't fire for some reason — 90s gives headroom above the
+# ~30s script-level timeouts plus normal probe/restart-command execution
+# time, so a wedged run still gets killed instead of blocking the next
+# OnUnitActiveSec firing forever (Type=oneshot units don't re-fire while
+# still "running").
+TimeoutStartSec=90
 ExecStart=@REPO_PATH@/scripts/ezgha-fleet-watchdog.sh --host linux
 Environment=HOME=@HOME@
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin

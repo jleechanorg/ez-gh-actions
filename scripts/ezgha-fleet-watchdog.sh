@@ -65,6 +65,9 @@
 #   EZGHA_WATCHDOG_MISS_THRESHOLD consecutive misses before restart (default: 3)
 #   EZGHA_WATCHDOG_LOAD_THRESHOLD 1-min load ceiling for restart (default: 12)
 #   EZGHA_WATCHDOG_COOLDOWN_SECONDS minimum seconds between restarts per host (default: 1800)
+#   EZGHA_WATCHDOG_MISS_STALE_SECONDS discard miss_count older than this many
+#                                  seconds, independent of reboot detection
+#                                  (default: 480 = 4x the 120s timer tick)
 
 set -uo pipefail
 
@@ -80,10 +83,15 @@ COOLDOWN_SECONDS="${EZGHA_WATCHDOG_COOLDOWN_SECONDS:-1800}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host) HOST_FILTER="$2"; shift 2 ;;
+    --host)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --host requires an argument (mac|linux)" >&2
+        exit 2
+      fi
+      HOST_FILTER="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,58p' "$0"
+      sed -n '2,70p' "$0"
       exit 0
       ;;
     *) shift ;;
@@ -122,13 +130,29 @@ boot_time() {
   fi
 }
 
+# Tick-gap staleness threshold for get_miss_count(), in seconds. This is
+# ADDITIONAL to (not a replacement for) the boot_time()-based reboot guard
+# below — it fires even WITHOUT a reboot, e.g. when the systemd timer itself
+# has a gap between firings (delayed by system load, or a single tick
+# hanging without a C#2-style timeout). The shipped timer's
+# OnUnitActiveSec is 120s (systemd/ezgha-watchdog.timer); 480s is 4x that
+# interval, i.e. tolerates up to 3 fully-skipped ticks (360s) plus one
+# tick's worth of slop for the probe/restart work itself, before treating a
+# leftover miss_count as too old to combine with a fresh miss.
+MISS_COUNT_STALE_SECONDS="${EZGHA_WATCHDOG_MISS_STALE_SECONDS:-480}"
+
 get_miss_count() { # $1=host
   local file="$STATE_DIR/$1.miss_count"
   if [[ -f "$file" ]]; then
-    local mtime bt
+    local mtime bt now
     mtime=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
     bt=$(boot_time)
     if [[ "$bt" != "0" && "$mtime" != "0" && "$mtime" -lt "$bt" ]]; then
+      echo 0
+      return
+    fi
+    now=$(date +%s)
+    if [[ "$mtime" != "0" && "$now" -ge "$mtime" && $((now - mtime)) -ge "$MISS_COUNT_STALE_SECONDS" ]]; then
       echo 0
       return
     fi
@@ -204,7 +228,7 @@ do_restart_linux() {
   if [[ "$(uname -s)" == "Linux" ]]; then
     systemctl --user restart ezgha.service 2>&1
   else
-    ssh -o ConnectTimeout=5 jeff-ubuntu "systemctl --user restart ezgha.service" 2>&1
+    timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu "systemctl --user restart ezgha.service" 2>&1
   fi
 }
 
@@ -290,7 +314,7 @@ check_mac() {
 
   local configured actual slots config_file="$HOME/.config/ezgha/config.toml"
   configured=$(grep -E "^count = " "$config_file" 2>/dev/null | grep -oE "[0-9]+")
-  actual=$("$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
+  actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
   slots=$(slot_count)
 
   if [[ -z "$configured" || -z "$actual" ]]; then
@@ -303,18 +327,39 @@ check_mac() {
 
 check_linux() {
   if [[ -n "$HOST_FILTER" && "$HOST_FILTER" != "linux" ]]; then return 0; fi
+  # Mirror of check_mac()'s Darwin guard. This function has an ssh-based
+  # remote path (below) that lets it manage jeff-ubuntu from a non-Linux
+  # host (e.g. running this script by hand on the Mac). That path reads and
+  # writes state files under THIS invoking host's own
+  # $EZGHA_WATCHDOG_STATE_DIR — completely independent of the
+  # miss-counter/last-restart state kept by the watchdog process that
+  # already runs natively ON jeff-ubuntu via the shipped systemd unit
+  # (systemd/ezgha-watchdog.service, which always passes --host linux). Two
+  # uncoordinated processes tracking separate miss-counters for the SAME
+  # remote daemon could each independently decide to restart it —
+  # reintroducing the exact restart-flapping this whole PR exists to
+  # prevent. Guard against a bare (no --host) invocation on a non-Linux host
+  # exactly like check_mac() guards against a bare invocation on a
+  # non-Darwin host; an explicit `--host linux` still opts in to the ssh
+  # path deliberately.
+  if [[ "$(uname -s)" != "Linux" && "$HOST_FILTER" != "linux" ]]; then
+    log "LINUX: skipping — running on non-Linux host with no explicit --host linux filter (ssh path would use locally-scoped state uncoordinated with the native jeff-ubuntu watchdog; see comment above check_linux)"
+    return 0
+  fi
   local configured actual slots
   if [[ "$(uname -s)" == "Linux" ]]; then
     configured=$(grep -E "^count = " "$HOME/.config/ezgha/config.toml" 2>/dev/null | grep -oE "[0-9]+")
-    actual=$("$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
+    actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
     slots=$(slot_count)
   else
-    configured=$(ssh -o ConnectTimeout=5 jeff-ubuntu 'grep -E "^count = " ~/.config/ezgha/config.toml 2>/dev/null | grep -oE "[0-9]+"' 2>/dev/null)
-    actual=$(ssh -o ConnectTimeout=5 jeff-ubuntu '$HOME/.cargo/bin/ezgha status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+"' 2>/dev/null)
+    configured=$(timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu 'grep -E "^count = " ~/.config/ezgha/config.toml 2>/dev/null | grep -oE "[0-9]+"' 2>/dev/null)
+    # shellcheck disable=SC2016  # single quotes intentional: $HOME/$(...) must expand on the REMOTE host, not locally. (shellcheck normally recognizes this for a bare `ssh` invocation but loses that context once wrapped in `timeout`.)
+    actual=$(timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu '$HOME/.cargo/bin/ezgha status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+"' 2>/dev/null)
     # Same single-value-capture fix as slot_count() above, applied inline
     # since this runs on the remote host via ssh rather than calling the
     # local function.
-    slots=$(ssh -o ConnectTimeout=5 jeff-ubuntu 'n=$(grep -c "=" ~/.config/ezgha/slot_assignments.toml 2>/dev/null); echo "${n:-0}"' 2>/dev/null)
+    # shellcheck disable=SC2016  # single quotes intentional: $(...) must run on the REMOTE host, not locally. (same shellcheck ssh-context quirk as above)
+    slots=$(timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu 'n=$(grep -c "=" ~/.config/ezgha/slot_assignments.toml 2>/dev/null); echo "${n:-0}"' 2>/dev/null)
   fi
 
   if [[ -z "$configured" || -z "$actual" ]]; then
