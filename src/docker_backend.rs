@@ -217,17 +217,36 @@ fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config
     Ok(())
 }
 
-/// Reserve the first unused slot in `1..=cfg.runner.count` and return its index.
+/// Reserve the first unused slot in `1..=cfg.runner.count` and return its
+/// index — equivalent to `next_slot_excluding` with an empty exclusion set.
 /// The slot is recorded in the persisted assignments file under an empty
 /// runner_id marker; callers MUST update it via `record_slot_runner_id` after
 /// the JIT registration succeeds, or release it via `release_slot` if the
-/// registration fails.
+/// registration fails. Production code always goes through
+/// `next_slot_excluding` directly (via `start_missing_runners`); this
+/// no-exclusions wrapper now exists purely for tests.
+#[cfg(test)]
 pub fn next_slot(cfg: &Config) -> Result<u32> {
+    next_slot_excluding(cfg, &HashSet::new())
+}
+
+/// Like `next_slot`, but skips any slot number present in `excluded` even if
+/// it is technically free in the persisted assignments file. Used by
+/// `start_missing_runners` so that a slot which just failed (and had its
+/// reservation released) within the current call cannot be immediately
+/// re-picked as the "lowest free slot" — which previously caused every
+/// remaining retry in the batch to pile onto one permanently-broken slot
+/// while every other genuinely-fillable slot went untried (bead
+/// ez-gh-actions-oau).
+pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<u32> {
     if cfg.runner.count == 0 {
         bail!("cfg.runner.count is 0; nothing to allocate");
     }
     let mut assignments = read_slot_assignments_for(Some(cfg))?;
     for slot in 1..=cfg.runner.count {
+        if excluded.contains(&slot) {
+            continue;
+        }
         let key = slot.to_string();
         if let std::collections::btree_map::Entry::Vacant(e) = assignments.assignments.entry(key) {
             e.insert(String::new());
@@ -912,8 +931,12 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
     (cpus, mem)
 }
 
-/// Start one ephemeral JIT runner container. Returns (container_id, runner_name).
-pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
+/// Start one ephemeral JIT runner container in a slot the caller has already
+/// reserved (e.g. via `next_slot_excluding`), instead of letting this
+/// function pick the lowest free slot itself. Used by `start_missing_runners`
+/// so a failed slot can be excluded from the next pick within the same batch.
+/// Returns (container_id, runner_name).
+fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(String, String)> {
     #[cfg(test)]
     {
         let mut hook = TEST_START_ONE_NAMES.lock().unwrap();
@@ -926,9 +949,16 @@ pub fn start_one(cfg: &Config, backend: Backend) -> Result<(String, String)> {
         }
     }
 
-    start_one_with_generate(cfg, backend, github::generate_jitconfig)
+    start_one_with_generate_at_slot(cfg, backend, slot, github::generate_jitconfig)
 }
 
+/// Test-only convenience wrapper: allocates the next free slot itself (via
+/// `next_slot`) then delegates to `start_one_with_generate_at_slot`.
+/// Production code always goes through `start_one_at_slot` /
+/// `start_one_with_generate_at_slot` with an explicit slot from
+/// `next_slot_excluding`, so this indirection now exists purely for tests
+/// that don't care about slot-exclusion behavior.
+#[cfg(test)]
 fn start_one_with_generate(
     cfg: &Config,
     backend: Backend,
@@ -942,6 +972,20 @@ fn start_one_with_generate(
     // Acquire a stable numeric slot BEFORE calling GitHub so a JIT
     // registration that never gets a container still gets cleaned up.
     let slot = next_slot(cfg)?;
+    start_one_with_generate_at_slot(cfg, backend, slot, generate_jitconfig)
+}
+
+fn start_one_with_generate_at_slot(
+    cfg: &Config,
+    backend: Backend,
+    slot: u32,
+    generate_jitconfig: impl FnOnce(
+        &crate::config::GithubConfig,
+        &str,
+        &[String],
+        &HashSet<u64>,
+    ) -> Result<(String, u64)>,
+) -> Result<(String, String)> {
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
@@ -1155,15 +1199,50 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+/// Start `missing` runners, one per free slot. Tracks which slot numbers have
+/// already failed WITHIN this call and excludes them from subsequent slot
+/// picks, so a single permanently-broken slot (e.g. an unresolvable 409
+/// zombie GitHub registration) can only ever consume one of the `missing`
+/// attempts — the other attempts try genuinely different slots instead of
+/// retrying the same one `missing` times (bead ez-gh-actions-oau; confirmed
+/// live incident 2026-07-08: 90+ consecutive attempts concentrated on one
+/// slot collapsed the entire 16-slot fleet to 0 containers).
+///
+/// This exclusion is scoped to a single call: it does not persist across
+/// separate `ensure_count` ticks, so a transiently-failed slot is retried
+/// normally on the next tick.
 fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
+    start_missing_runners_with_starter(cfg, backend, missing, start_one_at_slot)
+}
+
+fn start_missing_runners_with_starter(
+    cfg: &Config,
+    backend: Backend,
+    missing: u32,
+    starter: impl Fn(&Config, Backend, u32) -> Result<(String, String)>,
+) -> Result<Vec<String>> {
     let mut started = Vec::new();
     let mut last_err = None;
+    let mut failed_slots: HashSet<u32> = HashSet::new();
     for _ in 0..missing {
         watchdog::ping();
-        match start_one(cfg, backend) {
+        let slot = match next_slot_excluding(cfg, &failed_slots) {
+            Ok(slot) => slot,
+            Err(e) => {
+                // No free, non-excluded slot left at all (e.g. every slot is
+                // either occupied or has already failed this cycle) — further
+                // iterations cannot possibly succeed either, so stop instead
+                // of spinning through the remaining `missing` count.
+                eprintln!("warning: no runner slot available to attempt: {e:#}");
+                last_err = Some(e);
+                break;
+            }
+        };
+        match starter(cfg, backend, slot) {
             Ok((_, name)) => started.push(name),
             Err(e) => {
-                eprintln!("warning: failed to start runner: {e:#}");
+                eprintln!("warning: failed to start runner in slot {slot}: {e:#}");
+                failed_slots.insert(slot);
                 last_err = Some(e);
             }
         }
@@ -1569,6 +1648,91 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "all 16 start_one() calls must be consumed directly"
+        );
+    }
+
+    #[test]
+    fn start_missing_runners_excludes_permanently_stuck_slot_within_one_call() {
+        // Regression test for bead ez-gh-actions-oau — confirmed LIVE incident
+        // 2026-07-08. Root cause: start_missing_runners looped `missing` times
+        // calling start_one(), which internally calls next_slot() to grab the
+        // lowest currently-free slot number. When a slot is PERMANENTLY broken
+        // (e.g. an unresolvable 409 zombie GitHub registration), start_one's
+        // failure path releases that slot's reservation, so the *next*
+        // iteration's next_slot() call picks the exact same slot again — it is
+        // still the lowest free number. Net effect: every iteration in the
+        // batch piled onto the one broken slot, and the other genuinely
+        // fillable slots were never attempted. Live: 90+ consecutive attempts
+        // on one slot, zero attempts on ~14 other missing slots, fleet
+        // collapsed 16 -> 0 containers.
+        //
+        // This test drives the REAL slot-allocation path (next_slot_excluding,
+        // via start_missing_runners_with_starter) with a starter that fails
+        // deterministically for one specific slot on EVERY attempt (not just
+        // once), and asserts the other N-1 slots each get exactly one attempt
+        // and succeed — proving one stuck slot can consume at most one
+        // iteration of the batch.
+        let _env = TestEnv::new("exclude_stuck_slot");
+        let cfg = cfg_with(5, "ez-org-runner");
+        const BROKEN_SLOT: u32 = 3;
+
+        let attempts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let attempts_for_closure = std::sync::Arc::clone(&attempts);
+        let starter = move |_cfg: &Config, _backend: Backend, slot: u32| -> Result<(String, String)> {
+            *attempts_for_closure
+                .lock()
+                .unwrap()
+                .entry(slot)
+                .or_insert(0) += 1;
+            if slot == BROKEN_SLOT {
+                // Mirror the REAL failure path in
+                // `start_one_with_generate_at_slot`: on error, it releases the
+                // slot's reservation (`release_slot_for`) so the slot becomes
+                // free again. That release is exactly what makes the slot
+                // re-pickable as "the lowest free slot" on the very next
+                // `next_slot`/`next_slot_excluding` call — the mechanism this
+                // test must exercise to prove the exclusion set (not just
+                // "the slot happens to still be reserved") is what prevents
+                // the retry-pileup bug.
+                release_slot(BROKEN_SLOT).unwrap();
+                bail!("simulated permanent JIT-generation failure for slot {slot}");
+            }
+            let name = format!("ez-org-runner-{slot}");
+            Ok((format!("container-{name}"), name))
+        };
+
+        let started = start_missing_runners_with_starter(&cfg, Backend::Docker, 5, starter)
+            .expect("4 of 5 slots succeed, so overall call must return Ok with those 4");
+
+        assert_eq!(
+            started.len(),
+            4,
+            "the 4 genuinely-fillable slots must all be started; only the permanently-broken \
+             slot should fail — the bug made ALL 5 iterations pile onto slot {BROKEN_SLOT}"
+        );
+
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(
+            attempts.get(&BROKEN_SLOT).copied(),
+            Some(1),
+            "the permanently-broken slot must be attempted exactly ONCE per call, not retried \
+             for every remaining iteration in the batch (this is the exact bug from ez-gh-actions-oau)"
+        );
+        for slot in 1..=5u32 {
+            if slot != BROKEN_SLOT {
+                assert_eq!(
+                    attempts.get(&slot).copied(),
+                    Some(1),
+                    "slot {slot} should be attempted exactly once and succeed on the first try"
+                );
+            }
+        }
+        assert_eq!(
+            attempts.values().sum::<u32>(),
+            5,
+            "5 missing slots must mean 5 attempts across 5 DISTINCT slots, not 5 retries \
+             concentrated on the single broken slot"
         );
     }
 
