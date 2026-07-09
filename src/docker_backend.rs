@@ -35,6 +35,16 @@ static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
 static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+/// Overrides the binary name/path used to build every `docker` `Command` in
+/// this module. Unlike mutating the process-wide `PATH` env var (which any
+/// OTHER test in this binary — including unrelated modules like `alert.rs`,
+/// which mutates `PATH` under its own, uncoordinated lock — can race with
+/// under `cargo test`'s default multi-threaded runner), this is a plain
+/// in-process value gated behind this module's own `TEST_LOCK`, so it cannot
+/// leak into or be clobbered by any other test. See
+/// `start_one_releases_slot_on_docker_run_failure` for the only user.
+#[cfg(test)]
+static TEST_DOCKER_BIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Env var that overrides the slot assignments file path. Used by tests to
 /// avoid touching the user's real `~/.config/ezgha/slot_assignments.toml`.
@@ -538,19 +548,24 @@ fn release_stale_slots_from_with_containers_for(
         } else if let Ok(rid) = id_str.parse::<u64>() {
             if !live_ids.contains(&rid) {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
-                if local_container_names
-                    .as_ref()
-                    .is_some_and(|local_names| local_names.contains(&expected_name))
-                {
-                    eprintln!(
-                        "warning: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (treating as in-flight / eventual consistency)"
-                    );
-                } else {
-                    // The recorded runner_id is no longer registered on GitHub
-                    // (server-side reap, manual removal, or a stale entry from a
-                    // prior host) and no local container exists, so reclaim.
-                    release_slot_for(cfg, slot_n)?;
-                    reclaimed += 1;
+                match local_container_names {
+                    Some(local_names) if local_names.contains(&expected_name) => {
+                        eprintln!(
+                            "warning: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (treating as in-flight / eventual consistency)"
+                        );
+                    }
+                    Some(_) => {
+                        // The recorded runner_id is no longer registered on GitHub
+                        // (server-side reap, manual removal, or a stale entry from a
+                        // prior host) and no local container exists, so reclaim.
+                        release_slot_for(cfg, slot_n)?;
+                        reclaimed += 1;
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: keeping slot {slot_n}: docker ps failed locally so container existence for {expected_name} is unknown while GH registration {rid} is absent; skipping reclaim this tick to avoid a blind mass-reclaim"
+                        );
+                    }
                 }
             } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
@@ -820,6 +835,22 @@ fn run_docker(cmd: Command, detail: &str) -> Result<Output> {
     run_docker_with_timeout(cmd, detail, DOCKER_TIMEOUT)
 }
 
+/// Build a `Command` for the `docker` binary. In test builds this honors
+/// `TEST_DOCKER_BIN` so a test can redirect every docker invocation in this
+/// module to a fake script without touching the process-wide `PATH` env var
+/// (which is shared with every other thread/test in the binary). Production
+/// behavior is unchanged: always `Command::new("docker")`, resolved via the
+/// real `PATH`.
+fn docker_cmd() -> Command {
+    #[cfg(test)]
+    {
+        if let Some(bin) = TEST_DOCKER_BIN.lock().unwrap().clone() {
+            return Command::new(bin);
+        }
+    }
+    Command::new("docker")
+}
+
 /// Process-wide guard so `print_doctor`'s warning prints at most once per
 /// `serve` process — otherwise the 30s reconciliation loop would re-emit the
 /// same diagnostic forever.
@@ -834,7 +865,7 @@ fn runner_name_for(cfg: &Config, slot: u32) -> String {
 /// the local host when docker runs inside a VM (Colima/Lima/Docker Desktop)
 /// or on a remote context. Limits must respect the daemon, not the host.
 pub fn daemon_capacity() -> Option<(f64, u64)> {
-    let mut cmd = Command::new("docker");
+    let mut cmd = docker_cmd();
     cmd.args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"]);
     let out = run_docker(cmd, "reading docker daemon capacity").ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -914,7 +945,7 @@ fn start_one_with_generate(
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
-    let mut pre_rm = Command::new("docker");
+    let mut pre_rm = docker_cmd();
     pre_rm.args(["rm", "-f", &runner_name]);
     let _ = run_docker(pre_rm, "pre-start rm -f").ok();
 
@@ -944,7 +975,7 @@ fn start_one_with_generate(
     record_slot_runner_id_for(Some(cfg), slot, runner_id)?;
     watchdog::ping();
 
-    let mut cmd = Command::new("docker");
+    let mut cmd = docker_cmd();
     cmd.args(["run", "-d", "--rm"]);
     cmd.args(["--name", &runner_name]);
     cmd.args(["--label", MANAGED_LABEL]);
@@ -1007,7 +1038,7 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
         return Ok(containers);
     }
 
-    let mut cmd = Command::new("docker");
+    let mut cmd = docker_cmd();
     cmd.args([
         "ps",
         "--filter",
@@ -1054,7 +1085,7 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
     let containers = managed_containers()?;
     let owned_containers = current_prefix_containers(&containers, cfg);
     for c in &owned_containers {
-        let mut cmd = Command::new("docker");
+        let mut cmd = docker_cmd();
         cmd.args(["rm", "-f", &c.id]);
         let _ = run_docker(cmd, "stop_all rm -f").ok();
     }
@@ -1108,7 +1139,7 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
         return free;
     }
 
-    let mut cmd = Command::new("docker");
+    let mut cmd = docker_cmd();
     cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
     let out = run_docker(cmd, "measuring docker daemon free disk")
         .ok()
@@ -1255,6 +1286,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -1327,6 +1359,7 @@ mod tests {
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
+            *TEST_DOCKER_BIN.lock().unwrap() = None;
             let _ = std::fs::remove_file(&self.path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
@@ -1637,34 +1670,48 @@ mod tests {
     fn start_one_releases_slot_on_docker_run_failure() {
         let _env = TestEnv::new("docker_run_failure");
         let cfg = cfg_with(2, "ez-org-runner");
-        let temp_dir = env::temp_dir().join("ezgha-docker-fake-run");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-docker-fake-run-{}", std::process::id()));
         let script = temp_dir.join("docker");
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(
             &script,
+            // Absolute `#!/bin/sh` shebang (not `/usr/bin/env sh`): the
+            // kernel resolves an absolute shebang path directly via execve,
+            // with no PATH lookup involved. `env sh` would need `sh` to be
+            // resolvable via the process's PATH at exec time, which is not
+            // reliable here — other tests in this same binary (e.g.
+            // `alert.rs`'s `PATH`-mutating tests) can transiently replace or
+            // empty PATH on another thread while this script executes.
             b"#!/bin/sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
         )
         .unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_readonly(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
-        }
-        std::fs::set_permissions(&script, perms).unwrap();
-        let old_path = env::var("PATH").unwrap_or_default();
-        env::set_var("PATH", &temp_dir);
-        let err = start_one_with_generate(
-            &cfg,
-            Backend::Docker,
-            |_gh, _name, _labels, _owned| Ok(("jit".into(), 9876)),
-        )
+        // Use `set_permissions` directly instead of shelling out to `chmod`
+        // (removes a dependency on `chmod` being resolvable on PATH).
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Redirect every `docker` invocation in this module to the fake
+        // script via the in-process `TEST_DOCKER_BIN` hook rather than
+        // mutating the real, process-wide `PATH` env var. `PATH` is shared
+        // by every thread in the test binary — including unrelated modules
+        // like `alert.rs`, which mutates `PATH` under its own, uncoordinated
+        // lock — so replacing (or even prepending to) it here would race
+        // with those other tests under `cargo test`'s default parallel
+        // runner and intermittently corrupt command resolution for both
+        // sides. `TEST_DOCKER_BIN` is gated behind this module's own
+        // `TEST_LOCK` (via `TestEnv`) and cleared unconditionally in
+        // `TestEnv`'s `Drop` impl, so it's panic-safe and fully isolated
+        // from every other test in the binary.
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 9876))
+        })
         .expect_err("start_one should fail when docker run exits non-zero");
-        env::set_var("PATH", old_path);
+
         assert!(
-            !err.to_string().is_empty(),
-            "docker run invocation should fail and return a surfaced error"
+            err.to_string().contains("docker run failed") && err.to_string().contains("simulation"),
+            "docker run failure should be surfaced; got: {err:#}"
         );
         let assignments = read_slot_assignments().unwrap();
         assert!(
@@ -1699,6 +1746,36 @@ mod tests {
             assignments.assignments.get("1").map(String::as_str),
             Some("4242"),
             "slot 1 should remain recorded"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_slot_when_runner_id_not_in_live_but_container_list_unavailable() {
+        let _env = TestEnv::new("stale_container_list_unavailable");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        // local_container_names = None simulates `docker ps` / managed_containers()
+        // failing at the caller — we must NOT blind-reclaim in this case.
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "slot must be kept when local container existence is unknown (docker ps failed) even if GH registration is absent"
+        );
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(
+            assignments.assignments.get("1").map(String::as_str),
+            Some("4242"),
+            "slot 1 should remain recorded when container list is unavailable"
         );
     }
 
@@ -1794,7 +1871,21 @@ mod tests {
         record_slot_runner_id(1, 4242).unwrap();
 
         let live = vec![runner_info(9999, "ez-org-runner-2")];
-        let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
+        // Use an explicit (empty) local-container set rather than the
+        // `release_stale_slots_from` helper's `None`: post-B2-fix, `None`
+        // means "docker ps failed, container existence unknown" and
+        // correctly does NOT reclaim (see
+        // `release_stale_slots_keeps_slot_when_runner_id_not_in_live_but_container_list_unavailable`).
+        // This test's scenario is "we positively confirmed (via a
+        // successful, empty docker ps) that no local container exists",
+        // which must still reclaim.
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
 
         assert_eq!(reclaimed, 1, "the stale slot must be reclaimed");
         let a = read_slot_assignments().unwrap();
