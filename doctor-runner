@@ -458,6 +458,38 @@ for _i in $(seq 1 "$CONFIGURED_COUNT"); do
     EXECUTING) EXECUTING_SLOTS+=("$_name") ;;
   esac
 done
+
+# DOWN persistence (2-sample rule): ephemeral slots naturally blink for
+# 20-35s per job cycle (container destroyed after each job, respawned on the
+# next serve tick). A single-sample DOWN therefore reads a HEALTHY recycling
+# fleet as broken — observed 2026-07-09 post-deploy on jeff-ubuntu: 5 "DOWN"
+# slots, all Up again within 20s. Worse, a false DOWN feeds the restart
+# remediation advice at the end of this script — a self-outage risk (see
+# CLAUDE.md Self-Outage Prevention Principle). DOWN only counts when it
+# persists across two samples >= DOWN_PERSISTENCE_WAIT_SECONDS apart
+# (default 30s, > one serve tick); slots that recover in between are a
+# normal ephemeral recycle, classified by their second-sample state.
+DOWN_PERSISTENCE_WAIT_SECONDS="${DOWN_PERSISTENCE_WAIT_SECONDS:-30}"
+if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
+  info "first-pass DOWN candidates (${DOWN_SLOTS[*]}) — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s to filter normal ephemeral recycling"
+  sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
+  _PERSISTENT_DOWN=()
+  _BLINKED=()
+  for _name in "${DOWN_SLOTS[@]}"; do
+    case "$(classify_local_slot "$_name")" in
+      DOWN)      _PERSISTENT_DOWN+=("$_name") ;;
+      IDLE)      IDLE_SLOTS+=("$_name");      _BLINKED+=("$_name") ;;
+      EXECUTING) EXECUTING_SLOTS+=("$_name"); _BLINKED+=("$_name") ;;
+    esac
+  done
+  if [ "${#_BLINKED[@]}" -gt 0 ]; then
+    info "recycled normally (respawned within ${DOWN_PERSISTENCE_WAIT_SECONDS}s, NOT a defect): ${_BLINKED[*]}"
+  fi
+  DOWN_SLOTS=()
+  if [ "${#_PERSISTENT_DOWN[@]}" -gt 0 ]; then
+    DOWN_SLOTS=("${_PERSISTENT_DOWN[@]}")
+  fi
+fi
 info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
 
 # IDLE is only a defect (IDLE-STARVED) once the queue has been non-empty for
@@ -561,8 +593,16 @@ list_slot_work() {
       running=$(ssh -o ConnectTimeout=4 "$host" "docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
     fi
     if [ "$running" != "true" ]; then
-      printf "    %-22s %s\n" "$name" "DOWN — no container"
-      dn=$((dn+1))
+      # Display defers to section 9's PERSISTENT verdict for local slots so
+      # sections 9 and 10 can never contradict each other on DOWN (observed
+      # 2026-07-09: c-8 shown EXECUTING in one section, DOWN in the other,
+      # from independent probes seconds apart on a recycling fleet).
+      if [ "$host" = "localhost" ] && ! printf ' %s ' "${DOWN_SLOTS[*]:-}" | grep -q " $name "; then
+        printf "    %-22s %s\n" "$name" "RECYCLING — blinked between samples (not a defect per 2-sample rule; section 9 verdict governs)"
+      else
+        printf "    %-22s %s\n" "$name" "DOWN — no container"
+        dn=$((dn+1))
+      fi
       continue
     fi
     if [ "$host" = "localhost" ]; then
@@ -660,6 +700,35 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
       EXECUTING) REMOTE_EXECUTING_SLOTS+=("$_name") ;;
     esac
   done <<< "$REMOTE_REPORT"
+  # Same 2-sample DOWN-persistence rule as the local pass (see section 9):
+  # re-probe only the DOWN candidates after one serve tick; a slot that came
+  # back is a normal ephemeral recycle, not a defect.
+  if [ "${#REMOTE_DOWN_SLOTS[@]}" -gt 0 ]; then
+    info "$REMOTE_LABEL first-pass DOWN candidates (${REMOTE_DOWN_SLOTS[*]}) — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s"
+    sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
+    _R_PERSISTENT=()
+    _R_BLINKED=()
+    for _name in "${REMOTE_DOWN_SLOTS[@]}"; do
+      _state2=$(timeout 20 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" "
+        running=\$(docker inspect -f '{{.State.Running}}' '$_name' 2>/dev/null || echo false)
+        if [ \"\$running\" != true ]; then echo DOWN
+        elif docker top '$_name' -eo pid,comm 2>/dev/null | grep -qw Worker; then echo EXECUTING
+        else echo IDLE; fi
+      " 2>/dev/null || echo DOWN)
+      case "$_state2" in
+        DOWN)      _R_PERSISTENT+=("$_name") ;;
+        IDLE)      REMOTE_IDLE_SLOTS+=("$_name");      _R_BLINKED+=("$_name") ;;
+        EXECUTING) REMOTE_EXECUTING_SLOTS+=("$_name"); _R_BLINKED+=("$_name") ;;
+      esac
+    done
+    if [ "${#_R_BLINKED[@]}" -gt 0 ]; then
+      info "$REMOTE_LABEL recycled normally (respawned within ${DOWN_PERSISTENCE_WAIT_SECONDS}s, NOT a defect): ${_R_BLINKED[*]}"
+    fi
+    REMOTE_DOWN_SLOTS=()
+    if [ "${#_R_PERSISTENT[@]}" -gt 0 ]; then
+      REMOTE_DOWN_SLOTS=("${_R_PERSISTENT[@]}")
+    fi
+  fi
   info "$REMOTE_LABEL slots (remote proof via ssh): ${#REMOTE_EXECUTING_SLOTS[@]} executing, ${#REMOTE_IDLE_SLOTS[@]} idle, ${#REMOTE_DOWN_SLOTS[@]} down (of $REMOTE_COUNT configured)"
   if [ "${#REMOTE_DOWN_SLOTS[@]}" -gt 0 ]; then
     bad "$REMOTE_LABEL DOWN (no container) — ${#REMOTE_DOWN_SLOTS[@]} slot(s): ${REMOTE_DOWN_SLOTS[*]}"
