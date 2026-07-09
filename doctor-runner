@@ -276,6 +276,26 @@ else
     GH_TOKEN_STALE_CRITICAL=1
   fi
 fi
+# Live 200-check: mtime alone cannot detect a token that LOOKS fresh (young
+# mtime, under the 45min TTL window) but is cryptographically dead — the
+# exact jleechan-wzk root cause: a cached ghs_ token survives an app
+# private-key rotation with a perfectly fresh mtime, but every API call
+# using it 401s, because the signature is bound to a key that no longer
+# validates. Every other `gh api` call in this script rides the OPERATOR's
+# ambient `gh auth` (see `gh auth status` — usually a personal token), not
+# ezgha's own app token, so none of them actually exercise gh_token's
+# validity; explicitly override GH_TOKEN for this one call so it tests what
+# section 4b claims to test.
+if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
+  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | head -1 | awk '{print $2}')
+  if [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
+    ok "gh_token live-check: 200 against orgs/$ORG/actions/runners (mtime freshness confirmed by a real call, not just a clock)"
+  else
+    bad "gh_token live-check FAILED: mtime says '$GH_TOKEN_STATUS' (age ${GH_TOKEN_AGE_MIN}m) but a live API call using this exact token returned HTTP ${GH_TOKEN_LIVE_HTTP:-<no response>}, not 200 — token is cryptographically dead (likely signed by a rotated-out private key, see bead jleechan-wzk) even though its mtime looks fine"
+    GH_TOKEN_STATUS="live_check_failed"
+    GH_TOKEN_STALE_CRITICAL=1
+  fi
+fi
 if [ "$JSON" = "1" ]; then
   info "gh_token_status=$GH_TOKEN_STATUS gh_token_age_min=$GH_TOKEN_AGE_MIN gh_token_stale_critical=$GH_TOKEN_STALE_CRITICAL"
 fi
