@@ -217,6 +217,70 @@ if [ -f "${CONFIG_PATH}" ]; then
   fi
 fi
 
+# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper) ─
+# These three units keep the ezgha fleet healthy between deploys:
+#   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
+#   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
+#                            (prevents the jleechan-wzk 401-on-key-rotation failure)
+#   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
+UNIT_DIR="${SCRIPT_DIR}/systemd"
+if [ -d "${UNIT_DIR}" ]; then
+  REPO_PATH="${SCRIPT_DIR}"
+  HOME_DIR="${HOME}"
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # macOS: wrap each systemd-style unit into a launchd plist
+    install_macos_plist() {
+      local name="$1" interval_sec="$2" exec_path="$3" exec_args="$4"
+      local plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-${name}.plist"
+      if [ -f "${plist}" ]; then
+        launchctl unload "${plist}" 2>/dev/null || true
+      fi
+      mkdir -p "${HOME_DIR}/.local/state/ezgha"
+      cat > "${plist}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>org.jleechanorg.ezgha-${name}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${exec_path}</string>
+PLIST
+      for a in ${exec_args}; do
+        printf '    <string>%s</string>\n' "${a}" >> "${plist}"
+      done
+      cat >> "${plist}" <<PLIST
+  </array>
+  <key>StartInterval</key><integer>${interval_sec}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>${HOME_DIR}/.local/state/ezgha/${name}.log</string>
+  <key>StandardErrorPath</key><string>${HOME_DIR}/.local/state/ezgha/${name}.log</string>
+</dict></plist>
+PLIST
+      launchctl load -w "${plist}" 2>/dev/null || true
+      ok "macOS plist installed: ${name} (every ${interval_sec}s)"
+    }
+    install_macos_plist "token-refresh" "2700"  "${REPO_PATH}/scripts/refresh_gh_app_token.sh" ""
+    install_macos_plist "queue-reaper"  "21600" "${REPO_PATH}/scripts/cleanup-stuck-runs.sh" "--apply"
+    install_macos_plist "watchdog"      "120"   "${REPO_PATH}/scripts/ezgha-fleet-watchdog.sh" "--host macos"
+  elif command -v systemctl >/dev/null 2>&1; then
+    # Linux: copy the systemd units with @REPO_PATH@ / @HOME@ placeholders substituted
+    USER_UNIT_DIR="${HOME}/.config/systemd/user"
+    mkdir -p "${USER_UNIT_DIR}"
+    for unit in "${UNIT_DIR}"/ezgha-*.service "${UNIT_DIR}"/ezgha-*.timer; do
+      [ -f "${unit}" ] || continue
+      base="$(basename "${unit}")"
+      sed -e "s|@REPO_PATH@|${REPO_PATH}|g" \
+          -e "s|@HOME@|${HOME_DIR}|g" \
+          "${unit}" > "${USER_UNIT_DIR}/${base}"
+    done
+    systemctl --user daemon-reload 2>/dev/null || true
+    for timer in ezgha-watchdog.timer ezgha-token-refresh.timer ezgha-queue-reaper.timer; do
+      systemctl --user enable --now "${timer}" 2>/dev/null && ok "systemd --user timer enabled: ${timer}" \
+        || bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
+    done
+  fi
+fi
+
 # ── Run post-deployment exit criteria checks ─────────────────────────────────
 if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/docs/verify-exit-criteria.sh" ]; then
   info "Running post-deployment exit criteria checks"
