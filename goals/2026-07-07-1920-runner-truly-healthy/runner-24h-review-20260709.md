@@ -223,3 +223,117 @@ touching it within 24h.
   watchdog-restart mechanism described here — it only touches Colima/Lima backend-selection restart
   logic (`attempt_backend_restart()` in `src/main.rs`), which was checked and ruled out as a
   candidate 4th restart trigger.
+
+---
+
+## 7. Remediation verified (addendum, 2026-07-09, sidekick-churn)
+
+Full remediation of the churn described in §0–§5 above, executed by a dedicated persistent
+sidekick (`sidekick-churn`) under a user-directed 4-hour deadline, with `/advice` (3-reviewer
+panel) as the merge gate and blanket merge approval granted mid-mission. This section records
+what shipped, what was independently re-broken and found live during the work, and the final
+before/after evidence.
+
+### 7.1 What shipped (all merged to `main`, `jleechanorg/ez-gh-actions`)
+
+| PR | Commit | Fixes |
+|---|---|---|
+| #33 | `1a9baf4` | Path 1 mass-reclaim on truncated `list_runners` data (the §0–§4 dominant root cause) — `None`-container-list now keeps-and-warns instead of falling through to reclaim; the PR's own new test had a process-global `PATH`-mutation race, root-caused and fixed via a `docker_cmd()` test-hook indirection instead (zero PATH mutation) after the originally-prescribed RAII-guard approach was empirically proven still flaky under real parallel test execution |
+| #34 | `18eab65` | Durable in-repo replacement for the external, unversioned `ezgha-fleet-watchdog.sh` (bead `2ik`) — N=3 consecutive-miss threshold, 1-min load gate, 30-min per-host cooldown, fixed a discarded-exit-status bug found by adversarial review (a failed restart was being silently recorded as success) |
+| #35 | `caf7c3e` | Mac token-refresh hardening (bead `hcu`) — retry-once on transient mint failures, 45s hard timeout wrapper distinguishing hang-kills from other failures, regression tests with measured wall-clock proof |
+| #36 | `f35446e` | PR #34 follow-up: reboot-stale-state guard (state older than the current boot is ignored) generalized into one unified mtime-freshness check covering both the reboot case and a broader inter-tick staleness gap (cold-review finding C#3); `check_linux()` host-detection guard mirroring `check_mac()`'s (C#1); `timeout 30` wrapping on every probe/ssh call plus `TimeoutStartSec=90` on the systemd unit (C#2); minor `--help`/`--host` argument-handling fixes (C#5/C#6) |
+| — | `205b660` | `doctor-runner` tracked in git for the first time (was gitignored) + GitHub App token freshness check (bead `hcu` item 5): `ok`<45min / `warn` 45–60min / `bad`>60min, wired into the existing `CRITICAL` counter |
+| #37 | `65ffec5` | A **new bug found live during this remediation** (see §7.2) — `start_missing_runners` no longer retries the same permanently-blocked slot on every iteration of its respawn loop |
+
+The watchdog timer (`ezgha-watchdog.timer`) remains **stopped** — it is gated on three pre-arm
+conditions, none yet shipped: bead `xfw` (satisfied by #36), bead `30p`/`uh2` (daemon SIGTERM/
+graceful-shutdown handling — the daemon still has zero graceful-shutdown support, so even a
+*correctly-gated* watchdog restart still orphans in-flight registrations), and bead `lxn` (the
+watchdog's ephemeral-churn guard can mask a genuinely stuck serve loop, since a frozen slot file
+reads identically to healthy churn having just settled).
+
+### 7.2 A new P0 found live: single-slot fleet starvation (bead `oau`)
+
+During the post-deploy churn watch, jeff-ubuntu's fleet collapsed from 16 to 0 containers over
+~10 minutes. Root cause (confirmed by direct code read and live reproduction): a same-host
+zombie GitHub runner registration — orphaned by an uncoordinated double-restart (two operators,
+messages crossed in flight, restarted the same service ~10s apart; see §7.4) — hit an
+unresolvable 409 conflict on every respawn attempt. `start_missing_runners`'s
+`for _ in 0..missing { start_one(...) }` loop calls `next_slot()`, which always allocates the
+lowest free slot number; on failure the slot is released back to "free" immediately, so every
+iteration of the loop re-picked the *same* permanently-blocked slot instead of trying the other
+15 — one stuck slot starved the entire fleet. Confirmed via `journalctl`: 90+ consecutive
+attempts, 100% concentrated on the one slot, zero attempts on any other, for ~10 minutes.
+
+Remediated live: cancelled the GitHub Actions workflow run holding the stuck job (`gh api -X
+POST .../runs/{id}/cancel`; the per-runner `DELETE` 422'd while the job stayed "in_progress",
+per-job cancel isn't exposed by the REST API), which took ~2 minutes to clear GitHub-side. Fleet
+respawned all 16 slots in one tick the moment it cleared, confirming the diagnosis. The durable
+fix (PR #37) adds a `failed_slots` exclusion set scoped to one `start_missing_runners` call, with
+a regression test proven via revert-and-confirm-fail (temporarily reverting the exclusion,
+watching the new test fail 2-started-vs-4-expected, restoring, confirming 211/211 green).
+
+### 7.3 Before / after — churn eliminated
+
+Two independent 15-minute `journalctl`-sampled measurement windows on jeff-ubuntu, both taken
+*after* the live incident in §7.2 had fully recovered (to avoid conflating incident-debris
+cleanup with steady-state behavior):
+
+| Window | Span (PDT) | SHA | Total respawns | Total reclaims | 409s | Containers |
+|---|---|---|---|---|---|---|
+| Baseline (§0, this doc) | pre-fix | `1a02b36` | 8–13 **per 3-min window**, sustained | — | — | nominal 16/16, 94% <6min old |
+| Clean window 1 | 23:41–23:56 | `1a9baf4` (pre-oau) | 33 over 15min, declining, **0 for the last 6 consecutive minutes** | same pattern | n/a | stable 16 for last 6 samples |
+| Clean window 2 | 23:50–00:06 | `65ffec5` (post-oau) | 3 over 15min (13/15 samples at 0) | 3 over 15min | **0** | held at 16 the entire window |
+
+Extrapolating the pre-fix baseline to a 15-minute window (8–13/3min → ~40–65/15min) against the
+post-fix measured 3/15min is a **>90% reduction**, and unlike the pre-fix pattern the few
+remaining events show no fleet-count impact at all — an immediate, clean backfill each time.
+`doctor-runner --detail` at the end of the measurement window confirms: jeff-ubuntu Linux slots
+0 executing / 16 idle / 0 down (16/16, GitHub Actions queue empty — the ephemeral fleet is fully
+provisioned with nothing queued, satisfying the CLAUDE.md "22/22 executing or truly nothing
+queued" bar for this host), GitHub App token fresh (39min old, well under the 60min TTL).
+
+One pre-existing, unrelated `doctor-runner` check (`serve-loop starvation`, beads `yrt`/`g3o`)
+flagged a 226s gap between respawns during this same window. Given the fleet was stably full and
+idle (0 executing, nothing queued) for the entire window, a multi-minute gap between respawn
+events is expected — there was nothing missing to respawn — and is very likely a false-positive
+of that heuristic in the specific "fleet full and idle" case rather than a new finding; flagged
+for a future look, not actioned here (out of this remediation's scope).
+
+**Mac**: separately recovered from its own, unrelated collapse (old `d6c366d` binary's Path-4
+churn loop at full amplitude) when deployed to `1a9baf4` — held 6/6 across all samples taken.
+The `65ffec5` (oau fix) update to Mac is **deferred**, not skipped: tracked as a condition on
+bead `oau` (Mac `load_1min`<12, or <30 at operator discretion given macOS load semantics and no
+watchdog-reboot risk on that host; re-verify token freshness <45min at execution time). Mac
+already carries the dominant B1/B2/watchdog fixes from the `1a9baf4` deploy; the oau bug's
+trigger (a same-host restart-collision zombie) is rare and, on a 6-slot fleet, caps capacity
+rather than collapsing it — team-lead's assessment, ratified, no override of the load-safety gate.
+
+### 7.4 Process note: coordination collisions
+
+Five distinct concurrent-dispatch/coordination collisions occurred across this remediation
+(prior watchdog-message races noted elsewhere; the jeff-ubuntu double-restart described in §7.2;
+two independent agents redirected onto the same PR #36 follow-up branch; team-lead independently
+shipping the same `doctor-runner` commit ~10 minutes ahead of an in-flight duplicate PR). All
+were caught and reconciled without data loss, but the jeff-ubuntu double-restart had a *measured
+production cost* — it is the confirmed root cause of the §7.2 incident, not merely a near-miss.
+The concrete lesson (filed on bead `vt6`): ownership-transfer messages between concurrent
+operator sessions require **ack-before-act** — the transferor must receive explicit confirmation
+before taking any mutating action, not merely send the transfer message and proceed. Given this
+recurred five times in one session with a proven cost on one occurrence, the recommended
+durability level is a protocol/tooling change (e.g. a claim-file the transferee writes and the
+transferor polls for), not a memory note alone.
+
+### 7.5 Outstanding, deliberately not actioned in this remediation
+
+- Bead `s9d` (Mac slot-2 stale-registration self-heal gap — `release_stale_slots` Path 1 frees a
+  local slot without deleting the corresponding GitHub registration, unlike Path 2's cancel-then-
+  delete) — a different gap than anything fixed here, left open.
+- Bead `5ki` (Path 4 registered-recently grace window) — explicitly deferred pending real
+  post-deploy churn data; the data now says churn is near-zero without it, so it likely remains
+  low priority, but no final call is made here.
+- Beads `30p`/`uh2` (daemon SIGTERM handling) and `lxn` (churn-guard masks a stuck serve loop) —
+  both pre-arm conditions for watchdog-timer re-enablement, not yet started (design-only).
+- Bead `7og` (slot-lifecycle state-machine consolidation, filed per the CLAUDE.md cross-incident
+  rule after 7+ P0/P1 beads hit this subsystem in 24h) — design-only, intentionally not started
+  under this session's complexity-budget checkpoint.
