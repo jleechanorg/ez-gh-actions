@@ -15,8 +15,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! token="$("${SCRIPT_DIR}/mint_gh_app_token.py" "$@")"; then
-  echo "failed to refresh ${TOKEN_PATH}; existing token left unchanged" >&2
+rc=0
+token=$(timeout 45s "${SCRIPT_DIR}/mint_gh_app_token.py" "$@") || rc=$?
+if [[ $rc -ne 0 ]]; then
+  if [[ $rc -eq 124 ]]; then
+    echo "mint script hung and was force-killed after 45s (possible network/subprocess wedge — see bead ez-gh-actions-hcu)" >&2
+  else
+    echo "failed to refresh ${TOKEN_PATH}; existing token left unchanged (exit code $rc)" >&2
+  fi
   exit 1
 fi
 
