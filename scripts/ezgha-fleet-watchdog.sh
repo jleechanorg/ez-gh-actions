@@ -46,6 +46,50 @@
 #      The old external script used `tee -a` INSIDE `log()` while the
 #      systemd unit ALSO captured stdout via StandardOutput=append to the
 #      SAME file — every line was written twice.
+#   5. State freshness — miss_count and last_restart state files are
+#      treated as stale (reset to 0 on read) if their mtime is older than
+#      $EZGHA_WATCHDOG_STATE_STALE_SECONDS (default 480s / 8min — 4x the
+#      systemd timer's 120s tick interval, tolerating up to 3 skipped/slow
+#      ticks; inside the 6-10min band that keeps genuinely-consecutive
+#      misses in a live run from ever being mistaken for stale). ONE
+#      mtime-age check, applied uniformly by both get_miss_count() and
+#      get_last_restart(), covers two distinct failure modes that would
+#      otherwise need separate handling:
+#        a) REBOOT-STALE-STATE — state files are plain files under
+#           ~/.local/state, not tmpfs, so they persist across a host
+#           reboot. The systemd timer fires 30s after boot (OnBootSec=30s).
+#           A stale miss_count>=threshold left over from before a reboot
+#           could otherwise trigger an immediate restart of a daemon that
+#           hasn't finished starting; a stale-but-recent last_restart could
+#           wrongly block a genuinely-needed post-reboot restart for the
+#           full cooldown window.
+#        b) General staleness — e.g. the watchdog itself was stopped for an
+#           extended period, or a timer tick was skipped/delayed (system
+#           load, or a hung probe before the C#2 timeout fix landed),
+#           leaving old counters to linger.
+#      Because the check applies on READ, a stale miss_count is normalized
+#      to 0 BEFORE the current tick's increment/comparison in
+#      evaluate_host() — a stale count can never combine with a fresh miss
+#      to reach the threshold early.
+#   6. Host-mismatch guard (both hosts) — check_mac() and check_linux()
+#      each skip (log only) when invoked bare (no explicit --host filter)
+#      on a host that doesn't match, rather than silently reading/acting on
+#      the OTHER host's state via ssh. Without this, a bare invocation on
+#      the Mac would run check_linux() over ssh using the Mac's own local
+#      state files — a second, uncoordinated watchdog instance racing
+#      against jeff-ubuntu's own systemd-timer-driven instance (separate
+#      miss counters, separate cooldowns) against the SAME remote daemon.
+#      Use `--host mac` / `--host linux` explicitly to force a cross-host
+#      check.
+#   7. Probe timeouts — every ezgha status probe and ssh invocation is
+#      wrapped in `timeout 30 ...`. A hung probe (or a hung remote command —
+#      ssh's own -o ConnectTimeout=5 only bounds the TCP handshake, not a
+#      stuck remote process) would otherwise wedge this script's
+#      `Type=oneshot` systemd unit indefinitely; since OnUnitActiveSec never
+#      re-fires while the unit is still running, a single hang would
+#      silently disable the watchdog exactly when the fleet needs it.
+#      systemd/ezgha-watchdog.service also sets TimeoutStartSec=90 as an
+#      independent backstop.
 #
 # Usage:
 #   ./ezgha-fleet-watchdog.sh                  # check both hosts, fix if needed
@@ -57,14 +101,18 @@
 #   0 = both checked hosts at or above configured count (or a restart fired)
 #   1 = one or more hosts below count and no restart was performed this tick
 #       (waiting for miss threshold, in cooldown, load gate tripped, or dry-run)
-#   2 = supervisor not installed / state unreadable on one or more hosts
+#   2 = supervisor not installed / state unreadable on one or more hosts /
+#       bad CLI arguments
 #
 # Env overrides (mainly for testing):
-#   EZGHA_BIN                     ezgha binary path (default: $HOME/.cargo/bin/ezgha)
-#   EZGHA_WATCHDOG_STATE_DIR      state dir (default: $HOME/.local/state/ezgha/watchdog)
-#   EZGHA_WATCHDOG_MISS_THRESHOLD consecutive misses before restart (default: 3)
-#   EZGHA_WATCHDOG_LOAD_THRESHOLD 1-min load ceiling for restart (default: 12)
+#   EZGHA_BIN                       ezgha binary path (default: $HOME/.cargo/bin/ezgha)
+#   EZGHA_WATCHDOG_STATE_DIR        state dir (default: $HOME/.local/state/ezgha/watchdog)
+#   EZGHA_WATCHDOG_MISS_THRESHOLD   consecutive misses before restart (default: 3)
+#   EZGHA_WATCHDOG_LOAD_THRESHOLD   1-min load ceiling for restart (default: 12)
 #   EZGHA_WATCHDOG_COOLDOWN_SECONDS minimum seconds between restarts per host (default: 1800)
+#   EZGHA_WATCHDOG_STATE_STALE_SECONDS
+#                                   max state-file age before miss_count/last_restart
+#                                   are treated as stale and reset to 0 (default: 480)
 
 set -uo pipefail
 
@@ -77,13 +125,21 @@ STATE_DIR="${EZGHA_WATCHDOG_STATE_DIR:-$HOME/.local/state/ezgha/watchdog}"
 MISS_THRESHOLD="${EZGHA_WATCHDOG_MISS_THRESHOLD:-3}"
 LOAD_THRESHOLD="${EZGHA_WATCHDOG_LOAD_THRESHOLD:-12}"
 COOLDOWN_SECONDS="${EZGHA_WATCHDOG_COOLDOWN_SECONDS:-1800}"
+# See guardrail 5 in the header comment above for the full rationale on this
+# default (4x the 120s timer tick interval, inside the 6-10min band).
+STATE_STALE_SECONDS="${EZGHA_WATCHDOG_STATE_STALE_SECONDS:-480}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --host) HOST_FILTER="$2"; shift 2 ;;
+    --host)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --host requires an argument (mac|linux)" >&2
+        exit 2
+      fi
+      HOST_FILTER="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,58p' "$0"
+      sed -n '2,115p' "$0"
       exit 0
       ;;
     *) shift ;;
@@ -94,8 +150,39 @@ log() { echo "[$TS] $*"; }
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
+# read_fresh_state prints the value stored in state file $1, unless the
+# file's mtime is older than $STATE_STALE_SECONDS, in which case it is
+# treated as stale/absent and "0" is printed instead (guardrail 5). Used by
+# BOTH get_miss_count() and get_last_restart() so a single age check covers
+# the reboot-stale-state scenario and general (non-reboot) staleness alike
+# — there is deliberately no separate boot-time-comparison mechanism; an
+# earlier version of this fix used one, but a plain mtime-age check
+# subsumes it (a reboot is just one way a state file's mtime can predate
+# "now" by more than the staleness window) while being simpler and
+# portable without any OS-specific boot-time lookup. Fails safe: missing
+# file -> "0" (unchanged base case); unreadable mtime -> NOT treated as
+# stale (falls through to the file's stored value) rather than crashing or
+# guessing.
+read_fresh_state() { # $1=state file path -> stored value, or 0 if missing/stale
+  local file="$1"
+  [[ -f "$file" ]] || { echo 0; return; }
+
+  local mtime
+  mtime="$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || true)"
+  if [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    local now
+    now="$(date +%s)"
+    if (( now - mtime > STATE_STALE_SECONDS )); then
+      echo 0
+      return
+    fi
+  fi
+
+  cat "$file" 2>/dev/null || echo 0
+}
+
 get_miss_count() { # $1=host
-  cat "$STATE_DIR/$1.miss_count" 2>/dev/null || echo 0
+  read_fresh_state "$STATE_DIR/$1.miss_count"
 }
 
 set_miss_count() { # $1=host $2=count
@@ -104,7 +191,7 @@ set_miss_count() { # $1=host $2=count
 }
 
 get_last_restart() { # $1=host -> epoch seconds, 0 if never
-  cat "$STATE_DIR/$1.last_restart" 2>/dev/null || echo 0
+  read_fresh_state "$STATE_DIR/$1.last_restart"
 }
 
 set_last_restart() { # $1=host $2=epoch
@@ -156,7 +243,7 @@ do_restart_linux() {
   if [[ "$(uname -s)" == "Linux" ]]; then
     systemctl --user restart ezgha.service 2>&1
   else
-    ssh -o ConnectTimeout=5 jeff-ubuntu "systemctl --user restart ezgha.service" 2>&1
+    timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu "systemctl --user restart ezgha.service" 2>&1
   fi
 }
 
@@ -242,7 +329,7 @@ check_mac() {
 
   local configured actual slots config_file="$HOME/.config/ezgha/config.toml"
   configured=$(grep -E "^count = " "$config_file" 2>/dev/null | grep -oE "[0-9]+")
-  actual=$("$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
+  actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
   slots=$(slot_count)
 
   if [[ -z "$configured" || -z "$actual" ]]; then
@@ -255,18 +342,39 @@ check_mac() {
 
 check_linux() {
   if [[ -n "$HOST_FILTER" && "$HOST_FILTER" != "linux" ]]; then return 0; fi
+  # Mirror of check_mac()'s Darwin guard. This function has an ssh-based
+  # remote path (below) that lets it manage jeff-ubuntu from a non-Linux
+  # host (e.g. running this script by hand on the Mac). That path reads and
+  # writes state files under THIS invoking host's own
+  # $EZGHA_WATCHDOG_STATE_DIR — completely independent of the
+  # miss-counter/last-restart state kept by the watchdog process that
+  # already runs natively ON jeff-ubuntu via the shipped systemd unit
+  # (systemd/ezgha-watchdog.service, which always passes --host linux). Two
+  # uncoordinated processes tracking separate miss-counters for the SAME
+  # remote daemon could each independently decide to restart it —
+  # reintroducing the exact restart-flapping this whole PR exists to
+  # prevent. Guard against a bare (no --host) invocation on a non-Linux host
+  # exactly like check_mac() guards against a bare invocation on a
+  # non-Darwin host; an explicit `--host linux` still opts in to the ssh
+  # path deliberately.
+  if [[ "$(uname -s)" != "Linux" && "$HOST_FILTER" != "linux" ]]; then
+    log "LINUX: skipping — running on non-Linux host with no explicit --host linux filter (ssh path would use locally-scoped state uncoordinated with the native jeff-ubuntu watchdog; see comment above check_linux)"
+    return 0
+  fi
   local configured actual slots
   if [[ "$(uname -s)" == "Linux" ]]; then
     configured=$(grep -E "^count = " "$HOME/.config/ezgha/config.toml" 2>/dev/null | grep -oE "[0-9]+")
-    actual=$("$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
+    actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
     slots=$(slot_count)
   else
-    configured=$(ssh -o ConnectTimeout=5 jeff-ubuntu 'grep -E "^count = " ~/.config/ezgha/config.toml 2>/dev/null | grep -oE "[0-9]+"' 2>/dev/null)
-    actual=$(ssh -o ConnectTimeout=5 jeff-ubuntu '$HOME/.cargo/bin/ezgha status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+"' 2>/dev/null)
+    configured=$(timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu 'grep -E "^count = " ~/.config/ezgha/config.toml 2>/dev/null | grep -oE "[0-9]+"' 2>/dev/null)
+    # shellcheck disable=SC2016  # single quotes intentional: $HOME/$(...) must expand on the REMOTE host, not locally. (shellcheck normally recognizes this for a bare `ssh` invocation but loses that context once wrapped in `timeout`.)
+    actual=$(timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu '$HOME/.cargo/bin/ezgha status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+"' 2>/dev/null)
     # Same single-value-capture fix as slot_count() above, applied inline
     # since this runs on the remote host via ssh rather than calling the
     # local function.
-    slots=$(ssh -o ConnectTimeout=5 jeff-ubuntu 'n=$(grep -c "=" ~/.config/ezgha/slot_assignments.toml 2>/dev/null); echo "${n:-0}"' 2>/dev/null)
+    # shellcheck disable=SC2016  # single quotes intentional: $(...) must run on the REMOTE host, not locally. (same shellcheck ssh-context quirk as above)
+    slots=$(timeout 30 ssh -o ConnectTimeout=5 jeff-ubuntu 'n=$(grep -c "=" ~/.config/ezgha/slot_assignments.toml 2>/dev/null); echo "${n:-0}"' 2>/dev/null)
   fi
 
   if [[ -z "$configured" || -z "$actual" ]]; then
