@@ -51,6 +51,18 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 ## Recent activity (rolling)
 
+### 2026-07-09 (ez-gh-actions) — /nextsteps sync + tracker status
+
+- Ran `/nextsteps` now to refresh tracker alignment after `1a02b36`.
+- Closed-bead/status sweep result: no new beads closed in this pass; critical P0 blockers remain `ez-gh-actions-5ki`, `ez-gh-actions-0jo`, `ez-gh-actions-lyf`.
+- Cross-host deployment bead `ez-gh-actions-4kv` remains open and should only close after Linux/Mac Gate-0-safe rollout with sustained per-slot `docker top` proof of full 22/22 running.
+- `1a02b36` (`codex/gpt-5: avoid backend restart churn when docker reachable`) is now part of the active timeline and did not close the reconcile race gap in Path 4.
+
+- Closed `ez-gh-actions-o6i` (`next-steps-2026-07-08`) after completing a post-failure tracker pass.
+- Landed `codex/gpt-5: avoid backend restart churn when docker reachable` ([`1a02b36`](https://github.com/jleechanorg/ez-gh-actions/commit/1a02b36)) on Linux.
+- P0 reconciliation race blockers remain open: `ez-gh-actions-5ki`, `ez-gh-actions-0jo`, `ez-gh-actions-lyf`.
+- Cross-host deploy task `ez-gh-actions-4kv` is still open; coordinate Gate-0-safe deploy + full 22/22 proof before claiming full health.
+
 ### 2026-07-09 (ez-gh-actions) — Linux/macOS runner convergence root-cause
 
 - Confirmed root cause of current cap shortfall is reconciliation instability, not a long-term worker-availability loss.
