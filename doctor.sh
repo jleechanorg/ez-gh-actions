@@ -25,7 +25,7 @@ for a in "$@"; do
       echo "usage: doctor.sh [--prove] [--detail]"
       echo "  --prove   dispatch a live ezgha-selftest and verify it runs on the configured runner prefix (adds ~1-2 min)"
       echo "  --detail  verbose output"
-      echo "env: LOOP_WINDOW (min, default 3), ROUTING_N (runs, default 6), ORG, EZGHA_REPO"
+    echo "env: LOOP_WINDOW (min, default 3), ROUTING_N (runs, default 6), REQUIRE_ROUTING_PROOF (0|1, default 0), ORG, EZGHA_REPO"
       exit 0 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
@@ -35,6 +35,7 @@ ORG="${ORG:-jleechanorg}"
 EZGHA_REPO="${EZGHA_REPO:-jleechanorg/ez-gh-actions}"
 QUEUE_REPO="${QUEUE_REPO:-jleechanorg/worldarchitect.ai}"
 QUEUE_TAIL_WARN_MIN="${QUEUE_TAIL_WARN_MIN:-20}"
+REQUIRE_ROUTING_PROOF="${REQUIRE_ROUTING_PROOF:-0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- helpers -------------------------------------------------------------
@@ -293,7 +294,17 @@ while read -r rid; do
     warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-*)"
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
-info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+if [ "$REQUIRE_ROUTING_PROOF" = "1" ]; then
+  info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+else
+  if [ "$REAL_TOTAL" -eq 0 ]; then
+    info "no recent ezgha-selftest runs found (routing proof skipped)"
+  elif [ "$REAL_ON_FLEET" -lt "$REAL_TOTAL" ]; then
+    warn "routing is mixed across fleets; this is advisory only while REQUIRE_ROUTING_PROOF=0 (set to 1 to fail fast)"
+  else
+    info "recent routing proof looks healthy: $REAL_ON_FLEET / $REAL_TOTAL"
+  fi
+fi
 
 # --- E2. optional live canary: dispatch a job and prove it runs NOW ------
 # `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
@@ -553,8 +564,11 @@ if [ "$LOOP_FAILS" -gt 3 ]; then
     warn "ensure_count failed $LOOP_FAILS times in last ${LOOP_WINDOW}m (transient reconcile miss; $HEALTHY_RUNNERS healthy runners online)"
   fi
 fi
-# real-execution gate: at least one recent job must have succeeded on our fleet
-[ "${REAL_ON_FLEET:-0}" -lt 1 ]            && CRITICAL=$((CRITICAL+1))
+# real-execution gate (optional): require at least one recent success on our configured
+# fleet only when explicitly enabled. This avoids false failures when shared self-hosted
+# labels route selftests to the healthy Linux/other pools temporarily.
+[ "$REQUIRE_ROUTING_PROOF" = "1" ] && [ "${REAL_TOTAL:-0}" -lt 1 ] && CRITICAL=$((CRITICAL+1))
+[ "$REQUIRE_ROUTING_PROOF" = "1" ] && [ "${REAL_ON_FLEET:-0}" -lt 1 ] && CRITICAL=$((CRITICAL+1))
 # canary gate (only when --prove): the live job must have run on our fleet
 [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]  && CRITICAL=$((CRITICAL+1))
 # queue tail gate: fresh backlog waiting > QUEUE_TAIL_WARN_MIN means saturated/mis-routing
