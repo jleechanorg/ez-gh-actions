@@ -208,14 +208,33 @@ evaluate_host() {
   fi
 
   log "$label: RESTARTING (miss=$misses >= $MISS_THRESHOLD, cooldown clear, load ok)"
-  "$restart_fn" | while IFS= read -r line; do log "$label: $line"; done
-  set_last_restart "$host" "$(date +%s)"
-  set_miss_count "$host" 0
+  local restart_output restart_rc=0
+  restart_output="$("$restart_fn" 2>&1)" || restart_rc=$?
+  while IFS= read -r line; do log "$label: $line"; done <<< "$restart_output"
+  if [[ "$restart_rc" -eq 0 ]]; then
+    set_last_restart "$host" "$(date +%s)"
+    set_miss_count "$host" 0
+  else
+    log "$label: RESTART FAILED (exit=$restart_rc) — miss counter and last-restart NOT updated, will retry next eligible tick"
+  fi
   return 0
 }
 
 check_mac() {
   if [[ -n "$HOST_FILTER" && "$HOST_FILTER" != "mac" ]]; then return 0; fi
+  # KNOWN GAP: unlike check_linux(), this function has no ssh-based remote
+  # fallback for reaching the actual Mac host from a non-Mac invoker — this
+  # repo has no established `ssh macbook`-style convention to mirror (only
+  # `ssh jeff-ubuntu` exists). If invoked bare (no --host mac) on a non-Darwin
+  # host, it would otherwise silently read the LOCAL host's own ezgha state
+  # and mislabel it "MAC". Guard against that footgun explicitly. This is not
+  # exploitable in production today because the shipped
+  # systemd/ezgha-watchdog.service always passes --host linux, which skips
+  # this function entirely via the HOST_FILTER check above.
+  if [[ "$(uname -s)" != "Darwin" && "$HOST_FILTER" != "mac" ]]; then
+    log "MAC: skipping — running on non-Darwin host with no explicit --host mac filter (no ssh fallback implemented; see comment above check_mac)"
+    return 0
+  fi
   if ! command -v "$EZGHA" >/dev/null 2>&1; then
     log "MAC: ezgha binary not found at $EZGHA"
     return 2
