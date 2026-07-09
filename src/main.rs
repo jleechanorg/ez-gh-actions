@@ -143,6 +143,14 @@ fn log_skipped_stronger_backends(skipped_stronger: &[backend::Backend], backend:
     }
 }
 
+fn docker_reachable() -> bool {
+    std::process::Command::new("docker")
+        .args(["info", "--format", "{{.ServerVersion}}"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
     let plat = platform::detect();
     match backend::select(&plat, cfg.policy.minimum_isolation) {
@@ -165,12 +173,7 @@ fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
         Selection::None => {
             // Improved diagnostic (bead jyy): probe docker directly so the
             // operator gets an actionable error instead of a generic message.
-            let docker_reachable = std::process::Command::new("docker")
-                .args(["info", "--format", "{{.ServerVersion}}"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if docker_reachable {
+            if docker_reachable() {
                 bail!(
                     "no usable backend found — docker is reachable but no suitable backend was selected \
                      (check policy.minimum_isolation in config). Run `ezgha doctor` for details."
@@ -217,6 +220,7 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                 best_available.name()
             ),
             Selection::None => {
+                let docker_reachable = docker_reachable();
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     // Exhausted budget — surface the same rich diagnostic as choose_backend.
@@ -231,8 +235,10 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                 }
                 let wait = retry_interval.min(remaining);
                 eprintln!(
-                    "no usable backend yet — docker daemon not reachable, retrying in {}s \
+                    "no usable backend yet — docker daemon {}{}, retrying in {}s \
                      ({}s remaining before giving up)",
+                    if docker_reachable { "reachable" } else { "not reachable" },
+                    if docker_reachable { " but no usable backend was selected" } else { "" },
                     wait.as_secs(),
                     remaining.as_secs()
                 );
@@ -400,6 +406,12 @@ fn backend_restart_can_help(selection: &Selection) -> bool {
 fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoveryState) -> bool {
     let selection = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
     if !backend_restart_can_help(&selection) {
+        return false;
+    }
+    if matches!(selection, Selection::None) && docker_reachable() {
+        eprintln!(
+            "backend selection is NONE but docker is reachable; skipping restart to avoid unnecessary churn"
+        );
         return false;
     }
     if !recovery.allow_restart(cfg) {
