@@ -403,9 +403,10 @@ fi
 # IDLE, waiting for work). This section enumerates every CONFIGURED slot —
 # not just however many containers happen to exist — so a slot that never
 # got a container at all (DOWN) is reported by name, not silently absent.
-section "9. per-slot local execution proof (docker top, LOCAL-ONLY)"
+section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
 CONFIGURED_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
 CONFIGURED_COUNT="${CONFIGURED_COUNT:-16}"
+HOST_LABEL="$PLATFORM ($(hostname -s 2>/dev/null || hostname))"
 
 classify_local_slot() {
   # Echoes one of: DOWN | IDLE | EXECUTING for container name "$1".
@@ -437,13 +438,20 @@ for _i in $(seq 1 "$CONFIGURED_COUNT"); do
     EXECUTING) EXECUTING_SLOTS+=("$_name") ;;
   esac
 done
-info "Linux slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
+info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
 
-# IDLE is only a defect when there is a backlog of queued self-hosted work
-# (reuses QUEUE_QUEUED_FRESH from section 8 above) — an idle fleet with an
-# empty queue is healthy, not starved. DOWN is always a defect regardless.
-BACKLOG_PRESENT=0
-[ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ] && BACKLOG_PRESENT=1
+# IDLE is only a defect (IDLE-STARVED) once the queue has been non-empty for
+# at least IDLE_STARVED_THRESHOLD_MIN minutes — a single-tick queue blip (job
+# just created, not yet picked up) is not starvation. QUEUE_OLDEST_FRESH_AGE_MIN
+# (from scripts/queue-health.sh, section 8) is how long the oldest fresh
+# queued run has actually been waiting — the correct sustained-duration
+# signal, not just instantaneous QUEUE_QUEUED_FRESH>0. DOWN is always a
+# defect regardless of queue state.
+IDLE_STARVED_THRESHOLD_MIN="${IDLE_STARVED_THRESHOLD_MIN:-5}"
+STARVED_PRESENT=0
+if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ] && awk -v a="${QUEUE_OLDEST_FRESH_AGE_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
+  STARVED_PRESENT=1
+fi
 
 SLOT_PROOF_CRITICAL=0
 if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
@@ -451,14 +459,16 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
   SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#DOWN_SLOTS[@]}))
 fi
 if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
-  if [ "$BACKLOG_PRESENT" -eq 1 ]; then
-    bad "IDLE-with-backlog (${QUEUE_QUEUED_FRESH} jobs queued) — ${#IDLE_SLOTS[@]} slot(s): ${IDLE_SLOTS[*]}"
+  if [ "$STARVED_PRESENT" -eq 1 ]; then
+    bad "IDLE-STARVED (${QUEUE_QUEUED_FRESH} jobs queued, oldest waiting ${QUEUE_OLDEST_FRESH_AGE_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#IDLE_SLOTS[@]} slot(s): ${IDLE_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#IDLE_SLOTS[@]}))
+  elif [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
+    info "IDLE-OK (${QUEUE_QUEUED_FRESH} job(s) queued ${QUEUE_OLDEST_FRESH_AGE_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold, not yet starved): ${IDLE_SLOTS[*]}"
   else
-    info "idle (no queue backlog, expected): ${IDLE_SLOTS[*]}"
+    info "IDLE-OK (nothing queued): ${IDLE_SLOTS[*]}"
   fi
 fi
-[ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "executing right now: ${EXECUTING_SLOTS[*]}"
+[ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "EXECUTING right now: ${EXECUTING_SLOTS[*]}"
 
 # --- F4. EXPLICIT-WORK INVENTORY (every Configured slot, every machine) --
 # The user's bar is concrete: list each runner's job OR say the queue has no
@@ -469,32 +479,54 @@ fi
 # All from local-truth sources; no GitHub API counts.
 section "10. EXPLICIT-WORK INVENTORY (every config'd runner, every machine)"
 EXPLICIT_WORK_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-# Cache runner-registry (name<->id) and in_progress runs once so we don't
-# re-hit the org API per slot. The set +e / set -e sandwich prevents
-# `set -euo pipefail` from killing the script on a transiently-empty
-# jq result. Important: GitHub has no `/orgs/{org}/actions/runs` endpoint
-# (404), so in_progress runs have to be queried at the *repo* level. We
-# query the known consumer repo (worldarchitect.ai) plus the ezgha
-# self-tested repo (ez-gh-actions) so we cover what the runners can
-# actually be working on.
-set +e
-RUNNERS_JSON=$(gh api "/orgs/jleechanorg/actions/runners?per_page=100" 2>/dev/null)
-IN_PROGRESS_WAI_JSON=$(gh api "/repos/jleechanorg/worldarchitect.ai/actions/runs?status=in_progress&per_page=100" 2>/dev/null)
-IN_PROGRESS_EZG_JSON=$(gh api "/repos/jleechanorg/ez-gh-actions/actions/runs?status=in_progress&per_page=100" 2>/dev/null)
-IN_PROGRESS_ALL_JSON=$(printf '%s\n%s' "$IN_PROGRESS_WAI_JSON" "$IN_PROGRESS_EZG_JSON" \
-  | jq -s '{total_count: ([.[0].total_count//0, .[1].total_count//0] | add), workflow_runs: ([.[0].workflow_runs//[], .[1].workflow_runs//[]] | add)}' 2>/dev/null)
-set -e
-gh_runner_id_for_name() {
-  [ -z "$RUNNERS_JSON" ] && return 0
-  printf '%s' "$RUNNERS_JSON" | jq -r --arg n "$1" '.runners[]? // empty | select(.name==$n) | .id // empty' 2>/dev/null | head -1
+# Ground truth for "what job is this runner executing" is the per-run JOBS
+# API (repos/{repo}/actions/runs/{run_id}/jobs), which carries runner_name
+# directly. The workflow-RUN object has NO runner_id/runner_name field at
+# all (verified against a live in-progress run 2026-07-09) — the prior
+# implementation joined on `.runner_id` against run objects, which does not
+# exist, so the join silently never matched and every EXECUTING slot fell
+# through to the "no run mapped" placeholder regardless of real activity.
+# We enumerate in-progress runs on the repos our fleet actually serves, then
+# each run's jobs, and index by runner_name so EXECUTING slots get real job
+# name + repo + elapsed + run URL. The set +e / set -e sandwich prevents
+# `set -euo pipefail` from killing the script on a transiently-empty result.
+EXPLICIT_WORK_REPOS="${EXPLICIT_WORK_REPOS:-jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions}"
+build_runner_job_index() {
+  local repo run_ids rid runs_json jobs_json
+  for repo in $EXPLICIT_WORK_REPOS; do
+    runs_json=$(gh api "repos/$repo/actions/runs?status=in_progress&per_page=50" 2>/dev/null) || continue
+    run_ids=$(printf '%s' "$runs_json" | jq -r '.workflow_runs[]?.id // empty' 2>/dev/null)
+    for rid in $run_ids; do
+      jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || continue
+      printf '%s' "$jobs_json" | jq -c --arg repo "$repo" \
+        '.jobs[]? | select(.status=="in_progress") | {runner_name, job_name: .name, repo: $repo, html_url, started_at}' 2>/dev/null
+    done
+  done
 }
-gh_run_summary_for_runner() {
-  local runnerid="$1"
-  [ -z "$runnerid" ] && return 0
-  [ -z "$IN_PROGRESS_ALL_JSON" ] && return 0
-  printf '%s' "$IN_PROGRESS_ALL_JSON" \
-    | jq -r --arg r "$runnerid" '.workflow_runs[]? // empty | select(.runner_id==($r|tonumber)) | "run=\(.databaseId) name=\(.name) repo=\(.repository.full_name) branch=\(.head_branch)"' 2>/dev/null | head -1
-  true
+set +e
+RUNNER_JOB_INDEX_JSON=$(build_runner_job_index | jq -s '.' 2>/dev/null)
+set -e
+[ -z "$RUNNER_JOB_INDEX_JSON" ] && RUNNER_JOB_INDEX_JSON='[]'
+job_evidence_for_runner() {
+  # Prints "job=<name> repo=<repo> elapsed=<X>m url=<url>" or empty if this
+  # runner has no matching in-progress job in the index right now.
+  local name="$1" rec job_name repo html_url started_at elapsed_min
+  rec=$(printf '%s' "$RUNNER_JOB_INDEX_JSON" | jq -c --arg n "$name" '.[] | select(.runner_name==$n)' 2>/dev/null | head -1)
+  [ -z "$rec" ] && return 0
+  job_name=$(printf '%s' "$rec" | jq -r '.job_name')
+  repo=$(printf '%s' "$rec" | jq -r '.repo')
+  html_url=$(printf '%s' "$rec" | jq -r '.html_url')
+  started_at=$(printf '%s' "$rec" | jq -r '.started_at')
+  elapsed_min=$(python3 -c "
+import datetime
+try:
+    s = datetime.datetime.fromisoformat('$started_at'.replace('Z', '+00:00'))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    print(f'{(now - s).total_seconds() / 60:.1f}')
+except Exception:
+    print('?')
+" 2>/dev/null)
+  printf 'job=%s repo=%s elapsed=%sm url=%s' "$job_name" "$repo" "${elapsed_min:-?}" "$html_url"
 }
 list_slot_work() {
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
@@ -502,7 +534,7 @@ list_slot_work() {
   local ok=0 idl=0 dn=0 busy=0
   for i in $(seq 1 "$count"); do
     local name="${prefix}-${i}"
-    local running work runnerid jobline
+    local running work jobline
     if [ "$host" = "localhost" ]; then
       running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
     else
@@ -521,76 +553,76 @@ list_slot_work() {
     if [ "$work" -eq 0 ]; then
       busy=$((busy+1))
       ok=$((ok+1))
-      # Map runner name -> runner id -> active run summary. If the API fails
-      # (rate-limit, etc.) we still report EXECUTING with a "(api lookup
-      # unavailable)" note rather than hiding that there's real work.
       set +e
-      runnerid=$(gh_runner_id_for_name "$name")
-      jobline=""
-      runner_state="online"
-      if [ -n "$RUNNERS_JSON" ] && [ -n "$runnerid" ]; then
-        runner_state=$(printf '%s' "$RUNNERS_JSON" | jq -r --arg r "$runnerid" '.runners[]? // empty | select(.id==($r|tonumber)) | .status // "unknown"' 2>/dev/null | head -1)
-      fi
-      if [ -n "$runnerid" ]; then
-        jobline=$(gh_run_summary_for_runner "$runnerid")
-      fi
+      jobline=$(job_evidence_for_runner "$name")
       set -e
       if [ -z "$jobline" ]; then
-        # Three legitimate reasons: (a) runner id missing from org registry
-        # — likely freshly started, GH registry updates lag 5-15s; (b) job
-        # was just dispatched, GitHub hasn't yet recorded runner_id on the
-        # run (race window); (c) org API rate-limit truncated the response.
-        # We must NOT hide EXECUTING behind this — the Runner.Worker process
-        # is the ground truth. Show all signals.
-        if [ -z "$runnerid" ]; then
-          jobline="(runner id not in current org registry yet — registry lags ~5-15s after container start; status $runner_state; Runner.Worker pid is the ground truth)"
-        else
-          jobline="(runner id=$runnerid, status=$runner_state, but GitHub has no in_progress run mapped to it right now — likely a race: Runner.Worker started ~2-8s ago, GH hasn't recorded it yet)"
-        fi
+        # Runner.Worker process is running (local ground truth) but no
+        # in-progress job in the index matched this runner_name yet — a
+        # race window (job just dispatched, GH hasn't recorded it) or the
+        # job is on a repo not in EXPLICIT_WORK_REPOS. Never hide EXECUTING
+        # behind this; the process is the ground truth.
+        jobline="(no in-progress job matched runner_name=$name in $EXPLICIT_WORK_REPOS yet — likely a 2-8s dispatch race; Runner.Worker pid is the ground truth)"
       fi
-      printf "    %-22s EXECUTING %s  → %s\n" "$name" "id=${runnerid:-?} $runner_state" "$jobline"
+      printf "    %-22s EXECUTING → %s\n" "$name" "$jobline"
     else
       idl=$((idl+1))
-      # Distinguish healthy-idle (queue empty) from starved-idle (queue
-      # non-empty). This is the ONLY thing the user asked us to be precise
-      # about — "queue has no pending items" means IDLE is healthy.
-      if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
-        printf "    %-22s IDLE — %d fresh queued jobs waiting (could be receiving one)\n" "$name" "$QUEUE_QUEUED_FRESH"
+      # 4-state model: IDLE-OK (nothing queued, or queued but under the
+      # sustained-starvation threshold) vs IDLE-STARVED (queue has been
+      # non-empty for >= IDLE_STARVED_THRESHOLD_MIN minutes — see section 9).
+      if [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
+        printf "    %-22s IDLE-STARVED — %d fresh queued jobs, oldest waiting %sm >= %sm threshold\n" "$name" "$QUEUE_QUEUED_FRESH" "$QUEUE_OLDEST_FRESH_AGE_MIN" "$IDLE_STARVED_THRESHOLD_MIN"
+      elif [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
+        printf "    %-22s IDLE-OK — %d job(s) queued %sm < %sm threshold (not yet starved)\n" "$name" "$QUEUE_QUEUED_FRESH" "$QUEUE_OLDEST_FRESH_AGE_MIN" "$IDLE_STARVED_THRESHOLD_MIN"
       else
-        printf "    %-22s IDLE — queue empty (healthy)\n" "$name"
+        printf "    %-22s IDLE-OK — nothing queued\n" "$name"
       fi
     fi
   done
   printf "  %s totals: %d executing, %d idle, %d down  (of %d configured)\n" "$label" "$busy" "$idl" "$dn" "$count"
 }
 
-# Linux fleet (local)
-LINUX_PREFIX="${RUNNER_NAME_PREFIX:-ez-runner-c}"
-LINUX_COUNT="${CONFIGURED_COUNT:-16}"
-list_slot_work "$LINUX_PREFIX" "$LINUX_COUNT" "localhost" "LINUX (jeff-ubuntu)"
+# Local fleet — whichever host this script is actually running on (was
+# hardcoded "LINUX (jeff-ubuntu)" regardless of $PLATFORM, so running this
+# ON the Mac mislabeled the Mac's own fleet as Linux's — fixed to report the
+# true local host so evidence provenance is never ambiguous).
+LOCAL_PREFIX="${RUNNER_NAME_PREFIX:-ez-runner-c}"
+LOCAL_COUNT="${CONFIGURED_COUNT:-16}"
+list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 
-# Mac fleet (SSH) — only when reachable. Never dead when unreachable.
-if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$EXPLICIT_WORK_HOST" true >/dev/null 2>&1; then
-  MAC_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
-  MAC_COUNT="${MAC_RUNNER_COUNT:-6}"
-  list_slot_work "$MAC_PREFIX" "$MAC_COUNT" "$EXPLICIT_WORK_HOST" "MAC ($EXPLICIT_WORK_HOST)"
+# Remote fleet (SSH) — the OTHER half of the two-host fleet. Only when
+# reachable. Never dead when unreachable.
+if [ "$PLATFORM" = "macos" ]; then
+  REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
+  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
+  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-16}"
+  REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
-  printf "\n  MAC (%s): not reachable via SSH — per-slot work inventory skipped\n" "$EXPLICIT_WORK_HOST"
+  REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
+  REMOTE_COUNT="${MAC_RUNNER_COUNT:-6}"
+  REMOTE_LABEL="macos ($REMOTE_HOST)"
+fi
+if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
+  list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
+else
+  printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
 fi
 
-# Optional Mac fleet probe via SSH — best-effort, never fatal if unreachable
-# (the mission's fleet is "16 Linux + 6 Mac"; the Mac half is proven the
-# same way, over SSH, when the host is reachable).
-MAC_HOST="${MAC_HOST:-macbook}"
-MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
-MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-6}"
-if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/null 2>&1; then
-  MAC_DOWN_SLOTS=()
-  MAC_IDLE_SLOTS=()
-  MAC_EXECUTING_SLOTS=()
-  MAC_REPORT=$(timeout 20 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" "
-    for i in \$(seq 1 $MAC_RUNNER_COUNT); do
-      name=\"${MAC_RUNNER_NAME_PREFIX}-\${i}\"
+# Remote-fleet probe via SSH, for the verdict's SLOT_PROOF_CRITICAL count —
+# best-effort, never fatal if unreachable. Uses the same REMOTE_HOST/PREFIX/
+# COUNT resolved above (macos->jeff-ubuntu when running on the Mac,
+# linux->macbook when running on Linux) so DOWN/STARVED counting is
+# symmetric regardless of which host doctor-runner is invoked from — was
+# previously hardcoded to always SSH to "macbook", which silently omitted
+# jeff-ubuntu's DOWN/STARVED slots from the verdict when run on the Mac.
+if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
+  REMOTE_DOWN_SLOTS=()
+  REMOTE_IDLE_SLOTS=()
+  REMOTE_EXECUTING_SLOTS=()
+  REMOTE_REPORT=$(timeout 20 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" "
+    for i in \$(seq 1 $REMOTE_COUNT); do
+      name=\"${REMOTE_PREFIX}-\${i}\"
       running=\$(docker inspect -f '{{.State.Running}}' \"\$name\" 2>/dev/null || echo false)
       if [ \"\$running\" != true ]; then echo \"\$name DOWN\"; continue; fi
       if docker top \"\$name\" -eo pid,comm 2>/dev/null | grep -qw Worker; then
@@ -603,22 +635,22 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/nul
   while read -r _name _state; do
     [ -z "$_name" ] && continue
     case "$_state" in
-      DOWN)      MAC_DOWN_SLOTS+=("$_name") ;;
-      IDLE)      MAC_IDLE_SLOTS+=("$_name") ;;
-      EXECUTING) MAC_EXECUTING_SLOTS+=("$_name") ;;
+      DOWN)      REMOTE_DOWN_SLOTS+=("$_name") ;;
+      IDLE)      REMOTE_IDLE_SLOTS+=("$_name") ;;
+      EXECUTING) REMOTE_EXECUTING_SLOTS+=("$_name") ;;
     esac
-  done <<< "$MAC_REPORT"
-  info "Mac slots (local proof via ssh): ${#MAC_EXECUTING_SLOTS[@]} executing, ${#MAC_IDLE_SLOTS[@]} idle, ${#MAC_DOWN_SLOTS[@]} down (of $MAC_RUNNER_COUNT configured)"
-  if [ "${#MAC_DOWN_SLOTS[@]}" -gt 0 ]; then
-    bad "Mac DOWN (no container) — ${#MAC_DOWN_SLOTS[@]} slot(s): ${MAC_DOWN_SLOTS[*]}"
-    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#MAC_DOWN_SLOTS[@]}))
+  done <<< "$REMOTE_REPORT"
+  info "$REMOTE_LABEL slots (remote proof via ssh): ${#REMOTE_EXECUTING_SLOTS[@]} executing, ${#REMOTE_IDLE_SLOTS[@]} idle, ${#REMOTE_DOWN_SLOTS[@]} down (of $REMOTE_COUNT configured)"
+  if [ "${#REMOTE_DOWN_SLOTS[@]}" -gt 0 ]; then
+    bad "$REMOTE_LABEL DOWN (no container) — ${#REMOTE_DOWN_SLOTS[@]} slot(s): ${REMOTE_DOWN_SLOTS[*]}"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_DOWN_SLOTS[@]}))
   fi
-  if [ "${#MAC_IDLE_SLOTS[@]}" -gt 0 ] && [ "$BACKLOG_PRESENT" -eq 1 ]; then
-    bad "Mac IDLE-with-backlog — ${#MAC_IDLE_SLOTS[@]} slot(s): ${MAC_IDLE_SLOTS[*]}"
-    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#MAC_IDLE_SLOTS[@]}))
+  if [ "${#REMOTE_IDLE_SLOTS[@]}" -gt 0 ] && [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
+    bad "$REMOTE_LABEL IDLE-STARVED (oldest queued ${QUEUE_OLDEST_FRESH_AGE_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#REMOTE_IDLE_SLOTS[@]} slot(s): ${REMOTE_IDLE_SLOTS[*]}"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_IDLE_SLOTS[@]}))
   fi
 else
-  warn "Mac ($MAC_HOST) not reachable via SSH — skipping Mac per-slot proof"
+  warn "$REMOTE_LABEL not reachable via SSH — skipping remote per-slot proof"
 fi
 
 # Serve-loop-starvation signal: the largest gap between respawn bursts, plus

@@ -6,7 +6,7 @@
 ## Fleet capacity standard — no excuses, prove per-slot execution
 The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16 on jeff-ubuntu) + **6 Mac** (ez-mac-runner-b-1..6) = **22 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 22/22 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
 - **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returns TRUNCATED/partial data — the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
-- `./doctor.sh` enforces this with a per-slot executing gate. Run it; fix any DOWN (no container) or IDLE (container up, no Runner.Worker) slot before declaring the fleet healthy.
+- **`./doctor-runner` is authoritative** (`./doctor.sh` is LEGACY/BROKEN on docker 27+ — see bead ez-gh-actions-91r — kept only as a back-reference). It enforces per-slot activity truth with a 4-state model: EXECUTING (job+repo+run URL+elapsed evidence) / IDLE-OK (nothing queued, or queued for less than `IDLE_STARVED_THRESHOLD_MIN`=5min — healthy) / IDLE-STARVED (queued >=5min — defect) / DOWN (no container — defect). A busy fleet must never measure as dead — the motivating defect this replaced was a tail-grep on "Listening for Jobs" that read a fully-busy fleet as 0/22 healthy. Run it; fix any DOWN or IDLE-STARVED slot before declaring the fleet healthy.
 - Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 16). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
 
 ## Key files
@@ -14,11 +14,11 @@ The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16
 - `src/github.rs` — GitHub API calls (JIT config, runner registration, conflict resolution)
 - `src/main.rs` — CLI entry point
 - `~/.config/ezgha/config.toml` — runtime config (do NOT commit this)
-- `doctor.sh` — fleet health check script
+- `doctor-runner` — authoritative fleet health check script (`doctor.sh` is a deprecated back-reference, broken on docker 27+)
 - `docs/verify-exit-criteria.sh` — ironclad exit criteria checker (Gates 0–10)
 - `Dockerfile.runner` — custom runner image with `gh` + `jq` pre-installed
 - `.claude/skills/ezgha-doctor/SKILL.md` — diagnostic + self-healing recipes
-- `.claude/commands/doctor.md` — `/doctor` slash command
+- `.claude/commands/doctor-ezactions.md` — `/doctor-ezactions` slash command (`.claude/commands/doctor.md` is a deprecation stub pointing here)
 
 ## Custom runner image (IMPORTANT)
 The config must use `ezgha-runner:latest` (built from `Dockerfile.runner`), NOT the bare `ghcr.io/actions/actions-runner:latest` image.
@@ -75,9 +75,9 @@ systemctl --user status ezgha.service
 limactl start colima
 ```
 
-## /doctor command
-Running `/doctor` in this repo executes:
-1. `./doctor.sh` — fleet health check
+## /doctor-ezactions command
+Running `/doctor-ezactions` in this repo executes (bare `/doctor` is a deprecated alias):
+1. `./doctor-runner` — fleet health check (4-state per-slot activity truth)
 2. `./docs/verify-exit-criteria.sh` — ironclad exit criteria (Gates 0–10)
 
 Self-heal any failures found before reporting.

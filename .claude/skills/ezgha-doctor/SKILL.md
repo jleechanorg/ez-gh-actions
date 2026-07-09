@@ -87,23 +87,37 @@ The doctor groups failures into 10 sections (9 legacy + section 10 explicit-work
 6. **live docker containers** — at least 14/16 containers should be running locally with `ezgha=managed` label.
 9. **per-slot local execution proof** — see "Step 2b" below. This is the ironclad, GitHub-API-independent enforcement of "N/N runners actually executing."
 
-### Step 2b — Per-slot local execution proof (section 9, ironclad gate)
+### Step 2b — Per-slot activity truth (section 9, ironclad gate)
 
 Sections 5/6 ("online" at GitHub, container count) can both be **fooled by a
 GitHub API rate limit** — "online"/"busy" flags go stale or the query itself
-fails, and container *count* alone can't tell IDLE apart from EXECUTING.
+fails, and container *count* alone can't tell idle apart from executing. A
+naive `docker logs | grep "Listening for Jobs"` check is worse: it reads a
+fully-busy fleet as 0/22 healthy, because an EXECUTING runner doesn't print
+that line while it's running a job (observed 2026-07-09: 0/19 "listening"
+while 9 jobs were in_progress — the motivating defect for this section).
+
 Section 9 fixes this by proving state from **docker only, never GitHub**:
-for every CONFIGURED slot (`${RUNNER_NAME_PREFIX}-1..count`, plus the Mac
-fleet over SSH to `macbook` if reachable), it runs `docker inspect` +
-`docker top <container> -eo cmd | grep Runner.Worker` and classifies each
-slot as:
+for every CONFIGURED slot (`${RUNNER_NAME_PREFIX}-1..count`, plus the other
+host's fleet over SSH — `jeff-ubuntu` when run on the Mac, `macbook` when run
+on Linux — if reachable), it runs `docker inspect` + `docker top <container>
+-eo pid,comm | grep Worker` and classifies each slot into exactly one of
+four states:
 
 - **DOWN** — no running container at all. Always a defect.
-- **IDLE** — container up, `Runner.Listener` present, no `Runner.Worker`. A
-  defect **only when there's a queue backlog** (`QUEUE_QUEUED_FRESH > 0`,
-  reused from section 8) — idle with an empty queue is healthy, not starved.
+- **IDLE-STARVED** — container up, `Runner.Listener` present, no
+  `Runner.Worker`, AND the queue has been non-empty for
+  `>= IDLE_STARVED_THRESHOLD_MIN` minutes (default 5; `QUEUE_OLDEST_FRESH_AGE_MIN`
+  from section 8, not just instantaneous `QUEUE_QUEUED_FRESH > 0` — a
+  single-tick queue blip is not starvation). A defect.
+- **IDLE-OK** — idle, and either nothing is queued or the queue has been
+  non-empty for less than the threshold. Healthy, not a defect.
 - **EXECUTING** — `Runner.Worker` present. This is the actual per-slot proof
-  the mission's "22/22 executing" standard requires.
+  the mission's "22/22 executing" standard requires. Section 10 attributes
+  each EXECUTING slot to a real job (name + repo + elapsed + run URL) via
+  the GitHub **jobs** API (`runs/{id}/jobs`, matched on `runner_name`) — the
+  workflow-run object itself has no `runner_id`/`runner_name` field, so a
+  lookup against the runs list alone silently never matches.
 
 It also surfaces the **serve-loop-starvation signal**: the largest gap (in
 seconds, Linux-only — journalctl has per-line timestamps, macOS's redirected
