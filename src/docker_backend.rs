@@ -377,6 +377,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     // Mirrors the qbl helper signature but iterates `live_runners` directly
     // keyed on `runner.name` prefix (Path 1 has already wiped the slot-file
     // row, so the runner_id is no longer reachable from `assignments`).
+    let mut reaped_ids = HashSet::new();
     if let Some(local_names) = local_container_names.as_ref() {
         for (runner_id, runner_name) in offline_not_busy_owned_missing_container_registrations(
             &live_runners,
@@ -389,6 +390,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             match github::remove_runner(&cfg.github, runner_id) {
                 Ok(()) => {
                     reclaimed += 1;
+                    reaped_ids.insert(runner_id);
                     watchdog::ping();
                 }
                 Err(err) if is_runner_busy_lock_error(&err) => {
@@ -406,6 +408,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
                         .is_some_and(|r| reclaim_zombie_locked_runner(cfg, r));
                     if healed {
                         reclaimed += 1;
+                        reaped_ids.insert(runner_id);
                         watchdog::ping();
                     } else {
                         eprintln!(
@@ -447,6 +450,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     for r in &live_runners {
         if r.name.starts_with(&prefix)
             && !owned_ids.contains(&r.id)
+            && !reaped_ids.contains(&r.id)
             && r.status.eq_ignore_ascii_case("offline")
             && !r.busy
         {
