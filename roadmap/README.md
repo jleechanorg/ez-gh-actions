@@ -46,9 +46,18 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 ## Recent activity (by day)
 
+- [2026-07-09](activity/2026-07-09.md) — Root-cause confirmed: Linux fleet convergence failure from runner reconciliation churn; tracked with `jleechan-zy6` and `jleechan-9zd`.
 - [2026-07-07](activity/2026-07-07.md) — Fleet doctor session + macOS deadlock recovery + `--cpus` float precision fix
 
 ## Recent activity (rolling)
+
+### 2026-07-09 (ez-gh-actions) — Linux/macOS runner convergence root-cause
+
+- Confirmed root cause of current cap shortfall is reconciliation instability, not a long-term worker-availability loss.
+- Live Linux host checks: 13/16 active while logs repeatedly showed `ensure_count` partial success + `missing-registration` + reclaim/respawn loops.
+- Mac host now matches live target in latest sample; this remains sensitive to local host stability and restart storms.
+- Opened follow-up beads `jleechan-zy6` and `jleechan-9zd` for hardening the stale-slot reclaim and Path 1 in-flight registration race.
+- External notes tracked in `~/roadmap/2026-07-09-ez-gh-actions-reconciliation-root-cause.md`.
 
 ### 2026-07-07 (Codex continuation) — saturation investigation + `/nextsteps` tracker sync
 
