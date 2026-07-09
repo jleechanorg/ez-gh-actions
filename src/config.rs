@@ -317,12 +317,54 @@ fn default_canary_poll_interval_seconds() -> u64 {
     15
 }
 
+fn default_serve_interval_seconds() -> u64 {
+    30
+}
+
+fn minimum_serve_interval_seconds() -> u64 {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Refuse to start when the best available backend is weaker than this.
     /// "vm" > "container". Fail closed instead of silently degrading.
     pub minimum_isolation: IsolationLevel,
+    /// Seconds the serve loop sleeps after a successful `ensure_count` pass
+    /// (and after a non-restart ensure failure) before the next tick. Lower
+    /// values shrink the window an ephemeral runner slot sits dead between a
+    /// job finishing and its replacement spawning (~40% duty-cycle loss at the
+    /// 30s default under short-job CI load).
+    ///
+    /// Clamped to a 5s floor at use-site (`serve_interval()`): sub-5s ticks
+    /// would hammer `release_stale_slots`' GitHub `list_runners` call.
+    ///
+    /// Blast radius: at a 10s tick, `release_stale_slots`' `list_runners`
+    /// runs ~360 calls/hr, versus the App-token budget of 9350/hr (normal peak
+    /// total <1000/hr) — a safe margin. The queue monitor keeps its own
+    /// independent `check_interval_seconds` and is unaffected by this field.
+    #[serde(default = "default_serve_interval_seconds")]
+    pub serve_interval_seconds: u64,
+}
+
+impl Policy {
+    /// The serve-loop sleep interval, clamped to the 5s floor. Emits a one-line
+    /// clamp note (matching the `note: clamping ...` style used in
+    /// docker_backend.rs) when the configured value is below the floor.
+    pub fn serve_interval(&self) -> std::time::Duration {
+        let min = minimum_serve_interval_seconds();
+        let secs = if self.serve_interval_seconds < min {
+            eprintln!(
+                "note: clamping serve_interval_seconds {} -> {}",
+                self.serve_interval_seconds, min
+            );
+            min
+        } else {
+            self.serve_interval_seconds
+        };
+        std::time::Duration::from_secs(secs)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -410,6 +452,7 @@ impl Config {
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
+                serve_interval_seconds: default_serve_interval_seconds(),
             },
             alert: AlertConfig {
                 failure_alert_threshold: default_failure_alert_threshold(),
@@ -851,6 +894,65 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.canary.poll_interval_seconds = 5;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn policy_serve_interval_parses_configured_value() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+serve_interval_seconds = 10
+"#;
+        let cfg = load_from_str(raw, "serve-interval-10").unwrap();
+        assert_eq!(cfg.policy.serve_interval_seconds, 10);
+        assert_eq!(cfg.policy.serve_interval(), std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn policy_serve_interval_defaults_to_30_when_absent() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg = load_from_str(raw, "serve-interval-default").unwrap();
+        assert_eq!(cfg.policy.serve_interval_seconds, 30);
+        assert_eq!(cfg.policy.serve_interval(), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn policy_serve_interval_clamps_below_floor_to_5() {
+        let mut policy = Policy {
+            minimum_isolation: IsolationLevel::Container,
+            serve_interval_seconds: 2,
+        };
+        assert_eq!(policy.serve_interval(), std::time::Duration::from_secs(5));
+        // exactly at floor is preserved
+        policy.serve_interval_seconds = 5;
+        assert_eq!(policy.serve_interval(), std::time::Duration::from_secs(5));
     }
 
     #[test]

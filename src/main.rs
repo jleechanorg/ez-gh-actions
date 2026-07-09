@@ -783,7 +783,7 @@ fn main() -> Result<()> {
                         // clock so the threshold counts overall daemon
                         // liveness, not just alert throughput.
                         deadman.record_delivery(Instant::now());
-                        (Duration::from_secs(30), true)
+                        (cfg.policy.serve_interval(), true)
                     }
                     Err(e) => {
                         ensure_fail_streak += 1;
@@ -808,7 +808,7 @@ fn main() -> Result<()> {
                             }
                             (Duration::from_secs(8), false)
                         } else {
-                            (Duration::from_secs(30), false)
+                            (cfg.policy.serve_interval(), false)
                         }
                     }
                 };
