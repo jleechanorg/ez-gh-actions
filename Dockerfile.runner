@@ -22,4 +22,18 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Playwright's Chromium + WebKit system dependencies at build time (as root).
+# The workflows' own runtime fallback (apt-get download + dpkg-deb extract, for a
+# non-root/no-sudo CI job user) cannot work in this image because /var/lib/apt/lists/
+# is wiped by the RUN steps above to keep the image small -- apt-get download has
+# nothing to resolve against at container runtime. Baking the real system libraries
+# in here, while apt still has a fresh package index and we're still root, is the
+# actual fix (verified via `playwright install-deps chromium webkit` + a real
+# chromium/webkit launch probe against this exact base image, both as root and as
+# the non-root runner user).
+RUN apt-get update && python3 -m venv /opt/playwright-deps-venv \
+    && /opt/playwright-deps-venv/bin/pip install --quiet playwright \
+    && /opt/playwright-deps-venv/bin/python -m playwright install-deps chromium webkit \
+    && rm -rf /opt/playwright-deps-venv /var/lib/apt/lists/*
+
 USER runner
