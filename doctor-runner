@@ -1013,15 +1013,15 @@ if ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.n
   bad "verdict: runners-online gate FAILED (no ONLINE runner with prefix '$RUNNER_NAME_PREFIX' found; total=$TOTAL online=$ONLINE offline=$OFFLINE busy=$BUSY)"
   CRITICAL=$((CRITICAL+1))
 fi
-# Container count gate: EXPECTED_CONTAINERS is derived from the AUTHORITATIVE
-# source, runner.count in config.toml (same awk pattern section 9 already
-# uses for CONFIGURED_COUNT), NOT from a whole-file grep of
-# slot_assignments.toml. That file now carries BOTH [assignments] and
-# [registered_at] sections (registered_at added during churn remediation),
-# one line per slot each, so a plain `grep -c '='` double-counts (~28 for a
-# 16-slot fleet) and falsely tripped this gate — see ez-gh-actions-nj2j.
-# Fallback (only when config.toml is unreadable): count lines within the
-# [assignments] section ONLY, never a whole-file grep.
+# EXPECTED_CONTAINERS is derived from the AUTHORITATIVE source, runner.count
+# in config.toml (same awk pattern section 9 already uses for
+# CONFIGURED_COUNT), NOT from a whole-file grep of slot_assignments.toml.
+# That file now carries BOTH [assignments] and [registered_at] sections
+# (registered_at added during churn remediation), one line per slot each, so
+# a plain `grep -c '='` double-counts (~28 for a 16-slot fleet) and falsely
+# tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
+# config.toml is unreadable): count lines within the [assignments] section
+# ONLY, never a whole-file grep.
 CONFIG_RUNNER_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
 if [ -n "${CONFIG_RUNNER_COUNT:-}" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$CONFIG_RUNNER_COUNT}"
@@ -1031,8 +1031,45 @@ elif [ -f "$SLOT_FILE" ]; then
 else
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-6}"
 fi
-if [ "${CONTAINER_COUNT:-0}" -lt "$EXPECTED_CONTAINERS" ]; then
-  bad "verdict: container-count gate FAILED (observed=${CONTAINER_COUNT:-0}, expected>=${EXPECTED_CONTAINERS} from config.toml runner.count=${CONFIG_RUNNER_COUNT:-<unreadable, used fallback>})"
+# Live-slot gate (consolidated, ez-gh-actions-n9py): REPLACES the prior
+# single-sample `docker ps` container-count comparison (CONTAINER_COUNT vs
+# EXPECTED_CONTAINERS). That gate compared ONE raw `docker ps --filter
+# label=ezgha=managed` snapshot (taken in section 6, at whatever instant the
+# script happened to run it) directly against config.toml runner.count.
+# Under normal ephemeral churn — a runner finishes a job, its container is
+# destroyed, and the next serve tick respawns it — that single sample
+# legitimately oscillates (observed 16->15->16 within 15s on a fully healthy
+# fleet), so the gate flapped [BAD] while section 9's 2-sample-verified
+# per-slot proof (bead ez-gh-actions-b895) showed 0 down in the SAME run.
+# Rather than add a retry/threshold to the flaky sample, this DELETES it and
+# derives the live-container signal from data section 9 already computed:
+# EXECUTING_SLOTS / IDLE_SLOTS / DOWN_SLOTS (LOCAL-ONLY, post 2-sample DOWN
+# persistence — a slot that recovers between section 9's two samples is
+# already folded into EXECUTING_SLOTS or IDLE_SLOTS as a normal recycle
+# ("cycling"), never counted as DOWN). Only a slot that stays DOWN across
+# BOTH section-9 samples reduces the live count.
+# compute_live_slot_critical() is sed-extracted by
+# tests/doctor_runner_live_slot_gate_test.sh so tests exercise the real
+# logic, never a reimplementation.
+compute_live_slot_critical() {
+  # args: executing_n idle_n expected_containers
+  # (down_n is deliberately NOT an input — a DOWN slot simply isn't counted
+  # in executing_n/idle_n, so it naturally reduces `live` without needing to
+  # be passed in; callers may still report it separately for the message.)
+  # stdout: "<live_slots> <critical:0|1>"
+  local exec_n="$1" idle_n="$2" expected="$3"
+  local live=$((exec_n + idle_n))
+  local critical=0
+  if [ "$live" -lt "$expected" ]; then
+    critical=1
+  fi
+  printf '%d %d\n' "$live" "$critical"
+}
+read -r LOCAL_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
+  compute_live_slot_critical "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "$EXPECTED_CONTAINERS"
+)
+if [ "${LIVE_SLOT_CRITICAL:-0}" -eq 1 ]; then
+  bad "verdict: live-slot gate FAILED (live slots (executing+idle+cycling from per-slot proof) = ${LOCAL_LIVE_SLOTS}, expected >= ${EXPECTED_CONTAINERS} from config.toml runner.count=${CONFIG_RUNNER_COUNT:-<unreadable, used fallback>}; ${#DOWN_SLOTS[@]} persisted-DOWN slot(s) of ${CONFIGURED_COUNT} configured)"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise

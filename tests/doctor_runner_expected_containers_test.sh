@@ -15,9 +15,19 @@
 # then exercises it against a fixture slot_assignments.toml with both
 # sections + a config.toml with runner.count=16, asserting:
 #   1. EXPECTED_CONTAINERS resolves to 16 (from config.toml), not ~28.
-#   2. A 16-container fleet does NOT trip the container-count CRITICAL.
-#   3. The section-scoped fallback (no config.toml) also resolves to 16,
+#   2. The section-scoped fallback (no config.toml) also resolves to 16,
 #      not the whole-file double-count.
+#
+# NOTE (ez-gh-actions-n9py): this test previously ALSO exercised the verdict
+# CRITICAL comparison that consumed EXPECTED_CONTAINERS (a single-sample
+# `docker ps` CONTAINER_COUNT vs EXPECTED_CONTAINERS check). That comparison
+# was deleted — it flapped [BAD] on a healthy fleet under normal ephemeral
+# churn (container briefly missing from one `docker ps` sample, observed
+# 16->15->16 within 15s) — and replaced with a gate derived from the
+# section-9 per-slot inventory (EXECUTING_SLOTS/IDLE_SLOTS, 2-sample DOWN
+# persistence). That replacement gate (compute_live_slot_critical) is
+# covered by tests/doctor_runner_live_slot_gate_test.sh; this file now only
+# covers the EXPECTED_CONTAINERS derivation itself, which is unchanged.
 #
 # Usage: bash tests/doctor_runner_expected_containers_test.sh
 
@@ -56,21 +66,25 @@ FUNC_END=$(tail -n +"$FUNC_START" "$DOCTOR_SCRIPT" | grep -n '^}' | head -1 | cu
 FUNC_END=$((FUNC_START + FUNC_END - 1))
 FUNC_SRC=$(sed -n "${FUNC_START},${FUNC_END}p" "$DOCTOR_SCRIPT")
 
-# Extract the real EXPECTED_CONTAINERS derivation + container-count gate
-# block from doctor-runner.
+# Extract the real EXPECTED_CONTAINERS derivation block from doctor-runner
+# (bounded by CONFIG_RUNNER_COUNT= ... the closing `fi` of the if/elif/else
+# — NOT through the now-removed container-count CRITICAL comparison, which
+# was deleted; see ez-gh-actions-n9py).
 DERIVE_START=$(grep -n '^CONFIG_RUNNER_COUNT=' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
-DERIVE_END=$(grep -n 'container-count gate FAILED' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
-DERIVE_END=$((DERIVE_END + 2))  # include the CRITICAL increment + closing fi
-if [ -z "$DERIVE_START" ] || [ -z "$DERIVE_END" ]; then
+if [ -z "$DERIVE_START" ]; then
   echo "FAIL: could not locate EXPECTED_CONTAINERS derivation block in $DOCTOR_SCRIPT" >&2
   exit 1
 fi
+DERIVE_END_OFFSET=$(tail -n +"$DERIVE_START" "$DOCTOR_SCRIPT" | grep -n '^fi$' | head -1 | cut -d: -f1)
+if [ -z "$DERIVE_END_OFFSET" ]; then
+  echo "FAIL: could not locate closing 'fi' of EXPECTED_CONTAINERS derivation block in $DOCTOR_SCRIPT" >&2
+  exit 1
+fi
+DERIVE_END=$((DERIVE_START + DERIVE_END_OFFSET - 1))
 DERIVE_SRC=$(sed -n "${DERIVE_START},${DERIVE_END}p" "$DOCTOR_SCRIPT")
 
-bad() { printf '  [BAD]  %s\n' "$*"; }  # stub matching doctor-runner's helper
-
 run_case() {
-  local label="$1" config_present="$2" expected_value="$3" container_count="$4" expect_critical="$5"
+  local label="$1" config_present="$2" expected_value="$3"
   if [ "$config_present" = "yes" ]; then
     cat > "$CONFIG_DIR/config.toml" <<EOF
 version = 1
@@ -84,9 +98,7 @@ EOF
 
   HOME="$TEMP_HOME"
   SLOT_FILE="$SLOT_FILE"
-  CONTAINER_COUNT="$container_count"
   EXPECTED_CONTAINERS=""
-  CRITICAL=0
   eval "$FUNC_SRC"
   eval "$DERIVE_SRC"
 
@@ -95,16 +107,8 @@ EOF
     echo "  [$label] EXPECTED_CONTAINERS mismatch: got=$EXPECTED_CONTAINERS want=$expected_value -- FAIL"
     PASS=false
   fi
-  if [ "$expect_critical" = "yes" ] && [ "$CRITICAL" -eq 0 ]; then
-    echo "  [$label] expected CRITICAL>0 but got CRITICAL=$CRITICAL -- FAIL"
-    PASS=false
-  fi
-  if [ "$expect_critical" = "no" ] && [ "$CRITICAL" -ne 0 ]; then
-    echo "  [$label] expected CRITICAL=0 but got CRITICAL=$CRITICAL -- FAIL"
-    PASS=false
-  fi
   if [ "$PASS" = "true" ]; then
-    echo "  [$label] EXPECTED_CONTAINERS=$EXPECTED_CONTAINERS CRITICAL=$CRITICAL -- PASS"
+    echo "  [$label] EXPECTED_CONTAINERS=$EXPECTED_CONTAINERS -- PASS"
     return 0
   else
     return 1
@@ -114,20 +118,14 @@ EOF
 echo "--- doctor-runner EXPECTED_CONTAINERS regression ---"
 OVERALL_PASS=true
 
-# Case 1: config.toml present (count=16), 16 containers reported -> must
-# resolve EXPECTED_CONTAINERS=16 (not ~28 from the old double-count bug) and
-# must NOT trip the container-count critical.
-run_case "config-present-16-containers" "yes" "16" "16" "no" || OVERALL_PASS=false
+# Case 1: config.toml present (count=16) -> must resolve EXPECTED_CONTAINERS=16
+# (not ~28 from the old double-count bug).
+run_case "config-present-16-containers" "yes" "16" || OVERALL_PASS=false
 
 # Case 2: config.toml MISSING, fall back to section-scoped [assignments]
-# count (16 entries), 16 containers reported -> must resolve to 16 via the
-# fallback (never the whole-file double-count of ~28) and must NOT trip.
-run_case "config-missing-section-scoped-fallback" "no" "16" "16" "no" || OVERALL_PASS=false
-
-# Case 3: config.toml present (count=16), only 10 containers reported -> the
-# gate MUST still correctly detect a real shortfall (proves the fix didn't
-# just disable the check).
-run_case "config-present-real-shortfall" "yes" "16" "10" "yes" || OVERALL_PASS=false
+# count (16 entries) -> must resolve to 16 via the fallback (never the
+# whole-file double-count of ~28).
+run_case "config-missing-section-scoped-fallback" "no" "16" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
