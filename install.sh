@@ -281,7 +281,13 @@ PLIST
   <key>StandardErrorPath</key><string>${HOME_DIR}/.local/state/ezgha/${name}.log</string>
 </dict></plist>
 PLIST
-      if grep -qF "${SCRIPT_DIR}" "${plist}" || grep -qi 'worktree' "${plist}"; then
+      # Strip XML comment blocks before scanning so a template's own
+      # explanatory prose (which may legitimately say "worktree") can't
+      # trip this guard on itself — only <string> values are checked. See
+      # the equivalent fix in launchd/install-launchagents.sh.
+      local plist_scanned
+      plist_scanned="$(sed '/<!--/,/-->/d' "${plist}")"
+      if grep -qF "${SCRIPT_DIR}" <<<"${plist_scanned}" || grep -qi 'worktree' <<<"${plist_scanned}"; then
         bad "refusing to load ${plist}: still references the repo/worktree checkout path"
         rm -f "${plist}"
         return 1
@@ -303,7 +309,12 @@ PLIST
       sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
           -e "s|@HOME@|${HOME_DIR}|g" \
           "${unit}" > "${dest}"
-      if grep -q '@[A-Z_]*@' "${dest}" || grep -qF "${SCRIPT_DIR}" "${dest}" || grep -qi 'worktree' "${dest}"; then
+      # Strip '#'-prefixed comment lines before scanning so an explanatory
+      # comment in the unit file (which may legitimately say "worktree")
+      # can't trip this guard on itself — only directive values are
+      # checked. See the equivalent fix in launchd/install-launchagents.sh.
+      unit_scanned="$(grep -v '^[[:space:]]*#' "${dest}")"
+      if grep -q '@[A-Z_]*@' <<<"${unit_scanned}" || grep -qF "${SCRIPT_DIR}" <<<"${unit_scanned}" || grep -qi 'worktree' <<<"${unit_scanned}"; then
         bad "refusing to load ${dest}: unsubstituted placeholder or repo/worktree path reference"
         rm -f "${dest}"
         continue

@@ -31,18 +31,26 @@ templates=("${LAUNCHD_DIR}"/*.plist.template)
 # passing guard here is what would have caught the ez-gh-actions-sa1t
 # incident (dead watchdog plist pointing at a deleted worktree) at install
 # time instead of silently 41h later.
+#
+# The path/worktree checks scan the rendered file with XML comment blocks
+# stripped first, so a template's own explanatory <!-- ... --> prose (e.g.
+# this very script's templates document why they use @SCRIPTS_DIR@ "NOT a
+# repo/worktree checkout path") can't trip the guard on itself. Only actual
+# <string> values are checked.
 verify_rendered_plist() {
   local dest="$1"
-  if grep -q '@[A-Z_]*@' "$dest"; then
+  local scanned
+  scanned="$(sed '/<!--/,/-->/d' "$dest")"
+  if grep -q '@[A-Z_]*@' <<<"$scanned"; then
     echo "ERROR: ${dest} still contains an unsubstituted @PLACEHOLDER@ — refusing to load it" >&2
     grep -n '@[A-Z_]*@' "$dest" >&2
     return 1
   fi
-  if grep -qF "${REPO_PATH}" "$dest"; then
+  if grep -qF "${REPO_PATH}" <<<"$scanned"; then
     echo "ERROR: ${dest} references the repo checkout path (${REPO_PATH}) — refusing to load it" >&2
     return 1
   fi
-  if grep -qi 'worktree' "$dest"; then
+  if grep -qi 'worktree' <<<"$scanned"; then
     echo "ERROR: ${dest} references a 'worktree' path — refusing to load it" >&2
     return 1
   fi
