@@ -657,8 +657,7 @@ fn release_stale_slots_from_with_containers_for(
                         && !local_names.contains(&expected_name)
                     {
                         if slot_in_grace_window(assignments, slot) {
-                            let elapsed = seconds_since_registered(assignments, slot)
-                                .unwrap_or(0);
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered {elapsed}s ago (within {}s JIT-propagation grace window)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
