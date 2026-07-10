@@ -764,6 +764,12 @@ fn offline_not_busy_owned_missing_container_registrations(
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
         if slot_in_grace_window(assignments, slot) {
+            eprintln!(
+                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at within {}s grace window",
+                runner.name,
+                runner.id,
+                REGISTRATION_GRACE_WINDOW.as_secs()
+            );
             continue;
         }
         reapable.push((runner.id, runner.name.clone()));
