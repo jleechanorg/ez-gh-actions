@@ -104,6 +104,14 @@ fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str) -> bool {
     now_epoch_secs().saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
 }
 
+/// Seconds elapsed since `slot`'s `registered_at` timestamp, if recorded.
+/// Used to log how close a grace-window skip-reap decision was to the
+/// boundary, rather than just the fixed window size.
+fn seconds_since_registered(assignments: &SlotAssignments, slot: &str) -> Option<u64> {
+    let &registered_at = assignments.registered_at.get(slot)?;
+    Some(now_epoch_secs().saturating_sub(registered_at))
+}
+
 /// Resolve the path of the slot assignment file. Honors `EZGHA_SLOT_ASSIGNMENTS_PATH`
 /// (test escape hatch) and `XDG_CONFIG_HOME` (per XDG Base Directory spec),
 /// falling back to `~/.config`.
@@ -649,8 +657,10 @@ fn release_stale_slots_from_with_containers_for(
                         && !local_names.contains(&expected_name)
                     {
                         if slot_in_grace_window(assignments, slot) {
+                            let elapsed = seconds_since_registered(assignments, slot)
+                                .unwrap_or(0);
                             eprintln!(
-                                "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered <{}s ago (JIT-propagation grace window)",
+                                "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered {elapsed}s ago (within {}s JIT-propagation grace window)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
@@ -764,8 +774,9 @@ fn offline_not_busy_owned_missing_container_registrations(
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
         if slot_in_grace_window(assignments, slot) {
+            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
             eprintln!(
-                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at within {}s grace window",
+                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at {elapsed}s ago (within {}s grace window)",
                 runner.name,
                 runner.id,
                 REGISTRATION_GRACE_WINDOW.as_secs()
