@@ -978,6 +978,30 @@ pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
     Ok(())
 }
 
+/// Deadline-bounded twin of `remove_runner` for the graceful-shutdown drain
+/// (bead ez-gh-actions-30p). The plain `remove_runner` uses unbounded backoff
+/// and can block ~128s under GitHub's secondary rate limit — far past the 15s
+/// drain budget. This variant threads `deadline` through `run_gh_with_backoff_until`
+/// so a rate-limited delete bails instead of sleeping past the budget; the
+/// caller then leaves the registration to `release_stale_slots` (fail-safe).
+pub fn remove_runner_until(gh: &GithubConfig, id: u64, deadline: Instant) -> Result<()> {
+    let path = runner_remove_path(gh, id);
+    let out = run_gh_with_backoff_until(deadline, || {
+        let mut cmd = gh_command();
+        cmd.args(["api", "-X", "DELETE", &path]);
+        cmd
+    })
+    .context("failed to run `gh api`")?;
+    if !out.status.success() {
+        bail!(
+            "gh api remove runner {id} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    watchdog::ping();
+    Ok(())
+}
+
 /// Probe whether the `gh` CLI has ANY working account.
 ///
 /// `gh auth status` exits non-zero when ANY account is in a failed state — even
@@ -1928,6 +1952,75 @@ exit 0
         assert_eq!(jit, "abc123");
         assert_eq!(runner_id, 456);
         assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_runner_until_succeeds_via_fake_gh() {
+        // Happy path: a bounded delete that the (faked) gh accepts returns Ok.
+        // Hermetic — uses a fake gh stub, never the real network.
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rm-ok-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        remove_runner_until(&repo_cfg(), 4242, deadline).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_runner_until_bails_instead_of_sleeping_past_deadline() {
+        // Bounded-backoff proof: a persistent secondary-rate-limit (Retry-After: 5)
+        // with an already-elapsed deadline must NOT sleep the 5s — it bails on the
+        // first attempt. Hermetic (fake gh stub); asserts fast return + Err.
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rm-budget-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'gh: secondary rate limit exceeded (HTTP 403)' >&2\n\
+             echo 'Retry-After: 5' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let start = std::time::Instant::now();
+        // Already-elapsed deadline: any retry sleep (5s) would cross it, so the
+        // bounded loop must bail on attempt 1 rather than sleeping.
+        let result = remove_runner_until(&repo_cfg(), 4242, Instant::now());
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "persistent 403 must surface as an error");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must bail without sleeping past the deadline, took {}s",
+            elapsed.as_secs()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

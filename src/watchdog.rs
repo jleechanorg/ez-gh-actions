@@ -68,7 +68,7 @@ fn heartbeat_interval_from_watchdog_usec(usec: u64) -> Option<Duration> {
     Some(interval.clamp(Duration::from_secs(1), Duration::from_secs(30)))
 }
 
-fn sleep_interruptibly(duration: Duration, stop: &AtomicBool) {
+pub(crate) fn sleep_interruptibly(duration: Duration, stop: &AtomicBool) {
     let deadline = std::time::Instant::now() + duration;
     while !stop.load(Ordering::Relaxed) {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());

@@ -63,6 +63,12 @@ fn systemd_service_unit(
         "NotifyAccess=all".to_string(),
         "Restart=on-failure".to_string(),
         "RestartSec=30".to_string(),
+        // Graceful shutdown (bead ez-gh-actions-30p): drain caps at 15s; give
+        // systemd 30s before SIGKILL so it never kills mid-drain. KillMode=mixed
+        // sends SIGTERM to the main ezgha process only, so the drain's own
+        // freshly-spawned `gh`/`docker` children run unmolested until it exits.
+        "TimeoutStopSec=30".to_string(),
+        "KillMode=mixed".to_string(),
         "TimeoutStartSec=130".to_string(),
         format!("Environment=\"PATH={}\"", path_env),
         format!("Environment=\"HOME={}\"", home_dir.display()),
@@ -183,6 +189,7 @@ fn install_launchd(exe: &std::path::Path, config_path: &std::path::Path) -> Resu
     <array><string>{}</string><string>--config</string><string>{}</string><string>serve</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
+    <key>ExitTimeOut</key><integer>30</integer>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key><string>{}</string>
@@ -336,5 +343,25 @@ mod tests {
         assert!(unit.contains("--source on-failure"));
         assert!(unit.contains("--unit %i"));
         assert!(unit.contains("TimeoutStartSec=30"));
+    }
+
+    #[test]
+    fn systemd_unit_has_graceful_shutdown_settings() {
+        // Bead ez-gh-actions-30p: verify TimeoutStopSec=30 and KillMode=mixed
+        // are present for graceful drain.
+        let unit = systemd_service_unit(
+            std::path::Path::new("/home/jleechan/.cargo/bin/ezgha"),
+            std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/home/jleechan"),
+        );
+        assert!(
+            unit.contains("TimeoutStopSec=30"),
+            "TimeoutStopSec=30 required for graceful drain (bead ez-gh-actions-30p)"
+        );
+        assert!(
+            unit.contains("KillMode=mixed"),
+            "KillMode=mixed required so drain children run unmolested (bead ez-gh-actions-30p)"
+        );
     }
 }
