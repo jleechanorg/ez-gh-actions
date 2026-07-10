@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
 # queue-health.sh — GitHub Actions queue metrics for ezgha fleet diagnosis.
-# Read-only. Used by doctor.sh and runnable standalone:
+# Read-only. Used by doctor-runner (sourced, section 8) and runnable standalone:
 #   ./scripts/queue-health.sh
 #   QUEUE_REPO=jleechanorg/worldarchitect.ai QUEUE_TAIL_WARN_MIN=20 ./scripts/queue-health.sh
+#
+# BAD/critical trigger is JOB-level: the oldest fresh queued JOB's wait
+# (job created_at -> now, status=queued), read from doctor-runner's
+# section-F1b job map (JOBLEVEL_OLDEST_QUEUED_MIN / JOBLEVEL_QUEUED_COUNT)
+# when sourced. Run-level queued ages are reported as INFORMATIONAL only:
+# a workflow RUN sits "queued" for 30+ minutes under `concurrency:`
+# serialization or staged gate workflows (Green Gate) while every actual
+# job gets a runner within seconds — observed 2026-07-10 01:11, run
+# 29060462908 was run-level queued 33.4m but its only job was created at
+# 01:11:49 and picked up immediately (zero runner wait). Standalone runs
+# (no job map in the environment) fall back to the run-level max, labeled
+# as such.
 set -euo pipefail
 
 # When sourced by doctor.sh, use return — never exit the parent.
@@ -122,8 +134,11 @@ else:
     print('export QUEUE_OLDEST_STALE_ID=0')
     print('export QUEUE_OLDEST_STALE_AGE_DAYS=0')
 
-queue_bad = 1 if mx > tail_warn else 0
-print(f'export QUEUE_TAIL_BAD={queue_bad}')
+# Run-level tail exceedance is INFORMATIONAL only (run age includes
+# concurrency/staged-gate wait, not runner wait) — the BAD trigger
+# (QUEUE_TAIL_BAD) is computed in bash below from JOB-level wait.
+runlevel_exceeded = 1 if mx > tail_warn else 0
+print(f'export QUEUE_RUNLEVEL_TAIL_EXCEEDED={runlevel_exceeded}')
 print(f'export QUEUE_STALE_ZOMBIES={1 if len(stale) > 0 else 0}')
 PY
 )"
@@ -131,17 +146,43 @@ PY
 info "workflow runs in_progress: $QUEUE_IN_PROGRESS"
 info "workflow runs queued (total): $QUEUE_QUEUED_TOTAL (fresh <${STALE_HOURS}h: $QUEUE_QUEUED_FRESH, stale zombies: $QUEUE_QUEUED_STALE)"
 
+# Run-level stats: INFORMATIONAL context only — never a BAD/critical
+# trigger. Run age counts concurrency-serialization and staged-gate (Green
+# Gate) wait, which is not runner wait.
 if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
-  info "fresh queue wait — p50=${QUEUE_P50_MIN}m p90=${QUEUE_P90_MIN}m max=${QUEUE_MAX_FRESH_MIN}m (tail warn threshold: ${QUEUE_TAIL_WARN_MIN}m)"
-  info "oldest fresh queued: id=$QUEUE_OLDEST_FRESH_ID name=$QUEUE_OLDEST_FRESH_NAME branch=$QUEUE_OLDEST_FRESH_BRANCH age=${QUEUE_OLDEST_FRESH_AGE_MIN}m"
-  if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
-    bad "queue tail ${QUEUE_MAX_FRESH_MIN}m exceeds ${QUEUE_TAIL_WARN_MIN}m — runners saturated or mis-routing"
-    info "superseded dry-run: QUEUE_REPO=$QUEUE_REPO ./scripts/queue-backlog-drain.sh --min-age-min ${QUEUE_TAIL_WARN_MIN}"
-  else
-    ok "queue tail ${QUEUE_MAX_FRESH_MIN}m within ${QUEUE_TAIL_WARN_MIN}m threshold"
+  info "fresh queue wait (RUN-level, informational) — p50=${QUEUE_P50_MIN}m p90=${QUEUE_P90_MIN}m max=${QUEUE_MAX_FRESH_MIN}m"
+  info "oldest fresh queued run: id=$QUEUE_OLDEST_FRESH_ID name=$QUEUE_OLDEST_FRESH_NAME branch=$QUEUE_OLDEST_FRESH_BRANCH age=${QUEUE_OLDEST_FRESH_AGE_MIN}m"
+  if [ "${QUEUE_RUNLEVEL_TAIL_EXCEEDED:-0}" -eq 1 ]; then
+    info "run-level tail ${QUEUE_MAX_FRESH_MIN}m exceeds ${QUEUE_TAIL_WARN_MIN}m — NOT a defect by itself: run age includes concurrency/staged-gate wait (e.g. 2026-07-10 run 29060462908: 33.4m run-queued, job picked up in seconds); job-level verdict below"
   fi
 else
   ok "no fresh queued runs (<${STALE_HOURS}h) — queue drained"
+fi
+
+# BAD/critical trigger: JOB-level oldest fresh queued-job wait. When sourced
+# by doctor-runner, JOBLEVEL_* come from the section-F1b job map (same
+# STALE_HOURS freshness rule, single fetch across every repo the fleet
+# serves). Standalone invocations have no job map — fall back to the
+# run-level max so the script stays useful on its own, labeled as such.
+if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "${JOBLEVEL_OLDEST_QUEUED_MIN}" != "?" ]; then
+  QUEUE_TAIL_SOURCE="job-level"
+  QUEUE_TAIL_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN}"
+  QUEUE_TAIL_N="${JOBLEVEL_QUEUED_COUNT:-0}"
+else
+  QUEUE_TAIL_SOURCE="run-level FALLBACK (no job map — standalone run; may overcount concurrency wait)"
+  QUEUE_TAIL_MIN="${QUEUE_MAX_FRESH_MIN:-0}"
+  QUEUE_TAIL_N="${QUEUE_QUEUED_FRESH:-0}"
+fi
+QUEUE_TAIL_BAD=0
+if [ "${QUEUE_TAIL_N:-0}" -gt 0 ] && awk -v m="${QUEUE_TAIL_MIN:-0}" -v t="${QUEUE_TAIL_WARN_MIN}" 'BEGIN{exit !(m > t)}'; then
+  QUEUE_TAIL_BAD=1
+fi
+export QUEUE_TAIL_BAD
+if [ "${QUEUE_TAIL_BAD}" -eq 1 ]; then
+  bad "queue tail (${QUEUE_TAIL_SOURCE}) ${QUEUE_TAIL_MIN}m exceeds ${QUEUE_TAIL_WARN_MIN}m — ${QUEUE_TAIL_N} queued job(s); runners saturated or mis-routing"
+  info "superseded dry-run: QUEUE_REPO=$QUEUE_REPO ./scripts/queue-backlog-drain.sh --min-age-min ${QUEUE_TAIL_WARN_MIN}"
+else
+  ok "queue tail (${QUEUE_TAIL_SOURCE}) ${QUEUE_TAIL_MIN}m within ${QUEUE_TAIL_WARN_MIN}m threshold (${QUEUE_TAIL_N} queued job(s))"
 fi
 
 if [ "${QUEUE_QUEUED_STALE:-0}" -gt 0 ]; then
