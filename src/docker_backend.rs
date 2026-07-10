@@ -1269,6 +1269,15 @@ pub struct DrainSummary {
 /// on next start (requirement 3: never kill running containers). Best-effort and
 /// bounded by `deadline` (≤15s); anything not drained in time is reclaimed by the
 /// reaper. Fail-safe, never fail-orphan: on any uncertainty it defers.
+///
+/// CONCURRENCY INVARIANT: this drain runs AFTER the serve loop has broken, in a
+/// process where spawning is single-threaded and `docker run` is synchronous, so
+/// by the time we read the slot file no new JIT registration can enter the orphan
+/// window. If spawning ever becomes concurrent/async (a background spawner still
+/// live during drain), this function MUST additionally honor the
+/// `REGISTRATION_GRACE_WINDOW` guard (as `release_stale_slots` does) before
+/// deregistering, or it could delete a registration whose container is still
+/// mid-launch on another thread.
 pub fn drain_inflight_registrations(cfg: &Config, deadline: Instant) -> DrainSummary {
     // Source of truth for "is a real container attached to this slot". If we
     // CANNOT list containers, we must not risk deregistering a live runner —

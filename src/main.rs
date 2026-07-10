@@ -871,9 +871,14 @@ fn main() -> Result<()> {
             // in-flight (container-less) registrations within a bounded grace so
             // a restart never orphans a live GitHub runner. Running containers
             // are left alive (they survive the restart; ensure_count re-adopts
-            // them on next start). Hard cap 15s — below TimeoutStopSec=30 and
-            // WatchdogSec=300. Anything not drained is reclaimed by
-            // release_stale_slots (fail-safe). No-op sd_notify on macOS launchd.
+            // them on next start). Budget: the deadline is enforced at TWO levels
+            // — the inter-slot loop stops issuing new deletes once it passes, and
+            // each individual DELETE is capped at the remaining budget in
+            // remove_runner_until (child gh process bounded, not just its retry
+            // sleeps). Worst case is therefore ~15s + one child-kill latency
+            // (sub-second), safely below TimeoutStopSec=30 and WatchdogSec=300.
+            // Anything not drained is reclaimed by release_stale_slots
+            // (fail-safe). No-op sd_notify on macOS launchd.
             let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
             println!("shutdown requested; draining in-flight runner registrations (<=15s)");
             let drain_deadline = Instant::now() + Duration::from_secs(15);
