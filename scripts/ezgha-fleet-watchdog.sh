@@ -47,27 +47,36 @@
 #      systemd unit ALSO captured stdout via StandardOutput=append to the
 #      SAME file — every line was written twice.
 #   5. State freshness — miss_count and last_restart state files are
-#      treated as stale (reset to 0 on read) if their mtime is older than
-#      $EZGHA_WATCHDOG_STATE_STALE_SECONDS (default 480s / 8min — 4x the
-#      systemd timer's 120s tick interval, tolerating up to 3 skipped/slow
-#      ticks; inside the 6-10min band that keeps genuinely-consecutive
-#      misses in a live run from ever being mistaken for stale). ONE
-#      mtime-age check, applied uniformly by both get_miss_count() and
-#      get_last_restart(), covers two distinct failure modes that would
-#      otherwise need separate handling:
-#        a) REBOOT-STALE-STATE — state files are plain files under
-#           ~/.local/state, not tmpfs, so they persist across a host
-#           reboot. The systemd timer fires 30s after boot (OnBootSec=30s).
-#           A stale miss_count>=threshold left over from before a reboot
-#           could otherwise trigger an immediate restart of a daemon that
-#           hasn't finished starting; a stale-but-recent last_restart could
-#           wrongly block a genuinely-needed post-reboot restart for the
-#           full cooldown window.
-#        b) General staleness — e.g. the watchdog itself was stopped for an
-#           extended period, or a timer tick was skipped/delayed (system
-#           load, or a hung probe before the C#2 timeout fix landed),
-#           leaving old counters to linger.
-#      Because the check applies on READ, a stale miss_count is normalized
+#      treated as stale (reset to 0 on read) by read_fresh_state() when
+#      EITHER of two independent checks trips. Both are applied uniformly
+#      by get_miss_count() and get_last_restart():
+#        a) REBOOT guard (primary) — the state file's mtime predates the
+#           current host boot time (Linux: /proc/stat `btime`; macOS:
+#           `sysctl kern.boottime`). State files are plain files under
+#           ~/.local/state, not tmpfs, so they survive a reboot, and the
+#           systemd timer then fires 30s after boot (OnBootSec=30s). A
+#           stale miss_count>=threshold left over from before the reboot
+#           could otherwise restart a daemon that hasn't finished starting
+#           (0 containers is legitimate mid-boot — the exact orphan-
+#           registration harm this PR exists to prevent), and a stale-but-
+#           recent last_restart could wrongly block a genuinely-needed
+#           post-reboot restart for the full cooldown window. This check is
+#           what catches a FAST reboot that the age backstop (b) would
+#           miss: if the box reboots quickly, pre-reboot state can be
+#           YOUNGER than STATE_STALE_SECONDS yet still belong to a dead
+#           boot session. Fails safe — if boot time cannot be determined,
+#           this check is skipped and behavior falls back to (b) alone, so
+#           no new failure mode is introduced (bead ez-gh-actions-xfw).
+#        b) AGE backstop (general staleness) — the file's mtime is older
+#           than $EZGHA_WATCHDOG_STATE_STALE_SECONDS (default 480s / 8min —
+#           4x the systemd timer's 120s tick interval, tolerating up to 3
+#           skipped/slow ticks; inside the 6-10min band that keeps
+#           genuinely-consecutive misses in a live run from ever being
+#           mistaken for stale). Covers non-reboot staleness: e.g. the
+#           watchdog was stopped for an extended period, or a timer tick
+#           was skipped/delayed (system load, or a hung probe before the
+#           C#2 timeout fix landed), leaving old counters to linger.
+#      Because both checks apply on READ, a stale miss_count is normalized
 #      to 0 BEFORE the current tick's increment/comparison in
 #      evaluate_host() — a stale count can never combine with a fresh miss
 #      to reach the threshold early.
@@ -139,7 +148,7 @@ while [[ $# -gt 0 ]]; do
       HOST_FILTER="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,115p' "$0"
+      sed -n '2,124p' "$0"
       exit 0
       ;;
     *) shift ;;
@@ -150,19 +159,40 @@ log() { echo "[$TS] $*"; }
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
+# boot_time prints the host's boot time in epoch seconds, or nothing if it
+# cannot be determined. Linux: the `btime <epoch>` line in /proc/stat.
+# macOS/BSD: `sysctl kern.boottime` ("{ sec = 1700000000, usec = 0 } ...").
+# An unknown boot time is left empty ON PURPOSE so read_fresh_state's
+# reboot guard (guardrail 5a) degrades to a no-op — preserving prior
+# behavior rather than guessing and risking a new failure mode.
+boot_time() {
+  local bt=""
+  if [[ -r /proc/stat ]]; then
+    bt="$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null || true)"
+  fi
+  if [[ ! "$bt" =~ ^[0-9]+$ ]]; then
+    bt="$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec *= *([0-9]+).*/\1/' || true)"
+  fi
+  [[ "$bt" =~ ^[0-9]+$ ]] && echo "$bt"
+}
+
+# Boot time is fixed for the life of the host, so resolve it once here
+# instead of on every read_fresh_state() call. Empty when undeterminable.
+BOOT_TIME="$(boot_time)"
+
 # read_fresh_state prints the value stored in state file $1, unless the
-# file's mtime is older than $STATE_STALE_SECONDS, in which case it is
-# treated as stale/absent and "0" is printed instead (guardrail 5). Used by
-# BOTH get_miss_count() and get_last_restart() so a single age check covers
-# the reboot-stale-state scenario and general (non-reboot) staleness alike
-# — there is deliberately no separate boot-time-comparison mechanism; an
-# earlier version of this fix used one, but a plain mtime-age check
-# subsumes it (a reboot is just one way a state file's mtime can predate
-# "now" by more than the staleness window) while being simpler and
-# portable without any OS-specific boot-time lookup. Fails safe: missing
-# file -> "0" (unchanged base case); unreadable mtime -> NOT treated as
-# stale (falls through to the file's stored value) rather than crashing or
-# guessing.
+# file is considered stale, in which case "0" is printed instead
+# (guardrail 5). A file is stale if EITHER (a) its mtime predates the
+# current boot time ($BOOT_TIME) — the REBOOT guard — OR (b) its mtime is
+# older than $STATE_STALE_SECONDS — the general-staleness AGE backstop. The
+# reboot check is what catches a FAST reboot whose pre-reboot state is
+# still younger than STATE_STALE_SECONDS (a reboot is one way a state file
+# can belong to a dead boot session while still looking recent); the age
+# check catches non-reboot staleness. Used by BOTH get_miss_count() and
+# get_last_restart(). Fails safe at every step: missing file -> "0" (base
+# case); unreadable mtime -> NOT treated as stale (falls through to the
+# stored value) rather than crashing or guessing; unknown $BOOT_TIME ->
+# reboot check skipped, age check still applies (bead ez-gh-actions-xfw).
 read_fresh_state() { # $1=state file path -> stored value, or 0 if missing/stale
   local file="$1"
   [[ -f "$file" ]] || { echo 0; return; }
@@ -170,6 +200,14 @@ read_fresh_state() { # $1=state file path -> stored value, or 0 if missing/stale
   local mtime
   mtime="$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || true)"
   if [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    # (a) REBOOT guard: state written before the current boot cannot
+    # describe the current boot session. Applies even to a file younger
+    # than STATE_STALE_SECONDS. Skipped when boot time is unknown.
+    if [[ "$BOOT_TIME" =~ ^[0-9]+$ ]] && (( mtime < BOOT_TIME )); then
+      echo 0
+      return
+    fi
+    # (b) AGE backstop: non-reboot staleness.
     local now
     now="$(date +%s)"
     if (( now - mtime > STATE_STALE_SECONDS )); then
