@@ -95,6 +95,52 @@ recent_logs() {
   fi
 }
 
+# Serve-loop-heartbeat signal: max gap between consecutive "queue monitor:"
+# journal lines, restricted to lines sharing the same daemon PID. Extracted
+# as a standalone function (stdin: `journalctl -o short-unix` lines; stdout:
+# "<max_gap_seconds> <restart_boundary_seen:0|1>") so tests/*.sh can
+# sed-extract and exercise the real logic against fixture journal lines
+# instead of re-implementing it — see ez-gh-actions-wxfl.
+#
+# This REPLACES the prior demand-driven "respawn-burst gap" heuristic (which
+# measured gaps between "respawned ephemeral runner" lines and false-
+# positived on idle fleets with zero respawn demand, and across ordinary
+# daemon restarts). The queue monitor tick fires on its own configured
+# cadence every serve loop iteration regardless of whether anything needed
+# respawning (see src/main.rs's `queue_monitor + invariant sampler drive`
+# tick and queue_monitor.rs's "queue monitor: ..." log line), so its cadence
+# is a true liveness heartbeat, not a demand signal.
+#
+# PID-scoping: journalctl's `-o short-unix` format is
+# "<epoch[.usec]> <hostname> ezgha[<pid>]: <msg>". The PID column changes on
+# every daemon restart, so a gap that spans a PID change is a deploy/restart
+# boundary, not a stall — it is excluded from the max-gap calculation
+# entirely (not just capped), and reported separately via the second output
+# field so a restart mid-window never reads as starvation.
+compute_heartbeat_gap() {
+  awk '
+    !/queue monitor:/ { next }
+    {
+      ts = $1
+      sub(/\..*/, "", ts)
+      pid = $3
+      sub(/^ezgha\[/, "", pid)
+      sub(/\]:$/, "", pid)
+      if (prev_ts != "") {
+        if (pid == prev_pid) {
+          gap = ts - prev_ts
+          if (gap > max_gap) max_gap = gap
+        } else {
+          restart_boundary = 1
+        }
+      }
+      prev_ts = ts
+      prev_pid = pid
+    }
+    END { printf "%d %d\n", max_gap + 0, restart_boundary + 0 }
+  '
+}
+
 # --- A. local daemon + service ------------------------------------------
 section "1. ezgha service"
 SERVICE_STATE=$(probe_service_state)
@@ -889,32 +935,44 @@ else
   warn "$REMOTE_LABEL not reachable via SSH — skipping remote per-slot proof"
 fi
 
-# Serve-loop-starvation signal: the largest gap between respawn bursts, plus
-# how often the monitor tick is hitting a rate limit. This is the direct
-# observable for the ez-gh-actions-yrt/g3o starvation bug (a 60-90s+ gap
-# here means ensure_count is being starved by a rate-limited monitor tick
-# again, regardless of what the per-slot proof above shows this instant).
+# Serve-loop-heartbeat signal: the largest gap between consecutive
+# "queue monitor:" journal lines (same-PID only — see compute_heartbeat_gap
+# above), plus how often the monitor tick is hitting a rate limit. This
+# REPLACES the old demand-driven respawn-burst-gap heuristic
+# (ez-gh-actions-yrt/g3o), which measured gaps between "respawned ephemeral
+# runner" lines and false-positived whenever the fleet was idle (no respawn
+# demand -> no lines -> spurious max-gap) or whenever the daemon restarted
+# mid-window (a routine deploy restart read as a starvation gap). The queue
+# monitor tick fires every serve-loop iteration regardless of demand, so its
+# cadence is a true liveness heartbeat; PID-scoping makes restart boundaries
+# provably non-events instead of accidentally-small ones.
+# Threshold: 5x the configured [runner] serve_tick_seconds (default 30s if
+# absent, matching src/config.rs's default_serve_tick_seconds(); shipped in
+# commit f7772e5) — a stalled loop misses this many ticks before we call it
+# starved, well above normal queue_monitor.check_interval_seconds jitter.
 # Linux-only: journalctl timestamps every line; macOS's redirected launchd
 # log files carry no per-line timestamp to diff.
 STARVE_WINDOW="${STARVE_WINDOW:-10}"
-STARVE_GAP_WARN_SECONDS="${STARVE_GAP_WARN_SECONDS:-150}"
+SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
+STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 5))
 if [ "$PLATFORM" = "linux" ]; then
-  # `-o short-unix` timestamps carry sub-second precision (epoch.usec);
-  # truncate to whole seconds before the arithmetic gap check below, or a
-  # gap like "109.13" fails bash's integer-only `-gt` with a syntax error.
-  MAX_RESPAWN_GAP=$(journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
-    | grep 'respawned ephemeral runner' \
-    | awk '{split($1, t, "."); print t[1]}' \
-    | sort -n -u \
-    | awk 'NR>1{gap=$1-prev; if (gap>max) max=gap} {prev=$1} END{print max+0}')
+  read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN < <(
+    journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
+      | compute_heartbeat_gap
+  )
   RATE_LIMIT_COUNT=$(recent_logs "$STARVE_WINDOW" | grep -c -i 'rate limit' || true)
-  info "serve-loop starvation signal (last ${STARVE_WINDOW}m): max respawn-burst gap=${MAX_RESPAWN_GAP:-0}s, rate-limit occurrences=$RATE_LIMIT_COUNT"
-  if [ "${MAX_RESPAWN_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
-    bad "serve-loop starvation: respawn gap ${MAX_RESPAWN_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s — ensure_count is being starved (see ez-gh-actions-yrt/g3o)"
+  RESTART_NOTE=""
+  if [ "${RESTART_BOUNDARY_SEEN:-0}" -eq 1 ]; then
+    RESTART_NOTE=" (a daemon-restart boundary was seen in-window and excluded from the gap measurement)"
+  fi
+  info "serve-loop heartbeat signal (last ${STARVE_WINDOW}m): max queue-monitor gap=${MAX_HEARTBEAT_GAP:-0}s, threshold=${STARVE_GAP_WARN_SECONDS}s (serve_tick_seconds=${SERVE_TICK_SECONDS} x5), rate-limit occurrences=$RATE_LIMIT_COUNT${RESTART_NOTE}"
+  if [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
+    bad "serve-loop starvation: queue-monitor heartbeat gap ${MAX_HEARTBEAT_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s (5x serve_tick_seconds=${SERVE_TICK_SECONDS}) within a single daemon PID — the serve loop has stalled, not restarted (see ez-gh-actions-wxfl, replacing the respawn-gap heuristic from ez-gh-actions-yrt/g3o)"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
   fi
 else
-  warn "serve-loop starvation signal skipped on $PLATFORM (no per-line timestamps in launchd log redirect)"
+  warn "serve-loop heartbeat signal skipped on $PLATFORM (no per-line timestamps in launchd log redirect)"
 fi
 
 # --- G. verdict ----------------------------------------------------------
