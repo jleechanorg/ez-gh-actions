@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
-# cleanup-stuck-runs.sh — report or remove GitHub Actions queue artifacts.
+# cleanup-stuck-runs.sh — report or remove GitHub Actions queue artifacts,
+# across multiple repos.
 #
-# Three classes of "stuck" runs on worldarchitect.ai (and QUEUE_REPO):
+# Three classes of "stuck" runs per repo in QUEUE_REPOS:
 #   1. Zombies (>STALE_HOURS old, status=queued) — GitHub rejects DELETE on a
 #      queued run (HTTP 403); cancel first (-> completed/cancelled), then delete.
 #   2. Superseded queued runs — same branch + workflow, keeping the newest queued run.
 #   3. Fresh tail (>FRESH_TAIL_MIN old, still queued) — cancel via API (drops CI for that PR).
+#
+# Multi-repo coverage (ez-gh-actions-ssjg): QUEUE_REPOS is a space-separated
+# list, scanned in a loop. A failing repo is logged and counted but does NOT
+# abort the loop — every repo in the list gets its own attempt every tick.
+# QUEUE_REPO (singular) remains supported for back-compat with other scripts
+# (queue-health.sh, queue-backlog-drain.sh) that set a single override repo;
+# if only QUEUE_REPO is set, it becomes a one-element QUEUE_REPOS list.
+#
+# Force-cancel fallback (jleechan-uud): plain POST .../cancel returns HTTP 202
+# but silently no-ops on runs whose only job never started (runner_id:0).
+# After any cancel (superseded or tail), this script verifies ~20s later
+# (CANCEL_VERIFY_WAIT_S) that the run actually left "queued"; if not, it
+# retries via POST .../force-cancel. This verify+force-cancel happens
+# synchronously per-run at the moment of that specific cancel call — not via
+# same-tick batch-list membership, which previously let a run wedged in one
+# tick survive every later tick forever (the plain cancel keeps returning 202
+# and no-oping on it).
 #
 # Usage:
 #   ./scripts/cleanup-stuck-runs.sh                 # dry-run: zombies + superseded queued runs
@@ -13,11 +31,18 @@
 #   ./scripts/cleanup-stuck-runs.sh --zombies        # dry-run: only >STALE_HOURS artifacts
 #   ./scripts/cleanup-stuck-runs.sh --superseded     # dry-run: only older queued runs by branch+workflow
 #   ./scripts/cleanup-stuck-runs.sh --tail --apply   # cancel fresh tail >45m; intentionally opt-in
+#
+# Env overrides:
+#   QUEUE_REPOS="owner/repo1 owner/repo2 ..."  # space-separated; default: see DEFAULT_QUEUE_REPOS below
+#   QUEUE_REPO="owner/repo"                    # single-repo back-compat override (ignored if QUEUE_REPOS set)
+#   CANCEL_VERIFY_WAIT_S=20                    # seconds to wait before force-cancel verify (0 to skip wait, e.g. tests)
 set -euo pipefail
 
-QUEUE_REPO="${QUEUE_REPO:-jleechanorg/worldarchitect.ai}"
+DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ai_universe jleechanorg/worldai_claw jleechanorg/mctrl_test jleechanorg/jleechanclaw jleechanorg/ai_universe_living_blog jleechanorg/agent-orchestrator jleechanorg/dark-factory jleechanorg/ez-gh-actions"
+QUEUE_REPOS="${QUEUE_REPOS:-${QUEUE_REPO:-$DEFAULT_QUEUE_REPOS}}"
 STALE_HOURS="${STALE_HOURS:-8}"
 FRESH_TAIL_MIN="${FRESH_TAIL_MIN:-45}"
+CANCEL_VERIFY_WAIT_S="${CANCEL_VERIFY_WAIT_S:-20}"
 DRY_RUN=1
 DO_ZOMBIES=1
 DO_SUPERSEDED=1
@@ -38,7 +63,7 @@ while [[ $# -gt 0 ]]; do
     --apply) DRY_RUN=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,14p' "$0"
+      sed -n '2,29p' "$0"
       exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -49,9 +74,17 @@ if ! command -v gh >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
-export QUEUE_REPO STALE_HOURS FRESH_TAIL_MIN DRY_RUN DO_ZOMBIES DO_SUPERSEDED DO_TAIL
+export STALE_HOURS FRESH_TAIL_MIN DRY_RUN DO_ZOMBIES DO_SUPERSEDED DO_TAIL CANCEL_VERIFY_WAIT_S
 
-python3 <<'PY'
+FAILED_REPOS=()
+REPO_COUNT=0
+
+for repo in $QUEUE_REPOS; do
+  [[ -z "$repo" ]] && continue
+  REPO_COUNT=$((REPO_COUNT + 1))
+  repo_rc=0
+
+  QUEUE_REPO="$repo" python3 <<'PY' 2>&1 | sed "s#^#[${repo}] #" || repo_rc=$?
 import json, os, subprocess, datetime, time, sys
 from collections import defaultdict
 
@@ -62,6 +95,7 @@ dry = os.environ.get("DRY_RUN") == "1"
 do_zombies = os.environ.get("DO_ZOMBIES") == "1"
 do_superseded = os.environ.get("DO_SUPERSEDED") == "1"
 do_tail = os.environ.get("DO_TAIL") == "1"
+verify_wait_s = float(os.environ.get("CANCEL_VERIFY_WAIT_S", "20"))
 
 # Rate-limit resilience (bead jleechan-me9): GitHub applies a SECONDARY
 # throttle to the /actions/* REST family that is invisible in the primary
@@ -70,7 +104,7 @@ do_tail = os.environ.get("DO_TAIL") == "1"
 # queue unswept — observed live 2026-07-08 02:41-03:42Z while >20m runs
 # accumulated. On a rate-limit 403: back off once (60s), retry, and if
 # still throttled skip the tick GRACEFULLY (exit 0 with a log line) so
-# launchd cadence resumes next interval instead of logging a crash.
+# launchd/systemd cadence resumes next interval instead of logging a crash.
 def list_queued_page(page):
     return json.loads(subprocess.check_output([
         "gh", "api", f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}"
@@ -191,12 +225,9 @@ def force_cancel_run(rid):
 
 # Plain cancel only. POST .../cancel returns 202 but queued runs frequently
 # STAY queued (observed live 2026-07-07 on runs 28884233335 / 28892581952);
-# the force-cancel endpoint is what actually transitions them. Rather than
-# poll status per run (1-2 extra API calls x N cancels — a real contributor
-# to the secondary throttle, bead jleechan-me9), callers batch-verify: the
-# tail pass re-lists queued runs ONCE after all cancels and force-cancels
-# only the ids that survived. The rare zombie-delete path keeps its own
-# per-run poll (delete requires the transition to have completed).
+# the force-cancel endpoint is what actually transitions them. Every caller
+# of cancel_run() below pairs it with verify_and_force_cancel() so a run's
+# fate is resolved synchronously, per-run, right after its own cancel call.
 def cancel_run(rid):
     subprocess.check_output([
         "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/cancel"
@@ -218,8 +249,34 @@ def delete_run(rid):
         pass
     subprocess.check_output(["gh", "run", "delete", str(rid), "-R", repo], stderr=subprocess.STDOUT)
 
-stats = {"zombie_deleted": 0, "zombie_failed": 0, "tail_cancelled": 0, "tail_failed": 0}
-stats.update({"superseded_cancelled": 0, "superseded_failed": 0, "tail_force_cancelled": 0})
+def verify_and_force_cancel(rid, label):
+    """After a plain cancel_run(rid) call, wait ~verify_wait_s and check the
+    run actually left "queued". If it is still queued (the 202-but-no-op
+    behavior — bead jleechan-uud), force-cancel it. This is called
+    synchronously right after each individual cancel, not tracked via
+    same-tick batch-list membership, so a run's fate never depends on
+    whether a later re-listing call in the SAME tick succeeded — the
+    original defect that let wedged runs survive every subsequent tick.
+    Returns True if a force-cancel was issued.
+    """
+    if verify_wait_s > 0:
+        time.sleep(verify_wait_s)
+    try:
+        status = run_status(rid)
+    except subprocess.CalledProcessError as e:
+        print(f"WARN verify status inconclusive for {label} {rid}: {(e.output or b'').decode()[:120]}")
+        return False
+    if status != "queued":
+        return False
+    force_cancel_run(rid)
+    print(f"force-cancelled stuck {label} {rid} (survived plain cancel)")
+    return True
+
+stats = {
+    "zombie_deleted": 0, "zombie_failed": 0,
+    "tail_cancelled": 0, "tail_failed": 0, "tail_force_cancelled": 0,
+    "superseded_cancelled": 0, "superseded_failed": 0, "superseded_force_cancelled": 0,
+}
 
 if do_zombies:
     for age_m, r in sorted(zombies, key=lambda x: x[0], reverse=True):
@@ -264,10 +321,17 @@ if do_superseded:
             except subprocess.CalledProcessError as e:
                 stats["superseded_failed"] += 1
                 print(f"FAIL superseded {rid} url={url}: {(e.output or b'').decode()[:160]}")
+                time.sleep(0.35)
+                continue
+            try:
+                if verify_and_force_cancel(rid, "superseded"):
+                    stats["superseded_force_cancelled"] += 1
+            except subprocess.CalledProcessError as e:
+                stats["superseded_failed"] += 1
+                print(f"FAIL force-cancel superseded {rid}: {(e.output or b'').decode()[:120]}")
             time.sleep(0.35)
 
 if do_tail:
-    tail_cancelled_ids = []
     for age_m, r in sorted(tail, key=lambda x: x[0], reverse=True):
         if do_superseded and r["id"] in superseded_ids:
             continue
@@ -278,46 +342,33 @@ if do_tail:
             continue
         try:
             cancel_run(rid)
-            tail_cancelled_ids.append(rid)
             stats["tail_cancelled"] += 1
             print(f"cancelled tail {rid} {age_m:.0f}m workflow={name!r} branch={b!r} url={url}")
         except subprocess.CalledProcessError as e:
             stats["tail_failed"] += 1
             print(f"FAIL tail {rid} url={url}: {(e.output or b'').decode()[:160]}")
-        time.sleep(0.35)
-
-    # Batched force-cancel verification: ONE re-listing instead of a status
-    # poll per cancelled run. Any cancelled id still present as queued did
-    # not transition (the 202-but-still-queued behavior) — force-cancel it.
-    if tail_cancelled_ids:
-        time.sleep(8)
-        still_queued = set()
+            time.sleep(0.35)
+            continue
         try:
-            page = 1
-            while True:
-                data = list_queued_page(page)
-                batch = data.get("workflow_runs", [])
-                still_queued.update(r["id"] for r in batch)
-                if len(batch) < 100:
-                    break
-                page += 1
-        except subprocess.CalledProcessError:
-            still_queued = None  # verification listing throttled; skip quietly
-        if still_queued is None:
-            print("force-cancel verification skipped: re-listing rate-limited")
-        else:
-            stuck = [rid for rid in tail_cancelled_ids if rid in still_queued]
-            for rid in stuck:
-                try:
-                    force_cancel_run(rid)
-                    stats["tail_force_cancelled"] += 1
-                    print(f"force-cancelled stuck tail {rid} (survived plain cancel)")
-                except subprocess.CalledProcessError as e:
-                    stats["tail_failed"] += 1
-                    print(f"FAIL force-cancel {rid}: {(e.output or b'').decode()[:120]}")
-                time.sleep(0.35)
+            if verify_and_force_cancel(rid, "tail"):
+                stats["tail_force_cancelled"] += 1
+        except subprocess.CalledProcessError as e:
+            stats["tail_failed"] += 1
+            print(f"FAIL force-cancel tail {rid}: {(e.output or b'').decode()[:120]}")
+        time.sleep(0.35)
 
 print("summary:", stats)
 if stats["zombie_failed"] or stats["superseded_failed"] or stats["tail_failed"]:
     sys.exit(1)
 PY
+
+  if [[ "$repo_rc" -ne 0 ]]; then
+    echo "[$repo] cleanup pass FAILED (exit=$repo_rc) — continuing to next repo"
+    FAILED_REPOS+=("$repo")
+  fi
+done
+
+echo "=== overall: ${REPO_COUNT} repo(s) scanned, ${#FAILED_REPOS[@]} failed: ${FAILED_REPOS[*]:-none} ==="
+if [[ ${#FAILED_REPOS[@]} -gt 0 ]]; then
+  exit 1
+fi

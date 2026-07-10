@@ -5,8 +5,15 @@
 #
 # Calls cleanup-stuck-runs.sh --tail --apply with FRESH_TAIL_MIN=20 on a
 # schedule (see launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template)
-# so the worldarchitect.ai self-hosted queue tail doesn't silently regrow past
-# the 20-minute health threshold between manual/agent-driven cleanup passes.
+# so the self-hosted queue tail doesn't silently regrow past the 20-minute
+# health threshold between manual/agent-driven cleanup passes.
+#
+# Multi-repo coverage (ez-gh-actions-ssjg): this script does NOT hardcode a
+# repo. It relies entirely on cleanup-stuck-runs.sh's own QUEUE_REPOS default
+# (worldarchitect.ai + ai_universe + worldai_claw + mctrl_test + jleechanclaw
+# + ai_universe_living_blog + agent-orchestrator + dark-factory + ez-gh-actions)
+# unless QUEUE_REPOS/QUEUE_REPO is exported into this script's environment
+# (e.g. by the launchd plist) to override it.
 #
 # 20-minute threshold + repeated --apply cancellation of fresh-tail queued
 # runs on active PRs is pre-authorized per the 2026-07-07

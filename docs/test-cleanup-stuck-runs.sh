@@ -54,8 +54,22 @@ JSON
   exit 0
 fi
 
+if [[ "$1" == "api" && "$2" == "-X" && "$3" == "POST" && "$4" == *"/force-cancel" ]]; then
+  printf '{"ok":true}\n'
+  exit 0
+fi
+
 if [[ "$1" == "api" && "$2" == "-X" && "$3" == "POST" && "$4" == *"/cancel" ]]; then
   printf '{"ok":true}\n'
+  exit 0
+fi
+
+# Post-cancel verify_and_force_cancel() status check (jleechan-uud fix):
+# `gh api repos/.../actions/runs/{id} --jq .status`. Report "cancelled" (not
+# "queued") so this fixture never triggers a force-cancel — the dedicated
+# force-cancel test exercises the "stays queued" branch separately.
+if [[ "$1" == "api" && "$*" == *"--jq"* && "$*" == *".status"* ]]; then
+  printf 'cancelled\n'
   exit 0
 fi
 
@@ -71,6 +85,13 @@ chmod +x "$tmpdir/gh"
 
 export PATH="$tmpdir:$PATH"
 export GH_LOG="$tmpdir/gh.log"
+# Single-repo, no verify-wait: keeps this fixture's assertions exact (one
+# cancel per matching id, not one per QUEUE_REPOS default entry) and fast.
+# Multi-repo looping and the force-cancel verify path have their own
+# dedicated tests (tests/cleanup_stuck_runs_multirepo_test.sh,
+# tests/cleanup_stuck_runs_force_cancel_test.sh).
+export QUEUE_REPOS="jleechanorg/worldarchitect.ai"
+export CANCEL_VERIFY_WAIT_S=0
 
 dry_output="$(./scripts/cleanup-stuck-runs.sh --superseded)"
 grep -q "mode=dry-run" <<<"$dry_output"
