@@ -117,10 +117,21 @@ recent_logs() {
 # boundary, not a stall — it is excluded from the max-gap calculation
 # entirely (not just capped), and reported separately via the second output
 # field so a restart mid-window never reads as starvation.
+#
+# Sample count (3rd output field, codex adversarial review 2026-07-10): with
+# ZERO "queue monitor:" lines in the window, max_gap is awk's uninitialized-
+# variable default of 0 — which read as a perfectly healthy 0s gap even
+# though a completely silent serve loop (logging broken, loop wedged before
+# ever reaching the tick) produces exactly the same empty input. The 0-gap
+# value alone is indistinguishable between "healthy, sub-threshold gaps" and
+# "no evidence at all", so callers MUST also check the sample count: 0
+# samples while the service is active is the alarm, not a >0 gap. A window
+# shorter than one tick can legitimately yield 1 sample, so only 0 is fatal.
 compute_heartbeat_gap() {
   awk '
     !/queue monitor:/ { next }
     {
+      samples++
       ts = $1
       sub(/\..*/, "", ts)
       pid = $3
@@ -137,7 +148,7 @@ compute_heartbeat_gap() {
       prev_ts = ts
       prev_pid = pid
     }
-    END { printf "%d %d\n", max_gap + 0, restart_boundary + 0 }
+    END { printf "%d %d %d\n", max_gap + 0, restart_boundary + 0, samples + 0 }
   '
 }
 
@@ -709,7 +720,20 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
     # respawn cycle (deregister -> JIT token -> docker run) can take
     # 30-60s+ under load, longer than the 2-sample window above, so
     # "containerless both samples" alone is not proof of abandonment.
-    _RESPAWN_LOG=$(fetch_respawn_log_window "localhost" "$PLATFORM" "$RESPAWN_EVIDENCE_WINDOW_MIN")
+    #
+    # set -euo pipefail is active for the whole script — a bare
+    # `_VAR=$(cmd)` abort the ENTIRE doctor run mid-classification if
+    # fetch_respawn_log_window returns nonzero (ssh hiccup, missing log
+    # file; codex adversarial review 2026-07-10, P1). Guard the call so a
+    # fetch failure degrades gracefully instead of killing the run.
+    # FAIL-SAFE DIRECTION: a failed fetch is "no evidence", which classifies
+    # the candidate DOWN (never mask a fetch failure as CYCLING) — the
+    # evidence text is annotated below so operators see WHY.
+    RESPAWN_FETCH_FAILED_LOCAL=0
+    if ! _RESPAWN_LOG=$(fetch_respawn_log_window "localhost" "$PLATFORM" "$RESPAWN_EVIDENCE_WINDOW_MIN"); then
+      _RESPAWN_LOG=""
+      RESPAWN_FETCH_FAILED_LOCAL=1
+    fi
     _TRUE_DOWN=()
     for _name in "${_PERSISTENT_DOWN[@]}"; do
       if [ -n "$_RESPAWN_LOG" ] && [ "$(printf '%s\n' "$_RESPAWN_LOG" | journal_has_respawn_evidence "$_name")" = "1" ]; then
@@ -773,7 +797,9 @@ fi
 
 SLOT_PROOF_CRITICAL=0
 if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
-  bad "DOWN (no container) — ${#DOWN_SLOTS[@]} slot(s): ${DOWN_SLOTS[*]}"
+  _down_note=""
+  [ "${RESPAWN_FETCH_FAILED_LOCAL:-0}" -eq 1 ] && _down_note=" (respawn-log fetch failed)"
+  bad "DOWN (no container) — ${#DOWN_SLOTS[@]} slot(s): ${DOWN_SLOTS[*]}${_down_note}"
   SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#DOWN_SLOTS[@]}))
 fi
 if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
@@ -907,7 +933,15 @@ list_slot_work() {
       local _remote_platform="linux"
       case "$label" in macos*) _remote_platform="macos" ;; esac
       local _log
-      _log=$(fetch_respawn_log_window "$host" "$_remote_platform" "$RESPAWN_EVIDENCE_WINDOW_MIN")
+      # Same set -e hazard as the local call site above (codex adversarial
+      # review 2026-07-10, P1): guard so an ssh hiccup or missing log file
+      # degrades to "no evidence" (stays DOWN, annotated below) instead of
+      # aborting the whole doctor run mid-classification.
+      _respawn_fetch_failed=0
+      if ! _log=$(fetch_respawn_log_window "$host" "$_remote_platform" "$RESPAWN_EVIDENCE_WINDOW_MIN"); then
+        _log=""
+        _respawn_fetch_failed=1
+      fi
       for i in $(seq 1 "$count"); do
         [ "${slot_state[i]}" != "DOWN" ] && continue
         name="${prefix}-${i}"
@@ -962,7 +996,9 @@ list_slot_work() {
       DOWN)
         dn=$((dn+1))
         LAST_DOWN_SLOTS+=("$name")
-        printf "    %-22s %-13s %s\n" "$name" "DOWN" "no container across both samples AND no respawn activity in daemon log for ${RESPAWN_EVIDENCE_WINDOW_MIN}m — critical"
+        _down_evidence="no container across both samples AND no respawn activity in daemon log for ${RESPAWN_EVIDENCE_WINDOW_MIN}m — critical"
+        [ "${_respawn_fetch_failed:-0}" -eq 1 ] && _down_evidence="${_down_evidence} (respawn-log fetch failed)"
+        printf "    %-22s %-13s %s\n" "$name" "DOWN" "$_down_evidence"
         ;;
     esac
   done
@@ -1051,7 +1087,7 @@ SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); pri
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
 STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
 if [ "$PLATFORM" = "linux" ]; then
-  read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN < <(
+  read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN HEARTBEAT_SAMPLE_COUNT < <(
     journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
       | compute_heartbeat_gap
   )
@@ -1060,8 +1096,19 @@ if [ "$PLATFORM" = "linux" ]; then
   if [ "${RESTART_BOUNDARY_SEEN:-0}" -eq 1 ]; then
     RESTART_NOTE=" (a daemon-restart boundary was seen in-window and excluded from the gap measurement)"
   fi
-  info "serve-loop heartbeat signal (last ${STARVE_WINDOW}m): max queue-monitor gap=${MAX_HEARTBEAT_GAP:-0}s, threshold=${STARVE_GAP_WARN_SECONDS}s (serve_tick_seconds=${SERVE_TICK_SECONDS} x8), rate-limit occurrences=$RATE_LIMIT_COUNT${RESTART_NOTE}"
-  if [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
+  info "serve-loop heartbeat signal (last ${STARVE_WINDOW}m): max queue-monitor gap=${MAX_HEARTBEAT_GAP:-0}s, threshold=${STARVE_GAP_WARN_SECONDS}s (serve_tick_seconds=${SERVE_TICK_SECONDS} x8), samples=${HEARTBEAT_SAMPLE_COUNT:-0}, rate-limit occurrences=$RATE_LIMIT_COUNT${RESTART_NOTE}"
+  # Codex adversarial review 2026-07-10 (P1): 0 samples in-window makes
+  # compute_heartbeat_gap emit gap=0 (awk's uninitialized-variable default),
+  # which the gap>threshold gate below reads as perfectly healthy — a
+  # completely silent serve loop (wedged before its first tick, or logging
+  # broken) false-greens. 0 samples is only meaningful as an alarm while the
+  # service is active (SERVICE_STATE gate above already catches inactive/
+  # failed/not-loaded); a window shorter than one tick can legitimately
+  # yield exactly 1 sample, so only 0 trips this.
+  if [ "${HEARTBEAT_SAMPLE_COUNT:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
+    bad "serve-loop heartbeat: no queue-monitor samples in ${STARVE_WINDOW}m while service is active — loop silent or logging broken"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
+  elif [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
     bad "serve-loop starvation: queue-monitor heartbeat gap ${MAX_HEARTBEAT_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS}) within a single daemon PID — the serve loop has stalled, not restarted (see ez-gh-actions-wxfl, replacing the respawn-gap heuristic from ez-gh-actions-yrt/g3o; threshold raised 5x->8x in ez-gh-actions-5n0h after a 99s busy-tick gap nearly tripped the old 100s threshold)"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
   fi

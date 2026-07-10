@@ -218,6 +218,25 @@ def run_status(rid):
     ], stderr=subprocess.STDOUT)
     return out.decode().strip()
 
+# Listing->cancel race guard (codex adversarial review 2026-07-10, P1): the
+# queued list is built ONCE per repo scan at the top of this script, but
+# actual cancellation happens later — the multi-repo QUEUE_REPOS loop plus
+# the per-cancel CANCEL_VERIFY_WAIT_S (~20s) sleeps can stretch this to
+# minutes. A run picked up by a runner in that window is no longer "queued"
+# by the time we act on it; force-cancelling it anyway kills an
+# in-progress job, not a stuck one. Recheck status immediately before every
+# cancel/delete decision. Fail-open on a status-check error (returns True,
+# with a note) rather than skip: the existing per-call CalledProcessError
+# handling already tolerates a cancel attempt against a run that turns out
+# to be non-queued, so an unreadable status is not a reason to leave a truly
+# stuck run untouched.
+def recheck_still_queued(rid):
+    try:
+        status = run_status(rid)
+    except subprocess.CalledProcessError:
+        return True, "unknown (status check failed)"
+    return status == "queued", status
+
 def force_cancel_run(rid):
     subprocess.check_output([
         "gh", "api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/force-cancel"
@@ -239,6 +258,18 @@ def delete_run(rid):
     # gh run delete succeeds. Ignore cancel failures (e.g. already completed);
     # the delete call below surfaces any real problem. Zombies are rare, so a
     # per-run poll + force-cancel here is cheap and keeps delete reliable.
+    #
+    # Zombies are >STALE_HOURS old by definition, which might read as "safe
+    # to skip the race recheck" — but zombie runs DO occasionally get picked
+    # up after days queued (observed live 2026-07-10: run 28905898434 started
+    # executing after 3 days queued). The recheck is trivial here too, so
+    # apply the same listing->cancel race guard as the tail/superseded paths
+    # instead of assuming staleness rules it out. Returns (deleted: bool,
+    # status: str|None) — deleted=False means the run left "queued" in the
+    # meantime and was left alone instead of being force-cancelled.
+    still, cur_status = recheck_still_queued(rid)
+    if not still:
+        return False, cur_status
     try:
         cancel_run(rid)
         time.sleep(2)
@@ -248,6 +279,7 @@ def delete_run(rid):
     except subprocess.CalledProcessError:
         pass
     subprocess.check_output(["gh", "run", "delete", str(rid), "-R", repo], stderr=subprocess.STDOUT)
+    return True, None
 
 def verify_and_force_cancel(rid, label):
     """After a plain cancel_run(rid) call, wait ~verify_wait_s and check the
@@ -264,7 +296,15 @@ def verify_and_force_cancel(rid, label):
     try:
         status = run_status(rid)
     except subprocess.CalledProcessError as e:
+        # A status-check failure here is indistinguishable from a
+        # verified-success (both fall through this function returning False,
+        # no force-cancel issued) unless counted separately — the caller
+        # cannot tell "confirmed left queued" from "couldn't confirm
+        # anything" (codex adversarial review 2026-07-10, P2). Count it so
+        # the summary — and the exit code — reflect the run's true fate is
+        # unknown, not silently treated as success.
         print(f"WARN verify status inconclusive for {label} {rid}: {(e.output or b'').decode()[:120]}")
+        stats["verify_inconclusive"] += 1
         return False
     if status != "queued":
         return False
@@ -276,6 +316,8 @@ stats = {
     "zombie_deleted": 0, "zombie_failed": 0,
     "tail_cancelled": 0, "tail_failed": 0, "tail_force_cancelled": 0,
     "superseded_cancelled": 0, "superseded_failed": 0, "superseded_force_cancelled": 0,
+    "skipped_no_longer_queued": 0,
+    "verify_inconclusive": 0,
 }
 
 if do_zombies:
@@ -286,9 +328,13 @@ if do_zombies:
             print(f"[dry-run] would delete zombie {rid} {age_m/60/24:.1f}d workflow={name!r} branch={b!r} url={url}")
             continue
         try:
-            delete_run(rid)
-            stats["zombie_deleted"] += 1
-            print(f"deleted zombie {rid} {age_m/60/24:.1f}d workflow={name!r} branch={b!r} url={url}")
+            deleted, cur_status = delete_run(rid)
+            if deleted:
+                stats["zombie_deleted"] += 1
+                print(f"deleted zombie {rid} {age_m/60/24:.1f}d workflow={name!r} branch={b!r} url={url}")
+            else:
+                stats["skipped_no_longer_queued"] += 1
+                print(f"skipped zombie {rid}: no longer queued (now {cur_status})")
         except subprocess.CalledProcessError as e:
             stats["zombie_failed"] += 1
             print(f"FAIL zombie {rid} url={url}: {(e.output or b'').decode()[:160]}")
@@ -313,6 +359,11 @@ if do_superseded:
             url = run_url(r)
             if dry:
                 print(f"[dry-run] would cancel superseded queued {rid} {age_m:.0f}m workflow={name!r} branch={b!r} url={url}")
+                continue
+            still, cur_status = recheck_still_queued(rid)
+            if not still:
+                stats["skipped_no_longer_queued"] += 1
+                print(f"skipped superseded {rid}: no longer queued (now {cur_status})")
                 continue
             try:
                 cancel_run(rid)
@@ -340,6 +391,11 @@ if do_tail:
         if dry:
             print(f"[dry-run] would cancel tail {rid} {age_m:.0f}m workflow={name!r} branch={b!r} url={url}")
             continue
+        still, cur_status = recheck_still_queued(rid)
+        if not still:
+            stats["skipped_no_longer_queued"] += 1
+            print(f"skipped tail {rid}: no longer queued (now {cur_status})")
+            continue
         try:
             cancel_run(rid)
             stats["tail_cancelled"] += 1
@@ -358,7 +414,11 @@ if do_tail:
         time.sleep(0.35)
 
 print("summary:", stats)
-if stats["zombie_failed"] or stats["superseded_failed"] or stats["tail_failed"]:
+# verify_inconclusive (codex adversarial review 2026-07-10, P2): a
+# run_status() failure during post-cancel verification is NOT proof the
+# cancel succeeded — mirror the existing *_failed exit-nonzero policy so the
+# script can't exit 0 on unproven cancels.
+if stats["zombie_failed"] or stats["superseded_failed"] or stats["tail_failed"] or stats["verify_inconclusive"]:
     sys.exit(1)
 PY
 

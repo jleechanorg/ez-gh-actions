@@ -47,6 +47,42 @@ uninstall() {
     rm -f "${plist}"
     ok "launchd agent removed"
   fi
+
+  # Auxiliary units (token-refresh / queue-reaper / watchdog) — installed
+  # further below in the main flow as ezgha-<name>.timer+.service on Linux
+  # and org.jleechanorg.ezgha-<name>.plist on macOS, all pointed at scripts
+  # in ~/.local/libexec/ezgha. Uninstall previously disabled only the main
+  # service + plist, then rm -rf'd libexec — leaving these three still
+  # scheduled against a now-deleted script. That is exactly the dead-path-
+  # scheduled-job incident class from 2026-07-09 (codex adversarial review
+  # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
+  # FIRST). Every removal below is best-effort (|| true) so a missing
+  # unit/plist never aborts the uninstall.
+  AUX_NAMES="token-refresh queue-reaper watchdog"
+  if command -v systemctl >/dev/null 2>&1; then
+    for aux in ${AUX_NAMES}; do
+      systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
+      rm -f "${HOME}/.config/systemd/user/ezgha-${aux}.timer" \
+            "${HOME}/.config/systemd/user/ezgha-${aux}.service"
+      ok "systemd --user aux unit removed: ezgha-${aux}"
+    done
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+  if [ "$(uname -s)" = "Darwin" ]; then
+    for aux in ${AUX_NAMES}; do
+      aux_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-${aux}.plist"
+      launchctl unload "${aux_plist}" 2>/dev/null || true
+      rm -f "${aux_plist}"
+      ok "launchd aux agent removed: org.jleechanorg.ezgha-${aux}"
+    done
+    # Legacy interim reaper (superseded by the repo-declared queue-reaper
+    # unit above, see the install-time legacy-agent cleanup loop further
+    # down) — clear it too so a full uninstall leaves nothing scheduled.
+    stopgap_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist"
+    launchctl unload "${stopgap_plist}" 2>/dev/null || true
+    rm -f "${stopgap_plist}"
+  fi
+
   if command -v cargo >/dev/null 2>&1 && cargo uninstall "${CRATE}" 2>/dev/null; then
     ok "cargo uninstall ${CRATE}"
   else

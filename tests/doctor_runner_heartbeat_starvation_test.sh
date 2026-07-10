@@ -83,7 +83,7 @@ qm_line() {
 }
 
 run_case() {
-  local label="$1" fixture="$2" expect_starved="$3" expect_restart_boundary="$4"
+  local label="$1" fixture="$2" expect_starved="$3" expect_restart_boundary="$4" service_state="${5:-active}"
 
   HOME="$TEMP_HOME"
   eval "$FUNC_SRC"
@@ -91,22 +91,32 @@ run_case() {
 
   local out
   out=$(printf '%s\n' "$fixture" | compute_heartbeat_gap)
-  local max_gap restart_boundary
-  read -r max_gap restart_boundary <<< "$out"
+  local max_gap restart_boundary sample_count
+  read -r max_gap restart_boundary sample_count <<< "$out"
 
+  # Mirrors doctor-runner's actual call-site gate order verbatim (codex
+  # adversarial review 2026-07-10, finding 1): 0 samples while the service
+  # is active is checked FIRST and is fatal on its own, independent of
+  # max_gap (which awk defaults to 0 -- indistinguishable from "healthy"
+  # without the sample-count check). Only when samples > 0 does the gap
+  # threshold apply.
+  SERVICE_STATE="$service_state"
   CRITICAL=0
-  if [ "${max_gap:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
+  if [ "${sample_count:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
+    bad "serve-loop heartbeat: no queue-monitor samples in window while service is active — loop silent or logging broken"
+    CRITICAL=$((CRITICAL + 1))
+  elif [ "${max_gap:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
     bad "serve-loop starvation: queue-monitor heartbeat gap ${max_gap}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS})"
     CRITICAL=$((CRITICAL + 1))
   fi
 
   PASS=true
   if [ "$expect_starved" = "yes" ] && [ "$CRITICAL" -eq 0 ]; then
-    echo "  [$label] expected starved (CRITICAL>0) but got CRITICAL=0 (max_gap=$max_gap threshold=$STARVE_GAP_WARN_SECONDS) -- FAIL"
+    echo "  [$label] expected starved (CRITICAL>0) but got CRITICAL=0 (max_gap=$max_gap samples=$sample_count threshold=$STARVE_GAP_WARN_SECONDS) -- FAIL"
     PASS=false
   fi
   if [ "$expect_starved" = "no" ] && [ "$CRITICAL" -ne 0 ]; then
-    echo "  [$label] expected healthy (CRITICAL=0) but got CRITICAL=$CRITICAL (max_gap=$max_gap threshold=$STARVE_GAP_WARN_SECONDS) -- FAIL"
+    echo "  [$label] expected healthy (CRITICAL=0) but got CRITICAL=$CRITICAL (max_gap=$max_gap samples=$sample_count threshold=$STARVE_GAP_WARN_SECONDS) -- FAIL"
     PASS=false
   fi
   if [ "$restart_boundary" != "$expect_restart_boundary" ]; then
@@ -114,7 +124,7 @@ run_case() {
     PASS=false
   fi
   if [ "$PASS" = "true" ]; then
-    echo "  [$label] max_gap=${max_gap}s threshold=${STARVE_GAP_WARN_SECONDS}s restart_boundary=$restart_boundary CRITICAL=$CRITICAL -- PASS"
+    echo "  [$label] max_gap=${max_gap}s samples=${sample_count} threshold=${STARVE_GAP_WARN_SECONDS}s restart_boundary=$restart_boundary service_state=$service_state CRITICAL=$CRITICAL -- PASS"
     return 0
   else
     return 1
@@ -185,6 +195,37 @@ FIXTURE_D=$(
   qm_line "$((BASE + 99))" 4192142
 )
 run_case "20s-tick-99s-gap-healthy-under-8x" "$FIXTURE_D" "no" "0" || OVERALL_PASS=false
+
+cat > "$CONFIG_DIR/config.toml" <<'EOF'
+version = 1
+[runner]
+serve_tick_seconds = 30
+name_prefix = "ez-runner-c"
+count = 16
+EOF
+
+# Case (e): codex adversarial review 2026-07-10 (finding 1, P1) -- ZERO
+# "queue monitor:" lines in the window while the service is active. Before
+# the fix, compute_heartbeat_gap's awk max_gap defaults to 0 (uninitialized
+# variable) on empty input, which the plain gap>threshold gate read as a
+# perfectly healthy 0s gap -- a completely silent serve loop (wedged before
+# its first tick, or logging broken) false-greened. Must now trip CRITICAL
+# via the sample-count check, independent of the gap value.
+FIXTURE_E=""
+run_case "zero-samples-active-service-critical" "$FIXTURE_E" "yes" "0" "active" || OVERALL_PASS=false
+
+# Case (f): same empty fixture, but the service is NOT active. Out of scope
+# per the finding -- the SERVICE_STATE gate elsewhere in doctor-runner
+# already catches inactive/failed/not-loaded, so the heartbeat check itself
+# must not ALSO fire (no double-counting / no misleading heartbeat-specific
+# message when the real defect is "service down").
+run_case "zero-samples-inactive-service-not-double-counted" "$FIXTURE_E" "no" "0" "inactive" || OVERALL_PASS=false
+
+# Case (g): exactly 1 sample in-window is legitimate (a window shorter than
+# one serve tick can catch only a single line) -- must NOT trip the
+# zero-samples alarm.
+FIXTURE_G=$(qm_line "$BASE" 4192142)
+run_case "one-sample-active-service-healthy" "$FIXTURE_G" "no" "0" "active" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
