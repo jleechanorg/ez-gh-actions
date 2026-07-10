@@ -74,7 +74,10 @@ mod tests {
         request_for_test();
         let start = std::time::Instant::now();
         sleep_interruptibly(Duration::from_secs(30));
-        assert!(start.elapsed() < Duration::from_secs(1), "must return promptly when flag set");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must return promptly when flag set"
+        );
         reset_for_test();
     }
 }

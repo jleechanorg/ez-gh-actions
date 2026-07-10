@@ -2942,15 +2942,11 @@ mod tests {
 
         // Fake remover that records deregistered ids
         let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
-        let summary = drain_inflight_registrations_inner(
-            &cfg,
-            deadline,
-            Some(&container_names),
-            |id, _| {
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
                 deregistered.lock().unwrap().push(id);
                 Ok(())
-            },
-        );
+            });
 
         assert_eq!(summary.registrations_deregistered, 1);
         assert_eq!(*deregistered.lock().unwrap(), vec![4242]);
@@ -2974,15 +2970,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
 
         let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
-        let summary = drain_inflight_registrations_inner(
-            &cfg,
-            deadline,
-            Some(&container_names),
-            |id, _| {
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
                 deregistered.lock().unwrap().push(id);
                 Ok(())
-            },
-        );
+            });
 
         assert_eq!(summary.containers_preserved, 1);
         assert_eq!(summary.registrations_deregistered, 0);
@@ -3005,12 +2997,10 @@ mod tests {
         let container_names: HashSet<String> = HashSet::new();
         let deadline = Instant::now() + Duration::from_secs(15);
 
-        let summary = drain_inflight_registrations_inner(
-            &cfg,
-            deadline,
-            Some(&container_names),
-            |_, _| panic!("should not call remove_runner for empty reservation"),
-        );
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |_, _| {
+                panic!("should not call remove_runner for empty reservation")
+            });
 
         assert_eq!(summary.reservations_released, 1);
         assert_eq!(summary.registrations_deregistered, 0);
@@ -3067,15 +3057,11 @@ mod tests {
         let deadline = Instant::now();
 
         let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
-        let summary = drain_inflight_registrations_inner(
-            &cfg,
-            deadline,
-            Some(&container_names),
-            |id, _| {
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
                 deregistered.lock().unwrap().push(id);
                 Ok(())
-            },
-        );
+            });
 
         assert_eq!(summary.deferred_to_reaper, 1);
         assert_eq!(summary.registrations_deregistered, 0);
