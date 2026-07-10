@@ -58,6 +58,7 @@ extract_fn() {
   sed -n "${start},${end}p" "$WATCHDOG"
 }
 
+eval "$(extract_fn parse_bsd_boottime)"
 eval "$(extract_fn boot_time)"
 eval "$(extract_fn read_fresh_state)"
 
@@ -108,6 +109,37 @@ if [[ "$LIVE_BOOT" =~ ^[0-9]+$ ]] && [ "$LIVE_BOOT" -gt 0 ] && [ "$LIVE_BOOT" -l
 else
   echo "  [boot_time-live] boot_time()='$LIVE_BOOT' not a plausible past epoch -- FAIL"
   OVERALL_PASS=false
+fi
+
+# macOS/BSD parse: `sysctl kern.boottime` emits "{ sec = N, usec = M } ...".
+# The real parse_bsd_boottime() must return the EPOCH (first "sec"), never
+# the microseconds (the "usec" substring). This is the skeptic-caught
+# defect: a greedy `.*sec` regex captured usec, making BOOT_TIME 0..999999
+# and the reboot guard a permanent no-op on every Mac (Linux CI never
+# exercised the branch, so the bug hid). Feed literal fixtures through the
+# REAL extracted function.
+mac_parse_case() {
+  local label="$1" fixture="$2" expect="$3" got
+  got=$(printf '%s\n' "$fixture" | parse_bsd_boottime)
+  if [ "$got" = "$expect" ]; then
+    echo "  [$label] parse_bsd_boottime='$got' (expected $expect) -- PASS"
+  else
+    echo "  [$label] parse_bsd_boottime='$got' (expected $expect) -- FAIL"
+    OVERALL_PASS=false
+  fi
+}
+mac_parse_case "macos-boottime-nonzero-usec-returns-sec" \
+  '{ sec = 1699999999, usec = 123456 } Mon Oct 14 12:00:00 2023' "1699999999"
+mac_parse_case "macos-boottime-zero-usec-returns-sec" \
+  '{ sec = 1699999999, usec = 0 } Mon Oct 14 12:00:00 2023' "1699999999"
+
+# Guard that the greedy-regex defect cannot regress: the source must NOT
+# contain an unanchored `.*sec *=` parse (which would recapture usec).
+if grep -qE 's/\.\*sec \*= \*' "$WATCHDOG"; then
+  echo "  [macos-parse-no-greedy-regex] found unanchored '.*sec *=' parse -- FAIL"
+  OVERALL_PASS=false
+else
+  echo "  [macos-parse-no-greedy-regex] no unanchored '.*sec *=' parse present -- PASS"
 fi
 
 # Case (a): FAST reboot -- state predates boot but is only 120s old, well

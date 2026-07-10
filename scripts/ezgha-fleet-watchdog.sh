@@ -159,9 +159,23 @@ log() { echo "[$TS] $*"; }
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
+# parse_bsd_boottime extracts the boot epoch (the `sec` field) from macOS/BSD
+# `sysctl kern.boottime` output, read on stdin
+# ("{ sec = 1700000000, usec = 0 } Mon ..."). The `^[{ ]*` anchor is
+# load-bearing: a naive `.*sec` is GREEDY and matches the LAST "sec" in the
+# string — the "usec" substring — capturing microseconds (0..999999) instead
+# of the epoch, which would silently break the reboot guard on every Mac
+# (bead ez-gh-actions-xfw skeptic finding). Anchoring to the leading `{`/
+# spaces forces the FIRST "sec" (the epoch). Factored out of boot_time() so
+# it can be unit-tested against a literal fixture on non-macOS CI, where
+# boot_time() itself always takes the Linux /proc/stat branch.
+parse_bsd_boottime() { # stdin: sysctl kern.boottime output -> epoch seconds
+  sed -E 's/^[{ ]*sec *= *([0-9]+).*/\1/'
+}
+
 # boot_time prints the host's boot time in epoch seconds, or nothing if it
 # cannot be determined. Linux: the `btime <epoch>` line in /proc/stat.
-# macOS/BSD: `sysctl kern.boottime` ("{ sec = 1700000000, usec = 0 } ...").
+# macOS/BSD: `sysctl kern.boottime` via parse_bsd_boottime (see above).
 # An unknown boot time is left empty ON PURPOSE so read_fresh_state's
 # reboot guard (guardrail 5a) degrades to a no-op — preserving prior
 # behavior rather than guessing and risking a new failure mode.
@@ -171,7 +185,7 @@ boot_time() {
     bt="$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null || true)"
   fi
   if [[ ! "$bt" =~ ^[0-9]+$ ]]; then
-    bt="$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec *= *([0-9]+).*/\1/' || true)"
+    bt="$(sysctl -n kern.boottime 2>/dev/null | parse_bsd_boottime || true)"
   fi
   [[ "$bt" =~ ^[0-9]+$ ]] && echo "$bt"
 }
