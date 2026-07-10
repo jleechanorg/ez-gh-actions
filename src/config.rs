@@ -273,10 +273,22 @@ pub struct Limits {
     /// Disk exhaustion is the dominant self-hosted runner failure mode.
     #[serde(default = "default_min_free_disk_gb")]
     pub min_free_disk_gb: u64,
+    /// Refuse to spawn new runners when host MemAvailable drops below this.
+    /// Mirrors `min_free_disk_gb`: piling more runner containers onto an
+    /// already memory-strained host is how a shared box gets OOM-killed
+    /// (jeff-ubuntu, 2026-07-10). Default keeps ~2GB headroom above the
+    /// kernel's own ~10% OOM-killer safety zone on a 62GB host with a
+    /// 30GB-capped VM — see bead jleechan-aeh0 for the full derivation.
+    #[serde(default = "default_min_available_memory_mb")]
+    pub min_available_memory_mb: u64,
 }
 
 fn default_min_free_disk_gb() -> u64 {
     10
+}
+
+fn default_min_available_memory_mb() -> u64 {
+    8192
 }
 
 fn default_failure_alert_threshold() -> u32 {
@@ -436,6 +448,7 @@ impl Config {
                 cpus,
                 pids: 512,
                 min_free_disk_gb: default_min_free_disk_gb(),
+                min_available_memory_mb: default_min_available_memory_mb(),
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,

@@ -34,6 +34,8 @@ static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
 #[cfg(test)]
 static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
+static TEST_AVAILABLE_MEM_MB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 /// Overrides the binary name/path used to build every `docker` `Command` in
 /// this module. Unlike mutating the process-wide `PATH` env var (which any
@@ -1271,6 +1273,19 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+/// Host `MemAvailable` in MB, wrapping [`crate::platform::available_mem_mb`]
+/// with a test injection point (mirrors [`free_disk_gb`]'s `TEST_FREE_DISK_GB`
+/// pattern) so `ensure_count_outcome`'s memory-floor guard is unit-testable
+/// without depending on the real host's memory state.
+fn available_mem_mb() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(mem) = *TEST_AVAILABLE_MEM_MB.lock().unwrap() {
+        return mem;
+    }
+
+    crate::platform::available_mem_mb()
+}
+
 /// Start `missing` runners, one per free slot. Tracks which slot numbers have
 /// already failed WITHIN this call and excludes them from subsequent slot
 /// picks, so a single permanently-broken slot (e.g. an unresolvable 409
@@ -1415,6 +1430,35 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             );
         }
     }
+    match available_mem_mb() {
+        Some(mem) if mem < cfg.limits.min_available_memory_mb => {
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.memory_floor",
+                Severity::Critical,
+                "Runner pool paused: host memory floor reached",
+                &format!(
+                    "only {mem} MB memory available on the host (floor: {} MB) for {}. \
+                     refusing to spawn runners until memory pressure clears",
+                    cfg.limits.min_available_memory_mb, cfg.github.target
+                ),
+            );
+            bail!(
+                "only {mem} MB memory available on the host (floor: {} MB) — \
+                 refusing to spawn runners; free up memory (e.g. stop unrelated \
+                 processes, wait for existing jobs to finish) first",
+                cfg.limits.min_available_memory_mb
+            );
+        }
+        // `Some(_) within floor` and `None` (measurement unavailable) both fall
+        // through deliberately: unlike disk, a single failed memory read is not
+        // itself treated as a strike-worthy degraded signal, since memory
+        // measurement failure is far rarer than disk (no docker-daemon RPC
+        // involved) and erring toward "keep spawning" avoids a starvation
+        // pattern on hosts where `/proc/meminfo`/`vm_stat` is transiently
+        // unreadable but otherwise healthy.
+        Some(_) | None => {}
+    }
     let missing = cfg.runner.count - alive;
     let refill = start_missing_runners(cfg, backend, missing);
     // Release any failed reservations from this cycle
@@ -1508,6 +1552,7 @@ mod tests {
             *TEST_SLOT_PATH.lock().unwrap() = None;
             *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_AVAILABLE_MEM_MB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
@@ -1872,6 +1917,64 @@ mod tests {
         assert!(
             !outcome.is_partial_failure(),
             "2 successful starts out of 2 missing is a healthy full refill, not a failure"
+        );
+    }
+
+    #[test]
+    fn ensure_count_refuses_to_spawn_below_memory_floor() {
+        // Mirrors the disk-floor guard (ensure_count_real_wiring_computes_missing_before_start_missing):
+        // when host MemAvailable is below cfg.limits.min_available_memory_mb, ensure_count_outcome
+        // must refuse to spawn rather than piling more runner containers onto an already-strained
+        // host — this is the Gate-0 gap that let jeff-ubuntu OOM on 2026-07-10 (bead jleechan-aeh0).
+        let _env = TestEnv::new("ensure_count_memory_floor");
+        let mut cfg = cfg_with(5, "ez-org-runner");
+        cfg.limits.min_available_memory_mb = 8192;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_AVAILABLE_MEM_MB.lock().unwrap() = Some(Some(1024));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-org-runner-1".into(),
+            "ez-org-runner-2".into(),
+            "ez-org-runner-3".into(),
+            "ez-org-runner-4".into(),
+            "ez-org-runner-5".into(),
+        ]);
+
+        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("memory"),
+            "refusal error must mention memory so operators can diagnose it, got: {err:#}"
+        );
+        assert!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len() == 5,
+            "no start_one calls should be consumed when refusing below the memory floor"
+        );
+    }
+
+    #[test]
+    fn ensure_count_spawns_normally_above_memory_floor() {
+        // Healthy-host control for the guard above: plenty of MemAvailable must NOT
+        // block a refill. Prevents the "deadlock" failure mode the /advice synthesis
+        // warned about (floor set so conservatively the daemon refuses under normal
+        // conditions).
+        let _env = TestEnv::new("ensure_count_memory_floor_ok");
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.min_available_memory_mb = 8192;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_AVAILABLE_MEM_MB.lock().unwrap() = Some(Some(32768));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-1".into(), "ez-org-runner-2".into()]);
+
+        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            started,
+            vec!["ez-org-runner-1", "ez-org-runner-2"],
+            "plenty of MemAvailable must not block a normal refill"
         );
     }
 

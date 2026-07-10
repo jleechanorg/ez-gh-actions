@@ -180,6 +180,66 @@ fn total_mem_mb() -> u64 {
     }
 }
 
+/// Currently-available host memory in MB, i.e. what could be handed to a new
+/// process right now without swapping — the same quantity `free -h`'s
+/// "available" column reports on Linux. `None` means the measurement itself
+/// failed (missing `/proc/meminfo` field, `vm_stat` not on PATH, etc.); the
+/// caller treats that the same way `free_disk_gb`'s `None` is treated —
+/// a degraded-measurement signal, not "plenty of memory".
+pub fn available_mem_mb() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // MemAvailable (not MemFree) is the kernel's own estimate of memory
+        // available for new allocations without swapping — it already
+        // accounts for reclaimable caches/buffers the way MemFree does not.
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
+                return Some(kb / 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has no MemAvailable equivalent exposed via sysctl; derive it
+        // from `vm_stat`'s free + inactive + speculative pages (the pages the
+        // kernel would hand back on demand without swapping), the same
+        // convention Activity Monitor's "Memory Used" complement and most
+        // macOS memory-pressure tooling uses.
+        let cmd = Command::new("vm_stat");
+        let (ok, out) = capture(cmd)?;
+        if !ok {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out);
+        let page_size = text
+            .lines()
+            .next()
+            .and_then(|first| first.split("page size of").nth(1))
+            .and_then(|rest| rest.trim().split(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(4096);
+        let pages = |label: &str| -> u64 {
+            text.lines()
+                .find(|l| l.starts_with(label))
+                .and_then(|l| l.split(':').nth(1))
+                .and_then(|n| n.trim().trim_end_matches('.').parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let free = pages("Pages free");
+        let inactive = pages("Pages inactive");
+        let speculative = pages("Pages speculative");
+        let available_bytes = (free + inactive + speculative) * page_size;
+        Some(available_bytes / 1024 / 1024)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
