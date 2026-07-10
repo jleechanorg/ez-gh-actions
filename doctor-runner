@@ -29,6 +29,7 @@ ORG="${ORG:-jleechanorg}"
 EZGHA_REPO="${EZGHA_REPO:-jleechanorg/ez-gh-actions}"
 QUEUE_REPO="${QUEUE_REPO:-jleechanorg/worldarchitect.ai}"
 QUEUE_TAIL_WARN_MIN="${QUEUE_TAIL_WARN_MIN:-20}"
+STALE_HOURS="${STALE_HOURS:-8}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # --- helpers -------------------------------------------------------------
@@ -399,6 +400,108 @@ if [ "$PROVE" = "1" ]; then
 fi
 
 
+# --- F1b. cross-repo JOB map (single fetch, reused by sections 8, 9, 10) --
+# Built BEFORE section 8 so the queue-tail gate can trigger on JOB-level
+# waits instead of RUN-level age. A workflow RUN can sit "queued" for 30+
+# minutes at run level purely from `concurrency:` serialization or staged
+# gate workflows (Green Gate) while every actual JOB gets a runner within
+# seconds — observed 2026-07-10 01:11: run 29060462908 was run-level queued
+# 33.4m, yet its only job was created at 01:11:49 and picked up immediately
+# (33 minutes of concurrency wait, zero runner wait). Run age is NOT runner
+# wait; job created_at -> now on status=queued jobs is. This is the SAME
+# fetch section 10 previously made — moved, not duplicated, so total API
+# call count is unchanged.
+EXPLICIT_WORK_REPOS="${EXPLICIT_WORK_REPOS:-jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions}"
+RUNNER_JOB_INDEX_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-doctor-jobmap.XXXXXX" 2>/dev/null || echo "/tmp/ezgha-doctor-jobmap.$$")
+# Fetch-failure ledger: build_runner_job_index runs inside a PIPELINE (a
+# subshell), so a shell counter would be lost — failures are appended to
+# this side file and counted by the parent afterward. Without it, a
+# rate-limited/truncated fan-out silently yields an EMPTY map that is
+# indistinguishable from a genuinely drained queue (JOBLEVEL_QUEUED_COUNT=0,
+# oldest=0m) and the section-8 gate would report GREEN under the exact
+# API-truncation hazard documented in CLAUDE.md. Health gates must fail
+# honest, never silent-green: any fetch error degrades the job map to
+# "unknown" and forces the run-level fallback path.
+JOBMAP_ERRORS_FILE="${RUNNER_JOB_INDEX_FILE}.errors"
+: > "$JOBMAP_ERRORS_FILE"
+trap 'rm -f "$RUNNER_JOB_INDEX_FILE" "$JOBMAP_ERRORS_FILE"' EXIT
+
+iso_elapsed_min() {
+  # Minutes elapsed since an ISO-8601 timestamp ("?" on parse failure).
+  python3 -c "
+import sys, datetime
+try:
+    s = datetime.datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00'))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    print(f'{(now - s).total_seconds() / 60:.1f}')
+except Exception:
+    print('?')
+" "$1" 2>/dev/null
+}
+
+build_runner_job_index() {
+  # Emits one JSON object per queued/in-progress job across all
+  # EXPLICIT_WORK_REPOS. Fresh-only: runs older than STALE_HOURS (section
+  # 8's freshness rule, default 8h) are queue zombies, not live work —
+  # skipping them ALSO bounds the per-run jobs-API fan-out.
+  local repo status runs_json jobs_json rid run_url fresh_cutoff
+  if [ "$PLATFORM" = "macos" ]; then
+    fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  else
+    fresh_cutoff=$(date -u -d "${STALE_HOURS:-8} hours ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  fi
+  for repo in $EXPLICIT_WORK_REPOS; do
+    for status in in_progress queued; do
+      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
+      while IFS=$'\t' read -r rid run_url; do
+        [ -z "$rid" ] && continue
+        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+        printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
+          '.jobs[]? | select(.status=="in_progress" or .status=="queued")
+           | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
+      done < <(printf '%s' "$runs_json" | jq -r --arg cutoff "${fresh_cutoff:-}" \
+        '.workflow_runs[]? | select($cutoff == "" or .created_at > $cutoff) | [.id, .html_url] | @tsv' 2>/dev/null)
+    done
+  done
+}
+set +e
+build_runner_job_index | jq -s 'unique_by(.html_url)' > "$RUNNER_JOB_INDEX_FILE" 2>/dev/null
+set -e
+[ -s "$RUNNER_JOB_INDEX_FILE" ] || echo '[]' > "$RUNNER_JOB_INDEX_FILE"
+
+# Job-level queue counts — computed from the SAME single fetch above
+# (fresh-only), never a second API sweep. Section 8's QUEUE_* variables are
+# run-level and single-repo; these are job-level across every repo the
+# fleet serves, and are what the section-8 tail gate and section-9
+# starvation gate trigger on.
+set +e
+JOBLEVEL_QUEUED_COUNT=$(jq '[.[] | select(.status=="queued")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_INPROG_COUNT=$(jq '[.[] | select(.status=="in_progress")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+JOBLEVEL_OLDEST_QUEUED_AT=$(jq -r '[.[] | select(.status=="queued")] | sort_by(.created_at) | first | .created_at // empty' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
+set -e
+JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
+JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
+JOBLEVEL_OLDEST_QUEUED_MIN="0"
+[ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ] && JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT")
+
+# Count fetch failures recorded by the (subshell) builder. Run-list failures
+# and per-run jobs failures counted separately for the diagnostic message.
+JOBLEVEL_RUNLIST_ERRORS=0
+JOBLEVEL_JOBS_ERRORS=0
+if [ -s "$JOBMAP_ERRORS_FILE" ]; then
+  JOBLEVEL_RUNLIST_ERRORS=$(grep -c '^runlist' "$JOBMAP_ERRORS_FILE" 2>/dev/null || true)
+  JOBLEVEL_JOBS_ERRORS=$(grep -c '^jobs' "$JOBMAP_ERRORS_FILE" 2>/dev/null || true)
+fi
+JOBLEVEL_FETCH_ERRORS=$(( ${JOBLEVEL_RUNLIST_ERRORS:-0} + ${JOBLEVEL_JOBS_ERRORS:-0} ))
+export JOBLEVEL_FETCH_ERRORS JOBLEVEL_RUNLIST_ERRORS JOBLEVEL_JOBS_ERRORS
+if [ "$JOBLEVEL_FETCH_ERRORS" -gt 0 ]; then
+  # Degraded map: counts are UNKNOWN, not zero. "?" makes every consumer
+  # (section 8 tail gate, section 9 starvation inputs, verdict queue line)
+  # take its run-level fallback path instead of trusting a silently-empty map.
+  JOBLEVEL_OLDEST_QUEUED_MIN="?"
+  warn "job map DEGRADED: ${JOBLEVEL_FETCH_ERRORS} fetch error(s) (${JOBLEVEL_RUNLIST_ERRORS} run-list, ${JOBLEVEL_JOBS_ERRORS} per-run jobs) — job-level queue counts are UNKNOWN, not zero; run-level fallback will govern the queue gate"
+fi
+
 # --- F2. GitHub Actions queue health (saturation / tail latency) ----------
 QUEUE_TAIL_BAD=0
 QUEUE_QUEUED_STALE=0
@@ -496,14 +599,29 @@ info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE
 
 # IDLE is only a defect (IDLE-STARVED) once the queue has been non-empty for
 # at least IDLE_STARVED_THRESHOLD_MIN minutes — a single-tick queue blip (job
-# just created, not yet picked up) is not starvation. QUEUE_OLDEST_FRESH_AGE_MIN
-# (from scripts/queue-health.sh, section 8) is how long the oldest fresh
-# queued run has actually been waiting — the correct sustained-duration
-# signal, not just instantaneous QUEUE_QUEUED_FRESH>0. DOWN is always a
-# defect regardless of queue state.
+# just created, not yet picked up) is not starvation. Starvation inputs are
+# JOB-level (from the section-F1b job map): a run-level queued age includes
+# concurrency-serialization and staged-gate wait, which false-alarms exactly
+# like the section-8 tail gate did (2026-07-10 run 29060462908: 33.4m
+# run-queued, zero runner wait). JOBLEVEL_OLDEST_QUEUED_MIN is how long the
+# oldest fresh queued JOB has actually been waiting for a runner — the
+# correct sustained-duration signal. Falls back to section 8's run-level
+# values only if the job-map lookup produced no usable number. DOWN is
+# always a defect regardless of queue state.
 IDLE_STARVED_THRESHOLD_MIN="${IDLE_STARVED_THRESHOLD_MIN:-5}"
+# Degraded/unusable job map ("?" age or any fetch error) means job-level
+# counts are UNKNOWN — fall back to section 8's run-level values for BOTH
+# inputs (a job-level count of 0 from a truncated fan-out must never
+# suppress a starvation signal the run-level data can still see).
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-?}" = "?" ]; then
+  STARVE_QUEUED_COUNT="${QUEUE_QUEUED_FRESH:-0}"
+  STARVE_OLDEST_MIN="${QUEUE_OLDEST_FRESH_AGE_MIN:-0}"
+else
+  STARVE_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
+  STARVE_OLDEST_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN:-0}"
+fi
 STARVED_PRESENT=0
-if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ] && awk -v a="${QUEUE_OLDEST_FRESH_AGE_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
+if [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ] && awk -v a="${STARVE_OLDEST_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
   STARVED_PRESENT=1
 fi
 
@@ -514,10 +632,10 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
 fi
 if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
   if [ "$STARVED_PRESENT" -eq 1 ]; then
-    bad "IDLE-STARVED (${QUEUE_QUEUED_FRESH} jobs queued, oldest waiting ${QUEUE_OLDEST_FRESH_AGE_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#IDLE_SLOTS[@]} slot(s): ${IDLE_SLOTS[*]}"
+    bad "IDLE-STARVED (${STARVE_QUEUED_COUNT} jobs queued, oldest job waiting ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#IDLE_SLOTS[@]} slot(s): ${IDLE_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#IDLE_SLOTS[@]}))
-  elif [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
-    info "IDLE-OK (${QUEUE_QUEUED_FRESH} job(s) queued ${QUEUE_OLDEST_FRESH_AGE_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold, not yet starved): ${IDLE_SLOTS[*]}"
+  elif [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ]; then
+    info "IDLE-OK (${STARVE_QUEUED_COUNT} job(s) queued ${STARVE_OLDEST_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold, not yet starved): ${IDLE_SLOTS[*]}"
   else
     info "IDLE-OK (nothing queued): ${IDLE_SLOTS[*]}"
   fi
@@ -543,70 +661,15 @@ EXPLICIT_WORK_HOST="${EXPLICIT_WORK_HOST:-macbook}"
 # We enumerate runs with status in_progress AND queued (queued runs can hold
 # in-progress jobs and vice versa) on the repos our fleet actually serves,
 # then each fresh run's jobs, into ONE temp-file job map indexed by
-# runner_name — joined per-slot below, never one API call per slot. The
-# set +e / set -e sandwich prevents `set -euo pipefail` from killing the
-# script on a transiently-empty result.
-EXPLICIT_WORK_REPOS="${EXPLICIT_WORK_REPOS:-jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions}"
+# runner_name — joined per-slot below, never one API call per slot.
+# NOTE: the job map itself ($RUNNER_JOB_INDEX_FILE) and the JOBLEVEL_*
+# counts are built ONCE in section F1b (before section 8) so the queue-tail
+# and starvation gates can trigger on job-level waits; this section only
+# consumes them.
 SECTION10_DOWN_RESAMPLE_SECONDS="${SECTION10_DOWN_RESAMPLE_SECONDS:-25}"
-RUNNER_JOB_INDEX_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-doctor-jobmap.XXXXXX" 2>/dev/null || echo "/tmp/ezgha-doctor-jobmap.$$")
-trap 'rm -f "$RUNNER_JOB_INDEX_FILE"' EXIT
-
-iso_elapsed_min() {
-  # Minutes elapsed since an ISO-8601 timestamp ("?" on parse failure).
-  python3 -c "
-import sys, datetime
-try:
-    s = datetime.datetime.fromisoformat(sys.argv[1].replace('Z', '+00:00'))
-    now = datetime.datetime.now(datetime.timezone.utc)
-    print(f'{(now - s).total_seconds() / 60:.1f}')
-except Exception:
-    print('?')
-" "$1" 2>/dev/null
-}
-
-build_runner_job_index() {
-  # Emits one JSON object per queued/in-progress job across all
-  # EXPLICIT_WORK_REPOS. Fresh-only: runs older than STALE_HOURS (section
-  # 8's freshness rule, default 8h) are queue zombies, not live work —
-  # skipping them ALSO bounds the per-run jobs-API fan-out.
-  local repo status runs_json jobs_json rid run_url fresh_cutoff
-  if [ "$PLATFORM" = "macos" ]; then
-    fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-  else
-    fresh_cutoff=$(date -u -d "${STALE_HOURS:-8} hours ago" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
-  fi
-  for repo in $EXPLICIT_WORK_REPOS; do
-    for status in in_progress queued; do
-      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || continue
-      while IFS=$'\t' read -r rid run_url; do
-        [ -z "$rid" ] && continue
-        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || continue
-        printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
-          '.jobs[]? | select(.status=="in_progress" or .status=="queued")
-           | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
-      done < <(printf '%s' "$runs_json" | jq -r --arg cutoff "${fresh_cutoff:-}" \
-        '.workflow_runs[]? | select($cutoff == "" or .created_at > $cutoff) | [.id, .html_url] | @tsv' 2>/dev/null)
-    done
-  done
-}
-set +e
-build_runner_job_index | jq -s 'unique_by(.html_url)' > "$RUNNER_JOB_INDEX_FILE" 2>/dev/null
-set -e
-[ -s "$RUNNER_JOB_INDEX_FILE" ] || echo '[]' > "$RUNNER_JOB_INDEX_FILE"
-
-# Job-level queue counts for the verdict line — computed from the SAME
-# single fetch above (fresh-only), never a second API sweep. Section 8's
-# QUEUE_* variables are run-level and single-repo; these are job-level
-# across every repo the fleet serves.
-set +e
-JOBLEVEL_QUEUED_COUNT=$(jq '[.[] | select(.status=="queued")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
-JOBLEVEL_INPROG_COUNT=$(jq '[.[] | select(.status=="in_progress")] | length' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
-JOBLEVEL_OLDEST_QUEUED_AT=$(jq -r '[.[] | select(.status=="queued")] | sort_by(.created_at) | first | .created_at // empty' "$RUNNER_JOB_INDEX_FILE" 2>/dev/null)
-set -e
-JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
-JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
-JOBLEVEL_OLDEST_QUEUED_MIN="0"
-[ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ] && JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT")
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  warn "job map DEGRADED (${JOBLEVEL_FETCH_ERRORS} fetch errors) — per-slot job evidence below may be incomplete; Runner.Worker pids remain ground truth"
+fi
 info "job map: ${JOBLEVEL_INPROG_COUNT} in-progress + ${JOBLEVEL_QUEUED_COUNT} queued fresh job(s) across: $EXPLICIT_WORK_REPOS"
 
 job_evidence_for_runner() {
@@ -693,9 +756,9 @@ list_slot_work() {
         # sustained-starvation threshold) vs IDLE-STARVED (queue has been
         # non-empty for >= IDLE_STARVED_THRESHOLD_MIN minutes — see section 9).
         if [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
-          printf "    %-22s %-13s %s\n" "$name" "IDLE-STARVED" "${QUEUE_QUEUED_FRESH} fresh queued jobs, oldest waiting ${QUEUE_OLDEST_FRESH_AGE_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold"
-        elif [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ]; then
-          printf "    %-22s %-13s %s\n" "$name" "IDLE-OK" "${QUEUE_QUEUED_FRESH} job(s) queued ${QUEUE_OLDEST_FRESH_AGE_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold (not yet starved)"
+          printf "    %-22s %-13s %s\n" "$name" "IDLE-STARVED" "${STARVE_QUEUED_COUNT} fresh queued jobs, oldest job waiting ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold"
+        elif [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ]; then
+          printf "    %-22s %-13s %s\n" "$name" "IDLE-OK" "${STARVE_QUEUED_COUNT} job(s) queued ${STARVE_OLDEST_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold (not yet starved)"
         else
           printf "    %-22s %-13s %s\n" "$name" "IDLE-OK" "nothing queued"
         fi
@@ -806,7 +869,7 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_DOWN_SLOTS[@]}))
   fi
   if [ "${#REMOTE_IDLE_SLOTS[@]}" -gt 0 ] && [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
-    bad "$REMOTE_LABEL IDLE-STARVED (oldest queued ${QUEUE_OLDEST_FRESH_AGE_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#REMOTE_IDLE_SLOTS[@]} slot(s): ${REMOTE_IDLE_SLOTS[*]}"
+    bad "$REMOTE_LABEL IDLE-STARVED (oldest queued job ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#REMOTE_IDLE_SLOTS[@]} slot(s): ${REMOTE_IDLE_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_IDLE_SLOTS[@]}))
   fi
 else
@@ -843,10 +906,13 @@ fi
 
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
-# Job-level queue counts (fresh-only, from section 10's single job-map
+# Job-level queue counts (fresh-only, from section F1b's single job-map
 # fetch) — printed for BOTH healthy and unhealthy verdicts so the queue
-# state is never hidden behind a green light.
-if [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
+# state is never hidden behind a green light. A degraded map prints as
+# UNKNOWN, never as a reassuring "0 queued".
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  echo "  queue: UNKNOWN — job map degraded (${JOBLEVEL_FETCH_ERRORS} fetch errors); section-8 run-level fallback governed the queue gate"
+elif [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
   echo "  queue: ${JOBLEVEL_QUEUED_COUNT} queued job(s) (oldest ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 else
   echo "  queue: 0 queued job(s) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
@@ -883,7 +949,9 @@ fi
 [ "${REAL_ON_FLEET:-0}" -lt 1 ]            && CRITICAL=$((CRITICAL+1))
 # canary gate (only when --prove): the live job must have run on our fleet
 [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]  && CRITICAL=$((CRITICAL+1))
-# queue tail gate: fresh backlog waiting > QUEUE_TAIL_WARN_MIN means saturated/mis-routing
+# queue tail gate: oldest fresh queued JOB waiting > QUEUE_TAIL_WARN_MIN means
+# saturated/mis-routing. JOB-level (job created_at -> now), not run age — run
+# age includes concurrency/staged-gate wait and false-alarmed (2026-07-10).
 [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && CRITICAL=$((CRITICAL+1))
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
