@@ -20,11 +20,13 @@
   machine (see ez-gh-actions runner-queue-healthy-mac mission STATE.md).
 
   Install (placeholders substituted at install time):
-    @HOME@       -> install user's $HOME
-    @REPO_PATH@  -> absolute path to this repo checkout
+    @HOME@        -> install user's $HOME
+    @SCRIPTS_DIR@ -> stable installed script dir, ~/.local/libexec/ezgha
+                     (NOT a repo/worktree checkout path — scripts are copied
+                     there by launchd/install-launchagents.sh before render)
 
     sed -e "s|@HOME@|$HOME|g" \
-        -e "s|@REPO_PATH@|<absolute-path-to-ez-gh-actions-checkout>|g" \
+        -e "s|@SCRIPTS_DIR@|$HOME/.local/libexec/ezgha|g" \
       launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template \
       > ~/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist
     launchctl load ~/Library/LaunchAgents/org.jleechanorg.ezgha-queue-reaper-stopgap.plist
@@ -44,11 +46,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>@REPO_PATH@/scripts/queue-reaper-stopgap.sh</string>
+    <string>@SCRIPTS_DIR@/queue-reaper-stopgap.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>@REPO_PATH@</string>
+  <string>@HOME@</string>
 
   <key>EnvironmentVariables</key>
   <dict>

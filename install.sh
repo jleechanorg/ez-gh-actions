@@ -37,6 +37,8 @@ uninstall() {
   else
     ok "${CRATE} not installed via cargo (nothing to remove)"
   fi
+  rm -rf "${HOME}/.local/libexec/ezgha"
+  ok "stable script install dir removed: ${HOME}/.local/libexec/ezgha"
   info "Config left in place: ${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/"
   exit 0
 }
@@ -228,10 +230,28 @@ fi
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
 #   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
+#
+# Scripts are NEVER exec'd from this repo/worktree checkout: they are copied
+# (install -m 0755) to the stable user-scope location ~/.local/libexec/ezgha/
+# first, and every unit/plist references ONLY that stable path via
+# @SCRIPTS_DIR@ — the uv-tool-install pattern (repo is source, libexec dir is
+# what runs). See bead ez-gh-actions-sa1t: a plist that pointed at a deleted
+# worktree ran silently dead (207 consecutive exit-78 failures, ~41h) with no
+# visible symptom because the fleet happened to stay healthy anyway.
 UNIT_DIR="${SCRIPT_DIR}/systemd"
 if [ -d "${UNIT_DIR}" ]; then
-  REPO_PATH="${SCRIPT_DIR}"
   HOME_DIR="${HOME}"
+  SCRIPTS_DIR="${HOME_DIR}/.local/libexec/ezgha"
+  mkdir -p "${SCRIPTS_DIR}"
+  # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
+  # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
+  # same flat directory so sibling-relative lookups keep working post-install.
+  for script in "${SCRIPT_DIR}"/scripts/*.sh "${SCRIPT_DIR}"/scripts/*.py; do
+    [ -f "${script}" ] || continue
+    install -m 0755 "${script}" "${SCRIPTS_DIR}/$(basename "${script}")"
+  done
+  ok "scripts installed to stable path: ${SCRIPTS_DIR}"
+
   if [ "$(uname -s)" = "Darwin" ]; then
     # macOS: wrap each systemd-style unit into a launchd plist
     install_macos_plist() {
@@ -261,22 +281,33 @@ PLIST
   <key>StandardErrorPath</key><string>${HOME_DIR}/.local/state/ezgha/${name}.log</string>
 </dict></plist>
 PLIST
+      if grep -qF "${SCRIPT_DIR}" "${plist}" || grep -qi 'worktree' "${plist}"; then
+        bad "refusing to load ${plist}: still references the repo/worktree checkout path"
+        rm -f "${plist}"
+        return 1
+      fi
       launchctl load -w "${plist}" 2>/dev/null || true
       ok "macOS plist installed: ${name} (every ${interval_sec}s)"
     }
-    install_macos_plist "token-refresh" "2700"  "${REPO_PATH}/scripts/refresh_gh_app_token.sh" ""
-    install_macos_plist "queue-reaper"  "21600" "${REPO_PATH}/scripts/cleanup-stuck-runs.sh" "--apply"
-    install_macos_plist "watchdog"      "120"   "${REPO_PATH}/scripts/ezgha-fleet-watchdog.sh" "--host macos"
+    install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
+    install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    install_macos_plist "watchdog"      "120"   "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host macos"
   elif command -v systemctl >/dev/null 2>&1; then
-    # Linux: copy the systemd units with @REPO_PATH@ / @HOME@ placeholders substituted
+    # Linux: copy the systemd units with @SCRIPTS_DIR@ / @HOME@ placeholders substituted
     USER_UNIT_DIR="${HOME}/.config/systemd/user"
     mkdir -p "${USER_UNIT_DIR}"
     for unit in "${UNIT_DIR}"/ezgha-*.service "${UNIT_DIR}"/ezgha-*.timer; do
       [ -f "${unit}" ] || continue
       base="$(basename "${unit}")"
-      sed -e "s|@REPO_PATH@|${REPO_PATH}|g" \
+      dest="${USER_UNIT_DIR}/${base}"
+      sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
           -e "s|@HOME@|${HOME_DIR}|g" \
-          "${unit}" > "${USER_UNIT_DIR}/${base}"
+          "${unit}" > "${dest}"
+      if grep -q '@[A-Z_]*@' "${dest}" || grep -qF "${SCRIPT_DIR}" "${dest}" || grep -qi 'worktree' "${dest}"; then
+        bad "refusing to load ${dest}: unsubstituted placeholder or repo/worktree path reference"
+        rm -f "${dest}"
+        continue
+      fi
     done
     systemctl --user daemon-reload 2>/dev/null || true
     for timer in ezgha-watchdog.timer ezgha-token-refresh.timer ezgha-queue-reaper.timer; do

@@ -12,7 +12,7 @@ Type=oneshot
 # OnUnitActiveSec firing forever (Type=oneshot units don't re-fire while
 # still "running").
 TimeoutStartSec=90
-ExecStart=@REPO_PATH@/scripts/ezgha-fleet-watchdog.sh --host linux
+ExecStart=@SCRIPTS_DIR@/ezgha-fleet-watchdog.sh --host linux
 Environment=HOME=@HOME@
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
 StandardOutput=append:%h/.local/state/ezgha/watchdog.log

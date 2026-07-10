@@ -16,14 +16,18 @@
 # --tail lever.
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# cleanup-stuck-runs.sh is a sibling script — resolved relative to this
+# script's own directory, NOT a repo-relative "scripts/" path, so this still
+# works whether this script is run from a repo checkout (scripts/) or from
+# its stable install location (~/.local/libexec/ezgha/), where both scripts
+# are copied flat into the same directory. See bead ez-gh-actions-sa1t.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${HOME}/Library/Logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="${LOG_DIR}/ezgha-queue-reaper-stopgap.log"
 
 {
   echo "=== $(date -u +%FT%TZ) queue-reaper-stopgap tick ==="
-  cd "$REPO_DIR"
   # cleanup-stuck-runs.sh exits 1 whenever ANY individual cancel fails, which
   # includes the expected/benign race where a queued run completes or gets
   # cancelled naturally between the scan and the cancel call (see
@@ -31,6 +35,6 @@ LOG_FILE="${LOG_DIR}/ezgha-queue-reaper-stopgap.log"
   # for a periodic reaper, not a wrapper failure, so don't let `set -e` above
   # swallow the completion marker over a partial-failure exit code.
   rc=0
-  FRESH_TAIL_MIN=20 ./scripts/cleanup-stuck-runs.sh --tail --apply || rc=$?
+  FRESH_TAIL_MIN=20 "${SCRIPT_DIR}/cleanup-stuck-runs.sh" --tail --apply || rc=$?
   echo "=== $(date -u +%FT%TZ) tick complete (cleanup-stuck-runs.sh exit=$rc) ==="
 } >> "$LOG_FILE" 2>&1

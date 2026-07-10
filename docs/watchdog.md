@@ -40,16 +40,20 @@ original script.
 
 ## Linux systemd user timer
 
-Install the templates into the user systemd directory after substituting
-the repo checkout path:
+Scripts are never exec'd from the repo/worktree checkout — `install.sh`
+copies `scripts/*.sh` to the stable user-scope location
+`~/.local/libexec/ezgha/` first, then renders the unit with `@SCRIPTS_DIR@`
+pointing there (not `@REPO_PATH@`), so a deleted worktree can never take the
+watchdog down again (bead `ez-gh-actions-sa1t`). To install by hand:
 
 ```bash
-repo_path="$(pwd)"
-mkdir -p ~/.config/systemd/user ~/.local/state/ezgha
-sed "s|@REPO_PATH@|${repo_path}|g; s|@HOME@|${HOME}|g" \
+scripts_dir="${HOME}/.local/libexec/ezgha"
+mkdir -p ~/.config/systemd/user ~/.local/state/ezgha "${scripts_dir}"
+install -m 0755 scripts/ezgha-fleet-watchdog.sh "${scripts_dir}/"
+sed "s|@SCRIPTS_DIR@|${scripts_dir}|g; s|@HOME@|${HOME}|g" \
   systemd/ezgha-watchdog.service \
   > ~/.config/systemd/user/ezgha-watchdog.service
-sed "s|@REPO_PATH@|${repo_path}|g; s|@HOME@|${HOME}|g" \
+sed "s|@SCRIPTS_DIR@|${scripts_dir}|g; s|@HOME@|${HOME}|g" \
   systemd/ezgha-watchdog.timer \
   > ~/.config/systemd/user/ezgha-watchdog.timer
 

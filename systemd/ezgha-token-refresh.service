@@ -3,4 +3,4 @@ Description=Refresh ezgha GitHub App installation token
 
 [Service]
 Type=oneshot
-ExecStart=@REPO_PATH@/scripts/refresh_gh_app_token.sh
+ExecStart=@SCRIPTS_DIR@/refresh_gh_app_token.sh

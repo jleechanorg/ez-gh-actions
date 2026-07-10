@@ -8,11 +8,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>@REPO_PATH@/scripts/refresh_gh_app_token.sh</string>
+    <string>@SCRIPTS_DIR@/refresh_gh_app_token.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>@REPO_PATH@</string>
+  <string>@HOME@</string>
 
   <key>EnvironmentVariables</key>
   <dict>

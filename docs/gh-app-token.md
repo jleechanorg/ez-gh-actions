@@ -38,16 +38,21 @@ to `scripts/refresh_gh_app_token.sh`.
 
 ## Linux systemd user timer
 
-Install the templates into the user systemd directory after substituting the
-repo checkout path:
+Scripts are never exec'd from the repo/worktree checkout — `install.sh`
+copies `scripts/*.sh` (and `mint_gh_app_token.py`, a sibling helper) to the
+stable user-scope location `~/.local/libexec/ezgha/` first, then renders the
+unit with `@SCRIPTS_DIR@` pointing there (not `@REPO_PATH@`), so a deleted
+worktree can never silently take a scheduled job down (bead
+`ez-gh-actions-sa1t`). To install by hand:
 
 ```bash
-repo_path="$(pwd)"
-mkdir -p ~/.config/systemd/user
-sed "s|@REPO_PATH@|${repo_path}|g" \
+scripts_dir="${HOME}/.local/libexec/ezgha"
+mkdir -p ~/.config/systemd/user "${scripts_dir}"
+install -m 0755 scripts/refresh_gh_app_token.sh scripts/mint_gh_app_token.py "${scripts_dir}/"
+sed "s|@SCRIPTS_DIR@|${scripts_dir}|g" \
   systemd/ezgha-token-refresh.service \
   > ~/.config/systemd/user/ezgha-token-refresh.service
-sed "s|@REPO_PATH@|${repo_path}|g" \
+sed "s|@SCRIPTS_DIR@|${scripts_dir}|g" \
   systemd/ezgha-token-refresh.timer \
   > ~/.config/systemd/user/ezgha-token-refresh.timer
 
@@ -69,10 +74,12 @@ mkdir -p ~/.local/state/ezgha
 ./launchd/install-launchagents.sh install
 ```
 
-That substitutes `@REPO_PATH@`/`@HOME@` and loads every `launchd/*.plist.template`
-in the directory (use `./launchd/install-launchagents.sh status` to check, or
-`remove` to unload). `RunAtLoad=true` mints a token immediately on load, then
-`StartInterval=2700` refreshes it every 45 minutes. Logs go to
+That copies `scripts/*.sh` (+ `mint_gh_app_token.py`) to the stable
+`~/.local/libexec/ezgha/` install dir, substitutes `@SCRIPTS_DIR@`/`@HOME@`,
+and loads every `launchd/*.plist.template` in the directory (use
+`./launchd/install-launchagents.sh status` to check, or `remove` to unload
+and delete the libexec dir). `RunAtLoad=true` mints a token immediately on
+load, then `StartInterval=2700` refreshes it every 45 minutes. Logs go to
 `~/.local/state/ezgha/token-refresh.log`.
 
 ## Daemon auth behavior
