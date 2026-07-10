@@ -28,6 +28,14 @@ set -euo pipefail
 RECLAIM_PATTERN='release_stale_slots reclaimed'
 RESPAWN_PATTERN='respawned ephemeral runner'
 
+# Windows shorter than this are too short to extrapolate to an hourly rate
+# with any confidence — a couple of events in a few seconds is exactly the
+# kind of transient burst (daemon restart, JIT retry storm) that produces a
+# wildly misleading "/hour" figure when linearly scaled up. Below this floor
+# we still show the raw counts but flag the rate as low-confidence instead
+# of printing a bare number that looks authoritative.
+MIN_CONFIDENT_WINDOW_HOURS="0.0833" # 5 minutes
+
 platform=""
 since="1 hour ago"
 log_file="/tmp/ezgha-launchd-stderr.log"
@@ -66,18 +74,22 @@ count_matches() {
 report() {
     local reclaims="$1" respawns="$2" window_hours="$3" window_desc="$4"
 
-    local reclaims_per_hour respawns_per_hour
+    local reclaims_per_hour respawns_per_hour suffix=""
     if awk "BEGIN{exit !($window_hours > 0)}"; then
         reclaims_per_hour=$(awk -v c="$reclaims" -v h="$window_hours" 'BEGIN{printf "%.2f", c/h}')
         respawns_per_hour=$(awk -v c="$respawns" -v h="$window_hours" 'BEGIN{printf "%.2f", c/h}')
+        if awk "BEGIN{exit !($window_hours < $MIN_CONFIDENT_WINDOW_HOURS)}"; then
+            suffix=" [LOW-CONFIDENCE: window < ${MIN_CONFIDENT_WINDOW_HOURS}h, extrapolated from a short sample]"
+            echo "warning: window (${window_hours}h) is below the ${MIN_CONFIDENT_WINDOW_HOURS}h confidence floor — rate is extrapolated from a short sample and may not reflect steady-state churn" >&2
+        fi
     else
         reclaims_per_hour="n/a (zero-length window)"
         respawns_per_hour="n/a (zero-length window)"
     fi
 
     echo "=== ezgha churn rate ($platform, $window_desc) ==="
-    echo "reclaims: $reclaims (${reclaims_per_hour}/hour)"
-    echo "respawns: $respawns (${respawns_per_hour}/hour)"
+    echo "reclaims: $reclaims (${reclaims_per_hour}/hour)${suffix}"
+    echo "respawns: $respawns (${respawns_per_hour}/hour)${suffix}"
 }
 
 case "$platform" in
@@ -124,17 +136,16 @@ case "$platform" in
         # BSD/macOS date, though this branch only runs on Linux where GNU
         # date is standard). Use GNU date to resolve --since into an epoch
         # delta against "now" for the rate calculation.
-        since_epoch=$(date -d "$since" +%s 2>/dev/null || echo "")
-        now_epoch=$(date +%s)
-        if [[ -n "$since_epoch" ]]; then
-            window_seconds=$(( now_epoch - since_epoch ))
-            if (( window_seconds < 0 )); then
-                window_seconds=0
-            fi
-            window_hours=$(awk -v s="$window_seconds" 'BEGIN{printf "%.4f", s/3600}')
-        else
-            window_hours="0"
+        if ! since_epoch=$(date -d "$since" +%s 2>/dev/null); then
+            echo "unable to parse --since value '$since' via 'date -d' (is GNU date available and is the value valid?)" >&2
+            exit 1
         fi
+        now_epoch=$(date +%s)
+        window_seconds=$(( now_epoch - since_epoch ))
+        if (( window_seconds < 0 )); then
+            window_seconds=0
+        fi
+        window_hours=$(awk -v s="$window_seconds" 'BEGIN{printf "%.4f", s/3600}')
         report "$reclaims" "$respawns" "$window_hours" "journalctl --since \"$since\", unit $unit, ~${window_hours}h"
         ;;
     *)
