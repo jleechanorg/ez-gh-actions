@@ -141,6 +141,56 @@ compute_heartbeat_gap() {
   '
 }
 
+# --- DOWN-persistence journal cross-check (ez-gh-actions-5n0h) -----------
+# A slot containerless across BOTH doctor-runner samples (~25-30s apart) is
+# NOT proof of abandonment: a real respawn cycle (deregister -> mint JIT
+# token -> docker run) can take 30-60s+ under load, longer than that window
+# — observed 2026-07-09 on a busy fleet, three consecutive runs each flagged
+# a DIFFERENT rotating slot persisted-DOWN, and every flagged slot was back
+# "Up <60s" later (the daemon self-healed every one). Before calling a
+# still-containerless slot DOWN, cross-check the daemon's own log for a
+# respawn/management line on that EXACT slot within the last few minutes —
+# evidence the daemon has not abandoned the slot, just not finished the
+# cycle yet ("CYCLING", not "DOWN"). Split into a pure classifier (stdin =
+# log text, testable via fixture lines) and a log-source fetcher (talks to
+# the live system — journalctl locally/over ssh on Linux hosts, the launchd
+# stdout log locally/over ssh on macOS hosts, reusing the exact log sources
+# recent_logs() already established) so tests/*.sh can sed-extract only the
+# classifier, never a reimplementation.
+RESPAWN_EVIDENCE_WINDOW_MIN="${RESPAWN_EVIDENCE_WINDOW_MIN:-3}"
+
+# Pure: stdin = daemon log lines (any of the formats above), $1 = slot name.
+# Echoes 1 if a "respawned ephemeral runner <name>" line for this EXACT name
+# is present (anchored at end-of-line so "ez-runner-c-1" cannot false-match
+# a line ending in "ez-runner-c-10"), else 0.
+journal_has_respawn_evidence() {
+  local name="$1"
+  if grep -q "respawned ephemeral runner ${name}\$"; then
+    echo 1
+  else
+    echo 0
+  fi
+}
+
+# Log-source fetch (NOT unit-testable — talks to the live system). $1=host
+# ("localhost" or an ssh-reachable hostname), $2=that HOST's platform
+# ("linux"|"macos" — the platform the daemon we're checking runs on, not
+# necessarily the platform this script was invoked from), $3=minutes.
+fetch_respawn_log_window() {
+  local host="$1" remote_platform="$2" mins="${3:-$RESPAWN_EVIDENCE_WINDOW_MIN}"
+  if [ "$host" = "localhost" ]; then
+    recent_logs "$mins"
+    return 0
+  fi
+  if [ "$remote_platform" = "linux" ]; then
+    timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" \
+      "journalctl --user -u ezgha.service --since '${mins} minutes ago' --no-pager 2>/dev/null" 2>/dev/null
+  else
+    timeout 10 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" \
+      "tail -n 400 /tmp/ezgha-launchd-stdout.log 2>/dev/null" 2>/dev/null
+  fi
+}
+
 # --- A. local daemon + service ------------------------------------------
 section "1. ezgha service"
 SERVICE_STATE=$(probe_service_state)
@@ -634,6 +684,7 @@ done
 # (default 30s, > one serve tick); slots that recover in between are a
 # normal ephemeral recycle, classified by their second-sample state.
 DOWN_PERSISTENCE_WAIT_SECONDS="${DOWN_PERSISTENCE_WAIT_SECONDS:-30}"
+CYCLING_SLOTS=()
 if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
   info "first-pass DOWN candidates (${DOWN_SLOTS[*]}) — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s to filter normal ephemeral recycling"
   sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
@@ -651,10 +702,46 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
   fi
   DOWN_SLOTS=()
   if [ "${#_PERSISTENT_DOWN[@]}" -gt 0 ]; then
-    DOWN_SLOTS=("${_PERSISTENT_DOWN[@]}")
+    # Still containerless after BOTH docker samples — before calling these
+    # persisted-DOWN, cross-check the daemon's own log for respawn/
+    # management activity on the EXACT slot name in the last
+    # RESPAWN_EVIDENCE_WINDOW_MIN minutes (ez-gh-actions-5n0h): a real
+    # respawn cycle (deregister -> JIT token -> docker run) can take
+    # 30-60s+ under load, longer than the 2-sample window above, so
+    # "containerless both samples" alone is not proof of abandonment.
+    _RESPAWN_LOG=$(fetch_respawn_log_window "localhost" "$PLATFORM" "$RESPAWN_EVIDENCE_WINDOW_MIN")
+    _TRUE_DOWN=()
+    for _name in "${_PERSISTENT_DOWN[@]}"; do
+      if [ -n "$_RESPAWN_LOG" ] && [ "$(printf '%s\n' "$_RESPAWN_LOG" | journal_has_respawn_evidence "$_name")" = "1" ]; then
+        CYCLING_SLOTS+=("$_name")
+      else
+        _TRUE_DOWN+=("$_name")
+      fi
+    done
+    if [ "${#CYCLING_SLOTS[@]}" -gt 0 ]; then
+      info "CYCLING (containerless both samples but daemon log shows respawn activity in last ${RESPAWN_EVIDENCE_WINDOW_MIN}m — mid-cycle, not abandoned; ez-gh-actions-5n0h): ${CYCLING_SLOTS[*]}"
+    fi
+    DOWN_SLOTS=()
+    if [ "${#_TRUE_DOWN[@]}" -gt 0 ]; then
+      DOWN_SLOTS=("${_TRUE_DOWN[@]}")
+    fi
   fi
 fi
-info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
+info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#CYCLING_SLOTS[@]} cycling, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
+
+# Single source of truth for section 10's local-host table (below): "<name>
+# <STATE>" lines built from this SAME post-resample, post-journal-crosscheck
+# classification. Section 10 previously re-probed docker a SECOND time with
+# its own separate 25s resample window, so it could observe the local fleet
+# at a different instant than this section — the exact disagreement bead
+# ez-gh-actions-5n0h reported ("totals said 0 down while gates said 1-3
+# down"). Reusing this table means section 9 and section 10 always report
+# identical local per-slot state for the SAME run.
+LOCAL_SLOT_STATE_TABLE=""
+for _name in "${EXECUTING_SLOTS[@]}"; do LOCAL_SLOT_STATE_TABLE+="$_name EXECUTING"$'\n'; done
+for _name in "${IDLE_SLOTS[@]}"; do LOCAL_SLOT_STATE_TABLE+="$_name IDLE"$'\n'; done
+for _name in "${CYCLING_SLOTS[@]}"; do LOCAL_SLOT_STATE_TABLE+="$_name CYCLING"$'\n'; done
+for _name in "${DOWN_SLOTS[@]}"; do LOCAL_SLOT_STATE_TABLE+="$_name DOWN"$'\n'; done
 
 # IDLE is only a defect (IDLE-STARVED) once the queue has been non-empty for
 # at least IDLE_STARVED_THRESHOLD_MIN minutes — a single-tick queue blip (job
@@ -700,6 +787,7 @@ if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
   fi
 fi
 [ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "EXECUTING right now: ${EXECUTING_SLOTS[*]}"
+[ "${#CYCLING_SLOTS[@]}" -gt 0 ] && info "CYCLING (mid-respawn per daemon log, not a defect): ${CYCLING_SLOTS[*]}"
 
 # --- F4. EXPLICIT-WORK INVENTORY (every Configured slot, every machine) --
 # The user's bar is concrete: list each runner's job OR say the queue has no
@@ -767,31 +855,73 @@ probe_slot_state() {
 list_slot_work() {
   # Aligned table, one row per configured slot:
   #   <slot>  <STATE>  <job name> | started <ISO time> (<elapsed>m ago) | <run html_url>
-  # Two passes so the single 25s DOWN re-sample (bead ez-gh-actions-b895)
-  # happens ONCE per host, and rows still print in slot order: pass 1
-  # classifies every slot; first-pass DOWN candidates are re-probed after
-  # SECTION10_DOWN_RESAMPLE_SECONDS — a slot that is back Up on the second
-  # sample is CYCLING (normal ephemeral respawn, NOT a critical defect);
-  # only a DOWN that persists both samples prints as DOWN. Pass 2 renders.
+  #
+  # LOCAL_SLOT_STATE_TABLE (built once by section 9, including its 2-sample
+  # DOWN persistence AND journal cross-check — ez-gh-actions-5n0h) is reused
+  # verbatim for the localhost/matching-prefix/matching-count case instead of
+  # re-probing docker a SECOND time. Running the full probe-resample cycle
+  # twice (once for the verdict gate in section 9, once again here for the
+  # printed table) at two different instants is exactly what let section 9's
+  # totals and the verdict gate disagree on the SAME run (bead evidence:
+  # "totals said 0 down while gates said 1-3 down").
+  #
+  # Any other host (remote, or a localhost call with a different
+  # prefix/count) still does its own probe + 2-sample resample + journal
+  # cross-check below, and exports its result via the LAST_*_SLOTS globals
+  # so the caller can reuse it for the verdict instead of probing a third
+  # time (see the remote-fleet call site below this function).
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
   printf "\n  %s (%d configured):\n" "$label" "$count"
   local -a slot_state=()
   local i name jobline has_down=0
-  for i in $(seq 1 "$count"); do
-    slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
-    [ "${slot_state[i]}" = "DOWN" ] && has_down=1
-  done
-  if [ "$has_down" -eq 1 ]; then
-    info "$label: first-pass DOWN candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895)"
-    sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
+
+  if [ "$host" = "localhost" ] && [ -n "${LOCAL_SLOT_STATE_TABLE:-}" ] \
+     && [ "$prefix" = "${RUNNER_NAME_PREFIX:-}" ] && [ "$count" = "${CONFIGURED_COUNT:-}" ]; then
     for i in $(seq 1 "$count"); do
-      [ "${slot_state[i]}" != "DOWN" ] && continue
-      case "$(probe_slot_state "$host" "${prefix}-${i}")" in
-        DOWN) : ;;                                # persisted both samples — stays DOWN
-        *)    slot_state[i]="CYCLING" ;;          # back Up — normal respawn, not a defect
-      esac
+      name="${prefix}-${i}"
+      slot_state[i]=$(printf '%s\n' "$LOCAL_SLOT_STATE_TABLE" | awk -v n="$name" '$1==n{print $2; exit}')
+      [ -z "${slot_state[i]:-}" ] && slot_state[i]="DOWN"
     done
+  else
+    for i in $(seq 1 "$count"); do
+      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+      [ "${slot_state[i]}" = "DOWN" ] && has_down=1
+    done
+    if [ "$has_down" -eq 1 ]; then
+      info "$label: first-pass DOWN candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895)"
+      sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
+      for i in $(seq 1 "$count"); do
+        [ "${slot_state[i]}" != "DOWN" ] && continue
+        case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+          DOWN) : ;;                                # persisted both docker samples — check journal next
+          *)    slot_state[i]="CYCLING" ;;          # back Up — normal respawn, not a defect
+        esac
+      done
+      # Journal cross-check (ez-gh-actions-5n0h): a slot still containerless
+      # after BOTH docker samples is not necessarily abandoned — a real
+      # respawn cycle (deregister -> JIT token -> docker run) can take
+      # 30-60s+ under load, longer than the 2-sample window above. Check
+      # this HOST's own daemon log for a respawn/management line on the
+      # EXACT slot name within the last RESPAWN_EVIDENCE_WINDOW_MIN minutes
+      # before finalizing DOWN.
+      local _remote_platform="linux"
+      case "$label" in macos*) _remote_platform="macos" ;; esac
+      local _log
+      _log=$(fetch_respawn_log_window "$host" "$_remote_platform" "$RESPAWN_EVIDENCE_WINDOW_MIN")
+      for i in $(seq 1 "$count"); do
+        [ "${slot_state[i]}" != "DOWN" ] && continue
+        name="${prefix}-${i}"
+        if [ -n "$_log" ] && [ "$(printf '%s\n' "$_log" | journal_has_respawn_evidence "$name")" = "1" ]; then
+          slot_state[i]="CYCLING"
+        fi
+      done
+    fi
   fi
+
+  LAST_EXECUTING_SLOTS=()
+  LAST_IDLE_SLOTS=()
+  LAST_CYCLING_SLOTS=()
+  LAST_DOWN_SLOTS=()
   local exec_n=0 idl=0 dn=0 cyc=0
   printf "    %-22s %-13s %s\n" "SLOT" "STATE" "EVIDENCE"
   for i in $(seq 1 "$count"); do
@@ -799,6 +929,7 @@ list_slot_work() {
     case "${slot_state[i]:-DOWN}" in
       EXECUTING)
         exec_n=$((exec_n+1))
+        LAST_EXECUTING_SLOTS+=("$name")
         set +e
         jobline=$(job_evidence_for_runner "$name")
         set -e
@@ -811,6 +942,7 @@ list_slot_work() {
         ;;
       IDLE)
         idl=$((idl+1))
+        LAST_IDLE_SLOTS+=("$name")
         # 4-state model: IDLE-OK (nothing queued, or queued but under the
         # sustained-starvation threshold) vs IDLE-STARVED (queue has been
         # non-empty for >= IDLE_STARVED_THRESHOLD_MIN minutes — see section 9).
@@ -824,11 +956,13 @@ list_slot_work() {
         ;;
       CYCLING)
         cyc=$((cyc+1))
-        printf "    %-22s %-13s %s\n" "$name" "CYCLING" "respawned within one tick (blinked between samples ${SECTION10_DOWN_RESAMPLE_SECONDS}s apart — not a defect; bead ez-gh-actions-b895)"
+        LAST_CYCLING_SLOTS+=("$name")
+        printf "    %-22s %-13s %s\n" "$name" "CYCLING" "containerless but daemon log shows respawn/management activity, or 2nd sample recovered (not a defect; ez-gh-actions-b895/5n0h)"
         ;;
       DOWN)
         dn=$((dn+1))
-        printf "    %-22s %-13s %s\n" "$name" "DOWN" "no container (persisted both samples ${SECTION10_DOWN_RESAMPLE_SECONDS}s apart — critical)"
+        LAST_DOWN_SLOTS+=("$name")
+        printf "    %-22s %-13s %s\n" "$name" "DOWN" "no container across both samples AND no respawn activity in daemon log for ${RESPAWN_EVIDENCE_WINDOW_MIN}m — critical"
         ;;
     esac
   done
@@ -844,7 +978,16 @@ LOCAL_COUNT="${CONFIGURED_COUNT:-16}"
 list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 
 # Remote fleet (SSH) — the OTHER half of the two-host fleet. Only when
-# reachable. Never dead when unreachable.
+# reachable. Never dead when unreachable. A SINGLE reachability check and a
+# SINGLE list_slot_work call now feed BOTH the printed inventory (above) and
+# the verdict's SLOT_PROOF_CRITICAL count below (ez-gh-actions-5n0h item 3):
+# the prior code ran TWO SEPARATE ssh probes of the remote fleet — one here,
+# one again just for the verdict — each with its own docker-state samples
+# taken at a different instant, which is exactly how the printed totals and
+# the verdict gate could disagree on the SAME run ("totals said 0 down while
+# gates said 1-3 down"). list_slot_work's LAST_*_SLOTS globals (populated
+# during this ONE call, including its own 2-sample resample and journal
+# cross-check) are now the only remote sample taken.
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
   REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
@@ -856,73 +999,17 @@ else
   REMOTE_COUNT="${MAC_RUNNER_COUNT:-6}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
+REMOTE_EXECUTING_SLOTS=()
+REMOTE_IDLE_SLOTS=()
+REMOTE_CYCLING_SLOTS=()
+REMOTE_DOWN_SLOTS=()
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
-else
-  printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
-fi
-
-# Remote-fleet probe via SSH, for the verdict's SLOT_PROOF_CRITICAL count —
-# best-effort, never fatal if unreachable. Uses the same REMOTE_HOST/PREFIX/
-# COUNT resolved above (macos->jeff-ubuntu when running on the Mac,
-# linux->macbook when running on Linux) so DOWN/STARVED counting is
-# symmetric regardless of which host doctor-runner is invoked from — was
-# previously hardcoded to always SSH to "macbook", which silently omitted
-# jeff-ubuntu's DOWN/STARVED slots from the verdict when run on the Mac.
-if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
-  REMOTE_DOWN_SLOTS=()
-  REMOTE_IDLE_SLOTS=()
-  REMOTE_EXECUTING_SLOTS=()
-  REMOTE_REPORT=$(timeout 20 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" "
-    for i in \$(seq 1 $REMOTE_COUNT); do
-      name=\"${REMOTE_PREFIX}-\${i}\"
-      running=\$(docker inspect -f '{{.State.Running}}' \"\$name\" 2>/dev/null || echo false)
-      if [ \"\$running\" != true ]; then echo \"\$name DOWN\"; continue; fi
-      if docker top \"\$name\" -eo pid,comm 2>/dev/null | grep -qw Worker; then
-        echo \"\$name EXECUTING\"
-      else
-        echo \"\$name IDLE\"
-      fi
-    done
-  " 2>/dev/null || true)
-  while read -r _name _state; do
-    [ -z "$_name" ] && continue
-    case "$_state" in
-      DOWN)      REMOTE_DOWN_SLOTS+=("$_name") ;;
-      IDLE)      REMOTE_IDLE_SLOTS+=("$_name") ;;
-      EXECUTING) REMOTE_EXECUTING_SLOTS+=("$_name") ;;
-    esac
-  done <<< "$REMOTE_REPORT"
-  # Same 2-sample DOWN-persistence rule as the local pass (see section 9):
-  # re-probe only the DOWN candidates after one serve tick; a slot that came
-  # back is a normal ephemeral recycle, not a defect.
-  if [ "${#REMOTE_DOWN_SLOTS[@]}" -gt 0 ]; then
-    info "$REMOTE_LABEL first-pass DOWN candidates (${REMOTE_DOWN_SLOTS[*]}) — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s"
-    sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
-    _R_PERSISTENT=()
-    _R_BLINKED=()
-    for _name in "${REMOTE_DOWN_SLOTS[@]}"; do
-      _state2=$(timeout 20 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" "
-        running=\$(docker inspect -f '{{.State.Running}}' '$_name' 2>/dev/null || echo false)
-        if [ \"\$running\" != true ]; then echo DOWN
-        elif docker top '$_name' -eo pid,comm 2>/dev/null | grep -qw Worker; then echo EXECUTING
-        else echo IDLE; fi
-      " 2>/dev/null || echo DOWN)
-      case "$_state2" in
-        DOWN)      _R_PERSISTENT+=("$_name") ;;
-        IDLE)      REMOTE_IDLE_SLOTS+=("$_name");      _R_BLINKED+=("$_name") ;;
-        EXECUTING) REMOTE_EXECUTING_SLOTS+=("$_name"); _R_BLINKED+=("$_name") ;;
-      esac
-    done
-    if [ "${#_R_BLINKED[@]}" -gt 0 ]; then
-      info "$REMOTE_LABEL recycled normally (respawned within ${DOWN_PERSISTENCE_WAIT_SECONDS}s, NOT a defect): ${_R_BLINKED[*]}"
-    fi
-    REMOTE_DOWN_SLOTS=()
-    if [ "${#_R_PERSISTENT[@]}" -gt 0 ]; then
-      REMOTE_DOWN_SLOTS=("${_R_PERSISTENT[@]}")
-    fi
-  fi
-  info "$REMOTE_LABEL slots (remote proof via ssh): ${#REMOTE_EXECUTING_SLOTS[@]} executing, ${#REMOTE_IDLE_SLOTS[@]} idle, ${#REMOTE_DOWN_SLOTS[@]} down (of $REMOTE_COUNT configured)"
+  REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
+  REMOTE_IDLE_SLOTS=("${LAST_IDLE_SLOTS[@]}")
+  REMOTE_CYCLING_SLOTS=("${LAST_CYCLING_SLOTS[@]}")
+  REMOTE_DOWN_SLOTS=("${LAST_DOWN_SLOTS[@]}")
+  info "$REMOTE_LABEL slots (remote proof via ssh, single sample reused by verdict below): ${#REMOTE_EXECUTING_SLOTS[@]} executing, ${#REMOTE_IDLE_SLOTS[@]} idle, ${#REMOTE_CYCLING_SLOTS[@]} cycling, ${#REMOTE_DOWN_SLOTS[@]} down (of $REMOTE_COUNT configured)"
   if [ "${#REMOTE_DOWN_SLOTS[@]}" -gt 0 ]; then
     bad "$REMOTE_LABEL DOWN (no container) — ${#REMOTE_DOWN_SLOTS[@]} slot(s): ${REMOTE_DOWN_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_DOWN_SLOTS[@]}))
@@ -932,6 +1019,7 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_IDLE_SLOTS[@]}))
   fi
 else
+  printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
   warn "$REMOTE_LABEL not reachable via SSH — skipping remote per-slot proof"
 fi
 
@@ -946,16 +1034,22 @@ fi
 # monitor tick fires every serve-loop iteration regardless of demand, so its
 # cadence is a true liveness heartbeat; PID-scoping makes restart boundaries
 # provably non-events instead of accidentally-small ones.
-# Threshold: 5x the configured [runner] serve_tick_seconds (default 30s if
+# Threshold: 8x the configured [runner] serve_tick_seconds (default 30s if
 # absent, matching src/config.rs's default_serve_tick_seconds(); shipped in
 # commit f7772e5) — a stalled loop misses this many ticks before we call it
 # starved, well above normal queue_monitor.check_interval_seconds jitter.
+# Was 5x (150s at the 30s default) until ez-gh-actions-5n0h: bead evidence
+# measured a real busy-tick gap of 99s against the 100s 5x threshold on a
+# healthy fleet — a single more-loaded tick away from a false starvation
+# alarm. Raised to 8x (240s at the 30s default) to give genuine headroom
+# above the observed busy-tick stretch while still catching a real stall
+# (a stalled loop misses 8 consecutive ticks, not 1-2 slow ones).
 # Linux-only: journalctl timestamps every line; macOS's redirected launchd
 # log files carry no per-line timestamp to diff.
 STARVE_WINDOW="${STARVE_WINDOW:-10}"
 SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
-STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 5))
+STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
 if [ "$PLATFORM" = "linux" ]; then
   read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN < <(
     journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
@@ -966,9 +1060,9 @@ if [ "$PLATFORM" = "linux" ]; then
   if [ "${RESTART_BOUNDARY_SEEN:-0}" -eq 1 ]; then
     RESTART_NOTE=" (a daemon-restart boundary was seen in-window and excluded from the gap measurement)"
   fi
-  info "serve-loop heartbeat signal (last ${STARVE_WINDOW}m): max queue-monitor gap=${MAX_HEARTBEAT_GAP:-0}s, threshold=${STARVE_GAP_WARN_SECONDS}s (serve_tick_seconds=${SERVE_TICK_SECONDS} x5), rate-limit occurrences=$RATE_LIMIT_COUNT${RESTART_NOTE}"
+  info "serve-loop heartbeat signal (last ${STARVE_WINDOW}m): max queue-monitor gap=${MAX_HEARTBEAT_GAP:-0}s, threshold=${STARVE_GAP_WARN_SECONDS}s (serve_tick_seconds=${SERVE_TICK_SECONDS} x8), rate-limit occurrences=$RATE_LIMIT_COUNT${RESTART_NOTE}"
   if [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
-    bad "serve-loop starvation: queue-monitor heartbeat gap ${MAX_HEARTBEAT_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s (5x serve_tick_seconds=${SERVE_TICK_SECONDS}) within a single daemon PID — the serve loop has stalled, not restarted (see ez-gh-actions-wxfl, replacing the respawn-gap heuristic from ez-gh-actions-yrt/g3o)"
+    bad "serve-loop starvation: queue-monitor heartbeat gap ${MAX_HEARTBEAT_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS}) within a single daemon PID — the serve loop has stalled, not restarted (see ez-gh-actions-wxfl, replacing the respawn-gap heuristic from ez-gh-actions-yrt/g3o; threshold raised 5x->8x in ez-gh-actions-5n0h after a 99s busy-tick gap nearly tripped the old 100s threshold)"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
   fi
 else
@@ -1050,15 +1144,20 @@ fi
 # BOTH section-9 samples reduces the live count.
 # compute_live_slot_critical() is sed-extracted by
 # tests/doctor_runner_live_slot_gate_test.sh so tests exercise the real
-# logic, never a reimplementation.
+# logic, never a reimplementation. cycling_n (ez-gh-actions-5n0h) is an
+# OPTIONAL 4th arg, default 0, so the existing 3-arg call sites/tests keep
+# working unmodified: a slot that is still containerless after 2 samples but
+# has journal-confirmed respawn activity (CYCLING, not DOWN) also counts as
+# live — the daemon is provably still managing it, just mid-cycle.
 compute_live_slot_critical() {
-  # args: executing_n idle_n expected_containers
+  # args: executing_n idle_n expected_containers [cycling_n]
   # (down_n is deliberately NOT an input — a DOWN slot simply isn't counted
-  # in executing_n/idle_n, so it naturally reduces `live` without needing to
-  # be passed in; callers may still report it separately for the message.)
+  # in executing_n/idle_n/cycling_n, so it naturally reduces `live` without
+  # needing to be passed in; callers may still report it separately for the
+  # message.)
   # stdout: "<live_slots> <critical:0|1>"
-  local exec_n="$1" idle_n="$2" expected="$3"
-  local live=$((exec_n + idle_n))
+  local exec_n="$1" idle_n="$2" expected="$3" cycling_n="${4:-0}"
+  local live=$((exec_n + idle_n + cycling_n))
   local critical=0
   if [ "$live" -lt "$expected" ]; then
     critical=1
@@ -1066,7 +1165,7 @@ compute_live_slot_critical() {
   printf '%d %d\n' "$live" "$critical"
 }
 read -r LOCAL_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
-  compute_live_slot_critical "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "$EXPECTED_CONTAINERS"
+  compute_live_slot_critical "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "$EXPECTED_CONTAINERS" "${#CYCLING_SLOTS[@]}"
 )
 if [ "${LIVE_SLOT_CRITICAL:-0}" -eq 1 ]; then
   bad "verdict: live-slot gate FAILED (live slots (executing+idle+cycling from per-slot proof) = ${LOCAL_LIVE_SLOTS}, expected >= ${EXPECTED_CONTAINERS} from config.toml runner.count=${CONFIG_RUNNER_COUNT:-<unreadable, used fallback>}; ${#DOWN_SLOTS[@]} persisted-DOWN slot(s) of ${CONFIGURED_COUNT} configured)"

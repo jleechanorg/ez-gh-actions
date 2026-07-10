@@ -18,14 +18,17 @@
 # lines from doctor-runner (via sed, not a re-implementation), then
 # exercises them against fixture journalctl `-o short-unix` lines,
 # asserting:
-#   (a) regular same-PID ticks 30s apart -> healthy (gap well under 5x
+#   (a) regular same-PID ticks 30s apart -> healthy (gap well under 8x
 #       tick threshold).
 #   (b) same fixture PLUS a 214s gap that spans a PID change (i.e. a
 #       daemon restart) -> still healthy: the cross-PID gap is excluded
-#       from the max-gap measurement entirely (restart-immune), even
-#       though 214s alone would exceed the default 150s threshold.
-#   (c) a real stall: two same-PID ticks with a gap > 5x the configured
+#       from the max-gap measurement entirely (restart-immune).
+#   (c) a real stall: two same-PID ticks with a gap > 8x the configured
 #       tick -> starved (CRITICAL).
+#
+# Threshold is 8x serve_tick_seconds (was 5x until ez-gh-actions-5n0h: bead
+# evidence measured a real busy-tick gap of 99s against the old 100s 5x
+# threshold on a healthy fleet -- flap-prone under busy-tick stretch).
 #
 # Usage: bash tests/doctor_runner_heartbeat_starvation_test.sh
 
@@ -93,7 +96,7 @@ run_case() {
 
   CRITICAL=0
   if [ "${max_gap:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
-    bad "serve-loop starvation: queue-monitor heartbeat gap ${max_gap}s exceeds ${STARVE_GAP_WARN_SECONDS}s (5x serve_tick_seconds=${SERVE_TICK_SECONDS})"
+    bad "serve-loop starvation: queue-monitor heartbeat gap ${max_gap}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS})"
     CRITICAL=$((CRITICAL + 1))
   fi
 
@@ -150,14 +153,38 @@ FIXTURE_B=$(
 )
 run_case "restart-boundary-214s-gap-immune" "$FIXTURE_B" "no" "1" || OVERALL_PASS=false
 
-# Case (c): a real stall -- two same-PID ticks 170s apart (> 5x the
-# configured 30s tick = 150s threshold) -> starved. Proves the fix didn't
-# just disable the check.
+# Case (c): a real stall -- two same-PID ticks 250s apart (> 8x the
+# configured 30s tick = 240s threshold) -> starved. Proves the fix didn't
+# just disable the check. (Threshold raised 5x->8x in ez-gh-actions-5n0h:
+# bead evidence measured a real busy-tick gap of 99s against the old 100s
+# 5x threshold on a healthy fleet -- one more-loaded tick from a false
+# alarm -- so the fixture gap here was widened from 170s/150s-threshold to
+# 250s/240s-threshold to stay a genuine stall under the new headroom.)
 FIXTURE_C=$(
   qm_line "$BASE" 4192142
-  qm_line "$((BASE + 170))" 4192142
+  qm_line "$((BASE + 250))" 4192142
 )
-run_case "same-pid-170s-gap-starved" "$FIXTURE_C" "yes" "0" || OVERALL_PASS=false
+run_case "same-pid-250s-gap-starved" "$FIXTURE_C" "yes" "0" || OVERALL_PASS=false
+
+# Case (d): the exact real-incident values from the ez-gh-actions-5n0h bead
+# report -- serve_tick_seconds=20 (jeff-ubuntu's configured tick, lowered
+# from 30 during 2026-07-09 duty-cycle tuning) and a 99s gap, which was
+# measured live against the OLD 5x threshold (100s) -- one more-loaded tick
+# away from a false starvation alarm on a healthy fleet. Under the new 8x
+# threshold (160s) this must read healthy with real headroom, not just
+# barely under.
+cat > "$CONFIG_DIR/config.toml" <<'EOF'
+version = 1
+[runner]
+serve_tick_seconds = 20
+name_prefix = "ez-runner-c"
+count = 16
+EOF
+FIXTURE_D=$(
+  qm_line "$BASE" 4192142
+  qm_line "$((BASE + 99))" 4192142
+)
+run_case "20s-tick-99s-gap-healthy-under-8x" "$FIXTURE_D" "no" "0" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
