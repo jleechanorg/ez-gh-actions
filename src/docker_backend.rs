@@ -59,6 +59,49 @@ struct SlotAssignments {
     /// runner_id has not been recorded yet.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     assignments: BTreeMap<String, String>,
+    /// Slot index -> unix-epoch-seconds when `record_slot_runner_id` last
+    /// recorded a runner_id for that slot (bead ez-gh-actions-5ki). Read by
+    /// `release_stale_slots`' offline+!busy reap paths (Path 1's own branch
+    /// and the Path 4 `offline_not_busy_owned_missing_container_registrations`
+    /// sub-pass) to skip reaping a registration that is still inside its
+    /// JIT-propagation grace window — GitHub can take several seconds after
+    /// `generate_jitconfig` returns before the runner flips from `offline` to
+    /// `online`/appears in `docker ps`, and a reconciliation tick landing in
+    /// that gap would otherwise delete the brand-new registration, causing
+    /// `ensure_count` to respawn it next tick in an endless loop (see
+    /// `runner-24h-review-20260709.md` §0/§1 and bead `ez-gh-actions-g3i`).
+    /// Absent entry (e.g. a slot file written before this field existed, or a
+    /// slot recorded via the pre-fix code path) is treated as "no grace
+    /// window active" — never blocks a reap, only ever adds one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    registered_at: BTreeMap<String, u64>,
+}
+
+/// Grace window (bead ez-gh-actions-5ki): a registration recorded within this
+/// many seconds of "now" is never reaped by the offline+!busy+no-container
+/// paths, regardless of what the GitHub API / local docker snapshot show,
+/// because both sources are known to lag JIT registration by a few seconds.
+/// 60s matches 5ki's spec — comfortably above the ~5s propagation lag Track A
+/// measured, while still short enough that a genuinely dead registration is
+/// reclaimed within two `release_stale_slots` ticks (30s cadence).
+const REGISTRATION_GRACE_WINDOW: Duration = Duration::from_secs(60);
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// True if `slot`'s `registered_at` timestamp is within `REGISTRATION_GRACE_WINDOW`
+/// of now. Missing entries (no timestamp recorded) are NOT in the grace
+/// window — the fix only ever narrows what gets reaped, never widens it, so a
+/// slot file predating this field behaves exactly as before.
+fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str) -> bool {
+    let Some(&registered_at) = assignments.registered_at.get(slot) else {
+        return false;
+    };
+    now_epoch_secs().saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
 }
 
 /// Resolve the path of the slot assignment file. Honors `EZGHA_SLOT_ASSIGNMENTS_PATH`
@@ -270,9 +313,11 @@ pub fn record_slot_runner_id(slot: u32, runner_id: u64) -> Result<()> {
 
 fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) -> Result<()> {
     let mut assignments = read_slot_assignments_for(cfg)?;
+    let key = slot.to_string();
     assignments
         .assignments
-        .insert(slot.to_string(), runner_id.to_string());
+        .insert(key.clone(), runner_id.to_string());
+    assignments.registered_at.insert(key, now_epoch_secs());
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -285,7 +330,9 @@ pub fn release_slot(slot: u32) -> Result<()> {
 
 fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     let mut assignments = read_slot_assignments_for(cfg)?;
-    assignments.assignments.remove(&slot.to_string());
+    let key = slot.to_string();
+    assignments.assignments.remove(&key);
+    assignments.registered_at.remove(&key);
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -409,6 +456,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     let mut reaped_ids = HashSet::new();
     if let Some(local_names) = local_container_names.as_ref() {
         for (runner_id, runner_name) in offline_not_busy_owned_missing_container_registrations(
+            &assignments,
             &live_runners,
             &cfg.runner.name_prefix,
             local_names,
@@ -600,11 +648,18 @@ fn release_stale_slots_from_with_containers_for(
                         && !runner.busy
                         && !local_names.contains(&expected_name)
                     {
-                        eprintln!(
-                            "warning: releasing slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle and has no local container"
-                        );
-                        release_slot_for(cfg, slot_n)?;
-                        reclaimed += 1;
+                        if slot_in_grace_window(assignments, slot) {
+                            eprintln!(
+                                "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered <{}s ago (JIT-propagation grace window)",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                        } else {
+                            eprintln!(
+                                "warning: releasing slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle and has no local container"
+                            );
+                            release_slot_for(cfg, slot_n)?;
+                            reclaimed += 1;
+                        }
                     }
                 }
             }
@@ -673,6 +728,7 @@ fn offline_busy_owned_missing_container_slots(
 /// against the live runner list directly. See synthesis
 /// `mac-stalereg-s9d-investigation-20260708.md` §2 and §6.
 fn offline_not_busy_owned_missing_container_registrations(
+    assignments: &SlotAssignments,
     live_runners: &[github::RunnerInfo],
     runner_prefix: &str,
     local_container_names: &HashSet<String>,
@@ -698,6 +754,16 @@ fn offline_not_busy_owned_missing_container_registrations(
         if local_container_names.contains(&runner.name) {
             // Local container present — could be parent mid-restart or
             // API snapshot lag. Leave the registration alone.
+            continue;
+        }
+        // bead ez-gh-actions-5ki: this runner's slot may have been recorded
+        // (and released by Path 1, in this SAME tick or an earlier one) well
+        // within the JIT-propagation grace window. `assignments` here is the
+        // snapshot taken at the top of `release_stale_slots`, before Path 1's
+        // writes, so a slot Path 1 just released this tick still has its
+        // `registered_at` entry for this check.
+        let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
+        if slot_in_grace_window(assignments, slot) {
             continue;
         }
         reapable.push((runner.id, runner.name.clone()));
@@ -2109,10 +2175,21 @@ mod tests {
 
     #[test]
     fn release_stale_slots_releases_offline_runner_when_container_missing() {
+        // bead ez-gh-actions-5ki: this registration must be OUTSIDE the grace
+        // window for Path 1 to reap it — `record_slot_runner_id` stamps
+        // `registered_at` to "now", so backdate it past the window to
+        // exercise the pre-5ki reap behavior independent of the new grace
+        // logic (that's covered by its own dedicated tests below).
         let _env = TestEnv::new("offline_missing_container");
         let cfg = cfg_with(2, "ez-org-runner");
         let _slot = next_slot(&cfg).unwrap();
         record_slot_runner_id(1, 1234).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, None).unwrap();
 
         let live = vec![github::RunnerInfo {
             id: 1234,
@@ -2131,7 +2208,7 @@ mod tests {
 
         assert_eq!(
             reclaimed, 1,
-            "offline idle runner without a local container should not hold its slot"
+            "offline idle runner without a local container, registered outside the grace window, should not hold its slot"
         );
         assert!(
             read_slot_assignments().unwrap().assignments.is_empty(),
@@ -2469,6 +2546,7 @@ mod tests {
         let live = vec![s9d_runner(140294, "ez-org-runner-2", "offline", false)];
         let local_names = HashSet::new();
         let reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
             &live,
             "ez-org-runner",
             &local_names,
@@ -2489,6 +2567,7 @@ mod tests {
         let live = vec![s9d_runner(1234, "ez-org-runner-1", "offline", true)];
         let local_names = HashSet::new();
         let reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
             &live,
             "ez-org-runner",
             &local_names,
@@ -2509,6 +2588,7 @@ mod tests {
         let live = vec![s9d_runner(1234, "ez-org-runner-1", "online", false)];
         let local_names = HashSet::new();
         let reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
             &live,
             "ez-org-runner",
             &local_names,
@@ -2528,6 +2608,7 @@ mod tests {
         let live = vec![s9d_runner(1234, "ez-org-runner-1", "offline", false)];
         let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
         let reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
             &live,
             "ez-org-runner",
             &local_names,
@@ -2549,6 +2630,7 @@ mod tests {
         let live = vec![s9d_runner(1234, "ez-runner-c-2", "offline", false)];
         let local_names = HashSet::new();
         let reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
             &live,
             "ez-org-runner",
             &local_names,
@@ -2556,6 +2638,135 @@ mod tests {
         assert!(
             reapable.is_empty(),
             "a runner whose name does not match our prefix is sibling-host state and MUST NOT be reaped; got: {reapable:?}"
+        );
+    }
+
+    // --- bead ez-gh-actions-5ki: registration grace window ---
+
+    #[test]
+    fn ensure_count_respawn_within_grace_window_is_not_reaped_by_release_stale_slots() {
+        // Test 1 (5ki spec): a slot recorded "just now" via record_slot_runner_id
+        // (mirroring ensure_count's respawn -> record_slot_runner_id sequence)
+        // must NOT be reaped by release_stale_slots even though the runner
+        // looks exactly like the reapable shape (offline, !busy, no local
+        // container yet) — this is the JIT-propagation lag window the fix
+        // exists to cover.
+        let _env = TestEnv::new("5ki_grace_window_fresh");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap(); // stamps registered_at = now
+
+        let live = vec![github::RunnerInfo {
+            id: 1234,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: false,
+        }];
+        let local_names = HashSet::new(); // container not up yet
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "a registration recorded within the grace window must NOT be reaped"
+        );
+        assert_eq!(
+            read_slot_assignments().unwrap().assignments.get("1"),
+            Some(&"1234".to_string()),
+            "slot 1 must still be held"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_reclaims_after_grace_window_elapses() {
+        // Test 2 (5ki spec): once registered_at falls outside the window, the
+        // exact same offline/!busy/no-container shape becomes reapable again
+        // — the fix narrows the reap timing, it does not disable it.
+        let _env = TestEnv::new("5ki_grace_window_elapsed");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 1234).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, None).unwrap();
+
+        let live = vec![github::RunnerInfo {
+            id: 1234,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: false,
+        }];
+        let local_names = HashSet::new();
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "once the grace window has elapsed, an offline/!busy/no-container \
+             registration must still be reclaimed as before this fix"
+        );
+    }
+
+    #[test]
+    fn path4_u3w_helper_skips_fresh_registration_even_after_path1_released_its_slot_entry() {
+        // Test 3/4 (5ki spec, combined): Path 4 (the u3w helper) is keyed on
+        // live_runners + the SAME assignments snapshot taken at the top of
+        // release_stale_slots — even after Path 1 has already released the
+        // slot entry earlier in this same tick, the snapshot passed to Path 4
+        // still carries the pre-release registered_at, so a fresh respawn
+        // that Path 1 just evicted from the slot file is still protected.
+        let live = vec![s9d_runner(140294, "ez-org-runner-2", "offline", false)];
+        let local_names = HashSet::new();
+        let mut assignments = SlotAssignments::default();
+        assignments
+            .registered_at
+            .insert("2".to_string(), now_epoch_secs());
+
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &assignments,
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert!(
+            reapable.is_empty(),
+            "Path 4 must not reap a registration whose slot was registered within \
+             the grace window, even though Path 1 already dropped the slot-file \
+             entry for it this tick; got: {reapable:?}"
+        );
+    }
+
+    #[test]
+    fn path4_u3w_helper_reaps_stale_registration_with_no_grace_window_entry() {
+        // Test 5 (5ki spec): a slot file with no registered_at entry at all
+        // (e.g. written before this fix shipped, or a genuinely orphaned
+        // registration with no matching slot ever recorded) must behave
+        // exactly as before the fix — no grace window protection, reapable.
+        let live = vec![s9d_runner(140294, "ez-org-runner-2", "offline", false)];
+        let local_names = HashSet::new();
+        let reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
+            &live,
+            "ez-org-runner",
+            &local_names,
+        );
+        assert_eq!(
+            reapable,
+            vec![(140294, "ez-org-runner-2".to_string())],
+            "a registration with no recorded registered_at must be reapable exactly as before the grace-window fix"
         );
     }
 
@@ -2572,12 +2783,14 @@ mod tests {
         let qbl_candidates = offline_busy_owned_missing_container_slots(
             &SlotAssignments {
                 assignments: BTreeMap::from([("1".to_string(), "1234".to_string())]),
+                ..Default::default()
             },
             &live,
             "ez-org-runner",
             &local_names,
         );
         let u3w_reapable = offline_not_busy_owned_missing_container_registrations(
+            &SlotAssignments::default(),
             &live,
             "ez-org-runner",
             &local_names,
