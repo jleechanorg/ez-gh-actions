@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
 # install.sh — install ez-gh-actions (ezgha) and, optionally, its user service.
 # Idempotent, no sudo. Re-run any time to upgrade the binary.
-#   ./install.sh              install / upgrade ezgha
-#   ./install.sh --uninstall  remove ezgha + its user service (config left in place)
+#   ./install.sh                  install / upgrade ezgha. The fleet watchdog
+#                                  (ezgha-watchdog.timer on Linux, the launchd
+#                                  watchdog agent on macOS) is NOT armed by
+#                                  default — arming is gated on beads
+#                                  ez-gh-actions-30p (P0: no SIGTERM handling
+#                                  — watchdog restarts orphan in-flight
+#                                  registrations), uh2, lxn. The watchdog unit
+#                                  file is still rendered/copied on Linux;
+#                                  only enabling/loading is skipped, and any
+#                                  drifted-enabled Linux timer is disabled.
+#   ./install.sh --with-watchdog  same as above, but ALSO arms the watchdog
+#                                  (systemctl enable --now on Linux, launchd
+#                                  load on macOS). Only pass this once the
+#                                  30p/uh2/lxn gate has cleared.
+#   ./install.sh --uninstall      remove ezgha + its user service (config left in place)
+#   ./install.sh --dev            bypass production git-state checks (local development)
+# Flags compose, e.g.: ./install.sh --dev --with-watchdog
 set -euo pipefail
 
 REPO_URL="https://github.com/jleechanorg/ez-gh-actions"
@@ -44,11 +59,23 @@ uninstall() {
 }
 
 DEV_MODE=0
-if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "-u" ]; then
-  uninstall
-elif [ "${1:-}" = "--dev" ] || [ "${1:-}" = "-d" ]; then
-  DEV_MODE=1
-fi
+WITH_WATCHDOG=0
+for arg in "$@"; do
+  case "${arg}" in
+    --uninstall|-u)
+      uninstall
+      ;;
+    --dev|-d)
+      DEV_MODE=1
+      ;;
+    --with-watchdog)
+      WITH_WATCHDOG=1
+      ;;
+    *)
+      : # ignore unrecognized args (back-compat with prior permissive parsing)
+      ;;
+  esac
+done
 
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
@@ -297,7 +324,21 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
-    install_macos_plist "watchdog"      "120"   "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host macos"
+    # Watchdog is gated separately: arming (writing + launchd-loading the
+    # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
+    # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do
+    # NOT call install_macos_plist for watchdog at all when the gate is
+    # closed, so a default run cannot itself create/overwrite the plist.
+    watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
+    if [ "${WITH_WATCHDOG}" -eq 1 ]; then
+      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host macos"
+      ok "watchdog armed: operator asserted ez-gh-actions-30p/uh2/lxn gate cleared"
+    else
+      info "watchdog arming skipped — gated on beads ez-gh-actions-30p/uh2/lxn; pass --with-watchdog once the gate clears"
+      if [ -f "${watchdog_plist}" ]; then
+        bad "WARNING: ${watchdog_plist} exists but watchdog arming is gated OFF by default — this run did NOT write it, so it is likely an out-of-band re-arm (see ez-gh-actions-sa1t 2026-07-09 incident, recurred same day). NOT deleting it — investigate (launchctl list | grep ezgha-watchdog) before it fires."
+      fi
+    fi
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux: copy the systemd units with @SCRIPTS_DIR@ / @HOME@ placeholders substituted
     USER_UNIT_DIR="${HOME}/.config/systemd/user"
@@ -321,10 +362,33 @@ PLIST
       fi
     done
     systemctl --user daemon-reload 2>/dev/null || true
-    for timer in ezgha-watchdog.timer ezgha-token-refresh.timer ezgha-queue-reaper.timer; do
-      systemctl --user enable --now "${timer}" 2>/dev/null && ok "systemd --user timer enabled: ${timer}" \
-        || bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
+    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer; do
+      if systemctl --user enable --now "${timer}" 2>/dev/null; then
+        ok "systemd --user timer enabled: ${timer}"
+      else
+        bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
+      fi
     done
+    # ezgha-watchdog.timer is gated separately: the unit file was already
+    # rendered above (repo is source, ~/.config/systemd/user is what
+    # `systemctl` reads), but enabling/loading it is what's actually gated
+    # on ez-gh-actions-30p/uh2/lxn — see bead ez-gh-actions-sa1t.
+    if [ "${WITH_WATCHDOG}" -eq 1 ]; then
+      if systemctl --user enable --now ezgha-watchdog.timer 2>/dev/null; then
+        ok "systemd --user timer enabled: ezgha-watchdog.timer (operator asserted ez-gh-actions-30p/uh2/lxn gate cleared)"
+      else
+        bad "failed to enable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
+      fi
+    else
+      info "watchdog arming skipped — gated on beads ez-gh-actions-30p/uh2/lxn; pass --with-watchdog once the gate clears"
+      if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
+        if systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null; then
+          ok "disabled drifted-enabled ezgha-watchdog.timer (healed out-of-band re-arm)"
+        else
+          bad "failed to disable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
+        fi
+      fi
+    fi
   fi
 fi
 
