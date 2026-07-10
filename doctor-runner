@@ -413,7 +413,18 @@ fi
 # call count is unchanged.
 EXPLICIT_WORK_REPOS="${EXPLICIT_WORK_REPOS:-jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions}"
 RUNNER_JOB_INDEX_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-doctor-jobmap.XXXXXX" 2>/dev/null || echo "/tmp/ezgha-doctor-jobmap.$$")
-trap 'rm -f "$RUNNER_JOB_INDEX_FILE"' EXIT
+# Fetch-failure ledger: build_runner_job_index runs inside a PIPELINE (a
+# subshell), so a shell counter would be lost — failures are appended to
+# this side file and counted by the parent afterward. Without it, a
+# rate-limited/truncated fan-out silently yields an EMPTY map that is
+# indistinguishable from a genuinely drained queue (JOBLEVEL_QUEUED_COUNT=0,
+# oldest=0m) and the section-8 gate would report GREEN under the exact
+# API-truncation hazard documented in CLAUDE.md. Health gates must fail
+# honest, never silent-green: any fetch error degrades the job map to
+# "unknown" and forces the run-level fallback path.
+JOBMAP_ERRORS_FILE="${RUNNER_JOB_INDEX_FILE}.errors"
+: > "$JOBMAP_ERRORS_FILE"
+trap 'rm -f "$RUNNER_JOB_INDEX_FILE" "$JOBMAP_ERRORS_FILE"' EXIT
 
 iso_elapsed_min() {
   # Minutes elapsed since an ISO-8601 timestamp ("?" on parse failure).
@@ -441,10 +452,10 @@ build_runner_job_index() {
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
-      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || continue
+      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
       while IFS=$'\t' read -r rid run_url; do
         [ -z "$rid" ] && continue
-        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || continue
+        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
            | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
@@ -472,6 +483,24 @@ JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
 JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
 JOBLEVEL_OLDEST_QUEUED_MIN="0"
 [ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ] && JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT")
+
+# Count fetch failures recorded by the (subshell) builder. Run-list failures
+# and per-run jobs failures counted separately for the diagnostic message.
+JOBLEVEL_RUNLIST_ERRORS=0
+JOBLEVEL_JOBS_ERRORS=0
+if [ -s "$JOBMAP_ERRORS_FILE" ]; then
+  JOBLEVEL_RUNLIST_ERRORS=$(grep -c '^runlist' "$JOBMAP_ERRORS_FILE" 2>/dev/null || true)
+  JOBLEVEL_JOBS_ERRORS=$(grep -c '^jobs' "$JOBMAP_ERRORS_FILE" 2>/dev/null || true)
+fi
+JOBLEVEL_FETCH_ERRORS=$(( ${JOBLEVEL_RUNLIST_ERRORS:-0} + ${JOBLEVEL_JOBS_ERRORS:-0} ))
+export JOBLEVEL_FETCH_ERRORS JOBLEVEL_RUNLIST_ERRORS JOBLEVEL_JOBS_ERRORS
+if [ "$JOBLEVEL_FETCH_ERRORS" -gt 0 ]; then
+  # Degraded map: counts are UNKNOWN, not zero. "?" makes every consumer
+  # (section 8 tail gate, section 9 starvation inputs, verdict queue line)
+  # take its run-level fallback path instead of trusting a silently-empty map.
+  JOBLEVEL_OLDEST_QUEUED_MIN="?"
+  warn "job map DEGRADED: ${JOBLEVEL_FETCH_ERRORS} fetch error(s) (${JOBLEVEL_RUNLIST_ERRORS} run-list, ${JOBLEVEL_JOBS_ERRORS} per-run jobs) — job-level queue counts are UNKNOWN, not zero; run-level fallback will govern the queue gate"
+fi
 
 # --- F2. GitHub Actions queue health (saturation / tail latency) ----------
 QUEUE_TAIL_BAD=0
@@ -580,9 +609,17 @@ info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE
 # values only if the job-map lookup produced no usable number. DOWN is
 # always a defect regardless of queue state.
 IDLE_STARVED_THRESHOLD_MIN="${IDLE_STARVED_THRESHOLD_MIN:-5}"
-STARVE_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-${QUEUE_QUEUED_FRESH:-0}}"
-STARVE_OLDEST_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN:-${QUEUE_OLDEST_FRESH_AGE_MIN:-0}}"
-[ "$STARVE_OLDEST_MIN" = "?" ] && STARVE_OLDEST_MIN="${QUEUE_OLDEST_FRESH_AGE_MIN:-0}"
+# Degraded/unusable job map ("?" age or any fetch error) means job-level
+# counts are UNKNOWN — fall back to section 8's run-level values for BOTH
+# inputs (a job-level count of 0 from a truncated fan-out must never
+# suppress a starvation signal the run-level data can still see).
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-?}" = "?" ]; then
+  STARVE_QUEUED_COUNT="${QUEUE_QUEUED_FRESH:-0}"
+  STARVE_OLDEST_MIN="${QUEUE_OLDEST_FRESH_AGE_MIN:-0}"
+else
+  STARVE_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
+  STARVE_OLDEST_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN:-0}"
+fi
 STARVED_PRESENT=0
 if [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ] && awk -v a="${STARVE_OLDEST_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
   STARVED_PRESENT=1
@@ -630,6 +667,9 @@ EXPLICIT_WORK_HOST="${EXPLICIT_WORK_HOST:-macbook}"
 # and starvation gates can trigger on job-level waits; this section only
 # consumes them.
 SECTION10_DOWN_RESAMPLE_SECONDS="${SECTION10_DOWN_RESAMPLE_SECONDS:-25}"
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  warn "job map DEGRADED (${JOBLEVEL_FETCH_ERRORS} fetch errors) — per-slot job evidence below may be incomplete; Runner.Worker pids remain ground truth"
+fi
 info "job map: ${JOBLEVEL_INPROG_COUNT} in-progress + ${JOBLEVEL_QUEUED_COUNT} queued fresh job(s) across: $EXPLICIT_WORK_REPOS"
 
 job_evidence_for_runner() {
@@ -866,10 +906,13 @@ fi
 
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
-# Job-level queue counts (fresh-only, from section 10's single job-map
+# Job-level queue counts (fresh-only, from section F1b's single job-map
 # fetch) — printed for BOTH healthy and unhealthy verdicts so the queue
-# state is never hidden behind a green light.
-if [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
+# state is never hidden behind a green light. A degraded map prints as
+# UNKNOWN, never as a reassuring "0 queued".
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  echo "  queue: UNKNOWN — job map degraded (${JOBLEVEL_FETCH_ERRORS} fetch errors); section-8 run-level fallback governed the queue gate"
+elif [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
   echo "  queue: ${JOBLEVEL_QUEUED_COUNT} queued job(s) (oldest ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 else
   echo "  queue: 0 queued job(s) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"

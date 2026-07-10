@@ -162,14 +162,32 @@ fi
 # BAD/critical trigger: JOB-level oldest fresh queued-job wait. When sourced
 # by doctor-runner, JOBLEVEL_* come from the section-F1b job map (same
 # STALE_HOURS freshness rule, single fetch across every repo the fleet
-# serves). Standalone invocations have no job map — fall back to the
-# run-level max so the script stays useful on its own, labeled as such.
-if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "${JOBLEVEL_OLDEST_QUEUED_MIN}" != "?" ]; then
+# serves). The job-level branch is taken ONLY when the map is trustworthy:
+# any fetch error (JOBLEVEL_FETCH_ERRORS>0, counted by F1b's failure
+# ledger), an unparseable age ("?"), or the cross-check contradiction below
+# degrades to the run-level fallback — a truncated fan-out yields an empty
+# map that looks exactly like a drained queue, and a health gate must fail
+# honest, never silent-green (CLAUDE.md API-truncation hazard).
+# Standalone invocations have no job map — same run-level fallback, labeled.
+QUEUE_JOBMAP_DEGRADED=0
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" = "?" ]; then
+  QUEUE_JOBMAP_DEGRADED=1
+fi
+# Cross-check guard: run-level sees fresh queued runs, the job map saw ZERO
+# queued jobs, AND the map had fetch errors — the "empty" map is a
+# truncation artifact contradicted by run-level data. Degraded, never green.
+if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ] && [ "${JOBLEVEL_QUEUED_COUNT:-0}" -eq 0 ] && [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  QUEUE_JOBMAP_DEGRADED=1
+fi
+if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "$QUEUE_JOBMAP_DEGRADED" -eq 0 ]; then
   QUEUE_TAIL_SOURCE="job-level"
   QUEUE_TAIL_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN}"
   QUEUE_TAIL_N="${JOBLEVEL_QUEUED_COUNT:-0}"
 else
-  QUEUE_TAIL_SOURCE="run-level FALLBACK (no job map — standalone run; may overcount concurrency wait)"
+  if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "$QUEUE_JOBMAP_DEGRADED" -eq 1 ]; then
+    warn "job map degraded (${JOBLEVEL_FETCH_ERRORS:-?} fetch errors) — job-level gate unavailable, using run-level"
+  fi
+  QUEUE_TAIL_SOURCE="run-level FALLBACK (no usable job map; may overcount concurrency wait)"
   QUEUE_TAIL_MIN="${QUEUE_MAX_FRESH_MIN:-0}"
   QUEUE_TAIL_N="${QUEUE_QUEUED_FRESH:-0}"
 fi
