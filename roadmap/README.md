@@ -46,6 +46,7 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 ## Recent activity (by day)
 
+- [2026-07-10](activity/2026-07-10.md) — Fleet-hardening marathon: stable-libexec migration (sa1t closed), doctor-runner honesty ×4 (first exit-0), ao-runner farm eradicated, reaper multi-repo + Linux timer installed, codex cold-review fixes, factory lane opened (10 beads incl. PR#47 drive).
 - [2026-07-09](activity/2026-07-09.md) — Root-cause confirmed: Linux fleet convergence failure from runner reconciliation churn; tracked with `jleechan-zy6` and `jleechan-9zd`.
 - [2026-07-07](activity/2026-07-07.md) — Fleet doctor session + macOS deadlock recovery + `--cpus` float precision fix
 
