@@ -183,6 +183,47 @@ EOF
       fail "systemd/ezgha.service.d/10-oomd-omit.conf missing [Service] section"
     fi
   fi
+
+  # Swap-path scope-boundary regression guard (second adversarial
+  # re-verification pass, 2026-07-10): per `man systemd.resource-control`,
+  # ManagedOOMPreference=omit is honored on the memory-PRESSURE kill path
+  # for a same-owner unit like ezgha.service, but NOT on the swap-usage
+  # kill path (root-owned-only, no same-owner exception). This drop-in
+  # therefore must NEVER set ManagedOOMSwap or SwapUsedLimit -- doing so
+  # would claim/imply swap-path protection this mechanism cannot actually
+  # provide. This assertion exists so a future edit can't silently
+  # reintroduce that false-protection claim.
+  if grep -qE '^(ManagedOOMSwap|SwapUsedLimit)=' "${OOMD_OMIT}"; then
+    fail "systemd/ezgha.service.d/10-oomd-omit.conf sets ManagedOOMSwap or SwapUsedLimit -- REGRESSION: the omit exemption does NOT cover the swap-usage kill path (root-owned-only per man systemd.resource-control, no same-owner exception), so this would silently imply swap-path protection that doesn't exist"
+  else
+    ok "systemd/ezgha.service.d/10-oomd-omit.conf correctly does not set ManagedOOMSwap/SwapUsedLimit (swap-path scope boundary respected)"
+  fi
+fi
+
+# ── 2c. docs/host-ops-sudo-block-0725.md -- Option A's actual command
+#        blocks must not tighten the swap-usage kill path (same
+#        scope-boundary regression guard, applied to the doc's code
+#        fences specifically, not just prose that explains the boundary
+#        -- prose legitimately mentions SwapUsedLimit/ManagedOOMSwap to
+#        explain why they're absent, so this check targets the heredoc
+#        bodies between `<<'EOF'` and `EOF` inside the Option A section
+#        only). ──────────────────────────────────────────────────────────
+SUDO_DOC="${REPO_ROOT}/docs/host-ops-sudo-block-0725.md"
+if [ ! -f "${SUDO_DOC}" ]; then
+  fail "docs/host-ops-sudo-block-0725.md does not exist"
+else
+  # Extract lines between "### Option A" and the next "### " heading, then
+  # within that, only the heredoc BODY lines (between <<'EOF' and EOF) --
+  # i.e. what would actually be written to disk if the operator copy-pastes
+  # the block, not the surrounding explanatory comments.
+  awk '/^### Option A/{flag=1} /^### Option B/{flag=0} flag' "${SUDO_DOC}" \
+    | awk '/<<.EOF./{heredoc=1; next} /^EOF$/{heredoc=0; next} heredoc' \
+    > "${WORK}/option-a-heredoc-bodies.txt"
+  if grep -qE '^(ManagedOOMSwap|SwapUsedLimit)=' "${WORK}/option-a-heredoc-bodies.txt"; then
+    fail "docs/host-ops-sudo-block-0725.md Option A's actual command block (heredoc body, not prose) sets ManagedOOMSwap or SwapUsedLimit -- REGRESSION: this reintroduces the swap-path exposure this doc was corrected to remove (see 'swap-path scope boundary' finding in the same doc)"
+  else
+    ok "docs/host-ops-sudo-block-0725.md Option A's command block does not set ManagedOOMSwap/SwapUsedLimit (swap-path scope boundary respected in the actual copy-pasteable commands)"
+  fi
 fi
 
 # ── 3. agent-cli-scoped.sh syntax ───────────────────────────────────────────
