@@ -1286,6 +1286,60 @@ fn available_mem_mb() -> Option<u64> {
     crate::platform::available_mem_mb()
 }
 
+/// Classification of the Docker endpoint this process talks to, used to
+/// scope the outer-host `MemAvailable` floor below (review comment
+/// 3561631800). `unix://`/`npipe://` are local sockets — including
+/// VM-backed daemons like Colima/Desktop, whose own memory can still differ
+/// from the host's, a known gap left for a follow-up since `docker info`
+/// only exposes daemon `MemTotal`, not a live available-equivalent.
+/// `tcp://`/`ssh://` are remote: the host's memory is irrelevant to them.
+/// Everything else (unrecognized scheme, empty output, failed probe) is
+/// `Unknown`, and the floor is bypassed rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockerEndpointClass {
+    Local,
+    Remote,
+    Unknown,
+}
+
+/// Pure classification of an already-resolved endpoint host string (e.g.
+/// `unix:///var/run/docker.sock`, `tcp://1.2.3.4:2375`). Split out from
+/// [`docker_endpoint_class`] so the scheme-matching rules are unit-testable
+/// without spawning a `docker` process.
+fn classify_docker_endpoint_host(host: &str) -> DockerEndpointClass {
+    if host.starts_with("unix://") || host.starts_with("npipe://") {
+        DockerEndpointClass::Local
+    } else if host.starts_with("tcp://") || host.starts_with("ssh://") {
+        DockerEndpointClass::Remote
+    } else {
+        DockerEndpointClass::Unknown
+    }
+}
+
+/// Effective Docker endpoint scheme for this process, determined via an
+/// unqualified `docker context inspect` (no explicit context name) run
+/// through [`docker_cmd`]/[`run_docker`] under the current process
+/// environment — so `DOCKER_HOST` and `DOCKER_CONTEXT` overrides are
+/// resolved exactly the way every other `docker` invocation in this module
+/// sees them, and so tests can redirect the probe via `TEST_DOCKER_BIN`
+/// like every other docker call here (no separate test-injection seam).
+fn docker_endpoint_class() -> DockerEndpointClass {
+    let mut cmd = docker_cmd();
+    cmd.args([
+        "context",
+        "inspect",
+        "--format",
+        "{{.Endpoints.docker.Host}}",
+    ]);
+    let Ok(out) = run_docker(cmd, "reading effective docker endpoint") else {
+        return DockerEndpointClass::Unknown;
+    };
+    if !out.status.success() {
+        return DockerEndpointClass::Unknown;
+    }
+    classify_docker_endpoint_host(String::from_utf8_lossy(&out.stdout).trim())
+}
+
 /// Start `missing` runners, one per free slot. Tracks which slot numbers have
 /// already failed WITHIN this call and excludes them from subsequent slot
 /// picks, so a single permanently-broken slot (e.g. an unresolvable 409
@@ -1430,34 +1484,48 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             );
         }
     }
-    match available_mem_mb() {
-        Some(mem) if mem < cfg.limits.min_available_memory_mb => {
-            let _ = alert::notify(
-                cfg,
-                "runner_pool.memory_floor",
-                Severity::Critical,
-                "Runner pool paused: host memory floor reached",
-                &format!(
-                    "only {mem} MB memory available on the host (floor: {} MB) for {}. \
-                     refusing to spawn runners until memory pressure clears",
-                    cfg.limits.min_available_memory_mb, cfg.github.target
-                ),
-            );
-            bail!(
-                "only {mem} MB memory available on the host (floor: {} MB) — \
-                 refusing to spawn runners; free up memory (e.g. stop unrelated \
-                 processes, wait for existing jobs to finish) first",
-                cfg.limits.min_available_memory_mb
+    match docker_endpoint_class() {
+        DockerEndpointClass::Local => match available_mem_mb() {
+            Some(mem) if mem < cfg.limits.min_available_memory_mb => {
+                let _ = alert::notify(
+                    cfg,
+                    "runner_pool.memory_floor",
+                    Severity::Critical,
+                    "Runner pool paused: host memory floor reached",
+                    &format!(
+                        "only {mem} MB memory available on the host (floor: {} MB) for {}. \
+                         refusing to spawn runners until memory pressure clears",
+                        cfg.limits.min_available_memory_mb, cfg.github.target
+                    ),
+                );
+                bail!(
+                    "only {mem} MB memory available on the host (floor: {} MB) — \
+                     refusing to spawn runners; free up memory (e.g. stop unrelated \
+                     processes, wait for existing jobs to finish) first",
+                    cfg.limits.min_available_memory_mb
+                );
+            }
+            // `Some(_) within floor` and `None` (measurement unavailable) both fall
+            // through deliberately: unlike disk, a single failed memory read is not
+            // itself treated as a strike-worthy degraded signal, since memory
+            // measurement failure is far rarer than disk (no docker-daemon RPC
+            // involved) and erring toward "keep spawning" avoids a starvation
+            // pattern on hosts where `/proc/meminfo`/`vm_stat` is transiently
+            // unreadable but otherwise healthy.
+            Some(_) | None => {}
+        },
+        DockerEndpointClass::Remote => {
+            eprintln!(
+                "note: skipping host memory floor — docker endpoint is remote (tcp/ssh); \
+                 the local host's memory has no relationship to the remote daemon's memory"
             );
         }
-        // `Some(_) within floor` and `None` (measurement unavailable) both fall
-        // through deliberately: unlike disk, a single failed memory read is not
-        // itself treated as a strike-worthy degraded signal, since memory
-        // measurement failure is far rarer than disk (no docker-daemon RPC
-        // involved) and erring toward "keep spawning" avoids a starvation
-        // pattern on hosts where `/proc/meminfo`/`vm_stat` is transiently
-        // unreadable but otherwise healthy.
-        Some(_) | None => {}
+        DockerEndpointClass::Unknown => {
+            eprintln!(
+                "note: skipping host memory floor — could not determine the docker endpoint \
+                 scheme (context inspect failed, empty output, or an unrecognized scheme)"
+            );
+        }
     }
     let missing = cfg.runner.count - alive;
     let refill = start_missing_runners(cfg, backend, missing);
@@ -1920,13 +1988,47 @@ mod tests {
         );
     }
 
+    /// Write a fake `docker` executable that responds to `context inspect
+    /// --format ...` with `host_line` (echoed verbatim, or nothing if
+    /// `None`) at `exit_code`, and succeeds silently for every other
+    /// subcommand. Mirrors `start_one_releases_slot_on_docker_run_failure`'s
+    /// `TEST_DOCKER_BIN` script-injection pattern (never mutates `PATH`).
+    fn write_fake_docker_context_script(
+        label: &str,
+        host_line: Option<&str>,
+        exit_code: i32,
+    ) -> PathBuf {
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-docker-fake-context-{}-{label}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let script = temp_dir.join("docker");
+        let echo = host_line
+            .map(|h| format!("echo \"{h}\"; "))
+            .unwrap_or_default();
+        let body = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"context\" ] && [ \"$2\" = \"inspect\" ]; then {echo}exit {exit_code}; fi\nexit 0\n"
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn set_fake_docker_endpoint(label: &str, host_line: Option<&str>, exit_code: i32) {
+        let script = write_fake_docker_context_script(label, host_line, exit_code);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+    }
+
     #[test]
     fn ensure_count_refuses_to_spawn_below_memory_floor() {
         // Mirrors the disk-floor guard (ensure_count_real_wiring_computes_missing_before_start_missing):
-        // when host MemAvailable is below cfg.limits.min_available_memory_mb, ensure_count_outcome
-        // must refuse to spawn rather than piling more runner containers onto an already-strained
-        // host — this is the Gate-0 gap that let jeff-ubuntu OOM on 2026-07-10 (bead jleechan-aeh0).
+        // when host MemAvailable is below cfg.limits.min_available_memory_mb AND the docker
+        // endpoint is a local unix socket, ensure_count_outcome must refuse to spawn rather
+        // than piling more runner containers onto an already-strained host — this is the
+        // Gate-0 gap that let jeff-ubuntu OOM on 2026-07-10 (bead jleechan-aeh0).
         let _env = TestEnv::new("ensure_count_memory_floor");
+        set_fake_docker_endpoint("unix", Some("unix:///var/run/docker.sock"), 0);
         let mut cfg = cfg_with(5, "ez-org-runner");
         cfg.limits.min_available_memory_mb = 8192;
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
@@ -1954,12 +2056,112 @@ mod tests {
     }
 
     #[test]
+    fn ensure_count_refuses_to_spawn_below_memory_floor_on_npipe_endpoint() {
+        // npipe:// (Windows named pipe) is a local endpoint exactly like unix:// —
+        // the floor must keep applying there too.
+        let _env = TestEnv::new("ensure_count_memory_floor_npipe");
+        set_fake_docker_endpoint("npipe", Some("npipe://./pipe/docker_engine"), 0);
+        let mut cfg = cfg_with(3, "ez-org-runner");
+        cfg.limits.min_available_memory_mb = 8192;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_AVAILABLE_MEM_MB.lock().unwrap() = Some(Some(1024));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-org-runner-1".into(),
+            "ez-org-runner-2".into(),
+            "ez-org-runner-3".into(),
+        ]);
+
+        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("memory"),
+            "npipe is a local endpoint; the memory floor must still refuse, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn ensure_count_bypasses_memory_floor_for_remote_tcp_endpoint() {
+        // tcp:// is an unambiguously remote daemon — the local host's memory has no
+        // relationship to it, so the floor must be bypassed rather than blocking a
+        // healthy remote fleet on a misread of the wrong machine's memory.
+        let _env = TestEnv::new("ensure_count_memory_floor_tcp");
+        set_fake_docker_endpoint("tcp", Some("tcp://10.0.0.5:2375"), 0);
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.min_available_memory_mb = 8192;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_AVAILABLE_MEM_MB.lock().unwrap() = Some(Some(1024));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-1".into(), "ez-org-runner-2".into()]);
+
+        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            started,
+            vec!["ez-org-runner-1", "ez-org-runner-2"],
+            "a remote tcp:// endpoint must bypass the outer-host memory floor entirely"
+        );
+    }
+
+    #[test]
+    fn ensure_count_bypasses_memory_floor_for_remote_ssh_endpoint() {
+        let _env = TestEnv::new("ensure_count_memory_floor_ssh");
+        set_fake_docker_endpoint("ssh", Some("ssh://runner-host"), 0);
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.min_available_memory_mb = 8192;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_AVAILABLE_MEM_MB.lock().unwrap() = Some(Some(1024));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-1".into(), "ez-org-runner-2".into()]);
+
+        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            started,
+            vec!["ez-org-runner-1", "ez-org-runner-2"],
+            "a remote ssh:// endpoint must bypass the outer-host memory floor entirely"
+        );
+    }
+
+    #[test]
+    fn ensure_count_bypasses_memory_floor_when_context_inspect_fails() {
+        // `docker context inspect` itself can fail (unknown/misconfigured
+        // DOCKER_CONTEXT, docker CLI too old, etc.) — bypass rather than guess,
+        // since blocking spawns on an unreadable classification is worse than
+        // occasionally skipping the floor.
+        let _env = TestEnv::new("ensure_count_memory_floor_inspect_failure");
+        set_fake_docker_endpoint("inspect_failure", None, 1);
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.min_available_memory_mb = 8192;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_AVAILABLE_MEM_MB.lock().unwrap() = Some(Some(1024));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-1".into(), "ez-org-runner-2".into()]);
+
+        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            started,
+            vec!["ez-org-runner-1", "ez-org-runner-2"],
+            "a failed `docker context inspect` must bypass the floor, not block spawns"
+        );
+    }
+
+    #[test]
     fn ensure_count_spawns_normally_above_memory_floor() {
-        // Healthy-host control for the guard above: plenty of MemAvailable must NOT
-        // block a refill. Prevents the "deadlock" failure mode the /advice synthesis
-        // warned about (floor set so conservatively the daemon refuses under normal
-        // conditions).
+        // Healthy-host control for the guard above: plenty of MemAvailable on a
+        // local endpoint must NOT block a refill. Prevents the "deadlock" failure
+        // mode the /advice synthesis warned about (floor set so conservatively the
+        // daemon refuses under normal conditions).
         let _env = TestEnv::new("ensure_count_memory_floor_ok");
+        set_fake_docker_endpoint("unix_healthy", Some("unix:///var/run/docker.sock"), 0);
         let mut cfg = cfg_with(2, "ez-org-runner");
         cfg.limits.min_available_memory_mb = 8192;
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
@@ -1974,8 +2176,74 @@ mod tests {
         assert_eq!(
             started,
             vec!["ez-org-runner-1", "ez-org-runner-2"],
-            "plenty of MemAvailable must not block a normal refill"
+            "plenty of MemAvailable on a local endpoint must not block a normal refill"
         );
+    }
+
+    #[test]
+    fn classify_docker_endpoint_host_unix_is_local() {
+        assert_eq!(
+            classify_docker_endpoint_host("unix:///var/run/docker.sock"),
+            DockerEndpointClass::Local
+        );
+    }
+
+    #[test]
+    fn classify_docker_endpoint_host_npipe_is_local() {
+        assert_eq!(
+            classify_docker_endpoint_host("npipe://./pipe/docker_engine"),
+            DockerEndpointClass::Local
+        );
+    }
+
+    #[test]
+    fn classify_docker_endpoint_host_tcp_is_remote() {
+        assert_eq!(
+            classify_docker_endpoint_host("tcp://10.0.0.5:2375"),
+            DockerEndpointClass::Remote
+        );
+    }
+
+    #[test]
+    fn classify_docker_endpoint_host_ssh_is_remote() {
+        assert_eq!(
+            classify_docker_endpoint_host("ssh://runner-host"),
+            DockerEndpointClass::Remote
+        );
+    }
+
+    #[test]
+    fn classify_docker_endpoint_host_unrecognized_scheme_is_unknown() {
+        assert_eq!(
+            classify_docker_endpoint_host("fd://3"),
+            DockerEndpointClass::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_docker_endpoint_host_empty_is_unknown() {
+        assert_eq!(
+            classify_docker_endpoint_host(""),
+            DockerEndpointClass::Unknown
+        );
+    }
+
+    #[test]
+    fn docker_endpoint_class_honors_context_inspect_output() {
+        // End-to-end wiring check: docker_endpoint_class() must actually run
+        // `docker context inspect` through docker_cmd()/TEST_DOCKER_BIN (not a
+        // separate injection seam) so DOCKER_HOST/DOCKER_CONTEXT selection is
+        // honored exactly like every other docker call in this module.
+        let _env = TestEnv::new("docker_endpoint_class_wiring");
+        set_fake_docker_endpoint("wiring_unix", Some("unix:///var/run/docker.sock"), 0);
+        assert_eq!(docker_endpoint_class(), DockerEndpointClass::Local);
+    }
+
+    #[test]
+    fn docker_endpoint_class_bypasses_on_command_failure() {
+        let _env = TestEnv::new("docker_endpoint_class_command_failure");
+        set_fake_docker_endpoint("wiring_failure", None, 1);
+        assert_eq!(docker_endpoint_class(), DockerEndpointClass::Unknown);
     }
 
     #[test]
