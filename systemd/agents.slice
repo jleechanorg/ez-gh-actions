@@ -1,0 +1,59 @@
+# agents.slice — user-scope memory ceiling for interactive agent CLI processes
+# (claude/codex/cursor/gemini/etc). Part of bead ez-gh-actions-0725 (panel
+# decision recorded on ez-gh-actions-ah94, Tier 1 do-now item #2).
+#
+# HOW A PROCESS JOINS THIS SLICE (opt-in, nothing auto-migrates):
+#   scripts/host/agent-cli-scoped.sh <command> [args...]
+# which runs `systemd-run --user --slice=agents.slice --scope -- <command>`.
+# This unit only needs to exist under ~/.config/systemd/user/ for that to
+# work — systemd auto-starts a slice the first time a scope/service
+# references it. No `systemctl --user enable` step is required or performed
+# by this repo's install path; see install.sh comments near the auxiliary
+# unit loop for why this unit is intentionally NOT swept into the
+# `ezgha-*.service`/`ezgha-*.timer` glob (it is a host-wide concern, not
+# ezgha-fleet-specific, and must stay opt-in per the panel's "don't
+# force-migrate any live session" instruction).
+#
+# WHY MemoryHigh (not MemoryMax): MemoryHigh is a *soft* ceiling — the
+# kernel throttles the cgroup and aggressively reclaims its reclaimable
+# memory (page cache first, then swaps out anonymous pages) once usage
+# exceeds the threshold, but it does NOT invoke the OOM killer against
+# member processes. That is the deliberate choice here: a safety mechanism
+# must not itself cause the outage it's meant to prevent (repo CLAUDE.md
+# "Self-Outage Prevention Principle") — a hard MemoryMax on a live coding
+# agent's cgroup would SIGKILL agents outright, turning a memory-pressure
+# warning into forced session loss, which is worse than the degrade-and-
+# slow-down behavior MemoryHigh gives you.
+#
+# BLAST RADIUS / NORMAL PEAK / SAFE MARGIN (required by repo CLAUDE.md
+# "Safety & Monitoring Principles" for any new threshold):
+#   - Normal peak observed (2026-07-08 through 2026-07-10 incident window):
+#     host squeezed to ~14GB of headroom outside the Colima VM (which holds
+#     a static 48GiB/24cpu allocation of the 62GB host total, out of scope
+#     for this bead) across ~25-29 concurrent claude/codex/agent CLI
+#     processes plus the ezgha daemon and system processes. That ~14GB
+#     window is what pegged the 16GB swapfile at 99-100% utilization for
+#     multiple days, produced D-state process pileup, and spiked load
+#     average to 218, triggering a watchdog reboot on 2026-07-10 that
+#     killed an in-progress agent session.
+#   - MemoryHigh=20G leaves roughly 6GB of throttling headroom above that
+#     observed ~14GB peak before this slice starts reclaiming/throttling
+#     its own member processes. It is deliberately NOT set at or below the
+#     observed peak — the goal is to catch runaway growth *beyond* what has
+#     already been observed as "normal but uncomfortable," not to throttle
+#     the fleet's steady-state operation and cause a second, self-inflicted
+#     degradation.
+#   - This ceiling applies ONLY to processes explicitly launched via
+#     agent-cli-scoped.sh into this slice — it has zero effect on the
+#     ezgha daemon, the Colima VM, or any process not opted in.
+#
+# Static syntax validation only (no live start/enable performed by this
+# commit): `systemd-analyze verify systemd/agents.slice`
+
+[Unit]
+Description=Interactive agent CLI processes (claude/codex/cursor/etc) — soft memory ceiling
+Before=slices.target
+
+[Slice]
+MemoryHigh=20G
+MemoryAccounting=yes

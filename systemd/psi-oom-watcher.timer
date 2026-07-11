@@ -1,0 +1,36 @@
+# psi-oom-watcher.timer — the automatic caller for psi-oom-watcher.service.
+# Part of bead ez-gh-actions-0725. Per repo CLAUDE.md "Automation
+# completeness": a script with only a manual invocation path is not
+# automation, so this timer is mandatory, not optional, alongside the
+# watcher script itself.
+#
+# INTERVAL: 20s, chosen from the instructed 10-30s range. Rationale: the
+# watcher script keys off "full avg10" (a 10-second rolling average per
+# kernel PSI docs), so polling much faster than 10s would mostly re-sample
+# the same rolling window and add overhead without new signal; polling
+# much slower than 20s risks missing the CRIT_CONSECUTIVE=2-consecutive-
+# poll confirmation window (see psi-oom-watcher.sh) before a fast-developing
+# thrash event (the 2026-07-10 incident went from healthy to load-218
+# D-state pileup within tens of seconds to minutes, not the multi-day
+# swap-percentage climb that preceded it). 20s gives two full independent
+#10s-average samples per confirmation cycle while keeping the oneshot
+# service's own overhead (one /proc read + one `ps` scan, well under 1s
+# wall time — see TimeoutStartSec=30 in the .service as an intentionally
+# generous backstop, not the expected runtime) negligible against a
+# 20-second cadence.
+#
+# NOT enabled/started by this commit — see psi-oom-watcher.service header
+# and docs/host-ops-sudo-block-0725.md for manual install steps left to the
+# human operator. Static syntax validation only:
+# `systemd-analyze verify systemd/psi-oom-watcher.timer`
+[Unit]
+Description=Run the PSI memory-pressure watcher every 20 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=20s
+Persistent=false
+Unit=psi-oom-watcher.service
+
+[Install]
+WantedBy=timers.target
