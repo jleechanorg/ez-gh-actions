@@ -47,10 +47,13 @@ D-state process pileup, load 218, watchdog reboot). Two independent
 remediation paths, pick ONE (both are documented below since availability/
 preference may vary):
 
-- **Option A (recommended, lower blast radius): tune the existing
-  systemd-oomd via a drop-in.** No new package, no new failure surface —
-  just tighter thresholds on infrastructure already proven to be wired
-  into the right cgroups. This is the path of least new risk.
+- **Option A (recommended, lower blast radius, WITH a required per-unit
+  exemption): tune the existing systemd-oomd via a drop-in.** No new
+  package, no new failure surface — just tighter thresholds on
+  infrastructure already proven to be wired into the right cgroups. **This
+  requires an explicit exemption for `ezgha.service` (step 0 below) —
+  without it, tightening the thresholds makes the Colima VM a live
+  SIGKILL candidate, see the cgroup finding immediately below.**
 - **Option B: install earlyoom instead/in addition.** earlyoom is NOT
   currently installed (`apt-cache policy earlyoom` shows
   `Installed: (none)`, `Candidate: 1.7-2`) — this requires `apt-get
@@ -70,6 +73,57 @@ Do NOT enable zram until whichever option you pick has been observed
 actually intervening (or confirmed absent-intervention because pressure
 stayed healthy) through at least one full day of normal multi-agent load.
 
+## Finding: the Colima VM lives INSIDE ezgha.service's own cgroup
+
+Checked live on jeff-ubuntu 2026-07-10 (read-only, no changes made) during
+adversarial verification of this bead's first draft:
+
+```
+$ pgrep -f qemu-system-x86_64
+24265
+$ cat /proc/24265/cgroup
+0::/user.slice/user-1000.slice/user@1000.service/app.slice/ezgha.service
+$ systemctl --user status ezgha.service
+● ezgha.service - ez-gh-actions ephemeral GitHub Actions runners
+     Memory: 33.6G (peak: 36.3G swap: 171.3M)
+     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/ezgha.service
+             ├─ 3766 /home/jleechan/.cargo/bin/ezgha ... serve
+             ├─ 4252 limactl usernet ...
+             ├─ 22414 limactl hostagent ...
+             └─ 24265 /usr/bin/qemu-system-x86_64 -m 49152 ...
+```
+
+The Colima VM (qemu process + its limactl helpers) is not in a separate
+slice or scope — it's a direct child process tree of the ezgha daemon
+itself, so its ~33.6G memory footprint is entirely inside
+`ezgha.service`'s own cgroup accounting. This means: **tightening
+`SwapUsedLimit`/`DefaultMemoryPressureLimit` on `user.slice`/
+`user-1000.slice` (step 2 below) makes `ezgha.service` — and therefore the
+Colima VM inside it — a live SIGKILL candidate the moment aggregate
+pressure/swap in that subtree crosses the new tighter threshold.** Unlike
+this bead's own `psi-oom-watcher.sh` fallback, systemd-oomd has no
+cooldown, no grace period, and no exclusion list of its own — it kills
+immediately once its candidate-selection logic picks a cgroup. Applying
+Option A's tightened thresholds WITHOUT the exemption below would produce
+a *harsher* version of the exact failure this bead exists to prevent:
+instead of a slow swap-thrash-to-reboot, one bad tick could nuke the
+entire runner fleet outright.
+
+**The fix is a real, already-committed, already-verified artifact in this
+repo**, not just a doc note: `systemd/ezgha.service.d/10-oomd-omit.conf`
+sets `ManagedOOMPreference=omit` on `ezgha.service`. Per
+`systemd.resource-control(5)`, this extended-attribute-based exemption is
+respected because `ezgha.service` and the monitored ancestor
+(`user-1000.slice`) are owned by the same UID (verified via the delegated
+`cgroup.controllers` check performed earlier in this bead). Confirmed via
+`systemd-analyze verify --user` (paired with a stub base unit, since a
+bare drop-in fragment can't be verified standalone) — parses cleanly.
+**This step requires NO sudo** (it's a `~/.config/systemd/user/` override,
+owned by the invoking user) but DOES require restarting `ezgha.service`
+for the omit xattr to attach to its live cgroup — coordinate with the
+ezgha deploy-owner per repo CLAUDE.md single-writer rule; do not restart
+opportunistically.
+
 ---
 
 ## System-scope commands
@@ -77,6 +131,21 @@ stayed healthy) through at least one full day of normal multi-agent load.
 ### Option A — tune systemd-oomd (recommended first move)
 
 ```bash
+# 0. REQUIRED FIRST (no sudo needed): install the per-unit exemption so
+#    ezgha.service (and the Colima VM living inside its cgroup, see
+#    finding above) is never a systemd-oomd kill candidate, regardless of
+#    how tight steps 1-2 below make the ancestor slice thresholds.
+mkdir -p ~/.config/systemd/user/ezgha.service.d
+cp systemd/ezgha.service.d/10-oomd-omit.conf ~/.config/systemd/user/ezgha.service.d/
+systemctl --user daemon-reload
+# The omit xattr only attaches when the unit's cgroup is (re)created, so
+# this exemption does not take effect until the NEXT ezgha.service
+# restart. This is a live-daemon restart -- do not run it here; hand off
+# to the deploy-owner alongside whatever restart they're already doing
+# for other reasons, or schedule one deliberately. Until that restart
+# happens, do NOT proceed with steps 1-2 below (they would leave the VM
+# exposed in the gap between "thresholds tightened" and "exemption live").
+
 # 1. Create a drop-in tightening the pressure/swap thresholds. Numbers
 #    chosen to fire meaningfully before the host watchdog's max-load-1
 #    territory (this host's /etc/watchdog.conf currently reads
@@ -105,13 +174,16 @@ ManagedOOMMemoryPressureLimit=30%
 ManagedOOMSwap=kill
 EOF
 
-# 3. Apply.
+# 3. Apply (order matters: only do this AFTER step 0's exemption is
+#    already live via an ezgha.service restart -- see step 0's note).
 sudo systemctl daemon-reload
 sudo systemctl restart systemd-oomd
 
-# 4. Verify it picked up the new config.
+# 4. Verify it picked up the new config, AND verify the exemption is
+#    actually attached to ezgha.service's live cgroup (the omit xattr):
 systemd-analyze cat-config systemd/oomd.conf
 systemctl status systemd-oomd
+systemctl --user show -p ManagedOOMPreference ezgha.service   # expect: omit
 ```
 
 ### Option B — install earlyoom (alternative/supplemental)

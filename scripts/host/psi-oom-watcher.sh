@@ -99,7 +99,29 @@
 # repo exists to keep up, which is a categorically worse outcome than the
 # swap-thrash this watcher is trying to prevent. qemu/colima/lima processes
 # are therefore hard-excluded by both comm AND full args (defense in depth,
-# since `comm` truncates to 15 chars and could theoretically collide).
+# since `comm` truncates to 15 chars and could theoretically collide). Note:
+# `ps` on this host shows TWO qemu-system-x86 processes (the ~32GB main VM
+# plus a smaller guest-agent-adjacent one) — both are covered because the
+# exclusion matches on comm/args pattern, not a specific PID or RSS size.
+#
+# SECOND EXCLUSION FOUND DURING ADVERSARIAL VERIFICATION (2026-07-10,
+# sidekick-memarch): after qemu/colima, the next-largest-RSS process on
+# this host by a wide margin was `warp-terminal` (~760MB) — the user's GUI
+# terminal emulator. This script's own stated rationale for excluding
+# tmux/screen ("protect the user's ability to keep working") applies
+# equally to the GUI terminal app hosting the user's session — SIGTERM-ing
+# it would kill every pane/tab the user has open, including whatever
+# terminal they'd use to investigate the very crisis this script fired for.
+# Common GUI terminal emulators are therefore added to the exclusion list
+# alongside the tmux/screen *server* processes already covered. This is
+# scoped narrowly to terminal emulators specifically (not desktop apps in
+# general, e.g. a browser) because that's the specific class this script's
+# own "keep the user working" rationale already commits to protecting;
+# widening further (e.g. to browsers) would start trading away the
+# watcher's usefulness against a class of risk it was never designed to
+# cover. After this exclusion, live `ps` on this host confirms the next
+# candidates are legitimate `claude` CLI processes — i.e. the actual
+# intended target class, confirming the watcher is not left toothless.
 #
 # USAGE (normally invoked by psi-oom-watcher.timer -> .service, but safe to
 # run by hand for testing):
@@ -120,8 +142,12 @@ COOLDOWN_SEC="${COOLDOWN_SEC:-600}"         # 10 minutes
 DRY_RUN="${DRY_RUN:-0}"
 
 # comm-based exclusions (exact match against ps -o comm=, which truncates
-# at 15 chars — qemu-system-x86_64 truncates to "qemu-system-x86").
-EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher\.sh|ezgha|qemu-system-x86|colima|lima|dockerd|docker)$'
+# at 15 chars — qemu-system-x86_64 truncates to "qemu-system-x86"). Grouped:
+# core system/session processes, the VM backing the runner fleet
+# (qemu/colima/lima), and GUI terminal emulators (see "SECOND EXCLUSION"
+# comment above — warp-terminal was the real second-largest-RSS process
+# found on jeff-ubuntu during adversarial verification).
+EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher\.sh|ezgha|qemu-system-x86|colima|lima|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
 # args-based exclusions (defense in depth for the comm-truncation case
 # above, and to catch any Colima/Lima helper process whose comm doesn't
 # start with one of the names above but whose full command line does).

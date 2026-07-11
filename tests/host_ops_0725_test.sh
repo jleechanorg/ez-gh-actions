@@ -86,20 +86,32 @@ else
     fail "scripts/host/psi-oom-watcher.sh is missing the qemu/colima exclusion -- REGRESSION: this class of bug let a live dry-run target the Colima VM (32GB RSS qemu-system-x86 process) as the SIGTERM candidate, which would kill the entire runner fleet"
   fi
 
+  if grep -q 'warp-terminal' "${WATCHER}" && grep -q 'gnome-terminal' "${WATCHER}"; then
+    ok "scripts/host/psi-oom-watcher.sh exclusion list references GUI terminal emulators (warp-terminal etc, regression guard present)"
+  else
+    fail "scripts/host/psi-oom-watcher.sh is missing the GUI-terminal-emulator exclusion -- REGRESSION: adversarial verification found warp-terminal (~760MB RSS) was the real second-largest-RSS process on jeff-ubuntu after qemu/colima, and would have been SIGTERM'd instead of an agent CLI process"
+  fi
+
   # Behavioral smoke test: fabricate a fake process table via a stub `ps`
-  # on PATH that returns a qemu-system-x86 process as the top-RSS entry
-  # (exactly the shape seen on jeff-ubuntu) plus one legitimate non-excluded
-  # process, and assert the watcher picks the second one, never the first.
+  # on PATH shaped exactly like the REAL fixture seen on jeff-ubuntu during
+  # adversarial verification: qemu (Colima VM, ~32GB, must be excluded),
+  # then warp-terminal (~760MB, the user's GUI terminal, must be excluded),
+  # then a legitimate `claude` agent CLI process (the actual intended
+  # target class) -- assert the watcher skips BOTH exclusions and lands on
+  # the claude process, never qemu or warp-terminal.
   STUB_BIN="${WORK}/bin"
   mkdir -p "${STUB_BIN}"
   cat > "${STUB_BIN}/ps" <<'EOF'
 #!/usr/bin/env bash
 # Stub ps: ignores its arguments, always returns a fixed fixture table
-# shaped like `ps -o pid=,rss=,comm=,args= --sort=-rss` output: qemu (the
-# Colima VM, must be excluded) first by RSS, then a legitimate target.
+# shaped like `ps -o pid=,rss=,comm=,args= --sort=-rss` output, matching
+# the real top-of-stack seen on jeff-ubuntu 2026-07-10: qemu (Colima VM)
+# and warp-terminal (GUI terminal) both must be excluded; the claude
+# process is the legitimate target.
 cat <<'TABLE'
   24265 33072676 qemu-system-x86 /usr/bin/qemu-system-x86_64 -m 49152 -drive file=/home/jleechan/.lima/colima/diffdisk -name lima-colima
-  12439   808000 warp-terminal /usr/bin/warp-terminal
+  12439   759760 warp-terminal /usr/bin/warp-terminal
+  19195   616432 claude /home/jleechan/.npm-global/bin/claude
 TABLE
 EOF
   chmod +x "${STUB_BIN}/ps"
@@ -124,12 +136,52 @@ EOF
     if grep 'would send SIGTERM' "${WATCHER_LOG}" | grep -q 'pid=24265'; then
       fail "REGRESSION: watcher selected the Colima VM qemu process (pid=24265) as its SIGTERM target -- this would kill the entire runner fleet"
     elif grep 'would send SIGTERM' "${WATCHER_LOG}" | grep -q 'pid=12439'; then
-      ok "watcher correctly skipped the qemu/colima process and targeted the legitimate largest-RSS process instead (behavioral smoke test)"
+      fail "REGRESSION: watcher selected the user's GUI terminal (warp-terminal, pid=12439) as its SIGTERM target -- this would kill the user's terminal session mid-crisis"
+    elif grep 'would send SIGTERM' "${WATCHER_LOG}" | grep -q 'pid=19195'; then
+      ok "watcher correctly skipped qemu/colima AND warp-terminal, landing on the legitimate claude agent CLI process (behavioral smoke test)"
     else
-      fail "watcher logged a SIGTERM target that matched neither expected pid -- inspect ${WATCHER_LOG}"
+      fail "watcher logged a SIGTERM target that matched none of the expected pids -- inspect ${WATCHER_LOG}"
     fi
   else
     fail "watcher never reached the DRY_RUN action line across 2 consecutive CRIT polls -- expected 'would send SIGTERM' in ${WATCHER_LOG}"
+  fi
+fi
+
+# ── 2b. ezgha.service.d/10-oomd-omit.conf -- exists, correct directive,
+#        and parses via systemd-analyze verify when paired with a stub
+#        base unit (a bare drop-in fragment can't be verified standalone
+#        -- systemd-analyze verify requires a full unit file path). ──────
+OOMD_OMIT="${REPO_ROOT}/systemd/ezgha.service.d/10-oomd-omit.conf"
+if [ ! -f "${OOMD_OMIT}" ]; then
+  fail "systemd/ezgha.service.d/10-oomd-omit.conf does not exist -- REGRESSION: without this per-unit systemd-oomd exemption, tuning system-scope oomd thresholds (docs/host-ops-sudo-block-0725.md Option A) makes the Colima VM (which lives inside ezgha.service's own cgroup) a live SIGKILL candidate"
+else
+  if grep -q '^ManagedOOMPreference=omit$' "${OOMD_OMIT}"; then
+    ok "systemd/ezgha.service.d/10-oomd-omit.conf sets ManagedOOMPreference=omit"
+  else
+    fail "systemd/ezgha.service.d/10-oomd-omit.conf is missing 'ManagedOOMPreference=omit'"
+  fi
+
+  if [ "${HAVE_SYSTEMD_ANALYZE}" -eq 1 ]; then
+    PAIR_DIR="${WORK}/oomd-omit-pair"
+    mkdir -p "${PAIR_DIR}/ezgha.service.d"
+    cat > "${PAIR_DIR}/ezgha.service" <<'EOF'
+[Unit]
+Description=stub ezgha (test fixture, not the real unit)
+[Service]
+ExecStart=/bin/true
+EOF
+    cp "${OOMD_OMIT}" "${PAIR_DIR}/ezgha.service.d/"
+    if systemd-analyze verify --user "${PAIR_DIR}/ezgha.service" >"${WORK}/oomd-omit-verify.log" 2>&1; then
+      ok "systemd/ezgha.service.d/10-oomd-omit.conf passes systemd-analyze verify --user (paired with stub base unit)"
+    else
+      fail "systemd/ezgha.service.d/10-oomd-omit.conf failed systemd-analyze verify --user: $(cat "${WORK}/oomd-omit-verify.log")"
+    fi
+  else
+    if grep -q '^\[Service\]' "${OOMD_OMIT}"; then
+      ok "systemd/ezgha.service.d/10-oomd-omit.conf structural check (systemd-analyze unavailable): has [Service] section"
+    else
+      fail "systemd/ezgha.service.d/10-oomd-omit.conf missing [Service] section"
+    fi
   fi
 fi
 
