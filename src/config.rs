@@ -516,6 +516,15 @@ impl Config {
                 self.limits.memory_mb
             );
         }
+        if self.runner.runner_floor_mb < 512 {
+            anyhow::bail!(
+                "runner.runner_floor_mb must be at least 512 (got {}); 0 means the \
+                 fail-loud budget guard (bead ez-gh-actions-yz6b) can never trigger \
+                 regardless of fleet_budget_mb, silently defeating the safety check \
+                 this field exists to enforce",
+                self.runner.runner_floor_mb
+            );
+        }
         if !self.limits.cpus.is_finite() || self.limits.cpus < 0.5 {
             anyhow::bail!(
                 "limits.cpus must be a finite value >= 0.5 (got {}); 0 means \
@@ -803,6 +812,13 @@ minimum_isolation = "container"
     fn reject_zero_memory() {
         let mut cfg = valid_config();
         cfg.limits.memory_mb = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_zero_runner_floor_mb() {
+        let mut cfg = valid_config();
+        cfg.runner.runner_floor_mb = 0;
         assert!(cfg.validate().is_err());
     }
 

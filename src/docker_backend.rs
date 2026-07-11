@@ -986,11 +986,20 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
     if let Some((ncpu, daemon_mem)) = capacity {
         let n_f = (cfg.runner.count as f64).max(1.0);
         let n_u = (cfg.runner.count as u64).max(1);
-        // Per-runner share of the daemon, floored at validate() minimums so a
-        // hand-edited cfg that over-aggregates still gets a sane per-runner
-        // request rather than docker run exploding from over-memory.
+        // Per-runner share of the FLEET budget (daemon capacity minus the
+        // guest/Docker-overhead reserve), floored at validate() minimums so
+        // a hand-edited cfg that over-aggregates still gets a sane
+        // per-runner request rather than docker run exploding from
+        // over-memory. Mirrors derive_memory_budget's fleet_budget_mb =
+        // vm_total_mb - guest_reserve_mb formula (bead ez-gh-actions-yz6b
+        // round 3) so the startup fail-loud guard / `ezgha doctor` preview
+        // and the ACTUAL docker run --memory limit stay in sync — before
+        // this fix they were two disconnected calculations and the guard
+        // could report "OK" while runners were still spawned with zero real
+        // guest headroom (daemon_mem / count, ignoring guest_reserve_mb).
+        let fleet_mem_budget = daemon_mem.saturating_sub(cfg.runner.guest_reserve_mb);
         let cpu_share = (ncpu / n_f).max(0.5);
-        let mem_share = (daemon_mem / n_u).max(512);
+        let mem_share = (fleet_mem_budget / n_u).max(512);
         if cpus > cpu_share {
             eprintln!(
                 "note: clamping cpus {cpus} -> {cpu_share} (daemon {ncpu} / {} runners)",
@@ -1000,7 +1009,9 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
         }
         if mem > mem_share {
             eprintln!(
-                "note: clamping memory {mem} MB -> {mem_share} MB (daemon {daemon_mem} / {} runners)",
+                "note: clamping memory {mem} MB -> {mem_share} MB (fleet_budget {fleet_mem_budget} MB \
+                 [daemon {daemon_mem} MB - guest_reserve {} MB] / {} runners)",
+                cfg.runner.guest_reserve_mb,
                 cfg.runner.count
             );
             mem = mem_share;
@@ -1377,7 +1388,13 @@ fn poll_peak_rss(containers: &[ManagedContainer]) {
     for c in containers {
         cmd.arg(&c.id);
     }
-    let out = match run_docker(cmd, "polling peak RSS") {
+    // Deliberately short, dedicated timeout (NOT the full 45s DOCKER_TIMEOUT):
+    // this call runs inside release_stale_slots, which ensure_count_outcome
+    // calls BEFORE checking alive count / spawning replacements — a stalled
+    // telemetry-only call must not meaningfully delay respawn decisions.
+    // Bead ez-gh-actions-yz6b round 3 (adversarial review P2 finding).
+    const PEAK_RSS_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+    let out = match run_docker_with_timeout(cmd, "polling peak RSS", PEAK_RSS_POLL_TIMEOUT) {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
             eprintln!(
@@ -1854,6 +1871,30 @@ mod tests {
             "per_runner * count must fit daemon memory (got mem={mem}, count={}, product={mem_total}, daemon={daemon_mem})",
             cfg.runner.count
         );
+    }
+
+    #[test]
+    fn effective_limits_respects_guest_reserve_ground_truth() {
+        // Regression for a P1 gap found in adversarial review round 3:
+        // before this fix, effective_limits_with_capacity divided the RAW
+        // daemon capacity by count, completely ignoring guest_reserve_mb —
+        // meaning the startup fail-loud guard / `ezgha doctor` preview
+        // could report "OK" while the ACTUAL per-container docker run
+        // --memory limit still left zero real headroom for the guest OS /
+        // Docker daemon. Ground truth: 48163 MB daemon (Colima VM), 4096 MB
+        // guest reserve (default), 16 runners -> fleet_budget = 44067,
+        // per-runner <= 44067/16 = 2754 MB, NOT ~3010 MB (48163/16, the
+        // pre-fix number).
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 16;
+        cfg.limits.memory_mb = 5977; // matches jeff-ubuntu's real config.toml
+        assert_eq!(cfg.runner.guest_reserve_mb, 4096); // sanity: default
+        let (_, mem) = effective_limits_with_capacity(&cfg, Some((4.0, 48163)));
+        assert!(
+            mem <= 2754,
+            "effective_limits must respect guest_reserve_mb: expected <= 2754 MB (44067/16), got {mem} MB"
+        );
+        assert!(mem >= 512); // floor still applies
     }
 
     #[test]
