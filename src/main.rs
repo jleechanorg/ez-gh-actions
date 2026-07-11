@@ -1366,7 +1366,25 @@ mod tests {
             .parse()
             .unwrap();
         let _ = std::fs::remove_file(&pid_path);
-        let still_alive = unsafe { libc::kill(child_pid, 0) } == 0;
+        let mut still_alive = true;
+        for _ in 0..50 {
+            let exists = unsafe { libc::kill(child_pid, 0) } == 0;
+            #[cfg(target_os = "linux")]
+            let is_zombie = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, tail)| tail.starts_with('Z'))
+                })
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let is_zombie = false;
+            still_alive = exists && !is_zombie;
+            if !still_alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         if still_alive {
             unsafe {
                 libc::kill(child_pid, libc::SIGKILL);
