@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
@@ -1068,6 +1068,17 @@ pub fn derive_memory_budget(
     })
 }
 
+/// Resolve `vm_total_mb`: explicit `cfg.runner.vm_total_mb` override, else
+/// `daemon_capacity()` auto-detect (preserving pre-yz6b auto-detect
+/// behavior when the key is unset). Shared by `resolve_and_log_memory_budget`
+/// (Serve startup, fail-loud) and `preview_memory_budget` (`ezgha doctor`,
+/// read-only, never blocks).
+fn resolve_vm_total_mb(cfg: &Config) -> Option<u64> {
+    cfg.runner
+        .vm_total_mb
+        .or_else(|| daemon_capacity().map(|(_, mem)| mem))
+}
+
 /// Resolve `vm_total_mb` (explicit `cfg.runner.vm_total_mb` override, else
 /// `daemon_capacity()` auto-detect — preserving pre-yz6b auto-detect
 /// behavior when the key is unset), derive the fleet memory budget, and log
@@ -1079,20 +1090,14 @@ pub fn derive_memory_budget(
 /// Prevention Principle). Returns `Err` only for the deliberate fail-loud
 /// case inside `derive_memory_budget`.
 pub fn resolve_and_log_memory_budget(cfg: &Config) -> Result<Option<MemoryBudget>> {
-    let vm_total_mb = match cfg.runner.vm_total_mb {
-        Some(mb) => mb,
-        None => match daemon_capacity() {
-            Some((_, mem)) => mem,
-            None => {
-                eprintln!(
-                    "warning: cannot determine VM/daemon memory ceiling (runner.vm_total_mb \
-                     unset and the `docker info` capacity probe failed); skipping startup \
-                     memory budget check. Set runner.vm_total_mb explicitly (check `colima \
-                     status` / `limactl list`) to enable it."
-                );
-                return Ok(None);
-            }
-        },
+    let Some(vm_total_mb) = resolve_vm_total_mb(cfg) else {
+        eprintln!(
+            "warning: cannot determine VM/daemon memory ceiling (runner.vm_total_mb \
+             unset and the `docker info` capacity probe failed); skipping startup \
+             memory budget check. Set runner.vm_total_mb explicitly (check `colima \
+             status` / `limactl list`) to enable it."
+        );
+        return Ok(None);
     };
     let budget = derive_memory_budget(
         vm_total_mb,
@@ -1111,6 +1116,43 @@ pub fn resolve_and_log_memory_budget(cfg: &Config) -> Result<Option<MemoryBudget
         budget.runner_floor_mb,
     );
     Ok(Some(budget))
+}
+
+/// Read-only PREVIEW of the same derivation used at `Serve` startup. Never
+/// blocks, never prints via `bail!`/`Err` propagation, never restarts
+/// anything — for `ezgha doctor` so an operator can see whether the NEXT
+/// `ezgha serve` (re)start would trip the fail-loud guard, without actually
+/// triggering it. (Self-Outage Prevention Principle: discovering "restart
+/// would fail loud" via a live crash-loop is exactly the outage this
+/// preview exists to prevent — bead ez-gh-actions-yz6b round 2.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryBudgetPreview {
+    /// The configured fleet fits within the derived budget.
+    Pass(MemoryBudget),
+    /// The configured fleet would fail the startup fail-loud guard; the
+    /// String is the same detailed message `derive_memory_budget` would
+    /// bail! with (contains vm_total_mb/guest_reserve_mb/fleet_budget_mb/
+    /// runner_count/runner_floor_mb/required_mb/shortfall_mb).
+    Fail(String),
+    /// Could not determine `vm_total_mb` at all (no config override and
+    /// `docker info` capacity probe failed) — not a pass or fail verdict,
+    /// just "can't tell".
+    Unknown,
+}
+
+pub fn preview_memory_budget(cfg: &Config) -> MemoryBudgetPreview {
+    let Some(vm_total_mb) = resolve_vm_total_mb(cfg) else {
+        return MemoryBudgetPreview::Unknown;
+    };
+    match derive_memory_budget(
+        vm_total_mb,
+        cfg.runner.guest_reserve_mb,
+        cfg.runner.count,
+        cfg.runner.runner_floor_mb,
+    ) {
+        Ok(budget) => MemoryBudgetPreview::Pass(budget),
+        Err(err) => MemoryBudgetPreview::Fail(format!("{err:#}")),
+    }
 }
 
 /// Start one ephemeral JIT runner container in a slot the caller has already
@@ -1296,12 +1338,36 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
 static PEAK_RSS_MB: std::sync::Mutex<BTreeMap<String, u64>> =
     std::sync::Mutex::new(BTreeMap::new());
 
+/// Debounce window for `poll_peak_rss`: `ensure_count_outcome` calls
+/// `release_stale_slots` twice per serve tick (once before spawning new
+/// runners, once after, to release failed reservations from that cycle) —
+/// without this, the `docker stats` subprocess would fire twice per tick
+/// for no additional telemetry value. 5s is comfortably below the normal
+/// tick cadence (`serve_tick_seconds`, default 30, floor 5) so back-to-back
+/// same-tick calls collapse into one poll while genuinely separate ticks
+/// still poll fresh.
+const PEAK_RSS_POLL_DEBOUNCE: Duration = Duration::from_secs(5);
+
+static LAST_PEAK_RSS_POLL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
 /// Poll `docker stats --no-stream` for every currently-managed container
 /// and update the process-wide peak-RSS high-water mark. Best-effort: any
 /// failure (docker busy, transient error, unrecognized output format) is
 /// swallowed with a warning — RSS telemetry must never be able to block or
 /// break the reconciliation tick it rides along with.
 fn poll_peak_rss(containers: &[ManagedContainer]) {
+    // Debounce: collapse back-to-back calls within the same tick.
+    {
+        let mut last = LAST_PEAK_RSS_POLL.lock().unwrap();
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < PEAK_RSS_POLL_DEBOUNCE {
+                return;
+            }
+        }
+        *last = Some(now);
+    }
+
     if containers.is_empty() {
         return;
     }
@@ -1824,6 +1890,38 @@ mod tests {
             msg.contains("5085"),
             "missing shortfall (49152-44067): {msg}"
         );
+    }
+
+    #[test]
+    fn preview_memory_budget_pass_matches_derive_memory_budget_happy_path() {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.vm_total_mb = Some(48163);
+        cfg.runner.guest_reserve_mb = 4096;
+        cfg.runner.runner_floor_mb = 2048; // "bare survivable minimum" — see round-1 happy-path test
+        match preview_memory_budget(&cfg) {
+            MemoryBudgetPreview::Pass(budget) => {
+                assert_eq!(budget.fleet_budget_mb, 44067);
+                assert_eq!(budget.per_runner_budget_mb, 2754);
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_memory_budget_fail_matches_derive_memory_budget_fail_loud_path() {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.vm_total_mb = Some(48163);
+        cfg.runner.guest_reserve_mb = 4096;
+        cfg.runner.runner_floor_mb = 3072; // default — fails loud at count=16 (see round-1 test)
+        match preview_memory_budget(&cfg) {
+            MemoryBudgetPreview::Fail(msg) => {
+                assert!(
+                    msg.contains("shortfall_mb=5085"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
     }
 
     #[test]

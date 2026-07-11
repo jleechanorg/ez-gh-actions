@@ -719,6 +719,28 @@ fn main() -> Result<()> {
                     cfg.github.target,
                     cfg.runner.count
                 );
+                match docker_backend::preview_memory_budget(&cfg) {
+                    docker_backend::MemoryBudgetPreview::Pass(b) => println!(
+                        "memory budget check (preview): would PASS on next restart — \
+                         vm_total_mb={} guest_reserve_mb={} fleet_budget_mb={} runner_count={} \
+                         per_runner_budget_mb={} runner_floor_mb={}",
+                        b.vm_total_mb,
+                        b.guest_reserve_mb,
+                        b.fleet_budget_mb,
+                        b.runner_count,
+                        b.per_runner_budget_mb,
+                        b.runner_floor_mb,
+                    ),
+                    docker_backend::MemoryBudgetPreview::Fail(msg) => println!(
+                        "memory budget check (preview): would FAIL on next restart with current \
+                         config — {msg}"
+                    ),
+                    docker_backend::MemoryBudgetPreview::Unknown => println!(
+                        "memory budget check (preview): unknown — cannot determine VM/daemon \
+                         memory ceiling (set runner.vm_total_mb explicitly; check `colima status` \
+                         / `limactl list`)"
+                    ),
+                }
             } else {
                 println!("config: none — run `ezgha init --target owner/repo`");
             }
