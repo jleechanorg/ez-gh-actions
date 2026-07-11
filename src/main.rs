@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 mod alert;
 mod backend;
 mod canary;
@@ -251,7 +254,8 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
 const BACKEND_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 const BACKEND_RESTART_WINDOW: Duration = Duration::from_secs(600);
 const BACKEND_RESTART_MAX_ATTEMPTS: u32 = 3;
-const BACKEND_RESTART_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// A real Colima cold start exceeded the old 30s budget and left detached Lima children.
+const BACKEND_RESTART_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 struct BackendRecoveryState {
@@ -331,11 +335,15 @@ impl BackendRecoveryState {
 }
 
 fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<bool> {
-    let mut child = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to execute {cmd}"))?;
     let start = Instant::now();
@@ -347,6 +355,10 @@ fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration)
             return Ok(status.success());
         }
         if start.elapsed() >= timeout {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             bail!(
@@ -362,20 +374,40 @@ fn run_restart_command(cmd: &str, args: &[&str]) -> Result<bool> {
     run_restart_command_with_timeout(cmd, args, BACKEND_RESTART_COMMAND_TIMEOUT)
 }
 
-fn attempt_backend_restart() -> Result<bool> {
-    // Keep host bootstrap logic portable: prefer the project-local tooling (`colima`),
-    // then the underlying VM launcher (`limactl`), then systemd's native unit.
-    let attempts = [
-        ("colima", ["start"].as_ref()),
-        ("limactl", ["start", "colima"].as_ref()),
-        (
-            "systemctl",
-            ["--user", "start", "lima-vm@colima.service"].as_ref(),
-        ),
-    ];
-    for (cmd, args) in attempts {
-        match run_restart_command(cmd, args) {
-            Ok(true) => return Ok(true),
+type RestartCommand = (&'static str, &'static [&'static str]);
+
+const MACOS_BACKEND_RESTART_COMMANDS: &[RestartCommand] = &[("colima", &["start"])];
+const LINUX_BACKEND_RESTART_COMMANDS: &[RestartCommand] = &[
+    ("systemctl", &["--user", "start", "lima-vm@colima.service"]),
+    ("limactl", &["start", "colima"]),
+];
+
+fn backend_restart_commands(os: &str) -> &'static [RestartCommand] {
+    match os {
+        "macos" => MACOS_BACKEND_RESTART_COMMANDS,
+        "linux" => LINUX_BACKEND_RESTART_COMMANDS,
+        _ => &[],
+    }
+}
+
+fn attempt_backend_restart_with<R, H>(
+    commands: &[RestartCommand],
+    mut run: R,
+    mut backend_healthy: H,
+) -> Result<bool>
+where
+    R: FnMut(&str, &[&str]) -> Result<bool>,
+    H: FnMut() -> bool,
+{
+    for (cmd, args) in commands {
+        match run(cmd, args) {
+            Ok(true) => {
+                if backend_healthy() {
+                    return Ok(true);
+                }
+                eprintln!("{cmd} restart command returned success but Docker is still unreachable");
+                return Ok(false);
+            }
             Ok(false) => {
                 eprintln!("{cmd} exists but restart returned non-zero ({:?})", args);
             }
@@ -390,6 +422,15 @@ fn attempt_backend_restart() -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn attempt_backend_restart() -> Result<bool> {
+    let platform = platform::detect();
+    attempt_backend_restart_with(
+        backend_restart_commands(platform.os),
+        run_restart_command,
+        docker_reachable,
+    )
 }
 
 fn backend_restart_can_help(selection: &Selection) -> bool {
@@ -1200,6 +1241,51 @@ mod tests {
     }
 
     #[test]
+    fn macos_restart_uses_only_colima_profile_command() {
+        let commands = backend_restart_commands("macos");
+        let names: Vec<_> = commands.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["colima"]);
+    }
+
+    #[test]
+    fn linux_restart_never_invokes_colima_profile_command() {
+        let commands = backend_restart_commands("linux");
+        assert!(commands.iter().all(|(name, _)| *name != "colima"));
+        assert!(commands.iter().any(|(name, _)| *name == "systemctl"));
+    }
+
+    #[test]
+    fn restart_command_success_is_not_backend_recovery_without_docker() {
+        let commands: &[RestartCommand] =
+            &[("colima", &["start"]), ("limactl", &["start", "colima"])];
+        let mut attempts = 0;
+        let recovered = attempt_backend_restart_with(
+            commands,
+            |_, _| {
+                attempts += 1;
+                Ok(true)
+            },
+            || false,
+        )
+        .unwrap();
+
+        assert!(!recovered);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn restart_reports_recovery_only_after_docker_is_reachable() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let recovered = attempt_backend_restart_with(commands, |_, _| Ok(true), || true).unwrap();
+        assert!(recovered);
+    }
+
+    #[test]
+    fn backend_restart_timeout_allows_cold_colima_startup() {
+        assert!(BACKEND_RESTART_COMMAND_TIMEOUT >= Duration::from_secs(120));
+    }
+
+    #[test]
     fn restart_command_reports_success() {
         assert!(run_restart_command_with_timeout(
             "/bin/sh",
@@ -1247,6 +1333,48 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "timeout should fire promptly, took {:?}",
             start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_command_timeout_kills_descendants() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "ezgha-restart-descendant-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "/bin/sleep 10 & child=$!; echo $child > {}; wait $child",
+            pid_path.display()
+        );
+
+        let err = run_restart_command_with_timeout(
+            "/bin/sh",
+            &["-c", &script],
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+
+        let child_pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pid_path);
+        let still_alive = unsafe { libc::kill(child_pid, 0) } == 0;
+        if still_alive {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !still_alive,
+            "timed-out restart left child pid {child_pid} alive"
         );
     }
 
