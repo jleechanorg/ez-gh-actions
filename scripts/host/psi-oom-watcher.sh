@@ -147,7 +147,17 @@ DRY_RUN="${DRY_RUN:-0}"
 # (qemu/colima/lima), and GUI terminal emulators (see "SECOND EXCLUSION"
 # comment above — warp-terminal was the real second-largest-RSS process
 # found on jeff-ubuntu during adversarial verification).
-EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher\.sh|ezgha|qemu-system-x86|colima|lima|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
+#
+# NOTE (fixed 2026-07-10, third adversarial re-verification pass): this
+# list previously included the literal string "psi-oom-watcher\.sh", which
+# can NEVER match -- when this script runs as a directly-executed
+# shebang'd file (`./psi-oom-watcher.sh`), the kernel's comm field
+# truncates at 15 bytes, dropping the ".sh" suffix entirely (comm is
+# "psi-oom-watcher", exactly 15 chars). This was harmless in practice
+# (self-exclusion is already guaranteed by the PID/PPID checks above,
+# independent of this pattern) but was documentation-misleading. Fixed to
+# the actual truncated value so the intent and the mechanism agree.
+EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher|ezgha|qemu-system-x86|colima|lima|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
 # args-based exclusions (defense in depth for the comm-truncation case
 # above, and to catch any Colima/Lima helper process whose comm doesn't
 # start with one of the names above but whose full command line does).
@@ -256,9 +266,16 @@ fi
 target_rss_mb=$((target_rss / 1024))
 
 if [ "${DRY_RUN}" = "1" ]; then
-  log "DRY_RUN: would send SIGTERM to pid=${target_pid} comm=${target_comm} rss=${target_rss_mb}MB (full avg10=${full_avg10}%, streak=${streak})"
-  echo "${now_epoch}" > "${COOLDOWN_MARKER}"
-  rm -f "${STREAK_FILE}"
+  # BUG FIXED (2026-07-10, third adversarial re-verification pass): this
+  # branch previously wrote COOLDOWN_MARKER and cleared STREAK_FILE exactly
+  # like a real SIGTERM action, even though nothing was sent. That meant a
+  # human running a DRY_RUN rehearsal during an actual incident would
+  # silently arm the 10-minute cooldown and suppress REAL protection for
+  # the rest of that window -- disabling the safety mechanism precisely
+  # when it's needed most. DRY_RUN is now purely observational: it logs
+  # what it would do and touches NO cooldown/streak state at all, so a
+  # rehearsal can never suppress a real intervention.
+  log "DRY_RUN: would send SIGTERM to pid=${target_pid} comm=${target_comm} rss=${target_rss_mb}MB (full avg10=${full_avg10}%, streak=${streak}) -- DRY_RUN does not touch cooldown/streak state; real protection remains fully armed after this rehearsal"
   exit 0
 fi
 

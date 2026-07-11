@@ -18,6 +18,62 @@ enabled** until this OOM layer is verified working in production —
 thin-provisioning brownout risk on zram makes it strictly worse than a
 plain swapfile if memory pressure isn't already being caught upstream.
 
+## Installing the user-scope pieces (agents.slice + psi-oom-watcher)
+
+Added 2026-07-10 (third adversarial re-verification pass) — the unit
+comments for `systemd/psi-oom-watcher.service` referenced "the README note
+on this unit pair for install steps," but no such note existed anywhere
+in this repo, and `install.sh`'s existing copy loops only sweep
+`ezgha-*.service`/`ezgha-*.timer` (this bead's units are deliberately NOT
+prefixed `ezgha-`, to keep them out of that auto-enabling loop — see the
+comments in `systemd/agents.slice`). Concretely, that meant there was no
+documented way to actually install the automatic caller — weakening the
+"has an automatic caller" claim, since nothing installed the caller
+either. This section is that missing documentation.
+
+**None of the commands below require sudo.** They install unit files and
+reload the user systemd manager's config — they do NOT `enable --now`
+anything (that activation step is deliberately left for the human
+operator to run separately, once ready):
+
+```bash
+# From this repo's checkout (adjust the path if running from elsewhere):
+REPO_ROOT="$(pwd)"   # or wherever your ez-gh-actions checkout is
+
+# 1. agents.slice -- no placeholders to substitute, copy as-is.
+mkdir -p ~/.config/systemd/user
+cp "${REPO_ROOT}/systemd/agents.slice" ~/.config/systemd/user/
+
+# 2. psi-oom-watcher.service + .timer -- the .service has @SCRIPTS_DIR@ /
+#    @HOME@ placeholders (same convention as the ezgha-* aux units, see
+#    install.sh's own substitution step) that must be substituted before
+#    systemd will accept the unit. SCRIPTS_DIR here is the same stable
+#    libexec path install.sh already uses for the ezgha-* units, so the
+#    watcher script needs to be copied there too:
+mkdir -p ~/.local/libexec/ezgha
+install -m 0755 "${REPO_ROOT}/scripts/host/psi-oom-watcher.sh" ~/.local/libexec/ezgha/
+sed -e "s|@SCRIPTS_DIR@|${HOME}/.local/libexec/ezgha|g" \
+    -e "s|@HOME@|${HOME}|g" \
+    "${REPO_ROOT}/systemd/psi-oom-watcher.service" > ~/.config/systemd/user/psi-oom-watcher.service
+cp "${REPO_ROOT}/systemd/psi-oom-watcher.timer" ~/.config/systemd/user/
+
+# 3. Load the new unit definitions (does NOT start/enable anything):
+systemctl --user daemon-reload
+
+# 4. Sanity-check what got installed, still without activating anything:
+systemctl --user cat agents.slice
+systemctl --user cat psi-oom-watcher.service
+systemctl --user cat psi-oom-watcher.timer
+
+# 5. ACTIVATION -- deliberately a separate, explicit step. This is where
+#    a human operator decides to actually turn the watcher on:
+#      systemctl --user enable --now psi-oom-watcher.timer
+#    agents.slice does not need (and cannot usefully be) "enabled" --
+#    it activates automatically the first time a process is launched into
+#    it via scripts/host/agent-cli-scoped.sh (see that script's own
+#    comments for usage).
+```
+
 ## Finding: systemd-oomd is already installed and running
 
 Checked live on jeff-ubuntu 2026-07-10 (read-only, no changes made):
@@ -62,14 +118,16 @@ preference may vary):
   adversarial re-verification of an earlier draft of this doc that did
   tighten it). Swap-triggered protection for the Colima VM is **only**
   available via Option B.
-- **Option B: install earlyoom.** Required if you want protection against
-  the swap-usage kill path specifically — earlyoom excludes by process
-  name/args (`--avoid`) regardless of cgroup ownership, so it isn't
-  subject to systemd-oomd's root-owned-only restriction on the swap path
-  (see finding below). earlyoom is NOT currently installed (`apt-cache
-  policy earlyoom` shows `Installed: (none)`, `Candidate: 1.7-2`) — this
-  requires `apt-get install`, hence sudo, hence this document rather than
-  something the agent could do unprivileged.
+- **Option B: install earlyoom.** The best available protection against
+  the swap-usage kill path specifically — earlyoom's victim selection
+  isn't a systemd-oomd cgroup xattr, so it isn't subject to the
+  root-owned-only restriction on that path (see finding below). **Read
+  the "earlyoom `--avoid` scope boundary" finding below before assuming
+  this is a hard guarantee — it is a strong soft preference, not an
+  exclusion.** earlyoom is NOT currently installed (`apt-cache policy
+  earlyoom` shows `Installed: (none)`, `Candidate: 1.7-2`) — this requires
+  `apt-get install`, hence sudo, hence this document rather than something
+  the agent could do unprivileged.
 
 Do NOT enable zram until whichever option you pick has been observed
 actually intervening (or confirmed absent-intervention because pressure
@@ -165,9 +223,64 @@ is — not tightened, not otherwise touched, so this doc does not newly
 introduce or worsen the pre-existing swap-path exposure. The 2026-07-10
 incident that motivated this whole bead was specifically a swap-exhaustion
 event, so if swap-path protection for the Colima VM matters to you,
-**Option A does not provide it — install Option B (earlyoom)**, whose
-`--avoid` process-name/args matching is not subject to this cgroup-
-ownership restriction at all.
+**Option A does not provide it — install Option B (earlyoom)** — but read
+the next finding before assuming Option B is a hard guarantee either.
+
+## Finding: earlyoom's `--avoid` is a soft preference, not a hard exclusion — and the exact pattern below was previously broken by comm truncation
+
+Found during a third adversarial re-verification pass (2026-07-10). Two
+separate, independently-verified problems in an earlier draft of this
+doc's Option B config:
+
+**1. The regex pattern would never have matched the Colima VM at all.**
+The earlier draft used `--avoid '(^|/)(ezgha|qemu-system-x86_64|systemd)$'`.
+Live on this host, the qemu process's kernel `comm` field (what `--avoid`
+actually matches against — confirmed via earlyoom's own README: "The
+regex is matched against the basename of the process as shown in
+`/proc/PID/comm`") is `qemu-system-x86` — the kernel truncates `comm` at
+15 bytes, and `qemu-system-x86_64` is 18 bytes, so the trailing `_64` is
+silently dropped. The pattern's `$` anchor requires that exact trailing
+`_64`, so it could never match the truncated value actually present.
+Fixed below: the pattern now uses `qemu-system-x86` (the real, truncated,
+observed value) instead of the full untruncated binary name.
+
+**2. `--avoid` is NOT a hard exclusion, and there is no `--ignore` flag in
+the actual installable package.** Verified by downloading and inspecting
+the real `.deb` this doc's `apt-get install` command installs
+(`apt-get download earlyoom` → extracted `earlyoom_1.7-2_amd64.deb`,
+read `usr/bin/earlyoom --help`, `usr/share/man/man1/earlyoom.1.gz`, and
+`usr/share/doc/earlyoom/README.md.gz` directly — not guessed, not taken
+on faith from any other source). The manpage's own wording:
+`--avoid REGEX` — *"avoid killing processes matching REGEX (subtracts 300
+from oom_score)"*. That is a soft priority adjustment, not an exclusion —
+earlyoom's own README explicitly frames `--avoid`/`--prefer` as a pair of
+symmetric nudges, not an allow/deny mechanism. **Version 1.7-2 (the exact
+apt-cache candidate on this host, confirmed earlier in this doc) has NO
+`--ignore` flag, no equivalent hard-exclusion flag, and no `--ignore` in
+its `--help` output, man page, or README at all** — the only relevant
+flags that exist are `--avoid` and `--prefer` (both soft, both act via
+oom_score adjustment: -300 / an unspecified positive bump respectively).
+An `-i` flag DOES exist in this version, but it means something entirely
+different (per the changelog: "optionally (-i option) ignore any positive
+adjustments set in `/proc/*/oom_score_adj`" — a global toggle for whether
+earlyoom respects the kernel's own oom_score_adj values, unrelated to
+per-process exclusion by name).
+
+**Consequence: even with the truncation fixed below, `--avoid` on its own
+is a preference, not a guarantee** — under a severe-enough swap-exhaustion
+event, earlyoom could theoretically still select a `--avoid`-listed
+process if every other candidate's adjusted score is somehow still higher
+(unlikely for a 33GB process, but not impossible by construction). **The
+genuinely strong, verified protection is `OOMScoreAdjust=-1000`**, now set
+on `ezgha.service` itself in `systemd/ezgha.service.d/10-oomd-omit.conf`
+(see that file's own comments for the full explanation) — a kernel-level
+per-process value, inherited by the qemu/limactl descendants, respected by
+BOTH the raw kernel OOM killer AND earlyoom's default (non-`-i`) victim
+selection, confirmed via `man systemd.exec`: *"-1000 (to disable OOM
+killing of processes of this unit)"*. This directive requires no sudo (a
+`--user` unit override) and was added specifically to close the gap that
+`--avoid` alone cannot close. The fixed `--avoid` pattern below is kept as
+defense-in-depth on top of it, not as the primary mechanism.
 
 ---
 
@@ -175,27 +288,54 @@ ownership restriction at all.
 
 ### Option A — tune systemd-oomd's memory-PRESSURE path only (does not cover the swap-usage path — see finding above)
 
+**SAFETY: this is deliberately split into TWO separate code blocks with an
+explicit stop between them.** Copy-pasting a single continuous fence that
+spans both "install the exemption" and "tighten the threshold" creates a
+real hazard: nothing stops a human from pasting the whole thing at once,
+which would tighten systemd-oomd's pressure threshold BEFORE the
+exemption is actually live on `ezgha.service`'s cgroup (the omit xattr
+only attaches on the unit's NEXT restart, not immediately on
+`daemon-reload`) — briefly exposing the Colima VM during exactly the
+window this doc exists to close. Run block 1, wait for its `read -p` gate
+to confirm the exemption is live, THEN run block 2. Do not run block 2
+until block 1's gate is satisfied.
+
+**Block 1 — install the exemption (no sudo) + confirm it's live:**
+
 ```bash
-# 0. REQUIRED FIRST (no sudo needed): install the per-unit exemption so
-#    ezgha.service (and the Colima VM living inside its cgroup, see
-#    finding above) is never a memory-PRESSURE systemd-oomd kill
-#    candidate, regardless of how tight step 2 below makes the ancestor
-#    slice's pressure threshold. This does NOT protect against the
-#    swap-usage kill path (architectural limitation, see finding above) --
-#    that's precisely why step 1 below deliberately does not touch
-#    SwapUsedLimit at all.
+# REQUIRED FIRST (no sudo needed): install the per-unit exemption so
+# ezgha.service (and the Colima VM living inside its cgroup, see finding
+# above) is never a memory-PRESSURE systemd-oomd kill candidate,
+# regardless of how tight block 2 below makes the ancestor slice's
+# pressure threshold. This does NOT protect against the swap-usage kill
+# path (architectural limitation, see finding above) -- that's precisely
+# why block 2 deliberately does not touch SwapUsedLimit at all.
 mkdir -p ~/.config/systemd/user/ezgha.service.d
 cp systemd/ezgha.service.d/10-oomd-omit.conf ~/.config/systemd/user/ezgha.service.d/
 systemctl --user daemon-reload
-# The omit xattr only attaches when the unit's cgroup is (re)created, so
-# this exemption does not take effect until the NEXT ezgha.service
-# restart. This is a live-daemon restart -- do not run it here; hand off
-# to the deploy-owner alongside whatever restart they're already doing
-# for other reasons, or schedule one deliberately. Until that restart
-# happens, do NOT proceed with step 2 below (it would leave the VM
-# exposed in the gap between "pressure threshold tightened" and
-# "exemption live").
 
+# The omit xattr (and the OOMScoreAdjust value in the same drop-in) only
+# attach when the unit's cgroup is (re)created -- i.e. on ezgha.service's
+# NEXT restart, not on this daemon-reload. This is a live-daemon restart --
+# do not run it as part of this rehearsal; hand off to the deploy-owner
+# alongside whatever restart they're already doing for other reasons, or
+# schedule one deliberately, per repo CLAUDE.md single-writer rule.
+#
+# GATE: do not proceed to Block 2 until this restart has happened AND the
+# line below confirms it. This blocks accidental copy-paste-everything:
+read -p "Press Enter ONLY after confirming 'systemctl --user show -p ManagedOOMPreference ezgha.service' prints ManagedOOMPreference=omit (i.e. ezgha.service has been restarted since this drop-in was installed): "
+systemctl --user show -p ManagedOOMPreference,OOMScoreAdjust ezgha.service
+# Expected output:
+#   ManagedOOMPreference=omit
+#   OOMScoreAdjust=-1000
+# If it does NOT show these values, ezgha.service has not yet been
+# restarted since this drop-in was installed -- STOP, do not run Block 2,
+# arrange the restart first.
+```
+
+**Block 2 — tighten the threshold (sudo required), only after Block 1's gate is confirmed:**
+
+```bash
 # 1. Create a drop-in tightening ONLY the memory-pressure threshold.
 #    Numbers chosen to fire meaningfully before the host watchdog's
 #    max-load-1 territory (this host's /etc/watchdog.conf currently reads
@@ -233,8 +373,8 @@ ManagedOOMMemoryPressure=kill
 ManagedOOMMemoryPressureLimit=30%
 EOF
 
-# 3. Apply (order matters: only do this AFTER step 0's exemption is
-#    already live via an ezgha.service restart -- see step 0's note).
+# 3. Apply (order matters: only do this AFTER Block 1's gate confirmed the
+#    exemption is already live via an ezgha.service restart).
 sudo systemctl daemon-reload
 sudo systemctl restart systemd-oomd
 
@@ -248,26 +388,42 @@ systemctl show -p ManagedOOMSwap user-1000.slice              # expect: auto (un
 
 ### Option B — install earlyoom (alternative/supplemental)
 
+**Prerequisite (do this first, no sudo needed): install the
+`OOMScoreAdjust=-1000` protection** described in the "earlyoom `--avoid`
+scope boundary" finding above (same Block 1 as Option A — if you already
+ran Option A's Block 1, this is already done; if you're doing Option B
+standalone, run Option A's Block 1 first). This is the mechanism that
+actually protects Colima under earlyoom's default victim selection — the
+`--avoid` regex below is defense-in-depth on top of it, not the primary
+protection.
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y earlyoom
 
 # Tune via /etc/default/earlyoom (Debian/Ubuntu packaging convention).
 # -m / -s here are PERCENT-FREE thresholds (not PSI directly -- earlyoom's
-# PSI-aware mode is enabled by default when the kernel supports it via
-# --avoid/--prefer flags for target selection, but its core trigger is
-# available-memory + swap-free percentage, tuned here to fire earlier than
-# the historical incident's near-100% swap saturation):
+# core trigger is available-memory + swap-free percentage, tuned here to
+# fire earlier than the historical incident's near-100% swap saturation).
 sudo tee /etc/default/earlyoom > /dev/null <<'EOF'
 # -m <percent>  : trigger when available memory falls below this percent
 # -s <percent>  : trigger when available swap falls below this percent
 # -r <seconds>  : report memory status at this interval (0 = only on kill)
-# --avoid       : regex of processes to NEVER kill (protects the ezgha
-#                 daemon and the Colima/qemu VM process explicitly -- see
-#                 the equivalent exclusion added to this repo's user-scope
-#                 psi-oom-watcher.sh fallback after a live dry-run showed
-#                 it would otherwise target the Colima VM's qemu process)
-EARLYOOM_ARGS="-m 15 -s 20 -r 60 --avoid '(^|/)(ezgha|qemu-system-x86_64|systemd)$'"
+# --avoid       : SOFT preference only (subtracts 300 from oom_score per
+#                 `man earlyoom` on the exact 1.7-2 package this apt-get
+#                 installs -- verified by extracting the real .deb, not
+#                 guessed). This is NOT a guaranteed exclusion; the real
+#                 protection for the Colima VM is the OOMScoreAdjust=-1000
+#                 drop-in on ezgha.service (see the "earlyoom --avoid
+#                 scope boundary" finding above and the prerequisite note
+#                 immediately above this code block) -- this --avoid regex
+#                 is defense-in-depth on top of that, not a substitute for
+#                 it. Pattern uses "qemu-system-x86" (NOT the untruncated
+#                 "qemu-system-x86_64") because earlyoom matches against
+#                 the kernel's comm field, which truncates at 15 bytes --
+#                 confirmed live on this host: `cat /proc/<qemu-pid>/comm`
+#                 returns "qemu-system-x86", dropping the trailing "_64".
+EARLYOOM_ARGS="-m 15 -s 20 -r 60 --avoid '(^|/)(ezgha|qemu-system-x86|systemd)$'"
 EOF
 
 sudo systemctl enable --now earlyoom

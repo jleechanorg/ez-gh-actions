@@ -44,24 +44,59 @@ ok() {
 HAVE_SYSTEMD_ANALYZE=0
 command -v systemd-analyze >/dev/null 2>&1 && HAVE_SYSTEMD_ANALYZE=1
 
+# Portability fix (fourth adversarial re-verification pass, 2026-07-10):
+# the original version of this test only fell back to a structural
+# (grep-based) check when systemd-analyze was ENTIRELY MISSING from PATH.
+# But `systemd-analyze verify --user` can also fail for purely
+# environmental reasons -- e.g. no live user D-Bus/systemd session, common
+# in containers/CI -- with errors like "Failed to connect to bus" or
+# "Failed to lookup RuntimeDirectory path", which is NOT a unit-file
+# defect. The original test treated that the same as a genuine syntax
+# error and hard-failed, even though a structural fallback path already
+# existed for the "binary missing" case. looks_like_infra_failure()
+# distinguishes the two so this test stays portable without papering over
+# real syntax errors.
+looks_like_infra_failure() {
+  grep -qiE 'failed to (connect to bus|lookup .*runtimedirectory|create bus connection|get (d-)?bus connection)|no such file or directory.*(bus|runtime)|system has not been booted with systemd|failed to create.*d-bus|could not connect to bus' "$1"
+}
+
+# verify_unit LABEL UNIT_PATH FALLBACK_FN
+# Tries `systemd-analyze verify --user` first (if the binary exists). On a
+# genuine failure it hard-fails via fail(). On an infra/environment
+# failure, OR when systemd-analyze isn't installed at all, it calls
+# FALLBACK_FN (a shell function name) to run a structural grep-based check
+# instead.
+verify_unit() {
+  local label="$1" unit_path="$2" fallback_fn="$3"
+  local logfile="${WORK}/verify-log-${RANDOM}-${RANDOM}"
+  if [ "${HAVE_SYSTEMD_ANALYZE}" -eq 1 ]; then
+    if systemd-analyze verify --user "${unit_path}" >"${logfile}" 2>&1; then
+      ok "${label} passes systemd-analyze verify --user"
+      return 0
+    fi
+    if looks_like_infra_failure "${logfile}"; then
+      echo "INFO: ${label}: systemd-analyze verify --user failed due to environment (no live user systemd session -- expected in containers/CI), falling back to structural check" >&2
+    else
+      fail "${label} failed systemd-analyze verify --user: $(cat "${logfile}")"
+      return 1
+    fi
+  fi
+  "${fallback_fn}"
+}
+
 # ── 1. agents.slice syntax ──────────────────────────────────────────────────
 SLICE="${REPO_ROOT}/systemd/agents.slice"
 if [ ! -f "${SLICE}" ]; then
   fail "systemd/agents.slice does not exist"
 else
-  if [ "${HAVE_SYSTEMD_ANALYZE}" -eq 1 ]; then
-    if systemd-analyze verify --user "${SLICE}" >"${WORK}/slice-verify.log" 2>&1; then
-      ok "systemd/agents.slice passes systemd-analyze verify --user"
-    else
-      fail "systemd/agents.slice failed systemd-analyze verify --user: $(cat "${WORK}/slice-verify.log")"
-    fi
-  else
+  slice_structural_check() {
     if grep -q '^\[Slice\]' "${SLICE}" && grep -q '^MemoryHigh=' "${SLICE}"; then
-      ok "systemd/agents.slice structural check (systemd-analyze unavailable): has [Slice] + MemoryHigh="
+      ok "systemd/agents.slice structural check: has [Slice] + MemoryHigh="
     else
       fail "systemd/agents.slice missing [Slice] section or MemoryHigh= directive"
     fi
-  fi
+  }
+  verify_unit "systemd/agents.slice" "${SLICE}" slice_structural_check
   if ! grep -q '^MemoryHigh=20G$' "${SLICE}"; then
     fail "systemd/agents.slice MemoryHigh is not the documented 20G value (blast-radius comment would be stale)"
   else
@@ -145,6 +180,21 @@ EOF
   else
     fail "watcher never reached the DRY_RUN action line across 2 consecutive CRIT polls -- expected 'would send SIGTERM' in ${WATCHER_LOG}"
   fi
+
+  # DRY_RUN state-poisoning regression guard (third adversarial
+  # re-verification pass, 2026-07-10): a DRY_RUN rehearsal must NEVER write
+  # the cooldown marker -- doing so would silently disable REAL protection
+  # for the full 10-minute cooldown window right when a human is most
+  # likely to be running a rehearsal (during an actual incident). The two
+  # DRY_RUN polls above already crossed CRIT_CONSECUTIVE and hit the
+  # action-log line, so if the bug were present, COOLDOWN_MARKER would
+  # exist by now.
+  COOLDOWN_MARKER_PATH="${STATE_DIR}/psi-oom-watcher.last-action"
+  if [ -f "${COOLDOWN_MARKER_PATH}" ]; then
+    fail "REGRESSION: DRY_RUN wrote the cooldown marker (${COOLDOWN_MARKER_PATH}) -- a rehearsal during a real incident would silently suppress the watcher's real SIGTERM protection for the full cooldown window"
+  else
+    ok "DRY_RUN correctly did not write the cooldown marker -- real protection stays fully armed after a rehearsal"
+  fi
 fi
 
 # ── 2b. ezgha.service.d/10-oomd-omit.conf -- exists, correct directive,
@@ -161,28 +211,29 @@ else
     fail "systemd/ezgha.service.d/10-oomd-omit.conf is missing 'ManagedOOMPreference=omit'"
   fi
 
-  if [ "${HAVE_SYSTEMD_ANALYZE}" -eq 1 ]; then
-    PAIR_DIR="${WORK}/oomd-omit-pair"
-    mkdir -p "${PAIR_DIR}/ezgha.service.d"
-    cat > "${PAIR_DIR}/ezgha.service" <<'EOF'
+  if grep -q '^OOMScoreAdjust=-1000$' "${OOMD_OMIT}"; then
+    ok "systemd/ezgha.service.d/10-oomd-omit.conf sets OOMScoreAdjust=-1000 (kernel-level protection, covers the swap-path gap ManagedOOMPreference=omit cannot)"
+  else
+    fail "systemd/ezgha.service.d/10-oomd-omit.conf is missing 'OOMScoreAdjust=-1000' -- REGRESSION: this is the mechanism that protects Colima from earlyoom's default victim selection and the raw kernel OOM killer, verified via man systemd.exec ('-1000: to disable OOM killing of processes of this unit')"
+  fi
+
+  PAIR_DIR="${WORK}/oomd-omit-pair"
+  mkdir -p "${PAIR_DIR}/ezgha.service.d"
+  cat > "${PAIR_DIR}/ezgha.service" <<'EOF'
 [Unit]
 Description=stub ezgha (test fixture, not the real unit)
 [Service]
 ExecStart=/bin/true
 EOF
-    cp "${OOMD_OMIT}" "${PAIR_DIR}/ezgha.service.d/"
-    if systemd-analyze verify --user "${PAIR_DIR}/ezgha.service" >"${WORK}/oomd-omit-verify.log" 2>&1; then
-      ok "systemd/ezgha.service.d/10-oomd-omit.conf passes systemd-analyze verify --user (paired with stub base unit)"
-    else
-      fail "systemd/ezgha.service.d/10-oomd-omit.conf failed systemd-analyze verify --user: $(cat "${WORK}/oomd-omit-verify.log")"
-    fi
-  else
+  cp "${OOMD_OMIT}" "${PAIR_DIR}/ezgha.service.d/"
+  oomd_omit_structural_check() {
     if grep -q '^\[Service\]' "${OOMD_OMIT}"; then
-      ok "systemd/ezgha.service.d/10-oomd-omit.conf structural check (systemd-analyze unavailable): has [Service] section"
+      ok "systemd/ezgha.service.d/10-oomd-omit.conf structural check: has [Service] section"
     else
       fail "systemd/ezgha.service.d/10-oomd-omit.conf missing [Service] section"
     fi
-  fi
+  }
+  verify_unit "systemd/ezgha.service.d/10-oomd-omit.conf (paired with stub base unit)" "${PAIR_DIR}/ezgha.service" oomd_omit_structural_check
 
   # Swap-path scope-boundary regression guard (second adversarial
   # re-verification pass, 2026-07-10): per `man systemd.resource-control`,
@@ -224,6 +275,49 @@ else
   else
     ok "docs/host-ops-sudo-block-0725.md Option A's command block does not set ManagedOOMSwap/SwapUsedLimit (swap-path scope boundary respected in the actual copy-pasteable commands)"
   fi
+
+  # ── 2d. earlyoom (Option B) regression guards, third adversarial
+  #        re-verification pass, 2026-07-10 ──────────────────────────────
+  # Extract Option B's EARLYOOM_ARGS heredoc body specifically (same
+  # technique as Option A above): between "### Option B" and the next
+  # "### " heading (or EOF-of-doc), only the <<'EOF' ... EOF heredoc body.
+  awk '/^### Option B/{flag=1} /^---/{flag=0} flag' "${SUDO_DOC}" \
+    | awk '/<<.EOF./{heredoc=1; next} /^EOF$/{heredoc=0; next} heredoc' \
+    > "${WORK}/option-b-heredoc-bodies.txt"
+
+  # (a) Truncation bug: earlyoom matches against the kernel's comm field,
+  # which truncates at 15 bytes -- "qemu-system-x86_64" (18 bytes) can
+  # never appear in a live comm value, only the truncated "qemu-system-x86"
+  # (15 bytes) can. Check the ACTUAL EARLYOOM_ARGS= directive line
+  # specifically (not the whole heredoc body, which also legitimately
+  # contains explanatory '#' comment lines that mention the untruncated
+  # form for documentation purposes -- those are fine, only the live
+  # directive matters for whether the regex actually works).
+  earlyoom_args_line="$(grep '^EARLYOOM_ARGS=' "${WORK}/option-b-heredoc-bodies.txt" || true)"
+  if [ -z "${earlyoom_args_line}" ]; then
+    fail "docs/host-ops-sudo-block-0725.md Option B's heredoc body has no EARLYOOM_ARGS= line -- expected the earlyoom config directive to be present"
+  elif printf '%s' "${earlyoom_args_line}" | grep -qF 'qemu-system-x86_64'; then
+    fail "docs/host-ops-sudo-block-0725.md Option B's EARLYOOM_ARGS= directive still contains the untruncated 'qemu-system-x86_64' -- REGRESSION: earlyoom matches against the kernel comm field (15-byte truncated), so this pattern can never match the live qemu process and provides zero protection. Line: ${earlyoom_args_line}"
+  elif printf '%s' "${earlyoom_args_line}" | grep -qF 'qemu-system-x86'; then
+    ok "docs/host-ops-sudo-block-0725.md Option B's EARLYOOM_ARGS= directive uses the correctly-truncated 'qemu-system-x86' (not the untruncated _64 form)"
+  else
+    fail "docs/host-ops-sudo-block-0725.md Option B's EARLYOOM_ARGS= directive does not reference qemu-system-x86 at all -- expected the truncated pattern to be present. Line: ${earlyoom_args_line}"
+  fi
+
+  # (b) Semantics: --avoid must not be described as a hard/guaranteed
+  # exclusion anywhere in the doc (verified against the real earlyoom
+  # 1.7-2 man page: it's a soft -300 oom_score adjustment, and there is no
+  # --ignore hard-exclusion flag in that version at all).
+  if grep -qi 'NEVER kill' "${SUDO_DOC}"; then
+    fail "docs/host-ops-sudo-block-0725.md still describes --avoid (or similar) as a mechanism that will 'NEVER kill' a process -- REGRESSION: verified against the real earlyoom 1.7-2 man page, --avoid is a soft -300 oom_score preference, not a guarantee; this phrasing overclaims protection that doesn't exist"
+  else
+    ok "docs/host-ops-sudo-block-0725.md does not overclaim --avoid as a hard exclusion ('NEVER kill' phrasing absent)"
+  fi
+  if grep -q 'subtracts 300 from oom_score\|SOFT preference' "${SUDO_DOC}"; then
+    ok "docs/host-ops-sudo-block-0725.md accurately describes --avoid as a soft oom_score preference"
+  else
+    fail "docs/host-ops-sudo-block-0725.md is missing the accurate soft-preference description of --avoid (subtracts 300 from oom_score, per the real earlyoom 1.7-2 man page)"
+  fi
 fi
 
 # ── 3. agent-cli-scoped.sh syntax ───────────────────────────────────────────
@@ -261,19 +355,14 @@ else
     ok "systemd/psi-oom-watcher.service has no unsubstituted placeholders after rendering"
   fi
 
-  if [ "${HAVE_SYSTEMD_ANALYZE}" -eq 1 ]; then
-    if systemd-analyze verify --user "${RENDERED_SERVICE}" >"${WORK}/service-verify.log" 2>&1; then
-      ok "systemd/psi-oom-watcher.service passes systemd-analyze verify --user (rendered)"
-    else
-      fail "systemd/psi-oom-watcher.service failed systemd-analyze verify --user (rendered): $(cat "${WORK}/service-verify.log")"
-    fi
-  else
+  service_structural_check() {
     if grep -q '^\[Service\]' "${RENDERED_SERVICE}" && grep -q '^ExecStart=' "${RENDERED_SERVICE}"; then
-      ok "systemd/psi-oom-watcher.service structural check (systemd-analyze unavailable): has [Service] + ExecStart="
+      ok "systemd/psi-oom-watcher.service structural check: has [Service] + ExecStart="
     else
       fail "systemd/psi-oom-watcher.service missing [Service] section or ExecStart= directive"
     fi
-  fi
+  }
+  verify_unit "systemd/psi-oom-watcher.service (rendered)" "${RENDERED_SERVICE}" service_structural_check
 fi
 
 # ── 5. psi-oom-watcher.timer syntax + Unit= reference correctness ──────────
@@ -281,19 +370,14 @@ TIMER="${REPO_ROOT}/systemd/psi-oom-watcher.timer"
 if [ ! -f "${TIMER}" ]; then
   fail "systemd/psi-oom-watcher.timer does not exist"
 else
-  if [ "${HAVE_SYSTEMD_ANALYZE}" -eq 1 ]; then
-    if systemd-analyze verify --user "${TIMER}" >"${WORK}/timer-verify.log" 2>&1; then
-      ok "systemd/psi-oom-watcher.timer passes systemd-analyze verify --user"
-    else
-      fail "systemd/psi-oom-watcher.timer failed systemd-analyze verify --user: $(cat "${WORK}/timer-verify.log")"
-    fi
-  else
+  timer_structural_check() {
     if grep -q '^\[Timer\]' "${TIMER}"; then
-      ok "systemd/psi-oom-watcher.timer structural check (systemd-analyze unavailable): has [Timer] section"
+      ok "systemd/psi-oom-watcher.timer structural check: has [Timer] section"
     else
       fail "systemd/psi-oom-watcher.timer missing [Timer] section"
     fi
-  fi
+  }
+  verify_unit "systemd/psi-oom-watcher.timer" "${TIMER}" timer_structural_check
 
   if grep -q '^Unit=psi-oom-watcher\.service$' "${TIMER}"; then
     ok "systemd/psi-oom-watcher.timer Unit= correctly references psi-oom-watcher.service"
