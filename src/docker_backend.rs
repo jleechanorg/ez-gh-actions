@@ -377,12 +377,15 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     watchdog::ping();
     let assignments = read_slot_assignments_for(Some(cfg))?;
     let local_container_names = match managed_containers() {
-        Ok(containers) => Some(
-            containers
-                .into_iter()
-                .map(|container| container.name)
-                .collect::<HashSet<_>>(),
-        ),
+        Ok(containers) => {
+            poll_peak_rss(&containers);
+            Some(
+                containers
+                    .into_iter()
+                    .map(|container| container.name)
+                    .collect::<HashSet<_>>(),
+            )
+        }
         Err(err) => {
             eprintln!(
                 "warning: skipping container-aware stale-slot reconciliation (docker unreachable): {err:#}"
@@ -390,6 +393,9 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             None
         }
     };
+    if let Some(names) = &local_container_names {
+        reap_stale_peak_rss_entries(names);
+    }
     let reclaimed = release_stale_slots_from_with_containers_for(
         Some(cfg),
         &assignments,
@@ -1003,6 +1009,110 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
     (cpus, mem)
 }
 
+/// Derived, VM-aware memory budget for the fleet, computed once at daemon
+/// startup from explicit config — NOT the same computation as
+/// `effective_limits`, which clamps live per-`docker run` requests against
+/// whatever `daemon_capacity()` reports at that instant. This is an audit /
+/// fail-loud guard: bead ez-gh-actions-yz6b. The pre-existing clamp divided
+/// the whole docker-daemon-reported memory by runner count, leaving zero
+/// headroom for the Docker daemon / guest OS running inside the VM (Colima
+/// et al). This computes the budget explicitly and refuses to start rather
+/// than silently degrading below `runner_floor_mb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    pub vm_total_mb: u64,
+    pub guest_reserve_mb: u64,
+    pub fleet_budget_mb: u64,
+    pub runner_count: u32,
+    pub runner_floor_mb: u64,
+    pub per_runner_budget_mb: u64,
+}
+
+/// Pure derivation, no I/O — easy to unit test. `fleet_budget_mb =
+/// vm_total_mb - guest_reserve_mb` (saturating, never underflows).
+/// `per_runner_budget_mb = fleet_budget_mb / runner_count`. FAILS LOUD
+/// (returns `Err`, does not clamp) if `runner_count * runner_floor_mb >
+/// fleet_budget_mb` — the caller must not silently under-provision runners
+/// below the research-validated floor (an earlier under-floor clamp caused
+/// a jest OOM failure class).
+pub fn derive_memory_budget(
+    vm_total_mb: u64,
+    guest_reserve_mb: u64,
+    runner_count: u32,
+    runner_floor_mb: u64,
+) -> Result<MemoryBudget> {
+    let count_u64 = (runner_count as u64).max(1);
+    let fleet_budget_mb = vm_total_mb.saturating_sub(guest_reserve_mb);
+    let required_mb = count_u64.saturating_mul(runner_floor_mb);
+    if required_mb > fleet_budget_mb {
+        let shortfall_mb = required_mb - fleet_budget_mb;
+        anyhow::bail!(
+            "refusing to start: memory budget shortfall: vm_total_mb={vm_total_mb} \
+             guest_reserve_mb={guest_reserve_mb} fleet_budget_mb={fleet_budget_mb} \
+             runner_count={runner_count} runner_floor_mb={runner_floor_mb} \
+             required_mb={required_mb} shortfall_mb={shortfall_mb}; lower runner.count, \
+             raise runner.vm_total_mb (must match the real VM ceiling — check `colima status` \
+             / `limactl list`), or lower runner.guest_reserve_mb. Refusing to silently clamp \
+             below the runner_floor_mb floor (bead ez-gh-actions-yz6b: an earlier under-floor \
+             clamp caused a jest OOM failure class)."
+        );
+    }
+    let per_runner_budget_mb = fleet_budget_mb / count_u64;
+    Ok(MemoryBudget {
+        vm_total_mb,
+        guest_reserve_mb,
+        fleet_budget_mb,
+        runner_count,
+        runner_floor_mb,
+        per_runner_budget_mb,
+    })
+}
+
+/// Resolve `vm_total_mb` (explicit `cfg.runner.vm_total_mb` override, else
+/// `daemon_capacity()` auto-detect — preserving pre-yz6b auto-detect
+/// behavior when the key is unset), derive the fleet memory budget, and log
+/// the full derivation at info level so it's auditable in the journal
+/// (`journalctl --user -u ezgha.service`). Returns `Ok(None)` (not an
+/// error) if NEITHER an explicit config value NOR `daemon_capacity()` is
+/// available — a telemetry/audit feature must never be able to block
+/// startup on its own inability to introspect the environment (Self-Outage
+/// Prevention Principle). Returns `Err` only for the deliberate fail-loud
+/// case inside `derive_memory_budget`.
+pub fn resolve_and_log_memory_budget(cfg: &Config) -> Result<Option<MemoryBudget>> {
+    let vm_total_mb = match cfg.runner.vm_total_mb {
+        Some(mb) => mb,
+        None => match daemon_capacity() {
+            Some((_, mem)) => mem,
+            None => {
+                eprintln!(
+                    "warning: cannot determine VM/daemon memory ceiling (runner.vm_total_mb \
+                     unset and the `docker info` capacity probe failed); skipping startup \
+                     memory budget check. Set runner.vm_total_mb explicitly (check `colima \
+                     status` / `limactl list`) to enable it."
+                );
+                return Ok(None);
+            }
+        },
+    };
+    let budget = derive_memory_budget(
+        vm_total_mb,
+        cfg.runner.guest_reserve_mb,
+        cfg.runner.count,
+        cfg.runner.runner_floor_mb,
+    )?;
+    println!(
+        "memory budget: vm_total_mb={} guest_reserve_mb={} fleet_budget_mb={} runner_count={} \
+         per_runner_budget_mb={} runner_floor_mb={}",
+        budget.vm_total_mb,
+        budget.guest_reserve_mb,
+        budget.fleet_budget_mb,
+        budget.runner_count,
+        budget.per_runner_budget_mb,
+        budget.runner_floor_mb,
+    );
+    Ok(Some(budget))
+}
+
 /// Start one ephemeral JIT runner container in a slot the caller has already
 /// reserved (e.g. via `next_slot_excluding`), instead of letting this
 /// function pick the lowest free slot itself. Used by `start_missing_runners`
@@ -1174,6 +1284,104 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
         containers.push(serde_json::from_str(line).context("unexpected docker ps json")?);
     }
     Ok(containers)
+}
+
+/// Process-wide high-water-mark of each managed runner container's RSS, in
+/// MB, keyed by container name. Updated every `release_stale_slots` tick
+/// (the existing per-serve-tick reconciliation loop) and logged once a
+/// tracked container disappears (job finished / slot reclaimed / container
+/// removed). Bead ez-gh-actions-yz6b: this is observability only — it does
+/// NOT feed back into scheduling in this bead (deferred to a possible
+/// future VM-resize decision).
+static PEAK_RSS_MB: std::sync::Mutex<BTreeMap<String, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Poll `docker stats --no-stream` for every currently-managed container
+/// and update the process-wide peak-RSS high-water mark. Best-effort: any
+/// failure (docker busy, transient error, unrecognized output format) is
+/// swallowed with a warning — RSS telemetry must never be able to block or
+/// break the reconciliation tick it rides along with.
+fn poll_peak_rss(containers: &[ManagedContainer]) {
+    if containers.is_empty() {
+        return;
+    }
+    let mut cmd = docker_cmd();
+    cmd.arg("stats");
+    cmd.args(["--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"]);
+    for c in containers {
+        cmd.arg(&c.id);
+    }
+    let out = match run_docker(cmd, "polling peak RSS") {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "warning: docker stats (peak RSS poll) failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!("warning: docker stats (peak RSS poll) failed: {err:#}");
+            return;
+        }
+    };
+    let mut peaks = PEAK_RSS_MB.lock().unwrap();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((name, mem_usage)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(mb) = parse_mem_usage_mb(mem_usage) else {
+            continue;
+        };
+        let entry = peaks.entry(name.to_string()).or_insert(0);
+        if mb > *entry {
+            *entry = mb;
+        }
+    }
+}
+
+/// Parse docker stats' `MemUsage` column, e.g. `"512.3MiB / 3GiB"`,
+/// returning the USED side converted to whole MB (rounded). Returns `None`
+/// on any format this function doesn't recognize rather than panicking —
+/// telemetry parsing must never crash the daemon.
+fn parse_mem_usage_mb(s: &str) -> Option<u64> {
+    let used = s.split('/').next()?.trim();
+    parse_docker_size_mb(used)
+}
+
+fn parse_docker_size_mb(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let split_at = s.find(|c: char| c.is_alphabetic())?;
+    let (num_part, unit) = s.split_at(split_at);
+    let value: f64 = num_part.trim().parse().ok()?;
+    let mb = match unit.trim() {
+        "B" => value / 1024.0 / 1024.0,
+        "KiB" | "kB" => value / 1024.0,
+        "MiB" | "MB" => value,
+        "GiB" | "GB" => value * 1024.0,
+        _ => return None,
+    };
+    Some(mb.round() as u64)
+}
+
+/// Log and drop peak-RSS entries for containers that vanished since the
+/// last poll (job finished, slot reclaimed, container removed). Called once
+/// per `release_stale_slots` tick with the fresh set of currently-alive
+/// managed container names.
+fn reap_stale_peak_rss_entries(alive_names: &HashSet<String>) {
+    let mut peaks = PEAK_RSS_MB.lock().unwrap();
+    let gone: Vec<String> = peaks
+        .keys()
+        .filter(|name| !alive_names.contains(*name))
+        .cloned()
+        .collect();
+    for name in gone {
+        if let Some(peak_mb) = peaks.remove(&name) {
+            eprintln!(
+                "info: runner {name} reclaimed — peak RSS {peak_mb} MB observed over lifetime"
+            );
+        }
+    }
 }
 
 fn current_prefix_containers<'a>(
@@ -1580,6 +1788,93 @@ mod tests {
             "per_runner * count must fit daemon memory (got mem={mem}, count={}, product={mem_total}, daemon={daemon_mem})",
             cfg.runner.count
         );
+    }
+
+    #[test]
+    fn derive_memory_budget_happy_path_ground_truth() {
+        // Ground truth from the 2026-07-10 jeff-ubuntu incident (bead
+        // ez-gh-actions-yz6b): 48163 MB Colima VM, 4096 MB guest reserve,
+        // 16 runners. Uses an explicit 2048 MB floor ("bare survivable
+        // minimum" per the panel refinement note) rather than the 3072 MB
+        // default — at the DEFAULT floor these exact numbers correctly fail
+        // loud (see `derive_memory_budget_fails_loud_when_floor_unmet`
+        // below); that is the deliberate bug this bead fixes, not a test
+        // bug (the pre-yz6b fleet was already running underwater at the
+        // default floor, which is *why* this bead exists).
+        let budget = derive_memory_budget(48163, 4096, 16, 2048).unwrap();
+        assert_eq!(budget.fleet_budget_mb, 44067); // 48163 - 4096
+        assert_eq!(budget.per_runner_budget_mb, 2754); // 44067 / 16
+        assert!(budget.per_runner_budget_mb >= 2048);
+    }
+
+    #[test]
+    fn derive_memory_budget_fails_loud_when_floor_unmet() {
+        // Same ground-truth VM/reserve/count, but the DEFAULT 3072 MB
+        // floor: 16 * 3072 = 49152 > 44067 fleet_budget -> must fail loud,
+        // not silently clamp below 3072 MB (the regression this bead exists
+        // to prevent).
+        let err = derive_memory_budget(48163, 4096, 16, 3072).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("48163"), "missing vm_total: {msg}");
+        assert!(msg.contains("4096"), "missing guest_reserve: {msg}");
+        assert!(msg.contains("44067"), "missing fleet_budget: {msg}");
+        assert!(msg.contains("16"), "missing runner_count: {msg}");
+        assert!(msg.contains("3072"), "missing runner_floor: {msg}");
+        assert!(
+            msg.contains("5085"),
+            "missing shortfall (49152-44067): {msg}"
+        );
+    }
+
+    #[test]
+    fn runner_config_missing_new_keys_falls_back_to_documented_defaults() {
+        // A config.toml written before this bead (no vm_total_mb /
+        // guest_reserve_mb / runner_floor_mb keys) must still deserialize
+        // via serde defaults, not panic, and the derivation must run
+        // end-to-end without panicking on those defaults.
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 2
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.runner.vm_total_mb, None);
+        assert_eq!(cfg.runner.guest_reserve_mb, 4096);
+        assert_eq!(cfg.runner.runner_floor_mb, 3072);
+        let budget = derive_memory_budget(
+            16384,
+            cfg.runner.guest_reserve_mb,
+            cfg.runner.count,
+            cfg.runner.runner_floor_mb,
+        )
+        .unwrap();
+        assert_eq!(budget.fleet_budget_mb, 16384 - 4096);
+        assert!(budget.per_runner_budget_mb >= cfg.runner.runner_floor_mb);
+    }
+
+    #[test]
+    fn parse_docker_size_mb_handles_common_units() {
+        assert_eq!(parse_docker_size_mb("512.3MiB"), Some(512));
+        assert_eq!(parse_docker_size_mb("1.5GiB"), Some(1536));
+        assert_eq!(parse_docker_size_mb("2048KiB"), Some(2));
+        assert_eq!(parse_docker_size_mb("bogus"), None);
+    }
+
+    #[test]
+    fn parse_mem_usage_mb_takes_used_side_of_slash() {
+        assert_eq!(parse_mem_usage_mb("512.3MiB / 3GiB"), Some(512));
+        assert_eq!(parse_mem_usage_mb("not a mem usage string"), None);
     }
 
     #[test]

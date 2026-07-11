@@ -653,6 +653,9 @@ fn main() -> Result<()> {
                 }
                 cfg.limits.cpus = cfg.limits.cpus.min(cpu_share);
                 cfg.limits.memory_mb = cfg.limits.memory_mb.min(mem_share);
+                // Record the auto-detected VM/daemon ceiling explicitly so the
+                // startup memory-budget guard (bead yz6b) has a known ground truth.
+                cfg.runner.vm_total_mb = Some(daemon_mem);
                 println!(
                     "docker daemon capacity: {ncpu} cpus, {daemon_mem} MB; \
                      per-runner ceiling at count={count}: {cpu_share:.2} cpus, {mem_share} MB"
@@ -747,6 +750,10 @@ fn main() -> Result<()> {
             // with After=lima-vm@colima.service the Docker socket may not be
             // ready for a few seconds after limactl start exits.
             let backend = wait_for_backend(&cfg, Duration::from_secs(120))?;
+            // VM-aware memory budget derivation + fail-loud guard (bead
+            // ez-gh-actions-yz6b). See docker_backend::resolve_and_log_memory_budget.
+            docker_backend::resolve_and_log_memory_budget(&cfg)
+                .context("memory budget check failed at startup")?;
             println!(
                 "supervising {} ephemeral runner(s) for {} on {}",
                 cfg.runner.count,
