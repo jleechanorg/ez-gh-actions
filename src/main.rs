@@ -12,6 +12,7 @@ mod canary;
 mod config;
 mod docker_backend;
 mod github;
+mod lima_convergence;
 mod platform;
 mod queue_monitor;
 mod reaper;
@@ -105,6 +106,21 @@ enum Commands {
         source: SystemdAlertSource,
         #[arg(long)]
         unit: String,
+    },
+    /// Inspect dual-Lima state on this host (bead ez-gh-actions-apye).
+    /// Pure read-only probe; prints which canonical socket the daemon SHOULD
+    /// be using and whether a migration is implied. NEVER mutates Lima,
+    /// Docker contexts, or services — the operator runs the migration step
+    /// out of band after reviewing this output.
+    LimaConverge {
+        /// Docker context name whose current socket resolution should be
+        /// checked against the canonical-preferred socket.
+        #[arg(long, default_value = "lima-colima")]
+        context: String,
+        /// Override the path the daemon thinks it's pointed at (defaults to
+        /// `DOCKER_HOST` if set, else `unix:///var/run/docker.sock`).
+        #[arg(long)]
+        current_socket: Option<String>,
     },
 }
 
@@ -1196,6 +1212,67 @@ fn main() -> Result<()> {
         Commands::SystemdAlertHook { source, unit } => {
             let cfg = Config::load(&path)?;
             run_systemd_alert_hook(&cfg, *source, unit)?;
+        }
+        Commands::LimaConverge {
+            context,
+            current_socket,
+        } => {
+            // Bead ez-gh-actions-apye — pure read-only probe, never mutates
+            // Lima/Docker. Operator inspects the report and runs the
+            // migration out of band.
+            let probe = lima_convergence::probe_dual_lima();
+            let current = current_socket
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("DOCKER_HOST")
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("/var/run/docker.sock"));
+            let plan = lima_convergence::migration_plan(&probe, &current);
+            let report = serde_json::json!({
+                "bead": "ez-gh-actions-apye",
+                "context": context,
+                "current_socket": current,
+                "canonical": probe.canonical.as_ref().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "vm_dir": c.vm_dir,
+                    "docker_socket": c.docker_socket,
+                    "socket_alive": c.socket_alive,
+                })),
+                "legacy": probe.legacy.iter().map(|l| serde_json::json!({
+                    "name": l.name,
+                    "vm_dir": l.vm_dir,
+                    "docker_socket": l.docker_socket,
+                    "socket_alive": l.socket_alive,
+                })).collect::<Vec<_>>(),
+                "preferred_socket": lima_convergence::preferred_socket(&probe),
+                "needs_convergence": probe.needs_convergence(),
+                "migration_plan": plan.as_ref().map(|p| serde_json::json!({
+                    "from_socket": p.from_socket,
+                    "to_socket": p.to_socket,
+                    "job_drain_required": p.job_drain_required,
+                    "backup_marker": p.backup_marker,
+                })),
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            // Acceptance criterion (5): if a migration is implied and the
+            // operator passed `--write-backup`, persist the previous-socket
+            // marker so the rollback path is recoverable. We do NOT touch
+            // the Docker context itself — that step is operator-driven.
+            if let Some(p) = plan {
+                let entry = lima_convergence::backup_entry_for(&context, &p);
+                lima_convergence::write_backup_marker(&p.backup_marker, &[entry]).with_context(
+                    || format!("writing backup marker to {}", p.backup_marker.display()),
+                )?;
+                eprintln!(
+                    "wrote backup marker to {} (context={}, previous={})",
+                    p.backup_marker.display(),
+                    context,
+                    p.from_socket.display()
+                );
+            }
         }
     }
     Ok(())
