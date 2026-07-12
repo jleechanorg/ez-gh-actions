@@ -15,13 +15,15 @@ fail() {
 
 echo "Running static lint checks..."
 
-if rg -n --pcre2 'gh\s+pr\s+create\b[^\n]*--body(?!-)' "$INTEGRATE_SCRIPT"; then
+# grep -P (PCRE) is portable to ubuntu-latest GitHub Actions runners;
+# ripgrep is NOT pre-installed there (CI log: "rg: command not found").
+if grep -Pn 'gh\s+pr\s+create\b[^\n]*--body(?!-)' "$INTEGRATE_SCRIPT" >/dev/null; then
   fail "Unsafe inline --body argument detected in integrate.sh gh pr create path."
 else
   echo "PASS: No inline --body argument in integrate.sh PR create command."
 fi
 
-if rg -q --pcre2 'gh\s+pr\s+create\b[^\n]*--body-file\b' "$INTEGRATE_SCRIPT"; then
+if grep -Pq 'gh\s+pr\s+create\b[^\n]*--body-file\b' "$INTEGRATE_SCRIPT"; then
   echo "PASS: integrate.sh uses --body-file for PR body text."
 else
   fail "Expected integrate.sh to use --body-file for PR body payloads."
