@@ -22,3 +22,33 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Format
         run: cargo fmt --check
+
+  # Runs every tests/*.sh regression suite on every PR.
+  # Wires previously-orphaned tests (doctor-runner 4-state model, watchdog
+  # state machine, install/aux-unit guards, respawn journal cross-check, ...)
+  # into the PR gate so a green CI is now impossible without green shell
+  # regressions. See ez-gh-actions-r8od. Tests are hermetic (tmp HOME, no
+  # live fleet touches, stubbed docker where needed) and complete in well
+  # under 30s each on a CI runner.
+  shell-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Run tests/*.sh
+        # set -e ensures the step fails the job on any non-zero exit from a
+        # test. tee preserves a per-test transcript in the CI log for
+        # post-mortem; the trailing grep isolates the regression-summary
+        # line each test prints so a failure shows REGRESSION_TEST: FAIL.
+        run: |
+          set -euo pipefail
+          status=0
+          for t in tests/*.sh; do
+            echo "::: running $t :::"
+            bash "$t" || status=$?
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "shell-tests: one or more tests/*.sh failed (status=$status)" >&2
+            exit "$status"
+          fi
