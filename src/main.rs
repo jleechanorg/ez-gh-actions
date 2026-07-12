@@ -831,6 +831,12 @@ fn main() -> Result<()> {
                         }
                     }
                 };
+                // Re-check shutdown between ensure_count and the monitor/canary/deadman
+                // block: a SIGTERM received during ensure_count_outcome must not let
+                // 75s of monitor work run — that window alone can exhaust TimeoutStopSec=30.
+                if shutdown::is_requested() {
+                    break;
+                }
                 if ensure_succeeded {
                     watchdog::ping();
                     // Fresh budget base for monitor ticks: respawn pacing may
