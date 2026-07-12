@@ -11,6 +11,18 @@ on:
   pull_request:
     paths:
       - ".beads/issues.jsonl"
+  # GitHub Actions does NOT auto-trigger workflows introduced by the very PR
+  # that adds them — the workflow file is invisible to the pull_request event
+  # because it doesn't exist on main yet. Add an explicit push trigger on main
+  # so the guard fires on every direct push to main (the case bead jleechan-w528
+  # documents: silent regressions merged straight to main). We avoid
+  # `pull_request_target` here to keep the workflow read-only and avoid the
+  # classic fork-PR code-execution foot-gun.
+  push:
+    branches:
+      - main
+    paths:
+      - ".beads/issues.jsonl"
 
 permissions:
   contents: read
@@ -29,8 +41,20 @@ jobs:
       - name: Run deletion/regression guard
         run: |
           set -euo pipefail
-          parent_sha="${{ github.event.pull_request.base.sha }}"
-          head_sha="${{ github.event.pull_request.head.sha }}"
-          merge_base="$(git merge-base "$parent_sha" "$head_sha")"
-          echo "Comparing .beads/issues.jsonl: merge-base=$merge_base -> head=$head_sha"
-          python3 scripts/check_beads_no_regression.py "$merge_base" "$head_sha"
+          head_sha="${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            parent_sha="${{ github.event.pull_request.base.sha }}"
+            merge_base="$(git merge-base "$parent_sha" "$head_sha")"
+            echo "Comparing .beads/issues.jsonl: merge-base=$merge_base -> head=$head_sha (pull_request)"
+          else
+            # On push to main: compare HEAD (the new commit) against its first
+            # parent. This handles both direct pushes (HEAD~1 is the prior tip
+            # of main) and the common case where the merge commit on main has
+            # the prior tip of main as parent. If the parent itself didn't
+            # touch .beads/issues.jsonl the script still correctly compares
+            # against the most recent commit that did, per the script's
+            # documented behavior.
+            parent_sha="$(git rev-parse HEAD^)"
+            echo "Comparing .beads/issues.jsonl: parent=$parent_sha -> head=$head_sha (push to main)"
+          fi
+          python3 scripts/check_beads_no_regression.py "$parent_sha" "$head_sha"
