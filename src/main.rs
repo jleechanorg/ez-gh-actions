@@ -984,6 +984,26 @@ fn run_test_alert(cfg: &config::Config, event_key: &str) -> Result<()> {
 }
 
 fn run_tick<T>(label: &str, run: impl FnOnce() -> Result<Option<T>>) -> bool {
+    // Per-tick heartbeat timestamp (ez-gh-actions-5u3s): on Linux,
+    // doctor-runner's compute_heartbeat_gap() derives its liveness signal
+    // from journalctl's own `-o short-unix` per-line timestamp on the
+    // "queue monitor: ..." log line queue_monitor.rs emits — journalctl
+    // stamps every line regardless of what the process prints, so no
+    // daemon-side timestamp was ever needed there. On macOS, launchd
+    // redirects stdout/stderr to plain files (/tmp/ezgha-launchd-*.log)
+    // with NO per-line timestamp added by the OS, so doctor-runner's
+    // macOS branch has historically had nothing to diff and skips the
+    // heartbeat check entirely (see doctor-runner's "serve-loop heartbeat
+    // signal skipped on $PLATFORM" warn()). This line gives the macOS
+    // launchd log its own per-tick Unix timestamp, in the same
+    // "<epoch> tick=<label>" shape doctor-runner can grep/diff — mirrors
+    // journalctl's short-unix behavior without depending on it. Emitted
+    // once per serve-loop tick (run_tick wraps both the queue-monitor
+    // drive and the deadman check), matching journalctl's per-tick
+    // cadence 1:1. Consuming this from doctor-runner's macOS branch is a
+    // follow-up (see PR body / ez-gh-actions-lxn); this only adds the
+    // daemon-side emission.
+    println!("{}", format_heartbeat_line(unix_now_secs(), label));
     match run() {
         Ok(_) => true,
         Err(err) => {
@@ -991,6 +1011,15 @@ fn run_tick<T>(label: &str, run: impl FnOnce() -> Result<Option<T>>) -> bool {
             false
         }
     }
+}
+
+// Formats the per-tick heartbeat line printed by run_tick(). Extracted as a
+// pure function (no I/O) so tests can assert on the exact wire format
+// doctor-runner's macOS branch will eventually parse, without needing to
+// capture process stdout — see run_tick's doc comment for why this line
+// exists (ez-gh-actions-5u3s).
+fn format_heartbeat_line(unix_secs: u64, tick_label: &str) -> String {
+    format!("ezgha heartbeat: {unix_secs} tick={tick_label}")
 }
 
 fn main() -> Result<()> {
@@ -2339,6 +2368,22 @@ mod tests {
             "queue monitor check",
             || Ok(None)
         ));
+    }
+
+    #[test]
+    fn heartbeat_line_carries_unix_timestamp_and_tick_label() {
+        // Regression guard for ez-gh-actions-5u3s: doctor-runner's macOS
+        // branch has no per-line timestamp to diff (launchd redirects
+        // stdout to a plain file, unlike journalctl's -o short-unix on
+        // Linux) so it has historically skipped the heartbeat-starvation
+        // check entirely. This asserts the exact wire format the
+        // daemon-side fix emits once per serve-loop tick: a parseable
+        // "<unix_secs> tick=<label>" pair a future doctor-runner consumer
+        // can grep/diff, mirroring journalctl's short-unix shape.
+        let line = format_heartbeat_line(1_720_000_000, "queue monitor check");
+        assert_eq!(line, "ezgha heartbeat: 1720000000 tick=queue monitor check");
+        assert!(line.starts_with("ezgha heartbeat: "));
+        assert!(line.contains("tick=queue monitor check"));
     }
 
     #[test]
