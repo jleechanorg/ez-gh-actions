@@ -1,0 +1,17 @@
+[Unit]
+Description=ezgha singleton backend-aware recovery controller (bead ez-gh-actions-ghd2.7)
+# Boot-scoped activator. Runs once at boot AND every hour (OnUnitActiveSec)
+# to surface recovery controller state + drain stale quarantine. The
+# controller itself is owned by `ezgha serve`; this unit exists so the
+# operator can inspect / drain state via `systemctl --user start
+# ezgha-recovery.service` without restarting the daemon.
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=@CARGO_BIN@/ezgha recovery-status
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
+StandardOutput=append:%h/.local/state/ezgha/recovery.log
+StandardError=append:%h/.local/state/ezgha/recovery.log
+TimeoutStartSec=30

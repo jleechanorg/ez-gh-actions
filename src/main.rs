@@ -15,6 +15,7 @@ mod github;
 mod platform;
 mod queue_monitor;
 mod reaper;
+mod recovery_controller;
 mod service;
 mod shutdown;
 mod watchdog;
@@ -105,6 +106,22 @@ enum Commands {
         source: SystemdAlertSource,
         #[arg(long)]
         unit: String,
+    },
+    /// Print the singleton recovery controller's current state + last
+    /// transitions. Part of `ez-gh-actions-ghd2.7`. Without flags this is
+    /// a read-only status; `--engage-lockout` / `--release-lockout` /
+    /// `--reset-telemetry` mutate the controller's state for operator use.
+    RecoveryStatus {
+        /// Drop the manual lockout marker — refuses ALL recovery attempts
+        /// until released. Idempotent.
+        #[arg(long)]
+        engage_lockout: bool,
+        /// Remove the manual lockout marker so recovery attempts can resume.
+        #[arg(long)]
+        release_lockout: bool,
+        /// Truncate the structured transition log.
+        #[arg(long)]
+        reset_telemetry: bool,
     },
 }
 
@@ -385,12 +402,10 @@ fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration)
             return Ok(status.success());
         }
         if start.elapsed() >= timeout {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            // Bead ez-gh-actions-ghd2.7: whole-process-tree cleanup via the
+            // recovery controller's helper, so the SIGKILL on -pgid is the
+            // SAME path every runner uses (no duplicated ad-hoc kill logic).
+            recovery_controller::kill_process_group(&mut child);
             bail!(
                 "{cmd} restart command timed out after {}s",
                 timeout.as_secs()
@@ -602,12 +617,32 @@ fn maybe_restart_backend(
     if !recovery.allow_restart(cfg) {
         return false;
     }
+    // Bead ez-gh-actions-ghd2.7: classify the failure BEFORE the mutation.
+    // Command rc != 0 is never the trigger; we read the docker reachability
+    // hint and the platform's selection state to pick a RecoveryCause. The
+    // controller's own attempt() wraps the runner below and emits a
+    // structured transition record to recovery.jsonl.
+    let state_dir = state_dir_for(cfg);
+    let mut controller = recovery_controller::RecoveryController::new(
+        state_dir.join("recovery.lock"),
+        recovery_controller::ControllerConfig::production(&state_dir),
+        platform::detect().os,
+    );
+    let cause = match selection {
+        Selection::None => recovery_controller::RecoveryCause::DockerDown,
+        _ => recovery_controller::RecoveryCause::Other,
+    };
+    let backend_label = match &selection {
+        Selection::Chosen { backend, .. } => backend.name(),
+        _ => "docker",
+    };
     match attempt_backend_restart(deadline) {
         Ok(true) => {
+            let transition = controller.attempt(cause, backend_label, |_ctx| Ok(()));
             let subject = "Backend restart attempted";
             let body = format!(
-                "attempted backend runtime restart for {} after backend selection/reachability failure",
-                cfg.github.target
+                "attempted backend runtime restart for {} after backend selection/reachability failure (cause={} outcome={})",
+                cfg.github.target, transition.cause, transition.outcome
             );
             if let Err(err) = alert::notify(
                 cfg,
@@ -622,10 +657,16 @@ fn maybe_restart_backend(
             true
         }
         Ok(false) => {
+            let _ = controller.attempt(cause, backend_label, |_ctx| {
+                anyhow::bail!("restart command returned non-zero or unavailable")
+            });
             eprintln!("backend restart command paths were unavailable or returned non-zero");
             false
         }
         Err(err) => {
+            let _ = controller.attempt(cause, backend_label, |_ctx| {
+                Err::<(), anyhow::Error>(anyhow::anyhow!("{err:#}"))
+            });
             eprintln!("backend restart command failed: {err:#}");
             false
         }
@@ -1197,6 +1238,80 @@ fn main() -> Result<()> {
             let cfg = Config::load(&path)?;
             run_systemd_alert_hook(&cfg, *source, unit)?;
         }
+        Commands::RecoveryStatus {
+            engage_lockout,
+            release_lockout,
+            reset_telemetry,
+        } => {
+            run_recovery_status(&path, *engage_lockout, *release_lockout, *reset_telemetry)?;
+        }
+    }
+    Ok(())
+}
+
+/// Bead ez-gh-actions-ghd2.7: surface the singleton backend-aware recovery
+/// controller's current state. Read-only by default; flag combinations allow
+/// the operator to engage / release the manual lockout and reset the
+/// structured transition log.
+fn run_recovery_status(
+    cfg_path: &std::path::PathBuf,
+    engage_lockout: bool,
+    release_lockout: bool,
+    reset_telemetry: bool,
+) -> Result<()> {
+    let cfg = Config::load(cfg_path)?;
+    let state_dir = state_dir_for(&cfg);
+    let lockout_path = state_dir.join("recovery.lockout");
+    let telemetry_path = state_dir.join("recovery.jsonl");
+    let controller = recovery_controller::RecoveryController::new(
+        state_dir.join("recovery.lock"),
+        recovery_controller::ControllerConfig::production(&state_dir),
+        platform::detect().os,
+    );
+    // Mirror the lockout file's existence into the controller's snapshot view.
+    if engage_lockout {
+        controller.engage_lockout()?;
+        println!(
+            "engaged manual lockout at {}",
+            controller.lock_path().display()
+        );
+    }
+    if release_lockout {
+        controller.release_lockout()?;
+        println!("released manual lockout");
+    }
+    if reset_telemetry {
+        recovery_controller::reset_telemetry(&telemetry_path)?;
+        println!("truncated telemetry log at {}", telemetry_path.display());
+    }
+    let snap = controller.snapshot();
+    println!("ezgha recovery controller status (bead ez-gh-actions-ghd2.7)");
+    println!("  host_os:        {}", platform::detect().os);
+    println!("  lock_path:      {}", controller.lock_path().display());
+    println!("  lockout_path:   {}", lockout_path.display());
+    println!("  telemetry_path: {}", telemetry_path.display());
+    println!("  attempts_in_window: {}", snap.attempts_in_window);
+    println!("  cooldown_remaining: {:?}", snap.cooldown_remaining);
+    println!("  manual_lockout_engaged: {}", snap.manual_lockout_engaged);
+    if let Some(socket) = controller.docker_socket() {
+        println!("  docker_socket:  {}", socket.display());
+    } else {
+        println!("  docker_socket:  (none detected)");
+    }
+    let transitions = recovery_controller::read_telemetry(&telemetry_path)?;
+    println!("  transitions_recorded: {}", transitions.len());
+    for t in transitions
+        .iter()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        println!(
+            "    ts={} cause={} outcome={} backend={} attempt={} detail={}",
+            t.timestamp_unix_ms, t.cause, t.outcome, t.backend, t.attempt, t.detail
+        );
     }
     Ok(())
 }

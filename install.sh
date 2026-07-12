@@ -58,7 +58,7 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog"
+  AUX_NAMES="token-refresh queue-reaper watchdog recovery"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -360,6 +360,11 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    # Recovery controller probe (bead ez-gh-actions-ghd2.7). Runs `ezgha
+    # recovery-status` hourly so the operator can audit recovery transitions
+    # without restarting the daemon. Unlike watchdog, this is safe to arm
+    # by default — it only reads state and writes a single log line.
+    install_macos_plist "recovery" "3600" "${CARGO_BIN}/ezgha" "recovery-status"
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do
@@ -385,6 +390,7 @@ PLIST
       dest="${USER_UNIT_DIR}/${base}"
       sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
           -e "s|@HOME@|${HOME_DIR}|g" \
+          -e "s|@CARGO_BIN@|${CARGO_BIN}|g" \
           "${unit}" > "${dest}"
       # Strip '#'-prefixed comment lines before scanning so an explanatory
       # comment in the unit file (which may legitimately say "worktree")
@@ -398,7 +404,7 @@ PLIST
       fi
     done
     systemctl --user daemon-reload 2>/dev/null || true
-    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer; do
+    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer ezgha-recovery.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user timer enabled: ${timer}"
       else

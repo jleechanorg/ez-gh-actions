@@ -1,0 +1,11 @@
+[Unit]
+Description=Run ezgha recovery controller status probe every hour (bead ez-gh-actions-ghd2.7)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=3600s
+Persistent=true
+Unit=ezgha-recovery.service
+
+[Install]
+WantedBy=timers.target

@@ -91,7 +91,10 @@ case "$action" in
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"
       dest="${TARGET_DIR}/${label}.plist"
-      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$dest"
+      sed -e "s|@HOME@|${HOME}|g" \
+          -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+          -e "s|@CARGO_BIN@|${HOME}/.cargo/bin|g" \
+          "$tmpl" > "$dest"
       verify_rendered_plist "$dest" || { rm -f "$dest"; exit 1; }
       verify_scripts_exist "$dest" || { rm -f "$dest"; exit 1; }
       echo "installed: $dest"
