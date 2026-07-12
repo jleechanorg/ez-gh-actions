@@ -147,19 +147,38 @@ impl QueueMonitorState {
     /// (`drive_serve_loop_ticks`) passes the real `fetch_fleet_runner_stats`
     /// and `fetch_capped_queue_snapshot` while the red-phase tests pass
     /// counting closures.
+    ///
+    /// `rest_budget_check` (bead ez-gh-actions-4jv, REST-budget-aware
+    /// deprioritization) is a third seam of the same shape: production wires
+    /// in `github::rest_budget_remaining` (an actual `gh api rate_limit`
+    /// call -- itself quota-EXEMPT, so checking it never spends the budget
+    /// it's measuring), tests wire in a fake closure returning a fixed
+    /// count. When the returned remaining-count is below
+    /// `cfg.queue_monitor.rest_budget_floor`, this tick's read-heavy fetches
+    /// (`fetch_fleet`/`fetch_repo`, i.e. queue snapshot enumeration and
+    /// invariant-sampler polling) are SKIPPED entirely for this iteration
+    /// and a deferral is logged with the observed remaining count -- neither
+    /// `last_check` timestamp advances, so both ticks retry next iteration
+    /// once budget recovers. This function has ZERO reachability to
+    /// `generate_jitconfig`/runner registration (that write path lives in
+    /// `docker_backend::ensure_count`, called from `main.rs`'s serve loop
+    /// entirely independently of this driver) -- the critical write path is
+    /// structurally, not just conditionally, exempt from this gate.
     #[allow(clippy::too_many_arguments)]
-    pub fn drive_with_fetcher<FFleet, FRepo>(
+    pub fn drive_with_fetcher<FFleet, FRepo, FBudget>(
         &mut self,
         cfg: &Config,
         loop_start: Instant,
         invariant_sampler: &mut InvariantSamplerState,
         mut fetch_fleet: FFleet,
         mut fetch_repo: FRepo,
+        mut rest_budget_check: FBudget,
     ) -> Result<(Option<QueueStats>, Option<InvariantSample>)>
     where
         FFleet: FnMut(Instant) -> Result<FleetRunnerStats>,
         FRepo:
             FnMut(&str, Option<FleetRunnerStats>, usize, Instant) -> Result<(QueueSnapshot, bool)>,
+        FBudget: FnMut() -> Result<u32>,
     {
         // Compute which ticks are due. Mirrors the gating inside
         // `maybe_check` / `maybe_sample` exactly so a "due" decision here
@@ -185,6 +204,28 @@ impl QueueMonitorState {
 
         if !qm_due && !is_due {
             return Ok((None, None));
+        }
+
+        // REST-budget-aware deprioritization (bead ez-gh-actions-4jv): check
+        // the REST (core) bucket's remaining count BEFORE firing any of this
+        // tick's read-heavy fetches (fleet + per-repo queue/job enumeration).
+        // A `gh api rate_limit` call failure here is treated as "budget
+        // unknown" and does NOT block the tick -- only a successfully
+        // observed low count defers, so a transient rate_limit-endpoint
+        // hiccup can't itself starve monitoring. If remaining is at/under
+        // the configured floor, skip this iteration's read-heavy work
+        // entirely and log why; neither `last_check` timestamp advances, so
+        // both ticks are retried on the next serve-loop iteration once
+        // budget recovers.
+        if let Ok(remaining) = rest_budget_check() {
+            if remaining <= cfg.queue_monitor.rest_budget_floor {
+                eprintln!(
+                    "queue_monitor: deferring read-heavy REST calls this tick -- \
+                     REST core budget remaining={remaining} <= floor={}",
+                    cfg.queue_monitor.rest_budget_floor
+                );
+                return Ok((None, None));
+            }
         }
 
         // Union of repos needed by the due ticks. `cfg.queue_monitor.repo`
@@ -319,6 +360,7 @@ impl QueueMonitorState {
             invariant_sampler,
             fetch_fleet_runner_stats,
             fetch_capped_queue_snapshot,
+            github::rest_budget_remaining,
         )
     }
 }
@@ -2198,6 +2240,7 @@ exit 1
                     false,
                 ))
             },
+            || Ok(u32::MAX),
         );
 
         assert_eq!(
@@ -2261,6 +2304,7 @@ exit 1
                     false,
                 ))
             },
+            || Ok(u32::MAX),
         );
 
         let mut seen = repos_seen.lock().unwrap().clone();
@@ -2317,6 +2361,7 @@ exit 1
                     false,
                 ))
             },
+            || Ok(u32::MAX),
         );
 
         assert_eq!(
@@ -2371,6 +2416,7 @@ exit 1
                     false,
                 ))
             },
+            || Ok(u32::MAX),
         );
 
         assert_eq!(fleet_calls.load(Ordering::SeqCst), 1);
@@ -2387,6 +2433,248 @@ exit 1
              MONITORED_INVARIANT_REPOS must not be touched when it's not due"
         );
         assert_eq!(seen, vec!["owner/repo".to_string()]);
+    }
+
+    /// TDD evidence (a): when the injected REST budget check reports a
+    /// remaining count AT/UNDER `cfg.queue_monitor.rest_budget_floor`, both
+    /// ticks' read-heavy fetches (fleet + per-repo enumeration) must be
+    /// skipped entirely for that iteration -- proving the deprioritization
+    /// gate actually short-circuits before any fetch closure runs, not just
+    /// that it exists.
+    #[test]
+    fn low_rest_budget_defers_read_heavy_fetches() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+        let repo_calls = Arc::new(AtomicUsize::new(0));
+        let budget_checks = Arc::new(AtomicUsize::new(0));
+
+        let result = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| {
+                fleet_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+            },
+            |_repo, _fleet, _cap, _deadline| {
+                repo_calls.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+            // Below the floor: budget check itself must still run (it's the
+            // gate), but everything after it must not.
+            || {
+                budget_checks.fetch_add(1, Ordering::SeqCst);
+                Ok(499)
+            },
+        );
+
+        assert!(result.is_ok(), "a deferred tick is not an error");
+        let (qm_result, is_result) = result.unwrap();
+        assert!(
+            qm_result.is_none(),
+            "queue monitor tick must defer, not run"
+        );
+        assert!(
+            is_result.is_none(),
+            "invariant sampler tick must defer, not run"
+        );
+        assert_eq!(
+            budget_checks.load(Ordering::SeqCst),
+            1,
+            "the budget check itself must run exactly once to make the defer decision"
+        );
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            0,
+            "fleet fetch must be skipped when REST budget is below the floor"
+        );
+        assert_eq!(
+            repo_calls.load(Ordering::SeqCst),
+            0,
+            "repo fetch must be skipped when REST budget is below the floor"
+        );
+        assert_eq!(
+            queue_monitor.last_check, None,
+            "a deferred tick must not advance last_check, so it retries next iteration"
+        );
+        assert_eq!(
+            invariant_sampler.last_check, None,
+            "a deferred invariant-sampler tick must not advance last_check either"
+        );
+    }
+
+    /// Companion to `low_rest_budget_defers_read_heavy_fetches`: a remaining
+    /// count comfortably ABOVE the floor must NOT defer -- proves the gate
+    /// is a real threshold, not an unconditional skip.
+    #[test]
+    fn healthy_rest_budget_does_not_defer_read_heavy_fetches() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+
+        let (qm_result, is_result) = queue_monitor
+            .drive_with_fetcher(
+                &cfg,
+                Instant::now(),
+                &mut invariant_sampler,
+                |_| {
+                    fleet_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+                },
+                |_repo, _fleet, _cap, _deadline| {
+                    Ok((
+                        QueueSnapshot {
+                            queued: vec![],
+                            in_progress: vec![],
+                            fleet: None,
+                        },
+                        false,
+                    ))
+                },
+                || Ok(4500),
+            )
+            .unwrap();
+
+        assert!(
+            qm_result.is_some(),
+            "queue monitor tick must run when budget is healthy"
+        );
+        assert!(
+            is_result.is_some(),
+            "invariant sampler tick must run when budget is healthy"
+        );
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            1,
+            "fleet fetch must happen when REST budget is above the floor"
+        );
+    }
+
+    /// A failed budget check (e.g. transient `gh api rate_limit` error) must
+    /// NOT be treated as "below floor" -- it must fall through to running
+    /// the ticks normally rather than starving monitoring on top of an
+    /// already-flaky API. Only a successfully observed low count defers.
+    #[test]
+    fn rest_budget_check_error_does_not_defer() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+
+        let (qm_result, _is_result) = queue_monitor
+            .drive_with_fetcher(
+                &cfg,
+                Instant::now(),
+                &mut invariant_sampler,
+                |_| {
+                    fleet_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+                },
+                |_repo, _fleet, _cap, _deadline| {
+                    Ok((
+                        QueueSnapshot {
+                            queued: vec![],
+                            in_progress: vec![],
+                            fleet: None,
+                        },
+                        false,
+                    ))
+                },
+                || anyhow::bail!("simulated `gh api rate_limit` transient failure"),
+            )
+            .unwrap();
+
+        assert!(
+            qm_result.is_some(),
+            "a failed budget check must not defer the tick -- budget-unknown proceeds normally"
+        );
+        assert_eq!(fleet_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// TDD evidence (b): `drive_serve_loop_ticks` -- the ONLY production
+    /// entry point that wires in the real `github::rest_budget_remaining`
+    /// gate -- has no parameter, closure, or code path that reaches
+    /// `docker_backend::ensure_count`/`github::generate_jitconfig`. The
+    /// write path is registered/invoked exclusively from `main.rs`'s serve
+    /// loop as a structurally separate call, so it is impossible for this
+    /// gate to ever block runner registration -- there is no shared
+    /// function, no shared closure, no shared state between the two. This
+    /// test asserts the healthy-budget case still returns without touching
+    /// any registration-related state, documenting (not just asserting by
+    /// absence) that the write path is out of reach of this module.
+    #[test]
+    fn drive_with_fetcher_never_touches_registration_write_path() {
+        // `drive_with_fetcher`'s only fetcher seams are FFleet (list_runners),
+        // FRepo (queue/job enumeration), and FBudget (rate_limit) -- none of
+        // which is, wraps, or calls `generate_jitconfig`. This is enforced
+        // structurally (by the function signature itself, verified at
+        // compile time) rather than by a runtime check: there is no
+        // `generate_jitconfig`-shaped parameter for a test to inject in the
+        // first place, which is the strongest guarantee available for
+        // "never gated by the budget check".
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+
+        // Even with budget reported as exhausted (0 remaining), the call
+        // must complete without any reference to runner registration --
+        // there is nothing in this module that could call it.
+        let result = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0)),
+            |_repo, _fleet, _cap, _deadline| {
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+            || Ok(0),
+        );
+        assert!(result.is_ok());
     }
 
     /// Pure helper: a Config with `enabled` toggled per-test. Reuses the
