@@ -1,6 +1,9 @@
-beads.db
-beads.db-wal
-beads.db-shm
-last-touched
 .br_history/
+.br_recovery/
 .sync.lock
+.write.lock
+*.tmp
+beads.db
+beads.db-shm
+beads.db-wal
+last-touched
