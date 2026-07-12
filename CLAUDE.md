@@ -93,3 +93,7 @@ Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gate
 - Never run `git add -A` — stage only files you changed
 - Always push after finishing any unit of work
 - Never modify `~/.config/ezgha/config.toml` without also restarting the service
+
+## Standards & reviews
+- **Repo-local `/code-standards`** lives at `.claude/commands/code-standards.md` and layers ten repo-specific gates (fleet capacity 22/22, single-writer, layered-design, self-outage prevention, blast-radius, self-healing recipes, honest gates, automation-callers, no-silent-underprovisioning, test isolation) on top of the user-scope `~/.claude/commands/code-standards.md` (ZFC + ponytail). New code must pass repo-local /code-standards before merge.
+- **Blast radius required** for any change to a threshold, health-check, watchdog configuration, restart policy, resource limit, or monitor cadence: PR description must state the normal peak of the bounded metric and verify a safe remaining margin (per "Safety & Monitoring Principles" above). Cold reviewers REJECT otherwise — proven pattern (PR #53 drain deadline was checked between slots but not inside in-flight gh DELETE; caught 2026-07-10).
