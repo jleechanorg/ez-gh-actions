@@ -16,6 +16,7 @@ mod platform;
 mod queue_monitor;
 mod reaper;
 mod service;
+mod shutdown;
 mod watchdog;
 
 use alert::Severity;
@@ -944,7 +945,16 @@ fn main() -> Result<()> {
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             let mut deadman = alert::DeadManState::new(Instant::now());
+
+            // Graceful shutdown (bead ez-gh-actions-30p): install SIGTERM/SIGINT
+            // handlers so a systemctl/watchdog/manual restart drains in-flight
+            // registrations instead of orphaning them.
+            shutdown::install_handlers();
+
             loop {
+                if shutdown::is_requested() {
+                    break;
+                }
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
@@ -1014,6 +1024,12 @@ fn main() -> Result<()> {
                         }
                     }
                 };
+                // Re-check shutdown between ensure_count and the monitor/canary/deadman
+                // block: a SIGTERM received during ensure_count_outcome must not let
+                // 75s of monitor work run — that window alone can exhaust TimeoutStopSec=30.
+                if shutdown::is_requested() {
+                    break;
+                }
                 if ensure_succeeded {
                     watchdog::ping();
                     // Fresh budget base for monitor ticks: respawn pacing may
@@ -1048,8 +1064,32 @@ fn main() -> Result<()> {
                 let _ = run_tick("deadman alert self-test", || {
                     Ok(Some(deadman.check(&cfg, Instant::now())))
                 });
-                std::thread::sleep(sleep);
+                shutdown::sleep_interruptibly(sleep);
             }
+            // SIGTERM drain: tell systemd we're stopping, then deregister
+            // in-flight (container-less) registrations within a bounded grace so
+            // a restart never orphans a live GitHub runner. Running containers
+            // are left alive (they survive the restart; ensure_count re-adopts
+            // them on next start). Budget: the deadline is enforced at TWO levels
+            // — the inter-slot loop stops issuing new deletes once it passes, and
+            // each individual DELETE is capped at the remaining budget in
+            // remove_runner_until (child gh process bounded, not just its retry
+            // sleeps). Worst case is therefore ~15s + one child-kill latency
+            // (sub-second), safely below TimeoutStopSec=30 and WatchdogSec=300.
+            // Anything not drained is reclaimed by release_stale_slots
+            // (fail-safe). No-op sd_notify on macOS launchd.
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+            println!("shutdown requested; draining in-flight runner registrations (<=15s)");
+            let drain_deadline = Instant::now() + Duration::from_secs(15);
+            let drain = docker_backend::drain_inflight_registrations(&cfg, drain_deadline);
+            println!(
+                "drain complete: {} reservation(s) released, {} orphan registration(s) deregistered, \
+                 {} container-backed runner(s) preserved, {} left to reaper",
+                drain.reservations_released,
+                drain.registrations_deregistered,
+                drain.containers_preserved,
+                drain.deferred_to_reaper
+            );
         }
         Commands::Stop => {
             let cfg = Config::load(&path)?;

@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
@@ -1255,6 +1255,123 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
     Ok(owned_containers.len())
 }
 
+/// Outcome counts from a graceful-shutdown drain — used for the operator log
+/// line and for unit tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrainSummary {
+    /// Empty-id reservations (JIT never issued) freed locally.
+    pub reservations_released: usize,
+    /// In-flight orphan registrations (no container) deregistered on GitHub.
+    pub registrations_deregistered: usize,
+    /// Registrations backed by a live container — left alive (survive restart).
+    pub containers_preserved: usize,
+    /// Left for `release_stale_slots` + 60s grace window (deadline hit, delete
+    /// failed, container state unknown, or unparseable id). Fail-safe.
+    pub deferred_to_reaper: usize,
+}
+
+/// Graceful-shutdown drain (bead ez-gh-actions-30p). On SIGTERM the serve loop
+/// calls this after breaking out of the loop. It deregisters JIT registrations
+/// that are recorded in the slot file but have NO backing container (the orphan
+/// window), so a daemon restart never leaves a live GitHub registration with no
+/// runner. Registrations backed by a running container are LEFT UNTOUCHED — the
+/// runner (busy or idle) survives the restart and is re-adopted by `ensure_count`
+/// on next start (requirement 3: never kill running containers). Best-effort and
+/// bounded by `deadline` (≤15s); anything not drained in time is reclaimed by the
+/// reaper. Fail-safe, never fail-orphan: on any uncertainty it defers.
+///
+/// CONCURRENCY INVARIANT: this drain runs AFTER the serve loop has broken, in a
+/// process where spawning is single-threaded and `docker run` is synchronous, so
+/// by the time we read the slot file no new JIT registration can enter the orphan
+/// window. If spawning ever becomes concurrent/async (a background spawner still
+/// live during drain), this function MUST additionally honor the
+/// `REGISTRATION_GRACE_WINDOW` guard (as `release_stale_slots` does) before
+/// deregistering, or it could delete a registration whose container is still
+/// mid-launch on another thread.
+pub fn drain_inflight_registrations(cfg: &Config, deadline: Instant) -> DrainSummary {
+    // Source of truth for "is a real container attached to this slot". If we
+    // CANNOT list containers, we must not risk deregistering a live runner —
+    // pass None so assigned slots defer to the reaper (empty reservations are
+    // still safe to free: no GH registration exists for them).
+    let container_names: Option<HashSet<String>> = match managed_containers() {
+        Ok(list) => Some(list.into_iter().map(|c| c.name).collect()),
+        Err(e) => {
+            eprintln!(
+                "drain: could not list containers ({e:#}); releasing empty reservations only, \
+                 leaving assigned slots to release_stale_slots"
+            );
+            None
+        }
+    };
+    drain_inflight_registrations_inner(cfg, deadline, container_names.as_ref(), |id, dl| {
+        github::remove_runner_until(&cfg.github, id, dl)
+    })
+}
+
+/// Testable core of the drain. `container_names` is the set of live managed
+/// container names, or `None` when container state is unknown (docker ps
+/// failed). `remove_runner` is the deadline-bounded GitHub delete (injected in
+/// tests). Delete strictly by owned runner_id (from the slot file), never by
+/// name.
+fn drain_inflight_registrations_inner(
+    cfg: &Config,
+    deadline: Instant,
+    container_names: Option<&HashSet<String>>,
+    remove_runner: impl Fn(u64, Instant) -> Result<()>,
+) -> DrainSummary {
+    let mut summary = DrainSummary::default();
+    let regs = match read_slot_assignments_for(Some(cfg)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("drain: could not read slot assignments ({e:#}); leaving all to reaper");
+            return summary;
+        }
+    };
+    for (slot_key, id_str) in &regs.assignments {
+        let Ok(slot) = slot_key.parse::<u32>() else {
+            continue;
+        };
+        if id_str.is_empty() {
+            // Reserved, JIT not yet issued — no GitHub registration exists; free it.
+            if release_slot_for(Some(cfg), slot).is_ok() {
+                summary.reservations_released += 1;
+            }
+            continue;
+        }
+        let Ok(runner_id) = id_str.parse::<u64>() else {
+            // Unparseable id: never guess — let the reaper handle it.
+            summary.deferred_to_reaper += 1;
+            continue;
+        };
+        let Some(names) = container_names else {
+            // Container state unknown: cannot prove this is an orphan — defer.
+            summary.deferred_to_reaper += 1;
+            continue;
+        };
+        if names.contains(&runner_name_for(cfg, slot)) {
+            // A live container is attached — leave the runner alive.
+            summary.containers_preserved += 1;
+            continue;
+        }
+        // In-flight orphan: registration exists, no container ⇒ deregister.
+        if Instant::now() >= deadline {
+            summary.deferred_to_reaper += 1;
+            continue;
+        }
+        match remove_runner(runner_id, deadline) {
+            Ok(()) => {
+                let _ = release_slot_for(Some(cfg), slot);
+                summary.registrations_deregistered += 1;
+            }
+            Err(e) => {
+                eprintln!("drain: remove_runner {runner_id} failed ({e:#}); leaving to reaper");
+                summary.deferred_to_reaper += 1;
+            }
+        }
+    }
+    summary
+}
+
 /// Free disk in GB as seen by the docker DAEMON, measured from inside a
 /// container: the container's root overlay lives on the daemon's storage, so
 /// this is the disk runner jobs will actually fill. A host-side `df` would
@@ -1307,6 +1424,10 @@ fn start_missing_runners_with_starter(
     let mut last_err = None;
     let mut failed_slots: HashSet<u32> = HashSet::new();
     for _ in 0..missing {
+        if crate::shutdown::is_requested() {
+            eprintln!("shutdown requested; stopping runner spawn mid-batch");
+            break;
+        }
         watchdog::ping();
         let slot = match next_slot_excluding(cfg, &failed_slots) {
             Ok(slot) => slot,
@@ -2822,5 +2943,150 @@ mod tests {
             "Path 4 (u3w) MUST NOT take the offline+busy case — that would attempt to \
              delete a runner whose job lock has not been cancelled. Got: {u3w_reapable:?}"
         );
+    }
+
+    #[test]
+    fn drain_deregisters_container_less_registration() {
+        let _env = TestEnv::new("drain-deregister-orphan");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id (simulating JIT issued but no container yet)
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // No containers exist (empty set)
+        let container_names: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        // Fake remover that records deregistered ids
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            });
+
+        assert_eq!(summary.registrations_deregistered, 1);
+        assert_eq!(*deregistered.lock().unwrap(), vec![4242]);
+        // Slot should be released
+        let assignments = read_slot_assignments().unwrap();
+        assert!(!assignments.assignments.contains_key("1"));
+    }
+
+    #[test]
+    fn drain_leaves_container_backed_registration() {
+        let _env = TestEnv::new("drain-preserve-backed");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // Container exists for this slot
+        let container_names: HashSet<String> = HashSet::from(["ez-org-runner-1".to_string()]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            });
+
+        assert_eq!(summary.containers_preserved, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        assert!(deregistered.lock().unwrap().is_empty());
+        // Slot should still have the runner_id
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.get("1"), Some(&"4242".to_string()));
+    }
+
+    #[test]
+    fn drain_releases_empty_reservation() {
+        let _env = TestEnv::new("drain-release-empty");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 but DON'T record a runner_id (empty reservation)
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        // Don't call record_slot_runner_id — leave it empty
+
+        let container_names: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |_, _| {
+                panic!("should not call remove_runner for empty reservation")
+            });
+
+        assert_eq!(summary.reservations_released, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        // Slot should be released
+        let assignments = read_slot_assignments().unwrap();
+        assert!(!assignments.assignments.contains_key("1"));
+    }
+
+    #[test]
+    fn drain_defers_when_container_state_unknown() {
+        let _env = TestEnv::new("drain-defer-unknown");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // Container state unknown (None)
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary = drain_inflight_registrations_inner(
+            &cfg,
+            deadline,
+            None, // Unknown container state
+            |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            },
+        );
+
+        assert_eq!(summary.deferred_to_reaper, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        assert!(deregistered.lock().unwrap().is_empty());
+        // Slot should still have the runner_id (deferred)
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.get("1"), Some(&"4242".to_string()));
+    }
+
+    #[test]
+    fn drain_defers_container_less_registration_when_deadline_elapsed() {
+        let _env = TestEnv::new("drain-defer-elapsed");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // No containers exist
+        let container_names: HashSet<String> = HashSet::new();
+        // Already elapsed deadline
+        let deadline = Instant::now();
+
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            });
+
+        assert_eq!(summary.deferred_to_reaper, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        assert!(deregistered.lock().unwrap().is_empty());
+        // Slot should still have the runner_id (deferred)
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.get("1"), Some(&"4242".to_string()));
     }
 }
