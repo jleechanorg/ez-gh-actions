@@ -1394,5 +1394,50 @@ if [ "$CRITICAL" -gt 0 ]; then
   echo "  4. Re-run ./doctor.sh --detail after each step"
   exit 1
 fi
-ok "fleet healthy: $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up, $LOOP_FAILS loop errors"
+# compute_verdict_summary() aggregates the per-slot LOCAL TRUTH (section 9:
+# EXECUTING_SLOTS/IDLE_SLOTS/DOWN_SLOTS/CYCLING_SLOTS, already 2-sample
+# DOWN-persistence-verified) and REMOTE TRUTH (section 10:
+# REMOTE_EXECUTING_SLOTS/REMOTE_IDLE_SLOTS/REMOTE_DOWN_SLOTS/
+# REMOTE_CYCLING_SLOTS, single ssh sample) into the headline verdict line —
+# replacing the old "$ONLINE/$TOTAL runners online ... $CONTAINER_COUNT
+# containers up" line, which mixed the GitHub API's online/busy count
+# (untrustworthy: truncates under the secondary rate limit — the SAME fleet
+# was reported as 7/11/16/19/22 across calls minutes apart, see repo
+# CLAUDE.md "Fleet capacity standard") with a Mac-LOCAL-ONLY container count
+# (silently blind to the other host's half of the two-host fleet) and never
+# consulted the per-slot arrays that are the actual ground truth (ez-gh-actions-5u3s).
+# IDLE is split into idle-ok vs idle-starved using the same
+# STARVED_PRESENT/STARVE_QUEUED_COUNT/STARVE_OLDEST_MIN inputs section 9's
+# per-slot [BAD] lines already used, so the summary line can never disagree
+# with the detail lines above it in the SAME run.
+# sed-extracted by tests/doctor_runner_verdict_line_test.sh so tests exercise
+# the real logic, never a reimplementation.
+compute_verdict_summary() {
+  # args: local_exec local_idle local_down local_cycling \
+  #       remote_exec remote_idle remote_down remote_cycling \
+  #       starved_present
+  # stdout: "<total> <configured> <executing> <idle_ok> <idle_starved> <down>"
+  local l_exec="$1" l_idle="$2" l_down="$3" l_cyc="$4"
+  local r_exec="$5" r_idle="$6" r_down="$7" r_cyc="$8"
+  local starved="${9:-0}"
+  local executing=$((l_exec + r_exec + l_cyc + r_cyc))
+  local idle_total=$((l_idle + r_idle))
+  local idle_starved=0 idle_ok=$idle_total
+  if [ "$starved" -eq 1 ]; then
+    idle_starved=$idle_total
+    idle_ok=0
+  fi
+  local down=$((l_down + r_down))
+  local total=$((executing + idle_ok + idle_starved + down))
+  local configured=$((l_exec + l_idle + l_down + l_cyc + r_exec + r_idle + r_down + r_cyc))
+  printf '%d %d %d %d %d %d\n' "$total" "$configured" "$executing" "$idle_ok" "$idle_starved" "$down"
+}
+read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDICT_IDLE_STARVED VERDICT_DOWN < <(
+  compute_verdict_summary \
+    "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#DOWN_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
+    "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_DOWN_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
+    "${STARVED_PRESENT:-0}"
+)
+ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
+info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0
