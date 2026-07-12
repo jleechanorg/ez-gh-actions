@@ -328,6 +328,13 @@ pub fn default_reaper_repos(cfg: &Config) -> Vec<String> {
 /// path (bead ez-gh-actions-qbl) so both correlate a busy runner to its
 /// phantom run/job through the exact same GitHub calls — no divergent
 /// duplicate lookups.
+///
+/// SCOPE NOTE (bead ez-gh-actions-4jv P1 follow-up): `list_workflow_jobs`
+/// here is intentionally NOT gated by the REST-budget floor. Both
+/// callers of `collect_repo_runs` are event-driven (CLI invocation,
+/// zombie-slot self-heal), not serve-loop iterations -- they cannot
+/// starve `ensure_count` the way `queue_monitor`'s per-tick reads could.
+/// See `canary::run_once` for the parallel exemption rationale.
 pub fn collect_repo_runs(repos: &[String]) -> Result<Vec<(String, RepoRunsWithJobs)>> {
     let mut repo_runs = Vec::new();
     for repo in repos {
