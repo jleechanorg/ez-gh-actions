@@ -735,23 +735,27 @@ elif git merge-base --is-ancestor origin/main HEAD; then
    ...and $((commit_count - commit_limit)) more commits not shown"
             fi
 
-            pr_body="Auto-generated PR to sync $commit_count commits that were ahead on local main.
+            pr_body_file="$(mktemp)"
+            {
+                printf 'Auto-generated PR to sync %s commits that were ahead on local main.\n\n' "$commit_count"
+                printf 'This PR was created by integrate.sh to handle repository branch protection rules.\n\n'
+                printf 'Commits included:\n'
+                printf '%s\n\n' "$commit_list"
+                printf 'Please review and merge to complete the integration process.\n'
+            } > "$pr_body_file"
 
-This PR was created by integrate.sh to handle repository branch protection rules.
-
-Commits included:
-$commit_list
-
-Please review and merge to complete the integration process."
-
-            if pr_url=$(gh pr create --title "$pr_title" --body "$pr_body" 2>/dev/null); then
+            # Avoid shell interpolation by passing PR body as an explicit file argument.
+            # This prevents Markdown from being interpreted as shell code and preserves exact text.
+            if pr_url=$(gh pr create --title "$pr_title" --body-file "$pr_body_file" 2>/dev/null); then
                 echo -e "${GREEN}✅ Created PR: $pr_url${NC}"
                 echo "   Please review and merge the PR, then re-run integrate.sh"
+                rm -f "$pr_body_file"
                 die 0
             else
                 echo "⚠️  Could not create PR automatically. Please create one manually:"
                 echo "   Branch: $sync_branch"
                 echo "   URL: https://github.com/$(get_github_repo_url)/compare/$sync_branch"
+                rm -f "$pr_body_file"
                 die 1 "Could not create PR automatically. Please create one manually using the URL above"
             fi
         else

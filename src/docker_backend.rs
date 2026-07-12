@@ -9,7 +9,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Once;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
@@ -104,6 +104,14 @@ fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str) -> bool {
         return false;
     };
     now_epoch_secs().saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
+}
+
+/// Seconds elapsed since `slot`'s `registered_at` timestamp, if recorded.
+/// Used to log how close a grace-window skip-reap decision was to the
+/// boundary, rather than just the fixed window size.
+fn seconds_since_registered(assignments: &SlotAssignments, slot: &str) -> Option<u64> {
+    let &registered_at = assignments.registered_at.get(slot)?;
+    Some(now_epoch_secs().saturating_sub(registered_at))
 }
 
 /// Resolve the path of the slot assignment file. Honors `EZGHA_SLOT_ASSIGNMENTS_PATH`
@@ -379,12 +387,15 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     watchdog::ping();
     let assignments = read_slot_assignments_for(Some(cfg))?;
     let local_container_names = match managed_containers() {
-        Ok(containers) => Some(
-            containers
-                .into_iter()
-                .map(|container| container.name)
-                .collect::<HashSet<_>>(),
-        ),
+        Ok(containers) => {
+            poll_peak_rss(&containers);
+            Some(
+                containers
+                    .into_iter()
+                    .map(|container| container.name)
+                    .collect::<HashSet<_>>(),
+            )
+        }
         Err(err) => {
             eprintln!(
                 "warning: skipping container-aware stale-slot reconciliation (docker unreachable): {err:#}"
@@ -392,6 +403,9 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             None
         }
     };
+    if let Some(names) = &local_container_names {
+        reap_stale_peak_rss_entries(names);
+    }
     let reclaimed = release_stale_slots_from_with_containers_for(
         Some(cfg),
         &assignments,
@@ -651,8 +665,9 @@ fn release_stale_slots_from_with_containers_for(
                         && !local_names.contains(&expected_name)
                     {
                         if slot_in_grace_window(assignments, slot) {
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
                             eprintln!(
-                                "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered <{}s ago (JIT-propagation grace window)",
+                                "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered {elapsed}s ago (within {}s JIT-propagation grace window)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
@@ -766,8 +781,9 @@ fn offline_not_busy_owned_missing_container_registrations(
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
         if slot_in_grace_window(assignments, slot) {
+            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
             eprintln!(
-                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at within {}s grace window",
+                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at {elapsed}s ago (within {}s grace window)",
                 runner.name,
                 runner.id,
                 REGISTRATION_GRACE_WINDOW.as_secs()
@@ -982,11 +998,20 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
     if let Some((ncpu, daemon_mem)) = capacity {
         let n_f = (cfg.runner.count as f64).max(1.0);
         let n_u = (cfg.runner.count as u64).max(1);
-        // Per-runner share of the daemon, floored at validate() minimums so a
-        // hand-edited cfg that over-aggregates still gets a sane per-runner
-        // request rather than docker run exploding from over-memory.
+        // Per-runner share of the FLEET budget (daemon capacity minus the
+        // guest/Docker-overhead reserve), floored at validate() minimums so
+        // a hand-edited cfg that over-aggregates still gets a sane
+        // per-runner request rather than docker run exploding from
+        // over-memory. Mirrors derive_memory_budget's fleet_budget_mb =
+        // vm_total_mb - guest_reserve_mb formula (bead ez-gh-actions-yz6b
+        // round 3) so the startup fail-loud guard / `ezgha doctor` preview
+        // and the ACTUAL docker run --memory limit stay in sync — before
+        // this fix they were two disconnected calculations and the guard
+        // could report "OK" while runners were still spawned with zero real
+        // guest headroom (daemon_mem / count, ignoring guest_reserve_mb).
+        let fleet_mem_budget = daemon_mem.saturating_sub(cfg.runner.guest_reserve_mb);
         let cpu_share = (ncpu / n_f).max(0.5);
-        let mem_share = (daemon_mem / n_u).max(512);
+        let mem_share = (fleet_mem_budget / n_u).max(512);
         if cpus > cpu_share {
             eprintln!(
                 "note: clamping cpus {cpus} -> {cpu_share} (daemon {ncpu} / {} runners)",
@@ -996,13 +1021,161 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
         }
         if mem > mem_share {
             eprintln!(
-                "note: clamping memory {mem} MB -> {mem_share} MB (daemon {daemon_mem} / {} runners)",
+                "note: clamping memory {mem} MB -> {mem_share} MB (fleet_budget {fleet_mem_budget} MB \
+                 [daemon {daemon_mem} MB - guest_reserve {} MB] / {} runners)",
+                cfg.runner.guest_reserve_mb,
                 cfg.runner.count
             );
             mem = mem_share;
         }
     }
     (cpus, mem)
+}
+
+/// Derived, VM-aware memory budget for the fleet, computed once at daemon
+/// startup from explicit config — NOT the same computation as
+/// `effective_limits`, which clamps live per-`docker run` requests against
+/// whatever `daemon_capacity()` reports at that instant. This is an audit /
+/// fail-loud guard: bead ez-gh-actions-yz6b. The pre-existing clamp divided
+/// the whole docker-daemon-reported memory by runner count, leaving zero
+/// headroom for the Docker daemon / guest OS running inside the VM (Colima
+/// et al). This computes the budget explicitly and refuses to start rather
+/// than silently degrading below `runner_floor_mb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    pub vm_total_mb: u64,
+    pub guest_reserve_mb: u64,
+    pub fleet_budget_mb: u64,
+    pub runner_count: u32,
+    pub runner_floor_mb: u64,
+    pub per_runner_budget_mb: u64,
+}
+
+/// Pure derivation, no I/O — easy to unit test. `fleet_budget_mb =
+/// vm_total_mb - guest_reserve_mb` (saturating, never underflows).
+/// `per_runner_budget_mb = fleet_budget_mb / runner_count`. FAILS LOUD
+/// (returns `Err`, does not clamp) if `runner_count * runner_floor_mb >
+/// fleet_budget_mb` — the caller must not silently under-provision runners
+/// below the research-validated floor (an earlier under-floor clamp caused
+/// a jest OOM failure class).
+pub fn derive_memory_budget(
+    vm_total_mb: u64,
+    guest_reserve_mb: u64,
+    runner_count: u32,
+    runner_floor_mb: u64,
+) -> Result<MemoryBudget> {
+    let count_u64 = (runner_count as u64).max(1);
+    let fleet_budget_mb = vm_total_mb.saturating_sub(guest_reserve_mb);
+    let required_mb = count_u64.saturating_mul(runner_floor_mb);
+    if required_mb > fleet_budget_mb {
+        let shortfall_mb = required_mb - fleet_budget_mb;
+        anyhow::bail!(
+            "refusing to start: memory budget shortfall: vm_total_mb={vm_total_mb} \
+             guest_reserve_mb={guest_reserve_mb} fleet_budget_mb={fleet_budget_mb} \
+             runner_count={runner_count} runner_floor_mb={runner_floor_mb} \
+             required_mb={required_mb} shortfall_mb={shortfall_mb}; lower runner.count, \
+             raise runner.vm_total_mb (must match the real VM ceiling — check `colima status` \
+             / `limactl list`), or lower runner.guest_reserve_mb. Refusing to silently clamp \
+             below the runner_floor_mb floor (bead ez-gh-actions-yz6b: an earlier under-floor \
+             clamp caused a jest OOM failure class)."
+        );
+    }
+    let per_runner_budget_mb = fleet_budget_mb / count_u64;
+    Ok(MemoryBudget {
+        vm_total_mb,
+        guest_reserve_mb,
+        fleet_budget_mb,
+        runner_count,
+        runner_floor_mb,
+        per_runner_budget_mb,
+    })
+}
+
+/// Resolve `vm_total_mb`: explicit `cfg.runner.vm_total_mb` override, else
+/// `daemon_capacity()` auto-detect (preserving pre-yz6b auto-detect
+/// behavior when the key is unset). Shared by `resolve_and_log_memory_budget`
+/// (Serve startup, fail-loud) and `preview_memory_budget` (`ezgha doctor`,
+/// read-only, never blocks).
+fn resolve_vm_total_mb(cfg: &Config) -> Option<u64> {
+    cfg.runner
+        .vm_total_mb
+        .or_else(|| daemon_capacity().map(|(_, mem)| mem))
+}
+
+/// Resolve `vm_total_mb` (explicit `cfg.runner.vm_total_mb` override, else
+/// `daemon_capacity()` auto-detect — preserving pre-yz6b auto-detect
+/// behavior when the key is unset), derive the fleet memory budget, and log
+/// the full derivation at info level so it's auditable in the journal
+/// (`journalctl --user -u ezgha.service`). Returns `Ok(None)` (not an
+/// error) if NEITHER an explicit config value NOR `daemon_capacity()` is
+/// available — a telemetry/audit feature must never be able to block
+/// startup on its own inability to introspect the environment (Self-Outage
+/// Prevention Principle). Returns `Err` only for the deliberate fail-loud
+/// case inside `derive_memory_budget`.
+pub fn resolve_and_log_memory_budget(cfg: &Config) -> Result<Option<MemoryBudget>> {
+    let Some(vm_total_mb) = resolve_vm_total_mb(cfg) else {
+        eprintln!(
+            "warning: cannot determine VM/daemon memory ceiling (runner.vm_total_mb \
+             unset and the `docker info` capacity probe failed); skipping startup \
+             memory budget check. Set runner.vm_total_mb explicitly (check `colima \
+             status` / `limactl list`) to enable it."
+        );
+        return Ok(None);
+    };
+    let budget = derive_memory_budget(
+        vm_total_mb,
+        cfg.runner.guest_reserve_mb,
+        cfg.runner.count,
+        cfg.runner.runner_floor_mb,
+    )?;
+    println!(
+        "memory budget: vm_total_mb={} guest_reserve_mb={} fleet_budget_mb={} runner_count={} \
+         per_runner_budget_mb={} runner_floor_mb={}",
+        budget.vm_total_mb,
+        budget.guest_reserve_mb,
+        budget.fleet_budget_mb,
+        budget.runner_count,
+        budget.per_runner_budget_mb,
+        budget.runner_floor_mb,
+    );
+    Ok(Some(budget))
+}
+
+/// Read-only PREVIEW of the same derivation used at `Serve` startup. Never
+/// blocks, never prints via `bail!`/`Err` propagation, never restarts
+/// anything — for `ezgha doctor` so an operator can see whether the NEXT
+/// `ezgha serve` (re)start would trip the fail-loud guard, without actually
+/// triggering it. (Self-Outage Prevention Principle: discovering "restart
+/// would fail loud" via a live crash-loop is exactly the outage this
+/// preview exists to prevent — bead ez-gh-actions-yz6b round 2.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryBudgetPreview {
+    /// The configured fleet fits within the derived budget.
+    Pass(MemoryBudget),
+    /// The configured fleet would fail the startup fail-loud guard; the
+    /// String is the same detailed message `derive_memory_budget` would
+    /// bail! with (contains vm_total_mb/guest_reserve_mb/fleet_budget_mb/
+    /// runner_count/runner_floor_mb/required_mb/shortfall_mb).
+    Fail(String),
+    /// Could not determine `vm_total_mb` at all (no config override and
+    /// `docker info` capacity probe failed) — not a pass or fail verdict,
+    /// just "can't tell".
+    Unknown,
+}
+
+pub fn preview_memory_budget(cfg: &Config) -> MemoryBudgetPreview {
+    let Some(vm_total_mb) = resolve_vm_total_mb(cfg) else {
+        return MemoryBudgetPreview::Unknown;
+    };
+    match derive_memory_budget(
+        vm_total_mb,
+        cfg.runner.guest_reserve_mb,
+        cfg.runner.count,
+        cfg.runner.runner_floor_mb,
+    ) {
+        Ok(budget) => MemoryBudgetPreview::Pass(budget),
+        Err(err) => MemoryBudgetPreview::Fail(format!("{err:#}")),
+    }
 }
 
 /// Start one ephemeral JIT runner container in a slot the caller has already
@@ -1178,6 +1351,134 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
     Ok(containers)
 }
 
+/// Process-wide high-water-mark of each managed runner container's RSS, in
+/// MB, keyed by container name. Updated every `release_stale_slots` tick
+/// (the existing per-serve-tick reconciliation loop) and logged once a
+/// tracked container disappears (job finished / slot reclaimed / container
+/// removed). Bead ez-gh-actions-yz6b: this is observability only — it does
+/// NOT feed back into scheduling in this bead (deferred to a possible
+/// future VM-resize decision).
+static PEAK_RSS_MB: std::sync::Mutex<BTreeMap<String, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Debounce window for `poll_peak_rss`: `ensure_count_outcome` calls
+/// `release_stale_slots` twice per serve tick (once before spawning new
+/// runners, once after, to release failed reservations from that cycle) —
+/// without this, the `docker stats` subprocess would fire twice per tick
+/// for no additional telemetry value. 5s is comfortably below the normal
+/// tick cadence (`serve_tick_seconds`, default 30, floor 5) so back-to-back
+/// same-tick calls collapse into one poll while genuinely separate ticks
+/// still poll fresh.
+const PEAK_RSS_POLL_DEBOUNCE: Duration = Duration::from_secs(5);
+
+static LAST_PEAK_RSS_POLL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Poll `docker stats --no-stream` for every currently-managed container
+/// and update the process-wide peak-RSS high-water mark. Best-effort: any
+/// failure (docker busy, transient error, unrecognized output format) is
+/// swallowed with a warning — RSS telemetry must never be able to block or
+/// break the reconciliation tick it rides along with.
+fn poll_peak_rss(containers: &[ManagedContainer]) {
+    // Debounce: collapse back-to-back calls within the same tick.
+    {
+        let mut last = LAST_PEAK_RSS_POLL.lock().unwrap();
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < PEAK_RSS_POLL_DEBOUNCE {
+                return;
+            }
+        }
+        *last = Some(now);
+    }
+
+    if containers.is_empty() {
+        return;
+    }
+    let mut cmd = docker_cmd();
+    cmd.arg("stats");
+    cmd.args(["--no-stream", "--format", "{{.Name}}\t{{.MemUsage}}"]);
+    for c in containers {
+        cmd.arg(&c.id);
+    }
+    // Deliberately short, dedicated timeout (NOT the full 45s DOCKER_TIMEOUT):
+    // this call runs inside release_stale_slots, which ensure_count_outcome
+    // calls BEFORE checking alive count / spawning replacements — a stalled
+    // telemetry-only call must not meaningfully delay respawn decisions.
+    // Bead ez-gh-actions-yz6b round 3 (adversarial review P2 finding).
+    const PEAK_RSS_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+    let out = match run_docker_with_timeout(cmd, "polling peak RSS", PEAK_RSS_POLL_TIMEOUT) {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "warning: docker stats (peak RSS poll) failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!("warning: docker stats (peak RSS poll) failed: {err:#}");
+            return;
+        }
+    };
+    let mut peaks = PEAK_RSS_MB.lock().unwrap();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((name, mem_usage)) = line.split_once('\t') else {
+            continue;
+        };
+        let Some(mb) = parse_mem_usage_mb(mem_usage) else {
+            continue;
+        };
+        let entry = peaks.entry(name.to_string()).or_insert(0);
+        if mb > *entry {
+            *entry = mb;
+        }
+    }
+}
+
+/// Parse docker stats' `MemUsage` column, e.g. `"512.3MiB / 3GiB"`,
+/// returning the USED side converted to whole MB (rounded). Returns `None`
+/// on any format this function doesn't recognize rather than panicking —
+/// telemetry parsing must never crash the daemon.
+fn parse_mem_usage_mb(s: &str) -> Option<u64> {
+    let used = s.split('/').next()?.trim();
+    parse_docker_size_mb(used)
+}
+
+fn parse_docker_size_mb(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let split_at = s.find(|c: char| c.is_alphabetic())?;
+    let (num_part, unit) = s.split_at(split_at);
+    let value: f64 = num_part.trim().parse().ok()?;
+    let mb = match unit.trim() {
+        "B" => value / 1024.0 / 1024.0,
+        "KiB" | "kB" => value / 1024.0,
+        "MiB" | "MB" => value,
+        "GiB" | "GB" => value * 1024.0,
+        _ => return None,
+    };
+    Some(mb.round() as u64)
+}
+
+/// Log and drop peak-RSS entries for containers that vanished since the
+/// last poll (job finished, slot reclaimed, container removed). Called once
+/// per `release_stale_slots` tick with the fresh set of currently-alive
+/// managed container names.
+fn reap_stale_peak_rss_entries(alive_names: &HashSet<String>) {
+    let mut peaks = PEAK_RSS_MB.lock().unwrap();
+    let gone: Vec<String> = peaks
+        .keys()
+        .filter(|name| !alive_names.contains(*name))
+        .cloned()
+        .collect();
+    for name in gone {
+        if let Some(peak_mb) = peaks.remove(&name) {
+            eprintln!(
+                "info: runner {name} reclaimed — peak RSS {peak_mb} MB observed over lifetime"
+            );
+        }
+    }
+}
+
 fn current_prefix_containers<'a>(
     containers: &'a [ManagedContainer],
     cfg: &Config,
@@ -1245,6 +1546,123 @@ pub fn stop_all(cfg: &Config) -> Result<usize> {
         let _ = release_slot_for(Some(cfg), slot);
     }
     Ok(owned_containers.len())
+}
+
+/// Outcome counts from a graceful-shutdown drain — used for the operator log
+/// line and for unit tests.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DrainSummary {
+    /// Empty-id reservations (JIT never issued) freed locally.
+    pub reservations_released: usize,
+    /// In-flight orphan registrations (no container) deregistered on GitHub.
+    pub registrations_deregistered: usize,
+    /// Registrations backed by a live container — left alive (survive restart).
+    pub containers_preserved: usize,
+    /// Left for `release_stale_slots` + 60s grace window (deadline hit, delete
+    /// failed, container state unknown, or unparseable id). Fail-safe.
+    pub deferred_to_reaper: usize,
+}
+
+/// Graceful-shutdown drain (bead ez-gh-actions-30p). On SIGTERM the serve loop
+/// calls this after breaking out of the loop. It deregisters JIT registrations
+/// that are recorded in the slot file but have NO backing container (the orphan
+/// window), so a daemon restart never leaves a live GitHub registration with no
+/// runner. Registrations backed by a running container are LEFT UNTOUCHED — the
+/// runner (busy or idle) survives the restart and is re-adopted by `ensure_count`
+/// on next start (requirement 3: never kill running containers). Best-effort and
+/// bounded by `deadline` (≤15s); anything not drained in time is reclaimed by the
+/// reaper. Fail-safe, never fail-orphan: on any uncertainty it defers.
+///
+/// CONCURRENCY INVARIANT: this drain runs AFTER the serve loop has broken, in a
+/// process where spawning is single-threaded and `docker run` is synchronous, so
+/// by the time we read the slot file no new JIT registration can enter the orphan
+/// window. If spawning ever becomes concurrent/async (a background spawner still
+/// live during drain), this function MUST additionally honor the
+/// `REGISTRATION_GRACE_WINDOW` guard (as `release_stale_slots` does) before
+/// deregistering, or it could delete a registration whose container is still
+/// mid-launch on another thread.
+pub fn drain_inflight_registrations(cfg: &Config, deadline: Instant) -> DrainSummary {
+    // Source of truth for "is a real container attached to this slot". If we
+    // CANNOT list containers, we must not risk deregistering a live runner —
+    // pass None so assigned slots defer to the reaper (empty reservations are
+    // still safe to free: no GH registration exists for them).
+    let container_names: Option<HashSet<String>> = match managed_containers() {
+        Ok(list) => Some(list.into_iter().map(|c| c.name).collect()),
+        Err(e) => {
+            eprintln!(
+                "drain: could not list containers ({e:#}); releasing empty reservations only, \
+                 leaving assigned slots to release_stale_slots"
+            );
+            None
+        }
+    };
+    drain_inflight_registrations_inner(cfg, deadline, container_names.as_ref(), |id, dl| {
+        github::remove_runner_until(&cfg.github, id, dl)
+    })
+}
+
+/// Testable core of the drain. `container_names` is the set of live managed
+/// container names, or `None` when container state is unknown (docker ps
+/// failed). `remove_runner` is the deadline-bounded GitHub delete (injected in
+/// tests). Delete strictly by owned runner_id (from the slot file), never by
+/// name.
+fn drain_inflight_registrations_inner(
+    cfg: &Config,
+    deadline: Instant,
+    container_names: Option<&HashSet<String>>,
+    remove_runner: impl Fn(u64, Instant) -> Result<()>,
+) -> DrainSummary {
+    let mut summary = DrainSummary::default();
+    let regs = match read_slot_assignments_for(Some(cfg)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("drain: could not read slot assignments ({e:#}); leaving all to reaper");
+            return summary;
+        }
+    };
+    for (slot_key, id_str) in &regs.assignments {
+        let Ok(slot) = slot_key.parse::<u32>() else {
+            continue;
+        };
+        if id_str.is_empty() {
+            // Reserved, JIT not yet issued — no GitHub registration exists; free it.
+            if release_slot_for(Some(cfg), slot).is_ok() {
+                summary.reservations_released += 1;
+            }
+            continue;
+        }
+        let Ok(runner_id) = id_str.parse::<u64>() else {
+            // Unparseable id: never guess — let the reaper handle it.
+            summary.deferred_to_reaper += 1;
+            continue;
+        };
+        let Some(names) = container_names else {
+            // Container state unknown: cannot prove this is an orphan — defer.
+            summary.deferred_to_reaper += 1;
+            continue;
+        };
+        if names.contains(&runner_name_for(cfg, slot)) {
+            // A live container is attached — leave the runner alive.
+            summary.containers_preserved += 1;
+            continue;
+        }
+        // In-flight orphan: registration exists, no container ⇒ deregister.
+        if Instant::now() >= deadline {
+            summary.deferred_to_reaper += 1;
+            continue;
+        }
+        match remove_runner(runner_id, deadline) {
+            Ok(()) => {
+                let _ = release_slot_for(Some(cfg), slot);
+                summary.registrations_deregistered += 1;
+            }
+            Err(e) => {
+                eprintln!("drain: remove_runner {runner_id} failed ({e:#}); leaving to reaper");
+                summary.deferred_to_reaper += 1;
+            }
+        }
+    }
+    summary
 }
 
 /// Free disk in GB as seen by the docker DAEMON, measured from inside a
@@ -1366,6 +1784,10 @@ fn start_missing_runners_with_starter(
     let mut last_err = None;
     let mut failed_slots: HashSet<u32> = HashSet::new();
     for _ in 0..missing {
+        if crate::shutdown::is_requested() {
+            eprintln!("shutdown requested; stopping runner spawn mid-batch");
+            break;
+        }
         watchdog::ping();
         let slot = match next_slot_excluding(cfg, &failed_slots) {
             Ok(slot) => slot,
@@ -1693,6 +2115,149 @@ mod tests {
             "per_runner * count must fit daemon memory (got mem={mem}, count={}, product={mem_total}, daemon={daemon_mem})",
             cfg.runner.count
         );
+    }
+
+    #[test]
+    fn effective_limits_respects_guest_reserve_ground_truth() {
+        // Regression for a P1 gap found in adversarial review round 3:
+        // before this fix, effective_limits_with_capacity divided the RAW
+        // daemon capacity by count, completely ignoring guest_reserve_mb —
+        // meaning the startup fail-loud guard / `ezgha doctor` preview
+        // could report "OK" while the ACTUAL per-container docker run
+        // --memory limit still left zero real headroom for the guest OS /
+        // Docker daemon. Ground truth: 48163 MB daemon (Colima VM), 4096 MB
+        // guest reserve (default), 16 runners -> fleet_budget = 44067,
+        // per-runner <= 44067/16 = 2754 MB, NOT ~3010 MB (48163/16, the
+        // pre-fix number).
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 16;
+        cfg.limits.memory_mb = 5977; // matches jeff-ubuntu's real config.toml
+        assert_eq!(cfg.runner.guest_reserve_mb, 4096); // sanity: default
+        let (_, mem) = effective_limits_with_capacity(&cfg, Some((4.0, 48163)));
+        assert!(
+            mem <= 2754,
+            "effective_limits must respect guest_reserve_mb: expected <= 2754 MB (44067/16), got {mem} MB"
+        );
+        assert!(mem >= 512); // floor still applies
+    }
+
+    #[test]
+    fn derive_memory_budget_happy_path_ground_truth() {
+        // Ground truth from the 2026-07-10 jeff-ubuntu incident (bead
+        // ez-gh-actions-yz6b): 48163 MB Colima VM, 4096 MB guest reserve,
+        // 16 runners. Uses an explicit 2048 MB floor ("bare survivable
+        // minimum" per the panel refinement note) rather than the 3072 MB
+        // default — at the DEFAULT floor these exact numbers correctly fail
+        // loud (see `derive_memory_budget_fails_loud_when_floor_unmet`
+        // below); that is the deliberate bug this bead fixes, not a test
+        // bug (the pre-yz6b fleet was already running underwater at the
+        // default floor, which is *why* this bead exists).
+        let budget = derive_memory_budget(48163, 4096, 16, 2048).unwrap();
+        assert_eq!(budget.fleet_budget_mb, 44067); // 48163 - 4096
+        assert_eq!(budget.per_runner_budget_mb, 2754); // 44067 / 16
+        assert!(budget.per_runner_budget_mb >= 2048);
+    }
+
+    #[test]
+    fn derive_memory_budget_fails_loud_when_floor_unmet() {
+        // Same ground-truth VM/reserve/count, but the DEFAULT 3072 MB
+        // floor: 16 * 3072 = 49152 > 44067 fleet_budget -> must fail loud,
+        // not silently clamp below 3072 MB (the regression this bead exists
+        // to prevent).
+        let err = derive_memory_budget(48163, 4096, 16, 3072).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("48163"), "missing vm_total: {msg}");
+        assert!(msg.contains("4096"), "missing guest_reserve: {msg}");
+        assert!(msg.contains("44067"), "missing fleet_budget: {msg}");
+        assert!(msg.contains("16"), "missing runner_count: {msg}");
+        assert!(msg.contains("3072"), "missing runner_floor: {msg}");
+        assert!(
+            msg.contains("5085"),
+            "missing shortfall (49152-44067): {msg}"
+        );
+    }
+
+    #[test]
+    fn preview_memory_budget_pass_matches_derive_memory_budget_happy_path() {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.vm_total_mb = Some(48163);
+        cfg.runner.guest_reserve_mb = 4096;
+        cfg.runner.runner_floor_mb = 2048; // "bare survivable minimum" — see round-1 happy-path test
+        match preview_memory_budget(&cfg) {
+            MemoryBudgetPreview::Pass(budget) => {
+                assert_eq!(budget.fleet_budget_mb, 44067);
+                assert_eq!(budget.per_runner_budget_mb, 2754);
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_memory_budget_fail_matches_derive_memory_budget_fail_loud_path() {
+        let mut cfg = cfg_with(16, "ez-org-runner");
+        cfg.runner.vm_total_mb = Some(48163);
+        cfg.runner.guest_reserve_mb = 4096;
+        cfg.runner.runner_floor_mb = 3072; // default — fails loud at count=16 (see round-1 test)
+        match preview_memory_budget(&cfg) {
+            MemoryBudgetPreview::Fail(msg) => {
+                assert!(
+                    msg.contains("shortfall_mb=5085"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runner_config_missing_new_keys_falls_back_to_documented_defaults() {
+        // A config.toml written before this bead (no vm_total_mb /
+        // guest_reserve_mb / runner_floor_mb keys) must still deserialize
+        // via serde defaults, not panic, and the derivation must run
+        // end-to-end without panicking on those defaults.
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 2
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.runner.vm_total_mb, None);
+        assert_eq!(cfg.runner.guest_reserve_mb, 4096);
+        assert_eq!(cfg.runner.runner_floor_mb, 3072);
+        let budget = derive_memory_budget(
+            16384,
+            cfg.runner.guest_reserve_mb,
+            cfg.runner.count,
+            cfg.runner.runner_floor_mb,
+        )
+        .unwrap();
+        assert_eq!(budget.fleet_budget_mb, 16384 - 4096);
+        assert!(budget.per_runner_budget_mb >= cfg.runner.runner_floor_mb);
+    }
+
+    #[test]
+    fn parse_docker_size_mb_handles_common_units() {
+        assert_eq!(parse_docker_size_mb("512.3MiB"), Some(512));
+        assert_eq!(parse_docker_size_mb("1.5GiB"), Some(1536));
+        assert_eq!(parse_docker_size_mb("2048KiB"), Some(2));
+        assert_eq!(parse_docker_size_mb("bogus"), None);
+    }
+
+    #[test]
+    fn parse_mem_usage_mb_takes_used_side_of_slash() {
+        assert_eq!(parse_mem_usage_mb("512.3MiB / 3GiB"), Some(512));
+        assert_eq!(parse_mem_usage_mb("not a mem usage string"), None);
     }
 
     #[test]
@@ -3183,5 +3748,150 @@ mod tests {
             "Path 4 (u3w) MUST NOT take the offline+busy case — that would attempt to \
              delete a runner whose job lock has not been cancelled. Got: {u3w_reapable:?}"
         );
+    }
+
+    #[test]
+    fn drain_deregisters_container_less_registration() {
+        let _env = TestEnv::new("drain-deregister-orphan");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id (simulating JIT issued but no container yet)
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // No containers exist (empty set)
+        let container_names: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        // Fake remover that records deregistered ids
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            });
+
+        assert_eq!(summary.registrations_deregistered, 1);
+        assert_eq!(*deregistered.lock().unwrap(), vec![4242]);
+        // Slot should be released
+        let assignments = read_slot_assignments().unwrap();
+        assert!(!assignments.assignments.contains_key("1"));
+    }
+
+    #[test]
+    fn drain_leaves_container_backed_registration() {
+        let _env = TestEnv::new("drain-preserve-backed");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // Container exists for this slot
+        let container_names: HashSet<String> = HashSet::from(["ez-org-runner-1".to_string()]);
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            });
+
+        assert_eq!(summary.containers_preserved, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        assert!(deregistered.lock().unwrap().is_empty());
+        // Slot should still have the runner_id
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.get("1"), Some(&"4242".to_string()));
+    }
+
+    #[test]
+    fn drain_releases_empty_reservation() {
+        let _env = TestEnv::new("drain-release-empty");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 but DON'T record a runner_id (empty reservation)
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        // Don't call record_slot_runner_id — leave it empty
+
+        let container_names: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |_, _| {
+                panic!("should not call remove_runner for empty reservation")
+            });
+
+        assert_eq!(summary.reservations_released, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        // Slot should be released
+        let assignments = read_slot_assignments().unwrap();
+        assert!(!assignments.assignments.contains_key("1"));
+    }
+
+    #[test]
+    fn drain_defers_when_container_state_unknown() {
+        let _env = TestEnv::new("drain-defer-unknown");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // Container state unknown (None)
+        let deadline = Instant::now() + Duration::from_secs(15);
+
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary = drain_inflight_registrations_inner(
+            &cfg,
+            deadline,
+            None, // Unknown container state
+            |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            },
+        );
+
+        assert_eq!(summary.deferred_to_reaper, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        assert!(deregistered.lock().unwrap().is_empty());
+        // Slot should still have the runner_id (deferred)
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.get("1"), Some(&"4242".to_string()));
+    }
+
+    #[test]
+    fn drain_defers_container_less_registration_when_deadline_elapsed() {
+        let _env = TestEnv::new("drain-defer-elapsed");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        // Reserve slot 1 and record a runner_id
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+        record_slot_runner_id(slot, 4242).unwrap();
+
+        // No containers exist
+        let container_names: HashSet<String> = HashSet::new();
+        // Already elapsed deadline
+        let deadline = Instant::now();
+
+        let deregistered: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let summary =
+            drain_inflight_registrations_inner(&cfg, deadline, Some(&container_names), |id, _| {
+                deregistered.lock().unwrap().push(id);
+                Ok(())
+            });
+
+        assert_eq!(summary.deferred_to_reaper, 1);
+        assert_eq!(summary.registrations_deregistered, 0);
+        assert!(deregistered.lock().unwrap().is_empty());
+        // Slot should still have the runner_id (deferred)
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.get("1"), Some(&"4242".to_string()));
     }
 }

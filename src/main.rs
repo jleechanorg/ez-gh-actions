@@ -3,6 +3,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 mod alert;
 mod backend;
 mod canary;
@@ -13,6 +16,7 @@ mod platform;
 mod queue_monitor;
 mod reaper;
 mod service;
+mod shutdown;
 mod watchdog;
 
 use alert::Severity;
@@ -195,6 +199,14 @@ fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
 /// the socket may not be ready immediately). PolicyBlocked errors are permanent
 /// and are returned immediately without retrying.
 ///
+/// `deadline` (computed below from `timeout`) is threaded into every
+/// `maybe_restart_backend` call this loop makes, so a backend-restart attempt's
+/// own timeout is clamped to whatever remains of `timeout` (see
+/// `BackendRestartTiming::clamped_restart_timeout`) — this function never itself
+/// blocks meaningfully past `timeout`, which keeps it inside the systemd unit's
+/// TimeoutStartSec margin (service.rs) even when a restart command is slow.
+/// See bead jleechan-9c7l finding #1.
+///
 /// Bead: ez-gh-actions-3z5
 fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::Backend> {
     let deadline = Instant::now() + timeout;
@@ -226,7 +238,7 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                     // Exhausted budget — surface the same rich diagnostic as choose_backend.
                     return choose_backend(cfg);
                 }
-                if maybe_restart_backend(cfg, &mut recovery) {
+                if maybe_restart_backend(cfg, &mut recovery, Some(deadline)) {
                     eprintln!(
                         "backend restart attempted while waiting for service readiness; retrying quickly"
                     );
@@ -251,7 +263,29 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
 const BACKEND_RESTART_COOLDOWN: Duration = Duration::from_secs(60);
 const BACKEND_RESTART_WINDOW: Duration = Duration::from_secs(600);
 const BACKEND_RESTART_MAX_ATTEMPTS: u32 = 3;
-const BACKEND_RESTART_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+// A real Colima cold start exceeded the old 30s budget and left detached Lima children.
+// This is a ceiling, not a guarantee: when a caller supplies an outer deadline (see
+// `clamped_restart_timeout`), the effective per-attempt timeout is clamped to whatever
+// budget remains under that deadline, so a slow cold start can never itself blow past
+// the caller's own timeout (e.g. wait_for_backend's 120s startup budget / systemd
+// TimeoutStartSec=130 in service.rs) and get killed mid-flight by the outer layer
+// instead of failing cleanly here.
+const BACKEND_RESTART_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+// Below this much remaining outer budget, don't even start a restart attempt — it
+// would almost certainly still be running when the caller's own deadline expires,
+// so starting one just trades a clean "no budget left" failure for a messy one where
+// the outer deadline (systemd, wait_for_backend) kills it mid-flight instead.
+const BACKEND_RESTART_MIN_BUDGET: Duration = Duration::from_secs(10);
+// Reserved off the remaining outer budget before it's used as a restart-command (or
+// health-poll) timeout, so SIGKILL + wait() cleanup has time to run and the caller
+// still sees control returned before its own deadline hits.
+const BACKEND_RESTART_SAFETY_MARGIN: Duration = Duration::from_secs(5);
+// A restart command exiting 0 doesn't mean Docker is reachable yet — the socket can
+// lag the process reporting "started" by a few seconds. Poll instead of taking a
+// single immediate reading, so a real recovery isn't misreported as a failed attempt
+// (which would burn one of BACKEND_RESTART_MAX_ATTEMPTS and start a cooldown).
+const BACKEND_RESTART_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const BACKEND_RESTART_HEALTH_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug)]
 struct BackendRecoveryState {
@@ -331,11 +365,15 @@ impl BackendRecoveryState {
 }
 
 fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<bool> {
-    let mut child = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to execute {cmd}"))?;
     let start = Instant::now();
@@ -347,6 +385,10 @@ fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration)
             return Ok(status.success());
         }
         if start.elapsed() >= timeout {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
             let _ = child.kill();
             let _ = child.wait();
             bail!(
@@ -358,24 +400,145 @@ fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration)
     }
 }
 
-fn run_restart_command(cmd: &str, args: &[&str]) -> Result<bool> {
-    run_restart_command_with_timeout(cmd, args, BACKEND_RESTART_COMMAND_TIMEOUT)
+/// Timing knobs for `attempt_backend_restart_with`, factored out of the hardcoded
+/// constants so tests can shrink every duration involved (command ceiling, floor,
+/// margin, health-poll ceiling/interval) without waiting on real multi-second sleeps.
+/// Production code always uses `BackendRestartTiming::PRODUCTION`.
+#[derive(Clone, Copy)]
+struct BackendRestartTiming {
+    command_ceiling: Duration,
+    min_budget: Duration,
+    safety_margin: Duration,
+    health_poll_ceiling: Duration,
+    health_poll_interval: Duration,
 }
 
-fn attempt_backend_restart() -> Result<bool> {
-    // Keep host bootstrap logic portable: prefer the project-local tooling (`colima`),
-    // then the underlying VM launcher (`limactl`), then systemd's native unit.
-    let attempts = [
-        ("colima", ["start"].as_ref()),
-        ("limactl", ["start", "colima"].as_ref()),
-        (
-            "systemctl",
-            ["--user", "start", "lima-vm@colima.service"].as_ref(),
-        ),
-    ];
-    for (cmd, args) in attempts {
-        match run_restart_command(cmd, args) {
-            Ok(true) => return Ok(true),
+impl BackendRestartTiming {
+    const PRODUCTION: Self = Self {
+        command_ceiling: BACKEND_RESTART_COMMAND_TIMEOUT,
+        min_budget: BACKEND_RESTART_MIN_BUDGET,
+        safety_margin: BACKEND_RESTART_SAFETY_MARGIN,
+        health_poll_ceiling: BACKEND_RESTART_HEALTH_POLL_TIMEOUT,
+        health_poll_interval: BACKEND_RESTART_HEALTH_POLL_INTERVAL,
+    };
+
+    /// Effective per-attempt restart-command timeout, clamped to whatever remains
+    /// under `deadline` (an outer caller budget, e.g. wait_for_backend's startup
+    /// window). Returns `None` when the remaining budget is below `min_budget` — the
+    /// caller should fail fast rather than start an attempt that can't meaningfully
+    /// run. `deadline: None` means "no outer budget" (e.g. the main serve loop, which
+    /// has no external startup deadline to protect) and keeps the full ceiling.
+    fn clamped_restart_timeout(&self, deadline: Option<Instant>) -> Option<Duration> {
+        match deadline {
+            None => Some(self.command_ceiling),
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                if remaining < self.min_budget {
+                    None
+                } else {
+                    Some(
+                        remaining
+                            .saturating_sub(self.safety_margin)
+                            .min(self.command_ceiling),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Effective health-poll timeout, clamped the same way as `clamped_restart_timeout`
+    /// but against `health_poll_ceiling`. Never returns a value requiring a wait beyond
+    /// what's left of `deadline`: even a near-zero remaining budget still gets one
+    /// immediate health check inside `poll_backend_healthy`.
+    fn clamped_health_poll_timeout(&self, deadline: Option<Instant>) -> Duration {
+        match deadline {
+            None => self.health_poll_ceiling,
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                remaining
+                    .saturating_sub(self.safety_margin)
+                    .min(self.health_poll_ceiling)
+            }
+        }
+    }
+}
+
+/// Poll `backend_healthy` until it reports true or `timeout` elapses. Used after a
+/// restart command reports success, since the Docker socket can lag the process
+/// reporting "started" by a few seconds — a single immediate probe would misreport
+/// a real recovery as a failure.
+fn poll_backend_healthy<H>(mut backend_healthy: H, timeout: Duration, interval: Duration) -> bool
+where
+    H: FnMut() -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if backend_healthy() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+type RestartCommand = (&'static str, &'static [&'static str]);
+
+const MACOS_BACKEND_RESTART_COMMANDS: &[RestartCommand] = &[("colima", &["start"])];
+const LINUX_BACKEND_RESTART_COMMANDS: &[RestartCommand] = &[
+    ("systemctl", &["--user", "start", "lima-vm@colima.service"]),
+    ("limactl", &["start", "colima"]),
+];
+
+fn backend_restart_commands(os: &str) -> &'static [RestartCommand] {
+    match os {
+        "macos" => MACOS_BACKEND_RESTART_COMMANDS,
+        "linux" => LINUX_BACKEND_RESTART_COMMANDS,
+        _ => &[],
+    }
+}
+
+fn attempt_backend_restart_with<R, H>(
+    commands: &[RestartCommand],
+    deadline: Option<Instant>,
+    timing: BackendRestartTiming,
+    mut run: R,
+    mut backend_healthy: H,
+) -> Result<bool>
+where
+    R: FnMut(&str, &[&str], Duration) -> Result<bool>,
+    H: FnMut() -> bool,
+{
+    for (cmd, args) in commands {
+        let timeout = match timing.clamped_restart_timeout(deadline) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "{cmd} restart skipped: remaining startup budget below {:?} floor \
+                     (fail-fast — avoiding a restart the outer deadline would kill mid-flight)",
+                    timing.min_budget
+                );
+                return Ok(false);
+            }
+        };
+        match run(cmd, args, timeout) {
+            Ok(true) => {
+                let health_timeout = timing.clamped_health_poll_timeout(deadline);
+                if poll_backend_healthy(
+                    &mut backend_healthy,
+                    health_timeout,
+                    timing.health_poll_interval,
+                ) {
+                    return Ok(true);
+                }
+                eprintln!(
+                    "{cmd} restart command returned success but Docker did not become \
+                     reachable within {:?}",
+                    health_timeout
+                );
+                return Ok(false);
+            }
             Ok(false) => {
                 eprintln!("{cmd} exists but restart returned non-zero ({:?})", args);
             }
@@ -392,6 +555,21 @@ fn attempt_backend_restart() -> Result<bool> {
     Ok(false)
 }
 
+/// `deadline` is the caller's own outer budget (e.g. wait_for_backend's startup
+/// window), if any. `None` means "no outer deadline to protect" — used by the main
+/// serve loop, which is not time-boxed the way service startup is (out of scope for
+/// this fix; see bead jleechan-9c7l finding #3).
+fn attempt_backend_restart(deadline: Option<Instant>) -> Result<bool> {
+    let platform = platform::detect();
+    attempt_backend_restart_with(
+        backend_restart_commands(platform.os),
+        deadline,
+        BackendRestartTiming::PRODUCTION,
+        run_restart_command_with_timeout,
+        docker_reachable,
+    )
+}
+
 fn backend_restart_can_help(selection: &Selection) -> bool {
     matches!(
         selection,
@@ -403,7 +581,14 @@ fn backend_restart_can_help(selection: &Selection) -> bool {
     )
 }
 
-fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoveryState) -> bool {
+/// `deadline` is forwarded to `attempt_backend_restart` — `Some(_)` when the caller
+/// has its own outer time budget to protect (e.g. wait_for_backend's startup window),
+/// `None` for callers with no such budget (e.g. the main serve loop).
+fn maybe_restart_backend(
+    cfg: &config::Config,
+    recovery: &mut BackendRecoveryState,
+    deadline: Option<Instant>,
+) -> bool {
     let selection = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
     if !backend_restart_can_help(&selection) {
         return false;
@@ -417,7 +602,7 @@ fn maybe_restart_backend(cfg: &config::Config, recovery: &mut BackendRecoverySta
     if !recovery.allow_restart(cfg) {
         return false;
     }
-    match attempt_backend_restart() {
+    match attempt_backend_restart(deadline) {
         Ok(true) => {
             let subject = "Backend restart attempted";
             let body = format!(
@@ -653,6 +838,9 @@ fn main() -> Result<()> {
                 }
                 cfg.limits.cpus = cfg.limits.cpus.min(cpu_share);
                 cfg.limits.memory_mb = cfg.limits.memory_mb.min(mem_share);
+                // Record the auto-detected VM/daemon ceiling explicitly so the
+                // startup memory-budget guard (bead yz6b) has a known ground truth.
+                cfg.runner.vm_total_mb = Some(daemon_mem);
                 println!(
                     "docker daemon capacity: {ncpu} cpus, {daemon_mem} MB; \
                      per-runner ceiling at count={count}: {cpu_share:.2} cpus, {mem_share} MB"
@@ -716,6 +904,28 @@ fn main() -> Result<()> {
                     cfg.github.target,
                     cfg.runner.count
                 );
+                match docker_backend::preview_memory_budget(&cfg) {
+                    docker_backend::MemoryBudgetPreview::Pass(b) => println!(
+                        "memory budget check (preview): would PASS on next restart — \
+                         vm_total_mb={} guest_reserve_mb={} fleet_budget_mb={} runner_count={} \
+                         per_runner_budget_mb={} runner_floor_mb={}",
+                        b.vm_total_mb,
+                        b.guest_reserve_mb,
+                        b.fleet_budget_mb,
+                        b.runner_count,
+                        b.per_runner_budget_mb,
+                        b.runner_floor_mb,
+                    ),
+                    docker_backend::MemoryBudgetPreview::Fail(msg) => println!(
+                        "memory budget check (preview): would FAIL on next restart with current \
+                         config — {msg}"
+                    ),
+                    docker_backend::MemoryBudgetPreview::Unknown => println!(
+                        "memory budget check (preview): unknown — cannot determine VM/daemon \
+                         memory ceiling (set runner.vm_total_mb explicitly; check `colima status` \
+                         / `limactl list`)"
+                    ),
+                }
             } else {
                 println!("config: none — run `ezgha init --target owner/repo`");
             }
@@ -747,6 +957,10 @@ fn main() -> Result<()> {
             // with After=lima-vm@colima.service the Docker socket may not be
             // ready for a few seconds after limactl start exits.
             let backend = wait_for_backend(&cfg, Duration::from_secs(120))?;
+            // VM-aware memory budget derivation + fail-loud guard (bead
+            // ez-gh-actions-yz6b). See docker_backend::resolve_and_log_memory_budget.
+            docker_backend::resolve_and_log_memory_budget(&cfg)
+                .context("memory budget check failed at startup")?;
             println!(
                 "supervising {} ephemeral runner(s) for {} on {}",
                 cfg.runner.count,
@@ -760,7 +974,16 @@ fn main() -> Result<()> {
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             let mut deadman = alert::DeadManState::new(Instant::now());
+
+            // Graceful shutdown (bead ez-gh-actions-30p): install SIGTERM/SIGINT
+            // handlers so a systemctl/watchdog/manual restart drains in-flight
+            // registrations instead of orphaning them.
+            shutdown::install_handlers();
+
             loop {
+                if shutdown::is_requested() {
+                    break;
+                }
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
@@ -795,7 +1018,16 @@ fn main() -> Result<()> {
                         ensure_fail_streak += 1;
                         eprintln!("ensure_count failed (will retry): {e:#}");
                         notify_ensure_failure(&cfg, backend, ensure_fail_streak, &format!("{e:#}"));
-                        if maybe_restart_backend(&cfg, &mut backend_recovery) {
+                        // No outer deadline here (unlike wait_for_backend's startup
+                        // window): the serve loop runs indefinitely, so there's no
+                        // caller budget to clamp against. Worst-case per-attempt
+                        // blocking of this loop's ensure_count/respawn cadence stays
+                        // at the ceiling (up to BACKEND_RESTART_COMMAND_TIMEOUT x
+                        // len(commands) — 120s x 2 = 240s on Linux). Restructuring
+                        // this loop to bound that is tracked separately (beads
+                        // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
+                        // part of this fix.
+                        if maybe_restart_backend(&cfg, &mut backend_recovery, None) {
                             let subject = "Backend restart attempted after ensure_count failures";
                             let body = format!(
                                 "serve loop attempted backend restart after {} failures for {} on {}",
@@ -821,6 +1053,12 @@ fn main() -> Result<()> {
                         }
                     }
                 };
+                // Re-check shutdown between ensure_count and the monitor/canary/deadman
+                // block: a SIGTERM received during ensure_count_outcome must not let
+                // 75s of monitor work run — that window alone can exhaust TimeoutStopSec=30.
+                if shutdown::is_requested() {
+                    break;
+                }
                 if ensure_succeeded {
                     watchdog::ping();
                     // Fresh budget base for monitor ticks: respawn pacing may
@@ -855,8 +1093,32 @@ fn main() -> Result<()> {
                 let _ = run_tick("deadman alert self-test", || {
                     Ok(Some(deadman.check(&cfg, Instant::now())))
                 });
-                std::thread::sleep(sleep);
+                shutdown::sleep_interruptibly(sleep);
             }
+            // SIGTERM drain: tell systemd we're stopping, then deregister
+            // in-flight (container-less) registrations within a bounded grace so
+            // a restart never orphans a live GitHub runner. Running containers
+            // are left alive (they survive the restart; ensure_count re-adopts
+            // them on next start). Budget: the deadline is enforced at TWO levels
+            // — the inter-slot loop stops issuing new deletes once it passes, and
+            // each individual DELETE is capped at the remaining budget in
+            // remove_runner_until (child gh process bounded, not just its retry
+            // sleeps). Worst case is therefore ~15s + one child-kill latency
+            // (sub-second), safely below TimeoutStopSec=30 and WatchdogSec=300.
+            // Anything not drained is reclaimed by release_stale_slots
+            // (fail-safe). No-op sd_notify on macOS launchd.
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+            println!("shutdown requested; draining in-flight runner registrations (<=15s)");
+            let drain_deadline = Instant::now() + Duration::from_secs(15);
+            let drain = docker_backend::drain_inflight_registrations(&cfg, drain_deadline);
+            println!(
+                "drain complete: {} reservation(s) released, {} orphan registration(s) deregistered, \
+                 {} container-backed runner(s) preserved, {} left to reaper",
+                drain.reservations_released,
+                drain.registrations_deregistered,
+                drain.containers_preserved,
+                drain.deferred_to_reaper
+            );
         }
         Commands::Stop => {
             let cfg = Config::load(&path)?;
@@ -1200,6 +1462,222 @@ mod tests {
     }
 
     #[test]
+    fn macos_restart_uses_only_colima_profile_command() {
+        let commands = backend_restart_commands("macos");
+        let names: Vec<_> = commands.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["colima"]);
+    }
+
+    #[test]
+    fn linux_restart_never_invokes_colima_profile_command() {
+        let commands = backend_restart_commands("linux");
+        assert!(commands.iter().all(|(name, _)| *name != "colima"));
+        assert!(commands.iter().any(|(name, _)| *name == "systemctl"));
+    }
+
+    /// Shrunk-down timing so restart/health-poll tests run in milliseconds instead of
+    /// waiting on the real multi-second/minute production constants.
+    const FAST_TEST_TIMING: BackendRestartTiming = BackendRestartTiming {
+        command_ceiling: Duration::from_millis(200),
+        min_budget: Duration::from_millis(20),
+        safety_margin: Duration::from_millis(5),
+        health_poll_ceiling: Duration::from_millis(100),
+        health_poll_interval: Duration::from_millis(2),
+    };
+
+    #[test]
+    fn restart_command_success_is_not_backend_recovery_without_docker() {
+        let commands: &[RestartCommand] =
+            &[("colima", &["start"]), ("limactl", &["start", "colima"])];
+        let mut attempts = 0;
+        let recovered = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                attempts += 1;
+                Ok(true)
+            },
+            || false,
+        )
+        .unwrap();
+
+        assert!(!recovered);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn restart_reports_recovery_only_after_docker_is_reachable() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let recovered = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| Ok(true),
+            || true,
+        )
+        .unwrap();
+        assert!(recovered);
+    }
+
+    #[test]
+    fn backend_restart_timeout_allows_cold_colima_startup() {
+        assert!(BACKEND_RESTART_COMMAND_TIMEOUT >= Duration::from_secs(120));
+    }
+
+    // --- finding #1: per-attempt restart timeout clamped to remaining outer budget ---
+
+    #[test]
+    fn restart_command_timeout_is_clamped_to_remaining_outer_budget() {
+        // Outer deadline leaves less than the full command_ceiling but comfortably
+        // above min_budget — the effective per-attempt timeout must shrink to fit
+        // (minus safety_margin), not use the full ceiling.
+        let deadline = Instant::now() + Duration::from_millis(60);
+        let mut observed_timeout = None;
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let _ = attempt_backend_restart_with(
+            commands,
+            Some(deadline),
+            FAST_TEST_TIMING,
+            |_, _, timeout| {
+                observed_timeout = Some(timeout);
+                Ok(true)
+            },
+            || true,
+        );
+        let observed = observed_timeout.expect("run should have been called");
+        assert!(
+            observed < FAST_TEST_TIMING.command_ceiling,
+            "expected timeout clamped below the {:?} ceiling, got {observed:?}",
+            FAST_TEST_TIMING.command_ceiling,
+        );
+        // remaining(~60ms) - safety_margin(5ms) ~= 55ms, well under the 200ms ceiling.
+        assert!(
+            observed <= Duration::from_millis(56),
+            "expected ~55ms clamped timeout, got {observed:?}"
+        );
+    }
+
+    #[test]
+    fn restart_command_uses_full_ceiling_with_no_outer_deadline() {
+        let mut observed_timeout = None;
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let _ = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, timeout| {
+                observed_timeout = Some(timeout);
+                Ok(true)
+            },
+            || true,
+        );
+        assert_eq!(observed_timeout, Some(FAST_TEST_TIMING.command_ceiling));
+    }
+
+    // --- finding #1: fail-fast floor skips the attempt entirely ---
+
+    #[test]
+    fn restart_attempt_is_skipped_when_remaining_budget_is_below_floor() {
+        let deadline = Instant::now() + Duration::from_millis(5); // below min_budget (20ms)
+        let mut attempts = 0;
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let recovered = attempt_backend_restart_with(
+            commands,
+            Some(deadline),
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                attempts += 1;
+                Ok(true)
+            },
+            || true,
+        )
+        .unwrap();
+        assert!(!recovered);
+        assert_eq!(
+            attempts, 0,
+            "run() must not be called when remaining budget is below the floor"
+        );
+    }
+
+    #[test]
+    fn restart_attempt_already_expired_deadline_is_skipped_not_attempted() {
+        let deadline = Instant::now(); // no budget left at all
+        let mut attempts = 0;
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let recovered = attempt_backend_restart_with(
+            commands,
+            Some(deadline),
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                attempts += 1;
+                Ok(true)
+            },
+            || true,
+        )
+        .unwrap();
+        assert!(!recovered);
+        assert_eq!(attempts, 0);
+    }
+
+    // --- finding #2: bounded health-poll retry instead of a single immediate probe ---
+
+    #[test]
+    fn restart_recovery_succeeds_after_delayed_docker_reachable_probe() {
+        // Simulates the documented socket-lag: the first two probes see Docker as
+        // still unreachable, the third succeeds. A single-immediate-probe design
+        // would misreport this as a failed restart.
+        let mut probes = 0;
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let recovered = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| Ok(true),
+            || {
+                probes += 1;
+                probes >= 3
+            },
+        )
+        .unwrap();
+        assert!(recovered);
+        assert_eq!(probes, 3);
+    }
+
+    #[test]
+    fn restart_recovery_gives_up_after_health_poll_ceiling_elapses() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let mut probes = 0;
+        let recovered = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| Ok(true),
+            || {
+                probes += 1;
+                false
+            },
+        )
+        .unwrap();
+        assert!(!recovered);
+        assert!(
+            probes > 1,
+            "should have retried at least once, got {probes} probes"
+        );
+    }
+
+    #[test]
+    fn health_poll_timeout_is_also_clamped_to_remaining_outer_budget() {
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let observed = FAST_TEST_TIMING.clamped_health_poll_timeout(Some(deadline));
+        assert!(
+            observed < FAST_TEST_TIMING.health_poll_ceiling,
+            "expected health-poll timeout clamped below the {:?} ceiling, got {observed:?}",
+            FAST_TEST_TIMING.health_poll_ceiling,
+        );
+    }
+
+    #[test]
     fn restart_command_reports_success() {
         assert!(run_restart_command_with_timeout(
             "/bin/sh",
@@ -1247,6 +1725,66 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "timeout should fire promptly, took {:?}",
             start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_command_timeout_kills_descendants() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "ezgha-restart-descendant-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let script = format!(
+            "/bin/sleep 10 & child=$!; echo $child > {}; wait $child",
+            pid_path.display()
+        );
+
+        let err = run_restart_command_with_timeout(
+            "/bin/sh",
+            &["-c", &script],
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+
+        let child_pid: i32 = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _ = std::fs::remove_file(&pid_path);
+        let mut still_alive = true;
+        for _ in 0..50 {
+            let exists = unsafe { libc::kill(child_pid, 0) } == 0;
+            #[cfg(target_os = "linux")]
+            let is_zombie = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, tail)| tail.starts_with('Z'))
+                })
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let is_zombie = false;
+            still_alive = exists && !is_zombie;
+            if !still_alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if still_alive {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !still_alive,
+            "timed-out restart left child pid {child_pid} alive"
         );
     }
 

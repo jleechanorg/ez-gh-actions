@@ -397,13 +397,51 @@ pub(crate) fn run_gh_with_backoff_until(
     run_gh_with_backoff_core(Some(deadline), make_cmd)
 }
 
+/// Like `run_gh_with_backoff_until`, but ALSO caps each attempt's child `gh`
+/// process at the remaining budget (`min(GH_TIMEOUT, deadline - now)`), not just
+/// the inter-attempt sleeps. The SIGTERM drain uses this so a single hung
+/// `gh api DELETE` (network/DNS stall) can never block past the 15s drain
+/// deadline and cross `TimeoutStopSec=30` into a SIGKILL mid-drain (bead
+/// ez-gh-actions-30p). Deliberately scoped to the drain: other deadline-bounded
+/// callers keep the fixed `GH_TIMEOUT` per-call bound.
+pub(crate) fn run_gh_with_backoff_until_capped(
+    deadline: Instant,
+    make_cmd: impl FnMut() -> Command,
+) -> Result<std::process::Output> {
+    run_gh_with_backoff_core_capped(Some(deadline), true, make_cmd)
+}
+
 fn run_gh_with_backoff_core(
     deadline: Option<Instant>,
+    make_cmd: impl FnMut() -> Command,
+) -> Result<std::process::Output> {
+    run_gh_with_backoff_core_capped(deadline, false, make_cmd)
+}
+
+/// Core backoff loop. When `cap_child_to_deadline` is true AND a `deadline` is
+/// set, each attempt's child `gh` process is bounded at
+/// `min(GH_TIMEOUT, deadline - now)` (via `run_gh_with_timeout`) so a single
+/// in-flight call can never block past the caller's budget. Non-capped callers
+/// (the default, e.g. `list_runners_until` / `queue_monitor`) keep the fixed
+/// `GH_TIMEOUT` per-call bound unchanged — the deadline still gates their
+/// inter-attempt sleeps as before. Only the SIGTERM drain
+/// (`remove_runner_until`) opts into the cap (bead ez-gh-actions-30p).
+fn run_gh_with_backoff_core_capped(
+    deadline: Option<Instant>,
+    cap_child_to_deadline: bool,
     mut make_cmd: impl FnMut() -> Command,
 ) -> Result<std::process::Output> {
     let mut delay = GH_RETRY_BASE_DELAY;
     for attempt in 1..=GH_MAX_RETRIES {
-        let out = run_gh(make_cmd())?;
+        let out = match (cap_child_to_deadline, deadline) {
+            (true, Some(dl)) => {
+                // Cap the child at the remaining budget so a network/DNS hang
+                // can't outrun the drain deadline. Never longer than GH_TIMEOUT.
+                let remaining = dl.saturating_duration_since(Instant::now());
+                run_gh_with_timeout(make_cmd(), remaining.min(GH_TIMEOUT))?
+            }
+            _ => run_gh(make_cmd())?,
+        };
         if out.status.success() {
             return Ok(out);
         }
@@ -502,7 +540,19 @@ pub(crate) fn api_post_empty(path: &str, fields: &[(&str, &str)]) -> Result<()> 
 ///
 /// Unlike `platform::capture_with_timeout`, this captures *both* streams so
 /// callers can inspect stderr on non-zero exits.
-fn run_gh(mut cmd: Command) -> Result<std::process::Output> {
+fn run_gh(cmd: Command) -> Result<std::process::Output> {
+    run_gh_with_timeout(cmd, GH_TIMEOUT)
+}
+
+/// Like `run_gh`, but bounds the child at an explicit `timeout` instead of the
+/// fixed `GH_TIMEOUT`. Used by the SIGTERM drain path (bead ez-gh-actions-30p)
+/// so a single in-flight `gh api DELETE` can be capped at the REMAINING drain
+/// budget: the plain `run_gh` recv_timeout is `GH_TIMEOUT` (45s), which alone
+/// can outrun the 15s drain / `TimeoutStopSec=30` and get SIGKILLed mid-drain.
+/// The deadline gate in `run_gh_with_backoff_core` only bounds inter-attempt
+/// SLEEPS, not the per-call child — the same "a budget only bounds calls that
+/// check it" gap the serve-loop starvation fix closed.
+fn run_gh_with_timeout(mut cmd: Command, timeout: Duration) -> Result<std::process::Output> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -528,12 +578,12 @@ fn run_gh(mut cmd: Command) -> Result<std::process::Output> {
     });
 
     // Wait for stdout first (the larger payload); stderr is typically small.
-    let stdout = match rx_out.recv_timeout(GH_TIMEOUT) {
+    let stdout = match rx_out.recv_timeout(timeout) {
         Ok(b) => b,
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("gh CLI timed out after {}s", GH_TIMEOUT.as_secs());
+            bail!("gh CLI timed out after {}s", timeout.as_secs());
         }
     };
     // Stderr may still be draining; give it a short extra window.
@@ -963,6 +1013,35 @@ fn list_runners_core(gh: &GithubConfig, deadline: Option<Instant>) -> Result<Vec
 pub fn remove_runner(gh: &GithubConfig, id: u64) -> Result<()> {
     let path = runner_remove_path(gh, id);
     let out = run_gh_with_backoff(|| {
+        let mut cmd = gh_command();
+        cmd.args(["api", "-X", "DELETE", &path]);
+        cmd
+    })
+    .context("failed to run `gh api`")?;
+    if !out.status.success() {
+        bail!(
+            "gh api remove runner {id} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    watchdog::ping();
+    Ok(())
+}
+
+/// Deadline-bounded twin of `remove_runner` for the graceful-shutdown drain
+/// (bead ez-gh-actions-30p). The plain `remove_runner` uses unbounded backoff
+/// and can block ~128s under GitHub's secondary rate limit — far past the 15s
+/// drain budget. This variant threads `deadline` through the CAPPED backoff
+/// path (`run_gh_with_backoff_until_capped`), which bounds BOTH the inter-attempt
+/// sleeps AND each attempt's child `gh` process at the remaining budget
+/// (`min(GH_TIMEOUT, deadline - now)`) — so neither a rate-limit sleep nor a
+/// single hung DELETE (network/DNS stall) can outrun the deadline. On any miss
+/// the caller leaves the registration to `release_stale_slots` (fail-safe).
+pub fn remove_runner_until(gh: &GithubConfig, id: u64, deadline: Instant) -> Result<()> {
+    let path = runner_remove_path(gh, id);
+    // Capped variant: bounds BOTH inter-attempt sleeps AND the per-call child at
+    // the remaining drain budget, so a hung DELETE can't cross TimeoutStopSec.
+    let out = run_gh_with_backoff_until_capped(deadline, || {
         let mut cmd = gh_command();
         cmd.args(["api", "-X", "DELETE", &path]);
         cmd
@@ -1928,6 +2007,118 @@ exit 0
         assert_eq!(jit, "abc123");
         assert_eq!(runner_id, 456);
         assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_runner_until_succeeds_via_fake_gh() {
+        // Happy path: a bounded delete that the (faked) gh accepts returns Ok.
+        // Hermetic — uses a fake gh stub, never the real network.
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rm-ok-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        remove_runner_until(&repo_cfg(), 4242, deadline).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_runner_until_bails_instead_of_sleeping_past_deadline() {
+        // Bounded-backoff proof: a persistent secondary-rate-limit (Retry-After: 5)
+        // with an already-elapsed deadline must NOT sleep the 5s — it bails on the
+        // first attempt. Hermetic (fake gh stub); asserts fast return + Err.
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rm-budget-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'gh: secondary rate limit exceeded (HTTP 403)' >&2\n\
+             echo 'Retry-After: 5' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let start = std::time::Instant::now();
+        // Already-elapsed deadline: any retry sleep (5s) would cross it, so the
+        // bounded loop must bail on attempt 1 rather than sleeping.
+        let result = remove_runner_until(&repo_cfg(), 4242, Instant::now());
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "persistent 403 must surface as an error");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must bail without sleeping past the deadline, took {}s",
+            elapsed.as_secs()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_runner_until_kills_hung_child_at_remaining_budget() {
+        // The skeptic's defect (bead ez-gh-actions-30p): a single in-flight
+        // `gh api DELETE` that HANGS must be killed at the remaining drain
+        // budget, not at the fixed 45s GH_TIMEOUT — otherwise it crosses
+        // TimeoutStopSec=30 and systemd SIGKILLs mid-drain. Fake gh sleeps 10s;
+        // with a ~1s deadline the child must be killed and the call must return
+        // (Err) well before the 10s sleep would finish. Hermetic, no real API.
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rm-hang-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 10\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let start = std::time::Instant::now();
+        let result =
+            remove_runner_until(&repo_cfg(), 4242, Instant::now() + Duration::from_secs(1));
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "a hung DELETE must surface as an error (child killed at budget)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "hung child must be killed at the ~1s remaining budget, not the 10s \
+             sleep or the 45s GH_TIMEOUT; took {}s",
+            elapsed.as_secs()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

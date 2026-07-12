@@ -41,11 +41,13 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 15. `2ik` (P3) — commit or delete external ~/.local/bin/ezgha-fleet-watchdog.sh (Gate 7 committed-config rule)
 16. `1fu`/`zkn`/`zyb` — hostname-scoped dereg residual, runner_group_id config, minor review gaps
 17. Add `.claude/hooks/git-header.sh` or drop the footer convention for this repo (hook referenced by global CLAUDE.md is absent here)
+18. **Repo-local `/code-standards`** (`.claude/commands/code-standards.md`) — layers ten repo gates (fleet-capacity 22/22, single-writer, layered-design, self-outage, blast-radius, self-healing recipes, honest gates, automation-callers, no-silent-underprovisioning, test isolation) on top of the user-scope command. New code must pass before merge. PRs touching thresholds / health / watchdog / restart / resource / monitor cadence MUST include a "Blast radius" section.
 
 **Cross-host (Mac)**: jleechan-5rv (P2, re-test after new binary + bxy), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
 
 ## Recent activity (by day)
 
+- [2026-07-11](activity/2026-07-11.md) — 48-hour cross-fleet audit: Mac forced-reset recovery loop, Linux memory/watchdog reboot, PR #56 self-healing fix, and prioritized watchdog/CI/deploy guardrails.
 - [2026-07-10](activity/2026-07-10.md) — Fleet-hardening marathon: stable-libexec migration (sa1t closed), doctor-runner honesty ×4 (first exit-0), ao-runner farm eradicated, reaper multi-repo + Linux timer installed, codex cold-review fixes, factory lane opened (10 beads incl. PR#47 drive).
 - [2026-07-09](activity/2026-07-09.md) — Root-cause confirmed: Linux fleet convergence failure from runner reconciliation churn; tracked with `jleechan-zy6` and `jleechan-9zd`.
 - [2026-07-07](activity/2026-07-07.md) — Fleet doctor session + macOS deadlock recovery + `--cpus` float precision fix

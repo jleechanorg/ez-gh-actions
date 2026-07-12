@@ -194,6 +194,39 @@ When `doctor-runner` exits 1 **or** queue tail > `QUEUE_TAIL_WARN_MIN` (20m):
 
 See `docs/harness-early-victory-5whys.md` for why restart-looping is forbidden.
 
+## Safe GitHub payload pattern (PRs, issues, comments)
+
+For Markdown or operator-generated text, never inject body text directly into a
+shell word.
+
+Use file/stdin payloads:
+
+```bash
+body_file=$(mktemp)
+cat > "$body_file" <<'EOF'
+Body content with markdown and command-looking text:
+`backticks` and $(command substitution) must stay literal.
+EOF
+
+repo="jleechanorg/ez-gh-actions"
+
+# PR create path (exact body text in file, no shell interpolation)
+gh pr create --title "Safe test" --body-file "$body_file"
+
+# Structured API path for arbitrary payloads
+jq -n \
+  --rawfile body "$body_file" \
+  '{title: "Safe test", body: $body}' \
+| gh api repos/"${repo}"/pulls --method POST --input -
+
+# Comment example (same no-interpolation principle)
+issue_number=123
+jq -n --rawfile body "$body_file" '{body: $body}' \
+| gh api repos/"${repo}"/issues/"${issue_number}"/comments --method POST --input -
+```
+
+Do not use interpolated `--body "$payload"` for Markdown content.
+
 ## Important context
 
 - ezgha slots live at `${XDG_CONFIG_HOME:-~/.config}/ezgha/slot_assignments.toml`. The 16-slot capacity is set by `~/.config/ezgha/config.toml` `runner.count`.

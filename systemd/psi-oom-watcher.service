@@ -1,0 +1,27 @@
+# psi-oom-watcher.service — one-shot invocation of the PSI polling watcher,
+# fired periodically by psi-oom-watcher.timer (the mandatory automatic
+# caller — see repo CLAUDE.md "Automation completeness": a script with no
+# automatic trigger is not automation). Part of bead ez-gh-actions-0725.
+#
+# NOT enabled/started by this commit. Installation is manual, deliberate,
+# and left to the human operator — see docs/host-ops-sudo-block-0725.md's
+# "Installing the user-scope pieces" section for the exact copy +
+# placeholder-substitution + daemon-reload commands (none require sudo;
+# activation via `enable --now` is a separate, explicit final step). Static
+# syntax validation only: `systemd-analyze verify systemd/psi-oom-watcher.service`
+[Unit]
+Description=PSI memory-pressure early-warning watcher (user-scope, SIGTERM-only, cooldown-gated)
+After=network.target
+
+[Service]
+Type=oneshot
+# Short timeout: this is a single /proc read + a `ps` scan + at most one
+# `kill -TERM`, not a long-running probe — 30s is generous headroom above
+# what it actually takes, matching the ezgha-watchdog.service convention of
+# a systemd-level backstop above the script's own expected runtime.
+TimeoutStartSec=30
+ExecStart=@SCRIPTS_DIR@/psi-oom-watcher.sh
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
+StandardOutput=append:%h/.local/state/ezgha/psi-oom-watcher.log
+StandardError=append:%h/.local/state/ezgha/psi-oom-watcher.log

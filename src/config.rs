@@ -240,6 +240,29 @@ pub struct RunnerConfig {
     /// so a typo'd 0 cannot hot-loop the daemon against the GitHub API.
     #[serde(default = "default_serve_tick_seconds")]
     pub serve_tick_seconds: u64,
+    /// Explicit override for the Docker daemon/VM total memory ceiling in MB
+    /// (e.g. the Colima VM's allocated memory — check `colima status` /
+    /// `limactl list` output). When unset (`None`), the daemon falls back to
+    /// auto-detecting the daemon's reported MemTotal via `docker info` (see
+    /// `daemon_capacity()`), matching pre-yz6b behavior. Set this explicitly
+    /// to pin the ceiling to ground truth if `docker info` ever under/over
+    /// reports. THIS FIELD HAS NO SAFE NUMERIC DEFAULT — if set, it MUST
+    /// match the real VM allocation, not be guessed.
+    #[serde(default)]
+    pub vm_total_mb: Option<u64>,
+    /// Memory reserved for the Docker daemon and guest OS overhead inside
+    /// the VM — NOT available to runner containers. The pre-yz6b clamp
+    /// divided the full VM total by runner count, leaving zero guest
+    /// headroom (bead ez-gh-actions-yz6b, 2026-07-10 swap-thrash incident).
+    #[serde(default = "default_guest_reserve_mb")]
+    pub guest_reserve_mb: u64,
+    /// Minimum memory a single runner may be budgeted before the daemon
+    /// refuses to start rather than silently clamping lower. Research-
+    /// validated for this fleet's jest+playwright+rust workloads — do not
+    /// lower without checking the historical jest-OOM incident (an earlier
+    /// per-runner floor set too low caused a jest OOM failure class).
+    #[serde(default = "default_runner_floor_mb")]
+    pub runner_floor_mb: u64,
 }
 
 impl RunnerConfig {
@@ -261,6 +284,14 @@ fn default_serve_tick_seconds() -> u64 {
 
 fn default_runner_name_prefix() -> String {
     "ez-org-runner".into()
+}
+
+fn default_guest_reserve_mb() -> u64 {
+    4096
+}
+
+fn default_runner_floor_mb() -> u64 {
+    3072
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -442,6 +473,9 @@ impl Config {
                 image: "ghcr.io/actions/actions-runner:latest".into(),
                 name_prefix: default_runner_name_prefix(),
                 serve_tick_seconds: default_serve_tick_seconds(),
+                vm_total_mb: None,
+                guest_reserve_mb: default_guest_reserve_mb(),
+                runner_floor_mb: default_runner_floor_mb(),
             },
             limits: Limits {
                 memory_mb: mem,
@@ -493,6 +527,15 @@ impl Config {
                 "limits.memory_mb must be at least 512 (got {}); 0 means \
                  'unlimited' to Docker and defeats the resource cap",
                 self.limits.memory_mb
+            );
+        }
+        if self.runner.runner_floor_mb < 512 {
+            anyhow::bail!(
+                "runner.runner_floor_mb must be at least 512 (got {}); 0 means the \
+                 fail-loud budget guard (bead ez-gh-actions-yz6b) can never trigger \
+                 regardless of fleet_budget_mb, silently defeating the safety check \
+                 this field exists to enforce",
+                self.runner.runner_floor_mb
             );
         }
         if !self.limits.cpus.is_finite() || self.limits.cpus < 0.5 {
@@ -682,6 +725,9 @@ minimum_isolation = "container"
             image: "ezgha-runner:latest".into(),
             name_prefix: default_runner_name_prefix(),
             serve_tick_seconds: 20,
+            vm_total_mb: None,
+            guest_reserve_mb: default_guest_reserve_mb(),
+            runner_floor_mb: default_runner_floor_mb(),
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
         // A typo'd 0 (or anything under the floor) must not hot-loop the
@@ -779,6 +825,13 @@ minimum_isolation = "container"
     fn reject_zero_memory() {
         let mut cfg = valid_config();
         cfg.limits.memory_mb = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_zero_runner_floor_mb() {
+        let mut cfg = valid_config();
+        cfg.runner.runner_floor_mb = 0;
         assert!(cfg.validate().is_err());
     }
 
