@@ -1140,6 +1140,18 @@ REMOTE_EXECUTING_SLOTS=()
 REMOTE_IDLE_SLOTS=()
 REMOTE_CYCLING_SLOTS=()
 REMOTE_DOWN_SLOTS=()
+# REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
+# below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
+# printed only a warn() — `configured` then collapsed to the local-only
+# count (e.g. 16 instead of 22) so a Linux run with the Mac unreachable
+# reported "fleet healthy: 16/16" instead of "16/22 with 6 down". Treat
+# unreachable as the strongest negative signal available (we have ZERO
+# evidence about any of the remote slots, so all of them are unproven):
+# populate REMOTE_DOWN_SLOTS with synthetic names so the verdict gate
+# counts them and the headline `down` reflects reality, and bump
+# SLOT_PROOF_CRITICAL so the verdict flips to `bad` (the "fleet healthy"
+# ok() line cannot survive an unreachable half of the fleet).
+REMOTE_UNREACHABLE=0
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
   REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
@@ -1157,8 +1169,25 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
   fi
 else
   printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
-  warn "$REMOTE_LABEL not reachable via SSH — skipping remote per-slot proof"
+  # Synthesize per-slot DOWN entries for every remote slot we cannot prove.
+  # We have NO evidence about any of them — neither a container, nor a
+  # jobline, nor a journal respawn line — so each remote slot is
+  # conservatively reported as DOWN. This (a) keeps `configured` at the
+  # full expected fleet size (no silent local-only collapse), (b) puts
+  # the unreachable slots into the headline `down` count (so a Mac
+  # outage from jeff-ubuntu is reported as 6/22 down, not "0/16 down"),
+  # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
+  # `ok` to `bad` so an unreachable host can never silently green.
+  REMOTE_UNREACHABLE=1
+  _unreach_idx=1
+  while [ "$_unreach_idx" -le "$REMOTE_COUNT" ]; do
+    REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unreach_idx} (unreachable)")
+    _unreach_idx=$((_unreach_idx + 1))
+  done
+  bad "$REMOTE_LABEL not reachable via SSH — all ${REMOTE_COUNT} remote slot(s) unproven (counted as DOWN); verdict cannot green while the remote fleet is unreachable"
+  SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
 fi
+export REMOTE_UNREACHABLE
 
 # Serve-loop-heartbeat signal: the largest gap between consecutive
 # "queue monitor:" journal lines (same-PID only — see compute_heartbeat_gap
@@ -1416,11 +1445,28 @@ compute_verdict_summary() {
   # args: local_exec local_idle local_down local_cycling \
   #       remote_exec remote_idle remote_down remote_cycling \
   #       starved_present
-  # stdout: "<total> <configured> <executing> <idle_ok> <idle_starved> <down>"
+  # stdout: "<total> <configured> <executing> <idle_ok> <idle_starved> <down> <cycling>"
+  #
+  # Bucket semantics (must match section 9/10's per-slot [BAD]/info lines):
+  #   - EXECUTING = EXECUTING ONLY. A cycling slot is containerless by
+  #     definition (the daemon is mid-respawn); folding cycling into
+  #     executing inflates the executing bucket with slots that have no
+  #     Runner.Worker pid and counts a healthy mid-cycle as proof of work,
+  #     which is exactly what the per-slot evidence gates already
+  #     correctly exclude (only EXECUTING slots get a jobline / "ok" line).
+  #     Cycling slots ARE live (they count toward `live` and `configured`),
+  #     but they get their own bucket in the headline summary, never
+  #     silently mixed into executing.
+  #   - CYCLING is folded into `down` here ONLY in the headline-down sense
+  #     that a cycling slot is not currently executing a job — it is NOT
+  #     a defect (the journal cross-check confirmed the daemon is still
+  #     managing it), so the headline `down` count does not increment
+  #     cycling. The per-slot info/bad lines already distinguish them.
   local l_exec="$1" l_idle="$2" l_down="$3" l_cyc="$4"
   local r_exec="$5" r_idle="$6" r_down="$7" r_cyc="$8"
   local starved="${9:-0}"
-  local executing=$((l_exec + r_exec + l_cyc + r_cyc))
+  local executing=$((l_exec + r_exec))
+  local cycling=$((l_cyc + r_cyc))
   local idle_total=$((l_idle + r_idle))
   local idle_starved=0 idle_ok=$idle_total
   if [ "$starved" -eq 1 ]; then
@@ -1428,16 +1474,16 @@ compute_verdict_summary() {
     idle_ok=0
   fi
   local down=$((l_down + r_down))
-  local total=$((executing + idle_ok + idle_starved + down))
+  local total=$((executing + idle_ok + idle_starved + cycling + down))
   local configured=$((l_exec + l_idle + l_down + l_cyc + r_exec + r_idle + r_down + r_cyc))
-  printf '%d %d %d %d %d %d\n' "$total" "$configured" "$executing" "$idle_ok" "$idle_starved" "$down"
+  printf '%d %d %d %d %d %d %d\n' "$total" "$configured" "$executing" "$idle_ok" "$idle_starved" "$down" "$cycling"
 }
-read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDICT_IDLE_STARVED VERDICT_DOWN < <(
+read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDICT_IDLE_STARVED VERDICT_DOWN VERDICT_CYCLING < <(
   compute_verdict_summary \
     "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#DOWN_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
     "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_DOWN_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
     "${STARVED_PRESENT:-0}"
 )
-ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
+ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
 info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0
