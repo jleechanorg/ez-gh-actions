@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Regression test for .githooks/commit-msg — proves the hook:
+#   (a) REJECTS subjects without a recognized runtime provenance prefix
+#   (b) REJECTS subjects where the prefix is present but the ':' delimiter
+#       is missing (must be `prefix/model:` or `human:`)
+#   (c) ACCEPTS every canonical prefix from the global CLAUDE.md
+#       "Commit provenance tag" table
+#   (d) ACCEPTS git-merge subjects (they bypass the prefix gate)
+#   (e) ACCEPTS empty-commit-file abort path (no crash; returns 2)
+#   (f) ACCEPTS comments-only commit-msg files (treated as empty subject)
+#
+# Why: bead ez-gh-actions-jcie. Five squash merges on origin/main landed
+# without a runtime prefix (d79d502, 629ee4d, 8eac59f, b3bbe1c, d54cb0b);
+# we must not regress to that state again.
+#
+# Usage: bash tests/commit_msg_provenance_prefix_test.sh
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOOK="$REPO_ROOT/.githooks/commit-msg"
+
+if [ ! -x "$HOOK" ]; then
+  echo "FAIL: hook not found or not executable: $HOOK" >&2
+  exit 1
+fi
+
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Helper: write a commit-msg file with the given subject as the FIRST
+# non-comment line. If subject is empty, write an entirely empty file.
+write_msg() {
+  local msgfile="$1"
+  local subject="$2"
+  : > "$msgfile"
+  if [ "$subject" = "__EMPTY__" ]; then
+    return
+  fi
+  if [ "$subject" = "__COMMENTS_ONLY__" ]; then
+    printf '# just a comment\n# nothing else\n' > "$msgfile"
+    return
+  fi
+  printf '%s\n' "$subject" > "$msgfile"
+}
+
+# Asserts: hook exit code matches expected; on REJECT we also expect the
+# REJECTED marker in stderr (proves the helpful error path fires, not just
+# a generic non-zero).
+assert_hook() {
+  local label="$1"
+  local subject="$2"
+  local expected_rc="$3"
+  local expect_stderr_marker="${4:-}"   # empty -> no stderr assertion
+
+  local msgfile="$TMPDIR/${label// /_}.msg"
+  write_msg "$msgfile" "$subject"
+
+  local actual_rc=0
+  local stderr_collected=""
+  stderr_collected="$(bash "$HOOK" "$msgfile" 2>&1 >/dev/null)" || actual_rc=$?
+
+  if [ "$actual_rc" != "$expected_rc" ]; then
+    echo "FAIL [$label]: expected rc=$expected_rc got rc=$actual_rc" >&2
+    echo "  subject: $subject" >&2
+    echo "  stderr:  $stderr_collected" >&2
+    exit 1
+  fi
+
+  if [ -n "$expect_stderr_marker" ]; then
+    if ! printf '%s' "$stderr_collected" | grep -q -- "$expect_stderr_marker"; then
+      echo "FAIL [$label]: expected stderr to contain '$expect_stderr_marker'" >&2
+      echo "  actual stderr: $stderr_collected" >&2
+      exit 1
+    fi
+  fi
+}
+
+# ----- (a) REJECT: no prefix -----
+assert_hook "no_prefix_simple"      "fix: typo in README"             1 "REJECTED"
+assert_hook "no_prefix_feat"        "feat(runner): faster cycle"      1 "REJECTED"
+assert_hook "no_prefix_chore"       "chore(beads): update"            1 "REJECTED"
+
+# ----- (b) REJECT: prefix present but missing ':' delimiter -----
+assert_hook "prefix_no_colon"       "claude/sonnet fix the bug"       1 "REJECTED"
+assert_hook "human_no_colon"        "human tweak"                     1 "REJECTED"
+
+# ----- (c) ACCEPT: every canonical prefix -----
+assert_hook "accept_claude_sonnet"  "claude/sonnet: chore: lint fix"      0
+assert_hook "accept_claudem_minimax" "claudem/minimax-M3: chore: hook"    0
+assert_hook "accept_claudew_glm"    "claudew/glm-5.1: feat(api): tweak"   0
+assert_hook "accept_gemini"         "gemini/3-flash: docs: update"        0
+assert_hook "accept_codex"          "codex/o3-mini: fix: race"            0
+assert_hook "accept_cursor"         "cursor/claude: refactor: clean"      0
+assert_hook "accept_ao"             "ao/claude: chore: spawn retry"       0
+assert_hook "accept_human"          "human: merge resolution"             0
+
+# ----- (d) ACCEPT: merge commits bypass the gate -----
+assert_hook "accept_merge_branch"   "Merge branch 'foo' into main"        0
+assert_hook "accept_merge_tag"      "Merge tag 'v1.2.3'"                 0
+assert_hook "accept_merge_commit"   "Merge commit 'abc123' into main"     0
+
+# ----- (e) Edge: missing arg / unreadable file -----
+# (bash "$HOOK" with no $1) — the hook must exit non-zero, not crash with
+# an unhelpful shell error.
+set +e
+no_arg_rc=0
+bash "$HOOK" >/dev/null 2>&1 || no_arg_rc=$?
+set -e
+if [ "$no_arg_rc" -eq 0 ]; then
+  echo "FAIL [no_arg]: expected non-zero rc when invoked without commit-msg file" >&2
+  exit 1
+fi
+
+# ----- (f) Edge: comments-only commit-msg file -----
+# git itself strips leading comments, but the hook still sees them. If the
+# file has NO non-comment content, treat as empty subject -> reject.
+comments_msg="$TMPDIR/comments_only.msg"
+write_msg "$comments_msg" "__COMMENTS_ONLY__"
+comments_rc=0
+bash "$HOOK" "$comments_msg" >/dev/null 2>&1 || comments_rc=$?
+# comments-only is treated as empty subject -> rc=2 from the hook
+if [ "$comments_rc" != "2" ]; then
+  echo "FAIL [comments_only]: expected rc=2 (empty subject) got rc=$comments_rc" >&2
+  exit 1
+fi
+
+# ----- (g) Edge: comment line THEN a valid subject must ACCEPT -----
+mixed_msg="$TMPDIR/mixed.msg"
+printf '# This is a comment that git will strip\nclaude/sonnet: actual subject\n' > "$mixed_msg"
+mixed_rc=0
+bash "$HOOK" "$mixed_msg" >/dev/null 2>&1 || mixed_rc=$?
+if [ "$mixed_rc" != "0" ]; then
+  echo "FAIL [comment_then_subject]: expected rc=0 (valid subject after comment) got rc=$mixed_rc" >&2
+  exit 1
+fi
+
+echo "PASS: commit-msg provenance prefix hook behaves correctly across"
+echo "  - 3 reject cases (no prefix, 3 styles)"
+echo "  - 2 reject cases (prefix without ':' delimiter)"
+echo "  - 8 accept cases (all canonical runtime prefixes)"
+echo "  - 3 accept cases (git-merge subjects bypass the gate)"
+echo "  - 1 edge case  (missing arg -> non-zero, no crash)"
+echo "  - 1 edge case  (comments-only file -> rc=2 empty-subject)"
+echo "  - 1 edge case  (comment-then-subject -> rc=0)"
+echo "Reference bead: ez-gh-actions-jcie"

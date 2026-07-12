@@ -76,6 +76,12 @@ Every commit subject must be prefixed with the runtime that produced it:
 - `claude/<model-id>: <subject>`
 - `human: <subject>`
 
+**Enforced locally** by `.githooks/commit-msg` (bead `ez-gh-actions-jcie`).
+Recognized prefixes: `claude/`, `claudem/`, `claudew/`, `gemini/`, `codex/`,
+`cursor/`, `ao/`, `human` (each terminated by `:`). Opt in per-developer
+with `git config core.hooksPath .githooks` — see `.githooks/README.md`.
+Merge commits and `git commit --no-verify` bypass the gate.
+
 ## Common self-healing recipes
 
 ### Gate 3 FAIL: container count low

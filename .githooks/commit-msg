@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# commit-msg hook: enforce runtime provenance prefix on commit subjects.
+#
+# Per CLAUDE.md "Commit conventions" and the global CLAUDE.md "Commit provenance
+# tag" rule, every commit subject MUST start with one of the recognized runtime
+# prefixes. This hook rejects (non-zero exit) any commit-msg whose first line
+# does not match the prefix list, with a clear message pointing at the spec.
+#
+# Recognized prefixes (canonical list — keep in sync with global CLAUDE.md):
+#   claude/<model-id>:    Claude Code native session
+#   claudem/<model-id>:   MiniMax CLI / MiniMax-M3 family
+#   claudew/<model-id>:   Wafer CLI / GLM family
+#   gemini/<model-id>:    Gemini CLI
+#   codex/<model-id>:     Codex CLI
+#   cursor/<model>:       Cursor / OpenCode
+#   ao/<model>:           Agent Orchestrator worker
+#   human:                Human-authored commit
+#
+# Wired via:  git config core.hooksPath .githooks
+# Standalone: bash .githooks/commit-msg <path-to-commit-msg-file>
+# Bypass:     git commit --no-verify  (escape hatch for emergency fixes only)
+#
+# Bead: ez-gh-actions-jcie
+
+set -euo pipefail
+
+COMMIT_MSG_FILE="${1:-}"
+if [ -z "$COMMIT_MSG_FILE" ] || [ ! -f "$COMMIT_MSG_FILE" ]; then
+  echo "commit-msg hook: missing or unreadable commit-msg file: '$COMMIT_MSG_FILE'" >&2
+  exit 2
+fi
+
+# Read the FIRST non-comment, non-blank line. git commit-msg files may begin
+# with comments (#) — git strips them on commit but we still see them in $1
+# during the hook. Use the first non-comment, non-blank line as the subject.
+subject="$(awk '
+  /^[[:space:]]*$/ { next }       # blank line: skip
+  /^[[:space:]]*#/ { next }       # comment line: skip
+  { print; exit }
+' "$COMMIT_MSG_FILE")"
+
+if [ -z "$subject" ]; then
+  echo "commit-msg hook: empty commit subject (after skipping comments/blanks)" >&2
+  exit 2
+fi
+
+# Allowed prefixes — anchored at start of subject, terminated by ':'.
+# Keep this list in lockstep with global CLAUDE.md "Commit provenance tag" table.
+allowed_re='^(claude|claudem|claudew|gemini|codex|cursor|ao|human)/?[a-zA-Z0-9._-]*:[[:space:]]'
+
+# Merge commits often have subjects like "Merge branch 'foo' into main" —
+# those are produced by git itself and should be allowed through (the
+# individual squash commits inside the merge were each validated at their
+# own commit-msg hook invocation; the merge commit's provenance is the
+# human/operator that pushed the merge).
+merge_re='^Merge (branch|tag|commit) '
+
+if [[ "$subject" =~ $allowed_re ]]; then
+  exit 0
+fi
+
+if [[ "$subject" =~ $merge_re ]]; then
+  exit 0
+fi
+
+cat >&2 <<EOF
+commit-msg hook: REJECTED — subject lacks runtime provenance prefix.
+
+  subject: $subject
+
+Per CLAUDE.md "Commit conventions" and the global CLAUDE.md "Commit provenance
+tag" rule, every commit subject MUST start with one of:
+
+  claude/<model-id>:    Claude Code native
+  claudem/<model-id>:   MiniMax / MiniMax-M3 family
+  claudew/<model-id>:   Wafer / GLM family
+  gemini/<model-id>:    Gemini CLI
+  codex/<model-id>:     Codex CLI
+  cursor/<model>:       Cursor / OpenCode
+  ao/<model>:           Agent Orchestrator worker
+  human:                Human-authored
+
+Examples:
+  claude/sonnet: chore(hooks): add commit-msg provenance gate
+  human: fix: typo in README
+
+Bypass (emergency only):  git commit --no-verify
+Reference bead:            ez-gh-actions-jcie
+EOF
+exit 1
