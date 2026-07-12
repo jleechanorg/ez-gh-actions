@@ -838,6 +838,9 @@ fn main() -> Result<()> {
                 }
                 cfg.limits.cpus = cfg.limits.cpus.min(cpu_share);
                 cfg.limits.memory_mb = cfg.limits.memory_mb.min(mem_share);
+                // Record the auto-detected VM/daemon ceiling explicitly so the
+                // startup memory-budget guard (bead yz6b) has a known ground truth.
+                cfg.runner.vm_total_mb = Some(daemon_mem);
                 println!(
                     "docker daemon capacity: {ncpu} cpus, {daemon_mem} MB; \
                      per-runner ceiling at count={count}: {cpu_share:.2} cpus, {mem_share} MB"
@@ -901,6 +904,28 @@ fn main() -> Result<()> {
                     cfg.github.target,
                     cfg.runner.count
                 );
+                match docker_backend::preview_memory_budget(&cfg) {
+                    docker_backend::MemoryBudgetPreview::Pass(b) => println!(
+                        "memory budget check (preview): would PASS on next restart — \
+                         vm_total_mb={} guest_reserve_mb={} fleet_budget_mb={} runner_count={} \
+                         per_runner_budget_mb={} runner_floor_mb={}",
+                        b.vm_total_mb,
+                        b.guest_reserve_mb,
+                        b.fleet_budget_mb,
+                        b.runner_count,
+                        b.per_runner_budget_mb,
+                        b.runner_floor_mb,
+                    ),
+                    docker_backend::MemoryBudgetPreview::Fail(msg) => println!(
+                        "memory budget check (preview): would FAIL on next restart with current \
+                         config — {msg}"
+                    ),
+                    docker_backend::MemoryBudgetPreview::Unknown => println!(
+                        "memory budget check (preview): unknown — cannot determine VM/daemon \
+                         memory ceiling (set runner.vm_total_mb explicitly; check `colima status` \
+                         / `limactl list`)"
+                    ),
+                }
             } else {
                 println!("config: none — run `ezgha init --target owner/repo`");
             }
@@ -932,6 +957,10 @@ fn main() -> Result<()> {
             // with After=lima-vm@colima.service the Docker socket may not be
             // ready for a few seconds after limactl start exits.
             let backend = wait_for_backend(&cfg, Duration::from_secs(120))?;
+            // VM-aware memory budget derivation + fail-loud guard (bead
+            // ez-gh-actions-yz6b). See docker_backend::resolve_and_log_memory_budget.
+            docker_backend::resolve_and_log_memory_budget(&cfg)
+                .context("memory budget check failed at startup")?;
             println!(
                 "supervising {} ephemeral runner(s) for {} on {}",
                 cfg.runner.count,
