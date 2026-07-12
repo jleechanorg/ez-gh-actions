@@ -146,6 +146,7 @@ else
 cat <<'TABLE'
   24265 33072676 qemu-system-x86 /usr/bin/qemu-system-x86_64 -m 49152 -drive file=/home/jleechan/.lima/colima/diffdisk -name lima-colima
   12439   759760 warp-terminal /usr/bin/warp-terminal
+  11111   700000 limactl /usr/local/bin/limactl hostagent
   19195   616432 claude /home/jleechan/.npm-global/bin/claude
 TABLE
 EOF
@@ -172,8 +173,10 @@ EOF
       fail "REGRESSION: watcher selected the Colima VM qemu process (pid=24265) as its SIGTERM target -- this would kill the entire runner fleet"
     elif grep 'would send SIGTERM' "${WATCHER_LOG}" | grep -q 'pid=12439'; then
       fail "REGRESSION: watcher selected the user's GUI terminal (warp-terminal, pid=12439) as its SIGTERM target -- this would kill the user's terminal session mid-crisis"
+    elif grep 'would send SIGTERM' "${WATCHER_LOG}" | grep -q 'pid=11111'; then
+      fail "REGRESSION: watcher selected the limactl helper (pid=11111) as its SIGTERM target -- this would break Colima/Lima VM management and take down the runner fleet"
     elif grep 'would send SIGTERM' "${WATCHER_LOG}" | grep -q 'pid=19195'; then
-      ok "watcher correctly skipped qemu/colima AND warp-terminal, landing on the legitimate claude agent CLI process (behavioral smoke test)"
+      ok "watcher correctly skipped qemu/colima, warp-terminal, AND limactl helpers, landing on the legitimate claude agent CLI process (behavioral smoke test)"
     else
       fail "watcher logged a SIGTERM target that matched none of the expected pids -- inspect ${WATCHER_LOG}"
     fi

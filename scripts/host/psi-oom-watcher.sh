@@ -157,7 +157,7 @@ DRY_RUN="${DRY_RUN:-0}"
 # (self-exclusion is already guaranteed by the PID/PPID checks above,
 # independent of this pattern) but was documentation-misleading. Fixed to
 # the actual truncated value so the intent and the mechanism agree.
-EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher|ezgha|qemu-system-x86|colima|lima|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
+EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher|ezgha|qemu-system-x86|colima|lima|limactl|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
 # args-based exclusions (defense in depth for the comm-truncation case
 # above, and to catch any Colima/Lima helper process whose comm doesn't
 # start with one of the names above but whose full command line does).
