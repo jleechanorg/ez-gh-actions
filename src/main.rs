@@ -1262,7 +1262,7 @@ fn main() -> Result<()> {
             // marker so the rollback path is recoverable. We do NOT touch
             // the Docker context itself — that step is operator-driven.
             if let Some(p) = plan {
-                let entry = lima_convergence::backup_entry_for(&context, &p);
+                let entry = lima_convergence::backup_entry_for(context, &p);
                 lima_convergence::write_backup_marker(&p.backup_marker, &[entry]).with_context(
                     || format!("writing backup marker to {}", p.backup_marker.display()),
                 )?;
