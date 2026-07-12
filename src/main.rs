@@ -1591,7 +1591,10 @@ mod tests {
         )
         .unwrap();
         assert!(!recovered);
-        assert!(probes > 1, "should have retried at least once, got {probes} probes");
+        assert!(
+            probes > 1,
+            "should have retried at least once, got {probes} probes"
+        );
     }
 
     #[test]
