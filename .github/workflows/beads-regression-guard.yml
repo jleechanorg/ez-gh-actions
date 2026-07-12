@@ -1,0 +1,36 @@
+name: Beads Regression Guard
+
+# Guards .beads/issues.jsonl against silent data loss from a stale-DB
+# full-file rewrite clobbering a concurrent session's beads (deleted ids or
+# reverted updated_at timestamps). See bead jleechan-w528 for the incident
+# this check was written to catch: two separate pushes each dropped several
+# concurrently-created/updated beads because the flush was based on a DB
+# snapshot that predated a sibling session's commits.
+
+on:
+  pull_request:
+    paths:
+      - ".beads/issues.jsonl"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Detect bead deletions/regressions
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","ezgha"]') }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run deletion/regression guard
+        run: |
+          set -euo pipefail
+          parent_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          merge_base="$(git merge-base "$parent_sha" "$head_sha")"
+          echo "Comparing .beads/issues.jsonl: merge-base=$merge_base -> head=$head_sha"
+          python3 scripts/check_beads_no_regression.py "$merge_base" "$head_sha"
