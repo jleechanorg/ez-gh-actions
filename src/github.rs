@@ -513,6 +513,60 @@ pub(crate) fn api_json_until(path: &str, deadline: Instant) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Parsed slice of `gh api rate_limit`'s response -- only the `core` REST
+/// bucket's `remaining` count matters for the budget-floor check below; the
+/// `search`/`graphql`/etc buckets are ignored on purpose since every call
+/// site this gates (`queue_monitor` read-heavy fetches) goes through the
+/// REST (`core`) bucket, never GraphQL.
+#[derive(Debug, Deserialize)]
+struct RateLimitResponse {
+    resources: RateLimitResources,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResources {
+    core: RateLimitBucket,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitBucket {
+    remaining: u32,
+}
+
+/// Parses `gh api rate_limit`'s JSON body and extracts
+/// `resources.core.remaining`. Split out from `rest_budget_remaining` so the
+/// parsing logic is testable without exec'ing `gh` (see
+/// `rate_limit_response_parses_core_remaining` below).
+fn parse_rest_budget_remaining(body: &[u8]) -> Result<u32> {
+    let parsed: RateLimitResponse =
+        serde_json::from_slice(body).context("parse `gh api rate_limit` response")?;
+    Ok(parsed.resources.core.remaining)
+}
+
+/// Returns the REST (core) bucket's remaining call count via `gh api
+/// rate_limit` -- itself quota-EXEMPT, so checking it never consumes budget
+/// from the bucket it's measuring. Used by `queue_monitor`'s REST-budget
+/// deprioritization gate (see `queue_monitor::rest_budget_floor_allows`) to
+/// decide whether a tick's read-heavy calls should fire or defer; the
+/// write-path (`generate_jitconfig`/runner registration) never calls this
+/// and is never gated by it.
+pub fn rest_budget_remaining() -> Result<u32> {
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = gh_command();
+        cmd.args(["api", "rate_limit"]);
+        cmd
+    })
+    .context("failed to run `gh api rate_limit`")?;
+    if !out.status.success() {
+        log_gh_response("gh api rate_limit", &out);
+        bail!(
+            "gh api rate_limit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    parse_rest_budget_remaining(&out.stdout)
+}
+
 pub(crate) fn api_post_empty(path: &str, fields: &[(&str, &str)]) -> Result<()> {
     let out = run_gh_with_backoff(|| {
         let mut cmd = gh_command();
@@ -1850,6 +1904,62 @@ github.com
         // Sanity: confirm the parsing logic we wrote above would treat this
         // stdout as success. We don't exec `gh` here — just validate the
         // string search the function depends on.
+    }
+
+    #[test]
+    fn rate_limit_response_parses_core_remaining() {
+        // Real `gh api rate_limit` shape (trimmed to the fields we read).
+        let body = br#"{
+            "resources": {
+                "core": {"limit": 5000, "used": 4750, "remaining": 250, "reset": 1700000000},
+                "search": {"limit": 30, "used": 0, "remaining": 30, "reset": 1700000000},
+                "graphql": {"limit": 5000, "used": 0, "remaining": 5000, "reset": 1700000000}
+            },
+            "rate": {"limit": 5000, "used": 4750, "remaining": 250, "reset": 1700000000}
+        }"#;
+        let remaining = parse_rest_budget_remaining(body).unwrap();
+        assert_eq!(remaining, 250);
+    }
+
+    #[test]
+    fn rate_limit_response_rejects_malformed_json() {
+        let err = parse_rest_budget_remaining(b"not json").unwrap_err();
+        assert!(
+            err.to_string().contains("parse `gh api rate_limit`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rest_budget_remaining_execs_gh_api_rate_limit_and_parses_core() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rate-limit-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo '{"resources":{"core":{"limit":5000,"used":4999,"remaining":1,"reset":0}}}'
+exit 0
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let remaining = rest_budget_remaining().unwrap();
+        assert_eq!(remaining, 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
