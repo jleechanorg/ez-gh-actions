@@ -434,9 +434,16 @@ fi
 EXPECTED_RUNNING=0
 for slot in $(seq 1 "$COUNT"); do
     SLOT_NAME="${NAME_PREFIX}-${slot}"
-    if ! container_state_is_running "$SLOT_NAME"; then
-        fail "Slot $SLOT_NAME is missing or not running"
-    fi
+    retry=0
+    max_retries=6
+    while ! container_state_is_running "$SLOT_NAME"; do
+        if [ "$retry" -ge "$max_retries" ]; then
+            fail "Slot $SLOT_NAME is missing or not running after $((max_retries * 5))s"
+        fi
+        echo "    [INFO] Slot $SLOT_NAME not running yet, retrying in 5s (retry $((retry + 1))/$max_retries)..."
+        sleep 5
+        retry=$((retry + 1))
+    done
 
     SLOT_JSON=$(docker inspect "$SLOT_NAME" 2>/dev/null || echo '[]')
     if [ "$SLOT_JSON" = "[]" ]; then
