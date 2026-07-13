@@ -36,6 +36,18 @@ staged shedding (`ez-gh-actions-ghd2.7`), and watchdog repair
 (`ez-gh-actions-6478`). Mac restoration is tracked by
 `ez-gh-actions-ghd2.3` and `ez-gh-actions-hcu`.
 
+**Machine-portable recovery contract:** live files under `~/.config`,
+`~/.local`, and `/etc` are deployment outputs, not the source of truth. The
+10-runner program must land as repository-owned host profiles, rendered
+systemd/watchdog configuration, idempotent install/restore/rollback tooling,
+doctor drift checks, and clean-machine integration coverage. Track the
+versioned profile and installer in `ez-gh-actions-e0z0.2`; track disposable
+restore, upgrade, drift, and rollback proof in `ez-gh-actions-e0z0.3`. The
+existing VM-sizing (`jleechan-bih3`), aggregate-cap (`jleechan-aqh`),
+single-backend (`ez-gh-actions-apye`), pressure-watcher
+(`ez-gh-actions-0725`), and watchdog-shedding (`ez-gh-actions-6478`) beads now
+require committed portable artifacts. Manual host edits cannot close them.
+
 **Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
 2. ~~`bxy` (P1)~~ — DONE: release_slot on JIT failure + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)
