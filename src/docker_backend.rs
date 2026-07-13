@@ -1107,25 +1107,35 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
         Err(_) => return false,
     };
 
-    // cgroup-v2: any line containing the literal token "cpu" in a
-    // whitespace-separated list counts. `/sys/fs/cgroup/cgroup.controllers`
-    // is a single line of space-separated names like "cpu cpuacct memory …"
-    // on v1 hosts, but we are already in v2 namespace here (`--cgroupns=host`
-    // on a v2 daemon returns the v2 file). Be lenient anyway.
+    // cgroup-v2: `/sys/fs/cgroup/cgroup.controllers` is a single line of
+    // space-separated controller names like "cpuset cpu io memory hugetlb
+    // pids rdma misc". Any token equal to "cpu" counts as the controller
+    // being available.
+    //
+    // cgroup-v1 `/proc/cgroups` is a header line plus rows shaped
+    // `<subsystem> <hierarchy> <num_cgroups> <enabled>`; the "cpu" row must
+    // have enabled = 1. The probe uses `cat v2 2>/dev/null || cat v1`, so
+    // only one of the two formats will be present.
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        // Distinguish v1 vs v2: v1 lines look like "cpu\t<Hierarchy>\t<NumCgroups>\t<Enabled>"
-        // (multiple columns), v2 is a single header-less word list.
         let cols: Vec<&str> = trimmed.split_whitespace().collect();
         if cols.len() == 1 && cols[0] == "cpu" {
-            // v2 controllers list, where "cpu" appears as a standalone token.
+            // v2 controllers file split one-token-per-line (unusual but
+            // some kernels do this for readability).
             return true;
         }
+        if cols.len() >= 2 && !cols[0].starts_with('#') {
+            // v2 single-line space-separated list: any token equal to "cpu".
+            // Skip the v1 header line "#subsys_name hierarchy num_cgroups enabled".
+            if cols.iter().any(|c| *c == "cpu") {
+                return true;
+            }
+        }
         if cols.len() >= 4 {
-            // v1 `/proc/cgroups` row: name hiararchy numcgroups enabled.
+            // v1 `/proc/cgroups` row: name hierarchy numcgroups enabled.
             if cols[0] == "cpu" && cols[3] == "1" {
                 return true;
             }
