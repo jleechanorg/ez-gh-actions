@@ -1,0 +1,10 @@
+# app-lima-vm.slice — user-scope memory ceiling for the Colima/Lima VM QEMU process.
+# Part of bead jleechan-aqh (apply and verify limits against the actual QEMU cgroup).
+
+[Unit]
+Description=Colima/Lima VM QEMU process slice — soft memory ceiling
+Before=slices.target
+
+[Slice]
+MemoryHigh=38G
+MemoryAccounting=yes

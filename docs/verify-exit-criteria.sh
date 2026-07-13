@@ -209,11 +209,15 @@ inspect_has_no_new_privileges() {
 }
 
 runner_has_worker_process() {
+    # Worker processes are spawned only when the runner has accepted a job.
+    # Idle runners have Runner.Listener but NOT Runner.Worker, so listening
+    # alone is not sufficient proof of execution — that would falsely pass on
+    # an idle fleet. Must observe a Worker process explicitly.
     local name="$1"
     if ! docker top "$name" >/dev/null 2>&1; then
         return 1
     fi
-    docker top "$name" 2>/dev/null | awk 'NR>1 && $0 ~ /Runner\.Worker|Runner\.Listener/ {found=1} END {exit !found}'
+    docker top "$name" 2>/dev/null | awk 'NR>1 && $0 ~ /Runner\.Worker/ {found=1} END {exit !found}'
 }
 
 daemon_overlay_free_disk_gb() {
@@ -353,10 +357,21 @@ pass "Gate 2: Service active and Docker/Colima daemon up (platform=$PLATFORM)"
 # --- Gate 3: Fleet capacity ---
 echo "--- Checking Gate 3: Fleet capacity ---"
 verify_kdump_pstore
-# Parse runner.count from config.toml
-CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+# Resolve the live config file the daemon actually uses. ezgha reads from
+# ~/.config/ezgha/config.toml on Linux and from
+# "$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml" on
+# macOS. Reading only the Linux path would silently validate a stale mirror
+# while the real Mac fleet stays at the wrong count.
+detect_config_file() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml"
+        return 0
+    fi
+    echo "$HOME/.config/ezgha/config.toml"
+}
+CONFIG_FILE=$(detect_config_file)
 if [ ! -f "$CONFIG_FILE" ]; then
-    fail "Config file not found at $CONFIG_FILE"
+    fail "Config file not found at platform-correct path: $CONFIG_FILE"
 fi
 COUNT=$(toml_get_runner count 2>/dev/null || grep -E 'count\s*=\s*' "$CONFIG_FILE" | head -1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
 NAME_PREFIX=$(toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
