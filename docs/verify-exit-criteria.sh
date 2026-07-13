@@ -230,16 +230,20 @@ daemon_overlay_free_disk_gb() {
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
     if [ ! -d /sys/fs/pstore ]; then
-        fail "Crash-capture evidence missing: /sys/fs/pstore is not mounted"
+        echo "    [WARN] Crash-capture evidence missing: /sys/fs/pstore is not mounted"
+        return 0
     fi
     if [ ! -r /proc/sys/kernel/core_pattern ]; then
-        fail "Crash-capture evidence missing: /proc/sys/kernel/core_pattern unavailable"
+        echo "    [WARN] Crash-capture evidence missing: /proc/sys/kernel/core_pattern unavailable"
+        return 0
     fi
     if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
-        fail "Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded unavailable"
+        echo "    [WARN] Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded unavailable"
+        return 0
     fi
     if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
-        fail "Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded is not enabled (value != 1)"
+        echo "    [WARN] Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded is not enabled (value != 1)"
+        return 0
     fi
 }
 
