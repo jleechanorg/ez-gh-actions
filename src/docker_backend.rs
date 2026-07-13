@@ -1189,8 +1189,30 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
 /// `daemon / count`; clamping to raw `daemon` would silently over-commit by
 /// `count×` (bug vmz — count=16 on a 4-CPU/12-GB daemon would issue per-runner
 /// requests summing to 32 CPU + 95 GB, triggering OOM-kills).
+///
+/// **VM ceiling override**: if `cfg.runner.vm_total_mb` is set, use it as
+/// the fleet budget base instead of the docker daemon's reported `MemTotal`.
+/// This fixes the case where the docker daemon reports LESS memory than the
+/// actual VM ceiling (e.g. Colima reserves memory for the guest OS that
+/// the daemon doesn't see). Previously, with `count=6` on a 24GiB Colima VM,
+/// `docker info --format {{.MemTotal}}` returned 15957MB (the daemon's view
+/// after guest reserve), so the clamp computed `fleet_budget_mb = 13909MB`,
+/// `per_runner = 2318MB` — silently degrading configured `memory_mb = 3072`
+/// by 25% on every runner. Setting `vm_total_mb = 24576` (the actual VM
+/// ceiling) restores `fleet_budget_mb = 22528`, `per_runner = 3754MB`,
+/// respecting the configured 3072MB floor.
 pub fn effective_limits(cfg: &Config) -> (f64, u64) {
-    effective_limits_with_capacity(cfg, daemon_capacity())
+    let (ncpu, daemon_mem) = match daemon_capacity() {
+        Some(c) => c,
+        None => return (cfg.limits.cpus, cfg.limits.memory_mb),
+    };
+    // If vm_total_mb override is set, use it as the fleet budget base
+    // instead of the docker daemon's reported MemTotal. This is the SAME
+    // value that derive_memory_budget uses for the startup fail-loud guard,
+    // so the guard and the runtime clamp stay in sync (bead ez-gh-actions-yz6b
+    // round 3 sync requirement).
+    let fleet_mem_base = cfg.runner.vm_total_mb.unwrap_or(daemon_mem);
+    effective_limits_with_capacity(cfg, Some((ncpu, fleet_mem_base)))
 }
 
 fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) -> (f64, u64) {
