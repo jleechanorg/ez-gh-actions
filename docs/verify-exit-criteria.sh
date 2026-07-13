@@ -514,6 +514,14 @@ if [ "$FLOOR_REQUIREMENT_MB" -gt "$HOST_BUDGET_MB" ]; then
 fi
 
 EXPECTED_RUNNING=0
+# --- Lane H R3 arithmetic traceability (2026-07-13) ---
+# Per-slot aggregate = limit_mb × count; runner budget = vm_total_mb - guest_reserve_mb.
+# Current target: 3000 × 10 = 30000 MiB (≈29.3 GiB) vs budget 36864 - 4096 = 32768 MiB (32 GiB)
+# ⇒ headroom = 2768 MiB (≈2.7 GiB) for host reserve / cgroup overhead / sibling slots.
+# Prior value 3100 × 10 = 31000 MiB (≈30.3 GiB) ⇒ only 1768 MiB (≈1.7 GiB) headroom
+# (too tight under load). Lowering memory_mb from 3100 → 3000 widens the safety
+# margin so the host-watchdog (`max-load-1 = 24`) is less likely to trip under
+# aggregate memory pressure. Restart pending deploy-owner (single-writer rule).
 for slot in $(seq 1 "$COUNT"); do
     SLOT_NAME="${NAME_PREFIX}-${slot}"
     retry=0
@@ -850,6 +858,77 @@ AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
               }')
 echo "    [PASS] Gate 8 (2) AO/MCP processes (n=${AO_MCP_TOTAL}) are inside an enforced slice with a finite memory ceiling"
 
+# (2.5) agents.slice enrollment probe (round-3 lane G, bead ez-gh-actions-0725) ---
+# The round-3 panel decision flipped agents.slice from opt-in to AUTO-MIGRATE
+# with --opt-out (see systemd/agents.slice header for the policy change).
+# That auto-migrate default is only as good as its enforcement: if any
+# agent-CLI binary is on PATH yet zero leaves are enrolled in the slice, an
+# operator could be silently running unscoped and the verifier would never
+# notice. This probe fail-closes on exactly that shape.
+#
+# Rule (per bead ez-gh-actions-0725):
+#   - For each candidate agent-CLI binary on PATH (claude, codex, gemini,
+#     cursor, aider, cody), note whether it exists. If NONE are on PATH,
+#     the requirement is waived (operators who have not installed an
+#     agent CLI do not need to enroll anything).
+#   - If ANY candidate is on PATH, then agents.slice MUST have at least
+#     one enrolled leaf (transient scope-* or service-* child), AND
+#     every enrolled leaf's memory.high MUST be a finite value (an
+#     "unbounded leaf within a bounded slice" is the exact failure
+#     shape that motivated this probe — the slice's own MemoryHigh
+#     applies to the SUM of its children, so a leaf with memory.high=
+#     max inside agents.slice defeats the parent cap).
+#   - The ao-daemon.service drop-in at
+#     systemd/ao-daemon-memory-cap.service.d/memory.conf installs
+#     Slice=agents.slice + MemoryHigh=20G on the daemon; the script
+#     scripts/host/agent-auto-migrate.sh enrolls interactive sessions.
+AGENT_CLI_BINARIES="claude codex gemini cursor aider cody"
+AGENT_CLI_FOUND=""
+AGENT_CLI_MISSING=""
+for bin in $AGENT_CLI_BINARIES; do
+    if command -v "$bin" >/dev/null 2>&1; then
+        # Resolve via `command -v` path so installers put the binary
+        # on PATH in a non-standard location (npm-global, ~/.local/bin)
+        # and still match.
+        AGENT_CLI_FOUND="${AGENT_CLI_FOUND}${bin}($(command -v "$bin")) "
+    else
+        AGENT_CLI_MISSING="${AGENT_CLI_MISSING}${bin} "
+    fi
+done
+if [ -z "${AGENT_CLI_FOUND// /}" ]; then
+    echo "    [SKIP] Gate 8 (2.5) agents.slice enrollment: no agent-CLI binaries on PATH (${AGENT_CLI_MISSING}missing); requirement waived per bead ez-gh-actions-0725"
+else
+    # Walk the slice's child cgroups under user.slice/user-<UID>.slice/
+    # user@<UID>.service/agents.slice/ (transient scopes + service
+    # leaves both sit there). Each child is a real enrollment.
+    SYSFS="/sys/fs/cgroup"
+    AGENT_SLICE_BASE="${SYSFS}/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice"
+    AGENT_LEAF_COUNT=0
+    AGENT_UNBOUNDED_LEAVES=""
+    if [ -d "${AGENT_SLICE_BASE}" ]; then
+        # Enumerate immediate child cgroups of the slice.
+        while IFS= read -r leaf_dir; do
+            [ -d "$leaf_dir" ] || continue
+            AGENT_LEAF_COUNT=$((AGENT_LEAF_COUNT + 1))
+            leaf_high=$(cat "${leaf_dir}/memory.high" 2>/dev/null || echo "?")
+            # Treat "max" AND "unreadable" as unbounded; the helper
+            # cgroup_leaf_has_memory_ceiling accepts both. Either shape
+            # means the leaf has no enforced ceiling.
+            if [ "$leaf_high" = "max" ] || [ "$leaf_high" = "?" ]; then
+                leaf_name=$(basename "$leaf_dir")
+                AGENT_UNBOUNDED_LEAVES="${AGENT_UNBOUNDED_LEAVES}${leaf_name}(memory.high=${leaf_high}) "
+            fi
+        done < <(find "${AGENT_SLICE_BASE}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
+    fi
+    if [ "$AGENT_LEAF_COUNT" -eq 0 ]; then
+        fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: agent-CLI binaries on PATH (${AGENT_CLI_FOUND}) but ${AGENT_SLICE_BASE} has zero enrolled leaves. Remediation: per bead ez-gh-actions-0725 (round-3 policy: AUTO-MIGRATE with --opt-out), run 'scripts/host/agent-auto-migrate.sh apply' to relaunch matching PIDs into the slice, OR install systemd/ao-daemon-memory-cap.service.d/memory.conf to enroll the ao-daemon.service so the slice has at least one service-* leaf. The AGENT_SLICE_OPT_OUT=1 env-var escape hatch exists for explicit opt-OUT per session."
+    fi
+    if [ -n "$AGENT_UNBOUNDED_LEAVES" ]; then
+        fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: slice has ${AGENT_LEAF_COUNT} leaf(ves) but ${AGENT_UNBOUNDED_LEAVES}are unbounded (memory.high=max). The parent slice's MemoryHigh applies to the SUM of children, so a leaf with memory.high=max defeats the aggregate cap. Remediation: copy systemd/ao-daemon-memory-cap.service.d/memory.conf to ~/.config/systemd/user/ao-daemon.service.d/ and ensure every interactive agent-CLI session enrolls via scripts/host/agent-auto-migrate.sh (which delegates to systemd-run --user --slice=agents.slice --scope -- <cmd>). Per bead ez-gh-actions-0725."
+    fi
+    echo "    [PASS] Gate 8 (2.5) agents.slice enrollment: ${AGENT_LEAF_COUNT} leaf(ves) enrolled (all memory.high finite); agent-CLI on PATH: ${AGENT_CLI_FOUND}"
+fi
+
 # (3) PSI admission check --------------------------------------------------------------
 # Either a real cgroup is enrolled with systemd-oomd (ManagedOOM
 # MemoryPressure/Swap explicitly opted in, OR oomctl reports a
@@ -1131,6 +1210,60 @@ else
 fi
 
 pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
+
+# --- Gate 9: Controlled host-pressure proof (bead ez-gh-actions-bjpk, R3 lane L) ---
+# This gate invokes scripts/host/host-pressure-proof.sh — the executable
+# proof that the three host-reliability lanes (I: PSI/hysteresis admission
+# refusal in src/docker_backend.rs::eval_admission; J: 4-stage
+# drain→reclaim→verify→escalate shed chain in
+# scripts/host/psi-oom-watcher.sh; K: kernel-panic harness in
+# scripts/host/crash-capture-verify.sh) work together under live pressure
+# without OOM, watchdog reboot, or QEMU cgroup ceiling breach.
+#
+# Two modes:
+#   * DEFAULT (HPP_LIVE != 1): the verifier runs --dry-run only — it
+#     verifies the script EXISTS, its preconditions are met (QEMU running,
+#     agents.slice enrolled, config readable, stress-ng installed), and
+#     the auto-computed pressure plan is sane. This is the path normal CI
+#     takes; it does NOT spawn stress-ng or canaries and is safe to run
+#     on the live fleet.
+#   * LIVE (HPP_LIVE=1): the verifier runs the full live pressure + canary
+#     burst + recovery loop. This is operator-gated — it pressures the
+#     host for ~60s with stress-ng inside agents.slice, dispatches N
+#     concurrent canaries, and waits for MemAvailable to recover. Use
+#     this on a quiet window (e.g. before a major release) to validate
+#     the round-3 protection stack end-to-end. NEVER auto-enable in CI.
+#
+# Dry-run timeout defaults to 180s (HPP_TIMEOUT overrides). Live mode
+# defaults to 300s (HPP_TIMEOUT overrides).
+echo "--- Checking Gate 9: Controlled host-pressure proof ---"
+HPP_SCRIPT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/host-pressure-proof.sh"
+if [ ! -x "${HPP_SCRIPT}" ]; then
+    fail "Gate 9: host-pressure-proof.sh not found or not executable at ${HPP_SCRIPT}"
+fi
+HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-180}"
+if [ "${HPP_LIVE:-0}" = "1" ]; then
+    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-300}"
+fi
+HPP_DRY_OUTPUT=""
+if ! HPP_DRY_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --dry-run 2>&1); then
+    echo "${HPP_DRY_OUTPUT}"
+    fail "Gate 9: dry-run failed (exit $?) — see host-pressure-proof.sh output above. Preconditions unmet (QEMU not running, agents.slice not enrolled, stress-ng missing, etc.) — apply the remediation printed in the dry-run output."
+fi
+echo "${HPP_DRY_OUTPUT}"
+# Live: only attempt if --live enabled and host not under pressure already
+if [ "${HPP_LIVE:-0}" = "1" ]; then
+    HPP_LIVE_OUTPUT=""
+    if ! HPP_LIVE_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --timeout-seconds "${HPP_TIMEOUT_VAL}" 2>&1); then
+        echo "${HPP_LIVE_OUTPUT}"
+        fail "Gate 9: live host-pressure-proof exited $? — host did not absorb + recover from controlled pressure within budget"
+    fi
+    echo "${HPP_LIVE_OUTPUT}"
+    pass "Gate 9: Host absorbed + recovered from controlled pressure (round-3 acceptance)"
+else
+    echo "    [INFO] Gate 9 dry-run verified; live proof requires HPP_LIVE=1"
+    pass "Gate 9: Controlled host-pressure harness present (dry-run path)"
+fi
 
 # --- Gate 10: GitHub API budget ---
 echo "--- Checking Gate 10: GitHub API budget ---"
