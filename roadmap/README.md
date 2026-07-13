@@ -22,10 +22,19 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 [issue #71](https://github.com/jleechanorg/ez-gh-actions/issues/71), mandatory
 agent/MCP containment in
 [issue #72](https://github.com/jleechanorg/ez-gh-actions/issues/72), and the
-72-hour acceptance soak in
-[issue #73](https://github.com/jleechanorg/ez-gh-actions/issues/73). The
-program bead is `ez-gh-actions-e0z0`; the final soak is
-`ez-gh-actions-e0z0.1`.
+bounded real-job capacity proof recorded by `ez-gh-actions-e0z0`. The rejected
+72-hour soak in [issue #73](https://github.com/jleechanorg/ez-gh-actions/issues/73)
+and bead `ez-gh-actions-e0z0.1` is closed.
+
+**2026-07-12 19:35 crash update:** global OOM killed the Linux runner QEMU at
+37.6 GiB RSS with swap exhausted; watchdog then rebooted after its load-based
+repair policy failed to reduce pressure. Restart prevention is now an ordered
+P0 chain: deploy alignment (`jleechan-qo8`), aggregate runner cap
+(`jleechan-aqh`), host admission (`jleechan-1kkj`), agent/MCP containment
+(`ez-gh-actions-0725`), fail-closed reconciliation (`ez-gh-actions-ghd2.1`),
+staged shedding (`ez-gh-actions-ghd2.7`), and watchdog repair
+(`ez-gh-actions-6478`). Mac restoration is tracked by
+`ez-gh-actions-ghd2.3` and `ez-gh-actions-hcu`.
 
 **Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
@@ -57,7 +66,7 @@ program bead is `ez-gh-actions-e0z0`; the final soak is
 
 ## Recent activity (by day)
 
-- [2026-07-12](activity/2026-07-12.md) - Ten-runner host-availability program: host-first capacity envelope, mandatory agent containment, staged shedding, and 72-hour soak.
+- [2026-07-12](activity/2026-07-12.md) - Host-availability program, proven QEMU/global-OOM watchdog reboot, ordered P0 containment, and Mac six-runner restoration.
 - [2026-07-11](activity/2026-07-11.md) — 48-hour cross-fleet audit: Mac forced-reset recovery loop, Linux memory/watchdog reboot, PR #56 self-healing fix, and prioritized watchdog/CI/deploy guardrails.
 - [2026-07-10](activity/2026-07-10.md) — Fleet-hardening marathon: stable-libexec migration (sa1t closed), doctor-runner honesty ×4 (first exit-0), ao-runner farm eradicated, reaper multi-repo + Linux timer installed, codex cold-review fixes, factory lane opened (10 beads incl. PR#47 drive).
 - [2026-07-09](activity/2026-07-09.md) — Root-cause confirmed: Linux fleet convergence failure from runner reconciliation churn; tracked with `jleechan-zy6` and `jleechan-9zd`.
