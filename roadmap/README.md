@@ -17,6 +17,16 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 `gdy` is now actually closed in beads, `bxy` promoted to P1, `ozk` promoted to P2,
 `juv` retitled as the correlation layer, and missing Docker-timeout bead `fl0` created.
 
+**2026-07-12 host-availability program:** Jeff-Ubuntu's explicit target is now
+10 Linux runners. Track the host-first capacity envelope in
+[issue #71](https://github.com/jleechanorg/ez-gh-actions/issues/71), mandatory
+agent/MCP containment in
+[issue #72](https://github.com/jleechanorg/ez-gh-actions/issues/72), and the
+72-hour acceptance soak in
+[issue #73](https://github.com/jleechanorg/ez-gh-actions/issues/73). The
+program bead is `ez-gh-actions-e0z0`; the final soak is
+`ez-gh-actions-e0z0.1`.
+
 **Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
 2. ~~`bxy` (P1)~~ — DONE: release_slot on JIT failure + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)
@@ -47,6 +57,7 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 ## Recent activity (by day)
 
+- [2026-07-12](activity/2026-07-12.md) - Ten-runner host-availability program: host-first capacity envelope, mandatory agent containment, staged shedding, and 72-hour soak.
 - [2026-07-11](activity/2026-07-11.md) — 48-hour cross-fleet audit: Mac forced-reset recovery loop, Linux memory/watchdog reboot, PR #56 self-healing fix, and prioritized watchdog/CI/deploy guardrails.
 - [2026-07-10](activity/2026-07-10.md) — Fleet-hardening marathon: stable-libexec migration (sa1t closed), doctor-runner honesty ×4 (first exit-0), ao-runner farm eradicated, reaper multi-repo + Linux timer installed, codex cold-review fixes, factory lane opened (10 beads incl. PR#47 drive).
 - [2026-07-09](activity/2026-07-09.md) — Root-cause confirmed: Linux fleet convergence failure from runner reconciliation churn; tracked with `jleechan-zy6` and `jleechan-9zd`.
