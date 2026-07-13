@@ -1273,7 +1273,26 @@ fn start_one_with_generate_at_slot(
     // inside its cgroup instead of taking the host down.
     cmd.args(["--memory", &format!("{memory_mb}m")]);
     cmd.args(["--memory-swap", &format!("{memory_mb}m")]);
-    cmd.args(["--cpus", &format!("{:.2}", cpus)]);
+    // Skip --cpus if the host is Linux and does not support the cpu controller
+    let has_cpu_controller = || -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(controllers) = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
+                controllers.split_whitespace().any(|c| c == "cpu")
+            } else {
+                true
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    };
+    if has_cpu_controller() {
+        cmd.args(["--cpus", &format!("{:.2}", cpus)]);
+    } else {
+        eprintln!("warning: cpu cgroup controller not available; skipping --cpus limit");
+    }
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
     if backend == Backend::DockerSysbox {
