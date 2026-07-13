@@ -241,21 +241,47 @@ REPRODUCIBLE REMEDIATION:
     2. sudo reboot                                     # required; GRUB + crashkernel=2G only take effect after reboot
     3. ./docs/verify-exit-criteria.sh                  # re-run; this gate will turn green once /sys/kernel/kexec_crash_loaded == 1
 REMEDIATE
+    # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
+    #     it routes only userspace coredumps (SIGSEGV in a process), NOT
+    #     kernel panics. Kdump dumps kernel panics via kexec-loaded crash
+    #     kernel writing to /var/crash, completely independent of
+    #     core_pattern. Checking core_pattern for "pstore" here was a false
+    #     positive — it could fail when kdump is correctly installed.
+    #     Skip it; it is not a kdump artifact.
+    #
+    # (2) /sys/fs/pstore is a SEPARATE firmware-level capture path
+    #     (pstore/ramoops; survives a panic to read back via dmesg-equivalent
+    #     after reboot). It is NOT a kdump mechanism, but it IS a legitimate
+    #     kernel log capture surface that survives a panic, and the project's
+    #     "physical-host availability" goal benefits from having at least
+    #     one panic-time capture path beyond kdump alone. Keeping it checked
+    #     here is intentional; it is independent of core_pattern.
     if [ ! -d /sys/fs/pstore ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/fs/pstore is not mounted (no crash logs can survive a panic)"
+        fail "Crash capture FAIL-CLOSED: /sys/fs/pstore is not mounted (no firmware/pstore crash logs can survive a panic)"
     fi
-    if [ ! -r /proc/sys/kernel/core_pattern ]; then
-        fail "Crash capture FAIL-CLOSED: /proc/sys/kernel/core_pattern is unreadable"
-    fi
+    # (3) Kernel-panic capture lives in /sys/kernel/kexec_crash_loaded:
+    #     when kdump has kexec-loaded the crash kernel, this reads '1'.
+    #     If the kernel was rebooted after running configure-grub-kdump.sh
+    #     but kexec_crash_loaded is still 0, the crash kernel did NOT load
+    #     — either GRUB picked the wrong cmdline or crashkernel= is wrong.
     if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
         fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is missing (kdump kernel never installed)"
     fi
     if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
         fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is not '1' (kdump kernel is not loaded into the running kernel)"
     fi
-    # core_pattern must point at pstore (or systemd-pstore) so kernel panics are preserved
-    if ! grep -Eq 'pstore' /proc/sys/kernel/core_pattern 2>/dev/null; then
-        fail "Crash capture FAIL-CLOSED: core_pattern does not route to pstore (current: $(cat /proc/sys/kernel/core_pattern 2>/dev/null))"
+    # (4) /var/crash is the kdump-tools default destination on debian/ubuntu.
+    #     If the directory is missing OR not writable by root, the vmcore
+    #     file cannot land and the panic capture is silently lost (kexec
+    #     loads the crash kernel, then the crash kernel mounts the root
+    #     filesystem and writes here; if this path is unwritable, kdump
+    #     fails its post-reboot handshake and produces no vmcore).
+    KDUMP_DIR=/var/crash
+    if [ ! -d "$KDUMP_DIR" ]; then
+        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR does not exist; kdump has no dump target. Remediation: install kdump-tools (apt-get install kdump-tools) or run scripts/host/configure-grub-kdump.sh which prepares the path."
+    fi
+    if [ ! -w "$KDUMP_DIR" ]; then
+        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR is not writable by root; kernel cannot save vmcores here."
     fi
 }
 
@@ -533,15 +559,16 @@ for slot in $(seq 1 "$COUNT"); do
             EXPECTED_EFFECTIVE_BYTES=$((PER_SLOT_HOST_MB * 1024 * 1024))
         fi
     fi
-    # Reject MemorySwap > Memory. A greater swap value defeats the memory
-    # limit because the container can swap beyond its memory cap. Acceptable
-    # values are: equal to Memory (explicit ceiling), 0 (unset, daemon default
-    # is double Memory), or -1 (unlimited swap, but only valid when also
-    # denoted unlimited — we fail it conservatively).
-    if [ "$SLOT_MEMORY_SWAP_BYTES" -ne "$SLOT_MEMORY_BYTES" ] \
-        && [ "$SLOT_MEMORY_SWAP_BYTES" -ne 0 ] \
-        && [ "$SLOT_MEMORY_SWAP_BYTES" -ne -1 ]; then
-        fail "slot $SLOT_NAME MemorySwap=${SLOT_MEMORY_SWAP_BYTES} != Memory=${SLOT_MEMORY_BYTES}: swap must equal memory (or 0/-1); a greater swap value defeats the memory limit"
+    # Reject any MemorySwap value that is not EXACTLY equal to Memory.
+    # In Docker cgroup semantics, MemorySwap=0 means "default extra-swap"
+    # (double of Memory, defeat the limit), and MemorySwap=-1 means
+    # "unlimited swap" (also defeats the limit). Only an EXACT
+    # MemorySwap == Memory is the legitimate safety claim. Acceptable
+    # values are: MemorySwap == Memory (no extra swap). Anything else
+    # — including 0, -1, double-Memory, anything not exactly equal —
+    # fails-closed.
+    if [ "$SLOT_MEMORY_SWAP_BYTES" -ne "$SLOT_MEMORY_BYTES" ]; then
+        fail "slot $SLOT_NAME MemorySwap=${SLOT_MEMORY_SWAP_BYTES} != Memory=${SLOT_MEMORY_BYTES}: only EXACT MemorySwap == Memory is allowed. MemorySwap=0 means default 2x memory; MemorySwap=-1 means unlimited swap — both defeat the memory limit. The daemon must set MemorySwap equal to Memory explicitly so swap cannot extend beyond the cgroup ceiling."
     fi
     # EXACT clamp check. 4 MiB slack accommodates cgroupfs page-alignment
     # rounding observed on this fleet: docker rounds 3200 MiB → 3197 MiB (a
@@ -723,10 +750,18 @@ echo "--- Checking Gate 8: VM/AO/MCP containment ---"
 #                      user-scope .timer, OR rely on systemd-oomd active
 #                      at any scope (default policy on Ubuntu 24.04
 #                      manages user.slice automatically).
-#   (4) Aggregate:     lower [limits].memory_mb, lower [runner].count,
-#                      or raise [runner].vm_total_mb so containers + QEMU
-#                      RSS + AO/MCP RSS fit (vm_total_mb - guest_reserve_mb).
-echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) tune [limits].memory_mb / count / vm_total_mb so aggregate fits."
+#   (4) Aggregate:     physical_host_RAM >= QEMU slice ceiling (read from
+#                      /sys/fs/cgroup${QEMU_CG}/memory.high) + AO/MCP slice
+#                      ceilings (sum across unique slice paths) + mandatory
+#                      host reserve (max(2G, 10% of host RAM)). Container
+#                      memory limits are NOT summed — they live inside the
+#                      guest VM and roll up into the QEMU ceiling. The old
+#                      equation double-counted container limits as if they
+#                      were sibling RSS on the host. New remediation: raise
+#                      physical host RAM, lower MemoryHigh on
+#                      app-lima-vm.slice, or lower the agent-CLI slice
+#                      MemoryHigh.
+echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
@@ -743,7 +778,7 @@ QEMU_CG=""
 if [ "$PROBE_QEMU_SLICE" = "1" ]; then
     QEMU_PID=$(pgrep -f 'qemu-system-x86_64' | head -1 || true)
     if [ -z "$QEMU_PID" ]; then
-        echo "    [WARN] Gate 8 (1) no qemu-system-x86_64 process found; fail-closed below"
+        fail "Gate 8 (1) FAIL-CLOSED: no qemu-system-x86_64 process detected on this host. The project's stated goal (physical-host availability) requires that the Colima/Lima VM is provably bounded by an enforced cgroup ceiling; without that process the bound cannot be verified. Remediation: start the Colima VM (limactl start colima, or colima start) — without it Docker daemon has no parent and the per-container limits are unrolled."
     else
         # /proc/<pid>/cgroup on cgroup-v2-only hosts is a single line
         # starting with "0::<path>". Extract the path with grep + cut.
@@ -816,63 +851,284 @@ AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
 echo "    [PASS] Gate 8 (2) AO/MCP processes (n=${AO_MCP_TOTAL}) are inside an enforced slice with a finite memory ceiling"
 
 # (3) PSI admission check --------------------------------------------------------------
-# Either psi-oom-watcher.timer is enrolled (user-scope backstop per
-# scripts/host/psi-oom-watcher.sh), OR systemd-oomd is active at any
-# scope (system-oomd manages user slices by default on Ubuntu 24.04).
-# Without one, sustained memory pressure has no in-tree reaction before
-# the watchdog fires.
+# Either a real cgroup is enrolled with systemd-oomd (ManagedOOM
+# MemoryPressure/Swap explicitly opted in, OR oomctl reports a
+# non-empty "Memory Pressure Monitored CGroups:" list), OR
+# psi-oom-watcher.timer is enrolled AND the script it invokes actually
+# contains a real shed action path (kill / systemctl stop / qemu-lima-
+# docker shed, not a no-op journal logger). One of the two MUST be live;
+# the previous version of this check accepted "systemd-oomd active"
+# alone, which fails to detect the 2026-07-10 host-crash failure mode
+# where oomd was running but no cgroup was actually enrolled for
+# protection (oomctl reported an empty "Memory Pressure Monitored
+# CGroups:" list even with ManagedOOMMemoryPressure=auto on every top-
+# level slice — oomd is watching but never kills anything).
 PSI_OK=0
 PSI_SOURCE=""
-TIMER_ENABLED=$(systemctl --user is-enabled psi-oom-watcher.timer 2>/dev/null || true)
-TIMER_ACTIVE=$(systemctl --user is-active psi-oom-watcher.timer 2>/dev/null || true)
-if [ "$TIMER_ENABLED" = "enabled" ] && [ "$TIMER_ACTIVE" = "active" ]; then
-    PSI_OK=1
-    PSI_SOURCE="psi-oom-watcher.timer (user-scope)"
-elif systemctl is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
-    PSI_OK=1
-    PSI_SOURCE="systemd-oomd (system-scope)"
+
+# --- Option A: systemd-oomd with a real, enrolled cgroup -----------------
+OOMD_ACTIVE=0
+OOMD_SCOPE=""
+if systemctl is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
+    OOMD_ACTIVE=1
+    OOMD_SCOPE="system"
 elif systemctl --user is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
-    PSI_OK=1
-    PSI_SOURCE="systemd-oomd (user-scope)"
+    OOMD_ACTIVE=1
+    OOMD_SCOPE="user"
 fi
+OOMD_ENROLLED=0
+OOMD_ENROLL_PROOF=""
+if [ "$OOMD_ACTIVE" = "1" ]; then
+    # oomctl is the ground truth: it reports the cgroups oomd is actually
+    # monitoring, after the "auto" -> concrete resolution step. An empty
+    # list means oomd is running but doing nothing (the exact failure
+    # mode that motivated this hardening). If oomctl is unavailable, fall
+    # back to walking every loaded unit for an explicit
+    # ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill opt-in (or
+    # ManagedOOMPreference=avoid/omit, which also enrolls the unit as
+    # a candidate for oomd action).
+    OOMCTL_OUT="$(oomctl 2>/dev/null || true)"
+    if [ -n "$OOMCTL_OUT" ]; then
+        PRESSURE_ENROLLED="$(printf '%s\n' "$OOMCTL_OUT" | awk '
+            /^Memory Pressure Monitored CGroups:/ { capturing = 1; next }
+            /^Swap Monitored CGroups:/            { capturing = 0 }
+            capturing                             { print }
+        ' | grep -E '^[[:space:]]' | grep -v '^[[:space:]]*$' || true)"
+        SWAP_ENROLLED="$(printf '%s\n' "$OOMCTL_OUT" | awk '
+            /^Swap Monitored CGroups:/ { capturing = 1; next }
+            capturing                  { print }
+        ' | grep -E '^[[:space:]]' | grep -v '^[[:space:]]*$' || true)"
+        if [ -n "$PRESSURE_ENROLLED" ] || [ -n "$SWAP_ENROLLED" ]; then
+            OOMD_ENROLLED=1
+            OOMD_ENROLL_PROOF="oomctl: pressure=$(printf '%s\n' "$PRESSURE_ENROLLED" | grep -c . || echo 0) swap=$(printf '%s\n' "$SWAP_ENROLLED" | grep -c . || echo 0) cgroup(s) enrolled"
+        fi
+    fi
+    if [ "$OOMD_ENROLLED" = "0" ]; then
+        # Fallback: walk loaded units for an explicit kill/protect opt-in.
+        # ManagedOOMMemoryPressure and ManagedOOMSwap are the actual
+        # systemd properties (the brief's "ManagedOOM=" is shorthand for
+        # these two). ManagedOOMPreference=avoid/omit are also real
+        # enrollments (the unit is a candidate for oomd action).
+        EXPLICIT_KILL_UNITS="$(systemctl show --property=ManagedOOMMemoryPressure,ManagedOOMSwap,ManagedOOMPreference --value --no-pager 2>/dev/null \
+            | grep -E '^(kill|avoid|omit)$' | sort -u || true)"
+        if [ -n "$EXPLICIT_KILL_UNITS" ]; then
+            OOMD_ENROLLED=1
+            OOMD_ENROLL_PROOF="systemctl show: explicit ManagedOOM opt-in (${EXPLICIT_KILL_UNITS//$'\n'/,})"
+        fi
+    fi
+    if [ "$OOMD_ENROLLED" = "1" ]; then
+        PSI_OK=1
+        PSI_SOURCE="systemd-oomd (${OOMD_SCOPE}-scope, ${OOMD_ENROLL_PROOF})"
+    fi
+fi
+
+# --- Option B: psi-oom-watcher.timer enrolled with a real shed path -----
 if [ "$PSI_OK" != "1" ]; then
-    fail "Gate 8 (3) PSI admission is not wired up: psi-oom-watcher.timer not enabled+active and systemd-oomd not active at any scope. Remediation: enroll scripts/host/psi-oom-watcher.sh via a user-scope .timer (per bead ez-gh-actions-0725), or enable systemd-oomd in default policy."
+    TIMER_ENABLED=$(systemctl --user is-enabled psi-oom-watcher.timer 2>/dev/null || true)
+    TIMER_ACTIVE=$(systemctl --user is-active psi-oom-watcher.timer 2>/dev/null || true)
+    PSI_SCRIPT=""
+    # Resolve the actual script path the timer invokes. Prefer
+    # systemctl cat (resolves ExecStart on this host); fall back to the
+    # repo's expected path. Bail to "" if neither yields a readable
+    # file — the gate must not trust an unverified path.
+    if [ "$TIMER_ENABLED" = "enabled" ] && [ "$TIMER_ACTIVE" = "active" ]; then
+        TIMER_UNIT_FILE=$(systemctl --user cat psi-oom-watcher.timer 2>/dev/null \
+            | awk '/^ExecStart=/ { sub(/^ExecStart=/, ""); print; exit }' || true)
+        if [ -n "$TIMER_UNIT_FILE" ] && [ -r "$TIMER_UNIT_FILE" ]; then
+            PSI_SCRIPT="$TIMER_UNIT_FILE"
+        elif [ -r "${SCRIPTS_DIR:-}/psi-oom-watcher.sh" ]; then
+            PSI_SCRIPT="${SCRIPTS_DIR}/psi-oom-watcher.sh"
+        fi
+        SHED_PROOF=""
+        if [ -n "$PSI_SCRIPT" ] && [ -r "$PSI_SCRIPT" ]; then
+            # "Real shed action" = the script can actually terminate
+            # something under sustained pressure. Patterns accepted:
+            #   - kill / pkill (any process termination)
+            #   - systemctl stop/kill (slice/unit termination)
+            #   - qemu/lima/colima/docker stop|kill|shutdown|qemu-monitor
+            #     (the brief's explicit example class — VM/container shed)
+            # A no-op watcher that only logs to journal must NOT pass.
+            if grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
+                | grep -Eq '\b(kill|pkill)\b[[:space:]]' \
+                || grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
+                    | grep -Eq 'systemctl[[:space:]]+(stop|kill)' \
+                || grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
+                    | grep -Eq '(qemu|lima|colima|docker)[[:space:]]+(stop|kill|shutdown|qemu-monitor-command)'; then
+                SHED_PROOF="script=${PSI_SCRIPT##*/} contains real shed action (kill/systemctl-stop/qemu-lima-docker shed)"
+            fi
+        fi
+        if [ -n "$SHED_PROOF" ]; then
+            PSI_OK=1
+            PSI_SOURCE="psi-oom-watcher.timer (user-scope, ${SHED_PROOF})"
+        fi
+    fi
+fi
+
+if [ "$PSI_OK" != "1" ]; then
+    # Distinguish the two failure shapes so the operator knows which
+    # remediation applies. The oomd-only failure is the exact one that
+    # produced the 2026-07-10 host crash; the script failure is the
+    # "watcher is enrolled but does nothing" shape.
+    OOMD_BUT_NO_CGROUP=""
+    if [ "$OOMD_ACTIVE" = "1" ] && [ "$OOMD_ENROLLED" = "0" ]; then
+        OOMD_BUT_NO_CGROUP=" NOTE: systemd-oomd is active at ${OOMD_SCOPE}-scope but oomctl reports zero monitored cgroups — this is the exact 'oomd running but no cgroup enrolled' shape that allowed the 2026-07-10 host crash. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice (e.g. user.slice, system.slice) so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list, or set ManagedOOMPreference=avoid/omit on slices you want protected from oom-kill, or wire scripts/host/psi-oom-watcher.sh into psi-oom-watcher.timer as a user-scope backstop (per bead ez-gh-actions-0725)."
+    fi
+    fail "Gate 8 (3) PSI admission is not wired up with a real shed action: oomd has no enrolled cgroup, AND psi-oom-watcher.timer is either not enabled+active or its script contains no kill/systemctl-stop/qemu-lima-docker shed path. Remediation: enroll scripts/host/psi-oom-watcher.sh via a user-scope .timer (per bead ez-gh-actions-0725), OR set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list.${OOMD_BUT_NO_CGROUP}"
 fi
 PSI_AVG10=$(awk '/^full/ {for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) {gsub("avg10=", "", $i); print $i; exit}}' /proc/pressure/memory 2>/dev/null || echo "?")
 echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /proc/pressure/memory full avg10=${PSI_AVG10}%)"
 
-# (4) Aggregate container + QEMU + AO/MCP memory budget ------------------------------
-# Sum (a) the configured HostConfig.Memory for all managed containers
-# (the LIMIT, not actual usage — a transient spike to the limit is the
-# threat model), (b) the current QEMU process RSS from the host's
-# /proc/<qemu>/status, (c) the current RSS sum of all AO/MCP processes.
-# Compare against (VM_TOTAL_MB - GUEST_RESERVE_MB). If the sum exceeds
-# the budget we are one transient spike away from a host OOM.
-AGG_CONTAINER_BYTES=$(docker inspect $(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null) --format '{{.HostConfig.Memory}}' 2>/dev/null | awk '{s+=$1} END {print s+0}')
-AGG_CONTAINER_MB=$((AGG_CONTAINER_BYTES / 1024 / 1024))
-AGG_QEMU_MB=0
-if [ -n "$QEMU_PID" ] && [ -r "/proc/$QEMU_PID/status" ]; then
-    QEMU_RSS_KB=$(grep VmRSS "/proc/$QEMU_PID/status" 2>/dev/null | awk '{print $2}')
-    [ -n "$QEMU_RSS_KB" ] && AGG_QEMU_MB=$((QEMU_RSS_KB / 1024))
-fi
-AGG_AO_MCP_MB=$(ps -u "$(id -u)" -o rss=,args= --no-headers 2>/dev/null | awk '
-              {
-                cmd = ""
-                for (i = 2; i <= NF; i++) cmd = cmd " " $i
-                if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
-                  s+=$1
-                }
-              }
-              END {
-                print int(s/1024)
+# (4) Physical-host RAM envelope ---------------------------------------------------
+# Total bounded memory demand on the physical host's RAM, compared
+# against /proc/meminfo MemTotal. The previous version double-counted
+# container-Memory limits inside QEMU RSS — but containers run INSIDE
+# the guest VM, so their demand rolls up into the VM's RSS / slice
+# ceiling. Adding them again over-counted by roughly
+# [runner].count * [limits].memory_mb (~50 GB on this host), masking
+# the real budget headroom and silently re-introducing the 2026-07-10
+# OOM failure mode this gate exists to prevent.
+#
+# New equation (per bead ez-gh-actions-bjpk, P0 #R2-6):
+#
+#   physical_host_RAM >= QEMU_slice_ceiling       # VM (app-lima-vm.slice)
+#                     + AO/MCP_slice_ceiling      # orchestration agents
+#                     + other_bounded             # future top-level slices
+#                     + mandatory_host_reserve    # kernel/system/monitoring
+#
+# QEMU slice ceiling: read from /sys/fs/cgroup${QEMU_CG}/memory.high
+# (the kernel-enforced DefaultMemoryHigh pushed down from
+# app-lima-vm.slice). If 'max', the VM has no upper bound on host RAM
+# — fail-closed.
+#
+# AO/MCP slice ceiling: for each AO/MCP process, walk UP the cgroup
+# tree to find the first ancestor with a finite memory.high — that is
+# the slice ceiling for that branch. Sum across unique slice paths
+# (multiple services under one slice share the slice's ceiling;
+# summing per-leaf would over-count). For any AO/MCP process with no
+# bounded ancestor, fall back to that process's live RSS and warn
+# (defense in depth; gate (2) already FAIL-CLOSES on missing AO/MCP
+# ceiling).
+#
+# Mandatory host reserve: max(2 GiB, 10% of physical host RAM) — keeps
+# headroom for the kernel, system services, monitoring daemons, and
+# the watchdog itself. Without this carve-out, slices pinned at
+# host-RAM ceiling leave zero room for anything else.
+#
+# physical_host_RAM is read from /proc/meminfo MemTotal (kernel truth),
+# independent of the guest VM's `VM_TOTAL_MB` (which is the
+# guest-visible Docker budget for per-container clamps).
+#
+# Skip on macOS — cgroup-v2 is a Linux-only kernel interface, so the
+# slice-ceiling model does not apply.
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "    [SKIP] Gate 8 (4) host-RAM aggregate: macOS — cgroup-v2 not available, host-RAM envelope model is Linux-only"
+else
+    HOST_MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    if ! is_uint "$HOST_MEM_TOTAL_KB" || [ "$HOST_MEM_TOTAL_KB" -eq 0 ]; then
+        fail "Gate 8 (4) could not read physical-host MemTotal from /proc/meminfo (got '${HOST_MEM_TOTAL_KB}'). Remediation: verify /proc/meminfo is readable on this host."
+    fi
+    HOST_MEM_TOTAL_MB=$((HOST_MEM_TOTAL_KB / 1024))
+
+    # (4a) QEMU slice ceiling --------------------------------------------------------
+    # Read the slice's enforced memory.high (set by app-lima-vm.slice,
+    # currently 38 GiB). If "max", the VM has no upper bound — fail-closed.
+    QEMU_CG_PATH="${QEMU_CG#0::}"
+    if [ -z "$QEMU_CG_PATH" ]; then
+        fail "Gate 8 (4) QEMU cgroup path is empty (QEMU_CG='$QEMU_CG'). Remediation: gate (1) must succeed before this probe; restart the verifier with a running QEMU/Colima VM."
+    fi
+    QEMU_CEILING_BYTES=$(cat "/sys/fs/cgroup${QEMU_CG_PATH}/memory.high" 2>/dev/null || echo "")
+    if [ -z "$QEMU_CEILING_BYTES" ]; then
+        fail "Gate 8 (4) QEMU slice /sys/fs/cgroup${QEMU_CG_PATH}/memory.high is unreadable. Remediation: verify cgroup-v2 fs is mounted and the slice path is correct (got QEMU_CG='$QEMU_CG')."
+    fi
+    if [ "$QEMU_CEILING_BYTES" = "max" ]; then
+        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+    fi
+    QEMU_CEILING_MB=$(awk -v b="$QEMU_CEILING_BYTES" 'BEGIN { printf "%d\n", b / 1024 / 1024 }')
+
+    # (4b) AO/MCP slice ceiling ------------------------------------------------------
+    # For each AO/MCP process, find the closest *.slice ancestor in its
+    # cgroup path — that slice's memory.high is the effective ceiling
+    # for that branch. The kernel enforces a slice's DefaultMemoryHigh
+    # on the SUM of all its children, so multiple services under one
+    # slice share that slice's ceiling; summing per-leaf readings (each
+    # leaf reads the inherited value) would over-count by N. Dedup by
+    # SLICE PATH, not leaf path.
+    #
+    # For any AO/MCP process whose closest slice has memory.high=max
+    # (or whose cgroup path has no slice at all), fall back to that
+    # process's live RSS and warn. Gate (2) already FAIL-CLOSES on any
+    # unbounded AO/MCP process; this is defense in depth.
+    declare -A AO_MCP_SLICE_SEEN
+    AO_MCP_CEILING_MB=0
+    AO_MCP_CEILING_NOTE=""
+    AO_MCP_UNBOUNDED_COUNT=0
+    while read -r pid; do
+        [ -z "$pid" ] && continue
+        cg=$(grep '^0::' "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
+        [ -z "$cg" ] && continue
+        cg="${cg#0::}"
+        slice_path=""
+        ancestor="$cg"
+        # Walk UP from the leaf looking for the closest *.slice; stop
+        # at the first one we find (don't escape its scope — the closer
+        # slice is the one that bounds this branch).
+        while [ -n "$ancestor" ]; do
+            case "$ancestor" in
+                *.slice)
+                    val=$(cat "/sys/fs/cgroup${ancestor}/memory.high" 2>/dev/null || echo "")
+                    if [ -n "$val" ] && [ "$val" != "max" ]; then
+                        slice_path="$ancestor"
+                    fi
+                    # Stop at the closest slice — bounded or not. Looking
+                    # further up would escape this slice's scope.
+                    break
+                    ;;
+            esac
+            ancestor="${ancestor%/*}"
+        done
+        if [ -z "$slice_path" ]; then
+            # No slice, OR closest slice is unbounded — fall back to live RSS.
+            rss_kb=$(awk '/^VmRSS:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null || echo 0)
+            [ -z "$rss_kb" ] && rss_kb=0
+            AO_MCP_CEILING_MB=$((AO_MCP_CEILING_MB + rss_kb / 1024))
+            AO_MCP_UNBOUNDED_COUNT=$((AO_MCP_UNBOUNDED_COUNT + 1))
+        else
+            if [ -n "${AO_MCP_SLICE_SEEN[$slice_path]:-}" ]; then continue; fi
+            AO_MCP_SLICE_SEEN[$slice_path]=1
+            ceiling_bytes=$(cat "/sys/fs/cgroup${slice_path}/memory.high" 2>/dev/null || echo "")
+            AO_MCP_CEILING_MB=$((AO_MCP_CEILING_MB + ceiling_bytes / 1024 / 1024))
+        fi
+    done < <(ps -u "$(id -u)" -o pid=,args= --no-headers 2>/dev/null | \
+              awk '{
+                  cmd = ""
+                  for (i = 2; i <= NF; i++) cmd = cmd " " $i
+                  if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
+                      print $1
+                  }
               }')
-AGG_AO_MCP_MB=${AGG_AO_MCP_MB:-0}
-AGG_TOTAL_MB=$((AGG_CONTAINER_MB + AGG_QEMU_MB + AGG_AO_MCP_MB))
-AGG_BUDGET_MB=$((VM_TOTAL_MB - GUEST_RESERVE_MB))
-if [ "$AGG_TOTAL_MB" -gt "$AGG_BUDGET_MB" ]; then
-    fail "Gate 8 (4) aggregate memory demand ${AGG_TOTAL_MB}MB exceeds budget ${AGG_BUDGET_MB}MB (containers=${AGG_CONTAINER_MB}MB qemu_rss=${AGG_QEMU_MB}MB ao_mcp_rss=${AGG_AO_MCP_MB}MB; budget = vm_total_mb ${VM_TOTAL_MB}MB - guest_reserve_mb ${GUEST_RESERVE_MB}MB). Remediation: lower [limits].memory_mb, reduce [runner].count, or raise [runner].vm_total_mb so the aggregate fits the VM/host budget."
+    if [ "$AO_MCP_UNBOUNDED_COUNT" -gt 0 ]; then
+        AO_MCP_CEILING_NOTE="(n=${AO_MCP_UNBOUNDED_COUNT} AO/MCP processes unbounded — live RSS used for those)"
+    fi
+
+    # (4c) Mandatory host reserve ----------------------------------------------------
+    # 10% of host RAM, with a 2 GiB floor.
+    MANDATORY_RESERVE_MB=$((HOST_MEM_TOTAL_MB / 10))
+    if [ "$MANDATORY_RESERVE_MB" -lt 2048 ]; then
+        MANDATORY_RESERVE_MB=2048
+    fi
+
+    # (4d) Sum and compare -----------------------------------------------------------
+    # QEMU_ceiling + AO/MCP_ceiling + mandatory_reserve <= physical_host_RAM.
+    # (Other bounded top-level cgroups are counted via the AO/MCP slice
+    # walk above; add explicit terms here as new bounded top-level slices
+    # ship.)
+    AGG_TOTAL_MB=$((QEMU_CEILING_MB + AO_MCP_CEILING_MB + MANDATORY_RESERVE_MB))
+    AGG_BUDGET_MB=$HOST_MEM_TOTAL_MB
+    if [ "$AGG_TOTAL_MB" -gt "$AGG_BUDGET_MB" ]; then
+        fail "Gate 8 (4) aggregate bounded demand ${AGG_TOTAL_MB}MB exceeds physical host RAM ${AGG_BUDGET_MB}MB (qemu_ceiling=${QEMU_CEILING_MB}MB + ao_mcp_ceiling=${AO_MCP_CEILING_MB}MB ${AO_MCP_CEILING_NOTE}+ mandatory_reserve=${MANDATORY_RESERVE_MB}MB; physical_host_RAM=${HOST_MEM_TOTAL_MB}MB from /proc/meminfo MemTotal). Remediation: raise physical host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+    fi
+    echo "    [PASS] Gate 8 (4) aggregate bounded demand ${AGG_TOTAL_MB}MB <= physical host RAM ${AGG_BUDGET_MB}MB (qemu_ceiling=${QEMU_CEILING_MB}MB + ao_mcp_ceiling=${AO_MCP_CEILING_MB}MB ${AO_MCP_CEILING_NOTE}+ mandatory_reserve=${MANDATORY_RESERVE_MB}MB)"
 fi
-echo "    [PASS] Gate 8 (4) aggregate memory ${AGG_TOTAL_MB}MB <= budget ${AGG_BUDGET_MB}MB (containers=${AGG_CONTAINER_MB}MB qemu_rss=${AGG_QEMU_MB}MB ao_mcp_rss=${AGG_AO_MCP_MB}MB)"
 
 pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 
