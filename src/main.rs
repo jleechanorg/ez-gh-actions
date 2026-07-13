@@ -595,9 +595,7 @@ fn maybe_restart_backend(
         return false;
     }
     if backend_reachable {
-        eprintln!(
-            "backend is reachable; skipping backend restart attempt"
-        );
+        eprintln!("backend is reachable; skipping backend restart attempt");
         return false;
     }
     if !recovery.allow_restart(cfg) {
@@ -1028,7 +1026,12 @@ fn main() -> Result<()> {
                         // this loop to bound that is tracked separately (beads
                         // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
                         // part of this fix.
-                        if maybe_restart_backend(&cfg, &mut backend_recovery, None, docker_reachable()) {
+                        if maybe_restart_backend(
+                            &cfg,
+                            &mut backend_recovery,
+                            None,
+                            docker_reachable(),
+                        ) {
                             let subject = "Backend restart attempted after ensure_count failures";
                             let body = format!(
                                 "serve loop attempted backend restart after {} failures for {} on {}",
