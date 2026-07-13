@@ -1067,9 +1067,7 @@ fn probe_docker_cpu_controller_available() -> bool {
             };
         }
 
-        eprintln!(
-            "docker_cpu_controller_available: daemon_in_vm=false, reading host cgroup files"
-        );
+        eprintln!("docker_cpu_controller_available: daemon_in_vm=false, reading host cgroup files");
 
         if let Ok(controllers) = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
             if controllers.split_whitespace().any(|c| c == "cpu") {
