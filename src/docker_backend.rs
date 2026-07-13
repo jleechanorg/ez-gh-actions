@@ -26,6 +26,7 @@ const MANAGED_LABEL: &str = "ezgha=managed";
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
+const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[cfg(test)]
@@ -942,6 +943,49 @@ fn run_docker(cmd: Command, detail: &str) -> Result<Output> {
     run_docker_with_timeout(cmd, detail, DOCKER_TIMEOUT)
 }
 
+/// Validate that the host docker daemon is attached to a cpu cgroup that can
+/// actually enforce `--cpus`. If this cannot be verified, callers must fail
+/// closed: launching with a missing/disabled CPU limit would allow a single
+/// job to saturate the host and defeat the reliability boundary this tool is
+/// supposed to enforce.
+pub fn docker_cpu_controller_available() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if crate::platform::detect().daemon_in_vm {
+            return true;
+        }
+
+        if let Ok(controllers) = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
+            if controllers.split_whitespace().any(|c| c == "cpu") {
+                return true;
+            }
+        }
+
+        // Legacy cgroup-v1 hosts can expose availability only in /proc/cgroups.
+        if let Ok(cgroups) = std::fs::read_to_string("/proc/cgroups") {
+            for line in cgroups.lines() {
+                let mut cols = line.split_whitespace();
+                let name = cols.next();
+                let _ = cols.next();
+                let _ = cols.next();
+                let enabled = cols.next();
+                if name == Some("cpu") && enabled == Some("1") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
 /// Build a `Command` for the `docker` binary. In test builds this honors
 /// `TEST_DOCKER_BIN` so a test can redirect every docker invocation in this
 /// module to a fake script without touching the process-wide `PATH` env var
@@ -1273,26 +1317,10 @@ fn start_one_with_generate_at_slot(
     // inside its cgroup instead of taking the host down.
     cmd.args(["--memory", &format!("{memory_mb}m")]);
     cmd.args(["--memory-swap", &format!("{memory_mb}m")]);
-    // Skip --cpus if the host is Linux and does not support the cpu controller
-    let has_cpu_controller = || -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(controllers) = std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
-                controllers.split_whitespace().any(|c| c == "cpu")
-            } else {
-                true
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            true
-        }
-    };
-    if has_cpu_controller() {
-        cmd.args(["--cpus", &format!("{:.2}", cpus)]);
-    } else {
-        eprintln!("warning: cpu cgroup controller not available; skipping --cpus limit");
+    if !docker_cpu_controller_available() {
+        bail!(CPUS_REQUIRE_CPU_CONTROLLER_ERR);
     }
+    cmd.args(["--cpus", &format!("{:.2}", cpus)]);
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
     if backend == Backend::DockerSysbox {

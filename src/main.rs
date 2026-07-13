@@ -238,7 +238,7 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                     // Exhausted budget — surface the same rich diagnostic as choose_backend.
                     return choose_backend(cfg);
                 }
-                if maybe_restart_backend(cfg, &mut recovery, Some(deadline)) {
+                if maybe_restart_backend(cfg, &mut recovery, Some(deadline), docker_reachable) {
                     eprintln!(
                         "backend restart attempted while waiting for service readiness; retrying quickly"
                     );
@@ -588,14 +588,15 @@ fn maybe_restart_backend(
     cfg: &config::Config,
     recovery: &mut BackendRecoveryState,
     deadline: Option<Instant>,
+    backend_reachable: bool,
 ) -> bool {
     let selection = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
     if !backend_restart_can_help(&selection) {
         return false;
     }
-    if matches!(selection, Selection::None) && docker_reachable() {
+    if backend_reachable {
         eprintln!(
-            "backend selection is NONE but docker is reachable; skipping restart to avoid unnecessary churn"
+            "backend is reachable; skipping backend restart attempt"
         );
         return false;
     }
@@ -1027,7 +1028,7 @@ fn main() -> Result<()> {
                         // this loop to bound that is tracked separately (beads
                         // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
                         // part of this fix.
-                        if maybe_restart_backend(&cfg, &mut backend_recovery, None) {
+                        if maybe_restart_backend(&cfg, &mut backend_recovery, None, docker_reachable()) {
                             let subject = "Backend restart attempted after ensure_count failures";
                             let body = format!(
                                 "serve loop attempted backend restart after {} failures for {} on {}",

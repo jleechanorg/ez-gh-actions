@@ -48,6 +48,35 @@ single-backend (`ez-gh-actions-apye`), pressure-watcher
 (`ez-gh-actions-0725`), and watchdog-shedding (`ez-gh-actions-6478`) beads now
 require committed portable artifacts. Manual host edits cannot close them.
 
+**2026-07-13 reliability architecture correction:** crash prevention was the
+original goal; implementation and verification drifted toward per-container
+isolation and single-runner canaries, neither of which proves physical-host
+survival. The outer availability boundary remains incomplete: the actual QEMU
+cgroup needs a funded host reserve and aggregate cap, AO/agent/MCP/browser
+workloads need separate containment, admission must use memory/swap/PSI, partial
+GitHub snapshots must fail closed, backend recovery must require proven backend
+failure, and watchdog shedding must demonstrate released QEMU RSS. The latest
+abrupt reset had no OOM/watchdog/panic record and remains unclassified because
+kdump/pstore capture was ineffective. Commit `d77e53a` is an implementation
+checkpoint only, not evidence that these boundaries are deployed or that the
+10-Linux/6-Mac capacity contract passes. Its physical-host CPU-controller check
+is also unresolved: Docker runs inside the Lima guest, so absence of a host
+controller can incorrectly suppress a valid guest `--cpus` limit. This is a
+regression risk, not completion of `ez-gh-actions-222n`.
+
+Execute next in dependency order: restore goal traceability
+(`ez-gh-actions-u1qt`); settle the architecture and capacity contract
+(`ez-gh-actions-kdne`, `ez-gh-actions-s17j`); land portable profiles and real
+outer limits (`ez-gh-actions-e0z0.2`, `jleechan-bih3`, `jleechan-aqh`,
+`ez-gh-actions-sa8c`, `ez-gh-actions-0725`); make admission, reconciliation,
+and recovery fail closed (`jleechan-1kkj`, `ez-gh-actions-ghd2.1`,
+`ez-gh-actions-2tpd`); add staged shedding and crash observability
+(`ez-gh-actions-6478`, `ez-gh-actions-gam1`); then run the executable
+host-availability proof (`ez-gh-actions-bjpk`). Disk/IO and CPU enforcement are
+tracked by `ez-gh-actions-nwbm` and `ez-gh-actions-222n`. Mac six-runner
+restoration remains `ez-gh-actions-ghd2.3` plus `ez-gh-actions-hcu`. No 72-hour
+soak is required.
+
 **Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
 2. ~~`bxy` (P1)~~ — DONE: release_slot on JIT failure + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)

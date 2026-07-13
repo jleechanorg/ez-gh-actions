@@ -128,6 +128,46 @@ try:
 except ModuleNotFoundError:
     try:
         import toml
+except ModuleNotFoundError:
+    raise SystemExit(2)
+    data = toml.load(path)
+else:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    value = data.get(key, default)
+    print(value)
+PY
+}
+
+is_uint() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_float() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+container_state_is_running() {
+    local name="$1"
+    local raw
+    raw=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo "false")
+    [ "$raw" = "true" ]
+}
+
+toml_get_limits() {
+    local key="$1"
+    local default="${2:-}"
+    python3 - "$CONFIG_FILE" "$key" "$default" <<'PY'
+import sys
+
+path, key, default = sys.argv[1:]
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import toml
     except ModuleNotFoundError:
         raise SystemExit(2)
     data = toml.load(path)
@@ -135,9 +175,72 @@ else:
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-value = data.get(key, default)
+value = data["limits"].get(key, default)
 print(value)
 PY
+}
+
+daemon_in_vm() {
+    [ "$(uname -s)" = "Darwin" ] && return 0
+    local daemon_kernel host_kernel
+    daemon_kernel=$(docker info --format '{{.KernelVersion}}' 2>/dev/null | tr -d '[:space:]' || true)
+    host_kernel=$(uname -r | tr -d '[:space:]' || true)
+    [ -n "$daemon_kernel" ] && [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+}
+
+cpu_controller_available() {
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+        if grep -qw 'cpu' /sys/fs/cgroup/cgroup.controllers; then
+            return 0
+        fi
+    fi
+    if [ -f /proc/cgroups ]; then
+        awk '$1=="cpu" && $4=="1" {found=1} END {exit !found}' /proc/cgroups
+        return
+    fi
+    return 1
+}
+
+inspect_has_no_new_privileges() {
+    local name="$1"
+    local raw
+    raw=$(docker inspect "$name" --format '{{.HostConfig.SecurityOpt}}' 2>/dev/null || echo '')
+    echo "$raw" | grep -q 'no-new-privileges'
+}
+
+runner_has_worker_process() {
+    local name="$1"
+    if ! docker top "$name" >/dev/null 2>&1; then
+        return 1
+    fi
+    docker top "$name" 2>/dev/null | awk 'NR>1 && $0 ~ /Runner\.Worker|Runner\.Listener/ {found=1} END {exit !found}'
+}
+
+daemon_overlay_free_disk_gb() {
+    local image="$1"
+    local avail_kb
+    avail_kb=$(docker run --rm --entrypoint df "$image" -Pk / 2>/dev/null | awk 'NR==2 {print $4}' || true)
+    if ! is_uint "$avail_kb"; then
+        echo ""
+        return 1
+    fi
+    echo $((avail_kb / 1024 / 1024))
+}
+
+verify_kdump_pstore() {
+    [ "$(uname -s)" = "Linux" ] || return 0
+    if [ ! -d /sys/fs/pstore ]; then
+        fail "Crash-capture evidence missing: /sys/fs/pstore is not mounted"
+    fi
+    if [ ! -r /proc/sys/kernel/core_pattern ]; then
+        fail "Crash-capture evidence missing: /proc/sys/kernel/core_pattern unavailable"
+    fi
+    if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
+        fail "Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded unavailable"
+    fi
+    if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
+        fail "Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded is not enabled (value != 1)"
+    fi
 }
 
 # --- Gate 0: Deployed code == committed code ---
@@ -245,93 +348,159 @@ pass "Gate 2: Service active and Docker/Colima daemon up (platform=$PLATFORM)"
 
 # --- Gate 3: Fleet capacity ---
 echo "--- Checking Gate 3: Fleet capacity ---"
+verify_kdump_pstore
 # Parse runner.count from config.toml
 CONFIG_FILE="$HOME/.config/ezgha/config.toml"
 if [ ! -f "$CONFIG_FILE" ]; then
     fail "Config file not found at $CONFIG_FILE"
 fi
 COUNT=$(toml_get_runner count 2>/dev/null || grep -E 'count\s*=\s*' "$CONFIG_FILE" | head -1 | awk -F'=' '{print $2}' | tr -d '[:space:]')
-
-# Read name_prefix from config (default: ez-org-runner)
 NAME_PREFIX=$(toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
+LIMIT_MEMORY_MB=$(toml_get_limits memory_mb 0)
+LIMIT_CPUS=$(toml_get_limits cpus 0.50)
+LIMIT_PIDS=$(toml_get_limits pids 1024)
+MIN_FREE_DISK_GB=$(toml_get_limits min_free_disk_gb 10)
+VM_TOTAL_MB=$(toml_get_runner vm_total_mb 0)
+GUEST_RESERVE_MB=$(toml_get_runner guest_reserve_mb 4096)
+RUNNER_FLOOR_MB=$(toml_get_runner runner_floor_mb 3072)
+RUNNER_IMAGE=$(toml_get_runner image ghcr.io/actions/actions-runner:latest 2>/dev/null || echo 'ghcr.io/actions/actions-runner:latest')
 
 if [ -z "$COUNT" ]; then
     fail "Could not parse runner.count from $CONFIG_FILE"
 fi
+if ! is_uint "$COUNT"; then
+    fail "runner.count is not a valid unsigned integer: '$COUNT'"
+fi
+if [ "$COUNT" -eq 0 ]; then
+    fail "runner.count must be >= 1"
+fi
+if ! is_float "$LIMIT_CPUS"; then
+    fail "limits.cpus is not a valid numeric value: '$LIMIT_CPUS'"
+fi
+if ! is_uint "$LIMIT_MEMORY_MB"; then
+    fail "limits.memory_mb is not a valid unsigned integer: '$LIMIT_MEMORY_MB'"
+fi
+if ! is_uint "$LIMIT_PIDS"; then
+    fail "limits.pids is not a valid unsigned integer: '$LIMIT_PIDS'"
+fi
+if ! is_uint "$MIN_FREE_DISK_GB"; then
+    fail "limits.min_free_disk_gb is not a valid unsigned integer: '$MIN_FREE_DISK_GB'"
+fi
+if ! is_uint "$GUEST_RESERVE_MB"; then
+    fail "runner.guest_reserve_mb is not a valid unsigned integer: '$GUEST_RESERVE_MB'"
+fi
+if ! is_uint "$RUNNER_FLOOR_MB"; then
+    fail "runner.runner_floor_mb is not a valid unsigned integer: '$RUNNER_FLOOR_MB'"
+fi
 
-RAW_RUNNERS=$(gh_checked api orgs/jleechanorg/actions/runners --paginate --slurp) || fail "Unable to list GitHub runners after retries"
-ONLINE_RUNNERS=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.[]?.runners[]? | select(.name | startswith($p)) | select(.status == "online") | .name') || fail "Gate 3: Unable to parse GitHub runner list"
-ONLINE_COUNT=$(count_nonempty_lines "$ONLINE_RUNNERS")
-BUSY_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.[]?.runners[]? | select(.name | startswith($p)) | select(.busy == true)] | length') || fail "Gate 3: Unable to parse busy runner count"
-EFFECTIVE_CAPACITY=$((ONLINE_COUNT))
-# Note: busy runners are a subset of online runners; adding both double-counts
-# them. EFFECTIVE_CAPACITY = total online (which already includes busy runners).
+EXPECTED_NANO_CPUS=$(awk -v cpus="$LIMIT_CPUS" 'BEGIN { printf "%.0f", cpus * 1000000000 }')
+if [ "$EXPECTED_NANO_CPUS" -le 0 ]; then
+    fail "Could not compute expected NanoCPUs from limits.cpus='$LIMIT_CPUS'"
+fi
+EXPECTED_MEMORY_BYTES=$((LIMIT_MEMORY_MB * 1024 * 1024))
+if [ "$EXPECTED_MEMORY_BYTES" -le 0 ]; then
+    fail "Computed expected memory bytes must be > 0 (limits.memory_mb='$LIMIT_MEMORY_MB')"
+fi
 
-# Check offline runners
-OFFLINE_COUNT=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '[.[]?.runners[]? | select(.name | startswith($p)) | select(.status == "offline")] | length') || fail "Gate 3: Unable to parse offline runner count"
+if ! daemon_in_vm; then
+    if ! cpu_controller_available; then
+        fail "CPU controller check failed: this host does not expose a usable cpu cgroup controller"
+    fi
+fi
 
-# Local container check for the configured runner prefix. The ezgha label is
-# shared by isolated canary daemons, so raw managed-container count can mask
-# missing production capacity.
+if [ -z "$VM_TOTAL_MB" ] || ! is_uint "$VM_TOTAL_MB" || [ "$VM_TOTAL_MB" -eq 0 ]; then
+    DAEMON_MEM_BYTES=$(docker info --format '{{.MemTotal}}' 2>/dev/null || true)
+    if ! is_uint "$DAEMON_MEM_BYTES" || [ "$DAEMON_MEM_BYTES" -eq 0 ]; then
+        fail "Could not verify host/VM memory budget: vm_total_mb missing and docker info unavailable"
+    fi
+    VM_TOTAL_MB=$((DAEMON_MEM_BYTES / 1024 / 1024))
+fi
+if [ -z "$VM_TOTAL_MB" ] || ! is_uint "$VM_TOTAL_MB"; then
+    fail "Could not verify host/VM memory budget: vm_total_mb invalid/missing"
+fi
+if [ "$VM_TOTAL_MB" -le "$GUEST_RESERVE_MB" ]; then
+    fail "Memory budget invalid: vm_total_mb ($VM_TOTAL_MB) <= guest_reserve_mb ($GUEST_RESERVE_MB)"
+fi
+HOST_BUDGET_MB=$((VM_TOTAL_MB - GUEST_RESERVE_MB))
+FLOOR_REQUIREMENT_MB=$((COUNT * RUNNER_FLOOR_MB))
+if [ "$FLOOR_REQUIREMENT_MB" -gt "$HOST_BUDGET_MB" ]; then
+    fail "Configured runner floor would violate host reserve: count($COUNT)*runner_floor_mb($RUNNER_FLOOR_MB)=$FLOOR_REQUIREMENT_MB > vm_total_mb($VM_TOTAL_MB)-guest_reserve_mb($GUEST_RESERVE_MB)=$HOST_BUDGET_MB"
+fi
+
+EXPECTED_RUNNING=0
+for slot in $(seq 1 "$COUNT"); do
+    SLOT_NAME="${NAME_PREFIX}-${slot}"
+    if ! container_state_is_running "$SLOT_NAME"; then
+        fail "Slot $SLOT_NAME is missing or not running"
+    fi
+
+    SLOT_JSON=$(docker inspect "$SLOT_NAME" 2>/dev/null || echo '[]')
+    if [ "$SLOT_JSON" = "[]" ]; then
+        fail "docker inspect returned no data for slot $SLOT_NAME"
+    fi
+
+    SLOT_MEMORY_BYTES=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.Memory // 0')
+    SLOT_MEMORY_SWAP_BYTES=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.MemorySwap // 0')
+    SLOT_NANO_CPUS=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.NanoCpus // 0')
+    SLOT_CPU_QUOTA=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.CPUQuota // 0')
+    SLOT_CPU_PERIOD=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.CPUPeriod // 0')
+    SLOT_PIDS_LIMIT=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.PidsLimit // -1')
+    SLOT_STATUS=$(echo "$SLOT_JSON" | jq -r '.[0].State.Status // "unknown"')
+
+    if [ "$SLOT_MEMORY_BYTES" -ne "$EXPECTED_MEMORY_BYTES" ]; then
+        fail "slot $SLOT_NAME memory limit mismatch: HostConfig.Memory=${SLOT_MEMORY_BYTES} bytes (expected ${EXPECTED_MEMORY_BYTES})"
+    fi
+    if [ "$SLOT_MEMORY_SWAP_BYTES" -ne "$EXPECTED_MEMORY_BYTES" ]; then
+        fail "slot $SLOT_NAME memory-swap mismatch: HostConfig.MemorySwap=${SLOT_MEMORY_SWAP_BYTES} bytes (expected ${EXPECTED_MEMORY_BYTES})"
+    fi
+    if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_NANO_CPUS" ]; then
+        if [ "$SLOT_CPU_QUOTA" -le 0 ] || [ "$SLOT_CPU_PERIOD" -le 0 ]; then
+            fail "slot $SLOT_NAME CPU enforcement unavailable: HostConfig.NanoCpus=${SLOT_NANO_CPUS}, CPUQuota=${SLOT_CPU_QUOTA}, CPUPeriod=${SLOT_CPU_PERIOD}"
+        fi
+    fi
+    if [ "$SLOT_PIDS_LIMIT" -lt 0 ] || [ "$SLOT_PIDS_LIMIT" -ne "$LIMIT_PIDS" ]; then
+        fail "slot $SLOT_NAME PIDs mismatch: HostConfig.PidsLimit=${SLOT_PIDS_LIMIT}, expected ${LIMIT_PIDS}"
+    fi
+    if [ "$SLOT_STATUS" != "running" ]; then
+        fail "slot $SLOT_NAME is not running (docker inspect State.Status=${SLOT_STATUS})"
+    fi
+    if ! inspect_has_no_new_privileges "$SLOT_NAME"; then
+        fail "slot $SLOT_NAME missing HostConfig.SecurityOpt no-new-privileges"
+    fi
+    if ! runner_has_worker_process "$SLOT_NAME"; then
+        fail "slot $SLOT_NAME is not executing Runner.Worker/Listener"
+    fi
+    EXPECTED_RUNNING=$((EXPECTED_RUNNING + 1))
+done
+
+if [ "$EXPECTED_RUNNING" -ne "$COUNT" ]; then
+    fail "Fleet execution check failed: expected $COUNT running slots with Worker process, saw $EXPECTED_RUNNING"
+fi
+
+OVERLAY_FREE_DISK_GB=$(daemon_overlay_free_disk_gb "$RUNNER_IMAGE" || true)
+if [ -z "$OVERLAY_FREE_DISK_GB" ] || ! is_uint "$OVERLAY_FREE_DISK_GB"; then
+    fail "Could not measure daemon overlay free disk via runner image $RUNNER_IMAGE"
+fi
+if [ "$OVERLAY_FREE_DISK_GB" -lt "$MIN_FREE_DISK_GB" ]; then
+    fail "Daemon overlay free disk floor violated: ${OVERLAY_FREE_DISK_GB}GiB available < configured min ${MIN_FREE_DISK_GB}GiB"
+fi
+
 CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null | awk -v p="$NAME_PREFIX" '
 index($0, p "-") == 1 {
     suffix = substr($0, length(p) + 2)
     if (suffix ~ /^[0-9]+$/) print
-}' | wc -l)
-CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
-
-# Validate runner names match expected format (prefix-N)
-INVALID_NAMES=$(echo "$RAW_RUNNERS" | jq -r --arg p "$NAME_PREFIX" '.[]?.runners[]? | select(.name | startswith($p)) | .name') || fail "Gate 3: Unable to parse runner names"
-INVALID_NAMES=$(echo "$INVALID_NAMES" | grep -vE "^.+-[0-9]+$" || true)
-if [ -n "$INVALID_NAMES" ]; then
-    fail "Invalid runner names registered on GitHub:\n$INVALID_NAMES"
+}' | wc -l | tr -d "[:space:]")
+SLOT_FILE_STATE_DIR=$(toml_get_top state_dir "" 2>/dev/null || echo "")
+if [ -z "$SLOT_FILE_STATE_DIR" ]; then
+    SLOT_FILE_STATE_DIR="$HOME/.config/ezgha"
 fi
+SLOT_COUNT=$(grep -c '=' "$SLOT_FILE_STATE_DIR/slot_assignments.toml" 2>/dev/null || echo 0)
 
-# EFFECTIVE_CAPACITY is only a reliable signal when the fleet is quiescent.
-# When runners are actively cycling through jobs, GitHub de-registers a runner
-# the instant its container exits (--rm) and doesn't show the replacement until
-# the new container connects — there is always a respawn-gap window where
-# ONLINE_COUNT < COUNT. Only enforce the threshold when no runners are busy.
-# The quiescent block below (BUSY_COUNT=0) already checks the strict threshold.
-if [ "$BUSY_COUNT" -eq 0 ] && [ "$EFFECTIVE_CAPACITY" -lt "$((COUNT - 1))" ]; then
-    fail "Effective capacity ($EFFECTIVE_CAPACITY) is lower than target COUNT-1 ($((COUNT - 1))) [quiescent fleet]"
+if [ "$CONTAINER_COUNT" -lt "$COUNT" ] || [ "$SLOT_COUNT" -lt "$COUNT" ]; then
+    fail "Local fleet reconciliation evidence incomplete: containers=$CONTAINER_COUNT, slot file entries=$SLOT_COUNT, target=$COUNT"
 fi
 
-
-# Quiescent sample check: if no busy runners, online count must equal target count, and offline count must be zero
-if [ "$BUSY_COUNT" -eq 0 ]; then
-    if [ "$ONLINE_COUNT" -lt "$COUNT" ]; then
-        fail "Fleet is quiescent but online count ($ONLINE_COUNT) < target count ($COUNT)"
-    fi
-    if [ "$OFFLINE_COUNT" -gt 0 ]; then
-        fail "Fleet is quiescent but has $OFFLINE_COUNT offline runners registered"
-    fi
-fi
-
-# Slot file count is the authoritative local measure: it persists across the
-# respawn gap (container finishes job → auto-removed by --rm → slot still
-# reserved → daemon respawns within 30s). An instantaneous 'docker ps' count
-# is always wrong under high utilization and triggers false failures.
-SLOT_COUNT=0
-STATE_DIR=$(toml_get_top state_dir "" 2>/dev/null || echo "")
-if [ -n "$STATE_DIR" ]; then
-    SLOT_FILE="$STATE_DIR/slot_assignments.toml"
-else
-    SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
-fi
-if [ -f "$SLOT_FILE" ]; then
-    SLOT_COUNT=$(grep -c '\.' "$SLOT_FILE" 2>/dev/null || echo 0)
-    # slot file has one entry per reserved slot; count lines with '=' as a proxy
-    SLOT_COUNT=$(grep -c '=' "$SLOT_FILE" 2>/dev/null || echo 0)
-fi
-# Fall back to docker ps only if slot file is absent/empty
-if [ "$SLOT_COUNT" -eq 0 ]; then
-    SLOT_COUNT="$CONTAINER_COUNT"
-fi
-if [ "$SLOT_COUNT" -lt "$((COUNT - 1))" ] && [ "$CONTAINER_COUNT" -lt "$((COUNT - 1))" ]; then
-    fail "Local managed container count ($CONTAINER_COUNT) is lower than COUNT-1 ($((COUNT - 1))) and slot file has only $SLOT_COUNT reserved slots"
-fi
-pass "Gate 3: Fleet capacity meets targets (Effective capacity: $EFFECTIVE_CAPACITY, Containers: $CONTAINER_COUNT, Slots: $SLOT_COUNT)"
+pass "Gate 3: Full local per-slot execution and envelope enforcement proof passed (slots=$COUNT, per-slot workers=$EXPECTED_RUNNING)"
 
 # --- Gate 4: Real job execution ---
 echo "--- Checking Gate 4: Real job execution ---"
