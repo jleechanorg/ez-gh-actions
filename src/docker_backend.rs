@@ -1031,7 +1031,10 @@ fn read_cached_or_reprobe() -> bool {
     // `docker run` per tick — the TTL bounds the worst-case outage from
     // "until restart" to "5 minutes from probe-flip".
     let probed = probe_docker_cpu_controller_available();
-    *g = Some(ProbeCache { value: probed, at: Instant::now() });
+    *g = Some(ProbeCache {
+        value: probed,
+        at: Instant::now(),
+    });
     probed
 }
 
@@ -4096,8 +4099,7 @@ minimum_isolation = "container"
             // Linux 5.x emits a `#subsys_name ...` header line; the
             // parser must skip comment rows and still detect a real
             // enabled cpu row below.
-            let input =
-                b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu 12 234 1\n";
+            let input = b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu 12 234 1\n";
             assert!(
                 parse_controller_probe(input),
                 "v1 header comment must be skipped and the cpu row below must match"
