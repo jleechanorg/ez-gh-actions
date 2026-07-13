@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,16 @@ const DISK_MEASURE_STRIKES: u32 = 2;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
+/// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
+/// every admission decision. `Mutex` (not `RwLock`) because the read+write
+/// pattern is "lock, rotate, push, decide, unlock" — RwLock would still
+/// need a write lock for the rotate+push, so a plain Mutex avoids the
+/// extra atomic at the same cost. None slots mean "no reading yet" and
+/// break the hysteresis chain (so the daemon gets a 5-tick grace window
+/// after a fresh start).
+static PRESSURE_WINDOW: Mutex<[Option<f64>; 5]> = Mutex::new([None, None, None, None, None]);
 
 #[cfg(test)]
 static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
@@ -1294,6 +1305,121 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
     Some((ncpu, mem_bytes / 1024 / 1024))
 }
 
+/// Lane-I (Round-3 swarm): read PSI cgroup-v2 memory pressure (`some` line)
+/// and host `MemAvailable`. Returns `(pressure_pct, available_bytes)`. Pure
+/// helper — no global state, no I/O beyond reading two small sysfs/proc
+/// files. Refuses to start a new runner when the host is already under
+/// sustained memory pressure, even if disk-floor is healthy (the
+/// `min_free_disk_gb` guard alone did not save the host from the 2026-07-12
+/// crash). Default cgroup path is `user.slice` because that's where the
+/// daemon is most likely to live; an `Err` is returned if `/proc/self/cgroup`
+/// cannot be parsed AND `user.slice` is unreadable, so a misconfigured host
+/// fails loud rather than silently admitting a runaway job.
+pub fn memory_pressure_pct() -> Result<(f64, u64)> {
+    memory_pressure_pct_from(DEFAULT_PRESSURE_PATH, &read_meminfo_available)
+}
+
+const DEFAULT_PRESSURE_PATH: &str = "/sys/fs/cgroup/user.slice/memory.pressure";
+
+fn memory_pressure_pct_from(
+    pressure_path: &str,
+    read_meminfo: &dyn Fn() -> Option<u64>,
+) -> Result<(f64, u64)> {
+    let pressure_raw = std::fs::read_to_string(pressure_path)
+        .with_context(|| format!("reading memory pressure at {pressure_path}"))?;
+    // PSI cgroup-v2 line format:
+    //   some avg10=1.23 avg60=4.56 avg300=2.34 total=...
+    // We use `avg10` (the most recent 10s window) — short enough to react
+    // before the host tips into OOM, long enough that a single tick's
+    // disk-stall jitter doesn't trigger an admission refusal.
+    let mut pct: Option<f64> = None;
+    for line in pressure_raw.lines() {
+        if let Some(rest) = line.strip_prefix("some") {
+            for tok in rest.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("avg10=") {
+                    pct = v.parse::<f64>().ok();
+                    break;
+                }
+            }
+        }
+    }
+    let pressure_pct = pct.with_context(|| format!("no `some avg10=` line in {pressure_path}"))?;
+    let available_bytes =
+        read_meminfo().with_context(|| "could not read MemAvailable from /proc/meminfo")?;
+    Ok((pressure_pct, available_bytes))
+}
+
+/// Parse the single `MemAvailable: N kB` line out of `/proc/meminfo`.
+fn read_meminfo_available() -> Option<u64> {
+    let raw = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Lane-I admission policy. Pure function — no I/O, no globals — so the
+/// 4-branch test suite can drive every code path without touching
+/// `/proc/meminfo` or `/sys/fs/cgroup`. The 5-tick rolling window of
+/// previous pressure readings is passed in as `prev_window: &mut [Option<f64>; 5]`
+/// (newest sample at the END); on each call we rotate left, push the new
+/// reading, and decide. We refuse on:
+///   1. absolute pressure > 50% (any single tick),
+///   2. available_bytes < 2× per-runner memory,
+///   3. hysteresis: all 5 most-recent readings are rising (each tick's
+///      reading is strictly greater than the prior tick).
+///
+/// Tests pass a pre-populated `prev_window` so they can drive each branch
+/// deterministically without spinning up the real daemon.
+pub fn eval_admission(
+    pressure_pct: f64,
+    available_bytes: u64,
+    runner_memory_bytes: u64,
+    prev_window: &mut [Option<f64>; 5],
+) -> Result<(), String> {
+    if pressure_pct > 50.0 {
+        return Err(format!(
+            "PSE memory pressure {pressure_pct:.1}% > 50%; refusing new start"
+        ));
+    }
+    let two_x = runner_memory_bytes.saturating_mul(2);
+    if available_bytes < two_x {
+        let avail_mb = available_bytes / 1024 / 1024;
+        let runner_mb = runner_memory_bytes / 1024 / 1024;
+        return Err(format!(
+            "MemAvailable {avail_mb} MB < 2× runner memory {runner_mb} MB"
+        ));
+    }
+    // Hysteresis: rotate left, push the new reading into the tail, then
+    // check that every consecutive (prev, curr) pair in the window is
+    // strictly rising. None slots mean "no prior reading" and break the
+    // rising chain — so hysteresis can only FIRE once the ring is full AND
+    // every consecutive pair is rising. That gives a 5-tick grace at
+    // startup (which is exactly what we want — we should not refuse a new
+    // start on tick 1 just because the daemon restarted into a busy host).
+    prev_window.rotate_left(1);
+    prev_window[4] = Some(pressure_pct);
+    if prev_window.iter().all(Option::is_some) {
+        let mut prev = prev_window[0].unwrap();
+        let mut all_rising = true;
+        for slot in prev_window.iter().skip(1) {
+            let curr = slot.unwrap();
+            if curr <= prev {
+                all_rising = false;
+                break;
+            }
+            prev = curr;
+        }
+        if all_rising {
+            return Err("PSE hysteresis: pressure rising 5 consecutive ticks".to_string());
+        }
+    }
+    Ok(())
+}
+
 /// Clamp configured limits to what the daemon can actually provide PER
 /// RUNNER. With `count` ephemeral runners, each runner must fit
 /// `daemon / count`; clamping to raw `daemon` would silently over-commit by
@@ -2173,6 +2299,49 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                  — disk floor guard is NOT active this cycle"
             );
         }
+    }
+    // Lane-I (Round-3 swarm): pressure-aware admission. Disk floor alone did
+    // not save the host from the 2026-07-12 crash — we ALSO need to refuse
+    // new starts under sustained memory pressure even if there's plenty
+    // of disk. Reads PSI cgroup-v2 memory.pressure + /proc/meminfo; refuses
+    // on absolute pressure > 50%, on available < 2× per-runner memory, OR
+    // on a 5-tick rising-pressure hysteresis (sustained growth = OOM is
+    // imminent even if the current absolute reading is below threshold).
+    // Best-effort: if either read fails (cgroup not mounted, /proc/meminfo
+    // unreadable, parse error) we LOG and continue rather than bail — a
+    // single broken probe must NOT take the runner pool offline. The
+    // hysteresis window is read+rotated as one Mutex guard.
+    let admission_probe = memory_pressure_pct();
+    let admission_decision: Result<(), String> = {
+        let mut window = PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
+        match &admission_probe {
+            Ok((pct, available)) => {
+                let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
+                eval_admission(*pct, *available, runner_bytes, &mut window)
+            }
+            Err(e) => {
+                // Probe failed — degrade gracefully. Push a None-equivalent
+                // (we can't, since the window is Option<f64>; push 0.0 to
+                // break the rising chain on the next successful probe) and
+                // log so the operator sees degraded-but-not-stopped.
+                window.rotate_left(1);
+                window[4] = Some(0.0);
+                eprintln!(
+                    "warning: PSI admission probe failed ({e:#}); pressure-aware gate is NOT active this cycle"
+                );
+                Ok(())
+            }
+        }
+    };
+    if let Err(reason) = admission_decision {
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.memory_pressure",
+            Severity::Critical,
+            "Runner pool paused: memory pressure",
+            &format!("refusing to spawn runners: {reason}"),
+        );
+        bail!("{reason}");
     }
     let missing = cfg.runner.count - alive;
     let refill = start_missing_runners(cfg, backend, missing);
@@ -4103,6 +4272,83 @@ minimum_isolation = "container"
             assert!(
                 parse_controller_probe(input),
                 "v1 header comment must be skipped and the cpu row below must match"
+            );
+        }
+    }
+
+    /// Lane-I (Round-3 swarm): the 4-branch unit suite for `eval_admission`.
+    /// All tests are pure-function: they drive `eval_admission` directly
+    /// with explicit pressure / available / window values, so no
+    /// `/proc/meminfo` or `/sys/fs/cgroup` read happens during cargo test
+    /// (CI runners don't always have cgroup-v2 memory.pressure mounted, and
+    /// we want hermetic CI regardless of host shape).
+    mod eval_admission_tests {
+        use super::eval_admission;
+
+        const RUNNER_BYTES: u64 = 3 * 1024 * 1024 * 1024; // 3 GiB
+        const EMPTY_WINDOW: [Option<f64>; 5] = [None, None, None, None, None];
+
+        #[test]
+        fn admits_when_pressure_low_and_available_huge() {
+            // (a) 30% pressure, 16 GiB available → admit.
+            let mut window = EMPTY_WINDOW;
+            let res = eval_admission(30.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, &mut window);
+            assert!(
+                res.is_ok(),
+                "30% pressure + 16 GiB avail must admit, got: {res:?}"
+            );
+            // Window should now hold the new reading at the tail.
+            assert_eq!(
+                window[3], None,
+                "ring left-rotation must shift None to slot 3"
+            );
+            assert_eq!(window[4], Some(30.0), "new reading pushed to tail");
+        }
+
+        #[test]
+        fn refuses_on_absolute_pressure_above_threshold() {
+            // (b) 80% pressure, plenty of avail → refuse (absolute).
+            let mut window = EMPTY_WINDOW;
+            let err = eval_admission(80.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, &mut window)
+                .expect_err("80% pressure must refuse");
+            assert!(
+                err.contains("PSE memory pressure 80.0% > 50%"),
+                "refusal message must cite the pressure value, got: {err}"
+            );
+        }
+
+        #[test]
+        fn refuses_when_available_below_two_x_runner_memory() {
+            // (c) 30% pressure (well under 50%) but only 1 GiB available
+            // against a 3 GiB runner — 1 < 6, so refuse (available branch).
+            let mut window = EMPTY_WINDOW;
+            let one_gib: u64 = 1024 * 1024 * 1024;
+            let err = eval_admission(30.0, one_gib, RUNNER_BYTES, &mut window)
+                .expect_err("1 GiB avail vs 3 GiB runner must refuse");
+            assert!(
+                err.contains("MemAvailable 1024 MB < 2× runner memory 3072 MB"),
+                "refusal message must cite both MB values, got: {err}"
+            );
+        }
+
+        #[test]
+        fn refuses_on_five_tick_rising_hysteresis_even_below_absolute_threshold() {
+            // (d) pressure 20% (well under 50%) AND plenty of avail, but
+            // every one of the 5 most-recent ticks has been strictly
+            // rising — refuse on the hysteresis branch.
+            //
+            // Pre-populate the ring FULLY with 4 prior readings so the
+            // rotate_left on this call doesn't create a None slot — the
+            // hysteresis check requires `all(Option::is_some)` to fire.
+            // Sequence after rotate_left + push(20.0):
+            //   [12.0, 15.0, 18.0, 19.0, 20.0]  (all rising)
+            let mut window: [Option<f64>; 5] =
+                [Some(10.0), Some(12.0), Some(15.0), Some(18.0), Some(19.0)];
+            let err = eval_admission(20.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, &mut window)
+                .expect_err("5-tick rising must refuse even at 20% pressure");
+            assert!(
+                err.contains("PSE hysteresis: pressure rising 5 consecutive ticks"),
+                "refusal message must cite hysteresis, got: {err}"
             );
         }
     }
