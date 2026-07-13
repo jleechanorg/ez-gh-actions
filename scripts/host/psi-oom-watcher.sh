@@ -130,19 +130,31 @@
 #   scripts/host/psi-oom-watcher.sh --dry-run   # same, via flag
 #   scripts/host/psi-oom-watcher.sh --priority-file /etc/ezgha/low-priority.list
 #
-# STAGED SHED CHAIN (R3 lane J, see bead ez-gh-actions-6478):
-# when the CRIT path is reached, run four bounded stages BEFORE the
-# `kill -TERM` to a single user process — the per-process SIGTERM was the
-# round-1 fallback that logged but otherwise reduced to "let the watchdog
-# reboot the box" (see 2026-07-10 incident). Stage 1 drains lowest-priority
-# managed containers; stage 2 writes `1` to the QEMU cgroup's
-# `memory.reclaim` to ask the kernel to release page cache + swap (does NOT
-# signal processes); stage 3 sleeps 5s and verifies the QEMU RSS dropped by
-# >= RSS_DROP_MIN_KB (default 1048576 = 1 GiB); stage 4 only runs if the
-# verify failed — it writes a watchdog-wait marker + logs CRITICAL and the
-# original SIGTERM path is suppressed. The shed block is fully dry-runnable
-# via `--dry-run` / `DRY_RUN=1` and is encoded as discrete functions so
-# unit-test stubs can call them in isolation.
+# STAGED SHED CHAIN (R3 lane J, see bead ez-gh-actions-6478; R4 lane T fixes
+# per beads ez-gh-actions-r3f10 / ez-gh-actions-r3f11): when the CRIT path
+# is reached, run four bounded stages BEFORE the `kill -TERM` to a single
+# user process — the per-process SIGTERM was the round-1 fallback that
+# logged but otherwise reduced to "let the watchdog reboot the box" (see
+# 2026-07-10 incident). Stage 1 drains lowest-priority managed containers;
+# stage 2 writes a multi-GiB target to the QEMU cgroup's `memory.reclaim` to
+# ask the kernel to release page cache + swap (does NOT signal processes);
+# stage 3 sleeps 5s and verifies the QEMU RSS dropped by >= RSS_DROP_MIN_KB
+# (default 1048576 = 1 GiB) — using a baseline RSS captured BEFORE stage 1,
+# not after, so the comparison is honest; stage 4 only runs if the verify
+# failed — it writes a watchdog-wait marker + logs CRITICAL and the original
+# SIGTERM path is suppressed. The shed block is fully dry-runnable via
+# `--dry-run` / `DRY_RUN=1` and is encoded as discrete functions so unit-
+# test stubs can call them in isolation.
+#
+# R4 lane T (ez-gh-actions-r3f10): PSI_SHED_CHAIN is MANDATORY. The default
+# below defines the canonical 4-stage chain; if the env var is unset OR
+# empty at timer invocation (i.e. when this script is invoked as a
+# oneshot without the --shed CLI flag), exit 64 — fail-closed. The empty
+# default in round 3 was the cold-review-flagged defect: a staged shed
+# that nobody wired up is a no-op defense. PSI_SHED_CHAIN is set in the
+# systemd .service `Environment=` line (see systemd/psi-oom-watcher.service)
+# so a fresh install gets it for free.
+DEFAULT_PSI_SHED_CHAIN="drain,reclaim,verify,escalate"
 set -euo pipefail
 
 PSI_FILE="${PSI_FILE:-/proc/pressure/memory}"
@@ -157,16 +169,23 @@ CRIT_CONSECUTIVE="${CRIT_CONSECUTIVE:-2}"   # consecutive polls at/above CRIT be
 COOLDOWN_SEC="${COOLDOWN_SEC:-600}"         # 10 minutes
 DRY_RUN="${DRY_RUN:-0}"
 
-# R3 lane J (ez-gh-actions-6478): when non-empty, the CRIT path also runs the
+# R3 lane J (ez-gh-actions-6478): when set, the CRIT path also runs the
 # staged shed chain (drain/reclaim/verify/escalate) BEFORE the per-process
-# SIGTERM fallback. Default off so existing timers behave identically until
-# the watchdog policy is updated by the deploy-owner. CLI flags
-# (--shed / --dry-run / --priority-file) are parsed later, after the shed
-# function definitions are in scope (forward references do not work in
-# top-level bash evaluation order).
+# SIGTERM fallback. R4 lane T (ez-gh-actions-r3f10): the chain is
+# MANDATORY at timer invocation — empty/unset fails-closed with exit 64.
+# The source of truth is the service unit's `Environment=` line (see
+# systemd/psi-oom-watcher.service); DEFAULT_PSI_SHED_CHAIN above is the
+# canonical chain shape, NOT a silent fallback at runtime — silent
+# defaults are exactly the regression the cold review flagged. CLI flags
+# (--shed / --dry-run / --priority-file) are parsed later, after the
+# shed function definitions are in scope (forward references do not work
+# in top-level bash evaluation order). NOTE: we deliberately do NOT
+# default PSI_SHED_CHAIN here; that would mask the empty/unset case the
+# validator exists to catch.
 PSI_SHED_CHAIN="${PSI_SHED_CHAIN:-}"
 _shed_mode=""
 _shed_show_help=""
+_shed_strict_required=0
 
 # comm-based exclusions (exact match against ps -o comm=, which truncates
 # at 15 chars — qemu-system-x86_64 truncates to "qemu-system-x86"). Grouped:
@@ -309,7 +328,21 @@ stage1_drain() {
 # Resolve QEMU cgroup (v2 unified) and ask the kernel to release its
 # reclaimable memory. `memory.reclaim` is a no-op when RSS is already
 # below high water — safe to call repeatedly (idempotent).
+#
+# R4 lane T (ez-gh-actions-r3f11): the original write of `1` (a single
+# byte) was rejected by the kernel as effectively a no-op — cgroup-v2
+# `memory.reclaim` interprets the value as "reclaim UP TO <N> bytes". A
+# 1-byte target is satisfied instantly and the kernel does nothing
+# meaningful. Write SHED_RECLAIM_TARGET_BYTES (default 8 GiB) instead.
+# The kernel simply stops when it has freed that much OR when it runs
+# out of reclaimable pages; either is fine. If memory.high or
+# memory.max for the cgroup is reachable and lower, prefer 0 (the kernel
+# treats 0 as "reclaim up to your limit" per cgroup-v2 docs). We write
+# 8 GiB as a defensive lower bound — large enough that an actual multi-
+# GiB QEMU RSS drop is achievable in SHED_VERIFY_DELAY seconds, small
+# enough that a healthy QEMU at 4 GiB won't be pummeled.
 stage2_reclaim_qemu() {
+  local reclaim_target_bytes="${SHED_RECLAIM_TARGET_BYTES:-8589934592}"   # 8 GiB
   SHED_QEMU_PID="$(pgrep -f qemu-system-x86_64 2>/dev/null | head -1 || true)"
   if [ -z "${SHED_QEMU_PID}" ]; then
     _shed_log stage2 "no qemu-system-x86_64 pid found — skipping reclaim"
@@ -329,19 +362,22 @@ stage2_reclaim_qemu() {
 
   SHED_QEMU_CG_PATH="/sys/fs/cgroup${SHED_QEMU_CG}"
   if [ ! -w "${SHED_QEMU_CG_PATH}/memory.reclaim" ]; then
-    if _shed_dry stage2 "write 1 to ${SHED_QEMU_CG_PATH}/memory.reclaim (skipping: not writable)"; then
+    if _shed_dry stage2 "write ${reclaim_target_bytes} to ${SHED_QEMU_CG_PATH}/memory.reclaim (skipping: not writable)"; then
       return 0
     fi
     _shed_log stage2 "${SHED_QEMU_CG_PATH}/memory.reclaim not writable — skipping reclaim (likely needs root or v1 cgroup)"
     return 0
   fi
 
-  if _shed_dry stage2 "printf 1 > ${SHED_QEMU_CG_PATH}/memory.reclaim"; then
+  if _shed_dry stage2 "printf %d > ${SHED_QEMU_CG_PATH}/memory.reclaim (target_bytes=${reclaim_target_bytes})"; then
     return 0
   fi
 
-  if printf '1\n' > "${SHED_QEMU_CG_PATH}/memory.reclaim" 2>>"${LOG_FILE}"; then
-    _shed_log stage2 "wrote 1 to ${SHED_QEMU_CG_PATH}/memory.reclaim (pid=${SHED_QEMU_PID})"
+  # R4 lane T (ez-gh-actions-r3f11): multi-GiB target so the kernel
+  # actually does meaningful reclaim work. The kernel parses the value as
+  # a decimal byte count and reclaims up to that many bytes.
+  if printf '%d\n' "${reclaim_target_bytes}" > "${SHED_QEMU_CG_PATH}/memory.reclaim" 2>>"${LOG_FILE}"; then
+    _shed_log stage2 "wrote ${reclaim_target_bytes} bytes (8 GiB) to ${SHED_QEMU_CG_PATH}/memory.reclaim (pid=${SHED_QEMU_PID})"
   else
     _shed_log stage2 "write to memory.reclaim failed (continuing chain)"
   fi
@@ -349,18 +385,40 @@ stage2_reclaim_qemu() {
 }
 
 # ---------------- Stage 3: Verify ----------------
-# Capture pre-stage RSS baseline, sleep, then compare against the
-# post-stage baseline. Returns 0 on >= RSS_DROP_MIN_KB drop.
+# R4 lane T (ez-gh-actions-r3f11): the previous version of this stage
+# captured baseline RSS HERE, which was already AFTER stages 1+2 had run
+# (drain had stopped containers, reclaim had told the kernel to free
+# memory). That made the comparison `baseline - now` always near zero
+# (or even negative under further compaction / page-cache churn), so the
+# "ok" branch was effectively unconditional. Fix: capture baseline RSS
+# UP-FRONT in `run_shed_stages` (BEFORE stage1_drain), stash it via the
+# exported `SHED_BASELINE_RSS`, and have this stage consume that
+# pre-drain snapshot only. Falls back to local capture if the variable
+# is empty (e.g. this stage invoked in isolation by a test stub).
 stage3_verify() {
   local baseline now kb_drop
+  # Prefer the pre-drain baseline captured by run_shed_stages.
+  baseline="${SHED_BASELINE_RSS:-}"
+  if [ -z "${baseline}" ]; then
+    # Fallback path: stage called in isolation. We still capture
+    # immediately (which is honest, since nothing has happened yet),
+    # but log that we're falling back so test stubs can be fixed.
+    if [ -z "${SHED_QEMU_PID}" ] || ! [ -r "/proc/${SHED_QEMU_PID}/status" ]; then
+      _shed_log stage3 "no live qemu pid to verify against — cannot declare success"
+      SHED_RESULT="fail"
+      return 0
+    fi
+    baseline="$(awk '/^VmRSS:/{print $2; exit}' "/proc/${SHED_QEMU_PID}/status" 2>/dev/null || echo 0)"
+    _shed_log stage3 "fallback baseline (no SHED_BASELINE_RSS staged) RSS=${baseline} kB"
+  fi
+
   if [ -z "${SHED_QEMU_PID}" ] || ! [ -r "/proc/${SHED_QEMU_PID}/status" ]; then
     _shed_log stage3 "no live qemu pid to verify against — cannot declare success"
     SHED_RESULT="fail"
     return 0
   fi
 
-  baseline="$(awk '/^VmRSS:/{print $2; exit}' "/proc/${SHED_QEMU_PID}/status" 2>/dev/null || echo 0)"
-  _shed_log stage3 "baseline RSS=${baseline} kB (pid=${SHED_QEMU_PID}); sleeping ${SHED_VERIFY_DELAY}s"
+  _shed_log stage3 "pre-drain baseline RSS=${baseline} kB (pid=${SHED_QEMU_PID}); sleeping ${SHED_VERIFY_DELAY}s"
   sleep "${SHED_VERIFY_DELAY}"
   now="$(awk '/^VmRSS:/{print $2; exit}' "/proc/${SHED_QEMU_PID}/status" 2>/dev/null || echo 0)"
   kb_drop=$((baseline - now))
@@ -406,7 +464,17 @@ stage4_escalate() {
 # ---------------- Dispatcher ----------------
 run_shed_stages() {
   SHED_RESULT=""
-  _shed_log chain "begin dry_run=${DRY_RUN} priority_file='${PRIORITY_FILE}' low_priority='${LOW_PRIORITY_CONTAINERS}'"
+  SHED_BASELINE_RSS=""
+  # R4 lane T (ez-gh-actions-r3f11): capture pre-drain RSS BEFORE
+  # stage1_drain so the verify stage measures an HONEST delta. Stage 2
+  # populates SHED_QEMU_PID lazily; if it's still empty (no qemu running),
+  # we leave SHED_BASELINE_RSS empty too and stage3_verify falls back to
+  # its in-stage capture path.
+  SHED_QEMU_PID_TMP="$(pgrep -f qemu-system-x86_64 2>/dev/null | head -1 || true)"
+  if [ -n "${SHED_QEMU_PID_TMP}" ] && [ -r "/proc/${SHED_QEMU_PID_TMP}/status" ]; then
+    SHED_BASELINE_RSS="$(awk '/^VmRSS:/{print $2; exit}' "/proc/${SHED_QEMU_PID_TMP}/status" 2>/dev/null || echo 0)"
+  fi
+  _shed_log chain "begin dry_run=${DRY_RUN} priority_file='${PRIORITY_FILE}' low_priority='${LOW_PRIORITY_CONTAINERS}' pre_drain_baseline_rss_kB=${SHED_BASELINE_RSS:-n/a}"
   stage1_drain
   stage2_reclaim_qemu
   stage3_verify
@@ -430,6 +498,7 @@ _parse_shed_args() {
       --priority-file) shift; PRIORITY_FILE="${1:-}" ;;
       --priority-file=*) PRIORITY_FILE="${1#--priority-file=}" ;;
       --shed) _shed_mode=1 ;;
+      --shed=*) _shed_mode=1; PSI_SHED_CHAIN="${1#--shed=}" ;;
       --help|-h) _shed_show_help=1 ;;
       *) ;;  # silently ignore unknown — the watcher accepts positional args historically
     esac
@@ -439,30 +508,82 @@ _parse_shed_args() {
 
 _shed_show_help() {
   cat <<EOF
-psi-oom-watcher.sh — PSI early-warning + staged QEMU/RSS shed (R3 lane J)
+psi-oom-watcher.sh — PSI early-warning + staged QEMU/RSS shed (R3 lane J, R4 lane T)
 
 Polling mode (default):
   scripts/host/psi-oom-watcher.sh             # run one polling tick
   DRY_RUN=1 scripts/host/psi-oom-watcher.sh   # one polling tick, log only
 
-Shed chain (R3 lane J, ez-gh-actions-6478):
+Shed chain (R3 lane J, ez-gh-actions-6478; R4 mandatory chain):
   scripts/host/psi-oom-watcher.sh --shed [--dry-run] \\
     [--priority-file /path/to/low-priority.list]
+  scripts/host/psi-oom-watcher.sh --shed=drain,reclaim,verify,escalate [--dry-run]
 
 Environment:
   WARN_THRESHOLD, CRIT_THRESHOLD, CRIT_CONSECUTIVE, COOLDOWN_SEC
-  LOW_PRIORITY_CONTAINERS  space-separated list (default has 4)
-  PRIORITY_FILE            optional list file (one name per line, # comments)
-  RSS_DROP_MIN_KB          verify threshold (default 1048576 = 1 GiB)
-  SHED_VERIFY_DELAY        seconds between reclaim and verify (default 5)
-  DRY_RUN                  1 = no-op every stage, log only
+  LOW_PRIORITY_CONTAINERS    space-separated list (default has 4)
+  PRIORITY_FILE              optional list file (one name per line, # comments)
+  RSS_DROP_MIN_KB            verify threshold (default 1048576 = 1 GiB)
+  SHED_VERIFY_DELAY          seconds between reclaim and verify (default 5)
+  SHED_RECLAIM_TARGET_BYTES  reclaim target (default 8589934592 = 8 GiB)
+  DRY_RUN                    1 = no-op every stage, log only
+  PSI_SHED_CHAIN             mandatory at timer invocation (default: drain,reclaim,verify,escalate)
+                             empty/unset -> exit 64 fail-closed (R4 lane T fix)
 
 Stages:
   1 drain     — docker stop --time 10 <name> for each low-priority container
-  2 reclaim   — printf 1 > <qemu-cgroup>/memory.reclaim (kernel, no signal)
-  3 verify    — sleep SHED_VERIFY_DELAY, measure qemu VmRSS, drop >= RSS_DROP_MIN_KB
+  2 reclaim   — printf %d > <qemu-cgroup>/memory.reclaim (kernel, no signal; default 8 GiB)
+  3 verify    — sleep SHED_VERIFY_DELAY, measure qemu VmRSS drop vs PRE-DRAIN baseline
   4 escalate  — write world-readable flag at \${SHED_FLAG_FILE}, log CRITICAL
 EOF
+}
+
+# R4 lane T (ez-gh-actions-r3f10): validate PSI_SHED_CHAIN.
+#
+# Behavior (as specified):
+#   * Strict mode (poll timer / --shed invocation, NOT --dry-run):
+#       - empty/missing chain -> exit 64, fail-closed.
+#       - chain present but missing one or more of the 4 canonical stages
+#         -> also exit 64 (a chain without verify/escalate is not the
+#         staged shed the cold review required).
+#   * Dry-run mode (--dry-run):
+#       - empty/missing chain -> still log the fail-closed message AND
+#         print the plan, exit 0 (so the verifier can SEE the dry-run
+#         output and the install-owner can see what's missing).
+#       - chain present but missing stages -> log "incomplete chain"
+#         WARNING, still print the plan, exit 0.
+#
+# `strict` is 1 by default; 0 means dry-run (warn-but-print-plan).
+_validate_shed_chain() {
+  local strict="${1:-1}"
+  local chain="${PSI_SHED_CHAIN:-}"
+  local canon="${DEFAULT_PSI_SHED_CHAIN}"
+  if [ -z "${chain}" ]; then
+    if [ "${strict}" = "1" ]; then
+      printf '[%s] [FAIL] PSI_SHED_CHAIN is empty; the staged shed chain is mandatory for the host-pressure reliability boundary. Set Environment=PSI_SHED_CHAIN=<stages> in the .service or use the --shed=<chain> CLI flag.\n' "$(date -u +%FT%TZ)" | tee -a "${LOG_FILE}" >&2
+      exit 64
+    fi
+    log "shed-chain WARNING: PSI_SHED_CHAIN is empty; --dry-run printing plan only, no chain will run"
+    return 0
+  fi
+
+  # Compare each canonical stage (order-independent for validity check;
+  # execution order is fixed in run_shed_stages).
+  local stage missing=0
+  for stage in drain reclaim verify escalate; do
+    case ",${chain}," in
+      *,"${stage}",*) ;;
+      *) missing=$((missing + 1));;
+    esac
+  done
+  if [ "${missing}" -gt 0 ]; then
+    if [ "${strict}" = "1" ]; then
+      printf '[%s] [FAIL] PSI_SHED_CHAIN=%q is incomplete (missing %d of 4 canonical stages: drain,reclaim,verify,escalate). Aborting; a staged shed missing stages is no defense at all.\n' "$(date -u +%FT%TZ)" "${chain}" "${missing}" | tee -a "${LOG_FILE}" >&2
+      exit 64
+    fi
+    log "shed-chain WARNING: incomplete chain PSI_SHED_CHAIN=${chain} (missing stages: ${chain} vs canonical ${DEFAULT_PSI_SHED_CHAIN}); --dry-run printing plan only"
+  fi
+  return 0
 }
 
 # Now that all shed functions are defined, parse CLI flags and short-circuit
@@ -475,7 +596,11 @@ if [ "${_shed_show_help:-0}" = "1" ]; then
   exit 0
 fi
 if [ "${_shed_mode:-0}" = "1" ]; then
-  log "shed-mode invoked (dry_run=${DRY_RUN} priority_file='${PRIORITY_FILE}')"
+  # R4 lane T (ez-gh-actions-r3f10): explicit --shed mode ALSO fails-closed
+  # on an empty/incomplete chain unless --dry-run was passed (where we
+  # warn-but-print-plan so the verifier can SEE the dry-run output).
+  _validate_shed_chain "$( [ "${DRY_RUN}" = "1" ] && echo 0 || echo 1 )"
+  log "shed-mode invoked (dry_run=${DRY_RUN} priority_file='${PRIORITY_FILE}' chain='${PSI_SHED_CHAIN}')"
   if run_shed_stages; then
     log "shed-mode: SHED_RESULT=${SHED_RESULT}"
     exit 0
@@ -483,6 +608,15 @@ if [ "${_shed_mode:-0}" = "1" ]; then
   log "shed-mode: SHED_RESULT=${SHED_RESULT} (chain failed; watchdog-wait flag raised)"
   exit 1
 fi
+
+# R4 lane T (ez-gh-actions-r3f10): polling-mode (timer-fired) entry must
+# also fail-closed on an empty/incomplete PSI_SHED_CHAIN. The .service
+# unit's `Environment=PSI_SHED_CHAIN=drain,reclaim,verify,escalate` line
+# is what populates this for a fresh install; if it is missing, we
+# refuse to run rather than silently fall back to the round-1 single-
+# process SIGTERM behavior (which the round-3 cold review flagged as
+# "staged shed that isn't wired up is no defense").
+_validate_shed_chain 1
 
 
 if [ ! -r "${PSI_FILE}" ]; then
