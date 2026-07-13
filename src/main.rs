@@ -950,6 +950,18 @@ fn main() -> Result<()> {
             // read-modify-write. Auto-released on process death; opt-out via
             // EZGHA_SKIP_LOCK=1 for tests.
             let _serve_lock = acquire_serve_lock(&cfg).context("acquire serve.lock")?;
+            // Pre-warm the cgroup-probe image cache (lane E2 / P1 #R2-9c).
+            // Fire-and-forget on a dedicated thread so the daemon proceeds
+            // into wait_for_backend (which can spend up to 120s on Lima cold
+            // start) without blocking on the pull. The pull races with the
+            // backend wait, so by the time the first
+            // `docker_cpu_controller_available` call fires (lazily, on the
+            // first ensure_count tick that needs `--cpus`) the image is
+            // almost always in the local cache — eliminating the 5+ second
+            // first-spawn latency that can fail a verifier running
+            // immediately after daemon restart. Pull failure is warn-only;
+            // the probe will re-pull on demand if the cache missed.
+            docker_backend::prepull_probe_image();
             // Use wait_for_backend (bead 3z5): retry up to 120s for the Docker
             // daemon to become reachable. This handles the boot-time race where
             // Lima/Colima is still starting when this service unit fires — even

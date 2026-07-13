@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::{Once, OnceLock};
+use std::sync::Once;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -20,6 +20,15 @@ use crate::reaper;
 use crate::watchdog;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
+
+/// Pinned image used by the in-daemon cgroup-probe (`docker run --rm`).
+/// Pinning prevents (a) a `latest` tag drift breaking the probe when
+/// upstream alpine ships a major cgroup-tools change, and (b) the
+/// first-spawn cold start paying 5+ seconds of image-pull latency on
+/// a freshly-restarted daemon. The daemon fire-and-forgets
+/// `docker pull` of this tag at startup (`prepull_probe_image`) so the
+/// cache is warm by the time the first probe fires.
+pub const PROBE_IMAGE: &str = "alpine:3.19";
 
 /// Consecutive-`None` counter for `free_disk_gb`. After this many in a
 /// row we treat the disk floor as exceeded and refuse to spawn, since a
@@ -987,37 +996,121 @@ fn run_docker(cmd: Command, detail: &str) -> Result<Output> {
 /// daemon shares the host kernel, we read the host's cgroup files directly
 /// (the historical behavior).
 ///
-/// The result is cached behind a `OnceLock<bool>` so the serve loop does not
-/// re-spawn a probe container on every `ensure_count` tick.
+/// Cached result of `probe_docker_cpu_controller_available` plus the
+/// `Instant` it was recorded at, so a transient probe failure (Docker socket
+/// not up at boot, image pull race, cgroup mount race) does not pin a
+/// `false` answer FOR THE LIFETIME OF THE DAEMON. The previous
+/// `OnceLock<bool>` cached the first probe result forever; a single early
+/// failure meant the daemon refused to start runners for the entire
+/// process — exactly the fail-closed-too-far behavior the cold review
+/// flagged. With a 5-minute TTL the daemon re-probes often enough that a
+/// transient blip self-heals without operator intervention, while still
+/// avoiding a `docker run` exec on every `ensure_count` tick.
+const CPU_PROBE_CACHE_TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone, Copy)]
+struct ProbeCache {
+    value: bool,
+    at: Instant,
+}
+
+/// Fast-path read-through cache. Lock contention is negligible — this
+/// function is on the serve loop's tick, but the lock is only held for a
+/// struct-copy read or a single `Instant::now()` write, and the cold
+/// path (expired/missing) is amortized to one probe per TTL.
+fn read_cached_or_reprobe() -> bool {
+    static RESULT: std::sync::Mutex<Option<ProbeCache>> = std::sync::Mutex::new(None);
+    let mut g = RESULT.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(c) = *g {
+        if c.at.elapsed() < CPU_PROBE_CACHE_TTL {
+            return c.value;
+        }
+    }
+    // Cache miss OR expired: re-probe. Even on a `false` result we cache
+    // it (for TTL duration) so a sustained failure does not busy-loop a
+    // `docker run` per tick — the TTL bounds the worst-case outage from
+    // "until restart" to "5 minutes from probe-flip".
+    let probed = probe_docker_cpu_controller_available();
+    *g = Some(ProbeCache { value: probed, at: Instant::now() });
+    probed
+}
+
+/// The result is cached behind a `Mutex<Option<ProbeCache>>` with a
+/// 5-minute TTL so the serve loop does not re-spawn a probe container on
+/// every `ensure_count` tick, AND a transient probe failure (Docker socket
+/// not up at boot, image pull race, cgroup mount race) does not pin a
+/// `false` answer for the lifetime of the daemon.
 pub fn docker_cpu_controller_available() -> bool {
     // Test seam (test builds only): when a test installs a forced answer via
     // `cpu_probe_overrides::set`, that answer takes precedence over both the
-    // OnceLock cache and the live probe. This lets the 4 boundary tests
+    // TTL cache and the live probe. This lets the 4 boundary tests
     // (host-enabled/guest-enabled, host-enabled/guest-disabled,
     // host-disabled/guest-enabled, host-disabled/guest-disabled) drive
     // `docker_cpu_controller_available` deterministically without touching
     // the real cgroup filesystem or running `docker run`. The check runs
-    // BEFORE the OnceLock so tests can flip the answer between calls; the
-    // `TEST_LOCK` Mutex<()>> serializes concurrent tests around this state.
+    // BEFORE the cache so tests can flip the answer between calls; the
+    // `TEST_LOCK` Mutex<()> serializes concurrent tests around this state.
     #[cfg(test)]
     {
         if let Some(forced) = cpu_probe_overrides::get() {
             return forced;
         }
     }
-    // Fast path: OnceLock caches the FIRST successful probe result so the
-    // serve loop's ensure_count tick does not re-exec `docker run` on every
-    // iteration.
-    static RESULT: OnceLock<bool> = OnceLock::new();
-    if let Some(cached) = RESULT.get() {
-        return *cached;
-    }
-    let probed = probe_docker_cpu_controller_available();
-    // Race-tolerant: if two threads probe concurrently, both compute the
-    // same answer and the first writer wins. The answer is deterministic
-    // for the lifetime of the daemon, so a stale-but-equal value is fine.
-    let _ = RESULT.set(probed);
-    probed
+    read_cached_or_reprobe()
+}
+
+/// Fire-and-forget `docker pull <PROBE_IMAGE>` so the probe image is in the
+/// local cache BEFORE any `docker run` probe call. The first probe after a
+/// daemon cold start otherwise pays 5+ seconds of image-pull latency, which
+/// can fail a verifier that runs immediately after restart. Best-effort:
+/// pull failure is logged as a warning but does NOT block startup — the
+/// probe call itself will trigger a re-pull on demand if the cache missed,
+/// so the daemon is still correct, just slower on first probe.
+///
+/// Spawned on a dedicated thread because the daemon is otherwise purely
+/// synchronous (no tokio runtime) and we want startup to proceed without
+/// waiting on the pull. The project's only other long-lived background
+/// threads are `watchdog::start_background` and `canary::run_once`-spawned
+/// canary runs (both use the same `std::thread::Builder::new().name(...)`
+/// pattern); following it keeps journalctl `-t` filtering useful.
+pub fn prepull_probe_image() {
+    std::thread::Builder::new()
+        .name("ezgha-probe-prepull".into())
+        .spawn(|| {
+            let out = Command::new("docker")
+                .args(["pull", PROBE_IMAGE])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    // Success is silent: every-5-minute daemon restart
+                    // would otherwise spam the journal with a healthy-pull
+                    // line, drowning the actual warnings. Operators who
+                    // need it can `docker image inspect alpine:3.19`.
+                }
+                Ok(o) => {
+                    // stderr from `docker pull` on a not-found image or
+                    // registry hiccup is the most diagnostic signal we
+                    // have — surface it on the same line as our warning
+                    // so a journalctl grep finds it without a second hop.
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    eprintln!(
+                        "WARN: prepull_probe_image: `docker pull {}` exited {:?}: {}",
+                        PROBE_IMAGE,
+                        o.status.code(),
+                        stderr.trim()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: prepull_probe_image: failed to spawn `docker pull {}`: {e}",
+                        PROBE_IMAGE
+                    );
+                }
+            }
+        })
+        .ok();
 }
 
 /// Internal: performs the actual probe. Result is cached by the public
@@ -1042,7 +1135,7 @@ fn probe_docker_cpu_controller_available() -> bool {
         // launching a short-lived `docker run` with `--cgroupns=host` so
         // the container inherits the daemon's cgroup hierarchy.
         if platform.daemon_in_vm {
-            let probe_img = "alpine:latest";
+            let probe_img = PROBE_IMAGE;
             let out = Command::new("docker")
                 .args([
                     "run", "--rm", "--cgroupns=host", "--network=none",
@@ -1127,16 +1220,30 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
             // some kernels do this for readability).
             return true;
         }
-        if cols.len() >= 2 && !cols[0].starts_with('#') {
+        if cols.len() >= 4 && !cols[0].starts_with('#') {
+            // v1 `/proc/cgroups` row: name hierarchy num_cgroups enabled.
+            // Process v1 rows under the strict enabled-first gate, and
+            // explicitly skip the v2 list-token fallback for v1-shaped
+            // rows — otherwise a disabled v1 row with name="cpu" would
+            // be caught by the v2 `contains("cpu")` check below, exactly
+            // the regression the cold review flagged. A v1 row is shaped
+            // "name hier num enabled" so the trailing column is a
+            // 0/1 flag, not another controller token.
+            if cols[3] != "1" {
+                // Disabled controller — must NOT count, even if its
+                // name happens to be "cpu" or "cpu,cpuacct" / "cpu,...".
+                continue;
+            }
+            // Modern kernels can expose the cpu controller as a combined
+            // row named "cpu,cpuacct" (or any other "cpu,<x>" combination).
+            // Treat any of those as a hit.
+            if cols[0] == "cpu" || cols[0] == "cpu,cpuacct" || cols[0].starts_with("cpu,") {
+                return true;
+            }
+        } else if cols.len() >= 2 && !cols[0].starts_with('#') {
             // v2 single-line space-separated list: any token equal to "cpu".
             // Skip the v1 header line "#subsys_name hierarchy num_cgroups enabled".
             if cols.contains(&"cpu") {
-                return true;
-            }
-        }
-        if cols.len() >= 4 {
-            // v1 `/proc/cgroups` row: name hierarchy numcgroups enabled.
-            if cols[0] == "cpu" && cols[3] == "1" {
                 return true;
             }
         }
@@ -3856,5 +3963,145 @@ minimum_isolation = "container"
             "test override must win over OnceLock cache so tests can flip the answer"
         );
         cpu_probe_overrides::set(None);
+    }
+
+    /// Lane E3 P1 #R2-9d: the `cpu_probe_overrides` seam must win over the
+    /// TTL cache (not just the OnceLock). The old `OnceLock<bool>` cached
+    /// the FIRST probe answer forever; the new `Mutex<Option<ProbeCache>>`
+    /// re-probes every `CPU_PROBE_CACHE_TTL` (5 minutes) so a transient
+    /// probe failure self-heals. This test pins that the seam still takes
+    /// precedence AFTER a value has been cached — flipping the override
+    /// between two calls must be observable on the second call, even if
+    /// the cached value would otherwise be returned. If a future refactor
+    /// moves the seam AFTER the cache read, this test fails.
+    #[test]
+    fn cpu_controller_override_wins_over_ttl_cache() {
+        let _env = TestEnv::new("cpu-override-wins-over-ttl");
+        // Force an initial `true` answer and let it be cached.
+        cpu_probe_overrides::set(Some(true));
+        assert!(
+            docker_cpu_controller_available(),
+            "first call under override=true must return true"
+        );
+        // Now flip the override to `false` while the cache still holds
+        // the `true` result. The seam runs BEFORE the cache read, so the
+        // second call must observe the new override value — not the
+        // cached `true`.
+        cpu_probe_overrides::set(Some(false));
+        assert!(
+            !docker_cpu_controller_available(),
+            "override seam must win over TTL cache: flipping to false must be observed on next call"
+        );
+        // And back to true, to confirm the seam is read fresh on every
+        // call (not memoized into the cache layer).
+        cpu_probe_overrides::set(Some(true));
+        assert!(
+            docker_cpu_controller_available(),
+            "override seam must win over TTL cache: flipping back to true must also be observed"
+        );
+        cpu_probe_overrides::set(None);
+    }
+
+    /// Parser-level tests for `parse_controller_probe` covering the v1
+    /// `/proc/cgroups` row-parsing order. Lane E1 / P1 #R2-9a:
+    /// the enabled column (`cols[3]`) must be checked BEFORE the
+    /// controller name (`cols[0]`), and the name match must also
+    /// accept the combined `cpu,cpuacct` / `cpu,<x>` rows some
+    /// modern kernels expose.
+    ///
+    /// Real `/proc/cgroups` row layout (verified on this host):
+    ///   `name hierarchy num_cgroups enabled`
+    /// i.e. `cols[0]` is the controller name and `cols[3]` is
+    /// the enabled flag. Test inputs below follow that layout.
+    mod parse_controller_probe_tests {
+        use super::parse_controller_probe;
+
+        #[test]
+        fn v1_combined_cpu_cpuacct_enabled_true() {
+            // Combined controller on a modern kernel; enabled=1.
+            // Real /proc/cgroups row: name=cpu,cpuacct, hier=1,
+            // numcgroups=1, enabled=1. Must be treated as cpu.
+            let input = b"cpu,cpuacct 1 1 1\n";
+            assert!(
+                parse_controller_probe(input),
+                "v1 combined cpu,cpuacct with enabled=1 must match"
+            );
+        }
+
+        #[test]
+        fn v1_combined_cpu_cpuacct_disabled_false() {
+            // Same row shape but enabled=0: the parser must NOT
+            // match — the enabled gate fires before the name match.
+            let input = b"cpu,cpuacct 1 1 0\n";
+            assert!(
+                !parse_controller_probe(input),
+                "v1 combined cpu,cpuacct with enabled=0 must NOT match (disabled controller)"
+            );
+        }
+
+        #[test]
+        fn v1_cpu_name_disabled_false() {
+            // Plain "cpu" name but enabled=0: must NOT match. This
+            // is the regression the cold review flagged — the old
+            // code's `cols[0] == "cpu" && cols[3] == "1"` already
+            // did the right thing, but the new order (enabled-first)
+            // makes the intent explicit and survives any future
+            // refactor that reorders the conjunction.
+            let input = b"cpu 12 1 0\n";
+            assert!(
+                !parse_controller_probe(input),
+                "v1 row with name=cpu and enabled=0 must NOT match (disabled controller)"
+            );
+        }
+
+        #[test]
+        fn v1_different_controller_returns_false() {
+            // Different controller name, different enabled value —
+            // a memory row with enabled=1 must NOT match the cpu
+            // probe. (The cpu name is absent, the enabled gate
+            // passes, but the name check fails.)
+            let input = b"memory 12 234 1\n";
+            assert!(
+                !parse_controller_probe(input),
+                "v1 row with name=memory must NOT match the cpu probe"
+            );
+        }
+
+        #[test]
+        fn v1_cpu_name_enabled_true() {
+            // Sanity: the canonical enabled cpu row still matches.
+            // Real /proc/cgroups row: name=cpu, hier=12,
+            // numcgroups=234, enabled=1.
+            let input = b"cpu 12 234 1\n";
+            assert!(
+                parse_controller_probe(input),
+                "v1 row with name=cpu and enabled=1 must match"
+            );
+        }
+
+        #[test]
+        fn v1_cpu_comma_x_enabled_true() {
+            // "cpu,foo" / "cpu,<anything>" form. Some kernels expose
+            // a row named "cpu,cpuset" or similar; the starts_with
+            // check should treat those as cpu.
+            let input = b"cpu,cpuset 5 1 1\n";
+            assert!(
+                parse_controller_probe(input),
+                "v1 row with name=cpu,<x> and enabled=1 must match"
+            );
+        }
+
+        #[test]
+        fn v1_header_comment_is_ignored() {
+            // Linux 5.x emits a `#subsys_name ...` header line; the
+            // parser must skip comment rows and still detect a real
+            // enabled cpu row below.
+            let input =
+                b"#subsys_name\thierarchy\tnum_cgroups\tenabled\ncpu 12 234 1\n";
+            assert!(
+                parse_controller_probe(input),
+                "v1 header comment must be skipped and the cpu row below must match"
+            );
+        }
     }
 }
