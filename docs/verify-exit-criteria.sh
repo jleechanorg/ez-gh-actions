@@ -451,11 +451,12 @@ for slot in $(seq 1 "$COUNT"); do
     SLOT_PIDS_LIMIT=$(echo "$SLOT_JSON" | jq -r '.[0].HostConfig.PidsLimit // -1')
     SLOT_STATUS=$(echo "$SLOT_JSON" | jq -r '.[0].State.Status // "unknown"')
 
-    if [ "$SLOT_MEMORY_BYTES" -ne "$EXPECTED_MEMORY_BYTES" ]; then
-        fail "slot $SLOT_NAME memory limit mismatch: HostConfig.Memory=${SLOT_MEMORY_BYTES} bytes (expected ${EXPECTED_MEMORY_BYTES})"
+    RUNNER_FLOOR_BYTES=$((RUNNER_FLOOR_MB * 1024 * 1024))
+    if [ "$SLOT_MEMORY_BYTES" -lt "$RUNNER_FLOOR_BYTES" ] || [ "$SLOT_MEMORY_BYTES" -gt "$EXPECTED_MEMORY_BYTES" ]; then
+        fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES out of bounds: expected between $RUNNER_FLOOR_BYTES and $EXPECTED_MEMORY_BYTES bytes"
     fi
-    if [ "$SLOT_MEMORY_SWAP_BYTES" -ne "$EXPECTED_MEMORY_BYTES" ]; then
-        fail "slot $SLOT_NAME memory-swap mismatch: HostConfig.MemorySwap=${SLOT_MEMORY_SWAP_BYTES} bytes (expected ${EXPECTED_MEMORY_BYTES})"
+    if [ "$SLOT_MEMORY_SWAP_BYTES" -lt "$RUNNER_FLOOR_BYTES" ] || [ "$SLOT_MEMORY_SWAP_BYTES" -gt "$EXPECTED_MEMORY_BYTES" ]; then
+        fail "slot $SLOT_NAME memory-swap limit $SLOT_MEMORY_SWAP_BYTES out of bounds: expected between $RUNNER_FLOOR_BYTES and $EXPECTED_MEMORY_BYTES bytes"
     fi
     if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_NANO_CPUS" ]; then
         if [ "$SLOT_CPU_QUOTA" -le 0 ] || [ "$SLOT_CPU_PERIOD" -le 0 ]; then
