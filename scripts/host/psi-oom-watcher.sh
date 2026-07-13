@@ -127,6 +127,22 @@
 # run by hand for testing):
 #   scripts/host/psi-oom-watcher.sh
 #   DRY_RUN=1 scripts/host/psi-oom-watcher.sh   # log what it WOULD do, no signal sent
+#   scripts/host/psi-oom-watcher.sh --dry-run   # same, via flag
+#   scripts/host/psi-oom-watcher.sh --priority-file /etc/ezgha/low-priority.list
+#
+# STAGED SHED CHAIN (R3 lane J, see bead ez-gh-actions-6478):
+# when the CRIT path is reached, run four bounded stages BEFORE the
+# `kill -TERM` to a single user process — the per-process SIGTERM was the
+# round-1 fallback that logged but otherwise reduced to "let the watchdog
+# reboot the box" (see 2026-07-10 incident). Stage 1 drains lowest-priority
+# managed containers; stage 2 writes `1` to the QEMU cgroup's
+# `memory.reclaim` to ask the kernel to release page cache + swap (does NOT
+# signal processes); stage 3 sleeps 5s and verifies the QEMU RSS dropped by
+# >= RSS_DROP_MIN_KB (default 1048576 = 1 GiB); stage 4 only runs if the
+# verify failed — it writes a watchdog-wait marker + logs CRITICAL and the
+# original SIGTERM path is suppressed. The shed block is fully dry-runnable
+# via `--dry-run` / `DRY_RUN=1` and is encoded as discrete functions so
+# unit-test stubs can call them in isolation.
 set -euo pipefail
 
 PSI_FILE="${PSI_FILE:-/proc/pressure/memory}"
@@ -140,6 +156,17 @@ CRIT_THRESHOLD="${CRIT_THRESHOLD:-40}"      # full avg10 percent
 CRIT_CONSECUTIVE="${CRIT_CONSECUTIVE:-2}"   # consecutive polls at/above CRIT before acting
 COOLDOWN_SEC="${COOLDOWN_SEC:-600}"         # 10 minutes
 DRY_RUN="${DRY_RUN:-0}"
+
+# R3 lane J (ez-gh-actions-6478): when non-empty, the CRIT path also runs the
+# staged shed chain (drain/reclaim/verify/escalate) BEFORE the per-process
+# SIGTERM fallback. Default off so existing timers behave identically until
+# the watchdog policy is updated by the deploy-owner. CLI flags
+# (--shed / --dry-run / --priority-file) are parsed later, after the shed
+# function definitions are in scope (forward references do not work in
+# top-level bash evaluation order).
+PSI_SHED_CHAIN="${PSI_SHED_CHAIN:-}"
+_shed_mode=""
+_shed_show_help=""
 
 # comm-based exclusions (exact match against ps -o comm=, which truncates
 # at 15 chars — qemu-system-x86_64 truncates to "qemu-system-x86"). Grouped:
@@ -168,6 +195,295 @@ mkdir -p "${STATE_DIR}"
 log() {
   printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$1" | tee -a "${LOG_FILE}" >&2
 }
+##############################################################################
+# STAGED SHED CHAIN (R3 lane J, ez-gh-actions-6478)
+##############################################################################
+# Each stage is a function so unit-test stubs can call them in isolation.
+# `run_shed_stages` dispatches them in order, exports SHED_RESULT so the
+# caller (or a future hook) can decide whether the watchdog can stay armed.
+# The full chain is also exposed via `scripts/host/psi-oom-watcher.sh --shed`
+# for one-shot invocation outside the polling loop (useful for hand-driven
+# pressure-injection tests).
+##############################################################################
+
+# Override knobs (with safe defaults that match the bead example).
+LOW_PRIORITY_CONTAINERS="${LOW_PRIORITY_CONTAINERS:-ez-mac-runner-b-1 ez-mac-runner-b-2 ez-runner-c-9 ez-runner-c-10}"
+PRIORITY_FILE="${PRIORITY_FILE:-}"
+RSS_DROP_MIN_KB="${RSS_DROP_MIN_KB:-1048576}"   # 1 GiB in kB
+SHED_VERIFY_DELAY="${SHED_VERIFY_DELAY:-5}"    # seconds between write+verify
+SHED_FLAG_DIR="${SHED_FLAG_DIR:-/run/ezgha}"
+SHED_FLAG_FILE="${SHED_FLAG_DIR}/watchdog-wait-required.flag"
+
+# Reset on every invocation so callers can `source` and probe.
+SHED_RESULT=""
+SHED_QEMU_PID=""
+SHED_QEMU_CG=""
+SHED_QEMU_CG_PATH=""
+
+# ---------------- helpers ----------------
+_shed_log() {
+  # Stage-internal logger that prefixes the stage tag for post-mortem grep.
+  printf '[%s] [shed/%s] %s\n' "$(date -u +%FT%TZ)" "$1" "$2" | tee -a "${LOG_FILE}" >&2
+}
+
+_shed_dry() {
+  # Echo a dry-run action without performing it. Returns 0 unless DRY_RUN is off.
+  if [ "${DRY_RUN}" = "1" ]; then
+    printf '[%s] [shed/%s] DRY_RUN %s\n' "$(date -u +%FT%TZ)" "$1" "$2" | tee -a "${LOG_FILE}" >&2
+    return 0
+  fi
+  return 1
+}
+
+_shed_priority_list() {
+  # Emit one container name per line. LOW_PRIORITY_CONTAINERS may be
+  # space-separated OR newline-separated; both are accepted (tokens split
+  # on whitespace). A optional PRIORITY_FILE (one name per line, '#'
+  # comments and blank lines ignored) is appended to the env list. The
+  # caller (stage1_drain) MUST iterate by word, not by line, because the
+  # env list can be either format.
+  printf '%s\n' "${LOW_PRIORITY_CONTAINERS}"
+  if [ -n "${PRIORITY_FILE}" ]; then
+    if [ -r "${PRIORITY_FILE}" ]; then
+      # Strip comments/blank lines in-place and emit each surviving line.
+      sed -e 's/#.*$//' -e '/^[[:space:]]*$/d' "${PRIORITY_FILE}"
+    else
+      _shed_log priority "${PRIORITY_FILE} set but not readable; ignoring"
+    fi
+  fi
+}
+
+# ---------------- Stage 1: Drain ----------------
+stage1_drain() {
+  # Stop low-priority containers gracefully (10s SIGTERM window). Track
+  # which actually exited to spot containers that ignored SIGTERM (which
+  # is logged but does not abort the chain — the chain continues to
+  # stage 2 regardless of stage 1 outcome, per bead spec). Words in both
+  # the env list (space-separated) and the priority file (line-separated)
+  # are iterated uniformly — word splitting handles both.
+  local stopped=0 attempted=0
+  # Collect names into an array that tolerates BOTH space-separated env
+  # values and line-separated file entries (use newline as IFS, then walk
+  # each entry, splitting on internal whitespace just in case).
+  local names=()
+  local raw=""
+  while IFS= read -r raw || [ -n "${raw}" ]; do
+    # shellcheck disable=SC2206
+    parts=( ${raw} )
+    for p in "${parts[@]}"; do
+      [ -z "${p}" ] && continue
+      case "${p}" in '#'*) continue ;; esac
+      names+=( "${p}" )
+    done
+  done < <(_shed_priority_list)
+
+  if [ "${#names[@]}" -eq 0 ]; then
+    _shed_log stage1 "summary: empty priority list; nothing to drain"
+    return 0
+  fi
+
+  local name
+  for name in "${names[@]}"; do
+    attempted=$((attempted + 1))
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${name}"; then
+      _shed_log stage1 "skip ${name} (not running)"
+      continue
+    fi
+    if _shed_dry stage1 "docker stop --time 10 ${name}"; then
+      stopped=$((stopped + 1))
+      continue
+    fi
+    if docker stop --time 10 "${name}" >/dev/null 2>>"${LOG_FILE}"; then
+      stopped=$((stopped + 1))
+      _shed_log stage1 "stopped ${name}"
+    else
+      _shed_log stage1 "docker stop ${name} failed (continuing chain)"
+    fi
+  done
+
+  _shed_log stage1 "summary: attempted=${attempted} stopped=${stopped}"
+  return 0
+}
+
+# ---------------- Stage 2: Reclaim QEMU ----------------
+# Resolve QEMU cgroup (v2 unified) and ask the kernel to release its
+# reclaimable memory. `memory.reclaim` is a no-op when RSS is already
+# below high water — safe to call repeatedly (idempotent).
+stage2_reclaim_qemu() {
+  SHED_QEMU_PID="$(pgrep -f qemu-system-x86_64 2>/dev/null | head -1 || true)"
+  if [ -z "${SHED_QEMU_PID}" ]; then
+    _shed_log stage2 "no qemu-system-x86_64 pid found — skipping reclaim"
+    return 0
+  fi
+
+  SHED_QEMU_CG="$(awk -F'::' '/^0:/{print $2; exit}' "/proc/${SHED_QEMU_PID}/cgroup" 2>/dev/null || true)"
+  if [ -z "${SHED_QEMU_CG}" ]; then
+    # Defensive fallback: also strip the `0::` prefix from any cgroup-v2 line
+    # in case the kernel format has shifted (e.g. controller id changed).
+    SHED_QEMU_CG="$(awk -F':' '{ for (i=1;i<=NF;i++) if (match($i, "^/")) { print $i; exit } }' "/proc/${SHED_QEMU_PID}/cgroup" 2>/dev/null || true)"
+  fi
+  if [ -z "${SHED_QEMU_CG}" ]; then
+    _shed_log stage2 "no cgroup line for qemu pid=${SHED_QEMU_PID} — skipping reclaim"
+    return 0
+  fi
+
+  SHED_QEMU_CG_PATH="/sys/fs/cgroup${SHED_QEMU_CG}"
+  if [ ! -w "${SHED_QEMU_CG_PATH}/memory.reclaim" ]; then
+    if _shed_dry stage2 "write 1 to ${SHED_QEMU_CG_PATH}/memory.reclaim (skipping: not writable)"; then
+      return 0
+    fi
+    _shed_log stage2 "${SHED_QEMU_CG_PATH}/memory.reclaim not writable — skipping reclaim (likely needs root or v1 cgroup)"
+    return 0
+  fi
+
+  if _shed_dry stage2 "printf 1 > ${SHED_QEMU_CG_PATH}/memory.reclaim"; then
+    return 0
+  fi
+
+  if printf '1\n' > "${SHED_QEMU_CG_PATH}/memory.reclaim" 2>>"${LOG_FILE}"; then
+    _shed_log stage2 "wrote 1 to ${SHED_QEMU_CG_PATH}/memory.reclaim (pid=${SHED_QEMU_PID})"
+  else
+    _shed_log stage2 "write to memory.reclaim failed (continuing chain)"
+  fi
+  return 0
+}
+
+# ---------------- Stage 3: Verify ----------------
+# Capture pre-stage RSS baseline, sleep, then compare against the
+# post-stage baseline. Returns 0 on >= RSS_DROP_MIN_KB drop.
+stage3_verify() {
+  local baseline now kb_drop
+  if [ -z "${SHED_QEMU_PID}" ] || ! [ -r "/proc/${SHED_QEMU_PID}/status" ]; then
+    _shed_log stage3 "no live qemu pid to verify against — cannot declare success"
+    SHED_RESULT="fail"
+    return 0
+  fi
+
+  baseline="$(awk '/^VmRSS:/{print $2; exit}' "/proc/${SHED_QEMU_PID}/status" 2>/dev/null || echo 0)"
+  _shed_log stage3 "baseline RSS=${baseline} kB (pid=${SHED_QEMU_PID}); sleeping ${SHED_VERIFY_DELAY}s"
+  sleep "${SHED_VERIFY_DELAY}"
+  now="$(awk '/^VmRSS:/{print $2; exit}' "/proc/${SHED_QEMU_PID}/status" 2>/dev/null || echo 0)"
+  kb_drop=$((baseline - now))
+  _shed_log stage3 "post-RSS=${now} kB drop=${kb_drop} kB (target>=${RSS_DROP_MIN_KB})"
+
+  if [ "${kb_drop}" -ge "${RSS_DROP_MIN_KB}" ]; then
+    SHED_RESULT="ok"
+  else
+    SHED_RESULT="fail"
+  fi
+  return 0
+}
+
+# ---------------- Stage 4: Escalate ----------------
+# Marker file (world-readable so watchdog without sudo can read it),
+# CRITICAL log line, and non-zero exit. Idempotent: rewriting a present
+# flag refreshes its mtime but does not change the meaning.
+stage4_escalate() {
+  mkdir -p "${SHED_FLAG_DIR}" 2>/dev/null || true
+  chmod 0755 "${SHED_FLAG_DIR}" 2>/dev/null || true
+
+  local ts reason pressure streak_info
+  ts="$(date -u +%FT%TZ)"
+  pressure="${full_avg10:-n/a}"
+  streak_info="${streak:-n/a}"
+  reason="qemu RSS did not drop >= ${RSS_DROP_MIN_KB} kB after stage1+stage2 (full avg10=${pressure}, streak=${streak_info})"
+  if _shed_dry stage4 "write escalation flag ${SHED_FLAG_FILE} (reason=${reason})"; then
+    return 0
+  fi
+
+  # Atomically (to the extent `install` allows) write a 0644 flag with the
+  # reason embedded so the watchdog / next boot can read it directly.
+  umask 0222 || true   # ensure resulting file is world-readable
+  printf 'shed_escalate_at=%s reason=%s\n' "${ts}" "${reason}" > "${SHED_FLAG_FILE}.tmp" 2>>"${LOG_FILE}" \
+    && mv -f "${SHED_FLAG_FILE}.tmp" "${SHED_FLAG_FILE}" 2>>"${LOG_FILE}" \
+    || _shed_log stage4 "failed to write escalation flag at ${SHED_FLAG_FILE}"
+  chmod 0644 "${SHED_FLAG_FILE}" 2>/dev/null || true
+
+  _shed_log stage4 "CRITICAL ${reason}; escalation flag written to ${SHED_FLAG_FILE}"
+  return 1   # signal the caller that chain did not free enough memory
+}
+
+# ---------------- Dispatcher ----------------
+run_shed_stages() {
+  SHED_RESULT=""
+  _shed_log chain "begin dry_run=${DRY_RUN} priority_file='${PRIORITY_FILE}' low_priority='${LOW_PRIORITY_CONTAINERS}'"
+  stage1_drain
+  stage2_reclaim_qemu
+  stage3_verify
+  if [ "${SHED_RESULT}" = "ok" ]; then
+    _shed_log chain "OK — watchdog may continue to wait; suppressing per-process SIGTERM fallback"
+    return 0
+  fi
+  stage4_escalate || return 1
+  return 0
+}
+
+# ---------------- CLI surface for the shed block ----------------
+# Allow `scripts/host/psi-oom-watcher.sh --shed` to run ONLY the shed
+# dispatch (outside the polling loop) for hand-driven pressure tests.
+# Also parse --dry-run / --priority-file flags at top level BEFORE the
+# normal watcher loop, so the existing dry-run path keeps its meaning.
+_parse_shed_args() {
+  while [ "${1:-}" != "" ]; do
+    case "$1" in
+      --dry-run) DRY_RUN=1 ;;
+      --priority-file) shift; PRIORITY_FILE="${1:-}" ;;
+      --priority-file=*) PRIORITY_FILE="${1#--priority-file=}" ;;
+      --shed) _shed_mode=1 ;;
+      --help|-h) _shed_show_help=1 ;;
+      *) ;;  # silently ignore unknown — the watcher accepts positional args historically
+    esac
+    shift || true
+  done
+}
+
+_shed_show_help() {
+  cat <<EOF
+psi-oom-watcher.sh — PSI early-warning + staged QEMU/RSS shed (R3 lane J)
+
+Polling mode (default):
+  scripts/host/psi-oom-watcher.sh             # run one polling tick
+  DRY_RUN=1 scripts/host/psi-oom-watcher.sh   # one polling tick, log only
+
+Shed chain (R3 lane J, ez-gh-actions-6478):
+  scripts/host/psi-oom-watcher.sh --shed [--dry-run] \\
+    [--priority-file /path/to/low-priority.list]
+
+Environment:
+  WARN_THRESHOLD, CRIT_THRESHOLD, CRIT_CONSECUTIVE, COOLDOWN_SEC
+  LOW_PRIORITY_CONTAINERS  space-separated list (default has 4)
+  PRIORITY_FILE            optional list file (one name per line, # comments)
+  RSS_DROP_MIN_KB          verify threshold (default 1048576 = 1 GiB)
+  SHED_VERIFY_DELAY        seconds between reclaim and verify (default 5)
+  DRY_RUN                  1 = no-op every stage, log only
+
+Stages:
+  1 drain     — docker stop --time 10 <name> for each low-priority container
+  2 reclaim   — printf 1 > <qemu-cgroup>/memory.reclaim (kernel, no signal)
+  3 verify    — sleep SHED_VERIFY_DELAY, measure qemu VmRSS, drop >= RSS_DROP_MIN_KB
+  4 escalate  — write world-readable flag at \${SHED_FLAG_FILE}, log CRITICAL
+EOF
+}
+
+# Now that all shed functions are defined, parse CLI flags and short-circuit
+# --help / --shed modes BEFORE the PSI read so they work even when
+# /proc/pressure/memory is missing (e.g. macOS smoke test, CI environment).
+_parse_shed_args "$@"
+
+if [ "${_shed_show_help:-0}" = "1" ]; then
+  _shed_show_help
+  exit 0
+fi
+if [ "${_shed_mode:-0}" = "1" ]; then
+  log "shed-mode invoked (dry_run=${DRY_RUN} priority_file='${PRIORITY_FILE}')"
+  if run_shed_stages; then
+    log "shed-mode: SHED_RESULT=${SHED_RESULT}"
+    exit 0
+  fi
+  log "shed-mode: SHED_RESULT=${SHED_RESULT} (chain failed; watchdog-wait flag raised)"
+  exit 1
+fi
+
 
 if [ ! -r "${PSI_FILE}" ]; then
   log "PSI file ${PSI_FILE} not readable — kernel may lack CONFIG_PSI, or this is not Linux. Exiting without action."
@@ -279,6 +595,19 @@ if [ "${DRY_RUN}" = "1" ]; then
   exit 0
 fi
 
+# R3 lane J (ez-gh-actions-6478): when PSI_SHED_CHAIN is set, run the staged
+# shed chain FIRST. If it recovers enough memory, the watchdog stays armed
+# and the per-process SIGTERM fallback below is suppressed for this tick.
+if [ -n "${PSI_SHED_CHAIN}" ]; then
+  if run_shed_stages && [ "${SHED_RESULT}" = "ok" ]; then
+    log "ACTION(staged-shed): SHED_RESULT=ok — per-process SIGTERM fallback suppressed for this tick (cooldown still armed; full avg10=${full_avg10}%, streak=${streak}/${CRIT_CONSECUTIVE})"
+    echo "${now_epoch}" > "${COOLDOWN_MARKER}"
+    rm -f "${STREAK_FILE}"
+    exit 0
+  fi
+  log "ACTION(staged-shed): SHED_RESULT=${SHED_RESULT:-fail} — falling through to per-process SIGTERM fallback"
+fi
+
 log "ACTION: sending SIGTERM to pid=${target_pid} comm=${target_comm} rss=${target_rss_mb}MB — sustained memory pressure full avg10=${full_avg10}% for ${streak} consecutive polls. Cooldown ${COOLDOWN_SEC}s starts now."
 if kill -TERM "${target_pid}" 2>>"${LOG_FILE}"; then
   log "SIGTERM delivered to pid=${target_pid}."
@@ -288,3 +617,4 @@ fi
 
 echo "${now_epoch}" > "${COOLDOWN_MARKER}"
 rm -f "${STREAK_FILE}"
+
