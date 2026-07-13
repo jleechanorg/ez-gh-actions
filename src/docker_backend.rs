@@ -1234,16 +1234,22 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
             // some kernels do this for readability).
             return true;
         }
-        if cols.len() >= 4 && !cols[0].starts_with('#') {
-            // v1 `/proc/cgroups` row: name hierarchy num_cgroups enabled.
-            // Process v1 rows under the strict enabled-first gate, and
-            // explicitly skip the v2 list-token fallback for v1-shaped
-            // rows — otherwise a disabled v1 row with name="cpu" would
-            // be caught by the v2 `contains("cpu")` check below, exactly
-            // the regression the cold review flagged. A v1 row is shaped
-            // "name hier num enabled" so the trailing column is a
-            // 0/1 flag, not another controller token.
-            if cols[3] != "1" {
+        // Distinguish v1 row vs v2 list BEFORE applying either check —
+        // v1 `/proc/cgroups` rows end with "0" or "1"; v2 controllers
+        // lists end with a controller name. Without this disambiguation,
+        // a v2 line like "cpuset cpu io memory hugetlb pids rdma misc"
+        // (7 tokens, trailing token "misc") matches `cols.len() >= 4`
+        // but `cols[3] != "1"`, so the v1 branch would skip it forever
+        // and the v2 `contains("cpu")` fallback would never run. That is
+        // exactly the regression the live fleet just hit: the daemon's
+        // first probe cached false and refused to start runners for 5
+        // minutes (the new TTL cache from round-3 lane E3).
+        let last = cols[cols.len() - 1];
+        let is_v1_row = cols.len() >= 4
+            && !cols[0].starts_with('#')
+            && (last == "0" || last == "1");
+        if is_v1_row {
+            if last != "1" {
                 // Disabled controller — must NOT count, even if its
                 // name happens to be "cpu" or "cpu,cpuacct" / "cpu,...".
                 continue;
@@ -1254,9 +1260,10 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
             if cols[0] == "cpu" || cols[0] == "cpu,cpuacct" || cols[0].starts_with("cpu,") {
                 return true;
             }
-        } else if cols.len() >= 2 && !cols[0].starts_with('#') {
+            continue;
+        }
+        if cols.len() >= 2 && !cols[0].starts_with('#') {
             // v2 single-line space-separated list: any token equal to "cpu".
-            // Skip the v1 header line "#subsys_name hierarchy num_cgroups enabled".
             if cols.contains(&"cpu") {
                 return true;
             }
