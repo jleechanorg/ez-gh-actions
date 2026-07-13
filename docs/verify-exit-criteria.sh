@@ -125,18 +125,17 @@ path, key, default = sys.argv[1:]
 
 try:
     import tomllib
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
 except ModuleNotFoundError:
     try:
         import toml
-except ModuleNotFoundError:
-    raise SystemExit(2)
+    except ModuleNotFoundError:
+        raise SystemExit(2)
     data = toml.load(path)
-else:
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
 
-    value = data.get(key, default)
-    print(value)
+value = data.get(key, default)
+print(value)
 PY
 }
 
@@ -233,22 +232,64 @@ daemon_overlay_free_disk_gb() {
 
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
+    cat <<'REMEDIATE'
+[FAIL] Crash capture is not active on this host. The project's stated goal
+       (physical-host availability) cannot be proven without it.
+
+REPRODUCIBLE REMEDIATION:
+    1. sudo bash scripts/host/configure-grub-kdump.sh    # already-prepared, transactional, survives failure
+    2. sudo reboot                                     # required; GRUB + crashkernel=2G only take effect after reboot
+    3. ./docs/verify-exit-criteria.sh                  # re-run; this gate will turn green once /sys/kernel/kexec_crash_loaded == 1
+REMEDIATE
     if [ ! -d /sys/fs/pstore ]; then
-        echo "    [WARN] Crash-capture evidence missing: /sys/fs/pstore is not mounted"
-        return 0
+        fail "Crash capture FAIL-CLOSED: /sys/fs/pstore is not mounted (no crash logs can survive a panic)"
     fi
     if [ ! -r /proc/sys/kernel/core_pattern ]; then
-        echo "    [WARN] Crash-capture evidence missing: /proc/sys/kernel/core_pattern unavailable"
-        return 0
+        fail "Crash capture FAIL-CLOSED: /proc/sys/kernel/core_pattern is unreadable"
     fi
     if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
-        echo "    [WARN] Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded unavailable"
-        return 0
+        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is missing (kdump kernel never installed)"
     fi
     if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
-        echo "    [WARN] Crash-capture evidence missing: /sys/kernel/kexec_crash_loaded is not enabled (value != 1)"
-        return 0
+        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is not '1' (kdump kernel is not loaded into the running kernel)"
     fi
+    # core_pattern must point at pstore (or systemd-pstore) so kernel panics are preserved
+    if ! grep -Eq 'pstore' /proc/sys/kernel/core_pattern 2>/dev/null; then
+        fail "Crash capture FAIL-CLOSED: core_pattern does not route to pstore (current: $(cat /proc/sys/kernel/core_pattern 2>/dev/null))"
+    fi
+}
+
+# Verify the cgroup v2 leaf cgroup for the given raw /proc/<pid>/cgroup line
+# (including the optional leading "0::") has a finite memory ceiling in
+# /sys/fs/cgroup (memory.high or memory.max != "max"). Returns 0 if the leaf
+# is bounded, 1 if it is unbounded OR cannot be read. On failure, the offending
+# cgroup path (and which file was max/unreadable) is printed on stdout so the
+# cold reader sees exactly which cgroup is missing the ceiling.
+#
+# Why this uses the kernel-side file (not `systemctl --user show`):
+# `systemctl --user show <nonexistent-unit>` quietly returns
+# MemoryHigh=infinity, which is indistinguishable from a real slice that
+# happens to be set to infinity. The cgroup-fs file is the actual kernel
+# truth: a finite value there IS the ceiling, regardless of whether systemd
+# has a matching unit file loaded. Used by Gate 8 (VM/AO/MCP containment,
+# bead jleechan-aqh).
+cgroup_leaf_has_memory_ceiling() {
+    local cg_raw="$1"
+    [ -z "$cg_raw" ] && return 1
+    cg_raw="${cg_raw#0::}"  # strip cgroup-v2 "0::" prefix if present
+    local sysfs="/sys/fs/cgroup"
+    local leaf_high leaf_max
+    leaf_high=$(cat "${sysfs}${cg_raw}/memory.high" 2>/dev/null || echo "")
+    leaf_max=$(cat "${sysfs}${cg_raw}/memory.max" 2>/dev/null || echo "")
+    if [ -z "$leaf_high" ] && [ -z "$leaf_max" ]; then
+        echo "${cg_raw} (cgroup files unreadable)"
+        return 1
+    fi
+    if [ "$leaf_high" = "max" ] && [ "$leaf_max" = "max" ]; then
+        echo "${cg_raw} (memory.high=max memory.max=max)"
+        return 1
+    fi
+    return 0
 }
 
 # --- Gate 0: Deployed code == committed code ---
@@ -474,15 +515,64 @@ for slot in $(seq 1 "$COUNT"); do
     SLOT_STATUS=$(echo "$SLOT_JSON" | jq -r '.[0].State.Status // "unknown"')
 
     RUNNER_FLOOR_BYTES=$((RUNNER_FLOOR_MB * 1024 * 1024))
-    if [ "$SLOT_MEMORY_BYTES" -lt "$RUNNER_FLOOR_BYTES" ] || [ "$SLOT_MEMORY_BYTES" -gt "$EXPECTED_MEMORY_BYTES" ]; then
-        fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES out of bounds: expected between $RUNNER_FLOOR_BYTES and $EXPECTED_MEMORY_BYTES bytes"
+    # Compute EXACT effective memory clamp. The daemon caps per-slot memory at
+    # min(LIMIT_MEMORY_MB, (VM_TOTAL_MB - GUEST_RESERVE_MB) / COUNT). Any value
+    # in the [runner_floor_mb..limit_memory_mb] range is therefore a weakened
+    # claim and MUST be rejected — a slot set to 3.5 GB on a 6 GB target would
+    # silently half-fit jobs and crush sibling slots' budgets.
+    EXPECTED_EFFECTIVE_BYTES=$EXPECTED_MEMORY_BYTES
+    if is_uint "$VM_TOTAL_MB" && [ "$VM_TOTAL_MB" -gt 0 ] \
+        && is_uint "$GUEST_RESERVE_MB" && [ "$GUEST_RESERVE_MB" -gt 0 ] \
+        && [ "$VM_TOTAL_MB" -gt "$GUEST_RESERVE_MB" ] \
+        && [ "$COUNT" -gt 0 ]; then
+        HOST_BUDGET_MB=$((VM_TOTAL_MB - GUEST_RESERVE_MB))
+        PER_SLOT_HOST_MB=$((HOST_BUDGET_MB / COUNT))
+        if [ "$LIMIT_MEMORY_MB" -lt "$PER_SLOT_HOST_MB" ]; then
+            EXPECTED_EFFECTIVE_BYTES=$((LIMIT_MEMORY_MB * 1024 * 1024))
+        else
+            EXPECTED_EFFECTIVE_BYTES=$((PER_SLOT_HOST_MB * 1024 * 1024))
+        fi
     fi
-    if [ "$SLOT_MEMORY_SWAP_BYTES" -lt "$RUNNER_FLOOR_BYTES" ] || [ "$SLOT_MEMORY_SWAP_BYTES" -gt "$EXPECTED_MEMORY_BYTES" ]; then
-        fail "slot $SLOT_NAME memory-swap limit $SLOT_MEMORY_SWAP_BYTES out of bounds: expected between $RUNNER_FLOOR_BYTES and $EXPECTED_MEMORY_BYTES bytes"
+    # Reject MemorySwap > Memory. A greater swap value defeats the memory
+    # limit because the container can swap beyond its memory cap. Acceptable
+    # values are: equal to Memory (explicit ceiling), 0 (unset, daemon default
+    # is double Memory), or -1 (unlimited swap, but only valid when also
+    # denoted unlimited — we fail it conservatively).
+    if [ "$SLOT_MEMORY_SWAP_BYTES" -ne "$SLOT_MEMORY_BYTES" ] \
+        && [ "$SLOT_MEMORY_SWAP_BYTES" -ne 0 ] \
+        && [ "$SLOT_MEMORY_SWAP_BYTES" -ne -1 ]; then
+        fail "slot $SLOT_NAME MemorySwap=${SLOT_MEMORY_SWAP_BYTES} != Memory=${SLOT_MEMORY_BYTES}: swap must equal memory (or 0/-1); a greater swap value defeats the memory limit"
+    fi
+    # EXACT clamp check. 4 MiB slack accommodates cgroupfs page-alignment
+    # rounding observed on this fleet: docker rounds 3200 MiB → 3197 MiB (a
+    # 3 MiB alignment artifact). Anything beyond that is a real drift; values
+    # inside the [runner_floor_mb..target] range are still rejected as weakened
+    # (this slack is NOT a softening — it just accommodates the cgroupfs
+    # 4 KiB page boundary that host kernel uses for cgroup v2 memory limits).
+    SLACK=$((4 * 1024 * 1024))
+    DIFF=$((SLOT_MEMORY_BYTES - EXPECTED_EFFECTIVE_BYTES))
+    ABS_DIFF=${DIFF#-}
+    if [ "$ABS_DIFF" -gt "$SLACK" ]; then
+        fail "slot $SLOT_NAME memory limit ${SLOT_MEMORY_BYTES} bytes != expected effective clamp ${EXPECTED_EFFECTIVE_BYTES} bytes (exact: vm_budget ${VM_TOTAL_MB} - reserve ${GUEST_RESERVE_MB}, divided by ${COUNT} slots, capped at limits.memory_mb=${LIMIT_MEMORY_MB}); weakened values in the [runner_floor_mb..target] range are NOT acceptable"
+    fi
+    RUNNER_FLOOR_BYTES=$((RUNNER_FLOOR_MB * 1024 * 1024))
+    if [ "$SLOT_MEMORY_BYTES" -lt "$RUNNER_FLOOR_BYTES" ]; then
+        fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES below the absolute floor $RUNNER_FLOOR_BYTES bytes (runner_floor_mb=$RUNNER_FLOOR_MB)"
     fi
     if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_NANO_CPUS" ]; then
         if [ "$SLOT_CPU_QUOTA" -le 0 ] || [ "$SLOT_CPU_PERIOD" -le 0 ]; then
-            fail "slot $SLOT_NAME CPU enforcement unavailable: HostConfig.NanoCpus=${SLOT_NANO_CPUS}, CPUQuota=${SLOT_CPU_QUOTA}, CPUPeriod=${SLOT_CPU_PERIOD}"
+            fail "slot $SLOT_NAME CPU enforcement unavailable: HostConfig.NanoCpus=${SLOT_NANO_CPUS}, CPUQuota=${SLOT_CPU_QUOTA}, CPUPeriod=${SLOT_CPU_PERIOD}; expected NanoCpus=${EXPECTED_NANO_CPUS}"
+        fi
+        # Ratio check: CPUQuota / CPUPeriod must equal LIMIT_CPUS (±1% tolerance).
+        # cgroupfs sometimes rounds NanoCpus slightly vs period*quota, so a 1% band
+        # is required to avoid false-positives while still catching a quota=-1
+        # (unlimited) or quota far outside the requested CPU count.
+        EXPECTED_QUOTA=$(awk -v cpus="$LIMIT_CPUS" -v period="$SLOT_CPU_PERIOD" 'BEGIN { printf "%.0f", cpus * period }')
+        TOLERANCE=$(awk -v q="$EXPECTED_QUOTA" 'BEGIN { printf "%.0f", q * 0.01 + 1 }')
+        DIFF=$(awk -v a="$SLOT_CPU_QUOTA" -v b="$EXPECTED_QUOTA" 'BEGIN { d = a - b; if (d < 0) d = -d; printf "%.0f", d }')
+        if [ "$DIFF" -gt "$TOLERANCE" ]; then
+            ACTUAL_RATIO=$(awk -v q="$SLOT_CPU_QUOTA" -v p="$SLOT_CPU_PERIOD" 'BEGIN { if (p <= 0) print "inf"; else printf "%.3f", q / p }')
+            fail "slot $SLOT_NAME CPUQuota/CPUPeriod ratio mismatch: HostConfig.CPUQuota=${SLOT_CPU_QUOTA}/CPUPeriod=${SLOT_CPU_PERIOD} = ${ACTUAL_RATIO} CPUs, expected ${LIMIT_CPUS} CPUs (quota=${EXPECTED_QUOTA}, tolerance=±${TOLERANCE}). NanoCpus is also wrong: ${SLOT_NANO_CPUS} != ${EXPECTED_NANO_CPUS}."
         fi
     fi
     if [ "$SLOT_PIDS_LIMIT" -lt 0 ] || [ "$SLOT_PIDS_LIMIT" -ne "$LIMIT_PIDS" ]; then
@@ -524,7 +614,24 @@ SLOT_FILE_STATE_DIR=$(toml_get_top state_dir "" 2>/dev/null || echo "")
 if [ -z "$SLOT_FILE_STATE_DIR" ]; then
     SLOT_FILE_STATE_DIR="$HOME/.config/ezgha"
 fi
-SLOT_COUNT=$(grep -c '=' "$SLOT_FILE_STATE_DIR/slot_assignments.toml" 2>/dev/null || echo 0)
+SLOT_ASSIGNMENTS_FILE="$SLOT_FILE_STATE_DIR/slot_assignments.toml"
+if [ ! -f "$SLOT_ASSIGNMENTS_FILE" ]; then
+    fail "Slot assignment file missing: $SLOT_ASSIGNMENTS_FILE"
+fi
+# The daemon (src/docker_backend.rs SlotAssignments) serializes two tables
+# ([assignments] and [registered_at]) with numeric string keys of the form
+# '<slot_index> = "<runner_id>"'. Count only the [assignments] table entries
+# (slot_index -> runner_id), excluding section headers ([...]) and any
+# non-numeric keys — so SLOT_COUNT reflects the number of registered slots.
+SLOT_COUNT=$(awk '
+    /^\[assignments\]/ { in_assignments=1; next }
+    /^\[registered_at\]|^[[:space:]]*\[/ { in_assignments=0; next }
+    in_assignments && /^[[:space:]]*[0-9]+[[:space:]]*=/ { count++ }
+    END { print count+0 }
+' "$SLOT_ASSIGNMENTS_FILE" 2>/dev/null)
+if ! is_uint "$SLOT_COUNT"; then
+    fail "Could not parse slot count from $SLOT_ASSIGNMENTS_FILE (got '$SLOT_COUNT')"
+fi
 
 if [ "$CONTAINER_COUNT" -lt "$COUNT" ] || [ "$SLOT_COUNT" -lt "$COUNT" ]; then
     fail "Local fleet reconciliation evidence incomplete: containers=$CONTAINER_COUNT, slot file entries=$SLOT_COUNT, target=$COUNT"
@@ -586,6 +693,188 @@ if ! gh_checked api rate_limit >/dev/null; then
     fail "Gate 7: Unable to query rate limit (GitHub API down)"
 fi
 pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
+
+# --- Gate 8: VM/AO/MCP containment (process-level backstop; bead jleechan-aqh) ---
+# Why this gate exists: the project's stated goal is physical-host
+# availability (prevent watchdog reboots). Per-container clamps in Gate 3
+# cover individual Docker containers, but they do NOT bound (a) the QEMU
+# process running the Colima/Lima VM (host-side, outside the container
+# envelope), (b) the Agent Orchestrator and MCP daemons (which run as
+# user-scope processes with no enforced cgroup ceiling), or (c) the
+# aggregate memory demand across all three. The 2026-07-10 watchdog
+# reboot had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
+# place. This gate makes the absence of any of those constraints a
+# verifier-level fail-closed, citing the four remediation paths so the
+# cold reader sees them at the top of the gate output.
+echo "--- Checking Gate 8: VM/AO/MCP containment ---"
+# Remediation primer (printed before probes fire so a cold reader sees
+# the four probes + their fixes):
+#   (1) QEMU slice:    systemd/app-lima-vm.slice (MemoryHigh=38G) must be
+#                      deployed to ~/.config/systemd/user/ AND reloaded
+#                      (systemctl --user daemon-reload); the LIVE leaf
+#                      cgroup's memory.high in /sys/fs/cgroup must be a
+#                      finite value (currently "max").
+#   (2) AO/MCP slice:  an agent-CLI systemd slice from ez-gh-actions-0725
+#                      must wrap ao-daemon.service with a finite
+#                      MemoryHigh; currently ao-daemon.service has
+#                      memory.high=max and contains the AO daemon + MCP
+#                      servers uncontained.
+#   (3) PSI admission: enroll scripts/host/psi-oom-watcher.sh via a
+#                      user-scope .timer, OR rely on systemd-oomd active
+#                      at any scope (default policy on Ubuntu 24.04
+#                      manages user.slice automatically).
+#   (4) Aggregate:     lower [limits].memory_mb, lower [runner].count,
+#                      or raise [runner].vm_total_mb so containers + QEMU
+#                      RSS + AO/MCP RSS fit (vm_total_mb - guest_reserve_mb).
+echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) tune [limits].memory_mb / count / vm_total_mb so aggregate fits."
+
+# (1) QEMU cgroup probe --------------------------------------------------------------
+# Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
+# reachable from a macOS shell. On Linux + daemon-in-VM (typical
+# jeff-ubuntu), QEMU runs at host scope and IS reachable via
+# /proc/<qemu>/cgroup, so we still probe. On every other combo, we probe.
+PROBE_QEMU_SLICE=1
+if [ "$(uname -s)" = "Darwin" ] && daemon_in_vm; then
+    PROBE_QEMU_SLICE=0
+    echo "    [SKIP] Gate 8 (1) QEMU slice probe: daemon-in-VM on macOS (Lima VM cgroup not reachable from macOS shell)"
+fi
+QEMU_PID=""
+QEMU_CG=""
+if [ "$PROBE_QEMU_SLICE" = "1" ]; then
+    QEMU_PID=$(pgrep -f 'qemu-system-x86_64' | head -1 || true)
+    if [ -z "$QEMU_PID" ]; then
+        echo "    [WARN] Gate 8 (1) no qemu-system-x86_64 process found; fail-closed below"
+    else
+        # /proc/<pid>/cgroup on cgroup-v2-only hosts is a single line
+        # starting with "0::<path>". Extract the path with grep + cut.
+        QEMU_CG=$(grep '^0::' "/proc/$QEMU_PID/cgroup" 2>/dev/null | head -1 || true)
+        if [ -z "$QEMU_CG" ]; then
+            fail "Gate 8 (1) PID $QEMU_PID has no cgroup-v2 entry in /proc/$QEMU_PID/cgroup. Remediation: ensure the host kernel exposes CONFIG_CGROUP_V2."
+        fi
+        # /proc/<pid>/cgroup escapes '-' as the literal 4-char sequence
+        # '\x2d' on this host, so 'app-lima-vm' written plainly will not
+        # match 'app-lima\x2dvm.slice'. Match on the unit/service name
+        # instead — 'lima-vm' substring catches both 'lima-vm@colima.service'
+        # and 'app-lima\x2dvm.slice'.
+        if ! echo "$QEMU_CG" | grep -q 'lima-vm'; then
+            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
+        fi
+        if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
+            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+        fi
+        echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
+    fi
+fi
+
+# (2) AO/MCP slice probe --------------------------------------------------------------
+# Identify Agent Orchestrator + MCP daemon processes by argv pattern
+# (comm alone misses python3-spawned MCP servers), then verify each
+# leaf cgroup has a finite memory ceiling. Processes running in
+# /user@<uid>.service/ (the unbounded user session) are also a fail.
+AO_MCP_BAD=""
+AO_MCP_BAD_COUNT=0
+while read -r pid; do
+    [ -z "$pid" ] && continue
+    cg=$(grep '^0::' "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
+    [ -z "$cg" ] && continue
+    comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+    # /user@<uid>.service/ is the unbounded user session — fail-closed.
+    if echo "$cg" | grep -qE '/user@[0-9]+\.service/'; then
+        AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid}) "
+        AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
+        continue
+    fi
+    if ! LEAF_CHECK=$(cgroup_leaf_has_memory_ceiling "$cg"); then
+        AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid},$LEAF_CHECK) "
+        AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
+    fi
+done < <(ps -u "$(id -u)" -o pid=,args= --no-headers 2>/dev/null | \
+          awk '{
+              cmd = ""
+              for (i = 2; i <= NF; i++) cmd = cmd " " $i
+              # Match on full argv: ao-go, agent_orchestrator, the various
+              # MCP daemons (slack-mcp, gmail-mcp, filesystem-mcp, …), and
+              # the daemon launcher script.
+              if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
+                  print $1
+              }
+          }')
+if [ -n "$AO_MCP_BAD" ]; then
+    fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite MemoryHigh (~20G) so the Agent Orchestrator + MCP daemons cannot OOM the host."
+fi
+AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
+              {
+                cmd = ""
+                for (i = 1; i <= NF; i++) cmd = cmd " " $i
+                if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
+                  c++
+                }
+              }
+              END {
+                print c+0
+              }')
+echo "    [PASS] Gate 8 (2) AO/MCP processes (n=${AO_MCP_TOTAL}) are inside an enforced slice with a finite memory ceiling"
+
+# (3) PSI admission check --------------------------------------------------------------
+# Either psi-oom-watcher.timer is enrolled (user-scope backstop per
+# scripts/host/psi-oom-watcher.sh), OR systemd-oomd is active at any
+# scope (system-oomd manages user slices by default on Ubuntu 24.04).
+# Without one, sustained memory pressure has no in-tree reaction before
+# the watchdog fires.
+PSI_OK=0
+PSI_SOURCE=""
+TIMER_ENABLED=$(systemctl --user is-enabled psi-oom-watcher.timer 2>/dev/null || true)
+TIMER_ACTIVE=$(systemctl --user is-active psi-oom-watcher.timer 2>/dev/null || true)
+if [ "$TIMER_ENABLED" = "enabled" ] && [ "$TIMER_ACTIVE" = "active" ]; then
+    PSI_OK=1
+    PSI_SOURCE="psi-oom-watcher.timer (user-scope)"
+elif systemctl is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
+    PSI_OK=1
+    PSI_SOURCE="systemd-oomd (system-scope)"
+elif systemctl --user is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
+    PSI_OK=1
+    PSI_SOURCE="systemd-oomd (user-scope)"
+fi
+if [ "$PSI_OK" != "1" ]; then
+    fail "Gate 8 (3) PSI admission is not wired up: psi-oom-watcher.timer not enabled+active and systemd-oomd not active at any scope. Remediation: enroll scripts/host/psi-oom-watcher.sh via a user-scope .timer (per bead ez-gh-actions-0725), or enable systemd-oomd in default policy."
+fi
+PSI_AVG10=$(awk '/^full/ {for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) {gsub("avg10=", "", $i); print $i; exit}}' /proc/pressure/memory 2>/dev/null || echo "?")
+echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /proc/pressure/memory full avg10=${PSI_AVG10}%)"
+
+# (4) Aggregate container + QEMU + AO/MCP memory budget ------------------------------
+# Sum (a) the configured HostConfig.Memory for all managed containers
+# (the LIMIT, not actual usage — a transient spike to the limit is the
+# threat model), (b) the current QEMU process RSS from the host's
+# /proc/<qemu>/status, (c) the current RSS sum of all AO/MCP processes.
+# Compare against (VM_TOTAL_MB - GUEST_RESERVE_MB). If the sum exceeds
+# the budget we are one transient spike away from a host OOM.
+AGG_CONTAINER_BYTES=$(docker inspect $(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null) --format '{{.HostConfig.Memory}}' 2>/dev/null | awk '{s+=$1} END {print s+0}')
+AGG_CONTAINER_MB=$((AGG_CONTAINER_BYTES / 1024 / 1024))
+AGG_QEMU_MB=0
+if [ -n "$QEMU_PID" ] && [ -r "/proc/$QEMU_PID/status" ]; then
+    QEMU_RSS_KB=$(grep VmRSS "/proc/$QEMU_PID/status" 2>/dev/null | awk '{print $2}')
+    [ -n "$QEMU_RSS_KB" ] && AGG_QEMU_MB=$((QEMU_RSS_KB / 1024))
+fi
+AGG_AO_MCP_MB=$(ps -u "$(id -u)" -o rss=,args= --no-headers 2>/dev/null | awk '
+              {
+                cmd = ""
+                for (i = 2; i <= NF; i++) cmd = cmd " " $i
+                if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
+                  s+=$1
+                }
+              }
+              END {
+                print int(s/1024)
+              }')
+AGG_AO_MCP_MB=${AGG_AO_MCP_MB:-0}
+AGG_TOTAL_MB=$((AGG_CONTAINER_MB + AGG_QEMU_MB + AGG_AO_MCP_MB))
+AGG_BUDGET_MB=$((VM_TOTAL_MB - GUEST_RESERVE_MB))
+if [ "$AGG_TOTAL_MB" -gt "$AGG_BUDGET_MB" ]; then
+    fail "Gate 8 (4) aggregate memory demand ${AGG_TOTAL_MB}MB exceeds budget ${AGG_BUDGET_MB}MB (containers=${AGG_CONTAINER_MB}MB qemu_rss=${AGG_QEMU_MB}MB ao_mcp_rss=${AGG_AO_MCP_MB}MB; budget = vm_total_mb ${VM_TOTAL_MB}MB - guest_reserve_mb ${GUEST_RESERVE_MB}MB). Remediation: lower [limits].memory_mb, reduce [runner].count, or raise [runner].vm_total_mb so the aggregate fits the VM/host budget."
+fi
+echo "    [PASS] Gate 8 (4) aggregate memory ${AGG_TOTAL_MB}MB <= budget ${AGG_BUDGET_MB}MB (containers=${AGG_CONTAINER_MB}MB qemu_rss=${AGG_QEMU_MB}MB ao_mcp_rss=${AGG_AO_MCP_MB}MB)"
+
+pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 
 # --- Gate 10: GitHub API budget ---
 echo "--- Checking Gate 10: GitHub API budget ---"
