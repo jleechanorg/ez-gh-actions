@@ -1,10 +1,31 @@
 # app-lima-vm.slice — user-scope memory ceiling for the Colima/Lima VM QEMU process.
 # Part of bead jleechan-aqh (apply and verify limits against the actual QEMU cgroup).
+#
+# DefaultMemoryHigh (NOT MemoryHigh) on purpose: a slice's MemoryHigh applies
+# to the slice's OWN cgroup, not its children. DefaultMemoryHigh is the
+# inherited ceiling pushed to every descendant cgroup that does not set its
+# own MemoryHigh. That is what we want — the lima-vm@colima.service unit
+# inside this slice will pick up 38G without any drop-in modification.
+#
+# Per repo CLAUDE.md "Self-Outage Prevention Principle": a *soft* MemoryHigh
+# (throttle + reclaim) is preferred over MemoryMax (SIGKILL), because a hard
+# kill of the VM under memory pressure would itself take down every container
+# the fleet depends on — turning a guard into the outage it was meant to
+# prevent. 38 GiB is set above the VM's static 36 GiB allocation so the
+# ceiling only activates on a runaway beyond what the VM is sized for.
+#
+# Installation (no sudo, user-scope):
+#   cp systemd/app-lima-vm.slice ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user restart lima-vm@colima.service
+# Then verify:
+#   cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-lima\\x2dvm.slice/lima-vm@colima.service/memory.high
+# should print 40802189312 (= 38 GiB).
 
 [Unit]
-Description=Colima/Lima VM QEMU process slice — soft memory ceiling
+Description=Colima/Lima VM QEMU process slice — soft inherited memory ceiling
 Before=slices.target
 
 [Slice]
-MemoryHigh=38G
+DefaultMemoryHigh=38G
 MemoryAccounting=yes
