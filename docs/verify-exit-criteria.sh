@@ -240,6 +240,13 @@ REPRODUCIBLE REMEDIATION:
     1. sudo bash scripts/host/configure-grub-kdump.sh    # already-prepared, transactional, survives failure
     2. sudo reboot                                     # required; GRUB + crashkernel=2G only take effect after reboot
     3. ./docs/verify-exit-criteria.sh                  # re-run; this gate will turn green once /sys/kernel/kexec_crash_loaded == 1
+                                                       # After reboot, kexec_crash_loaded should read 1.
+
+OPERATIONAL PROOF (separate from this gate's check):
+    Once rebooted, run scripts/host/crash-capture-verify.sh --force (after --dry-run)
+    to confirm a vmcore lands in /var/crash; this is the OPERATIONAL proof that kdump works.
+    Then run scripts/host/crash-capture-verify.sh --verify <stamp> --no-trigger after
+    the post-panic reboot to close bead ez-gh-actions-r3f15.
 REMEDIATE
     # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
     #     it routes only userspace coredumps (SIGSEGV in a process), NOT
@@ -315,6 +322,48 @@ cgroup_leaf_has_memory_ceiling() {
         echo "${cg_raw} (memory.high=max memory.max=max)"
         return 1
     fi
+    return 0
+}
+
+# Probe the Colima/Lima VM running on a remote Mac host. Returns 0 if the
+# VM's cgroup-v2 leaf has a finite memory ceiling (matching the Linux
+# Gate 8 (1) semantics — the Mac fleet must NOT be running in an
+# unbounded slice, or it can OOM the host the same way QEMU does on
+# Linux). Returns 1 if the leaf is unbounded / unreadable. Echoes the
+# offending value on stdout for the cold reader.
+#
+# The probe tunnels `ssh <host> limactl shell colima -- cat <cgroup-file>`
+# rather than reading the host-side Mac filesystem, because the cgroup
+# tree lives INSIDE the colima VM — `limactl shell` is the only way to
+# read it from the macOS host shell.
+#
+# SKIP-vs-FAIL distinction: SSH unreachable -> caller decides. This
+# function ITSELF fails-closed on a successful probe with max/unreadable;
+# the verifier Gate 8 (5) wraps this in a SKIP-when-unreachable gate so
+# a Linux-only verifier run does not fail because no Mac is on the
+# network (per bead ez-gh-actions-r3f16 spec).
+mac_probe() {
+    local mac_host="$1"
+    local probe_cmd="limactl shell colima -- bash -c 'echo HIGH=\\$(cat /sys/fs/cgroup/init.scope/memory.high); echo MAX=\\$(cat /sys/fs/cgroup/init.scope/memory.max); echo CURRENT=\\$(cat /sys/fs/cgroup/init.scope/memory.current)'"
+    local out
+    # 5s SSH connect/probe timeout (matches the Gate 8 (5) spec).
+    if ! out=$(timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=4 "$mac_host" "$probe_cmd" 2>&1); then
+        echo "ssh-unreachable (exit=$?, host=$mac_host)"
+        return 125   # distinct code from "max" (1) so the caller can SKIP
+    fi
+    local high max current
+    high=$(printf '%s\n' "$out" | awk -F= '/^HIGH=/{print $2; exit}')
+    max=$(printf '%s\n' "$out"  | awk -F= '/^MAX=/{print $2; exit}')
+    current=$(printf '%s\n' "$out" | awk -F= '/^CURRENT=/{print $2; exit}')
+    if [ -z "$high" ] && [ -z "$max" ]; then
+        echo "limactl shell colima returned no HIGH/MAX lines (out='$out')"
+        return 1
+    fi
+    if { [ "$high" = "max" ] || [ -z "$high" ]; } && { [ "$max" = "max" ] || [ -z "$max" ]; }; then
+        echo "Mac $mac_host colima VM cgroup /init.scope memory.high=${high:-?} memory.max=${max:-?} (UNBOUNDED)"
+        return 1
+    fi
+    echo "Mac $mac_host colima VM cgroup /init.scope memory.high=${high:-?} memory.max=${max:-?} current=${current:-?}"
     return 0
 }
 
@@ -706,6 +755,29 @@ if [ "$PLATFORM" = "linux" ]; then
     if [ -z "$MONITOR_TASKS" ] || [ "$TIMER_ENABLED" != "enabled" ] || [ "$TIMER_ACTIVE" != "active" ]; then
         fail "Gate 7: Monitoring timer not properly installed/enabled/active (timers: '$MONITOR_TASKS', enabled: '$TIMER_ENABLED', active: '$TIMER_ACTIVE', service: '$SERVICE_ACTIVE')"
     fi
+    # R4 lane T (ez-gh-actions-r3f10): assert the systemd unit has
+    # PSI_SHED_CHAIN set, non-empty. The unit file may not be installed
+    # on every host (per the bead, install is manual), so we tolerate
+    # the unit being absent (timer enrollment itself is asserted by
+    # Gate 8 elsewhere). If the unit IS present but PSI_SHED_CHAIN is
+    # empty, we FAIL — that is the exact cold-review-flagged
+    # regression this gate exists to prevent.
+    PSI_OOM_ENV="$(systemctl --user show psi-oom-watcher.service -p Environment 2>/dev/null || true)"
+    PSI_OOM_PRESENT="no"
+    PSI_OOM_CHAIN=""
+    if [ -n "${PSI_OOM_ENV}" ]; then
+        PSI_OOM_PRESENT="yes"
+        # Extract the PSI_SHED_CHAIN= substring (handles both quoted and
+        # ambient forms, plus the surrounding Environment=VALUE list).
+        PSI_OOM_CHAIN="$(printf '%s' "${PSI_OOM_ENV}" | tr ' ' '\n' | sed -n 's/^PSI_SHED_CHAIN=//p' | head -1)"
+        # Also strip surrounding quotes if any.
+        PSI_OOM_CHAIN="${PSI_OOM_CHAIN#\"}"
+        PSI_OOM_CHAIN="${PSI_OOM_CHAIN%\"}"
+        if [ -z "${PSI_OOM_CHAIN}" ]; then
+            fail "Gate 7: psi-oom-watcher.service installed but PSI_SHED_CHAIN is empty (cold-review R3-F10 regression). Remediation: set Environment=\"PSI_SHED_CHAIN=drain,reclaim,verify,escalate\" in the user-scope unit and daemon-reload."
+        fi
+    fi
+    echo "    [INFO] psi-oom-watcher.service present=${PSI_OOM_PRESENT} PSI_SHED_CHAIN=${PSI_OOM_CHAIN:-<not-installed>}"
 elif [ "$PLATFORM" = "macos" ]; then
     # Mac monitoring can be launchd-based; pass only if any health-related launchd
     # task is currently loaded.
@@ -1197,16 +1269,67 @@ else
     fi
 
     # (4d) Sum and compare -----------------------------------------------------------
+    # Soft-throttle overflow: a cgroup with MemoryHigh=X can transiently
+    # reach up to ~2*X before the kernel throttles (or before the host
+    # OOM fires). The host reserve equation must assume the worst case
+    # for each bounded cgroup, not the nominal ceiling. See bead
+    # ez-gh-actions-r3f5 (round-3 cold review): option (a) of the
+    # brief — MemoryMax (hard) — would outright OOM-kill slices under
+    # transient overshoot, violating the Self-Outage Prevention
+    # Principle; option (b) — model the soft-throttle overshoot and
+    # reserve for it — is what we do here. Apply this multiplier per
+    # bounded-ceiling source so that future top-level slices (AO slice,
+    # MCP slice, other bounded workloads) are sized for both their own
+    # bound AND their transient overshoot.
+    SOFT_THROTTLE_OVERFLOW_MULT=2
+
     # QEMU_ceiling + AO/MCP_ceiling + mandatory_reserve <= physical_host_RAM.
-    # (Other bounded top-level cgroups are counted via the AO/MCP slice
+    # Other bounded top-level cgroups are counted via the AO/MCP slice
     # walk above; add explicit terms here as new bounded top-level slices
-    # ship.)
-    AGG_TOTAL_MB=$((QEMU_CEILING_MB + AO_MCP_CEILING_MB + MANDATORY_RESERVE_MB))
+    # ship (each multiplied by SOFT_THROTTLE_OVERFLOW_MULT).
+    QEMU_WORST_MB=$((QEMU_CEILING_MB * SOFT_THROTTLE_OVERFLOW_MULT))
+    AO_MCP_WORST_MB=$((AO_MCP_CEILING_MB * SOFT_THROTTLE_OVERFLOW_MULT))
+    AGG_TOTAL_MB=$((QEMU_WORST_MB + AO_MCP_WORST_MB + MANDATORY_RESERVE_MB))
     AGG_BUDGET_MB=$HOST_MEM_TOTAL_MB
     if [ "$AGG_TOTAL_MB" -gt "$AGG_BUDGET_MB" ]; then
-        fail "Gate 8 (4) aggregate bounded demand ${AGG_TOTAL_MB}MB exceeds physical host RAM ${AGG_BUDGET_MB}MB (qemu_ceiling=${QEMU_CEILING_MB}MB + ao_mcp_ceiling=${AO_MCP_CEILING_MB}MB ${AO_MCP_CEILING_NOTE}+ mandatory_reserve=${MANDATORY_RESERVE_MB}MB; physical_host_RAM=${HOST_MEM_TOTAL_MB}MB from /proc/meminfo MemTotal). Remediation: raise physical host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+        fail "Gate 8 (4) aggregate worst-case demand ${AGG_TOTAL_MB}MB exceeds physical host RAM ${AGG_BUDGET_MB}MB (qemu_ceiling=${QEMU_CEILING_MB}MB * overflow_mult=${SOFT_THROTTLE_OVERFLOW_MULT} = ${QEMU_WORST_MB}MB + ao_mcp_ceiling=${AO_MCP_CEILING_MB}MB * overflow_mult=${SOFT_THROTTLE_OVERFLOW_MULT} = ${AO_MCP_WORST_MB}MB ${AO_MCP_CEILING_NOTE}+ mandatory_reserve=${MANDATORY_RESERVE_MB}MB; physical_host_RAM=${HOST_MEM_TOTAL_MB}MB from /proc/meminfo MemTotal). The 2x soft-throttle overflow accounts for transient MemoryHigh overshoot before the kernel throttles (per bead ez-gh-actions-r3f5). Remediation: raise physical host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh — each ceiling is now sized for both its own bound AND its transient overshoot."
     fi
-    echo "    [PASS] Gate 8 (4) aggregate bounded demand ${AGG_TOTAL_MB}MB <= physical host RAM ${AGG_BUDGET_MB}MB (qemu_ceiling=${QEMU_CEILING_MB}MB + ao_mcp_ceiling=${AO_MCP_CEILING_MB}MB ${AO_MCP_CEILING_NOTE}+ mandatory_reserve=${MANDATORY_RESERVE_MB}MB)"
+    echo "    [PASS] Gate 8 (4) aggregate worst-case demand ${AGG_TOTAL_MB}MB (overflow_mult=${SOFT_THROTTLE_OVERFLOW_MULT} applied per bounded-ceiling source) <= physical host RAM ${AGG_BUDGET_MB}MB (qemu_worst=${QEMU_WORST_MB}MB + ao_mcp_worst=${AO_MCP_WORST_MB}MB ${AO_MCP_CEILING_NOTE}+ mandatory_reserve=${MANDATORY_RESERVE_MB}MB)"
+fi
+
+# (5) Mac parity probe (bead ez-gh-actions-r3f16) -----------------------------------
+# Round-3 cold review noted that the fleet has a Mac component
+# (ez-mac-runner-b-1..6) but Gate 8 only probes the Linux host's QEMU
+# cgroup. The Mac side runs colima (a Linux VM under QEMU) on macOS; its
+# cgroup tree is INSIDE the colima VM, reachable from the macOS host
+# shell only via `limactl shell colima --`. This probe brings Gate 8's
+# coverage to parity with the Mac fleet.
+#
+# SKIP vs FAIL distinction (per spec):
+#   - ssh unreachable -> SKIP, not FAIL. The verifier is run primarily
+#     on the Linux side; a CI run from a Linux box without a Mac on the
+#     network must NOT fail-closed just because the Mac fleet is off.
+#   - ssh reachable but memory.high=max (or unreadable) -> FAIL-CLOSED.
+#     Same shape as Gate 8 (1) on Linux: a Mac fleet in an unbounded
+#     cgroup can OOM the macOS host the same way QEMU does on Linux.
+#
+# MAC_HOSTNAME env-var overrides the default "macbook" so CI environments
+# with a different ssh alias (e.g. "jeff-mac", "jleechan-mbp") can
+# repoint the probe without editing the script.
+echo "--- Checking Gate 8 (5): Mac parity probe ---"
+MAC_HOSTNAME_VAL="${MAC_HOSTNAME:-macbook}"
+if ! command -v ssh >/dev/null 2>&1; then
+    echo "    [SKIP] Gate 8 (5) Mac parity probe: ssh binary not on PATH; cannot probe ${MAC_HOSTNAME_VAL}"
+elif MAC_PROBE_OUT=$(mac_probe "$MAC_HOSTNAME_VAL" 2>&1); then
+    # mac_probe exit 0 = finite ceiling; exit 125 = ssh unreachable (skip); exit 1 = max/unreadable (fail)
+    echo "    [PASS] Gate 8 (5) Mac parity: $MAC_PROBE_OUT"
+else
+    rc=$?
+    if [ "$rc" = "125" ]; then
+        echo "    [SKIP] Gate 8 (5) Mac parity probe: ssh ${MAC_HOSTNAME_VAL} unreachable (probe returned: ${MAC_PROBE_OUT}); the verifier is run on the Linux side primarily and Mac fleet coverage is OPTIONAL when no Mac is reachable"
+    else
+        fail "Gate 8 (5) Mac parity FAIL-CLOSED: ${MAC_PROBE_OUT}. Remediation: apply a cgroup-v2 MemoryHigh on the colima VM (e.g. via a systemd drop-in inside the colima guest, or a limactl profile-level memory limit), or reduce the Mac fleet's effective footprint so it fits within the macOS host's physical RAM. Bead: ez-gh-actions-r3f16."
+    fi
 fi
 
 pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
@@ -1220,49 +1343,102 @@ pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 # scripts/host/crash-capture-verify.sh) work together under live pressure
 # without OOM, watchdog reboot, or QEMU cgroup ceiling breach.
 #
-# Two modes:
-#   * DEFAULT (HPP_LIVE != 1): the verifier runs --dry-run only — it
-#     verifies the script EXISTS, its preconditions are met (QEMU running,
-#     agents.slice enrolled, config readable, stress-ng installed), and
-#     the auto-computed pressure plan is sane. This is the path normal CI
-#     takes; it does NOT spawn stress-ng or canaries and is safe to run
-#     on the live fleet.
-#   * LIVE (HPP_LIVE=1): the verifier runs the full live pressure + canary
-#     burst + recovery loop. This is operator-gated — it pressures the
-#     host for ~60s with stress-ng inside agents.slice, dispatches N
-#     concurrent canaries, and waits for MemAvailable to recover. Use
-#     this on a quiet window (e.g. before a major release) to validate
-#     the round-3 protection stack end-to-end. NEVER auto-enable in CI.
+# r3f8 cold-review fix (round-4): a dry-run is a precondition check, NOT a
+# pressure proof. The previous Gate 9 wired `--dry-run` as the DEFAULT and
+# PASSed on its exit 0 — which meant the gate could report green without
+# ever applying real pressure. The fix flips the default: the script now
+# exits 64 from --dry-run (refusal, "proof not attempted"); the verifier
+# Gate 9 treats exit 64 as FAIL unless HPP_LIVE=1 is explicitly set.
 #
-# Dry-run timeout defaults to 180s (HPP_TIMEOUT overrides). Live mode
-# defaults to 300s (HPP_TIMEOUT overrides).
-echo "--- Checking Gate 9: Controlled host-pressure proof ---"
+# r3f9 enforcement: any canary failure, runner-count loss > 10%, or missing
+# admission-refusal alert now aborts the live proof (exit 1). The script
+# also enforces runner_count concurrency (no hardcoded 3).
+#
+# Two modes:
+#   * DEFAULT (HPP_LIVE != 1): the verifier invokes --dry-run, expects
+#     exit 64, prints a SKIP notice, and FAILs Gate 9. Normal CI hits this
+#     path unless the operator opts in with HPP_LIVE=1.
+#   * LIVE (HPP_LIVE=1): the verifier invokes --live with HPP_LIVE=1 set;
+#     requires exit 0 for PASS. Operator-gated — pressures the host for
+#     ~60s with stress-ng inside agents.slice, dispatches runner_count
+#     concurrent canaries, enforces any-canary-fail / runner-loss >10% /
+#     missing-admission-refusal / OOM / recovery-fail. NEVER auto-enable
+#     in CI without an explicit operator ack that the live host is fair
+#     game.
+#
+# The script also exits 33 ("HPP_LIVE=1 required") if invoked with no flag
+# and no env. The verifier treats 33 as "proof not attempted" too, so a
+# missing-env invocation fails Gate 9.
+#
+# Mac parity (bead ez-gh-actions-r3f16): --mac-hostname is forwarded on
+# both paths so the script can probe the Mac fleet (ssh reachable, colima
+# running, etc.) and the live path can dispatch Mac canaries.
+#
+# Dry-run / refusal timeout defaults to 180s. Live mode defaults to 600s
+# (HPP_TIMEOUT overrides both).
+echo "--- Checking Gate 9: Controlled host-pressure proof (r3f8 dry-run-as-PASS removed) ---"
 HPP_SCRIPT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/host-pressure-proof.sh"
 if [ ! -x "${HPP_SCRIPT}" ]; then
     fail "Gate 9: host-pressure-proof.sh not found or not executable at ${HPP_SCRIPT}"
 fi
-HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-180}"
+HPP_MAC_HOSTNAME_VAL="${MAC_HOSTNAME:-macbook}"
+HPP_PROOF_OUTPUT=""
+HPP_PROOF_RC=0
+# Always invoke the script (so missing preconditions surface as a hard FAIL
+# regardless of mode). The verifier selects mode by setting HPP_LIVE.
 if [ "${HPP_LIVE:-0}" = "1" ]; then
-    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-300}"
-fi
-HPP_DRY_OUTPUT=""
-if ! HPP_DRY_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --dry-run 2>&1); then
-    echo "${HPP_DRY_OUTPUT}"
-    fail "Gate 9: dry-run failed (exit $?) — see host-pressure-proof.sh output above. Preconditions unmet (QEMU not running, agents.slice not enrolled, stress-ng missing, etc.) — apply the remediation printed in the dry-run output."
-fi
-echo "${HPP_DRY_OUTPUT}"
-# Live: only attempt if --live enabled and host not under pressure already
-if [ "${HPP_LIVE:-0}" = "1" ]; then
-    HPP_LIVE_OUTPUT=""
-    if ! HPP_LIVE_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --timeout-seconds "${HPP_TIMEOUT_VAL}" 2>&1); then
-        echo "${HPP_LIVE_OUTPUT}"
-        fail "Gate 9: live host-pressure-proof exited $? — host did not absorb + recover from controlled pressure within budget"
+    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-600}"
+    # Live: forward HPP_LIVE into the script env. --live sets it inside too,
+    # but forwarding here makes the intent explicit at the verifier boundary.
+    if ! HPP_PROOF_OUTPUT=$(HPP_LIVE=1 timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --live --timeout-seconds "${HPP_TIMEOUT_VAL}" --mac-hostname "${HPP_MAC_HOSTNAME_VAL}" 2>&1); then
+        HPP_PROOF_RC=$?
     fi
-    echo "${HPP_LIVE_OUTPUT}"
-    pass "Gate 9: Host absorbed + recovered from controlled pressure (round-3 acceptance)"
 else
-    echo "    [INFO] Gate 9 dry-run verified; live proof requires HPP_LIVE=1"
-    pass "Gate 9: Controlled host-pressure harness present (dry-run path)"
+    # Default mode: invoke --dry-run. The script exits 64 by design (r3f8).
+    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-180}"
+    if ! HPP_PROOF_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --dry-run --mac-hostname "${HPP_MAC_HOSTNAME_VAL}" 2>&1); then
+        HPP_PROOF_RC=$?
+    fi
+fi
+echo "${HPP_PROOF_OUTPUT}"
+# Classify the script's exit code.
+if [ "${HPP_LIVE:-0}" = "1" ]; then
+    case "${HPP_PROOF_RC}" in
+        0)
+            pass "Gate 9: Host absorbed + recovered from controlled pressure (HPP_LIVE=1, r3f9 enforcement active: any canary fail / runner-loss > 10% / missing admission refusal / OOM / recovery-fail → exit 1)"
+            ;;
+        2)
+            fail "Gate 9: HPP_LIVE=1 was set but precondition check failed (exit 2). See host-pressure-proof output above — apply the remediation it printed (start QEMU, enroll agents.slice, install stress-ng, Mac ssh unreachable, etc.)."
+            ;;
+        64|33)
+            fail "Gate 9: HPP_LIVE=1 was set but the script returned ${HPP_PROOF_RC} (refusal). Treat as a script wiring bug — live mode should never refuse on an authorized invocation."
+            ;;
+        *)
+            fail "Gate 9: live host-pressure-proof exited ${HPP_PROOF_RC} — host did not absorb + recover from controlled pressure within budget (Linux path and/or Mac canary burst failed; r3f9 enforcer active)"
+            ;;
+    esac
+else
+    # Default mode: --dry-run is expected to exit 64. Anything other than 64
+    # is a real failure (precondition fail exits 2, e.g. agents.slice not
+    # enrolled; HPP_LIVE missing on default invocation exits 33).
+    case "${HPP_PROOF_RC}" in
+        64)
+            # Expected refusal. Gate 9 FAILs by default (per r3f8) — the
+            # dry-run is NOT a proof. Operator must opt in with HPP_LIVE=1.
+            echo "    [SKIP] dry-run does not prove pressure; set HPP_LIVE=1 (or pass --live) to authorize the live burst"
+            fail "Gate 9: proof not attempted (HPP_LIVE=1 not set). Default invocation only verifies preconditions; only HPP_LIVE=1 + exit 0 counts as a Gate 9 PASS."
+            ;;
+        33)
+            # Distinct refusal: defaulted invocation hit the HPP_LIVE env gate.
+            fail "Gate 9: host-pressure-proof exited 33 (HPP_LIVE=1 required). Default invocation cannot be authorized without HPP_LIVE=1 in the env, OR pass --live explicitly."
+            ;;
+        2)
+            fail "Gate 9: dry-run precondition check failed (exit 2). See host-pressure-proof output above — apply the remediation it printed (start QEMU, enroll agents.slice, install stress-ng, Mac ssh unreachable, etc.)."
+            ;;
+        *)
+            fail "Gate 9: dry-run returned unexpected exit ${HPP_PROOF_RC}. Expected 64 (refusal). Inspect host-pressure-proof.sh output above."
+            ;;
+    esac
 fi
 
 # --- Gate 10: GitHub API budget ---

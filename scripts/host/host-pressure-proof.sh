@@ -54,30 +54,39 @@
 #
 # USAGE
 # -----
-#   scripts/host/host-pressure-proof.sh                      # full live run
-#   scripts/host/host-pressure-proof.sh --dry-run            # verify preconditions + plan, do not spawn
-#   HPP_SKIP_PRESSURE=1 scripts/host/host-pressure-proof.sh  # test harness path without stress-ng
-#   scripts/host/host-pressure-proof.sh --pressure-mb 4096   # override the auto-computed pressure
-#   scripts/host/host-pressure-proof.sh --concurrency 5      # 5 concurrent canary invocations
+#   HPP_LIVE=1 scripts/host/host-pressure-proof.sh           # full live run (DEFAULT)
+#   scripts/host/host-pressure-proof.sh --live              # explicit alias
+#   scripts/host/host-pressure-proof.sh --dry-run            # refuse: prints plan, exits 64 (NOT a pass)
+#   scripts/host/host-pressure-proof.sh --pressure-mb 4096  # override the auto-computed pressure
+#   scripts/host/host-pressure-proof.sh --concurrency 5     # override canary concurrency
 #   scripts/host/host-pressure-proof.sh --timeout-seconds 900 # extend wall budget
 #
 # EXIT CODES
 # ----------
 #   0 = host absorbed pressure + recovered without OOM/watchdog/abort
-#   1 = abort condition triggered (OOM, watchdog reboot, recovery failure)
+#   1 = abort condition triggered (OOM, watchdog reboot, recovery failure, canary fail, runner-count loss, no admission refusal observed)
 #   2 = precondition fail (QEMU not running, agents.slice not enrolled, etc.)
+#  32 = excluded by design (placeholder, currently unused)
+#  33 = HPP_LIVE=1 required (live mode invoked without the env flag)
+#  64 = DRY-RUN does NOT prove pressure (refusal: "skipped, not passed" signal to verifier)
 #
-# The dry-run path (--dry-run or HPP_SKIP_PRESSURE=1) prints the plan and
-# verifies preconditions; it does NOT spawn stress-ng and never exits 1.
+# The --dry-run path prints the plan and verifies preconditions but NEVER
+# exits 0 with a "proof successful" verdict — it exits 64 so the verifier
+# Gate 9 distinguishes "operator explicitly said run live" from "default
+# invocation asked for a pressure proof" and refuses to false-pass. HPP_SKIP_PRESSURE
+# (the legacy env alias for --dry-run) has been REMOVED; only --dry-run and
+# HPP_LIVE=1 / --live remain as valid invocation paths.
 #
 # OPERATOR SAFETY
 # ---------------
 # The script is idempotent: re-running it is safe. If a prior run was
 # killed mid-flight, transient scope-* units from `systemd-run` are
 # auto-reaped when the user session ends; no persistent state is left
-# on disk beyond the log file. --dry-run is the default when invoked
-# by the verifier (Gate 9) so the live fleet is never pressured during
-# normal CI; live mode requires explicit HPP_LIVE=1 in the env.
+# on disk beyond the log file. Live mode requires explicit HPP_LIVE=1
+# in the env (or --live, which sets it) so a forgotten terminal cannot
+# accidentally trigger stress-ng against the live host. The default
+# invocation (no flag) is LIVE and is gated by HPP_LIVE; an unset env
+# exits 33 ("HPP_LIVE=1 required").
 
 set -euo pipefail
 
@@ -85,41 +94,66 @@ set -euo pipefail
 
 DRY_RUN=0
 HPP_PRESSURE_MB_OVERRIDE=""
-HPP_CONCURRENCY=3
+HPP_CONCURRENCY=0            # 0 = auto-derive from runner_count (overrides legacy hardcoded 3)
 HPP_TIMEOUT_SECONDS=600
 HPP_CANARY_TIMEOUT_SECONDS=180
 HPP_RECOVERY_TIMEOUT_SECONDS=300
 HPP_RECOVERY_PCT=10        # MemAvailable must recover to within 10% of baseline
-HPP_SKIP_PRESSURE="${HPP_SKIP_PRESSURE:-0}"
+# Mac parity (bead ez-gh-actions-r3f16): when set and the named Mac host
+# is reachable over SSH, dispatch an equivalent canary burst to the Mac
+# fleet (ez-mac-runner-b-1..6) and probe the colima-VM cgroup the same
+# way Gate 8 (1) probes QEMU on Linux. Empty (default) = Linux-only.
+# Mac dispatch is OPT-IN for now: the verifier Gate 9 sets this to
+# 'macbook' explicitly. Mac failures are fail-closed (exit 1) when set;
+# when empty, no Mac probes run.
+HPP_MAC_HOSTNAME="${HPP_MAC_HOSTNAME:-}"
+# Max acceptable runner-count drop during pressure (fraction × 100). Default 10 (= 10%).
+HPP_RUNNER_LOSS_PCT=10
+# Required admission-refusal signal during peak: alert log MUST contain at least
+# one "runner_pool.memory_pressure" line during the pressure phase. Set to 0 to
+# disable (NOT recommended for production proof).
+HPP_REQUIRE_ADMISSION_REFUSAL=1
 
 usage() {
     cat <<EOF
 host-pressure-proof.sh — controlled host-pressure + recovery proof
-  --dry-run                   verify preconditions + plan, no live pressure
+
+MODES (default is LIVE; --dry-run is the NON-pass refusal mode):
+  HPP_LIVE=1 ./host-pressure-proof.sh        # full live run (default when env set)
+  ./host-pressure-proof.sh --live            # explicit alias; sets HPP_LIVE=1 internally
+  ./host-pressure-proof.sh --dry-run         # prints plan + preconditions, exits 64 (NOT a pass)
+
+  Defaults & flags:
+  --dry-run                   verify preconditions + plan, exit 64 (refusal — not a proof)
+  --live                      same as HPP_LIVE=1 (alias only; flag does not bypass env check)
   --pressure-mb <N>           override auto-computed pressure (default: count × limits.memory_mb)
-  --concurrency <N>           number of concurrent canary invocations (default: 3)
+  --concurrency <N>           number of concurrent canary invocations (default: runner_count)
   --timeout-seconds <N>       total wall budget (default: 600)
   --canary-timeout-seconds <N>  per-canary timeout (default: 180)
   --recovery-timeout-seconds <N>  max wait for MemAvailable recovery (default: 300)
   --recovery-pct <N>          MemAvailable must recover to within N% of baseline (default: 10)
+  --runner-loss-pct <N>       FAIL if runner count drops more than N% (default: 10)
+  --no-admission-required     do NOT fail if no admission refusal observed (off by default)
   -h | --help                 show this help
 
 Environment:
-  HPP_SKIP_PRESSURE=1         same as --dry-run (used by harness path test)
-  HPP_LIVE=1                  (set by verifier Gate 9 live mode)
-  HPP_TIMEOUT                  override total wall budget (default 180s dry-run / 300s live)
-  CONFIG_FILE                  override ezgha config path (default: ~/.config/ezgha/config.toml)
+  HPP_LIVE=1                  explicit live-mode gate (required for any default invocation)
+  HPP_TIMEOUT                 override total wall budget (default 600s)
+  CONFIG_FILE                 override ezgha config path (default: ~/.config/ezgha/config.toml)
 
 Exit codes:
-  0  host absorbed + recovered
-  1  abort (OOM, watchdog, recovery failure)
-  2  precondition fail
+  0  host absorbed + recovered (PROOF PASSED, all central claims enforced)
+  1  abort (OOM, watchdog, recovery failure, canary fail, runner-count loss, missing admission refusal)
+  2  precondition fail (QEMU/agents.slice/config/stress-ng not ready)
+ 33  HPP_LIVE=1 required (live mode invoked without the env flag)
+ 64  DRY-RUN refusal — does NOT prove pressure; only --live with HPP_LIVE=1 counts as a proof
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --dry-run)            DRY_RUN=1 ;;
+        --live)               export HPP_LIVE=1 ;;
         --pressure-mb)        shift; HPP_PRESSURE_MB_OVERRIDE="${1:-}" ;;
         --pressure-mb=*)      HPP_PRESSURE_MB_OVERRIDE="${1#--pressure-mb=}" ;;
         --concurrency)        shift; HPP_CONCURRENCY="${1:-}" ;;
@@ -132,16 +166,27 @@ while [ "$#" -gt 0 ]; do
         --recovery-timeout-seconds=*) HPP_RECOVERY_TIMEOUT_SECONDS="${1#--recovery-timeout-seconds=}" ;;
         --recovery-pct)       shift; HPP_RECOVERY_PCT="${1:-}" ;;
         --recovery-pct=*)     HPP_RECOVERY_PCT="${1#--recovery-pct=}" ;;
+        --runner-loss-pct)    shift; HPP_RUNNER_LOSS_PCT="${1:-}" ;;
+        --runner-loss-pct=*)  HPP_RUNNER_LOSS_PCT="${1#--runner-loss-pct=}" ;;
+        --no-admission-required) HPP_REQUIRE_ADMISSION_REFUSAL=0 ;;
+        --mac-hostname)       shift; HPP_MAC_HOSTNAME="${1:-}" ;;
+        --mac-hostname=*)     HPP_MAC_HOSTNAME="${1#--mac-hostname=}" ;;
         -h|--help)            usage; exit 0 ;;
         *)  echo "Error: unknown argument: $1" >&2; usage >&2; exit 64 ;;
     esac
     shift
 done
 
-# Honor the env var on top of the flag, so a harness that exports
-# HPP_SKIP_PRESSURE=1 can reuse this script as a one-call probe.
-if [ "${HPP_SKIP_PRESSURE}" = "1" ]; then
-    DRY_RUN=1
+# Default (no flags) = LIVE; HPP_LIVE=1 is mandatory outside the --dry-run path
+# because a forgotten terminal must not be able to trigger stress-ng on the
+# live host.
+LIVE_REQUESTED=0
+EXPLICIT_DRY_RUN=0
+if [ "${DRY_RUN}" = "1" ]; then
+    EXPLICIT_DRY_RUN=1
+    LIVE_REQUESTED=0
+elif [ "${HPP_LIVE:-0}" = "1" ]; then
+    LIVE_REQUESTED=1
 fi
 
 # -------- paths ----------------------------------------------------------------
@@ -360,12 +405,87 @@ else
     log "WARN: dmesg not readable (sysctl kernel.dmesg_restrict=1?); OOM-kill check will be a no-op"
 fi
 
-# -------- dry-run path ---------------------------------------------------------
+# -------- Mac parity probe (bead ez-gh-actions-r3f16, opt-in) -----------------
+# When --mac-hostname <name> is set (or HPP_MAC_HOSTNAME env-var),
+# probe the colima-VM cgroup on the Mac side BEFORE the mode gate so the
+# dry-run summary surfaces the Mac state. SKIP semantics (ssh unreachable
+# = probe skipped, NOT a fail) match the verifier Gate 8 (5) contract.
+# Mac is OPT-IN for the host-pressure harness itself; the verifier Gate 9
+# default sets --mac-hostname=macbook so a Mac fleet outage cannot escape
+# unnoticed. Same SKIP-vs-FAIL rules as the verifier:
+#   - ssh unreachable: log SKIP and continue. Linux path proceeds.
+#   - ssh reachable but colima VM memory.high=max (or unreadable):
+#     fail-closed (exit 2 — precondition fail). The Mac fleet must NOT
+#     be running in an unbounded slice; that's the same host-freeze
+#     failure mode Gate 8 (1) prevents on Linux.
+MAC_PROBE_RESULT="disabled"
+MAC_PROBE_DETAIL="(no --mac-hostname; Mac parity opt-in for host-pressure harness)"
+if [ -n "${HPP_MAC_HOSTNAME}" ]; then
+    mac_probe_local() {
+        local host="$1"
+        local probe_cmd="limactl shell colima -- bash -c 'echo HIGH=\\$(cat /sys/fs/cgroup/init.scope/memory.high); echo MAX=\\$(cat /sys/fs/cgroup/init.scope/memory.max); echo CURRENT=\\$(cat /sys/fs/cgroup/init.scope/memory.current)'"
+        local probe_out
+        if ! probe_out=$(timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=4 "$host" "$probe_cmd" 2>&1); then
+            echo "SKIP:ssh-unreachable(host=$host)"
+            return 0
+        fi
+        local high max
+        high=$(printf '%s\n' "$probe_out" | awk -F= '/^HIGH=/{print $2; exit}')
+        max=$(printf '%s\n' "$probe_out"  | awk -F= '/^MAX=/{print $2; exit}')
+        if { [ "$high" = "max" ] || [ -z "$high" ]; } && { [ "$max" = "max" ] || [ -z "$max" ]; }; then
+            echo "FAIL:memory.high=${high:-?} memory.max=${max:-?}"
+            return 1
+        fi
+        echo "PASS:memory.high=${high:-?} memory.max=${max:-?}"
+        return 0
+    }
+    MAC_PROBE_DETAIL="(probing ${HPP_MAC_HOSTNAME})"
+    MAC_PROBE_RAW=$(mac_probe_local "${HPP_MAC_HOSTNAME}" 2>&1) || MAC_PROBE_RC=$?
+    MAC_PROBE_RC="${MAC_PROBE_RC:-0}"
+    case "${MAC_PROBE_RAW}" in
+        SKIP:*) MAC_PROBE_RESULT="skipped" ;;
+        PASS:*) MAC_PROBE_RESULT="ok" ;;
+        FAIL:*) MAC_PROBE_RESULT="unbounded" ;;
+        *)      MAC_PROBE_RESULT="error" ;;
+    esac
+    MAC_PROBE_DETAIL="${MAC_PROBE_RAW}"
+    log "Mac parity probe (${HPP_MAC_HOSTNAME}): ${MAC_PROBE_RESULT} (${MAC_PROBE_DETAIL})"
+    if [ "${MAC_PROBE_RESULT}" = "unbounded" ]; then
+        # Fail-closed when Mac was explicitly requested: the operator who
+        # passed --mac-hostname wanted Mac coverage; a max ceiling is
+        # exactly the failure shape the probe exists to catch.
+        die_precondition "Mac colima VM cgroup ${HPP_MAC_HOSTNAME} has unbounded memory.high/max (${MAC_PROBE_DETAIL})" "apply a cgroup-v2 MemoryHigh on the colima VM (e.g. systemd drop-in inside the guest, or limactl profile memory limit), or pass --mac-hostname= (empty) to skip Mac parity"
+    fi
+fi
 
-if [ "${DRY_RUN}" = "1" ]; then
-    cat <<EOF
-host-pressure-proof — DRY RUN
-================================
+# -------- mode gate ------------------------------------------------------------
+#
+# After preconditions pass (Linux, QEMU bounded, agents.slice enrolled,
+# config readable, stress-ng installed for live mode), enforce the mode
+# gate. This is the r3f8 cold-review fix: a dry-run is a precondition check,
+# NOT a pressure proof. The proof mode can ONLY pass on --live with HPP_LIVE=1.
+
+# Resolve auto-derived values BEFORE the gate so the gate's diagnostic
+# output reflects what live mode WOULD have run.
+EFFECTIVE_CONCURRENCY="${HPP_CONCURRENCY}"
+if [ "${EFFECTIVE_CONCURRENCY}" = "0" ]; then
+    EFFECTIVE_CONCURRENCY="${CONFIG_RUNNER_COUNT}"
+fi
+if ! [[ "${EFFECTIVE_CONCURRENCY}" =~ ^[0-9]+$ ]] || [ "${EFFECTIVE_CONCURRENCY}" -lt 1 ]; then
+    die_precondition "--concurrency='${EFFECTIVE_CONCURRENCY}' is invalid; must be a positive integer (or 0 to auto-derive from runner_count)" "rerun with --concurrency <N> where N>=1, or rely on the default (runner_count from config)"
+fi
+
+if [ "${LIVE_REQUESTED}" = "0" ]; then
+    # Two distinct refusal shapes:
+    #   (a) User passed --dry-run explicitly. Print the plan, refuse, exit 64
+    #       (verifier treats 64 as "proof not attempted" → FAIL).
+    #   (b) User passed nothing and HPP_LIVE != 1. Print a short notice, exit 33
+    #       (HPP_LIVE=1 required — separate from the --dry-run refusal so the
+    #       operator gets a clear, distinct error).
+    if [ "${EXPLICIT_DRY_RUN}" = "1" ]; then
+        cat <<EOF
+host-pressure-proof — DRY RUN / NON-PROOF PATH
+================================================
 config_file              : ${CONFIG_FILE}
 runner_count             : ${CONFIG_RUNNER_COUNT}
 limits.memory_mb         : ${CONFIG_MEMORY_MB}
@@ -375,10 +495,12 @@ QEMU pid                 : ${QEMU_PID}
 agents.slice leaves      : ${AGENT_LEAF_COUNT}
 pressure (MB)            : ${PRESSURE_MB} (${PRESSURE_SOURCE})
 pressure cap (MB)        : ${PRESSURE_CAP_MB} (agents.slice ceiling - 4G safety)
-concurrency              : ${HPP_CONCURRENCY}
+auto concurrency         : ${EFFECTIVE_CONCURRENCY} (= runner_count from config)
 canary timeout (s)       : ${HPP_CANARY_TIMEOUT_SECONDS}
 recovery timeout (s)     : ${HPP_RECOVERY_TIMEOUT_SECONDS}
 recovery pct             : ${HPP_RECOVERY_PCT}
+runner-loss-pct max      : ${HPP_RUNNER_LOSS_PCT}
+admission-refusal req'd  : ${HPP_REQUIRE_ADMISSION_REFUSAL}
 total timeout (s)        : ${HPP_TIMEOUT_SECONDS}
 baseline mem_available   : $((BASELINE_MEM_AVAIL_KB / 1024))MB
 baseline load_1min       : ${BASELINE_LOAD_1MIN}
@@ -387,13 +509,25 @@ baseline runner count    : ${BASELINE_RUNNER_COUNT}
 dmesg readable           : ${OOM_DMESG_READABLE}
 stress-ng on PATH        : $(command -v stress-ng || echo "MISSING")
 ezgha binary             : ${EZGHA_BIN}
+mac parity probe         : ${MAC_PROBE_RESULT} ${MAC_PROBE_DETAIL}
 
-This dry-run verifies the harness path WITHOUT spawning stress-ng or canaries.
-Re-run without --dry-run (or unset HPP_SKIP_PRESSURE) to execute the live proof.
+Preconditions are SATISFIED for this script to run live. The dry-run / no-flag
+refusal is BY DESIGN (r3f8): a precondition check does NOT prove the host
+absorbs pressure. The verifier Gate 9 catches exit 64 as "proof not attempted"
+and will FAIL unless HPP_LIVE=1 is set and the live run exits 0.
 EOF
-    log "DRY-RUN complete; preconditions satisfied (exit 0)"
-    exit 0
+        log "[FAIL] DRY-RUN mode does NOT satisfy Gate 9; only --live is a valid proof path. Set HPP_LIVE=1 or invoke --live explicitly and run the canary burst."
+        printf '[FAIL] DRY-RUN mode does NOT satisfy Gate 9; only --live is a valid proof path. Set HPP_LIVE=1 or invoke --live explicitly and run the canary burst.\n' >&2
+        exit 64
+    fi
+    log "HPP_LIVE=1 is required for live mode (current value='${HPP_LIVE:-unset}'). Refusing to spawn stress-ng on a forgotten terminal."
+    printf '[FAIL] HPP_LIVE=1 required: this host-pressure proof is operator-gated. Set HPP_LIVE=1 (or pass --live) to authorize the live burst.\n' >&2
+    exit 33
 fi
+
+# Live mode entered. Promote EFFECTIVE_CONCURRENCY for the rest of the script.
+HPP_CONCURRENCY="${EFFECTIVE_CONCURRENCY}"
+log "LIVE MODE entered (HPP_LIVE=1, --dry-run not set); concurrency=${HPP_CONCURRENCY}"
 
 # -------- live path ------------------------------------------------------------
 #
@@ -411,7 +545,26 @@ fi
 # Aborts are non-zero (exit 1); precondition failures are exit 2 (handled
 # above); clean recovery is exit 0.
 
-trap 'log "ABORT: caught signal; cleaning up stress-ng and canary PIDs"; kill $(jobs -p) 2>/dev/null || true; exit 1' INT TERM
+trap 'log "ABORT: caught signal; cleaning up stress-ng and canary PIDs"; kill $(jobs -p) 2>/dev/null || true; hpp_cleanup; exit 1' INT TERM
+
+# Cleanup hook — registered for EXIT too so a normal completion (exit 0) still
+# tears down temp files and the dmesg snapshot. No-op if cleanup already ran.
+hpp_cleanup() {
+    local rc=$?
+    if [ -n "${STRESS_NG_LOG:-}" ] && [ -f "${STRESS_NG_LOG}" ]; then
+        rm -f "${STRESS_NG_LOG}" 2>/dev/null || true
+    fi
+    if [ -n "${CANARY_OUT_DIR:-}" ] && [ -d "${CANARY_OUT_DIR}" ]; then
+        rm -rf "${CANARY_OUT_DIR}" 2>/dev/null || true
+    fi
+    if [ -n "${DMESG_SNAPSHOT:-}" ] && [ -f "${DMESG_SNAPSHOT}" ]; then
+        rm -f "${DMESG_SNAPSHOT}" 2>/dev/null || true
+    fi
+    return ${rc}
+}
+# EXIT trap is harmless if hpp_cleanup wasn't defined above yet (deferred
+# to runtime — bash resolves by the time the trap fires).
+trap 'hpp_cleanup' EXIT
 
 # Phase 2: stress-ng ------------------------------------------------------------
 # Spawn from systemd-run --user --slice=agents.slice --scope so the pressure
@@ -438,11 +591,9 @@ log "stress-ng scope launched: systemd-run pid=${SYSTEMD_RUN_PID} stress-ng pid=
 
 # Phase 3: concurrent canary burst ----------------------------------------------
 # canary-once does not accept --concurrency, so we spawn HPP_CONCURRENCY
-# independent invocations in the background. Each captures its run-id from
-# stdout. We do NOT fail-closed on a single canary timeout (a slow GitHub
-# workflow is not a host-pressure failure); the host-pressure signals come
-# from dmesg, QEMU RSS, and slice memory — the canary is just to make
-# sure the runner pipeline stays responsive under pressure.
+# independent invocations in the background. Each writes a structured result
+# file so the verdict phase can attribute canary-specific failures to run-id.
+# Per r3f9: ANY canary failure (non-zero exit or per-canary timeout) is FAIL.
 log "PHASE 3: dispatching ${HPP_CONCURRENCY} concurrent canary invocations (timeout=${HPP_CANARY_TIMEOUT_SECONDS}s each)"
 CANARY_OUT_DIR="$(mktemp -d -t hpp-canary.XXXXXX)"
 CANARY_PIDS=()
@@ -450,13 +601,24 @@ for i in $(seq 1 "${HPP_CONCURRENCY}"); do
     (
         out_file="${CANARY_OUT_DIR}/canary-${i}.json"
         log_file="${CANARY_OUT_DIR}/canary-${i}.log"
-        if "${EZGHA_BIN}" --config "${CONFIG_FILE}" canary-once \
-            --timeout-seconds "${HPP_CANARY_TIMEOUT_SECONDS}" \
-            --no-alert >"${out_file}" 2>"${log_file}"; then
+        rc_file="${CANARY_OUT_DIR}/canary-${i}.rc"
+        # Run the canary with an outer timeout so a hung canary-once cannot
+        # block past HPP_CANARY_TIMEOUT_SECONDS. We add a small grace on
+        # top of the canary's internal --timeout-seconds so the wrapper
+        # catches hangs the inner timeout does not.
+        outer_timeout=$(( HPP_CANARY_TIMEOUT_SECONDS + 30 ))
+        if timeout "${outer_timeout}" \
+            "${EZGHA_BIN}" --config "${CONFIG_FILE}" canary-once \
+                --timeout-seconds "${HPP_CANARY_TIMEOUT_SECONDS}" \
+                --no-alert >"${out_file}" 2>"${log_file}"; then
             run_id="$(jq -r '.run_id // "unknown"' "${out_file}" 2>/dev/null || echo "unknown")"
             log "CANARY-${i} OK run_id=${run_id}"
+            printf '0\n' >"${rc_file}"
         else
-            log "CANARY-${i} FAIL (see ${log_file})"
+            rc=$?
+            log "CANARY-${i} FAIL exit=${rc} (see ${log_file})"
+            # 124 = GNU timeout killed it; preserve distinct signal info.
+            printf '%s\n' "${rc}" >"${rc_file}"
         fi
     ) &
     CANARY_PIDS+=( $! )
@@ -612,12 +774,56 @@ if [ "${RECOVERY_OK}" != "1" ]; then
     EXIT_CODE=1
     REASONS+=( "RECOVERY_FAILED: MemAvailable did not return to within ${HPP_RECOVERY_PCT}% of baseline within ${HPP_RECOVERY_TIMEOUT_SECONDS}s" )
 fi
-if [ "${FINAL_RUNNER_COUNT}" -lt "${BASELINE_RUNNER_COUNT}" ]; then
-    # Runners may have been intentionally shed by lane J; the proof
-    # is that the host did not crash, not that every runner survived.
-    # We log it as a WARNING, not an abort, because lane J's stage 1
-    # is allowed to stop low-priority containers under pressure.
-    log "WARN: runner count dropped from ${BASELINE_RUNNER_COUNT} to ${FINAL_RUNNER_COUNT} (likely lane J stage 1 drain — expected under pressure)"
+
+# r3f9 — CANARY claim: any canary exit non-zero or timeout = FAIL.
+# Walk the per-canary rc files; the CANARY_PIDS loop above already waited
+# for the wrappers, so the rc files are populated.
+CANARY_FAIL_COUNT=0
+if [ "${HPP_CONCURRENCY}" -gt 0 ]; then
+    for i in $(seq 1 "${HPP_CONCURRENCY}"); do
+        rc_file="${CANARY_OUT_DIR}/canary-${i}.rc"
+        if [ -f "${rc_file}" ]; then
+            rc="$(cat "${rc_file}" 2>/dev/null | tr -d '[:space:]')"
+            if [ -z "${rc}" ]; then rc=1; fi
+            if [ "${rc}" != "0" ]; then
+                CANARY_FAIL_COUNT=$(( CANARY_FAIL_COUNT + 1 ))
+            fi
+        else
+            # No rc file at all = wrapper died before recording = treat as FAIL.
+            CANARY_FAIL_COUNT=$(( CANARY_FAIL_COUNT + 1 ))
+        fi
+    done
+fi
+if [ "${CANARY_FAIL_COUNT}" -gt 0 ]; then
+    EXIT_CODE=1
+    REASONS+=( "CANARY_FAILED: ${CANARY_FAIL_COUNT}/${HPP_CONCURRENCY} canaries exited non-zero or timed out (r3f9: any canary failure = FAIL)" )
+fi
+
+# r3f9 — RUNNER-LOSS claim: drop > HPP_RUNNER_LOSS_PCT% of baseline = FAIL.
+# Intentionally stricter than r3 commit 1d68972 (which only WARNed). Lane J's
+# stage 1 drain is allowed only when its hysteresis gate fires — but that
+# gate's verdict IS the admission-refusal signal checked below. If admission
+# refusal was observed AND we lost runners, that's the expected shed chain
+# and we accept up to RUNNER_LOSS_PCT%. If NO admission refusal was observed
+# AND we lost runners, the gate is broken and we FAIL.
+RUNNER_LOSS=$(( BASELINE_RUNNER_COUNT - FINAL_RUNNER_COUNT ))
+if [ "${RUNNER_LOSS}" -lt 0 ]; then RUNNER_LOSS=0; fi
+RUNNER_LOSS_PCT_RAW=0
+if [ "${BASELINE_RUNNER_COUNT}" -gt 0 ]; then
+    RUNNER_LOSS_PCT_RAW=$(( RUNNER_LOSS * 100 / BASELINE_RUNNER_COUNT ))
+fi
+if [ "${RUNNER_LOSS_PCT_RAW}" -gt "${HPP_RUNNER_LOSS_PCT}" ]; then
+    EXIT_CODE=1
+    REASONS+=( "RUNNER_LOSS_OVER_LIMIT: lost ${RUNNER_LOSS}/${BASELINE_RUNNER_COUNT} runners (${RUNNER_LOSS_PCT_RAW}%) during pressure; threshold=${HPP_RUNNER_LOSS_PCT}% (r3f9: >10% = FAIL)" )
+fi
+
+# r3f9 — ADMISSION REFUSAL claim: gate must refuse AT LEAST ONCE under peak
+# pressure if HPP_REQUIRE_ADMISSION_REFUSAL=1. Without this, the proof is
+# inconclusive — the gate could be mis-wired or the pressure too low to
+# reach threshold, and we'd return PASS on a system that cannot shed.
+if [ "${HPP_REQUIRE_ADMISSION_REFUSAL}" = "1" ] && [ "${ADMISSION_REFUSAL_OBSERVED}" != "1" ]; then
+    EXIT_CODE=1
+    REASONS+=( "ADMISSION_REFUSAL_MISSING: zero 'runner_pool.memory_pressure' alerts during pressure phase; the admission gate did NOT trigger — pressure may be too low or gate is mis-wired (r3f9: required signal absent)" )
 fi
 
 # Final dmesg OOM check trumps everything
@@ -634,19 +840,19 @@ log "  baseline load_1min     : ${BASELINE_LOAD_1MIN}"
 log "  baseline qemu_rss      : $((BASELINE_QEMU_RSS_KB / 1024))MB"
 log "  baseline runners       : ${BASELINE_RUNNER_COUNT}"
 log "  pressure (MB)          : ${PRESSURE_MB} (${PRESSURE_SOURCE})"
+log "  concurrency            : ${HPP_CONCURRENCY} (0 = auto → runner_count)"
+log "  canary fail count      : ${CANARY_FAIL_COUNT}/${HPP_CONCURRENCY}"
+log "  runner loss            : ${RUNNER_LOSS}/${BASELINE_RUNNER_COUNT} (${RUNNER_LOSS_PCT_RAW}%; threshold ${HPP_RUNNER_LOSS_PCT}%)"
 log "  max load_1min observed : ${MAX_LOAD_1MIN}"
 log "  max agents.slice (MB)  : ${MAX_AGENTS_MB}"
 log "  slice reclaim observed : ${SLICE_RECLAIM_OBSERVED}"
-log "  admission refusal obs. : ${ADMISSION_REFUSAL_OBSERVED}"
+log "  admission refusal obs. : ${ADMISSION_REFUSAL_OBSERVED} (required=${HPP_REQUIRE_ADMISSION_REFUSAL})"
 log "  recovery ok            : ${RECOVERY_OK}"
 log "  final mem_available    : $((FINAL_QEMU_RSS_KB / 1024))MB qemu / $((RECOVERY_FINAL_KB / 1024))MB host"
 log "  final runners          : ${FINAL_RUNNER_COUNT}"
 log "  OOM during pressure    : ${OOM_KILL_DETECTED}"
 log "  OOM after pressure     : ${FINAL_OOM_KILL_DETECTED}"
 log "================================================="
-
-# Cleanup the dmesg snapshot
-rm -f "${DMESG_SNAPSHOT}" || true
 
 if [ "${EXIT_CODE}" = "0" ]; then
     log "PASS: host absorbed pressure + recovered without OOM/watchdog/abort"
