@@ -1245,9 +1245,8 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
         // first probe cached false and refused to start runners for 5
         // minutes (the new TTL cache from round-3 lane E3).
         let last = cols[cols.len() - 1];
-        let is_v1_row = cols.len() >= 4
-            && !cols[0].starts_with('#')
-            && (last == "0" || last == "1");
+        let is_v1_row =
+            cols.len() >= 4 && !cols[0].starts_with('#') && (last == "0" || last == "1");
         if is_v1_row {
             if last != "1" {
                 // Disabled controller — must NOT count, even if its
