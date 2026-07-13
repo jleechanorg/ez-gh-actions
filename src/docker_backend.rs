@@ -1130,7 +1130,7 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
         if cols.len() >= 2 && !cols[0].starts_with('#') {
             // v2 single-line space-separated list: any token equal to "cpu".
             // Skip the v1 header line "#subsys_name hierarchy num_cgroups enabled".
-            if cols.iter().any(|c| *c == "cpu") {
+            if cols.contains(&"cpu") {
                 return true;
             }
         }
