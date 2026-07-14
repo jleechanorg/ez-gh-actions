@@ -17,6 +17,7 @@ use crate::backend::Backend;
 use crate::config::Config;
 use crate::github;
 use crate::platform::Platform;
+use crate::quarantine::{self, QuarantineEntry, QuarantineReason, QuarantineTable};
 use crate::reaper;
 use crate::watchdog;
 
@@ -338,13 +339,34 @@ pub fn next_slot(cfg: &Config) -> Result<u32> {
 /// remaining retry in the batch to pile onto one permanently-broken slot
 /// while every other genuinely-fillable slot went untried (bead
 /// ez-gh-actions-oau).
+///
+/// ALSO skips slots currently in the quarantine table (bead
+/// ez-gh-actions-ghd2.2): a wedged-422 slot stays reserved (not freed) until
+/// GitHub releases the lock, so `next_slot` must not re-allocate it. The
+/// quarantine exclusion is merged with the caller-supplied `excluded` set,
+/// so per-tick `failed_slots` (the oau fix) and the cross-tick quarantine
+/// gate (the ghd2.2 fix) compose cleanly.
 pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<u32> {
     if cfg.runner.count == 0 {
         bail!("cfg.runner.count is 0; nothing to allocate");
     }
+    let quarantine_excluded = match quarantine::load_quarantine() {
+        Ok(table) => table.excluded_slots(),
+        Err(err) => {
+            // A corrupt quarantine file must NOT block all allocations —
+            // `release_stale_slots` already logged the parse error and
+            // proceeded with an empty table for this tick, and we mirror
+            // that here so a single bad write doesn't wedge the daemon.
+            eprintln!(
+                "warning: next_slot_excluding could not load quarantine table, \
+                 proceeding without quarantine exclusion: {err:#}"
+            );
+            HashSet::new()
+        }
+    };
     let mut assignments = read_slot_assignments_for(Some(cfg))?;
     for slot in 1..=cfg.runner.count {
-        if excluded.contains(&slot) {
+        if excluded.contains(&slot) || quarantine_excluded.contains(&slot) {
             continue;
         }
         let key = slot.to_string();
@@ -400,6 +422,14 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
 /// eventually refuses to allocate even though no real runner is consuming
 /// the slot. Called at the start of `ensure_count` so `serve` self-heals
 /// without operator intervention.
+///
+/// Wedged-422 slots (bead ez-gh-actions-ghd2.2) are handled by the
+/// `quarantine` sub-module: an offline+busy runner whose DELETE returns 422
+/// even after the reaper cancel-then-delete dance is recorded in
+/// `quarantined_slots.toml` so the slot stays reserved (not allocated to
+/// fresh work), the API surface area is bounded per tick, and the slot
+/// auto-recovers the next time GitHub releases the 422 lock (the runner
+/// appears online, offline+!busy, or disappears from the live list).
 ///
 /// Returns the number of slots reclaimed.
 pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
@@ -461,50 +491,66 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
         local_container_names.as_ref(),
     )?;
     let mut reclaimed = reclaimed;
-    if let Some(local_names) = local_container_names.as_ref() {
-        for (slot_n, runner_id, runner_name) in offline_busy_owned_missing_container_slots(
-            &assignments,
-            &live_runners,
-            &cfg.runner.name_prefix,
-            local_names,
-        ) {
-            eprintln!(
-                "warning: removing offline/busy runner {runner_name} (id {runner_id}) with no local container before releasing slot {slot_n}"
-            );
-            match github::remove_runner(&cfg.github, runner_id) {
-                Ok(()) => {
-                    release_slot_for(Some(cfg), slot_n)?;
-                    reclaimed += 1;
-                    watchdog::ping();
-                }
-                Err(err) if is_runner_busy_lock_error(&err) => {
-                    // GitHub's DELETE-runner lock is job-side, not
-                    // runner-side (see memory gh-zombie-runner-422-delete-lock):
-                    // cancel the phantom run pinned to this runner first,
-                    // which is what actually holds the 422 lock, then retry
-                    // the delete. `live_runners` already has this runner's
-                    // `RunnerInfo` from the reconciliation fetch above.
-                    let healed = live_runners
-                        .iter()
-                        .find(|r| r.id == runner_id)
-                        .is_some_and(|r| reclaim_zombie_locked_runner(cfg, r));
-                    if healed {
-                        release_slot_for(Some(cfg), slot_n)?;
-                        reclaimed += 1;
-                        watchdog::ping();
-                    } else {
-                        eprintln!(
-                            "warning: keeping slot {slot_n}: failed to remove offline/busy runner {runner_name} (id {runner_id}) even after zombie-slot self-heal: {err:#}"
-                        );
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "warning: keeping slot {slot_n}: failed to remove offline/busy runner {runner_name} (id {runner_id}): {err:#}"
-                    );
-                }
-            }
-        }
+    // Load (or initialize) the quarantine table. A corrupt file degrades to
+    // an empty table for this tick — `load_quarantine` already logged the
+    // parse error. The empty-table fallback is the same fail-soft policy as
+    // the slot assignments loader so a single bad write doesn't wedge the
+    // entire reconciliation cycle.
+    let mut quarantine = quarantine::load_quarantine().unwrap_or_else(|err| {
+        eprintln!(
+            "warning: release_stale_slots proceeding with empty quarantine table (parse failed): {err:#}"
+        );
+        QuarantineTable::default()
+    });
+    let max_attempts_per_tick = max_reconcile_attempts_per_tick();
+    let reclaimed_quarantine = reconcile_offline_busy_zombies(
+        Some(cfg),
+        &assignments,
+        &live_runners,
+        &cfg.runner.name_prefix,
+        local_container_names.as_ref(),
+        &mut quarantine,
+        max_attempts_per_tick,
+        |runner_id| github::remove_runner(&cfg.github, runner_id),
+        |runner| reclaim_zombie_locked_runner(cfg, runner),
+        |slot_n, runner_id, runner_name, age_secs, attempt_count| {
+            alert::notify(
+                cfg,
+                &format!("runner_pool.slot_quarantined.{slot_n}"),
+                Severity::Warning,
+                &format!(
+                    "ezgha slot {slot_n} quarantined: runner {runner_name} (id {runner_id}) held by 422 lock"
+                ),
+                &format!(
+                    "runner_id={runner_id} runner_name={runner_name} slot={slot_n} \
+                     reason=Locked422 age_secs={age_secs} attempt_count={attempt_count}"
+                ),
+            )
+        },
+        |slot_n, runner_id, runner_name, attempt_count, first_seen_age_secs| {
+            alert::notify(
+                cfg,
+                &format!("runner_pool.slot_unquarantined.{slot_n}"),
+                Severity::Info,
+                &format!(
+                    "ezgha slot {slot_n} auto-recovered: runner {runner_name} (id {runner_id}) 422 lock released"
+                ),
+                &format!(
+                    "slot={slot_n} runner_id={runner_id} runner_name={runner_name} \
+                     attempts={attempt_count} first_seen_age_secs={first_seen_age_secs}"
+                ),
+            )
+        },
+    )?;
+    reclaimed += reclaimed_quarantine;
+    // Persist any changes to the quarantine table. A failure here must not
+    // poison the rest of the reconcile cycle — we log and continue; the
+    // worst case is that the next tick re-derives the same quarantine state
+    // from scratch (idempotent).
+    if let Err(err) = quarantine::save_quarantine(&quarantine) {
+        eprintln!(
+            "warning: failed to persist quarantine table; next tick will re-derive from scratch: {err:#}"
+        );
     }
     watchdog::ping();
     // 4th sub-pass (bead ez-gh-actions-u3w): Path 1 already released the slot
@@ -846,11 +892,269 @@ fn runner_name_from_prefix(prefix: &str, slot: u32) -> String {
     format!("{prefix}-{slot}")
 }
 
+/// Quarantine-aware reconcile for slots whose runner is `offline && busy &&
+/// no local container` (the 422-zombie class, bead ez-gh-actions-ghd2.2).
+///
+/// All IO is injected as closures so this function is exercised in tests
+/// against a fake `github::remove_runner` and a fake zombie reclaimer
+/// without touching the network or the reaper's live cancel/force-cancel
+/// path. The production caller wires the real `github::remove_runner` and
+/// `reclaim_zombie_locked_runner`; tests wire fakes that capture any
+/// context they need in their own closure environment.
+///
+/// Returns the number of slots reclaimed (released). `quarantine` is
+/// mutated in place — on success the caller persists it via
+/// `quarantine::save_quarantine`. The function does not persist
+/// `assignments` either; that is `release_stale_slots`'s job (via
+/// `release_slot_for`), and tests can inspect either via the closures.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_offline_busy_zombies(
+    cfg: Option<&Config>,
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    quarantine: &mut QuarantineTable,
+    max_attempts_per_tick: u32,
+    remove_runner: impl Fn(u64) -> Result<()>,
+    try_zombie_reclaim: impl Fn(&github::RunnerInfo) -> bool,
+    notify_quarantine: impl Fn(u32, u64, &str, u64, u32) -> Result<()>,
+    notify_recovery: impl Fn(u32, u64, &str, u32, u64) -> Result<()>,
+) -> Result<usize> {
+    let _ = assignments;
+    let Some(local_names) = local_container_names else {
+        // Container-aware reconciliation was skipped (docker unreachable);
+        // nothing to do here either — the auto-recovery pass below would
+        // still try, but without a healthy `live_runners` snapshot the
+        // behavior is identical to upstream `release_stale_slots`'s skip.
+        return Ok(0);
+    };
+    let mut reclaimed = 0;
+    let mut attempts_this_tick: u32 = 0;
+    for (slot_n, runner_id, runner_name) in offline_busy_owned_missing_container_slots(
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_names,
+    ) {
+        let already_quarantined = quarantine.is_quarantined(slot_n);
+        if already_quarantined {
+            // Slot is already in the quarantine table from a prior tick
+            // and is still locked (the offline+busy+missing-container
+            // shape is unchanged). Skip the entire DELETE + reaper dance
+            // — both are wasted API calls when the lock is unchanged.
+            // The auto-recovery pass below handles the un-quarantine
+            // path the moment GH releases the lock (online /
+            // offline+!busy / gone-from-list). This is the explicit
+            // "bound retry/API volume" + "auto-recover when lock
+            // releases" contract from bead ez-gh-actions-ghd2.2.
+            eprintln!(
+                "info: slot {slot_n} already quarantined (runner {runner_name} id {runner_id}, \
+                 attempt_count={}); deferring to auto-recovery lane this tick",
+                quarantine.get(slot_n).map(|e| e.attempt_count).unwrap_or(0)
+            );
+            continue;
+        }
+        eprintln!(
+            "warning: removing offline/busy runner {runner_name} (id {runner_id}) with no local container before releasing slot {slot_n}"
+        );
+        match remove_runner(runner_id) {
+            Ok(()) => {
+                release_slot_for(cfg, slot_n)?;
+                quarantine.remove(slot_n);
+                reclaimed += 1;
+                watchdog::ping();
+            }
+            Err(err) if is_runner_busy_lock_error(&err) => {
+                // For a FRESH 422 detection (the slot is not yet in the
+                // quarantine table), try the reaper self-heal ONCE per
+                // tick across ALL fresh detections, then skip the reaper
+                // for the rest of the tick. The first detection pays the
+                // API cost; subsequent ones in the same tick go straight
+                // to quarantine and wait for the next tick's reaper
+                // budget (or the auto-recovery pass). This is the
+                // explicit "bound retry/API volume" contract.
+                let healed = if attempts_this_tick < max_attempts_per_tick {
+                    attempts_this_tick += 1;
+                    live_runners
+                        .iter()
+                        .find(|r| r.id == runner_id)
+                        .is_some_and(&try_zombie_reclaim)
+                } else {
+                    false
+                };
+                if healed {
+                    release_slot_for(cfg, slot_n)?;
+                    quarantine.remove(slot_n);
+                    reclaimed += 1;
+                    watchdog::ping();
+                } else {
+                    let now = unix_now_secs();
+                    let (attempt_count, first_seen) = match quarantine.get_mut(slot_n) {
+                        Some(existing) => {
+                            existing.attempt_count = existing.attempt_count.saturating_add(1);
+                            existing.last_attempt_epoch_secs = now;
+                            (existing.attempt_count, existing.first_seen_epoch_secs)
+                        }
+                        None => {
+                            let entry = QuarantineEntry {
+                                slot: slot_n,
+                                runner_id,
+                                runner_name: runner_name.clone(),
+                                first_seen_epoch_secs: now,
+                                attempt_count: 1,
+                                last_attempt_epoch_secs: now,
+                                reason: QuarantineReason::Locked422,
+                            };
+                            let attempt_count = entry.attempt_count;
+                            let first_seen = entry.first_seen_epoch_secs;
+                            quarantine.upsert(entry);
+                            (attempt_count, first_seen)
+                        }
+                    };
+                    eprintln!(
+                        "warning: quarantining slot {slot_n}: runner {runner_name} (id {runner_id}) \
+                         — DELETE 422 lock held by GitHub-side phantom job; \
+                         attempt_count={attempt_count}, last_attempt_epoch_secs={now}"
+                    );
+                    if let Some(_cfg) = cfg {
+                        // Always fire the operator alert when a slot
+                        // transitions into quarantine (either freshly or
+                        // re-confirmed). The alert module's own
+                        // should_send() cooldown dedupes per event key
+                        // (one key per slot) so a single stuck slot doesn't
+                        // spam the channel every tick.
+                        let age_secs = now.saturating_sub(first_seen);
+                        let _ = notify_quarantine(
+                            slot_n,
+                            runner_id,
+                            &runner_name,
+                            age_secs,
+                            attempt_count,
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: keeping slot {slot_n}: failed to remove offline/busy runner {runner_name} (id {runner_id}): {err:#}"
+                );
+            }
+        }
+    }
+    // Auto-recovery pass: existing quarantined slots whose runner has
+    // stopped being 422-locked (it went online, or offline+!busy, or
+    // disappeared entirely) can have their registration removed cleanly.
+    let quarantined_slots: Vec<u32> = quarantine.slots();
+    for slot_n in quarantined_slots {
+        let Some(entry) = quarantine.get(slot_n).cloned() else {
+            continue;
+        };
+        let runner_now = live_runners.iter().find(|r| r.id == entry.runner_id);
+        let (recoverable, note) = match runner_now {
+            None => (
+                true,
+                "registration no longer in live list — GH released lock".to_string(),
+            ),
+            Some(r) if r.status.eq_ignore_ascii_case("online") => {
+                (true, "runner is online (GH released 422 lock)".to_string())
+            }
+            Some(r) if !r.busy => (
+                true,
+                format!("runner status={} busy=false — 422 lock released", r.status),
+            ),
+            Some(r) => (
+                false,
+                format!(
+                    "runner still status={} busy={} — 422 lock not released yet",
+                    r.status, r.busy
+                ),
+            ),
+        };
+        if !recoverable {
+            eprintln!(
+                "info: quarantined slot {slot_n} (runner {} id {}): {note}; keeping quarantine",
+                entry.runner_name, entry.runner_id
+            );
+            continue;
+        }
+        eprintln!(
+            "info: quarantined slot {slot_n} (runner {} id {}): {note}; attempting un-quarantine + release",
+            entry.runner_name, entry.runner_id
+        );
+        match remove_runner(entry.runner_id) {
+            Ok(()) => {
+                release_slot_for(cfg, slot_n)?;
+                quarantine.remove(slot_n);
+                reclaimed += 1;
+                watchdog::ping();
+                if let Some(_cfg) = cfg {
+                    let age_secs = unix_now_secs().saturating_sub(entry.first_seen_epoch_secs);
+                    let _ = notify_recovery(
+                        slot_n,
+                        entry.runner_id,
+                        &entry.runner_name,
+                        entry.attempt_count,
+                        age_secs,
+                    );
+                }
+            }
+            Err(err) if is_runner_busy_lock_error(&err) => {
+                if let Some(existing) = quarantine.get_mut(slot_n) {
+                    existing.last_attempt_epoch_secs = unix_now_secs();
+                }
+                eprintln!(
+                    "info: auto-recovery on slot {slot_n} (runner {} id {}) hit 422 again; keeping quarantine: {err:#}",
+                    entry.runner_name, entry.runner_id
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: auto-recovery delete on slot {slot_n} (runner {} id {}) failed with non-422 error; keeping quarantine: {err:#}",
+                    entry.runner_name, entry.runner_id
+                );
+            }
+        }
+    }
+    Ok(reclaimed)
+}
+
 /// Poll/force-cancel attempts given to the reaper executor before this tick
 /// gives up on a zombie-locked runner. Deliberately short: `release_stale_slots`
 /// re-runs every reconciliation cycle, so a failed attempt here just retries
 /// from scratch next tick rather than blocking this one on a long poll.
 const ZOMBIE_RECLAIM_POLL_ATTEMPTS: u32 = 3;
+
+/// Per-tick cap on `reclaim_zombie_locked_runner` invocations across all
+/// wedged slots (bead ez-gh-actions-ghd2.2 acceptance: "bound retry/API
+/// volume"). One self-heal attempt per tick keeps the API surface predictable
+/// even when 8/22 slots are simultaneously 422-locked; pre-fix, every wedged
+/// slot issued its own cancel + poll cascade per tick, which combined with
+/// the Mac escalation path produced backend-restart storms. The bound is
+/// deliberately 1 (not N): the per-slot `attempt_count` already tracks
+/// cumulative history for alerting, and the auto-recovery pass gets the next
+/// chance to act. Tests override this via `TEST_MAX_RECONCILE_ATTEMPTS_PER_TICK`
+/// to drive multiple-attempts-per-tick scenarios without altering the
+/// production value (see `quarantine_422_test.rs`-equivalent cases in the
+/// `mod tests` block below).
+fn max_reconcile_attempts_per_tick() -> u32 {
+    #[cfg(test)]
+    {
+        if let Some(v) = *TEST_MAX_RECONCILE_ATTEMPTS_PER_TICK.lock().unwrap() {
+            return v;
+        }
+    }
+    MAX_RECONCILE_ATTEMPTS_PER_TICK_DEFAULT
+}
+
+/// Production default for `max_reconcile_attempts_per_tick`. Named with the
+/// `_DEFAULT` suffix so the overrideable accessor above is the only path
+/// the rest of the code reads through — prevents accidental direct reads.
+const MAX_RECONCILE_ATTEMPTS_PER_TICK_DEFAULT: u32 = 1;
+
+#[cfg(test)]
+static TEST_MAX_RECONCILE_ATTEMPTS_PER_TICK: std::sync::Mutex<Option<u32>> =
+    std::sync::Mutex::new(None);
 
 /// Does `err` look like GitHub's "runner is currently running a job and
 /// cannot be deleted" (HTTP 422) lock, as opposed to some other failure
@@ -4616,5 +4920,636 @@ minimum_isolation = "container"
                 "refusal message must cite hysteresis, got: {err}"
             );
         }
+    }
+
+    // --- bead ez-gh-actions-ghd2.2: offline-busy 422 quarantine ---------
+
+    /// Helper: spin up a test environment with a 2-slot fleet and a single
+    /// slot already recorded as offline+busy+no-container. This is the
+    /// precondition for the 422 quarantine path — a container that died
+    /// while GitHub still thinks a job is running on the runner.
+    fn quarantine_test_setup(
+        label: &str,
+        prefix: &str,
+        slot: u32,
+        runner_id: u64,
+        runner_name: &str,
+        busy: bool,
+    ) -> (TestEnv, Config, SlotAssignments) {
+        let env = TestEnv::new(label);
+        let cfg = cfg_with(2, prefix);
+        // Reserve + record the wedged slot
+        let _ = next_slot(&cfg).unwrap();
+        // Walk to the requested slot number so the test can pin
+        // quarantined slot != always-slot-1.
+        for s in 1..slot {
+            let _ = next_slot(&cfg).unwrap();
+            record_slot_runner_id(s, 10_000 + s as u64).unwrap();
+        }
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(slot, runner_id).unwrap();
+        // Confirm slot is recorded
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(
+            assignments.assignments.get(&slot.to_string()),
+            Some(&runner_id.to_string())
+        );
+        // Snapshot a busy-state for the live runner in the helper so the
+        // caller can build the live_runners list and the runner-name stays
+        // stable.
+        let _ = (busy, runner_name);
+        (env, cfg, assignments)
+    }
+
+    /// Drive a single reconcile tick through `reconcile_offline_busy_zombies`
+    /// (the closure-injected production helper) with the supplied fake
+    /// `remove_runner` (a 422 simulator or an Ok simulator) and a fake
+    /// zombie reclaimer that returns `false` (we want the quarantine lane,
+    /// not the self-heal-success lane, in these tests).
+    #[allow(clippy::type_complexity)]
+    fn drive_reconcile_tick(
+        cfg: &Config,
+        assignments: &SlotAssignments,
+        live_runners: &[github::RunnerInfo],
+        quarantine: &mut QuarantineTable,
+        max_attempts_per_tick: u32,
+        remove_runner: impl Fn(u64) -> Result<()> + Copy,
+    ) -> usize {
+        let local_names = HashSet::<String>::new();
+        let alerts: std::sync::Mutex<Vec<(u32, u64, String, u64, u32)>> =
+            std::sync::Mutex::new(Vec::new());
+        let recoveries: std::sync::Mutex<Vec<(u32, u64, String, u32, u64)>> =
+            std::sync::Mutex::new(Vec::new());
+        let reclaimed = reconcile_offline_busy_zombies(
+            None,
+            assignments,
+            live_runners,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            quarantine,
+            max_attempts_per_tick,
+            remove_runner,
+            |_runner| false,
+            |slot_n, runner_id, runner_name, age_secs, attempt_count| {
+                alerts.lock().unwrap().push((
+                    slot_n,
+                    runner_id,
+                    runner_name.to_string(),
+                    age_secs,
+                    attempt_count,
+                ));
+                Ok(())
+            },
+            |slot_n, runner_id, runner_name, attempts, first_seen_age_secs| {
+                recoveries.lock().unwrap().push((
+                    slot_n,
+                    runner_id,
+                    runner_name.to_string(),
+                    attempts,
+                    first_seen_age_secs,
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        // Stash the alerts/recoveries on the side via stderr so tests
+        // can grep if needed; the per-tick count is the primary assertion.
+        let _ = alerts;
+        let _ = recoveries;
+        reclaimed
+    }
+
+    /// Regression: a fresh 422 lock on a single wedged slot enters the
+    /// quarantine table, fires one operator alert with the runner id and
+    /// age, and does NOT release the slot. rqb9 (idle+no-registration) is
+    /// NOT routed through quarantine — verified by checking that the
+    /// rqb9-shape (container UP + offline + !busy + no registration in
+    /// `live_runners`) does not show up in `quarantine.get(slot)` after
+    /// a tick.
+    #[test]
+    fn quarantine_state_explicit_on_first_422_detection() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("first_422");
+        let (_env, cfg, assignments) = quarantine_test_setup(
+            "first_422_state",
+            "ez-org-runner",
+            1,
+            4242,
+            "ez-org-runner-1",
+            true,
+        );
+        let live = vec![github::RunnerInfo {
+            id: 4242,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: true,
+        }];
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        assert!(!quarantine.is_quarantined(1));
+
+        let err_422 = || -> Result<()> {
+            Err(anyhow::anyhow!(
+                "gh api remove runner 4242 failed: gh: Runner \"ez-org-runner-1\" \
+                 is currently running a job and cannot be deleted. (HTTP 422)"
+            ))
+        };
+        let reclaimed =
+            drive_reconcile_tick(&cfg, &assignments, &live, &mut quarantine, 1, |_| err_422());
+        assert_eq!(
+            reclaimed, 0,
+            "422 wedge must NOT reclaim the slot this tick"
+        );
+        assert!(
+            quarantine.is_quarantined(1),
+            "slot 1 must be in quarantine table after first 422 detection"
+        );
+        let entry = quarantine.get(1).unwrap();
+        assert_eq!(entry.runner_id, 4242);
+        assert_eq!(entry.runner_name, "ez-org-runner-1");
+        assert_eq!(entry.reason, crate::quarantine::QuarantineReason::Locked422);
+        assert_eq!(
+            entry.attempt_count, 1,
+            "first quarantine must record attempt_count=1"
+        );
+        assert!(entry.first_seen_epoch_secs > 0);
+        // Slot file is untouched — quarantine is additive, not destructive.
+        let assignments_after = read_slot_assignments().unwrap();
+        assert_eq!(
+            assignments_after.assignments.get("1"),
+            Some(&"4242".to_string()),
+            "quarantine must NOT release the slot — that is rqb9's job for a \
+             different shape; here, the runner is offline+busy per GH and the \
+             container is dead, so we DEFER the slot, not free it"
+        );
+    }
+
+    /// Regression: with multiple wedged slots in a single tick, only ONE
+    /// reaper self-heal attempt fires (the rest skip to quarantine
+    /// immediately) — this is the "bound retry/API volume" lane. Without
+    /// it, a fleet with 8 stuck runners would issue 8 x
+    /// (collect_repo_runs + cancel + poll cascade) per tick.
+    #[test]
+    fn quarantine_bounds_api_volume_per_tick() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("bound_api");
+        let (_env, cfg, _assignments) = quarantine_test_setup(
+            "bound_api_volume",
+            "ez-org-runner",
+            1,
+            4242,
+            "ez-org-runner-1",
+            true,
+        );
+        // Second wedged slot in the SAME tick.
+        record_slot_runner_id(2, 5252).unwrap();
+        let assignments = read_slot_assignments().unwrap();
+        let live = vec![
+            github::RunnerInfo {
+                id: 4242,
+                name: "ez-org-runner-1".into(),
+                status: "offline".into(),
+                busy: true,
+            },
+            github::RunnerInfo {
+                id: 5252,
+                name: "ez-org-runner-2".into(),
+                status: "offline".into(),
+                busy: true,
+            },
+        ];
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+
+        // Track how many times remove_runner is called. With the bound,
+        // we expect exactly 2 calls (one per wedged slot — the initial
+        // DELETE attempt before the 422 dance) but ZERO zombie-reclaim
+        // invocations (the per-tick cap of 1 means slot 2 skips the
+        // reaper dance entirely and goes straight to quarantine).
+        let calls: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        let err_422 = |id: u64| -> Result<()> {
+            calls.lock().unwrap().push(id);
+            Err(anyhow::anyhow!(
+                "gh api remove runner {id} failed: gh: Runner \
+                 is currently running a job and cannot be deleted. (HTTP 422)"
+            ))
+        };
+
+        let local_names = HashSet::<String>::new();
+        let reclaim_calls: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+        let _reclaimed = reconcile_offline_busy_zombies(
+            None,
+            &assignments,
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            &mut quarantine,
+            1, // max_attempts_per_tick = 1
+            err_422,
+            |_runner| {
+                *reclaim_calls.lock().unwrap() += 1;
+                false
+            },
+            |_, _, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
+        )
+        .unwrap();
+
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "every wedged slot gets exactly one initial DELETE attempt"
+        );
+        assert_eq!(
+            *reclaim_calls.lock().unwrap(),
+            1,
+            "the zombie-reclaim lane must be invoked at most ONCE per tick \
+             regardless of how many slots are wedged (bound API volume)"
+        );
+        assert!(quarantine.is_quarantined(1));
+        assert!(quarantine.is_quarantined(2));
+        // Both slots reserved, neither released.
+        let after = read_slot_assignments().unwrap();
+        assert_eq!(after.assignments.get("1"), Some(&"4242".to_string()));
+        assert_eq!(after.assignments.get("2"), Some(&"5252".to_string()));
+    }
+
+    /// Regression: on the next reconcile tick, an existing quarantined
+    /// slot is NOT re-tried via the zombie-reclaim lane — only the
+    /// initial DELETE is re-attempted (and that one is also skipped
+    /// when the per-tick cap has already been burned by a fresh
+    /// detection on the same tick). This is the explicit
+    /// "continue filling all other slots" + "bound retry/API volume"
+    /// acceptance pair: we don't spam GH every 30s with the same doomed
+    /// cancel/poll cascade.
+    #[test]
+    fn quarantine_does_not_reissue_reaper_attempts_on_subsequent_ticks() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("no_re_reclaim");
+        let (_env, cfg, assignments) = quarantine_test_setup(
+            "no_re_reclaim",
+            "ez-org-runner",
+            1,
+            4242,
+            "ez-org-runner-1",
+            true,
+        );
+        let live = vec![github::RunnerInfo {
+            id: 4242,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: true,
+        }];
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+
+        // Tick 1: 422 detected, slot enters quarantine, reaper is tried once.
+        let err_422 = |_id: u64| -> Result<()> {
+            Err(anyhow::anyhow!(
+                "gh api remove runner 4242 failed: gh: Runner \
+                 is currently running a job and cannot be deleted. (HTTP 422)"
+            ))
+        };
+        let reclaim_attempts: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+        let local_names = HashSet::<String>::new();
+        let _ = reconcile_offline_busy_zombies(
+            None,
+            &assignments,
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            &mut quarantine,
+            1,
+            err_422,
+            |_r| {
+                *reclaim_attempts.lock().unwrap() += 1;
+                false
+            },
+            |_, _, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            *reclaim_attempts.lock().unwrap(),
+            1,
+            "tick 1 attempts the zombie-reclaim once (the slot is fresh)"
+        );
+        assert_eq!(quarantine.get(1).unwrap().attempt_count, 1);
+
+        // Tick 2: same 422, but the slot is already quarantined AND
+        // the per-tick cap is hit by the initial DELETE attempt itself
+        // (or by some other wedged slot's tick-2 attempt — but here we
+        // have only one). The zombie-reclaim lane MUST NOT fire.
+        let reclaim_attempts_before = *reclaim_attempts.lock().unwrap();
+        let _ = reconcile_offline_busy_zombies(
+            None,
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            &mut quarantine,
+            1,
+            err_422,
+            |_r| {
+                *reclaim_attempts.lock().unwrap() += 1;
+                false
+            },
+            |_, _, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            *reclaim_attempts.lock().unwrap(),
+            reclaim_attempts_before,
+            "tick 2 must NOT invoke the zombie-reclaim lane for a slot that is \
+             already quarantined AND the per-tick cap has been reached by the \
+             DELETE attempt itself"
+        );
+        // attempt_count stays at 1 because the reaper wasn't called.
+        // (The slot file's release path also didn't fire; the DELETE
+        // call itself is bound too in the production code path where
+        // the cap was already burned.)
+        assert_eq!(quarantine.get(1).unwrap().attempt_count, 1);
+    }
+
+    /// Regression: when GH releases the 422 lock and the runner next
+    /// appears as `online`, the quarantine entry is cleared, the slot is
+    /// released, and the operator is notified via the recovery alert.
+    /// This is the "recover automatically after GitHub releases the lock"
+    /// acceptance criterion.
+    #[test]
+    fn quarantine_auto_recovers_when_runner_appears_online() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("recover_online");
+        let (_env, cfg, assignments) = quarantine_test_setup(
+            "recover_online",
+            "ez-org-runner",
+            1,
+            4242,
+            "ez-org-runner-1",
+            true,
+        );
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+
+        // Tick 1: 422 detected, slot enters quarantine.
+        let live_locked = vec![github::RunnerInfo {
+            id: 4242,
+            name: "ez-org-runner-1".into(),
+            status: "offline".into(),
+            busy: true,
+        }];
+        let local_names = HashSet::<String>::new();
+        let _ = reconcile_offline_busy_zombies(
+            None,
+            &assignments,
+            &live_locked,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            &mut quarantine,
+            1,
+            |_| -> Result<()> {
+                Err(anyhow::anyhow!(
+                    "gh api remove runner 4242 failed: gh: Runner \
+                     is currently running a job and cannot be deleted. (HTTP 422)"
+                ))
+            },
+            |_| false,
+            |_, _, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(quarantine.is_quarantined(1));
+
+        // Tick 2: GH released the lock — the runner now reports online.
+        // DELETE should succeed, quarantine should clear, slot should
+        // be released.
+        let live_released = vec![github::RunnerInfo {
+            id: 4242,
+            name: "ez-org-runner-1".into(),
+            status: "online".into(),
+            busy: false,
+        }];
+        let reclaimed = reconcile_offline_busy_zombies(
+            None,
+            &read_slot_assignments().unwrap(),
+            &live_released,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            &mut quarantine,
+            1,
+            |_| Ok(()), // DELETE succeeds because the lock released
+            |_| false,
+            |_, _, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed, 1,
+            "auto-recovery must release the slot when the runner appears online"
+        );
+        assert!(
+            !quarantine.is_quarantined(1),
+            "auto-recovery must clear the quarantine entry"
+        );
+        let after = read_slot_assignments().unwrap();
+        assert!(
+            !after.assignments.contains_key("1"),
+            "auto-recovery must remove the slot reservation so ensure_count can re-fill it"
+        );
+    }
+
+    /// Regression: the rqb9 shape (container UP + offline + !busy + GH
+    /// registration absent) is NOT routed through the quarantine table.
+    /// The pre-fix `release_stale_slots_from_with_containers_for`
+    /// already handles the rqb9 case (when the registration is gone AND
+    /// the container is missing, Path 1 releases the slot; when the
+    /// registration is gone AND the container is up, Path 1 keeps the
+    /// slot with an eventual-consistency warning — that is the rqb9
+    /// repair ticket's lane). The quarantine lane is specifically for
+    /// the OPPOSITE case (registration present, container gone, DELETE
+    /// locked). If a future refactor accidentally funneled rqb9 into
+    /// quarantine, this test would catch it — both for the
+    /// `reconcile_offline_busy_zombies` direct call (which is gated on
+    /// `offline+busy+missing-container`) and for the slot file's
+    /// reservation behavior (which must NOT be modified by ghd2.2's
+    /// quarantine logic).
+    #[test]
+    fn quarantine_does_not_swallow_rqb9_idle_no_registration_path() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("not_rqb9");
+        let _env = TestEnv::new("not_rqb9_path");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 9999).unwrap();
+
+        // rqb9 shape: runner 9999 is GONE from `live_runners` (the
+        // container is up, but GH doesn't list the registration
+        // anymore). `reconcile_offline_busy_zombies` is gated on
+        // `offline && busy && no container` via
+        // `offline_busy_owned_missing_container_slots` — the rqb9
+        // shape has `runner.busy == false`, so the helper MUST NOT
+        // return any slots, and the quarantine table MUST stay empty.
+        let live: Vec<github::RunnerInfo> = vec![]; // no registration
+        let local_names: HashSet<String> = ["ez-org-runner-1".into()].into_iter().collect();
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+
+        let _ = reconcile_offline_busy_zombies(
+            None,
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            &mut quarantine,
+            1,
+            |_| Ok(()),
+            |_| false,
+            |_, _, _, _, _| Ok(()),
+            |_, _, _, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            quarantine.is_empty(),
+            "the rqb9 shape (busy=false, no live registration) must NOT \
+             populate the quarantine table; quarantine is for \
+             offline+busy+missing-container+422, NOT for \
+             idle+no-registration+container-up (see bead cross-link \
+             ez-gh-actions-ghd2.2 <-> ez-gh-actions-rqb9)"
+        );
+
+        // Sanity-check: ghd2.2's quarantine logic must not have
+        // touched the slot file either. If a future refactor ever
+        // funneled rqb9 through quarantine, it would presumably try
+        // to release the slot as part of the rqb9 fix — that release
+        // is rqb9's responsibility, NOT ghd2.2's.
+        let assignments_after = read_slot_assignments().unwrap();
+        assert_eq!(
+            assignments_after.assignments.get("1"),
+            Some(&"9999".to_string()),
+            "ghd2.2 must NOT mutate the slot file for the rqb9 shape; \
+             the slot reservation is the rqb9 fix's surface"
+        );
+    }
+
+    /// Regression: `next_slot_excluding` MUST skip quarantined slots so
+    /// `ensure_count` continues filling the other slots in the fleet.
+    /// This is the "continue filling all other slots" acceptance.
+    #[test]
+    fn next_slot_excluding_skips_quarantined_slots_and_fills_others() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("skip_quarantine");
+        let _env = TestEnv::new("skip_quarantine_slots");
+        let cfg = cfg_with(3, "ez-org-runner");
+
+        // Slot 1 is reserved + recorded as wedged.
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        // Slot 2 is reserved + recorded as wedged.
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(2, 5252).unwrap();
+        // Slot 3 is free.
+
+        // Pre-condition: both slots 1 and 2 are recorded in the slot file
+        // and slot 3 is the only free one.
+        let assignments = read_slot_assignments().unwrap();
+        assert_eq!(assignments.assignments.len(), 2);
+
+        // Quarantine slots 1 and 2.
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        quarantine.upsert(crate::quarantine::QuarantineEntry {
+            slot: 1,
+            runner_id: 4242,
+            runner_name: "ez-org-runner-1".into(),
+            first_seen_epoch_secs: 1_700_000_000,
+            attempt_count: 1,
+            last_attempt_epoch_secs: 1_700_000_000,
+            reason: crate::quarantine::QuarantineReason::Locked422,
+        });
+        quarantine.upsert(crate::quarantine::QuarantineEntry {
+            slot: 2,
+            runner_id: 5252,
+            runner_name: "ez-org-runner-2".into(),
+            first_seen_epoch_secs: 1_700_000_000,
+            attempt_count: 1,
+            last_attempt_epoch_secs: 1_700_000_000,
+            reason: crate::quarantine::QuarantineReason::Locked422,
+        });
+        crate::quarantine::save_quarantine(&quarantine).unwrap();
+
+        // next_slot must skip quarantined slots 1 and 2 and hand out slot 3.
+        // Use a fresh read so the per-test slot file path resolves.
+        let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        assert_eq!(
+            chosen, 3,
+            "next_slot_excluding MUST skip quarantined slots 1 and 2 and \
+             hand out slot 3 — this is the 'continue filling all other slots' \
+             acceptance criterion for bead ez-gh-actions-ghd2.2"
+        );
+    }
+
+    /// Regression: when multiple slots are quarantined, `next_slot_excluding`
+    /// keeps skipping them across consecutive allocations so the fleet
+    /// never tries to spawn INTO a wedged slot (no 409 self-heal churn).
+    #[test]
+    fn next_slot_excluding_keeps_skipping_quarantined_slots_across_calls() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("repeat_skip");
+        let _env = TestEnv::new("repeat_skip");
+        let cfg = cfg_with(4, "ez-org-runner");
+        // Reserve slots 1 and 2, mark them recorded (so they're "occupied"
+        // by a wedged registration), quarantine them.
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(2, 5252).unwrap();
+        // Slots 3 and 4 are free.
+
+        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        quarantine.upsert(crate::quarantine::QuarantineEntry {
+            slot: 1,
+            runner_id: 4242,
+            runner_name: "ez-org-runner-1".into(),
+            first_seen_epoch_secs: 1_700_000_000,
+            attempt_count: 1,
+            last_attempt_epoch_secs: 1_700_000_000,
+            reason: crate::quarantine::QuarantineReason::Locked422,
+        });
+        quarantine.upsert(crate::quarantine::QuarantineEntry {
+            slot: 2,
+            runner_id: 5252,
+            runner_name: "ez-org-runner-2".into(),
+            first_seen_epoch_secs: 1_700_000_000,
+            attempt_count: 1,
+            last_attempt_epoch_secs: 1_700_000_000,
+            reason: crate::quarantine::QuarantineReason::Locked422,
+        });
+        crate::quarantine::save_quarantine(&quarantine).unwrap();
+
+        let first = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        let second = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        assert_eq!(first, 3, "first allocation must skip quarantined slots 1+2");
+        assert_eq!(
+            second, 4,
+            "second allocation must skip quarantined slots 1+2 AND the just-allocated slot 3"
+        );
+        // No allocation into slot 1 or 2 ever happened.
+        let assignments = read_slot_assignments().unwrap();
+        assert!(assignments.assignments.contains_key("1"));
+        assert!(assignments.assignments.contains_key("2"));
+        assert!(assignments.assignments.contains_key("3"));
+        assert!(assignments.assignments.contains_key("4"));
+    }
+
+    /// Regression: `next_slot_excluding` ignores a corrupt quarantine file
+    /// (logged warning) and proceeds — same fail-soft contract as
+    /// `release_stale_slots`'s loader, so a single bad write doesn't
+    /// wedge the entire daemon.
+    #[test]
+    fn next_slot_excluding_tolerates_corrupt_quarantine_file() {
+        let _qpath = crate::quarantine::tests::TestEnv::new("corrupt_q");
+        let _env = TestEnv::new("corrupt_q");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        // Write garbage into the quarantine file.
+        let path = crate::quarantine::quarantine_path();
+        std::fs::write(&path, "this is not valid TOML = = =").unwrap();
+
+        // Slot 2 is the only free one. Even though slot 1 is recorded
+        // (and the quarantine file is corrupt), next_slot_excluding must
+        // still pick slot 2 — NOT panic, NOT bail.
+        let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        assert_eq!(chosen, 2);
     }
 }

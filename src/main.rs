@@ -13,6 +13,7 @@ mod config;
 mod docker_backend;
 mod github;
 mod platform;
+mod quarantine;
 mod queue_monitor;
 mod reaper;
 mod service;
