@@ -190,6 +190,49 @@ else
   missing=1
 fi
 
+# ── Self-contained docker socket detection ──────────────────────────────────
+# /var/run/docker.sock may be a stale symlink to a non-existent path
+# (typical after switching from Docker Desktop to Colima on macOS, or
+# when a fresh machine has only Colima installed and never had Docker
+# Desktop). ezgha queries the docker daemon via DOCKER_HOST; if the
+# socket is not at /var/run/docker.sock, the launchd service / systemd
+# unit must include the real socket path as DOCKER_HOST.
+# See session 2026-07-13 investigation: c-runner registration was
+# briefly thought broken when the symlink target didn't exist; the
+# actual cause was that the colima socket had been substituted but the
+# plist/unit still pointed at /var/run/docker.sock.
+DOCKER_HOST_OVERRIDE=""
+# Strategy 1: trust the active docker context
+DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+# Strategy 2: probe colima's default location
+DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
+# Strategy 3: probe docker desktop's socket
+DOCKER_DESKTOP_SOCK="${HOME}/.docker/run/docker.sock"
+DOCKER_DEFAULT_SOCK="/var/run/docker.sock"
+
+is_socket_alive() {
+  # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
+  local sock="$1"
+  [ -S "$sock" ] || return 1
+  DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
+}
+
+if [ -n "$DOCKER_CTX_HOST" ] && [ "$DOCKER_CTX_HOST" != "unix://$DOCKER_DEFAULT_SOCK" ]; then
+  # Active docker context already points at a non-default socket — export it
+  # so launchd plist / systemd unit can persist it.
+  DOCKER_HOST_OVERRIDE="$DOCKER_CTX_HOST"
+  info "docker context already overrides default socket: ${DOCKER_CTX_HOST}"
+elif is_socket_alive "$DOCKER_COLIMA_SOCK" && [ ! -e "$DOCKER_DEFAULT_SOCK" ]; then
+  # Colima is reachable, default symlink is broken/missing — surface the colima
+  # socket to ezgha so the service can find docker.
+  DOCKER_HOST_OVERRIDE="unix://$DOCKER_COLIMA_SOCK"
+  info "colima socket detected at ${DOCKER_COLIMA_SOCK}; setting DOCKER_HOST so launchd/systemd can find the daemon"
+elif is_socket_alive "$DOCKER_DESKTOP_SOCK" && [ ! -e "$DOCKER_DEFAULT_SOCK" ]; then
+  DOCKER_HOST_OVERRIDE="unix://$DOCKER_DESKTOP_SOCK"
+  info "docker-desktop socket detected at ${DOCKER_DESKTOP_SOCK}; setting DOCKER_HOST"
+fi
+export DOCKER_HOST_OVERRIDE
+
 if command -v gh >/dev/null 2>&1; then
   if gh auth status >/dev/null 2>&1; then
     ok "gh CLI authenticated"
@@ -338,6 +381,21 @@ PLIST
       done
       cat >> "${plist}" <<PLIST
   </array>
+PLIST
+      # Inject DOCKER_HOST env var if the default socket is broken and a
+      # colima / docker-desktop socket was detected. Without this, the
+      # launchd service fails to find the docker daemon and no runners
+      # register with GitHub — see install.sh self-contained-detection
+      # block above for the matching probe logic.
+      if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
+        cat >> "${plist}" <<PLIST
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>
+  </dict>
+PLIST
+      fi
+      cat >> "${plist}" <<PLIST
   <key>StartInterval</key><integer>${interval_sec}</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${HOME_DIR}/.local/state/ezgha/${name}.log</string>
