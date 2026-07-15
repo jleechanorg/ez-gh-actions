@@ -73,7 +73,7 @@ verify_scripts_exist() {
 }
 
 install_scripts() {
-  mkdir -p "${SCRIPTS_DIR}"
+  mkdir -p "${SCRIPTS_DIR}" "${HOME}/.local/state/ezgha"
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.
@@ -96,7 +96,17 @@ case "$action" in
       verify_scripts_exist "$dest" || { rm -f "$dest"; exit 1; }
       echo "installed: $dest"
       launchctl unload "$dest" 2>/dev/null || true
-      launchctl load "$dest"
+      if ! launchctl load "$dest"; then
+        echo "ERROR: launchctl failed to load ${dest}" >&2
+        rm -f "$dest"
+        exit 1
+      fi
+      if ! launchctl print "gui/$(id -u)/${label}" >/dev/null; then
+        echo "ERROR: launchctl did not register ${label}" >&2
+        launchctl unload "$dest" 2>/dev/null || true
+        rm -f "$dest"
+        exit 1
+      fi
       echo "loaded: $label"
     done
     ;;

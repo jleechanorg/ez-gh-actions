@@ -18,6 +18,10 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test
+      - name: Mac trim guard shell regressions
+        run: |
+          bash tests/colima_trim_guard_test.sh
+          bash tests/install_colima_trim_agent_test.sh
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Format
