@@ -88,9 +88,21 @@ test ! -e \
 
 UPGRADE_HOME="$WORK/upgrade-home"
 UPGRADE_PLIST="$UPGRADE_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-runner-dashboard.plist"
+UPGRADE_LIBEXEC="$UPGRADE_HOME/.local/libexec/ezgha"
+UPGRADE_EXPECTED="$WORK/upgrade-expected"
 UPGRADE_LOG="$WORK/upgrade-launchctl.log"
-mkdir -p "$(dirname "$UPGRADE_PLIST")"
+mkdir -p "$(dirname "$UPGRADE_PLIST")" "$UPGRADE_LIBEXEC/dashboard" \
+  "$UPGRADE_EXPECTED/dashboard"
 printf '%s\n' 'prior-known-good-plist' > "$UPGRADE_PLIST"
+for script in publish_runner_dashboard.sh runner_dashboard_host_probe.sh \
+  build_runner_dashboard_snapshot.py; do
+  printf 'prior-known-good:%s\n' "$script" > "$UPGRADE_EXPECTED/$script"
+  cp -p "$UPGRADE_EXPECTED/$script" "$UPGRADE_LIBEXEC/$script"
+done
+for asset in index.html style.css dashboard.js; do
+  printf 'prior-known-good:%s\n' "$asset" > "$UPGRADE_EXPECTED/dashboard/$asset"
+  cp -p "$UPGRADE_EXPECTED/dashboard/$asset" "$UPGRADE_LIBEXEC/dashboard/$asset"
+done
 set +e
 HOME="$UPGRADE_HOME" PATH="$BIN:$PATH" \
   LAUNCHCTL_LOG="$UPGRADE_LOG" LAUNCHCTL_FAIL_DASHBOARD_LOAD=once \
@@ -102,6 +114,14 @@ set -e
 test "$UPGRADE_STATUS" -eq 42
 test "$(cat "$UPGRADE_PLIST")" = 'prior-known-good-plist'
 test "$(grep -c '^load .*runner-dashboard.plist$' "$UPGRADE_LOG")" -eq 2
+for script in publish_runner_dashboard.sh runner_dashboard_host_probe.sh \
+  build_runner_dashboard_snapshot.py; do
+  cmp "$UPGRADE_EXPECTED/$script" "$UPGRADE_LIBEXEC/$script"
+done
+for asset in index.html style.css dashboard.js; do
+  cmp "$UPGRADE_EXPECTED/dashboard/$asset" "$UPGRADE_LIBEXEC/dashboard/$asset"
+done
 if compgen -G "$UPGRADE_PLIST.*" >/dev/null; then exit 1; fi
+if compgen -G "$UPGRADE_HOME/.local/state/ezgha/.runner-dashboard-backup.*" >/dev/null; then exit 1; fi
 
 echo "runner dashboard launchd install tests passed"

@@ -359,6 +359,13 @@ if [ -d "${UNIT_DIR}" ]; then
   # same flat directory so sibling-relative lookups keep working post-install.
   for script in "${SCRIPT_DIR}"/scripts/*.sh "${SCRIPT_DIR}"/scripts/*.py; do
     [ -f "${script}" ] || continue
+    if [ "$(uname -s)" = "Darwin" ]; then
+      case "$(basename "${script}")" in
+        publish_runner_dashboard.sh|runner_dashboard_host_probe.sh|build_runner_dashboard_snapshot.py)
+          continue
+          ;;
+      esac
+    fi
     install -m 0755 "${script}" "${SCRIPTS_DIR}/$(basename "${script}")"
   done
   ok "scripts installed to stable path: ${SCRIPTS_DIR}"

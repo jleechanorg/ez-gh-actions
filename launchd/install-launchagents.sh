@@ -23,6 +23,21 @@ TARGET_DIR="${HOME}/Library/LaunchAgents"
 SCRIPTS_DIR="${HOME}/.local/libexec/ezgha"
 DASHBOARD_DIR="${SCRIPTS_DIR}/dashboard"
 STATE_DIR="${HOME}/.local/state/ezgha"
+DASHBOARD_LABEL="org.jleechanorg.ezgha-runner-dashboard"
+DASHBOARD_SCRIPTS=(
+  publish_runner_dashboard.sh
+  runner_dashboard_host_probe.sh
+  build_runner_dashboard_snapshot.py
+)
+DASHBOARD_ASSETS=(index.html style.css dashboard.js)
+DASHBOARD_TRANSACTION_ACTIVE=false
+DASHBOARD_PAYLOAD_BACKUP=""
+DASHBOARD_PLIST_DEST=""
+DASHBOARD_PLIST_CANDIDATE=""
+DASHBOARD_PLIST_BACKUP=""
+DASHBOARD_HAD_PRIOR=0
+DASHBOARD_PRIOR_UNLOADED=false
+DASHBOARD_REPLACEMENT_INSTALLED=false
 
 action="${1:-status}"
 label_filter="${2:-}"
@@ -98,8 +113,75 @@ install_scripts() {
   echo "scripts installed: ${SCRIPTS_DIR}"
 }
 
+backup_dashboard_payload() {
+  mkdir -p "${SCRIPTS_DIR}" "${DASHBOARD_DIR}" "${STATE_DIR}"
+  chmod 0700 "${STATE_DIR}"
+  DASHBOARD_PAYLOAD_BACKUP="$(
+    mktemp -d "${STATE_DIR}/.runner-dashboard-backup.XXXXXX"
+  )"
+  mkdir -p "${DASHBOARD_PAYLOAD_BACKUP}/dashboard"
+  for name in "${DASHBOARD_SCRIPTS[@]}"; do
+    [[ ! -f "${SCRIPTS_DIR}/${name}" ]] || \
+      cp -p "${SCRIPTS_DIR}/${name}" "${DASHBOARD_PAYLOAD_BACKUP}/${name}"
+  done
+  for name in "${DASHBOARD_ASSETS[@]}"; do
+    [[ ! -f "${DASHBOARD_DIR}/${name}" ]] || \
+      cp -p "${DASHBOARD_DIR}/${name}" "${DASHBOARD_PAYLOAD_BACKUP}/dashboard/${name}"
+  done
+  DASHBOARD_TRANSACTION_ACTIVE=true
+}
+
+restore_dashboard_payload() {
+  local name
+  for name in "${DASHBOARD_SCRIPTS[@]}"; do
+    rm -f "${SCRIPTS_DIR}/${name}"
+    [[ ! -f "${DASHBOARD_PAYLOAD_BACKUP}/${name}" ]] || \
+      cp -p "${DASHBOARD_PAYLOAD_BACKUP}/${name}" "${SCRIPTS_DIR}/${name}"
+  done
+  for name in "${DASHBOARD_ASSETS[@]}"; do
+    rm -f "${DASHBOARD_DIR}/${name}"
+    [[ ! -f "${DASHBOARD_PAYLOAD_BACKUP}/dashboard/${name}" ]] || \
+      cp -p "${DASHBOARD_PAYLOAD_BACKUP}/dashboard/${name}" "${DASHBOARD_DIR}/${name}"
+  done
+}
+
+rollback_dashboard_install() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${DASHBOARD_TRANSACTION_ACTIVE}" == true ]]; then
+    restore_dashboard_payload
+    [[ -z "${DASHBOARD_PLIST_CANDIDATE}" ]] || rm -f "${DASHBOARD_PLIST_CANDIDATE}"
+    if [[ "${DASHBOARD_REPLACEMENT_INSTALLED}" == true ]]; then
+      rm -f "${DASHBOARD_PLIST_DEST}"
+    fi
+    if [[ "${DASHBOARD_HAD_PRIOR}" -eq 1 && -f "${DASHBOARD_PLIST_BACKUP}" ]]; then
+      mv "${DASHBOARD_PLIST_BACKUP}" "${DASHBOARD_PLIST_DEST}"
+      if [[ "${DASHBOARD_PRIOR_UNLOADED}" == true ]]; then
+        launchctl load "${DASHBOARD_PLIST_DEST}" || \
+          echo "ERROR: restored prior plist but could not reload it: ${DASHBOARD_PLIST_DEST}" >&2
+      fi
+    fi
+    [[ -z "${DASHBOARD_PLIST_BACKUP}" ]] || rm -f "${DASHBOARD_PLIST_BACKUP}"
+    rm -rf "${DASHBOARD_PAYLOAD_BACKUP}"
+  fi
+  exit "${rc}"
+}
+
+commit_dashboard_install() {
+  rm -f "${DASHBOARD_PLIST_BACKUP}"
+  rm -rf "${DASHBOARD_PAYLOAD_BACKUP}"
+  DASHBOARD_TRANSACTION_ACTIVE=false
+}
+
 case "$action" in
   install)
+    for tmpl in "${templates[@]}"; do
+      if [[ "$(basename "$tmpl" .plist.template)" == "${DASHBOARD_LABEL}" ]]; then
+        backup_dashboard_payload
+        trap rollback_dashboard_install EXIT
+        break
+      fi
+    done
     install_scripts
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
@@ -108,18 +190,32 @@ case "$action" in
       candidate="${dest}.candidate.$$"
       backup="${dest}.backup.$$"
       had_prior=0
+      if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
+        DASHBOARD_PLIST_DEST="${dest}"
+        DASHBOARD_PLIST_CANDIDATE="${candidate}"
+        DASHBOARD_PLIST_BACKUP="${backup}"
+      fi
       sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$candidate"
       verify_rendered_plist "$candidate" || { rm -f "$candidate"; exit 1; }
       verify_scripts_exist "$candidate" || { rm -f "$candidate"; exit 1; }
       if [[ -f "$dest" ]]; then
         cp -p "$dest" "$backup"
         had_prior=1
-        launchctl unload "$dest" 2>/dev/null || true
+        if launchctl unload "$dest" 2>/dev/null; then
+          [[ "${label}" != "${DASHBOARD_LABEL}" ]] || DASHBOARD_PRIOR_UNLOADED=true
+        fi
+      fi
+      if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
+        DASHBOARD_HAD_PRIOR="${had_prior}"
       fi
       mv "$candidate" "$dest"
+      [[ "${label}" != "${DASHBOARD_LABEL}" ]] || DASHBOARD_REPLACEMENT_INSTALLED=true
       echo "installed: $dest"
       launchctl load "$dest" || {
         rc=$?
+        if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
+          exit "$rc"
+        fi
         rm -f "$dest"
         if [[ "$had_prior" -eq 1 ]]; then
           mv "$backup" "$dest"
@@ -129,6 +225,9 @@ case "$action" in
         exit "$rc"
       }
       rm -f "$backup"
+      if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
+        commit_dashboard_install
+      fi
       echo "loaded: $label"
     done
     ;;
