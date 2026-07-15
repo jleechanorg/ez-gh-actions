@@ -25,7 +25,9 @@ exit 0
 SH
 chmod +x "$BIN/launchctl"
 
-HOME="$HOME_T" PATH="$BIN:$PATH" bash "$ROOT/launchd/install-launchagents.sh" install
+DOCKER_HOST_FIXTURE='unix:///fixture/colima&primary.sock'
+HOME="$HOME_T" PATH="$BIN:$PATH" DOCKER_HOST_OVERRIDE="$DOCKER_HOST_FIXTURE" \
+  bash "$ROOT/launchd/install-launchagents.sh" install
 
 for asset in index.html style.css dashboard.js; do
   test -f "$HOME_T/.local/libexec/ezgha/dashboard/$asset"
@@ -36,7 +38,8 @@ done
 
 PLIST="$HOME_T/Library/LaunchAgents/org.jleechanorg.ezgha-runner-dashboard.plist"
 test -f "$PLIST"
-PLIST="$PLIST" HOME_T="$HOME_T" python3 - <<'PY'
+PLIST="$PLIST" HOME_T="$HOME_T" DOCKER_HOST_FIXTURE="$DOCKER_HOST_FIXTURE" \
+  python3 - <<'PY'
 import os
 import plistlib
 from pathlib import Path
@@ -50,6 +53,9 @@ assert payload["ProgramArguments"] == [
 ]
 assert payload["StartInterval"] == 600
 assert payload["EnvironmentVariables"]["HOME"] == home
+assert payload["EnvironmentVariables"]["DOCKER_HOST"] == os.environ[
+    "DOCKER_HOST_FIXTURE"
+]
 serialized = str(payload)
 assert "worktree" not in serialized.lower()
 assert "@HOME@" not in serialized

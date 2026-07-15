@@ -196,6 +196,19 @@ case "$action" in
         DASHBOARD_PLIST_BACKUP="${backup}"
       fi
       sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$candidate"
+      if [[ "${label}" == "${DASHBOARD_LABEL}" && -n "${DOCKER_HOST_OVERRIDE:-}" ]]; then
+        python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload = plistlib.loads(path.read_bytes())
+payload["EnvironmentVariables"]["DOCKER_HOST"] = sys.argv[2]
+with path.open("wb") as handle:
+    plistlib.dump(payload, handle, sort_keys=False)
+PY
+      fi
       verify_rendered_plist "$candidate" || { rm -f "$candidate"; exit 1; }
       verify_scripts_exist "$candidate" || { rm -f "$candidate"; exit 1; }
       if [[ -f "$dest" ]]; then
