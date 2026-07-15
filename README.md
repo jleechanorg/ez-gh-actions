@@ -200,9 +200,12 @@ that is the point of composing them.
     `ezgha` itself cannot escalate to root without an additional exploit.
   - **Disk floor guard** — `ezgha serve` refuses to spawn new runners when
     either the Docker volume or its outer host filesystem drops below
-    `min_free_disk_gb` (default 10 GB). macOS enforces a 40 GB minimum host
+    `min_free_disk_gb` (default 10 GB). macOS enforces a 15 GB minimum host
     floor because a Colima guest can report free space after its sparse disk
-    has exhausted the host APFS volume.
+    has exhausted the host APFS volume. (Recalibrated from 40 GB on
+    2026-07-15: 40 GB sat inside the Mac host's normal 35-46 GB free range
+    and flapped the fleet; the VM's own disk is capped so host exposure is
+    the sparse VM files, ~6 GB observed.)
   - **No docker.sock mounted into runners**, no privileged mode, no
     `--cap-add` beyond the defaults.
 - **What it does NOT enforce**: nothing in `ezgha` is a substitute for keeping
@@ -376,7 +379,7 @@ image = "ezgha-runner:latest"   # see "Custom runner image" below
 memory_mb = 4096                # hard cgroup ceiling (swap pinned to same value)
 cpus = 2.0
 pids = 512
-min_free_disk_gb = 10           # daemon + host floor (macOS host minimum: 40)
+min_free_disk_gb = 10           # daemon + host floor (macOS host minimum: 15)
 
 [policy]
 minimum_isolation = "container" # "vm" = refuse to run jobs unless execution is
