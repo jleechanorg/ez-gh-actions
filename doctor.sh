@@ -54,6 +54,16 @@ case "$(uname -s)" in
   *)      PLATFORM="other" ;;
 esac
 
+# BEGIN launchd service Docker endpoint
+if [ "$PLATFORM" = "macos" ]; then
+  LAUNCHD_PLIST="$HOME/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
+  LAUNCHD_DOCKER_HOST=$(plutil -extract EnvironmentVariables.DOCKER_HOST raw -o - "$LAUNCHD_PLIST" 2>/dev/null || true)
+  if [ -n "$LAUNCHD_DOCKER_HOST" ]; then
+    export DOCKER_HOST="$LAUNCHD_DOCKER_HOST"
+  fi
+fi
+# END launchd service Docker endpoint
+
 # Probe the supervisor (systemd on Linux, launchd on macOS) for ezgha's
 # service state. Returns one of: active | inactive | failed | not-loaded.
 probe_service_state() {
