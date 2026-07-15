@@ -10,6 +10,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 's
 import mint_gh_app_token
 
 class TestMintRetry(unittest.TestCase):
+    def test_retry_budget_fits_refresh_wrapper(self):
+        attempt_budget = mint_gh_app_token.REQUEST_TIMEOUT_SECONDS * 2
+        retry_budget = attempt_budget + mint_gh_app_token.RETRY_DELAY_SECONDS
+
+        self.assertLess(retry_budget, 45)
+
     @patch('requests.post')
     @patch('time.sleep')
     def test_retry_on_connection_error(self, mock_sleep, mock_post):
