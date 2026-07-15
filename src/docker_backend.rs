@@ -2727,6 +2727,7 @@ mod tests {
                 .map(|slot| format!("ez-org-runner-{slot}"))
                 .collect(),
         );
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -2754,6 +2755,7 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -2771,6 +2773,7 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
