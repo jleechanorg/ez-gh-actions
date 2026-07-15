@@ -150,6 +150,61 @@ unset GH_TOKEN GITHUB_TOKEN GH_TOKEN_AGENTF AO_BOT_GH_TOKEN \
 exec "$(dirname "$0")/ezgha" "$@"
 "#;
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn launchd_plist(
+    wrapper_path: &std::path::Path,
+    config_path: &std::path::Path,
+    path_env: &str,
+    home_dir: &std::path::Path,
+    docker_host: Option<&str>,
+) -> String {
+    let docker_host_entry = docker_host
+        .filter(|host| !host.is_empty())
+        .map(|host| {
+            format!(
+                "\n        <key>DOCKER_HOST</key><string>{}</string>",
+                xml_escape(host)
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>org.jleechanorg.ezgha</string>
+    <key>ProgramArguments</key>
+    <array><string>{}</string><string>--config</string><string>{}</string><string>serve</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ExitTimeOut</key><integer>30</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>{}</string>
+        <key>HOME</key><string>{}</string>{}
+    </dict>
+    <key>StandardOutPath</key><string>/tmp/ezgha-launchd-stdout.log</string>
+    <key>StandardErrorPath</key><string>/tmp/ezgha-launchd-stderr.log</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&wrapper_path.display().to_string()),
+        xml_escape(&config_path.display().to_string()),
+        xml_escape(path_env),
+        xml_escape(&home_dir.display().to_string()),
+        docker_host_entry,
+    )
+}
+
 fn install_launchd(exe: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
     let agents = home()?.join("Library/LaunchAgents");
     std::fs::create_dir_all(&agents)?;
@@ -179,31 +234,20 @@ fn install_launchd(exe: &std::path::Path, config_path: &std::path::Path) -> Resu
         perms.set_mode(0o755);
         std::fs::set_permissions(&wrapper_path, perms)?;
     }
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>org.jleechanorg.ezgha</string>
-    <key>ProgramArguments</key>
-    <array><string>{}</string><string>--config</string><string>{}</string><string>serve</string></array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>ExitTimeOut</key><integer>30</integer>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key><string>{}</string>
-        <key>HOME</key><string>{}</string>
-    </dict>
-    <key>StandardOutPath</key><string>/tmp/ezgha-launchd-stdout.log</string>
-    <key>StandardErrorPath</key><string>/tmp/ezgha-launchd-stderr.log</string>
-</dict>
-</plist>
-"#,
-        wrapper_path.display(),
-        config_path.display(),
-        path_env,
-        home_dir.display()
+    let docker_host = std::env::var("DOCKER_HOST_OVERRIDE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("DOCKER_HOST")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
+    let plist = launchd_plist(
+        &wrapper_path,
+        config_path,
+        &path_env,
+        &home_dir,
+        docker_host.as_deref(),
     );
     std::fs::write(&plist_path, plist)?;
     println!("wrote {}", plist_path.display());
@@ -293,6 +337,52 @@ mod tests {
         assert!(
             LAUNCHD_WRAPPER.contains("exec \"$(dirname \"$0\")/ezgha\""),
             "LAUNCHD_WRAPPER must exec the real binary in-place"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_persists_and_escapes_explicit_docker_host() {
+        let plist = launchd_plist(
+            std::path::Path::new("/Users/test/.cargo/bin/ezgha-launchd-wrapper.sh"),
+            std::path::Path::new("/Users/test/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/Users/test"),
+            Some("unix:///Users/test/docker&socket<active>"),
+        );
+
+        assert!(plist.contains("<key>DOCKER_HOST</key>"));
+        assert!(
+            plist.contains("<string>unix:///Users/test/docker&amp;socket&lt;active&gt;</string>")
+        );
+        assert!(!plist.contains("docker&socket<active>"));
+    }
+
+    #[test]
+    fn launchd_plist_omits_docker_host_without_override() {
+        let plist = launchd_plist(
+            std::path::Path::new("/Users/test/.cargo/bin/ezgha-launchd-wrapper.sh"),
+            std::path::Path::new("/Users/test/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/Users/test"),
+            None,
+        );
+
+        assert!(!plist.contains("DOCKER_HOST"));
+    }
+
+    #[test]
+    fn installer_regenerates_existing_launchd_service_with_detected_docker_host() {
+        let installer = include_str!("../install.sh");
+
+        assert!(
+            installer.contains(
+                "DOCKER_HOST=\"${DOCKER_HOST_OVERRIDE}\" \"${CARGO_BIN}/${BIN}\" install-service"
+            ),
+            "install.sh must pass the detected socket to install-service"
+        );
+        assert!(
+            !installer.contains("launchctl load \"${plist}\""),
+            "install.sh must regenerate an existing plist instead of reloading stale bytes"
         );
     }
 
