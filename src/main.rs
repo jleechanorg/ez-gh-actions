@@ -678,6 +678,14 @@ fn apply_ensure_outcome_to_failure_streak(
     partial_failure
 }
 
+// Five 5s local-only polls cover the observed 20-25s runner startup tail.
+// With normal sub-100ms Docker probes, monitors are deferred <=25s; if probes
+// consume their full shared 5s budget, the elapsed-time ceiling ends the
+// episode in about 30s. Settling performs no GitHub calls. Every ceiling runs
+// monitors and exactly one immediate full reconciliation, leaving >270s of
+// the 300s watchdog window. Repeated ceilings retain this pacing and escalate
+// through the configured alert channel at `failure_alert_threshold`; alert
+// cooldown supplies notification hysteresis without delaying reconciliation.
 const MAX_SETTLING_POLLS: u32 = 5;
 const MAX_SETTLING_DURATION: Duration = Duration::from_secs(25);
 
@@ -741,6 +749,47 @@ fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration,
         SettlingDecision::Recovered => (cfg.runner.serve_tick(), true),
         SettlingDecision::Ceiling => (Duration::ZERO, true),
     }
+}
+
+#[derive(Default)]
+struct SettlingCeilingState {
+    consecutive_ceilings: u32,
+}
+
+impl SettlingCeilingState {
+    fn record_recovery(&mut self) {
+        self.consecutive_ceilings = 0;
+    }
+}
+
+fn record_settling_ceiling(
+    cfg: &config::Config,
+    state: &mut SettlingCeilingState,
+    detail: &str,
+) -> bool {
+    state.consecutive_ceilings = state.consecutive_ceilings.saturating_add(1);
+    let threshold = cfg.alert.failure_alert_threshold.max(1);
+    if state.consecutive_ceilings < threshold {
+        return false;
+    }
+
+    let subject = "Runner refill settling remains stuck";
+    let body = format!(
+        "{} consecutive bounded settling episodes reached their ceiling for {} (threshold: {}). \
+         First-turnover episodes remain nonfailures, but this persistent shortage needs operator \
+         attention. Latest evidence: {detail}",
+        state.consecutive_ceilings, cfg.github.target, threshold
+    );
+    if let Err(err) = alert::notify(
+        cfg,
+        "serve.runner_settling.ceiling",
+        Severity::Critical,
+        subject,
+        &body,
+    ) {
+        eprintln!("WARN: settling-ceiling alert send error: {err:#}");
+    }
+    true
 }
 
 fn systemd_alert_decision(
@@ -1050,6 +1099,7 @@ fn main() -> Result<()> {
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             let mut settling: Option<SettlingEpisode> = None;
+            let mut settling_ceilings = SettlingCeilingState::default();
             let mut deadman = alert::DeadManState::new(Instant::now());
 
             // Graceful shutdown (bead ez-gh-actions-30p): install SIGTERM/SIGINT
@@ -1085,15 +1135,24 @@ fn main() -> Result<()> {
                                          after {attempts} poll(s)",
                                         cfg.runner.count
                                     );
+                                    settling_ceilings.record_recovery();
                                     settling = None;
                                 }
                                 SettlingDecision::Ceiling => {
-                                    eprintln!(
-                                        "WARN: runner startup settling ceiling reached: \
-                                         {executing}/{} executing locally, best {best_executing}, \
-                                         {attempts} poll(s); running monitors before immediate \
-                                         reconciliation",
+                                    let detail = format!(
+                                        "{executing}/{} executing locally, best {best_executing}, \
+                                         {attempts} poll(s)",
                                         cfg.runner.count
+                                    );
+                                    let escalated = record_settling_ceiling(
+                                        &cfg,
+                                        &mut settling_ceilings,
+                                        &detail,
+                                    );
+                                    eprintln!(
+                                        "{}: runner startup settling ceiling reached: {detail}; \
+                                         running monitors before immediate reconciliation",
+                                        if escalated { "CRITICAL" } else { "WARN" }
                                     );
                                     settling = None;
                                 }
@@ -1101,9 +1160,13 @@ fn main() -> Result<()> {
                             settling_plan(&cfg, decision)
                         }
                         Err(e) => {
+                            let detail =
+                                format!("local Runner.Worker readiness check failed: {e:#}");
+                            let escalated =
+                                record_settling_ceiling(&cfg, &mut settling_ceilings, &detail);
                             eprintln!(
-                                "WARN: local Runner.Worker readiness check failed: {e:#}; \
-                                 running monitors before immediate reconciliation"
+                                "{}: {detail}; running monitors before immediate reconciliation",
+                                if escalated { "CRITICAL" } else { "WARN" }
                             );
                             settling = None;
                             settling_plan(&cfg, SettlingDecision::Ceiling)
@@ -1124,6 +1187,7 @@ fn main() -> Result<()> {
                                 settling = Some(SettlingEpisode::start(Instant::now(), executing));
                                 settling_plan(&cfg, SettlingDecision::Continue)
                             } else {
+                                settling_ceilings.record_recovery();
                                 settling_plan(&cfg, SettlingDecision::Recovered)
                             };
                             for name in outcome.started {
@@ -1606,6 +1670,48 @@ mod tests {
             (Duration::ZERO, true),
             "the bounded episode must run monitors and add no sleep before the next expensive reconciliation"
         );
+    }
+
+    #[test]
+    fn repeated_settling_ceilings_alert_at_threshold_and_reset_only_on_recovery() {
+        alert::clear_alert_state();
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 3;
+        let dir = unique_temp_dir("settling-ceiling-alert");
+        let log = dir.join("alerts.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+        let mut state = SettlingCeilingState::default();
+
+        assert!(!record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "episode 1 stayed at 5/6"
+        ));
+        assert!(!record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "episode 2 stayed at 5/6"
+        ));
+        assert!(!log.exists(), "first turnover episodes remain non-alerting");
+
+        assert!(record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "episode 3 stayed at 5/6"
+        ));
+        let raw = std::fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("serve.runner_settling.ceiling"));
+        assert!(raw.contains("3 consecutive bounded settling episodes"));
+
+        state.record_recovery();
+        assert_eq!(state.consecutive_ceilings, 0);
+        assert!(!record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "new streak episode 1"
+        ));
+        assert_eq!(state.consecutive_ceilings, 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
