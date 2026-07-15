@@ -783,6 +783,21 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
     }
 }
 
+fn settling_for_ensure_decision(
+    now: Instant,
+    decision: EnsureSuccessDecision,
+) -> Option<SettlingEpisode> {
+    match decision {
+        EnsureSuccessDecision::StartSettling { executing } => {
+            Some(SettlingEpisode::start(now, executing))
+        }
+        // Incomplete evidence has no proven executing lower bound. Keep the
+        // local-readiness branch armed until a complete probe proves recovery.
+        EnsureSuccessDecision::IncompleteReadiness => Some(SettlingEpisode::start(now, 0)),
+        EnsureSuccessDecision::Recovered => None,
+    }
+}
+
 #[derive(Default)]
 struct SettlingCeilingState {
     consecutive_ceilings: u32,
@@ -1200,7 +1215,10 @@ fn main() -> Result<()> {
                                 "{}: {detail}; running monitors before immediate reconciliation",
                                 if escalated { "CRITICAL" } else { "WARN" }
                             );
-                            settling = None;
+                            // Do not return to full-container reconciliation:
+                            // that early return cannot prove Runner.Worker
+                            // readiness and would falsely reset this streak.
+                            settling = Some(SettlingEpisode::start(Instant::now(), 0));
                             settling_plan(&cfg, SettlingDecision::Ceiling)
                         }
                     }
@@ -1214,11 +1232,10 @@ fn main() -> Result<()> {
                                 &outcome,
                             );
                             let decision = ensure_success_decision(&cfg, &outcome);
+                            let next_settling =
+                                settling_for_ensure_decision(Instant::now(), decision);
                             match decision {
-                                EnsureSuccessDecision::StartSettling { executing } => {
-                                    settling =
-                                        Some(SettlingEpisode::start(Instant::now(), executing));
-                                }
+                                EnsureSuccessDecision::StartSettling { .. } => {}
                                 EnsureSuccessDecision::Recovered => {
                                     settling_ceilings.record_recovery();
                                 }
@@ -1237,12 +1254,12 @@ fn main() -> Result<()> {
                                     );
                                     eprintln!(
                                         "{}: {detail}; running monitors before immediate \
-                                         reconciliation",
+                                        reconciliation",
                                         if escalated { "CRITICAL" } else { "WARN" }
                                     );
-                                    settling = None;
                                 }
                             }
+                            settling = next_settling;
                             let plan = ensure_success_plan(&cfg, decision);
                             for name in outcome.started {
                                 println!("respawned ephemeral runner {name}");

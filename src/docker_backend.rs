@@ -3499,11 +3499,22 @@ minimum_isolation = "container"
         let after_refill: Vec<_> = (1..=6)
             .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
             .collect();
-        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [
+            initial,
+            after_refill.clone(),
+            after_refill.clone(),
+            after_refill,
+        ]
+        .into();
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() =
-            Some([Err("synthetic post-refill docker top timeout".to_string())].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [
+                Err("synthetic post-refill docker top timeout".to_string()),
+                Ok(6),
+            ]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -3524,6 +3535,40 @@ minimum_isolation = "container"
             (Duration::ZERO, true),
             "incomplete post-refill evidence must run monitors and add zero sleep before reconciliation"
         );
+
+        let started_at = Instant::now();
+        let mut settling = crate::settling_for_ensure_decision(started_at, decision)
+            .expect("incomplete readiness must keep local probing armed");
+        let mut ceilings = crate::SettlingCeilingState::default();
+        assert!(!crate::record_settling_ceiling(
+            &cfg,
+            &mut ceilings,
+            "synthetic first incomplete episode"
+        ));
+
+        let misleading_full_container_outcome =
+            ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert_eq!(
+            crate::ensure_success_decision(&cfg, &misleading_full_container_outcome),
+            crate::EnsureSuccessDecision::Recovered,
+            "a standalone full-container tick cannot prove Runner.Worker readiness"
+        );
+        assert!(
+            settling.is_active(),
+            "pending local readiness state must take precedence over the full-container early return"
+        );
+        assert_eq!(
+            ceilings.consecutive_ceilings, 1,
+            "no readiness proof means no reset"
+        );
+
+        let executing = local_executing_runner_count(&cfg).unwrap();
+        assert_eq!(
+            settling.observe(started_at + Duration::from_secs(5), executing, 6),
+            crate::SettlingDecision::Recovered
+        );
+        ceilings.record_recovery();
+        assert_eq!(ceilings.consecutive_ceilings, 0);
     }
 
     #[test]
