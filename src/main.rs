@@ -678,18 +678,68 @@ fn apply_ensure_outcome_to_failure_streak(
     partial_failure
 }
 
-fn serve_success_plan(
-    cfg: &config::Config,
-    outcome: &docker_backend::EnsureCountOutcome,
-    fast_followup_armed: &mut bool,
-) -> (Duration, bool) {
-    if outcome.remaining_shortage == 0 {
-        *fast_followup_armed = true;
-        (cfg.runner.serve_tick(), true)
-    } else if std::mem::take(fast_followup_armed) {
-        (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
-    } else {
-        (cfg.runner.serve_tick(), true)
+const MAX_SETTLING_POLLS: u32 = 5;
+const MAX_SETTLING_DURATION: Duration = Duration::from_secs(25);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlingDecision {
+    Continue,
+    Recovered,
+    Ceiling,
+}
+
+struct SettlingEpisode {
+    started_at: Option<Instant>,
+    attempts: u32,
+    best_executing: u32,
+    stagnant_polls: u32,
+}
+
+impl SettlingEpisode {
+    fn start(now: Instant, executing: u32) -> Self {
+        Self {
+            started_at: Some(now),
+            attempts: 0,
+            best_executing: executing,
+            stagnant_polls: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        self.started_at.is_some()
+    }
+
+    fn observe(&mut self, now: Instant, executing: u32, target: u32) -> SettlingDecision {
+        let Some(started_at) = self.started_at else {
+            return SettlingDecision::Ceiling;
+        };
+        self.attempts += 1;
+        if executing > self.best_executing {
+            self.best_executing = executing;
+            self.stagnant_polls = 0;
+        } else {
+            self.stagnant_polls += 1;
+        }
+        if executing >= target {
+            self.started_at = None;
+            return SettlingDecision::Recovered;
+        }
+        if self.attempts >= MAX_SETTLING_POLLS
+            || now.saturating_duration_since(started_at) >= MAX_SETTLING_DURATION
+        {
+            self.started_at = None;
+            return SettlingDecision::Ceiling;
+        }
+        SettlingDecision::Continue
+    }
+}
+
+fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration, bool) {
+    match decision {
+        SettlingDecision::Continue => (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false),
+        SettlingDecision::Recovered => (cfg.runner.serve_tick(), true),
+        SettlingDecision::Ceiling => (Duration::ZERO, true),
     }
 }
 
@@ -999,7 +1049,7 @@ fn main() -> Result<()> {
             let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
-            let mut fast_followup_armed = true;
+            let mut settling: Option<SettlingEpisode> = None;
             let mut deadman = alert::DeadManState::new(Instant::now());
 
             // Graceful shutdown (bead ez-gh-actions-30p): install SIGTERM/SIGINT
@@ -1014,75 +1064,131 @@ fn main() -> Result<()> {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
-                let (sleep, run_monitors) = match docker_backend::ensure_count_outcome(
-                    &cfg, backend,
-                ) {
-                    Ok(outcome) => {
-                        apply_ensure_outcome_to_failure_streak(
-                            &cfg,
-                            backend,
-                            &mut ensure_fail_streak,
-                            &outcome,
-                        );
-                        let plan = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
-                        for name in outcome.started {
-                            println!("respawned ephemeral runner {name}");
-                        }
-                        // A successful ensure_count is itself a "pipeline is
-                        // alive" signal — a healthy fleet should not need to
-                        // fire alerts to prove liveness. Bump the dead-man
-                        // clock so the threshold counts overall daemon
-                        // liveness, not just alert throughput.
-                        deadman.record_delivery(Instant::now());
-                        // Respawn cadence: configurable via [runner]
-                        // serve_tick_seconds (default 30, 5s floor) — a
-                        // finished short job leaves its slot dead for up to
-                        // one tick + container startup, so hosts chasing
-                        // duty cycle can lower this (2026-07-09 coordination
-                        // with jeff-ubuntu's 60->20 change).
-                        plan
-                    }
-                    Err(e) => {
-                        ensure_fail_streak += 1;
-                        eprintln!("ensure_count failed (will retry): {e:#}");
-                        notify_ensure_failure(&cfg, backend, ensure_fail_streak, &format!("{e:#}"));
-                        // No outer deadline here (unlike wait_for_backend's startup
-                        // window): the serve loop runs indefinitely, so there's no
-                        // caller budget to clamp against. Worst-case per-attempt
-                        // blocking of this loop's ensure_count/respawn cadence stays
-                        // at the ceiling (up to BACKEND_RESTART_COMMAND_TIMEOUT x
-                        // len(commands) — 120s x 2 = 240s on Linux). Restructuring
-                        // this loop to bound that is tracked separately (beads
-                        // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
-                        // part of this fix.
-                        if maybe_restart_backend(
-                            &cfg,
-                            &mut backend_recovery,
-                            None,
-                            docker_reachable(),
-                        ) {
-                            let subject = "Backend restart attempted after ensure_count failures";
-                            let body = format!(
-                                "serve loop attempted backend restart after {} failures for {} on {}",
-                                ensure_fail_streak,
-                                cfg.github.target,
-                                backend.name()
-                            );
-                            if let Err(err) = alert::notify(
-                                &cfg,
-                                "serve.backend.restart.attempted",
-                                Severity::Info,
-                                subject,
-                                &body,
-                            ) {
-                                eprintln!("WARN: alert send error: {err:#}");
+                let (sleep, run_monitors) = if settling.is_some() {
+                    match docker_backend::local_executing_runner_count(&cfg) {
+                        Ok(executing) => {
+                            let (decision, attempts, best_executing) = {
+                                let episode = settling.as_mut().expect("checked above");
+                                let decision =
+                                    episode.observe(Instant::now(), executing, cfg.runner.count);
+                                (decision, episode.attempts, episode.best_executing)
+                            };
+                            match decision {
+                                SettlingDecision::Continue => println!(
+                                    "runner startup settling: {executing}/{} executing locally \
+                                     (poll {attempts}/{MAX_SETTLING_POLLS})",
+                                    cfg.runner.count
+                                ),
+                                SettlingDecision::Recovered => {
+                                    println!(
+                                        "runner startup settled: {executing}/{} executing locally \
+                                         after {attempts} poll(s)",
+                                        cfg.runner.count
+                                    );
+                                    settling = None;
+                                }
+                                SettlingDecision::Ceiling => {
+                                    eprintln!(
+                                        "WARN: runner startup settling ceiling reached: \
+                                         {executing}/{} executing locally, best {best_executing}, \
+                                         {attempts} poll(s); running monitors before immediate \
+                                         reconciliation",
+                                        cfg.runner.count
+                                    );
+                                    settling = None;
+                                }
                             }
-                            (Duration::from_secs(8), false)
-                        } else {
-                            // Failure retry uses the same configured cadence
-                            // as success — the existing 8s fast-path above
-                            // already covers the post-backend-restart case.
-                            (cfg.runner.serve_tick(), false)
+                            settling_plan(&cfg, decision)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "WARN: local Runner.Worker readiness check failed: {e:#}; \
+                                 running monitors before immediate reconciliation"
+                            );
+                            settling = None;
+                            settling_plan(&cfg, SettlingDecision::Ceiling)
+                        }
+                    }
+                } else {
+                    match docker_backend::ensure_count_outcome(&cfg, backend) {
+                        Ok(outcome) => {
+                            apply_ensure_outcome_to_failure_streak(
+                                &cfg,
+                                backend,
+                                &mut ensure_fail_streak,
+                                &outcome,
+                            );
+                            let plan = if outcome.remaining_shortage > 0 {
+                                let executing =
+                                    cfg.runner.count.saturating_sub(outcome.remaining_shortage);
+                                settling = Some(SettlingEpisode::start(Instant::now(), executing));
+                                settling_plan(&cfg, SettlingDecision::Continue)
+                            } else {
+                                settling_plan(&cfg, SettlingDecision::Recovered)
+                            };
+                            for name in outcome.started {
+                                println!("respawned ephemeral runner {name}");
+                            }
+                            // A successful ensure_count is itself a "pipeline is
+                            // alive" signal — a healthy fleet should not need to
+                            // fire alerts to prove liveness. Bump the dead-man
+                            // clock so the threshold counts overall daemon
+                            // liveness, not just alert throughput.
+                            deadman.record_delivery(Instant::now());
+                            // Respawn cadence: configurable via [runner]
+                            // serve_tick_seconds (default 30, 5s floor). A
+                            // bounded local-only settling episode follows a
+                            // refill without repeating GitHub reconciliation.
+                            plan
+                        }
+                        Err(e) => {
+                            ensure_fail_streak += 1;
+                            eprintln!("ensure_count failed (will retry): {e:#}");
+                            notify_ensure_failure(
+                                &cfg,
+                                backend,
+                                ensure_fail_streak,
+                                &format!("{e:#}"),
+                            );
+                            // No outer deadline here (unlike wait_for_backend's startup
+                            // window): the serve loop runs indefinitely, so there's no
+                            // caller budget to clamp against. Worst-case per-attempt
+                            // blocking of this loop's ensure_count/respawn cadence stays
+                            // at the ceiling (up to BACKEND_RESTART_COMMAND_TIMEOUT x
+                            // len(commands) — 120s x 2 = 240s on Linux). Restructuring
+                            // this loop to bound that is tracked separately (beads
+                            // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
+                            // part of this fix.
+                            if maybe_restart_backend(
+                                &cfg,
+                                &mut backend_recovery,
+                                None,
+                                docker_reachable(),
+                            ) {
+                                let subject =
+                                    "Backend restart attempted after ensure_count failures";
+                                let body = format!(
+                                    "serve loop attempted backend restart after {} failures for {} on {}",
+                                    ensure_fail_streak,
+                                    cfg.github.target,
+                                    backend.name()
+                                );
+                                if let Err(err) = alert::notify(
+                                    &cfg,
+                                    "serve.backend.restart.attempted",
+                                    Severity::Info,
+                                    subject,
+                                    &body,
+                                ) {
+                                    eprintln!("WARN: alert send error: {err:#}");
+                                }
+                                (Duration::from_secs(8), false)
+                            } else {
+                                // Failure retry uses the same configured cadence
+                                // as success — the existing 8s fast-path above
+                                // already covers the post-backend-restart case.
+                                (cfg.runner.serve_tick(), false)
+                            }
                         }
                     }
                 };
@@ -1432,78 +1538,73 @@ mod tests {
     }
 
     #[test]
-    fn serve_success_plan_fast_follows_local_shortage_without_monitors() {
-        let mut cfg = test_config();
-        cfg.runner.serve_tick_seconds = 30;
-        let mut fast_followup_armed = true;
-        let outcome = docker_backend::EnsureCountOutcome {
-            started: vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()],
-            missing: 2,
-            remaining_shortage: 2,
-            start_failures: 0,
-        };
-
-        let (sleep, run_monitors) = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
-
-        assert_eq!(sleep, Duration::from_secs(config::MIN_SERVE_TICK_SECONDS));
-        assert!(
-            !run_monitors,
-            "known local shortage must not wait behind synchronous monitors"
-        );
-        assert!(
-            !fast_followup_armed,
-            "the fast path is one-shot until local capacity recovers"
-        );
-    }
-
-    #[test]
-    fn serve_success_plan_preserves_configured_cadence_when_locally_full() {
-        let mut cfg = test_config();
-        cfg.runner.serve_tick_seconds = 30;
-        let mut fast_followup_armed = false;
-        let outcome = docker_backend::EnsureCountOutcome {
-            started: vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()],
-            missing: 2,
-            remaining_shortage: 0,
-            start_failures: 0,
-        };
-
-        let (sleep, run_monitors) = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
-
-        assert_eq!(sleep, Duration::from_secs(30));
-        assert!(
-            run_monitors,
-            "a locally full fleet keeps the normal monitoring cadence"
-        );
-        assert!(
-            fast_followup_armed,
-            "full local capacity rearms the next shortage fast path"
-        );
-    }
-
-    #[test]
-    fn serve_success_plan_bounds_persistent_shortage_to_one_fast_followup() {
-        let mut cfg = test_config();
-        cfg.runner.serve_tick_seconds = 30;
-        let mut fast_followup_armed = true;
-        let outcome = docker_backend::EnsureCountOutcome {
-            started: Vec::new(),
-            missing: 1,
-            remaining_shortage: 1,
-            start_failures: 0,
-        };
-
-        let first = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
-        let second = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
+    fn settling_episode_tracks_not_ready_progress_until_all_six_execute() {
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 4);
 
         assert_eq!(
-            first,
-            (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+            episode.observe(started_at + Duration::from_secs(5), 4, 6),
+            SettlingDecision::Continue
         );
         assert_eq!(
-            second,
+            episode.stagnant_polls, 1,
+            "+5s container-not-ready poll is tracked"
+        );
+
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(10), 5, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(episode.best_executing, 5);
+        assert_eq!(
+            episode.stagnant_polls, 0,
+            "incremental execution progress resets stagnation"
+        );
+
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(15), 5, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(20), 5, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(25), 6, 6),
+            SettlingDecision::Recovered
+        );
+        assert!(!episode.is_active());
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        assert_eq!(
+            settling_plan(&cfg, SettlingDecision::Recovered),
             (Duration::from_secs(30), true),
-            "persistent slot reservations must not create an unbounded fast retry/monitor-starvation loop"
+            "recovery resumes monitors and the configured cadence"
+        );
+    }
+
+    #[test]
+    fn settling_episode_ceiling_guarantees_monitor_then_immediate_reconcile() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 4);
+
+        for seconds in [5, 10, 15, 20] {
+            assert_eq!(
+                episode.observe(started_at + Duration::from_secs(seconds), 4, 6),
+                SettlingDecision::Continue
+            );
+        }
+        let ceiling = episode.observe(started_at + Duration::from_secs(25), 4, 6);
+
+        assert_eq!(ceiling, SettlingDecision::Ceiling);
+        assert_eq!(episode.attempts, MAX_SETTLING_POLLS);
+        assert!(!episode.is_active());
+        assert_eq!(
+            settling_plan(&cfg, ceiling),
+            (Duration::ZERO, true),
+            "the bounded episode must run monitors and add no sleep before the next expensive reconciliation"
         );
     }
 

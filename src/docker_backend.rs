@@ -48,6 +48,9 @@ const MACOS_HOST_DISK_FLOOR_GB: u64 = 15;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
+const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -68,6 +71,9 @@ static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mut
 static TEST_HOST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<std::collections::VecDeque<u32>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
 /// Overrides the binary name/path used to build every `docker` `Command` in
 /// this module. Unlike mutating the process-wide `PATH` env var (which any
 /// OTHER test in this binary — including unrelated modules like `alert.rs`,
@@ -1825,7 +1831,7 @@ static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
     std::collections::VecDeque<Vec<ManagedContainer>>,
 > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
-pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedContainer>> {
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().pop_front() {
         return Ok(containers);
@@ -1844,7 +1850,7 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
         "--format",
         "json",
     ]);
-    let out = run_docker(cmd, "listing managed containers")?;
+    let out = run_docker_with_timeout(cmd, "listing managed containers", timeout)?;
     if !out.status.success() {
         bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -1856,6 +1862,70 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
         containers.push(serde_json::from_str(line).context("unexpected docker ps json")?);
     }
     Ok(containers)
+}
+
+pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+    managed_containers_with_timeout(DOCKER_TIMEOUT)
+}
+
+fn runner_worker_present(output: &str) -> bool {
+    output
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().nth(1) == Some("Runner.Worker"))
+}
+
+fn executing_runner_count_from_containers(
+    cfg: &Config,
+    containers: &[ManagedContainer],
+    deadline: Instant,
+) -> u32 {
+    let owned = current_prefix_containers(containers, cfg);
+    #[cfg(test)]
+    {
+        let _ = deadline;
+        if let Some(count) = TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap().pop_front() {
+            return count.min(owned.len() as u32);
+        }
+        // Existing lifecycle tests model ready containers without shelling out
+        // to a real Docker daemon. Tests exercising startup readiness enqueue
+        // explicit Runner.Worker counts above.
+        owned.len() as u32
+    }
+
+    #[cfg(not(test))]
+    let mut executing = 0;
+    #[cfg(not(test))]
+    for container in owned {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut cmd = docker_cmd();
+        cmd.args(["top", &container.id, "-eo", "pid,comm"]);
+        let timeout = remaining.min(LOCAL_TOP_TIMEOUT);
+        if let Ok(out) = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout) {
+            if out.status.success() && runner_worker_present(&String::from_utf8_lossy(&out.stdout))
+            {
+                executing += 1;
+            }
+        }
+    }
+    #[cfg(not(test))]
+    executing
+}
+
+/// Cheap local capacity truth for the serve-loop settling episode. This path
+/// talks only to Docker (`ps` + bounded `top`); it never lists or mutates
+/// GitHub runners, registrations, or workflow jobs.
+pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
+    let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
+    let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
+    Ok(executing_runner_count_from_containers(
+        cfg,
+        &containers,
+        deadline,
+    ))
 }
 
 /// Process-wide high-water-mark of each managed runner container's RSS, in
@@ -2326,7 +2396,7 @@ pub struct EnsureCountOutcome {
     pub started: Vec<String>,
     /// Shortage observed before this call's sole start batch.
     pub missing: u32,
-    /// Shortage from a fresh local container recount after that batch.
+    /// Shortage from a fresh local Runner.Worker readiness recount after that batch.
     pub remaining_shortage: u32,
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
@@ -2361,7 +2431,11 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let containers = managed_containers()?;
-    let alive = current_prefix_containers(&containers, cfg).len() as u32;
+    let alive = executing_runner_count_from_containers(
+        cfg,
+        &containers,
+        Instant::now() + LOCAL_READINESS_BUDGET,
+    );
     if alive >= cfg.runner.count {
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
@@ -2505,7 +2579,11 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
 
     let refill = refill?;
     let containers_after = managed_containers().context("post-refill local container recount")?;
-    let alive_after = current_prefix_containers(&containers_after, cfg).len() as u32;
+    let alive_after = executing_runner_count_from_containers(
+        cfg,
+        &containers_after,
+        Instant::now() + LOCAL_READINESS_BUDGET,
+    );
     let outcome = EnsureCountOutcome {
         started: refill.started,
         missing,
@@ -2602,6 +2680,7 @@ mod tests {
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
             TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().clear();
+            TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap().clear();
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -3205,6 +3284,51 @@ minimum_isolation = "container"
             &["must-not-start"],
             "a reservation wedge must not invoke the starter without a free slot"
         );
+    }
+
+    #[test]
+    fn ensure_count_does_not_treat_container_without_runner_worker_as_capacity() {
+        let _env = TestEnv::new("ensure_count_worker_readiness");
+        let cfg = cfg_with(6, "ez-org-runner");
+        for slot in 1..=6 {
+            assert_eq!(next_slot(&cfg).unwrap(), slot);
+            record_slot_runner_id(slot, 2000 + u64::from(slot)).unwrap();
+        }
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let six_containers: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [six_containers.clone(), six_containers].into();
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = [4, 4].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.missing, 2,
+            "two containers without Runner.Worker are not ready capacity"
+        );
+        assert_eq!(outcome.remaining_shortage, 2);
+        assert!(
+            outcome.started.is_empty(),
+            "occupied slots cannot be double-started"
+        );
+        assert!(
+            !outcome.is_partial_failure(),
+            "booting/settling workers are not backend failures"
+        );
+    }
+
+    #[test]
+    fn runner_worker_parser_requires_exact_process_name() {
+        let output = "PID COMMAND\n101 Runner.Listener\n202 Runner.Worker\n";
+        assert!(runner_worker_present(output));
+        assert!(!runner_worker_present("PID COMMAND\n101 Runner.Listener\n"));
+        assert!(!runner_worker_present(
+            "PID COMMAND\n202 NotRunner.Workerish\n"
+        ));
     }
 
     #[test]
