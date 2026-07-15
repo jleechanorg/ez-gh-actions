@@ -48,6 +48,9 @@ case "$(uname -s)" in
   *)      PLATFORM="other" ;;
 esac
 
+source "$SCRIPT_DIR/scripts/launchd-service-docker-endpoint.sh"
+use_launchd_service_docker_endpoint "$PLATFORM"
+
 # Probe the supervisor (systemd on Linux, launchd on macOS) for ezgha's
 # service state. Returns one of: active | inactive | failed | not-loaded.
 probe_service_state() {
