@@ -36,15 +36,9 @@ pub const PROBE_IMAGE: &str = "alpine:3.19";
 /// row we treat the disk floor as exceeded and refuse to spawn, since a
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
-/// Mac host floor. Recalibrated 40 -> 15 on 2026-07-15: the 926GB Mac host's
-/// steady-state free space is 35-46GB, so a 40GB floor sits inside normal
-/// operating range and flapped the fleet all day 2026-07-14 (down at 37-39GB,
-/// up at 41-46GB). Blast radius: runner workloads write inside the VM's own
-/// 20GiB disk (guarded separately by min_free_disk_gb on the daemon side);
-/// host exposure is the sparse VM disk files (~6GB observed), so 15GB leaves
-/// 20-30GB margin at steady state while still refusing to spawn on a
-/// genuinely full host.
-const MACOS_HOST_DISK_FLOOR_GB: u64 = 15;
+/// Incident-derived early warning for Mac host pressure. This is deliberately
+/// observability-only: `limits.min_free_disk_gb` remains the admission floor.
+const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
@@ -69,6 +63,8 @@ static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
 static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_HOST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_IS_MACOS_HOST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
@@ -2281,26 +2277,24 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
-fn effective_host_disk_floor_gb(configured_floor_gb: u64, is_macos: bool) -> u64 {
-    if is_macos {
-        // ponytail: keep one incident-derived Mac safety floor here; add a
-        // separate host-floor config only if heterogeneous hosts need it.
-        configured_floor_gb.max(MACOS_HOST_DISK_FLOOR_GB)
-    } else {
-        configured_floor_gb
-    }
-}
-
 /// Free space on the outer host filesystem that backs Docker's storage.
 /// This is intentionally separate from `free_disk_gb`: with Colima the guest
 /// can report ample overlay space while its sparse disk has exhausted APFS.
+fn is_macos_host() -> bool {
+    #[cfg(test)]
+    if let Some(is_macos) = *TEST_IS_MACOS_HOST.lock().unwrap() {
+        return is_macos;
+    }
+    cfg!(target_os = "macos")
+}
+
 fn host_free_disk_gb() -> Option<u64> {
     #[cfg(test)]
     if let Some(free) = *TEST_HOST_FREE_DISK_GB.lock().unwrap() {
         return free;
     }
 
-    let path = if cfg!(target_os = "macos") {
+    let path = if is_macos_host() {
         "/System/Volumes/Data"
     } else {
         "/"
@@ -2445,8 +2439,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             start_failures: 0,
         });
     }
-    let host_floor_gb =
-        effective_host_disk_floor_gb(cfg.limits.min_free_disk_gb, cfg!(target_os = "macos"));
+    let host_floor_gb = cfg.limits.min_free_disk_gb;
     match host_free_disk_gb() {
         Some(free) if free < host_floor_gb => {
             let _ = alert::notify(
@@ -2463,7 +2456,20 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                 "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
             );
         }
-        Some(_) => {}
+        Some(free) => {
+            if is_macos_host() && free < MACOS_HOST_DISK_PRESSURE_ALERT_GB {
+                let _ = alert::notify(
+                    cfg,
+                    "runner_pool.host_disk_pressure",
+                    Severity::Warning,
+                    "Mac host disk pressure approaching admission floor",
+                    &format!(
+                        "{free} GB free on the Mac host filesystem is below the {MACOS_HOST_DISK_PRESSURE_ALERT_GB} GB pressure-alert threshold for {}; runner admission remains enabled until the configured {} GB floor is crossed",
+                        cfg.github.target, cfg.limits.min_free_disk_gb
+                    ),
+                );
+            }
+        }
         None => {
             let _ = alert::notify(
                 cfg,
@@ -2679,6 +2685,7 @@ mod tests {
             *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_IS_MACOS_HOST.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
             TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().clear();
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
@@ -2695,13 +2702,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_host_floor_never_drops_below_pressure_threshold() {
-        assert_eq!(effective_host_disk_floor_gb(5, true), 15);
-        assert_eq!(effective_host_disk_floor_gb(48, true), 48);
-        assert_eq!(effective_host_disk_floor_gb(5, false), 5);
-    }
-
-    #[test]
     fn host_disk_probe_reads_outer_filesystem() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
@@ -2710,19 +2710,90 @@ mod tests {
     }
 
     #[test]
-    fn host_disk_floor_refuses_batch_before_any_runner_starts() {
-        let _env = TestEnv::new("host_disk_floor");
+    fn mac_host_pressure_alert_does_not_block_six_slot_refill_at_39_gb() {
+        let env = TestEnv::new("host_disk_pressure_alert");
+        crate::alert::clear_alert_state();
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(true);
         let mut cfg = cfg_with(6, "ez-org-runner");
-        cfg.limits.min_free_disk_gb = 40;
+        cfg.limits.min_free_disk_gb = 5;
+        let alert_log = env.path.with_file_name("alerts.jsonl");
+        cfg.alert.log_path = Some(alert_log.clone());
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(
+            (1..=6)
+                .map(|slot| format!("ez-org-runner-{slot}"))
+                .collect(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started.len(), 6);
+        assert_eq!(outcome.missing, 6);
+        let alert = std::fs::read_to_string(alert_log).unwrap();
+        assert!(alert.contains("runner_pool.host_disk_pressure"));
+        assert!(alert.contains("\"severity\":\"WARNING\""));
+        assert!(alert.contains("39 GB free"));
+        assert!(alert.contains("40 GB"));
+        assert!(!alert.contains("refusing to spawn"));
+    }
+
+    #[test]
+    fn linux_host_does_not_emit_mac_pressure_alert() {
+        let env = TestEnv::new("linux_host_disk_pressure");
+        crate::alert::clear_alert_state();
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        let alert_log = env.path.with_file_name("alerts.jsonl");
+        cfg.alert.log_path = Some(alert_log.clone());
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert!(!alert_log.exists());
+    }
+
+    #[test]
+    fn configured_host_disk_floor_admits_exact_boundary() {
+        let _env = TestEnv::new("host_disk_floor_boundary");
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert_eq!(outcome.missing, 1);
+    }
+
+    #[test]
+    fn configured_host_disk_floor_refuses_space_below_the_floor() {
+        let _env = TestEnv::new("host_disk_floor");
+        let mut cfg = cfg_with(6, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(4));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
 
         let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
 
-        assert!(format!("{err:#}").contains("host filesystem"));
+        let message = format!("{err:#}");
+        assert!(message.contains("host filesystem"));
+        assert!(message.contains("floor: 5 GB"));
         assert_eq!(
             TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
             1,

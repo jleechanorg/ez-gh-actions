@@ -48,7 +48,7 @@ uninstall() {
     ok "launchd agent removed"
   fi
 
-  # Auxiliary units (token-refresh / queue-reaper / watchdog) — installed
+  # Auxiliary units (token-refresh / queue-reaper / watchdog / colima-trim) — installed
   # further below in the main flow as ezgha-<name>.timer+.service on Linux
   # and org.jleechanorg.ezgha-<name>.plist on macOS, all pointed at scripts
   # in ~/.local/libexec/ezgha. Uninstall previously disabled only the main
@@ -58,7 +58,7 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog"
+  AUX_NAMES="token-refresh queue-reaper watchdog colima-trim"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -333,8 +333,8 @@ if [ -f "${CONFIG_PATH}" ]; then
   fi
 fi
 
-# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper) ─
-# These three units keep the ezgha fleet healthy between deploys:
+# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, colima-trim) ─
+# These auxiliary units keep the ezgha fleet healthy between deploys:
 #   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
@@ -416,11 +416,22 @@ PLIST
         rm -f "${plist}"
         return 1
       fi
-      launchctl load -w "${plist}" 2>/dev/null || true
+      if ! launchctl load -w "${plist}"; then
+        bad "launchctl failed to load ${plist}"
+        rm -f "${plist}"
+        return 1
+      fi
+      if ! launchctl print "gui/$(id -u)/org.jleechanorg.ezgha-${name}" >/dev/null; then
+        bad "launchctl did not register org.jleechanorg.ezgha-${name}"
+        launchctl unload "${plist}" 2>/dev/null || true
+        rm -f "${plist}"
+        return 1
+      fi
       ok "macOS plist installed: ${name} (every ${interval_sec}s)"
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do
