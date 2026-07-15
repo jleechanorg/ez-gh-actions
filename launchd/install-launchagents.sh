@@ -100,6 +100,16 @@ verify_scripts_exist() {
 install_scripts() {
   mkdir -p "${SCRIPTS_DIR}" "${DASHBOARD_DIR}" "${STATE_DIR}"
   chmod 0700 "${STATE_DIR}"
+  if [[ "$label_filter" == "$DASHBOARD_LABEL" ]]; then
+    for name in "${DASHBOARD_SCRIPTS[@]}"; do
+      install -m 0755 "${REPO_PATH}/scripts/${name}" "${SCRIPTS_DIR}/${name}"
+    done
+    for name in "${DASHBOARD_ASSETS[@]}"; do
+      install -m 0644 "${REPO_PATH}/dashboard/${name}" "${DASHBOARD_DIR}/${name}"
+    done
+    echo "dashboard payload installed: ${SCRIPTS_DIR}"
+    return
+  fi
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.

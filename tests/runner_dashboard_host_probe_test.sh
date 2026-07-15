@@ -4,7 +4,22 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROBE="$ROOT/scripts/runner_dashboard_host_probe.sh"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+MAC_LOG="/tmp/ezgha-launchd-stdout.log"
+MAC_LOG_BACKUP="$WORK/mac-launchd.log.backup"
+MAC_LOG_EXISTED=0
+if [[ -e "$MAC_LOG" ]]; then
+  cp -p "$MAC_LOG" "$MAC_LOG_BACKUP"
+  MAC_LOG_EXISTED=1
+fi
+cleanup() {
+  if [[ "$MAC_LOG_EXISTED" -eq 1 ]]; then
+    cp -p "$MAC_LOG_BACKUP" "$MAC_LOG"
+  else
+    rm -f "$MAC_LOG"
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 HOME_T="$WORK/home"
 BIN="$WORK/bin"
 mkdir -p "$HOME_T/.config/ezgha" "$HOME_T/.local/state/ezgha/watchdog" "$BIN"
@@ -50,13 +65,19 @@ sed -n '1,$p' > "$BIN/docker" <<'SH'
 case "$1" in
   info) exit 0 ;;
   run)
-    [[ "${STUB_DOCKER_RUN_FAIL:-0}" != 1 ]] || exit 3
-    [[ "$2" == "--rm" && "$3" == "--entrypoint" && "$4" == "df" ]] || exit 2
-    [[ "$5" == "secret-image" && "$6" == "-Pk" && "$7" == "/" ]] || exit 2
+    echo "dashboard probe must not create or pull a container" >&2
+    exit 99
+    ;;
+  exec)
+    [[ "${STUB_DOCKER_EXEC_FAIL:-0}" != 1 ]] || exit 3
+    [[ "$2" == "secret-prefix-1" && "$3" == "df" && "$4" == "-Pk" && "$5" == "/" ]] || exit 2
     echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
     echo "/dev/test 99999999 1 ${STUB_DAEMON_FREE_KB:-99999998} 1% /"
     ;;
-  inspect) echo true ;;
+  inspect)
+    [[ "${STUB_ALL_DOWN:-0}" != 1 ]] || { echo false; exit 0; }
+    echo true
+    ;;
   top)
     if [[ "${STUB_TOP_FAIL:-0}" == 1 ]]; then exit 1; fi
     echo 'PID COMMAND'
@@ -74,8 +95,9 @@ printf '%s\n' "${STUB_LAUNCHCTL_LIST:-}"
 SH
 sed -n '1,$p' > "$BIN/df" <<'SH'
 #!/usr/bin/env bash
+[[ "${STUB_HOST_DF_FAIL:-0}" != 1 ]] || exit 3
 echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
-echo '/dev/test 99999999 1 99999998 1% /'
+echo "/dev/test 99999999 1 ${STUB_HOST_FREE_KB:-99999998} 1% /"
 SH
 for forbidden in gh ssh; do
   sed -n '1,$p' > "$BIN/$forbidden" <<'SH'
@@ -114,6 +136,25 @@ for forbidden in ("secret-prefix", "secret-org", "secret-label", "secret-image")
     assert forbidden not in serialized
 PY
 
+printf '%s\n' \
+  'respawned ephemeral runner secret-prefix-1' \
+  'respawned ephemeral runner secret-prefix-2' > "$MAC_LOG"
+printf '0\n' > "$HOME_T/.local/state/ezgha/watchdog/mac.miss_count"
+printf '5\n' > "$HOME_T/.local/state/ezgha/watchdog/mac.miss_threshold"
+STUB_UNAME=Darwin STUB_ALL_DOWN=1 \
+  STUB_LAUNCHCTL_LIST='123 0 org.jleechanorg.ezgha' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-old-respawn.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "mac-old-respawn.json").read_text())
+assert payload["fleet"]["cycling"] == 0
+assert payload["fleet"]["down"] == 2
+PY
+
 STUB_DAEMON_FREE_KB=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
   bash "$PROBE" --host-class linux > "$WORK/daemon-disk-critical.json"
 WORK="$WORK" python3 - <<'PY'
@@ -126,7 +167,35 @@ assert payload["sources"]["disk"]["ok"] is True
 assert payload["disk"] == {"status": "critical"}
 PY
 
-STUB_DOCKER_RUN_FAIL=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+STUB_UNAME=Darwin STUB_LAUNCHCTL_LIST='123 0 org.jleechanorg.ezgha' \
+  STUB_HOST_FREE_KB=$((39 * 1024 * 1024)) PATH="$BIN:$PATH" HOME="$HOME_T" \
+  EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/host-disk-critical.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "host-disk-critical.json").read_text())
+assert payload["sources"]["disk"]["ok"] is True
+assert payload["disk"] == {"status": "critical"}
+PY
+grep -Fq 'const MACOS_HOST_DISK_FLOOR_GB: u64 = 40;' "$ROOT/src/docker_backend.rs"
+grep -Fq 'HOST_DISK_FLOOR_GB=40' "$PROBE"
+
+STUB_HOST_DF_FAIL=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/host-disk-unknown.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "host-disk-unknown.json").read_text())
+assert payload["sources"]["disk"]["ok"] is False
+assert payload["disk"] == {"status": "unknown"}
+PY
+
+STUB_DOCKER_EXEC_FAIL=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
   bash "$PROBE" --host-class linux > "$WORK/daemon-disk-unknown.json"
 WORK="$WORK" python3 - <<'PY'
 import json

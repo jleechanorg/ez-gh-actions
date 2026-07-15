@@ -128,4 +128,28 @@ test "$STATUS" -ne 0
 [[ "$OUTPUT" == *"ownership marker"* ]]
 test "$(git --git-dir="$REMOTE" show legacy-pages:existing.html)" = "existing public content"
 
+TREE_PROBES="$WORK/tree-probes"
+mkdir -p "$TREE_PROBES"
+cat > "$TREE_PROBES/mac.sh" <<'SH'
+#!/usr/bin/env bash
+bash -c 'trap "" TERM; sleep 60' &
+child=$!
+printf '%s\n' "$child" > "${TREE_CHILD_PID:?}"
+wait "$child"
+SH
+chmod +x "$TREE_PROBES/mac.sh"
+cp "$PROBES/linux.sh" "$TREE_PROBES/linux.sh"
+TREE_CHILD_PID="$WORK/tree-child.pid" \
+EZGHA_DASHBOARD_PROBE_TIMEOUT_SECONDS=1 \
+EZGHA_DASHBOARD_PROBE_DIR="$TREE_PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/tree-timeout.lock" \
+bash "$PUBLISHER" --collect-only "$WORK/tree-timeout-site"
+CHILD_PID="$(cat "$WORK/tree-child.pid")"
+if kill -0 "$CHILD_PID" 2>/dev/null; then
+  echo "timed-out probe descendant survived: $CHILD_PID" >&2
+  kill "$CHILD_PID" 2>/dev/null || true
+  exit 1
+fi
+
 echo "runner dashboard publisher tests passed"

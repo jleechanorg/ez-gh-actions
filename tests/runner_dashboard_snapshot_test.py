@@ -86,17 +86,33 @@ class SnapshotTest(unittest.TestCase):
             )
             self.assertFalse(snapshot["sources"][f"{host_class}_host"]["ok"])
 
-    def test_missing_watchdog_is_unknown_not_zero(self):
+    def test_all_down_remains_valid_when_container_disk_is_unavailable(self):
         mac = host_payload("mac", 6)
-        mac["sources"]["watchdog_state"]["ok"] = False
-        mac["watchdog"]["consecutive_misses"] = None
+        mac["fleet"].update(executing=0, idle=0, cycling=0, down=6)
+        mac["sources"]["disk"]["ok"] = False
+        mac["disk"]["status"] = "unknown"
         snapshot = MODULE.build_snapshot(
             mac_payload=mac,
             linux_payload=host_payload("linux", 16),
             observed_at="2026-07-14T20:00:00Z",
             published_at="2026-07-14T20:00:05Z",
         )
-        self.assertFalse(snapshot["sources"]["mac_host"]["ok"])
+        self.assertTrue(snapshot["sources"]["mac_host"]["ok"])
+
+    def test_missing_watchdog_is_explicit_degraded_telemetry(self):
+        mac = host_payload("mac", 6)
+        mac["sources"]["watchdog_state"]["ok"] = False
+        mac["watchdog"] = {"consecutive_misses": None, "restart_after": None}
+        snapshot = MODULE.build_snapshot(
+            mac_payload=mac,
+            linux_payload=host_payload("linux", 16),
+            observed_at="2026-07-14T20:00:00Z",
+            published_at="2026-07-14T20:00:05Z",
+        )
+        self.assertTrue(snapshot["sources"]["mac_host"]["ok"])
+        self.assertFalse(
+            snapshot["fleets"]["mac"]["sources"]["watchdog_state"]["ok"]
+        )
         self.assertIsNone(
             snapshot["fleets"]["mac"]["watchdog"]["consecutive_misses"]
         )

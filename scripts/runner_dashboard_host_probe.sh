@@ -59,7 +59,6 @@ except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
     raise SystemExit(1)
 print(count)
 print(prefix)
-print(image)
 print(disk_floor)
 PY
 }
@@ -167,8 +166,10 @@ recent_respawn_evidence() {
   local name="$1" logs=""
   if [[ "$(uname -s)" == "Linux" ]]; then
     logs="$(journalctl --user -u ezgha.service --since "$RESPAWN_EVIDENCE_WINDOW_MIN minutes ago" --no-pager 2>/dev/null || true)"
-  elif [[ -f /tmp/ezgha-launchd-stdout.log ]]; then
-    logs="$(tail -n 400 /tmp/ezgha-launchd-stdout.log 2>/dev/null || true)"
+  else
+    # The macOS launchd log has no reliably parseable timestamps. Historical
+    # respawn lines must not downgrade a persistently missing fleet to cycling.
+    return 1
   fi
   grep -q "respawned ephemeral runner $name$" <<<"$logs"
 }
@@ -176,14 +177,12 @@ recent_respawn_evidence() {
 CONFIG_OK=false
 TARGET=""
 PREFIX=""
-IMAGE=""
 DISK_FLOOR_GB=""
 config_output="$(read_config 2>/dev/null || true)"
-if [[ "$(printf '%s\n' "$config_output" | awk 'NF { count++ } END { print count + 0 }')" -eq 4 ]]; then
+if [[ "$(printf '%s\n' "$config_output" | awk 'NF { count++ } END { print count + 0 }')" -eq 3 ]]; then
   TARGET="$(printf '%s\n' "$config_output" | sed -n '1p')"
   PREFIX="$(printf '%s\n' "$config_output" | sed -n '2p')"
-  IMAGE="$(printf '%s\n' "$config_output" | sed -n '3p')"
-  DISK_FLOOR_GB="$(printf '%s\n' "$config_output" | sed -n '4p')"
+  DISK_FLOOR_GB="$(printf '%s\n' "$config_output" | sed -n '3p')"
   CONFIG_OK=true
 fi
 
@@ -254,14 +253,42 @@ DISK_OK=false
 DISK_STATUS="unknown"
 if [[ "$CONFIG_OK" == true ]]; then
   DISK_OUTPUT=""
-  if DISK_OUTPUT="$(docker run --rm --entrypoint df "$IMAGE" -Pk / 2>/dev/null)"; then
-    FREE_KB="$(awk 'NR == 2 { print $4 }' <<<"$DISK_OUTPUT")"
-  else
-    FREE_KB=""
+  HOST_DISK_OUTPUT=""
+  HOST_DISK_PATH="/"
+  HOST_DISK_FLOOR_GB="$DISK_FLOOR_GB"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    HOST_DISK_PATH="/System/Volumes/Data"
+    if (( HOST_DISK_FLOOR_GB < 40 )); then
+      # Keep this synchronized with MACOS_HOST_DISK_FLOOR_GB in
+      # src/docker_backend.rs; the contract test fails if either value drifts.
+      HOST_DISK_FLOOR_GB=40
+    fi
   fi
-  if [[ "$FREE_KB" =~ ^[0-9]+$ ]]; then
+  DAEMON_DISK_CONTAINER=""
+  if [[ "$DOCKER_OK" == true ]]; then
+    for ((slot=1; slot<=TARGET; slot++)); do
+      candidate="${PREFIX}-${slot}"
+      if [[ "$(docker inspect -f '{{.State.Running}}' "$candidate" 2>/dev/null || true)" == "true" ]]; then
+        DAEMON_DISK_CONTAINER="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$DAEMON_DISK_CONTAINER" ]] && \
+    DISK_OUTPUT="$(docker exec "$DAEMON_DISK_CONTAINER" df -Pk / 2>/dev/null)"; then
+    DAEMON_FREE_KB="$(awk 'NR == 2 { print $4 }' <<<"$DISK_OUTPUT")"
+  else
+    DAEMON_FREE_KB=""
+  fi
+  if HOST_DISK_OUTPUT="$(df -Pk "$HOST_DISK_PATH" 2>/dev/null)"; then
+    HOST_FREE_KB="$(awk 'NR == 2 { print $4 }' <<<"$HOST_DISK_OUTPUT")"
+  else
+    HOST_FREE_KB=""
+  fi
+  if [[ "$DAEMON_FREE_KB" =~ ^[0-9]+$ && "$HOST_FREE_KB" =~ ^[0-9]+$ ]]; then
     DISK_OK=true
-    if (( FREE_KB >= DISK_FLOOR_GB * 1024 * 1024 )); then
+    if (( DAEMON_FREE_KB >= DISK_FLOOR_GB * 1024 * 1024 &&
+      HOST_FREE_KB >= HOST_DISK_FLOOR_GB * 1024 * 1024 )); then
       DISK_STATUS="healthy"
     else
       DISK_STATUS="critical"

@@ -430,8 +430,7 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
-    "${SCRIPT_DIR}/launchd/install-launchagents.sh" install \
-      "org.jleechanorg.ezgha-runner-dashboard"
+    info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do

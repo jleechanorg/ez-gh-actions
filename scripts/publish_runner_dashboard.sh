@@ -110,6 +110,8 @@ run_probe() {
   local output="$1"
   shift
   python3 - "$PROBE_TIMEOUT_SECONDS" "$output" "$@" <<'PY'
+import os
+import signal
 import subprocess
 import sys
 
@@ -118,13 +120,28 @@ output = sys.argv[2]
 command = sys.argv[3:]
 try:
     with open(output, "wb") as handle:
-        subprocess.run(
+        process = subprocess.Popen(
             command,
-            check=True,
             stdout=handle,
             stderr=subprocess.DEVNULL,
-            timeout=timeout,
+            start_new_session=True,
         )
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, command)
 except (OSError, subprocess.SubprocessError):
     with open(output, "w", encoding="utf-8") as handle:
         handle.write("{}\n")
@@ -135,17 +152,34 @@ run_bounded() {
   local seconds="$1"
   shift
   python3 - "$seconds" "$@" <<'PY'
+import os
+import signal
 import subprocess
 import sys
 
 try:
-    subprocess.run(
+    process = subprocess.Popen(
         sys.argv[2:],
-        check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        timeout=int(sys.argv[1]),
+        start_new_session=True,
     )
+    try:
+        returncode = process.wait(timeout=int(sys.argv[1]))
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, sys.argv[2:])
 except (OSError, subprocess.SubprocessError):
     raise SystemExit(1)
 PY

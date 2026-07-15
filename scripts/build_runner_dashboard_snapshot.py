@@ -54,16 +54,41 @@ def _public_host(payload, expected_class):
             and classified == fleet["configured"]
             and fleet["reserved"] <= fleet["configured"]
         )
+    all_down = (
+        valid_counts
+        and fleet["configured"] > 0
+        and fleet["down"] == fleet["configured"]
+        and all(fleet[key] == 0 for key in ("executing", "idle", "cycling"))
+    )
+    disk_valid = (
+        sources["disk"]["ok"] and disk_status != "unknown"
+    ) or (
+        all_down and not sources["disk"]["ok"] and disk_status == "unknown"
+    )
     valid = (
         payload.get("schema_version") == 1
         and payload.get("host_class") == expected_class
         and set(sources) == set(SOURCE_KEYS)
-        and all(source["ok"] for source in sources.values())
+        and all(
+            sources[key]["ok"]
+            for key in SOURCE_KEYS
+            if key not in {"disk", "watchdog_state"}
+        )
         and valid_counts
-        and disk_status != "unknown"
-        and consecutive is not None
-        and restart_after is not None
-        and restart_after > 0
+        and disk_valid
+        and (
+            (
+                sources["watchdog_state"]["ok"]
+                and consecutive is not None
+                and restart_after is not None
+                and restart_after > 0
+            )
+            or (
+                not sources["watchdog_state"]["ok"]
+                and consecutive is None
+                and restart_after is None
+            )
+        )
     )
     return {
         "sources": sources,

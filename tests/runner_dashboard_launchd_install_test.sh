@@ -68,10 +68,11 @@ HOME="$HOME_T" PATH="$BIN:$PATH" bash "$ROOT/launchd/install-launchagents.sh" re
 test ! -e "$HOME_T/.local/libexec/ezgha"
 test ! -e "$PLIST"
 
-INSTALL_WIRING="$(
-  sed -n '/launchd\/install-launchagents.sh" install/,+1p' "$ROOT/install.sh"
-)"
-[[ "$INSTALL_WIRING" == *'"org.jleechanorg.ezgha-runner-dashboard"'* ]]
+if grep -A1 'launchd/install-launchagents.sh" install' "$ROOT/install.sh" |
+  grep -q 'org.jleechanorg.ezgha-runner-dashboard'; then
+  echo "default install must not activate the deferred dashboard" >&2
+  exit 1
+fi
 if grep -q 'dashboard_template=' "$ROOT/install.sh"; then exit 1; fi
 if grep -q 'SCRIPT_DIR}/dashboard/' "$ROOT/install.sh"; then exit 1; fi
 
@@ -100,6 +101,7 @@ UPGRADE_LOG="$WORK/upgrade-launchctl.log"
 mkdir -p "$(dirname "$UPGRADE_PLIST")" "$UPGRADE_LIBEXEC/dashboard" \
   "$UPGRADE_EXPECTED/dashboard"
 printf '%s\n' 'prior-known-good-plist' > "$UPGRADE_PLIST"
+printf '%s\n' 'prior-unrelated-cleanup-script' > "$UPGRADE_LIBEXEC/cleanup-stuck-runs.sh"
 for script in publish_runner_dashboard.sh runner_dashboard_host_probe.sh \
   build_runner_dashboard_snapshot.py; do
   printf 'prior-known-good:%s\n' "$script" > "$UPGRADE_EXPECTED/$script"
@@ -119,6 +121,8 @@ UPGRADE_STATUS=$?
 set -e
 test "$UPGRADE_STATUS" -eq 42
 test "$(cat "$UPGRADE_PLIST")" = 'prior-known-good-plist'
+test "$(cat "$UPGRADE_LIBEXEC/cleanup-stuck-runs.sh")" = \
+  'prior-unrelated-cleanup-script'
 test "$(grep -c '^load .*runner-dashboard.plist$' "$UPGRADE_LOG")" -eq 2
 for script in publish_runner_dashboard.sh runner_dashboard_host_probe.sh \
   build_runner_dashboard_snapshot.py; do

@@ -24,8 +24,8 @@ function host(configured) {
     ),
     fleet: {
       configured,
-      executing: configured - 1,
-      idle: 1,
+      executing: configured,
+      idle: 0,
       cycling: 0,
       down: 0,
       reserved: configured,
@@ -71,6 +71,15 @@ test('cycling capacity is degraded, never healthy', () => {
   assert.equal(classifySnapshot(snapshot, NOW).state, 'degraded');
 });
 
+test('idle capacity is degraded without queue-health proof', () => {
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.fleet.executing -= 1;
+  snapshot.fleets.mac.fleet.idle = 1;
+  const status = classifySnapshot(snapshot, NOW);
+  assert.equal(status.state, 'degraded');
+  assert.match(status.detail, /idle/i);
+});
+
 test('one down slot is degraded', () => {
   const snapshot = structuredClone(HEALTHY);
   snapshot.fleets.linux.fleet.executing -= 1;
@@ -89,6 +98,8 @@ test('all slots down is critical', () => {
   snapshot.fleets.mac.fleet.executing = 0;
   snapshot.fleets.mac.fleet.idle = 0;
   snapshot.fleets.mac.fleet.down = 6;
+  snapshot.fleets.mac.sources.disk.ok = false;
+  snapshot.fleets.mac.disk.status = 'unknown';
   assert.equal(classifySnapshot(snapshot, NOW).state, 'critical');
 });
 
@@ -120,6 +131,18 @@ test("watchdog severity uses each host's published restart threshold", () => {
   assert.equal(classifySnapshot(reached, NOW).state, 'critical');
 });
 
+test('inactive watchdog is degraded without hiding live fleet truth', () => {
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.sources.watchdog_state.ok = false;
+  snapshot.fleets.mac.watchdog = {
+    consecutive_misses: null,
+    restart_after: null,
+  };
+  const status = classifySnapshot(snapshot, NOW);
+  assert.equal(status.state, 'degraded');
+  assert.match(status.detail, /watchdog/i);
+});
+
 test('invalid host contracts stay unknown before severity classification', () => {
   for (const mutate of [
     (snapshot) => {
@@ -148,7 +171,7 @@ test('missing source and inconsistent classification are stale', () => {
       snapshot.sources.mac_host.ok = false;
     },
     (snapshot) => {
-      snapshot.fleets.linux.fleet.idle = 0;
+      snapshot.fleets.linux.fleet.idle = 1;
     },
     (snapshot) => {
       snapshot.fleets.mac.watchdog.consecutive_misses = null;

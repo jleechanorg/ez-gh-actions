@@ -66,18 +66,41 @@
       'service',
       'watchdog_state',
     ];
+    const requiredSourceKeys = sourceKeys.filter(
+      (key) => key !== 'watchdog_state',
+    );
+    const watchdogAvailable = sources.watchdog_state?.ok === true;
+    const allDown =
+      fleet.configured > 0 &&
+      fleet.down === fleet.configured &&
+      fleet.executing === 0 &&
+      fleet.idle === 0 &&
+      fleet.cycling === 0;
+    const diskValid =
+      (sources.disk?.ok === true &&
+        ['healthy', 'critical'].includes(host?.disk?.status)) ||
+      (allDown &&
+        sources.disk?.ok === false &&
+        host?.disk?.status === 'unknown');
     return (
       Object.keys(sources).sort().join(',') === sourceKeys.join(',') &&
-      sourceKeys.every((key) => sources[key]?.ok === true) &&
+      requiredSourceKeys
+        .filter((key) => key !== 'disk')
+        .every((key) => sources[key]?.ok === true) &&
+      diskValid &&
+      typeof sources.watchdog_state?.ok === 'boolean' &&
       FLEET_KEYS.every((key) => isCount(fleet[key])) &&
       fleet.configured === EXPECTED_CONFIGURED[fleetName] &&
       fleet.executing + fleet.idle + fleet.cycling + fleet.down ===
         fleet.configured &&
       fleet.reserved <= fleet.configured &&
-      ['healthy', 'critical'].includes(host?.disk?.status) &&
-      isCount(host?.watchdog?.consecutive_misses) &&
-      Number.isInteger(host?.watchdog?.restart_after) &&
-      host.watchdog.restart_after > 0
+      ((watchdogAvailable &&
+        isCount(host?.watchdog?.consecutive_misses) &&
+        Number.isInteger(host?.watchdog?.restart_after) &&
+        host.watchdog.restart_after > 0) ||
+        (!watchdogAvailable &&
+          host?.watchdog?.consecutive_misses === null &&
+          host?.watchdog?.restart_after === null))
     );
   }
 
@@ -119,6 +142,11 @@
         reasons.push(`${name} has ${fleet.down} down slot(s)`);
       if (fleet.cycling > 0)
         reasons.push(`${name} has ${fleet.cycling} cycling slot(s)`);
+      if (fleet.idle > 0) {
+        reasons.push(
+          `${name} has ${fleet.idle} idle slot(s) without queue-health proof`,
+        );
+      }
       if (fleet.executing + fleet.idle + fleet.cycling < fleet.configured) {
         reasons.push(`${name} live fleet short`);
       }
@@ -127,6 +155,9 @@
       }
       if (host.watchdog.consecutive_misses > 0) {
         reasons.push(`${name} watchdog shortfall`);
+      }
+      if (host.sources.watchdog_state.ok !== true) {
+        reasons.push(`${name} watchdog inactive or stale`);
       }
     }
     return reasons;
@@ -184,7 +215,7 @@
       state: 'live',
       kicker: 'LOCAL CAPACITY SNAPSHOT',
       detail:
-        'Local capacity probes report 6 Mac and 16 Linux slots executing or idle. Queue health is not measured by this dashboard.',
+        'Local capacity probes report 6 Mac and 16 Linux slots executing. Queue health is not measured by this dashboard.',
     };
   }
 
