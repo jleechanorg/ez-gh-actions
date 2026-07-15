@@ -13,6 +13,7 @@ cat > "${STUB_BIN}/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${LAUNCHCTL_LOG:?}"
 if [[ "$1" == load && "$*" == *"${FAIL_LAUNCHCTL_LABEL:-__never__}"* ]]; then exit 1; fi
+if [[ "$1" == print && "$*" == *"${FAIL_LAUNCHCTL_PRINT_LABEL:-__never__}"* ]]; then exit 1; fi
 exit 0
 EOF
 cat > "${STUB_BIN}/uname" <<'EOF'
@@ -55,6 +56,12 @@ if HOME="${HOME_T}" FAIL_LAUNCHCTL_LABEL="colima-trim" bash "${REPO_ROOT}/launch
   exit 1
 fi
 [[ ! -e "${PLIST}" ]] || { echo "FAIL: failed launch left trim plist behind" >&2; exit 1; }
+
+if HOME="${HOME_T}" FAIL_LAUNCHCTL_PRINT_LABEL="colima-trim" bash "${REPO_ROOT}/launchd/install-launchagents.sh" install >/dev/null 2>&1; then
+  echo "FAIL: launchd registration verification failure was swallowed" >&2
+  exit 1
+fi
+[[ ! -e "${PLIST}" ]] || { echo "FAIL: unverified launch left trim plist behind" >&2; exit 1; }
 
 # The primary installer owns full uninstall and must include the same agent.
 touch "${PLIST}"

@@ -34,7 +34,7 @@ s.listen(1)
 time.sleep(300)
 PY
 SOCKET_PID=$!
-for _ in 1 2 3 4 5; do [[ -S "${HOME_T}/.colima/default/docker.sock" ]] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [[ -S "${HOME_T}/.colima/default/docker.sock" ]] && break; sleep 0.1; done
 [[ -S "${HOME_T}/.colima/default/docker.sock" ]] || fail "fixture socket was not created"
 
 cat > "${STUB_BIN}/uname" <<'EOF'
@@ -207,11 +207,12 @@ grep -Fq '"reason":"emergency_pressure_bypass"' "${EZGHA_LOG_PATH}" || fail "eme
 pass "host pressure below 30 GiB bypasses the success cooldown"
 
 reset_case failed-attempt
-mkdir -p "${XDG_STATE_HOME}/ezgha"
-printf '1900 attempt\n' > "${XDG_STATE_HOME}/ezgha/colima-trim.last-attempt"
-STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"
+if STUB_TRIM_FAIL=1 STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"; then
+  fail "stubbed trim failure returned success"
+fi
+STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) EZGHA_NOW_EPOCH=2100 "${GUARD}"
 grep -Fq '"reason":"previous_attempt_retry"' "${EZGHA_LOG_PATH}" || fail "failed attempt was not retryable"
-grep -q fstrim "${STUB_COLIMA_LOG}" || fail "failed attempt marker suppressed retry"
+[[ "$(grep -c fstrim "${STUB_COLIMA_LOG}")" -eq 2 ]] || fail "real failed attempt was not retried"
 pass "a prior failed attempt is retryable on the next poll"
 
 reset_case no-timeout
