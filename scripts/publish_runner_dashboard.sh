@@ -10,7 +10,14 @@ PROBE_DIR="${EZGHA_DASHBOARD_PROBE_DIR:-}"
 REMOTE_LINUX_HOST="${EZGHA_DASHBOARD_LINUX_HOST:-jeff-ubuntu}"
 # shellcheck disable=SC2016  # Expand HOME on the remote host, not the publisher.
 REMOTE_SCRIPTS_DIR='$HOME/.local/libexec/ezgha'
-LOCK_DIR="${EZGHA_DASHBOARD_LOCK_DIR:-${TMPDIR:-/tmp}/ezgha-runner-dashboard.lock}"
+DEFAULT_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ezgha"
+LOCK_DIR_IS_DEFAULT=false
+if [[ -n "${EZGHA_DASHBOARD_LOCK_DIR:-}" ]]; then
+  LOCK_DIR="$EZGHA_DASHBOARD_LOCK_DIR"
+else
+  LOCK_DIR="$DEFAULT_STATE_DIR/runner-dashboard.lock"
+  LOCK_DIR_IS_DEFAULT=true
+fi
 PUBLISH_BRANCH="${EZGHA_DASHBOARD_PUBLISH_BRANCH:-gh-pages}"
 PUBLISH_REMOTE="${EZGHA_DASHBOARD_PUBLISH_REMOTE:-https://github.com/jleechanorg/ez-gh-actions.git}"
 OWNERSHIP_MARKER=".ezgha-runner-dashboard-owned"
@@ -62,6 +69,9 @@ cleanup() {
 acquire_lock() {
   local owner_pid owner_identity live_identity stale_lock
   mkdir -p "$(dirname "$LOCK_DIR")"
+  if [[ "$LOCK_DIR_IS_DEFAULT" == true ]]; then
+    chmod 0700 "$DEFAULT_STATE_DIR"
+  fi
   for _ in 1 2; do
     if mkdir "$LOCK_DIR" 2>/dev/null; then
       printf '%s\n' "$$" > "$LOCK_DIR/owner.pid"

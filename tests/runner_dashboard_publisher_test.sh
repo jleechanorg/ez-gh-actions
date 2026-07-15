@@ -42,6 +42,17 @@ assert "must-not-publish" not in serialized
 assert "secret-host" not in serialized
 PY
 
+DEFAULT_HOME="$WORK/default-home"
+mkdir -p "$DEFAULT_HOME"
+HOME="$DEFAULT_HOME" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+bash "$PUBLISHER" --collect-only "$WORK/default-lock-site"
+DEFAULT_STATE_DIR="$DEFAULT_HOME/.local/state/ezgha"
+test -d "$DEFAULT_STATE_DIR"
+MODE="$(stat -f %Lp "$DEFAULT_STATE_DIR" 2>/dev/null || stat -c %a "$DEFAULT_STATE_DIR")"
+test "$MODE" = "700"
+
 printf 'keep until replacement succeeds\n' > "$SITE/sentinel.txt"
 set +e
 OUTPUT="$({
