@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROBE="$ROOT/scripts/runner_dashboard_host_probe.sh"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+HOME_T="$WORK/home"
+BIN="$WORK/bin"
+mkdir -p "$HOME_T/.config/ezgha" "$HOME_T/.local/state/ezgha/watchdog" "$BIN"
+
+sed -n '1,$p' > "$HOME_T/.config/ezgha/config.toml" <<'CONFIG'
+version = 1
+[github]
+scope = "org"
+target = "secret-org"
+[runner]
+labels = ["secret-label"]
+count = 2
+image = "secret-image"
+name_prefix = "secret-prefix"
+[limits]
+memory_mb = 1
+cpus = 1.0
+pids = 1
+min_free_disk_gb = 1
+[policy]
+minimum_isolation = "container"
+CONFIG
+sed -n '1,$p' > "$HOME_T/.config/ezgha/slot_assignments.toml" <<'SLOTS'
+[assignments]
+"secret-prefix-1" = 1
+"secret-prefix-2" = 2
+[registered_at]
+"secret-prefix-1" = 1
+SLOTS
+printf '0\n' > "$HOME_T/.local/state/ezgha/watchdog/linux.miss_count"
+printf '5\n' > "$HOME_T/.local/state/ezgha/watchdog/linux.miss_threshold"
+
+sed -n '1,$p' > "$BIN/uname" <<'SH'
+#!/usr/bin/env bash
+echo "${STUB_UNAME:-Linux}"
+SH
+sed -n '1,$p' > "$BIN/systemctl" <<'SH'
+#!/usr/bin/env bash
+echo "${STUB_SYSTEMCTL_STATE:-active}"
+SH
+sed -n '1,$p' > "$BIN/docker" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  info) exit 0 ;;
+  run)
+    [[ "${STUB_DOCKER_RUN_FAIL:-0}" != 1 ]] || exit 3
+    [[ "$2" == "--rm" && "$3" == "--entrypoint" && "$4" == "df" ]] || exit 2
+    [[ "$5" == "secret-image" && "$6" == "-Pk" && "$7" == "/" ]] || exit 2
+    echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+    echo "/dev/test 99999999 1 ${STUB_DAEMON_FREE_KB:-99999998} 1% /"
+    ;;
+  inspect) echo true ;;
+  top)
+    if [[ "${STUB_TOP_FAIL:-0}" == 1 ]]; then exit 1; fi
+    echo 'PID COMMAND'
+    case "$2" in
+      *-1) echo '10 Runner.Worker' ;;
+      *-2) echo '11 Runner.Listener' ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+SH
+sed -n '1,$p' > "$BIN/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${STUB_LAUNCHCTL_LIST:-}"
+SH
+sed -n '1,$p' > "$BIN/df" <<'SH'
+#!/usr/bin/env bash
+echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+echo '/dev/test 99999999 1 99999998 1% /'
+SH
+for forbidden in gh ssh; do
+  sed -n '1,$p' > "$BIN/$forbidden" <<'SH'
+#!/usr/bin/env bash
+echo "forbidden command invoked" >&2
+exit 99
+SH
+done
+chmod +x "$BIN"/*
+
+PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/healthy.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "healthy.json").read_text())
+assert payload["sources"]["config"]["ok"] is True
+assert payload["sources"]["service"]["ok"] is True
+assert payload["sources"]["docker"]["ok"] is True
+assert payload["sources"]["process_probe"]["ok"] is True
+assert payload["sources"]["watchdog_state"]["ok"] is True
+assert payload["fleet"] == {
+    "configured": 2,
+    "executing": 1,
+    "idle": 1,
+    "cycling": 0,
+    "down": 0,
+    "reserved": 2,
+}
+assert payload["disk"] == {"status": "healthy"}
+assert payload["watchdog"] == {"consecutive_misses": 0, "restart_after": 5}
+serialized = json.dumps(payload)
+for forbidden in ("secret-prefix", "secret-org", "secret-label", "secret-image"):
+    assert forbidden not in serialized
+PY
+
+STUB_DAEMON_FREE_KB=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/daemon-disk-critical.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "daemon-disk-critical.json").read_text())
+assert payload["sources"]["disk"]["ok"] is True
+assert payload["disk"] == {"status": "critical"}
+PY
+
+STUB_DOCKER_RUN_FAIL=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/daemon-disk-unknown.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "daemon-disk-unknown.json").read_text())
+assert payload["sources"]["disk"]["ok"] is False
+assert payload["disk"] == {"status": "unknown"}
+PY
+
+assert_service_state() {
+  local fixture="$1" expected="$2" actual
+  actual="$(STUB_UNAME=Darwin STUB_LAUNCHCTL_LIST="$fixture" PATH="$BIN:$PATH" \
+    bash "$PROBE" --service-state)"
+  [[ "$actual" == "$expected" ]]
+}
+assert_service_state '123 0 org.jleechanorg.ezgha' active
+assert_service_state '123 9 org.jleechanorg.ezgha' active
+assert_service_state '- 0 org.jleechanorg.ezgha' inactive
+assert_service_state '- 9 org.jleechanorg.ezgha' failed
+assert_service_state '' not-loaded
+[[ "$(STUB_SYSTEMCTL_STATE=failed PATH="$BIN:$PATH" bash "$PROBE" --service-state)" == failed ]]
+
+STUB_TOP_FAIL=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/top-failure.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "top-failure.json").read_text())
+assert payload["sources"]["process_probe"]["ok"] is False
+for key in ("executing", "idle", "cycling", "down"):
+    assert payload["fleet"][key] is None
+PY
+
+rm "$HOME_T/.local/state/ezgha/watchdog/linux.miss_count"
+PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/no-watchdog.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "no-watchdog.json").read_text())
+assert payload["sources"]["watchdog_state"]["ok"] is False
+assert payload["watchdog"]["consecutive_misses"] is None
+PY
+
+printf '1oops2\n' > "$HOME_T/.local/state/ezgha/watchdog/linux.miss_count"
+PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/malformed-watchdog.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "malformed-watchdog.json").read_text())
+assert payload["sources"]["watchdog_state"]["ok"] is False
+assert payload["watchdog"]["consecutive_misses"] is None
+PY
+
+set +e
+DOCTOR_OUTPUT="$(bash "$ROOT/doctor-runner" --json 2>&1)"
+DOCTOR_STATUS=$?
+set -e
+test "$DOCTOR_STATUS" -eq 2
+[[ "$DOCTOR_OUTPUT" == *"unsupported"* ]]
+grep -Fq 'runner_dashboard_host_probe.sh" --service-state' "$ROOT/doctor-runner"
+
+echo "runner dashboard host probe tests passed"

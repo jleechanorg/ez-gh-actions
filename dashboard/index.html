@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Runner Fleet Status</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="dashboard.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#fleet-status">Skip to fleet status</a>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">EZ GH ACTIONS // OPERATIONS</p>
+        <h1>Runner fleet status</h1>
+      </div>
+      <p class="classification">PUBLIC AGGREGATES ONLY</p>
+    </header>
+
+    <main id="fleet-status">
+      <section
+        id="status-banner"
+        class="status-banner"
+        data-state="stale"
+        aria-labelledby="status-kicker"
+      >
+        <div>
+          <p id="status-kicker" class="status-kicker">LOADING SNAPSHOT</p>
+          <p id="status-detail" class="status-detail">
+            Checking publisher status…
+          </p>
+        </div>
+        <dl class="timestamps">
+          <div>
+            <dt>Observed</dt>
+            <dd id="last-observed">unavailable</dd>
+          </div>
+          <div>
+            <dt>Published</dt>
+            <dd id="last-published">unavailable</dd>
+          </div>
+        </dl>
+      </section>
+      <p
+        id="status-announcement"
+        class="visually-hidden"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        Checking runner status.
+      </p>
+
+      <div class="fleet-grid" aria-label="Runner fleet aggregate counts">
+        <section class="fleet-panel" aria-labelledby="mac-heading">
+          <header>
+            <p class="panel-code">FLEET 01</p>
+            <h2 id="mac-heading">macOS / ARM64</h2>
+          </header>
+          <dl class="metric-grid">
+            <div>
+              <dt>Configured target</dt>
+              <dd id="mac-target">—</dd>
+            </div>
+            <div>
+              <dt>Executing</dt>
+              <dd id="mac-executing">—</dd>
+            </div>
+            <div>
+              <dt>Idle</dt>
+              <dd id="mac-idle">—</dd>
+            </div>
+            <div>
+              <dt>Cycling</dt>
+              <dd id="mac-cycling">—</dd>
+            </div>
+            <div>
+              <dt>Down</dt>
+              <dd id="mac-down">—</dd>
+            </div>
+            <div>
+              <dt>Reserved slots</dt>
+              <dd id="mac-reserved">—</dd>
+            </div>
+          </dl>
+          <div class="verification-row">
+            <span>Disk floor</span>
+            <strong id="mac-disk">UNKNOWN</strong>
+          </div>
+          <div class="verification-row">
+            <span>Watchdog misses</span>
+            <strong id="mac-watchdog">—</strong>
+          </div>
+        </section>
+
+        <section class="fleet-panel" aria-labelledby="linux-heading">
+          <header>
+            <p class="panel-code">FLEET 02</p>
+            <h2 id="linux-heading">Linux / X64</h2>
+          </header>
+          <dl class="metric-grid">
+            <div>
+              <dt>Configured target</dt>
+              <dd id="linux-target">—</dd>
+            </div>
+            <div>
+              <dt>Executing</dt>
+              <dd id="linux-executing">—</dd>
+            </div>
+            <div>
+              <dt>Idle</dt>
+              <dd id="linux-idle">—</dd>
+            </div>
+            <div>
+              <dt>Cycling</dt>
+              <dd id="linux-cycling">—</dd>
+            </div>
+            <div>
+              <dt>Down</dt>
+              <dd id="linux-down">—</dd>
+            </div>
+            <div>
+              <dt>Reserved slots</dt>
+              <dd id="linux-reserved">—</dd>
+            </div>
+          </dl>
+          <div class="verification-row">
+            <span>Disk floor</span>
+            <strong id="linux-disk">UNKNOWN</strong>
+          </div>
+          <div class="verification-row">
+            <span>Watchdog misses</span>
+            <strong id="linux-watchdog">—</strong>
+          </div>
+        </section>
+      </div>
+
+      <section class="systems-panel" aria-labelledby="systems-heading">
+        <header>
+          <p class="panel-code">SUPPORT SYSTEMS</p>
+          <h2 id="systems-heading">Guardrails</h2>
+        </header>
+        <dl class="systems-grid">
+          <div>
+            <dt>Mac source</dt>
+            <dd id="mac-source">UNKNOWN</dd>
+          </div>
+          <div>
+            <dt>Linux source</dt>
+            <dd id="linux-source">UNKNOWN</dd>
+          </div>
+          <div>
+            <dt>Restart thresholds</dt>
+            <dd id="watchdog-trip">—</dd>
+          </div>
+        </dl>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Snapshot refreshes every ten minutes. Unknown values are never treated
+        as zero.
+      </p>
+    </footer>
+  </body>
+</html>

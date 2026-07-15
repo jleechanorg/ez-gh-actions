@@ -242,6 +242,11 @@ set_miss_count() { # $1=host $2=count
   echo "$2" > "$STATE_DIR/$1.miss_count"
 }
 
+set_miss_threshold() { # $1=host
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  echo "$MISS_THRESHOLD" > "$STATE_DIR/$1.miss_threshold"
+}
+
 get_last_restart() { # $1=host -> epoch seconds, 0 if never
   read_fresh_state "$STATE_DIR/$1.last_restart"
 }
@@ -306,6 +311,7 @@ evaluate_host() {
   local host="$1" configured="$2" actual="$3" slots="$4" restart_fn="$5"
   local label
   label="$(echo "$host" | tr '[:lower:]' '[:upper:]')"
+  set_miss_threshold "$host"
 
   log "$label: configured=$configured, managed=$actual, slots=$slots"
 

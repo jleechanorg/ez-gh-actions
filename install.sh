@@ -48,17 +48,17 @@ uninstall() {
     ok "launchd agent removed"
   fi
 
-  # Auxiliary units (token-refresh / queue-reaper / watchdog) — installed
+  # Auxiliary units (token-refresh / queue-reaper / watchdog / dashboard) — installed
   # further below in the main flow as ezgha-<name>.timer+.service on Linux
   # and org.jleechanorg.ezgha-<name>.plist on macOS, all pointed at scripts
   # in ~/.local/libexec/ezgha. Uninstall previously disabled only the main
-  # service + plist, then rm -rf'd libexec — leaving these three still
+  # service + plist, then rm -rf'd libexec — leaving these jobs still
   # scheduled against a now-deleted script. That is exactly the dead-path-
   # scheduled-job incident class from 2026-07-09 (codex adversarial review
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog"
+  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -333,12 +333,13 @@ if [ -f "${CONFIG_PATH}" ]; then
   fi
 fi
 
-# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper) ─
-# These three units keep the ezgha fleet healthy between deploys:
+# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, dashboard) ─
+# These units keep the ezgha fleet observable and healthy between deploys:
 #   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
 #   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
+#   - runner-dashboard:      publishes aggregate fleet health from the Mac host
 #
 # Scripts are NEVER exec'd from this repo/worktree checkout: they are copied
 # (install -m 0755) to the stable user-scope location ~/.local/libexec/ezgha/
@@ -351,7 +352,8 @@ UNIT_DIR="${SCRIPT_DIR}/systemd"
 if [ -d "${UNIT_DIR}" ]; then
   HOME_DIR="${HOME}"
   SCRIPTS_DIR="${HOME_DIR}/.local/libexec/ezgha"
-  mkdir -p "${SCRIPTS_DIR}"
+  mkdir -p "${SCRIPTS_DIR}" "${HOME_DIR}/.local/state/ezgha"
+  chmod 0700 "${HOME_DIR}/.local/state/ezgha"
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.
@@ -421,6 +423,8 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    "${SCRIPT_DIR}/launchd/install-launchagents.sh" install \
+      "org.jleechanorg.ezgha-runner-dashboard"
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do

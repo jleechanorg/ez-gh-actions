@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # regression test: install.sh --uninstall must tear down the auxiliary
-# systemd timers/services (token-refresh, queue-reaper, watchdog) BEFORE
+# systemd timers/services (token-refresh, queue-reaper, watchdog, dashboard) BEFORE
 # removing ~/.local/libexec/ezgha -- leaving them scheduled against a
 # now-deleted script recreates the exact dead-path-scheduled-job incident
 # class from 2026-07-09 (codex adversarial review 2026-07-10, finding 4).
@@ -36,6 +36,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 WORK=$(mktemp -d)
+# shellcheck disable=SC2329  # Invoked indirectly by EXIT trap.
 cleanup() { rm -rf "${WORK}"; }
 trap cleanup EXIT
 
@@ -77,7 +78,8 @@ mkdir -p "${HOME_T}/.config/systemd/user" "${HOME_T}/.local/libexec/ezgha"
 for unit in ezgha.service \
             ezgha-token-refresh.service ezgha-token-refresh.timer \
             ezgha-queue-reaper.service ezgha-queue-reaper.timer \
-            ezgha-watchdog.service ezgha-watchdog.timer; do
+            ezgha-watchdog.service ezgha-watchdog.timer \
+            ezgha-runner-dashboard.service ezgha-runner-dashboard.timer; do
   printf '[Unit]\nDescription=stub\n' > "${HOME_T}/.config/systemd/user/${unit}"
 done
 printf '#!/usr/bin/env bash\ntrue\n' > "${HOME_T}/.local/libexec/ezgha/cleanup-stuck-runs.sh"
@@ -90,7 +92,7 @@ HOME="${HOME_T}" SYSTEMCTL_LOG="${SYSTEMCTL_LOG}" \
 
 # ── Assertions ─────────────────────────────────────────────────────────────
 
-for aux in token-refresh queue-reaper watchdog; do
+for aux in token-refresh queue-reaper watchdog runner-dashboard; do
   if grep -q "disable --now ezgha-${aux}.timer" "${SYSTEMCTL_LOG}"; then
     echo "PASS: uninstall disabled ezgha-${aux}.timer"
   else

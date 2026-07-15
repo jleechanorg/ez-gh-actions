@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # doctor.sh — ez-gh-actions fleet health check. Read-only.
-# Outputs a one-shot human-readable report; --json emits machine-parseable
-# status for the loop agent (or a follow-up Claude Code session) to drive
-# iteration. Designed to fail loudly on the things that previously caused
+# Outputs a one-shot human-readable report. Aggregate machine-readable status
+# is owned by scripts/runner_dashboard_host_probe.sh; --json now fails early
+# instead of falsely wrapping this detailed cross-host report as JSON.
+# Designed to fail loudly on the things that previously caused
 # silent fleet decay (slot-file desync, missing daemons, container/reg drift).
 set -euo pipefail
 
 # --- arg parsing ---------------------------------------------------------
-JSON=0
 DETAIL=0
 PROVE=0
 for a in "$@"; do
   case "$a" in
-    --json) JSON=1 ;;
+    --json)
+      echo "doctor-runner --json is unsupported; use scripts/runner_dashboard_host_probe.sh --host-class mac|linux" >&2
+      exit 2
+      ;;
     --detail|-v|--verbose) DETAIL=1 ;;
     --prove) PROVE=1 ;;   # dispatch a live canary job and verify it runs on our fleet
     -h|--help)
@@ -51,31 +54,7 @@ esac
 # Probe the supervisor (systemd on Linux, launchd on macOS) for ezgha's
 # service state. Returns one of: active | inactive | failed | not-loaded.
 probe_service_state() {
-  if [ "$PLATFORM" = "linux" ]; then
-    systemctl --user is-active ezgha.service 2>/dev/null || echo "inactive"
-  elif [ "$PLATFORM" = "macos" ]; then
-    # launchctl prints `PID STATUS LABEL` per loaded job. The ezgha label is
-    # `org.jleechanorg.ezgha`. PID column "-" with STATUS "0" means loaded
-    # but not running; any other STATUS is the last exit code.
-    local line
-    line=$(launchctl list 2>/dev/null | awk '$3 == "org.jleechanorg.ezgha" {print; exit}')
-    if [ -z "$line" ]; then
-      echo "not-loaded"
-      return
-    fi
-    local pid status
-    pid=$(echo "$line" | awk '{print $1}')
-    status=$(echo "$line" | awk '{print $2}')
-    if [ -n "$pid" ] && [ "$pid" != "-" ]; then
-      echo "active"
-    elif [ "$status" = "0" ]; then
-      echo "inactive"
-    else
-      echo "failed"
-    fi
-  else
-    echo "unsupported"
-  fi
+  "$SCRIPT_DIR/scripts/runner_dashboard_host_probe.sh" --service-state
 }
 
 # Read the last N minutes of ezgha service logs. On Linux this is journalctl;
@@ -419,10 +398,6 @@ if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN
     GH_TOKEN_STALE_CRITICAL=1
   fi
 fi
-if [ "$JSON" = "1" ]; then
-  info "gh_token_status=$GH_TOKEN_STATUS gh_token_age_min=$GH_TOKEN_AGE_MIN gh_token_stale_critical=$GH_TOKEN_STALE_CRITICAL"
-fi
-
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
 RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')

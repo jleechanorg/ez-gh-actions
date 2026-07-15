@@ -21,10 +21,20 @@ REPO_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCHD_DIR="${REPO_PATH}/launchd"
 TARGET_DIR="${HOME}/Library/LaunchAgents"
 SCRIPTS_DIR="${HOME}/.local/libexec/ezgha"
+DASHBOARD_DIR="${SCRIPTS_DIR}/dashboard"
+STATE_DIR="${HOME}/.local/state/ezgha"
 
 action="${1:-status}"
+label_filter="${2:-}"
 
 templates=("${LAUNCHD_DIR}"/*.plist.template)
+if [[ "$action" == "install" && -n "$label_filter" ]]; then
+  templates=("${LAUNCHD_DIR}/${label_filter}.plist.template")
+  if [[ ! -f "${templates[0]}" ]]; then
+    echo "ERROR: unknown launchd template label: ${label_filter}" >&2
+    exit 2
+  fi
+fi
 
 # Guard: fail loudly if a rendered plist still references a repo/worktree
 # checkout path or has an unsubstituted @...@ placeholder left in it. A
@@ -73,13 +83,17 @@ verify_scripts_exist() {
 }
 
 install_scripts() {
-  mkdir -p "${SCRIPTS_DIR}"
+  mkdir -p "${SCRIPTS_DIR}" "${DASHBOARD_DIR}" "${STATE_DIR}"
+  chmod 0700 "${STATE_DIR}"
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.
   for script in "${REPO_PATH}"/scripts/*.sh "${REPO_PATH}"/scripts/*.py; do
     [[ -f "$script" ]] || continue
     install -m 0755 "$script" "${SCRIPTS_DIR}/$(basename "$script")"
+  done
+  for asset in index.html style.css dashboard.js; do
+    install -m 0644 "${REPO_PATH}/dashboard/${asset}" "${DASHBOARD_DIR}/${asset}"
   done
   echo "scripts installed: ${SCRIPTS_DIR}"
 }
@@ -96,7 +110,11 @@ case "$action" in
       verify_scripts_exist "$dest" || { rm -f "$dest"; exit 1; }
       echo "installed: $dest"
       launchctl unload "$dest" 2>/dev/null || true
-      launchctl load "$dest"
+      launchctl load "$dest" || {
+        rc=$?
+        rm -f "$dest"
+        exit "$rc"
+      }
       echo "loaded: $label"
     done
     ;;
@@ -118,7 +136,7 @@ case "$action" in
     launchctl list | grep -i "org.jleechanorg.ezgha" || echo "no ezgha launchd jobs loaded"
     ;;
   *)
-    echo "usage: $0 {install|remove|status}" >&2
+    echo "usage: $0 {install [label]|remove|status}" >&2
     exit 2
     ;;
 esac
