@@ -72,8 +72,8 @@ static TEST_HOST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
-static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<std::collections::VecDeque<u32>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
+static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<Option<std::collections::VecDeque<u32>>> =
+    std::sync::Mutex::new(None);
 /// Overrides the binary name/path used to build every `docker` `Command` in
 /// this module. Unlike mutating the process-wide `PATH` env var (which any
 /// OTHER test in this binary — including unrelated modules like `alert.rs`,
@@ -1884,13 +1884,13 @@ fn executing_runner_count_from_containers(
     #[cfg(test)]
     {
         let _ = deadline;
-        if let Some(count) = TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap().pop_front() {
-            return count.min(owned.len() as u32);
-        }
-        // Existing lifecycle tests model ready containers without shelling out
-        // to a real Docker daemon. Tests exercising startup readiness enqueue
-        // explicit Runner.Worker counts above.
-        owned.len() as u32
+        let mut counts = TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap();
+        let count = counts
+            .as_mut()
+            .expect("test must explicitly configure Runner.Worker readiness")
+            .pop_front()
+            .expect("test Runner.Worker readiness sequence exhausted");
+        count.min(owned.len() as u32)
     }
 
     #[cfg(not(test))]
@@ -1915,9 +1915,11 @@ fn executing_runner_count_from_containers(
     executing
 }
 
-/// Cheap local capacity truth for the serve-loop settling episode. This path
-/// talks only to Docker (`ps` + bounded `top`); it never lists or mutates
-/// GitHub runners, registrations, or workflow jobs.
+/// Cheap local progress signal for a bounded post-refill settling episode.
+/// Normal spawn capacity remains managed-container count because idle healthy
+/// listeners have no Runner.Worker. This path talks only to Docker (`ps` +
+/// bounded `top`); it never lists or mutates GitHub runners, registrations, or
+/// workflow jobs.
 pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
     let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
@@ -2431,11 +2433,10 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let containers = managed_containers()?;
-    let alive = executing_runner_count_from_containers(
-        cfg,
-        &containers,
-        Instant::now() + LOCAL_READINESS_BUDGET,
-    );
+    // Container presence owns normal spawn capacity. Runner.Worker exists only
+    // while a job is executing, so using it here would classify a healthy idle
+    // Listener-only fleet as missing and create a permanent settle/reconcile loop.
+    let alive = current_prefix_containers(&containers, cfg).len() as u32;
     if alive >= cfg.runner.count {
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
@@ -2680,7 +2681,7 @@ mod tests {
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
             TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().clear();
-            TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap().clear();
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -3177,6 +3178,7 @@ minimum_isolation = "container"
         ]);
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([3].into());
 
         let started = ensure_count(&cfg, Backend::Docker).unwrap();
 
@@ -3222,6 +3224,7 @@ minimum_isolation = "container"
             "ez-org-runner-6".into(),
             "must-not-start-in-a-second-batch".into(),
         ]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([4].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -3268,6 +3271,7 @@ minimum_isolation = "container"
         ];
         *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [five_alive.clone(), five_alive].into();
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([5].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker)
             .expect("an exited one-job container with a settling registration is pending turnover");
@@ -3287,37 +3291,66 @@ minimum_isolation = "container"
     }
 
     #[test]
-    fn ensure_count_does_not_treat_container_without_runner_worker_as_capacity() {
-        let _env = TestEnv::new("ensure_count_worker_readiness");
+    fn ensure_count_full_idle_listener_fleet_has_no_shortage_or_settling_signal() {
+        let _env = TestEnv::new("ensure_count_idle_listener_capacity");
         let cfg = cfg_with(6, "ez-org-runner");
-        for slot in 1..=6 {
-            assert_eq!(next_slot(&cfg).unwrap(), slot);
-            record_slot_runner_id(slot, 2000 + u64::from(slot)).unwrap();
-        }
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
-        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         let six_containers: Vec<_> = (1..=6)
             .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
             .collect();
-        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
-            [six_containers.clone(), six_containers].into();
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = [4, 4].into();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [six_containers].into();
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.missing, 0);
+        assert_eq!(outcome.remaining_shortage, 0);
+        assert!(
+            outcome.started.is_empty(),
+            "six managed Listener-only containers are normal idle capacity"
+        );
+        assert!(
+            !outcome.is_partial_failure(),
+            "normal idle capacity must not drive guards or alerts"
+        );
+        assert!(
+            TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap().is_none(),
+            "normal full-capacity ticks must not consult Runner.Worker readiness or enter settling"
+        );
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap(),
+            &["must-not-start"],
+            "normal idle capacity must not spawn"
+        );
+    }
+
+    #[test]
+    fn ensure_count_uses_runner_worker_only_after_actual_refill() {
+        let _env = TestEnv::new("ensure_count_post_refill_worker_readiness");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let initial: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let after_refill: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([4].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
         assert_eq!(
             outcome.missing, 2,
-            "two containers without Runner.Worker are not ready capacity"
+            "spawn shortage is managed-container count"
         );
-        assert_eq!(outcome.remaining_shortage, 2);
-        assert!(
-            outcome.started.is_empty(),
-            "occupied slots cannot be double-started"
-        );
-        assert!(
-            !outcome.is_partial_failure(),
-            "booting/settling workers are not backend failures"
+        assert_eq!(outcome.started.len(), 2);
+        assert_eq!(
+            outcome.remaining_shortage, 2,
+            "post-refill settling waits for the two new Runner.Worker processes"
         );
     }
 
@@ -3339,6 +3372,7 @@ minimum_isolation = "container"
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
