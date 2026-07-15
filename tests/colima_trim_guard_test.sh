@@ -166,6 +166,13 @@ STUB_ROOT_BLOCKS=$((1 * 1024 * 1024 * 2)) \
 grep -Fq '"reason":"reclaim_estimate_below_minimum"' "${EZGHA_LOG_PATH}" || fail "estimate skip reason missing"
 pass "conservative reclaim estimate below 1 GiB fails closed"
 
+reset_case probe-only
+EZGHA_PROBE_ONLY=1 "${GUARD}"
+! grep -q fstrim "${STUB_COLIMA_LOG}" || fail "probe-only mode trimmed"
+grep -Fq '"event":"trim_probe_complete"' "${EZGHA_LOG_PATH}" || fail "probe-only completion missing"
+[[ ! -e "${XDG_STATE_HOME}/ezgha/colima-trim.last-attempt" ]] || fail "probe-only mode mutated cooldown state"
+pass "probe-only mode exercises guard probes without trim or cooldown mutation"
+
 reset_case profile
 STUB_DOCKER_HOST="unix://${HOME_T}/.colima/ci/docker.sock" "${GUARD}" || true
 [[ ! -s "${STUB_COLIMA_LOG}" ]] || fail "unsupported profile reached Colima"

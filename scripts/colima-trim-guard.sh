@@ -172,6 +172,13 @@ if (( estimated_reclaimable_kib < MIN_RECLAIM_KIB )); then
   exit 0
 fi
 
+if [[ "${EZGHA_PROBE_ONLY:-0}" == "1" ]]; then
+  printf '{"timestamp_epoch":%s,"event":"trim_probe_complete","profile":"%s","host_free_kib":%s,"data_alloc_kib":%s,"root_alloc_kib":%s,"guest_data_used_kib":%s,"guest_root_used_kib":%s,"estimated_reclaimable_kib":%s}\n' \
+    "${NOW_EPOCH}" "${profile}" "${host_free_kib}" "${data_alloc_kib}" "${root_alloc_kib}" \
+    "${data_used_kib}" "${root_used_kib}" "${estimated_reclaimable_kib}" >> "${LOG_PATH}"
+  exit 0
+fi
+
 printf '%s attempt\n' "${NOW_EPOCH}" > "${COOLDOWN_FILE}"
 printf '{"timestamp_epoch":%s,"event":"trim_started","profile":"%s","host_free_before_kib":%s,"data_alloc_before_kib":%s,"root_alloc_before_kib":%s,"guest_data_used_kib":%s,"guest_root_used_kib":%s,"estimated_reclaimable_kib":%s}\n' \
   "${NOW_EPOCH}" "${profile}" "${host_free_kib}" "${data_alloc_kib}" "${root_alloc_kib}" \
