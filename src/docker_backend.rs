@@ -2377,7 +2377,9 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             );
             bail!(
                 "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
-                 reclaim space (e.g. `docker system prune`) first",
+                 reclaim space first. Do NOT run docker system/image prune: with the fleet idle it \
+                 deletes the required ezgha-runner:latest image (2026-07-14 incident); \
+                 prefer `docker builder prune` and container/log cleanup",
                 cfg.limits.min_free_disk_gb
             );
         }
