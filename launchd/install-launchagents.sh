@@ -105,16 +105,30 @@ case "$action" in
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"
       dest="${TARGET_DIR}/${label}.plist"
-      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$dest"
-      verify_rendered_plist "$dest" || { rm -f "$dest"; exit 1; }
-      verify_scripts_exist "$dest" || { rm -f "$dest"; exit 1; }
+      candidate="${dest}.candidate.$$"
+      backup="${dest}.backup.$$"
+      had_prior=0
+      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$candidate"
+      verify_rendered_plist "$candidate" || { rm -f "$candidate"; exit 1; }
+      verify_scripts_exist "$candidate" || { rm -f "$candidate"; exit 1; }
+      if [[ -f "$dest" ]]; then
+        cp -p "$dest" "$backup"
+        had_prior=1
+        launchctl unload "$dest" 2>/dev/null || true
+      fi
+      mv "$candidate" "$dest"
       echo "installed: $dest"
-      launchctl unload "$dest" 2>/dev/null || true
       launchctl load "$dest" || {
         rc=$?
         rm -f "$dest"
+        if [[ "$had_prior" -eq 1 ]]; then
+          mv "$backup" "$dest"
+          launchctl load "$dest" || \
+            echo "ERROR: restored prior plist but could not reload it: $dest" >&2
+        fi
         exit "$rc"
       }
+      rm -f "$backup"
       echo "loaded: $label"
     done
     ;;

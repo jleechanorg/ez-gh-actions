@@ -32,6 +32,20 @@ fail() {
   PASS=false
 }
 
+INSTALLED_MAC_HOST_ARG="$(
+  sed -n 's/.*ezgha-fleet-watchdog\.sh" "--host \([^" ]*\)".*/\1/p' \
+    "$REPO_ROOT/install.sh"
+)"
+PARSER_HOSTS="$(
+  sed -n 's/.*argument (\([^)]*\)).*/\1/p' \
+    "$REPO_ROOT/scripts/ezgha-fleet-watchdog.sh" | head -1
+)"
+if printf '%s\n' "$PARSER_HOSTS" | tr '|' '\n' | grep -Fxq "$INSTALLED_MAC_HOST_ARG"; then
+  echo "PASS: Mac watchdog install host '$INSTALLED_MAC_HOST_ARG' matches parser"
+else
+  fail "Mac watchdog install host '$INSTALLED_MAC_HOST_ARG' is outside parser contract '$PARSER_HOSTS'"
+fi
+
 # ── 1. Build a minimal, docs/-less copy of the tree install.sh needs ─────────
 # (docs/-less so the live post-deploy verify-exit-criteria.sh gate is never
 # reached -- see header comment.)

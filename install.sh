@@ -432,7 +432,7 @@ PLIST
     # closed, so a default run cannot itself create/overwrite the plist.
     watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
     if [ "${WITH_WATCHDOG}" -eq 1 ]; then
-      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host macos"
+      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host mac"
       ok "watchdog armed: operator asserted ez-gh-actions-30p/uh2/lxn gate cleared"
     else
       info "watchdog arming skipped — gated on beads ez-gh-actions-30p/uh2/lxn; pass --with-watchdog once the gate clears"

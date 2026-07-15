@@ -10,8 +10,15 @@ mkdir -p "$HOME_T/Library/LaunchAgents" "$BIN"
 
 sed -n '1,$p' > "$BIN/launchctl" <<'SH'
 #!/usr/bin/env bash
+if [[ -n "${LAUNCHCTL_LOG:-}" ]]; then printf '%s\n' "$*" >> "$LAUNCHCTL_LOG"; fi
 if [[ "${LAUNCHCTL_FAIL_DASHBOARD_LOAD:-0}" == "1" &&
       "${1:-}" == "load" && "${2:-}" == *runner-dashboard.plist ]]; then
+  exit 42
+fi
+if [[ "${LAUNCHCTL_FAIL_DASHBOARD_LOAD:-0}" == "once" &&
+      "${1:-}" == "load" && "${2:-}" == *runner-dashboard.plist &&
+      ! -e "${LAUNCHCTL_FAIL_ONCE_STATE:?}" ]]; then
+  : > "$LAUNCHCTL_FAIL_ONCE_STATE"
   exit 42
 fi
 exit 0
@@ -78,5 +85,23 @@ test ! -e \
   "$FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-runner-dashboard.plist"
 test ! -e \
   "$FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-token-refresh.plist"
+
+UPGRADE_HOME="$WORK/upgrade-home"
+UPGRADE_PLIST="$UPGRADE_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-runner-dashboard.plist"
+UPGRADE_LOG="$WORK/upgrade-launchctl.log"
+mkdir -p "$(dirname "$UPGRADE_PLIST")"
+printf '%s\n' 'prior-known-good-plist' > "$UPGRADE_PLIST"
+set +e
+HOME="$UPGRADE_HOME" PATH="$BIN:$PATH" \
+  LAUNCHCTL_LOG="$UPGRADE_LOG" LAUNCHCTL_FAIL_DASHBOARD_LOAD=once \
+  LAUNCHCTL_FAIL_ONCE_STATE="$WORK/upgrade-failed-once" \
+  bash "$ROOT/launchd/install-launchagents.sh" install \
+    org.jleechanorg.ezgha-runner-dashboard >/dev/null 2>&1
+UPGRADE_STATUS=$?
+set -e
+test "$UPGRADE_STATUS" -eq 42
+test "$(cat "$UPGRADE_PLIST")" = 'prior-known-good-plist'
+test "$(grep -c '^load .*runner-dashboard.plist$' "$UPGRADE_LOG")" -eq 2
+if compgen -G "$UPGRADE_PLIST.*" >/dev/null; then exit 1; fi
 
 echo "runner dashboard launchd install tests passed"

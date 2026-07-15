@@ -192,7 +192,12 @@ FC2="$WORK/c2.last_restart"
 write_state "$FC2" 5 $((NOW - 600))   # older than 480s staleness window
 run_case "boot-unknown-old-age-backstop-still-fires" "" "$FC2" "0"
 
-# Case (d): missing file -> 0 base case (boot known, irrelevant).
+# Case (d): a future mtime cannot describe state already observed now.
+FD="$WORK/d.miss_count"
+write_state "$FD" 9 $((NOW + 60))
+run_case "future-mtime-rejected" $((NOW - 100000)) "$FD" "0"
+
+# Case (e): missing file -> 0 base case (boot known, irrelevant).
 run_case "missing-file-base-case" $((NOW - 60)) "$WORK/nope.miss_count" "0"
 
 echo "--- summary ---"

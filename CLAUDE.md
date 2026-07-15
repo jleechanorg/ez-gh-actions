@@ -75,6 +75,22 @@ systemctl --user status ezgha.service
 limactl start colima
 ```
 
+### Runner dashboard publisher recovery
+- **launchd load failure:** a failed first install removes its candidate; a
+  failed upgrade restores and attempts to reload the prior plist. Fix the
+  printed cause, confirm the prior job is still loaded, then retry only the
+  dashboard agent with
+  `bash launchd/install-launchagents.sh install org.jleechanorg.ezgha-runner-dashboard`;
+  do not hand-load a candidate or partial plist.
+- **Stale dashboard output:** inspect
+  `~/.local/state/ezgha/runner-dashboard.stderr.log` and fix the reported probe,
+  auth, or push failure. For transient failures, launchd retries automatically
+  every 600 seconds; run `~/.local/libexec/ezgha/publish_runner_dashboard.sh --publish`
+  only when an immediate post-fix check is needed.
+- **Ownership-marker refusal:** keep the failure closed. Manually inspect who
+  owns the configured Pages branch and resolve that ownership before retrying;
+  never auto-create the marker, delete existing content, or overwrite the branch.
+
 ## /doctor-ezactions command
 Running `/doctor-ezactions` in this repo executes (bare `/doctor` is a deprecated alias):
 1. `./doctor-runner` — fleet health check (4-state per-slot activity truth)
