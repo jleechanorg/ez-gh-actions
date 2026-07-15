@@ -24,8 +24,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 WORK=$(mktemp -d)
-cleanup() { rm -rf "${WORK}"; }
-trap cleanup EXIT
+trap 'rm -rf "${WORK}"' EXIT
 
 PASS=true
 fail() {
@@ -82,6 +81,11 @@ EOF
 cat > "${STUB_BIN}/gh" <<'EOF'
 #!/usr/bin/env bash
 exit 0
+EOF
+
+cat > "${STUB_BIN}/uname" <<'EOF'
+#!/usr/bin/env bash
+echo Linux
 EOF
 
 cat > "${STUB_BIN}/systemctl" <<'EOF'
