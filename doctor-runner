@@ -860,14 +860,49 @@ job_evidence_for_runner() {
   elapsed_min=$(iso_elapsed_min "$started_at")
   printf '%s | started %s (%sm ago) | %s' "$job_name" "$started_at" "${elapsed_min:-?}" "$run_url"
 }
+# Resolve the DOCKER_HOST the remote host's ezgha DAEMON actually uses, so
+# remote docker probes hit the daemon's endpoint — NOT the ssh login shell's
+# active docker context. Root cause (2026-07-15): the macbook's interactive
+# context was `colima-ci` while the daemon ran against
+# unix:///Users/jleechan/.colima/default/docker.sock; every remote probe
+# queried the wrong daemon and reported 5/6 DOWN while 6 containers existed
+# on the daemon's socket. macOS: read EnvironmentVariables.DOCKER_HOST from
+# the launchd plist (the daemon's source of truth). Linux: the systemd unit
+# env or default socket. Empty result = bare `docker` (unchanged behavior).
+REMOTE_DOCKER_HOST_CACHE=""
+REMOTE_DOCKER_HOST_CACHED_FOR=""
+remote_docker_env() {
+  local host="$1"
+  if [ "$REMOTE_DOCKER_HOST_CACHED_FOR" = "$host" ]; then
+    printf '%s' "$REMOTE_DOCKER_HOST_CACHE"
+    return 0
+  fi
+  local dh
+  dh=$(timeout 8 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" '
+    if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
+      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
+    elif command -v systemctl >/dev/null 2>&1; then
+      systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1
+    fi' 2>/dev/null) || dh=""
+  if [ -n "$dh" ]; then
+    REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
+  else
+    REMOTE_DOCKER_HOST_CACHE=""
+  fi
+  REMOTE_DOCKER_HOST_CACHED_FOR="$host"
+  printf '%s' "$REMOTE_DOCKER_HOST_CACHE"
+}
+
 probe_slot_state() {
   # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1"
-  # (localhost = local docker, anything else = ssh).
-  local host="$1" name="$2" running work
+  # (localhost = local docker, anything else = ssh against the remote
+  # DAEMON's docker endpoint — see remote_docker_env).
+  local host="$1" name="$2" running work denv
   if [ "$host" = "localhost" ]; then
     running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
   else
-    running=$(ssh -o ConnectTimeout=4 "$host" "docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
+    denv=$(remote_docker_env "$host")
+    running=$(ssh -o ConnectTimeout=4 "$host" "${denv}docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
   fi
   if [ "$running" != "true" ]; then
     echo "DOWN"
@@ -876,7 +911,7 @@ probe_slot_state() {
   if [ "$host" = "localhost" ]; then
     set +e; docker top "$name" -eo pid,comm 2>/dev/null | grep -qw Worker; work=$?; set -e
   else
-    set +e; ssh -o ConnectTimeout=4 "$host" "docker top '$name' -eo pid,comm 2>/dev/null | grep -qw Worker" >/dev/null 2>&1; work=$?; set -e
+    set +e; ssh -o ConnectTimeout=4 "$host" "${denv}docker top '$name' -eo pid,comm 2>/dev/null | grep -qw Worker" >/dev/null 2>&1; work=$?; set -e
   fi
   if [ "$work" -eq 0 ]; then echo "EXECUTING"; else echo "IDLE"; fi
 }
