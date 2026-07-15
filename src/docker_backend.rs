@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::ffi::CString;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ pub const PROBE_IMAGE: &str = "alpine:3.19";
 /// row we treat the disk floor as exceeded and refuse to spawn, since a
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
+const MACOS_HOST_DISK_FLOOR_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
@@ -54,6 +56,8 @@ static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_HOST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 /// Overrides the binary name/path used to build every `docker` `Command` in
@@ -2186,6 +2190,41 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+fn effective_host_disk_floor_gb(configured_floor_gb: u64, is_macos: bool) -> u64 {
+    if is_macos {
+        // ponytail: keep one incident-derived Mac safety floor here; add a
+        // separate host-floor config only if heterogeneous hosts need it.
+        configured_floor_gb.max(MACOS_HOST_DISK_FLOOR_GB)
+    } else {
+        configured_floor_gb
+    }
+}
+
+/// Free space on the outer host filesystem that backs Docker's storage.
+/// This is intentionally separate from `free_disk_gb`: with Colima the guest
+/// can report ample overlay space while its sparse disk has exhausted APFS.
+fn host_free_disk_gb() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = *TEST_HOST_FREE_DISK_GB.lock().unwrap() {
+        return free;
+    }
+
+    let path = if cfg!(target_os = "macos") {
+        "/System/Volumes/Data"
+    } else {
+        "/"
+    };
+    let path = CString::new(path).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a live NUL-terminated CString and `stats` points to a
+    // valid writable `statvfs` value for the duration of the call.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    let available_bytes = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
+    Some((available_bytes / 1024 / 1024 / 1024) as u64)
+}
+
 /// Start `missing` runners, one per free slot. Tracks which slot numbers have
 /// already failed WITHIN this call and excludes them from subsequent slot
 /// picks, so a single permanently-broken slot (e.g. an unresolvable 409
@@ -2285,6 +2324,41 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             started: Vec::new(),
             missing: 0,
         });
+    }
+    let host_floor_gb =
+        effective_host_disk_floor_gb(cfg.limits.min_free_disk_gb, cfg!(target_os = "macos"));
+    match host_free_disk_gb() {
+        Some(free) if free < host_floor_gb => {
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.host_disk_floor",
+                Severity::Critical,
+                "Runner pool paused: host disk floor reached",
+                &format!(
+                    "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) for {}. refusing to spawn runners until space is reclaimed",
+                    cfg.github.target
+                ),
+            );
+            bail!(
+                "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
+            );
+        }
+        Some(_) => {}
+        None => {
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.host_disk_measurement_unavailable",
+                Severity::Critical,
+                "Runner pool paused: host disk measurement unavailable",
+                &format!(
+                    "could not measure host free disk for {}; refusing to spawn runners until measurement succeeds",
+                    cfg.github.target
+                ),
+            );
+            bail!(
+                "could not measure host filesystem free disk — refusing to spawn runners until measurement recovers"
+            );
+        }
     }
     match free_disk_gb(&cfg.runner.image) {
         Some(free) if free < cfg.limits.min_free_disk_gb => {
@@ -2461,6 +2535,7 @@ mod tests {
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
+            *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
             Self { _lock: lock, path }
         }
     }
@@ -2470,6 +2545,7 @@ mod tests {
             *TEST_SLOT_PATH.lock().unwrap() = None;
             *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
@@ -2481,6 +2557,42 @@ mod tests {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+    }
+
+    #[test]
+    fn macos_host_floor_never_drops_below_pressure_threshold() {
+        assert_eq!(effective_host_disk_floor_gb(5, true), 40);
+        assert_eq!(effective_host_disk_floor_gb(48, true), 48);
+        assert_eq!(effective_host_disk_floor_gb(5, false), 5);
+    }
+
+    #[test]
+    fn host_disk_probe_reads_outer_filesystem() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
+
+        assert!(host_free_disk_gb().is_some());
+    }
+
+    #[test]
+    fn host_disk_floor_refuses_batch_before_any_runner_starts() {
+        let _env = TestEnv::new("host_disk_floor");
+        let mut cfg = cfg_with(6, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 40;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+
+        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+
+        assert!(format!("{err:#}").contains("host filesystem"));
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
+            1,
+            "host disk admission must reject the entire refill before start_one consumes any slot"
+        );
     }
 
     #[test]

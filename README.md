@@ -199,7 +199,10 @@ that is the point of composing them.
     LaunchAgent), not as root, not as a system service. Compromise of
     `ezgha` itself cannot escalate to root without an additional exploit.
   - **Disk floor guard** — `ezgha serve` refuses to spawn new runners when
-    the Docker volume drops below `min_free_disk_gb` (default 10 GB).
+    either the Docker volume or its outer host filesystem drops below
+    `min_free_disk_gb` (default 10 GB). macOS enforces a 40 GB minimum host
+    floor because a Colima guest can report free space after its sparse disk
+    has exhausted the host APFS volume.
   - **No docker.sock mounted into runners**, no privileged mode, no
     `--cap-add` beyond the defaults.
 - **What it does NOT enforce**: nothing in `ezgha` is a substitute for keeping
@@ -373,7 +376,7 @@ image = "ezgha-runner:latest"   # see "Custom runner image" below
 memory_mb = 4096                # hard cgroup ceiling (swap pinned to same value)
 cpus = 2.0
 pids = 512
-min_free_disk_gb = 10           # refuse to spawn below this floor
+min_free_disk_gb = 10           # daemon + host floor (macOS host minimum: 40)
 
 [policy]
 minimum_isolation = "container" # "vm" = refuse to run jobs unless execution is
