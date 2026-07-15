@@ -50,7 +50,11 @@ EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
 bash "$PUBLISHER" --collect-only "$WORK/default-lock-site"
 DEFAULT_STATE_DIR="$DEFAULT_HOME/.local/state/ezgha"
 test -d "$DEFAULT_STATE_DIR"
-MODE="$(stat -f %Lp "$DEFAULT_STATE_DIR" 2>/dev/null || stat -c %a "$DEFAULT_STATE_DIR")"
+if MODE="$(stat -f %Lp "$DEFAULT_STATE_DIR" 2>/dev/null)"; then
+  :
+else
+  MODE="$(stat -c %a "$DEFAULT_STATE_DIR")"
+fi
 test "$MODE" = "700"
 
 printf 'keep until replacement succeeds\n' > "$SITE/sentinel.txt"
