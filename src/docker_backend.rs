@@ -2300,9 +2300,9 @@ impl EnsureCountOutcome {
 }
 
 /// Ensure `count` managed runner containers are alive; start the shortfall.
-/// Refuses to spawn when the daemon's disk is below the configured floor —
-/// disk exhaustion is the dominant self-hosted runner failure mode, and
-/// spawning more work onto a full disk makes the incident worse.
+/// Refuses to spawn when either the outer host or daemon disk is below its
+/// floor — disk exhaustion is the dominant self-hosted runner failure mode,
+/// and spawning more work onto a full disk makes the incident worse.
 pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     Ok(ensure_count_outcome(cfg, backend)?.started)
 }
