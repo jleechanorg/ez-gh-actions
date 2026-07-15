@@ -751,6 +751,26 @@ fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration,
     }
 }
 
+fn apply_local_settling_decision(
+    settling: &mut Option<SettlingEpisode>,
+    pending_readiness: &mut bool,
+    decision: SettlingDecision,
+) {
+    match decision {
+        SettlingDecision::Continue => {}
+        SettlingDecision::Recovered => {
+            *settling = None;
+            *pending_readiness = false;
+        }
+        // Clear the local polling episode so the zero-sleep plan runs one full
+        // reconciliation next, but retain the unproven-readiness invariant.
+        SettlingDecision::Ceiling => {
+            *settling = None;
+            *pending_readiness = true;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnsureSuccessDecision {
     StartSettling { executing: u32 },
@@ -783,18 +803,36 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
     }
 }
 
-fn settling_for_ensure_decision(
+fn ensure_success_decision_with_pending_readiness(
+    decision: EnsureSuccessDecision,
+    pending_readiness: bool,
+) -> EnsureSuccessDecision {
+    if pending_readiness && decision == EnsureSuccessDecision::Recovered {
+        EnsureSuccessDecision::StartSettling { executing: 0 }
+    } else {
+        decision
+    }
+}
+
+fn apply_ensure_success_decision(
+    settling: &mut Option<SettlingEpisode>,
+    pending_readiness: &mut bool,
     now: Instant,
     decision: EnsureSuccessDecision,
-) -> Option<SettlingEpisode> {
+) {
     match decision {
         EnsureSuccessDecision::StartSettling { executing } => {
-            Some(SettlingEpisode::start(now, executing))
+            *settling = Some(SettlingEpisode::start(now, executing));
+            *pending_readiness = true;
         }
-        // Incomplete evidence has no proven executing lower bound. Keep the
-        // local-readiness branch armed until a complete probe proves recovery.
-        EnsureSuccessDecision::IncompleteReadiness => Some(SettlingEpisode::start(now, 0)),
-        EnsureSuccessDecision::Recovered => None,
+        EnsureSuccessDecision::IncompleteReadiness => {
+            *settling = None;
+            *pending_readiness = true;
+        }
+        EnsureSuccessDecision::Recovered => {
+            *settling = None;
+            *pending_readiness = false;
+        }
     }
 }
 
@@ -1146,6 +1184,7 @@ fn main() -> Result<()> {
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             let mut settling: Option<SettlingEpisode> = None;
+            let mut pending_readiness = false;
             let mut settling_ceilings = SettlingCeilingState::default();
             let mut deadman = alert::DeadManState::new(Instant::now());
 
@@ -1183,7 +1222,6 @@ fn main() -> Result<()> {
                                         cfg.runner.count
                                     );
                                     settling_ceilings.record_recovery();
-                                    settling = None;
                                 }
                                 SettlingDecision::Ceiling => {
                                     let detail = format!(
@@ -1201,9 +1239,13 @@ fn main() -> Result<()> {
                                          running monitors before immediate reconciliation",
                                         if escalated { "CRITICAL" } else { "WARN" }
                                     );
-                                    settling = None;
                                 }
                             }
+                            apply_local_settling_decision(
+                                &mut settling,
+                                &mut pending_readiness,
+                                decision,
+                            );
                             settling_plan(&cfg, decision)
                         }
                         Err(e) => {
@@ -1215,10 +1257,11 @@ fn main() -> Result<()> {
                                 "{}: {detail}; running monitors before immediate reconciliation",
                                 if escalated { "CRITICAL" } else { "WARN" }
                             );
-                            // Do not return to full-container reconciliation:
-                            // that early return cannot prove Runner.Worker
-                            // readiness and would falsely reset this streak.
-                            settling = Some(SettlingEpisode::start(Instant::now(), 0));
+                            apply_local_settling_decision(
+                                &mut settling,
+                                &mut pending_readiness,
+                                SettlingDecision::Ceiling,
+                            );
                             settling_plan(&cfg, SettlingDecision::Ceiling)
                         }
                     }
@@ -1231,9 +1274,10 @@ fn main() -> Result<()> {
                                 &mut ensure_fail_streak,
                                 &outcome,
                             );
-                            let decision = ensure_success_decision(&cfg, &outcome);
-                            let next_settling =
-                                settling_for_ensure_decision(Instant::now(), decision);
+                            let decision = ensure_success_decision_with_pending_readiness(
+                                ensure_success_decision(&cfg, &outcome),
+                                pending_readiness,
+                            );
                             match decision {
                                 EnsureSuccessDecision::StartSettling { .. } => {}
                                 EnsureSuccessDecision::Recovered => {
@@ -1259,7 +1303,12 @@ fn main() -> Result<()> {
                                     );
                                 }
                             }
-                            settling = next_settling;
+                            apply_ensure_success_decision(
+                                &mut settling,
+                                &mut pending_readiness,
+                                Instant::now(),
+                                decision,
+                            );
                             let plan = ensure_success_plan(&cfg, decision);
                             for name in outcome.started {
                                 println!("respawned ephemeral runner {name}");
@@ -1743,6 +1792,75 @@ mod tests {
             (Duration::ZERO, true),
             "the bounded episode must run monitors and add no sleep before the next expensive reconciliation"
         );
+    }
+
+    #[test]
+    fn successful_short_probes_rearm_across_episodes_until_real_recovery() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 3;
+        let mut now = Instant::now();
+        let mut settling = Some(SettlingEpisode::start(now, 4));
+        let mut pending_readiness = true;
+        let mut ceilings = SettlingCeilingState::default();
+
+        for expected_ceilings in 1..=3 {
+            let mut decision = SettlingDecision::Continue;
+            for _ in 0..MAX_SETTLING_POLLS {
+                now += Duration::from_secs(5);
+                decision = settling
+                    .as_mut()
+                    .expect("successful-short evidence must remain pending")
+                    .observe(now, 4, 6);
+            }
+            assert_eq!(decision, SettlingDecision::Ceiling);
+            let escalated = record_settling_ceiling(
+                &cfg,
+                &mut ceilings,
+                "synthetic complete 4/6 probe episode",
+            );
+            assert_eq!(escalated, expected_ceilings == 3);
+            apply_local_settling_decision(&mut settling, &mut pending_readiness, decision);
+
+            assert!(
+                pending_readiness && settling.is_none(),
+                "a complete but short ceiling must force the promised immediate full reconciliation"
+            );
+            assert_eq!(
+                settling_plan(&cfg, decision),
+                (Duration::ZERO, true),
+                "ceiling must run monitors before the full reconciliation"
+            );
+
+            let full_container_decision = ensure_success_decision_with_pending_readiness(
+                EnsureSuccessDecision::Recovered,
+                pending_readiness,
+            );
+            assert_eq!(
+                full_container_decision,
+                EnsureSuccessDecision::StartSettling { executing: 0 },
+                "full-container reconciliation cannot clear pending worker evidence"
+            );
+            apply_ensure_success_decision(
+                &mut settling,
+                &mut pending_readiness,
+                now,
+                full_container_decision,
+            );
+            assert!(
+                settling.as_ref().is_some_and(SettlingEpisode::is_active),
+                "the completed full reconciliation must resume local worker proof"
+            );
+            assert_eq!(ceilings.consecutive_ceilings, expected_ceilings);
+        }
+
+        now += Duration::from_secs(5);
+        let recovered = settling.as_mut().unwrap().observe(now, 6, 6);
+        assert_eq!(recovered, SettlingDecision::Recovered);
+        apply_local_settling_decision(&mut settling, &mut pending_readiness, recovered);
+        ceilings.record_recovery();
+
+        assert!(!pending_readiness && settling.is_none());
+        assert_eq!(ceilings.consecutive_ceilings, 0);
     }
 
     #[test]

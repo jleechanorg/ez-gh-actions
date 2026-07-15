@@ -3528,7 +3528,11 @@ minimum_isolation = "container"
             .as_deref()
             .unwrap()
             .contains("synthetic post-refill docker top timeout"));
-        let decision = crate::ensure_success_decision(&cfg, &outcome);
+        let mut pending_readiness = false;
+        let decision = crate::ensure_success_decision_with_pending_readiness(
+            crate::ensure_success_decision(&cfg, &outcome),
+            pending_readiness,
+        );
         assert_eq!(decision, crate::EnsureSuccessDecision::IncompleteReadiness);
         assert_eq!(
             crate::ensure_success_plan(&cfg, decision),
@@ -3537,8 +3541,17 @@ minimum_isolation = "container"
         );
 
         let started_at = Instant::now();
-        let mut settling = crate::settling_for_ensure_decision(started_at, decision)
-            .expect("incomplete readiness must keep local probing armed");
+        let mut settling = None;
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            started_at,
+            decision,
+        );
+        assert!(
+            pending_readiness && settling.is_none(),
+            "incomplete evidence must force the next full reconciliation while remaining pending"
+        );
         let mut ceilings = crate::SettlingCeilingState::default();
         assert!(!crate::record_settling_ceiling(
             &cfg,
@@ -3548,14 +3561,26 @@ minimum_isolation = "container"
 
         let misleading_full_container_outcome =
             ensure_count_outcome(&cfg, Backend::Docker).unwrap();
-        assert_eq!(
+        let full_container_decision = crate::ensure_success_decision_with_pending_readiness(
             crate::ensure_success_decision(&cfg, &misleading_full_container_outcome),
-            crate::EnsureSuccessDecision::Recovered,
+            pending_readiness,
+        );
+        assert_eq!(
+            full_container_decision,
+            crate::EnsureSuccessDecision::StartSettling { executing: 0 },
             "a standalone full-container tick cannot prove Runner.Worker readiness"
         );
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            started_at,
+            full_container_decision,
+        );
         assert!(
-            settling.is_active(),
-            "pending local readiness state must take precedence over the full-container early return"
+            settling
+                .as_ref()
+                .is_some_and(crate::SettlingEpisode::is_active),
+            "the completed full reconciliation must rearm local worker proof"
         );
         assert_eq!(
             ceilings.consecutive_ceilings, 1,
@@ -3563,11 +3588,15 @@ minimum_isolation = "container"
         );
 
         let executing = local_executing_runner_count(&cfg).unwrap();
-        assert_eq!(
-            settling.observe(started_at + Duration::from_secs(5), executing, 6),
-            crate::SettlingDecision::Recovered
-        );
+        let recovered =
+            settling
+                .as_mut()
+                .unwrap()
+                .observe(started_at + Duration::from_secs(5), executing, 6);
+        assert_eq!(recovered, crate::SettlingDecision::Recovered);
+        crate::apply_local_settling_decision(&mut settling, &mut pending_readiness, recovered);
         ceilings.record_recovery();
+        assert!(!pending_readiness && settling.is_none());
         assert_eq!(ceilings.consecutive_ceilings, 0);
     }
 
