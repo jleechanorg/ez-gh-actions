@@ -47,8 +47,20 @@ printf '%s\n' "$*" >> "${STUB_TIMEOUT_LOG:?}"
 while [[ "$1" == --* ]]; do
   if [[ "$1" == "--kill-after" ]]; then shift 2; else shift; fi
 done
-[[ "$1" == "60" ]] && shift
+[[ "$1" == "55" ]] && shift
 exec "$@"
+EOF
+cat > "${STUB_BIN}/shlock" <<'EOF'
+#!/usr/bin/env bash
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f) lock_file="$2"; shift 2 ;;
+    -p) shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+[[ -e "${lock_file}" ]] && exit 1
+printf '%s\n' "$$" > "${lock_file}"
 EOF
 cat > "${STUB_BIN}/PlistBuddy" <<'EOF'
 #!/usr/bin/env bash
@@ -80,6 +92,7 @@ case "$1" in
   status) printf '{"docker_socket":"%s"}\n' "${STUB_STATUS_DOCKER_HOST:-${STUB_DOCKER_HOST}}" ;;
   ssh)
     if [[ "$*" == *fstrim* ]]; then
+      [[ "${STUB_TRIM_FAIL:-0}" == 1 ]] && exit 1
       printf '/mnt/lima-colima: 5 GiB trimmed\n/: 1 GiB trimmed\n'
     else
       printf 'DATA_USED_KIB=%s\nROOT_USED_KIB=%s\n' \
@@ -88,6 +101,11 @@ case "$1" in
     ;;
   *) exit 2 ;;
 esac
+EOF
+cat > "${STUB_BIN}/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_DOCKER_LOG:?}"
+exit 99
 EOF
 chmod +x "${STUB_BIN}"/*
 
@@ -113,7 +131,9 @@ reset_case() {
   export EZGHA_LOG_PATH="${CASE_DIR}/guard.jsonl"
   export STUB_COLIMA_LOG="${CASE_DIR}/colima.log"
   export STUB_DF_COUNT="${CASE_DIR}/df.count"
+  export STUB_DOCKER_LOG="${CASE_DIR}/docker.log"
   : > "${STUB_COLIMA_LOG}"
+  : > "${STUB_DOCKER_LOG}"
 }
 
 reset_case trims
@@ -129,7 +149,7 @@ grep -Fq '"event":"trim_complete"' "${EZGHA_LOG_PATH}" || fail "structured compl
 grep -Fq '"host_free_before_kib":40894464' "${EZGHA_LOG_PATH}" || fail "before value missing from log"
 grep -Fq '"host_free_after_kib":47185920' "${EZGHA_LOG_PATH}" || fail "after value missing from log"
 pass "39 GiB host pressure with conservative estimate >=1 GiB trims fixed mounts and logs before/after"
-grep -Fq -- '--signal=TERM --kill-after=5 60' "${STUB_TIMEOUT_LOG}" || fail "whole guard was not bounded at 60 seconds"
+grep -Fq -- '--signal=TERM --kill-after=5 55' "${STUB_TIMEOUT_LOG}" || fail "TERM+KILL budget was not bounded at 60 seconds"
 pass "the whole controller is bounded by a 60-second supervisor"
 
 reset_case floor
@@ -166,13 +186,36 @@ grep -Fq '"reason":"singleton_locked"' "${EZGHA_LOG_PATH}" || fail "singleton re
 pass "atomic singleton lock suppresses overlapping runs"
 
 reset_case cooldown
-"${GUARD}"
-EZGHA_NOW_EPOCH=2100 "${GUARD}"
+STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"
+STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) EZGHA_NOW_EPOCH=2100 "${GUARD}"
 [[ "$(grep -c 'fstrim' "${STUB_COLIMA_LOG}")" -eq 1 ]] || fail "15-minute cooldown did not suppress second trim"
 grep -Fq '"reason":"cooldown_active"' "${EZGHA_LOG_PATH}" || fail "cooldown skip reason missing"
 pass "15-minute cooldown prevents repeated trim attempts"
 
-if grep -Eq 'docker (prune|rm)|colima (start|stop|restart|delete)' "${STUB_COLIMA_LOG}"; then
+reset_case emergency
+STUB_HOST_FREE_AFTER_KIB=$((29 * 1024 * 1024)) "${GUARD}"
+STUB_HOST_FREE_AFTER_KIB=$((29 * 1024 * 1024)) EZGHA_NOW_EPOCH=2100 "${GUARD}"
+[[ "$(grep -c 'fstrim' "${STUB_COLIMA_LOG}")" -eq 2 ]] || fail "emergency pressure did not bypass success cooldown"
+grep -Fq '"reason":"emergency_pressure_bypass"' "${EZGHA_LOG_PATH}" || fail "emergency bypass event missing"
+pass "host pressure below 30 GiB bypasses the success cooldown"
+
+reset_case failed-attempt
+mkdir -p "${XDG_STATE_HOME}/ezgha"
+printf '1900 attempt\n' > "${XDG_STATE_HOME}/ezgha/colima-trim.last-attempt"
+STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"
+grep -Fq '"reason":"previous_attempt_retry"' "${EZGHA_LOG_PATH}" || fail "failed attempt was not retryable"
+grep -q fstrim "${STUB_COLIMA_LOG}" || fail "failed attempt marker suppressed retry"
+pass "a prior failed attempt is retryable on the next poll"
+
+reset_case no-timeout
+if EZGHA_TIMEOUT_BIN="${WORK}/missing-timeout" "${GUARD}" 2>/dev/null; then
+  fail "missing timeout primitive did not fail closed"
+fi
+[[ ! -s "${STUB_COLIMA_LOG}" && ! -s "${STUB_DOCKER_LOG}" ]] || fail "missing timeout reached Colima or Docker"
+pass "missing timeout primitive fails before external runtime access"
+
+if grep -Eq '^(start|stop|restart|delete)( |$)' "${STUB_COLIMA_LOG}"; then
   fail "guard invoked a prohibited destructive or lifecycle command"
 fi
-pass "no Docker deletion or Colima lifecycle command is invoked"
+[[ ! -s "${STUB_DOCKER_LOG}" ]] || fail "guard invoked Docker"
+pass "no Docker command or Colima lifecycle command is invoked"

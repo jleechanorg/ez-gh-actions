@@ -96,7 +96,17 @@ case "$action" in
       verify_scripts_exist "$dest" || { rm -f "$dest"; exit 1; }
       echo "installed: $dest"
       launchctl unload "$dest" 2>/dev/null || true
-      launchctl load "$dest"
+      if ! launchctl load "$dest"; then
+        echo "ERROR: launchctl failed to load ${dest}" >&2
+        rm -f "$dest"
+        exit 1
+      fi
+      if ! launchctl print "gui/$(id -u)/${label}" >/dev/null; then
+        echo "ERROR: launchctl did not register ${label}" >&2
+        launchctl unload "$dest" 2>/dev/null || true
+        rm -f "$dest"
+        exit 1
+      fi
       echo "loaded: $label"
     done
     ;;

@@ -416,12 +416,22 @@ PLIST
         rm -f "${plist}"
         return 1
       fi
-      launchctl load -w "${plist}" 2>/dev/null || true
+      if ! launchctl load -w "${plist}"; then
+        bad "launchctl failed to load ${plist}"
+        rm -f "${plist}"
+        return 1
+      fi
+      if ! launchctl print "gui/$(id -u)/org.jleechanorg.ezgha-${name}" >/dev/null; then
+        bad "launchctl did not register org.jleechanorg.ezgha-${name}"
+        launchctl unload "${plist}" 2>/dev/null || true
+        rm -f "${plist}"
+        return 1
+      fi
       ok "macOS plist installed: ${name} (every ${interval_sec}s)"
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
-    install_macos_plist "colima-trim"   "300"   "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
+    install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do

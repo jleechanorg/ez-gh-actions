@@ -8,12 +8,16 @@ PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin
 export PATH
 
 if [[ "${1:-}" != "--bounded" ]]; then
-  timeout_bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
-  if [[ -z "${timeout_bin}" ]]; then
+  if [[ -n "${EZGHA_TIMEOUT_BIN+x}" ]]; then
+    timeout_bin="${EZGHA_TIMEOUT_BIN}"
+  else
+    timeout_bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  fi
+  if [[ -z "${timeout_bin}" || ! -x "${timeout_bin}" ]]; then
     echo "colima-trim-guard: timeout/gtimeout unavailable; refusing an unbounded run" >&2
     exit 1
   fi
-  exec "${timeout_bin}" --signal=TERM --kill-after=5 60 "$0" --bounded
+  exec "${timeout_bin}" --signal=TERM --kill-after=5 55 "$0" --bounded
 fi
 
 STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/ezgha"
@@ -23,6 +27,7 @@ COOLDOWN_FILE="${STATE_DIR}/colima-trim.last-attempt"
 MAIN_PLIST="${EZGHA_MAIN_PLIST:-${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist}"
 PLISTBUDDY_BIN="${EZGHA_PLISTBUDDY_BIN:-/usr/libexec/PlistBuddy}"
 HOST_TRIGGER_KIB=$((40 * 1024 * 1024))
+EMERGENCY_BYPASS_KIB=$((30 * 1024 * 1024))
 MIN_RECLAIM_KIB=$((1024 * 1024))
 COOLDOWN_SECONDS=900
 
@@ -92,14 +97,6 @@ if [[ ! -S "${socket_path}" || -L "${socket_path}" || ! -f "${data_disk}" || -L 
   exit 0
 fi
 
-if [[ -f "${COOLDOWN_FILE}" ]]; then
-  last_attempt="$(sed -n '1p' "${COOLDOWN_FILE}" 2>/dev/null || true)"
-  if is_uint "${last_attempt}" && (( NOW_EPOCH - last_attempt < COOLDOWN_SECONDS )); then
-    log_skip "cooldown_active" "${profile}"
-    exit 0
-  fi
-fi
-
 host_free_kib="$(df -kP /System/Volumes/Data 2>/dev/null | awk 'NR == 2 {print $4}')"
 if ! is_uint "${host_free_kib}"; then
   log_skip "host_free_probe_failed" "${profile}"
@@ -108,6 +105,20 @@ fi
 if (( host_free_kib >= HOST_TRIGGER_KIB )); then
   log_skip "host_free_above_trigger" "${profile}" "${host_free_kib}"
   exit 0
+fi
+
+if [[ -f "${COOLDOWN_FILE}" ]]; then
+  read -r last_attempt last_result < "${COOLDOWN_FILE}" || true
+  if is_uint "${last_attempt}" && (( NOW_EPOCH - last_attempt < COOLDOWN_SECONDS )); then
+    if [[ "${last_result:-attempt}" == "success" && host_free_kib -ge EMERGENCY_BYPASS_KIB ]]; then
+      log_skip "cooldown_active" "${profile}" "${host_free_kib}"
+      exit 0
+    fi
+    reason="previous_attempt_retry"
+    [[ "${last_result:-attempt}" == "success" ]] && reason="emergency_pressure_bypass"
+    printf '{"timestamp_epoch":%s,"event":"trim_cooldown_bypassed","reason":"%s","profile":"%s","host_free_kib":%s}\n' \
+      "${NOW_EPOCH}" "${reason}" "${profile}" "${host_free_kib}" >> "${LOG_PATH}"
+  fi
 fi
 
 colima_bin="$(command -v colima 2>/dev/null || true)"
@@ -161,7 +172,7 @@ if (( estimated_reclaimable_kib < MIN_RECLAIM_KIB )); then
   exit 0
 fi
 
-printf '%s\n' "${NOW_EPOCH}" > "${COOLDOWN_FILE}"
+printf '%s attempt\n' "${NOW_EPOCH}" > "${COOLDOWN_FILE}"
 printf '{"timestamp_epoch":%s,"event":"trim_started","profile":"%s","host_free_before_kib":%s,"data_alloc_before_kib":%s,"root_alloc_before_kib":%s,"guest_data_used_kib":%s,"guest_root_used_kib":%s,"estimated_reclaimable_kib":%s}\n' \
   "${NOW_EPOCH}" "${profile}" "${host_free_kib}" "${data_alloc_kib}" "${root_alloc_kib}" \
   "${data_used_kib}" "${root_used_kib}" "${estimated_reclaimable_kib}" >> "${LOG_PATH}"
@@ -172,6 +183,7 @@ if ! ${colima_bin} ssh --profile "${profile}" -- sh -c "${trim_script}" >/dev/nu
     "${NOW_EPOCH}" "${profile}" "${host_free_kib}" "${estimated_reclaimable_kib}" >> "${LOG_PATH}"
   exit 1
 fi
+printf '%s success\n' "${NOW_EPOCH}" > "${COOLDOWN_FILE}"
 
 host_free_after_kib="$(df -kP /System/Volumes/Data 2>/dev/null | awk 'NR == 2 {print $4}')"
 data_blocks_after="$(stat -f %b "${data_disk}" 2>/dev/null || echo "${data_blocks}")"
