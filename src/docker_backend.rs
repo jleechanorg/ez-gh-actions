@@ -36,15 +36,6 @@ pub const PROBE_IMAGE: &str = "alpine:3.19";
 /// row we treat the disk floor as exceeded and refuse to spawn, since a
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
-/// Mac host floor. Recalibrated 40 -> 15 on 2026-07-15: the 926GB Mac host's
-/// steady-state free space is 35-46GB, so a 40GB floor sits inside normal
-/// operating range and flapped the fleet all day 2026-07-14 (down at 37-39GB,
-/// up at 41-46GB). Blast radius: runner workloads write inside the VM's own
-/// 20GiB disk (guarded separately by min_free_disk_gb on the daemon side);
-/// host exposure is the sparse VM disk files (~6GB observed), so 15GB leaves
-/// 20-30GB margin at steady state while still refusing to spawn on a
-/// genuinely full host.
-const MACOS_HOST_DISK_FLOOR_GB: u64 = 15;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
@@ -2199,16 +2190,6 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
-fn effective_host_disk_floor_gb(configured_floor_gb: u64, is_macos: bool) -> u64 {
-    if is_macos {
-        // ponytail: keep one incident-derived Mac safety floor here; add a
-        // separate host-floor config only if heterogeneous hosts need it.
-        configured_floor_gb.max(MACOS_HOST_DISK_FLOOR_GB)
-    } else {
-        configured_floor_gb
-    }
-}
-
 /// Free space on the outer host filesystem that backs Docker's storage.
 /// This is intentionally separate from `free_disk_gb`: with Colima the guest
 /// can report ample overlay space while its sparse disk has exhausted APFS.
@@ -2334,8 +2315,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             missing: 0,
         });
     }
-    let host_floor_gb =
-        effective_host_disk_floor_gb(cfg.limits.min_free_disk_gb, cfg!(target_os = "macos"));
+    let host_floor_gb = cfg.limits.min_free_disk_gb;
     match host_free_disk_gb() {
         Some(free) if free < host_floor_gb => {
             let _ = alert::notify(
@@ -2571,13 +2551,6 @@ mod tests {
     }
 
     #[test]
-    fn macos_host_floor_never_drops_below_pressure_threshold() {
-        assert_eq!(effective_host_disk_floor_gb(5, true), 15);
-        assert_eq!(effective_host_disk_floor_gb(48, true), 48);
-        assert_eq!(effective_host_disk_floor_gb(5, false), 5);
-    }
-
-    #[test]
     fn host_disk_probe_reads_outer_filesystem() {
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
@@ -2586,19 +2559,38 @@ mod tests {
     }
 
     #[test]
-    fn host_disk_floor_refuses_batch_before_any_runner_starts() {
-        let _env = TestEnv::new("host_disk_floor");
-        let mut cfg = cfg_with(6, "ez-org-runner");
-        cfg.limits.min_free_disk_gb = 40;
+    fn configured_host_disk_floor_admits_space_above_the_floor() {
+        let _env = TestEnv::new("host_disk_floor_admits");
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
-        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(14));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert_eq!(outcome.missing, 1);
+    }
+
+    #[test]
+    fn configured_host_disk_floor_refuses_space_below_the_floor() {
+        let _env = TestEnv::new("host_disk_floor");
+        let mut cfg = cfg_with(6, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(4));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
 
         let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
 
-        assert!(format!("{err:#}").contains("host filesystem"));
+        let message = format!("{err:#}");
+        assert!(message.contains("host filesystem"));
+        assert!(message.contains("floor: 5 GB"));
         assert_eq!(
             TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
             1,
