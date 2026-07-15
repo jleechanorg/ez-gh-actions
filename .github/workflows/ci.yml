@@ -28,6 +28,8 @@ jobs:
           bash tests/runner_dashboard_host_probe_test.sh
           bash tests/runner_dashboard_publisher_test.sh
           bash tests/runner_dashboard_launchd_install_test.sh
+          bash tests/watchdog_reboot_stale_state_test.sh
+          bash tests/install_watchdog_gate_test.sh
           bash tests/install_uninstall_aux_units_test.sh
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

@@ -50,7 +50,25 @@ test('freshness fails closed after 20 minutes and for future clocks', () => {
 });
 
 test('healthy exact contract is live', () => {
-  assert.equal(classifySnapshot(HEALTHY, NOW).state, 'live');
+  const status = classifySnapshot(HEALTHY, NOW);
+  assert.equal(status.state, 'live');
+  assert.match(status.detail, /local capacity/i);
+  assert.match(status.detail, /queue health is not measured/i);
+});
+
+test('underconfigured capacity is unknown, never healthy', () => {
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.fleet.configured = 5;
+  snapshot.fleets.mac.fleet.executing = 4;
+  snapshot.fleets.mac.fleet.reserved = 5;
+  assert.equal(classifySnapshot(snapshot, NOW).state, 'stale');
+});
+
+test('cycling capacity is degraded, never healthy', () => {
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.linux.fleet.executing -= 1;
+  snapshot.fleets.linux.fleet.cycling = 1;
+  assert.equal(classifySnapshot(snapshot, NOW).state, 'degraded');
 });
 
 test('one down slot is degraded', () => {
@@ -153,6 +171,15 @@ test('aria-live is limited to one concise announcement', async () => {
   assert.equal((html.match(/aria-live=/g) || []).length, 1);
   assert.match(html, /id="status-announcement"[^>]*aria-live="polite"/);
   assert.doesNotMatch(html, /id="status-banner"[^>]*aria-live=/);
+});
+
+test('page copy limits its claim to local capacity', async () => {
+  const html = (await readFile('dashboard/index.html', 'utf8')).replace(
+    /\s+/g,
+    ' ',
+  );
+  assert.match(html, /local capacity/i);
+  assert.match(html, /does not assert queue health/i);
 });
 
 test('repeated refresh does not re-announce unchanged state', () => {

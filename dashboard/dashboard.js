@@ -3,6 +3,7 @@
 
   const STALE_AFTER_MS = 20 * 60 * 1000;
   const SOURCE_KEYS = ['linux_host', 'mac_host'];
+  const EXPECTED_CONFIGURED = { mac: 6, linux: 16 };
   const FLEET_KEYS = [
     'configured',
     'executing',
@@ -54,7 +55,7 @@
     );
   }
 
-  function validFleet(host) {
+  function validFleet(host, fleetName) {
     const fleet = host?.fleet || {};
     const sources = host?.sources || {};
     const sourceKeys = [
@@ -69,7 +70,7 @@
       Object.keys(sources).sort().join(',') === sourceKeys.join(',') &&
       sourceKeys.every((key) => sources[key]?.ok === true) &&
       FLEET_KEYS.every((key) => isCount(fleet[key])) &&
-      fleet.configured > 0 &&
+      fleet.configured === EXPECTED_CONFIGURED[fleetName] &&
       fleet.executing + fleet.idle + fleet.cycling + fleet.down ===
         fleet.configured &&
       fleet.reserved <= fleet.configured &&
@@ -116,6 +117,8 @@
       const fleet = host.fleet;
       if (fleet.down > 0)
         reasons.push(`${name} has ${fleet.down} down slot(s)`);
+      if (fleet.cycling > 0)
+        reasons.push(`${name} has ${fleet.cycling} cycling slot(s)`);
       if (fleet.executing + fleet.idle + fleet.cycling < fleet.configured) {
         reasons.push(`${name} live fleet short`);
       }
@@ -150,8 +153,8 @@
 
     if (
       !SOURCE_KEYS.every((key) => snapshot.sources[key].ok) ||
-      !validFleet(snapshot.fleets?.mac) ||
-      !validFleet(snapshot.fleets?.linux)
+      !validFleet(snapshot.fleets?.mac, 'mac') ||
+      !validFleet(snapshot.fleets?.linux, 'linux')
     ) {
       return {
         state: 'stale',
@@ -179,14 +182,15 @@
     }
     return {
       state: 'live',
-      kicker: 'LIVE SNAPSHOT',
-      detail: 'All public local-truth probes report a healthy fleet.',
+      kicker: 'LOCAL CAPACITY SNAPSHOT',
+      detail:
+        'Local capacity probes report 6 Mac and 16 Linux slots executing or idle. Queue health is not measured by this dashboard.',
     };
   }
 
   function announceStatus(state) {
     const announcements = {
-      live: 'Runner status: live snapshot.',
+      live: 'Runner local capacity status: live snapshot. Queue health not measured.',
       degraded: 'Runner status: live degraded.',
       critical: 'Runner status: live critical.',
       stale: 'Runner status: stale or unknown.',

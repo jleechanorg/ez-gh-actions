@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
-    <title>Runner Fleet Status</title>
+    <title>Runner Local Capacity Status</title>
     <link rel="stylesheet" href="style.css" />
     <script src="dashboard.js" defer></script>
   </head>
@@ -13,7 +13,7 @@
     <header class="masthead">
       <div>
         <p class="eyebrow">EZ GH ACTIONS // OPERATIONS</p>
-        <h1>Runner fleet status</h1>
+        <h1>Runner local capacity status</h1>
       </div>
       <p class="classification">PUBLIC AGGREGATES ONLY</p>
     </header>
@@ -48,10 +48,13 @@
         aria-live="polite"
         aria-atomic="true"
       >
-        Checking runner status.
+        Checking runner local capacity.
       </p>
 
-      <div class="fleet-grid" aria-label="Runner fleet aggregate counts">
+      <div
+        class="fleet-grid"
+        aria-label="Runner local capacity aggregate counts"
+      >
         <section class="fleet-panel" aria-labelledby="mac-heading">
           <header>
             <p class="panel-code">FLEET 01</p>
@@ -159,8 +162,9 @@
 
     <footer>
       <p>
-        Snapshot refreshes every ten minutes. Unknown values are never treated
-        as zero.
+        This dashboard reports local capacity only; it does not assert queue
+        health or job pickup latency. Snapshots refresh every ten minutes, and
+        unknown values are never treated as zero.
       </p>
     </footer>
   </body>

@@ -9,6 +9,7 @@ from pathlib import Path
 
 SOURCE_KEYS = ("config", "service", "docker", "process_probe", "disk", "watchdog_state")
 FLEET_KEYS = ("configured", "executing", "idle", "cycling", "down", "reserved")
+EXPECTED_CONFIGURED = {"mac": 6, "linux": 16}
 
 
 def _load_object(path):
@@ -49,7 +50,7 @@ def _public_host(payload, expected_class):
             fleet[key] for key in ("executing", "idle", "cycling", "down")
         )
         valid_counts = (
-            fleet["configured"] > 0
+            fleet["configured"] == EXPECTED_CONFIGURED[expected_class]
             and classified == fleet["configured"]
             and fleet["reserved"] <= fleet["configured"]
         )

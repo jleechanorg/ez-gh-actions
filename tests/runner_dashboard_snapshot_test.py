@@ -71,6 +71,21 @@ class SnapshotTest(unittest.TestCase):
         )
         self.assertFalse(snapshot["sources"]["linux_host"]["ok"])
 
+    def test_underconfigured_host_fails_closed(self):
+        for host_class, configured in (("mac", 5), ("linux", 15)):
+            payloads = {
+                "mac": host_payload("mac", 6),
+                "linux": host_payload("linux", 16),
+            }
+            payloads[host_class] = host_payload(host_class, configured)
+            snapshot = MODULE.build_snapshot(
+                mac_payload=payloads["mac"],
+                linux_payload=payloads["linux"],
+                observed_at="2026-07-14T20:00:00Z",
+                published_at="2026-07-14T20:00:05Z",
+            )
+            self.assertFalse(snapshot["sources"][f"{host_class}_host"]["ok"])
+
     def test_missing_watchdog_is_unknown_not_zero(self):
         mac = host_payload("mac", 6)
         mac["sources"]["watchdog_state"]["ok"] = False
