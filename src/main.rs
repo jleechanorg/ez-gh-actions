@@ -678,6 +678,21 @@ fn apply_ensure_outcome_to_failure_streak(
     partial_failure
 }
 
+fn serve_success_plan(
+    cfg: &config::Config,
+    outcome: &docker_backend::EnsureCountOutcome,
+    fast_followup_armed: &mut bool,
+) -> (Duration, bool) {
+    if outcome.remaining_shortage == 0 {
+        *fast_followup_armed = true;
+        (cfg.runner.serve_tick(), true)
+    } else if std::mem::take(fast_followup_armed) {
+        (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+    } else {
+        (cfg.runner.serve_tick(), true)
+    }
+}
+
 fn systemd_alert_decision(
     source: SystemdAlertSource,
     unit: &str,
@@ -984,6 +999,7 @@ fn main() -> Result<()> {
             let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
+            let mut fast_followup_armed = true;
             let mut deadman = alert::DeadManState::new(Instant::now());
 
             // Graceful shutdown (bead ez-gh-actions-30p): install SIGTERM/SIGINT
@@ -998,7 +1014,7 @@ fn main() -> Result<()> {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
-                let (sleep, ensure_succeeded) = match docker_backend::ensure_count_outcome(
+                let (sleep, run_monitors) = match docker_backend::ensure_count_outcome(
                     &cfg, backend,
                 ) {
                     Ok(outcome) => {
@@ -1008,6 +1024,7 @@ fn main() -> Result<()> {
                             &mut ensure_fail_streak,
                             &outcome,
                         );
+                        let plan = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
                         for name in outcome.started {
                             println!("respawned ephemeral runner {name}");
                         }
@@ -1023,7 +1040,7 @@ fn main() -> Result<()> {
                         // one tick + container startup, so hosts chasing
                         // duty cycle can lower this (2026-07-09 coordination
                         // with jeff-ubuntu's 60->20 change).
-                        (cfg.runner.serve_tick(), true)
+                        plan
                     }
                     Err(e) => {
                         ensure_fail_streak += 1;
@@ -1075,7 +1092,7 @@ fn main() -> Result<()> {
                 if shutdown::is_requested() {
                     break;
                 }
-                if ensure_succeeded {
+                if run_monitors {
                     watchdog::ping();
                     // Fresh budget base for monitor ticks: respawn pacing may
                     // legitimately spend minutes before this point, and that
@@ -1380,6 +1397,8 @@ mod tests {
         let partial = docker_backend::EnsureCountOutcome {
             started: vec!["ez-org-runner-1".into()],
             missing: 4,
+            remaining_shortage: 3,
+            start_failures: 3,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1396,6 +1415,8 @@ mod tests {
         let recovered = docker_backend::EnsureCountOutcome {
             started: vec!["ez-org-runner-2".into(), "ez-org-runner-3".into()],
             missing: 2,
+            remaining_shortage: 0,
+            start_failures: 0,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1407,6 +1428,82 @@ mod tests {
         assert_eq!(
             ensure_fail_streak, 0,
             "non-partial ensure_count success resets the serve alert streak"
+        );
+    }
+
+    #[test]
+    fn serve_success_plan_fast_follows_local_shortage_without_monitors() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        let mut fast_followup_armed = true;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()],
+            missing: 2,
+            remaining_shortage: 2,
+            start_failures: 0,
+        };
+
+        let (sleep, run_monitors) = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
+
+        assert_eq!(sleep, Duration::from_secs(config::MIN_SERVE_TICK_SECONDS));
+        assert!(
+            !run_monitors,
+            "known local shortage must not wait behind synchronous monitors"
+        );
+        assert!(
+            !fast_followup_armed,
+            "the fast path is one-shot until local capacity recovers"
+        );
+    }
+
+    #[test]
+    fn serve_success_plan_preserves_configured_cadence_when_locally_full() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        let mut fast_followup_armed = false;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()],
+            missing: 2,
+            remaining_shortage: 0,
+            start_failures: 0,
+        };
+
+        let (sleep, run_monitors) = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
+
+        assert_eq!(sleep, Duration::from_secs(30));
+        assert!(
+            run_monitors,
+            "a locally full fleet keeps the normal monitoring cadence"
+        );
+        assert!(
+            fast_followup_armed,
+            "full local capacity rearms the next shortage fast path"
+        );
+    }
+
+    #[test]
+    fn serve_success_plan_bounds_persistent_shortage_to_one_fast_followup() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        let mut fast_followup_armed = true;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 1,
+            remaining_shortage: 1,
+            start_failures: 0,
+        };
+
+        let first = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
+        let second = serve_success_plan(&cfg, &outcome, &mut fast_followup_armed);
+
+        assert_eq!(
+            first,
+            (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+        );
+        assert_eq!(
+            second,
+            (Duration::from_secs(30), true),
+            "persistent slot reservations must not create an unbounded fast retry/monitor-starvation loop"
         );
     }
 

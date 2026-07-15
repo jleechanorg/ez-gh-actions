@@ -339,7 +339,12 @@ fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config
 /// no-exclusions wrapper now exists purely for tests.
 #[cfg(test)]
 pub fn next_slot(cfg: &Config) -> Result<u32> {
-    next_slot_excluding(cfg, &HashSet::new())
+    next_slot_excluding(cfg, &HashSet::new())?.with_context(|| {
+        format!(
+            "all {} runner slot(s) are currently in use on this host",
+            cfg.runner.count
+        )
+    })
 }
 
 /// Like `next_slot`, but skips any slot number present in `excluded` even if
@@ -350,7 +355,7 @@ pub fn next_slot(cfg: &Config) -> Result<u32> {
 /// remaining retry in the batch to pile onto one permanently-broken slot
 /// while every other genuinely-fillable slot went untried (bead
 /// ez-gh-actions-oau).
-pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<u32> {
+pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Option<u32>> {
     if cfg.runner.count == 0 {
         bail!("cfg.runner.count is 0; nothing to allocate");
     }
@@ -363,14 +368,10 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<u32>
         if let std::collections::btree_map::Entry::Vacant(e) = assignments.assignments.entry(key) {
             e.insert(String::new());
             write_slot_assignments_for(&assignments, Some(cfg))?;
-            return Ok(slot);
+            return Ok(Some(slot));
         }
     }
-    bail!(
-        "all {} runner slot(s) are currently in use on this host; \
-         stop/release a slot first (e.g. `ezgha stop`) or raise cfg.runner.count",
-        cfg.runner.count
-    );
+    Ok(None)
 }
 
 /// Record the GitHub runner_id returned by `generate_jitconfig` for a slot
@@ -1819,8 +1820,17 @@ pub struct ManagedContainer {
 #[cfg(test)]
 static TEST_MANAGED_CONTAINERS: std::sync::Mutex<Option<Vec<ManagedContainer>>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
+    std::collections::VecDeque<Vec<ManagedContainer>>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
 
 pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+    #[cfg(test)]
+    if let Some(containers) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().pop_front() {
+        return Ok(containers);
+    }
+
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINERS.lock().unwrap().clone() {
         return Ok(containers);
@@ -2246,8 +2256,18 @@ fn host_free_disk_gb() -> Option<u64> {
 /// This exclusion is scoped to a single call: it does not persist across
 /// separate `ensure_count` ticks, so a transiently-failed slot is retried
 /// normally on the next tick.
-fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
+fn start_missing_runners(
+    cfg: &Config,
+    backend: Backend,
+    missing: u32,
+) -> Result<StartMissingOutcome> {
     start_missing_runners_with_starter(cfg, backend, missing, start_one_at_slot)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StartMissingOutcome {
+    started: Vec<String>,
+    start_failures: u32,
 }
 
 fn start_missing_runners_with_starter(
@@ -2255,8 +2275,9 @@ fn start_missing_runners_with_starter(
     backend: Backend,
     missing: u32,
     starter: impl Fn(&Config, Backend, u32) -> Result<(String, String)>,
-) -> Result<Vec<String>> {
+) -> Result<StartMissingOutcome> {
     let mut started = Vec::new();
+    let mut start_failures = 0;
     let mut last_err = None;
     let mut failed_slots: HashSet<u32> = HashSet::new();
     for _ in 0..missing {
@@ -2266,13 +2287,14 @@ fn start_missing_runners_with_starter(
         }
         watchdog::ping();
         let slot = match next_slot_excluding(cfg, &failed_slots) {
-            Ok(slot) => slot,
+            Ok(Some(slot)) => slot,
+            Ok(None) => {
+                eprintln!("info: no free runner slot yet; registration turnover is still settling");
+                break;
+            }
             Err(e) => {
-                // No free, non-excluded slot left at all (e.g. every slot is
-                // either occupied or has already failed this cycle) — further
-                // iterations cannot possibly succeed either, so stop instead
-                // of spinning through the remaining `missing` count.
-                eprintln!("warning: no runner slot available to attempt: {e:#}");
+                eprintln!("warning: failed to allocate a runner slot: {e:#}");
+                start_failures += 1;
                 last_err = Some(e);
                 break;
             }
@@ -2282,6 +2304,7 @@ fn start_missing_runners_with_starter(
             Err(e) => {
                 eprintln!("warning: failed to start runner in slot {slot}: {e:#}");
                 failed_slots.insert(slot);
+                start_failures += 1;
                 last_err = Some(e);
             }
         }
@@ -2292,19 +2315,30 @@ fn start_missing_runners_with_starter(
             return Err(e);
         }
     }
-    Ok(started)
+    Ok(StartMissingOutcome {
+        started,
+        start_failures,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsureCountOutcome {
     pub started: Vec<String>,
+    /// Shortage observed before this call's sole start batch.
     pub missing: u32,
+    /// Shortage from a fresh local container recount after that batch.
+    pub remaining_shortage: u32,
+    /// Actual JIT/Docker/allocator failures, excluding occupied reservations
+    /// that are still settling after a one-job container exits.
+    pub start_failures: u32,
 }
 
 impl EnsureCountOutcome {
-    /// A partial failure is when we started fewer runners than were missing.
+    /// Pending registration turnover is not a backend failure. Only an
+    /// attempted start/allocation that actually failed advances alert/restart
+    /// accounting.
     pub fn is_partial_failure(&self) -> bool {
-        (self.started.len() as u32) < self.missing
+        self.start_failures > 0
     }
 }
 
@@ -2332,6 +2366,8 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
             missing: 0,
+            remaining_shortage: 0,
+            start_failures: 0,
         });
     }
     let host_floor_gb =
@@ -2467,8 +2503,15 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // Release any failed reservations from this cycle
     let _ = release_stale_slots(cfg);
 
-    let started = refill?;
-    let outcome = EnsureCountOutcome { started, missing };
+    let refill = refill?;
+    let containers_after = managed_containers().context("post-refill local container recount")?;
+    let alive_after = current_prefix_containers(&containers_after, cfg).len() as u32;
+    let outcome = EnsureCountOutcome {
+        started: refill.started,
+        missing,
+        remaining_shortage: cfg.runner.count.saturating_sub(alive_after),
+        start_failures: refill.start_failures,
+    };
     if outcome.is_partial_failure() {
         eprintln!(
             "warning: ensure_count started only {} of {} missing runner(s); treating as partial failure for alert streak accounting",
@@ -2558,6 +2601,7 @@ mod tests {
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
+            TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().clear();
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -2936,10 +2980,10 @@ minimum_isolation = "container"
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some((1..=16).map(|n| format!("ez-org-runner-{n}")).collect());
 
-        let started = start_missing_runners(&cfg, Backend::Docker, 16).unwrap();
+        let outcome = start_missing_runners(&cfg, Backend::Docker, 16).unwrap();
 
         assert_eq!(
-            started.len(),
+            outcome.started.len(),
             16,
             "must start the full shortfall directly in one call, no load-gate batching"
         );
@@ -3006,11 +3050,11 @@ minimum_isolation = "container"
                 Ok((format!("container-{name}"), name))
             };
 
-        let started = start_missing_runners_with_starter(&cfg, Backend::Docker, 5, starter)
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 5, starter)
             .expect("4 of 5 slots succeed, so overall call must return Ok with those 4");
 
         assert_eq!(
-            started.len(),
+            outcome.started.len(),
             4,
             "the 4 genuinely-fillable slots must all be started; only the permanently-broken \
              slot should fail — the bug made ALL 5 iterations pile onto slot {BROKEN_SLOT}"
@@ -3074,6 +3118,96 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn ensure_count_recounts_locally_after_one_bounded_start_batch() {
+        let _env = TestEnv::new("ensure_count_post_batch_recount");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [
+            vec![
+                managed_container("ez-org-runner-1"),
+                managed_container("ez-org-runner-2"),
+                managed_container("ez-org-runner-3"),
+                managed_container("ez-org-runner-4"),
+            ],
+            vec![
+                managed_container("ez-org-runner-3"),
+                managed_container("ez-org-runner-4"),
+                managed_container("ez-org-runner-5"),
+                managed_container("ez-org-runner-6"),
+            ],
+        ]
+        .into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-org-runner-5".into(),
+            "ez-org-runner-6".into(),
+            "must-not-start-in-a-second-batch".into(),
+        ]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.missing, 2,
+            "initial snapshot should start one batch of two"
+        );
+        assert_eq!(
+            outcome.started.len(),
+            2,
+            "one call may start at most the initial shortage"
+        );
+        assert_eq!(
+            outcome.remaining_shortage, 2,
+            "the post-batch local recount must expose jobs that exited while starts were serialized"
+        );
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap(),
+            &["must-not-start-in-a-second-batch"],
+            "ensure_count must never start a second batch in the same call"
+        );
+        assert!(
+            !outcome.is_partial_failure(),
+            "legitimate turnover after a fully successful batch is not a backend failure"
+        );
+    }
+
+    #[test]
+    fn ensure_count_treats_all_reserved_slots_as_pending_turnover_not_failure() {
+        let _env = TestEnv::new("ensure_count_reserved_turnover");
+        let cfg = cfg_with(6, "ez-org-runner");
+        for slot in 1..=6 {
+            assert_eq!(next_slot(&cfg).unwrap(), slot);
+            record_slot_runner_id(slot, 1000 + u64::from(slot)).unwrap();
+        }
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let five_alive = vec![
+            managed_container("ez-org-runner-1"),
+            managed_container("ez-org-runner-2"),
+            managed_container("ez-org-runner-3"),
+            managed_container("ez-org-runner-4"),
+            managed_container("ez-org-runner-5"),
+        ];
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [five_alive.clone(), five_alive].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker)
+            .expect("an exited one-job container with a settling registration is pending turnover");
+
+        assert_eq!(outcome.missing, 1);
+        assert!(outcome.started.is_empty());
+        assert_eq!(outcome.remaining_shortage, 1);
+        assert!(
+            !outcome.is_partial_failure(),
+            "no free local slot is not a JIT/Docker start failure and must not drive backend restart accounting"
+        );
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap(),
+            &["must-not-start"],
+            "a reservation wedge must not invoke the starter without a free slot"
+        );
+    }
+
+    #[test]
     fn ensure_count_outcome_flags_fewer_than_half_started() {
         let _env = TestEnv::new("ensure_count_partial");
         let cfg = cfg_with(4, "ez-org-runner");
@@ -3099,6 +3233,8 @@ minimum_isolation = "container"
         let outcome = EnsureCountOutcome {
             started: vec!["runner-1".into(), "runner-2".into()],
             missing: 2,
+            remaining_shortage: 0,
+            start_failures: 0,
         };
         assert!(
             !outcome.is_partial_failure(),
@@ -3111,6 +3247,8 @@ minimum_isolation = "container"
         let outcome = EnsureCountOutcome {
             started: vec!["runner-1".into()],
             missing: 2,
+            remaining_shortage: 1,
+            start_failures: 1,
         };
         assert!(
             outcome.is_partial_failure(),
