@@ -73,7 +73,7 @@ verify_scripts_exist() {
 }
 
 install_scripts() {
-  mkdir -p "${SCRIPTS_DIR}"
+  mkdir -p "${SCRIPTS_DIR}" "${HOME}/.local/state/ezgha"
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.

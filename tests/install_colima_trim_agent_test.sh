@@ -30,6 +30,7 @@ HOME="${HOME_T}" bash "${REPO_ROOT}/launchd/install-launchagents.sh" install >/d
 PLIST="${HOME_T}/Library/LaunchAgents/org.jleechanorg.ezgha-colima-trim.plist"
 [[ -f "${PLIST}" ]] || { echo "FAIL: trim plist was not rendered" >&2; exit 1; }
 [[ -x "${HOME_T}/.local/libexec/ezgha/colima-trim-guard.sh" ]] || { echo "FAIL: stable guard script missing" >&2; exit 1; }
+[[ -d "${HOME_T}/.local/state/ezgha" ]] || { echo "FAIL: launchd log/state directory missing" >&2; exit 1; }
 grep -Fq "${HOME_T}/.local/libexec/ezgha/colima-trim-guard.sh" "${PLIST}" || { echo "FAIL: plist does not use stable script path" >&2; exit 1; }
 grep -Fq '<integer>300</integer>' "${PLIST}" || { echo "FAIL: plist interval is not five minutes" >&2; exit 1; }
 ! grep -Eq '@[A-Z_]+@|worktree' "${PLIST}" || { echo "FAIL: rendered plist contains unsafe placeholder/path" >&2; exit 1; }
