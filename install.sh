@@ -179,12 +179,7 @@ else
 fi
 
 if command -v docker >/dev/null 2>&1; then
-  if docker version >/dev/null 2>&1; then
-    ok "docker daemon reachable"
-  else
-    bad "docker CLI found but daemon unreachable — start it (Colima/Lima/Docker Desktop) and check 'docker context ls'"
-    missing=1
-  fi
+  ok "docker CLI"
 else
   bad "docker not found — install Docker, or Colima/Lima for a VM-backed daemon (https://docs.docker.com/get-docker)"
   missing=1
@@ -232,6 +227,17 @@ elif is_socket_alive "$DOCKER_DESKTOP_SOCK" && [ ! -e "$DOCKER_DEFAULT_SOCK" ]; 
   info "docker-desktop socket detected at ${DOCKER_DESKTOP_SOCK}; setting DOCKER_HOST"
 fi
 export DOCKER_HOST_OVERRIDE
+
+if command -v docker >/dev/null 2>&1; then
+  if [ -n "${DOCKER_HOST_OVERRIDE}" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" docker version >/dev/null 2>&1; then
+    ok "docker daemon reachable via ${DOCKER_HOST_OVERRIDE}"
+  elif [ -z "${DOCKER_HOST_OVERRIDE}" ] && docker version >/dev/null 2>&1; then
+    ok "docker daemon reachable"
+  else
+    bad "docker CLI found but daemon unreachable — start it (Colima/Lima/Docker Desktop) and check 'docker context ls'"
+    missing=1
+  fi
+fi
 
 if command -v gh >/dev/null 2>&1; then
   if gh auth status >/dev/null 2>&1; then
@@ -308,15 +314,12 @@ if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
     if [ -f "${plist}" ] && launchctl list 2>/dev/null | grep -q "org.jleechanorg.ezgha"; then
-      info "Restarting launchd agent..."
-      launchctl unload "${plist}" 2>/dev/null || true
-      launchctl load "${plist}"
-      ok "ezgha service restarted via launchd"
+      info "Regenerating launchd agent..."
     else
       info "Installing ezgha service..."
-      "${CARGO_BIN}/${BIN}" install-service
-      ok "ezgha service installed and started via launchd"
     fi
+    DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
+    ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
     if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
       info "Restarting systemd service..."
@@ -504,4 +507,3 @@ cat <<'EOF'
   ezgha start                        # launch one ephemeral runner now
   ezgha install-service              # keep runners supervised at login (if not auto-installed)
 EOF
-
