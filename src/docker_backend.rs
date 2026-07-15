@@ -36,6 +36,7 @@ pub const PROBE_IMAGE: &str = "alpine:3.19";
 /// row we treat the disk floor as exceeded and refuse to spawn, since a
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
+const REFILL_CONVERGENCE_MAX_PASSES: u32 = 3;
 /// Mac host floor. Recalibrated 40 -> 15 on 2026-07-15: the 926GB Mac host's
 /// steady-state free space is 35-46GB, so a 40GB floor sits inside normal
 /// operating range and flapped the fleet all day 2026-07-14 (down at 37-39GB,
@@ -1819,8 +1820,21 @@ pub struct ManagedContainer {
 #[cfg(test)]
 static TEST_MANAGED_CONTAINERS: std::sync::Mutex<Option<Vec<ManagedContainer>>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
+    Option<std::collections::VecDeque<Vec<ManagedContainer>>>,
+> = std::sync::Mutex::new(None);
 
 pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+    #[cfg(test)]
+    if let Some(snapshots) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().as_mut() {
+        if snapshots.len() > 1 {
+            return Ok(snapshots.pop_front().unwrap());
+        }
+        if let Some(snapshot) = snapshots.front() {
+            return Ok(snapshot.clone());
+        }
+    }
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINERS.lock().unwrap().clone() {
         return Ok(containers);
@@ -2327,7 +2341,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let containers = managed_containers()?;
-    let alive = current_prefix_containers(&containers, cfg).len() as u32;
+    let mut alive = current_prefix_containers(&containers, cfg).len() as u32;
     if alive >= cfg.runner.count {
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
@@ -2462,21 +2476,54 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         );
         bail!("{reason}");
     }
-    let missing = cfg.runner.count - alive;
-    let refill = start_missing_runners(cfg, backend, missing);
-    // Release any failed reservations from this cycle
-    let _ = release_stale_slots(cfg);
+    let mut started = Vec::new();
+    let mut total_missing = 0;
+    for pass in 1..=REFILL_CONVERGENCE_MAX_PASSES {
+        let missing = cfg.runner.count - alive;
+        total_missing += missing;
+        let batch = start_missing_runners(cfg, backend, missing)?;
+        let batch_complete = batch.len() as u32 == missing;
+        started.extend(batch);
 
-    let started = refill?;
-    let outcome = EnsureCountOutcome { started, missing };
-    if outcome.is_partial_failure() {
-        eprintln!(
-            "warning: ensure_count started only {} of {} missing runner(s); treating as partial failure for alert streak accounting",
-            outcome.started.len(),
-            outcome.missing
-        );
+        // Reconcile reservations and then re-count locally. A different
+        // one-job ephemeral runner can finish while this serialized batch is
+        // starting, so the original `missing` snapshot is not proof that the
+        // fleet reached its configured count (ghd2.1, 2026-07-15 incident).
+        let _ = release_stale_slots(cfg);
+        if !batch_complete {
+            let outcome = EnsureCountOutcome {
+                started,
+                missing: total_missing,
+            };
+            eprintln!(
+                "warning: ensure_count started only {} of {} missing runner(s); treating as partial failure for alert streak accounting",
+                outcome.started.len(),
+                outcome.missing
+            );
+            return Ok(outcome);
+        }
+
+        let containers = managed_containers()?;
+        alive = current_prefix_containers(&containers, cfg).len() as u32;
+        if alive >= cfg.runner.count {
+            return Ok(EnsureCountOutcome {
+                started,
+                missing: total_missing,
+            });
+        }
+        if pass < REFILL_CONVERGENCE_MAX_PASSES {
+            eprintln!(
+                "info: runner refill pass {pass}/{REFILL_CONVERGENCE_MAX_PASSES} ended at {alive}/{} alive; retrying newly-finished slots in the same ensure_count call",
+                cfg.runner.count
+            );
+        }
     }
-    Ok(outcome)
+
+    bail!(
+        "runner refill did not converge after {REFILL_CONVERGENCE_MAX_PASSES} refill passes: {alive}/{} alive; started {} replacement(s)",
+        cfg.runner.count,
+        started.len()
+    )
 }
 
 #[cfg(test)]
@@ -2558,6 +2605,7 @@ mod tests {
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
+            *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -3046,12 +3094,25 @@ minimum_isolation = "container"
         let cfg = cfg_with(5, "ez-org-runner");
         *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
-        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
-            managed_container("ez-org-runner-1"),
-            managed_container("ez-org-runner-2"),
-            managed_container("ez-org-runner-3"),
-            managed_container("ez-canary-runner-1"),
-        ]);
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = Some(
+            [
+                vec![
+                    managed_container("ez-org-runner-1"),
+                    managed_container("ez-org-runner-2"),
+                    managed_container("ez-org-runner-3"),
+                    managed_container("ez-canary-runner-1"),
+                ],
+                vec![
+                    managed_container("ez-org-runner-1"),
+                    managed_container("ez-org-runner-2"),
+                    managed_container("ez-org-runner-3"),
+                    managed_container("ez-org-runner-4"),
+                    managed_container("ez-org-runner-5"),
+                    managed_container("ez-canary-runner-1"),
+                ],
+            ]
+            .into(),
+        );
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
 
@@ -3070,6 +3131,98 @@ minimum_isolation = "container"
                 .unwrap()
                 .is_empty(),
             "real start_missing_runners path should consume exactly two start_one calls"
+        );
+    }
+
+    #[test]
+    fn ensure_count_recounts_when_a_container_exits_during_refill() {
+        let _env = TestEnv::new("ensure_count_mid_refill_exit");
+        let cfg = cfg_with(4, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = Some(
+            [
+                vec![
+                    managed_container("ez-org-runner-1"),
+                    managed_container("ez-org-runner-2"),
+                ],
+                vec![
+                    managed_container("ez-org-runner-2"),
+                    managed_container("ez-org-runner-3"),
+                    managed_container("ez-org-runner-4"),
+                ],
+                vec![
+                    managed_container("ez-org-runner-1"),
+                    managed_container("ez-org-runner-2"),
+                    managed_container("ez-org-runner-3"),
+                    managed_container("ez-org-runner-4"),
+                ],
+            ]
+            .into(),
+        );
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-org-runner-3".into(),
+            "ez-org-runner-4".into(),
+            "ez-org-runner-1".into(),
+        ]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.started,
+            vec![
+                "ez-org-runner-3",
+                "ez-org-runner-4",
+                "ez-org-runner-1"
+            ],
+            "a slot that exits during the first refill must be replaced before the same ensure_count call returns"
+        );
+        assert_eq!(
+            outcome.started.iter().collect::<HashSet<_>>().len(),
+            outcome.started.len(),
+            "bounded convergence must not spawn the same replacement twice"
+        );
+        assert!(
+            TEST_START_ONE_NAMES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "the second-pass replacement must be consumed in the same call"
+        );
+    }
+
+    #[test]
+    fn ensure_count_stops_after_three_nonconverging_refill_passes() {
+        let _env = TestEnv::new("ensure_count_convergence_bound");
+        let cfg = cfg_with(8, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let six_alive = || {
+            (1..=6)
+                .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+                .collect::<Vec<_>>()
+        };
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            Some([six_alive(), six_alive(), six_alive(), six_alive()].into());
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some((1..=6).map(|n| format!("replacement-{n}")).collect());
+
+        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("did not converge after 3 refill passes"),
+            "the convergence loop must fail after its strict three-pass bound: {err:#}"
+        );
+        assert!(
+            TEST_START_ONE_NAMES
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "the bound must allow exactly three two-runner passes, then stop"
         );
     }
 
