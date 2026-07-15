@@ -318,7 +318,7 @@ if [ -f "${CONFIG_PATH}" ]; then
     else
       info "Installing ezgha service..."
     fi
-    DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
+    DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
     if systemctl --user is-active ezgha.service >/dev/null 2>&1; then

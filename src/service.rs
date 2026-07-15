@@ -376,9 +376,9 @@ mod tests {
 
         assert!(
             installer.contains(
-                "DOCKER_HOST=\"${DOCKER_HOST_OVERRIDE}\" \"${CARGO_BIN}/${BIN}\" install-service"
+                "DOCKER_HOST=\"${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}\" \"${CARGO_BIN}/${BIN}\" install-service"
             ),
-            "install.sh must pass the detected socket to install-service"
+            "install.sh must pass the detected socket or preserve the ambient Docker host"
         );
         assert!(
             !installer.contains("launchctl load \"${plist}\""),
