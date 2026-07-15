@@ -1140,7 +1140,7 @@ fn probe_docker_cpu_controller_available() -> bool {
     // behavior and report availability so the caller proceeds.
     #[cfg(not(target_os = "linux"))]
     {
-        return true;
+        true
     }
 
     #[cfg(target_os = "linux")]
@@ -1229,6 +1229,7 @@ fn probe_docker_cpu_controller_available() -> bool {
 /// The probe runs `cat <v2> 2>/dev/null || cat <v1> …` so the output is
 /// exactly one of the two formats — never both, never empty when the daemon
 /// is healthy. Empty/unparseable output fails closed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_controller_probe(bytes: &[u8]) -> bool {
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => s,
