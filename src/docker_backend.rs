@@ -2407,6 +2407,11 @@ pub struct EnsureCountOutcome {
     pub missing: u32,
     /// Shortage from a fresh local Runner.Worker readiness recount after that batch.
     pub remaining_shortage: u32,
+    /// Explicit incomplete post-refill readiness evidence. When present,
+    /// `remaining_shortage` is only the managed-container shortfall and the
+    /// serve loop must run monitors plus immediate reconciliation instead of
+    /// treating the worker state as recovered.
+    pub post_refill_readiness_error: Option<String>,
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
     pub start_failures: u32,
@@ -2449,6 +2454,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             started: Vec::new(),
             missing: 0,
             remaining_shortage: 0,
+            post_refill_readiness_error: None,
             start_failures: 0,
         });
     }
@@ -2599,16 +2605,31 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
 
     let refill = refill?;
     let containers_after = managed_containers().context("post-refill local container recount")?;
-    let alive_after = executing_runner_count_from_containers(
+    let readiness_after = executing_runner_count_from_containers(
         cfg,
         &containers_after,
         Instant::now() + LOCAL_READINESS_BUDGET,
-    )
-    .context("post-refill Runner.Worker readiness probe incomplete")?;
+    );
+    let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
+        Ok(alive_after) => (cfg.runner.count.saturating_sub(alive_after), None),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            eprintln!(
+                "warning: post-refill Runner.Worker readiness incomplete: {detail}; \
+                 preserving successful starts for immediate serve-loop reconciliation"
+            );
+            let containers_alive = current_prefix_containers(&containers_after, cfg).len() as u32;
+            (
+                cfg.runner.count.saturating_sub(containers_alive),
+                Some(detail),
+            )
+        }
+    };
     let outcome = EnsureCountOutcome {
         started: refill.started,
         missing,
-        remaining_shortage: cfg.runner.count.saturating_sub(alive_after),
+        remaining_shortage,
+        post_refill_readiness_error,
         start_failures: refill.start_failures,
     };
     if outcome.is_partial_failure() {
@@ -3467,6 +3488,45 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn post_refill_incomplete_readiness_preserves_starts_and_forces_immediate_reconcile() {
+        let _env = TestEnv::new("post_refill_incomplete_readiness");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let initial: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let after_refill: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() =
+            Some([Err("synthetic post-refill docker top timeout".to_string())].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.started.len(),
+            2,
+            "successful refill must not be discarded"
+        );
+        assert!(outcome
+            .post_refill_readiness_error
+            .as_deref()
+            .unwrap()
+            .contains("synthetic post-refill docker top timeout"));
+        let decision = crate::ensure_success_decision(&cfg, &outcome);
+        assert_eq!(decision, crate::EnsureSuccessDecision::IncompleteReadiness);
+        assert_eq!(
+            crate::ensure_success_plan(&cfg, decision),
+            (Duration::ZERO, true),
+            "incomplete post-refill evidence must run monitors and add zero sleep before reconciliation"
+        );
+    }
+
+    #[test]
     fn ensure_count_outcome_flags_fewer_than_half_started() {
         let _env = TestEnv::new("ensure_count_partial");
         let cfg = cfg_with(4, "ez-org-runner");
@@ -3494,6 +3554,7 @@ minimum_isolation = "container"
             started: vec!["runner-1".into(), "runner-2".into()],
             missing: 2,
             remaining_shortage: 0,
+            post_refill_readiness_error: None,
             start_failures: 0,
         };
         assert!(
@@ -3508,6 +3569,7 @@ minimum_isolation = "container"
             started: vec!["runner-1".into()],
             missing: 2,
             remaining_shortage: 1,
+            post_refill_readiness_error: None,
             start_failures: 1,
         };
         assert!(

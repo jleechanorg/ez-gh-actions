@@ -751,6 +751,38 @@ fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration,
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnsureSuccessDecision {
+    StartSettling { executing: u32 },
+    Recovered,
+    IncompleteReadiness,
+}
+
+fn ensure_success_decision(
+    cfg: &config::Config,
+    outcome: &docker_backend::EnsureCountOutcome,
+) -> EnsureSuccessDecision {
+    if outcome.post_refill_readiness_error.is_some() {
+        EnsureSuccessDecision::IncompleteReadiness
+    } else if outcome.remaining_shortage > 0 {
+        EnsureSuccessDecision::StartSettling {
+            executing: cfg.runner.count.saturating_sub(outcome.remaining_shortage),
+        }
+    } else {
+        EnsureSuccessDecision::Recovered
+    }
+}
+
+fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) -> (Duration, bool) {
+    match decision {
+        EnsureSuccessDecision::StartSettling { .. } => {
+            settling_plan(cfg, SettlingDecision::Continue)
+        }
+        EnsureSuccessDecision::Recovered => settling_plan(cfg, SettlingDecision::Recovered),
+        EnsureSuccessDecision::IncompleteReadiness => settling_plan(cfg, SettlingDecision::Ceiling),
+    }
+}
+
 #[derive(Default)]
 struct SettlingCeilingState {
     consecutive_ceilings: u32,
@@ -1181,15 +1213,37 @@ fn main() -> Result<()> {
                                 &mut ensure_fail_streak,
                                 &outcome,
                             );
-                            let plan = if outcome.remaining_shortage > 0 {
-                                let executing =
-                                    cfg.runner.count.saturating_sub(outcome.remaining_shortage);
-                                settling = Some(SettlingEpisode::start(Instant::now(), executing));
-                                settling_plan(&cfg, SettlingDecision::Continue)
-                            } else {
-                                settling_ceilings.record_recovery();
-                                settling_plan(&cfg, SettlingDecision::Recovered)
-                            };
+                            let decision = ensure_success_decision(&cfg, &outcome);
+                            match decision {
+                                EnsureSuccessDecision::StartSettling { executing } => {
+                                    settling =
+                                        Some(SettlingEpisode::start(Instant::now(), executing));
+                                }
+                                EnsureSuccessDecision::Recovered => {
+                                    settling_ceilings.record_recovery();
+                                }
+                                EnsureSuccessDecision::IncompleteReadiness => {
+                                    let detail = format!(
+                                        "post-refill Runner.Worker readiness incomplete: {}",
+                                        outcome
+                                            .post_refill_readiness_error
+                                            .as_deref()
+                                            .expect("decision requires readiness error")
+                                    );
+                                    let escalated = record_settling_ceiling(
+                                        &cfg,
+                                        &mut settling_ceilings,
+                                        &detail,
+                                    );
+                                    eprintln!(
+                                        "{}: {detail}; running monitors before immediate \
+                                         reconciliation",
+                                        if escalated { "CRITICAL" } else { "WARN" }
+                                    );
+                                    settling = None;
+                                }
+                            }
+                            let plan = ensure_success_plan(&cfg, decision);
                             for name in outcome.started {
                                 println!("respawned ephemeral runner {name}");
                             }
@@ -1568,6 +1622,7 @@ mod tests {
             started: vec!["ez-org-runner-1".into()],
             missing: 4,
             remaining_shortage: 3,
+            post_refill_readiness_error: None,
             start_failures: 3,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
@@ -1586,6 +1641,7 @@ mod tests {
             started: vec!["ez-org-runner-2".into(), "ez-org-runner-3".into()],
             missing: 2,
             remaining_shortage: 0,
+            post_refill_readiness_error: None,
             start_failures: 0,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
