@@ -42,6 +42,12 @@ const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
+// Post-refill readiness gets one 5s shared local-Docker budget. At the normal
+// sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
+// under host pressure, a single probe may use up to 1s and the shared deadline
+// may expire before all slots are inspected. That is explicit incomplete
+// evidence, never false recovery: the caller runs monitors and an immediate
+// full reconciliation. The probe budget is far below the 300s watchdog margin.
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(5);
 #[cfg(not(test))]
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
@@ -68,8 +74,9 @@ static TEST_IS_MACOS_HOST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::ne
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
-static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<Option<std::collections::VecDeque<u32>>> =
-    std::sync::Mutex::new(None);
+static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<
+    Option<std::collections::VecDeque<std::result::Result<u32, String>>>,
+> = std::sync::Mutex::new(None);
 /// Overrides the binary name/path used to build every `docker` `Command` in
 /// this module. Unlike mutating the process-wide `PATH` env var (which any
 /// OTHER test in this binary — including unrelated modules like `alert.rs`,
@@ -1875,7 +1882,7 @@ fn executing_runner_count_from_containers(
     cfg: &Config,
     containers: &[ManagedContainer],
     deadline: Instant,
-) -> u32 {
+) -> Result<u32> {
     let owned = current_prefix_containers(containers, cfg);
     #[cfg(test)]
     {
@@ -1885,8 +1892,9 @@ fn executing_runner_count_from_containers(
             .as_mut()
             .expect("test must explicitly configure Runner.Worker readiness")
             .pop_front()
-            .expect("test Runner.Worker readiness sequence exhausted");
-        count.min(owned.len() as u32)
+            .expect("test Runner.Worker readiness sequence exhausted")
+            .map_err(anyhow::Error::msg)?;
+        Ok(count.min(owned.len() as u32))
     }
 
     #[cfg(not(test))]
@@ -1895,20 +1903,29 @@ fn executing_runner_count_from_containers(
     for container in owned {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            bail!(
+                "Runner.Worker readiness budget expired before inspecting {}",
+                container.name
+            );
         }
         let mut cmd = docker_cmd();
         cmd.args(["top", &container.id, "-eo", "pid,comm"]);
         let timeout = remaining.min(LOCAL_TOP_TIMEOUT);
-        if let Ok(out) = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout) {
-            if out.status.success() && runner_worker_present(&String::from_utf8_lossy(&out.stdout))
-            {
-                executing += 1;
-            }
+        let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
+            .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
+        if !out.status.success() {
+            bail!(
+                "docker top failed for {}: {}",
+                container.name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        if runner_worker_present(&String::from_utf8_lossy(&out.stdout)) {
+            executing += 1;
         }
     }
     #[cfg(not(test))]
-    executing
+    Ok(executing)
 }
 
 /// Cheap local progress signal for a bounded post-refill settling episode.
@@ -1919,11 +1936,7 @@ fn executing_runner_count_from_containers(
 pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
     let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
-    Ok(executing_runner_count_from_containers(
-        cfg,
-        &containers,
-        deadline,
-    ))
+    executing_runner_count_from_containers(cfg, &containers, deadline)
 }
 
 /// Process-wide high-water-mark of each managed runner container's RSS, in
@@ -2590,7 +2603,8 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         cfg,
         &containers_after,
         Instant::now() + LOCAL_READINESS_BUDGET,
-    );
+    )
+    .context("post-refill Runner.Worker readiness probe incomplete")?;
     let outcome = EnsureCountOutcome {
         started: refill.started,
         missing,
@@ -2727,7 +2741,7 @@ mod tests {
                 .map(|slot| format!("ez-org-runner-{slot}"))
                 .collect(),
         );
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -2755,7 +2769,7 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -2773,7 +2787,7 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -3252,7 +3266,7 @@ minimum_isolation = "container"
         ]);
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([3].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(3)].into());
 
         let started = ensure_count(&cfg, Backend::Docker).unwrap();
 
@@ -3298,7 +3312,7 @@ minimum_isolation = "container"
             "ez-org-runner-6".into(),
             "must-not-start-in-a-second-batch".into(),
         ]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([4].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(4)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -3345,7 +3359,7 @@ minimum_isolation = "container"
         ];
         *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [five_alive.clone(), five_alive].into();
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([5].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(5)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker)
             .expect("an exited one-job container with a settling registration is pending turnover");
@@ -3413,7 +3427,7 @@ minimum_isolation = "container"
         *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([4].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(4)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -3439,6 +3453,20 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn local_worker_readiness_propagates_incomplete_probe_evidence() {
+        let _env = TestEnv::new("local_worker_readiness_incomplete");
+        let cfg = cfg_with(1, "ez-org-runner");
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [vec![managed_container("ez-org-runner-1")]].into();
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() =
+            Some([Err("synthetic docker top timeout".to_string())].into());
+
+        let err = local_executing_runner_count(&cfg).unwrap_err();
+
+        assert!(format!("{err:#}").contains("synthetic docker top timeout"));
+    }
+
+    #[test]
     fn ensure_count_outcome_flags_fewer_than_half_started() {
         let _env = TestEnv::new("ensure_count_partial");
         let cfg = cfg_with(4, "ez-org-runner");
@@ -3446,7 +3474,7 @@ minimum_isolation = "container"
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([0].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
