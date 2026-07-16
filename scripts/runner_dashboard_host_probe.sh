@@ -307,6 +307,19 @@ if WATCHDOG_MISSES="$(read_fresh_uint "$STATE_DIR/$HOST_CLASS.miss_count")" && \
   [[ "$WATCHDOG_THRESHOLD" =~ ^[1-9][0-9]*$ ]]; then
   WATCHDOG_OK=true
 fi
+if [[ "$WATCHDOG_OK" != true ]]; then
+  # The `&&` chain above can partially succeed (e.g. miss_count reads fine
+  # but miss_threshold is missing/stale) and still leave WATCHDOG_MISSES set
+  # from its own successful assignment before the chain short-circuits. Per
+  # the snapshot builder's explicit-degraded-telemetry contract, a not-ok
+  # watchdog_state source must report both fields as null/absent — a
+  # half-filled telemetry pair (numbers with unknown ok=false) is exactly
+  # the inconsistent state that made a healthy 10/10 linux fleet on
+  # jeff-ubuntu (miss_count present, miss_threshold file missing) fail
+  # snapshot validity.
+  WATCHDOG_MISSES=""
+  WATCHDOG_THRESHOLD=""
+fi
 
 HOST_CLASS="$HOST_CLASS" TARGET="$TARGET" EXECUTING="$EXECUTING" IDLE="$IDLE" \
 CYCLING="$CYCLING" DOWN="$DOWN" RESERVED="$RESERVED" DISK_STATUS="$DISK_STATUS" \

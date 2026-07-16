@@ -280,6 +280,27 @@ assert payload["sources"]["watchdog_state"]["ok"] is False
 assert payload["watchdog"]["consecutive_misses"] is None
 PY
 
+# Regression: a valid, present miss_count with a MISSING miss_threshold
+# (exactly the live jeff-ubuntu state that made a healthy 10/10 linux fleet
+# report linux_host.ok:false) must not leak a numeric consecutive_misses
+# alongside watchdog_state.ok:false — both watchdog fields must be null
+# together, per the snapshot builder's explicit-degraded-telemetry contract.
+printf '0\n' > "$HOME_T/.local/state/ezgha/watchdog/linux.miss_count"
+rm -f "$HOME_T/.local/state/ezgha/watchdog/linux.miss_threshold"
+PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/missing-threshold-only.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "missing-threshold-only.json").read_text())
+assert payload["sources"]["watchdog_state"]["ok"] is False
+assert payload["watchdog"]["consecutive_misses"] is None
+assert payload["watchdog"]["restart_after"] is None
+PY
+printf '5\n' > "$HOME_T/.local/state/ezgha/watchdog/linux.miss_threshold"
+
 set +e
 DOCTOR_OUTPUT="$(bash "$ROOT/doctor-runner" --json 2>&1)"
 DOCTOR_STATUS=$?
