@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
+use std::ffi::CString;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -36,9 +37,21 @@ pub const PROBE_IMAGE: &str = "alpine:3.19";
 /// row we treat the disk floor as exceeded and refuse to spawn, since a
 /// sustained inability to measure is itself a degraded-daemon signal.
 const DISK_MEASURE_STRIKES: u32 = 2;
+/// Incident-derived early warning for Mac host pressure. This is deliberately
+/// observability-only: `limits.min_free_disk_gb` remains the admission floor.
+const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
+// Post-refill readiness gets one 5s shared local-Docker budget. At the normal
+// sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
+// under host pressure, a single probe may use up to 1s and the shared deadline
+// may expire before all slots are inspected. That is explicit incomplete
+// evidence, never false recovery: the caller runs monitors and an immediate
+// full reconciliation. The probe budget is far below the 300s watchdog margin.
+const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -56,7 +69,15 @@ static TEST_RELEASE_STALE_SLOTS_RESULT: std::sync::Mutex<Option<usize>> =
 #[cfg(test)]
 static TEST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
+static TEST_HOST_FREE_DISK_GB: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_IS_MACOS_HOST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+#[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<
+    Option<std::collections::VecDeque<std::result::Result<u32, String>>>,
+> = std::sync::Mutex::new(None);
 /// Overrides the binary name/path used to build every `docker` `Command` in
 /// this module. Unlike mutating the process-wide `PATH` env var (which any
 /// OTHER test in this binary — including unrelated modules like `alert.rs`,
@@ -328,7 +349,12 @@ fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config
 /// no-exclusions wrapper now exists purely for tests.
 #[cfg(test)]
 pub fn next_slot(cfg: &Config) -> Result<u32> {
-    next_slot_excluding(cfg, &HashSet::new())
+    next_slot_excluding(cfg, &HashSet::new())?.with_context(|| {
+        format!(
+            "all {} runner slot(s) are currently in use on this host",
+            cfg.runner.count
+        )
+    })
 }
 
 /// Like `next_slot`, but skips any slot number present in `excluded` even if
@@ -346,7 +372,7 @@ pub fn next_slot(cfg: &Config) -> Result<u32> {
 /// quarantine exclusion is merged with the caller-supplied `excluded` set,
 /// so per-tick `failed_slots` (the oau fix) and the cross-tick quarantine
 /// gate (the ghd2.2 fix) compose cleanly.
-pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<u32> {
+pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Option<u32>> {
     if cfg.runner.count == 0 {
         bail!("cfg.runner.count is 0; nothing to allocate");
     }
@@ -373,14 +399,10 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<u32>
         if let std::collections::btree_map::Entry::Vacant(e) = assignments.assignments.entry(key) {
             e.insert(String::new());
             write_slot_assignments_for(&assignments, Some(cfg))?;
-            return Ok(slot);
+            return Ok(Some(slot));
         }
     }
-    bail!(
-        "all {} runner slot(s) are currently in use on this host; \
-         stop/release a slot first (e.g. `ezgha stop`) or raise cfg.runner.count",
-        cfg.runner.count
-    );
+    Ok(None)
 }
 
 /// Record the GitHub runner_id returned by `generate_jitconfig` for a slot
@@ -1440,7 +1462,7 @@ fn probe_docker_cpu_controller_available() -> bool {
     // behavior and report availability so the caller proceeds.
     #[cfg(not(target_os = "linux"))]
     {
-        return true;
+        true
     }
 
     #[cfg(target_os = "linux")]
@@ -1529,6 +1551,7 @@ fn probe_docker_cpu_controller_available() -> bool {
 /// The probe runs `cat <v2> 2>/dev/null || cat <v1> …` so the output is
 /// exactly one of the two formats — never both, never empty when the daemon
 /// is healthy. Empty/unparseable output fails closed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_controller_probe(bytes: &[u8]) -> bool {
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => s,
@@ -2110,8 +2133,17 @@ pub struct ManagedContainer {
 #[cfg(test)]
 static TEST_MANAGED_CONTAINERS: std::sync::Mutex<Option<Vec<ManagedContainer>>> =
     std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
+    std::collections::VecDeque<Vec<ManagedContainer>>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
 
-pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedContainer>> {
+    #[cfg(test)]
+    if let Some(containers) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().pop_front() {
+        return Ok(containers);
+    }
+
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINERS.lock().unwrap().clone() {
         return Ok(containers);
@@ -2125,7 +2157,7 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
         "--format",
         "json",
     ]);
-    let out = run_docker(cmd, "listing managed containers")?;
+    let out = run_docker_with_timeout(cmd, "listing managed containers", timeout)?;
     if !out.status.success() {
         bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -2137,6 +2169,78 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
         containers.push(serde_json::from_str(line).context("unexpected docker ps json")?);
     }
     Ok(containers)
+}
+
+pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
+    managed_containers_with_timeout(DOCKER_TIMEOUT)
+}
+
+fn runner_worker_present(output: &str) -> bool {
+    output
+        .lines()
+        .skip(1)
+        .any(|line| line.split_whitespace().nth(1) == Some("Runner.Worker"))
+}
+
+fn executing_runner_count_from_containers(
+    cfg: &Config,
+    containers: &[ManagedContainer],
+    deadline: Instant,
+) -> Result<u32> {
+    let owned = current_prefix_containers(containers, cfg);
+    #[cfg(test)]
+    {
+        let _ = deadline;
+        let mut counts = TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap();
+        let count = counts
+            .as_mut()
+            .expect("test must explicitly configure Runner.Worker readiness")
+            .pop_front()
+            .expect("test Runner.Worker readiness sequence exhausted")
+            .map_err(anyhow::Error::msg)?;
+        Ok(count.min(owned.len() as u32))
+    }
+
+    #[cfg(not(test))]
+    let mut executing = 0;
+    #[cfg(not(test))]
+    for container in owned {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "Runner.Worker readiness budget expired before inspecting {}",
+                container.name
+            );
+        }
+        let mut cmd = docker_cmd();
+        cmd.args(["top", &container.id, "-eo", "pid,comm"]);
+        let timeout = remaining.min(LOCAL_TOP_TIMEOUT);
+        let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
+            .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
+        if !out.status.success() {
+            bail!(
+                "docker top failed for {}: {}",
+                container.name,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        if runner_worker_present(&String::from_utf8_lossy(&out.stdout)) {
+            executing += 1;
+        }
+    }
+    #[cfg(not(test))]
+    Ok(executing)
+}
+
+/// Cheap local progress signal for a bounded post-refill settling episode.
+/// Normal spawn capacity remains managed-container count because idle healthy
+/// listeners have no Runner.Worker. This path talks only to Docker (`ps` +
+/// bounded `top`); it never lists or mutates GitHub runners, registrations, or
+/// workflow jobs.
+pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
+    let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
+    let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
+    executing_runner_count_from_containers(cfg, &containers, deadline)
 }
 
 /// Process-wide high-water-mark of each managed runner container's RSS, in
@@ -2490,6 +2594,39 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
     Some(avail_kb / 1024 / 1024)
 }
 
+/// Free space on the outer host filesystem that backs Docker's storage.
+/// This is intentionally separate from `free_disk_gb`: with Colima the guest
+/// can report ample overlay space while its sparse disk has exhausted APFS.
+fn is_macos_host() -> bool {
+    #[cfg(test)]
+    if let Some(is_macos) = *TEST_IS_MACOS_HOST.lock().unwrap() {
+        return is_macos;
+    }
+    cfg!(target_os = "macos")
+}
+
+fn host_free_disk_gb() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = *TEST_HOST_FREE_DISK_GB.lock().unwrap() {
+        return free;
+    }
+
+    let path = if is_macos_host() {
+        "/System/Volumes/Data"
+    } else {
+        "/"
+    };
+    let path = CString::new(path).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a live NUL-terminated CString and `stats` points to a
+    // valid writable `statvfs` value for the duration of the call.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    let available_bytes = u128::from(stats.f_bavail) * u128::from(stats.f_frsize);
+    Some((available_bytes / 1024 / 1024 / 1024) as u64)
+}
+
 /// Start `missing` runners, one per free slot. Tracks which slot numbers have
 /// already failed WITHIN this call and excludes them from subsequent slot
 /// picks, so a single permanently-broken slot (e.g. an unresolvable 409
@@ -2502,8 +2639,18 @@ pub fn free_disk_gb(image: &str) -> Option<u64> {
 /// This exclusion is scoped to a single call: it does not persist across
 /// separate `ensure_count` ticks, so a transiently-failed slot is retried
 /// normally on the next tick.
-fn start_missing_runners(cfg: &Config, backend: Backend, missing: u32) -> Result<Vec<String>> {
+fn start_missing_runners(
+    cfg: &Config,
+    backend: Backend,
+    missing: u32,
+) -> Result<StartMissingOutcome> {
     start_missing_runners_with_starter(cfg, backend, missing, start_one_at_slot)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StartMissingOutcome {
+    started: Vec<String>,
+    start_failures: u32,
 }
 
 fn start_missing_runners_with_starter(
@@ -2511,8 +2658,9 @@ fn start_missing_runners_with_starter(
     backend: Backend,
     missing: u32,
     starter: impl Fn(&Config, Backend, u32) -> Result<(String, String)>,
-) -> Result<Vec<String>> {
+) -> Result<StartMissingOutcome> {
     let mut started = Vec::new();
+    let mut start_failures = 0;
     let mut last_err = None;
     let mut failed_slots: HashSet<u32> = HashSet::new();
     for _ in 0..missing {
@@ -2522,13 +2670,14 @@ fn start_missing_runners_with_starter(
         }
         watchdog::ping();
         let slot = match next_slot_excluding(cfg, &failed_slots) {
-            Ok(slot) => slot,
+            Ok(Some(slot)) => slot,
+            Ok(None) => {
+                eprintln!("info: no free runner slot yet; registration turnover is still settling");
+                break;
+            }
             Err(e) => {
-                // No free, non-excluded slot left at all (e.g. every slot is
-                // either occupied or has already failed this cycle) — further
-                // iterations cannot possibly succeed either, so stop instead
-                // of spinning through the remaining `missing` count.
-                eprintln!("warning: no runner slot available to attempt: {e:#}");
+                eprintln!("warning: failed to allocate a runner slot: {e:#}");
+                start_failures += 1;
                 last_err = Some(e);
                 break;
             }
@@ -2538,6 +2687,7 @@ fn start_missing_runners_with_starter(
             Err(e) => {
                 eprintln!("warning: failed to start runner in slot {slot}: {e:#}");
                 failed_slots.insert(slot);
+                start_failures += 1;
                 last_err = Some(e);
             }
         }
@@ -2548,26 +2698,42 @@ fn start_missing_runners_with_starter(
             return Err(e);
         }
     }
-    Ok(started)
+    Ok(StartMissingOutcome {
+        started,
+        start_failures,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsureCountOutcome {
     pub started: Vec<String>,
+    /// Shortage observed before this call's sole start batch.
     pub missing: u32,
+    /// Shortage from a fresh local Runner.Worker readiness recount after that batch.
+    pub remaining_shortage: u32,
+    /// Explicit incomplete post-refill readiness evidence. When present,
+    /// `remaining_shortage` is only the managed-container shortfall and the
+    /// serve loop must run monitors plus immediate reconciliation instead of
+    /// treating the worker state as recovered.
+    pub post_refill_readiness_error: Option<String>,
+    /// Actual JIT/Docker/allocator failures, excluding occupied reservations
+    /// that are still settling after a one-job container exits.
+    pub start_failures: u32,
 }
 
 impl EnsureCountOutcome {
-    /// A partial failure is when we started fewer runners than were missing.
+    /// Pending registration turnover is not a backend failure. Only an
+    /// attempted start/allocation that actually failed advances alert/restart
+    /// accounting.
     pub fn is_partial_failure(&self) -> bool {
-        (self.started.len() as u32) < self.missing
+        self.start_failures > 0
     }
 }
 
 /// Ensure `count` managed runner containers are alive; start the shortfall.
-/// Refuses to spawn when the daemon's disk is below the configured floor —
-/// disk exhaustion is the dominant self-hosted runner failure mode, and
-/// spawning more work onto a full disk makes the incident worse.
+/// Refuses to spawn when either the outer host or daemon disk is below its
+/// floor — disk exhaustion is the dominant self-hosted runner failure mode,
+/// and spawning more work onto a full disk makes the incident worse.
 pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
     Ok(ensure_count_outcome(cfg, backend)?.started)
 }
@@ -2583,12 +2749,65 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let containers = managed_containers()?;
+    // Container presence owns normal spawn capacity. Runner.Worker exists only
+    // while a job is executing, so using it here would classify a healthy idle
+    // Listener-only fleet as missing and create a permanent settle/reconcile loop.
     let alive = current_prefix_containers(&containers, cfg).len() as u32;
     if alive >= cfg.runner.count {
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
             missing: 0,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            start_failures: 0,
         });
+    }
+    let host_floor_gb = cfg.limits.min_free_disk_gb;
+    match host_free_disk_gb() {
+        Some(free) if free < host_floor_gb => {
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.host_disk_floor",
+                Severity::Critical,
+                "Runner pool paused: host disk floor reached",
+                &format!(
+                    "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) for {}. refusing to spawn runners until space is reclaimed",
+                    cfg.github.target
+                ),
+            );
+            bail!(
+                "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
+            );
+        }
+        Some(free) => {
+            if is_macos_host() && free < MACOS_HOST_DISK_PRESSURE_ALERT_GB {
+                let _ = alert::notify(
+                    cfg,
+                    "runner_pool.host_disk_pressure",
+                    Severity::Warning,
+                    "Mac host disk pressure approaching admission floor",
+                    &format!(
+                        "{free} GB free on the Mac host filesystem is below the {MACOS_HOST_DISK_PRESSURE_ALERT_GB} GB pressure-alert threshold for {}; runner admission remains enabled until the configured {} GB floor is crossed",
+                        cfg.github.target, cfg.limits.min_free_disk_gb
+                    ),
+                );
+            }
+        }
+        None => {
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.host_disk_measurement_unavailable",
+                Severity::Critical,
+                "Runner pool paused: host disk measurement unavailable",
+                &format!(
+                    "could not measure host free disk for {}; refusing to spawn runners until measurement succeeds",
+                    cfg.github.target
+                ),
+            );
+            bail!(
+                "could not measure host filesystem free disk — refusing to spawn runners until measurement recovers"
+            );
+        }
     }
     match free_disk_gb(&cfg.runner.image) {
         Some(free) if free < cfg.limits.min_free_disk_gb => {
@@ -2606,7 +2825,9 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             );
             bail!(
                 "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
-                 reclaim space (e.g. `docker system prune`) first",
+                 reclaim space first. Do NOT run docker system/image prune: with the fleet idle it \
+                 deletes the required ezgha-runner:latest image (2026-07-14 incident); \
+                 prefer `docker builder prune` and container/log cleanup",
                 cfg.limits.min_free_disk_gb
             );
         }
@@ -2686,8 +2907,35 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // Release any failed reservations from this cycle
     let _ = release_stale_slots(cfg);
 
-    let started = refill?;
-    let outcome = EnsureCountOutcome { started, missing };
+    let refill = refill?;
+    let containers_after = managed_containers().context("post-refill local container recount")?;
+    let readiness_after = executing_runner_count_from_containers(
+        cfg,
+        &containers_after,
+        Instant::now() + LOCAL_READINESS_BUDGET,
+    );
+    let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
+        Ok(alive_after) => (cfg.runner.count.saturating_sub(alive_after), None),
+        Err(error) => {
+            let detail = format!("{error:#}");
+            eprintln!(
+                "warning: post-refill Runner.Worker readiness incomplete: {detail}; \
+                 preserving successful starts for immediate serve-loop reconciliation"
+            );
+            let containers_alive = current_prefix_containers(&containers_after, cfg).len() as u32;
+            (
+                cfg.runner.count.saturating_sub(containers_alive),
+                Some(detail),
+            )
+        }
+    };
+    let outcome = EnsureCountOutcome {
+        started: refill.started,
+        missing,
+        remaining_shortage,
+        post_refill_readiness_error,
+        start_failures: refill.start_failures,
+    };
     if outcome.is_partial_failure() {
         eprintln!(
             "warning: ensure_count started only {} of {} missing runner(s); treating as partial failure for alert streak accounting",
@@ -2765,6 +3013,7 @@ mod tests {
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
+            *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
             Self { _lock: lock, path }
         }
     }
@@ -2774,7 +3023,11 @@ mod tests {
             *TEST_SLOT_PATH.lock().unwrap() = None;
             *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
+            *TEST_IS_MACOS_HOST.lock().unwrap() = None;
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = None;
+            TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().clear();
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -2785,6 +3038,109 @@ mod tests {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+    }
+
+    #[test]
+    fn host_disk_probe_reads_outer_filesystem() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
+
+        assert!(host_free_disk_gb().is_some());
+    }
+
+    #[test]
+    fn mac_host_pressure_alert_does_not_block_six_slot_refill_at_39_gb() {
+        let env = TestEnv::new("host_disk_pressure_alert");
+        crate::alert::clear_alert_state();
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(true);
+        let mut cfg = cfg_with(6, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        let alert_log = env.path.with_file_name("alerts.jsonl");
+        cfg.alert.log_path = Some(alert_log.clone());
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(
+            (1..=6)
+                .map(|slot| format!("ez-org-runner-{slot}"))
+                .collect(),
+        );
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started.len(), 6);
+        assert_eq!(outcome.missing, 6);
+        let alert = std::fs::read_to_string(alert_log).unwrap();
+        assert!(alert.contains("runner_pool.host_disk_pressure"));
+        assert!(alert.contains("\"severity\":\"WARNING\""));
+        assert!(alert.contains("39 GB free"));
+        assert!(alert.contains("40 GB"));
+        assert!(!alert.contains("refusing to spawn"));
+    }
+
+    #[test]
+    fn linux_host_does_not_emit_mac_pressure_alert() {
+        let env = TestEnv::new("linux_host_disk_pressure");
+        crate::alert::clear_alert_state();
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        let alert_log = env.path.with_file_name("alerts.jsonl");
+        cfg.alert.log_path = Some(alert_log.clone());
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert!(!alert_log.exists());
+    }
+
+    #[test]
+    fn configured_host_disk_floor_admits_exact_boundary() {
+        let _env = TestEnv::new("host_disk_floor_boundary");
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.started, vec!["ez-org-runner-1"]);
+        assert_eq!(outcome.missing, 1);
+    }
+
+    #[test]
+    fn configured_host_disk_floor_refuses_space_below_the_floor() {
+        let _env = TestEnv::new("host_disk_floor");
+        let mut cfg = cfg_with(6, "ez-org-runner");
+        cfg.limits.min_free_disk_gb = 5;
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(4));
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+
+        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("host filesystem"));
+        assert!(message.contains("floor: 5 GB"));
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
+            1,
+            "host disk admission must reject the entire refill before start_one consumes any slot"
+        );
     }
 
     #[test]
@@ -3117,10 +3473,10 @@ minimum_isolation = "container"
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some((1..=16).map(|n| format!("ez-org-runner-{n}")).collect());
 
-        let started = start_missing_runners(&cfg, Backend::Docker, 16).unwrap();
+        let outcome = start_missing_runners(&cfg, Backend::Docker, 16).unwrap();
 
         assert_eq!(
-            started.len(),
+            outcome.started.len(),
             16,
             "must start the full shortfall directly in one call, no load-gate batching"
         );
@@ -3187,11 +3543,11 @@ minimum_isolation = "container"
                 Ok((format!("container-{name}"), name))
             };
 
-        let started = start_missing_runners_with_starter(&cfg, Backend::Docker, 5, starter)
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 5, starter)
             .expect("4 of 5 slots succeed, so overall call must return Ok with those 4");
 
         assert_eq!(
-            started.len(),
+            outcome.started.len(),
             4,
             "the 4 genuinely-fillable slots must all be started; only the permanently-broken \
              slot should fail — the bug made ALL 5 iterations pile onto slot {BROKEN_SLOT}"
@@ -3235,6 +3591,7 @@ minimum_isolation = "container"
         ]);
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(3)].into());
 
         let started = ensure_count(&cfg, Backend::Docker).unwrap();
 
@@ -3255,6 +3612,299 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn ensure_count_recounts_locally_after_one_bounded_start_batch() {
+        let _env = TestEnv::new("ensure_count_post_batch_recount");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [
+            vec![
+                managed_container("ez-org-runner-1"),
+                managed_container("ez-org-runner-2"),
+                managed_container("ez-org-runner-3"),
+                managed_container("ez-org-runner-4"),
+            ],
+            vec![
+                managed_container("ez-org-runner-3"),
+                managed_container("ez-org-runner-4"),
+                managed_container("ez-org-runner-5"),
+                managed_container("ez-org-runner-6"),
+            ],
+        ]
+        .into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-org-runner-5".into(),
+            "ez-org-runner-6".into(),
+            "must-not-start-in-a-second-batch".into(),
+        ]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(4)].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.missing, 2,
+            "initial snapshot should start one batch of two"
+        );
+        assert_eq!(
+            outcome.started.len(),
+            2,
+            "one call may start at most the initial shortage"
+        );
+        assert_eq!(
+            outcome.remaining_shortage, 2,
+            "the post-batch local recount must expose jobs that exited while starts were serialized"
+        );
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap(),
+            &["must-not-start-in-a-second-batch"],
+            "ensure_count must never start a second batch in the same call"
+        );
+        assert!(
+            !outcome.is_partial_failure(),
+            "legitimate turnover after a fully successful batch is not a backend failure"
+        );
+    }
+
+    #[test]
+    fn ensure_count_treats_all_reserved_slots_as_pending_turnover_not_failure() {
+        let _env = TestEnv::new("ensure_count_reserved_turnover");
+        let cfg = cfg_with(6, "ez-org-runner");
+        for slot in 1..=6 {
+            assert_eq!(next_slot(&cfg).unwrap(), slot);
+            record_slot_runner_id(slot, 1000 + u64::from(slot)).unwrap();
+        }
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let five_alive = vec![
+            managed_container("ez-org-runner-1"),
+            managed_container("ez-org-runner-2"),
+            managed_container("ez-org-runner-3"),
+            managed_container("ez-org-runner-4"),
+            managed_container("ez-org-runner-5"),
+        ];
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [five_alive.clone(), five_alive].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(5)].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker)
+            .expect("an exited one-job container with a settling registration is pending turnover");
+
+        assert_eq!(outcome.missing, 1);
+        assert!(outcome.started.is_empty());
+        assert_eq!(outcome.remaining_shortage, 1);
+        assert!(
+            !outcome.is_partial_failure(),
+            "no free local slot is not a JIT/Docker start failure and must not drive backend restart accounting"
+        );
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap(),
+            &["must-not-start"],
+            "a reservation wedge must not invoke the starter without a free slot"
+        );
+    }
+
+    #[test]
+    fn ensure_count_full_idle_listener_fleet_has_no_shortage_or_settling_signal() {
+        let _env = TestEnv::new("ensure_count_idle_listener_capacity");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        let six_containers: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [six_containers].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(outcome.missing, 0);
+        assert_eq!(outcome.remaining_shortage, 0);
+        assert!(
+            outcome.started.is_empty(),
+            "six managed Listener-only containers are normal idle capacity"
+        );
+        assert!(
+            !outcome.is_partial_failure(),
+            "normal idle capacity must not drive guards or alerts"
+        );
+        assert!(
+            TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap().is_none(),
+            "normal full-capacity ticks must not consult Runner.Worker readiness or enter settling"
+        );
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap(),
+            &["must-not-start"],
+            "normal idle capacity must not spawn"
+        );
+    }
+
+    #[test]
+    fn ensure_count_uses_runner_worker_only_after_actual_refill() {
+        let _env = TestEnv::new("ensure_count_post_refill_worker_readiness");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let initial: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let after_refill: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(4)].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.missing, 2,
+            "spawn shortage is managed-container count"
+        );
+        assert_eq!(outcome.started.len(), 2);
+        assert_eq!(
+            outcome.remaining_shortage, 2,
+            "post-refill settling waits for the two new Runner.Worker processes"
+        );
+    }
+
+    #[test]
+    fn runner_worker_parser_requires_exact_process_name() {
+        let output = "PID COMMAND\n101 Runner.Listener\n202 Runner.Worker\n";
+        assert!(runner_worker_present(output));
+        assert!(!runner_worker_present("PID COMMAND\n101 Runner.Listener\n"));
+        assert!(!runner_worker_present(
+            "PID COMMAND\n202 NotRunner.Workerish\n"
+        ));
+    }
+
+    #[test]
+    fn local_worker_readiness_propagates_incomplete_probe_evidence() {
+        let _env = TestEnv::new("local_worker_readiness_incomplete");
+        let cfg = cfg_with(1, "ez-org-runner");
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [vec![managed_container("ez-org-runner-1")]].into();
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() =
+            Some([Err("synthetic docker top timeout".to_string())].into());
+
+        let err = local_executing_runner_count(&cfg).unwrap_err();
+
+        assert!(format!("{err:#}").contains("synthetic docker top timeout"));
+    }
+
+    #[test]
+    fn post_refill_incomplete_readiness_preserves_starts_and_forces_immediate_reconcile() {
+        let _env = TestEnv::new("post_refill_incomplete_readiness");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        let initial: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let after_refill: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [
+            initial,
+            after_refill.clone(),
+            after_refill.clone(),
+            after_refill,
+        ]
+        .into();
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [
+                Err("synthetic post-refill docker top timeout".to_string()),
+                Ok(6),
+            ]
+            .into(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        assert_eq!(
+            outcome.started.len(),
+            2,
+            "successful refill must not be discarded"
+        );
+        assert!(outcome
+            .post_refill_readiness_error
+            .as_deref()
+            .unwrap()
+            .contains("synthetic post-refill docker top timeout"));
+        let mut pending_readiness = false;
+        let decision = crate::ensure_success_decision_with_pending_readiness(
+            crate::ensure_success_decision(&cfg, &outcome),
+            pending_readiness,
+        );
+        assert_eq!(decision, crate::EnsureSuccessDecision::IncompleteReadiness);
+        assert_eq!(
+            crate::ensure_success_plan(&cfg, decision),
+            (Duration::ZERO, true),
+            "incomplete post-refill evidence must run monitors and add zero sleep before reconciliation"
+        );
+
+        let started_at = Instant::now();
+        let mut settling = None;
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            started_at,
+            decision,
+        );
+        assert!(
+            pending_readiness && settling.is_none(),
+            "incomplete evidence must force the next full reconciliation while remaining pending"
+        );
+        let mut ceilings = crate::SettlingCeilingState::default();
+        assert!(!crate::record_settling_ceiling(
+            &cfg,
+            &mut ceilings,
+            "synthetic first incomplete episode"
+        ));
+
+        let misleading_full_container_outcome =
+            ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        let full_container_decision = crate::ensure_success_decision_with_pending_readiness(
+            crate::ensure_success_decision(&cfg, &misleading_full_container_outcome),
+            pending_readiness,
+        );
+        assert_eq!(
+            full_container_decision,
+            crate::EnsureSuccessDecision::StartSettling { executing: 0 },
+            "a standalone full-container tick cannot prove Runner.Worker readiness"
+        );
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            started_at,
+            full_container_decision,
+        );
+        assert!(
+            settling
+                .as_ref()
+                .is_some_and(crate::SettlingEpisode::is_active),
+            "the completed full reconciliation must rearm local worker proof"
+        );
+        assert_eq!(
+            ceilings.consecutive_ceilings, 1,
+            "no readiness proof means no reset"
+        );
+
+        let executing = local_executing_runner_count(&cfg).unwrap();
+        let recovered =
+            settling
+                .as_mut()
+                .unwrap()
+                .observe(started_at + Duration::from_secs(5), executing, 6);
+        assert_eq!(recovered, crate::SettlingDecision::Recovered);
+        crate::apply_local_settling_decision(&mut settling, &mut pending_readiness, recovered);
+        ceilings.record_recovery();
+        assert!(!pending_readiness && settling.is_none());
+        assert_eq!(ceilings.consecutive_ceilings, 0);
+    }
+
+    #[test]
     fn ensure_count_outcome_flags_fewer_than_half_started() {
         let _env = TestEnv::new("ensure_count_partial");
         let cfg = cfg_with(4, "ez-org-runner");
@@ -3262,6 +3912,7 @@ minimum_isolation = "container"
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -3280,6 +3931,9 @@ minimum_isolation = "container"
         let outcome = EnsureCountOutcome {
             started: vec!["runner-1".into(), "runner-2".into()],
             missing: 2,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            start_failures: 0,
         };
         assert!(
             !outcome.is_partial_failure(),
@@ -3292,6 +3946,9 @@ minimum_isolation = "container"
         let outcome = EnsureCountOutcome {
             started: vec!["runner-1".into()],
             missing: 2,
+            remaining_shortage: 1,
+            post_refill_readiness_error: None,
+            start_failures: 1,
         };
         assert!(
             outcome.is_partial_failure(),
@@ -5469,7 +6126,7 @@ minimum_isolation = "container"
 
         // next_slot must skip quarantined slots 1 and 2 and hand out slot 3.
         // Use a fresh read so the per-test slot file path resolves.
-        let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         assert_eq!(
             chosen, 3,
             "next_slot_excluding MUST skip quarantined slots 1 and 2 and \
@@ -5515,8 +6172,8 @@ minimum_isolation = "container"
         });
         crate::quarantine::save_quarantine(&quarantine).unwrap();
 
-        let first = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
-        let second = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        let first = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
+        let second = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         assert_eq!(first, 3, "first allocation must skip quarantined slots 1+2");
         assert_eq!(
             second, 4,
@@ -5549,7 +6206,7 @@ minimum_isolation = "container"
         // Slot 2 is the only free one. Even though slot 1 is recorded
         // (and the quarantine file is corrupt), next_slot_excluding must
         // still pick slot 2 — NOT panic, NOT bail.
-        let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap();
+        let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         assert_eq!(chosen, 2);
     }
 }

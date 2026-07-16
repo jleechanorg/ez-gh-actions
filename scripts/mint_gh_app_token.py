@@ -24,6 +24,8 @@ DEFAULT_APP_ID = "4245332"
 DEFAULT_INSTALLATION_ID = "145172957"
 DEFAULT_KEY_PATH = "~/.config/ezgha/app_private_key.pem"
 GITHUB_API = "https://api.github.com"
+REQUEST_TIMEOUT_SECONDS = 15
+RETRY_DELAY_SECONDS = 2.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +67,7 @@ def post_with_retry(url: str, headers: dict[str, str], timeout: int) -> requests
         pass
 
     # Retry exactly once on transient failure (exception or 5xx)
-    time.sleep(2.5)
+    time.sleep(RETRY_DELAY_SECONDS)
     return requests.post(url, headers=headers, timeout=timeout)
 
 
@@ -100,7 +102,9 @@ def main() -> int:
     }
 
     try:
-        response = post_with_retry(url, headers=headers, timeout=30)
+        response = post_with_retry(
+            url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+        )
     except requests.RequestException as exc:
         fail(f"GitHub App token request failed: {exc}")
 

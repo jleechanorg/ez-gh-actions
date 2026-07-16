@@ -14,6 +14,45 @@ This skill drives the **doctor-runner** script that ships at the repo root, plus
 - journal full of `ensure_count failed (will retry): … runner with the name already exists`
 - worldarchitect.ai fleet page shows fewer than 16 `ez-org-runner-*` runners online
 
+## Step 0 — Mac host: check ALL FIVE layers (2026-07-14 outage lesson)
+
+On the Mac, "runners down" is usually SEVERAL stacked causes — each masks the
+next, so never stop at the first fix. Check every layer, in order (memory:
+`mac-fleet-outage-causal-chain-2026-07-14`):
+
+1. **VM state — BOTH lima homes**: `colima list` (profile home `~/.colima`)
+   AND `limactl list` (home `~/.lima`) — two independent instances exist and
+   have fought each other (dual-Lima convergence: bead ez-gh-actions-apye).
+   A stale-state start failure ("vz driver is running but host agent is not"
+   / "already running, ignoring") needs a force-stop + restart cycle —
+   deploy-owner only (`.claude/hooks/vm-lifecycle-guard.sh` blocks it otherwise).
+2. **Daemon socket wiring**: `/var/run/docker.sock` may be a dead symlink.
+   Check the plist: `plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist`
+   → `EnvironmentVariables.DOCKER_HOST` must point at the RUNNING VM's socket
+   (e.g. `unix:///Users/jleechan/.colima/default/docker.sock`). install.sh
+   auto-injects this but its docker prereq check can abort first
+   (bead jleechan-ea02 — workaround: run install.sh with DOCKER_HOST exported).
+3. **Host disk floor**: daemon stderr `only N GB free (floor: 40 GB)` —
+   `MACOS_HOST_DISK_FLOOR_GB=40` is a hard floor (config cannot lower it on
+   macOS). Reclaim: cargo target dirs, `~/Library/Caches`, stale simulators
+   (`xcrun simctl delete unavailable` + named stale test sims), then
+   `tmutil thinlocalsnapshots / 21474836480 4` — APFS snapshots PIN deleted
+   blocks, so df may not move until you thin. Bead jleechan-er7x.
+4. **Runner image present**: `docker image inspect ezgha-runner:latest` on
+   the daemon's socket. Daemon stderr `could not measure daemon free disk …
+   image missing?` means it's gone — a system/image prune while the fleet is
+   idle deletes it (in-use images survive, the idle runner image does not).
+   Rebuild: `docker build -f Dockerfile.runner -t ezgha-runner:latest .`
+   Bead jleechan-kobt.
+5. **Watchdog reality check**: the deployed watchdog may be a divergent copy
+   (2026-07-14: plist invoked an old 221-line script from another repo that
+   only LOGS its remediation). Confirm which script the watchdog plist runs
+   and read `~/Library/Logs/ezgha-watchdog-launchd.log`. Bead jleechan-yib3.
+
+Per-slot end-state proof after recovery: `docker top <c> | grep -E 'Runner\.(Listener|Worker)'`
+for every container — ephemeral churn (containers seconds old, Worker already
+present) is HEALTHY under queue backlog.
+
 ## Step 1 — Establish the baseline
 
 ```bash

@@ -435,6 +435,10 @@ case "$(uname -s)" in
   *)      PLATFORM="other" ;;
 esac
 
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+source "$REPO_ROOT/scripts/launchd-service-docker-endpoint.sh"
+use_launchd_service_docker_endpoint "$PLATFORM"
+
 probe_service_state() {
   if [ "$PLATFORM" = "linux" ]; then
     systemctl --user is-active ezgha.service 2>/dev/null || echo "inactive"
