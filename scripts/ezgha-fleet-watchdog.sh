@@ -198,10 +198,11 @@ BOOT_TIME="$(boot_time)"
 # file is considered stale, in which case "0" is printed instead
 # (guardrail 5). A file is stale if EITHER (a) its mtime predates the
 # current boot time ($BOOT_TIME) — the REBOOT guard — OR (b) its mtime is
-# older than $STATE_STALE_SECONDS — the general-staleness AGE backstop. The
-# reboot check is what catches a FAST reboot whose pre-reboot state is
-# still younger than STATE_STALE_SECONDS (a reboot is one way a state file
-# can belong to a dead boot session while still looking recent); the age
+# older than $STATE_STALE_SECONDS — the general-staleness AGE backstop — OR
+# (c) its mtime is in the future, so it cannot describe state already
+# observed by this run. The reboot check catches a FAST reboot whose
+# pre-reboot state is still younger than STATE_STALE_SECONDS (a reboot can
+# leave a recent-looking state file from a dead boot session); the age
 # check catches non-reboot staleness. Used by BOTH get_miss_count() and
 # get_last_restart(). Fails safe at every step: missing file -> "0" (base
 # case); unreadable mtime -> NOT treated as stale (falls through to the
@@ -211,9 +212,14 @@ read_fresh_state() { # $1=state file path -> stored value, or 0 if missing/stale
   local file="$1"
   [[ -f "$file" ]] || { echo 0; return; }
 
-  local mtime
+  local mtime now
   mtime="$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || true)"
   if [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    now="$(date +%s)"
+    if (( mtime > now )); then
+      echo 0
+      return
+    fi
     # (a) REBOOT guard: state written before the current boot cannot
     # describe the current boot session. Applies even to a file younger
     # than STATE_STALE_SECONDS. Skipped when boot time is unknown.
@@ -222,8 +228,6 @@ read_fresh_state() { # $1=state file path -> stored value, or 0 if missing/stale
       return
     fi
     # (b) AGE backstop: non-reboot staleness.
-    local now
-    now="$(date +%s)"
     if (( now - mtime > STATE_STALE_SECONDS )); then
       echo 0
       return
@@ -240,6 +244,11 @@ get_miss_count() { # $1=host
 set_miss_count() { # $1=host $2=count
   [[ "$DRY_RUN" -eq 1 ]] && return 0
   echo "$2" > "$STATE_DIR/$1.miss_count"
+}
+
+set_miss_threshold() { # $1=host
+  [[ "$DRY_RUN" -eq 1 ]] && return 0
+  echo "$MISS_THRESHOLD" > "$STATE_DIR/$1.miss_threshold"
 }
 
 get_last_restart() { # $1=host -> epoch seconds, 0 if never
@@ -306,6 +315,7 @@ evaluate_host() {
   local host="$1" configured="$2" actual="$3" slots="$4" restart_fn="$5"
   local label
   label="$(echo "$host" | tr '[:lower:]' '[:upper:]')"
+  set_miss_threshold "$host"
 
   log "$label: configured=$configured, managed=$actual, slots=$slots"
 

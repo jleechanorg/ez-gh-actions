@@ -61,6 +61,7 @@ extract_fn() {
 eval "$(extract_fn parse_bsd_boottime)"
 eval "$(extract_fn boot_time)"
 eval "$(extract_fn read_fresh_state)"
+eval "$(extract_fn set_miss_threshold)"
 
 # Assert the reboot guard is actually wired into read_fresh_state (a
 # BOOT_TIME mtime comparison), not merely defined -- the defect this guards
@@ -73,8 +74,8 @@ fi
 # shellcheck disable=SC2034  # consumed by the eval'd read_fresh_state() (age backstop)
 STATE_STALE_SECONDS=480   # match the script default
 WORK=$(mktemp -d)
-cleanup() { rm -rf "$WORK"; }
-trap cleanup EXIT
+trap 'rm -rf "$WORK"' EXIT
+STATE_DIR="$WORK"
 
 NOW=$(date +%s)
 OVERALL_PASS=true
@@ -82,7 +83,13 @@ OVERALL_PASS=true
 # write_state $file $value $mtime_epoch
 write_state() {
   echo "$2" > "$1"
-  touch -d "@$3" "$1"
+  python3 - "$1" "$3" <<'PY'
+import os
+import sys
+
+timestamp = int(sys.argv[2])
+os.utime(sys.argv[1], (timestamp, timestamp))
+PY
 }
 
 run_case() {
@@ -99,6 +106,26 @@ run_case() {
 }
 
 echo "--- watchdog reboot-stale-state guard (ez-gh-actions-xfw) ---"
+
+# The dashboard must report the watchdog's configured threshold, not a
+# second hard-coded value. Prove the watchdog publishes that local truth and
+# that dry-run remains non-mutating.
+export DRY_RUN=0 MISS_THRESHOLD=5
+set_miss_threshold linux
+if [ "$(cat "$STATE_DIR/linux.miss_threshold")" = "5" ]; then
+  echo "  [dynamic-threshold-published] miss_threshold=5 -- PASS"
+else
+  echo "  [dynamic-threshold-published] expected miss_threshold=5 -- FAIL"
+  OVERALL_PASS=false
+fi
+export DRY_RUN=1 MISS_THRESHOLD=7
+set_miss_threshold linux
+if [ "$(cat "$STATE_DIR/linux.miss_threshold")" = "5" ]; then
+  echo "  [dynamic-threshold-dry-run] state unchanged -- PASS"
+else
+  echo "  [dynamic-threshold-dry-run] state mutated -- FAIL"
+  OVERALL_PASS=false
+fi
 
 # Sanity: boot_time() on this host must yield a plausible epoch (Linux CI
 # has /proc/stat btime). If it can't be read here the guard would silently
@@ -165,7 +192,12 @@ FC2="$WORK/c2.last_restart"
 write_state "$FC2" 5 $((NOW - 600))   # older than 480s staleness window
 run_case "boot-unknown-old-age-backstop-still-fires" "" "$FC2" "0"
 
-# Case (d): missing file -> 0 base case (boot known, irrelevant).
+# Case (d): a future mtime cannot describe state already observed now.
+FD="$WORK/d.miss_count"
+write_state "$FD" 9 $((NOW + 60))
+run_case "future-mtime-rejected" $((NOW - 100000)) "$FD" "0"
+
+# Case (e): missing file -> 0 base case (boot known, irrelevant).
 run_case "missing-file-base-case" $((NOW - 60)) "$WORK/nope.miss_count" "0"
 
 echo "--- summary ---"

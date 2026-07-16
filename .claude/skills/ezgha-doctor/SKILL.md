@@ -219,7 +219,11 @@ Run doctor again. Repeat until it returns 0. If it stays 1 for 10+ minutes despi
 
 ## Output format
 
-Always run `bash /home/jleechan/projects/ez-gh-actions/doctor-runner` (no flags) first. The human-readable output is the audit trail. `--json` is available for scripted checks but not enabled by default.
+Always run `bash /home/jleechan/projects/ez-gh-actions/doctor-runner` (no flags)
+first. The human-readable output is the audit trail. `doctor-runner --json` is
+unsupported. For aggregate local scripted checks, use
+`scripts/runner_dashboard_host_probe.sh --host-class mac|linux`; that public
+projection is not a replacement for the full doctor report.
 
 
 ## Step 5 — Harness diagnosis (mandatory on failure)

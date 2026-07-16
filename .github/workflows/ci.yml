@@ -14,10 +14,23 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
       - name: Build
         run: cargo build --all-targets
       - name: Test
         run: cargo test
+      - name: Runner dashboard contract tests
+        run: |
+          python3 -m unittest tests/runner_dashboard_snapshot_test.py
+          node --test tests/runner_dashboard_ui_test.mjs
+          bash tests/runner_dashboard_host_probe_test.sh
+          bash tests/runner_dashboard_publisher_test.sh
+          bash tests/runner_dashboard_launchd_install_test.sh
+          bash tests/watchdog_reboot_stale_state_test.sh
+          bash tests/install_watchdog_gate_test.sh
+          bash tests/install_uninstall_aux_units_test.sh
       - name: Mac trim guard shell regressions
         run: |
           bash tests/colima_trim_guard_test.sh

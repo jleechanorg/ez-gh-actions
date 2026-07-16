@@ -24,14 +24,27 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 WORK=$(mktemp -d)
-cleanup() { rm -rf "${WORK}"; }
-trap cleanup EXIT
+trap 'rm -rf "${WORK}"' EXIT
 
 PASS=true
 fail() {
   echo "FAIL: $1" >&2
   PASS=false
 }
+
+INSTALLED_MAC_HOST_ARG="$(
+  sed -n 's/.*ezgha-fleet-watchdog\.sh" "--host \([^" ]*\)".*/\1/p' \
+    "$REPO_ROOT/install.sh"
+)"
+PARSER_HOSTS="$(
+  sed -n 's/.*argument (\([^)]*\)).*/\1/p' \
+    "$REPO_ROOT/scripts/ezgha-fleet-watchdog.sh" | head -1
+)"
+if printf '%s\n' "$PARSER_HOSTS" | tr '|' '\n' | grep -Fxq "$INSTALLED_MAC_HOST_ARG"; then
+  echo "PASS: Mac watchdog install host '$INSTALLED_MAC_HOST_ARG' matches parser"
+else
+  fail "Mac watchdog install host '$INSTALLED_MAC_HOST_ARG' is outside parser contract '$PARSER_HOSTS'"
+fi
 
 # ── 1. Build a minimal, docs/-less copy of the tree install.sh needs ─────────
 # (docs/-less so the live post-deploy verify-exit-criteria.sh gate is never
@@ -82,6 +95,11 @@ EOF
 cat > "${STUB_BIN}/gh" <<'EOF'
 #!/usr/bin/env bash
 exit 0
+EOF
+
+cat > "${STUB_BIN}/uname" <<'EOF'
+#!/usr/bin/env bash
+echo Linux
 EOF
 
 cat > "${STUB_BIN}/systemctl" <<'EOF'
