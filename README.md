@@ -428,12 +428,17 @@ execution proof.
 ### Custom runner image
 
 The default `ghcr.io/actions/actions-runner:latest` image lacks `gh` and `jq`, causing
-workflows that use these tools to fail with exit code 127. Build and use the custom
-image:
+workflows that use these tools to fail with exit code 127. `./install.sh` builds and
+tags the custom image automatically on every run, so this only needs to be done by
+hand after editing `Dockerfile.runner` directly:
 
 ```bash
-docker build -f Dockerfile.runner -t ezgha-runner:latest .
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:latest .
 ```
+
+Use `DOCKER_BUILDKIT=0` (legacy builder) — BuildKit failed a reproducible `apt-get
+install python3-venv` step on a colima/vz host even with `--no-cache`, while the
+legacy builder succeeded immediately (bead jleechan-bl0n).
 
 ### Stale container name-collision fix
 

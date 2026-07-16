@@ -273,6 +273,38 @@ else
   ok "installed from ${REPO_URL}"
 fi
 
+# ── Build the custom runner image ──────────────────────────────────────────
+# Every example config ships `image = "ezgha-runner:latest"` (bare
+# ghcr.io/actions/actions-runner:latest lacks gh/jq -> exit 127 in workflows).
+# The image lives only in the Docker/Colima VM's local store, never in git,
+# so a fresh VM (new machine, `colima delete && colima start`, disk-pressure
+# recreation) has no way to get it back except this step. Idempotent: a
+# no-op rebuild of an unchanged Dockerfile.runner is a fast cache hit.
+if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" docker version >/dev/null 2>&1; then
+  info "Building ezgha-runner:latest from Dockerfile.runner"
+  # DOCKER_BUILDKIT=0 (legacy builder): BuildKit's build-context network path
+  # hit a reproducible "python3-venv has no installation candidate" apt
+  # failure on this colima/vz setup even with --no-cache, while the legacy
+  # builder and a plain `docker run ... apt-get install` both succeeded
+  # immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully
+  # isolated; defaulting to the legacy builder here is the proven-reliable path.
+  if DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" DOCKER_BUILDKIT=0 \
+      docker build -f "${SCRIPT_DIR}/Dockerfile.runner" -t ezgha-runner:latest "${SCRIPT_DIR}" \
+      >/tmp/ezgha-runner-build.log 2>&1; then
+    ok "ezgha-runner:latest built"
+  else
+    bad "ezgha-runner:latest build failed — see /tmp/ezgha-runner-build.log (daemon will refuse to spawn runners without this image)"
+    missing=1
+  fi
+else
+  info "Docker daemon unreachable or Dockerfile.runner missing — skipping runner image build (fix docker reachability above, then re-run ./install.sh)"
+fi
+
+if [ "${missing}" -ne 0 ]; then
+  bad "Fix the items above, then re-run ./install.sh"
+  exit 1
+fi
+
 CARGO_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin"
 case ":${PATH}:" in
   *":${CARGO_BIN}:"*) : ;;
