@@ -376,7 +376,7 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
     if cfg.runner.count == 0 {
         bail!("cfg.runner.count is 0; nothing to allocate");
     }
-    let quarantine_excluded = match quarantine::load_quarantine() {
+    let quarantine_excluded = match quarantine::load_quarantine_for(Some(cfg)) {
         Ok(table) => table.excluded_slots(),
         Err(err) => {
             // A corrupt quarantine file must NOT block all allocations —
@@ -518,7 +518,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     // parse error. The empty-table fallback is the same fail-soft policy as
     // the slot assignments loader so a single bad write doesn't wedge the
     // entire reconciliation cycle.
-    let mut quarantine = quarantine::load_quarantine().unwrap_or_else(|err| {
+    let mut quarantine = quarantine::load_quarantine_for(Some(cfg)).unwrap_or_else(|err| {
         eprintln!(
             "warning: release_stale_slots proceeding with empty quarantine table (parse failed): {err:#}"
         );
@@ -569,7 +569,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     // poison the rest of the reconcile cycle — we log and continue; the
     // worst case is that the next tick re-derives the same quarantine state
     // from scratch (idempotent).
-    if let Err(err) = quarantine::save_quarantine(&quarantine) {
+    if let Err(err) = quarantine::save_quarantine_for(Some(cfg), &quarantine) {
         eprintln!(
             "warning: failed to persist quarantine table; next tick will re-derive from scratch: {err:#}"
         );
@@ -926,7 +926,7 @@ fn runner_name_from_prefix(prefix: &str, slot: u32) -> String {
 ///
 /// Returns the number of slots reclaimed (released). `quarantine` is
 /// mutated in place — on success the caller persists it via
-/// `quarantine::save_quarantine`. The function does not persist
+/// `quarantine::save_quarantine_for`. The function does not persist
 /// `assignments` either; that is `release_stale_slots`'s job (via
 /// `release_slot_for`), and tests can inspect either via the closures.
 #[allow(clippy::too_many_arguments)]
@@ -3415,6 +3415,75 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn state_dir_isolates_quarantine_between_configs() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Hold quarantine's own test lock too: this test reads/writes
+        // TEST_QUARANTINE_PATH directly (to prove cfg.state_dir-based
+        // resolution), and that static is checked before cfg.state_dir in
+        // quarantine_path_for — without this lock a concurrently-running
+        // TestEnv-based quarantine test could clobber it mid-flight.
+        let _qlock = crate::quarantine::tests::test_lock();
+        *TEST_SLOT_PATH.lock().unwrap() = None;
+        *crate::quarantine::TEST_QUARANTINE_PATH.lock().unwrap() = None;
+        let base = env::temp_dir().join(format!(
+            "ezgha-state-dir-quarantine-isolation-{}",
+            std::process::id()
+        ));
+        let dir_a = base.join("prod");
+        let dir_b = base.join("canary");
+        let mut prod = cfg_with(1, "ez-prod");
+        prod.state_dir = Some(dir_a.clone());
+        let mut canary = cfg_with(1, "ez-canary");
+        canary.state_dir = Some(dir_b.clone());
+
+        let mut prod_quarantine = crate::quarantine::load_quarantine_for(Some(&prod)).unwrap();
+        prod_quarantine.upsert(crate::quarantine::QuarantineEntry {
+            slot: 1,
+            runner_id: 101,
+            runner_name: "ez-prod-1".into(),
+            first_seen_epoch_secs: 1_700_000_000,
+            attempt_count: 0,
+            last_attempt_epoch_secs: 1_700_000_000,
+            reason: crate::quarantine::QuarantineReason::Locked422,
+        });
+        crate::quarantine::save_quarantine_for(Some(&prod), &prod_quarantine).unwrap();
+
+        let mut canary_quarantine = crate::quarantine::load_quarantine_for(Some(&canary)).unwrap();
+        canary_quarantine.upsert(crate::quarantine::QuarantineEntry {
+            slot: 1,
+            runner_id: 202,
+            runner_name: "ez-canary-1".into(),
+            first_seen_epoch_secs: 1_700_000_000,
+            attempt_count: 0,
+            last_attempt_epoch_secs: 1_700_000_000,
+            reason: crate::quarantine::QuarantineReason::Locked422,
+        });
+        crate::quarantine::save_quarantine_for(Some(&canary), &canary_quarantine).unwrap();
+
+        let prod_reloaded = crate::quarantine::load_quarantine_for(Some(&prod)).unwrap();
+        let canary_reloaded = crate::quarantine::load_quarantine_for(Some(&canary)).unwrap();
+        assert_eq!(
+            prod_reloaded.get(1).unwrap().runner_id,
+            101,
+            "prod's quarantine file must not be overwritten by canary's write"
+        );
+        assert_eq!(
+            canary_reloaded.get(1).unwrap().runner_id,
+            202,
+            "canary's quarantine file must not be overwritten by prod's write"
+        );
+
+        let prod_raw = std::fs::read_to_string(dir_a.join("quarantined_slots.toml")).unwrap();
+        let canary_raw = std::fs::read_to_string(dir_b.join("quarantined_slots.toml")).unwrap();
+        assert!(prod_raw.contains("101"));
+        assert!(!prod_raw.contains("202"));
+        assert!(canary_raw.contains("202"));
+        assert!(!canary_raw.contains("101"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn read_slot_assignments_quarantines_corrupt_file_and_returns_empty() {
         let env = TestEnv::new("corrupt_slot_file");
         let path = env.path.clone();
@@ -5700,7 +5769,7 @@ minimum_isolation = "container"
             status: "offline".into(),
             busy: true,
         }];
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
         assert!(!quarantine.is_quarantined(1));
 
         let err_422 = || -> Result<()> {
@@ -5772,7 +5841,7 @@ minimum_isolation = "container"
                 busy: true,
             },
         ];
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
 
         // Track how many times remove_runner is called. With the bound,
         // we expect exactly 2 calls (one per wedged slot — the initial
@@ -5853,7 +5922,7 @@ minimum_isolation = "container"
             status: "offline".into(),
             busy: true,
         }];
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
 
         // Tick 1: 422 detected, slot enters quarantine, reaper is tried once.
         let err_422 = |_id: u64| -> Result<()> {
@@ -5940,7 +6009,7 @@ minimum_isolation = "container"
             "ez-org-runner-1",
             true,
         );
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
 
         // Tick 1: 422 detected, slot enters quarantine.
         let live_locked = vec![github::RunnerInfo {
@@ -6041,7 +6110,7 @@ minimum_isolation = "container"
         // return any slots, and the quarantine table MUST stay empty.
         let live: Vec<github::RunnerInfo> = vec![]; // no registration
         let local_names: HashSet<String> = ["ez-org-runner-1".into()].into_iter().collect();
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
 
         let _ = reconcile_offline_busy_zombies(
             None,
@@ -6103,7 +6172,7 @@ minimum_isolation = "container"
         assert_eq!(assignments.assignments.len(), 2);
 
         // Quarantine slots 1 and 2.
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
         quarantine.upsert(crate::quarantine::QuarantineEntry {
             slot: 1,
             runner_id: 4242,
@@ -6122,7 +6191,7 @@ minimum_isolation = "container"
             last_attempt_epoch_secs: 1_700_000_000,
             reason: crate::quarantine::QuarantineReason::Locked422,
         });
-        crate::quarantine::save_quarantine(&quarantine).unwrap();
+        crate::quarantine::save_quarantine_for(None, &quarantine).unwrap();
 
         // next_slot must skip quarantined slots 1 and 2 and hand out slot 3.
         // Use a fresh read so the per-test slot file path resolves.
@@ -6151,7 +6220,7 @@ minimum_isolation = "container"
         record_slot_runner_id(2, 5252).unwrap();
         // Slots 3 and 4 are free.
 
-        let mut quarantine = crate::quarantine::load_quarantine().unwrap();
+        let mut quarantine = crate::quarantine::load_quarantine_for(None).unwrap();
         quarantine.upsert(crate::quarantine::QuarantineEntry {
             slot: 1,
             runner_id: 4242,
@@ -6170,7 +6239,7 @@ minimum_isolation = "container"
             last_attempt_epoch_secs: 1_700_000_000,
             reason: crate::quarantine::QuarantineReason::Locked422,
         });
-        crate::quarantine::save_quarantine(&quarantine).unwrap();
+        crate::quarantine::save_quarantine_for(None, &quarantine).unwrap();
 
         let first = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         let second = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
@@ -6200,7 +6269,7 @@ minimum_isolation = "container"
         record_slot_runner_id(1, 4242).unwrap();
 
         // Write garbage into the quarantine file.
-        let path = crate::quarantine::quarantine_path();
+        let path = crate::quarantine::quarantine_path_for(None);
         std::fs::write(&path, "this is not valid TOML = = =").unwrap();
 
         // Slot 2 is the only free one. Even though slot 1 is recorded

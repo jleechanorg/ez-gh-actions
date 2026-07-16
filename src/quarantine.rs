@@ -28,6 +28,7 @@
 //! mirror case: container DOWN + GH reports offline+busy + DELETE 422 →
 //! defer the slot rather than recycle, restart, or kill a sibling.
 
+use crate::config::Config;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -95,12 +96,16 @@ pub enum QuarantineReason {
     Locked422,
 }
 
-/// Path to the quarantine TOML file. Resolution order, mirroring the slot
-/// assignments convention in `docker_backend`:
+/// Path to the quarantine TOML file. Resolution order, mirroring
+/// `slot_assignments_path_for` in `docker_backend` exactly (same isolation
+/// guarantee: `cfg.state_dir` scopes this file so two fleets/configs
+/// co-located on one host — e.g. prod + canary — never share quarantine
+/// state and cross-contaminate slot indices):
 /// 1. `EZGHA_QUARANTINE_PATH` env var (operator override / tests).
 /// 2. `TEST_QUARANTINE_PATH` static (in-process test override).
-/// 3. `<state_dir>/quarantined_slots.toml` (production default).
-pub fn quarantine_path() -> PathBuf {
+/// 3. `cfg.state_dir` when the caller has a `Config` (production default).
+/// 4. Global `~/.config/ezgha/` fallback when no `cfg` is available.
+pub fn quarantine_path_for(cfg: Option<&Config>) -> PathBuf {
     #[cfg(test)]
     {
         if let Some(p) = TEST_QUARANTINE_PATH.lock().unwrap().clone() {
@@ -110,15 +115,20 @@ pub fn quarantine_path() -> PathBuf {
     if let Ok(p) = std::env::var(QUARANTINE_PATH_ENV) {
         return PathBuf::from(p);
     }
-    default_quarantine_path()
+    default_quarantine_path_for(cfg)
 }
 
-fn default_quarantine_path() -> PathBuf {
-    // Mirror the slot assignments path derivation so the two files live side
-    // by side in the same state directory — operator inspection only needs
-    // to `ls` one place. We deliberately re-derive the state dir here
-    // rather than calling into `docker_backend` to avoid creating a module
-    // cycle (`docker_backend` already depends on `quarantine`).
+fn default_quarantine_path_for(cfg: Option<&Config>) -> PathBuf {
+    // Mirror the slot assignments path derivation exactly, including the
+    // state_dir scoping — two fleets/configs sharing a host must never
+    // share a quarantine file (bare numeric slot indices would collide).
+    if let Some(state_dir) = cfg.and_then(|cfg| cfg.state_dir.clone()) {
+        return state_dir.join("quarantined_slots.toml");
+    }
+    // No cfg available (or cfg.state_dir unset): fall back to the global
+    // XDG config location. We deliberately re-derive this here rather than
+    // calling into `docker_backend` to avoid creating a module cycle
+    // (`docker_backend` already depends on `quarantine`).
     let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "~".into());
         format!("{home}/.config")
@@ -130,8 +140,8 @@ fn default_quarantine_path() -> PathBuf {
 
 /// Load the quarantine table from disk. A missing or empty file is not an
 /// error — it just means "no quarantined slots", the steady state.
-pub fn load_quarantine() -> Result<QuarantineTable> {
-    let path = quarantine_path();
+pub fn load_quarantine_for(cfg: Option<&Config>) -> Result<QuarantineTable> {
+    let path = quarantine_path_for(cfg);
     if !path.exists() {
         return Ok(QuarantineTable::default());
     }
@@ -154,8 +164,8 @@ pub fn load_quarantine() -> Result<QuarantineTable> {
 /// Persist the quarantine table atomically (write-tmp + rename) — a torn
 /// write would lose every quarantined slot's state and restart the lock
 /// dance from scratch on the very next tick.
-pub fn save_quarantine(table: &QuarantineTable) -> Result<()> {
-    let path = quarantine_path();
+pub fn save_quarantine_for(cfg: Option<&Config>, table: &QuarantineTable) -> Result<()> {
+    let path = quarantine_path_for(cfg);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -249,6 +259,28 @@ pub(crate) mod tests {
         dir.join("quarantined_slots.toml")
     }
 
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    /// Acquire the same lock `TestEnv` uses to guard `TEST_QUARANTINE_PATH`.
+    /// Exposed so cross-module tests (e.g. `docker_backend`'s state_dir
+    /// isolation tests) that read/write `TEST_QUARANTINE_PATH` directly
+    /// without going through `TestEnv` still serialize against every other
+    /// quarantine test — otherwise a concurrently-running `TestEnv`-based
+    /// test can clobber `TEST_QUARANTINE_PATH` mid-flight (it is checked
+    /// before `cfg.state_dir` in `quarantine_path_for`), causing spurious
+    /// cross-test data races.
+    pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        // Recover from poisoning: a previous test that held the lock and
+        // panicked must not cascade into every subsequent test (which is
+        // what a bare .unwrap() does on a poisoned mutex). The data this
+        // lock guards is the TEST_QUARANTINE_PATH static, which TestEnv's
+        // Drop resets anyway, so any half-applied mutation from the
+        // panicked test is harmless.
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     pub(crate) struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         path: PathBuf,
@@ -256,17 +288,7 @@ pub(crate) mod tests {
 
     impl TestEnv {
         pub(crate) fn new(label: &str) -> Self {
-            static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-            // Recover from poisoning: a previous test that held the lock
-            // and panicked must not cascade into every subsequent test
-            // (which is what a bare .unwrap() does on a poisoned mutex).
-            // The data this lock guards is the TEST_QUARANTINE_PATH
-            // static, which TestEnv::drop resets anyway, so any
-            // half-applied mutation from the panicked test is harmless.
-            let lock = LOCK
-                .get_or_init(|| std::sync::Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let lock = test_lock();
             let path = tmp_path(label);
             *TEST_QUARANTINE_PATH.lock().unwrap() = Some(path.clone());
             TestEnv { _lock: lock, path }
@@ -298,7 +320,7 @@ pub(crate) mod tests {
     #[test]
     fn load_returns_empty_when_file_missing() {
         let _env = TestEnv::new("missing");
-        let table = load_quarantine().unwrap();
+        let table = load_quarantine_for(None).unwrap();
         assert!(table.entries.is_empty());
     }
 
@@ -318,9 +340,9 @@ pub(crate) mod tests {
             "ez-org-runner-7",
             QuarantineReason::Locked422,
         ));
-        save_quarantine(&table).unwrap();
+        save_quarantine_for(None, &table).unwrap();
 
-        let loaded = load_quarantine().unwrap();
+        let loaded = load_quarantine_for(None).unwrap();
         assert_eq!(loaded.entries.len(), 2);
         assert_eq!(loaded.get(3).unwrap().runner_id, 9999);
         assert_eq!(loaded.get(7).unwrap().runner_name, "ez-org-runner-7");
@@ -398,7 +420,7 @@ pub(crate) mod tests {
     fn load_returns_empty_on_corrupt_file_without_panicking() {
         let _env = TestEnv::new("corrupt");
         std::fs::write(&_env.path, "this is not valid TOML = = =").unwrap();
-        let result = load_quarantine();
+        let result = load_quarantine_for(None);
         assert!(result.is_err(), "corrupt file must surface a parse error");
         // Caller's responsibility to surface this; we just confirm we did
         // not panic and did not silently return garbage. The empty-on-parse-
@@ -424,7 +446,7 @@ pub(crate) mod tests {
             "ez-org-runner-1",
             QuarantineReason::Locked422,
         ));
-        save_quarantine(&table).unwrap();
+        save_quarantine_for(None, &table).unwrap();
         let original = std::fs::read_to_string(&_env.path).unwrap();
         assert!(original.contains("runner_name"));
 
@@ -435,7 +457,7 @@ pub(crate) mod tests {
         table.upsert(new);
         let path = _env.path.clone();
         let reader = std::thread::spawn(move || std::fs::read_to_string(&path).unwrap());
-        save_quarantine(&table).unwrap();
+        save_quarantine_for(None, &table).unwrap();
         let seen = reader.join().unwrap();
         // The reader saw either the original or the new file, never a
         // partial mix: the only legal values are `original` or a string
