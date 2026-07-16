@@ -535,6 +535,7 @@ impl Config {
         if self.limits.pids < 1 {
             anyhow::bail!("limits.pids must be at least 1 (got {})", self.limits.pids);
         }
+        require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
         if self.runner.count < 1 {
             anyhow::bail!(
                 "runner.count must be at least 1 (got {})",
@@ -861,6 +862,16 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.limits.pids = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_zero_min_free_disk_gb() {
+        let mut cfg = valid_config();
+        cfg.limits.min_free_disk_gb = 0;
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(format!("{err:#}").contains("limits.min_free_disk_gb must be at least 1"));
     }
 
     #[test]

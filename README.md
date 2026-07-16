@@ -199,10 +199,11 @@ that is the point of composing them.
     LaunchAgent), not as root, not as a system service. Compromise of
     `ezgha` itself cannot escalate to root without an additional exploit.
   - **Disk floor guard** — `ezgha serve` refuses to spawn new runners when
-    either the Docker volume or its outer host filesystem drops below
-    `min_free_disk_gb` (default 10 GB). macOS enforces a 40 GB minimum host
-    floor because a Colima guest can report free space after its sparse disk
-    has exhausted the host APFS volume.
+    either the Docker volume or its outer host filesystem drops below the
+    configured `min_free_disk_gb` (default 10 GB). The outer-host probe is
+    required on macOS because a Colima guest can report free space after its
+    sparse disk has exhausted the host APFS volume; both probes use the same
+    configured floor.
   - **No docker.sock mounted into runners**, no privileged mode, no
     `--cap-add` beyond the defaults.
 - **What it does NOT enforce**: nothing in `ezgha` is a substitute for keeping
@@ -376,7 +377,7 @@ image = "ezgha-runner:latest"   # see "Custom runner image" below
 memory_mb = 4096                # hard cgroup ceiling (swap pinned to same value)
 cpus = 2.0
 pids = 512
-min_free_disk_gb = 10           # daemon + host floor (macOS host minimum: 40)
+min_free_disk_gb = 10           # floor for both daemon and outer-host free space
 
 [policy]
 minimum_isolation = "container" # "vm" = refuse to run jobs unless execution is
@@ -427,12 +428,17 @@ execution proof.
 ### Custom runner image
 
 The default `ghcr.io/actions/actions-runner:latest` image lacks `gh` and `jq`, causing
-workflows that use these tools to fail with exit code 127. Build and use the custom
-image:
+workflows that use these tools to fail with exit code 127. `./install.sh` builds and
+tags the custom image automatically on every run, so this only needs to be done by
+hand after editing `Dockerfile.runner` directly:
 
 ```bash
-docker build -f Dockerfile.runner -t ezgha-runner:latest .
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:latest .
 ```
+
+Use `DOCKER_BUILDKIT=0` (legacy builder) — BuildKit failed a reproducible `apt-get
+install python3-venv` step on a colima/vz host even with `--no-cache`, while the
+legacy builder succeeded immediately (bead jleechan-bl0n).
 
 ### Stale container name-collision fix
 

@@ -24,16 +24,22 @@ The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16
 The config must use `ezgha-runner:latest` (built from `Dockerfile.runner`), NOT the bare `ghcr.io/actions/actions-runner:latest` image.
 The bare upstream image lacks `gh` and `jq`, causing workflows to fail with exit code 127.
 
-To rebuild after changes to Dockerfile.runner:
+**`./install.sh` now builds this image automatically** (added 2026-07-16) whenever `Dockerfile.runner` is present and the docker daemon is reachable — this is the fix for a recurring outage class where VM recreation (disk pressure, `colima delete`, a fresh machine) silently drops the image and the daemon refuses to spawn runners with "could not measure daemon free disk … image missing?".
+
+To rebuild manually after changes to `Dockerfile.runner`:
 ```bash
-docker build -f Dockerfile.runner -t ezgha-runner:latest .
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:latest .
 ```
+Use `DOCKER_BUILDKIT=0` (legacy builder), not the BuildKit default — BuildKit's build-context network path hit a reproducible `python3-venv has no installation candidate` apt failure on this colima/vz setup even with `--no-cache`, while the legacy builder and a plain `docker run ... apt-get install` both succeeded immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully isolated; `DOCKER_BUILDKIT=0` is the proven-reliable path and is what `install.sh` uses.
 
 Then update `~/.config/ezgha/config.toml`:
 ```toml
 [runner]
 image = "ezgha-runner:latest"
 ```
+
+## Reproducibility discipline — no orphaned one-off fixes
+Every fix applied during an incident must land in a **git-tracked** file (`install.sh`, `Dockerfile.runner`, `config/*.toml.example`, this file, README, a `.claude/skills/*` doc, or at minimum a `br` bead with the exact remediation) before the session ends. A fix that exists only as local host state (a manually rebuilt Docker image, a hand-edited `~/Library/LaunchAgents/*.plist`, a one-off `docker build`/`sysctl`/`launchctl` invocation) is **not done** — if this machine were wiped and `./install.sh` re-run on a fresh Mac, every fix from every past incident must reappear automatically. When you fix something live on the host, ask "does `install.sh` (or the daemon/config) reproduce this on a fresh machine?" — if not, encode it there before moving on, not just in a memory file or a bead comment.
 
 ## After any commit (IMPORTANT — Gate 0)
 Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
@@ -47,6 +53,8 @@ Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD
    **EXCEPTION**: if containers are actively draining (dropping over consecutive checks) due to a stuck/slow serve loop — confirmed by low load plus a shrinking container count with a live in-flight `gh api` process as the daemon's child — restart IS the remediation, not the risk. Low load + a draining fleet means the loop is stuck, not busy; waiting only makes it worse. This exact scenario happened 2026-07-07 (an expensive per-tick GitHub API fetch starved `ensure_count`, draining the fleet to 0 containers) — see `queue_monitor::SERVE_LOOP_TIME_BUDGET` for the structural fix that should prevent recurrence.
 4. `systemctl --user restart ezgha.service` — restart daemon
 5. `./docs/verify-exit-criteria.sh` — verify all gates pass
+
+If daemon logs show `could not measure daemon free disk … image missing?` after the restart, the VM lost `ezgha-runner:latest` (common after disk-pressure recreation) — run `./install.sh` (which rebuilds it automatically) or the manual command in "Custom runner image" above, rather than restart-looping.
 
 ## Commit conventions
 Every commit subject must be prefixed with the runtime that produced it:
@@ -104,6 +112,9 @@ Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gate
 ## Safety & Monitoring Principles
 - **Self-Outage Prevention Principle**: A safety, health, or monitoring mechanism must not be able to cause the outage or failure it is designed to guard against.
 - **Blast-Radius & Interaction Review**: Any change to a threshold, health-check, watchdog configuration, restart policy, resource limit, or monitor cadence must be accompanied by an evaluation of its blast radius and interaction with other components. The change description must state the normal peak of the bounded metric and verify a safe remaining margin.
+- **Watchdogs must act, not advise**: A monitor that detects a failure and only logs the remediation command ("manual intervention needed — try X") is a broken guardrail. Detection scripts must either execute their known remediation (with backoff, max-attempts, and a hysteresis marker) or escalate loudly to a surface a human actually watches. The deployed watchdog logging `try 'colima stop --force && colima start'` every 5 minutes for 3+ hours (2026-07-14) while the fleet sat dead is the canonical violation. Bead: jleechan-yib3.
+- **VM/backend lifecycle is deploy-owner-only**: `colima stop/delete`, `limactl stop/delete/factory-reset`, `docker system/image prune`, and `docker context rm/use` are covered by the same single-writer rule as deploy steps 2–5. Enforced for sessions in this repo by `.claude/hooks/vm-lifecycle-guard.sh` (bypass: `EZGHA_DEPLOY_OWNER=1`). Two 2026-07-14 incidents: a read-only verifier subagent ran `colima stop --force` and killed the prod VM mid-recovery (bead jleechan-rvv1); a prune-class action deleted `ezgha-runner:latest` while the fleet was down (in-use images survive a prune, the idle runner image does not — bead jleechan-kobt). A short-timeout `colima start` killed mid-flight also CREATES the "vz driver is running but host agent is not" stale state.
+- **Never quote executable remediation commands in agent-consumed text**: Log messages, error strings, subagent prompts, and verifier claims must describe remediation ("force-stop then restart the VM"), not embed the runnable command — agents execute quoted commands with collateral damage. When a runnable command is genuinely needed in docs, prefix it `OPERATOR-ONLY:`. Applies to daemon log strings too (a `docker system prune` suggestion in an ensure_count error is an image-deletion instruction to any agent chasing disk pressure).
 
 ## Safety rails
 - Never run `git add -A` — stage only files you changed

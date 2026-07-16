@@ -48,7 +48,8 @@ uninstall() {
     ok "launchd agent removed"
   fi
 
-  # Auxiliary units (token-refresh / queue-reaper / watchdog / dashboard) — installed
+  # Auxiliary units (token-refresh / queue-reaper / watchdog / dashboard /
+  # colima-trim) — installed
   # further below in the main flow as ezgha-<name>.timer+.service on Linux
   # and org.jleechanorg.ezgha-<name>.plist on macOS, all pointed at scripts
   # in ~/.local/libexec/ezgha. Uninstall previously disabled only the main
@@ -58,7 +59,7 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard"
+  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard colima-trim"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -273,6 +274,38 @@ else
   ok "installed from ${REPO_URL}"
 fi
 
+# ── Build the custom runner image ──────────────────────────────────────────
+# Every example config ships `image = "ezgha-runner:latest"` (bare
+# ghcr.io/actions/actions-runner:latest lacks gh/jq -> exit 127 in workflows).
+# The image lives only in the Docker/Colima VM's local store, never in git,
+# so a fresh VM (new machine, `colima delete && colima start`, disk-pressure
+# recreation) has no way to get it back except this step. Idempotent: a
+# no-op rebuild of an unchanged Dockerfile.runner is a fast cache hit.
+if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" docker version >/dev/null 2>&1; then
+  info "Building ezgha-runner:latest from Dockerfile.runner"
+  # DOCKER_BUILDKIT=0 (legacy builder): BuildKit's build-context network path
+  # hit a reproducible "python3-venv has no installation candidate" apt
+  # failure on this colima/vz setup even with --no-cache, while the legacy
+  # builder and a plain `docker run ... apt-get install` both succeeded
+  # immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully
+  # isolated; defaulting to the legacy builder here is the proven-reliable path.
+  if DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" DOCKER_BUILDKIT=0 \
+      docker build -f "${SCRIPT_DIR}/Dockerfile.runner" -t ezgha-runner:latest "${SCRIPT_DIR}" \
+      >/tmp/ezgha-runner-build.log 2>&1; then
+    ok "ezgha-runner:latest built"
+  else
+    bad "ezgha-runner:latest build failed — see /tmp/ezgha-runner-build.log (daemon will refuse to spawn runners without this image)"
+    missing=1
+  fi
+else
+  info "Docker daemon unreachable or Dockerfile.runner missing — skipping runner image build (fix docker reachability above, then re-run ./install.sh)"
+fi
+
+if [ "${missing}" -ne 0 ]; then
+  bad "Fix the items above, then re-run ./install.sh"
+  exit 1
+fi
+
 CARGO_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin"
 case ":${PATH}:" in
   *":${CARGO_BIN}:"*) : ;;
@@ -333,13 +366,14 @@ if [ -f "${CONFIG_PATH}" ]; then
   fi
 fi
 
-# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, dashboard) ─
-# These units keep the ezgha fleet observable and healthy between deploys:
+# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, dashboard, colima-trim) ─
+# These auxiliary units keep the ezgha fleet observable and healthy between deploys:
 #   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
 #   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
 #   - runner-dashboard:      publishes aggregate fleet health from the Mac host
+#   - colima-trim:           guards Colima VM disk trim to prevent runaway growth
 #
 # Scripts are NEVER exec'd from this repo/worktree checkout: they are copied
 # (install -m 0755) to the stable user-scope location ~/.local/libexec/ezgha/
@@ -425,12 +459,23 @@ PLIST
         rm -f "${plist}"
         return 1
       fi
-      launchctl load -w "${plist}" 2>/dev/null || true
+      if ! launchctl load -w "${plist}"; then
+        bad "launchctl failed to load ${plist}"
+        rm -f "${plist}"
+        return 1
+      fi
+      if ! launchctl print "gui/$(id -u)/org.jleechanorg.ezgha-${name}" >/dev/null; then
+        bad "launchctl did not register org.jleechanorg.ezgha-${name}"
+        launchctl unload "${plist}" 2>/dev/null || true
+        rm -f "${plist}"
+        return 1
+      fi
       ok "macOS plist installed: ${name} (every ${interval_sec}s)"
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
+    install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do

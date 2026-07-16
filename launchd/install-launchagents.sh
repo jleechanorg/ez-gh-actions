@@ -247,6 +247,20 @@ PY
         fi
         exit "$rc"
       }
+      if ! launchctl print "gui/$(id -u)/${label}" >/dev/null; then
+        echo "ERROR: launchctl did not register ${label}" >&2
+        if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
+          exit 1
+        fi
+        launchctl unload "$dest" 2>/dev/null || true
+        rm -f "$dest"
+        if [[ "$had_prior" -eq 1 ]]; then
+          mv "$backup" "$dest"
+          launchctl load "$dest" || \
+            echo "ERROR: restored prior plist but could not reload it: $dest" >&2
+        fi
+        exit 1
+      fi
       rm -f "$backup"
       if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
         commit_dashboard_install

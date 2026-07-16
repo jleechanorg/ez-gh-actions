@@ -31,6 +31,10 @@ jobs:
           bash tests/watchdog_reboot_stale_state_test.sh
           bash tests/install_watchdog_gate_test.sh
           bash tests/install_uninstall_aux_units_test.sh
+      - name: Mac trim guard shell regressions
+        run: |
+          bash tests/colima_trim_guard_test.sh
+          bash tests/install_colima_trim_agent_test.sh
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Format
