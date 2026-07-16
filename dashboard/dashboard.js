@@ -3,7 +3,7 @@
 
   const STALE_AFTER_MS = 20 * 60 * 1000;
   const SOURCE_KEYS = ['linux_host', 'mac_host'];
-  const EXPECTED_CONFIGURED = { mac: 6, linux: 16 };
+  const EXPECTED_CONFIGURED = { mac: 6, linux: 10 };
   const FLEET_KEYS = [
     'configured',
     'executing',
@@ -215,7 +215,7 @@
       state: 'live',
       kicker: 'LOCAL CAPACITY SNAPSHOT',
       detail:
-        'Local capacity probes report 6 Mac and 16 Linux slots executing. Queue health is not measured by this dashboard.',
+        'Local capacity probes report 6 Mac and 10 Linux slots executing. Queue health is not measured by this dashboard.',
     };
   }
 

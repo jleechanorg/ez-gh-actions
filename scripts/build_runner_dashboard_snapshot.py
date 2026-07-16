@@ -9,7 +9,7 @@ from pathlib import Path
 
 SOURCE_KEYS = ("config", "service", "docker", "process_probe", "disk", "watchdog_state")
 FLEET_KEYS = ("configured", "executing", "idle", "cycling", "down", "reserved")
-EXPECTED_CONFIGURED = {"mac": 6, "linux": 16}
+EXPECTED_CONFIGURED = {"mac": 6, "linux": 10}
 
 
 def _load_object(path):

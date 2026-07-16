@@ -258,11 +258,14 @@ if [[ "$CONFIG_OK" == true ]]; then
   HOST_DISK_FLOOR_GB="$DISK_FLOOR_GB"
   if [[ "$(uname -s)" == "Darwin" ]]; then
     HOST_DISK_PATH="/System/Volumes/Data"
-    if (( HOST_DISK_FLOOR_GB < 40 )); then
-      # Keep this synchronized with MACOS_HOST_DISK_FLOOR_GB in
-      # src/docker_backend.rs; the contract test fails if either value drifts.
-      HOST_DISK_FLOOR_GB=40
-    fi
+    # No Mac-specific floor bump here: src/docker_backend.rs removed the
+    # hardcoded 40GB Mac host floor (see commit f388a8b, "honor configured
+    # Mac disk floor") after it flapped the fleet all day 2026-07-14 — the
+    # 926GB Mac host's steady-state free space (35-46GB) sits inside a 40GB
+    # floor. The configured limits.min_free_disk_gb is the sole admission
+    # floor on every platform now; 40GB survives only as a warning-only
+    # pressure-alert threshold (MACOS_HOST_DISK_PRESSURE_ALERT_GB) that does
+    # not gate admission and this dashboard does not need to mirror.
   fi
   DAEMON_DISK_CONTAINER=""
   if [[ "$DOCKER_OK" == true ]]; then

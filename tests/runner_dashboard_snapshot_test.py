@@ -46,7 +46,7 @@ class SnapshotTest(unittest.TestCase):
     def test_exact_public_contract(self):
         snapshot = MODULE.build_snapshot(
             mac_payload=host_payload("mac", 6),
-            linux_payload=host_payload("linux", 16),
+            linux_payload=host_payload("linux", 10),
             observed_at="2026-07-14T20:00:00Z",
             published_at="2026-07-14T20:00:05Z",
         )
@@ -54,14 +54,29 @@ class SnapshotTest(unittest.TestCase):
             "mac_host": {"ok": True},
             "linux_host": {"ok": True},
         })
-        self.assertEqual(snapshot["fleets"]["linux"]["fleet"]["configured"], 16)
+        self.assertEqual(snapshot["fleets"]["linux"]["fleet"]["configured"], 10)
         serialized = json.dumps(snapshot)
         self.assertNotIn("must-not-publish", serialized)
         self.assertNotIn("secret_host", serialized)
         self.assertNotIn("raw", serialized)
 
+    def test_healthy_ten_configured_linux_fleet_is_ok(self):
+        # Regression for the EXPECTED_CONFIGURED["linux"] drift: the constant
+        # previously hardcoded 16 while the real jeff-ubuntu fleet config is
+        # 10, so a perfectly healthy 10/10 linux fleet was permanently
+        # reported STALE/UNKNOWN. This fixture is independent of the module's
+        # own EXPECTED_CONFIGURED so it can't silently re-mask a future drift.
+        snapshot = MODULE.build_snapshot(
+            mac_payload=host_payload("mac", 6),
+            linux_payload=host_payload("linux", 10),
+            observed_at="2026-07-14T20:00:00Z",
+            published_at="2026-07-14T20:00:05Z",
+        )
+        self.assertTrue(snapshot["sources"]["linux_host"]["ok"])
+        self.assertEqual(snapshot["fleets"]["linux"]["fleet"]["configured"], 10)
+
     def test_inconsistent_slot_sum_fails_closed(self):
-        linux = host_payload("linux", 16)
+        linux = host_payload("linux", 10)
         linux["fleet"]["down"] = 1
         snapshot = MODULE.build_snapshot(
             mac_payload=host_payload("mac", 6),
@@ -72,10 +87,10 @@ class SnapshotTest(unittest.TestCase):
         self.assertFalse(snapshot["sources"]["linux_host"]["ok"])
 
     def test_underconfigured_host_fails_closed(self):
-        for host_class, configured in (("mac", 5), ("linux", 15)):
+        for host_class, configured in (("mac", 5), ("linux", 9)):
             payloads = {
                 "mac": host_payload("mac", 6),
-                "linux": host_payload("linux", 16),
+                "linux": host_payload("linux", 10),
             }
             payloads[host_class] = host_payload(host_class, configured)
             snapshot = MODULE.build_snapshot(
@@ -93,7 +108,7 @@ class SnapshotTest(unittest.TestCase):
         mac["disk"]["status"] = "unknown"
         snapshot = MODULE.build_snapshot(
             mac_payload=mac,
-            linux_payload=host_payload("linux", 16),
+            linux_payload=host_payload("linux", 10),
             observed_at="2026-07-14T20:00:00Z",
             published_at="2026-07-14T20:00:05Z",
         )
@@ -105,7 +120,7 @@ class SnapshotTest(unittest.TestCase):
         mac["watchdog"] = {"consecutive_misses": None, "restart_after": None}
         snapshot = MODULE.build_snapshot(
             mac_payload=mac,
-            linux_payload=host_payload("linux", 16),
+            linux_payload=host_payload("linux", 10),
             observed_at="2026-07-14T20:00:00Z",
             published_at="2026-07-14T20:00:05Z",
         )
@@ -118,7 +133,7 @@ class SnapshotTest(unittest.TestCase):
         )
 
     def test_dynamic_watchdog_threshold_is_preserved(self):
-        linux = host_payload("linux", 16)
+        linux = host_payload("linux", 10)
         linux["watchdog"] = {"consecutive_misses": 4, "restart_after": 5}
         snapshot = MODULE.build_snapshot(
             mac_payload=host_payload("mac", 6),
@@ -139,7 +154,7 @@ class SnapshotTest(unittest.TestCase):
             linux = root / "linux.json"
             output = root / "status.json"
             mac.write_text(json.dumps(host_payload("mac", 6)))
-            linux.write_text(json.dumps(host_payload("linux", 16)))
+            linux.write_text(json.dumps(host_payload("linux", 10)))
             args = [
                 str(MODULE_PATH),
                 "--mac-host", str(mac),

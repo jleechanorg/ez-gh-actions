@@ -17,7 +17,7 @@ EOF
   chmod +x "$path"
 }
 write_probe "$PROBES/mac.sh" mac 6 5
-write_probe "$PROBES/linux.sh" linux 16 15
+write_probe "$PROBES/linux.sh" linux 10 9
 
 SITE="$WORK/site"
 EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \

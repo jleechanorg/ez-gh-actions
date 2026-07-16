@@ -40,7 +40,7 @@ const HEALTHY = {
   published_at: '2026-07-14T22:29:00Z',
   observed_at: '2026-07-14T22:28:00Z',
   sources: { mac_host: { ok: true }, linux_host: { ok: true } },
-  fleets: { mac: host(6), linux: host(16) },
+  fleets: { mac: host(6), linux: host(10) },
 };
 
 test('freshness fails closed after 20 minutes and for future clocks', () => {
@@ -230,6 +230,6 @@ test('repeated refresh does not re-announce unchanged state', () => {
   render(HEALTHY, NOW);
   render(structuredClone(HEALTHY), NOW);
   assert.equal(writes, 1);
-  assert.equal(elements.get('linux-target').textContent, '16');
+  assert.equal(elements.get('linux-target').textContent, '10');
   delete globalThis.document;
 });

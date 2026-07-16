@@ -167,8 +167,31 @@ assert payload["sources"]["disk"]["ok"] is True
 assert payload["disk"] == {"status": "critical"}
 PY
 
+# No Mac-specific 40GB floor bump: min_free_disk_gb (1 GB in this fixture's
+# config.toml) is the sole admission floor on every platform, matching
+# src/docker_backend.rs commit f388a8b ("honor configured Mac disk floor") —
+# a hardcoded 40GB Mac floor previously flapped the fleet all day 2026-07-14
+# because it sat inside the 926GB Mac host's normal 35-46GB free range.
+# 39GB free is comfortably above the configured 1GB floor, so this must
+# report healthy, not critical.
 STUB_UNAME=Darwin STUB_LAUNCHCTL_LIST='123 0 org.jleechanorg.ezgha' \
   STUB_HOST_FREE_KB=$((39 * 1024 * 1024)) PATH="$BIN:$PATH" HOME="$HOME_T" \
+  EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/host-disk-healthy-above-configured-floor.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+payload = json.loads((Path(os.environ["WORK"]) / "host-disk-healthy-above-configured-floor.json").read_text())
+assert payload["sources"]["disk"]["ok"] is True
+assert payload["disk"] == {"status": "healthy"}
+PY
+
+# A Mac host below the *configured* floor (not a hardcoded Mac-only value)
+# must still report critical.
+STUB_UNAME=Darwin STUB_LAUNCHCTL_LIST='123 0 org.jleechanorg.ezgha' \
+  STUB_HOST_FREE_KB=1 PATH="$BIN:$PATH" HOME="$HOME_T" \
   EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
   bash "$PROBE" --host-class mac > "$WORK/host-disk-critical.json"
 WORK="$WORK" python3 - <<'PY'
@@ -180,8 +203,6 @@ payload = json.loads((Path(os.environ["WORK"]) / "host-disk-critical.json").read
 assert payload["sources"]["disk"]["ok"] is True
 assert payload["disk"] == {"status": "critical"}
 PY
-grep -Fq 'const MACOS_HOST_DISK_FLOOR_GB: u64 = 40;' "$ROOT/src/docker_backend.rs"
-grep -Fq 'HOST_DISK_FLOOR_GB=40' "$PROBE"
 
 STUB_HOST_DF_FAIL=1 PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
   bash "$PROBE" --host-class linux > "$WORK/host-disk-unknown.json"
