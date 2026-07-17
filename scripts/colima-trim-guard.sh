@@ -7,31 +7,43 @@ set -euo pipefail
 PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin"
 export PATH
 
-if [[ "${1:-}" != "--bounded" ]]; then
-  if [[ -n "${EZGHA_TIMEOUT_BIN+x}" ]]; then
-    timeout_bin="${EZGHA_TIMEOUT_BIN}"
-  else
-    timeout_bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
-  fi
-  if [[ -z "${timeout_bin}" || ! -x "${timeout_bin}" ]]; then
-    echo "colima-trim-guard: timeout/gtimeout unavailable; refusing an unbounded run" >&2
-    exit 1
-  fi
-  exec "${timeout_bin}" --signal=TERM --kill-after=5 55 "$0" --bounded
-fi
-
 STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/ezgha"
 LOG_PATH="${EZGHA_LOG_PATH:-${STATE_DIR}/colima-trim.jsonl}"
 LOCK_FILE="${STATE_DIR}/colima-trim.lock"
 COOLDOWN_FILE="${STATE_DIR}/colima-trim.last-attempt"
+mkdir -p "${STATE_DIR}"
+
+if [[ -n "${EZGHA_TIMEOUT_BIN+x}" ]]; then
+  timeout_bin="${EZGHA_TIMEOUT_BIN}"
+else
+  timeout_bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+fi
+if [[ -z "${timeout_bin}" || ! -x "${timeout_bin}" ]]; then
+  echo "colima-trim-guard: timeout/gtimeout unavailable; refusing an unbounded run" >&2
+  exit 1
+fi
+if [[ "${1:-}" != "--bounded" ]]; then
+  if "${timeout_bin}" --signal=TERM --kill-after=5 75 "$0" --bounded; then
+    exit 0
+  else
+    rc=$?
+    if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+      timeout_epoch="$(date +%s)"
+      printf '%s timeout\n' "${timeout_epoch}" > "${COOLDOWN_FILE}"
+      printf '{"timestamp_epoch":%s,"event":"outer_timeout","exit_code":%s,"timeout_seconds":75}\n' \
+        "${timeout_epoch}" "${rc}" >> "${LOG_PATH}"
+    fi
+    exit "${rc}"
+  fi
+fi
+
 MAIN_PLIST="${EZGHA_MAIN_PLIST:-${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist}"
 PLISTBUDDY_BIN="${EZGHA_PLISTBUDDY_BIN:-/usr/libexec/PlistBuddy}"
 HOST_TRIGGER_KIB=$((40 * 1024 * 1024))
 EMERGENCY_BYPASS_KIB=$((30 * 1024 * 1024))
 MIN_RECLAIM_KIB=$((1024 * 1024))
 COOLDOWN_SECONDS=900
-
-mkdir -p "${STATE_DIR}"
+FAILURE_BACKOFF_SECONDS=120
 
 log_skip() {
   local reason="$1" profile="${2:-unknown}" host_free="${3:-0}" estimate="${4:-0}"
@@ -46,6 +58,26 @@ is_uint() {
   esac
 }
 
+run_stage() {
+  local stage="$1" duration="$2" rc
+  shift 2
+  printf '{"timestamp_epoch":%s,"event":"stage_started","stage":"%s","timeout_seconds":%s}\n' \
+    "${NOW_EPOCH}" "${stage}" "${duration}" >> "${LOG_PATH}"
+  "${timeout_bin}" --signal=TERM --kill-after=2 "${duration}" "$@"
+  rc=$?
+  if (( rc == 0 )); then
+    printf '{"timestamp_epoch":%s,"event":"stage_completed","stage":"%s"}\n' \
+      "${NOW_EPOCH}" "${stage}" >> "${LOG_PATH}"
+  else
+    printf '{"timestamp_epoch":%s,"event":"stage_failed","stage":"%s","exit_code":%s}\n' \
+      "${NOW_EPOCH}" "${stage}" "${rc}" >> "${LOG_PATH}"
+    if [[ "${rc}" == "124" || "${rc}" == "137" ]]; then
+      printf '%s timeout\n' "${NOW_EPOCH}" > "${COOLDOWN_FILE}"
+    fi
+  fi
+  return "${rc}"
+}
+
 NOW_EPOCH="${EZGHA_NOW_EPOCH:-$(date +%s)}"
 if [[ "$(uname -s)" != "Darwin" ]]; then
   log_skip "not_macos"
@@ -57,9 +89,41 @@ if [[ -z "${shlock_bin}" ]]; then
   log_skip "singleton_primitive_unavailable"
   exit 0
 fi
-if ! "${shlock_bin}" -f "${LOCK_FILE}" -p "$$"; then
-  log_skip "singleton_locked"
-  exit 0
+if "${shlock_bin}" -f "${LOCK_FILE}" -p "$$"; then
+  :
+else
+  if [[ ! -f "${LOCK_FILE}" || -L "${LOCK_FILE}" ]]; then
+    log_skip "singleton_lock_ambiguous"
+    exit 0
+  fi
+  lock_pid="$(head -n 1 "${LOCK_FILE}" 2>/dev/null || true)"
+  if ! is_uint "${lock_pid}"; then
+    log_skip "singleton_lock_ambiguous"
+    exit 0
+  fi
+  recovery_reason="dead_pid"
+  if kill -0 "${lock_pid}" 2>/dev/null; then
+    ps_bin="${EZGHA_PS_BIN:-/bin/ps}"
+    owner_command="$(${ps_bin} -ww -p "${lock_pid}" -o command= 2>/dev/null || true)"
+    case "${owner_command}" in
+      *"${0##*/}"*"--bounded"*)
+        log_skip "singleton_locked"
+        exit 0
+        ;;
+      "")
+        log_skip "singleton_lock_ambiguous"
+        exit 0
+        ;;
+      *) recovery_reason="pid_reused" ;;
+    esac
+  fi
+  rm -f "${LOCK_FILE}"
+  printf '{"timestamp_epoch":%s,"event":"stale_lock_recovered","reason":"%s","previous_pid":%s}\n' \
+    "${NOW_EPOCH}" "${recovery_reason}" "${lock_pid}" >> "${LOG_PATH}"
+  if ! "${shlock_bin}" -f "${LOCK_FILE}" -p "$$"; then
+    log_skip "singleton_locked"
+    exit 0
+  fi
 fi
 trap 'rm -f "${LOCK_FILE}"' EXIT
 
@@ -109,6 +173,12 @@ fi
 
 if [[ -f "${COOLDOWN_FILE}" ]]; then
   read -r last_attempt last_result < "${COOLDOWN_FILE}" || true
+  if is_uint "${last_attempt}" && \
+      [[ "${last_result:-attempt}" != "success" ]] && \
+      (( NOW_EPOCH - last_attempt < FAILURE_BACKOFF_SECONDS )); then
+    log_skip "failure_backoff_active" "${profile}" "${host_free_kib}"
+    exit 0
+  fi
   if is_uint "${last_attempt}" && (( NOW_EPOCH - last_attempt < COOLDOWN_SECONDS )); then
     if [[ "${last_result:-attempt}" == "success" && host_free_kib -ge EMERGENCY_BYPASS_KIB ]]; then
       log_skip "cooldown_active" "${profile}" "${host_free_kib}"
@@ -126,7 +196,7 @@ if [[ -z "${colima_bin}" ]]; then
   log_skip "colima_unavailable" "${profile}" "${host_free_kib}"
   exit 0
 fi
-if ! status_json="$(${colima_bin} status --profile "${profile}" --json 2>/dev/null)"; then
+if ! status_json="$(run_stage colima_status 10 "${colima_bin}" status --profile "${profile}" --json 2>/dev/null)"; then
   log_skip "profile_not_running" "${profile}" "${host_free_kib}"
   exit 0
 fi
@@ -148,7 +218,7 @@ root_discard=$(lsblk -bndo DISC-MAX "$root_dev" | head -n 1)
 [ -n "$root_discard" ] && [ "$root_discard" != 0 ]
 printf "DATA_USED_KIB=%s\n" "$(df -kP /mnt/lima-colima | awk '\''NR == 2 {print $3}'\'')"
 printf "ROOT_USED_KIB=%s\n" "$(df -kP / | awk '\''NR == 2 {print $3}'\'')"'
-probe="$(${colima_bin} ssh --profile "${profile}" -- sh -c "${probe_script}" 2>/dev/null || true)"
+probe="$(run_stage guest_probe 15 "${colima_bin}" ssh --profile "${profile}" -- sh -c "${probe_script}" 2>/dev/null || true)"
 data_used_kib="$(awk -F= '$1 == "DATA_USED_KIB" {print $2}' <<<"${probe}")"
 root_used_kib="$(awk -F= '$1 == "ROOT_USED_KIB" {print $2}' <<<"${probe}")"
 if ! is_uint "${data_used_kib}" || ! is_uint "${root_used_kib}"; then
@@ -185,7 +255,8 @@ printf '{"timestamp_epoch":%s,"event":"trim_started","profile":"%s","host_free_b
   "${data_used_kib}" "${root_used_kib}" "${estimated_reclaimable_kib}" >> "${LOG_PATH}"
 
 trim_script='set -eu; sudo fstrim --verbose /mnt/lima-colima; sudo fstrim --verbose /'
-if ! ${colima_bin} ssh --profile "${profile}" -- sh -c "${trim_script}" >/dev/null; then
+if ! run_stage guest_trim 30 "${colima_bin}" ssh --profile "${profile}" -- sh -c "${trim_script}" >/dev/null; then
+  printf '%s failed\n' "${NOW_EPOCH}" > "${COOLDOWN_FILE}"
   printf '{"timestamp_epoch":%s,"event":"trim_failed","profile":"%s","host_free_before_kib":%s,"estimated_reclaimable_kib":%s}\n' \
     "${NOW_EPOCH}" "${profile}" "${host_free_kib}" "${estimated_reclaimable_kib}" >> "${LOG_PATH}"
   exit 1

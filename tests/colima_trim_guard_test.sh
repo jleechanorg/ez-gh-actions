@@ -47,7 +47,11 @@ printf '%s\n' "$*" >> "${STUB_TIMEOUT_LOG:?}"
 while [[ "$1" == --* ]]; do
   if [[ "$1" == "--kill-after" ]]; then shift 2; else shift; fi
 done
-[[ "$1" == "55" ]] && shift
+duration="$1"
+shift
+if [[ "${STUB_TIMEOUT_FAIL_SECONDS:-}" == "${duration}" ]]; then
+  exit 124
+fi
 exec "$@"
 EOF
 cat > "${STUB_BIN}/shlock" <<'EOF'
@@ -61,6 +65,21 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -e "${lock_file}" ]] && exit 1
 printf '%s\n' "$$" > "${lock_file}"
+EOF
+cat > "${STUB_BIN}/ps" <<'EOF'
+#!/usr/bin/env bash
+pid=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p) pid="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [[ -n "${STUB_ACTIVE_LOCK_PID:-}" && "${pid}" == "${STUB_ACTIVE_LOCK_PID}" ]]; then
+  printf '/bin/bash %s --bounded\n' "${STUB_GUARD_PATH:?}"
+else
+  printf '/usr/bin/unrelated-process\n'
+fi
 EOF
 cat > "${STUB_BIN}/PlistBuddy" <<'EOF'
 #!/usr/bin/env bash
@@ -112,7 +131,9 @@ chmod +x "${STUB_BIN}"/*
 export HOME="${HOME_T}"
 export PATH="${STUB_BIN}:/usr/bin:/bin"
 export EZGHA_PLISTBUDDY_BIN="${STUB_BIN}/PlistBuddy"
+export EZGHA_PS_BIN="${STUB_BIN}/ps"
 export EZGHA_MAIN_PLIST="${HOME_T}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
+export STUB_GUARD_PATH="${GUARD}"
 export EZGHA_NOW_EPOCH=2000
 export STUB_DOCKER_HOST="unix://${HOME_T}/.colima/default/docker.sock"
 export STUB_HOST_FREE_BEFORE_KIB=$((39 * 1024 * 1024))
@@ -149,8 +170,12 @@ grep -Fq '"event":"trim_complete"' "${EZGHA_LOG_PATH}" || fail "structured compl
 grep -Fq '"host_free_before_kib":40894464' "${EZGHA_LOG_PATH}" || fail "before value missing from log"
 grep -Fq '"host_free_after_kib":47185920' "${EZGHA_LOG_PATH}" || fail "after value missing from log"
 pass "39 GiB host pressure with conservative estimate >=1 GiB trims fixed mounts and logs before/after"
-grep -Fq -- '--signal=TERM --kill-after=5 55' "${STUB_TIMEOUT_LOG}" || fail "TERM+KILL budget was not bounded at 60 seconds"
-pass "the whole controller is bounded by a 60-second supervisor"
+grep -Fq -- '--signal=TERM --kill-after=5 75' "${STUB_TIMEOUT_LOG}" || fail "outer supervisor lacked headroom above stage ceilings"
+pass "the whole controller is bounded with headroom above stage ceilings"
+grep -Fq -- '--signal=TERM --kill-after=2 10' "${STUB_TIMEOUT_LOG}" || fail "Colima status lacked its own timeout"
+grep -Fq -- '--signal=TERM --kill-after=2 15' "${STUB_TIMEOUT_LOG}" || fail "guest probe lacked its own timeout"
+grep -Fq -- '--signal=TERM --kill-after=2 30' "${STUB_TIMEOUT_LOG}" || fail "guest trim lacked its own timeout"
+pass "each external Colima stage has a diagnostic timeout below the supervisor ceiling"
 
 reset_case floor
 STUB_HOST_FREE_BEFORE_KIB=$((40 * 1024 * 1024)) "${GUARD}"
@@ -186,11 +211,64 @@ grep -Fq '"reason":"profile_socket_mismatch"' "${EZGHA_LOG_PATH}" || fail "statu
 pass "running-profile status must report the persisted Docker socket"
 
 reset_case singleton
-mkdir -p "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
-"${GUARD}"
+mkdir -p "${XDG_STATE_HOME}/ezgha"
+printf '%s\n' "$$" > "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
+STUB_ACTIVE_LOCK_PID="$$" "${GUARD}"
 [[ ! -s "${STUB_COLIMA_LOG}" ]] || fail "singleton-locked run reached Colima"
 grep -Fq '"reason":"singleton_locked"' "${EZGHA_LOG_PATH}" || fail "singleton rejection missing"
 pass "atomic singleton lock suppresses overlapping runs"
+
+reset_case stale-singleton
+mkdir -p "${XDG_STATE_HOME}/ezgha"
+printf '%s\n' '99999999' > "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
+"${GUARD}"
+grep -Fq '"event":"stale_lock_recovered"' "${EZGHA_LOG_PATH}" || fail "dead-PID lock recovery was not logged"
+grep -Fq '"event":"trim_complete"' "${EZGHA_LOG_PATH}" || fail "dead-PID lock prevented the eligible trim"
+[[ ! -e "${XDG_STATE_HOME}/ezgha/colima-trim.lock" ]] || fail "recovered singleton lock remained after exit"
+pass "a dead-PID shlock file is recovered before singleton acquisition"
+
+reset_case reused-singleton
+mkdir -p "${XDG_STATE_HOME}/ezgha"
+printf '%s\n' "$$" > "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
+"${GUARD}"
+grep -Fq '"event":"stale_lock_recovered","reason":"pid_reused"' "${EZGHA_LOG_PATH}" || fail "reused PID lock recovery was not logged"
+grep -Fq '"event":"trim_complete"' "${EZGHA_LOG_PATH}" || fail "unrelated reused PID prevented trim"
+pass "a live unrelated PID cannot wedge the singleton forever"
+
+reset_case status-timeout
+STUB_TIMEOUT_FAIL_SECONDS=10 "${GUARD}"
+grep -Fq '"event":"stage_failed","stage":"colima_status","exit_code":124' "${EZGHA_LOG_PATH}" || fail "status timeout lacked stage evidence"
+grep -Fq '"reason":"profile_not_running"' "${EZGHA_LOG_PATH}" || fail "status timeout did not fail closed"
+! grep -q fstrim "${STUB_COLIMA_LOG}" || fail "status timeout reached trim"
+pass "a hung status probe is bounded and names the failed stage"
+
+STUB_HOST_FREE_AFTER_KIB=$((39 * 1024 * 1024)) EZGHA_NOW_EPOCH=2060 "${GUARD}"
+grep -Fq '"reason":"failure_backoff_active"' "${EZGHA_LOG_PATH}" || fail "timed-out status probe immediately retried"
+pass "a timed-out stage backs off the next launchd poll"
+
+reset_case probe-timeout
+STUB_TIMEOUT_FAIL_SECONDS=15 "${GUARD}"
+grep -Fq '"event":"stage_failed","stage":"guest_probe","exit_code":124' "${EZGHA_LOG_PATH}" || fail "guest probe timeout lacked stage evidence"
+grep -Fq '"reason":"guest_mount_or_discard_probe_failed"' "${EZGHA_LOG_PATH}" || fail "guest probe timeout did not fail closed"
+! grep -q fstrim "${STUB_COLIMA_LOG}" || fail "guest probe timeout reached trim"
+pass "a hung guest probe is bounded and named"
+
+reset_case trim-timeout
+if STUB_TIMEOUT_FAIL_SECONDS=30 "${GUARD}"; then
+  fail "timed-out trim returned success"
+fi
+grep -Fq '"event":"stage_failed","stage":"guest_trim","exit_code":124' "${EZGHA_LOG_PATH}" || fail "trim timeout lacked stage evidence"
+grep -Fq '"event":"trim_failed"' "${EZGHA_LOG_PATH}" || fail "trim timeout lacked terminal failure evidence"
+grep -Fq 'failed' "${XDG_STATE_HOME}/ezgha/colima-trim.last-attempt" || fail "trim timeout did not persist failure backoff"
+pass "a hung trim is bounded, named, and backoff-gated"
+
+reset_case outer-timeout
+if STUB_TIMEOUT_FAIL_SECONDS=75 "${GUARD}"; then
+  fail "outer timeout returned success"
+fi
+grep -Fq '"event":"outer_timeout","exit_code":124,"timeout_seconds":75' "${EZGHA_LOG_PATH}" || fail "outer timeout lacked structured evidence"
+grep -Fq 'timeout' "${XDG_STATE_HOME}/ezgha/colima-trim.last-attempt" || fail "outer timeout did not persist backoff state"
+pass "the outer supervisor records timeout evidence and backoff state"
 
 reset_case cooldown
 STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"
@@ -211,9 +289,12 @@ if STUB_TRIM_FAIL=1 STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"; t
   fail "stubbed trim failure returned success"
 fi
 STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) EZGHA_NOW_EPOCH=2100 "${GUARD}"
+grep -Fq '"reason":"failure_backoff_active"' "${EZGHA_LOG_PATH}" || fail "failed attempt retried inside failure backoff"
+[[ "$(grep -c fstrim "${STUB_COLIMA_LOG}")" -eq 1 ]] || fail "failed attempt retried too soon"
+STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) EZGHA_NOW_EPOCH=2120 "${GUARD}"
 grep -Fq '"reason":"previous_attempt_retry"' "${EZGHA_LOG_PATH}" || fail "failed attempt was not retryable"
 [[ "$(grep -c fstrim "${STUB_COLIMA_LOG}")" -eq 2 ]] || fail "real failed attempt was not retried"
-pass "a prior failed attempt is retryable on the next poll"
+pass "a prior failed attempt retries after the bounded failure backoff"
 
 reset_case no-timeout
 if EZGHA_TIMEOUT_BIN="${WORK}/missing-timeout" "${GUARD}" 2>/dev/null; then
