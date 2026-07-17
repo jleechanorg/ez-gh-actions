@@ -3014,6 +3014,21 @@ mod tests {
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+            // Redirect the quarantine table into the test's temp dir.
+            // Without this, tests whose cfg has no state_dir fall through
+            // to the REAL global XDG path (~/.config/ezgha/
+            // quarantined_slots.toml): they read production quarantine
+            // state (a host whose global file quarantines slot 1 makes
+            // next_slot return 2 and every slot-allocation test fail) and
+            // WRITE fixture entries into the production file — both
+            // observed live on the MacBook, 2026-07-16. Safety: TEST_LOCK
+            // serializes every TestEnv test, so a process-wide env var is
+            // race-free here.
+            let qpath = path
+                .parent()
+                .map(|p| p.join("quarantined_slots.toml"))
+                .unwrap_or_else(|| PathBuf::from("quarantined_slots.toml"));
+            std::env::set_var("EZGHA_QUARANTINE_PATH", &qpath);
             Self { _lock: lock, path }
         }
     }
@@ -3033,6 +3048,9 @@ mod tests {
             // Drop the cpu-probe test seam so the next test sees a clean
             // override state instead of a value leaked from this test.
             cpu_probe_overrides::set(None);
+            // Clear the quarantine redirect set in new() (TEST_LOCK is
+            // still held here, so no other test can observe the gap).
+            std::env::remove_var("EZGHA_QUARANTINE_PATH");
             let _ = std::fs::remove_file(&self.path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
@@ -3416,13 +3434,23 @@ minimum_isolation = "container"
 
     #[test]
     fn state_dir_isolates_quarantine_between_configs() {
-        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // Hold quarantine's own test lock too: this test reads/writes
+        // LOCK ORDER: quarantine lock FIRST, then TEST_LOCK — matching the
+        // 422-family tests (quarantine::tests::TestEnv::new acquires the
+        // quarantine lock, then quarantine_test_setup acquires TEST_LOCK).
+        // The previous order here (TEST_LOCK → quarantine lock) was the
+        // other half of an AB-BA inversion that deadlocked the whole suite
+        // in parallel runs: this test held TEST_LOCK waiting for the
+        // quarantine lock while a 422-family test held the quarantine lock
+        // waiting for TEST_LOCK (observed live 2026-07-16, `cargo test`
+        // hung >5min; serial `--test-threads=1` passed 312/312).
+        //
+        // The quarantine lock is held because this test reads/writes
         // TEST_QUARANTINE_PATH directly (to prove cfg.state_dir-based
         // resolution), and that static is checked before cfg.state_dir in
-        // quarantine_path_for — without this lock a concurrently-running
+        // quarantine_path_for — without it a concurrently-running
         // TestEnv-based quarantine test could clobber it mid-flight.
         let _qlock = crate::quarantine::tests::test_lock();
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *TEST_SLOT_PATH.lock().unwrap() = None;
         *crate::quarantine::TEST_QUARANTINE_PATH.lock().unwrap() = None;
         let base = env::temp_dir().join(format!(
