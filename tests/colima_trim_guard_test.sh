@@ -47,7 +47,11 @@ printf '%s\n' "$*" >> "${STUB_TIMEOUT_LOG:?}"
 while [[ "$1" == --* ]]; do
   if [[ "$1" == "--kill-after" ]]; then shift 2; else shift; fi
 done
-[[ "$1" == "55" ]] && shift
+duration="$1"
+shift
+if [[ "${STUB_TIMEOUT_FAIL_SECONDS:-}" == "${duration}" ]]; then
+  exit 124
+fi
 exec "$@"
 EOF
 cat > "${STUB_BIN}/shlock" <<'EOF'
@@ -151,6 +155,10 @@ grep -Fq '"host_free_after_kib":47185920' "${EZGHA_LOG_PATH}" || fail "after val
 pass "39 GiB host pressure with conservative estimate >=1 GiB trims fixed mounts and logs before/after"
 grep -Fq -- '--signal=TERM --kill-after=5 55' "${STUB_TIMEOUT_LOG}" || fail "TERM+KILL budget was not bounded at 60 seconds"
 pass "the whole controller is bounded by a 60-second supervisor"
+grep -Fq -- '--signal=TERM --kill-after=2 10' "${STUB_TIMEOUT_LOG}" || fail "Colima status lacked its own timeout"
+grep -Fq -- '--signal=TERM --kill-after=2 15' "${STUB_TIMEOUT_LOG}" || fail "guest probe lacked its own timeout"
+grep -Fq -- '--signal=TERM --kill-after=2 30' "${STUB_TIMEOUT_LOG}" || fail "guest trim lacked its own timeout"
+pass "each external Colima stage has a diagnostic timeout below the supervisor ceiling"
 
 reset_case floor
 STUB_HOST_FREE_BEFORE_KIB=$((40 * 1024 * 1024)) "${GUARD}"
@@ -186,11 +194,28 @@ grep -Fq '"reason":"profile_socket_mismatch"' "${EZGHA_LOG_PATH}" || fail "statu
 pass "running-profile status must report the persisted Docker socket"
 
 reset_case singleton
-mkdir -p "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
+mkdir -p "${XDG_STATE_HOME}/ezgha"
+printf '%s\n' "$$" > "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
 "${GUARD}"
 [[ ! -s "${STUB_COLIMA_LOG}" ]] || fail "singleton-locked run reached Colima"
 grep -Fq '"reason":"singleton_locked"' "${EZGHA_LOG_PATH}" || fail "singleton rejection missing"
 pass "atomic singleton lock suppresses overlapping runs"
+
+reset_case stale-singleton
+mkdir -p "${XDG_STATE_HOME}/ezgha"
+printf '%s\n' '99999999' > "${XDG_STATE_HOME}/ezgha/colima-trim.lock"
+"${GUARD}"
+grep -Fq '"event":"stale_lock_recovered"' "${EZGHA_LOG_PATH}" || fail "dead-PID lock recovery was not logged"
+grep -Fq '"event":"trim_complete"' "${EZGHA_LOG_PATH}" || fail "dead-PID lock prevented the eligible trim"
+[[ ! -e "${XDG_STATE_HOME}/ezgha/colima-trim.lock" ]] || fail "recovered singleton lock remained after exit"
+pass "a dead-PID shlock file is recovered before singleton acquisition"
+
+reset_case status-timeout
+STUB_TIMEOUT_FAIL_SECONDS=10 "${GUARD}"
+grep -Fq '"event":"stage_failed","stage":"colima_status","exit_code":124' "${EZGHA_LOG_PATH}" || fail "status timeout lacked stage evidence"
+grep -Fq '"reason":"profile_not_running"' "${EZGHA_LOG_PATH}" || fail "status timeout did not fail closed"
+! grep -q fstrim "${STUB_COLIMA_LOG}" || fail "status timeout reached trim"
+pass "a hung status probe is bounded and names the failed stage"
 
 reset_case cooldown
 STUB_HOST_FREE_AFTER_KIB=$((35 * 1024 * 1024)) "${GUARD}"
