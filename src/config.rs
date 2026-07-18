@@ -288,6 +288,26 @@ pub struct RunnerConfig {
     /// looking "configured" while doing nothing.
     #[serde(default)]
     pub wheelhouse_host_path: Option<String>,
+    /// Host-side parent directory for per-runner job workspaces
+    /// (`{workspace_host_path}/{runner_name}`), bind-mounted read-write into
+    /// each container at `/home/runner/_work` -- the actions/runner default
+    /// workspace root. Same rationale as `wheelhouse_host_path` (bead
+    /// jleechan-93cf): checkout/build/test scratch currently lands in the
+    /// container's ephemeral writable overlay layer instead of host-visible,
+    /// trim-eligible disk. Opt-in (`None` by default), fail-open if the
+    /// parent path is missing. The per-runner subdirectory is wiped by the
+    /// daemon immediately before each container start (see
+    /// `start_one_with_generate_at_slot`) so no job ever sees a prior job's
+    /// checkout, build output, or credentials -- required to preserve the
+    /// per-job isolation ephemeral runners exist for.
+    ///
+    /// CRITICAL on Colima/Mac: same virtiofs-allowlist requirement as
+    /// `wheelhouse_host_path` above -- must live under a mount from
+    /// `colima ssh -- mount | grep virtiofs` (e.g. a subdirectory of
+    /// `~/.cache`), or the mount silently resolves to an empty phantom
+    /// directory instead of failing loudly.
+    #[serde(default)]
+    pub workspace_host_path: Option<String>,
 }
 
 impl RunnerConfig {
@@ -490,6 +510,7 @@ impl Config {
                 guest_reserve_mb: default_guest_reserve_mb(),
                 runner_floor_mb: default_runner_floor_mb(),
                 wheelhouse_host_path: None,
+                workspace_host_path: None,
             },
             limits: Limits {
                 memory_mb: mem,
@@ -743,6 +764,7 @@ minimum_isolation = "container"
             guest_reserve_mb: default_guest_reserve_mb(),
             runner_floor_mb: default_runner_floor_mb(),
             wheelhouse_host_path: None,
+            workspace_host_path: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
         // A typo'd 0 (or anything under the floor) must not hot-loop the

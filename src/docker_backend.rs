@@ -2103,6 +2103,29 @@ fn start_one_with_generate_at_slot(
             cmd.args(["-e", "PIP_FIND_LINKS=/opt/wheelhouse"]);
         }
     }
+    // Opt-in per-runner job workspace (bead jleechan-93cf): read-write mount
+    // so checkouts/builds/test scratch land in a host-visible, trim-eligible
+    // directory instead of the container's ephemeral writable overlay layer.
+    // Fail-open on absence, same as the wheelhouse mount above. Wiped before
+    // every container start (not just on first creation) so a job never
+    // inherits a prior job's checkout, build output, or credentials -- the
+    // per-job isolation property ephemeral runners exist to guarantee.
+    if let Some(workspace_root) = &cfg.runner.workspace_host_path {
+        let workspace_root = std::path::Path::new(workspace_root);
+        if workspace_root.is_dir() {
+            let runner_workspace = workspace_root.join(&runner_name);
+            let _ = std::fs::remove_dir_all(&runner_workspace);
+            if std::fs::create_dir_all(&runner_workspace).is_ok() {
+                cmd.args([
+                    "-v",
+                    &format!(
+                        "{}:/home/runner/_work",
+                        runner_workspace.to_string_lossy()
+                    ),
+                ]);
+            }
+        }
+    }
     cmd.arg(&cfg.runner.image);
     cmd.args(["./run.sh", "--jitconfig", &jit]);
 
@@ -4223,6 +4246,112 @@ minimum_isolation = "container"
         assert!(
             !run_line.contains("/opt/wheelhouse"),
             "a missing wheelhouse path must not be mounted (fail-open); got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn workspace_mount_added_when_configured_root_exists() {
+        let _env = TestEnv::new("workspace_mount_present");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-workspace-test-{}", std::process::id()));
+        let workspace_root = temp_dir.join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 3333))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("a docker run invocation should have been logged");
+        let expected_runner_workspace = workspace_root.join("ez-org-runner-1");
+        assert!(
+            run_line.contains(&format!(
+                "{}:/home/runner/_work",
+                expected_runner_workspace.display()
+            )),
+            "run args should mount a per-runner workspace subdir read-write at /home/runner/_work; got: {run_line}"
+        );
+        assert!(
+            expected_runner_workspace.is_dir(),
+            "the per-runner workspace subdir should have been created on the host"
+        );
+    }
+
+    #[test]
+    fn workspace_mount_skipped_fail_open_when_configured_root_missing() {
+        let _env = TestEnv::new("workspace_mount_missing_fail_open");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-workspace-missing-test-{}", std::process::id()));
+        // Deliberately do NOT create this directory -- proves fail-open.
+        let missing_root = temp_dir.join("does-not-exist");
+        cfg.runner.workspace_host_path = Some(missing_root.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect("start_one should succeed even when the configured workspace root is missing");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            !run_line.contains("/home/runner/_work"),
+            "a missing workspace root must not be mounted (fail-open); got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn workspace_mount_wipes_prior_job_leftovers_before_start() {
+        let _env = TestEnv::new("workspace_mount_wipes_leftovers");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-workspace-wipe-test-{}", std::process::id()));
+        let workspace_root = temp_dir.join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
+
+        // Simulate a prior job's leftover checkout/credentials in this slot's
+        // workspace subdir -- must not be visible to the next job.
+        let runner_workspace = workspace_root.join("ez-org-runner-1");
+        std::fs::create_dir_all(&runner_workspace).unwrap();
+        std::fs::write(runner_workspace.join("leaked-secret.txt"), b"prior job data").unwrap();
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 5555))
+        })
+        .expect("start_one should succeed");
+
+        assert!(
+            !runner_workspace.join("leaked-secret.txt").exists(),
+            "prior job's leftover file must be wiped before the next container starts"
+        );
+        assert!(
+            runner_workspace.is_dir(),
+            "a fresh empty workspace subdir should exist after the wipe"
         );
     }
 

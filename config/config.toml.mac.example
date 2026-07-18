@@ -32,6 +32,21 @@ name_prefix = "ez-mac-runner-b"
 # arbitrary path like ~/.ezgha/wheelhouse.
 # wheelhouse_host_path = "/Users/jleechan/.cache/ezgha-wheelhouse"
 
+# Opt-in per-runner job workspace (bead jleechan-93cf): mounted read-write
+# into each container at /home/runner/_work (the actions/runner default
+# workspace root) at {workspace_host_path}/{runner_name}, so checkouts,
+# dependency installs, and build/test scratch land on host-visible,
+# trim-eligible disk instead of the ephemeral writable overlay layer. The
+# daemon wipes each runner's subdirectory immediately before every container
+# start, so no job ever sees a prior job's checkout, build output, or
+# credentials. If the parent path doesn't exist the mount is silently
+# skipped (fail-open), same as the wheelhouse above.
+#
+# CRITICAL on Colima/Mac: same virtiofs-allowlist requirement as
+# wheelhouse_host_path above -- use a subdirectory of ~/.cache, not an
+# arbitrary path.
+# workspace_host_path = "/Users/jleechan/.cache/ezgha-workspace"
+
 [limits]
 memory_mb = 8192
 cpus = 4.0
