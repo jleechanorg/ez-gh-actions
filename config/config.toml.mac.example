@@ -17,7 +17,20 @@ name_prefix = "ez-mac-runner-b"
 # container's writable overlay layer every job. Populate the directory
 # yourself (e.g. `pip download -r requirements.txt -d <dir>` on a schedule);
 # if the path doesn't exist the mount is silently skipped (fail-open).
-# wheelhouse_host_path = "/Users/jleechan/.ezgha/wheelhouse"
+#
+# CRITICAL on Colima/Mac: this path MUST live under one of Colima's
+# configured virtiofs mounts (check `colima ssh -- mount | grep virtiofs`
+# for the current allowlist -- e.g. ~/.cache, ~/Library/Caches/colima,
+# ~/.local/share/worldarchitect-runners). A path OUTSIDE that allowlist
+# does NOT fail loudly: `docker run -v <unmounted-host-path>:...` silently
+# bind-mounts an empty phantom directory instead (confirmed live,
+# 2026-07-17/18) -- the daemon's own is_dir() check on the HOST side still
+# passes (the real directory exists on macOS), so the mount is attempted,
+# but PIP_FIND_LINKS ends up pointing at an empty dir inside the container
+# and pip quietly falls through to a normal network download, looking
+# "configured" while doing nothing. Use a subdirectory of ~/.cache, not an
+# arbitrary path like ~/.ezgha/wheelhouse.
+# wheelhouse_host_path = "/Users/jleechan/.cache/ezgha-wheelhouse"
 
 [limits]
 memory_mb = 8192

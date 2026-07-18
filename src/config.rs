@@ -275,6 +275,17 @@ pub struct RunnerConfig {
     /// exist on the host at container-start time, the mount is skipped
     /// (fail-open) rather than failing the run — this is a pure accelerant,
     /// never correctness-required, and jobs must work identically without it.
+    ///
+    /// CRITICAL on Colima/Mac: this path MUST live under one of Colima's
+    /// configured virtiofs mounts (`colima ssh -- mount | grep virtiofs`),
+    /// e.g. a subdirectory of `~/.cache`. A path outside that allowlist does
+    /// NOT fail loudly — `docker run -v <host-path>:...` on an unmounted
+    /// path silently bind-mounts an empty phantom directory (confirmed live,
+    /// 2026-07-17/18); the `is_dir()` check below still passes since the
+    /// real directory exists on the macOS host, so the mount is attempted,
+    /// but `PIP_FIND_LINKS` ends up pointing at an empty dir inside the
+    /// container and pip quietly falls through to a full network download —
+    /// looking "configured" while doing nothing.
     #[serde(default)]
     pub wheelhouse_host_path: Option<String>,
 }
