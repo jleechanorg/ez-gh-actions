@@ -11,6 +11,13 @@ labels = ["self-hosted", "self-hosted-mikey", "ezgha", "macOS", "ARM64"]
 count = 6
 image = "ezgha-runner:latest"
 name_prefix = "ez-mac-runner-b"
+# Opt-in shared pip wheelhouse (bead jleechan-93cf): mounted read-only into
+# every runner container at /opt/wheelhouse with PIP_FIND_LINKS pointed at
+# it, so pip installs stop writing their whole download into the ephemeral
+# container's writable overlay layer every job. Populate the directory
+# yourself (e.g. `pip download -r requirements.txt -d <dir>` on a schedule);
+# if the path doesn't exist the mount is silently skipped (fail-open).
+# wheelhouse_host_path = "/Users/jleechan/.ezgha/wheelhouse"
 
 [limits]
 memory_mb = 8192

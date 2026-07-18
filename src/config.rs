@@ -263,6 +263,20 @@ pub struct RunnerConfig {
     /// per-runner floor set too low caused a jest OOM failure class).
     #[serde(default = "default_runner_floor_mb")]
     pub runner_floor_mb: u64,
+    /// Host-side directory of pre-downloaded Python wheels (e.g. populated by
+    /// `pip download -r requirements.txt -d <dir>` on a schedule external to
+    /// this daemon), bind-mounted read-only into every runner container at
+    /// `/opt/wheelhouse` with `PIP_FIND_LINKS` pointed at it. Opt-in (`None`
+    /// by default): ephemeral runners currently write their whole pip
+    /// download into the container's writable overlay layer every job, which
+    /// is never returned to the host until an explicit fstrim (bead
+    /// jleechan-93cf, "Move high-churn runner workspaces and caches out of
+    /// ephemeral Docker writable layers"). If the configured path doesn't
+    /// exist on the host at container-start time, the mount is skipped
+    /// (fail-open) rather than failing the run — this is a pure accelerant,
+    /// never correctness-required, and jobs must work identically without it.
+    #[serde(default)]
+    pub wheelhouse_host_path: Option<String>,
 }
 
 impl RunnerConfig {
@@ -464,6 +478,7 @@ impl Config {
                 vm_total_mb: None,
                 guest_reserve_mb: default_guest_reserve_mb(),
                 runner_floor_mb: default_runner_floor_mb(),
+                wheelhouse_host_path: None,
             },
             limits: Limits {
                 memory_mb: mem,
@@ -716,6 +731,7 @@ minimum_isolation = "container"
             vm_total_mb: None,
             guest_reserve_mb: default_guest_reserve_mb(),
             runner_floor_mb: default_runner_floor_mb(),
+            wheelhouse_host_path: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
         // A typo'd 0 (or anything under the floor) must not hot-loop the

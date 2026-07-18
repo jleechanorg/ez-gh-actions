@@ -2092,6 +2092,17 @@ fn start_one_with_generate_at_slot(
     if backend == Backend::DockerSysbox {
         cmd.args(["--runtime", "sysbox-runc"]);
     }
+    // Opt-in shared pip wheelhouse (bead jleechan-93cf): read-only mount so
+    // jobs stop writing their whole pip download into the ephemeral
+    // container's writable overlay layer every run. Fail-open on absence --
+    // this is a pure accelerant, never correctness-required, and the daemon
+    // must never refuse to start a runner over a missing cache directory.
+    if let Some(wheelhouse) = &cfg.runner.wheelhouse_host_path {
+        if std::path::Path::new(wheelhouse).is_dir() {
+            cmd.args(["-v", &format!("{wheelhouse}:/opt/wheelhouse:ro")]);
+            cmd.args(["-e", "PIP_FIND_LINKS=/opt/wheelhouse"]);
+        }
+    }
     cmd.arg(&cfg.runner.image);
     cmd.args(["./run.sh", "--jitconfig", &jit]);
 
@@ -4128,6 +4139,90 @@ minimum_isolation = "container"
         assert!(
             assignments.assignments.is_empty(),
             "slot reserved by start_one should be cleaned up when docker run fails"
+        );
+    }
+
+    /// Fake `docker` script that captures its full argv to `capture_path`
+    /// (one line per invocation) and, for `run`, prints a fake container ID
+    /// to stdout so `start_one_with_generate` sees a successful start.
+    fn fake_docker_capturing_args(temp_dir: &std::path::Path, capture_path: &std::path::Path) -> PathBuf {
+        std::fs::create_dir_all(temp_dir).unwrap();
+        let script = temp_dir.join("docker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = \"run\" ]; then echo fakecontaineridabc123; fi\nexit 0\n",
+                capture_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    fn wheelhouse_mount_added_when_configured_path_exists() {
+        let _env = TestEnv::new("wheelhouse_mount_present");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-wheelhouse-test-{}", std::process::id()));
+        let wheelhouse_dir = temp_dir.join("wheelhouse");
+        std::fs::create_dir_all(&wheelhouse_dir).unwrap();
+        cfg.runner.wheelhouse_host_path = Some(wheelhouse_dir.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 1111))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains(&format!("{}:/opt/wheelhouse:ro", wheelhouse_dir.display())),
+            "run args should mount the configured wheelhouse read-only; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("PIP_FIND_LINKS=/opt/wheelhouse"),
+            "run args should set PIP_FIND_LINKS; got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn wheelhouse_mount_skipped_fail_open_when_configured_path_missing() {
+        let _env = TestEnv::new("wheelhouse_mount_missing_fail_open");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-wheelhouse-missing-test-{}", std::process::id()));
+        // Deliberately do NOT create this directory -- proves fail-open.
+        let missing_wheelhouse = temp_dir.join("does-not-exist");
+        cfg.runner.wheelhouse_host_path = Some(missing_wheelhouse.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 2222))
+        })
+        .expect("start_one should succeed even when the configured wheelhouse path is missing");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            !run_line.contains("/opt/wheelhouse"),
+            "a missing wheelhouse path must not be mounted (fail-open); got: {run_line}"
         );
     }
 
