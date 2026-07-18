@@ -29,6 +29,17 @@ The **pip wheelhouse** half of opportunity #1 — the self-contained piece that 
 - Two new tests (`wheelhouse_mount_added_when_configured_path_exists`, `wheelhouse_mount_skipped_fail_open_when_configured_path_missing`); full suite 314/314 passes.
 - Documented in `config/config.toml.mac.example`.
 
+## Live verification of the mount mechanism
+
+Ran a standalone throwaway container against the real Colima docker daemon (not the production `org.jleechanorg.ezgha` daemon or its 6 real containers):
+
+```
+docker run --rm -v /tmp/wheelhouse_live_test:/opt/wheelhouse:ro -e PIP_FIND_LINKS=/opt/wheelhouse alpine:3.19 \
+  sh -c "ls -la /opt/wheelhouse && echo PIP_FIND_LINKS=\$PIP_FIND_LINKS && touch /opt/wheelhouse/should-fail"
+```
+
+Confirmed: the mounted file is visible, `PIP_FIND_LINKS` resolves correctly, and the write attempt is rejected with `Read-only file system` (isolation confirmed) — the exact mechanism `start_one_with_generate_at_slot` now uses, verified live without touching the production fleet.
+
 ## What did NOT ship (deliberately)
 
 - **Not deployed to the live host.** `org.jleechanorg.ezgha` was actively managing 6 real runner containers at the time of this work; rebuilding the binary and restarting the daemon to pick up this change would have disrupted live CI jobs. Deployment (rebuild, restart, populate a real wheelhouse directory, exercise real jobs) is a deliberate follow-up, not bundled into this pass.
