@@ -476,6 +476,57 @@ PLIST
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
+    # ── Guest-native fstrim cadence — the actual root cause fix, not just the guard ──
+    # colima-trim-guard.sh is a host-side EMERGENCY safety net (fires only when
+    # host free space drops below 40GiB) and has twice proven unreliable (stale
+    # shlock lock, then an outer-timeout hang — bead jleechan-wy3s/jleechan-zxhf).
+    # The actual driver of Colima disk growth is ephemeral JIT runner churn
+    # (create -> run one job -> destroy, by GitHub Actions ephemeral-runner
+    # design) on an ext4 filesystem with no online discard: every churned
+    # container leaves permanently-allocated sparse blocks until something
+    # trims them. The guest ships its own fstrim.timer, but Ubuntu's stock
+    # default is OnCalendar=weekly — useless against a churn rate of ~8 full
+    # container lifecycles per 20 seconds observed live (2026-07-17). This
+    # overrides the guest's own timer to run every 5 minutes, independent of
+    # macOS launchd/shlock entirely — no colima-ssh subprocess from the host
+    # needed for routine trimming; colima-trim-guard.sh remains only as a
+    # backup for genuine host-wide emergencies.
+    # Second, deeper bug found in the same investigation: stock fstrim.service
+    # runs `fstrim --listed-in /etc/fstab:/proc/self/mountinfo`, which SILENTLY
+    # skips /mnt/lima-colima (the actual docker data-root, on /dev/vdb1) even
+    # though it fully supports discard (DISC-MAX 60G) and is live-mounted —
+    # it is simply absent from /etc/fstab (mounted separately by lima at boot)
+    # and --listed-in evidently does not pick it up from mountinfo either in
+    # practice. Confirmed live 2026-07-17: the frequent-timer fix alone ran
+    # every 5 min for 10+ minutes trimming only /, /boot, /boot/efi (a few
+    # hundred MiB each) while the 50+ GiB datadisk never moved; a manual
+    # `fstrim /mnt/lima-colima` then reclaimed 46.7 GiB in one shot. Overriding
+    # ExecStart to `fstrim --all` (trims every currently-mounted filesystem
+    # that supports discard, not just fstab-listed ones) fixes this at the
+    # command level, independent of the timer-frequency fix above.
+    if command -v colima >/dev/null 2>&1 && colima status --profile default >/dev/null 2>&1; then
+      if colima ssh --profile default -- sudo mkdir -p /etc/systemd/system/fstrim.service.d /etc/systemd/system/fstrim.timer.d 2>/dev/null; then
+        colima ssh --profile default -- sudo tee /etc/systemd/system/fstrim.service.d/override.conf >/dev/null <<'FSTRIM_SVC_EOF'
+[Service]
+ExecStart=
+ExecStart=/sbin/fstrim --all --verbose --quiet-unsupported
+FSTRIM_SVC_EOF
+        colima ssh --profile default -- sudo tee /etc/systemd/system/fstrim.timer.d/override.conf >/dev/null <<'FSTRIM_EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*:0/5
+AccuracySec=30s
+RandomizedDelaySec=30s
+FSTRIM_EOF
+        colima ssh --profile default -- sudo systemctl daemon-reload 2>/dev/null
+        colima ssh --profile default -- sudo systemctl restart fstrim.timer 2>/dev/null
+        ok "guest fstrim.timer overridden to every 5 minutes with --all scope (was weekly + fstab-only, silently missing the docker data-root) — root-cause fix for Colima sparse-disk growth"
+      else
+        info "guest fstrim.timer override skipped — could not reach Colima guest via sudo (VM not running or no sudo)"
+      fi
+    else
+      info "guest fstrim.timer override skipped — colima not installed or default profile not running"
+    fi
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do
