@@ -2123,6 +2123,17 @@ fn start_one_with_generate_at_slot(
                         runner_workspace.to_string_lossy()
                     ),
                 ]);
+                // Flag this container as having the virtiofs-backed workspace
+                // mount so the image's /usr/local/bin/tar wrapper
+                // (docker/tar-workspace-wrapper.sh) knows to guard tar
+                // extractions under /home/runner/_work -- the checkout path
+                // (_work/<owner>/<repo>) is NOT covered by the tmpfs shadows
+                // below and remains exposed to the same symlink-corruption
+                // bug whenever a workflow step tar-extracts an archive
+                // containing a symlink there (npm ci, release tarballs,
+                // docker save/load, etc). See
+                // tests/workspace_mount_symlink_extraction_test.sh step 4.
+                cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
                 // Shadow the three fixed actions-runner-internal subdirs with
                 // tmpfs (bead jleechan-93cf regression, 2026-07-19): tar
                 // extraction of an archive containing a symlink corrupts the
@@ -4358,6 +4369,55 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn workspace_mount_sets_virtiofs_env_for_tar_wrapper() {
+        // Regression test for the WIDENED understanding of bead jleechan-93cf
+        // (2026-07-19 follow-up): the tmpfs-shadow fix above only protects
+        // the three fixed runner-internal cache dirs. Real job checkouts
+        // under _work/<owner>/<repo> -- the dominant disk-churn win this
+        // mount exists for -- are NOT shadowed and remain exposed to the
+        // same virtiofs symlink-extraction corruption whenever a workflow
+        // step tar-extracts an archive containing a symlink there (npm ci,
+        // downloaded release tarballs, docker save/load, etc; confirmed live
+        // with a synthetic npm-style archive). The daemon now flags every
+        // container that has this bind mount with EZGHA_VIRTIOFS_WORKSPACE=1
+        // so the image's /usr/local/bin/tar wrapper
+        // (docker/tar-workspace-wrapper.sh) knows to stage extractions
+        // destined for /home/runner/_work on the container's own tmpfs/
+        // overlay /tmp first, then `cp -a` (safe syscalls) into the real
+        // virtiofs destination -- see
+        // tests/workspace_mount_symlink_extraction_test.sh step 4.
+        let _env = TestEnv::new("workspace_mount_virtiofs_env");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-workspace-virtiofs-env-test-{}", std::process::id()));
+        let workspace_root = temp_dir.join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 3335))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains("-e EZGHA_VIRTIOFS_WORKSPACE=1"),
+            "run args should flag the container as having the virtiofs-backed \
+             workspace mount so /usr/local/bin/tar knows to guard extractions; \
+             got: {run_line}"
+        );
+    }
+
+    #[test]
     fn workspace_mount_skipped_fail_open_when_configured_root_missing() {
         let _env = TestEnv::new("workspace_mount_missing_fail_open");
         cpu_probe_overrides::set(Some(true));
@@ -4385,6 +4445,11 @@ minimum_isolation = "container"
         assert!(
             !run_line.contains("/home/runner/_work"),
             "a missing workspace root must not be mounted (fail-open); got: {run_line}"
+        );
+        assert!(
+            !run_line.contains("EZGHA_VIRTIOFS_WORKSPACE"),
+            "the tar-wrapper env flag must not be set when there is no workspace mount \
+             to guard; got: {run_line}"
         );
     }
 

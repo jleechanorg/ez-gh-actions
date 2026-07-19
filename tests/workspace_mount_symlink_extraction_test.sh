@@ -18,18 +18,36 @@
 # (all of which have symlinks somewhere in their extracted tree) at a 41%
 # (13/32) Mac job failure rate before this test existed.
 #
-# Fix: the daemon shadows the three fixed GitHub-Actions-runner-internal
-# subdirectories (_work/_actions, _work/_temp, _work/_tool) with tmpfs
-# mounts layered inside the workspace bind, so the runner's own
-# action-repo/tool-cache extraction never touches virtiofs, while the
-# actual disk-churn win (job checkouts + build scratch, which live directly
-# under _work/<owner>/<repo>, not under the three shadowed dirs) is
-# unaffected.
+# WIDENED understanding (2026-07-19/20 follow-up): the corruption is not
+# limited to the three GitHub-Actions-runner-internal cache dirs. ANY
+# tar extraction of an archive containing a symlink onto this mount is
+# affected, including under the real checkout path
+# (_work/<owner>/<repo>) -- exercised by workflow steps like `npm ci`,
+# downloaded release tarballs, `docker save`/`load`, and git submodule
+# tarballs. Step 4 below reproduces this specifically and proves the fix.
+#
+# Two-part fix:
+#  1. The daemon shadows the three fixed GitHub-Actions-runner-internal
+#     subdirectories (_work/_actions, _work/_temp, _work/_tool) with tmpfs
+#     mounts layered inside the workspace bind, so the runner's own
+#     action-repo/tool-cache extraction never touches virtiofs.
+#  2. A `/usr/local/bin/tar` wrapper baked into the runner image
+#     (docker/tar-workspace-wrapper.sh) covers the rest of the mount: when
+#     the daemon flags a container with EZGHA_VIRTIOFS_WORKSPACE=1 (see
+#     docker_backend.rs), any tar EXTRACT destined for /home/runner/_work
+#     is staged on the container's own tmpfs/overlay /tmp first, then
+#     `cp -a` (safe syscalls) into the real destination. This preserves
+#     the disk-churn-reduction goal the mount exists for (checkouts/build
+#     scratch never touch tmpfs) while fixing symlink corruption
+#     everywhere tar is used on the mount, not just the three cache dirs.
 #
 # Usage: bash tests/workspace_mount_symlink_extraction_test.sh
 #
 # Requires: docker reachable (DOCKER_HOST must point at the real daemon
-# socket on Colima/Mac hosts), ezgha-runner:latest image present.
+# socket on Colima/Mac hosts), ezgha-runner:latest image present (rebuild
+# with `DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t
+# ezgha-runner:latest .` after any change to docker/tar-workspace-wrapper.sh
+# so step 4 exercises the current wrapper, not a stale image).
 
 set -u
 
@@ -127,6 +145,60 @@ if printf '%s' "${FIXED_OUT}" | grep -q "real content"; then
   ok "tmpfs-shadowed _actions subdir: extraction + symlink read succeeded (this is the fix's mechanism)"
 else
   bad "tmpfs-shadowed _actions subdir extraction unexpectedly failed: ${FIXED_OUT}"
+fi
+
+echo "=== 4. Fix verification: checkout-path (_work/<owner>/<repo>) extraction is now guarded by the tar wrapper ==="
+# This is the WIDENED scope this test now covers: real job checkouts, not
+# just the three tmpfs-shadowed cache dirs from step 3. First prove the
+# raw exposure still exists without the flag (RED), then prove the
+# wrapper fixes it with the daemon's flag set (GREEN) -- exactly the
+# EZGHA_VIRTIOFS_WORKSPACE=1 env var docker_backend.rs sets whenever
+# workspace_host_path is configured.
+CHECKOUT_HOST_RED="${WORKDIR}/host-checkout-red"
+mkdir -p "${CHECKOUT_HOST_RED}"
+RED_OUT=$(docker run --rm \
+  -v "${WORKDIR}/repro.tar.gz:/tmp/repro.tar.gz:ro" \
+  -v "${CHECKOUT_HOST_RED}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    mkdir -p /home/runner/_work/some-owner/some-repo && cd /home/runner/_work/some-owner/some-repo
+    tar -xzf /tmp/repro.tar.gz 2>&1
+    echo "---read---"
+    cat pkg/data/inner/target.txt 2>&1
+  ' 2>&1)
+echo "${RED_OUT}" | sed 's/^/    /'
+if printf '%s' "${RED_OUT}" | grep -q "Permission denied"; then
+  ok "RED confirmed: unguarded checkout-path extraction still corrupts the symlink (proves this is a real, currently-exposed gap without the fix)"
+else
+  bad "expected the unguarded checkout-path extraction to reproduce the symlink corruption (RED baseline broken): ${RED_OUT}"
+fi
+
+CHECKOUT_HOST_GREEN="${WORKDIR}/host-checkout-green"
+mkdir -p "${CHECKOUT_HOST_GREEN}"
+GREEN_OUT=$(docker run --rm \
+  -e EZGHA_VIRTIOFS_WORKSPACE=1 \
+  -v "${WORKDIR}/repro.tar.gz:/tmp/repro.tar.gz:ro" \
+  -v "${CHECKOUT_HOST_GREEN}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    mkdir -p /home/runner/_work/some-owner/some-repo && cd /home/runner/_work/some-owner/some-repo
+    tar -xzf /tmp/repro.tar.gz 2>&1
+    echo "---read---"
+    cat pkg/data/inner/target.txt 2>&1
+  ' 2>&1)
+echo "${GREEN_OUT}" | sed 's/^/    /'
+if printf '%s' "${GREEN_OUT}" | grep -q "real content" && ! printf '%s' "${GREEN_OUT}" | grep -q "Permission denied"; then
+  ok "GREEN: checkout-path extraction succeeds via the tar wrapper when EZGHA_VIRTIOFS_WORKSPACE=1 is set"
+else
+  bad "checkout-path extraction with the tar-wrapper flag set should have succeeded: ${GREEN_OUT}"
+fi
+# Also verify on the HOST side (not just inside the container) that the
+# symlink actually landed correctly on the real virtiofs-backed directory,
+# proving cp -a materialized it there and this isn't a coincidental
+# extraction into some unrelated path.
+HOST_LINK="${CHECKOUT_HOST_GREEN}/some-owner/some-repo/pkg/data/inner/target.txt"
+if [ -L "${HOST_LINK}" ] && [ "$(cat "${HOST_LINK}" 2>&1)" = "real content" ]; then
+  ok "host-side check: symlink landed correctly on the real workspace bind mount, readable via the host filesystem"
+else
+  bad "host-side check failed -- expected a readable symlink at ${HOST_LINK}"
 fi
 
 echo
