@@ -78,7 +78,8 @@ pub struct QueueMonitorState {
     consecutive_bad: u32,
     /// How many consecutive ticks have observed `remaining <=
     /// cfg.queue_monitor.rest_budget_floor`. Resets to 0 the moment a tick
-    /// observes `remaining > floor` (or returns Unknown). When this hits
+    /// observes `remaining > floor`. An Unknown probe neither increments nor
+    /// clears it. When this hits
     /// `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD`, the probe is skipped for
     /// `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks -- bounding the rate at
     /// which a persistent-low-budget state can re-probe and wastefully
@@ -222,10 +223,10 @@ impl QueueMonitorState {
     /// `RestBudgetProbe::Unknown` on deadline overrun / transient error /
     /// non-parseable response. When `Known(n)` reports `n <=
     /// cfg.queue_monitor.rest_budget_floor`, this tick's read-heavy fetches
-    /// are SKIPPED entirely and a deferral is logged. `Unknown` does NOT
-    /// defer (fail-open: a broken probe must not starve monitoring on top of
-    /// an already-flaky API -- same invariant as the prior `Ok`-vs-`Err`
-    /// fail-open). When `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` consecutive
+    /// are SKIPPED entirely and a deferral is logged. `Unknown` also defers:
+    /// deadline, secondary-limit, and transient failures mean the API is
+    /// degraded, so launching the read-heavy work would risk delaying the
+    /// next `ensure_count`. When `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` consecutive
     /// ticks observe `Known(n) <= floor`, the probe itself is skipped for
     /// the next `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks -- the gate
     /// defers without spending API quota on a probe that has nothing new
@@ -280,7 +281,7 @@ impl QueueMonitorState {
         // the REST (core) bucket's remaining count BEFORE firing any of this
         // tick's read-heavy fetches (fleet + per-repo queue/job enumeration).
         //
-        // Three layers of fail-open:
+        // Three layers of conservative deferral:
         //   1. Floor-hit backoff: if we've seen `remaining <= floor` on
         //      `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` consecutive ticks,
         //      skip the probe entirely for the next
@@ -289,8 +290,9 @@ impl QueueMonitorState {
         //      from triggering a `gh api rate_limit` call every 30 s
         //      indefinitely.
         //   2. `Unknown` probe outcome (deadline overrun, transient gh
-        //      error, non-parseable response): proceed with the tick --
-        //      same fail-open invariant the prior `Err`-handling asserted.
+        //      error, non-parseable response): defer because the API is
+        //      already degraded and read-heavy work could consume the
+        //      monitor deadline before the next `ensure_count`.
         //   3. `Known(n) <= floor`: defer this iteration's read-heavy
         //      work; neither `last_check` timestamp advances, so both
         //      ticks retry on the next serve-loop iteration once budget
@@ -327,11 +329,14 @@ impl QueueMonitorState {
                 self.rest_budget_skip_ticks_remaining = 0;
             }
             github::RestBudgetProbe::Unknown => {
-                // Fail-open: a probe that couldn't be trusted MUST NOT
-                // be treated as "below floor", same invariant as before.
                 // We do not modify the floor-hit counter on Unknown: an
                 // Unknown outcome isn't evidence of low budget either
                 // way, so it's neither a hit nor a clear.
+                eprintln!(
+                    "queue_monitor: deferring read-heavy REST calls this tick -- \
+                     REST budget probe outcome unknown"
+                );
+                return Ok((None, None));
             }
         }
 
@@ -2692,16 +2697,13 @@ exit 1
         );
     }
 
-    /// A `RestBudgetProbe::Unknown` outcome (deadline overrun, transient gh
-    /// error, non-parseable response -- formerly a `Result::Err`) must NOT
-    /// be treated as "below floor" -- it must fall through to running the
-    /// ticks normally rather than starving monitoring on top of an
-    /// already-flaky API. Only a successfully observed low count defers.
-    /// This is the same fail-open invariant the test name preserved from
-    /// the prior `Err`-based API, now restated in terms of the new
-    /// `RestBudgetProbe` enum.
+    /// A `RestBudgetProbe::Unknown` outcome means the API is degraded or the
+    /// probe deadline was exhausted. Starting the read-heavy monitor work in
+    /// that state can consume the remaining serve-loop budget and delay the
+    /// next `ensure_count`, so the monitor tick must defer without advancing
+    /// either consumer's timestamp.
     #[test]
-    fn rest_budget_probe_unknown_does_not_defer() {
+    fn rest_budget_probe_unknown_defers_read_heavy_fetches() {
         let mut cfg = base_test_config();
         cfg.queue_monitor.enabled = true;
         cfg.invariant_sampler.enabled = true;
@@ -2714,7 +2716,7 @@ exit 1
 
         let fleet_calls = Arc::new(AtomicUsize::new(0));
 
-        let (qm_result, _is_result) = queue_monitor
+        let (qm_result, is_result) = queue_monitor
             .drive_with_fetcher(
                 &cfg,
                 Instant::now(),
@@ -2737,11 +2739,18 @@ exit 1
             )
             .unwrap();
 
+        assert!(qm_result.is_none(), "budget-unknown must defer the tick");
         assert!(
-            qm_result.is_some(),
-            "a failed budget check must not defer the tick -- budget-unknown proceeds normally"
+            is_result.is_none(),
+            "budget-unknown must defer the invariant sampler too"
         );
-        assert_eq!(fleet_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            0,
+            "budget-unknown must not launch read-heavy fleet fetching"
+        );
+        assert_eq!(queue_monitor.last_check, None);
+        assert_eq!(invariant_sampler.last_check, None);
     }
 
     /// TDD evidence (b): `drive_serve_loop_ticks` -- the ONLY production

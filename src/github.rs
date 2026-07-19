@@ -544,14 +544,11 @@ fn parse_rest_budget_remaining(body: &[u8]) -> Result<u32> {
 }
 
 /// Outcome of `rest_budget_remaining_until` -- distinguishes a confident
-/// observed low budget (gate should defer) from "budget unknown" (gate should
-/// proceed). The Unknown arm is what fails-open semantics return when the
+/// observed low budget from "budget unknown". The Unknown arm is returned when the
 /// probe itself can't be trusted (deadline overrun, secondary-limit response
-/// without a parseable count, transient `gh` error): the gate must NEVER
-/// treat Unknown as "below floor", because that would let a flaky probe
-/// itself starve monitoring on top of an already-flaky API -- see the
-/// 2026-07-07 incident where a rate-limited serve-loop fetch starved
-/// `ensure_count`.
+/// without a parseable count, transient `gh` error). Callers decide how to
+/// handle that degraded state; the queue monitor defers its read-heavy work
+/// so the next `ensure_count` remains reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestBudgetProbe {
     /// Probe succeeded and observed `remaining` calls in the REST (core)
@@ -559,9 +556,8 @@ pub enum RestBudgetProbe {
     Known(u32),
     /// Probe could not be trusted (deadline overrun, transient gh error,
     /// secondary-limit response without a parseable body). Callers MUST
-    /// fall through to running the tick rather than treating this as
-    /// "below floor" -- the same fail-open invariant the 2026-07-07
-    /// `rest_budget_check_error_does_not_defer` test asserts.
+    /// handle the degraded state conservatively rather than assuming budget
+    /// is healthy.
     Unknown,
 }
 
@@ -578,7 +574,7 @@ pub enum RestBudgetProbe {
 pub const REST_BUDGET_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Deadline-bounded probe for the REST (core) bucket's remaining call count.
-/// See `RestBudgetProbe` for the fail-open contract.
+/// See `RestBudgetProbe` for the outcome contract.
 ///
 /// IMPORTANT: this probe is quota-EXEMPT only from GitHub's PRIMARY rate
 /// limit (the `/rate_limit` endpoint itself is documented to not count
@@ -608,8 +604,8 @@ pub fn rest_budget_remaining_until(deadline: Instant) -> RestBudgetProbe {
         Ok(out) => out,
         Err(err) => {
             // Probe itself failed to even spawn `gh`, or the backoff loop
-            // bailed on a non-retryable classification. Treat as Unknown:
-            // the gate must NOT block monitoring on a broken probe.
+            // bailed on a non-retryable classification. Treat as Unknown so
+            // the caller can avoid additional read-heavy work.
             eprintln!(
                 "github::rest_budget_remaining_until: probe exec failed, returning Unknown: {err}"
             );
@@ -621,7 +617,7 @@ pub fn rest_budget_remaining_until(deadline: Instant) -> RestBudgetProbe {
         // We deliberately do NOT try to parse the stderr for a Retry-After
         // here: the budget check is meant to be cheap, and a non-zero exit
         // is the same signal "we can't trust the probe right now" --
-        // returning Unknown lets the gate fail open.
+        // returning Unknown lets the caller defer optional reads safely.
         log_gh_response("gh api rate_limit", &out);
         return RestBudgetProbe::Unknown;
     }
@@ -649,7 +645,7 @@ pub fn rest_budget_remaining() -> Result<u32> {
         RestBudgetProbe::Known(n) => Ok(n),
         RestBudgetProbe::Unknown => bail!(
             "rest_budget_remaining: probe returned Unknown (deadline overrun or transient gh error); \
-             caller should use rest_budget_remaining_until and treat Unknown as fail-open"
+             caller should use rest_budget_remaining_until and handle Unknown conservatively"
         ),
     }
 }
@@ -2050,20 +2046,20 @@ exit 0
     }
 
     /// TDD evidence — bead ez-gh-actions-4jv P1 follow-up: the budget probe
-    /// MUST fail-open fast when `gh api rate_limit` itself blocks past the
+    /// MUST return Unknown quickly when `gh api rate_limit` itself blocks past the
     /// caller's deadline (the exact defect the P1 review flagged on the
     /// prior unbounded `rest_budget_remaining`). We simulate the failure
     /// with a fake `gh` that sleeps 30 s (far past the 5 s probe deadline),
     /// then assert:
     ///   1. `rest_budget_remaining_until` returns within the deadline.
-    ///   2. It returns `RestBudgetProbe::Unknown` (fail-open, NOT
+    ///   2. It returns `RestBudgetProbe::Unknown` (NOT
     ///      `Known(0)` or any other "below floor" signal that would
     ///      starve the caller).
     ///   3. The write path / `generate_jitconfig` is structurally
     ///      unaffected (this is a github.rs test -- nothing in
     ///      `rest_budget_remaining_until` can reach the write path).
     #[test]
-    fn rest_budget_remaining_until_fails_open_when_probe_overruns_deadline() {
+    fn rest_budget_remaining_until_returns_unknown_when_probe_overruns_deadline() {
         // The fake `gh` sleeps 30 s on every call. With a 1 s deadline,
         // the backoff loop's child-gh timeout (GH_TIMEOUT=45s) won't
         // trip first -- the deadline gate in `run_gh_with_backoff_core`
@@ -2099,8 +2095,7 @@ exit 0
         assert_eq!(
             probe,
             RestBudgetProbe::Unknown,
-            "an overrun probe must return Unknown (fail-open), not Known(0) or anything \
-             else that the gate could read as 'below floor'"
+            "an overrun probe must return Unknown rather than inventing a core-budget count"
         );
         // We give ourselves 5x the deadline as the upper bound: the
         // backoff loop runs a single attempt with a 45 s child timeout,
@@ -2162,7 +2157,7 @@ exit 0
         assert_eq!(
             probe,
             RestBudgetProbe::Unknown,
-            "a secondary-limit response must yield Unknown (fail-open), not be parsed as \
+            "a secondary-limit response must yield Unknown, not be parsed as \
              a real budget count"
         );
         // Backoff base = 2s, max 32s; with a 2s deadline the loop
