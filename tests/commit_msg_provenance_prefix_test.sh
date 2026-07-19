@@ -85,6 +85,18 @@ assert_hook "no_prefix_chore"       "chore(beads): update"            1 "REJECTE
 assert_hook "prefix_no_colon"       "claude/sonnet fix the bug"       1 "REJECTED"
 assert_hook "human_no_colon"        "human tweak"                     1 "REJECTED"
 
+# ----- (b2) REJECT: prefix present but missing mandatory model-id segment -----
+# (CodeRabbit/Codex review, PR #66: "claude: fix" without a model-id used to
+# pass because the '/model-id' segment was optional in the regex.)
+assert_hook "claude_no_model"       "claude: missing model"          1 "REJECTED"
+assert_hook "gemini_no_model"       "gemini: missing model"          1 "REJECTED"
+assert_hook "codex_no_model"        "codex: missing model"           1 "REJECTED"
+
+# ----- (b3) REJECT: word that merely starts with "human" -----
+# (CodeRabbit review, PR #66: "humane: tweak" used to slip through because
+# the trailing 'e' was absorbed by the optional model-id character class.)
+assert_hook "humane_lookalike"      "humane: tweak"                  1 "REJECTED"
+
 # ----- (c) ACCEPT: every canonical prefix -----
 assert_hook "accept_claude_sonnet"  "claude/sonnet: chore: lint fix"      0
 assert_hook "accept_claudem_minimax" "claudem/minimax-M3: chore: hook"    0
@@ -99,6 +111,12 @@ assert_hook "accept_human"          "human: merge resolution"             0
 assert_hook "accept_merge_branch"   "Merge branch 'foo' into main"        0
 assert_hook "accept_merge_tag"      "Merge tag 'v1.2.3'"                 0
 assert_hook "accept_merge_commit"   "Merge commit 'abc123' into main"     0
+# (CodeRabbit review, PR #66: these two real git/GitHub merge subject forms
+# used to be REJECTED because merge_re only matched "Merge branch|tag|commit".)
+assert_hook "accept_merge_remote_tracking" \
+  "Merge remote-tracking branch 'origin/main'"                            0
+assert_hook "accept_merge_pull_request" \
+  "Merge pull request #66 from jleechanorg/factory/ez-gh-actions-jcie-r1"  0
 
 # ----- (e) Edge: missing arg / unreadable file -----
 # (bash "$HOOK" with no $1) — the hook must exit non-zero, not crash with
@@ -138,8 +156,10 @@ fi
 echo "PASS: commit-msg provenance prefix hook behaves correctly across"
 echo "  - 3 reject cases (no prefix, 3 styles)"
 echo "  - 2 reject cases (prefix without ':' delimiter)"
+echo "  - 3 reject cases (prefix missing mandatory model-id segment)"
+echo "  - 1 reject case  (word merely starting with 'human')"
 echo "  - 8 accept cases (all canonical runtime prefixes)"
-echo "  - 3 accept cases (git-merge subjects bypass the gate)"
+echo "  - 5 accept cases (git-merge subjects bypass the gate)"
 echo "  - 1 edge case  (missing arg -> non-zero, no crash)"
 echo "  - 1 edge case  (comments-only file -> rc=2 empty-subject)"
 echo "  - 1 edge case  (comment-then-subject -> rc=0)"

@@ -46,20 +46,36 @@ fi
 
 # Allowed prefixes — anchored at start of subject, terminated by ':'.
 # Keep this list in lockstep with global CLAUDE.md "Commit provenance tag" table.
-allowed_re='^(claude|claudem|claudew|gemini|codex|cursor|ao|human)/?[a-zA-Z0-9._-]*:[[:space:]]'
+#
+# `human:` has no model segment (per CLAUDE.md example `human: <subject>`), so
+# it gets its own exact-match regex. Every other runtime prefix REQUIRES a
+# `/<model-id>` segment before the ':' — the slash and model-id are NOT
+# optional, otherwise bare "claude: fix" (no model) or "humane: tweak" (word
+# that merely starts with "human") would incorrectly pass.
+allowed_re='^(claude|claudem|claudew|gemini|codex|cursor|ao)/[a-zA-Z0-9._-]+:[[:space:]]'
+human_re='^human:[[:space:]]'
 
-# Merge commits often have subjects like "Merge branch 'foo' into main" —
-# those are produced by git itself and should be allowed through (the
-# individual squash commits inside the merge were each validated at their
-# own commit-msg hook invocation; the merge commit's provenance is the
-# human/operator that pushed the merge).
-merge_re='^Merge (branch|tag|commit) '
+# Merge commits are produced by git itself and should be allowed through
+# regardless of exact wording (the individual squash commits inside the merge
+# were each validated at their own commit-msg hook invocation; the merge
+# commit's provenance is the human/operator that pushed the merge). Covers:
+#   Merge branch 'foo' into main
+#   Merge remote-tracking branch 'origin/main'
+#   Merge tag 'v1.2.3'
+#   Merge commit 'abc123' into main
+#   Merge pull request #66 from jleechanorg/some-branch
+merge_re='^Merge (remote-tracking )?(branch|tag|commit) '
+merge_pr_re='^Merge pull request #[0-9]+ '
 
 if [[ "$subject" =~ $allowed_re ]]; then
   exit 0
 fi
 
-if [[ "$subject" =~ $merge_re ]]; then
+if [[ "$subject" =~ $human_re ]]; then
+  exit 0
+fi
+
+if [[ "$subject" =~ $merge_re ]] || [[ "$subject" =~ $merge_pr_re ]]; then
   exit 0
 fi
 

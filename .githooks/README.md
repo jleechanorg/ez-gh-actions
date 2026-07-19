@@ -25,8 +25,8 @@ authors must not be allowed to silently regress to that state — bead
 | Aspect | Behavior |
 |--------|----------|
 | Subject line | First non-comment, non-blank line of the commit-msg file |
-| Allowed prefixes | `claude/`, `claudem/`, `claudew/`, `gemini/`, `codex/`, `cursor/`, `ao/`, `human` (terminated by `:`) |
-| Merge commits | Bypass the gate (subjects like `Merge branch 'foo' into main`) |
+| Allowed prefixes | `claude/<model-id>:`, `claudem/<model-id>:`, `claudew/<model-id>:`, `gemini/<model-id>:`, `codex/<model-id>:`, `cursor/<model>:`, `ao/<model>:` (model-id is mandatory), or `human:` (no model segment) |
+| Merge commits | Bypass the gate (`Merge branch/tag/commit ...`, `Merge remote-tracking branch ...`, `Merge pull request #N from ...`) |
 | Empty subject | Reject (rc=2) |
 | Comments-only | Reject (treated as empty subject) |
 | Bypass | `git commit --no-verify` (emergency only) |
