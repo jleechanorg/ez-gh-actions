@@ -17,6 +17,7 @@ import check_beads_no_regression as guard
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 FIXTURE_DIR = os.path.join(REPO_ROOT, 'scripts', 'tests', 'fixtures', 'bead_regression_guard')
 SCRIPT_PATH = os.path.join(REPO_ROOT, 'scripts', 'check_beads_no_regression.py')
+WORKFLOW_PATH = os.path.join(REPO_ROOT, '.github', 'workflows', 'beads-regression-guard.yml')
 
 
 class TestCompareBeadsUnit(unittest.TestCase):
@@ -90,6 +91,17 @@ class TestFixtureSubprocess(unittest.TestCase):
         result = self._run("normal_parent.jsonl", "normal_head.jsonl")
         self.assertEqual(result.returncode, 0, msg=f"stderr: {result.stderr}")
         self.assertIn("OK", result.stdout)
+
+
+class TestWorkflowComparisonBase(unittest.TestCase):
+    """The push guard must cover the whole delivered commit range."""
+
+    def test_push_uses_event_before_instead_of_only_head_parent(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as workflow_file:
+            workflow = workflow_file.read()
+
+        self.assertIn('parent_sha="${{ github.event.before }}"', workflow)
+        self.assertNotIn('parent_sha="$(git rev-parse HEAD^)"', workflow)
 
 
 if __name__ == '__main__':

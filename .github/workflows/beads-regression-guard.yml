@@ -47,14 +47,11 @@ jobs:
             parent_sha="$(git merge-base "$base_sha" "$head_sha")"
             echo "Comparing .beads/issues.jsonl: merge-base=$parent_sha -> head=$head_sha (pull_request)"
           else
-            # On push to main: compare HEAD (the new commit) against its first
-            # parent. This handles both direct pushes (HEAD~1 is the prior tip
-            # of main) and the common case where the merge commit on main has
-            # the prior tip of main as parent. If the parent itself didn't
-            # touch .beads/issues.jsonl the script still correctly compares
-            # against the most recent commit that did, per the script's
-            # documented behavior.
-            parent_sha="$(git rev-parse HEAD^)"
-            echo "Comparing .beads/issues.jsonl: parent=$parent_sha -> head=$head_sha (push to main)"
+            # On push to main, github.event.before is the remote main tip
+            # before the complete delivered push. HEAD^ only covers the last
+            # commit and can miss a regression introduced earlier in a
+            # multi-commit push.
+            parent_sha="${{ github.event.before }}"
+            echo "Comparing .beads/issues.jsonl: push-before=$parent_sha -> head=$head_sha (push to main)"
           fi
           python3 scripts/check_beads_no_regression.py "$parent_sha" "$head_sha"
