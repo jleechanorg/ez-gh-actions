@@ -1,6 +1,9 @@
 #!/bin/bash
 # ezgha tar wrapper (bead jleechan-93cf follow-up, 2026-07-19/20).
 #
+# (comment-only touch to trigger the mac-virtiofs-canary.yml path filter for
+# a real dispatch verification -- see PR description; no behavior change.)
+#
 # Baked into the runner image at /usr/local/bin/tar, which resolves ahead of
 # the real GNU tar at /usr/bin/tar in this image's PATH -- so any workflow
 # step that invokes the bare `tar` CLI (e.g. `curl ... | tar xzf -`, a
