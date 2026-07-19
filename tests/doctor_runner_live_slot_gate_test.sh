@@ -14,28 +14,31 @@
 # fully managed fleet -- so the gate flapped [BAD] while section 9/10's
 # 2-sample-verified per-slot proof showed 0 down in the SAME run.
 #
-# This test extracts the ACTUAL compute_execution_slot_critical() function from
+# This test extracts the ACTUAL compute_live_slot_critical() function from
 # doctor-runner (via sed, not a re-implementation) so it can't silently
 # drift from the real logic, then exercises it against fixture per-slot
 # counts, asserting:
-#   (a) all 10 Linux + 6 Mac configured slots executing -> NOT critical.
-#   (b) Linux full, 4 Mac executing + 2 idle -> critical.
-#   (c) Linux full, 5 Mac executing + 1 cycling -> critical.
-#   (d) Linux full, 4 Mac executing + 2 DOWN -> critical.
+#   (a) 1 executing + 15 IDLE-OK with no queue -> NOT critical.
+#   (b) all 10 Linux + 6 Mac configured slots executing -> NOT critical.
+#   (c) one slot cycling under daemon management -> NOT critical.
+#   (d) one persisted-DOWN slot -> critical.
 #
 # Usage: bash tests/doctor_runner_live_slot_gate_test.sh
+
+# Literal fixed-string assertions intentionally contain shell syntax.
+# shellcheck disable=SC2016
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
 
-# Extract the real compute_execution_slot_critical() function definition from
+# Extract the real compute_live_slot_critical() function definition from
 # doctor-runner (lines bounded by its def/close-brace markers) rather than
 # hardcoding a duplicate -- keeps the test honest against code drift.
-FUNC_START=$(grep -n '^compute_execution_slot_critical() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+FUNC_START=$(grep -n '^compute_live_slot_critical() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
 if [ -z "$FUNC_START" ]; then
-  echo "FAIL: could not locate compute_execution_slot_critical() in $DOCTOR_SCRIPT" >&2
+  echo "FAIL: could not locate compute_live_slot_critical() in $DOCTOR_SCRIPT" >&2
   exit 1
 fi
 FUNC_END=$(tail -n +"$FUNC_START" "$DOCTOR_SCRIPT" | grep -n '^}' | head -1 | cut -d: -f1)
@@ -59,60 +62,68 @@ if ! grep -Fq 'FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))' "$DOCTOR_
   echo "FAIL: production gate does not derive aggregate local+remote configured count" >&2
   exit 1
 fi
-if ! grep -Fq '"$FLEET_CONFIGURED_COUNT"' "$DOCTOR_SCRIPT"; then
-  echo "FAIL: production execution gate does not consume aggregate configured count" >&2
+if ! grep -Fq '"${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#CYCLING_SLOTS[@]}"' "$DOCTOR_SCRIPT"; then
+  echo "FAIL: production live-slot gate does not consume local four-state inventory" >&2
+  exit 1
+fi
+if ! grep -Fq '"${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}"' "$DOCTOR_SCRIPT"; then
+  echo "FAIL: production live-slot gate does not consume remote four-state inventory" >&2
   exit 1
 fi
 
 bad() { printf '  [BAD]  %s\n' "$*"; }  # stub matching doctor-runner's helper
 
 run_case() {
-  local label="$1" local_exec_n="$2" remote_exec_n="$3" expected="$4" expect_critical="$5"
+  local label="$1" local_exec_n="$2" local_idle_n="$3" local_cycling_n="$4"
+  local remote_exec_n="$5" remote_idle_n="$6" remote_cycling_n="$7"
+  local expected="$8" expect_critical="$9"
 
   eval "$FUNC_SRC"
 
-  local out executing critical
-  out=$(compute_execution_slot_critical "$local_exec_n" "$remote_exec_n" "$expected")
-  read -r executing critical <<< "$out"
+  local out live critical
+  out=$(compute_live_slot_critical \
+    "$local_exec_n" "$local_idle_n" "$local_cycling_n" \
+    "$remote_exec_n" "$remote_idle_n" "$remote_cycling_n" \
+    "$expected")
+  read -r live critical <<< "$out"
 
   CRITICAL=0
   if [ "$critical" -eq 1 ]; then
-    bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${executing}, expected >= ${expected} from config.toml runner.count=${expected})"
+    bad "verdict: live-slot gate FAILED (managed live slots = ${live}, expected ${expected})"
     CRITICAL=$((CRITICAL + 1))
   fi
 
   PASS=true
   if [ "$expect_critical" = "yes" ] && [ "$CRITICAL" -eq 0 ]; then
-    echo "  [$label] expected CRITICAL>0 but got CRITICAL=0 (executing=$executing expected=$expected) -- FAIL"
+    echo "  [$label] expected CRITICAL>0 but got CRITICAL=0 (live=$live expected=$expected) -- FAIL"
     PASS=false
   fi
   if [ "$expect_critical" = "no" ] && [ "$CRITICAL" -ne 0 ]; then
-    echo "  [$label] expected CRITICAL=0 but got CRITICAL=$CRITICAL (executing=$executing expected=$expected) -- FAIL"
+    echo "  [$label] expected CRITICAL=0 but got CRITICAL=$CRITICAL (live=$live expected=$expected) -- FAIL"
     PASS=false
   fi
   if [ "$PASS" = "true" ]; then
-    echo "  [$label] executing=$executing expected=$expected CRITICAL=$CRITICAL -- PASS"
+    echo "  [$label] live=$live expected=$expected CRITICAL=$CRITICAL -- PASS"
     return 0
   else
     return 1
   fi
 }
 
-echo "--- doctor-runner execution-slot gate regression ---"
+echo "--- doctor-runner live-slot gate regression ---"
 OVERALL_PASS=true
 
-# Full configured capacity is healthy only when every Linux and Mac slot has
-# Runner.Worker proof.
-run_case "10linux-6mac-exec-16expected" 10 6 16 "no" || OVERALL_PASS=false
+# A drained queue with 1 executing and 15 IDLE-OK slots is healthy.
+run_case "1exec-15idle-ok-16expected" 1 9 0 0 6 0 16 "no" || OVERALL_PASS=false
 
-# Two remote idle listeners are available but not executing real jobs.
-run_case "10linux-4mac-exec-2mac-idle-16expected" 10 4 16 "yes" || OVERALL_PASS=false
+# Full configured capacity executing remains healthy.
+run_case "10linux-6mac-exec-16expected" 10 0 0 6 0 0 16 "no" || OVERALL_PASS=false
 
-# One remote mid-respawn slot is cycling and cannot green the fleet.
-run_case "10linux-5mac-exec-1mac-cycling-16expected" 10 5 16 "yes" || OVERALL_PASS=false
+# A journal-confirmed cycling slot remains under daemon management.
+run_case "9linux-exec-1cycling-6mac-idle-16expected" 9 0 1 0 6 0 16 "no" || OVERALL_PASS=false
 
 # Persisted remote DOWN slots remain critical.
-run_case "10linux-4mac-exec-2mac-down-16expected" 10 4 16 "yes" || OVERALL_PASS=false
+run_case "9linux-exec-6mac-idle-1down-16expected" 9 0 0 0 6 0 16 "yes" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

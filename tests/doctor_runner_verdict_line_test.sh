@@ -123,8 +123,8 @@ OVERALL_PASS=true
 
 # Case (a): 10 local (8 executing + 2 idle, no starvation, matching this
 # repo's current 10-Linux contract) + 6 remote (6 executing, current
-# 6-Mac contract) = 16 configured. This is bucket-accounting coverage only;
-# the separate execution-slot gate correctly rejects its 14/16 execution.
+# 6-Mac contract) = 16 configured. The two idle slots are IDLE-OK when the
+# queue is not starved, so the live-slot gate keeps this healthy.
 run_case "local8exec-2idle-remote6exec-bucket-math" \
   8 2 0 0  6 0 0 0  0 \
   16 16 14 2 0 0 0 || OVERALL_PASS=false

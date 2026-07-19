@@ -1303,7 +1303,7 @@ elif [ -f "$SLOT_FILE" ]; then
 else
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$DEFAULT_CONFIGURED_COUNT}"
 fi
-# Execution-slot gate (consolidated, ez-gh-actions-n9py): REPLACES the prior
+# Live-slot gate (consolidated, ez-gh-actions-n9py): REPLACES the prior
 # single-sample `docker ps` container-count comparison (CONTAINER_COUNT vs
 # EXPECTED_CONTAINERS). That gate compared ONE raw `docker ps --filter
 # label=ezgha=managed` snapshot (taken in section 6, at whatever instant the
@@ -1314,30 +1314,38 @@ fi
 # fleet), so the gate flapped [BAD] while section 9's 2-sample-verified
 # per-slot proof (bead ez-gh-actions-b895) showed 0 down in the SAME run.
 # Rather than add a retry/threshold to the flaky sample, this DELETES it and
-# derives the execution-proof signal from section 9's per-slot Runner.Worker
-# inspection. Idle, cycling, and down slots remain useful diagnostic buckets,
-# but none prove that a real Actions job is executing.
-# compute_execution_slot_critical() is sed-extracted by
+# derives the managed-capacity signal from sections 9 and 10's per-slot truth.
+# EXECUTING, IDLE-OK, and journal-confirmed CYCLING slots are healthy capacity;
+# persisted-DOWN slots reduce the live count, while IDLE-STARVED is rejected by
+# the existing per-slot critical path above.
+# compute_live_slot_critical() is sed-extracted by
 # tests/doctor_runner_live_slot_gate_test.sh so tests exercise the real
 # logic, never a reimplementation.
-compute_execution_slot_critical() {
-# args: local_executing_n remote_executing_n configured_total
-  # stdout: "<executing_slots> <critical:0|1>"
-  local local_exec_n="$1" remote_exec_n="$2" expected="$3"
-  local exec_n=$((local_exec_n + remote_exec_n))
+compute_live_slot_critical() {
+  # args: local exec/idle/cycling, remote exec/idle/cycling, configured total
+  # stdout: "<managed_live_slots> <critical:0|1>"
+  local local_exec_n="$1" local_idle_n="$2" local_cycling_n="$3"
+  local remote_exec_n="$4" remote_idle_n="$5" remote_cycling_n="$6"
+  local expected="$7"
+  local live_n=$((
+    local_exec_n + local_idle_n + local_cycling_n +
+    remote_exec_n + remote_idle_n + remote_cycling_n
+  ))
   local critical=0
-  if [ "$exec_n" -lt "$expected" ]; then
+  if [ "$live_n" -lt "$expected" ]; then
     critical=1
   fi
-  printf '%d %d\n' "$exec_n" "$critical"
+  printf '%d %d\n' "$live_n" "$critical"
 }
 FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))
-read -r FLEET_EXECUTING_SLOTS EXECUTION_SLOT_CRITICAL < <(
-  compute_execution_slot_critical \
-    "${#EXECUTING_SLOTS[@]}" "${#REMOTE_EXECUTING_SLOTS[@]}" "$FLEET_CONFIGURED_COUNT"
+read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
+  compute_live_slot_critical \
+    "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
+    "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
+    "$FLEET_CONFIGURED_COUNT"
 )
-if [ "${EXECUTION_SLOT_CRITICAL:-0}" -eq 1 ]; then
-  bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${FLEET_EXECUTING_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote; local=${#EXECUTING_SLOTS[@]}/${LOCAL_COUNT}, remote=${#REMOTE_EXECUTING_SLOTS[@]}/${REMOTE_COUNT}; idle=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
+if [ "${LIVE_SLOT_CRITICAL:-0}" -eq 1 ]; then
+  bad "verdict: live-slot gate FAILED (managed live slots = ${FLEET_LIVE_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote; executing=$(( ${#EXECUTING_SLOTS[@]} + ${#REMOTE_EXECUTING_SLOTS[@]} )), idle-ok=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise
