@@ -2,4 +2,8 @@
 # Not needed by any production script — only by unittest fixtures that
 # mock the `requests` module (verify_mint_no_retry_on_4xx.py,
 # verify_mint_retry.py). See bead ez-gh-actions-r8od.
+# PyJWT: scripts/mint_gh_app_token.py imports `jwt` at module load and
+# sys.exit(2)s without it; the verify_mint_* tests import that script, so
+# a runner image without PyJWT preinstalled fails before any mocks run.
 requests
+PyJWT
