@@ -38,6 +38,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
+LEGACY_DOCTOR_SCRIPT="$REPO_ROOT/doctor.sh"
 
 TEMP_HOME=$(mktemp -d)
 cleanup() { rm -rf "$TEMP_HOME"; }
@@ -64,6 +65,22 @@ grep -Fq 'CONFIGURED_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
 }
 grep -Fq 'CONFIG_RUNNER_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
   echo "FAIL: verdict derivation does not use read_config_runner_count()" >&2
+  exit 1
+}
+grep -Fq 'DEFAULT_LINUX_RUNNER_COUNT=10' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: Linux fallback count is not the current 10-runner contract" >&2
+  exit 1
+}
+grep -Fq 'DEFAULT_MAC_RUNNER_COUNT=6' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: macOS fallback count is not the current 6-runner contract" >&2
+  exit 1
+}
+grep -Fq 'REMOTE_COUNT="${REMOTE_LINUX_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: remote Linux fallback count is not the current 10-runner contract" >&2
+  exit 1
+}
+grep -Fq 'CONFIGURED_COUNT="${CONFIGURED_COUNT:-10}"' "$LEGACY_DOCTOR_SCRIPT" || {
+  echo "FAIL: legacy doctor fallback count is not the current 10-runner contract" >&2
   exit 1
 }
 
@@ -114,7 +131,7 @@ run_case() {
 version = 1
 [runner]
 name_prefix = "ez-runner-c"
-count = 16 # RESIZED 2026-07-13: restore to 6 after Colima resize to 24GiB
+count = 16 # synthetic fixture; trailing digits must not alter the parsed count 24
 EOF
   else
     rm -f "$CONFIG_DIR/config.toml"
@@ -140,10 +157,28 @@ EOF
   fi
 }
 
+run_platform_default_case() {
+  local label="$1" platform_default="$2"
+
+  HOME="$TEMP_HOME"
+  SLOT_FILE="$CONFIG_DIR/missing-slot-assignments.toml"
+  EXPECTED_CONTAINERS=""
+  DEFAULT_CONFIGURED_COUNT="$platform_default"
+  eval "$COUNT_FUNC_SRC"
+  eval "$FUNC_SRC"
+  eval "$DERIVE_SRC"
+
+  if [ "$EXPECTED_CONTAINERS" != "$platform_default" ]; then
+    echo "  [$label] EXPECTED_CONTAINERS mismatch: got=$EXPECTED_CONTAINERS want=$platform_default -- FAIL"
+    return 1
+  fi
+  echo "  [$label] EXPECTED_CONTAINERS=$EXPECTED_CONTAINERS -- PASS"
+}
+
 echo "--- doctor-runner EXPECTED_CONTAINERS regression ---"
 OVERALL_PASS=true
 
-# Case 1: config.toml present (count=16) -> must resolve EXPECTED_CONTAINERS=16
+# Case 1: synthetic config.toml (count=16) -> must resolve EXPECTED_CONTAINERS=16
 # (not ~28 from the old double-count bug).
 run_case "config-present-16-containers" "yes" "16" || OVERALL_PASS=false
 
@@ -151,6 +186,11 @@ run_case "config-present-16-containers" "yes" "16" || OVERALL_PASS=false
 # count (16 entries) -> must resolve to 16 via the fallback (never the
 # whole-file double-count of ~28).
 run_case "config-missing-section-scoped-fallback" "no" "16" || OVERALL_PASS=false
+
+# Cases 3-4: with neither config nor slot assignments available, use the
+# platform-selected default instead of silently treating every host as macOS.
+run_platform_default_case "linux-platform-default" "10" || OVERALL_PASS=false
+run_platform_default_case "macos-platform-default" "6" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

@@ -11,7 +11,7 @@ use crate::github;
 const FLEET_ORG: &str = "jleechanorg";
 const LINUX_FLEET_PREFIX: &str = "ez-runner-c-";
 const MAC_FLEET_PREFIX: &str = "ez-mac-runner-b-";
-const LINUX_FLEET_COUNT: u32 = 16;
+const LINUX_FLEET_COUNT: u32 = 10;
 const MAC_FLEET_COUNT: u32 = 6;
 const EXPECTED_FLEET_RUNNERS: usize = (LINUX_FLEET_COUNT + MAC_FLEET_COUNT) as usize;
 
@@ -416,7 +416,7 @@ pub struct InvariantSample {
     pub inv1: bool,
     pub inv2: bool,
     /// Populated only when `inv1` is false. One of "missing-registration"
-    /// (fewer than the expected 22 runners are registered at all),
+    /// (fewer than the expected 16 runners are registered at all),
     /// "offline-respawning" (registered but not all online -- JIT
     /// deregister/respawn churn, see docs/ed8-fleet-churn-root-cause-*.md),
     /// or "genuinely-idle" (fully registered and online, but not picking up
@@ -493,7 +493,7 @@ fn combine_invariant_sample(
         .fold(0.0_f64, f64::max);
 
     // busy_count can never exceed EXPECTED_FLEET_RUNNERS (fleet_runner_stats
-    // filters to the 22 expected names only), so `>=` and `==` are
+    // filters to the 16 expected names only), so `>=` and `==` are
     // operationally identical; `>=` is the defensive form.
     //
     // Correctness fix, 2026-07-07 (found while verifying the mission's first
@@ -513,7 +513,7 @@ fn combine_invariant_sample(
     // silently accepted rather than alerted on). Only an UNCAPPED zero (a
     // fetch that genuinely enumerated everything and found nothing queued)
     // can satisfy this branch of the OR. The busy_count branch is unaffected
-    // -- fleet stats are never capped, so `busy >= 22` remains fully reliable
+    // -- fleet stats are never capped, so `busy >= 16` remains fully reliable
     // regardless of `queued_jobs_capped`.
     let inv1 =
         fleet.busy_count >= EXPECTED_FLEET_RUNNERS || (queued_jobs == 0 && !queued_jobs_capped);
@@ -1555,24 +1555,39 @@ mod tests {
     }
 
     #[test]
-    fn fleet_stats_counts_exact_22_runner_pool_only() {
+    fn fleet_stats_counts_exact_16_runner_pool_only() {
         let runners = vec![
             runner("ez-runner-c-1", "online", true),
             runner("ez-runner-c-2", "online", false),
+            runner("ez-runner-c-10", "online", true),
+            runner("ez-runner-c-11", "online", true),
             runner("ez-mac-runner-b-1", "offline", false),
+            runner("ez-mac-runner-b-6", "online", false),
             runner("ez-canary-runner-b-1", "online", false),
         ];
 
         let stats = fleet_runner_stats(runners);
 
-        assert_eq!(stats.expected_total, 22);
-        assert_eq!(stats.registered_count, 3);
-        assert_eq!(stats.busy_count, 1);
-        assert_eq!(stats.idle_count, 1);
+        assert_eq!(stats.expected_total, 16);
+        assert_eq!(stats.registered_count, 5);
+        assert_eq!(stats.busy_count, 2);
+        assert_eq!(stats.idle_count, 2);
         assert!(stats.missing_names.contains(&"ez-runner-c-3".to_string()));
-        assert!(stats
+        assert!(!stats
             .missing_names
             .contains(&"ez-mac-runner-b-6".to_string()));
+        assert!(stats
+            .runners
+            .iter()
+            .any(|runner| runner.name == "ez-runner-c-10"));
+        assert!(stats
+            .runners
+            .iter()
+            .any(|runner| runner.name == "ez-mac-runner-b-6"));
+        assert!(!stats
+            .runners
+            .iter()
+            .any(|runner| runner.name == "ez-runner-c-11"));
         assert!(!stats
             .runners
             .iter()
@@ -1838,7 +1853,7 @@ exit 1
         assert_eq!(
             sample.inv1_fail_class.as_deref(),
             Some("genuinely-idle"),
-            "busy < 22 with the fleet fully registered+online and no confirmed \
+            "busy < 16 with the fleet fully registered+online and no confirmed \
              queued work classifies as genuinely-idle, not a fabricated pass"
         );
     }
@@ -1921,7 +1936,7 @@ exit 1
             registered_count: EXPECTED_FLEET_RUNNERS - 1,
             busy_count: EXPECTED_FLEET_RUNNERS - 1,
             idle_count: 0,
-            missing_names: vec!["ez-runner-c-16".into()],
+            missing_names: vec!["ez-runner-c-10".into()],
             runners: vec![fleet_runner("ez-mac-runner-b-1", "offline", false)],
         };
         assert_eq!(classify_inv1_failure(&fleet), "missing-registration");
@@ -1966,8 +1981,8 @@ exit 1
         cfg.invariant_sampler.history_path = Some(history.clone());
         let sample = InvariantSample {
             ts: 1_700_000_000,
-            busy: 20,
-            registered: 22,
+            busy: 14,
+            registered: 16,
             queued_jobs: 3,
             queued_jobs_capped: false,
             oldest_queued_job_min: 12.5,
@@ -2000,7 +2015,7 @@ exit 1
             assert!(obj.contains_key(key), "missing schema field {key}");
         }
         assert_eq!(obj.len(), 10, "no extra fields beyond the E1 schema");
-        assert_eq!(obj["busy"], 20);
+        assert_eq!(obj["busy"], 14);
         assert_eq!(obj["inv1"], false);
         assert_eq!(obj["inv1_fail_class"], "genuinely-idle");
         let _ = fs::remove_dir_all(dir);

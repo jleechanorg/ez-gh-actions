@@ -368,7 +368,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot local execution proof (docker top, LOCAL-ONLY)"
 CONFIGURED_COUNT=$(awk -F'=' '/^[[:space:]]*count/ {split($2, a, "#"); gsub(/[^0-9]/,"",a[1]); print a[1]; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
-CONFIGURED_COUNT="${CONFIGURED_COUNT:-16}"
+CONFIGURED_COUNT="${CONFIGURED_COUNT:-10}"
 
 classify_local_slot() {
   # Echoes one of: DOWN | IDLE | EXECUTING for container name "$1".
@@ -420,7 +420,7 @@ fi
 [ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "executing right now: ${EXECUTING_SLOTS[*]}"
 
 # Optional Mac fleet probe via SSH — best-effort, never fatal if unreachable
-# (the mission's fleet is "16 Linux + 6 Mac"; the Mac half is proven the
+# (the current fleet is "10 Linux + 6 Mac"; the Mac half is proven the
 # same way, over SSH, when the host is reachable).
 MAC_HOST="${MAC_HOST:-macbook}"
 MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
@@ -575,7 +575,7 @@ fi
 [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && CRITICAL=$((CRITICAL+1))
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
-# the "22/22 executing" standard — ground truth from docker, not the
+# the "16/16 executing" standard — ground truth from docker, not the
 # GitHub API, so it cannot be fooled by a rate-limited fleet-state query.
 [ "${SLOT_PROOF_CRITICAL:-0}" -gt 0 ] && CRITICAL=$((CRITICAL + SLOT_PROOF_CRITICAL))
 

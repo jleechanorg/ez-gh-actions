@@ -1,4 +1,4 @@
-# jeff-ubuntu fleet — 16 runners, native docker.
+# jeff-ubuntu fleet — 10 runners.
 # Install: cp config/config.toml.linux.example ~/.config/ezgha/config.toml
 version = 1
 
@@ -7,13 +7,13 @@ scope = "org"
 target = "jleechanorg"
 
 [runner]
-name_prefix = "ez-runner-b"
+name_prefix = "ez-runner-c"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64"]
-count = 16
+count = 10
 image = "ezgha-runner:latest"
 
 [limits]
-memory_mb = 5977
+memory_mb = 3000
 cpus = 2.0
 pids = 512
 min_free_disk_gb = 10

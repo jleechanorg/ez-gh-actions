@@ -156,7 +156,7 @@ about to exhaust its API budget (every serve cycle calls list_runners + generate
   (and, if the runner uses a GitHub App/graphql, check `.graphql.remaining` too)
 - No `403`/`429` secondary-rate-limit errors in the ezgha journal in the last 30 min
 - The serve loop's poll interval × COUNT stays within a sane fraction of the hourly budget
-  (document the math: 16 runners × 2 calls / 30s ≈ 3840 calls/hr — must be < budget)
+  (document the math: 10 Linux runners × 2 calls / 30s ≈ 2400 calls/hr — must be < budget)
 
 ## Gate 8 — Security + hygiene (⊘ manual review + AUTO greps) (AUTO where noted)
 
