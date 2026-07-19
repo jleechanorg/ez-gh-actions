@@ -2118,10 +2118,7 @@ fn start_one_with_generate_at_slot(
             if std::fs::create_dir_all(&runner_workspace).is_ok() {
                 cmd.args([
                     "-v",
-                    &format!(
-                        "{}:/home/runner/_work",
-                        runner_workspace.to_string_lossy()
-                    ),
+                    &format!("{}:/home/runner/_work", runner_workspace.to_string_lossy()),
                 ]);
                 // Flag this container as having the virtiofs-backed workspace
                 // mount so the image's /usr/local/bin/tar wrapper
@@ -2159,10 +2156,7 @@ fn start_one_with_generate_at_slot(
                 // denied" even though extraction itself succeeds (bead
                 // jleechan-krow, found via adversarial review of this fix).
                 for shadowed in ["_actions", "_temp", "_tool"] {
-                    cmd.args([
-                        "--tmpfs",
-                        &format!("/home/runner/_work/{shadowed}:exec"),
-                    ]);
+                    cmd.args(["--tmpfs", &format!("/home/runner/_work/{shadowed}:exec")]);
                 }
             }
         }
@@ -4209,7 +4203,10 @@ minimum_isolation = "container"
     /// Fake `docker` script that captures its full argv to `capture_path`
     /// (one line per invocation) and, for `run`, prints a fake container ID
     /// to stdout so `start_one_with_generate` sees a successful start.
-    fn fake_docker_capturing_args(temp_dir: &std::path::Path, capture_path: &std::path::Path) -> PathBuf {
+    fn fake_docker_capturing_args(
+        temp_dir: &std::path::Path,
+        capture_path: &std::path::Path,
+    ) -> PathBuf {
         std::fs::create_dir_all(temp_dir).unwrap();
         let script = temp_dir.join("docker");
         std::fs::write(
@@ -4264,8 +4261,10 @@ minimum_isolation = "container"
         let _env = TestEnv::new("wheelhouse_mount_missing_fail_open");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(2, "ez-org-runner");
-        let temp_dir =
-            env::temp_dir().join(format!("ezgha-wheelhouse-missing-test-{}", std::process::id()));
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-wheelhouse-missing-test-{}",
+            std::process::id()
+        ));
         // Deliberately do NOT create this directory -- proves fail-open.
         let missing_wheelhouse = temp_dir.join("does-not-exist");
         cfg.runner.wheelhouse_host_path = Some(missing_wheelhouse.to_string_lossy().into_owned());
@@ -4295,8 +4294,7 @@ minimum_isolation = "container"
         let _env = TestEnv::new("workspace_mount_present");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(2, "ez-org-runner");
-        let temp_dir =
-            env::temp_dir().join(format!("ezgha-workspace-test-{}", std::process::id()));
+        let temp_dir = env::temp_dir().join(format!("ezgha-workspace-test-{}", std::process::id()));
         let workspace_root = temp_dir.join("workspace-root");
         std::fs::create_dir_all(&workspace_root).unwrap();
         cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
@@ -4397,8 +4395,10 @@ minimum_isolation = "container"
         let _env = TestEnv::new("workspace_mount_virtiofs_env");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(1, "ez-org-runner");
-        let temp_dir =
-            env::temp_dir().join(format!("ezgha-workspace-virtiofs-env-test-{}", std::process::id()));
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-workspace-virtiofs-env-test-{}",
+            std::process::id()
+        ));
         let workspace_root = temp_dir.join("workspace-root");
         std::fs::create_dir_all(&workspace_root).unwrap();
         cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
@@ -4430,8 +4430,10 @@ minimum_isolation = "container"
         let _env = TestEnv::new("workspace_mount_missing_fail_open");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(2, "ez-org-runner");
-        let temp_dir =
-            env::temp_dir().join(format!("ezgha-workspace-missing-test-{}", std::process::id()));
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-workspace-missing-test-{}",
+            std::process::id()
+        ));
         // Deliberately do NOT create this directory -- proves fail-open.
         let missing_root = temp_dir.join("does-not-exist");
         cfg.runner.workspace_host_path = Some(missing_root.to_string_lossy().into_owned());
@@ -4476,7 +4478,11 @@ minimum_isolation = "container"
         // workspace subdir -- must not be visible to the next job.
         let runner_workspace = workspace_root.join("ez-org-runner-1");
         std::fs::create_dir_all(&runner_workspace).unwrap();
-        std::fs::write(runner_workspace.join("leaked-secret.txt"), b"prior job data").unwrap();
+        std::fs::write(
+            runner_workspace.join("leaked-secret.txt"),
+            b"prior job data",
+        )
+        .unwrap();
 
         let capture = temp_dir.join("docker-args.log");
         let script = fake_docker_capturing_args(&temp_dir, &capture);
