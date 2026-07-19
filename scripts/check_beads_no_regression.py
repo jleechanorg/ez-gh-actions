@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -99,12 +100,32 @@ def read_beads_from_git(revision: str, path: str) -> dict[str, dict]:
     return parse_jsonl_beads(result.stdout, f"{revision}:{path}")
 
 
+# beads `updated_at` values commonly carry 9-digit nanosecond fractional
+# seconds (e.g. "...T20:00:00.123456789Z"). `datetime.fromisoformat` only
+# gained arbitrary-precision fractional-second support in Python 3.11; on
+# older CPython builds (3.10 and earlier) it raises ValueError for anything
+# other than exactly 3 or 6 digits, which would make parse_timestamp return
+# None and silently skip the regression check. Truncate/pad the fractional
+# part to exactly 6 digits (microseconds) ourselves so parsing is
+# version-independent instead of relying on the runtime's Python version.
+_FRACTIONAL_SECONDS_RE = re.compile(r"(\.\d+)")
+
+
+def _normalize_fractional_seconds(value: str) -> str:
+    def _truncate(match: "re.Match[str]") -> str:
+        digits = match.group(1)[1:]  # strip leading '.'
+        digits = (digits + "000000")[:6]
+        return f".{digits}"
+
+    return _FRACTIONAL_SECONDS_RE.sub(_truncate, value, count=1)
+
+
 def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
         # Normalize trailing 'Z' (Zulu) to an explicit UTC offset for fromisoformat.
-        normalized = value.replace("Z", "+00:00")
+        normalized = _normalize_fractional_seconds(value.replace("Z", "+00:00"))
         dt = datetime.fromisoformat(normalized)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)

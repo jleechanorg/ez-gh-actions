@@ -43,9 +43,9 @@ jobs:
           set -euo pipefail
           head_sha="${{ github.sha }}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            parent_sha="${{ github.event.pull_request.base.sha }}"
-            merge_base="$(git merge-base "$parent_sha" "$head_sha")"
-            echo "Comparing .beads/issues.jsonl: merge-base=$merge_base -> head=$head_sha (pull_request)"
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            parent_sha="$(git merge-base "$base_sha" "$head_sha")"
+            echo "Comparing .beads/issues.jsonl: merge-base=$parent_sha -> head=$head_sha (pull_request)"
           else
             # On push to main: compare HEAD (the new commit) against its first
             # parent. This handles both direct pushes (HEAD~1 is the prior tip
