@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # doctor.sh — ez-gh-actions fleet health check. Read-only.
-# Outputs a one-shot human-readable report; --json emits machine-parseable
-# status for the loop agent (or a follow-up Claude Code session) to drive
-# iteration. Designed to fail loudly on the things that previously caused
+# Outputs a one-shot human-readable report. Aggregate machine-readable status
+# is owned by scripts/runner_dashboard_host_probe.sh; --json now fails early
+# instead of falsely wrapping this detailed cross-host report as JSON.
+# Designed to fail loudly on the things that previously caused
 # silent fleet decay (slot-file desync, missing daemons, container/reg drift).
 set -euo pipefail
 
 # --- arg parsing ---------------------------------------------------------
-JSON=0
 DETAIL=0
 PROVE=0
 for a in "$@"; do
   case "$a" in
-    --json) JSON=1 ;;
+    --json)
+      echo "doctor-runner --json is unsupported; use scripts/runner_dashboard_host_probe.sh --host-class mac|linux" >&2
+      exit 2
+      ;;
     --detail|-v|--verbose) DETAIL=1 ;;
     --prove) PROVE=1 ;;   # dispatch a live canary job and verify it runs on our fleet
     -h|--help)
@@ -39,6 +42,28 @@ warn() { printf '  [WARN] %s\n' "$*"; }
 bad() { printf '  [BAD]  %s\n' "$*"; }
 info() { printf '  [..]   %s\n' "$*"; }
 
+# Parse the authoritative [runner].count with Python's TOML parser. The old
+# awk removed every non-digit from the whole assignment tail, so digits in an
+# inline comment (for example a resize date) were appended to the real value;
+# section 9 then attempted `seq 1 <that enormous number>` and never reached
+# the verdict. Keep both count consumers on this one parser.
+read_config_runner_count() {
+  python3 - "$1" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        count = tomllib.load(handle)["runner"]["count"]
+    if type(count) is not int or count <= 0:
+        raise ValueError("invalid runner.count")
+except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
+    raise SystemExit(1)
+
+print(count)
+PY
+}
+
 # Platform detection: the same fleet can run on Linux (systemd) or macOS
 # (launchd) and the diagnostic surfaces differ accordingly. Detect ONCE at
 # the top so downstream sections branch consistently.
@@ -48,34 +73,13 @@ case "$(uname -s)" in
   *)      PLATFORM="other" ;;
 esac
 
+source "$SCRIPT_DIR/scripts/launchd-service-docker-endpoint.sh"
+use_launchd_service_docker_endpoint "$PLATFORM"
+
 # Probe the supervisor (systemd on Linux, launchd on macOS) for ezgha's
 # service state. Returns one of: active | inactive | failed | not-loaded.
 probe_service_state() {
-  if [ "$PLATFORM" = "linux" ]; then
-    systemctl --user is-active ezgha.service 2>/dev/null || echo "inactive"
-  elif [ "$PLATFORM" = "macos" ]; then
-    # launchctl prints `PID STATUS LABEL` per loaded job. The ezgha label is
-    # `org.jleechanorg.ezgha`. PID column "-" with STATUS "0" means loaded
-    # but not running; any other STATUS is the last exit code.
-    local line
-    line=$(launchctl list 2>/dev/null | awk '$3 == "org.jleechanorg.ezgha" {print; exit}')
-    if [ -z "$line" ]; then
-      echo "not-loaded"
-      return
-    fi
-    local pid status
-    pid=$(echo "$line" | awk '{print $1}')
-    status=$(echo "$line" | awk '{print $2}')
-    if [ -n "$pid" ] && [ "$pid" != "-" ]; then
-      echo "active"
-    elif [ "$status" = "0" ]; then
-      echo "inactive"
-    else
-      echo "failed"
-    fi
-  else
-    echo "unsupported"
-  fi
+  "$SCRIPT_DIR/scripts/runner_dashboard_host_probe.sh" --service-state
 }
 
 # Read the last N minutes of ezgha service logs. On Linux this is journalctl;
@@ -419,10 +423,6 @@ if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN
     GH_TOKEN_STALE_CRITICAL=1
   fi
 fi
-if [ "$JSON" = "1" ]; then
-  info "gh_token_status=$GH_TOKEN_STATUS gh_token_age_min=$GH_TOKEN_AGE_MIN gh_token_stale_critical=$GH_TOKEN_STALE_CRITICAL"
-fi
-
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
 RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
@@ -457,6 +457,65 @@ CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 info "managed containers running: $CONTAINER_COUNT (expected: configured runner.count)"
 echo "$CONTAINER_NAMES" | head -20
+
+# --- D2. host resource pressure (2026-07-19, user request: "detect these
+# upfront") -----------------------------------------------------------------
+# General host CPU congestion (concurrent agent sessions, browser automation,
+# disk scanners, OS background daemons) is NOT an ezgha bug, but it degrades
+# the daemon's own ability to talk to Docker -- confirmed live: 550
+# "docker CLI timed out" errors + 6394 "settling ceiling reached" warnings
+# co-occurred with a 1-min load average of 25-231 on a 14-core Mac while the
+# top CPU consumers were a disk-usage scanner, three Aside browser-automation
+# helpers, and macOS's own XProtect/syspolicyd/suggestd daemons -- none of
+# them ezgha-related. This section surfaces that congestion (and its
+# fingerprint in the daemon's own logs) so it's visible at a glance instead
+# of requiring an ad-hoc `ps aux` + log grep every time the fleet seems
+# flaky. Non-blocking (WARN only) -- machine congestion outside ezgha's
+# control should not fail the health gate, but it must never be invisible.
+section "6b. host resource pressure"
+if [ "$PLATFORM" = "macos" ]; then
+  CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
+elif [ "$PLATFORM" = "linux" ]; then
+  CORES=$(nproc 2>/dev/null || echo 0)
+else
+  CORES=0
+fi
+LOAD_LINE=$(uptime 2>/dev/null || true)
+LOAD_1MIN=$(printf '%s' "$LOAD_LINE" | sed -nE 's/.*load averages?:[[:space:]]*([0-9]+([.][0-9]+)?).*/\1/p' 2>/dev/null || true)
+info "uptime: ${LOAD_LINE:-unavailable}"
+if [ -n "$LOAD_1MIN" ] && [ "$CORES" -gt 0 ] 2>/dev/null; then
+  THRESHOLD=$((CORES * 2))
+  if awk -v load="$LOAD_1MIN" -v threshold="$THRESHOLD" 'BEGIN { exit !(load > threshold) }'; then
+    warn "1-min load ($LOAD_1MIN) exceeds 2x core count ($CORES cores, threshold $THRESHOLD) -- host is oversubscribed; expect slower docker CLI calls and respawns, not necessarily an ezgha bug"
+  else
+    ok "1-min load ($LOAD_1MIN) within 2x core count ($CORES cores)"
+  fi
+else
+  warn "could not parse load average or core count -- skipping oversubscription check"
+fi
+info "top 5 CPU consumers right now:"
+# `set -o pipefail` turns ps's SIGPIPE (from head closing the pipe early)
+# into a script-aborting error -- `|| true` on the full pipeline avoids that
+# without losing the actual failure signal (head/sed themselves not failing).
+{ ps -Ao pcpu,comm -r 2>/dev/null | head -6 | tail -5 | sed 's/^/    /'; } || true
+# Correlate with the daemon's OWN degradation signature from recent_logs(),
+# reusing the rest of the script's log source. Linux is time-windowed; macOS
+# launchd redirects have no timestamps, so report their bounded tail honestly.
+if [ "$PLATFORM" = "macos" ]; then
+  PRESSURE_LOG_SCOPE="recent launchd log tail (up to 200 lines per stream)"
+else
+  PRESSURE_LOG_SCOPE="last 5 min"
+fi
+TIMEOUT_HITS=$(recent_logs 5 2>/dev/null | grep -c 'docker CLI timed out' || true)
+SETTLING_HITS=$(recent_logs 5 2>/dev/null | grep -c 'settling ceiling reached' || true)
+if [ "${TIMEOUT_HITS:-0}" -gt 0 ] 2>/dev/null; then
+  warn "daemon logged $TIMEOUT_HITS 'docker CLI timed out' error(s) in the $PRESSURE_LOG_SCOPE -- host congestion is measurably slowing the daemon's own docker calls"
+else
+  ok "no 'docker CLI timed out' errors in the $PRESSURE_LOG_SCOPE"
+fi
+if [ "${SETTLING_HITS:-0}" -gt 3 ] 2>/dev/null; then
+  warn "daemon logged $SETTLING_HITS 'settling ceiling reached' warning(s) in the $PRESSURE_LOG_SCOPE -- container respawns are running slower than expected, consistent with host congestion above"
+fi
 
 # --- E. recent routing proof: jobs REALLY ran on the configured fleet -----
 # "online" is not "working". This section proves recent GitHub Actions jobs
@@ -649,8 +708,15 @@ fi
 # not just however many containers happen to exist — so a slot that never
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
-CONFIGURED_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
-CONFIGURED_COUNT="${CONFIGURED_COUNT:-16}"
+CONFIGURED_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
+DEFAULT_LINUX_RUNNER_COUNT=10
+DEFAULT_MAC_RUNNER_COUNT=6
+if [ "$PLATFORM" = "macos" ]; then
+  DEFAULT_CONFIGURED_COUNT="$DEFAULT_MAC_RUNNER_COUNT"
+else
+  DEFAULT_CONFIGURED_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"
+fi
+CONFIGURED_COUNT="${CONFIGURED_COUNT:-$DEFAULT_CONFIGURED_COUNT}"
 HOST_LABEL="$PLATFORM ($(hostname -s 2>/dev/null || hostname))"
 
 classify_local_slot() {
@@ -857,14 +923,49 @@ job_evidence_for_runner() {
   elapsed_min=$(iso_elapsed_min "$started_at")
   printf '%s | started %s (%sm ago) | %s' "$job_name" "$started_at" "${elapsed_min:-?}" "$run_url"
 }
+# Resolve the DOCKER_HOST the remote host's ezgha DAEMON actually uses, so
+# remote docker probes hit the daemon's endpoint — NOT the ssh login shell's
+# active docker context. Root cause (2026-07-15): the macbook's interactive
+# context was `colima-ci` while the daemon ran against
+# unix:///Users/jleechan/.colima/default/docker.sock; every remote probe
+# queried the wrong daemon and reported 5/6 DOWN while 6 containers existed
+# on the daemon's socket. macOS: read EnvironmentVariables.DOCKER_HOST from
+# the launchd plist (the daemon's source of truth). Linux: the systemd unit
+# env or default socket. Empty result = bare `docker` (unchanged behavior).
+REMOTE_DOCKER_HOST_CACHE=""
+REMOTE_DOCKER_HOST_CACHED_FOR=""
+remote_docker_env() {
+  local host="$1"
+  if [ "$REMOTE_DOCKER_HOST_CACHED_FOR" = "$host" ]; then
+    printf '%s' "$REMOTE_DOCKER_HOST_CACHE"
+    return 0
+  fi
+  local dh
+  dh=$(timeout 8 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" '
+    if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
+      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
+    elif command -v systemctl >/dev/null 2>&1; then
+      systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1
+    fi' 2>/dev/null) || dh=""
+  if [ -n "$dh" ]; then
+    REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
+  else
+    REMOTE_DOCKER_HOST_CACHE=""
+  fi
+  REMOTE_DOCKER_HOST_CACHED_FOR="$host"
+  printf '%s' "$REMOTE_DOCKER_HOST_CACHE"
+}
+
 probe_slot_state() {
   # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1"
-  # (localhost = local docker, anything else = ssh).
-  local host="$1" name="$2" running work
+  # (localhost = local docker, anything else = ssh against the remote
+  # DAEMON's docker endpoint — see remote_docker_env).
+  local host="$1" name="$2" running work denv
   if [ "$host" = "localhost" ]; then
     running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
   else
-    running=$(ssh -o ConnectTimeout=4 "$host" "docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
+    denv=$(remote_docker_env "$host")
+    running=$(ssh -o ConnectTimeout=4 "$host" "${denv}docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
   fi
   if [ "$running" != "true" ]; then
     echo "DOWN"
@@ -873,7 +974,7 @@ probe_slot_state() {
   if [ "$host" = "localhost" ]; then
     set +e; docker top "$name" -eo pid,comm 2>/dev/null | grep -qw Worker; work=$?; set -e
   else
-    set +e; ssh -o ConnectTimeout=4 "$host" "docker top '$name' -eo pid,comm 2>/dev/null | grep -qw Worker" >/dev/null 2>&1; work=$?; set -e
+    set +e; ssh -o ConnectTimeout=4 "$host" "${denv}docker top '$name' -eo pid,comm 2>/dev/null | grep -qw Worker" >/dev/null 2>&1; work=$?; set -e
   fi
   if [ "$work" -eq 0 ]; then echo "EXECUTING"; else echo "IDLE"; fi
 }
@@ -1010,7 +1111,7 @@ list_slot_work() {
 # ON the Mac mislabeled the Mac's own fleet as Linux's — fixed to report the
 # true local host so evidence provenance is never ambiguous).
 LOCAL_PREFIX="${RUNNER_NAME_PREFIX:-ez-runner-c}"
-LOCAL_COUNT="${CONFIGURED_COUNT:-16}"
+LOCAL_COUNT="$CONFIGURED_COUNT"
 list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 
 # Remote fleet (SSH) — the OTHER half of the two-host fleet. Only when
@@ -1027,12 +1128,12 @@ list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
   REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
-  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-16}"
+  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
   REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
-  REMOTE_COUNT="${MAC_RUNNER_COUNT:-6}"
+  REMOTE_COUNT="${MAC_RUNNER_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
 REMOTE_EXECUTING_SLOTS=()
@@ -1163,14 +1264,14 @@ fi
 # tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
 # config.toml is unreadable): count lines within the [assignments] section
 # ONLY, never a whole-file grep.
-CONFIG_RUNNER_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+CONFIG_RUNNER_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
 if [ -n "${CONFIG_RUNNER_COUNT:-}" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$CONFIG_RUNNER_COUNT}"
 elif [ -f "$SLOT_FILE" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$(count_assignments_section "$SLOT_FILE")}"
-  EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-6}"
+  EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$DEFAULT_CONFIGURED_COUNT}"
 else
-  EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-6}"
+  EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$DEFAULT_CONFIGURED_COUNT}"
 fi
 # Live-slot gate (consolidated, ez-gh-actions-n9py): REPLACES the prior
 # single-sample `docker ps` container-count comparison (CONTAINER_COUNT vs
@@ -1254,7 +1355,7 @@ if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
 fi
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
-# the "22/22 executing" standard — ground truth from docker, not the
+# the "16/16 executing" standard — ground truth from docker, not the
 # GitHub API, so it cannot be fooled by a rate-limited fleet-state query.
 # Per-slot bad() lines already printed above (section 9/10); this is the
 # verdict-level summary tying that evidence to the CRITICAL count.

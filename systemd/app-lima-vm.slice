@@ -1,0 +1,40 @@
+# app-lima-vm.slice — user-scope DIRECT memory ceiling for the Colima/Lima VM QEMU process.
+# Part of bead jleechan-aqh (apply and verify limits against the actual QEMU cgroup).
+#
+# MemoryHigh (NOT DefaultMemoryHigh) on purpose: this slice declares the
+# enforcement directly. DefaultMemoryHigh only applies as an inherited cap
+# to descendants that don't set their own — leaving the slice's actual
+# ceiling unset is a workaround that depends on a user-scope drop-in that
+# is not in this repo. By setting MemoryHigh on the slice itself, every
+# service placed inside (lima-vm@colima, etc.) inherits the cap with no
+# drop-in required.
+#
+# Per repo CLAUDE.md "Self-Outage Prevention Principle": a *soft* MemoryHigh
+# (throttle + reclaim under pressure) is preferred over MemoryMax (SIGKILL).
+# MemoryMax would kill the VM outright under pressure, defeating the very
+# reliability boundary this is meant to enforce — turning the guard into the
+# outage it was meant to prevent.
+#
+# 34 GiB is set ON PURPOSE below the 36 GiB guest VM static allocation AND
+# 2 GiB below the ~37.6 GiB observed failure point. The throttle sits in the
+# band where the VM is at its top end but has not yet crossed into the
+# runaway that produced the earlier crash; with 34 GiB the throttle WILL
+# catch that runaway. Going lower (e.g. 30 GiB) would throttle during
+# normal peak and degrade the fleet; going higher (e.g. 38 GiB) sits above
+# the failure point and would not have caught the crash.
+#
+# Installation (no sudo, user-scope):
+#   cp systemd/app-lima-vm.slice ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user restart lima-vm@colima.service
+# Then verify:
+#   cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-lima\\x2dvm.slice/lima-vm@colima.service/memory.high
+# should print 36507222016 (= 34 GiB).
+
+[Unit]
+Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (34 GiB)
+Before=slices.target
+
+[Slice]
+MemoryHigh=34G
+MemoryAccounting=yes

@@ -889,9 +889,55 @@ pub struct RunnerInfo {
     pub busy: bool,
 }
 
+/// One page of `gh api --paginate --slurp` output for the runners-listing
+/// endpoint. `total_count` is the org/repo-wide count GitHub reports on page 0;
+/// it is `None` on page 0 when the API omits it (older gh / non-paginated
+/// callers) and on every page >= 1 (GitHub only emits it on page 0).
+///
+/// Tracking it is what makes the partial-snapshot fail-closed check possible:
+/// a truncated HTTP-200 stream (the 2026-07-07 churn root cause flagged by
+/// ez-gh-actions-r3f12 / ghd2.1) has `total_count != observed`, and the daemon
+/// must refuse to mutate slot state in that case.
 #[derive(Debug, Deserialize)]
 struct RunnerList {
+    #[serde(default)]
+    total_count: Option<u64>,
     runners: Vec<RunnerInfo>,
+}
+
+/// Outcome of consuming a paginated list-runners page stream.
+///
+/// `Complete` means the stream is authoritative and callers may safely mutate
+/// slot state from it. `Partial { expected, observed }` means the first page's
+/// `total_count` disagrees with the items actually observed across all pages —
+/// i.e. the HTTP-200 stream was truncated (network drop, rate-limit tail cut,
+/// `gh api` child-killed) and any slot-state mutation would silently work from
+/// stale data. The caller MUST refuse rather than guess.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotOutcome {
+    Complete,
+    Partial { expected: u64, observed: u64 },
+}
+
+/// Pure verifier — given a parsed page stream, classify it as Complete or
+/// Partial without touching I/O. Rules (matches the GitHub REST contract for
+/// `<resource>` list endpoints, where `total_count` appears ONLY on page 0):
+///
+/// * If page 0 has no `total_count`, the stream is treated as Complete (the
+///   API didn't promise a count, so the page stream is authoritative).
+/// * If page 0 has a `total_count`, it MUST equal the sum of items across
+///   every page — otherwise the stream is Partial and the caller must refuse
+///   to mutate state on it.
+fn verify_snapshot_complete(pages: &[RunnerList]) -> SnapshotOutcome {
+    let observed: u64 = pages.iter().map(|p| p.runners.len() as u64).sum();
+    let expected = pages.first().and_then(|p| p.total_count);
+    match expected {
+        Some(t) if t != observed => SnapshotOutcome::Partial {
+            expected: t,
+            observed,
+        },
+        _ => SnapshotOutcome::Complete,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1005,6 +1051,20 @@ fn list_runners_core(gh: &GithubConfig, deadline: Option<Instant>) -> Result<Vec
         )
     })?;
     watchdog::ping();
+    // Fail-closed on partial HTTP-200. If the first page's `total_count` disagrees
+    // with the items actually observed across the page stream, the response is
+    // truncated — `gh api` got cut off mid-paginate (rate-limit tail, child-killed,
+    // network drop). Mutating slot state on that data is the destructive churn
+    // flagged by ez-gh-actions-r3f12 / ghd2.1: `release_stale_slots` would
+    // reclaim every "missing" runner, then `ensure_count` respawns them, then
+    // the next tick re-registers the originals. Refuse to mutate instead.
+    if let SnapshotOutcome::Partial { expected, observed } = verify_snapshot_complete(&pages) {
+        log_gh_response("gh api list runners truncated payload", &out);
+        bail!(
+            "partial snapshot: expected {expected} runners but observed {observed} from page stream; \
+             refusing to mutate slot state on truncated data"
+        );
+    }
     Ok(pages.into_iter().flat_map(|page| page.runners).collect())
 }
 
@@ -1561,6 +1621,206 @@ mod tests {
         let pages: Vec<RunnerList> = serde_json::from_slice(b"[]").unwrap();
         let flattened: Vec<RunnerInfo> = pages.into_iter().flat_map(|p| p.runners).collect();
         assert!(flattened.is_empty());
+    }
+
+    // -- partial-snapshot fail-closed (bead ez-gh-actions-r3f12 / ghd2.1) --
+
+    /// Pure-function tests for the snapshot-completeness verifier. Covers the
+    /// edge cases that are awkward to express through a fake-`gh` script.
+    #[test]
+    fn verify_snapshot_complete_classifies_cases() {
+        let page = |ids: &[u64], tc: Option<u64>| RunnerList {
+            runners: ids
+                .iter()
+                .map(|id| RunnerInfo {
+                    id: *id,
+                    name: format!("ez-runner-{id}"),
+                    status: "online".into(),
+                    busy: false,
+                })
+                .collect(),
+            total_count: tc,
+        };
+
+        // Empty stream: nothing expected, nothing observed -> Complete.
+        assert_eq!(verify_snapshot_complete(&[]), SnapshotOutcome::Complete);
+
+        // Page 0 has no total_count: API didn't promise a count -> Complete.
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[1, 2], None)]),
+            SnapshotOutcome::Complete
+        );
+
+        // total_count matches the page-0 count alone.
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[1, 2], Some(2))]),
+            SnapshotOutcome::Complete
+        );
+
+        // total_count matches the sum across multiple pages (the happy path).
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[1, 2], Some(3)), page(&[3], Some(3))]),
+            SnapshotOutcome::Complete
+        );
+
+        // total_count=0 with empty stream: explicitly told us nothing was there.
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[], Some(0))]),
+            SnapshotOutcome::Complete
+        );
+
+        // total_count disagrees: Partial -- the r3f12 destructive-churn trigger.
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[1, 2], Some(100))]),
+            SnapshotOutcome::Partial {
+                expected: 100,
+                observed: 2,
+            }
+        );
+
+        // total_count disagrees across multiple pages: still Partial.
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[1, 2], Some(5)), page(&[3], Some(5))]),
+            SnapshotOutcome::Partial {
+                expected: 5,
+                observed: 3,
+            }
+        );
+
+        // First page missing total_count but later page has one: still
+        // Complete. Only page 0's count is authoritative (GitHub REST
+        // contract: total_count is emitted only on page 0).
+        assert_eq!(
+            verify_snapshot_complete(&[page(&[1], None), page(&[2], Some(2))]),
+            SnapshotOutcome::Complete
+        );
+    }
+
+    /// Helper: write `payload` to a file inside a temp dir, write a tiny
+    /// `fake-gh` shell script that cats that file to stdout, mark it
+    /// executable. Returns (dir, script-path) so the caller can both
+    /// `with_gh_exe(...)` and `remove_dir_all(dir)` on teardown.
+    fn setup_fake_gh_payload(name: &str, payload: &str) -> (PathBuf, PathBuf) {
+        // Use a per-test unique id (atomic counter) so the temp dir never
+        // collides between parallel test threads. The original code used
+        // `process::id()` + `thread::current().name()`, but cargo-test worker
+        // threads share `process::id()` and unnamed threads collide on the
+        // fallback name `test`, which produced flaky empty-stdout failures
+        // when one parallel test's payload was overwritten before another
+        // test's fake-gh could `cat` it.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-{}-{}-{}",
+            name,
+            std::process::id(),
+            unique
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload_file = dir.join("payload.json");
+        std::fs::write(&payload_file, payload).unwrap();
+        let script = dir.join("fake-gh");
+        // When cargo spawns the test binary it inherits the parent shell's
+        // env, but `PATH` may not include `/usr/bin` / `/bin` (some CI
+        // environments strip the child's PATH). Plain `cat` inside the
+        // script then fails with "cat: not found", and the captured stdout
+        // comes back empty -- which surfaces as
+        // `serde_json::from_slice("")` ("EOF while parsing at line 1
+        // column 0") and a flake only visible when the suite runs in
+        // parallel. Set `PATH` explicitly at the top of the script so
+        // `/bin/cat` (or `/usr/bin/cat`) is found regardless of inherited
+        // environment.
+        let script_body = format!(
+            "#!/bin/sh\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\ncat <<'EZGHA_FAKE_GH_PAYLOAD_EOF'\n{payload}\nEZGHA_FAKE_GH_PAYLOAD_EOF\n",
+            payload = payload,
+        );
+        std::fs::write(&script, script_body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        (dir, script)
+    }
+
+    /// Page 0 promises 100 runners but the stream only delivers 3 items. This
+    /// is the r3f4-f16 / ghd2.1 destructive-churn scenario: the daemon MUST
+    /// refuse to mutate slot state on truncated data, not silently truncate.
+    #[test]
+    fn list_runners_partial_snapshot_bails() {
+        let payload = r#"[
+            {"total_count": 100, "runners": [
+                {"id": 1, "name": "ez-runner-c-1", "status": "online", "busy": false},
+                {"id": 2, "name": "ez-runner-c-2", "status": "online", "busy": false}
+            ]},
+            {"total_count": 100, "runners": [
+                {"id": 3, "name": "ez-runner-c-3", "status": "offline", "busy": false}
+            ]}
+        ]"#;
+        let (dir, script) = setup_fake_gh_payload("list-partial-snap", payload);
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let err = list_runners(&org_cfg())
+            .expect_err("partial snapshot must bail rather than return truncated data");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("partial snapshot"),
+            "error must mention partial snapshot, got: {msg}"
+        );
+        assert!(
+            msg.contains("expected 100"),
+            "expected count must appear in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("observed 3"),
+            "observed count must appear in error, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `total_count` matches the items actually observed. The flat list is
+    /// returned unchanged.
+    #[test]
+    fn list_runners_complete_snapshot_succeeds() {
+        let payload = r#"[
+            {"total_count": 3, "runners": [
+                {"id": 1, "name": "ez-runner-c-1", "status": "online", "busy": false},
+                {"id": 2, "name": "ez-runner-c-2", "status": "offline", "busy": false}
+            ]},
+            {"total_count": 3, "runners": [
+                {"id": 3, "name": "ez-runner-c-3", "status": "online", "busy": true}
+            ]}
+        ]"#;
+        let (dir, script) = setup_fake_gh_payload("list-complete-snap", payload);
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let runners = list_runners(&org_cfg()).expect("complete snapshot must succeed");
+        let ids: Vec<u64> = runners.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Page 0 omits `total_count`. The page stream is authoritative when the
+    /// API doesn't promise a count -- treated as Complete rather than bailing
+    /// on a "missing" promise.
+    #[test]
+    fn list_runners_first_page_missing_total_count_succeeds() {
+        let payload = r#"[
+            {"runners": [
+                {"id": 10, "name": "ez-runner-c-10", "status": "online", "busy": false}
+            ]},
+            {"runners": [
+                {"id": 11, "name": "ez-runner-c-11", "status": "online", "busy": true}
+            ]}
+        ]"#;
+        let (dir, script) = setup_fake_gh_payload("list-missing-tc", payload);
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let runners = list_runners(&org_cfg())
+            .expect("missing total_count on page 0 must be treated as Complete");
+        let ids: Vec<u64> = runners.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![10, 11]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Real-world regression: `gh auth status` exits non-zero when any account

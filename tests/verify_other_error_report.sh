@@ -31,7 +31,8 @@ echo "Exit code: $rc"
 echo "Stderr output:"
 cat "$STDERR_FILE"
 
-if grep -q "exit code 42" "$STDERR_FILE"; then
+if grep -q "exit code 42" "$STDERR_FILE" &&
+  grep -Eq "elapsed_seconds=[0-9]+" "$STDERR_FILE"; then
   echo "MINT_OTHER_ERROR_REPORT: PASS"
 else
   echo "MINT_OTHER_ERROR_REPORT: FAIL"

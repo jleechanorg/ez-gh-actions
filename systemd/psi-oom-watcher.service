@@ -23,5 +23,19 @@ TimeoutStartSec=30
 ExecStart=@SCRIPTS_DIR@/psi-oom-watcher.sh
 Environment=HOME=@HOME@
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
+# R4 lane T (ez-gh-actions-r3f10): PSI_SHED_CHAIN is mandatory. Empty
+# causes psi-oom-watcher.sh to exit 64 (fail-closed). Without this
+# line, the polling-mode invocation gets the script's DEFAULT_PSI_SHED_CHAIN
+# fallback at parse time — which IS the canonical 4-stage chain in this
+# repo, but we set it explicitly here too so (a) the verifier Gate 7
+# can grep `systemctl --user show` output for it, and (b) the
+# cold-review "is this chain actually wired" question has a
+# unambiguous service-unit-level answer. Quoted to tolerate any future
+# whitespace-bearing chain value.
+Environment="PSI_SHED_CHAIN=drain,reclaim,verify,escalate"
+# Default reclaim target — 8 GiB (R4 lane T fix: prior single-byte
+# write was a kernel no-op). Override per-host if QEMU MemoryHigh is
+# lower; the script will clamp its delta against the cgroup ceiling.
+Environment="SHED_RECLAIM_TARGET_BYTES=8589934592"
 StandardOutput=append:%h/.local/state/ezgha/psi-oom-watcher.log
 StandardError=append:%h/.local/state/ezgha/psi-oom-watcher.log

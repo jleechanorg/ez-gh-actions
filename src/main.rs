@@ -14,6 +14,7 @@ mod docker_backend;
 mod github;
 mod lima_convergence;
 mod platform;
+mod quarantine;
 mod queue_monitor;
 mod reaper;
 mod service;
@@ -254,7 +255,7 @@ fn wait_for_backend(cfg: &config::Config, timeout: Duration) -> Result<backend::
                     // Exhausted budget — surface the same rich diagnostic as choose_backend.
                     return choose_backend(cfg);
                 }
-                if maybe_restart_backend(cfg, &mut recovery, Some(deadline)) {
+                if maybe_restart_backend(cfg, &mut recovery, Some(deadline), docker_reachable) {
                     eprintln!(
                         "backend restart attempted while waiting for service readiness; retrying quickly"
                     );
@@ -604,15 +605,14 @@ fn maybe_restart_backend(
     cfg: &config::Config,
     recovery: &mut BackendRecoveryState,
     deadline: Option<Instant>,
+    backend_reachable: bool,
 ) -> bool {
     let selection = backend::select(&platform::detect(), cfg.policy.minimum_isolation);
     if !backend_restart_can_help(&selection) {
         return false;
     }
-    if matches!(selection, Selection::None) && docker_reachable() {
-        eprintln!(
-            "backend selection is NONE but docker is reachable; skipping restart to avoid unnecessary churn"
-        );
+    if backend_reachable {
+        eprintln!("backend is reachable; skipping backend restart attempt");
         return false;
     }
     if !recovery.allow_restart(cfg) {
@@ -693,6 +693,205 @@ fn apply_ensure_outcome_to_failure_streak(
         *ensure_fail_streak = 0;
     }
     partial_failure
+}
+
+// Five 5s local-only polls cover the observed 20-25s runner startup tail.
+// With normal sub-100ms Docker probes, monitors are deferred <=25s; if probes
+// consume their full shared 5s budget, the elapsed-time ceiling ends the
+// episode in about 30s. Settling performs no GitHub calls. Every ceiling runs
+// monitors and exactly one immediate full reconciliation, leaving >270s of
+// the 300s watchdog window. Repeated ceilings retain this pacing and escalate
+// through the configured alert channel at `failure_alert_threshold`; alert
+// cooldown supplies notification hysteresis without delaying reconciliation.
+const MAX_SETTLING_POLLS: u32 = 5;
+const MAX_SETTLING_DURATION: Duration = Duration::from_secs(25);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlingDecision {
+    Continue,
+    Recovered,
+    Ceiling,
+}
+
+struct SettlingEpisode {
+    started_at: Option<Instant>,
+    attempts: u32,
+    best_executing: u32,
+    stagnant_polls: u32,
+}
+
+impl SettlingEpisode {
+    fn start(now: Instant, executing: u32) -> Self {
+        Self {
+            started_at: Some(now),
+            attempts: 0,
+            best_executing: executing,
+            stagnant_polls: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        self.started_at.is_some()
+    }
+
+    fn observe(&mut self, now: Instant, executing: u32, target: u32) -> SettlingDecision {
+        let Some(started_at) = self.started_at else {
+            return SettlingDecision::Ceiling;
+        };
+        self.attempts += 1;
+        if executing > self.best_executing {
+            self.best_executing = executing;
+            self.stagnant_polls = 0;
+        } else {
+            self.stagnant_polls += 1;
+        }
+        if executing >= target {
+            self.started_at = None;
+            return SettlingDecision::Recovered;
+        }
+        if self.attempts >= MAX_SETTLING_POLLS
+            || now.saturating_duration_since(started_at) >= MAX_SETTLING_DURATION
+        {
+            self.started_at = None;
+            return SettlingDecision::Ceiling;
+        }
+        SettlingDecision::Continue
+    }
+}
+
+fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration, bool) {
+    match decision {
+        SettlingDecision::Continue => (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false),
+        SettlingDecision::Recovered => (cfg.runner.serve_tick(), true),
+        SettlingDecision::Ceiling => (Duration::ZERO, true),
+    }
+}
+
+fn apply_local_settling_decision(
+    settling: &mut Option<SettlingEpisode>,
+    pending_readiness: &mut bool,
+    decision: SettlingDecision,
+) {
+    match decision {
+        SettlingDecision::Continue => {}
+        SettlingDecision::Recovered => {
+            *settling = None;
+            *pending_readiness = false;
+        }
+        // Clear the local polling episode so the zero-sleep plan runs one full
+        // reconciliation next, but retain the unproven-readiness invariant.
+        SettlingDecision::Ceiling => {
+            *settling = None;
+            *pending_readiness = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnsureSuccessDecision {
+    StartSettling { executing: u32 },
+    Recovered,
+    IncompleteReadiness,
+}
+
+fn ensure_success_decision(
+    cfg: &config::Config,
+    outcome: &docker_backend::EnsureCountOutcome,
+) -> EnsureSuccessDecision {
+    if outcome.post_refill_readiness_error.is_some() {
+        EnsureSuccessDecision::IncompleteReadiness
+    } else if outcome.remaining_shortage > 0 {
+        EnsureSuccessDecision::StartSettling {
+            executing: cfg.runner.count.saturating_sub(outcome.remaining_shortage),
+        }
+    } else {
+        EnsureSuccessDecision::Recovered
+    }
+}
+
+fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) -> (Duration, bool) {
+    match decision {
+        EnsureSuccessDecision::StartSettling { .. } => {
+            settling_plan(cfg, SettlingDecision::Continue)
+        }
+        EnsureSuccessDecision::Recovered => settling_plan(cfg, SettlingDecision::Recovered),
+        EnsureSuccessDecision::IncompleteReadiness => settling_plan(cfg, SettlingDecision::Ceiling),
+    }
+}
+
+fn ensure_success_decision_with_pending_readiness(
+    decision: EnsureSuccessDecision,
+    pending_readiness: bool,
+) -> EnsureSuccessDecision {
+    if pending_readiness && decision == EnsureSuccessDecision::Recovered {
+        EnsureSuccessDecision::StartSettling { executing: 0 }
+    } else {
+        decision
+    }
+}
+
+fn apply_ensure_success_decision(
+    settling: &mut Option<SettlingEpisode>,
+    pending_readiness: &mut bool,
+    now: Instant,
+    decision: EnsureSuccessDecision,
+) {
+    match decision {
+        EnsureSuccessDecision::StartSettling { executing } => {
+            *settling = Some(SettlingEpisode::start(now, executing));
+            *pending_readiness = true;
+        }
+        EnsureSuccessDecision::IncompleteReadiness => {
+            *settling = None;
+            *pending_readiness = true;
+        }
+        EnsureSuccessDecision::Recovered => {
+            *settling = None;
+            *pending_readiness = false;
+        }
+    }
+}
+
+#[derive(Default)]
+struct SettlingCeilingState {
+    consecutive_ceilings: u32,
+}
+
+impl SettlingCeilingState {
+    fn record_recovery(&mut self) {
+        self.consecutive_ceilings = 0;
+    }
+}
+
+fn record_settling_ceiling(
+    cfg: &config::Config,
+    state: &mut SettlingCeilingState,
+    detail: &str,
+) -> bool {
+    state.consecutive_ceilings = state.consecutive_ceilings.saturating_add(1);
+    let threshold = cfg.alert.failure_alert_threshold.max(1);
+    if state.consecutive_ceilings < threshold {
+        return false;
+    }
+
+    let subject = "Runner refill settling remains stuck";
+    let body = format!(
+        "{} consecutive bounded settling episodes reached their ceiling for {} (threshold: {}). \
+         First-turnover episodes remain nonfailures, but this persistent shortage needs operator \
+         attention. Latest evidence: {detail}",
+        state.consecutive_ceilings, cfg.github.target, threshold
+    );
+    if let Err(err) = alert::notify(
+        cfg,
+        "serve.runner_settling.ceiling",
+        Severity::Critical,
+        subject,
+        &body,
+    ) {
+        eprintln!("WARN: settling-ceiling alert send error: {err:#}");
+    }
+    true
 }
 
 fn systemd_alert_decision(
@@ -967,6 +1166,18 @@ fn main() -> Result<()> {
             // read-modify-write. Auto-released on process death; opt-out via
             // EZGHA_SKIP_LOCK=1 for tests.
             let _serve_lock = acquire_serve_lock(&cfg).context("acquire serve.lock")?;
+            // Pre-warm the cgroup-probe image cache (lane E2 / P1 #R2-9c).
+            // Fire-and-forget on a dedicated thread so the daemon proceeds
+            // into wait_for_backend (which can spend up to 120s on Lima cold
+            // start) without blocking on the pull. The pull races with the
+            // backend wait, so by the time the first
+            // `docker_cpu_controller_available` call fires (lazily, on the
+            // first ensure_count tick that needs `--cpus`) the image is
+            // almost always in the local cache — eliminating the 5+ second
+            // first-spawn latency that can fail a verifier running
+            // immediately after daemon restart. Pull failure is warn-only;
+            // the probe will re-pull on demand if the cache missed.
+            docker_backend::prepull_probe_image();
             // Use wait_for_backend (bead 3z5): retry up to 120s for the Docker
             // daemon to become reachable. This handles the boot-time race where
             // Lima/Colima is still starting when this service unit fires — even
@@ -989,6 +1200,9 @@ fn main() -> Result<()> {
             let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
+            let mut settling: Option<SettlingEpisode> = None;
+            let mut pending_readiness = false;
+            let mut settling_ceilings = SettlingCeilingState::default();
             let mut deadman = alert::DeadManState::new(Instant::now());
 
             // Graceful shutdown (bead ez-gh-actions-30p): install SIGTERM/SIGINT
@@ -1003,69 +1217,179 @@ fn main() -> Result<()> {
                 // Ping BEFORE ensure_count: batch JIT+docker spawn can exceed
                 // WatchdogSec=300; a post-work-only ping lets systemd SIGABRT mid-spawn.
                 watchdog::ping();
-                let (sleep, ensure_succeeded) = match docker_backend::ensure_count_outcome(
-                    &cfg, backend,
-                ) {
-                    Ok(outcome) => {
-                        apply_ensure_outcome_to_failure_streak(
-                            &cfg,
-                            backend,
-                            &mut ensure_fail_streak,
-                            &outcome,
-                        );
-                        for name in outcome.started {
-                            println!("respawned ephemeral runner {name}");
-                        }
-                        // A successful ensure_count is itself a "pipeline is
-                        // alive" signal — a healthy fleet should not need to
-                        // fire alerts to prove liveness. Bump the dead-man
-                        // clock so the threshold counts overall daemon
-                        // liveness, not just alert throughput.
-                        deadman.record_delivery(Instant::now());
-                        // Respawn cadence: configurable via [runner]
-                        // serve_tick_seconds (default 30, 5s floor) — a
-                        // finished short job leaves its slot dead for up to
-                        // one tick + container startup, so hosts chasing
-                        // duty cycle can lower this (2026-07-09 coordination
-                        // with jeff-ubuntu's 60->20 change).
-                        (cfg.runner.serve_tick(), true)
-                    }
-                    Err(e) => {
-                        ensure_fail_streak += 1;
-                        eprintln!("ensure_count failed (will retry): {e:#}");
-                        notify_ensure_failure(&cfg, backend, ensure_fail_streak, &format!("{e:#}"));
-                        // No outer deadline here (unlike wait_for_backend's startup
-                        // window): the serve loop runs indefinitely, so there's no
-                        // caller budget to clamp against. Worst-case per-attempt
-                        // blocking of this loop's ensure_count/respawn cadence stays
-                        // at the ceiling (up to BACKEND_RESTART_COMMAND_TIMEOUT x
-                        // len(commands) — 120s x 2 = 240s on Linux). Restructuring
-                        // this loop to bound that is tracked separately (beads
-                        // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
-                        // part of this fix.
-                        if maybe_restart_backend(&cfg, &mut backend_recovery, None) {
-                            let subject = "Backend restart attempted after ensure_count failures";
-                            let body = format!(
-                                "serve loop attempted backend restart after {} failures for {} on {}",
-                                ensure_fail_streak,
-                                cfg.github.target,
-                                backend.name()
-                            );
-                            if let Err(err) = alert::notify(
-                                &cfg,
-                                "serve.backend.restart.attempted",
-                                Severity::Info,
-                                subject,
-                                &body,
-                            ) {
-                                eprintln!("WARN: alert send error: {err:#}");
+                let (sleep, run_monitors) = if settling.is_some() {
+                    match docker_backend::local_executing_runner_count(&cfg) {
+                        Ok(executing) => {
+                            let (decision, attempts, best_executing) = {
+                                let episode = settling.as_mut().expect("checked above");
+                                let decision =
+                                    episode.observe(Instant::now(), executing, cfg.runner.count);
+                                (decision, episode.attempts, episode.best_executing)
+                            };
+                            match decision {
+                                SettlingDecision::Continue => println!(
+                                    "runner startup settling: {executing}/{} executing locally \
+                                     (poll {attempts}/{MAX_SETTLING_POLLS})",
+                                    cfg.runner.count
+                                ),
+                                SettlingDecision::Recovered => {
+                                    println!(
+                                        "runner startup settled: {executing}/{} executing locally \
+                                         after {attempts} poll(s)",
+                                        cfg.runner.count
+                                    );
+                                    settling_ceilings.record_recovery();
+                                }
+                                SettlingDecision::Ceiling => {
+                                    let detail = format!(
+                                        "{executing}/{} executing locally, best {best_executing}, \
+                                         {attempts} poll(s)",
+                                        cfg.runner.count
+                                    );
+                                    let escalated = record_settling_ceiling(
+                                        &cfg,
+                                        &mut settling_ceilings,
+                                        &detail,
+                                    );
+                                    eprintln!(
+                                        "{}: runner startup settling ceiling reached: {detail}; \
+                                         running monitors before immediate reconciliation",
+                                        if escalated { "CRITICAL" } else { "WARN" }
+                                    );
+                                }
                             }
-                            (Duration::from_secs(8), false)
-                        } else {
-                            // Failure retry uses the same configured cadence
-                            // as success — the existing 8s fast-path above
-                            // already covers the post-backend-restart case.
-                            (cfg.runner.serve_tick(), false)
+                            apply_local_settling_decision(
+                                &mut settling,
+                                &mut pending_readiness,
+                                decision,
+                            );
+                            settling_plan(&cfg, decision)
+                        }
+                        Err(e) => {
+                            let detail =
+                                format!("local Runner.Worker readiness check failed: {e:#}");
+                            let escalated =
+                                record_settling_ceiling(&cfg, &mut settling_ceilings, &detail);
+                            eprintln!(
+                                "{}: {detail}; running monitors before immediate reconciliation",
+                                if escalated { "CRITICAL" } else { "WARN" }
+                            );
+                            apply_local_settling_decision(
+                                &mut settling,
+                                &mut pending_readiness,
+                                SettlingDecision::Ceiling,
+                            );
+                            settling_plan(&cfg, SettlingDecision::Ceiling)
+                        }
+                    }
+                } else {
+                    match docker_backend::ensure_count_outcome(&cfg, backend) {
+                        Ok(outcome) => {
+                            apply_ensure_outcome_to_failure_streak(
+                                &cfg,
+                                backend,
+                                &mut ensure_fail_streak,
+                                &outcome,
+                            );
+                            let decision = ensure_success_decision_with_pending_readiness(
+                                ensure_success_decision(&cfg, &outcome),
+                                pending_readiness,
+                            );
+                            match decision {
+                                EnsureSuccessDecision::StartSettling { .. } => {}
+                                EnsureSuccessDecision::Recovered => {
+                                    settling_ceilings.record_recovery();
+                                }
+                                EnsureSuccessDecision::IncompleteReadiness => {
+                                    let detail = format!(
+                                        "post-refill Runner.Worker readiness incomplete: {}",
+                                        outcome
+                                            .post_refill_readiness_error
+                                            .as_deref()
+                                            .expect("decision requires readiness error")
+                                    );
+                                    let escalated = record_settling_ceiling(
+                                        &cfg,
+                                        &mut settling_ceilings,
+                                        &detail,
+                                    );
+                                    eprintln!(
+                                        "{}: {detail}; running monitors before immediate \
+                                        reconciliation",
+                                        if escalated { "CRITICAL" } else { "WARN" }
+                                    );
+                                }
+                            }
+                            apply_ensure_success_decision(
+                                &mut settling,
+                                &mut pending_readiness,
+                                Instant::now(),
+                                decision,
+                            );
+                            let plan = ensure_success_plan(&cfg, decision);
+                            for name in outcome.started {
+                                println!("respawned ephemeral runner {name}");
+                            }
+                            // A successful ensure_count is itself a "pipeline is
+                            // alive" signal — a healthy fleet should not need to
+                            // fire alerts to prove liveness. Bump the dead-man
+                            // clock so the threshold counts overall daemon
+                            // liveness, not just alert throughput.
+                            deadman.record_delivery(Instant::now());
+                            // Respawn cadence: configurable via [runner]
+                            // serve_tick_seconds (default 30, 5s floor). A
+                            // bounded local-only settling episode follows a
+                            // refill without repeating GitHub reconciliation.
+                            plan
+                        }
+                        Err(e) => {
+                            ensure_fail_streak += 1;
+                            eprintln!("ensure_count failed (will retry): {e:#}");
+                            notify_ensure_failure(
+                                &cfg,
+                                backend,
+                                ensure_fail_streak,
+                                &format!("{e:#}"),
+                            );
+                            // No outer deadline here (unlike wait_for_backend's startup
+                            // window): the serve loop runs indefinitely, so there's no
+                            // caller budget to clamp against. Worst-case per-attempt
+                            // blocking of this loop's ensure_count/respawn cadence stays
+                            // at the ceiling (up to BACKEND_RESTART_COMMAND_TIMEOUT x
+                            // len(commands) — 120s x 2 = 240s on Linux). Restructuring
+                            // this loop to bound that is tracked separately (beads
+                            // ez-gh-actions-yrt/zai/nuk, jleechan-9c7l finding #3), not
+                            // part of this fix.
+                            if maybe_restart_backend(
+                                &cfg,
+                                &mut backend_recovery,
+                                None,
+                                docker_reachable(),
+                            ) {
+                                let subject =
+                                    "Backend restart attempted after ensure_count failures";
+                                let body = format!(
+                                    "serve loop attempted backend restart after {} failures for {} on {}",
+                                    ensure_fail_streak,
+                                    cfg.github.target,
+                                    backend.name()
+                                );
+                                if let Err(err) = alert::notify(
+                                    &cfg,
+                                    "serve.backend.restart.attempted",
+                                    Severity::Info,
+                                    subject,
+                                    &body,
+                                ) {
+                                    eprintln!("WARN: alert send error: {err:#}");
+                                }
+                                (Duration::from_secs(8), false)
+                            } else {
+                                // Failure retry uses the same configured cadence
+                                // as success — the existing 8s fast-path above
+                                // already covers the post-backend-restart case.
+                                (cfg.runner.serve_tick(), false)
+                            }
                         }
                     }
                 };
@@ -1075,7 +1399,7 @@ fn main() -> Result<()> {
                 if shutdown::is_requested() {
                     break;
                 }
-                if ensure_succeeded {
+                if run_monitors {
                     watchdog::ping();
                     // Fresh budget base for monitor ticks: respawn pacing may
                     // legitimately spend minutes before this point, and that
@@ -1441,6 +1765,9 @@ mod tests {
         let partial = docker_backend::EnsureCountOutcome {
             started: vec!["ez-org-runner-1".into()],
             missing: 4,
+            remaining_shortage: 3,
+            post_refill_readiness_error: None,
+            start_failures: 3,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1457,6 +1784,9 @@ mod tests {
         let recovered = docker_backend::EnsureCountOutcome {
             started: vec!["ez-org-runner-2".into(), "ez-org-runner-3".into()],
             missing: 2,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            start_failures: 0,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1469,6 +1799,188 @@ mod tests {
             ensure_fail_streak, 0,
             "non-partial ensure_count success resets the serve alert streak"
         );
+    }
+
+    #[test]
+    fn settling_episode_tracks_not_ready_progress_until_all_six_execute() {
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 4);
+
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(5), 4, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(
+            episode.stagnant_polls, 1,
+            "+5s container-not-ready poll is tracked"
+        );
+
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(10), 5, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(episode.best_executing, 5);
+        assert_eq!(
+            episode.stagnant_polls, 0,
+            "incremental execution progress resets stagnation"
+        );
+
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(15), 5, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(20), 5, 6),
+            SettlingDecision::Continue
+        );
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(25), 6, 6),
+            SettlingDecision::Recovered
+        );
+        assert!(!episode.is_active());
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        assert_eq!(
+            settling_plan(&cfg, SettlingDecision::Recovered),
+            (Duration::from_secs(30), true),
+            "recovery resumes monitors and the configured cadence"
+        );
+    }
+
+    #[test]
+    fn settling_episode_ceiling_guarantees_monitor_then_immediate_reconcile() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 4);
+
+        for seconds in [5, 10, 15, 20] {
+            assert_eq!(
+                episode.observe(started_at + Duration::from_secs(seconds), 4, 6),
+                SettlingDecision::Continue
+            );
+        }
+        let ceiling = episode.observe(started_at + Duration::from_secs(25), 4, 6);
+
+        assert_eq!(ceiling, SettlingDecision::Ceiling);
+        assert_eq!(episode.attempts, MAX_SETTLING_POLLS);
+        assert!(!episode.is_active());
+        assert_eq!(
+            settling_plan(&cfg, ceiling),
+            (Duration::ZERO, true),
+            "the bounded episode must run monitors and add no sleep before the next expensive reconciliation"
+        );
+    }
+
+    #[test]
+    fn successful_short_probes_rearm_across_episodes_until_real_recovery() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 3;
+        let mut now = Instant::now();
+        let mut settling = Some(SettlingEpisode::start(now, 4));
+        let mut pending_readiness = true;
+        let mut ceilings = SettlingCeilingState::default();
+
+        for expected_ceilings in 1..=3 {
+            let mut decision = SettlingDecision::Continue;
+            for _ in 0..MAX_SETTLING_POLLS {
+                now += Duration::from_secs(5);
+                decision = settling
+                    .as_mut()
+                    .expect("successful-short evidence must remain pending")
+                    .observe(now, 4, 6);
+            }
+            assert_eq!(decision, SettlingDecision::Ceiling);
+            let escalated = record_settling_ceiling(
+                &cfg,
+                &mut ceilings,
+                "synthetic complete 4/6 probe episode",
+            );
+            assert_eq!(escalated, expected_ceilings == 3);
+            apply_local_settling_decision(&mut settling, &mut pending_readiness, decision);
+
+            assert!(
+                pending_readiness && settling.is_none(),
+                "a complete but short ceiling must force the promised immediate full reconciliation"
+            );
+            assert_eq!(
+                settling_plan(&cfg, decision),
+                (Duration::ZERO, true),
+                "ceiling must run monitors before the full reconciliation"
+            );
+
+            let full_container_decision = ensure_success_decision_with_pending_readiness(
+                EnsureSuccessDecision::Recovered,
+                pending_readiness,
+            );
+            assert_eq!(
+                full_container_decision,
+                EnsureSuccessDecision::StartSettling { executing: 0 },
+                "full-container reconciliation cannot clear pending worker evidence"
+            );
+            apply_ensure_success_decision(
+                &mut settling,
+                &mut pending_readiness,
+                now,
+                full_container_decision,
+            );
+            assert!(
+                settling.as_ref().is_some_and(SettlingEpisode::is_active),
+                "the completed full reconciliation must resume local worker proof"
+            );
+            assert_eq!(ceilings.consecutive_ceilings, expected_ceilings);
+        }
+
+        now += Duration::from_secs(5);
+        let recovered = settling.as_mut().unwrap().observe(now, 6, 6);
+        assert_eq!(recovered, SettlingDecision::Recovered);
+        apply_local_settling_decision(&mut settling, &mut pending_readiness, recovered);
+        ceilings.record_recovery();
+
+        assert!(!pending_readiness && settling.is_none());
+        assert_eq!(ceilings.consecutive_ceilings, 0);
+    }
+
+    #[test]
+    fn repeated_settling_ceilings_alert_at_threshold_and_reset_only_on_recovery() {
+        alert::clear_alert_state();
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 3;
+        let dir = unique_temp_dir("settling-ceiling-alert");
+        let log = dir.join("alerts.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+        let mut state = SettlingCeilingState::default();
+
+        assert!(!record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "episode 1 stayed at 5/6"
+        ));
+        assert!(!record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "episode 2 stayed at 5/6"
+        ));
+        assert!(!log.exists(), "first turnover episodes remain non-alerting");
+
+        assert!(record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "episode 3 stayed at 5/6"
+        ));
+        let raw = std::fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("serve.runner_settling.ceiling"));
+        assert!(raw.contains("3 consecutive bounded settling episodes"));
+
+        state.record_recovery();
+        assert_eq!(state.consecutive_ceilings, 0);
+        assert!(!record_settling_ceiling(
+            &cfg,
+            &mut state,
+            "new streak episode 1"
+        ));
+        assert_eq!(state.consecutive_ceilings, 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

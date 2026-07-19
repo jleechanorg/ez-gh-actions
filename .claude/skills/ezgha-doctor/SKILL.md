@@ -14,6 +14,45 @@ This skill drives the **doctor-runner** script that ships at the repo root, plus
 - journal full of `ensure_count failed (will retry): … runner with the name already exists`
 - worldarchitect.ai fleet page shows fewer than 16 `ez-org-runner-*` runners online
 
+## Step 0 — Mac host: check ALL FIVE layers (2026-07-14 outage lesson)
+
+On the Mac, "runners down" is usually SEVERAL stacked causes — each masks the
+next, so never stop at the first fix. Check every layer, in order (memory:
+`mac-fleet-outage-causal-chain-2026-07-14`):
+
+1. **VM state — BOTH lima homes**: `colima list` (profile home `~/.colima`)
+   AND `limactl list` (home `~/.lima`) — two independent instances exist and
+   have fought each other (dual-Lima convergence: bead ez-gh-actions-apye).
+   A stale-state start failure ("vz driver is running but host agent is not"
+   / "already running, ignoring") needs a force-stop + restart cycle —
+   deploy-owner only (`.claude/hooks/vm-lifecycle-guard.sh` blocks it otherwise).
+2. **Daemon socket wiring**: `/var/run/docker.sock` may be a dead symlink.
+   Check the plist: `plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist`
+   → `EnvironmentVariables.DOCKER_HOST` must point at the RUNNING VM's socket
+   (e.g. `unix:///Users/jleechan/.colima/default/docker.sock`). install.sh
+   auto-injects this but its docker prereq check can abort first
+   (bead jleechan-ea02 — workaround: run install.sh with DOCKER_HOST exported).
+3. **Host disk floor**: daemon stderr `only N GB free (floor: 40 GB)` —
+   `MACOS_HOST_DISK_FLOOR_GB=40` is a hard floor (config cannot lower it on
+   macOS). Reclaim: cargo target dirs, `~/Library/Caches`, stale simulators
+   (`xcrun simctl delete unavailable` + named stale test sims), then
+   `tmutil thinlocalsnapshots / 21474836480 4` — APFS snapshots PIN deleted
+   blocks, so df may not move until you thin. Bead jleechan-er7x.
+4. **Runner image present**: `docker image inspect ezgha-runner:latest` on
+   the daemon's socket. Daemon stderr `could not measure daemon free disk …
+   image missing?` means it's gone — a system/image prune while the fleet is
+   idle deletes it (in-use images survive, the idle runner image does not).
+   Rebuild: `docker build -f Dockerfile.runner -t ezgha-runner:latest .`
+   Bead jleechan-kobt.
+5. **Watchdog reality check**: the deployed watchdog may be a divergent copy
+   (2026-07-14: plist invoked an old 221-line script from another repo that
+   only LOGS its remediation). Confirm which script the watchdog plist runs
+   and read `~/Library/Logs/ezgha-watchdog-launchd.log`. Bead jleechan-yib3.
+
+Per-slot end-state proof after recovery: `docker top <c> | grep -E 'Runner\.(Listener|Worker)'`
+for every container — ephemeral churn (containers seconds old, Worker already
+present) is HEALTHY under queue backlog.
+
 ## Step 1 — Establish the baseline
 
 ```bash
@@ -31,7 +70,8 @@ If `fleet unhealthy`, continue. **Never restart-loop the service** — see
 `docs/harness-early-victory-5whys.md`. **Before any `systemctl --user restart
 ezgha.service`, check `uptime` (1-min load) and `docker ps --filter
 label=ezgha=managed | wc -l` (container count) — skip the restart if load_1min
-> 12 or containers < 12, since a mass cold respawn has twice tripped this
+> 12 or live containers are below 75% of configured capacity (fewer than 8
+> on the 10-runner Linux host), since a mass cold respawn has twice tripped this
 host's watchdog (`max-load-1 = 24`) into a full reboot on 2026-07-07.**
 
 
@@ -84,7 +124,7 @@ The doctor groups failures into 10 sections (9 legacy + section 10 explicit-work
    ```
    (This is the standard reset; slot-recon PR shipped with v0.1.x makes the loop self-heal.)
 5. **GitHub org runner fleet** — `ez-org-runner-N` should all be `online` at GitHub. If only some: see "Missing daemon, runner alive" below.
-6. **live docker containers** — at least 14/16 containers should be running locally with `ezgha=managed` label.
+6. **live docker containers** — all configured containers should be present: 10/10 on Linux or 6/6 on Mac, with the `ezgha=managed` label.
 9. **per-slot local execution proof** — see "Step 2b" below. This is the ironclad, GitHub-API-independent enforcement of "N/N runners actually executing."
 
 ### Step 2b — Per-slot activity truth (section 9, ironclad gate)
@@ -93,7 +133,7 @@ Sections 5/6 ("online" at GitHub, container count) can both be **fooled by a
 GitHub API rate limit** — "online"/"busy" flags go stale or the query itself
 fails, and container *count* alone can't tell idle apart from executing. A
 naive `docker logs | grep "Listening for Jobs"` check is worse: it reads a
-fully-busy fleet as 0/22 healthy, because an EXECUTING runner doesn't print
+fully-busy fleet as 0/16 healthy, because an EXECUTING runner doesn't print
 that line while it's running a job (observed 2026-07-09: 0/19 "listening"
 while 9 jobs were in_progress — the motivating defect for this section).
 
@@ -113,7 +153,7 @@ four states:
 - **IDLE-OK** — idle, and either nothing is queued or the queue has been
   non-empty for less than the threshold. Healthy, not a defect.
 - **EXECUTING** — `Runner.Worker` present. This is the actual per-slot proof
-  the mission's "22/22 executing" standard requires. Section 10 attributes
+  the mission's "16/16 executing" standard requires. Section 10 attributes
   each EXECUTING slot to a real job (name + repo + elapsed + run URL) via
   the GitHub **jobs** API (`runs/{id}/jobs`, matched on `runner_name`) — the
   workflow-run object itself has no `runner_id`/`runner_name` field, so a
@@ -180,7 +220,11 @@ Run doctor again. Repeat until it returns 0. If it stays 1 for 10+ minutes despi
 
 ## Output format
 
-Always run `bash /home/jleechan/projects/ez-gh-actions/doctor-runner` (no flags) first. The human-readable output is the audit trail. `--json` is available for scripted checks but not enabled by default.
+Always run `bash /home/jleechan/projects/ez-gh-actions/doctor-runner` (no flags)
+first. The human-readable output is the audit trail. `doctor-runner --json` is
+unsupported. For aggregate local scripted checks, use
+`scripts/runner_dashboard_host_probe.sh --host-class mac|linux`; that public
+projection is not a replacement for the full doctor report.
 
 
 ## Step 5 — Harness diagnosis (mandatory on failure)

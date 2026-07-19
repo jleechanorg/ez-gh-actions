@@ -1,18 +1,65 @@
 # agents.slice — user-scope memory ceiling for interactive agent CLI processes
-# (claude/codex/cursor/gemini/etc). Part of bead ez-gh-actions-0725 (panel
-# decision recorded on ez-gh-actions-ah94, Tier 1 do-now item #2).
+# (claude/codex/cursor/gemini/etc) AND any orchestration that spawns them
+# (ao-daemon). Part of bead ez-gh-actions-0725 (panel decision recorded on
+# ez-gh-actions-ah94, Tier 1 do-now item #2; round-3 policy flip on
+# 2026-07-12 from opt-in to AUTO-MIGRATE-with-OPT-OUT).
 #
-# HOW A PROCESS JOINS THIS SLICE (opt-in, nothing auto-migrates):
-#   scripts/host/agent-cli-scoped.sh <command> [args...]
-# which runs `systemd-run --user --slice=agents.slice --scope -- <command>`.
-# This unit only needs to exist under ~/.config/systemd/user/ for that to
-# work — systemd auto-starts a slice the first time a scope/service
-# references it. No `systemctl --user enable` step is required or performed
-# by this repo's install path; see install.sh comments near the auxiliary
-# unit loop for why this unit is intentionally NOT swept into the
-# `ezgha-*.service`/`ezgha-*.timer` glob (it is a host-wide concern, not
-# ezgha-fleet-specific, and must stay opt-in per the panel's "don't
-# force-migrate any live session" instruction).
+# HOW A PROCESS JOINS THIS SLICE (round-3 policy: AUTO-MIGRATE, --opt-out):
+#   Default behavior is AUTO-MIGRATE — every interactive agent CLI process
+#   and any ao-daemon.service descendant discovered on the host MUST be
+#   enrolled in agents.slice by default. The script that enforces this is
+#   scripts/host/agent-auto-migrate.sh (added in lane G of round 3):
+#
+#     scripts/host/agent-auto-migrate.sh apply     # relaunch matching PIDs
+#     scripts/host/agent-auto-migrate.sh apply --dry-run
+#     scripts/host/agent-auto-migrate.sh status    # enrolled leaves + RSS
+#
+#   The auto-migrate helper discovers already-running PIDs by base name
+#   (claude, codex, gemini, cursor, aider, cody), captures their argv +
+#   cwd, SIGTERMs the original, and relaunches via
+#   `systemd-run --user --slice=agents.slice --scope -- <cmd>` (so the
+#   relaunched process inherits this slice's MemoryHigh=20G). Cgroup v2
+#   cannot move a running process into a new slice mid-flight without
+#   sub-tree privileges, so the relaunch pathway is the only supported
+#   mechanism — see agent-auto-migrate.sh header for the full rationale.
+#
+#   For NEW sessions, the legacy opt-in wrapper still exists at
+#   scripts/host/agent-cli-scoped.sh (gained a `--auto-attach` flag in
+#   round 3 that uses the same systemd-run pathway as auto-migrate). Use
+#   it when you want a NEW session to start inside the slice from the
+#   outset without going through the migrate-then-relaunch dance.
+#
+#   The OPT-OUT escape hatch is a single env-var on the running session:
+#     AGENT_SLICE_OPT_OUT=1 scripts/host/agent-cli-scoped.sh <command>
+#   When set, agent-cli-scoped.sh runs the command unscoped (no
+#   `--slice=agents.slice`); otherwise it inherits the auto-attach path
+#   and the new session joins the slice. A user-scope drop-in for
+#   ao-daemon.service lives at
+#   systemd/ao-daemon-memory-cap.service.d/memory.conf and enforces the
+#   same slice enrollment on the daemon without any per-session flag.
+#
+#   This unit only needs to exist under ~/.config/systemd/user/ for any
+#   of the above to work — systemd auto-starts a slice the first time a
+#   scope/service references it. No `systemctl --user enable` step is
+#   required or performed by this repo's install path; see install.sh
+#   comments near the auxiliary unit loop for why this unit is
+#   intentionally NOT swept into the `ezgha-*.service`/`ezgha-*.timer`
+#   glob (it is a host-wide concern, not ezgha-fleet-specific, and stays
+#   auto-migrated by script rather than by an ezgha-systemd-unit install
+#   hook — this lets the install path stay one-writer and avoids the
+#   2026-07-07 install-loop race).
+#
+# AUTO-MIGRATION TRIGGER (how the helper runs by default):
+#   The auto-migrate helper is invoked BY a one-shot systemd user service
+#   that runs on user-session-start (recommended path) AND by the
+#   verify-exit-criteria.sh Gate 8 (2) probe (fails-closed if any
+#   agent-CLI binary on PATH has zero enrolled leaves in this slice).
+#   Wiring the service is out of scope for this slice file — see
+#   scripts/host/install.sh and bead ez-gh-actions-0725 followups for
+#   the systemd path unit that the harness owns. Until that ships,
+#   operators run `scripts/host/agent-auto-migrate.sh apply` manually on
+#   session start; the policy change here is "default-on" rather than
+#   "default-auto-on-boot," pending the systemd path unit.
 #
 # WHY MemoryHigh (not MemoryMax): MemoryHigh is a *soft* ceiling — the
 # kernel throttles the cgroup and aggressively reclaims its reclaimable

@@ -13,8 +13,11 @@
 # This test extracts the ACTUAL derivation code from doctor-runner (via sed,
 # not a re-implementation) so it can't silently drift from the real logic,
 # then exercises it against a fixture slot_assignments.toml with both
-# sections + a config.toml with runner.count=16, asserting:
+# sections + a config.toml with runner.count=16 followed by an inline comment
+# containing more digits, asserting:
 #   1. EXPECTED_CONTAINERS resolves to 16 (from config.toml), not ~28.
+#      It must also ignore digits in the inline comment; concatenating those
+#      digits made section 9 execute an effectively infinite `seq` on Mac.
 #   2. The section-scoped fallback (no config.toml) also resolves to 16,
 #      not the whole-file double-count.
 #
@@ -35,6 +38,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
+LEGACY_DOCTOR_SCRIPT="$REPO_ROOT/doctor.sh"
 
 TEMP_HOME=$(mktemp -d)
 cleanup() { rm -rf "$TEMP_HOME"; }
@@ -42,6 +46,43 @@ trap cleanup EXIT
 
 CONFIG_DIR="$TEMP_HOME/.config/ezgha"
 mkdir -p "$CONFIG_DIR"
+
+# Extract the real TOML-aware runner-count parser. Both section 9 and the
+# verdict derivation must call this helper so inline-comment handling cannot
+# drift between the two consumers.
+COUNT_FUNC_START=$(grep -n '^read_config_runner_count() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$COUNT_FUNC_START" ]; then
+  echo "FAIL: could not locate read_config_runner_count() in $DOCTOR_SCRIPT" >&2
+  exit 1
+fi
+COUNT_FUNC_END=$(tail -n +"$COUNT_FUNC_START" "$DOCTOR_SCRIPT" | grep -n '^}' | head -1 | cut -d: -f1)
+COUNT_FUNC_END=$((COUNT_FUNC_START + COUNT_FUNC_END - 1))
+COUNT_FUNC_SRC=$(sed -n "${COUNT_FUNC_START},${COUNT_FUNC_END}p" "$DOCTOR_SCRIPT")
+
+grep -Fq 'CONFIGURED_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: section 9 does not use read_config_runner_count()" >&2
+  exit 1
+}
+grep -Fq 'CONFIG_RUNNER_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: verdict derivation does not use read_config_runner_count()" >&2
+  exit 1
+}
+grep -Fq 'DEFAULT_LINUX_RUNNER_COUNT=10' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: Linux fallback count is not the current 10-runner contract" >&2
+  exit 1
+}
+grep -Fq 'DEFAULT_MAC_RUNNER_COUNT=6' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: macOS fallback count is not the current 6-runner contract" >&2
+  exit 1
+}
+grep -Fq 'REMOTE_COUNT="${REMOTE_LINUX_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: remote Linux fallback count is not the current 10-runner contract" >&2
+  exit 1
+}
+grep -Fq 'CONFIGURED_COUNT="${CONFIGURED_COUNT:-10}"' "$LEGACY_DOCTOR_SCRIPT" || {
+  echo "FAIL: legacy doctor fallback count is not the current 10-runner contract" >&2
+  exit 1
+}
 
 # Fixture: slot_assignments.toml with BOTH [assignments] and [registered_at]
 # sections, 16 entries each — the exact shape that broke the old grep -c '='.
@@ -90,7 +131,7 @@ run_case() {
 version = 1
 [runner]
 name_prefix = "ez-runner-c"
-count = 16
+count = 16 # synthetic fixture; trailing digits must not alter the parsed count 24
 EOF
   else
     rm -f "$CONFIG_DIR/config.toml"
@@ -99,6 +140,7 @@ EOF
   HOME="$TEMP_HOME"
   SLOT_FILE="$SLOT_FILE"
   EXPECTED_CONTAINERS=""
+  eval "$COUNT_FUNC_SRC"
   eval "$FUNC_SRC"
   eval "$DERIVE_SRC"
 
@@ -115,10 +157,28 @@ EOF
   fi
 }
 
+run_platform_default_case() {
+  local label="$1" platform_default="$2"
+
+  HOME="$TEMP_HOME"
+  SLOT_FILE="$CONFIG_DIR/missing-slot-assignments.toml"
+  EXPECTED_CONTAINERS=""
+  DEFAULT_CONFIGURED_COUNT="$platform_default"
+  eval "$COUNT_FUNC_SRC"
+  eval "$FUNC_SRC"
+  eval "$DERIVE_SRC"
+
+  if [ "$EXPECTED_CONTAINERS" != "$platform_default" ]; then
+    echo "  [$label] EXPECTED_CONTAINERS mismatch: got=$EXPECTED_CONTAINERS want=$platform_default -- FAIL"
+    return 1
+  fi
+  echo "  [$label] EXPECTED_CONTAINERS=$EXPECTED_CONTAINERS -- PASS"
+}
+
 echo "--- doctor-runner EXPECTED_CONTAINERS regression ---"
 OVERALL_PASS=true
 
-# Case 1: config.toml present (count=16) -> must resolve EXPECTED_CONTAINERS=16
+# Case 1: synthetic config.toml (count=16) -> must resolve EXPECTED_CONTAINERS=16
 # (not ~28 from the old double-count bug).
 run_case "config-present-16-containers" "yes" "16" || OVERALL_PASS=false
 
@@ -126,6 +186,11 @@ run_case "config-present-16-containers" "yes" "16" || OVERALL_PASS=false
 # count (16 entries) -> must resolve to 16 via the fallback (never the
 # whole-file double-count of ~28).
 run_case "config-missing-section-scoped-fallback" "no" "16" || OVERALL_PASS=false
+
+# Cases 3-4: with neither config nor slot assignments available, use the
+# platform-selected default instead of silently treating every host as macOS.
+run_platform_default_case "linux-platform-default" "10" || OVERALL_PASS=false
+run_platform_default_case "macos-platform-default" "6" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

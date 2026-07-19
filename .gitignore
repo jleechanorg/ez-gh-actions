@@ -4,3 +4,5 @@
 /config/daemon.toml
 goals/*/22-of-22-proof.jsonl
 .worktrees/
+__pycache__/
+*.py[cod]

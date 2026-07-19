@@ -263,6 +263,51 @@ pub struct RunnerConfig {
     /// per-runner floor set too low caused a jest OOM failure class).
     #[serde(default = "default_runner_floor_mb")]
     pub runner_floor_mb: u64,
+    /// Host-side directory of pre-downloaded Python wheels (e.g. populated by
+    /// `pip download -r requirements.txt -d <dir>` on a schedule external to
+    /// this daemon), bind-mounted read-only into every runner container at
+    /// `/opt/wheelhouse` with `PIP_FIND_LINKS` pointed at it. Opt-in (`None`
+    /// by default): ephemeral runners currently write their whole pip
+    /// download into the container's writable overlay layer every job, which
+    /// is never returned to the host until an explicit fstrim (bead
+    /// jleechan-93cf, "Move high-churn runner workspaces and caches out of
+    /// ephemeral Docker writable layers"). If the configured path doesn't
+    /// exist on the host at container-start time, the mount is skipped
+    /// (fail-open) rather than failing the run — this is a pure accelerant,
+    /// never correctness-required, and jobs must work identically without it.
+    ///
+    /// CRITICAL on Colima/Mac: this path MUST live under one of Colima's
+    /// configured virtiofs mounts (`colima ssh -- mount | grep virtiofs`),
+    /// e.g. a subdirectory of `~/.cache`. A path outside that allowlist does
+    /// NOT fail loudly — `docker run -v <host-path>:...` on an unmounted
+    /// path silently bind-mounts an empty phantom directory (confirmed live,
+    /// 2026-07-17/18); the `is_dir()` check below still passes since the
+    /// real directory exists on the macOS host, so the mount is attempted,
+    /// but `PIP_FIND_LINKS` ends up pointing at an empty dir inside the
+    /// container and pip quietly falls through to a full network download —
+    /// looking "configured" while doing nothing.
+    #[serde(default)]
+    pub wheelhouse_host_path: Option<String>,
+    /// Host-side parent directory for per-runner job workspaces
+    /// (`{workspace_host_path}/{runner_name}`), bind-mounted read-write into
+    /// each container at `/home/runner/_work` -- the actions/runner default
+    /// workspace root. Same rationale as `wheelhouse_host_path` (bead
+    /// jleechan-93cf): checkout/build/test scratch currently lands in the
+    /// container's ephemeral writable overlay layer instead of host-visible,
+    /// trim-eligible disk. Opt-in (`None` by default), fail-open if the
+    /// parent path is missing. The per-runner subdirectory is wiped by the
+    /// daemon immediately before each container start (see
+    /// `start_one_with_generate_at_slot`) so no job ever sees a prior job's
+    /// checkout, build output, or credentials -- required to preserve the
+    /// per-job isolation ephemeral runners exist for.
+    ///
+    /// CRITICAL on Colima/Mac: same virtiofs-allowlist requirement as
+    /// `wheelhouse_host_path` above -- must live under a mount from
+    /// `colima ssh -- mount | grep virtiofs` (e.g. a subdirectory of
+    /// `~/.cache`), or the mount silently resolves to an empty phantom
+    /// directory instead of failing loudly.
+    #[serde(default)]
+    pub workspace_host_path: Option<String>,
 }
 
 impl RunnerConfig {
@@ -464,6 +509,8 @@ impl Config {
                 vm_total_mb: None,
                 guest_reserve_mb: default_guest_reserve_mb(),
                 runner_floor_mb: default_runner_floor_mb(),
+                wheelhouse_host_path: None,
+                workspace_host_path: None,
             },
             limits: Limits {
                 memory_mb: mem,
@@ -535,6 +582,7 @@ impl Config {
         if self.limits.pids < 1 {
             anyhow::bail!("limits.pids must be at least 1 (got {})", self.limits.pids);
         }
+        require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
         if self.runner.count < 1 {
             anyhow::bail!(
                 "runner.count must be at least 1 (got {})",
@@ -715,6 +763,8 @@ minimum_isolation = "container"
             vm_total_mb: None,
             guest_reserve_mb: default_guest_reserve_mb(),
             runner_floor_mb: default_runner_floor_mb(),
+            wheelhouse_host_path: None,
+            workspace_host_path: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
         // A typo'd 0 (or anything under the floor) must not hot-loop the
@@ -861,6 +911,16 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.limits.pids = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn reject_zero_min_free_disk_gb() {
+        let mut cfg = valid_config();
+        cfg.limits.min_free_disk_gb = 0;
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(format!("{err:#}").contains("limits.min_free_disk_gb must be at least 1"));
     }
 
     #[test]

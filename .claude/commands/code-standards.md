@@ -35,10 +35,10 @@ Repo-local command may add gates, NEVER remove user-scope gates. Conflict = user
 These are the **enforceable** rules derived from the repo's own statements. Every review must check each one.
 
 ### 1. Fleet capacity standard (P0)
-**The fleet MUST run 22/22 (16 Linux + 6 Mac).** Anything less is BROKEN; root-cause and fix. **No "churn" / "normal cycling" excuses.**
+**The fleet MUST run 16/16 (10 Linux + 6 Mac).** Anything less is BROKEN; root-cause and fix. **No "churn" / "normal cycling" excuses.**
 - GitHub API is **NOT** authoritative — use local `docker top` / `docker ps` for per-slot `Runner.Worker` proof.
 - `./doctor-runner` is authoritative; it enforces a 4-state model: EXECUTING / IDLE-OK / IDLE-STARVED / DOWN. Busy fleets must never measure as dead.
-- **Review gate**: any PR that touches `ensure_count`, `release_stale_slots`, runner registration, slot reconciliation, or job assignment MUST prove (in the PR description) that 22/22 holds under a busy CI burst, not just at idle.
+- **Review gate**: any PR that touches `ensure_count`, `release_stale_slots`, runner registration, slot reconciliation, or job assignment MUST prove (in the PR description) that 16/16 holds under a busy CI burst, not just at idle.
 
 ### 2. Single-writer rule (P0, mandatory)
 Steps 2–5 of Gate 0 (`cargo install`, `systemctl --user restart ezgha.service`, `./docs/verify-exit-criteria.sh`, `docker rm -f`) are the **deploy-owner's** responsibility ONLY.

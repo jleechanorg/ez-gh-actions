@@ -36,4 +36,13 @@ RUN apt-get update && python3 -m venv /opt/playwright-deps-venv \
     && /opt/playwright-deps-venv/bin/python -m playwright install-deps chromium webkit \
     && rm -rf /opt/playwright-deps-venv /var/lib/apt/lists/*
 
+# Wrap `tar` (bead jleechan-93cf follow-up): /usr/local/bin resolves ahead
+# of /usr/bin in this image's PATH, so bare `tar` calls from workflow steps
+# transparently go through the wrapper; the real GNU tar at /usr/bin/tar is
+# untouched. See docker/tar-workspace-wrapper.sh for why (virtiofs symlink-
+# extraction corruption on the workspace_host_path bind mount) and
+# tests/workspace_mount_symlink_extraction_test.sh for the regression test.
+COPY docker/tar-workspace-wrapper.sh /usr/local/bin/tar
+RUN chmod 0755 /usr/local/bin/tar
+
 USER runner

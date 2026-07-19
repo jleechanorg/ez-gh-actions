@@ -17,6 +17,66 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 `gdy` is now actually closed in beads, `bxy` promoted to P1, `ozk` promoted to P2,
 `juv` retitled as the correlation layer, and missing Docker-timeout bead `fl0` created.
 
+**2026-07-12 host-availability program:** Jeff-Ubuntu's explicit target is now
+10 Linux runners. Track the host-first capacity envelope in
+[issue #71](https://github.com/jleechanorg/ez-gh-actions/issues/71), mandatory
+agent/MCP containment in
+[issue #72](https://github.com/jleechanorg/ez-gh-actions/issues/72), and the
+bounded real-job capacity proof recorded by `ez-gh-actions-e0z0`. The rejected
+72-hour soak in [issue #73](https://github.com/jleechanorg/ez-gh-actions/issues/73)
+and bead `ez-gh-actions-e0z0.1` is closed.
+
+**2026-07-12 19:35 crash update:** global OOM killed the Linux runner QEMU at
+37.6 GiB RSS with swap exhausted; watchdog then rebooted after its load-based
+repair policy failed to reduce pressure. Restart prevention is now an ordered
+P0 chain: deploy alignment (`jleechan-qo8`), aggregate runner cap
+(`jleechan-aqh`), host admission (`jleechan-1kkj`), agent/MCP containment
+(`ez-gh-actions-0725`), fail-closed reconciliation (`ez-gh-actions-ghd2.1`),
+staged shedding (`ez-gh-actions-ghd2.7`), and watchdog repair
+(`ez-gh-actions-6478`). Mac restoration is tracked by
+`ez-gh-actions-ghd2.3` and `ez-gh-actions-hcu`.
+
+**Machine-portable recovery contract:** live files under `~/.config`,
+`~/.local`, and `/etc` are deployment outputs, not the source of truth. The
+10-runner program must land as repository-owned host profiles, rendered
+systemd/watchdog configuration, idempotent install/restore/rollback tooling,
+doctor drift checks, and clean-machine integration coverage. Track the
+versioned profile and installer in `ez-gh-actions-e0z0.2`; track disposable
+restore, upgrade, drift, and rollback proof in `ez-gh-actions-e0z0.3`. The
+existing VM-sizing (`jleechan-bih3`), aggregate-cap (`jleechan-aqh`),
+single-backend (`ez-gh-actions-apye`), pressure-watcher
+(`ez-gh-actions-0725`), and watchdog-shedding (`ez-gh-actions-6478`) beads now
+require committed portable artifacts. Manual host edits cannot close them.
+
+**2026-07-13 reliability architecture correction:** crash prevention was the
+original goal; implementation and verification drifted toward per-container
+isolation and single-runner canaries, neither of which proves physical-host
+survival. The outer availability boundary remains incomplete: the actual QEMU
+cgroup needs a funded host reserve and aggregate cap, AO/agent/MCP/browser
+workloads need separate containment, admission must use memory/swap/PSI, partial
+GitHub snapshots must fail closed, backend recovery must require proven backend
+failure, and watchdog shedding must demonstrate released QEMU RSS. The latest
+abrupt reset had no OOM/watchdog/panic record and remains unclassified because
+kdump/pstore capture was ineffective. Commit `d77e53a` is an implementation
+checkpoint only, not evidence that these boundaries are deployed or that the
+10-Linux/6-Mac capacity contract passes. Its physical-host CPU-controller check
+is also unresolved: Docker runs inside the Lima guest, so absence of a host
+controller can incorrectly suppress a valid guest `--cpus` limit. This is a
+regression risk, not completion of `ez-gh-actions-222n`.
+
+Execute next in dependency order: restore goal traceability
+(`ez-gh-actions-u1qt`); settle the architecture and capacity contract
+(`ez-gh-actions-kdne`, `ez-gh-actions-s17j`); land portable profiles and real
+outer limits (`ez-gh-actions-e0z0.2`, `jleechan-bih3`, `jleechan-aqh`,
+`ez-gh-actions-sa8c`, `ez-gh-actions-0725`); make admission, reconciliation,
+and recovery fail closed (`jleechan-1kkj`, `ez-gh-actions-ghd2.1`,
+`ez-gh-actions-2tpd`); add staged shedding and crash observability
+(`ez-gh-actions-6478`, `ez-gh-actions-gam1`); then run the executable
+host-availability proof (`ez-gh-actions-bjpk`). Disk/IO and CPU enforcement are
+tracked by `ez-gh-actions-nwbm` and `ez-gh-actions-222n`. Mac six-runner
+restoration remains `ez-gh-actions-ghd2.3` plus `ez-gh-actions-hcu`. No 72-hour
+soak is required.
+
 **Phase 1 — stop the bleeding + honest gates (S each)**
 1. ~~Watchdog pings + WatchdogSec=180 in source~~ — DONE `aabd822`/`42dff7c` (Linux deployed; Mac install pending, see jleechan-5rv/0q9)
 2. ~~`bxy` (P1)~~ — DONE: release_slot on JIT failure + quarantine corrupt slot_assignments.toml instead of wedging (read_slot_assignments hard-fails)
@@ -41,12 +101,13 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 15. `2ik` (P3) — commit or delete external ~/.local/bin/ezgha-fleet-watchdog.sh (Gate 7 committed-config rule)
 16. `1fu`/`zkn`/`zyb` — hostname-scoped dereg residual, runner_group_id config, minor review gaps
 17. Add `.claude/hooks/git-header.sh` or drop the footer convention for this repo (hook referenced by global CLAUDE.md is absent here)
-18. **Repo-local `/code-standards`** (`.claude/commands/code-standards.md`) — layers ten repo gates (fleet-capacity 22/22, single-writer, layered-design, self-outage, blast-radius, self-healing recipes, honest gates, automation-callers, no-silent-underprovisioning, test isolation) on top of the user-scope command. New code must pass before merge. PRs touching thresholds / health / watchdog / restart / resource / monitor cadence MUST include a "Blast radius" section.
+18. **Repo-local `/code-standards`** (`.claude/commands/code-standards.md`) — layers ten repo gates (fleet-capacity 16/16: 10 Linux + 6 Mac, single-writer, layered-design, self-outage, blast-radius, self-healing recipes, honest gates, automation-callers, no-silent-underprovisioning, test isolation) on top of the user-scope command. New code must pass before merge. PRs touching thresholds / health / watchdog / restart / resource / monitor cadence MUST include a "Blast radius" section.
 
 **Cross-host (Mac)**: jleechan-5rv (P2, re-test after new binary + bxy), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
 
 ## Recent activity (by day)
 
+- [2026-07-12](activity/2026-07-12.md) - Host-availability program, proven QEMU/global-OOM watchdog reboot, ordered P0 containment, and Mac six-runner restoration.
 - [2026-07-11](activity/2026-07-11.md) — 48-hour cross-fleet audit: Mac forced-reset recovery loop, Linux memory/watchdog reboot, PR #56 self-healing fix, and prioritized watchdog/CI/deploy guardrails.
 - [2026-07-10](activity/2026-07-10.md) — Fleet-hardening marathon: stable-libexec migration (sa1t closed), doctor-runner honesty ×4 (first exit-0), ao-runner farm eradicated, reaper multi-repo + Linux timer installed, codex cold-review fixes, factory lane opened (10 beads incl. PR#47 drive).
 - [2026-07-09](activity/2026-07-09.md) — Root-cause confirmed: Linux fleet convergence failure from runner reconciliation churn; tracked with `jleechan-zy6` and `jleechan-9zd`.
@@ -58,13 +119,13 @@ Takeover audit 2026-07-07 reconciled current beads against Claude/Codex sparse h
 
 - Ran `/nextsteps` now to refresh tracker alignment after `1a02b36`.
 - Closed-bead/status sweep result: no new beads closed in this pass; critical P0 blockers remain `ez-gh-actions-5ki`, `ez-gh-actions-0jo`, `ez-gh-actions-lyf`.
-- Cross-host deployment bead `ez-gh-actions-4kv` remains open and should only close after Linux/Mac Gate-0-safe rollout with sustained per-slot `docker top` proof of full 22/22 running.
+- Cross-host deployment bead `ez-gh-actions-4kv` remains open and should only close after Linux/Mac Gate-0-safe rollout with sustained per-slot `docker top` proof of full 16/16 running.
 - `1a02b36` (`codex/gpt-5: avoid backend restart churn when docker reachable`) is now part of the active timeline and did not close the reconcile race gap in Path 4.
 
 - Closed `ez-gh-actions-o6i` (`next-steps-2026-07-08`) after completing a post-failure tracker pass.
 - Landed `codex/gpt-5: avoid backend restart churn when docker reachable` ([`1a02b36`](https://github.com/jleechanorg/ez-gh-actions/commit/1a02b36)) on Linux.
 - P0 reconciliation race blockers remain open: `ez-gh-actions-5ki`, `ez-gh-actions-0jo`, `ez-gh-actions-lyf`.
-- Cross-host deploy task `ez-gh-actions-4kv` is still open; coordinate Gate-0-safe deploy + full 22/22 proof before claiming full health.
+- Cross-host deploy task `ez-gh-actions-4kv` is still open; coordinate Gate-0-safe deploy + full 16/16 proof before claiming full health.
 
 ### 2026-07-09 (ez-gh-actions) — Linux/macOS runner convergence root-cause
 

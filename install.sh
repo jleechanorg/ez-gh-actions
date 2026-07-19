@@ -48,17 +48,18 @@ uninstall() {
     ok "launchd agent removed"
   fi
 
-  # Auxiliary units (token-refresh / queue-reaper / watchdog) — installed
+  # Auxiliary units (token-refresh / queue-reaper / watchdog / dashboard /
+  # colima-trim) — installed
   # further below in the main flow as ezgha-<name>.timer+.service on Linux
   # and org.jleechanorg.ezgha-<name>.plist on macOS, all pointed at scripts
   # in ~/.local/libexec/ezgha. Uninstall previously disabled only the main
-  # service + plist, then rm -rf'd libexec — leaving these three still
+  # service + plist, then rm -rf'd libexec — leaving these jobs still
   # scheduled against a now-deleted script. That is exactly the dead-path-
   # scheduled-job incident class from 2026-07-09 (codex adversarial review
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog"
+  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard colima-trim"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -179,15 +180,64 @@ else
 fi
 
 if command -v docker >/dev/null 2>&1; then
-  if docker version >/dev/null 2>&1; then
+  ok "docker CLI"
+else
+  bad "docker not found — install Docker, or Colima/Lima for a VM-backed daemon (https://docs.docker.com/get-docker)"
+  missing=1
+fi
+
+# ── Self-contained docker socket detection ──────────────────────────────────
+# /var/run/docker.sock may be a stale symlink to a non-existent path
+# (typical after switching from Docker Desktop to Colima on macOS, or
+# when a fresh machine has only Colima installed and never had Docker
+# Desktop). ezgha queries the docker daemon via DOCKER_HOST; if the
+# socket is not at /var/run/docker.sock, the launchd service / systemd
+# unit must include the real socket path as DOCKER_HOST.
+# See session 2026-07-13 investigation: c-runner registration was
+# briefly thought broken when the symlink target didn't exist; the
+# actual cause was that the colima socket had been substituted but the
+# plist/unit still pointed at /var/run/docker.sock.
+DOCKER_HOST_OVERRIDE=""
+# Strategy 1: trust the active docker context
+DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+# Strategy 2: probe colima's default location
+DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
+# Strategy 3: probe docker desktop's socket
+DOCKER_DESKTOP_SOCK="${HOME}/.docker/run/docker.sock"
+DOCKER_DEFAULT_SOCK="/var/run/docker.sock"
+
+is_socket_alive() {
+  # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
+  local sock="$1"
+  [ -S "$sock" ] || return 1
+  DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
+}
+
+if [ -n "$DOCKER_CTX_HOST" ] && [ "$DOCKER_CTX_HOST" != "unix://$DOCKER_DEFAULT_SOCK" ]; then
+  # Active docker context already points at a non-default socket — export it
+  # so launchd plist / systemd unit can persist it.
+  DOCKER_HOST_OVERRIDE="$DOCKER_CTX_HOST"
+  info "docker context already overrides default socket: ${DOCKER_CTX_HOST}"
+elif is_socket_alive "$DOCKER_COLIMA_SOCK" && [ ! -e "$DOCKER_DEFAULT_SOCK" ]; then
+  # Colima is reachable, default symlink is broken/missing — surface the colima
+  # socket to ezgha so the service can find docker.
+  DOCKER_HOST_OVERRIDE="unix://$DOCKER_COLIMA_SOCK"
+  info "colima socket detected at ${DOCKER_COLIMA_SOCK}; setting DOCKER_HOST so launchd/systemd can find the daemon"
+elif is_socket_alive "$DOCKER_DESKTOP_SOCK" && [ ! -e "$DOCKER_DEFAULT_SOCK" ]; then
+  DOCKER_HOST_OVERRIDE="unix://$DOCKER_DESKTOP_SOCK"
+  info "docker-desktop socket detected at ${DOCKER_DESKTOP_SOCK}; setting DOCKER_HOST"
+fi
+export DOCKER_HOST_OVERRIDE
+
+if command -v docker >/dev/null 2>&1; then
+  if [ -n "${DOCKER_HOST_OVERRIDE}" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" docker version >/dev/null 2>&1; then
+    ok "docker daemon reachable via ${DOCKER_HOST_OVERRIDE}"
+  elif [ -z "${DOCKER_HOST_OVERRIDE}" ] && docker version >/dev/null 2>&1; then
     ok "docker daemon reachable"
   else
     bad "docker CLI found but daemon unreachable — start it (Colima/Lima/Docker Desktop) and check 'docker context ls'"
     missing=1
   fi
-else
-  bad "docker not found — install Docker, or Colima/Lima for a VM-backed daemon (https://docs.docker.com/get-docker)"
-  missing=1
 fi
 
 if command -v gh >/dev/null 2>&1; then
@@ -222,6 +272,38 @@ if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
 else
   cargo install --git "${REPO_URL}"
   ok "installed from ${REPO_URL}"
+fi
+
+# ── Build the custom runner image ──────────────────────────────────────────
+# Every example config ships `image = "ezgha-runner:latest"` (bare
+# ghcr.io/actions/actions-runner:latest lacks gh/jq -> exit 127 in workflows).
+# The image lives only in the Docker/Colima VM's local store, never in git,
+# so a fresh VM (new machine, `colima delete && colima start`, disk-pressure
+# recreation) has no way to get it back except this step. Idempotent: a
+# no-op rebuild of an unchanged Dockerfile.runner is a fast cache hit.
+if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" docker version >/dev/null 2>&1; then
+  info "Building ezgha-runner:latest from Dockerfile.runner"
+  # DOCKER_BUILDKIT=0 (legacy builder): BuildKit's build-context network path
+  # hit a reproducible "python3-venv has no installation candidate" apt
+  # failure on this colima/vz setup even with --no-cache, while the legacy
+  # builder and a plain `docker run ... apt-get install` both succeeded
+  # immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully
+  # isolated; defaulting to the legacy builder here is the proven-reliable path.
+  if DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" DOCKER_BUILDKIT=0 \
+      docker build -f "${SCRIPT_DIR}/Dockerfile.runner" -t ezgha-runner:latest "${SCRIPT_DIR}" \
+      >/tmp/ezgha-runner-build.log 2>&1; then
+    ok "ezgha-runner:latest built"
+  else
+    bad "ezgha-runner:latest build failed — see /tmp/ezgha-runner-build.log (daemon will refuse to spawn runners without this image)"
+    missing=1
+  fi
+else
+  info "Docker daemon unreachable or Dockerfile.runner missing — skipping runner image build (fix docker reachability above, then re-run ./install.sh)"
+fi
+
+if [ "${missing}" -ne 0 ]; then
+  bad "Fix the items above, then re-run ./install.sh"
+  exit 1
 fi
 
 CARGO_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin"
@@ -265,15 +347,12 @@ if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
     if [ -f "${plist}" ] && launchctl list 2>/dev/null | grep -q "org.jleechanorg.ezgha"; then
-      info "Restarting launchd agent..."
-      launchctl unload "${plist}" 2>/dev/null || true
-      launchctl load "${plist}"
-      ok "ezgha service restarted via launchd"
+      info "Regenerating launchd agent..."
     else
       info "Installing ezgha service..."
-      "${CARGO_BIN}/${BIN}" install-service
-      ok "ezgha service installed and started via launchd"
     fi
+    DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
+    ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
     if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
       info "Restarting systemd service..."
@@ -287,12 +366,14 @@ if [ -f "${CONFIG_PATH}" ]; then
   fi
 fi
 
-# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper) ─
-# These three units keep the ezgha fleet healthy between deploys:
+# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, dashboard, colima-trim) ─
+# These auxiliary units keep the ezgha fleet observable and healthy between deploys:
 #   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
 #   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
+#   - runner-dashboard:      publishes aggregate fleet health from the Mac host
+#   - colima-trim:           guards Colima VM disk trim to prevent runaway growth
 #
 # Scripts are NEVER exec'd from this repo/worktree checkout: they are copied
 # (install -m 0755) to the stable user-scope location ~/.local/libexec/ezgha/
@@ -305,12 +386,20 @@ UNIT_DIR="${SCRIPT_DIR}/systemd"
 if [ -d "${UNIT_DIR}" ]; then
   HOME_DIR="${HOME}"
   SCRIPTS_DIR="${HOME_DIR}/.local/libexec/ezgha"
-  mkdir -p "${SCRIPTS_DIR}"
+  mkdir -p "${SCRIPTS_DIR}" "${HOME_DIR}/.local/state/ezgha"
+  chmod 0700 "${HOME_DIR}/.local/state/ezgha"
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.
   for script in "${SCRIPT_DIR}"/scripts/*.sh "${SCRIPT_DIR}"/scripts/*.py; do
     [ -f "${script}" ] || continue
+    if [ "$(uname -s)" = "Darwin" ]; then
+      case "$(basename "${script}")" in
+        publish_runner_dashboard.sh|runner_dashboard_host_probe.sh|build_runner_dashboard_snapshot.py)
+          continue
+          ;;
+      esac
+    fi
     install -m 0755 "${script}" "${SCRIPTS_DIR}/$(basename "${script}")"
   done
   ok "scripts installed to stable path: ${SCRIPTS_DIR}"
@@ -338,6 +427,21 @@ PLIST
       done
       cat >> "${plist}" <<PLIST
   </array>
+PLIST
+      # Inject DOCKER_HOST env var if the default socket is broken and a
+      # colima / docker-desktop socket was detected. Without this, the
+      # launchd service fails to find the docker daemon and no runners
+      # register with GitHub — see install.sh self-contained-detection
+      # block above for the matching probe logic.
+      if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
+        cat >> "${plist}" <<PLIST
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>
+  </dict>
+PLIST
+      fi
+      cat >> "${plist}" <<PLIST
   <key>StartInterval</key><integer>${interval_sec}</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${HOME_DIR}/.local/state/ezgha/${name}.log</string>
@@ -355,11 +459,74 @@ PLIST
         rm -f "${plist}"
         return 1
       fi
-      launchctl load -w "${plist}" 2>/dev/null || true
+      if ! launchctl load -w "${plist}"; then
+        bad "launchctl failed to load ${plist}"
+        rm -f "${plist}"
+        return 1
+      fi
+      if ! launchctl print "gui/$(id -u)/org.jleechanorg.ezgha-${name}" >/dev/null; then
+        bad "launchctl did not register org.jleechanorg.ezgha-${name}"
+        launchctl unload "${plist}" 2>/dev/null || true
+        rm -f "${plist}"
+        return 1
+      fi
       ok "macOS plist installed: ${name} (every ${interval_sec}s)"
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
+    install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
+    # ── Guest-native fstrim cadence — the actual root cause fix, not just the guard ──
+    # colima-trim-guard.sh is a host-side EMERGENCY safety net (fires only when
+    # host free space drops below 40GiB) and has twice proven unreliable (stale
+    # shlock lock, then an outer-timeout hang — bead jleechan-wy3s/jleechan-zxhf).
+    # The actual driver of Colima disk growth is ephemeral JIT runner churn
+    # (create -> run one job -> destroy, by GitHub Actions ephemeral-runner
+    # design) on an ext4 filesystem with no online discard: every churned
+    # container leaves permanently-allocated sparse blocks until something
+    # trims them. The guest ships its own fstrim.timer, but Ubuntu's stock
+    # default is OnCalendar=weekly — useless against a churn rate of ~8 full
+    # container lifecycles per 20 seconds observed live (2026-07-17). This
+    # overrides the guest's own timer to run every 5 minutes, independent of
+    # macOS launchd/shlock entirely — no colima-ssh subprocess from the host
+    # needed for routine trimming; colima-trim-guard.sh remains only as a
+    # backup for genuine host-wide emergencies.
+    # Second, deeper bug found in the same investigation: stock fstrim.service
+    # runs `fstrim --listed-in /etc/fstab:/proc/self/mountinfo`, which SILENTLY
+    # skips /mnt/lima-colima (the actual docker data-root, on /dev/vdb1) even
+    # though it fully supports discard (DISC-MAX 60G) and is live-mounted —
+    # it is simply absent from /etc/fstab (mounted separately by lima at boot)
+    # and --listed-in evidently does not pick it up from mountinfo either in
+    # practice. Confirmed live 2026-07-17: the frequent-timer fix alone ran
+    # every 5 min for 10+ minutes trimming only /, /boot, /boot/efi (a few
+    # hundred MiB each) while the 50+ GiB datadisk never moved; a manual
+    # `fstrim /mnt/lima-colima` then reclaimed 46.7 GiB in one shot. Overriding
+    # ExecStart to `fstrim --all` (trims every currently-mounted filesystem
+    # that supports discard, not just fstab-listed ones) fixes this at the
+    # command level, independent of the timer-frequency fix above.
+    if command -v colima >/dev/null 2>&1 && colima status --profile default >/dev/null 2>&1; then
+      if colima ssh --profile default -- sudo mkdir -p /etc/systemd/system/fstrim.service.d /etc/systemd/system/fstrim.timer.d 2>/dev/null; then
+        colima ssh --profile default -- sudo tee /etc/systemd/system/fstrim.service.d/override.conf >/dev/null <<'FSTRIM_SVC_EOF'
+[Service]
+ExecStart=
+ExecStart=/sbin/fstrim --all --verbose --quiet-unsupported
+FSTRIM_SVC_EOF
+        colima ssh --profile default -- sudo tee /etc/systemd/system/fstrim.timer.d/override.conf >/dev/null <<'FSTRIM_EOF'
+[Timer]
+OnCalendar=
+OnCalendar=*:0/5
+AccuracySec=30s
+RandomizedDelaySec=30s
+FSTRIM_EOF
+        colima ssh --profile default -- sudo systemctl daemon-reload 2>/dev/null
+        colima ssh --profile default -- sudo systemctl restart fstrim.timer 2>/dev/null
+        ok "guest fstrim.timer overridden to every 5 minutes with --all scope (was weekly + fstab-only, silently missing the docker data-root) — root-cause fix for Colima sparse-disk growth"
+      else
+        info "guest fstrim.timer override skipped — could not reach Colima guest via sudo (VM not running or no sudo)"
+      fi
+    else
+      info "guest fstrim.timer override skipped — colima not installed or default profile not running"
+    fi
     # Watchdog is gated separately: arming (writing + launchd-loading the
     # plist) is skipped by default — gated on ez-gh-actions-30p/uh2/lxn, see
     # bead ez-gh-actions-sa1t. Unlike token-refresh/queue-reaper above, we do
@@ -367,7 +534,7 @@ PLIST
     # closed, so a default run cannot itself create/overwrite the plist.
     watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
     if [ "${WITH_WATCHDOG}" -eq 1 ]; then
-      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host macos"
+      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host mac"
       ok "watchdog armed: operator asserted ez-gh-actions-30p/uh2/lxn gate cleared"
     else
       info "watchdog arming skipped — gated on beads ez-gh-actions-30p/uh2/lxn; pass --with-watchdog once the gate clears"
@@ -446,4 +613,3 @@ cat <<'EOF'
   ezgha start                        # launch one ephemeral runner now
   ezgha install-service              # keep runners supervised at login (if not auto-installed)
 EOF
-

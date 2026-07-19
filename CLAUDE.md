@@ -4,10 +4,10 @@
 `ezgha` is a Rust CLI that manages ephemeral self-hosted GitHub Actions runners using Docker JIT registration. One binary; installs as a user systemd service.
 
 ## Fleet capacity standard — no excuses, prove per-slot execution
-The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16 on jeff-ubuntu) + **6 Mac** (ez-mac-runner-b-1..6) = **22 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 22/22 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
-- **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returns TRUNCATED/partial data — the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
-- **`./doctor-runner` is authoritative** (`./doctor.sh` is LEGACY/BROKEN on docker 27+ — see bead ez-gh-actions-91r — kept only as a back-reference). It enforces per-slot activity truth with a 4-state model: EXECUTING (job+repo+run URL+elapsed evidence) / IDLE-OK (nothing queued, or queued for less than `IDLE_STARVED_THRESHOLD_MIN`=5min — healthy) / IDLE-STARVED (queued >=5min — defect) / DOWN (no container — defect). A busy fleet must never measure as dead — the motivating defect this replaced was a tail-grep on "Listening for Jobs" that read a fully-busy fleet as 0/22 healthy. Run it; fix any DOWN or IDLE-STARVED slot before declaring the fleet healthy.
-- Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 16). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
+The fleet MUST run its full configured capacity: **10 Linux** (ez-runner-c-1..10 on jeff-ubuntu) + **6 Mac** (ez-mac-runner-b-1..6) = **16 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 16/16 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
+- **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returned TRUNCATED/partial data — during the prior 22-runner contract, the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
+- **`./doctor-runner` is authoritative** (`./doctor.sh` is LEGACY/BROKEN on docker 27+ — see bead ez-gh-actions-91r — kept only as a back-reference). It enforces per-slot activity truth with a 4-state model: EXECUTING (job+repo+run URL+elapsed evidence) / IDLE-OK (nothing queued, or queued for less than `IDLE_STARVED_THRESHOLD_MIN`=5min — healthy) / IDLE-STARVED (queued >=5min — defect) / DOWN (no container — defect). A busy fleet must never measure as dead — the motivating defect this replaced was a tail-grep on "Listening for Jobs" that read a fully-busy fleet as 0/16 healthy. Run it; fix any DOWN or IDLE-STARVED slot before declaring the fleet healthy.
+- Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 10). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
 
 ## Key files
 - `src/docker_backend.rs` — core runner lifecycle (slot allocation, container management)
@@ -20,20 +20,40 @@ The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16
 - `.claude/skills/ezgha-doctor/SKILL.md` — diagnostic + self-healing recipes
 - `.claude/commands/doctor-ezactions.md` — `/doctor-ezactions` slash command (`.claude/commands/doctor.md` is a deprecation stub pointing here)
 
+## Workspace mount + virtiofs symlink extraction bug (Mac, bead jleechan-93cf)
+
+`runner.workspace_host_path` bind-mounts a host directory at `/home/runner/_work` (disk-churn fix). On Colima/Mac, `tar` extracting an archive containing a symlink onto that virtiofs-backed mount corrupts the symlink into an unreadable 0-byte mode-000 file (`tar: ...: Cannot open: Permission denied`) — confirmed live with `actions/setup-python`'s own tarball, which the GitHub Actions runner extracts into `_work/_actions` when downloading the action. A plain `ln -s` on the mount works fine; extraction into the container's own overlay filesystem works fine; only tar-extracting a real archive onto virtiofs corrupts symlink members. This broke `setup-python`/`setup-node`/`setup-gcloud` on the Mac fleet at a 41% job failure rate for ~1-2 days before being caught (2026-07-19).
+
+**Fix (part 1 — runner-internal cache dirs):** the daemon tmpfs-shadows the three fixed runner-internal cache dirs (`_actions`, `_temp`, `_tool`) inside the workspace mount, so the runner's own action/tool-cache extraction never touches virtiofs, while checkouts/build scratch (which live directly under `_work/<owner>/<repo>`, the actual disk-churn win) are unaffected.
+
+**WIDENED understanding (2026-07-19/20 follow-up):** the corruption is NOT limited to the three runner-internal cache dirs — any tar extraction of an archive containing a symlink anywhere on this mount is affected, including the real checkout path `_work/<owner>/<repo>` (exposed by workflow steps like `npm ci`, downloaded release tarballs, `docker save`/`load`, git submodule tarballs). Shadowing that path with tmpfs too was considered and rejected — it's the highest-volume directory and the actual reason this mount exists (checkout/build-scratch disk churn), so tmpfs-shadowing it would reintroduce the original problem.
+
+**Fix (part 2 — checkout path, everywhere else on the mount):** the runner image (`Dockerfile.runner`) bakes a `tar` wrapper at `/usr/local/bin/tar` (`docker/tar-workspace-wrapper.sh`, resolves ahead of the real `/usr/bin/tar` in PATH). The daemon sets `EZGHA_VIRTIOFS_WORKSPACE=1` on every container that has the workspace mount (`docker_backend.rs`); when that flag is set, any tar **extract** whose destination resolves under `/home/runner/_work` is handled via a mirror-then-sync design: any pre-existing destination content is copied into a tmpfs/overlay stage dir first (a no-op for a fresh destination), the real tar runs in the stage, then the stage is `cp -a`'d back onto the real destination (safe lstat/symlink-preserving syscalls) and tar's real exit code is propagated. Mirroring first means GNU tar's own collision/overwrite-protection flags (`--keep-old-files`, etc.) see the same pre-existing files they'd see extracting in place — this was revised twice after adversarial review: an earlier "stage into an empty dir" design defeated `--keep-old-files`, and an earlier "only stage when the destination is empty" design never engaged for the realistic case (real jobs run `actions/checkout` first, so the destination is essentially always already populated by the time any other workflow step tar-extracts something). Every other invocation (archive creation, listing, extraction outside the mount, or any container without the flag) passes straight through to the real tar untouched — zero behavior change for installs that don't opt into `workspace_host_path`. Known cost: this mirrors the *entire* pre-existing destination tree on every guarded extraction, so it's O(destination size), not free — accepted given the alternative was a real, evidenced production bug. Known accepted gap: an archive member whose stored mode blocks even owner-read (e.g. mode 000) fails to sync from stage to the real destination, since `cp` can no longer re-read what tar already restricted — this is a distinct, narrow, two-phase-design limitation (not virtiofs-specific — true on any filesystem), separate from a *second*, already-broken-natively virtiofs limitation where mode-000 files fail even on direct, unwrapped extraction. Neither is fixed here (rare in real CI archives, unlike symlinks); see `docker/tar-workspace-wrapper.sh`'s header comment for the full detail.
+
+**Regression coverage:** `tests/workspace_mount_symlink_extraction_test.sh` (Layer 2, real Docker — baseline overlay-fs extraction works; raw mount root is diagnostically still broken; tmpfs-shadowed `_actions`/`_temp`/`_tool` extraction and execution succeed; RED→GREEN proof that unguarded checkout-path extraction corrupts while the tar wrapper fixes it, verified on both a fresh and a realistic already-populated destination and on both the container and host side; `--keep-old-files` collision protection is preserved; mode-000 members are diagnosed as an out-of-scope, already-broken-natively limitation, not a regression) + `docker_backend::tests::workspace_mount_shadows_actions_temp_tool_with_tmpfs` and `docker_backend::tests::workspace_mount_sets_virtiofs_env_for_tar_wrapper` (Layer 1, unit — assert the `--tmpfs ...:exec` args and the `-e EZGHA_VIRTIOFS_WORKSPACE=1` flag are emitted exactly when `workspace_host_path` is configured, and absent when it's not). Run the integration test after any change to the workspace-mount code path or the wrapper script: rebuild the image first (`DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:latest .`), then `DOCKER_HOST=... bash tests/workspace_mount_symlink_extraction_test.sh`.
+
+**Why this took 1-2 days to catch (see `/harness` 2026-07-19):** pre-deploy validation for this feature was a synthetic single-file write test, not a real job — the bead's own acceptance criteria required real-job validation before shipping and it was skipped. There is also no job-success-rate monitor in this repo's health tooling (`doctor-runner` measures container *activity*, EXECUTING/IDLE/DOWN, never job *outcome*) — a fleet failing 75% of jobs it picks up reads as perfectly healthy. Any future change to `docker_backend.rs`'s container-start/mount path is a **production runtime change**: validate with a real job (or the integration test above) before/immediately after deploying, not unit tests alone.
+
 ## Custom runner image (IMPORTANT)
 The config must use `ezgha-runner:latest` (built from `Dockerfile.runner`), NOT the bare `ghcr.io/actions/actions-runner:latest` image.
 The bare upstream image lacks `gh` and `jq`, causing workflows to fail with exit code 127.
 
-To rebuild after changes to Dockerfile.runner:
+**`./install.sh` now builds this image automatically** (added 2026-07-16) whenever `Dockerfile.runner` is present and the docker daemon is reachable — this is the fix for a recurring outage class where VM recreation (disk pressure, `colima delete`, a fresh machine) silently drops the image and the daemon refuses to spawn runners with "could not measure daemon free disk … image missing?".
+
+To rebuild manually after changes to `Dockerfile.runner`:
 ```bash
-docker build -f Dockerfile.runner -t ezgha-runner:latest .
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:latest .
 ```
+Use `DOCKER_BUILDKIT=0` (legacy builder), not the BuildKit default — BuildKit's build-context network path hit a reproducible `python3-venv has no installation candidate` apt failure on this colima/vz setup even with `--no-cache`, while the legacy builder and a plain `docker run ... apt-get install` both succeeded immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully isolated; `DOCKER_BUILDKIT=0` is the proven-reliable path and is what `install.sh` uses.
 
 Then update `~/.config/ezgha/config.toml`:
 ```toml
 [runner]
 image = "ezgha-runner:latest"
 ```
+
+## Reproducibility discipline — no orphaned one-off fixes
+Every fix applied during an incident must land in a **git-tracked** file (`install.sh`, `Dockerfile.runner`, `config/*.toml.example`, this file, README, a `.claude/skills/*` doc, or at minimum a `br` bead with the exact remediation) before the session ends. A fix that exists only as local host state (a manually rebuilt Docker image, a hand-edited `~/Library/LaunchAgents/*.plist`, a one-off `docker build`/`sysctl`/`launchctl` invocation) is **not done** — if this machine were wiped and `./install.sh` re-run on a fresh Mac, every fix from every past incident must reappear automatically. When you fix something live on the host, ask "does `install.sh` (or the daemon/config) reproduce this on a fresh machine?" — if not, encode it there before moving on, not just in a memory file or a bead comment.
 
 ## After any commit (IMPORTANT — Gate 0)
 Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
@@ -43,10 +63,12 @@ Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD
 
 1. `cargo test` — verify all tests pass
 2. `cargo install --path .` — install updated binary (embeds new HEAD SHA)
-3. **Before `systemctl --user restart ezgha.service`, check `uptime` (1-min load average) and `docker ps --filter label=ezgha=managed | wc -l` (running container count). If load_1min > 12 or containers < 12, DO NOT restart — wait for reconciliation and recheck.** Mass cold respawns of many runners at once have tripped the host watchdog (`/etc/watchdog.conf` `max-load-1 = 24` on this 32-thread box) and rebooted the box twice on 2026-07-07, once killing an in-progress agent session outright. This check protects the fleet regardless of which agent/session is running Gate 0 — see bead `ez-gh-actions-po2` for the durable fix (load-aware respawn pacing inside the daemon itself) that will make this manual check unnecessary once it lands.
+3. **Before `systemctl --user restart ezgha.service`, check `uptime` (1-min load average) and `docker ps --filter label=ezgha=managed | wc -l` (running container count). If load_1min > 12 or live containers are below 75% of configured capacity (fewer than 8 on the 10-runner Linux host), DO NOT restart — wait for reconciliation and recheck.** Mass cold respawns of many runners at once have tripped the host watchdog (`/etc/watchdog.conf` `max-load-1 = 24` on this 32-thread box) and rebooted the box twice on 2026-07-07, once killing an in-progress agent session outright. This check protects the fleet regardless of which agent/session is running Gate 0 — see bead `ez-gh-actions-po2` for the durable fix (load-aware respawn pacing inside the daemon itself) that will make this manual check unnecessary once it lands.
    **EXCEPTION**: if containers are actively draining (dropping over consecutive checks) due to a stuck/slow serve loop — confirmed by low load plus a shrinking container count with a live in-flight `gh api` process as the daemon's child — restart IS the remediation, not the risk. Low load + a draining fleet means the loop is stuck, not busy; waiting only makes it worse. This exact scenario happened 2026-07-07 (an expensive per-tick GitHub API fetch starved `ensure_count`, draining the fleet to 0 containers) — see `queue_monitor::SERVE_LOOP_TIME_BUDGET` for the structural fix that should prevent recurrence.
 4. `systemctl --user restart ezgha.service` — restart daemon
 5. `./docs/verify-exit-criteria.sh` — verify all gates pass
+
+If daemon logs show `could not measure daemon free disk … image missing?` after the restart, the VM lost `ezgha-runner:latest` (common after disk-pressure recreation) — run `./install.sh` (which rebuilds it automatically) or the manual command in "Custom runner image" above, rather than restart-looping.
 
 ## Commit conventions
 Every commit subject must be prefixed with the runtime that produced it:
@@ -75,6 +97,22 @@ systemctl --user status ezgha.service
 limactl start colima
 ```
 
+### Runner dashboard publisher recovery
+- **launchd load failure:** a failed first install removes its candidate; a
+  failed upgrade restores and attempts to reload the prior plist. Fix the
+  printed cause, confirm the prior job is still loaded, then retry only the
+  dashboard agent with
+  `bash launchd/install-launchagents.sh install org.jleechanorg.ezgha-runner-dashboard`;
+  do not hand-load a candidate or partial plist.
+- **Stale dashboard output:** inspect
+  `~/.local/state/ezgha/runner-dashboard.stderr.log` and fix the reported probe,
+  auth, or push failure. For transient failures, launchd retries automatically
+  every 600 seconds; run `~/.local/libexec/ezgha/publish_runner_dashboard.sh --publish`
+  only when an immediate post-fix check is needed.
+- **Ownership-marker refusal:** keep the failure closed. Manually inspect who
+  owns the configured Pages branch and resolve that ownership before retrying;
+  never auto-create the marker, delete existing content, or overwrite the branch.
+
 ## /doctor-ezactions command
 Running `/doctor-ezactions` in this repo executes (bare `/doctor` is a deprecated alias):
 1. `./doctor-runner` — fleet health check (4-state per-slot activity truth)
@@ -88,6 +126,9 @@ Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gate
 ## Safety & Monitoring Principles
 - **Self-Outage Prevention Principle**: A safety, health, or monitoring mechanism must not be able to cause the outage or failure it is designed to guard against.
 - **Blast-Radius & Interaction Review**: Any change to a threshold, health-check, watchdog configuration, restart policy, resource limit, or monitor cadence must be accompanied by an evaluation of its blast radius and interaction with other components. The change description must state the normal peak of the bounded metric and verify a safe remaining margin.
+- **Watchdogs must act, not advise**: A monitor that detects a failure and only logs the remediation command ("manual intervention needed — try X") is a broken guardrail. Detection scripts must either execute their known remediation (with backoff, max-attempts, and a hysteresis marker) or escalate loudly to a surface a human actually watches. The deployed watchdog logging `try 'colima stop --force && colima start'` every 5 minutes for 3+ hours (2026-07-14) while the fleet sat dead is the canonical violation. Bead: jleechan-yib3.
+- **VM/backend lifecycle is deploy-owner-only**: `colima stop/delete`, `limactl stop/delete/factory-reset`, `docker system/image prune`, and `docker context rm/use` are covered by the same single-writer rule as deploy steps 2–5. Enforced for sessions in this repo by `.claude/hooks/vm-lifecycle-guard.sh` (bypass: `EZGHA_DEPLOY_OWNER=1`). Two 2026-07-14 incidents: a read-only verifier subagent ran `colima stop --force` and killed the prod VM mid-recovery (bead jleechan-rvv1); a prune-class action deleted `ezgha-runner:latest` while the fleet was down (in-use images survive a prune, the idle runner image does not — bead jleechan-kobt). A short-timeout `colima start` killed mid-flight also CREATES the "vz driver is running but host agent is not" stale state.
+- **Never quote executable remediation commands in agent-consumed text**: Log messages, error strings, subagent prompts, and verifier claims must describe remediation ("force-stop then restart the VM"), not embed the runnable command — agents execute quoted commands with collateral damage. When a runnable command is genuinely needed in docs, prefix it `OPERATOR-ONLY:`. Applies to daemon log strings too (a `docker system prune` suggestion in an ensure_count error is an image-deletion instruction to any agent chasing disk pressure).
 
 ## Safety rails
 - Never run `git add -A` — stage only files you changed
@@ -95,5 +136,5 @@ Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gate
 - Never modify `~/.config/ezgha/config.toml` without also restarting the service
 
 ## Standards & reviews
-- **Repo-local `/code-standards`** lives at `.claude/commands/code-standards.md` and layers ten repo-specific gates (fleet capacity 22/22, single-writer, layered-design, self-outage prevention, blast-radius, self-healing recipes, honest gates, automation-callers, no-silent-underprovisioning, test isolation) on top of the user-scope `~/.claude/commands/code-standards.md` (ZFC + ponytail). New code must pass repo-local /code-standards before merge.
+- **Repo-local `/code-standards`** lives at `.claude/commands/code-standards.md` and layers ten repo-specific gates (fleet capacity 16/16, single-writer, layered-design, self-outage prevention, blast-radius, self-healing recipes, honest gates, automation-callers, no-silent-underprovisioning, test isolation) on top of the user-scope `~/.claude/commands/code-standards.md` (ZFC + ponytail). New code must pass repo-local /code-standards before merge.
 - **Blast radius required** for any change to a threshold, health-check, watchdog configuration, restart policy, resource limit, or monitor cadence: PR description must state the normal peak of the bounded metric and verify a safe remaining margin (per "Safety & Monitoring Principles" above). Cold reviewers REJECT otherwise — proven pattern (PR #53 drain deadline was checked between slots but not inside in-flight gh DELETE; caught 2026-07-10).
