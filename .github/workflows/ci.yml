@@ -49,6 +49,8 @@ jobs:
           bash tests/doctor_runner_live_slot_gate_test.sh
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
+      - name: Install ripgrep for integrate.sh PR-payload regression test
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Host-ops, GitHub App token, and PR-payload regression tests
         run: |
           bash tests/host_ops_0725_test.sh
