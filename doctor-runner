@@ -1321,20 +1321,22 @@ fi
 # tests/doctor_runner_live_slot_gate_test.sh so tests exercise the real
 # logic, never a reimplementation.
 compute_execution_slot_critical() {
-  # args: executing_n expected_containers
+# args: local_executing_n remote_executing_n configured_total
   # stdout: "<executing_slots> <critical:0|1>"
-  local exec_n="$1" expected="$2"
+  local local_exec_n="$1" remote_exec_n="$2" expected="$3"
+  local exec_n=$((local_exec_n + remote_exec_n))
   local critical=0
   if [ "$exec_n" -lt "$expected" ]; then
     critical=1
   fi
   printf '%d %d\n' "$exec_n" "$critical"
 }
-read -r LOCAL_EXECUTING_SLOTS EXECUTION_SLOT_CRITICAL < <(
-  compute_execution_slot_critical "${#EXECUTING_SLOTS[@]}" "$EXPECTED_CONTAINERS"
+read -r FLEET_EXECUTING_SLOTS EXECUTION_SLOT_CRITICAL < <(
+  compute_execution_slot_critical \
+    "${#EXECUTING_SLOTS[@]}" "${#REMOTE_EXECUTING_SLOTS[@]}" "$CONFIGURED_COUNT"
 )
 if [ "${EXECUTION_SLOT_CRITICAL:-0}" -eq 1 ]; then
-  bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${LOCAL_EXECUTING_SLOTS}, expected >= ${EXPECTED_CONTAINERS} from config.toml runner.count=${CONFIG_RUNNER_COUNT:-<unreadable, used fallback>}; ${#IDLE_SLOTS[@]} idle, ${#CYCLING_SLOTS[@]} cycling, ${#DOWN_SLOTS[@]} persisted-DOWN slot(s) of ${CONFIGURED_COUNT} configured)"
+  bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${FLEET_EXECUTING_SLOTS}, expected ${CONFIGURED_COUNT} across local+remote; local=${#EXECUTING_SLOTS[@]}/${EXPECTED_CONTAINERS}, remote=${#REMOTE_EXECUTING_SLOTS[@]}/${REMOTE_COUNT}; idle=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise

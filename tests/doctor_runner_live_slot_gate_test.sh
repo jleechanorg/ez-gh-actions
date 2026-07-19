@@ -18,10 +18,10 @@
 # doctor-runner (via sed, not a re-implementation) so it can't silently
 # drift from the real logic, then exercises it against fixture per-slot
 # counts, asserting:
-#   (a) all 16 configured slots executing -> NOT critical.
-#   (b) 14 executing + 2 idle -> critical: idle is not Runner.Worker proof.
-#   (c) 15 executing + 1 cycling -> critical: churn is not execution proof.
-#   (d) 14 executing + 2 DOWN -> critical.
+#   (a) all 10 Linux + 6 Mac configured slots executing -> NOT critical.
+#   (b) Linux full, 4 Mac executing + 2 idle -> critical.
+#   (c) Linux full, 5 Mac executing + 1 cycling -> critical.
+#   (d) Linux full, 4 Mac executing + 2 DOWN -> critical.
 #
 # Usage: bash tests/doctor_runner_live_slot_gate_test.sh
 
@@ -55,12 +55,12 @@ fi
 bad() { printf '  [BAD]  %s\n' "$*"; }  # stub matching doctor-runner's helper
 
 run_case() {
-  local label="$1" exec_n="$2" idle_n="$3" cycling_n="$4" expected="$5" expect_critical="$6"
+  local label="$1" local_exec_n="$2" remote_exec_n="$3" expected="$4" expect_critical="$5"
 
   eval "$FUNC_SRC"
 
   local out executing critical
-  out=$(compute_execution_slot_critical "$exec_n" "$expected")
+  out=$(compute_execution_slot_critical "$local_exec_n" "$remote_exec_n" "$expected")
   read -r executing critical <<< "$out"
 
   CRITICAL=0
@@ -89,17 +89,18 @@ run_case() {
 echo "--- doctor-runner execution-slot gate regression ---"
 OVERALL_PASS=true
 
-# Full configured capacity is healthy only when every slot has Runner.Worker.
-run_case "16exec-16expected" 16 0 0 16 "no" || OVERALL_PASS=false
+# Full configured capacity is healthy only when every Linux and Mac slot has
+# Runner.Worker proof.
+run_case "10linux-6mac-exec-16expected" 10 6 16 "no" || OVERALL_PASS=false
 
-# Idle listeners are available but are not executing a real Actions job.
-run_case "14exec-2idle-16expected" 14 2 0 16 "yes" || OVERALL_PASS=false
+# Two remote idle listeners are available but not executing real jobs.
+run_case "10linux-4mac-exec-2mac-idle-16expected" 10 4 16 "yes" || OVERALL_PASS=false
 
-# A mid-respawn slot is cycling, not executing, and cannot green the fleet.
-run_case "15exec-1cycling-16expected" 15 0 1 16 "yes" || OVERALL_PASS=false
+# One remote mid-respawn slot is cycling and cannot green the fleet.
+run_case "10linux-5mac-exec-1mac-cycling-16expected" 10 5 16 "yes" || OVERALL_PASS=false
 
-# Persisted DOWN slots remain critical.
-run_case "14exec-2persisted-down-16expected" 14 0 0 16 "yes" || OVERALL_PASS=false
+# Persisted remote DOWN slots remain critical.
+run_case "10linux-4mac-exec-2mac-down-16expected" 10 4 16 "yes" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
