@@ -81,9 +81,22 @@ pub fn is_socket_alive(path: &Path) -> bool {
             // SAFETY: libc::socket + connect on a Unix-domain path with a
             // short timeout. We never read/write; we only need to know
             // whether connect() succeeded quickly.
+            //
+            // Portability fix (compile error found repairing PR #67 on
+            // macOS): `libc::SOCK_NONBLOCK` OR'd into the `socket()` type
+            // argument is a Linux-only extension -- it does not exist in
+            // the BSD/macOS `libc` crate bindings, so this failed to
+            // compile at all on the Mac fleet half of this two-host repo.
+            // Create a plain blocking socket, then set O_NONBLOCK via
+            // `fcntl`, which is portable to both Linux and macOS/BSD.
             unsafe {
-                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0);
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
                 if fd < 0 {
+                    return Some(false);
+                }
+                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                    let _ = libc::close(fd);
                     return Some(false);
                 }
                 let mut sockaddr: libc::sockaddr_un = std::mem::zeroed();
@@ -132,7 +145,7 @@ pub struct LimaInstance {
 
 /// Probe one Lima HOME for instances. Returns one entry per discovered
 /// VM directory; missing docker.sock is fine (the VM may be stopped).
-fn probe_lima_home(home_root: &Path, lima_home: &Path) -> Vec<LimaInstance> {
+fn probe_lima_home(lima_home: &Path) -> Vec<LimaInstance> {
     let Ok(read) = fs::read_dir(lima_home) else {
         return Vec::new();
     };
@@ -164,7 +177,13 @@ fn probe_lima_home(home_root: &Path, lima_home: &Path) -> Vec<LimaInstance> {
             .unwrap_or((None, false));
         out.push(LimaInstance {
             name,
-            lima_home: home_root.to_path_buf(),
+            // Cold-review fix (PR #67): this was `home_root.to_path_buf()`
+            // (the user's HOME), not the actual Lima home directory this
+            // instance was discovered under (e.g.
+            // `~/.config/colima/_lima` or `~/.lima`) -- every LimaInstance
+            // reported the same wrong value regardless of which Lima home
+            // it came from.
+            lima_home: lima_home.to_path_buf(),
             vm_dir: path,
             docker_socket: socket_path,
             socket_alive,
@@ -180,6 +199,59 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"))
+}
+
+/// Strip a Docker `unix://` endpoint scheme, if present, and return the bare
+/// filesystem path. Docker context metadata and `DOCKER_HOST` both use the
+/// `unix:///path/to/docker.sock` URL form; converting that raw string
+/// straight to a `PathBuf` (the pre-fix behavior) left the literal `unix://`
+/// characters as part of the path, so it could never `Path`-equal a real
+/// socket path resolved via filesystem probing. Pure string transform, no
+/// I/O — testable without a real Docker context.
+pub fn strip_unix_socket_scheme(raw: &str) -> PathBuf {
+    PathBuf::from(raw.trim().strip_prefix("unix://").unwrap_or(raw.trim()))
+}
+
+/// Resolve the Docker socket a NAMED context actually points at, by asking
+/// Docker itself (`docker context inspect`) rather than reimplementing
+/// Docker's own context-store hashing/lookup (`~/.docker/contexts/meta/...`)
+/// in this binary. Cold-review fix (PR #67, HIGH + P2 duplicate): the
+/// `lima-converge` CLI previously never consulted the requested `--context`
+/// at all -- it fell straight through to `DOCKER_HOST` or the hardcoded
+/// `/var/run/docker.sock` default, so on a host where context selection
+/// (not `DOCKER_HOST`) is how `lima-colima` resolves the legacy socket, the
+/// tool reported the wrong "current" socket and planned migrations against
+/// it. Returns `None` on any failure (docker missing, context missing,
+/// non-unix endpoint) so callers can fall back to `DOCKER_HOST`/default —
+/// this is a best-effort read-only lookup, never authoritative on its own.
+pub fn resolve_context_socket(context: &str) -> Option<PathBuf> {
+    resolve_context_socket_with_docker(context, Path::new("docker"))
+}
+
+fn resolve_context_socket_with_docker(context: &str, docker: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new(docker)
+        .args([
+            "context",
+            "inspect",
+            "--format",
+            "{{.Endpoints.docker.Host}}",
+            context,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let host = String::from_utf8_lossy(&output.stdout);
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let socket = trimmed.strip_prefix("unix://")?;
+    if socket.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(socket))
 }
 
 /// Result of probing the host for dual-Lima presence.
@@ -209,11 +281,11 @@ fn probe_dual_lima_from(home: &Path) -> DualLimaProbe {
     let canonical_home = home.join(CANONICAL_LIMA_HOME_RELATIVE);
     let legacy_home = home.join(LEGACY_LIMA_HOME_RELATIVE);
 
-    let canonical = probe_lima_home(home, &canonical_home)
+    let canonical = probe_lima_home(&canonical_home)
         .into_iter()
         .find(|inst| inst.name == CANONICAL_INSTANCE_NAME);
 
-    let legacy = probe_lima_home(home, &legacy_home);
+    let legacy = probe_lima_home(&legacy_home);
 
     DualLimaProbe { canonical, legacy }
 }
@@ -272,9 +344,16 @@ pub fn migration_plan(probe: &DualLimaProbe, current_socket: &Path) -> Option<Mi
         .as_ref()
         .and_then(|c| c.docker_socket.clone())
         .filter(|p| is_socket_alive(p))?;
-    let canonical_str = canonical_socket.to_string_lossy().to_string();
-    let current_str = current_socket.to_string_lossy().to_string();
-    if canonical_str == current_str {
+    // Cold-review fix (PR #67, MEDIUM): this used to compare
+    // `to_string_lossy()` string equality here while `current_is_legacy`
+    // below already used `Path` equality (`docker_socket.as_deref() ==
+    // Some(current_socket)`). A `unix://`-prefixed value or any path that
+    // is textually different but resolves to the same `Path` (e.g. a
+    // trailing slash) made the two checks disagree -- "already converged"
+    // could read false while "is legacy" also read false, producing a
+    // migration plan for a socket that's actually already canonical.
+    // `Path` equality is what the rest of this module already relies on.
+    if canonical_socket.as_path() == current_socket {
         return None; // already converged
     }
     // Drain is required iff current socket points at a legacy VM AND
@@ -382,11 +461,32 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    /// Shortest usable tmp root for planting real `AF_UNIX` sockets in
+    /// tests. Portability fix found repairing PR #67 on macOS:
+    /// `std::env::temp_dir()` resolves to a long per-user path on macOS
+    /// (`/var/folders/<hash>/<hash>/T/`, commonly 45+ chars) which, once
+    /// joined with this fixture's nested `<instance>/docker.sock` layout,
+    /// overflows `sockaddr_un.sun_path` (104 bytes on macOS/BSD, incl. NUL)
+    /// and made every test in this module panic with "path must be shorter
+    /// than SUN_LEN" on a Mac, even though the SAME fixture fit comfortably
+    /// under Linux's 108-byte `sun_path` via the shorter `/tmp`. Prefer the
+    /// plain `/tmp` mountpoint (present on both platforms) over the
+    /// resolved system temp dir; fall back to `std::env::temp_dir()` if
+    /// `/tmp` is somehow unusable.
+    fn short_tmp_root() -> PathBuf {
+        let tmp = PathBuf::from("/tmp");
+        if tmp.is_dir() {
+            tmp
+        } else {
+            std::env::temp_dir()
+        }
+    }
+
     /// Create a fresh tempdir mimicking a Linux HOME. Returns the home dir.
     fn fake_home() -> PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = short_tmp_root().join(format!(
             "ezgha-lima-{}-{}-{}",
             std::process::id(),
             n,
@@ -440,6 +540,52 @@ mod tests {
         assert!(is_socket_alive(&alive), "bound listener must be alive");
         assert!(!is_socket_alive(&dead), "regular file must not be alive");
         assert!(!is_socket_alive(&home.join("does-not-exist.sock")));
+    }
+
+    #[test]
+    fn strip_unix_socket_scheme_removes_prefix_when_present() {
+        // Cold-review fix (PR #67, HIGH/MEDIUM): DOCKER_HOST and `docker
+        // context inspect` both report `unix://` URLs, not bare paths.
+        assert_eq!(
+            strip_unix_socket_scheme("unix:///Users/jleechan/.lima/colima/sock/docker.sock"),
+            PathBuf::from("/Users/jleechan/.lima/colima/sock/docker.sock")
+        );
+    }
+
+    #[test]
+    fn strip_unix_socket_scheme_passes_through_bare_path() {
+        assert_eq!(
+            strip_unix_socket_scheme("/var/run/docker.sock"),
+            PathBuf::from("/var/run/docker.sock")
+        );
+    }
+
+    #[test]
+    fn strip_unix_socket_scheme_trims_whitespace() {
+        // `docker context inspect --format` output is newline-terminated.
+        assert_eq!(
+            strip_unix_socket_scheme("unix:///tmp/docker.sock\n"),
+            PathBuf::from("/tmp/docker.sock")
+        );
+    }
+
+    #[test]
+    fn probe_lima_home_reports_the_lima_home_it_was_probed_under_not_user_home() {
+        // Cold-review fix (PR #67, LOW): `probe_lima_home` used to stamp
+        // every `LimaInstance.lima_home` with the user's HOME directory
+        // regardless of which Lima home (`.lima` vs
+        // `.config/colima/_lima`) the instance was actually found under.
+        let home = fake_home();
+        plant_instance(&home, ".config/colima/_lima", "colima", true);
+        plant_instance(&home, ".lima", "colima", true);
+        let probe = probe_dual_lima_from(&home);
+        let canonical = probe.canonical.expect("canonical instance planted");
+        assert_eq!(canonical.lima_home, home.join(".config/colima/_lima"));
+        assert_eq!(probe.legacy.len(), 1);
+        assert_eq!(probe.legacy[0].lima_home, home.join(".lima"));
+        // The two lima_home values must differ -- this is exactly what the
+        // pre-fix code (always `home_root`) could never produce.
+        assert_ne!(canonical.lima_home, probe.legacy[0].lima_home);
     }
 
     #[test]
@@ -530,6 +676,27 @@ mod tests {
     }
 
     #[test]
+    fn migration_plan_already_converged_check_uses_path_equality_via_resolved_scheme() {
+        // Cold-review fix (PR #67, MEDIUM): the "already converged" check
+        // used `to_string_lossy()` string equality while `job_drain_required`
+        // used `Path` equality -- a caller that resolved `current_socket`
+        // from a raw `unix://` URL without stripping the scheme (the exact
+        // bug `strip_unix_socket_scheme` now fixes at the call site) would
+        // never string-match the plain filesystem path `probe_dual_lima`
+        // discovers, so a plan was wrongly generated for an already-current
+        // socket. This test drives `migration_plan` with a `current_socket`
+        // built through `strip_unix_socket_scheme`, proving the two are
+        // `Path`-equal end to end.
+        let home = fake_home();
+        let canonical_sock = plant_instance(&home, ".config/colima/_lima", "colima", true);
+        plant_instance(&home, ".lima", "colima", true);
+        let probe = probe_dual_lima_from(&home);
+        let via_url = strip_unix_socket_scheme(&format!("unix://{}", canonical_sock.display()));
+        assert_eq!(via_url, canonical_sock);
+        assert!(migration_plan(&probe, &via_url).is_none());
+    }
+
+    #[test]
     fn backup_marker_round_trips_and_overwrites_per_context() {
         let home = fake_home();
         let marker = home.join("marker.json");
@@ -584,5 +751,59 @@ mod tests {
         let now = now_epoch_secs();
         assert!(entry.migrated_at_unix <= now);
         assert!(now - entry.migrated_at_unix < 3600);
+    }
+
+    #[test]
+    fn resolve_context_socket_returns_none_for_nonexistent_context() {
+        // Best-effort lookup: a context name that cannot exist must fail
+        // closed (None), never panic, whether or not `docker` itself is
+        // installed on the machine running this test.
+        assert!(
+            resolve_context_socket("definitely-not-a-real-docker-context-ez-gh-actions-apye")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_context_socket_uses_named_context_and_normalizes_unix_endpoint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = fake_home();
+        let docker = home.join("docker");
+        let captured_args = home.join("docker-args.txt");
+        fs::write(
+            &docker,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf 'unix:///tmp/context.sock\\n'\n",
+                captured_args.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            resolve_context_socket_with_docker("lima-colima", &docker),
+            Some(PathBuf::from("/tmp/context.sock"))
+        );
+        assert_eq!(
+            fs::read_to_string(captured_args).unwrap(),
+            "context inspect --format {{.Endpoints.docker.Host}} lima-colima\n"
+        );
+    }
+
+    #[test]
+    fn resolve_context_socket_rejects_non_unix_endpoint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = fake_home();
+        let docker = home.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\nprintf 'tcp://docker.example:2376\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(resolve_context_socket_with_docker("remote", &docker), None);
     }
 }

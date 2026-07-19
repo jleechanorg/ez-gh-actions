@@ -112,16 +112,29 @@ enum Commands {
     /// Pure read-only probe; prints which canonical socket the daemon SHOULD
     /// be using and whether a migration is implied. NEVER mutates Lima,
     /// Docker contexts, or services — the operator runs the migration step
-    /// out of band after reviewing this output.
+    /// out of band after reviewing this output. The one filesystem write
+    /// this command can perform (the rollback backup marker) only happens
+    /// when `--write-backup` is passed explicitly (see acceptance criterion
+    /// 5); a plain inspection run never touches disk.
     LimaConverge {
         /// Docker context name whose current socket resolution should be
-        /// checked against the canonical-preferred socket.
+        /// checked against the canonical-preferred socket. Resolved via
+        /// `docker context inspect` first (cold-review fix, PR #67 HIGH) --
+        /// falls back to `DOCKER_HOST`/default only when that lookup fails.
         #[arg(long, default_value = "lima-colima")]
         context: String,
         /// Override the path the daemon thinks it's pointed at (defaults to
-        /// `DOCKER_HOST` if set, else `unix:///var/run/docker.sock`).
+        /// resolving `--context` via `docker context inspect`, then
+        /// `DOCKER_HOST` if set, else `/var/run/docker.sock`).
         #[arg(long)]
         current_socket: Option<String>,
+        /// Persist the rollback backup marker when a migration is implied.
+        /// Without this flag the command is purely diagnostic and writes
+        /// nothing to disk (cold-review fix, PR #67 P2) -- the marker is the
+        /// only rollback record, so a dry-run inspection must never
+        /// overwrite it with a stale/default socket.
+        #[arg(long, default_value_t = false)]
+        write_backup: bool,
     },
 }
 
@@ -1540,18 +1553,29 @@ fn main() -> Result<()> {
         Commands::LimaConverge {
             context,
             current_socket,
+            write_backup,
         } => {
             // Bead ez-gh-actions-apye — pure read-only probe, never mutates
             // Lima/Docker. Operator inspects the report and runs the
             // migration out of band.
             let probe = lima_convergence::probe_dual_lima();
+            // Resolution order (cold-review fix, PR #67 HIGH + P2 duplicate):
+            // (1) explicit `--current-socket` override, (2) the NAMED
+            // `--context` resolved via `docker context inspect` (this is how
+            // `lima-colima` actually selects a socket when `DOCKER_HOST` is
+            // unset — the prior code never consulted the context at all),
+            // (3) `DOCKER_HOST`, (4) the hardcoded default. Both (1) and (3)
+            // may carry a `unix://` scheme, so all three are normalized
+            // through the same `strip_unix_socket_scheme` helper
+            // `migration_plan`'s `Path`-equality check relies on.
             let current = current_socket
                 .as_deref()
-                .map(std::path::PathBuf::from)
+                .map(lima_convergence::strip_unix_socket_scheme)
+                .or_else(|| lima_convergence::resolve_context_socket(context))
                 .or_else(|| {
                     std::env::var_os("DOCKER_HOST")
                         .filter(|s| !s.is_empty())
-                        .map(std::path::PathBuf::from)
+                        .map(|s| lima_convergence::strip_unix_socket_scheme(&s.to_string_lossy()))
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("/var/run/docker.sock"));
             let plan = lima_convergence::migration_plan(&probe, &current);
@@ -1581,21 +1605,35 @@ fn main() -> Result<()> {
                 })),
             });
             println!("{}", serde_json::to_string_pretty(&report)?);
-            // Acceptance criterion (5): if a migration is implied and the
+            // Acceptance criterion (5): if a migration is implied AND the
             // operator passed `--write-backup`, persist the previous-socket
             // marker so the rollback path is recoverable. We do NOT touch
             // the Docker context itself — that step is operator-driven.
+            // Cold-review fix (PR #67 P2): this used to write unconditionally
+            // whenever a plan existed, even on a plain diagnostic run with no
+            // `--write-backup` flag (which didn't exist at all) — a dry-run
+            // inspection could silently overwrite the only rollback marker
+            // with a stale/default socket before any real migration.
             if let Some(p) = plan {
-                let entry = lima_convergence::backup_entry_for(context, &p);
-                lima_convergence::write_backup_marker(&p.backup_marker, &[entry]).with_context(
-                    || format!("writing backup marker to {}", p.backup_marker.display()),
-                )?;
-                eprintln!(
-                    "wrote backup marker to {} (context={}, previous={})",
-                    p.backup_marker.display(),
-                    context,
-                    p.from_socket.display()
-                );
+                if *write_backup {
+                    let entry = lima_convergence::backup_entry_for(context, &p);
+                    lima_convergence::write_backup_marker(&p.backup_marker, &[entry])
+                        .with_context(|| {
+                            format!("writing backup marker to {}", p.backup_marker.display())
+                        })?;
+                    eprintln!(
+                        "wrote backup marker to {} (context={}, previous={})",
+                        p.backup_marker.display(),
+                        context,
+                        p.from_socket.display()
+                    );
+                } else {
+                    eprintln!(
+                        "migration implied (context={}, previous={}) but --write-backup not passed — no backup marker written, no mutation performed",
+                        context,
+                        p.from_socket.display()
+                    );
+                }
             }
         }
     }
