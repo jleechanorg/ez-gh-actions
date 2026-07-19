@@ -1143,8 +1143,9 @@ REMOTE_DOWN_SLOTS=()
 # REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
 # below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
 # printed only a warn() — `configured` then collapsed to the local-only
-# count (e.g. 16 instead of 22) so a Linux run with the Mac unreachable
-# reported "fleet healthy: 16/16" instead of "16/22 with 6 down". Treat
+# count (e.g. 10 instead of 16, per this repo's current 10-Linux + 6-Mac
+# contract) so a Linux run with the Mac unreachable reported "fleet
+# healthy: 10/10" instead of "10/16 with 6 down". Treat
 # unreachable as the strongest negative signal available (we have ZERO
 # evidence about any of the remote slots, so all of them are unproven):
 # populate REMOTE_DOWN_SLOTS with synthetic names so the verdict gate
@@ -1175,7 +1176,7 @@ else
   # conservatively reported as DOWN. This (a) keeps `configured` at the
   # full expected fleet size (no silent local-only collapse), (b) puts
   # the unreachable slots into the headline `down` count (so a Mac
-  # outage from jeff-ubuntu is reported as 6/22 down, not "0/16 down"),
+  # outage from jeff-ubuntu is reported as 6/16 down, not "0/10 down"),
   # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
   # `ok` to `bad` so an unreachable host can never silently green.
   REMOTE_UNREACHABLE=1

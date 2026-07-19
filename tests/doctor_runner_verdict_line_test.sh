@@ -121,17 +121,18 @@ run_case() {
 echo "--- doctor-runner verdict-line summary regression ---"
 OVERALL_PASS=true
 
-# Case (a): 16 local (14 executing + 2 idle, no starvation) + 6 remote
-# (6 executing) = 22 configured, all healthy, no starvation, no down.
-run_case "local14exec-2idle-remote6exec-no-starvation" \
-  14 2 0 0  6 0 0 0  0 \
-  22 22 20 2 0 0 0 || OVERALL_PASS=false
+# Case (a): 10 local (8 executing + 2 idle, no starvation, matching this
+# repo's current 10-Linux contract) + 6 remote (6 executing, current
+# 6-Mac contract) = 16 configured, all healthy, no starvation, no down.
+run_case "local8exec-2idle-remote6exec-no-starvation" \
+  8 2 0 0  6 0 0 0  0 \
+  16 16 14 2 0 0 0 || OVERALL_PASS=false
 
 # Case (b): same as (a) but starvation present -- the 2 local idle slots
 # must reclassify from idle-ok to idle-starved, not vanish.
-run_case "local14exec-2idle-remote6exec-starved" \
-  14 2 0 0  6 0 0 0  1 \
-  22 22 20 0 2 0 0 || OVERALL_PASS=false
+run_case "local8exec-2idle-remote6exec-starved" \
+  8 2 0 0  6 0 0 0  1 \
+  16 16 14 0 2 0 0 || OVERALL_PASS=false
 
 # Case (c): 2 local DOWN + 1 remote DOWN, 1 local CYCLING (mid-respawn,
 # journal-confirmed). PROVES the fix: cycling is its own bucket, NOT
@@ -144,16 +145,18 @@ run_case "local-2down-1cycling-remote-1down" \
 
 # Case (d): unreachable-remote regression (P1 #2 from PR #64 cold review).
 # Remote host unreachable -> 6 remote slots are UNPROVEN, so they
-# contribute as DOWN. `configured` must stay at the full 22 (NOT collapse
-# to local-only 16), and `down` must include all 6 unreachable slots.
+# contribute as DOWN. `configured` must stay at the full 16 (NOT collapse
+# to local-only 10), and `down` must include all 6 unreachable slots.
+# Fleet-capacity numbers match this repo's CURRENT CLAUDE.md contract
+# (10 Linux + 6 Mac = 16), not the prior 16 Linux + 6 Mac = 22 contract.
 # This mirrors what doctor-runner now does at the unreachable branch:
 # it synthesizes REMOTE_DOWN_SLOTS entries so the verdict gate sees
 # REMOTE_COUNT down slots. Driving this through compute_verdict_summary
 # directly proves the math doesn't silently lose the unreachable half
 # of the fleet.
-run_case "local-16exec-remote-unreachable-6down" \
-  16 0 0 0  0 0 6 0  0 \
-  22 22 16 0 0 6 0 || OVERALL_PASS=false
+run_case "local-10exec-remote-unreachable-6down" \
+  10 0 0 0  0 0 6 0  0 \
+  16 16 10 0 0 6 0 || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
