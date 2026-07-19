@@ -2151,10 +2151,17 @@ fn start_one_with_generate_at_slot(
                 // names, never needing host persistence for the disk-churn
                 // goal this mount exists for (checkouts/build scratch live
                 // directly under _work/<owner>/<repo>, unaffected by this).
+                // `:exec` is required -- Docker's default tmpfs mount
+                // options include `noexec`, but `_tool` stores installed
+                // tool runtimes (e.g. setup-python's Python binary) that
+                // the job then executes directly from this path. Without
+                // `:exec` those runtimes fail with rc126 "Permission
+                // denied" even though extraction itself succeeds (bead
+                // jleechan-krow, found via adversarial review of this fix).
                 for shadowed in ["_actions", "_temp", "_tool"] {
                     cmd.args([
                         "--tmpfs",
-                        &format!("/home/runner/_work/{shadowed}"),
+                        &format!("/home/runner/_work/{shadowed}:exec"),
                     ]);
                 }
             }
@@ -4360,10 +4367,11 @@ minimum_isolation = "container"
             .find(|l| l.starts_with("run "))
             .expect("a docker run invocation should have been logged");
         for shadowed in ["_actions", "_temp", "_tool"] {
-            let expected = format!("--tmpfs /home/runner/_work/{shadowed}");
+            let expected = format!("--tmpfs /home/runner/_work/{shadowed}:exec");
             assert!(
                 run_line.contains(&expected),
-                "run args should tmpfs-shadow {shadowed}; got: {run_line}"
+                "run args should tmpfs-shadow {shadowed} with executable runtimes enabled; \
+                 got: {run_line}"
             );
         }
     }

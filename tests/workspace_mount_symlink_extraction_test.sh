@@ -91,6 +91,26 @@ ln -s ../target.txt "${ARCHIVE_SRC}/pkg/data/inner/target.txt"
 # (harmless noise, but keeps output clean for the asserts below).
 COPYFILE_DISABLE=1 tar -czf "${WORKDIR}/repro.tar.gz" -C "${ARCHIVE_SRC}" pkg
 
+# Collision fixture: the guarded tar path must preserve GNU tar's native
+# overwrite contracts, not merely produce the expected happy-path tree.
+COLLISION_SRC="${WORKDIR}/collision-src"
+mkdir -p "${COLLISION_SRC}"
+echo "new-content" > "${COLLISION_SRC}/existing.txt"
+COPYFILE_DISABLE=1 tar -czf "${WORKDIR}/collision.tar.gz" -C "${COLLISION_SRC}" existing.txt
+
+# Mode fixture: GNU tar intentionally creates mode-000 archive members via a
+# writable placeholder and applies the archived mode at the end. A narrow
+# VirtioFS workaround must not change the final archived permissions.
+# Build this fixture on the container's overlay filesystem. Creating it on
+# macOS and then asking host bsdtar to read the mode-000 file fails before
+# the Docker behavior under test is reached.
+docker run --rm -v "${WORKDIR}:/work" "${IMAGE}" sh -c '
+  set -e
+  mkdir -p /tmp/ezgha-mode-src
+  echo mode-zero > /tmp/ezgha-mode-src/mode-zero.txt
+  /usr/bin/tar --mode=000 -czf /work/mode-zero.tar.gz -C /tmp/ezgha-mode-src mode-zero.txt
+'
+
 echo "=== 1. Baseline: extraction into the container's own overlay filesystem (/tmp) ==="
 BASELINE_OUT=$(docker run --rm -v "${WORKDIR}/repro.tar.gz:/tmp/repro.tar.gz:ro" \
   "${IMAGE}" sh -c '
@@ -129,22 +149,33 @@ else
   bad "unexpected output extracting into the workspace bind mount root: ${MOUNT_OUT}"
 fi
 
-echo "=== 3. Fix verification: _actions is tmpfs-shadowed, so extraction there succeeds regardless ==="
+echo "=== 3. Fix verification: all runner-internal tmpfs shadows support extraction and execution ==="
 FIXED_OUT=$(docker run --rm \
   -v "${WORKDIR}/repro.tar.gz:/tmp/repro.tar.gz:ro" \
   -v "${HOST_WORKSPACE}:/home/runner/_work" \
-  --tmpfs /home/runner/_work/_actions \
+  --tmpfs /home/runner/_work/_actions:exec \
+  --tmpfs /home/runner/_work/_temp:exec \
+  --tmpfs /home/runner/_work/_tool:exec \
   "${IMAGE}" sh -c '
     mkdir -p /home/runner/_work/_actions/cache-test && cd /home/runner/_work/_actions/cache-test
     tar -xzf /tmp/repro.tar.gz 2>&1
     echo "---read---"
     cat pkg/data/inner/target.txt 2>&1
+    for shadowed in _actions _temp _tool; do
+      probe="/home/runner/_work/${shadowed}/ezgha-exec-probe"
+      printf "#!/bin/sh\necho exec-%s-ok\n" "${shadowed}" > "${probe}"
+      chmod 0755 "${probe}"
+      "${probe}"
+    done
   ' 2>&1)
 echo "${FIXED_OUT}" | sed 's/^/    /'
-if printf '%s' "${FIXED_OUT}" | grep -q "real content"; then
-  ok "tmpfs-shadowed _actions subdir: extraction + symlink read succeeded (this is the fix's mechanism)"
+if printf '%s' "${FIXED_OUT}" | grep -q "real content" \
+  && printf '%s' "${FIXED_OUT}" | grep -q "exec-_actions-ok" \
+  && printf '%s' "${FIXED_OUT}" | grep -q "exec-_temp-ok" \
+  && printf '%s' "${FIXED_OUT}" | grep -q "exec-_tool-ok"; then
+  ok "tmpfs-shadowed _actions/_temp/_tool: extraction and executable probes succeeded"
 else
-  bad "tmpfs-shadowed _actions subdir extraction unexpectedly failed: ${FIXED_OUT}"
+  bad "tmpfs-shadowed extraction/execution unexpectedly failed: ${FIXED_OUT}"
 fi
 
 echo "=== 4. Fix verification: checkout-path (_work/<owner>/<repo>) extraction is now guarded by the tar wrapper ==="
@@ -199,6 +230,105 @@ if [ -L "${HOST_LINK}" ] && [ "$(cat "${HOST_LINK}" 2>&1)" = "real content" ]; t
   ok "host-side check: symlink landed correctly on the real workspace bind mount, readable via the host filesystem"
 else
   bad "host-side check failed -- expected a readable symlink at ${HOST_LINK}"
+fi
+
+# A real workflow extracts after actions/checkout has populated the repo.
+# Guarding only missing/empty destinations is therefore not a fix for the
+# production call path; an unrelated existing file must remain while the
+# archive's symlink is materialized correctly.
+CHECKOUT_HOST_POPULATED="${WORKDIR}/host-checkout-populated"
+mkdir -p "${CHECKOUT_HOST_POPULATED}/some-owner/some-repo"
+echo "checkout-content" > "${CHECKOUT_HOST_POPULATED}/some-owner/some-repo/already-checked-out.txt"
+POPULATED_OUT=$(docker run --rm \
+  -e EZGHA_VIRTIOFS_WORKSPACE=1 \
+  -v "${WORKDIR}/repro.tar.gz:/tmp/repro.tar.gz:ro" \
+  -v "${CHECKOUT_HOST_POPULATED}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    cd /home/runner/_work/some-owner/some-repo
+    tar -xzf /tmp/repro.tar.gz 2>&1
+    printf "archive=%s existing=%s\n" \
+      "$(cat pkg/data/inner/target.txt 2>&1)" \
+      "$(cat already-checked-out.txt 2>&1)"
+  ' 2>&1)
+echo "${POPULATED_OUT}" | sed 's/^/    /'
+if printf '%s' "${POPULATED_OUT}" | grep -q "archive=real content existing=checkout-content" \
+  && ! printf '%s' "${POPULATED_OUT}" | grep -q "Permission denied"; then
+  ok "guarded tar fixes symlink extraction in a populated checkout without losing existing content"
+else
+  bad "guarded tar did not fix the real populated-checkout path: ${POPULATED_OUT}"
+fi
+
+echo "=== 5. Contract verification: guarded tar preserves native overwrite and mode semantics ==="
+MODE_NATIVE_HOST="${WORKDIR}/host-mode-native"
+mkdir -p "${MODE_NATIVE_HOST}"
+MODE_NATIVE_OUT=$(docker run --rm \
+  -v "${WORKDIR}/mode-zero.tar.gz:/tmp/mode-zero.tar.gz:ro" \
+  -v "${MODE_NATIVE_HOST}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    dest=/home/runner/_work/some-owner/some-repo
+    mkdir -p "${dest}" && cd "${dest}"
+    set +e
+    /usr/bin/tar -xzf /tmp/mode-zero.tar.gz >/tmp/mode-native.out 2>&1
+    mode_rc=$?
+    set -e
+    mode=$(stat -c %a mode-zero.txt 2>/dev/null || printf missing)
+    printf "mode_rc=%s mode_zero=%s\n" "${mode_rc}" "${mode}"
+  ' 2>&1)
+echo "${MODE_NATIVE_OUT}" | sed 's/^/    native: /'
+CONTRACT_HOST="${WORKDIR}/host-contract"
+mkdir -p "${CONTRACT_HOST}"
+CONTRACT_OUT=$(docker run --rm \
+  -e EZGHA_VIRTIOFS_WORKSPACE=1 \
+  -v "${WORKDIR}/collision.tar.gz:/tmp/collision.tar.gz:ro" \
+  -v "${WORKDIR}/mode-zero.tar.gz:/tmp/mode-zero.tar.gz:ro" \
+  -v "${CONTRACT_HOST}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    set -u
+    dest=/home/runner/_work/some-owner/some-repo
+    mkdir -p "${dest}"
+    echo old-content > "${dest}/existing.txt"
+    cd "${dest}"
+    set +e
+    tar -xzf /tmp/collision.tar.gz --keep-old-files >/tmp/keep-old.out 2>&1
+    keep_rc=$?
+    tar -xzf /tmp/mode-zero.tar.gz >/tmp/mode-guarded.out 2>&1
+    mode_rc=$?
+    set -e
+    printf "keep_rc=%s keep_content=%s\n" "${keep_rc}" "$(cat existing.txt)"
+    mode=$(stat -c %a mode-zero.txt 2>/dev/null || printf missing)
+    printf "mode_rc=%s mode_zero=%s\n" "${mode_rc}" "${mode}"
+  ' 2>&1)
+echo "${CONTRACT_OUT}" | sed 's/^/    /'
+if printf '%s' "${CONTRACT_OUT}" | grep -Eq 'keep_rc=[1-9][0-9]* keep_content=old-content'; then
+  ok "guarded tar preserves --keep-old-files failure status and existing content"
+else
+  bad "guarded tar changed --keep-old-files semantics: ${CONTRACT_OUT}"
+fi
+# Diagnostic, NOT a pass/fail gate (same status as step 2's raw-mount-root
+# check): a mode-000 (or any owner-unreadable) archive member is a DISTINCT,
+# already-broken-natively virtiofs/FUSE limitation -- native (unwrapped) tar
+# also fails to extract it directly onto this mount, confirmed above, even
+# as root. The guarded path fails too, but via a structurally different
+# mechanism: tar's own extraction succeeds in the tmpfs stage (content
+# written, then chmod'd to the archived mode as tar's last step for that
+# member), but the wrapper's second phase -- `cp -a` copying the stage back
+# onto the real destination -- must itself re-open that file for reading,
+# and a mode that blocks owner-read blocks `cp` exactly like it would any
+# other non-root process, independent of virtiofs. That's why the exit code
+# differs (native's own internal open-during-extraction failure vs cp's
+# open-during-copy failure) even though the qualitative outcome is the same
+# in both cases: the file is not usable (mode_zero=missing). This wrapper
+# does not attempt to fix either failure class; both are tracked as known,
+# accepted, narrow gaps (real CI archives essentially always keep files
+# owner-readable) rather than blocking the symlink fix this file verifies.
+MODE_NATIVE_SIGNATURE=$(printf '%s' "${MODE_NATIVE_OUT}" | grep -Eo 'mode_rc=[0-9]+ mode_zero=[0-9]+|mode_rc=[0-9]+ mode_zero=missing' | tail -1)
+MODE_GUARDED_SIGNATURE=$(printf '%s' "${CONTRACT_OUT}" | grep -Eo 'mode_rc=[0-9]+ mode_zero=[0-9]+|mode_rc=[0-9]+ mode_zero=missing' | tail -1)
+if printf '%s' "${MODE_NATIVE_SIGNATURE}" | grep -q "mode_zero=missing" && printf '%s' "${MODE_GUARDED_SIGNATURE}" | grep -q "mode_zero=missing"; then
+  info "confirmed: mode-000 archive members fail on both native and guarded paths (native=${MODE_NATIVE_SIGNATURE}; guarded=${MODE_GUARDED_SIGNATURE}) -- pre-existing virtiofs/two-phase-copy limitation, out of scope for the symlink fix, tracked separately"
+elif [ -n "${MODE_NATIVE_SIGNATURE}" ] && [ "${MODE_GUARDED_SIGNATURE}" = "${MODE_NATIVE_SIGNATURE}" ]; then
+  ok "guarded tar preserves native mode-000 extraction status and final filesystem state (${MODE_GUARDED_SIGNATURE})"
+else
+  bad "guarded tar produced a WORSE outcome than native for a mode-000 member (e.g. silently applied wrong permissions instead of failing): native=${MODE_NATIVE_SIGNATURE:-missing}; guarded=${MODE_GUARDED_SIGNATURE:-missing}"
 fi
 
 echo
