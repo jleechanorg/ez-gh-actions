@@ -1331,12 +1331,13 @@ compute_execution_slot_critical() {
   fi
   printf '%d %d\n' "$exec_n" "$critical"
 }
+FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))
 read -r FLEET_EXECUTING_SLOTS EXECUTION_SLOT_CRITICAL < <(
   compute_execution_slot_critical \
-    "${#EXECUTING_SLOTS[@]}" "${#REMOTE_EXECUTING_SLOTS[@]}" "$CONFIGURED_COUNT"
+    "${#EXECUTING_SLOTS[@]}" "${#REMOTE_EXECUTING_SLOTS[@]}" "$FLEET_CONFIGURED_COUNT"
 )
 if [ "${EXECUTION_SLOT_CRITICAL:-0}" -eq 1 ]; then
-  bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${FLEET_EXECUTING_SLOTS}, expected ${CONFIGURED_COUNT} across local+remote; local=${#EXECUTING_SLOTS[@]}/${EXPECTED_CONTAINERS}, remote=${#REMOTE_EXECUTING_SLOTS[@]}/${REMOTE_COUNT}; idle=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
+  bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${FLEET_EXECUTING_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote; local=${#EXECUTING_SLOTS[@]}/${LOCAL_COUNT}, remote=${#REMOTE_EXECUTING_SLOTS[@]}/${REMOTE_COUNT}; idle=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise

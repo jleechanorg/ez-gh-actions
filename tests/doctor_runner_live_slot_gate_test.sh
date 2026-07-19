@@ -52,6 +52,18 @@ if grep -q 'CONTAINER_COUNT:-0}" -lt' "$DOCTOR_SCRIPT"; then
   exit 1
 fi
 
+# The production call must derive the aggregate expected count from both host
+# contracts. Passing local CONFIGURED_COUNT (10 on Linux) would let all six Mac
+# slots be non-executing while 10 >= 10 still greens.
+if ! grep -Fq 'FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))' "$DOCTOR_SCRIPT"; then
+  echo "FAIL: production gate does not derive aggregate local+remote configured count" >&2
+  exit 1
+fi
+if ! grep -Fq '"$FLEET_CONFIGURED_COUNT"' "$DOCTOR_SCRIPT"; then
+  echo "FAIL: production execution gate does not consume aggregate configured count" >&2
+  exit 1
+fi
+
 bad() { printf '  [BAD]  %s\n' "$*"; }  # stub matching doctor-runner's helper
 
 run_case() {
