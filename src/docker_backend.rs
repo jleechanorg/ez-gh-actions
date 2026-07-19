@@ -2123,6 +2123,29 @@ fn start_one_with_generate_at_slot(
                         runner_workspace.to_string_lossy()
                     ),
                 ]);
+                // Shadow the three fixed actions-runner-internal subdirs with
+                // tmpfs (bead jleechan-93cf regression, 2026-07-19): tar
+                // extraction of an archive containing a symlink corrupts the
+                // symlink into a 0-byte, mode-000, unreadable file when the
+                // destination is this virtiofs-backed bind mount on
+                // Colima/Mac -- confirmed live with actions/setup-python's
+                // own tarball (which the runner extracts into _actions when
+                // downloading the action) and reproduced in
+                // tests/workspace_mount_symlink_extraction_test.sh. A plain
+                // `ln -s` on the mount works fine and extraction into the
+                // container's own overlay filesystem works fine -- only
+                // tar-extracting a real archive onto virtiofs corrupts
+                // symlink members. _actions/_temp/_tool are the runner's own
+                // action-repo and tool-download caches, always these three
+                // names, never needing host persistence for the disk-churn
+                // goal this mount exists for (checkouts/build scratch live
+                // directly under _work/<owner>/<repo>, unaffected by this).
+                for shadowed in ["_actions", "_temp", "_tool"] {
+                    cmd.args([
+                        "--tmpfs",
+                        &format!("/home/runner/_work/{shadowed}"),
+                    ]);
+                }
             }
         }
     }
@@ -4286,6 +4309,52 @@ minimum_isolation = "container"
             expected_runner_workspace.is_dir(),
             "the per-runner workspace subdir should have been created on the host"
         );
+    }
+
+    #[test]
+    fn workspace_mount_shadows_actions_temp_tool_with_tmpfs() {
+        // Regression test for the 2026-07-19 live incident (bead
+        // jleechan-93cf): tar extraction of an archive containing a symlink
+        // corrupts the symlink into an unreadable 0-byte mode-000 file when
+        // the destination is this virtiofs-backed workspace bind mount on
+        // Colima/Mac -- confirmed with actions/setup-python's own tarball,
+        // reproduced end-to-end in
+        // tests/workspace_mount_symlink_extraction_test.sh. GitHub's own
+        // actions-runner extracts downloaded action repos and tools into
+        // exactly these three fixed subdirectory names, so shadowing them
+        // with tmpfs keeps that extraction off virtiofs entirely while the
+        // disk-churn win this mount exists for (checkouts/build scratch,
+        // which live directly under _work/<owner>/<repo>) is unaffected.
+        let _env = TestEnv::new("workspace_mount_tmpfs_shadow");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-workspace-tmpfs-test-{}", std::process::id()));
+        let workspace_root = temp_dir.join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 3334))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.starts_with("run "))
+            .expect("a docker run invocation should have been logged");
+        for shadowed in ["_actions", "_temp", "_tool"] {
+            let expected = format!("--tmpfs /home/runner/_work/{shadowed}");
+            assert!(
+                run_line.contains(&expected),
+                "run args should tmpfs-shadow {shadowed}; got: {run_line}"
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,16 @@ The fleet MUST run its full configured capacity: **16 Linux** (ez-runner-c-1..16
 - `.claude/skills/ezgha-doctor/SKILL.md` — diagnostic + self-healing recipes
 - `.claude/commands/doctor-ezactions.md` — `/doctor-ezactions` slash command (`.claude/commands/doctor.md` is a deprecation stub pointing here)
 
+## Workspace mount + virtiofs symlink extraction bug (Mac, bead jleechan-93cf)
+
+`runner.workspace_host_path` bind-mounts a host directory at `/home/runner/_work` (disk-churn fix). On Colima/Mac, `tar` extracting an archive containing a symlink onto that virtiofs-backed mount corrupts the symlink into an unreadable 0-byte mode-000 file (`tar: ...: Cannot open: Permission denied`) — confirmed live with `actions/setup-python`'s own tarball, which the GitHub Actions runner extracts into `_work/_actions` when downloading the action. A plain `ln -s` on the mount works fine; extraction into the container's own overlay filesystem works fine; only tar-extracting a real archive onto virtiofs corrupts symlink members. This broke `setup-python`/`setup-node`/`setup-gcloud` on the Mac fleet at a 41% job failure rate for ~1-2 days before being caught (2026-07-19).
+
+**Fix:** the daemon tmpfs-shadows the three fixed runner-internal cache dirs (`_actions`, `_temp`, `_tool`) inside the workspace mount, so the runner's own action/tool-cache extraction never touches virtiofs, while checkouts/build scratch (which live directly under `_work/<owner>/<repo>`, the actual disk-churn win) are unaffected.
+
+**Regression coverage:** `tests/workspace_mount_symlink_extraction_test.sh` (Layer 2, real Docker — reproduces the bug against a synthetic archive with the same symlink shape, then proves the tmpfs shadow fixes it) + `docker_backend::tests::workspace_mount_shadows_actions_temp_tool_with_tmpfs` (Layer 1, unit — asserts the `--tmpfs` args are emitted). Run the integration test after any change to the workspace-mount code path: `DOCKER_HOST=... bash tests/workspace_mount_symlink_extraction_test.sh`.
+
+**Why this took 1-2 days to catch (see `/harness` 2026-07-19):** pre-deploy validation for this feature was a synthetic single-file write test, not a real job — the bead's own acceptance criteria required real-job validation before shipping and it was skipped. There is also no job-success-rate monitor in this repo's health tooling (`doctor-runner` measures container *activity*, EXECUTING/IDLE/DOWN, never job *outcome*) — a fleet failing 75% of jobs it picks up reads as perfectly healthy. Any future change to `docker_backend.rs`'s container-start/mount path is a **production runtime change**: validate with a real job (or the integration test above) before/immediately after deploying, not unit tests alone.
+
 ## Custom runner image (IMPORTANT)
 The config must use `ezgha-runner:latest` (built from `Dockerfile.runner`), NOT the bare `ghcr.io/actions/actions-runner:latest` image.
 The bare upstream image lacks `gh` and `jq`, causing workflows to fail with exit code 127.
