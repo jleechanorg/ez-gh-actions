@@ -1,0 +1,93 @@
+# Mac virtiofs-canary gate (bead jleechan-93cf follow-up).
+#
+# Motivation: a virtiofs symlink-corruption bug in the Mac fleet's
+# workspace-mount code path shipped and ran at a 41% job failure rate for
+# 1-2 days (2026-07-19) before being caught, because its regression test
+# (tests/workspace_mount_symlink_extraction_test.sh) requires a real
+# Colima/virtiofs-backed Mac host to exercise the bug class at all -- a
+# bare GitHub-hosted Ubuntu runner has no virtiofs bridge, so the test was
+# never wired into any CI gate. This workflow dispatches that test to the
+# real self-hosted Mac fleet on every PR touching the workspace-mount code
+# path, instead of leaving it as a manual-only pre-deploy step.
+#
+# IMPORTANT -- runs-on label note: the fleet's example config
+# (config/config.toml.mac.example) lists labels
+# ["self-hosted","self-hosted-mikey","ezgha","macOS","ARM64"], but the
+# ACTUAL live-deployed config on the Mac host
+# (~/Library/Application Support/org.jleechanorg.ezgha/config.toml, the
+# real ProjectDirs path -- NOT ~/.config/ezgha/config.toml, which macOS
+# does not read) registers runners with labels
+# ["self-hosted","self-hosted-mikey","ezgha","self-hosted-macos"] instead
+# -- confirmed live via `docker exec <container> env` /
+# `gh api orgs/jleechanorg/actions/runners` on 2026-07-18. Using the
+# example file's macOS/ARM64 labels here would have made this workflow
+# queue forever with zero matching runners. runs-on below uses the
+# CONFIRMED LIVE label set. If the fleet's labels are ever changed to match
+# the example file, this must be updated in the same change.
+#
+# KNOWN GAP (see PR description / bead follow-up): the ephemeral runner
+# containers do not currently have the host Docker daemon socket forwarded
+# into them (no /var/run/docker.sock bind, no DOCKER_HOST env -- confirmed
+# live via `docker exec <container> docker version`), so the nested
+# `docker run` calls inside workspace_mount_symlink_extraction_test.sh
+# cannot reach a real daemon from inside the job and the script correctly
+# SKIPs (exit 0) rather than silently reporting a false PASS. This job
+# still proves real dispatch to the real fleet and keeps the script wired
+# in so it activates automatically the moment nested docker access lands
+# (tracked as a follow-up), but a green run here does not yet prove the
+# symlink-corruption fix; see the PR body for the full disclosure.
+name: Mac virtiofs canary
+
+on:
+  pull_request:
+    paths:
+      - "src/docker_backend.rs"
+      - "Dockerfile.runner"
+      - "docker/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mac-virtiofs-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  virtiofs-canary:
+    runs-on: [self-hosted, ezgha, self-hosted-macos]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Prove execution environment
+        run: |
+          echo "runner: $RUNNER_NAME on $(hostname)"
+          uname -a
+          sysctl -n hw.ncpu 2>/dev/null || nproc || true
+          echo "docker CLI: $(command -v docker || echo none)"
+          if docker version >/dev/null 2>&1; then
+            echo "nested docker daemon: REACHABLE (script should exercise real assertions)"
+          else
+            echo "nested docker daemon: UNREACHABLE (script will SKIP -- known gap, see workflow header comment)"
+          fi
+
+      - name: Run virtiofs symlink-extraction regression test
+        id: virtiofs_test
+        run: |
+          set -o pipefail
+          bash tests/workspace_mount_symlink_extraction_test.sh 2>&1 | tee /tmp/virtiofs-canary.log
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Flag a non-executing SKIP loudly (do not let it hide silently)
+        if: always()
+        run: |
+          if grep -q '^SKIP:' /tmp/virtiofs-canary.log; then
+            echo "::warning::workspace_mount_symlink_extraction_test.sh SKIPped (no nested docker daemon in this runner container) -- this run did NOT exercise the virtiofs symlink-corruption assertions. See the workflow file header for the tracked follow-up."
+          elif grep -q '\[FAIL\]' /tmp/virtiofs-canary.log; then
+            echo "::error::workspace_mount_symlink_extraction_test.sh reported one or more [FAIL] assertions -- see the job log above."
+          else
+            echo "workspace_mount_symlink_extraction_test.sh ran its real assertions (no SKIP) -- see [OK]/[FAIL] counts above."
+          fi
