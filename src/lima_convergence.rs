@@ -413,7 +413,8 @@ pub fn write_backup_marker(
     }
     let existing = if marker_path.exists() {
         let raw = fs::read_to_string(marker_path)?;
-        serde_json::from_str::<BackupMarker>(&raw).unwrap_or_default()
+        serde_json::from_str::<BackupMarker>(&raw)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
     } else {
         BackupMarker {
             entries: Vec::new(),
@@ -426,7 +427,9 @@ pub fn write_backup_marker(
     }
     let json = serde_json::to_string_pretty(&merged)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    fs::write(marker_path, json)
+    let temp_path = marker_path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&temp_path, json)?;
+    fs::rename(temp_path, marker_path)
 }
 
 fn now_epoch_secs() -> u64 {
@@ -733,6 +736,25 @@ mod tests {
         };
         write_backup_marker(&nested, std::slice::from_ref(&entry)).unwrap();
         assert!(nested.exists());
+    }
+
+    #[test]
+    fn backup_marker_rejects_corrupt_existing_state_without_overwriting_it() {
+        let home = fake_home();
+        let marker = home.join("marker.json");
+        let corrupt = "{not valid rollback json";
+        fs::write(&marker, corrupt).unwrap();
+        let entry = BackupMarkerEntry {
+            context: "lima-colima".into(),
+            previous_socket: PathBuf::from("/tmp/legacy.sock"),
+            migrated_at_unix: 1,
+        };
+
+        let error = write_backup_marker(&marker, &[entry])
+            .expect_err("corrupt rollback state must fail closed");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(marker).unwrap(), corrupt);
     }
 
     #[test]
