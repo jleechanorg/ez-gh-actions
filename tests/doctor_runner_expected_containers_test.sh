@@ -13,8 +13,11 @@
 # This test extracts the ACTUAL derivation code from doctor-runner (via sed,
 # not a re-implementation) so it can't silently drift from the real logic,
 # then exercises it against a fixture slot_assignments.toml with both
-# sections + a config.toml with runner.count=16, asserting:
+# sections + a config.toml with runner.count=16 followed by an inline comment
+# containing more digits, asserting:
 #   1. EXPECTED_CONTAINERS resolves to 16 (from config.toml), not ~28.
+#      It must also ignore digits in the inline comment; concatenating those
+#      digits made section 9 execute an effectively infinite `seq` on Mac.
 #   2. The section-scoped fallback (no config.toml) also resolves to 16,
 #      not the whole-file double-count.
 #
@@ -42,6 +45,27 @@ trap cleanup EXIT
 
 CONFIG_DIR="$TEMP_HOME/.config/ezgha"
 mkdir -p "$CONFIG_DIR"
+
+# Extract the real TOML-aware runner-count parser. Both section 9 and the
+# verdict derivation must call this helper so inline-comment handling cannot
+# drift between the two consumers.
+COUNT_FUNC_START=$(grep -n '^read_config_runner_count() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$COUNT_FUNC_START" ]; then
+  echo "FAIL: could not locate read_config_runner_count() in $DOCTOR_SCRIPT" >&2
+  exit 1
+fi
+COUNT_FUNC_END=$(tail -n +"$COUNT_FUNC_START" "$DOCTOR_SCRIPT" | grep -n '^}' | head -1 | cut -d: -f1)
+COUNT_FUNC_END=$((COUNT_FUNC_START + COUNT_FUNC_END - 1))
+COUNT_FUNC_SRC=$(sed -n "${COUNT_FUNC_START},${COUNT_FUNC_END}p" "$DOCTOR_SCRIPT")
+
+grep -Fq 'CONFIGURED_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: section 9 does not use read_config_runner_count()" >&2
+  exit 1
+}
+grep -Fq 'CONFIG_RUNNER_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: verdict derivation does not use read_config_runner_count()" >&2
+  exit 1
+}
 
 # Fixture: slot_assignments.toml with BOTH [assignments] and [registered_at]
 # sections, 16 entries each — the exact shape that broke the old grep -c '='.
@@ -90,7 +114,7 @@ run_case() {
 version = 1
 [runner]
 name_prefix = "ez-runner-c"
-count = 16
+count = 16 # RESIZED 2026-07-13: restore to 6 after Colima resize to 24GiB
 EOF
   else
     rm -f "$CONFIG_DIR/config.toml"
@@ -99,6 +123,7 @@ EOF
   HOME="$TEMP_HOME"
   SLOT_FILE="$SLOT_FILE"
   EXPECTED_CONTAINERS=""
+  eval "$COUNT_FUNC_SRC"
   eval "$FUNC_SRC"
   eval "$DERIVE_SRC"
 

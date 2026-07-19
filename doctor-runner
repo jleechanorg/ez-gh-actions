@@ -42,6 +42,28 @@ warn() { printf '  [WARN] %s\n' "$*"; }
 bad() { printf '  [BAD]  %s\n' "$*"; }
 info() { printf '  [..]   %s\n' "$*"; }
 
+# Parse the authoritative [runner].count with Python's TOML parser. The old
+# awk removed every non-digit from the whole assignment tail, so digits in an
+# inline comment (for example a resize date) were appended to the real value;
+# section 9 then attempted `seq 1 <that enormous number>` and never reached
+# the verdict. Keep both count consumers on this one parser.
+read_config_runner_count() {
+  python3 - "$1" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as handle:
+        count = tomllib.load(handle)["runner"]["count"]
+    if type(count) is not int or count <= 0:
+        raise ValueError("invalid runner.count")
+except (OSError, KeyError, TypeError, ValueError, tomllib.TOMLDecodeError):
+    raise SystemExit(1)
+
+print(count)
+PY
+}
+
 # Platform detection: the same fleet can run on Linux (systemd) or macOS
 # (launchd) and the diagnostic surfaces differ accordingly. Detect ONCE at
 # the top so downstream sections branch consistently.
@@ -436,6 +458,65 @@ CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 info "managed containers running: $CONTAINER_COUNT (expected: configured runner.count)"
 echo "$CONTAINER_NAMES" | head -20
 
+# --- D2. host resource pressure (2026-07-19, user request: "detect these
+# upfront") -----------------------------------------------------------------
+# General host CPU congestion (concurrent agent sessions, browser automation,
+# disk scanners, OS background daemons) is NOT an ezgha bug, but it degrades
+# the daemon's own ability to talk to Docker -- confirmed live: 550
+# "docker CLI timed out" errors + 6394 "settling ceiling reached" warnings
+# co-occurred with a 1-min load average of 25-231 on a 14-core Mac while the
+# top CPU consumers were a disk-usage scanner, three Aside browser-automation
+# helpers, and macOS's own XProtect/syspolicyd/suggestd daemons -- none of
+# them ezgha-related. This section surfaces that congestion (and its
+# fingerprint in the daemon's own logs) so it's visible at a glance instead
+# of requiring an ad-hoc `ps aux` + log grep every time the fleet seems
+# flaky. Non-blocking (WARN only) -- machine congestion outside ezgha's
+# control should not fail the health gate, but it must never be invisible.
+section "6b. host resource pressure"
+if [ "$PLATFORM" = "macos" ]; then
+  CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 0)
+elif [ "$PLATFORM" = "linux" ]; then
+  CORES=$(nproc 2>/dev/null || echo 0)
+else
+  CORES=0
+fi
+LOAD_LINE=$(uptime 2>/dev/null || true)
+LOAD_1MIN=$(printf '%s' "$LOAD_LINE" | sed -nE 's/.*load averages?:[[:space:]]*([0-9]+([.][0-9]+)?).*/\1/p' 2>/dev/null || true)
+info "uptime: ${LOAD_LINE:-unavailable}"
+if [ -n "$LOAD_1MIN" ] && [ "$CORES" -gt 0 ] 2>/dev/null; then
+  THRESHOLD=$((CORES * 2))
+  if awk -v load="$LOAD_1MIN" -v threshold="$THRESHOLD" 'BEGIN { exit !(load > threshold) }'; then
+    warn "1-min load ($LOAD_1MIN) exceeds 2x core count ($CORES cores, threshold $THRESHOLD) -- host is oversubscribed; expect slower docker CLI calls and respawns, not necessarily an ezgha bug"
+  else
+    ok "1-min load ($LOAD_1MIN) within 2x core count ($CORES cores)"
+  fi
+else
+  warn "could not parse load average or core count -- skipping oversubscription check"
+fi
+info "top 5 CPU consumers right now:"
+# `set -o pipefail` turns ps's SIGPIPE (from head closing the pipe early)
+# into a script-aborting error -- `|| true` on the full pipeline avoids that
+# without losing the actual failure signal (head/sed themselves not failing).
+{ ps -Ao pcpu,comm -r 2>/dev/null | head -6 | tail -5 | sed 's/^/    /'; } || true
+# Correlate with the daemon's OWN degradation signature from recent_logs(),
+# reusing the rest of the script's log source. Linux is time-windowed; macOS
+# launchd redirects have no timestamps, so report their bounded tail honestly.
+if [ "$PLATFORM" = "macos" ]; then
+  PRESSURE_LOG_SCOPE="recent launchd log tail (up to 200 lines per stream)"
+else
+  PRESSURE_LOG_SCOPE="last 5 min"
+fi
+TIMEOUT_HITS=$(recent_logs 5 2>/dev/null | grep -c 'docker CLI timed out' || true)
+SETTLING_HITS=$(recent_logs 5 2>/dev/null | grep -c 'settling ceiling reached' || true)
+if [ "${TIMEOUT_HITS:-0}" -gt 0 ] 2>/dev/null; then
+  warn "daemon logged $TIMEOUT_HITS 'docker CLI timed out' error(s) in the $PRESSURE_LOG_SCOPE -- host congestion is measurably slowing the daemon's own docker calls"
+else
+  ok "no 'docker CLI timed out' errors in the $PRESSURE_LOG_SCOPE"
+fi
+if [ "${SETTLING_HITS:-0}" -gt 3 ] 2>/dev/null; then
+  warn "daemon logged $SETTLING_HITS 'settling ceiling reached' warning(s) in the $PRESSURE_LOG_SCOPE -- container respawns are running slower than expected, consistent with host congestion above"
+fi
+
 # --- E. recent routing proof: jobs REALLY ran on the configured fleet -----
 # "online" is not "working". This section proves recent GitHub Actions jobs
 # were actually EXECUTED by configured-prefix runners by reading each run's
@@ -627,7 +708,7 @@ fi
 # not just however many containers happen to exist — so a slot that never
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
-CONFIGURED_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+CONFIGURED_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
 CONFIGURED_COUNT="${CONFIGURED_COUNT:-16}"
 HOST_LABEL="$PLATFORM ($(hostname -s 2>/dev/null || hostname))"
 
@@ -1176,7 +1257,7 @@ fi
 # tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
 # config.toml is unreadable): count lines within the [assignments] section
 # ONLY, never a whole-file grep.
-CONFIG_RUNNER_COUNT=$(awk -F'=' '/^count/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+CONFIG_RUNNER_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
 if [ -n "${CONFIG_RUNNER_COUNT:-}" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$CONFIG_RUNNER_COUNT}"
 elif [ -f "$SLOT_FILE" ]; then
