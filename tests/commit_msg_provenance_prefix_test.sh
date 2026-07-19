@@ -19,9 +19,26 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$REPO_ROOT/.githooks/commit-msg"
+SERVER_WORKFLOW="$REPO_ROOT/.github/workflows/ci-selfhosted.yml"
 
 if [ ! -x "$HOOK" ]; then
   echo "FAIL: hook not found or not executable: $HOOK" >&2
+  exit 1
+fi
+
+# The local hook cannot see squash commits created by GitHub. Keep the
+# server-side PR-title gate wired to this same validator so the default squash
+# subject is checked without duplicating the prefix contract in workflow YAML.
+if ! grep -Fq "PR_TITLE: \${{ github.event.pull_request.title }}" "$SERVER_WORKFLOW"; then
+  echo "FAIL: self-hosted CI does not validate the pull-request title" >&2
+  exit 1
+fi
+if ! grep -Fq "bash .githooks/commit-msg \"\$commit_msg_file\"" "$SERVER_WORKFLOW"; then
+  echo "FAIL: self-hosted CI does not reuse the commit-msg validator" >&2
+  exit 1
+fi
+if ! grep -Eq 'types:.*edited' "$SERVER_WORKFLOW"; then
+  echo "FAIL: editing a rejected pull-request title does not rerun the gate" >&2
   exit 1
 fi
 

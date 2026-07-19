@@ -6,6 +6,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, edited, synchronize, reopened]
 
 permissions:
   contents: read
@@ -22,6 +23,14 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
+      - name: Validate squash-merge provenance prefix
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          commit_msg_file="$RUNNER_TEMP/pr-title-commit-message"
+          printf '%s\n' "$PR_TITLE" > "$commit_msg_file"
+          bash .githooks/commit-msg "$commit_msg_file"
       - name: Prove execution environment
         run: |
           echo "runner: $RUNNER_NAME on $(hostname)"
