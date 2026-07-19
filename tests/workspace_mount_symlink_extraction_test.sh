@@ -331,6 +331,52 @@ else
   bad "guarded tar produced a WORSE outcome than native for a mode-000 member (e.g. silently applied wrong permissions instead of failing): native=${MODE_NATIVE_SIGNATURE:-missing}; guarded=${MODE_GUARDED_SIGNATURE:-missing}"
 fi
 
+echo "=== 6. Regression: multiple -C occurrences must defer to native tar, never silently misplace output ==="
+# Found by adversarial review (2026-07-20): GNU tar's per-member directory
+# targeting (multiple -C flags in one invocation, each scoping only the
+# members listed after it) is rare but real. An earlier wrapper revision
+# collapsed every -C into a single trailing one, which GNU tar silently
+# ignores (nothing follows it) -- rc=0, looking successful, while both
+# real destinations ended up empty. This must never happen: the wrapper
+# should now detect 2+ -C occurrences and bail out to native tar unmodified
+# BEFORE any staging, so behavior is byte-for-byte identical to unwrapped
+# tar for this shape (re-exposing the disclosed symlink-corruption gap for
+# this narrow case, never a NEW silent-misplacement regression).
+MULTIC_SRC="${WORKDIR}/multic-src"
+mkdir -p "${MULTIC_SRC}/sub1" "${MULTIC_SRC}/sub2"
+echo "content-a" > "${MULTIC_SRC}/sub1/fileA.txt"
+echo "content-b" > "${MULTIC_SRC}/sub2/fileB.txt"
+COPYFILE_DISABLE=1 tar -czf "${WORKDIR}/multic.tar.gz" -C "${MULTIC_SRC}" sub1/fileA.txt sub2/fileB.txt
+
+MULTIC_NATIVE_HOST="${WORKDIR}/host-multic-native"
+mkdir -p "${MULTIC_NATIVE_HOST}/dirA" "${MULTIC_NATIVE_HOST}/dirB"
+MULTIC_NATIVE_OUT=$(docker run --rm \
+  -v "${WORKDIR}/multic.tar.gz:/tmp/multic.tar.gz:ro" \
+  -v "${MULTIC_NATIVE_HOST}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    /usr/bin/tar -xzf /tmp/multic.tar.gz -C /home/runner/_work/dirA sub1/fileA.txt -C /home/runner/_work/dirB sub2/fileB.txt; echo "rc=$?"
+    printf "dirA=%s dirB=%s\n" "$(cat /home/runner/_work/dirA/sub1/fileA.txt 2>&1)" "$(cat /home/runner/_work/dirB/sub2/fileB.txt 2>&1)"
+  ' 2>&1)
+echo "${MULTIC_NATIVE_OUT}" | sed 's/^/    native: /'
+
+MULTIC_GUARDED_HOST="${WORKDIR}/host-multic-guarded"
+mkdir -p "${MULTIC_GUARDED_HOST}/dirA" "${MULTIC_GUARDED_HOST}/dirB"
+MULTIC_GUARDED_OUT=$(docker run --rm \
+  -e EZGHA_VIRTIOFS_WORKSPACE=1 \
+  -v "${WORKDIR}/multic.tar.gz:/tmp/multic.tar.gz:ro" \
+  -v "${MULTIC_GUARDED_HOST}:/home/runner/_work" \
+  "${IMAGE}" sh -c '
+    tar -xzf /tmp/multic.tar.gz -C /home/runner/_work/dirA sub1/fileA.txt -C /home/runner/_work/dirB sub2/fileB.txt; echo "rc=$?"
+    printf "dirA=%s dirB=%s\n" "$(cat /home/runner/_work/dirA/sub1/fileA.txt 2>&1)" "$(cat /home/runner/_work/dirB/sub2/fileB.txt 2>&1)"
+  ' 2>&1)
+echo "${MULTIC_GUARDED_OUT}" | sed 's/^/    guarded: /'
+
+if printf '%s' "${MULTIC_GUARDED_OUT}" | grep -q "dirA=content-a dirB=content-b"; then
+  ok "guarded tar correctly splits members across multiple -C destinations (matches native)"
+else
+  bad "guarded tar mishandled multiple -C occurrences: native=${MULTIC_NATIVE_OUT}; guarded=${MULTIC_GUARDED_OUT}"
+fi
+
 echo
 echo "=== Summary: ${PASS} passed, ${FAIL} failed ==="
 if [ "${FAIL}" -gt 0 ]; then

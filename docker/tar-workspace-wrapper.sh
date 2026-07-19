@@ -104,13 +104,32 @@
 # ponytail: this only detects the common tar invocation shapes actually seen
 # in CI workflows (`tar -xzf ...[-C dir]`, `tar xzf ...[-C dir]` old-style
 # bundling, `--extract`/`--directory[=]`). It does not attempt to parse every
-# GNU tar option combination (e.g. multiple chained -C flags for multi-
-# directory extraction from one archive, or `..`-normalization of the
-# destination path). Ceiling: if extraction ever silently misdetects, the
-# fallback is the ORIGINAL bug (status quo), never a NEW regression -- see
+# GNU tar option combination, or `..`-normalization of the destination path.
+# Ceiling: if extraction ever silently misdetects, the fallback is the
+# ORIGINAL bug (status quo), never a NEW regression -- see
 # tests/workspace_mount_symlink_extraction_test.sh for the covered shapes.
 # Upgrade path: replace with a real tar-option parser if a missed shape
 # shows up in production job logs.
+#
+# EXPLICIT CARVE-OUT, found by adversarial review (2026-07-20): GNU tar
+# supports MULTIPLE `-C`/`--directory` occurrences in one invocation, each
+# scoping only the members listed AFTER it (per-member directory targeting,
+# e.g. `tar -C dirA -xf a.tar sub1/f -C dirB sub2/f`), rare but real (some
+# release-packaging scripts use this). Collapsing every `-C` into a single
+# trailing `-C "${stage}"` (placed after ALL member names) is unsafe here:
+# GNU tar ignores a `-C` that has no member names following it, so it
+# silently extracts relative to whatever cwd it inherited instead -- rc=0,
+# looking successful, while the real destinations end up empty and files
+# land somewhere unrelated. That is NOT the disclosed "falls back to the
+# original bug" ceiling above -- it is a distinct, WORSE failure mode
+# (silent success with misplaced output) that this wrapper must not permit.
+# Confirmed via live repro: unwrapped tar correctly splits members across
+# both directories; the naive single-trailing-`-C` rewrite left both empty.
+# Mitigation: detect 2+ `-C`/`--directory` occurrences up front and bail
+# out to the real tar unmodified BEFORE doing any staging -- this correctly
+# re-exposes the known, disclosed symlink-corruption gap for this narrow
+# shape (matching the documented fallback contract) rather than silently
+# misplacing files.
 
 set -euo pipefail
 
@@ -120,6 +139,25 @@ WORKSPACE_ROOT=/home/runner/_work
 # Fast path: no virtiofs-backed workspace mount in this container (or the
 # daemon didn't opt into it) -- nothing to guard against, run the real tar.
 if [ -z "${EZGHA_VIRTIOFS_WORKSPACE:-}" ]; then
+  exec "${REAL_TAR}" "$@"
+fi
+
+# Bail out up front if this invocation uses multiple -C/--directory
+# occurrences -- see the "EXPLICIT CARVE-OUT" header comment above. Must be
+# checked before any staging decision, and does not need extract/-C-value
+# parsing since a single grep-style pass over the raw args is sufficient
+# and cannot itself misfire (worst case: an archive filename that happens
+# to literally equal "-C" -- vanishingly rare, and even then the fallback
+# is just the disclosed status quo, never a new regression).
+c_flag_count=0
+for arg in "$@"; do
+  case "${arg}" in
+    -C|--directory|--directory=*)
+      c_flag_count=$((c_flag_count + 1))
+      ;;
+  esac
+done
+if [ "${c_flag_count}" -ge 2 ]; then
   exec "${REAL_TAR}" "$@"
 fi
 
