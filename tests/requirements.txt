@@ -1,0 +1,5 @@
+# Python dependencies needed to run tests/ under CI.
+# Not needed by any production script — only by unittest fixtures that
+# mock the `requests` module (verify_mint_no_retry_on_4xx.py,
+# verify_mint_retry.py). See bead ez-gh-actions-r8od.
+requests
