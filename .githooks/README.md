@@ -20,12 +20,15 @@ Each lacked the `claude/<model>:`, `gemini/<model>:`, `codex/<model>:`, or
 authors must not be allowed to silently regress to that state — bead
 `ez-gh-actions-jcie`.
 
-The `CI (self-hosted ezgha)` workflow applies this same validator to each pull
-request title, which is GitHub's default squash-merge subject. Editing a title
-reruns that gate. The local hook remains the earlier feedback path for ordinary
-commits; CI is the server-side gate for squash candidates. A merger can still
-replace the default subject in GitHub's merge dialog, so repository ruleset
-enforcement would be required to make manual subject overrides impossible.
+The `CI (self-hosted ezgha)` workflow applies this same validator to each
+same-repository pull request title, which is GitHub's default squash-merge
+subject. It uses `pull_request_target`, skips fork heads before allocating a
+self-hosted runner, and checks out only the trusted base SHA before invoking
+this hook. Editing a title reruns that gate. The local hook remains the earlier
+feedback path for ordinary commits; CI is the server-side gate for squash
+candidates. A merger can still replace the default subject in GitHub's merge
+dialog, so repository ruleset enforcement would be required to make manual
+subject overrides impossible.
 
 ## Hook contract
 

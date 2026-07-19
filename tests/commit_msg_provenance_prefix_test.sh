@@ -29,6 +29,25 @@ fi
 # The local hook cannot see squash commits created by GitHub. Keep the
 # server-side PR-title gate wired to this same validator so the default squash
 # subject is checked without duplicating the prefix contract in workflow YAML.
+# `pull_request_target` loads the workflow from the trusted default branch. The
+# whole self-hosted job must also be skipped for fork heads, before a runner is
+# allocated, and the validator must come from the trusted base revision.
+if ! grep -Eq '^[[:space:]]+pull_request_target:' "$SERVER_WORKFLOW"; then
+  echo "FAIL: self-hosted CI does not use trusted pull_request_target metadata" >&2
+  exit 1
+fi
+if grep -Eq '^[[:space:]]+pull_request:' "$SERVER_WORKFLOW"; then
+  echo "FAIL: self-hosted CI still schedules untrusted pull_request code" >&2
+  exit 1
+fi
+if ! grep -Fq "github.event.pull_request.head.repo.full_name == github.repository" "$SERVER_WORKFLOW"; then
+  echo "FAIL: self-hosted CI does not skip fork pull requests at the job boundary" >&2
+  exit 1
+fi
+if ! grep -Fq "ref: \${{ github.event.pull_request.base.sha }}" "$SERVER_WORKFLOW"; then
+  echo "FAIL: self-hosted CI does not load the validator from the trusted base revision" >&2
+  exit 1
+fi
 if ! grep -Fq "PR_TITLE: \${{ github.event.pull_request.title }}" "$SERVER_WORKFLOW"; then
   echo "FAIL: self-hosted CI does not validate the pull-request title" >&2
   exit 1

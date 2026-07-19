@@ -1,11 +1,11 @@
 # Runs the test suite on an ezgha-managed ephemeral runner so the self-hosted
-# fleet does real work on every push. Deliberately push-to-main only: fork PRs
-# must never reach a self-hosted runner on a public repo.
+# fleet does real work on every push. PR metadata is read from the trusted base
+# workflow, and fork heads are skipped before a self-hosted runner is allocated.
 name: CI (self-hosted ezgha)
 on:
   push:
     branches: [main]
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
@@ -17,14 +17,18 @@ concurrency:
 
 jobs:
   test-on-ezgha:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, ezgha]
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Checkout trusted base validator
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
       - name: Validate squash-merge provenance prefix
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
