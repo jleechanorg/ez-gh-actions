@@ -11,21 +11,17 @@
 # runner.count. Under normal ephemeral churn (a runner finishes a job, its
 # container is destroyed, and the next serve tick respawns it) that single
 # sample legitimately oscillates -- observed 16->15->16 within 15s on a
-# fully healthy fleet -- so the gate flapped [BAD] while section 9/10's
+# fully managed fleet -- so the gate flapped [BAD] while section 9/10's
 # 2-sample-verified per-slot proof showed 0 down in the SAME run.
 #
-# This test extracts the ACTUAL compute_live_slot_critical() function from
+# This test extracts the ACTUAL compute_execution_slot_critical() function from
 # doctor-runner (via sed, not a re-implementation) so it can't silently
 # drift from the real logic, then exercises it against fixture per-slot
 # counts, asserting:
-#   (a) 16 configured, 14 executing + 1 idle + 1 recovered-cycling (folded
-#       into idle by section 9's resample) = 16 live -> NOT critical, even
-#       though a raw docker-ps sample momentarily read 15 (the old gate's
-#       false-positive scenario -- this test proves the NEW gate no longer
-#       consults that raw sample at all).
-#   (b) 16 configured, only 14 live (2 slots persisted DOWN across both
-#       section-9 samples) -> critical fires, proving the fix didn't just
-#       disable the check.
+#   (a) all 16 configured slots executing -> NOT critical.
+#   (b) 14 executing + 2 idle -> critical: idle is not Runner.Worker proof.
+#   (c) 15 executing + 1 cycling -> critical: churn is not execution proof.
+#   (d) 14 executing + 2 DOWN -> critical.
 #
 # Usage: bash tests/doctor_runner_live_slot_gate_test.sh
 
@@ -34,12 +30,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
 
-# Extract the real compute_live_slot_critical() function definition from
+# Extract the real compute_execution_slot_critical() function definition from
 # doctor-runner (lines bounded by its def/close-brace markers) rather than
 # hardcoding a duplicate -- keeps the test honest against code drift.
-FUNC_START=$(grep -n '^compute_live_slot_critical() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+FUNC_START=$(grep -n '^compute_execution_slot_critical() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
 if [ -z "$FUNC_START" ]; then
-  echo "FAIL: could not locate compute_live_slot_critical() in $DOCTOR_SCRIPT" >&2
+  echo "FAIL: could not locate compute_execution_slot_critical() in $DOCTOR_SCRIPT" >&2
   exit 1
 fi
 FUNC_END=$(tail -n +"$FUNC_START" "$DOCTOR_SCRIPT" | grep -n '^}' | head -1 | cut -d: -f1)
@@ -59,51 +55,51 @@ fi
 bad() { printf '  [BAD]  %s\n' "$*"; }  # stub matching doctor-runner's helper
 
 run_case() {
-  local label="$1" exec_n="$2" idle_n="$3" expected="$4" expect_critical="$5"
+  local label="$1" exec_n="$2" idle_n="$3" cycling_n="$4" expected="$5" expect_critical="$6"
 
   eval "$FUNC_SRC"
 
-  local out live critical
-  out=$(compute_live_slot_critical "$exec_n" "$idle_n" "$expected")
-  read -r live critical <<< "$out"
+  local out executing critical
+  out=$(compute_execution_slot_critical "$exec_n" "$expected")
+  read -r executing critical <<< "$out"
 
   CRITICAL=0
   if [ "$critical" -eq 1 ]; then
-    bad "verdict: live-slot gate FAILED (live slots (executing+idle+cycling from per-slot proof) = ${live}, expected >= ${expected} from config.toml runner.count=${expected})"
+    bad "verdict: execution-slot gate FAILED (executing slots with Runner.Worker proof = ${executing}, expected >= ${expected} from config.toml runner.count=${expected})"
     CRITICAL=$((CRITICAL + 1))
   fi
 
   PASS=true
   if [ "$expect_critical" = "yes" ] && [ "$CRITICAL" -eq 0 ]; then
-    echo "  [$label] expected CRITICAL>0 but got CRITICAL=0 (live=$live expected=$expected) -- FAIL"
+    echo "  [$label] expected CRITICAL>0 but got CRITICAL=0 (executing=$executing expected=$expected) -- FAIL"
     PASS=false
   fi
   if [ "$expect_critical" = "no" ] && [ "$CRITICAL" -ne 0 ]; then
-    echo "  [$label] expected CRITICAL=0 but got CRITICAL=$CRITICAL (live=$live expected=$expected) -- FAIL"
+    echo "  [$label] expected CRITICAL=0 but got CRITICAL=$CRITICAL (executing=$executing expected=$expected) -- FAIL"
     PASS=false
   fi
   if [ "$PASS" = "true" ]; then
-    echo "  [$label] live=$live expected=$expected CRITICAL=$CRITICAL -- PASS"
+    echo "  [$label] executing=$executing expected=$expected CRITICAL=$CRITICAL -- PASS"
     return 0
   else
     return 1
   fi
 }
 
-echo "--- doctor-runner live-slot gate regression ---"
+echo "--- doctor-runner execution-slot gate regression ---"
 OVERALL_PASS=true
 
-# Case (a): 16 configured, 14 executing + 1 idle + 1 recovered-cycling
-# (already folded into idle_n=2 by section 9's 2-sample resample) = 16 live
-# -> NOT critical. This is the exact scenario a raw docker-ps sample would
-# have misread as 15/16 (a container mid-respawn momentarily missing from
-# `docker ps`) and flapped [BAD] on a healthy fleet.
-run_case "14exec-2idle-cycling-folded-in-16expected" 14 2 16 "no" || OVERALL_PASS=false
+# Full configured capacity is healthy only when every slot has Runner.Worker.
+run_case "16exec-16expected" 16 0 0 16 "no" || OVERALL_PASS=false
 
-# Case (b): 16 configured, totals show only 14 live (exec+idle) because 2
-# slots persisted DOWN across both section-9 samples -> critical fires with
-# the named message. Proves the fix didn't just disable the check.
-run_case "14exec-0idle-2persisted-down-16expected" 14 0 16 "yes" || OVERALL_PASS=false
+# Idle listeners are available but are not executing a real Actions job.
+run_case "14exec-2idle-16expected" 14 2 0 16 "yes" || OVERALL_PASS=false
+
+# A mid-respawn slot is cycling, not executing, and cannot green the fleet.
+run_case "15exec-1cycling-16expected" 15 0 1 16 "yes" || OVERALL_PASS=false
+
+# Persisted DOWN slots remain critical.
+run_case "14exec-2persisted-down-16expected" 14 0 0 16 "yes" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
