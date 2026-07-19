@@ -119,13 +119,13 @@ enum Commands {
     LimaConverge {
         /// Docker context name whose current socket resolution should be
         /// checked against the canonical-preferred socket. Resolved via
-        /// `docker context inspect` first (cold-review fix, PR #67 HIGH) --
-        /// falls back to `DOCKER_HOST`/default only when that lookup fails.
+        /// `docker context inspect` first. Failed/non-Unix resolution may
+        /// fall back for read-only diagnostics, but not for backup writes.
         #[arg(long, default_value = "lima-colima")]
         context: String,
         /// Override the path the daemon thinks it's pointed at (defaults to
-        /// resolving `--context` via `docker context inspect`, then
-        /// `DOCKER_HOST` if set, else `/var/run/docker.sock`).
+        /// resolving `--context` via `docker context inspect`; diagnostic
+        /// fallback is `DOCKER_HOST`, then `/var/run/docker.sock`).
         #[arg(long)]
         current_socket: Option<String>,
         /// Persist the rollback backup marker when a migration is implied.
@@ -1568,21 +1568,22 @@ fn main() -> Result<()> {
             // may carry a `unix://` scheme, so all three are normalized
             // through the same `strip_unix_socket_scheme` helper
             // `migration_plan`'s `Path`-equality check relies on.
-            let current = current_socket
-                .as_deref()
-                .map(lima_convergence::strip_unix_socket_scheme)
-                .or_else(|| lima_convergence::resolve_context_socket(context))
-                .or_else(|| {
-                    std::env::var_os("DOCKER_HOST")
-                        .filter(|s| !s.is_empty())
-                        .map(|s| lima_convergence::strip_unix_socket_scheme(&s.to_string_lossy()))
-                })
-                .unwrap_or_else(|| std::path::PathBuf::from("/var/run/docker.sock"));
-            let plan = lima_convergence::migration_plan(&probe, &current);
+            let docker_host = std::env::var_os("DOCKER_HOST")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string_lossy().into_owned());
+            let current_resolution = lima_convergence::resolve_current_socket(
+                context,
+                current_socket.as_deref(),
+                docker_host.as_deref(),
+            );
+            let current = &current_resolution.socket;
+            let plan = lima_convergence::migration_plan(&probe, current);
             let report = serde_json::json!({
                 "bead": "ez-gh-actions-apye",
                 "context": context,
                 "current_socket": current,
+                "current_socket_source": current_resolution.source,
+                "backup_provenance_verified": current_resolution.backup_provenance_verified,
                 "canonical": probe.canonical.as_ref().map(|c| serde_json::json!({
                     "name": c.name,
                     "vm_dir": c.vm_dir,
@@ -1605,6 +1606,12 @@ fn main() -> Result<()> {
                 })),
             });
             println!("{}", serde_json::to_string_pretty(&report)?);
+            if !current_resolution.backup_provenance_verified {
+                eprintln!(
+                    "diagnostic-only socket fallback used ({}) — rollback backup writes require --current-socket or a resolvable Unix named context",
+                    current_resolution.source
+                );
+            }
             // Acceptance criterion (5): if a migration is implied AND the
             // operator passed `--write-backup`, persist the previous-socket
             // marker so the rollback path is recoverable. We do NOT touch
@@ -1616,6 +1623,16 @@ fn main() -> Result<()> {
             // with a stale/default socket before any real migration.
             if let Some(p) = plan {
                 if *write_backup {
+                    current_resolution
+                        .require_backup_provenance()
+                        .map_err(|reason| {
+                            anyhow::anyhow!(
+                                "refusing --write-backup for context '{}' from source '{}': {}",
+                                context,
+                                current_resolution.source,
+                                reason
+                            )
+                        })?;
                     let entry = lima_convergence::backup_entry_for(context, &p);
                     lima_convergence::write_backup_marker(&p.backup_marker, &[entry])
                         .with_context(|| {

@@ -222,8 +222,9 @@ pub fn strip_unix_socket_scheme(raw: &str) -> PathBuf {
 /// (not `DOCKER_HOST`) is how `lima-colima` resolves the legacy socket, the
 /// tool reported the wrong "current" socket and planned migrations against
 /// it. Returns `None` on any failure (docker missing, context missing,
-/// non-unix endpoint) so callers can fall back to `DOCKER_HOST`/default —
-/// this is a best-effort read-only lookup, never authoritative on its own.
+/// non-unix endpoint). Callers may still use `DOCKER_HOST`/default for a
+/// clearly-labelled read-only diagnostic, but those guesses are not valid
+/// provenance for a rollback backup.
 pub fn resolve_context_socket(context: &str) -> Option<PathBuf> {
     resolve_context_socket_with_docker(context, Path::new("docker"))
 }
@@ -252,6 +253,87 @@ fn resolve_context_socket_with_docker(context: &str, docker: &Path) -> Option<Pa
         return None;
     }
     Some(PathBuf::from(socket))
+}
+
+/// The current socket used by a convergence diagnostic, together with
+/// whether it is authoritative enough to persist as rollback state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSocketResolution {
+    pub socket: PathBuf,
+    pub source: &'static str,
+    pub backup_provenance_verified: bool,
+}
+
+impl CurrentSocketResolution {
+    pub fn require_backup_provenance(&self) -> std::result::Result<(), &'static str> {
+        if self.backup_provenance_verified {
+            Ok(())
+        } else {
+            Err("pass --current-socket or restore a Unix named Docker context before writing rollback state")
+        }
+    }
+}
+
+/// Resolve a current socket for diagnostics. Only an operator-provided
+/// `--current-socket` or a successfully inspected Unix named context is
+/// trusted for rollback writes; ambient/default fallbacks remain read-only.
+pub fn resolve_current_socket(
+    context: &str,
+    explicit_socket: Option<&str>,
+    docker_host: Option<&str>,
+) -> CurrentSocketResolution {
+    resolve_current_socket_from_context(
+        explicit_socket,
+        docker_host,
+        resolve_context_socket(context),
+    )
+}
+
+#[cfg(test)]
+fn resolve_current_socket_with_docker(
+    context: &str,
+    explicit_socket: Option<&str>,
+    docker_host: Option<&str>,
+    docker: &Path,
+) -> CurrentSocketResolution {
+    resolve_current_socket_from_context(
+        explicit_socket,
+        docker_host,
+        resolve_context_socket_with_docker(context, docker),
+    )
+}
+
+fn resolve_current_socket_from_context(
+    explicit_socket: Option<&str>,
+    docker_host: Option<&str>,
+    context_socket: Option<PathBuf>,
+) -> CurrentSocketResolution {
+    if let Some(socket) = explicit_socket {
+        return CurrentSocketResolution {
+            socket: strip_unix_socket_scheme(socket),
+            source: "explicit-current-socket",
+            backup_provenance_verified: true,
+        };
+    }
+    if let Some(socket) = context_socket {
+        return CurrentSocketResolution {
+            socket,
+            source: "named-unix-context",
+            backup_provenance_verified: true,
+        };
+    }
+    if let Some(socket) = docker_host.filter(|socket| !socket.is_empty()) {
+        return CurrentSocketResolution {
+            socket: strip_unix_socket_scheme(socket),
+            source: "ambient-docker-host-fallback",
+            backup_provenance_verified: false,
+        };
+    }
+    CurrentSocketResolution {
+        socket: PathBuf::from("/var/run/docker.sock"),
+        source: "default-socket-fallback",
+        backup_provenance_verified: false,
+    }
 }
 
 /// Result of probing the host for dual-Lima presence.
@@ -827,5 +909,60 @@ mod tests {
         fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(resolve_context_socket_with_docker("remote", &docker), None);
+    }
+
+    #[test]
+    fn backup_provenance_rejects_fallback_when_docker_or_context_is_missing() {
+        let missing_docker = fake_home().join("missing-docker");
+        let resolution = resolve_current_socket_with_docker(
+            "missing-context",
+            None,
+            Some("unix:///tmp/ambient.sock"),
+            &missing_docker,
+        );
+
+        assert_eq!(resolution.socket, PathBuf::from("/tmp/ambient.sock"));
+        assert!(resolution.require_backup_provenance().is_err());
+    }
+
+    #[test]
+    fn backup_provenance_rejects_fallback_after_tcp_context_endpoint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = fake_home();
+        let docker = home.join("docker");
+        fs::write(
+            &docker,
+            "#!/bin/sh\nprintf 'tcp://docker.example:2376\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let resolution = resolve_current_socket_with_docker(
+            "remote",
+            None,
+            Some("unix:///tmp/ambient.sock"),
+            &docker,
+        );
+
+        assert_eq!(resolution.socket, PathBuf::from("/tmp/ambient.sock"));
+        assert!(resolution.require_backup_provenance().is_err());
+    }
+
+    #[test]
+    fn backup_provenance_accepts_explicit_current_socket_override() {
+        let missing_docker = fake_home().join("missing-docker");
+        let resolution = resolve_current_socket_with_docker(
+            "missing-context",
+            Some("unix:///tmp/operator-confirmed.sock"),
+            Some("unix:///tmp/ambient.sock"),
+            &missing_docker,
+        );
+
+        assert_eq!(
+            resolution.socket,
+            PathBuf::from("/tmp/operator-confirmed.sock")
+        );
+        assert!(resolution.require_backup_provenance().is_ok());
     }
 }
