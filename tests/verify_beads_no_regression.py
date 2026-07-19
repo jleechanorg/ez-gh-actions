@@ -103,6 +103,20 @@ class TestWorkflowComparisonBase(unittest.TestCase):
         self.assertIn('parent_sha="${{ github.event.before }}"', workflow)
         self.assertNotIn('parent_sha="$(git rev-parse HEAD^)"', workflow)
 
+    def test_public_pr_uses_trusted_base_code_and_skips_forks_before_runner(self):
+        with open(WORKFLOW_PATH, encoding="utf-8") as workflow_file:
+            workflow = workflow_file.read()
+
+        self.assertIn("  pull_request_target:", workflow)
+        self.assertNotIn("  pull_request:\n", workflow)
+        self.assertIn(
+            "if: github.event_name == 'push' || "
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            workflow,
+        )
+        self.assertIn('ref: ${{ github.event.pull_request.base.sha }}', workflow)
+        self.assertIn('head_sha="${{ github.event.pull_request.head.sha }}"', workflow)
+
 
 if __name__ == '__main__':
     suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])
