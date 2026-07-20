@@ -76,6 +76,18 @@ Every commit subject must be prefixed with the runtime that produced it:
 - `claude/<model-id>: <subject>`
 - `human: <subject>`
 
+**Enforced server-side for same-repository squash candidates** by the
+self-hosted CI workflow, which validates each PR title (GitHub's default squash
+subject) with `.githooks/commit-msg` from the trusted base SHA and reruns when
+the title is edited. Fork heads are skipped before a self-hosted runner is
+allocated. A merge-dialog title override remains outside this repository
+workflow; preventing that requires a GitHub repository ruleset. **Enforced
+locally for ordinary commits** by the same hook (bead `ez-gh-actions-jcie`).
+Recognized prefixes: `claude/`, `claudem/`, `claudew/`, `gemini/`, `codex/`,
+`cursor/`, `ao/`, `human` (each terminated by `:`). Opt in per-developer
+with `git config core.hooksPath .githooks` — see `.githooks/README.md`.
+Merge commits and `git commit --no-verify` bypass the gate.
+
 ## Common self-healing recipes
 
 ### Gate 3 FAIL: container count low
