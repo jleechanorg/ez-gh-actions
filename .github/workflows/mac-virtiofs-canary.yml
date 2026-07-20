@@ -38,28 +38,45 @@
 # symlink-corruption fix; see the PR body for the full disclosure.
 name: Mac virtiofs canary
 
+# SECURITY: this is a PUBLIC repo and this job runs on the self-hosted Mac
+# fleet, so the trigger follows the repo's guarded pattern (see
+# ci-selfhosted.yml, beads-regression-guard.yml; bead jleechan-5kbs):
+# pull_request_target (workflow definition always taken from the trusted
+# base branch) + a job-level same-repo guard so fork heads NEVER reach a
+# self-hosted runner. The PR head is checked out explicitly by SHA only
+# after the same-repo guard has passed.
 on:
-  pull_request:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
     paths:
       - "src/docker_backend.rs"
       - "Dockerfile.runner"
       - "docker/**"
+      - "tests/workspace_mount_symlink_extraction_test.sh"
+      - ".github/workflows/mac-virtiofs-canary.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Under pull_request_target, github.ref is the BASE ref (main) for every
+# PR, so key the group by PR number to avoid cross-PR cancellation;
+# workflow_dispatch runs fall back to the ref.
 concurrency:
-  group: mac-virtiofs-canary-${{ github.ref }}
+  group: mac-virtiofs-canary-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   virtiofs-canary:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, ezgha, self-hosted-macos]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          # Same-repo heads only (guarded above); for workflow_dispatch this
+          # is empty and checkout falls back to the default (trusted) ref.
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Prove execution environment
@@ -77,7 +94,10 @@ jobs:
       - name: Run virtiofs symlink-extraction regression test
         id: virtiofs_test
         run: |
-          set -o pipefail
+          # Explicit -e so a nonzero test exit fails this step even if the
+          # runner's default shell flags ever change; the trailing echo must
+          # never mask a real failure.
+          set -eo pipefail
           bash tests/workspace_mount_symlink_extraction_test.sh 2>&1 | tee /tmp/virtiofs-canary.log
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
