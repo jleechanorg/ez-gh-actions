@@ -184,6 +184,21 @@ pub fn run_once(
         url: None,
     };
 
+    // canary `list_workflow_runs` / `list_workflow_jobs` are intentionally
+    // NOT gated by the REST-budget floor (bead ez-gh-actions-4jv P1 scope
+    // follow-up): canary runs in a deadline-bounded poll loop with its own
+    // timeout (`cfg.canary.poll_timeout_seconds`), triggered by the
+    // scheduler independently of the serve-loop hot path. Adding the gate
+    // here would either (a) silently break canary observability on a
+    // low-budget day, or (b) require threading `RestBudgetProbe` through
+    // this hot loop -- the canary is a one-shot dispatch per scheduled
+    // tick (default 600s), not a per-iteration serve-loop reader, so the
+    // rate pressure is `2 * 1/600` calls/s = negligible vs. the serve
+    // loop's `~1 call/30s` queue/invariant fetches. The same exemption
+    // applies to `reaper::collect_repo_runs` (`list_repo_in_progress_runs`
+    // + `list_workflow_jobs` on reaper.rs:336) which is invoked from
+    // `main::run_reaper_plan` (CLI) and `docker_backend::reclaim_zombie_locked_runner`
+    // (qbl self-heal) -- both are event-driven, not serve-loop reads.
     loop {
         let runs = github::list_workflow_runs(repo, &cfg.canary.workflow, 20)?;
         if let Some(run) = find_run_by_nonce(&runs, &nonce) {

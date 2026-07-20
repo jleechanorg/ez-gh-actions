@@ -513,6 +513,143 @@ pub(crate) fn api_json_until(path: &str, deadline: Instant) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Parsed slice of `gh api rate_limit`'s response -- only the `core` REST
+/// bucket's `remaining` count matters for the budget-floor check below; the
+/// `search`/`graphql`/etc buckets are ignored on purpose since every call
+/// site this gates (`queue_monitor` read-heavy fetches) goes through the
+/// REST (`core`) bucket, never GraphQL.
+#[derive(Debug, Deserialize)]
+struct RateLimitResponse {
+    resources: RateLimitResources,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitResources {
+    core: RateLimitBucket,
+}
+
+#[derive(Debug, Deserialize)]
+struct RateLimitBucket {
+    remaining: u32,
+}
+
+/// Parses `gh api rate_limit`'s JSON body and extracts
+/// `resources.core.remaining`. Split out from `rest_budget_remaining` so the
+/// parsing logic is testable without exec'ing `gh` (see
+/// `rate_limit_response_parses_core_remaining` below).
+fn parse_rest_budget_remaining(body: &[u8]) -> Result<u32> {
+    let parsed: RateLimitResponse =
+        serde_json::from_slice(body).context("parse `gh api rate_limit` response")?;
+    Ok(parsed.resources.core.remaining)
+}
+
+/// Outcome of `rest_budget_remaining_until` -- distinguishes a confident
+/// observed low budget from "budget unknown". The Unknown arm is returned when the
+/// probe itself can't be trusted (deadline overrun, secondary-limit response
+/// without a parseable count, transient `gh` error). Callers decide how to
+/// handle that degraded state; the queue monitor defers its read-heavy work
+/// so the next `ensure_count` remains reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestBudgetProbe {
+    /// Probe succeeded and observed `remaining` calls in the REST (core)
+    /// bucket. Callers compare this to `cfg.queue_monitor.rest_budget_floor`.
+    Known(u32),
+    /// Probe could not be trusted (deadline overrun, transient gh error,
+    /// secondary-limit response without a parseable body). Callers MUST
+    /// handle the degraded state conservatively rather than assuming budget
+    /// is healthy.
+    Unknown,
+}
+
+/// Maximum wall-clock time the REST-budget probe is allowed to spend on a
+/// single `gh api rate_limit` call before `rest_budget_remaining_until` gives
+/// up and returns `RestBudgetProbe::Unknown`. Sized at 5 s -- long enough to
+/// absorb a single normal `gh api` roundtrip (typically < 1 s) plus one
+/// transient backoff retry (GH_RETRY_BASE_DELAY = 2 s) under a Retry-After
+/// response, but short enough that the probe can NEVER consume more than a
+/// fraction of the serve loop's per-tick time budget. Critically, this caps
+/// the probe independently of `GH_MAX_RETRIES` (5) × `GH_RETRY_MAX_DELAY`
+/// (32 s) = 160 s of unbounded blocking -- the exact defect the P1 review
+/// flagged on `rest_budget_remaining`.
+pub const REST_BUDGET_PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Deadline-bounded probe for the REST (core) bucket's remaining call count.
+/// See `RestBudgetProbe` for the outcome contract.
+///
+/// IMPORTANT: this probe is quota-EXEMPT only from GitHub's PRIMARY rate
+/// limit (the `/rate_limit` endpoint itself is documented to not count
+/// against the bucket it measures). It is NOT exempt from SECONDARY rate
+/// limits -- a sustained burst of probes can itself trigger a secondary
+/// response, which `run_gh_with_backoff` would happily retry past a 160 s
+/// ceiling without `deadline`. Threading `deadline` here means the probe
+/// either returns a `Known` count or bails to `Unknown` well before it can
+/// starve the calling serve-loop tick's other reads.
+///
+/// Implementation note: we use `run_gh_with_backoff_until_capped` (not the
+/// plain `run_gh_with_backoff_until`) precisely because the plain variant
+/// only bounds inter-attempt sleeps -- a single hung `gh` child (e.g.
+/// secondary-limit stall, network/DNS hang) would otherwise run to its
+/// 45 s `GH_TIMEOUT` ceiling INSIDE the backoff loop, blowing past the
+/// 5 s probe deadline. The `_capped` variant caps each attempt's child at
+/// `min(GH_TIMEOUT, deadline - now)` so the deadline gate actually
+/// bounds every code path the probe can take, including a stalled
+/// child -- the "a budget only bounds calls that check it" gap the
+/// 2026-07-08 serve-loop starvation fix closed.
+pub fn rest_budget_remaining_until(deadline: Instant) -> RestBudgetProbe {
+    let out = match run_gh_with_backoff_until_capped(deadline, || {
+        let mut cmd = gh_command();
+        cmd.args(["api", "rate_limit"]);
+        cmd
+    }) {
+        Ok(out) => out,
+        Err(err) => {
+            // Probe itself failed to even spawn `gh`, or the backoff loop
+            // bailed on a non-retryable classification. Treat as Unknown so
+            // the caller can avoid additional read-heavy work.
+            eprintln!(
+                "github::rest_budget_remaining_until: probe exec failed, returning Unknown: {err}"
+            );
+            return RestBudgetProbe::Unknown;
+        }
+    };
+    if !out.status.success() {
+        // gh exited non-zero -- secondary-limit response, auth failure, etc.
+        // We deliberately do NOT try to parse the stderr for a Retry-After
+        // here: the budget check is meant to be cheap, and a non-zero exit
+        // is the same signal "we can't trust the probe right now" --
+        // returning Unknown lets the caller defer optional reads safely.
+        log_gh_response("gh api rate_limit", &out);
+        return RestBudgetProbe::Unknown;
+    }
+    match parse_rest_budget_remaining(&out.stdout) {
+        Ok(remaining) => RestBudgetProbe::Known(remaining),
+        Err(err) => {
+            eprintln!(
+                "github::rest_budget_remaining_until: failed to parse probe body, \
+                 returning Unknown: {err}"
+            );
+            RestBudgetProbe::Unknown
+        }
+    }
+}
+
+/// Backwards-compatible wrapper around `rest_budget_remaining_until` for
+/// callers that don't carry a deadline (e.g. one-off tests). Uses a 5 s
+/// probe deadline -- same as the production `REST_BUDGET_PROBE_DEADGET`.
+/// New code should prefer `rest_budget_remaining_until` with an explicit
+/// deadline derived from the calling tick's `loop_start`.
+#[allow(dead_code)] // public API for external callers; production uses _until
+pub fn rest_budget_remaining() -> Result<u32> {
+    let probe = rest_budget_remaining_until(Instant::now() + REST_BUDGET_PROBE_DEADLINE);
+    match probe {
+        RestBudgetProbe::Known(n) => Ok(n),
+        RestBudgetProbe::Unknown => bail!(
+            "rest_budget_remaining: probe returned Unknown (deadline overrun or transient gh error); \
+             caller should use rest_budget_remaining_until and handle Unknown conservatively"
+        ),
+    }
+}
+
 pub(crate) fn api_post_empty(path: &str, fields: &[(&str, &str)]) -> Result<()> {
     let out = run_gh_with_backoff(|| {
         let mut cmd = gh_command();
@@ -1850,6 +1987,189 @@ github.com
         // Sanity: confirm the parsing logic we wrote above would treat this
         // stdout as success. We don't exec `gh` here — just validate the
         // string search the function depends on.
+    }
+
+    #[test]
+    fn rate_limit_response_parses_core_remaining() {
+        // Real `gh api rate_limit` shape (trimmed to the fields we read).
+        let body = br#"{
+            "resources": {
+                "core": {"limit": 5000, "used": 4750, "remaining": 250, "reset": 1700000000},
+                "search": {"limit": 30, "used": 0, "remaining": 30, "reset": 1700000000},
+                "graphql": {"limit": 5000, "used": 0, "remaining": 5000, "reset": 1700000000}
+            },
+            "rate": {"limit": 5000, "used": 4750, "remaining": 250, "reset": 1700000000}
+        }"#;
+        let remaining = parse_rest_budget_remaining(body).unwrap();
+        assert_eq!(remaining, 250);
+    }
+
+    #[test]
+    fn rate_limit_response_rejects_malformed_json() {
+        let err = parse_rest_budget_remaining(b"not json").unwrap_err();
+        assert!(
+            err.to_string().contains("parse `gh api rate_limit`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rest_budget_remaining_execs_gh_api_rate_limit_and_parses_core() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rate-limit-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo '{"resources":{"core":{"limit":5000,"used":4999,"remaining":1,"reset":0}}}'
+exit 0
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let remaining = rest_budget_remaining().unwrap();
+        assert_eq!(remaining, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// TDD evidence — bead ez-gh-actions-4jv P1 follow-up: the budget probe
+    /// MUST return Unknown quickly when `gh api rate_limit` itself blocks past the
+    /// caller's deadline (the exact defect the P1 review flagged on the
+    /// prior unbounded `rest_budget_remaining`). We simulate the failure
+    /// with a fake `gh` that sleeps 30 s (far past the 5 s probe deadline),
+    /// then assert:
+    ///   1. `rest_budget_remaining_until` returns within the deadline.
+    ///   2. It returns `RestBudgetProbe::Unknown` (NOT
+    ///      `Known(0)` or any other "below floor" signal that would
+    ///      starve the caller).
+    ///   3. The write path / `generate_jitconfig` is structurally
+    ///      unaffected (this is a github.rs test -- nothing in
+    ///      `rest_budget_remaining_until` can reach the write path).
+    #[test]
+    fn rest_budget_remaining_until_returns_unknown_when_probe_overruns_deadline() {
+        // The fake `gh` sleeps 30 s on every call. With a 1 s deadline,
+        // the backoff loop's child-gh timeout (GH_TIMEOUT=45s) won't
+        // trip first -- the deadline gate in `run_gh_with_backoff_core`
+        // is what bails. Sleep 30 is well past 1 s and within the 45 s
+        // GH_TIMEOUT, so we're testing the deadline path specifically
+        // (not the GH_TIMEOUT path). Either way the probe must fail
+        // open and return within ~1 s of wall time.
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rate-limit-deadline-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+
+        // 1 s deadline -- the fake `gh` sleeps 30 s, so the probe MUST
+        // bail out within ~1 s of wall time.
+        let start = std::time::Instant::now();
+        let probe = rest_budget_remaining_until(start + Duration::from_secs(1));
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            probe,
+            RestBudgetProbe::Unknown,
+            "an overrun probe must return Unknown rather than inventing a core-budget count"
+        );
+        // We give ourselves 5x the deadline as the upper bound: the
+        // backoff loop runs a single attempt with a 45 s child timeout,
+        // so on a fast Linux box this should comfortably return in <2 s.
+        // We use a generous 5 s ceiling only to absorb CI noise; the
+        // 30 s sleep guarantees we are NOT measuring the natural
+        // completion of the fake gh.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "rest_budget_remaining_until must bail out within the caller's deadline (1s); \
+             observed {elapsed:?} -- the 30s fake-gh sleep means any value >=5s proves the \
+             deadline gate is not firing"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Companion: a non-zero exit (e.g. secondary-limit 403) must also
+    /// yield `Unknown`, not `Known(0)` and not `Err`. Mirrors the prior
+    /// `rest_budget_check_error_does_not_defer` invariant, restated in
+    /// terms of `RestBudgetProbe`.
+    #[test]
+    fn rest_budget_remaining_until_returns_unknown_on_secondary_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-rate-limit-secondary-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-gh");
+        std::fs::write(
+            &script,
+            // Mimic the secondary-limit shape observed in production
+            // logs: HTTP 403 with a Retry-After header. The prior
+            // unbounded `rest_budget_remaining` would have slept here
+            // for `Retry-After` (or 60s default) and then retried up
+            // to GH_MAX_RETRIES times -- the exact 160s-stall defect
+            // the P1 review flagged.
+            "#!/bin/sh\necho 'gh: API rate limit exceeded (HTTP 403)' >&2\necho 'Retry-After: 60' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let _guard = with_gh_exe(script.to_str().unwrap());
+
+        // Generous deadline -- the backoff loop may try once, classify
+        // Retry-After, and bail because the deadline would be exhausted.
+        // We want Unknown, NOT an error or a panic.
+        let start = std::time::Instant::now();
+        let probe = rest_budget_remaining_until(start + Duration::from_secs(2));
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            probe,
+            RestBudgetProbe::Unknown,
+            "a secondary-limit response must yield Unknown, not be parsed as \
+             a real budget count"
+        );
+        // Backoff base = 2s, max 32s; with a 2s deadline the loop
+        // should bail on the first sleep attempt. 5s ceiling is
+        // generous enough to absorb CI noise but well below the
+        // 60s+ Retry-After floor that the prior unbounded probe
+        // would have slept through.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "secondary-limit probe must bail within the deadline; observed {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

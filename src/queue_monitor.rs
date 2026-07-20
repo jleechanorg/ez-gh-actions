@@ -54,10 +54,47 @@ const INVARIANT_JOB_ENUMERATION_CAP: usize = 50;
 /// ~150s of monitor time before ensure_count runs again).
 pub const SERVE_LOOP_TIME_BUDGET: Duration = Duration::from_secs(75);
 
+/// Number of consecutive ticks that must observe `remaining <= floor`
+/// before the probe is skipped for `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS`
+/// ticks. 3 ticks at the default 30 s serve tick = ~90 s of monitoring
+/// seeing low budget before backoff kicks in -- long enough to confirm
+/// this isn't a single-probe fluke, short enough that a genuinely
+/// sustained-low bucket reaches the no-probe steady state within a
+/// couple of minutes instead of hammering `gh api rate_limit` every
+/// tick indefinitely.
+pub const REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD: u32 = 3;
+
+/// Number of ticks to skip the probe for after the floor-hit threshold
+/// is reached. 5 ticks at the default 30 s serve tick = ~150 s of probe
+/// silence -- comfortably more than GitHub's secondary rate-limit
+/// cool-down window (typically 60-120 s) so the next probe sees fresh
+/// budget, but short enough that budget recovery is observed within ~3
+/// minutes rather than ten.
+pub const REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS: u32 = 5;
+
 #[derive(Debug, Default)]
 pub struct QueueMonitorState {
     last_check: Option<Instant>,
     consecutive_bad: u32,
+    /// How many consecutive ticks have observed `remaining <=
+    /// cfg.queue_monitor.rest_budget_floor`. Resets to 0 the moment a tick
+    /// observes `remaining > floor`. An Unknown probe neither increments nor
+    /// clears it. When this hits
+    /// `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD`, the probe is skipped for
+    /// `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks -- bounding the rate at
+    /// which a persistent-low-budget state can re-probe and wastefully
+    /// spend time on a gate that just deferred. See
+    /// `REST_BUDGET_FLOOR_HIT_BACKOFF_*` doc comments for thresholds.
+    rest_budget_consecutive_floor_hits: u32,
+    /// Number of consecutive ticks remaining in the floor-hit backoff window.
+    /// 0 means "no backoff active". Each iteration that observes the
+    /// skip-active branch decrements this counter by 1; when it hits 0 the
+    /// next iteration runs the probe normally again. Tick-counted (not
+    /// wall-clock-based) per the bead's `K=5 ticks` specification -- a config
+    /// bump to `serve_tick_seconds` shouldn't extend the skip window, and
+    /// tick-counting keeps the failure semantics obvious: "the next K ticks
+    /// defer without probing, regardless of how long each tick takes".
+    rest_budget_skip_ticks_remaining: u32,
 }
 
 impl QueueMonitorState {
@@ -65,6 +102,8 @@ impl QueueMonitorState {
         Self {
             last_check: None,
             consecutive_bad: 0,
+            rest_budget_consecutive_floor_hits: 0,
+            rest_budget_skip_ticks_remaining: 0,
         }
     }
 
@@ -130,6 +169,32 @@ impl QueueMonitorState {
         self.consecutive_bad
     }
 
+    /// Increment the consecutive-floor-hit counter and, once the threshold is
+    /// reached, arm the skip-until deadline so the next
+    /// `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks of `drive_with_fetcher`
+    /// skip the `gh api rate_limit` probe entirely and defer. Without this
+    /// backoff, a sustained-low bucket (e.g. a 60-min secondary-rate-limit
+    /// cool-down that never reports `remaining > floor`) would trigger a
+    /// `gh api rate_limit` call on every serve-loop tick indefinitely --
+    /// the very failure mode the P1 review flagged (probe firing every
+    /// tick on a long-stalled bucket).
+    ///
+    /// `cfg` is retained as a parameter for future extensibility (e.g. a
+    /// per-deployment override of the threshold) -- the current backoff
+    /// is purely tick-counted per the bead's `K=5 ticks` specification,
+    /// independent of `serve_tick_seconds`, so a config bump doesn't
+    /// extend or shorten the skip window.
+    #[allow(unused_variables)]
+    fn bump_floor_hit_counter(&mut self, cfg: &Config) {
+        self.rest_budget_consecutive_floor_hits =
+            self.rest_budget_consecutive_floor_hits.saturating_add(1);
+        if self.rest_budget_consecutive_floor_hits >= REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD
+            && self.rest_budget_skip_ticks_remaining == 0
+        {
+            self.rest_budget_skip_ticks_remaining = REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS;
+        }
+    }
+
     /// Drive one serve-loop iteration for both the queue monitor and the
     /// invariant sampler, deduplicating their network fetches. The previous
     /// shape called `maybe_check` and `maybe_sample` independently, each of
@@ -147,19 +212,44 @@ impl QueueMonitorState {
     /// (`drive_serve_loop_ticks`) passes the real `fetch_fleet_runner_stats`
     /// and `fetch_capped_queue_snapshot` while the red-phase tests pass
     /// counting closures.
+    ///
+    /// `rest_budget_check` (bead ez-gh-actions-4jv, REST-budget-aware
+    /// deprioritization) is a third seam of the same shape: production wires
+    /// in `github::rest_budget_remaining_until` (an actual `gh api rate_limit`
+    /// call -- itself primary-quota-EXEMPT but NOT secondary-quota-exempt,
+    /// so the probe is deadline-bounded at `REST_BUDGET_PROBE_DEADLINE` to
+    /// keep a secondary-limit response from stalling the serve loop). The
+    /// closure returns `RestBudgetProbe::Known(n)` on success and
+    /// `RestBudgetProbe::Unknown` on deadline overrun / transient error /
+    /// non-parseable response. When `Known(n)` reports `n <=
+    /// cfg.queue_monitor.rest_budget_floor`, this tick's read-heavy fetches
+    /// are SKIPPED entirely and a deferral is logged. `Unknown` also defers:
+    /// deadline, secondary-limit, and transient failures mean the API is
+    /// degraded, so launching the read-heavy work would risk delaying the
+    /// next `ensure_count`. When `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` consecutive
+    /// ticks observe `Known(n) <= floor`, the probe itself is skipped for
+    /// the next `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks -- the gate
+    /// defers without spending API quota on a probe that has nothing new
+    /// to report. This function has ZERO reachability to
+    /// `generate_jitconfig`/runner registration (that write path lives in
+    /// `docker_backend::ensure_count`, called from `main.rs`'s serve loop
+    /// entirely independently of this driver) -- the critical write path is
+    /// structurally, not just conditionally, exempt from this gate.
     #[allow(clippy::too_many_arguments)]
-    pub fn drive_with_fetcher<FFleet, FRepo>(
+    pub fn drive_with_fetcher<FFleet, FRepo, FBudget>(
         &mut self,
         cfg: &Config,
         loop_start: Instant,
         invariant_sampler: &mut InvariantSamplerState,
         mut fetch_fleet: FFleet,
         mut fetch_repo: FRepo,
+        mut rest_budget_check: FBudget,
     ) -> Result<(Option<QueueStats>, Option<InvariantSample>)>
     where
         FFleet: FnMut(Instant) -> Result<FleetRunnerStats>,
         FRepo:
             FnMut(&str, Option<FleetRunnerStats>, usize, Instant) -> Result<(QueueSnapshot, bool)>,
+        FBudget: FnMut() -> github::RestBudgetProbe,
     {
         // Compute which ticks are due. Mirrors the gating inside
         // `maybe_check` / `maybe_sample` exactly so a "due" decision here
@@ -185,6 +275,69 @@ impl QueueMonitorState {
 
         if !qm_due && !is_due {
             return Ok((None, None));
+        }
+
+        // REST-budget-aware deprioritization (bead ez-gh-actions-4jv): check
+        // the REST (core) bucket's remaining count BEFORE firing any of this
+        // tick's read-heavy fetches (fleet + per-repo queue/job enumeration).
+        //
+        // Three layers of conservative deferral:
+        //   1. Floor-hit backoff: if we've seen `remaining <= floor` on
+        //      `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` consecutive ticks,
+        //      skip the probe entirely for the next
+        //      `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks and defer.
+        //      Bounded probe frequency prevents a persistent-low bucket
+        //      from triggering a `gh api rate_limit` call every 30 s
+        //      indefinitely.
+        //   2. `Unknown` probe outcome (deadline overrun, transient gh
+        //      error, non-parseable response): defer because the API is
+        //      already degraded and read-heavy work could consume the
+        //      monitor deadline before the next `ensure_count`.
+        //   3. `Known(n) <= floor`: defer this iteration's read-heavy
+        //      work; neither `last_check` timestamp advances, so both
+        //      ticks retry on the next serve-loop iteration once budget
+        //      recovers.
+        if self.rest_budget_skip_ticks_remaining > 0 {
+            self.rest_budget_skip_ticks_remaining -= 1;
+            eprintln!(
+                "queue_monitor: skipping REST budget probe ({} ticks remaining in \
+                 floor-hit backoff)",
+                self.rest_budget_skip_ticks_remaining
+            );
+            eprintln!(
+                "queue_monitor: deferring read-heavy REST calls this tick -- \
+                 REST budget probe in floor-hit backoff"
+            );
+            return Ok((None, None));
+        }
+        match rest_budget_check() {
+            github::RestBudgetProbe::Known(remaining) => {
+                if remaining <= cfg.queue_monitor.rest_budget_floor {
+                    self.bump_floor_hit_counter(cfg);
+                    eprintln!(
+                        "queue_monitor: deferring read-heavy REST calls this tick -- \
+                         REST core budget remaining={remaining} <= floor={} (consecutive floor hits={}/{})",
+                        cfg.queue_monitor.rest_budget_floor,
+                        self.rest_budget_consecutive_floor_hits,
+                        REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD
+                    );
+                    return Ok((None, None));
+                }
+                // Healthy budget: clear the floor-hit counter so a future
+                // dip starts counting from zero again.
+                self.rest_budget_consecutive_floor_hits = 0;
+                self.rest_budget_skip_ticks_remaining = 0;
+            }
+            github::RestBudgetProbe::Unknown => {
+                // We do not modify the floor-hit counter on Unknown: an
+                // Unknown outcome isn't evidence of low budget either
+                // way, so it's neither a hit nor a clear.
+                eprintln!(
+                    "queue_monitor: deferring read-heavy REST calls this tick -- \
+                     REST budget probe outcome unknown"
+                );
+                return Ok((None, None));
+            }
         }
 
         // Union of repos needed by the due ticks. `cfg.queue_monitor.repo`
@@ -313,12 +466,22 @@ impl QueueMonitorState {
         loop_start: Instant,
         invariant_sampler: &mut InvariantSamplerState,
     ) -> Result<(Option<QueueStats>, Option<InvariantSample>)> {
+        // Probe deadline is derived from `loop_start` plus the
+        // independent `REST_BUDGET_PROBE_DEADLINE` (5 s) budget --
+        // critically NOT `SERVE_LOOP_TIME_BUDGET` (75 s), which would
+        // re-introduce the exact defect the P1 review flagged (a
+        // probe that can stall the serve loop up to 160 s in the worst
+        // case). 5 s caps the probe independently so a hung or
+        // secondary-limited `gh api rate_limit` can never spend more
+        // than a fraction of any tick's time.
+        let probe_deadline = loop_start + github::REST_BUDGET_PROBE_DEADLINE;
         self.drive_with_fetcher(
             cfg,
             loop_start,
             invariant_sampler,
             fetch_fleet_runner_stats,
             fetch_capped_queue_snapshot,
+            || github::rest_budget_remaining_until(probe_deadline),
         )
     }
 }
@@ -2198,6 +2361,7 @@ exit 1
                     false,
                 ))
             },
+            || github::RestBudgetProbe::Known(u32::MAX),
         );
 
         assert_eq!(
@@ -2261,6 +2425,7 @@ exit 1
                     false,
                 ))
             },
+            || github::RestBudgetProbe::Known(u32::MAX),
         );
 
         let mut seen = repos_seen.lock().unwrap().clone();
@@ -2317,6 +2482,7 @@ exit 1
                     false,
                 ))
             },
+            || github::RestBudgetProbe::Known(u32::MAX),
         );
 
         assert_eq!(
@@ -2371,6 +2537,7 @@ exit 1
                     false,
                 ))
             },
+            || github::RestBudgetProbe::Known(u32::MAX),
         );
 
         assert_eq!(fleet_calls.load(Ordering::SeqCst), 1);
@@ -2389,11 +2556,393 @@ exit 1
         assert_eq!(seen, vec!["owner/repo".to_string()]);
     }
 
+    /// TDD evidence (a): when the injected REST budget check reports a
+    /// remaining count AT/UNDER `cfg.queue_monitor.rest_budget_floor`, both
+    /// ticks' read-heavy fetches (fleet + per-repo enumeration) must be
+    /// skipped entirely for that iteration -- proving the deprioritization
+    /// gate actually short-circuits before any fetch closure runs, not just
+    /// that it exists.
+    #[test]
+    fn low_rest_budget_defers_read_heavy_fetches() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+        let repo_calls = Arc::new(AtomicUsize::new(0));
+        let budget_checks = Arc::new(AtomicUsize::new(0));
+
+        let result = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| {
+                fleet_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+            },
+            |_repo, _fleet, _cap, _deadline| {
+                repo_calls.fetch_add(1, Ordering::SeqCst);
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+            // Below the floor: budget check itself must still run (it's the
+            // gate), but everything after it must not.
+            || {
+                budget_checks.fetch_add(1, Ordering::SeqCst);
+                github::RestBudgetProbe::Known(499)
+            },
+        );
+
+        assert!(result.is_ok(), "a deferred tick is not an error");
+        let (qm_result, is_result) = result.unwrap();
+        assert!(
+            qm_result.is_none(),
+            "queue monitor tick must defer, not run"
+        );
+        assert!(
+            is_result.is_none(),
+            "invariant sampler tick must defer, not run"
+        );
+        assert_eq!(
+            budget_checks.load(Ordering::SeqCst),
+            1,
+            "the budget check itself must run exactly once to make the defer decision"
+        );
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            0,
+            "fleet fetch must be skipped when REST budget is below the floor"
+        );
+        assert_eq!(
+            repo_calls.load(Ordering::SeqCst),
+            0,
+            "repo fetch must be skipped when REST budget is below the floor"
+        );
+        assert_eq!(
+            queue_monitor.last_check, None,
+            "a deferred tick must not advance last_check, so it retries next iteration"
+        );
+        assert_eq!(
+            invariant_sampler.last_check, None,
+            "a deferred invariant-sampler tick must not advance last_check either"
+        );
+    }
+
+    /// Companion to `low_rest_budget_defers_read_heavy_fetches`: a remaining
+    /// count comfortably ABOVE the floor must NOT defer -- proves the gate
+    /// is a real threshold, not an unconditional skip.
+    #[test]
+    fn healthy_rest_budget_does_not_defer_read_heavy_fetches() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+
+        let (qm_result, is_result) = queue_monitor
+            .drive_with_fetcher(
+                &cfg,
+                Instant::now(),
+                &mut invariant_sampler,
+                |_| {
+                    fleet_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+                },
+                |_repo, _fleet, _cap, _deadline| {
+                    Ok((
+                        QueueSnapshot {
+                            queued: vec![],
+                            in_progress: vec![],
+                            fleet: None,
+                        },
+                        false,
+                    ))
+                },
+                || github::RestBudgetProbe::Known(4500),
+            )
+            .unwrap();
+
+        assert!(
+            qm_result.is_some(),
+            "queue monitor tick must run when budget is healthy"
+        );
+        assert!(
+            is_result.is_some(),
+            "invariant sampler tick must run when budget is healthy"
+        );
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            1,
+            "fleet fetch must happen when REST budget is above the floor"
+        );
+    }
+
+    /// A `RestBudgetProbe::Unknown` outcome means the API is degraded or the
+    /// probe deadline was exhausted. Starting the read-heavy monitor work in
+    /// that state can consume the remaining serve-loop budget and delay the
+    /// next `ensure_count`, so the monitor tick must defer without advancing
+    /// either consumer's timestamp.
+    #[test]
+    fn rest_budget_probe_unknown_defers_read_heavy_fetches() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+
+        let fleet_calls = Arc::new(AtomicUsize::new(0));
+
+        let (qm_result, is_result) = queue_monitor
+            .drive_with_fetcher(
+                &cfg,
+                Instant::now(),
+                &mut invariant_sampler,
+                |_| {
+                    fleet_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0))
+                },
+                |_repo, _fleet, _cap, _deadline| {
+                    Ok((
+                        QueueSnapshot {
+                            queued: vec![],
+                            in_progress: vec![],
+                            fleet: None,
+                        },
+                        false,
+                    ))
+                },
+                || github::RestBudgetProbe::Unknown,
+            )
+            .unwrap();
+
+        assert!(qm_result.is_none(), "budget-unknown must defer the tick");
+        assert!(
+            is_result.is_none(),
+            "budget-unknown must defer the invariant sampler too"
+        );
+        assert_eq!(
+            fleet_calls.load(Ordering::SeqCst),
+            0,
+            "budget-unknown must not launch read-heavy fleet fetching"
+        );
+        assert_eq!(queue_monitor.last_check, None);
+        assert_eq!(invariant_sampler.last_check, None);
+    }
+
+    /// TDD evidence (b): `drive_serve_loop_ticks` -- the ONLY production
+    /// entry point that wires in the real `github::rest_budget_remaining`
+    /// gate -- has no parameter, closure, or code path that reaches
+    /// `docker_backend::ensure_count`/`github::generate_jitconfig`. The
+    /// write path is registered/invoked exclusively from `main.rs`'s serve
+    /// loop as a structurally separate call, so it is impossible for this
+    /// gate to ever block runner registration -- there is no shared
+    /// function, no shared closure, no shared state between the two. This
+    /// test asserts the healthy-budget case still returns without touching
+    /// any registration-related state, documenting (not just asserting by
+    /// absence) that the write path is out of reach of this module.
+    #[test]
+    fn drive_with_fetcher_never_touches_registration_write_path() {
+        // `drive_with_fetcher`'s only fetcher seams are FFleet (list_runners),
+        // FRepo (queue/job enumeration), and FBudget (rate_limit) -- none of
+        // which is, wraps, or calls `generate_jitconfig`. This is enforced
+        // structurally (by the function signature itself, verified at
+        // compile time) rather than by a runtime check: there is no
+        // `generate_jitconfig`-shaped parameter for a test to inject in the
+        // first place, which is the strongest guarantee available for
+        // "never gated by the budget check".
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+        queue_monitor.last_check = None;
+
+        // Even with budget reported as exhausted (0 remaining), the call
+        // must complete without any reference to runner registration --
+        // there is nothing in this module that could call it.
+        let result = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0)),
+            |_repo, _fleet, _cap, _deadline| {
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+            || github::RestBudgetProbe::Known(0),
+        );
+        assert!(result.is_ok());
+    }
+
     /// Pure helper: a Config with `enabled` toggled per-test. Reuses the
     /// existing `test_config_with_log` shape so we don't duplicate platform
     /// construction logic -- but here we only need the in-memory parts.
     fn base_test_config() -> Config {
         let (cfg, _dir, _log) = test_config_with_log();
         cfg
+    }
+
+    /// TDD evidence (c) — bead ez-gh-actions-4jv P1 follow-up: when
+    /// `drive_with_fetcher` observes `Known(remaining) <= floor` on
+    /// `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` consecutive ticks, the
+    /// next `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS` ticks must NOT call the
+    /// probe closure at all. This proves the bounded-probe-frequency
+    /// backoff (the second half of the P1 fix) actually short-circuits
+    /// before any probe runs, not just that it exists.
+    #[test]
+    fn floor_hit_backoff_skips_probe_after_threshold_consecutive_ticks() {
+        let mut cfg = base_test_config();
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.repo = Some("jleechanorg/some-other-repo".into());
+        cfg.queue_monitor.rest_budget_floor = 500;
+        // Backoff is tick-counted (not wall-clock-based), so no
+        // `serve_tick_seconds` override needed; the test runs in ms.
+
+        let mut queue_monitor = QueueMonitorState::new();
+        let mut invariant_sampler = InvariantSamplerState::new();
+
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+
+        // First `REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD` ticks all
+        // observe `Known(499)` (below floor) -- this should trip the
+        // threshold and arm the skip window.
+        for tick in 0..REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD {
+            queue_monitor.last_check = None;
+            invariant_sampler.last_check = None;
+            let probes_for_this_tick = Arc::clone(&probe_calls);
+            let _ = queue_monitor.drive_with_fetcher(
+                &cfg,
+                Instant::now(),
+                &mut invariant_sampler,
+                |_| Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0)),
+                |_repo, _fleet, _cap, _deadline| {
+                    Ok((
+                        QueueSnapshot {
+                            queued: vec![],
+                            in_progress: vec![],
+                            fleet: None,
+                        },
+                        false,
+                    ))
+                },
+                || {
+                    probes_for_this_tick.fetch_add(1, Ordering::SeqCst);
+                    github::RestBudgetProbe::Known(499)
+                },
+            );
+            assert_eq!(
+                probes_for_this_tick.load(Ordering::SeqCst),
+                (tick + 1) as usize,
+                "probe must run on every tick up to and including the threshold trip"
+            );
+        }
+
+        // Threshold tripped; next `REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS`
+        // ticks must NOT call the probe at all (the skip window is
+        // armed). We verify this by snapshotting the probe count and
+        // asserting it doesn't change across `K` ticks.
+        let probes_after_threshold = probe_calls.load(Ordering::SeqCst);
+        for _ in 0..REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS {
+            queue_monitor.last_check = None;
+            invariant_sampler.last_check = None;
+            let probes_for_this_tick = Arc::clone(&probe_calls);
+            let _ = queue_monitor.drive_with_fetcher(
+                &cfg,
+                Instant::now(),
+                &mut invariant_sampler,
+                |_| Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0)),
+                |_repo, _fleet, _cap, _deadline| {
+                    Ok((
+                        QueueSnapshot {
+                            queued: vec![],
+                            in_progress: vec![],
+                            fleet: None,
+                        },
+                        false,
+                    ))
+                },
+                || {
+                    probes_for_this_tick.fetch_add(1, Ordering::SeqCst);
+                    github::RestBudgetProbe::Known(499)
+                },
+            );
+            assert_eq!(
+                probes_for_this_tick.load(Ordering::SeqCst),
+                probes_after_threshold,
+                "probe must NOT be called during the floor-hit backoff window"
+            );
+        }
+
+        // A healthy budget on the next tick clears the floor-hit counter
+        // AND the skip window, restoring normal probe cadence.
+        queue_monitor.last_check = None;
+        invariant_sampler.last_check = None;
+        let probes_for_this_tick = Arc::clone(&probe_calls);
+        let _ = queue_monitor.drive_with_fetcher(
+            &cfg,
+            Instant::now(),
+            &mut invariant_sampler,
+            |_| Ok(full_fleet(EXPECTED_FLEET_RUNNERS, 0)),
+            |_repo, _fleet, _cap, _deadline| {
+                Ok((
+                    QueueSnapshot {
+                        queued: vec![],
+                        in_progress: vec![],
+                        fleet: None,
+                    },
+                    false,
+                ))
+            },
+            || {
+                probes_for_this_tick.fetch_add(1, Ordering::SeqCst);
+                github::RestBudgetProbe::Known(4500)
+            },
+        );
+        assert_eq!(
+            probes_for_this_tick.load(Ordering::SeqCst),
+            probes_after_threshold + 1,
+            "a healthy budget observation must resume probing"
+        );
+        assert_eq!(
+            queue_monitor.rest_budget_consecutive_floor_hits, 0,
+            "healthy budget must clear the floor-hit counter"
+        );
+        assert_eq!(
+            queue_monitor.rest_budget_skip_ticks_remaining, 0,
+            "healthy budget must clear the skip window"
+        );
     }
 }

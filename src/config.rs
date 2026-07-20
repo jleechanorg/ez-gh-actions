@@ -90,6 +90,18 @@ pub struct QueueMonitorConfig {
     /// Require this many consecutive bad samples before alerting.
     #[serde(default = "default_queue_consecutive_alert_threshold")]
     pub consecutive_alert_threshold: u32,
+    /// REST-budget-aware deprioritization floor (bead ez-gh-actions-4jv):
+    /// when `gh api rate_limit`'s `resources.core.remaining` count drops
+    /// below this value, `drive_with_fetcher`'s read-heavy fetches (queue
+    /// snapshot enumeration, invariant sampler polling) are SKIPPED for that
+    /// tick instead of firing, leaving headroom in the REST bucket for the
+    /// critical write path (`generate_jitconfig`/runner registration, in
+    /// `docker_backend::ensure_count`, which is NEVER gated by this check --
+    /// it runs on its own path in `main.rs`, entirely independent of
+    /// `drive_with_fetcher`). Default 500 leaves ~10% of the 5000/hr REST
+    /// bucket as headroom.
+    #[serde(default = "default_queue_rest_budget_floor")]
+    pub rest_budget_floor: u32,
 }
 
 impl Default for QueueMonitorConfig {
@@ -101,6 +113,7 @@ impl Default for QueueMonitorConfig {
             check_interval_seconds: default_queue_check_interval_seconds(),
             stale_hours: default_queue_stale_hours(),
             consecutive_alert_threshold: default_queue_consecutive_alert_threshold(),
+            rest_budget_floor: default_queue_rest_budget_floor(),
         }
     }
 }
@@ -391,6 +404,12 @@ fn maximum_queue_stale_hours() -> u64 {
 
 fn default_queue_consecutive_alert_threshold() -> u32 {
     2
+}
+
+/// Default REST-budget-aware deprioritization floor -- see
+/// `QueueMonitorConfig::rest_budget_floor`'s doc comment for rationale.
+fn default_queue_rest_budget_floor() -> u32 {
+    500
 }
 
 fn default_canary_workflow() -> String {
