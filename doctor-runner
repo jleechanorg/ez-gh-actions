@@ -485,7 +485,16 @@ LOAD_1MIN=$(printf '%s' "$LOAD_LINE" | sed -nE 's/.*load averages?:[[:space:]]*(
 info "uptime: ${LOAD_LINE:-unavailable}"
 if [ -n "$LOAD_1MIN" ] && [ "$CORES" -gt 0 ] 2>/dev/null; then
   THRESHOLD=$((CORES * 2))
-  if awk -v load="$LOAD_1MIN" -v threshold="$THRESHOLD" 'BEGIN { exit !(load > threshold) }'; then
+  # NOTE: the awk variable here must NOT be named "load" -- gawk (the
+  # default /usr/bin/awk on Debian/Ubuntu, including jeff-ubuntu and
+  # GitHub-hosted ubuntu-latest runners) reserves "load" as a builtin
+  # tied to its @load dynamic-extension mechanism and fails closed with
+  # "awk: fatal: cannot use gawk builtin `load' as variable name" --
+  # confirmed live in CI (bead ez-gh-actions-r8od) wiring
+  # tests/doctor_runner_host_pressure_test.sh into ci.yml. BSD awk (macOS)
+  # has no such reservation, so this was silently broken on any real
+  # gawk host despite passing locally on a Mac.
+  if awk -v cur_load="$LOAD_1MIN" -v threshold="$THRESHOLD" 'BEGIN { exit !(cur_load > threshold) }'; then
     warn "1-min load ($LOAD_1MIN) exceeds 2x core count ($CORES cores, threshold $THRESHOLD) -- host is oversubscribed; expect slower docker CLI calls and respawns, not necessarily an ezgha bug"
   else
     ok "1-min load ($LOAD_1MIN) within 2x core count ($CORES cores)"

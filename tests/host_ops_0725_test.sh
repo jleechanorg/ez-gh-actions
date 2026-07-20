@@ -160,11 +160,20 @@ EOF
   # First poll only advances the consecutive-CRIT streak; second poll
   # crosses CRIT_CONSECUTIVE=2 and evaluates (DRY_RUN=1, so it logs the
   # target instead of signaling it).
+  #
+  # PSI_SHED_CHAIN is required here (added mandatory-input validation in
+  # commits 689c4a4/6934878 after this test was originally written in
+  # b3bbe1c) -- without it the watcher fails closed with "PSI_SHED_CHAIN
+  # is empty" before ever reaching the SIGTERM-target logic this test is
+  # actually exercising. Use the canonical default chain so the watcher's
+  # crit-consecutive/DRY_RUN behavior under test is unaffected.
   PATH="${STUB_BIN}:${PATH}" PSI_FILE="${FAKE_PSI}" STATE_DIR="${STATE_DIR}" \
     WARN_THRESHOLD=10 CRIT_THRESHOLD=40 CRIT_CONSECUTIVE=2 DRY_RUN=1 \
+    PSI_SHED_CHAIN="drain,reclaim,verify,escalate" \
     bash "${WATCHER}" >>"${STATE_DIR}/run1.log" 2>&1 || true
   PATH="${STUB_BIN}:${PATH}" PSI_FILE="${FAKE_PSI}" STATE_DIR="${STATE_DIR}" \
     WARN_THRESHOLD=10 CRIT_THRESHOLD=40 CRIT_CONSECUTIVE=2 DRY_RUN=1 \
+    PSI_SHED_CHAIN="drain,reclaim,verify,escalate" \
     bash "${WATCHER}" >>"${STATE_DIR}/run2.log" 2>&1 || true
 
   WATCHER_LOG="${STATE_DIR}/psi-oom-watcher.log"
