@@ -25,7 +25,11 @@ jobs:
         if: github.event_name == 'pull_request_target'
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          # Use base.ref (live tip of the trusted base branch) instead of base.sha,
+          # which is frozen at PR-creation time and can predate files this validator
+          # needs (e.g. .githooks/commit-msg landed on main after the PR was opened,
+          # causing exit 127 "No such file or directory" on PRs like #91).
+          ref: ${{ github.event.pull_request.base.ref }}
           persist-credentials: false
       - name: Validate squash-merge provenance prefix
         if: github.event_name == 'pull_request_target'
