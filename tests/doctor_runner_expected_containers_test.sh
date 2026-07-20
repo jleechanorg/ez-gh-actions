@@ -27,8 +27,8 @@
 # was deleted — it flapped [BAD] on a healthy fleet under normal ephemeral
 # churn (container briefly missing from one `docker ps` sample, observed
 # 16->15->16 within 15s) — and replaced with a gate derived from the
-# section-9 per-slot inventory (EXECUTING_SLOTS/IDLE_SLOTS, 2-sample DOWN
-# persistence). That replacement gate (compute_live_slot_critical) is
+# section-9 per-slot inventory (Runner.Worker execution proof). That
+# replacement gate (compute_execution_slot_critical) is
 # covered by tests/doctor_runner_live_slot_gate_test.sh; this file now only
 # covers the EXPECTED_CONTAINERS derivation itself, which is unchanged.
 #

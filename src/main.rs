@@ -12,6 +12,7 @@ mod canary;
 mod config;
 mod docker_backend;
 mod github;
+mod lima_convergence;
 mod platform;
 mod quarantine;
 mod queue_monitor;
@@ -106,6 +107,34 @@ enum Commands {
         source: SystemdAlertSource,
         #[arg(long)]
         unit: String,
+    },
+    /// Inspect dual-Lima state on this host (bead ez-gh-actions-apye).
+    /// Pure read-only probe; prints which canonical socket the daemon SHOULD
+    /// be using and whether a migration is implied. NEVER mutates Lima,
+    /// Docker contexts, or services — the operator runs the migration step
+    /// out of band after reviewing this output. The one filesystem write
+    /// this command can perform (the rollback backup marker) only happens
+    /// when `--write-backup` is passed explicitly (see acceptance criterion
+    /// 5); a plain inspection run never touches disk.
+    LimaConverge {
+        /// Docker context name whose current socket resolution should be
+        /// checked against the canonical-preferred socket. Resolved via
+        /// `docker context inspect` first. Failed/non-Unix resolution may
+        /// fall back for read-only diagnostics, but not for backup writes.
+        #[arg(long, default_value = "lima-colima")]
+        context: String,
+        /// Override the path the daemon thinks it's pointed at (defaults to
+        /// resolving `--context` via `docker context inspect`; diagnostic
+        /// fallback is `DOCKER_HOST`, then `/var/run/docker.sock`).
+        #[arg(long)]
+        current_socket: Option<String>,
+        /// Persist the rollback backup marker when a migration is implied.
+        /// Without this flag the command is purely diagnostic and writes
+        /// nothing to disk (cold-review fix, PR #67 P2) -- the marker is the
+        /// only rollback record, so a dry-run inspection must never
+        /// overwrite it with a stale/default socket.
+        #[arg(long, default_value_t = false)]
+        write_backup: bool,
     },
 }
 
@@ -1520,6 +1549,109 @@ fn main() -> Result<()> {
         Commands::SystemdAlertHook { source, unit } => {
             let cfg = Config::load(&path)?;
             run_systemd_alert_hook(&cfg, *source, unit)?;
+        }
+        Commands::LimaConverge {
+            context,
+            current_socket,
+            write_backup,
+        } => {
+            // Bead ez-gh-actions-apye — pure read-only probe, never mutates
+            // Lima/Docker. Operator inspects the report and runs the
+            // migration out of band.
+            let probe = lima_convergence::probe_dual_lima();
+            // Resolution order (cold-review fix, PR #67 HIGH + P2 duplicate):
+            // (1) explicit `--current-socket` override, (2) the NAMED
+            // `--context` resolved via `docker context inspect` (this is how
+            // `lima-colima` actually selects a socket when `DOCKER_HOST` is
+            // unset — the prior code never consulted the context at all),
+            // (3) `DOCKER_HOST`, (4) the hardcoded default. Both (1) and (3)
+            // may carry a `unix://` scheme, so all three are normalized
+            // through the same `strip_unix_socket_scheme` helper
+            // `migration_plan`'s `Path`-equality check relies on.
+            let docker_host = std::env::var_os("DOCKER_HOST")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string_lossy().into_owned());
+            let current_resolution = lima_convergence::resolve_current_socket(
+                context,
+                current_socket.as_deref(),
+                docker_host.as_deref(),
+            );
+            let current = &current_resolution.socket;
+            let plan = lima_convergence::migration_plan(&probe, current);
+            let report = serde_json::json!({
+                "bead": "ez-gh-actions-apye",
+                "context": context,
+                "current_socket": current,
+                "current_socket_source": current_resolution.source,
+                "backup_provenance_verified": current_resolution.backup_provenance_verified,
+                "canonical": probe.canonical.as_ref().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "vm_dir": c.vm_dir,
+                    "docker_socket": c.docker_socket,
+                    "socket_alive": c.socket_alive,
+                })),
+                "legacy": probe.legacy.iter().map(|l| serde_json::json!({
+                    "name": l.name,
+                    "vm_dir": l.vm_dir,
+                    "docker_socket": l.docker_socket,
+                    "socket_alive": l.socket_alive,
+                })).collect::<Vec<_>>(),
+                "preferred_socket": lima_convergence::preferred_socket(&probe),
+                "needs_convergence": probe.needs_convergence(),
+                "migration_plan": plan.as_ref().map(|p| serde_json::json!({
+                    "from_socket": p.from_socket,
+                    "to_socket": p.to_socket,
+                    "job_drain_required": p.job_drain_required,
+                    "backup_marker": p.backup_marker,
+                })),
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !current_resolution.backup_provenance_verified {
+                eprintln!(
+                    "diagnostic-only socket fallback used ({}) — rollback backup writes require --current-socket or a resolvable Unix named context",
+                    current_resolution.source
+                );
+            }
+            // Acceptance criterion (5): if a migration is implied AND the
+            // operator passed `--write-backup`, persist the previous-socket
+            // marker so the rollback path is recoverable. We do NOT touch
+            // the Docker context itself — that step is operator-driven.
+            // Cold-review fix (PR #67 P2): this used to write unconditionally
+            // whenever a plan existed, even on a plain diagnostic run with no
+            // `--write-backup` flag (which didn't exist at all) — a dry-run
+            // inspection could silently overwrite the only rollback marker
+            // with a stale/default socket before any real migration.
+            if let Some(p) = plan {
+                if *write_backup {
+                    current_resolution
+                        .require_backup_provenance()
+                        .map_err(|reason| {
+                            anyhow::anyhow!(
+                                "refusing --write-backup for context '{}' from source '{}': {}",
+                                context,
+                                current_resolution.source,
+                                reason
+                            )
+                        })?;
+                    let entry = lima_convergence::backup_entry_for(context, &p);
+                    lima_convergence::write_backup_marker(&p.backup_marker, &[entry])
+                        .with_context(|| {
+                            format!("writing backup marker to {}", p.backup_marker.display())
+                        })?;
+                    eprintln!(
+                        "wrote backup marker to {} (context={}, previous={})",
+                        p.backup_marker.display(),
+                        context,
+                        p.from_socket.display()
+                    );
+                } else {
+                    eprintln!(
+                        "migration implied (context={}, previous={}) but --write-backup not passed — no backup marker written, no mutation performed",
+                        context,
+                        p.from_socket.display()
+                    );
+                }
+            }
         }
     }
     Ok(())

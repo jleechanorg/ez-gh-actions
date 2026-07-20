@@ -35,6 +35,36 @@ jobs:
         run: |
           bash tests/colima_trim_guard_test.sh
           bash tests/install_colima_trim_agent_test.sh
+      - name: Cleanup-stuck-runs regression tests
+        run: |
+          bash tests/cleanup_stuck_runs_force_cancel_test.sh
+          bash tests/cleanup_stuck_runs_multirepo_test.sh
+          bash tests/cleanup_stuck_runs_race_skip_test.sh
+          bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
+      - name: Doctor-runner regression tests
+        run: |
+          bash tests/doctor_runner_expected_containers_test.sh
+          bash tests/doctor_runner_heartbeat_starvation_test.sh
+          bash tests/doctor_runner_host_pressure_test.sh
+          bash tests/doctor_runner_live_slot_gate_test.sh
+          bash tests/doctor_runner_respawn_fetch_failure_test.sh
+          bash tests/doctor_runner_respawn_journal_test.sh
+      - name: Install ripgrep for integrate.sh PR-payload regression test
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Host-ops, GitHub App token, and PR-payload regression tests
+        run: |
+          bash tests/host_ops_0725_test.sh
+          bash tests/integrate_pr_payload_regression_test.sh
+          bash tests/launchd_docker_host_consumers_test.sh
+          bash tests/refresh_gh_app_token_timeout_test.sh
+          bash tests/verify_other_error_report.sh
+      - name: Install Python test-only dependencies
+        run: pip install -r tests/requirements.txt
+      - name: Mint-token and job-outcome-monitor Python regression tests
+        run: |
+          python3 -m unittest tests/verify_mint_no_retry_on_4xx.py
+          python3 -m unittest tests/verify_mint_retry.py
+          python3 -m unittest tests/job_outcome_monitor_test.py
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Format

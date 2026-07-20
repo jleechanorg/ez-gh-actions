@@ -485,7 +485,16 @@ LOAD_1MIN=$(printf '%s' "$LOAD_LINE" | sed -nE 's/.*load averages?:[[:space:]]*(
 info "uptime: ${LOAD_LINE:-unavailable}"
 if [ -n "$LOAD_1MIN" ] && [ "$CORES" -gt 0 ] 2>/dev/null; then
   THRESHOLD=$((CORES * 2))
-  if awk -v load="$LOAD_1MIN" -v threshold="$THRESHOLD" 'BEGIN { exit !(load > threshold) }'; then
+  # NOTE: the awk variable here must NOT be named "load" -- gawk (the
+  # default /usr/bin/awk on Debian/Ubuntu, including jeff-ubuntu and
+  # GitHub-hosted ubuntu-latest runners) reserves "load" as a builtin
+  # tied to its @load dynamic-extension mechanism and fails closed with
+  # "awk: fatal: cannot use gawk builtin `load' as variable name" --
+  # confirmed live in CI (bead ez-gh-actions-r8od) wiring
+  # tests/doctor_runner_host_pressure_test.sh into ci.yml. BSD awk (macOS)
+  # has no such reservation, so this was silently broken on any real
+  # gawk host despite passing locally on a Mac.
+  if awk -v cur_load="$LOAD_1MIN" -v threshold="$THRESHOLD" 'BEGIN { exit !(cur_load > threshold) }'; then
     warn "1-min load ($LOAD_1MIN) exceeds 2x core count ($CORES cores, threshold $THRESHOLD) -- host is oversubscribed; expect slower docker CLI calls and respawns, not necessarily an ezgha bug"
   else
     ok "1-min load ($LOAD_1MIN) within 2x core count ($CORES cores)"
@@ -1140,6 +1149,19 @@ REMOTE_EXECUTING_SLOTS=()
 REMOTE_IDLE_SLOTS=()
 REMOTE_CYCLING_SLOTS=()
 REMOTE_DOWN_SLOTS=()
+# REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
+# below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
+# printed only a warn() — `configured` then collapsed to the local-only
+# count (e.g. 10 instead of 16, per this repo's current 10-Linux + 6-Mac
+# contract) so a Linux run with the Mac unreachable reported "fleet
+# healthy: 10/10" instead of "10/16 with 6 down". Treat
+# unreachable as the strongest negative signal available (we have ZERO
+# evidence about any of the remote slots, so all of them are unproven):
+# populate REMOTE_DOWN_SLOTS with synthetic names so the verdict gate
+# counts them and the headline `down` reflects reality, and bump
+# SLOT_PROOF_CRITICAL so the verdict flips to `bad` (the "fleet healthy"
+# ok() line cannot survive an unreachable half of the fleet).
+REMOTE_UNREACHABLE=0
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
   REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
@@ -1157,8 +1179,25 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
   fi
 else
   printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
-  warn "$REMOTE_LABEL not reachable via SSH — skipping remote per-slot proof"
+  # Synthesize per-slot DOWN entries for every remote slot we cannot prove.
+  # We have NO evidence about any of them — neither a container, nor a
+  # jobline, nor a journal respawn line — so each remote slot is
+  # conservatively reported as DOWN. This (a) keeps `configured` at the
+  # full expected fleet size (no silent local-only collapse), (b) puts
+  # the unreachable slots into the headline `down` count (so a Mac
+  # outage from jeff-ubuntu is reported as 6/16 down, not "0/10 down"),
+  # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
+  # `ok` to `bad` so an unreachable host can never silently green.
+  REMOTE_UNREACHABLE=1
+  _unreach_idx=1
+  while [ "$_unreach_idx" -le "$REMOTE_COUNT" ]; do
+    REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unreach_idx} (unreachable)")
+    _unreach_idx=$((_unreach_idx + 1))
+  done
+  bad "$REMOTE_LABEL not reachable via SSH — all ${REMOTE_COUNT} remote slot(s) unproven (counted as DOWN); verdict cannot green while the remote fleet is unreachable"
+  SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
 fi
+export REMOTE_UNREACHABLE
 
 # Serve-loop-heartbeat signal: the largest gap between consecutive
 # "queue monitor:" journal lines (same-PID only — see compute_heartbeat_gap
@@ -1280,43 +1319,42 @@ fi
 # script happened to run it) directly against config.toml runner.count.
 # Under normal ephemeral churn — a runner finishes a job, its container is
 # destroyed, and the next serve tick respawns it — that single sample
-# legitimately oscillates (observed 16->15->16 within 15s on a fully healthy
+# legitimately oscillates (observed 16->15->16 within 15s on a fully managed
 # fleet), so the gate flapped [BAD] while section 9's 2-sample-verified
 # per-slot proof (bead ez-gh-actions-b895) showed 0 down in the SAME run.
 # Rather than add a retry/threshold to the flaky sample, this DELETES it and
-# derives the live-container signal from data section 9 already computed:
-# EXECUTING_SLOTS / IDLE_SLOTS / DOWN_SLOTS (LOCAL-ONLY, post 2-sample DOWN
-# persistence — a slot that recovers between section 9's two samples is
-# already folded into EXECUTING_SLOTS or IDLE_SLOTS as a normal recycle
-# ("cycling"), never counted as DOWN). Only a slot that stays DOWN across
-# BOTH section-9 samples reduces the live count.
+# derives the managed-capacity signal from sections 9 and 10's per-slot truth.
+# EXECUTING, IDLE-OK, and journal-confirmed CYCLING slots are healthy capacity;
+# persisted-DOWN slots reduce the live count, while IDLE-STARVED is rejected by
+# the existing per-slot critical path above.
 # compute_live_slot_critical() is sed-extracted by
 # tests/doctor_runner_live_slot_gate_test.sh so tests exercise the real
-# logic, never a reimplementation. cycling_n (ez-gh-actions-5n0h) is an
-# OPTIONAL 4th arg, default 0, so the existing 3-arg call sites/tests keep
-# working unmodified: a slot that is still containerless after 2 samples but
-# has journal-confirmed respawn activity (CYCLING, not DOWN) also counts as
-# live — the daemon is provably still managing it, just mid-cycle.
+# logic, never a reimplementation.
 compute_live_slot_critical() {
-  # args: executing_n idle_n expected_containers [cycling_n]
-  # (down_n is deliberately NOT an input — a DOWN slot simply isn't counted
-  # in executing_n/idle_n/cycling_n, so it naturally reduces `live` without
-  # needing to be passed in; callers may still report it separately for the
-  # message.)
-  # stdout: "<live_slots> <critical:0|1>"
-  local exec_n="$1" idle_n="$2" expected="$3" cycling_n="${4:-0}"
-  local live=$((exec_n + idle_n + cycling_n))
+  # args: local exec/idle/cycling, remote exec/idle/cycling, configured total
+  # stdout: "<managed_live_slots> <critical:0|1>"
+  local local_exec_n="$1" local_idle_n="$2" local_cycling_n="$3"
+  local remote_exec_n="$4" remote_idle_n="$5" remote_cycling_n="$6"
+  local expected="$7"
+  local live_n=$((
+    local_exec_n + local_idle_n + local_cycling_n +
+    remote_exec_n + remote_idle_n + remote_cycling_n
+  ))
   local critical=0
-  if [ "$live" -lt "$expected" ]; then
+  if [ "$live_n" -lt "$expected" ]; then
     critical=1
   fi
-  printf '%d %d\n' "$live" "$critical"
+  printf '%d %d\n' "$live_n" "$critical"
 }
-read -r LOCAL_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
-  compute_live_slot_critical "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "$EXPECTED_CONTAINERS" "${#CYCLING_SLOTS[@]}"
+FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))
+read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
+  compute_live_slot_critical \
+    "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
+    "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
+    "$FLEET_CONFIGURED_COUNT"
 )
 if [ "${LIVE_SLOT_CRITICAL:-0}" -eq 1 ]; then
-  bad "verdict: live-slot gate FAILED (live slots (executing+idle+cycling from per-slot proof) = ${LOCAL_LIVE_SLOTS}, expected >= ${EXPECTED_CONTAINERS} from config.toml runner.count=${CONFIG_RUNNER_COUNT:-<unreadable, used fallback>}; ${#DOWN_SLOTS[@]} persisted-DOWN slot(s) of ${CONFIGURED_COUNT} configured)"
+  bad "verdict: live-slot gate FAILED (managed live slots = ${FLEET_LIVE_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote; executing=$(( ${#EXECUTING_SLOTS[@]} + ${#REMOTE_EXECUTING_SLOTS[@]} )), idle-ok=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise
@@ -1394,5 +1432,67 @@ if [ "$CRITICAL" -gt 0 ]; then
   echo "  4. Re-run ./doctor.sh --detail after each step"
   exit 1
 fi
-ok "fleet healthy: $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up, $LOOP_FAILS loop errors"
+# compute_verdict_summary() aggregates the per-slot LOCAL TRUTH (section 9:
+# EXECUTING_SLOTS/IDLE_SLOTS/DOWN_SLOTS/CYCLING_SLOTS, already 2-sample
+# DOWN-persistence-verified) and REMOTE TRUTH (section 10:
+# REMOTE_EXECUTING_SLOTS/REMOTE_IDLE_SLOTS/REMOTE_DOWN_SLOTS/
+# REMOTE_CYCLING_SLOTS, single ssh sample) into the headline verdict line —
+# replacing the old "$ONLINE/$TOTAL runners online ... $CONTAINER_COUNT
+# containers up" line, which mixed the GitHub API's online/busy count
+# (untrustworthy: truncates under the secondary rate limit — the SAME fleet
+# was reported as 7/11/16/19/22 across calls minutes apart, see repo
+# CLAUDE.md "Fleet capacity standard") with a Mac-LOCAL-ONLY container count
+# (silently blind to the other host's half of the two-host fleet) and never
+# consulted the per-slot arrays that are the actual ground truth (ez-gh-actions-5u3s).
+# IDLE is split into idle-ok vs idle-starved using the same
+# STARVED_PRESENT/STARVE_QUEUED_COUNT/STARVE_OLDEST_MIN inputs section 9's
+# per-slot [BAD] lines already used, so the summary line can never disagree
+# with the detail lines above it in the SAME run.
+# sed-extracted by tests/doctor_runner_verdict_line_test.sh so tests exercise
+# the real logic, never a reimplementation.
+compute_verdict_summary() {
+  # args: local_exec local_idle local_down local_cycling \
+  #       remote_exec remote_idle remote_down remote_cycling \
+  #       starved_present
+  # stdout: "<total> <configured> <executing> <idle_ok> <idle_starved> <down> <cycling>"
+  #
+  # Bucket semantics (must match section 9/10's per-slot [BAD]/info lines):
+  #   - EXECUTING = EXECUTING ONLY. A cycling slot is containerless by
+  #     definition (the daemon is mid-respawn); folding cycling into
+  #     executing inflates the executing bucket with slots that have no
+  #     Runner.Worker pid and counts a healthy mid-cycle as proof of work,
+  #     which is exactly what the per-slot evidence gates already
+  #     correctly exclude (only EXECUTING slots get a jobline / "ok" line).
+  #     Cycling slots ARE live (they count toward `live` and `configured`),
+  #     but they get their own bucket in the headline summary, never
+  #     silently mixed into executing.
+  #   - CYCLING is folded into `down` here ONLY in the headline-down sense
+  #     that a cycling slot is not currently executing a job — it is NOT
+  #     a defect (the journal cross-check confirmed the daemon is still
+  #     managing it), so the headline `down` count does not increment
+  #     cycling. The per-slot info/bad lines already distinguish them.
+  local l_exec="$1" l_idle="$2" l_down="$3" l_cyc="$4"
+  local r_exec="$5" r_idle="$6" r_down="$7" r_cyc="$8"
+  local starved="${9:-0}"
+  local executing=$((l_exec + r_exec))
+  local cycling=$((l_cyc + r_cyc))
+  local idle_total=$((l_idle + r_idle))
+  local idle_starved=0 idle_ok=$idle_total
+  if [ "$starved" -eq 1 ]; then
+    idle_starved=$idle_total
+    idle_ok=0
+  fi
+  local down=$((l_down + r_down))
+  local total=$((executing + idle_ok + idle_starved + cycling + down))
+  local configured=$((l_exec + l_idle + l_down + l_cyc + r_exec + r_idle + r_down + r_cyc))
+  printf '%d %d %d %d %d %d %d\n' "$total" "$configured" "$executing" "$idle_ok" "$idle_starved" "$down" "$cycling"
+}
+read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDICT_IDLE_STARVED VERDICT_DOWN VERDICT_CYCLING < <(
+  compute_verdict_summary \
+    "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#DOWN_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
+    "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_DOWN_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
+    "${STARVED_PRESENT:-0}"
+)
+ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
+info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0

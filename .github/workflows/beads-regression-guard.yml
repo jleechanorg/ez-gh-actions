@@ -1,0 +1,72 @@
+name: Beads Regression Guard
+
+# Guards .beads/issues.jsonl against silent data loss from a stale-DB
+# full-file rewrite clobbering a concurrent session's beads (deleted ids or
+# reverted updated_at timestamps). See bead jleechan-w528 for the incident
+# this check was written to catch: two separate pushes each dropped several
+# concurrently-created/updated beads because the flush was based on a DB
+# snapshot that predated a sibling session's commits.
+
+on:
+  # pull_request_target loads this workflow from the trusted base branch.
+  # The job-level same-repository guard below is evaluated before a
+  # self-hosted runner is allocated, so fork heads never reach the fleet.
+  pull_request_target:
+    paths:
+      - ".beads/issues.jsonl"
+  # GitHub Actions does NOT auto-trigger workflows introduced by the very PR
+  # that adds them — the workflow file is invisible to the pull_request event
+  # because it doesn't exist on main yet. Add an explicit push trigger on main
+  # so the guard fires on every direct push to main (the case bead jleechan-w528
+  # documents: silent regressions merged straight to main). We avoid
+  push:
+    branches:
+      - main
+    paths:
+      - ".beads/issues.jsonl"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Detect bead deletions/regressions
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","ezgha"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted PR base validator
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Checkout pushed main revision
+        if: github.event_name == 'push'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run deletion/regression guard
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            head_sha="${{ github.event.pull_request.head.sha }}"
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            git fetch --no-tags origin "$head_sha"
+            parent_sha="$(git merge-base "$base_sha" "$head_sha")"
+            echo "Comparing .beads/issues.jsonl: merge-base=$parent_sha -> head=$head_sha (trusted same-repo pull_request_target)"
+          else
+            head_sha="${{ github.sha }}"
+            # On push to main, github.event.before is the remote main tip
+            # before the complete delivered push. HEAD^ only covers the last
+            # commit and can miss a regression introduced earlier in a
+            # multi-commit push.
+            parent_sha="${{ github.event.before }}"
+            echo "Comparing .beads/issues.jsonl: push-before=$parent_sha -> head=$head_sha (push to main)"
+          fi
+          python3 scripts/check_beads_no_regression.py "$parent_sha" "$head_sha"
