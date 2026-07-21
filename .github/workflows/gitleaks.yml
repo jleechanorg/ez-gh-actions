@@ -1,7 +1,15 @@
+# SECURITY: this is a PUBLIC repo and this job runs on the self-hosted
+# fleet, so the trigger follows the repo's guarded pattern (see
+# ci-selfhosted.yml, mac-virtiofs-canary.yml; bead jleechan-5kbs):
+# pull_request_target (workflow definition always taken from the trusted
+# base branch) + a job-level same-repo guard so fork heads NEVER reach a
+# self-hosted runner. Only after that guard passes is the PR head checked
+# out, by explicit SHA.
 name: Gitleaks
 
 on:
-  pull_request:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
   push:
     branches: [main]
 
@@ -11,11 +19,15 @@ permissions:
 jobs:
   scan:
     name: Secret scan
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","ezgha"]') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
+          # Same-repo heads only (guarded above); for push this expression
+          # is empty and checkout falls back to the default (trusted) ref.
+          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Install gitleaks
