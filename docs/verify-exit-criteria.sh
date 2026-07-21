@@ -647,20 +647,43 @@ for slot in $(seq 1 "$COUNT"); do
     if [ "$SLOT_MEMORY_BYTES" -lt "$RUNNER_FLOOR_BYTES" ]; then
         fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES below the absolute floor $RUNNER_FLOOR_BYTES bytes (runner_floor_mb=$RUNNER_FLOOR_MB)"
     fi
-    if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_NANO_CPUS" ]; then
+    # Compute EXACT effective CPU clamp, mirroring src/docker_backend.rs
+    # effective_limits_with_capacity(): the daemon caps per-slot cpus at
+    # max(daemon_ncpu / count, 0.5) whenever that share is BELOW the
+    # configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU VM with 6
+    # runners clamps to 1.667 per slot -- observed live, bead jleechan-ehsi).
+    # Checking the raw configured value here would permanently fail Gate 3
+    # on any host where configured cpus*count exceeds the VM's core count,
+    # even though the daemon's clamp is the intended, safe behavior (same
+    # pattern as the memory clamp above).
+    EXPECTED_EFFECTIVE_CPUS=$LIMIT_CPUS
+    DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    if is_uint "$DAEMON_NCPU" && [ "$DAEMON_NCPU" -gt 0 ] && [ "$COUNT" -gt 0 ]; then
+        CPU_SHARE=$(awk -v ncpu="$DAEMON_NCPU" -v count="$COUNT" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
+        EXPECTED_EFFECTIVE_CPUS=$(awk -v cfg="$LIMIT_CPUS" -v share="$CPU_SHARE" 'BEGIN { print (cfg > share) ? share : cfg }')
+    fi
+    # The daemon passes cpus to `docker run --cpus` via format!("{:.2}", cpus)
+    # (src/docker_backend.rs) -- 2-decimal rounding BEFORE docker converts it
+    # to NanoCpus, e.g. 1.6666666666666667 -> "1.67" -> NanoCpus=1670000000,
+    # not the naive full-precision 1666666667. Round here identically or this
+    # check permanently mismatches by the rounding delta.
+    EXPECTED_EFFECTIVE_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.2f", cpus }')
+    EXPECTED_EFFECTIVE_NANO_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.0f", cpus * 1000000000 }')
+    if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_EFFECTIVE_NANO_CPUS" ]; then
         if [ "$SLOT_CPU_QUOTA" -le 0 ] || [ "$SLOT_CPU_PERIOD" -le 0 ]; then
-            fail "slot $SLOT_NAME CPU enforcement unavailable: HostConfig.NanoCpus=${SLOT_NANO_CPUS}, CPUQuota=${SLOT_CPU_QUOTA}, CPUPeriod=${SLOT_CPU_PERIOD}; expected NanoCpus=${EXPECTED_NANO_CPUS}"
+            fail "slot $SLOT_NAME CPU enforcement unavailable: HostConfig.NanoCpus=${SLOT_NANO_CPUS}, CPUQuota=${SLOT_CPU_QUOTA}, CPUPeriod=${SLOT_CPU_PERIOD}; expected effective NanoCpus=${EXPECTED_EFFECTIVE_NANO_CPUS} (configured limits.cpus=${LIMIT_CPUS}, daemon_ncpu=${DAEMON_NCPU:-unknown}, count=${COUNT})"
         fi
-        # Ratio check: CPUQuota / CPUPeriod must equal LIMIT_CPUS (±1% tolerance).
-        # cgroupfs sometimes rounds NanoCpus slightly vs period*quota, so a 1% band
-        # is required to avoid false-positives while still catching a quota=-1
+        # Ratio check: CPUQuota / CPUPeriod must equal the EFFECTIVE (clamped)
+        # cpu share, not the raw configured value (±1% tolerance). cgroupfs
+        # sometimes rounds NanoCpus slightly vs period*quota, so a 1% band is
+        # required to avoid false-positives while still catching a quota=-1
         # (unlimited) or quota far outside the requested CPU count.
-        EXPECTED_QUOTA=$(awk -v cpus="$LIMIT_CPUS" -v period="$SLOT_CPU_PERIOD" 'BEGIN { printf "%.0f", cpus * period }')
+        EXPECTED_QUOTA=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" -v period="$SLOT_CPU_PERIOD" 'BEGIN { printf "%.0f", cpus * period }')
         TOLERANCE=$(awk -v q="$EXPECTED_QUOTA" 'BEGIN { printf "%.0f", q * 0.01 + 1 }')
         DIFF=$(awk -v a="$SLOT_CPU_QUOTA" -v b="$EXPECTED_QUOTA" 'BEGIN { d = a - b; if (d < 0) d = -d; printf "%.0f", d }')
         if [ "$DIFF" -gt "$TOLERANCE" ]; then
             ACTUAL_RATIO=$(awk -v q="$SLOT_CPU_QUOTA" -v p="$SLOT_CPU_PERIOD" 'BEGIN { if (p <= 0) print "inf"; else printf "%.3f", q / p }')
-            fail "slot $SLOT_NAME CPUQuota/CPUPeriod ratio mismatch: HostConfig.CPUQuota=${SLOT_CPU_QUOTA}/CPUPeriod=${SLOT_CPU_PERIOD} = ${ACTUAL_RATIO} CPUs, expected ${LIMIT_CPUS} CPUs (quota=${EXPECTED_QUOTA}, tolerance=±${TOLERANCE}). NanoCpus is also wrong: ${SLOT_NANO_CPUS} != ${EXPECTED_NANO_CPUS}."
+            fail "slot $SLOT_NAME CPUQuota/CPUPeriod ratio mismatch: HostConfig.CPUQuota=${SLOT_CPU_QUOTA}/CPUPeriod=${SLOT_CPU_PERIOD} = ${ACTUAL_RATIO} CPUs, expected effective ${EXPECTED_EFFECTIVE_CPUS} CPUs (quota=${EXPECTED_QUOTA}, tolerance=±${TOLERANCE}; configured limits.cpus=${LIMIT_CPUS}). NanoCpus is also wrong: ${SLOT_NANO_CPUS} != ${EXPECTED_EFFECTIVE_NANO_CPUS}."
         fi
     fi
     if [ "$SLOT_PIDS_LIMIT" -lt 0 ] || [ "$SLOT_PIDS_LIMIT" -ne "$LIMIT_PIDS" ]; then
