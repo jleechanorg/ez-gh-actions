@@ -20,7 +20,11 @@ permissions:
 jobs:
   scan:
     name: Secret scan
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    # workflow_dispatch is collaborator-only (forks cannot dispatch) and
+    # always runs the trusted base workflow definition, so it's as trusted
+    # as push -- included so `gh workflow run Gitleaks` can prove the guard
+    # actually runs the scan job, not just skip it.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJson(vars.SELF_HOSTED_RUNNER_LABELS || '["self-hosted","ezgha"]') }}
     timeout-minutes: 10
     steps:
