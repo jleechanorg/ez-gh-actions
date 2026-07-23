@@ -107,6 +107,7 @@ soak is required.
 
 ## Recent activity (by day)
 
+- [2026-07-23](activity/2026-07-23.md) — AO ecosystem mission v2 closed (all 6 PRs merged across TS + Go); live Go AO cutover test surfaced the codex-launcher flag bug [jleechan-dkh7](https://github.com/jleechanorg/agent-orchestrator/issues/); harness fully restored to baseline.
 - [2026-07-12](activity/2026-07-12.md) - Host-availability program, proven QEMU/global-OOM watchdog reboot, ordered P0 containment, and Mac six-runner restoration.
 - [2026-07-11](activity/2026-07-11.md) — 48-hour cross-fleet audit: Mac forced-reset recovery loop, Linux memory/watchdog reboot, PR #56 self-healing fix, and prioritized watchdog/CI/deploy guardrails.
 - [2026-07-10](activity/2026-07-10.md) — Fleet-hardening marathon: stable-libexec migration (sa1t closed), doctor-runner honesty ×4 (first exit-0), ao-runner farm eradicated, reaper multi-repo + Linux timer installed, codex cold-review fixes, factory lane opened (10 beads incl. PR#47 drive).
