@@ -59,7 +59,7 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard colima-trim"
+  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard colima-trim mission-output-cleanup"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
