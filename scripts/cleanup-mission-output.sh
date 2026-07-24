@@ -25,7 +25,7 @@
 set -euo pipefail
 
 DRY_RUN=true
-MIN_AGE_HOURS=24
+MIN_AGE_HOURS=4
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)           DRY_RUN=false; shift ;;
@@ -39,8 +39,16 @@ done
 # Roots to clean — these are the only paths ezgha-runner-b-* writes
 # worktree outputs to (per the ez-gh-actions source). Adding new roots is a
 # one-line edit here, NOT a config flag — these names are not user-controlled.
+# All known top-level dirs that ez-mac-runner-b-* creates worktree
+# outputs under. Some are project-specific names ("worldarchitect.ai",
+# "worldarchitectai", "worldarchitect-ai") and some are worktree-style
+# (ez-mac-runner-b-N-XXXXXX hashes get nested as worldarchitect-prXXXX-... or
+# the runner's session workspace). Keep the protected-prefix list in sync
+# with ACTIVE_PREFIXES below.
 TARGETS=(
   "/private/tmp/worldarchitect.ai"
+  "/private/tmp/worldarchitect-ai"
+  "/private/tmp/worldarchitectai"
   "/private/tmp/wa-missions"
 )
 
