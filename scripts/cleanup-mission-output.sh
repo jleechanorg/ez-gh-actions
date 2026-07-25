@@ -81,7 +81,11 @@ MANIFEST="${MANIFEST_DIR}/mission-output-cleanup-$(date -u +%Y%m%dT%H%M%SZ).mani
 # Clean up manifests older than 30 days
 find "$MANIFEST_DIR" -type f -name "mission-output-cleanup-*.manifest" -mtime +30 -delete 2>/dev/null || true
 
-log() { printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "${DRY_RUN:+DRY-RUN}" "$*" | tee -a "$LOG" ; }
+log() {
+  local tag="APPLY"
+  if [[ "$DRY_RUN" == "true" ]]; then tag="DRY-RUN"; fi
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$tag" "$*" | tee -a "$LOG"
+}
 
 get_mtime() {
   local target="$1"
