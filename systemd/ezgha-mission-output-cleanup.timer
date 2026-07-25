@@ -1,0 +1,11 @@
+[Unit]
+Description=Clean stale ezgha/AO mission worktree outputs every 1 hour
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=ezgha-mission-output-cleanup.service
+
+[Install]
+WantedBy=timers.target

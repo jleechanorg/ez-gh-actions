@@ -474,6 +474,7 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
     # ── Guest-native fstrim cadence — the actual root cause fix, not just the guard ──
@@ -565,7 +566,7 @@ FSTRIM_EOF
       fi
     done
     systemctl --user daemon-reload 2>/dev/null || true
-    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer; do
+    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user timer enabled: ${timer}"
       else

@@ -79,7 +79,9 @@ for unit in ezgha.service \
             ezgha-token-refresh.service ezgha-token-refresh.timer \
             ezgha-queue-reaper.service ezgha-queue-reaper.timer \
             ezgha-watchdog.service ezgha-watchdog.timer \
-            ezgha-runner-dashboard.service ezgha-runner-dashboard.timer; do
+            ezgha-runner-dashboard.service ezgha-runner-dashboard.timer \
+            ezgha-colima-trim.service ezgha-colima-trim.timer \
+            ezgha-mission-output-cleanup.service ezgha-mission-output-cleanup.timer; do
   printf '[Unit]\nDescription=stub\n' > "${HOME_T}/.config/systemd/user/${unit}"
 done
 printf '#!/usr/bin/env bash\ntrue\n' > "${HOME_T}/.local/libexec/ezgha/cleanup-stuck-runs.sh"
@@ -95,7 +97,7 @@ HOME="${HOME_T}" SYSTEMCTL_LOG="${SYSTEMCTL_LOG}" \
 
 # ── Assertions ─────────────────────────────────────────────────────────────
 
-for aux in token-refresh queue-reaper watchdog runner-dashboard; do
+for aux in token-refresh queue-reaper watchdog runner-dashboard colima-trim mission-output-cleanup; do
   if grep -q "disable --now ezgha-${aux}.timer" "${SYSTEMCTL_LOG}"; then
     echo "PASS: uninstall disabled ezgha-${aux}.timer"
   else

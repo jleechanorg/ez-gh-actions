@@ -1,0 +1,12 @@
+[Unit]
+Description=Clean stale ezgha/AO mission worktree outputs
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=@SCRIPTS_DIR@/cleanup-mission-output.sh --apply
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin
+Environment=MIN_AGE_HOURS=4
+StandardOutput=append:%h/.local/state/ezgha/mission-output-cleanup.log
+StandardError=append:%h/.local/state/ezgha/mission-output-cleanup.log
