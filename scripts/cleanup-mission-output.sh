@@ -126,7 +126,7 @@ for root in "${TARGETS[@]}"; do
     # skip in-use (lsof on the dir with timeout)
     if command -v lsof >/dev/null 2>&1; then
       # lsof +D has the header line; filter out header
-      nopen=$(timeout 2 lsof +D "$d" 2>/dev/null | tail -n +2 | grep -c . || echo 0)
+      nopen=$(timeout 2 lsof +D "$d" 2>/dev/null | tail -n +2 | grep -c . | tr -d '[:space:]' || echo 0)
       if (( ${nopen:-0} > 0 )); then
         log "  SKIP in-use (lsof $nopen open): $d"
         skipped=$((skipped+1))
