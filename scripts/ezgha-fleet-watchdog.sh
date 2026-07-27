@@ -297,8 +297,69 @@ slot_count() {
   echo "${n:-0}"
 }
 
+# ensure_runner_image rebuilds the configured $RUNNER_IMAGE in colima when it
+# is missing. Without this, the daemon's serve loop enters a
+# "could not measure daemon free disk" safety lockout that refuses to spawn
+# runners until the image returns, and a vanilla `launchctl kickstart` cannot
+# heal it (the missing image persists across restarts). Called only on the Mac
+# path (do_restart_linux's host, jeff-ubuntu, bakes the image into the runner
+# container build, not a local daemon cache).
+#
+# KNOWN SCOPE: macOS host only. No-op when EZGHA_WATCHDOG_IMAGE_HEAL=0.
+# KNOWN FAILURE MODES (informational; not handled here):
+#   - cold colima cache + Docker backend itself unreachable: install.sh's v2
+#     fingerprint at line ~336 handles backend bring-up; this helper assumes
+#     `docker` is already callable.
+#   - BuildKit-related "python3-venv has no installation candidate" failure:
+#     install.sh uses DOCKER_BUILDKIT=0 (bead jleechan-bl0n, 2026-07-16); we
+#     mirror that.
+ensure_runner_image() {
+  if [[ "${EZGHA_WATCHDOG_IMAGE_HEAL:-1}" -eq 0 ]]; then
+    log "ensure_runner_image: disabled via EZGHA_WATCHDOG_IMAGE_HEAL=0"
+    return 0
+  fi
+  local image="${RUNNER_IMAGE:-ezgha-runner:latest}"
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    log "ensure_runner_image: $image already present"
+    return 0
+  fi
+  log "ensure_runner_image: $image MISSING — rebuilding via DOCKER_BUILDKIT=0 (may take a few minutes)"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "ensure_runner_image: DRY-RUN — would rebuild $image"
+    return 0
+  fi
+  # Find Dockerfile.runner relative to this script's install sibling. Most
+  # production installs deploy scripts/ezgha-fleet-watchdog.sh alongside
+  # the repo, but install.sh's --prefix path may also copy it standalone
+  # into $HOME/.local/libexec/ezgha/. In the latter case the caller is
+  # expected to set $EZGHA_REPO_ROOT to the repo root. Fall back to the
+  # default paths in priority order.
+  local repo_root="${EZGHA_REPO_ROOT:-}"
+  if [[ -z "$repo_root" ]] && [[ -f "${0%/*}/../../Dockerfile.runner" ]]; then
+    repo_root="$(cd "${0%/*}/../.." && pwd)"
+  fi
+  if [[ -z "$repo_root" ]] || [[ ! -f "$repo_root/Dockerfile.runner" ]]; then
+    log "ensure_runner_image: cannot locate Dockerfile.runner (set EZGHA_REPO_ROOT); skipping rebuild"
+    return 1
+  fi
+  local build_log build_rc=0
+  build_log="$(DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t "$image" "$repo_root" 2>&1)" || build_rc=$?
+  while IFS= read -r line; do log "ensure_runner_image: docker build: $line"; done <<< "$build_log"
+  if [[ "$build_rc" -ne 0 ]]; then
+    log "ensure_runner_image: REBUILD FAILED (exit=$build_rc) — daemon restart will proceed but serve loop will likely re-enter the disk-measurement lockout until image is present"
+    return 1
+  fi
+  log "ensure_runner_image: REBUILD OK — $image present"
+  return 0
+}
+
 # shellcheck disable=SC2317  # invoked indirectly via evaluate_host's $restart_fn
 do_restart_mac() {
+  # Heal the runner image BEFORE restarting the daemon. Even a successful
+  # restart of a serve loop stuck behind a missing image re-enters the
+  # "could not measure daemon free disk" safety lockout on the very next
+  # tick and re-creates the same 0/N fleet state.
+  ensure_runner_image || true
   launchctl kickstart -k "gui/$(id -u)/org.jleechanorg.ezgha" 2>&1
 }
 
