@@ -21,6 +21,7 @@ BIN="ezgha"
 
 ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 bad()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; }
+warn() { printf '  \033[33m⚠\033[0m %s\n' "$1" >&2; }
 info() { printf '\033[1m%s\033[0m\n' "$1"; }
 
 SCRIPT_DIR=""
@@ -195,6 +196,56 @@ fi
 # briefly thought broken when the symlink target didn't exist; the
 # actual cause was that the colima socket had been substituted but the
 # plist/unit still pointed at /var/run/docker.sock.
+#
+# Idempotent Colima start + stale-VZ recovery (added 2026-07-26, root
+# cause: when a prior `colima stop --force` aborts or the host reboots
+# while the VZ disk was attached, subsequent `colima start` fails with
+# "failed to run attach disk colima, in use by instance colima" because
+# the basedisk/diffdisk files are still on disk under
+# ~/.colima/_lima/colima/ but no live limactl instance record exists.
+# The clean fix is to remove the stale _lima/ directory, recreate via
+# `colima start`, and re-install the fstrim override below. A plain
+# `colima restart` does NOT clear this state. Idempotent: a healthy VM
+# is left untouched, only the stale-disk error path triggers cleanup.
+ensure_colima_docker_daemon() {
+  # Only relevant on macOS where Colima is the docker host.
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  command -v colima >/dev/null 2>&1 || return 0
+  command -v limactl >/dev/null 2>&1 || return 0
+
+  # If the docker socket is already healthy, do nothing.
+  local colima_sock="${HOME}/.colima/default/docker.sock"
+  if is_socket_alive "$colima_sock" 2>/dev/null; then
+    return 0
+  fi
+
+  # Cheap path: try a plain colima start first.
+  if colima start 2>/dev/null && is_socket_alive "$colima_sock"; then
+    return 0
+  fi
+
+  # Stale-VZ recovery: the ha.stderr.log fingerprint is the
+  # "in use by instance" error from a prior aborted boot. Only then do
+  # we delete the _lima/ profile directory and recreate.
+  local lima_dir="${HOME}/.colima/_lima/colima"
+  local ha_log="${lima_dir}/ha.stderr.log"
+  if [ -f "$ha_log" ] && grep -q "in use by instance" "$ha_log" 2>/dev/null; then
+    warn "Colima VM in stale VZ state (basedisk/diffdisk present but lima instance missing); clearing ${lima_dir} and recreating"
+    # Use limactl first (safer — only removes the instance record if it
+    # somehow exists), then rm the _lima/ profile dir for the clean fix.
+    limactl delete --force colima >/dev/null 2>&1 || true
+    rm -rf "${lima_dir}"
+    if colima start && is_socket_alive "$colima_sock"; then
+      ok "Colima VM recreated after stale-VZ recovery"
+      return 0
+    fi
+    # If we hit the stale-VZ branch but the recreate still failed, fall
+    # through to the generic error path below (no nested bad-message).
+  fi
+
+  return 1
+}
+ensure_colima_docker_daemon || true
 DOCKER_HOST_OVERRIDE=""
 # Strategy 1: trust the active docker context
 DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
