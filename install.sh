@@ -207,6 +207,14 @@ fi
 # `colima start`, and re-install the fstrim override below. A plain
 # `colima restart` does NOT clear this state. Idempotent: a healthy VM
 # is left untouched, only the stale-disk error path triggers cleanup.
+#
+# The fingerprint check covers two failure shapes observed in the wild:
+#   1. ha.stderr.log literally contains "in use by instance" (the
+#      post-aborted-boot case)
+#   2. colima list says Stopped AND ~/.colima/_lima/colima/ is missing
+#      or has no ha.sock — same root cause, the _lima dir was wiped
+#      by hand or by another tool, but a stale 'colima' instance record
+#      is still registered with limactl.
 ensure_colima_docker_daemon() {
   # Only relevant on macOS where Colima is the docker host.
   [ "$(uname -s)" = "Darwin" ] || return 0
@@ -224,13 +232,25 @@ ensure_colima_docker_daemon() {
     return 0
   fi
 
-  # Stale-VZ recovery: the ha.stderr.log fingerprint is the
-  # "in use by instance" error from a prior aborted boot. Only then do
-  # we delete the _lima/ profile directory and recreate.
+  # Stale-VZ recovery — fingerprint 1: literal "in use by instance" in
+  # the prior boot log.
   local lima_dir="${HOME}/.colima/_lima/colima"
   local ha_log="${lima_dir}/ha.stderr.log"
+  local stale_vz=0
   if [ -f "$ha_log" ] && grep -q "in use by instance" "$ha_log" 2>/dev/null; then
-    warn "Colima VM in stale VZ state (basedisk/diffdisk present but lima instance missing); clearing ${lima_dir} and recreating"
+    stale_vz=1
+  fi
+  # Fingerprint 2: colima list says Stopped AND the _lima/ dir is gone
+  # or the hostagent socket is missing (same root cause: the
+  # limactl-side state is desynced from the on-disk profile).
+  if [ "$stale_vz" -eq 0 ]; then
+    if colima list 2>/dev/null | grep -q "Stopped" && [ ! -S "${lima_dir}/ha.sock" ]; then
+      stale_vz=1
+    fi
+  fi
+
+  if [ "$stale_vz" -eq 1 ]; then
+    warn "Colima VM in stale VZ state; clearing ${lima_dir} and recreating"
     # Use limactl first (safer — only removes the instance record if it
     # somehow exists), then rm the _lima/ profile dir for the clean fix.
     limactl delete --force colima >/dev/null 2>&1 || true
