@@ -121,10 +121,40 @@ LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 exec 9>"${LOCK_FILE}"
 info "Acquiring single-owner deploy lock..."
 if ! flock -n 9; then
-  bad "Another deploy or installation is currently in progress (unable to acquire lock on ${LOCK_FILE})."
-  exit 1
+  # Fingerprint 3: a dead PID is holding flock on the lockfile. Visible
+  # as colima NOT running but lsof still reporting a `${LOCK_FILE}`
+  # holder whose PID is not our own. Live repro 2026-07-26: a dead
+  # `colima 97852` process held FD 9w on the lockfile, blocking every
+  # install.sh invocation. Main session cleared the lock; the dead
+  # colima left it behind. Recovery: kill the lockholder (TERM, then
+  # KILL), drop the lockfile, then re-acquire — if any other deploy is
+  # genuinely running, the second flock will still fail and we exit.
+  local_lockholder_pids="$(lsof -t "${LOCK_FILE}" 2>/dev/null | grep -v "^${$}$" || true)"
+  if [ -n "${local_lockholder_pids}" ]; then
+    warn "Deploy lock held by dead PID(s) ${local_lockholder_pids}; clearing"
+    # Use shell-agnostic kill (no `kill` builtin assumptions) — `lsof -ti`
+    # leaves only PIDs, xargs -r handles the empty case. pidonly-via-lsof
+    # means we don't need to parse lsof's human output.
+    echo "${local_lockholder_pids}" | xargs -r kill -TERM 2>/dev/null || true
+    sleep 2
+    echo "${local_lockholder_pids}" | xargs -r kill -KILL 2>/dev/null || true
+    rm -f "${LOCK_FILE}"
+    # Re-open and retry exactly once; if a live deploy is genuinely
+    # running, the second flock -n will fail and we exit cleanly.
+    exec 9>"${LOCK_FILE}"
+    if flock -n 9; then
+      ok "Deploy lock acquired after clearing dead holder"
+    else
+      bad "Another deploy or installation is currently in progress (unable to acquire lock on ${LOCK_FILE} after clearing dead holder)."
+      exit 1
+    fi
+  else
+    bad "Another deploy or installation is currently in progress (unable to acquire lock on ${LOCK_FILE})."
+    exit 1
+  fi
+else
+  ok "Deploy lock acquired"
 fi
-ok "Deploy lock acquired"
 
 # ── Validate Git state for production ─────────────────────────────────────────
 if [ "${DEV_MODE}" -eq 0 ]; then
