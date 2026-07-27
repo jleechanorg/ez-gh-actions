@@ -10,7 +10,7 @@
 #
 # Safety:
 #   - Only targets known mission output directories and prefixes (no user dirs touched)
-#   - Only removes subdirs whose mtime is >= MIN_AGE_HOURS (default 4h)
+#   - Only removes subdirs whose mtime is >= MIN_AGE_HOURS (default 48h)
 #   - Skips subdirs whose name matches an active ezgha-runner marker
 #     (ez-mac-runner-b-*, wf_*, wa-*)
 #   - Skips subdirs that have open file handles (lsof)
@@ -20,7 +20,7 @@
 #
 # Usage: cleanup-mission-output.sh [options]
 #   --apply            perform deletions (default is dry-run)
-#   --min-age-hours N  override the 4h default
+#   --min-age-hours N  override the 48h default (env MIN_AGE_HOURS also works)
 #
 # Invoked by launchd (macOS) or systemd timer (Linux):
 #   macOS: org.jleechanorg.ezgha-mission-output-cleanup
@@ -29,7 +29,16 @@
 set -euo pipefail
 
 DRY_RUN=true
-MIN_AGE_HOURS=4
+# 48h retention floor. Was 4h, which deleted mission output while the work that
+# produced it was often still in play — see the 2026-07-26 sweep, where this job
+# removed 68 dirs under /private/tmp/worldarchitect.ai in one 15:54 pass.
+#
+# `${MIN_AGE_HOURS:-48}`, not a bare assignment: the launchd plist
+# (org.jleechanorg.ezgha-mission-output-cleanup) sets MIN_AGE_HOURS in
+# EnvironmentVariables, and a bare `MIN_AGE_HOURS=4` silently clobbered it, so
+# that plist knob has never had any effect. The env var now works as intended;
+# the CLI flag below still wins over both.
+MIN_AGE_HOURS="${MIN_AGE_HOURS:-48}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)           DRY_RUN=false; shift ;;
