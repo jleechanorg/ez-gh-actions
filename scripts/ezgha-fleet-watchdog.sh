@@ -122,6 +122,8 @@
 #   EZGHA_WATCHDOG_STATE_STALE_SECONDS
 #                                   max state-file age before miss_count/last_restart
 #                                   are treated as stale and reset to 0 (default: 480)
+#   EZGHA_WATCHDOG_ALLOW_RESTART    1 = restart once guardrails clear (default);
+#                                   0 = detect + log only, never restart
 
 set -uo pipefail
 
@@ -137,6 +139,7 @@ COOLDOWN_SECONDS="${EZGHA_WATCHDOG_COOLDOWN_SECONDS:-1800}"
 # See guardrail 5 in the header comment above for the full rationale on this
 # default (4x the 120s timer tick interval, inside the 6-10min band).
 STATE_STALE_SECONDS="${EZGHA_WATCHDOG_STATE_STALE_SECONDS:-480}"
+ALLOW_RESTART="${EZGHA_WATCHDOG_ALLOW_RESTART:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -353,6 +356,11 @@ evaluate_host() {
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     log "$label: DRY-RUN — would restart now (miss=$misses >= $MISS_THRESHOLD, cooldown clear, load ok)"
+    return 1
+  fi
+
+  if [[ "$ALLOW_RESTART" -ne 1 ]]; then
+    log "$label: restart threshold reached but EZGHA_WATCHDOG_ALLOW_RESTART=0 — skipping (detect+log only)"
     return 1
   fi
 

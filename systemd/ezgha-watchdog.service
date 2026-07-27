@@ -14,6 +14,7 @@ Type=oneshot
 TimeoutStartSec=90
 ExecStart=@SCRIPTS_DIR@/ezgha-fleet-watchdog.sh --host linux
 Environment=HOME=@HOME@
+Environment=EZGHA_WATCHDOG_ALLOW_RESTART=1
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
 StandardOutput=append:%h/.local/state/ezgha/watchdog.log
 StandardError=append:%h/.local/state/ezgha/watchdog.log

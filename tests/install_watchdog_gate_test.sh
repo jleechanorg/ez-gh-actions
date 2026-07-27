@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# regression test: install.sh must NOT unconditionally arm the fleet
-# watchdog. Watchdog re-arm is gated on beads ez-gh-actions-30p (P0: no
-# SIGTERM handling -- watchdog restarts orphan in-flight registrations),
-# uh2, lxn -- see ez-gh-actions-sa1t. A default `./install.sh` run must:
-#   (a) still render/copy the ezgha-watchdog.timer/.service unit files
+# regression test: install.sh arms the fleet watchdog by default.
+# A default `./install.sh` run must:
+#   (a) render/copy the ezgha-watchdog.timer/.service unit files
 #       (repo is source, ~/.config/systemd/user is what systemctl reads),
-#   (b) but SKIP `systemctl --user enable --now` for the watchdog timer,
-#   (c) and heal drift: if the watchdog timer is already enabled (e.g. an
-#       out-of-band re-arm), disable it.
-# `./install.sh --with-watchdog` must enable it.
+#   (b) enable `systemctl --user enable --now` for the watchdog timer,
+#   (c) render ezgha-watchdog.service with EZGHA_WATCHDOG_ALLOW_RESTART=1.
+# `./install.sh --without-watchdog` must skip arming and heal drift: if the
+# watchdog timer is already enabled (e.g. an out-of-band re-arm), disable it.
+# `./install.sh --with-watchdog` remains supported (same as default).
 #
 # This drives install.sh's REAL Linux watchdog-gating code path end-to-end
 # with `systemctl`/`docker`/`gh`/`cargo`/`git` stubbed out on PATH -- it
@@ -149,51 +148,64 @@ run_install() {
     bash "${TEMP_REPO}/install.sh" --dev "$@" >"${temp_home}/install.log" 2>&1
 }
 
-# ── Case A: default run (no --with-watchdog) ─────────────────────────────────
+# ── Case A: default run arms watchdog ────────────────────────────────────────
 HOME_A="${WORK}/home_a"
 STATE_A="${WORK}/state_a"
 mkdir -p "${HOME_A}"
 run_install "${HOME_A}" "${STATE_A}"
 
-if [ -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case A: default run armed ezgha-watchdog.timer (must stay disabled without --with-watchdog)"
+if [ ! -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
+  fail "Case A: default run did NOT enable ezgha-watchdog.timer (watchdog armed by default)"
 else
-  echo "PASS: Case A: default run left ezgha-watchdog.timer disabled"
+  echo "PASS: Case A: default run enabled ezgha-watchdog.timer"
 fi
 
 if [ ! -f "${STATE_A}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_A}/ezgha-queue-reaper.timer.enabled" ]; then
-  fail "Case A: default run failed to enable token-refresh/queue-reaper timers (only watchdog should be gated)"
+  fail "Case A: default run failed to enable token-refresh/queue-reaper timers"
 else
   echo "PASS: Case A: default run still enabled token-refresh + queue-reaper timers"
 fi
 
-rendered_unit="${HOME_A}/.config/systemd/user/ezgha-watchdog.timer"
-if [ ! -f "${rendered_unit}" ]; then
-  fail "Case A: default run did not render ezgha-watchdog.timer unit file (unit files must always be rendered; only enable/load is gated)"
+rendered_timer="${HOME_A}/.config/systemd/user/ezgha-watchdog.timer"
+if [ ! -f "${rendered_timer}" ]; then
+  fail "Case A: default run did not render ezgha-watchdog.timer unit file"
 else
-  echo "PASS: Case A: default run still rendered ezgha-watchdog.timer unit file"
+  echo "PASS: Case A: default run rendered ezgha-watchdog.timer unit file"
 fi
 
-if ! grep -q "watchdog arming skipped" "${HOME_A}/install.log"; then
-  fail "Case A: install.sh did not print the watchdog-gated skip message"
+rendered_service="${HOME_A}/.config/systemd/user/ezgha-watchdog.service"
+if [ ! -f "${rendered_service}" ]; then
+  fail "Case A: default run did not render ezgha-watchdog.service unit file"
 else
-  echo "PASS: Case A: install.sh printed the watchdog-gated skip message"
+  echo "PASS: Case A: default run rendered ezgha-watchdog.service unit file"
 fi
 
-# ── Case B: heal drift -- a pre-enabled watchdog timer must be disabled ──────
+if ! grep -q 'Environment=EZGHA_WATCHDOG_ALLOW_RESTART=1' "${rendered_service}"; then
+  fail "Case A: rendered ezgha-watchdog.service missing EZGHA_WATCHDOG_ALLOW_RESTART=1"
+else
+  echo "PASS: Case A: rendered ezgha-watchdog.service includes EZGHA_WATCHDOG_ALLOW_RESTART=1"
+fi
+
+# ── Case B: --without-watchdog heals drift (pre-enabled timer disabled) ──────
 HOME_B="${WORK}/home_b"
 STATE_B="${WORK}/state_b"
 mkdir -p "${HOME_B}" "${STATE_B}"
 touch "${STATE_B}/ezgha-watchdog.timer.enabled"   # simulate out-of-band re-arm
-run_install "${HOME_B}" "${STATE_B}"
+run_install "${HOME_B}" "${STATE_B}" --without-watchdog
 
 if [ -f "${STATE_B}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case B: default run did NOT heal a pre-enabled (out-of-band) ezgha-watchdog.timer"
+  fail "Case B: --without-watchdog did NOT disable a pre-enabled ezgha-watchdog.timer"
 else
-  echo "PASS: Case B: default run disabled a drifted-enabled ezgha-watchdog.timer"
+  echo "PASS: Case B: --without-watchdog disabled a drifted-enabled ezgha-watchdog.timer"
 fi
 
-# ── Case C: --with-watchdog arms it ───────────────────────────────────────────
+if ! grep -q "watchdog arming skipped" "${HOME_B}/install.log"; then
+  fail "Case B: install.sh did not print the watchdog opt-out skip message"
+else
+  echo "PASS: Case B: install.sh printed the watchdog opt-out skip message"
+fi
+
+# ── Case C: --with-watchdog still arms it (backward compat) ──────────────────
 HOME_C="${WORK}/home_c"
 STATE_C="${WORK}/state_c"
 mkdir -p "${HOME_C}"
