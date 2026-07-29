@@ -4574,7 +4574,8 @@ minimum_isolation = "container"
     }
 
     #[test]
-    fn release_stale_slots_releases_slot_when_runner_id_not_in_live_but_container_exists_past_grace() {
+    fn release_stale_slots_releases_slot_when_runner_id_not_in_live_but_container_exists_past_grace(
+    ) {
         // Mirrors the keep test above but with the slot's `registered_at`
         // backdated past REGISTRATION_GRACE_WINDOW. The original
         // keep-forever behavior is the bug; the new contract is "keep
@@ -4643,7 +4644,8 @@ minimum_isolation = "container"
     }
 
     #[test]
-    fn release_stale_slots_releases_slot_when_runner_id_not_in_live_and_container_list_unavailable_past_grace() {
+    fn release_stale_slots_releases_slot_when_runner_id_not_in_live_and_container_list_unavailable_past_grace(
+    ) {
         // Same as the keep-forever bug above but for the docker-ps-failed
         // (local_container_names = None) branch. Past the grace window, even
         // a docker-ps failure should not hold a slot forever.
