@@ -562,6 +562,16 @@ PLIST
         rm -f "${plist}"
         return 1
       fi
+      # Sentinel verification: the deployed watchdog script MUST contain the
+      # image-heal function — without this check, install.sh silently installs
+      # a plist pointing at an older copy of ezgha-fleet-watchdog.sh that has
+      # no ensure_runner_image, which is exactly the 2026-07-14 + 2026-07-29
+      # outage class (bead jleechan-xlo7).
+      if [[ "${name}" == "watchdog" ]] && ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
+        bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
+        rm -f "${plist}"
+        return 1
+      fi
       if ! launchctl load -w "${plist}"; then
         bad "launchctl failed to load ${plist}"
         rm -f "${plist}"

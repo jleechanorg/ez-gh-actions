@@ -160,6 +160,26 @@ done
 
 log() { echo "[$TS] $*"; }
 
+# Plist-drift self-check (added 2026-07-29; bead jleechan-xlo7). On macOS the
+# only acceptable deployment path is ~/.local/libexec/ezgha/ezgha-fleet-watchdog.sh;
+# running from anywhere else means install.sh was never re-run after a script
+# edit and the deployed plist is invoking an older / divergent copy (the
+# 2026-07-14 outage + the 2026-07-29 recurrence — same worldarchitect.ai plist
+# path, restart-looping without image-heal). Fail closed so the drift becomes
+# visible immediately instead of masquerading as "watchdog is running".
+# Set EZGHA_WATCHDOG_ALLOW_DRIFT=1 to bypass (recovery only).
+if [[ "$(uname -s)" == "Darwin" ]] && [[ "${EZGHA_WATCHDOG_ALLOW_DRIFT:-0}" -ne 1 ]]; then
+  _self_real="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+  case "$_self_real" in
+    "$HOME"/.local/libexec/ezgha/ezgha-fleet-watchdog.sh) ;;
+    *)
+      log "WATCHDOG PLIST DRIFT: running from $_self_real — expected \$HOME/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
+      log "WATCHDOG PLIST DRIFT: re-run install.sh to regenerate the plist, or set EZGHA_WATCHDOG_ALLOW_DRIFT=1 to bypass"
+      exit 78  # EX_CONFIG: launchd convention for "configuration error, will retry"
+      ;;
+  esac
+fi
+
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # parse_bsd_boottime extracts the boot epoch (the `sec` field) from macOS/BSD
