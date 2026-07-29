@@ -748,9 +748,32 @@ fn release_stale_slots_from_with_containers_for(
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 match local_container_names {
                     Some(local_names) if local_names.contains(&expected_name) => {
-                        eprintln!(
-                            "warning: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (treating as in-flight / eventual consistency)"
-                        );
+                        if slot_in_grace_window(assignments, slot) {
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            eprintln!(
+                                "info: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (within {}s JIT-propagation grace window; elapsed {elapsed}s)",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                        } else {
+                            // Beyond the grace window: GH has permanently
+                            // rejected/reaped the registration (e.g. duplicate-
+                            // name collision, server-side cleanup, or a registration
+                            // that silently failed and was never going to land).
+                            // The local container is untracked on GH and the slot
+                            // would otherwise be held forever. Force reclaim so a
+                            // fresh allocation cycle can claim it. The container
+                            // itself is left alone — it will be reaped by the next
+                            // ezgha serve tick as orphaned, and any in-flight job
+                            // it was running has already been lost (GH shows the
+                            // runner as offline/busy in this state).
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            eprintln!(
+                                "warning: releasing slot {slot_n}: local container {expected_name} still exists but GH registration {rid} has been absent for {elapsed}s (past {}s grace window) — assuming permanent GH-side rejection",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                            release_slot_for(cfg, slot_n)?;
+                            reclaimed += 1;
+                        }
                     }
                     Some(_) => {
                         // The recorded runner_id is no longer registered on GitHub
@@ -760,9 +783,27 @@ fn release_stale_slots_from_with_containers_for(
                         reclaimed += 1;
                     }
                     None => {
-                        eprintln!(
-                            "warning: keeping slot {slot_n}: docker ps failed locally so container existence for {expected_name} is unknown while GH registration {rid} is absent; skipping reclaim this tick to avoid a blind mass-reclaim"
-                        );
+                        if slot_in_grace_window(assignments, slot) {
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            eprintln!(
+                                "info: keeping slot {slot_n}: docker ps failed locally so container existence for {expected_name} is unknown while GH registration {rid} is absent (within {}s grace window; elapsed {elapsed}s)",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                        } else {
+                            // Beyond the grace window: even if docker ps is failing,
+                            // holding a slot forever because of a transient infra
+                            // issue is worse than risking one extra allocation.
+                            // The caller already logged the docker-ps failure earlier
+                            // in the serve loop; we just reclaim here so the slot
+                            // doesn't become a permanent dead reservation.
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            eprintln!(
+                                "warning: releasing slot {slot_n}: docker ps failed locally and GH registration {rid} has been absent for {elapsed}s (past {}s grace window) — reclaiming to avoid permanent reservation",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                            release_slot_for(cfg, slot_n)?;
+                            reclaimed += 1;
+                        }
                     }
                 }
             } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
@@ -4533,6 +4574,46 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn release_stale_slots_releases_slot_when_runner_id_not_in_live_but_container_exists_past_grace(
+    ) {
+        // Mirrors the keep test above but with the slot's `registered_at`
+        // backdated past REGISTRATION_GRACE_WINDOW. The original
+        // keep-forever behavior is the bug; the new contract is "keep
+        // within the grace window, force-reclaim after".
+        let _env = TestEnv::new("stale_running_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        // Backdate `registered_at` to far past the grace window.
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "slot must be reclaimed when local container exists but GH registration has been absent past the grace window (was the keep-forever bug)"
+        );
+        let assignments = read_slot_assignments().unwrap();
+        assert!(
+            !assignments.assignments.contains_key("1"),
+            "slot 1 should be released (assignments row deleted)"
+        );
+    }
+
+    #[test]
     fn release_stale_slots_keeps_slot_when_runner_id_not_in_live_but_container_list_unavailable() {
         let _env = TestEnv::new("stale_container_list_unavailable");
         let cfg = cfg_with(2, "ez-org-runner");
@@ -4559,6 +4640,44 @@ minimum_isolation = "container"
             assignments.assignments.get("1").map(String::as_str),
             Some("4242"),
             "slot 1 should remain recorded when container list is unavailable"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_releases_slot_when_runner_id_not_in_live_and_container_list_unavailable_past_grace(
+    ) {
+        // Same as the keep-forever bug above but for the docker-ps-failed
+        // (local_container_names = None) branch. Past the grace window, even
+        // a docker-ps failure should not hold a slot forever.
+        let _env = TestEnv::new("stale_container_list_unavailable_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        // None = docker ps failed at the caller.
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "slot must be reclaimed when container list is unavailable AND GH registration has been absent past the grace window"
+        );
+        let assignments = read_slot_assignments().unwrap();
+        assert!(
+            !assignments.assignments.contains_key("1"),
+            "slot 1 should be released (assignments row deleted)"
         );
     }
 
