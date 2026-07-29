@@ -479,7 +479,30 @@ check_mac() {
   fi
 
   local configured actual slots config_file="$HOME/.config/ezgha/config.toml"
-  configured=$(grep -E "^count = " "$config_file" 2>/dev/null | grep -oE "[0-9]+")
+  # Read runner.count via python TOML — a naive `grep -oE '[0-9]+'` against
+  # `count = 6` matches EVERY number on the line, including digits inside the
+  # comment (e.g. `# RESIZED 2026-07-13 ... 6x3072MB ... 24GiB`), producing a
+  # multi-line $configured that breaks the numeric [[ -ge ]] test below and
+  # makes the watchdog exit 1 every cycle. The prior worldarchitect.ai copy
+  # used the same python approach; the ez-gh-actions copy regressed to a
+  # brittle grep when rewritten in 2026-07. tomllib is stdlib on Python 3.11+,
+  # tomli is the backport for 3.10-.
+  configured=$(python3 -c '
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    sys.exit(0)
+runner = cfg.get("runner", {}) if isinstance(cfg, dict) else {}
+count = runner.get("count") if isinstance(runner, dict) else None
+if isinstance(count, int) and count >= 0:
+    print(count)
+' "$config_file" 2>/dev/null)
   actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
   slots=$(slot_count)
 
@@ -514,7 +537,24 @@ check_linux() {
   fi
   local configured actual slots
   if [[ "$(uname -s)" == "Linux" ]]; then
-    configured=$(grep -E "^count = " "$HOME/.config/ezgha/config.toml" 2>/dev/null | grep -oE "[0-9]+")
+    # Same python-TOML approach as check_mac() — avoids the comment-number
+    # matching bug from a naive grep on lines like `count = 6  # ... 6x3072MB`.
+    configured=$(python3 -c '
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    sys.exit(0)
+runner = cfg.get("runner", {}) if isinstance(cfg, dict) else {}
+count = runner.get("count") if isinstance(runner, dict) else None
+if isinstance(count, int) and count >= 0:
+    print(count)
+' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
     actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
     slots=$(slot_count)
   else
