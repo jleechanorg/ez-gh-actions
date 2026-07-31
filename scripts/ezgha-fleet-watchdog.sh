@@ -478,6 +478,21 @@ check_mac() {
     return 2
   fi
 
+  # STRUCTURAL FIX for jleechan-xlo7 followup (recurred 2026-07-14,
+  # 2026-07-29, 2026-07-31): ensure_runner_image was previously only called
+  # from do_restart_mac(), which evaluate_host() guards behind a load-gate
+  # (`if ! load_gate_ok; then skip`). Under sustained high host load (load
+  # avg 26-140 observed across the recurrences), the daemon never
+  # restarts, so the image is never rebuilt, and the ezgha serve loop stays
+  # stuck on `could not measure daemon free disk for 979 cycles` even
+  # though rebuilding the image (a few-second `docker build`) doesn't
+  # require a daemon restart at all. Lift ensure_runner_image out of the
+  # load-gated restart path: run it unconditionally at the top of every
+  # check_mac() cycle. Idempotent (it `docker image inspect`s first and
+  # only rebuilds if missing), safe to call every cycle, and image-heal
+  # becomes independent of fleet state and host load.
+  ensure_runner_image || log "MAC: ensure_runner_image returned non-zero (continuing to state check)"
+
   local configured actual slots config_file="$HOME/.config/ezgha/config.toml"
   # Read runner.count via python TOML — a naive `grep -oE '[0-9]+'` against
   # `count = 6` matches EVERY number on the line, including digits inside the

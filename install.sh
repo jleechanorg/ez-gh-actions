@@ -539,6 +539,15 @@ PLIST
         fi
         if [ "${name}" = "watchdog" ]; then
           printf '    <key>EZGHA_WATCHDOG_ALLOW_RESTART</key><string>1</string>\n' >> "${plist}"
+          # EZGHA_REPO_ROOT: ensure_runner_image() needs to locate
+          # Dockerfile.runner from its deployed libexec path. After the
+          # 2026-07-31 recurrence (load-gated restart, image stays missing
+          # under sustained high host load), this env var is what lets
+          # the unconditional rebuild actually find a Dockerfile. Mirrored
+          # manually on the live plist via `plutil -insert`; doing it here
+          # so the next install.sh run carries it forward instead of
+          # regressing to the load-gated failure mode.
+          printf '    <key>EZGHA_REPO_ROOT</key><string>%s</string>\n' "${SCRIPT_DIR}" >> "${plist}"
         fi
         cat >> "${plist}" <<PLIST
   </dict>
