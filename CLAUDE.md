@@ -55,9 +55,12 @@ image = "ezgha-runner:latest"
 ## Reproducibility discipline — no orphaned one-off fixes
 Every fix applied during an incident must land in a **git-tracked** file (`install.sh`, `Dockerfile.runner`, `config/*.toml.example`, this file, README, a `.claude/skills/*` doc, or at minimum a `br` bead with the exact remediation) before the session ends. A fix that exists only as local host state (a manually rebuilt Docker image, a hand-edited `~/Library/LaunchAgents/*.plist`, a one-off `docker build`/`sysctl`/`launchctl` invocation) is **not done** — if this machine were wiped and `./install.sh` re-run on a fresh Mac, every fix from every past incident must reappear automatically. When you fix something live on the host, ask "does `install.sh` (or the daemon/config) reproduce this on a fresh machine?" — if not, encode it there before moving on, not just in a memory file or a bead comment.
 
-## After any commit (IMPORTANT — Gate 0)
-Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
-**Every commit — even docs-only — advances HEAD**, so you must always rebuild after committing:
+## After production-affecting commits (IMPORTANT — Gate 0)
+Gate 0 checks that the installed binary's embedded SHA matches the commit deployed
+to the live fleet. The designated deploy-owner runs steps 2–5 after changes to the
+production image, installed binary, deployment scripts, or live runtime configuration.
+Docs-only, tests-only, and policy-only commits do not rebuild or restart the live fleet;
+run their relevant repository checks, commit, push, and leave production untouched.
 
 > **WHO RUNS THE DEPLOY STEPS (2–5) — single-writer rule (MANDATORY).** Steps 2–5 (`cargo install`, `systemctl restart`, `verify-exit-criteria.sh`) mutate the LIVE production fleet and are the responsibility of the **single deploy-owner** for the current session ONLY. If you are a dispatched sub-agent, a `codex exec` job, a `/sidekick` worker, or any session that is NOT the designated deploy-owner: **`cargo test` + commit + push ONLY. Do NOT run `cargo install --path .`, do NOT run `systemctl --user restart ezgha.service`, do NOT run `./docs/verify-exit-criteria.sh` (it dispatches a live canary and can auto-start units).** Hand the deploy to the deploy-owner and stop. Rationale: uncoordinated restarts stack respawn waves and have caused two host-watchdog near-misses and two self-inflicted double-restarts (2026-07-07/08); a `codex` job that ran these steps literally as "Gate 0 self-verification" restarted the prod daemon out from under the single-writer owner. When you dispatch a `codex`/sub-agent that commits in this repo, its prompt MUST include "commit + push only; do NOT cargo install / restart / run verify-exit-criteria.sh."
 
