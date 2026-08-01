@@ -14,6 +14,14 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
+# Pre-bake pip at the latest version. CI workflows that `pip install`
+# inside an `ENABLE_NETWORK_TESTS=0`-isolated job race against the
+# daemon's startup on `pip install --upgrade pip`; pre-baking here
+# removes the runtime upgrade dependency entirely. Bead jleechan-m66a.
+# `|| true` so a transient PyPI failure during image build doesn't
+# break the build (the bare `pip` is still usable; just not latest).
+RUN python3 -m pip install --upgrade --quiet pip || true
+
 # Install GitHub CLI (gh)
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
