@@ -2302,6 +2302,7 @@ exit 1
             name: name.into(),
             status: status.into(),
             busy,
+            run_id: None,
         }
     }
 

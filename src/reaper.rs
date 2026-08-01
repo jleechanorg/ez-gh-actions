@@ -517,6 +517,7 @@ pub(crate) mod test_support {
             name: name.into(),
             status: "online".into(),
             busy: true,
+            run_id: None,
         }
     }
 

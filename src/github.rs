@@ -1024,6 +1024,18 @@ pub struct RunnerInfo {
     pub name: String,
     pub status: String,
     pub busy: bool,
+    /// GitHub's reported run_id when this runner is currently executing a job
+    /// (`/repos/{owner}/{repo}/actions/runners/{id}` includes a `runId` field
+    /// only while busy). `None` when the runner is idle or when the API did
+    /// not surface the field (older API versions, secondary-rate-limit
+    /// truncation). Used by `release_stale_slots` to correlate a reclaim
+    /// decision with the in-flight job — bead jleechan-tv58.
+    ///
+    /// GitHub may also report this field as `null` while idle, so we
+    /// deserialize missing-vs-null with `#[serde(default)]` and tolerate
+    /// either as `None`.
+    #[serde(default)]
+    pub run_id: Option<u64>,
 }
 
 /// One page of `gh api --paginate --slurp` output for the runners-listing
@@ -1687,6 +1699,7 @@ mod tests {
             name: name.into(),
             status: status.into(),
             busy,
+            run_id: None,
         }
     }
 
@@ -1774,6 +1787,7 @@ mod tests {
                     name: format!("ez-runner-{id}"),
                     status: "online".into(),
                     busy: false,
+                    run_id: None,
                 })
                 .collect(),
             total_count: tc,

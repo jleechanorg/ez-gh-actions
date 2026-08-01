@@ -106,6 +106,7 @@ soak is required.
 **Cross-host (Mac)**: jleechan-5rv (P2, re-test after new binary + bxy), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
 
 ## Recent activity (by day)
+- [2026-08-01](activity/2026-08-01.md)
 
 - [2026-07-23](activity/2026-07-23.md) — AO ecosystem mission v2 closed (all 6 PRs merged across TS + Go); live Go AO cutover test surfaced the codex-launcher flag bug [jleechan-dkh7](https://github.com/jleechanorg/agent-orchestrator/issues/); harness fully restored to baseline.
 - [2026-07-12](activity/2026-07-12.md) - Host-availability program, proven QEMU/global-OOM watchdog reboot, ordered P0 containment, and Mac six-runner restoration.
