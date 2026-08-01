@@ -136,6 +136,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         write_backup: bool,
     },
+    /// Dump recent reclaim-history records from the in-memory ring buffer
+    /// (bead jleechan-uurm, first-wave Path-1 race investigation jleechan-9yx8).
+    /// Most-recent-first across all slots when `--slot` is omitted; scoped to
+    /// a single slot when `--slot N` is passed. Read-only — does not mutate
+    /// slot state or trigger any reconcile cycle. Records live in process
+    /// memory; if the daemon has not been running long enough to observe a
+    /// reclaim event, the output will be empty.
+    ReclaimHistory {
+        /// Filter to a single slot (1..=cfg.runner.count).
+        #[arg(long)]
+        slot: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1652,6 +1664,37 @@ fn main() -> Result<()> {
                     );
                 }
             }
+        }
+        Commands::ReclaimHistory { slot } => {
+            // Read-only dump of the in-process reclaim ring buffer.
+            // Records are populated by `release_stale_slots` (Path 1's
+            // empty-id branch + the four recorded-id reclaim branches + the
+            // Path 4 grace-window skip). Output is one line per record,
+            // most-recent-first. Empty output means no reclaim events have
+            // been observed in this process's lifetime — operators looking
+            // for past events should consult journald, not this subcommand.
+            let slot_key: Option<String> = slot.map(|n| n.to_string());
+            let records = docker_backend::snapshot_reclaim(slot_key.as_deref());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "bead": "jleechan-uurm",
+                    "filter_slot": slot,
+                    "record_count": records.len(),
+                    "records": records.into_iter().map(|(_k, r)| {
+                        serde_json::json!({
+                            "slot": r.slot,
+                            "runner_id": r.runner_id,
+                            "last_run_id": r.last_run_id,
+                            "peak_rss_mb": r.peak_rss_mb,
+                            "monotonic_secs": r.monotonic_secs,
+                            "wall_secs": r.wall_secs,
+                            "in_grace": r.in_grace,
+                            "reason": r.reason,
+                        })
+                    }).collect::<Vec<_>>(),
+                }))?
+            );
         }
     }
     Ok(())

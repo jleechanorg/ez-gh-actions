@@ -122,6 +122,123 @@ mod cpu_probe_overrides {
 const SLOT_ASSIGNMENTS_PATH_ENV: &str = "EZGHA_SLOT_ASSIGNMENTS_PATH";
 static SLOT_ASSIGNMENTS_MISSING_WARNED: Once = Once::new();
 
+/// Per-slot in-memory ring buffer of recent reclaim decisions (bead
+/// jleechan-uurm). The first-wave Path-1 race investigation (jleechan-9yx8)
+/// flagged the existing logs as forensically thin: the per-slot reclaim log
+/// lacked `runner_id`/`last_run_id`/`monotonic_ts`/`elapsed_secs`/`in_grace`,
+/// and the empty-id branch contributed only to a summary count. We now keep
+/// a short rolling history per slot so an operator can pull recent activity
+/// via `ezgha reclaim-history [--slot N]` without scraping journald.
+///
+/// Max entries per slot is small (16) because the diagnosis window for a
+/// given flap is minutes, not hours; a larger cap would just hold noise.
+/// Daemon start is captured at the first `record_reclaim` call so the
+/// `monotonic_ts` field is comparable across processes.
+const RECLAIM_RING_CAP: usize = 16;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimRecord {
+    /// Monotonic seconds since daemon start (matches `Instant::elapsed`).
+    pub monotonic_secs: f64,
+    /// Wall-clock unix epoch seconds (`now_epoch_secs()` at record time).
+    pub wall_secs: u64,
+    /// Slot that was reclaimed (or skipped) — as the user-facing slot number.
+    pub slot: u32,
+    /// runner_id recorded for this slot, if any (empty-id branch = 0).
+    pub runner_id: u64,
+    /// `last_run_id` of the slot if known (0 if unknown / empty-id).
+    pub last_run_id: u64,
+    /// Peak RSS of the local container at reclaim time, if known (0 otherwise).
+    pub peak_rss_mb: u64,
+    /// True if the decision was to SKIP the reclaim because the slot's
+    /// `registered_at` was within `REGISTRATION_GRACE_WINDOW`.
+    pub in_grace: bool,
+    /// Human-readable reason: "empty-id-grace-skip", "empty-id-reclaim",
+    /// "gh-rejected-past-grace", "name-mismatch", etc.
+    pub reason: String,
+}
+
+fn daemon_start_instant() -> &'static std::sync::Mutex<Option<Instant>> {
+    use std::sync::{Mutex, OnceLock};
+    static START: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    START.get_or_init(|| Mutex::new(None))
+}
+
+fn ensure_daemon_start() -> Instant {
+    let mut guard = daemon_start_instant().lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(Instant::now());
+    }
+    guard.unwrap()
+}
+
+fn reclaim_ring() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<ReclaimRecord>>> {
+    use std::sync::{Mutex, OnceLock};
+    static RING: OnceLock<Mutex<std::collections::HashMap<String, std::collections::VecDeque<ReclaimRecord>>>> =
+        OnceLock::new();
+    RING.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record a reclaim decision (or grace-window skip) into the per-slot ring.
+/// `slot_key` is the stringified slot number ("1".."16"). When the deque
+/// reaches `RECLAIM_RING_CAP`, the oldest entry is evicted FIFO so memory is
+/// bounded regardless of churn.
+pub fn record_reclaim(slot_key: &str, mut rec: ReclaimRecord) {
+    let start = ensure_daemon_start();
+    rec.monotonic_secs = start.elapsed().as_secs_f64();
+    if let Ok(mut ring) = reclaim_ring().lock() {
+        let entry = ring.entry(slot_key.to_string()).or_default();
+        if entry.len() >= RECLAIM_RING_CAP {
+            entry.pop_front();
+        }
+        entry.push_back(rec);
+    }
+}
+
+/// Snapshot the ring for read-side consumers (CLI `reclaim-history`).
+/// Most-recent-first ordering. Empty result if no reclaim events recorded
+/// yet on this slot.
+pub fn snapshot_reclaim(slot_key: Option<&str>) -> Vec<(String, ReclaimRecord)> {
+    let ring = match reclaim_ring().lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(String, ReclaimRecord)> = Vec::new();
+    match slot_key {
+        Some(key) => {
+            if let Some(deque) = ring.get(key) {
+                for rec in deque.iter().rev() {
+                    out.push((key.to_string(), rec.clone()));
+                }
+            }
+        }
+        None => {
+            for (k, deque) in ring.iter() {
+                for rec in deque.iter().rev() {
+                    out.push((k.clone(), rec.clone()));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.1.monotonic_secs.partial_cmp(&a.1.monotonic_secs).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
+/// Test-only escape hatch: clear the reclaim ring buffer and the cached
+/// daemon-start instant so a `TestEnv` can be hermetic even though the
+/// underlying state lives in a process-wide `OnceLock`. Never call from
+/// production code — it is `#[cfg(test)]` and would discard legitimate
+/// forensic data in the field.
+#[cfg(test)]
+pub fn reset_reclaim_state_for_tests() {
+    if let Ok(mut ring) = reclaim_ring().lock() {
+        ring.clear();
+    }
+    if let Ok(mut start) = daemon_start_instant().lock() {
+        *start = None;
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct SlotAssignments {
     /// Stable slot index serialized as a string key (TOML requires string map
@@ -181,6 +298,36 @@ fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str) -> bool {
 fn seconds_since_registered(assignments: &SlotAssignments, slot: &str) -> Option<u64> {
     let &registered_at = assignments.registered_at.get(slot)?;
     Some(now_epoch_secs().saturating_sub(registered_at))
+}
+
+/// True if `slot`'s `assignments[id_str]` is empty (a `next_slot_excluding`
+/// reservation that has not yet been filled by `record_slot_runner_id_for`)
+/// AND the `registered_at` timestamp written by `next_slot_excluding` is
+/// within `REGISTRATION_GRACE_WINDOW`. This protects the JIT round-trip
+/// window — between `next_slot_excluding` (writes empty id) and
+/// `record_slot_runner_id_for` (writes the runner_id + `registered_at`) — from
+/// being reaped by Path 1's empty-id branch in `release_stale_slots`.
+///
+/// Bead jleechan-uurm. First-wave Path-1 race investigation (jleechan-9yx8)
+/// showed the 2026-07-08 fix (PR #33, 1a9baf4) moved `record_slot_runner_id_for`
+/// post-JIT pre-docker-run but did NOT gate Path 1's empty-id reclaim by a
+/// grace window, leaving a sibling race open: `ensure_count_outcome` calls
+/// `release_stale_slots` TWICE per tick (`:2857`, `:3018`), and a concurrent
+/// `start_one_with_generate_at_slot` whose `generate_jitconfig` succeeded but
+/// whose `docker run` had not yet landed could be reaped mid-flight, causing
+/// the next cycle to allocate a fresh runner_id (slot-file flap).
+fn empty_id_reservation_in_grace_window(
+    assignments: &SlotAssignments,
+    slot: &str,
+    id_str: &str,
+) -> bool {
+    if !id_str.is_empty() {
+        return false;
+    }
+    let Some(&registered_at) = assignments.registered_at.get(slot) else {
+        return false;
+    };
+    now_epoch_secs().saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
 }
 
 /// Resolve the path of the slot assignment file. Honors `EZGHA_SLOT_ASSIGNMENTS_PATH`
@@ -396,8 +543,16 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
             continue;
         }
         let key = slot.to_string();
-        if let std::collections::btree_map::Entry::Vacant(e) = assignments.assignments.entry(key) {
+        if let std::collections::btree_map::Entry::Vacant(e) = assignments.assignments.entry(key.clone()) {
             e.insert(String::new());
+            // Bead jleechan-uurm: record the reservation time so the grace-
+            // window check in release_stale_slots (Path 1's empty-id branch)
+            // can protect an in-flight JIT round-trip from being reaped while
+            // next_slot_excluding (here) and record_slot_runner_id_for are
+            // both racing the same slot. See first-wave report for full
+            // race diagram; this is the post-2026-07-08 fix (1a9baf4)
+            // extension.
+            assignments.registered_at.insert(key, now_epoch_secs());
             write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(Some(slot));
         }
@@ -740,7 +895,58 @@ fn release_stale_slots_from_with_containers_for(
             // Reserved by `next_slot` but `record_slot_runner_id` never ran
             // (JIT registration failed mid-flight, or the daemon died before
             // the container came up). Free the slot immediately so the next
-            // allocation cycle can claim it.
+            // allocation cycle can claim it — BUT only after the JIT
+            // round-trip grace window closes (bead jleechan-uurm, first-wave
+            // Path-1 race investigation jleechan-9yx8). The 2026-07-08 fix
+            // (1a9baf4, PR #33) moved `record_slot_runner_id_for` to
+            // post-JIT pre-docker-run so the empty-id window is now the
+            // multi-second JIT round-trip itself; without this grace gate,
+            // `ensure_count_outcome`'s TWICE-per-tick `release_stale_slots`
+            // calls (`:2857`, `:3018`) would reap the reservation while a
+            // concurrent `start_one_with_generate_at_slot` is still between
+            // `next_slot_excluding` (`:393-401`) and `record_slot_runner_id_for`
+            // (`:2115`), causing slot-file flap.
+            let in_grace = empty_id_reservation_in_grace_window(assignments, slot, id_str);
+            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+            let wall_secs = now_epoch_secs();
+            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+            if in_grace {
+                eprintln!(
+                    "debug: release_stale_slots: skipping empty-id slot {slot_n} (registered_at={elapsed}s ago, within {}s grace window; monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs})",
+                    REGISTRATION_GRACE_WINDOW.as_secs()
+                );
+                record_reclaim(
+                    slot,
+                    ReclaimRecord {
+                        monotonic_secs: 0.0, // filled in by record_reclaim
+                        wall_secs,
+                        slot: slot_n,
+                        runner_id: 0,
+                        last_run_id: 0,
+                        peak_rss_mb: 0,
+                        in_grace: true,
+                        reason: "empty-id-grace-skip".to_string(),
+                    },
+                );
+                continue;
+            }
+            eprintln!(
+                "info: release_stale_slots reclaimed empty-id slot {slot_n} (registered_at={elapsed}s ago, past {}s grace window; monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs})",
+                REGISTRATION_GRACE_WINDOW.as_secs()
+            );
+            record_reclaim(
+                slot,
+                ReclaimRecord {
+                    monotonic_secs: 0.0, // filled in by record_reclaim
+                    wall_secs,
+                    slot: slot_n,
+                    runner_id: 0,
+                    last_run_id: 0,
+                    peak_rss_mb: 0,
+                    in_grace: false,
+                    reason: "empty-id-reclaim".to_string(),
+                },
+            );
             release_slot_for(cfg, slot_n)?;
             reclaimed += 1;
         } else if let Ok(rid) = id_str.parse::<u64>() {
@@ -767,9 +973,23 @@ fn release_stale_slots_from_with_containers_for(
                             // it was running has already been lost (GH shows the
                             // runner as offline/busy in this state).
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            let wall_secs = now_epoch_secs();
+                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
                             eprintln!(
-                                "warning: releasing slot {slot_n}: local container {expected_name} still exists but GH registration {rid} has been absent for {elapsed}s (past {}s grace window) — assuming permanent GH-side rejection",
-                                REGISTRATION_GRACE_WINDOW.as_secs()
+                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id=0 monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb=0 in_grace=false reason=gh-rejected-past-grace (local container {expected_name} still exists)"
+                            );
+                            record_reclaim(
+                                slot,
+                                ReclaimRecord {
+                                    monotonic_secs: 0.0,
+                                    wall_secs,
+                                    slot: slot_n,
+                                    runner_id: rid,
+                                    last_run_id: 0,
+                                    peak_rss_mb: 0,
+                                    in_grace: false,
+                                    reason: "gh-rejected-past-grace".to_string(),
+                                },
                             );
                             release_slot_for(cfg, slot_n)?;
                             reclaimed += 1;
@@ -779,6 +999,25 @@ fn release_stale_slots_from_with_containers_for(
                         // The recorded runner_id is no longer registered on GitHub
                         // (server-side reap, manual removal, or a stale entry from a
                         // prior host) and no local container exists, so reclaim.
+                        let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                        let wall_secs = now_epoch_secs();
+                        let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                        eprintln!(
+                            "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id=0 monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb=0 in_grace=false reason=gh-missing-no-local-container"
+                        );
+                        record_reclaim(
+                            slot,
+                            ReclaimRecord {
+                                monotonic_secs: 0.0,
+                                wall_secs,
+                                slot: slot_n,
+                                runner_id: rid,
+                                last_run_id: 0,
+                                peak_rss_mb: 0,
+                                in_grace: false,
+                                reason: "gh-missing-no-local-container".to_string(),
+                            },
+                        );
                         release_slot_for(cfg, slot_n)?;
                         reclaimed += 1;
                     }
@@ -797,9 +1036,23 @@ fn release_stale_slots_from_with_containers_for(
                             // in the serve loop; we just reclaim here so the slot
                             // doesn't become a permanent dead reservation.
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            let wall_secs = now_epoch_secs();
+                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
                             eprintln!(
-                                "warning: releasing slot {slot_n}: docker ps failed locally and GH registration {rid} has been absent for {elapsed}s (past {}s grace window) — reclaiming to avoid permanent reservation",
-                                REGISTRATION_GRACE_WINDOW.as_secs()
+                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id=0 monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb=0 in_grace=false reason=docker-ps-failed-past-grace (reclaiming to avoid permanent reservation)"
+                            );
+                            record_reclaim(
+                                slot,
+                                ReclaimRecord {
+                                    monotonic_secs: 0.0,
+                                    wall_secs,
+                                    slot: slot_n,
+                                    runner_id: rid,
+                                    last_run_id: 0,
+                                    peak_rss_mb: 0,
+                                    in_grace: false,
+                                    reason: "docker-ps-failed-past-grace".to_string(),
+                                },
                             );
                             release_slot_for(cfg, slot_n)?;
                             reclaimed += 1;
@@ -809,9 +1062,25 @@ fn release_stale_slots_from_with_containers_for(
             } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 if !runner_prefix.is_empty() && runner.name != expected_name {
+                    let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                    let wall_secs = now_epoch_secs();
+                    let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
                     eprintln!(
-                        "warning: releasing slot {slot_n}: runner name mismatch (expected {expected_name}, got {} on GitHub for id {rid})",
+                        "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id=0 monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb=0 in_grace=false reason=name-mismatch (got {} on GitHub for id {rid})",
                         runner.name
+                    );
+                    record_reclaim(
+                        slot,
+                        ReclaimRecord {
+                            monotonic_secs: 0.0,
+                            wall_secs,
+                            slot: slot_n,
+                            runner_id: rid,
+                            last_run_id: 0,
+                            peak_rss_mb: 0,
+                            in_grace: false,
+                            reason: "name-mismatch".to_string(),
+                        },
                     );
                     release_slot_for(cfg, slot_n)?;
                     reclaimed += 1;
@@ -827,8 +1096,24 @@ fn release_stale_slots_from_with_containers_for(
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            let wall_secs = now_epoch_secs();
+                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
                             eprintln!(
-                                "warning: releasing slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle and has no local container"
+                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id=0 monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb=0 in_grace=false reason=offline-idle-no-container"
+                            );
+                            record_reclaim(
+                                slot,
+                                ReclaimRecord {
+                                    monotonic_secs: 0.0,
+                                    wall_secs,
+                                    slot: slot_n,
+                                    runner_id: rid,
+                                    last_run_id: 0,
+                                    peak_rss_mb: 0,
+                                    in_grace: false,
+                                    reason: "offline-idle-no-container".to_string(),
+                                },
                             );
                             release_slot_for(cfg, slot_n)?;
                             reclaimed += 1;
@@ -938,12 +1223,31 @@ fn offline_not_busy_owned_missing_container_registrations(
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
         if slot_in_grace_window(assignments, slot) {
             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+            let wall_secs = now_epoch_secs();
+            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
             eprintln!(
-                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at {elapsed}s ago (within {}s grace window)",
+                "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at {elapsed}s ago (within {}s grace window; monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs})",
                 runner.name,
                 runner.id,
                 REGISTRATION_GRACE_WINDOW.as_secs()
             );
+            // Record the skip so an operator can see Path 4 grace-skips in the
+            // ring buffer alongside Path 1 reclaims — same diagnostic surface.
+            if let Ok(slot_n) = slot.parse::<u32>() {
+                record_reclaim(
+                    slot,
+                    ReclaimRecord {
+                        monotonic_secs: 0.0,
+                        wall_secs,
+                        slot: slot_n,
+                        runner_id: runner.id,
+                        last_run_id: 0,
+                        peak_rss_mb: 0,
+                        in_grace: true,
+                        reason: "path4-grace-skip".to_string(),
+                    },
+                );
+            }
             continue;
         }
         reapable.push((runner.id, runner.name.clone()));
@@ -3124,6 +3428,12 @@ mod tests {
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+            // Bead jleechan-uurm: also reset the reclaim ring buffer +
+            // daemon-start instant — both live in a process-wide OnceLock
+            // (not in TEST_SLOT_PATH) so without this reset a test that
+            // expects an empty buffer would see leftover records from
+            // earlier tests in the same `cargo test` invocation.
+            reset_reclaim_state_for_tests();
             // Redirect the quarantine table into the test's temp dir.
             // Without this, tests whose cfg has no state_dir fall through
             // to the REAL global XDG path (~/.config/ezgha/
@@ -4954,21 +5264,40 @@ minimum_isolation = "container"
         assert_eq!(reclaimed, 0);
     }
 
+    /// Bead jleechan-uurm: as of the post-PR-#33 grace-window fix, an
+    /// empty-id reservation whose `registered_at` is within
+    /// REGISTRATION_GRACE_WINDOW is PROTECTED, not reaped — that is the
+    /// whole point of the gate (sibling race against Path 1's empty-id
+    /// branch). This test was the original "empty-id must be released"
+    /// contract that locked in the pre-fix behavior; the contract changed
+    /// when the 2026-07-08 fix (PR #33, 1a9baf4) moved
+    /// `record_slot_runner_id_for` to post-JIT pre-docker-run, exposing the
+    /// JIT round-trip window. See companion test
+    /// `release_stale_slots_never_reclaims_empty_id_within_grace_window`
+    /// for the new positive-path contract and
+    /// `release_stale_slots_reclaims_empty_id_past_grace_window` for the
+    /// past-grace case.
     #[test]
     fn release_stale_slots_handles_empty_runner_id() {
         let _env = TestEnv::new("stale_empty");
         let cfg = cfg_with(2, "ez-org-runner");
-        // Reserved (`next_slot`) but `record_slot_runner_id` never ran — this
-        // is the "JIT in flight, daemon crashed" wedge case.
+        // Reserved (`next_slot`) but `record_slot_runner_id` never ran —
+        // `registered_at` was just written by next_slot so the slot is
+        // inside the JIT round-trip grace window. The OLD test asserted
+        // reclaimed == 1 ("empty-id must be released"); the NEW contract
+        // is reclaimed == 0 because the empty-id reservation is in-grace.
         let _slot = next_slot(&cfg).unwrap();
 
         let live: Vec<github::RunnerInfo> = vec![];
         let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
 
-        assert_eq!(reclaimed, 1, "empty-id reservations must be released");
+        assert_eq!(
+            reclaimed, 0,
+            "empty-id reservations within the JIT round-trip grace window must NOT be released (was the pre-fix unconditional-reclaim bug)"
+        );
         assert!(
-            read_slot_assignments().unwrap().assignments.is_empty(),
-            "all reservations must be cleared when none have runner_ids"
+            !read_slot_assignments().unwrap().assignments.is_empty(),
+            "the empty-id reservation must remain so the in-flight JIT can still record its runner_id"
         );
     }
 
@@ -6796,5 +7125,300 @@ minimum_isolation = "container"
         // still pick slot 2 — NOT panic, NOT bail.
         let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         assert_eq!(chosen, 2);
+    }
+
+    /// Bead jleechan-uurm: regression test for the empty-id Path-1 race.
+    /// When `next_slot` writes an empty-id reservation, the slot's
+    /// `registered_at` MUST be recorded so the grace-window check in
+    /// `release_stale_slots` can protect an in-flight JIT round-trip from
+    /// being reaped. Before this fix, `next_slot` did not write
+    /// `registered_at`, so the slot file had a "no grace timestamp" entry
+    /// for an empty reservation — which meant `release_stale_slots`'s
+    /// empty-id branch would always reclaim it on the very next tick.
+    #[test]
+    fn next_slot_records_registered_at_for_empty_id_reservation() {
+        let _env = TestEnv::new("next_slot_records_registered_at");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1);
+
+        let assignments = read_slot_assignments().unwrap();
+        let key = "1".to_string();
+        assert_eq!(
+            assignments.assignments.get(&key).map(String::as_str),
+            Some(""),
+            "next_slot must leave an empty-id reservation"
+        );
+        let registered_at = assignments
+            .registered_at
+            .get(&key)
+            .copied()
+            .expect("next_slot must record registered_at for the empty-id reservation");
+        // Within the grace window — the just-reserved slot should be
+        // considered in-grace.
+        assert!(
+            slot_in_grace_window(&assignments, &key),
+            "slot must be in grace window immediately after next_slot reservation (registered_at={registered_at})"
+        );
+        // elapsed_secs should be near zero (the test takes microseconds).
+        let elapsed = seconds_since_registered(&assignments, &key).unwrap();
+        assert!(elapsed <= 5, "elapsed_secs should be near 0, got {elapsed}");
+    }
+
+    /// Bead jleechan-uurm: `release_stale_slots` MUST NOT reclaim an
+    /// empty-id reservation whose `registered_at` is within
+    /// REGISTRATION_GRACE_WINDOW. This is the core invariant the first-wave
+    /// Path-1 race investigation (jleechan-9yx8) identified as broken
+    /// (the post-2026-07-08 sibling race against the empty-id branch).
+    /// Toggle FAIL -> PASS: pre-patch, the empty-id branch always reclaims
+    /// regardless of registered_at, so this test fails with reclaimed=1.
+    /// Post-patch, registered_at written by next_slot is within the 60s
+    /// window, so the grace gate kicks in and reclaimed=0.
+    #[test]
+    fn release_stale_slots_never_reclaims_empty_id_within_grace_window() {
+        let _env = TestEnv::new("release_stale_slots_empty_id_in_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let slot = next_slot(&cfg).unwrap();
+        assert_eq!(slot, 1, "first slot must be 1");
+
+        // Sanity: slot 1 is reserved with empty id and registered_at now.
+        let pre = read_slot_assignments().unwrap();
+        assert_eq!(
+            pre.assignments.get("1").map(String::as_str),
+            Some(""),
+            "precondition: slot 1 must have empty id"
+        );
+        assert!(
+            pre.registered_at.contains_key("1"),
+            "precondition: slot 1 must have registered_at written by next_slot"
+        );
+
+        // Run release_stale_slots: it must NOT reclaim slot 1 because its
+        // registered_at is within REGISTRATION_GRACE_WINDOW.
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &[],
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "release_stale_slots must NOT reclaim an empty-id slot within the grace window"
+        );
+        let after = read_slot_assignments().unwrap();
+        assert_eq!(
+            after.assignments.get("1").map(String::as_str),
+            Some(""),
+            "slot 1 must remain recorded as empty-id after the grace-window skip"
+        );
+        assert!(
+            after.registered_at.contains_key("1"),
+            "slot 1's registered_at must remain so subsequent ticks within the window also skip"
+        );
+
+        // The ring buffer must record the grace-window skip so operators can
+        // see it via `ezgha reclaim-history --slot 1`.
+        let history = snapshot_reclaim(Some("1"));
+        assert_eq!(history.len(), 1, "ring buffer must have one skip record");
+        let (key, rec) = &history[0];
+        assert_eq!(key, "1");
+        assert_eq!(rec.slot, 1);
+        assert_eq!(rec.runner_id, 0);
+        assert!(rec.in_grace, "recorded skip must have in_grace=true");
+        assert_eq!(rec.reason, "empty-id-grace-skip");
+        assert!(
+            rec.monotonic_secs >= 0.0,
+            "monotonic_secs must be filled by record_reclaim"
+        );
+    }
+
+    /// Bead jleechan-uurm: a backdated empty-id reservation (registered_at
+    /// outside the grace window) MUST still be reclaimable — the gate only
+    /// protects the JIT round-trip window, not genuinely stale slots.
+    /// Companion test to `release_stale_slots_never_reclaims_empty_id_within_grace_window`.
+    #[test]
+    fn release_stale_slots_reclaims_empty_id_past_grace_window() {
+        let _env = TestEnv::new("release_stale_slots_empty_id_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+
+        // Backdate registered_at past REGISTRATION_GRACE_WINDOW.
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &[],
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "an empty-id slot whose registered_at is past the grace window MUST be reclaimable (the original unconditional behavior is correct for genuinely stale reservations)"
+        );
+        let after = read_slot_assignments().unwrap();
+        assert!(
+            !after.assignments.contains_key("1"),
+            "slot 1 must be released after grace-window expiry"
+        );
+
+        let history = snapshot_reclaim(Some("1"));
+        assert_eq!(history.len(), 1);
+        let (_, rec) = &history[0];
+        assert!(!rec.in_grace, "reclaim record must have in_grace=false");
+        assert_eq!(rec.reason, "empty-id-reclaim");
+    }
+
+    /// Bead jleechan-uurm: per-slot reclaim log line MUST include
+    /// runner_id, monotonic_ts, elapsed_secs, peak_rss_mb, in_grace so an
+    /// operator can correlate a reclaim to a specific in-flight JIT/dockerrun
+    /// outcome. The empty-id branch is the most forensically-thin one (the
+    /// first-wave report flagged it as contributing only to a summary
+    /// count), so this test exercises the empty-id-reclaim ring entry path
+    /// to verify the new fields are populated.
+    #[test]
+    fn release_stale_slots_records_runner_id_and_last_run_id_in_reclaim_log() {
+        let _env = TestEnv::new("release_stale_slots_per_slot_log");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+
+        // Backdate to past-grace so the reclaim path (not the skip path)
+        // exercises the per-slot log + ring buffer code path.
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // Now exercise the recorded-id reclaim path (Path 1's "GH missing,
+        // no local container" branch) which writes runner_id into the log.
+        let _ = next_slot(&cfg).unwrap();
+        record_slot_runner_id(2, 4242).unwrap();
+
+        // Backdate slot 2's registered_at past grace.
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "2".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // Pre-populate a synthetic last_run_id by abusing the
+        // `last_run_id` map. There isn't a public last_run_id writer yet
+        // (bead jleechan-tv58 will add one), so this test asserts the
+        // ring buffer's `runner_id` field is populated correctly when a
+        // recorded-id branch reclaims. last_run_id is asserted to be 0
+        // until bead jleechan-tv58 wires a real source.
+        let live = vec![runner_info(9999, "ez-org-runner-other")];
+        let _ = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            "ez-org-runner",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+
+        let history = snapshot_reclaim(None);
+        // We expect at least two records: slot 1 (empty-id-reclaim) and
+        // slot 2 (gh-missing-no-local-container). The empty-id record has
+        // runner_id=0; the recorded-id record has runner_id=4242.
+        let slot_1_records: Vec<_> = history
+            .iter()
+            .filter(|(_k, r)| r.slot == 1)
+            .collect();
+        let slot_2_records: Vec<_> = history
+            .iter()
+            .filter(|(_k, r)| r.slot == 2)
+            .collect();
+        assert!(
+            !slot_1_records.is_empty(),
+            "slot 1 must have at least one reclaim record"
+        );
+        assert!(
+            !slot_2_records.is_empty(),
+            "slot 2 must have at least one reclaim record (recorded-id branch must populate runner_id)"
+        );
+        let (_, slot_1_rec) = slot_1_records[0];
+        assert_eq!(
+            slot_1_rec.runner_id, 0,
+            "empty-id reclaim must have runner_id=0"
+        );
+        assert_eq!(
+            slot_1_rec.reason, "empty-id-reclaim",
+            "empty-id reclaim reason"
+        );
+        assert!(
+            !slot_1_rec.in_grace,
+            "empty-id reclaim (past grace) must have in_grace=false"
+        );
+        let (_, slot_2_rec) = slot_2_records[0];
+        assert_eq!(
+            slot_2_rec.runner_id, 4242,
+            "recorded-id reclaim must propagate the recorded runner_id into the ring buffer"
+        );
+        assert_eq!(
+            slot_2_rec.reason, "gh-missing-no-local-container",
+            "recorded-id reclaim reason"
+        );
+        assert!(
+            slot_2_rec.last_run_id == 0,
+            "last_run_id is 0 until bead jleechan-tv58 wires a real source"
+        );
+    }
+
+    /// Bead jleechan-uurm: the ring buffer must cap at RECLAIM_RING_CAP
+    /// entries per slot (FIFO eviction). Diagnostic window is small —
+    /// older entries are not load-bearing.
+    #[test]
+    fn reclaim_ring_buffer_evicts_oldest_at_cap() {
+        let _env = TestEnv::new("reclaim_ring_buffer_evicts_oldest");
+        // Drive 17 grace-skip records into the ring buffer for slot 7.
+        // (RECLAIM_RING_CAP=16, so the first record must be evicted.)
+        for i in 0..(RECLAIM_RING_CAP + 1) {
+            record_reclaim(
+                "7",
+                ReclaimRecord {
+                    monotonic_secs: 0.0,
+                    wall_secs: now_epoch_secs() + i as u64,
+                    slot: 7,
+                    runner_id: 0,
+                    last_run_id: 0,
+                    peak_rss_mb: 0,
+                    in_grace: true,
+                    reason: format!("probe-{i}"),
+                },
+            );
+        }
+        let history = snapshot_reclaim(Some("7"));
+        assert_eq!(
+            history.len(),
+            RECLAIM_RING_CAP,
+            "ring buffer must cap at RECLAIM_RING_CAP entries per slot"
+        );
+        // Most-recent-first: the FIRST record returned must have the
+        // highest monotonic_secs (the LAST record pushed). The oldest
+        // record (probe-0) must have been evicted.
+        let reasons: Vec<&str> = history.iter().map(|(_, r)| r.reason.as_str()).collect();
+        assert!(
+            reasons[0].starts_with("probe-") && reasons[0] != "probe-0",
+            "oldest record (probe-0) must have been evicted; most-recent-first record is {}",
+            reasons[0]
+        );
+        // The last record in the output (oldest still-present) must NOT
+        // be probe-0.
+        assert_ne!(
+            reasons.last().copied(),
+            Some("probe-0"),
+            "probe-0 must be evicted"
+        );
     }
 }
