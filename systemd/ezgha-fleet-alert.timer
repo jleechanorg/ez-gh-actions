@@ -1,0 +1,19 @@
+[Unit]
+Description=ezgha fleet health alerting timer (deterministic, multi-window hysteresis)
+# This timer fires the corresponding .service every 5 minutes. The
+# alerting script (scripts/ezgha-fleet-alert.sh) is the deterministic
+# half of bead jleechan-vg1d — NO AI in the polling loop. Multi-window
+# hysteresis (5-min short + 1-hour long) means it only fires when BOTH
+# windows confirm a degraded fleet.
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*:0/5
+# Persistent=true: catch up missed runs (e.g., after sleep, after the
+# host was paused/resumed). The script is idempotent and read-only with
+# respect to daemon state, so a backfill run is harmless.
+Persistent=true
+Unit=ezgha-fleet-alert.service
+
+[Install]
+WantedBy=timers.target
