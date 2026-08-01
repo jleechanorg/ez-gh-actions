@@ -160,6 +160,26 @@ done
 
 log() { echo "[$TS] $*"; }
 
+# Plist-drift self-check (added 2026-07-29; bead jleechan-xlo7). On macOS the
+# only acceptable deployment path is ~/.local/libexec/ezgha/ezgha-fleet-watchdog.sh;
+# running from anywhere else means install.sh was never re-run after a script
+# edit and the deployed plist is invoking an older / divergent copy (the
+# 2026-07-14 outage + the 2026-07-29 recurrence — same worldarchitect.ai plist
+# path, restart-looping without image-heal). Fail closed so the drift becomes
+# visible immediately instead of masquerading as "watchdog is running".
+# Set EZGHA_WATCHDOG_ALLOW_DRIFT=1 to bypass (recovery only).
+if [[ "$(uname -s)" == "Darwin" ]] && [[ "${EZGHA_WATCHDOG_ALLOW_DRIFT:-0}" -ne 1 ]]; then
+  _self_real="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+  case "$_self_real" in
+    "$HOME"/.local/libexec/ezgha/ezgha-fleet-watchdog.sh) ;;
+    *)
+      log "WATCHDOG PLIST DRIFT: running from $_self_real — expected \$HOME/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
+      log "WATCHDOG PLIST DRIFT: re-run install.sh to regenerate the plist, or set EZGHA_WATCHDOG_ALLOW_DRIFT=1 to bypass"
+      exit 78  # EX_CONFIG: launchd convention for "configuration error, will retry"
+      ;;
+  esac
+fi
+
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 
 # parse_bsd_boottime extracts the boot epoch (the `sec` field) from macOS/BSD
@@ -458,8 +478,46 @@ check_mac() {
     return 2
   fi
 
+  # STRUCTURAL FIX for jleechan-xlo7 followup (recurred 2026-07-14,
+  # 2026-07-29, 2026-07-31): ensure_runner_image was previously only called
+  # from do_restart_mac(), which evaluate_host() guards behind a load-gate
+  # (`if ! load_gate_ok; then skip`). Under sustained high host load (load
+  # avg 26-140 observed across the recurrences), the daemon never
+  # restarts, so the image is never rebuilt, and the ezgha serve loop stays
+  # stuck on `could not measure daemon free disk for 979 cycles` even
+  # though rebuilding the image (a few-second `docker build`) doesn't
+  # require a daemon restart at all. Lift ensure_runner_image out of the
+  # load-gated restart path: run it unconditionally at the top of every
+  # check_mac() cycle. Idempotent (it `docker image inspect`s first and
+  # only rebuilds if missing), safe to call every cycle, and image-heal
+  # becomes independent of fleet state and host load.
+  ensure_runner_image || log "MAC: ensure_runner_image returned non-zero (continuing to state check)"
+
   local configured actual slots config_file="$HOME/.config/ezgha/config.toml"
-  configured=$(grep -E "^count = " "$config_file" 2>/dev/null | grep -oE "[0-9]+")
+  # Read runner.count via python TOML — a naive `grep -oE '[0-9]+'` against
+  # `count = 6` matches EVERY number on the line, including digits inside the
+  # comment (e.g. `# RESIZED 2026-07-13 ... 6x3072MB ... 24GiB`), producing a
+  # multi-line $configured that breaks the numeric [[ -ge ]] test below and
+  # makes the watchdog exit 1 every cycle. The prior worldarchitect.ai copy
+  # used the same python approach; the ez-gh-actions copy regressed to a
+  # brittle grep when rewritten in 2026-07. tomllib is stdlib on Python 3.11+,
+  # tomli is the backport for 3.10-.
+  configured=$(python3 -c '
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    sys.exit(0)
+runner = cfg.get("runner", {}) if isinstance(cfg, dict) else {}
+count = runner.get("count") if isinstance(runner, dict) else None
+if isinstance(count, int) and count >= 0:
+    print(count)
+' "$config_file" 2>/dev/null)
   actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
   slots=$(slot_count)
 
@@ -494,7 +552,24 @@ check_linux() {
   fi
   local configured actual slots
   if [[ "$(uname -s)" == "Linux" ]]; then
-    configured=$(grep -E "^count = " "$HOME/.config/ezgha/config.toml" 2>/dev/null | grep -oE "[0-9]+")
+    # Same python-TOML approach as check_mac() — avoids the comment-number
+    # matching bug from a naive grep on lines like `count = 6  # ... 6x3072MB`.
+    configured=$(python3 -c '
+import sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+try:
+    with open(sys.argv[1], "rb") as f:
+        cfg = tomllib.load(f)
+except Exception:
+    sys.exit(0)
+runner = cfg.get("runner", {}) if isinstance(cfg, dict) else {}
+count = runner.get("count") if isinstance(runner, dict) else None
+if isinstance(count, int) and count >= 0:
+    print(count)
+' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
     actual=$(timeout 30 "$EZGHA" status 2>/dev/null | grep -oE "managed containers: [0-9]+" | grep -oE "[0-9]+")
     slots=$(slot_count)
   else

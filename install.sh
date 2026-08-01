@@ -539,6 +539,15 @@ PLIST
         fi
         if [ "${name}" = "watchdog" ]; then
           printf '    <key>EZGHA_WATCHDOG_ALLOW_RESTART</key><string>1</string>\n' >> "${plist}"
+          # EZGHA_REPO_ROOT: ensure_runner_image() needs to locate
+          # Dockerfile.runner from its deployed libexec path. After the
+          # 2026-07-31 recurrence (load-gated restart, image stays missing
+          # under sustained high host load), this env var is what lets
+          # the unconditional rebuild actually find a Dockerfile. Mirrored
+          # manually on the live plist via `plutil -insert`; doing it here
+          # so the next install.sh run carries it forward instead of
+          # regressing to the load-gated failure mode.
+          printf '    <key>EZGHA_REPO_ROOT</key><string>%s</string>\n' "${SCRIPT_DIR}" >> "${plist}"
         fi
         cat >> "${plist}" <<PLIST
   </dict>
@@ -559,6 +568,16 @@ PLIST
       plist_scanned="$(sed '/<!--/,/-->/d' "${plist}")"
       if grep -qF "${SCRIPT_DIR}" <<<"${plist_scanned}" || grep -qi 'worktree' <<<"${plist_scanned}"; then
         bad "refusing to load ${plist}: still references the repo/worktree checkout path"
+        rm -f "${plist}"
+        return 1
+      fi
+      # Sentinel verification: the deployed watchdog script MUST contain the
+      # image-heal function — without this check, install.sh silently installs
+      # a plist pointing at an older copy of ezgha-fleet-watchdog.sh that has
+      # no ensure_runner_image, which is exactly the 2026-07-14 + 2026-07-29
+      # outage class (bead jleechan-xlo7).
+      if [[ "${name}" == "watchdog" ]] && ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
+        bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
         rm -f "${plist}"
         return 1
       fi
