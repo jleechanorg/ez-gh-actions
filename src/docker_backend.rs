@@ -49,7 +49,16 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
 // full reconciliation. The probe budget is far below the 300s watchdog margin.
-const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(5);
+//
+// Bead jleechan-viff follow-up (2026-08-01): the previous 5s budget was
+// insufficient for 6 sequential `docker top` calls (each capped at
+// `LOCAL_TOP_TIMEOUT: 1s`; 6 × 1s = 6s ≯ 5s) under host pressure — caused
+// the budget-exhausted path to fire on the 6th container, emitting a
+// false-positive CRITICAL even though the runner-present fix (PR #112) was
+// already in place. Raised to 30s so 6 probes comfortably fit (6 × 1s = 6s
+// + safety margin) and the runner-present check actually runs to completion.
+// Still well under the 300s watchdog margin.
+const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
 
