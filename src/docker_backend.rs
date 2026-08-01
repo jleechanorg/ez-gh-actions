@@ -2572,6 +2572,19 @@ fn start_one_with_generate_at_slot(
             cmd.args(["-e", "PIP_FIND_LINKS=/opt/wheelhouse"]);
         }
     }
+    // Opt-in persistent pip DOWNLOAD cache (bead jleechan-m66a + worldarchitect.ai
+    // jleechan-yov): read-write mount of a host directory into the container's
+    // `~/.cache/pip`, complementary to the wheelhouse above. Wheelhouse is for
+    // pre-staged wheels (read-only); this is the writeable metadata cache pip
+    // writes on every `pip install` (--cache-dir default). Without it, every
+    // ephemeral container rebuilds the wheel metadata from scratch on every
+    // install, even when the python deps haven't changed. Fail-open on absence.
+    if let Some(pip_cache) = &cfg.runner.pip_cache_host_path {
+        if std::path::Path::new(pip_cache).is_dir() {
+            cmd.args(["-v", &format!("{}:/home/runner/.cache/pip", pip_cache.display())]);
+            cmd.args(["-e", "PIP_CACHE_DIR=/home/runner/.cache/pip"]);
+        }
+    }
     // Opt-in per-runner job workspace (bead jleechan-93cf): read-write mount
     // so checkouts/builds/test scratch land in a host-visible, trim-eligible
     // directory instead of the container's ephemeral writable overlay layer.

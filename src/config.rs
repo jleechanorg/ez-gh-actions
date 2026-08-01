@@ -301,6 +301,23 @@ pub struct RunnerConfig {
     /// looking "configured" while doing nothing.
     #[serde(default)]
     pub wheelhouse_host_path: Option<String>,
+    /// Host-side directory for the persistent `pip` download cache,
+    /// bind-mounted read-write into each container at
+    /// `/home/runner/.cache/pip` (the `pip` default). Complementary to
+    /// `wheelhouse_host_path` — that one is a READ-ONLY mount of
+    /// pre-staged wheels (via `PIP_FIND_LINKS=/opt/wheelhouse`), this one
+    /// is a READ-WRITE mount of the pip download cache (via
+    /// `PIP_CACHE_DIR=/home/runner/.cache/pip`). Both together cover
+    /// ephemeral-isolated CI runs (e.g. `ENABLE_NETWORK_TESTS=0`):
+    /// wheelhouse = pre-staged packages, pip_cache = every install's
+    /// `pip download` artifacts. Without pip_cache, every job that does
+    /// `pip install` rebuilds the entire wheel metadata cache from
+    /// scratch, even when the python deps haven't changed. Bead
+    /// jleechan-m66a (combined with worldarchitect.ai jleechan-yov).
+    /// Fail-open: missing directory is silently skipped, never a
+    /// correctness-required dependency. Default `None`.
+    #[serde(default)]
+    pub pip_cache_host_path: Option<std::path::PathBuf>,
     /// Host-side parent directory for per-runner job workspaces
     /// (`{workspace_host_path}/{runner_name}`), bind-mounted read-write into
     /// each container at `/home/runner/_work` -- the actions/runner default
@@ -529,6 +546,7 @@ impl Config {
                 guest_reserve_mb: default_guest_reserve_mb(),
                 runner_floor_mb: default_runner_floor_mb(),
                 wheelhouse_host_path: None,
+                pip_cache_host_path: None,
                 workspace_host_path: None,
             },
             limits: Limits {
@@ -783,6 +801,7 @@ minimum_isolation = "container"
             guest_reserve_mb: default_guest_reserve_mb(),
             runner_floor_mb: default_runner_floor_mb(),
             wheelhouse_host_path: None,
+            pip_cache_host_path: None,
             workspace_host_path: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
