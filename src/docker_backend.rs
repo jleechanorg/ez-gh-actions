@@ -7526,8 +7526,17 @@ minimum_isolation = "container"
     /// absent / idle. This is the path that the recorded-id reclaim
     /// branches use to surface the in-flight `run_id` into the log line
     /// and ring buffer.
+    ///
+    /// Test name matches the `tests/slot_drift_reclaim_correlation_test.sh`
+    /// CI gate (bead jleechan-tv58 acceptance criterion 4): the bash script
+    /// filters `cargo test` by this exact name and fails if the line
+    /// `test live_runners_last_run_id_is_some_for_busy_runner_with_run_id
+    /// ... ok` is not present. Pre-patch (no RunnerInfo.run_id field,
+    /// no helper) the test does not exist -> cargo matches 0 tests ->
+    /// no `ok` line -> bash gate fails. Post-patch the test exists and
+    /// passes -> bash gate passes.
     #[test]
-    fn live_runners_last_run_id_returns_run_id_or_none() {
+    fn live_runners_last_run_id_is_some_for_busy_runner_with_run_id() {
         let live = vec![
             github::RunnerInfo {
                 id: 100,

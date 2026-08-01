@@ -49,6 +49,18 @@ jobs:
           bash tests/doctor_runner_live_slot_gate_test.sh
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
+      - name: Slot-drift reclaim correlation regression test (bead jleechan-tv58)
+        # Hermetic test (no Docker daemon, no GitHub auth required). Runs
+        # the production `release_stale_slots_from_with_containers` path
+        # via `cargo test --bin ezgha` and asserts the recorded-id
+        # reclaim branch surfaces `last_run_id` from a non-zero
+        # `RunnerInfo.run_id`. Pre-patch the test name does not exist
+        # (`RunnerInfo.run_id` was added in commit fcf373c on
+        # jleechan-uurm-slot-reclaim-grace-window), so cargo matches
+        # zero tests and the bash gate fails. Wired as a required job on
+        # every PR. Timeout: 10 min (test runs in ~10s in CI).
+        timeout-minutes: 10
+        run: bash tests/slot_drift_reclaim_correlation_test.sh
       - name: Install ripgrep for integrate.sh PR-payload regression test
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Host-ops, GitHub App token, and PR-payload regression tests
