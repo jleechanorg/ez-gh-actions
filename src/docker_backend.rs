@@ -2726,6 +2726,24 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
     managed_containers_with_timeout(DOCKER_TIMEOUT)
 }
 
+/// True if the container's `docker top` output contains a `Runner.Worker` or
+/// `Runner.Listener` process. Both indicate the runner is registered and
+/// ready to take jobs (Worker = currently running one, Listener = idle and
+/// polling GitHub for a job). A container with NEITHER is a real defect
+/// (the runner process died / never started). Bead jleechan-viff: prior code
+/// (`runner_worker_present`) only checked for Worker, which misclassified
+/// idle-but-healthy listeners as "not executing" and triggered false-positive
+/// `runner startup settling ceiling reached: 0/6 executing locally` CRITICAL
+/// during normal idle periods.
+fn runner_present(output: &str) -> bool {
+    output.lines().skip(1).any(|line| {
+        matches!(
+            line.split_whitespace().nth(1),
+            Some("Runner.Worker" | "Runner.Listener")
+        )
+    })
+}
+
 fn runner_worker_present(output: &str) -> bool {
     output
         .lines()
@@ -2775,7 +2793,13 @@ fn executing_runner_count_from_containers(
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        if runner_worker_present(&String::from_utf8_lossy(&out.stdout)) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if runner_present(&stdout) {
+            // Bead jleechan-viff: previously `runner_worker_present` only —
+            // misclassified idle listeners as "not executing" and triggered
+            // false-positive settling-ceiling CRITICAL. New `runner_present`
+            // accepts Runner.Worker (job in flight) OR Runner.Listener
+            // (registered + idle) as "ready to take jobs".
             executing += 1;
         }
     }
@@ -4428,6 +4452,30 @@ minimum_isolation = "container"
         assert!(!runner_worker_present("PID COMMAND\n101 Runner.Listener\n"));
         assert!(!runner_worker_present(
             "PID COMMAND\n202 NotRunner.Workerish\n"
+        ));
+    }
+
+    /// Bead jleechan-viff: `runner_present` (the new function used by the
+    /// daemon's settling-ceiling check) accepts both `Runner.Worker` (job in
+    /// flight) AND `Runner.Listener` (registered + idle) as "ready to take
+    /// jobs". The old `runner_worker_present` only checked Worker, which
+    /// misclassified idle-but-healthy listeners as "not executing" and
+    /// caused false-positive `runner startup settling ceiling reached: 0/6
+    /// executing locally` CRITICALs on idle healthy fleets. This test pins
+    /// the corrected semantics.
+    #[test]
+    fn runner_present_accepts_listener_or_worker() {
+        // Either Runner.Listener OR Runner.Worker → ready.
+        assert!(runner_present("PID COMMAND\n101 Runner.Listener\n"));
+        assert!(runner_present("PID COMMAND\n202 Runner.Worker\n"));
+        assert!(runner_present("PID COMMAND\n1 Runner.Listener\n2 Runner.Worker\n"));
+        // Neither process present → genuinely broken.
+        assert!(!runner_present("PID COMMAND\n101 NotRunner.Workerish\n"));
+        assert!(!runner_present("PID COMMAND\n"));
+        // Substring matches must NOT false-positive (e.g. "Runner.Workerish"
+        // is not a Runner.Worker process).
+        assert!(!runner_present(
+            "PID COMMAND\n202 NotRunner.Workerish\n203 NotRunner.Listenerish\n"
         ));
     }
 
