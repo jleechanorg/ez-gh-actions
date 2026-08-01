@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  org.jleechanorg.ezgha-fleet-alert — deterministic fleet health alerting
+  (bead jleechan-vg1d).
+
+  Purpose:
+    Runs scripts/ezgha-fleet-alert.sh every 300s (5 min) to fire alerts
+    when the ezgha fleet is degraded on BOTH the 5-min short window AND
+    the 1-hour long window (multi-window hysteresis; no AI in the loop).
+
+  Why this exists: the operator was previously the alerting layer (catches
+  multi-slot reclaim patterns via Slack pings). Cross-model review on
+  2026-08-01 explicitly REJECTED the AI-cron variant ("AI-as-a-Daemon"
+  anti-pattern, Gemini) — this plist + script is the DETERMINISTIC
+  variant. NO LLM calls, NO GitHub API calls for fleet state. Reads
+  daemon stderr via tail-with-lock, NOT direct opens (daemon-hot-path
+  isolation; same class as ez-gh-actions-yrt).
+
+  Install (placeholders substituted at install time):
+    @HOME@        -> install user's $HOME
+    @SCRIPTS_DIR@ -> stable installed script dir, ~/.local/libexec/ezgha
+                     (NOT a repo/worktree checkout path — scripts are copied
+                     there by launchd/install-launchagents.sh before render)
+
+    bash launchd/install-launchagents.sh install org.jleechanorg.ezgha-fleet-alert
+
+  Activate (after install):
+    launchctl load -w ~/Library/LaunchAgents/org.jleechanorg.ezgha-fleet-alert.plist
+
+  Disable:
+    launchctl unload ~/Library/LaunchAgents/org.jleechanorg.ezgha-fleet-alert.plist
+
+  Or use launchd/install-launchagents.sh (handles install/remove/cleanup of
+  orphans for all plists templated in this directory).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.jleechanorg.ezgha-fleet-alert</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>@SCRIPTS_DIR@/ezgha-fleet-alert.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@HOME@</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+    <!-- Default alert sink on Mac is osascript (display notification). -->
+    <key>ALERT_SINK</key>
+    <string>macos</string>
+    <!-- Override SLACK_WEBHOOK_URL via launchctl setenv or env-vars plist
+         if Slack routing is desired (see scripts/ezgha-fleet-alert.sh). -->
+    <key>DAEMON_STDERR_LOG</key>
+    <string>@HOME@/Library/Logs/ezgha-launchd-stderr.log</string>
+    <key>SLOT_FILE</key>
+    <string>@HOME@/.config/ezgha/slot_assignments.toml</string>
+    <key>STATE_DIR</key>
+    <string>@HOME@/.local/state/ezgha/alert</string>
+  </dict>
+
+  <!-- 5-minute cadence matches the daemon's serve-loop tick. -->
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <!-- Do not alert on initial install before the daemon has had time to
+       settle (an idle Mac fleet in the first 5 min post-install would
+       otherwise satisfy the "both windows OK" path so this is mostly
+       defensive; kept for clarity per launchd-plist-template/SKILL.md). -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>@HOME@/Library/Logs/ezgha-fleet-alert-launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>@HOME@/Library/Logs/ezgha-fleet-alert-launchd.log</string>
+
+  <!-- 60s throttle: if the previous run is still in flight, do not pile
+       up additional starts. The script itself is read-only and exits
+       quickly; this is defense-in-depth. -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+</dict>
+</plist>
