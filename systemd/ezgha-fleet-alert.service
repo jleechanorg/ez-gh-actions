@@ -1,0 +1,23 @@
+[Unit]
+Description=ezgha fleet health alerting service (bead jleechan-vg1d)
+After=network.target docker.service
+
+[Service]
+Type=oneshot
+# Script-level guard: scripts/ezgha-fleet-alert.sh uses tail-with-lock
+# with TAIL_LOCK_TIMEOUT_SEC=10s, so a hung log read cannot wedge the
+# unit. This systemd-level TimeoutStartSec=60 is the backstop so a
+# future regression in the script can't permanently block the timer
+# (Type=oneshot units don't re-fire while still "running").
+TimeoutStartSec=60
+ExecStart=@SCRIPTS_DIR@/ezgha-fleet-alert.sh
+# Default Linux sink is notify-send. Override to slack via Environment=
+# if SLACK_WEBHOOK_URL is set.
+Environment=ALERT_SINK=linux
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin:@HOME@/.cargo/bin
+# Daemon stderr lives at the launchd-emitted location on the Mac box
+# but on Linux the daemon logs via journald — fall back to journalctl
+# if the file is absent (handled in scripts/ezgha-fleet-alert.sh).
+StandardOutput=append:%h/.local/state/ezgha/fleet-alert-systemd.log
+StandardError=append:%h/.local/state/ezgha/fleet-alert-systemd.log
