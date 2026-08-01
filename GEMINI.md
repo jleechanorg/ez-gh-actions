@@ -8,35 +8,23 @@
 - `src/github.rs` — GitHub API calls (JIT config, runner registration, conflict resolution)
 - `src/main.rs` — CLI entry point
 - `~/.config/ezgha/config.toml` — runtime config (do NOT commit this)
-- `doctor.sh` — fleet health check script
+- `doctor-runner` — authoritative fleet health check (`doctor.sh` is a deprecated back-reference)
 - `docs/verify-exit-criteria.sh` — ironclad exit criteria checker (Gates 0–10)
 - `Dockerfile.runner` — custom runner image with `gh` + `jq` pre-installed
 - `.claude/skills/ezgha-doctor/SKILL.md` — diagnostic + self-healing recipes
-- `.claude/commands/doctor.md` — `/doctor` slash command
+- `.claude/commands/doctor-ezactions.md` — `/doctor-ezactions` slash command (`/doctor` is a deprecated alias)
 
 ## Custom runner image (IMPORTANT)
 The config must use `ezgha-runner:latest` (built from `Dockerfile.runner`), NOT the bare `ghcr.io/actions/actions-runner:latest` image.
 The bare upstream image lacks `gh` and `jq`, causing workflows to fail with exit code 127.
 
-To rebuild after changes to Dockerfile.runner:
-```bash
-docker build -f Dockerfile.runner -t ezgha-runner:latest .
-```
+Only the designated deploy-owner may rebuild the production image or update `~/.config/ezgha/config.toml`. Follow the canonical image-build and deployment procedure in `CLAUDE.md`; other workers commit, push, and hand off.
 
-Then update `~/.config/ezgha/config.toml`:
-```toml
-[runner]
-image = "ezgha-runner:latest"
-```
+## After any commit
 
-## After any commit (IMPORTANT — Gate 0)
-Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
-**Every commit — even docs-only — advances HEAD**, so you must always rebuild after committing:
+Run `cargo test`, commit scoped files, and push. Live installation, service restart, and `verify-exit-criteria.sh` belong to the **single deploy-owner** for the current session, using the canonical Gate 0 procedure in `CLAUDE.md`.
 
-1. `cargo test` — verify all tests pass
-2. `cargo install --path .` — install updated binary (embeds new HEAD SHA)
-3. `systemctl --user restart ezgha.service` — restart daemon
-4. `./docs/verify-exit-criteria.sh` — verify all gates pass
+If you are not the designated deploy-owner: **commit + push only; do not deploy.** Hand the exact commit SHA and test result to the deploy-owner.
 
 ## Commit conventions
 Every commit subject must be prefixed with the runtime that produced it:
@@ -45,6 +33,8 @@ Every commit subject must be prefixed with the runtime that produced it:
 - `human: <subject>`
 
 ## Common self-healing recipes
+
+The commands below mutate the live fleet and are **deploy-owner-only**. Non-owners may collect the diagnostic evidence, then hand remediation to the designated owner.
 
 ### Gate 3 FAIL: container count low
 1. Check for stale containers: `docker ps --filter label=ezgha=managed --format '{{.Names}} {{.Image}}'`
@@ -65,15 +55,15 @@ systemctl --user status ezgha.service
 limactl start colima
 ```
 
-## /doctor command
-Running `/doctor` in this repo executes:
-1. `./doctor.sh` — fleet health check
-2. `./docs/verify-exit-criteria.sh` — ironclad exit criteria (Gates 0–10)
+## /doctor-ezactions command
+Running `/doctor-ezactions` in this repo executes:
+1. `./doctor-runner` — authoritative fleet health check
+2. Deploy-owner only: `./docs/verify-exit-criteria.sh` — live exit criteria
 
-Self-heal any failures found before reporting.
+Non-owners report the diagnostic result and hand off; they do not self-heal the live fleet.
 
 ## /harness command  
-Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gates. Report PASS/FAIL per gate.
+Only the designated deploy-owner runs the live `/harness` workflow. Other workers run repository-local tests and report the exact commit SHA.
 
 ## Safety & Monitoring Principles
 - **Self-Outage Prevention Principle**: A safety, health, or monitoring mechanism must not be able to cause the outage or failure it is designed to guard against.
@@ -82,4 +72,4 @@ Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gate
 ## Safety rails
 - Never run `git add -A` — stage only files you changed
 - Always push after finishing any unit of work
-- Never modify `~/.config/ezgha/config.toml` without also restarting the service
+- Only the designated deploy-owner may modify `~/.config/ezgha/config.toml` or restart the service
