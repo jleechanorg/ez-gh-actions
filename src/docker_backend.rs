@@ -2590,7 +2590,10 @@ fn start_one_with_generate_at_slot(
     // install, even when the python deps haven't changed. Fail-open on absence.
     if let Some(pip_cache) = &cfg.runner.pip_cache_host_path {
         if std::path::Path::new(pip_cache).is_dir() {
-            cmd.args(["-v", &format!("{}:/home/runner/.cache/pip", pip_cache.display())]);
+            cmd.args([
+                "-v",
+                &format!("{}:/home/runner/.cache/pip", pip_cache.display()),
+            ]);
             cmd.args(["-e", "PIP_CACHE_DIR=/home/runner/.cache/pip"]);
         }
     }
@@ -2753,6 +2756,7 @@ fn runner_present(output: &str) -> bool {
     })
 }
 
+#[allow(dead_code)]
 fn runner_worker_present(output: &str) -> bool {
     output
         .lines()
@@ -4477,7 +4481,9 @@ minimum_isolation = "container"
         // Either Runner.Listener OR Runner.Worker → ready.
         assert!(runner_present("PID COMMAND\n101 Runner.Listener\n"));
         assert!(runner_present("PID COMMAND\n202 Runner.Worker\n"));
-        assert!(runner_present("PID COMMAND\n1 Runner.Listener\n2 Runner.Worker\n"));
+        assert!(runner_present(
+            "PID COMMAND\n1 Runner.Listener\n2 Runner.Worker\n"
+        ));
         // Neither process present → genuinely broken.
         assert!(!runner_present("PID COMMAND\n101 NotRunner.Workerish\n"));
         assert!(!runner_present("PID COMMAND\n"));
