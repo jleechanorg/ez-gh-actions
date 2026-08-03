@@ -913,49 +913,53 @@ fi
 # (comm alone misses python3-spawned MCP servers), then verify each
 # leaf cgroup has a finite memory ceiling. Processes running in
 # /user@<uid>.service/ (the unbounded user session) are also a fail.
-AO_MCP_BAD=""
-AO_MCP_BAD_COUNT=0
-while read -r pid; do
-    [ -z "$pid" ] && continue
-    cg=$(grep '^0::' "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
-    [ -z "$cg" ] && continue
-    comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
-    # /user@<uid>.service/ is the unbounded user session — fail-closed.
-    if echo "$cg" | grep -qE '/user@[0-9]+\.service/'; then
-        AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid}) "
-        AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
-        continue
-    fi
-    if ! LEAF_CHECK=$(cgroup_leaf_has_memory_ceiling "$cg"); then
-        AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid},$LEAF_CHECK) "
-        AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
-    fi
-done < <(ps -u "$(id -u)" -o pid=,args= --no-headers 2>/dev/null | \
-          awk '{
-              cmd = ""
-              for (i = 2; i <= NF; i++) cmd = cmd " " $i
-              # Match on full argv: ao-go, agent_orchestrator, the various
-              # MCP daemons (slack-mcp, gmail-mcp, filesystem-mcp, …), and
-              # the daemon launcher script.
-              if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
-                  print $1
-              }
-          }')
-if [ -n "$AO_MCP_BAD" ]; then
-    fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite MemoryHigh (~20G) so the Agent Orchestrator + MCP daemons cannot OOM the host."
-fi
-AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
-              {
-                cmd = ""
-                for (i = 1; i <= NF; i++) cmd = cmd " " $i
-                if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
-                  c++
-                }
-              }
-              END {
-                print c+0
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "    [SKIP] Gate 8 (2) AO/MCP slice probe: macOS — cgroup-v2 / systemd slices not available"
+else
+    AO_MCP_BAD=""
+    AO_MCP_BAD_COUNT=0
+    while read -r pid; do
+        [ -z "$pid" ] && continue
+        cg=$(grep '^0::' "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
+        [ -z "$cg" ] && continue
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
+        # /user@<uid>.service/ is the unbounded user session — fail-closed.
+        if echo "$cg" | grep -qE '/user@[0-9]+\.service/'; then
+            AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid}) "
+            AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
+            continue
+        fi
+        if ! LEAF_CHECK=$(cgroup_leaf_has_memory_ceiling "$cg"); then
+            AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid},$LEAF_CHECK) "
+            AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
+        fi
+    done < <(ps -u "$(id -u)" -o pid=,args= --no-headers 2>/dev/null | \
+              awk '{
+                  cmd = ""
+                  for (i = 2; i <= NF; i++) cmd = cmd " " $i
+                  # Match on full argv: ao-go, agent_orchestrator, the various
+                  # MCP daemons (slack-mcp, gmail-mcp, filesystem-mcp, …), and
+                  # the daemon launcher script.
+                  if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
+                      print $1
+                  }
               }')
-echo "    [PASS] Gate 8 (2) AO/MCP processes (n=${AO_MCP_TOTAL}) are inside an enforced slice with a finite memory ceiling"
+    if [ -n "$AO_MCP_BAD" ]; then
+        fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite MemoryHigh (~20G) so the Agent Orchestrator + MCP daemons cannot OOM the host."
+    fi
+    AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
+                  {
+                    cmd = ""
+                    for (i = 1; i <= NF; i++) cmd = cmd " " $i
+                    if (cmd ~ /(ao-go|agent_orchestrator|slack-mcp|slack_mcp|gmail-mcp|gmail_mcp|mcp-daemon|mcp_daemon|start-mcp-daemons|mcp__)/) {
+                      c++
+                    }
+                  }
+                  END {
+                    print c+0
+                  }')
+    echo "    [PASS] Gate 8 (2) AO/MCP processes (n=${AO_MCP_TOTAL}) are inside an enforced slice with a finite memory ceiling"
+fi
 
 # (2.5) agents.slice enrollment probe (round-3 lane G, bead ez-gh-actions-0725) ---
 # The round-3 panel decision flipped agents.slice from opt-in to AUTO-MIGRATE
