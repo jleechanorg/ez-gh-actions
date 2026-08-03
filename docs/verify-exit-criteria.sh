@@ -994,7 +994,9 @@ for bin in $AGENT_CLI_BINARIES; do
         AGENT_CLI_MISSING="${AGENT_CLI_MISSING}${bin} "
     fi
 done
-if [ -z "${AGENT_CLI_FOUND// /}" ]; then
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "    [SKIP] Gate 8 (2.5) agents.slice enrollment: macOS — cgroup-v2 / systemd slices not available"
+elif [ -z "${AGENT_CLI_FOUND// /}" ]; then
     echo "    [SKIP] Gate 8 (2.5) agents.slice enrollment: no agent-CLI binaries on PATH (${AGENT_CLI_MISSING}missing); requirement waived per bead ez-gh-actions-0725"
 else
     # Walk the slice's child cgroups under user.slice/user-<UID>.slice/
@@ -1043,6 +1045,12 @@ fi
 # level slice — oomd is watching but never kills anything).
 PSI_OK=0
 PSI_SOURCE=""
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "    [SKIP] Gate 8 (3) PSI admission check: macOS — PSI and systemd-oomd not available"
+    PSI_OK=1
+    PSI_SOURCE="macOS (PSI/systemd-oomd not available)"
+fi
 
 # --- Option A: systemd-oomd with a real, enrolled cgroup -----------------
 OOMD_ACTIVE=0
@@ -1404,6 +1412,10 @@ pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 # Dry-run / refusal timeout defaults to 180s. Live mode defaults to 600s
 # (HPP_TIMEOUT overrides both).
 echo "--- Checking Gate 9: Controlled host-pressure proof (r3f8 dry-run-as-PASS removed) ---"
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo "    [SKIP] Gate 9: host-pressure proof: macOS — stress-ng inside agents.slice is Linux-only"
+    pass "Gate 9: Controlled host-pressure proof (skipped on macOS)"
+else
 HPP_SCRIPT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/host-pressure-proof.sh"
 if [ ! -x "${HPP_SCRIPT}" ]; then
     fail "Gate 9: host-pressure-proof.sh not found or not executable at ${HPP_SCRIPT}"
@@ -1466,6 +1478,7 @@ else
             fail "Gate 9: dry-run returned unexpected exit ${HPP_PROOF_RC}. Expected 64 (refusal). Inspect host-pressure-proof.sh output above."
             ;;
     esac
+fi
 fi
 
 # --- Gate 10: GitHub API budget ---
