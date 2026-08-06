@@ -206,6 +206,97 @@ fetch_respawn_log_window() {
   fi
 }
 
+# Single shared DOWN re-sample + journal cross-check, called by section 9
+# (verdict gate) and reused by section 10's localhost branch via
+# LOCAL_SLOT_STATE_TABLE. Consolidates the prior duplicate sleep
+# (sections 9 and 10 each ran their own ~25-30s re-sample on the local
+# fleet, observing the SAME slots at different instants and disagreeing
+# on DOWN state -- GH#41 / bead ez-gh-actions-xv1t). Inputs: a list of
+# DOWN candidate slot names. Side effects: sleeps exactly once, mutates
+# the four global per-slot arrays (EXECUTING_SLOTS, IDLE_SLOTS,
+# CYCLING_SLOTS, DOWN_SLOTS) to reflect the post-resample /
+# post-journal-cross-check state. NO-OP when no candidates are passed
+# (zero sleeps, zero classify_local_slot calls -- the
+# "no-first-pass-down-no-sleep-at-all" case).
+_down_resample_consolidated() {
+  local host_arg="$1" platform_arg="$2"; shift 2
+  local -a candidates=("$@")
+  if [ "${#candidates[@]}" -eq 0 ]; then return 0; fi
+  # Set HOST / PLATFORM helpers (without `local`) so the sed-extracted
+  # journal-cross-check block (used by
+  # tests/doctor_runner_respawn_fetch_failure_test.sh) can reference
+  # the call site's arguments after standalone eval. Function-scope
+  # `local host=...` would be invisible once the block is hoisted out.
+  HOST="$host_arg"
+  PLATFORM="$platform_arg"
+  info "first-pass DOWN candidates (${candidates[*]}) on $HOST -- re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s once (sections 9 + 10 share this single pass; GH#41 / ez-gh-actions-xv1t)"
+  sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
+  # NOTE: _PERSISTENT_DOWN / _BLINKED / _RESPAWN_LOG / _TRUE_DOWN are
+  # intentionally NOT declared `local` -- they preserve the original
+  # global names the prior inline section 9 used, so the existing
+  # doctor_runner_respawn_fetch_failure_test.sh can sed-extract the
+  # journal-cross-check block (`if [ "${#_PERSISTENT_DOWN[@]}" -gt 0 ]
+  # then ... if ! _RESPAWN_LOG=$(fetch_respawn_log_window ...)`) without
+  # its extraction markers going stale (codex adversarial review
+  # 2026-07-10 P1: the set -euo pipefail guard around the fetch call is
+  # the load-bearing piece of that test).
+  _PERSISTENT_DOWN=()
+  _BLINKED=()
+  local _name _state
+  for _name in "${candidates[@]}"; do
+    _state=$(classify_local_slot "$_name")
+    case "$_state" in
+      DOWN)      _PERSISTENT_DOWN+=("$_name") ;;
+      IDLE)      IDLE_SLOTS+=("$_name");      _BLINKED+=("$_name") ;;
+      EXECUTING) EXECUTING_SLOTS+=("$_name"); _BLINKED+=("$_name") ;;
+    esac
+  done
+  if [ "${#_BLINKED[@]}" -gt 0 ]; then
+    info "recycled normally (respawned within ${DOWN_PERSISTENCE_WAIT_SECONDS}s, NOT a defect): ${_BLINKED[*]}"
+  fi
+  DOWN_SLOTS=()
+  if [ "${#_PERSISTENT_DOWN[@]}" -gt 0 ]; then
+    # Still containerless after BOTH docker samples -- before calling these
+    # persisted-DOWN, cross-check the daemon's own log for respawn/
+    # management activity on the EXACT slot name in the last
+    # RESPAWN_EVIDENCE_WINDOW_MIN minutes (ez-gh-actions-5n0h): a real
+    # respawn cycle (deregister -> JIT token -> docker run) can take
+    # 30-60s+ under load, longer than the 2-sample window above, so
+    # "containerless both samples" alone is not proof of abandonment.
+    #
+    # set -euo pipefail is active for the whole script -- a bare
+    # `_VAR=$(cmd)` abort the ENTIRE doctor run mid-classification if
+    # fetch_respawn_log_window returns nonzero (ssh hiccup, missing log
+    # file; codex adversarial review 2026-07-10, P1). Guard the call so a
+    # fetch failure degrades gracefully instead of killing the run.
+    # FAIL-SAFE DIRECTION: a failed fetch is "no evidence", which classifies
+    # the candidate DOWN (never mask a fetch failure as CYCLING) -- the
+    # evidence text is annotated below so operators see WHY.
+    RESPAWN_FETCH_FAILED_LOCAL=0
+    _RESPAWN_LOG=""
+    if ! _RESPAWN_LOG=$(fetch_respawn_log_window "${HOST:-localhost}" "$PLATFORM" "$RESPAWN_EVIDENCE_WINDOW_MIN"); then
+      _RESPAWN_LOG=""
+      RESPAWN_FETCH_FAILED_LOCAL=1
+    fi
+    _TRUE_DOWN=()
+    for _name in "${_PERSISTENT_DOWN[@]}"; do
+      if [ -n "$_RESPAWN_LOG" ] && [ "$(printf '%s\n' "$_RESPAWN_LOG" | journal_has_respawn_evidence "$_name")" = "1" ]; then
+        CYCLING_SLOTS+=("$_name")
+      else
+        _TRUE_DOWN+=("$_name")
+      fi
+    done
+    if [ "${#CYCLING_SLOTS[@]}" -gt 0 ]; then
+      info "CYCLING (containerless both samples but daemon log shows respawn activity in last ${RESPAWN_EVIDENCE_WINDOW_MIN}m -- mid-cycle, not abandoned; ez-gh-actions-5n0h): ${CYCLING_SLOTS[*]}"
+    fi
+    DOWN_SLOTS=()
+    if [ "${#_TRUE_DOWN[@]}" -gt 0 ]; then
+      DOWN_SLOTS=("${_TRUE_DOWN[@]}")
+    fi
+  fi
+  return 0
+}
+
 # --- A. local daemon + service ------------------------------------------
 section "1. ezgha service"
 SERVICE_STATE=$(probe_service_state)
@@ -771,61 +862,8 @@ done
 # normal ephemeral recycle, classified by their second-sample state.
 DOWN_PERSISTENCE_WAIT_SECONDS="${DOWN_PERSISTENCE_WAIT_SECONDS:-30}"
 CYCLING_SLOTS=()
-if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
-  info "first-pass DOWN candidates (${DOWN_SLOTS[*]}) — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s to filter normal ephemeral recycling"
-  sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
-  _PERSISTENT_DOWN=()
-  _BLINKED=()
-  for _name in "${DOWN_SLOTS[@]}"; do
-    case "$(classify_local_slot "$_name")" in
-      DOWN)      _PERSISTENT_DOWN+=("$_name") ;;
-      IDLE)      IDLE_SLOTS+=("$_name");      _BLINKED+=("$_name") ;;
-      EXECUTING) EXECUTING_SLOTS+=("$_name"); _BLINKED+=("$_name") ;;
-    esac
-  done
-  if [ "${#_BLINKED[@]}" -gt 0 ]; then
-    info "recycled normally (respawned within ${DOWN_PERSISTENCE_WAIT_SECONDS}s, NOT a defect): ${_BLINKED[*]}"
-  fi
-  DOWN_SLOTS=()
-  if [ "${#_PERSISTENT_DOWN[@]}" -gt 0 ]; then
-    # Still containerless after BOTH docker samples — before calling these
-    # persisted-DOWN, cross-check the daemon's own log for respawn/
-    # management activity on the EXACT slot name in the last
-    # RESPAWN_EVIDENCE_WINDOW_MIN minutes (ez-gh-actions-5n0h): a real
-    # respawn cycle (deregister -> JIT token -> docker run) can take
-    # 30-60s+ under load, longer than the 2-sample window above, so
-    # "containerless both samples" alone is not proof of abandonment.
-    #
-    # set -euo pipefail is active for the whole script — a bare
-    # `_VAR=$(cmd)` abort the ENTIRE doctor run mid-classification if
-    # fetch_respawn_log_window returns nonzero (ssh hiccup, missing log
-    # file; codex adversarial review 2026-07-10, P1). Guard the call so a
-    # fetch failure degrades gracefully instead of killing the run.
-    # FAIL-SAFE DIRECTION: a failed fetch is "no evidence", which classifies
-    # the candidate DOWN (never mask a fetch failure as CYCLING) — the
-    # evidence text is annotated below so operators see WHY.
-    RESPAWN_FETCH_FAILED_LOCAL=0
-    if ! _RESPAWN_LOG=$(fetch_respawn_log_window "localhost" "$PLATFORM" "$RESPAWN_EVIDENCE_WINDOW_MIN"); then
-      _RESPAWN_LOG=""
-      RESPAWN_FETCH_FAILED_LOCAL=1
-    fi
-    _TRUE_DOWN=()
-    for _name in "${_PERSISTENT_DOWN[@]}"; do
-      if [ -n "$_RESPAWN_LOG" ] && [ "$(printf '%s\n' "$_RESPAWN_LOG" | journal_has_respawn_evidence "$_name")" = "1" ]; then
-        CYCLING_SLOTS+=("$_name")
-      else
-        _TRUE_DOWN+=("$_name")
-      fi
-    done
-    if [ "${#CYCLING_SLOTS[@]}" -gt 0 ]; then
-      info "CYCLING (containerless both samples but daemon log shows respawn activity in last ${RESPAWN_EVIDENCE_WINDOW_MIN}m — mid-cycle, not abandoned; ez-gh-actions-5n0h): ${CYCLING_SLOTS[*]}"
-    fi
-    DOWN_SLOTS=()
-    if [ "${#_TRUE_DOWN[@]}" -gt 0 ]; then
-      DOWN_SLOTS=("${_TRUE_DOWN[@]}")
-    fi
-  fi
-fi
+RESPAWN_FETCH_FAILED_LOCAL=0
+_down_resample_consolidated "localhost" "$PLATFORM" "${DOWN_SLOTS[@]}"
 info "$HOST_LABEL slots (local proof): ${#EXECUTING_SLOTS[@]} executing, ${#IDLE_SLOTS[@]} idle, ${#CYCLING_SLOTS[@]} cycling, ${#DOWN_SLOTS[@]} down (of $CONFIGURED_COUNT configured)"
 
 # Single source of truth for section 10's local-host table (below): "<name>

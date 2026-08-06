@@ -99,6 +99,25 @@ fi
 # anywhere in the script = the pre-fix duplicate-sleep pathology has come
 # back (the issue's central complaint: "each perform their own ~25-30s
 # DOWN re-sample sleep").
+#
+# Also pin the consolidation helper itself: GH#41's intent was that the
+# DOWN re-sample is performed by a single named helper called by
+# section 9, not duplicated inline. If a future refactor inlines the
+# helper back into section 9's body, the static "one sleep" assertion
+# would still pass (no behavior change) but the structural consolidation
+# would have regressed.
+if ! grep -q '^_down_resample_consolidated() {' "$DOCTOR_SCRIPT"; then
+  echo "FAIL: _down_resample_consolidated() helper missing from $DOCTOR_SCRIPT (GH#41 structural consolidation regressed)" >&2
+  OVERALL_PASS=false
+else
+  echo "  [consolidation-helper-present] _down_resample_consolidated() helper present -- PASS"
+fi
+if ! grep -q '_down_resample_consolidated "localhost" "\$PLATFORM"' "$DOCTOR_SCRIPT"; then
+  echo "FAIL: section 9 does not call _down_resample_consolidated for the local host (GH#41 structural consolidation regressed)" >&2
+  OVERALL_PASS=false
+else
+  echo "  [consolidation-helper-called] section 9 calls _down_resample_consolidated for localhost -- PASS"
+fi
 DOWN_PERSISTENCE_SLEEP_COUNT=$(grep -c 'sleep "\$DOWN_PERSISTENCE_WAIT_SECONDS"' "$DOCTOR_SCRIPT" || true)
 if [ "$DOWN_PERSISTENCE_SLEEP_COUNT" -ne 1 ]; then
   echo "FAIL: found $DOWN_PERSISTENCE_SLEEP_COUNT occurrences of 'sleep \"\$DOWN_PERSISTENCE_WAIT_SECONDS\"' in $DOCTOR_SCRIPT, expected exactly 1 (section 9's shared re-sample; GH#41 / ez-gh-actions-xv1t)" >&2
@@ -149,37 +168,49 @@ fi
 # local slot for the whole consolidated run, and identical DOWN counts
 # for the same fixture slots.
 #
-# We extract section 9's DOWN-persistence block (the lines from the first
-# `if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then` after the first classification
-# loop through its closing `fi`) and section 10's local-host branch (the
-# `if [ "$host" = "localhost" ] && ... LOCAL_SLOT_STATE_TABLE ...` arm)
-# via sed line markers, then eval both in a subshell with stubs.
+# We extract section 9's DOWN-persistence block (the lines from the
+# first `if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then` after the first
+# classification loop through its closing `fi`) and section 10's
+# local-host branch (the `if [ "$host" = "localhost" ] && ...
+# LOCAL_SLOT_STATE_TABLE ...` arm) via sed line markers, then eval
+# both in a subshell with stubs.
 
-S9_BLOCK_START=$(grep -n 'if \[ "\${#DOWN_SLOTS\[@\]}" -gt 0 \]; then' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+# Section 9's DOWN-persistence block is now invoked via the
+# _down_resample_consolidated helper (GH#41 consolidation). The
+# helper definition itself contains the re-sample + journal
+# cross-check we need to exercise end-to-end.
+S9_BLOCK_START=$(grep -n '^_down_resample_consolidated() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
 if [ -z "$S9_BLOCK_START" ]; then
-  echo "FAIL: could not locate section 9's DOWN-persistence block in $DOCTOR_SCRIPT" >&2
+  echo "FAIL: could not locate _down_resample_consolidated() helper in $DOCTOR_SCRIPT (consolidation helper missing)" >&2
   OVERALL_PASS=false
 else
-  # Find the matching `fi`. Section 9 has nested `if [ "${#_PERSISTENT_DOWN[@]}" -gt 0 ]`
-  # inside, so we walk forward counting `if` / `fi` depth. Match `if`
-  # at column 0 (the outer block) AND 2-space-indented (the nested block).
+  # Find the matching `}` that closes the helper. Walk forward counting
+  # `{` / `}` brace depth (the helper uses bash function syntax with
+  # `if [ ... ]` blocks nested inside, so we need to track BOTH if/fi
+  # depth and {/} brace depth). The closing `}` is on its own line at
+  # column 0.
   S9_BLOCK_END=$(awk -v start="$S9_BLOCK_START" '
     NR < start { next }
+    BEGIN { depth = 0; brace_depth = 0 }
     {
+      # Track if/fi depth (matches nested bash conditionals).
       n_if = 0
       n_fi = 0
-      # Outer if at column 0: `if [` (e.g. "if [ \"${#DOWN_SLOTS...")
       if ($0 ~ /^if \[/) n_if++
       if ($0 ~ /^if !/) n_if++
-      # Nested if at 2-space indent: "  if [" or "  if !"
       if ($0 ~ /^  if \[/) n_if++
       if ($0 ~ /^  if !/) n_if++
-      # Outer fi at column 0
       if ($0 ~ /^fi$/) n_fi++
-      # Inner fi at 2-space indent
       if ($0 ~ /^  fi$/) n_fi++
       depth += n_if - n_fi
-      if (depth == 0 && NR > start) { print NR; exit }
+
+      # Track function-body brace depth. The helper opens with `{` on
+      # the same line as the `()` so its opening brace is captured by
+      # `^_down_resample_consolidated() {` (or `}` for the closer).
+      if ($0 ~ /^[A-Za-z_][A-Za-z_0-9]*\(\) \{$/) brace_depth++
+      if ($0 ~ /^\}$/) brace_depth--
+
+      if (depth == 0 && brace_depth == 0 && NR > start) { print NR; exit }
     }
   ' "$DOCTOR_SCRIPT")
   if [ -z "$S9_BLOCK_END" ]; then
@@ -291,6 +322,7 @@ else
           ok()   { :; }
           warn() { :; }
           section() { :; }
+          probe_service_state() { echo "active"; }
 
           # Pre-populate section 9's input state.
           PLATFORM="linux"
@@ -325,8 +357,9 @@ else
           CYCLING_SLOTS=()
           RESPAWN_FETCH_FAILED_LOCAL=0
 
-          # Run section 9's DOWN-persistence block (eval'd standalone).
+          # Define the helper, then call it the same way section 9 does.
           eval "$S9_BLOCK_SRC"
+          _down_resample_consolidated "localhost" "$PLATFORM" "${DOWN_SLOTS[@]}"
 
           # Capture section 9's final per-slot arrays.
           S9_DOWN="${DOWN_SLOTS[*]:-}"
