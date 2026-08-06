@@ -24,6 +24,30 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; }
 warn() { printf '  \033[33m⚠\033[0m %s\n' "$1" >&2; }
 info() { printf '\033[1m%s\033[0m\n' "$1"; }
 
+# Structured, single-line, parseable attribution log emitted before every
+# ezgha.service restart we drive from this script (Linux systemd restart +
+# macOS install-service regeneration). Closes GH#42: an unattributed clean
+# restart of ezgha.service occurred 2026-07-09 18:01:13 with no identifiable
+# invoking session -- a future unattributed restart must be traceable to its
+# origin from the logs alone. Logs to stderr (not stdout) so journalctl
+# captures it under systemd; reason is overridable via EZGHA_RESTART_REASON
+# (default 'install-sh auto-restart'). `logname` is preferred but is missing
+# on some macOS setups -- fall back to `id -un`, then 'unknown'.
+_log_restart_attribution() {
+  local reason="${EZGHA_RESTART_REASON:-install-sh auto-restart}"
+  local invocation
+  invocation="$(printf '%q ' "$0" "$@" 2>/dev/null)" || invocation="$0 $*"
+  local session
+  session="$(logname 2>/dev/null || id -un 2>/dev/null || echo unknown)"
+  printf 'INFO ezgha restart_attribution ts=%s pid=%s ppid=%s session=%s reason="%s" invocation="%s"\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%FT%TZ)" \
+    "$$" \
+    "$PPID" \
+    "$session" \
+    "$reason" \
+    "$invocation" >&2
+}
+
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -450,11 +474,13 @@ if [ -f "${CONFIG_PATH}" ]; then
     else
       info "Installing ezgha service..."
     fi
+    _log_restart_attribution "ezgha launchd install-service"
     DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
     if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
       info "Restarting systemd service..."
+      _log_restart_attribution "ezgha systemd restart"
       systemctl --user restart ezgha.service
       ok "ezgha service restarted via systemd"
     else
