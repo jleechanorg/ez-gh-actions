@@ -16,6 +16,21 @@ The full design — including the 32-agent adversarial review that shaped v1 —
 [DESIGN.md](DESIGN.md). A static architecture diagram is at
 [`docs/architecture.svg`](docs/architecture.svg).
 
+## Repository hooks
+
+Enable the local Git hooks (commit-msg provenance-prefix check + pre-push
+binary-drift check) for every clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The pre-push hook blocks pushes when the SHA embedded in your installed
+`ezgha` binary differs from `git rev-parse HEAD` after a Rust change —
+the server-side `binary-sha-drift.yml` CI workflow catches any case the
+hook misses. Bypass the local hook with `EZGHA_SKIP_BINARY_DRIFT_CHECK=1
+git push` only when you understand the consequence.
+
 ## How isolation works
 
 `ezgha` runs **one ephemeral container per job** on a host you control. The runner is
