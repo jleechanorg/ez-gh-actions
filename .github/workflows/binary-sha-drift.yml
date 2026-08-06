@@ -1,0 +1,84 @@
+name: Binary SHA Drift Check
+
+# Server-side companion to the local .githooks/pre-push hook.
+#
+# Builds the binary from the pushed HEAD, captures the SHA embedded in
+# `ezgha --version`, and asserts it matches `git rev-parse HEAD`. Catches
+# any case where a binary with a stale SHA reaches main (e.g. a commit
+# skipped the local hook, or a squash-merge bypassed the hook contract).
+#
+# Companion surface: tests/install_binary_drift_test.sh (Layer 1) covers
+# the local hook; this workflow is the server-side Layer 2.
+#
+# Reference: GH#103, bead jleechan-zs0j.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Built binary SHA matches HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1cb83b4237403b291c4cd5c0c1a82d0892ee31bc # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-binary-sha-drift-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-binary-sha-drift-
+
+      - name: Build & install ezgha
+        run: |
+          set -euo pipefail
+          cargo install --path . --root /tmp/ezgha-install --locked --quiet
+
+      - name: Compare installed binary SHA vs HEAD
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          # The --version output format is set in src/main.rs:31:
+          #   `ezgha <CARGO_PKG_VERSION>-<GIT_SHA>-<rustc-target-triple>`
+          # Extract the 7-40 hex SHA segment between the first two '-'
+          # delimiters.
+          INSTALLED_SHA="$(
+            /tmp/ezgha-install/bin/ezgha --version \
+              | sed -n 's/.*-\([0-9a-f]\{7,40\}\)-.*/\1/p' \
+              | head -1
+          )"
+          if [ -z "${INSTALLED_SHA}" ]; then
+            echo "FAIL: could not extract a SHA from 'ezgha --version' output." >&2
+            /tmp/ezgha-install/bin/ezgha --version >&2
+            exit 1
+          fi
+          echo "HEAD_SHA=${HEAD_SHA}"
+          echo "INSTALLED_SHA=${INSTALLED_SHA}"
+          if [ "${INSTALLED_SHA}" != "${HEAD_SHA}" ]; then
+            echo "FAIL: ezgha binary-drift on HEAD ${HEAD_SHA}: installed binary embeds SHA ${INSTALLED_SHA}." >&2
+            echo "      This means a non-default cargo build pipeline produced the artifact; investigate build.rs / --locked usage." >&2
+            exit 1
+          fi
+          echo "PASS: installed binary SHA matches HEAD"
