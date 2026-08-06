@@ -50,10 +50,14 @@ echo "${SENTINEL}" > "${HOME_T}/.config/ezgha/secrets/alert-credential"
 echo "${SENTINEL}" > "${HOME_T}/.local/share/ezgha/tokens/app-token"
 echo "${SENTINEL}" > "${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem"
 
-export EZGHA_SECRET_AUDIT_PATHS="${HOME_T}/.config/ezgha/config.toml|${HOME_T}/.config/ezgha/secrets/alert-credential|${HOME_T}/.local/share/ezgha/tokens/app-token|${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem|${HOME_T}/.config/ezgha/secrets/missing-on-purpose"
+export EZGHA_SECRET_AUDIT_PATHS="${HOME_T}/.config/ezgha|${HOME_T}/.config/ezgha/secrets|${HOME_T}/.local/share/ezgha|${HOME_T}/.local/share/ezgha/tokens|${HOME_T}/.config/ezgha/config.toml|${HOME_T}/.config/ezgha/secrets/alert-credential|${HOME_T}/.local/share/ezgha/tokens/app-token|${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem|${HOME_T}/.config/ezgha/secrets/missing-on-purpose"
 
 # ── Case 1: 600 file → exit 0, no warning, sentinel NOT printed ─────────────
+chmod 700 "${HOME_T}/.config/ezgha" "${HOME_T}/.config/ezgha/secrets" "${HOME_T}/.local/share/ezgha" "${HOME_T}/.local/share/ezgha/tokens" 2>/dev/null || true
 chmod 600 "${HOME_T}/.config/ezgha/config.toml" 2>/dev/null || true
+chmod 600 "${HOME_T}/.config/ezgha/secrets/alert-credential" 2>/dev/null || true
+chmod 600 "${HOME_T}/.local/share/ezgha/tokens/app-token" 2>/dev/null || true
+chmod 600 "${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem" 2>/dev/null || true
 LOG1="${WORK}/case1.log"
 if ! HOME="${HOME_T}" bash "${AUDIT}" >"${LOG1}" 2>&1; then
   fail "Case 1: 600 file should be safe but audit exited non-zero"

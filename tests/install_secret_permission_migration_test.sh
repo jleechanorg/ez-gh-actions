@@ -27,6 +27,16 @@ fail() {
   PASS=false
 }
 
+# Portable stat mode getter — works on both Linux (GNU stat -c '%a') and
+# macOS (BSD stat -f '%Lp').
+get_mode() {
+  if stat -c '%a' "$1" >/dev/null 2>&1; then
+    stat -c '%a' "$1"
+  else
+    stat -f '%Lp' "$1"
+  fi
+}
+
 # If install.d/10-secret-permissions.sh is missing, the test reports RED
 # (Phase 1 contract) but exits 0 so the scaffold is itself GREEN as a
 # red-test; the harness reports FAIL when the script later exists but
@@ -126,10 +136,10 @@ chmod 660 "${HOME_T}/.local/share/ezgha/tokens/app-token"
 chmod 640 "${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem"
 
 # ── 4. Confirm pre-state is unsafe (sanity check on the test) ─────────────
-PRE_CONFIG_MODE=$(stat -c '%a' "${HOME_T}/.config/ezgha/config.toml")
-PRE_ALERT_MODE=$(stat -c '%a' "${HOME_T}/.config/ezgha/secrets/alert-credential")
-PRE_TOKEN_MODE=$(stat -c '%a' "${HOME_T}/.local/share/ezgha/tokens/app-token")
-PRE_KEY_MODE=$(stat -c '%a' "${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem")
+PRE_CONFIG_MODE=$(get_mode "${HOME_T}/.config/ezgha/config.toml")
+PRE_ALERT_MODE=$(get_mode "${HOME_T}/.config/ezgha/secrets/alert-credential")
+PRE_TOKEN_MODE=$(get_mode "${HOME_T}/.local/share/ezgha/tokens/app-token")
+PRE_KEY_MODE=$(get_mode "${HOME_T}/.local/share/ezgha/tokens/app_private_key.pem")
 
 if [ "${PRE_CONFIG_MODE}" != "644" ] || [ "${PRE_ALERT_MODE}" != "664" ] || [ "${PRE_TOKEN_MODE}" != "660" ] || [ "${PRE_KEY_MODE}" != "640" ]; then
   fail "Pre-install modes were not seeded correctly (config=${PRE_CONFIG_MODE}, alert=${PRE_ALERT_MODE}, token=${PRE_TOKEN_MODE}, key=${PRE_KEY_MODE})"
@@ -145,7 +155,7 @@ HOME="${HOME_T}" bash "${TEMP_REPO}/install.sh" --dev >"${HOME_T}/install.log" 2
 
 # ── 6. Assert post-install modes are 600 for every secret-bearing file ────
 post_mode() {
-  stat -c '%a' "$1" 2>/dev/null || echo "MISSING"
+  if [ -e "$1" ]; then get_mode "$1"; else echo "MISSING"; fi
 }
 
 POST_CONFIG_MODE=$(post_mode "${HOME_T}/.config/ezgha/config.toml")
