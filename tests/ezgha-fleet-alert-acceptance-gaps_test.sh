@@ -73,10 +73,16 @@ run_alert() {
   printf '%s\n' "$out"
 }
 
-# Extract a value from the JSON payload on stdout.
+# Extract a value from the JSON payload on stdout. Handles both string and
+# numeric fields: "field":"value" -> value, "field":N -> N.
 json_field() {
   local payload="$1" field="$2"
-  printf '%s\n' "$payload" | sed -n "s/.*\"$field\":\"\\([^\"]*\\)\".*/\\1/p" | head -1
+  local v
+  v="$(printf '%s\n' "$payload" | sed -nE "s/.*\"$field\":\"([^\"]*)\".*/\\1/p" | head -1)"
+  if [[ -z "$v" ]]; then
+    v="$(printf '%s\n' "$payload" | sed -nE "s/.*\"$field\":([0-9]+).*/\\1/p" | head -1)"
+  fi
+  printf '%s' "$v"
 }
 
 # Fake doctor-runner stub: prints verdict + 4 counts in a parseable format.
@@ -87,13 +93,20 @@ make_doctor_stub() {
   cat > "$stub_path" <<STUB
 #!/usr/bin/env bash
 # fake doctor-runner stub for GH#106 acceptance-gap tests
-echo "doctor: $verdict"
-echo "executing=$exec_count"
-echo "idle_ok=$idle_ok"
-echo "idle_starved=$idle_starved"
-echo "down=$down_count"
+echo "doctor: __VERDICT__"
+echo "executing=__EXEC__"
+echo "idle_ok=__IDLE_OK__"
+echo "idle_starved=__IDLE_STARVED__"
+echo "down=__DOWN__"
 exit 0
 STUB
+  sed -i '' \
+    -e "s|__VERDICT__|$verdict|" \
+    -e "s|__EXEC__|$exec_count|" \
+    -e "s|__IDLE_OK__|$idle_ok|" \
+    -e "s|__IDLE_STARVED__|$idle_starved|" \
+    -e "s|__DOWN__|$down_count|" \
+    "$stub_path"
   chmod +x "$stub_path"
 }
 
@@ -178,7 +191,7 @@ test2_critical_scan_gated_by_doctor() {
     EZGHA_DOCTOR_RUNNER=1 \
     DOCTOR_RUNNER_PATH="$doctor_stub" \
     CRITICAL_DEGRADED_THRESHOLD=2 \
-    EZGHA_EXPECTED_CAPACITY=16 \
+    EZGHA_EXPECTED_CAPACITY=6 \
     "$SCRIPT"
   )"
   rc=$?
@@ -196,8 +209,8 @@ test2_critical_scan_gated_by_doctor() {
 }
 
 # ── test 3: container_count degraded contributes to degraded ─────────────
-# EZGHA_EXPECTED_CAPACITY=16, but slot file shows only 4 (or no containers).
-# Expect: alert fires (exit 1) due to container_count degradation.
+# EZGHA_EXPECTED_CAPACITY set to a value above the real `docker ps` count,
+# so the script's container_count_check reports degraded. Expect exit 1.
 test3_container_count_degraded() {
   local name="test3-container-count-degraded"
   local cell_dir="${WORK}/${name}"
@@ -208,8 +221,11 @@ test3_container_count_degraded() {
   local doctor_stub="${cell_dir}/doctor-runner"
 
   build_log "$stderr_log" 0
-  build_slot_file "$slot_file" 4  # only 4 slots filled
-  make_doctor_stub "$doctor_stub" "ok" 4 0 0 0
+  build_slot_file "$slot_file" 16
+  # doctor OK → CRITICAL gate is disabled; container_count check is the sole
+  # signal that elevates degraded. We set EZGHA_EXPECTED_CAPACITY to a value
+  # that is GUARANTEED > `docker ps` on any host (e.g. 99999).
+  make_doctor_stub "$doctor_stub" "ok" 16 0 0 0
 
   local rc payload
   payload="$(
@@ -221,7 +237,7 @@ test3_container_count_degraded() {
     ALERT_SINK=none \
     EZGHA_DOCTOR_RUNNER=1 \
     DOCTOR_RUNNER_PATH="$doctor_stub" \
-    EZGHA_EXPECTED_CAPACITY=16 \
+    EZGHA_EXPECTED_CAPACITY=99999 \
     "$SCRIPT"
   )"
   rc=$?
@@ -230,12 +246,10 @@ test3_container_count_degraded() {
   count="$(json_field "$payload" container_count)"
   expected="$(json_field "$payload" expected_capacity)"
 
-  if [[ "$count" != "4" ]]; then
-    fail "${name}: expected container_count=4, got '${count}'"
-  elif [[ "$expected" != "16" ]]; then
-    fail "${name}: expected expected_capacity=16, got '${expected}'"
+  if [[ "$expected" != "99999" ]]; then
+    fail "${name}: expected expected_capacity=99999, got '${expected}'"
   elif [[ "$rc" -ne 1 ]]; then
-    fail "${name}: expected exit 1 (container_count < expected), got ${rc}"
+    fail "${name}: expected exit 1 (container_count < expected), got ${rc} (count=${count})"
   else
     echo "PASS: ${name} (rc=${rc}, container_count=${count}, expected=${expected})"
   fi
