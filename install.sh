@@ -445,14 +445,40 @@ CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
 if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
+    # Drift detection (GH#15 / bead jleechan-r00n): capture the loaded plist's
+    # hash BEFORE install-service so we can warn the operator if the
+    # freshly-regenerated plist differs — a unit drift is the exact failure
+    # mode that left a stale plist missing WatchdogSec=60 in production on
+    # 2026-07-06 (the daemon got killed every 60s by systemd watchdog
+    # because the new binary emitted sd_notify heartbeats the old plist
+    # didn't ask for).
+    _plist_hash_before=""
+    if [ -f "${plist}" ]; then
+      _plist_hash_before="$(shasum -a 256 "${plist}" 2>/dev/null | awk '{print $1}')"
+    fi
     if [ -f "${plist}" ] && launchctl list 2>/dev/null | grep -q "org.jleechanorg.ezgha"; then
       info "Regenerating launchd agent..."
     else
       info "Installing ezgha service..."
     fi
     DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
+    # Drift check (after install-service rewrote the plist from scratch
+    # based on the daemon binary's compiled-in template).
+    _plist_hash_after=""
+    if [ -f "${plist}" ]; then
+      _plist_hash_after="$(shasum -a 256 "${plist}" 2>/dev/null | awk '{print $1}')"
+    fi
+    if [ -n "${_plist_hash_before}" ] && [ -n "${_plist_hash_after}" ] \
+       && [ "${_plist_hash_before}" != "${_plist_hash_after}" ]; then
+      warn "launchd plist changed during install-service (daemon was NOT active; this would normally be safe, but if you restart later, double-check plutil ${plist} still matches daemon expectations)"
+    fi
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
+    _unit_path="${HOME}/.config/systemd/user/ezgha.service"
+    _unit_hash_before=""
+    if [ -f "${_unit_path}" ]; then
+      _unit_hash_before="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
+    fi
     if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
       info "Restarting systemd service..."
       systemctl --user restart ezgha.service
@@ -461,6 +487,20 @@ if [ -f "${CONFIG_PATH}" ]; then
       info "Installing ezgha service..."
       "${CARGO_BIN}/${BIN}" install-service
       ok "ezgha service installed and started via systemd"
+    fi
+    # Drift check (after install-service rewrote the unit file from scratch).
+    # If the unit file changed AND the service is NOT currently active, the
+    # operator must `systemctl --user daemon-reload` before the next start —
+    # otherwise systemd uses the cached pre-reload unit, defeating the whole
+    # point of regenerating it (this is the production 2026-07-06 lesson).
+    _unit_hash_after=""
+    if [ -f "${_unit_path}" ]; then
+      _unit_hash_after="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
+    fi
+    if [ -n "${_unit_hash_before}" ] && [ -n "${_unit_hash_after}" ] \
+       && [ "${_unit_hash_before}" != "${_unit_hash_after}" ] \
+       && ! systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+      warn "systemd --user unit file changed during install-service and the service is NOT active. Run: systemctl --user daemon-reload && systemctl --user start ezgha.service"
     fi
   fi
 fi

@@ -225,6 +225,16 @@ reachable Docker daemon, an authenticated `gh`), builds and installs the `ezgha`
 binary, and prints the guided next steps below. Re-run it any time to upgrade.
 Uninstall with `./install.sh --uninstall` (your config is left in place).
 
+**After every binary upgrade, `install.sh` automatically re-invokes `ezgha
+install-service`** so the systemd `--user` unit (Linux) or launchd plist
+(Mac) is regenerated from the new binary's compiled-in template — preventing
+the stale-unit failure mode where a new daemon binary emits `sd_notify`
+heartbeats against an old unit that doesn't ask for them (production
+incident 2026-07-06: stale unit → no `WatchdogSec=60` → daemon killed every
+60s). If the unit file changed AND the service is not currently active,
+`install.sh` prints a `daemon-reload` warning so the operator can refresh
+the cached unit before the next start.
+
 Claude Code users get an install + diagnosis walkthrough from the
 [`ezgha-install`](.claude/skills/ezgha-install/SKILL.md) skill.
 
