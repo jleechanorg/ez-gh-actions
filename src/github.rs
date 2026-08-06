@@ -513,6 +513,121 @@ pub(crate) fn api_json_until(path: &str, deadline: Instant) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// Run a `gh api graphql -f query=<q> [-F var=value]*` invocation, returning
+/// the raw JSON response body. Mirrors `api_json`'s shape and rate-limit
+/// handling but targets the GraphQL endpoint, which has its own (separate)
+/// rate-limit bucket from REST `core`. Centralized here so call sites can
+/// use `graphql_first(...)` without each re-implementing the GraphQL
+/// transport, retry/backoff, and stderr logging.
+///
+/// `variables` are passed as `-F name=value` (typed) so JSON scalars/ints
+/// round-trip cleanly; this matches how `gh api graphql` expects complex
+/// inputs (objects, enums, integers) and avoids the stringly-typed `-f`
+/// trap for numeric limits and IDs.
+#[allow(dead_code)] // Public infrastructure; production callers land in follow-up PRs.
+pub(crate) fn api_graphql_json(query: &str, variables: &[(&str, &str)]) -> Result<Vec<u8>> {
+    let out = run_gh_with_backoff(|| {
+        let mut cmd = gh_command();
+        cmd.args(["api", "graphql", "-f", &format!("query={query}")]);
+        for (k, v) in variables {
+            cmd.args(["-F", &format!("{k}={v}")]);
+        }
+        cmd
+    })
+    .with_context(|| "failed to run `gh api graphql`")?;
+    if !out.status.success() {
+        log_gh_response("gh api graphql", &out);
+        bail!(
+            "gh api graphql failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// GraphQL-first / REST-fallback wrapper. Tries the GraphQL query first;
+/// on ANY error (rate limit, transport, parse, schema mismatch), falls
+/// back to the provided REST closure. Returns the deserialized result.
+///
+/// This is the centralized seam for the "always try GraphQL first, fall
+/// back to REST" policy — call sites that need this pattern MUST go
+/// through this helper rather than open-coding the try/fallback dance,
+/// so the fallback trigger, logging, and rate-limit handling live in
+/// exactly one place.
+///
+/// Single point of policy:
+///   - GraphQL HTTP failure (rate limit, 502, auth)        → call `rest_fn()`
+///   - GraphQL response present but deserialization fails   → call `rest_fn()`
+///   - GraphQL response present AND deserializes cleanly    → return it
+///
+/// `rest_fn` is invoked at most once. If the caller prefers a hard
+/// failure (no fallback) — e.g. a write operation, or a call site whose
+/// correctness depends on GraphQL — use `api_graphql_json` directly
+/// instead.
+///
+/// This helper does NOT touch the REST `core` budget gate
+/// (`rest_budget_remaining`) — GraphQL and REST have separate rate-limit
+/// buckets. The fallback's REST call will be subject to the existing
+/// backoff machinery inside `api_json` (or whichever REST helper the
+/// caller wraps in `rest_fn`), which already handles retries.
+#[allow(dead_code)] // Public infrastructure; production callers land in follow-up PRs.
+pub(crate) fn graphql_first<T, F>(
+    query: &str,
+    variables: &[(&str, &str)],
+    rest_fn: F,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+{
+    match api_graphql_json(query, variables) {
+        Ok(body) => match serde_json::from_slice::<T>(&body) {
+            Ok(parsed) => Ok(parsed),
+            Err(parse_err) => {
+                eprintln!(
+                    "graphql_first: graphql response did not deserialize ({parse_err}); \
+                     falling back to REST"
+                );
+                rest_fn()
+            }
+        },
+        Err(gh_err) => {
+            eprintln!(
+                "graphql_first: graphql call failed ({gh_err:#}); falling back to REST"
+            );
+            rest_fn()
+        }
+    }
+}
+
+/// Deadline-bounded twin of `graphql_first` for `queue_monitor`'s
+/// budget-tracked tick — see `run_gh_with_backoff_until`. Short-circuits
+/// straight to `rest_fn()` if `deadline` has already passed at entry.
+///
+/// The GraphQL attempt itself is bounded by the existing
+/// `run_gh_with_backoff` `GH_TIMEOUT` (45 s), not by `deadline` — callers
+/// that need full deadline-bounded GraphQL (e.g. a sub-15 s drain) should
+/// add a `graphql_first_until_capped` variant that uses
+/// `run_gh_with_backoff_until_capped`; current callers (e.g.
+/// `queue_monitor`) bound the GraphQL retry via the surrounding
+/// `monitor.tick` deadline, not per-call.
+#[allow(dead_code)] // Public infrastructure; production callers land in follow-up PRs.
+pub(crate) fn graphql_first_until<T, F>(
+    deadline: Instant,
+    query: &str,
+    variables: &[(&str, &str)],
+    rest_fn: F,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+{
+    if Instant::now() >= deadline {
+        return rest_fn();
+    }
+    graphql_first(query, variables, rest_fn)
+}
+
 /// Parsed slice of `gh api rate_limit`'s response -- only the `core` REST
 /// bucket's `remaining` count matters for the budget-floor check below; the
 /// `search`/`graphql`/etc buckets are ignored on purpose since every call
@@ -2712,6 +2827,263 @@ exit 0
             "hung child must be killed at the ~1s remaining budget, not the 10s \
              sleep or the 45s GH_TIMEOUT; took {}s",
             elapsed.as_secs()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ------------------------------------------------------------------
+    // graphql_first / api_graphql_json helpers
+    //
+    // These tests use a fake `gh` script to deterministically simulate
+    // success, GraphQL rate-limit failure, and GraphQL deserialization
+    // failure, and assert the wrapper's fallback / no-fallback behavior.
+    // ------------------------------------------------------------------
+
+    fn write_fake_gh_script(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let script = dir.join("fake-gh");
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        script
+    }
+
+    fn unique_fake_gh_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ezgha-fake-gh-{label}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FakeViewer {
+        login: String,
+    }
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FakeGraphqlData {
+        viewer: FakeViewer,
+    }
+    /// Mirrors the actual `gh api graphql` response envelope: every GraphQL
+    /// response is wrapped in `{"data": ..., "errors": [...]}`. Call sites
+    /// using `graphql_first` deserialize against this wrapper shape.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FakeGraphqlResult {
+        data: FakeGraphqlData,
+    }
+
+    #[test]
+    fn api_graphql_json_succeeds_with_valid_response() {
+        let dir = unique_fake_gh_dir("gql-success");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+# Fake `gh api graphql`: only echo on the GraphQL endpoint.
+case "$*" in
+    *graphql*) echo '{"data":{"viewer":{"login":"octocat"}}}' ;;
+    *) echo '{"message":"unexpected path"}'; exit 1 ;;
+esac
+exit 0
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let body = api_graphql_json(
+            "query { viewer { login } }",
+            &[("unused", "ignored")],
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["data"]["viewer"]["login"], "octocat");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn api_graphql_json_returns_err_when_gh_fails() {
+        // Simulates GitHub returning HTTP 502 with a JSON body — gh exits
+        // non-zero and prints the error to stderr. The helper must surface
+        // this as Err so the wrapper's fallback path can engage.
+        let dir = unique_fake_gh_dir("gql-fail");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+echo '{"message":"Server Error"}' >&2
+echo 'gh: Server Error (HTTP 502)' >&2
+exit 1
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let err = api_graphql_json("query { viewer { login } }", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("gh api graphql failed"),
+            "unexpected error chain: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graphql_first_uses_graphql_when_response_deserializes() {
+        // Happy path: GraphQL succeeds AND response shape matches T, so the
+        // REST closure must NOT be invoked (we'd notice — it panics).
+        let dir = unique_fake_gh_dir("gql-first-happy");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+echo '{"data":{"viewer":{"login":"graphql-user"}}}'
+exit 0
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let result: FakeGraphqlResult = graphql_first(
+            "query { viewer { login } }",
+            &[],
+            || panic!("REST fallback must NOT be invoked when GraphQL succeeded"),
+        )
+        .unwrap();
+        assert_eq!(result.data.viewer.login, "graphql-user");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graphql_first_falls_back_to_rest_when_gh_fails() {
+        // GraphQL path exits 1 (rate limit / 502). The wrapper must catch
+        // the error and invoke the REST closure exactly once.
+        let dir = unique_fake_gh_dir("gql-fallback-rest");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+echo 'gh: API rate limit exceeded' >&2
+exit 1
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let mut rest_calls = 0;
+        let result: FakeGraphqlResult = graphql_first(
+            "query { viewer { login } }",
+            &[],
+            || {
+                rest_calls += 1;
+                Ok(FakeGraphqlResult {
+                    data: FakeGraphqlData {
+                        viewer: FakeViewer {
+                            login: "rest-user".into(),
+                        },
+                    },
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result.data.viewer.login, "rest-user", "fallback returned the wrong result");
+        assert_eq!(rest_calls, 1, "REST closure must be called exactly once on GraphQL failure");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graphql_first_falls_back_to_rest_on_deserialize_failure() {
+        // GraphQL returns a body that does NOT match T (e.g. schema drift,
+        // missing fields, wrong wrapper). The wrapper must treat this as a
+        // fallback signal — a deserialized-to-Err response is NOT the same
+        // as a successful parse, and a silent Ok-wrong-shape would be a
+        // correctness defect at the call site.
+        let dir = unique_fake_gh_dir("gql-deser-fallback");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+# Body that does not have a `login` field at all — strict deserialize fails.
+echo '{"data":{"viewer":{"handle":"not-a-login-field"}}}'
+exit 0
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let result: FakeGraphqlResult = graphql_first(
+            "query { viewer { login } }",
+            &[],
+            || {
+                Ok(FakeGraphqlResult {
+                    data: FakeGraphqlData {
+                        viewer: FakeViewer {
+                            login: "rest-fallback-user".into(),
+                        },
+                    },
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result.data.viewer.login, "rest-fallback-user");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graphql_first_propagates_err_when_rest_also_fails() {
+        // Both GraphQL and REST fail — the wrapper must propagate the REST
+        // error (NOT the GraphQL error), since REST is the path of last
+        // resort and its error message is what the caller should see.
+        let dir = unique_fake_gh_dir("gql-rest-both-fail");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+echo 'gh: API rate limit exceeded' >&2
+exit 1
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let err: anyhow::Error = graphql_first::<FakeGraphqlResult, _>(
+            "query { viewer { login } }",
+            &[],
+            || anyhow::bail!("rest boom"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("rest boom"),
+            "expected REST error to be the propagated one, got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn graphql_first_until_skips_graphql_when_deadline_already_passed() {
+        // If the deadline is in the past, we must go straight to rest_fn —
+        // we cannot afford to spend any of the remaining 0 ms on a gh call,
+        // and a `graphql_first` GraphQL attempt would block up to GH_TIMEOUT
+        // (45 s). The fake gh script would also panic because we expect
+        // zero calls into the graphql path.
+        let dir = unique_fake_gh_dir("gql-deadline-passed");
+        let script = write_fake_gh_script(
+            &dir,
+            r#"#!/bin/sh
+echo 'should not be called' >&2
+exit 99
+"#,
+        );
+        let _guard = with_gh_exe(script.to_str().unwrap());
+        let already_expired = Instant::now() - Duration::from_secs(1);
+        let mut rest_calls = 0;
+        let result: FakeGraphqlResult = graphql_first_until(
+            already_expired,
+            "query { viewer { login } }",
+            &[],
+            || {
+                rest_calls += 1;
+                Ok(FakeGraphqlResult {
+                    data: FakeGraphqlData {
+                        viewer: FakeViewer {
+                            login: "deadline-rest".into(),
+                        },
+                    },
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(result.data.viewer.login, "deadline-rest");
+        assert_eq!(
+            rest_calls, 1,
+            "REST closure must be invoked exactly once when deadline has passed"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
