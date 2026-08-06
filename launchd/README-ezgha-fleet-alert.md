@@ -75,3 +75,54 @@ launchctl list | grep org.jleechanorg.ezgha-fleet-alert
   operator activates the plist after the PR is merged; this lane ships
   the template + script + systemd unit only.
 - **NO live deploy from this lane.** Operator activates.
+
+## GH#106 acceptance env vars (bead jleechan-vsd1)
+
+The following env vars were added in GH#106 to close the five
+acceptance gaps. All are optional with sensible defaults — see the
+script header for the canonical contract.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `EZGHA_DOCTOR_RUNNER` | `0` | When `1`, invoke `$DOCTOR_RUNNER_PATH` and parse its 4-state verdict. Verdict `fail` elevates both windows to degraded. |
+| `DOCTOR_RUNNER_PATH` | `<repo>/doctor-runner` | Path to the doctor-runner executable. |
+| `CRITICAL_DEGRADED_THRESHOLD` | `2` | Number of `CRITICAL` lines in the daemon stderr log within the short window before the gate fires. Only contributes to degraded when doctor-runner OR container_count is also degraded (idleness false-positive guard). |
+| `EZGHA_EXPECTED_CAPACITY` | `16` | Expected per-host container count. Compared against `docker ps --filter label=ezgha=managed`. Shortfall elevates both windows to degraded. |
+| `ALERT_LOG_FILE` | `/var/log/ezgha-alerts.log` | JSONL sink. Falls back to `$STATE_DIR/alerts.log` if not writable. |
+
+## GH#106 payload schema additions
+
+The JSON payload on stdout now includes these fields (in addition to
+the original fields):
+
+- `doctor_verdict` (`ok` / `fail` / `n/a`) — when `EZGHA_DOCTOR_RUNNER=1`
+- `doctor_executing`, `doctor_idle_ok`, `doctor_idle_starved`, `doctor_down` — 4-state counts (int)
+- `critical_in_window` (int) — CRITICAL lines in the short window
+- `container_count` (int) — local `docker ps --label ezgha=managed` count
+- `expected_capacity` (int) — value of `EZGHA_EXPECTED_CAPACITY`
+
+**Field rename:** `reason` → `evidence` (the free-text explanation of
+the alert decision). The old `reason` field is no longer present.
+Tests and downstream consumers must use `evidence`.
+
+## Backwards compatibility
+
+- `EZGHA_DOCTOR_RUNNER=0` (default) → all `doctor_*` fields are `"n/a"` / `0`.
+- `ALERT_LOG_FILE` unset → no JSONL sink is written (only stdout).
+- `EZGHA_EXPECTED_CAPACITY=0` (or unset) → `container_count >= 0` always,
+  so the container-count check is effectively a no-op (useful for tests
+  that don't want this gate to fire).
+
+## Operational notes (GH#106)
+
+- **False-positive guard for CRITICAL stderr scan:** the daemon
+  routinely logs `CRITICAL runner startup settling ceiling reached:
+  0/6 executing locally` on a healthy idle fleet (memory
+  `feedback_2026-08-01_daemon_settling_check_false_positive_idle.md`).
+  The CRITICAL scan only fires when doctor-runner (fail) OR
+  container_count shortfall is also present. CRITICAL alone is gated
+  off.
+- **JSONL sink at `/var/log/ezgha-alerts.log`:** requires root/sudo to
+  create the file. On a non-root launchd install, the script falls
+  back to `$STATE_DIR/alerts.log` automatically — no operator action
+  needed, but the events accumulate in the user state directory.
