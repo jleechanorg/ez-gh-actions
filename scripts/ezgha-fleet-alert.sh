@@ -59,6 +59,37 @@
 #   TAIL_LOCK_TIMEOUT_SEC=10      # max wait for tail-with-lock
 #   ALERT_HOST=$(hostname -s)     # embedded in alert payload
 #
+#   GH#106 acceptance (added 2026-08-06, bead jleechan-vsd1):
+#   EZGHA_DOCTOR_RUNNER=1         # opt-in: parse ./doctor-runner verdict
+#   DOCTOR_RUNNER_PATH=./doctor-runner  # path to doctor-runner
+#   CRITICAL_DEGRADED_THRESHOLD=2 # CRITICAL stderr lines to count degraded
+#                                 # (only fires if doctor-runner is also degraded
+#                                 # OR container_count_check is degraded —
+#                                 # the idle false-positive guard per
+#                                 # feedback_2026-08-01_daemon_settling_check)
+#   EZGHA_EXPECTED_CAPACITY=16    # expected per-host container count (10 Mac,
+#                                 # 6 Linux) — compared against
+#                                 # `docker ps --filter label=ezgha=managed`
+#   ALERT_LOG_FILE=/var/log/ezgha-alerts.log  # JSONL sink (falls back to
+#                                 # $STATE_DIR/alerts.log if not writable;
+#                                 # root or sudo required for /var/log)
+#
+# Alert payload schema (acceptance criterion 3):
+#   { "ts": "...", "host": "...", "gate": "ezgha-fleet-alert",
+#     "severity": "critical|info",
+#     "evidence": "<free-text explanation; was 'reason' before 2026-08-06>",
+#     "short_window_sec": N, "long_window_sec": N,
+#     "short_state": "ok|degraded", "long_state": "ok|degraded",
+#     "short_reclaim_count": N, "long_reclaim_count": N,
+#     "short_origin": "fresh|cached|stale-cache|no-data",
+#     "long_origin": "fresh|cached|stale-cache|no-data",
+#     "slot_file_health": "ok:N|degraded:N|missing",
+#     "doctor_verdict": "ok|fail|n/a",        # GH#106 gap 1
+#     "doctor_executing": N, "doctor_idle_ok": N,
+#     "doctor_idle_starved": N, "doctor_down": N,   # GH#106 gap 1
+#     "critical_in_window": N,                       # GH#106 gap 2
+#     "container_count": N, "expected_capacity": N } # GH#106 gap 3
+#
 # Exit codes:
 #   0 = both windows OK (no action)
 #   1 = ALERT fired (both windows degraded)
@@ -99,6 +130,13 @@ SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 SLOT_CAPACITY="${SLOT_CAPACITY:-16}"
 TAIL_LOCK_TIMEOUT_SEC="${TAIL_LOCK_TIMEOUT_SEC:-10}"
 ALERT_HOST="${ALERT_HOST:-$(hostname -s 2>/dev/null || echo unknown)}"
+
+# GH#106 acceptance env (added 2026-08-06, bead jleechan-vsd1).
+EZGHA_DOCTOR_RUNNER="${EZGHA_DOCTOR_RUNNER:-0}"
+DOCTOR_RUNNER_PATH="${DOCTOR_RUNNER_PATH:-$(cd "$(dirname "$SELF_PATH")/.." && pwd)/doctor-runner}"
+CRITICAL_DEGRADED_THRESHOLD="${CRITICAL_DEGRADED_THRESHOLD:-2}"
+EZGHA_EXPECTED_CAPACITY="${EZGHA_EXPECTED_CAPACITY:-16}"
+ALERT_LOG_FILE="${ALERT_LOG_FILE:-/var/log/ezgha-alerts.log}"
 
 # ── self-test mode ──────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--self-test" ]]; then
