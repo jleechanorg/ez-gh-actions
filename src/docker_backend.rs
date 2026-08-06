@@ -7709,6 +7709,149 @@ minimum_isolation = "container"
         );
     }
 
+    // ================= Bead ez-gh-actions-qz5j (GH#50) tests =================
+    // The reclaim decision loop historically re-read `now_epoch_secs()` /
+    // `ensure_daemon_start().elapsed()` at every site, which is TOCTOU-prone:
+    // between the first read and the last read, real wall-clock advances, so
+    // the `wall_secs` and `monotonic_ts` recorded into adjacent logs/records
+    // in the same pass can disagree — making it impossible to correlate
+    // them or to reason about grace-window boundaries from the ring buffer.
+    //
+    // The fix computes `now_wall` and `now_monotonic` ONCE at the entry of
+    // the reclaim pass into a `ReclaimContext` struct and threads it down
+    // through helpers. These three tests pin the post-fix invariants; they
+    // are RED pre-fix (the struct doesn't exist yet — these tests will fail
+    // to compile until ReclaimContext is introduced, then they assert
+    // structural invariants on it).
+
+    /// The `ReclaimContext` struct MUST exist (post-fix), and its
+    /// `wall_secs` field MUST equal the wall-clock at construction
+    /// (within a sub-second tolerance). Pre-fix this struct does not
+    /// exist — this test fails to compile until the refactor lands.
+    /// Post-fix it proves the entry instant is captured exactly once.
+    #[test]
+    fn reclaim_context_captures_wall_secs_at_construction() {
+        let pre = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ctx = ReclaimContext::now();
+        let post = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // wall_secs captured at construction must lie within the [pre, post]
+        // window of wall-clock reads — bounded by construction time only,
+        // never re-read afterward. Pre-fix the struct doesn't exist; the
+        // test fails to compile.
+        assert!(
+            ctx.wall_secs >= pre && ctx.wall_secs <= post,
+            "ReclaimContext::now().wall_secs={} must lie within [{}, {}] \
+             (read once at construction, never re-read). bead ez-gh-actions-qz5j",
+            ctx.wall_secs,
+            pre,
+            post
+        );
+    }
+
+    /// All `wall_secs` values recorded by a SINGLE `release_stale_slots` pass
+    /// MUST equal `ctx.wall_secs` from the entry instant — pre-fix they were
+    /// read independently at each site and could disagree across the wall
+    /// second boundary. We exercise this by recording 3 in-grace empty-id
+    /// reservations and verifying all three records share the same wall_secs
+    /// value (the entry instant reads once, threaded through the loop).
+    ///
+    /// Pre-fix this test is observably flaky in CI: when 3 sequential
+    /// `now_epoch_secs()` calls straddle a wall-second boundary, the values
+    /// differ (recorded as different `wall_secs` in the ring buffer).
+    #[test]
+    fn release_stale_slots_records_single_wall_secs_across_pass() {
+        // Force the producer pass to straddle a second boundary by sleeping
+        // up to ~1.0s before each slot allocation. With three
+        // `next_slot()` calls spaced ~330ms apart, the inner loop runs
+        // across a wall-second boundary probabilistically — but more
+        // importantly, even WITHOUT the sleep, pre-fix each iteration's
+        // `now_epoch_secs()` reads wall clock independently, so the three
+        // recorded wall_secs are allowed to disagree; post-fix they MUST
+        // equal the entry instant.
+        let _env = TestEnv::new("qz5j_single_wall_secs");
+        let cfg = cfg_with(3, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = next_slot(&cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = next_slot(&cfg).unwrap();
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &[],
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+        assert_eq!(reclaimed, 0, "all three are in-grace empty-id; nothing reaped");
+
+        let mut slot_wall: Vec<(String, u64)> = Vec::new();
+        for slot in ["1", "2", "3"] {
+            let history = snapshot_reclaim(Some(slot));
+            assert_eq!(history.len(), 1, "slot {slot} must have exactly one record");
+            slot_wall.push((slot.to_string(), history[0].1.wall_secs));
+        }
+        let first = slot_wall[0].1;
+        for (slot, w) in &slot_wall {
+            assert_eq!(
+                *w, first,
+                "slot {slot} recorded wall_secs={w} but slot 1 recorded wall_secs={first}; \
+                 all entries from a single reclaim pass must equal the entry instant \
+                 (bead ez-gh-actions-qz5j)"
+            );
+        }
+    }
+
+    /// A slot whose `registered_at` is within the grace window at ENTRY must
+    /// remain classified as `in_grace=true` throughout the pass — the grace
+    /// check is keyed on the entry instant, not on a re-read of the wall
+    /// clock at every record site. Pre-fix the helper functions each
+    /// re-called `now_epoch_secs()`, so a slow second-boundary crossing
+    /// could flip a borderline slot from grace-skip to reclaim mid-pass.
+    /// Post-fix the same `ctx.wall_secs` is used for every grace check in
+    /// the pass.
+    #[test]
+    fn release_stale_slots_grace_classification_uses_entry_instant() {
+        let _env = TestEnv::new("qz5j_grace_uses_entry_instant");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+        // registered_at was just written by next_slot (within grace),
+        // so the empty-id branch must classify this as in_grace=true and
+        // emit a `empty-id-grace-skip` record.
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &[],
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "slot 1 was registered moments ago by next_slot; must not be reaped"
+        );
+
+        let history = snapshot_reclaim(Some("1"));
+        assert_eq!(history.len(), 1);
+        let (_, rec) = &history[0];
+        assert!(
+            rec.in_grace,
+            "grace-window check must use entry instant; in_grace must be true \
+             (bead ez-gh-actions-qz5j). reason={}",
+            rec.reason
+        );
+        assert_eq!(
+            rec.reason, "empty-id-grace-skip",
+            "expected the grace-skip branch; got {}",
+            rec.reason
+        );
+    }
+    // ================= End bead ez-gh-actions-qz5j tests =================
+
     /// Bead jleechan-uurm: the ring buffer must cap at RECLAIM_RING_CAP
     /// entries per slot (FIFO eviction). Diagnostic window is small —
     /// older entries are not load-bearing.
