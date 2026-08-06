@@ -31,6 +31,13 @@ the server-side `binary-sha-drift.yml` CI workflow catches any case the
 hook misses. Bypass the local hook with `EZGHA_SKIP_BINARY_DRIFT_CHECK=1
 git push` only when you understand the consequence.
 
+The same hook also runs `scripts/lint_gh_api_no_shell_interp.sh` on every
+shell-script path the commit touches, blocking pushes that introduce a
+shell-interpolated `gh api ... -f body="$BODY"` call (where backticks
+or `$(...)` in the body would execute on the build host). Use
+`jq --rawfile BODY_FILE . | gh api --input -` instead, or bypass with
+`EZGHA_SKIP_GH_API_LINT_CHECK=1 git push`.
+
 ## How isolation works
 
 `ezgha` runs **one ephemeral container per job** on a host you control. The runner is

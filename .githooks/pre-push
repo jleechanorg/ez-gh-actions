@@ -13,6 +13,18 @@
 #   EZGHA_BIN=/path/to/ezgha           override the binary used for SHA extraction
 #
 # Reference: GH#103, bead jleechan-zs0j.
+#
+# Additional gate (added in GH#58 / bead jleechan-o9s8): blocks `git push`
+# when the latest commit touches any shell script that contains a
+# shell-interpolated `gh api` body (e.g. `gh api ... -f body="$BODY"`
+# where BODY contains backticks or `$(...)`). The shell would evaluate
+# the body before gh sees it, defeating any quoting the author thought
+# they had and risking secret/command-output injection into PR / issue
+# bodies. Bypass:
+#
+#   EZGHA_SKIP_GH_API_LINT_CHECK=1      skip this additional gate
+#
+# Reference: GH#58, bead jleechan-o9s8.
 
 set -euo pipefail
 
@@ -85,6 +97,71 @@ about to push. Run \`cargo install --path .\` first, then re-push.
 
   Override the binary path with:
     EZGHA_BIN=/custom/path/to/ezgha git push
+EOF
+  exit 1
+fi
+
+# ── 6. GH#58 lint: reject shell-interpolated `gh api` bodies ─────────────
+# Catches the unsafe pattern from PR #56: a Markdown body with backticks
+# interpolated into a shell-built `gh api ... -f body=...` call. The
+# safe pattern is `jq --rawfile BODY_FILE . | gh api --input -` (or
+# `jq -Rs <<<"$BODY" | gh api --input -`). See scripts/lint_gh_api_no_shell_interp.sh
+# for the full rule.
+#
+# We only lint the files the latest commit actually changed, so a
+# docs-only or Rust-only commit is never blocked by this gate.
+if [ "${EZGHA_SKIP_GH_API_LINT_CHECK:-0}" = "1" ]; then
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+LINT_BIN="$REPO_ROOT/scripts/lint_gh_api_no_shell_interp.sh"
+if [ ! -x "$LINT_BIN" ]; then
+  # Lint script missing: skip silently. The CI-side test
+  # (`tests/lint_gh_api_no_shell_interp_test.sh`) catches drift on
+  # every test run; we do not want a missing lint file to block pushes
+  # when a developer is mid-branch.
+  exit 0
+fi
+
+# Collect every shell-script-y path the latest commit touched. The lint
+# scans both files and directories; passing a list of files works.
+touched_paths="$(git diff --name-only HEAD~1..HEAD -- \
+  'scripts/*.sh' 'scripts/*/*.sh' 'tests/*.sh' 'tests/*/*.sh' \
+  'install.sh' 'install.d/*.sh' '.githooks/*' \
+  2>/dev/null || true)"
+if [ -z "${touched_paths}" ]; then
+  exit 0
+fi
+
+# Run the lint with each touched path as an argument. Use `|| true` so
+# a lint failure surfaces via the script's own non-zero exit, not via
+# `set -e` killing us mid-output.
+# shellcheck disable=SC2086  # word-splitting on $touched_paths is intentional
+lint_output="$(bash "$LINT_BIN" $touched_paths 2>&1)" || lint_rc=$?
+lint_rc="${lint_rc:-0}"
+if [ "$lint_rc" -ne 0 ]; then
+  printf '%s\n' "$lint_output" >&2
+  cat >&2 <<EOF
+
+ezgha pre-push: GH#58 lint flagged shell-interpolated gh api body.
+
+  One or more shell scripts in this commit use the unsafe pattern
+  \`gh api ... -f body="\$VAR"\` (or --field body=...) where the body
+  is evaluated by the shell before gh sees it. Backticks or \$(...)
+  in the body execute on the build host, and command output can be
+  injected into PR / issue / comment bodies.
+
+  Fix: pipe a structured payload through stdin:
+
+    jq --rawfile BODY_FILE . | gh api --input -
+    # or
+    jq -Rs .  <<<"\$BODY" | gh api --input -
+
+  Skip this check (NOT recommended) with:
+    EZGHA_SKIP_GH_API_LINT_CHECK=1 git push
+
+  Reference: GH#58, bead jleechan-o9s8.
 EOF
   exit 1
 fi
