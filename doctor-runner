@@ -326,13 +326,20 @@ else
   info "slot_assignments.toml absent (no reservations)"
 fi
 
-# Read the configured runner name prefix from ~/.config/ezgha/config.toml.
+# Resolve config file path: macOS ezgha binary uses ~/Library/Application Support/org.jleechanorg.ezgha/config.toml
+if [ "$PLATFORM" = "macos" ] && [ -f "$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml" ]; then
+  EZGHA_CONFIG_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml"
+else
+  EZGHA_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+fi
+
+# Read the configured runner name prefix from config.toml.
 # Different platforms/stacks use different prefixes: jeff-ubuntu Linux uses
 # `ez-org-runner` (legacy) or `ez-runner-b` (after prefix rename PR #8143),
 # Mac uses `ez-mac-runner` and may collide so suffixes like `-b` get added
 # by next_slot to avoid GitHub-side 422s. The doctor must accept ALL of
 # these, not a single hardcoded `ez-org-`.
-RUNNER_NAME_PREFIX=$(awk -F'"' '/^name_prefix/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+RUNNER_NAME_PREFIX=$(awk -F'"' '/^name_prefix/ {print $2; exit}' "$EZGHA_CONFIG_FILE" 2>/dev/null)
 if [ -z "$RUNNER_NAME_PREFIX" ]; then
   # Legacy / missing config: fall back to `ez-org-runner` (the pre-#8143 default).
   RUNNER_NAME_PREFIX="ez-org-runner"
@@ -342,7 +349,7 @@ info "configured runner name prefix: $RUNNER_NAME_PREFIX"
 
 # Policy vs backend: catch minimum_isolation=vm on hosts where docker blips
 # leave backend at container-only (Mac colima socket flake → serve fail-closed).
-POLICY_MIN=$(awk -F'"' '/^minimum_isolation/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+POLICY_MIN=$(awk -F'"' '/^minimum_isolation/ {print $2; exit}' "$EZGHA_CONFIG_FILE" 2>/dev/null)
 if [ -n "$POLICY_MIN" ]; then
   info "configured minimum_isolation: $POLICY_MIN"
   if recent_logs 10 | grep -q 'policy requires vm isolation but best available backend is docker'; then
@@ -627,12 +634,16 @@ except Exception:
 " "$1" 2>/dev/null
 }
 
+gh_api_retry() {
+  gh api "$1" 2>/dev/null || { sleep 0.2; gh api "$1" 2>/dev/null; }
+}
+
 build_runner_job_index() {
   # Emits one JSON object per queued/in-progress job across all
   # EXPLICIT_WORK_REPOS. Fresh-only: runs older than STALE_HOURS (section
   # 8's freshness rule, default 8h) are queue zombies, not live work —
   # skipping them ALSO bounds the per-run jobs-API fan-out.
-  local repo status runs_json jobs_json rid run_url fresh_cutoff
+  local repo status runs_json jobs_json rid run_url fresh_cutoff limit
   if [ "$PLATFORM" = "macos" ]; then
     fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
   else
@@ -640,10 +651,12 @@ build_runner_job_index() {
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
-      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
+      limit=50
+      [ "$status" = "queued" ] && limit=15
+      runs_json=$(gh_api_retry "repos/$repo/actions/runs?status=$status&per_page=$limit") || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
       while IFS=$'\t' read -r rid run_url; do
         [ -z "$rid" ] && continue
-        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+        jobs_json=$(gh_api_retry "repos/$repo/actions/runs/$rid/jobs") || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
            | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
@@ -717,7 +730,7 @@ fi
 # not just however many containers happen to exist — so a slot that never
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
-CONFIGURED_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
+CONFIGURED_COUNT=$(read_config_runner_count "$EZGHA_CONFIG_FILE" 2>/dev/null || true)
 DEFAULT_LINUX_RUNNER_COUNT=10
 DEFAULT_MAC_RUNNER_COUNT=6
 if [ "$PLATFORM" = "macos" ]; then
@@ -1141,7 +1154,21 @@ if [ "$PLATFORM" = "macos" ]; then
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
+  if [ -z "${MAC_RUNNER_NAME_PREFIX:-}" ]; then
+    MAC_RUNNER_NAME_PREFIX=$(ssh "$REMOTE_HOST" "python3 -c \"
+import tomllib, os
+p1 = os.path.expanduser('~/Library/Application Support/org.jleechanorg.ezgha/config.toml')
+p2 = os.path.expanduser('~/.config/ezgha/config.toml')
+for p in (p1, p2):
+    if os.path.exists(p):
+        with open(p, 'rb') as f:
+            v = tomllib.load(f).get('runner', {}).get('name_prefix', '')
+            if v:
+                print(v)
+                break
+\"" 2>/dev/null || echo "")
+  fi
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-e}"
   REMOTE_COUNT="${MAC_RUNNER_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
@@ -1223,7 +1250,7 @@ export REMOTE_UNREACHABLE
 # Linux-only: journalctl timestamps every line; macOS's redirected launchd
 # log files carry no per-line timestamp to diff.
 STARVE_WINDOW="${STARVE_WINDOW:-10}"
-SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$EZGHA_CONFIG_FILE" 2>/dev/null)
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
 STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
 if [ "$PLATFORM" = "linux" ]; then
@@ -1303,7 +1330,7 @@ fi
 # tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
 # config.toml is unreadable): count lines within the [assignments] section
 # ONLY, never a whole-file grep.
-CONFIG_RUNNER_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
+CONFIG_RUNNER_COUNT=$(read_config_runner_count "$EZGHA_CONFIG_FILE" 2>/dev/null || true)
 if [ -n "${CONFIG_RUNNER_COUNT:-}" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$CONFIG_RUNNER_COUNT}"
 elif [ -f "$SLOT_FILE" ]; then

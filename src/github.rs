@@ -571,11 +571,7 @@ pub(crate) fn api_graphql_json(query: &str, variables: &[(&str, &str)]) -> Resul
 /// backoff machinery inside `api_json` (or whichever REST helper the
 /// caller wraps in `rest_fn`), which already handles retries.
 #[allow(dead_code)] // Public infrastructure; production callers land in follow-up PRs.
-pub(crate) fn graphql_first<T, F>(
-    query: &str,
-    variables: &[(&str, &str)],
-    rest_fn: F,
-) -> Result<T>
+pub(crate) fn graphql_first<T, F>(query: &str, variables: &[(&str, &str)], rest_fn: F) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
     F: FnOnce() -> Result<T>,
@@ -592,9 +588,7 @@ where
             }
         },
         Err(gh_err) => {
-            eprintln!(
-                "graphql_first: graphql call failed ({gh_err:#}); falling back to REST"
-            );
+            eprintln!("graphql_first: graphql call failed ({gh_err:#}); falling back to REST");
             rest_fn()
         }
     }
@@ -2894,11 +2888,8 @@ exit 0
 "#,
         );
         let _guard = with_gh_exe(script.to_str().unwrap());
-        let body = api_graphql_json(
-            "query { viewer { login } }",
-            &[("unused", "ignored")],
-        )
-        .unwrap();
+        let body =
+            api_graphql_json("query { viewer { login } }", &[("unused", "ignored")]).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["data"]["viewer"]["login"], "octocat");
         let _ = std::fs::remove_dir_all(dir);
@@ -2940,11 +2931,9 @@ exit 0
 "#,
         );
         let _guard = with_gh_exe(script.to_str().unwrap());
-        let result: FakeGraphqlResult = graphql_first(
-            "query { viewer { login } }",
-            &[],
-            || panic!("REST fallback must NOT be invoked when GraphQL succeeded"),
-        )
+        let result: FakeGraphqlResult = graphql_first("query { viewer { login } }", &[], || {
+            panic!("REST fallback must NOT be invoked when GraphQL succeeded")
+        })
         .unwrap();
         assert_eq!(result.data.viewer.login, "graphql-user");
         let _ = std::fs::remove_dir_all(dir);
@@ -2964,23 +2953,25 @@ exit 1
         );
         let _guard = with_gh_exe(script.to_str().unwrap());
         let mut rest_calls = 0;
-        let result: FakeGraphqlResult = graphql_first(
-            "query { viewer { login } }",
-            &[],
-            || {
-                rest_calls += 1;
-                Ok(FakeGraphqlResult {
-                    data: FakeGraphqlData {
-                        viewer: FakeViewer {
-                            login: "rest-user".into(),
-                        },
+        let result: FakeGraphqlResult = graphql_first("query { viewer { login } }", &[], || {
+            rest_calls += 1;
+            Ok(FakeGraphqlResult {
+                data: FakeGraphqlData {
+                    viewer: FakeViewer {
+                        login: "rest-user".into(),
                     },
-                })
-            },
-        )
+                },
+            })
+        })
         .unwrap();
-        assert_eq!(result.data.viewer.login, "rest-user", "fallback returned the wrong result");
-        assert_eq!(rest_calls, 1, "REST closure must be called exactly once on GraphQL failure");
+        assert_eq!(
+            result.data.viewer.login, "rest-user",
+            "fallback returned the wrong result"
+        );
+        assert_eq!(
+            rest_calls, 1,
+            "REST closure must be called exactly once on GraphQL failure"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3001,19 +2992,15 @@ exit 0
 "#,
         );
         let _guard = with_gh_exe(script.to_str().unwrap());
-        let result: FakeGraphqlResult = graphql_first(
-            "query { viewer { login } }",
-            &[],
-            || {
-                Ok(FakeGraphqlResult {
-                    data: FakeGraphqlData {
-                        viewer: FakeViewer {
-                            login: "rest-fallback-user".into(),
-                        },
+        let result: FakeGraphqlResult = graphql_first("query { viewer { login } }", &[], || {
+            Ok(FakeGraphqlResult {
+                data: FakeGraphqlData {
+                    viewer: FakeViewer {
+                        login: "rest-fallback-user".into(),
                     },
-                })
-            },
-        )
+                },
+            })
+        })
         .unwrap();
         assert_eq!(result.data.viewer.login, "rest-fallback-user");
         let _ = std::fs::remove_dir_all(dir);
@@ -3033,12 +3020,11 @@ exit 1
 "#,
         );
         let _guard = with_gh_exe(script.to_str().unwrap());
-        let err: anyhow::Error = graphql_first::<FakeGraphqlResult, _>(
-            "query { viewer { login } }",
-            &[],
-            || anyhow::bail!("rest boom"),
-        )
-        .unwrap_err();
+        let err: anyhow::Error =
+            graphql_first::<FakeGraphqlResult, _>("query { viewer { login } }", &[], || {
+                anyhow::bail!("rest boom")
+            })
+            .unwrap_err();
         assert!(
             err.to_string().contains("rest boom"),
             "expected REST error to be the propagated one, got: {err:#}"
@@ -3064,11 +3050,8 @@ exit 99
         let _guard = with_gh_exe(script.to_str().unwrap());
         let already_expired = Instant::now() - Duration::from_secs(1);
         let mut rest_calls = 0;
-        let result: FakeGraphqlResult = graphql_first_until(
-            already_expired,
-            "query { viewer { login } }",
-            &[],
-            || {
+        let result: FakeGraphqlResult =
+            graphql_first_until(already_expired, "query { viewer { login } }", &[], || {
                 rest_calls += 1;
                 Ok(FakeGraphqlResult {
                     data: FakeGraphqlData {
@@ -3077,9 +3060,8 @@ exit 99
                         },
                     },
                 })
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(result.data.viewer.login, "deadline-rest");
         assert_eq!(
             rest_calls, 1,
