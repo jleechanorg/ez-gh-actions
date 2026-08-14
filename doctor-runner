@@ -1148,7 +1148,21 @@ if [ "$PLATFORM" = "macos" ]; then
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
+  if [ -z "${MAC_RUNNER_NAME_PREFIX:-}" ]; then
+    MAC_RUNNER_NAME_PREFIX=$(ssh "$REMOTE_HOST" "python3 -c \"
+import tomllib, os
+p1 = os.path.expanduser('~/Library/Application Support/org.jleechanorg.ezgha/config.toml')
+p2 = os.path.expanduser('~/.config/ezgha/config.toml')
+for p in (p1, p2):
+    if os.path.exists(p):
+        with open(p, 'rb') as f:
+            v = tomllib.load(f).get('runner', {}).get('name_prefix', '')
+            if v:
+                print(v)
+                break
+\"" 2>/dev/null || echo "")
+  fi
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-e}"
   REMOTE_COUNT="${MAC_RUNNER_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
