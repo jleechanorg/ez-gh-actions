@@ -634,12 +634,16 @@ except Exception:
 " "$1" 2>/dev/null
 }
 
+gh_api_retry() {
+  gh api "$1" 2>/dev/null || { sleep 0.2; gh api "$1" 2>/dev/null; }
+}
+
 build_runner_job_index() {
   # Emits one JSON object per queued/in-progress job across all
   # EXPLICIT_WORK_REPOS. Fresh-only: runs older than STALE_HOURS (section
   # 8's freshness rule, default 8h) are queue zombies, not live work —
   # skipping them ALSO bounds the per-run jobs-API fan-out.
-  local repo status runs_json jobs_json rid run_url fresh_cutoff
+  local repo status runs_json jobs_json rid run_url fresh_cutoff limit
   if [ "$PLATFORM" = "macos" ]; then
     fresh_cutoff=$(date -u -v-"${STALE_HOURS:-8}"H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
   else
@@ -647,10 +651,12 @@ build_runner_job_index() {
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
-      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
+      limit=50
+      [ "$status" = "queued" ] && limit=15
+      runs_json=$(gh_api_retry "repos/$repo/actions/runs?status=$status&per_page=$limit") || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
       while IFS=$'\t' read -r rid run_url; do
         [ -z "$rid" ] && continue
-        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+        jobs_json=$(gh_api_retry "repos/$repo/actions/runs/$rid/jobs") || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
            | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
