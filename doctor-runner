@@ -305,7 +305,15 @@ LOOP_FAILS=$(recent_logs "$LOOP_WINDOW" | grep -c 'ensure_count failed' || true)
 LAST_LOOP=$(recent_logs "$LOOP_WINDOW" | tail -n 1 | cut -c1-40 || true)
 info "ensure_count failed occurrences in last ${LOOP_WINDOW} min: $LOOP_FAILS"
 info "most recent log line: $LAST_LOOP"
-SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+if [ "$PLATFORM" = "macos" ]; then
+  LOCAL_CONFIG_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml"
+  [ -f "$LOCAL_CONFIG_FILE" ] || LOCAL_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+  SLOT_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/slot_assignments.toml"
+  [ -f "$SLOT_FILE" ] || SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+else
+  LOCAL_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+  SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+fi
 # Section-scoped count: slot_assignments.toml now carries BOTH [assignments]
 # and [registered_at] sections, one line per slot each (registered_at was
 # added during churn remediation). A whole-file `grep -c '='` therefore
@@ -326,13 +334,13 @@ else
   info "slot_assignments.toml absent (no reservations)"
 fi
 
-# Read the configured runner name prefix from ~/.config/ezgha/config.toml.
+# Read the configured runner name prefix from config.toml.
 # Different platforms/stacks use different prefixes: jeff-ubuntu Linux uses
 # `ez-org-runner` (legacy) or `ez-runner-b` (after prefix rename PR #8143),
 # Mac uses `ez-mac-runner` and may collide so suffixes like `-b` get added
 # by next_slot to avoid GitHub-side 422s. The doctor must accept ALL of
 # these, not a single hardcoded `ez-org-`.
-RUNNER_NAME_PREFIX=$(awk -F'"' '/^name_prefix/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+RUNNER_NAME_PREFIX=$(grep -E '^name_prefix' "$LOCAL_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' "\x27')
 if [ -z "$RUNNER_NAME_PREFIX" ]; then
   # Legacy / missing config: fall back to `ez-org-runner` (the pre-#8143 default).
   RUNNER_NAME_PREFIX="ez-org-runner"
@@ -342,7 +350,7 @@ info "configured runner name prefix: $RUNNER_NAME_PREFIX"
 
 # Policy vs backend: catch minimum_isolation=vm on hosts where docker blips
 # leave backend at container-only (Mac colima socket flake → serve fail-closed).
-POLICY_MIN=$(awk -F'"' '/^minimum_isolation/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+POLICY_MIN=$(grep -E '^minimum_isolation' "$LOCAL_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' "\x27')
 if [ -n "$POLICY_MIN" ]; then
   info "configured minimum_isolation: $POLICY_MIN"
   if recent_logs 10 | grep -q 'policy requires vm isolation but best available backend is docker'; then
@@ -717,7 +725,7 @@ fi
 # not just however many containers happen to exist — so a slot that never
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
-CONFIGURED_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
+CONFIGURED_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
 DEFAULT_LINUX_RUNNER_COUNT=10
 DEFAULT_MAC_RUNNER_COUNT=6
 if [ "$PLATFORM" = "macos" ]; then
@@ -1136,13 +1144,13 @@ list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 # cross-check) are now the only remote sample taken.
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
-  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
-  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"
+  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-}"
+  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-}"
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
-  REMOTE_COUNT="${MAC_RUNNER_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-}"
+  REMOTE_COUNT="${MAC_RUNNER_COUNT:-}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
 REMOTE_EXECUTING_SLOTS=()
@@ -1163,6 +1171,24 @@ REMOTE_DOWN_SLOTS=()
 # ok() line cannot survive an unreachable half of the fleet).
 REMOTE_UNREACHABLE=0
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
+  if [ -z "$REMOTE_PREFIX" ]; then
+    if [ "$PLATFORM" = "macos" ]; then
+      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^name_prefix' ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_PREFIX="${REMOTE_PREFIX:-ez-runner-c}"
+    else
+      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^name_prefix' ~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_PREFIX="${REMOTE_PREFIX:-ez-mac-runner-e}"
+    fi
+  fi
+  if [ -z "$REMOTE_COUNT" ]; then
+    if [ "$PLATFORM" = "macos" ]; then
+      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^count\s*=' ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"
+    else
+      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^count\s*=' ~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
+    fi
+  fi
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
   REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
   REMOTE_IDLE_SLOTS=("${LAST_IDLE_SLOTS[@]}")
@@ -1223,7 +1249,7 @@ export REMOTE_UNREACHABLE
 # Linux-only: journalctl timestamps every line; macOS's redirected launchd
 # log files carry no per-line timestamp to diff.
 STARVE_WINDOW="${STARVE_WINDOW:-10}"
-SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$LOCAL_CONFIG_FILE" 2>/dev/null)
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
 STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
 if [ "$PLATFORM" = "linux" ]; then
@@ -1303,7 +1329,7 @@ fi
 # tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
 # config.toml is unreadable): count lines within the [assignments] section
 # ONLY, never a whole-file grep.
-CONFIG_RUNNER_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
+CONFIG_RUNNER_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
 if [ -n "${CONFIG_RUNNER_COUNT:-}" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$CONFIG_RUNNER_COUNT}"
 elif [ -f "$SLOT_FILE" ]; then
