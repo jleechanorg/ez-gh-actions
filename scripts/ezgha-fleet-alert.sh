@@ -413,8 +413,9 @@ if (( !short_degraded )) && (( !long_degraded )); then
   emit_alert ok ok "$short_count" "$long_count" "$slot_health" info "all-windows-ok"
   exit 0
 elif (( short_degraded )) && (( long_degraded )); then
-  emit_alert degraded degraded "$short_count" "$long_count" "$slot_health" critical "both-windows-degraded"
-  dispatch_alert
+  payload="$(emit_alert degraded degraded "$short_count" "$long_count" "$slot_health" critical "both-windows-degraded")"
+  printf '%s\n' "$payload"
+  printf '%s\n' "$payload" | dispatch_alert
   exit 1
 else
   # Hysteresis hold: only one window degraded.

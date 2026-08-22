@@ -75,7 +75,7 @@ grep -Fq 'DEFAULT_MAC_RUNNER_COUNT=6' "$DOCTOR_SCRIPT" || {
   echo "FAIL: macOS fallback count is not the current 6-runner contract" >&2
   exit 1
 }
-grep -Fq 'REMOTE_COUNT="${REMOTE_LINUX_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"' "$DOCTOR_SCRIPT" || {
+grep -Eq 'REMOTE_COUNT=.*DEFAULT_LINUX_RUNNER_COUNT' "$DOCTOR_SCRIPT" || {
   echo "FAIL: remote Linux fallback count is not the current 10-runner contract" >&2
   exit 1
 }
@@ -138,6 +138,7 @@ EOF
   fi
 
   HOME="$TEMP_HOME"
+  LOCAL_CONFIG_FILE="$CONFIG_DIR/config.toml"
   SLOT_FILE="$SLOT_FILE"
   EXPECTED_CONTAINERS=""
   eval "$COUNT_FUNC_SRC"
@@ -161,6 +162,7 @@ run_platform_default_case() {
   local label="$1" platform_default="$2"
 
   HOME="$TEMP_HOME"
+  LOCAL_CONFIG_FILE="$CONFIG_DIR/missing-config.toml"
   SLOT_FILE="$CONFIG_DIR/missing-slot-assignments.toml"
   EXPECTED_CONTAINERS=""
   DEFAULT_CONFIGURED_COUNT="$platform_default"

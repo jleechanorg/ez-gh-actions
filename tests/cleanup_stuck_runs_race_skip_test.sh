@@ -30,7 +30,7 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 # A run well past FRESH_TAIL_MIN (below), still under the 8h zombie threshold.
-CREATED_AT="$(date -u -d '-60 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+CREATED_AT="$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=60)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
 
 cat >"$tmpdir/gh" <<SH
 #!/usr/bin/env bash
