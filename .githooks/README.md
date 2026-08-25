@@ -1,8 +1,44 @@
-# .githooks — runtime provenance prefix enforcement
+# .githooks — runtime provenance prefix enforcement + behavioral sentinels
 
-This directory contains the `commit-msg` hook that enforces the runtime
-provenance prefix rule from `CLAUDE.md` (project) and the global
-`~/.claude/CLAUDE.md` "Commit provenance tag" rule.
+This directory contains:
+
+1. `commit-msg` — enforces the runtime provenance prefix rule from
+   `CLAUDE.md` (project) and the global `~/.claude/CLAUDE.md`
+   "Commit provenance tag" rule.
+2. `pre-commit` — rejects shell scripts that use `docker build -f
+   <relative_path>` (the 2026-08-20 Mac fleet outage bug class;
+   see `.claude/skills/install-gate-checks/SKILL.md` for the
+   behavioral sentinel rationale).
+
+## pre-commit hook — docker build path-syntax check
+
+The `pre-commit` hook runs on every commit and rejects any shell script
+(`*.sh`, `*.bash`, or any file under `scripts/`) that contains a
+relative `-f Dockerfile.runner` (or any other `docker build -f
+<relative>` pattern) without a leading `/`, `$`, or `"$`.
+
+Background: the 2026-08-20 Mac fleet outage was caused by
+`scripts/ezgha-fleet-watchdog.sh:366` using a relative
+`-f Dockerfile.runner` which Docker resolved against launchd's
+cwd-of-/. The hook catches the same class of regression at commit
+time (companion to `.github/workflows/install-sentinel.yml` which
+catches it at PR time).
+
+Opt in with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Bypass (emergency only): `git commit --no-verify`.
+
+Companion artifacts:
+- `.claude/skills/install-gate-checks/SKILL.md` — behavioral sentinel pattern
+- `.github/workflows/install-sentinel.yml` — CI behavioral checks
+- commit `b3fe954` — the original line 366 fix (Aug 2026)
+- bead `jleechan-zgvz` — line 366 bug + 5 follow-up safety gaps
+
+---
 
 ## Why this exists
 

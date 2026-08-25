@@ -1,0 +1,124 @@
+# CI gate: install-time sentinel behavioral checks
+#
+# Triggered on every PR + push to main. Asserts that:
+#   1. install.sh's watchdog sentinel is BEHAVIORAL (catches
+#      '-f Dockerfile.runner' relative-path bug class), not just
+#      presence-of-function-name
+#   2. The watchdog's ensure_runner_image is exercisable end-to-end
+#      via the integration test (Layer 2, real Docker)
+#   3. No future PR reintroduces a presence-only sentinel for the
+#      same class of bug
+#
+# Background: the 2026-08-20 Mac fleet outage (line 366 path bug)
+# shipped because install.sh:619 only checked for the *presence* of
+# 'ensure_runner_image' (string grep) — the function existed, the
+# sentinel passed, the underlying build command was silently broken
+# for 19 days (311+ REBUILD FAILED events, every 120s of watchdog tick).
+#
+# Companion to: install-gate-checks skill, CLAUDE.md "Sentinel checks
+# at install time" section, bead jleechan-zgvz, commit b3fe954.
+
+name: install-sentinel
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sentinel-behavioral:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert install.sh watchdog sentinel is BEHAVIORAL
+        run: |
+          set -euo pipefail
+          SENTINEL_FILE="install.sh"
+          if [[ ! -f "$SENTINEL_FILE" ]]; then
+            echo "FATAL: $SENTINEL_FILE not found" >&2
+            exit 2
+          fi
+
+          # Behavioral check #1: the watchdog sentinel MUST grep for
+          # the relative '-f Dockerfile.runner' pattern (the bug
+          # class). A presence-only sentinel would NOT have this line.
+          if ! grep -qE "grep .q.*-f Dockerfile\\.runner|grep .q.*Dockerfile\\.runner.*failure class" "$SENTINEL_FILE"; then
+            echo "FAIL: $SENTINEL_FILE does NOT include the relative-path behavioral sentinel." >&2
+            echo "      The 2026-08-20 outage shipped because this check was missing." >&2
+            echo "      See install-gate-checks skill for the required pattern." >&2
+            exit 1
+          fi
+          echo "OK: install.sh includes relative-path behavioral sentinel."
+
+      - name: Assert watchdog build command uses absolute -f
+        run: |
+          set -euo pipefail
+          WATCHDOG="scripts/ezgha-fleet-watchdog.sh"
+          if [[ ! -f "$WATCHDOG" ]]; then
+            echo "FATAL: $WATCHDOG not found" >&2
+            exit 2
+          fi
+
+          # Behavioral check #2: ensure_runner_image MUST use
+          # 'docker build -f "$repo_root/Dockerfile.runner"' (absolute
+          # path), NOT 'docker build -f Dockerfile.runner' (relative).
+          #
+          # The presence of the buggy pattern is a hard fail.
+          if grep -E "docker build -f Dockerfile\\.runner[^/]|docker build -f Dockerfile\\.runner[[:space:]]+-[a-z]|docker build -f Dockerfile\\.runner[[:space:]]+\\$" "$WATCHDOG"; then
+            echo "FAIL: $WATCHDOG contains relative '-f Dockerfile.runner' (the 2026-08-20 bug class)." >&2
+            exit 1
+          fi
+
+          # The absolute-path pattern MUST be present.
+          if ! grep -qE "docker build -f .\\\$repo_root/Dockerfile\\.runner" "$WATCHDOG"; then
+            echo "FAIL: $WATCHDOG does NOT use absolute '-f \$repo_root/Dockerfile.runner'." >&2
+            echo "      See commit b3fe954 for the canonical fix." >&2
+            exit 1
+          fi
+          echo "OK: watchdog build command uses absolute path."
+
+      - name: Run integration test (Layer 2, real Docker)
+        run: |
+          set -euo pipefail
+          # Requires docker-in-docker or a docker socket mount; on
+          # the default ubuntu-latest runner this will exercise the
+          # build path against the host's docker (if available) or
+          # skip cleanly with a warning if not.
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "SKIP: docker not on runner PATH; install-gate-checks behavioral assertion covered the broken path."
+            exit 0
+          fi
+          if ! docker version >/dev/null 2>&1; then
+            echo "SKIP: docker daemon not reachable; behavioral sentinel already validated the broken path."
+            exit 0
+          fi
+          bash tests/watchdog_ensure_runner_image_test.sh
+
+      - name: Assert skill exists
+        run: |
+          set -euo pipefail
+          SKILL=".claude/skills/install-gate-checks/SKILL.md"
+          if [[ ! -f "$SKILL" ]]; then
+            echo "FAIL: $SKILL not found." >&2
+            echo "      The install-gate-checks skill is required to document the behavioral sentinel pattern." >&2
+            exit 1
+          fi
+          # The skill MUST include the 2026-08-20 reference (to
+          # document the failure class) and the 'decision table'
+          # section.
+          if ! grep -q "2026-08-20" "$SKILL"; then
+            echo "FAIL: $SKILL missing 2026-08-20 failure reference." >&2
+            exit 1
+          fi
+          if ! grep -q "Decision table\|decision table" "$SKILL"; then
+            echo "FAIL: $SKILL missing decision table." >&2
+            exit 1
+          fi
+          echo "OK: install-gate-checks skill present with required sections."
