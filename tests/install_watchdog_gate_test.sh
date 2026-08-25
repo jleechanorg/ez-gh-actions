@@ -49,13 +49,39 @@ fi
 # (docs/-less so the live post-deploy verify-exit-criteria.sh gate is never
 # reached -- see header comment.)
 TEMP_REPO="${WORK}/repo"
-mkdir -p "${TEMP_REPO}/systemd" "${TEMP_REPO}/scripts"
+mkdir -p "${TEMP_REPO}/systemd" "${TEMP_REPO}/scripts/host"
 cp "${REPO_ROOT}/install.sh" "${TEMP_REPO}/install.sh"
 cp "${REPO_ROOT}"/systemd/ezgha-*.service "${REPO_ROOT}"/systemd/ezgha-*.timer "${TEMP_REPO}/systemd/"
+cp "${REPO_ROOT}"/systemd/app-lima-vm.slice \
+   "${REPO_ROOT}"/systemd/agents.slice \
+   "${REPO_ROOT}"/systemd/automation.slice \
+   "${REPO_ROOT}"/systemd/agent-scope-reaper.service \
+   "${REPO_ROOT}"/systemd/agent-scope-reaper.timer \
+   "${REPO_ROOT}"/systemd/psi-oom-watcher.service \
+   "${REPO_ROOT}"/systemd/psi-oom-watcher.timer \
+   "${TEMP_REPO}/systemd/"
+mkdir -p "${TEMP_REPO}/systemd/ao-daemon.service.d" \
+         "${TEMP_REPO}/systemd/ao-orchestrator.service.d" \
+         "${TEMP_REPO}/systemd/ai.dark-factory.daemon.service.d" \
+         "${TEMP_REPO}/systemd/lima-vm@colima.service.d" \
+         "${TEMP_REPO}/systemd/guest"
+cp "${REPO_ROOT}"/systemd/ao-daemon.service.d/20-automation-slice.conf \
+   "${TEMP_REPO}/systemd/ao-daemon.service.d/"
+cp "${REPO_ROOT}"/systemd/ao-orchestrator.service.d/20-automation-slice.conf \
+   "${TEMP_REPO}/systemd/ao-orchestrator.service.d/"
+cp "${REPO_ROOT}"/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.conf \
+   "${TEMP_REPO}/systemd/ai.dark-factory.daemon.service.d/"
+cp "${REPO_ROOT}"/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf \
+   "${TEMP_REPO}/systemd/lima-vm@colima.service.d/"
+cp "${REPO_ROOT}"/systemd/guest/actions.slice \
+   "${TEMP_REPO}/systemd/guest/"
 printf '[package]\nname = "ez-gh-actions"\nversion = "0.0.0"\n' > "${TEMP_REPO}/Cargo.toml"
 for name in ezgha-fleet-watchdog.sh refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
+done
+for name in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
+  cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
 done
 
 # ── 2. Stub PATH ───────────────────────────────────────────────────────────
@@ -96,6 +122,22 @@ cat > "${STUB_BIN}/gh" <<'EOF'
 exit 0
 EOF
 
+cat > "${STUB_BIN}/limactl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${LIMACTL_CAPTURE:?}"
+case "$*" in
+  *"tee /etc/systemd/system/actions.slice"*) cat > "${GUEST_ACTIONS_SLICE_CAPTURE:?}" ;;
+esac
+exit 0
+EOF
+
+for agent in codex claude gemini; do
+  cat > "${STUB_BIN}/${agent}" <<EOF
+#!/usr/bin/env bash
+echo ${agent}-stub
+EOF
+done
+
 cat > "${STUB_BIN}/uname" <<'EOF'
 #!/usr/bin/env bash
 echo Linux
@@ -108,6 +150,7 @@ cat > "${STUB_BIN}/systemctl" <<'EOF'
 # the test harness.
 : "${SYSTEMCTL_STATE_DIR:?SYSTEMCTL_STATE_DIR must be exported}"
 if [ "${1:-}" = "--user" ]; then shift; fi
+printf '%s\n' "$*" >> "${SYSTEMCTL_CAPTURE:-/dev/null}"
 sub="${1:-}"
 shift || true
 case "${sub}" in
@@ -138,6 +181,11 @@ EOF
 
 chmod +x "${STUB_BIN}"/*
 export PATH="${STUB_BIN}:${PATH}"
+export LIMACTL_CAPTURE="${WORK}/limactl.calls"
+export GUEST_ACTIONS_SLICE_CAPTURE="${WORK}/guest-actions.slice"
+export SYSTEMCTL_CAPTURE="${WORK}/systemctl.calls"
+: > "${LIMACTL_CAPTURE}"
+: > "${SYSTEMCTL_CAPTURE}"
 
 run_install() {
   # $1 = temp HOME, $2 = systemctl state dir, remaining = install.sh args
@@ -186,6 +234,51 @@ else
   echo "PASS: Case A: rendered ezgha-watchdog.service includes EZGHA_WATCHDOG_ALLOW_RESTART=1"
 fi
 
+# Host crash controls are source-controlled and rendered into stable paths.
+for unit in app-lima-vm.slice agents.slice automation.slice \
+            agent-scope-reaper.service agent-scope-reaper.timer \
+            psi-oom-watcher.service psi-oom-watcher.timer; do
+  if [ ! -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
+    fail "Case A: host control unit was not installed: ${unit}"
+  fi
+done
+for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+  if [ ! -f "${STATE_A}/${timer}.enabled" ]; then
+    fail "Case A: host control timer was not enabled: ${timer}"
+  fi
+done
+for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
+  if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
+    fail "Case A: stable host script was not installed: ${script}"
+  fi
+done
+for dropin in \
+  ao-daemon.service.d/20-automation-slice.conf \
+  ao-orchestrator.service.d/20-automation-slice.conf \
+  ai.dark-factory.daemon.service.d/20-automation-slice.conf; do
+  if [ ! -f "${HOME_A}/.config/systemd/user/${dropin}" ]; then
+    fail "Case A: service drop-in was not installed: ${dropin}"
+  fi
+done
+if [ ! -f "${HOME_A}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ]; then
+  fail "Case A: direct QEMU service memory ceiling was not installed"
+fi
+if ! grep -Fqx 'set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: direct QEMU service memory ceiling was not applied live"
+fi
+if ! cmp -s "${REPO_ROOT}/systemd/guest/actions.slice" "${GUEST_ACTIONS_SLICE_CAPTURE}"; then
+  fail "Case A: tracked guest actions.slice was not installed through limactl"
+fi
+if ! grep -Fqx 'shell colima -- sudo -n systemctl set-property --runtime actions.slice MemoryHigh=28G MemoryMax=32G MemorySwapMax=0 TasksMax=6000' "${LIMACTL_CAPTURE}"; then
+  fail "Case A: guest actions.slice live limits were not applied"
+fi
+for agent in codex claude gemini; do
+  wrapper="${HOME_A}/.local/bin/${agent}"
+  if [ ! -x "${wrapper}" ] || ! grep -q 'ezgha-agent-wrapper' "${wrapper}"; then
+    fail "Case A: scoped agent wrapper was not installed: ${agent}"
+  fi
+done
+
 # ── Case B: --without-watchdog heals drift (pre-enabled timer disabled) ──────
 HOME_B="${WORK}/home_b"
 STATE_B="${WORK}/state_b"
@@ -221,6 +314,25 @@ if [ ! -f "${STATE_C}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_C}
   fail "Case C: --with-watchdog run failed to also enable token-refresh/queue-reaper timers"
 else
   echo "PASS: Case C: --with-watchdog run still enabled token-refresh + queue-reaper timers"
+fi
+
+# ── Case E: uninstall restores a pre-existing CLI symlink and removes host controls.
+HOME_E="${WORK}/home_e"
+STATE_E="${WORK}/state_e"
+mkdir -p "${HOME_E}/.local/bin" "${STATE_E}"
+ln -s "${STUB_BIN}/codex" "${HOME_E}/.local/bin/codex"
+run_install "${HOME_E}" "${STATE_E}"
+HOME="${HOME_E}" SYSTEMCTL_STATE_DIR="${STATE_E}" \
+  bash "${TEMP_REPO}/install.sh" --uninstall >"${HOME_E}/uninstall.log" 2>&1
+if [ ! -L "${HOME_E}/.local/bin/codex" ] || [ "$(readlink "${HOME_E}/.local/bin/codex")" != "${STUB_BIN}/codex" ]; then
+  fail "Case E: uninstall did not restore the pre-existing codex symlink"
+fi
+if [ -e "${HOME_E}/.config/systemd/user/agents.slice" ] || \
+   [ -e "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" ]; then
+  fail "Case E: uninstall left host-control units behind"
+fi
+if ! grep -Fqx 'shell colima -- sudo -n rm -f /etc/systemd/system/actions.slice' "${LIMACTL_CAPTURE}"; then
+  fail "Case E: uninstall did not remove the persistent guest actions.slice"
 fi
 
 # ── Case D: flag composes with --dev (already exercised via run_install,

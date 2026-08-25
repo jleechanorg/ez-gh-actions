@@ -179,6 +179,113 @@ print(value)
 PY
 }
 
+# Gate-8 cgroup-parent checks are kept as small helpers so focused regression
+# tests can exercise the live evidence path without running every verifier
+# gate. In production the roots default to the real /proc and cgroup mounts;
+# VERIFY_EXIT_CRITERIA_* overrides are test-only fixture seams.
+verify_configured_actions_slice() {
+    local config_path="$1"
+    CONFIG_FILE="$config_path"
+    local parent
+    parent=$(toml_get_limits cgroup_parent "" 2>/dev/null || true)
+    [ "$parent" = "actions.slice" ] || {
+        echo "limits.cgroup_parent must be actions.slice (got '${parent:-unset}')" >&2
+        return 1
+    }
+}
+
+verify_platform_actions_slice() {
+    local platform="$1" config_path="$2"
+    [ "$platform" = Linux ] || return 0
+    verify_configured_actions_slice "$config_path"
+}
+
+verify_managed_runners_in_actions_slice() {
+    local cgroup_root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local proc_root="${VERIFY_EXIT_CRITERIA_PROC_ROOT:-/proc}"
+    [ -d "${cgroup_root}/actions.slice" ] || {
+        echo "${cgroup_root}/actions.slice is missing" >&2
+        return 1
+    }
+    local ids
+    ids=$(docker ps --filter label=ezgha=managed --format '{{.ID}}' 2>/dev/null || true)
+    [ -n "$ids" ] || {
+        echo "no managed runner containers found" >&2
+        return 1
+    }
+    local id pid raw path
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        pid=$(docker inspect -f '{{.State.Pid}}' "$id" 2>/dev/null || true)
+        [ -n "$pid" ] || { echo "managed runner $id has no host PID" >&2; return 1; }
+        raw=$(grep '^0::' "${proc_root}/${pid}/cgroup" 2>/dev/null | head -1 || true)
+        path="${raw#0::}"
+        case "$path" in
+            /actions.slice|/actions.slice/*) ;;
+            *)
+                echo "managed runner $id (pid=$pid) is outside actions.slice: ${path:-unavailable}" >&2
+                return 1
+                ;;
+        esac
+        [ -d "${cgroup_root}${path}" ] || {
+            echo "managed runner $id cgroup is not materialized under ${cgroup_root}: $path" >&2
+            return 1
+        }
+    done <<< "$ids"
+}
+
+verify_guest_managed_runners_in_actions_slice() {
+    command -v limactl >/dev/null 2>&1 || {
+        echo "limactl is unavailable for the Docker VM cgroup probe" >&2
+        return 1
+    }
+    limactl shell colima -- sh -lc '
+        test -d /sys/fs/cgroup/actions.slice || exit 1
+        ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}")
+        test -n "$ids" || exit 1
+        for id in $ids; do
+            pid=$(docker inspect -f "{{.State.Pid}}" "$id") || exit 1
+            raw=$(grep "^0::" "/proc/$pid/cgroup" | head -1) || exit 1
+            path=${raw#0::}
+            case "$path" in
+                /actions.slice|/actions.slice/*) ;;
+                *) exit 1 ;;
+            esac
+            test -d "/sys/fs/cgroup$path" || exit 1
+        done
+    ' >/dev/null 2>&1
+}
+
+cgroup_has_effective_memory_ceiling() {
+    local current="${1#0::}"
+    local root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    case "$current" in /*) ;; *) return 1 ;; esac
+    local high max
+    while :; do
+        high=$(cat "${root}${current}/memory.high" 2>/dev/null || true)
+        max=$(cat "${root}${current}/memory.max" 2>/dev/null || true)
+        if { [ -n "$high" ] && [ "$high" != max ]; } \
+           || { [ -n "$max" ] && [ "$max" != max ]; }; then
+            return 0
+        fi
+        [ "$current" = / ] && break
+        current="${current%/*}"
+        [ -n "$current" ] || current=/
+    done
+    return 1
+}
+
+if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
+    case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
+        config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        containers) verify_managed_runners_in_actions_slice ;;
+        cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
+        *) echo "unknown verifier test case" >&2; exit 2 ;;
+    esac
+    exit $?
+fi
+
 daemon_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
     local daemon_kernel host_kernel
@@ -292,10 +399,10 @@ REMEDIATE
     fi
 }
 
-# Verify the cgroup v2 leaf cgroup for the given raw /proc/<pid>/cgroup line
-# (including the optional leading "0::") has a finite memory ceiling in
-# /sys/fs/cgroup (memory.high or memory.max != "max"). Returns 0 if the leaf
-# is bounded, 1 if it is unbounded OR cannot be read. On failure, the offending
+# Verify the cgroup v2 path for the given raw /proc/<pid>/cgroup line
+# (including the optional leading "0::") has a finite effective memory ceiling
+# in its ancestry. Returns 0 if the process is recursively bounded, 1 if its
+# whole ancestry is unbounded or unreadable. On failure, the offending
 # cgroup path (and which file was max/unreadable) is printed on stdout so the
 # cold reader sees exactly which cgroup is missing the ceiling.
 #
@@ -309,20 +416,9 @@ REMEDIATE
 cgroup_leaf_has_memory_ceiling() {
     local cg_raw="$1"
     [ -z "$cg_raw" ] && return 1
-    cg_raw="${cg_raw#0::}"  # strip cgroup-v2 "0::" prefix if present
-    local sysfs="/sys/fs/cgroup"
-    local leaf_high leaf_max
-    leaf_high=$(cat "${sysfs}${cg_raw}/memory.high" 2>/dev/null || echo "")
-    leaf_max=$(cat "${sysfs}${cg_raw}/memory.max" 2>/dev/null || echo "")
-    if [ -z "$leaf_high" ] && [ -z "$leaf_max" ]; then
-        echo "${cg_raw} (cgroup files unreadable)"
-        return 1
-    fi
-    if [ "$leaf_high" = "max" ] && [ "$leaf_max" = "max" ]; then
-        echo "${cg_raw} (memory.high=max memory.max=max)"
-        return 1
-    fi
-    return 0
+    if cgroup_has_effective_memory_ceiling "$cg_raw"; then return 0; fi
+    echo "${cg_raw#0::} (no finite memory.high or memory.max in cgroup ancestry)"
+    return 1
 }
 
 # Probe the Colima/Lima VM running on a remote Mac host. Returns 0 if the
@@ -841,6 +937,126 @@ pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
 # verifier-level fail-closed, citing the four remediation paths so the
 # cold reader sees them at the top of the gate output.
 echo "--- Checking Gate 8: VM/AO/MCP containment ---"
+MODERN_UNIT_DIR="${HOME}/.config/systemd/user"
+MODERN_WRAPPER="${HOME}/.local/bin/codex"
+if [ "$(uname -s)" = "Linux" ]; then
+    if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
+        fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
+    fi
+    if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
+        if ! verify_guest_managed_runners_in_actions_slice; then
+            fail "Gate 8: every managed runner in the Docker VM must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
+        fi
+    elif ! verify_managed_runners_in_actions_slice; then
+        fail "Gate 8: every managed runner must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
+    fi
+    echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
+fi
+if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
+   && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
+   && [ -f "${MODERN_UNIT_DIR}/automation.slice" ] \
+   && [ -f "${MODERN_WRAPPER}" ] \
+   && grep -q '^# ezgha-agent-wrapper$' "${MODERN_WRAPPER}"; then
+    echo "    [INFO] Gate 8: modern finite host envelope detected"
+    modern_unit_value() {
+        awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"
+    }
+    modern_to_mb() {
+        case "$1" in
+            *G) echo $(( ${1%G} * 1024 )) ;;
+            *M) echo "${1%M}" ;;
+            *K) echo $(( ${1%K} / 1024 )) ;;
+            *[!0-9]*) echo 0 ;;
+            *) echo $(( $1 / 1024 / 1024 )) ;;
+        esac
+    }
+
+    MODERN_MAX_TOTAL_MB=0
+    for slice in app-lima-vm.slice agents.slice automation.slice; do
+        slice_file="${MODERN_UNIT_DIR}/${slice}"
+        high=$(modern_unit_value "$slice_file" MemoryHigh)
+        max=$(modern_unit_value "$slice_file" MemoryMax)
+        swap=$(modern_unit_value "$slice_file" MemorySwapMax)
+        tasks=$(modern_unit_value "$slice_file" TasksMax)
+        if [ -z "$high" ] || [ "$high" = max ] || [ -z "$max" ] || [ "$max" = max ] \
+           || [ -z "$swap" ] || [ "$swap" = max ] || [ -z "$tasks" ] || [ "$tasks" = infinity ]; then
+            fail "Gate 8 modern envelope: ${slice} lacks a finite MemoryHigh/MemoryMax/MemorySwapMax/TasksMax tuple"
+        fi
+        MODERN_MAX_TOTAL_MB=$((MODERN_MAX_TOTAL_MB + $(modern_to_mb "$max")))
+        echo "    [PASS] ${slice}: high=${high} max=${max} swap=${swap} tasks=${tasks}"
+    done
+
+    # Gate 8 guest runner aggregate: the ten container limits are nested
+    # inside Colima, so their sum must also be bounded below the VM ceiling.
+    # Verify the persisted unit and the live cgroup rather than trusting the
+    # host config's cgroup_parent string alone.
+    GUEST_ACTIONS_VALUES=""
+    if command -v limactl >/dev/null 2>&1; then
+        GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
+            test -f /etc/systemd/system/actions.slice || exit 1
+            cat /sys/fs/cgroup/actions.slice/memory.high
+            cat /sys/fs/cgroup/actions.slice/memory.max
+            cat /sys/fs/cgroup/actions.slice/memory.swap.max
+            cat /sys/fs/cgroup/actions.slice/pids.max
+            ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}") || exit 1
+            test -n "$ids" || exit 1
+            for id in $ids; do
+                pid=$(docker inspect -f "{{.State.Pid}}" "$id") || exit 1
+                raw=$(grep "^0::" "/proc/$pid/cgroup" | head -1) || exit 1
+                path=${raw#0::}
+                case "$path" in
+                    /actions.slice|/actions.slice/*) ;;
+                    *) exit 1 ;;
+                esac
+                test -d "/sys/fs/cgroup$path" || exit 1
+            done
+            echo RUNNERS=actions.slice
+        ' 2>/dev/null | tr '\n' ' ' || true)
+    fi
+    read -r guest_high guest_max guest_swap guest_tasks guest_runners _ <<<"${GUEST_ACTIONS_VALUES}"
+    if [ "${guest_high:-}" != 30064771072 ] \
+       || [ "${guest_max:-}" != 34359738368 ] \
+       || [ "${guest_swap:-}" != 0 ] \
+       || [ "${guest_tasks:-}" != 6000 ] \
+       || [ "${guest_runners:-}" != "RUNNERS=actions.slice" ]; then
+        fail "Gate 8 guest runner aggregate: expected live high=28G max=32G swap=0 tasks=6000 and every runner in actions.slice, got high=${guest_high:-unavailable} max=${guest_max:-unavailable} swap=${guest_swap:-unavailable} tasks=${guest_tasks:-unavailable} runners=${guest_runners:-unavailable}"
+    fi
+    echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
+
+    MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
+    MODERN_RESERVE_MB=$((MODERN_HOST_TOTAL_MB / 10))
+    [ "$MODERN_RESERVE_MB" -ge 2048 ] || MODERN_RESERVE_MB=2048
+    if [ $((MODERN_MAX_TOTAL_MB + MODERN_RESERVE_MB)) -gt "$MODERN_HOST_TOTAL_MB" ]; then
+        fail "Gate 8 modern envelope: hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB exceed host ${MODERN_HOST_TOTAL_MB}MB"
+    else
+        echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
+    fi
+
+    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+        if ! systemctl --user is-enabled "$timer" >/dev/null 2>&1 \
+           || ! systemctl --user is-active "$timer" >/dev/null 2>&1; then
+            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
+        fi
+    done
+    for dropin in \
+        ao-daemon.service.d/20-automation-slice.conf \
+        ao-orchestrator.service.d/20-automation-slice.conf \
+        ai.dark-factory.daemon.service.d/20-automation-slice.conf; do
+        if [ ! -f "${MODERN_UNIT_DIR}/${dropin}" ] \
+           || ! grep -q '^Slice=automation.slice$' "${MODERN_UNIT_DIR}/${dropin}"; then
+            fail "Gate 8 modern envelope: missing automation drop-in ${dropin}"
+        fi
+    done
+    for bin in codex claude gemini; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            wrapper="${HOME}/.local/bin/${bin}"
+            if [ ! -f "$wrapper" ] || ! grep -q '^# ezgha-agent-wrapper$' "$wrapper"; then
+                fail "Gate 8 modern envelope: installed ${bin} is not routed through the scoped wrapper"
+            fi
+        fi
+    done
+    echo "    [PASS] Gate 8: modern hard host envelope and future-session containment installed"
+fi
 # Remediation primer (printed before probes fire so a cold reader sees
 # the four probes + their fixes):
 #   (1) QEMU slice:    systemd/app-lima-vm.slice (MemoryHigh=38G) must be
@@ -923,12 +1139,6 @@ else
         cg=$(grep '^0::' "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
         [ -z "$cg" ] && continue
         comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
-        # /user@<uid>.service/ is the unbounded user session — fail-closed.
-        if echo "$cg" | grep -qE '/user@[0-9]+\.service/'; then
-            AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid}) "
-            AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
-            continue
-        fi
         if ! LEAF_CHECK=$(cgroup_leaf_has_memory_ceiling "$cg"); then
             AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid},$LEAF_CHECK) "
             AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
@@ -975,16 +1185,12 @@ fi
 #     the requirement is waived (operators who have not installed an
 #     agent CLI do not need to enroll anything).
 #   - If ANY candidate is on PATH, then agents.slice MUST have at least
-#     one enrolled leaf (transient scope-* or service-* child), AND
-#     every enrolled leaf's memory.high MUST be a finite value (an
-#     "unbounded leaf within a bounded slice" is the exact failure
-#     shape that motivated this probe — the slice's own MemoryHigh
-#     applies to the SUM of its children, so a leaf with memory.high=
-#     max inside agents.slice defeats the parent cap).
-#   - The ao-daemon.service drop-in at
-#     systemd/ao-daemon-memory-cap.service.d/memory.conf installs
-#     Slice=agents.slice + MemoryHigh=20G on the daemon; the script
-#     scripts/host/agent-auto-migrate.sh enrolls interactive sessions.
+#     one enrolled leaf (transient scope-* or service-* child), and the
+#     slice must have a finite recursive memory ceiling. Child scopes may
+#     retain memory.high=max: cgroup-v2 still applies the finite parent to
+#     the aggregate of every descendant.
+#   - install.sh routes future CLI launches through agent-scoped-launch.sh;
+#     existing sessions are intentionally not killed during installation.
 AGENT_CLI_BINARIES="claude codex gemini cursor aider cody"
 AGENT_CLI_FOUND=""
 AGENT_CLI_MISSING=""
@@ -1009,29 +1215,21 @@ else
     SYSFS="/sys/fs/cgroup"
     AGENT_SLICE_BASE="${SYSFS}/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice"
     AGENT_LEAF_COUNT=0
-    AGENT_UNBOUNDED_LEAVES=""
     if [ -d "${AGENT_SLICE_BASE}" ]; then
         # Enumerate immediate child cgroups of the slice.
         while IFS= read -r leaf_dir; do
             [ -d "$leaf_dir" ] || continue
             AGENT_LEAF_COUNT=$((AGENT_LEAF_COUNT + 1))
-            leaf_high=$(cat "${leaf_dir}/memory.high" 2>/dev/null || echo "?")
-            # Treat "max" AND "unreadable" as unbounded; the helper
-            # cgroup_leaf_has_memory_ceiling accepts both. Either shape
-            # means the leaf has no enforced ceiling.
-            if [ "$leaf_high" = "max" ] || [ "$leaf_high" = "?" ]; then
-                leaf_name=$(basename "$leaf_dir")
-                AGENT_UNBOUNDED_LEAVES="${AGENT_UNBOUNDED_LEAVES}${leaf_name}(memory.high=${leaf_high}) "
-            fi
         done < <(find "${AGENT_SLICE_BASE}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
     fi
     if [ "$AGENT_LEAF_COUNT" -eq 0 ]; then
         fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: agent-CLI binaries on PATH (${AGENT_CLI_FOUND}) but ${AGENT_SLICE_BASE} has zero enrolled leaves. Remediation: per bead ez-gh-actions-0725 (round-3 policy: AUTO-MIGRATE with --opt-out), run 'scripts/host/agent-auto-migrate.sh apply' to relaunch matching PIDs into the slice, OR install systemd/ao-daemon-memory-cap.service.d/memory.conf to enroll the ao-daemon.service so the slice has at least one service-* leaf. The AGENT_SLICE_OPT_OUT=1 env-var escape hatch exists for explicit opt-OUT per session."
     fi
-    if [ -n "$AGENT_UNBOUNDED_LEAVES" ]; then
-        fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: slice has ${AGENT_LEAF_COUNT} leaf(ves) but ${AGENT_UNBOUNDED_LEAVES}are unbounded (memory.high=max). The parent slice's MemoryHigh applies to the SUM of children, so a leaf with memory.high=max defeats the aggregate cap. Remediation: copy systemd/ao-daemon-memory-cap.service.d/memory.conf to ~/.config/systemd/user/ao-daemon.service.d/ and ensure every interactive agent-CLI session enrolls via scripts/host/agent-auto-migrate.sh (which delegates to systemd-run --user --slice=agents.slice --scope -- <cmd>). Per bead ez-gh-actions-0725."
+    AGENT_SLICE_CG="${AGENT_SLICE_BASE#${SYSFS}}"
+    if ! cgroup_has_effective_memory_ceiling "$AGENT_SLICE_CG"; then
+        fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: slice has ${AGENT_LEAF_COUNT} leaf(ves) but no finite memory.high/memory.max in its cgroup ancestry."
     fi
-    echo "    [PASS] Gate 8 (2.5) agents.slice enrollment: ${AGENT_LEAF_COUNT} leaf(ves) enrolled (all memory.high finite); agent-CLI on PATH: ${AGENT_CLI_FOUND}"
+    echo "    [PASS] Gate 8 (2.5) agents.slice enrollment: ${AGENT_LEAF_COUNT} leaf(ves) enrolled under a finite aggregate ceiling; agent-CLI on PATH: ${AGENT_CLI_FOUND}"
 fi
 
 # (3) PSI admission check --------------------------------------------------------------

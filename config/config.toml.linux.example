@@ -11,12 +11,22 @@ name_prefix = "ez-runner-c"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64"]
 count = 10
 image = "ezgha-runner:latest"
+# Colima is provisioned with 36 GiB on this host. Keeping the explicit value
+# makes the physical-host envelope check active instead of relying on daemon
+# auto-detection.
+vm_total_mb = 36864
+guest_reserve_mb = 4096
+# Reserve 8 GiB of the 62.8 GiB physical host for the host OS and non-runner
+# services (at least max(2 GiB, 10% of physical RAM)). The configured VM total
+# must fit below this envelope.
+host_reserve_mb = 8192
 
 [limits]
 memory_mb = 3000
 cpus = 2.0
 pids = 512
 min_free_disk_gb = 10
+cgroup_parent = "actions.slice"
 
 [policy]
 # Native linux docker = container isolation. "vm" only if daemon is VM-contained

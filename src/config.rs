@@ -269,6 +269,11 @@ pub struct RunnerConfig {
     /// headroom (bead ez-gh-actions-yz6b, 2026-07-10 swap-thrash incident).
     #[serde(default = "default_guest_reserve_mb")]
     pub guest_reserve_mb: u64,
+    /// Physical-host RAM reserved outside the Docker VM. A configured
+    /// `vm_total_mb` must fit within `physical host RAM - host_reserve_mb`.
+    /// Zero preserves behavior for configurations written before this field.
+    #[serde(default)]
+    pub host_reserve_mb: u64,
     /// Minimum memory a single runner may be budgeted before the daemon
     /// refuses to start rather than silently clamping lower. Research-
     /// validated for this fleet's jest+playwright+rust workloads — do not
@@ -379,6 +384,9 @@ pub struct Limits {
     /// Disk exhaustion is the dominant self-hosted runner failure mode.
     #[serde(default = "default_min_free_disk_gb")]
     pub min_free_disk_gb: u64,
+    /// Optional systemd cgroup/slice parent for every runner container.
+    #[serde(default)]
+    pub cgroup_parent: Option<String>,
 }
 
 fn default_min_free_disk_gb() -> u64 {
@@ -544,6 +552,7 @@ impl Config {
                 serve_tick_seconds: default_serve_tick_seconds(),
                 vm_total_mb: None,
                 guest_reserve_mb: default_guest_reserve_mb(),
+                host_reserve_mb: 0,
                 runner_floor_mb: default_runner_floor_mb(),
                 wheelhouse_host_path: None,
                 pip_cache_host_path: None,
@@ -554,6 +563,7 @@ impl Config {
                 cpus,
                 pids: 512,
                 min_free_disk_gb: default_min_free_disk_gb(),
+                cgroup_parent: None,
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
@@ -618,6 +628,9 @@ impl Config {
         }
         if self.limits.pids < 1 {
             anyhow::bail!("limits.pids must be at least 1 (got {})", self.limits.pids);
+        }
+        if let Some(parent) = &self.limits.cgroup_parent {
+            validate_cgroup_parent(parent)?;
         }
         require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
         if self.runner.count < 1 {
@@ -721,6 +734,37 @@ impl Config {
         Ok(())
     }
 
+    /// Fail closed when an explicitly configured Docker VM would consume the
+    /// physical host's reserved envelope. The check is separate from the
+    /// syntactic/semantic config validation because callers must supply the
+    /// physical host capacity and should only apply it when a VM total is
+    /// configured (the legacy auto-detected path remains unchanged).
+    pub fn validate_host_envelope(&self, physical_host_mem_mb: u64) -> Result<()> {
+        self.validate()?;
+        let Some(vm_total_mb) = self.runner.vm_total_mb else {
+            return Ok(());
+        };
+        let available = physical_host_mem_mb
+            .checked_sub(self.runner.host_reserve_mb)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runner.host_reserve_mb ({}) exceeds physical host memory ({} MB)",
+                    self.runner.host_reserve_mb,
+                    physical_host_mem_mb
+                )
+            })?;
+        if vm_total_mb > available {
+            anyhow::bail!(
+                "configured VM total ({} MB) exceeds physical host envelope ({} MB total − {} MB reserve = {} MB)",
+                vm_total_mb,
+                physical_host_mem_mb,
+                self.runner.host_reserve_mb,
+                available
+            );
+        }
+        Ok(())
+    }
+
     pub fn load(path: &PathBuf) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("no config at {} — run `ezgha init` first", path.display()))?;
@@ -746,6 +790,26 @@ impl Config {
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
+}
+
+/// Check that a cgroup parent is one safe systemd unit/slice component.
+/// Docker accepts arbitrary cgroup paths, so reject separators, whitespace,
+/// and path traversal rather than passing an unsafe hierarchy to the daemon.
+fn validate_cgroup_parent(parent: &str) -> Result<()> {
+    if parent.is_empty() || parent.trim() != parent || parent == "." || parent == ".." {
+        anyhow::bail!(
+            "limits.cgroup_parent must be a non-empty systemd cgroup/slice name without surrounding whitespace"
+        );
+    }
+    if !parent
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@'))
+    {
+        anyhow::bail!(
+            "limits.cgroup_parent contains unsafe characters; use a single systemd cgroup/slice name"
+        );
+    }
+    Ok(())
 }
 
 fn is_owner_repo(value: &str) -> bool {
@@ -799,6 +863,7 @@ minimum_isolation = "container"
             serve_tick_seconds: 20,
             vm_total_mb: None,
             guest_reserve_mb: default_guest_reserve_mb(),
+            host_reserve_mb: 0,
             runner_floor_mb: default_runner_floor_mb(),
             wheelhouse_host_path: None,
             pip_cache_host_path: None,
@@ -894,6 +959,55 @@ minimum_isolation = "container"
     #[test]
     fn valid_config_passes_validation() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_config_without_host_reserve_or_cgroup_parent_still_loads() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 10
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg = load_from_str(raw, "legacy-host-reserve").unwrap();
+        assert_eq!(cfg.runner.host_reserve_mb, 0);
+        assert_eq!(cfg.limits.cgroup_parent, None);
+    }
+
+    #[test]
+    fn cgroup_parent_accepts_systemd_slice_name() {
+        let mut cfg = valid_config();
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn cgroup_parent_rejects_path_and_whitespace_injection() {
+        let mut cfg = valid_config();
+        for parent in ["", " ", "actions.slice/child", "../escape", "actions slice"] {
+            cfg.limits.cgroup_parent = Some(parent.into());
+            assert!(cfg.validate().is_err(), "unsafe parent: {parent:?}");
+        }
+    }
+
+    #[test]
+    fn host_envelope_rejects_vm_total_above_physical_host_minus_reserve() {
+        let mut cfg = valid_config();
+        cfg.runner.vm_total_mb = Some(60_000);
+        cfg.runner.host_reserve_mb = 4_096;
+        assert!(cfg.validate_host_envelope(64_000).is_err());
+        cfg.runner.vm_total_mb = Some(59_000);
+        assert!(cfg.validate_host_envelope(64_000).is_ok());
     }
 
     #[test]

@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic abandoned agent scope reaper
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=5min
+Unit=agent-scope-reaper.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

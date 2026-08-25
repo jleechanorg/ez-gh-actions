@@ -1,0 +1,6 @@
+[Unit]
+Description=Reap abandoned transient agent scopes
+
+[Service]
+Type=oneshot
+ExecStart=@SCRIPTS_DIR@/agent-scope-reaper.sh

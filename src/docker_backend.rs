@@ -2196,7 +2196,8 @@ fn read_meminfo_available() -> Option<u64> {
 /// (newest sample at the END); on each call we rotate left, push the new
 /// reading, and decide. We refuse on:
 ///   1. absolute pressure > 50% (any single tick),
-///   2. available_bytes < 2× per-runner memory,
+///   2. available_bytes < host reserve + per-runner memory (and the existing
+///      2× per-runner safety floor),
 ///   3. hysteresis: all 5 most-recent readings are rising (each tick's
 ///      reading is strictly greater than the prior tick).
 ///
@@ -2206,11 +2207,21 @@ pub fn eval_admission(
     pressure_pct: f64,
     available_bytes: u64,
     runner_memory_bytes: u64,
+    host_reserve_bytes: u64,
     prev_window: &mut [Option<f64>; 5],
 ) -> Result<(), String> {
     if pressure_pct > 50.0 {
         return Err(format!(
             "PSE memory pressure {pressure_pct:.1}% > 50%; refusing new start"
+        ));
+    }
+    let reserve_plus_runner = host_reserve_bytes.saturating_add(runner_memory_bytes);
+    if host_reserve_bytes > 0 && available_bytes < reserve_plus_runner {
+        let avail_mb = available_bytes / 1024 / 1024;
+        let reserve_mb = host_reserve_bytes / 1024 / 1024;
+        let runner_mb = runner_memory_bytes / 1024 / 1024;
+        return Err(format!(
+            "MemAvailable {avail_mb} MB < host reserve {reserve_mb} MB + runner memory {runner_mb} MB"
         ));
     }
     let two_x = runner_memory_bytes.saturating_mul(2);
@@ -2399,6 +2410,11 @@ fn resolve_vm_total_mb(cfg: &Config) -> Option<u64> {
 /// Prevention Principle). Returns `Err` only for the deliberate fail-loud
 /// case inside `derive_memory_budget`.
 pub fn resolve_and_log_memory_budget(cfg: &Config) -> Result<Option<MemoryBudget>> {
+    // A configured Docker VM is nested inside the physical host. Validate that
+    // its ceiling leaves the explicitly reserved host envelope before deriving
+    // the separate guest/daemon budget below. `platform::detect()` reports the
+    // physical machine's memory, not the Docker daemon's VM allocation.
+    cfg.validate_host_envelope(crate::platform::detect().total_mem_mb)?;
     let Some(vm_total_mb) = resolve_vm_total_mb(cfg) else {
         eprintln!(
             "warning: cannot determine VM/daemon memory ceiling (runner.vm_total_mb \
@@ -2567,6 +2583,9 @@ fn start_one_with_generate_at_slot(
     cmd.args(["--cpus", &format!("{:.2}", cpus)]);
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
+    if let Some(parent) = &cfg.limits.cgroup_parent {
+        cmd.args(["--cgroup-parent", parent]);
+    }
     if backend == Backend::DockerSysbox {
         cmd.args(["--runtime", "sysbox-runc"]);
     }
@@ -3451,32 +3470,50 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // not save the host from the 2026-07-12 crash — we ALSO need to refuse
     // new starts under sustained memory pressure even if there's plenty
     // of disk. Reads PSI cgroup-v2 memory.pressure + /proc/meminfo; refuses
-    // on absolute pressure > 50%, on available < 2× per-runner memory, OR
+    // on absolute pressure > 50%, on available < host reserve + runner memory
+    // (and the legacy 2× per-runner floor), OR
     // on a 5-tick rising-pressure hysteresis (sustained growth = OOM is
     // imminent even if the current absolute reading is below threshold).
-    // Best-effort: if either read fails (cgroup not mounted, /proc/meminfo
-    // unreadable, parse error) we LOG and continue rather than bail — a
-    // single broken probe must NOT take the runner pool offline. The
-    // hysteresis window is read+rotated as one Mutex guard.
+    // Legacy configs without a physical-host reserve remain best-effort when
+    // either read fails. Once a reserve is configured, probe failure is a
+    // fail-closed admission error. The hysteresis window is read+rotated as
+    // one Mutex guard.
     let admission_probe = memory_pressure_pct();
     let admission_decision: Result<(), String> = {
         let mut window = PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
         match &admission_probe {
             Ok((pct, available)) => {
                 let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
-                eval_admission(*pct, *available, runner_bytes, &mut window)
+                let host_reserve_bytes = cfg.runner.host_reserve_mb.saturating_mul(1024 * 1024);
+                eval_admission(
+                    *pct,
+                    *available,
+                    runner_bytes,
+                    host_reserve_bytes,
+                    &mut window,
+                )
             }
             Err(e) => {
-                // Probe failed — degrade gracefully. Push a None-equivalent
-                // (we can't, since the window is Option<f64>; push 0.0 to
-                // break the rising chain on the next successful probe) and
-                // log so the operator sees degraded-but-not-stopped.
+                // Preserve the legacy fail-open behavior only when no
+                // physical-host reserve is configured. Once an operator has
+                // requested a host envelope, inability to measure
+                // MemAvailable must fail closed rather than silently bypass
+                // that safety contract.
                 window.rotate_left(1);
                 window[4] = Some(0.0);
-                eprintln!(
-                    "warning: PSI admission probe failed ({e:#}); pressure-aware gate is NOT active this cycle"
-                );
-                Ok(())
+                if cfg.runner.host_reserve_mb > 0 {
+                    Err(format!(
+                        "host-reserve admission probe failed; refusing new start: {e:#}"
+                    ))
+                } else {
+                    // A no-reserve legacy config remains best-effort. The
+                    // warning makes the degraded state visible and the zero
+                    // sample breaks any rising-pressure chain.
+                    eprintln!(
+                        "warning: PSI admission probe failed ({e:#}); pressure-aware gate is NOT active this cycle"
+                    );
+                    Ok(())
+                }
             }
         }
     };
@@ -4804,6 +4841,35 @@ minimum_isolation = "container"
         assert!(
             run_line.contains("PIP_FIND_LINKS=/opt/wheelhouse"),
             "run args should set PIP_FIND_LINKS; got: {run_line}"
+        );
+    }
+
+    #[test]
+    fn configured_cgroup_parent_is_emitted_on_runner_start() {
+        let _env = TestEnv::new("cgroup_parent");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-cgroup-parent-test-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect("start_one should succeed");
+
+        let run_line = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("run "))
+            .expect("a docker run invocation should have been logged")
+            .to_string();
+        assert!(
+            run_line.contains("--cgroup-parent actions.slice"),
+            "configured cgroup parent must be passed to every runner: {run_line}"
         );
     }
 
@@ -6642,7 +6708,7 @@ minimum_isolation = "container"
         fn admits_when_pressure_low_and_available_huge() {
             // (a) 30% pressure, 16 GiB available → admit.
             let mut window = EMPTY_WINDOW;
-            let res = eval_admission(30.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, &mut window);
+            let res = eval_admission(30.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, 0, &mut window);
             assert!(
                 res.is_ok(),
                 "30% pressure + 16 GiB avail must admit, got: {res:?}"
@@ -6659,7 +6725,7 @@ minimum_isolation = "container"
         fn refuses_on_absolute_pressure_above_threshold() {
             // (b) 80% pressure, plenty of avail → refuse (absolute).
             let mut window = EMPTY_WINDOW;
-            let err = eval_admission(80.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, &mut window)
+            let err = eval_admission(80.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, 0, &mut window)
                 .expect_err("80% pressure must refuse");
             assert!(
                 err.contains("PSE memory pressure 80.0% > 50%"),
@@ -6673,12 +6739,22 @@ minimum_isolation = "container"
             // against a 3 GiB runner — 1 < 6, so refuse (available branch).
             let mut window = EMPTY_WINDOW;
             let one_gib: u64 = 1024 * 1024 * 1024;
-            let err = eval_admission(30.0, one_gib, RUNNER_BYTES, &mut window)
+            let err = eval_admission(30.0, one_gib, RUNNER_BYTES, 0, &mut window)
                 .expect_err("1 GiB avail vs 3 GiB runner must refuse");
             assert!(
                 err.contains("MemAvailable 1024 MB < 2× runner memory 3072 MB"),
                 "refusal message must cite both MB values, got: {err}"
             );
+        }
+
+        #[test]
+        fn refuses_when_available_only_covers_runner_but_not_host_reserve() {
+            let mut window = EMPTY_WINDOW;
+            let host_reserve = 4 * 1024 * 1024 * 1024;
+            let available = host_reserve + RUNNER_BYTES - 1;
+            let err = eval_admission(30.0, available, RUNNER_BYTES, host_reserve, &mut window)
+                .expect_err("available memory must include the configured host reserve");
+            assert!(err.contains("host reserve"), "got: {err}");
         }
 
         #[test]
@@ -6694,7 +6770,7 @@ minimum_isolation = "container"
             //   [12.0, 15.0, 18.0, 19.0, 20.0]  (all rising)
             let mut window: [Option<f64>; 5] =
                 [Some(10.0), Some(12.0), Some(15.0), Some(18.0), Some(19.0)];
-            let err = eval_admission(20.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, &mut window)
+            let err = eval_admission(20.0, 16 * 1024 * 1024 * 1024, RUNNER_BYTES, 0, &mut window)
                 .expect_err("5-tick rising must refuse even at 20% pressure");
             assert!(
                 err.contains("PSE hysteresis: pressure rising 5 consecutive ticks"),

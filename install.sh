@@ -65,6 +65,44 @@ uninstall() {
     done
     systemctl --user daemon-reload 2>/dev/null || true
   fi
+
+  # Restore agent CLI entry points that were replaced by scoped wrappers.
+  # Backups live under libexec so uninstall must restore them before removing
+  # that directory.
+  for agent in codex claude gemini cursor aider cody; do
+    wrapper="${HOME}/.local/bin/${agent}"
+    backup="${HOME}/.local/libexec/ezgha/wrapper-backups/${agent}"
+    if [ -f "${wrapper}" ] && grep -q '^# ezgha-agent-wrapper$' "${wrapper}"; then
+      rm -f "${wrapper}"
+      if [ -e "${backup}" ] || [ -L "${backup}" ]; then
+        mv "${backup}" "${wrapper}"
+      fi
+    fi
+  done
+  for unit in agent-scope-reaper.timer psi-oom-watcher.timer; do
+    systemctl --user disable --now "${unit}" 2>/dev/null || true
+  done
+  rm -f "${HOME}/.config/systemd/user/agent-scope-reaper.service" \
+        "${HOME}/.config/systemd/user/agent-scope-reaper.timer" \
+        "${HOME}/.config/systemd/user/psi-oom-watcher.service" \
+        "${HOME}/.config/systemd/user/psi-oom-watcher.timer" \
+        "${HOME}/.config/systemd/user/app-lima-vm.slice" \
+        "${HOME}/.config/systemd/user/agents.slice" \
+        "${HOME}/.config/systemd/user/automation.slice"
+  rm -f "${HOME}/.config/systemd/user/ao-daemon.service.d/20-automation-slice.conf" \
+        "${HOME}/.config/systemd/user/ao-orchestrator.service.d/20-automation-slice.conf" \
+        "${HOME}/.config/systemd/user/ai.dark-factory.daemon.service.d/20-automation-slice.conf" \
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+  # Remove only the persistent guest unit. Do not stop the active slice here:
+  # existing runner containers may still be attached while uninstall drains.
+  if command -v limactl >/dev/null 2>&1; then
+    if limactl shell colima -- sudo -n rm -f /etc/systemd/system/actions.slice >/dev/null 2>&1; then
+      limactl shell colima -- sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    else
+      warn "could not remove persistent Colima guest actions.slice"
+    fi
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
   if [ "$(uname -s)" = "Darwin" ]; then
     for aux in ${AUX_NAMES}; do
       aux_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-${aux}.plist"
@@ -686,10 +724,129 @@ FSTRIM_EOF
         continue
       fi
     done
+
+
+    # Host-wide reliability controls. Keep executable paths stable and render
+    # all templates from tracked source; no live service or VM is restarted.
+    for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
+      source_script="${SCRIPT_DIR}/scripts/host/${script}"
+      [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
+      install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
+    done
+
+    for unit in app-lima-vm.slice agents.slice automation.slice; do
+      install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
+    done
+    for unit in agent-scope-reaper.service agent-scope-reaper.timer \
+                psi-oom-watcher.service psi-oom-watcher.timer; do
+      sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+          -e "s|@HOME@|${HOME_DIR}|g" \
+          "${UNIT_DIR}/${unit}" > "${USER_UNIT_DIR}/${unit}"
+    done
+
+    for service in ao-daemon ao-orchestrator ai.dark-factory.daemon; do
+      dropin_dir="${USER_UNIT_DIR}/${service}.service.d"
+      mkdir -p "${dropin_dir}"
+      install -m 0644 \
+        "${UNIT_DIR}/${service}.service.d/20-automation-slice.conf" \
+        "${dropin_dir}/20-automation-slice.conf"
+    done
+    mkdir -p "${USER_UNIT_DIR}/lima-vm@colima.service.d"
+    install -m 0644 \
+      "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+      "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+
+    # Docker's --cgroup-parent=actions.slice places every runner beneath one
+    # guest aggregate. Install the tracked slice inside Colima so ten
+    # individually bounded containers cannot consume the guest's 4G reserve.
+    guest_actions_slice="${UNIT_DIR}/guest/actions.slice"
+    if command -v limactl >/dev/null 2>&1 && [ -f "${guest_actions_slice}" ]; then
+      if limactl shell colima -- sudo -n tee /etc/systemd/system/actions.slice \
+          < "${guest_actions_slice}" >/dev/null 2>&1; then
+        if limactl shell colima -- sudo -n systemctl daemon-reload >/dev/null 2>&1 &&
+           limactl shell colima -- sudo -n systemctl start actions.slice >/dev/null 2>&1 &&
+           limactl shell colima -- sudo -n systemctl set-property --runtime actions.slice \
+             MemoryHigh=28G MemoryMax=32G MemorySwapMax=0 TasksMax=6000 >/dev/null 2>&1; then
+          ok "Colima guest actions.slice installed and bounded"
+        else
+          warn "guest actions.slice installed but live limits could not be applied"
+        fi
+      else
+        warn "guest actions.slice skipped — colima is unavailable or guest sudo is not passwordless"
+      fi
+    else
+      info "guest actions.slice skipped — limactl or tracked unit unavailable"
+    fi
+    # Remove the superseded 20G agents.slice AO drop-in from earlier releases.
+    rm -f "${USER_UNIT_DIR}/ao-daemon.service.d/memory.conf"
+
+    install_agent_wrapper() {
+      local agent="$1" dest real backup tmp real_q
+      dest="${HOME_DIR}/.local/bin/${agent}"
+      backup="${SCRIPTS_DIR}/wrapper-backups/${agent}"
+      # `type -P` ignores shell functions named codex/claude and returns only
+      # an executable path. `command -v` can return the bare function name,
+      # which readlink then mis-resolves relative to the repo checkout.
+      real="$(type -P "${agent}" 2>/dev/null || true)"
+      [ -n "${real}" ] || return 0
+      mkdir -p "${HOME_DIR}/.local/bin" "${SCRIPTS_DIR}/wrapper-backups"
+      if [ -f "${dest}" ] && grep -q '^# ezgha-agent-wrapper$' "${dest}"; then
+        if [ -e "${backup}" ] || [ -L "${backup}" ]; then
+          real="$(readlink -f "${backup}" 2>/dev/null || true)"
+        else
+          real="$(sed -n 's/^# real-bin: //p' "${dest}" | head -1)"
+        fi
+      else
+        real="$(readlink -f "${real}" 2>/dev/null || printf '%s' "${real}")"
+        if [ -e "${dest}" ] || [ -L "${dest}" ]; then
+          cp -a "${dest}" "${backup}"
+        fi
+      fi
+      [ -n "${real}" ] || { bad "could not resolve real ${agent} binary"; return 1; }
+      printf -v real_q '%q' "${real}"
+      tmp="$(mktemp "${HOME_DIR}/.local/bin/.${agent}.ezgha.XXXXXX")"
+      cat > "${tmp}" <<EOF
+#!/usr/bin/env bash
+# ezgha-agent-wrapper
+# real-bin: ${real}
+REAL_BIN=${real_q}
+exec "\${HOME}/.local/libexec/ezgha/agent-scoped-launch.sh" "${agent}" "\${REAL_BIN}" "\$@"
+EOF
+      chmod 0755 "${tmp}"
+      mv -f "${tmp}" "${dest}"
+    }
+    for agent in codex claude gemini cursor aider cody; do
+      install_agent_wrapper "${agent}"
+    done
+
+    # The system watchdog on this host calls this historical user-owned path.
+    # Replace it atomically so it never observes a partially-written repair
+    # ladder; the canonical tracked copy remains in libexec above.
+    mkdir -p "${HOME_DIR}/.local/bin"
+    repair_tmp="$(mktemp "${HOME_DIR}/.local/bin/.watchdog-load-repair.XXXXXX")"
+    install -m 0755 "${SCRIPTS_DIR}/watchdog-load-repair.sh" "${repair_tmp}"
+    mv -f "${repair_tmp}" "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
+
     systemctl --user daemon-reload 2>/dev/null || true
+    # Apply the direct QEMU ceiling to an already-running Colima service.
+    # The tracked drop-in supplies the same values after the next boot; the
+    # runtime property closes the upgrade window without restarting the VM.
+    if systemctl --user set-property --runtime lima-vm@colima.service \
+         MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 2>/dev/null; then
+      ok "live QEMU service memory ceiling applied"
+    else
+      warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
+    fi
     for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user timer enabled: ${timer}"
+      else
+        bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
+      fi
+    done
+    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+      if systemctl --user enable --now "${timer}" 2>/dev/null; then
+        ok "systemd --user host-control timer enabled: ${timer}"
       else
         bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
       fi

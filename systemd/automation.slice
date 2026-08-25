@@ -1,0 +1,13 @@
+# automation.slice — finite budget for orchestration/watchdog automation.
+# measured margin: automation's observed 3.0 GiB peak leaves 1.0 GiB before
+# MemoryHigh and 3.0 GiB before MemoryMax; swap/tasks are finite too.
+[Unit]
+Description=Automation and dark-factory processes — bounded host budget
+Before=slices.target
+
+[Slice]
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=1G
+TasksMax=4096
+MemoryAccounting=yes

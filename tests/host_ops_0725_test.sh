@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # regression test: static validation of the bead ez-gh-actions-0725
 # host-pressure-relief artifacts (agents.slice, psi-oom-watcher.sh/.service/
-# .timer, agent-cli-scoped.sh). This test NEVER starts/enables anything
+# .timer, agent-scoped-launch.sh). This test NEVER starts/enables anything
 # live -- it only checks syntax and structural wiring, matching the
 # constraint this bead's artifacts were built under ("you MAY validate them
 # with systemd-analyze verify ... but do not actually start/enable
@@ -15,7 +15,7 @@
 #      after live testing on jeff-ubuntu actually holds (regression guard
 #      for the "watcher targets the Colima VM and kills the whole runner
 #      fleet" near-miss found during development of this bead).
-#   3. scripts/host/agent-cli-scoped.sh -- valid bash syntax (bash -n).
+#   3. scripts/host/agent-scoped-launch.sh -- valid bash syntax (bash -n).
 #   4. systemd/psi-oom-watcher.service -- valid unit syntax after
 #      @SCRIPTS_DIR@/@HOME@ substitution against a stub executable (mirrors
 #      install.sh's real substitution step, see install.sh's aux-unit loop).
@@ -97,10 +97,10 @@ else
     fi
   }
   verify_unit "systemd/agents.slice" "${SLICE}" slice_structural_check
-  if ! grep -q '^MemoryHigh=20G$' "${SLICE}"; then
-    fail "systemd/agents.slice MemoryHigh is not the documented 20G value (blast-radius comment would be stale)"
+  if ! grep -q '^MemoryHigh=10G$' "${SLICE}" || ! grep -q '^MemoryMax=12G$' "${SLICE}"; then
+    fail "systemd/agents.slice does not carry the documented 10G high / 12G hard envelope"
   else
-    ok "systemd/agents.slice MemoryHigh=20G matches documented blast-radius value"
+    ok "systemd/agents.slice has the documented 10G high / 12G hard envelope"
   fi
 fi
 
@@ -332,15 +332,15 @@ else
   fi
 fi
 
-# ── 3. agent-cli-scoped.sh syntax ───────────────────────────────────────────
-WRAPPER="${REPO_ROOT}/scripts/host/agent-cli-scoped.sh"
+# ── 3. agent-scoped-launch.sh syntax ────────────────────────────────────────
+WRAPPER="${REPO_ROOT}/scripts/host/agent-scoped-launch.sh"
 if [ ! -f "${WRAPPER}" ]; then
-  fail "scripts/host/agent-cli-scoped.sh does not exist"
+  fail "scripts/host/agent-scoped-launch.sh does not exist"
 else
   if bash -n "${WRAPPER}" 2>"${WORK}/wrapper-syntax.log"; then
-    ok "scripts/host/agent-cli-scoped.sh passes bash -n"
+    ok "scripts/host/agent-scoped-launch.sh passes bash -n"
   else
-    fail "scripts/host/agent-cli-scoped.sh failed bash -n: $(cat "${WORK}/wrapper-syntax.log")"
+    fail "scripts/host/agent-scoped-launch.sh failed bash -n: $(cat "${WORK}/wrapper-syntax.log")"
   fi
 fi
 

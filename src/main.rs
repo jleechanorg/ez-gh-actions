@@ -199,6 +199,8 @@ fn docker_reachable() -> bool {
 
 fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
     let plat = platform::detect();
+    cfg.validate_host_envelope(plat.total_mem_mb)
+        .context("physical host memory envelope validation failed")?;
     match backend::select(&plat, cfg.policy.minimum_isolation) {
         Selection::Chosen {
             backend,
