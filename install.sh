@@ -576,10 +576,17 @@ PLIST
       # a plist pointing at an older copy of ezgha-fleet-watchdog.sh that has
       # no ensure_runner_image, which is exactly the 2026-07-14 + 2026-07-29
       # outage class (bead jleechan-xlo7).
-      if [[ "${name}" == "watchdog" ]] && ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
-        bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
-        rm -f "${plist}"
-        return 1
+      if [[ "${name}" == "watchdog" ]]; then
+        if ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
+          bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
+          rm -f "${plist}"
+          return 1
+        fi
+        if grep -q '\-f Dockerfile\.runner' "${exec_path}" 2>/dev/null; then
+          bad "refusing to install ${plist}: ${exec_path} contains relative Dockerfile.runner path (lstat /Dockerfile.runner failure class)"
+          rm -f "${plist}"
+          return 1
+        fi
       fi
       if ! launchctl load -w "${plist}"; then
         bad "launchctl failed to load ${plist}"
