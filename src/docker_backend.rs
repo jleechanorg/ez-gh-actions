@@ -58,9 +58,15 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 // already in place. Raised to 30s so 6 probes comfortably fit (6 × 1s = 6s
 // + safety margin) and the runner-present check actually runs to completion.
 // Still well under the 300s watchdog margin.
+//
+// 2026-08-26: Under sustained Mac host load (6 heavy Docker containers),
+// `docker top` consistently exceeds 1s, causing `LOCAL_TOP_TIMEOUT` to fire
+// on every readiness poll → cascade CRITICAL alerts → SettlingDecision::Ceiling
+// → runner respawn blocked → fleet drops below capacity. Raised per-call cap
+// to 3s (6 × 3s = 18s ≤ 30s budget; still far below 300s watchdog).
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
-const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
