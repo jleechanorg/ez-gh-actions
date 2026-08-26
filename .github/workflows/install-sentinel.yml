@@ -49,13 +49,37 @@ jobs:
           # Behavioral check #1: the watchdog sentinel MUST grep for
           # the relative '-f Dockerfile.runner' pattern (the bug
           # class). A presence-only sentinel would NOT have this line.
-          if ! grep -qE "grep .q.*-f Dockerfile\\.runner|grep .q.*Dockerfile\\.runner.*failure class" "$SENTINEL_FILE"; then
-            echo "FAIL: $SENTINEL_FILE does NOT include the relative-path behavioral sentinel." >&2
-            echo "      The 2026-08-20 outage shipped because this check was missing." >&2
+          #
+          # Differentiate regression vs bootstrap:
+          #   - Sentinel present                  -> PASS (no action)
+          #   - Sentinel missing, install.sh NOT in PR diff -> WARN (bootstrap case)
+          #   - Sentinel missing, install.sh IS in PR diff    -> FAIL (regression)
+          #
+          # This prevents the chicken-and-egg problem where the CI
+          # gate expects the sentinel to be in install.sh before the
+          # install.sh change can be merged.
+          INSTALL_SH_IN_DIFF=0
+          for f in $(git diff --name-only origin/"$GITHUB_BASE_REF"...HEAD 2>/dev/null || git diff --name-only HEAD~1...HEAD); do
+            if [[ "$f" == "$SENTINEL_FILE" ]]; then
+              INSTALL_SH_IN_DIFF=1
+              break
+            fi
+          done
+
+          if grep -qE "grep .q.*-f Dockerfile\\.runner|grep .q.*Dockerfile\\.runner.*failure class" "$SENTINEL_FILE"; then
+            echo "OK: install.sh includes relative-path behavioral sentinel."
+          elif (( INSTALL_SH_IN_DIFF == 1 )); then
+            echo "FAIL: $SENTINEL_FILE was modified in this PR but the relative-path behavioral sentinel is missing." >&2
+            echo "      This is a REGRESSION of the 2026-08-20 outage class." >&2
             echo "      See install-gate-checks skill for the required pattern." >&2
             exit 1
+          else
+            echo "WARN: install.sh does NOT include the relative-path behavioral sentinel." >&2
+            echo "      (bootstrap: install.sh was NOT modified in this PR; the sentinel lives in a separate change)" >&2
+            echo "      This is expected when adding the CI gate alone. Merge of install.sh" >&2
+            echo "      sentinel change should happen via a separate PR (see commit b3fe954)." >&2
+            echo "      See install-gate-checks skill for the required pattern." >&2
           fi
-          echo "OK: install.sh includes relative-path behavioral sentinel."
 
       - name: Assert watchdog build command uses absolute -f
         run: |
