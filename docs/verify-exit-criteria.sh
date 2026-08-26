@@ -339,22 +339,7 @@ daemon_overlay_free_disk_gb() {
 
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
-    cat <<'REMEDIATE'
-[FAIL] Crash capture is not active on this host. The project's stated goal
-       (physical-host availability) cannot be proven without it.
-
-REPRODUCIBLE REMEDIATION:
-    1. sudo bash scripts/host/configure-grub-kdump.sh    # already-prepared, transactional, survives failure
-    2. sudo reboot                                     # required; GRUB + crashkernel=2G only take effect after reboot
-    3. ./docs/verify-exit-criteria.sh                  # re-run; this gate will turn green once /sys/kernel/kexec_crash_loaded == 1
-                                                       # After reboot, kexec_crash_loaded should read 1.
-
-OPERATIONAL PROOF (separate from this gate's check):
-    Once rebooted, run scripts/host/crash-capture-verify.sh --force (after --dry-run)
-    to confirm a vmcore lands in /var/crash; this is the OPERATIONAL proof that kdump works.
-    Then run scripts/host/crash-capture-verify.sh --verify <stamp> --no-trigger after
-    the post-panic reboot to close bead ez-gh-actions-r3f15.
-REMEDIATE
+    "$REPO_ROOT/scripts/host/kdump-remediation.sh"
     # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
     #     it routes only userspace coredumps (SIGSEGV in a process), NOT
     #     kernel panics. Kdump dumps kernel panics via kexec-loaded crash
@@ -375,7 +360,7 @@ REMEDIATE
     fi
     # (3) Kernel-panic capture lives in /sys/kernel/kexec_crash_loaded:
     #     when kdump has kexec-loaded the crash kernel, this reads '1'.
-    #     If the kernel was rebooted after running configure-grub-kdump.sh
+    #     If the kernel was rebooted after the supported kdump remediation
     #     but kexec_crash_loaded is still 0, the crash kernel did NOT load
     #     — either GRUB picked the wrong cmdline or crashkernel= is wrong.
     if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
@@ -392,7 +377,7 @@ REMEDIATE
     #     fails its post-reboot handshake and produces no vmcore).
     KDUMP_DIR=/var/crash
     if [ ! -d "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR does not exist; kdump has no dump target. Remediation: install kdump-tools (apt-get install kdump-tools) or run scripts/host/configure-grub-kdump.sh which prepares the path."
+        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR does not exist; kdump has no dump target. Remediation: install kdump-tools, then sudo install -d -m 0755 /var/crash and follow scripts/host/kdump-remediation.sh."
     fi
     if [ ! -w "$KDUMP_DIR" ]; then
         fail "Crash capture FAIL-CLOSED: $KDUMP_DIR is not writable by root; kernel cannot save vmcores here."
@@ -940,6 +925,13 @@ echo "--- Checking Gate 8: VM/AO/MCP containment ---"
 MODERN_UNIT_DIR="${HOME}/.config/systemd/user"
 MODERN_WRAPPER="${HOME}/.local/bin/codex"
 if [ "$(uname -s)" = "Linux" ]; then
+    # Read-only assertion: it never reloads or restarts watchdog, runners,
+    # containers, or the VM. It does require the active watchdog config to
+    # contain exactly one repair-maximum = 0 so repair cannot vote reboot.
+    WATCHDOG_CONF_PATH=/etc/watchdog.conf ASSERT_LIVE_WATCHDOG=1 \
+        "$REPO_ROOT/scripts/host/assert-no-host-reboot-vote.sh" \
+        || fail "Gate 8 (0) watchdog repair still has a host-reboot vote"
+    echo "    [PASS] Gate 8 (0) watchdog repair cannot vote for a host reboot"
     if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
         fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
     fi

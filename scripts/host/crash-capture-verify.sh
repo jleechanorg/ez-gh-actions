@@ -3,7 +3,7 @@
 # LABELED: human-gated (triggers a controlled kernel panic via sysrq-c)
 #
 # DO NOT auto-invoke. The operator must run this script manually AFTER:
-#   (a) sudo bash scripts/host/configure-grub-kdump.sh && sudo reboot
+#   (a) following scripts/host/kdump-remediation.sh, including reboot
 #   (b) confirming kexec_crash_loaded == 1 (verifier Gate 3 will pass)
 #
 # Recovery flow:
@@ -14,6 +14,7 @@
 # Part of bead ez-gh-actions-gam1 (lane K — crash-capture verification harness).
 
 set -euo pipefail
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 # -------- argument parsing -----------------------------------------------------
 
@@ -97,15 +98,14 @@ check_kexec_loaded() {
         cat >&2 <<EOF
 Error: kdump is NOT armed (kexec_crash_loaded=$v).
 This means the running kernel does NOT have a crash kernel loaded.
-Most likely cause: scripts/host/configure-grub-kdump.sh was run but the
-host has not been rebooted into the new GRUB config (crashkernel=2G).
+Most likely cause: the host has not rebooted into the single distro-owned
+crashkernel configuration, or kdump-tools failed to load it.
 
 Remediation:
-  1. Confirm configure-grub-kdump.sh ran cleanly:
-     grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub
-     # expect to see crashkernel=2G
-  2. Reboot: sudo reboot
-  3. After reboot, re-run this script with --dry-run.
+  1. bash "$REPO_ROOT/scripts/host/kdump-remediation.sh"
+  2. Run its dry-run and operator-gated apply steps.
+  3. Reboot only in the approved maintenance window.
+  4. After reboot, re-run this script with --dry-run.
 EOF
         exit 2
     fi

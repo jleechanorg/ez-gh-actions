@@ -2,7 +2,11 @@
 # scripts/host/configure-grub-kdump.sh
 # Configure GRUB to enable kdump (crashkernel=2G), enable CPU cgroups,
 # install/enable kdump-tools/kexec-tools, and update GRUB transactionally.
-# This script must be run with sudo/root privileges.
+# WARNING (Jeff-Ubuntu 2026-08-26): do NOT run this script on that host.
+# It writes crashkernel=2G into /etc/default/grub while kdump-tools.cfg already
+# injects crashkernel=512M,high — a duplicate that leaves kexec_crash_loaded=0.
+# Use scripts/host/apply-cfs-nohz-panic-stop.sh + docs/notes/kdump-dedup-maint-window.md.
+
 
 set -euo pipefail
 

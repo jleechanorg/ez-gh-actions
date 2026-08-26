@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Root-invoked, bounded repair ladder for host memory pressure (issue #75).
-# This file is a policy artifact: it never reboots. A non-zero result means
-# watchdog may consider reboot only after every bounded stage was attempted.
+# Shedder only: this file never reboots and never votes for a reboot.
+# watchdog(8) treats a non-zero repair-binary exit as "shut the host down"
+# (2026-08-25 17:34 PDT: exit 1 logged as a reboot vote, then SIGTERM systemd).
+# Always exit 0 after attempting the bounded stages. Pair with
+# repair-maximum = 0 in config/watchdog.conf so a successful repair that
+# has not yet dropped loadavg cannot escalate to reboot either
+# (watchdog.conf(5): zero means a repair program reporting success can
+# always block reboot).
 set -u -o pipefail
 
 DEADLINE_SECONDS="${REPAIR_DEADLINE_SECONDS:-110}"
@@ -295,8 +301,8 @@ verify_recovery() {
 verify_recovery pre-stop
 
 # 5. Only stop the VM after verification says pressure remains. This is the
-# final bounded shedding stage; watchdog decides separately whether reboot is
-# warranted from our non-zero result.
+# final bounded shedding stage. We still return success to watchdog so the
+# host is not rebooted when pressure remains.
 if [ "$verify_improved" -eq 0 ]; then
   if run_bounded limactl run_as_repair_user timeout --signal TERM --kill-after=2s \
     "${REPAIR_LIMA_STOP_TIMEOUT_SECONDS:-30}s" "$LIMACTL_BIN" --tty=false stop "${REPAIR_LIMA_INSTANCE:-colima}"; then
@@ -312,5 +318,7 @@ fi
 if [ "$DRY_RUN" = "1" ]; then log result recovered "dry-run plan completed without mutation"; exit 0; fi
 if [ "$verify_improved" -eq 1 ]; then log result recovered "recovery thresholds verified"; exit 0; fi
 if [ "$(remaining)" -le 0 ]; then overall_ok=0; log result deadline "all stages reached total deadline"; fi
-log result reboot-eligible "all bounded stages attempted; caller may consider reboot"
-exit 1
+# Exit 0 even when shedding did not clear pressure. A non-zero status is a
+# reboot vote to watchdog(8); this script must not cast that vote.
+log result shed-complete "all bounded stages attempted; watchdog must not reboot"
+exit 0

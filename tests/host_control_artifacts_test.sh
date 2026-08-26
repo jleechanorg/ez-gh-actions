@@ -30,12 +30,37 @@ assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemoryHigh=34G"
 assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemoryMax=38G"
 assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "TasksMax=4096"
+assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "CPUQuota=1600%"
 QEMU_DROPIN="$REPO_ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
 assert_file "$QEMU_DROPIN"
 assert_line "$QEMU_DROPIN" "MemoryHigh=34G"
 assert_line "$QEMU_DROPIN" "MemoryMax=38G"
 assert_line "$QEMU_DROPIN" "MemorySwapMax=2G"
 assert_line "$QEMU_DROPIN" "TasksMax=4096"
+assert_line "$QEMU_DROPIN" "CPUQuota=1600%"
+assert_file "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service"
+for setting in MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
+  grep -Fq "$setting" "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service" \
+    || fail "lima-vm-cpu-ceiling.service missing $setting"
+done
+assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
+bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
+grep -q 'QEMU_PROC_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
+  || fail "QEMU assertion lacks injected proc-root fixture support"
+grep -q 'QEMU_CGROUP_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
+  || fail "QEMU assertion lacks injected cgroup-root fixture support"
+APPLY_WD="$REPO_ROOT/scripts/host/apply-watchdog-no-reboot-vote.sh"
+assert_file "$APPLY_WD"
+bash -n "$APPLY_WD"
+APPLY_WATCHDOG_DRY_RUN=1 bash "$APPLY_WD" | grep -q 'repair-maximum=0' \
+  || fail "apply-watchdog-no-reboot-vote.sh dry-run missing repair-maximum=0"
+assert_file "$REPO_ROOT/config/sysctl.d/99-ezgha-oops-reboot.conf"
+assert_line "$REPO_ROOT/config/sysctl.d/99-ezgha-oops-reboot.conf" "kernel.panic = 10"
+assert_file "$REPO_ROOT/config/grub.d/zz-ezgha-nohz-panic.cfg"
+grep -q 'nohz=off' "$REPO_ROOT/config/grub.d/zz-ezgha-nohz-panic.cfg" \
+  || fail "grub drop-in missing nohz=off"
+APPLY_PANIC_STOP_DRY_RUN=1 bash "$REPO_ROOT/scripts/host/apply-cfs-nohz-panic-stop.sh" | grep -q 'nohz=off' \
+  || fail "apply-cfs-nohz-panic-stop.sh dry-run missing nohz=off"
 GUEST_ACTIONS_SLICE="$REPO_ROOT/systemd/guest/actions.slice"
 assert_file "$GUEST_ACTIONS_SLICE"
 assert_line "$GUEST_ACTIONS_SLICE" "MemoryHigh=28G"
@@ -58,7 +83,7 @@ grep -q -- '--collect' "$LAUNCH" || fail "launcher does not collect transient sc
 for cli in codex claude gemini cursor aider cody; do
   grep -q "$cli" "$LAUNCH" || fail "launcher does not list $cli"
 done
-STUB="$(mktemp -d)"; trap 'rm -rf "$STUB"' EXIT
+STUB="$(mktemp -d)"; trap 'rm -rf "$STUB"; [ -z "${WATCHDOG_FIXTURE_DIR:-}" ] || rm -rf "$WATCHDOG_FIXTURE_DIR"' EXIT
 cat > "$STUB/systemd-run" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "${LAUNCH_CAPTURE:?}"
@@ -94,6 +119,27 @@ ok "orphan reaper artifacts"
 
 REPAIR="$REPO_ROOT/scripts/host/watchdog-load-repair.sh"
 assert_file "$REPAIR"; bash -n "$REPAIR"
+! grep -q 'log result reboot-eligible' "$REPAIR" || fail "repair still logs reboot-eligible (that exit 1 is a watchdog(8) reboot vote)"
+! grep -q '^exit 1$' "$REPAIR" || fail "repair still exits 1 (watchdog(8) reboot vote)"
+assert_line "$REPO_ROOT/config/watchdog.conf" "repair-maximum = 0"
+# Use a temporary executable fixture for the configured repair-binary path;
+# the tracked config deliberately names the installed /home path, which this
+# test must not create or mutate.
+WATCHDOG_FIXTURE_DIR="$(mktemp -d)"
+WATCHDOG_FIXTURE_REPAIR="$WATCHDOG_FIXTURE_DIR/watchdog-load-repair.sh"
+cp "$REPAIR" "$WATCHDOG_FIXTURE_REPAIR"
+chmod +x "$WATCHDOG_FIXTURE_REPAIR"
+sed "s#^[[:space:]]*repair-binary[[:space:]]*=.*#repair-binary = $WATCHDOG_FIXTURE_REPAIR#" \
+  "$REPO_ROOT/config/watchdog.conf" > "$WATCHDOG_FIXTURE_DIR/watchdog.conf"
+ASSERT_LIVE_WATCHDOG=1 WATCHDOG_CONF_PATH="$WATCHDOG_FIXTURE_DIR/watchdog.conf" \
+  REPO_ROOT="$REPO_ROOT" bash "$REPO_ROOT/scripts/host/assert-no-host-reboot-vote.sh" >/dev/null \
+  || fail "watchdog reboot-vote assertion does not accept the safe fixture config"
+grep -Fq 'WATCHDOG_CONF_PATH=/etc/watchdog.conf' "$REPO_ROOT/docs/verify-exit-criteria.sh" \
+  || fail "exit criteria does not pin the live watchdog config path"
+grep -Fq 'ASSERT_LIVE_WATCHDOG=1' "$REPO_ROOT/docs/verify-exit-criteria.sh" \
+  || fail "exit criteria does not run the Linux watchdog assertion in live read-only mode"
+grep -Fq 'scripts/host/assert-no-host-reboot-vote.sh' "$REPO_ROOT/docs/verify-exit-criteria.sh" \
+  || fail "exit criteria does not invoke the watchdog assertion"
 for stage in freeze close kill remove reclaim verify limactl; do
   grep -q "$stage" "$REPAIR" || fail "repair missing stage $stage"
 done
@@ -144,7 +190,9 @@ REPAIR_TRACE="$STUB/trace" REPAIR_SYSTEMCTL_ARGS="$STUB/systemctl.args" \
   DOCKER_CONTEXT=poisoned-context DOCKER_CONFIG=/tmp/poisoned-docker-config \
   PATH="$STUB:$PATH" "$REPAIR" >/dev/null || repair_rc=$?
 repair_rc="${repair_rc:-0}"
-[ "$repair_rc" -ne 0 ] || fail "unrecovered pressure incorrectly returned success after VM stop"
+[ "$repair_rc" -eq 0 ] || fail "unrecovered pressure must still exit 0; non-zero is a watchdog(8) reboot vote"
+grep -q '"stage":"result","status":"shed-complete"' "$STUB/repair.log" || fail "unrecovered pressure did not log shed-complete"
+! grep -q 'reboot-eligible' "$STUB/repair.log" || fail "repair logged reboot-eligible"
 [ "$(grep -c '"stage":"verify"' "$STUB/repair.log")" -ge 2 ] || fail "VM stop path did not perform bounded post-stop verification"
 grep -nFx 'admission' "$STUB/trace" >/dev/null || fail "repair did not close admission"
 grep -nFx 'containers' "$STUB/trace" >/dev/null || fail "repair did not shed containers"

@@ -8,7 +8,7 @@ machine.
 # MacBook (6× ez-mac-runner-b-*)
 cp config/config.toml.mac.example ~/.config/ezgha/config.toml
 
-# jeff-ubuntu (16× ez-runner-b-*)
+# jeff-ubuntu (10× ez-runner-c-*)
 cp config/config.toml.linux.example ~/.config/ezgha/config.toml
 
 # jeff-ubuntu canary reserved capacity (1× ez-canary-runner-b-*)
@@ -24,6 +24,23 @@ launchctl kickstart -k gui/$(id -u)/org.jleechanorg.ezgha
 # Linux
 systemctl --user restart ezgha.service
 ```
+
+## Jeff-Ubuntu restore boundary
+
+The production contract is 10 Linux runners. A temporary live count of 5 is
+an incident state, not a second supported template.
+
+For a count-only restoration window, do **not** run `install.sh`: it also
+rebuilds the Docker image, installs units, and restarts the service. Inspect
+the runtime config and `failure_ladder.toml` first, deploy the already-reviewed
+binary separately, change only `runner.count`, and then restart `ezgha.service`
+under explicit operator authorization. An open failure-ladder cooldown is a
+diagnostic signal; do not delete its ledger merely to force ten starts.
+
+After restart, the exit criterion is ten named Linux slots proven locally with
+`Runner.Worker` via `docker top`, not GitHub API counts. Those deployment and
+verification actions change live machine state and are intentionally outside a
+repository-only preflight.
 
 ## `minimum_isolation` policy
 

@@ -755,6 +755,9 @@ FSTRIM_EOF
     install -m 0644 \
       "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
       "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+    install -m 0644 \
+      "${UNIT_DIR}/lima-vm-cpu-ceiling.service" \
+      "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
 
     # Docker's --cgroup-parent=actions.slice places every runner beneath one
     # guest aggregate. Install the tracked slice inside Colima so ten
@@ -832,10 +835,15 @@ EOF
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.
     if systemctl --user set-property --runtime lima-vm@colima.service \
-         MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 2>/dev/null; then
-      ok "live QEMU service memory ceiling applied"
+         MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null; then
+      ok "live QEMU service memory+CPU ceiling applied"
     else
       warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
+    fi
+    if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
+      ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
+    else
+      warn "lima-vm-cpu-ceiling.service not enabled"
     fi
     for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then

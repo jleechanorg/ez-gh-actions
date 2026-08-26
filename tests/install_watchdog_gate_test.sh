@@ -73,6 +73,8 @@ cp "${REPO_ROOT}"/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.c
    "${TEMP_REPO}/systemd/ai.dark-factory.daemon.service.d/"
 cp "${REPO_ROOT}"/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf \
    "${TEMP_REPO}/systemd/lima-vm@colima.service.d/"
+cp "${REPO_ROOT}"/systemd/lima-vm-cpu-ceiling.service \
+   "${TEMP_REPO}/systemd/"
 cp "${REPO_ROOT}"/systemd/guest/actions.slice \
    "${TEMP_REPO}/systemd/guest/"
 printf '[package]\nname = "ez-gh-actions"\nversion = "0.0.0"\n' > "${TEMP_REPO}/Cargo.toml"
@@ -263,8 +265,11 @@ done
 if [ ! -f "${HOME_A}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ]; then
   fail "Case A: direct QEMU service memory ceiling was not installed"
 fi
-if ! grep -Fqx 'set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096' "${SYSTEMCTL_CAPTURE}"; then
-  fail "Case A: direct QEMU service memory ceiling was not applied live"
+if ! grep -Fqx 'set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: direct QEMU service memory+CPU ceiling was not applied live"
+fi
+if ! grep -q 'enable --now lima-vm-cpu-ceiling.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: lima-vm-cpu-ceiling.service was not enabled"
 fi
 if ! cmp -s "${REPO_ROOT}/systemd/guest/actions.slice" "${GUEST_ACTIONS_SLICE_CAPTURE}"; then
   fail "Case A: tracked guest actions.slice was not installed through limactl"

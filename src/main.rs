@@ -11,6 +11,7 @@ mod backend;
 mod canary;
 mod config;
 mod docker_backend;
+mod failure_ladder;
 mod github;
 mod lima_convergence;
 mod platform;
@@ -716,10 +717,22 @@ fn apply_ensure_outcome_to_failure_streak(
             outcome.missing
         );
         notify_ensure_failure(cfg, backend, *ensure_fail_streak, &detail);
+    } else if outcome.admission_paused_reason.is_some() {
+        // A deliberate fail-closed pause with no new start failure is not
+        // backend recovery. Preserve the prior streak until a genuinely
+        // healthy ensure resets it; monitors still run during the pause.
+        return false;
     } else {
         *ensure_fail_streak = 0;
     }
     partial_failure
+}
+
+fn ensure_outcome_may_credit_deadman(outcome: &docker_backend::EnsureCountOutcome) -> bool {
+    outcome.admission_paused_reason.is_none()
+        && !outcome.is_partial_failure()
+        && outcome.post_refill_readiness_error.is_none()
+        && outcome.remaining_shortage == 0
 }
 
 // Five 5s local-only polls cover the observed 20-25s runner startup tail.
@@ -820,13 +833,41 @@ enum EnsureSuccessDecision {
     StartSettling { executing: u32 },
     Recovered,
     IncompleteReadiness,
+    AdmissionPaused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCommandDisposition {
+    AtCapacity,
+    Started,
+    AdmissionPaused,
+    PendingShortage,
+    Incomplete,
+}
+
+fn start_command_disposition(
+    outcome: &docker_backend::EnsureCountOutcome,
+) -> StartCommandDisposition {
+    if outcome.admission_paused_reason.is_some() {
+        StartCommandDisposition::AdmissionPaused
+    } else if outcome.start_failures > 0 || outcome.post_refill_readiness_error.is_some() {
+        StartCommandDisposition::Incomplete
+    } else if !outcome.started.is_empty() {
+        StartCommandDisposition::Started
+    } else if outcome.remaining_shortage == 0 {
+        StartCommandDisposition::AtCapacity
+    } else {
+        StartCommandDisposition::PendingShortage
+    }
 }
 
 fn ensure_success_decision(
     cfg: &config::Config,
     outcome: &docker_backend::EnsureCountOutcome,
 ) -> EnsureSuccessDecision {
-    if outcome.post_refill_readiness_error.is_some() {
+    if outcome.admission_paused_reason.is_some() {
+        EnsureSuccessDecision::AdmissionPaused
+    } else if outcome.post_refill_readiness_error.is_some() {
         EnsureSuccessDecision::IncompleteReadiness
     } else if outcome.remaining_shortage > 0 {
         EnsureSuccessDecision::StartSettling {
@@ -844,6 +885,7 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
         }
         EnsureSuccessDecision::Recovered => settling_plan(cfg, SettlingDecision::Recovered),
         EnsureSuccessDecision::IncompleteReadiness => settling_plan(cfg, SettlingDecision::Ceiling),
+        EnsureSuccessDecision::AdmissionPaused => (cfg.runner.serve_tick(), true),
     }
 }
 
@@ -872,6 +914,11 @@ fn apply_ensure_success_decision(
         EnsureSuccessDecision::IncompleteReadiness => {
             *settling = None;
             *pending_readiness = true;
+        }
+        EnsureSuccessDecision::AdmissionPaused => {
+            *settling = None;
+            // Retain any prior incomplete-readiness evidence while admission
+            // is closed; a pause is not proof that workers recovered.
         }
         EnsureSuccessDecision::Recovered => {
             *settling = None;
@@ -1177,13 +1224,51 @@ fn main() -> Result<()> {
             if let Some(c) = count {
                 cfg.runner.count = *c;
             }
+            // `start` mutates the same slot assignments and failure-ladder
+            // ledger as `serve`; serialize both commands across the entire
+            // read-modify-write sequence.
+            let _state_lock = acquire_serve_lock(&cfg).context("acquire runner-state lock")?;
             let backend = choose_backend(&cfg)?;
-            let started = docker_backend::ensure_count(&cfg, backend)?;
-            if started.is_empty() {
-                println!("already at capacity ({} runners)", cfg.runner.count);
-            }
-            for name in started {
+            let outcome = docker_backend::ensure_count_outcome(&cfg, backend)?;
+            for name in &outcome.started {
                 println!("started ephemeral runner {name} [{}]", backend.name());
+            }
+            match start_command_disposition(&outcome) {
+                StartCommandDisposition::AtCapacity => {
+                    println!("already at capacity ({} runners)", cfg.runner.count);
+                }
+                StartCommandDisposition::Started => {
+                    if outcome.remaining_shortage > 0 {
+                        println!(
+                            "refill started; {} runner(s) are still becoming locally ready",
+                            outcome.remaining_shortage
+                        );
+                    }
+                }
+                StartCommandDisposition::AdmissionPaused => bail!(
+                    "runner admission paused with {} runner(s) still missing: {}",
+                    outcome.remaining_shortage,
+                    outcome
+                        .admission_paused_reason
+                        .as_deref()
+                        .expect("paused disposition requires a reason")
+                ),
+                StartCommandDisposition::PendingShortage => bail!(
+                    "runner refill is pending with {} runner(s) still missing; no new runner was started (slot turnover may still be settling)",
+                    outcome.remaining_shortage
+                ),
+                StartCommandDisposition::Incomplete => bail!(
+                    "runner refill incomplete: started {} of {} missing runner(s), {} local start failure(s), {} runner(s) still not ready{}",
+                    outcome.started.len(),
+                    outcome.missing,
+                    outcome.start_failures,
+                    outcome.remaining_shortage,
+                    outcome
+                        .post_refill_readiness_error
+                        .as_deref()
+                        .map(|error| format!("; readiness evidence: {error}"))
+                        .unwrap_or_default()
+                ),
             }
         }
         Commands::Serve => {
@@ -1312,6 +1397,7 @@ fn main() -> Result<()> {
                 } else {
                     match docker_backend::ensure_count_outcome(&cfg, backend) {
                         Ok(outcome) => {
+                            let deadman_credit = ensure_outcome_may_credit_deadman(&outcome);
                             apply_ensure_outcome_to_failure_streak(
                                 &cfg,
                                 backend,
@@ -1346,6 +1432,15 @@ fn main() -> Result<()> {
                                         if escalated { "CRITICAL" } else { "WARN" }
                                     );
                                 }
+                                EnsureSuccessDecision::AdmissionPaused => {
+                                    eprintln!(
+                                        "runner admission remains paused: {}",
+                                        outcome
+                                            .admission_paused_reason
+                                            .as_deref()
+                                            .expect("decision requires admission pause reason")
+                                    );
+                                }
                             }
                             apply_ensure_success_decision(
                                 &mut settling,
@@ -1357,12 +1452,13 @@ fn main() -> Result<()> {
                             for name in outcome.started {
                                 println!("respawned ephemeral runner {name}");
                             }
-                            // A successful ensure_count is itself a "pipeline is
-                            // alive" signal — a healthy fleet should not need to
-                            // fire alerts to prove liveness. Bump the dead-man
-                            // clock so the threshold counts overall daemon
-                            // liveness, not just alert throughput.
-                            deadman.record_delivery(Instant::now());
+                            // Only a fully evidenced healthy ensure is a
+                            // "pipeline is alive" signal. Pauses, partial
+                            // starts, shortages, and incomplete readiness must
+                            // not reset the dead-man clock.
+                            if deadman_credit {
+                                deadman.record_delivery(Instant::now());
+                            }
                             // Respawn cadence: configurable via [runner]
                             // serve_tick_seconds (default 30, 5s floor). A
                             // bounded local-only settling episode follows a
@@ -1746,7 +1842,7 @@ fn ok(b: bool) -> &'static str {
 }
 
 /// Acquire an advisory `flock(2)` on `<config_dir>/ezgha/serve.lock` to
-/// prevent two `ezgha serve` instances from racing on the slot file. The
+/// prevent `ezgha serve` and `ezgha start` from racing on mutable runner state. The
 /// helper returns a `ServeLock` guard; dropping the `Option<File>` inside
 /// closes the fd and releases the flock automatically (also happens when
 /// the process dies). Tests opt out with `EZGHA_SKIP_LOCK=1`.
@@ -1793,8 +1889,8 @@ fn acquire_serve_lock(cfg: &config::Config) -> Result<ServeLock> {
         let e = std::io::Error::last_os_error();
         match e.kind() {
             ErrorKind::WouldBlock => bail!(
-                "another ezgha serve is running (lock held at {}); \
-                 refusing to start. Set EZGHA_SKIP_LOCK=1 to bypass (tests only).",
+                "another stateful ezgha runner command is active (lock held at {}); \
+                 refusing to race it. Set EZGHA_SKIP_LOCK=1 to bypass (tests only).",
                 path.display()
             ),
             _ => return Err(e.into()),
@@ -1847,6 +1943,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn runner_state_lock_refuses_concurrent_mutator_for_same_config() {
+        let base =
+            std::env::temp_dir().join(format!("ezgha-runner-state-lock-{}", std::process::id()));
+        let mut cfg = test_config();
+        cfg.state_dir = Some(base.clone());
+
+        let first = acquire_serve_lock(&cfg).expect("first state mutator lock");
+        let err = match acquire_serve_lock(&cfg) {
+            Ok(_) => panic!("second mutator must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("stateful ezgha runner command"));
+
+        drop(first);
+        acquire_serve_lock(&cfg).expect("lock must recover when first guard drops");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1868,6 +1983,7 @@ mod tests {
             remaining_shortage: 3,
             post_refill_readiness_error: None,
             start_failures: 3,
+            admission_paused_reason: None,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1887,6 +2003,7 @@ mod tests {
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             start_failures: 0,
+            admission_paused_reason: None,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1899,6 +2016,159 @@ mod tests {
             ensure_fail_streak, 0,
             "non-partial ensure_count success resets the serve alert streak"
         );
+    }
+
+    #[test]
+    fn deliberate_admission_pause_does_not_start_settling_or_backend_failure_streak() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 99;
+        let mut ensure_fail_streak = 2;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 10,
+            remaining_shortage: 10,
+            post_refill_readiness_error: None,
+            start_failures: 0,
+            admission_paused_reason: Some("fleet circuit open".into()),
+        };
+
+        assert!(!apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut ensure_fail_streak,
+            &outcome,
+        ));
+        assert_eq!(ensure_fail_streak, 2);
+        assert_eq!(
+            ensure_success_decision(&cfg, &outcome),
+            EnsureSuccessDecision::AdmissionPaused
+        );
+        assert_eq!(
+            ensure_success_plan(&cfg, EnsureSuccessDecision::AdmissionPaused),
+            (cfg.runner.serve_tick(), true),
+            "intentional pauses must keep queue/health monitors running"
+        );
+
+        let mut settling = Some(SettlingEpisode::start(Instant::now(), 0));
+        let mut pending_readiness = true;
+        apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            Instant::now(),
+            EnsureSuccessDecision::AdmissionPaused,
+        );
+        assert!(settling.is_none());
+        assert!(pending_readiness);
+    }
+
+    #[test]
+    fn start_command_never_reports_shortage_or_pause_as_at_capacity() {
+        let outcome = |started: Vec<&str>,
+                       missing,
+                       remaining_shortage,
+                       start_failures,
+                       admission_paused_reason: Option<&str>,
+                       post_refill_readiness_error: Option<&str>| {
+            docker_backend::EnsureCountOutcome {
+                started: started.into_iter().map(str::to_owned).collect(),
+                missing,
+                remaining_shortage,
+                post_refill_readiness_error: post_refill_readiness_error.map(str::to_owned),
+                start_failures,
+                admission_paused_reason: admission_paused_reason.map(str::to_owned),
+            }
+        };
+
+        assert_eq!(
+            start_command_disposition(&outcome(vec![], 0, 0, 0, None, None)),
+            StartCommandDisposition::AtCapacity
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(
+                vec![],
+                10,
+                10,
+                0,
+                Some("fleet circuit open"),
+                None,
+            )),
+            StartCommandDisposition::AdmissionPaused
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(vec![], 10, 10, 0, None, None)),
+            StartCommandDisposition::PendingShortage
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(vec!["runner-1"], 10, 9, 1, None, None)),
+            StartCommandDisposition::Incomplete
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(
+                vec!["runner-1"],
+                1,
+                1,
+                0,
+                None,
+                Some("docker top timed out"),
+            )),
+            StartCommandDisposition::Incomplete
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(vec!["runner-1"], 1, 1, 0, None, None)),
+            StartCommandDisposition::Started
+        );
+    }
+
+    #[test]
+    fn paused_control_plane_failure_still_advances_failure_streak() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 99;
+        let mut ensure_fail_streak = 0;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 10,
+            remaining_shortage: 10,
+            post_refill_readiness_error: None,
+            start_failures: 1,
+            admission_paused_reason: Some("GitHub JIT/control-plane start failed".into()),
+        };
+
+        assert!(apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut ensure_fail_streak,
+            &outcome,
+        ));
+        assert_eq!(ensure_fail_streak, 1);
+    }
+
+    #[test]
+    fn deadman_credit_requires_fully_healthy_ensure_evidence() {
+        let healthy = docker_backend::EnsureCountOutcome {
+            started: vec!["runner-1".into()],
+            missing: 1,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            start_failures: 0,
+            admission_paused_reason: None,
+        };
+        assert!(ensure_outcome_may_credit_deadman(&healthy));
+
+        let mut impaired = healthy.clone();
+        impaired.remaining_shortage = 1;
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+
+        impaired = healthy.clone();
+        impaired.start_failures = 1;
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+
+        impaired = healthy.clone();
+        impaired.post_refill_readiness_error = Some("docker top timed out".into());
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+
+        impaired = healthy;
+        impaired.admission_paused_reason = Some("fleet circuit open".into());
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
     }
 
     #[test]

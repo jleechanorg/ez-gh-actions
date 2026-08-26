@@ -66,6 +66,10 @@ jobs:
       - name: Host-ops, GitHub App token, and PR-payload regression tests
         run: |
           bash tests/host_ops_0725_test.sh
+          bash tests/host_control_artifacts_test.sh
+          bash tests/assert_no_host_reboot_vote_test.sh
+          bash tests/assert_qemu_cpu_ceiling_test.sh
+          bash tests/apply_cfs_nohz_panic_stop_test.sh
           bash tests/integrate_pr_payload_regression_test.sh
           bash tests/launchd_docker_host_consumers_test.sh
           bash tests/refresh_gh_app_token_timeout_test.sh
