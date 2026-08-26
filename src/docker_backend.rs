@@ -5920,6 +5920,7 @@ minimum_isolation = "container"
     #[test]
     fn disk_measure_strike_counter_bails_after_threshold() {
         use std::sync::atomic::Ordering;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Reset before and after to be hermetic.
         CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
         // First miss is tolerated (warn, no bail).
@@ -5941,6 +5942,7 @@ minimum_isolation = "container"
     #[test]
     fn disk_measure_strike_counter_resets_on_success() {
         use std::sync::atomic::Ordering;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
         // Drive a miss then a "Some" (modeled as the reset the production path
         // performs after a successful read).
