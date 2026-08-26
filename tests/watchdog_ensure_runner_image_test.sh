@@ -81,6 +81,15 @@ run_ensure_runner_image() {
     return 0
   fi
 
+  # Replicate the watchdog's behavior exactly: check image presence
+  # first (no-op case), only rebuild if missing. Without this check,
+  # the test would rebuild the image on every invocation and the
+  # "present-image is a no-op" assertion would falsely fail.
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    echo "[test] ensure_runner_image: ${image} already present (no-op)"
+    return 0
+  fi
+
   # Build path MUST use absolute -f (matches the fixed watchdog code)
   local build_log build_rc=0
   build_log="$(DOCKER_BUILDKIT=0 docker build -f "${repo_root}/Dockerfile.runner" -t "${image}" "${repo_root}" 2>&1)" || build_rc=$?
