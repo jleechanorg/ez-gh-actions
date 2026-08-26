@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — local companion to Gate 0 (deployed code == committed code).
+#
+# Blocks `git push` when the latest commit touched any Rust source / Cargo
+# manifest / build.rs AND the SHA embedded in the installed `ezgha` binary
+# differs from `git rev-parse HEAD`. This catches the common agent failure
+# mode where a code change is committed and pushed without a corresponding
+# `cargo install --path .`, leaving the daemon running an older binary than
+# the source-of-truth on disk.
+#
+# Bypass:
+#   EZGHA_SKIP_BINARY_DRIFT_CHECK=1    skip this entire check
+#   EZGHA_BIN=/path/to/ezgha           override the binary used for SHA extraction
+#
+# Reference: GH#103, bead jleechan-zs0j.
+
+set -euo pipefail
+
+# ── 1. Bypass ──────────────────────────────────────────────────────────────
+if [ "${EZGHA_SKIP_BINARY_DRIFT_CHECK:-0}" = "1" ]; then
+  exit 0
+fi
+
+# ── 2. Did the latest commit change any Rust source / manifest / build.rs? ─
+# We only check the latest commit (HEAD~1..HEAD), which is what `git push`
+# is forwarding. A bash-only / docs-only commit is never a binary-drift
+# concern, so we exit 0 cleanly with no warning.
+changed_rust_files="$(git diff --name-only HEAD~1..HEAD -- '*.rs' 'Cargo.*' 'build.rs' 2>/dev/null || true)"
+if [ -z "${changed_rust_files}" ]; then
+  exit 0
+fi
+
+# ── 3. Locate the installed binary ─────────────────────────────────────────
+EZGHA_BIN_PATH="${EZGHA_BIN:-$HOME/.cargo/bin/ezgha}"
+
+# Prefer `command -v ezgha` so a developer-overridden PATH wins, falling
+# back to the explicit EZGHA_BIN override / default.
+if command -v ezgha >/dev/null 2>&1; then
+  EZGHA_CMD=(ezgha)
+elif [ -x "${EZGHA_BIN_PATH}" ]; then
+  EZGHA_CMD=("${EZGHA_BIN_PATH}")
+else
+  # Fresh host / never installed: warn loudly but DO NOT block the push.
+  # A first-time contributor will hit this on every push until they install,
+  # and we do not want to create a hard gate that punishes greenfield use.
+  printf 'pre-push: fresh-host warning — ezgha binary not installed yet (%s missing). Skipping binary-drift check.\n' "${EZGHA_BIN_PATH}" >&2
+  printf '         Install with: cargo install --path . (skip with EZGHA_SKIP_BINARY_DRIFT_CHECK=1)\n' >&2
+  exit 0
+fi
+
+# ── 4. Extract installed SHA from `ezgha --version` ───────────────────────
+# Version string format (set in src/main.rs:31):
+#   `ezgha <CARGO_PKG_VERSION>-<GIT_SHA>-<rustc-target-triple>`
+# Extract the 7-40 hex SHA segment between the first two '-' delimiters.
+installed_sha="$(
+  "${EZGHA_CMD[@]}" --version 2>/dev/null \
+    | sed -n 's/.*-\([0-9a-f]\{7,40\}\)-.*/\1/p' \
+    | head -1
+)"
+
+if [ -z "${installed_sha}" ]; then
+  # Could not parse a SHA out of `ezgha --version` — likely a stale binary
+  # predating the build.rs GIT_SHA wiring. Warn but do not block; the
+  # server-side Gate 0 (`docs/verify-exit-criteria.sh:372`) still catches
+  # this case on the next deploy-owner run.
+  printf 'pre-push: could not extract SHA from `ezgha --version` output. Skipping binary-drift check.\n' >&2
+  exit 0
+fi
+
+# ── 5. Compare against HEAD ────────────────────────────────────────────────
+head_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+if [ -z "${head_sha}" ]; then
+  printf 'pre-push: could not determine HEAD SHA. Skipping binary-drift check.\n' >&2
+  exit 0
+fi
+
+if [ "${installed_sha}" != "${head_sha}" ]; then
+  cat >&2 <<EOF
+ezgha binary-drift: HEAD=${head_sha} installed=${installed_sha}
+The installed binary at \`${EZGHA_CMD[*]}\` does not match the code you are
+about to push. Run \`cargo install --path .\` first, then re-push.
+
+  Skip this check (NOT recommended) with:
+    EZGHA_SKIP_BINARY_DRIFT_CHECK=1 git push
+
+  Override the binary path with:
+    EZGHA_BIN=/custom/path/to/ezgha git push
+EOF
+  exit 1
+fi
+
+exit 0
