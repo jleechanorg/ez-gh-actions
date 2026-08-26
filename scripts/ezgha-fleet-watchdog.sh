@@ -363,7 +363,7 @@ ensure_runner_image() {
     return 1
   fi
   local build_log build_rc=0
-  build_log="$(DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t "$image" "$repo_root" 2>&1)" || build_rc=$?
+  build_log="$(DOCKER_BUILDKIT=0 docker build -f "$repo_root/Dockerfile.runner" -t "$image" "$repo_root" 2>&1)" || build_rc=$?
   while IFS= read -r line; do log "ensure_runner_image: docker build: $line"; done <<< "$build_log"
   if [[ "$build_rc" -ne 0 ]]; then
     log "ensure_runner_image: REBUILD FAILED (exit=$build_rc) — daemon restart will proceed but serve loop will likely re-enter the disk-measurement lockout until image is present"
