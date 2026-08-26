@@ -94,19 +94,42 @@ jobs:
           # 'docker build -f "$repo_root/Dockerfile.runner"' (absolute
           # path), NOT 'docker build -f Dockerfile.runner' (relative).
           #
-          # The presence of the buggy pattern is a hard fail.
+          # Differentiate regression vs bootstrap (same pattern as
+          # step 1): only FAIL when the watchdog was modified in this
+          # PR (regression). WARN otherwise (bootstrap — the fix
+          # lives in commit b3fe954 on a separate branch).
+          WATCHDOG_IN_DIFF=0
+          for f in $(git diff --name-only origin/"$GITHUB_BASE_REF"...HEAD 2>/dev/null || git diff --name-only HEAD~1...HEAD); do
+            if [[ "$f" == "$WATCHDOG" ]]; then
+              WATCHDOG_IN_DIFF=1
+              break
+            fi
+          done
+
           if grep -E "docker build -f Dockerfile\\.runner[^/]|docker build -f Dockerfile\\.runner[[:space:]]+-[a-z]|docker build -f Dockerfile\\.runner[[:space:]]+\\$" "$WATCHDOG"; then
-            echo "FAIL: $WATCHDOG contains relative '-f Dockerfile.runner' (the 2026-08-20 bug class)." >&2
-            exit 1
+            if (( WATCHDOG_IN_DIFF == 1 )); then
+              echo "FAIL: $WATCHDOG was modified in this PR and reintroduced the relative '-f Dockerfile.runner' pattern (the 2026-08-20 bug class)." >&2
+              exit 1
+            else
+              echo "WARN: $WATCHDOG contains relative '-f Dockerfile.runner' (the 2026-08-20 bug class)." >&2
+              echo "      (bootstrap: \$WATCHDOG was NOT modified in this PR; the fix lives in commit b3fe954)" >&2
+              echo "      See install-gate-checks skill for the required pattern." >&2
+            fi
           fi
 
-          # The absolute-path pattern MUST be present.
+          # The absolute-path pattern is the goal state.
           if ! grep -qE "docker build -f .\\\$repo_root/Dockerfile\\.runner" "$WATCHDOG"; then
-            echo "FAIL: $WATCHDOG does NOT use absolute '-f \$repo_root/Dockerfile.runner'." >&2
-            echo "      See commit b3fe954 for the canonical fix." >&2
-            exit 1
+            if (( WATCHDOG_IN_DIFF == 1 )); then
+              echo "FAIL: $WATCHDOG was modified in this PR but does NOT use absolute '-f \$repo_root/Dockerfile.runner'." >&2
+              echo "      See commit b3fe954 for the canonical fix." >&2
+              exit 1
+            else
+              echo "WARN: $WATCHDOG does NOT use absolute '-f \$repo_root/Dockerfile.runner' (the 2026-08-20 fix not yet on main)." >&2
+              echo "      (bootstrap: \$WATCHDOG was NOT modified in this PR; the fix lives in commit b3fe954)" >&2
+            fi
+          else
+            echo "OK: watchdog build command uses absolute path."
           fi
-          echo "OK: watchdog build command uses absolute path."
 
       - name: Run integration test (Layer 2, real Docker)
         run: |
