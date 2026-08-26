@@ -34,8 +34,38 @@ infer_user() {
 REPAIR_USER="$(infer_user)"
 REPAIR_USER_HOME="${REPAIR_USER_HOME:-$(getent passwd "$REPAIR_USER" | cut -d: -f6)}"
 REPAIR_USER_HOME="${REPAIR_USER_HOME:-$HOME}"
-DOCKER_HOST="${REPAIR_DOCKER_HOST:-unix://${REPAIR_USER_HOME}/.colima/default/docker.sock}"
 DOCKER_BIN="${REPAIR_DOCKER_BIN:-$(command -v docker 2>/dev/null || printf docker)}"
+
+resolve_docker_host() {
+  local context_host="" candidate
+  if [ -n "${REPAIR_DOCKER_HOST:-}" ]; then
+    printf '%s' "$REPAIR_DOCKER_HOST"
+    return
+  fi
+  if [ "$(id -u)" -eq 0 ] && [ "$REPAIR_USER" != root ]; then
+    context_host="$(runuser -u "$REPAIR_USER" -- env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_CONFIG \
+      HOME="$REPAIR_USER_HOME" \
+      "$DOCKER_BIN" context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null | head -1 || true)"
+  else
+    context_host="$(env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_CONFIG HOME="$REPAIR_USER_HOME" \
+      "$DOCKER_BIN" context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null | head -1 || true)"
+  fi
+  if [ -n "$context_host" ]; then
+    printf '%s' "$context_host"
+    return
+  fi
+  for candidate in \
+    "$REPAIR_USER_HOME/.lima/colima/sock/docker.sock" \
+    "$REPAIR_USER_HOME/.colima/default/docker.sock"; do
+    if [ -S "$candidate" ]; then
+      printf 'unix://%s' "$candidate"
+      return
+    fi
+  done
+  printf 'unix://%s/.lima/colima/sock/docker.sock' "$REPAIR_USER_HOME"
+}
+
+DOCKER_HOST="$(resolve_docker_host)"
 if [ -n "${REPAIR_LIMACTL_BIN:-}" ]; then
   LIMACTL_BIN="$REPAIR_LIMACTL_BIN"
 elif [ -x "$REPAIR_USER_HOME/.local/bin/limactl" ]; then
@@ -46,9 +76,10 @@ fi
 
 run_as_repair_user() {
   if [ "$(id -u)" -eq 0 ] && [ "$REPAIR_USER" != root ]; then
-    runuser -u "$REPAIR_USER" -- env HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
+    runuser -u "$REPAIR_USER" -- env -u DOCKER_CONTEXT -u DOCKER_CONFIG \
+      HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
   else
-    env HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
+    env -u DOCKER_CONTEXT -u DOCKER_CONFIG HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
   fi
 }
 
@@ -124,9 +155,11 @@ run_bounded() {
   if [ "${1:-}" = run_as_repair_user ]; then
     shift
     if [ "$(id -u)" -eq 0 ] && [ "$REPAIR_USER" != root ]; then
-      timeout --signal TERM --kill-after=2s "${left}s" runuser -u "$REPAIR_USER" -- env HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
+      timeout --signal TERM --kill-after=2s "${left}s" runuser -u "$REPAIR_USER" -- \
+        env -u DOCKER_CONTEXT -u DOCKER_CONFIG HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
     else
-      timeout --signal TERM --kill-after=2s "${left}s" env HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
+      timeout --signal TERM --kill-after=2s "${left}s" env -u DOCKER_CONTEXT -u DOCKER_CONFIG \
+        HOME="$REPAIR_USER_HOME" DOCKER_HOST="$DOCKER_HOST" "$@"
     fi
   else
     timeout --signal TERM --kill-after=2s "${left}s" "$@"
@@ -182,13 +215,20 @@ if ! close_admission; then overall_ok=0; fi
 
 # 2. kill/remove managed runners directly, independent of daemon shutdown.
 containers="${REPAIR_MANAGED_CONTAINERS:-}"
+container_query_ok=1
 if [ -z "$containers" ] && [ "$DRY_RUN" != "1" ]; then
-  containers="$(run_as_repair_user "$DOCKER_BIN" ps -q --filter label=ezgha=managed 2>/dev/null || true)"
+  if ! containers="$(run_as_repair_user "$DOCKER_BIN" ps -q --filter label=ezgha=managed 2>/dev/null)"; then
+    container_query_ok=0
+    overall_ok=0
+    log containers failed "managed container discovery failed via ${DOCKER_HOST}; continuing"
+  fi
 fi
 if [ "$DRY_RUN" = "1" ] && [ -z "$containers" ]; then
   containers="managed-containers"
 fi
-if [ -n "$containers" ]; then
+if [ "$container_query_ok" -eq 0 ]; then
+  :
+elif [ -n "$containers" ]; then
   if run_bounded containers run_as_repair_user "$DOCKER_BIN" rm -f $containers; then log containers complete "managed containers removed"; else overall_ok=0; log containers failed "container removal failed; continuing"; fi
 else
   log containers complete "no managed containers (idempotent)"
@@ -258,7 +298,8 @@ verify_recovery pre-stop
 # final bounded shedding stage; watchdog decides separately whether reboot is
 # warranted from our non-zero result.
 if [ "$verify_improved" -eq 0 ]; then
-  if run_bounded limactl run_as_repair_user "$LIMACTL_BIN" stop --timeout="${REPAIR_LIMA_STOP_TIMEOUT_SECONDS:-30}" "${REPAIR_LIMA_INSTANCE:-colima}"; then
+  if run_bounded limactl run_as_repair_user timeout --signal TERM --kill-after=2s \
+    "${REPAIR_LIMA_STOP_TIMEOUT_SECONDS:-30}s" "$LIMACTL_BIN" --tty=false stop "${REPAIR_LIMA_INSTANCE:-colima}"; then
     log limactl complete "bounded VM stop requested"
     verify_recovery post-stop
   else

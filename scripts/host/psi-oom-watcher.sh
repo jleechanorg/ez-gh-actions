@@ -668,14 +668,27 @@ if [ "${streak}" -lt "${CRIT_CONSECUTIVE}" ]; then
   exit 0
 fi
 
-# Cooldown check — never act more than once per COOLDOWN_SEC, regardless of
-# how long the crisis persists.
+# Staged runner/QEMU shedding is the first response to every newly confirmed
+# critical episode. It is re-armed by CRIT_CONSECUTIVE samples rather than the
+# long arbitrary-process SIGTERM cooldown: the latter must never suppress the
+# resource owner we can identify and shed safely.
 now_epoch="$(date +%s)"
+if [ "${DRY_RUN}" != "1" ] && [ -n "${PSI_SHED_CHAIN}" ]; then
+  if run_shed_stages && [ "${SHED_RESULT}" = "ok" ]; then
+    log "ACTION(staged-shed): SHED_RESULT=ok — per-process SIGTERM fallback suppressed for this tick; staged shedding re-arms after ${CRIT_CONSECUTIVE} new critical samples (full avg10=${full_avg10}%, streak=${streak}/${CRIT_CONSECUTIVE})"
+    rm -f "${STREAK_FILE}"
+    exit 0
+  fi
+  log "ACTION(staged-shed): SHED_RESULT=${SHED_RESULT:-fail} — falling through to cooldown-gated per-process SIGTERM fallback"
+fi
+
+# Only arbitrary-process SIGTERM is cooldown-gated. Runner/QEMU shedding above
+# remains available if pressure rebounds during this window.
 if [ -f "${COOLDOWN_MARKER}" ]; then
   last_epoch="$(cat "${COOLDOWN_MARKER}" 2>/dev/null || echo 0)"
   elapsed=$((now_epoch - last_epoch))
   if [ "${elapsed}" -lt "${COOLDOWN_SEC}" ]; then
-    log "CRIT threshold sustained but cooldown active (${elapsed}s/${COOLDOWN_SEC}s since last action) — logging only, no signal sent."
+    log "CRIT threshold sustained; staged shedding was attempted, but arbitrary-process SIGTERM cooldown is active (${elapsed}s/${COOLDOWN_SEC}s since last signal)."
     exit 0
   fi
 fi
@@ -729,19 +742,6 @@ if [ "${DRY_RUN}" = "1" ]; then
   exit 0
 fi
 
-# R3 lane J (ez-gh-actions-6478): when PSI_SHED_CHAIN is set, run the staged
-# shed chain FIRST. If it recovers enough memory, the watchdog stays armed
-# and the per-process SIGTERM fallback below is suppressed for this tick.
-if [ -n "${PSI_SHED_CHAIN}" ]; then
-  if run_shed_stages && [ "${SHED_RESULT}" = "ok" ]; then
-    log "ACTION(staged-shed): SHED_RESULT=ok — per-process SIGTERM fallback suppressed for this tick (cooldown still armed; full avg10=${full_avg10}%, streak=${streak}/${CRIT_CONSECUTIVE})"
-    echo "${now_epoch}" > "${COOLDOWN_MARKER}"
-    rm -f "${STREAK_FILE}"
-    exit 0
-  fi
-  log "ACTION(staged-shed): SHED_RESULT=${SHED_RESULT:-fail} — falling through to per-process SIGTERM fallback"
-fi
-
 log "ACTION: sending SIGTERM to pid=${target_pid} comm=${target_comm} rss=${target_rss_mb}MB — sustained memory pressure full avg10=${full_avg10}% for ${streak} consecutive polls. Cooldown ${COOLDOWN_SEC}s starts now."
 if kill -TERM "${target_pid}" 2>>"${LOG_FILE}"; then
   log "SIGTERM delivered to pid=${target_pid}."
@@ -751,4 +751,3 @@ fi
 
 echo "${now_epoch}" > "${COOLDOWN_MARKER}"
 rm -f "${STREAK_FILE}"
-

@@ -207,6 +207,63 @@ EOF
   else
     ok "DRY_RUN correctly did not write the cooldown marker -- real protection stays fully armed after a rehearsal"
   fi
+
+  staged_line="$(grep -n 'if run_shed_stages' "${WATCHER}" | tail -1 | cut -d: -f1)"
+  cooldown_line="$(grep -n 'if \[ -f "${COOLDOWN_MARKER}" \]' "${WATCHER}" | head -1 | cut -d: -f1)"
+  if [ -n "${staged_line}" ] && [ -n "${cooldown_line}" ] && [ "${staged_line}" -lt "${cooldown_line}" ]; then
+    ok "staged runner shedding runs before the arbitrary-process SIGTERM cooldown"
+  else
+    fail "REGRESSION: cooldown suppresses staged runner shedding during sustained critical PSI"
+  fi
+
+  staged_success_block="$(tail -n "+${staged_line}" "${WATCHER}" | sed -n '1,/^[[:space:]]*fi$/p')"
+  if printf '%s\n' "${staged_success_block}" | grep -q 'COOLDOWN_MARKER'; then
+    fail "REGRESSION: successful staged runner shedding arms the 10-minute arbitrary-process cooldown"
+  else
+    ok "successful staged runner shedding re-arms through the consecutive-PSI gate, not the long SIGTERM cooldown"
+  fi
+
+  # Behavioral incident regression: a pre-existing arbitrary-process cooldown
+  # must not suppress staged runner/QEMU shedding during a newly sustained PSI
+  # episode. Use a real, harmless sleep PID for /proc RSS reads and stub only
+  # Docker/pgrep so no host container or process is touched.
+  RUNTIME_BIN="${WORK}/runtime-bin"
+  RUNTIME_STATE="${WORK}/runtime-state"
+  mkdir -p "${RUNTIME_BIN}" "${RUNTIME_STATE}"
+  sleep 30 &
+  fixture_qemu_pid=$!
+  cat > "${RUNTIME_BIN}/pgrep" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' '${fixture_qemu_pid}'
+EOF
+  cat > "${RUNTIME_BIN}/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) printf 'ez-runner-c-9\n' ;;
+  stop) printf '%s\n' "${*: -1}" >> "${RUNTIME_DOCKER_STOPS:?}" ;;
+esac
+EOF
+  cat > "${RUNTIME_BIN}/ps" <<'EOF'
+#!/usr/bin/env bash
+printf '999999 1024 agent-fixture agent-fixture\n'
+EOF
+  chmod +x "${RUNTIME_BIN}/pgrep" "${RUNTIME_BIN}/docker" "${RUNTIME_BIN}/ps"
+  cooldown_epoch=$(( $(date +%s) - 60 ))
+  printf '%s\n' "$cooldown_epoch" > "${RUNTIME_STATE}/psi-oom-watcher.last-action"
+  printf '1\n' > "${RUNTIME_STATE}/psi-oom-watcher.crit-streak"
+  PATH="${RUNTIME_BIN}:${PATH}" PSI_FILE="${FAKE_PSI}" STATE_DIR="${RUNTIME_STATE}" \
+    WARN_THRESHOLD=10 CRIT_THRESHOLD=40 CRIT_CONSECUTIVE=2 DRY_RUN=0 \
+    PSI_SHED_CHAIN="drain,reclaim,verify,escalate" LOW_PRIORITY_CONTAINERS="ez-runner-c-9" \
+    SHED_VERIFY_DELAY=0 RSS_DROP_MIN_KB=0 RUNTIME_DOCKER_STOPS="${RUNTIME_STATE}/docker-stops" \
+    bash "${WATCHER}" >"${RUNTIME_STATE}/run.log" 2>&1 || true
+  kill "${fixture_qemu_pid}" 2>/dev/null || true
+  wait "${fixture_qemu_pid}" 2>/dev/null || true
+  grep -Fxq 'ez-runner-c-9' "${RUNTIME_STATE}/docker-stops" || fail "pre-existing cooldown suppressed staged runner drain"
+  grep -q 'ACTION(staged-shed): SHED_RESULT=ok' "${RUNTIME_STATE}/psi-oom-watcher.log" || fail "staged shed did not complete successfully under pre-existing cooldown"
+  ! grep -q 'ACTION: sending SIGTERM' "${RUNTIME_STATE}/psi-oom-watcher.log" || fail "successful staged shed fell through to arbitrary-process SIGTERM"
+  [ ! -e "${RUNTIME_STATE}/psi-oom-watcher.crit-streak" ] || fail "successful staged shed did not reset the consecutive critical streak"
+  [ "$(cat "${RUNTIME_STATE}/psi-oom-watcher.last-action")" = "$cooldown_epoch" ] || fail "staged shed rewrote the arbitrary-process cooldown marker"
+  ok "pre-existing SIGTERM cooldown does not suppress staged runner shedding (behavioral fixture)"
 fi
 
 # ── 2b. ezgha.service.d/10-oomd-omit.conf -- exists, correct directive,

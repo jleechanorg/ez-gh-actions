@@ -114,20 +114,34 @@ printf '%s\n' "$*" > "${REPAIR_SYSTEMCTL_ARGS:?}"
 EOF
 cat > "$STUB/docker" <<'EOF'
 #!/usr/bin/env bash
-if [ "${1:-}" = ps ]; then printf 'runner-1\n'; else printf 'containers\n' >> "${REPAIR_TRACE:?}"; fi
+if [ "${1:-}" = context ] && [ "${2:-}" = inspect ]; then
+  printf 'unix:///tmp/active-lima/docker.sock\n'
+elif [ "${1:-}" = ps ]; then
+  printf 'runner-1\n'
+else
+  printf 'containers\n' >> "${REPAIR_TRACE:?}"
+fi
 printf '%s\n' "${DOCKER_HOST:-}" > "${REPAIR_DOCKER_HOST_CAPTURE:?}"
+printf '%s\n' "${DOCKER_CONTEXT:-}" > "${REPAIR_DOCKER_CONTEXT_CAPTURE:?}"
+printf '%s\n' "${DOCKER_CONFIG:-}" > "${REPAIR_DOCKER_CONFIG_CAPTURE:?}"
 EOF
 cat > "$STUB/limactl" <<'EOF'
 #!/usr/bin/env bash
 printf 'limactl\n' >> "${REPAIR_TRACE:?}"
 printf '%s\n' "$HOME" > "${REPAIR_LIMACTL_HOME_CAPTURE:?}"
+if [ -n "${REPAIR_LIMACTL_ARGS_CAPTURE:-}" ]; then
+  printf '%s\n' "$*" > "${REPAIR_LIMACTL_ARGS_CAPTURE}"
+fi
 EOF
 chmod +x "$STUB/systemctl" "$STUB/docker" "$STUB/limactl"
 REPAIR_TRACE="$STUB/trace" REPAIR_SYSTEMCTL_ARGS="$STUB/systemctl.args" \
   REPAIR_DOCKER_HOST_CAPTURE="$STUB/docker-host" REPAIR_LIMACTL_HOME_CAPTURE="$STUB/limactl-home" \
+  REPAIR_DOCKER_CONTEXT_CAPTURE="$STUB/docker-context" REPAIR_DOCKER_CONFIG_CAPTURE="$STUB/docker-config" \
+  REPAIR_LIMACTL_ARGS_CAPTURE="$STUB/limactl-args" \
   REPAIR_LIMACTL_BIN="$STUB/limactl" REPAIR_USER="$USER" REPAIR_USER_HOME="$HOME" REPAIR_ALLOW_NONROOT=1 REPAIR_DEADLINE_SECONDS=10 \
   REPAIR_LOG_FILE="$STUB/repair.log" REPAIR_MEMINFO_FILE="$STUB/meminfo" REPAIR_PSI_FILE="$STUB/psi" \
   REPAIR_QEMU_CGROUP="$STUB/cgroup" REPAIR_VERIFY_WINDOW_SECONDS=0 REPAIR_VERIFY_WAIT_SECONDS=0 REPAIR_LIMA_STOP_TIMEOUT_SECONDS=1 \
+  DOCKER_CONTEXT=poisoned-context DOCKER_CONFIG=/tmp/poisoned-docker-config \
   PATH="$STUB:$PATH" "$REPAIR" >/dev/null || repair_rc=$?
 repair_rc="${repair_rc:-0}"
 [ "$repair_rc" -ne 0 ] || fail "unrecovered pressure incorrectly returned success after VM stop"
@@ -141,8 +155,12 @@ containers_line=$(grep -nFx 'containers' "$STUB/trace" | head -1 | cut -d: -f1)
 limactl_line=$(grep -nFx 'limactl' "$STUB/trace" | head -1 | cut -d: -f1)
 [ "$admission_line" -lt "$admission_poll_line" ] && [ "$admission_poll_line" -lt "$containers_line" ] && [ "$containers_line" -lt "$limactl_line" ] || fail "repair stages are out of order or admission raced snapshot"
 grep -Fq -- '--user --machine=' "$STUB/systemctl.args" || fail "repair did not target the owning user manager"
-grep -Fq 'unix://' "$STUB/docker-host" || fail "repair did not pass user Docker socket"
+grep -Fxq 'unix:///tmp/active-lima/docker.sock' "$STUB/docker-host" || fail "repair did not discover and pass the active user Docker context socket"
+[ -z "$(cat "$STUB/docker-context")" ] || fail "repair leaked inherited DOCKER_CONTEXT into managed-container operations"
+[ -z "$(cat "$STUB/docker-config")" ] || fail "repair leaked inherited DOCKER_CONFIG into managed-container operations"
 [ "$(cat "$STUB/limactl-home")" = "$HOME" ] || fail "repair did not run limactl with owning user HOME"
+grep -Fq -- '--tty=false stop colima' "$STUB/limactl-args" || fail "repair did not invoke limactl stop noninteractively"
+! grep -Fq -- '--timeout' "$STUB/limactl-args" || fail "repair passed unsupported --timeout flag to limactl stop"
 grep -q '/proc/.*cgroup' "$REPAIR" || fail "repair does not dynamically derive QEMU cgroup from PID"
 grep -q 'REPAIR_RECLAIM_BYTES' "$REPAIR" || fail "repair lacks configurable reclaim bytes"
 grep -q 'REPAIR_MIN_AVAILABLE_KB' "$REPAIR" || fail "repair lacks MemAvailable reserve floor"
