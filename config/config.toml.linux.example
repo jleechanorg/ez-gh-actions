@@ -32,3 +32,12 @@ cgroup_parent = "actions.slice"
 # Native linux docker = container isolation. "vm" only if daemon is VM-contained
 # and you want fail-closed enforcement when backend drops below vm.
 minimum_isolation = "container"
+
+[queue_monitor]
+enabled = false
+
+[canary]
+enabled = false
+
+[invariant_sampler]
+enabled = false
