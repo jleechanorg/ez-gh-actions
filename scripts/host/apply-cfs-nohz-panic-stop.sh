@@ -45,15 +45,20 @@ grub_dropin_dir="$(root_path /etc/default/grub.d)"
 grub_dropin_dest="${grub_dropin_dir}/zz-ezgha-nohz-panic.cfg"
 grub="$(root_path /etc/default/grub)"
 kdump_source="${grub_dropin_dir}/kdump-tools.cfg"
+generated_grub="$(root_path "${APPLY_PANIC_STOP_GENERATED_GRUB:-/boot/grub/grub.cfg}")"
 
 # --- preflight all inputs before changing live or persistent state ---
 [ -f "$grub" ] || fail "missing $grub"
 [ -f "$kdump_source" ] || fail "missing distro kdump source $kdump_source"
+if [ ! -f "$generated_grub" ] || [ -L "$generated_grub" ]; then
+  fail "missing or unsafe generated GRUB artifact $generated_grub"
+fi
 source_copy="$(mktemp)"
 rewritten="$(mktemp)"
 backup=""
 sysctl_backup="$(mktemp)"
 grub_dropin_backup="$(mktemp)"
+generated_grub_backup="$(mktemp)"
 sysctl_had=0
 grub_dropin_had=0
 grub_had=0
@@ -88,6 +93,11 @@ cleanup() {
       run_root "$UPDATE_GRUB_BIN" \
         || echo "FAIL: could not regenerate GRUB from restored sources" >&2
     fi
+    # The updater may partially mutate its generated artifact even when it
+    # exits non-zero. Restore the exact pre-transaction bytes after any retry;
+    # this is the integrity guarantee if rollback regeneration also fails.
+    run_root cp -a "$generated_grub_backup" "$generated_grub" \
+      || echo "FAIL: could not restore generated GRUB artifact $generated_grub" >&2
     if [ "$sysctl_attempted" -eq 1 ]; then
       run_root "$SYSCTL_BIN" -w \
         "kernel.panic=$panic_before" "kernel.panic_on_oops=$panic_on_oops_before" \
@@ -97,7 +107,7 @@ cleanup() {
   if [ "$transaction_committed" -ne 1 ] && [ -n "$backup" ]; then
     run_root rm -f "$backup"
   fi
-  rm -f "$source_copy" "$rewritten" "$sysctl_backup" "$grub_dropin_backup"
+  rm -f "$source_copy" "$rewritten" "$sysctl_backup" "$grub_dropin_backup" "$generated_grub_backup"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -171,6 +181,8 @@ if [ -e "$grub_dropin_dest" ]; then
   run_root cp -a "$grub_dropin_dest" "$grub_dropin_backup"
   grub_dropin_had=1
 fi
+run_root cp -a "$generated_grub" "$generated_grub_backup" \
+  || fail "could not snapshot generated GRUB artifact $generated_grub"
 
 transaction_started=1
 run_root mkdir -p "$(dirname "$sysctl_dest")"

@@ -11,9 +11,10 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 run_case() {
   local label="$1" main_tokens="$2" dropin_tokens="$3"
   local root="$TMP/$label/root" bin="$TMP/$label/bin" trace="$TMP/$label/trace" state="$TMP/$label/sysctl-state"
-  mkdir -p "$root/etc/default/grub.d" "$root/etc/sysctl.d" "$bin"
+  mkdir -p "$root/etc/default/grub.d" "$root/etc/sysctl.d" "$root/boot/grub" "$bin"
   printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$main_tokens" > "$root/etc/default/grub"
   printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$dropin_tokens" > "$root/etc/default/grub.d/kdump-tools.cfg"
+  printf 'generated grub bytes\n' > "$root/boot/grub/grub.cfg"
   printf 'kernel.panic=0\nkernel.panic_on_oops=0\n' > "$state"
   printf 'old sysctl drop-in\n' > "$root/etc/sysctl.d/99-ezgha-oops-reboot.conf"
   printf 'old nohz drop-in\n' > "$root/etc/default/grub.d/zz-ezgha-nohz-panic.cfg"
@@ -51,9 +52,10 @@ run_case repeated 'crashkernel=512M quiet crashkernel=2G crashkernel=512M,high' 
 bad_root="$TMP/bad/root"
 bad_bin="$TMP/bad/bin"
 bad_state="$TMP/bad/sysctl-state"
-mkdir -p "$bad_root/etc/default/grub.d" "$bad_root/etc/sysctl.d" "$bad_bin"
+mkdir -p "$bad_root/etc/default/grub.d" "$bad_root/etc/sysctl.d" "$bad_root/boot/grub" "$bad_bin"
 printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet crashkernel=2G"\n' > "$bad_root/etc/default/grub"
 printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > "$bad_root/etc/default/grub.d/kdump-tools.cfg"
+printf 'generated grub bytes\n' > "$bad_root/boot/grub/grub.cfg"
 printf 'kernel.panic=4\nkernel.panic_on_oops=0\n' > "$bad_state"
 printf 'old sysctl drop-in\n' > "$bad_root/etc/sysctl.d/99-ezgha-oops-reboot.conf"
 printf 'old nohz drop-in\n' > "$bad_root/etc/default/grub.d/zz-ezgha-nohz-panic.cfg"
@@ -97,6 +99,7 @@ grep -Fqx 'kernel.panic_on_oops=0' "$bad_state" || fail "invalid kdump source ch
 rollback_root="$TMP/rollback/root"
 rollback_bin="$TMP/rollback/bin"
 rollback_trace="$TMP/rollback/trace"
+rollback_err="$TMP/rollback/stderr"
 rollback_state="$TMP/rollback/sysctl-state"
 rollback_generated="$rollback_root/boot/grub/grub.cfg"
 rollback_update_count="$TMP/rollback/update-count"
@@ -114,7 +117,7 @@ cp "$rollback_root/etc/default/grub.d/zz-ezgha-nohz-panic.cfg" "$TMP/rollback/or
 # shellcheck disable=SC2016 # Generated fixtures intentionally retain their own expansions.
 printf '#!/usr/bin/env bash\nprintf "sysctl %%s\\n" "$*" >> "%s"\nif [ "${1:-}" = "-n" ]; then case "${2:-}" in kernel.panic) sed -n "s/^kernel.panic=//p" "%s";; kernel.panic_on_oops) sed -n "s/^kernel.panic_on_oops=//p" "%s";; *) exit 1;; esac; exit 0; fi\nif [ "${1:-}" = "-w" ]; then for assignment in "${@:2}"; do key="${assignment%%%%=*}"; value="${assignment#*=}"; sed -i "s/^${key}=.*/${key}=${value}/" "%s"; done; exit 0; fi\nexit 1\n' "$rollback_trace" "$rollback_state" "$rollback_state" "$rollback_state" > "$rollback_bin/sysctl"
 # shellcheck disable=SC2016 # Generated fixture intentionally retains its own expansions.
-printf '#!/usr/bin/env bash\nprintf "update-grub\\n" >> "%s"\ncount=0; [ -f "%s" ] && count=$(cat "%s")\nprintf "%%s" "$((count + 1))" > "%s"\nif [ "$count" -eq 0 ]; then printf "partially mutated generated grub bytes\\n" > "%s"; exit 7; fi\nprintf "original generated grub bytes\\n" > "%s"\nexit 0\n' "$rollback_trace" "$rollback_update_count" "$rollback_update_count" "$rollback_update_count" "$rollback_generated" "$rollback_generated" > "$rollback_bin/update-grub"
+printf '#!/usr/bin/env bash\nprintf "update-grub\\n" >> "%s"\ncount=0; [ -f "%s" ] && count=$(cat "%s")\nprintf "%%s" "$((count + 1))" > "%s"\nprintf "partially mutated generated grub bytes %%s\\n" "$((count + 1))" > "%s"\nexit 7\n' "$rollback_trace" "$rollback_update_count" "$rollback_update_count" "$rollback_update_count" "$rollback_generated" > "$rollback_bin/update-grub"
 printf '#!/usr/bin/env bash\nprintf "root %%s\\n" "$*" >> "%s"\nexec "$@"\n' "$rollback_trace" > "$rollback_bin/run-root"
 chmod +x "$rollback_bin/sysctl" "$rollback_bin/update-grub" "$rollback_bin/run-root"
 rollback_rc=0
@@ -122,7 +125,7 @@ APPLY_PANIC_STOP_ROOT="$rollback_root" \
   APPLY_PANIC_STOP_ROOT_CMD="$rollback_bin/run-root" \
   APPLY_PANIC_STOP_SYSCTL="$rollback_bin/sysctl" \
   APPLY_PANIC_STOP_UPDATE_GRUB="$rollback_bin/update-grub" \
-  bash "$REPO_ROOT/scripts/host/apply-cfs-nohz-panic-stop.sh" >/dev/null 2>&1 || rollback_rc=$?
+  bash "$REPO_ROOT/scripts/host/apply-cfs-nohz-panic-stop.sh" >/dev/null 2>"$rollback_err" || rollback_rc=$?
 [ "$rollback_rc" -ne 0 ] || fail "failing update-grub returned success"
 cmp -s "$TMP/rollback/original-grub" "$rollback_root/etc/default/grub" \
   || fail "failing update-grub did not restore the exact original GRUB source"
@@ -140,6 +143,8 @@ grep -Fqx "root $rollback_bin/update-grub" "$rollback_trace" \
   || fail "failing update-grub bypassed the privileged wrapper"
 [ "$(grep -Fc "root $rollback_bin/update-grub" "$rollback_trace")" -eq 2 ] \
   || fail "failing update-grub did not invoke privileged rollback regeneration"
+grep -q 'could not regenerate GRUB from restored sources' "$rollback_err" \
+  || fail "double update-grub failure was not reported loudly"
 
 remediation="$(bash "$REPO_ROOT/scripts/host/kdump-remediation.sh")"
 echo "$remediation" | grep -q 'apply-cfs-nohz-panic-stop.sh' \
