@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::CString;
 use std::io::Read;
@@ -8,9 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
-use std::sync::Mutex;
-use std::sync::Once;
+use std::sync::{mpsc, Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -44,6 +42,7 @@ static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 const DOCKER_CLEANUP_RESERVE: Duration = Duration::from_millis(50);
+const DOCKER_REAPER_RETRY_DELAY: Duration = Duration::from_millis(10);
 // Post-refill readiness gets one 30s shared local-Docker budget. At the normal
 // sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
 // under host pressure, a single probe may use up to 3s and the shared deadline
@@ -513,44 +512,112 @@ fn reap_killed_child_until_deadline(
     }
 }
 
-fn handoff_child_to_background_reaper(child: std::process::Child, detail: &str) {
-    let detail = detail.to_owned();
-    let holder = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-    let worker_holder = std::sync::Arc::clone(&holder);
-    if let Err(error) = std::thread::Builder::new()
+struct DockerReapRequest {
+    child: std::process::Child,
+    detail: String,
+}
+
+struct DockerChildReaper {
+    sender: mpsc::Sender<DockerReapRequest>,
+    recovery: Arc<Mutex<VecDeque<DockerReapRequest>>>,
+}
+
+static DOCKER_CHILD_REAPER: OnceLock<std::result::Result<DockerChildReaper, String>> =
+    OnceLock::new();
+
+fn retry_wait_until_reaped<T, E, F>(mut owner: T, mut wait: F, detail: &str) -> T
+where
+    E: std::fmt::Display,
+    F: FnMut(&mut T) -> std::result::Result<(), E>,
+{
+    loop {
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait(&mut owner)));
+        match attempt {
+            Ok(Ok(())) => return owner,
+            Ok(Err(error)) => {
+                eprintln!("warning: Docker child wait failed while {detail}: {error}; retrying");
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: Docker child wait panicked while {detail}; retaining ownership and retrying"
+                );
+            }
+        }
+        std::thread::sleep(DOCKER_REAPER_RETRY_DELAY);
+    }
+}
+
+#[allow(clippy::zombie_processes)]
+fn reap_owned_docker_child(request: DockerReapRequest) {
+    let DockerReapRequest { child, detail } = request;
+    let _child = retry_wait_until_reaped(
+        child,
+        |child| child.wait().map(|_| ()).map_err(|error| error.to_string()),
+        &detail,
+    );
+}
+
+fn docker_child_reaper_loop(
+    receiver: mpsc::Receiver<DockerReapRequest>,
+    recovery: Arc<Mutex<VecDeque<DockerReapRequest>>>,
+) {
+    loop {
+        let request = recovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front();
+        let request = request.or_else(|| match receiver.recv_timeout(DOCKER_REAPER_RETRY_DELAY) {
+            Ok(request) => Some(request),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!(
+                    "error: Docker child reaper queue disconnected; draining its recovery queue"
+                );
+                None
+            }
+        });
+        if let Some(request) = request {
+            reap_owned_docker_child(request);
+        }
+    }
+}
+
+fn initialize_docker_child_reaper() -> std::result::Result<DockerChildReaper, String> {
+    let (sender, receiver) = mpsc::channel();
+    let recovery = Arc::new(Mutex::new(VecDeque::new()));
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let worker_recovery = Arc::clone(&recovery);
+    std::thread::Builder::new()
         .name("ezgha-docker-reaper".to_owned())
         .spawn(move || {
-            let Some(mut child) = worker_holder.lock().unwrap().take() else {
-                return;
-            };
-            if let Err(error) = child.wait() {
-                eprintln!("warning: background Docker reaper failed while {detail}: {error}");
-            }
+            let _ = ready_sender.send(());
+            docker_child_reaper_loop(receiver, worker_recovery);
         })
-    {
-        eprintln!(
-            "warning: failed to hand off timed-out Docker child to background reaper: {error}"
-        );
-        if let Some(child) = holder.lock().unwrap().take() {
-            let fallback_holder = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
-            let fallback_worker_holder = std::sync::Arc::clone(&fallback_holder);
-            if let Err(fallback_error) = std::thread::Builder::new()
-                .name("ezgha-docker-reaper-fallback".to_owned())
-                .spawn(move || {
-                    if let Some(mut child) = fallback_worker_holder.lock().unwrap().take() {
-                        let _ = child.wait();
-                    }
-                })
-            {
-                eprintln!(
-                    "error: failed to start fallback Docker reaper: {fallback_error}; retaining child ownership"
-                );
-                // Keep the Child alive rather than silently dropping it. The
-                // kill already issued above guarantees termination; retaining
-                // this owner prevents an implicit Child drop on this failure
-                // path while the handoff failure remains visible in logs.
-                std::mem::forget(fallback_holder);
-            }
+        .map_err(|error| format!("failed to start Docker child reaper: {error}"))?;
+    ready_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|error| format!("Docker child reaper failed readiness verification: {error}"))?;
+    Ok(DockerChildReaper { sender, recovery })
+}
+
+fn docker_child_reaper() -> Result<&'static DockerChildReaper> {
+    DOCKER_CHILD_REAPER
+        .get_or_init(initialize_docker_child_reaper)
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!(error.clone()))
+}
+
+impl DockerChildReaper {
+    fn enqueue(&self, request: DockerReapRequest) {
+        if let Err(error) = self.sender.send(request) {
+            eprintln!(
+                "error: Docker child reaper send failed; retaining child in recovery queue: {}",
+                error.0.detail
+            );
+            self.recovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(error.0);
         }
     }
 }
@@ -560,9 +627,13 @@ fn docker_timeout<T>(
     detail: &str,
     timeout: Duration,
     deadline: Instant,
+    reaper: &DockerChildReaper,
 ) -> Result<T> {
     if let Some(child) = reap_killed_child_until_deadline(child, deadline) {
-        handoff_child_to_background_reaper(child, detail);
+        reaper.enqueue(DockerReapRequest {
+            child,
+            detail: detail.to_owned(),
+        });
     }
     bail!(
         "docker CLI timed out after {}ms while {detail}",
@@ -570,7 +641,17 @@ fn docker_timeout<T>(
     );
 }
 
-fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+fn run_docker_with_timeout(cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+    run_docker_with_timeout_after_reaper_init(cmd, detail, timeout, docker_child_reaper())
+}
+
+fn run_docker_with_timeout_after_reaper_init(
+    mut cmd: Command,
+    detail: &str,
+    timeout: Duration,
+    reaper: Result<&DockerChildReaper>,
+) -> Result<Output> {
+    let reaper = reaper?;
     let started = Instant::now();
     let deadline = started + timeout;
     // Keep a bounded cleanup window inside the command budget. Reads and
@@ -608,7 +689,7 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return docker_timeout(child, detail, timeout, deadline);
+            return docker_timeout(child, detail, timeout, deadline, reaper);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
@@ -616,7 +697,7 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return docker_timeout(child, detail, timeout, deadline);
+            return docker_timeout(child, detail, timeout, deadline, reaper);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
@@ -627,7 +708,7 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
             Ok(None) => {
                 let remaining = phase_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return docker_timeout(child, detail, timeout, deadline);
+                    return docker_timeout(child, detail, timeout, deadline, reaper);
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
@@ -4379,6 +4460,54 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn reaper_retries_transient_wait_without_dropping_owner() {
+        #[derive(Debug)]
+        struct FakeChild {
+            attempts: u32,
+        }
+
+        let child = retry_wait_until_reaped(
+            FakeChild { attempts: 0 },
+            |child| {
+                child.attempts += 1;
+                if child.attempts < 3 {
+                    Err("transient wait failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            "transient wait test",
+        );
+        assert_eq!(child.attempts, 3);
+    }
+
+    #[test]
+    fn reaper_initialization_failure_prevents_child_spawn() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let marker = tmp_path("reaper_init_failure").with_extension("spawned");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo spawned > \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+        ]);
+        let init_failure: Result<&DockerChildReaper> =
+            Err(anyhow::anyhow!("injected Docker child reaper init failure"));
+        let result = run_docker_with_timeout_after_reaper_init(
+            cmd,
+            "reaper initialization failure test",
+            Duration::from_secs(1),
+            init_failure,
+        );
+        assert!(result.is_err());
+        assert!(
+            !marker.exists(),
+            "command must not spawn when reaper initialization fails"
+        );
+    }
+
+    #[test]
     fn background_reaper_eventually_reaps_transferred_child() {
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
@@ -4386,7 +4515,10 @@ minimum_isolation = "container"
             .unwrap();
         let pid = child.id() as libc::pid_t;
         child.kill().unwrap();
-        handoff_child_to_background_reaper(child, "background reaper test");
+        docker_child_reaper().unwrap().enqueue(DockerReapRequest {
+            child,
+            detail: "background reaper test".to_owned(),
+        });
 
         let mut reaped = false;
         for _ in 0..100 {
