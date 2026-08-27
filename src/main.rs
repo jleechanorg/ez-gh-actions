@@ -1768,15 +1768,13 @@ fn main() -> Result<()> {
             }
         }
         Commands::ReclaimHistory { slot } => {
-            // Read-only dump of the in-process reclaim ring buffer.
-            // Records are populated by `release_stale_slots` (Path 1's
-            // empty-id branch + the four recorded-id reclaim branches + the
-            // Path 4 grace-window skip). Output is one line per record,
-            // most-recent-first. Empty output means no reclaim events have
-            // been observed in this process's lifetime — operators looking
-            // for past events should consult journald, not this subcommand.
+            // Read-only dump of the in-process reclaim ring buffer and durable
+            // lifecycle evidence stored on disk.
             let slot_key: Option<String> = slot.map(|n| n.to_string());
             let records = docker_backend::snapshot_reclaim(slot_key.as_deref());
+            let cfg = config_path(&cli).ok().and_then(|p| Config::load(&p).ok());
+            let durable = docker_backend::read_lifecycle_evidence_for(cfg.as_ref(), *slot)
+                .unwrap_or_default();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -1795,6 +1793,8 @@ fn main() -> Result<()> {
                             "reason": r.reason,
                         })
                     }).collect::<Vec<_>>(),
+                    "durable_evidence_count": durable.len(),
+                    "durable_evidence": durable.into_iter().map(|(_slot, ev)| ev).collect::<Vec<_>>(),
                 }))?
             );
         }
