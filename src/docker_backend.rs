@@ -493,16 +493,19 @@ fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
     );
 }
 
-fn reap_killed_child_until_deadline(child: &mut std::process::Child, deadline: Instant) -> bool {
+fn reap_killed_child_until_deadline(
+    mut child: std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::Child> {
     let _ = child.kill();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Err(_) => return false,
+            Ok(Some(_)) => return None,
+            Err(_) => return Some(child),
             Ok(None) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return false;
+                    return Some(child);
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
@@ -510,13 +513,57 @@ fn reap_killed_child_until_deadline(child: &mut std::process::Child, deadline: I
     }
 }
 
+fn handoff_child_to_background_reaper(child: std::process::Child, detail: &str) {
+    let detail = detail.to_owned();
+    let holder = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let worker_holder = std::sync::Arc::clone(&holder);
+    if let Err(error) = std::thread::Builder::new()
+        .name("ezgha-docker-reaper".to_owned())
+        .spawn(move || {
+            let Some(mut child) = worker_holder.lock().unwrap().take() else {
+                return;
+            };
+            if let Err(error) = child.wait() {
+                eprintln!("warning: background Docker reaper failed while {detail}: {error}");
+            }
+        })
+    {
+        eprintln!(
+            "warning: failed to hand off timed-out Docker child to background reaper: {error}"
+        );
+        if let Some(child) = holder.lock().unwrap().take() {
+            let fallback_holder = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+            let fallback_worker_holder = std::sync::Arc::clone(&fallback_holder);
+            if let Err(fallback_error) = std::thread::Builder::new()
+                .name("ezgha-docker-reaper-fallback".to_owned())
+                .spawn(move || {
+                    if let Some(mut child) = fallback_worker_holder.lock().unwrap().take() {
+                        let _ = child.wait();
+                    }
+                })
+            {
+                eprintln!(
+                    "error: failed to start fallback Docker reaper: {fallback_error}; retaining child ownership"
+                );
+                // Keep the Child alive rather than silently dropping it. The
+                // kill already issued above guarantees termination; retaining
+                // this owner prevents an implicit Child drop on this failure
+                // path while the handoff failure remains visible in logs.
+                std::mem::forget(fallback_holder);
+            }
+        }
+    }
+}
+
 fn docker_timeout<T>(
-    child: &mut std::process::Child,
+    child: std::process::Child,
     detail: &str,
     timeout: Duration,
     deadline: Instant,
 ) -> Result<T> {
-    let _reaped = reap_killed_child_until_deadline(child, deadline);
+    if let Some(child) = reap_killed_child_until_deadline(child, deadline) {
+        handoff_child_to_background_reaper(child, detail);
+    }
     bail!(
         "docker CLI timed out after {}ms while {detail}",
         timeout.as_millis()
@@ -561,7 +608,7 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return docker_timeout(&mut child, detail, timeout, deadline);
+            return docker_timeout(child, detail, timeout, deadline);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
@@ -569,7 +616,7 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return docker_timeout(&mut child, detail, timeout, deadline);
+            return docker_timeout(child, detail, timeout, deadline);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
@@ -580,7 +627,7 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
             Ok(None) => {
                 let remaining = phase_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return docker_timeout(&mut child, detail, timeout, deadline);
+                    return docker_timeout(child, detail, timeout, deadline);
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
@@ -4275,9 +4322,15 @@ minimum_isolation = "container"
 
     #[test]
     fn run_docker_timeout_covers_stderr_and_reaping() {
+        let pid_path = tmp_path("docker_timeout_pid").with_extension("pid");
         let start = Instant::now();
         let mut cmd = std::process::Command::new("/bin/sh");
-        cmd.args(["-c", "exec 1>&-; exec /bin/sleep 30"]);
+        cmd.args([
+            "-c",
+            "echo $$ > \"$1\"; exec 1>&-; exec /bin/sleep 30",
+            "sh",
+            pid_path.to_str().unwrap(),
+        ]);
         let result = run_docker_with_timeout(
             cmd,
             "hung docker command with closed stdout simulation",
@@ -4290,25 +4343,60 @@ minimum_isolation = "container"
             "stderr and process reaping must share the deadline, got {:?}",
             elapsed
         );
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "timed-out child must eventually be reaped");
     }
 
     #[test]
     fn killed_docker_child_is_reaped_within_cleanup_window() {
-        let mut child = std::process::Command::new("/bin/sleep")
+        let child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
         let pid = child.id() as libc::pid_t;
-        assert!(reap_killed_child_until_deadline(
-            &mut child,
-            Instant::now() + Duration::from_secs(1)
-        ));
-        assert!(child.try_wait().unwrap().is_some(), "child must be reaped");
+        assert!(
+            reap_killed_child_until_deadline(child, Instant::now() + Duration::from_secs(1))
+                .is_none(),
+            "child must be reaped"
+        );
         assert_ne!(
             unsafe { libc::kill(pid, 0) },
             0,
             "timed-out child must be killed and reaped"
         );
+    }
+
+    #[test]
+    fn background_reaper_eventually_reaps_transferred_child() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        child.kill().unwrap();
+        handoff_child_to_background_reaper(child, "background reaper test");
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "background reaper must eventually reap its child");
     }
 
     #[test]
