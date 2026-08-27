@@ -76,6 +76,49 @@ WATCHDOG_CONF_PATH="$tmp/mismatched-binary.conf" ASSERT_LIVE_WATCHDOG=1 REPO_ROO
   bash "${REPO_ROOT}/scripts/host/assert-no-host-reboot-vote.sh" >/dev/null 2>&1 || rc=$?
 [ "$rc" -ne 0 ] || { echo "FAIL: unsafe configured repair-binary should fail" >&2; exit 1; }
 
+# Digest binding must reject executable lookalikes even when their text would
+# satisfy the old marker-based checks.  These fixtures model common wrapper
+# mistakes/attacks: an unconditional non-zero exit, a commented or conditional
+# failure, set -e changing error handling, an early exec, and a different
+# executable that merely contains the shed-complete marker.
+assert_digest_rejected() {
+  local label="$1" body="$2" fixture config out rc=0
+  fixture="$tmp/${label}.sh"
+  config="$tmp/${label}.conf"
+  printf '%s\n' "$body" > "$fixture"
+  chmod +x "$fixture"
+  printf 'repair-maximum = 0\nrepair-binary = %s\n' "$fixture" > "$config"
+  out="$(WATCHDOG_CONF_PATH="$config" ASSERT_LIVE_WATCHDOG=1 REPO_ROOT="$REPO_ROOT" \
+    bash "${REPO_ROOT}/scripts/host/assert-no-host-reboot-vote.sh" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || { echo "FAIL: $label should fail closed" >&2; exit 1; }
+  echo "$out" | grep -q 'digest mismatch' \
+    || { echo "FAIL: $label did not fail on digest mismatch: $out" >&2; exit 1; }
+}
+
+assert_digest_rejected 'exit-2' "#!/usr/bin/env bash
+printf '%s\\n' 'shed-complete'
+exit 2"
+assert_digest_rejected 'commented-failure' "#!/usr/bin/env bash
+# exit 1
+printf '%s\\n' 'shed-complete'
+exit 0"
+assert_digest_rejected 'conditional-failure' "#!/usr/bin/env bash
+if [ \"\${REPAIR_FAIL:-0}\" = 1 ]; then exit 1; fi
+printf '%s\\n' 'shed-complete'
+exit 0"
+assert_digest_rejected 'set-e-failure' "#!/usr/bin/env bash
+set -e
+false
+printf '%s\\n' 'shed-complete'
+exit 0"
+assert_digest_rejected 'early-exec' "#!/usr/bin/env bash
+exec /bin/true
+printf '%s\\n' 'shed-complete'
+exit 0"
+assert_digest_rejected 'marker-lookalike' "#!/usr/bin/env bash
+printf '%s\\n' 'shed-complete'
+exit 0"
+
 # Rehearse the actual watchdog contract against a configured fixture binary.
 # Every external operation is a failing stub and all paths point into $tmp;
 # watchdog must still see a zero status when shedding cannot proceed.  This

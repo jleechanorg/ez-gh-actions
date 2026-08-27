@@ -43,8 +43,8 @@ read_repair_binary() {
     # watchdog.conf accepts a plain path.  Permit an inline comment and a
     # quoted value in fixtures, but reject an empty assignment below.
     value="${value%%#*}"
-    value="${value#${value%%[![:space:]]*}}"
-    value="${value%${value##*[![:space:]]}}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
     if [[ "$value" == '"'*'"' && "$value" == *'"' ]]; then
       value="${value:1:${#value}-2}"
     fi
@@ -66,27 +66,41 @@ read_repair_binary() {
 }
 
 check_repair_binary_script() {
-  local configured="$1" resolved
+  local configured="$1" resolved canonical_digest configured_digest
   [ -r "$configured" ] || fail "configured repair-binary is unreadable: $configured"
   [ -f "$configured" ] || fail "configured repair-binary is not a regular file: $configured"
   [ -x "$configured" ] || fail "configured repair-binary is not executable: $configured"
   resolved="$(readlink -f -- "$configured" 2>/dev/null || true)"
   [ -n "$resolved" ] || fail "configured repair-binary path cannot be resolved: $configured"
+  [ -f "$resolved" ] || fail "resolved repair-binary is not a regular file: $resolved"
   [ -r "$resolved" ] || fail "resolved repair-binary is unreadable: $resolved"
-  if grep -q 'log result reboot-eligible' "$resolved"; then
-    fail "$configured still logs reboot-eligible"
+  [ -x "$resolved" ] || fail "resolved repair-binary is not executable: $resolved"
+
+  # The configured path is the executable watchdog will invoke.  Text scans
+  # are insufficient here: a stale wrapper can contain shed-complete while
+  # exiting early, enabling set -e, or delegating to an unsafe payload.  Bind
+  # it byte-for-byte to the canonical artifact checked into this revision.
+  command -v sha256sum >/dev/null 2>&1 \
+    || fail "sha256sum is required to verify configured repair-binary provenance"
+  if ! canonical_digest="$(sha256sum -- "$REPAIR_REPO" 2>/dev/null)"; then
+    fail "cannot compute canonical repair-binary digest: $REPAIR_REPO"
   fi
-  if grep -q '^exit 1$' "$resolved"; then
-    fail "$configured still exits 1"
+  if ! configured_digest="$(sha256sum -- "$resolved" 2>/dev/null)"; then
+    fail "cannot compute configured repair-binary digest: $resolved"
   fi
-  grep -q 'log result shed-complete' "$resolved" \
-    || fail "$configured missing shed-complete result"
-  # The repair script has an intentional exit 2 preflight for non-root direct
-  # invocations.  watchdog runs it as root; do not reject that guarded branch
-  # with a simplistic grep for every non-zero-looking token.
+  canonical_digest="${canonical_digest%% *}"
+  configured_digest="${configured_digest%% *}"
+  [[ "$canonical_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+    || fail "cannot compute canonical repair-binary digest: $REPAIR_REPO"
+  [[ "$configured_digest" =~ ^[[:xdigit:]]{64}$ ]] \
+    || fail "cannot compute configured repair-binary digest: $resolved"
+  [ "$configured_digest" = "$canonical_digest" ] \
+    || fail "$configured repair-binary digest mismatch (expected canonical $canonical_digest, got $configured_digest)"
 }
 
 [ -f "$REPAIR_REPO" ] || fail "missing $REPAIR_REPO"
+[ -r "$REPAIR_REPO" ] || fail "canonical repair-binary is unreadable: $REPAIR_REPO"
+[ -x "$REPAIR_REPO" ] || fail "canonical repair-binary is not executable: $REPAIR_REPO"
 if grep -q 'log result reboot-eligible' "$REPAIR_REPO"; then
   fail "$REPAIR_REPO still logs reboot-eligible"
 fi

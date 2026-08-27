@@ -46,30 +46,58 @@ grub_dropin_dest="${grub_dropin_dir}/zz-ezgha-nohz-panic.cfg"
 grub="$(root_path /etc/default/grub)"
 kdump_source="${grub_dropin_dir}/kdump-tools.cfg"
 
-# --- this boot: stop 6-hour hangs ---
-run_root "$SYSCTL_BIN" -w kernel.panic=10 kernel.panic_on_oops=1
-run_root mkdir -p "$(dirname "$sysctl_dest")"
-run_root install -m 0644 "$SYSCTL_SRC" "$sysctl_dest"
-
-# --- next boot: disable NOHZ idle balancing (the Oops path) ---
-run_root mkdir -p "$grub_dropin_dir"
-run_root install -m 0644 "$GRUB_SRC" "$grub_dropin_dest"
-
-# --- kdump: one effective crashkernel= source only ---
+# --- preflight all inputs before changing live or persistent state ---
 [ -f "$grub" ] || fail "missing $grub"
 [ -f "$kdump_source" ] || fail "missing distro kdump source $kdump_source"
 source_copy="$(mktemp)"
 rewritten="$(mktemp)"
 backup=""
-grub_committed=0
+sysctl_backup="$(mktemp)"
+grub_dropin_backup="$(mktemp)"
+sysctl_had=0
+grub_dropin_had=0
+grub_had=0
+transaction_started=0
+transaction_committed=0
+sysctl_attempted=0
+update_grub_attempted=0
 cleanup() {
   rc=$?
   trap - EXIT
-  if [ -n "$backup" ] && [ "$grub_committed" -ne 1 ]; then
-    run_root cp -a "$backup" "$grub" \
-      || echo "FAIL: could not restore $grub from $backup" >&2
+  set +e
+  if [ "$transaction_started" -eq 1 ] && [ "$transaction_committed" -ne 1 ]; then
+    if [ "$grub_had" -eq 1 ]; then
+      run_root cp -a "$backup" "$grub" \
+        || echo "FAIL: could not restore $grub from $backup" >&2
+    else
+      run_root rm -f "$grub"
+    fi
+    if [ "$sysctl_had" -eq 1 ]; then
+      run_root cp -a "$sysctl_backup" "$sysctl_dest" \
+        || echo "FAIL: could not restore $sysctl_dest" >&2
+    else
+      run_root rm -f "$sysctl_dest"
+    fi
+    if [ "$grub_dropin_had" -eq 1 ]; then
+      run_root cp -a "$grub_dropin_backup" "$grub_dropin_dest" \
+        || echo "FAIL: could not restore $grub_dropin_dest" >&2
+    else
+      run_root rm -f "$grub_dropin_dest"
+    fi
+    if [ "$update_grub_attempted" -eq 1 ]; then
+      run_root "$UPDATE_GRUB_BIN" \
+        || echo "FAIL: could not regenerate GRUB from restored sources" >&2
+    fi
+    if [ "$sysctl_attempted" -eq 1 ]; then
+      run_root "$SYSCTL_BIN" -w \
+        "kernel.panic=$panic_before" "kernel.panic_on_oops=$panic_on_oops_before" \
+        || echo "FAIL: could not restore live panic sysctl values" >&2
+    fi
   fi
-  rm -f "$source_copy" "$rewritten"
+  if [ "$transaction_committed" -ne 1 ] && [ -n "$backup" ]; then
+    run_root rm -f "$backup"
+  fi
+  rm -f "$source_copy" "$rewritten" "$sysctl_backup" "$grub_dropin_backup"
   exit "$rc"
 }
 trap cleanup EXIT
@@ -97,11 +125,6 @@ awk '
   END { if (failed) exit 1 }
 ' "$source_copy" > "$rewritten" || fail "could not parse $grub safely"
 
-ts="$(date +%Y%m%d%H%M%S)"
-backup="${grub}.bak.kdump-dedup-${ts}"
-run_root cp -a "$grub" "$backup"
-run_root cp "$rewritten" "$grub"
-
 count_crashkernel_tokens() {
   awk -F'"' '
     /^GRUB_CMDLINE_LINUX(_DEFAULT)?="/ {
@@ -112,16 +135,61 @@ count_crashkernel_tokens() {
   ' "$@"
 }
 
-mapfile -t grub_sources < <(find "$grub_dropin_dir" -maxdepth 1 -type f -name '*.cfg' -print | sort)
-grub_sources=("$grub" "${grub_sources[@]}")
-all_crashkernels="$(count_crashkernel_tokens "${grub_sources[@]}")"
+mapfile -t grub_dropins < <(find "$grub_dropin_dir" -maxdepth 1 -type f -name '*.cfg' -print | sort)
+# Count against the prospective rewritten main file, not the still-unchanged
+# live file.  This proves the transaction will leave exactly one effective
+# crashkernel source before any target is mutated.
+all_crashkernels="$(count_crashkernel_tokens "$rewritten" "${grub_dropins[@]}")"
 kdump_crashkernels="$(count_crashkernel_tokens "$kdump_source")"
 if [ "$all_crashkernels" -ne 1 ] || [ "$kdump_crashkernels" -ne 1 ]; then
   fail "expected exactly one crashkernel token, owned by $kdump_source; found total=$all_crashkernels kdump-tools=$kdump_crashkernels"
 fi
 
+# Read the live values before any mutation so every failure path can restore
+# them.  Empty/non-numeric output indicates an unsafe or unusable sysctl tool.
+panic_before="$(run_root "$SYSCTL_BIN" -n kernel.panic)" \
+  || fail "could not read live kernel.panic"
+panic_on_oops_before="$(run_root "$SYSCTL_BIN" -n kernel.panic_on_oops)" \
+  || fail "could not read live kernel.panic_on_oops"
+[[ "$panic_before" =~ ^[0-9]+$ ]] || fail "invalid live kernel.panic value: $panic_before"
+[[ "$panic_on_oops_before" =~ ^[0-9]+$ ]] \
+  || fail "invalid live kernel.panic_on_oops value: $panic_on_oops_before"
+
+# Snapshot every target before starting the transaction.  Missing targets are
+# represented by a flag so rollback removes files created by a partial apply.
+if [ -e "$grub" ]; then
+  ts="$(date +%Y%m%d%H%M%S)"
+  backup="${grub}.bak.kdump-dedup-${ts}"
+  run_root cp -a "$grub" "$backup"
+  grub_had=1
+fi
+if [ -e "$sysctl_dest" ]; then
+  run_root cp -a "$sysctl_dest" "$sysctl_backup"
+  sysctl_had=1
+fi
+if [ -e "$grub_dropin_dest" ]; then
+  run_root cp -a "$grub_dropin_dest" "$grub_dropin_backup"
+  grub_dropin_had=1
+fi
+
+transaction_started=1
+run_root mkdir -p "$(dirname "$sysctl_dest")"
+run_root install -m 0644 "$SYSCTL_SRC" "$sysctl_dest"
+
+# --- next boot: disable NOHZ idle balancing (the Oops path) ---
+run_root mkdir -p "$grub_dropin_dir"
+run_root install -m 0644 "$GRUB_SRC" "$grub_dropin_dest"
+run_root cp "$rewritten" "$grub"
+
+# Regeneration is part of the transaction.  A non-zero exit restores the
+# original GRUB, drop-ins, and live sysctl values in cleanup().
+update_grub_attempted=1
 run_root "$UPDATE_GRUB_BIN"
-grub_committed=1
+
+# --- this boot: stop 6-hour hangs ---
+sysctl_attempted=1
+run_root "$SYSCTL_BIN" -w kernel.panic=10 kernel.panic_on_oops=1
+transaction_committed=1
 echo "PASS: panic=10 live; nohz=off + panic=10 in GRUB. Reboot to stop the Oops path."
 echo "Verify now:  sysctl kernel.panic kernel.panic_on_oops"
-echo "Verify next: tr ' ' '\\n' </proc/cmdline | grep -E 'nohz|panic|crashkernel'"
+printf '%s\n' "Verify next: tr ' ' '\\n' </proc/cmdline | grep -E 'nohz|panic|crashkernel'"

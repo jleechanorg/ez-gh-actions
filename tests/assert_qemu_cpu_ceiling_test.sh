@@ -54,6 +54,37 @@ live_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
 echo "$live_out" | grep -q 'pid=4242.*lima-vm@colima.service' \
   || { echo "FAIL: live fixture did not report exact QEMU cgroup: $live_out" >&2; exit 1; }
 
+# An explicit PID still requires a QEMU process identity.  A non-QEMU process
+# in the correctly bounded service cgroup must fail closed rather than pass
+# solely because its cgroup has the expected limits.
+mkdir -p "$PROC/5252"
+printf 'systemd\n' > "$PROC/5252/comm"
+printf '0::/user.slice/app.slice/lima-vm@colima.service\n' > "$PROC/5252/cgroup"
+printf '4242\n5252\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/cgroup.procs"
+nonqemu_rc=0
+nonqemu_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
+  QEMU_PID=5252 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
+  || nonqemu_rc=$?
+[ "$nonqemu_rc" -ne 0 ] || {
+  echo "FAIL: explicit non-QEMU PID incorrectly passed: $nonqemu_out" >&2
+  exit 1
+}
+echo "$nonqemu_out" | grep -q 'QEMU_PID=5252 is not qemu-system-x86' \
+  || { echo "FAIL: non-QEMU PID rejection was not reported: $nonqemu_out" >&2; exit 1; }
+
+# Multi-QEMU fixture: an unrelated, bounded QEMU has the lower PID and must
+# not satisfy the check when QEMU_PID is omitted.  Resolution must select the
+# sole QEMU in lima-vm@colima.service, not the first bounded process.
+mkdir -p "$PROC/1111"
+printf 'qemu-system-x86_64\n' > "$PROC/1111/comm"
+printf '0::/user.slice/app.slice/unrelated.scope\n' > "$PROC/1111/cgroup"
+printf '1111\n' > "$CG/user.slice/app.slice/unrelated.scope/cgroup.procs"
+auto_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
+  bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
+  || { echo "FAIL: service-bound multi-QEMU fixture rejected: $auto_out" >&2; exit 1; }
+echo "$auto_out" | grep -q 'pid=4242.*lima-vm@colima.service' \
+  || { echo "FAIL: auto-resolution selected an unrelated QEMU: $auto_out" >&2; exit 1; }
+
 # A bounded sibling must not satisfy the check when the PID's own cgroup is
 # absent.  This catches regressions to basename/sibling discovery.
 rm -rf "$CG/user.slice/app.slice/lima-vm@colima.service"
