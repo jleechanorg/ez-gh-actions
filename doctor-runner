@@ -1305,6 +1305,45 @@ fi
 
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
+# BEGIN host-aware failure remediation (hermetically extracted by
+# tests/doctor_runner_host_lifecycle_test.sh).
+emit_failure_remediation() {
+  local fleet_critical="$1" host_critical="$2" platform="$3"
+
+  if [ "$fleet_critical" -gt 0 ]; then
+    bad "fleet unhealthy: $fleet_critical critical check(s) failed"
+  fi
+  if [ "$host_critical" -gt 0 ]; then
+    bad "physical-host lifecycle policy FAILED ($host_critical operator-owned setting(s); see section 6c)"
+    echo "  Operator action is required outside ezgha; doctor-runner will not mutate host lifecycle settings."
+  fi
+  if [ "$fleet_critical" -le 0 ]; then
+    return
+  fi
+
+  if [ "$host_critical" -gt 0 ]; then
+    echo "  Host lifecycle findings are separate; the child-layer remediation below does not address them."
+  fi
+  echo
+  echo "Suggested child-layer remediation (platform=$platform):"
+  if [ "$platform" = "linux" ]; then
+    echo "  1. Stop and restart ezgha:  systemctl --user restart ezgha.service"
+  elif [ "$platform" = "macos" ]; then
+    echo "  1. Stop and restart ezgha:  launchctl kickstart -k gui/$(id -u)/org.jleechanorg.ezgha"
+    echo "     (or reload plist:        launchctl unload ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist && launchctl load -w ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist)"
+  else
+    echo "  1. Stop and restart ezgha via your platform's service manager"
+  fi
+  echo "  2. Reset slot file:          rm ~/.config/ezgha/slot_assignments.toml"
+  if command -v colima >/dev/null 2>&1; then
+    echo "  3. Start colima if down:     colima start"
+  elif command -v limactl >/dev/null 2>&1; then
+    echo "  3. Start lima if down:       limactl start <name>"
+  fi
+  echo "  4. Re-run ./doctor.sh --detail after each step"
+}
+# END host-aware failure remediation
+
 # Job-level queue counts (fresh-only, from section F1b's single job-map
 # fetch) — printed for BOTH healthy and unhealthy verdicts so the queue
 # state is never hidden behind a green light. A degraded map prints as
@@ -1317,10 +1356,6 @@ else
   echo "  queue: 0 queued job(s) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 fi
 CRITICAL=0
-if [ "${HOST_LIFECYCLE_CRITICAL:-0}" -gt 0 ]; then
-  bad "verdict: physical-host lifecycle-authority gate FAILED (${HOST_LIFECYCLE_CRITICAL} critical setting(s); see section 6c)"
-  CRITICAL=$((CRITICAL + HOST_LIFECYCLE_CRITICAL))
-fi
 # Every increment below prints a named [BAD] line at the point of increment —
 # fail-loud requirement (ez-gh-actions-nj2j): the motivating incident was a
 # verdict of "1 critical check(s) failed" with ZERO [BAD] lines anywhere in
@@ -1462,25 +1497,8 @@ if [ "${GH_TOKEN_STALE_CRITICAL:-0}" -gt 0 ]; then
   CRITICAL=$((CRITICAL + GH_TOKEN_STALE_CRITICAL))
 fi
 
-if [ "$CRITICAL" -gt 0 ]; then
-  bad "fleet unhealthy: $CRITICAL critical check(s) failed"
-  echo
-  echo "Suggested remediation (platform=$PLATFORM):"
-  if [ "$PLATFORM" = "linux" ]; then
-    echo "  1. Stop and restart ezgha:  systemctl --user restart ezgha.service"
-  elif [ "$PLATFORM" = "macos" ]; then
-    echo "  1. Stop and restart ezgha:  launchctl kickstart -k gui/$(id -u)/org.jleechanorg.ezgha"
-    echo "     (or reload plist:        launchctl unload ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist && launchctl load -w ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist)"
-  else
-    echo "  1. Stop and restart ezgha via your platform's service manager"
-  fi
-  echo "  2. Reset slot file:          rm ~/.config/ezgha/slot_assignments.toml"
-  if command -v colima >/dev/null 2>&1; then
-    echo "  3. Start colima if down:     colima start"
-  elif command -v limactl >/dev/null 2>&1; then
-    echo "  3. Start lima if down:       limactl start <name>"
-  fi
-  echo "  4. Re-run ./doctor.sh --detail after each step"
+if [ "$CRITICAL" -gt 0 ] || [ "${HOST_LIFECYCLE_CRITICAL:-0}" -gt 0 ]; then
+  emit_failure_remediation "$CRITICAL" "${HOST_LIFECYCLE_CRITICAL:-0}" "$PLATFORM"
   exit 1
 fi
 # compute_verdict_summary() aggregates the per-slot LOCAL TRUTH (section 9:
