@@ -59,7 +59,7 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 // + safety margin) and the runner-present check actually runs to completion.
 // Still well under the 300s watchdog margin.
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
-const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -2818,7 +2818,7 @@ fn executing_runner_count_from_containers(
         }
         let mut cmd = docker_cmd();
         cmd.args(["top", &container.id, "-eo", "pid,comm"]);
-        let timeout = remaining.min(LOCAL_TOP_TIMEOUT);
+        let timeout = readiness_probe_timeout(remaining);
         let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
             .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
         if !out.status.success() {
