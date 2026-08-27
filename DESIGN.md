@@ -132,8 +132,10 @@ the full multi-layer guarantee.
 - **Lifecycle**: started at host boot (or via `limactl start colima`,
   `systemctl --user start ezgha.service` prereqs). Independent of `ezgha serve`.
 - **Enforces**: hardware virtualization (separate kernel from host), VM resource
-  limits (the hypervisor caps RAM/vCPUs/disk; the container cannot exhaust host
-  resources, only VM quota), VM network isolation (bridged or NAT'd).
+  limits (the hypervisor may cap RAM/vCPUs/disk and bounds guest allocation when those
+  limits are correctly applied), VM network isolation (bridged or NAT'd). This is not
+  a literal proof that all host resources are protected: shared mounts, page cache,
+  hypervisor bugs, and host policy remain separate concerns.
 - **Detection by `ezgha`**: `src/platform.rs::daemon_in_vm()` compares
   `docker info --format '{{.KernelVersion}}'` against host `uname -r`. A mismatch
   means the daemon is inside a VM. `select()` in `src/backend.rs` uses this signal
@@ -141,8 +143,8 @@ the full multi-layer guarantee.
   required. On macOS this comparison is short-circuited (every Mac Docker daemon
   is VM-contained by construction).
 - **Does NOT enforce**: VM escape. That is a real (rare) attack class. `ezgha` does
-  not claim VM-escape immunity; it claims the **host blast-radius** is bounded by
-  the VM (at worst, the attacker reaches the VM's userspace, not your host kernel).
+  not claim VM-escape immunity or a literal host-survival guarantee. The VM is an
+  additional boundary whose deployed limits and mounts require live verification.
 - **Config knobs**: standard Colima/Lima/QEMU configuration; `ezgha` only needs
   the daemon reachable.
 
@@ -172,6 +174,29 @@ virtualization, the host by OS hardening.
 A malicious job would need to break **all three boundaries** (cgroup/namespace →
 VM hypervisor → host kernel). Layers 1–3 are mitigated by Layer 3's hardware
 virtualization; Layer 4 is OS hardening.
+
+## Host-survival failure ladder (operational contract)
+
+For the Jeff-Ubuntu fleet, capacity remains **10 Linux plus 6 Mac runners**. A
+temporary Linux count of 5 is a live failure, not a reduced contract. The desired
+failure order is deliberately narrow: job/container first, then a single failing slot,
+then admission for the fleet, then the Colima VM under sustained pressure. It does not
+claim that a container or VM can never crash, exhaust, or otherwise affect the host.
+
+| Scope | Owner | Allowed action |
+|---|---|---|
+| Job/container | Docker limits and ephemeral lifecycle | End the job/container. |
+| Repeated local start failure | `ezgha` persistent per-slot circuit | Quarantine that slot temporarily; leave other eligible slots available. |
+| Systemic start failures | `ezgha` fleet admission circuit | Pause new starts; do not stop the VM or host. |
+| Sustained host pressure | Root-owned watchdog repair | Close admission, shed managed containers, then request a bounded Colima stop. |
+| Host | Watchdog configuration and operator controls | Never vote for a host reboot from runner load/PSI repair. |
+
+The Rust daemon may make a bounded **start** request when the Docker/Colima backend is
+genuinely unreachable; admission pauses and local start failures do not trigger it. It
+cannot stop the VM or perform host lifecycle actions. The live verdict remains
+**FAIL** until the companion [ironclad goal](roadmap/host-uncrashable-goal-ironclad-2026-08-26.md)
+proves, together, the live watchdog setting, finite QEMU cgroup limits, resolved
+whole-home 9p, an armed single-crashkernel kdump boot, and restored 10-Linux capacity.
 
 ## Origin of this design
 
@@ -317,11 +342,11 @@ policy violation is a hard error (fail closed).
 
 **Daemon-in-VM reclassification.** For the `minimum_isolation = "vm"` policy, a Docker
 backend counts as VM-grade containment when the daemon itself runs inside a VM — the
-common desktop/dev setups (Colima, Lima, Docker Desktop) — because the host blast-radius
-is then bounded by the VM, not just the cgroup. We detect this by comparing the daemon's
+common desktop/dev setups (Colima, Lima, Docker Desktop) — because it adds a VM boundary
+beyond the cgroup. We detect this by comparing the daemon's
 kernel (`docker info`) against the host kernel (`uname`): a mismatch means containers
 execute against a different kernel, i.e. inside a VM. Per-job isolation is still
-container-grade in this case; the guarantee the policy makes is host blast-radius. A
+container-grade in this case; this policy classification is not a host-survival proof. A
 bare-metal docker daemon (kernels match) stays container-tier and is **refused** under a
 `vm` policy, so the fail-closed contract holds on Linux servers where docker shares the
 host kernel.

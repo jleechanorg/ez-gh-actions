@@ -4,8 +4,9 @@ Easy **isolated** self-hosted GitHub Actions runners. One Rust binary that:
 
 - runs each job in a **fresh ephemeral runner** (GitHub JIT registration — one job, then
   the runner deregisters and its container is removed),
-- applies **hard resource limits** (memory, CPUs, PIDs) so a runaway job can't take the
-  host down,
+- applies **hard resource limits** (memory, CPUs, PIDs) to bound an individual job's
+  container; host-survival still requires the outer VM, watchdog, and live operational
+  checks described below,
 - **prefers the strongest isolation the host can deliver** (VM backends on the roadmap;
   Docker and Docker+sysbox today) and **fails closed** when policy demands more than
   the host offers,
@@ -15,6 +16,34 @@ Easy **isolated** self-hosted GitHub Actions runners. One Rust binary that:
 The full design — including the 32-agent adversarial review that shaped v1 — lives in
 [DESIGN.md](DESIGN.md). A static architecture diagram is at
 [`docs/architecture.svg`](docs/architecture.svg).
+
+## Host-survival failure ladder (Jeff-Ubuntu)
+
+The production capacity contract is **10 Linux runners plus 6 Mac runners**. The
+temporary Linux count of 5 is an incident workaround, not a capacity target, and the
+host-survival verdict remains **FAIL** until the live criteria in the
+[ironclad goal](roadmap/host-uncrashable-goal-ironclad-2026-08-26.md) pass together.
+
+Containment is an ordered recovery policy, not a literal proof that a container or VM
+can never affect the physical host:
+
+| Failure scope | Owner | Response |
+|---|---|---|
+| Job | Runner/container limits | Fail the job or container first. |
+| Repeated slot start failures | `ezgha` persistent circuit ledger | Open only that slot's circuit; other eligible slots continue. |
+| Several open slot circuits | `ezgha` admission policy | Pause new admissions; existing jobs are not force-stopped. |
+| Sustained host pressure after admission closes | Root-owned watchdog repair | Shed managed containers, then make a bounded Colima-stop request if pressure remains. |
+| Physical host | Watchdog configuration and operator controls | No watchdog reboot vote; the Rust daemon cannot stop the VM or perform host lifecycle actions. |
+
+The daemon retains its existing bounded ability to **start** an unreachable Docker/Colima
+backend after a genuine reachability failure. Admission pauses and local runner-start
+failures do not enter that recovery path; only the root-owned pressure repair may stop
+Colima.
+
+The still-open live gaps are whole-home 9p/virtfs, deployment of the watchdog's live
+`repair-maximum=0`, one armed crashkernel with kdump loaded on the current boot, and
+restoring the Linux count from 5 to 10. Repository checks document the intended
+controls; they do not close those live gaps.
 
 ## How isolation works
 
@@ -112,8 +141,9 @@ that is the point of composing them.
   removed by `--rm` on exit.
 - **What enforces isolation**:
   - **Linux cgroups** — hard ceilings on memory (`--memory` + `--memory-swap`),
-    CPU (`--cpus`), and process count (`--pids-limit`). A runaway job dies inside
-    its cgroup; the host can't be OOM-killed by a single job.
+    CPU (`--cpus`), and process count (`--pids-limit`). A runaway job is constrained
+    to its cgroup budget; that budget is necessary but not by itself a host-survival
+    proof.
   - **Linux namespaces** — PID, mount, network, UTS, IPC, user. The runner sees
     only its own processes, mounts, hostname, network namespace.
   - **`--security-opt no-new-privileges`** — blocks setuid binaries and capability
@@ -165,8 +195,9 @@ that is the point of composing them.
     directly; they would first need to break out of the VM (a much harder,
     rarer, and more-researched class of bug).
   - **VM resource limits** — the hypervisor can cap VM RAM, vCPUs, and disk.
-    The container cannot exhaust the host's resources; it can only exhaust
-    the VM's quota.
+    With finite, correctly applied outer limits this bounds the guest's direct
+    allocation, but it does not prove all host-side effects are contained (for
+    example, shared 9p/page-cache behavior still needs live verification).
   - **VM network isolation** — the VM's network is bridged or NAT'd through
     the host. A container cannot bind to the host's IP directly.
 - **Detection by `ezgha`**: `ezgha doctor` (and `init`) compares the daemon's
@@ -178,9 +209,9 @@ that is the point of composing them.
   This is how `ezgha` automatically satisfies `policy.minimum_isolation = "vm"`
   without you having to wire it up manually.
 - **What it does NOT enforce**: VM escape is a real (rare) attack class.
-  `ezgha` does not claim VM-escape immunity; it claims the **host blast-radius**
-  is bounded by the VM (at worst, the attacker reaches the VM's userspace, not
-  your host kernel).
+  `ezgha` does not claim VM-escape immunity or a literal host-survival guarantee.
+  The VM is an additional boundary whose effectiveness depends on the deployed
+  hypervisor limits, mounts, and host controls.
 - **Configuration knobs**: standard Colima/Lima/QEMU config; `ezgha` only needs
   the docker daemon reachable.
 
@@ -350,12 +381,12 @@ policy violation is a hard error (fail closed).
 
 **Daemon-in-VM reclassification.** For `policy.minimum_isolation = "vm"`, a Docker
 backend counts as VM-grade containment when the daemon itself runs inside a VM — the
-common desktop/dev setups (Colima, Lima, Docker Desktop) — because the host blast
-radius is then bounded by the VM, not just the cgroup. We detect this by comparing the
+common desktop/dev setups (Colima, Lima, Docker Desktop) — because it adds a VM
+boundary beyond the cgroup. We detect this by comparing the
 daemon's kernel (`docker info`) against the host kernel (`uname`): a mismatch means
 containers execute against a different kernel, i.e. inside a VM. Per-job isolation is
-still container-grade in this case; the guarantee the policy makes is **host blast
-radius**. A bare-metal Docker daemon (kernels match) stays container-tier and is
+still container-grade in this case; this policy classification is not a live
+host-survival proof. A bare-metal Docker daemon (kernels match) stays container-tier and is
 **refused** under a `vm` policy, so the fail-closed contract holds on Linux servers
 where Docker shares the host kernel.
 

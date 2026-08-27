@@ -22,6 +22,11 @@ pub struct Config {
     pub runner: RunnerConfig,
     pub limits: Limits,
     pub policy: Policy,
+    /// Persistent per-slot and fleet-wide admission circuit policy. This is
+    /// intentionally separate from alert streaks: it controls whether new
+    /// containers may be started, never VM or host lifecycle.
+    #[serde(default)]
+    pub failure_ladder: FailureLadderConfig,
     #[serde(default)]
     pub alert: AlertConfig,
     #[serde(default)]
@@ -30,6 +35,41 @@ pub struct Config {
     pub canary: CanaryConfig,
     #[serde(default)]
     pub invariant_sampler: InvariantSamplerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FailureLadderConfig {
+    /// Failed local starts for one slot within the rolling window before its
+    /// circuit opens.
+    #[serde(default = "default_slot_failure_threshold")]
+    pub slot_failure_threshold: u32,
+    /// Rolling window used to count local start failures.
+    #[serde(default = "default_slot_failure_window_secs")]
+    pub slot_failure_window_secs: u64,
+    /// How long an opened slot is excluded from allocation.
+    #[serde(default = "default_slot_cooldown_secs")]
+    pub slot_cooldown_secs: u64,
+    /// Concurrent distinct open slots that pause all new admissions. At
+    /// runtime this is capped to the configured runner count for small legacy
+    /// fleets, so the default of three remains reachable for 1-2 slot configs.
+    #[serde(default = "default_fleet_open_slot_threshold")]
+    pub fleet_open_slot_threshold: u32,
+    /// How long a fleet admission pause lasts before a gradual retry.
+    #[serde(default = "default_fleet_cooldown_secs")]
+    pub fleet_cooldown_secs: u64,
+}
+
+impl Default for FailureLadderConfig {
+    fn default() -> Self {
+        Self {
+            slot_failure_threshold: default_slot_failure_threshold(),
+            slot_failure_window_secs: default_slot_failure_window_secs(),
+            slot_cooldown_secs: default_slot_cooldown_secs(),
+            fleet_open_slot_threshold: default_fleet_open_slot_threshold(),
+            fleet_cooldown_secs: default_fleet_cooldown_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -397,6 +437,26 @@ fn default_failure_alert_threshold() -> u32 {
     3
 }
 
+fn default_slot_failure_threshold() -> u32 {
+    3
+}
+
+fn default_slot_failure_window_secs() -> u64 {
+    600
+}
+
+fn default_slot_cooldown_secs() -> u64 {
+    900
+}
+
+fn default_fleet_open_slot_threshold() -> u32 {
+    3
+}
+
+fn default_fleet_cooldown_secs() -> u64 {
+    600
+}
+
 fn default_alert_cooldown_seconds() -> u64 {
     900
 }
@@ -568,6 +628,7 @@ impl Config {
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
             },
+            failure_ladder: FailureLadderConfig::default(),
             alert: AlertConfig {
                 failure_alert_threshold: default_failure_alert_threshold(),
                 alert_cooldown_secs: default_alert_cooldown_seconds(),
@@ -652,6 +713,26 @@ impl Config {
         require_at_least_one(
             "alert.failure_alert_threshold",
             self.alert.failure_alert_threshold as u64,
+        )?;
+        require_at_least_one(
+            "failure_ladder.slot_failure_threshold",
+            self.failure_ladder.slot_failure_threshold as u64,
+        )?;
+        require_at_least_one(
+            "failure_ladder.slot_failure_window_secs",
+            self.failure_ladder.slot_failure_window_secs,
+        )?;
+        require_at_least_one(
+            "failure_ladder.slot_cooldown_secs",
+            self.failure_ladder.slot_cooldown_secs,
+        )?;
+        require_at_least_one(
+            "failure_ladder.fleet_open_slot_threshold",
+            self.failure_ladder.fleet_open_slot_threshold as u64,
+        )?;
+        require_at_least_one(
+            "failure_ladder.fleet_cooldown_secs",
+            self.failure_ladder.fleet_cooldown_secs,
         )?;
         require_at_least_one("alert.alert_cooldown_secs", self.alert.alert_cooldown_secs)?;
         require_non_empty_path("alert.log_path", &self.alert.log_path)?;
@@ -959,6 +1040,70 @@ minimum_isolation = "container"
     #[test]
     fn valid_config_passes_validation() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn failure_ladder_defaults_are_bounded_and_legacy_compatible() {
+        let cfg = valid_config();
+        assert_eq!(cfg.failure_ladder.slot_failure_threshold, 3);
+        assert_eq!(cfg.failure_ladder.slot_failure_window_secs, 600);
+        assert_eq!(cfg.failure_ladder.slot_cooldown_secs, 900);
+        assert_eq!(cfg.failure_ladder.fleet_open_slot_threshold, 3);
+        assert_eq!(cfg.failure_ladder.fleet_cooldown_secs, 600);
+
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 10
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let loaded = load_from_str(raw, "legacy-failure-ladder").unwrap();
+        assert_eq!(loaded.failure_ladder, FailureLadderConfig::default());
+    }
+
+    #[test]
+    fn failure_ladder_rejects_zero_boundaries() {
+        let mut cfg = valid_config();
+        cfg.failure_ladder.slot_failure_threshold = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.slot_failure_window_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.slot_cooldown_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.fleet_open_slot_threshold = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.fleet_cooldown_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn linux_fleet_example_preserves_ten_runner_bounded_contract() {
+        let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
+            .expect("tracked Linux fleet example must parse");
+        cfg.validate()
+            .expect("tracked Linux fleet example must validate");
+        assert_eq!(cfg.runner.count, 10);
+        assert_eq!(cfg.runner.image, "ezgha-runner:latest");
+        assert_eq!(cfg.limits.cgroup_parent.as_deref(), Some("actions.slice"));
+        assert_eq!(cfg.failure_ladder, FailureLadderConfig::default());
     }
 
     #[test]

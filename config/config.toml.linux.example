@@ -33,6 +33,19 @@ cgroup_parent = "actions.slice"
 # and you want fail-closed enforcement when backend drops below vm.
 minimum_isolation = "container"
 
+# Local start failures collapse inward before they can become a fleet or VM
+# restart storm. Open one slot after 3 failures in 10 minutes; pause all new
+# admission only after 3 distinct slot circuits are open. Existing jobs keep
+# running, and these circuits never stop Colima or the physical host.
+[failure_ladder]
+slot_failure_threshold = 3
+slot_failure_window_secs = 600
+slot_cooldown_secs = 900
+fleet_open_slot_threshold = 3
+fleet_cooldown_secs = 600
+
+# Read-only auxiliary observers stay opt-in on Linux so they cannot compete
+# with the core serve reconciliation loop or become host-pressure voters.
 [queue_monitor]
 enabled = false
 
