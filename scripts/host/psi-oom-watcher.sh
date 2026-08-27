@@ -205,9 +205,11 @@ _shed_strict_required=0
 # the actual truncated value so the intent and the mechanism agree.
 EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher|ezgha|qemu-system-x86|colima|lima|limactl|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
 # args-based exclusions (defense in depth for the comm-truncation case
-# above, and to catch any Colima/Lima helper process whose comm doesn't
-# start with one of the names above but whose full command line does).
-EXCLUDE_ARGS_PATTERN='(qemu-system|\.lima/colima|/colima/|lima-colima)'
+# above, and to catch processes whose executable wrapper hides their identity).
+# Warp's AppImage launcher uses comm=AppRun: on 2026-08-26 the name-only
+# exclusion missed it and this watcher SIGTERM'd the user's terminal. Match the
+# specific warp-terminal argv path; excluding every AppRun would be overbroad.
+EXCLUDE_ARGS_PATTERN='(qemu-system|\.lima/colima|/colima/|lima-colima|(^|/)warp-terminal([[:space:]/]|$))'
 
 mkdir -p "${STATE_DIR}"
 
@@ -230,7 +232,10 @@ LOW_PRIORITY_CONTAINERS="${LOW_PRIORITY_CONTAINERS:-ez-mac-runner-b-1 ez-mac-run
 PRIORITY_FILE="${PRIORITY_FILE:-}"
 RSS_DROP_MIN_KB="${RSS_DROP_MIN_KB:-1048576}"   # 1 GiB in kB
 SHED_VERIFY_DELAY="${SHED_VERIFY_DELAY:-5}"    # seconds between write+verify
-SHED_FLAG_DIR="${SHED_FLAG_DIR:-/run/ezgha}"
+# Persist escalation evidence beside the watcher log. The previous /run/ezgha
+# default was root-owned and could not be created by this user-scope service,
+# which made the production escalation marker impossible to write.
+SHED_FLAG_DIR="${SHED_FLAG_DIR:-${STATE_DIR}}"
 SHED_FLAG_FILE="${SHED_FLAG_DIR}/watchdog-wait-required.flag"
 
 # Reset on every invocation so callers can `source` and probe.
@@ -433,13 +438,9 @@ stage3_verify() {
 }
 
 # ---------------- Stage 4: Escalate ----------------
-# Marker file (world-readable so watchdog without sudo can read it),
-# CRITICAL log line, and non-zero exit. Idempotent: rewriting a present
-# flag refreshes its mtime but does not change the meaning.
+# Marker file, CRITICAL log line, and non-zero exit. Idempotent: rewriting a
+# present flag refreshes its mtime but does not change the meaning.
 stage4_escalate() {
-  mkdir -p "${SHED_FLAG_DIR}" 2>/dev/null || true
-  chmod 0755 "${SHED_FLAG_DIR}" 2>/dev/null || true
-
   local ts reason pressure streak_info
   ts="$(date -u +%FT%TZ)"
   pressure="${full_avg10:-n/a}"
@@ -449,15 +450,19 @@ stage4_escalate() {
     return 0
   fi
 
-  # Atomically (to the extent `install` allows) write a 0644 flag with the
-  # reason embedded so the watchdog / next boot can read it directly.
+  # Atomically write a 0644 flag with the reason embedded so post-mortem tools
+  # and the next boot can read it directly. Do not claim success if any part
+  # of the write fails: the 2026-08-26 incident exposed exactly that false log.
   umask 0222 || true   # ensure resulting file is world-readable
-  printf 'shed_escalate_at=%s reason=%s\n' "${ts}" "${reason}" > "${SHED_FLAG_FILE}.tmp" 2>>"${LOG_FILE}" \
+  if mkdir -p "${SHED_FLAG_DIR}" 2>>"${LOG_FILE}" \
+    && printf 'shed_escalate_at=%s reason=%s\n' "${ts}" "${reason}" > "${SHED_FLAG_FILE}.tmp" 2>>"${LOG_FILE}" \
     && mv -f "${SHED_FLAG_FILE}.tmp" "${SHED_FLAG_FILE}" 2>>"${LOG_FILE}" \
-    || _shed_log stage4 "failed to write escalation flag at ${SHED_FLAG_FILE}"
-  chmod 0644 "${SHED_FLAG_FILE}" 2>/dev/null || true
-
-  _shed_log stage4 "CRITICAL ${reason}; escalation flag written to ${SHED_FLAG_FILE}"
+    && chmod 0644 "${SHED_FLAG_FILE}" 2>>"${LOG_FILE}"; then
+    _shed_log stage4 "CRITICAL ${reason}; escalation flag written to ${SHED_FLAG_FILE}"
+  else
+    rm -f "${SHED_FLAG_FILE}.tmp" 2>/dev/null || true
+    _shed_log stage4 "CRITICAL ${reason}; FAILED to write escalation flag at ${SHED_FLAG_FILE}"
+  fi
   return 1   # signal the caller that chain did not free enough memory
 }
 
@@ -679,7 +684,9 @@ if [ "${DRY_RUN}" != "1" ] && [ -n "${PSI_SHED_CHAIN}" ]; then
     rm -f "${STREAK_FILE}"
     exit 0
   fi
-  log "ACTION(staged-shed): SHED_RESULT=${SHED_RESULT:-fail} — falling through to cooldown-gated per-process SIGTERM fallback"
+  log "ACTION(staged-shed): SHED_RESULT=${SHED_RESULT:-fail} — stage-4 escalation recorded; per-process SIGTERM fallback suppressed"
+  rm -f "${STREAK_FILE}"
+  exit 1
 fi
 
 # Only arbitrary-process SIGTERM is cooldown-gated. Runner/QEMU shedding above

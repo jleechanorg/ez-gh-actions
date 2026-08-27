@@ -128,9 +128,10 @@ else
   fi
 
   # Behavioral smoke test: fabricate a fake process table via a stub `ps`
-  # on PATH shaped exactly like the REAL fixture seen on jeff-ubuntu during
+  # on PATH shaped exactly like the REAL fixtures seen on jeff-ubuntu during
   # adversarial verification: qemu (Colima VM, ~32GB, must be excluded),
-  # then warp-terminal (~760MB, the user's GUI terminal, must be excluded),
+  # then Warp's AppImage launcher (comm=AppRun, argv ends in warp-terminal;
+  # ~760MB and must be excluded),
   # then a legitimate `claude` agent CLI process (the actual intended
   # target class) -- assert the watcher skips BOTH exclusions and lands on
   # the claude process, never qemu or warp-terminal.
@@ -141,11 +142,11 @@ else
 # Stub ps: ignores its arguments, always returns a fixed fixture table
 # shaped like `ps -o pid=,rss=,comm=,args= --sort=-rss` output, matching
 # the real top-of-stack seen on jeff-ubuntu 2026-07-10: qemu (Colima VM)
-# and warp-terminal (GUI terminal) both must be excluded; the claude
+# and Warp's real AppImage-shaped process both must be excluded; the claude
 # process is the legitimate target.
 cat <<'TABLE'
   24265 33072676 qemu-system-x86 /usr/bin/qemu-system-x86_64 -m 49152 -drive file=/home/jleechan/.lima/colima/diffdisk -name lima-colima
-  12439   759760 warp-terminal /usr/bin/warp-terminal
+  12439   759760 AppRun /home/jleechan/.local/bin/warp-terminal
   11111   700000 limactl /usr/local/bin/limactl hostagent
   19195   616432 claude /home/jleechan/.npm-global/bin/claude
 TABLE
@@ -264,6 +265,46 @@ EOF
   [ ! -e "${RUNTIME_STATE}/psi-oom-watcher.crit-streak" ] || fail "successful staged shed did not reset the consecutive critical streak"
   [ "$(cat "${RUNTIME_STATE}/psi-oom-watcher.last-action")" = "$cooldown_epoch" ] || fail "staged shed rewrote the arbitrary-process cooldown marker"
   ok "pre-existing SIGTERM cooldown does not suppress staged runner shedding (behavioral fixture)"
+
+  # Behavioral production-incident regression: if staged runner/QEMU shedding
+  # cannot free the required memory, stage 4 is the terminal action for this
+  # user-scope watcher. It must record the escalation and return non-zero so
+  # systemd exposes the failure; it must not fall through to SIGTERM an
+  # unrelated large process. A nonexistent fixture PID makes stage 3 fail
+  # without touching the live cgroup tree, and the kill stub records any unsafe
+  # fallback attempt instead of signaling a real process.
+  FAIL_STATE="${WORK}/failure-state"
+  mkdir -p "${FAIL_STATE}"
+  cat > "${RUNTIME_BIN}/pgrep" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' '999998'
+EOF
+  cat > "${RUNTIME_BIN}/ps" <<'EOF'
+#!/usr/bin/env bash
+printf '999999 1048576 agent-fixture agent-fixture\n'
+EOF
+  cat > "${RUNTIME_BIN}/kill" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${RUNTIME_KILL_CALLS:?}"
+EOF
+  chmod +x "${RUNTIME_BIN}/pgrep" "${RUNTIME_BIN}/ps" "${RUNTIME_BIN}/kill"
+  printf '1\n' > "${FAIL_STATE}/psi-oom-watcher.crit-streak"
+  set +e
+  PATH="${RUNTIME_BIN}:${PATH}" PSI_FILE="${FAKE_PSI}" STATE_DIR="${FAIL_STATE}" \
+    WARN_THRESHOLD=10 CRIT_THRESHOLD=40 CRIT_CONSECUTIVE=2 DRY_RUN=0 \
+    PSI_SHED_CHAIN="drain,reclaim,verify,escalate" LOW_PRIORITY_CONTAINERS="" \
+    SHED_VERIFY_DELAY=0 RSS_DROP_MIN_KB=1048576 \
+    RUNTIME_KILL_CALLS="${FAIL_STATE}/kill-calls" \
+    bash "${WATCHER}" >"${FAIL_STATE}/run.log" 2>&1
+  fail_status=$?
+  set -e
+  [ "${fail_status}" -ne 0 ] || fail "failed staged shed returned success instead of exposing stage-4 escalation to systemd"
+  [ -s "${FAIL_STATE}/watchdog-wait-required.flag" ] || fail "stage 4 did not persist its escalation marker in the default state directory"
+  grep -q 'qemu RSS did not drop' "${FAIL_STATE}/watchdog-wait-required.flag" || fail "stage-4 escalation marker omitted the failure reason"
+  [ ! -e "${FAIL_STATE}/kill-calls" ] || fail "failed staged shed fell through to arbitrary-process SIGTERM"
+  ! grep -q 'ACTION: sending SIGTERM' "${FAIL_STATE}/psi-oom-watcher.log" || fail "failed staged shed logged an arbitrary-process SIGTERM action"
+  grep -q 'per-process SIGTERM fallback suppressed' "${FAIL_STATE}/psi-oom-watcher.log" || fail "failed staged shed did not log that arbitrary-process SIGTERM was suppressed"
+  ok "failed staged shed records escalation, returns non-zero, and suppresses arbitrary-process SIGTERM (behavioral fixture)"
 fi
 
 # ── 2b. ezgha.service.d/10-oomd-omit.conf -- exists, correct directive,

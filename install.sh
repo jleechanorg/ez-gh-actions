@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # install.sh — install ez-gh-actions (ezgha) and, optionally, its user service.
 # Idempotent, no sudo. Re-run any time to upgrade the binary.
-#   ./install.sh                  install / upgrade ezgha and arm the fleet
-#                                  watchdog by default (ezgha-watchdog.timer on
-#                                  Linux, the launchd watchdog agent on macOS).
-#                                  Restart is enabled (EZGHA_WATCHDOG_ALLOW_RESTART=1).
+#   ./install.sh                  install / upgrade ezgha with auxiliary
+#                                  monitoring/watchdog loops disabled.
 #   ./install.sh --without-watchdog  install / upgrade but skip arming the
 #                                  watchdog; on Linux, any drifted-enabled
 #                                  ezgha-watchdog.timer is disabled.
-#   ./install.sh --with-watchdog  explicit opt-in (same as default; kept for
-#                                  backward compatibility)
+#   ./install.sh --with-watchdog  explicit opt-in for the fleet watchdog
 #   ./install.sh --uninstall      remove ezgha + its user service (config left in place)
 #   ./install.sh --dev            bypass production git-state checks (local development)
 # Flags compose, e.g.: ./install.sh --dev --without-watchdog
@@ -135,7 +132,7 @@ uninstall() {
 }
 
 DEV_MODE=0
-WITH_WATCHDOG=1
+WITH_WATCHDOG=0
 for arg in "$@"; do
   case "${arg}" in
     --uninstall|-u)
@@ -850,23 +847,38 @@ EOF
     else
       warn "lima-vm-cpu-ceiling.service not enabled"
     fi
-    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer ezgha-mission-output-cleanup.timer; do
+    for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user timer enabled: ${timer}"
       else
         bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
       fi
     done
-    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-      if systemctl --user enable --now "${timer}" 2>/dev/null; then
-        ok "systemd --user host-control timer enabled: ${timer}"
+    # Auxiliary mutation loops are opt-out by policy. Keep their tracked units
+    # installed for manual diagnostics, but heal prior enabled state.
+    for pair in \
+      "ezgha-queue-reaper.timer ezgha-queue-reaper.service" \
+      "agent-scope-reaper.timer agent-scope-reaper.service"; do
+      timer="${pair%% *}"
+      service="${pair#* }"
+      if systemctl --user disable --now "${timer}" 2>/dev/null \
+         && systemctl --user stop "${service}" 2>/dev/null; then
+        ok "systemd --user auxiliary loop disabled: ${timer}"
       else
-        bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
+        bad "failed to disable auxiliary loop: ${timer} / ${service}"
       fi
     done
-    # ezgha-watchdog.timer: armed by default (restart enabled via
-    # Environment=EZGHA_WATCHDOG_ALLOW_RESTART=1 in ezgha-watchdog.service).
-    # Pass --without-watchdog to skip arming and heal drift.
+    # Retired after the 2026-08-26 incident where the user-scope PSI watcher
+    # selected Warp's AppImage process as its fallback SIGTERM target. Keep the
+    # tracked script/unit installed for audit and manual diagnostics, but heal
+    # any previously enabled timer and stop an invocation already in flight.
+    if systemctl --user disable --now psi-oom-watcher.timer 2>/dev/null \
+       && systemctl --user stop psi-oom-watcher.service 2>/dev/null; then
+      ok "systemd --user PSI OOM watcher disabled by policy"
+    else
+      bad "failed to disable psi-oom-watcher (run: systemctl --user status psi-oom-watcher.timer psi-oom-watcher.service)"
+    fi
+    # ezgha-watchdog.timer is explicit opt-in. The default heals drifted state.
     if [ "${WITH_WATCHDOG}" -eq 1 ]; then
       if systemctl --user enable --now ezgha-watchdog.timer 2>/dev/null; then
         ok "systemd --user timer enabled: ezgha-watchdog.timer (restart enabled)"
@@ -874,14 +886,15 @@ EOF
         bad "failed to enable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
       fi
     else
-      info "watchdog arming skipped (--without-watchdog)"
+      info "watchdog arming skipped (default; use --with-watchdog to opt in)"
       if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
         if systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null; then
-          ok "disabled drifted-enabled ezgha-watchdog.timer (--without-watchdog)"
+          ok "disabled drifted-enabled ezgha-watchdog.timer"
         else
           bad "failed to disable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
         fi
       fi
+      systemctl --user stop ezgha-watchdog.service 2>/dev/null || true
     fi
   fi
 fi

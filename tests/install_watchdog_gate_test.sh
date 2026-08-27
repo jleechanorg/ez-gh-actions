@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# regression test: install.sh arms the fleet watchdog by default.
+# regression test: install.sh leaves monitoring/watchdog loops disabled by default.
 # A default `./install.sh` run must:
 #   (a) render/copy the ezgha-watchdog.timer/.service unit files
 #       (repo is source, ~/.config/systemd/user is what systemctl reads),
-#   (b) enable `systemctl --user enable --now` for the watchdog timer,
+#   (b) disable a previously armed watchdog timer,
 #   (c) render ezgha-watchdog.service with EZGHA_WATCHDOG_ALLOW_RESTART=1.
-# `./install.sh --without-watchdog` must skip arming and heal drift: if the
-# watchdog timer is already enabled (e.g. an out-of-band re-arm), disable it.
-# `./install.sh --with-watchdog` remains supported (same as default).
+# `./install.sh --without-watchdog` is the default-compatible explicit opt-out.
+# `./install.sh --with-watchdog` remains the explicit opt-in.
 #
 # This drives install.sh's REAL Linux watchdog-gating code path end-to-end
 # with `systemctl`/`docker`/`gh`/`cargo`/`git` stubbed out on PATH -- it
@@ -201,19 +200,43 @@ run_install() {
 # ── Case A: default run arms watchdog ────────────────────────────────────────
 HOME_A="${WORK}/home_a"
 STATE_A="${WORK}/state_a"
-mkdir -p "${HOME_A}"
+mkdir -p "${HOME_A}" "${STATE_A}"
+touch "${STATE_A}/psi-oom-watcher.timer.enabled" # simulate prior installation
+touch "${STATE_A}/ezgha-queue-reaper.timer.enabled" # simulate prior installation
+touch "${STATE_A}/agent-scope-reaper.timer.enabled" # simulate prior installation
+touch "${STATE_A}/ezgha-watchdog.timer.enabled" # simulate prior installation
 run_install "${HOME_A}" "${STATE_A}"
 
-if [ ! -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case A: default run did NOT enable ezgha-watchdog.timer (watchdog armed by default)"
+if [ -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
+  fail "Case A: default run re-enabled ezgha-watchdog.timer"
 else
-  echo "PASS: Case A: default run enabled ezgha-watchdog.timer"
+  echo "PASS: Case A: default run kept ezgha-watchdog.timer disabled"
+fi
+if ! grep -Fqx 'stop ezgha-watchdog.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not stop an in-flight ezgha-watchdog.service"
+else
+  echo "PASS: Case A: default install stopped ezgha-watchdog.service"
 fi
 
-if [ ! -f "${STATE_A}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_A}/ezgha-queue-reaper.timer.enabled" ]; then
-  fail "Case A: default run failed to enable token-refresh/queue-reaper timers"
+if [ ! -f "${STATE_A}/ezgha-token-refresh.timer.enabled" ]; then
+  fail "Case A: default run failed to enable token-refresh timer"
 else
-  echo "PASS: Case A: default run still enabled token-refresh + queue-reaper timers"
+  echo "PASS: Case A: default run still enabled token-refresh timer"
+fi
+if [ -f "${STATE_A}/ezgha-queue-reaper.timer.enabled" ]; then
+  fail "Case A: default install re-enabled retired queue-reaper timer"
+else
+  echo "PASS: Case A: default install kept queue-reaper timer disabled"
+fi
+if ! grep -Fqx 'disable --now ezgha-queue-reaper.timer' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not disable a drifted queue-reaper timer"
+else
+  echo "PASS: Case A: default install disabled a drifted queue-reaper timer"
+fi
+if ! grep -Fqx 'stop ezgha-queue-reaper.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not stop an in-flight queue-reaper service"
+else
+  echo "PASS: Case A: default install stopped queue-reaper service"
 fi
 
 rendered_timer="${HOME_A}/.config/systemd/user/ezgha-watchdog.timer"
@@ -244,11 +267,36 @@ for unit in app-lima-vm.slice agents.slice automation.slice \
     fail "Case A: host control unit was not installed: ${unit}"
   fi
 done
-for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-  if [ ! -f "${STATE_A}/${timer}.enabled" ]; then
-    fail "Case A: host control timer was not enabled: ${timer}"
-  fi
-done
+if [ -f "${STATE_A}/agent-scope-reaper.timer.enabled" ]; then
+  fail "Case A: default install re-enabled retired agent-scope-reaper.timer"
+else
+  echo "PASS: Case A: default install kept agent-scope-reaper.timer disabled"
+fi
+if ! grep -Fqx 'disable --now agent-scope-reaper.timer' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not disable a drifted agent-scope-reaper.timer"
+else
+  echo "PASS: Case A: default install disabled a drifted agent-scope-reaper.timer"
+fi
+if ! grep -Fqx 'stop agent-scope-reaper.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not stop an in-flight agent-scope-reaper.service"
+else
+  echo "PASS: Case A: default install stopped agent-scope-reaper.service"
+fi
+if [ -f "${STATE_A}/psi-oom-watcher.timer.enabled" ]; then
+  fail "Case A: default install re-enabled retired psi-oom-watcher.timer"
+else
+  echo "PASS: Case A: default install kept psi-oom-watcher.timer disabled"
+fi
+if ! grep -Fqx 'disable --now psi-oom-watcher.timer' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not explicitly heal a previously enabled psi-oom-watcher.timer"
+else
+  echo "PASS: Case A: default install disabled a drifted psi-oom-watcher.timer"
+fi
+if ! grep -Fqx 'stop psi-oom-watcher.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not stop an in-flight psi-oom-watcher.service"
+else
+  echo "PASS: Case A: default install stopped psi-oom-watcher.service"
+fi
 for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
@@ -315,10 +363,15 @@ else
   echo "PASS: Case C: --with-watchdog enabled ezgha-watchdog.timer"
 fi
 
-if [ ! -f "${STATE_C}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_C}/ezgha-queue-reaper.timer.enabled" ]; then
-  fail "Case C: --with-watchdog run failed to also enable token-refresh/queue-reaper timers"
+if [ ! -f "${STATE_C}/ezgha-token-refresh.timer.enabled" ]; then
+  fail "Case C: --with-watchdog run failed to also enable token-refresh timer"
 else
-  echo "PASS: Case C: --with-watchdog run still enabled token-refresh + queue-reaper timers"
+  echo "PASS: Case C: --with-watchdog run still enabled token-refresh timer"
+fi
+if [ -f "${STATE_C}/ezgha-queue-reaper.timer.enabled" ]; then
+  fail "Case C: --with-watchdog unexpectedly enabled retired queue-reaper timer"
+else
+  echo "PASS: Case C: --with-watchdog kept queue-reaper timer disabled"
 fi
 
 # ── Case E: uninstall restores a pre-existing CLI symlink and removes host controls.

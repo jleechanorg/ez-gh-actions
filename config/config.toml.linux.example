@@ -43,3 +43,14 @@ slot_failure_window_secs = 600
 slot_cooldown_secs = 900
 fleet_open_slot_threshold = 3
 fleet_cooldown_secs = 600
+
+# Read-only auxiliary observers stay opt-in on Linux so they cannot compete
+# with the core serve reconciliation loop or become host-pressure voters.
+[queue_monitor]
+enabled = false
+
+[canary]
+enabled = false
+
+[invariant_sampler]
+enabled = false
