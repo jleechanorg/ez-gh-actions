@@ -844,13 +844,23 @@ EOF
         bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
       fi
     done
-    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+    for timer in agent-scope-reaper.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user host-control timer enabled: ${timer}"
       else
         bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
       fi
     done
+    # Retired after the 2026-08-26 incident where the user-scope PSI watcher
+    # selected Warp's AppImage process as its fallback SIGTERM target. Keep the
+    # tracked script/unit installed for audit and manual diagnostics, but heal
+    # any previously enabled timer and stop an invocation already in flight.
+    if systemctl --user disable --now psi-oom-watcher.timer 2>/dev/null \
+       && systemctl --user stop psi-oom-watcher.service 2>/dev/null; then
+      ok "systemd --user PSI OOM watcher disabled by policy"
+    else
+      bad "failed to disable psi-oom-watcher (run: systemctl --user status psi-oom-watcher.timer psi-oom-watcher.service)"
+    fi
     # ezgha-watchdog.timer: armed by default (restart enabled via
     # Environment=EZGHA_WATCHDOG_ALLOW_RESTART=1 in ezgha-watchdog.service).
     # Pass --without-watchdog to skip arming and heal drift.

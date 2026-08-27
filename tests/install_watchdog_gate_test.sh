@@ -199,7 +199,8 @@ run_install() {
 # ── Case A: default run arms watchdog ────────────────────────────────────────
 HOME_A="${WORK}/home_a"
 STATE_A="${WORK}/state_a"
-mkdir -p "${HOME_A}"
+mkdir -p "${HOME_A}" "${STATE_A}"
+touch "${STATE_A}/psi-oom-watcher.timer.enabled" # simulate prior installation
 run_install "${HOME_A}" "${STATE_A}"
 
 if [ ! -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
@@ -242,11 +243,24 @@ for unit in app-lima-vm.slice agents.slice automation.slice \
     fail "Case A: host control unit was not installed: ${unit}"
   fi
 done
-for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-  if [ ! -f "${STATE_A}/${timer}.enabled" ]; then
-    fail "Case A: host control timer was not enabled: ${timer}"
-  fi
-done
+if [ ! -f "${STATE_A}/agent-scope-reaper.timer.enabled" ]; then
+  fail "Case A: agent-scope-reaper.timer was not enabled"
+fi
+if [ -f "${STATE_A}/psi-oom-watcher.timer.enabled" ]; then
+  fail "Case A: default install re-enabled retired psi-oom-watcher.timer"
+else
+  echo "PASS: Case A: default install kept psi-oom-watcher.timer disabled"
+fi
+if ! grep -Fqx 'disable --now psi-oom-watcher.timer' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not explicitly heal a previously enabled psi-oom-watcher.timer"
+else
+  echo "PASS: Case A: default install disabled a drifted psi-oom-watcher.timer"
+fi
+if ! grep -Fqx 'stop psi-oom-watcher.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not stop an in-flight psi-oom-watcher.service"
+else
+  echo "PASS: Case A: default install stopped psi-oom-watcher.service"
+fi
 for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
