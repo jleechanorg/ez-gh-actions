@@ -1590,8 +1590,8 @@ pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 # --- Gate 9: synthetic pressure harness prohibition ---
 # Host-safety validation must not create the failure it is trying to detect.
 # The retired live pressure harness could allocate many GiB and dispatch a
-# concurrent runner burst. Gate 9 runs the hermetic policy regression instead;
-# capacity and containment are proven by the read-only gates above.
+# concurrent runner burst. Gate 9 runs the hermetic policy regression instead.
+# It proves repository policy only; it is not a live host-survival proof.
 echo "--- Checking Gate 9: Host-lifecycle safety policy ---"
 HOST_SAFETY_TEST="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/tests/forbid_host_reboot_primitives_test.sh"
 if ! bash "${HOST_SAFETY_TEST}"; then
@@ -1611,5 +1611,5 @@ fi
 pass "Gate 10: GitHub API budget is healthy ($REMAINING_API/$LIMIT_API remaining)"
 
 echo "==================================================="
-echo -e "${GREEN}ALL AUTO GATES PASS EXCELLENTLY!${NC}"
+echo -e "${GREEN}ALL AUTOMATED CHECKS PASSED; LIVE HOST SURVIVAL IS NOT PROVED${NC}"
 exit 0

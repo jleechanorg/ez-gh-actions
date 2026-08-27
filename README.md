@@ -18,8 +18,8 @@ The full design — including the 32-agent adversarial review that shaped v1 —
 
 ## Host-survival failure ladder (Jeff-Ubuntu)
 
-The production capacity contract is **10 Linux runners plus 6 Mac runners**. The
-any observed Linux shortfall is a live failure, not a reduced contract, and the
+The production capacity contract is **10 Linux runners plus 6 Mac runners**.
+Any observed Linux shortfall is a live failure, not a reduced contract, and the
 host-survival verdict remains **FAIL** until the live criteria in the
 [Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md) pass together.
 

@@ -534,6 +534,27 @@ if [ "${SETTLING_HITS:-0}" -gt 3 ] 2>/dev/null; then
   warn "daemon logged $SETTLING_HITS 'settling ceiling reached' warning(s) in the $PRESSURE_LOG_SCOPE -- container respawns are running slower than expected, consistent with host congestion above"
 fi
 
+# --- D3. forbidden host lifecycle authority (read-only) ------------------
+HOST_LIFECYCLE_CRITICAL=0
+if [ "$PLATFORM" = "linux" ]; then
+  section "6c. forbidden host lifecycle authority"
+  if systemctl is-active --quiet watchdog.service 2>/dev/null || \
+     systemctl is-enabled --quiet watchdog.service 2>/dev/null; then
+    bad "system watchdog.service is active or boot-enabled; physical-host lifecycle authority must be operator-only"
+    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
+  else
+    ok "system watchdog.service is inactive and not boot-enabled"
+  fi
+  PANIC_TIMEOUT=$(sysctl -n kernel.panic 2>/dev/null || echo unknown)
+  PANIC_ON_OOPS=$(sysctl -n kernel.panic_on_oops 2>/dev/null || echo unknown)
+  if [ "$PANIC_TIMEOUT" != "0" ] || [ "$PANIC_ON_OOPS" != "0" ]; then
+    bad "kernel auto-recovery is armed (kernel.panic=${PANIC_TIMEOUT}, kernel.panic_on_oops=${PANIC_ON_OOPS}); operator must disarm it"
+    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
+  else
+    ok "kernel panic and oops auto-recovery are disabled"
+  fi
+fi
+
 # --- E. recent routing proof: jobs REALLY ran on the configured fleet -----
 # "online" is not "working". This section proves recent GitHub Actions jobs
 # were actually EXECUTED by configured-prefix runners by reading each run's
@@ -1296,6 +1317,10 @@ else
   echo "  queue: 0 queued job(s) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 fi
 CRITICAL=0
+if [ "${HOST_LIFECYCLE_CRITICAL:-0}" -gt 0 ]; then
+  bad "verdict: physical-host lifecycle-authority gate FAILED (${HOST_LIFECYCLE_CRITICAL} critical setting(s); see section 6c)"
+  CRITICAL=$((CRITICAL + HOST_LIFECYCLE_CRITICAL))
+fi
 # Every increment below prints a named [BAD] line at the point of increment —
 # fail-loud requirement (ez-gh-actions-nj2j): the motivating incident was a
 # verdict of "1 critical check(s) failed" with ZERO [BAD] lines anywhere in

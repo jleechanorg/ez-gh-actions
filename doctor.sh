@@ -490,31 +490,9 @@ else
   warn "serve-loop starvation signal skipped on $PLATFORM (no per-line timestamps in launchd log redirect)"
 fi
 
-# === 10. forbidden host lifecycle authority (read-only) ===
-HOST_LIFECYCLE_CRITICAL=0
-if [ "$PLATFORM" = "linux" ]; then
-  section "10. forbidden host lifecycle authority"
-  if systemctl is-active --quiet watchdog.service 2>/dev/null || \
-     systemctl is-enabled --quiet watchdog.service 2>/dev/null; then
-    bad "system watchdog.service is active or boot-enabled; physical-host lifecycle authority must be operator-only"
-    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL+1))
-  else
-    ok "system watchdog.service is inactive and not boot-enabled"
-  fi
-  panic_timeout=$(sysctl -n kernel.panic 2>/dev/null || echo unknown)
-  panic_on_oops=$(sysctl -n kernel.panic_on_oops 2>/dev/null || echo unknown)
-  if [ "$panic_timeout" != "0" ] || [ "$panic_on_oops" != "0" ]; then
-    bad "kernel auto-recovery is armed (kernel.panic=${panic_timeout}, kernel.panic_on_oops=${panic_on_oops}); operator must disarm it"
-    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL+1))
-  else
-    ok "kernel panic and oops auto-recovery are disabled"
-  fi
-fi
-
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
 CRITICAL=0
-[ "${HOST_LIFECYCLE_CRITICAL:-0}" -gt 0 ]   && CRITICAL=$((CRITICAL + HOST_LIFECYCLE_CRITICAL))
 [ "$SERVICE_STATE" != "active" ]            && CRITICAL=$((CRITICAL+1))
 [ "$COLIMA_STATUS" = "Stopped" ]            && CRITICAL=$((CRITICAL+1))
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
