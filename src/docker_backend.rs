@@ -43,21 +43,12 @@ const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
-// Post-refill readiness gets one 5s shared local-Docker budget. At the normal
+// Post-refill readiness gets one 30s shared local-Docker budget. At the normal
 // sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
-// under host pressure, a single probe may use up to 1s and the shared deadline
+// under host pressure, a single probe may use up to 3s and the shared deadline
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
 // full reconciliation. The probe budget is far below the 300s watchdog margin.
-//
-// Bead jleechan-viff follow-up (2026-08-01): the previous 5s budget was
-// insufficient for 6 sequential `docker top` calls (each capped at
-// `LOCAL_TOP_TIMEOUT: 1s`; 6 × 1s = 6s ≯ 5s) under host pressure — caused
-// the budget-exhausted path to fire on the 6th container, emitting a
-// false-positive CRITICAL even though the runner-present fix (PR #112) was
-// already in place. Raised to 30s so 6 probes comfortably fit (6 × 1s = 6s
-// + safety margin) and the runner-present check actually runs to completion.
-// Still well under the 300s watchdog margin.
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -501,7 +492,37 @@ fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
     );
 }
 
+fn reap_killed_child_until_deadline(child: &mut std::process::Child, deadline: Instant) {
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
+}
+
+fn docker_timeout<T>(
+    child: &mut std::process::Child,
+    detail: &str,
+    timeout: Duration,
+    deadline: Instant,
+) -> Result<T> {
+    reap_killed_child_until_deadline(child, deadline);
+    bail!(
+        "docker CLI timed out after {}ms while {detail}",
+        timeout.as_millis()
+    );
+}
+
 fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -529,24 +550,36 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
         let _ = tx_err.send(buf);
     });
 
-    let stdout = match rx_out.recv_timeout(timeout) {
+    let stdout = match rx_out.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(buf) => buf,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "docker CLI timed out after {}ms while {detail}",
-                timeout.as_millis()
-            );
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return docker_timeout(&mut child, detail, timeout, deadline);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+    let stderr = match rx_err.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(buf) => buf,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return docker_timeout(&mut child, detail, timeout, deadline);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return docker_timeout(&mut child, detail, timeout, deadline);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("wait for docker CLI during {detail}"));
+            }
         }
     };
-    let stderr = rx_err
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_default();
-
-    let status = child
-        .wait()
-        .with_context(|| format!("wait for docker CLI during {detail}"))?;
     Ok(Output {
         status,
         stdout,
@@ -2786,6 +2819,11 @@ fn readiness_probe_timeout(remaining: Duration) -> Duration {
     remaining.min(LOCAL_TOP_TIMEOUT)
 }
 
+fn readiness_probe_timeout_until(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then(|| readiness_probe_timeout(remaining))
+}
+
 fn executing_runner_count_from_containers(
     cfg: &Config,
     containers: &[ManagedContainer],
@@ -2809,16 +2847,15 @@ fn executing_runner_count_from_containers(
     let mut executing = 0;
     #[cfg(not(test))]
     for container in owned {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!(
-                "Runner.Worker readiness budget expired before inspecting {}",
-                container.name
-            );
-        }
+        let timeout =
+            readiness_probe_timeout_until(deadline, Instant::now()).with_context(|| {
+                format!(
+                    "Runner.Worker readiness budget expired before inspecting {}",
+                    container.name
+                )
+            })?;
         let mut cmd = docker_cmd();
         cmd.args(["top", &container.id, "-eo", "pid,comm"]);
-        let timeout = readiness_probe_timeout(remaining);
         let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
             .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
         if !out.status.success() {
@@ -2849,7 +2886,8 @@ fn executing_runner_count_from_containers(
 /// workflow jobs.
 pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
-    let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
+    let containers =
+        managed_containers_with_timeout(deadline.saturating_duration_since(Instant::now()))?;
     executing_runner_count_from_containers(cfg, &containers, deadline)
 }
 
@@ -3536,12 +3574,13 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     let _ = release_stale_slots(cfg);
 
     let refill = refill?;
-    let containers_after = managed_containers().context("post-refill local container recount")?;
-    let readiness_after = executing_runner_count_from_containers(
-        cfg,
-        &containers_after,
-        Instant::now() + LOCAL_READINESS_BUDGET,
-    );
+    let readiness_deadline = Instant::now() + LOCAL_READINESS_BUDGET;
+    let containers_after = managed_containers_with_timeout(
+        readiness_deadline.saturating_duration_since(Instant::now()),
+    )
+    .context("post-refill local container recount")?;
+    let readiness_after =
+        executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
     let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
         Ok(alive_after) => (cfg.runner.count.saturating_sub(alive_after), None),
         Err(error) => {
@@ -4193,6 +4232,25 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn run_docker_timeout_covers_stderr_and_reaping() {
+        let start = Instant::now();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exec 1>&-; exec sleep 30"]);
+        let result = run_docker_with_timeout(
+            cmd,
+            "hung docker command with closed stdout simulation",
+            Duration::from_millis(200),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "hung command should timeout");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stderr and process reaping must share the deadline, got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
     fn start_missing_runners_starts_full_shortfall_directly() {
         // Regression guard for the po2 throttle removal (watchdog relaxed to
         // max-load-1=96 on 2026-07-07): with N missing and N successful
@@ -4547,6 +4605,32 @@ minimum_isolation = "container"
         assert_eq!(
             readiness_probe_timeout(Duration::from_millis(500)),
             Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn readiness_probes_share_deadline_and_stop_after_it() {
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+
+        // The first probes get the normal per-probe cap, while the final
+        // probe receives only the budget left at that point.
+        assert_eq!(
+            readiness_probe_timeout_until(deadline, start),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            readiness_probe_timeout_until(deadline, start + Duration::from_secs(2)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            readiness_probe_timeout_until(deadline, start + Duration::from_secs(28)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            readiness_probe_timeout_until(deadline, start + LOCAL_READINESS_BUDGET),
+            None,
+            "no new container probe may start after the shared deadline"
         );
     }
 
