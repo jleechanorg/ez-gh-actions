@@ -8,6 +8,12 @@ Goal criterion:
 [ez-gh-actions-fkbm](https://github.com/jleechanorg/ez-gh-actions/issues/126)
 criterion 5 (one `crashkernel=`, `kexec_crash_loaded=1`, vmcore proof).
 
+`scripts/host/configure-grub-kdump.sh` is retired. It is now a refusal-only
+entrypoint: direct invocation exits `1` before any root, filesystem, package,
+or service command and directs operators to
+`scripts/host/apply-cfs-nohz-panic-stop.sh` plus this maintenance-window
+procedure. Do not revive or replace that legacy script.
+
 Read-only snapshot taken 2026-08-26 on host `Jeff-Ubuntu`
 (`6.17.0-29-generic`). Live `/proc/cmdline` has **both**:
 
@@ -42,10 +48,11 @@ plus a broken quoted assignment if the `\n` lands inside the
 un-reserve a duplicate already on the running cmdline. Criterion 5 of
 `ez-gh-actions-fkbm` explicitly says: never run that sed.
 
-Also do **not** run `scripts/host/configure-grub-kdump.sh` for this
-window. It strips `crashkernel=` from `/etc/default/grub` and writes
-`crashkernel=2G` there, while leaving `kdump-tools.cfg`'s
-`crashkernel=512M,high` in place — another duplicate, just with `2G`.
+The retired `scripts/host/configure-grub-kdump.sh` must not be revived for
+this window. Its legacy implementation stripped `crashkernel=` from
+`/etc/default/grub` and wrote `crashkernel=2G` there while leaving
+`kdump-tools.cfg`'s `crashkernel=512M,high` in place — another duplicate,
+just with `2G`.
 
 ## Live sources (quoted 2026-08-26, read-only)
 

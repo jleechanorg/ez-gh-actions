@@ -27,7 +27,12 @@ Same bug as 08:24, 22:46, 00:37. **count=5 did not stop it.**
 OPERATOR-ONLY: `sudo bash scripts/host/apply-cfs-nohz-panic-stop.sh`
 then OPERATOR-ONLY: `sudo reboot`
 
-Never run `ez-gh-actions-8rx2` or `scripts/host/configure-grub-kdump.sh` (adds another `crashkernel=`).
+`scripts/host/configure-grub-kdump.sh` is retired and now refuses every
+invocation before it runs a host command. Use the supported procedure above
+and the maintenance-window note below; never revive or substitute the legacy
+script. Never run `ez-gh-actions-8rx2` (it adds another `crashkernel=`).
+
+Maintenance-window details: `docs/notes/kdump-dedup-maint-window.md`.
 
 ## What will not stop it
 
