@@ -29,6 +29,8 @@ FORBIDDEN_FILES=(
   "config/grub.d/zz-ezgha-nohz-panic.cfg"
   "systemd/ezgha-watchdog.service"
   "systemd/ezgha-watchdog.timer"
+  "docs/watchdog.md"
+  "scripts/host/host-pressure-proof.sh"
   "tests/apply_cfs_nohz_panic_stop_test.sh"
   "tests/apply_watchdog_no_reboot_vote_test.sh"
   "tests/assert_no_host_reboot_vote_test.sh"
@@ -46,7 +48,34 @@ if [ "$FAILURES" -eq 0 ]; then
   ok "No forbidden files exist in repo"
 fi
 
-# 2. Scan active code (src/, scripts/, systemd/, install.sh) for forbidden host reboot / forced-panic primitives
+# 2. Assert active operational documents and verifiers do not point operators
+# at retired host-lifecycle automation. Historical incident records may retain
+# names for provenance, so keep this list deliberately bounded.
+FORBIDDEN_ACTIVE_REFERENCES=(
+  "scripts/host/kdump-remediation.sh"
+  "scripts/host/apply-watchdog-no-reboot-vote.sh"
+  "scripts/host/assert-no-host-reboot-vote.sh"
+  "scripts/host/watchdog-load-repair.sh"
+  "systemd/ezgha-watchdog.service"
+  "systemd/ezgha-watchdog.timer"
+  "scripts/host/host-pressure-proof.sh"
+)
+ACTIVE_DOCUMENTS=(
+  "README.md"
+  "DESIGN.md"
+  "docs/verify-exit-criteria.sh"
+  "docs/superpowers/plans/2026-08-26-borg-failure-ladder.md"
+  ".claude/skills/ezgha-doctor/SKILL.md"
+  ".claude/commands/doctor-ezactions.md"
+)
+
+for rel in "${FORBIDDEN_ACTIVE_REFERENCES[@]}"; do
+  if grep -Fn -- "$rel" "${ACTIVE_DOCUMENTS[@]/#/${REPO_ROOT}/}" 2>/dev/null; then
+    fail "Active operational guidance references retired host automation: ${rel}"
+  fi
+done
+
+# 3. Scan active code (src/, scripts/, systemd/, install.sh) for forbidden host reboot / forced-panic primitives
 # Forbidden patterns in executable / configuration files:
 # - sysrq trigger (echo c > /proc/sysrq-trigger, etc.)
 # - host reboot/shutdown commands (systemctl reboot, /sbin/reboot, shutdown -r, poweroff, etc.)

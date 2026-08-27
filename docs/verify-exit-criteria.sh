@@ -345,9 +345,7 @@ verify_kdump_pstore() {
     local pstore_root="${VERIFY_EXIT_CRITERIA_PSTORE_ROOT:-/sys/fs/pstore}"
     local kexec_crash_loaded_path="${VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH:-/sys/kernel/kexec_crash_loaded}"
     local kdump_dir="${VERIFY_EXIT_CRITERIA_KDUMP_DIR:-/var/crash}"
-    local remediation="${VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION:-${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/kdump-remediation.sh}"
     kdump_fail() {
-        "$remediation"
         fail "$1"
     }
     # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
@@ -370,9 +368,9 @@ verify_kdump_pstore() {
     fi
     # (3) Kernel-panic capture lives in /sys/kernel/kexec_crash_loaded:
     #     when kdump has kexec-loaded the crash kernel, this reads '1'.
-    #     If the kernel was rebooted after the supported kdump remediation
-    #     but kexec_crash_loaded is still 0, the crash kernel did NOT load
-    #     — either GRUB picked the wrong cmdline or crashkernel= is wrong.
+    #     A value other than 1 means the crash kernel is not armed on this
+    #     running boot. This verifier reports that state but never changes
+    #     boot configuration or host lifecycle state.
     if [ ! -f "$kexec_crash_loaded_path" ]; then
         kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is missing (kdump kernel never installed)"
     fi
@@ -387,13 +385,37 @@ verify_kdump_pstore() {
     #     cannot land and the panic capture is silently lost (kexec
     #     loads the crash kernel, then the crash kernel mounts the root
     #     filesystem and writes here; if this path is unwritable, kdump
-    #     fails its post-reboot handshake and produces no vmcore).
+    #     produces no vmcore).
     if [ ! -d "$kdump_dir" ]; then
-        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir does not exist; kdump has no dump target. Remediation: install kdump-tools, then sudo install -d -m 0755 /var/crash and follow scripts/host/kdump-remediation.sh."
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir does not exist; kdump has no dump target. Operator action is required outside this verifier."
     fi
     if ! kdump_target_mount_is_writable "$kdump_dir"; then
         kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir is not on a verifiably writable mount; kernel cannot save vmcores here."
     fi
+}
+
+verify_fresh_canary() {
+    local canary_config="$1"
+    local canary_timeout_seconds="${2:-600}"
+    local ezgha_bin="${VERIFY_EXIT_CRITERIA_EZGHA_BIN:-$HOME/.cargo/bin/ezgha}"
+    if [ ! -f "$canary_config" ]; then
+        fail "Gate 4: canary config file not found at $canary_config"
+    fi
+    local canary_name_prefix canary_out canary_run_id canary_runner canary_tts
+    canary_name_prefix=$(CONFIG_FILE="$canary_config" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
+    if ! canary_out=$("$ezgha_bin" --config "$canary_config" canary-once --timeout-seconds "$canary_timeout_seconds" 2>&1); then
+        echo "$canary_out"
+        fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${canary_name_prefix}-* using $canary_config"
+    fi
+    echo "$canary_out"
+    canary_run_id=$(echo "$canary_out" | jq -r '.run_id // empty' 2>/dev/null || true)
+    canary_runner=$(echo "$canary_out" | jq -r '.runner_name // empty' 2>/dev/null || true)
+    canary_tts=$(echo "$canary_out" | jq -r '.time_to_start_seconds // empty' 2>/dev/null || true)
+    if [ -z "$canary_run_id" ] || [ -z "$canary_runner" ]; then
+        fail "Gate 4: canary output lacked run_id or runner_name"
+    fi
+    echo "    [INFO] Fresh canary run $canary_run_id started on $canary_runner in ${canary_tts:-?}s"
+    pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
 if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
@@ -403,6 +425,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         containers) verify_managed_runners_in_actions_slice ;;
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
+        canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
     exit $?
@@ -678,8 +701,8 @@ EXPECTED_RUNNING=0
 # ⇒ headroom = 2768 MiB (≈2.7 GiB) for host reserve / cgroup overhead / sibling slots.
 # Prior value 3100 × 10 = 31000 MiB (≈30.3 GiB) ⇒ only 1768 MiB (≈1.7 GiB) headroom
 # (too tight under load). Lowering memory_mb from 3100 → 3000 widens the safety
-# margin so the host-watchdog (`max-load-1 = 24`) is less likely to trip under
-# aggregate memory pressure. Restart pending deploy-owner (single-writer rule).
+# margin so aggregate runner memory remains inside the finite VM envelope.
+# Deployment remains pending the designated deploy-owner (single-writer rule).
 for slot in $(seq 1 "$COUNT"); do
     SLOT_NAME="${NAME_PREFIX}-${slot}"
     retry=0
@@ -859,23 +882,7 @@ pass "Gate 3: Full local per-slot capacity and envelope enforcement proof passed
 echo "--- Checking Gate 4: Real job execution ---"
 CANARY_TIMEOUT_SECONDS="${CANARY_TIMEOUT_SECONDS:-600}"
 CANARY_CONFIG="${CANARY_CONFIG_FILE:-$CONFIG_FILE}"
-if [ ! -f "$CANARY_CONFIG" ]; then
-    fail "Gate 4: canary config file not found at $CANARY_CONFIG"
-fi
-CANARY_NAME_PREFIX=$(CONFIG_FILE="$CANARY_CONFIG" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
-if ! CANARY_OUT=$(~/.cargo/bin/ezgha --config "$CANARY_CONFIG" canary-once --timeout-seconds "$CANARY_TIMEOUT_SECONDS" 2>&1); then
-    echo "$CANARY_OUT"
-    fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${CANARY_NAME_PREFIX}-* using $CANARY_CONFIG"
-fi
-echo "$CANARY_OUT"
-CANARY_RUN_ID=$(echo "$CANARY_OUT" | jq -r '.run_id // empty' 2>/dev/null || true)
-CANARY_RUNNER=$(echo "$CANARY_OUT" | jq -r '.runner_name // empty' 2>/dev/null || true)
-CANARY_TTS=$(echo "$CANARY_OUT" | jq -r '.time_to_start_seconds // empty' 2>/dev/null || true)
-if [ -z "$CANARY_RUN_ID" ] || [ -z "$CANARY_RUNNER" ]; then
-    fail "Gate 4: canary output lacked run_id or runner_name"
-fi
-echo "    [INFO] Fresh canary run $CANARY_RUN_ID started on $CANARY_RUNNER in ${CANARY_TTS:-?}s"
-pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $CANARY_CONFIG"
+verify_fresh_canary "$CANARY_CONFIG" "$CANARY_TIMEOUT_SECONDS"
 
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"
@@ -1580,117 +1587,17 @@ fi
 
 pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 
-# --- Gate 9: Controlled host-pressure proof (bead ez-gh-actions-bjpk, R3 lane L) ---
-# This gate invokes scripts/host/host-pressure-proof.sh — the executable
-# proof that the three host-reliability lanes (I: PSI/hysteresis admission
-# refusal in src/docker_backend.rs::eval_admission; J: 4-stage
-# drain→reclaim→verify→escalate shed chain in
-# scripts/host/psi-oom-watcher.sh; K: kernel-panic harness in
-# scripts/host/crash-capture-verify.sh) work together under live pressure
-# without OOM, watchdog reboot, or QEMU cgroup ceiling breach.
-#
-# r3f8 cold-review fix (round-4): a dry-run is a precondition check, NOT a
-# pressure proof. The previous Gate 9 wired `--dry-run` as the DEFAULT and
-# PASSed on its exit 0 — which meant the gate could report green without
-# ever applying real pressure. The fix flips the default: the script now
-# exits 64 from --dry-run (refusal, "proof not attempted"); the verifier
-# Gate 9 treats exit 64 as FAIL unless HPP_LIVE=1 is explicitly set.
-#
-# r3f9 enforcement: any canary failure, runner-count loss > 10%, or missing
-# admission-refusal alert now aborts the live proof (exit 1). The script
-# also enforces runner_count concurrency (no hardcoded 3).
-#
-# Two modes:
-#   * DEFAULT (HPP_LIVE != 1): the verifier invokes --dry-run, expects
-#     exit 64, prints a SKIP notice, and FAILs Gate 9. Normal CI hits this
-#     path unless the operator opts in with HPP_LIVE=1.
-#   * LIVE (HPP_LIVE=1): the verifier invokes --live with HPP_LIVE=1 set;
-#     requires exit 0 for PASS. Operator-gated — pressures the host for
-#     ~60s with stress-ng inside agents.slice, dispatches runner_count
-#     concurrent canaries, enforces any-canary-fail / runner-loss >10% /
-#     missing-admission-refusal / OOM / recovery-fail. NEVER auto-enable
-#     in CI without an explicit operator ack that the live host is fair
-#     game.
-#
-# The script also exits 33 ("HPP_LIVE=1 required") if invoked with no flag
-# and no env. The verifier treats 33 as "proof not attempted" too, so a
-# missing-env invocation fails Gate 9.
-#
-# Mac parity (bead ez-gh-actions-r3f16): --mac-hostname is forwarded on
-# both paths so the script can probe the Mac fleet (ssh reachable, colima
-# running, etc.) and the live path can dispatch Mac canaries.
-#
-# Dry-run / refusal timeout defaults to 180s. Live mode defaults to 600s
-# (HPP_TIMEOUT overrides both).
-echo "--- Checking Gate 9: Controlled host-pressure proof (r3f8 dry-run-as-PASS removed) ---"
-if [ "$(uname -s)" = "Darwin" ]; then
-    echo "    [SKIP] Gate 9: host-pressure proof: macOS — stress-ng inside agents.slice is Linux-only"
-    pass "Gate 9: Controlled host-pressure proof (skipped on macOS)"
-else
-HPP_SCRIPT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/host-pressure-proof.sh"
-if [ ! -x "${HPP_SCRIPT}" ]; then
-    fail "Gate 9: host-pressure-proof.sh not found or not executable at ${HPP_SCRIPT}"
+# --- Gate 9: synthetic pressure harness prohibition ---
+# Host-safety validation must not create the failure it is trying to detect.
+# The retired live pressure harness could allocate many GiB and dispatch a
+# concurrent runner burst. Gate 9 runs the hermetic policy regression instead;
+# capacity and containment are proven by the read-only gates above.
+echo "--- Checking Gate 9: Host-lifecycle safety policy ---"
+HOST_SAFETY_TEST="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/tests/forbid_host_reboot_primitives_test.sh"
+if ! bash "${HOST_SAFETY_TEST}"; then
+    fail "Gate 9: host-lifecycle safety policy regression failed"
 fi
-HPP_MAC_HOSTNAME_VAL="${MAC_HOSTNAME:-macbook}"
-HPP_PROOF_OUTPUT=""
-HPP_PROOF_RC=0
-# Always invoke the script (so missing preconditions surface as a hard FAIL
-# regardless of mode). The verifier selects mode by setting HPP_LIVE.
-if [ "${HPP_LIVE:-0}" = "1" ]; then
-    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-600}"
-    # Live: forward HPP_LIVE into the script env. --live sets it inside too,
-    # but forwarding here makes the intent explicit at the verifier boundary.
-    if ! HPP_PROOF_OUTPUT=$(HPP_LIVE=1 timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --live --timeout-seconds "${HPP_TIMEOUT_VAL}" --mac-hostname "${HPP_MAC_HOSTNAME_VAL}" 2>&1); then
-        HPP_PROOF_RC=$?
-    fi
-else
-    # Default mode: invoke --dry-run. The script exits 64 by design (r3f8).
-    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-180}"
-    if ! HPP_PROOF_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --dry-run --mac-hostname "${HPP_MAC_HOSTNAME_VAL}" 2>&1); then
-        HPP_PROOF_RC=$?
-    fi
-fi
-echo "${HPP_PROOF_OUTPUT}"
-# Classify the script's exit code.
-if [ "${HPP_LIVE:-0}" = "1" ]; then
-    case "${HPP_PROOF_RC}" in
-        0)
-            pass "Gate 9: Host absorbed + recovered from controlled pressure (HPP_LIVE=1, r3f9 enforcement active: any canary fail / runner-loss > 10% / missing admission refusal / OOM / recovery-fail → exit 1)"
-            ;;
-        2)
-            fail "Gate 9: HPP_LIVE=1 was set but precondition check failed (exit 2). See host-pressure-proof output above — apply the remediation it printed (start QEMU, enroll agents.slice, install stress-ng, Mac ssh unreachable, etc.)."
-            ;;
-        64|33)
-            fail "Gate 9: HPP_LIVE=1 was set but the script returned ${HPP_PROOF_RC} (refusal). Treat as a script wiring bug — live mode should never refuse on an authorized invocation."
-            ;;
-        *)
-            fail "Gate 9: live host-pressure-proof exited ${HPP_PROOF_RC} — host did not absorb + recover from controlled pressure within budget (Linux path and/or Mac canary burst failed; r3f9 enforcer active)"
-            ;;
-    esac
-else
-    # Default mode: --dry-run is expected to exit 64. Anything other than 64
-    # is a real failure (precondition fail exits 2, e.g. agents.slice not
-    # enrolled; HPP_LIVE missing on default invocation exits 33).
-    case "${HPP_PROOF_RC}" in
-        64)
-            # Expected refusal. Gate 9 FAILs by default (per r3f8) — the
-            # dry-run is NOT a proof. Operator must opt in with HPP_LIVE=1.
-            echo "    [SKIP] dry-run does not prove pressure; set HPP_LIVE=1 (or pass --live) to authorize the live burst"
-            fail "Gate 9: proof not attempted (HPP_LIVE=1 not set). Default invocation only verifies preconditions; only HPP_LIVE=1 + exit 0 counts as a Gate 9 PASS."
-            ;;
-        33)
-            # Distinct refusal: defaulted invocation hit the HPP_LIVE env gate.
-            fail "Gate 9: host-pressure-proof exited 33 (HPP_LIVE=1 required). Default invocation cannot be authorized without HPP_LIVE=1 in the env, OR pass --live explicitly."
-            ;;
-        2)
-            fail "Gate 9: dry-run precondition check failed (exit 2). See host-pressure-proof output above — apply the remediation it printed (start QEMU, enroll agents.slice, install stress-ng, Mac ssh unreachable, etc.)."
-            ;;
-        *)
-            fail "Gate 9: dry-run returned unexpected exit ${HPP_PROOF_RC}. Expected 64 (refusal). Inspect host-pressure-proof.sh output above."
-            ;;
-    esac
-fi
-fi
+pass "Gate 9: Host-lifecycle safety policy is enforced"
 
 # --- Gate 10: GitHub API budget ---
 echo "--- Checking Gate 10: GitHub API budget ---"

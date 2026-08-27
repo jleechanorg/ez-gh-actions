@@ -178,7 +178,7 @@ virtualization; Layer 4 is OS hardening.
 ## Host-survival failure ladder (operational contract)
 
 For the Jeff-Ubuntu fleet, capacity remains **10 Linux plus 6 Mac runners**. A
-temporary Linux count of 5 is a live failure, not a reduced contract. The desired
+Linux capacity below 10 is a live failure, not a reduced contract. The desired
 failure order is deliberately narrow: job/container first, then a single failing slot,
 then admission for the fleet, then the Colima VM under sustained pressure. It does not
 claim that a container or VM can never crash, exhaust, or otherwise affect the host.
@@ -188,15 +188,17 @@ claim that a container or VM can never crash, exhaust, or otherwise affect the h
 | Job/container | Docker limits and ephemeral lifecycle | End the job/container. |
 | Repeated local start failure | `ezgha` persistent per-slot circuit | Quarantine that slot temporarily; leave other eligible slots available. |
 | Systemic start failures | `ezgha` fleet admission circuit | Pause new starts; do not stop the VM or host. |
-| Sustained host pressure | Root-owned watchdog repair | Close admission, shed managed containers, then request a bounded Colima stop. |
-| Host | Watchdog configuration and operator controls | Never vote for a host reboot from runner load/PSI repair. |
+| Sustained host pressure | `ezgha` admission policy and finite cgroups | Close admission and let the smallest bounded child fail. |
+| VM failure | VM supervisor and operator | Contain failure to the VM; runner automation cannot control host lifecycle. |
+| Host | Operator only | Repository automation cannot restart, shut down, or deliberately panic the physical host. |
 
 The Rust daemon may make a bounded **start** request when the Docker/Colima backend is
 genuinely unreachable; admission pauses and local start failures do not trigger it. It
 cannot stop the VM or perform host lifecycle actions. The live verdict remains
-**FAIL** until the companion [ironclad goal](roadmap/host-uncrashable-goal-ironclad-2026-08-26.md)
-proves, together, the live watchdog setting, finite QEMU cgroup limits, resolved
-whole-home 9p, an armed single-crashkernel kdump boot, and restored 10-Linux capacity.
+**FAIL** until the companion [Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md)
+proves, together, absence of boot-enabled host-lifecycle automation, finite QEMU cgroup
+limits, resolved whole-home 9p, read-only crash-capture readiness, and stable
+10-Linux capacity.
 
 ## Origin of this design
 

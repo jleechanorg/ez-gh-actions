@@ -5,8 +5,7 @@ Easy **isolated** self-hosted GitHub Actions runners. One Rust binary that:
 - runs each job in a **fresh ephemeral runner** (GitHub JIT registration — one job, then
   the runner deregisters and its container is removed),
 - applies **hard resource limits** (memory, CPUs, PIDs) to bound an individual job's
-  container; host-survival still requires the outer VM, watchdog, and live operational
-  checks described below,
+  container; aggregate limits and the outer VM bound the fleet,
 - **prefers the strongest isolation the host can deliver** (VM backends on the roadmap;
   Docker and Docker+sysbox today) and **fails closed** when policy demands more than
   the host offers,
@@ -20,9 +19,9 @@ The full design — including the 32-agent adversarial review that shaped v1 —
 ## Host-survival failure ladder (Jeff-Ubuntu)
 
 The production capacity contract is **10 Linux runners plus 6 Mac runners**. The
-temporary Linux count of 5 is an incident workaround, not a capacity target, and the
+any observed Linux shortfall is a live failure, not a reduced contract, and the
 host-survival verdict remains **FAIL** until the live criteria in the
-[ironclad goal](roadmap/host-uncrashable-goal-ironclad-2026-08-26.md) pass together.
+[Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md) pass together.
 
 Containment is an ordered recovery policy, not a literal proof that a container or VM
 can never affect the physical host:
@@ -32,18 +31,19 @@ can never affect the physical host:
 | Job | Runner/container limits | Fail the job or container first. |
 | Repeated slot start failures | `ezgha` persistent circuit ledger | Open only that slot's circuit; other eligible slots continue. |
 | Several open slot circuits | `ezgha` admission policy | Pause new admissions; existing jobs are not force-stopped. |
-| Sustained host pressure after admission closes | Root-owned watchdog repair | Shed managed containers, then make a bounded Colima-stop request if pressure remains. |
-| Physical host | Watchdog configuration and operator controls | No watchdog reboot vote; the Rust daemon cannot stop the VM or perform host lifecycle actions. |
+| Sustained host pressure after admission closes | `ezgha` admission policy and finite cgroups | Stop admitting work; let individual jobs/containers fail within their limits. |
+| VM failure | VM supervisor and operator | Contain the failure to the VM; automated runner code does not control physical-host lifecycle. |
+| Physical host | Operator only | No repository automation may restart, shut down, or deliberately panic the host. |
 
 The daemon retains its existing bounded ability to **start** an unreachable Docker/Colima
 backend after a genuine reachability failure. Admission pauses and local runner-start
-failures do not enter that recovery path; only the root-owned pressure repair may stop
-Colima.
+failures do not enter that recovery path. Automated recovery ends at child boundaries;
+stopping the VM or changing physical-host lifecycle state requires an operator.
 
-The still-open live gaps are whole-home 9p/virtfs, deployment of the watchdog's live
-`repair-maximum=0`, one armed crashkernel with kdump loaded on the current boot, and
-restoring the Linux count from 5 to 10. Repository checks document the intended
-controls; they do not close those live gaps.
+The still-open live gaps are whole-home 9p/virtfs, removal of boot-enabled host-lifecycle
+automation and panic auto-recovery settings, one armed crashkernel with kdump loaded on
+the current boot, and stable proof of all 10 Linux slots executing. Repository checks
+document the intended controls; they do not close those live gaps.
 
 ## How isolation works
 

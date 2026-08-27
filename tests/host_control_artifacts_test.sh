@@ -118,6 +118,7 @@ for forbidden_file in \
   "$REPO_ROOT/config/grub.d/zz-ezgha-nohz-panic.cfg" \
   "$REPO_ROOT/systemd/ezgha-watchdog.service" \
   "$REPO_ROOT/systemd/ezgha-watchdog.timer" \
+  "$REPO_ROOT/scripts/host/host-pressure-proof.sh" \
   "$REPO_ROOT/scripts/ezgha-fleet-watchdog.sh"; do
   [ ! -e "$forbidden_file" ] || fail "forbidden watchdog/reboot artifact still exists: $forbidden_file"
 done
