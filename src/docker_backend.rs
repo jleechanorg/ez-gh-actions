@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Once, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -87,6 +87,11 @@ static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<
 /// `start_one_releases_slot_on_docker_run_failure` for the only user.
 #[cfg(test)]
 static TEST_DOCKER_BIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_DOCKER_REAPER_PANIC_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_DOCKER_REAPER_PANIC_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Test seam for `docker_cpu_controller_available`. When a test installs
 /// `Some(b)` via `cpu_probe_overrides::set`, the public function returns `b`
@@ -517,23 +522,27 @@ struct DockerReapRequest {
     detail: String,
 }
 
+struct DockerReapQueue {
+    pending: Mutex<VecDeque<DockerReapRequest>>,
+    wake: Condvar,
+}
+
 struct DockerChildReaper {
-    sender: mpsc::Sender<DockerReapRequest>,
-    recovery: Arc<Mutex<VecDeque<DockerReapRequest>>>,
+    queue: Arc<DockerReapQueue>,
 }
 
 static DOCKER_CHILD_REAPER: OnceLock<std::result::Result<DockerChildReaper, String>> =
     OnceLock::new();
 
-fn retry_wait_until_reaped<T, E, F>(mut owner: T, mut wait: F, detail: &str) -> T
+fn retry_wait_until_reaped<T, E, F>(owner: &mut T, mut wait: F, detail: &str)
 where
     E: std::fmt::Display,
     F: FnMut(&mut T) -> std::result::Result<(), E>,
 {
     loop {
-        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait(&mut owner)));
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait(owner)));
         match attempt {
-            Ok(Ok(())) => return owner,
+            Ok(Ok(())) => return,
             Ok(Err(error)) => {
                 eprintln!("warning: Docker child wait failed while {detail}: {error}; retrying");
             }
@@ -548,56 +557,98 @@ where
 }
 
 #[allow(clippy::zombie_processes)]
-fn reap_owned_docker_child(request: DockerReapRequest) {
-    let DockerReapRequest { child, detail } = request;
-    let _child = retry_wait_until_reaped(
-        child,
+fn reap_owned_docker_child(request: &mut DockerReapRequest) {
+    retry_wait_until_reaped(
+        &mut request.child,
         |child| child.wait().map(|_| ()).map_err(|error| error.to_string()),
-        &detail,
+        &request.detail,
     );
 }
 
-fn docker_child_reaper_loop(
-    receiver: mpsc::Receiver<DockerReapRequest>,
-    recovery: Arc<Mutex<VecDeque<DockerReapRequest>>>,
-) {
-    loop {
-        let request = recovery
+impl DockerReapQueue {
+    fn enqueue(&self, request: DockerReapRequest) {
+        self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pop_front();
-        let request = request.or_else(|| match receiver.recv_timeout(DOCKER_REAPER_RETRY_DELAY) {
-            Ok(request) => Some(request),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!(
-                    "error: Docker child reaper queue disconnected; draining its recovery queue"
-                );
-                None
+            .push_back(request);
+        self.wake.notify_one();
+    }
+
+    fn next(&self) -> DockerReapRequest {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            #[cfg(test)]
+            if TEST_DOCKER_REAPER_PANIC_ONCE.swap(false, Ordering::SeqCst) {
+                TEST_DOCKER_REAPER_PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                panic!("injected Docker child reaper worker panic");
             }
-        });
-        if let Some(request) = request {
-            reap_owned_docker_child(request);
+            if let Some(request) = pending.pop_front() {
+                return request;
+            }
+            pending = self
+                .wake
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+fn docker_child_reaper_worker(
+    queue: Arc<DockerReapQueue>,
+    ready_sender: Option<mpsc::SyncSender<()>>,
+) {
+    if let Some(ready_sender) = ready_sender {
+        let _ = ready_sender.send(());
+    }
+    loop {
+        let mut request = queue.next();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reap_owned_docker_child(&mut request);
+        }));
+        if outcome.is_err() {
+            queue.enqueue(request);
+            eprintln!("error: Docker child reaper recovered a worker panic");
+        }
+    }
+}
+
+fn docker_child_reaper_supervisor(queue: Arc<DockerReapQueue>, ready_sender: mpsc::SyncSender<()>) {
+    let mut first_worker = true;
+    loop {
+        let worker_queue = Arc::clone(&queue);
+        let worker_ready_sender = if first_worker {
+            Some(ready_sender.clone())
+        } else {
+            None
+        };
+        first_worker = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            docker_child_reaper_worker(worker_queue, worker_ready_sender);
+        }));
+        if result.is_err() {
+            eprintln!("error: Docker child reaper worker panicked; restarting supervisor worker");
         }
     }
 }
 
 fn initialize_docker_child_reaper() -> std::result::Result<DockerChildReaper, String> {
-    let (sender, receiver) = mpsc::channel();
-    let recovery = Arc::new(Mutex::new(VecDeque::new()));
+    let queue = Arc::new(DockerReapQueue {
+        pending: Mutex::new(VecDeque::new()),
+        wake: Condvar::new(),
+    });
     let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    let worker_recovery = Arc::clone(&recovery);
+    let worker_queue = Arc::clone(&queue);
     std::thread::Builder::new()
         .name("ezgha-docker-reaper".to_owned())
-        .spawn(move || {
-            let _ = ready_sender.send(());
-            docker_child_reaper_loop(receiver, worker_recovery);
-        })
+        .spawn(move || docker_child_reaper_supervisor(worker_queue, ready_sender))
         .map_err(|error| format!("failed to start Docker child reaper: {error}"))?;
     ready_receiver
         .recv_timeout(Duration::from_secs(1))
         .map_err(|error| format!("Docker child reaper failed readiness verification: {error}"))?;
-    Ok(DockerChildReaper { sender, recovery })
+    Ok(DockerChildReaper { queue })
 }
 
 fn docker_child_reaper() -> Result<&'static DockerChildReaper> {
@@ -609,16 +660,7 @@ fn docker_child_reaper() -> Result<&'static DockerChildReaper> {
 
 impl DockerChildReaper {
     fn enqueue(&self, request: DockerReapRequest) {
-        if let Err(error) = self.sender.send(request) {
-            eprintln!(
-                "error: Docker child reaper send failed; retaining child in recovery queue: {}",
-                error.0.detail
-            );
-            self.recovery
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push_back(error.0);
-        }
+        self.queue.enqueue(request);
     }
 }
 
@@ -4466,8 +4508,9 @@ minimum_isolation = "container"
             attempts: u32,
         }
 
-        let child = retry_wait_until_reaped(
-            FakeChild { attempts: 0 },
+        let mut child = FakeChild { attempts: 0 };
+        retry_wait_until_reaped(
+            &mut child,
             |child| {
                 child.attempts += 1;
                 if child.attempts < 3 {
@@ -4529,6 +4572,46 @@ minimum_isolation = "container"
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(reaped, "background reaper must eventually reap its child");
+    }
+
+    #[test]
+    fn supervised_reaper_recovers_after_worker_panic() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let reaper = docker_child_reaper().unwrap();
+        let panic_count = TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst);
+        TEST_DOCKER_REAPER_PANIC_ONCE.store(true, Ordering::SeqCst);
+        reaper.queue.wake.notify_one();
+        for _ in 0..100 {
+            if TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst) > panic_count {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst) > panic_count,
+            "reaper worker should observe the injected panic"
+        );
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        child.kill().unwrap();
+        reaper.enqueue(DockerReapRequest {
+            child,
+            detail: "supervised reaper recovery test".to_owned(),
+        });
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "supervised reaper must reap after worker restart");
     }
 
     #[test]
