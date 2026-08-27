@@ -14,27 +14,11 @@ This skill drives the **doctor-runner** script that ships at the repo root, plus
 - journal full of `ensure_count failed (will retry): … runner with the name already exists`
 - worldarchitect.ai fleet page shows fewer than 16 `ez-org-runner-*` runners online
 
-## Step 0 — Mac host: check ALL FIVE layers (2026-07-14 outage lesson)
+## Step 0 — Mac host: check all four runner layers
 
 On the Mac, "runners down" is usually SEVERAL stacked causes — each masks the
 next, so never stop at the first fix. Check every layer, in order (memory:
 `mac-fleet-outage-causal-chain-2026-07-14`).
-
-> ⚠️ **RUN THESE TWO COMMANDS FIRST on any Mac fleet-down symptom — they take 5s and surface the
-> #1 recurring harness-layer-present-but-broken failure** (bead `jleechan-xlo7`,
-> recurred 2026-07-14 → 2026-07-29):
->
-> ```bash
-> plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist | grep ProgramArguments.1
-> grep -c ensure_runner_image ~/.local/libexec/ezgha/ezgha-fleet-watchdog.sh
-> ```
->
-> **Healthy:** `ProgramArguments.1` is `~/.local/libexec/ezgha/ezgha-fleet-watchdog.sh` AND
-> `grep` returns `≥1`. **Drift:** if `ProgramArguments.1` contains `worldarchitect.ai`, `worktree`,
-> or a repo path — the deployed watchdog is an OLDER copy that doesn't have the image-heal function,
-> and restart-loops the daemon without ever rebuilding `ezgha-runner:latest`. Fix: re-run
-> `./install.sh` to regenerate the plist. The same applies to other launchd agents — any
-> `ProgramArguments[1]` pointing outside `~/.local/libexec/ezgha/` is a drift defect.
 
 1. **VM state — BOTH lima homes**: `colima list` (profile home `~/.colima`)
    AND `limactl list` (home `~/.lima`) — two independent instances exist and
@@ -60,16 +44,6 @@ next, so never stop at the first fix. Check every layer, in order (memory:
    idle deletes it (in-use images survive, the idle runner image does not).
    Rebuild: `docker build -f Dockerfile.runner -t ezgha-runner:latest .`
    Bead jleechan-kobt.
-5. **Watchdog reality check**: the deployed watchdog may be a divergent copy
-   (2026-07-14 + 2026-07-29: plist invoked an old 221-line script from another
-   repo that only LOGS its remediation, restart-looping without ever calling
-   `ensure_runner_image`). See the bolded callout above — `plutil ProgramArguments.1`
-   + `grep ensure_runner_image` is the 5-second verification. As of 2026-07-29,
-   the watchdog itself does a startup self-check (exits 78 on drift), so a
-   drift event also surfaces as `WATCHDOG PLIST DRIFT` in
-   `~/Library/Logs/ezgha-watchdog-launchd.log` instead of going silent.
-   Beads jleechan-yib3, jleechan-xlo7.
-
 Per-slot end-state proof after recovery: `docker top <c> | grep -E 'Runner\.(Listener|Worker)'`
 for every container — ephemeral churn (containers seconds old, Worker already
 present) is HEALTHY under queue backlog.
@@ -92,8 +66,8 @@ If `fleet unhealthy`, continue. **Never restart-loop the service** — see
 ezgha.service`, check `uptime` (1-min load) and `docker ps --filter
 label=ezgha=managed | wc -l` (container count) — skip the restart if load_1min
 > 12 or live containers are below 75% of configured capacity (fewer than 8
-> on the 10-runner Linux host), since a mass cold respawn has twice tripped this
-host's watchdog (`max-load-1 = 24`) into a full reboot on 2026-07-07.**
+> on the 10-runner Linux host), because a mass cold respawn increases pressure
+> and can interrupt in-flight registrations and operator sessions.**
 
 
 
@@ -254,7 +228,7 @@ When `doctor-runner` exits 1 **or** queue tail > `QUEUE_TAIL_WARN_MIN` (20m):
 
 1. Invoke `/harness` (read `~/.claude/skills/harness-engineering/SKILL.md`)
 2. Classify: silent degradation | missing validation | repeated manual fix
-3. Check: Is external watchdog masking slot drift? Is systemd unit stale? Are zombie queued runs polluting metrics?
+3. Check: Is a stale supervisor unit masking slot drift? Are zombie queued runs polluting metrics?
 4. Propose durable harness fixes — not just `systemctl restart`
 
 See `docs/harness-early-victory-5whys.md` for why restart-looping is forbidden.

@@ -28,8 +28,8 @@
 # and, only as a LAST RESORT after sustained danger-zone pressure, sends
 # SIGTERM (never SIGKILL — see rationale below) to a single process that
 # the invoking user owns. It is a narrow, conservative backstop meant to
-# convert an uncontrolled thrash-to-reboot into one clean early
-# intervention — it is explicitly NOT trying to replace systemd-oomd or
+# convert uncontrolled memory thrash into one clean early intervention —
+# it is explicitly NOT trying to replace systemd-oomd or
 # earlyoom, both of which run with real privilege and broader visibility.
 #
 # WHICH PSI FIELD, AND WHY ("full avg10"):
@@ -59,8 +59,8 @@
 # WHY SIGTERM, NEVER SIGKILL: SIGTERM gives the target process a chance to
 # flush state / exit its own cleanup path (e.g. a coding agent CLI can
 # save session state) rather than being killed mid-write. This mirrors the
-# repo-wide convention already established for the fleet watchdog's own
-# process-management posture. If a process ignores SIGTERM, this script
+# repo-wide graceful process-management posture. If a process ignores
+# SIGTERM, this script
 # does NOT escalate to SIGKILL — it logs and waits for the next polling
 # cycle's re-evaluation (by which point RSS/pressure has likely already
 # started dropping if the SIGTERM was heeded elsewhere in the process
@@ -134,14 +134,14 @@
 # per beads ez-gh-actions-r3f10 / ez-gh-actions-r3f11): when the CRIT path
 # is reached, run four bounded stages BEFORE the `kill -TERM` to a single
 # user process — the per-process SIGTERM was the round-1 fallback that
-# logged but otherwise reduced to "let the watchdog reboot the box" (see
-# 2026-07-10 incident). Stage 1 drains lowest-priority managed containers;
+# did not reduce aggregate VM pressure (see 2026-07-10 incident). Stage 1
+# drains lowest-priority managed containers;
 # stage 2 writes a multi-GiB target to the QEMU cgroup's `memory.reclaim` to
 # ask the kernel to release page cache + swap (does NOT signal processes);
 # stage 3 sleeps 5s and verifies the QEMU RSS dropped by >= RSS_DROP_MIN_KB
 # (default 1048576 = 1 GiB) — using a baseline RSS captured BEFORE stage 1,
 # not after, so the comparison is honest; stage 4 only runs if the verify
-# failed — it writes a watchdog-wait marker + logs CRITICAL and the original
+# failed — it writes a pressure-recovery marker + logs CRITICAL and the original
 # SIGTERM path is suppressed. The shed block is fully dry-runnable via
 # `--dry-run` / `DRY_RUN=1` and is encoded as discrete functions so unit-
 # test stubs can call them in isolation.
@@ -221,7 +221,7 @@ log() {
 ##############################################################################
 # Each stage is a function so unit-test stubs can call them in isolation.
 # `run_shed_stages` dispatches them in order, exports SHED_RESULT so the
-# caller (or a future hook) can decide whether the watchdog can stay armed.
+# caller (or a future hook) can decide whether operator recovery is required.
 # The full chain is also exposed via `scripts/host/psi-oom-watcher.sh --shed`
 # for one-shot invocation outside the polling loop (useful for hand-driven
 # pressure-injection tests).
@@ -236,7 +236,7 @@ SHED_VERIFY_DELAY="${SHED_VERIFY_DELAY:-5}"    # seconds between write+verify
 # default was root-owned and could not be created by this user-scope service,
 # which made the production escalation marker impossible to write.
 SHED_FLAG_DIR="${SHED_FLAG_DIR:-${STATE_DIR}}"
-SHED_FLAG_FILE="${SHED_FLAG_DIR}/watchdog-wait-required.flag"
+SHED_FLAG_FILE="${SHED_FLAG_DIR}/pressure-recovery-required.flag"
 
 # Reset on every invocation so callers can `source` and probe.
 SHED_RESULT=""
@@ -484,7 +484,7 @@ run_shed_stages() {
   stage2_reclaim_qemu
   stage3_verify
   if [ "${SHED_RESULT}" = "ok" ]; then
-    _shed_log chain "OK — watchdog may continue to wait; suppressing per-process SIGTERM fallback"
+    _shed_log chain "OK — aggregate pressure dropped; suppressing per-process SIGTERM fallback"
     return 0
   fi
   stage4_escalate || return 1
@@ -610,7 +610,7 @@ if [ "${_shed_mode:-0}" = "1" ]; then
     log "shed-mode: SHED_RESULT=${SHED_RESULT}"
     exit 0
   fi
-  log "shed-mode: SHED_RESULT=${SHED_RESULT} (chain failed; watchdog-wait flag raised)"
+  log "shed-mode: SHED_RESULT=${SHED_RESULT} (chain failed; pressure-recovery flag raised)"
   exit 1
 fi
 

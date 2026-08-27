@@ -299,8 +299,8 @@ EOF
   fail_status=$?
   set -e
   [ "${fail_status}" -ne 0 ] || fail "failed staged shed returned success instead of exposing stage-4 escalation to systemd"
-  [ -s "${FAIL_STATE}/watchdog-wait-required.flag" ] || fail "stage 4 did not persist its escalation marker in the default state directory"
-  grep -q 'qemu RSS did not drop' "${FAIL_STATE}/watchdog-wait-required.flag" || fail "stage-4 escalation marker omitted the failure reason"
+  [ -s "${FAIL_STATE}/pressure-recovery-required.flag" ] || fail "stage 4 did not persist its escalation marker in the default state directory"
+  grep -q 'qemu RSS did not drop' "${FAIL_STATE}/pressure-recovery-required.flag" || fail "stage-4 escalation marker omitted the failure reason"
   [ ! -e "${FAIL_STATE}/kill-calls" ] || fail "failed staged shed fell through to arbitrary-process SIGTERM"
   ! grep -q 'ACTION: sending SIGTERM' "${FAIL_STATE}/psi-oom-watcher.log" || fail "failed staged shed logged an arbitrary-process SIGTERM action"
   grep -q 'per-process SIGTERM fallback suppressed' "${FAIL_STATE}/psi-oom-watcher.log" || fail "failed staged shed did not log that arbitrary-process SIGTERM was suppressed"

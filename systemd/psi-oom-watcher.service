@@ -17,8 +17,8 @@ After=network.target
 Type=oneshot
 # Short timeout: this is a single /proc read + a `ps` scan + at most one
 # `kill -TERM`, not a long-running probe — 30s is generous headroom above
-# what it actually takes, matching the ezgha-watchdog.service convention of
-# a systemd-level backstop above the script's own expected runtime.
+# what it actually takes and providing a systemd-level backstop above the
+# script's own expected runtime.
 TimeoutStartSec=30
 ExecStart=@SCRIPTS_DIR@/psi-oom-watcher.sh
 Environment=HOME=@HOME@

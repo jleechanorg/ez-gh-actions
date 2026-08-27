@@ -107,29 +107,30 @@ qemu_max_line=$(grep -n 'QEMU_CEILING_BYTES.*=' "$VERIFY" | head -1 | cut -d: -f
 grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
   || fail "live max QEMU ceiling is not fail-closed"
 
-# Kdump/pstore verification should be quiet on a healthy fixture, while an
-# actual failure must print the operator remediation sequence.
+# Kdump/pstore verification is diagnostic-only. It must be quiet on a healthy
+# fixture, fail closed on an unhealthy fixture, and never invoke a remediation
+# hook (including the retired compatibility environment variable).
 mkdir -p "$TMP/pstore" "$TMP/crash"
 chmod 0555 "$TMP/crash"
 printf '1\n' > "$TMP/kexec_crash_loaded"
-cat > "$TMP/remediation" <<'EOF'
+cat > "$TMP/forbidden-remediation" <<EOF
 #!/usr/bin/env bash
-printf 'REMEDIATION_CALLED\n'
+touch "$TMP/remediation-was-called"
 EOF
-chmod +x "$TMP/remediation"
+chmod +x "$TMP/forbidden-remediation"
 healthy_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
   VERIFY_EXIT_CRITERIA_TEST_CASE=kdump \
   VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
   VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
   VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
   VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS=rw,relatime \
-  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
+  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/forbidden-remediation" \
   bash "$VERIFY" 2>&1) \
   || fail "healthy kdump fixture should pass: $healthy_out"
 ! grep -Fq '[FAIL]' <<<"$healthy_out" \
   || fail "healthy kdump fixture emitted a false [FAIL]: $healthy_out"
-! grep -Fq 'REMEDIATION_CALLED' <<<"$healthy_out" \
-  || fail "healthy kdump fixture invoked remediation"
+[ ! -e "$TMP/remediation-was-called" ] \
+  || fail "healthy kdump fixture invoked forbidden remediation"
 
 rm -rf "$TMP/pstore"
 failed_out=''
@@ -139,11 +140,13 @@ failed_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
   VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
   VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
   VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
-  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
+  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/forbidden-remediation" \
   bash "$VERIFY" 2>&1) || failed_rc=$?
 [ "$failed_rc" -ne 0 ] || fail "missing pstore fixture should fail closed"
-grep -Fq 'REMEDIATION_CALLED' <<<"$failed_out" \
-  || fail "kdump failure omitted actionable remediation: $failed_out"
+grep -Fq 'Crash capture FAIL-CLOSED' <<<"$failed_out" \
+  || fail "kdump failure omitted diagnostic: $failed_out"
+[ ! -e "$TMP/remediation-was-called" ] \
+  || fail "kdump failure invoked forbidden remediation"
 
 mkdir -p "$TMP/pstore"
 readonly_out=''
@@ -154,10 +157,12 @@ readonly_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
   VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
   VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
   VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS=ro,relatime \
-  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
+  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/forbidden-remediation" \
   bash "$VERIFY" 2>&1) || readonly_rc=$?
 [ "$readonly_rc" -ne 0 ] || fail "read-only kdump target mount should fail closed"
-grep -Fq 'REMEDIATION_CALLED' <<<"$readonly_out" \
-  || fail "read-only kdump target omitted actionable remediation: $readonly_out"
+grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
+  || fail "read-only kdump target omitted diagnostic: $readonly_out"
+[ ! -e "$TMP/remediation-was-called" ] \
+  || fail "read-only kdump target invoked forbidden remediation"
 
 echo "VERIFY_EXIT_GATE8_TEST: PASS"

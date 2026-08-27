@@ -60,6 +60,7 @@ jobs:
           bash tests/doctor_runner_expected_containers_test.sh
           bash tests/doctor_runner_heartbeat_starvation_test.sh
           bash tests/doctor_runner_host_pressure_test.sh
+          bash tests/doctor_runner_host_lifecycle_test.sh
           bash tests/doctor_runner_live_slot_gate_test.sh
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
