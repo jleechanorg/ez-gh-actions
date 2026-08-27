@@ -23,6 +23,17 @@ jobs:
         run: cargo test
       - name: Layer-2 failure-ladder real-binary regression test
         run: bash tests/ezgha_start_failure_ladder_layer2_test.sh
+      - name: Layer-2 serve-loop failure-ladder regression test
+        env:
+          EZGHA_SERVE_LAYER2_ARTIFACT_DIR: ${{ runner.temp }}/ezgha-serve-layer2
+        run: bash tests/ezgha_serve_failure_ladder_layer2_test.sh "$EZGHA_SERVE_LAYER2_ARTIFACT_DIR"
+      - name: Upload Layer-2 serve-loop diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ezgha-serve-layer2-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ezgha-serve-layer2
+          if-no-files-found: error
       - name: Runner dashboard contract tests
         run: |
           python3 -m unittest tests/runner_dashboard_snapshot_test.py

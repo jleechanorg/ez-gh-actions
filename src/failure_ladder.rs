@@ -14,6 +14,25 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SAVE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_FAIL_SAVE_ON_CALL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only seam used to deterministically exercise callers' persistence
+/// failure handling without relying on filesystem permissions or races.
+#[cfg(test)]
+pub(crate) fn set_test_save_failure_on_call(call: Option<usize>) {
+    TEST_FAIL_SAVE_ON_CALL.with(|target| target.set(call));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_save_failure() {
+    TEST_SAVE_CALL_COUNT.with(|count| count.set(0));
+    TEST_FAIL_SAVE_ON_CALL.with(|target| target.set(None));
+}
+
 /// Conservative, independently validated circuit thresholds.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FailureLadderPolicy {
@@ -121,6 +140,16 @@ impl FailureLadder {
 
     /// Persist atomically with a temporary sibling followed by rename.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        #[cfg(test)]
+        let fail_this_call = TEST_SAVE_CALL_COUNT.with(|count| {
+            let call = count.get().saturating_add(1);
+            count.set(call);
+            TEST_FAIL_SAVE_ON_CALL.with(|target| target.get() == Some(call))
+        });
+        #[cfg(test)]
+        if fail_this_call {
+            bail!("simulated failure-ladder persistence failure");
+        }
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)

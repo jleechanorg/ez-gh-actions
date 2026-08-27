@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::sync::Once;
@@ -43,6 +43,17 @@ const DISK_MEASURE_STRIKES: u32 = 2;
 /// observability-only: `limits.min_free_disk_gb` remains the admission floor.
 const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
+/// Once a failure-ladder transition cannot be persisted, the on-disk ledger
+/// is stale and the daemon must not admit another external start against it.
+/// This latch intentionally lasts for the daemon lifetime; process restart is
+/// the explicit recovery condition that re-establishes a fresh persistence
+/// contract before admission resumes.
+static FAILURE_LADDER_PERSISTENCE_FAILED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn reset_failure_ladder_admission_latch_for_tests() {
+    FAILURE_LADDER_PERSISTENCE_FAILED.store(false, Ordering::SeqCst);
+}
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 // Post-refill readiness gets one 5s shared local-Docker budget. At the normal
@@ -3350,6 +3361,15 @@ fn start_missing_runners_with_starter(
     missing: u32,
     starter: impl Fn(&Config, Backend, u32) -> Result<(String, String)>,
 ) -> Result<StartMissingOutcome> {
+    if FAILURE_LADDER_PERSISTENCE_FAILED.load(Ordering::SeqCst) {
+        let reason =
+            "failure-ladder persistence previously failed; runner admission remains paused until daemon restart";
+        eprintln!("warning: {reason}");
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(reason.into()),
+            ..StartMissingOutcome::default()
+        });
+    }
     let mut started = Vec::new();
     let mut start_failures = 0;
     let mut last_err = None;
@@ -3382,6 +3402,21 @@ fn start_missing_runners_with_starter(
                 "fleet admission circuit is open with {} slot circuit(s); existing jobs remain running",
                 ladder.open_slot_count(now)
             )),
+            ..StartMissingOutcome::default()
+        });
+    }
+    // Prove that the current ledger can still be durably persisted before any
+    // external JIT/Docker start.  A transition save can race with filesystem
+    // failure after this point, so the daemon-lifetime latch below remains
+    // necessary; this preflight closes the first-attempt fail-open window.
+    if let Err(err) = ladder.save(&path) {
+        FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+        let reason = format!(
+            "could not preflight failure-ladder persistence; runner admission remains paused until daemon restart: {err:#}"
+        );
+        eprintln!("warning: {reason}");
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(reason),
             ..StartMissingOutcome::default()
         });
     }
@@ -3419,6 +3454,7 @@ fn start_missing_runners_with_starter(
                 started.push(name);
                 let transition = ladder.record_success(slot, now_epoch_secs());
                 if let Err(err) = ladder.save(&path) {
+                    FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
                     admission_paused_reason = Some(format!(
                         "could not persist failure-ladder recovery; pausing further starts: {err:#}"
                     ));
@@ -3443,6 +3479,7 @@ fn start_missing_runners_with_starter(
                 start_failures += 1;
                 let transition = ladder.record_failure(policy, slot, now_epoch_secs())?;
                 if let Err(err) = ladder.save(&path) {
+                    FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
                     admission_paused_reason = Some(format!(
                         "could not persist failure-ladder failure; pausing further starts: {err:#}"
                     ));
@@ -3828,6 +3865,8 @@ mod tests {
     impl TestEnv {
         fn new(label: &str) -> Self {
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_failure_ladder_admission_latch_for_tests();
+            crate::failure_ladder::reset_test_save_failure();
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
@@ -3868,6 +3907,8 @@ mod tests {
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
+            reset_failure_ladder_admission_latch_for_tests();
+            crate::failure_ladder::reset_test_save_failure();
             // Drop the cpu-probe test seam so the next test sees a clean
             // override state instead of a value leaked from this test.
             cpu_probe_overrides::set(None);
@@ -4540,6 +4581,110 @@ minimum_isolation = "container"
         .unwrap();
         assert!(paused.admission_paused_reason.is_some());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn failure_ladder_save_failure_latches_admission_across_reconciliation_ticks() {
+        let _env = TestEnv::new("failure_ladder_save_failure_latch");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let state_path = failure_ladder_path_for(&cfg);
+        FailureLadder::default()
+            .save(&state_path)
+            .expect("baseline ledger should be durable before the injected failure");
+        // Save #1 above is the baseline.  Save #2 is the preflight and must
+        // succeed; save #3 records the local-start failure and is injected to
+        // fail after the external starter has run exactly once.
+        crate::failure_ladder::set_test_save_failure_on_call(Some(3));
+
+        let first = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release_slot(slot)?;
+                bail!("simulated local container start failure")
+            }
+        })
+        .expect("save failure should become a bounded admission pause");
+        assert_eq!(first.start_failures, 1);
+        assert!(first
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not persist failure-ladder failure")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // The old ledger is still readable, but its failed transition was not
+        // persisted.  A subsequent serve tick must remain fail-closed rather
+        // than re-invoking JIT/Docker admission against that stale ledger.
+        let second = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, _slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                unreachable!("latched admission must not invoke the starter")
+            }
+        })
+        .expect("latched admission should be a bounded pause");
+        assert!(second
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failure-ladder persistence")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Clearing the injected save error is not enough: recovery is an
+        // explicit daemon-lifetime condition (process restart), represented
+        // here by the test-only latch reset.
+        crate::failure_ladder::reset_test_save_failure();
+        let still_paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            1,
+            |_cfg, _backend, _slot| unreachable!("latch must survive save recovery alone"),
+        )
+        .expect("latch should remain closed until explicit recovery");
+        assert!(still_paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        reset_failure_ladder_admission_latch_for_tests();
+        let recovered = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release_slot(slot)?;
+                bail!("post-restart simulated local start failure")
+            }
+        })
+        .expect("explicit restart-equivalent reset should reopen admission");
+        assert_eq!(recovered.start_failures, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failure_ladder_preflight_save_failure_blocks_external_starter() {
+        let _env = TestEnv::new("failure_ladder_preflight_save_failure");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let state_path = failure_ladder_path_for(&cfg);
+        FailureLadder::default()
+            .save(&state_path)
+            .expect("baseline ledger should be durable before the injected failure");
+        // Save #1 above is the baseline; fail the preflight save (#2).
+        crate::failure_ladder::set_test_save_failure_on_call(Some(2));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, _slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                unreachable!("failed persistence preflight must precede external admission")
+            }
+        })
+        .expect("preflight failure should become a bounded admission pause");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.start_failures, 0);
+        assert!(outcome
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("preflight")));
     }
 
     #[test]
