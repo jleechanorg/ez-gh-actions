@@ -124,6 +124,7 @@ grep -Fq 'Gate 8 (0) on-disk watchdog contract failed' "$VERIFY" \
 # Kdump/pstore verification should be quiet on a healthy fixture, while an
 # actual failure must print the operator remediation sequence.
 mkdir -p "$TMP/pstore" "$TMP/crash"
+chmod 0555 "$TMP/crash"
 printf '1\n' > "$TMP/kexec_crash_loaded"
 cat > "$TMP/remediation" <<'EOF'
 #!/usr/bin/env bash
@@ -135,6 +136,7 @@ healthy_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
   VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
   VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
   VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
+  VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS=rw,relatime \
   VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
   bash "$VERIFY" 2>&1) \
   || fail "healthy kdump fixture should pass: $healthy_out"
@@ -156,5 +158,20 @@ failed_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
 [ "$failed_rc" -ne 0 ] || fail "missing pstore fixture should fail closed"
 grep -Fq 'REMEDIATION_CALLED' <<<"$failed_out" \
   || fail "kdump failure omitted actionable remediation: $failed_out"
+
+mkdir -p "$TMP/pstore"
+readonly_out=''
+readonly_rc=0
+readonly_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=kdump \
+  VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
+  VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
+  VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
+  VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS=ro,relatime \
+  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
+  bash "$VERIFY" 2>&1) || readonly_rc=$?
+[ "$readonly_rc" -ne 0 ] || fail "read-only kdump target mount should fail closed"
+grep -Fq 'REMEDIATION_CALLED' <<<"$readonly_out" \
+  || fail "read-only kdump target omitted actionable remediation: $readonly_out"
 
 echo "VERIFY_EXIT_GATE8_TEST: PASS"

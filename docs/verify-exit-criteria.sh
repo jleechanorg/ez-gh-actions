@@ -326,6 +326,20 @@ daemon_overlay_free_disk_gb() {
     echo $((avail_kb / 1024 / 1024))
 }
 
+kdump_target_mount_is_writable() {
+    local target="$1" mount_options
+    if [ "${VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS+x}" = x ]; then
+        mount_options="$VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS"
+    else
+        command -v findmnt >/dev/null 2>&1 || return 1
+        mount_options="$(findmnt -n -o OPTIONS --target "$target" 2>/dev/null)" || return 1
+    fi
+    case ",$mount_options," in
+        *,rw,*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
     local pstore_root="${VERIFY_EXIT_CRITERIA_PSTORE_ROOT:-/sys/fs/pstore}"
@@ -365,17 +379,20 @@ verify_kdump_pstore() {
     if [ "$(cat "$kexec_crash_loaded_path" 2>/dev/null || echo 0)" != "1" ]; then
         kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is not '1' (kdump kernel is not loaded into the running kernel)"
     fi
-    # (4) /var/crash is the kdump-tools default destination on debian/ubuntu.
-    #     If the directory is missing OR not writable by root, the vmcore
-    #     file cannot land and the panic capture is silently lost (kexec
+    # (4) /var/crash is the kdump-tools default destination on Debian/Ubuntu.
+    #     Kdump writes as root, so testing `-w` as the unprivileged verifier
+    #     would reject a normal root-owned mode-0755 directory. Instead,
+    #     require that the directory exists and its containing mount is rw.
+    #     If the directory is missing or the mount is read-only, the vmcore
+    #     cannot land and the panic capture is silently lost (kexec
     #     loads the crash kernel, then the crash kernel mounts the root
     #     filesystem and writes here; if this path is unwritable, kdump
     #     fails its post-reboot handshake and produces no vmcore).
     if [ ! -d "$kdump_dir" ]; then
         kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir does not exist; kdump has no dump target. Remediation: install kdump-tools, then sudo install -d -m 0755 /var/crash and follow scripts/host/kdump-remediation.sh."
     fi
-    if [ ! -w "$kdump_dir" ]; then
-        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir is not writable by root; kernel cannot save vmcores here."
+    if ! kdump_target_mount_is_writable "$kdump_dir"; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir is not on a verifiably writable mount; kernel cannot save vmcores here."
     fi
 }
 
