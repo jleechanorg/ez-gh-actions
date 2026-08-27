@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 # install.sh — install ez-gh-actions (ezgha) and, optionally, its user service.
 # Idempotent, no sudo. Re-run any time to upgrade the binary.
-#   ./install.sh                  install / upgrade ezgha with auxiliary
-#                                  monitoring/watchdog loops disabled.
-#   ./install.sh --without-watchdog  install / upgrade but skip arming the
-#                                  watchdog; on Linux, any drifted-enabled
-#                                  ezgha-watchdog.timer is disabled.
-#   ./install.sh --with-watchdog  explicit opt-in for the fleet watchdog
+#   ./install.sh                  install / upgrade ezgha
 #   ./install.sh --uninstall      remove ezgha + its user service (config left in place)
 #   ./install.sh --dev            bypass production git-state checks (local development)
-# Flags compose, e.g.: ./install.sh --dev --without-watchdog
+# Flags compose, e.g.: ./install.sh --dev
 set -euo pipefail
 
 REPO_URL="https://github.com/jleechanorg/ez-gh-actions"
@@ -95,6 +90,7 @@ uninstall() {
         "${HOME}/.config/systemd/user/ao-orchestrator.service.d/20-automation-slice.conf" \
         "${HOME}/.config/systemd/user/ai.dark-factory.daemon.service.d/20-automation-slice.conf" \
         "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+  rm -f "${HOME}/.local/bin/watchdog-load-repair.sh"
   # Remove only the persistent guest unit. Do not stop the active slice here:
   # existing runner containers may still be attached while uninstall drains.
   if command -v limactl >/dev/null 2>&1; then
@@ -132,7 +128,6 @@ uninstall() {
 }
 
 DEV_MODE=0
-WITH_WATCHDOG=0
 for arg in "$@"; do
   case "${arg}" in
     --uninstall|-u)
@@ -141,11 +136,8 @@ for arg in "$@"; do
     --dev|-d)
       DEV_MODE=1
       ;;
-    --with-watchdog)
-      WITH_WATCHDOG=1
-      ;;
-    --without-watchdog)
-      WITH_WATCHDOG=0
+    --with-watchdog|--without-watchdog)
+      : # deprecated / removed flags
       ;;
     *)
       : # ignore unrecognized args (back-compat with prior permissive parsing)
@@ -505,9 +497,8 @@ if [ -f "${CONFIG_PATH}" ]; then
   fi
 fi
 
-# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, dashboard, colima-trim) ─
+# ── Install auxiliary systemd / launchd units (token-refresh, queue-reaper, dashboard, colima-trim) ─
 # These auxiliary units keep the ezgha fleet observable and healthy between deploys:
-#   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
 #   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
@@ -567,29 +558,12 @@ PLIST
       cat >> "${plist}" <<PLIST
   </array>
 PLIST
-      # EnvironmentVariables: DOCKER_HOST when detected; watchdog always gets
-      # EZGHA_WATCHDOG_ALLOW_RESTART=1 (restart enabled by default).
-      if [ -n "${DOCKER_HOST_OVERRIDE}" ] || [ "${name}" = "watchdog" ]; then
+      # EnvironmentVariables: DOCKER_HOST when detected.
+      if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
         cat >> "${plist}" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
-PLIST
-        if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
-          printf '    <key>DOCKER_HOST</key><string>%s</string>\n' "${DOCKER_HOST_OVERRIDE}" >> "${plist}"
-        fi
-        if [ "${name}" = "watchdog" ]; then
-          printf '    <key>EZGHA_WATCHDOG_ALLOW_RESTART</key><string>1</string>\n' >> "${plist}"
-          # EZGHA_REPO_ROOT: ensure_runner_image() needs to locate
-          # Dockerfile.runner from its deployed libexec path. After the
-          # 2026-07-31 recurrence (load-gated restart, image stays missing
-          # under sustained high host load), this env var is what lets
-          # the unconditional rebuild actually find a Dockerfile. Mirrored
-          # manually on the live plist via `plutil -insert`; doing it here
-          # so the next install.sh run carries it forward instead of
-          # regressing to the load-gated failure mode.
-          printf '    <key>EZGHA_REPO_ROOT</key><string>%s</string>\n' "${SCRIPT_DIR}" >> "${plist}"
-        fi
-        cat >> "${plist}" <<PLIST
+    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>
   </dict>
 PLIST
       fi
@@ -608,16 +582,6 @@ PLIST
       plist_scanned="$(sed '/<!--/,/-->/d' "${plist}")"
       if grep -qF "${SCRIPT_DIR}" <<<"${plist_scanned}" || grep -qi 'worktree' <<<"${plist_scanned}"; then
         bad "refusing to load ${plist}: still references the repo/worktree checkout path"
-        rm -f "${plist}"
-        return 1
-      fi
-      # Sentinel verification: the deployed watchdog script MUST contain the
-      # image-heal function — without this check, install.sh silently installs
-      # a plist pointing at an older copy of ezgha-fleet-watchdog.sh that has
-      # no ensure_runner_image, which is exactly the 2026-07-14 + 2026-07-29
-      # outage class (bead jleechan-xlo7).
-      if [[ "${name}" == "watchdog" ]] && ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
-        bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
         rm -f "${plist}"
         return 1
       fi
@@ -690,19 +654,11 @@ FSTRIM_EOF
     else
       info "guest fstrim.timer override skipped — colima not installed or default profile not running"
     fi
-    # Watchdog: armed by default (restart enabled via EZGHA_WATCHDOG_ALLOW_RESTART=1
-    # in install_macos_plist). Pass --without-watchdog to skip arming.
+    # Clear any legacy watchdog plist on macOS
     watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
-    if [ "${WITH_WATCHDOG}" -eq 1 ]; then
-      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host mac"
-      ok "watchdog armed (restart enabled)"
-    else
-      info "watchdog arming skipped (--without-watchdog)"
-      if [ -f "${watchdog_plist}" ]; then
-        launchctl unload "${watchdog_plist}" 2>/dev/null || true
-        rm -f "${watchdog_plist}"
-        ok "disabled drifted-loaded watchdog plist (--without-watchdog)"
-      fi
+    if [ -f "${watchdog_plist}" ]; then
+      launchctl unload "${watchdog_plist}" 2>/dev/null || true
+      rm -f "${watchdog_plist}"
     fi
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux: copy the systemd units with @SCRIPTS_DIR@ / @HOME@ placeholders substituted
@@ -730,7 +686,7 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
+    for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
@@ -824,13 +780,8 @@ EOF
       install_agent_wrapper "${agent}"
     done
 
-    # The system watchdog on this host calls this historical user-owned path.
-    # Replace it atomically so it never observes a partially-written repair
-    # ladder; the canonical tracked copy remains in libexec above.
-    mkdir -p "${HOME_DIR}/.local/bin"
-    repair_tmp="$(mktemp "${HOME_DIR}/.local/bin/.watchdog-load-repair.XXXXXX")"
-    install -m 0755 "${SCRIPTS_DIR}/watchdog-load-repair.sh" "${repair_tmp}"
-    mv -f "${repair_tmp}" "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
+    # Remove any historical repair script
+    rm -f "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
 
     systemctl --user daemon-reload 2>/dev/null || true
     # Apply the direct QEMU ceiling to an already-running Colima service.
@@ -878,24 +829,13 @@ EOF
     else
       bad "failed to disable psi-oom-watcher (run: systemctl --user status psi-oom-watcher.timer psi-oom-watcher.service)"
     fi
-    # ezgha-watchdog.timer is explicit opt-in. The default heals drifted state.
-    if [ "${WITH_WATCHDOG}" -eq 1 ]; then
-      if systemctl --user enable --now ezgha-watchdog.timer 2>/dev/null; then
-        ok "systemd --user timer enabled: ezgha-watchdog.timer (restart enabled)"
-      else
-        bad "failed to enable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
-      fi
-    else
-      info "watchdog arming skipped (default; use --with-watchdog to opt in)"
-      if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
-        if systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null; then
-          ok "disabled drifted-enabled ezgha-watchdog.timer"
-        else
-          bad "failed to disable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
-        fi
-      fi
-      systemctl --user stop ezgha-watchdog.service 2>/dev/null || true
+
+    # Clean up any drifted or legacy watchdog units
+    if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
+      systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null || true
     fi
+    systemctl --user stop ezgha-watchdog.service 2>/dev/null || true
+    rm -f "${USER_UNIT_DIR}/ezgha-watchdog.timer" "${USER_UNIT_DIR}/ezgha-watchdog.service"
   fi
 fi
 

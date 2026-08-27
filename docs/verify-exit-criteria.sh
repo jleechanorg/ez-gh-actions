@@ -880,10 +880,10 @@ pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet usi
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"
 if [ "$PLATFORM" = "linux" ]; then
-    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-watchdog/ || $2 ~ /ezgha-watchdog/ || $3 ~ /ezgha-watchdog/ || $0 ~ /ezgha-watchdog/' || true)
-    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-watchdog.timer 2>/dev/null || true)
-    TIMER_ACTIVE=$(systemctl --user is-active ezgha-watchdog.timer 2>/dev/null || true)
-    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-watchdog.service 2>/dev/null || true)
+    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-token-refresh/ || $2 ~ /ezgha-token-refresh/ || $3 ~ /ezgha-token-refresh/ || $0 ~ /ezgha-token-refresh/' || true)
+    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-token-refresh.timer 2>/dev/null || true)
+    TIMER_ACTIVE=$(systemctl --user is-active ezgha-token-refresh.timer 2>/dev/null || true)
+    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-token-refresh.service 2>/dev/null || true)
     if [ -z "$MONITOR_TASKS" ] || [ "$TIMER_ENABLED" != "enabled" ] || [ "$TIMER_ACTIVE" != "active" ]; then
         fail "Gate 7: Monitoring timer not properly installed/enabled/active (timers: '$MONITOR_TASKS', enabled: '$TIMER_ENABLED', active: '$TIMER_ACTIVE', service: '$SERVICE_ACTIVE')"
     fi
@@ -935,13 +935,13 @@ pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
 
 # --- Gate 8: VM/AO/MCP containment (process-level backstop; bead jleechan-aqh) ---
 # Why this gate exists: the project's stated goal is physical-host
-# availability (prevent watchdog reboots). Per-container clamps in Gate 3
+# availability (prevent unconstrained process memory growth). Per-container clamps in Gate 3
 # cover individual Docker containers, but they do NOT bound (a) the QEMU
 # process running the Colima/Lima VM (host-side, outside the container
 # envelope), (b) the Agent Orchestrator and MCP daemons (which run as
 # user-scope processes with no enforced cgroup ceiling), or (c) the
-# aggregate memory demand across all three. The 2026-07-10 watchdog
-# reboot had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
+# aggregate memory demand across all three. The 2026-07-10 incident
+# had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
 # place. This gate makes the absence of any of those constraints a
 # verifier-level fail-closed, citing the four remediation paths so the
 # cold reader sees them at the top of the gate output.
@@ -949,14 +949,6 @@ echo "--- Checking Gate 8: VM/AO/MCP containment ---"
 MODERN_UNIT_DIR="${HOME}/.config/systemd/user"
 MODERN_WRAPPER="${HOME}/.local/bin/codex"
 if [ "$(uname -s)" = "Linux" ]; then
-    # Read-only assertion: it never reloads or restarts watchdog, runners,
-    # containers, or the VM. It checks only the on-disk /etc/watchdog.conf
-    # and the configured repair-binary bytes; it does not claim the running
-    # watchdog daemon has reloaded that config or changed runtime state.
-    WATCHDOG_CONF_PATH=/etc/watchdog.conf ASSERT_LIVE_WATCHDOG=1 \
-        "$REPO_ROOT/scripts/host/assert-no-host-reboot-vote.sh" \
-        || fail "Gate 8 (0) on-disk watchdog contract failed: repair config or binary could still permit a host-reboot vote"
-    echo "    [PASS] Gate 8 (0) on-disk watchdog config and repair binary match the no-host-reboot-vote contract"
     if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
         fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
     fi

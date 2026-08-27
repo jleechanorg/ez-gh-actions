@@ -107,20 +107,6 @@ qemu_max_line=$(grep -n 'QEMU_CEILING_BYTES.*=' "$VERIFY" | head -1 | cut -d: -f
 grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
   || fail "live max QEMU ceiling is not fail-closed"
 
-# Gate 8 (0) is a read-only assertion about the on-disk watchdog config and
-# configured repair-binary bytes. It must not claim that a running watchdog
-# daemon has reloaded/restarted or that runtime state cannot vote reboot.
-grep -Fq 'on-disk watchdog config' "$VERIFY" \
-  || fail "Gate 8 (0) does not describe its on-disk watchdog contract"
-grep -Fq '[PASS] Gate 8 (0) on-disk watchdog config and repair binary match the no-host-reboot-vote contract' "$VERIFY" \
-  || fail "Gate 8 (0) PASS wording overclaims runtime watchdog state"
-! grep -Fq 'active watchdog config' "$VERIFY" \
-  || fail "Gate 8 (0) comments still claim an active watchdog config"
-! grep -Fq '[PASS] Gate 8 (0) watchdog repair cannot vote for a host reboot' "$VERIFY" \
-  || fail "Gate 8 (0) PASS wording still overclaims runtime behavior"
-grep -Fq 'Gate 8 (0) on-disk watchdog contract failed' "$VERIFY" \
-  || fail "Gate 8 (0) failure wording does not identify the on-disk contract"
-
 # Kdump/pstore verification should be quiet on a healthy fixture, while an
 # actual failure must print the operator remediation sequence.
 mkdir -p "$TMP/pstore" "$TMP/crash"

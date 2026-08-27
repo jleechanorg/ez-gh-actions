@@ -43,7 +43,6 @@ jobs:
           bash tests/runner_dashboard_host_probe_test.sh
           bash tests/runner_dashboard_publisher_test.sh
           bash tests/runner_dashboard_launchd_install_test.sh
-          bash tests/watchdog_reboot_stale_state_test.sh
           bash tests/install_watchdog_gate_test.sh
           bash tests/install_uninstall_aux_units_test.sh
       - name: Mac trim guard shell regressions
@@ -82,11 +81,8 @@ jobs:
         run: |
           bash tests/host_ops_0725_test.sh
           bash tests/host_control_artifacts_test.sh
-          bash tests/assert_no_host_reboot_vote_test.sh
+          bash tests/forbid_host_reboot_primitives_test.sh
           bash tests/assert_qemu_cpu_ceiling_test.sh
-          bash tests/apply_cfs_nohz_panic_stop_test.sh
-          bash tests/apply_watchdog_no_reboot_vote_test.sh
-          bash tests/configure_grub_kdump_retired_test.sh
           bash tests/integrate_pr_payload_regression_test.sh
           bash tests/launchd_docker_host_consumers_test.sh
           bash tests/refresh_gh_app_token_timeout_test.sh

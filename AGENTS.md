@@ -81,6 +81,9 @@ Self-heal any failures found before reporting.
 ## /harness command  
 Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gates. Report PASS/FAIL per gate.
 
+## Safety & Monitoring Principles
+- **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**: See `CLAUDE.md` ("Safety & Monitoring Principles"). Physical-host reboot/shutdown commands and watchdog-driven forced restarts are strictly forbidden. Recovery authority belongs strictly to the child layer (container replenishment, process `Restart=on-failure`, graceful shutdown, and operator recovery).
+
 ## Safety rails
 - Never run `git add -A` — stage only files you changed
 - Always push after finishing any unit of work
