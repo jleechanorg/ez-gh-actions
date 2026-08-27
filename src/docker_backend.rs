@@ -253,6 +253,13 @@ pub fn snapshot_reclaim(slot_key: Option<&str>) -> Vec<(String, ReclaimRecord)> 
     out
 }
 
+fn in_memory_gh_missing_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>>
+{
+    use std::sync::{Mutex, OnceLock};
+    static STORE: OnceLock<Mutex<std::collections::HashMap<String, u64>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Test-only escape hatch: clear the reclaim ring buffer and the cached
 /// daemon-start instant so a `TestEnv` can be hermetic even though the
 /// underlying state lives in a process-wide `OnceLock`. Never call from
@@ -265,6 +272,9 @@ pub fn reset_reclaim_state_for_tests() {
     }
     if let Ok(mut start) = daemon_start_instant().lock() {
         *start = None;
+    }
+    if let Ok(mut missing) = in_memory_gh_missing_store().lock() {
+        missing.clear();
     }
 }
 
@@ -362,6 +372,9 @@ pub fn apply_slot_release_with_lifecycle_evidence(
     evidence: LifecycleEvidence,
 ) {
     let key = slot.to_string();
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
+    }
     let history = assignments
         .lifecycle_evidence
         .entry(key.clone())
@@ -428,6 +441,7 @@ pub struct ContainerLifecycleProbe {
 pub fn probe_container_lifecycle(
     container_name: &str,
     container_info: Option<&ManagedContainer>,
+    deadline: Option<Instant>,
 ) -> ContainerLifecycleProbe {
     let mut probe = ContainerLifecycleProbe::default();
 
@@ -445,13 +459,16 @@ pub fn probe_container_lifecycle(
     }
 
     // 2. Fetch bounded listener log tail with a single tight timeout (<= 500ms total deadline)
+    let effective_deadline =
+        deadline.unwrap_or_else(|| Instant::now() + Duration::from_millis(500));
+    let remaining = effective_deadline.saturating_duration_since(Instant::now());
+    if remaining < Duration::from_millis(10) {
+        return probe;
+    }
+
     let mut cmd_logs = docker_cmd();
     cmd_logs.args(["logs", "--tail", "50", container_name]);
-    if let Ok(out) = run_docker_with_timeout(
-        cmd_logs,
-        "capturing listener log tail",
-        Duration::from_millis(500),
-    ) {
+    if let Ok(out) = run_docker_with_timeout(cmd_logs, "capturing listener log tail", remaining) {
         if out.status.success() {
             let mut combined = String::new();
             if !out.stdout.is_empty() {
@@ -463,11 +480,12 @@ pub fn probe_container_lifecycle(
                 }
                 combined.push_str(&String::from_utf8_lossy(&out.stderr));
             }
-            let bounded = bound_log_tail(&combined, 50, 8192);
+            let pre_redacted = redact_secrets(&combined);
+            let bounded = bound_log_tail(&pre_redacted, 50, 8192);
             if !bounded.is_empty() {
-                let redacted = redact_secrets(&bounded);
-                if !redacted.is_empty() {
-                    probe.listener_log_tail = Some(redacted);
+                let post_redacted = redact_secrets(&bounded);
+                if !post_redacted.is_empty() {
+                    probe.listener_log_tail = Some(post_redacted);
                 }
             }
         }
@@ -834,6 +852,9 @@ fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
 }
 
 fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+    let start = Instant::now();
+    let deadline = start + timeout;
+
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -861,29 +882,56 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
         let _ = tx_err.send(buf);
     });
 
-    let stdout = match rx_out.recv_timeout(timeout) {
+    let stdout = match rx_out.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(buf) => buf,
         Err(_) => {
             let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.try_wait();
             bail!(
                 "docker CLI timed out after {}ms while {detail}",
                 timeout.as_millis()
             );
         }
     };
-    let stderr = rx_err
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_default();
 
-    let status = child
-        .wait()
-        .with_context(|| format!("wait for docker CLI during {detail}"))?;
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    let stderr = match rx_err.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(buf) => buf,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.try_wait();
+            bail!(
+                "docker CLI timed out after {}ms while {detail}",
+                timeout.as_millis()
+            );
+        }
+    };
+
+    let reap_deadline = deadline.max(Instant::now() + Duration::from_millis(50));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= reap_deadline {
+                    let _ = child.kill();
+                    let _ = child.try_wait();
+                    bail!(
+                        "docker CLI timed out after {}ms while {detail}",
+                        timeout.as_millis()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => {
+                bail!("failed waiting for docker CLI during {detail}: {err}");
+            }
+        }
+    }
 }
 
 fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config>) -> Result<()> {
@@ -976,6 +1024,9 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
                 .registered_at
                 .insert(key.clone(), now_epoch_secs());
             assignments.gh_missing_first_observed_at.remove(&key);
+            if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+                store.remove(&key);
+            }
             write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(Some(slot));
         }
@@ -1000,6 +1051,9 @@ fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) ->
         .registered_at
         .insert(key.clone(), now_epoch_secs());
     assignments.gh_missing_first_observed_at.remove(&key);
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
+    }
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -1011,8 +1065,11 @@ pub fn release_slot(slot: u32) -> Result<()> {
 }
 
 fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
-    let mut assignments = read_slot_assignments_for(cfg)?;
     let key = slot.to_string();
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
+    }
+    let mut assignments = read_slot_assignments_for(cfg)?;
     assignments.assignments.remove(&key);
     assignments.registered_at.remove(&key);
     assignments.gh_missing_first_observed_at.remove(&key);
@@ -1027,12 +1084,18 @@ fn record_gh_missing_first_observed_for(
     slot: u32,
     observed_at: u64,
 ) -> Result<()> {
-    let mut current = read_slot_assignments_for(cfg)?;
     let key = slot.to_string();
+    let authoritative_ts = if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        *store.entry(key.clone()).or_insert(observed_at)
+    } else {
+        observed_at
+    };
+
+    let mut current = read_slot_assignments_for(cfg)?;
     if let std::collections::btree_map::Entry::Vacant(e) =
         current.gh_missing_first_observed_at.entry(key)
     {
-        e.insert(observed_at);
+        e.insert(authoritative_ts);
         write_slot_assignments_for(&current, cfg)?;
     }
     Ok(())
@@ -1042,8 +1105,11 @@ fn record_gh_missing_first_observed_for(
 /// the runner is authoritatively observed live on GitHub). Re-reads current disk
 /// state at mutation time to avoid clobbering concurrent or preceding slot updates.
 fn clear_gh_missing_first_observed_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
-    let mut current = read_slot_assignments_for(cfg)?;
     let key = slot.to_string();
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
+    }
+    let mut current = read_slot_assignments_for(cfg)?;
     if current.gh_missing_first_observed_at.remove(&key).is_some() {
         write_slot_assignments_for(&current, cfg)?;
     }
@@ -1343,6 +1409,7 @@ fn release_stale_slots_from_with_containers_for(
     if assignments.assignments.is_empty() {
         return Ok(0);
     }
+    let tick_evidence_deadline = Instant::now() + Duration::from_millis(500);
     let live_ids: HashSet<u64> = live_runners.iter().map(|r| r.id).collect();
     let mut reclaimed = 0;
     for (slot, id_str) in &assignments.assignments {
@@ -1448,10 +1515,15 @@ fn release_stale_slots_from_with_containers_for(
                             let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
                             let current_assignments = read_slot_assignments_for(cfg)
                                 .unwrap_or_else(|_| assignments.clone());
+                            let in_mem_ts = in_memory_gh_missing_store()
+                                .lock()
+                                .ok()
+                                .and_then(|store| store.get(slot).copied());
                             let first_observed = current_assignments
                                 .gh_missing_first_observed_at
                                 .get(slot)
                                 .copied()
+                                .or(in_mem_ts)
                                 .unwrap_or(wall_secs);
                             let gh_missing_duration_secs = wall_secs.saturating_sub(first_observed);
                             // Bead jleechan-tv58: surface the in-flight run_id
@@ -1464,7 +1536,11 @@ fn release_stale_slots_from_with_containers_for(
                             let jit_issued_at = assignments.registered_at.get(slot).copied();
                             let container_info = managed_containers
                                 .and_then(|list| list.iter().find(|c| c.name == expected_name));
-                            let probe = probe_container_lifecycle(&expected_name, container_info);
+                            let probe = probe_container_lifecycle(
+                                &expected_name,
+                                container_info,
+                                Some(tick_evidence_deadline),
+                            );
 
                             let evidence = LifecycleEvidence {
                                 slot: slot_n,
@@ -9007,7 +9083,7 @@ exit 0
             running_for: "10 minutes".to_string(),
         };
 
-        let probe = probe_container_lifecycle("ez-org-runner-1", Some(&container_info));
+        let probe = probe_container_lifecycle("ez-org-runner-1", Some(&container_info), None);
         assert_eq!(
             probe.container_id,
             Some("cid-mock-abcdef123456".to_string())
@@ -9046,7 +9122,7 @@ exec /bin/sleep 10
         *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
 
         let start = Instant::now();
-        let probe = probe_container_lifecycle("ez-org-runner-1", None);
+        let probe = probe_container_lifecycle("ez-org-runner-1", None, None);
         let elapsed = start.elapsed();
 
         // Must timeout and return gracefully within bounded <= 500ms deadline (+ margin for test harness)
@@ -9586,6 +9662,187 @@ exec /bin/sleep 10
         assert_eq!(
             assignments.gh_missing_first_observed_at.get("2").copied(),
             Some(1700000015)
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_10_hung_slots_share_single_deadline_and_complete_in_500ms() {
+        let _env = TestEnv::new("10_hung_slots_shared_deadline");
+        let cfg = cfg_with(10, "ez-org-runner");
+
+        let now = now_epoch_secs();
+        let jit_issued_at = now - REGISTRATION_GRACE_WINDOW.as_secs() - 10;
+        let mut initial = SlotAssignments::default();
+        let mut local_names = HashSet::new();
+
+        for slot_n in 1..=10 {
+            initial
+                .assignments
+                .insert(slot_n.to_string(), (1000 + slot_n as u64).to_string());
+            initial
+                .registered_at
+                .insert(slot_n.to_string(), jit_issued_at);
+            local_names.insert(format!("ez-org-runner-{slot_n}"));
+        }
+        write_slot_assignments_for(&initial, Some(&cfg)).unwrap();
+
+        // Install a hanging docker shim (10s sleep per invocation)
+        let script = _env.path.parent().unwrap().join("hanging-docker-10.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+exec /bin/sleep 10
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let live = vec![];
+        let start = Instant::now();
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(reclaimed, 10, "all 10 stale slots must be reclaimed");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "10 hung slots must finish within shared tick deadline (target <=500ms + test margin); took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn run_docker_with_timeout_bounds_hanging_stderr_with_closed_stdout() {
+        let _env = TestEnv::new("timeout_closed_stdout_hanging_stderr");
+
+        let script = _env.path.parent().unwrap().join("hanging-stderr.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+# Close stdout immediately, hang stderr
+exec 1>&-
+exec /bin/sleep 10 1>&2
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let cmd = Command::new(&script);
+        let start = Instant::now();
+        let res = run_docker_with_timeout(cmd, "test-hanging-stderr", Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "must return timeout error");
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "hanging stderr with closed stdout must not wait 5s; elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_before_bounding_prevents_truncated_secret_leaks() {
+        let sensitive_pat = [
+            "github_pat_",
+            "11SECRET_PAT_CONTENT_ABCDEF1234567890_XYZ987654321",
+        ]
+        .concat();
+        let sensitive_jwt = [
+            "eyJ",
+            "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        ]
+        .concat();
+
+        let prefix = "X".repeat(8185);
+        let raw_stream = format!("{prefix}{sensitive_pat}\n{sensitive_jwt}\n");
+
+        let pre_redacted = redact_secrets(&raw_stream);
+        let bounded = bound_log_tail(&pre_redacted, 50, 8192);
+        let finalized = redact_secrets(&bounded);
+
+        assert!(
+            !finalized.contains("11SECRET_PAT_CONTENT_ABCDEF"),
+            "token content must not leak across truncation boundary"
+        );
+        assert!(
+            !finalized.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"),
+            "JWT signature must not leak"
+        );
+        assert!(finalized.contains("[REDACTED_GH_PAT]") || !finalized.contains(&sensitive_pat));
+    }
+
+    #[test]
+    fn gh_missing_observation_survives_persistence_failure_and_retains_original_timestamp_on_recovery(
+    ) {
+        let _env = TestEnv::new("missing_observation_survives_write_failure");
+        let cfg = cfg_with(1, "ez-org-runner");
+
+        let _s1 = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+
+        let t0 = now_epoch_secs() - 70;
+        let mut initial = read_slot_assignments_for(Some(&cfg)).unwrap();
+        initial.registered_at.insert("1".to_string(), t0);
+        write_slot_assignments_for(&initial, Some(&cfg)).unwrap();
+
+        let record_res = record_gh_missing_first_observed_for(Some(&cfg), 1, t0);
+        assert!(record_res.is_ok());
+
+        // Simulate slot_assignments.toml losing the gh_missing entry due to write rollback/failure
+        let mut corrupted = read_slot_assignments_for(Some(&cfg)).unwrap();
+        corrupted.gh_missing_first_observed_at.clear();
+        write_slot_assignments_for(&corrupted, Some(&cfg)).unwrap();
+
+        // Subsequent tick at t0 + 50s (now - 20s): in-memory authoritative timestamp must be retained
+        let t1 = t0 + 50;
+        let record_res2 = record_gh_missing_first_observed_for(Some(&cfg), 1, t1);
+        assert!(record_res2.is_ok());
+
+        // Advance time past grace and reclaim
+        let mut past_grace = read_slot_assignments_for(Some(&cfg)).unwrap();
+        past_grace.registered_at.insert("1".to_string(), t0 - 10);
+        write_slot_assignments_for(&past_grace, Some(&cfg)).unwrap();
+
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let live = vec![];
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 1);
+        let final_assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        let ev = &final_assignments.lifecycle_evidence["1"][0];
+        assert!(
+            ev.gh_missing_duration_secs >= 70,
+            "missing duration must be measured from initial observation t0; got {}",
+            ev.gh_missing_duration_secs
         );
     }
 }
