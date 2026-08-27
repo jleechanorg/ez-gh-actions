@@ -372,9 +372,6 @@ pub fn apply_slot_release_with_lifecycle_evidence(
     evidence: LifecycleEvidence,
 ) {
     let key = slot.to_string();
-    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
-        store.remove(&key);
-    }
     let history = assignments
         .lifecycle_evidence
         .entry(key.clone())
@@ -399,7 +396,12 @@ pub fn release_slot_with_lifecycle_evidence_for(
 ) -> Result<()> {
     let mut current = read_slot_assignments_for(cfg)?;
     apply_slot_release_with_lifecycle_evidence(&mut current, slot, evidence.clone());
-    write_slot_assignments_for(&current, cfg)
+    write_slot_assignments_for(&current, cfg)?;
+    let key = slot.to_string();
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
+    }
+    Ok(())
 }
 
 pub fn read_lifecycle_evidence_for(
@@ -851,9 +853,61 @@ fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
     );
 }
 
+fn cleanup_and_reap_child(
+    mut child: std::process::Child,
+    detail: &str,
+    reason: &str,
+) -> Result<()> {
+    let child_pid = child.id();
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child_pid as i32), libc::SIGKILL);
+        libc::kill(child_pid as i32, libc::SIGKILL);
+    }
+    let _ = child.kill();
+
+    let cleanup_deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < cleanup_deadline {
+        match child.try_wait() {
+            Ok(Some(_status)) => return Ok(()),
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(err) => {
+                bail!(
+                    "failed to poll reap status for docker child process {child_pid} during {detail} after {reason}: {err}"
+                );
+            }
+        }
+    }
+
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => bail!(
+            "cleanup failed: unable to reap docker child process {child_pid} for {detail} after {reason} within cleanup deadline"
+        ),
+        Err(err) => bail!(
+            "cleanup failed: error checking reap status for docker child process {child_pid} for {detail} after {reason}: {err}"
+        ),
+    }
+}
+
+fn handle_docker_child_error(
+    child: std::process::Child,
+    detail: &str,
+    primary_error_msg: &str,
+) -> Result<Output> {
+    cleanup_and_reap_child(child, detail, primary_error_msg)?;
+    bail!("{primary_error_msg}")
+}
+
 fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
     let start = Instant::now();
     let deadline = start + timeout;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd
         .stdin(std::process::Stdio::null())
@@ -885,11 +939,13 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     let stdout = match rx_out.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(buf) => buf,
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.try_wait();
-            bail!(
-                "docker CLI timed out after {}ms while {detail}",
-                timeout.as_millis()
+            return handle_docker_child_error(
+                child,
+                detail,
+                &format!(
+                    "docker CLI timed out after {}ms while {detail}",
+                    timeout.as_millis()
+                ),
             );
         }
     };
@@ -897,11 +953,13 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
     let stderr = match rx_err.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(buf) => buf,
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.try_wait();
-            bail!(
-                "docker CLI timed out after {}ms while {detail}",
-                timeout.as_millis()
+            return handle_docker_child_error(
+                child,
+                detail,
+                &format!(
+                    "docker CLI timed out after {}ms while {detail}",
+                    timeout.as_millis()
+                ),
             );
         }
     };
@@ -918,17 +976,23 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
             }
             Ok(None) => {
                 if Instant::now() >= reap_deadline {
-                    let _ = child.kill();
-                    let _ = child.try_wait();
-                    bail!(
-                        "docker CLI timed out after {}ms while {detail}",
-                        timeout.as_millis()
+                    return handle_docker_child_error(
+                        child,
+                        detail,
+                        &format!(
+                            "docker CLI timed out after {}ms while {detail}",
+                            timeout.as_millis()
+                        ),
                     );
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(err) => {
-                bail!("failed waiting for docker CLI during {detail}: {err}");
+                return handle_docker_child_error(
+                    child,
+                    detail,
+                    &format!("failed waiting for docker CLI during {detail}: {err}"),
+                );
             }
         }
     }
@@ -1024,10 +1088,10 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
                 .registered_at
                 .insert(key.clone(), now_epoch_secs());
             assignments.gh_missing_first_observed_at.remove(&key);
+            write_slot_assignments_for(&assignments, Some(cfg))?;
             if let Ok(mut store) = in_memory_gh_missing_store().lock() {
                 store.remove(&key);
             }
-            write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(Some(slot));
         }
     }
@@ -1051,10 +1115,11 @@ fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) ->
         .registered_at
         .insert(key.clone(), now_epoch_secs());
     assignments.gh_missing_first_observed_at.remove(&key);
+    write_slot_assignments_for(&assignments, cfg)?;
     if let Ok(mut store) = in_memory_gh_missing_store().lock() {
         store.remove(&key);
     }
-    write_slot_assignments_for(&assignments, cfg)
+    Ok(())
 }
 
 /// Release a slot previously acquired by `next_slot`. The slot becomes
@@ -1066,14 +1131,15 @@ pub fn release_slot(slot: u32) -> Result<()> {
 
 fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     let key = slot.to_string();
-    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
-        store.remove(&key);
-    }
     let mut assignments = read_slot_assignments_for(cfg)?;
     assignments.assignments.remove(&key);
     assignments.registered_at.remove(&key);
     assignments.gh_missing_first_observed_at.remove(&key);
-    write_slot_assignments_for(&assignments, cfg)
+    write_slot_assignments_for(&assignments, cfg)?;
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
+    }
+    Ok(())
 }
 
 /// Atomically record the first time a slot was observed missing on GitHub while
@@ -1106,12 +1172,12 @@ fn record_gh_missing_first_observed_for(
 /// state at mutation time to avoid clobbering concurrent or preceding slot updates.
 fn clear_gh_missing_first_observed_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     let key = slot.to_string();
-    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
-        store.remove(&key);
-    }
     let mut current = read_slot_assignments_for(cfg)?;
     if current.gh_missing_first_observed_at.remove(&key).is_some() {
         write_slot_assignments_for(&current, cfg)?;
+    }
+    if let Ok(mut store) = in_memory_gh_missing_store().lock() {
+        store.remove(&key);
     }
     Ok(())
 }
@@ -9843,6 +9909,240 @@ exec /bin/sleep 10 1>&2
             ev.gh_missing_duration_secs >= 70,
             "missing duration must be measured from initial observation t0; got {}",
             ev.gh_missing_duration_secs
+        );
+    }
+
+    #[test]
+    fn gh_missing_observation_survives_release_write_failure_and_preserves_authoritative_t0() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = TestEnv::new("missing_obs_release_write_failure");
+        let cfg = cfg_with(1, "ez-org-runner");
+
+        let _s1 = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+
+        let t0 = now_epoch_secs() - 70;
+        let mut initial = read_slot_assignments_for(Some(&cfg)).unwrap();
+        initial.registered_at.insert("1".to_string(), t0);
+        write_slot_assignments_for(&initial, Some(&cfg)).unwrap();
+
+        // 1. First observation recorded at t0
+        record_gh_missing_first_observed_for(Some(&cfg), 1, t0).unwrap();
+
+        // 2. Simulate initial persistence write failure: disk loses gh_missing entry (t0 lives only in memory)
+        let mut disk_failure = read_slot_assignments_for(Some(&cfg)).unwrap();
+        disk_failure.gh_missing_first_observed_at.clear();
+        write_slot_assignments_for(&disk_failure, Some(&cfg)).unwrap();
+
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let live = vec![];
+
+        // 3. Inject real filesystem write failure on release: make state directory read-only
+        let slot_path = slot_assignments_path_for(Some(&cfg));
+        let parent_dir = slot_path.parent().unwrap();
+        let orig_perms = std::fs::metadata(parent_dir).unwrap().permissions();
+        let mut ro_perms = orig_perms.clone();
+        ro_perms.set_mode(0o555);
+        std::fs::set_permissions(parent_dir, ro_perms).unwrap();
+
+        // Attempt reclaim: release write must fail closed
+        let failed_reclaim = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        );
+        assert!(
+            failed_reclaim.is_err(),
+            "reclaim must fail when durable release write fails"
+        );
+
+        // Restore permissions
+        std::fs::set_permissions(parent_dir, orig_perms).unwrap();
+
+        // Verify slot is NOT released on disk and no evidence was lost/written partially
+        let disk_after_fail = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert_eq!(
+            disk_after_fail.assignments.get("1").map(String::as_str),
+            Some("4242"),
+            "slot 1 must remain assigned on disk after release write failure"
+        );
+
+        // 4. Subsequent tick: persistence is restored, reclaim succeeds
+        let successful_reclaim = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        );
+        assert_eq!(
+            successful_reclaim.unwrap(),
+            1,
+            "reclaim must succeed once persistence is restored"
+        );
+
+        // 5. Final durable evidence MUST reflect original observation t0 (duration >= 70s), not duration 0
+        let final_assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(
+            !final_assignments.assignments.contains_key("1"),
+            "slot 1 must now be released"
+        );
+        let ev = &final_assignments.lifecycle_evidence["1"][0];
+        assert!(
+            ev.gh_missing_duration_secs >= 70,
+            "final durable evidence MUST use original first-observation duration (>=70s), got {}",
+            ev.gh_missing_duration_secs
+        );
+    }
+
+    #[test]
+    fn run_docker_with_timeout_stdout_timeout_kills_and_reaps_child_process() {
+        let _env = TestEnv::new("timeout_reap_stdout");
+        let pid_path = _env.path.parent().unwrap().join("child-stdout.pid");
+        let script = _env.path.parent().unwrap().join("hung-stdout.sh");
+
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo $$ > "{}"
+exec /bin/sleep 10
+"#,
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let cmd = Command::new(&script);
+        let start = Instant::now();
+        let res = run_docker_with_timeout(cmd, "test-hung-stdout", Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "must return timeout error");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "timeout must be bounded; elapsed: {elapsed:?}"
+        );
+
+        // Read real child PID
+        let child_pid_str = std::fs::read_to_string(&pid_path).expect("child PID file must exist");
+        let child_pid: i32 = child_pid_str.trim().parse().expect("valid PID integer");
+
+        // Prove PID no longer exists / has been reaped
+        let mut still_alive = true;
+        for _ in 0..50 {
+            let exists = unsafe { libc::kill(child_pid, 0) } == 0;
+            #[cfg(target_os = "linux")]
+            let is_zombie = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, tail)| tail.starts_with('Z'))
+                })
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let is_zombie = false;
+            still_alive = exists && !is_zombie;
+            if !still_alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if still_alive {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !still_alive,
+            "stdout timeout left child pid {child_pid} alive or unreaped"
+        );
+    }
+
+    #[test]
+    fn run_docker_with_timeout_stderr_timeout_kills_and_reaps_child_process() {
+        let _env = TestEnv::new("timeout_reap_stderr");
+        let pid_path = _env.path.parent().unwrap().join("child-stderr.pid");
+        let script = _env.path.parent().unwrap().join("hung-stderr.sh");
+
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo $$ > "{}"
+# Close stdout immediately, hang stderr
+exec 1>&-
+exec /bin/sleep 10 1>&2
+"#,
+                pid_path.display()
+            ),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let cmd = Command::new(&script);
+        let start = Instant::now();
+        let res = run_docker_with_timeout(cmd, "test-hung-stderr", Duration::from_millis(300));
+        let elapsed = start.elapsed();
+
+        assert!(res.is_err(), "must return timeout error");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "timeout must be bounded; elapsed: {elapsed:?}"
+        );
+
+        // Read real child PID
+        let child_pid_str = std::fs::read_to_string(&pid_path).expect("child PID file must exist");
+        let child_pid: i32 = child_pid_str.trim().parse().expect("valid PID integer");
+
+        // Prove PID no longer exists / has been reaped
+        let mut still_alive = true;
+        for _ in 0..50 {
+            let exists = unsafe { libc::kill(child_pid, 0) } == 0;
+            #[cfg(target_os = "linux")]
+            let is_zombie = std::fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, tail)| tail.starts_with('Z'))
+                })
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let is_zombie = false;
+            still_alive = exists && !is_zombie;
+            if !still_alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if still_alive {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !still_alive,
+            "stderr timeout left child pid {child_pid} alive or unreaped"
         );
     }
 }
