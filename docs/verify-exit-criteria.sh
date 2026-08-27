@@ -275,17 +275,6 @@ cgroup_has_effective_memory_ceiling() {
     return 1
 }
 
-if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
-    case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
-        config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
-        platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
-        containers) verify_managed_runners_in_actions_slice ;;
-        cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
-        *) echo "unknown verifier test case" >&2; exit 2 ;;
-    esac
-    exit $?
-fi
-
 daemon_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
     local daemon_kernel host_kernel
@@ -337,24 +326,30 @@ daemon_overlay_free_disk_gb() {
     echo $((avail_kb / 1024 / 1024))
 }
 
+kdump_target_mount_is_writable() {
+    local target="$1" mount_options
+    if [ "${VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS+x}" = x ]; then
+        mount_options="$VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS"
+    else
+        command -v findmnt >/dev/null 2>&1 || return 1
+        mount_options="$(findmnt -n -o OPTIONS --target "$target" 2>/dev/null)" || return 1
+    fi
+    case ",$mount_options," in
+        *,rw,*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
-    cat <<'REMEDIATE'
-[FAIL] Crash capture is not active on this host. The project's stated goal
-       (physical-host availability) cannot be proven without it.
-
-REPRODUCIBLE REMEDIATION:
-    1. sudo bash scripts/host/configure-grub-kdump.sh    # already-prepared, transactional, survives failure
-    2. sudo reboot                                     # required; GRUB + crashkernel=2G only take effect after reboot
-    3. ./docs/verify-exit-criteria.sh                  # re-run; this gate will turn green once /sys/kernel/kexec_crash_loaded == 1
-                                                       # After reboot, kexec_crash_loaded should read 1.
-
-OPERATIONAL PROOF (separate from this gate's check):
-    Once rebooted, run scripts/host/crash-capture-verify.sh --force (after --dry-run)
-    to confirm a vmcore lands in /var/crash; this is the OPERATIONAL proof that kdump works.
-    Then run scripts/host/crash-capture-verify.sh --verify <stamp> --no-trigger after
-    the post-panic reboot to close bead ez-gh-actions-r3f15.
-REMEDIATE
+    local pstore_root="${VERIFY_EXIT_CRITERIA_PSTORE_ROOT:-/sys/fs/pstore}"
+    local kexec_crash_loaded_path="${VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH:-/sys/kernel/kexec_crash_loaded}"
+    local kdump_dir="${VERIFY_EXIT_CRITERIA_KDUMP_DIR:-/var/crash}"
+    local remediation="${VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION:-${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/kdump-remediation.sh}"
+    kdump_fail() {
+        "$remediation"
+        fail "$1"
+    }
     # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
     #     it routes only userspace coredumps (SIGSEGV in a process), NOT
     #     kernel panics. Kdump dumps kernel panics via kexec-loaded crash
@@ -370,34 +365,48 @@ REMEDIATE
     #     "physical-host availability" goal benefits from having at least
     #     one panic-time capture path beyond kdump alone. Keeping it checked
     #     here is intentional; it is independent of core_pattern.
-    if [ ! -d /sys/fs/pstore ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/fs/pstore is not mounted (no firmware/pstore crash logs can survive a panic)"
+    if [ ! -d "$pstore_root" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $pstore_root is not mounted (no firmware/pstore crash logs can survive a panic)"
     fi
     # (3) Kernel-panic capture lives in /sys/kernel/kexec_crash_loaded:
     #     when kdump has kexec-loaded the crash kernel, this reads '1'.
-    #     If the kernel was rebooted after running configure-grub-kdump.sh
+    #     If the kernel was rebooted after the supported kdump remediation
     #     but kexec_crash_loaded is still 0, the crash kernel did NOT load
     #     — either GRUB picked the wrong cmdline or crashkernel= is wrong.
-    if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is missing (kdump kernel never installed)"
+    if [ ! -f "$kexec_crash_loaded_path" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is missing (kdump kernel never installed)"
     fi
-    if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is not '1' (kdump kernel is not loaded into the running kernel)"
+    if [ "$(cat "$kexec_crash_loaded_path" 2>/dev/null || echo 0)" != "1" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is not '1' (kdump kernel is not loaded into the running kernel)"
     fi
-    # (4) /var/crash is the kdump-tools default destination on debian/ubuntu.
-    #     If the directory is missing OR not writable by root, the vmcore
-    #     file cannot land and the panic capture is silently lost (kexec
+    # (4) /var/crash is the kdump-tools default destination on Debian/Ubuntu.
+    #     Kdump writes as root, so testing `-w` as the unprivileged verifier
+    #     would reject a normal root-owned mode-0755 directory. Instead,
+    #     require that the directory exists and its containing mount is rw.
+    #     If the directory is missing or the mount is read-only, the vmcore
+    #     cannot land and the panic capture is silently lost (kexec
     #     loads the crash kernel, then the crash kernel mounts the root
     #     filesystem and writes here; if this path is unwritable, kdump
     #     fails its post-reboot handshake and produces no vmcore).
-    KDUMP_DIR=/var/crash
-    if [ ! -d "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR does not exist; kdump has no dump target. Remediation: install kdump-tools (apt-get install kdump-tools) or run scripts/host/configure-grub-kdump.sh which prepares the path."
+    if [ ! -d "$kdump_dir" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir does not exist; kdump has no dump target. Remediation: install kdump-tools, then sudo install -d -m 0755 /var/crash and follow scripts/host/kdump-remediation.sh."
     fi
-    if [ ! -w "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR is not writable by root; kernel cannot save vmcores here."
+    if ! kdump_target_mount_is_writable "$kdump_dir"; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir is not on a verifiably writable mount; kernel cannot save vmcores here."
     fi
 }
+
+if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
+    case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
+        config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        containers) verify_managed_runners_in_actions_slice ;;
+        cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
+        kdump) verify_kdump_pstore ;;
+        *) echo "unknown verifier test case" >&2; exit 2 ;;
+    esac
+    exit $?
+fi
 
 # Verify the cgroup v2 path for the given raw /proc/<pid>/cgroup line
 # (including the optional leading "0::") has a finite effective memory ceiling
@@ -871,10 +880,10 @@ pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet usi
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"
 if [ "$PLATFORM" = "linux" ]; then
-    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-watchdog/ || $2 ~ /ezgha-watchdog/ || $3 ~ /ezgha-watchdog/ || $0 ~ /ezgha-watchdog/' || true)
-    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-watchdog.timer 2>/dev/null || true)
-    TIMER_ACTIVE=$(systemctl --user is-active ezgha-watchdog.timer 2>/dev/null || true)
-    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-watchdog.service 2>/dev/null || true)
+    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-token-refresh/ || $2 ~ /ezgha-token-refresh/ || $3 ~ /ezgha-token-refresh/ || $0 ~ /ezgha-token-refresh/' || true)
+    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-token-refresh.timer 2>/dev/null || true)
+    TIMER_ACTIVE=$(systemctl --user is-active ezgha-token-refresh.timer 2>/dev/null || true)
+    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-token-refresh.service 2>/dev/null || true)
     if [ -z "$MONITOR_TASKS" ] || [ "$TIMER_ENABLED" != "enabled" ] || [ "$TIMER_ACTIVE" != "active" ]; then
         fail "Gate 7: Monitoring timer not properly installed/enabled/active (timers: '$MONITOR_TASKS', enabled: '$TIMER_ENABLED', active: '$TIMER_ACTIVE', service: '$SERVICE_ACTIVE')"
     fi
@@ -926,13 +935,13 @@ pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
 
 # --- Gate 8: VM/AO/MCP containment (process-level backstop; bead jleechan-aqh) ---
 # Why this gate exists: the project's stated goal is physical-host
-# availability (prevent watchdog reboots). Per-container clamps in Gate 3
+# availability (prevent unconstrained process memory growth). Per-container clamps in Gate 3
 # cover individual Docker containers, but they do NOT bound (a) the QEMU
 # process running the Colima/Lima VM (host-side, outside the container
 # envelope), (b) the Agent Orchestrator and MCP daemons (which run as
 # user-scope processes with no enforced cgroup ceiling), or (c) the
-# aggregate memory demand across all three. The 2026-07-10 watchdog
-# reboot had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
+# aggregate memory demand across all three. The 2026-07-10 incident
+# had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
 # place. This gate makes the absence of any of those constraints a
 # verifier-level fail-closed, citing the four remediation paths so the
 # cold reader sees them at the top of the gate output.

@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::sync::Once;
@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::failure_ladder::{FailureLadder, FailureLadderPolicy, FailureLadderTransition};
 use crate::github;
 use crate::platform::Platform;
 use crate::quarantine::{self, QuarantineEntry, QuarantineReason, QuarantineTable};
@@ -23,6 +24,7 @@ use crate::reaper;
 use crate::watchdog;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
+const FAILURE_LADDER_PATH_ENV: &str = "EZGHA_FAILURE_LADDER_PATH";
 
 /// Pinned image used by the in-daemon cgroup-probe (`docker run --rm`).
 /// Pinning prevents (a) a `latest` tag drift breaking the probe when
@@ -41,6 +43,17 @@ const DISK_MEASURE_STRIKES: u32 = 2;
 /// observability-only: `limits.min_free_disk_gb` remains the admission floor.
 const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
+/// Once a failure-ladder transition cannot be persisted, the on-disk ledger
+/// is stale and the daemon must not admit another external start against it.
+/// This latch intentionally lasts for the daemon lifetime; process restart is
+/// the explicit recovery condition that re-establishes a fresh persistence
+/// contract before admission resumes.
+static FAILURE_LADDER_PERSISTENCE_FAILED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn reset_failure_ladder_admission_latch_for_tests() {
+    FAILURE_LADDER_PERSISTENCE_FAILED.store(false, Ordering::SeqCst);
+}
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 // Post-refill readiness gets one 5s shared local-Docker budget. At the normal
@@ -2485,6 +2498,21 @@ pub fn preview_memory_budget(cfg: &Config) -> MemoryBudgetPreview {
 /// function pick the lowest free slot itself. Used by `start_missing_runners`
 /// so a failed slot can be excluded from the next pick within the same batch.
 /// Returns (container_id, runner_name).
+#[derive(Debug)]
+struct ControlPlaneStartError(String);
+
+impl std::fmt::Display for ControlPlaneStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ControlPlaneStartError {}
+
+fn control_plane_start_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(ControlPlaneStartError(format!("{error:#}")))
+}
+
 fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(String, String)> {
     #[cfg(test)]
     {
@@ -2498,7 +2526,10 @@ fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(Strin
         }
     }
 
-    start_one_with_generate_at_slot(cfg, backend, slot, github::generate_jitconfig)
+    start_one_with_generate_at_slot(cfg, backend, slot, |github, name, labels, owned_ids| {
+        github::generate_jitconfig(github, name, labels, owned_ids)
+            .map_err(control_plane_start_error)
+    })
 }
 
 /// Test-only convenience wrapper: allocates the next free slot itself (via
@@ -3258,6 +3289,70 @@ fn start_missing_runners(
 struct StartMissingOutcome {
     started: Vec<String>,
     start_failures: u32,
+    admission_paused_reason: Option<String>,
+}
+
+fn failure_ladder_policy(cfg: &Config) -> FailureLadderPolicy {
+    FailureLadderPolicy {
+        slot_failure_threshold: cfg.failure_ladder.slot_failure_threshold,
+        slot_window_secs: cfg.failure_ladder.slot_failure_window_secs,
+        slot_cooldown_secs: cfg.failure_ladder.slot_cooldown_secs,
+        // Keep the default policy usable for legacy/small one- and two-slot
+        // configs while ensuring the fleet circuit is never impossible.
+        fleet_open_slots_threshold: cfg
+            .failure_ladder
+            .fleet_open_slot_threshold
+            .min(cfg.runner.count.max(1)),
+        fleet_cooldown_secs: cfg.failure_ladder.fleet_cooldown_secs,
+    }
+}
+
+fn failure_ladder_path_for(cfg: &Config) -> PathBuf {
+    if let Ok(path) = env::var(FAILURE_LADDER_PATH_ENV) {
+        return PathBuf::from(path);
+    }
+    if let Some(state_dir) = &cfg.state_dir {
+        return state_dir.join("failure_ladder.toml");
+    }
+    slot_assignments_path_for(Some(cfg)).with_file_name("failure_ladder.toml")
+}
+
+fn notify_failure_ladder_transition(
+    cfg: &Config,
+    transition: &FailureLadderTransition,
+    open_slots: usize,
+) {
+    if transition.slot_opened {
+        let slot = transition.slot.expect("slot-open transition has a slot");
+        let _ = alert::notify(
+            cfg,
+            &format!("runner_pool.slot_circuit.{slot}"),
+            Severity::Warning,
+            "Runner slot circuit opened",
+            &format!(
+                "slot {slot} reached the local-start failure threshold; excluding only that slot for {} seconds while sibling slots remain eligible",
+                cfg.failure_ladder.slot_cooldown_secs
+            ),
+        );
+    }
+    if transition.fleet_opened {
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.fleet_admission_circuit",
+            Severity::Critical,
+            "Runner fleet admission paused",
+            &format!(
+                "{open_slots} distinct slot circuits are open; pausing only new runner starts for {} seconds. Existing jobs continue, and ezgha will not stop the VM or host",
+                cfg.failure_ladder.fleet_cooldown_secs
+            ),
+        );
+    }
+    if transition.slot_closed || transition.fleet_closed {
+        eprintln!(
+            "info: runner failure circuit recovered (slot={:?}, slot_closed={}, fleet_closed={})",
+            transition.slot, transition.slot_closed, transition.fleet_closed
+        );
+    }
 }
 
 fn start_missing_runners_with_starter(
@@ -3266,10 +3361,66 @@ fn start_missing_runners_with_starter(
     missing: u32,
     starter: impl Fn(&Config, Backend, u32) -> Result<(String, String)>,
 ) -> Result<StartMissingOutcome> {
+    if FAILURE_LADDER_PERSISTENCE_FAILED.load(Ordering::SeqCst) {
+        let reason =
+            "failure-ladder persistence previously failed; runner admission remains paused until daemon restart";
+        eprintln!("warning: {reason}");
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(reason.into()),
+            ..StartMissingOutcome::default()
+        });
+    }
     let mut started = Vec::new();
     let mut start_failures = 0;
     let mut last_err = None;
-    let mut failed_slots: HashSet<u32> = HashSet::new();
+    let path = failure_ladder_path_for(cfg);
+    let policy = failure_ladder_policy(cfg);
+    let mut ladder = match FailureLadder::load(&path) {
+        Ok(ladder) => ladder,
+        Err(err) => {
+            let reason = format!(
+                "failure-ladder state is unreadable; failing closed without starting runners: {err:#}"
+            );
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.failure_ladder_state",
+                Severity::Critical,
+                "Runner admission paused: failure-ladder state unreadable",
+                &reason,
+            );
+            return Ok(StartMissingOutcome {
+                admission_paused_reason: Some(reason),
+                ..StartMissingOutcome::default()
+            });
+        }
+    };
+    let now = now_epoch_secs();
+    let mut failed_slots: HashSet<u32> = ladder.excluded_slots(now);
+    if ladder.fleet_admission_is_paused(now) {
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(format!(
+                "fleet admission circuit is open with {} slot circuit(s); existing jobs remain running",
+                ladder.open_slot_count(now)
+            )),
+            ..StartMissingOutcome::default()
+        });
+    }
+    // Prove that the current ledger can still be durably persisted before any
+    // external JIT/Docker start.  A transition save can race with filesystem
+    // failure after this point, so the daemon-lifetime latch below remains
+    // necessary; this preflight closes the first-attempt fail-open window.
+    if let Err(err) = ladder.save(&path) {
+        FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+        let reason = format!(
+            "could not preflight failure-ladder persistence; runner admission remains paused until daemon restart: {err:#}"
+        );
+        eprintln!("warning: {reason}");
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(reason),
+            ..StartMissingOutcome::default()
+        });
+    }
+    let mut admission_paused_reason = None;
     for _ in 0..missing {
         if crate::shutdown::is_requested() {
             eprintln!("shutdown requested; stopping runner spawn mid-batch");
@@ -3279,7 +3430,16 @@ fn start_missing_runners_with_starter(
         let slot = match next_slot_excluding(cfg, &failed_slots) {
             Ok(Some(slot)) => slot,
             Ok(None) => {
-                eprintln!("info: no free runner slot yet; registration turnover is still settling");
+                if ladder.open_slot_count(now_epoch_secs()) > 0 {
+                    admission_paused_reason = Some(format!(
+                        "{} runner slot circuit(s) are cooling down; sibling slots are occupied or settling",
+                        ladder.open_slot_count(now_epoch_secs())
+                    ));
+                } else {
+                    eprintln!(
+                        "info: no free runner slot yet; registration turnover is still settling"
+                    );
+                }
                 break;
             }
             Err(e) => {
@@ -3290,12 +3450,56 @@ fn start_missing_runners_with_starter(
             }
         };
         match starter(cfg, backend, slot) {
-            Ok((_, name)) => started.push(name),
+            Ok((_, name)) => {
+                started.push(name);
+                let transition = ladder.record_success(slot, now_epoch_secs());
+                if let Err(err) = ladder.save(&path) {
+                    FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+                    admission_paused_reason = Some(format!(
+                        "could not persist failure-ladder recovery; pausing further starts: {err:#}"
+                    ));
+                    break;
+                }
+                notify_failure_ladder_transition(
+                    cfg,
+                    &transition,
+                    ladder.open_slot_count(now_epoch_secs()),
+                );
+            }
             Err(e) => {
                 eprintln!("warning: failed to start runner in slot {slot}: {e:#}");
+                if e.downcast_ref::<ControlPlaneStartError>().is_some() {
+                    start_failures += 1;
+                    admission_paused_reason = Some(format!(
+                        "GitHub JIT/control-plane start failed; pausing this refill without penalizing slot {slot}: {e:#}"
+                    ));
+                    break;
+                }
                 failed_slots.insert(slot);
                 start_failures += 1;
-                last_err = Some(e);
+                let transition = ladder.record_failure(policy, slot, now_epoch_secs())?;
+                if let Err(err) = ladder.save(&path) {
+                    FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+                    admission_paused_reason = Some(format!(
+                        "could not persist failure-ladder failure; pausing further starts: {err:#}"
+                    ));
+                    break;
+                }
+                notify_failure_ladder_transition(
+                    cfg,
+                    &transition,
+                    ladder.open_slot_count(now_epoch_secs()),
+                );
+                if transition.slot_opened {
+                    debug_assert!(ladder.slot_is_open(slot, now_epoch_secs()));
+                }
+                if ladder.fleet_admission_is_paused(now_epoch_secs()) {
+                    admission_paused_reason = Some(format!(
+                        "fleet admission circuit opened after {} distinct slot circuits; existing jobs remain running",
+                        ladder.open_slot_count(now_epoch_secs())
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -3308,6 +3512,7 @@ fn start_missing_runners_with_starter(
     Ok(StartMissingOutcome {
         started,
         start_failures,
+        admission_paused_reason,
     })
 }
 
@@ -3326,6 +3531,9 @@ pub struct EnsureCountOutcome {
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
     pub start_failures: u32,
+    /// A deliberate admission refusal is not a backend failure and must not
+    /// trigger a Colima restart. Existing jobs continue to run.
+    pub admission_paused_reason: Option<String>,
 }
 
 impl EnsureCountOutcome {
@@ -3337,12 +3545,15 @@ impl EnsureCountOutcome {
     }
 }
 
-/// Ensure `count` managed runner containers are alive; start the shortfall.
-/// Refuses to spawn when either the outer host or daemon disk is below its
-/// floor — disk exhaustion is the dominant self-hosted runner failure mode,
-/// and spawning more work onto a full disk makes the incident worse.
-pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
-    Ok(ensure_count_outcome(cfg, backend)?.started)
+fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome {
+    EnsureCountOutcome {
+        started: Vec::new(),
+        missing,
+        remaining_shortage: missing,
+        post_refill_readiness_error: None,
+        start_failures: 0,
+        admission_paused_reason: Some(reason),
+    }
 }
 
 pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
@@ -3367,6 +3578,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             start_failures: 0,
+            admission_paused_reason: None,
         });
     }
     let host_floor_gb = cfg.limits.min_free_disk_gb;
@@ -3382,9 +3594,12 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                     cfg.github.target
                 ),
             );
-            bail!(
-                "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
-            );
+            return Ok(admission_paused_outcome(
+                cfg.runner.count.saturating_sub(alive),
+                format!(
+                    "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
+                ),
+            ));
         }
         Some(free) => {
             if is_macos_host() && free < MACOS_HOST_DISK_PRESSURE_ALERT_GB {
@@ -3411,9 +3626,10 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                     cfg.github.target
                 ),
             );
-            bail!(
-                "could not measure host filesystem free disk — refusing to spawn runners until measurement recovers"
-            );
+            return Ok(admission_paused_outcome(
+                cfg.runner.count.saturating_sub(alive),
+                "could not measure host filesystem free disk — refusing to spawn runners until measurement recovers".into(),
+            ));
         }
     }
     match free_disk_gb(&cfg.runner.image) {
@@ -3430,13 +3646,13 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                     cfg.github.target
                 ),
             );
-            bail!(
-                "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
-                 reclaim space first. Do NOT run docker system/image prune: with the fleet idle it \
-                 deletes the required ezgha-runner:latest image (2026-07-14 incident); \
-                 prefer `docker builder prune` and container/log cleanup",
-                cfg.limits.min_free_disk_gb
-            );
+            return Ok(admission_paused_outcome(
+                cfg.runner.count.saturating_sub(alive),
+                format!(
+                    "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; reclaim space first. Do NOT run docker system/image prune: with the fleet idle it deletes the required ezgha-runner:latest image (2026-07-14 incident); prefer `docker builder prune` and container/log cleanup",
+                    cfg.limits.min_free_disk_gb
+                ),
+            ));
         }
         Some(_) => {
             CONSECUTIVE_DISK_NONE.store(0, Ordering::Relaxed);
@@ -3454,11 +3670,12 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                         cfg.github.target
                     ),
                 );
-                bail!(
-                    "could not measure daemon free disk for {n} cycles in a row — \
-                     refusing to spawn runners until disk measurement recovers \
-                     (image missing? df broken? daemon wedged?)"
-                );
+                return Ok(admission_paused_outcome(
+                    cfg.runner.count.saturating_sub(alive),
+                    format!(
+                        "could not measure daemon free disk for {n} cycles in a row — refusing to spawn runners until disk measurement recovers (image missing? df broken? daemon wedged?)"
+                    ),
+                ));
             }
             eprintln!(
                 "warning: could not measure daemon free disk ({n}/{DISK_MEASURE_STRIKES} strikes) \
@@ -3525,7 +3742,10 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             "Runner pool paused: memory pressure",
             &format!("refusing to spawn runners: {reason}"),
         );
-        bail!("{reason}");
+        return Ok(admission_paused_outcome(
+            cfg.runner.count.saturating_sub(alive),
+            reason,
+        ));
     }
     let missing = cfg.runner.count - alive;
     let refill = start_missing_runners(cfg, backend, missing);
@@ -3560,6 +3780,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         remaining_shortage,
         post_refill_readiness_error,
         start_failures: refill.start_failures,
+        admission_paused_reason: refill.admission_paused_reason,
     };
     if outcome.is_partial_failure() {
         eprintln!(
@@ -3625,6 +3846,14 @@ mod tests {
         cfg
     }
 
+    #[test]
+    fn fleet_circuit_threshold_is_reachable_for_small_legacy_fleets() {
+        let one = cfg_with(1, "ez-org-runner");
+        let two = cfg_with(2, "ez-org-runner");
+        assert_eq!(failure_ladder_policy(&one).fleet_open_slots_threshold, 1);
+        assert_eq!(failure_ladder_policy(&two).fleet_open_slots_threshold, 2);
+    }
+
     /// Lock + redirect the slot assignments path for the duration of a test.
     /// Always pair with `_lock` to avoid races with other tests in the same
     /// binary.
@@ -3636,6 +3865,8 @@ mod tests {
     impl TestEnv {
         fn new(label: &str) -> Self {
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            reset_failure_ladder_admission_latch_for_tests();
+            crate::failure_ladder::reset_test_save_failure();
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
@@ -3676,6 +3907,8 @@ mod tests {
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
+            reset_failure_ladder_admission_latch_for_tests();
+            crate::failure_ladder::reset_test_save_failure();
             // Drop the cpu-probe test seam so the next test sees a clean
             // override state instead of a value leaked from this test.
             cpu_probe_overrides::set(None);
@@ -3780,11 +4013,14 @@ mod tests {
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
 
-        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
-        let message = format!("{err:#}");
+        let message = outcome
+            .admission_paused_reason
+            .expect("disk floor is a deliberate admission pause, not a backend error");
         assert!(message.contains("host filesystem"));
         assert!(message.contains("floor: 5 GB"));
+        assert_eq!(outcome.start_failures, 0);
         assert_eq!(
             TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
             1,
@@ -4306,6 +4542,227 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn repeated_local_start_failures_open_only_the_slot_circuit() {
+        let env = TestEnv::new("persistent_slot_circuit");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let attempts_for_starter = std::sync::Arc::clone(&attempts);
+            let outcome = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                1,
+                move |_cfg, _backend, slot| {
+                    attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                    release_slot(slot)?;
+                    bail!("simulated local container start failure")
+                },
+            )
+            .expect("local start failures are a bounded partial outcome");
+            assert_eq!(outcome.start_failures, 1);
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let state_path = env.path.with_file_name("failure_ladder.toml");
+        let ladder = FailureLadder::load(&state_path).unwrap();
+        assert!(ladder.slot_is_open(1, now_epoch_secs()));
+
+        let attempts_for_starter = std::sync::Arc::clone(&attempts);
+        let paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            1,
+            move |_cfg, _backend, _slot| {
+                attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                unreachable!("an open slot circuit must be excluded before start")
+            },
+        )
+        .unwrap();
+        assert!(paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn failure_ladder_save_failure_latches_admission_across_reconciliation_ticks() {
+        let _env = TestEnv::new("failure_ladder_save_failure_latch");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let state_path = failure_ladder_path_for(&cfg);
+        FailureLadder::default()
+            .save(&state_path)
+            .expect("baseline ledger should be durable before the injected failure");
+        // Save #1 above is the baseline.  Save #2 is the preflight and must
+        // succeed; save #3 records the local-start failure and is injected to
+        // fail after the external starter has run exactly once.
+        crate::failure_ladder::set_test_save_failure_on_call(Some(3));
+
+        let first = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release_slot(slot)?;
+                bail!("simulated local container start failure")
+            }
+        })
+        .expect("save failure should become a bounded admission pause");
+        assert_eq!(first.start_failures, 1);
+        assert!(first
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not persist failure-ladder failure")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // The old ledger is still readable, but its failed transition was not
+        // persisted.  A subsequent serve tick must remain fail-closed rather
+        // than re-invoking JIT/Docker admission against that stale ledger.
+        let second = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, _slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                unreachable!("latched admission must not invoke the starter")
+            }
+        })
+        .expect("latched admission should be a bounded pause");
+        assert!(second
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failure-ladder persistence")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Clearing the injected save error is not enough: recovery is an
+        // explicit daemon-lifetime condition (process restart), represented
+        // here by the test-only latch reset.
+        crate::failure_ladder::reset_test_save_failure();
+        let still_paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            1,
+            |_cfg, _backend, _slot| unreachable!("latch must survive save recovery alone"),
+        )
+        .expect("latch should remain closed until explicit recovery");
+        assert!(still_paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        reset_failure_ladder_admission_latch_for_tests();
+        let recovered = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release_slot(slot)?;
+                bail!("post-restart simulated local start failure")
+            }
+        })
+        .expect("explicit restart-equivalent reset should reopen admission");
+        assert_eq!(recovered.start_failures, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failure_ladder_preflight_save_failure_blocks_external_starter() {
+        let _env = TestEnv::new("failure_ladder_preflight_save_failure");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let state_path = failure_ladder_path_for(&cfg);
+        FailureLadder::default()
+            .save(&state_path)
+            .expect("baseline ledger should be durable before the injected failure");
+        // Save #1 above is the baseline; fail the preflight save (#2).
+        crate::failure_ladder::set_test_save_failure_on_call(Some(2));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, _slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                unreachable!("failed persistence preflight must precede external admission")
+            }
+        })
+        .expect("preflight failure should become a bounded admission pause");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.start_failures, 0);
+        assert!(outcome
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("preflight")));
+    }
+
+    #[test]
+    fn github_jit_failures_do_not_penalize_healthy_slots() {
+        let env = TestEnv::new("control_plane_not_slot_failure");
+        let cfg = cfg_with(3, "ez-org-runner");
+
+        for _ in 0..6 {
+            let outcome = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                3,
+                |_cfg, _backend, slot| {
+                    release_slot(slot)?;
+                    Err(control_plane_start_error(anyhow::anyhow!(
+                        "simulated GitHub secondary rate limit"
+                    )))
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome.start_failures, 1);
+            assert!(outcome
+                .admission_paused_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("without penalizing slot")));
+        }
+
+        let state_path = env.path.with_file_name("failure_ladder.toml");
+        let ladder = FailureLadder::load(&state_path).unwrap();
+        assert_eq!(ladder.open_slot_count(now_epoch_secs()), 0);
+        assert!(ladder.excluded_slots(now_epoch_secs()).is_empty());
+        assert!(!ladder.fleet_admission_is_paused(now_epoch_secs()));
+    }
+
+    #[test]
+    fn three_distinct_slot_circuits_pause_all_new_admission() {
+        let _env = TestEnv::new("persistent_fleet_circuit");
+        let cfg = cfg_with(3, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut last = StartMissingOutcome::default();
+        for _ in 0..9 {
+            let attempts_for_starter = std::sync::Arc::clone(&attempts);
+            last = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                1,
+                move |_cfg, _backend, slot| {
+                    attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                    release_slot(slot)?;
+                    bail!("simulated systemic local start failure")
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 9);
+        assert!(last
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("fleet admission circuit opened")));
+
+        let attempts_for_starter = std::sync::Arc::clone(&attempts);
+        let paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            3,
+            move |_cfg, _backend, _slot| {
+                attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                unreachable!("fleet circuit must close admission before allocation")
+            },
+        )
+        .unwrap();
+        assert!(paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 9);
+    }
+
+    #[test]
     fn ensure_count_real_wiring_computes_missing_before_start_missing() {
         let _env = TestEnv::new("ensure_count_wiring");
         let cfg = cfg_with(5, "ez-org-runner");
@@ -4321,12 +4778,12 @@ minimum_isolation = "container"
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(3)].into());
 
-        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
         assert_eq!(
-            started,
+            outcome.started,
             vec!["ez-org-runner-4", "ez-org-runner-5"],
-            "ensure_count must compute missing=count-alive using only current-prefix containers"
+            "ensure_count_outcome must compute missing=count-alive using only current-prefix containers"
         );
         assert!(
             TEST_START_ONE_NAMES
@@ -4688,6 +5145,7 @@ minimum_isolation = "container"
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             start_failures: 0,
+            admission_paused_reason: None,
         };
         assert!(
             !outcome.is_partial_failure(),
@@ -4703,6 +5161,7 @@ minimum_isolation = "container"
             remaining_shortage: 1,
             post_refill_readiness_error: None,
             start_failures: 1,
+            admission_paused_reason: None,
         };
         assert!(
             outcome.is_partial_failure(),
@@ -5606,6 +6065,7 @@ minimum_isolation = "container"
     #[test]
     fn disk_measure_strike_counter_bails_after_threshold() {
         use std::sync::atomic::Ordering;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Reset before and after to be hermetic.
         CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
         // First miss is tolerated (warn, no bail).
@@ -5627,6 +6087,7 @@ minimum_isolation = "container"
     #[test]
     fn disk_measure_strike_counter_resets_on_success() {
         use std::sync::atomic::Ordering;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
         // Drive a miss then a "Some" (modeled as the reset the production path
         // performs after a successful read).
