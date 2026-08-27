@@ -59,7 +59,6 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 // + safety margin) and the runner-present check actually runs to completion.
 // Still well under the 300s watchdog margin.
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
-#[cfg(not(test))]
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
@@ -2783,6 +2782,10 @@ fn runner_worker_present(output: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some("Runner.Worker"))
 }
 
+fn readiness_probe_timeout(remaining: Duration) -> Duration {
+    remaining.min(LOCAL_TOP_TIMEOUT)
+}
+
 fn executing_runner_count_from_containers(
     cfg: &Config,
     containers: &[ManagedContainer],
@@ -4529,6 +4532,22 @@ minimum_isolation = "container"
         assert!(!runner_present(
             "PID COMMAND\n202 NotRunner.Workerish\n203 NotRunner.Listenerish\n"
         ));
+    }
+
+    #[test]
+    fn readiness_probe_timeout_caps_at_three_seconds_and_preserves_sub_three_seconds() {
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(30)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
