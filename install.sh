@@ -33,7 +33,12 @@ uninstall() {
   info "Uninstalling ${BIN}"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --user disable --now ezgha.service 2>/dev/null || true
-    rm -f "${HOME}/.config/systemd/user/ezgha.service"
+    # This oneshot is enabled under lima-vm@colima.service and reapplies
+    # runtime QEMU limits whenever Colima starts. Remove its enablement and
+    # unit on uninstall so ezgha leaves no host-control policy behind.
+    systemctl --user disable --now lima-vm-cpu-ceiling.service 2>/dev/null || true
+    rm -f "${HOME}/.config/systemd/user/ezgha.service" \
+          "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service"
     systemctl --user daemon-reload 2>/dev/null || true
     ok "systemd --user service removed"
   fi
