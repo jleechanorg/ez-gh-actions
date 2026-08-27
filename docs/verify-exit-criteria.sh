@@ -275,17 +275,6 @@ cgroup_has_effective_memory_ceiling() {
     return 1
 }
 
-if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
-    case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
-        config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
-        platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
-        containers) verify_managed_runners_in_actions_slice ;;
-        cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
-        *) echo "unknown verifier test case" >&2; exit 2 ;;
-    esac
-    exit $?
-fi
-
 daemon_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
     local daemon_kernel host_kernel
@@ -339,7 +328,14 @@ daemon_overlay_free_disk_gb() {
 
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
-    "$REPO_ROOT/scripts/host/kdump-remediation.sh"
+    local pstore_root="${VERIFY_EXIT_CRITERIA_PSTORE_ROOT:-/sys/fs/pstore}"
+    local kexec_crash_loaded_path="${VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH:-/sys/kernel/kexec_crash_loaded}"
+    local kdump_dir="${VERIFY_EXIT_CRITERIA_KDUMP_DIR:-/var/crash}"
+    local remediation="${VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION:-${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/kdump-remediation.sh}"
+    kdump_fail() {
+        "$remediation"
+        fail "$1"
+    }
     # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
     #     it routes only userspace coredumps (SIGSEGV in a process), NOT
     #     kernel panics. Kdump dumps kernel panics via kexec-loaded crash
@@ -355,19 +351,19 @@ verify_kdump_pstore() {
     #     "physical-host availability" goal benefits from having at least
     #     one panic-time capture path beyond kdump alone. Keeping it checked
     #     here is intentional; it is independent of core_pattern.
-    if [ ! -d /sys/fs/pstore ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/fs/pstore is not mounted (no firmware/pstore crash logs can survive a panic)"
+    if [ ! -d "$pstore_root" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $pstore_root is not mounted (no firmware/pstore crash logs can survive a panic)"
     fi
     # (3) Kernel-panic capture lives in /sys/kernel/kexec_crash_loaded:
     #     when kdump has kexec-loaded the crash kernel, this reads '1'.
     #     If the kernel was rebooted after the supported kdump remediation
     #     but kexec_crash_loaded is still 0, the crash kernel did NOT load
     #     — either GRUB picked the wrong cmdline or crashkernel= is wrong.
-    if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is missing (kdump kernel never installed)"
+    if [ ! -f "$kexec_crash_loaded_path" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is missing (kdump kernel never installed)"
     fi
-    if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is not '1' (kdump kernel is not loaded into the running kernel)"
+    if [ "$(cat "$kexec_crash_loaded_path" 2>/dev/null || echo 0)" != "1" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is not '1' (kdump kernel is not loaded into the running kernel)"
     fi
     # (4) /var/crash is the kdump-tools default destination on debian/ubuntu.
     #     If the directory is missing OR not writable by root, the vmcore
@@ -375,14 +371,25 @@ verify_kdump_pstore() {
     #     loads the crash kernel, then the crash kernel mounts the root
     #     filesystem and writes here; if this path is unwritable, kdump
     #     fails its post-reboot handshake and produces no vmcore).
-    KDUMP_DIR=/var/crash
-    if [ ! -d "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR does not exist; kdump has no dump target. Remediation: install kdump-tools, then sudo install -d -m 0755 /var/crash and follow scripts/host/kdump-remediation.sh."
+    if [ ! -d "$kdump_dir" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir does not exist; kdump has no dump target. Remediation: install kdump-tools, then sudo install -d -m 0755 /var/crash and follow scripts/host/kdump-remediation.sh."
     fi
-    if [ ! -w "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR is not writable by root; kernel cannot save vmcores here."
+    if [ ! -w "$kdump_dir" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir is not writable by root; kernel cannot save vmcores here."
     fi
 }
+
+if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
+    case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
+        config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        containers) verify_managed_runners_in_actions_slice ;;
+        cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
+        kdump) verify_kdump_pstore ;;
+        *) echo "unknown verifier test case" >&2; exit 2 ;;
+    esac
+    exit $?
+fi
 
 # Verify the cgroup v2 path for the given raw /proc/<pid>/cgroup line
 # (including the optional leading "0::") has a finite effective memory ceiling
@@ -926,12 +933,13 @@ MODERN_UNIT_DIR="${HOME}/.config/systemd/user"
 MODERN_WRAPPER="${HOME}/.local/bin/codex"
 if [ "$(uname -s)" = "Linux" ]; then
     # Read-only assertion: it never reloads or restarts watchdog, runners,
-    # containers, or the VM. It does require the active watchdog config to
-    # contain exactly one repair-maximum = 0 so repair cannot vote reboot.
+    # containers, or the VM. It checks only the on-disk /etc/watchdog.conf
+    # and the configured repair-binary bytes; it does not claim the running
+    # watchdog daemon has reloaded that config or changed runtime state.
     WATCHDOG_CONF_PATH=/etc/watchdog.conf ASSERT_LIVE_WATCHDOG=1 \
         "$REPO_ROOT/scripts/host/assert-no-host-reboot-vote.sh" \
-        || fail "Gate 8 (0) watchdog repair still has a host-reboot vote"
-    echo "    [PASS] Gate 8 (0) watchdog repair cannot vote for a host reboot"
+        || fail "Gate 8 (0) on-disk watchdog contract failed: repair config or binary could still permit a host-reboot vote"
+    echo "    [PASS] Gate 8 (0) on-disk watchdog config and repair binary match the no-host-reboot-vote contract"
     if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
         fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
     fi

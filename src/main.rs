@@ -1585,6 +1585,10 @@ fn main() -> Result<()> {
         }
         Commands::Stop => {
             let cfg = Config::load(&path)?;
+            // `stop` mutates the same slot assignments and runner
+            // registrations as `serve`/`start`; serialize the entire
+            // read-modify-write sequence so cleanup cannot race a refill.
+            let _state_lock = acquire_serve_lock(&cfg).context("acquire runner-state lock")?;
             let n = docker_backend::stop_all(&cfg)?;
             println!("removed {n} managed container(s); deregistered idle ezgha runners");
         }

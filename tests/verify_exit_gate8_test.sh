@@ -107,4 +107,54 @@ qemu_max_line=$(grep -n 'QEMU_CEILING_BYTES.*=' "$VERIFY" | head -1 | cut -d: -f
 grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
   || fail "live max QEMU ceiling is not fail-closed"
 
+# Gate 8 (0) is a read-only assertion about the on-disk watchdog config and
+# configured repair-binary bytes. It must not claim that a running watchdog
+# daemon has reloaded/restarted or that runtime state cannot vote reboot.
+grep -Fq 'on-disk watchdog config' "$VERIFY" \
+  || fail "Gate 8 (0) does not describe its on-disk watchdog contract"
+grep -Fq '[PASS] Gate 8 (0) on-disk watchdog config and repair binary match the no-host-reboot-vote contract' "$VERIFY" \
+  || fail "Gate 8 (0) PASS wording overclaims runtime watchdog state"
+! grep -Fq 'active watchdog config' "$VERIFY" \
+  || fail "Gate 8 (0) comments still claim an active watchdog config"
+! grep -Fq '[PASS] Gate 8 (0) watchdog repair cannot vote for a host reboot' "$VERIFY" \
+  || fail "Gate 8 (0) PASS wording still overclaims runtime behavior"
+grep -Fq 'Gate 8 (0) on-disk watchdog contract failed' "$VERIFY" \
+  || fail "Gate 8 (0) failure wording does not identify the on-disk contract"
+
+# Kdump/pstore verification should be quiet on a healthy fixture, while an
+# actual failure must print the operator remediation sequence.
+mkdir -p "$TMP/pstore" "$TMP/crash"
+printf '1\n' > "$TMP/kexec_crash_loaded"
+cat > "$TMP/remediation" <<'EOF'
+#!/usr/bin/env bash
+printf 'REMEDIATION_CALLED\n'
+EOF
+chmod +x "$TMP/remediation"
+healthy_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=kdump \
+  VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
+  VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
+  VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
+  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
+  bash "$VERIFY" 2>&1) \
+  || fail "healthy kdump fixture should pass: $healthy_out"
+! grep -Fq '[FAIL]' <<<"$healthy_out" \
+  || fail "healthy kdump fixture emitted a false [FAIL]: $healthy_out"
+! grep -Fq 'REMEDIATION_CALLED' <<<"$healthy_out" \
+  || fail "healthy kdump fixture invoked remediation"
+
+rm -rf "$TMP/pstore"
+failed_out=''
+failed_rc=0
+failed_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=kdump \
+  VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
+  VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH="$TMP/kexec_crash_loaded" \
+  VERIFY_EXIT_CRITERIA_KDUMP_DIR="$TMP/crash" \
+  VERIFY_EXIT_CRITERIA_KDUMP_REMEDIATION="$TMP/remediation" \
+  bash "$VERIFY" 2>&1) || failed_rc=$?
+[ "$failed_rc" -ne 0 ] || fail "missing pstore fixture should fail closed"
+grep -Fq 'REMEDIATION_CALLED' <<<"$failed_out" \
+  || fail "kdump failure omitted actionable remediation: $failed_out"
+
 echo "VERIFY_EXIT_GATE8_TEST: PASS"
