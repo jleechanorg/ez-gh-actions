@@ -268,14 +268,64 @@ pub fn reset_reclaim_state_for_tests() {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct SlotAssignments {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LifecycleEvidence {
+    /// Slot index (as a user-facing slot number 1..=cfg.runner.count).
+    pub slot: u32,
+    /// Human-readable reason for the lifecycle event / reclaim (e.g. "gh-rejected-past-grace").
+    pub reason: String,
+    /// Wall-clock unix epoch seconds when evidence was recorded.
+    pub recorded_at_epoch_secs: u64,
+    /// Monotonic seconds since daemon start when recorded.
+    pub monotonic_secs: f64,
+    /// Unix epoch seconds when JIT was issued (recorded in slot table as registered_at) if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jit_issued_at_epoch_secs: Option<u64>,
+    /// Elapsed seconds since JIT registration was issued.
+    pub registration_age_secs: u64,
+    /// GitHub runner id.
+    pub runner_id: u64,
+    /// GitHub runner name.
+    pub runner_name: String,
+    /// Whether the runner was observed in the authoritative GitHub list (false on gh-rejected reclaim).
+    pub gh_observed: bool,
+    /// GitHub observed status ("missing", "offline", "online", etc.).
+    pub gh_status: String,
+    /// Duration in seconds that the runner has been missing on GitHub since first observed missing.
+    pub gh_missing_duration_secs: u64,
+    /// Local container ID if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_id: Option<String>,
+    /// Local container status/state ("running", "exited", etc.) if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_status: Option<String>,
+    /// Local container peak RSS in MiB if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_mb: Option<u64>,
+    /// Bounded, secret-redacted listener log tail if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listener_log_tail: Option<String>,
+    /// Container or runner process exit reason / code if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_reason: Option<String>,
+    /// GitHub Actions workflow job ID if exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<u64>,
+    /// GitHub Actions workflow run ID if exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<u64>,
+}
+
+const LIFECYCLE_EVIDENCE_CAP_PER_SLOT: usize = 16;
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SlotAssignments {
     /// Stable slot index serialized as a string key (TOML requires string map
     /// keys) -> GitHub runner_id assigned via JIT registration. An empty
     /// value means the slot is reserved (JIT call in flight) but the
     /// runner_id has not been recorded yet.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    assignments: BTreeMap<String, String>,
+    pub assignments: BTreeMap<String, String>,
     /// Slot index -> unix-epoch-seconds when `record_slot_runner_id` last
     /// recorded a runner_id for that slot (bead ez-gh-actions-5ki). Read by
     /// `release_stale_slots`' offline+!busy reap paths (Path 1's own branch
@@ -291,7 +341,307 @@ struct SlotAssignments {
     /// slot recorded via the pre-fix code path) is treated as "no grace
     /// window active" — never blocks a reap, only ever adds one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    registered_at: BTreeMap<String, u64>,
+    pub registered_at: BTreeMap<String, u64>,
+    /// Slot index -> unix-epoch-seconds when GitHub runner registration was FIRST
+    /// observed missing while the local container exists.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gh_missing_first_observed_at: BTreeMap<String, u64>,
+    /// Slot index -> durable lifecycle evidence records. Persisted BEFORE
+    /// slot deletion to preserve forensic evidence across reclaims, slot releases,
+    /// and daemon restarts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lifecycle_evidence: BTreeMap<String, Vec<LifecycleEvidence>>,
+}
+
+/// Pure state transition: records durable lifecycle evidence for a slot (appending
+/// and capping history) and removes the slot's active assignment, registration timestamp,
+/// and gh-missing observation timestamp in a single step.
+pub fn apply_slot_release_with_lifecycle_evidence(
+    assignments: &mut SlotAssignments,
+    slot: u32,
+    evidence: LifecycleEvidence,
+) {
+    let key = slot.to_string();
+    let history = assignments
+        .lifecycle_evidence
+        .entry(key.clone())
+        .or_default();
+    if history.len() >= LIFECYCLE_EVIDENCE_CAP_PER_SLOT {
+        history.remove(0);
+    }
+    history.push(evidence);
+
+    assignments.assignments.remove(&key);
+    assignments.registered_at.remove(&key);
+    assignments.gh_missing_first_observed_at.remove(&key);
+}
+
+/// Atomically record lifecycle evidence and release a slot in a single state transition
+/// (single current-state read, modify, and atomic write). If the disk write fails, the entire
+/// operation fails atomically, ensuring evidence is never absent for a released slot.
+pub fn release_slot_with_lifecycle_evidence_for(
+    cfg: Option<&Config>,
+    slot: u32,
+    evidence: &LifecycleEvidence,
+) -> Result<()> {
+    let mut current = read_slot_assignments_for(cfg)?;
+    apply_slot_release_with_lifecycle_evidence(&mut current, slot, evidence.clone());
+    write_slot_assignments_for(&current, cfg)
+}
+
+pub fn read_lifecycle_evidence_for(
+    cfg: Option<&Config>,
+    slot: Option<u32>,
+) -> Result<Vec<(u32, LifecycleEvidence)>> {
+    let assignments = read_slot_assignments_for(cfg)?;
+    let mut out = Vec::new();
+    match slot {
+        Some(slot_n) => {
+            if let Some(list) = assignments.lifecycle_evidence.get(&slot_n.to_string()) {
+                for ev in list {
+                    out.push((slot_n, ev.clone()));
+                }
+            }
+        }
+        None => {
+            for (k, list) in &assignments.lifecycle_evidence {
+                if let Ok(slot_n) = k.parse::<u32>() {
+                    for ev in list {
+                        out.push((slot_n, ev.clone()));
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by_key(|b| std::cmp::Reverse(b.1.recorded_at_epoch_secs));
+    Ok(out)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ContainerLifecycleProbe {
+    pub container_id: Option<String>,
+    pub container_status: Option<String>,
+    pub exit_reason: Option<String>,
+    pub listener_log_tail: Option<String>,
+}
+
+pub fn probe_container_lifecycle(
+    container_name: &str,
+    container_info: Option<&ManagedContainer>,
+) -> ContainerLifecycleProbe {
+    let mut probe = ContainerLifecycleProbe::default();
+
+    // 1. Reuse existing container metadata if available, avoiding redundant inspect subprocess
+    if let Some(c) = container_info {
+        if !c.id.is_empty() {
+            probe.container_id = Some(c.id.clone());
+        }
+        if !c.state.is_empty() {
+            probe.container_status = Some(c.state.clone());
+            if c.state != "running" {
+                probe.exit_reason = Some(format!("status={}", c.state));
+            }
+        }
+    }
+
+    // 2. Fetch bounded listener log tail with a single tight timeout (<= 500ms total deadline)
+    let mut cmd_logs = docker_cmd();
+    cmd_logs.args(["logs", "--tail", "50", container_name]);
+    if let Ok(out) = run_docker_with_timeout(
+        cmd_logs,
+        "capturing listener log tail",
+        Duration::from_millis(500),
+    ) {
+        if out.status.success() {
+            let mut combined = String::new();
+            if !out.stdout.is_empty() {
+                combined.push_str(&String::from_utf8_lossy(&out.stdout));
+            }
+            if !out.stderr.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            }
+            let bounded = bound_log_tail(&combined, 50, 8192);
+            if !bounded.is_empty() {
+                let redacted = redact_secrets(&bounded);
+                if !redacted.is_empty() {
+                    probe.listener_log_tail = Some(redacted);
+                }
+            }
+        }
+    }
+
+    probe
+}
+
+pub fn bound_log_tail(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start_idx = lines.len().saturating_sub(max_lines);
+    let selected_lines = &lines[start_idx..];
+    let joined = selected_lines.join("\n");
+    if joined.len() > max_bytes {
+        let byte_start = joined.len() - max_bytes;
+        let safe_start = joined
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .find(|&idx| idx >= byte_start)
+            .unwrap_or(0);
+        joined[safe_start..].to_string()
+    } else {
+        joined
+    }
+}
+
+pub fn redact_secrets(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for line in input.lines() {
+        let mut redacted_line = String::with_capacity(line.len());
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            // Check for GitHub tokens (ghp_, gho_, ghu_, ghs_, ghr_)
+            let slice: String = chars[i..std::cmp::min(i + 11, chars.len())]
+                .iter()
+                .collect();
+            if slice.starts_with("ghp_")
+                || slice.starts_with("gho_")
+                || slice.starts_with("ghu_")
+                || slice.starts_with("ghs_")
+                || slice.starts_with("ghr_")
+            {
+                redacted_line.push_str("[REDACTED_GH_TOKEN]");
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                continue;
+            }
+            if slice.starts_with("github_pat_") {
+                redacted_line.push_str("[REDACTED_GH_PAT]");
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Check for Bearer / bearer token
+            let lower_slice: String = chars[i..std::cmp::min(i + 7, chars.len())]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
+            if lower_slice.starts_with("bearer ") {
+                redacted_line.push_str("Bearer [REDACTED]");
+                i += 7;
+                while i < chars.len()
+                    && !chars[i].is_whitespace()
+                    && chars[i] != '"'
+                    && chars[i] != '\''
+                    && chars[i] != ','
+                    && chars[i] != ';'
+                {
+                    i += 1;
+                }
+                continue;
+            }
+
+            let rest: String = chars[i..].iter().collect();
+            let lower_rest = rest.to_ascii_lowercase();
+
+            // Check for Authorization header (redact rest of header value on line)
+            if lower_rest.starts_with("authorization:") {
+                redacted_line.push_str("Authorization: [REDACTED]");
+                i = chars.len();
+                continue;
+            }
+
+            // Check for unflagged JWT tokens (starts with eyJ and has length >= 16)
+            if rest.starts_with("eyJ") {
+                let mut jwt_end = i;
+                while jwt_end < chars.len()
+                    && (chars[jwt_end].is_alphanumeric()
+                        || chars[jwt_end] == '_'
+                        || chars[jwt_end] == '-'
+                        || chars[jwt_end] == '.')
+                {
+                    jwt_end += 1;
+                }
+                if jwt_end - i >= 16 {
+                    redacted_line.push_str("[REDACTED_JWT]");
+                    i = jwt_end;
+                    continue;
+                }
+            }
+
+            // Check for key-value / query parameter / flag secrets
+            let secret_patterns = [
+                ("--jitconfig ", "--jitconfig [REDACTED]", 12),
+                ("--jitconfig=", "--jitconfig=[REDACTED]", 12),
+                ("--token ", "--token [REDACTED]", 8),
+                ("--token=", "--token=[REDACTED]", 8),
+                ("?access_token=", "?access_token=[REDACTED]", 14),
+                ("&access_token=", "&access_token=[REDACTED]", 14),
+                ("access_token=", "access_token=[REDACTED]", 13),
+                ("?token=", "?token=[REDACTED]", 7),
+                ("&token=", "&token=[REDACTED]", 7),
+                ("token=", "token=[REDACTED]", 6),
+                ("runner_token=", "RUNNER_TOKEN=[REDACTED]", 13),
+                ("runner_jitconfig=", "RUNNER_JITCONFIG=[REDACTED]", 17),
+                ("github_token=", "GITHUB_TOKEN=[REDACTED]", 13),
+                ("?api_key=", "?api_key=[REDACTED]", 9),
+                ("&api_key=", "&api_key=[REDACTED]", 9),
+                ("api_key=", "api_key=[REDACTED]", 8),
+                ("api_key: ", "api_key: [REDACTED]", 9),
+                ("api_key:", "api_key: [REDACTED]", 8),
+                ("?client_secret=", "?client_secret=[REDACTED]", 15),
+                ("&client_secret=", "&client_secret=[REDACTED]", 15),
+                ("client_secret=", "client_secret=[REDACTED]", 14),
+                ("client_secret: ", "client_secret: [REDACTED]", 15),
+                ("client_secret:", "client_secret: [REDACTED]", 14),
+                ("?password=", "?password=[REDACTED]", 10),
+                ("&password=", "&password=[REDACTED]", 10),
+                ("password=", "password=[REDACTED]", 9),
+                ("password: ", "password: [REDACTED]", 10),
+                ("password:", "password: [REDACTED]", 9),
+                ("?secret=", "?secret=[REDACTED]", 8),
+                ("&secret=", "&secret=[REDACTED]", 8),
+                ("secret=", "secret=[REDACTED]", 7),
+                ("secret: ", "secret: [REDACTED]", 8),
+                ("secret:", "secret: [REDACTED]", 7),
+            ];
+
+            let mut matched = false;
+            for &(pat, replacement, pat_len) in &secret_patterns {
+                if lower_rest.starts_with(pat) {
+                    redacted_line.push_str(replacement);
+                    i += pat_len;
+                    while i < chars.len()
+                        && !chars[i].is_whitespace()
+                        && chars[i] != '"'
+                        && chars[i] != '\''
+                        && chars[i] != ','
+                        && chars[i] != ';'
+                        && chars[i] != '&'
+                    {
+                        i += 1;
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+
+            redacted_line.push(chars[i]);
+            i += 1;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&redacted_line);
+    }
+    out
 }
 
 /// Grace window (bead ez-gh-actions-5ki): a registration recorded within this
@@ -383,51 +733,19 @@ fn live_runners_last_run_id(live_runners: &[github::RunnerInfo], runner_id: u64)
 ///   * the parser cannot make sense of the output.
 ///
 /// Bead jleechan-tv58: populates the `peak_rss_mb` field in
-/// `ReclaimRecord`. `0` is a deliberate signal, not a failure — the field
-/// is forensic, not load-bearing.
+/// Read the cached peak RSS (in MB) for a container name if tracked by
+/// `poll_peak_rss`, without spawning any subprocess.
+fn cached_container_peak_rss_mb(container_name: &str) -> u64 {
+    PEAK_RSS_MB
+        .lock()
+        .ok()
+        .and_then(|peaks| peaks.get(container_name).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
 fn container_peak_rss_mb(container_name: &str) -> u64 {
-    // `docker stats` parses cleanly with `--no-stream --format '{{.MemUsage}}'`
-    // which yields strings like "123.4MiB / 7.7GiB" or "0B / 7.7GiB".
-    let out = match std::process::Command::new("docker")
-        .args([
-            "stats",
-            "--no-stream",
-            "--format",
-            "{{.MemUsage}}",
-            container_name,
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return 0,
-    };
-    let s = String::from_utf8_lossy(&out.stdout);
-    // Take the part before the slash ("123.4MiB" -> "123.4MiB").
-    let head = s.trim().split('/').next().unwrap_or("").trim();
-    if head.is_empty() || head == "0B" {
-        return 0;
-    }
-    // Parse "<number><unit>" where unit is one of B/KiB/MiB/GiB/TiB. K8s /
-    // Docker use IEC binary suffixes (KiB, MiB, GiB) — the `.` is decimal,
-    // not binary, so we treat the number as a float and multiply by the
-    // binary-unit factor.
-    let (num_str, unit) = head.split_at(
-        head.find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(head.len()),
-    );
-    let num: f64 = match num_str.parse() {
-        Ok(v) => v,
-        Err(_) => return 0,
-    };
-    let bytes = match unit {
-        "B" => num,
-        "KiB" => num * 1024.0,
-        "MiB" => num * 1024.0 * 1024.0,
-        "GiB" => num * 1024.0 * 1024.0 * 1024.0,
-        "TiB" => num * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => return 0,
-    };
-    (bytes / (1024.0 * 1024.0)) as u64 // MiB
+    cached_container_peak_rss_mb(container_name)
 }
 
 /// Resolve the path of the slot assignment file. Honors `EZGHA_SLOT_ASSIGNMENTS_PATH`
@@ -654,7 +972,10 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
             // both racing the same slot. See first-wave report for full
             // race diagram; this is the post-2026-07-08 fix (1a9baf4)
             // extension.
-            assignments.registered_at.insert(key, now_epoch_secs());
+            assignments
+                .registered_at
+                .insert(key.clone(), now_epoch_secs());
+            assignments.gh_missing_first_observed_at.remove(&key);
             write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(Some(slot));
         }
@@ -675,7 +996,10 @@ fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) ->
     assignments
         .assignments
         .insert(key.clone(), runner_id.to_string());
-    assignments.registered_at.insert(key, now_epoch_secs());
+    assignments
+        .registered_at
+        .insert(key.clone(), now_epoch_secs());
+    assignments.gh_missing_first_observed_at.remove(&key);
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -691,7 +1015,39 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     let key = slot.to_string();
     assignments.assignments.remove(&key);
     assignments.registered_at.remove(&key);
+    assignments.gh_missing_first_observed_at.remove(&key);
     write_slot_assignments_for(&assignments, cfg)
+}
+
+/// Atomically record the first time a slot was observed missing on GitHub while
+/// its local container exists, if not already recorded. Re-reads current disk
+/// state at mutation time to avoid clobbering concurrent or preceding slot updates.
+fn record_gh_missing_first_observed_for(
+    cfg: Option<&Config>,
+    slot: u32,
+    observed_at: u64,
+) -> Result<()> {
+    let mut current = read_slot_assignments_for(cfg)?;
+    let key = slot.to_string();
+    if let std::collections::btree_map::Entry::Vacant(e) =
+        current.gh_missing_first_observed_at.entry(key)
+    {
+        e.insert(observed_at);
+        write_slot_assignments_for(&current, cfg)?;
+    }
+    Ok(())
+}
+
+/// Atomically clear the first-observed-missing timestamp for a slot (e.g. when
+/// the runner is authoritatively observed live on GitHub). Re-reads current disk
+/// state at mutation time to avoid clobbering concurrent or preceding slot updates.
+fn clear_gh_missing_first_observed_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
+    let mut current = read_slot_assignments_for(cfg)?;
+    let key = slot.to_string();
+    if current.gh_missing_first_observed_at.remove(&key).is_some() {
+        write_slot_assignments_for(&current, cfg)?;
+    }
+    Ok(())
 }
 
 /// Release slots whose recorded `runner_id` no longer corresponds to a live
@@ -742,15 +1098,10 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     };
     watchdog::ping();
     let assignments = read_slot_assignments_for(Some(cfg))?;
-    let local_container_names = match managed_containers() {
+    let managed = match managed_containers() {
         Ok(containers) => {
             poll_peak_rss(&containers);
-            Some(
-                containers
-                    .into_iter()
-                    .map(|container| container.name)
-                    .collect::<HashSet<_>>(),
-            )
+            Some(containers)
         }
         Err(err) => {
             eprintln!(
@@ -759,6 +1110,12 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             None
         }
     };
+    let local_container_names = managed.as_ref().map(|containers| {
+        containers
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<HashSet<_>>()
+    });
     if let Some(names) = &local_container_names {
         reap_stale_peak_rss_entries(names);
     }
@@ -768,6 +1125,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
         &live_runners,
         &cfg.runner.name_prefix,
         local_container_names.as_ref(),
+        managed.as_deref(),
     )?;
     let mut reclaimed = reclaimed;
     // Load (or initialize) the quarantine table. A corrupt file degrades to
@@ -970,6 +1328,7 @@ fn release_stale_slots_from_with_containers(
         live_runners,
         runner_prefix,
         local_container_names,
+        None,
     )
 }
 
@@ -979,6 +1338,7 @@ fn release_stale_slots_from_with_containers_for(
     live_runners: &[github::RunnerInfo],
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
+    managed_containers: Option<&[ManagedContainer]>,
 ) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
@@ -1058,6 +1418,14 @@ fn release_stale_slots_from_with_containers_for(
                     Some(local_names) if local_names.contains(&expected_name) => {
                         if slot_in_grace_window(assignments, slot) {
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            // Track first authoritative observation of GH missing while local container exists
+                            if let Err(err) =
+                                record_gh_missing_first_observed_for(cfg, slot_n, now_epoch_secs())
+                            {
+                                eprintln!(
+                                    "warning: failed to record gh_missing_first_observed_at for slot {slot_n}: {err:#}"
+                                );
+                            }
                             eprintln!(
                                 "info: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (within {}s JIT-propagation grace window; elapsed {elapsed}s)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
@@ -1074,21 +1442,67 @@ fn release_stale_slots_from_with_containers_for(
                             // ezgha serve tick as orphaned, and any in-flight job
                             // it was running has already been lost (GH shows the
                             // runner as offline/busy in this state).
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            let registration_age_secs =
+                                seconds_since_registered(assignments, slot).unwrap_or(0);
                             let wall_secs = now_epoch_secs();
                             let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                            let current_assignments = read_slot_assignments_for(cfg)
+                                .unwrap_or_else(|_| assignments.clone());
+                            let first_observed = current_assignments
+                                .gh_missing_first_observed_at
+                                .get(slot)
+                                .copied()
+                                .unwrap_or(wall_secs);
+                            let gh_missing_duration_secs = wall_secs.saturating_sub(first_observed);
                             // Bead jleechan-tv58: surface the in-flight run_id
                             // (when GH shows one) and the local container's peak
-                            // RSS so an operator can correlate this reclaim to
-                            // a real job. Both are best-effort forensic data:
-                            // `last_run_id=0` and `peak_rss_mb=0` are valid
-                            // signals ("GitHub didn't surface runId" / "no
-                            // container / docker stats failed"), NOT failures.
+                            // RSS from in-memory cache so an operator can correlate this reclaim to
+                            // a real job without spawning a blocking subprocess.
                             let last_run_id =
                                 live_runners_last_run_id(live_runners, rid).unwrap_or(0);
-                            let peak_rss_mb = container_peak_rss_mb(&expected_name);
+                            let peak_rss_mb = cached_container_peak_rss_mb(&expected_name);
+                            let jit_issued_at = assignments.registered_at.get(slot).copied();
+                            let container_info = managed_containers
+                                .and_then(|list| list.iter().find(|c| c.name == expected_name));
+                            let probe = probe_container_lifecycle(&expected_name, container_info);
+
+                            let evidence = LifecycleEvidence {
+                                slot: slot_n,
+                                reason: "gh-rejected-past-grace".to_string(),
+                                recorded_at_epoch_secs: wall_secs,
+                                monotonic_secs,
+                                jit_issued_at_epoch_secs: jit_issued_at,
+                                registration_age_secs,
+                                runner_id: rid,
+                                runner_name: expected_name.clone(),
+                                gh_observed: false,
+                                gh_status: "missing".to_string(),
+                                gh_missing_duration_secs,
+                                container_id: probe.container_id.clone(),
+                                container_status: probe.container_status.clone(),
+                                peak_rss_mb: if peak_rss_mb > 0 {
+                                    Some(peak_rss_mb)
+                                } else {
+                                    None
+                                },
+                                listener_log_tail: probe.listener_log_tail.clone(),
+                                exit_reason: probe.exit_reason.clone(),
+                                job_id: None,
+                                run_id: if last_run_id > 0 {
+                                    Some(last_run_id)
+                                } else {
+                                    None
+                                },
+                            };
+
+                            // Atomically persist lifecycle evidence and release slot in a single state transition
+                            release_slot_with_lifecycle_evidence_for(cfg, slot_n, &evidence)?;
+
+                            let cid_str = evidence.container_id.as_deref().unwrap_or("none");
+                            let cstatus_str =
+                                evidence.container_status.as_deref().unwrap_or("unknown");
                             eprintln!(
-                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} still exists)"
+                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} runner_name={expected_name} gh_observed=false gh_status=missing gh_missing_duration_secs={gh_missing_duration_secs} registration_age_secs={registration_age_secs} container_id={cid_str} container_status={cstatus_str} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={registration_age_secs} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} still exists)"
                             );
                             record_reclaim(
                                 slot,
@@ -1103,7 +1517,6 @@ fn release_stale_slots_from_with_containers_for(
                                     reason: "gh-rejected-past-grace".to_string(),
                                 },
                             );
-                            release_slot_for(cfg, slot_n)?;
                             reclaimed += 1;
                         }
                     }
@@ -1186,6 +1599,12 @@ fn release_stale_slots_from_with_containers_for(
                     }
                 }
             } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
+                // Authoritative observation of runner present on GitHub: clear any prior missing observation
+                if let Err(err) = clear_gh_missing_first_observed_for(cfg, slot_n) {
+                    eprintln!(
+                        "warning: failed to clear gh_missing_first_observed_at for slot {slot_n}: {err:#}"
+                    );
+                }
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 if !runner_prefix.is_empty() && runner.name != expected_name {
                     let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
@@ -8290,6 +8709,883 @@ minimum_isolation = "container"
             reasons.last().copied(),
             Some("probe-0"),
             "probe-0 must be evicted"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_persists_durable_lifecycle_evidence_before_gh_rejected_reclaim() {
+        let _env = TestEnv::new("durable_evidence_gh_rejected");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+
+        let jit_issued_at = now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 10;
+        let mut assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assignments
+            .registered_at
+            .insert("1".to_string(), jit_issued_at);
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 1, "slot 1 must be reclaimed");
+
+        let reloaded = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(
+            !reloaded.assignments.contains_key("1"),
+            "slot 1 assignment row must be deleted from active table"
+        );
+        assert!(
+            !reloaded.registered_at.contains_key("1"),
+            "slot 1 registered_at must be cleared on release"
+        );
+
+        let evidence_list = reloaded
+            .lifecycle_evidence
+            .get("1")
+            .expect("durable lifecycle evidence must exist for slot 1 after release");
+        assert_eq!(evidence_list.len(), 1);
+        let evidence = &evidence_list[0];
+        assert_eq!(evidence.slot, 1);
+        assert_eq!(evidence.reason, "gh-rejected-past-grace");
+        assert_eq!(evidence.runner_id, 4242);
+        assert_eq!(evidence.runner_name, "ez-org-runner-1");
+        assert!(!evidence.gh_observed);
+        assert_eq!(evidence.gh_status, "missing");
+        // When first observed past grace, gh_missing_duration_secs is 0 (current snapshot), not registration age
+        assert_eq!(evidence.gh_missing_duration_secs, 0);
+        assert!(
+            evidence.registration_age_secs >= REGISTRATION_GRACE_WINDOW.as_secs() + 10,
+            "registration_age_secs must reflect elapsed time since registration"
+        );
+        assert_eq!(evidence.jit_issued_at_epoch_secs, Some(jit_issued_at));
+    }
+
+    #[test]
+    fn release_stale_slots_tracks_gh_missing_observation_across_grace_and_reclaim() {
+        let _env = TestEnv::new("track_gh_missing_observation");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+
+        // Step 1: Registered within grace window (e.g. 10s ago)
+        let now = now_epoch_secs();
+        let jit_issued_at = now - 10;
+        let mut assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assignments
+            .registered_at
+            .insert("1".to_string(), jit_issued_at);
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // Step 2: GH is missing while local container exists (within grace)
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reclaimed, 0, "must not reclaim within grace window");
+
+        // Verify gh_missing_first_observed_at was persisted to disk
+        let reloaded = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(
+            reloaded.gh_missing_first_observed_at.contains_key("1"),
+            "first missing observation timestamp must be recorded in slot_assignments"
+        );
+        let first_seen = reloaded.gh_missing_first_observed_at["1"];
+
+        // Step 3: Simulate time passing past grace window (registration 70s ago, first missing 60s ago)
+        let mut updated = read_slot_assignments_for(Some(&cfg)).unwrap();
+        updated.registered_at.insert(
+            "1".to_string(),
+            now - REGISTRATION_GRACE_WINDOW.as_secs() - 10,
+        );
+        updated
+            .gh_missing_first_observed_at
+            .insert("1".to_string(), first_seen - 60);
+        write_slot_assignments_for(&updated, Some(&cfg)).unwrap();
+
+        // Step 4: Reconcile tick now reclaims past grace
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reclaimed, 1, "must reclaim slot past grace");
+
+        // Verify evidence accurately distinguishes missing duration from registration age
+        let final_assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(
+            !final_assignments
+                .gh_missing_first_observed_at
+                .contains_key("1"),
+            "gh_missing_first_observed_at must be cleared on slot release"
+        );
+        let ev = &final_assignments.lifecycle_evidence["1"][0];
+        assert!(
+            ev.gh_missing_duration_secs >= 60,
+            "gh_missing_duration_secs must measure duration since first observation, got {}",
+            ev.gh_missing_duration_secs
+        );
+        assert!(
+            ev.registration_age_secs >= 70,
+            "registration_age_secs must measure elapsed time since JIT issuance, got {}",
+            ev.registration_age_secs
+        );
+    }
+
+    #[test]
+    fn redact_secrets_omits_tokens_and_credentials_while_preserving_exit_context() {
+        let fake_jwt = [
+            "ey",
+            "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            ".",
+            "ey",
+            "JzdWIiOiIxMjM0NTY3ODkwIn0",
+            ".dummy_sig",
+        ]
+        .concat();
+        let fake_ghp = ["ghp_", "ABC1234567890abcdef1234567890abcdef"].concat();
+        let fake_pat = [
+            "github_pat_",
+            "11AAAAAAA01234567890abcdef_abcdefghijklmnopqrstuvwxyz1234567890abcdef",
+        ]
+        .concat();
+
+        let raw_logs = format!(
+            "\
+2026-08-27 21:00:00 [INFO] Runner.Listener initializing with --jitconfig {fake_jwt}
+2026-08-27 21:00:01 [DEBUG] Authenticating via token {fake_ghp}
+2026-08-27 21:00:02 [DEBUG] Direct token Bearer secret_bearer_token_xyz
+2026-08-27 21:00:03 [DEBUG] Fine-grained token: {fake_pat}
+2026-08-27 21:00:04 [DEBUG] Header Authorization: Bearer secret_bearer_token_abc
+2026-08-27 21:00:05 [DEBUG] Parameters --token reg_token_12345 password=mypassword123 api_key=sk-99887766 client_secret=sec_val_456
+2026-08-27 21:00:06 [INFO] RUNNER_TOKEN=secret_runner_tok RUNNER_JITCONFIG=secret_jit_data ACCESS_TOKEN=acc_tok
+2026-08-27 21:00:07 [ERROR] Runner.Listener lost registration; exit code 143 (SIGTERM received)
+2026-08-27 21:00:08 [INFO] Ephemeral runner process terminated gracefully"
+        );
+
+        let redacted = redact_secrets(&raw_logs);
+
+        // Prove all secret material is scrubbed
+        assert!(!redacted.contains(&fake_ghp));
+        assert!(!redacted.contains(&fake_pat));
+        assert!(!redacted.contains("secret_bearer_token_xyz"));
+        assert!(!redacted.contains("reg_token_12345"));
+        assert!(!redacted.contains("mypassword123"));
+        assert!(!redacted.contains("sk-99887766"));
+        assert!(!redacted.contains("sec_val_456"));
+        assert!(!redacted.contains("secret_runner_tok"));
+        assert!(!redacted.contains("secret_jit_data"));
+        assert!(!redacted.contains("acc_tok"));
+        assert!(!redacted.contains(&fake_jwt));
+
+        // Prove non-secret exit context and diagnostic messages are fully preserved
+        assert!(redacted.contains("[INFO] Runner.Listener initializing"));
+        assert!(redacted.contains(
+            "[ERROR] Runner.Listener lost registration; exit code 143 (SIGTERM received)"
+        ));
+        assert!(redacted.contains("[INFO] Ephemeral runner process terminated gracefully"));
+        assert!(redacted.contains("[REDACTED_GH_TOKEN]"));
+        assert!(redacted.contains("[REDACTED_GH_PAT]"));
+        assert!(redacted.contains("Bearer [REDACTED]"));
+    }
+
+    #[test]
+    fn adversarial_redaction_removes_unflagged_jwt_and_query_credentials() {
+        let fake_jwt = [
+            "ey",
+            "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            ".",
+            "ey",
+            "JzdWIiOiIxMjM0NTY3ODkwIiwicm9sZSI6InJ1bm5lciJ9",
+            ".signature_value_12345",
+        ]
+        .concat();
+
+        let raw_logs = format!(
+            "\
+2026-08-27 21:00:00 [DEBUG] Raw unflagged JWT token: {fake_jwt} in stream
+2026-08-27 21:00:01 [DEBUG] Query request https://api.github.com/v1/runners?token=query_tok_12345&access_token=sec_access_tok_67890&foo=bar
+2026-08-27 21:00:02 [DEBUG] Config payload api_key: secret_api_val_999 client_secret=client_sec_val_888 password: supersecret123
+2026-08-27 21:00:03 [ERROR] Runner.Listener exiting with status 143: worker stopped while processing job 98765"
+        );
+
+        let redacted = redact_secrets(&raw_logs);
+
+        // Adversarial assertions
+        assert!(!redacted.contains(&fake_jwt));
+        assert!(!redacted.contains("signature_value_12345"));
+        assert!(!redacted.contains("query_tok_12345"));
+        assert!(!redacted.contains("sec_access_tok_67890"));
+        assert!(!redacted.contains("secret_api_val_999"));
+        assert!(!redacted.contains("client_sec_val_888"));
+        assert!(!redacted.contains("supersecret123"));
+
+        // Prove replacements and query structure
+        assert!(redacted.contains("[REDACTED_JWT]"));
+        assert!(redacted.contains("?token=[REDACTED]"));
+        assert!(redacted.contains("&access_token=[REDACTED]"));
+        assert!(redacted.contains("&foo=bar"));
+        assert!(redacted.contains("api_key: [REDACTED]"));
+        assert!(redacted.contains("client_secret=[REDACTED]"));
+        assert!(redacted.contains("password: [REDACTED]"));
+
+        // Context intact
+        assert!(redacted.contains(
+            "Runner.Listener exiting with status 143: worker stopped while processing job 98765"
+        ));
+    }
+
+    #[test]
+    fn bound_log_tail_enforces_line_and_byte_caps() {
+        let mut many_lines = String::new();
+        for i in 1..=100 {
+            many_lines.push_str(&format!("line number {i}\n"));
+        }
+        let bounded_lines = bound_log_tail(&many_lines, 10, 10000);
+        let lines: Vec<&str> = bounded_lines.lines().collect();
+        assert_eq!(lines.len(), 10, "must bound to max lines");
+        assert_eq!(lines[0], "line number 91");
+        assert_eq!(lines[9], "line number 100");
+
+        let long_line = "a".repeat(5000);
+        let bounded_bytes = bound_log_tail(&long_line, 10, 256);
+        assert!(bounded_bytes.len() <= 256, "must bound to max bytes");
+    }
+
+    #[test]
+    fn probe_container_lifecycle_captures_container_metadata_and_redacted_logs() {
+        let _env = TestEnv::new("probe_container_lifecycle_mock");
+
+        let script = _env.path.parent().unwrap().join("mock-docker.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "logs" ]; then
+    printf 'Runner.Listener starting with --token secret_reg_tok\nRunner.Listener stopped with exit code 143\n'
+    exit 0
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let container_info = ManagedContainer {
+            id: "cid-mock-abcdef123456".to_string(),
+            name: "ez-org-runner-1".to_string(),
+            state: "exited".to_string(),
+            running_for: "10 minutes".to_string(),
+        };
+
+        let probe = probe_container_lifecycle("ez-org-runner-1", Some(&container_info));
+        assert_eq!(
+            probe.container_id,
+            Some("cid-mock-abcdef123456".to_string())
+        );
+        assert_eq!(probe.container_status, Some("exited".to_string()));
+        assert_eq!(probe.exit_reason, Some("status=exited".to_string()));
+        let log_tail = probe
+            .listener_log_tail
+            .expect("log tail should be captured");
+        assert!(!log_tail.contains("secret_reg_tok"));
+        assert!(log_tail.contains("--token [REDACTED]"));
+        assert!(log_tail.contains("Runner.Listener stopped with exit code 143"));
+    }
+
+    #[test]
+    fn probe_container_lifecycle_handles_docker_timeout_without_blocking() {
+        let _env = TestEnv::new("probe_container_lifecycle_timeout");
+
+        let script = _env.path.parent().unwrap().join("slow-docker.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+exec /bin/sleep 10
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let start = Instant::now();
+        let probe = probe_container_lifecycle("ez-org-runner-1", None);
+        let elapsed = start.elapsed();
+
+        // Must timeout and return gracefully within bounded <= 500ms deadline (+ margin for test harness)
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "probe must complete below tight bound (target <= 500ms); elapsed: {elapsed:?}"
+        );
+        assert_eq!(probe.listener_log_tail, None);
+    }
+
+    #[test]
+    fn old_slot_assignments_toml_without_lifecycle_evidence_still_loads() {
+        let legacy_toml = r#"
+[assignments]
+"1" = "4242"
+"2" = "8484"
+
+[registered_at]
+"1" = 1700000000
+"2" = 1700000010
+"#;
+        let parsed: SlotAssignments = toml::from_str(legacy_toml)
+            .expect("legacy slot_assignments.toml must deserialize cleanly");
+        assert_eq!(
+            parsed.assignments.get("1").map(String::as_str),
+            Some("4242")
+        );
+        assert_eq!(
+            parsed.assignments.get("2").map(String::as_str),
+            Some("8484")
+        );
+        assert_eq!(parsed.registered_at.get("1").copied(), Some(1700000000));
+        assert!(parsed.gh_missing_first_observed_at.is_empty());
+        assert!(parsed.lifecycle_evidence.is_empty());
+
+        let reserialized = toml::to_string_pretty(&parsed).expect("must serialize back to toml");
+        assert!(reserialized.contains("[assignments]"));
+        assert!(reserialized.contains("[registered_at]"));
+        assert!(!reserialized.contains("[lifecycle_evidence]"));
+        assert!(!reserialized.contains("[gh_missing_first_observed_at]"));
+    }
+
+    #[test]
+    fn release_stale_slots_full_integration_evidence_and_slot_release() {
+        let _env = TestEnv::new("full_integration_evidence_and_slot_release");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+
+        let jit_issued_at = now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 15;
+        let mut assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assignments
+            .registered_at
+            .insert("1".to_string(), jit_issued_at);
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let script = _env.path.parent().unwrap().join("integration-docker.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+if [ "$1" = "logs" ]; then
+    printf '2026-08-27 [INFO] Runner.Listener connected with Bearer ghp_secret123\n2026-08-27 [INFO] Listening for Jobs\n'
+    exit 0
+elif [ "$1" = "stats" ]; then
+    printf '128.0MiB / 8.0GiB\n'
+    exit 0
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let managed_list = vec![ManagedContainer {
+            id: "cid-integration-9988".to_string(),
+            name: "ez-org-runner-1".to_string(),
+            state: "running".to_string(),
+            running_for: "5 minutes".to_string(),
+        }];
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            Some(&managed_list),
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 1, "must reclaim 1 slot");
+
+        let reloaded_assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(!reloaded_assignments.assignments.contains_key("1"));
+        assert!(!reloaded_assignments.registered_at.contains_key("1"));
+
+        let evidence_list = read_lifecycle_evidence_for(Some(&cfg), Some(1)).unwrap();
+        assert_eq!(evidence_list.len(), 1);
+        let (slot_n, ev) = &evidence_list[0];
+        assert_eq!(*slot_n, 1);
+        assert_eq!(ev.slot, 1);
+        assert_eq!(ev.reason, "gh-rejected-past-grace");
+        assert_eq!(ev.runner_id, 4242);
+        assert_eq!(ev.runner_name, "ez-org-runner-1");
+        assert!(!ev.gh_observed);
+        assert_eq!(ev.gh_status, "missing");
+        assert_eq!(ev.gh_missing_duration_secs, 0);
+        assert!(ev.registration_age_secs >= REGISTRATION_GRACE_WINDOW.as_secs() + 15);
+        assert_eq!(ev.jit_issued_at_epoch_secs, Some(jit_issued_at));
+        assert_eq!(ev.container_id, Some("cid-integration-9988".to_string()));
+        assert_eq!(ev.container_status, Some("running".to_string()));
+        assert_eq!(ev.run_id, None);
+
+        let log_tail = ev
+            .listener_log_tail
+            .as_ref()
+            .expect("listener log tail present");
+        assert!(!log_tail.contains("ghp_secret123"));
+        assert!(log_tail.contains("Bearer [REDACTED]"));
+        assert!(log_tail.contains("Listening for Jobs"));
+    }
+
+    #[test]
+    fn release_stale_slots_multi_slot_tick_preserves_reclaim_and_observation_without_resurrection()
+    {
+        let _env = TestEnv::new("multi_slot_tick_atomic_persistence");
+        let cfg = cfg_with(3, "ez-org-runner");
+
+        // Seed slots 1, 2, 3
+        let _s1 = next_slot(&cfg).unwrap();
+        let _s2 = next_slot(&cfg).unwrap();
+        let _s3 = next_slot(&cfg).unwrap();
+
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 2, 8484).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 3, 9999).unwrap();
+
+        let now = now_epoch_secs();
+        let mut initial = read_slot_assignments_for(Some(&cfg)).unwrap();
+        // Slot 1: past grace
+        initial.registered_at.insert(
+            "1".to_string(),
+            now - REGISTRATION_GRACE_WINDOW.as_secs() - 10,
+        );
+        // Slot 2: in grace
+        initial.registered_at.insert("2".to_string(), now - 5);
+        // Slot 3: in grace, with prior missing timestamp to clear
+        initial.registered_at.insert("3".to_string(), now - 15);
+        initial
+            .gh_missing_first_observed_at
+            .insert("3".to_string(), now - 15);
+        write_slot_assignments_for(&initial, Some(&cfg)).unwrap();
+
+        // Containers exist for all 3
+        let local_names = HashSet::from([
+            "ez-org-runner-1".to_string(),
+            "ez-org-runner-2".to_string(),
+            "ez-org-runner-3".to_string(),
+        ]);
+        // Live runners: ONLY runner 9999 is live on GH (slot 3). Runners 4242 (slot 1) and 8484 (slot 2) are missing.
+        let live = vec![runner_info(9999, "ez-org-runner-3")];
+
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 1, "only slot 1 should be reclaimed");
+
+        // Reload from disk to verify atomic persistence without resurrection
+        let reloaded = read_slot_assignments_for(Some(&cfg)).unwrap();
+
+        // Slot 1: Must remain released and NOT resurrected by slot 2 or 3 mutations!
+        assert!(
+            !reloaded.assignments.contains_key("1"),
+            "slot 1 must not be resurrected"
+        );
+        assert!(
+            !reloaded.registered_at.contains_key("1"),
+            "slot 1 registered_at must not be resurrected"
+        );
+        assert!(
+            !reloaded.gh_missing_first_observed_at.contains_key("1"),
+            "slot 1 gh_missing_first_observed_at must be cleared"
+        );
+        assert!(
+            reloaded.lifecycle_evidence.contains_key("1"),
+            "slot 1 lifecycle evidence must be persisted"
+        );
+
+        // Slot 2: In grace, must be retained and have its observation state recorded
+        assert_eq!(
+            reloaded.assignments.get("2").map(String::as_str),
+            Some("8484")
+        );
+        assert!(
+            reloaded.gh_missing_first_observed_at.contains_key("2"),
+            "slot 2 must have gh_missing_first_observed_at recorded"
+        );
+
+        // Slot 3: Live on GH, must be retained and have prior missing observation cleared
+        assert_eq!(
+            reloaded.assignments.get("3").map(String::as_str),
+            Some("9999")
+        );
+        assert!(
+            !reloaded.gh_missing_first_observed_at.contains_key("3"),
+            "slot 3 gh_missing_first_observed_at must be cleared on live observation"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_multiple_in_grace_missing_slots_both_persist_observations() {
+        let _env = TestEnv::new("multi_in_grace_missing_observations");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        let _s1 = next_slot(&cfg).unwrap();
+        let _s2 = next_slot(&cfg).unwrap();
+
+        record_slot_runner_id_for(Some(&cfg), 1, 1111).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 2, 2222).unwrap();
+
+        let now = now_epoch_secs();
+        let mut initial = read_slot_assignments_for(Some(&cfg)).unwrap();
+        initial.registered_at.insert("1".to_string(), now - 10);
+        initial.registered_at.insert("2".to_string(), now - 15);
+        write_slot_assignments_for(&initial, Some(&cfg)).unwrap();
+
+        let local_names =
+            HashSet::from(["ez-org-runner-1".to_string(), "ez-org-runner-2".to_string()]);
+        // Neither runner is live on GH
+        let live = vec![];
+
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 0, "both slots are within grace");
+
+        // Reload from disk: both observation timestamps must survive (no last-write-wins wipe)
+        let reloaded = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(
+            reloaded.gh_missing_first_observed_at.contains_key("1"),
+            "slot 1 missing observation must survive on disk"
+        );
+        assert!(
+            reloaded.gh_missing_first_observed_at.contains_key("2"),
+            "slot 2 missing observation must survive on disk"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_c3_reclaim_with_hanging_docker_shim_completes_below_bound_and_uses_cached_peak(
+    ) {
+        let _env = TestEnv::new("c3_hanging_docker_shim_non_blocking");
+        let cfg = cfg_with(1, "ez-org-runner");
+
+        let _s1 = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+
+        let jit_issued_at = now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 10;
+        let mut assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assignments
+            .registered_at
+            .insert("1".to_string(), jit_issued_at);
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // Seed in-memory cached peak RSS
+        PEAK_RSS_MB
+            .lock()
+            .unwrap()
+            .insert("ez-org-runner-1".to_string(), 512);
+
+        // Install a hanging docker shim
+        let script = _env.path.parent().unwrap().join("hanging-docker.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+exec /bin/sleep 10
+"#,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let live = vec![];
+
+        let start = Instant::now();
+        let reclaimed = release_stale_slots_from_with_containers_for(
+            Some(&cfg),
+            &read_slot_assignments_for(Some(&cfg)).unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            None,
+        )
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(reclaimed, 1, "must reclaim past-grace slot");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "entire c-3 reclaim path must complete below tight bound (target <= 500ms); elapsed: {elapsed:?}"
+        );
+
+        let final_assignments = read_slot_assignments_for(Some(&cfg)).unwrap();
+        let ev = &final_assignments.lifecycle_evidence["1"][0];
+        assert_eq!(
+            ev.peak_rss_mb,
+            Some(512),
+            "evidence must use cached peak RSS from memory without spawning docker stats"
+        );
+        assert_eq!(
+            ev.listener_log_tail, None,
+            "listener log tail must fail-soft on docker hang"
+        );
+    }
+
+    #[test]
+    fn release_slot_with_lifecycle_evidence_single_transition_persists_evidence_and_removes_active_row(
+    ) {
+        let _env = TestEnv::new("single_transition_evidence_and_removal");
+        let cfg = cfg_with(2, "ez-org-runner");
+
+        let _s1 = next_slot(&cfg).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 1, 4242).unwrap();
+        record_gh_missing_first_observed_for(Some(&cfg), 1, 1700000000).unwrap();
+
+        let evidence = LifecycleEvidence {
+            slot: 1,
+            reason: "gh-rejected-past-grace".to_string(),
+            recorded_at_epoch_secs: 1700000100,
+            monotonic_secs: 12.34,
+            jit_issued_at_epoch_secs: Some(1700000000),
+            registration_age_secs: 100,
+            runner_id: 4242,
+            runner_name: "ez-org-runner-1".to_string(),
+            gh_observed: false,
+            gh_status: "missing".to_string(),
+            gh_missing_duration_secs: 100,
+            container_id: Some("cid-abc".to_string()),
+            container_status: Some("running".to_string()),
+            peak_rss_mb: Some(256),
+            listener_log_tail: Some("listening...".to_string()),
+            exit_reason: None,
+            job_id: None,
+            run_id: None,
+        };
+
+        release_slot_with_lifecycle_evidence_for(Some(&cfg), 1, &evidence)
+            .expect("atomic release must succeed");
+
+        // Reload once from disk
+        let reloaded = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(
+            !reloaded.assignments.contains_key("1"),
+            "active assignment must be removed"
+        );
+        assert!(
+            !reloaded.registered_at.contains_key("1"),
+            "registered_at must be removed"
+        );
+        assert!(
+            !reloaded.gh_missing_first_observed_at.contains_key("1"),
+            "gh_missing_first_observed_at must be removed"
+        );
+        assert_eq!(
+            reloaded.lifecycle_evidence.get("1").map(Vec::len),
+            Some(1),
+            "evidence must be present in same transition"
+        );
+    }
+
+    #[test]
+    fn release_slot_with_lifecycle_evidence_preserves_multislot_and_caps_history() {
+        let _env = TestEnv::new("multislot_evidence_and_capping");
+        let cfg = cfg_with(3, "ez-org-runner");
+
+        let _s1 = next_slot(&cfg).unwrap();
+        let _s2 = next_slot(&cfg).unwrap();
+        let _s3 = next_slot(&cfg).unwrap();
+
+        record_slot_runner_id_for(Some(&cfg), 1, 1001).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 2, 1002).unwrap();
+        record_slot_runner_id_for(Some(&cfg), 3, 1003).unwrap();
+        record_gh_missing_first_observed_for(Some(&cfg), 3, 1700000000).unwrap();
+
+        // Release slot 1 with multiple evidence entries exceeding cap
+        for i in 1..=(LIFECYCLE_EVIDENCE_CAP_PER_SLOT + 2) {
+            let ev = LifecycleEvidence {
+                slot: 1,
+                reason: format!("gh-rejected-past-grace-{i}"),
+                recorded_at_epoch_secs: 1700000000 + i as u64,
+                monotonic_secs: i as f64,
+                jit_issued_at_epoch_secs: Some(1700000000),
+                registration_age_secs: i as u64,
+                runner_id: 1001,
+                runner_name: "ez-org-runner-1".to_string(),
+                gh_observed: false,
+                gh_status: "missing".to_string(),
+                gh_missing_duration_secs: i as u64,
+                container_id: None,
+                container_status: None,
+                peak_rss_mb: None,
+                listener_log_tail: None,
+                exit_reason: None,
+                job_id: None,
+                run_id: None,
+            };
+            release_slot_with_lifecycle_evidence_for(Some(&cfg), 1, &ev).unwrap();
+        }
+
+        let reloaded = read_slot_assignments_for(Some(&cfg)).unwrap();
+        // Slot 1: capped at LIFECYCLE_EVIDENCE_CAP_PER_SLOT
+        let ev1 = &reloaded.lifecycle_evidence["1"];
+        assert_eq!(
+            ev1.len(),
+            LIFECYCLE_EVIDENCE_CAP_PER_SLOT,
+            "evidence history must be capped at LIFECYCLE_EVIDENCE_CAP_PER_SLOT"
+        );
+        assert_eq!(
+            ev1.last().unwrap().reason,
+            format!(
+                "gh-rejected-past-grace-{}",
+                LIFECYCLE_EVIDENCE_CAP_PER_SLOT + 2
+            )
+        );
+
+        // Slots 2 & 3: completely untouched
+        assert_eq!(
+            reloaded.assignments.get("2").map(String::as_str),
+            Some("1002")
+        );
+        assert!(reloaded.registered_at.contains_key("2"));
+        assert_eq!(
+            reloaded.assignments.get("3").map(String::as_str),
+            Some("1003")
+        );
+        assert!(reloaded.registered_at.contains_key("3"));
+        assert_eq!(
+            reloaded.gh_missing_first_observed_at.get("3").copied(),
+            Some(1700000000)
+        );
+    }
+
+    #[test]
+    fn apply_slot_release_with_lifecycle_evidence_pure_seam_cannot_leave_active_row_removed_without_evidence(
+    ) {
+        let mut assignments = SlotAssignments {
+            assignments: BTreeMap::from([
+                ("1".to_string(), "4242".to_string()),
+                ("2".to_string(), "8484".to_string()),
+            ]),
+            registered_at: BTreeMap::from([
+                ("1".to_string(), 1700000000),
+                ("2".to_string(), 1700000010),
+            ]),
+            gh_missing_first_observed_at: BTreeMap::from([
+                ("1".to_string(), 1700000005),
+                ("2".to_string(), 1700000015),
+            ]),
+            lifecycle_evidence: BTreeMap::new(),
+        };
+
+        let ev = LifecycleEvidence {
+            slot: 1,
+            reason: "gh-rejected-past-grace".to_string(),
+            recorded_at_epoch_secs: 1700000020,
+            monotonic_secs: 10.0,
+            jit_issued_at_epoch_secs: Some(1700000000),
+            registration_age_secs: 20,
+            runner_id: 4242,
+            runner_name: "ez-org-runner-1".to_string(),
+            gh_observed: false,
+            gh_status: "missing".to_string(),
+            gh_missing_duration_secs: 15,
+            container_id: Some("cid-1".to_string()),
+            container_status: Some("running".to_string()),
+            peak_rss_mb: Some(128),
+            listener_log_tail: None,
+            exit_reason: None,
+            job_id: None,
+            run_id: None,
+        };
+
+        apply_slot_release_with_lifecycle_evidence(&mut assignments, 1, ev);
+
+        // Verification of pure state transition:
+        // Slot 1 must have evidence AND have all active entries removed in the exact same step.
+        assert!(!assignments.assignments.contains_key("1"));
+        assert!(!assignments.registered_at.contains_key("1"));
+        assert!(!assignments.gh_missing_first_observed_at.contains_key("1"));
+        assert_eq!(
+            assignments.lifecycle_evidence.get("1").map(Vec::len),
+            Some(1)
+        );
+
+        // Slot 2 must be completely preserved.
+        assert_eq!(
+            assignments.assignments.get("2").map(String::as_str),
+            Some("8484")
+        );
+        assert_eq!(
+            assignments.registered_at.get("2").copied(),
+            Some(1700000010)
+        );
+        assert_eq!(
+            assignments.gh_missing_first_observed_at.get("2").copied(),
+            Some(1700000015)
         );
     }
 }
