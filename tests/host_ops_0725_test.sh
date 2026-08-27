@@ -128,9 +128,10 @@ else
   fi
 
   # Behavioral smoke test: fabricate a fake process table via a stub `ps`
-  # on PATH shaped exactly like the REAL fixture seen on jeff-ubuntu during
+  # on PATH shaped exactly like the REAL fixtures seen on jeff-ubuntu during
   # adversarial verification: qemu (Colima VM, ~32GB, must be excluded),
-  # then warp-terminal (~760MB, the user's GUI terminal, must be excluded),
+  # then Warp's AppImage launcher (comm=AppRun, argv ends in warp-terminal;
+  # ~760MB and must be excluded),
   # then a legitimate `claude` agent CLI process (the actual intended
   # target class) -- assert the watcher skips BOTH exclusions and lands on
   # the claude process, never qemu or warp-terminal.
@@ -141,11 +142,11 @@ else
 # Stub ps: ignores its arguments, always returns a fixed fixture table
 # shaped like `ps -o pid=,rss=,comm=,args= --sort=-rss` output, matching
 # the real top-of-stack seen on jeff-ubuntu 2026-07-10: qemu (Colima VM)
-# and warp-terminal (GUI terminal) both must be excluded; the claude
+# and Warp's real AppImage-shaped process both must be excluded; the claude
 # process is the legitimate target.
 cat <<'TABLE'
   24265 33072676 qemu-system-x86 /usr/bin/qemu-system-x86_64 -m 49152 -drive file=/home/jleechan/.lima/colima/diffdisk -name lima-colima
-  12439   759760 warp-terminal /usr/bin/warp-terminal
+  12439   759760 AppRun /home/jleechan/.local/bin/warp-terminal
   11111   700000 limactl /usr/local/bin/limactl hostagent
   19195   616432 claude /home/jleechan/.npm-global/bin/claude
 TABLE

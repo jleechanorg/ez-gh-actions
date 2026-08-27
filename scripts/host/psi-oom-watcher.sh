@@ -205,9 +205,11 @@ _shed_strict_required=0
 # the actual truncated value so the intent and the mechanism agree.
 EXCLUDE_NAME_PATTERN='^(systemd|\(sd-pam\)|sshd|Xorg|gnome-shell|tmux: server|screen|psi-oom-watcher|ezgha|qemu-system-x86|colima|lima|limactl|dockerd|docker|warp-terminal|gnome-terminal|gnome-terminal-server|konsole|alacritty|kitty|xterm|terminator|tilix|foot|wezterm|ghostty)$'
 # args-based exclusions (defense in depth for the comm-truncation case
-# above, and to catch any Colima/Lima helper process whose comm doesn't
-# start with one of the names above but whose full command line does).
-EXCLUDE_ARGS_PATTERN='(qemu-system|\.lima/colima|/colima/|lima-colima)'
+# above, and to catch processes whose executable wrapper hides their identity).
+# Warp's AppImage launcher uses comm=AppRun: on 2026-08-26 the name-only
+# exclusion missed it and this watcher SIGTERM'd the user's terminal. Match the
+# specific warp-terminal argv path; excluding every AppRun would be overbroad.
+EXCLUDE_ARGS_PATTERN='(qemu-system|\.lima/colima|/colima/|lima-colima|(^|/)warp-terminal([[:space:]/]|$))'
 
 mkdir -p "${STATE_DIR}"
 
