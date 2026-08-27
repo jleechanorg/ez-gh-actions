@@ -21,6 +21,8 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test
+      - name: Layer-2 failure-ladder real-binary regression test
+        run: bash tests/ezgha_start_failure_ladder_layer2_test.sh
       - name: Runner dashboard contract tests
         run: |
           python3 -m unittest tests/runner_dashboard_snapshot_test.py
@@ -70,6 +72,8 @@ jobs:
           bash tests/assert_no_host_reboot_vote_test.sh
           bash tests/assert_qemu_cpu_ceiling_test.sh
           bash tests/apply_cfs_nohz_panic_stop_test.sh
+          bash tests/apply_watchdog_no_reboot_vote_test.sh
+          bash tests/configure_grub_kdump_retired_test.sh
           bash tests/integrate_pr_payload_regression_test.sh
           bash tests/launchd_docker_host_consumers_test.sh
           bash tests/refresh_gh_app_token_timeout_test.sh
