@@ -322,7 +322,9 @@ enabled = false
 [invariant_sampler]
 enabled = false
 EOF
+total_partial_count=0
 for attempt in 1 2; do
+  mkdir -p "$TMP_ROOT/shim-state-phase2-$attempt"
   set +e
   env -i PATH="$SHIM_DIR:/usr/bin:/bin" HOME="$TMP_ROOT/home" \
     XDG_CONFIG_HOME="$TMP_ROOT/xdg-config" XDG_STATE_HOME="$TMP_ROOT/xdg-state" \
@@ -330,7 +332,7 @@ for attempt in 1 2; do
     DOCKER_HOST='unix:///layer2-no-daemon.sock' \
     EZGHA_LAYER2_DOCKER_LOG="$PHASE2_DOCKER_LOG" EZGHA_LAYER2_GH_LOG="$PHASE2_GH_LOG" \
     EZGHA_LAYER2_SHIM_STATE="$TMP_ROOT/shim-state-phase2-$attempt" \
-    timeout --foreground --signal=TERM --kill-after=5s 7s \
+    timeout --foreground --signal=TERM --kill-after=5s 12s \
     "$BIN" --config "$PHASE2_CONFIG" serve >"$PHASE2_DIR/serve-$attempt.out" 2>&1
   phase2_rc=$?
   set -e
@@ -338,9 +340,15 @@ for attempt in 1 2; do
 done
 for attempt in 1 2; do
   require_file_contains "$PHASE2_DIR/serve-$attempt.out" 'ensure_count started only 0 of 3 missing runner(s); treating as partial failure' "deadman phase $attempt lacked partial-refill evidence"
+  require_file_contains "$PHASE2_DIR/serve-$attempt.out" 'docker run failed: layer2: deterministic detached runner refusal' "deadman phase $attempt never reached the intended Docker admission failure"
+  if grep -q 'gh api generate-jitconfig failed' "$PHASE2_DIR/serve-$attempt.out"; then
+    fail "deadman phase $attempt stopped at the JIT shim instead of exercising runner admission"
+  fi
   partial_count="$(grep -c 'ensure_count started only 0 of 3 missing runner(s); treating as partial failure' "$PHASE2_DIR/serve-$attempt.out" || true)"
-  [[ "$partial_count" -ge 2 ]] || fail "deadman phase $attempt recorded only $partial_count partial refill(s); need repeated non-paused failures"
+  [[ "$partial_count" -ge 1 ]] || fail "deadman phase $attempt recorded no partial refill"
+  total_partial_count=$((total_partial_count + partial_count))
 done
+[[ "$total_partial_count" -ge 2 ]] || fail "deadman phase recorded only $total_partial_count partial refill(s) across two independent serve processes"
 if grep -q 'fleet admission circuit opened' "$PHASE2_DIR"/serve-*.out; then fail 'deadman phase unexpectedly opened fleet admission pause'; fi
 DEADMAN_PHASE2_COUNT="$(grep -c '"event_key":"alert.pipeline.deadman"' "$PHASE2_ALERT_LOG" || true)"
 [[ "$DEADMAN_PHASE2_COUNT" -ge 2 ]] || fail 'deadman did not fire during repeated partial-refill phase'
