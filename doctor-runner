@@ -704,7 +704,7 @@ QUEUE_QUEUED_STALE=0
 if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   set +e
   # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/scripts/queue-health.sh"
+  source "$SCRIPT_DIR/scripts/queue-health.sh" || true
   QUEUE_RC=$?
   set -e
   [ "$QUEUE_RC" -eq 1 ] && QUEUE_TAIL_BAD=1
@@ -962,7 +962,8 @@ remote_docker_env() {
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
       plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
     elif command -v systemctl >/dev/null 2>&1; then
-      systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1
+      _dh=$(systemctl --user show ezgha.service -p Environment 2>/dev/null | sed -n -E "s/.*DOCKER_HOST=([^ ]+).*/\1/p" | head -1)
+      if [ -n "$_dh" ]; then echo "$_dh"; else systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1; fi
     fi' 2>/dev/null) || dh=""
   if [ -n "$dh" ]; then
     REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
