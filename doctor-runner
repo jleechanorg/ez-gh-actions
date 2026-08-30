@@ -725,7 +725,7 @@ QUEUE_QUEUED_STALE=0
 if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   set +e
   # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/scripts/queue-health.sh"
+  source "$SCRIPT_DIR/scripts/queue-health.sh" || true
   QUEUE_RC=$?
   set -e
   [ "$QUEUE_RC" -eq 1 ] && QUEUE_TAIL_BAD=1
@@ -983,7 +983,8 @@ remote_docker_env() {
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
       plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
     elif command -v systemctl >/dev/null 2>&1; then
-      systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1
+      _dh=$(systemctl --user show ezgha.service -p Environment 2>/dev/null | sed -n -E "s/.*DOCKER_HOST=([^ ]+).*/\1/p" | head -1)
+      if [ -n "$_dh" ]; then echo "$_dh"; else systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1; fi
     fi' 2>/dev/null) || dh=""
   if [ -n "$dh" ]; then
     REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
@@ -1194,19 +1195,19 @@ REMOTE_UNREACHABLE=0
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   if [ -z "$REMOTE_PREFIX" ]; then
     if [ "$PLATFORM" = "macos" ]; then
-      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^name_prefix' ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "python3 -c \"import tomllib, os; p = os.path.expanduser('~/.config/ezgha/config.toml'); print(tomllib.load(open(p, 'rb'))['runner']['name_prefix']) if os.path.exists(p) else None\"" 2>/dev/null || true)
       REMOTE_PREFIX="${REMOTE_PREFIX:-ez-runner-c}"
     else
-      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^name_prefix' ~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "python3 -c \"import tomllib, os; paths=[os.path.expanduser('~/Library/Application Support/org.jleechanorg.ezgha/config.toml'), os.path.expanduser('~/.config/ezgha/config.toml')]; print(next((tomllib.load(open(p, 'rb'))['runner']['name_prefix'] for p in paths if os.path.exists(p)), ''))\"" 2>/dev/null || true)
       REMOTE_PREFIX="${REMOTE_PREFIX:-ez-mac-runner-e}"
     fi
   fi
   if [ -z "$REMOTE_COUNT" ]; then
     if [ "$PLATFORM" = "macos" ]; then
-      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^count\s*=' ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "python3 -c \"import tomllib, os; p = os.path.expanduser('~/.config/ezgha/config.toml'); print(tomllib.load(open(p, 'rb'))['runner']['count']) if os.path.exists(p) else None\"" 2>/dev/null || true)
       REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"
     else
-      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^count\s*=' ~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
+      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "python3 -c \"import tomllib, os; paths=[os.path.expanduser('~/Library/Application Support/org.jleechanorg.ezgha/config.toml'), os.path.expanduser('~/.config/ezgha/config.toml')]; print(next((tomllib.load(open(p, 'rb'))['runner']['count'] for p in paths if os.path.exists(p)), ''))\"" 2>/dev/null || true)
       REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
     fi
   fi

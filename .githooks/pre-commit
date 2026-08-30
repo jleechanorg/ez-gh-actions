@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Pre-commit hook: reject shell scripts that use `docker build -f
+# <relative_path>` (the 2026-08-20 Mac fleet outage bug class).
+#
+# Background: scripts/ezgha-fleet-watchdog.sh:366 used a relative
+# '-f Dockerfile.runner' which Docker resolves against launchd's
+# cwd-of-/. Under launchd, the launched bash process has no explicit
+# WorkingDirectory, so cwd defaults to /. Docker resolves
+# '-f Dockerfile.runner' against '/' -> '/Dockerfile.runner' -> ENOENT.
+# This caused 311+ silent REBUILD FAILED events over 19 days before
+# triggering the 2026-08-20 Mac fleet outage.
+#
+# This hook catches any future regression of the same class BEFORE it
+# can be committed. See:
+#   - .claude/skills/install-gate-checks/SKILL.md (behavioral sentinel pattern)
+#   - .github/workflows/install-sentinel.yml (CI behavioral checks)
+#   - commit b3fe954 (the original fix)
+#   - bead jleechan-zgvz (line 366 bug + follow-ups)
+#
+# Opt in per-developer with:
+#   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+# Get staged shell script changes only (not the full working tree)
+STAGED_SHELLSCRIPTS="$(git diff --cached --name-only --diff-filter=AM \
+  | grep -E '\.(sh|bash)$|^scripts/[a-z_-]+$' || true)"
+
+if [[ -z "${STAGED_SHELLSCRIPTS}" ]]; then
+  exit 0
+fi
+
+violations=0
+for f in ${STAGED_SHELLSCRIPTS}; do
+  if [[ ! -f "${f}" ]]; then
+    continue
+  fi
+
+  # Rule 1: 'docker build -f Dockerfile.runner' (relative, no leading
+  # slash, no $variable prefix) is the bug class.
+  if grep -nE 'docker build -f Dockerfile\.runner([[:space:]]|$)' "${f}" 2>/dev/null \
+       | grep -v '^[^:]*:[0-9]*:\s*#' >/dev/null 2>&1; then
+    echo "REJECT: ${f} contains relative '-f Dockerfile.runner' (the 2026-08-20 bug class)."
+    echo "        Use absolute '-f \"\$repo_root/Dockerfile.runner\"' instead."
+    echo "        See .claude/skills/install-gate-checks/SKILL.md for the pattern."
+    violations=$((violations + 1))
+  fi
+
+  # Rule 2: any 'docker build -f <word>' where <word> doesn't start
+  # with '/' or '$' or '"$' is suspect (catches similar relative-path
+  # bugs in OTHER paths, not just Dockerfile.runner).
+  if grep -nE 'docker build -f [^/"$]' "${f}" 2>/dev/null \
+       | grep -v '^[^:]*:[0-9]*:\s*#' >/dev/null 2>&1; then
+    echo "REJECT: ${f} contains 'docker build -f <relative>' (relative path class)."
+    echo "        Use absolute path or '\$var/Dockerfile.*' pattern."
+    violations=$((violations + 1))
+  fi
+done
+
+if (( violations > 0 )); then
+  echo
+  echo "Pre-commit hook rejected ${violations} violation(s)."
+  echo "See: .claude/skills/install-gate-checks/SKILL.md"
+  echo "Fix the relative paths to absolute, then re-stage and retry."
+  exit 1
+fi
+
+exit 0
