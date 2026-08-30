@@ -18,13 +18,13 @@ The fleet MUST run its full configured capacity: **10 Linux** (ez-runner-c-1..10
 - `docs/verify-exit-criteria.sh` — ironclad exit criteria checker (Gates 0–10)
 - `Dockerfile.runner` — custom runner image with `gh` + `jq` pre-installed
 - `.claude/skills/ezgha-doctor/SKILL.md` — diagnostic + self-healing recipes
-- `.claude/commands/doctor.md` — `/doctor` slash command
+- `.claude/commands/doctor-ezactions.md` — `/doctor-ezactions` slash command (`/doctor` is a deprecated alias)
 
 ## Custom runner image (IMPORTANT)
 The config must use `ezgha-runner:latest` (built from `Dockerfile.runner`), NOT the bare `ghcr.io/actions/actions-runner:latest` image.
 The bare upstream image lacks `gh` and `jq`, causing workflows to fail with exit code 127.
 
-To rebuild after changes to Dockerfile.runner:
+Only the designated deploy-owner rebuilds the production image or updates live runner configuration. For deploy-owner use, rebuild after changes to `Dockerfile.runner`:
 ```bash
 docker build -f Dockerfile.runner -t ezgha-runner:latest .
 ```
@@ -35,14 +35,11 @@ Then update `~/.config/ezgha/config.toml`:
 image = "ezgha-runner:latest"
 ```
 
-## After any commit (IMPORTANT — Gate 0)
-Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
-**Every commit — even docs-only — advances HEAD**, so you must always rebuild after committing:
+## After any commit
 
-1. `cargo test` — verify all tests pass
-2. `cargo install --path .` — install updated binary (embeds new HEAD SHA)
-3. `systemctl --user restart ezgha.service` — restart daemon
-4. `./docs/verify-exit-criteria.sh` — verify all gates pass
+All contributors run `cargo test`, commit scoped files, and push. Live installation, service restart, and `verify-exit-criteria.sh` are the responsibility of the **single deploy-owner** for the current session, following the canonical Gate 0 procedure in `CLAUDE.md`.
+
+Non-owners use **commit + push only; do not deploy**, then hand the exact SHA and test result to the deploy-owner.
 
 ## Commit conventions
 Every commit subject must be prefixed with the runtime that produced it:
@@ -51,6 +48,8 @@ Every commit subject must be prefixed with the runtime that produced it:
 - `human: <subject>`
 
 ## Common self-healing recipes
+
+The commands below mutate the live fleet and are **deploy-owner-only**. Non-owners collect diagnostics and hand remediation to the designated owner.
 
 ### Gate 3 FAIL: container count low
 1. Check for stale containers: `docker ps --filter label=ezgha=managed --format '{{.Names}} {{.Image}}'`
@@ -72,14 +71,14 @@ limactl start colima
 ```
 
 ## /doctor-ezactions command
-Running `/doctor-ezactions` in this repo executes:
+Deploy-owner-only `/doctor-ezactions` executes:
 1. `./doctor-runner` — fleet health check
 2. `./docs/verify-exit-criteria.sh` — ironclad exit criteria (Gates 0–10)
 
 Self-heal any failures found before reporting.
 
 ## /harness command  
-Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gates. Report PASS/FAIL per gate.
+Only the designated deploy-owner runs `/harness`; it executes `./docs/verify-exit-criteria.sh` and audits all gates.
 
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**: See `CLAUDE.md` ("Safety & Monitoring Principles"). Physical-host reboot/shutdown commands and watchdog-driven forced restarts are strictly forbidden. Recovery authority belongs strictly to the child layer (container replenishment, process `Restart=on-failure`, graceful shutdown, and operator recovery).
@@ -87,4 +86,4 @@ Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gate
 ## Safety rails
 - Never run `git add -A` — stage only files you changed
 - Always push after finishing any unit of work
-- Never modify `~/.config/ezgha/config.toml` without also restarting the service
+- Only the designated deploy-owner may modify `~/.config/ezgha/config.toml` or restart the service
