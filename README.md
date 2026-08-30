@@ -489,6 +489,27 @@ This repo registers a `/doctor` slash command (`.claude/commands/doctor.md`,
 `.codex/commands/doctor.md`) that runs the diagnostic skill and auto-repairs common
 failures.
 
+### Restart-attribution logging
+
+Every restart of `ezgha.service` driven by `install.sh` (Linux `systemctl --user
+restart`; macOS `install-service` regeneration) emits a structured attribution line
+on stderr immediately before the restart itself, so a future unattributed restart
+is traceable to its invoking session from the logs alone:
+
+```
+INFO ezgha restart_attribution ts=<ISO8601> pid=<PID> ppid=<PPID> session=<user> reason="<text>" invocation="<argv>"
+```
+
+`reason` defaults to `install-sh auto-restart`; override per-call with
+`EZGHA_RESTART_REASON=<text>`. Look it up after the fact with:
+
+```bash
+# Linux
+journalctl --user -u ezgha.service | grep restart_attribution
+# macOS
+log show --predicate 'process == "ezgha"' --info | grep restart_attribution
+```
+
 ## Status
 
 **v1 (M1):** Docker backend end-to-end, JIT ephemeral, limits, disk floor, service
