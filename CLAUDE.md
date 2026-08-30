@@ -10,7 +10,7 @@ The fleet MUST run its full configured capacity: **10 Linux** (ez-runner-c-1..10
 - Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 10). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
 
 ## Key files
-- `src/docker_backend.rs` — core runner lifecycle (slot allocation, container management)
+- `src/docker_backend.rs` — core runner lifecycle (slot allocation, container management). `release_stale_slots` constructs a single `ReclaimContext { wall_secs, monotonic_secs }` via `ReclaimContext::now()` and threads `&ctx` through every helper (grace-window checks, `elapsed_secs`, reclaim records) — do NOT re-read `now_epoch_secs()` / `ensure_daemon_start().elapsed()` inside reclaim helpers (TOCTOU, bead ez-gh-actions-qz5j / GH#50).
 - `src/github.rs` — GitHub API calls (JIT config, runner registration, conflict resolution)
 - `src/main.rs` — CLI entry point
 - `~/.config/ezgha/config.toml` — runtime config (do NOT commit this)
