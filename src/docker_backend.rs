@@ -8,7 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, Once, OnceLock};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -540,12 +540,12 @@ struct DockerReapQueue {
     wake: Condvar,
 }
 
+#[derive(Clone)]
 struct DockerChildReaper {
     queue: Arc<DockerReapQueue>,
 }
 
-static DOCKER_CHILD_REAPER: OnceLock<std::result::Result<DockerChildReaper, String>> =
-    OnceLock::new();
+static DOCKER_CHILD_REAPER: Mutex<Option<DockerChildReaper>> = Mutex::new(None);
 
 fn retry_wait_until_reaped<T, E, F>(owner: &mut T, mut wait: F, detail: &str)
 where
@@ -614,7 +614,9 @@ fn docker_child_reaper_worker(
     ready_sender: Option<mpsc::SyncSender<()>>,
 ) {
     if let Some(ready_sender) = ready_sender {
-        let _ = ready_sender.send(());
+        if ready_sender.send(()).is_err() {
+            return;
+        }
     }
     loop {
         let mut request = queue.next();
@@ -641,8 +643,13 @@ fn docker_child_reaper_supervisor(queue: Arc<DockerReapQueue>, ready_sender: mps
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             docker_child_reaper_worker(worker_queue, worker_ready_sender);
         }));
-        if result.is_err() {
-            eprintln!("error: Docker child reaper worker panicked; restarting supervisor worker");
+        match result {
+            Ok(()) => return,
+            Err(_) => {
+                eprintln!(
+                    "error: Docker child reaper worker panicked; restarting supervisor worker"
+                );
+            }
         }
     }
 }
@@ -664,11 +671,23 @@ fn initialize_docker_child_reaper() -> std::result::Result<DockerChildReaper, St
     Ok(DockerChildReaper { queue })
 }
 
-fn docker_child_reaper() -> Result<&'static DockerChildReaper> {
-    DOCKER_CHILD_REAPER
-        .get_or_init(initialize_docker_child_reaper)
-        .as_ref()
-        .map_err(|error| anyhow::anyhow!(error.clone()))
+fn get_or_initialize_docker_child_reaper(
+    cache: &Mutex<Option<DockerChildReaper>>,
+    initialize: impl FnOnce() -> std::result::Result<DockerChildReaper, String>,
+) -> Result<DockerChildReaper> {
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(reaper) = cached.as_ref() {
+        return Ok(reaper.clone());
+    }
+    let reaper = initialize().map_err(|error| anyhow::anyhow!(error))?;
+    *cached = Some(reaper.clone());
+    Ok(reaper)
+}
+
+fn docker_child_reaper() -> Result<DockerChildReaper> {
+    get_or_initialize_docker_child_reaper(&DOCKER_CHILD_REAPER, initialize_docker_child_reaper)
 }
 
 impl DockerChildReaper {
@@ -704,7 +723,7 @@ fn run_docker_with_timeout_after_reaper_init(
     mut cmd: Command,
     detail: &str,
     timeout: Duration,
-    reaper: Result<&DockerChildReaper>,
+    reaper: Result<DockerChildReaper>,
 ) -> Result<Output> {
     let reaper = reaper?;
     let started = Instant::now();
@@ -744,7 +763,7 @@ fn run_docker_with_timeout_after_reaper_init(
     {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return docker_timeout(child, detail, timeout, deadline, reaper);
+            return docker_timeout(child, detail, timeout, deadline, &reaper);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
@@ -752,7 +771,7 @@ fn run_docker_with_timeout_after_reaper_init(
     {
         Ok(buf) => buf,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return docker_timeout(child, detail, timeout, deadline, reaper);
+            return docker_timeout(child, detail, timeout, deadline, &reaper);
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
@@ -763,7 +782,7 @@ fn run_docker_with_timeout_after_reaper_init(
             Ok(None) => {
                 let remaining = phase_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    return docker_timeout(child, detail, timeout, deadline, reaper);
+                    return docker_timeout(child, detail, timeout, deadline, &reaper);
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
@@ -4771,7 +4790,7 @@ minimum_isolation = "container"
             "sh",
             marker.to_str().unwrap(),
         ]);
-        let init_failure: Result<&DockerChildReaper> =
+        let init_failure: Result<DockerChildReaper> =
             Err(anyhow::anyhow!("injected Docker child reaper init failure"));
         let result = run_docker_with_timeout_after_reaper_init(
             cmd,
@@ -4783,6 +4802,48 @@ minimum_isolation = "container"
         assert!(
             !marker.exists(),
             "command must not spawn when reaper initialization fails"
+        );
+    }
+
+    #[test]
+    fn reaper_initialization_retries_after_transient_failure() {
+        let cache = Mutex::new(None);
+        let attempts = AtomicU32::new(0);
+        let initialize = || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("injected transient reaper initialization failure".to_owned());
+            }
+            Ok(DockerChildReaper {
+                queue: Arc::new(DockerReapQueue {
+                    pending: Mutex::new(VecDeque::new()),
+                    wake: Condvar::new(),
+                }),
+            })
+        };
+
+        assert!(get_or_initialize_docker_child_reaper(&cache, initialize).is_err());
+        assert!(get_or_initialize_docker_child_reaper(&cache, initialize).is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reaper_supervisor_exits_after_readiness_receiver_is_dropped() {
+        let queue = Arc::new(DockerReapQueue {
+            pending: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+        });
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        drop(ready_receiver);
+        let (done_sender, done_receiver) = mpsc::sync_channel(0);
+
+        std::thread::spawn(move || {
+            docker_child_reaper_supervisor(queue, ready_sender);
+            let _ = done_sender.send(());
+        });
+
+        assert!(
+            done_receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "a timed-out initialization must not leave an orphan reaper thread"
         );
     }
 
