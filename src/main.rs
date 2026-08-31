@@ -780,15 +780,19 @@ impl SettlingEpisode {
             return SettlingDecision::Ceiling;
         };
         self.attempts += 1;
+        if executing >= target {
+            self.started_at = None;
+            return SettlingDecision::Recovered;
+        }
+        if executing < self.best_executing {
+            self.started_at = None;
+            return SettlingDecision::Ceiling;
+        }
         if executing > self.best_executing {
             self.best_executing = executing;
             self.stagnant_polls = 0;
         } else {
             self.stagnant_polls += 1;
-        }
-        if executing >= target {
-            self.started_at = None;
-            return SettlingDecision::Recovered;
         }
         if self.attempts >= MAX_SETTLING_POLLS
             || now.saturating_duration_since(started_at) >= MAX_SETTLING_DURATION
@@ -2218,6 +2222,25 @@ mod tests {
             settling_plan(&cfg, SettlingDecision::Recovered),
             (Duration::from_secs(30), true),
             "recovery resumes monitors and the configured cadence"
+        );
+    }
+
+    #[test]
+    fn settling_episode_reconciles_immediately_when_execution_regresses() {
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 5);
+
+        let decision = episode.observe(started_at + Duration::from_secs(5), 4, 6);
+
+        assert_eq!(decision, SettlingDecision::Ceiling);
+        assert_eq!(episode.attempts, 1);
+        assert!(!episode.is_active());
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        assert_eq!(
+            settling_plan(&cfg, decision),
+            (Duration::ZERO, true),
+            "lost executing capacity must run monitors and reconcile without another settling sleep"
         );
     }
 
