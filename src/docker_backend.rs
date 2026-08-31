@@ -57,7 +57,7 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 const DOCKER_CLEANUP_RESERVE: Duration = Duration::from_millis(50);
 const DOCKER_REAPER_RETRY_DELAY: Duration = Duration::from_millis(10);
 // Post-refill readiness gets one 30s shared local-Docker budget. At the normal
-// sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
+// sub-100ms `docker ps`/`docker top` latency this covers all 16 fleet slots;
 // under host pressure, a single probe may use up to 3s and the shared deadline
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
@@ -924,6 +924,44 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     write_slot_assignments_for(&assignments, cfg)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRunnerActivity {
+    Busy,
+    Idle,
+    Unknown,
+}
+
+fn local_runner_activity(container_name: &str) -> LocalRunnerActivity {
+    let mut cmd = docker_cmd();
+    cmd.args(["top", container_name, "-eo", "pid,comm"]);
+    let out = match run_docker_with_timeout(
+        cmd,
+        "checking local runner activity before stale reclaim",
+        LOCAL_TOP_TIMEOUT,
+    ) {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "warning: keeping {container_name}: local activity probe failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return LocalRunnerActivity::Unknown;
+        }
+        Err(err) => {
+            eprintln!("warning: keeping {container_name}: local activity probe failed: {err:#}");
+            return LocalRunnerActivity::Unknown;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if runner_worker_present(&stdout) {
+        LocalRunnerActivity::Busy
+    } else if runner_present(&stdout) {
+        LocalRunnerActivity::Idle
+    } else {
+        LocalRunnerActivity::Unknown
+    }
+}
+
 /// Release slots whose recorded `runner_id` no longer corresponds to a live
 /// GitHub-registered runner. Slots can get stuck if the docker daemon dies,
 /// the container exits abruptly, or GitHub reaps the registration server-side:
@@ -1210,6 +1248,42 @@ fn release_stale_slots_from_with_containers_for(
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
 ) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        cfg,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        local_runner_activity,
+    )
+}
+
+#[cfg(test)]
+fn release_stale_slots_from_with_containers_and_activity(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        None,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        activity_probe,
+    )
+}
+
+fn release_stale_slots_from_with_containers_and_activity_for(
+    cfg: Option<&Config>,
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
     }
@@ -1293,48 +1367,48 @@ fn release_stale_slots_from_with_containers_for(
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
-                            // Beyond the grace window: GH has permanently
-                            // rejected/reaped the registration (e.g. duplicate-
-                            // name collision, server-side cleanup, or a registration
-                            // that silently failed and was never going to land).
-                            // The local container is untracked on GH and the slot
-                            // would otherwise be held forever. Force reclaim so a
-                            // fresh allocation cycle can claim it. The container
-                            // itself is left alone — it will be reaped by the next
-                            // ezgha serve tick as orphaned, and any in-flight job
-                            // it was running has already been lost (GH shows the
-                            // runner as offline/busy in this state).
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                            let wall_secs = now_epoch_secs();
-                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
-                            // Bead jleechan-tv58: surface the in-flight run_id
-                            // (when GH shows one) and the local container's peak
-                            // RSS so an operator can correlate this reclaim to
-                            // a real job. Both are best-effort forensic data:
-                            // `last_run_id=0` and `peak_rss_mb=0` are valid
-                            // signals ("GitHub didn't surface runId" / "no
-                            // container / docker stats failed"), NOT failures.
-                            let last_run_id =
-                                live_runners_last_run_id(live_runners, rid).unwrap_or(0);
-                            let peak_rss_mb = container_peak_rss_mb(&expected_name);
-                            eprintln!(
-                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} still exists)"
-                            );
-                            record_reclaim(
-                                slot,
-                                ReclaimRecord {
-                                    monotonic_secs: 0.0,
-                                    wall_secs,
-                                    slot: slot_n,
-                                    runner_id: rid,
-                                    last_run_id,
-                                    peak_rss_mb,
-                                    in_grace: false,
-                                    reason: "gh-rejected-past-grace".to_string(),
-                                },
-                            );
-                            release_slot_for(cfg, slot_n)?;
-                            reclaimed += 1;
+                            match activity_probe(&expected_name) {
+                                LocalRunnerActivity::Busy => {
+                                    eprintln!(
+                                        "warning: keeping slot {slot_n}: local container {expected_name} has Runner.Worker while GH snapshot omits registration {rid} (elapsed {elapsed}s); refusing destructive reclaim"
+                                    );
+                                }
+                                LocalRunnerActivity::Unknown => {
+                                    eprintln!(
+                                        "warning: keeping slot {slot_n}: local activity for {expected_name} is unknown while GH snapshot omits registration {rid} (elapsed {elapsed}s); failing safe"
+                                    );
+                                }
+                                LocalRunnerActivity::Idle => {
+                                    // A proven listener with no GitHub registration
+                                    // can never receive another job. Recycling it is
+                                    // safe; a Worker or inconclusive probe is kept.
+                                    let wall_secs = now_epoch_secs();
+                                    let monotonic_secs =
+                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let last_run_id =
+                                        live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                                    let peak_rss_mb = container_peak_rss_mb(&expected_name);
+                                    eprintln!(
+                                        "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} is idle)"
+                                    );
+                                    record_reclaim(
+                                        slot,
+                                        ReclaimRecord {
+                                            monotonic_secs: 0.0,
+                                            wall_secs,
+                                            slot: slot_n,
+                                            runner_id: rid,
+                                            last_run_id,
+                                            peak_rss_mb,
+                                            in_grace: false,
+                                            reason: "gh-rejected-past-grace".to_string(),
+                                        },
+                                    );
+                                    release_slot_for(cfg, slot_n)?;
+                                    reclaimed += 1;
+                                }
+                            }
                         }
                     }
                     Some(_) => {
@@ -6164,9 +6238,8 @@ minimum_isolation = "container"
     fn release_stale_slots_releases_slot_when_runner_id_not_in_live_but_container_exists_past_grace(
     ) {
         // Mirrors the keep test above but with the slot's `registered_at`
-        // backdated past REGISTRATION_GRACE_WINDOW. The original
-        // keep-forever behavior is the bug; the new contract is "keep
-        // within the grace window, force-reclaim after".
+        // backdated past REGISTRATION_GRACE_WINDOW. A proven idle listener is
+        // safe to recycle because its GitHub registration no longer exists.
         let _env = TestEnv::new("stale_running_container_past_grace");
         let cfg = cfg_with(2, "ez-org-runner");
         let _slot = next_slot(&cfg).unwrap();
@@ -6181,11 +6254,12 @@ minimum_isolation = "container"
 
         let live = vec![runner_info(9999, "ez-org-runner-2")];
         let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
-        let reclaimed = release_stale_slots_from_with_containers(
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
             &read_slot_assignments().unwrap(),
             &live,
             &cfg.runner.name_prefix,
             Some(&local_names),
+            |_| LocalRunnerActivity::Idle,
         )
         .unwrap();
 
@@ -6197,6 +6271,79 @@ minimum_isolation = "container"
         assert!(
             !assignments.assignments.contains_key("1"),
             "slot 1 should be released (assignments row deleted)"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_busy_local_runner_when_gh_snapshot_omits_it_past_grace() {
+        let _env = TestEnv::new("stale_busy_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Busy,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "a local Runner.Worker must not be reclaimed from a single missing-GitHub snapshot"
+        );
+        assert_eq!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .get("1")
+                .map(String::as_str),
+            Some("4242"),
+            "the busy slot must remain owned until the local job finishes"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_local_runner_when_activity_probe_is_unknown() {
+        let _env = TestEnv::new("stale_unknown_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Unknown,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 0, "an inconclusive local probe must fail safe");
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "the slot must remain owned when local activity is unknown"
         );
     }
 
