@@ -784,6 +784,10 @@ impl SettlingEpisode {
             self.started_at = None;
             return SettlingDecision::Recovered;
         }
+        // A successful local count regression means ephemeral capacity was lost
+        // while this local-only episode was polling. End the episode so the
+        // caller runs monitors and ensure_count immediately; this does not
+        // restart the service, Docker backend, VM, or host.
         if executing < self.best_executing {
             self.started_at = None;
             return SettlingDecision::Ceiling;
@@ -2242,6 +2246,18 @@ mod tests {
             (Duration::ZERO, true),
             "lost executing capacity must run monitors and reconcile without another settling sleep"
         );
+    }
+
+    #[test]
+    fn settling_episode_target_recovery_wins_over_best_count_regression() {
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 7);
+
+        let decision = episode.observe(started_at + Duration::from_secs(5), 6, 6);
+
+        assert_eq!(decision, SettlingDecision::Recovered);
+        assert_eq!(episode.attempts, 1);
+        assert!(!episode.is_active());
     }
 
     #[test]
