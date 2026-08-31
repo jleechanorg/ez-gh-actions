@@ -61,7 +61,9 @@ const DOCKER_REAPER_RETRY_DELAY: Duration = Duration::from_millis(10);
 // under host pressure, a single probe may use up to 3s and the shared deadline
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
-// full reconciliation. The probe budget is far below the 300s watchdog margin.
+// full reconciliation. The deadline starts before Docker child-reaper
+// initialization and covers the `ps` plus all `top` probes. The probe budget is
+// far below the 300s watchdog margin.
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -716,22 +718,39 @@ fn docker_timeout<T>(
 }
 
 fn run_docker_with_timeout(cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
-    run_docker_with_timeout_after_reaper_init(cmd, detail, timeout, docker_child_reaper())
+    let deadline = Instant::now() + timeout;
+    run_docker_with_timeout_at_deadline(cmd, detail, timeout, deadline, docker_child_reaper())
 }
 
+#[cfg(test)]
 fn run_docker_with_timeout_after_reaper_init(
-    mut cmd: Command,
+    cmd: Command,
     detail: &str,
     timeout: Duration,
     reaper: Result<DockerChildReaper>,
 ) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    run_docker_with_timeout_at_deadline(cmd, detail, timeout, deadline, reaper)
+}
+
+fn run_docker_with_timeout_at_deadline(
+    mut cmd: Command,
+    detail: &str,
+    timeout: Duration,
+    deadline: Instant,
+    reaper: Result<DockerChildReaper>,
+) -> Result<Output> {
     let reaper = reaper?;
-    let started = Instant::now();
-    let deadline = started + timeout;
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        bail!(
+            "docker CLI timed out after {}ms while {detail}",
+            timeout.as_millis()
+        );
+    }
     // Keep a bounded cleanup window inside the command budget. Reads and
     // normal process reaping stop at this phase deadline; timeout cleanup can
     // then kill and reap until the single absolute command deadline.
-    let phase_deadline = started + timeout.saturating_sub(DOCKER_CLEANUP_RESERVE);
+    let phase_deadline = deadline - timeout.min(DOCKER_CLEANUP_RESERVE);
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -3056,6 +3075,10 @@ static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
 > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedContainer>> {
+    managed_containers_until_deadline(Instant::now() + timeout)
+}
+
+fn managed_containers_until_deadline(deadline: Instant) -> Result<Vec<ManagedContainer>> {
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().pop_front() {
         return Ok(containers);
@@ -3074,7 +3097,15 @@ fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedConta
         "--format",
         "json",
     ]);
-    let out = run_docker_with_timeout(cmd, "listing managed containers", timeout)?;
+    let timeout = remaining_until_deadline(deadline, Instant::now())
+        .context("docker ps readiness budget expired before spawning")?;
+    let out = run_docker_with_timeout_at_deadline(
+        cmd,
+        "listing managed containers",
+        timeout,
+        deadline,
+        docker_child_reaper(),
+    )?;
     if !out.status.success() {
         bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -3199,8 +3230,14 @@ fn executing_runner_count_from_containers(
         |container, timeout| {
             let mut cmd = docker_cmd();
             cmd.args(["top", &container.id, "-eo", "pid,comm"]);
-            let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
-                .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
+            let out = run_docker_with_timeout_at_deadline(
+                cmd,
+                "checking Runner.Worker readiness",
+                timeout,
+                deadline,
+                docker_child_reaper(),
+            )
+            .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
             if !out.status.success() {
                 bail!(
                     "docker top failed for {}: {}",
@@ -3221,9 +3258,7 @@ fn executing_runner_count_from_containers(
 /// workflow jobs.
 pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
-    let timeout = remaining_until_deadline(deadline, Instant::now())
-        .context("Runner.Worker readiness budget expired before listing managed containers")?;
-    let containers = managed_containers_with_timeout(timeout)?;
+    let containers = managed_containers_until_deadline(deadline)?;
     executing_runner_count_from_containers(cfg, &containers, deadline)
 }
 
@@ -4100,9 +4135,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
 
     let refill = refill?;
     let readiness_deadline = Instant::now() + LOCAL_READINESS_BUDGET;
-    let readiness_timeout = remaining_until_deadline(readiness_deadline, Instant::now())
-        .context("post-refill readiness budget expired before listing managed containers")?;
-    let containers_after = managed_containers_with_timeout(readiness_timeout)
+    let containers_after = managed_containers_until_deadline(readiness_deadline)
         .context("post-refill local container recount")?;
     let readiness_after =
         executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
@@ -4769,6 +4802,85 @@ minimum_isolation = "container"
             elapsed < Duration::from_secs(5),
             "timeout should fire promptly, got {:?}",
             elapsed
+        );
+    }
+
+    #[test]
+    fn docker_top_deadline_includes_reaper_initialization_and_has_no_extra_budget() {
+        let _env = TestEnv::new("docker_top_deadline");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-docker-top-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        for (label, top_delay, succeeds) in [("within", "1.5", true), ("over", "2.2", false)] {
+            let script = temp_dir.join(format!("docker-{label}"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"top\" ]; then /bin/sleep {top_delay}; printf 'PID COMMAND\\n1 Runner.Worker\\n'; fi\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+            let mut cmd = docker_cmd();
+            cmd.args(["top", "runner-1", "-eo", "pid,comm"]);
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(3);
+            std::thread::sleep(Duration::from_secs(1));
+            let reaper = Ok(DockerChildReaper {
+                queue: Arc::new(DockerReapQueue {
+                    pending: Mutex::new(VecDeque::new()),
+                    wake: Condvar::new(),
+                }),
+            });
+            let result = run_docker_with_timeout_at_deadline(
+                cmd,
+                "fake docker top readiness",
+                Duration::from_secs(3),
+                deadline,
+                reaper,
+            );
+
+            assert_eq!(result.is_ok(), succeeds, "top delay {top_delay}s");
+            if !succeeds {
+                assert!(
+                    result.unwrap_err().to_string().contains("timed out"),
+                    "over-deadline docker top must fail closed"
+                );
+            }
+        }
+
+        let marker = temp_dir.join("must-not-start");
+        let script = temp_dir.join("docker-expired");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho started > {}\n", marker.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+        let mut cmd = docker_cmd();
+        cmd.args(["top", "runner-1", "-eo", "pid,comm"]);
+        let expired_deadline = Instant::now() - Duration::from_millis(1);
+        let reaper = Ok(DockerChildReaper {
+            queue: Arc::new(DockerReapQueue {
+                pending: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+            }),
+        });
+        assert!(run_docker_with_timeout_at_deadline(
+            cmd,
+            "expired fake docker top readiness",
+            Duration::from_secs(3),
+            expired_deadline,
+            reaper,
+        )
+        .is_err());
+        assert!(
+            !marker.exists(),
+            "docker top must not start after its deadline"
         );
     }
 
