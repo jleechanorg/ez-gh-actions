@@ -5097,7 +5097,7 @@ minimum_isolation = "container"
     fn stalled_reaper_wait_does_not_block_later_child() {
         let reaper = initialize_docker_child_reaper().unwrap();
         let first = std::process::Command::new("/bin/sleep")
-            .arg("2")
+            .arg("30")
             .spawn()
             .unwrap();
         let first_pid = first.id() as libc::pid_t;
