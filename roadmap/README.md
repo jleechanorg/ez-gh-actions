@@ -6,6 +6,11 @@ Rolling operational notes for the `ezgha` self-hosted runner daemon.
 
 - [2026-08-30](activity/2026-08-30.md) — watchdog authority removed; child-layer fleet churn remains under investigation.
 
+## Current plan of record
+
+- [2026-08-30 child-layer fleet churn plan](nextsteps-2026-08-30-ezgha-fleet-churn-after-watchdog-removal.md)
+- [Ironclad 16/16 fleet resilience goal](goal-ironclad-2026-08-30-fleet-resilience.md)
+
 ## Next-steps queue (full, prioritized — 2026-07-07 takeover)
 
 Source: docs/goal-gap-review-20260706.md (53-agent adversarial review, 45 findings, 0 refuted;
