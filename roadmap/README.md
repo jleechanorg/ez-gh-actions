@@ -2,6 +2,10 @@
 
 Rolling operational notes for the `ezgha` self-hosted runner daemon.
 
+## Recent activity (by day)
+
+- [2026-08-30](activity/2026-08-30.md) — watchdog authority removed; child-layer fleet churn remains under investigation.
+
 ## Next-steps queue (full, prioritized — 2026-07-07 takeover)
 
 Source: docs/goal-gap-review-20260706.md (53-agent adversarial review, 45 findings, 0 refuted;
