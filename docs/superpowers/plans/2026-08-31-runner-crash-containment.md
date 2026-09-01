@@ -177,13 +177,7 @@ Expected: focused test PASS; the distinctive full rule occurs only in `CLAUDE.md
 - Create: `scripts/host/proof-allocator.sh`
 - Modify: `systemd/agents.slice`
 - Modify: `systemd/automation.slice`
-- Delete: `systemd/ezgha.service.d/10-oomd-omit.conf`
-- Delete: `systemd/psi-oom-watcher.service`
-- Delete: `systemd/psi-oom-watcher.timer`
-- Delete: `scripts/host/psi-oom-watcher.sh`
 - Create: `tests/host_crash_containment_artifacts_test.sh`
-- Modify: `tests/host_control_artifacts_test.sh`
-- Modify: `tests/host_ops_0725_test.sh`
 
 **Interfaces:**
 - Consumes: exact budgets from the specification.
@@ -218,10 +212,6 @@ expect systemd/agents.slice MemoryHigh=14G
 expect systemd/agents.slice MemoryMax=16G
 expect systemd/agents.slice ManagedOOMMemoryPressure=kill
 expect systemd/automation.slice ManagedOOMMemoryPressure=kill
-test ! -e "$ROOT/systemd/ezgha.service.d/10-oomd-omit.conf" || { echo "FAIL: stale OOM exemption remains" >&2; exit 1; }
-test ! -e "$ROOT/systemd/psi-oom-watcher.service" || { echo "FAIL: competing PSI repair service remains" >&2; exit 1; }
-test ! -e "$ROOT/systemd/psi-oom-watcher.timer" || { echo "FAIL: competing PSI repair timer remains" >&2; exit 1; }
-test ! -e "$ROOT/scripts/host/psi-oom-watcher.sh" || { echo "FAIL: orphaned PSI watcher script remains" >&2; exit 1; }
 echo "PASS: crash-containment artifacts"
 ```
 
@@ -291,9 +281,7 @@ ManagedOOMMemoryPressure=kill
 ManagedOOMMemoryPressureLimit=50%
 ```
 
-Add the same OOM directives to `systemd/automation.slice` without changing its 4G/6G/1G/4096 envelope. Update the stale peak and budget comments in both user slice files. Delete `systemd/ezgha.service.d/10-oomd-omit.conf`; host-Docker runner scopes are not descendants of `ezgha.service`, so exempting that service does not protect the runner aggregate and encodes the wrong policy.
-
-Delete the tracked `psi-oom-watcher.service`, timer, and `scripts/host/psi-oom-watcher.sh`. Their SIGTERM shed path is a second pressure-remediation authority and their verifier assumptions depend on broad `user.slice` monitoring, which this design intentionally removes. In the same Task 2 commit, update `tests/host_control_artifacts_test.sh` and `tests/host_ops_0725_test.sh` so they require the new artifacts and no longer require deleted watcher or exemption files. Task 4 retains uninstall-only legacy cleanup for installed copies but removes the deleted files from normal install source loops.
+Add the same OOM directives to `systemd/automation.slice` without changing its 4G/6G/1G/4096 envelope. Update the stale peak and budget comments in both user slice files. Legacy watcher/exemption removal belongs to Task 4 with the install-loop changes, so this Task 2 commit remains independently green.
 
 - [ ] **Step 6: Validate units and commit**
 
@@ -303,8 +291,7 @@ Run:
 bash tests/host_crash_containment_artifacts_test.sh
 systemd-analyze verify systemd/host/actions.slice systemd/host/ezghaproof.slice systemd/host/ezghaproof-hardlimit.slice systemd/host/ezghaproof-oomd.slice systemd/host/ezgha-hard-limit-proof.service systemd/host/ezgha-oomd-proof.service systemd/agents.slice systemd/automation.slice
 git diff --check
-git add systemd/host/actions.slice systemd/host/ezghaproof.slice systemd/host/ezghaproof-hardlimit.slice systemd/host/ezghaproof-oomd.slice systemd/host/ezgha-hard-limit-proof.service systemd/host/ezgha-oomd-proof.service systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf scripts/host/proof-allocator.sh systemd/agents.slice systemd/automation.slice tests/host_crash_containment_artifacts_test.sh tests/host_control_artifacts_test.sh tests/host_ops_0725_test.sh
-git add -u systemd/ezgha.service.d/10-oomd-omit.conf systemd/psi-oom-watcher.service systemd/psi-oom-watcher.timer scripts/host/psi-oom-watcher.sh
+git add systemd/host/actions.slice systemd/host/ezghaproof.slice systemd/host/ezghaproof-hardlimit.slice systemd/host/ezghaproof-oomd.slice systemd/host/ezgha-hard-limit-proof.service systemd/host/ezgha-oomd-proof.service systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf scripts/host/proof-allocator.sh systemd/agents.slice systemd/automation.slice tests/host_crash_containment_artifacts_test.sh
 git commit -m "codex/gpt-5.6-sol: define workload-first systemd limits"
 git push origin HEAD
 ```
@@ -423,9 +410,15 @@ Expected: all assertion fixtures PASS.
 - Modify: `src/main.rs`
 - Modify: `install.sh`
 - Modify: `config/config.toml.linux.example`
+- Delete: `systemd/ezgha.service.d/10-oomd-omit.conf`
+- Delete: `systemd/psi-oom-watcher.service`
+- Delete: `systemd/psi-oom-watcher.timer`
+- Delete: `scripts/host/psi-oom-watcher.sh`
 - Create: `tests/install_crash_containment_test.sh`
 - Modify: `tests/install_watchdog_gate_test.sh`
 - Modify: `tests/install_uninstall_aux_units_test.sh`
+- Modify: `tests/host_control_artifacts_test.sh`
+- Modify: `tests/host_ops_0725_test.sh`
 
 **Interfaces:**
 - Consumes: Task 2 unit files and Task 3 assertion.
@@ -437,7 +430,7 @@ Stub `sudo`, system and user `systemctl`, Docker, and `install`. Assert that hos
 
 ```text
 reject /run/systemd/*control overrides that would shadow tracked units
-read actions/agents/automation memory.current and require current + 2 GiB <= proposed MemoryHigh
+read actions/agents/automation memory.current and require their 2G/1G/512M margins below proposed MemoryHigh
 stage and syntax-check every persistent unit before touching /etc or ~/.config
 install systemd/host/actions.slice and fixed proof units -> /etc/systemd/system
 install root/user@ overrides -> /etc/systemd/system/{-.slice.d,user@.service.d}
@@ -463,9 +456,11 @@ Expected: FAIL because the installer does not exist.
 
 - [ ] **Step 3: Implement the idempotent installer**
 
-`--check` delegates to `assert-crash-containment.sh` and never mutates. `--install` uses `${SUDO_BIN:-sudo}` for `/etc/systemd/system` and supports fixture roots through explicit test-only environment variables already established by repository shell tests. Before installing, it rejects shadowing control drop-ins and requires `memory.current + 2 GiB <= proposed MemoryHigh` for every active workload slice. It stages and verifies persistent files, snapshots replaced files, installs atomically, reloads managers, and verifies effective properties. A verification failure restores the snapshots, reloads both managers again, and verifies the effective restored state before returning failure. It never calls `systemctl set-property`, so tracked files remain the only resource-policy owner.
+`--check` delegates to `assert-crash-containment.sh` and never mutates. `--install` uses `${SUDO_BIN:-sudo}` for `/etc/systemd/system` and supports fixture roots through explicit test-only environment variables already established by repository shell tests. Before installing, it rejects shadowing control drop-ins and requires an activation margin below each proposed `MemoryHigh`: 2 GiB for `actions.slice`, 1 GiB for `agents.slice`, and 512 MiB for `automation.slice`. These margins keep an unrelated transient agent peak from blocking the runner boundary while still preventing a live hard-limit cut at the threshold. It stages and verifies persistent files, snapshots replaced files, installs atomically, reloads managers, and verifies effective properties. A verification failure restores the snapshots, reloads both managers again, and verifies the effective restored state before returning failure. It never calls `systemctl set-property`, so tracked files remain the only resource-policy owner.
 
 Disable and remove installed `psi-oom-watcher.timer` and `psi-oom-watcher.service` before changing oomd enrollment, then remove the legacy stable copy at `~/.local/libexec/ezgha/psi-oom-watcher.sh`. Do not invoke the watcher during removal. Add an upgrade fixture that starts with all three installed artifacts and proves all three are absent after containment activation, plus the same assertion in uninstall fixtures.
+
+In this same task, delete the tracked watcher service, timer, script, and `systemd/ezgha.service.d/10-oomd-omit.conf`; remove them from normal install source loops before running any tests; and update `tests/host_control_artifacts_test.sh` and `tests/host_ops_0725_test.sh` to require the new policy instead of deleted artifacts. Keeping deletion and consumer updates in one commit prevents the intermediate hard failure caused by an install loop referencing an absent source.
 
 Do not stop or restart a live Lima VM. When host Docker is proven and `lima-vm@colima.service` is inactive, disable its future auto-start without `--now`; when it is active, report topology drift and leave it untouched for operator review.
 
@@ -491,7 +486,7 @@ TimeoutStartSec=150
 
 Remove the unconditional `After=lima-vm@colima.service` and `Wants=lima-vm@colima.service` lines from the generated unit. Make the installer-classified endpoint the single source for the generated service: on Linux, invoke `install-service` with normalized `DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}"`, have `src/service.rs` read that value, and emit a correctly escaped `Environment=DOCKER_HOST=...` only when an explicit endpoint exists. An absent value means the canonical host socket. In `src/main.rs`, make backend restart commands endpoint-aware: an unset endpoint or canonical `unix:///var/run/docker.sock` is host Docker and must never start Lima; only an explicit recognized Colima/Lima socket may use the existing bounded VM recovery commands. Preserve `WatchdogSec=300`, `NotifyAccess=all`, `StartLimitIntervalSec=300`, `StartLimitBurst=5`, `Restart=on-failure`, and `RestartSec=30`. Five 15-second assertion failures plus four 30-second restart delays fit within 300 seconds, so persistent exit `75` actually reaches the existing limiter. `TimeoutStartSec=150` covers the assertion plus the daemon's existing 120-second readiness window; systemd watchdog timing starts after `READY=1`, and a source comment plus generated-unit test pins that distinction.
 
-Update `install.sh` to install the assertion, wrapper, and SHA-256 receipts before invoking `ezgha install-service`. Complete unrelated image acquisition/recovery before the containment activation phase; on host-Docker Linux, a failed `install-crash-containment.sh --install` blocks only service enable/restart and prints the exact policy diagnostic, not prior image recovery. Add Rust unit tests proving the generated unit uses the passed executable path, contains no Lima dependency, preserves the bounded restart settings, uses the wrapper, omits `DOCKER_HOST` for the default host endpoint, and preserves correctly escaped canonical-host and recognized-VM endpoints. Add backend-recovery tests proving host Docker never invokes Lima while an explicit VM socket retains bounded recovery.
+Update `install.sh` to install the assertion, wrapper, and SHA-256 receipts before invoking `ezgha install-service`. The Linux path must always regenerate the unit even when `ezgha.service` is already active; `src/service.rs::install_systemd` records prior active state, writes the unit, reloads, enables it, and restarts it when previously active so the new `ExecStart` takes effect. Complete unrelated image acquisition/recovery before the containment activation phase; on host-Docker Linux, a failed `install-crash-containment.sh --install` blocks only service generation/restart and prints the exact policy diagnostic, not prior image recovery. Add Rust unit tests proving the generated unit uses the passed executable path, contains no Lima dependency, preserves the bounded restart settings, uses the wrapper, omits `DOCKER_HOST` for the default host endpoint, and preserves correctly escaped canonical-host and recognized-VM endpoints. Add a service-install fixture proving an already-active unit is regenerated and restarted, plus backend-recovery tests proving host Docker never invokes Lima while an explicit VM socket retains bounded recovery.
 
 - [ ] **Step 5: Correct the Linux host-Docker example**
 
@@ -510,7 +505,8 @@ bash tests/install_watchdog_gate_test.sh
 bash tests/install_uninstall_aux_units_test.sh
 bash tests/assert_crash_containment_test.sh
 git diff --check
-git add scripts/host/install-crash-containment.sh scripts/host/ezgha-start-gate.sh src/service.rs src/main.rs install.sh config/config.toml.linux.example tests/install_crash_containment_test.sh tests/install_watchdog_gate_test.sh tests/install_uninstall_aux_units_test.sh
+git add scripts/host/install-crash-containment.sh scripts/host/ezgha-start-gate.sh src/service.rs src/main.rs install.sh config/config.toml.linux.example tests/install_crash_containment_test.sh tests/install_watchdog_gate_test.sh tests/install_uninstall_aux_units_test.sh tests/host_control_artifacts_test.sh tests/host_ops_0725_test.sh
+git add -u systemd/ezgha.service.d/10-oomd-omit.conf systemd/psi-oom-watcher.service systemd/psi-oom-watcher.timer scripts/host/psi-oom-watcher.sh
 git commit -m "codex/gpt-5.6-sol: install host crash-containment policy"
 git push origin HEAD
 ```
@@ -522,6 +518,7 @@ Expected: all focused installer and assertion tests PASS.
 **Files:**
 - Modify: `doctor-runner`
 - Modify: `docs/verify-exit-criteria.sh`
+- Modify: `docs/host-ops-sudo-block-0725.md`
 - Modify: `tests/doctor_runner_host_pressure_test.sh`
 - Modify: `tests/verify_exit_gate8_test.sh`
 
@@ -552,7 +549,7 @@ Add an infinite `actions.slice` fixture expecting `verdict=FAIL` and a diagnosti
 
 - [ ] **Step 2: Add failing monitoring and Gate 8 fixtures**
 
-Extend `tests/verify_exit_gate8_test.sh` with mutually exclusive host-Docker and Colima fixtures. The host fixture passes only when Docker uses cgroup v2/systemd, every managed container both reports `actions.slice` and has an actual PID cgroup path below `/actions.slice`, system values match the profile, workload OOM enrollment is effective, root, `user@`, and the desktop ancestors are `auto` for both pressure and swap, no control drop-in shadows the tracked policy, and the unlimited agent override is absent. Remove legacy PSI-watcher checks and remediation text from both Gate 7 monitoring and Gate 8 pressure admission; replace them with effective `systemd-oomd` root enrollment and finite-cgroup checks. In host mode, exclude `app-lima-vm.slice` from budget arithmetic and never invoke `limactl`; retain the existing guest checks only in explicit Colima mode.
+Extend `tests/verify_exit_gate8_test.sh` with mutually exclusive host-Docker and Colima fixtures. The host fixture passes only when Docker uses cgroup v2/systemd, every managed container both reports `actions.slice` and has an actual PID cgroup path below `/actions.slice`, system values match the profile, workload OOM enrollment is effective, root, `user@`, and the desktop ancestors are `auto` for both pressure and swap, no control drop-in shadows the tracked policy, and the unlimited agent override is absent. Remove legacy PSI-watcher checks and remediation text from both Gate 7 monitoring and Gate 8 pressure admission; replace them with effective `systemd-oomd` root enrollment and finite-cgroup checks. Rewrite the active installation procedure in `docs/host-ops-sudo-block-0725.md` to mark the watcher and OOM exemption retired and point to the tracked crash-containment installer. Add a regression scan that fails when active surfaces (`install.sh`, `docs/verify-exit-criteria.sh`, `docs/host-ops-sudo-block-0725.md`, `README.md`, or `CLAUDE.md`) instruct users to install, enable, or depend on `psi-oom-watcher` or `10-oomd-omit.conf`; historical activity logs may retain incident references. In host mode, exclude `app-lima-vm.slice` from budget arithmetic and never invoke `limactl`; retain the existing guest checks only in explicit Colima mode.
 
 - [ ] **Step 3: Run both tests and confirm the red state**
 
@@ -585,7 +582,7 @@ bash tests/host_control_artifacts_test.sh
 bash tests/host_ops_0725_test.sh
 bash tests/crash_containment_policy_test.sh
 git diff --check
-git add doctor-runner docs/verify-exit-criteria.sh tests/doctor_runner_host_pressure_test.sh tests/verify_exit_gate8_test.sh
+git add doctor-runner docs/verify-exit-criteria.sh docs/host-ops-sudo-block-0725.md tests/doctor_runner_host_pressure_test.sh tests/verify_exit_gate8_test.sh
 git commit -m "codex/gpt-5.6-sol: verify effective runner containment"
 git push origin HEAD
 ```
@@ -725,33 +722,34 @@ uptime
 docker ps --filter label=ezgha=managed --format '{{.ID}}' | wc -l
 cat /sys/fs/cgroup/actions.slice/memory.current
 cat "$HOME/.config/systemd/user/agents.slice/memory.current" 2>/dev/null || true
+cat "$HOME/.config/systemd/user/automation.slice/memory.current" 2>/dev/null || true
 ```
 
-Proceed only when load is at most 12, at least 8 of 10 containers are present unless the documented low-load draining exception is proven, no target cgroup is already under pressure, and every active target has current use plus 2 GiB below its proposed `MemoryHigh`. Record current files and effective values for rollback evidence.
+Proceed only when load is at most 12, at least 8 of 10 containers are present unless the documented low-load draining exception is proven, no target cgroup is already under pressure, and current use fits below the proposed `MemoryHigh` with the Task 4 margins: 2 GiB for actions, 1 GiB for agents, and 512 MiB for automation. Record current files and effective values for rollback evidence.
 
-- [ ] **Step 4: Apply persistent containment without restarting the desktop**
+- [ ] **Step 4: Run the tracked deployment entrypoint**
 
 Run as the deploy owner:
 
 ```bash
-bash scripts/host/install-crash-containment.sh --install
+./install.sh
 bash scripts/host/assert-crash-containment.sh --config "$HOME/.config/ezgha/config.toml"
 ```
 
-Expected: system `actions.slice` and user workload properties match the specification; no systemd control drop-in exists; `user@UID.service` retains the same live MainPID and reports `ManagedOOMMemoryPressure=auto`; installed helper digests match the deployed commit. If verification fails, the installer restores the prior persistent files and reports the rollback result.
+Expected: `install.sh` completes image acquisition before containment activation, installs the exact helpers and receipts, applies the persistent hierarchy, regenerates the user unit with the actual installed binary and normalized endpoint, and restarts the previously active service only after the gate is installed. System `actions.slice` and user workload properties match the specification; no systemd control drop-in exists; `user@UID.service` retains the same live MainPID and reports `ManagedOOMMemoryPressure=auto`; installed helper digests match the deployed commit. If containment verification fails, the installer restores the prior persistent files and reports the rollback result without claiming the service restart succeeded.
 
-- [ ] **Step 5: Install the exact committed binary and restart only ezgha**
+- [ ] **Step 5: Verify the generated service and exact binary**
 
 Run:
 
 ```bash
-cargo install --path .
-systemctl --user daemon-reload
-systemctl --user restart ezgha.service
 systemctl --user status ezgha.service --no-pager -l
+systemctl --user show ezgha.service -p ExecStart -p Environment -p NRestarts --no-pager
+sha256sum "$HOME/.local/libexec/ezgha/assert-crash-containment.sh" \
+          "$HOME/.local/libexec/ezgha/ezgha-start-gate.sh"
 ```
 
-Expected: the main startup gate succeeds, replaces itself with `ezgha`, and `ezgha.service` is active. Do not start Colima.
+Expected: `ExecStart` names the stable gate, the actual installed Cargo binary, and the active config; the environment preserves the canonical host endpoint; helper hashes match receipts; the gate succeeds and replaces itself with `ezgha`; and the service is active. Lima remains inactive.
 
 - [ ] **Step 6: Verify ten runner scopes and effective budgets**
 
@@ -813,7 +811,7 @@ git add CLAUDE.md AGENTS.md README.md roadmap/up-changelog-20260831-crash-contai
   scripts/host/install-crash-containment.sh \
   scripts/host/prove-crash-containment.sh \
   install.sh config/config.toml.linux.example doctor-runner \
-  docs/verify-exit-criteria.sh \
+  docs/verify-exit-criteria.sh docs/host-ops-sudo-block-0725.md \
   .github/workflows/ci.yml \
   tests/crash_containment_policy_test.sh \
   tests/host_control_artifacts_test.sh \
