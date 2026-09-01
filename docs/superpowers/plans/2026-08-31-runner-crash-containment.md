@@ -15,9 +15,11 @@
 - Linux runner count remains exactly 10; Mac behavior and the six-runner Mac fleet do not change.
 - Host Docker remains the backend. Release 1 must not start Colima, Lima, or another VM and must not restart Docker.
 - `DOCKER_HOST` and `DOCKER_CONTEXT` are unset, the resolved Linux Docker endpoint is exactly `unix:///var/run/docker.sock`, and every Linux HostDocker CLI call is explicitly bound to that socket.
+- DockerSysbox uses the same canonical host endpoint contract; OS detection and selector rejection precede the first Docker command, and pre-pull occurs only after containment admission.
 - The Linux example and active deployment use exactly 2500 MiB per runner.
 - `actions.slice` is exactly `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=2000%`, and `IOWeight=25`.
 - `agents.slice` is exactly `MemoryHigh=18G`, `MemoryMax=20G`, `MemorySwapMax=2G`, and `TasksMax=8192`.
+- The agent limit is justified by fresh 8.10-GiB current and 17.14-GiB historical-peak evidence; activation requires current use below 18G before applying it.
 - `automation.slice` is exactly `MemoryHigh=4G`, `MemoryMax=6G`, `MemorySwapMax=1G`, and `TasksMax=4096`.
 - All three workload slices set `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`.
 - System `-.slice`, `user.slice`, `user-.slice`, `user@.service` and user-manager `app.slice`, `session.slice` set both managed-OOM policies to `auto`.
@@ -42,13 +44,14 @@
 - Modify `systemd/agents.slice` and `systemd/automation.slice`.
 - Modify `config/config.toml.linux.example` to use 2500 MiB and the exact HostDocker profile.
 - Delete `systemd/ezgha.service.d/10-oomd-omit.conf`.
+- Delete `systemd/psi-oom-watcher.service`, `systemd/psi-oom-watcher.timer`, and `scripts/host/psi-oom-watcher.sh`.
 - Modify `scripts/host/agent-scoped-launch.sh` and `scripts/host/agent-cli-scoped.sh`.
 - Modify focused artifact tests that currently require the exemption or opt-out.
 - Create `tests/host_crash_containment_release1_artifacts_test.sh`.
 
 **Task 2: runtime admission and ancestry**
 
-- Modify `src/config.rs`, `src/docker_backend.rs`, and `src/main.rs`.
+- Modify `src/config.rs`, `src/platform.rs`, `src/backend.rs`, `src/docker_backend.rs`, and `src/main.rs`.
 - Modify `src/service.rs` to remove Linux HostDocker dependence on VM units and unset `DOCKER_HOST`/`DOCKER_CONTEXT` in generated Linux HostDocker units.
 - Add focused Rust unit tests in the owning modules.
 
@@ -64,8 +67,8 @@
 
 **Task 5: operator surfaces and exit gate**
 
-- Modify `doctor-runner`, `docs/verify-exit-criteria.sh`, `README.md`, `config/README.md`, `CLAUDE.md`, and `AGENTS.md`.
-- Modify or add focused shell tests for the new verdict and gate.
+- Modify `install.sh`, `doctor-runner`, `docs/verify-exit-criteria.sh`, `README.md`, `config/README.md`, `CLAUDE.md`, and `AGENTS.md`.
+- Modify `tests/install_uninstall_aux_units_test.sh` and focused installer/doctor/exit-gate tests.
 
 ## Parallel Execution Map
 
@@ -111,6 +114,9 @@ Update legacy tests to reject, rather than require:
 ```text
 systemd/ezgha.service.d/10-oomd-omit.conf
 AGENT_SLICE_OPT_OUT
+systemd/psi-oom-watcher.service
+systemd/psi-oom-watcher.timer
+scripts/host/psi-oom-watcher.sh
 ```
 
 - [ ] **Step 2: Run the tests and confirm the intended failures**
@@ -126,6 +132,8 @@ Expected: the new test fails because files are absent; legacy tests fail where t
 - [ ] **Step 3: Add exact units and drop-ins**
 
 Use ordinary `[Slice]` sections for the three slices and `[Slice]` or `[Service]` as required by the target unit type. Do not add thresholds, watchdogs, restart actions, or host-lifecycle directives.
+
+Update the `agents.slice` comment to record the 8.10-GiB current, 17.14-GiB peak, 18G high, and 20G max arithmetic. Remove the stale 7.4-GiB-p95 justification for the superseded 10G/12G values.
 
 The actions slice must contain:
 
@@ -143,7 +151,7 @@ ManagedOOMSwap=auto
 
 - [ ] **Step 4: Remove both escape paths**
 
-Delete the tracked runner OOM exemption. Remove all `AGENT_SLICE_OPT_OUT` execution branches and user-facing help from both supported launcher scripts. Preserve normal scoped execution behavior.
+Delete the tracked runner OOM exemption and all three legacy PSI-watcher artifacts. Remove all `AGENT_SLICE_OPT_OUT` execution branches and user-facing help from both supported launcher scripts. Preserve normal scoped execution behavior.
 
 - [ ] **Step 5: Validate artifacts**
 
@@ -167,15 +175,16 @@ git commit -m "feat: add finite host containment policy [codex/gpt-5.6-sol]"
 
 ### Task 2: Fail Closed Before Linux Runner Mutation
 
-**Files:** `src/config.rs`, `src/docker_backend.rs`, `src/main.rs`, focused Rust tests, and `src/service.rs` for both Linux HostDocker VM-unit removal and Docker-selector environment clearing.
+**Files:** `src/config.rs`, `src/platform.rs`, `src/backend.rs`, `src/docker_backend.rs`, `src/main.rs`, focused Rust tests, and `src/service.rs` for both Linux HostDocker VM-unit removal and Docker-selector environment clearing.
 
 **Interfaces:**
 
 - Produces `HostContainmentProfile` with the fixed expected values.
 - Produces `require_host_containment(&Config) -> anyhow::Result<()>` for the Linux HostDocker create path.
 - Produces `require_container_actions_ancestry(container_id: &str) -> anyhow::Result<()>` after Docker start.
-- Produces a Linux HostDocker command factory that clears `DOCKER_HOST`/`DOCKER_CONTEXT` and adds `--host unix:///var/run/docker.sock` to every Docker operation; Mac and explicit VM factories remain unchanged.
+- Produces `DockerCommandTarget` with `CanonicalLinuxHost` and existing-platform variants, plus one `docker_command(target: DockerCommandTarget) -> Command` factory. `CanonicalLinuxHost` clears both selector variables and adds `--host unix:///var/run/docker.sock`; Mac and explicit VM variants preserve their existing endpoint behavior.
 - Produces a fixed maintenance-intent check used by every `start`, `serve`, and `stop` mutation path before and after `serve.lock` acquisition.
+- Produces a stable containment-admission failure event through the existing alert/journal API; repeated guard failure is visible without a separate monitor.
 - Mac and explicit VM-Docker paths do not invoke these guards.
 
 - [ ] **Step 1: Write unit tests for profile selection**
@@ -207,6 +216,8 @@ all workload policies auto and broad boundaries auto => pass
 user@UID.service kill or non-neutral => fail
 ```
 
+Inventory every production Docker call in `src/platform.rs`, `src/main.rs`, and `src/docker_backend.rs`. Add a structural test that rejects direct production `Command::new("docker")` outside the single factory, including reachability, platform detection, DockerSysbox classification, probe-image pre-pull, capacity probes, container peak RSS, inventory, inspect/top, cleanup, and create paths.
+
 - [ ] **Step 4: Run the focused Rust tests and confirm failure**
 
 ```bash
@@ -218,13 +229,17 @@ Expected: new tests fail because the admission and ancestry functions do not exi
 
 - [ ] **Step 5: Implement the fixed admission profile and probes**
 
-Read only canonical system paths and command output. Do not accept path arguments or environment-variable overrides in production code. Bind all later Linux HostDocker commands to the exact socket and clear both Docker selector variables. Update generated Linux HostDocker units with `UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT`, with a focused service-unit test; do not change Mac or explicit VM units. Return contextual errors without changing the host.
+Read only canonical system paths and command output. Do not accept path arguments or environment-variable overrides in production code. Split OS detection from Docker probing: on Linux reject selectors, choose `CanonicalLinuxHost`, and use that target for platform/backend discovery and every later Docker operation, including DockerSysbox. Move `prepull_probe_image` after `require_host_containment`; no pull or reachability probe may use an ambient endpoint. Update generated Linux HostDocker units with `UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT`, with a focused service-unit test; do not change Mac or explicit VM units. Return contextual errors without changing the host.
 
 - [ ] **Step 6: Place the guard before every create-side effect**
 
-At the single shared Linux HostDocker create entry, call `require_host_containment` before slot bookkeeping, old-container removal, workspace changes, JIT registration, or Docker execution. Keep the existing `--cgroup-parent actions.slice` argument.
+At the single shared Linux HostDocker/DockerSysbox create entry, call `require_host_containment` before slot bookkeeping, old-container removal, workspace changes, JIT registration, or runner Docker execution. The only Docker calls allowed before admission are canonical-endpoint read-only topology/containment probes. Keep the existing `--cgroup-parent actions.slice` argument.
 
 Add a test command recorder that proves a failed guard records no `docker rm`, `docker run`, JIT request, or slot mutation.
+
+Add serve-order tests proving selector rejection happens before platform Docker probing and the probe-image pull happens after a successful containment verdict. Assert every recorded Linux Docker argv begins with `docker --host unix:///var/run/docker.sock`, while Mac/explicit VM tests retain their existing argv.
+
+Add a focused test that a failed containment verdict emits the stable alert event once per existing cooldown semantics and never credits backend recovery or admission success.
 
 - [ ] **Step 7: Verify the created PID ancestry**
 
@@ -267,6 +282,8 @@ git commit -m "feat: gate Linux runner creation on host containment [codex/gpt-5
 
 Stub `docker`, `systemctl`, and `systemd-run` through a fixture `PATH`. Cover exact pass, one wrong slice value, `max`, wrong Docker driver, active exemption, present unlimited override, nine containers, eleven containers, and one wrong PID ancestry.
 
+Also cover a failed deploy-user manager connectivity probe, an active/enabled/installed PSI watcher, and a `kill` policy on each relevant ancestor boundary independently.
+
 - [ ] **Step 2: Run the test and confirm failure**
 
 ```bash
@@ -280,12 +297,14 @@ Expected: failure because the assertion script is absent.
 The script must use `set -euo pipefail`, canonical defaults, stable diagnostics, and no `sudo`. It verifies:
 
 ```text
+bounded systemctl --user show-environment connectivity
 Docker systemd/cgroup-v2
 exact three-slice values
 exact six broad-boundary policies
 neutral user@UID.service
 no installed ezgha OOM exemption
 no installed agents unlimited override
+no installed/active/enabled psi-oom-watcher artifact
 exactly ten managed ez-runner-c-* containers when --require-fleet is supplied
 actual PID ancestry for each required container
 ```
@@ -338,6 +357,7 @@ zero-container bootstrap with absent actions.slice
 non-Linux invocation
 root invocation
 missing exact sudo authorization
+unreachable deploy-user manager
 preflight failure
 live maintenance intent
 stale or malformed maintenance intent
@@ -361,7 +381,7 @@ bash tests/apply_host_containment_release1_test.sh
 
 - [ ] **Step 3: Implement the Linux gate and immutable preflight**
 
-Run `uname -s` first and require exact `Linux`, then reject effective UID 0. Resolve the fixed deploy UID from real/effective UID equality and its canonical home through `getent passwd`; require `HOME` equality and the user bus at `/run/user/<uid>/bus`. Require at least 8 GiB `MemAvailable`, swap use at most 50%, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, unset Docker selector variables, Docker 29-compatible systemd/cgroup-v2 at `unix:///var/run/docker.sock`, exact count 10, 2500-MiB runner memory, and `actions.slice` parent. Accept only zero containers with absent/empty `actions.slice` for bootstrap, or exactly ten contained containers plus `actions.slice/memory.current < 26G` for migration. Construct every later elevated argv, pre-authorize each with `sudo -n -l -- <exact argv>`, and fail without intent/service mutation if any is denied.
+Run `uname -s` first and require exact `Linux`, then reject effective UID 0. Resolve the fixed deploy UID from real/effective UID equality and its canonical home through `getent passwd`; require `HOME` equality, the user bus at `/run/user/<uid>/bus`, and a successful bounded read-only `systemctl --user show-environment`. Require at least 8 GiB `MemAvailable`, swap use at most 50%, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, `agents.slice/memory.current < 18G`, `automation.slice/memory.current < 4G`, unset Docker selector variables, Docker 29-compatible systemd/cgroup-v2 at `unix:///var/run/docker.sock`, exact count 10, 2500-MiB runner memory, and `actions.slice` parent. Accept only zero containers with absent/empty `actions.slice` for bootstrap, or exactly ten contained containers plus `actions.slice/memory.current < 26G` for migration. Construct every later elevated argv, pre-authorize each with `sudo -n -l -- <exact argv>`, and fail without intent/service mutation if any is denied.
 
 - [ ] **Step 4: Freeze mutations and snapshot before the reconciler stop**
 
@@ -369,11 +389,14 @@ Acquire the deploy-user activation lock and atomically create the deploy-user ma
 
 - [ ] **Step 5: Install and commit the finite actions boundary first**
 
-As the deploy user, leave the preflight-verified active config unchanged and install the fixed user-manager files. Use separate fixed `sudo -n` commands only to install/remove the enumerated system-manager files, reload the system manager, and apply/query `actions.slice`. Remove only:
+As the deploy user, leave the preflight-verified active config unchanged and install the fixed user-manager files. Before unlinking any watcher file, run `systemctl --user disable --now psi-oom-watcher.timer` followed by `systemctl --user stop psi-oom-watcher.service`; any failure retains intent and prevents `ezgha.service` restart. Use separate fixed `sudo -n` commands only to install/remove the enumerated system-manager files, reload the system manager, and apply/query `actions.slice`. Remove only:
 
 ```text
 <deploy-home>/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf
 <deploy-home>/.config/systemd/user/agents.slice.d/99-local-unlimited.conf
+<deploy-home>/.config/systemd/user/psi-oom-watcher.service
+<deploy-home>/.config/systemd/user/psi-oom-watcher.timer
+<deploy-home>/.local/lib/ezgha/host-controls/psi-oom-watcher.sh
 ```
 
 Reload the system manager. In bootstrap invoke the pre-authorized exact `sudo -n systemctl start actions.slice`; migration requires it already active. Apply the six exact properties and verify the live cgroup before runner admission. In migration also verify the existing ten PID ancestries. This verified point is forward-only: later recovery retains the persistent and runtime finite actions boundary.
@@ -392,7 +415,7 @@ Before mutation, exit without live effect. Snapshot failure leaves the service r
 
 - [ ] **Step 9: Assert forbidden operations never occur**
 
-Fixture tests reject `docker stop`, `docker pause`, `docker rm`, `docker run`, deregistration of a container-backed runner, `limactl`, `colima`, Docker restart, reboot/shutdown, Mac paths, launchctl, and caller-selected systemd destinations. They prove root invocation fails before mutation, absent-slice bootstrap starts and verifies the slice before any runner creation, a denied exact sudo authorization causes zero intent/service mutation, the system-scope-only exemption path is insufficient, every `systemctl --user`/config/lock operation retains the validated deploy UID/home/bus, the user service has no effective omit/-1000 values, and only the pre-authorized identical system argv cross `sudo -n`.
+Fixture tests reject `docker stop`, `docker pause`, `docker rm`, `docker run`, deregistration of a container-backed runner, `limactl`, `colima`, Docker restart, reboot/shutdown, Mac paths, launchctl, and caller-selected systemd destinations. They prove root invocation fails before mutation, absent-slice bootstrap starts and verifies the slice before any runner creation, a denied exact sudo authorization or failed user-manager probe causes zero intent/service mutation, the system-scope-only exemption path is insufficient, every `systemctl --user`/config/lock operation retains the validated deploy UID/home/bus, watcher disable/stop precedes file removal, no watcher enablement symlink or active unit survives, the user service has no effective omit/-1000 values, and only the pre-authorized identical system argv cross `sudo -n`.
 
 - [ ] **Step 10: Run focused checks**
 
@@ -419,11 +442,14 @@ git commit -m "feat: activate host containment atomically [codex/gpt-5.6-sol]"
 
 - `doctor-runner` calls the Task 3 script in read-only mode and includes containment in its final verdict.
 - The exit gate requires the Release 1 assertion and ten live contained Linux runners.
+- `install.sh` delegates the compatible Linux HostDocker path to Task 4 after staging an inactive service, and never installs the Colima-guest slice or PSI watcher on that path.
 - Repo guidance states crash containment and operator availability are primary; VM layering and security are not substitutes for a finite host boundary.
 
 - [ ] **Step 1: Write focused failing tests**
 
-Add tests proving a single containment mismatch makes both `doctor-runner` and the exit gate bad, while a passing stub preserves existing fleet verdict behavior. Assert docs and example config say Linux count 10, HostDocker, `actions.slice`, and fixed profile.
+Add tests proving a single containment mismatch makes both `doctor-runner` and the exit gate bad, while a passing stub preserves existing fleet verdict behavior. Assert containment admission failure invokes the existing high-severity alert/journal path. Assert docs and example config say Linux count 10, HostDocker, `actions.slice`, and fixed profile.
+
+Add installer tests proving the compatible Linux HostDocker path does not call `limactl`, install `systemd/guest/actions.slice`, or install/enable the PSI watcher; it stages the binary/config/service inactive and `exec`s the fixed Task 4 entrypoint. Mac and explicit VM install fixtures retain their existing behavior.
 
 - [ ] **Step 2: Run the focused tests and confirm failure**
 
@@ -436,22 +462,25 @@ bash tests/verify_exit_gate8_test.sh
 
 Add a bounded call to Task 3. Do not duplicate its policy parser in `doctor-runner` or the exit gate. Preserve existing Mac and job-activity checks.
 
+Verify and document Task 2's stable containment alert event and journal diagnostic so fail-closed fleet drain cannot be silent; Task 5 does not duplicate or reimplement that Rust path.
+
 - [ ] **Step 4: Update portable operator guidance**
 
-Document one install entrypoint, one assertion entrypoint, exact prerequisites, exact limits, failure behavior, and rollback stance. Remove claims that Colima/VM layering is the Linux crash boundary. Do not add Release 2 instructions to the immediate install path.
+Document one user-facing `install.sh` entrypoint, the delegated activation entrypoint, one assertion entrypoint, exact prerequisites, exact limits, failure behavior, and rollback stance. Remove claims that Colima/VM layering is the Linux crash boundary. On compatible Linux HostDocker, remove the current guest-slice `limactl` block and legacy watcher install; stage an inactive service and `exec` Task 4 rather than starting an uncontained daemon. Do not add Release 2 instructions to the immediate install path.
 
 - [ ] **Step 5: Run focused checks**
 
 ```bash
 bash tests/doctor_runner_host_pressure_test.sh
 bash tests/verify_exit_gate8_test.sh
-bash -n doctor-runner docs/verify-exit-criteria.sh
+bash tests/install_uninstall_aux_units_test.sh
+bash -n install.sh doctor-runner docs/verify-exit-criteria.sh
 ```
 
 - [ ] **Step 6: Commit the isolated unit**
 
 ```bash
-git add doctor-runner docs/verify-exit-criteria.sh README.md config CLAUDE.md AGENTS.md tests
+git add install.sh doctor-runner docs/verify-exit-criteria.sh README.md config CLAUDE.md AGENTS.md tests
 git commit -m "docs: make host containment a fleet invariant [codex/gpt-5.6-sol]"
 ```
 
@@ -478,6 +507,7 @@ bash tests/assert_host_containment_release1_test.sh
 bash tests/apply_host_containment_release1_test.sh
 bash tests/host_ops_0725_test.sh
 bash tests/host_control_artifacts_test.sh
+bash tests/install_uninstall_aux_units_test.sh
 bash tests/doctor_runner_host_pressure_test.sh
 bash tests/verify_exit_gate8_test.sh
 git diff --check

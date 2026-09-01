@@ -12,8 +12,10 @@ The 2026-09-01 read-only target-host probe established the facts needed for this
 - All ten current `ez-runner-c-1..10` container PIDs are already descendants of `/actions.slice`.
 - The effective host `actions.slice` is active but has infinite memory, swap, CPU, and task limits.
 - Effective `agents.slice` memory limits are infinite because `99-local-unlimited.conf` overrides the tracked unit.
+- Fresh cgroup evidence shows `agents.slice` at about 8.10 GiB current and 17.14 GiB historical peak, with zero current/peak swap; `automation.slice` is about 171 MiB current and 258 MiB peak.
 - `automation.slice` is finite at `MemoryHigh=4G`, `MemoryMax=6G`, and `MemorySwapMax=1G`.
 - `user@1000.service` is an active `systemd-oomd` pressure target with `ManagedOOMMemoryPressure=kill`, a 2-GiB pressure limit, `OOMScoreAdjust=100`, and no tracked local override.
+- The legacy `psi-oom-watcher` is currently inactive and disabled but remains installed and is reinstalled by `install.sh`; its sustained-PSI action can SIGTERM a deploy-user process.
 
 No Docker daemon restart is needed on this host. A different host whose Docker daemon is not cgroup v2/systemd fails Release 1 preflight and requires a separately reviewed maintenance change.
 
@@ -58,6 +60,8 @@ This release does not redesign deployment security. Root brokers, bundle authori
 
 Release 1 aligns the Linux example to the active 2500-MiB-per-runner config and requires exact equality at activation. Ten limits total about 24.41 GiB, below `actions.slice` `MemoryHigh=26G`. The three hard caps total 54 GiB on the measured 62.48-GiB host, leaving about 8.48 GiB outside those workload caps. That remainder is headroom, not a reservation or a global-OOM proof.
 
+The agent cap is intentionally higher than the old tracked 10G/12G unit because the measured 17.14-GiB peak would violate that old hard limit. `MemoryHigh=18G` sits about 0.86 GiB above the recorded peak and `MemoryMax=20G` about 2.86 GiB above it, while still preventing the prior 36.7-GiB agent event. Activation also requires current agent use below 18G and automation use below 4G before lowering limits.
+
 All three production workload slices set both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`. Six tracked boundary drop-ins do the same for:
 
 - system `-.slice`
@@ -75,13 +79,13 @@ Add one Linux HostDocker guard, `require_host_containment`, called by the shared
 
 1. Linux with configured count exactly 10.
 2. `limits.cgroup_parent = "actions.slice"`.
-3. `DOCKER_HOST` and `DOCKER_CONTEXT` are unset, the resolved default endpoint is exactly `unix:///var/run/docker.sock`, and every later Linux HostDocker CLI call is explicitly bound to that socket. Remote, Darwin, VM, inherited, and ambient-context endpoints are rejected.
+3. `DOCKER_HOST` and `DOCKER_CONTEXT` are unset, the resolved default endpoint is exactly `unix:///var/run/docker.sock`, and every Linux HostDocker or DockerSysbox CLI call is explicitly bound to that socket. Remote, Darwin, VM, inherited, and ambient-context endpoints are rejected.
 4. Docker cgroup v2 with the `systemd` driver.
 5. Effective `/sys/fs/cgroup/actions.slice` values equal the fixed profile and are not infinite.
 6. Effective production managed-OOM policies are `auto`.
 7. Effective `user@UID.service` is not a pressure or swap kill target and is neutral.
 
-The Linux HostDocker Docker-command factory clears `DOCKER_HOST` and `DOCKER_CONTEXT` and passes `--host unix:///var/run/docker.sock` for every inventory, removal, inspect, top, and run call; the generated service also unsets both inherited variables. The existing `docker run --cgroup-parent actions.slice` emission remains. After each container starts, the existing error-compensation path is extended to inspect its PID and require `/proc/<pid>/cgroup` beneath `/actions.slice` before treating the runner as ready. Wrong ancestry removes only that just-created managed container and compensates its exact JIT transition.
+One endpoint-aware Docker-command factory clears `DOCKER_HOST` and `DOCKER_CONTEXT` and passes `--host unix:///var/run/docker.sock` for every Linux HostDocker/DockerSysbox production call. This includes platform/backend discovery, reachability, `docker info`, runtime classification, pre-pull, capacity, inventory, metrics, inspect, top, removal, and run; no direct production `Command::new("docker")` remains outside the factory. OS detection and selector rejection happen before the first Docker probe, and the probe-image pre-pull moves after full containment admission. The generated service also unsets both inherited variables. The existing `docker run --cgroup-parent actions.slice` emission remains. After each container starts, the existing error-compensation path is extended to inspect its PID and require `/proc/<pid>/cgroup` beneath `/actions.slice` before treating the runner as ready. Wrong ancestry removes only that just-created managed container and compensates its exact JIT transition.
 
 Mac and explicit VM-Docker behavior remain unchanged. The guard is mandatory only for the fixed Linux HostDocker profile.
 
@@ -101,8 +105,10 @@ Release 1 owns this bounded set:
 - deletion of `systemd/ezgha.service.d/10-oomd-omit.conf`
 - `scripts/host/assert-host-containment-release1.sh`
 - `scripts/host/apply-host-containment-release1.sh`
-- focused Rust admission changes in `src/config.rs`, `src/docker_backend.rs`, and `src/main.rs`
+- deletion of `systemd/psi-oom-watcher.service`, `systemd/psi-oom-watcher.timer`, and `scripts/host/psi-oom-watcher.sh`
+- focused Rust admission and endpoint changes in `src/config.rs`, `src/platform.rs`, `src/backend.rs`, `src/docker_backend.rs`, and `src/main.rs`
 - Linux service generation changes in `src/service.rs`
+- Linux HostDocker delegation changes in `install.sh`
 - `config/config.toml.linux.example`
 - `tests/host_crash_containment_release1_artifacts_test.sh`
 - `tests/assert_host_containment_release1_test.sh`
@@ -115,10 +121,10 @@ Release 1 deletes the tracked runner OOM exemption and removes the `AGENT_SLICE_
 
 `scripts/host/apply-host-containment-release1.sh` is the only Release 1 live entrypoint. It runs as the deploy user, rejects effective UID 0, and accepts no caller-selected unit path, profile, service, or command. Its first operation is `uname -s`; any result other than exact `Linux` exits before path creation, config access, service commands, or other mutation. After that check, root invocation also exits before mutation. The fixed deployment identity is the current real/effective UID with canonical home from `getent passwd`; the script requires `HOME` to equal that home and uses `/run/user/<uid>/bus` for that user's manager. Only fixed internal `sudo -n` operations may install the enumerated system artifacts, reload the system manager, and apply/query the system `actions.slice`; all config, snapshot, intent, lock, `systemctl --user`, and user-manager work retains the deploy UID and canonical home. The sequence is:
 
-1. Read-only preflight requires at least 8 GiB `MemAvailable`, at most 50% swap use, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, Docker systemd/cgroup-v2, and the exact socket and ten-runner/2500-MiB profile. Fleet state is either bootstrap (zero managed containers and an absent or empty `actions.slice`) or in-place migration (exactly ten, all below `/actions.slice`, with `actions.slice/memory.current < 26G`); every partial or wrong-ancestry state fails before mutation. Before publishing intent or stopping a service, `sudo -n -l -- <exact argv>` must authorize every later enumerated system command; the activation executes those identical argument vectors and no other elevated command.
+1. Read-only preflight requires a working deploy-user manager connection, at least 8 GiB `MemAvailable`, at most 50% swap use, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, `agents.slice/memory.current < 18G`, `automation.slice/memory.current < 4G`, Docker systemd/cgroup-v2, and the exact socket and ten-runner/2500-MiB profile. Fleet state is either bootstrap (zero managed containers and an absent or empty `actions.slice`) or in-place migration (exactly ten, all below `/actions.slice`, with `actions.slice/memory.current < 26G`); every partial or wrong-ancestry state fails before mutation. Before publishing intent or stopping a service, `sudo -n -l -- <exact argv>` must authorize every later enumerated system command; the activation executes those identical argument vectors and no other elevated command.
 2. Acquire the fixed activation lock and atomically publish a maintenance intent containing PID and boot ID. Every `start`, `serve`, and `stop` path rejects a live intent both before and after acquiring the existing `serve.lock`; stale intent is rejected for operator recovery rather than silently removed.
 3. Snapshot every replaced/removed file and prior manager state before stopping the reconciler. In migration mode stop `ezgha.service`, then acquire and retain `serve.lock` for the remaining policy mutation. In bootstrap mode require it already inactive and acquire the lock. Do not stop, remove, pause, recreate, or deregister any runner container; migration jobs continue inside Docker. Existing graceful service shutdown may remove only registrations already proven to have no local container, which does not affect the ten snapshotted containers or their jobs.
-4. Install the fixed tracked units/drop-ins, leave the already-exact active config unchanged, remove `<deploy-home>/.config/systemd/user/agents.slice.d/99-local-unlimited.conf` and `<deploy-home>/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, and reload both managers. In bootstrap, run the enumerated `sudo -n systemctl start actions.slice` after the unit is installed; in migration it is already active. Apply the exact `actions.slice` properties and verify the live cgroup before any runner admission or later step. The user-manager assertion requires `ezgha.service` to report neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`.
+4. Install the fixed tracked units/drop-ins and leave the already-exact active config unchanged. Run `systemctl --user disable --now psi-oom-watcher.timer`, then `systemctl --user stop psi-oom-watcher.service`, before removing the installed watcher unit/script files; any failure retains maintenance intent and prevents service restart. Also remove `<deploy-home>/.config/systemd/user/agents.slice.d/99-local-unlimited.conf` and `<deploy-home>/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, then reload both managers. In bootstrap, run the enumerated `sudo -n systemctl start actions.slice` after the unit is installed; in migration it is already active. Apply the exact `actions.slice` properties and verify the live cgroup before any runner admission or later step. The user-manager assertion requires `ezgha.service` to report neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`, and requires the PSI watcher absent/inactive/disabled.
 5. Apply and verify the other slice and oomd properties. Run the read-only assertion with its ten-container check while `serve.lock` and maintenance intent still exclude runner mutations.
 6. Remove the maintenance intent and release `serve.lock` only after the policy assertion passes. Start `ezgha.service` and require readiness within 210 seconds. Migration mode repeats the assertion against the same ten container IDs; bootstrap mode requires exactly ten newly admitted contained containers within 600 seconds.
 
@@ -139,13 +145,16 @@ The reconciler interruption is bounded by its existing 30-second systemd stop ti
 The read-only assertion and exit gate require:
 
 - Docker reports cgroup v2/systemd.
+- the deploy-user manager answers a bounded read-only connectivity probe.
 - `actions.slice`, `agents.slice`, and `automation.slice` have the exact finite values.
 - all six broad boundary roots report both managed-OOM policies as `auto`.
 - `user@UID.service` is neutral and not a kill target.
 - no `ezgha.service` OOM exemption or unlimited agent override remains.
+- no legacy PSI watcher file, active unit, or enabled timer remains.
 - migration preserves the same ten managed Linux container IDs; bootstrap starts from zero and converges to exactly ten.
 - every managed PID is actually beneath `/actions.slice`.
 - `doctor-runner` remains read-only and reports a failing containment verdict on any mismatch.
+- containment admission failure emits the existing high-severity alert/journal path as well as the failing doctor verdict; fail-closed capacity loss is not silent.
 
 A bounded capacity proof may show ten simultaneous `Runner.Worker` processes, but Release 1 does not add a new workflow, image, attestation scheduler, or synthetic pressure allocator.
 
@@ -176,3 +185,4 @@ Release 2 must treat an already-active Release 1 host policy as its starting sta
 8. Activation never starts a VM, restarts Docker, changes Mac state, stops/removes a runner container, cancels a busy job, or reduces runner count.
 9. Migration preserves all ten existing containers; fresh bootstrap converges from zero to ten within 600 seconds. Either failure remains contained and explicit.
 10. The implementation, activation, rollback, assertion, docs, and focused tests are git-tracked and reproducible on a compatible fresh Ubuntu host.
+11. `install.sh` delegates compatible Linux HostDocker installation to the same activation entrypoint, never installs the Colima-guest slice on that path, and never reinstalls the retired PSI watcher.
