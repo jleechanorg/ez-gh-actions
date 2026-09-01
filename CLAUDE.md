@@ -125,6 +125,22 @@ limactl start colima
   owns the configured Pages branch and resolve that ownership before retrying;
   never auto-create the marker, delete existing content, or overwrite the branch.
 
+### Secret-permission audit (GH#61 / bead jleechan-sq4b)
+The July 11 read-only audit found a secret-bearing Linux ezgha config with
+group-writable bits; the audit script now flags those on every install.
+**Audit:**
+```bash
+bash scripts/check_secret_permissions.sh   # exits 1 if any unsafe, lists path+mode only
+```
+**Fix violations** without printing secrets — re-run install.sh; the
+`install.d/10-secret-permissions.sh` hook tightens every present canonical
+secret file to mode 600 (directories flagged separately by the audit; tighten
+those with `chmod 700` manually). For one-off drift, `chmod 600 <path>` is
+safe — the script never logs contents, only paths and mode bits.
+**Provenance:** credential rotation performed by operator outside this PR;
+<!-- ROTATION_DATE: see operator runbook -->
+do not record the rotated value anywhere in this repo.
+
 ## /doctor-ezactions command
 Running `/doctor-ezactions` in this repo executes (bare `/doctor` is a deprecated alias):
 1. `./doctor-runner` — fleet health check (4-state per-slot activity truth)

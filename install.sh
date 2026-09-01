@@ -849,6 +849,12 @@ if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/docs/verify-exit-criteria.sh" ]
   ok "Post-deployment checks passed"
 fi
 
+# ── Tighten secret-bearing config file permissions (GH#61 / jleechan-pu5j) ─
+# Sourced helper: installs/migrates all canonical secret files to mode 600
+# and runs the audit script. Single-line hook to keep install.sh's
+# single-writer surface minimal — logic lives in install.d/.
+source "$(dirname "${BASH_SOURCE[0]}")/install.d/10-secret-permissions.sh" || true
+
 info "Next steps"
 cat <<'EOF'
   cp config/config.toml.{mac,linux}.example ~/.config/ezgha/config.toml  # fleet templates (see config/README.md)
