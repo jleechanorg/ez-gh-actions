@@ -16,6 +16,7 @@
 - Release 1 has exactly three outcomes: finite policy/assertion, fail-closed HostDocker admission, and one canonical activation path.
 - Work is serialized into six TDD beads under existing parent `ez-gh-actions-sa8c`; no parallel program or broader criterion was created.
 - The only next action is causal RED bead [ez-gh-actions-sa8c.1 / #142](https://github.com/jleechanorg/ez-gh-actions/issues/142). No new design, review, roadmap, memory, deployment, or outcome-monitoring work begins while that RED is unresolved.
+- A separate coding agent owns that next action. This planning session does not claim a bead, edit implementation, merge, rebuild, deploy, or activate services.
 - `/advice` independently approved the exact design/plan content using Codex and Opus. AI Universe `/secondo` was unavailable because its token was expired; browser review was disabled by the `/sq` authorization boundary.
 
 ## Context
@@ -49,9 +50,17 @@ The active repository is `/home/jleechan/projects/ez-gh-actions` on branch `docs
 
 Every 30 minutes must end with fresh RED or GREEN command output. After two complete gate cycles or three total hours, stop with the exact failing command and blocker. A non-blocking style, wording, margin, or broader-hardening observation becomes a follow-up and does not restart planning.
 
+### Coding-agent handoff
+
+- Start from the latest `origin/docs/nextsteps-2026-08-30-fleet-churn` in an isolated branch/worktree; reviewed planning content begins at `fcd0b9e188cffec87fecf56ad3fa294a488306ba`. Claim only `ez-gh-actions-sa8c.1`.
+- Read `/home/jleechan/roadmap/ez-gh-actions/ironclad/ez-gh-actions-sa8c.1-goal-ironclad-2026-09-01.md`; change only its four owned test files.
+- The first checkpoint is a causal RED from `bash tests/host_crash_containment_release1_artifacts_test.sh` and `bash tests/assert_host_containment_release1_test.sh`.
+- Do not begin `.2`, alter production code, or activate host state until `.1` is independently reproduced and committed.
+
 ## PR / merge state
 
-- [PR #139](https://github.com/jleechanorg/ez-gh-actions/pull/139): **OPEN** when checked in this `/nextsteps` run. It is a documentation/planning PR; it is not implementation evidence.
+- [PR #139](https://github.com/jleechanorg/ez-gh-actions/pull/139): **OPEN**, non-draft, mergeable, and **UNSTABLE** when refreshed on 2026-09-01. CI, both self-hosted tests, secret scans, and CodeRabbit were successful; `virtiofs-canary` was queued. The Beads Regression Guard failed because closed historical bead `jleechan-q8y` was missing from the branch export; this refresh restores the exact base record for the next push.
+- The PR remains planning state, not implementation evidence. Do not call `/ready`, merge, rebuild, deploy, or activate from this handoff.
 - Issues [#142](https://github.com/jleechanorg/ez-gh-actions/issues/142), [#143](https://github.com/jleechanorg/ez-gh-actions/issues/143), [#144](https://github.com/jleechanorg/ez-gh-actions/issues/144), [#145](https://github.com/jleechanorg/ez-gh-actions/issues/145), [#146](https://github.com/jleechanorg/ez-gh-actions/issues/146), and [#147](https://github.com/jleechanorg/ez-gh-actions/issues/147) are **OPEN**.
 
 ## Learnings pointer
