@@ -14,6 +14,7 @@
 
 - Linux runner count remains exactly 10; Mac behavior and the six-runner Mac fleet do not change.
 - Host Docker remains the backend. Release 1 must not start Colima, Lima, or another VM and must not restart Docker.
+- Fixed-profile startup/recovery performs no backend lifecycle action; Docker failure alerts and retries passively.
 - `DOCKER_HOST` and `DOCKER_CONTEXT` are unset, the resolved Linux Docker endpoint is exactly `unix:///var/run/docker.sock`, and every Linux HostDocker CLI call is explicitly bound to that socket.
 - DockerSysbox uses the same canonical host endpoint contract; OS detection and selector rejection precede the first Docker command, and pre-pull occurs only after containment admission.
 - The Linux example and active deployment use exactly 2500 MiB per runner.
@@ -42,7 +43,7 @@
 - Create `systemd/user/app.slice.d/99-ezgha-containment.conf`.
 - Create `systemd/user/session.slice.d/99-ezgha-containment.conf`.
 - Modify `systemd/agents.slice` and `systemd/automation.slice`.
-- Modify `config/config.toml.linux.example` to use 2500 MiB and the exact HostDocker profile.
+- Modify `config/config.toml.linux.example` to use 2500 MiB, the exact HostDocker profile, and dispatch-only canary repo/workflow settings against the main fleet labels.
 - Delete `systemd/ezgha.service.d/10-oomd-omit.conf`.
 - Delete `systemd/psi-oom-watcher.service`, `systemd/psi-oom-watcher.timer`, and `scripts/host/psi-oom-watcher.sh`.
 - Modify `scripts/host/agent-scoped-launch.sh` and `scripts/host/agent-cli-scoped.sh`.
@@ -68,6 +69,7 @@
 **Task 5: operator surfaces and exit gate**
 
 - Modify `install.sh`, `doctor-runner`, `docs/verify-exit-criteria.sh`, `README.md`, `config/README.md`, `CLAUDE.md`, and `AGENTS.md`.
+- Delete `config/config.toml.linux-canary.example`; configure canary dispatch in the main Linux example instead.
 - Modify `tests/install_uninstall_aux_units_test.sh` and focused installer/doctor/exit-gate tests.
 
 ## Parallel Execution Map
@@ -185,6 +187,7 @@ git commit -m "feat: add finite host containment policy [codex/gpt-5.6-sol]"
 - Produces `DockerCommandTarget` with `CanonicalLinuxHost` and existing-platform variants, plus one `docker_command(target: DockerCommandTarget) -> Command` factory. `CanonicalLinuxHost` clears both selector variables and adds `--host unix:///var/run/docker.sock`; Mac and explicit VM variants preserve their existing endpoint behavior.
 - Produces a fixed maintenance-intent check used by every `start`, `serve`, and `stop` mutation path before and after `serve.lock` acquisition.
 - Produces a stable containment-admission failure event through the existing alert/journal API; repeated guard failure is visible without a separate monitor.
+- Produces fixed-profile backend-recovery suppression: no `lima-vm@colima.service`, `limactl`, Colima, or Docker lifecycle command from startup or retry.
 - Mac and explicit VM-Docker paths do not invoke these guards.
 
 - [ ] **Step 1: Write unit tests for profile selection**
@@ -196,9 +199,13 @@ Linux + HostDocker + count 10 + 2500 MiB + unix:///var/run/docker.sock => Releas
 Linux + wrong count, memory, parent, or endpoint => error
 Mac => no Release 1 profile
 explicit VM-Docker => existing behavior
+Linux canary-once with verifier config => dispatch-only, no Docker command
+Linux start/serve with count 1 or other non-profile config => fail before Docker
 ```
 
 Confirm the wrong-count and wrong-parent errors name the exact required values.
+
+Apply this profile check only to Linux runner-mutating `start`/`serve` and their shared create path. `canary-once`, status, doctor, and other nonmutating config consumers do not fail merely because a verifier config has a different count; they must remain Docker-free where currently expected.
 
 - [ ] **Step 2: Write unit tests for effective cgroup parsing**
 
@@ -240,6 +247,8 @@ Add a test command recorder that proves a failed guard records no `docker rm`, `
 Add serve-order tests proving selector rejection happens before platform Docker probing and the probe-image pull happens after a successful containment verdict. Assert every recorded Linux Docker argv begins with `docker --host unix:///var/run/docker.sock`, while Mac/explicit VM tests retain their existing argv.
 
 Add a focused test that a failed containment verdict emits the stable alert event once per existing cooldown semantics and never credits backend recovery or admission success.
+
+Change `backend_restart_can_help`/`maybe_restart_backend` and startup wait policy to accept the resolved profile. For fixed Linux HostDocker/DockerSysbox they return passive-retry/no-action without calling `backend_restart_commands`; generated service units omit Lima `Wants=`/`After=`. Add regression tests for initial unreachability and repeated serve failures that record zero VM/backend lifecycle commands. Preserve existing Mac and explicit VM recovery tests.
 
 - [ ] **Step 7: Verify the created PID ancestry**
 
@@ -284,6 +293,8 @@ Stub `docker`, `systemctl`, and `systemd-run` through a fixture `PATH`. Cover ex
 
 Also cover a failed deploy-user manager connectivity probe, an active/enabled/installed PSI watcher, and a `kill` policy on each relevant ancestor boundary independently.
 
+Cover an eleventh `ezgha=managed` container with a different prefix and a secondary `ezgha serve`/`ezgha-canary.service`; each must fail even when the ten expected names are present.
+
 - [ ] **Step 2: Run the test and confirm failure**
 
 ```bash
@@ -306,6 +317,7 @@ no installed ezgha OOM exemption
 no installed agents unlimited override
 no installed/active/enabled psi-oom-watcher artifact
 exactly ten managed ez-runner-c-* containers when --require-fleet is supplied
+no other ezgha=managed container or secondary Linux supervisor
 actual PID ancestry for each required container
 ```
 
@@ -381,7 +393,7 @@ bash tests/apply_host_containment_release1_test.sh
 
 - [ ] **Step 3: Implement the Linux gate and immutable preflight**
 
-Run `uname -s` first and require exact `Linux`, then reject effective UID 0. Resolve the fixed deploy UID from real/effective UID equality and its canonical home through `getent passwd`; require `HOME` equality, the user bus at `/run/user/<uid>/bus`, and a successful bounded read-only `systemctl --user show-environment`. Require at least 8 GiB `MemAvailable`, swap use at most 50%, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, `agents.slice/memory.current < 18G`, `automation.slice/memory.current < 4G`, unset Docker selector variables, Docker 29-compatible systemd/cgroup-v2 at `unix:///var/run/docker.sock`, exact count 10, 2500-MiB runner memory, and `actions.slice` parent. Accept only zero containers with absent/empty `actions.slice` for bootstrap, or exactly ten contained containers plus `actions.slice/memory.current < 26G` for migration. Construct every later elevated argv, pre-authorize each with `sudo -n -l -- <exact argv>`, and fail without intent/service mutation if any is denied.
+Run `uname -s` first and require exact `Linux`, then reject effective UID 0. Resolve the fixed deploy UID from real/effective UID equality and its canonical home through `getent passwd`; require `HOME` equality, the user bus at `/run/user/<uid>/bus`, a successful bounded read-only `systemctl --user show-environment`, and no secondary `ezgha serve` or canary service. Require at least 8 GiB `MemAvailable`, swap use at most 50%, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, `agents.slice/memory.current < 18G`, `automation.slice/memory.current < 4G`, unset Docker selector variables, Docker 29-compatible systemd/cgroup-v2 at `unix:///var/run/docker.sock`, exact count 10, 2500-MiB runner memory, and `actions.slice` parent. Accept only zero total `ezgha=managed` containers with absent/empty `actions.slice` for bootstrap, or exactly ten total managed containers with exact expected names/ancestry plus `actions.slice/memory.current < 26G` for migration. Construct every later elevated argv, pre-authorize each with `sudo -n -l -- <exact argv>`, and fail without intent/service mutation if any is denied.
 
 - [ ] **Step 4: Freeze mutations and snapshot before the reconciler stop**
 
@@ -443,6 +455,7 @@ git commit -m "feat: activate host containment atomically [codex/gpt-5.6-sol]"
 - `doctor-runner` calls the Task 3 script in read-only mode and includes containment in its final verdict.
 - The exit gate requires the Release 1 assertion and ten live contained Linux runners.
 - `install.sh` delegates the compatible Linux HostDocker path to Task 4 after staging an inactive service, and never installs the Colima-guest slice or PSI watcher on that path.
+- Gate 4 and `canary-once` use the main ten-runner Linux config/labels; no separate Linux canary supervisor or reserved eleventh runner remains documented.
 - Repo guidance states crash containment and operator availability are primary; VM layering and security are not substitutes for a finite host boundary.
 
 - [ ] **Step 1: Write focused failing tests**
@@ -450,6 +463,8 @@ git commit -m "feat: activate host containment atomically [codex/gpt-5.6-sol]"
 Add tests proving a single containment mismatch makes both `doctor-runner` and the exit gate bad, while a passing stub preserves existing fleet verdict behavior. Assert containment admission failure invokes the existing high-severity alert/journal path. Assert docs and example config say Linux count 10, HostDocker, `actions.slice`, and fixed profile.
 
 Add installer tests proving the compatible Linux HostDocker path does not call `limactl`, install `systemd/guest/actions.slice`, or install/enable the PSI watcher; it stages the binary/config/service inactive and `exec`s the fixed Task 4 entrypoint. Mac and explicit VM install fixtures retain their existing behavior.
+
+Add config/docs tests proving `config/config.toml.linux-canary.example` is gone, `config/README.md` contains no separate `systemd-run ... serve` instructions, the main Linux example includes the canary repo/workflow dispatch settings and main fleet labels, and Gate 4 defaults to that main config. A `canary-once` fixture must dispatch without Docker while `serve` on a one-runner verifier config fails before Docker.
 
 - [ ] **Step 2: Run the focused tests and confirm failure**
 
@@ -466,7 +481,7 @@ Verify and document Task 2's stable containment alert event and journal diagnost
 
 - [ ] **Step 4: Update portable operator guidance**
 
-Document one user-facing `install.sh` entrypoint, the delegated activation entrypoint, one assertion entrypoint, exact prerequisites, exact limits, failure behavior, and rollback stance. Remove claims that Colima/VM layering is the Linux crash boundary. On compatible Linux HostDocker, remove the current guest-slice `limactl` block and legacy watcher install; stage an inactive service and `exec` Task 4 rather than starting an uncontained daemon. Do not add Release 2 instructions to the immediate install path.
+Document one user-facing `install.sh` entrypoint, the delegated activation entrypoint, one assertion entrypoint, exact prerequisites, exact limits, failure behavior, and rollback stance. Remove claims that Colima/VM layering is the Linux crash boundary and remove fixed-Linux remediation that starts Lima/Colima. Replace fixed-profile exit-gate QEMU/Colima requirements with Task 3's host-containment assertion. On compatible Linux HostDocker, remove the current guest-slice `limactl` block and legacy watcher install; stage an inactive service and `exec` Task 4 rather than starting an uncontained daemon. Delete the separate Linux canary example/instructions and route canary proof through the main fleet config without changing runner count or labels. Do not add Release 2 instructions to the immediate install path.
 
 - [ ] **Step 5: Run focused checks**
 

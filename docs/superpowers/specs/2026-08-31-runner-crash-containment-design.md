@@ -46,7 +46,7 @@ This release does not redesign deployment security. Root brokers, bundle authori
 - Security isolation from malicious workflow code.
 - Replacing host Docker with Colima or adding a VM fallback.
 - Changing the runner image, labels, JIT lifecycle, scheduling, queue cleanup, or Mac fleet.
-- Adding a watchdog, pressure repair daemon, host reboot authority, or automatic Docker restart.
+- Adding a watchdog, pressure repair daemon, host reboot authority, automatic Docker restart, or VM/backend recovery for the fixed HostDocker profile.
 - Rebuilding `install.sh` around a privileged broker or transaction protocol.
 - Proving that global kernel OOM is impossible; uncapped desktop, kernel, Docker-daemon, and other system use remain residual risks.
 
@@ -87,6 +87,10 @@ Add one Linux HostDocker guard, `require_host_containment`, called by the shared
 
 One endpoint-aware Docker-command factory clears `DOCKER_HOST` and `DOCKER_CONTEXT` and passes `--host unix:///var/run/docker.sock` for every Linux HostDocker/DockerSysbox production call. This includes platform/backend discovery, reachability, `docker info`, runtime classification, pre-pull, capacity, inventory, metrics, inspect, top, removal, and run; no direct production `Command::new("docker")` remains outside the factory. OS detection and selector rejection happen before the first Docker probe, and the probe-image pre-pull moves after full containment admission. The generated service also unsets both inherited variables. The existing `docker run --cgroup-parent actions.slice` emission remains. After each container starts, the existing error-compensation path is extended to inspect its PID and require `/proc/<pid>/cgroup` beneath `/actions.slice` before treating the runner as ready. Wrong ancestry removes only that just-created managed container and compensates its exact JIT transition.
 
+The fixed Linux profile suppresses every backend lifecycle recovery call. Docker unreachability reports the existing containment/backend alert and retries passively; it never invokes `lima-vm@colima.service`, `limactl`, Colima, or a Docker restart. Generated Linux HostDocker service units have no Lima `Wants=`/`After=` dependency. Existing Mac and explicit VM profiles retain their current recovery policy.
+
+The former one-runner Linux canary config is retired because it creates an eleventh, differently budgeted HostDocker runner outside the fixed aggregate arithmetic. `canary-once` and Gate 4 dispatch through the main ten-runner config and labels without starting a second supervisor. Nonmutating canary dispatch may load a verifier config, but any Linux `start` or `serve` config that is not the exact ten-runner profile fails before its first Docker command.
+
 Mac and explicit VM-Docker behavior remain unchanged. The guard is mandatory only for the fixed Linux HostDocker profile.
 
 ## Tracked Artifacts
@@ -110,6 +114,7 @@ Release 1 owns this bounded set:
 - Linux service generation changes in `src/service.rs`
 - Linux HostDocker delegation changes in `install.sh`
 - `config/config.toml.linux.example`
+- deletion of `config/config.toml.linux-canary.example`
 - `tests/host_crash_containment_release1_artifacts_test.sh`
 - `tests/assert_host_containment_release1_test.sh`
 - `tests/apply_host_containment_release1_test.sh`
@@ -121,7 +126,7 @@ Release 1 deletes the tracked runner OOM exemption and removes the `AGENT_SLICE_
 
 `scripts/host/apply-host-containment-release1.sh` is the only Release 1 live entrypoint. It runs as the deploy user, rejects effective UID 0, and accepts no caller-selected unit path, profile, service, or command. Its first operation is `uname -s`; any result other than exact `Linux` exits before path creation, config access, service commands, or other mutation. After that check, root invocation also exits before mutation. The fixed deployment identity is the current real/effective UID with canonical home from `getent passwd`; the script requires `HOME` to equal that home and uses `/run/user/<uid>/bus` for that user's manager. Only fixed internal `sudo -n` operations may install the enumerated system artifacts, reload the system manager, and apply/query the system `actions.slice`; all config, snapshot, intent, lock, `systemctl --user`, and user-manager work retains the deploy UID and canonical home. The sequence is:
 
-1. Read-only preflight requires a working deploy-user manager connection, at least 8 GiB `MemAvailable`, at most 50% swap use, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, `agents.slice/memory.current < 18G`, `automation.slice/memory.current < 4G`, Docker systemd/cgroup-v2, and the exact socket and ten-runner/2500-MiB profile. Fleet state is either bootstrap (zero managed containers and an absent or empty `actions.slice`) or in-place migration (exactly ten, all below `/actions.slice`, with `actions.slice/memory.current < 26G`); every partial or wrong-ancestry state fails before mutation. Before publishing intent or stopping a service, `sudo -n -l -- <exact argv>` must authorize every later enumerated system command; the activation executes those identical argument vectors and no other elevated command.
+1. Read-only preflight requires a working deploy-user manager connection, no secondary Linux runner supervisor or canary service, at least 8 GiB `MemAvailable`, at most 50% swap use, memory PSI `full avg10 < 1.00`, at least 1 GiB free on the target filesystem, `agents.slice/memory.current < 18G`, `automation.slice/memory.current < 4G`, Docker systemd/cgroup-v2, and the exact socket and ten-runner/2500-MiB profile. Fleet state is either bootstrap (zero `ezgha=managed` containers and an absent or empty `actions.slice`) or in-place migration (exactly ten total `ezgha=managed` containers named `ez-runner-c-1..10`, all below `/actions.slice`, with `actions.slice/memory.current < 26G`); every partial, extra-prefix, or wrong-ancestry state fails before mutation. Before publishing intent or stopping a service, `sudo -n -l -- <exact argv>` must authorize every later enumerated system command; the activation executes those identical argument vectors and no other elevated command.
 2. Acquire the fixed activation lock and atomically publish a maintenance intent containing PID and boot ID. Every `start`, `serve`, and `stop` path rejects a live intent both before and after acquiring the existing `serve.lock`; stale intent is rejected for operator recovery rather than silently removed.
 3. Snapshot every replaced/removed file and prior manager state before stopping the reconciler. In migration mode stop `ezgha.service`, then acquire and retain `serve.lock` for the remaining policy mutation. In bootstrap mode require it already inactive and acquire the lock. Do not stop, remove, pause, recreate, or deregister any runner container; migration jobs continue inside Docker. Existing graceful service shutdown may remove only registrations already proven to have no local container, which does not affect the ten snapshotted containers or their jobs.
 4. Install the fixed tracked units/drop-ins and leave the already-exact active config unchanged. Run `systemctl --user disable --now psi-oom-watcher.timer`, then `systemctl --user stop psi-oom-watcher.service`, before removing the installed watcher unit/script files; any failure retains maintenance intent and prevents service restart. Also remove `<deploy-home>/.config/systemd/user/agents.slice.d/99-local-unlimited.conf` and `<deploy-home>/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, then reload both managers. In bootstrap, run the enumerated `sudo -n systemctl start actions.slice` after the unit is installed; in migration it is already active. Apply the exact `actions.slice` properties and verify the live cgroup before any runner admission or later step. The user-manager assertion requires `ezgha.service` to report neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`, and requires the PSI watcher absent/inactive/disabled.
@@ -152,6 +157,7 @@ The read-only assertion and exit gate require:
 - no `ezgha.service` OOM exemption or unlimited agent override remains.
 - no legacy PSI watcher file, active unit, or enabled timer remains.
 - migration preserves the same ten managed Linux container IDs; bootstrap starts from zero and converges to exactly ten.
+- no secondary Linux `ezgha serve`, canary service, or extra `ezgha=managed` container exists.
 - every managed PID is actually beneath `/actions.slice`.
 - `doctor-runner` remains read-only and reports a failing containment verdict on any mismatch.
 - containment admission failure emits the existing high-severity alert/journal path as well as the failing doctor verdict; fail-closed capacity loss is not silent.
@@ -186,3 +192,4 @@ Release 2 must treat an already-active Release 1 host policy as its starting sta
 9. Migration preserves all ten existing containers; fresh bootstrap converges from zero to ten within 600 seconds. Either failure remains contained and explicit.
 10. The implementation, activation, rollback, assertion, docs, and focused tests are git-tracked and reproducible on a compatible fresh Ubuntu host.
 11. `install.sh` delegates compatible Linux HostDocker installation to the same activation entrypoint, never installs the Colima-guest slice on that path, and never reinstalls the retired PSI watcher.
+12. Fixed-profile startup/recovery performs no VM or backend lifecycle action, and canary proof dispatch uses the existing ten-runner fleet rather than a separate daemon.
