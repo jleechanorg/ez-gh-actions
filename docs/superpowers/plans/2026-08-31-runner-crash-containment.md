@@ -17,10 +17,10 @@
 - Runner aggregate: `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=2000%`, `IOWeight=25` where supported.
 - Agent aggregate: `MemoryHigh=18G`, `MemoryMax=20G`, `MemorySwapMax=2G`, `TasksMax=8192`.
 - Automation aggregate: `MemoryHigh=4G`, `MemoryMax=6G`, `MemorySwapMax=1G`, `TasksMax=4096`.
-- Workload slices use `ManagedOOMMemoryPressure=kill` and `ManagedOOMMemoryPressureLimit=50%`; both `-.slice` and `user@UID.service` for the deploy owner explicitly use `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`, while the broad user service is neutral with `ManagedOOMPreference=none` and `OOMScoreAdjust=0`.
+- The three finite workload roots use `ManagedOOMMemoryPressure=kill`, `ManagedOOMMemoryPressureLimit=50%`, and `ManagedOOMSwap=kill`; six tracked drop-ins keep every desktop ancestor from `-.slice` through `session.slice` at `auto`, while the broad user service is neutral with `ManagedOOMPreference=none` and `OOMScoreAdjust=0`.
 - Docker must use cgroup v2 with the `systemd` driver. Endpoint classification and actual cgroup ancestry are both verified.
 - The fixed profile requires at least 62 GiB RAM and 32 logical CPUs; smaller hosts fail closed and require a reviewed profile.
-- The roughly 8.5-GiB arithmetic remainder on this host's measured 62.48 GiB is budgeted headroom, not a proof against global kernel OOM.
+- The roughly 8.5-GiB arithmetic remainder on this host's measured 62.48 GiB is budgeted headroom, not a proof against global kernel OOM. Activation records current/peak workload swap plus host swap free/total beside the prior 15.6-GiB incident peak and states the uncapped desktop/kernel/system residual risk.
 - No `systemctl set-property` runtime or persistent control drop-in may shadow tracked unit files.
 - No new watchdog, polling repair loop, VM fallback, host reboot authority, or VM deletion is permitted.
 - Every live mutation is performed by one deploy owner after the repository's load/container preflight.
@@ -40,7 +40,11 @@
 - `systemd/host/ezgha-hard-limit-proof.service`: fixed hard-limit proof launcher.
 - `systemd/host/ezgha-oomd-proof.service`: fixed oomd proof launcher.
 - `systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf`: disable broad root pressure and swap monitoring.
+- `systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf`: disable broad system-manager user-root monitoring.
+- `systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf`: portable inherited policy for dynamic `user-UID.slice`.
 - `systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf`: disable broad desktop-user pressure/swap monitoring and clear subtree-wide oomd/kernel exemptions.
+- `systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf`: disable broad user-manager application-root monitoring.
+- `systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf`: disable broad user-manager session-root monitoring.
 - `systemd/agents.slice`: finite interactive-agent aggregate and direct OOM enrollment.
 - `systemd/automation.slice`: finite automation aggregate and direct OOM enrollment.
 - `scripts/host/assert-crash-containment.sh`: mutation-free consumer of the Rust topology/containment verdict plus independent effective-property evidence.
@@ -53,6 +57,7 @@
 - `config/README.md`: staged bootstrap, managed upgrade, and endpoint migration workflow.
 - `doctor-runner`: read-only topology and containment report.
 - `docs/verify-exit-criteria.sh`: live host-Docker containment gate.
+- `tests/crash_containment_effect_inventory_test.sh`: exhaustive owner/class check for executable external effects.
 - Focused tests under `tests/`: artifact, assertion, installer, doctor, verifier, and pressure-proof behavior.
 
 ## Parallel Execution Map
@@ -124,14 +129,14 @@ Add this section to `CLAUDE.md` immediately before `Safety & Monitoring Principl
 ```markdown
 ## Crash-containment contract
 - **Primary goal:** keep the physical host, desktop session, terminal, and operator recovery tools alive under a full runner workload. Ten Linux runners remain the capacity contract; reducing runner count is not a containment fix.
-- **Workload-local pressure handling:** runner, agent, and automation pressure is handled within separately monitored finite roots. The whole `user@.service` is not a direct oomd pressure root. Do not claim a global kill order across independent roots or claim desktop survival without live evidence.
+- **Workload-local pressure handling:** runner, agent, and automation pressure and swap relief are handled within separately monitored finite roots. Every broad desktop ancestor from `-.slice` through `session.slice` remains `auto`; the whole `user@.service` and root swap tree are not direct oomd roots. Record current/peak swap and the fixed-profile reserve, and do not claim a global kill order or desktop survival without live evidence.
 - **Backend choice is subordinate to effective crash containment:** host Docker is valid when the system `actions.slice` and workload-first OOM policy are effective. Colima is neither required nor sufficient. Never switch backends as a recovery fallback if doing so bypasses a required resource boundary.
 - **Fail closed on missing limits:** do not start or refill runners when the effective aggregate is absent, infinite, installed in the wrong manager scope, or differs from the tracked fixed profile.
 - **Guard every admission path:** the Rust admission guard must run before direct `start`, direct or service-managed `serve`, image pre-pull, and every admission-side reconciliation mutation. Long-lived service admission uses a bounded background full attestor plus a fresh cheap permit at each runner-creation boundary; it must not put Docker, systemd, oomctl, or digest probes in the reconciliation thread. Pre-daemon recovery has a separate Rust decision that can start only an explicitly configured Colima/Lima backend through the existing bounded command; Docker Desktop is never auto-started. Recovery can never authorize runners or turn HostDocker into VM fallback. A shell wrapper is defense in depth, not the authority.
 - **Pressure relief remains independent:** outside a transaction, ordinary planned stop remains `systemctl --user stop ezgha.service` followed by `ezgha stop`. Urgent relief at any time uses tracked `ezgha emergency-stop --confirm`, which durably latches all later start/install/handoff until exact verified clearance; add `--cancel-running` only for proven-local managed containers. Relief never starts a backend/service, refills runners, or calls GitHub.
 - **One Linux deployment entrypoint:** deploy with `./install.sh`; do not replace it with raw `cargo install` plus `systemctl --user restart`, because the binary, helpers, receipt, config, policy, and generated unit are one transaction.
 - **Portable controls only:** every limit, installer action, preflight, and verifier must be git-tracked and reproducible from this repository. A live-only drop-in or one-off `systemctl set-property` is incident evidence, not a completed fix.
-- **No competing repair authority:** observation and verification may report drift, but no new watchdog or monitor may restart Docker, Colima, the desktop, or the host.
+- **No competing effect authority:** observation and verification remain read-only; shell queue tools cannot apply/cancel, doctor canaries delegate to gated Rust, and no watchdog, scheduled repair loop, runtime `set-property` unit, or monitor may mutate GitHub, runners, Docker, Colima, the desktop, or the host. CI inventories every remaining executable effect and permits only named Rust gates, narrow opt-in synthetic proof, and disconnected non-Linux/manual auxiliaries.
 - **Evidence is claim-specific:** hard-limit containment, oomd victim selection, and desktop survival are separate proofs; none substitutes for another.
 ```
 
@@ -181,7 +186,11 @@ Expected: focused test PASS; the distinctive full rule occurs only in `CLAUDE.md
 - Create: `systemd/host/ezgha-hard-limit-proof.service`
 - Create: `systemd/host/ezgha-oomd-proof.service`
 - Create: `systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf`
+- Create: `systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf`
+- Create: `systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf`
 - Create: `systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf`
+- Create: `systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf`
+- Create: `systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf`
 - Create: `scripts/host/proof-allocator.sh`
 - Modify: `systemd/agents.slice`
 - Modify: `systemd/automation.slice`
@@ -214,19 +223,43 @@ expect systemd/host/actions.slice CPUQuota=2000%
 expect systemd/host/actions.slice IOWeight=25
 expect systemd/host/actions.slice ManagedOOMMemoryPressure=kill
 expect systemd/host/actions.slice ManagedOOMMemoryPressureLimit=50%
+expect systemd/host/actions.slice ManagedOOMSwap=kill
+expect systemd/host/ezghaproof.slice MemoryMax=1G
+expect systemd/host/ezghaproof.slice MemorySwapMax=0
+expect systemd/host/ezghaproof.slice TasksMax=128
+expect systemd/host/ezghaproof.slice ManagedOOMMemoryPressure=auto
+expect systemd/host/ezghaproof.slice ManagedOOMSwap=auto
+expect systemd/host/ezghaproof-hardlimit.slice MemoryHigh=384M
 expect systemd/host/ezghaproof-hardlimit.slice MemoryMax=512M
+expect systemd/host/ezghaproof-hardlimit.slice MemorySwapMax=0
+! grep -q '^ManagedOOM' "$ROOT/systemd/host/ezghaproof-hardlimit.slice"
+expect systemd/host/ezghaproof-oomd.slice MemoryHigh=384M
 expect systemd/host/ezghaproof-oomd.slice MemoryMax=768M
+expect systemd/host/ezghaproof-oomd.slice MemorySwapMax=0
 expect systemd/host/ezghaproof-oomd.slice ManagedOOMMemoryPressure=kill
+expect systemd/host/ezghaproof-oomd.slice ManagedOOMMemoryPressureLimit=20%
 expect systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMMemoryPressure=auto
 expect systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMSwap=auto
+expect systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMMemoryPressure=auto
+expect systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMSwap=auto
+expect systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMMemoryPressure=auto
+expect systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMSwap=auto
 expect systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf ManagedOOMMemoryPressure=auto
 expect systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf ManagedOOMSwap=auto
 expect systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf ManagedOOMPreference=none
 expect systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf OOMScoreAdjust=0
+expect systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMMemoryPressure=auto
+expect systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMSwap=auto
+expect systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMMemoryPressure=auto
+expect systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf ManagedOOMSwap=auto
 expect systemd/agents.slice MemoryHigh=18G
 expect systemd/agents.slice MemoryMax=20G
 expect systemd/agents.slice ManagedOOMMemoryPressure=kill
+expect systemd/agents.slice ManagedOOMMemoryPressureLimit=50%
+expect systemd/agents.slice ManagedOOMSwap=kill
 expect systemd/automation.slice ManagedOOMMemoryPressure=kill
+expect systemd/automation.slice ManagedOOMMemoryPressureLimit=50%
+expect systemd/automation.slice ManagedOOMSwap=kill
 echo "PASS: crash-containment artifacts"
 ```
 
@@ -261,6 +294,7 @@ IOAccounting=yes
 IOWeight=25
 ManagedOOMMemoryPressure=kill
 ManagedOOMMemoryPressureLimit=50%
+ManagedOOMSwap=kill
 ```
 
 Create a top-level `ezghaproof.slice` with finite `MemoryMax=1G`, `MemorySwapMax=0`, `TasksMax=128`, and both `ManagedOOM*` policies set to `auto`. Create `ezghaproof-hardlimit.slice` with `MemoryHigh=384M`, `MemoryMax=512M`, and `MemorySwapMax=0`, but no `ManagedOOM*` policy. Create `ezghaproof-oomd.slice` with `MemoryHigh=384M`, `MemoryMax=768M`, `MemorySwapMax=0`, `ManagedOOMMemoryPressure=kill`, and `ManagedOOMMemoryPressureLimit=20%`. By systemd slice naming rules both are descendants only of the top-level proof slice, which is a sibling of production `actions.slice`.
@@ -287,6 +321,16 @@ ManagedOOMPreference=none
 OOMScoreAdjust=0
 ```
 
+Create `systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf` and `systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf` for the system manager, plus `systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf` and `systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf` for installation under `/etc/systemd/user`. Each contains:
+
+```ini
+[Slice]
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto
+```
+
+The truncated `user-.slice.d` name is the portable systemd inheritance path for dynamic `user-$UID.slice`; do not render a machine-specific UID into the repository. Task 4 receipt-enumerates and installs all six boundary drop-ins, each as a separate effect, and reloads the system and user managers separately.
+
 The root override closes vendor drift that could otherwise monitor every system and desktop cgroup for swap. The assertion walks `-.slice`, `user.slice`, `user-$UID.slice`, and `user@UID.service` and rejects either `ManagedOOMMemoryPressure=kill` or `ManagedOOMSwap=kill` on the desktop path. It also rejects `ManagedOOMPreference=avoid|omit` or negative `OOMScoreAdjust` on the broad user service. Do not implement the earlier `99-protect-ui.conf` proposal from `bd-a7c`: `ManagedOOMMemoryPressureLimit=0%` is ignored in `auto` mode, while `omit` plus `OOMScoreAdjust=-500` protects the entire session subtree and displaces victims instead of containing the runner source.
 
 - [ ] **Step 5: Update user workload slices and retire the inverted exemption**
@@ -296,9 +340,10 @@ Change `systemd/agents.slice` to `MemoryHigh=18G`, `MemoryMax=20G`, retain `Memo
 ```ini
 ManagedOOMMemoryPressure=kill
 ManagedOOMMemoryPressureLimit=50%
+ManagedOOMSwap=kill
 ```
 
-Add the same OOM directives to `systemd/automation.slice` without changing its 4G/6G/1G/4096 envelope. Update stale peak/budget comments from fresh read-only evidence: `agents.slice` was about 16.3 GiB current, 17.1 GiB peak, and about 1.1 GiB anon+kernel with the remainder primarily reclaimable file cache on 2026-08-31. `MemoryHigh=18G` therefore preserves the 1-GiB activation margin against enforceable `memory.current`, while `MemoryMax=20G` contains later growth.
+Add the same pressure and swap directives to `systemd/automation.slice` without changing its 4G/6G/1G/4096 envelope. `actions.slice`, `agents.slice`, and `automation.slice` are the only production roots with either managed-OOM policy set to `kill`; every ancestor from `-.slice` through `session.slice` remains `auto`. Update stale peak/budget comments from fresh read-only evidence: `agents.slice` was about 16.3 GiB current, 17.1 GiB peak, and about 1.1 GiB anon+kernel with the remainder primarily reclaimable file cache on 2026-08-31. `MemoryHigh=18G` therefore preserves the 1-GiB activation margin against enforceable `memory.current`, while `MemoryMax=20G` contains later growth.
 
 Remove the `AGENT_SLICE_OPT_OUT` short-circuit and its documentation from both supported launch wrappers and the migration helper. Missing `agents.slice` remains fail-closed; an agent command must not silently run in `app.slice` or directly under `user@.service`. Update the existing wrapper fixtures in `tests/host_control_artifacts_test.sh` to require scoped launch and to fail when any opt-out path or documentation remains. Update only the exact `agents.slice` 10G/12G expectations in `tests/host_control_artifacts_test.sh` and `tests/host_ops_0725_test.sh` to 18G/20G in this same lane; leave their watcher sections intact for the serial integration task. Legacy watcher/exemption removal belongs to Task 5 with all consumers, so this Task 2 commit remains independently green.
 
@@ -310,12 +355,14 @@ Run:
 bash tests/host_crash_containment_artifacts_test.sh
 systemd-analyze verify systemd/host/actions.slice systemd/host/ezghaproof.slice systemd/host/ezghaproof-hardlimit.slice systemd/host/ezghaproof-oomd.slice systemd/host/ezgha-hard-limit-proof.service systemd/host/ezgha-oomd-proof.service systemd/agents.slice systemd/automation.slice
 git diff --check
-git add systemd/host/actions.slice systemd/host/ezghaproof.slice systemd/host/ezghaproof-hardlimit.slice systemd/host/ezghaproof-oomd.slice systemd/host/ezgha-hard-limit-proof.service systemd/host/ezgha-oomd-proof.service systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf scripts/host/proof-allocator.sh systemd/agents.slice systemd/automation.slice scripts/host/agent-scoped-launch.sh scripts/host/agent-cli-scoped.sh scripts/host/agent-auto-migrate.sh tests/host_crash_containment_artifacts_test.sh tests/host_control_artifacts_test.sh tests/host_ops_0725_test.sh
+git add systemd/host/actions.slice systemd/host/ezghaproof.slice systemd/host/ezghaproof-hardlimit.slice systemd/host/ezghaproof-oomd.slice systemd/host/ezgha-hard-limit-proof.service systemd/host/ezgha-oomd-proof.service systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf scripts/host/proof-allocator.sh systemd/agents.slice systemd/automation.slice scripts/host/agent-scoped-launch.sh scripts/host/agent-cli-scoped.sh scripts/host/agent-auto-migrate.sh tests/host_crash_containment_artifacts_test.sh tests/host_control_artifacts_test.sh tests/host_ops_0725_test.sh
 git commit -m "codex/gpt-5.6-sol: define workload-first systemd limits"
 git push origin HEAD
 ```
 
 Expected: test PASS and `systemd-analyze verify` exits zero.
+
+The artifact fixture is the validation authority for the six drop-in fragments and checks their exact section/directive content; `systemd-analyze verify` receives only complete unit files because a standalone drop-in fragment is not a loadable unit.
 
 ### Task 3: Build the Read-Only Containment Assertion
 
@@ -393,7 +440,9 @@ pids.max         6000
 cpu.max          2000000 100000
 ```
 
-Use `systemctl show actions.slice` and `systemctl --user show agents.slice automation.slice ezgha.service` for OOM and effective-property assertions. Use system `systemctl show -- -.slice user.slice user-$(id -u).slice user@$(id -u).service` plus user-manager `systemctl --user show app.slice session.slice`, and require both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto` along every desktop ancestor; reject either policy at `kill`. Require `user@UID.service` to report `ManagedOOMPreference=none` and `OOMScoreAdjust=0`, rejecting the broad-session `avoid`/`omit` plus negative-score proposal. Reject the live `~/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, `ManagedOOMPreference=omit`, or `OOMScoreAdjust=-1000` on `ezgha.service`. Run unprivileged `oomctl --no-pager` through a bounded injectable binary and require it to list the intended system `actions.slice` plus user-manager `agents.slice` and `automation.slice`, with no broad root, user root, app root, or session root; inability to query is transient exit `75`, and missing effective roots are policy exit `78`. Resolve each managed container's actual `/proc/<pid>/cgroup` path and require it below `/actions.slice`; Docker's configured `CgroupParent` alone is not sufficient.
+Use `systemctl show actions.slice` and `systemctl --user show agents.slice automation.slice ezgha.service` for OOM and effective-property assertions. Require all three finite workload roots to report pressure `kill` at 50% plus swap `kill`. Use system `systemctl show -- -.slice user.slice user-$(id -u).slice user@$(id -u).service` plus user-manager `systemctl --user show app.slice session.slice`, and require both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto` along every desktop ancestor; reject either policy at `kill`, missing `user-.slice.d` inheritance, or a missing/overridden boundary artifact. Require `user@UID.service` to report `ManagedOOMPreference=none` and `OOMScoreAdjust=0`, rejecting the broad-session `avoid`/`omit` plus negative-score proposal. Reject the live `~/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, `ManagedOOMPreference=omit`, or `OOMScoreAdjust=-1000` on `ezgha.service`. Run unprivileged `oomctl --no-pager` through a bounded injectable binary and require only the intended finite `actions.slice`, `agents.slice`, and `automation.slice` production roots for both pressure and swap, with no broad root, user root, app root, or session root; inability to query is transient exit `75`, and missing/auto workload roots are policy exit `78`. Resolve each managed container's actual `/proc/<pid>/cgroup` path and require it below `/actions.slice`; Docker's configured `CgroupParent` alone is not sufficient.
+
+Before admission, record `MemTotal`, `MemAvailable`, `SwapTotal`, `SwapFree`, every workload root's `memory.current`, `memory.stat`, `memory.swap.current`, and `memory.swap.peak`, the exact 54-GiB hard-cap sum, and arithmetic reserve. Fixed-profile admission requires `MemTotal >= 62 GiB`, reserve `>= 8 GiB`, and the existing 1-GiB/1-GiB/512-MiB per-root activation margins; it fails before runner mutation on any mismatch. Evidence also records the prior incident's roughly 15.6-GiB system swap peak and explicitly states that current/peak workload swap plus arithmetic reserve do not cap the desktop, kernel, Docker daemon, or other system memory.
 
 Require at least 62 GiB `MemTotal` and 32 logical CPUs before accepting this fixed profile. Add boundary fixtures that reject 60 GiB and 61.99 GiB while accepting 62 GiB. Verify `io.weight=25` when the I/O controller is present in `cgroup.controllers`; otherwise report `io_controller=unavailable` without claiming I/O protection.
 
@@ -463,7 +512,8 @@ before image work or live policy mutation require both static and dynamic verdic
 classify upgrade versus fresh state; upgrades read all three real memory.current files and require 1G/1G/512M margins
 stage and syntax-check every persistent unit before the Rust executor may touch /etc or ~/.config
 Rust DeploymentGate: install systemd/host/actions.slice and fixed proof units -> /etc/systemd/system
-Rust DeploymentGate: install root/user@ overrides -> /etc/systemd/system/{-.slice.d,user@.service.d}
+Rust DeploymentGate: install each system desktop-boundary override -> /etc/systemd/system/{-.slice.d,user.slice.d,user-.slice.d,user@.service.d}
+Rust DeploymentGate: install each user-manager desktop-boundary override -> /etc/systemd/user/{app.slice.d,session.slice.d}
 Rust DeploymentGate: systemctl daemon-reload
 Rust DeploymentGate: systemctl start actions.slice
 Rust DeploymentGate: remove ~/.config/systemd/user/agents.slice.d/99-local-unlimited.conf
@@ -621,10 +671,22 @@ Expected: all focused installer and assertion tests PASS.
 ### Task 5: Make Doctor and Exit Gates Verify Effective Containment
 
 **Files:**
+- Modify: `CLAUDE.md`
+- Modify: `AGENTS.md`
+- Modify: `README.md`
+- Modify: `config/README.md`
+- Modify: `.claude/commands/doctor-ezactions.md`
+- Modify: `.claude/commands/code-standards.md`
+- Modify: `.claude/skills/ezgha-doctor/SKILL.md`
+- Modify: `.claude/skills/ezgha-install/SKILL.md`
 - Modify: `install.sh`
 - Create: `scripts/host/install-crash-containment.sh`
 - Modify: `scripts/cleanup-stuck-runs.sh`
+- Modify: `scripts/queue-backlog-drain.sh`
+- Modify: `scripts/queue-health.sh`
+- Modify: `doctor.sh`
 - Modify: `doctor-runner`
+- Modify: `docs/EXIT-CRITERIA.md`
 - Modify: `docs/verify-exit-criteria.sh`
 - Modify: `docs/host-ops-sudo-block-0725.md`
 - Modify: `.github/workflows/ci.yml`
@@ -636,7 +698,18 @@ Expected: all focused installer and assertion tests PASS.
 - Delete: `systemd/ezgha-queue-reaper.timer`
 - Delete: `scripts/queue-reaper-stopgap.sh`
 - Delete: `launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template`
+- Delete: `systemd/lima-vm-cpu-ceiling.service`
+- Delete: `systemd/agent-scope-reaper.service`
+- Delete: `systemd/agent-scope-reaper.timer`
+- Delete: `scripts/host/agent-scope-reaper.sh`
 - Modify: `docs/test-cleanup-stuck-runs.sh`
+- Modify: `docs/test-queue-backlog-drain.sh`
+- Modify: `scripts/host/assert-qemu-cpu-ceiling.sh`
+- Modify: `tests/assert_qemu_cpu_ceiling_test.sh`
+- Modify: `tests/cleanup_stuck_runs_force_cancel_test.sh`
+- Modify: `tests/cleanup_stuck_runs_multirepo_test.sh`
+- Modify: `tests/cleanup_stuck_runs_race_skip_test.sh`
+- Modify: `tests/cleanup_stuck_runs_verify_inconclusive_test.sh`
 - Modify: `tests/install_watchdog_gate_test.sh`
 - Modify: `tests/install_uninstall_aux_units_test.sh`
 - Modify: `tests/host_control_artifacts_test.sh`
@@ -644,6 +717,8 @@ Expected: all focused installer and assertion tests PASS.
 - Modify: `tests/doctor_runner_host_pressure_test.sh`
 - Modify: `tests/verify_exit_gate8_test.sh`
 - Create: `tests/crash_containment_suite.sh`
+- Create: `tests/crash_containment_effect_inventory_test.sh`
+- Create: `tests/doctor_canary_admission_test.sh`
 - Create: `tests/install_transaction_recovery_test.sh`
 - Create: `tests/install_crash_containment_test.sh`
 
@@ -679,11 +754,19 @@ Add an infinite `actions.slice` fixture expecting `verdict=FAIL` and a diagnosti
 
 - [ ] **Step 2: Add failing monitoring and Gate 8 fixtures**
 
-Extend `tests/verify_exit_gate8_test.sh` with mutually exclusive host-Docker and Colima fixtures. The host fixture passes only when Docker uses cgroup v2/systemd, every managed container both reports `actions.slice` and has an actual PID cgroup path below `/actions.slice`, system values exactly match the profile, workload OOM enrollment is effective, `-.slice`, `user.slice`, `user-UID.slice`, `user@UID.service`, `app.slice`, and `session.slice` are `auto` for both pressure and swap, `user@UID.service` is neutral with `ManagedOOMPreference=none` and `OOMScoreAdjust=0`, and unprivileged `oomctl` lists only the intended finite workload roots rather than the broad user manager or desktop. This intentionally replaces Ubuntu's vendor `user@.service ManagedOOMMemoryPressure=kill`, the observed whole-session crash blast radius, with direct finite workload roots; it does not claim that an uncapped desktop application can never cause global OOM. The fixture also requires no control drop-in shadows the tracked policy, the unlimited agent override is absent, every detected supported agent CLI PID is beneath the effective finite `agents.slice`, no `AGENT_SLICE_OPT_OUT` code/documentation remains, and `ezgha.service` has neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`. Its admission arithmetic must read and require the exact finite aggregate `actions.slice MemoryMax=28G + agents.slice MemoryMax=20G + automation.slice MemoryMax=6G = 54G`, require at least 62 GiB physical RAM, and report the measured roughly 8.5-GiB remainder explicitly; wrong, missing, or infinite values fail. In host mode, exclude inactive `app-lima-vm.slice` from arithmetic and never invoke `limactl`; retain guest checks only in explicit Colima mode.
+Extend `tests/verify_exit_gate8_test.sh` with mutually exclusive host-Docker and Colima fixtures. The host fixture passes only when Docker uses cgroup v2/systemd, every managed container both reports `actions.slice` and has an actual PID cgroup path below `/actions.slice`, system values exactly match the profile, all three finite workload roots report pressure `kill@50%` plus swap `kill`, all six receipt-bound desktop drop-ins exist and are effective, `-.slice`, `user.slice`, inherited `user-UID.slice`, `user@UID.service`, `app.slice`, and `session.slice` are `auto` for both pressure and swap, `user@UID.service` is neutral with `ManagedOOMPreference=none` and `OOMScoreAdjust=0`, and unprivileged `oomctl` lists only intended finite workload roots rather than the broad user manager or desktop. This intentionally replaces Ubuntu's vendor broad pressure/root-swap kill blast radius with direct finite workload roots; it does not claim that an uncapped desktop application can never cause global OOM. The fixture also requires no control drop-in shadows the tracked policy, the unlimited agent override is absent, every detected supported agent CLI PID is beneath the effective finite `agents.slice`, no `AGENT_SLICE_OPT_OUT` code/documentation remains, and `ezgha.service` has neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`. Its admission arithmetic must read and require the exact finite aggregate `actions.slice MemoryMax=28G + agents.slice MemoryMax=20G + automation.slice MemoryMax=6G = 54G`, require at least 62 GiB physical RAM and at least 8 GiB arithmetic reserve, and record `MemAvailable`, `SwapTotal`, `SwapFree`, workload `memory.swap.current`, and workload `memory.swap.peak` beside the historical 15.6-GiB incident peak and residual-risk statement; wrong, missing, infinite, or broad-monitored values fail. In host mode, exclude inactive `app-lima-vm.slice` from arithmetic and never invoke `limactl`; retain guest checks only in explicit Colima mode.
 
-Retire the old watcher stack atomically in this task. In the same commit: delete the four tracked watcher/exemption artifacts; remove their ordinary install and uninstall loops; add their exact final paths and prior state to the staging manifest so Task 4's Rust transaction disables/removes the installed timer, service, stable script, and live `~/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf` through typed gates; verify `ManagedOOMPreference` is not `omit` and `OOMScoreAdjust` is not `-1000`; remove any legacy `systemctl set-property --runtime actions.slice` path; update every active test and operator document; and replace Gate 7/8 watcher checks with effective `systemd-oomd` root enrollment and finite-cgroup checks. Rewrite `docs/host-ops-sudo-block-0725.md` to name the watcher and exemption as retired and point to the tracked containment transaction. Add a regression scan that fails when active surfaces (`install.sh`, `docs/verify-exit-criteria.sh`, `docs/host-ops-sudo-block-0725.md`, `README.md`, or `CLAUDE.md`) instruct users to install, enable, or depend on `psi-oom-watcher` or `10-oomd-omit.conf`; historical activity logs may retain incident references. Add a Task 5-owned forced-failure integration fixture that begins with byte-distinct installed watcher units/script and live exemption, plus active/enabled watcher state; inject failure after Rust retirement and prove exact file bytes, prior enabled/active states, and effective exemption properties are restored through Task 4 `ReliefGate`. No intermediate commit may delete a source artifact while the Rust transaction, verifier, or test still depends on it.
+Retire the old watcher stack atomically in this task. In the same commit: delete the four tracked watcher/exemption artifacts; remove their ordinary install and uninstall loops; add their exact final paths and prior state to the staging manifest so Task 4's Rust transaction disables/removes the installed timer, service, stable script, and live `~/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf` through typed gates; verify `ManagedOOMPreference` is not `omit` and `OOMScoreAdjust` is not `-1000`; remove every legacy `systemctl set-property --runtime` path; update every active test and operator document; and replace Gate 7/8 watcher checks with effective `systemd-oomd` root enrollment and finite-cgroup checks. Rewrite `docs/host-ops-sudo-block-0725.md` to name the watcher and exemption as retired and point to the tracked containment transaction. Add a regression scan covering `install.sh`, both doctors, queue scripts, `docs/verify-exit-criteria.sh`, `docs/host-ops-sudo-block-0725.md`, `docs/EXIT-CRITERIA.md`, `README.md`, `CLAUDE.md`, active tests, units, and workflows; fail when any active surface installs, enables, depends on, invokes, or suggests a retired watcher, exemption, reaper, runtime property unit, or retired queue/reaper shell apply/cancel path. The explicit `ManualAgentSessionMigration` class remains exempt. Historical activity/roadmap/goal records may retain incident references. Add a Task 5-owned forced-failure integration fixture that begins with byte-distinct installed watcher units/script and live exemption, plus active/enabled watcher state; inject failure after Rust retirement and prove exact file bytes, prior enabled/active states, and effective exemption properties are restored through Task 4 `ReliefGate`. No intermediate commit may delete a source artifact while the Rust transaction, verifier, or test still depends on it.
 
-Retire the independent queue-reaper stack in the same transaction. Task 5 deletes the tracked source artifacts, removes staging loops that recreate them, removes `cleanup-stuck-runs.sh --apply`, and adds exact installed service/timer/launchd/script targets plus prior state to the manifest. Task 4's Rust transaction stops/disables and removes those installed targets through typed gates. Verify no matching systemd unit or launchd job is active/enabled and no active source invokes the removed apply path. Forced-failure fixtures restore prior external reaper bytes/state exactly through `ReliefGate`; successful installation leaves only the supervisor-owned gated reaper. No intermediate commit may remove a source while the Rust transaction or an active test still references it.
+Retire the independent queue-reaper stack in the same transaction. Task 5 deletes the tracked source artifacts, removes staging loops that recreate them, and makes both `cleanup-stuck-runs.sh` and `queue-backlog-drain.sh` permanently read-only. Remove `--apply`, `--cancel-superseded`, `--yes`, every POST/DELETE helper, and every direct `gh run delete`; rejected legacy flags exit `64` before any `gh` invocation. Rewrite `docs/test-cleanup-stuck-runs.sh`, `docs/test-queue-backlog-drain.sh`, and all four `tests/cleanup_stuck_runs_*_test.sh` fixtures to prove the remaining reports are read-only and every legacy mutation flag makes zero GitHub calls. `scripts/queue-health.sh` emits only a read-only `ezgha reaper-plan --config PATH --json` inspection command, never an apply/cancel/delete suggestion. Add exact installed service/timer/launchd/script targets plus prior state to the manifest. Task 4's Rust transaction stops/disables and removes those installed targets through typed gates. Verify no matching systemd unit or launchd job is active/enabled and no active source invokes or advertises a removed path. Forced-failure fixtures restore prior external reaper bytes/state exactly through `ReliefGate`; successful installation leaves only the supervisor-owned gated reaper. No intermediate commit may remove a source while the Rust transaction or an active test still references it.
+
+Remove direct canary dispatch from both doctor scripts. `doctor.sh --prove` and `doctor-runner --prove` invoke only the exact receipt/config-bound installed Rust binary as `ezgha --config PATH canary-once --json`; Task 4's Rust path performs full admission, mints a fresh canary-dispatch permit immediately before the POST, correlates the exact run, and returns result JSON for read-only rendering. Shell never runs `gh workflow run`. `tests/doctor_canary_admission_test.sh` supplies a `gh` stub that fails on every invocation and an `ezgha` stub that records exact argv, proving both doctors delegate once and propagate denial/error without fallback.
+
+Remove the verifier's `docker run --rm ... df` disk probe. In fixed HostDocker mode, read `df -Pk` for the filesystem containing the classified Docker/state storage; in non-host or legacy topology report that disk sub-verdict as not applicable instead of creating a container. Fixtures reject any verifier call to Docker `run`, `pull`, `build`, `rm`, `stop`, or `start`.
+
+Retire the runtime `lima-vm-cpu-ceiling.service` and scheduled `agent-scope-reaper` service/timer/script in the same manifest. Remove their installer loops and every active dependency; rewrite the QEMU assertion and its consumers around persistent tracked slice policy rather than `systemctl set-property`. Task 4 snapshots installed bytes and enabled/active state, removes each artifact through separate deployment effects, and restores exact prior state only through `ReliefGate` on failed migration. Manual `agent-cli-scoped.sh` and `agent-auto-migrate.sh apply` remain the explicit `ManualAgentSessionMigration` class, but no timer or Linux installer invokes them automatically.
+
+Create `tests/crash_containment_effect_inventory_test.sh` as an exhaustive active-source and instruction gate. Scan tracked production executables, `install.sh`, both doctors, `scripts/**/*.sh`, `scripts/**/*.py`, active `docs/*.sh`, `launchd/**/*.sh`, `systemd/**/*.service`, `.github/workflows/*`, `CLAUDE.md`, `AGENTS.md`, `README.md`, `config/README.md`, `.claude/commands/**/*.md`, and `.claude/skills/**/*.md`; fail on an unclassified GitHub write/dispatch/delete, Docker lifecycle verb, mutating `systemctl`/`launchctl`/VM command, `systemd-run`, cgroup-control write, privileged shell, or retired command suggestion. Replace active direct operational instructions, including the config guide's transient `systemd-run ... serve`, `code-standards` raw cargo-install/restart/container removal, and `ezgha-install` Docker login/pull/VM/service mutations, with receipt-bound `./install.sh`/recovery, gated Rust canary/reaper/relief commands, or read-only inspection. The only named exceptions are Rust-gated source APIs, Task 6's literal opt-in `ProofEffect`, the disconnected `MacAuxiliaryManager`, and manual agent-session migration. The test also proves Linux install/doctor/CI/supervisor surfaces have no call edge to either auxiliary class, CI contains no host-manager/GitHub-write invocation or Docker-socket mount, and no retired script/unit/plist has an installer, timer, workflow, or active-document edge. Historical roadmap/activity/goal records are explicitly excluded as non-executable history.
 
 - [ ] **Step 3: Run both tests and confirm the red state**
 
@@ -710,7 +793,7 @@ After an allowed local `cargo build --locked --release` creates the exact candid
 
 Once `install.sh` has `exec`d the candidate, Rust obtains the dynamic verdict; after both verdicts pass, Rust snapshots the installed binary bytes/path/mode/digest; live config; every old policy/helper file; the deployment receipt; exact generated `ezgha.service` and `ezgha-alert@.service` units; retired watcher/exemption files; and applicable active/enabled states. Before image or installed/live mutation, Rust verifies preserved `state_dir`/target/scope/prefix, acquires `emergency.lock` only to reject any relief latch, releases it, stops active `ezgha.service`, and verifies inactive/MainPID exit without either lock. It then reacquires `emergency.lock`, rechecks all latches, publishes `Preparing`, and releases it before bounded `serve.lock` acquisition and the `Fenced` transition. It never waits for service stop, process exit, or the fence while holding the control lock; any latch instead records `ReliefLatched`, restores no active service, and starts nothing. Managed-upgrade containers may remain only when their actual cgroups are already beneath `actions.slice`. Legacy migration drains under the Rust-held FD without cancelling busy jobs. Rust validates numeric bounds/inode, requires `EWOULDBLOCK` on a second canonical descriptor, and never unlocks/closes the retained FD before terminal transfer or fail-closed recovery. Task 4 fixtures cover latch races, no control lock during waits, descriptor identity/contention, zero admission between fence and handoff, and release-build lock-bypass rejection; Task 5 fixtures prove the normal candidate identity/`exec` arguments and absence of a surviving shell coordinator.
 
-Only after quiescence, `Preparing`, fence acquisition, and nonce-matched `Fenced` may Rust acquire/build the image and commit the already-staged candidate binary, mode-`0600` config, helpers, policy, both units, and receipt manifest. Before `exec`, the shell performs reads and private staging only: it never runs `sudo`, a mutating `systemctl`, a final-path write/remove, Docker image mutation, socket/peer operations, or lock/latch/state mutation. Task 4's Rust executor revalidates the manifest and routes every live artifact/policy/unit commit and manager reload/enable/start spawn separately through `DeploymentGate`, with `TransactionAdmission` additionally required for deferred unit commits. Config and receipt artifacts are one Rust-owned rollback unit. Rust checks durable relief before/after each bounded operation, before deferred install, at least once per second during drain, and through handoff. Latch acknowledgment atomically records `ReliefLatched`, blocks every later forward gate, rolls back under `serve.lock` through `ReliefGate`, and leaves the supervisor inactive. Stale/malformed/mismatched transaction or latch state remains fail-closed until exact verified recovery/clearance; shell never retries an unknown live result.
+Only after quiescence, `Preparing`, fence acquisition, and nonce-matched `Fenced` may Rust acquire/build the image and commit the already-staged candidate binary, mode-`0600` config, helpers, policy, both units, and receipt manifest. Before `exec`, the shell performs reads and private staging only: it never runs `sudo`, a mutating `systemctl`, a final-path write/remove, Docker image mutation, socket/peer operations, or lock/latch/state mutation. Task 4's Rust executor revalidates the manifest and routes every live artifact/policy/unit commit and manager reload/enable/start spawn separately through `DeploymentGate`, with `TransactionAdmission` additionally required for deferred unit commits. The receipt enumerates all six desktop-boundary final paths and digests: four under `/etc/systemd/system/{-.slice.d,user.slice.d,user-.slice.d,user@.service.d}` and two under `/etc/systemd/user/{app.slice.d,session.slice.d}`. Each commit/remove and the system/user daemon reloads are separate typed effects; rollback restores or removes exact prior bytes only through `ReliefGate` followed by the matching reload. Config and receipt artifacts are one Rust-owned rollback unit. Rust checks durable relief before/after each bounded operation, before deferred install, at least once per second during drain, and through handoff. Latch acknowledgment atomically records `ReliefLatched`, blocks every later forward gate, rolls back under `serve.lock` through `ReliefGate`, and leaves the supervisor inactive. Stale/malformed/mismatched transaction or latch state remains fail-closed until exact verified recovery/clearance; shell never retries an unknown live result.
 
 Implement both recovery entrypoints in `install.sh`. The shell validates mutually exclusive exact syntax plus the existing deployment receipt and `exec`s its exact installed binary with only the confirmation value; a missing or path/mode/digest-mismatched receipt fails before recovery. It performs no lock, latch, state, socket, service-manager, or live-file mutation itself. Before any state, lock, gate, backend, manager, or final-path access, the Rust recovery entrypoint opens, `fstat`s, and hashes its own `/proc/self/exe` descriptor and requires canonical target, owner, regular-file mode, digest, and recovery-capable role to equal the installed receipt. Missing identity, an alternate copy, or pathname replacement/deletion exits with zero effects. Non-emergency `./install.sh --recover-transaction --confirm-transaction <nonce>` then causes Rust to acquire `serve.lock` without holding `emergency.lock`, reject any unresolved request, require the service inactive, prove no live transaction/service owner, and accept only matching `Preparing`, `Fenced`, `HandoffReserved`, `HandoffClaimed`, `HandoffLocked`, `SubmissionUnknown`, or `RecoveryRequired`. Rust completes/verifies saved rollback or proves no mutation, removes only identity-proven stale socket state, fsyncs `RecoveredInactive`, and leaves pre-baton state disabled/inactive while permitting a later clean transaction retry.
 
@@ -727,7 +810,7 @@ Run the bounded job-outcome monitor before and after applying `CPUQuota=2000%` w
 Run:
 
 ```bash
-bash -n doctor-runner docs/verify-exit-criteria.sh
+bash -n doctor.sh doctor-runner docs/verify-exit-criteria.sh
 bash -n install.sh scripts/host/install-crash-containment.sh tests/install_crash_containment_test.sh tests/install_transaction_recovery_test.sh
 bash tests/install_crash_containment_test.sh
 bash tests/install_transaction_recovery_test.sh
@@ -738,10 +821,18 @@ bash tests/host_ops_0725_test.sh
 bash tests/crash_containment_policy_test.sh
 bash tests/install_watchdog_gate_test.sh
 bash tests/install_uninstall_aux_units_test.sh
+bash docs/test-cleanup-stuck-runs.sh
+bash docs/test-queue-backlog-drain.sh
+bash tests/cleanup_stuck_runs_force_cancel_test.sh
+bash tests/cleanup_stuck_runs_multirepo_test.sh
+bash tests/cleanup_stuck_runs_race_skip_test.sh
+bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
+bash tests/doctor_canary_admission_test.sh
+bash tests/crash_containment_effect_inventory_test.sh
 bash tests/crash_containment_suite.sh
 git diff --check
-git add install.sh scripts/host/install-crash-containment.sh scripts/cleanup-stuck-runs.sh doctor-runner docs/verify-exit-criteria.sh docs/host-ops-sudo-block-0725.md docs/test-cleanup-stuck-runs.sh .github/workflows/ci.yml tests/install_crash_containment_test.sh tests/install_transaction_recovery_test.sh tests/install_watchdog_gate_test.sh tests/install_uninstall_aux_units_test.sh tests/host_control_artifacts_test.sh tests/host_ops_0725_test.sh tests/doctor_runner_host_pressure_test.sh tests/verify_exit_gate8_test.sh tests/crash_containment_suite.sh
-git add -u systemd/ezgha.service.d/10-oomd-omit.conf systemd/psi-oom-watcher.service systemd/psi-oom-watcher.timer scripts/host/psi-oom-watcher.sh systemd/ezgha-queue-reaper.service systemd/ezgha-queue-reaper.timer scripts/queue-reaper-stopgap.sh launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template
+git add CLAUDE.md AGENTS.md README.md config/README.md .claude/commands/doctor-ezactions.md .claude/commands/code-standards.md .claude/skills/ezgha-doctor/SKILL.md .claude/skills/ezgha-install/SKILL.md install.sh scripts/host/install-crash-containment.sh scripts/cleanup-stuck-runs.sh scripts/queue-backlog-drain.sh scripts/queue-health.sh doctor.sh doctor-runner docs/EXIT-CRITERIA.md docs/verify-exit-criteria.sh docs/host-ops-sudo-block-0725.md docs/test-cleanup-stuck-runs.sh docs/test-queue-backlog-drain.sh scripts/host/assert-qemu-cpu-ceiling.sh .github/workflows/ci.yml tests/assert_qemu_cpu_ceiling_test.sh tests/cleanup_stuck_runs_force_cancel_test.sh tests/cleanup_stuck_runs_multirepo_test.sh tests/cleanup_stuck_runs_race_skip_test.sh tests/cleanup_stuck_runs_verify_inconclusive_test.sh tests/install_crash_containment_test.sh tests/install_transaction_recovery_test.sh tests/install_watchdog_gate_test.sh tests/install_uninstall_aux_units_test.sh tests/host_control_artifacts_test.sh tests/host_ops_0725_test.sh tests/doctor_runner_host_pressure_test.sh tests/doctor_canary_admission_test.sh tests/verify_exit_gate8_test.sh tests/crash_containment_effect_inventory_test.sh tests/crash_containment_suite.sh
+git add -u systemd/ezgha.service.d/10-oomd-omit.conf systemd/psi-oom-watcher.service systemd/psi-oom-watcher.timer scripts/host/psi-oom-watcher.sh systemd/ezgha-queue-reaper.service systemd/ezgha-queue-reaper.timer scripts/queue-reaper-stopgap.sh launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template systemd/lima-vm-cpu-ceiling.service systemd/agent-scope-reaper.service systemd/agent-scope-reaper.timer scripts/host/agent-scope-reaper.sh
 git commit -m "codex/gpt-5.6-sol: verify effective runner containment"
 git push origin HEAD
 ```
@@ -795,12 +886,12 @@ Expected: FAIL because the proof script is absent.
 
 The script must:
 
-1. Run the read-only containment assertion; require `/ezghaproof.slice` and both proof children to contain no process; and require every production runner path to remain below `/actions.slice`, outside the proof subtree.
+1. Require `EZGHA_RUN_PRESSURE_PROOF=1`, reject `CI` or any recognized CI environment before mutation, run the read-only containment assertion, require `/ezghaproof.slice` and both proof children to contain no process, and require every production runner path to remain below `/actions.slice`, outside the proof subtree. Disabled, CI, or failed-preflight paths produce zero proof effects.
 2. Record boot ID, `user@UID.service` MainPID, Warp PID set, managed runner IDs, memory/PSI snapshots, `oomctl`, relevant journal cursors, and workload `memory.events`.
 3. In `--hard-limit` mode, use `${SUDO_BIN:-sudo} systemctl start ezgha-hard-limit-proof.service` for the fixed tracked unit and wait at most 90 seconds. Require `ezghaproof-hardlimit.slice`'s `oom`/`oom_kill` counter to increment and label the result only as kernel hard-limit containment.
 4. In `--oomd` mode, parse and record effective `DefaultMemoryPressureDurationSec` from `systemd-analyze cat-config systemd/oomd.conf`; accept only an unambiguous integral whole-second value in `1..=45` and reject missing, malformed, zero, negative, fractional, unit-suffixed, or larger values before allocation. Use `${SUDO_BIN:-sudo} systemctl start ezgha-oomd-proof.service` for the fixed tracked unit and wait at most 90 seconds. Sample the child `memory.pressure` once per second while the fixed 640-MiB working set is continuously retouched for up to 75 seconds. Require the exact `full avg10` value to remain at least 20% continuously for the discovered effective duration and require a new `systemd-oomd` journal record naming a descendant of `ezghaproof-oomd.slice`; `some`, `avg60`/`avg300`, a lone above-threshold sample, allocator exit, a kernel OOM, or a victim record without the continuous measured interval is not evidence.
 5. For both modes, require the boot ID, user-manager PID, Warp PID set, Docker daemon, and unrelated runner containers to remain alive. Record this separately as the survival verdict.
-6. Stop and reset only the named proof services with privileged `systemctl` calls whose unit names are literal in the script. Never use `systemd-run`, a shell passed through privilege escalation, arbitrary unit names, or command/environment overrides. Leave the empty tracked proof slices in place and never touch `actions.slice`, Docker, `ezgha.service`, or the host lifecycle.
+6. Own the only shell `ProofEffect`: literal `${SUDO_BIN:-sudo} systemctl {start,stop,reset-failed}` for exactly `ezgha-hard-limit-proof.service` and `ezgha-oomd-proof.service`, plus exactly one config/selector-validated `gh workflow run capacity-proof.yml` dispatch. Never use `systemd-run`, a shell passed through privilege escalation, arbitrary unit names, command/environment overrides, Docker lifecycle commands, GitHub cancel/delete endpoints, or any other workflow. Leave the empty tracked proof slices in place and never touch `actions.slice`, Docker, `ezgha.service`, or the host lifecycle.
 7. Inspect effective `memory.oom.group` for runner scopes. Do not claim whole-container hard-limit death when it is `0`; separately observe container exit and fleet replenishment during the ten-runner test.
 8. Change the existing 24-job, 240-second `capacity-proof.yml` matrix to select `[self-hosted, self-hosted-mikey, ezgha, ez-runner-c]`; repository fixtures prove the Mac and canary examples do not contain `ez-runner-c`. Before calling this subset fleet-unique or dispatching, query every runner in the actual GitHub registration scope and require the selector to match exactly the expected ten `ez-runner-c-1..10` IDs/names and no other runner; record the full collision-query result and fail on an extra or missing match. Replace the separate hold step with one shell step that writes `/tmp/ezgha-capacity-proof.marker` containing its `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, and matrix number, installs an exit trap, sleeps for 240 seconds while the marker remains present, and removes it on that same shell's exit. The proof fixture fails unless the exact selector, registry-wide collision check, and same-step marker/hold contract are present. In `--ten-workers --ref REF` mode, verify all ten local and registry-matched runners advertise the proposed six-label set `[self-hosted, self-hosted-mikey, ezgha, ez-runner-c, Linux, X64]`, snapshot recent capacity run IDs, dispatch with `gh workflow run capacity-proof.yml -R jleechanorg/ez-gh-actions --ref "$REF"`, and resolve exactly one new run ID. Poll direct host Docker until ten distinct managed containers simultaneously show `Runner.Worker` in `docker top`; require `docker exec` in each observed container to return a marker for that captured run ID/attempt with ten distinct matrix numbers; record each container's actual PID cgroup path beneath `/actions.slice`; and fail on timeout, fewer than ten, or any missing/mismatched marker. Watch only the captured run ID to successful completion and require its job metadata to name those same matrix jobs; do not cancel it, because cancellation would contaminate the job-outcome monitor. Bind evidence to the exact run ID, attempt, workflow SHA, ref, selector subset, registration-scope runner IDs/names/labels, container IDs, markers, process samples, job metadata, and timestamps.
 
@@ -981,6 +1072,10 @@ Set `EVIDENCE_DIR` to the directory printed by the successful pressure proof, th
 ```bash
 git status --short
 git add CLAUDE.md AGENTS.md README.md roadmap/up-changelog-20260831-crash-containment.md \
+  .claude/commands/doctor-ezactions.md \
+  .claude/commands/code-standards.md \
+  .claude/skills/ezgha-doctor/SKILL.md \
+  .claude/skills/ezgha-install/SKILL.md \
   systemd/host/actions.slice \
   systemd/host/ezghaproof.slice \
   systemd/host/ezghaproof-hardlimit.slice \
@@ -988,7 +1083,11 @@ git add CLAUDE.md AGENTS.md README.md roadmap/up-changelog-20260831-crash-contai
   systemd/host/ezgha-hard-limit-proof.service \
   systemd/host/ezgha-oomd-proof.service \
   systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf \
+  systemd/host/user.slice.d/90-ezgha-oomd-boundary.conf \
+  systemd/host/user-.slice.d/90-ezgha-oomd-boundary.conf \
   systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf \
+  systemd/user/app.slice.d/90-ezgha-oomd-boundary.conf \
+  systemd/user/session.slice.d/90-ezgha-oomd-boundary.conf \
   systemd/agents.slice systemd/automation.slice \
   src/alert.rs src/backend.rs src/canary.rs src/containment.rs src/config.rs src/docker_backend.rs src/failure_ladder.rs src/github.rs src/lima_convergence.rs src/main.rs src/platform.rs src/queue_monitor.rs src/quarantine.rs src/reaper.rs src/service.rs src/shutdown.rs \
   scripts/host/agent-scoped-launch.sh \
@@ -999,9 +1098,15 @@ git add CLAUDE.md AGENTS.md README.md roadmap/up-changelog-20260831-crash-contai
   scripts/host/proof-allocator.sh \
   scripts/host/install-crash-containment.sh \
   scripts/host/prove-crash-containment.sh \
-  install.sh scripts/cleanup-stuck-runs.sh config/README.md config/config.toml.linux.example doctor-runner \
-  docs/verify-exit-criteria.sh docs/host-ops-sudo-block-0725.md docs/test-cleanup-stuck-runs.sh \
+  install.sh scripts/cleanup-stuck-runs.sh scripts/queue-backlog-drain.sh scripts/queue-health.sh config/README.md config/config.toml.linux.example doctor.sh doctor-runner \
+  docs/EXIT-CRITERIA.md docs/verify-exit-criteria.sh docs/host-ops-sudo-block-0725.md docs/test-cleanup-stuck-runs.sh docs/test-queue-backlog-drain.sh \
+  scripts/host/assert-qemu-cpu-ceiling.sh \
   .github/workflows/ci.yml \
+  tests/assert_qemu_cpu_ceiling_test.sh \
+  tests/cleanup_stuck_runs_force_cancel_test.sh \
+  tests/cleanup_stuck_runs_multirepo_test.sh \
+  tests/cleanup_stuck_runs_race_skip_test.sh \
+  tests/cleanup_stuck_runs_verify_inconclusive_test.sh \
   tests/crash_containment_policy_test.sh \
   tests/host_control_artifacts_test.sh \
   tests/host_ops_0725_test.sh \
@@ -1012,11 +1117,13 @@ git add CLAUDE.md AGENTS.md README.md roadmap/up-changelog-20260831-crash-contai
   tests/install_watchdog_gate_test.sh \
   tests/install_uninstall_aux_units_test.sh \
   tests/doctor_runner_host_pressure_test.sh \
+  tests/doctor_canary_admission_test.sh \
   tests/verify_exit_gate8_test.sh \
+  tests/crash_containment_effect_inventory_test.sh \
   tests/crash_containment_suite.sh \
   tests/prove_crash_containment_test.sh \
   "$EVIDENCE_DIR"
-git add -u systemd/ezgha.service.d/10-oomd-omit.conf systemd/psi-oom-watcher.service systemd/psi-oom-watcher.timer scripts/host/psi-oom-watcher.sh systemd/ezgha-queue-reaper.service systemd/ezgha-queue-reaper.timer scripts/queue-reaper-stopgap.sh launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template
+git add -u systemd/ezgha.service.d/10-oomd-omit.conf systemd/psi-oom-watcher.service systemd/psi-oom-watcher.timer scripts/host/psi-oom-watcher.sh systemd/ezgha-queue-reaper.service systemd/ezgha-queue-reaper.timer scripts/queue-reaper-stopgap.sh launchd/org.jleechanorg.ezgha-queue-reaper-stopgap.plist.template systemd/lima-vm-cpu-ceiling.service systemd/agent-scope-reaper.service systemd/agent-scope-reaper.timer scripts/host/agent-scope-reaper.sh
 git commit -m "codex/gpt-5.6-sol: enforce workload crash containment"
 git push origin HEAD
 git status --short --branch
