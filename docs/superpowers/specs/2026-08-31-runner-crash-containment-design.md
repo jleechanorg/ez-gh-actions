@@ -8,7 +8,7 @@
 
 The production fleet currently runs ten runner containers through the host Docker daemon. Each container has a finite memory, CPU, and PID limit, but the shared host `actions.slice` has infinite aggregate limits. The tracked finite `actions.slice` is installed only inside Colima, so it does not constrain host-Docker containers. At the same time, a local `agents.slice` drop-in overrides the tracked finite values with infinity, while Ubuntu's vendor `user@.service` policy monitors the entire user manager for memory pressure.
 
-That topology inverts the intended failure order. During runner refill bursts, `systemd-oomd` can kill `user@1000.service`, taking Warp, tmux, Codex, and the desktop session together, while the runner aggregate remains unbounded. Colima is not the root requirement: the availability requirement is that lower-priority workloads fail before the operator session and physical host.
+That topology inverts the intended failure order. During runner refill bursts, `systemd-oomd` can kill the deploy owner's `user@UID.service`, taking Warp, tmux, Codex, and the desktop session together, while the runner aggregate remains unbounded. Colima is not the root requirement: the availability requirement is that lower-priority workloads fail before the operator session and physical host.
 
 ## Goals
 
@@ -37,8 +37,8 @@ That topology inverts the intended failure order. During runner refill bursts, `
 | May containment reduce runner count? | No; retain ten Linux runners. | Ten runners are an explicit capacity requirement. |
 | What should die first under runner pressure? | An eligible descendant of the monitored runner root; the desktop user manager is not a direct pressure target. | `systemd-oomd` selects within each monitored root, so the design guarantees workload-local candidate selection but does not claim a total order across independent runner, agent, and automation roots. |
 | How much host RAM remains outside hard workload caps? | Budget about 12.8 GiB on the 62.8 GiB host. | `actions.slice` 28 GiB + `agents.slice` 16 GiB + `automation.slice` 6 GiB = 50 GiB. This is headroom for uncapped desktop, kernel, Docker, and system use, not a proof that global OOM is impossible. |
-| What initial runner aggregate limits apply? | `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=1600%`. | Ten 2500-MiB container limits total about 24.4 GiB, so 26 GiB avoids permanent reclaim at full declared capacity. The 28-GiB hard cap preserves aggregate headroom; the CPU quota reserves half the 32-thread host and is accepted only after job-duration telemetry remains healthy. |
-| Does this lower the live per-runner memory limit? | No; Jeff-Ubuntu already has `count=10`, `runner_floor_mb=2500`, and `limits.memory_mb=2500`. | The tracked Linux example still says 3000 MiB. Aligning it to the deployed 2500-MiB profile changes the fresh-machine default by 16.7%, so the release gate records job success and duration evidence and refuses to silently lower any live host that differs. |
+| What initial runner aggregate limits apply? | `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=2000%`. | Ten 2500-MiB container limits total about 24.4 GiB, so 26 GiB avoids permanent reclaim at full declared capacity. Ten 2-CPU container limits total 20 CPUs, so the aggregate quota preserves the declared fleet sum while reserving 12 of 32 logical CPUs for the host. |
+| Does this lower the live per-runner memory limit? | No; Jeff-Ubuntu already has `count=10`, `runner_floor_mb=2500`, and `limits.memory_mb=2500`. | The tracked Linux example still says 3000 MiB. Aligning it to the deployed 2500-MiB profile changes the fresh-machine default by 16.7%, so the release gate records job outcomes and refuses to silently lower any live host that differs. |
 | What initial agent aggregate limits apply? | `MemoryHigh=14G`, `MemoryMax=16G`, `MemorySwapMax=2G`, `TasksMax=8192`. | Current observed agent usage is about 11.8 GiB; the reclaim boundary preserves about 2.2 GiB activation margin and the hard cap prevents another 36.7 GiB single-agent event. |
 | What host hardware may use this fixed profile? | At least 60 GiB RAM and 32 logical CPUs. | The numeric budgets are sized for the current 62.8-GiB, 32-thread host; a smaller machine must fail closed until it has a reviewed profile. |
 | How is runner I/O contained portably? | `IOWeight=25` when the cgroup I/O controller is available; no guessed bandwidth cap. | Relative weight preserves interactive priority without hard-coding a device-specific throughput value. |
@@ -78,7 +78,7 @@ The host uses three workload aggregates with non-overlapping ownership:
 │   └── ezghaproof-oomd.slice
 ├── user.slice
 │   └── user-1000.slice
-│       └── user@1000.service
+│       └── user@UID.service
 │           ├── agents.slice      interactive coding agents and descendants
 │           ├── automation.slice  AO and factory daemons
 │           ├── app.slice         Warp and desktop applications
@@ -99,19 +99,21 @@ The host uses three workload aggregates with non-overlapping ownership:
 
 ### Backend topology
 
-Host Docker at `unix:///var/run/docker.sock` is an allowed production backend. It is not described as VM-contained. The installer passes its normalized endpoint into `install-service`, and the generated unit persists that explicit endpoint; an absent value means the canonical host socket. The generated Linux service has no unconditional `lima-vm@colima.service` dependency, and endpoint-aware backend recovery must never start Lima when the canonical host socket is selected or implied. An explicit Colima/Lima endpoint may use the existing bounded VM recovery path. An inactive legacy Lima unit may be disabled after the backend endpoint is proven; no VM disk is deleted.
+Host Docker at `unix:///var/run/docker.sock` is an allowed production backend. It is not described as VM-contained. One endpoint-aware `BackendTopology` classifier combines the normalized configured endpoint with Docker daemon metadata: an absent or canonical host socket plus a same-kernel Linux daemon is `HostDocker`; a recognized explicit Colima/Lima socket plus VM daemon metadata is `VmDocker`; contradictory metadata, remote endpoints, and unknown sockets are `Unsupported` and fail closed. `Platform.daemon_in_vm` is only one metadata input and is never the classifier by itself. The installer passes the normalized endpoint into `install-service`, and the generated unit persists that explicit endpoint; an absent value means the canonical host socket. The generated Linux service has no unconditional `lima-vm@colima.service` dependency, and backend recovery must never start Lima for `HostDocker`. `VmDocker` may use the existing bounded VM recovery path. An inactive legacy Lima unit may be disabled after the backend endpoint is proven; no VM disk is deleted.
 
-The service may start only after the containment preflight establishes all of the following:
+For the `HostDocker` branch, the service may start only after the containment preflight establishes all of the following; `VmDocker` reports this host profile as not applicable and proceeds only through its separate VM gate:
 
 1. The configured endpoint is exactly the canonical host socket, not a Colima/Lima or remote endpoint.
 2. Docker reports cgroup v2 with the `systemd` cgroup driver.
 3. The configured cgroup parent is `actions.slice`.
 4. `/sys/fs/cgroup/actions.slice` exists under the system manager.
-5. Its memory, swap, CPU, and task limits are finite and no weaker than the declared profile.
+5. Its memory, swap, CPU, and task limits exactly match the declared fixed profile.
 6. `actions.slice` is enrolled for memory-pressure handling.
-7. `user@1000.service` is not actively monitored for memory pressure or swap and no ancestor is enrolled with `kill` for either policy.
+7. The deploy owner's `user@UID.service` is not actively monitored for memory pressure or swap and no ancestor is enrolled with `kill` for either policy.
 8. The tracked finite `agents.slice` is effective and no unlimited local override is active.
-9. The host has at least 60 GiB RAM and 32 logical CPUs; the fixed profile is rejected on a smaller machine instead of silently consuming its reserve.
+9. Neither the installed `ezgha.service.d/10-oomd-omit.conf` nor its effective `ManagedOOMPreference=omit`/`OOMScoreAdjust=-1000` remains.
+10. Unprivileged bounded `oomctl` queries work and list the intended workload roots, including effective user-manager `agents.slice` and `automation.slice` enrollment.
+11. The host has at least 60 GiB RAM and 32 logical CPUs; this fixed hardware profile is rejected on a smaller machine instead of silently consuming its reserve.
 
 Any failed invariant blocks new runner admission and emits a diagnostic naming the mismatched property. It does not restart Docker, Colima, the desktop, or the physical host.
 
@@ -123,13 +125,15 @@ Any failed invariant blocks new runner admission and emits a diagnostic naming t
 
 ### System policy artifacts
 
-`systemd/host/actions.slice` owns the host runner aggregate. A separate top-level `systemd/host/ezghaproof.slice` contains `ezghaproof-hardlimit.slice` and `ezghaproof-oomd.slice`, so a synthetic proof is never a descendant of the monitored production runner root. Fixed root-owned `ezgha-hard-limit-proof.service` and `ezgha-oomd-proof.service` units are the only proof launchers; they use a repository-owned allocator, have no Docker socket or credentials, and cannot accept an arbitrary command. The proof harness uses privileged `systemctl` only with those literal unit names and never permits `systemd-run` or a shell. `systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf` and `systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf` own the broad vendor-policy overrides. Existing `systemd/agents.slice` and `systemd/automation.slice` own user workload limits.
+`systemd/host/actions.slice` owns the host runner aggregate. A separate top-level `systemd/host/ezghaproof.slice` contains `ezghaproof-hardlimit.slice` and `ezghaproof-oomd.slice`, so a synthetic proof is never a descendant of the monitored production runner root. Fixed root-owned `ezgha-hard-limit-proof.service` and `ezgha-oomd-proof.service` units are the only proof launchers; they use a repository-owned Python-stdlib allocator, have no Docker socket or credentials, and cannot accept an arbitrary command. Hard-limit mode deliberately exceeds its child `MemoryMax`. Oomd mode allocates and continuously touches an anonymous working set above its child `MemoryHigh` but below `MemoryMax` for 75 seconds. Because systemd exposes pressure duration only as the global `DefaultMemoryPressureDurationSec`, the harness reads and records the effective merged oomd configuration, rejects a missing/unparseable duration or one above 45 seconds, and requires the child's exact `memory.pressure` `full avg10` value to stay at least 20% continuously for that duration before accepting a correctly named journal victim. Allocator exit without both the continuous measured interval and victim never passes. The proof harness uses privileged `systemctl` only with those literal unit names and never permits `systemd-run` or a shell. `systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf` and `systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf` own the broad vendor-policy overrides. Existing `systemd/agents.slice` and `systemd/automation.slice` own user workload limits.
 
 ### Installation
 
-`scripts/host/install-crash-containment.sh` installs and verifies system-scope artifacts with explicit privilege escalation. It supports a read-only `--check` mode and an applying `--install` mode. `install.sh` invokes the installer on systemd Linux hosts and fails rather than claiming success when the configured host-Docker fleet lacks the required system controls.
+`scripts/host/install-crash-containment.sh` installs and verifies system-scope artifacts with explicit privilege escalation. It supports a read-only capability/current-use `--preflight`, a read-only installed-state `--check`, and an applying `--install` mode. `install.sh` invokes the installer on systemd Linux hosts and fails rather than claiming success when the configured host-Docker fleet lacks the required system controls.
 
-Installation removes the known `agents.slice.d/99-local-unlimited.conf` drift file, disables and removes the obsolete `psi-oom-watcher` service/timer plus its installed stable script, and reloads the appropriate managers without restarting the desktop or physical host. Before lowering an active hard limit, it proves current use fits below the proposed `MemoryHigh` with a workload-specific activation margin: 1 GiB for actions, 1 GiB for agents, and 512 MiB for automation; otherwise it leaves the live policy unchanged and fails. The actions margin permits the declared ten-container maximum of about 24.4 GiB below `MemoryHigh=26G`. Rollback includes a second daemon reload and verification of the effective restored properties, not just restored files. It installs only persistent tracked units and never creates overriding `systemctl set-property` drop-ins. It never deletes VM data.
+Before any mutation, installation proves endpoint/daemon topology, Docker cgroup v2 with the `systemd` driver, hardware capacity, unprivileged `oomctl` access, required privilege, current runtime-cgroup usage, and a complete rollback snapshot. Unsupported hosts exit without changing the generated service or live limits. The supported portable target is a fresh systemd Ubuntu host meeting the declared 60-GiB/32-CPU profile; scaled profiles are a separate reviewed design, not an implicit fallback.
+
+Installation removes the known `agents.slice.d/99-local-unlimited.conf` drift file and the live `~/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, disables and removes the obsolete `psi-oom-watcher` service/timer plus its installed stable script, and reloads the appropriate managers without restarting the desktop or physical host. It verifies the exemption's unit configuration is gone before restart, then verifies the new MainPID's `/proc/<pid>/oom_score_adj` and effective properties after restart. Before lowering an active hard limit, it reads the actual system and user cgroup `memory.current` files and proves use fits below the proposed `MemoryHigh` with a workload-specific activation margin: 1 GiB for actions, 1 GiB for agents, and 512 MiB for automation; otherwise it leaves the live policy unchanged and fails. The actions margin permits the declared ten-container maximum of about 24.4 GiB below `MemoryHigh=26G`. The transaction snapshots the live config, all replaced system/user policy, helper files, the generated `ezgha.service`, and its prior active/enabled state. It atomically installs a mode-`0600` proposed config only after preflight. Any config, containment, assertion, service regeneration, restart, or post-start verification failure restores every snapshot, reloads both managers, restarts the prior unit only if it was previously active, and verifies the effective restored state before returning failure. It installs only persistent tracked units and never creates overriding `systemctl set-property` drop-ins. It never deletes VM data.
 
 ### Startup preflight
 
@@ -139,14 +143,14 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 ### Verification
 
-`docs/verify-exit-criteria.sh` verifies effective values rather than file presence. Host-Docker and Colima gates are mutually exclusive: the host path checks the system `actions.slice`, the `systemd` Docker cgroup driver, actual cgroup ancestry for every managed container, user workload caps, the `user@` OOM policy and ancestors, and the absence of unlimited/runtime overrides. It does not include an inactive Lima slice in host-Docker budget arithmetic or require a live guest. `doctor-runner` reports the same topology without mutating it.
+`docs/verify-exit-criteria.sh` verifies effective values rather than file presence. Host-Docker and Colima gates are mutually exclusive: the host path checks the system `actions.slice`, the `systemd` Docker cgroup driver, actual cgroup ancestry for every managed container, user workload caps, the `user@` OOM policy and ancestors, effective `oomctl` roots, and the absence of unlimited/runtime overrides and `ezgha.service` OOM exemptions. It does not include an inactive Lima slice in host-Docker budget arithmetic or require a live guest. `doctor-runner` reports the same topology without mutating it.
 
 ## Data Flow
 
-1. `install.sh` detects Linux systemd and the effective Docker endpoint, completes image acquisition/recovery, and then enters the containment transaction.
-2. The host containment installer copies tracked units and the root-owned proof allocator to their system and user destinations, atomically retires the old watcher/exemption stack, reloads managers, and checks effective properties.
-3. `ezgha install-service` regenerates the active user unit with the exact binary, config, startup gate, and normalized endpoint; the startup wrapper runs the read-only preflight and then replaces itself with `ezgha serve`.
-4. Host-Docker memory budgeting ignores VM-only guest-reserve fields and delegates the aggregate ceiling to system `actions.slice`; VM Docker retains the existing guest reserve and VM envelope.
+1. `install.sh` detects Linux systemd and the effective Docker endpoint, completes image acquisition/recovery, then runs the immutable topology/capability/current-usage preflight and captures rollback state before any mutation.
+2. The host containment installer copies tracked units and the root-owned proof allocator to their system and user destinations, atomically retires the old watcher and both source/live exemption state, reloads managers, and checks effective properties including `oomctl` roots.
+3. Only after containment is effective, `ezgha install-service` regenerates the active user unit with the exact binary, config, startup gate, and normalized endpoint. The startup wrapper runs the read-only preflight and then replaces itself with `ezgha serve`; any failure restores the prior unit and active state together with the containment transaction.
+4. The endpoint-aware topology enum controls budgeting: `HostDocker` ignores VM-only guest-reserve fields and delegates the aggregate ceiling to system `actions.slice`; `VmDocker` retains the existing guest reserve and VM envelope; `Unsupported` starts neither path.
 5. `ezgha` creates each runner with `--cgroup-parent=actions.slice` plus per-container memory, CPU, PID, swap, and security limits.
 6. The system manager accounts every runner beneath the finite aggregate.
 7. Under ordinary pressure, `MemoryHigh` throttles and reclaims workload memory.
@@ -158,7 +162,7 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 - The 12.8-GiB remainder is not reserved memory. Docker, the kernel, desktop applications, and other system services remain outside the three hard caps and can still trigger global kernel OOM.
 - Independent oomd monitoring roots do not provide a global runner-before-agent order. Each root selects only among its own eligible descendants.
 - `MemorySwapMax=0` avoids runner swap thrash but reduces the time available for PSI-based oomd action during an abrupt allocation burst; `MemoryMax` is the final boundary.
-- `CPUQuota=1600%` preserves half this 32-thread host but can change job latency. The deployment gate includes real job-outcome and duration evidence.
+- `CPUQuota=2000%` equals the ten configured 2-CPU container maxima and reserves 12 of 32 logical CPUs for the host; the capacity proof still checks real ten-job execution.
 - Portable block-device bandwidth caps require a measured device baseline. `IOWeight=25` gives runner I/O lower relative priority where the controller is available; the verifier reports unavailable controllers rather than asserting protection.
 
 ## Failure Handling
@@ -173,7 +177,8 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 | Agent aggregate exceeds its envelope | Pressure handling remains within `agents.slice`; desktop survival is a live integration result, not a static guarantee. |
 | `systemd-oomd` inactive | Hard cgroup limits still contain workloads; verifier reports degraded defense in depth. |
 | Host Docker selected while Lima unit is enabled | Verification fails with topology drift; installation may disable an already inactive Lima unit but never stops a live VM automatically. |
-| System privilege unavailable during install | Installation fails with the exact unapplied paths; it does not deploy a falsely green user-only approximation. |
+| System privilege, topology, driver, hardware, or `oomctl` preflight unavailable | Installation fails before mutation with the exact unmet prerequisite; it does not deploy a falsely green user-only approximation or restart the fleet. |
+| Post-mutation verification or gated restart fails | Restore system/user policy, helper files, the previous generated service, and its prior active state; verify the rollback before returning failure. |
 | Pressure proof harms the desktop or host | Test fails immediately and blocks deployment; no threshold is accepted from synthetic unit tests alone. |
 
 ## Testing Strategy
@@ -182,7 +187,7 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 - Validate systemd unit syntax with `systemd-analyze verify`.
 - Test the installer in a temporary root with stubbed `systemctl`, `sudo`, Docker endpoint, and cgroup files.
-- Cover host Docker, VM Docker, missing slice, infinite limit, wrong cgroup parent, vendor user OOM policy still active, and unlimited agent override.
+- Cover host Docker, VM Docker, contradictory endpoint/daemon metadata, missing slice, infinite limit, wrong cgroup parent, inaccessible `oomctl`, vendor user OOM policy still active, unlimited agent override, and a live `ezgha.service` OOM exemption.
 - Verify generated service/drop-in installation and removal behavior without touching the live fleet.
 - Verify README, `CLAUDE.md`, and `AGENTS.md` contain one canonical semantic rule plus pointers rather than duplicated policy bodies.
 
@@ -190,7 +195,7 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 - Run Rust tests and focused shell tests.
 - Run the containment assertion against the live host before restarting `ezgha`.
-- After deployment, dispatch `capacity-proof.yml` with the exclusive `ezgha-linux-primary` role selector and prove ten managed containers simultaneously run `Runner.Worker` under `actions.slice`; idle slot presence or a workflow scheduled to a different fleet is not capacity proof.
+- After deployment, dispatch `capacity-proof.yml` with the existing full Linux-primary label intersection `[self-hosted, self-hosted-mikey, ezgha, Linux, X64]` and prove ten managed containers simultaneously run `Runner.Worker` under `actions.slice`; idle slot presence or a workflow scheduled to a different fleet is not capacity proof.
 - Record actual cgroup paths and `memory.oom.group` for all managed containers.
 - Run separately labeled checks: a bounded `ezghaproof-hardlimit.slice` `MemoryMax` test, an isolated `ezghaproof-oomd.slice` `systemd-oomd` PSI/victim-selection test, an exact-run-ID ten-worker execution proof using direct `docker top`, and a host/desktop survival observation. None substitutes for another. Both synthetic tests use only fixed tracked system services and verify production runner scopes are outside the proof subtree before allocation.
 - Record host and user-manager boot IDs/PIDs before and after live proofs. The desktop, Warp, user manager, Docker daemon, and unrelated runner slots must remain alive.
@@ -200,14 +205,14 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 1. Host Docker is explicitly reported and accepted as the Linux production backend.
 2. Ten Linux runners remain configured; every live runner container is under system `/actions.slice`.
-3. Docker uses cgroup v2 with the `systemd` driver; effective runner aggregate limits are `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=1600%`, and `IOWeight=25` where the I/O controller is available.
+3. Docker uses cgroup v2 with the `systemd` driver; effective runner aggregate limits are `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=2000%`, and `IOWeight=25` where the I/O controller is available.
 4. Effective agent aggregate limits are `MemoryHigh=14G`, `MemoryMax=16G`, `MemorySwapMax=2G`, and `TasksMax=8192`; no unlimited override remains.
 5. Effective automation aggregate limits remain `MemoryHigh=4G`, `MemoryMax=6G`, `MemorySwapMax=1G`, and `TasksMax=4096`.
 6. Gate 8 proves the finite host aggregate is exactly `28G + 16G + 6G = 50G`, requires at least 60 GiB physical RAM, reports the remainder, and excludes inactive Lima capacity from host-Docker arithmetic.
-7. Workload aggregates are enrolled for memory-pressure handling at 50%; `-.slice` and `user@1000.service` report both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`, no ancestor enrolls the desktop indirectly, and `oomctl` lists only intended workload roots plus the empty proof root when a proof is active.
+7. Workload aggregates are enrolled for memory-pressure handling at 50%; `-.slice` and the deploy owner's `user@UID.service` report both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`, no ancestor enrolls the desktop indirectly, unprivileged `oomctl` lists the intended system and user workload roots plus the empty proof root when a proof is active, and `ezgha.service` has neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`.
 8. `ezgha.service` refuses startup on a proven host-Docker containment violation and can recover from a transient Docker query failure without exhausting its start limit.
-9. Separate executable evidence proves child hard-limit containment, isolated oomd descendant selection, ten simultaneous `Runner.Worker` processes tied to one successful capacity workflow run selected by the exclusive `ezgha-linux-primary` role label, and host/desktop survival; claims are limited to the proof that produced them.
-10. Host-Docker runtime and doctor paths ignore VM-only `vm_total_mb` and guest-reserve arithmetic, while explicit VM topology preserves those checks.
+9. Separate executable evidence proves child hard-limit containment, isolated oomd descendant selection, ten simultaneous `Runner.Worker` processes tied by in-container run markers to one successful capacity workflow run selected by the full Linux-primary label intersection, and host/desktop survival; claims are limited to the proof that produced them.
+10. The shared endpoint-aware topology classifier makes Host-Docker runtime and doctor paths ignore VM-only `vm_total_mb` and guest-reserve arithmetic, preserves those checks for explicit VM topology, and rejects contradictory/unknown topology.
 11. No new watchdog, host restart authority, VM fallback, or runner-count reduction is introduced.
 12. All controls, installation steps, verification logic, and the crash-containment tenet are git-tracked and reproducible on a fresh Ubuntu host.
 
