@@ -21,6 +21,7 @@
 - `actions.slice` is exactly `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=2000%`, and `IOWeight=25`.
 - `agents.slice` is exactly `MemoryHigh=18G`, `MemoryMax=20G`, `MemorySwapMax=2G`, and `TasksMax=8192`.
 - The agent limit is justified by fresh 8.10-GiB current and 17.14-GiB historical-peak evidence; activation requires current use below 18G before applying it.
+- On the measured 32-CPU host, actions `CPUQuota=2000%` equals the ten per-container CPU sums and `TasksMax=6000` exceeds their 5120-PID sum; these are aggregate drift/overhead bounds, not newly tighter per-job limits.
 - `automation.slice` is exactly `MemoryHigh=4G`, `MemoryMax=6G`, `MemorySwapMax=1G`, and `TasksMax=4096`.
 - All three workload slices set `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`.
 - System `-.slice`, `user.slice`, `user-.slice`, `user@.service` and user-manager `app.slice`, `session.slice` set both managed-OOM policies to `auto`.
@@ -72,6 +73,11 @@
 - Delete `config/config.toml.linux-canary.example`; configure canary dispatch in the main Linux example instead.
 - Modify `tests/install_uninstall_aux_units_test.sh` and focused installer/doctor/exit-gate tests.
 
+**Task 6: deterministic organic outcome window**
+
+- Create `scripts/host/runner-outcome-window.py`.
+- Create `tests/runner_outcome_window_test.py`.
+
 ## Parallel Execution Map
 
 After this plan and spec have an approved exact SHA:
@@ -80,7 +86,8 @@ After this plan and spec have an approved exact SHA:
 - Lane B owns Task 2 only.
 - Lane C owns Task 3 only.
 - The primary agent owns Task 5 while A-C run.
-- Task 4 starts after Task 1 and Task 3 interfaces are merged because it consumes their exact paths and assertion contract.
+- Task 6 starts in the first free lane because it owns two isolated new files.
+- Task 4 starts after Task 1 and Task 3 interfaces are merged because it consumes their exact paths and assertion contract; it has no GitHub evidence dependency.
 - Integration, live activation, and production verification are serialized under the primary deploy owner.
 
 Each writer uses an isolated worktree pinned to the approved SHA. No worker may run `cargo install`, restart `ezgha.service`, invoke the live exit gate, modify the Docker daemon, or deploy host files. The primary agent integrates commits in dependency order and is the only live deploy owner.
@@ -366,6 +373,8 @@ Test command order and final state for:
 clean success
 zero-container bootstrap success
 zero-container bootstrap with absent actions.slice
+bootstrap contained image build after actions commit point
+migration preserves existing image without rebuild
 non-Linux invocation
 root invocation
 missing exact sudo authorization
@@ -417,9 +426,11 @@ Reload the system manager. In bootstrap invoke the pre-authorized exact `sudo -n
 
 Reload the user manager, apply and verify agent, automation, and all six oomd boundary properties. In migration mode invoke Task 3 with `--require-fleet` while maintenance intent and `serve.lock` remain held and require the same ten IDs. In bootstrap mode invoke it without the fleet requirement and require zero managed containers.
 
+For bootstrap only, after the full policy assertion succeeds, use the single canonical Docker factory/argv to run the existing local image build with `--cgroup-parent actions.slice`, the tracked `Dockerfile.runner`, fixed tag `ezgha-runner:latest`, and no caller-selected context or flags. Verify the local image before releasing maintenance. Migration requires the existing image ID and never rebuilds while jobs may be active.
+
 - [ ] **Step 7: Release maintenance and restart only after proof**
 
-After the policy assertion passes, remove the maintenance intent, release `serve.lock`, and start `ezgha.service`. Require service readiness within 210 seconds. Migration repeats Task 3 `--require-fleet` against the same ten IDs; bootstrap requires ten contained containers within 600 seconds.
+After the policy and required image assertions pass, remove the maintenance intent, release `serve.lock`, and start `ezgha.service`. Require service readiness within 210 seconds. Migration repeats Task 3 `--require-fleet` against the same ten IDs; bootstrap requires ten contained containers within 600 seconds.
 
 - [ ] **Step 8: Implement explicit recovery states**
 
@@ -427,7 +438,7 @@ Before mutation, exit without live effect. Snapshot failure leaves the service r
 
 - [ ] **Step 9: Assert forbidden operations never occur**
 
-Fixture tests reject `docker stop`, `docker pause`, `docker rm`, `docker run`, deregistration of a container-backed runner, `limactl`, `colima`, Docker restart, reboot/shutdown, Mac paths, launchctl, and caller-selected systemd destinations. They prove root invocation fails before mutation, absent-slice bootstrap starts and verifies the slice before any runner creation, a denied exact sudo authorization or failed user-manager probe causes zero intent/service mutation, the system-scope-only exemption path is insufficient, every `systemctl --user`/config/lock operation retains the validated deploy UID/home/bus, watcher disable/stop precedes file removal, no watcher enablement symlink or active unit survives, the user service has no effective omit/-1000 values, and only the pre-authorized identical system argv cross `sudo -n`.
+Fixture tests reject `docker stop`, `docker pause`, `docker rm`, `docker run`, deregistration of a container-backed runner, `limactl`, `colima`, Docker restart, reboot/shutdown, Mac paths, launchctl, and caller-selected systemd destinations. They prove root invocation fails before mutation, absent-slice bootstrap starts and verifies the slice before the exact contained image build or runner creation, migration performs no image build, a denied exact sudo authorization or failed user-manager probe causes zero intent/service mutation, the system-scope-only exemption path is insufficient, every `systemctl --user`/config/lock operation retains the validated deploy UID/home/bus, watcher disable/stop precedes file removal, no watcher enablement symlink or active unit survives, the user service has no effective omit/-1000 values, and only the pre-authorized identical system argv cross `sudo -n`.
 
 - [ ] **Step 10: Run focused checks**
 
@@ -462,7 +473,7 @@ git commit -m "feat: activate host containment atomically [codex/gpt-5.6-sol]"
 
 Add tests proving a single containment mismatch makes both `doctor-runner` and the exit gate bad, while a passing stub preserves existing fleet verdict behavior. Assert containment admission failure invokes the existing high-severity alert/journal path. Assert docs and example config say Linux count 10, HostDocker, `actions.slice`, and fixed profile.
 
-Add installer tests proving the compatible Linux HostDocker path does not call `limactl`, install `systemd/guest/actions.slice`, or install/enable the PSI watcher; it stages the binary/config/service inactive and `exec`s the fixed Task 4 entrypoint. Mac and explicit VM install fixtures retain their existing behavior.
+Add installer tests proving compatible Linux branches before the first existing Docker context discovery, `DOCKER_HOST_OVERRIDE` export, `docker version`, or image build. It rejects nonempty selectors, performs no Docker command itself, does not call `limactl`, install `systemd/guest/actions.slice`, or install/enable the PSI watcher, stages the binary/config/service inactive, and `exec`s the fixed Task 4 entrypoint. Task 4 owns the post-policy bootstrap image build. Mac and explicit VM install fixtures retain their existing behavior.
 
 Add config/docs tests proving `config/config.toml.linux-canary.example` is gone, `config/README.md` contains no separate `systemd-run ... serve` instructions, the main Linux example includes the canary repo/workflow dispatch settings and main fleet labels, and Gate 4 defaults to that main config. A `canary-once` fixture must dispatch without Docker while `serve` on a one-runner verifier config fails before Docker.
 
@@ -501,7 +512,74 @@ git commit -m "docs: make host containment a fleet invariant [codex/gpt-5.6-sol]
 
 ---
 
-### Task 6: Integrate, Prove, Deploy, And Record
+### Task 6: Add A Fixed 24-Hour Outcome Window
+
+**Files:**
+
+- Create `scripts/host/runner-outcome-window.py`.
+- Create `tests/runner_outcome_window_test.py`.
+
+**Interfaces:**
+
+- Baseline mode is invoked by Task 7 immediately after activation and the live containment proof; it never extends the maintenance interval or controls the service.
+- Baseline captures local boot/cgroup/journal anchors before its first network request, fixes that instant as `T`, and covers `[T-24h,T)`; post covers `[T,T+24h)`.
+- Both modes are read-only with respect to runners, services, Docker, systemd, and GitHub.
+
+- [ ] **Step 1: Write failing fixture tests**
+
+Use only recorded GitHub membership/org-metadata/repository, Actions API/job-log, journal, cgroup, and boot-ID fixtures. Test complete multi-page org-repository/run/job collection, inactive or non-owner membership, public/private repository-count mismatch, an inaccessible repository, an incomplete or repeated page, API/rate failure, exact half-open time boundaries, a missing failed-job log, the versioned exact GitHub runner-lost diagnostic template, similar unmatched text, `memory.events` deltas and resets, an `actions.slice` kernel OOM record, boot-ID change, unavailable journal cursor/range, stable source hashing, deterministic sorted JSON, and post execution before `T+24h`.
+
+Assert `INCONCLUSIVE` and a nonzero exit for incomplete evidence. Assert the command inventory contains no GitHub mutation, Docker, `systemctl`, service, or runner command.
+
+- [ ] **Step 2: Confirm the tests fail before implementation**
+
+```bash
+python3 -m pytest -q tests/runner_outcome_window_test.py
+```
+
+- [ ] **Step 3: Implement the fixed baseline command**
+
+The integration owner supplies the fixed config, org, and output path immediately after live proof; the tool fixes `T` from its first local observation:
+
+```bash
+python3 scripts/host/runner-outcome-window.py baseline \
+  --config "$HOME/.config/ezgha/config.toml" \
+  --org jleechanorg \
+  --output "$HOME/.local/state/ezgha/release1-outcome-baseline.json"
+```
+
+Require the config to declare `scope = "org"`, target `jleechanorg`, and the fixed runner prefix. Require active org-owner membership and prove the visible public/private repository counts equal the authenticated org metadata before treating coverage as complete. Completely paginate that inventory, then every Actions run and job page needed for `[T-24h,T)`; select jobs whose assigned runner name has the exact config prefix. Archive and hash the log for every non-success conclusion, and record repository/workflow/run/job IDs, timestamps, runner name, conclusion, source-page IDs, boot ID, a journal cursor at `T`, and `actions.slice/memory.events`. Reject incomplete org visibility, inaccessible Actions metadata, duplicate/missing pages, pagination ambiguity, rate exhaustion, or a missing required log. The output is canonical sorted JSON written atomically. This is a complete credential-verified org-fleet observation, not a single-repository sample.
+
+- [ ] **Step 4: Implement the fixed post comparison**
+
+```bash
+python3 scripts/host/runner-outcome-window.py post \
+  --baseline "$HOME/.local/state/ezgha/release1-outcome-baseline.json" \
+  --output "$HOME/.local/state/ezgha/release1-outcome-post.json"
+```
+
+Refuse before `T+24h`. Re-prove org-owner inventory completeness, re-enumerate the complete org repository inventory, reject repository-set coverage drift that cannot be completely queried, and collect the matching `[T,T+24h)` population and exact log evidence. Classify runner loss only from versioned, exact normalized GitHub Actions diagnostic templates such as the service-generated `The self-hosted runner: <name> lost communication with the server.` record; similar free text remains unclassified. Classify infrastructure OOM only when `actions.slice` `oom` or `oom_kill` increases, or when a structured kernel OOM record in the complete journal interval from `T` through `T+24h` names the `actions.slice` cgroup. This is protocol-signature parsing, not general failure-policy inference.
+
+Return a failing verdict when the post window contains any infrastructure OOM, a runner-lost count above the baseline, or a new exact runner-lost signature. Return `INCONCLUSIVE` and nonzero on boot change, counter reset, incomplete API/log/journal coverage, or unknown rule/schema version. Report every other non-success conclusion without assigning fleet causation. Emit canonical JSON with the baseline hash, rule/schema versions, source IDs and hashes, class counts, comparison, and verdict.
+
+- [ ] **Step 5: Run focused checks**
+
+```bash
+python3 -m pytest -q tests/runner_outcome_window_test.py
+python3 -m py_compile scripts/host/runner-outcome-window.py
+git diff --check
+```
+
+- [ ] **Step 6: Commit the isolated unit**
+
+```bash
+git add scripts/host/runner-outcome-window.py tests/runner_outcome_window_test.py
+git commit -m "feat: record deterministic runner outcomes [codex/gpt-5.6-sol]"
+```
+
+---
+
+### Task 7: Integrate, Prove, Deploy, And Record
 
 **Files:** all Release 1 files after isolated commits are integrated.
 
@@ -509,7 +587,7 @@ git commit -m "docs: make host containment a fleet invariant [codex/gpt-5.6-sol]
 
 - [ ] **Step 1: Integrate in dependency order**
 
-Cherry-pick Task 1, Task 2, Task 3, Task 5, then Task 4. Resolve only task-owned conflicts; preserve unrelated `.playwright-mcp/` and user changes.
+Cherry-pick Task 1, Task 2, Task 3, Task 5, Task 6, then Task 4. Resolve only task-owned conflicts; preserve unrelated `.playwright-mcp/` and user changes.
 
 - [ ] **Step 2: Run the complete local quality gate**
 
@@ -525,6 +603,7 @@ bash tests/host_control_artifacts_test.sh
 bash tests/install_uninstall_aux_units_test.sh
 bash tests/doctor_runner_host_pressure_test.sh
 bash tests/verify_exit_gate8_test.sh
+python3 -m pytest -q tests/runner_outcome_window_test.py
 git diff --check
 ```
 
@@ -544,7 +623,7 @@ git push origin HEAD:docs/nextsteps-2026-08-30-fleet-churn
 
 - [ ] **Step 5: Repeat the live read-only preflight**
 
-Record Docker version, `CgroupDriver=systemd`, `CgroupVersion=2`, exact `unix:///var/run/docker.sock` resolution, CPU/RAM, current ten container IDs, PID ancestry, exact current system/user slice values, `actions.slice/memory.current`, free memory/swap/disk, and PSI. Abort activation on any fixed threshold or profile mismatch.
+Record Docker version, `CgroupDriver=systemd`, `CgroupVersion=2`, exact `unix:///var/run/docker.sock` resolution, 32-CPU/RAM facts, current ten container IDs, PID ancestry, exact current system/user slice values, `actions.slice/memory.current`, free memory/swap/disk, and PSI. Abort activation on any fixed threshold or profile mismatch.
 
 - [ ] **Step 6: Run the tracked activation entrypoint**
 
@@ -563,9 +642,19 @@ Run it as the deploy user, never through top-level `sudo`. Do not run ad hoc `sy
 
 Require the same ten local Linux container IDs and ten actual PIDs under `/actions.slice`. Confirm no runner container was stopped or recreated and the desktop session and operator terminal remained alive. Run the repo exit gate only after this proof.
 
+Immediately after live proof, run Task 6 baseline mode with its fixed config, org, and output path. It captures `T` before its first network call. Preserve the canonical baseline JSON with deployment evidence. A failed or inconclusive baseline does not stop, restart, or roll back the contained fleet; it keeps the deployment issue open and blocks Release 1 closure.
+
 - [ ] **Step 8: Record durable evidence and follow-up**
 
-Update the existing Bead/GitHub issue with exact commit, deployment time, assertion output, ten PID cgroups, slice values, and any failed state. Create separate Release 2 beads for deferred broker/image/attestation work without blocking Release 1 closure.
+Keep the deployment issue open through the following 24 hours, then run the fixed post command:
+
+```bash
+python3 scripts/host/runner-outcome-window.py post \
+  --baseline "$HOME/.local/state/ezgha/release1-outcome-baseline.json" \
+  --output "$HOME/.local/state/ezgha/release1-outcome-post.json"
+```
+
+Require its passing verdict; any new runner-lost signature/count or infrastructure OOM is a Release 1 failure even if `doctor-runner` reports healthy containers. Update the existing Bead/GitHub issue with exact commit, deployment time, assertion output, ten PID cgroups, slice values, both canonical JSON artifacts, and any failed or inconclusive state. Close the deployment Bead/issue only after a passing verdict; failure or `INCONCLUSIVE` keeps it open. Create separate Release 2 beads for deferred broker/image/attestation work without blocking the contained fleet.
 
 - [ ] **Step 9: Push the final evidence unit**
 

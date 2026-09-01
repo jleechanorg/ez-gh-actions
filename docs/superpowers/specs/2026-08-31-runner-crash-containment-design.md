@@ -62,6 +62,8 @@ Release 1 aligns the Linux example to the active 2500-MiB-per-runner config and 
 
 The agent cap is intentionally higher than the old tracked 10G/12G unit because the measured 17.14-GiB peak would violate that old hard limit. `MemoryHigh=18G` sits about 0.86 GiB above the recorded peak and `MemoryMax=20G` about 2.86 GiB above it, while still preventing the prior 36.7-GiB agent event. Activation also requires current agent use below 18G and automation use below 4G before lowering limits.
 
+On the measured 32-logical-CPU host, the actions quota of 2000% equals the ten existing 2-CPU container quotas, and `TasksMax=6000` is above their 5120-PID sum. Those aggregate values are defense against drift and aggregate overhead, not new CPU/task headroom below the already-declared per-container sum. Likewise, 28G exceeds the 24.41-GiB declared memory sum. The immediate crash-path change is the effective finite hierarchy, zero aggregate runner swap, finite agent/automation roots, and removal of broad oomd/watcher victim selection; the design does not credit the actions CPU/task numbers as a newly tighter per-job limit.
+
 All three production workload slices set both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`. Six tracked boundary drop-ins do the same for:
 
 - system `-.slice`
@@ -118,6 +120,7 @@ Release 1 owns this bounded set:
 - `tests/host_crash_containment_release1_artifacts_test.sh`
 - `tests/assert_host_containment_release1_test.sh`
 - `tests/apply_host_containment_release1_test.sh`
+- `scripts/host/runner-outcome-window.py` and `tests/runner_outcome_window_test.py`
 - concise policy/docs and live verifier integration
 
 Release 1 deletes the tracked runner OOM exemption and removes the `AGENT_SLICE_OPT_OUT` bypass for future supported CLI launches. It does not move or kill an existing interactive agent session during installation.
@@ -130,10 +133,10 @@ Release 1 deletes the tracked runner OOM exemption and removes the `AGENT_SLICE_
 2. Acquire the fixed activation lock and atomically publish a maintenance intent containing PID and boot ID. Every `start`, `serve`, and `stop` path rejects a live intent both before and after acquiring the existing `serve.lock`; stale intent is rejected for operator recovery rather than silently removed.
 3. Snapshot every replaced/removed file and prior manager state before stopping the reconciler. In migration mode stop `ezgha.service`, then acquire and retain `serve.lock` for the remaining policy mutation. In bootstrap mode require it already inactive and acquire the lock. Do not stop, remove, pause, recreate, or deregister any runner container; migration jobs continue inside Docker. Existing graceful service shutdown may remove only registrations already proven to have no local container, which does not affect the ten snapshotted containers or their jobs.
 4. Install the fixed tracked units/drop-ins and leave the already-exact active config unchanged. Run `systemctl --user disable --now psi-oom-watcher.timer`, then `systemctl --user stop psi-oom-watcher.service`, before removing the installed watcher unit/script files; any failure retains maintenance intent and prevents service restart. Also remove `<deploy-home>/.config/systemd/user/agents.slice.d/99-local-unlimited.conf` and `<deploy-home>/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf`, then reload both managers. In bootstrap, run the enumerated `sudo -n systemctl start actions.slice` after the unit is installed; in migration it is already active. Apply the exact `actions.slice` properties and verify the live cgroup before any runner admission or later step. The user-manager assertion requires `ezgha.service` to report neither `ManagedOOMPreference=omit` nor `OOMScoreAdjust=-1000`, and requires the PSI watcher absent/inactive/disabled.
-5. Apply and verify the other slice and oomd properties. Run the read-only assertion with its ten-container check while `serve.lock` and maintenance intent still exclude runner mutations.
-6. Remove the maintenance intent and release `serve.lock` only after the policy assertion passes. Start `ezgha.service` and require readiness within 210 seconds. Migration mode repeats the assertion against the same ten container IDs; bootstrap mode requires exactly ten newly admitted contained containers within 600 seconds.
+5. Apply and verify the other slice and oomd properties. While `serve.lock` and maintenance intent still exclude runner mutations, migration runs the read-only assertion with its ten-container check and bootstrap runs its default zero-fleet assertion. In bootstrap only, build the unchanged tracked `ezgha-runner:latest` using the canonical socket and exact `docker build --cgroup-parent actions.slice` after the finite actions boundary is effective; migration requires the existing local image and does not rebuild it. Verify the resulting local image before admission.
+6. Remove the maintenance intent and release `serve.lock` only after the policy and image assertions pass. Start `ezgha.service` and require readiness within 210 seconds. Migration mode repeats the assertion against the same ten container IDs; bootstrap mode requires exactly ten newly admitted contained containers within 600 seconds.
 
-The reconciler interruption is bounded by its existing 30-second systemd stop timeout plus 210 seconds for service readiness. Runner jobs are not interrupted by this sequence.
+In migration, reconciler interruption is bounded by its existing 30-second systemd stop timeout plus 210 seconds for service readiness. Bootstrap has no prior reconciler to interrupt and uses the separate 600-second ten-runner convergence deadline. Runner jobs are not interrupted by this sequence.
 
 ## Failure And Recovery
 
@@ -161,6 +164,9 @@ The read-only assertion and exit gate require:
 - every managed PID is actually beneath `/actions.slice`.
 - `doctor-runner` remains read-only and reports a failing containment verdict on any mismatch.
 - containment admission failure emits the existing high-severity alert/journal path as well as the failing doctor verdict; fail-closed capacity loss is not silent.
+- immediately after activation and live containment proof, deployment records the preceding 24-hour organic job outcome baseline and the following 24-hour outcomes; a new exact runner-lost signature/count or any infrastructure OOM keeps the release open even when containers remain healthy. Evidence collection never stops, restarts, or rolls back the contained fleet.
+
+`runner-outcome-window.py` makes that evidence executable. Immediately after live proof, baseline mode captures local boot/cgroup/journal anchors before its first network request, validates the fixed org-scoped active config, requires active org-owner membership, proves visible public/private repository counts match authenticated org metadata, and completely paginates every org repository and its relevant Actions runs/jobs. It records the resulting timestamp, the complete preceding 24-hour job population assigned to `ez-runner-c-*`, exact failed-job log archives, boot ID, `actions.slice/memory.events` counters, and journal cursor. Post mode refuses to run before that timestamp plus 24 hours, re-proves complete org visibility, captures the matching post window, and fails closed on inaccessible metadata, repository-set/API truncation/rate failure, missing logs, reboot/counter reset, or an incomplete journal interval. Versioned exact GitHub runner diagnostic messages classify runner-loss; an `actions.slice` `oom`/`oom_kill` counter increase or actions-slice kernel OOM record classifies infrastructure OOM. Other job conclusions remain reported but causally unclassified. The command emits deterministic JSON with source IDs, hashes, counts, classification-rule version, and comparison verdict; it does not mutate runners or services. Evidence failure keeps the deployment issue open but never changes the running fleet.
 
 A bounded capacity proof may show ten simultaneous `Runner.Worker` processes, but Release 1 does not add a new workflow, image, attestation scheduler, or synthetic pressure allocator.
 
@@ -172,7 +178,7 @@ The following are valid hardening work but not Release 1 prerequisites:
 - deployment receipts, rollback state machine, and `SCM_RIGHTS` service-lock handoff
 - typed effect coordinator and closed executable-effect inventory
 - immutable two-platform image publisher and local image receipt
-- full attestation scheduler, 100-cycle calibration, synthetic pressure proofs, and job-outcome comparison
+- full attestation scheduler, 100-cycle calibration, and synthetic pressure proofs
 - queue/reaper architecture changes
 - automated Docker cgroup-driver remediation
 - Darwin candidate, image receipt, and six-runner Mac migration
@@ -191,5 +197,6 @@ Release 2 must treat an already-active Release 1 host policy as its starting sta
 8. Activation never starts a VM, restarts Docker, changes Mac state, stops/removes a runner container, cancels a busy job, or reduces runner count.
 9. Migration preserves all ten existing containers; fresh bootstrap converges from zero to ten within 600 seconds. Either failure remains contained and explicit.
 10. The implementation, activation, rollback, assertion, docs, and focused tests are git-tracked and reproducible on a compatible fresh Ubuntu host.
-11. `install.sh` delegates compatible Linux HostDocker installation to the same activation entrypoint, never installs the Colima-guest slice on that path, and never reinstalls the retired PSI watcher.
+11. Before its first Docker discovery/build/export, `install.sh` branches compatible Linux HostDocker installation to the same activation entrypoint; that path never installs the Colima-guest slice or retired PSI watcher and performs a fresh image build only after the finite actions boundary is verified.
 12. Fixed-profile startup/recovery performs no VM or backend lifecycle action, and canary proof dispatch uses the existing ten-runner fleet rather than a separate daemon.
+13. A complete 24-hour post-activation organic job-outcome report shows no new exact runner-lost signature/count and no infrastructure OOM relative to the preceding 24 hours; the deployment issue closes only on a passing verdict and remains open on failure or `INCONCLUSIVE`.
