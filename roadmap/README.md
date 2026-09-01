@@ -4,12 +4,15 @@ Rolling operational notes for the `ezgha` self-hosted runner daemon.
 
 ## Recent activity (by day)
 
+- [2026-09-01](activity/2026-09-01.md) — Release 1 planning closed; six sequential TDD beads and a hard execution ceiling now lead directly to implementation.
 - [2026-08-30](activity/2026-08-30.md) — watchdog authority removed; child-layer fleet churn remains under investigation.
 
 ## Current plan of record
 
 - [2026-08-30 child-layer fleet churn plan](nextsteps-2026-08-30-ezgha-fleet-churn-after-watchdog-removal.md)
 - [Ironclad 16/16 fleet resilience goal](goal-ironclad-2026-08-30-fleet-resilience.md)
+- [Release 1 crash-containment design](../docs/superpowers/specs/2026-08-31-runner-crash-containment-design.md)
+- [Release 1 implementation plan](../docs/superpowers/plans/2026-08-31-runner-crash-containment.md)
 
 ## Next-steps queue (full, prioritized — 2026-07-07 takeover)
 

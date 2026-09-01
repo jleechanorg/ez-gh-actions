@@ -19,6 +19,18 @@ merged and deployed revision.
 | 6 | Both installed binaries exactly match merged `origin/main`. | Compare `git rev-parse origin/main` with `ezgha --version` on Linux and Mac after deployment. | Remote merged SHA and installed executable metadata. | Terra reviewer checks the comparison independently. | FAIL |
 | 7 | The host survives bounded normal-production verification without any prohibited test. | Record Linux `/proc/sys/kernel/random/boot_id` and Mac `sysctl -n kern.boottime` before and after the observation window; audit the command log to confirm no pressure, panic, reboot, shutdown, watchdog, or host-restart test ran. | Physical-host boot identity across real workload time. | Sol primary plus Terra final review. | FAIL |
 
+## Release 1 execution contract — 2026-09-01
+
+This is the bounded implementation dependency for the broader 16/16 goal. It reuses parent bead `ez-gh-actions-sa8c`; it does not add a new program or expand Release 1.
+
+| # | Criterion | Executable check | External anchor | Independent verifier | Status |
+|---|---|---|---|---|---|
+| R1 | Tracked policy and a hermetic assertion prove finite `actions.slice`, `agents.slice`, and `automation.slice` values, neutral broad OOM roots, and absence of the legacy PSI watcher and runner OOM exemption. | `bash tests/host_crash_containment_release1_artifacts_test.sh && bash tests/assert_host_containment_release1_test.sh && systemd-analyze verify systemd/host/actions.slice` | Tracked systemd files and fixture-observed effective values. | One independent verifier reproduces the focused commands. | FAIL |
+| R2 | Fixed Linux HostDocker admission performs no slot, JIT, workspace, removal, or Docker mutation unless containment and the canonical endpoint pass; every created PID is below `/actions.slice`. | `cargo test host_containment -- --nocapture && cargo test configured_cgroup_parent_is_emitted_on_runner_start -- --nocapture` | Rust effect ledger and real `/proc/<pid>/cgroup` ancestry contract. | One independent verifier reviews the affected Rust surfaces and reruns focused tests. | FAIL |
+| R3 | `./install.sh` stages and invokes one canonical activation path that reaches exactly ten contained slot names/PIDs or leaves `ezgha.service` inactive without Docker/VM/host lifecycle recovery. | `bash tests/apply_host_containment_release1_test.sh && bash tests/install_watchdog_gate_test.sh && bash tests/install_uninstall_aux_units_test.sh` | Versioned bundle manifest, activation ledger, and service post-state. | One independent verifier reproduces fixtures; live activation remains primary-operator-only. | FAIL |
+
+**Process ceiling:** one RED/GREEN pair at a time, one integrated review after R1-R3 are green, expensive outcome evidence once and last. Every 30 minutes must produce an executable RED or GREEN result. After two gate cycles or three hours, stop with the exact failing command and blocker. Do not create new criteria, reviewers, architecture, or tracking artifacts while an owning RED is unresolved.
+
 ## Anti-gaming rules
 
 - A single transient 16/16 frame is insufficient.
