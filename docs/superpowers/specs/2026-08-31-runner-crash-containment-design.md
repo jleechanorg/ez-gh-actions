@@ -1,7 +1,7 @@
 # Runner Crash Containment Design
 
 **Date:** 2026-08-31
-**Status:** Revised after `/advice`; implementation not started
+**Status:** Revised after second `/advice` review; implementation not started
 **Primary goal:** Keep the physical Ubuntu host, desktop session, Warp, and operator tools responsive while ten Linux GitHub Actions runners execute concurrently.
 
 ## Problem Statement
@@ -72,6 +72,9 @@ The host uses three workload aggregates with non-overlapping ownership:
 -.slice
 ├── actions.slice                 system scope, Docker container scopes
 │   └── docker-*.scope            one ephemeral runner per scope
+├── ezghaproof.slice              system scope, synthetic proofs only
+│   ├── ezghaproof-hardlimit.slice
+│   └── ezghaproof-oomd.slice
 ├── user.slice
 │   └── user-1000.slice
 │       └── user@1000.service
@@ -87,7 +90,7 @@ The host uses three workload aggregates with non-overlapping ownership:
 ### OOM ownership
 
 - `actions.slice`, `agents.slice`, and `automation.slice` set `ManagedOOMMemoryPressure=kill` with an explicit 50% pressure limit.
-- A tracked system drop-in overrides Ubuntu's vendor `user@.service` default with `ManagedOOMMemoryPressure=auto`. This prevents the whole desktop user manager from being the monitored pressure root.
+- Tracked system drop-ins force both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto` on `-.slice` and Ubuntu's vendor `user@.service` default. This prevents either a broad root or the whole desktop user manager from becoming a pressure or swap monitoring root through vendor policy.
 - Hard `MemoryMax` limits remain the deterministic last boundary even if `systemd-oomd` is unavailable or slow.
 - No workload receives `OOMScoreAdjust=-1000`. Protected workload exemptions invert the intended kill order and are removed from the host-Docker topology.
 - Independent monitored roots have no global priority order. The contract is local: an `actions.slice` pressure action chooses an eligible runner descendant, while agent and automation pressure is handled inside their own roots.
@@ -105,7 +108,7 @@ The service may start only after the containment preflight establishes all of th
 4. `/sys/fs/cgroup/actions.slice` exists under the system manager.
 5. Its memory, swap, CPU, and task limits are finite and no weaker than the declared profile.
 6. `actions.slice` is enrolled for memory-pressure handling.
-7. `user@1000.service` is not actively monitored as a memory-pressure root and no ancestor is enrolled with `kill`.
+7. `user@1000.service` is not actively monitored for memory pressure or swap and no ancestor is enrolled with `kill` for either policy.
 8. The tracked finite `agents.slice` is effective and no unlimited local override is active.
 9. The host has at least 60 GiB RAM and 32 logical CPUs; the fixed profile is rejected on a smaller machine instead of silently consuming its reserve.
 
@@ -119,17 +122,17 @@ Any failed invariant blocks new runner admission and emits a diagnostic naming t
 
 ### System policy artifacts
 
-`systemd/host/actions.slice` owns the host runner aggregate. Two empty child slices, `actions-hardlimit.slice` and `actions-oomdproof.slice`, provide isolated live-test scopes without changing the production root. `systemd/host/user@.service.d/90-ezgha-crash-containment.conf` owns the Ubuntu vendor-policy override. Existing `systemd/agents.slice` and `systemd/automation.slice` own user workload limits.
+`systemd/host/actions.slice` owns the host runner aggregate. A separate top-level `systemd/host/ezghaproof.slice` contains `ezghaproof-hardlimit.slice` and `ezghaproof-oomd.slice`, so a synthetic proof is never a descendant of the monitored production runner root. Fixed root-owned `ezgha-hard-limit-proof.service` and `ezgha-oomd-proof.service` units are the only proof launchers; they use a repository-owned allocator, have no Docker socket or credentials, and cannot accept an arbitrary command. The proof harness uses privileged `systemctl` only with those literal unit names and never permits `systemd-run` or a shell. `systemd/host/-.slice.d/90-ezgha-oomd-boundary.conf` and `systemd/host/user@.service.d/90-ezgha-oomd-boundary.conf` own the broad vendor-policy overrides. Existing `systemd/agents.slice` and `systemd/automation.slice` own user workload limits.
 
 ### Installation
 
 `scripts/host/install-crash-containment.sh` installs and verifies system-scope artifacts with explicit privilege escalation. It supports a read-only `--check` mode and an applying `--install` mode. `install.sh` invokes the installer on systemd Linux hosts and fails rather than claiming success when the configured host-Docker fleet lacks the required system controls.
 
-Installation removes the known `agents.slice.d/99-local-unlimited.conf` drift file, disables the obsolete `psi-oom-watcher` remediation path, and reloads the appropriate managers without restarting the desktop or physical host. Before lowering an active hard limit, it proves current use plus a safety margin fits below the proposed `MemoryHigh`; otherwise it leaves the live policy unchanged and fails. It installs only persistent tracked units and never creates overriding `systemctl set-property` drop-ins. It never deletes VM data.
+Installation removes the known `agents.slice.d/99-local-unlimited.conf` drift file, disables the obsolete `psi-oom-watcher` remediation path, and reloads the appropriate managers without restarting the desktop or physical host. Before lowering an active hard limit, it proves current use plus a safety margin fits below the proposed `MemoryHigh`; otherwise it leaves the live policy unchanged and fails. Rollback includes a second daemon reload and verification of the effective restored properties, not just restored files. It installs only persistent tracked units and never creates overriding `systemctl set-property` drop-ins. It never deletes VM data.
 
 ### Startup preflight
 
-`scripts/host/assert-crash-containment.sh` is a read-only executable installed under `~/.local/libexec/ezgha/`. A tracked `ezgha.service` drop-in calls it through `ExecStartPre`. Backend classification uses the configured Docker endpoint plus daemon metadata, not kernel-version comparison alone. Host Docker requires the host profile above; VM Docker reports that this particular preflight is not applicable and leaves VM-specific verification to a mutually exclusive VM gate. The installed helper's digest must match the tracked source.
+`scripts/host/assert-crash-containment.sh` is a read-only executable installed under `~/.local/libexec/ezgha/`. A tracked startup wrapper becomes the `ezgha.service` main `ExecStart`: it runs the assertion, exits `78` for a proven policy violation, retries only exit `75` with capped backoff for at most 120 seconds, returns `75` when that deadline expires, and `exec`s the real `ezgha serve` process after success. `RestartPreventExitStatus=78` therefore applies to the main process, while the existing `StartLimitIntervalSec=300`, `StartLimitBurst=5`, `Restart=on-failure`, and `RestartSec=30` crash-storm controls remain intact. `TimeoutStartSec=300` bounds the combined gate and existing daemon readiness windows. Backend classification uses the configured Docker endpoint plus daemon metadata, not kernel-version comparison alone. Host Docker requires the host profile above; VM Docker reports that this particular preflight is not applicable and leaves VM-specific verification to a mutually exclusive VM gate. Installed helper digests must match the tracked sources.
 
 The assertion returns distinct statuses for a proven policy violation and a transient inability to query Docker. The service drop-in permits recovery from transient failures without exhausting the existing start limit, while a proven policy violation remains fail-closed and clearly logged. This is normal service recovery, not a second repair daemon and never mutates containment policy.
 
@@ -141,7 +144,7 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 1. `install.sh` detects Linux systemd and the effective Docker endpoint.
 2. The host containment installer copies tracked units to their system and user destinations, reloads managers, and checks effective properties.
-3. `ezgha.service` runs the read-only preflight before `ezgha serve`.
+3. The `ezgha.service` startup wrapper runs the read-only preflight and then replaces itself with `ezgha serve`.
 4. `ezgha` creates each runner with `--cgroup-parent=actions.slice` plus per-container memory, CPU, PID, swap, and security limits.
 5. The system manager accounts every runner beneath the finite aggregate.
 6. Under ordinary pressure, `MemoryHigh` throttles and reclaims workload memory.
@@ -160,7 +163,8 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 | Failure | Required behavior |
 |---|---|
-| Host `actions.slice` missing or infinite | `ExecStartPre` fails; no new runners start. |
+| Host `actions.slice` missing or infinite | The main startup wrapper exits `78`; no new runners start and systemd does not restart the policy violation. |
+| Docker query is temporarily unavailable | The start-bound wrapper retries only the transient exit `75` for at most 120 seconds; expiry returns `75` to the existing bounded restart policy. No separate timer or daemon is created. |
 | One runner exceeds its limit | The cgroup-local OOM is contained to that runner scope. Whole-container exit is claimed only when effective `memory.oom.group` or observed exit behavior proves it. |
 | Runner aggregate exceeds `MemoryHigh` | Reclaim/throttle occurs inside `actions.slice`. |
 | Sustained runner pressure | An eligible runner descendant is selected within `actions.slice`; no cross-root runner-before-agent order is claimed. |
@@ -186,7 +190,7 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 - Run the containment assertion against the live host before restarting `ezgha`.
 - After deployment, prove ten managed containers use `actions.slice` and all effective aggregate values match the profile.
 - Record actual cgroup paths and `memory.oom.group` for all managed containers.
-- Run three separately labeled checks: a bounded child `MemoryMax` test, an isolated proof-slice `systemd-oomd` PSI/victim-selection test, and a ten-runner host/desktop survival observation. None substitutes for another.
+- Run three separately labeled checks: a bounded `ezghaproof-hardlimit.slice` `MemoryMax` test, an isolated `ezghaproof-oomd.slice` `systemd-oomd` PSI/victim-selection test, and a ten-runner host/desktop survival observation. None substitutes for another. Both synthetic tests use only fixed tracked system services and verify production runner scopes are outside the proof subtree before allocation.
 - Record host and user-manager boot IDs/PIDs before and after live proofs. The desktop, Warp, user manager, Docker daemon, and unrelated runner slots must remain alive.
 - Run `doctor-runner` and the exit-criteria harness. Fleet capacity remains ten Linux runners; full job execution proof follows the repository's existing capacity gate.
 
@@ -197,7 +201,7 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 3. Docker uses cgroup v2 with the `systemd` driver; effective runner aggregate limits are `MemoryHigh=26G`, `MemoryMax=28G`, `MemorySwapMax=0`, `TasksMax=6000`, `CPUQuota=1600%`, and `IOWeight=25` where the I/O controller is available.
 4. Effective agent aggregate limits are `MemoryHigh=14G`, `MemoryMax=16G`, `MemorySwapMax=2G`, and `TasksMax=8192`; no unlimited override remains.
 5. Effective automation aggregate limits remain `MemoryHigh=4G`, `MemoryMax=6G`, `MemorySwapMax=1G`, and `TasksMax=4096`.
-6. Workload aggregates are enrolled for memory-pressure handling at 50%; `user@1000.service` reports `ManagedOOMMemoryPressure=auto`, no ancestor enrolls it indirectly, and `oomctl` lists only intended workload roots.
+6. Workload aggregates are enrolled for memory-pressure handling at 50%; `-.slice` and `user@1000.service` report both `ManagedOOMMemoryPressure=auto` and `ManagedOOMSwap=auto`, no ancestor enrolls the desktop indirectly, and `oomctl` lists only intended workload roots plus the empty proof root when a proof is active.
 7. `ezgha.service` refuses startup on a proven host-Docker containment violation and can recover from a transient Docker query failure without exhausting its start limit.
 8. Separate executable evidence proves child hard-limit containment, isolated oomd descendant selection, and ten-runner host/desktop survival; claims are limited to the proof that produced them.
 9. No new watchdog, host restart authority, VM fallback, or runner-count reduction is introduced.
@@ -207,5 +211,5 @@ The assertion returns distinct statuses for a proven policy violation and a tran
 
 - The deploy owner must have non-interactive or interactive `sudo` authority to install system units under `/etc/systemd/system`; user-only installation cannot enforce Docker's system cgroup hierarchy.
 - The live deployment must follow the repository's single-writer checks before restarting `ezgha.service` or running the live harness.
-- The bounded pressure proof requires `systemd-run` and a memory allocator such as `stress-ng`; if `stress-ng` is absent, the repository test helper supplies a small bounded allocator rather than changing the acceptance criterion.
+- The bounded pressure proof requires privilege to start the two fixed tracked proof services by literal name; arbitrary transient units and commands are prohibited. The repository supplies the fixed bounded allocator rather than depending on `stress-ng` behavior.
 - Live activation requires current usage plus a 2-GiB safety margin to fit below each proposed `MemoryHigh`; otherwise deployment stops before installing or reloading units.
