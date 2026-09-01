@@ -86,12 +86,13 @@ After this plan and spec have an approved exact SHA:
 - Lane A owns Task 1 only.
 - Lane B owns Task 2 only.
 - Lane C owns Task 3 only.
-- The primary agent owns Task 5 while A-C run.
-- Task 6 starts in the first free lane because it owns two existing files untouched by the other lanes.
-- Task 4 starts after Task 1 and Task 3 interfaces are merged because it consumes their exact paths and assertion contract; it has no GitHub evidence dependency.
+- The primary agent owns independent Task 6 while A-C run.
+- Integrate green Tasks 1, 2, and 3, then start Task 4 from that integrated base because activation consumes their policy paths, maintenance-intent behavior, and assertion contract.
+- Integrate green Task 4, then start Task 5 from the base containing Tasks 1-4 because its installer fixtures stage and execute the actual Task 4 artifact.
+- Task 6 may integrate at any point before Task 7 because its two existing files are untouched by Tasks 1-5.
 - Integration, live activation, and production verification are serialized under the primary deploy owner.
 
-Each writer uses an isolated worktree pinned to the approved SHA. No worker may run `cargo install`, restart `ezgha.service`, invoke the live exit gate, modify the Docker daemon, or deploy host files. The primary agent integrates commits in dependency order and is the only live deploy owner.
+Tasks 1, 2, 3, and 6 use isolated worktrees pinned to the approved SHA. Dependent Task 4 uses an isolated worktree at the integration commit containing green Tasks 1-3; Task 5 uses one at the integration commit containing green Tasks 1-4. No worker may run `cargo install`, restart `ezgha.service`, invoke the live exit gate, modify the Docker daemon, or deploy host files. The primary agent integrates commits in dependency order and is the only live deploy owner.
 
 ---
 
@@ -196,6 +197,7 @@ git commit -m "feat: add finite host containment policy [codex/gpt-5.6-sol]"
 - Produces a fixed maintenance-intent check used by every `start`, `serve`, and `stop` mutation path before and after `serve.lock` acquisition.
 - Produces a stable containment-admission failure event through the existing alert/journal API; repeated guard failure is visible without a separate monitor.
 - Produces fixed-profile backend-recovery suppression: no `lima-vm@colima.service`, `limactl`, Colima, or Docker lifecycle command from startup or retry.
+- Produces nonmutating `ezgha render-release1-service`, which writes the fixed Linux user-unit text to stdout with `ExecStart=%h/.local/libexec/ezgha/release1/bin/ezgha serve --config %h/.config/ezgha/config.toml`, no Lima dependencies, and no enable/start/reload side effect. Task 5 stages that rendered file and Task 4 installs/enables it only inside activation.
 - Mac and explicit VM-Docker paths do not invoke these guards.
 
 - [ ] **Step 1: Write unit tests for profile selection**
@@ -257,6 +259,8 @@ Add serve-order tests proving selector rejection happens before platform Docker 
 Add a focused test that a failed containment verdict emits the stable alert event once per existing cooldown semantics and never credits backend recovery or admission success.
 
 Change `backend_restart_can_help`/`maybe_restart_backend` and startup wait policy to accept the resolved profile. For fixed Linux HostDocker/DockerSysbox they return passive-retry/no-action without calling `backend_restart_commands`; generated service units omit Lima `Wants=`/`After=`. Add regression tests for initial unreachability and repeated serve failures that record zero VM/backend lifecycle commands. Preserve existing Mac and explicit VM recovery tests.
+
+Add service-render tests proving `render-release1-service` is stdout-only, contains the exact stable bundle binary/config paths, has no Lima dependency or Docker selectors, and performs no `systemctl` operation. Existing `install-service` behavior for Mac and explicit VM profiles remains unchanged.
 
 - [ ] **Step 7: Verify the created PID ancestry**
 
@@ -365,7 +369,7 @@ git commit -m "feat: assert live host containment read only [codex/gpt-5.6-sol]"
 - The first operation is exact `uname -s` comparison with `Linux`; non-Linux exits before any other access or mutation.
 - The entrypoint runs as the deploy user and rejects effective UID 0 before mutation; only enumerated fixed system operations use internal `sudo -n`.
 - Production activation runs only from the fixed `$HOME/.local/libexec/ezgha/release1` bundle staged by Task 5. The bundle preserves the tracked policy/assertion tree plus `Dockerfile.runner` and `docker/tar-workspace-wrapper.sh`. `build_release1_runner_image()` takes no arguments, derives its Dockerfile/context from that canonical bundle, and is the sole shell bootstrap-build interface.
-- Success means finite policy is active and either the same ten migration containers remain or a zero-container bootstrap converges to ten contained containers.
+- Success means finite policy is active, activation itself issued no lifecycle mutation against pre-existing runners, and the fleet converges to ten contained slot names; naturally departed ephemeral IDs may be refilled after maintenance release.
 - Any failure that cannot prove containment leaves `ezgha.service` inactive.
 
 - [ ] **Step 1: Write state-machine fixture tests**
@@ -378,8 +382,12 @@ zero-container bootstrap success
 zero-container bootstrap with absent actions.slice
 bootstrap with absent agents.slice and automation.slice cgroups
 each missing cpu/io/memory/pids root controller
+watcher already absent
+watcher present but inactive/disabled
+watcher active/enabled and file-absent loaded drift
 bootstrap contained image build after actions commit point
 migration preserves existing image without rebuild
+migration with one or several snapshotted ephemeral containers departing while locked
 non-Linux invocation
 root invocation
 missing exact sudo authorization
@@ -411,11 +419,11 @@ Run `uname -s` first and require exact `Linux`, then reject effective UID 0. Res
 
 - [ ] **Step 4: Freeze mutations and snapshot before the reconciler stop**
 
-Acquire the deploy-user activation lock and atomically create the deploy-user maintenance intent with PID and boot ID. Snapshot every target file and prior manager state as that user. In migration mode stop only the deploy user's `ezgha.service`; in bootstrap mode require it already inactive. Acquire and retain the deploy-user `serve.lock`, then recheck the zero-or-ten state and ancestry. The Task 2 double-check makes direct `start`, `serve`, and `stop` refuse the maintenance interval. Existing graceful shutdown may clean only proven container-less registrations.
+Acquire the deploy-user activation lock and atomically create the deploy-user maintenance intent with PID and boot ID. Snapshot every target file, prior manager state, and each managed slot's `{name, container_id, pid, cgroup}` as that user. In migration mode stop only the deploy user's `ezgha.service`; in bootstrap mode require it already inactive. Acquire and retain the deploy-user `serve.lock`, then recheck fleet ancestry. The Task 2 double-check makes direct `start`, `serve`, and `stop` refuse the maintenance interval. Until maintenance release, the activation command ledger permits only Docker inventory/inspect/event reads and forbids `run`, `stop`, `pause`, `rm`, `kill`, `restart`, and prune. A snapshotted ID that disappears is recorded only as an independent ephemeral lifecycle departure; activation does not claim why it exited. Every surviving ID must retain its name and `/actions.slice` ancestry, and no new managed ID may appear while the reconciler is frozen. Existing graceful service shutdown may clean only proven container-less registrations.
 
 - [ ] **Step 5: Install and commit the finite actions boundary first**
 
-As the deploy user, leave the preflight-verified active config unchanged and install the fixed user-manager files. Before unlinking any watcher file, run `systemctl --user disable --now psi-oom-watcher.timer` followed by `systemctl --user stop psi-oom-watcher.service`; any failure retains intent and prevents `ezgha.service` restart. Use separate fixed `sudo -n` commands only to install/remove the enumerated system-manager files, reload the system manager, and apply/query `actions.slice`. Remove only:
+As the deploy user, leave the preflight-verified active config unchanged and install the fixed user-manager files. Watcher teardown is idempotent: read `LoadState`, `ActiveState`, and `UnitFileState` for both watcher units plus their known paths and timer symlink. If both units are `not-found`/inactive/disabled and all paths are absent, issue no disable/stop command. Otherwise disable the timer only when enabled or active, stop the service only when active, remove the known files, and reload; file-absent but loaded/active drift follows the same teardown. A command's nonzero result is fatal only when the required absent post-state is not achieved. Any residual loaded/active/enabled watcher, file, or symlink retains intent and prevents `ezgha.service` restart. Use separate fixed `sudo -n` commands only to install/remove the enumerated system-manager files, reload the system manager, and apply/query `actions.slice`. Remove only:
 
 ```text
 <deploy-home>/.config/systemd/user/ezgha.service.d/10-oomd-omit.conf
@@ -425,11 +433,11 @@ As the deploy user, leave the preflight-verified active config unchanged and ins
 <deploy-home>/.local/lib/ezgha/host-controls/psi-oom-watcher.sh
 ```
 
-Reload the system manager and user manager. In bootstrap invoke the pre-authorized exact `sudo -n systemctl start actions.slice` and deploy-user `systemctl --user start agents.slice automation.slice`; migration requires all three already active. Apply the exact properties, verify all effective files including `cpu.max`/`io.weight`, then require agent/automation current use below their highs before runner admission. In migration also verify the existing ten PID ancestries. This verified point is forward-only: later recovery retains the persistent and runtime finite actions boundary.
+Reload the system manager and user manager. In bootstrap invoke the pre-authorized exact `sudo -n systemctl start actions.slice` and deploy-user `systemctl --user start agents.slice automation.slice`; migration requires all three already active. Apply the exact properties, verify all effective files including `cpu.max`/`io.weight`, then require agent/automation current use below their highs before runner admission. In migration also verify every surviving snapshotted PID ancestry and account for each recorded departure. This verified point is forward-only: later recovery retains the persistent and runtime finite actions boundary.
 
 - [ ] **Step 6: Apply the remaining policy and prove the unchanged fleet**
 
-Reload the user manager, apply and verify agent, automation, and all six oomd boundary properties. In migration mode invoke Task 3 with `--require-fleet` while maintenance intent and `serve.lock` remain held and require the same ten IDs. In bootstrap mode invoke it without the fleet requirement and require zero managed containers.
+Reload the user manager, apply and verify agent, automation, and all six oomd boundary properties. While maintenance intent and `serve.lock` remain held, invoke Task 3 without `--require-fleet`. Migration additionally requires the current managed-ID set to be a subset of the snapshot, every survivor unchanged/contained, every disappearance recorded, and no new ID; bootstrap requires zero managed containers.
 
 For bootstrap only, after the full policy assertion succeeds, call the no-argument `build_release1_runner_image()` function. It executes exactly:
 
@@ -445,7 +453,7 @@ env -u DOCKER_HOST -u DOCKER_CONTEXT DOCKER_BUILDKIT=0 \
 
 - [ ] **Step 7: Release maintenance and restart only after proof**
 
-After the policy and required image assertions pass, remove the maintenance intent, release `serve.lock`, and start `ezgha.service`. Require service readiness within 210 seconds. Migration repeats Task 3 `--require-fleet` against the same ten IDs; bootstrap requires ten contained containers within 600 seconds.
+After the policy and required image assertions pass, remove the maintenance intent, release `serve.lock`, and enable/start `ezgha.service`. Migration requires exactly ten distinct live slot names `ez-runner-c-1..10` within 210 seconds and repeats Task 3 `--require-fleet`; a replacement ID is permitted only for a slot whose snapshot ID was recorded departed, while every surviving snapshot ID remains unchanged. Bootstrap requires the same ten contained slot names within 600 seconds.
 
 - [ ] **Step 8: Implement explicit recovery states**
 
@@ -453,7 +461,7 @@ Before mutation, exit without live effect. Snapshot failure leaves the service r
 
 - [ ] **Step 9: Assert forbidden operations never occur**
 
-Fixture tests reject `docker stop`, `docker pause`, `docker rm`, `docker run`, deregistration of a container-backed runner, `limactl`, `colima`, Docker restart, reboot/shutdown, Mac paths, launchctl, caller-selected build paths/flags, and caller-selected systemd destinations. They prove root invocation fails before mutation; every missing controller and a denied exact sudo authorization produce zero intent/service mutation; absent-slice bootstrap starts and verifies all three slices before exactly one canonical contained image-build argv or any runner creation; migration performs no image build; failed user-manager or bundle validation causes zero mutation; the system-scope-only exemption path is insufficient; every `systemctl --user`/config/lock operation retains the validated deploy UID/home/bus; watcher disable/stop precedes file removal; no watcher enablement symlink or active unit survives; the user service has no effective omit/-1000 values; and only the pre-authorized identical system argv cross `sudo -n`. Failure fixtures after reconciler stop assert the named precommit alert and no service restart.
+Fixture tests reject activation-issued `docker stop`, `pause`, `rm`, `run`, `kill`, `restart`, or prune before maintenance release, deregistration of a container-backed runner, `limactl`, `colima`, Docker restart, reboot/shutdown, Mac paths, launchctl, caller-selected build paths/flags, and caller-selected systemd destinations. They prove root invocation fails before mutation; every missing controller and a denied exact sudo authorization produce zero intent/service mutation; absent-slice bootstrap starts and verifies all three slices before exactly one canonical contained image-build argv or runner creation; migration performs no image build; unchanged migration preserves every ID; a natural one-or-many departure produces only subset/event-ledger records and post-release refill IDs for those slot names; a surviving ID with wrong ancestry fails; post-start fewer/duplicate/wrong slot names fail; failed user-manager or bundle validation causes zero mutation; the system-scope-only exemption path is insufficient; every user-manager/config/lock operation retains the validated deploy identity; absent watcher issues no disable/stop, while present and loaded-drift cases converge to exact absence; and only pre-authorized identical system argv cross `sudo -n`. Failure fixtures after reconciler stop assert the named precommit alert and no service restart.
 
 - [ ] **Step 10: Run focused checks**
 
@@ -480,7 +488,7 @@ git commit -m "feat: activate host containment atomically [codex/gpt-5.6-sol]"
 
 - `doctor-runner` calls the Task 3 script in read-only mode and includes containment in its final verdict.
 - The exit gate requires the Release 1 assertion and ten live contained Linux runners.
-- `install.sh` delegates the compatible Linux HostDocker path to Task 4 after staging an inactive service and the fixed release bundle at `$HOME/.local/libexec/ezgha/release1`, including all Task 1 policy artifacts, Task 3 assertion, activation script, `Dockerfile.runner`, and `docker/tar-workspace-wrapper.sh` at preserved relative paths; it never installs the Colima-guest slice or PSI watcher on that path.
+- Compatible Linux HostDocker has exactly one deployment command: `./install.sh`. After local tests and `cargo build --release --locked`, it stages a versioned verified bundle and atomically updates `$HOME/.local/libexec/ezgha/release1`, then ends with one `exec` of Task 4. It never invokes legacy `install-service`, starts/restarts the service, builds an image, installs auxiliary units, or runs Docker/VM commands before that exec.
 - Gate 4 and `canary-once` use the main ten-runner Linux config/labels; no separate Linux canary supervisor or reserved eleventh runner remains documented.
 - Repo guidance states crash containment and operator availability are primary; VM layering and security are not substitutes for a finite host boundary.
 
@@ -488,7 +496,7 @@ git commit -m "feat: activate host containment atomically [codex/gpt-5.6-sol]"
 
 Add tests proving a single containment mismatch makes both `doctor-runner` and the exit gate bad, while a passing stub preserves existing fleet verdict behavior. Assert containment admission failure invokes the existing high-severity alert/journal path. Assert docs and example config say Linux count 10, HostDocker, `actions.slice`, and fixed profile.
 
-Add installer tests proving compatible Linux branches before the first existing Docker context discovery, `DOCKER_HOST_OVERRIDE` export, `docker version`, or image build. It rejects nonempty selectors, performs no Docker command itself, does not call `limactl`, install `systemd/guest/actions.slice`, or install/enable the PSI watcher, stages the binary/config/service inactive plus the complete release bundle at its exact stable relative paths, and `exec`s that installed Task 4 entrypoint. The fixture requires `Dockerfile.runner` and executable `docker/tar-workspace-wrapper.sh` under the staged build context. Task 4 owns the post-policy bootstrap image build. Update `tests/install_watchdog_gate_test.sh` so its Linux HostDocker fixture rejects every PSI-watcher unit/script instead of copying or requiring them and verifies delegation precedes Docker/VM actions; preserve its Mac and explicit VM expectations.
+Add installer tests proving compatible Linux branches before the first existing Docker context discovery, `DOCKER_HOST_OVERRIDE` export, `docker version`, image build, legacy `install-service`, any service start/restart, or auxiliary-unit install. It rejects selectors, runs local tests plus `cargo build --release --locked`, and stages `target/release/ezgha`, the stdout of `ezgha render-release1-service`, all Task 1 policy artifacts, Task 3 assertion, Task 4 activation, `Dockerfile.runner`, and executable `docker/tar-workspace-wrapper.sh` under a private versioned release directory with preserved paths. A manifest records source HEAD, mode, and SHA-256 for every file. Verify manifest, binary `--version`, rendered `ExecStart`, and build context before atomically replacing a temporary symlink with `$HOME/.local/libexec/ezgha/release1`; manifest/stage failure leaves the old link, unit, and running service untouched. End the Linux branch with exactly one `exec "$BUNDLE_ROOT/apply-host-containment-release1.sh"`. Task 4 alone installs/enables the rendered unit and builds the bootstrap image after policy proof. Update `tests/install_watchdog_gate_test.sh` so Linux rejects every PSI-watcher unit/script and proves delegation precedes Docker/VM actions; preserve Mac/explicit-VM expectations.
 
 Add config/docs tests proving `config/config.toml.linux-canary.example` is gone, `config/README.md` contains no separate `systemd-run ... serve` instructions, the main Linux example includes the canary repo/workflow dispatch settings and main fleet labels, and Gate 4 defaults to that main config. A `canary-once` fixture must dispatch without Docker while `serve` on a one-runner verifier config fails before Docker.
 
@@ -497,6 +505,8 @@ Add config/docs tests proving `config/config.toml.linux-canary.example` is gone,
 ```bash
 bash tests/doctor_runner_host_pressure_test.sh
 bash tests/verify_exit_gate8_test.sh
+bash tests/install_watchdog_gate_test.sh
+bash tests/install_uninstall_aux_units_test.sh
 ```
 
 - [ ] **Step 3: Integrate the assertion without mutation**
@@ -507,7 +517,7 @@ Verify and document Task 2's stable containment alert event and journal diagnost
 
 - [ ] **Step 4: Update portable operator guidance**
 
-Document one user-facing `install.sh` entrypoint, the installed delegated activation entrypoint, one assertion entrypoint, exact prerequisites, exact limits, failure behavior, and rollback stance. State that compatible Linux requires pre-existing passwordless authorization for the enumerated fixed system-manager argv, that Release 1 does not edit sudoers, and that missing authorization fails with `SUDOERS_PREREQUISITE_MISSING` before service/intention mutation. Replace the stale global "no sudo" claim with OS/profile-specific behavior. Remove claims that Colima/VM layering is the Linux crash boundary and remove fixed-Linux remediation that starts Lima/Colima. Replace fixed-profile exit-gate QEMU/Colima requirements with Task 3's host-containment assertion. On compatible Linux HostDocker, remove the current guest-slice `limactl` block and legacy watcher install; stage the exact release bundle plus an inactive service and `exec` the installed Task 4 entrypoint rather than starting an uncontained daemon. Delete the separate Linux canary example/instructions and route canary proof through the main fleet config without changing runner count or labels. Do not add Release 2 instructions to the immediate install path.
+Document the single `./install.sh` deployment command, installed delegated activation/assertion paths, versioned bundle/manifest, exact prerequisites/limits, failure behavior, and rollback stance. State that compatible Linux requires pre-existing passwordless authorization for enumerated system argv, Release 1 does not edit sudoers, and denial emits `SUDOERS_PREREQUISITE_MISSING` before service/intent mutation. Replace the stale global "no sudo" claim with OS/profile behavior. Remove claims that VM layering is the Linux crash boundary and any fixed-Linux Lima/Colima remediation. Replace fixed-profile exit-gate QEMU/Colima requirements with Task 3's host assertion. Make Gate 0 use `$HOME/.local/libexec/ezgha/release1/bin/ezgha --version` on the fixed Linux profile and retain existing paths elsewhere. Delete the separate Linux canary instructions and route proof through the main fleet without changing count/labels. Do not add Release 2 work to the install path.
 
 - [ ] **Step 5: Run focused checks**
 
@@ -603,7 +613,7 @@ git commit -m "feat: record deterministic runner outcomes [codex/gpt-5.6-sol]"
 
 - [ ] **Step 1: Integrate in dependency order**
 
-Cherry-pick Task 1, Task 2, Task 3, Task 5, Task 6, then Task 4. Resolve only task-owned conflicts; preserve unrelated `.playwright-mcp/` and user changes.
+Integrate green Task 1, Task 2, and Task 3; implement/integrate Task 4 from that base; then implement/integrate Task 5 from the base containing Tasks 1-4. Integrate independent Task 6 before the final gate. Resolve only task-owned conflicts; preserve unrelated `.playwright-mcp/` and user changes.
 
 - [ ] **Step 2: Run the complete local quality gate**
 
@@ -642,22 +652,22 @@ git push origin HEAD:docs/nextsteps-2026-08-30-fleet-churn
 
 Record Docker version, `CgroupDriver=systemd`, `CgroupVersion=2`, exact `unix:///var/run/docker.sock` resolution, 32-CPU/RAM facts, current ten container IDs, PID ancestry, exact current system/user slice values, `actions.slice/memory.current`, free memory/swap/disk, and PSI. Abort activation on any fixed threshold or profile mismatch.
 
-- [ ] **Step 6: Run the tracked activation entrypoint**
+- [ ] **Step 6: Run the single deployment command**
 
 ```bash
-"$HOME/.local/libexec/ezgha/release1/apply-host-containment-release1.sh"
+./install.sh
 ```
 
-Run it as the deploy user, never through top-level `sudo`. Do not run ad hoc `systemctl`, Docker, or filesystem mutations around it. Preserve its receipt/log output as deployment evidence.
+Run it once as the deploy user, never through top-level `sudo`. It builds the release binary, stages/verifies/atomically selects the bundle, and `exec`s activation exactly once. Do not separately invoke the installed activation script or run ad hoc `systemctl`, Docker, or filesystem mutations around it. Preserve staging/activation output as deployment evidence.
 
 - [ ] **Step 7: Prove the live result**
 
 ```bash
-./scripts/host/assert-host-containment-release1.sh --require-fleet
+"$HOME/.local/libexec/ezgha/release1/assert-host-containment-release1.sh" --require-fleet
 ./doctor-runner
 ```
 
-Require the same ten local Linux container IDs and ten actual PIDs under `/actions.slice`. Confirm no runner container was stopped or recreated and the desktop session and operator terminal remained alive. Run the repo exit gate only after this proof.
+Require exactly ten local Linux slot names and ten actual PIDs under `/actions.slice`. Preserve the activation snapshot, Docker read/event ledger, departure records, and post-refill inventory: every snapshot ID that survived is unchanged, and new IDs occur only in recorded departed slots. Confirm activation issued no lifecycle mutation against a pre-existing runner and the desktop session/operator terminal remained alive. Run the repo exit gate only after this proof.
 
 Immediately after live proof, run Task 6 baseline mode:
 
