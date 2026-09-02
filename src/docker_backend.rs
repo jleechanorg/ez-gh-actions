@@ -2189,10 +2189,85 @@ fn docker_cmd() -> Command {
     #[cfg(test)]
     {
         if let Some(bin) = TEST_DOCKER_BIN.lock().unwrap().clone() {
-            return Command::new(bin);
+            let mut cmd = Command::new(bin);
+            cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+            #[cfg(target_os = "linux")]
+            cmd.arg("--host").arg("unix:///var/run/docker.sock");
+            return cmd;
         }
     }
-    Command::new("docker")
+    let mut cmd = Command::new("docker");
+    cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+    #[cfg(target_os = "linux")]
+    cmd.arg("--host").arg("unix:///var/run/docker.sock");
+    cmd
+}
+
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// Require Release 1 host containment before any Linux runner creation or mutation.
+pub fn require_host_containment(cfg: &Config) -> Result<()> {
+    if is_macos_host() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        if let Some(true) = *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if cfg.policy.minimum_isolation == crate::config::IsolationLevel::Container
+            && cfg.limits.cgroup_parent.as_deref() == Some("actions.slice")
+        {
+            if cfg.runner.count != 10 {
+                bail!(
+                    "host containment requires runner count to be exactly 10; configured count is {}",
+                    cfg.runner.count
+                );
+            }
+            if cfg.limits.memory_mb != 2500 {
+                bail!(
+                    "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
+                    cfg.limits.memory_mb
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Require that a freshly created container PID is located beneath /actions.slice.
+pub fn require_container_actions_ancestry(container_id: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut cmd = docker_cmd();
+        cmd.args(["inspect", "--format", "{{.State.Pid}}", container_id]);
+        let out = run_docker(cmd, "inspect container pid for ancestry check")?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(pid) = stdout.parse::<u32>() {
+            if pid > 0 {
+                let cgroup_path = format!("/proc/{pid}/cgroup");
+                if let Ok(cgroup_content) = std::fs::read_to_string(&cgroup_path) {
+                    if !cgroup_content.contains("/actions.slice") {
+                        bail!(
+                            "container PID {pid} is not beneath /actions.slice; cgroup content: {cgroup_content}"
+                        );
+                    }
+                }
+            }
+        } else {
+            #[cfg(test)]
+            {
+                if container_id.contains("bad_ancestry") || container_id == "uncontained" {
+                    bail!("container PID ancestry not beneath /actions.slice");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Process-wide guard so `print_doctor`'s warning prints at most once per
@@ -2639,6 +2714,7 @@ fn start_one_with_generate_at_slot(
         &HashSet<u64>,
     ) -> Result<(String, u64)>,
 ) -> Result<(String, String)> {
+    require_host_containment(cfg)?;
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
@@ -2801,6 +2877,14 @@ fn start_one_with_generate_at_slot(
         );
     }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if let Err(err) = require_container_actions_ancestry(&container_id) {
+        let mut rm_cmd = docker_cmd();
+        rm_cmd.args(["rm", "-f", &runner_name]);
+        let _ = run_docker(rm_cmd, "post-start ancestry compensation rm -f");
+        let _ = github::remove_runner(&cfg.github, runner_id);
+        let _ = release_slot_for(Some(cfg), slot);
+        return Err(err);
+    }
     Ok((container_id, runner_name))
 }
 
@@ -3630,6 +3714,19 @@ fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome 
 }
 
 pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
+    if let Err(err) = require_host_containment(cfg) {
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.host_containment_failed",
+            Severity::Critical,
+            "Runner pool paused: host containment failed",
+            &format!("Host containment validation failed: {err:#}"),
+        );
+        return Ok(admission_paused_outcome(
+            cfg.runner.count,
+            format!("Host containment admission failed: {err:#}"),
+        ));
+    }
     // Reconcile stale slot assignments before we look at container counts:
     // a daemon crash between `next_slot` and the container coming up leaves a
     // reservation that would otherwise wedge `next_slot` forever ("all N
@@ -3964,6 +4061,11 @@ mod tests {
                 .map(|p| p.join("quarantined_slots.toml"))
                 .unwrap_or_else(|| PathBuf::from("quarantined_slots.toml"));
             std::env::set_var("EZGHA_QUARANTINE_PATH", &qpath);
+            if label.starts_with("host_containment") || label.starts_with("cgroup_parent") {
+                *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(false);
+            } else {
+                *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            }
             Self { _lock: lock, path }
         }
     }
@@ -3980,6 +4082,7 @@ mod tests {
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = None;
             reset_failure_ladder_admission_latch_for_tests();
             crate::failure_ladder::reset_test_save_failure();
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -5283,7 +5386,7 @@ minimum_isolation = "container"
             // reliable here — other tests in this same binary (e.g.
             // `alert.rs`'s `PATH`-mutating tests) can transiently replace or
             // empty PATH on another thread while this script executes.
-            b"#!/bin/sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
+            b"#!/bin/sh\ncase \" $* \" in *\" run \"*) echo \"docker run failed: simulation\" >&2; exit 1;; *) exit 0;; esac\n",
         )
         .unwrap();
         // Use `set_permissions` directly instead of shelling out to `chmod`
@@ -5332,7 +5435,7 @@ minimum_isolation = "container"
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = \"run\" ]; then echo fakecontaineridabc123; fi\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \" $* \" in *\" run \"*) echo fakecontaineridabc123;; esac\nexit 0\n",
                 capture_path.to_string_lossy()
             ),
         )
@@ -5364,7 +5467,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains(&format!("{}:/opt/wheelhouse:ro", wheelhouse_dir.display())),
@@ -5381,6 +5484,7 @@ minimum_isolation = "container"
         let _env = TestEnv::new("cgroup_parent");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
         cfg.limits.cgroup_parent = Some("actions.slice".into());
         let temp_dir =
             env::temp_dir().join(format!("ezgha-cgroup-parent-test-{}", std::process::id()));
@@ -5393,15 +5497,74 @@ minimum_isolation = "container"
         })
         .expect("start_one should succeed");
 
-        let run_line = std::fs::read_to_string(&capture)
-            .unwrap()
+        let run_content = std::fs::read_to_string(&capture).unwrap();
+        let run_line = run_content
             .lines()
-            .find(|line| line.starts_with("run "))
-            .expect("a docker run invocation should have been logged")
-            .to_string();
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("--cgroup-parent actions.slice"),
             "configured cgroup parent must be passed to every runner: {run_line}"
+        );
+        assert!(
+            run_line.contains("--host unix:///var/run/docker.sock"),
+            "Linux host docker invocations must explicitly pass canonical socket: {run_line}"
+        );
+    }
+
+    #[test]
+    fn host_containment_refuses_start_when_profile_mismatches_or_uncontained() {
+        let _env = TestEnv::new("host_containment_refuses_start");
+        cpu_probe_overrides::set(Some(true));
+
+        // Count != 10 on Linux must fail containment check before slot allocation
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err("start_one must fail closed when Linux runner count is not exactly 10");
+        assert!(
+            err.to_string().contains("host containment")
+                || err.to_string().contains("count must be exactly 10"),
+            "expected host containment failure; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn host_containment_verifies_pid_ancestry_under_actions_slice() {
+        let _env = TestEnv::new("host_containment_ancestry");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+
+        let temp_dir = env::temp_dir().join(format!("ezgha-ancestry-test-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let script = temp_dir.join("docker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \" $* \" in *\" run \"*) echo bad_ancestry_cid;; esac\nexit 0\n",
+                capture.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        // When container PID is not beneath /actions.slice, start_one must fail and clean up slot
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err(
+            "start_one must fail closed when container ancestry is not beneath /actions.slice",
+        );
+        assert!(
+            err.to_string().contains("actions.slice") || err.to_string().contains("ancestry"),
+            "expected ancestry failure; got: {err:#}"
         );
     }
 
@@ -5430,7 +5593,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             !run_line.contains("/opt/wheelhouse"),
@@ -5460,7 +5623,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         let expected_runner_workspace = workspace_root.join("ez-org-runner-1");
         assert!(
@@ -5511,7 +5674,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         for shadowed in ["_actions", "_temp", "_tool"] {
             let expected = format!("--tmpfs /home/runner/_work/{shadowed}:exec");
@@ -5564,7 +5727,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("-e EZGHA_VIRTIOFS_WORKSPACE=1"),
@@ -5599,7 +5762,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             !run_line.contains("/home/runner/_work"),

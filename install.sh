@@ -686,7 +686,7 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh; do
+    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
@@ -695,12 +695,14 @@ FSTRIM_EOF
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
-    for unit in agent-scope-reaper.service agent-scope-reaper.timer \
-                psi-oom-watcher.service psi-oom-watcher.timer; do
+    for unit in agent-scope-reaper.service agent-scope-reaper.timer; do
       sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
           -e "s|@HOME@|${HOME_DIR}|g" \
           "${UNIT_DIR}/${unit}" > "${USER_UNIT_DIR}/${unit}"
     done
+    rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" \
+          "${USER_UNIT_DIR}/psi-oom-watcher.timer" \
+          "${USER_UNIT_DIR}/ezgha.service.d/10-oomd-omit.conf"
 
     for service in ao-daemon ao-orchestrator ai.dark-factory.daemon; do
       dropin_dir="${USER_UNIT_DIR}/${service}.service.d"

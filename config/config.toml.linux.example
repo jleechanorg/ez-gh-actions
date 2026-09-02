@@ -22,7 +22,7 @@ guest_reserve_mb = 4096
 host_reserve_mb = 8192
 
 [limits]
-memory_mb = 3000
+memory_mb = 2500
 cpus = 2.0
 pids = 512
 min_free_disk_gb = 10
