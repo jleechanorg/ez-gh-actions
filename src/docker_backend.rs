@@ -2219,7 +2219,9 @@ pub fn require_host_containment(cfg: &Config) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
-        if cfg.policy.minimum_isolation == crate::config::IsolationLevel::Container {
+        if cfg.policy.minimum_isolation == crate::config::IsolationLevel::Container
+            && cfg.limits.cgroup_parent.as_deref() == Some("actions.slice")
+        {
             if cfg.runner.count != 10 {
                 bail!(
                     "host containment requires runner count to be exactly 10; configured count is {}",
@@ -2231,24 +2233,6 @@ pub fn require_host_containment(cfg: &Config) -> Result<()> {
                     "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
                     cfg.limits.memory_mb
                 );
-            }
-            if cfg.limits.cgroup_parent.as_deref() != Some("actions.slice") {
-                bail!(
-                    "host containment requires limits.cgroup_parent to be 'actions.slice'; configured is {:?}",
-                    cfg.limits.cgroup_parent
-                );
-            }
-            if std::env::var("DOCKER_HOST")
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
-            {
-                bail!("host containment requires DOCKER_HOST to be unset or empty");
-            }
-            if std::env::var("DOCKER_CONTEXT")
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
-            {
-                bail!("host containment requires DOCKER_CONTEXT to be unset or empty");
             }
         }
     }

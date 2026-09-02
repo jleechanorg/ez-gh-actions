@@ -50,6 +50,10 @@ printf 'docker' >>"$EZGHA_LAYER2_DOCKER_LOG"
 printf ' <%s>' "$@" >>"$EZGHA_LAYER2_DOCKER_LOG"
 printf '\n' >>"$EZGHA_LAYER2_DOCKER_LOG"
 
+if [ "${1:-}" = "--host" ]; then
+  shift 2
+fi
+
 case "${1:-}" in
   version)
     [[ "${2:-}" == "--format" && "${3:-}" == '{{.Server.Version}}' ]] || exit 91
