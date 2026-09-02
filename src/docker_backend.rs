@@ -5393,15 +5393,60 @@ minimum_isolation = "container"
         })
         .expect("start_one should succeed");
 
-        let run_line = std::fs::read_to_string(&capture)
-            .unwrap()
+        let run_content = std::fs::read_to_string(&capture).unwrap();
+        let run_line = run_content
             .lines()
             .find(|line| line.starts_with("run "))
-            .expect("a docker run invocation should have been logged")
-            .to_string();
+            .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("--cgroup-parent actions.slice"),
             "configured cgroup parent must be passed to every runner: {run_line}"
+        );
+        assert!(
+            run_line.contains("--host unix:///var/run/docker.sock"),
+            "Linux host docker invocations must explicitly pass canonical socket: {run_line}"
+        );
+    }
+
+    #[test]
+    fn host_containment_refuses_start_when_profile_mismatches_or_uncontained() {
+        let _env = TestEnv::new("host_containment_refuses_start");
+        cpu_probe_overrides::set(Some(true));
+
+        // Count != 10 on Linux must fail containment check before slot allocation
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err("start_one must fail closed when Linux runner count is not exactly 10");
+        assert!(
+            err.to_string().contains("host containment") || err.to_string().contains("count must be exactly 10"),
+            "expected host containment failure; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn host_containment_verifies_pid_ancestry_under_actions_slice() {
+        let _env = TestEnv::new("host_containment_ancestry");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+
+        let temp_dir = env::temp_dir().join(format!("ezgha-ancestry-test-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        // When container PID is not beneath /actions.slice, start_one must fail and clean up slot
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err("start_one must fail closed when container ancestry is not beneath /actions.slice");
+        assert!(
+            err.to_string().contains("actions.slice") || err.to_string().contains("ancestry"),
+            "expected ancestry failure; got: {err:#}"
         );
     }
 
