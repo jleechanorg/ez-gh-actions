@@ -277,6 +277,13 @@ fi
 #      or has no ha.sock — same root cause, the _lima dir was wiped
 #      by hand or by another tool, but a stale 'colima' instance record
 #      is still registered with limactl.
+is_socket_alive() {
+  # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
+  local sock="$1"
+  [ -S "$sock" ] || return 1
+  DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
+}
+
 ensure_colima_docker_daemon() {
   # Only relevant on macOS where Colima is the docker host.
   [ "$(uname -s)" = "Darwin" ] || return 0
@@ -336,13 +343,6 @@ DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
 # Strategy 3: probe docker desktop's socket
 DOCKER_DESKTOP_SOCK="${HOME}/.docker/run/docker.sock"
 DOCKER_DEFAULT_SOCK="/var/run/docker.sock"
-
-is_socket_alive() {
-  # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
-  local sock="$1"
-  [ -S "$sock" ] || return 1
-  DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
-}
 
 if [ -n "$DOCKER_CTX_HOST" ] && [ "$DOCKER_CTX_HOST" != "unix://$DOCKER_DEFAULT_SOCK" ]; then
   # Active docker context already points at a non-default socket — export it

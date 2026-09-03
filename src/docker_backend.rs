@@ -5480,6 +5480,7 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn configured_cgroup_parent_is_emitted_on_runner_start() {
         let _env = TestEnv::new("cgroup_parent");
         cpu_probe_overrides::set(Some(true));
@@ -5513,6 +5514,7 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn host_containment_refuses_start_when_profile_mismatches_or_uncontained() {
         let _env = TestEnv::new("host_containment_refuses_start");
         cpu_probe_overrides::set(Some(true));
@@ -5532,6 +5534,7 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn host_containment_verifies_pid_ancestry_under_actions_slice() {
         let _env = TestEnv::new("host_containment_ancestry");
         cpu_probe_overrides::set(Some(true));
