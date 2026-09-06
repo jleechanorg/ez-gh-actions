@@ -55,12 +55,12 @@ fn reset_failure_ladder_admission_latch_for_tests() {
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
 const DOCKER_CLEANUP_RESERVE: Duration = Duration::from_millis(50);
-const DOCKER_REAPER_RETRY_DELAY: Duration = Duration::from_millis(10);
-/// A stalled child wait must not consume all reaper capacity. Each worker
-/// owns at most one child, so this cap bounds the number of indefinitely
-/// waiting children while allowing later children to make progress.
-const DOCKER_REAPER_WORKER_CAP: usize = 4;
+/// The scheduler polls each owned child without blocking, so one stalled child
+/// cannot monopolize the scheduler. This cap bounds retained child state and
+/// leaves excess requests queued for the next poll cycle.
+const DOCKER_REAPER_ACTIVE_CAP: usize = 64;
 const DOCKER_REAPER_QUEUE_ALERT_THRESHOLD: usize = 1;
+const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // Post-refill readiness gets one 30s shared local-Docker budget. At the normal
 // sub-100ms `docker ps`/`docker top` latency this covers all 16 fleet slots;
 // under host pressure, a single probe may use up to 3s and the shared deadline
@@ -555,35 +555,18 @@ struct DockerChildReaper {
 
 static DOCKER_CHILD_REAPER: Mutex<Option<DockerChildReaper>> = Mutex::new(None);
 
-fn retry_wait_until_reaped<T, E, F>(owner: &mut T, mut wait: F, detail: &str)
-where
-    E: std::fmt::Display,
-    F: FnMut(&mut T) -> std::result::Result<(), E>,
-{
-    loop {
-        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| wait(owner)));
-        match attempt {
-            Ok(Ok(())) => return,
-            Ok(Err(error)) => {
-                eprintln!("warning: Docker child wait failed while {detail}: {error}; retrying");
-            }
-            Err(_) => {
-                eprintln!(
-                    "warning: Docker child wait panicked while {detail}; retaining ownership and retrying"
-                );
-            }
+fn try_wait_owned_docker_child(request: &mut DockerReapRequest) -> bool {
+    match request.child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            eprintln!(
+                "warning: Docker child wait failed while {}; retaining ownership for retry: {error}",
+                request.detail
+            );
+            false
         }
-        std::thread::sleep(DOCKER_REAPER_RETRY_DELAY);
     }
-}
-
-#[allow(clippy::zombie_processes)]
-fn reap_owned_docker_child(request: &mut DockerReapRequest) {
-    retry_wait_until_reaped(
-        &mut request.child,
-        |child| child.wait().map(|_| ()).map_err(|error| error.to_string()),
-        &request.detail,
-    );
 }
 
 impl DockerReapQueue {
@@ -595,7 +578,7 @@ impl DockerReapQueue {
         pending.push_back(request);
         let pending_len = pending.len();
         let active = self.active.load(Ordering::Relaxed);
-        if active >= DOCKER_REAPER_WORKER_CAP && pending_len >= DOCKER_REAPER_QUEUE_ALERT_THRESHOLD
+        if active >= DOCKER_REAPER_ACTIVE_CAP && pending_len >= DOCKER_REAPER_QUEUE_ALERT_THRESHOLD
         {
             eprintln!(
                 "warning: Docker child reaper is saturated ({active} active waits, {pending_len} queued); stalled child waits may need operator investigation"
@@ -606,6 +589,19 @@ impl DockerReapQueue {
 
     fn worker_finished(&self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn take_next(&self) -> Option<DockerReapRequest> {
+        if self.active.load(Ordering::Relaxed) >= DOCKER_REAPER_ACTIVE_CAP {
+            return None;
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = pending.pop_front()?;
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Some(request)
     }
 
     fn next(&self) -> DockerReapRequest {
@@ -619,13 +615,28 @@ impl DockerReapQueue {
                 TEST_DOCKER_REAPER_PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
                 panic!("injected Docker child reaper worker panic");
             }
-            if let Some(request) = pending.pop_front() {
-                self.active.fetch_add(1, Ordering::Relaxed);
-                return request;
+            if self.active.load(Ordering::Relaxed) < DOCKER_REAPER_ACTIVE_CAP {
+                if let Some(request) = pending.pop_front() {
+                    self.active.fetch_add(1, Ordering::Relaxed);
+                    return request;
+                }
             }
             pending = self
                 .wake
                 .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_for_work(&self, timeout: Duration) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_empty() {
+            let _ = self
+                .wake
+                .wait_timeout(pending, timeout)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
@@ -640,16 +651,38 @@ fn docker_child_reaper_worker(
             return;
         }
     }
+    let mut active = VecDeque::new();
     loop {
-        let mut request = queue.next();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            reap_owned_docker_child(&mut request);
-        }));
-        queue.worker_finished();
-        if outcome.is_err() {
-            queue.enqueue(request);
-            eprintln!("error: Docker child reaper recovered a worker panic");
+        if active.is_empty() {
+            active.push_back(queue.next());
         }
+        while active.len() < DOCKER_REAPER_ACTIVE_CAP {
+            let Some(request) = queue.take_next() else {
+                break;
+            };
+            active.push_back(request);
+        }
+
+        let poll_count = active.len();
+        for _ in 0..poll_count {
+            let mut request = active.pop_front().expect("active reaper request missing");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                try_wait_owned_docker_child(&mut request)
+            }));
+            match outcome {
+                Ok(true) => queue.worker_finished(),
+                Ok(false) => active.push_back(request),
+                Err(_) => {
+                    eprintln!(
+                        "warning: Docker child wait panicked while {}; retaining ownership for retry",
+                        request.detail
+                    );
+                    active.push_back(request);
+                }
+            }
+        }
+
+        queue.wait_for_work(DOCKER_REAPER_POLL_INTERVAL);
     }
 }
 
@@ -687,18 +720,11 @@ fn initialize_docker_child_reaper() -> std::result::Result<DockerChildReaper, St
         active: AtomicUsize::new(0),
     });
     let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
-    for worker_index in 0..DOCKER_REAPER_WORKER_CAP {
-        let worker_queue = Arc::clone(&queue);
-        let worker_ready_sender = if worker_index == 0 {
-            Some(ready_sender.clone())
-        } else {
-            None
-        };
-        std::thread::Builder::new()
-            .name(format!("ezgha-docker-reaper-{worker_index}"))
-            .spawn(move || docker_child_reaper_supervisor(worker_queue, worker_ready_sender))
-            .map_err(|error| format!("failed to start Docker child reaper: {error}"))?;
-    }
+    let worker_queue = Arc::clone(&queue);
+    std::thread::Builder::new()
+        .name("ezgha-docker-reaper".to_owned())
+        .spawn(move || docker_child_reaper_supervisor(worker_queue, Some(ready_sender)))
+        .map_err(|error| format!("failed to start Docker child reaper: {error}"))?;
     ready_receiver
         .recv_timeout(Duration::from_secs(1))
         .map_err(|error| format!("Docker child reaper failed readiness verification: {error}"))?;
@@ -3131,11 +3157,12 @@ fn managed_containers_until_deadline(deadline: Instant) -> Result<Vec<ManagedCon
     ]);
     let timeout = remaining_until_deadline(deadline, Instant::now())
         .context("docker ps readiness budget expired before spawning")?;
+    let probe_deadline = (Instant::now() + timeout).min(deadline);
     let out = run_docker_with_timeout_at_deadline(
         cmd,
         "listing managed containers",
         timeout,
-        deadline,
+        probe_deadline,
         docker_child_reaper(),
     )?;
     if !out.status.success() {
@@ -3262,11 +3289,12 @@ fn executing_runner_count_from_containers(
         |container, timeout| {
             let mut cmd = docker_cmd();
             cmd.args(["top", &container.id, "-eo", "pid,comm"]);
+            let probe_deadline = (Instant::now() + timeout).min(deadline);
             let out = run_docker_with_timeout_at_deadline(
                 cmd,
                 "checking Runner.Worker readiness",
                 timeout,
-                deadline,
+                probe_deadline,
                 docker_child_reaper(),
             )
             .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
@@ -4978,25 +5006,17 @@ minimum_isolation = "container"
 
     #[test]
     fn reaper_retries_transient_wait_without_dropping_owner() {
-        #[derive(Debug)]
-        struct FakeChild {
-            attempts: u32,
-        }
-
-        let mut child = FakeChild { attempts: 0 };
-        retry_wait_until_reaped(
-            &mut child,
-            |child| {
-                child.attempts += 1;
-                if child.attempts < 3 {
-                    Err("transient wait failure".to_owned())
-                } else {
-                    Ok(())
-                }
-            },
-            "transient wait test",
-        );
-        assert_eq!(child.attempts, 3);
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .spawn()
+            .unwrap();
+        let mut req = DockerReapRequest {
+            child,
+            detail: "test transient wait".to_string(),
+        };
+        assert!(!try_wait_owned_docker_child(&mut req));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(try_wait_owned_docker_child(&mut req));
     }
 
     #[test]
@@ -5095,59 +5115,67 @@ minimum_isolation = "container"
 
     #[test]
     fn stalled_reaper_wait_does_not_block_later_child() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let reaper = initialize_docker_child_reaper().unwrap();
-        let first = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let first_pid = first.id() as libc::pid_t;
-        reaper.enqueue(DockerReapRequest {
-            child: first,
-            detail: "stalled reaper wait test (first child)".to_owned(),
-        });
-        let first_wait_started = (0..100).any(|_| {
+        let mut stalled_pids = Vec::new();
+        for index in 0..4 {
+            let first = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            stalled_pids.push(first.id() as libc::pid_t);
+            reaper.enqueue(DockerReapRequest {
+                child: first,
+                detail: format!("stalled reaper wait test (child {index})"),
+            });
+        }
+        let stalled_waits_started = (0..100).any(|_| {
             let pending_empty = reaper
                 .queue
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .is_empty();
-            if pending_empty && reaper.queue.active.load(Ordering::Relaxed) > 0 {
+            if pending_empty && reaper.queue.active.load(Ordering::Relaxed) == 4 {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
             false
         });
         assert!(
-            first_wait_started,
-            "first child must be owned by a reaper worker"
+            stalled_waits_started,
+            "four stalled children must be owned by the reaper before the fifth arrives"
         );
 
-        let mut second = std::process::Command::new("/bin/sleep")
+        let mut fifth = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .unwrap();
-        let second_pid = second.id() as libc::pid_t;
-        second.kill().unwrap();
+        let fifth_pid = fifth.id() as libc::pid_t;
+        fifth.kill().unwrap();
         reaper.enqueue(DockerReapRequest {
-            child: second,
-            detail: "stalled reaper wait test (later child)".to_owned(),
+            child: fifth,
+            detail: "stalled reaper wait test (fifth child)".to_owned(),
         });
 
-        let mut second_reaped = false;
+        let mut fifth_reaped = false;
         for _ in 0..100 {
-            if unsafe { libc::kill(second_pid, 0) } != 0 {
-                second_reaped = true;
+            if unsafe { libc::kill(fifth_pid, 0) } != 0 {
+                fifth_reaped = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        unsafe {
-            libc::kill(first_pid, libc::SIGKILL);
+        for pid in stalled_pids {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
         assert!(
-            second_reaped,
-            "a stalled first wait must not block reaping a later killed child"
+            fifth_reaped,
+            "four stalled waits must not block reaping a later killed child"
         );
     }
 
