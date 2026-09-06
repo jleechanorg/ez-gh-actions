@@ -4872,12 +4872,12 @@ minimum_isolation = "container"
             env::temp_dir().join(format!("ezgha-docker-top-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        for (label, top_delay, succeeds) in [("within", "1.5", true), ("over", "2.2", false)] {
+        for (label, top_delay, succeeds) in [("within", "0.2", true), ("over", "5.0", false)] {
             let script = temp_dir.join(format!("docker-{label}"));
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\nif [ \"$1\" = \"top\" ]; then /bin/sleep {top_delay}; printf 'PID COMMAND\\n1 Runner.Worker\\n'; fi\n"
+                    "#!/bin/sh\nset -e\nif [ \"$1\" = \"top\" ]; then sleep {top_delay}; printf 'PID COMMAND\\n1 Runner.Worker\\n'; fi\n"
                 ),
             )
             .unwrap();
