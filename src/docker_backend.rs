@@ -4904,6 +4904,16 @@ minimum_isolation = "container"
                 reaper,
             );
 
+            if !succeeds && result.is_ok() {
+                let out = result.as_ref().unwrap();
+                panic!(
+                    "expected timeout failure for top_delay={}s but succeeded! status={:?}, stdout={:?}, stderr={:?}",
+                    top_delay,
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
             assert_eq!(result.is_ok(), succeeds, "top delay {top_delay}s");
             if !succeeds {
                 assert!(
