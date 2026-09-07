@@ -4877,7 +4877,7 @@ minimum_isolation = "container"
             std::fs::write(
                 &script,
                 format!(
-                    "#!/bin/sh\nset -e\nif [ \"$1\" = \"top\" ]; then sleep {top_delay}; printf 'PID COMMAND\\n1 Runner.Worker\\n'; fi\n"
+                    "#!/bin/sh\necho \"INVOKED WITH ARGS: $*\" >&2\nif [ \"$1\" = \"top\" ]; then sleep {top_delay}; printf 'PID COMMAND\\n1 Runner.Worker\\n'; fi\n"
                 ),
             )
             .unwrap();
