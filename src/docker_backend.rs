@@ -2515,8 +2515,7 @@ fn docker_cmd() -> Command {
 static TEST_HOST_CONTAINMENT_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
 /// Require Release 1 host containment before any Linux runner creation or mutation.
-#[allow(unused_variables)]
-pub fn require_host_containment(cfg: &Config) -> Result<()> {
+pub fn require_host_containment(_cfg: &Config) -> Result<()> {
     if is_macos_host() {
         return Ok(());
     }
@@ -2528,6 +2527,7 @@ pub fn require_host_containment(cfg: &Config) -> Result<()> {
     }
     #[cfg(target_os = "linux")]
     {
+        let cfg = _cfg;
         if cfg.policy.minimum_isolation == crate::config::IsolationLevel::Container
             && cfg.limits.cgroup_parent.as_deref() == Some("actions.slice")
         {
@@ -2549,10 +2549,10 @@ pub fn require_host_containment(cfg: &Config) -> Result<()> {
 }
 
 /// Require that a freshly created container PID is located beneath /actions.slice.
-#[allow(unused_variables)]
-pub fn require_container_actions_ancestry(container_id: &str) -> Result<()> {
+pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        let container_id = _container_id;
         let mut cmd = docker_cmd();
         cmd.args(["inspect", "--format", "{{.State.Pid}}", container_id]);
         let out = run_docker(cmd, "inspect container pid for ancestry check")?;
@@ -6269,6 +6269,7 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn configured_cgroup_parent_is_emitted_on_runner_start() {
         let _env = TestEnv::new("cgroup_parent");
         cpu_probe_overrides::set(Some(true));
