@@ -61,7 +61,7 @@ for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
-for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh; do
+for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
   if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
     cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
   fi
@@ -199,14 +199,19 @@ fi
 
 # Host crash controls are source-controlled and rendered into stable paths.
 for unit in app-lima-vm.slice agents.slice automation.slice \
-            agent-scope-reaper.service agent-scope-reaper.timer \
-            psi-oom-watcher.service psi-oom-watcher.timer; do
+            agent-scope-reaper.service agent-scope-reaper.timer; do
   if [ ! -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
     fail "Case A: host control unit was not installed: ${unit}"
   fi
 done
 
-for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh; do
+for unit in psi-oom-watcher.service psi-oom-watcher.timer; do
+  if [ -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
+    fail "Case A: deprecated host control unit was not removed: ${unit}"
+  fi
+done
+
+for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
   fi
