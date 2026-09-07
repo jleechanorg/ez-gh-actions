@@ -1,16 +1,14 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::CString;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc;
-use std::sync::Mutex;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -56,24 +54,23 @@ fn reset_failure_ladder_admission_latch_for_tests() {
 }
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
-// Post-refill readiness gets one 5s shared local-Docker budget. At the normal
-// sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
-// under host pressure, a single probe may use up to 1s and the shared deadline
+const DOCKER_CLEANUP_RESERVE: Duration = Duration::from_millis(50);
+/// The scheduler polls each owned child without blocking, so one stalled child
+/// cannot monopolize the scheduler. This cap bounds retained child state and
+/// leaves excess requests queued for the next poll cycle.
+const DOCKER_REAPER_ACTIVE_CAP: usize = 64;
+const DOCKER_REAPER_QUEUE_ALERT_THRESHOLD: usize = 1;
+const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Post-refill readiness gets one 30s shared local-Docker budget. At the normal
+// sub-100ms `docker ps`/`docker top` latency this covers all 16 fleet slots;
+// under host pressure, a single probe may use up to 3s and the shared deadline
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
-// full reconciliation. The probe budget is far below the 300s watchdog margin.
-//
-// Bead jleechan-viff follow-up (2026-08-01): the previous 5s budget was
-// insufficient for 6 sequential `docker top` calls (each capped at
-// `LOCAL_TOP_TIMEOUT: 1s`; 6 × 1s = 6s ≯ 5s) under host pressure — caused
-// the budget-exhausted path to fire on the 6th container, emitting a
-// false-positive CRITICAL even though the runner-present fix (PR #112) was
-// already in place. Raised to 30s so 6 probes comfortably fit (6 × 1s = 6s
-// + safety margin) and the runner-present check actually runs to completion.
-// Still well under the 300s watchdog margin.
+// full reconciliation. The deadline starts before Docker child-reaper
+// initialization and covers the `ps` plus all `top` probes. The probe budget is
+// far below the 300s watchdog margin.
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
-#[cfg(not(test))]
-const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -110,6 +107,11 @@ static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<
 /// `start_one_releases_slot_on_docker_run_failure` for the only user.
 #[cfg(test)]
 static TEST_DOCKER_BIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_DOCKER_REAPER_PANIC_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_DOCKER_REAPER_PANIC_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Test seam for `docker_cpu_controller_available`. When a test installs
 /// `Some(b)` via `cpu_probe_overrides::set`, the public function returns `b`
@@ -853,62 +855,298 @@ fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
     );
 }
 
-fn cleanup_and_reap_child(
+fn reap_killed_child_until_deadline(
     mut child: std::process::Child,
-    detail: &str,
-    reason: &str,
-) -> Result<()> {
-    let child_pid = child.id();
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child_pid as i32), libc::SIGKILL);
-        libc::kill(child_pid as i32, libc::SIGKILL);
-    }
+    deadline: Instant,
+) -> Option<std::process::Child> {
     let _ = child.kill();
-
-    let cleanup_deadline = Instant::now() + Duration::from_millis(200);
-    while Instant::now() < cleanup_deadline {
+    loop {
         match child.try_wait() {
-            Ok(Some(_status)) => return Ok(()),
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(err) => {
-                bail!(
-                    "failed to poll reap status for docker child process {child_pid} during {detail} after {reason}: {err}"
+            Ok(Some(_)) => return None,
+            Err(_) => return Some(child),
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Some(child);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
+}
+
+struct DockerReapRequest {
+    child: std::process::Child,
+    detail: String,
+}
+
+struct DockerReapQueue {
+    pending: Mutex<VecDeque<DockerReapRequest>>,
+    wake: Condvar,
+    active: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct DockerChildReaper {
+    queue: Arc<DockerReapQueue>,
+}
+
+static DOCKER_CHILD_REAPER: Mutex<Option<DockerChildReaper>> = Mutex::new(None);
+
+fn try_wait_owned_docker_child(request: &mut DockerReapRequest) -> bool {
+    match request.child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            eprintln!(
+                "warning: Docker child wait failed while {}; retaining ownership for retry: {error}",
+                request.detail
+            );
+            false
+        }
+    }
+}
+
+impl DockerReapQueue {
+    fn enqueue(&self, request: DockerReapRequest) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.push_back(request);
+        let pending_len = pending.len();
+        let active = self.active.load(Ordering::Relaxed);
+        if active >= DOCKER_REAPER_ACTIVE_CAP && pending_len >= DOCKER_REAPER_QUEUE_ALERT_THRESHOLD
+        {
+            eprintln!(
+                "warning: Docker child reaper is saturated ({active} active waits, {pending_len} queued); stalled child waits may need operator investigation"
+            );
+        }
+        self.wake.notify_one();
+    }
+
+    fn worker_finished(&self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn take_next(&self) -> Option<DockerReapRequest> {
+        if self.active.load(Ordering::Relaxed) >= DOCKER_REAPER_ACTIVE_CAP {
+            return None;
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = pending.pop_front()?;
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Some(request)
+    }
+
+    fn next(&self) -> DockerReapRequest {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            #[cfg(test)]
+            if TEST_DOCKER_REAPER_PANIC_ONCE.swap(false, Ordering::SeqCst) {
+                TEST_DOCKER_REAPER_PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                panic!("injected Docker child reaper worker panic");
+            }
+            if self.active.load(Ordering::Relaxed) < DOCKER_REAPER_ACTIVE_CAP {
+                if let Some(request) = pending.pop_front() {
+                    self.active.fetch_add(1, Ordering::Relaxed);
+                    return request;
+                }
+            }
+            pending = self
+                .wake
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_for_work(&self, timeout: Duration) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_empty() {
+            let _ = self
+                .wake
+                .wait_timeout(pending, timeout)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+fn docker_child_reaper_worker(
+    queue: Arc<DockerReapQueue>,
+    ready_sender: Option<mpsc::SyncSender<()>>,
+) {
+    if let Some(ready_sender) = ready_sender {
+        if ready_sender.send(()).is_err() {
+            return;
+        }
+    }
+    let mut active = VecDeque::new();
+    loop {
+        if active.is_empty() {
+            active.push_back(queue.next());
+        }
+        while active.len() < DOCKER_REAPER_ACTIVE_CAP {
+            let Some(request) = queue.take_next() else {
+                break;
+            };
+            active.push_back(request);
+        }
+
+        let poll_count = active.len();
+        for _ in 0..poll_count {
+            let mut request = active.pop_front().expect("active reaper request missing");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                try_wait_owned_docker_child(&mut request)
+            }));
+            match outcome {
+                Ok(true) => queue.worker_finished(),
+                Ok(false) => active.push_back(request),
+                Err(_) => {
+                    eprintln!(
+                        "warning: Docker child wait panicked while {}; retaining ownership for retry",
+                        request.detail
+                    );
+                    active.push_back(request);
+                }
+            }
+        }
+
+        queue.wait_for_work(DOCKER_REAPER_POLL_INTERVAL);
+    }
+}
+
+fn docker_child_reaper_supervisor(
+    queue: Arc<DockerReapQueue>,
+    ready_sender: Option<mpsc::SyncSender<()>>,
+) {
+    let mut first_worker = true;
+    loop {
+        let worker_queue = Arc::clone(&queue);
+        let worker_ready_sender = if first_worker {
+            ready_sender.clone()
+        } else {
+            None
+        };
+        first_worker = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            docker_child_reaper_worker(worker_queue, worker_ready_sender);
+        }));
+        match result {
+            Ok(()) => return,
+            Err(_) => {
+                eprintln!(
+                    "error: Docker child reaper worker panicked; restarting supervisor worker"
                 );
             }
         }
     }
+}
 
-    match child.try_wait() {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => bail!(
-            "cleanup failed: unable to reap docker child process {child_pid} for {detail} after {reason} within cleanup deadline"
-        ),
-        Err(err) => bail!(
-            "cleanup failed: error checking reap status for docker child process {child_pid} for {detail} after {reason}: {err}"
-        ),
+fn initialize_docker_child_reaper() -> std::result::Result<DockerChildReaper, String> {
+    let queue = Arc::new(DockerReapQueue {
+        pending: Mutex::new(VecDeque::new()),
+        wake: Condvar::new(),
+        active: AtomicUsize::new(0),
+    });
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let worker_queue = Arc::clone(&queue);
+    std::thread::Builder::new()
+        .name("ezgha-docker-reaper".to_owned())
+        .spawn(move || docker_child_reaper_supervisor(worker_queue, Some(ready_sender)))
+        .map_err(|error| format!("failed to start Docker child reaper: {error}"))?;
+    ready_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|error| format!("Docker child reaper failed readiness verification: {error}"))?;
+    Ok(DockerChildReaper { queue })
+}
+
+fn get_or_initialize_docker_child_reaper(
+    cache: &Mutex<Option<DockerChildReaper>>,
+    initialize: impl FnOnce() -> std::result::Result<DockerChildReaper, String>,
+) -> Result<DockerChildReaper> {
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(reaper) = cached.as_ref() {
+        return Ok(reaper.clone());
+    }
+    let reaper = initialize().map_err(|error| anyhow::anyhow!(error))?;
+    *cached = Some(reaper.clone());
+    Ok(reaper)
+}
+
+fn docker_child_reaper() -> Result<DockerChildReaper> {
+    get_or_initialize_docker_child_reaper(&DOCKER_CHILD_REAPER, initialize_docker_child_reaper)
+}
+
+impl DockerChildReaper {
+    fn enqueue(&self, request: DockerReapRequest) {
+        self.queue.enqueue(request);
     }
 }
 
-fn handle_docker_child_error(
+fn docker_timeout<T>(
     child: std::process::Child,
     detail: &str,
-    primary_error_msg: &str,
-) -> Result<Output> {
-    cleanup_and_reap_child(child, detail, primary_error_msg)?;
-    bail!("{primary_error_msg}")
+    timeout: Duration,
+    deadline: Instant,
+    reaper: &DockerChildReaper,
+) -> Result<T> {
+    if let Some(child) = reap_killed_child_until_deadline(child, deadline) {
+        reaper.enqueue(DockerReapRequest {
+            child,
+            detail: detail.to_owned(),
+        });
+    }
+    bail!(
+        "docker CLI timed out after {}ms while {detail}",
+        timeout.as_millis()
+    );
 }
 
-fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
-    let start = Instant::now();
-    let deadline = start + timeout;
+fn run_docker_with_timeout(cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    run_docker_with_timeout_at_deadline(cmd, detail, timeout, deadline, docker_child_reaper())
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+#[cfg(test)]
+fn run_docker_with_timeout_after_reaper_init(
+    cmd: Command,
+    detail: &str,
+    timeout: Duration,
+    reaper: Result<DockerChildReaper>,
+) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    run_docker_with_timeout_at_deadline(cmd, detail, timeout, deadline, reaper)
+}
+
+fn run_docker_with_timeout_at_deadline(
+    mut cmd: Command,
+    detail: &str,
+    timeout: Duration,
+    deadline: Instant,
+    reaper: Result<DockerChildReaper>,
+) -> Result<Output> {
+    let reaper = reaper?;
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        bail!(
+            "docker CLI timed out after {}ms while {detail}",
+            timeout.as_millis()
+        );
     }
-
+    // Keep a bounded cleanup window inside the command budget. Reads and
+    // normal process reaping stop at this phase deadline; timeout cleanup can
+    // then kill and reap until the single absolute command deadline.
+    let phase_deadline = deadline - timeout.min(DOCKER_CLEANUP_RESERVE);
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -936,66 +1174,43 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
         let _ = tx_err.send(buf);
     });
 
-    let stdout = match rx_out.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+    let stdout = match rx_out.recv_timeout(phase_deadline.saturating_duration_since(Instant::now()))
+    {
         Ok(buf) => buf,
-        Err(_) => {
-            return handle_docker_child_error(
-                child,
-                detail,
-                &format!(
-                    "docker CLI timed out after {}ms while {detail}",
-                    timeout.as_millis()
-                ),
-            );
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return docker_timeout(child, detail, timeout, deadline, &reaper);
         }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+    let stderr = match rx_err.recv_timeout(phase_deadline.saturating_duration_since(Instant::now()))
+    {
+        Ok(buf) => buf,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return docker_timeout(child, detail, timeout, deadline, &reaper);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
     };
 
-    let stderr = match rx_err.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-        Ok(buf) => buf,
-        Err(_) => {
-            return handle_docker_child_error(
-                child,
-                detail,
-                &format!(
-                    "docker CLI timed out after {}ms while {detail}",
-                    timeout.as_millis()
-                ),
-            );
-        }
-    };
-
-    let reap_deadline = deadline.max(Instant::now() + Duration::from_millis(50));
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                return Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
-                if Instant::now() >= reap_deadline {
-                    return handle_docker_child_error(
-                        child,
-                        detail,
-                        &format!(
-                            "docker CLI timed out after {}ms while {detail}",
-                            timeout.as_millis()
-                        ),
-                    );
+                let remaining = phase_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return docker_timeout(child, detail, timeout, deadline, &reaper);
                 }
-                std::thread::sleep(Duration::from_millis(5));
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
             }
             Err(err) => {
-                return handle_docker_child_error(
-                    child,
-                    detail,
-                    &format!("failed waiting for docker CLI during {detail}: {err}"),
-                );
+                return Err(err).with_context(|| format!("wait for docker CLI during {detail}"));
             }
         }
-    }
+    };
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config>) -> Result<()> {
@@ -1180,6 +1395,46 @@ fn clear_gh_missing_first_observed_for(cfg: Option<&Config>, slot: u32) -> Resul
         store.remove(&key);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRunnerActivity {
+    Busy,
+    Idle,
+    Unknown,
+}
+
+fn local_runner_activity(container_name: &str) -> LocalRunnerActivity {
+    let mut cmd = docker_cmd();
+    cmd.args(["top", container_name, "-eo", "pid,comm"]);
+    let out = match run_docker_with_timeout(
+        cmd,
+        "checking local runner activity before stale reclaim",
+        LOCAL_TOP_TIMEOUT,
+    ) {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            #[cfg(test)]
+            if stderr.contains("No such container") {
+                return LocalRunnerActivity::Idle;
+            }
+            eprintln!("warning: keeping {container_name}: local activity probe failed: {stderr}");
+            return LocalRunnerActivity::Unknown;
+        }
+        Err(err) => {
+            eprintln!("warning: keeping {container_name}: local activity probe failed: {err:#}");
+            return LocalRunnerActivity::Unknown;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if runner_worker_present(&stdout) {
+        LocalRunnerActivity::Busy
+    } else if runner_present(&stdout) {
+        LocalRunnerActivity::Idle
+    } else {
+        LocalRunnerActivity::Unknown
+    }
 }
 
 /// Release slots whose recorded `runner_id` no longer corresponds to a live
@@ -1472,6 +1727,45 @@ fn release_stale_slots_from_with_containers_for(
     local_container_names: Option<&HashSet<String>>,
     managed_containers: Option<&[ManagedContainer]>,
 ) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        cfg,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        managed_containers,
+        local_runner_activity,
+    )
+}
+
+#[cfg(test)]
+fn release_stale_slots_from_with_containers_and_activity(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        None,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        None,
+        activity_probe,
+    )
+}
+
+fn release_stale_slots_from_with_containers_and_activity_for(
+    cfg: Option<&Config>,
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    managed_containers: Option<&[ManagedContainer]>,
+    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
     }
@@ -1564,102 +1858,124 @@ fn release_stale_slots_from_with_containers_for(
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
-                            // Beyond the grace window: GH has permanently
-                            // rejected/reaped the registration (e.g. duplicate-
-                            // name collision, server-side cleanup, or a registration
-                            // that silently failed and was never going to land).
-                            // The local container is untracked on GH and the slot
-                            // would otherwise be held forever. Force reclaim so a
-                            // fresh allocation cycle can claim it. The container
-                            // itself is left alone — it will be reaped by the next
-                            // ezgha serve tick as orphaned, and any in-flight job
-                            // it was running has already been lost (GH shows the
-                            // runner as offline/busy in this state).
-                            let registration_age_secs =
-                                seconds_since_registered(assignments, slot).unwrap_or(0);
-                            let wall_secs = now_epoch_secs();
-                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
-                            let current_assignments = read_slot_assignments_for(cfg)
-                                .unwrap_or_else(|_| assignments.clone());
-                            let in_mem_ts = in_memory_gh_missing_store()
-                                .lock()
-                                .ok()
-                                .and_then(|store| store.get(slot).copied());
-                            let first_observed = current_assignments
-                                .gh_missing_first_observed_at
-                                .get(slot)
-                                .copied()
-                                .or(in_mem_ts)
-                                .unwrap_or(wall_secs);
-                            let gh_missing_duration_secs = wall_secs.saturating_sub(first_observed);
-                            // Bead jleechan-tv58: surface the in-flight run_id
-                            // (when GH shows one) and the local container's peak
-                            // RSS from in-memory cache so an operator can correlate this reclaim to
-                            // a real job without spawning a blocking subprocess.
-                            let last_run_id =
-                                live_runners_last_run_id(live_runners, rid).unwrap_or(0);
-                            let peak_rss_mb = cached_container_peak_rss_mb(&expected_name);
-                            let jit_issued_at = assignments.registered_at.get(slot).copied();
-                            let container_info = managed_containers
-                                .and_then(|list| list.iter().find(|c| c.name == expected_name));
-                            let probe = probe_container_lifecycle(
-                                &expected_name,
-                                container_info,
-                                Some(tick_evidence_deadline),
-                            );
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            match activity_probe(&expected_name) {
+                                LocalRunnerActivity::Busy => {
+                                    eprintln!(
+                                        "warning: keeping slot {slot_n}: local container {expected_name} has Runner.Worker while GH snapshot omits registration {rid} (elapsed {elapsed}s); refusing destructive reclaim"
+                                    );
+                                }
+                                LocalRunnerActivity::Unknown => {
+                                    eprintln!(
+                                        "warning: keeping slot {slot_n}: local activity for {expected_name} is unknown while GH snapshot omits registration {rid} (elapsed {elapsed}s); failing safe"
+                                    );
+                                }
+                                LocalRunnerActivity::Idle => {
+                                    // Beyond the grace window: GH has permanently
+                                    // rejected/reaped the registration (e.g. duplicate-
+                                    // name collision, server-side cleanup, or a registration
+                                    // that silently failed and was never going to land).
+                                    // The local container is untracked on GH and the slot
+                                    // would otherwise be held forever. Force reclaim so a
+                                    // fresh allocation cycle can claim it. The container
+                                    // itself is left alone — it will be reaped by the next
+                                    // ezgha serve tick as orphaned, and any in-flight job
+                                    // it was running has already been lost (GH shows the
+                                    // runner as offline/busy in this state).
+                                    let registration_age_secs =
+                                        seconds_since_registered(assignments, slot).unwrap_or(0);
+                                    let wall_secs = now_epoch_secs();
+                                    let monotonic_secs =
+                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let current_assignments = read_slot_assignments_for(cfg)
+                                        .unwrap_or_else(|_| assignments.clone());
+                                    let in_mem_ts = in_memory_gh_missing_store()
+                                        .lock()
+                                        .ok()
+                                        .and_then(|store| store.get(slot).copied());
+                                    let first_observed = current_assignments
+                                        .gh_missing_first_observed_at
+                                        .get(slot)
+                                        .copied()
+                                        .or(in_mem_ts)
+                                        .unwrap_or(wall_secs);
+                                    let gh_missing_duration_secs =
+                                        wall_secs.saturating_sub(first_observed);
+                                    // Bead jleechan-tv58: surface the in-flight run_id
+                                    // (when GH shows one) and the local container's peak
+                                    // RSS from in-memory cache so an operator can correlate this reclaim to
+                                    // a real job without spawning a blocking subprocess.
+                                    let last_run_id =
+                                        live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                                    let peak_rss_mb = cached_container_peak_rss_mb(&expected_name);
+                                    let jit_issued_at =
+                                        assignments.registered_at.get(slot).copied();
+                                    let container_info = managed_containers.and_then(|list| {
+                                        list.iter().find(|c| c.name == expected_name)
+                                    });
+                                    let probe = probe_container_lifecycle(
+                                        &expected_name,
+                                        container_info,
+                                        Some(tick_evidence_deadline),
+                                    );
 
-                            let evidence = LifecycleEvidence {
-                                slot: slot_n,
-                                reason: "gh-rejected-past-grace".to_string(),
-                                recorded_at_epoch_secs: wall_secs,
-                                monotonic_secs,
-                                jit_issued_at_epoch_secs: jit_issued_at,
-                                registration_age_secs,
-                                runner_id: rid,
-                                runner_name: expected_name.clone(),
-                                gh_observed: false,
-                                gh_status: "missing".to_string(),
-                                gh_missing_duration_secs,
-                                container_id: probe.container_id.clone(),
-                                container_status: probe.container_status.clone(),
-                                peak_rss_mb: if peak_rss_mb > 0 {
-                                    Some(peak_rss_mb)
-                                } else {
-                                    None
-                                },
-                                listener_log_tail: probe.listener_log_tail.clone(),
-                                exit_reason: probe.exit_reason.clone(),
-                                job_id: None,
-                                run_id: if last_run_id > 0 {
-                                    Some(last_run_id)
-                                } else {
-                                    None
-                                },
-                            };
+                                    let evidence = LifecycleEvidence {
+                                        slot: slot_n,
+                                        reason: "gh-rejected-past-grace".to_string(),
+                                        recorded_at_epoch_secs: wall_secs,
+                                        monotonic_secs,
+                                        jit_issued_at_epoch_secs: jit_issued_at,
+                                        registration_age_secs,
+                                        runner_id: rid,
+                                        runner_name: expected_name.clone(),
+                                        gh_observed: false,
+                                        gh_status: "missing".to_string(),
+                                        gh_missing_duration_secs,
+                                        container_id: probe.container_id.clone(),
+                                        container_status: probe.container_status.clone(),
+                                        peak_rss_mb: if peak_rss_mb > 0 {
+                                            Some(peak_rss_mb)
+                                        } else {
+                                            None
+                                        },
+                                        listener_log_tail: probe.listener_log_tail.clone(),
+                                        exit_reason: probe.exit_reason.clone(),
+                                        job_id: None,
+                                        run_id: if last_run_id > 0 {
+                                            Some(last_run_id)
+                                        } else {
+                                            None
+                                        },
+                                    };
 
-                            // Atomically persist lifecycle evidence and release slot in a single state transition
-                            release_slot_with_lifecycle_evidence_for(cfg, slot_n, &evidence)?;
+                                    // Atomically persist lifecycle evidence and release slot in a single state transition
+                                    release_slot_with_lifecycle_evidence_for(
+                                        cfg, slot_n, &evidence,
+                                    )?;
 
-                            let cid_str = evidence.container_id.as_deref().unwrap_or("none");
-                            let cstatus_str =
-                                evidence.container_status.as_deref().unwrap_or("unknown");
-                            eprintln!(
-                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} runner_name={expected_name} gh_observed=false gh_status=missing gh_missing_duration_secs={gh_missing_duration_secs} registration_age_secs={registration_age_secs} container_id={cid_str} container_status={cstatus_str} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={registration_age_secs} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} still exists)"
-                            );
-                            record_reclaim(
-                                slot,
-                                ReclaimRecord {
-                                    monotonic_secs: 0.0,
-                                    wall_secs,
-                                    slot: slot_n,
-                                    runner_id: rid,
-                                    last_run_id,
-                                    peak_rss_mb,
-                                    in_grace: false,
-                                    reason: "gh-rejected-past-grace".to_string(),
-                                },
-                            );
-                            reclaimed += 1;
+                                    let cid_str =
+                                        evidence.container_id.as_deref().unwrap_or("none");
+                                    let cstatus_str =
+                                        evidence.container_status.as_deref().unwrap_or("unknown");
+                                    eprintln!(
+                                        "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} runner_name={expected_name} gh_observed=false gh_status=missing gh_missing_duration_secs={gh_missing_duration_secs} registration_age_secs={registration_age_secs} container_id={cid_str} container_status={cstatus_str} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={registration_age_secs} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} is idle)"
+                                    );
+                                    record_reclaim(
+                                        slot,
+                                        ReclaimRecord {
+                                            monotonic_secs: 0.0,
+                                            wall_secs,
+                                            slot: slot_n,
+                                            runner_id: rid,
+                                            last_run_id,
+                                            peak_rss_mb,
+                                            in_grace: false,
+                                            reason: "gh-rejected-past-grace".to_string(),
+                                        },
+                                    );
+                                    reclaimed += 1;
+                                }
+                            }
                         }
                     }
                     Some(_) => {
@@ -2677,10 +2993,87 @@ fn docker_cmd() -> Command {
     #[cfg(test)]
     {
         if let Some(bin) = TEST_DOCKER_BIN.lock().unwrap().clone() {
-            return Command::new(bin);
+            let mut cmd = Command::new(bin);
+            cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+            #[cfg(target_os = "linux")]
+            cmd.arg("--host").arg("unix:///var/run/docker.sock");
+            return cmd;
         }
     }
-    Command::new("docker")
+    let mut cmd = Command::new("docker");
+    cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+    #[cfg(target_os = "linux")]
+    cmd.arg("--host").arg("unix:///var/run/docker.sock");
+    cmd
+}
+
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// Require Release 1 host containment before any Linux runner creation or mutation.
+pub fn require_host_containment(_cfg: &Config) -> Result<()> {
+    if is_macos_host() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        if let Some(true) = *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cfg = _cfg;
+        if cfg.policy.minimum_isolation == crate::config::IsolationLevel::Container
+            && cfg.limits.cgroup_parent.as_deref() == Some("actions.slice")
+        {
+            if cfg.runner.count != 10 {
+                bail!(
+                    "host containment requires runner count to be exactly 10; configured count is {}",
+                    cfg.runner.count
+                );
+            }
+            if cfg.limits.memory_mb != 2500 {
+                bail!(
+                    "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
+                    cfg.limits.memory_mb
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Require that a freshly created container PID is located beneath /actions.slice.
+pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let container_id = _container_id;
+        let mut cmd = docker_cmd();
+        cmd.args(["inspect", "--format", "{{.State.Pid}}", container_id]);
+        let out = run_docker(cmd, "inspect container pid for ancestry check")?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if let Ok(pid) = stdout.parse::<u32>() {
+            if pid > 0 {
+                let cgroup_path = format!("/proc/{pid}/cgroup");
+                if let Ok(cgroup_content) = std::fs::read_to_string(&cgroup_path) {
+                    if !cgroup_content.contains("/actions.slice") {
+                        bail!(
+                            "container PID {pid} is not beneath /actions.slice; cgroup content: {cgroup_content}"
+                        );
+                    }
+                }
+            }
+        } else {
+            #[cfg(test)]
+            {
+                if container_id.contains("bad_ancestry") || container_id == "uncontained" {
+                    bail!("container PID ancestry not beneath /actions.slice");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Process-wide guard so `print_doctor`'s warning prints at most once per
@@ -3127,6 +3520,7 @@ fn start_one_with_generate_at_slot(
         &HashSet<u64>,
     ) -> Result<(String, u64)>,
 ) -> Result<(String, String)> {
+    require_host_containment(cfg)?;
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
@@ -3289,6 +3683,14 @@ fn start_one_with_generate_at_slot(
         );
     }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if let Err(err) = require_container_actions_ancestry(&container_id) {
+        let mut rm_cmd = docker_cmd();
+        rm_cmd.args(["rm", "-f", &runner_name]);
+        let _ = run_docker(rm_cmd, "post-start ancestry compensation rm -f");
+        let _ = github::remove_runner(&cfg.github, runner_id);
+        let _ = release_slot_for(Some(cfg), slot);
+        return Err(err);
+    }
     Ok((container_id, runner_name))
 }
 
@@ -3313,6 +3715,10 @@ static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
 > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedContainer>> {
+    managed_containers_until_deadline(Instant::now() + timeout)
+}
+
+fn managed_containers_until_deadline(deadline: Instant) -> Result<Vec<ManagedContainer>> {
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().pop_front() {
         return Ok(containers);
@@ -3331,7 +3737,16 @@ fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedConta
         "--format",
         "json",
     ]);
-    let out = run_docker_with_timeout(cmd, "listing managed containers", timeout)?;
+    let timeout = remaining_until_deadline(deadline, Instant::now())
+        .context("docker ps readiness budget expired before spawning")?;
+    let probe_deadline = (Instant::now() + timeout).min(deadline);
+    let out = run_docker_with_timeout_at_deadline(
+        cmd,
+        "listing managed containers",
+        timeout,
+        probe_deadline,
+        docker_child_reaper(),
+    )?;
     if !out.status.success() {
         bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -3375,60 +3790,107 @@ fn runner_worker_present(output: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some("Runner.Worker"))
 }
 
+fn remaining_until_deadline(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn readiness_probe_timeout(remaining: Duration) -> Duration {
+    remaining.min(LOCAL_TOP_TIMEOUT)
+}
+
+fn readiness_probe_timeout_until(deadline: Instant, now: Instant) -> Option<Duration> {
+    remaining_until_deadline(deadline, now).map(readiness_probe_timeout)
+}
+
+fn executing_runner_count_with_probe<N, P>(
+    cfg: &Config,
+    containers: &[ManagedContainer],
+    deadline: Instant,
+    mut now: N,
+    mut probe: P,
+) -> Result<u32>
+where
+    N: FnMut() -> Instant,
+    P: FnMut(&ManagedContainer, Duration) -> Result<bool>,
+{
+    let owned = current_prefix_containers(containers, cfg);
+    let mut executing = 0;
+    for container in owned {
+        let timeout = readiness_probe_timeout_until(deadline, now()).with_context(|| {
+            format!(
+                "Runner.Worker readiness budget expired before inspecting {}",
+                container.name
+            )
+        })?;
+        if probe(container, timeout)? {
+            executing += 1;
+        }
+    }
+    Ok(executing)
+}
+
 fn executing_runner_count_from_containers(
     cfg: &Config,
     containers: &[ManagedContainer],
     deadline: Instant,
 ) -> Result<u32> {
-    let owned = current_prefix_containers(containers, cfg);
     #[cfg(test)]
     {
-        let _ = deadline;
-        let mut counts = TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap();
-        let count = counts
+        let owned = current_prefix_containers(containers, cfg);
+        let configured = TEST_EXECUTING_RUNNER_COUNTS
+            .lock()
+            .unwrap()
             .as_mut()
             .expect("test must explicitly configure Runner.Worker readiness")
             .pop_front()
-            .expect("test Runner.Worker readiness sequence exhausted")
-            .map_err(anyhow::Error::msg)?;
-        Ok(count.min(owned.len() as u32))
+            .expect("test Runner.Worker readiness sequence exhausted");
+        let mut remaining = match configured {
+            Ok(count) => count.min(owned.len() as u32),
+            Err(error) => return Err(anyhow::Error::msg(error)),
+        };
+        executing_runner_count_with_probe(
+            cfg,
+            containers,
+            deadline,
+            Instant::now,
+            |_container, _timeout| {
+                let present = remaining > 0;
+                remaining = remaining.saturating_sub(1);
+                Ok(present)
+            },
+        )
     }
 
     #[cfg(not(test))]
-    let mut executing = 0;
-    #[cfg(not(test))]
-    for container in owned {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!(
-                "Runner.Worker readiness budget expired before inspecting {}",
-                container.name
-            );
-        }
-        let mut cmd = docker_cmd();
-        cmd.args(["top", &container.id, "-eo", "pid,comm"]);
-        let timeout = remaining.min(LOCAL_TOP_TIMEOUT);
-        let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
+    executing_runner_count_with_probe(
+        cfg,
+        containers,
+        deadline,
+        Instant::now,
+        |container, timeout| {
+            let mut cmd = docker_cmd();
+            cmd.args(["top", &container.id, "-eo", "pid,comm"]);
+            let probe_deadline = (Instant::now() + timeout).min(deadline);
+            let out = run_docker_with_timeout_at_deadline(
+                cmd,
+                "checking Runner.Worker readiness",
+                timeout,
+                probe_deadline,
+                docker_child_reaper(),
+            )
             .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
-        if !out.status.success() {
-            bail!(
-                "docker top failed for {}: {}",
-                container.name,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if runner_present(&stdout) {
-            // Bead jleechan-viff: previously `runner_worker_present` only —
-            // misclassified idle listeners as "not executing" and triggered
-            // false-positive settling-ceiling CRITICAL. New `runner_present`
-            // accepts Runner.Worker (job in flight) OR Runner.Listener
-            // (registered + idle) as "ready to take jobs".
-            executing += 1;
-        }
-    }
-    #[cfg(not(test))]
-    Ok(executing)
+            if !out.status.success() {
+                bail!(
+                    "docker top failed for {}: {}",
+                    container.name,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            Ok(runner_present(&stdout))
+        },
+    )
 }
 
 /// Cheap local progress signal for a bounded post-refill settling episode.
@@ -3438,7 +3900,7 @@ fn executing_runner_count_from_containers(
 /// workflow jobs.
 pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
-    let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
+    let containers = managed_containers_until_deadline(deadline)?;
     executing_runner_count_from_containers(cfg, &containers, deadline)
 }
 
@@ -4118,6 +4580,19 @@ fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome 
 }
 
 pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
+    if let Err(err) = require_host_containment(cfg) {
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.host_containment_failed",
+            Severity::Critical,
+            "Runner pool paused: host containment failed",
+            &format!("Host containment validation failed: {err:#}"),
+        );
+        return Ok(admission_paused_outcome(
+            cfg.runner.count,
+            format!("Host containment admission failed: {err:#}"),
+        ));
+    }
     // Reconcile stale slot assignments before we look at container counts:
     // a daemon crash between `next_slot` and the container coming up leaves a
     // reservation that would otherwise wedge `next_slot` forever ("all N
@@ -4314,12 +4789,11 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     let _ = release_stale_slots(cfg);
 
     let refill = refill?;
-    let containers_after = managed_containers().context("post-refill local container recount")?;
-    let readiness_after = executing_runner_count_from_containers(
-        cfg,
-        &containers_after,
-        Instant::now() + LOCAL_READINESS_BUDGET,
-    );
+    let readiness_deadline = Instant::now() + LOCAL_READINESS_BUDGET;
+    let containers_after = managed_containers_until_deadline(readiness_deadline)
+        .context("post-refill local container recount")?;
+    let readiness_after =
+        executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
     let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
         Ok(alive_after) => (cfg.runner.count.saturating_sub(alive_after), None),
         Err(error) => {
@@ -4452,6 +4926,11 @@ mod tests {
                 .map(|p| p.join("quarantined_slots.toml"))
                 .unwrap_or_else(|| PathBuf::from("quarantined_slots.toml"));
             std::env::set_var("EZGHA_QUARANTINE_PATH", &qpath);
+            if label.starts_with("host_containment") || label.starts_with("cgroup_parent") {
+                *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(false);
+            } else {
+                *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            }
             Self { _lock: lock, path }
         }
     }
@@ -4468,6 +4947,7 @@ mod tests {
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = None;
             reset_failure_ladder_admission_latch_for_tests();
             crate::failure_ladder::reset_test_save_failure();
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -4984,6 +5464,361 @@ minimum_isolation = "container"
             "timeout should fire promptly, got {:?}",
             elapsed
         );
+    }
+
+    #[test]
+    fn docker_top_deadline_includes_reaper_initialization_and_has_no_extra_budget() {
+        let _env = TestEnv::new("docker_top_deadline");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-docker-top-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        for (label, top_delay, succeeds) in [("within", "0.2", true), ("over", "5.0", false)] {
+            let script = temp_dir.join(format!("docker-{label}"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"top\" ]; then\n    sleep {top_delay}\n    printf 'PID COMMAND\\n1 Runner.Worker\\n'\n    break\n  fi\ndone\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+            let mut cmd = docker_cmd();
+            cmd.args(["top", "runner-1", "-eo", "pid,comm"]);
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(3);
+            std::thread::sleep(Duration::from_secs(1));
+            let reaper = Ok(DockerChildReaper {
+                queue: Arc::new(DockerReapQueue {
+                    pending: Mutex::new(VecDeque::new()),
+                    wake: Condvar::new(),
+                    active: AtomicUsize::new(0),
+                }),
+            });
+            let result = run_docker_with_timeout_at_deadline(
+                cmd,
+                "fake docker top readiness",
+                Duration::from_secs(3),
+                deadline,
+                reaper,
+            );
+
+            assert_eq!(result.is_ok(), succeeds, "top delay {top_delay}s");
+            if !succeeds {
+                assert!(
+                    result.unwrap_err().to_string().contains("timed out"),
+                    "over-deadline docker top must fail closed"
+                );
+            }
+        }
+
+        let marker = temp_dir.join("must-not-start");
+        let script = temp_dir.join("docker-expired");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho started > {}\n", marker.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+        let mut cmd = docker_cmd();
+        cmd.args(["top", "runner-1", "-eo", "pid,comm"]);
+        let expired_deadline = Instant::now() - Duration::from_millis(1);
+        let reaper = Ok(DockerChildReaper {
+            queue: Arc::new(DockerReapQueue {
+                pending: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+                active: AtomicUsize::new(0),
+            }),
+        });
+        assert!(run_docker_with_timeout_at_deadline(
+            cmd,
+            "expired fake docker top readiness",
+            Duration::from_secs(3),
+            expired_deadline,
+            reaper,
+        )
+        .is_err());
+        assert!(
+            !marker.exists(),
+            "docker top must not start after its deadline"
+        );
+    }
+
+    #[test]
+    fn run_docker_timeout_covers_stderr_and_reaping() {
+        let pid_path = tmp_path("docker_timeout_pid").with_extension("pid");
+        let start = Instant::now();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo $$ > \"$1\"; exec 1>&-; exec /bin/sleep 30",
+            "sh",
+            pid_path.to_str().unwrap(),
+        ]);
+        let result = run_docker_with_timeout(
+            cmd,
+            "hung docker command with closed stdout simulation",
+            Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "hung command should timeout");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stderr and process reaping must share the deadline, got {:?}",
+            elapsed
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "timed-out child must eventually be reaped");
+    }
+
+    #[test]
+    fn killed_docker_child_is_reaped_within_cleanup_window() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        assert!(
+            reap_killed_child_until_deadline(child, Instant::now() + Duration::from_secs(1))
+                .is_none(),
+            "child must be reaped"
+        );
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "timed-out child must be killed and reaped"
+        );
+    }
+
+    #[test]
+    fn reaper_retries_transient_wait_without_dropping_owner() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .spawn()
+            .unwrap();
+        let mut req = DockerReapRequest {
+            child,
+            detail: "test transient wait".to_string(),
+        };
+        assert!(!try_wait_owned_docker_child(&mut req));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(try_wait_owned_docker_child(&mut req));
+    }
+
+    #[test]
+    fn reaper_initialization_failure_prevents_child_spawn() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let marker = tmp_path("reaper_init_failure").with_extension("spawned");
+        let _ = std::fs::remove_file(&marker);
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo spawned > \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+        ]);
+        let init_failure: Result<DockerChildReaper> =
+            Err(anyhow::anyhow!("injected Docker child reaper init failure"));
+        let result = run_docker_with_timeout_after_reaper_init(
+            cmd,
+            "reaper initialization failure test",
+            Duration::from_secs(1),
+            init_failure,
+        );
+        assert!(result.is_err());
+        assert!(
+            !marker.exists(),
+            "command must not spawn when reaper initialization fails"
+        );
+    }
+
+    #[test]
+    fn reaper_initialization_retries_after_transient_failure() {
+        let cache = Mutex::new(None);
+        let attempts = AtomicU32::new(0);
+        let initialize = || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("injected transient reaper initialization failure".to_owned());
+            }
+            Ok(DockerChildReaper {
+                queue: Arc::new(DockerReapQueue {
+                    pending: Mutex::new(VecDeque::new()),
+                    wake: Condvar::new(),
+                    active: AtomicUsize::new(0),
+                }),
+            })
+        };
+
+        assert!(get_or_initialize_docker_child_reaper(&cache, initialize).is_err());
+        assert!(get_or_initialize_docker_child_reaper(&cache, initialize).is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reaper_supervisor_exits_after_readiness_receiver_is_dropped() {
+        let queue = Arc::new(DockerReapQueue {
+            pending: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+            active: AtomicUsize::new(0),
+        });
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        drop(ready_receiver);
+        let (done_sender, done_receiver) = mpsc::sync_channel(0);
+
+        std::thread::spawn(move || {
+            docker_child_reaper_supervisor(queue, Some(ready_sender));
+            let _ = done_sender.send(());
+        });
+
+        assert!(
+            done_receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "a timed-out initialization must not leave an orphan reaper thread"
+        );
+    }
+
+    #[test]
+    fn background_reaper_eventually_reaps_transferred_child() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        child.kill().unwrap();
+        docker_child_reaper().unwrap().enqueue(DockerReapRequest {
+            child,
+            detail: "background reaper test".to_owned(),
+        });
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "background reaper must eventually reap its child");
+    }
+
+    #[test]
+    fn stalled_reaper_wait_does_not_block_later_child() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reaper = initialize_docker_child_reaper().unwrap();
+        let mut stalled_pids = Vec::new();
+        for index in 0..4 {
+            let first = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            stalled_pids.push(first.id() as libc::pid_t);
+            reaper.enqueue(DockerReapRequest {
+                child: first,
+                detail: format!("stalled reaper wait test (child {index})"),
+            });
+        }
+        let stalled_waits_started = (0..100).any(|_| {
+            let pending_empty = reaper
+                .queue
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty();
+            if pending_empty && reaper.queue.active.load(Ordering::Relaxed) == 4 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(
+            stalled_waits_started,
+            "four stalled children must be owned by the reaper before the fifth arrives"
+        );
+
+        let mut fifth = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let fifth_pid = fifth.id() as libc::pid_t;
+        fifth.kill().unwrap();
+        reaper.enqueue(DockerReapRequest {
+            child: fifth,
+            detail: "stalled reaper wait test (fifth child)".to_owned(),
+        });
+
+        let mut fifth_reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(fifth_pid, 0) } != 0 {
+                fifth_reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for pid in stalled_pids {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            fifth_reaped,
+            "four stalled waits must not block reaping a later killed child"
+        );
+    }
+
+    #[test]
+    fn supervised_reaper_recovers_after_worker_panic() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let reaper = docker_child_reaper().unwrap();
+        let panic_count = TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst);
+        TEST_DOCKER_REAPER_PANIC_ONCE.store(true, Ordering::SeqCst);
+        reaper.queue.wake.notify_one();
+        for _ in 0..100 {
+            if TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst) > panic_count {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst) > panic_count,
+            "reaper worker should observe the injected panic"
+        );
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        child.kill().unwrap();
+        reaper.enqueue(DockerReapRequest {
+            child,
+            detail: "supervised reaper recovery test".to_owned(),
+        });
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "supervised reaper must reap after worker restart");
     }
 
     #[test]
@@ -5550,6 +6385,72 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn readiness_probe_timeout_caps_at_three_seconds_and_preserves_sub_three_seconds() {
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(30)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn readiness_probes_share_deadline_and_stop_after_it() {
+        let cfg = cfg_with(4, "ez-org-runner");
+        let containers: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let mut clock = [
+            start,
+            start + Duration::from_secs(2),
+            start + Duration::from_secs(28),
+            start + LOCAL_READINESS_BUDGET,
+        ]
+        .into_iter();
+        let mut launched = Vec::new();
+
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            || clock.next().unwrap(),
+            |container, timeout| {
+                launched.push((container.name.clone(), timeout));
+                Ok(true)
+            },
+        );
+
+        assert!(
+            result.unwrap_err().to_string().contains("ez-org-runner-4"),
+            "the fourth container must be rejected after the shared deadline"
+        );
+        assert_eq!(
+            launched,
+            vec![
+                ("ez-org-runner-1".to_string(), Duration::from_secs(3)),
+                ("ez-org-runner-2".to_string(), Duration::from_secs(3)),
+                ("ez-org-runner-3".to_string(), Duration::from_secs(2)),
+            ],
+            "sequential top probes must cap normally, shorten at the tail, and not launch after expiry"
+        );
+    }
+
+    #[test]
+    fn readiness_budget_does_not_spawn_docker_ps_after_expiry() {
+        let now = Instant::now();
+        let deadline = now - Duration::from_secs(1);
+        assert_eq!(remaining_until_deadline(deadline, now), None);
+    }
+
+    #[test]
     fn local_worker_readiness_propagates_incomplete_probe_evidence() {
         let _env = TestEnv::new("local_worker_readiness_incomplete");
         let cfg = cfg_with(1, "ez-org-runner");
@@ -5771,7 +6672,7 @@ minimum_isolation = "container"
             // reliable here — other tests in this same binary (e.g.
             // `alert.rs`'s `PATH`-mutating tests) can transiently replace or
             // empty PATH on another thread while this script executes.
-            b"#!/bin/sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
+            b"#!/bin/sh\ncase \" $* \" in *\" run \"*) echo \"docker run failed: simulation\" >&2; exit 1;; *) exit 0;; esac\n",
         )
         .unwrap();
         // Use `set_permissions` directly instead of shelling out to `chmod`
@@ -5820,7 +6721,7 @@ minimum_isolation = "container"
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = \"run\" ]; then echo fakecontaineridabc123; fi\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \" $* \" in *\" run \"*) echo fakecontaineridabc123;; esac\nexit 0\n",
                 capture_path.to_string_lossy()
             ),
         )
@@ -5852,7 +6753,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains(&format!("{}:/opt/wheelhouse:ro", wheelhouse_dir.display())),
@@ -5865,10 +6766,12 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn configured_cgroup_parent_is_emitted_on_runner_start() {
         let _env = TestEnv::new("cgroup_parent");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
         cfg.limits.cgroup_parent = Some("actions.slice".into());
         let temp_dir =
             env::temp_dir().join(format!("ezgha-cgroup-parent-test-{}", std::process::id()));
@@ -5881,15 +6784,77 @@ minimum_isolation = "container"
         })
         .expect("start_one should succeed");
 
-        let run_line = std::fs::read_to_string(&capture)
-            .unwrap()
+        let run_content = std::fs::read_to_string(&capture).unwrap();
+        let run_line = run_content
             .lines()
-            .find(|line| line.starts_with("run "))
-            .expect("a docker run invocation should have been logged")
-            .to_string();
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("--cgroup-parent actions.slice"),
             "configured cgroup parent must be passed to every runner: {run_line}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            run_line.contains("--host unix:///var/run/docker.sock"),
+            "Linux host docker invocations must explicitly pass canonical socket: {run_line}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_refuses_start_when_profile_mismatches_or_uncontained() {
+        let _env = TestEnv::new("host_containment_refuses_start");
+        cpu_probe_overrides::set(Some(true));
+
+        // Count != 10 on Linux must fail containment check before slot allocation
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err("start_one must fail closed when Linux runner count is not exactly 10");
+        assert!(
+            err.to_string().contains("host containment")
+                || err.to_string().contains("count must be exactly 10"),
+            "expected host containment failure; got: {err:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_verifies_pid_ancestry_under_actions_slice() {
+        let _env = TestEnv::new("host_containment_ancestry");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+
+        let temp_dir = env::temp_dir().join(format!("ezgha-ancestry-test-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let script = temp_dir.join("docker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \" $* \" in *\" run \"*) echo bad_ancestry_cid;; esac\nexit 0\n",
+                capture.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        // When container PID is not beneath /actions.slice, start_one must fail and clean up slot
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err(
+            "start_one must fail closed when container ancestry is not beneath /actions.slice",
+        );
+        assert!(
+            err.to_string().contains("actions.slice") || err.to_string().contains("ancestry"),
+            "expected ancestry failure; got: {err:#}"
         );
     }
 
@@ -5918,7 +6883,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             !run_line.contains("/opt/wheelhouse"),
@@ -5948,7 +6913,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         let expected_runner_workspace = workspace_root.join("ez-org-runner-1");
         assert!(
@@ -5999,7 +6964,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         for shadowed in ["_actions", "_temp", "_tool"] {
             let expected = format!("--tmpfs /home/runner/_work/{shadowed}:exec");
@@ -6052,7 +7017,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("-e EZGHA_VIRTIOFS_WORKSPACE=1"),
@@ -6087,7 +7052,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             !run_line.contains("/home/runner/_work"),
@@ -6173,9 +7138,8 @@ minimum_isolation = "container"
     fn release_stale_slots_releases_slot_when_runner_id_not_in_live_but_container_exists_past_grace(
     ) {
         // Mirrors the keep test above but with the slot's `registered_at`
-        // backdated past REGISTRATION_GRACE_WINDOW. The original
-        // keep-forever behavior is the bug; the new contract is "keep
-        // within the grace window, force-reclaim after".
+        // backdated past REGISTRATION_GRACE_WINDOW. A proven idle listener is
+        // safe to recycle because its GitHub registration no longer exists.
         let _env = TestEnv::new("stale_running_container_past_grace");
         let cfg = cfg_with(2, "ez-org-runner");
         let _slot = next_slot(&cfg).unwrap();
@@ -6190,11 +7154,12 @@ minimum_isolation = "container"
 
         let live = vec![runner_info(9999, "ez-org-runner-2")];
         let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
-        let reclaimed = release_stale_slots_from_with_containers(
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
             &read_slot_assignments().unwrap(),
             &live,
             &cfg.runner.name_prefix,
             Some(&local_names),
+            |_| LocalRunnerActivity::Idle,
         )
         .unwrap();
 
@@ -6206,6 +7171,79 @@ minimum_isolation = "container"
         assert!(
             !assignments.assignments.contains_key("1"),
             "slot 1 should be released (assignments row deleted)"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_busy_local_runner_when_gh_snapshot_omits_it_past_grace() {
+        let _env = TestEnv::new("stale_busy_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Busy,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "a local Runner.Worker must not be reclaimed from a single missing-GitHub snapshot"
+        );
+        assert_eq!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .get("1")
+                .map(String::as_str),
+            Some("4242"),
+            "the busy slot must remain owned until the local job finishes"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_local_runner_when_activity_probe_is_unknown() {
+        let _env = TestEnv::new("stale_unknown_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Unknown,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 0, "an inconclusive local probe must fail safe");
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "the slot must remain owned when local activity is unknown"
         );
     }
 
@@ -9249,7 +10287,11 @@ exec /bin/sleep 10
         std::fs::write(
             &script,
             r#"#!/bin/sh
-if [ "$1" = "logs" ]; then
+if [ "$1" = "top" ]; then
+    echo "PID COMM"
+    echo "1234 Runner.Listener"
+    exit 0
+elif [ "$1" = "logs" ]; then
     printf '2026-08-27 [INFO] Runner.Listener connected with Bearer ghp_secret123\n2026-08-27 [INFO] Listening for Jobs\n'
     exit 0
 elif [ "$1" = "stats" ]; then
@@ -9319,6 +10361,7 @@ exit 0
         assert!(!log_tail.contains("ghp_secret123"));
         assert!(log_tail.contains("Bearer [REDACTED]"));
         assert!(log_tail.contains("Listening for Jobs"));
+        *TEST_DOCKER_BIN.lock().unwrap() = None;
     }
 
     #[test]
@@ -9488,6 +10531,11 @@ exit 0
         std::fs::write(
             &script,
             r#"#!/bin/sh
+if [ "$1" = "top" ]; then
+    echo "PID COMM"
+    echo "1234 Runner.Listener"
+    exit 0
+fi
 exec /bin/sleep 10
 "#,
         )
@@ -9535,6 +10583,7 @@ exec /bin/sleep 10
             ev.listener_log_tail, None,
             "listener log tail must fail-soft on docker hang"
         );
+        *TEST_DOCKER_BIN.lock().unwrap() = None;
     }
 
     #[test]
@@ -9757,6 +10806,11 @@ exec /bin/sleep 10
         std::fs::write(
             &script,
             r#"#!/bin/sh
+if [ "$1" = "top" ]; then
+    echo "PID COMM"
+    echo "1234 Runner.Listener"
+    exit 0
+fi
 exec /bin/sleep 10
 "#,
         )
@@ -9790,6 +10844,7 @@ exec /bin/sleep 10
             elapsed < Duration::from_millis(900),
             "10 hung slots must finish within shared tick deadline (target <=500ms + test margin); took {elapsed:?}"
         );
+        *TEST_DOCKER_BIN.lock().unwrap() = None;
     }
 
     #[test]

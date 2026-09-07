@@ -81,6 +81,9 @@ printf ' <%s>' "$@" >&9
 printf '\n' >&9
 flock -u 9
 exec 9>&-
+if [ "${1:-}" = "--host" ]; then
+  shift 2
+fi
 case "${1:-}" in
   version)
     [[ "$#" -eq 3 && "${2:-}" == "--format" && "${3:-}" == '{{.Server.Version}}' ]] || exit 91

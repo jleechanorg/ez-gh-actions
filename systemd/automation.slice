@@ -11,3 +11,5 @@ MemoryMax=6G
 MemorySwapMax=1G
 TasksMax=4096
 MemoryAccounting=yes
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto

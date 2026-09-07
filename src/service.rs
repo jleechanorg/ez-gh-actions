@@ -70,6 +70,7 @@ fn systemd_service_unit(
         "TimeoutStopSec=30".to_string(),
         "KillMode=mixed".to_string(),
         "TimeoutStartSec=130".to_string(),
+        "UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT".to_string(),
         format!("Environment=\"PATH={}\"", path_env),
         format!("Environment=\"HOME={}\"", home_dir.display()),
         "".to_string(),
@@ -78,6 +79,41 @@ fn systemd_service_unit(
         "".to_string(),
     ]
     .join("\n")
+}
+
+pub fn render_release1_service() -> &'static str {
+    r#"[Unit]
+Description=ez-gh-actions ephemeral GitHub Actions runners (Release 1 host containment)
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=ezgha-alert@%N.service
+
+[Service]
+Type=notify
+ExecStart=%h/.local/libexec/ezgha/release1/bin/ezgha serve --config %h/.config/ezgha/config.toml
+ExecStopPost=-%h/.local/libexec/ezgha/release1/bin/ezgha --config %h/.config/ezgha/config.toml systemd-alert-hook --source exec-stop-post --unit %n
+UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT
+WatchdogSec=300
+NotifyAccess=all
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=30
+KillMode=mixed
+TimeoutStartSec=130
+
+[Install]
+WantedBy=default.target"#
+}
+
+pub fn render_release1_alert_service() -> &'static str {
+    r#"[Unit]
+Description=ezgha failure alert for %i
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/libexec/ezgha/release1/bin/ezgha systemd-alert-hook --source on-failure --unit %i
+UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT"#
 }
 
 fn systemd_alert_unit(
