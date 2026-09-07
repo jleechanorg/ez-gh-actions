@@ -137,6 +137,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         write_backup: bool,
     },
+    /// Render Release 1 main service unit to stdout
+    RenderRelease1Service,
+    /// Render Release 1 alert service unit to stdout
+    RenderRelease1AlertService,
     /// Dump recent reclaim-history records from the in-memory ring buffer
     /// (bead jleechan-uurm, first-wave Path-1 race investigation jleechan-9yx8).
     /// Most-recent-first across all slots when `--slot` is omitted; scoped to
@@ -1797,6 +1801,12 @@ fn main() -> Result<()> {
                     }).collect::<Vec<_>>(),
                 }))?
             );
+        }
+        Commands::RenderRelease1Service => {
+            println!("{}", service::render_release1_service());
+        }
+        Commands::RenderRelease1AlertService => {
+            println!("{}", service::render_release1_alert_service());
         }
     }
     Ok(())

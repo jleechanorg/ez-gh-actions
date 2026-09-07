@@ -16,12 +16,6 @@ case "$command_name" in
   *) echo "agent-scoped-launch.sh: unsupported agent CLI '$command_name'" >&2; exit 2 ;;
 esac
 
-# Explicit opt-out only. Any value other than an intentional 1 is ignored.
-if [ "${AGENT_SLICE_OPT_OUT:-0}" = "1" ]; then
-  echo "agent-scoped-launch.sh: explicit AGENT_SLICE_OPT_OUT=1; running unscoped" >&2
-  exec "$@"
-fi
-
 command -v systemd-run >/dev/null 2>&1 || {
   echo "agent-scoped-launch.sh: systemd-run is required" >&2
   exit 1

@@ -22,8 +22,8 @@ assert_file "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-s
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-daemon.service.d/20-automation-slice.conf" || fail "AO drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-orchestrator.service.d/20-automation-slice.conf" || fail "AO orchestrator drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.conf" || fail "dark-factory daemon drop-in does not select automation.slice"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=10G"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=12G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=18G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=20G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "TasksMax=8192"
 assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemoryHigh=34G"
@@ -84,11 +84,10 @@ EOF
 chmod +x "$STUB/codex"
 LAUNCH_CAPTURE="$STUB/capture" PATH="$STUB:$PATH" AGENT_SLICE_UNIT_FILE="$REPO_ROOT/systemd/agents.slice" \
   "$LAUNCH" claude claude --version >/dev/null
-grep -Eq -- '--user --slice=agents.slice --scope --collect --unit=agent-claude-[0-9]+-[0-9]+ -- claude --version' "$STUB/capture" || fail "launcher invocation did not preserve command, discoverable unit, and scope flags"
-LAUNCH_CAPTURE="$STUB/optout" PATH="$STUB:$PATH" AGENT_SLICE_OPT_OUT=1 \
-  "$LAUNCH" codex codex exec test >/dev/null
-grep -Fq 'exec test' "$STUB/optout" || fail "explicit opt-out did not execute command"
-ok "generic scoped launcher and explicit opt-out"
+if grep -q 'AGENT_SLICE_OPT_OUT' "$LAUNCH"; then
+  fail "launcher still contains forbidden AGENT_SLICE_OPT_OUT escape hatch"
+fi
+ok "generic scoped launcher enforces slice confinement with no opt-out"
 
 REAPER="$REPO_ROOT/scripts/host/agent-scope-reaper.sh"
 assert_file "$REAPER"; bash -n "$REAPER"
@@ -106,6 +105,11 @@ grep -q '"unit":"agent-live.scope".*"action":"defer"' "$STUB/reaper.log" || fail
 ok "orphan reaper artifacts"
 
 for forbidden_file in \
+  "$REPO_ROOT/systemd/ezgha.service.d/10-oomd-omit.conf" \
+  "$REPO_ROOT/systemd/psi-oom-watcher.service" \
+  "$REPO_ROOT/systemd/psi-oom-watcher.timer" \
+  "$REPO_ROOT/scripts/host/psi-oom-watcher.sh" \
+  "$REPO_ROOT/config/config.toml.linux-canary.example" \
   "$REPO_ROOT/scripts/host/watchdog-load-repair.sh" \
   "$REPO_ROOT/scripts/host/apply-watchdog-no-reboot-vote.sh" \
   "$REPO_ROOT/scripts/host/assert-no-host-reboot-vote.sh" \
@@ -120,9 +124,9 @@ for forbidden_file in \
   "$REPO_ROOT/systemd/ezgha-watchdog.timer" \
   "$REPO_ROOT/scripts/host/host-pressure-proof.sh" \
   "$REPO_ROOT/scripts/ezgha-fleet-watchdog.sh"; do
-  [ ! -e "$forbidden_file" ] || fail "forbidden watchdog/reboot artifact still exists: $forbidden_file"
+  [ ! -e "$forbidden_file" ] || fail "forbidden watchdog/reboot/exemption artifact still exists: $forbidden_file"
 done
-ok "watchdog and reboot artifacts are strictly absent"
+ok "watchdog, reboot, and exemption artifacts are strictly absent"
 
 grep -q 'Gate 8 guest runner aggregate' "$REPO_ROOT/docs/verify-exit-criteria.sh" || fail "exit criteria do not verify the guest runner aggregate"
 grep -q '/sys/fs/cgroup/actions.slice/memory.max' "$REPO_ROOT/docs/verify-exit-criteria.sh" || fail "exit criteria do not read the live guest actions.slice ceiling"
