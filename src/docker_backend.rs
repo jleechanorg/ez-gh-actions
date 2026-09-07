@@ -2515,6 +2515,7 @@ fn docker_cmd() -> Command {
 static TEST_HOST_CONTAINMENT_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
 /// Require Release 1 host containment before any Linux runner creation or mutation.
+#[allow(unused_variables)]
 pub fn require_host_containment(cfg: &Config) -> Result<()> {
     if is_macos_host() {
         return Ok(());
@@ -2548,6 +2549,7 @@ pub fn require_host_containment(cfg: &Config) -> Result<()> {
 }
 
 /// Require that a freshly created container PID is located beneath /actions.slice.
+#[allow(unused_variables)]
 pub fn require_container_actions_ancestry(container_id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -6293,6 +6295,7 @@ minimum_isolation = "container"
             run_line.contains("--cgroup-parent actions.slice"),
             "configured cgroup parent must be passed to every runner: {run_line}"
         );
+        #[cfg(target_os = "linux")]
         assert!(
             run_line.contains("--host unix:///var/run/docker.sock"),
             "Linux host docker invocations must explicitly pass canonical socket: {run_line}"
@@ -6300,6 +6303,7 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn host_containment_refuses_start_when_profile_mismatches_or_uncontained() {
         let _env = TestEnv::new("host_containment_refuses_start");
         cpu_probe_overrides::set(Some(true));
@@ -6319,6 +6323,7 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn host_containment_verifies_pid_ancestry_under_actions_slice() {
         let _env = TestEnv::new("host_containment_ancestry");
         cpu_probe_overrides::set(Some(true));
