@@ -539,6 +539,16 @@ if [ -d "${UNIT_DIR}" ]; then
     fi
     install -m 0755 "${script}" "${SCRIPTS_DIR}/$(basename "${script}")"
   done
+  if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ]; then
+    install -m 0644 "${SCRIPT_DIR}/Dockerfile.runner" "${SCRIPTS_DIR}/Dockerfile.runner"
+  fi
+  if [ -d "${SCRIPT_DIR}/docker" ]; then
+    mkdir -p "${SCRIPTS_DIR}/docker"
+    for docker_file in "${SCRIPT_DIR}/docker"/*; do
+      [ -f "${docker_file}" ] || continue
+      install -m 0755 "${docker_file}" "${SCRIPTS_DIR}/docker/$(basename "${docker_file}")"
+    done
+  fi
   ok "scripts installed to stable path: ${SCRIPTS_DIR}"
 
   if [ "$(uname -s)" = "Darwin" ]; then
@@ -585,7 +595,7 @@ PLIST
           # manually on the live plist via `plutil -insert`; doing it here
           # so the next install.sh run carries it forward instead of
           # regressing to the load-gated failure mode.
-          printf '    <key>EZGHA_REPO_ROOT</key><string>%s</string>\n' "${SCRIPT_DIR}" >> "${plist}"
+          printf '    <key>EZGHA_REPO_ROOT</key><string>%s</string>\n' "${SCRIPTS_DIR}" >> "${plist}"
         fi
         cat >> "${plist}" <<PLIST
   </dict>

@@ -352,18 +352,31 @@ ensure_runner_image() {
   # production installs deploy scripts/ezgha-fleet-watchdog.sh alongside
   # the repo, but install.sh's --prefix path may also copy it standalone
   # into $HOME/.local/libexec/ezgha/. In the latter case the caller is
-  # expected to set $EZGHA_REPO_ROOT to the repo root. Fall back to the
-  # default paths in priority order.
-  local repo_root="${EZGHA_REPO_ROOT:-}"
-  if [[ -z "$repo_root" ]] && [[ -f "${0%/*}/../../Dockerfile.runner" ]]; then
-    repo_root="$(cd "${0%/*}/../.." && pwd)"
+  # expected to set $EZGHA_REPO_ROOT to the scripts/libexec dir. Fall back to
+  # the default paths in priority order.
+  local dockerfile_path=""
+  if [[ -n "${EZGHA_REPO_ROOT:-}" ]] && [[ -f "${EZGHA_REPO_ROOT}/Dockerfile.runner" ]]; then
+    dockerfile_path="${EZGHA_REPO_ROOT}/Dockerfile.runner"
+  elif [[ -n "${SCRIPTS_DIR:-}" ]] && [[ -f "${SCRIPTS_DIR}/Dockerfile.runner" ]]; then
+    dockerfile_path="${SCRIPTS_DIR}/Dockerfile.runner"
+  elif [[ -n "${SCRIPT_DIR:-}" ]] && [[ -f "${SCRIPT_DIR}/Dockerfile.runner" ]]; then
+    dockerfile_path="${SCRIPT_DIR}/Dockerfile.runner"
+  elif [[ -f "${0%/*}/Dockerfile.runner" ]]; then
+    dockerfile_path="$(cd "${0%/*}" && pwd)/Dockerfile.runner"
+  elif [[ -f "${0%/*}/../Dockerfile.runner" ]]; then
+    dockerfile_path="$(cd "${0%/*}/.." && pwd)/Dockerfile.runner"
+  elif [[ -f "${0%/*}/../../Dockerfile.runner" ]]; then
+    dockerfile_path="$(cd "${0%/*}/../.." && pwd)/Dockerfile.runner"
   fi
-  if [[ -z "$repo_root" ]] || [[ ! -f "$repo_root/Dockerfile.runner" ]]; then
+
+  if [[ -z "${dockerfile_path}" ]] || [[ ! -f "${dockerfile_path}" ]]; then
     log "ensure_runner_image: cannot locate Dockerfile.runner (set EZGHA_REPO_ROOT); skipping rebuild"
     return 1
   fi
+  local build_context
+  build_context="$(cd "$(dirname "${dockerfile_path}")" && pwd)"
   local build_log build_rc=0
-  build_log="$(DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t "$image" "$repo_root" 2>&1)" || build_rc=$?
+  build_log="$(DOCKER_BUILDKIT=0 docker build -f "${dockerfile_path}" -t "$image" "${build_context}" 2>&1)" || build_rc=$?
   while IFS= read -r line; do log "ensure_runner_image: docker build: $line"; done <<< "$build_log"
   if [[ "$build_rc" -ne 0 ]]; then
     log "ensure_runner_image: REBUILD FAILED (exit=$build_rc) — daemon restart will proceed but serve loop will likely re-enter the disk-measurement lockout until image is present"

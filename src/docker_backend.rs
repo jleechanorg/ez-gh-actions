@@ -3181,30 +3181,120 @@ fn drain_inflight_registrations_inner(
     summary
 }
 
+/// Parse the available disk space in GB from `df -Pk /` output.
+///
+/// POSIX `df -P` guarantees:
+///   `Filesystem 1024-blocks Used Available Capacity Mounted on`
+///   `<fs> <total_kb> <used_kb> <avail_kb> <cap%> <mount>`
+///
+/// We search for the `Filesystem` header to tolerate any docker engine / CLI
+/// noise (such as image pull progress lines) that might precede the table.
+fn parse_df_avail_gb(stdout: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(stdout);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let data_line = if let Some(hdr_idx) = lines.iter().position(|l| l.starts_with("Filesystem")) {
+        lines.get(hdr_idx + 1)?
+    } else {
+        lines.get(1)?
+    };
+    let avail_kb: u64 = data_line.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb / 1024 / 1024)
+}
+
+/// List running container names from the local docker daemon.
+fn running_containers() -> Vec<String> {
+    let mut cmd = docker_cmd();
+    cmd.args(["ps", "--format", "{{.Names}}"]);
+    let out = match run_docker(cmd, "listing running containers") {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Prioritize container candidates for disk measurement.
+/// Dedicated anchor container (`ezgha-image-anchor`) is tried first since it is
+/// long-lived and does not churn. Active runners are tried next, followed by any
+/// other running container on the daemon.
+fn prioritize_containers(mut containers: Vec<String>) -> Vec<String> {
+    containers.sort_by_key(|c| {
+        if c == "ezgha-image-anchor" {
+            0
+        } else if c.contains("runner") || c.starts_with("ez-") {
+            1
+        } else {
+            2
+        }
+    });
+    containers
+}
+
+fn df_exec_container(container: &str) -> Option<u64> {
+    let mut cmd = docker_cmd();
+    cmd.args(["exec", container, "df", "-Pk", "/"]);
+    let out = run_docker(cmd, "measuring docker daemon free disk via exec").ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_df_avail_gb(&out.stdout)
+}
+
+fn df_run_image(image: &str) -> Option<u64> {
+    let mut cmd = docker_cmd();
+    cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
+    let out = run_docker(cmd, "measuring docker daemon free disk via run").ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_df_avail_gb(&out.stdout)
+}
+
 /// Free disk in GB as seen by the docker DAEMON, measured from inside a
 /// container: the container's root overlay lives on the daemon's storage, so
 /// this is the disk runner jobs will actually fill. A host-side `df` would
 /// read the wrong filesystem whenever the daemon is a VM (Colima/Lima/Desktop).
+///
+/// Decoupled from runner image presence:
+/// 1. If any running container exists (such as `ezgha-image-anchor` or any active
+///    runner container), query `df -Pk /` via `docker exec <container_name> df -Pk /`.
+///    This takes <30ms, creates zero containers, and is immune to missing runner images.
+/// 2. If no running container is available, run `docker run --rm --entrypoint df <image> -Pk /`.
+/// 3. If running `<image>` fails, fall back to probe image `PROBE_IMAGE` (`alpine:3.19`).
 pub fn free_disk_gb(image: &str) -> Option<u64> {
     #[cfg(test)]
     if let Some(free) = *TEST_FREE_DISK_GB.lock().unwrap() {
         return free;
     }
 
-    let mut cmd = docker_cmd();
-    cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
-    let out = run_docker(cmd, "measuring docker daemon free disk")
-        .ok()
-        .filter(|o| o.status.success())?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let avail_kb: u64 = stdout
-        .lines()
-        .nth(1)?
-        .split_whitespace()
-        .nth(3)?
-        .parse()
-        .ok()?;
-    Some(avail_kb / 1024 / 1024)
+    // 1. Check running containers first (exec is faster and doesn't create/destroy containers).
+    let running = running_containers();
+    for container in prioritize_containers(running) {
+        if let Some(free) = df_exec_container(&container) {
+            return Some(free);
+        }
+    }
+
+    // 2. Fall back to docker run with the configured runner image.
+    if let Some(free) = df_run_image(image) {
+        return Some(free);
+    }
+
+    // 3. Fall back to probe image if runner image is missing or failed to run.
+    if image != PROBE_IMAGE {
+        if let Some(free) = df_run_image(PROBE_IMAGE) {
+            return Some(free);
+        }
+    }
+
+    None
 }
 
 /// Free space on the outer host filesystem that backs Docker's storage.
@@ -3701,6 +3791,210 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
 
         assert!(host_free_disk_gb().is_some());
+    }
+
+    #[test]
+    fn parse_df_avail_gb_parses_standard_and_pull_prefixed_output() {
+        // 1. Standard df output: 86665296 KB -> 82 GB
+        let standard = b"Filesystem     1024-blocks     Used Available Capacity Mounted on\noverlay          102624184 10699728  86665296      11% /\n";
+        assert_eq!(parse_df_avail_gb(standard), Some(82));
+
+        // 2. Output with preceding docker pull progress / logs
+        let with_pull = b"Unable to find image 'alpine:3.19' locally\n3.19: Pulling from library/alpine\n5711127a7748: Pull complete\nDigest: sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1\nStatus: Downloaded newer image for alpine:3.19\nFilesystem           1024-blocks    Used Available Capacity Mounted on\noverlay              102624184  12462156  84902868  13% /\n";
+        assert_eq!(parse_df_avail_gb(with_pull), Some(80));
+
+        // 3. Malformed / empty / incomplete
+        assert_eq!(parse_df_avail_gb(b""), None);
+        assert_eq!(parse_df_avail_gb(b"Filesystem 1024-blocks\n"), None);
+        assert_eq!(
+            parse_df_avail_gb(
+                b"Filesystem 1024-blocks Used Available Capacity Mounted on\noverlay abc def\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn prioritize_containers_orders_anchor_then_runners_then_others() {
+        let containers = vec![
+            "hermes-mem0".to_string(),
+            "ez-mac-runner-g-2".to_string(),
+            "ezgha-image-anchor".to_string(),
+            "ez-mac-runner-g-1".to_string(),
+            "unrelated-db".to_string(),
+        ];
+        let prioritized = prioritize_containers(containers);
+        assert_eq!(
+            prioritized,
+            vec![
+                "ezgha-image-anchor".to_string(),
+                "ez-mac-runner-g-2".to_string(),
+                "ez-mac-runner-g-1".to_string(),
+                "hermes-mem0".to_string(),
+                "unrelated-db".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn free_disk_gb_queries_running_container_via_exec_and_prioritizes_anchor() {
+        let _env = TestEnv::new("free_disk_gb_exec");
+        *TEST_FREE_DISK_GB.lock().unwrap() = None;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("ezgha-free-disk-exec-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = temp_dir.join("docker");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> "{capture}"
+case "$*" in
+    ps*)
+        echo "ez-mac-runner-1"
+        echo "ezgha-image-anchor"
+        exit 0
+        ;;
+    *"exec ezgha-image-anchor df -Pk /"*)
+        echo "Filesystem     1024-blocks     Used Available Capacity Mounted on"
+        echo "overlay          104857600 20971520  83886080      20% /"
+        exit 0
+        ;;
+    *)
+        echo "unexpected command: $*" >&2
+        exit 1
+        ;;
+esac
+"#,
+                capture = capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let free = free_disk_gb("nonexistent-runner:latest");
+        assert_eq!(free, Some(80));
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert!(lines[0].starts_with("ps"));
+        assert!(lines[1].contains("exec ezgha-image-anchor df -Pk /"));
+        assert!(!logged.contains("run "));
+    }
+
+    #[test]
+    fn free_disk_gb_falls_back_to_run_image_when_no_containers_running() {
+        let _env = TestEnv::new("free_disk_gb_run_image");
+        *TEST_FREE_DISK_GB.lock().unwrap() = None;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("ezgha-free-disk-run-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = temp_dir.join("docker");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> "{capture}"
+case "$*" in
+    ps*)
+        exit 0
+        ;;
+    *"run --rm --entrypoint df my-runner:v1 -Pk /"*)
+        echo "Filesystem     1024-blocks     Used Available Capacity Mounted on"
+        echo "overlay          104857600 20971520  73400320      20% /"
+        exit 0
+        ;;
+    *)
+        echo "unexpected command: $*" >&2
+        exit 1
+        ;;
+esac
+"#,
+                capture = capture.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let free = free_disk_gb("my-runner:v1");
+        assert_eq!(free, Some(70));
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        assert!(logged.contains("run --rm --entrypoint df my-runner:v1 -Pk /"));
+        assert!(!logged.contains(PROBE_IMAGE));
+    }
+
+    #[test]
+    fn free_disk_gb_falls_back_to_probe_image_when_runner_image_fails() {
+        let _env = TestEnv::new("free_disk_gb_probe_fallback");
+        *TEST_FREE_DISK_GB.lock().unwrap() = None;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("ezgha-free-disk-probe-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = temp_dir.join("docker");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> "{capture}"
+case "$*" in
+    ps*)
+        exit 0
+        ;;
+    *"missing-runner:latest"*)
+        echo "Unable to find image 'missing-runner:latest' locally" >&2
+        exit 1
+        ;;
+    *"{probe}"*)
+        echo "Filesystem     1024-blocks     Used Available Capacity Mounted on"
+        echo "overlay          104857600 20971520  62914560      20% /"
+        exit 0
+        ;;
+    *)
+        echo "unexpected command: $*" >&2
+        exit 1
+        ;;
+esac
+"#,
+                capture = capture.display(),
+                probe = PROBE_IMAGE
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let free = free_disk_gb("missing-runner:latest");
+        assert_eq!(free, Some(60));
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        assert!(logged.contains("run --rm --entrypoint df missing-runner:latest -Pk /"));
+        assert!(logged.contains(&format!("run --rm --entrypoint df {PROBE_IMAGE} -Pk /")));
+    }
+
+    #[test]
+    fn free_disk_gb_returns_none_when_all_fail() {
+        let _env = TestEnv::new("free_disk_gb_all_fail");
+        *TEST_FREE_DISK_GB.lock().unwrap() = None;
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("ezgha-free-disk-fail-{}", std::process::id()));
+        let script = temp_dir.join("docker");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(&script, b"#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let free = free_disk_gb("broken-image:latest");
+        assert_eq!(free, None);
     }
 
     #[test]
