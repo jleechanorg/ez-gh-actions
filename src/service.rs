@@ -6,10 +6,13 @@ use std::process::Command;
 /// it running: systemd --user on Linux, launchd on macOS.
 pub fn install(config_path: &std::path::Path) -> Result<()> {
     let exe = std::env::current_exe().context("cannot resolve ezgha binary path")?;
+    let docker_host_override = std::env::var("DOCKER_HOST_OVERRIDE")
+        .ok()
+        .filter(|value| !value.is_empty());
     if cfg!(target_os = "linux") {
-        install_systemd(&exe, config_path)
+        install_systemd(&exe, config_path, docker_host_override.as_deref())
     } else if cfg!(target_os = "macos") {
-        install_launchd(&exe, config_path)
+        install_launchd(&exe, config_path, docker_host_override.as_deref())
     } else {
         bail!("service install is only supported on linux (systemd --user) and macos (launchd)")
     }
@@ -26,7 +29,11 @@ fn systemd_service_unit(
     config_path: &std::path::Path,
     path_env: &str,
     home_dir: &std::path::Path,
+    docker_host_override: Option<&str>,
 ) -> String {
+    let docker_host_environment = docker_host_override
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("Environment=\"DOCKER_HOST_OVERRIDE={host}\""));
     [
         "[Unit]".to_string(),
         "Description=ez-gh-actions ephemeral GitHub Actions runners".to_string(),
@@ -71,6 +78,7 @@ fn systemd_service_unit(
         "KillMode=mixed".to_string(),
         "TimeoutStartSec=130".to_string(),
         "UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT".to_string(),
+        docker_host_environment.unwrap_or_default(),
         format!("Environment=\"PATH={}\"", path_env),
         format!("Environment=\"HOME={}\"", home_dir.display()),
         "".to_string(),
@@ -121,7 +129,11 @@ fn systemd_alert_unit(
     config_path: &std::path::Path,
     path_env: &str,
     home_dir: &std::path::Path,
+    docker_host_override: Option<&str>,
 ) -> String {
+    let docker_host_environment = docker_host_override
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("Environment=\"DOCKER_HOST_OVERRIDE={host}\""));
     [
         "[Unit]".to_string(),
         "Description=ez-gh-actions service failure alert hook for %i".to_string(),
@@ -134,6 +146,7 @@ fn systemd_alert_unit(
             config_path.display()
         ),
         "TimeoutStartSec=30".to_string(),
+        docker_host_environment.unwrap_or_default(),
         format!("Environment=\"PATH={}\"", path_env),
         format!("Environment=\"HOME={}\"", home_dir.display()),
         "".to_string(),
@@ -141,7 +154,11 @@ fn systemd_alert_unit(
     .join("\n")
 }
 
-fn install_systemd(exe: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
+fn install_systemd(
+    exe: &std::path::Path,
+    config_path: &std::path::Path,
+    docker_host_override: Option<&str>,
+) -> Result<()> {
     let unit_dir = home()?.join(".config/systemd/user");
     std::fs::create_dir_all(&unit_dir)?;
     let unit_path = unit_dir.join("ezgha.service");
@@ -149,8 +166,9 @@ fn install_systemd(exe: &std::path::Path, config_path: &std::path::Path) -> Resu
     let path_env =
         std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
     let home_dir = home()?;
-    let unit = systemd_service_unit(exe, config_path, &path_env, &home_dir);
-    let alert_unit = systemd_alert_unit(exe, config_path, &path_env, &home_dir);
+    let unit = systemd_service_unit(exe, config_path, &path_env, &home_dir, docker_host_override);
+    let alert_unit =
+        systemd_alert_unit(exe, config_path, &path_env, &home_dir, docker_host_override);
     std::fs::write(&unit_path, unit)?;
     println!("wrote {}", unit_path.display());
     std::fs::write(&alert_unit_path, alert_unit)?;
@@ -206,7 +224,8 @@ fn launchd_plist(
         .filter(|host| !host.is_empty())
         .map(|host| {
             format!(
-                "\n        <key>DOCKER_HOST</key><string>{}</string>",
+                "\n        <key>DOCKER_HOST</key><string>{}</string>\n        <key>DOCKER_HOST_OVERRIDE</key><string>{}</string>",
+                xml_escape(host),
                 xml_escape(host)
             )
         })
@@ -241,7 +260,11 @@ fn launchd_plist(
     )
 }
 
-fn install_launchd(exe: &std::path::Path, config_path: &std::path::Path) -> Result<()> {
+fn install_launchd(
+    exe: &std::path::Path,
+    config_path: &std::path::Path,
+    docker_host_override: Option<&str>,
+) -> Result<()> {
     let agents = home()?.join("Library/LaunchAgents");
     std::fs::create_dir_all(&agents)?;
     let plist_path = agents.join("org.jleechanorg.ezgha.plist");
@@ -270,20 +293,12 @@ fn install_launchd(exe: &std::path::Path, config_path: &std::path::Path) -> Resu
         perms.set_mode(0o755);
         std::fs::set_permissions(&wrapper_path, perms)?;
     }
-    let docker_host = std::env::var("DOCKER_HOST_OVERRIDE")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("DOCKER_HOST")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
     let plist = launchd_plist(
         &wrapper_path,
         config_path,
         &path_env,
         &home_dir,
-        docker_host.as_deref(),
+        docker_host_override,
     );
     std::fs::write(&plist_path, plist)?;
     println!("wrote {}", plist_path.display());
@@ -391,6 +406,7 @@ mod tests {
             plist.contains("<string>unix:///Users/test/docker&amp;socket&lt;active&gt;</string>")
         );
         assert!(!plist.contains("docker&socket<active>"));
+        assert!(plist.contains("<key>DOCKER_HOST_OVERRIDE</key>"));
     }
 
     #[test]
@@ -412,14 +428,42 @@ mod tests {
 
         assert!(
             installer.contains(
-                "DOCKER_HOST=\"${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}\" \"${CARGO_BIN}/${BIN}\" install-service"
+                "DOCKER_HOST_OVERRIDE=\"${DOCKER_HOST_OVERRIDE}\" \"${CARGO_BIN}/${BIN}\" install-service"
             ),
-            "install.sh must pass the detected socket or preserve the ambient Docker host"
+            "install.sh must persist the selected socket without preserving ambient Docker selection"
         );
         assert!(
             !installer.contains("launchctl load \"${plist}\""),
             "install.sh must regenerate an existing plist instead of reloading stale bytes"
         );
+    }
+
+    #[test]
+    fn selected_docker_endpoint_is_persisted_for_systemd_and_launchd() {
+        let endpoint = "unix:///home/jleechan/.colima/default/docker.sock";
+        let systemd = systemd_service_unit(
+            std::path::Path::new("/home/jleechan/.cargo/bin/ezgha"),
+            std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/home/jleechan"),
+            Some(endpoint),
+        );
+        assert!(systemd.contains(&format!("Environment=\"DOCKER_HOST_OVERRIDE={endpoint}\"")));
+        assert!(systemd.contains("UnsetEnvironment=DOCKER_HOST DOCKER_CONTEXT"));
+
+        let launchd = launchd_plist(
+            std::path::Path::new("/Users/test/.cargo/bin/ezgha-launchd-wrapper.sh"),
+            std::path::Path::new("/Users/test/.config/ezgha/config.toml"),
+            "/usr/bin:/bin",
+            std::path::Path::new("/Users/test"),
+            Some(endpoint),
+        );
+        assert!(launchd.contains(&format!(
+            "<key>DOCKER_HOST</key><string>{endpoint}</string>"
+        )));
+        assert!(launchd.contains(&format!(
+            "<key>DOCKER_HOST_OVERRIDE</key><string>{endpoint}</string>"
+        )));
     }
 
     #[test]
@@ -429,6 +473,7 @@ mod tests {
             std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
             "/usr/bin:/bin",
             std::path::Path::new("/home/jleechan"),
+            None,
         );
         assert!(
             unit.contains("OnFailure=ezgha-alert@%N.service"),
@@ -444,6 +489,7 @@ mod tests {
             std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
             "/usr/bin:/bin",
             std::path::Path::new("/home/jleechan"),
+            None,
         );
 
         assert!(
@@ -463,6 +509,7 @@ mod tests {
             std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
             "/usr/bin:/bin",
             std::path::Path::new("/home/jleechan"),
+            None,
         );
         assert!(unit.contains("Type=oneshot"));
         assert!(unit.contains("systemd-alert-hook"));
@@ -480,6 +527,7 @@ mod tests {
             std::path::Path::new("/home/jleechan/.config/ezgha/config.toml"),
             "/usr/bin:/bin",
             std::path::Path::new("/home/jleechan"),
+            None,
         );
         assert!(
             unit.contains("TimeoutStopSec=30"),

@@ -10,6 +10,28 @@ use std::time::Duration;
 /// On expiry we kill the probe and treat the capability as absent.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
+/// Build a Docker command for the endpoint selected during installation.
+/// Services persist that endpoint in `DOCKER_HOST_OVERRIDE`; interactive
+/// `DOCKER_HOST` and `DOCKER_CONTEXT` are never trusted for daemon control.
+/// Linux falls back to its native socket when no endpoint was selected.
+pub fn docker_command() -> Command {
+    let mut cmd = Command::new("docker");
+    configure_docker_endpoint(&mut cmd);
+    cmd
+}
+
+pub fn configure_docker_endpoint(cmd: &mut Command) {
+    cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
+    if let Some(host) = std::env::var("DOCKER_HOST_OVERRIDE")
+        .ok()
+        .filter(|host| !host.trim().is_empty())
+    {
+        cmd.arg("--host").arg(host);
+    } else if cfg!(target_os = "linux") {
+        cmd.arg("--host").arg("unix:///var/run/docker.sock");
+    }
+}
+
 /// Run `cmd` capturing stdout, but never block longer than `timeout`. Returns
 /// `Some((exit_success, stdout_bytes))` if the child finished in time, or
 /// `None` if it errored or was killed for exceeding the deadline.
@@ -100,7 +122,7 @@ pub fn detect() -> Platform {
 /// a remote host. On macOS the daemon is always in a VM (macOS has no native
 /// Linux containers), so any Linux daemon kernel counts.
 fn daemon_in_vm() -> bool {
-    let mut docker_info = Command::new("docker");
+    let mut docker_info = docker_command();
     docker_info.args(["info", "--format", "{{.KernelVersion}}"]);
     let daemon_kernel = capture(docker_info)
         .filter(|(ok, _)| *ok)
@@ -134,13 +156,13 @@ fn kvm_usable() -> bool {
 }
 
 fn docker_daemon_ok() -> bool {
-    let mut cmd = Command::new("docker");
+    let mut cmd = docker_command();
     cmd.args(["version", "--format", "{{.Server.Version}}"]);
     capture(cmd).map(|(ok, _)| ok).unwrap_or(false)
 }
 
 fn sysbox_runtime_present() -> bool {
-    let mut cmd = Command::new("docker");
+    let mut cmd = docker_command();
     cmd.args(["info", "--format", "{{json .Runtimes}}"]);
     capture(cmd)
         .map(|(ok, out)| ok && String::from_utf8_lossy(&out).contains("sysbox-runc"))

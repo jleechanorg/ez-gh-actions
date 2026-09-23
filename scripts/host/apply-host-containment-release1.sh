@@ -110,6 +110,7 @@ if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
     printf '0\n' > "/proc/${user_manager_pid}/oom_score_adj"
     [ "$(cat "/proc/${user_manager_pid}/oom_score_adj")" = 0 ] \
       || fail "user manager OOM score adjustment did not become 0"
+    systemctl enable actions.slice
     systemctl start actions.slice
     systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
   fi

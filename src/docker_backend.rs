@@ -390,7 +390,7 @@ fn live_runners_last_run_id(live_runners: &[github::RunnerInfo], runner_id: u64)
 fn container_peak_rss_mb(container_name: &str) -> u64 {
     // `docker stats` parses cleanly with `--no-stream --format '{{.MemUsage}}'`
     // which yields strings like "123.4MiB / 7.7GiB" or "0B / 7.7GiB".
-    let out = match std::process::Command::new("docker")
+    let out = match docker_cmd()
         .args([
             "stats",
             "--no-stream",
@@ -2289,7 +2289,7 @@ pub fn prepull_probe_image() {
     std::thread::Builder::new()
         .name("ezgha-probe-prepull".into())
         .spawn(|| {
-            let out = Command::new("docker")
+            let out = docker_cmd()
                 .args(["pull", PROBE_IMAGE])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -2358,7 +2358,7 @@ fn probe_docker_cpu_controller_available() -> bool {
             // timeout fails closed (the daemon already fails closed on
             // any other probe error), so the safety contract is
             // unchanged.
-            let mut cmd = Command::new("docker");
+            let mut cmd = docker_cmd();
             cmd.args([
                 "run", "--rm", "--cgroupns=host", "--network=none",
                 probe_img, "sh", "-c",
@@ -2492,23 +2492,18 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
 /// module to a fake script without touching the process-wide `PATH` env var
 /// (which is shared with every other thread/test in the binary). Production
 /// behavior is unchanged: always `Command::new("docker")`, resolved via the
-/// real `PATH`.
+/// real `PATH`. Endpoint selection is owned by `platform` so startup probes
+/// and runner mutation always address the same daemon.
 fn docker_cmd() -> Command {
     #[cfg(test)]
     {
         if let Some(bin) = TEST_DOCKER_BIN.lock().unwrap().clone() {
             let mut cmd = Command::new(bin);
-            cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
-            #[cfg(target_os = "linux")]
-            cmd.arg("--host").arg("unix:///var/run/docker.sock");
+            crate::platform::configure_docker_endpoint(&mut cmd);
             return cmd;
         }
     }
-    let mut cmd = Command::new("docker");
-    cmd.env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT");
-    #[cfg(target_os = "linux")]
-    cmd.arg("--host").arg("unix:///var/run/docker.sock");
-    cmd
+    crate::platform::docker_command()
 }
 
 #[cfg(test)]
@@ -4631,11 +4626,14 @@ mod tests {
     struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         path: PathBuf,
+        docker_host_override: Option<std::ffi::OsString>,
     }
 
     impl TestEnv {
         fn new(label: &str) -> Self {
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let docker_host_override = env::var_os("DOCKER_HOST_OVERRIDE");
+            env::remove_var("DOCKER_HOST_OVERRIDE");
             reset_failure_ladder_admission_latch_for_tests();
             crate::failure_ladder::reset_test_save_failure();
             let path = tmp_path(label);
@@ -4674,7 +4672,11 @@ mod tests {
             } else {
                 *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
             }
-            Self { _lock: lock, path }
+            Self {
+                _lock: lock,
+                path,
+                docker_host_override,
+            }
         }
     }
 
@@ -4703,6 +4705,11 @@ mod tests {
             // Clear the quarantine redirect set in new() (TEST_LOCK is
             // still held here, so no other test can observe the gap).
             std::env::remove_var("EZGHA_QUARANTINE_PATH");
+            if let Some(value) = &self.docker_host_override {
+                std::env::set_var("DOCKER_HOST_OVERRIDE", value);
+            } else {
+                std::env::remove_var("DOCKER_HOST_OVERRIDE");
+            }
             let _ = std::fs::remove_file(&self.path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
@@ -6543,6 +6550,39 @@ minimum_isolation = "container"
         assert!(
             run_line.contains("--host unix:///var/run/docker.sock"),
             "Linux host docker invocations must explicitly pass canonical socket: {run_line}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn explicit_docker_host_override_is_emitted_on_runner_start() {
+        let _env = TestEnv::new("explicit_docker_host_override");
+        cpu_probe_overrides::set(Some(true));
+        std::env::set_var("DOCKER_HOST_OVERRIDE", "unix:///run/ezgha-selected-vm.sock");
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-explicit-docker-host-test-{}",
+            std::process::id()
+        ));
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect("start_one should use the explicitly selected Docker endpoint");
+
+        let run_content = std::fs::read_to_string(&capture).unwrap();
+        let run_line = run_content
+            .lines()
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains("--host unix:///run/ezgha-selected-vm.sock"),
+            "explicit Docker endpoint must be preserved for runner mutation: {run_line}"
         );
     }
 

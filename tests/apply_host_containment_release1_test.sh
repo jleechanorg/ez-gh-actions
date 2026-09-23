@@ -80,6 +80,19 @@ SYSTEMCTL_LOG="$WORK/pass_sys.log" PATH="$PASS_ROOT/bin:$PATH" \
 [ -f "$PASS_ROOT/etc/systemd/user/automation.slice" ] || fail "automation.slice not staged to user units"
 ok "apply-host-containment-release1.sh stages policy artifacts and boundary drop-ins"
 
+# Verify [Install] produces persistent boot wiring without touching the host unit graph.
+HOST_SYSTEMCTL="$(PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v systemctl || true)"
+if [ -n "$HOST_SYSTEMCTL" ]; then
+  "$HOST_SYSTEMCTL" --root "$PASS_ROOT" enable actions.slice \
+    || fail "staged actions.slice could not be enabled in isolated fixture root"
+  boot_link="$PASS_ROOT/etc/systemd/system/slices.target.wants/actions.slice"
+  [ -L "$boot_link" ] || fail "actions.slice enable did not create slices.target boot link"
+  boot_target="$(readlink "$boot_link")"
+  [ "$PASS_ROOT$boot_target" = "$PASS_ROOT/etc/systemd/system/actions.slice" ] \
+    || fail "actions.slice boot link does not resolve to the staged unit"
+  ok "actions.slice enable creates isolated persistent slices.target boot wiring"
+fi
+
 # 2. Pre-mutation gate: memory below floor
 MEM_FAIL_ROOT="$WORK/mem_fail"
 setup_fixture "$MEM_FAIL_ROOT"

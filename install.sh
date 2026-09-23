@@ -281,7 +281,7 @@ is_socket_alive() {
   # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
   local sock="$1"
   [ -S "$sock" ] || return 1
-  DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
+  env -u DOCKER_CONTEXT DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
 }
 
 ensure_colima_docker_daemon() {
@@ -336,8 +336,17 @@ ensure_colima_docker_daemon() {
 }
 ensure_colima_docker_daemon || true
 DOCKER_HOST_OVERRIDE=""
-# Strategy 1: trust the active docker context
-DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+# Resolve the Docker endpoint selected by the current shell into an explicit
+# value that can be persisted for the service and reused by every build and
+# runner mutation. Docker documents that DOCKER_CONTEXT overrides DOCKER_HOST,
+# so resolve a named context first; otherwise honor an explicit host socket.
+if [ -n "${DOCKER_CONTEXT:-}" ]; then
+  DOCKER_CTX_HOST=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+elif [ -n "${DOCKER_HOST:-}" ]; then
+  DOCKER_CTX_HOST="$DOCKER_HOST"
+else
+  DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+fi
 # Strategy 2: probe colima's default location
 DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
 # Strategy 3: probe docker desktop's socket
@@ -361,7 +370,7 @@ fi
 export DOCKER_HOST_OVERRIDE
 
 if command -v docker >/dev/null 2>&1; then
-  if [ -n "${DOCKER_HOST_OVERRIDE}" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" docker version >/dev/null 2>&1; then
+  if [ -n "${DOCKER_HOST_OVERRIDE}" ] && env -u DOCKER_CONTEXT DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" docker version >/dev/null 2>&1; then
     ok "docker daemon reachable via ${DOCKER_HOST_OVERRIDE}"
   elif [ -z "${DOCKER_HOST_OVERRIDE}" ] && docker version >/dev/null 2>&1; then
     ok "docker daemon reachable"
@@ -399,8 +408,9 @@ ok "All tests passed"
 # A Linux daemon that shares this kernel needs the host aggregate boundary
 # before replacing the binary, building an image, or starting the service.
 if [ "$(uname -s)" = "Linux" ]; then
-  docker_kernel="$(env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info --format '{{.KernelVersion}}' 2>/dev/null || true)"
-  [ -n "${docker_kernel}" ] || { bad "cannot determine canonical Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
+  docker_endpoint="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}"
+  docker_kernel="$(env -u DOCKER_CONTEXT DOCKER_HOST="${docker_endpoint}" docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
+  [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
   if [ "${docker_kernel}" = "$(uname -r)" ]; then
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
     HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
@@ -445,7 +455,7 @@ fi
 # so a fresh VM (new machine, `colima delete && colima start`, disk-pressure
 # recreation) has no way to get it back except this step. Idempotent: a
 # no-op rebuild of an unchanged Dockerfile.runner is a fast cache hit.
-if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" docker version >/dev/null 2>&1; then
+if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && env -u DOCKER_CONTEXT DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}" docker version >/dev/null 2>&1; then
   info "Building ezgha-runner:latest from Dockerfile.runner"
   # DOCKER_BUILDKIT=0 (legacy builder): BuildKit's build-context network path
   # hit a reproducible "python3-venv has no installation candidate" apt
@@ -453,7 +463,7 @@ if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRI
   # builder and a plain `docker run ... apt-get install` both succeeded
   # immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully
   # isolated; defaulting to the legacy builder here is the proven-reliable path.
-  if DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" DOCKER_BUILDKIT=0 \
+  if env -u DOCKER_CONTEXT DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}" DOCKER_BUILDKIT=0 \
       docker build -f "${SCRIPT_DIR}/Dockerfile.runner" -t ezgha-runner:latest "${SCRIPT_DIR}" \
       >/tmp/ezgha-runner-build.log 2>&1; then
     ok "ezgha-runner:latest built"
@@ -515,7 +525,7 @@ if [ -f "${CONFIG_PATH}" ]; then
     else
       info "Installing ezgha service..."
     fi
-    DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
+    DOCKER_HOST_OVERRIDE="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux containment is activated below before image build or service
@@ -526,6 +536,8 @@ fi
 
 if [ "${LINUX_SERVICE_PENDING:-0}" -eq 1 ]; then
   if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+    info "Refreshing systemd service endpoint after containment activation..."
+    DOCKER_HOST_OVERRIDE="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
     info "Restarting systemd service after containment activation..."
     systemctl --user restart ezgha.service
     ok "ezgha service restarted via systemd"

@@ -24,8 +24,19 @@ EOF
 cat > "$STUB_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
 args=" $* "
-if [[ "$args" == *" info "* ]]; then echo fixture-host-kernel; fi
-if [[ "$args" == *" build "* ]]; then echo docker-build >> "$EVENT_LOG"; fi
+if [[ "$args" == *" context inspect explicit-context "* ]]; then
+  echo unix:///fixture/context.sock
+  exit 0
+fi
+if [[ "$args" == *" info "* ]]; then
+  echo "docker-info:${DOCKER_HOST:-}" >> "$EVENT_LOG"
+  if [ "${DOCKER_HOST:-}" = "unix:///fixture/vm.sock" ] || [ "${DOCKER_HOST:-}" = "unix:///fixture/context.sock" ]; then
+    echo fixture-vm-kernel
+  else
+    echo fixture-host-kernel
+  fi
+fi
+if [[ "$args" == *" build "* ]]; then echo "docker-build:${DOCKER_HOST:-}" >> "$EVENT_LOG"; fi
 exit 0
 EOF
 cat > "$STUB_BIN/cargo" <<'EOF'
@@ -33,7 +44,7 @@ cat > "$STUB_BIN/cargo" <<'EOF'
 echo "cargo-$1" >> "$EVENT_LOG"
 if [ "${1:-}" = install ]; then
   mkdir -p "$HOME/.cargo/bin"
-  printf '#!/usr/bin/env bash\nexit 0\n' > "$HOME/.cargo/bin/ezgha"
+  printf '#!/usr/bin/env bash\nif [ "${1:-}" = install-service ]; then echo "install-service:${DOCKER_HOST_OVERRIDE:-}" >> "$EVENT_LOG"; fi\nexit 0\n' > "$HOME/.cargo/bin/ezgha"
   chmod +x "$HOME/.cargo/bin/ezgha"
 fi
 exit 0
@@ -56,7 +67,7 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
-  is-active) exit 1 ;;
+  is-active) [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1 ;;
   daemon-reload|start|set-property) echo "systemctl-$1" >> "$EVENT_LOG"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -93,7 +104,7 @@ EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" \
 
 [ -f "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/host/actions.slice" ] \
   || fail "installed containment policy subtree is incomplete"
-root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(line_of docker-build)"
+root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
@@ -114,4 +125,40 @@ run_failed_phase() {
 }
 run_failed_phase root
 run_failed_phase user
+
+# An explicitly selected VM daemon must be used consistently for reachability,
+# kernel classification, and image build. Its guest kernel differs from the
+# host, so host-Docker containment is intentionally not activated.
+VM_EVENT_LOG="$WORK/vm_events"
+VM_HOME="$WORK/vm_home"
+mkdir -p "$VM_HOME"
+env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" \
+  DOCKER_HOST='unix:///fixture/vm.sock' \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/vm-install.log" 2>&1 \
+  || fail "explicit VM endpoint fixture install failed"
+grep -qx 'docker-info:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
+  || fail "installer did not probe the explicitly selected VM endpoint"
+grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
+  || fail "installer did not build on the explicitly selected VM endpoint"
+if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
+  fail "VM endpoint was misclassified as native HostDocker"
+fi
+
+# Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
+# active-service upgrade path must persist that resolved endpoint before its
+# existing restart, rather than leaving an old unit pointed at native Docker.
+CONTEXT_EVENT_LOG="$WORK/context_events"
+CONTEXT_HOME="$WORK/context_home"
+mkdir -p "$CONTEXT_HOME/.config/ezgha"
+printf '# fixture\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
+env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" \
+  SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///fixture/ignored.sock' \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/context-install.log" 2>&1 \
+  || fail "named Docker context fixture install failed"
+grep -qx 'docker-info:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
+  || fail "DOCKER_CONTEXT did not override DOCKER_HOST during endpoint discovery"
+grep -qx 'docker-build:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
+  || fail "image build did not use the resolved named context endpoint"
+grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
+  || fail "active systemd service refresh did not persist the selected endpoint"
 echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"

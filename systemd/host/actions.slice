@@ -11,3 +11,6 @@ CPUQuota=2000%
 IOWeight=25
 ManagedOOMMemoryPressure=auto
 ManagedOOMSwap=auto
+
+[Install]
+WantedBy=slices.target

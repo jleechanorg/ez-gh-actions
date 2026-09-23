@@ -195,7 +195,7 @@ fn log_skipped_stronger_backends(skipped_stronger: &[backend::Backend], backend:
 }
 
 fn docker_reachable() -> bool {
-    std::process::Command::new("docker")
+    platform::docker_command()
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output()
         .map(|o| o.status.success())

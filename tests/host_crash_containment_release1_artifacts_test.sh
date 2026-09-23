@@ -27,6 +27,15 @@ assert_line "$ACTIONS_SLICE" "CPUQuota=2000%"
 assert_line "$ACTIONS_SLICE" "IOWeight=25"
 assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressure=auto"
 assert_line "$ACTIONS_SLICE" "ManagedOOMSwap=auto"
+assert_line "$ACTIONS_SLICE" "[Install]"
+assert_line "$ACTIONS_SLICE" "WantedBy=slices.target"
+
+APPLY_SCRIPT="$REPO_ROOT/scripts/host/apply-host-containment-release1.sh"
+enable_line="$(grep -nF 'systemctl enable actions.slice' "$APPLY_SCRIPT" | cut -d: -f1)"
+start_line="$(grep -nF 'systemctl start actions.slice' "$APPLY_SCRIPT" | cut -d: -f1)"
+[ -n "$enable_line" ] || fail "root containment activation does not persist actions.slice boot wiring"
+[ -n "$start_line" ] || fail "root containment activation does not start actions.slice"
+[ "$enable_line" -lt "$start_line" ] || fail "actions.slice must be enabled before it is started"
 ok "systemd/host/actions.slice finite boundary and auto OOM policies"
 
 # 2. User workload slices
