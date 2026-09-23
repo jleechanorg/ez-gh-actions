@@ -59,6 +59,37 @@
 #   TAIL_LOCK_TIMEOUT_SEC=10      # max wait for tail-with-lock
 #   ALERT_HOST=$(hostname -s)     # embedded in alert payload
 #
+#   GH#106 acceptance (added 2026-08-06, bead jleechan-vsd1):
+#   EZGHA_DOCTOR_RUNNER=1         # opt-in: parse ./doctor-runner verdict
+#   DOCTOR_RUNNER_PATH=./doctor-runner  # path to doctor-runner
+#   CRITICAL_DEGRADED_THRESHOLD=2 # CRITICAL stderr lines to count degraded
+#                                 # (only fires if doctor-runner is also degraded
+#                                 # OR container_count_check is degraded —
+#                                 # the idle false-positive guard per
+#                                 # feedback_2026-08-01_daemon_settling_check)
+#   EZGHA_EXPECTED_CAPACITY=16    # expected per-host container count (10 Mac,
+#                                 # 6 Linux) — compared against
+#                                 # `docker ps --filter label=ezgha=managed`
+#   ALERT_LOG_FILE=/var/log/ezgha-alerts.log  # JSONL sink (falls back to
+#                                 # $STATE_DIR/alerts.log if not writable;
+#                                 # root or sudo required for /var/log)
+#
+# Alert payload schema (acceptance criterion 3):
+#   { "ts": "...", "host": "...", "gate": "ezgha-fleet-alert",
+#     "severity": "critical|info",
+#     "evidence": "<free-text explanation; was 'reason' before 2026-08-06>",
+#     "short_window_sec": N, "long_window_sec": N,
+#     "short_state": "ok|degraded", "long_state": "ok|degraded",
+#     "short_reclaim_count": N, "long_reclaim_count": N,
+#     "short_origin": "fresh|cached|stale-cache|no-data",
+#     "long_origin": "fresh|cached|stale-cache|no-data",
+#     "slot_file_health": "ok:N|degraded:N|missing",
+#     "doctor_verdict": "ok|fail|n/a",        # GH#106 gap 1
+#     "doctor_executing": N, "doctor_idle_ok": N,
+#     "doctor_idle_starved": N, "doctor_down": N,   # GH#106 gap 1
+#     "critical_in_window": N,                       # GH#106 gap 2
+#     "container_count": N, "expected_capacity": N } # GH#106 gap 3
+#
 # Exit codes:
 #   0 = both windows OK (no action)
 #   1 = ALERT fired (both windows degraded)
@@ -99,6 +130,13 @@ SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 SLOT_CAPACITY="${SLOT_CAPACITY:-16}"
 TAIL_LOCK_TIMEOUT_SEC="${TAIL_LOCK_TIMEOUT_SEC:-10}"
 ALERT_HOST="${ALERT_HOST:-$(hostname -s 2>/dev/null || echo unknown)}"
+
+# GH#106 acceptance env (added 2026-08-06, bead jleechan-vsd1).
+EZGHA_DOCTOR_RUNNER="${EZGHA_DOCTOR_RUNNER:-0}"
+DOCTOR_RUNNER_PATH="${DOCTOR_RUNNER_PATH:-$(cd "$(dirname "$SELF_PATH")/.." && pwd)/doctor-runner}"
+CRITICAL_DEGRADED_THRESHOLD="${CRITICAL_DEGRADED_THRESHOLD:-2}"
+EZGHA_EXPECTED_CAPACITY="${EZGHA_EXPECTED_CAPACITY:-16}"
+ALERT_LOG_FILE="${ALERT_LOG_FILE:-/var/log/ezgha-alerts.log}"
 
 # ── self-test mode ──────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -220,6 +258,104 @@ filter_within_window() {
   done
 }
 
+# GH#106 gap 1: doctor-runner verdict polling.
+# When EZGHA_DOCTOR_RUNNER=1, invoke $DOCTOR_RUNNER_PATH and parse its
+# per-slot 4-state output. The expected output format is one line per
+# state with the prefix `executing=N`, `idle_ok=N`, `idle_starved=N`,
+# `down=N` plus a header line `doctor: <verdict>`. Robust callers
+# (operator unit tests, this script's stub) emit exactly that shape.
+# Returns: 0 if verified-degraded (fail), 1 if verified-ok or unavailable.
+# Echoes verdict on stdout: ok|fail|n/a.
+doctor_runner_check() {
+  if [[ "${EZGHA_DOCTOR_RUNNER:-0}" != "1" ]]; then
+    echo "n/a"
+    return 1
+  fi
+  local path="${DOCTOR_RUNNER_PATH:-}"
+  if [[ -z "$path" ]] || [[ ! -x "$path" ]]; then
+    log "doctor-runner: path not executable: '${path}' — treating as n/a"
+    echo "n/a"
+    return 1
+  fi
+  local out
+  if ! out="$("$path" 2>&1)"; then
+    log "doctor-runner: non-zero exit code — treating as n/a"
+    echo "n/a"
+    return 1
+  fi
+  local verdict
+  verdict="$(printf '%s\n' "$out" | sed -nE 's/^doctor:[[:space:]]+(ok|fail).*/\1/p' | head -1)"
+  if [[ -z "$verdict" ]]; then
+    log "doctor-runner: could not parse verdict line — treating as n/a"
+    echo "n/a"
+    return 1
+  fi
+  echo "$verdict"
+  return 0
+}
+
+# GH#106 gap 1 (companion): parse the 4 state counts from doctor-runner output.
+# Echoes four ints (executing idle_ok idle_starved down) on a single line.
+doctor_runner_parse_counts() {
+  local out="$1"
+  local exec idle_ok idle_starved down
+  exec="$(printf '%s\n' "$out" | sed -nE 's/^executing=([0-9]+).*/\1/p' | head -1)"
+  idle_ok="$(printf '%s\n' "$out" | sed -nE 's/^idle_ok=([0-9]+).*/\1/p' | head -1)"
+  idle_starved="$(printf '%s\n' "$out" | sed -nE 's/^idle_starved=([0-9]+).*/\1/p' | head -1)"
+  down="$(printf '%s\n' "$out" | sed -nE 's/^down=([0-9]+).*/\1/p' | head -1)"
+  printf '%s %s %s %s\n' \
+    "${exec:-0}" "${idle_ok:-0}" "${idle_starved:-0}" "${down:-0}"
+}
+
+# GH#106 gap 2: count CRITICAL lines in the daemon stderr log within a
+# time window. The window cutoff is wall_ts-based (PR #109 format) when
+# present; otherwise we fall back to the log file's mtime (best-effort).
+# Returns the int count on stdout.
+count_critical_in_window() {
+  local stderr_file="$1" window_sec="$2" now_epoch="$3"
+  if [[ ! -r "$stderr_file" ]]; then
+    echo "0"
+    return 0
+  fi
+  local cutoff=$(( now_epoch - window_sec ))
+  local log_mtime=0
+  log_mtime="$(stat -f %m "$stderr_file" 2>/dev/null || stat -c %Y "$stderr_file" 2>/dev/null || echo 0)"
+  local line ts cnt
+  cnt=0
+  while IFS= read -r line; do
+    # Only count lines that LOOK like daemon stderr (contain "CRITICAL").
+    [[ "$line" == *"CRITICAL"* ]] || continue
+    if [[ "$line" =~ wall_ts=([0-9]+) ]]; then
+      ts="${BASH_REMATCH[1]}"
+      if (( ts >= cutoff )); then
+        cnt=$(( cnt + 1 ))
+      fi
+    elif (( log_mtime >= cutoff )); then
+      # No wall_ts — fall back to mtime window (best-effort).
+      cnt=$(( cnt + 1 ))
+    fi
+  done < "$stderr_file"
+  echo "$cnt"
+  return 0
+}
+
+# GH#106 gap 3: container_count_check — compare the local container count
+# against EZGHA_EXPECTED_CAPACITY. Echoes "<count> <matches>" where
+# matches is 1 if count >= expected, 0 if below.
+container_count_check() {
+  local expected="${EZGHA_EXPECTED_CAPACITY:-16}"
+  local count
+  if command -v docker >/dev/null 2>&1; then
+    count="$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    count=0
+  fi
+  [[ "$count" =~ ^[0-9]+$ ]] || count=0
+  local matches=0
+  (( count >= expected )) && matches=1
+  printf '%s %s\n' "$count" "$matches"
+}
+
 # Check the slot file. Returns 0 if the slot count meets or exceeds the
 # configured capacity; 1 if missing/empty/degraded. We use a tiny TOML
 # subset parser: scan for `runner_ids = [...]` and count entries.
@@ -251,14 +387,30 @@ slot_file_health() {
 }
 
 # Compose the alert payload (JSON object on stdout).
+# GH#106: also writes an optional JSONL line to $ALERT_LOG_FILE (or
+# $STATE_DIR/alerts.log fallback) when emit_alert is invoked.
 emit_alert() {
   local short_state="$1" long_state="$2" short_count="$3" long_count="$4" \
-        slot_health="$5" severity="$6" reason="$7"
+        slot_health="$5" severity="$6" evidence="$7"
   local short_origin="${SHORT_ORIGIN:-fresh}"
   local long_origin="${LONG_ORIGIN:-fresh}"
-  cat <<JSON
-{"ts":"$TS","host":"$ALERT_HOST","gate":"ezgha-fleet-alert","severity":"$severity","reason":"$reason","short_window_sec":$SHORT_WINDOW_SEC,"long_window_sec":$LONG_WINDOW_SEC,"short_state":"$short_state","long_state":"$long_state","short_reclaim_count":$short_count,"long_reclaim_count":$long_count,"short_origin":"$short_origin","long_origin":"$long_origin","slot_file_health":"$slot_health"}
+  local payload
+  payload="$(cat <<JSON
+{"ts":"$TS","host":"$ALERT_HOST","gate":"ezgha-fleet-alert","severity":"$severity","evidence":"$evidence","short_window_sec":$SHORT_WINDOW_SEC,"long_window_sec":$LONG_WINDOW_SEC,"short_state":"$short_state","long_state":"$long_state","short_reclaim_count":$short_count,"long_reclaim_count":$long_count,"short_origin":"$short_origin","long_origin":"$long_origin","slot_file_health":"$slot_health","doctor_verdict":"$DOCTOR_VERDICT","doctor_executing":$DOCTOR_EXECUTING,"doctor_idle_ok":$DOCTOR_IDLE_OK,"doctor_idle_starved":$DOCTOR_IDLE_STARVED,"doctor_down":$DOCTOR_DOWN,"critical_in_window":$CRITICAL_IN_WINDOW,"container_count":$CONTAINER_COUNT,"expected_capacity":$EXPECTED_CAPACITY}
 JSON
+)"
+  printf '%s\n' "$payload"
+  # GH#106 gap 5: optional JSONL sink.
+  if [[ -n "${ALERT_LOG_FILE:-}" ]]; then
+    local target="$ALERT_LOG_FILE"
+    if ! ( umask 022 && printf '%s\n' "$payload" >> "$target" ) 2>/dev/null; then
+      # Fallback: $STATE_DIR/alerts.log (guaranteed writable — we created it above).
+      target="${STATE_DIR}/alerts.log"
+      if ! ( umask 022 && printf '%s\n' "$payload" >> "$target" ) 2>/dev/null; then
+        log "alert log sink: could not write to ALERT_LOG_FILE or fallback ${target}"
+      fi
+    fi
+  fi
 }
 
 # Dispatch to the configured alert sink. Receives the alert JSON on stdin.
@@ -270,7 +422,7 @@ dispatch_alert() {
       # osascript notification. Title truncates to 64 chars.
       local title="ezgha fleet degraded"
       local body
-      body="$(printf '%s' "$payload" | sed 's/.*"reason":"\([^"]*\)".*/reason=\1/' | head -c 200)"
+      body="$(printf '%s' "$payload" | sed 's/.*"evidence":"\([^"]*\)".*/evidence=\1/' | head -c 200)"
       osascript -e "display notification \"$body\" with title \"$title\"" \
         >/dev/null 2>&1 || log "macos sink: osascript failed"
       ;;
@@ -278,7 +430,7 @@ dispatch_alert() {
       if command -v notify-send >/dev/null 2>&1; then
         local title="ezgha fleet degraded"
         local body
-        body="$(printf '%s' "$payload" | sed 's/.*"reason":"\([^"]*\)".*/reason=\1/' | head -c 200)"
+        body="$(printf '%s' "$payload" | sed 's/.*"evidence":"\([^"]*\)".*/evidence=\1/' | head -c 200)"
         notify-send "$title" "$body" >/dev/null 2>&1 || log "linux sink: notify-send failed"
       else
         log "linux sink: notify-send not installed — payload on stderr only"
@@ -291,7 +443,7 @@ dispatch_alert() {
       else
         # Slack incoming webhook expects {"text": "..."}.
         local text
-        text="$(printf '%s' "$payload" | sed 's/.*"reason":"\([^"]*\)".*/ezgha fleet degraded: reason=\1/')"
+        text="$(printf '%s' "$payload" | sed 's/.*"evidence":"\([^"]*\)".*/ezgha fleet degraded: evidence=\1/')"
         curl --silent --show-error --fail \
           -X POST -H 'Content-Type: application/json' \
           --data "$(printf '{"text":"%s"}' "$text")" \
@@ -406,6 +558,59 @@ slot_rc=$?
 if (( slot_rc != 0 )); then
   short_degraded=1
   long_degraded=1
+fi
+
+# ── GH#106 acceptance signals (computed before emit_alert so the       ──
+# JSON payload includes them). Each signal is independently evaluated;
+# elevation logic only triggers BOTH windows degraded when the signal
+# is genuinely fleet-wide (doctor-down, container_count shortfall).
+DOCTOR_VERDICT="n/a"
+DOCTOR_EXECUTING=0
+DOCTOR_IDLE_OK=0
+DOCTOR_IDLE_STARVED=0
+DOCTOR_DOWN=0
+CRITICAL_IN_WINDOW=0
+CONTAINER_COUNT=0
+EXPECTED_CAPACITY="${EZGHA_EXPECTED_CAPACITY:-16}"
+
+# doctor-runner (gap 1)
+DOCTOR_VERDICT="$(doctor_runner_check)"
+if [[ "$DOCTOR_VERDICT" != "n/a" ]]; then
+  # Re-run to get the underlying output for count parsing.
+  if [[ -x "${DOCTOR_RUNNER_PATH:-}" ]]; then
+    _dr_out="$("${DOCTOR_RUNNER_PATH}" 2>&1 || true)"
+    _dr_counts="$(doctor_runner_parse_counts "$_dr_out")"
+    DOCTOR_EXECUTING="${_dr_counts%% *}"
+    _rest="${_dr_counts#* }"
+    DOCTOR_IDLE_OK="${_rest%% *}"
+    _rest="${_rest#* }"
+    DOCTOR_IDLE_STARVED="${_rest%% *}"
+    DOCTOR_DOWN="${_rest##* }"
+  fi
+  # doctor reports fail verdict → both windows degraded.
+  if [[ "$DOCTOR_VERDICT" == "fail" ]]; then
+    short_degraded=1
+    long_degraded=1
+  fi
+fi
+
+# container_count (gap 3)
+_cc_line="$(container_count_check)"
+CONTAINER_COUNT="${_cc_line%% *}"
+_cc_matches="${_cc_line##* }"
+if [[ "$_cc_matches" == "0" ]] && (( CONTAINER_COUNT < EXPECTED_CAPACITY )); then
+  short_degraded=1
+  long_degraded=1
+fi
+
+# CRITICAL stderr scan (gap 2) — gated by doctor/container (false-positive guard).
+CRITICAL_IN_WINDOW="$(count_critical_in_window "$DAEMON_STDERR_LOG" "$SHORT_WINDOW_SEC" "$EPOCH")"
+if (( CRITICAL_IN_WINDOW >= CRITICAL_DEGRADED_THRESHOLD )); then
+  # Only contribute to degraded if doctor-runner OR container_count is also degraded.
+  if [[ "$DOCTOR_VERDICT" == "fail" ]] || (( _cc_matches == 0 )); then
+    short_degraded=1
+    long_degraded=1
+  fi
 fi
 
 # ── emit ───────────────────────────────────────────────────────────────────
