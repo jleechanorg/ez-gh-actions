@@ -99,7 +99,7 @@ chmod +x "$TEMP_REPO/scripts/host/"*containment-release1.sh
 HOME_DIR="$WORK/home"
 mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user"
 printf '# fixture\n' > "$HOME_DIR/.config/ezgha/config.toml"
-EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" \
+EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/install.log" 2>&1 || fail "host-Docker fixture install failed"
 
 [ -f "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/host/actions.slice" ] \
@@ -115,7 +115,7 @@ run_failed_phase() {
   local log="$WORK/${phase}_events"
   mkdir -p "$home/.config/ezgha"
   printf '# fixture\n' > "$home/.config/ezgha/config.toml"
-  if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" "APPLY_FAIL_${phase^^}=1" \
+  if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" "APPLY_FAIL_${phase^^}=1" \
       bash "$TEMP_REPO/install.sh" --dev > "$WORK/${phase}.log" 2>&1; then
     fail "${phase} phase failure still allowed installation"
   fi
@@ -132,7 +132,7 @@ run_failed_phase user
 VM_EVENT_LOG="$WORK/vm_events"
 VM_HOME="$WORK/vm_home"
 mkdir -p "$VM_HOME"
-env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" CARGO_HOME="$VM_HOME/.cargo" \
+env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" CARGO_HOME="$VM_HOME/.cargo" XDG_CONFIG_HOME="$VM_HOME/.config" \
   DOCKER_HOST='unix:///fixture/vm.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/vm-install.log" 2>&1 \
   || fail "explicit VM endpoint fixture install failed"
@@ -151,7 +151,7 @@ CONTEXT_EVENT_LOG="$WORK/context_events"
 CONTEXT_HOME="$WORK/context_home"
 mkdir -p "$CONTEXT_HOME/.config/ezgha"
 printf '# fixture\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
-env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" CARGO_HOME="$CONTEXT_HOME/.cargo" \
+env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" CARGO_HOME="$CONTEXT_HOME/.cargo" XDG_CONFIG_HOME="$CONTEXT_HOME/.config" \
   SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///fixture/ignored.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/context-install.log" 2>&1 \
   || fail "named Docker context fixture install failed"
@@ -159,6 +159,11 @@ grep -qx 'docker-info:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
   || fail "DOCKER_CONTEXT did not override DOCKER_HOST during endpoint discovery"
 grep -qx 'docker-build:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
   || fail "image build did not use the resolved named context endpoint"
-grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
-  || fail "active systemd service refresh did not persist the selected endpoint"
+if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG"; then
+  echo "context fixture install log:" >&2
+  sed -n '1,120p' "$WORK/context-install.log" >&2 || true
+  echo "context fixture events:" >&2
+  cat "$CONTEXT_EVENT_LOG" >&2 || true
+  fail "active systemd service refresh did not persist the selected endpoint"
+fi
 echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"
