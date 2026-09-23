@@ -94,6 +94,11 @@ EOF
 
 cat > "${STUB_BIN}/docker" <<'EOF'
 #!/usr/bin/env bash
+if [[ " $* " == *" info "* ]]; then
+  # A different kernel models the existing VM-backed path; this watchdog test
+  # deliberately does not exercise the host-Docker activation branch.
+  echo "fixture-vm-kernel"
+fi
 exit 0
 EOF
 

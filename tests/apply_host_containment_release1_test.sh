@@ -38,6 +38,8 @@ setup_fixture() {
   printf '6000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
   printf 'default 25\n' > "$root/sys/fs/cgroup/actions.slice/io.weight"
+  printf '8589934592\n' > "$root/sys/fs/cgroup/actions.slice/memory.current"
+  printf '100\n' > "$root/sys/fs/cgroup/actions.slice/pids.current"
 
   cat > "$root/bin/systemctl" <<'SYS_EOF'
 #!/usr/bin/env bash
@@ -98,5 +100,15 @@ if PATH="$AGENT_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AGENT_MEM_FAIL
 fi
 [ ! -f "$AGENT_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before agent memory check"
 ok "apply-host-containment-release1.sh aborts before mutation when current agent use >= 18G"
+
+# 4. Pre-mutation gate: do not lower actions.slice beneath live use.
+ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
+setup_fixture "$ACTIONS_MEM_FAIL_ROOT"
+printf '27917287424\n' > "$ACTIONS_MEM_FAIL_ROOT/sys/fs/cgroup/actions.slice/memory.current"
+if PATH="$ACTIONS_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$ACTIONS_MEM_FAIL_ROOT" > "$WORK/actions_mem.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when actions usage was at the new high limit"
+fi
+[ ! -f "$ACTIONS_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before actions usage gate"
+ok "apply-host-containment-release1.sh aborts before lowering actions.slice beneath live use"
 
 echo "APPLY_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

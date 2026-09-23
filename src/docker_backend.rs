@@ -2514,6 +2514,221 @@ fn docker_cmd() -> Command {
 #[cfg(test)]
 static TEST_HOST_CONTAINMENT_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_CGROUP_ROOT: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_DAEMON_IN_VM: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_CONTAINER_ANCESTRY_OVERRIDE: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_USER_MANAGER_OOM_PROPERTIES: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_MEMORY_HIGH_BYTES: u64 = 26 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_MEMORY_MAX_BYTES: u64 = 28 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_PIDS_MAX: u64 = 6000;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_CPU_QUOTA_USEC: u64 = 2_000_000;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_CPU_PERIOD_USEC: u64 = 100_000;
+
+#[cfg(target_os = "linux")]
+fn host_containment_daemon_in_vm() -> bool {
+    #[cfg(test)]
+    if let Some(in_vm) = *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() {
+        return in_vm;
+    }
+
+    // This must use the same canonical endpoint as runner mutation. The
+    // ambient Docker context can point at Colima or a remote daemon while
+    // `docker_cmd` later creates containers on the host socket.
+    let host_kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|kernel| kernel.trim().to_owned())
+        .filter(|kernel| !kernel.is_empty());
+    let mut cmd = docker_cmd();
+    cmd.args(["info", "--format", "{{.KernelVersion}}"]);
+    let daemon_kernel = run_docker(
+        cmd,
+        "checking canonical Docker daemon kernel for containment",
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    .filter(|kernel| !kernel.is_empty());
+    matches!((host_kernel, daemon_kernel), (Some(host), Some(daemon)) if host != daemon)
+}
+
+#[cfg(target_os = "linux")]
+fn host_actions_cgroup_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap().clone() {
+        return root;
+    }
+    PathBuf::from("/sys/fs/cgroup")
+}
+
+#[cfg(target_os = "linux")]
+fn read_host_actions_limit(root: &Path, name: &str) -> Result<String> {
+    let path = root.join("actions.slice").join(name);
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("host containment requires readable {}", path.display()))
+        .map(|value| value.trim().to_owned())
+}
+
+/// Confirm the finite cgroup-v2 limits that bound the complete HostDocker fleet.
+#[cfg(target_os = "linux")]
+fn validate_host_actions_slice(root: &Path) -> Result<()> {
+    let memory_high = read_host_actions_limit(root, "memory.high")?;
+    let memory_high = memory_high.parse::<u64>().with_context(|| {
+        format!(
+            "host containment requires finite actions.slice memory.high={} bytes (got {memory_high:?})",
+            HOST_ACTIONS_MEMORY_HIGH_BYTES
+        )
+    })?;
+    if memory_high != HOST_ACTIONS_MEMORY_HIGH_BYTES {
+        bail!(
+            "host containment requires actions.slice memory.high={} bytes (got {memory_high})",
+            HOST_ACTIONS_MEMORY_HIGH_BYTES
+        );
+    }
+
+    let memory_max = read_host_actions_limit(root, "memory.max")?;
+    let memory_max = memory_max.parse::<u64>().with_context(|| {
+        format!(
+            "host containment requires finite actions.slice memory.max={} bytes (got {memory_max:?})",
+            HOST_ACTIONS_MEMORY_MAX_BYTES
+        )
+    })?;
+    if memory_max != HOST_ACTIONS_MEMORY_MAX_BYTES {
+        bail!(
+            "host containment requires actions.slice memory.max={} bytes (got {memory_max})",
+            HOST_ACTIONS_MEMORY_MAX_BYTES
+        );
+    }
+
+    let memory_swap_max = read_host_actions_limit(root, "memory.swap.max")?;
+    if memory_swap_max != "0" {
+        bail!(
+            "host containment requires actions.slice memory.swap.max=0 (got {memory_swap_max:?})"
+        );
+    }
+
+    let pids_max = read_host_actions_limit(root, "pids.max")?;
+    let pids_max = pids_max.parse::<u64>().with_context(|| {
+        format!(
+            "host containment requires finite actions.slice pids.max={HOST_ACTIONS_PIDS_MAX} (got {pids_max:?})"
+        )
+    })?;
+    if pids_max != HOST_ACTIONS_PIDS_MAX {
+        bail!(
+            "host containment requires actions.slice pids.max={HOST_ACTIONS_PIDS_MAX} (got {pids_max})"
+        );
+    }
+
+    let cpu_max = read_host_actions_limit(root, "cpu.max")?;
+    let mut cpu_max_parts = cpu_max.split_whitespace();
+    let quota = cpu_max_parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok());
+    let period = cpu_max_parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok());
+    if quota != Some(HOST_ACTIONS_CPU_QUOTA_USEC)
+        || period != Some(HOST_ACTIONS_CPU_PERIOD_USEC)
+        || cpu_max_parts.next().is_some()
+    {
+        bail!(
+            "host containment requires actions.slice cpu.max={} {} (got {cpu_max:?})",
+            HOST_ACTIONS_CPU_QUOTA_USEC,
+            HOST_ACTIONS_CPU_PERIOD_USEC
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_user_manager_oom_properties(properties: &str) -> Result<()> {
+    let values: BTreeMap<&str, &str> = properties
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    for (name, expected) in [
+        ("ManagedOOMMemoryPressure", "auto"),
+        ("ManagedOOMSwap", "auto"),
+        ("ManagedOOMPreference", "none"),
+        ("OOMScoreAdjust", "0"),
+    ] {
+        let actual = values.get(name).copied();
+        if actual != Some(expected) {
+            bail!(
+                "host containment requires user manager {name}={expected} (got {})",
+                actual.unwrap_or("missing")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_user_manager_oom_neutrality() -> Result<()> {
+    #[cfg(test)]
+    if let Some(properties) = TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap().clone() {
+        return validate_user_manager_oom_properties(&properties);
+    }
+
+    // SAFETY: geteuid has no preconditions and does not dereference Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    let mut cmd = Command::new("systemctl");
+    cmd.args([
+        "show",
+        &format!("user@{uid}.service"),
+        "--property=ManagedOOMMemoryPressure",
+        "--property=ManagedOOMSwap",
+        "--property=ManagedOOMPreference",
+        "--property=OOMScoreAdjust",
+    ]);
+    let out = run_docker_with_timeout(
+        cmd,
+        "reading user manager OOM policy for host containment",
+        DOCKER_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        bail!(
+            "host containment could not read user manager OOM policy: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    validate_user_manager_oom_properties(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn is_actions_slice_descendant(cgroup_content: &str) -> bool {
+    cgroup_content.lines().any(|line| {
+        line.rsplit_once(':')
+            .is_some_and(|(_, path)| path.starts_with("/actions.slice/"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_container_pid_for_ancestry(container_id: &str, stdout: &str) -> Result<u32> {
+    let pid = stdout.trim().parse::<u32>().with_context(|| {
+        format!(
+            "container PID ancestry inspection returned an invalid PID for {container_id}: {stdout:?}"
+        )
+    })?;
+    if pid == 0 {
+        bail!("container PID ancestry inspection returned PID 0 for {container_id}");
+    }
+    Ok(pid)
+}
+
 /// Require Release 1 host containment before any Linux runner creation or mutation.
 pub fn require_host_containment(_cfg: &Config) -> Result<()> {
     if is_macos_host() {
@@ -2528,22 +2743,29 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let cfg = _cfg;
-        if cfg.policy.minimum_isolation == crate::config::IsolationLevel::Container
-            && cfg.limits.cgroup_parent.as_deref() == Some("actions.slice")
-        {
-            if cfg.runner.count != 10 {
-                bail!(
-                    "host containment requires runner count to be exactly 10; configured count is {}",
-                    cfg.runner.count
-                );
-            }
-            if cfg.limits.memory_mb != 2500 {
-                bail!(
-                    "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
-                    cfg.limits.memory_mb
-                );
-            }
+        if host_containment_daemon_in_vm() {
+            return Ok(());
         }
+        if cfg.policy.minimum_isolation != crate::config::IsolationLevel::Container {
+            bail!("host containment requires policy.minimum_isolation=container");
+        }
+        if cfg.limits.cgroup_parent.as_deref() != Some("actions.slice") {
+            bail!("host containment requires limits.cgroup_parent=actions.slice");
+        }
+        if cfg.runner.count != 10 {
+            bail!(
+                "host containment requires runner count to be exactly 10; configured count is {}",
+                cfg.runner.count
+            );
+        }
+        if cfg.limits.memory_mb != 2500 {
+            bail!(
+                "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
+                cfg.limits.memory_mb
+            );
+        }
+        validate_host_actions_slice(&host_actions_cgroup_root())?;
+        require_user_manager_oom_neutrality()?;
     }
     Ok(())
 }
@@ -2553,28 +2775,38 @@ pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let container_id = _container_id;
+        // A canonical Docker endpoint backed by a VM reports guest PIDs that
+        // do not exist in this host's /proc. The host cgroup assertion is only
+        // meaningful for the native HostDocker profile; VM admission keeps its
+        // existing behavior without claiming host-level ancestry verification.
+        if host_containment_daemon_in_vm() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(allowed) = *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() {
+            if allowed {
+                return Ok(());
+            }
+            bail!("container PID ancestry not beneath /actions.slice");
+        }
         let mut cmd = docker_cmd();
         cmd.args(["inspect", "--format", "{{.State.Pid}}", container_id]);
         let out = run_docker(cmd, "inspect container pid for ancestry check")?;
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if let Ok(pid) = stdout.parse::<u32>() {
-            if pid > 0 {
-                let cgroup_path = format!("/proc/{pid}/cgroup");
-                if let Ok(cgroup_content) = std::fs::read_to_string(&cgroup_path) {
-                    if !cgroup_content.contains("/actions.slice") {
-                        bail!(
-                            "container PID {pid} is not beneath /actions.slice; cgroup content: {cgroup_content}"
-                        );
-                    }
-                }
-            }
-        } else {
-            #[cfg(test)]
-            {
-                if container_id.contains("bad_ancestry") || container_id == "uncontained" {
-                    bail!("container PID ancestry not beneath /actions.slice");
-                }
-            }
+        if !out.status.success() {
+            bail!(
+                "container PID ancestry inspection failed for {container_id}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let pid = parse_container_pid_for_ancestry(container_id, &stdout)?;
+        let cgroup_path = format!("/proc/{pid}/cgroup");
+        let cgroup_content = std::fs::read_to_string(&cgroup_path)
+            .with_context(|| format!("container PID {pid} has no readable cgroup path"))?;
+        if !is_actions_slice_descendant(&cgroup_content) {
+            bail!(
+                "container PID {pid} is not beneath /actions.slice; cgroup content: {cgroup_content}"
+            );
         }
     }
     Ok(())
@@ -4409,6 +4641,12 @@ mod tests {
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+            *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() =
+                Some(label != "host_containment_ancestry");
+            *TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap() = Some(
+                "ManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\nManagedOOMPreference=none\nOOMScoreAdjust=0\n"
+                    .to_owned(),
+            );
             // Bead jleechan-uurm: also reset the reclaim ring buffer +
             // daemon-start instant — both live in a process-wide OnceLock
             // (not in TEST_SLOT_PATH) so without this reset a test that
@@ -4430,8 +4668,9 @@ mod tests {
                 .map(|p| p.join("quarantined_slots.toml"))
                 .unwrap_or_else(|| PathBuf::from("quarantined_slots.toml"));
             std::env::set_var("EZGHA_QUARANTINE_PATH", &qpath);
-            if label.starts_with("host_containment") || label.starts_with("cgroup_parent") {
+            if label.starts_with("host_containment") {
                 *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(false);
+                *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
             } else {
                 *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
             }
@@ -4452,6 +4691,10 @@ mod tests {
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
             *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = None;
+            *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = None;
+            *TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap() = None;
             reset_failure_ladder_admission_latch_for_tests();
             crate::failure_ladder::reset_test_save_failure();
             // Drop the cpu-probe test seam so the next test sees a clean
@@ -6333,6 +6576,8 @@ minimum_isolation = "container"
         cfg.limits.cgroup_parent = Some("actions.slice".into());
 
         let temp_dir = env::temp_dir().join(format!("ezgha-ancestry-test-{}", std::process::id()));
+        write_actions_slice_fixture(&temp_dir);
+        *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(temp_dir.clone());
         let capture = temp_dir.join("docker-args.log");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let script = temp_dir.join("docker");
@@ -6358,6 +6603,112 @@ minimum_isolation = "container"
         assert!(
             err.to_string().contains("actions.slice") || err.to_string().contains("ancestry"),
             "expected ancestry failure; got: {err:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_actions_slice_fixture(root: &Path) {
+        let slice = root.join("actions.slice");
+        std::fs::create_dir_all(&slice).unwrap();
+        std::fs::write(slice.join("memory.high"), "27917287424\n").unwrap();
+        std::fs::write(slice.join("memory.max"), "30064771072\n").unwrap();
+        std::fs::write(slice.join("memory.swap.max"), "0\n").unwrap();
+        std::fs::write(slice.join("pids.max"), "6000\n").unwrap();
+        std::fs::write(slice.join("cpu.max"), "2000000 100000\n").unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_requires_exact_live_actions_slice_limits() {
+        let _env = TestEnv::new("host_containment_live_slice");
+        let root = env::temp_dir().join(format!(
+            "ezgha-host-containment-cgroup-{}",
+            std::process::id()
+        ));
+        write_actions_slice_fixture(&root);
+
+        validate_host_actions_slice(&root)
+            .expect("the exact finite HostDocker actions.slice boundary must pass admission");
+
+        std::fs::write(root.join("actions.slice/memory.high"), "max\n").unwrap();
+        let err = validate_host_actions_slice(&root)
+            .expect_err("an unbounded memory.high must fail HostDocker admission");
+        assert!(
+            err.to_string().contains("memory.high"),
+            "expected memory.high mismatch; got: {err:#}"
+        );
+        write_actions_slice_fixture(&root);
+        std::fs::remove_file(root.join("actions.slice/pids.max")).unwrap();
+        let err = validate_host_actions_slice(&root)
+            .expect_err("a missing tracked cgroup file must fail HostDocker admission");
+        assert!(
+            err.to_string().contains("pids.max"),
+            "expected the missing pids.max error; got: {err:#}"
+        );
+        write_actions_slice_fixture(&root);
+        std::fs::write(root.join("actions.slice/cpu.max"), "max 100000\n").unwrap();
+        let err = validate_host_actions_slice(&root)
+            .expect_err("a malformed or unlimited cpu.max must fail HostDocker admission");
+        assert!(
+            err.to_string().contains("cpu.max"),
+            "expected cpu.max mismatch; got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_rejects_missing_or_non_descendant_cgroup_paths() {
+        let _env = TestEnv::new("host_containment_cgroup_path");
+        assert!(
+            !is_actions_slice_descendant("0::/actions.slice"),
+            "the slice itself is not a runner scope"
+        );
+        assert!(
+            !is_actions_slice_descendant("0::/other.slice/actions.slice/runner.scope"),
+            "a substring match outside the actions slice must not pass"
+        );
+        assert!(
+            is_actions_slice_descendant("0::/actions.slice/docker-abc.scope"),
+            "a direct actions.slice descendant must pass"
+        );
+        assert!(
+            parse_container_pid_for_ancestry("runner", "0\n").is_err(),
+            "PID zero must fail closed"
+        );
+        assert!(
+            parse_container_pid_for_ancestry("runner", "not-a-pid\n").is_err(),
+            "an unreadable inspect value must fail closed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_backed_docker_skips_host_pid_ancestry_probe() {
+        let _env = TestEnv::new("host_containment_vm_ancestry");
+        *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
+        *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = Some(false);
+
+        require_container_actions_ancestry("guest-container")
+            .expect("guest PID ancestry must not be read through the host /proc");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_requires_neutral_user_manager_oom_policy() {
+        let _env = TestEnv::new("host_containment_user_manager_oom");
+        validate_user_manager_oom_properties(
+            "ManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\nManagedOOMPreference=none\nOOMScoreAdjust=0\n",
+        )
+        .expect("the neutral user manager OOM policy must pass containment admission");
+
+        let err = validate_user_manager_oom_properties(
+            "ManagedOOMMemoryPressure=kill\nManagedOOMSwap=auto\nManagedOOMPreference=none\nOOMScoreAdjust=0\n",
+        )
+        .expect_err("a user manager pressure-kill policy must fail containment admission");
+        assert!(
+            err.to_string().contains("ManagedOOMMemoryPressure"),
+            "expected the pressure policy mismatch; got: {err:#}"
         );
     }
 

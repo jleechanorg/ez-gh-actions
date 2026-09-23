@@ -1236,6 +1236,8 @@ fn main() -> Result<()> {
             if let Some(c) = count {
                 cfg.runner.count = *c;
             }
+            docker_backend::require_host_containment(&cfg)
+                .context("host containment admission failed before start")?;
             // `start` mutates the same slot assignments and failure-ladder
             // ledger as `serve`; serialize both commands across the entire
             // read-modify-write sequence.
@@ -1285,6 +1287,8 @@ fn main() -> Result<()> {
         }
         Commands::Serve => {
             let cfg = Config::load(&path)?;
+            docker_backend::require_host_containment(&cfg)
+                .context("host containment admission failed before serve")?;
             // Single-instance guard (bead 6gw): flock serve.lock so a second
             // `ezgha serve` refuses immediately instead of racing next_slot's
             // read-modify-write. Auto-released on process death; opt-out via

@@ -80,6 +80,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Host-ops, GitHub App token, and PR-payload regression tests
         run: |
+          bash tests/host_crash_containment_release1_artifacts_test.sh
+          bash tests/assert_host_containment_release1_test.sh
+          bash tests/apply_host_containment_release1_test.sh
+          bash tests/install_host_containment_test.sh
           bash tests/host_ops_0725_test.sh
           bash tests/host_control_artifacts_test.sh
           bash tests/forbid_host_reboot_primitives_test.sh

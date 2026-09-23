@@ -396,6 +396,39 @@ if ! cargo test >/dev/null 2>&1; then
 fi
 ok "All tests passed"
 
+# A Linux daemon that shares this kernel needs the host aggregate boundary
+# before replacing the binary, building an image, or starting the service.
+if [ "$(uname -s)" = "Linux" ]; then
+  docker_kernel="$(env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info --format '{{.KernelVersion}}' 2>/dev/null || true)"
+  [ -n "${docker_kernel}" ] || { bad "cannot determine canonical Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
+  if [ "${docker_kernel}" = "$(uname -r)" ]; then
+    HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
+    HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
+    mkdir -p "${HOST_CONTROL_DIR}" \
+      "${HOST_POLICY_DIR}/systemd/host/-.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/host/user.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/host/user-.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/host/user@.service.d" \
+      "${HOST_POLICY_DIR}/systemd/user/app.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/user/session.slice.d"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
+    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice; do
+      install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
+    done
+    if sudo -n true >/dev/null 2>&1; then
+      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+    elif command -v pkexec >/dev/null 2>&1; then
+      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+    else
+      bad "host containment root phase requires sudo or pkexec"
+      exit 1
+    fi
+    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" || { bad "host containment user phase failed after root policy activation"; exit 1; }
+    ok "host containment activated before binary replacement"
+  fi
+fi
+
 info "Installing ${BIN}"
 if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
   cargo install --path "${SCRIPT_DIR}"
@@ -485,15 +518,21 @@ if [ -f "${CONFIG_PATH}" ]; then
     DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
-    if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
-      info "Restarting systemd service..."
-      systemctl --user restart ezgha.service
-      ok "ezgha service restarted via systemd"
-    else
-      info "Installing ezgha service..."
-      "${CARGO_BIN}/${BIN}" install-service
-      ok "ezgha service installed and started via systemd"
-    fi
+    # Linux containment is activated below before image build or service
+    # lifecycle mutation. This branch deliberately records intent only.
+    LINUX_SERVICE_PENDING=1
+  fi
+fi
+
+if [ "${LINUX_SERVICE_PENDING:-0}" -eq 1 ]; then
+  if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+    info "Restarting systemd service after containment activation..."
+    systemctl --user restart ezgha.service
+    ok "ezgha service restarted via systemd"
+  else
+    info "Installing ezgha service after containment activation..."
+    "${CARGO_BIN}/${BIN}" install-service
+    ok "ezgha service installed and started via systemd"
   fi
 fi
 

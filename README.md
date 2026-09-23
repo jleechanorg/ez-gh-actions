@@ -45,6 +45,25 @@ automation and panic auto-recovery settings, one armed crashkernel with kdump lo
 the current boot, and stable proof of all 10 Linux slots executing. Repository checks
 document the intended controls; they do not close those live gaps.
 
+## Linux HostDocker crash containment
+
+On the 62-GiB/32-CPU Linux host profile, `install.sh` activates the tracked
+containment policy before starting the runner service. System policy installation
+requires administrator authentication. The runner fleet uses `actions.slice`
+with a 26-GiB memory high watermark, a 28-GiB hard limit, zero swap, 6,000 tasks,
+and a 20-CPU aggregate quota. Agent and automation slices have separate 20-GiB
+and 6-GiB hard limits. Broad desktop/user slices are removed from direct OOMD
+pressure targeting; individual workload limits remain enforced by the kernel.
+
+Activation checks current workload usage before lowering limits, and does not
+restart the desktop or Docker. Conflicting local unlimited overrides must be
+resolved before activation can pass. The daemon checks effective containment
+before admitting Linux host work; merely installing unit files is insufficient.
+The read-only `scripts/host/assert-host-containment-release1.sh` verifies policy;
+its `--require-fleet` option additionally verifies all ten runner PIDs belong to
+the aggregate slice. These controls contain resource exhaustion; they do not
+prove immunity to kernel, driver, hardware, or power failures.
+
 ## How isolation works
 
 `ezgha` runs **one ephemeral container per job** on a host you control. The runner is

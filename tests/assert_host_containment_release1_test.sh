@@ -63,12 +63,16 @@ setup_passing_fixture() {
   # Mock docker command
   cat > "$root/bin/docker" <<'DOCKER_EOF'
 #!/usr/bin/env bash
+if [ "$1" = "--host" ]; then shift 2; fi
 if [ "$1" = "info" ]; then
-  printf 'CgroupVersion: 2\nCgroupDriver: systemd\n'
+  printf '2 systemd\n'
 elif [ "$1" = "ps" ]; then
   for i in $(seq 1 10); do
-    printf "cid%02d ez-runner-c-%d %d\n" "$i" "$i" "$((10000 + i))"
+    printf "cid%02d ez-runner-c-%d\n" "$i" "$i"
   done
+elif [ "$1" = "inspect" ]; then
+  slot="${4#cid}"
+  printf '%s\n' "$((10000 + 10#$slot))"
 fi
 DOCKER_EOF
   chmod +x "$root/bin/docker"
@@ -84,14 +88,14 @@ DOCKER_EOF
 # 1. Test clean passing fixture
 FIXTURE_PASS="$WORK/pass"
 setup_passing_fixture "$FIXTURE_PASS"
-PATH="$FIXTURE_PASS/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" || fail "passing fixture failed assertion"
+PATH="$FIXTURE_PASS/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet || fail "passing fixture failed assertion"
 ok "assert-host-containment-release1.sh passes valid fixture"
 
 # 2. Test memory below floor (65,011,711 KiB)
 FIXTURE_MEM_FAIL="$WORK/mem_fail"
 setup_passing_fixture "$FIXTURE_MEM_FAIL"
 printf 'MemTotal:       65011711 kB\n' > "$FIXTURE_MEM_FAIL/proc/meminfo"
-if PATH="$FIXTURE_MEM_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_FAIL" > "$WORK/mem_fail.log" 2>&1; then
+if PATH="$FIXTURE_MEM_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_FAIL" --require-fleet > "$WORK/mem_fail.log" 2>&1; then
   fail "assertion passed when MemTotal was below floor"
 fi
 grep -q "FAIL: host MemTotal" "$WORK/mem_fail.log" || fail "missing expected MemTotal failure message"
@@ -101,7 +105,7 @@ ok "assert-host-containment-release1.sh rejects memory below 62 GiB floor"
 FIXTURE_CPU_FAIL="$WORK/cpu_fail"
 setup_passing_fixture "$FIXTURE_CPU_FAIL"
 printf '0-30\n' > "$FIXTURE_CPU_FAIL/sys/devices/system/cpu/online"
-if PATH="$FIXTURE_CPU_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_CPU_FAIL" > "$WORK/cpu_fail.log" 2>&1; then
+if PATH="$FIXTURE_CPU_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_CPU_FAIL" --require-fleet > "$WORK/cpu_fail.log" 2>&1; then
   fail "assertion passed when online CPUs was 31 (< 32)"
 fi
 grep -q "FAIL: host online logical CPUs" "$WORK/cpu_fail.log" || fail "missing expected CPU count failure message"
@@ -111,7 +115,7 @@ ok "assert-host-containment-release1.sh rejects fewer than 32 online CPUs"
 FIXTURE_CTRL_FAIL="$WORK/ctrl_fail"
 setup_passing_fixture "$FIXTURE_CTRL_FAIL"
 printf 'cpuset cpu io pids\n' > "$FIXTURE_CTRL_FAIL/sys/fs/cgroup/cgroup.controllers"
-if PATH="$FIXTURE_CTRL_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_CTRL_FAIL" > "$WORK/ctrl_fail.log" 2>&1; then
+if PATH="$FIXTURE_CTRL_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_CTRL_FAIL" --require-fleet > "$WORK/ctrl_fail.log" 2>&1; then
   fail "assertion passed when memory controller was missing"
 fi
 grep -q "FAIL: cgroup.controllers missing required controller" "$WORK/ctrl_fail.log" || fail "missing controller failure message"
@@ -121,7 +125,7 @@ ok "assert-host-containment-release1.sh rejects missing cgroup controller"
 FIXTURE_SLICE_FAIL="$WORK/slice_fail"
 setup_passing_fixture "$FIXTURE_SLICE_FAIL"
 printf 'max\n' > "$FIXTURE_SLICE_FAIL/sys/fs/cgroup/actions.slice/memory.max"
-if PATH="$FIXTURE_SLICE_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_SLICE_FAIL" > "$WORK/slice_fail.log" 2>&1; then
+if PATH="$FIXTURE_SLICE_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_SLICE_FAIL" --require-fleet > "$WORK/slice_fail.log" 2>&1; then
   fail "assertion passed when actions.slice memory.max was infinite"
 fi
 grep -q "FAIL: actions.slice memory.max" "$WORK/slice_fail.log" || fail "missing actions.slice memory.max failure message"
@@ -132,16 +136,17 @@ FIXTURE_COUNT_FAIL="$WORK/count_fail"
 setup_passing_fixture "$FIXTURE_COUNT_FAIL"
 cat > "$FIXTURE_COUNT_FAIL/bin/docker" <<'DOCKER_EOF'
 #!/usr/bin/env bash
+if [ "$1" = "--host" ]; then shift 2; fi
 if [ "$1" = "info" ]; then
-  printf 'CgroupVersion: 2\nCgroupDriver: systemd\n'
+  printf '2 systemd\n'
 elif [ "$1" = "ps" ]; then
   for i in $(seq 1 9); do
-    printf "cid%02d ez-runner-c-%d %d\n" "$i" "$i" "$((10000 + i))"
+    printf "cid%02d ez-runner-c-%d\n" "$i" "$i"
   done
 fi
 DOCKER_EOF
 chmod +x "$FIXTURE_COUNT_FAIL/bin/docker"
-if PATH="$FIXTURE_COUNT_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_COUNT_FAIL" > "$WORK/count_fail.log" 2>&1; then
+if PATH="$FIXTURE_COUNT_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_COUNT_FAIL" --require-fleet > "$WORK/count_fail.log" 2>&1; then
   fail "assertion passed when runner container count was 9"
 fi
 grep -q "FAIL: runner container count" "$WORK/count_fail.log" || fail "missing runner count failure message"
@@ -151,7 +156,7 @@ ok "assert-host-containment-release1.sh rejects container count != 10"
 FIXTURE_ANCESTRY_FAIL="$WORK/ancestry_fail"
 setup_passing_fixture "$FIXTURE_ANCESTRY_FAIL"
 printf "0::/user.slice/user-1000.slice/docker-cid01.scope\n" > "$FIXTURE_ANCESTRY_FAIL/proc/10001/cgroup"
-if PATH="$FIXTURE_ANCESTRY_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_ANCESTRY_FAIL" > "$WORK/ancestry_fail.log" 2>&1; then
+if PATH="$FIXTURE_ANCESTRY_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_ANCESTRY_FAIL" --require-fleet > "$WORK/ancestry_fail.log" 2>&1; then
   fail "assertion passed when container PID was not in /actions.slice"
 fi
 grep -q "FAIL: container PID not beneath /actions.slice" "$WORK/ancestry_fail.log" || fail "missing ancestry failure message"

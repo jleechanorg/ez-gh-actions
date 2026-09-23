@@ -1,145 +1,156 @@
 #!/usr/bin/env bash
-# Apply Release 1 finite host containment envelope and boundary policies.
-# Stages systemd host containment units and drop-ins, validates host resources,
-# reloads systemd manager, and runs the sibling read-only assertion.
-#
-# Usage:
-#   scripts/host/apply-host-containment-release1.sh [--root <fixture-root>]
+# Apply finite Release 1 host containment without restarting the desktop,
+# user manager, Docker daemon, or runner containers.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-
 ROOT="/"
+SYSTEM_PHASE=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --root)
-      ROOT="$2"
-      shift 2
-      ;;
-    *)
-      echo "Unknown option: $1" >&2
-      exit 1
-      ;;
+    --root) ROOT="$2"; shift 2 ;;
+    --system-phase) SYSTEM_PHASE=1; shift ;;
+    *) echo "FAIL: unknown argument '$1'" >&2; exit 1 ;;
   esac
 done
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { echo "OK: $*"; }
 
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-ok() {
-  echo "OK: $*"
-}
-
-# 1. Single-writer lock
-LOCK_DIR="${ROOT}/var/lock"
-if [ ! -d "${LOCK_DIR}" ]; then
-  LOCK_DIR="${ROOT}/tmp"
-fi
-mkdir -p "${LOCK_DIR}"
-LOCK_FILE="${LOCK_DIR}/apply-host-containment.lock"
-exec 200>"${LOCK_FILE}"
-if ! flock -n 200; then
-  fail "another apply-host-containment process is running (${LOCK_FILE})"
+if [ -d "${SCRIPT_DIR}/../../systemd/host" ]; then
+  POLICY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+elif [ -d "${SCRIPT_DIR}/host-containment-policy/systemd/host" ]; then
+  POLICY_ROOT="${SCRIPT_DIR}/host-containment-policy"
+else
+  fail "missing tracked host containment policy beside activation script"
 fi
 
-# 2. Pre-mutation resource gates
-MEMINFO="${ROOT}/proc/meminfo"
-[ -f "${MEMINFO}" ] || fail "missing ${MEMINFO}"
-MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' "${MEMINFO}")
-[ -n "${MEM_TOTAL_KB}" ] || fail "could not determine MemTotal from ${MEMINFO}"
-if [ "${MEM_TOTAL_KB}" -lt 65011712 ]; then
-  fail "MemTotal (${MEM_TOTAL_KB} kB) is below required 62 GiB floor (65011712 kB)"
-fi
-
-CPU_ONLINE="${ROOT}/sys/devices/system/cpu/online"
-[ -f "${CPU_ONLINE}" ] || fail "missing ${CPU_ONLINE}"
-CPU_COUNT=0
-IFS=',' read -ra RANGES < "${CPU_ONLINE}"
-for range in "${RANGES[@]}"; do
-  if [[ "${range}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-    start="${BASH_REMATCH[1]}"
-    end="${BASH_REMATCH[2]}"
-    CPU_COUNT=$((CPU_COUNT + end - start + 1))
-  elif [[ "${range}" =~ ^[0-9]+$ ]]; then
-    CPU_COUNT=$((CPU_COUNT + 1))
+if [ "$ROOT" = "/" ]; then
+  if [ "$SYSTEM_PHASE" -eq 1 ]; then
+    [ "$(id -u)" -eq 0 ] || fail "system phase must run as root"
+    DEPLOY_UID="${SUDO_UID:-${PKEXEC_UID:-}}"
+    [[ "$DEPLOY_UID" =~ ^[1-9][0-9]*$ ]] || fail "system phase requires the invoking deploy user identity"
+  else
+    [ "$(id -u)" -ne 0 ] || fail "run user phase as the deploy user, not root"
+    DEPLOY_UID="$(id -u)"
   fi
-done
-if [ "${CPU_COUNT}" -lt 32 ]; then
-  fail "online CPU count (${CPU_COUNT}) is below required 32 core floor"
+  USER_UNIT_DIR="${HOME}/.config/systemd/user"
+else
+  USER_UNIT_DIR="${ROOT}/etc/systemd/user"
 fi
-
-CONTROLLERS="${ROOT}/sys/fs/cgroup/cgroup.controllers"
-[ -f "${CONTROLLERS}" ] || fail "missing cgroup controllers file: ${CONTROLLERS}"
-for ctrl in cpu memory pids io; do
-  if ! grep -qw "${ctrl}" "${CONTROLLERS}"; then
-    fail "missing required cgroup v2 controller: ${ctrl}"
-  fi
-done
-
-# Check current slice usage thresholds
-AGENTS_MEM_CURRENT="${ROOT}/sys/fs/cgroup/agents.slice/memory.current"
-if [ -f "${AGENTS_MEM_CURRENT}" ]; then
-  CURRENT_BYTES=$(cat "${AGENTS_MEM_CURRENT}")
-  # 18 GiB = 19327352832 bytes
-  if [ "${CURRENT_BYTES}" -ge 19327352832 ]; then
-    fail "agents.slice memory.current (${CURRENT_BYTES} bytes) exceeds 18 GiB threshold"
-  fi
-fi
-
-AUTOMATION_MEM_CURRENT="${ROOT}/sys/fs/cgroup/automation.slice/memory.current"
-if [ -f "${AUTOMATION_MEM_CURRENT}" ]; then
-  AUTO_CURRENT_BYTES=$(cat "${AUTOMATION_MEM_CURRENT}")
-  # 4 GiB = 4294967296 bytes
-  if [ "${AUTO_CURRENT_BYTES}" -ge 4294967296 ]; then
-    fail "automation.slice memory.current (${AUTO_CURRENT_BYTES} bytes) exceeds 4 GiB threshold"
-  fi
-fi
-
-# 3. Stage finite containment policy and boundary drop-ins
 SYS_DIR="${ROOT}/etc/systemd/system"
-USER_DIR="${ROOT}/etc/systemd/user"
-mkdir -p "${SYS_DIR}/-.slice.d" \
-         "${SYS_DIR}/user.slice.d" \
-         "${SYS_DIR}/user-.slice.d" \
-         "${SYS_DIR}/user@.service.d" \
-         "${USER_DIR}/app.slice.d" \
-         "${USER_DIR}/session.slice.d"
+CGROUP_ROOT="${ROOT}/sys/fs/cgroup"
 
-cp "${REPO_ROOT}/systemd/host/actions.slice" "${SYS_DIR}/actions.slice"
-cp "${REPO_ROOT}/systemd/host/-.slice.d/99-ezgha-containment.conf" "${SYS_DIR}/-.slice.d/99-ezgha-containment.conf"
-cp "${REPO_ROOT}/systemd/host/user.slice.d/99-ezgha-containment.conf" "${SYS_DIR}/user.slice.d/99-ezgha-containment.conf"
-cp "${REPO_ROOT}/systemd/host/user-.slice.d/99-ezgha-containment.conf" "${SYS_DIR}/user-.slice.d/99-ezgha-containment.conf"
-cp "${REPO_ROOT}/systemd/host/user@.service.d/99-ezgha-containment.conf" "${SYS_DIR}/user@.service.d/99-ezgha-containment.conf"
+read_value() { [ -f "$1" ] && cat "$1"; }
+check_below() {
+  local file="$1" limit="$2" label="$3" value
+  [ -e "$file" ] || return 0
+  value="$(read_value "$file")" || fail "could not read ${label} at ${file}"
+  [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid ${label}: ${value}"
+  [ "$value" -lt "$limit" ] || fail "${label} (${value} bytes) is at or above its safe activation threshold"
+}
+user_cgroup_dir() {
+  local unit="$1" group
+  if [ "$ROOT" != "/" ]; then printf '%s/%s' "$CGROUP_ROOT" "$unit"; return; fi
+  group="$(systemctl --user show "$unit" -p ControlGroup --value 2>/dev/null || true)"
+  [ -n "$group" ] && printf '%s%s' "$CGROUP_ROOT" "$group"
+}
 
-cp "${REPO_ROOT}/systemd/user/app.slice.d/99-ezgha-containment.conf" "${USER_DIR}/app.slice.d/99-ezgha-containment.conf"
-cp "${REPO_ROOT}/systemd/user/session.slice.d/99-ezgha-containment.conf" "${USER_DIR}/session.slice.d/99-ezgha-containment.conf"
-cp "${REPO_ROOT}/systemd/agents.slice" "${USER_DIR}/agents.slice"
-cp "${REPO_ROOT}/systemd/automation.slice" "${USER_DIR}/automation.slice"
+# Every gate precedes writes or systemd state changes.
+mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "${ROOT}/proc/meminfo" 2>/dev/null || true)"
+[[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not determine MemTotal"
+[ "$mem_total_kib" -ge 65011712 ] || fail "MemTotal (${mem_total_kib} KiB) is below required 62 GiB floor"
+[ -f "${ROOT}/sys/devices/system/cpu/online" ] || fail "missing cpu/online"
+cpu_count=0; IFS=',' read -r -a cpu_ranges < "${ROOT}/sys/devices/system/cpu/online"
+for range in "${cpu_ranges[@]}"; do
+  if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then cpu_count=$((cpu_count + BASH_REMATCH[2] - BASH_REMATCH[1] + 1));
+  elif [[ "$range" =~ ^[0-9]+$ ]]; then cpu_count=$((cpu_count + 1)); fi
+done
+[ "$cpu_count" -ge 32 ] || fail "online CPU count (${cpu_count}) is below required 32 core floor"
+for controller in cpu memory pids io; do
+  grep -qw "$controller" "${CGROUP_ROOT}/cgroup.controllers" 2>/dev/null || fail "missing required cgroup v2 controller: ${controller}"
+done
+check_below "${CGROUP_ROOT}/actions.slice/memory.current" 27917287424 "actions.slice memory.current"
+check_below "${CGROUP_ROOT}/actions.slice/pids.current" 6000 "actions.slice pids.current"
+agents_dir="$(user_cgroup_dir agents.slice || true)"
+automation_dir="$(user_cgroup_dir automation.slice || true)"
+[ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 19327352832 "agents.slice memory.current"
+[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 4294967296 "automation.slice memory.current"
 
-# Remove legacy watcher and exemption drop-ins
-rm -f "${SYS_DIR}/ezgha.service.d/10-oomd-omit.conf" \
-      "${SYS_DIR}/psi-oom-watcher.service" \
-      "${SYS_DIR}/psi-oom-watcher.timer" \
-      "${USER_DIR}/psi-oom-watcher.service" \
-      "${USER_DIR}/psi-oom-watcher.timer"
+install_file() {
+  local source="$1" dest="$2"
+  [ -f "$source" ] || fail "missing tracked policy source: ${source}"
+  mkdir -p "$(dirname "$dest")"
+  install -m 0644 "$source" "$dest"
+}
+install_system_file() {
+  local source="$1" dest="$2"
+  [ -f "$source" ] || fail "missing tracked policy source: ${source}"
+  if [ "$ROOT" = "/" ]; then install -D -m 0644 "$source" "$dest"; else install_file "$source" "$dest"; fi
+}
 
-# 4. Reload systemd daemon
-if command -v systemctl >/dev/null 2>&1; then
-  if [ "${ROOT}" = "/" ]; then
-    systemctl daemon-reload || true
-    systemctl --user daemon-reload || true
+if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
+  install_system_file "${POLICY_ROOT}/systemd/host/actions.slice" "${SYS_DIR}/actions.slice"
+  for path in -.slice.d user.slice.d user-.slice.d user@.service.d; do
+    install_system_file "${POLICY_ROOT}/systemd/host/${path}/99-ezgha-containment.conf" "${SYS_DIR}/${path}/99-ezgha-containment.conf"
+  done
+  rm -f "${SYS_DIR}/ezgha.service.d/10-oomd-omit.conf" "${SYS_DIR}/psi-oom-watcher.service" "${SYS_DIR}/psi-oom-watcher.timer"
+  if [ "$ROOT" = "/" ]; then
+    systemctl daemon-reload
+    systemctl set-property "user@${DEPLOY_UID}.service" \
+      ManagedOOMMemoryPressure=auto ManagedOOMSwap=auto ManagedOOMPreference=none
+    for property in ManagedOOMMemoryPressure=auto ManagedOOMSwap=auto ManagedOOMPreference=none OOMScoreAdjust=0; do
+      key="${property%%=*}"; expected="${property#*=}"
+      actual="$(systemctl show "user@${DEPLOY_UID}.service" -p "$key" --value)"
+      [ "$actual" = "$expected" ] || fail "user@${DEPLOY_UID}.service ${key} ('$actual') != '$expected' after runtime policy apply"
+    done
+    user_manager_pid="$(systemctl show "user@${DEPLOY_UID}.service" -p MainPID --value)"
+    [[ "$user_manager_pid" =~ ^[1-9][0-9]*$ ]] || fail "could not resolve user@${DEPLOY_UID}.service MainPID"
+    grep -q "/user@${DEPLOY_UID}\.service" "/proc/${user_manager_pid}/cgroup" \
+      || fail "user manager PID ${user_manager_pid} is not in user@${DEPLOY_UID}.service"
+    printf '0\n' > "/proc/${user_manager_pid}/oom_score_adj"
+    [ "$(cat "/proc/${user_manager_pid}/oom_score_adj")" = 0 ] \
+      || fail "user manager OOM score adjustment did not become 0"
+    systemctl start actions.slice
+    systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
   fi
 fi
 
-# 5. Invoke sibling assertion
-ASSERT_SCRIPT="${SCRIPT_DIR}/assert-host-containment-release1.sh"
-[ -f "${ASSERT_SCRIPT}" ] || fail "missing sibling assertion script: ${ASSERT_SCRIPT}"
-
-if ! "${ASSERT_SCRIPT}" --root "${ROOT}"; then
-  fail "Release 1 containment assertion failed; leaving ezgha.service inactive"
+if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
+  # Only the documented, exact legacy override is migrated. Other local
+  # overrides remain a hard error rather than being silently superseded.
+  for unit in agents.slice automation.slice; do
+    dropin_dir="${USER_UNIT_DIR}/${unit}.d"
+    [ -d "$dropin_dir" ] || continue
+    while IFS= read -r dropin; do
+      case "$dropin" in *99-ezgha-containment.conf) continue ;; esac
+      if grep -Eq '^[[:space:]]*(MemoryHigh|MemoryMax|MemorySwapMax)[[:space:]]*=[[:space:]]*(infinity|max)[[:space:]]*$' "$dropin"; then
+        known_legacy="${USER_UNIT_DIR}/agents.slice.d/99-local-unlimited.conf"
+        if [ "$unit" = agents.slice ] && [ "$dropin" = "$known_legacy" ]; then
+          backup="${known_legacy}.ezgha-pre-containment.bak"
+          cp -a "$known_legacy" "$backup"
+          rm -f "$known_legacy"
+        else
+          fail "conflicting unlimited ${unit} override: ${dropin}; remove or replace that exact override before activation"
+        fi
+      fi
+    done < <(find "$dropin_dir" -maxdepth 1 -type f -name '*.conf' -print | sort)
+  done
+  install_file "${POLICY_ROOT}/systemd/user/app.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/app.slice.d/99-ezgha-containment.conf"
+  install_file "${POLICY_ROOT}/systemd/user/session.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/session.slice.d/99-ezgha-containment.conf"
+  install_file "${POLICY_ROOT}/systemd/agents.slice" "${USER_UNIT_DIR}/agents.slice"
+  install_file "${POLICY_ROOT}/systemd/automation.slice" "${USER_UNIT_DIR}/automation.slice"
+  rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" "${USER_UNIT_DIR}/psi-oom-watcher.timer"
+  if [ "$ROOT" = "/" ]; then
+    systemctl --user daemon-reload
+    systemctl --user start agents.slice automation.slice
+    systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
+    systemctl --user set-property automation.slice MemoryHigh=4G MemoryMax=6G MemorySwapMax=1G TasksMax=4096
+  fi
 fi
 
-ok "Release 1 host containment applied and verified"
+if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
+  ASSERT_SCRIPT="${SCRIPT_DIR}/assert-host-containment-release1.sh"
+  [ -x "$ASSERT_SCRIPT" ] || fail "missing sibling assertion script: ${ASSERT_SCRIPT}"
+  "$ASSERT_SCRIPT" --root "$ROOT"
+fi
+ok "Release 1 host containment ${SYSTEM_PHASE:+system }phase applied"
