@@ -138,16 +138,19 @@ else
   ok "No user-session kill primitives in active codebase"
 fi
 
-if grep -rnE '^[[:space:]]*ManagedOOMMemoryPressure=kill' "${REPO_ROOT}/systemd" 2>/dev/null; then
-  fail "Found ManagedOOMMemoryPressure=kill in tracked systemd units (oomd must not kill whole sessions)"
+if grep -rnE '^[[:space:]]*ManagedOOM(MemoryPressure|Swap)[[:space:]]*=[[:space:]]*kill' "${REPO_ROOT}/systemd" 2>/dev/null; then
+  fail "Found ManagedOOMMemoryPressure/ManagedOOMSwap=kill in tracked systemd units (oomd must not kill whole sessions)"
 else
-  ok "No ManagedOOMMemoryPressure=kill in tracked systemd units"
+  ok "No ManagedOOM*=kill in tracked systemd units"
 fi
 
 USER_AT_DROPIN="${REPO_ROOT}/systemd/host/user@.service.d/99-ezgha-containment.conf"
+# The last assignment of each key is the effective one; an earlier neutral line must not mask a later override.
 for line in 'ManagedOOMMemoryPressure=auto' 'ManagedOOMSwap=auto' 'ManagedOOMPreference=none' 'OOMScoreAdjust=0'; do
-  if ! grep -qx "$line" "$USER_AT_DROPIN" 2>/dev/null; then
-    fail "user@ containment drop-in lost '${line}'"
+  key="${line%%=*}"
+  effective="$( { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$USER_AT_DROPIN" 2>/dev/null || true; } | tail -1 | tr -d '[:space:]')"
+  if [ "$effective" != "$line" ]; then
+    fail "user@ containment drop-in effective ${key} is '${effective#*=}', expected '${line#*=}'"
   fi
 done
 
