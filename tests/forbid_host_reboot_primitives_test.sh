@@ -131,6 +131,26 @@ else
   ok "No active enablement of ezgha-watchdog in systemd/install"
 fi
 
+# 4. ezgha must never kill the user session or its manager, and must keep user@ oomd-neutral (bd-dea).
+if grep -rnE '(loginctl[[:space:]]+(terminate|kill)-(user|session)|systemctl[[:space:]]+(--user[[:space:]]+exit|kill[[:space:]]+user@)|kill[[:space:]]+-(9|KILL|s[[:space:]]+KILL)[[:space:]]+(--[[:space:]]*)?-1([^0-9]|$)|kill[[:space:]]+--[[:space:]]+-1([^0-9]|$)|pkill[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]]|killall[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]])' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
+  fail "Found forbidden user-session kill primitive"
+else
+  ok "No user-session kill primitives in active codebase"
+fi
+
+if grep -rnE '^[[:space:]]*ManagedOOMMemoryPressure=kill' "${REPO_ROOT}/systemd" 2>/dev/null; then
+  fail "Found ManagedOOMMemoryPressure=kill in tracked systemd units (oomd must not kill whole sessions)"
+else
+  ok "No ManagedOOMMemoryPressure=kill in tracked systemd units"
+fi
+
+USER_AT_DROPIN="${REPO_ROOT}/systemd/host/user@.service.d/99-ezgha-containment.conf"
+for line in 'ManagedOOMMemoryPressure=auto' 'ManagedOOMSwap=auto' 'ManagedOOMPreference=none' 'OOMScoreAdjust=0'; do
+  if ! grep -qx "$line" "$USER_AT_DROPIN" 2>/dev/null; then
+    fail "user@ containment drop-in lost '${line}'"
+  fi
+done
+
 if [ "$FAILURES" -gt 0 ]; then
   echo "FORBID_HOST_REBOOT_PRIMITIVES_TEST: FAILED ($FAILURES failures)" >&2
   exit 1
