@@ -132,7 +132,7 @@ else
 fi
 
 # 4. ezgha must never kill the user session or its manager, and must keep user@ oomd-neutral (bd-dea).
-if grep -rnE '(loginctl[[:space:]]+(terminate|kill)-(user|session)|systemctl[[:space:]]+(--user[[:space:]]+exit|kill[[:space:]]+user@)|kill[[:space:]]+-(9|KILL|s[[:space:]]+KILL)[[:space:]]+(--[[:space:]]*)?-1([^0-9]|$)|kill[[:space:]]+--[[:space:]]+-1([^0-9]|$)|pkill[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]]|killall[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]])' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
+if grep -rnE '(loginctl[[:space:]]+(terminate|kill)-(user|session)|"(terminate|kill)-(user|session)"|systemctl[[:space:]]+(--user[[:space:]]+exit|(stop|kill|restart)[[:space:]]+user@)|kill[[:space:]]+-(9|KILL|SIGKILL|s[[:space:]]+(KILL|SIGKILL))[[:space:]]+(--[[:space:]]*)?-1([^0-9]|$)|kill[[:space:]]+--[[:space:]]+-1([^0-9]|$)|(libc::)?kill\([[:space:]]*-1[[:space:]]*,|pkill[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-[uU][[:space:]]|killall[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]]|Command::new\("(loginctl|pkill|killall)"\))' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
   fail "Found forbidden user-session kill primitive"
 else
   ok "No user-session kill primitives in active codebase"
