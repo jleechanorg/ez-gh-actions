@@ -96,6 +96,12 @@ MUTATION_TARGETS=(
   "${REPO_ROOT}/doctor.sh"
 )
 
+# grep exits 2 when any operand is missing, which an `if grep` reads as "no match";
+# keep only existing paths so a deleted target cannot make every check pass silently.
+existing_paths() { local p; for p in "$@"; do [ -e "$p" ] && printf '%s\n' "$p"; done; return 0; }
+mapfile -t TARGETS < <(existing_paths "${TARGETS[@]}")
+mapfile -t MUTATION_TARGETS < <(existing_paths "${MUTATION_TARGETS[@]}")
+
 # Search for /proc/sysrq-trigger
 if grep -rnw "${TARGETS[@]}" -e 'sysrq-trigger' 2>/dev/null; then
   fail "Found forbidden sysrq-trigger reference in active codebase"
