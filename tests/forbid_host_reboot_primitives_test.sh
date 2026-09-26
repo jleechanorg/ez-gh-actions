@@ -96,6 +96,12 @@ MUTATION_TARGETS=(
   "${REPO_ROOT}/doctor.sh"
 )
 
+# grep exits 2 when any operand is missing, which an `if grep` reads as "no match";
+# keep only existing paths so a deleted target cannot make every check pass silently.
+existing_paths() { local p; for p in "$@"; do [ -e "$p" ] && printf '%s\n' "$p"; done; return 0; }
+mapfile -t TARGETS < <(existing_paths "${TARGETS[@]}")
+mapfile -t MUTATION_TARGETS < <(existing_paths "${MUTATION_TARGETS[@]}")
+
 # Search for /proc/sysrq-trigger
 if grep -rnw "${TARGETS[@]}" -e 'sysrq-trigger' 2>/dev/null; then
   fail "Found forbidden sysrq-trigger reference in active codebase"
@@ -130,6 +136,29 @@ if grep -rnE 'systemctl[[:space:]]+--user[[:space:]]+(enable|start)[[:space:]]+.
 else
   ok "No active enablement of ezgha-watchdog in systemd/install"
 fi
+
+# 4. ezgha must never kill the user session or its manager, and must keep user@ oomd-neutral (bd-dea).
+if grep -rnE '(loginctl[[:space:]]+(terminate|kill)-(user|session)|"(terminate|kill)-(user|session)"|systemctl[[:space:]]+(--user[[:space:]]+exit|(stop|kill|restart)[[:space:]]+user@)|kill[[:space:]]+(-[A-Za-z0-9]+|-s[[:space:]]+[A-Za-z0-9]+)[[:space:]]+(--[[:space:]]*)?-1([^0-9]|$)|kill[[:space:]]+--[[:space:]]+-1([^0-9]|$)|(libc::)?kill\([[:space:]]*-1[[:space:]]*,|pkill[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-[uU][[:space:]]|killall[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]]|Command::new\("(loginctl|pkill|killall)"\))' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
+  fail "Found forbidden user-session kill primitive"
+else
+  ok "No user-session kill primitives in active codebase"
+fi
+
+if grep -rnE '^[[:space:]]*ManagedOOM(MemoryPressure|Swap)[[:space:]]*=[[:space:]]*kill' "${REPO_ROOT}/systemd" 2>/dev/null; then
+  fail "Found ManagedOOMMemoryPressure/ManagedOOMSwap=kill in tracked systemd units (oomd must not kill whole sessions)"
+else
+  ok "No ManagedOOM*=kill in tracked systemd units"
+fi
+
+USER_AT_DROPIN="${REPO_ROOT}/systemd/host/user@.service.d/99-ezgha-containment.conf"
+# The last assignment of each key is the effective one; an earlier neutral line must not mask a later override.
+for line in 'ManagedOOMMemoryPressure=auto' 'ManagedOOMSwap=auto' 'ManagedOOMPreference=none' 'OOMScoreAdjust=0'; do
+  key="${line%%=*}"
+  effective="$( { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$USER_AT_DROPIN" 2>/dev/null || true; } | tail -1 | tr -d '[:space:]')"
+  if [ "$effective" != "$line" ]; then
+    fail "user@ containment drop-in effective ${key} is '${effective#*=}', expected '${line#*=}'"
+  fi
+done
 
 if [ "$FAILURES" -gt 0 ]; then
   echo "FORBID_HOST_REBOOT_PRIMITIVES_TEST: FAILED ($FAILURES failures)" >&2
