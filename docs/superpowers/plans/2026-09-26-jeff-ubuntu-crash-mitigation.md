@@ -186,22 +186,32 @@ WantedBy=multi-user.target
 
 ---
 
-## Task 3: netconsole config + MacBook receiver
+## Task 3: netconsole unit + MacBook receiver
 
 **Files:**
-- Create: `config/modprobe.d/netconsole.conf`
-- Create: `config/modules-load.d/netconsole.conf`
+- Create: `scripts/netconsole-eno2.sh`
+- Create: `systemd/netconsole-eno2.service`
 - Create: `config/netconsole/com.jleechan.netconsole-receiver.plist.template`
 - Create: `scripts/netconsole-receiver.sh` (MacBook side)
 - Modify: `tests/test_crash_capture_artifacts.py` (append)
 
+Design (spec D2.4, revised after `/advice`): no NetworkManager connection and no routable address on `eno2`; netpoll builds its own frames, so the source address lives only in the module parameter; the target MAC is omitted so netconsole broadcasts (the MacBook's private Wi-Fi MAC rotates); the module is loaded by a unit ordered after the `eno2` device, never by `modules-load.d`.
+
 **Step 1: Append failing tests**
 
 ```python
-def test_netconsole_modprobe_targets_macbook():
-    line = (ROOT / "config/modprobe.d/netconsole.conf").read_text().strip()
-    assert line.startswith("options netconsole netconsole=+6666@")
-    assert "/eno2,6666@192.168.254.199/ae:2f:22:95:b5:35" in line
+def test_netconsole_script_has_no_mac_and_no_nm():
+    src = (ROOT / "scripts/netconsole-eno2.sh").read_text()
+    assert "netconsole=+6666@" in src and "/eno2,6666@192.168.254.199/" in src
+    assert not re.search(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", src)   # no hardcoded MAC
+    assert "nmcli" not in src and "ip link set" in src
+    subprocess.run(["bash", "-n", str(ROOT / "scripts/netconsole-eno2.sh")], check=True)
+
+def test_netconsole_unit_orders_after_device():
+    u = (ROOT / "systemd/netconsole-eno2.service").read_text()
+    assert "After=sys-subsystem-net-devices-eno2.device" in u
+    assert "BindsTo=sys-subsystem-net-devices-eno2.device" in u
+    assert "ExecStart=/usr/local/libexec/netconsole-eno2.sh" in u
 
 def test_netconsole_receiver_template_uses_home_placeholder():
     t = (ROOT / "config/netconsole/com.jleechan.netconsole-receiver.plist.template").read_text()
@@ -212,15 +222,35 @@ def test_netconsole_receiver_template_uses_home_placeholder():
 
 **Step 3: Write**
 
-```
-# config/modprobe.d/netconsole.conf — bd-dea.10 D2.4. Source address is the
-# static eno2 address chosen in Task 4 (NETCONSOLE_SRC_IP); target is MacBook en0.
-options netconsole netconsole=+6666@192.168.254.130/eno2,6666@192.168.254.199/ae:2f:22:95:b5:35
+```bash
+#!/usr/bin/env bash
+# scripts/netconsole-eno2.sh — load netconsole on the idle wired NIC (bd-dea.10 D2.4).
+# Source address is synthetic (netpoll does not use the routing table); target MAC
+# omitted => Ethernet broadcast, so a rotating MacBook MAC cannot break delivery.
+set -euo pipefail
+DEV="${NETCONSOLE_DEV:-eno2}"
+SRC="${NETCONSOLE_SRC_IP:-192.168.254.130}"
+TGT="${NETCONSOLE_TGT_IP:-192.168.254.199}"
+ip link set "$DEV" up
+modprobe netconsole "netconsole=+6666@${SRC}/${DEV},6666@${TGT}/"
+echo "netconsole-eno2: loaded $(date +%s)" > /dev/kmsg
 ```
 
-```
-# config/modules-load.d/netconsole.conf
-netconsole
+```ini
+# systemd/netconsole-eno2.service
+[Unit]
+Description=netconsole over eno2 to the MacBook receiver (bd-dea.10 D2.4)
+BindsTo=sys-subsystem-net-devices-eno2.device
+After=sys-subsystem-net-devices-eno2.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/netconsole-eno2.sh
+ExecStop=/sbin/modprobe -r netconsole
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ```bash
@@ -248,9 +278,9 @@ exec nc -ukl 6666 >> "$LOG"
 </dict></plist>
 ```
 
-**Step 4: Run tests** → `7 passed`.
+**Step 4: Run tests** → `8 passed`.
 
-**Step 5: Commit** `claude/claude-fable-5-1: add netconsole modprobe config and MacBook receiver template (bd-dea.10 D2.4)`.
+**Step 5: Commit** `claude/claude-fable-5-1: add netconsole-eno2 unit and MacBook receiver template (bd-dea.10 D2.4)`.
 
 ---
 
@@ -315,11 +345,12 @@ WantedBy=timers.target
 **Step 1: Test**
 
 ```python
-def test_vmcore_triage_emits_verdict_tokens_and_needs_vmlinux():
+def test_vmcore_triage_emits_evidence_blocks_and_never_decides_alone():
     src = (ROOT / "scripts/vmcore-triage.sh").read_text()
-    for tok in ("VERDICT: SOFTWARE-UAF", "VERDICT: HARDWARE-MISEXECUTION", "VERDICT: INCONCLUSIVE"):
-        assert tok in src
+    assert "VERDICT: INCONCLUSIVE reason=human-review-required" in src
     assert "sysrq-induced" in src
+    assert "bt -r" in src and "dis -r" in src
+    assert "VERDICT: MEMORY-CORRUPTION" not in src and "VERDICT: HARDWARE-MISEXECUTION" not in src
     subprocess.run(["bash", "-n", str(ROOT / "scripts/vmcore-triage.sh")], check=True)
     r = subprocess.run([str(ROOT / "scripts/vmcore-triage.sh"), "/nonexistent"], capture_output=True, text=True)
     assert r.returncode != 0 and "VERDICT: INCONCLUSIVE" in r.stdout
@@ -330,9 +361,8 @@ def test_vmcore_triage_emits_verdict_tokens_and_needs_vmlinux():
 ```bash
 #!/usr/bin/env bash
 # scripts/vmcore-triage.sh <dump.<ts>> [vmlinux]
-# Runs `crash` in batch and prints the evidence for spec § 5, then a VERDICT line.
-# The script does not decide SOFTWARE vs HARDWARE by itself when the call site is
-# ambiguous; it prints the register/memory comparison and leaves INCONCLUSIVE.
+# Prints the spec § 5 evidence blocks from `crash` and ends with an INCONCLUSIVE
+# line; a human applies the § 5 table and a second reviewer concurs (C12).
 set -uo pipefail
 dump="${1:-}"; kver="$(uname -r)"
 vmlinux="${2:-$HOME/.local/share/vmlinux/vmlinux-$kver}"
@@ -351,25 +381,30 @@ ps -A | head -40
 runq
 quit
 EOF
-if ! grep -q "PANIC:" "$rep"; then echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load (see $rep)"; exit 1; fi
-if grep -qi "sysrq" "$rep" && grep -q "sysrq_handle_crash" "$rep"; then
+grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load report=$rep"; exit 1; }
+if grep -q "sysrq_handle_crash" "$rep"; then
   echo "VERDICT: INCONCLUSIVE reason=sysrq-induced (capture proof, not a real crash) report=$rep"; exit 0
 fi
-rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:\[<[0-9a-f]+>\]|RIP: [0-9a-f]{4}:[0-9a-f]+" "$rep" | grep -oE "[0-9a-f]{8,16}$|[0-9a-f]{1,4}\]" | head -1)
-top=$(grep -m1 -E "^ *#[0-9]+ .* at [0-9a-f]+: [a-z_]+\+0x" "$rep" | sed -E 's/.*: ([a-z_]+)\+.*/\1/')
-echo "faulting-RIP=$rip top-frame=$top report=$rep"
-# Disassemble the faulting call site and dump the memory behind it.
-crash -s "$vmlinux" "$dump" >> "$rep" 2>&1 <<EOF
-dis -l $top
-rd -x $rip 8
+# Frame #1's return address is the instruction after the call that jumped to the bad RIP.
+ret=$(grep -m1 -E "^ *#1 " "$rep" | grep -oE "\[ffffffff[0-9a-f]+\]" | tr -d '[]' | head -1)
+rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:[0-9a-f]+" "$rep" | awk -F: '{print $3}')
+fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
+{
+  echo "### call-site disassembly (last line is the transfer instruction), ret=$ret rip=$rip fault=$fault"
+  crash -s "$vmlinux" "$dump" 2>&1 <<EOF
+dis -r $ret
+kmem $rip
+kmem $fault
 quit
 EOF
-echo "--- decide with spec § 5 using $rep: direct call -> HARDWARE-MISEXECUTION; indirect call whose source word holds the bad value -> SOFTWARE-UAF ---"
+} >> "$rep"
+echo "evidence: $rep"
+echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see 'bt -r' and the dis -r block); for memory-sourced operands run: crash -s $vmlinux $dump  then  rd -x <addr> 1"
 echo "VERDICT: INCONCLUSIVE reason=human-review-required report=$rep"
 exit 0
 ```
 
-**Step 4:** `9 passed`. Fetch dbgsym without root:
+**Step 4:** tests pass. Fetch dbgsym without root:
 
 ```bash
 mkdir -p ~/.local/share/vmlinux && cd /tmp
@@ -378,39 +413,42 @@ curl -fsSL "http://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/" | grep -oE 'lin
 curl -fLo dbg.ddeb "http://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/<name>"
 dpkg -x dbg.ddeb /tmp/dbg && cp /tmp/dbg/usr/lib/debug/boot/vmlinux-6.17.0-29-generic ~/.local/share/vmlinux/
 ```
-Expected: `ls -la ~/.local/share/vmlinux/vmlinux-6.17.0-29-generic` ≈ 900 MB–1.2 GB.
+Expected: `ls -la ~/.local/share/vmlinux/vmlinux-6.17.0-29-generic` ≈ 900 MB–1.2 GB. If the pool has no 6.17.0-29 ddeb, record P5 as unmet; § 5 then cannot run until a kernel with a published ddeb is booted.
 
-**Step 5: Commit** `claude/claude-fable-5-1: add vmcore triage batch script for bd-dea.10 § 5`.
+**Step 5: Commit** `claude/claude-fable-5-1: add vmcore triage evidence script for bd-dea.10 § 5`.
 
 ---
 
 ## Task 7: Root-phase installer (human runs with sudo) — spec W2
 
+Precondition P6: the operator has approved the § 8 exception in a live message; otherwise run with `--no-panic-sysctls`, which skips the sysctl file.
+
 **Files:**
 - Create: `scripts/install-crash-capture.sh`
-- Modify: `tests/test_crash_capture_artifacts.py` (append: `bash -n` + asserts it never calls `reboot`/`shutdown`/`sysrq-trigger`)
+- Modify: `tests/test_crash_capture_artifacts.py` (append: `bash -n` + assert it never calls `reboot`/`shutdown`/`sysrq-trigger`)
 
 ```bash
 #!/usr/bin/env bash
 # scripts/install-crash-capture.sh — root phase for bd-dea.10 D1/D2 artifacts.
-# OPERATOR-ONLY: sudo bash scripts/install-crash-capture.sh [--with-netconsole]
+# OPERATOR-ONLY: sudo bash scripts/install-crash-capture.sh [--with-netconsole] [--no-panic-sysctls]
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 2; }
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-install -m 0644 "$R/config/sysctl.d/90-jeff-ubuntu-crash-capture.conf" /etc/sysctl.d/
-sysctl --system >/dev/null
+with_nc=0; no_sysctl=0
+for a in "$@"; do case "$a" in --with-netconsole) with_nc=1;; --no-panic-sysctls) no_sysctl=1;; esac; done
+if [ "$no_sysctl" = 0 ]; then
+  install -m 0644 "$R/config/sysctl.d/90-jeff-ubuntu-crash-capture.conf" /etc/sysctl.d/
+  sysctl --system >/dev/null
+fi
 install -m 0755 "$R/scripts/favored-core-cap.sh" /usr/local/libexec/favored-core-cap.sh
 install -m 0644 "$R/systemd/favored-core-cap.service" /etc/systemd/system/
-systemctl daemon-reload
-if [ "${1:-}" = "--with-netconsole" ]; then
-  nmcli con show netconsole-eno2 >/dev/null 2>&1 || nmcli con add type ethernet ifname eno2 con-name netconsole-eno2 \
-    ipv4.method manual ipv4.addresses 192.168.254.130/24 ipv4.never-default yes ipv6.method disabled
-  nmcli con up netconsole-eno2
-  install -m 0644 "$R/config/modprobe.d/netconsole.conf" /etc/modprobe.d/
-  install -m 0644 "$R/config/modules-load.d/netconsole.conf" /etc/modules-load.d/
-  modprobe netconsole
+if [ "$with_nc" = 1 ]; then
+  install -m 0755 "$R/scripts/netconsole-eno2.sh" /usr/local/libexec/netconsole-eno2.sh
+  install -m 0644 "$R/systemd/netconsole-eno2.service" /etc/systemd/system/
 fi
-echo "installed; the cap unit is NOT enabled yet (W4 does that after the SysRq-c proof)"
+systemctl daemon-reload
+[ "$with_nc" = 1 ] && systemctl enable --now netconsole-eno2.service
+echo "installed; favored-core-cap.service is NOT enabled yet (W4 does that after the SysRq-c proof)"
 ```
 
 Run order inside window W: W0 drain → `sudo bash scripts/install-crash-capture.sh --with-netconsole` (or without, per Task 4) → `bash scripts/assert-crash-capture.sh` → C7 probe from the spec. MacBook side: `scp scripts/netconsole-receiver.sh macbook:~/.local/libexec/` and install the plist per `~/.claude/skills/launchd-plist-template/SKILL.md` (substitute `@HOME@`, `launchctl bootstrap gui/$(id -u) …`).
@@ -422,7 +460,7 @@ Run order inside window W: W0 drain → `sudo bash scripts/install-crash-capture
 ## Task 8: Maintenance window W1/W3/W4 (human + deploy-owner; not scriptable by design)
 
 1. **W1 memtest:** `bash scripts/queue_memtest.sh` (existing, user_scope) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501 → C11.
-2. **W3 SysRq-c proof (drained, human watching):** as root, `echo 1 > /proc/sys/kernel/sysrq; echo c > /proc/sysrq-trigger`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host reboots on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced` → C10. If no dump: `sudo sed -i 's/crashkernel=512M,high/crashkernel=1G,high/' /etc/default/grub.d/kdump-tools.cfg && sudo update-grub`, reboot, repeat once; record the outcome in bd-dea.10.
+2. **W3 SysRq-c proof** (requires P6; drained; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc/sys/kernel` and `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced` and the report has `bt -r` and `dis -r` blocks → C10. If no dump: OPERATOR-ONLY, edit `/etc/default/grub.d/kdump-tools.cfg` from `crashkernel=512M,high` to `crashkernel=1G,high`, run `update-grub`, reboot, repeat once; record the outcome in bd-dea.10.
 3. **W4 cap:** `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/sched/itmt_enabled` → C6.
 
 ---
@@ -443,7 +481,7 @@ Record the start in bd-dea.10 and in `~/roadmap/jeff-ubuntu/design-2026-09-26-cr
 
 ## Task 10: After a crash or at 200 h / 400 h — decision execution
 
-- **Crash:** within 24 h run Task 6's script on the newest dump, read the report against spec § 5, and post `S1 VERDICT <…>` with the report path to bd-dea.10 (C12). Then open the next-step bead named in spec § D4 (S2a/S2b/S2c/S2d) with its own ironclad contract; the soak clock records elapsed as data.
+- **Crash:** within 24 h run Task 6's script on the newest dump, apply spec § 5 to the report (registers from `bt -r` against `RIP`; text/trampoline/memory words re-read with `rd -x`), and post `S1 VERDICT MEMORY-CORRUPTION/<subtype>` or `S1 VERDICT HARDWARE-MISEXECUTION 1-of-2` or `S1 INCONCLUSIVE <gap>` with the report path to bd-dea.10. Ask Codex to re-read the same report and add a concurring or dissenting `br` comment before any S2 bead is opened (C12). Then open the next-step bead named in spec § D4 with its own ironclad contract; the soak clock records elapsed as data.
 - **200 h clean:** `soakctl` target is extended by closing and restarting with `--target 400` and the same config string, noting "extension of <name>" in the reason.
 - **400 h clean:** post `S1 CLEAN 400h`, open the S3 reverse-test bead (revert cap, soak 200 h), and the S2c hygiene bead.
 
