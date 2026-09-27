@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-26
 **Bead:** bd-dea.10 (`br --db /home/jleechan/projects_other/user_scope/.beads/beads.db show bd-dea.10`), parent bd-dea
-**Status:** Design complete, revised once after `/advice` (Codex + Opus, 2026-09-26); implementation not started. Every host mutation below needs the sudo password (live: `sudo -n true` → "a password is required"), so execution is human-gated.
+**Status:** Design complete, revised twice: after `/advice` (Codex + Opus, 2026-09-26, ref 43bc980) and after `/web-advice` (ChatGPT, 2026-09-27, ref d82d7dd; Gemini failed twice, Perplexity unavailable). Implementation not started. Every host mutation below needs the sudo password (live: `sudo -n true` → "a password is required"), so execution is human-gated.
 **Inputs:** `~/roadmap/nextsteps-2026-08-01-jeff-ubuntu-crash.md` § 2026-09-26 and `~/roadmap/jeff-ubuntu/rootcause-2026-09-26/{crash_census,favored_core_finding,hardware_evidence,history_summary,upstream_research}.md`.
 **Roadmap pointer:** `~/roadmap/jeff-ubuntu/design-2026-09-26-crash-mitigation.md`.
 
@@ -15,7 +15,7 @@ Deliver, for the four items in bd-dea.10:
 - (c) a decision on `kernel.panic_on_oops`,
 - (d) one discriminating experiment and a `soakctl` protocol, changing one probability-affecting variable at a time.
 
-Done means: the next crash produces a vmcore that a written triage procedure classifies as SOFTWARE-UAF, HARDWARE-MISEXECUTION, or INCONCLUSIVE, and the box either survives 400 h under the experiment or the vmcore verdict selects the next single-variable step. Criteria are in § 10.
+Done means: the next crash produces a vmcore that a written triage procedure classifies as CONTROL-FLOW-MISMATCH, BAD-TARGET-CONSUMED, UAF-SUPPORTED, or INCONCLUSIVE (§ 5), and the box either survives 400 h under the experiment or the cross-dump conclusion selects the next single-variable step. Criteria are in § 10.
 
 ## 2. Evidence (every claim cites a rootcause file or a live command run 2026-09-26 23:10–23:30 PDT)
 
@@ -61,6 +61,7 @@ Set `scaling_max_freq=5500000` on cpu0–3 (runtime, sysfs, reverts in seconds, 
 1. It is the only lever that directly tests E3, the strongest statistical anomaly in the corpus.
 2. It keeps ITMT priority unchanged (priority derives from HWP highest-perf, not from `scaling_max_freq`), so scheduler steering toward cpu0–3 is constant and only the V/f point moves. It probes only one H-HW variant: the light-load top-turbo bin, which is exactly the state of an idle favored core woken by a softirq (24/26 crashes). It does not probe the idle/C-state exit-voltage variant; that is S2e (persistent `intel_idle.max_cstate=1`, bd-qy1). If crashes continue on cpu0–3 at 5.5 GHz, only the top-bin variant loses; if they stop for 400 h, H-HW gains strongly. The vmcore, not the cap, is the primary discriminator (§ 5).
 4. Prior worth stating: nine identical `0x283` fault addresses (E1) are easier to explain by a stale field read through a freed pointer than by mis-execution, so the software hypothesis starts ahead. The cap is chosen because it is the cheapest reversible H-HW probe, not because H-HW is favoured.
+5. **Damage containment precedes the experiment.** Intel's Raptor Lake guidance is BIOS with microcode ≥ 0x12F **and** Intel Default Settings (13900K: PL1 = 125 W, PL2 = 253 W). The board runs PL1 = PL2 = 253 W (E5), so it is not on Intel defaults. Restoring PL1 = 125 W (leave TVB and PL2 alone) happens in window W before S1 (W1b), because a 400 h soak must not deliberately keep an aging-accelerating power profile for the sake of attribution purity. S1 therefore carries two H-HW-side changes (PL1 restore + cap); the handoff permits two changes when the vmcore attributes, and neither change alters the software hypothesis. If the cap and PL1 together yield 400 h clean, the S3 reverse test removes the cap first (PL1 stays at Intel default permanently).
 3. Cost: ≤5 % single-thread peak on two cores. Runners are 2-CPU-quota containers and all-core turbo is already ≤5.5 GHz, so CI throughput is unaffected.
 
 Alternatives considered and their disposition:
@@ -71,7 +72,7 @@ Alternatives considered and their disposition:
 | Long-lived runners (container reuse) | Deferred to the H-SW branch (S2b) | ezgha JIT runners are single-job by construction (`src/github.rs:1051`); reuse is a product redesign with its own isolation review. |
 | Kernel 7.0.0-34 HWE | Rejected now | E14: it carries neither candidate fix and adds a nvidia/DKMS variable. |
 | Kernel 6.8.0-124 LTS | H-SW branch (S2a) | Predates the EEVDF single-runqueue rework (upstream_research.md § Q1), so it tests that anchor; the 2026-04-30 negative result is unverifiable (E15). |
-| BIOS PL1 = 125 W, TVB off | Hygiene after S1 (S2c/S3) | Requires physical presence; slows further Vmin wear but discriminates nothing on idle-context faults. |
+| BIOS PL1 = 125 W (Intel Default Settings) | **Before S1 (W1b)**, revised after `/web-advice` | Damage containment per Intel guidance; discriminates nothing, so it is not counted as the experiment's variable. TVB off stays deferred (S2c). |
 | `cgroup_disable=cpu` | Rejected | Undoes load-bearing `actions.slice` CPU containment; already failed as a cure (history_summary.md § (b) item 10). |
 | `psi=0` | Rejected | Removes 1/26 call site, disables PSI for oomd and the pressure recorder (bd-vjd). |
 | Disable ITMT (`/sys/kernel/debug/sched/itmt_enabled=0`) | Reserve as S2d | Tests "crashes follow scheduler steering" — useful only if S1 crashes on cpu0–3 and the vmcore is INCONCLUSIVE. |
@@ -79,10 +80,10 @@ Alternatives considered and their disposition:
 
 ### D2 — Logging
 
-1. **Keep kdump** (E7). Do not change `crashkernel=` before the SysRq-c proof (D4 step W3); raise to `1G,high` only if the proof shows the 640 MiB crash kernel OOMs.
+1. **Keep kdump** (E7) and **raise the reservation before the proof**: `kdump-config` recommends 1252 M against 640 MiB reserved, and Ubuntu's kdump documentation says an undersized crash kernel can OOM. Set `crashkernel=1536M,high crashkernel=128M,low` in `/etc/default/grub.d/kdump-tools.cfg` in window W0, take effect on the W1 reboot, verify `kexec_crash_size` ≥ 1.5 GiB before W3. Not a probability-affecting variable (§ 7).
 2. **Lockup panics:** `kernel.softlockup_panic=1`, `kernel.hardlockup_panic=1`, `kernel.hung_task_panic=0` (unchanged), via `/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf` (owned by user_scope, E19/E20). A freeze without an oops then panics into kdump instead of hanging until a human power-cycles. Blast radius in § 7.
 3. **`kernel.panic=10`:** after a panic the box reboots itself in 10 s if the crash kernel did not take over. This is a requested operator exception to the CLAUDE.md prohibition, argued in § 8; it is not claimed to be compliant.
-4. **netconsole → MacBook** over the idle wired NIC. netpoll builds its own frames on the named device, so `eno2` gets no NetworkManager connection and no routable address: the source address `192.168.254.130` exists only inside the netconsole parameter, the target MAC is omitted (netconsole then uses the Ethernet broadcast address, which avoids the MacBook's rotating private Wi-Fi MAC), and the module is loaded by a small unit ordered after `sys-subsystem-net-devices-eno2.device` that first sets the link up, not by `modules-load.d` (which runs before the link exists). Receiver: a launchd job on the MacBook running `nc -ukl 6666`. Value: last minute of kernel log before a crash and a backup if kdump fails; gap: MacBook sleep loses packets (accepted). netpoll works on NAPI drivers without `ndo_poll_controller`; T3/T4 prove it with a live `/dev/kmsg` probe before the item is marked done.
+4. **netconsole → MacBook** over the idle wired NIC. The kernel documents `src-ip` as an interface address, so the loader unit adds `192.168.254.130/32` to `eno2` (a host route only; no connected `/24`, so Wi-Fi routing and ARP are untouched) and sets the link up before `modprobe netconsole`. The target MAC defaults to broadcast (the MacBook's Wi-Fi MAC `ae:2f:…` is a locally administered, possibly rotating private address); because switches may suppress broadcast, the unit accepts an explicit `NETCONSOLE_TGT_MAC` and T4 records which mode delivered. The unit is ordered after `sys-subsystem-net-devices-eno2.device`, never `modules-load.d`. Receiver: a launchd job on the MacBook running `nc -ukl 6666`. Value: last minute of kernel log before a crash and a backup if kdump fails; gap: MacBook sleep loses packets (accepted). netpoll works on NAPI drivers without `ndo_poll_controller`; T3/T4 prove it with a live `/dev/kmsg` probe before the item is marked done.
 5. **vmcore triage script** (`scripts/vmcore-triage.sh` in user_scope) that runs `crash` in batch against a dbgsym `vmlinux` and prints the register-versus-memory comparison that decides § 5.
 
 ### D3 — `panic_on_oops`: keep 1
@@ -97,11 +98,12 @@ Alternatives considered and their disposition:
 
 | Step | Action | Proof |
 |---|---|---|
-| W0 | Drain: `systemctl --user stop ezgha.service`; wait for `docker ps --filter label=ezgha=managed` to reach 0 | live count = 0 |
-| W1 | Memtest86+ ≥ 4 passes overnight (bd-memtest501, reuse `scripts/queue_memtest.sh`) | photo/screenshot of pass count |
-| W2 | Install D2 sysctl file, netconsole config, receiver; `sysctl --system` | `assert-crash-capture.sh` → `PASS`, MacBook log shows a probe line |
-| W3 | SysRq-c proof. OPERATOR-ONLY, human present, fleet drained: write `c` to the SysRq trigger as root; box must dump and return by itself | new `/var/crash/<ts>/dump.<ts>` ≥ 50 MiB and `uptime` < window age; if no dump, raise `crashkernel=1G,high`, reboot, repeat once |
-| W4 | Apply D1 cap (`systemctl enable --now favored-core-cap.service`) | `favored-core-cap.sh assert` → `PASS S1-cap` |
+| W0 | Gates before anything destructive: (a) dbgsym `vmlinux` on disk with a Build ID equal to the running kernel's (P5); (b) netconsole L2 proof via `arping` from `eno2`, or netconsole formally dropped; (c) OPERATOR-ONLY edit of `crashkernel=` to `1536M,high` + `128M,low` and `update-grub` | `readelf -n vmlinux \| grep "Build ID"` matches `/sys/kernel/notes`; arping reply or `netconsole: UNAVAILABLE`; grub file diff |
+| W1 | Drain (`systemctl --user stop ezgha.service`, container count 0); reboot into Memtest86+ ≥ 4 passes overnight (bd-memtest501, reuse `scripts/queue_memtest.sh`) | photo/screenshot of pass count |
+| W1b | BIOS: restore Intel Default Settings power limits (PL1 = 125 W; leave PL2 and TVB); screenshot | after boot `constraint_0_power_limit_uw` = 125000000 |
+| W2 | Boot; verify `kexec_crash_loaded=1` and `kexec_crash_size` ≥ 1.5 GiB; install cap unit (not enabled), netconsole unit, receiver; **do not** install the lockup-panic sysctls yet | `assert-crash-capture.sh --pre` → `PASS C2`, MacBook log shows a probe line |
+| W3 | SysRq-c proof. OPERATOR-ONLY, human present, fleet still drained: write `c` to the SysRq trigger as root; box must dump and return by itself; run `vmcore-triage.sh` on the dump | `/var/crash/<ts>/dump.<ts>` ≥ 50 MiB, `crash` loads it against the W0 `vmlinux`, box back without a human touch; if no dump, fix and repeat once |
+| W4 | Install the lockup-panic sysctl file (`sysctl --system`); apply D1 cap (`systemctl enable --now favored-core-cap.service`) | `assert-crash-capture.sh` → `PASS C1`; `favored-core-cap.sh assert` → `PASS S1-cap` |
 | W5 | Start ezgha; `soakctl start favcore-cap-5500-10runners-<date> --target 200 --bead bd-dea.10 --config "6.17.0-29 nohz=off, cpu0-3 capped 5.5GHz, 10 runners, lockup panics on, kdump armed"`; enable the `soak-watch.timer` | `soakctl status` in progress; timer listed |
 
 **Soak targets** (soak skill rules, E4): target 200 h (≥ longest known 198.7 h). Promotion at 400 h crash-free (≥ 2× target and > 1.5× longest ever). A crash is data: record elapsed, do not reset.
@@ -110,40 +112,49 @@ Alternatives considered and their disposition:
 
 | S1 outcome | Verdict | Next single-variable step |
 |---|---|---|
-| Crash, vmcore | MEMORY-CORRUPTION (SOFTWARE-UAF) | S2a: boot `6.8.0-124` (keep cap; it is now known not to matter), soak 200 h/400 h. 6.8 survives → stay on 6.8, file Launchpad bug with vmcore, wait for an HWE build carrying the § E14 fixes. 6.8 crashes → S2b: runner-reuse design bead (churn reduction without losing 10 slots). |
-| Crash, vmcore | HARDWARE-MISEXECUTION (first) | Keep S1 running; a second HARDWARE vmcore is required (§ 5). Meanwhile run S2e (C-state clamp) as the next reboot-time variable only if 200 h pass without a second dump. |
-| Two vmcores | HARDWARE-MISEXECUTION (second) | S2c: BIOS PL1 = 125 W + TVB off, Intel Processor Diagnostic Tool, open RMA path; keep cap; soak 200 h. |
-| Crash, vmcore | MEMORY-CORRUPTION (DRAM-BITFLIP) | Memtest result (W1) decides: errors → RAM path (bd-hwpath28); clean → treat as UNKNOWN and continue S1. |
+| Crash, vmcore | UAF-SUPPORTED | S2a: boot `6.8.0-124` (keep cap; it is now known not to matter), soak 200 h/400 h. 6.8 survives → stay on 6.8, file Launchpad bug with vmcore, wait for an HWE build carrying the § E14 fixes. 6.8 crashes → S2b: runner-reuse design bead (churn reduction without losing 10 slots). |
+| Crash, vmcore | CONTROL-FLOW-MISMATCH (first) | Keep S1 running; HARDWARE-SUPPORTED needs a second independent mismatch or corroborating hardware evidence (§ 5). Run S2e (C-state clamp) as the next reboot-time variable only if 200 h pass without a second dump. |
+| Two vmcores | CONTROL-FLOW-MISMATCH ×2 → HARDWARE-SUPPORTED | S2c: TVB off, Intel Processor Diagnostic Tool, open RMA path; keep cap and PL1 default; soak 200 h. |
+| Crash, vmcore | BAD-TARGET-CONSUMED (no lifetime proof) | Origin undecided (software or hardware corrupted the value before the branch). Continue S1; escalate to S2a only after two BAD-TARGET dumps whose corrupted objects are both scheduler/cgroup/PSI-owned, or to S2e if memtest (W1) was dirty. |
 | Crash, vmcore | INCONCLUSIVE | Fix the capture gap named by the triage (dbgsym mismatch, truncated dump, crashkernel size), restart the same soak. If a second vmcore is also inconclusive, run S2d (ITMT off) as the next discriminator. |
 | Crash, no vmcore | — | Capture defect: W3 was not honest, or the failure was a hang without lockup detection. Fix and restart S1; do not change D1. |
 | 200 h clean | — | Extend the same soak to 400 h. |
-| 400 h clean | H-HW favored-core supported | Reverse test S3: revert the cap; if a crash returns within 200 h on cpu0–3, the cap is the fix (A/B/A). Then make the cap permanent, apply S2c hygiene, and open the RMA bead. |
+| 400 h clean | H-HW favored-core supported | Reverse test S3: revert the cap only (PL1 stays at Intel default); if a crash returns within 200 h on cpu0–3, the cap is the fix (A/B/A). Then make the cap permanent, apply S2c, and open the RMA bead. |
 
 ## 5. Vmcore triage decision procedure
 
-Inputs: `/var/crash/<ts>/dump.<ts>`, `vmlinux` from the matching `-dbgsym` ddeb (E17; fetched and `dpkg -x`'d without root). `scripts/vmcore-triage.sh` prints, in order: `sys`, `log | tail -120`, `bt`, `bt -f`, `bt -r` (the saved `pt_regs` of the faulting context), the disassembly ending at the return address of frame #1 (so the last instruction shown is the call that jumped to the bad `RIP`), `rd -x` of every memory word that instruction or its feeding `mov` reads, `kmem` for the bad `RIP` and for the fault address, `kmem -s` filtered to scheduler/cgroup/PSI caches, `ps -A | head`, `runq`.
+Inputs: `/var/crash/<ts>/dump.<ts>`, `vmlinux` from the matching dbgsym ddeb whose Build ID equals the running kernel's (W0a). `scripts/vmcore-triage.sh` prints, in order: `sys`, `log | tail -120`, `bt`, `bt -f`, `bt -r` (the saved `pt_regs` of the faulting context), the disassembly ending at the return address of frame #1 (the transfer instruction that reached the bad `RIP`), `rd -x` of every memory word that instruction or its feeding `mov` reads, `kmem` for the bad `RIP` and for the fault address, `kmem -s` filtered to scheduler/cgroup/PSI caches, `ps -A | head`, `runq`. The script never classifies; it emits `VERDICT: INCONCLUSIVE reason=human-review-required` (or `sysrq-induced`) and the evidence path.
 
-**Two timestamps matter.** Registers in `pt_regs` were captured by the exception entry at the fault instant. Memory in the dump was captured later, after the crash NMI stopped the other CPUs, so a concurrent free-and-reuse can rewrite a word between the fault and the dump. The rule therefore compares `RIP` against the *register or immediate that supplied the branch target*, and uses memory only to corroborate.
+**What a vmcore can and cannot say.** Registers in `pt_regs` were captured at the exception instant; dump memory was captured later, after the crash NMI stopped the other CPUs, so a concurrent free-and-reuse can rewrite a word in between. More fundamentally, a degraded core can corrupt the *load* that filled the branch register, an address calculation, a cache line, or an earlier store, so "the register already held the bad value" locates where corruption became architecturally visible; it does not say whether software or silicon put it there. The taxonomy below is therefore evidential, not causal, and the only strong single-dump signal is a reconstructed transfer whose contemporaneous source was valid while `RIP` was not.
 
-**Step 1 — classify the transfer instruction** (from `dis -r <return address of frame #1>`; note Ubuntu 6.17 compiles C indirect calls to `call __x86_indirect_thunk_<reg>` and `sched_clock` uses a static-call trampoline, so "looks like a direct call" is not evidence by itself):
+**Step 1 — reconstruct the transfer** from `dis -r <return address of frame #1>`; Ubuntu 6.17 compiles C indirect calls to `call __x86_indirect_thunk_<reg>` and `sched_clock` goes through a static-call trampoline, so the apparent form must be resolved to its real source:
 
 | Instruction form | Branch-target source |
 |---|---|
-| `call *%reg` or `call __x86_indirect_thunk_<reg>` | the named register in `pt_regs` |
-| `call *disp(%reg)` | the memory word at `reg+disp`, read with `rd -x` |
-| `call <symbol>` to a real function | the rel32 immediate in the text page (re-read with `rd -x` at the call site) |
+| `call *%reg` or `call __x86_indirect_thunk_<reg>` | the named register in `pt_regs` (confirm the thunk did not clobber it: `dis __x86_indirect_thunk_<reg>`) |
+| `call *disp(%reg)` | the memory word at `reg+disp`, read with `rd -x` (dump-time value; may have changed) |
+| `call <symbol>` to a real function | the rel32 immediate in the text page, re-read with `rd -x` at the call site |
 | `call __SCT__*` (static call) | the trampoline's `jmp` target: `dis __SCT__<name>` |
-| `ret` (frame #0 is unreachable from frame #1's call) | the stack slot shown by `bt -f` |
+| `ret` (frame #0 not reachable from frame #1's call) | the stack slot shown by `bt -f` |
 
-**Step 2 — verdict:**
+If the unwinder output is inconsistent (frame #1's return address does not sit after a transfer instruction, or the stack shows a later indirect transfer inside the callee), stop at INCONCLUSIVE.
 
-| Verdict | Rule |
+**Step 2 — classify the single dump:**
+
+| Class | Rule |
 |---|---|
-| MEMORY-CORRUPTION (sub-typed SOFTWARE-UAF / DRAM-BITFLIP / UNKNOWN) | The supplying register (or, for memory-sourced forms, the word read now) **equals** the bad `RIP`. The CPU faithfully executed a bad value it was handed. Sub-type: SOFTWARE-UAF if the word lives in a freed or re-used slab page of a scheduler/cgroup/PSI cache (`kmem`), or the containing object is a `cfs_rq`/`task_group`/`psi_group` whose cgroup is gone; DRAM-BITFLIP if the word differs from a valid function address by one bit; otherwise UNKNOWN. |
-| HARDWARE-MISEXECUTION | The supplying register in `pt_regs` (or a re-read, intact text immediate / static-call trampoline) holds a **valid kernel text address** and `RIP` does not equal it. The CPU did not jump where its own input said. Record the CPU number; it must be in 0–3 for E3 to keep its weight. Two independent vmcores with this verdict are required before S2c (BIOS/RMA) is opened. |
-| INCONCLUSIVE | `crash` cannot load the dump; the transfer instruction cannot be identified; the form is memory-sourced and the word read now is valid (the race above makes that unprovable either way); or the register that supplied the target was clobbered by the thunk. Record the exact gap and continue the soak. |
+| CONTROL-FLOW-MISMATCH | Transfer reconstructed unambiguously; its contemporaneous source (a `pt_regs` register, an intact text immediate, or an intact static-call trampoline) holds a **valid kernel text address** and `RIP` differs. Strong evidence that the core did not execute what it was given. Record the CPU number (E3 predicts 0–3). |
+| BAD-TARGET-CONSUMED | The contemporaneous source **holds the bad value** (0x283, 0x0, or the freed-page address). Establishes where corruption became visible; origin undecided. |
+| UAF-SUPPORTED | BAD-TARGET-CONSUMED **plus** an independently demonstrated object-lifetime violation: the word lives in an object of a scheduler/cgroup/PSI cache (`kmem`), that object's owner is gone (its cgroup/task_group/psi_group is not reachable from live lists), the allocator state shows free or re-use, and the pre-crash log shows the matching cgroup teardown (veth/scope removal) within seconds. "Address is inside a slab page" alone does not qualify. |
+| INCONCLUSIVE | Everything else: `crash` cannot load the dump; the transfer cannot be reconstructed; the source is memory-only and its dump-time value is valid (unprovable either way); the register was clobbered by the thunk; the unwinder disagrees with itself. Record the exact gap and continue the soak. |
 
-`scripts/vmcore-triage.sh` never emits MEMORY-CORRUPTION or HARDWARE-MISEXECUTION on its own; it emits the evidence blocks and `VERDICT: INCONCLUSIVE reason=human-review-required` unless the dump is the SysRq proof. The human applies the table and records the verdict in bd-dea.10 (C12). A second reviewer (Codex) re-reads the same report before any S2c action.
+**Step 3 — cross-dump conclusions** (these, not single dumps, drive S2 decisions):
+
+- HARDWARE-SUPPORTED: two independent CONTROL-FLOW-MISMATCH dumps, or one plus corroborating hardware evidence (MCE bank latch, memtest errors, Intel Processor Diagnostic Tool FAIL).
+- SOFTWARE-SUPPORTED: two UAF-SUPPORTED dumps, or one UAF-SUPPORTED dump whose lifetime violation matches a named upstream fix (upstream_research.md § Q1).
+- Anything less stays open; the soak continues and the next single-variable step is chosen from the S1 outcome table, not from the class label.
+
+A second reviewer (Codex) re-reads every report before a class is recorded in bd-dea.10 (C12), and no S2c (BIOS/RMA) action opens on a single dump.
 
 ## 6. Contradictions resolved
 
@@ -154,13 +165,14 @@ Inputs: `/var/crash/<ts>/dump.<ts>`, `vmlinux` from the matching `-dbgsym` ddeb 
 
 | Change | Bounded metric | Normal peak (source) | Trigger threshold | Margin / interaction |
 |---|---|---|---|---|
-| `softlockup_panic=1` | kernel-mode stalls > 2×`watchdog_thresh` = 20 s | 0 in 72 pstore dumps and retained journal (E9) | 20 s | `actions.slice` CPU quota throttles user space only; cannot produce a kernel-mode stall. A first-ever 20 s stall would now dump and reboot instead of freezing. |
+| `softlockup_panic=1` | kernel-mode stalls > 2×`watchdog_thresh` = 20 s | 0 in 72 pstore dumps and retained journal (E9) | 20 s | `actions.slice` CPU quota throttles user space only and should not itself trip the detector, but the detector does not know why its task missed (IRQ-off regions, SMI stalls, driver defects can). A first-ever 20 s stall would now dump and reboot instead of freezing. Enabled only after W3 passes. |
 | `hardlockup_panic=1` | NMI-detected stalls (`nmi_watchdog=1`, E8) | 0 (E9) | 10 s | Same; the perf NMI watchdog is already on. |
 | `kernel.panic=10` | seconds a dead host stays dead when kdump does not take over | today: unbounded (Sep 26 froze 78 min until a human) | 10 s | Acts only after a panic; creates no panic. |
 | `panic_on_oops=1` (explicit) | oopses that previously would not have panicked | 0 survivable oopses (E9) | first oops | No behaviour change from today (kdump-config already forces it). |
 | cpu0–3 cap 5.5 GHz | single-thread peak on two cores | 5.8 GHz TVB bin | n/a | −5 % on two cores; all-core turbo unchanged; runners unaffected (E12). Revert: `favored-core-cap.sh revert`. |
 | netconsole | UDP broadcast frames per kernel log line on `eno2` | measured in T3 before enabling (journal lines/hour) | n/a | Wired NIC is otherwise idle (E16); Wi-Fi untouched; broadcast frames are seen by every LAN host, so `printk` rate limiting stays default. |
-| crashkernel 640 MiB → 1 GiB (conditional) | RAM removed from the running system | 61 GiB total, 49 GiB available (live `free -g`) | only if W3 fails | < 2 % of RAM. |
+| crashkernel 640 MiB → 1.5 GiB (W0) | RAM removed from the running system | 61 GiB total, 49 GiB available (live `free -g`) | always | 2.5 % of RAM; not a crash-probability variable. |
+| Chained interaction | false watchdog → panic → crash-kexec → if capture fails, `kernel.panic=10` reboots | 0 watchdog events (E9); capture proven by W3 | — | A previously non-fatal watchdog warning becomes an unattended reboot and, if the crash kernel OOMs, leaves no vmcore. Mitigations: W3 proof at the raised reservation, lockup panics enabled only after W3, and `journalctl -k \| grep -c "soft lockup\|hard LOCKUP"` checked at every `soakctl watch` (must stay 0 or be explained). |
 
 ## 8. Safety principles — requested exception, not compliance
 
@@ -181,11 +193,11 @@ Why the exception is worth asking for: without 1–3 the Sep 26 crash froze the 
 | Q3 | `panic_on_oops`? | Keep 1 | § D3. |
 | Q4 | `kernel.panic`? | 10 | § 7/8; Sep 26 froze 78 min waiting for a human. |
 | Q5 | Which lockup panics? | soft=1, hard=1, hung_task=0 | Hung tasks (D-state on IO) are not host death and have benign causes. |
-| Q6 | netconsole target and path? | MacBook `en0` via `eno2`, static IP, MAC hardcoded | E16; the only wired idle NIC; Wi-Fi drivers do not support netpoll. |
+| Q6 | netconsole target and path? | MacBook `en0` via `eno2`; `/32` source address on the interface; broadcast MAC by default, explicit MAC optional | E16; the only wired idle NIC; Wi-Fi drivers do not support netpoll. |
 | Q7 | Change kernel now? | No | E14; 6.8 only in the H-SW branch. |
-| Q8 | BIOS PL1/TVB now? | No, after S1 | Physical presence; not a discriminator. |
+| Q8 | BIOS PL1/TVB now? | PL1 = 125 W (Intel default) before S1; TVB off deferred | Revised after `/web-advice`: Intel guidance makes the power profile damage containment, not a discriminator. |
 | Q9 | When does memtest run? | W1, in the same drained window | Box is offline anyway; closes bd-memtest501. |
-| Q10 | Raise `crashkernel` pre-emptively? | No; only if W3 fails | Do not touch a booting cmdline before proving need. |
+| Q10 | Raise `crashkernel` pre-emptively? | Yes, to 1536 M high before W3 | Revised after `/web-advice`: Ubuntu documents OOM risk below the recommended size, and the dump is the whole point. |
 | Q11 | Where do artifacts live? | user_scope (`systemd/`, `scripts/`, `config/`, `tests/`) | E19 forbids them in ez-gh-actions; E20 shows the precedent. |
 | Q12 | Soak target / promotion? | 200 h / 400 h | E4 and the soak skill's target rules. |
 | Q13 | Two changes in one window? | Yes: D2 (logging) + D1 (cap) | Logging does not change crash probability; vmcore attributes. |
@@ -193,6 +205,8 @@ Why the exception is worth asking for: without 1–3 the Sep 26 crash froze the 
 | Q15 | Design doc location? | Canonical here; pointer under `~/roadmap/jeff-ubuntu/` | The bead's acceptance path plus a git-reviewable canonical. |
 | Q16 | Treat the cap as the discriminator? | No; the vmcore is (revised after `/advice`) | Codex and Opus both flagged the cap as confounded and the original triage rule as unsound. |
 | Q17 | Claim compliance with the reboot-primitive prohibition? | No; request a bounded exception (§ 8) | Opus: the prohibition covers "invoke or instruct"; honesty over workaround. |
+| Q18 | Can one vmcore name the cause? | No; single dumps get an evidential class, conclusions need two | ChatGPT: register-equals-RIP does not exclude a corrupted load; UAF needs a demonstrated lifetime violation. |
+| Q19 | Which proofs gate W3? | dbgsym Build-ID match, netconsole L2 proof, raised crashkernel, kdump armed | ChatGPT: make "capture works" a precondition of the soak, not a discovery during it. |
 
 ## 10. Ironclad exit criteria (default FAIL; a verifier re-executes on Jeff-Ubuntu)
 
@@ -201,7 +215,7 @@ Each check prints exactly one `PASS <id>` or `FAIL <id> …` line.
 | # | Criterion | Check | Verifier |
 |---|---|---|---|
 | C1 | Sysctl file installed and effective | `for k in panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do [ "$(sysctl -n kernel.${k%%:*})" = "${k##*:}" ] \|\| { echo "FAIL C1 $k"; exit 1; }; done; [ -f /etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf ] && echo PASS C1 \|\| echo FAIL C1-file` | Codex |
-| C2 | kdump still armed after every reboot in scope | `[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] && echo PASS C2 \|\| echo FAIL C2` | Codex |
+| C2 | kdump armed at the raised reservation after every reboot in scope | `[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] && [ "$(cat /sys/kernel/kexec_crash_size)" -ge 1610612736 ] && echo PASS C2 \|\| echo FAIL C2` | Codex |
 | C3 | SysRq-c produced a real dump | `d=$(ls -d /var/crash/2026* 2>/dev/null \| tail -1); [ -n "$d" ] && [ "$(stat -c %s "$d"/dump.* 2>/dev/null \| sort -n \| tail -1)" -ge 52428800 ] && echo "PASS C3 $d" \|\| echo FAIL C3` | Codex |
 | C4 | Box returned by itself after the SysRq-c test | journal of the boot after the test shows `kdump-tools` completed and no `systemctl reboot` by a human: `journalctl -b -1 -u kdump-tools-dump.service --no-pager \| grep -q "saved vmcore" && echo PASS C4 \|\| echo FAIL C4` | Codex |
 | C5 | Favored-core cap live and persistent | `/usr/local/libexec/favored-core-cap.sh assert && systemctl is-enabled favored-core-cap.service \| grep -qx enabled && echo PASS C5 \|\| echo FAIL C5` | Codex |
@@ -210,18 +224,18 @@ Each check prints exactly one `PASS <id>` or `FAIL <id> …` line.
 | C8 | Soak registered with the right target and watchdog | `soakctl status favcore-cap-5500-10runners-* \| grep -q "target=200h" && systemctl --user is-active soak-watch.timer \| grep -qx active && echo PASS C8 \|\| echo FAIL C8` | Codex |
 | C9 | Fleet back to 10/10 after W5 | `./doctor-runner` shows 10 slots, none DOWN or IDLE-STARVED, **and** the deploy-owner's `./docs/verify-exit-criteria.sh` Gate 3 passes with a canary job whose `Runner.Worker` is seen by `docker top` → `PASS C9` | Deploy-owner |
 | C10 | Triage pipeline yields the § 5 evidence on the W3 dump | report from `scripts/vmcore-triage.sh <dump>` contains a `PANIC:` line, a `bt -r` register block with `RIP:`, and a disassembly block ending at frame #1's return address, and the script prints `VERDICT: INCONCLUSIVE reason=sysrq-induced` → `PASS C10`. This proves the pipeline delivers the inputs; the rule itself is only exercised by a real crash. | Codex |
-| C11 | Memtest86+ completed ≥ 4 passes with 0 errors | bead bd-memtest501 comment with a photo/screenshot and pass count → `PASS C11`, else `FAIL C11` | Human |
-| C12 | Terminal outcome recorded | bd-dea.10 comment contains one of: `S1 VERDICT MEMORY-CORRUPTION/<subtype>`, `S1 VERDICT HARDWARE-MISEXECUTION <n-of-2>`, `S1 INCONCLUSIVE <gap>`, `S1 CLEAN 400h`, names the report path, and names the next step from § D4; a second reviewer's `br` comment concurs → `PASS C12` | Codex |
+| C11 | Memtest86+ completed ≥ 4 passes with 0 errors, and BIOS PL1 restored | bead bd-memtest501 comment with a photo/screenshot and pass count, and `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` = 125000000 → `PASS C11`, else `FAIL C11` | Human |
+| C12 | Terminal outcome recorded | bd-dea.10 comment contains one of: `S1 CLASS CONTROL-FLOW-MISMATCH <n>`, `S1 CLASS BAD-TARGET-CONSUMED <n>`, `S1 CLASS UAF-SUPPORTED <n>`, `S1 INCONCLUSIVE <gap>`, `S1 CLEAN 400h`, names the report path, and names the next step from § D4; a second reviewer's `br` comment concurs → `PASS C12` | Codex |
 | C13 | No forbidden primitive entered ez-gh-actions | `bash tests/forbid_host_reboot_primitives_test.sh` → `PASS` | CI |
 
 ## 11. Implementation Preconditions (unmet as of design time)
 
 - **P1 sudo password / root.** Every host mutation (sysctl, unit install, netconsole, SysRq-c, crashkernel) needs it; C6 needs root debugfs. A human runs W0–W5 or supplies the password interactively.
 - **P2 Human presence for W1 and W3.** Memtest is a GRUB-menu boot; SysRq-c must be watched to confirm the auto-return.
-- **P3 `eno2` L2 adjacency to 192.168.254.0/24 and a free static address.** Unverified: `eno2` has carrier but no address (E16). T3 must `ping -I eno2 192.168.254.199` before enabling netconsole; if it fails, netconsole is recorded as UNAVAILABLE and D2.4 is dropped without blocking the rest.
+- **P3 `eno2` L2 adjacency to 192.168.254.0/24 and a free `/32` address.** Unverified: `eno2` has carrier but no address (E16). W0b must get an `arping -I eno2 192.168.254.199` reply (root, after adding the `/32`) before netconsole is enabled; if it fails, netconsole is recorded as UNAVAILABLE and D2.4 is dropped without blocking the rest.
 - **P4 MacBook awake.** Netconsole loses packets during sleep; the receiver is best-effort.
 - **P6 Operator exception (§ 8).** D2 items 2–3 and W3 run only after the operator explicitly approves the exception in a live message; otherwise they are skipped and recorded.
-- **P5 dbgsym for `crash`.** The `linux-image-unsigned-6.17.0-29-generic-dbgsym` ddeb (≈1 GiB) must be fetched from ddebs.ubuntu.com; no root needed for `dpkg -x` into `~/.local/share/vmlinux/`.
+- **P5 dbgsym for `crash` (hard gate for W3).** The 6.17.0-29 dbgsym ddeb (named `linux-image-6.17.0-29-generic-dbgsym` or `linux-image-unsigned-…-dbgsym` in the ddebs pool; ≈1 GiB) must be fetched and its `vmlinux` Build ID must equal the running kernel's before W3; no root needed for `dpkg -x` into `~/.local/share/vmlinux/`.
 
 ## 12. Out of scope
 
