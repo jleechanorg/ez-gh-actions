@@ -133,7 +133,7 @@ Inputs: `/var/crash/<ts>/dump.<ts>`, `vmlinux` from the matching dbgsym ddeb who
 | Instruction form | Branch-target source |
 |---|---|
 | `call *%reg` or `call __x86_indirect_thunk_<reg>` | the named register in the exception frame printed by `bt` (confirm the thunk did not clobber it: `dis __x86_indirect_thunk_<reg>`) |
-| `call *disp(%reg)` | the memory word at `reg+disp`, read with `rd -x` (dump-time value; may have changed) |
+| `call *disp(%reg)` | the memory word at `reg+disp`, read with `rd -x` — a **dump-time** value that may have changed since the transfer; it is never a contemporaneous source, so this form can only reach INCONCLUSIVE (with the dump-time word recorded as a hint) |
 | `call <symbol>` to a real function | the rel32 immediate in the text page, re-read with `rd -x` at the call site |
 | `call __SCT__*` (static call) | the trampoline's `jmp` target: `dis __SCT__<name>` |
 | `ret` (the exception frame is not reachable from the caller frame's call) | the stack slot shown by `bt -f` |
@@ -145,9 +145,9 @@ If the unwinder output is inconsistent (the caller frame's return address does n
 | Class | Rule |
 |---|---|
 | CONTROL-FLOW-MISMATCH | Transfer reconstructed unambiguously; its contemporaneous source (an exception-frame register, an intact text immediate, or an intact static-call trampoline) holds a **valid kernel text address** and `RIP` differs. Evidence that the core did not execute what it was given, with one caveat that keeps it short of proof: the exception frame is itself kernel memory (`pt_regs` saved on the stack at entry), so a memory-corruption defect can also produce an apparently valid source next to a bad `RIP`. Record the CPU number (E3 predicts 0–3). |
-| BAD-TARGET-CONSUMED | The contemporaneous source **holds the bad value** (0x283, 0x0, or the freed-page address). Establishes where corruption became visible; origin undecided. |
+| BAD-TARGET-CONSUMED | A **contemporaneous** source — an exception-frame register or an intact text immediate/trampoline — **holds the bad value** (0x283, 0x0, or the freed-page address). Establishes where corruption became visible; origin undecided. Memory-sourced forms never qualify (see INCONCLUSIVE). |
 | UAF-SUPPORTED | BAD-TARGET-CONSUMED **plus** an independently demonstrated object-lifetime violation: the word lives in an object of a scheduler/cgroup/PSI cache (`kmem`), that object's owner is gone (its cgroup/task_group/psi_group is not reachable from live lists), the allocator state shows free or re-use, and the pre-crash log shows the matching cgroup teardown (veth/scope removal) within seconds. "Address is inside a slab page" alone does not qualify. |
-| INCONCLUSIVE | Everything else: `crash` cannot load the dump; the transfer cannot be reconstructed; the source is memory-only and its dump-time value is valid (unprovable either way); the register was clobbered by the thunk; the unwinder disagrees with itself. Record the exact gap and continue the soak. |
+| INCONCLUSIVE | Everything else: `crash` cannot load the dump; the transfer cannot be reconstructed; the source is memory-only (`call *disp(%reg)`, a `ret` slot), whatever its dump-time value, because that word can be rewritten between the transfer and the dump; the register was clobbered by the thunk; the unwinder disagrees with itself. Record the exact gap (and the dump-time word as a hint) and continue the soak. |
 
 **Step 3 — cross-dump conclusions** (these, not single dumps, drive S2 decisions):
 
