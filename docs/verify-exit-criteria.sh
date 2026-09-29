@@ -901,10 +901,15 @@ if [ "$PLATFORM" = "linux" ]; then
     # Gate 8 elsewhere). If the unit IS present but PSI_SHED_CHAIN is
     # empty, we FAIL — that is the exact cold-review-flagged
     # regression this gate exists to prevent.
+    # `systemctl show` prints an `Environment=` line even for a unit that does not
+    # exist (LoadState=not-found), which read as "installed with an empty chain" and
+    # failed this gate on hosts where the watcher was never installed. Check the
+    # load state first; only a loaded unit can be missing its PSI_SHED_CHAIN.
+    PSI_OOM_LOAD="$(systemctl --user show psi-oom-watcher.service -p LoadState --value 2>/dev/null || true)"
     PSI_OOM_ENV="$(systemctl --user show psi-oom-watcher.service -p Environment 2>/dev/null || true)"
     PSI_OOM_PRESENT="no"
     PSI_OOM_CHAIN=""
-    if [ -n "${PSI_OOM_ENV}" ]; then
+    if [ "${PSI_OOM_LOAD}" = "loaded" ] && [ -n "${PSI_OOM_ENV}" ]; then
         PSI_OOM_PRESENT="yes"
         # Extract the PSI_SHED_CHAIN= substring (handles both quoted and
         # ambient forms, plus the surrounding Environment=VALUE list).
