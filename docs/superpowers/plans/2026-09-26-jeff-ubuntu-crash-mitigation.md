@@ -159,20 +159,36 @@ CAP_KHZ="${FAVORED_CORE_CAP_KHZ:-5500000}"
 CPUS="${FAVORED_CORE_CPUS:-0 1 2 3}"
 mode="${1:-assert}"
 SAVE_DIR="${FAVORED_CORE_SAVE_DIR:-/run/favored-core-cap}"   # original limits, restored on revert
+if [ -z "${CPUS//[[:space:]]/}" ]; then
+  echo "FAIL S1-cap FAVORED_CORE_CPUS is empty/whitespace-only"
+  exit 1
+fi
 for c in $CPUS; do
   f="$SYSFS/cpu$c/cpufreq"
   case "$mode" in
-    apply)  mkdir -p "$SAVE_DIR"; [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c"
+    apply)  [ -f "$f/scaling_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
+            mkdir -p "$SAVE_DIR"
+            [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c"
             cur=$(cat "$f/scaling_max_freq")
-            if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi ;;   # non-increasing
-    revert) if [ -f "$SAVE_DIR/cpu$c" ]; then cat "$SAVE_DIR/cpu$c" > "$f/scaling_max_freq"; rm -f "$SAVE_DIR/cpu$c"
-            else cat "$f/cpuinfo_max_freq" > "$f/scaling_max_freq"; fi ;;
-    assert) got=$(cat "$f/scaling_max_freq")
+            # Non-increasing: never raise a limit that is already below the cap.
+            if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi ;;
+    revert) [ -f "$f/cpuinfo_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
+            if [ -f "$SAVE_DIR/cpu$c" ]; then
+              cat "$SAVE_DIR/cpu$c" > "$f/scaling_max_freq"
+              rm -f "$SAVE_DIR/cpu$c"
+            else
+              # No saved value (never applied, or /run lost): leave the limit as it is.
+              # Raising it to cpuinfo_max_freq could undo a pre-existing lower limit.
+              echo "revert: cpu$c has no saved limit; leaving scaling_max_freq=$(cat "$f/scaling_max_freq") unchanged"
+            fi ;;
+    assert) [ -f "$f/scaling_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
+            got=$(cat "$f/scaling_max_freq")
+            # Capped means at or below the cap (a pre-existing lower limit is still capped).
             [ "$got" -le "$CAP_KHZ" ] || { echo "FAIL S1-cap cpu$c scaling_max_freq=$got want <= $CAP_KHZ"; exit 1; } ;;
     *) echo "usage: $0 apply|revert|assert" >&2; exit 2 ;;
   esac
 done
-[ "$mode" = assert ] && echo "PASS S1-cap cpus=[$CPUS] khz=$CAP_KHZ"
+[ "$mode" = assert ] && echo "PASS S1-cap cpus=[$CPUS] khz<=$CAP_KHZ"
 exit 0
 ```
 
@@ -430,7 +446,10 @@ ps -A | head -40
 runq
 quit
 EOF
-
+crash_rc=$?
+# A PANIC: header followed by a nonzero exit (e.g. crash failed to read task data)
+# is not a loaded dump; do not report partial output as evidence.
+[ "$crash_rc" -eq 0 ] || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load exit=$crash_rc report=$rep"; exit 1; }
 grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load report=$rep"; exit 1; }
 
 # Which frame? For the panicking task `crash` numbers the panic machinery first
