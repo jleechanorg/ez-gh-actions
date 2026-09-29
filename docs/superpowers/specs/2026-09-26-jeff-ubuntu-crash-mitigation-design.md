@@ -151,7 +151,7 @@ If the unwinder output is inconsistent (the caller frame's return address does n
 
 **Step 3 — cross-dump conclusions** (these, not single dumps, drive S2 decisions):
 
-- HARDWARE-SUPPORTED: two independent CONTROL-FLOW-MISMATCH dumps **and** at least one piece of hardware evidence that does not come from a vmcore (an MCE bank latch, a memtest error, an Intel Processor Diagnostic Tool FAIL, or a crash that stops after the cap/C-state change and returns on the S3 reverse test). Mismatch dumps alone, however many, never open S2c, because the saved frame they rely on is memory too.
+- HARDWARE-SUPPORTED: two independent CONTROL-FLOW-MISMATCH dumps **and** at least one piece of **CPU-specific** evidence that does not come from a vmcore: a decoded MCE whose bank is a core/cache bank on cpu0–3 (`ras-mc-ctl --errors` or `rasdaemon` journal, not the mere presence of a latch), an Intel Processor Diagnostic Tool FAIL, or the S3 reverse test bringing the crash back on cpu0–3. A memtest error is **not** corroboration: it names a third cause (DRAM/IMC) and is already a hard stop at W1 that routes to the RAM path. Mismatch dumps alone, however many, never open S2c, because the saved frame they rely on is memory too.
 - SOFTWARE-SUPPORTED: two UAF-SUPPORTED dumps, or one UAF-SUPPORTED dump whose lifetime violation matches a named upstream fix (upstream_research.md § Q1).
 - Anything less stays open; the soak continues and the next single-variable step is chosen from the S1 outcome table, not from the class label.
 

@@ -80,22 +80,68 @@ kernel.hung_task_panic = 0
 
 ```bash
 #!/usr/bin/env bash
-# scripts/assert-crash-capture.sh — read-only check of spec criteria C1/C2.
+# scripts/assert-crash-capture.sh — read-only check of spec criteria C1/C2
+# (bd-dea.10, docs/superpowers/specs/2026-09-26-jeff-ubuntu-crash-mitigation-design.md).
+#
+# Usage: assert-crash-capture.sh [--pre]
+#   (no args)  Check C1 (sysctl drop-in present + the five lockup/panic
+#              sysctls effective), then C2 (kdump armed with a >= 1.5 GiB
+#              crash-kernel reservation).
+#   --pre      Check ONLY C2. Used at spec window W2, before the lockup-panic
+#              sysctls are installed (the C1 sysctls land later, at W4).
+#
+# Read-only: never invokes a sysctl write mode and never writes into procfs.
+# The env overrides below let tests point this script at fake files/binaries
+# instead of live host state.
 set -euo pipefail
-f=/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf
-# --pre: capture-readiness only (C2), used at W2 before the sysctl file exists.
-if [ "${1:-}" != "--pre" ]; then
-  [ -f "$f" ] || { echo "FAIL C1-file $f missing"; exit 1; }
+
+SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf}"
+KEXEC_LOADED_FILE="${KEXEC_LOADED_FILE:-/sys/kernel/kexec_crash_loaded}"
+KEXEC_SIZE_FILE="${KEXEC_SIZE_FILE:-/sys/kernel/kexec_crash_size}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+C2_MIN_BYTES=1610612736 # 1.5 GiB, spec C2
+
+pre_only=0
+case "${1:-}" in
+  --pre) pre_only=1 ;;
+  "") ;;
+  *)
+    echo "usage: $0 [--pre]" >&2
+    exit 2
+    ;;
+esac
+
+check_c1() {
+  [ -f "$SYSCTL_FILE" ] || { echo "FAIL C1-file $SYSCTL_FILE missing"; exit 1; }
   # The lockup panics only mean something if the detectors themselves are on.
   for kv in watchdog:1 nmi_watchdog:1 soft_watchdog:1 panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do
-    k=${kv%%:*}; want=${kv##*:}; got=$(sysctl -n "kernel.$k")
+    k=${kv%%:*}
+    want=${kv##*:}
+    got=$("$SYSCTL_BIN" -n "kernel.$k" 2>/dev/null) || { echo "FAIL C1 kernel.$k unreadable"; exit 1; }
     [ "$got" = "$want" ] || { echo "FAIL C1 kernel.$k=$got want $want"; exit 1; }
   done
   echo "PASS C1"
+}
+
+check_c2() {
+  [ -f "$KEXEC_LOADED_FILE" ] || { echo "FAIL C2-file $KEXEC_LOADED_FILE missing"; exit 1; }
+  [ -f "$KEXEC_SIZE_FILE" ] || { echo "FAIL C2-file $KEXEC_SIZE_FILE missing"; exit 1; }
+  loaded=$(cat "$KEXEC_LOADED_FILE")
+  size=$(cat "$KEXEC_SIZE_FILE")
+  [ "$loaded" = "1" ] || { echo "FAIL C2 kexec_crash_loaded=$loaded want 1"; exit 1; }
+  case "$size" in
+    ''|*[!0-9]*) echo "FAIL C2 kexec_crash_size=$size not numeric"; exit 1 ;;
+  esac
+  [ "$size" -ge "$C2_MIN_BYTES" ] || { echo "FAIL C2 kexec_crash_size=$size want >= $C2_MIN_BYTES"; exit 1; }
+  echo "PASS C2"
+}
+
+if [ "$pre_only" -eq 1 ]; then
+  check_c2
+else
+  check_c1
+  check_c2
 fi
-[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] || { echo "FAIL C2 kexec_crash_loaded=0"; exit 1; }
-size=$(cat /sys/kernel/kexec_crash_size)
-[ "$size" -ge 1610612736 ] && echo "PASS C2 kexec_crash_size=$size" || { echo "FAIL C2 kexec_crash_size=$size < 1610612736"; exit 1; }
 ```
 
 **Step 4: Run test to verify it passes**
@@ -196,9 +242,10 @@ exit 0
 
 ```ini
 # systemd/favored-core-cap.service
+# systemd/favored-core-cap.service
 [Unit]
 Description=Cap TVB favored cores cpu0-3 to 5.5 GHz (bd-dea.10 experiment S1)
-After=multi-user.target
+# Deliberately no After= on the install target: WantedBy plus After on the same target is an ordering cycle.
 
 [Service]
 Type=oneshot
@@ -522,12 +569,17 @@ fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
   [ -n "$ret" ]   && echo "### command: dis -r $ret"
   [ -n "$rip" ]   && echo "### command: kmem $rip"
   [ -n "$fault" ] && echo "### command: kmem $fault"
+  [ -n "$ret" ]   || echo "### NOTE: no return address extracted; dis -r skipped"
+  [ -n "$rip" ]   || echo "### NOTE: no RIP extracted; kmem RIP skipped"
+  [ -n "$fault" ] || echo "### NOTE: no fault address extracted; kmem fault skipped"
   {
     [ -n "$ret" ]   && echo "dis -r $ret"
     [ -n "$rip" ]   && echo "kmem $rip"
     [ -n "$fault" ] && echo "kmem $fault"
     echo "quit"
   } | "$crash_bin" -s "$vmlinux" "$dump" 2>&1
+  second_rc=$?
+  [ "$second_rc" -eq 0 ] || echo "### NOTE: second crash run exited $second_rc; the block above may be incomplete"
 } >> "$rep"
 
 if grep -q "sysrq_handle_crash" "$rep"; then
