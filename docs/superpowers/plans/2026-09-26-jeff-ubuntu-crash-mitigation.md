@@ -8,7 +8,7 @@
 
 **Tech Stack:** bash, systemd (system + user), sysctl, netconsole/netpoll, launchd (MacBook), `crash` 8.0.4 + Ubuntu dbgsym, `soakctl`, pytest (user_scope test convention).
 
-**Implemented in user_scope PR #56** (branch `feat/jeff-ubuntu-crash-capture`). Tests live in per-task files there, not in one shared `tests/test_crash_capture_artifacts.py` as the task blocks below originally showed: `tests/test_crash_capture_sysctl.py`, `tests/test_favored_core_cap.py`, `tests/test_netconsole_artifacts.py`, `tests/test_soak_watch.py`, `tests/test_vmcore_triage.py`, `tests/test_install_crash_capture.py` (56 tests, root-free). Where a task block's test snippet and the PR differ, the PR is canonical.
+**Implemented in user_scope PR #56** (branch `feat/jeff-ubuntu-crash-capture`, merged 126c1fb) **and PR #57** (bd-lck: durable pre-S1 record, `assert-off`, soak-watch `FAVORED_CORE_EXPECT` switch; merged). Tests live in per-task files there, not in one shared `tests/test_crash_capture_artifacts.py` as the task blocks below originally showed: `tests/test_crash_capture_sysctl.py`, `tests/test_favored_core_cap.py`, `tests/test_netconsole_artifacts.py`, `tests/test_soak_watch.py`, `tests/test_vmcore_triage.py`, `tests/test_install_crash_capture.py` (56 tests, root-free). Where a task block's test snippet and the PR differ, the PR is canonical.
 
 **Preconditions (spec § 11):** P1 sudo for Tasks 7–9; P2 human present for W1/W3; P3 `eno2` adjacency (Task 4, under sudo in W0); P5 dbgsym with matching Build ID (Task 6, no root) is a hard gate before W3; P6a (SysRq proof) and P6b (lockup/panic sysctls) operator approvals.
 
@@ -200,13 +200,16 @@ def test_favored_core_unit_is_oneshot_with_revert():
 ```bash
 #!/usr/bin/env bash
 # scripts/favored-core-cap.sh — cap the two TVB favored cores (cpu0-3) to the
-# common P-core bin. Experiment S1 of bd-dea.10. Modes: apply | revert | assert.
+# common P-core bin. Experiment S1 of bd-dea.10. Modes: apply | revert | assert | assert-off.
+# assert-off (S3 reverse test): every CPU is back at its PRE-S1 limit, recorded durably by
+# the first apply under /var/lib/favored-core-cap (survives reboots, unlike the /run save file).
 set -euo pipefail
 SYSFS="${FAVORED_CORE_SYSFS:-/sys/devices/system/cpu}"
 CAP_KHZ="${FAVORED_CORE_CAP_KHZ:-5500000}"
 CPUS="${FAVORED_CORE_CPUS:-0 1 2 3}"
 mode="${1:-assert}"
 SAVE_DIR="${FAVORED_CORE_SAVE_DIR:-/run/favored-core-cap}"   # original limits, restored on revert
+DURABLE_DIR="${FAVORED_CORE_DURABLE_DIR:-/var/lib/favored-core-cap}"   # pre-S1 limits, written once, survive reboots
 if [ -z "${CPUS//[[:space:]]/}" ]; then
   echo "FAIL S1-cap FAVORED_CORE_CPUS is empty/whitespace-only"
   exit 1
@@ -215,11 +218,25 @@ for c in $CPUS; do
   f="$SYSFS/cpu$c/cpufreq"
   case "$mode" in
     apply)  [ -f "$f/scaling_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
-            mkdir -p "$SAVE_DIR"
-            [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c"
-            cur=$(cat "$f/scaling_max_freq")
-            # Non-increasing: never raise a limit that is already below the cap.
-            if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi ;;
+            mkdir -p "$SAVE_DIR" "$DURABLE_DIR"
+            rec="$DURABLE_DIR/cpu$c"
+            # The whole per-CPU step runs under one lock, so concurrent applies serialize:
+            # the /run save file and the durable pre-S1 record are each written exactly once
+            # (create-exclusive), any write failure is fatal BEFORE the cap is applied, and an
+            # existing empty record (interrupted write) stops the run instead of being replaced.
+            if ! (
+              flock -x 9
+              [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c" || { echo "FAIL S1-cap cpu$c could not write $SAVE_DIR/cpu$c; cap NOT applied"; exit 1; }
+              if [ -e "$rec" ]; then
+                [ -s "$rec" ] || { echo "FAIL S1-cap cpu$c durable record $rec is empty (interrupted write); inspect before re-applying"; exit 1; }
+              else
+                ( set -C; cat "$f/scaling_max_freq" > "$rec" ) 2>/dev/null || { echo "FAIL S1-cap cpu$c could not write durable record $rec; cap NOT applied"; exit 1; }
+                [ -s "$rec" ] || { echo "FAIL S1-cap cpu$c durable record $rec empty after write; cap NOT applied"; exit 1; }
+              fi
+              cur=$(cat "$f/scaling_max_freq")
+              # Non-increasing: never raise a limit that is already below the cap.
+              if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi
+            ) 9>"$DURABLE_DIR/.lock"; then exit 1; fi ;;
     revert) [ -f "$f/cpuinfo_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
             if [ -f "$SAVE_DIR/cpu$c" ]; then
               cat "$SAVE_DIR/cpu$c" > "$f/scaling_max_freq"
@@ -233,10 +250,17 @@ for c in $CPUS; do
             got=$(cat "$f/scaling_max_freq")
             # Capped means at or below the cap (a pre-existing lower limit is still capped).
             [ "$got" -le "$CAP_KHZ" ] || { echo "FAIL S1-cap cpu$c scaling_max_freq=$got want <= $CAP_KHZ"; exit 1; } ;;
-    *) echo "usage: $0 apply|revert|assert" >&2; exit 2 ;;
+    assert-off)
+            [ -f "$f/scaling_max_freq" ] || { echo "FAIL S3-capoff cpu$c cpufreq path missing: $f"; exit 1; }
+            [ -s "$DURABLE_DIR/cpu$c" ] || { echo "FAIL S3-capoff cpu$c no pre-S1 record in $DURABLE_DIR"; exit 1; }
+            [ -f "$SAVE_DIR/cpu$c" ] && { echo "FAIL S3-capoff cpu$c /run save file still present (cap not reverted)"; exit 1; }
+            got=$(cat "$f/scaling_max_freq"); want=$(cat "$DURABLE_DIR/cpu$c")
+            [ "$got" = "$want" ] || { echo "FAIL S3-capoff cpu$c scaling_max_freq=$got want pre-S1 $want"; exit 1; } ;;
+    *) echo "usage: $0 apply|revert|assert|assert-off" >&2; exit 2 ;;
   esac
 done
 [ "$mode" = assert ] && echo "PASS S1-cap cpus=[$CPUS] khz<=$CAP_KHZ"
+[ "$mode" = assert-off ] && echo "PASS S3-capoff cpus=[$CPUS] at pre-S1 limits"
 exit 0
 ```
 
@@ -419,10 +443,14 @@ def test_soak_watch_timer_every_5_min():
 # systemd/user/soak-watch.service
 [Unit]
 Description=soakctl watch (updates soak beads, records crash-as-data)
+
 [Service]
 Type=oneshot
 # Cap-drift guard (spec Q14/C8): a silently lost cap would misattribute a crash.
-ExecStart=/bin/sh -c '/usr/local/libexec/favored-core-cap.sh assert || echo "CAP-DRIFT $(date -u +%%FT%%TZ)"'
+# FAVORED_CORE_EXPECT=on (S1, default) checks the cap is present; =off (S3) checks the pre-S1 limits are back.
+EnvironmentFile=-%h/.config/soak-watch.env
+# $$ makes systemd pass a literal $ to sh, so the shell (not systemd, which has no :- default syntax) expands the variable.
+ExecStart=/bin/sh -c 'm=assert; [ "$${FAVORED_CORE_EXPECT:-on}" = off ] && m=assert-off; /usr/local/libexec/favored-core-cap.sh "$$m" || echo "CAP-DRIFT expect=$${FAVORED_CORE_EXPECT:-on} $$(date -u +%%FT%%TZ)"'
 ExecStart=%h/.local/bin/soakctl watch
 ```
 
@@ -707,7 +735,7 @@ Order is a gate ladder; do not skip forward.
 2. **W1b BIOS (operator may decline, spec § 7):** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11. If declined: comment `PL1 declined` on bd-dea.10, use `PL1=253W-declined` in the W5 config string, and read the S3 outcome with its cap-only branch.
 3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
 4. **W3 SysRq-c proof** (requires P6a; still drained — re-check `docker ps --filter label=ezgha=managed` = 0 and the unit still disabled after the memtest reboot; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4 (if the kdump kernel's boot is not persisted in the journal as `-b -1`, C4 fails closed; the fallback evidence is `/var/crash/<ts>/dmesg.<ts>` written by kdump-tools, which the operator records instead), then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`; the report must show `PANIC:`, `sysrq_handle_crash` in `bt`, a `bt -e` section and a `dis -r` header with `frame_source=` (the fallback label is expected: a SysRq panic has no exception block), and load in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym, `crash`/`makedumpfile` version), reboot, repeat once; record the outcome in bd-dea.10. Do not repeat the SysRq for a missing exception block: that is the expected shape of a SysRq dump.
-5. **W4 (OPERATOR-ONLY; requires user_scope bead bd-lck merged and installed, so that `apply` writes the durable `/var/lib/favored-core-cap/cpuN` record C5 checks):** if the operator approved P6b (and W3 passed), run Task 7 again without `--no-panic-sysctls` → C1; if P6b was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and add `P6b declined` to the W5 config string; if P6a was declined, record C3/C4/C10 as `WAIVED (P6a declined)`; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/x86/sched_itmt_enabled` must print `Y` → C6.
+5. **W4 (OPERATOR-ONLY; bd-lck is merged as user_scope PR #57 and installed, so `apply` writes the durable `/var/lib/favored-core-cap/cpuN` record C5 checks):** if the operator approved P6b (and W3 passed), run Task 7 again without `--no-panic-sysctls` → C1; if P6b was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and add `P6b declined` to the W5 config string; if P6a was declined, record C3/C4/C10 as `WAIVED (P6a declined)`; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/x86/sched_itmt_enabled` must print `Y` → C6.
 
 ---
 
