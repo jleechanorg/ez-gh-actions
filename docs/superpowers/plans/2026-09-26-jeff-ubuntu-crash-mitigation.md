@@ -8,7 +8,7 @@
 
 **Tech Stack:** bash, systemd (system + user), sysctl, netconsole/netpoll, launchd (MacBook), `crash` 8.0.4 + Ubuntu dbgsym, `soakctl`, pytest (user_scope test convention).
 
-**Implemented in user_scope PR #56** (branch `feat/jeff-ubuntu-crash-capture`, merged 126c1fb) **and PR #57** (bd-lck: durable pre-S1 record, `assert-off`, soak-watch `FAVORED_CORE_EXPECT` switch; merged). Tests live in per-task files there, not in one shared `tests/test_crash_capture_artifacts.py` as the task blocks below originally showed: `tests/test_crash_capture_sysctl.py`, `tests/test_favored_core_cap.py`, `tests/test_netconsole_artifacts.py`, `tests/test_soak_watch.py`, `tests/test_vmcore_triage.py`, `tests/test_install_crash_capture.py` (56 tests, root-free). Where a task block's test snippet and the PR differ, the PR is canonical.
+**Implemented in user_scope PR #56** (branch `feat/jeff-ubuntu-crash-capture`, merged 126c1fb) **and PR #57** (bd-lck: durable pre-S1 record, `assert-off`, soak-watch `FAVORED_CORE_EXPECT` switch; merged) **and PR #58** (the `/run` revert value is seeded from the durable record after a reboot; merged). Tests live in per-task files there, not in one shared `tests/test_crash_capture_artifacts.py` as the task blocks below originally showed: `tests/test_crash_capture_sysctl.py`, `tests/test_favored_core_cap.py`, `tests/test_netconsole_artifacts.py`, `tests/test_soak_watch.py`, `tests/test_vmcore_triage.py`, `tests/test_install_crash_capture.py` (56 tests, root-free). Where a task block's test snippet and the PR differ, the PR is canonical.
 
 **Preconditions (spec § 11):** P1 sudo for Tasks 7–9; P2 human present for W1/W3; P3 `eno2` adjacency (Task 4, under sudo in W0); P5 dbgsym with matching Build ID (Task 6, no root) is a hard gate before W3; P6a (SysRq proof) and P6b (lockup/panic sysctls) operator approvals.
 
@@ -226,13 +226,18 @@ for c in $CPUS; do
             # existing empty record (interrupted write) stops the run instead of being replaced.
             if ! (
               flock -x 9
-              [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c" || { echo "FAIL S1-cap cpu$c could not write $SAVE_DIR/cpu$c; cap NOT applied"; exit 1; }
+              # Order matters: validate/create the durable pre-S1 record FIRST, so an empty record
+              # (interrupted write) aborts before anything is written to /run; then seed the /run
+              # revert value from that record. /run is empty after every reboot, so a boot-time
+              # apply on an already-capped core must never record the capped value as the thing
+              # to restore.
               if [ -e "$rec" ]; then
                 [ -s "$rec" ] || { echo "FAIL S1-cap cpu$c durable record $rec is empty (interrupted write); inspect before re-applying"; exit 1; }
               else
                 ( set -C; cat "$f/scaling_max_freq" > "$rec" ) 2>/dev/null || { echo "FAIL S1-cap cpu$c could not write durable record $rec; cap NOT applied"; exit 1; }
                 [ -s "$rec" ] || { echo "FAIL S1-cap cpu$c durable record $rec empty after write; cap NOT applied"; exit 1; }
               fi
+              [ -f "$SAVE_DIR/cpu$c" ] || cp "$rec" "$SAVE_DIR/cpu$c" || { echo "FAIL S1-cap cpu$c could not write $SAVE_DIR/cpu$c; cap NOT applied"; exit 1; }
               cur=$(cat "$f/scaling_max_freq")
               # Non-increasing: never raise a limit that is already below the cap.
               if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi
