@@ -385,18 +385,39 @@ def test_vmcore_triage_emits_evidence_blocks_and_never_decides_alone():
 ```bash
 #!/usr/bin/env bash
 # scripts/vmcore-triage.sh <dump.<ts>> [vmlinux]
-# Prints the spec § 5 evidence blocks from `crash` and ends with an INCONCLUSIVE
-# line; a human applies the § 5 table and a second reviewer concurs (C12).
+#
+# Prints the spec § 5 evidence blocks from `crash` and ends with an
+# INCONCLUSIVE line; a human applies the § 5 table and a second reviewer
+# concurs (C12). This script NEVER classifies a crash as
+# CONTROL-FLOW-MISMATCH / BAD-TARGET-CONSUMED / UAF-SUPPORTED — that
+# judgment is spec § 5's, made by a human reading the evidence report.
+#
+# Testability: set CRASH_BIN to point at a fake `crash` binary (tests use
+# one that echoes canned output) instead of the real /usr/bin/crash, so this
+# script is exercisable without a real vmcore.
+# Intentionally omits -e (unlike every sibling script's `set -euo pipefail`):
+# the frame/RIP/fault `grep -m1 -oE` extractions below (lines ~46-58) are
+# expected to return no match on some real `crash` output shapes, and an
+# empty extraction must fall through to the INCONCLUSIVE/human-review path
+# below rather than aborting the script. The PANIC:/crash-could-not-load
+# checks already fail safely without -e.
 set -uo pipefail
-dump="${1:-}"; kver="$(uname -r)"
+
+dump="${1:-}"
+kver="$(uname -r)"
 # Dumps are root-owned, so this often runs under sudo where $HOME is /root; look in the invoking user's home too.
-owner_home="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
+owner_home="$(getent passwd "${SUDO_USER:-${USER:-}}" 2>/dev/null | cut -d: -f6)"
+owner_home="${owner_home:-$HOME}"
 vmlinux="${2:-${VMLINUX:-$owner_home/.local/share/vmlinux/vmlinux-$kver}}"
-out="${TRIAGE_OUT:-$HOME/.local/state/vmcore-triage}"; mkdir -p "$out"
+crash_bin="${CRASH_BIN:-crash}"
+out="${TRIAGE_OUT:-$HOME/.local/state/vmcore-triage}"
+mkdir -p "$out"
 rep="$out/triage-$(date +%Y%m%dT%H%M%S).txt"
+
 [ -r "$dump" ] || { echo "VERDICT: INCONCLUSIVE reason=dump-unreadable $dump"; exit 1; }
 [ -r "$vmlinux" ] || { echo "VERDICT: INCONCLUSIVE reason=vmlinux-missing $vmlinux (Task 6 step 4)"; exit 1; }
-crash -s "$vmlinux" "$dump" > "$rep" 2>&1 <<'EOF'
+
+"$crash_bin" -s "$vmlinux" "$dump" > "$rep" 2>&1 <<'EOF'
 sys
 log | tail -120
 bt
@@ -407,27 +428,50 @@ ps -A | head -40
 runq
 quit
 EOF
+
 grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load report=$rep"; exit 1; }
-# Frame #1's return address is the instruction after the call that jumped to the bad RIP.
-# In `crash` bt output the bracketed value is the frame STACK address; the instruction
-# address is the one after "at" — that is what dis -r needs.
-ret=$(grep -m1 -E "^ *#1 " "$rep" | grep -oE " at ffffffff[0-9a-f]+" | awk '{print $2}' | head -1)
-rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:[0-9a-f]+" "$rep" | awk -F: '{print $3}')
+
+# Which frame? For the panicking task `crash` numbers the panic machinery first
+# (#0 machine_kexec, #1 __crash_kexec, ... asm_exc_page_fault) and then prints the
+# interrupted context as an "[exception RIP: ...]" block followed by its saved
+# registers. The frame we need — the caller whose return address sits right after
+# the call that reached the bad RIP — is the FIRST frame printed AFTER that block.
+# In `bt` output the bracketed value is the frame's STACK address; the instruction
+# (return) address is the one after "at", which is what `dis -r` needs.
+ret=$(awk '/\[exception RIP:/{f=1; next} f && /^ *#[0-9]+ .* at ffffffff[0-9a-f]+/{ match($0, / at ffffffff[0-9a-f]+/); print substr($0, RSTART+4, RLENGTH-4); exit }' "$rep")
+frame_source="first-frame-after-exception-block"
+if [ -z "$ret" ]; then
+  # No exception block (e.g. crash on a non-panic task or truncated bt): fall back to
+  # frame #1 and say so, because #1 may be panic machinery — the human must check.
+  ret=$(grep -m1 -E "^ *#1 " "$rep" | grep -oE " at ffffffff[0-9a-f]+" | awk '{print $2}')
+  frame_source="fallback-frame-1-verify-manually"
+fi
+# RIP: prefer the saved-register line of the exception block ("RIP: <hex>  RSP: ...",
+# any run of whitespace before RSP:); fall back to the oops form "RIP: 0010:0x283" /
+# "RIP: 0010:sym+0x10" only when its tail is bare hex (unresolved symbol).
+rip=$(grep -m1 -oE "RIP: [0-9a-f]+[[:space:]]+RSP:" "$rep" | awk '{print $2}')
+if [ -z "$rip" ]; then
+  rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:(0x)?[0-9a-f]+" "$rep" | awk -F: '{print $3}' | sed 's/^0x//')
+fi
 fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
+
 {
-  echo "### call-site disassembly (last line is the transfer instruction), ret=$ret rip=$rip fault=$fault"
-  crash -s "$vmlinux" "$dump" 2>&1 <<EOF
+  echo "### call-site disassembly (last line is the transfer instruction): dis -r $ret [frame_source=$frame_source], then kmem $rip, kmem $fault"
+  "$crash_bin" -s "$vmlinux" "$dump" 2>&1 <<EOF2
 dis -r $ret
 kmem $rip
 kmem $fault
 quit
-EOF
+EOF2
 } >> "$rep"
+
 if grep -q "sysrq_handle_crash" "$rep"; then
-  echo "VERDICT: INCONCLUSIVE reason=sysrq-induced (capture proof, not a real crash) report=$rep"; exit 0
+  echo "VERDICT: INCONCLUSIVE reason=sysrq-induced (capture proof, not a real crash) report=$rep"
+  exit 0
 fi
+
 echo "evidence: $rep"
-echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see 'bt -r' and the dis -r block); for memory-sourced operands run: crash -s $vmlinux $dump  then  rd -x <addr> 1"
+echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see the [exception RIP:] register block printed by bt, bt -e, and the dis -r block; frame_source=$frame_source); for memory-sourced operands run: $crash_bin -s $vmlinux $dump  then  rd -x <addr> 1"
 echo "VERDICT: INCONCLUSIVE reason=human-review-required report=$rep"
 exit 0
 ```
@@ -524,7 +568,7 @@ Record the start in bd-dea.10 and in `~/roadmap/jeff-ubuntu/design-2026-09-26-cr
 
 ## Task 10: After a crash or at 200 h / 400 h — decision execution
 
-- **Crash:** within 24 h run Task 6's script on the newest dump, apply spec § 5 steps 1–2 to the report (reconstruct the transfer from the `dis -r` block; compare `RIP` with the `pt_regs` register or re-read immediate/trampoline; for UAF-SUPPORTED, demonstrate the lifetime violation with `kmem`, list walks, and the pre-crash teardown log), and post `S1 CLASS <CONTROL-FLOW-MISMATCH|BAD-TARGET-CONSUMED|UAF-SUPPORTED> <n>` or `S1 INCONCLUSIVE <gap>` with the report path to bd-dea.10. Ask Codex to re-read the same report and add a concurring or dissenting `br` comment (C12). Only spec § 5 step 3 (two dumps, or one plus corroboration) opens an S2 bead; a single class never does. The soak clock records elapsed as data.
+- **Crash:** within 24 h run Task 6's script on the newest dump, apply spec § 5 steps 1–2 to the report (reconstruct the transfer from the `dis -r` block, checking `frame_source=` is the first frame after the exception block; compare `RIP` with the `pt_regs` register or re-read immediate/trampoline; for UAF-SUPPORTED, demonstrate the lifetime violation with `kmem`, list walks, and the pre-crash teardown log), and post `S1 CLASS <CONTROL-FLOW-MISMATCH|BAD-TARGET-CONSUMED|UAF-SUPPORTED> <n>` or `S1 INCONCLUSIVE <gap>` with the report path to bd-dea.10. Ask Codex to re-read the same report and add a concurring or dissenting `br` comment (C12). Only spec § 5 step 3 (two dumps, or one plus corroboration) opens an S2 bead; a single class never does. The soak clock records elapsed as data.
 - **200 h clean:** `soakctl` target is extended by closing and restarting with `--target 400` and the same config string, noting "extension of <name>" in the reason.
 - **400 h clean:** post `S1 CLEAN 400h`, open the S3 reverse-test bead (revert the cap only, PL1 stays at Intel default, soak 200 h), and the S2c bead (TVB off, diagnostic tool, RMA path).
 
