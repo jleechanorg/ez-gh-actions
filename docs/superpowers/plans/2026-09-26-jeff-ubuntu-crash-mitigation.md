@@ -84,7 +84,8 @@ f=/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf
 # --pre: capture-readiness only (C2), used at W2 before the sysctl file exists.
 if [ "${1:-}" != "--pre" ]; then
   [ -f "$f" ] || { echo "FAIL C1-file $f missing"; exit 1; }
-  for kv in panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do
+  # The lockup panics only mean something if the detectors themselves are on.
+  for kv in watchdog:1 nmi_watchdog:1 soft_watchdog:1 panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do
     k=${kv%%:*}; want=${kv##*:}; got=$(sysctl -n "kernel.$k")
     [ "$got" = "$want" ] || { echo "FAIL C1 kernel.$k=$got want $want"; exit 1; }
   done
@@ -162,11 +163,12 @@ for c in $CPUS; do
   f="$SYSFS/cpu$c/cpufreq"
   case "$mode" in
     apply)  mkdir -p "$SAVE_DIR"; [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c"
-            echo "$CAP_KHZ" > "$f/scaling_max_freq" ;;
+            cur=$(cat "$f/scaling_max_freq")
+            if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi ;;   # non-increasing
     revert) if [ -f "$SAVE_DIR/cpu$c" ]; then cat "$SAVE_DIR/cpu$c" > "$f/scaling_max_freq"; rm -f "$SAVE_DIR/cpu$c"
             else cat "$f/cpuinfo_max_freq" > "$f/scaling_max_freq"; fi ;;
     assert) got=$(cat "$f/scaling_max_freq")
-            [ "$got" = "$CAP_KHZ" ] || { echo "FAIL S1-cap cpu$c scaling_max_freq=$got want $CAP_KHZ"; exit 1; } ;;
+            [ "$got" -le "$CAP_KHZ" ] || { echo "FAIL S1-cap cpu$c scaling_max_freq=$got want <= $CAP_KHZ"; exit 1; } ;;
     *) echo "usage: $0 apply|revert|assert" >&2; exit 2 ;;
   esac
 done

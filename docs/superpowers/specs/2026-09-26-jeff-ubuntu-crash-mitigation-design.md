@@ -56,7 +56,7 @@ Neither hypothesis is falsifiable from pstore text. A vmcore is: it shows whethe
 
 ### D1 — Probability reduction: restore Intel default PL1, then cap the two favored cores to the common 5.5 GHz bin (one combined H-HW mitigation)
 
-Set `scaling_max_freq=5500000` on cpu0–3 (runtime, sysfs, reverts in seconds, no reboot, no fleet impact). Rationale:
+Set `scaling_max_freq=5500000` on cpu0–3 (runtime, sysfs, reverts in seconds, no reboot, no fleet impact). The cap is non-increasing: a core whose limit is already below 5.5 GHz keeps it, and `assert` treats at-or-below the cap as capped. Rationale:
 
 1. It is the only lever that directly tests E3, the strongest statistical anomaly in the corpus.
 2. It keeps ITMT priority unchanged (priority derives from HWP highest-perf, not from `scaling_max_freq`), so scheduler steering toward cpu0–3 is constant and only the V/f point moves. It probes only one H-HW variant: the light-load top-turbo bin, which is exactly the state of an idle favored core woken by a softirq (24/26 crashes). It does not probe the idle/C-state exit-voltage variant; that is S2e (persistent `intel_idle.max_cstate=1`, bd-qy1). If crashes continue on cpu0–3 at 5.5 GHz, only the top-bin variant loses; if they stop for 400 h, H-HW gains strongly. The vmcore, not the cap, is the primary discriminator (§ 5).
@@ -215,7 +215,7 @@ Each check prints exactly one `PASS <id>` or `FAIL <id> …` line.
 
 | # | Criterion | Check | Verifier |
 |---|---|---|---|
-| C1 | Sysctl file installed and effective | `for k in panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do [ "$(sysctl -n kernel.${k%%:*})" = "${k##*:}" ] \|\| { echo "FAIL C1 $k"; exit 1; }; done; [ -f /etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf ] && echo PASS C1 \|\| echo FAIL C1-file` | Codex |
+| C1 | Sysctl file installed and effective, and the lockup detectors themselves are on | `for k in watchdog:1 nmi_watchdog:1 soft_watchdog:1 panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do [ "$(sysctl -n kernel.${k%%:*})" = "${k##*:}" ] \|\| { echo "FAIL C1 $k"; exit 1; }; done; [ -f /etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf ] && echo PASS C1 \|\| echo FAIL C1-file` | Codex |
 | C2 | kdump armed at the raised reservation after every reboot in scope | `[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] && [ "$(cat /sys/kernel/kexec_crash_size)" -ge 1610612736 ] && echo PASS C2 \|\| echo FAIL C2` | Codex |
 | C3 | SysRq-c produced a real dump | `d=$(ls -d /var/crash/2026* 2>/dev/null \| tail -1); [ -n "$d" ] && [ "$(stat -c %s "$d"/dump.* 2>/dev/null \| sort -n \| tail -1)" -ge 52428800 ] && echo "PASS C3 $d" \|\| echo FAIL C3` | Codex |
 | C4 | Box returned by itself after the SysRq-c test | journal of the boot after the test shows `kdump-tools` completed and no `systemctl reboot` by a human: `journalctl -b -1 -u kdump-tools-dump.service --no-pager \| grep -q "saved vmcore" && echo PASS C4 \|\| echo FAIL C4` | Codex |
