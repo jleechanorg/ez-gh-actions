@@ -324,7 +324,7 @@ exec nc -ukl 6666 >> "$LOG"
 
 ## Task 4: eno2 adjacency probe (Step 1 at W0b, Step 2 at W2; root) — decides whether netconsole ships
 
-**Step 1:** In window W0, as root: first duplicate-address detection, `ip link set eno2 up && arping -D -c 3 -I eno2 192.168.254.130` — any reply means the address is taken (ICMP silence is not proof; a host may ignore ping); abort and pick another `/32`. Then `ip addr replace 192.168.254.130/32 dev eno2 && arping -c 3 -I eno2 192.168.254.199`; a reply proves L2 adjacency.
+**Step 1:** In window W0, as root: `apt-get install -y iputils-arping` (not installed on the host), then duplicate-address detection, `ip link set eno2 up && arping -D -c 3 -I eno2 192.168.254.130` — any reply means the address is taken (ICMP silence is not proof; a host may ignore ping); abort and pick another `/32`. Then `ip addr replace 192.168.254.130/32 dev eno2 && arping -c 3 -I eno2 192.168.254.199`; a reply proves L2 adjacency.
 
 **Step 2 (W2, after Task 7 installs the unit):** probe delivery both ways: first with broadcast (default), then, if the MacBook log shows nothing within 5 s of `echo probe > /dev/kmsg`, with `NETCONSOLE_TGT_MAC=<current MacBook en0 MAC>` in the unit's environment. Record in bd-dea.10: `netconsole: OK (broadcast|mac)` or `netconsole: UNAVAILABLE (<reason>)`. If UNAVAILABLE, criterion C7 is recorded as `FAIL C7 unavailable-<reason>` and D2.4 is dropped; nothing else blocks.
 
@@ -501,9 +501,7 @@ exit 0
 
 ```bash
 mkdir -p ~/.local/share/vmlinux && cd /tmp
-# Preferred: Launchpad's tool resolves the exact ddeb name for the running ABI (ubuntu-dev-tools, no root):
-pull-lp-ddebs linux-image-6.17.0-29-generic 6.17.0-29.29~24.04.1 2>/dev/null || pull-lp-ddebs linux-image-unsigned-6.17.0-29-generic 6.17.0-29.29~24.04.1
-# Fallback: list the pool and pick whichever of the two names exists:
+# Primary: list the ddebs pool and pick whichever of the two names exists (pull-lp-ddebs is not installed here):
 curl -fsSL "http://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/" | grep -oE 'linux-image-(unsigned-)?6\.17\.0-29-generic-dbgsym_[^"]+_amd64\.ddeb' | sort -u
 dpkg -x linux-image-*6.17.0-29-generic-dbgsym_*.ddeb /tmp/dbg && cp /tmp/dbg/usr/lib/debug/boot/vmlinux-6.17.0-29-generic ~/.local/share/vmlinux/
 # Build-ID match against the running kernel:
@@ -564,7 +562,7 @@ Run order inside window W (spec § D4): W2 `sudo bash scripts/install-crash-capt
 
 Order is a gate ladder; do not skip forward.
 
-0. **W0 gates:** (a) Task 6 step 4 Build-ID match printed and the live-mode `crash` check passed; (b) Task 4 result recorded; (c) OPERATOR-ONLY: edit `/etc/default/grub.d/kdump-tools.cfg` so the crashkernel words read `crashkernel=1536M,high crashkernel=128M,low`, run `update-grub`, keep the `.bak-<date>` copy the earlier fixes left.
+0. **W0 gates:** (a) Task 6 step 4 Build-ID match printed and the live-mode `crash` check passed; (b) `apt-get install -y iputils-arping`, then Task 4 step 1 result recorded; (c) OPERATOR-ONLY: edit `/etc/default/grub.d/kdump-tools.cfg` so the crashkernel words read `crashkernel=1536M,high crashkernel=128M,low`, run `update-grub`, keep the `.bak-<date>` copy the earlier fixes left.
 1. **W1 memtest:** drain so that it survives the window's reboots: `systemctl --user disable --now ezgha.service` (enabled unit + `Linger=yes` would otherwise restart the fleet on every reboot); confirm `systemctl --user is-enabled ezgha.service` prints `disabled` and container count 0; `bash scripts/queue_memtest.sh` (existing) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501. **Any error: hard stop** — do not continue to W1b/W2/W3; open the RAM path (bd-hwpath28) and end the window.
 2. **W1b BIOS:** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11.
 3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
@@ -578,7 +576,7 @@ Order is a gate ladder; do not skip forward.
 ```bash
 systemctl --user enable --now ezgha.service        # re-enable: W1 disabled it so the drain survived reboots
 sleep 120 && ./doctor-runner                     # C9: 10 slots, none DOWN / IDLE-STARVED
-soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 200 --bead bd-dea.10 \
+soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 400 --bead bd-dea.10 \
   --config "6.17.0-29 nohz=off; PL1=125W; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; lockup panics=<on|P6b declined>; kdump armed 1536M; netconsole->macbook"
 soakctl status                                   # C8 (timer from Task 5 must be active)
 ```
@@ -590,7 +588,7 @@ Record the start in bd-dea.10 and in `~/roadmap/jeff-ubuntu/design-2026-09-26-cr
 ## Task 10: After a crash or at 200 h / 400 h — decision execution
 
 - **Crash:** within 24 h run Task 6's script on the newest dump, apply spec § 5 steps 1–2 to the report (reconstruct the transfer from the `dis -r` block, checking `frame_source=` is the first frame after the exception block; compare `RIP` with the `pt_regs` register or re-read immediate/trampoline; for UAF-SUPPORTED, demonstrate the lifetime violation with `kmem`, list walks, and the pre-crash teardown log), and post `S1 CLASS <CONTROL-FLOW-MISMATCH|BAD-TARGET-CONSUMED|UAF-SUPPORTED> <n>` or `S1 INCONCLUSIVE <gap>` with the report path to bd-dea.10. Ask Codex to re-read the same report and add a concurring or dissenting `br` comment (C12). Only spec § 5 step 3 (two dumps, or one plus corroboration) opens an S2 bead; a single class never does. The soak clock records elapsed as data.
-- **200 h clean:** `soakctl` target is extended by closing and restarting with `--target 400` and the same config string, noting "extension of <name>" in the reason.
+- **200 h checkpoint clean:** do not close or restart the soak (`soakctl` resets `started_epoch` on restart, which would push promotion to 600 h); record the checkpoint in bd-dea.10 and continue toward the 400 h target.
 - **400 h clean:** post `S1 CLEAN 400h`, open the S3 reverse-test bead (revert the cap only, PL1 stays at Intel default, soak 200 h), and the S2c bead (TVB off, diagnostic tool, RMA path).
 
 ---
