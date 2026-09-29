@@ -501,9 +501,12 @@ exit 0
 
 ```bash
 mkdir -p ~/.local/share/vmlinux && cd /tmp
-# Primary: list the ddebs pool and pick whichever of the two names exists (pull-lp-ddebs is not installed here):
-curl -fsSL "http://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/" | grep -oE 'linux-image-(unsigned-)?6\.17\.0-29-generic-dbgsym_[^"]+_amd64\.ddeb' | sort -u
-dpkg -x linux-image-*6.17.0-29-generic-dbgsym_*.ddeb /tmp/dbg && cp /tmp/dbg/usr/lib/debug/boot/vmlinux-6.17.0-29-generic ~/.local/share/vmlinux/
+# Primary: list the ddebs pool, pick whichever of the two names exists (pull-lp-ddebs is not installed here), download it, then extract:
+POOL="http://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/"
+DDEB=$(curl -fsSL "$POOL" | grep -oE 'linux-image-(unsigned-)?6\.17\.0-29-generic-dbgsym_[^"]+_amd64\.ddeb' | sort -u | head -1)
+[ -n "$DDEB" ] || { echo "no 6.17.0-29 dbgsym in the pool: P5 unmet"; exit 1; }
+curl -fLo "/tmp/$DDEB" "$POOL$DDEB"                      # ~1 GiB
+dpkg -x "/tmp/$DDEB" /tmp/dbg && cp /tmp/dbg/usr/lib/debug/boot/vmlinux-6.17.0-29-generic ~/.local/share/vmlinux/
 # Build-ID match against the running kernel:
 readelf -n ~/.local/share/vmlinux/vmlinux-6.17.0-29-generic | grep -o "Build ID: [0-9a-f]*"
 python3 - <<'PY'
