@@ -8,6 +8,8 @@
 
 **Tech Stack:** bash, systemd (system + user), sysctl, netconsole/netpoll, launchd (MacBook), `crash` 8.0.4 + Ubuntu dbgsym, `soakctl`, pytest (user_scope test convention).
 
+**Implemented in user_scope PR #56** (branch `feat/jeff-ubuntu-crash-capture`). Tests live in per-task files there, not in one shared `tests/test_crash_capture_artifacts.py` as the task blocks below originally showed: `tests/test_crash_capture_sysctl.py`, `tests/test_favored_core_cap.py`, `tests/test_netconsole_artifacts.py`, `tests/test_soak_watch.py`, `tests/test_vmcore_triage.py`, `tests/test_install_crash_capture.py` (56 tests, root-free). Where a task block's test snippet and the PR differ, the PR is canonical.
+
 **Preconditions (spec § 11):** P1 sudo for Tasks 7–9; P2 human present for W1/W3; P3 `eno2` adjacency (Task 4, under sudo in W0); P5 dbgsym with matching Build ID (Task 6, no root) is a hard gate before W3; P6a (SysRq proof) and P6b (lockup/panic sysctls) operator approvals.
 
 **Bead discipline:** commit prefix `claude/claude-fable-5-1:`; commit + push only; the deploy steps (Tasks 7–9) are run by the deploy-owner with the human, never by a dispatched sub-agent (ez-gh-actions CLAUDE.md single-writer rule applies to host mutation too).
@@ -400,19 +402,21 @@ WantedBy=timers.target
 - Create: `scripts/vmcore-triage.sh`
 - Modify: `tests/test_crash_capture_artifacts.py` (append)
 
-**Step 1: Test**
+**Step 1: Tests** — implemented as `tests/test_vmcore_triage.py` in user_scope PR #56 (per-task test files replaced the plan's original shared `tests/test_crash_capture_artifacts.py`). It drives the script with a fake `crash` binary (`CRASH_BIN`) that emits canned `bt` output per `FAKE_CRASH_VARIANT`: `sysrq`, `human-review`, `distinct-addrs`, `single-space-rip`, `no-panic`, `panic-then-fail`, `valid-symbol`. The canned outputs contain real-shaped panic-machinery frames (`#0 machine_kexec`, `#1 __crash_kexec`, `#2 asm_exc_page_fault`), an `[exception RIP: …]` block with a `RIP: <hex>  RSP:` register line, and post-exception frames with distinct bracket (stack) and `at` (instruction) addresses, so the frame-selection awk, the `at`-address extraction, the RIP regex (two-space and single-space forms), the valid-symbol branch, the SysRq short-circuit-after-disassembly, the nonzero `crash` exit, and the sudo `vmlinux` fallback are each exercised end-to-end. Tests:
 
-```python
-def test_vmcore_triage_emits_evidence_blocks_and_never_decides_alone():
-    src = (ROOT / "scripts/vmcore-triage.sh").read_text()
-    assert "VERDICT: INCONCLUSIVE reason=human-review-required" in src
-    assert "sysrq-induced" in src
-    assert "bt -e" in src and "dis -r" in src and "bt -r" not in src   # bt -r is raw stack data, not registers
-    for cls in ("CONTROL-FLOW-MISMATCH", "BAD-TARGET-CONSUMED", "UAF-SUPPORTED"):
-        assert f"VERDICT: {cls}" not in src   # the script never classifies; humans do (spec § 5)
-    subprocess.run(["bash", "-n", str(ROOT / "scripts/vmcore-triage.sh")], check=True)
-    r = subprocess.run([str(ROOT / "scripts/vmcore-triage.sh"), "/nonexistent"], capture_output=True, text=True)
-    assert r.returncode != 0 and "VERDICT: INCONCLUSIVE" in r.stdout
+```
+test_script_never_classifies_and_documents_taxonomy
+test_script_is_syntactically_valid_bash
+test_missing_dump_is_inconclusive_and_exits_nonzero
+test_missing_vmlinux_is_inconclusive_and_exits_nonzero
+test_sysrq_induced_capture_short_circuits_with_exit_zero
+test_human_review_required_reports_dis_r_and_exits_zero
+test_ret_extraction_uses_at_instruction_addr_not_bracket_stack_addr
+test_rip_extraction_tolerates_single_space_before_rsp
+test_crash_could_not_load_when_no_panic_line
+test_vmlinux_default_path_uses_invoking_users_home_under_sudo
+test_crash_nonzero_exit_after_panic_header_is_could_not_load
+test_valid_symbol_exception_disassembles_to_the_exception_rip
 ```
 
 **Step 2:** FAIL. **Step 3: Write**
