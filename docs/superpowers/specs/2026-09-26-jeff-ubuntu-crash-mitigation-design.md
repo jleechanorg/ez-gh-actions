@@ -120,7 +120,7 @@ Alternatives considered and their disposition:
 | Crash, vmcore | INCONCLUSIVE | Fix the capture gap named by the triage (dbgsym mismatch, truncated dump, crashkernel size), restart the same soak. If a second vmcore is also inconclusive, run S2d (ITMT off) as the next discriminator. |
 | Crash, no vmcore | — | If W3 ran: capture defect (fix and restart S1; do not change D1). If P6a was declined: capture was unproven, not dishonest; treat this crash as the capture test, fix the gap it exposed, restart S1. |
 | 200 h checkpoint clean | — | Continue the same soak (no restart); record the checkpoint in bd-dea.10. |
-| 400 h clean | H-HW supported as a class (combined PL1 + cap) | Reverse test S3: revert the cap only (PL1 stays at Intel default). Crash returns within 200 h on cpu0–3 → the cap is the operative change; make it permanent, apply S2c, open the RMA bead. No crash in 200 h → PL1 alone was sufficient; keep PL1, leave the cap off, still open the RMA bead (a chip that needed Intel defaults to stay up is a degraded chip). |
+| 400 h clean | H-HW supported as a class (combined PL1 + cap) | Reverse test S3: revert the cap only (PL1 stays at Intel default) and soak to the **same 400 h threshold** (a shorter S3 would be underpowered against a 400 h S1). Crash returns on cpu0–3 within 400 h → the cap is the operative change; make it permanent; then S2c/RMA opens only if that crash's vmcore is not UAF-SUPPORTED (a UAF-class recurrence re-opens the software branch instead). 400 h clean → PL1 alone was sufficient; keep PL1, leave the cap off, still open the RMA bead (a chip that needed Intel defaults to stay up is a degraded chip). Less than 400 h without a crash is inconclusive: keep waiting. |
 
 ## 5. Vmcore triage decision procedure
 
@@ -201,7 +201,7 @@ Why the exception is worth asking for: without 1–3 the Sep 26 crash froze the 
 | Q9 | When does memtest run? | W1, in the same drained window | Box is offline anyway; closes bd-memtest501. |
 | Q10 | Raise `crashkernel` pre-emptively? | Yes, to 1536 M high before W3 | Revised after `/web-advice`: Ubuntu documents OOM risk below the recommended size, and the dump is the whole point. |
 | Q11 | Where do artifacts live? | user_scope (`systemd/`, `scripts/`, `config/`, `tests/`) | E19 forbids them in ez-gh-actions; E20 shows the precedent. |
-| Q12 | Soak target / promotion? | 200 h / 400 h | E4 and the soak skill's target rules. |
+| Q12 | Soak target / promotion? | 400 h with a 200 h checkpoint, for S1 and for S3 | E4 and the soak skill's target rules; S3 must match S1's power to attribute. |
 | Q13 | Two changes in one window? | Yes: D2 (logging, no probability effect) + the combined H-HW pair D1 (PL1 restore + cap) | Logging does not change crash probability; PL1 restore is damage containment that must not wait; the S3 reverse test separates cap from PL1. |
 | Q14 | Soak watchdog? | user `soak-watch.timer` every 5 min, which also re-asserts the cap (`favored-core-cap.sh assert`) and logs a `CAP-DRIFT` line if it is gone | E18: `soakctl watch` is not scheduled today; a silently lost cap would misattribute a crash (Opus, round 2). |
 | Q15 | Design doc location? | Canonical here; pointer under `~/roadmap/jeff-ubuntu/` | The bead's acceptance path plus a git-reviewable canonical. |

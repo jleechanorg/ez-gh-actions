@@ -126,8 +126,8 @@ check_c1() {
 check_c2() {
   [ -f "$KEXEC_LOADED_FILE" ] || { echo "FAIL C2-file $KEXEC_LOADED_FILE missing"; exit 1; }
   [ -f "$KEXEC_SIZE_FILE" ] || { echo "FAIL C2-file $KEXEC_SIZE_FILE missing"; exit 1; }
-  loaded=$(cat "$KEXEC_LOADED_FILE")
-  size=$(cat "$KEXEC_SIZE_FILE")
+  loaded=$(cat "$KEXEC_LOADED_FILE" 2>/dev/null) || { echo "FAIL C2 $KEXEC_LOADED_FILE unreadable"; exit 1; }
+  size=$(cat "$KEXEC_SIZE_FILE" 2>/dev/null) || { echo "FAIL C2 $KEXEC_SIZE_FILE unreadable"; exit 1; }
   [ "$loaded" = "1" ] || { echo "FAIL C2 kexec_crash_loaded=$loaded want 1"; exit 1; }
   case "$size" in
     ''|*[!0-9]*) echo "FAIL C2 kexec_crash_size=$size not numeric"; exit 1 ;;
@@ -729,7 +729,7 @@ Record the start in bd-dea.10 and in `~/roadmap/jeff-ubuntu/design-2026-09-26-cr
 
 - **Crash:** within 24 h run Task 6's script on the newest dump, apply spec § 5 steps 1–2 to the report (reconstruct the transfer from the `dis -r` block, checking `frame_source=` is the first frame after the exception block; compare `RIP` with the `pt_regs` register or re-read immediate/trampoline; for UAF-SUPPORTED, demonstrate the lifetime violation with `kmem`, list walks, and the pre-crash teardown log), and post `S1 CLASS <CONTROL-FLOW-MISMATCH|BAD-TARGET-CONSUMED|UAF-SUPPORTED> <n>` or `S1 INCONCLUSIVE <gap>` with the report path to bd-dea.10. Ask Codex to re-read the same report and add a concurring or dissenting `br` comment (C12). Only spec § 5 step 3 (two dumps, or one plus corroboration) opens an S2 bead; a single class never does. The soak clock records elapsed as data.
 - **200 h checkpoint clean:** do not close or restart the soak (`soakctl` resets `started_epoch` on restart, which would push promotion to 600 h); record the checkpoint in bd-dea.10 and continue toward the 400 h target.
-- **400 h clean:** post `S1 CLEAN 400h` and open the S3 reverse-test bead (revert the cap only, PL1 stays at Intel default, soak 200 h). Do not open S2c yet: spec § D4 opens S2c only after S3 brings the crash back, and running S2c during S3 would confound the reverse test.
+- **400 h clean:** post `S1 CLEAN 400h` and open the S3 reverse-test bead (revert the cap only, PL1 stays at Intel default, soak to the same 400 h promotion threshold as S1). Do not open S2c yet: spec § D4 opens S2c only after S3 brings the crash back, and running S2c during S3 would confound the reverse test.
 
 ---
 
