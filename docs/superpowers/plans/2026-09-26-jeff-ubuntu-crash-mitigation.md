@@ -743,10 +743,17 @@ Order is a gate ladder; do not skip forward.
 
 ```bash
 systemctl --user enable --now ezgha.service        # re-enable: W1 disabled it so the drain survived reboots
-sleep 120 && ./doctor-runner                     # C9: 10 slots, none DOWN / IDLE-STARVED
+sleep 120 && ./doctor-runner                       # C9: 10 slots, none DOWN / IDLE-STARVED
+# Resolve the soak provenance from LIVE state, fail-closed (no placeholders reach soakctl):
+pl1_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw)
+case "$pl1_uw" in 125000000) pl1="PL1=125W" ;; 253000000) pl1="PL1=253W-declined" ;; *) echo "unexpected PL1 $pl1_uw: record W1b before starting"; exit 1 ;; esac
+if [ "$(sysctl -n kernel.softlockup_panic)" = 1 ] && [ "$(sysctl -n kernel.hardlockup_panic)" = 1 ] && [ "$(sysctl -n kernel.panic)" = 10 ]; then panics="lockup-panics=on"; else panics="lockup-panics=P6b-declined"; fi
+/usr/local/libexec/favored-core-cap.sh assert || { echo "cap not applied (W4 incomplete)"; exit 1; }
+[ "$(cat /sys/kernel/kexec_crash_size)" -ge 1610612736 ] || { echo "crashkernel reservation not 1.5 GiB (W0c reboot missing)"; exit 1; }
+nc=$(systemctl is-active netconsole-eno2.service 2>/dev/null || true); [ "$nc" = active ] && nc="netconsole=on" || nc="netconsole=WAIVED"
 soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 400 --bead bd-dea.10 \
-  --config "6.17.0-29 nohz=off; PL1=<125W|253W-declined>; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; lockup panics=<on|P6b declined>; kdump armed 1536M; netconsole->macbook"
-soakctl status                                   # C8 (timer from Task 5 must be active)
+  --config "$(uname -r) nohz=off; $pl1; cpu0-3 scaling_max<=5.5GHz; 10 ephemeral runners; $panics; kdump armed $(( $(cat /sys/kernel/kexec_crash_size) / 1048576 ))MiB; $nc"
+soakctl status                                     # C8 (timer from Task 5 must be active)
 ```
 
 Record the start in bd-dea.10 and in `~/roadmap/jeff-ubuntu/design-2026-09-26-crash-mitigation.md` § Status.
