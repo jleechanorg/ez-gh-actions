@@ -81,13 +81,18 @@ kernel.hung_task_panic = 0
 # scripts/assert-crash-capture.sh — read-only check of spec criteria C1/C2.
 set -euo pipefail
 f=/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf
-[ -f "$f" ] || { echo "FAIL C1-file $f missing"; exit 1; }
-for kv in panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do
-  k=${kv%%:*}; want=${kv##*:}; got=$(sysctl -n "kernel.$k")
-  [ "$got" = "$want" ] || { echo "FAIL C1 kernel.$k=$got want $want"; exit 1; }
-done
-echo "PASS C1"
-[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] && echo "PASS C2" || { echo "FAIL C2 kexec_crash_loaded=0"; exit 1; }
+# --pre: capture-readiness only (C2), used at W2 before the sysctl file exists.
+if [ "${1:-}" != "--pre" ]; then
+  [ -f "$f" ] || { echo "FAIL C1-file $f missing"; exit 1; }
+  for kv in panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do
+    k=${kv%%:*}; want=${kv##*:}; got=$(sysctl -n "kernel.$k")
+    [ "$got" = "$want" ] || { echo "FAIL C1 kernel.$k=$got want $want"; exit 1; }
+  done
+  echo "PASS C1"
+fi
+[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] || { echo "FAIL C2 kexec_crash_loaded=0"; exit 1; }
+size=$(cat /sys/kernel/kexec_crash_size)
+[ "$size" -ge 1610612736 ] && echo "PASS C2 kexec_crash_size=$size" || { echo "FAIL C2 kexec_crash_size=$size < 1610612736"; exit 1; }
 ```
 
 **Step 4: Run test to verify it passes**
@@ -119,7 +124,8 @@ def test_favored_core_cap_script_modes(tmp_path):
         d = tmp_path / f"cpu{c}/cpufreq"; d.mkdir(parents=True)
         (d / "cpuinfo_max_freq").write_text("5800000\n")
         (d / "scaling_max_freq").write_text("5800000\n")
-    env = {"FAVORED_CORE_SYSFS": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    (tmp_path / "cpu1/cpufreq/scaling_max_freq").write_text("5400000\n")   # a pre-existing lower limit must survive revert
+    env = {"FAVORED_CORE_SYSFS": str(tmp_path), "FAVORED_CORE_SAVE_DIR": str(tmp_path / "save"), "PATH": "/usr/bin:/bin"}
     s = str(ROOT / "scripts/favored-core-cap.sh")
     r = subprocess.run([s, "assert"], env=env, capture_output=True, text=True)
     assert r.returncode == 1 and "FAIL S1-cap" in r.stdout
@@ -129,6 +135,7 @@ def test_favored_core_cap_script_modes(tmp_path):
     assert r.returncode == 0 and r.stdout.startswith("PASS S1-cap")
     subprocess.run([s, "revert"], env=env, check=True)
     assert (tmp_path / "cpu0/cpufreq/scaling_max_freq").read_text().strip() == "5800000"
+    assert (tmp_path / "cpu1/cpufreq/scaling_max_freq").read_text().strip() == "5400000"
 
 def test_favored_core_unit_is_oneshot_with_revert():
     u = (ROOT / "systemd/favored-core-cap.service").read_text()
@@ -150,11 +157,14 @@ SYSFS="${FAVORED_CORE_SYSFS:-/sys/devices/system/cpu}"
 CAP_KHZ="${FAVORED_CORE_CAP_KHZ:-5500000}"
 CPUS="${FAVORED_CORE_CPUS:-0 1 2 3}"
 mode="${1:-assert}"
+SAVE_DIR="${FAVORED_CORE_SAVE_DIR:-/run/favored-core-cap}"   # original limits, restored on revert
 for c in $CPUS; do
   f="$SYSFS/cpu$c/cpufreq"
   case "$mode" in
-    apply)  echo "$CAP_KHZ" > "$f/scaling_max_freq" ;;
-    revert) cat "$f/cpuinfo_max_freq" > "$f/scaling_max_freq" ;;
+    apply)  mkdir -p "$SAVE_DIR"; [ -f "$SAVE_DIR/cpu$c" ] || cp "$f/scaling_max_freq" "$SAVE_DIR/cpu$c"
+            echo "$CAP_KHZ" > "$f/scaling_max_freq" ;;
+    revert) if [ -f "$SAVE_DIR/cpu$c" ]; then cat "$SAVE_DIR/cpu$c" > "$f/scaling_max_freq"; rm -f "$SAVE_DIR/cpu$c"
+            else cat "$f/cpuinfo_max_freq" > "$f/scaling_max_freq"; fi ;;
     assert) got=$(cat "$f/scaling_max_freq")
             [ "$got" = "$CAP_KHZ" ] || { echo "FAIL S1-cap cpu$c scaling_max_freq=$got want $CAP_KHZ"; exit 1; } ;;
     *) echo "usage: $0 apply|revert|assert" >&2; exit 2 ;;
@@ -288,7 +298,7 @@ exec nc -ukl 6666 >> "$LOG"
 
 ## Task 4: eno2 adjacency probe (W0b, root) — decides whether netconsole ships
 
-**Step 1:** In window W0, as root: `ip link set eno2 up && ip addr replace 192.168.254.130/32 dev eno2 && arping -c 3 -I eno2 192.168.254.199`. A reply proves L2 adjacency. Also confirm `192.168.254.130` is unused from the Wi-Fi side beforehand: `ping -c 1 -W 1 192.168.254.130` must fail (run before adding the address).
+**Step 1:** In window W0, as root: first duplicate-address detection, `ip link set eno2 up && arping -D -c 3 -I eno2 192.168.254.130` — any reply means the address is taken (ICMP silence is not proof; a host may ignore ping); abort and pick another `/32`. Then `ip addr replace 192.168.254.130/32 dev eno2 && arping -c 3 -I eno2 192.168.254.199`; a reply proves L2 adjacency.
 
 **Step 2:** Load the unit (Task 7) and probe delivery both ways: first with broadcast (default), then, if the MacBook log shows nothing within 5 s of `echo probe > /dev/kmsg`, with `NETCONSOLE_TGT_MAC=<current MacBook en0 MAC>` in the unit's environment. Record in bd-dea.10: `netconsole: OK (broadcast|mac)` or `netconsole: UNAVAILABLE (<reason>)`. If UNAVAILABLE, criterion C7 is recorded as `FAIL C7 unavailable-<reason>` and D2.4 is dropped; nothing else blocks.
 
@@ -385,11 +395,10 @@ runq
 quit
 EOF
 grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load report=$rep"; exit 1; }
-if grep -q "sysrq_handle_crash" "$rep"; then
-  echo "VERDICT: INCONCLUSIVE reason=sysrq-induced (capture proof, not a real crash) report=$rep"; exit 0
-fi
 # Frame #1's return address is the instruction after the call that jumped to the bad RIP.
-ret=$(grep -m1 -E "^ *#1 " "$rep" | grep -oE "\[ffffffff[0-9a-f]+\]" | tr -d '[]' | head -1)
+# In `crash` bt output the bracketed value is the frame STACK address; the instruction
+# address is the one after "at" — that is what dis -r needs.
+ret=$(grep -m1 -E "^ *#1 " "$rep" | grep -oE " at ffffffff[0-9a-f]+" | awk '{print $2}' | head -1)
 rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:[0-9a-f]+" "$rep" | awk -F: '{print $3}')
 fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
 {
@@ -401,6 +410,9 @@ kmem $fault
 quit
 EOF
 } >> "$rep"
+if grep -q "sysrq_handle_crash" "$rep"; then
+  echo "VERDICT: INCONCLUSIVE reason=sysrq-induced (capture proof, not a real crash) report=$rep"; exit 0
+fi
 echo "evidence: $rep"
 echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see 'bt -r' and the dis -r block); for memory-sourced operands run: crash -s $vmlinux $dump  then  rd -x <addr> 1"
 echo "VERDICT: INCONCLUSIVE reason=human-review-required report=$rep"
@@ -479,7 +491,7 @@ Order is a gate ladder; do not skip forward.
 2. **W1b BIOS:** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11.
 3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
 4. **W3 SysRq-c proof** (requires P6; still drained; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`, and the report loads in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym), reboot, repeat once; record the outcome in bd-dea.10.
-5. **W4:** run Task 7 again without `--no-panic-sysctls` → C1; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/sched/itmt_enabled` → C6.
+5. **W4:** if the operator approved P6, run Task 7 again without `--no-panic-sysctls` → C1; if P6 was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and add `P6 declined` to the W5 config string; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/sched/itmt_enabled` → C6.
 
 ---
 
@@ -489,7 +501,7 @@ Order is a gate ladder; do not skip forward.
 systemctl --user start ezgha.service
 sleep 120 && ./doctor-runner                     # C9: 10 slots, none DOWN / IDLE-STARVED
 soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 200 --bead bd-dea.10 \
-  --config "6.17.0-29 nohz=off; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; softlockup/hardlockup panic=1; kernel.panic=10; kdump armed 640MiB; netconsole->macbook"
+  --config "6.17.0-29 nohz=off; PL1=125W; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; lockup panics=<on|P6 declined>; kdump armed 1536M; netconsole->macbook"
 soakctl status                                   # C8 (timer from Task 5 must be active)
 ```
 
