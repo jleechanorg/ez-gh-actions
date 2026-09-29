@@ -479,14 +479,14 @@ grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-
 ret=$(awk '/\[exception RIP:/{f=1; next} f && /^ *#[0-9]+ .* at ffffffff[0-9a-f]+/{ match($0, / at ffffffff[0-9a-f]+/); print substr($0, RSTART+4, RLENGTH-4); exit }' "$rep")
 frame_source="first-frame-after-exception-block"
 # The heuristic holds when the exception RIP is NOT a valid text address (our class:
-# 0x283, 0x0, a freed page): crash cannot synthesize the interrupted function's own
-# frame, so the first frame after the block is the caller. When the exception RIP
-# resolves to a real symbol, that first frame is the interrupted function itself and
-# the faulting instruction is at the exception RIP; say so and disassemble there.
+# 0x283, 0x0, a freed page): crash cannot synthesize a frame for it, so the first frame
+# after the block carries the caller's return address. When the exception RIP resolves
+# to a real symbol, the faulting instruction is at the exception RIP; handled below.
 exc=$(grep -m1 -oE "\[exception RIP: [^]]*\]" "$rep")
+valid_symbol_exception=0
 case "$exc" in
   ""|*"unknown or invalid address"*) ;;
-  *) frame_source="exception-rip-is-a-valid-symbol:interrupted-function-not-caller" ;;
+  *) valid_symbol_exception=1 ;;
 esac
 if [ -z "$ret" ]; then
   # No exception block (e.g. crash on a non-panic task or truncated bt): fall back to
@@ -500,6 +500,14 @@ fi
 rip=$(grep -m1 -oE "RIP: [0-9a-f]+[[:space:]]+RSP:" "$rep" | awk '{print $2}')
 if [ -z "$rip" ]; then
   rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:(0x)?[0-9a-f]+" "$rep" | awk -F: '{print $3}' | sed 's/^0x//')
+fi
+# When the exception RIP resolves to a real symbol, the faulting instruction is at the
+# exception RIP itself, so disassemble up to and including it. Which function the first
+# post-exception frame belongs to is NOT asserted here (in crash's x86_64 bt it is often
+# the caller, taken from the return address at the exception RSP): confirm by hand.
+if [ "$valid_symbol_exception" = 1 ] && [ -n "$rip" ]; then
+  ret="$rip"
+  frame_source="exception-rip-is-a-valid-symbol:disassembling-to-the-faulting-instruction"
 fi
 fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
 
@@ -606,7 +614,11 @@ else
   stale="$SYSCTL_D/90-jeff-ubuntu-crash-capture.conf"
   if [ -f "$stale" ]; then
     rm -f "$stale"
-    echo "WARNING: removed stale $stale; the values it set stay live until the next boot or until the operator resets them"
+    # Do not leave the panic settings live on a declined path: restore the host's
+    # pre-P6b values (spec E8: softlockup_panic=0, hardlockup_panic=0, panic=0;
+    # panic_on_oops is owned by kdump-config and is left alone).
+    "$SYSCTL_BIN" -q -w kernel.softlockup_panic=0 kernel.hardlockup_panic=0 kernel.panic=0
+    echo "WARNING: removed stale $stale and restored kernel.softlockup_panic=0 kernel.hardlockup_panic=0 kernel.panic=0 (pre-P6b values)"
   fi
 fi
 
