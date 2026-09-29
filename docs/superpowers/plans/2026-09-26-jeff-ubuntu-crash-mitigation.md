@@ -749,15 +749,35 @@ Order is a gate ladder; do not skip forward.
 ```bash
 systemctl --user enable --now ezgha.service        # re-enable: W1 disabled it so the drain survived reboots
 sleep 120 && ./doctor-runner                       # C9: 10 slots, none DOWN / IDLE-STARVED
-# Resolve the soak provenance from LIVE state, fail-closed (no placeholders reach soakctl):
+# Resolve the soak provenance from LIVE state. Every field has exactly two legitimate states,
+# each backed by a record; anything else ABORTS (no unexpected state is ever relabelled).
+BEADS=/home/jleechan/projects_other/user_scope/.beads/beads.db
+notes=$(br --db "$BEADS" show bd-dea.10 2>/dev/null)
+# PL1: 125 W, or 253 W only with an explicit "PL1 declined" record on bd-dea.10.
 pl1_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw)
-case "$pl1_uw" in 125000000) pl1="PL1=125W" ;; 253000000) pl1="PL1=253W-declined" ;; *) echo "unexpected PL1 $pl1_uw: record W1b before starting"; exit 1 ;; esac
-if [ "$(sysctl -n kernel.softlockup_panic)" = 1 ] && [ "$(sysctl -n kernel.hardlockup_panic)" = 1 ] && [ "$(sysctl -n kernel.panic)" = 10 ]; then panics="lockup-panics=on"; else panics="lockup-panics=P6b-declined"; fi
-/usr/local/libexec/favored-core-cap.sh assert || { echo "cap not applied (W4 incomplete)"; exit 1; }
-[ "$(cat /sys/kernel/kexec_crash_size)" -ge 1610612736 ] || { echo "crashkernel reservation not 1.5 GiB (W0c reboot missing)"; exit 1; }
-nc=$(systemctl is-active netconsole-eno2.service 2>/dev/null || true); [ "$nc" = active ] && nc="netconsole=on" || nc="netconsole=WAIVED"
+case "$pl1_uw" in
+  125000000) pl1="PL1=125W" ;;
+  253000000) echo "$notes" | grep -q "PL1 declined" && pl1="PL1=253W-declined" || { echo "ABORT: PL1 is 253 W but bd-dea.10 has no 'PL1 declined' record (W1b not done or not recorded)"; exit 1; } ;;
+  *) echo "ABORT: unexpected PL1 $pl1_uw uW"; exit 1 ;;
+esac
+# Lockup panics: all three on (P6b approved, file present) or all three at the E8 values with no file (P6b declined, recorded); partial drift aborts.
+sl=$(sysctl -n kernel.softlockup_panic); hl=$(sysctl -n kernel.hardlockup_panic); kp=$(sysctl -n kernel.panic); f=/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf
+if [ "$sl$hl$kp" = "1110" ] && [ -f "$f" ]; then panics="lockup-panics=on"
+elif [ "$sl$hl$kp" = "000" ] && [ ! -f "$f" ] && echo "$notes" | grep -q "P6b declined"; then panics="lockup-panics=P6b-declined"
+else echo "ABORT: lockup-panic state softlockup=$sl hardlockup=$hl panic=$kp file=$([ -f "$f" ] && echo present || echo absent) matches neither the approved nor the recorded-declined state"; exit 1; fi
+[ "$(sysctl -n kernel.watchdog)$(sysctl -n kernel.nmi_watchdog)$(sysctl -n kernel.soft_watchdog)" = "111" ] || { echo "ABORT: a lockup detector is off"; exit 1; }
+# Cap, capture, netconsole: each must be in a proven state or an explicitly recorded waived state.
+/usr/local/libexec/favored-core-cap.sh assert || { echo "ABORT: cap not applied (W4 incomplete)"; exit 1; }
+for c in 0 1 2 3; do [ -s /var/lib/favored-core-cap/cpu$c ] || { echo "ABORT: no durable pre-S1 record for cpu$c"; exit 1; }; done
+[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] || { echo "ABORT: kdump not armed"; exit 1; }
+[ "$(cat /sys/kernel/kexec_crash_size)" -ge 1610612736 ] || { echo "ABORT: crashkernel reservation below 1.5 GiB (W0c reboot missing)"; exit 1; }
+if echo "$notes" | grep -q "P6a declined"; then capture="capture-proof=WAIVED-P6a"; elif ls /var/crash/2026*/dump.* >/dev/null 2>&1; then capture="capture-proof=W3"; else echo "ABORT: no W3 dump and no 'P6a declined' record"; exit 1; fi
+ncs=$(systemctl is-active netconsole-eno2.service 2>/dev/null || true); nce=$(systemctl is-enabled netconsole-eno2.service 2>/dev/null || true)
+if [ "$ncs" = active ] && [ "$nce" = enabled ]; then nc="netconsole=on"
+elif [ "$ncs" != active ] && [ "$nce" = disabled ] && echo "$notes" | grep -q "netconsole: UNAVAILABLE"; then nc="netconsole=WAIVED"
+else echo "ABORT: netconsole unit is $ncs/$nce without a matching record (a failed unit is not a waiver)"; exit 1; fi
 soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 400 --bead bd-dea.10 \
-  --config "$(uname -r) nohz=off; $pl1; cpu0-3 scaling_max<=5.5GHz; 10 ephemeral runners; $panics; kdump armed $(( $(cat /sys/kernel/kexec_crash_size) / 1048576 ))MiB; $nc"
+  --config "$(uname -r) nohz=off; $pl1; cpu0-3 scaling_max<=5.5GHz; 10 ephemeral runners; $panics; $capture; kdump armed $(( $(cat /sys/kernel/kexec_crash_size) / 1048576 ))MiB; $nc"
 soakctl status                                     # C8 (timer from Task 5 must be active)
 ```
 
