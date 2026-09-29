@@ -255,22 +255,39 @@ def test_netconsole_receiver_template_uses_home_placeholder():
 ```bash
 #!/usr/bin/env bash
 # scripts/netconsole-eno2.sh — load netconsole on the idle wired NIC (bd-dea.10 D2.4).
-# Source address is synthetic (netpoll does not use the routing table); target MAC
-# omitted => Ethernet broadcast, so a rotating MacBook MAC cannot break delivery.
+# The /32 source address lives on the interface (kernel docs: src-ip is an interface address);
+# target MAC omitted => Ethernet broadcast, so a rotating MacBook MAC cannot break delivery.
 set -euo pipefail
+
 DEV="${NETCONSOLE_DEV:-eno2}"
 SRC="${NETCONSOLE_SRC_IP:-192.168.254.130}"
 TGT="${NETCONSOLE_TGT_IP:-192.168.254.199}"
 TGT_MAC="${NETCONSOLE_TGT_MAC:-}"        # empty => Ethernet broadcast (switches may suppress; T4 proves)
+
+# Overridable so this script is testable without root (fake binaries + a scratch kmsg path).
+IP_BIN="${IP_BIN:-ip}"
+MODPROBE_BIN="${MODPROBE_BIN:-modprobe}"
+KMSG_PATH="${KMSG_PATH:-/dev/kmsg}"
 SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+WIFI="${NETCONSOLE_WIFI_DEV:-wlp0s20f3}"
+
+# "ip link set" brings the NIC up; "ip addr replace" adds a /32 host address
+# (kernel docs: src-ip must be an interface address; /32 adds no subnet route).
+mode="${1:-start}"
+if [ "$mode" = stop ]; then
+  # Undo everything start did: module, the /32, and the ARP sysctls (host default is 0).
+  "$MODPROBE_BIN" -r netconsole || true
+  "$IP_BIN" addr del "${SRC}/32" dev "$DEV" 2>/dev/null || true
+  "$SYSCTL_BIN" -q -w "net.ipv4.conf.${DEV}.arp_ignore=0" "net.ipv4.conf.${DEV}.arp_announce=0" "net.ipv4.conf.${WIFI}.arp_ignore=0"
+  exit 0
+fi
 # ARP hygiene first (spec D2.4): the host runs arp_ignore=0/arp_announce=0, so a second NIC on the
 # same segment would answer ARP for the Wi-Fi address and flap the router's entry mid-soak.
-WIFI="${NETCONSOLE_WIFI_DEV:-wlp0s20f3}"
 "$SYSCTL_BIN" -q -w "net.ipv4.conf.${DEV}.arp_ignore=1" "net.ipv4.conf.${DEV}.arp_announce=2" "net.ipv4.conf.${WIFI}.arp_ignore=1"
-ip link set "$DEV" up
-ip addr replace "${SRC}/32" dev "$DEV"   # kernel docs: src-ip must be an interface address; /32 adds no subnet route
-modprobe netconsole "netconsole=+6666@${SRC}/${DEV},6666@${TGT}/${TGT_MAC}"
-echo "netconsole-eno2: loaded $(date +%s)" > /dev/kmsg
+"$IP_BIN" link set "$DEV" up
+"$IP_BIN" addr replace "${SRC}/32" dev "$DEV"
+"$MODPROBE_BIN" netconsole "netconsole=+6666@${SRC}/${DEV},6666@${TGT}/${TGT_MAC}"
+echo "netconsole-eno2: loaded $(date +%s)" > "$KMSG_PATH"
 ```
 
 ```ini
@@ -285,7 +302,7 @@ Type=oneshot
 RemainAfterExit=yes
 EnvironmentFile=-/etc/default/netconsole-eno2
 ExecStart=/usr/local/libexec/netconsole-eno2.sh
-ExecStop=/sbin/modprobe -r netconsole
+ExecStop=/usr/local/libexec/netconsole-eno2.sh stop
 
 [Install]
 WantedBy=multi-user.target
@@ -461,6 +478,16 @@ grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-
 # (return) address is the one after "at", which is what `dis -r` needs.
 ret=$(awk '/\[exception RIP:/{f=1; next} f && /^ *#[0-9]+ .* at ffffffff[0-9a-f]+/{ match($0, / at ffffffff[0-9a-f]+/); print substr($0, RSTART+4, RLENGTH-4); exit }' "$rep")
 frame_source="first-frame-after-exception-block"
+# The heuristic holds when the exception RIP is NOT a valid text address (our class:
+# 0x283, 0x0, a freed page): crash cannot synthesize the interrupted function's own
+# frame, so the first frame after the block is the caller. When the exception RIP
+# resolves to a real symbol, that first frame is the interrupted function itself and
+# the faulting instruction is at the exception RIP; say so and disassemble there.
+exc=$(grep -m1 -oE "\[exception RIP: [^]]*\]" "$rep")
+case "$exc" in
+  ""|*"unknown or invalid address"*) ;;
+  *) frame_source="exception-rip-is-a-valid-symbol:interrupted-function-not-caller" ;;
+esac
 if [ -z "$ret" ]; then
   # No exception block (e.g. crash on a non-panic task or truncated bt): fall back to
   # frame #1 and say so, because #1 may be panic machinery — the human must check.
@@ -477,13 +504,18 @@ fi
 fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
 
 {
-  echo "### call-site disassembly (last line is the transfer instruction): dis -r $ret [frame_source=$frame_source], then kmem $rip, kmem $fault"
-  "$crash_bin" -s "$vmlinux" "$dump" 2>&1 <<EOF2
-dis -r $ret
-kmem $rip
-kmem $fault
-quit
-EOF2
+  echo "### call-site disassembly [frame_source=$frame_source] ret=$ret rip=$rip fault=$fault"
+  echo "### dis -r ADDR disassembles from the routine start UP TO AND INCLUDING ADDR: the LAST line is the"
+  echo "### instruction at the saved return PC; the TRANSFER (call/jmp) is the line immediately BEFORE it."
+  [ -n "$ret" ]   && echo "### command: dis -r $ret"
+  [ -n "$rip" ]   && echo "### command: kmem $rip"
+  [ -n "$fault" ] && echo "### command: kmem $fault"
+  {
+    [ -n "$ret" ]   && echo "dis -r $ret"
+    [ -n "$rip" ]   && echo "kmem $rip"
+    [ -n "$fault" ] && echo "kmem $fault"
+    echo "quit"
+  } | "$crash_bin" -s "$vmlinux" "$dump" 2>&1
 } >> "$rep"
 
 if grep -q "sysrq_handle_crash" "$rep"; then
@@ -492,7 +524,7 @@ if grep -q "sysrq_handle_crash" "$rep"; then
 fi
 
 echo "evidence: $rep"
-echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see the [exception RIP:] register block printed by bt, bt -e, and the dis -r block; frame_source=$frame_source); for memory-sourced operands run: $crash_bin -s $vmlinux $dump  then  rd -x <addr> 1"
+echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see the [exception RIP:] register block printed by bt, bt -e, and the dis -r block, whose transfer is the line BEFORE the last; frame_source=$frame_source); for memory-sourced operands run: $crash_bin -s $vmlinux $dump  then  rd -x <addr> 1"
 echo "VERDICT: INCONCLUSIVE reason=human-review-required report=$rep"
 exit 0
 ```
@@ -535,23 +567,60 @@ Precondition P6b: the operator has approved the lockup/panic sysctls in a live m
 #!/usr/bin/env bash
 # scripts/install-crash-capture.sh — root phase for bd-dea.10 D1/D2 artifacts.
 # OPERATOR-ONLY: sudo bash scripts/install-crash-capture.sh [--with-netconsole] [--no-panic-sysctls]
+#
+# Testable without root: DESTDIR-style overrides let tests redirect every
+# install target and stub the systemctl/sysctl binaries.
+#   SYSCTL_D=<dir>       default /etc/sysctl.d
+#   LIBEXEC_DIR=<dir>    default /usr/local/libexec
+#   SYSTEMD_DIR=<dir>    default /etc/systemd/system
+#   SYSTEMCTL_BIN=<bin>  default systemctl
+#   SYSCTL_BIN=<bin>     default sysctl
+#   SKIP_ROOT_CHECK=1    skip the `id -u` == 0 check (tests only)
 set -euo pipefail
-[ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 2; }
+
+[ "${SKIP_ROOT_CHECK:-0}" = "1" ] || [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 2; }
+
 R="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-with_nc=0; no_sysctl=0
-for a in "$@"; do case "$a" in --with-netconsole) with_nc=1;; --no-panic-sysctls) no_sysctl=1;; esac; done
+SYSCTL_D="${SYSCTL_D:-/etc/sysctl.d}"
+LIBEXEC_DIR="${LIBEXEC_DIR:-/usr/local/libexec}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+
+with_nc=0
+no_sysctl=0
+for a in "$@"; do
+  case "$a" in
+    --with-netconsole) with_nc=1 ;;
+    --no-panic-sysctls) no_sysctl=1 ;;
+    *) echo "unknown argument: $a" >&2; exit 2 ;;
+  esac
+done
+
 if [ "$no_sysctl" = 0 ]; then
-  install -m 0644 "$R/config/sysctl.d/90-jeff-ubuntu-crash-capture.conf" /etc/sysctl.d/
-  sysctl --system >/dev/null
+  install -D -m 0644 "$R/config/sysctl.d/90-jeff-ubuntu-crash-capture.conf" \
+    "$SYSCTL_D/90-jeff-ubuntu-crash-capture.conf"
+  "$SYSCTL_BIN" --system >/dev/null
+else
+  # A stale drop-in from an earlier approved install must not survive a declined P6b.
+  stale="$SYSCTL_D/90-jeff-ubuntu-crash-capture.conf"
+  if [ -f "$stale" ]; then
+    rm -f "$stale"
+    echo "WARNING: removed stale $stale; the values it set stay live until the next boot or until the operator resets them"
+  fi
 fi
-install -m 0755 "$R/scripts/favored-core-cap.sh" /usr/local/libexec/favored-core-cap.sh
-install -m 0644 "$R/systemd/favored-core-cap.service" /etc/systemd/system/
+
+install -D -m 0755 "$R/scripts/favored-core-cap.sh" "$LIBEXEC_DIR/favored-core-cap.sh"
+install -D -m 0644 "$R/systemd/favored-core-cap.service" "$SYSTEMD_DIR/favored-core-cap.service"
+
 if [ "$with_nc" = 1 ]; then
-  install -m 0755 "$R/scripts/netconsole-eno2.sh" /usr/local/libexec/netconsole-eno2.sh
-  install -m 0644 "$R/systemd/netconsole-eno2.service" /etc/systemd/system/
+  install -D -m 0755 "$R/scripts/netconsole-eno2.sh" "$LIBEXEC_DIR/netconsole-eno2.sh"
+  install -D -m 0644 "$R/systemd/netconsole-eno2.service" "$SYSTEMD_DIR/netconsole-eno2.service"
 fi
-systemctl daemon-reload
-[ "$with_nc" = 1 ] && systemctl enable --now netconsole-eno2.service
+
+"$SYSTEMCTL_BIN" daemon-reload
+[ "$with_nc" = 1 ] && "$SYSTEMCTL_BIN" enable --now netconsole-eno2.service
+
 echo "installed; favored-core-cap.service is NOT enabled yet (W4 does that after the SysRq-c proof)"
 ```
 
