@@ -215,12 +215,14 @@ def test_netconsole_script_has_no_mac_and_no_nm():
     assert "netconsole=+6666@" in src and "/eno2,6666@192.168.254.199/" in src
     assert not re.search(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", src)   # no hardcoded MAC
     assert "nmcli" not in src and "ip link set" in src and "ip addr replace" in src and "/32" in src
+    assert "arp_ignore=1" in src and "arp_announce=2" in src   # ARP flux guard, spec D2.4
     subprocess.run(["bash", "-n", str(ROOT / "scripts/netconsole-eno2.sh")], check=True)
 
 def test_netconsole_unit_orders_after_device():
     u = (ROOT / "systemd/netconsole-eno2.service").read_text()
     assert "After=sys-subsystem-net-devices-eno2.device" in u
     assert "BindsTo=sys-subsystem-net-devices-eno2.device" in u
+    assert "EnvironmentFile=-/etc/default/netconsole-eno2" in u
     assert "ExecStart=/usr/local/libexec/netconsole-eno2.sh" in u
 
 def test_netconsole_receiver_template_uses_home_placeholder():
@@ -242,6 +244,11 @@ DEV="${NETCONSOLE_DEV:-eno2}"
 SRC="${NETCONSOLE_SRC_IP:-192.168.254.130}"
 TGT="${NETCONSOLE_TGT_IP:-192.168.254.199}"
 TGT_MAC="${NETCONSOLE_TGT_MAC:-}"        # empty => Ethernet broadcast (switches may suppress; T4 proves)
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+# ARP hygiene first (spec D2.4): the host runs arp_ignore=0/arp_announce=0, so a second NIC on the
+# same segment would answer ARP for the Wi-Fi address and flap the router's entry mid-soak.
+WIFI="${NETCONSOLE_WIFI_DEV:-wlp0s20f3}"
+"$SYSCTL_BIN" -q -w "net.ipv4.conf.${DEV}.arp_ignore=1" "net.ipv4.conf.${DEV}.arp_announce=2" "net.ipv4.conf.${WIFI}.arp_ignore=1"
 ip link set "$DEV" up
 ip addr replace "${SRC}/32" dev "$DEV"   # kernel docs: src-ip must be an interface address; /32 adds no subnet route
 modprobe netconsole "netconsole=+6666@${SRC}/${DEV},6666@${TGT}/${TGT_MAC}"
@@ -258,6 +265,7 @@ After=sys-subsystem-net-devices-eno2.device
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+EnvironmentFile=-/etc/default/netconsole-eno2
 ExecStart=/usr/local/libexec/netconsole-eno2.sh
 ExecStop=/sbin/modprobe -r netconsole
 
@@ -364,7 +372,7 @@ def test_vmcore_triage_emits_evidence_blocks_and_never_decides_alone():
     src = (ROOT / "scripts/vmcore-triage.sh").read_text()
     assert "VERDICT: INCONCLUSIVE reason=human-review-required" in src
     assert "sysrq-induced" in src
-    assert "bt -r" in src and "dis -r" in src
+    assert "bt -e" in src and "dis -r" in src and "bt -r" not in src   # bt -r is raw stack data, not registers
     for cls in ("CONTROL-FLOW-MISMATCH", "BAD-TARGET-CONSUMED", "UAF-SUPPORTED"):
         assert f"VERDICT: {cls}" not in src   # the script never classifies; humans do (spec § 5)
     subprocess.run(["bash", "-n", str(ROOT / "scripts/vmcore-triage.sh")], check=True)
@@ -381,7 +389,9 @@ def test_vmcore_triage_emits_evidence_blocks_and_never_decides_alone():
 # line; a human applies the § 5 table and a second reviewer concurs (C12).
 set -uo pipefail
 dump="${1:-}"; kver="$(uname -r)"
-vmlinux="${2:-$HOME/.local/share/vmlinux/vmlinux-$kver}"
+# Dumps are root-owned, so this often runs under sudo where $HOME is /root; look in the invoking user's home too.
+owner_home="$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)"
+vmlinux="${2:-${VMLINUX:-$owner_home/.local/share/vmlinux/vmlinux-$kver}}"
 out="${TRIAGE_OUT:-$HOME/.local/state/vmcore-triage}"; mkdir -p "$out"
 rep="$out/triage-$(date +%Y%m%dT%H%M%S).txt"
 [ -r "$dump" ] || { echo "VERDICT: INCONCLUSIVE reason=dump-unreadable $dump"; exit 1; }
@@ -390,8 +400,8 @@ crash -s "$vmlinux" "$dump" > "$rep" 2>&1 <<'EOF'
 sys
 log | tail -120
 bt
+bt -e
 bt -f
-bt -r
 kmem -s | grep -E "cfs_rq|task_group|cgroup|psi|kmalloc-(64|96|128|192|256|512)"
 ps -A | head -40
 runq
@@ -441,7 +451,7 @@ while o+12<=len(d):
     o+=12+((n+3)&~3)+((s+3)&~3)
 PY
 ```
-Expected: the two Build IDs are identical; otherwise P5 is unmet and W3 must not run.
+Expected: the two Build IDs are identical; otherwise P5 is unmet and W3 must not run. Then (root) `sudo crash -s ~/.local/share/vmlinux/vmlinux-6.17.0-29-generic <<< 'sys' | head -5` must print the `KERNEL:`/`RELEASE:` block: the installed `crash` 8.0.4 was patched for 6.14 HWE dumps, not 6.17, so its ability to read this kernel is proven here, not assumed.
 
 **Step 5: Commit** `claude/claude-fable-5-1: add vmcore triage evidence script for bd-dea.10 § 5`.
 
@@ -489,8 +499,8 @@ Run order inside window W (spec § D4): W2 `sudo bash scripts/install-crash-capt
 
 Order is a gate ladder; do not skip forward.
 
-0. **W0 gates:** (a) Task 6 step 4 Build-ID match printed; (b) Task 4 result recorded; (c) OPERATOR-ONLY: edit `/etc/default/grub.d/kdump-tools.cfg` so the crashkernel words read `crashkernel=1536M,high crashkernel=128M,low`, run `update-grub`, keep the `.bak-<date>` copy the earlier fixes left.
-1. **W1 memtest:** drain so that it survives the window's reboots: `systemctl --user disable --now ezgha.service` (enabled unit + `Linger=yes` would otherwise restart the fleet on every reboot); confirm `systemctl --user is-enabled ezgha.service` prints `disabled` and container count 0; `bash scripts/queue_memtest.sh` (existing) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501.
+0. **W0 gates:** (a) Task 6 step 4 Build-ID match printed and the live-mode `crash` check passed; (b) Task 4 result recorded; (c) OPERATOR-ONLY: edit `/etc/default/grub.d/kdump-tools.cfg` so the crashkernel words read `crashkernel=1536M,high crashkernel=128M,low`, run `update-grub`, keep the `.bak-<date>` copy the earlier fixes left.
+1. **W1 memtest:** drain so that it survives the window's reboots: `systemctl --user disable --now ezgha.service` (enabled unit + `Linger=yes` would otherwise restart the fleet on every reboot); confirm `systemctl --user is-enabled ezgha.service` prints `disabled` and container count 0; `bash scripts/queue_memtest.sh` (existing) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501. **Any error: hard stop** — do not continue to W1b/W2/W3; open the RAM path (bd-hwpath28) and end the window.
 2. **W1b BIOS:** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11.
 3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
 4. **W3 SysRq-c proof** (requires P6; still drained — re-check `docker ps --filter label=ezgha=managed` = 0 and the unit still disabled after the memtest reboot; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`, and the report loads in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym), reboot, repeat once; record the outcome in bd-dea.10.
