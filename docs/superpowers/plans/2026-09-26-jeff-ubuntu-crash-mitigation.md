@@ -8,7 +8,7 @@
 
 **Tech Stack:** bash, systemd (system + user), sysctl, netconsole/netpoll, launchd (MacBook), `crash` 8.0.4 + Ubuntu dbgsym, `soakctl`, pytest (user_scope test convention).
 
-**Preconditions (spec § 11):** P1 sudo for Tasks 7–9; P2 human present for W1/W3; P3 `eno2` adjacency (Task 4, under sudo in W0); P5 dbgsym with matching Build ID (Task 6, no root) is a hard gate before W3; P6 operator exception for the lockup/panic sysctls and the SysRq proof.
+**Preconditions (spec § 11):** P1 sudo for Tasks 7–9; P2 human present for W1/W3; P3 `eno2` adjacency (Task 4, under sudo in W0); P5 dbgsym with matching Build ID (Task 6, no root) is a hard gate before W3; P6a (SysRq proof) and P6b (lockup/panic sysctls) operator approvals.
 
 **Bead discipline:** commit prefix `claude/claude-fable-5-1:`; commit + push only; the deploy steps (Tasks 7–9) are run by the deploy-owner with the human, never by a dispatched sub-agent (ez-gh-actions CLAUDE.md single-writer rule applies to host mutation too).
 
@@ -505,7 +505,7 @@ Expected: the two Build IDs are identical; otherwise P5 is unmet and W3 must not
 
 ## Task 7: Root-phase installer (human runs with sudo) — spec W2
 
-Precondition P6: the operator has approved the § 8 exception in a live message; otherwise run with `--no-panic-sysctls`, which skips the sysctl file.
+Precondition P6b: the operator has approved the lockup/panic sysctls in a live message and W3 (P6a) passed; otherwise run with `--no-panic-sysctls`, which skips the sysctl file.
 
 **Files:**
 - Create: `scripts/install-crash-capture.sh`
@@ -549,8 +549,8 @@ Order is a gate ladder; do not skip forward.
 1. **W1 memtest:** drain so that it survives the window's reboots: `systemctl --user disable --now ezgha.service` (enabled unit + `Linger=yes` would otherwise restart the fleet on every reboot); confirm `systemctl --user is-enabled ezgha.service` prints `disabled` and container count 0; `bash scripts/queue_memtest.sh` (existing) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501. **Any error: hard stop** — do not continue to W1b/W2/W3; open the RAM path (bd-hwpath28) and end the window.
 2. **W1b BIOS:** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11.
 3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
-4. **W3 SysRq-c proof** (requires P6; still drained — re-check `docker ps --filter label=ezgha=managed` = 0 and the unit still disabled after the memtest reboot; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`; the report must show `PANIC:`, `sysrq_handle_crash` in `bt`, a `bt -e` section and a `dis -r` header with `frame_source=` (the fallback label is expected: a SysRq panic has no exception block), and load in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym, `crash`/`makedumpfile` version), reboot, repeat once; record the outcome in bd-dea.10. Do not repeat the SysRq for a missing exception block: that is the expected shape of a SysRq dump.
-5. **W4:** if the operator approved P6, run Task 7 again without `--no-panic-sysctls` → C1; if P6 was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and add `P6 declined` to the W5 config string; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/sched/itmt_enabled` → C6.
+4. **W3 SysRq-c proof** (requires P6a; still drained — re-check `docker ps --filter label=ezgha=managed` = 0 and the unit still disabled after the memtest reboot; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`; the report must show `PANIC:`, `sysrq_handle_crash` in `bt`, a `bt -e` section and a `dis -r` header with `frame_source=` (the fallback label is expected: a SysRq panic has no exception block), and load in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym, `crash`/`makedumpfile` version), reboot, repeat once; record the outcome in bd-dea.10. Do not repeat the SysRq for a missing exception block: that is the expected shape of a SysRq dump.
+5. **W4:** if the operator approved P6b (and W3 passed), run Task 7 again without `--no-panic-sysctls` → C1; if P6b was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and add `P6b declined` to the W5 config string; if P6a was declined, record C3/C4/C10 as `WAIVED (P6a declined)`; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/x86/sched_itmt_enabled` must print `Y` → C6.
 
 ---
 
@@ -560,7 +560,7 @@ Order is a gate ladder; do not skip forward.
 systemctl --user enable --now ezgha.service        # re-enable: W1 disabled it so the drain survived reboots
 sleep 120 && ./doctor-runner                     # C9: 10 slots, none DOWN / IDLE-STARVED
 soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 200 --bead bd-dea.10 \
-  --config "6.17.0-29 nohz=off; PL1=125W; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; lockup panics=<on|P6 declined>; kdump armed 1536M; netconsole->macbook"
+  --config "6.17.0-29 nohz=off; PL1=125W; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; lockup panics=<on|P6b declined>; kdump armed 1536M; netconsole->macbook"
 soakctl status                                   # C8 (timer from Task 5 must be active)
 ```
 
