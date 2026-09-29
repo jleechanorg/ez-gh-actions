@@ -296,11 +296,11 @@ exec nc -ukl 6666 >> "$LOG"
 
 ---
 
-## Task 4: eno2 adjacency probe (W0b, root) — decides whether netconsole ships
+## Task 4: eno2 adjacency probe (Step 1 at W0b, Step 2 at W2; root) — decides whether netconsole ships
 
 **Step 1:** In window W0, as root: first duplicate-address detection, `ip link set eno2 up && arping -D -c 3 -I eno2 192.168.254.130` — any reply means the address is taken (ICMP silence is not proof; a host may ignore ping); abort and pick another `/32`. Then `ip addr replace 192.168.254.130/32 dev eno2 && arping -c 3 -I eno2 192.168.254.199`; a reply proves L2 adjacency.
 
-**Step 2:** Load the unit (Task 7) and probe delivery both ways: first with broadcast (default), then, if the MacBook log shows nothing within 5 s of `echo probe > /dev/kmsg`, with `NETCONSOLE_TGT_MAC=<current MacBook en0 MAC>` in the unit's environment. Record in bd-dea.10: `netconsole: OK (broadcast|mac)` or `netconsole: UNAVAILABLE (<reason>)`. If UNAVAILABLE, criterion C7 is recorded as `FAIL C7 unavailable-<reason>` and D2.4 is dropped; nothing else blocks.
+**Step 2 (W2, after Task 7 installs the unit):** probe delivery both ways: first with broadcast (default), then, if the MacBook log shows nothing within 5 s of `echo probe > /dev/kmsg`, with `NETCONSOLE_TGT_MAC=<current MacBook en0 MAC>` in the unit's environment. Record in bd-dea.10: `netconsole: OK (broadcast|mac)` or `netconsole: UNAVAILABLE (<reason>)`. If UNAVAILABLE, criterion C7 is recorded as `FAIL C7 unavailable-<reason>` and D2.4 is dropped; nothing else blocks.
 
 ---
 
@@ -318,6 +318,7 @@ def test_soak_watch_timer_every_5_min():
     s = (ROOT / "systemd/user/soak-watch.service").read_text()
     assert "OnUnitActiveSec=5min" in t and "WantedBy=timers.target" in t
     assert "ExecStart=%h/.local/bin/soakctl watch" in s
+    assert "favored-core-cap.sh assert" in s and "CAP-DRIFT" in s
 ```
 
 **Step 2:** FAIL. **Step 3: Write**
@@ -328,6 +329,8 @@ def test_soak_watch_timer_every_5_min():
 Description=soakctl watch (updates soak beads, records crash-as-data)
 [Service]
 Type=oneshot
+# Cap-drift guard (spec Q14/C8): a silently lost cap would misattribute a crash.
+ExecStart=/bin/sh -c '/usr/local/libexec/favored-core-cap.sh assert || echo "CAP-DRIFT $(date -u +%%FT%%TZ)"'
 ExecStart=%h/.local/bin/soakctl watch
 ```
 
@@ -487,10 +490,10 @@ Run order inside window W (spec § D4): W2 `sudo bash scripts/install-crash-capt
 Order is a gate ladder; do not skip forward.
 
 0. **W0 gates:** (a) Task 6 step 4 Build-ID match printed; (b) Task 4 result recorded; (c) OPERATOR-ONLY: edit `/etc/default/grub.d/kdump-tools.cfg` so the crashkernel words read `crashkernel=1536M,high crashkernel=128M,low`, run `update-grub`, keep the `.bak-<date>` copy the earlier fixes left.
-1. **W1 memtest:** drain (`systemctl --user stop ezgha.service`; container count 0); `bash scripts/queue_memtest.sh` (existing) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501.
+1. **W1 memtest:** drain so that it survives the window's reboots: `systemctl --user disable --now ezgha.service` (enabled unit + `Linger=yes` would otherwise restart the fleet on every reboot); confirm `systemctl --user is-enabled ezgha.service` prints `disabled` and container count 0; `bash scripts/queue_memtest.sh` (existing) → reboot into Memtest86+ → ≥ 4 passes → photo → comment on bd-memtest501.
 2. **W1b BIOS:** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11.
 3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
-4. **W3 SysRq-c proof** (requires P6; still drained; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`, and the report loads in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym), reboot, repeat once; record the outcome in bd-dea.10.
+4. **W3 SysRq-c proof** (requires P6; still drained — re-check `docker ps --filter label=ezgha=managed` = 0 and the unit still disabled after the memtest reboot; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4, then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`, and the report loads in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym), reboot, repeat once; record the outcome in bd-dea.10.
 5. **W4:** if the operator approved P6, run Task 7 again without `--no-panic-sysctls` → C1; if P6 was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and add `P6 declined` to the W5 config string; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/sched/itmt_enabled` → C6.
 
 ---
@@ -498,7 +501,7 @@ Order is a gate ladder; do not skip forward.
 ## Task 9: W5 — start the fleet and the soak
 
 ```bash
-systemctl --user start ezgha.service
+systemctl --user enable --now ezgha.service        # re-enable: W1 disabled it so the drain survived reboots
 sleep 120 && ./doctor-runner                     # C9: 10 slots, none DOWN / IDLE-STARVED
 soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 200 --bead bd-dea.10 \
   --config "6.17.0-29 nohz=off; PL1=125W; cpu0-3 scaling_max 5.5GHz; 10 ephemeral runners; lockup panics=<on|P6 declined>; kdump armed 1536M; netconsole->macbook"
