@@ -1017,7 +1017,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     # (bead ez-gh-actions-1mdp).
     if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
         GUEST_ACTIONS_VALUES=""
-        if command -v limactl >/dev/null 2>&1; then
+        {
             GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
                 test -f /etc/systemd/system/actions.slice || exit 1
                 cat /sys/fs/cgroup/actions.slice/memory.high
@@ -1038,7 +1038,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
                 done
                 echo RUNNERS=actions.slice
             ' 2>/dev/null | tr '\n' ' ' || true)
-        fi
+        }
         read -r guest_high guest_max guest_swap guest_tasks guest_runners _ <<<"${GUEST_ACTIONS_VALUES}"
         if [ "${guest_high:-}" != 30064771072 ] \
            || [ "${guest_max:-}" != 34359738368 ] \
@@ -1049,7 +1049,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         fi
         echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
     else
-        host_unit="$(dirname "$0")/../systemd/host/actions.slice"
+        host_unit="${REPO_ROOT}/systemd/host/actions.slice"
         host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"; }
         host_to_bytes() {
             case "$1" in
@@ -1063,6 +1063,13 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         host_max_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryMax)")
         host_swap_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemorySwapMax)")
         host_tasks_expect=$(host_unit_value "$host_unit" TasksMax)
+        # The tracked unit must itself be finite: an unbounded value would otherwise
+        # "match" an unbounded live slice and pass a gate whose point is the bound.
+        for v in "$host_high_expect" "$host_max_expect" "$host_swap_expect" "$host_tasks_expect"; do
+            case "$v" in
+                ''|max|infinity|*[!0-9]*) fail "Gate 8 host runner aggregate: tracked ${host_unit} must set finite numeric MemoryHigh/MemoryMax/MemorySwapMax/TasksMax (got high=${host_high_expect:-?} max=${host_max_expect:-?} swap=${host_swap_expect:-?} tasks=${host_tasks_expect:-?})" ;;
+            esac
+        done
         host_high=$(cat /sys/fs/cgroup/actions.slice/memory.high 2>/dev/null || true)
         host_max=$(cat /sys/fs/cgroup/actions.slice/memory.max 2>/dev/null || true)
         host_swap=$(cat /sys/fs/cgroup/actions.slice/memory.swap.max 2>/dev/null || true)
