@@ -53,8 +53,8 @@ if [ "$ROOT" = "/" ]; then
   check_user_property agents.slice MemoryHigh 19327352832
   check_user_property agents.slice MemoryMax 21474836480
   check_user_property agents.slice MemorySwapMax 2147483648
-  check_user_property automation.slice MemoryHigh 4294967296
-  check_user_property automation.slice MemoryMax 6442450944
+  check_user_property automation.slice MemoryHigh 8589934592
+  check_user_property automation.slice MemoryMax 10737418240
   check_user_property automation.slice MemorySwapMax 1073741824
   check_system_property() {
     local unit="$1" property="$2" expected="$3" actual

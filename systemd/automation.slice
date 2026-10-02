@@ -1,13 +1,19 @@
 # automation.slice — finite budget for orchestration/watchdog automation.
-# measured margin: automation's observed 3.0 GiB peak leaves 1.0 GiB before
-# MemoryHigh and 3.0 GiB before MemoryMax; swap/tasks are finite too.
+# measured margin: the slice also holds every AO-spawned worker scope
+# (tmux-spawn-*.scope inherit Slice= from ao-daemon.service), whose observed
+# unthrottled peak is 5.7 GiB (2026-10-02; the 2026-08-25 figure of 3.0 GiB
+# was daemons only). 8G leaves 2.3 GiB before MemoryHigh and 4.3 GiB before
+# MemoryMax; swap/tasks are finite too. At 4G the slice sat permanently
+# throttled (9.0M memory.events high), and its PSI, aggregated at
+# user.slice, tripped the ezgha admission gate and drained the runner
+# fleet to 0/10 (beads ez-gh-actions-u3c5, ez-gh-actions-6w33).
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target
 
 [Slice]
-MemoryHigh=4G
-MemoryMax=6G
+MemoryHigh=8G
+MemoryMax=10G
 MemorySwapMax=1G
 TasksMax=4096
 MemoryAccounting=yes

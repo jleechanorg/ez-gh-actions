@@ -74,7 +74,7 @@ check_below "${CGROUP_ROOT}/actions.slice/pids.current" 6000 "actions.slice pids
 agents_dir="$(user_cgroup_dir agents.slice || true)"
 automation_dir="$(user_cgroup_dir automation.slice || true)"
 [ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 19327352832 "agents.slice memory.current"
-[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 4294967296 "automation.slice memory.current"
+[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 8589934592 "automation.slice memory.current"
 
 install_file() {
   local source="$1" dest="$2"
@@ -145,7 +145,7 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
     systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=4G MemoryMax=6G MemorySwapMax=1G TasksMax=4096
+    systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096
   fi
 fi
 
