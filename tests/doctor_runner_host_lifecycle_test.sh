@@ -42,6 +42,22 @@ grep -Fq 'BAD system watchdog.service is active or boot-enabled' <<<"$armed"
 grep -Fq 'BAD kernel auto-recovery is armed' <<<"$armed"
 grep -Fq 'CRITICAL=2' <<<"$armed"
 
+# kdump design: panic=0 + panic_on_oops=1 is OK only with the crash kernel loaded.
+KEXEC_TMP=$(mktemp); trap 'rm -f "$KEXEC_TMP"' EXIT
+echo 1 > "$KEXEC_TMP"; export KEXEC_CRASH_LOADED_PATH="$KEXEC_TMP"
+kdump_ok=$(run_case no no 0 1)
+grep -Fq 'OK kernel.panic_on_oops=1 with crash kernel loaded: oops -> kdump crash capture' <<<"$kdump_ok"
+grep -Fq 'CRITICAL=0' <<<"$kdump_ok"
+echo 0 > "$KEXEC_TMP"
+kdump_unloaded=$(run_case no no 0 1)
+grep -Fq 'BAD kernel auto-recovery is armed' <<<"$kdump_unloaded"
+grep -Fq 'CRITICAL=1' <<<"$kdump_unloaded"
+echo 1 > "$KEXEC_TMP"
+timer_armed=$(run_case no no 10 1)
+grep -Fq 'BAD kernel auto-recovery is armed' <<<"$timer_armed"
+grep -Fq 'CRITICAL=1' <<<"$timer_armed"
+unset KEXEC_CRASH_LOADED_PATH
+
 eval "$VERDICT_FN_SRC"
 
 clean_remediation=$(emit_failure_remediation 0 0 linux)

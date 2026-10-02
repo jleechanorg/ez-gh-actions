@@ -15,7 +15,12 @@
 # 01:11:49 and picked up immediately (zero runner wait). Standalone runs
 # (no job map in the environment) fall back to the run-level max, labeled
 # as such.
-set -euo pipefail
+# Strict mode only when run standalone. When sourced by doctor-runner this
+# would re-arm errexit in the parent and let the trailing `[ .. ] && _qh_finish 1`
+# (a non-zero return by design) abort the whole doctor before section 10.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  set -euo pipefail
+fi
 
 # When sourced by doctor.sh, use return — never exit the parent.
 _qh_finish() {
@@ -210,5 +215,7 @@ if [ "${QUEUE_QUEUED_STALE:-0}" -gt 0 ]; then
   info "oldest stale: id=$QUEUE_OLDEST_STALE_ID name=$QUEUE_OLDEST_STALE_NAME branch=$QUEUE_OLDEST_STALE_BRANCH age=${QUEUE_OLDEST_STALE_AGE_DAYS}d created=$QUEUE_OLDEST_STALE_CREATED"
 fi
 
-[ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && _qh_finish 1
+if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
+  _qh_finish 1
+fi
 _qh_finish 0
