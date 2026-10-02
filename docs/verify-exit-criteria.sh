@@ -1007,42 +1007,75 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] ${slice}: high=${high} max=${max} swap=${swap} tasks=${tasks}"
     done
 
-    # Gate 8 guest runner aggregate: the ten container limits are nested
-    # inside Colima, so their sum must also be bounded below the VM ceiling.
-    # Verify the persisted unit and the live cgroup rather than trusting the
-    # host config's cgroup_parent string alone.
-    GUEST_ACTIONS_VALUES=""
-    if command -v limactl >/dev/null 2>&1; then
-        GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
-            test -f /etc/systemd/system/actions.slice || exit 1
-            cat /sys/fs/cgroup/actions.slice/memory.high
-            cat /sys/fs/cgroup/actions.slice/memory.max
-            cat /sys/fs/cgroup/actions.slice/memory.swap.max
-            cat /sys/fs/cgroup/actions.slice/pids.max
-            ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}") || exit 1
-            test -n "$ids" || exit 1
-            for id in $ids; do
-                pid=$(docker inspect -f "{{.State.Pid}}" "$id") || exit 1
-                raw=$(grep "^0::" "/proc/$pid/cgroup" | head -1) || exit 1
-                path=${raw#0::}
-                case "$path" in
-                    /actions.slice|/actions.slice/*) ;;
-                    *) exit 1 ;;
-                esac
-                test -d "/sys/fs/cgroup$path" || exit 1
-            done
-            echo RUNNERS=actions.slice
-        ' 2>/dev/null | tr '\n' ' ' || true)
+    # Gate 8 runner aggregate: the ten container limits must be nested inside a
+    # finite actions.slice. Where the docker daemon runs inside Colima (Mac, or a
+    # Linux host with a VM-backed daemon) that slice lives in the guest and is
+    # read through limactl; where the daemon runs on the host (jeff-ubuntu) the
+    # slice is the host's own, and the oracle is the tracked unit
+    # systemd/host/actions.slice, not the guest numbers. Checking the guest from
+    # a host-docker deployment reads "unavailable" and was a false FAIL
+    # (bead ez-gh-actions-1mdp).
+    if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
+        GUEST_ACTIONS_VALUES=""
+        if command -v limactl >/dev/null 2>&1; then
+            GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
+                test -f /etc/systemd/system/actions.slice || exit 1
+                cat /sys/fs/cgroup/actions.slice/memory.high
+                cat /sys/fs/cgroup/actions.slice/memory.max
+                cat /sys/fs/cgroup/actions.slice/memory.swap.max
+                cat /sys/fs/cgroup/actions.slice/pids.max
+                ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}") || exit 1
+                test -n "$ids" || exit 1
+                for id in $ids; do
+                    pid=$(docker inspect -f "{{.State.Pid}}" "$id") || exit 1
+                    raw=$(grep "^0::" "/proc/$pid/cgroup" | head -1) || exit 1
+                    path=${raw#0::}
+                    case "$path" in
+                        /actions.slice|/actions.slice/*) ;;
+                        *) exit 1 ;;
+                    esac
+                    test -d "/sys/fs/cgroup$path" || exit 1
+                done
+                echo RUNNERS=actions.slice
+            ' 2>/dev/null | tr '\n' ' ' || true)
+        fi
+        read -r guest_high guest_max guest_swap guest_tasks guest_runners _ <<<"${GUEST_ACTIONS_VALUES}"
+        if [ "${guest_high:-}" != 30064771072 ] \
+           || [ "${guest_max:-}" != 34359738368 ] \
+           || [ "${guest_swap:-}" != 0 ] \
+           || [ "${guest_tasks:-}" != 6000 ] \
+           || [ "${guest_runners:-}" != "RUNNERS=actions.slice" ]; then
+            fail "Gate 8 guest runner aggregate: expected live high=28G max=32G swap=0 tasks=6000 and every runner in actions.slice, got high=${guest_high:-unavailable} max=${guest_max:-unavailable} swap=${guest_swap:-unavailable} tasks=${guest_tasks:-unavailable} runners=${guest_runners:-unavailable}"
+        fi
+        echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
+    else
+        host_unit="$(dirname "$0")/../systemd/host/actions.slice"
+        host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"; }
+        host_to_bytes() {
+            case "$1" in
+                *G) echo $(( ${1%G} * 1024 * 1024 * 1024 )) ;;
+                *M) echo $(( ${1%M} * 1024 * 1024 )) ;;
+                *K) echo $(( ${1%K} * 1024 )) ;;
+                *) echo "$1" ;;
+            esac
+        }
+        host_high_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryHigh)")
+        host_max_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryMax)")
+        host_swap_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemorySwapMax)")
+        host_tasks_expect=$(host_unit_value "$host_unit" TasksMax)
+        host_high=$(cat /sys/fs/cgroup/actions.slice/memory.high 2>/dev/null || true)
+        host_max=$(cat /sys/fs/cgroup/actions.slice/memory.max 2>/dev/null || true)
+        host_swap=$(cat /sys/fs/cgroup/actions.slice/memory.swap.max 2>/dev/null || true)
+        host_tasks=$(cat /sys/fs/cgroup/actions.slice/pids.max 2>/dev/null || true)
+        if [ -z "$host_high_expect" ] || [ -z "$host_max_expect" ] || [ -z "$host_tasks_expect" ] \
+           || [ "${host_high:-}" != "$host_high_expect" ] \
+           || [ "${host_max:-}" != "$host_max_expect" ] \
+           || [ "${host_swap:-}" != "$host_swap_expect" ] \
+           || [ "${host_tasks:-}" != "$host_tasks_expect" ]; then
+            fail "Gate 8 host runner aggregate: live /sys/fs/cgroup/actions.slice (high=${host_high:-unavailable} max=${host_max:-unavailable} swap=${host_swap:-unavailable} tasks=${host_tasks:-unavailable}) does not match the tracked unit ${host_unit} (high=${host_high_expect:-?} max=${host_max_expect:-?} swap=${host_swap_expect:-?} tasks=${host_tasks_expect:-?})"
+        fi
+        echo "    [PASS] Gate 8 host runner aggregate: live actions.slice matches systemd/host/actions.slice (high=${host_high} max=${host_max} swap=${host_swap} tasks=${host_tasks}); runner membership proven above"
     fi
-    read -r guest_high guest_max guest_swap guest_tasks guest_runners _ <<<"${GUEST_ACTIONS_VALUES}"
-    if [ "${guest_high:-}" != 30064771072 ] \
-       || [ "${guest_max:-}" != 34359738368 ] \
-       || [ "${guest_swap:-}" != 0 ] \
-       || [ "${guest_tasks:-}" != 6000 ] \
-       || [ "${guest_runners:-}" != "RUNNERS=actions.slice" ]; then
-        fail "Gate 8 guest runner aggregate: expected live high=28G max=32G swap=0 tasks=6000 and every runner in actions.slice, got high=${guest_high:-unavailable} max=${guest_max:-unavailable} swap=${guest_swap:-unavailable} tasks=${guest_tasks:-unavailable} runners=${guest_runners:-unavailable}"
-    fi
-    echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
 
     MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
     MODERN_RESERVE_MB=$((MODERN_HOST_TOTAL_MB / 10))
