@@ -102,7 +102,12 @@ run_case() {
   # threshold apply.
   SERVICE_STATE="$service_state"
   CRITICAL=0
-  if [ "${sample_count:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
+  LOCAL_CONFIG_FILE="$CONFIG_DIR/config.toml"
+  QUEUE_MONITOR_ENABLED=""
+  eval "$(grep -E '^QUEUE_MONITOR_ENABLED=' "$DOCTOR_SCRIPT")"
+  if [ "$QUEUE_MONITOR_ENABLED" = "false" ]; then
+    :
+  elif [ "${sample_count:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
     bad "serve-loop heartbeat: no queue-monitor samples in window while service is active — loop silent or logging broken"
     CRITICAL=$((CRITICAL + 1))
   elif [ "${max_gap:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
@@ -226,6 +231,20 @@ run_case "zero-samples-inactive-service-not-double-counted" "$FIXTURE_E" "no" "0
 # zero-samples alarm.
 FIXTURE_G=$(qm_line "$BASE" 4192142)
 run_case "one-sample-active-service-healthy" "$FIXTURE_G" "no" "0" "active" || OVERALL_PASS=false
+
+# Case (h): [queue_monitor] enabled = false means the daemon never emits
+# "queue monitor:" lines, so zero samples while active is expected and must
+# NOT trip the silent-loop alarm (2026-10-02 false positive on jeff-ubuntu).
+cat > "$CONFIG_DIR/config.toml" <<'EOF2'
+version = 1
+[runner]
+serve_tick_seconds = 30
+name_prefix = "ez-runner-c"
+count = 16
+[queue_monitor]
+enabled = false
+EOF2
+run_case "zero-samples-queue-monitor-disabled-not-critical" "$FIXTURE_E" "no" "0" "active" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

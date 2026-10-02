@@ -1296,7 +1296,12 @@ STARVE_WINDOW="${STARVE_WINDOW:-10}"
 SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$LOCAL_CONFIG_FILE" 2>/dev/null)
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
 STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
-if [ "$PLATFORM" = "linux" ]; then
+# The heartbeat is the "queue monitor:" line, which the daemon only emits when
+# [queue_monitor] enabled = true; with it disabled, zero samples is expected.
+QUEUE_MONITOR_ENABLED=$(awk '/^\[/{sec=$0} sec=="[queue_monitor]" && /^enabled[[:space:]]*=/ {gsub(/[^a-z]/,"",$2); print $2; exit}' FS='=' "$LOCAL_CONFIG_FILE" 2>/dev/null)
+if [ "$PLATFORM" = "linux" ] && [ "$QUEUE_MONITOR_ENABLED" = "false" ]; then
+  info "serve-loop heartbeat signal skipped: [queue_monitor] enabled = false in $LOCAL_CONFIG_FILE, so the daemon emits no 'queue monitor:' lines; per-slot proof above is the liveness signal"
+elif [ "$PLATFORM" = "linux" ]; then
   read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN HEARTBEAT_SAMPLE_COUNT < <(
     journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
       | compute_heartbeat_gap
