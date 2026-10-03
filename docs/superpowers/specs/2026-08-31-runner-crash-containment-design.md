@@ -13,7 +13,7 @@ The 2026-09-01 read-only target-host probe established the facts needed for this
 - The effective host `actions.slice` is active but has infinite memory, swap, CPU, and task limits.
 - Effective `agents.slice` memory limits are infinite because `99-local-unlimited.conf` overrides the tracked unit.
 - Fresh cgroup evidence shows `agents.slice` at about 8.10 GiB current and 17.14 GiB historical peak, with zero current/peak swap; `automation.slice` is about 171 MiB current and 258 MiB peak.
-- `automation.slice` is finite at `MemoryHigh=4G`, `MemoryMax=6G`, and `MemorySwapMax=1G`.
+- `automation.slice` is finite at `MemoryHigh=8G`, `MemoryMax=10G`, and `MemorySwapMax=1G`.
 - `user@1000.service` is an active `systemd-oomd` pressure target with `ManagedOOMMemoryPressure=kill`, a 2-GiB pressure limit, `OOMScoreAdjust=100`, and no tracked local override.
 - The legacy `psi-oom-watcher` is currently inactive and disabled but remains installed and is reinstalled by `install.sh`; its sustained-PSI action can SIGTERM a deploy-user process.
 
