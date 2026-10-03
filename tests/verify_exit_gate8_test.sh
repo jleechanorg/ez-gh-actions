@@ -211,6 +211,10 @@ Swap Monitored CGroups:
 Memory Pressure Monitored CGroups:
 	Path: /user.slice
 EOF
+cat > "$TMP/oomctl-none.txt" <<'EOF'
+Dry Run: no
+Memory Pressure Monitored CGroups:
+EOF
 run_oomctl() {
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
   VERIFY_EXIT_CRITERIA_TEST_CASE=oomctl_actions \
@@ -222,22 +226,63 @@ if run_oomctl "$TMP/oomctl-empty.txt"; then
   fail "/actions.slice only under Swap (pressure lists /user.slice) must not pass"
 fi
 
-# Host-docker has a narrower contract than VM-backed deployments: the
-# runner aggregate itself must appear under oomctl's pressure list.  A legacy
-# user timer may exist, but cannot substitute for this live enrollment.
-run_host_docker_oomctl() {
-  VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
-  VERIFY_EXIT_CRITERIA_TEST_CASE=host_docker_actions_oomctl \
-  VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE="$1" \
-    bash "$VERIFY" >/dev/null 2>&1
+# Exercise the actual inline Gate 8 (3) branch. The timer is deliberately
+# enabled, active, and points to a script with a real `kill` shed path.
+# Host-docker still must fail without /actions.slice; VM-backed retains the
+# timer fallback when oomd has no enrolled cgroups.
+PSI_BIN="$TMP/psi-bin"
+mkdir -p "$PSI_BIN"
+cat > "$PSI_BIN/docker" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = info ] || exit 1
+if [ "${PSI_MODE:?}" = host ]; then uname -r; else printf 'guest-kernel\n'; fi
+EOF
+cat > "$PSI_BIN/oomctl" <<'EOF'
+#!/usr/bin/env bash
+cat "${PSI_OOMCTL_FIXTURE:?}"
+EOF
+cat > "$TMP/psi-shed.sh" <<'EOF'
+#!/usr/bin/env bash
+kill -0 "$$"
+EOF
+cat > "$PSI_BIN/systemctl" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  'is-active systemd-oomd') printf 'active\\n' ;;
+  *'--user is-enabled psi-oom-watcher.timer'*) printf 'enabled\\n' ;;
+  *'--user is-active psi-oom-watcher.timer'*) printf 'active\\n' ;;
+  *'--user cat psi-oom-watcher.timer'*) printf 'ExecStart=%s\\n' '$TMP/psi-shed.sh' ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$PSI_BIN/docker" "$PSI_BIN/oomctl" "$PSI_BIN/systemctl" "$TMP/psi-shed.sh"
+PSI_BLOCK="$TMP/gate8-psi-block.sh"
+{
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
+  printf '%s\n' 'fail() { echo "FAIL: $*" >&2; exit 1; }'
+  sed -n '/^daemon_in_vm() {/,/^}/p' "$VERIFY"
+  sed -n '/^oomctl_lists_actions_slice() {/,/^}/p' "$VERIFY"
+  sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY"
+  sed -n '/^# (3) PSI admission check/,/^# (4) Physical-host RAM envelope/{/^# (4) Physical-host RAM envelope/d;p}' "$VERIFY"
+} > "$PSI_BLOCK"
+chmod +x "$PSI_BLOCK"
+run_gate8_psi() { # mode oomctl-fixture
+  PATH="$PSI_BIN:$PATH" PSI_MODE="$1" PSI_OOMCTL_FIXTURE="$2" \
+    bash "$PSI_BLOCK" 2>&1
 }
-run_host_docker_oomctl "$TMP/oomctl-enrolled.txt" \
-  || fail "host-docker /actions.slice pressure enrollment should pass"
-if run_host_docker_oomctl "$TMP/oomctl-empty.txt"; then
-  fail "host-docker must reject a timer-substitutable oomctl result without /actions.slice"
+host_pass=$(run_gate8_psi host "$TMP/oomctl-enrolled.txt") \
+  || fail "host-docker /actions.slice pressure enrollment should pass: $host_pass"
+grep -Fq 'oomctl: /actions.slice under Memory Pressure Monitored CGroups' <<<"$host_pass" \
+  || fail "host-docker pass did not use the /actions.slice oomctl branch: $host_pass"
+if host_fail=$(run_gate8_psi host "$TMP/oomctl-empty.txt"); then
+  fail "host-docker Gate 8 (3) accepted an active psi timer without /actions.slice"
 fi
-grep -Fq 'if [ "$PSI_OK" != "1" ] && ! host_docker_requires_actions_oomctl; then' "$VERIFY" \
-  || fail "host-docker Gate 8 (3) still permits the psi-oom-watcher timer fallback"
+grep -Fq 'psi-oom-watcher.timer is not an acceptable fallback' <<<"$host_fail" \
+  || fail "host-docker rejection did not name the rejected timer fallback: $host_fail"
+vm_pass=$(run_gate8_psi vm "$TMP/oomctl-none.txt") \
+  || fail "VM-backed Gate 8 (3) should retain the active psi timer fallback: $vm_pass"
+grep -Fq 'psi-oom-watcher.timer (user-scope' <<<"$vm_pass" \
+  || fail "VM-backed pass did not use the timer fallback: $vm_pass"
 
 # Kdump/pstore verification is diagnostic-only. It must be quiet on a healthy
 # fixture, fail closed on an unhealthy fixture, and never invoke a remediation

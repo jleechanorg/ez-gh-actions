@@ -508,7 +508,6 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         kdump) verify_kdump_pstore ;;
         host_docker_envelope) verify_host_docker_envelope ;;
         oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
-        host_docker_actions_oomctl) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
