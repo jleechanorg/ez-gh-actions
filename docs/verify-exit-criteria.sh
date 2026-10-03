@@ -426,8 +426,9 @@ verify_modern_timers() {
     case "$enabled_state" in
         enabled|enabled-runtime)
             fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)" ;;
-        not-found|"Failed to get unit file state for "*": No such file or directory")
-            return 0 ;;
+        # A deleted unit file can remain loaded until its runtime instance
+        # stops, so still verify is-active before accepting this state.
+        not-found|"Failed to get unit file state for "*": No such file or directory") ;;
         disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
         *)
             # Query failure (e.g. lost user-manager bus): never read as "disabled".

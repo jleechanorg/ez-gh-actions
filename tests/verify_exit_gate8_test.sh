@@ -323,6 +323,18 @@ PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
 PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
   bash "$VERIFY" >/dev/null 2>&1 || fail "absent psi-oom-watcher.timer must pass"
+# A deleted unit file does not prove the previously loaded timer has stopped.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_TIMERS="psi-oom-watcher.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file but active psi timer must fail Gate 8"
+# Likewise, a missing unit file must not bypass a failed runtime-state query.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file runtime-state query failure must fail Gate 8 closed"
 # systemd 255 prints exactly "not-found" (exit 4) for an absent unit, the
 # normal state once install.sh has deleted the watcher unit files.
 PATH="$TMP/timerbin:$PATH" STUB_NOTFOUND=1 \
