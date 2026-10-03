@@ -7,12 +7,14 @@ ready for root runtime deployment. Three commits, in order:
 |---|---|
 | `d250267` | runner throughput: parallel readiness probes + busy/idle diagnostics + container-absent reclaim |
 | `b4669de` | runner throughput: 6s probe cap + absent reconcile + drop unused activity enum |
-| `HEAD`   | runner throughput: opt-in cpu_burst + absent-shortage fix (independent-review critical) |
+| `907ecda` | runner throughput: opt-in cpu_burst + absent-shortage fix (independent-review critical) |
 
 ## Final HEAD for deployment
 
 ```
-<pending: SHA printed after this commit lands>
+907ecda  HEAD (this commit)
+b4669de  round-2 review feedback fixes
+d250267  first-pass (parallel probes + diagnostic split + absent reclaim)
 ```
 
 Root owns `cargo install --path .`, `systemctl --user restart ezgha.service`,
@@ -21,7 +23,7 @@ no force push).
 
 ---
 
-## Commit HEAD — post-review critical fix + opt-in cpu_burst
+## Commit `907ecda` — post-review critical fix + opt-in cpu_burst
 
 ### Fix A — absent slot counts toward shortage, not toward alive
 
