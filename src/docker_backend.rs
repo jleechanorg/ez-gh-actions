@@ -10288,7 +10288,9 @@ minimum_isolation = "container"
             *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
             *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-runner-c-1".into()]);
-            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(1)].into());
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+                [Ok(ReadinessSummary { ready: 1, absent: vec![] })].into(),
+            );
 
             let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
