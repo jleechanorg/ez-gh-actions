@@ -36,8 +36,8 @@ check_cgroup_val() {
   actual="$(cat "$file")"
   [ "$actual" = "$expected" ] || fail "actions.slice $name ('$actual') != '$expected'"
 }
-check_cgroup_val "$ACTIONS_DIR/memory.high" 26843545600 memory.high
-check_cgroup_val "$ACTIONS_DIR/memory.max" 27917287424 memory.max
+check_cgroup_val "$ACTIONS_DIR/memory.high" 27917287424 memory.high
+check_cgroup_val "$ACTIONS_DIR/memory.max" 30064771072 memory.max
 check_cgroup_val "$ACTIONS_DIR/memory.swap.max" 0 memory.swap.max
 check_cgroup_val "$ACTIONS_DIR/pids.max" 6000 pids.max
 check_cgroup_val "$ACTIONS_DIR/cpu.max" "2000000 100000" cpu.max
@@ -54,7 +54,7 @@ if [ "$ROOT" = "/" ]; then
   check_user_property agents.slice MemoryMax 21474836480
   check_user_property agents.slice MemorySwapMax 2147483648
   check_user_property automation.slice MemoryHigh 8589934592
-  check_user_property automation.slice MemoryMax 9663676416
+  check_user_property automation.slice MemoryMax 10737418240
   check_user_property automation.slice MemorySwapMax 1073741824
   check_system_property() {
     local unit="$1" property="$2" expected="$3" actual

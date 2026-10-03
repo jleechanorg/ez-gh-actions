@@ -3,8 +3,8 @@ Description=Host aggregate boundary for GitHub Actions runner containers
 Before=slices.target
 
 [Slice]
-MemoryHigh=25G
-MemoryMax=26G
+MemoryHigh=26G
+MemoryMax=28G
 MemorySwapMax=0
 TasksMax=6000
 CPUQuota=2000%

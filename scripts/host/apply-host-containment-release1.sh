@@ -69,7 +69,7 @@ done
 for controller in cpu memory pids io; do
   grep -qw "$controller" "${CGROUP_ROOT}/cgroup.controllers" 2>/dev/null || fail "missing required cgroup v2 controller: ${controller}"
 done
-check_below "${CGROUP_ROOT}/actions.slice/memory.current" 26843545600 "actions.slice memory.current"
+check_below "${CGROUP_ROOT}/actions.slice/memory.current" 27917287424 "actions.slice memory.current"
 check_below "${CGROUP_ROOT}/actions.slice/pids.current" 6000 "actions.slice pids.current"
 agents_dir="$(user_cgroup_dir agents.slice || true)"
 automation_dir="$(user_cgroup_dir automation.slice || true)"
@@ -112,7 +112,7 @@ if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
       || fail "user manager OOM score adjustment did not become 0"
     systemctl enable actions.slice
     systemctl start actions.slice
-    systemctl set-property actions.slice MemoryHigh=25G MemoryMax=26G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
+    systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
   fi
 fi
 
@@ -145,7 +145,7 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
     systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=9G MemorySwapMax=1G TasksMax=4096
+    systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096
   fi
 fi
 

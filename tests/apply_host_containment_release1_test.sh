@@ -32,8 +32,8 @@ setup_fixture() {
   printf '1073741824\n' > "$root/sys/fs/cgroup/automation.slice/memory.current"
 
   # Staged actions.slice cgroup values
-  printf '26843545600\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
-  printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
+  printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
+  printf '30064771072\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
   printf '0\n' > "$root/sys/fs/cgroup/actions.slice/memory.swap.max"
   printf '6000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
@@ -117,7 +117,7 @@ ok "apply-host-containment-release1.sh aborts before mutation when current agent
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
 setup_fixture "$ACTIONS_MEM_FAIL_ROOT"
-printf '26843545600\n' > "$ACTIONS_MEM_FAIL_ROOT/sys/fs/cgroup/actions.slice/memory.current"
+printf '27917287424\n' > "$ACTIONS_MEM_FAIL_ROOT/sys/fs/cgroup/actions.slice/memory.current"
 if PATH="$ACTIONS_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$ACTIONS_MEM_FAIL_ROOT" > "$WORK/actions_mem.log" 2>&1; then
   fail "apply-host-containment-release1.sh passed when actions usage was at the new high limit"
 fi
