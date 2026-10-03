@@ -25,7 +25,7 @@ next, so never stop at the first fix. Check every layer, in order (memory:
    have fought each other (dual-Lima convergence: bead ez-gh-actions-apye).
    A stale-state start failure ("vz driver is running but host agent is not"
    / "already running, ignoring") needs a force-stop + restart cycle —
-   deploy-owner only (`.claude/hooks/vm-lifecycle-guard.sh` blocks it otherwise).
+   deploy-owner only (CLAUDE.md "VM/backend lifecycle is deploy-owner-only").
 2. **Daemon socket wiring**: `/var/run/docker.sock` may be a dead symlink.
    Check the plist: `plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist`
    → `EnvironmentVariables.DOCKER_HOST` must point at the RUNNING VM's socket
@@ -57,7 +57,7 @@ bash "$(git rev-parse --show-toplevel)/doctor-runner --prove"  # + live canary: 
 
 Read the verdict AND the exit code. `--prove` is the strongest evidence — it
 dispatches a fresh `ezgha-selftest` and confirms `runner_name` is
-`configured prefix (e.g. `ez-mac-runner-b-*`, `ez-runner-b-*`) with `conclusion=success`. The gate also checks a
+`configured prefix (e.g. `ez-mac-runner-g-*`, `ez-runner-c-*`) with `conclusion=success`. The gate also checks a
 real-execution proof (≥1 of the last 6 runs succeeded on our fleet) and a
 time-windowed error count (last 3 min, not last 200 lines — a since-recovered
 incident won't keep it red). If `fleet healthy` and exit 0, you're done — stop.
@@ -168,7 +168,7 @@ that adds a new `github::api_json(...)` call in that path (instead of
 `api_json_until`) would silently reopen the starvation hole.
 
 Env overrides: `MAC_HOST` (default `macbook`), `MAC_RUNNER_NAME_PREFIX`
-(default `ez-mac-runner-b`), `MAC_RUNNER_COUNT` (default `6`),
+(default: read from the Mac's config.toml), `MAC_RUNNER_COUNT` (default: read from config; the 6-runner contract is the floor),
 `STARVE_WINDOW` (minutes, default `10`), `STARVE_GAP_WARN_SECONDS`
 (default `150`).
 
