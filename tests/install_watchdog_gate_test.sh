@@ -35,6 +35,14 @@ cp "${REPO_ROOT}"/systemd/app-lima-vm.slice \
    "${REPO_ROOT}"/systemd/agents.slice \
    "${REPO_ROOT}"/systemd/automation.slice \
    "${TEMP_REPO}/systemd/"
+# The production tree deliberately removed these legacy artifacts.  Keep
+# minimal fixture inputs so the parent installer reaches Case A's stale-copy
+# assertions instead of failing while it tries to stage its then-required
+# sources.
+printf '[Unit]\nDescription=legacy reaper fixture\n' \
+  > "${TEMP_REPO}/systemd/agent-scope-reaper.service"
+printf '[Timer]\nUnit=agent-scope-reaper.service\n' \
+  > "${TEMP_REPO}/systemd/agent-scope-reaper.timer"
 mkdir -p "${TEMP_REPO}/systemd/host"
 cp -r "${REPO_ROOT}/systemd/host"/* "${TEMP_REPO}/systemd/host/" 2>/dev/null || true
 mkdir -p "${TEMP_REPO}/systemd/ao-daemon.service.d" \
@@ -59,6 +67,8 @@ for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
+printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/host/agent-scope-reaper.sh"
+chmod +x "${TEMP_REPO}/scripts/host/agent-scope-reaper.sh"
 for name in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
   if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
     cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
