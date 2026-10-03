@@ -420,7 +420,11 @@ if [ "$(uname -s)" = "Linux" ]; then
     # next VM start, and the 5G QEMU ceiling stays refused until it has.
     lima_yaml="${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml"
     if [ -f "${lima_yaml}" ] && ! grep -qx 'memory: "4GiB"' "${lima_yaml}"; then
-      sed -i 's/^memory: .*/memory: "4GiB"/' "${lima_yaml}"
+      if grep -q '^memory:' "${lima_yaml}"; then
+        sed -i 's/^memory: .*/memory: "4GiB"/' "${lima_yaml}"
+      else
+        printf 'memory: "4GiB"\n' >> "${lima_yaml}"
+      fi
       warn "colima guest memory set to 4GiB in ${lima_yaml}; it takes effect after one VM restart"
     fi
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"

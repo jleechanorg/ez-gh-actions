@@ -139,8 +139,10 @@ preflight_case automation_anon automation.slice $((7 * G)) $((G / 2)) 0 refuse
 ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its non-reclaimable use and changes nothing"
 
 # 3b. Lima guest memory gate: the host-docker QEMU ceiling (4608M/5G) is only
-#     safe for a <= 4 GiB guest; a larger configured guest refuses before any write.
-lima_case() { # name yaml-memory limactl-bytes expect(pass|refuse)
+#     safe for a <= 4 GiB guest. `limactl list` reports lima.yaml, not the
+#     running VM, so the running size comes from the colima QEMU's `-m` (MiB);
+#     any state the check cannot establish refuses before any write.
+lima_case() { # name yaml-memory limactl-status(Running|Stopped|ERROR) qemu-m-MiB(or -) expect(pass|refuse)
   local root="$WORK/lima_$1"
   setup_fixture "$root"
   mkdir -p "$root/lima/colima"
@@ -148,22 +150,37 @@ lima_case() { # name yaml-memory limactl-bytes expect(pass|refuse)
   cat > "$root/bin/limactl" <<LIMA_EOF
 #!/usr/bin/env bash
 [ "\$1 \$2 \$3" = "list --json colima" ] || exit 1
-printf '{"name":"colima","status":"Running","memory":%s}\n' "$3"
+[ "$3" = ERROR ] && { echo 'level=fatal msg="boom"' >&2; exit 1; }
+printf '{"name":"colima","status":"%s","memory":4294967296}\n' "$3"
 LIMA_EOF
   chmod +x "$root/bin/limactl"
+  if [ "$4" != - ]; then
+    mkdir -p "$root/proc/7777"
+    printf 'qemu-system-x86\n' > "$root/proc/7777/comm"
+    printf '%s\0' qemu-system-x86_64 -m "$4" -drive "file=$root/lima/colima/diffdisk,if=virtio" > "$root/proc/7777/cmdline"
+  fi
   if PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/lima_$1.log" 2>&1; then
-    [ "$4" = pass ] || fail "lima $1 passed but should refuse: $(tail -2 "$WORK/lima_$1.log")"
+    [ "$5" = pass ] || fail "lima $1 passed but should refuse: $(tail -2 "$WORK/lima_$1.log")"
   else
-    [ "$4" = refuse ] || fail "lima $1 refused but should pass: $(tail -2 "$WORK/lima_$1.log")"
+    [ "$5" = refuse ] || fail "lima $1 refused but should pass: $(tail -2 "$WORK/lima_$1.log")"
     [ ! -f "$root/etc/systemd/system/actions.slice" ] || fail "lima $1 staged files before refusing"
   fi
 }
-lima_case resized 4GiB 4294967296 pass
-lima_case running_8g 4GiB 8589934592 refuse
-grep -qx "FAIL lima guest memory 8589934592 > 4GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" "$WORK/lima_running_8g.log" \
-  || fail "lima refusal message mismatch: $(cat "$WORK/lima_running_8g.log")"
-lima_case yaml_8g 8GiB 4294967296 refuse
-grep -q "FAIL lima guest memory 8589934592 > 4GiB" "$WORK/lima_yaml_8g.log" || fail "lima.yaml 8GiB refusal message missing"
+lima_case resized_running 4GiB Running 4096 pass
+lima_case resized_stopped 4GiB Stopped - pass
+# lima.yaml already rewritten to 4GiB but the VM still runs with -m 8192:
+# limactl would report 4294967296 here, the running QEMU is what counts.
+lima_case yaml_rewritten_vm_8g 4GiB Running 8192 refuse
+grep -qx "FAIL lima guest memory 8589934592 > 4GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" "$WORK/lima_yaml_rewritten_vm_8g.log" \
+  || fail "lima refusal message mismatch: $(cat "$WORK/lima_yaml_rewritten_vm_8g.log")"
+lima_case yaml_8g_stopped 8GiB Stopped - refuse
+grep -q "FAIL lima guest memory 8589934592 > 4GiB" "$WORK/lima_yaml_8g_stopped.log" || fail "lima.yaml 8GiB refusal message missing"
+# Unknowable state fails closed: a failed limactl query, or a Running VM
+# whose QEMU process cannot be found.
+lima_case limactl_error 4GiB ERROR - refuse
+grep -q "FAIL lima guest memory unknown" "$WORK/lima_limactl_error.log" || fail "failed limactl query did not fail closed: $(cat "$WORK/lima_limactl_error.log")"
+lima_case running_no_qemu 4GiB Running - refuse
+grep -q "FAIL lima guest memory unknown" "$WORK/lima_running_no_qemu.log" || fail "Running VM without a QEMU process did not fail closed"
 ok "apply-host-containment-release1.sh refuses the host-docker QEMU ceiling while the Lima guest is above 4 GiB"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.

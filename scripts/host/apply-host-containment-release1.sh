@@ -101,7 +101,7 @@ if [ "$SYSTEM_PHASE" -eq 0 ]; then
   if [ "$ROOT" = "/" ]; then
     "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
   else
-    LIMACTL="${ROOT}/bin/limactl" LIMA_YAML="${ROOT}/lima/colima/lima.yaml" \
+    LIMACTL="${ROOT}/bin/limactl" LIMA_YAML="${ROOT}/lima/colima/lima.yaml" LIMA_PROC_ROOT="${ROOT}/proc" \
       "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
   fi
 fi

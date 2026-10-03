@@ -72,11 +72,12 @@ case "${1:-}" in
   *) exit 0 ;;
 esac
 EOF
-# limactl reports the colima guest size the VM is actually running with.
+# limactl reports VM status (its .memory mirrors lima.yaml, not the running
+# guest); the running size comes from the colima QEMU's -m in LIMA_PROC_ROOT.
 cat > "$STUB_BIN/limactl" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1 $2 $3" = "list --json colima" ]; then
-  printf '{"name":"colima","status":"Running","memory":%s}\n' "${LIMA_FIXTURE_MEM:-4294967296}"
+  printf '{"name":"colima","status":"%s","memory":4294967296}\n' "${LIMA_FIXTURE_STATUS:-Stopped}"
   exit 0
 fi
 exit 1
@@ -132,18 +133,35 @@ done
 grep -q 'MemoryHigh=4608M MemoryMax=5G' "$HD_UNITS/lima-vm-cpu-ceiling.service" \
   || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that re-applies the wrong ceiling"
 
-# A guest still running above 4 GiB keeps the existing QEMU ceiling (fail closed).
+# A guest still running at 8 GiB keeps the existing QEMU ceiling (fail closed)
+# even though this same install run rewrote lima.yaml to 4GiB.
 BIG_HOME="$WORK/big_guest_home"
-mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d"
+mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d" "$BIG_HOME/.lima/colima"
 printf '# fixture\n' > "$BIG_HOME/.config/ezgha/config.toml"
+printf 'cpus: 4\nmemory: "8GiB"\n' > "$BIG_HOME/.lima/colima/lima.yaml"
+BIG_PROC="$WORK/big_proc"
+mkdir -p "$BIG_PROC/7777"
+printf 'qemu-system-x86\n' > "$BIG_PROC/7777/comm"
+printf '%s\0' qemu-system-x86_64 -m 8192 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
 printf '[Service]\nMemoryHigh=34G\nMemoryMax=38G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
 env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
-  LIMA_FIXTURE_MEM=8589934592 \
+  LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1 || fail "big-guest fixture install failed"
 grep -qx 'MemoryMax=38G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   || fail "QEMU ceiling was lowered while the Lima guest is 8GiB"
 grep -q 'FAIL lima guest memory 8589934592 > 4GiB' "$WORK/big-install.log" \
   || fail "big-guest install did not report the Lima guest refusal"
+grep -qx 'memory: "4GiB"' "$BIG_HOME/.lima/colima/lima.yaml" || fail "big-guest install did not resize lima.yaml"
+
+# A lima.yaml without a memory: line gets one (sed alone would change nothing).
+NOMEM_HOME="$WORK/nomem_home"
+mkdir -p "$NOMEM_HOME/.config/ezgha" "$NOMEM_HOME/.lima/colima"
+printf '# fixture\n' > "$NOMEM_HOME/.config/ezgha/config.toml"
+printf 'cpus: 4\n' > "$NOMEM_HOME/.lima/colima/lima.yaml"
+env EVENT_LOG="$WORK/nomem_events" PATH="$STUB_BIN:$PATH" HOME="$NOMEM_HOME" CARGO_HOME="$NOMEM_HOME/.cargo" XDG_CONFIG_HOME="$NOMEM_HOME/.config" \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/nomem-install.log" 2>&1 || fail "no-memory-line fixture install failed"
+grep -qx 'memory: "4GiB"' "$NOMEM_HOME/.lima/colima/lima.yaml" \
+  || fail "lima.yaml without memory: was not set to 4GiB: $(cat "$NOMEM_HOME/.lima/colima/lima.yaml")"
 
 run_failed_phase() {
   local phase="$1"
