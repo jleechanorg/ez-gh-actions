@@ -142,9 +142,10 @@ ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its
 #     safe for a <= 4 GiB guest. `limactl list` reports lima.yaml, not the
 #     running VM, so the running size comes from the colima QEMU's `-m` (MiB);
 #     any state the check cannot establish refuses before any write.
-lima_case() { # name yaml-memory(or - for no lima.yaml) limactl-status(Running|Stopped|ERROR) qemu-m-MiB(or -) expect(pass|refuse) [limactl-.memory JSON, or - to omit]
-  local root="$WORK/lima_$1" memory_json=',"memory":4294967296'
+lima_case() { # name yaml-memory(or - for no lima.yaml) limactl-status (or __NUMBER__) qemu-m-MiB(or -) expect(pass|refuse) [limactl-.memory JSON, or - to omit]
+  local root="$WORK/lima_$1" memory_json=',"memory":4294967296' status_json
   case "${6:-}" in '') ;; -) memory_json='' ;; *) memory_json=",\"memory\":$6" ;; esac
+  case "$3" in __NUMBER__) status_json=7 ;; *) status_json="\"$3\"" ;; esac
   setup_fixture "$root"
   mkdir -p "$root/lima/colima"
   [ "$2" = - ] || printf 'cpus: 4\nmemory: %s\n' "$2" > "$root/lima/colima/lima.yaml"
@@ -152,7 +153,7 @@ lima_case() { # name yaml-memory(or - for no lima.yaml) limactl-status(Running|S
 #!/usr/bin/env bash
 [ "\$1 \$2 \$3" = "list --json colima" ] || exit 1
 [ "$3" = ERROR ] && { echo 'level=fatal msg="boom"' >&2; exit 1; }
-printf '{"name":"colima","status":"%s"%s}\n' "$3" '$memory_json'
+printf '{"name":"colima","status":%s%s}\n' '$status_json' '$memory_json'
 LIMA_EOF
   chmod +x "$root/bin/limactl"
   if [ "$4" != - ]; then
@@ -169,6 +170,19 @@ LIMA_EOF
 }
 lima_case resized_running 4GiB Running 4096 pass
 lima_case resized_stopped 4GiB Stopped - pass
+# Only an exact stopped state is safe without a QEMU proof. Lima's other
+# statuses describe incomplete or broken inspection, so they must fail closed.
+for status_case in Broken Unknown 'Stopped ' __NUMBER__; do
+  case "$status_case" in
+    Broken) status_name=broken_status ;;
+    Unknown) status_name=unknown_status ;;
+    __NUMBER__) status_name=nonstring_status ;;
+    *) status_name=whitespace_status ;;
+  esac
+  lima_case "$status_name" 4GiB "$status_case" - refuse
+  grep -q 'FAIL lima guest memory unknown (limactl.*status' "$WORK/lima_${status_name}.log" \
+    || fail "unsupported Lima status $status_case did not fail closed: $(cat "$WORK/lima_${status_name}.log")"
+done
 # lima.yaml already rewritten to 4GiB but the VM still runs with -m 8192:
 # limactl would report 4294967296 here, the running QEMU is what counts.
 lima_case yaml_rewritten_vm_8g 4GiB Running 8192 refuse

@@ -82,16 +82,29 @@ values+=("$bytes")
 
 command -v "$LIMACTL" >/dev/null 2>&1 || unknown "limactl not found for instance ${INSTANCE_DIR}"
 command -v python3 >/dev/null 2>&1 || unknown "python3 not found; cannot parse limactl list --json"
-# Prints "<status> <memory-bytes>"; .memory must be a JSON integer.
+# Lima's concrete states include Uninitialized, Installing, Broken, Stopped,
+# and Running. Only exact Stopped can lack a QEMU process; exact Running must
+# have one. Parse and validate both fields in Python so shell word splitting
+# cannot turn an otherwise unsupported status such as "Stopped " into Stopped.
 limactl_out="$("$LIMACTL" list --json colima 2>/dev/null)" || unknown "limactl list --json colima failed"
-read -r status limactl_mem < <(python3 -c 'import json,sys
-rows = [json.loads(l) for l in sys.stdin if l.strip()]
-row = rows[0] if len(rows) == 1 else {}
-mem = row.get("memory")
-ok = isinstance(mem, int) and not isinstance(mem, bool) and mem > 0
-print(row.get("status") or "-", mem if ok else "-")' <<<"$limactl_out" 2>/dev/null || echo "- -")
-[ "$status" != - ] || unknown "limactl list --json colima returned no status"
-[ "$limactl_mem" != - ] || unknown "limactl list --json colima .memory is absent or not integer bytes"
+limactl_fields="$(python3 -c 'import json,sys
+try:
+    rows = [json.loads(line) for line in sys.stdin if line.strip()]
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+if len(rows) != 1 or not isinstance(rows[0], dict):
+    raise SystemExit(1)
+status = rows[0].get("status")
+mem = rows[0].get("memory")
+if type(status) is not str or status not in ("Stopped", "Running"):
+    raise SystemExit(1)
+if type(mem) is not int or mem <= 0:
+    raise SystemExit(1)
+print(f"{status}|{mem}")' <<<"$limactl_out")" \
+  || unknown "limactl list --json colima has unsupported status or invalid .memory"
+IFS='|' read -r status limactl_mem extra <<<"$limactl_fields"
+[ -n "${status:-}" ] && [ -n "${limactl_mem:-}" ] && [ -z "${extra:-}" ] \
+  || unknown "limactl list --json colima has malformed validated fields"
 values+=("$limactl_mem")
 if [ "$status" = Running ] && [ "${#running[@]}" -eq 0 ]; then
   unknown "colima is Running but no colima QEMU process was found"
