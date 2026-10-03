@@ -23,7 +23,7 @@
 #         monotonic_ts=M wall_ts=W elapsed_secs=E peak_rss_mb=P
 #         in_grace=false reason=<reason-tag> (...)
 # Pre-PR-#109 fallback (still emitted on main + before redeploy):
-#   info: runner ez-mac-runner-b-N reclaimed — peak RSS Y MB observed over lifetime
+#   info: runner ez-mac-runner-g-N reclaimed — peak RSS Y MB observed over lifetime
 # Both formats are recognized — the script counts a "reclaim event" when
 # either matches.
 #

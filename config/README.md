@@ -5,7 +5,7 @@ auto-installed — copy to `~/.config/ezgha/config.toml` after editing limits fo
 machine.
 
 ```bash
-# MacBook (6× ez-mac-runner-b-*)
+# MacBook (6× ez-mac-runner-g-*)
 cp config/config.toml.mac.example ~/.config/ezgha/config.toml
 
 # jeff-ubuntu (10× ez-runner-c-*)
