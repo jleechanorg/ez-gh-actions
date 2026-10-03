@@ -743,7 +743,7 @@ if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   # shellcheck source=/dev/null
   source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   set -e
-  if [ "$QUEUE_RC" -eq 1 ]; then QUEUE_TAIL_BAD=1; fi
+  if [ "$QUEUE_RC" -ne 0 ]; then QUEUE_TAIL_BAD=1; fi  # 1 = tail exceeded, 2 = unmeasurable (UNPROVEN)
 else
   section "8. GitHub Actions queue health"
   warn "scripts/queue-health.sh missing — queue metrics skipped"
@@ -1225,19 +1225,27 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
     return 0
   }
   [ -n "$REMOTE_PREFIX" ] || REMOTE_PREFIX=$(_remote_cfg_get '^name_prefix')
-  _remote_count_from_cfg=0
-  if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); _remote_count_from_cfg=1; fi
+  _remote_count_src="config"
+  if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); else _remote_count_src="override"; fi
   if [ -z "$REMOTE_PREFIX" ] || [ -z "$REMOTE_COUNT" ]; then
     REMOTE_CONFIG_UNPROVEN=1
     REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
-    bad "$REMOTE_LABEL remote config (name_prefix/count) could not be read over SSH after retry — remote fleet UNPROVEN (no slot names guessed; fix SSH or set the MAC_RUNNER_NAME_PREFIX/MAC_RUNNER_COUNT or REMOTE_LINUX_PREFIX/REMOTE_LINUX_COUNT overrides)"
-    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
+    [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -ge "$DEFAULT_REMOTE_COUNT" ] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+    REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
+    bad "$REMOTE_LABEL remote config (name_prefix/count) could not be read over SSH after retry — remote fleet UNPROVEN (counted as $REMOTE_COUNT DOWN contract slot(s), no slot names guessed; fix SSH or set the MAC_RUNNER_NAME_PREFIX/MAC_RUNNER_COUNT or REMOTE_LINUX_PREFIX/REMOTE_LINUX_COUNT overrides)"
+    _unproven_idx=1
+    while [ "$_unproven_idx" -le "$REMOTE_COUNT" ]; do
+      REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unproven_idx} (unproven)")
+      _unproven_idx=$((_unproven_idx + 1))
+    done
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
   else
-  # A count READ FROM CONFIG below the fleet contract is underprovisioning, not
-  # the expected capacity: flag it and inspect the contract number of slots so
-  # the missing slot shows DOWN. Explicit env overrides are operator decisions.
-  if [ "$_remote_count_from_cfg" -eq 1 ] && [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -lt "$DEFAULT_REMOTE_COUNT" ]; then
-    bad "$REMOTE_LABEL remote config count $REMOTE_COUNT is below the fleet contract $DEFAULT_REMOTE_COUNT — underprovisioned"
+  # A count below the fleet contract (from config OR an env override) is
+  # underprovisioning, not the expected capacity: flag it and inspect the
+  # contract number of slots so the missing slot shows DOWN. Overrides may
+  # raise the count or set the prefix, never lower the contract.
+  if ! [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] || [ "$REMOTE_COUNT" -lt "$DEFAULT_REMOTE_COUNT" ]; then
+    bad "$REMOTE_LABEL remote $_remote_count_src count $REMOTE_COUNT is below the fleet contract $DEFAULT_REMOTE_COUNT — underprovisioned"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
     REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
   fi
@@ -1272,7 +1280,8 @@ else
   # placeholder prefix so the verdict always goes non-green and no slot name
   # is ever built from an empty prefix.
   REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
-  [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+  # Never below the contract (an explicit 0 must not zero out the criticals).
+  [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -ge "$DEFAULT_REMOTE_COUNT" ] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
   REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
   _unreach_idx=1
   while [ "$_unreach_idx" -le "$REMOTE_COUNT" ]; do

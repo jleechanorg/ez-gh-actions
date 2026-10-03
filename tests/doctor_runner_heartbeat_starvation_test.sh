@@ -63,16 +63,16 @@ FUNC_END=$(tail -n +"$FUNC_START" "$DOCTOR_SCRIPT" | grep -n '^}' | head -1 | cu
 FUNC_END=$((FUNC_START + FUNC_END - 1))
 FUNC_SRC=$(sed -n "${FUNC_START},${FUNC_END}p" "$DOCTOR_SCRIPT")
 
-# Extract the real SERVE_TICK_SECONDS + STARVE_GAP_WARN_SECONDS threshold
-# derivation lines (reads [runner] serve_tick_seconds from config.toml,
-# defaults to 30, threshold = 5x tick).
-TICK_START=$(grep -n '^SERVE_TICK_SECONDS=' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
-TICK_END=$(grep -n '^STARVE_GAP_WARN_SECONDS=' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
-if [ -z "$TICK_START" ] || [ -z "$TICK_END" ]; then
-  echo "FAIL: could not locate SERVE_TICK_SECONDS/STARVE_GAP_WARN_SECONDS derivation in $DOCTOR_SCRIPT" >&2
+# Extract the REAL heartbeat gate block (STARVE_WINDOW .. through the
+# platform if/elif/else, including the QUEUE_MONITOR_ENABLED skip) from
+# doctor-runner; it is executed below with stubbed journalctl/recent_logs.
+GATE_START=$(grep -n '^STARVE_WINDOW=' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+GATE_END=$(grep -n '^# --- G\. verdict' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
+if [ -z "$GATE_START" ] || [ -z "$GATE_END" ]; then
+  echo "FAIL: could not locate heartbeat gate block in $DOCTOR_SCRIPT" >&2
   exit 1
 fi
-TICK_SRC=$(sed -n "${TICK_START},${TICK_END}p" "$DOCTOR_SCRIPT")
+GATE_SRC=$(sed -n "${GATE_START},$((GATE_END - 1))p" "$DOCTOR_SCRIPT")
 
 bad() { printf '  [BAD]  %s\n' "$*"; }  # stub matching doctor-runner's helper
 
@@ -85,35 +85,37 @@ qm_line() {
 run_case() {
   local label="$1" fixture="$2" expect_starved="$3" expect_restart_boundary="$4" service_state="${5:-active}"
 
-  HOME="$TEMP_HOME"
-  eval "$FUNC_SRC"
-  eval "$TICK_SRC"
-
-  local out
-  out=$(printf '%s\n' "$fixture" | compute_heartbeat_gap)
-  local max_gap restart_boundary sample_count
-  read -r max_gap restart_boundary sample_count <<< "$out"
-
-  # Mirrors doctor-runner's actual call-site gate order verbatim (codex
-  # adversarial review 2026-07-10, finding 1): 0 samples while the service
-  # is active is checked FIRST and is fatal on its own, independent of
-  # max_gap (which awk defaults to 0 -- indistinguishable from "healthy"
-  # without the sample-count check). Only when samples > 0 does the gap
-  # threshold apply.
-  SERVICE_STATE="$service_state"
-  CRITICAL=0
-  LOCAL_CONFIG_FILE="$CONFIG_DIR/config.toml"
-  QUEUE_MONITOR_ENABLED=""
-  eval "$(grep -E '^QUEUE_MONITOR_ENABLED=' "$DOCTOR_SCRIPT")"
-  if [ "$QUEUE_MONITOR_ENABLED" = "false" ]; then
-    :
-  elif [ "${sample_count:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
-    bad "serve-loop heartbeat: no queue-monitor samples in window while service is active — loop silent or logging broken"
-    CRITICAL=$((CRITICAL + 1))
-  elif [ "${max_gap:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
-    bad "serve-loop starvation: queue-monitor heartbeat gap ${max_gap}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS})"
-    CRITICAL=$((CRITICAL + 1))
+  # Run the real gate block in a subshell with stubs. Any setup error (e.g.
+  # an unbound variable) is surfaced and fails the case instead of being
+  # masked.
+  local gate_out gate_rc=0
+  gate_out=$(
+    set -u
+    HOME="$TEMP_HOME"
+    PLATFORM=linux
+    SERVICE_STATE="$service_state"
+    SLOT_PROOF_CRITICAL=0
+    LOCAL_CONFIG_FILE="$CONFIG_DIR/config.toml"
+    FIXTURE_LINES="$fixture"
+    eval "$FUNC_SRC"
+    journalctl() { printf '%s\n' "$FIXTURE_LINES"; }
+    recent_logs() { :; }
+    info() { :; }; warn() { :; }
+    bad() { printf '  [BAD]  %s\n' "$*"; }
+    eval "$GATE_SRC"
+    echo "GATE_RESULT critical=$SLOT_PROOF_CRITICAL max_gap=${MAX_HEARTBEAT_GAP:-0} boundary=${RESTART_BOUNDARY_SEEN:-0} samples=${HEARTBEAT_SAMPLE_COUNT:-0} threshold=$STARVE_GAP_WARN_SECONDS"
+  ) 2>&1 || gate_rc=$?
+  if [ "$gate_rc" -ne 0 ] || ! grep -q '^GATE_RESULT' <<<"$gate_out" || grep -q 'unbound variable' <<<"$gate_out"; then
+    echo "  [$label] TEST SETUP ERROR (rc=$gate_rc): $gate_out"
+    return 1
   fi
+  local result CRITICAL max_gap restart_boundary sample_count STARVE_GAP_WARN_SECONDS
+  result=$(grep '^GATE_RESULT' <<<"$gate_out")
+  CRITICAL=$(sed -E 's/.*critical=([0-9]+).*/\1/' <<<"$result")
+  max_gap=$(sed -E 's/.*max_gap=([0-9]+).*/\1/' <<<"$result")
+  restart_boundary=$(sed -E 's/.*boundary=([0-9]+).*/\1/' <<<"$result")
+  sample_count=$(sed -E 's/.*samples=([0-9]+).*/\1/' <<<"$result")
+  STARVE_GAP_WARN_SECONDS=$(sed -E 's/.*threshold=([0-9]+).*/\1/' <<<"$result")
 
   PASS=true
   if [ "$expect_starved" = "yes" ] && [ "$CRITICAL" -eq 0 ]; then

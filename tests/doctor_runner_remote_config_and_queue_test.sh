@@ -48,7 +48,7 @@ out=$(FAKE_SSH_CFG=fail run_remote)
 check "unreadable config -> UNPROVEN [BAD] line" "grep -q 'BAD .*remote fleet UNPROVEN' <<<\"\$out\""
 check "no fabricated ez-mac-runner-e slots" "! grep -q 'ez-mac-runner-e' <<<\"\$out\""
 check "no slot listing attempted" "! grep -q '^LIST' <<<\"\$out\""
-check "verdict stays non-green (critical>0), no DOWN slots" "grep -q 'CRITICAL=1 DOWN=0 UNPROVEN=1' <<<\"\$out\""
+check "unproven remote: contract (6) slots counted DOWN + critical, headline reflects gap" "grep -q 'CRITICAL=6 DOWN=6 UNPROVEN=1' <<<\"\$out\" && grep -q '<unknown-prefix>-6 (unproven)' <<<\"\$out\""
 check "stale hardcoded prefix defaults removed" "! grep -q 'ez-mac-runner-e' '$ROOT/doctor-runner'"
 
 out=$(FAKE_SSH_CFG=ok run_remote)
@@ -60,16 +60,18 @@ check "config count 5 < contract 6 -> [BAD] underprovisioned" "grep -q 'BAD .*re
 check "underprovisioned inspects contract (6) slots, not 5" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && ! grep -q 'LIST ez-mac-runner-g 5' <<<\"\$out\""
 check "underprovisioned counts a slot-proof critical" "grep -q 'CRITICAL=1 ' <<<\"\$out\""
 
-out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=5 run_remote)
-check "env overrides bypass lookup" "grep -q 'LIST ez-mac-runner-g 5' <<<\"\$out\" && grep -q 'UNPROVEN=0' <<<\"\$out\""
+out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=6 run_remote)
+check "env overrides (prefix+count at contract) bypass lookup" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && grep -q 'UNPROVEN=0' <<<\"\$out\""
 
 # Finding A (Linux side): a remote Linux count below 10 is underprovisioned too.
 out=$(FAKE_SSH_CFG=ok FAKE_SSH_COUNT=9 T_PLATFORM=macos run_remote)
 check "linux config count 9 < contract 10 -> [BAD] underprovisioned" "grep -q 'BAD .*remote config count 9 is below the fleet contract 10 — underprovisioned' <<<\"\$out\" && grep -q 'LIST ez-mac-runner-g 10' <<<\"\$out\""
 
-# Explicit env override is an operator decision: not flagged against the contract.
+# Item 2: an explicit override below the contract is flagged too (it may raise the count, never lower it).
 out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=5 run_remote)
-check "explicit override count 5 not flagged underprovisioned" "! grep -q underprovisioned <<<\"\$out\" && grep -q 'CRITICAL=0 ' <<<\"\$out\""
+check "override count 5 < contract 6 -> underprovisioned, contract slots inspected, critical" "grep -q 'underprovisioned' <<<\"\$out\" && grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && grep -q 'CRITICAL=1 ' <<<\"\$out\""
+out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=8 run_remote)
+check "override count 8 > contract raises capacity, not flagged" "! grep -q underprovisioned <<<\"\$out\" && grep -q 'LIST ez-mac-runner-g 8' <<<\"\$out\" && grep -q 'CRITICAL=0 ' <<<\"\$out\""
 
 # Finding B: unreachable remote with empty prefix/count never greens, never builds "-1" names.
 cat > "$TMP/bin/ssh_down" <<'SH'
@@ -80,8 +82,11 @@ chmod +x "$TMP/bin/ssh_down"; cp "$TMP/bin/ssh" "$TMP/bin/ssh_real"; cp "$TMP/bi
 out=$(run_remote)
 check "unreachable + no override -> critical >= contract count" "grep -q 'CRITICAL=6 DOWN=6 ' <<<\"\$out\""
 check "unreachable + no override -> no empty-prefix slot names" "! grep -qE 'NAMES=(-| )|[ =]-[0-9]+ \\(unreachable' <<<\"\$out\""
-out=$(T_COUNT=3 run_remote)
-check "unreachable, count but no prefix -> placeholder prefix, critical 3" "grep -q 'CRITICAL=3 DOWN=3 ' <<<\"\$out\" && grep -q 'NAMES=<unknown-prefix>-1 ' <<<\"\$out\" && ! grep -qE '[ =]-[0-9]+ \\(unreachable' <<<\"\$out\""
+out=$(T_COUNT=8 run_remote)
+check "unreachable, count but no prefix -> placeholder prefix, critical 8" "grep -q 'CRITICAL=8 DOWN=8 ' <<<\"\$out\" && grep -q 'NAMES=<unknown-prefix>-1 ' <<<\"\$out\" && ! grep -qE '[ =]-[0-9]+ \\(unreachable' <<<\"\$out\""
+# Item 3: explicit count 0 with unreachable remote still adds criticals.
+out=$(T_PREFIX=ez-mac-runner-g T_COUNT=0 run_remote)
+check "unreachable + count 0 -> critical >= 1 (contract floor)" "grep -qE 'CRITICAL=([1-9][0-9]*) ' <<<\"\$out\""
 cp "$TMP/bin/ssh_real" "$TMP/bin/ssh"
 
 # --- queue block must not abort the caller ---
@@ -107,5 +112,29 @@ set -e
 check "queue tail BAD line printed" "grep -q 'queue tail (job-level)' <<<\"\$qout\""
 check "doctor continues past failing queue block (rc=0)" "[ $rc -eq 0 ]"
 check "next section reached with QUEUE_TAIL_BAD=1" "grep -q 'REACHED_NEXT_SECTION QUEUE_TAIL_BAD=1' <<<\"\$qout\""
+
+# Item 1: `gh api` failing inside queue-health.sh must not kill the caller
+# under `set -u` (unset QUEUE_* after a failed python eval) -- sections 9/10 must run.
+cat > "$TMP/bin/gh" <<'SH'
+#!/usr/bin/env bash
+echo "gh: simulated API failure" >&2
+exit 1
+SH
+chmod +x "$TMP/bin/gh"
+set +e
+qout=$(
+  set -euo pipefail
+  PATH="$TMP/bin:$PATH"
+  SCRIPT_DIR="$ROOT"
+  JOBLEVEL_QUEUED_COUNT=3 JOBLEVEL_OLDEST_QUEUED_MIN=45 JOBLEVEL_FETCH_ERRORS=0
+  export JOBLEVEL_QUEUED_COUNT JOBLEVEL_OLDEST_QUEUED_MIN JOBLEVEL_FETCH_ERRORS
+  eval "$QSNIP"
+  echo "REACHED_NEXT_SECTION QUEUE_RC=$QUEUE_RC QUEUE_TAIL_BAD=$QUEUE_TAIL_BAD"
+) 2>&1
+rc=$?
+set -e
+check "failing gh: doctor continues past queue block (rc=0)" "[ $rc -eq 0 ]"
+check "failing gh: next section reached, queue block non-green (QUEUE_RC=2)" "grep -q 'REACHED_NEXT_SECTION QUEUE_RC=2 QUEUE_TAIL_BAD=1' <<<\"\$qout\""
+check "failing gh: no unbound-variable abort" "! grep -q 'unbound variable' <<<\"\$qout\""
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }

@@ -64,6 +64,9 @@ jobs:
           bash tests/doctor_runner_live_slot_gate_test.sh
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
+          bash tests/doctor_runner_remote_config_and_queue_test.sh
+          bash tests/doctor_runner_unreachable_remote_test.sh
+          bash tests/doctor_runner_verdict_line_test.sh
       - name: Slot-drift reclaim correlation regression test (bead jleechan-tv58)
         # Hermetic test (no Docker daemon, no GitHub auth required). Runs
         # the production `release_stale_slots_from_with_containers` path

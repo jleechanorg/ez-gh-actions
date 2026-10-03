@@ -43,18 +43,19 @@ info() { printf '  [..]   %s\n' "$*"; }
 
 if ! command -v gh >/dev/null 2>&1; then
   bad "gh CLI not found — cannot measure queue health"
-  _qh_finish 2
+  _qh_finish 2; return 2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   bad "python3 not found — cannot measure queue health"
-  _qh_finish 2
+  _qh_finish 2; return 2
 fi
 
 section "8. GitHub Actions queue health ($QUEUE_REPO)"
 
 export QUEUE_REPO QUEUE_TAIL_WARN_MIN STALE_HOURS
 
-eval "$(python3 <<'PY'
+_qh_py_rc=0
+_qh_py_out=$(python3 <<'PY'
 import json, os, subprocess, datetime, statistics
 
 repo = os.environ["QUEUE_REPO"]
@@ -146,7 +147,12 @@ runlevel_exceeded = 1 if mx > tail_warn else 0
 print(f'export QUEUE_RUNLEVEL_TAIL_EXCEEDED={runlevel_exceeded}')
 print(f'export QUEUE_STALE_ZOMBIES={1 if len(stale) > 0 else 0}')
 PY
-)"
+) || _qh_py_rc=$?
+if [ "${_qh_py_rc:-0}" -ne 0 ]; then
+  bad "queue metrics unavailable: GitHub API read failed (python exit ${_qh_py_rc}) — queue health UNPROVEN"
+  _qh_finish 2; return 2
+fi
+eval "$_qh_py_out"
 
 info "workflow runs in_progress: $QUEUE_IN_PROGRESS"
 info "workflow runs queued (total): $QUEUE_QUEUED_TOTAL (fresh <${STALE_HOURS}h: $QUEUE_QUEUED_FRESH, stale zombies: $QUEUE_QUEUED_STALE)"
