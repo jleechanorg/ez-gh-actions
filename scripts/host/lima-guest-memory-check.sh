@@ -81,6 +81,7 @@ bytes="$(yaml_to_bytes "$yaml_mem")" || bytes=""
 values+=("$bytes")
 
 command -v "$LIMACTL" >/dev/null 2>&1 || unknown "limactl not found for instance ${INSTANCE_DIR}"
+command -v python3 >/dev/null 2>&1 || unknown "python3 not found; cannot parse limactl list --json"
 # Prints "<status> <memory-bytes>"; .memory must be a JSON integer.
 limactl_out="$("$LIMACTL" list --json colima 2>/dev/null)" || unknown "limactl list --json colima failed"
 read -r status limactl_mem < <(python3 -c 'import json,sys
