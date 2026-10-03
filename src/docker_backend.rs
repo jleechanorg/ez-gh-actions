@@ -1006,6 +1006,23 @@ enum LocalRunnerActivity {
     Busy,
     Idle,
     Unknown,
+    /// `docker top` reported the container no longer exists ("No such
+    /// container"). Distinct from `Unknown`: an absent container is a
+    /// definitive signal that the slot's local state has been torn down,
+    /// so `release_stale_slots` can safely reclaim. Genuine probe failures
+    /// (timeout, daemon error, transient I/O) remain `Unknown` and stay
+    /// fail-safe per bead jleechan-95jk root-cause analysis: do not blindly
+    /// treat all errors as absence.
+    Absent,
+}
+
+/// True if `docker top` stderr indicates the container is gone. Docker
+/// reports a missing container with "No such container" (the standard
+/// engine message since at least docker 20) and historically "No such
+/// object" in some plugin paths. Anything else (timeout, daemon error,
+/// I/O failure) is a transient/systemic failure that stays fail-safe.
+fn docker_top_container_absent(stderr: &str) -> bool {
+    stderr.contains("No such container") || stderr.contains("No such object")
 }
 
 fn local_runner_activity(container_name: &str) -> LocalRunnerActivity {
@@ -1018,9 +1035,12 @@ fn local_runner_activity(container_name: &str) -> LocalRunnerActivity {
     ) {
         Ok(out) if out.status.success() => out,
         Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if docker_top_container_absent(&stderr) {
+                return LocalRunnerActivity::Absent;
+            }
             eprintln!(
-                "warning: keeping {container_name}: local activity probe failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "warning: keeping {container_name}: local activity probe failed: {stderr}"
             );
             return LocalRunnerActivity::Unknown;
         }
@@ -1455,6 +1475,41 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                                     eprintln!(
                                         "warning: keeping slot {slot_n}: local activity for {expected_name} is unknown while GH snapshot omits registration {rid} (elapsed {elapsed}s); failing safe"
                                     );
+                                }
+                                LocalRunnerActivity::Absent => {
+                                    // Bead jleechan-95jk root-cause: a slot
+                                    // that is "gh-missing-but-locally-tracked"
+                                    // and whose local container is GONE
+                                    // (docker top: No such container) must
+                                    // reclaim immediately, not wait out the
+                                    // grace window. The previous code treated
+                                    // this as Unknown and the slot stayed
+                                    // reserved even though the container was
+                                    // already gone, blocking reconciliation.
+                                    let wall_secs = now_epoch_secs();
+                                    let monotonic_secs =
+                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let last_run_id =
+                                        live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                                    let peak_rss_mb = 0u64;
+                                    eprintln!(
+                                        "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-container-absent (docker top: No such container for {expected_name})"
+                                    );
+                                    record_reclaim(
+                                        slot,
+                                        ReclaimRecord {
+                                            monotonic_secs: 0.0,
+                                            wall_secs,
+                                            slot: slot_n,
+                                            runner_id: rid,
+                                            last_run_id,
+                                            peak_rss_mb,
+                                            in_grace: false,
+                                            reason: "gh-rejected-container-absent".to_string(),
+                                        },
+                                    );
+                                    release_slot_for(cfg, slot_n)?;
+                                    reclaimed += 1;
                                 }
                                 LocalRunnerActivity::Idle => {
                                     // A proven listener with no GitHub registration
@@ -3513,6 +3568,48 @@ fn runner_present(output: &str) -> bool {
     })
 }
 
+/// Three-state diagnostic split of a managed container's runner activity.
+///
+/// `Busy` = a `Runner.Worker` process is alive in the container (executing a
+/// GitHub Actions job right now). `ReadyIdle` = only `Runner.Listener` is
+/// alive (registered with GitHub, polling for work). `Unknown` = neither
+/// process is present (the runner has died or never started).
+///
+/// This split is purely diagnostic — the daemon's settling/readiness decision
+/// continues to count ReadyIdle as "ready" (the listener is polling for work
+/// and the slot IS operational), while Busy is "actually executing a job
+/// now". Bead jleechan-viff: the prior readiness check ignored listeners
+/// and produced false-positive `settling ceiling reached` CRITICALs on idle
+/// healthy fleets. This enum re-establishes that split without regressing
+/// it. Bead jleechan-95jk / 2026-10-03 throughput doc: distinguish Listener
+/// vs Worker in diagnostics (without breaking idle readiness) is exactly
+/// this enum's purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerActivityState {
+    Busy,
+    ReadyIdle,
+    Unknown,
+}
+
+fn runner_activity_state(output: &str) -> RunnerActivityState {
+    let mut has_worker = false;
+    let mut has_listener = false;
+    for line in output.lines().skip(1) {
+        match line.split_whitespace().nth(1) {
+            Some("Runner.Worker") => has_worker = true,
+            Some("Runner.Listener") => has_listener = true,
+            _ => {}
+        }
+    }
+    if has_worker {
+        RunnerActivityState::Busy
+    } else if has_listener {
+        RunnerActivityState::ReadyIdle
+    } else {
+        RunnerActivityState::Unknown
+    }
+}
+
 #[allow(dead_code)]
 fn runner_worker_present(output: &str) -> bool {
     output
@@ -3539,23 +3636,71 @@ fn executing_runner_count_with_probe<N, P>(
     containers: &[ManagedContainer],
     deadline: Instant,
     mut now: N,
-    mut probe: P,
+    probe: P,
 ) -> Result<u32>
 where
     N: FnMut() -> Instant,
-    P: FnMut(&ManagedContainer, Duration) -> Result<bool>,
+    P: Fn(&ManagedContainer, Duration) -> Result<bool> + Sync,
 {
     let owned = current_prefix_containers(containers, cfg);
+    if owned.is_empty() {
+        return Ok(0);
+    }
+    // Bounded parallelism: spawn one probe per container, capped by the
+    // fleet contract (10 Linux + 6 Mac = 16 max — itself under the
+    // `DockerChildReaper`'s `DOCKER_REAPER_ACTIVE_CAP` of 64). The shared
+    // 30s readiness deadline (`LOCAL_READINESS_BUDGET`) means the worst-case
+    // wall-clock cost of this whole readiness pass is bounded by
+    // `LOCAL_TOP_TIMEOUT` (3s) plus deadline overhead — sequential probes
+    // previously could spend up to 30s on a 10-container Linux host when
+    // every top call hit the 3s timeout (bead jleechan-95jk).
+    //
+    // Spawn-then-break on first deadline expiry: each per-container `now()`
+    // call yields the remaining wall-clock budget at dispatch time, and the
+    // FIRST container whose deadline has expired is rejected (its name is
+    // surfaced for the partial-readiness error); earlier ones keep their
+    // probes running. The probe itself is `Fn + Sync`: production probes are
+    // stateless or use an internal `Mutex`; tests adapt their mutable
+    // captures with `Arc<Mutex<_>>` (see
+    // `readiness_probes_share_deadline_and_stop_after_it`).
+    let probe_ref = &probe;
+    let mut deadline_expired: Option<String> = None;
+    let probe_results: Vec<Result<bool>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(owned.len());
+        for container in &owned {
+            let timeout = match readiness_probe_timeout_until(deadline, now()) {
+                Some(timeout) => timeout,
+                None => {
+                    deadline_expired.get_or_insert_with(|| container.name.clone());
+                    break;
+                }
+            };
+            handles.push(scope.spawn(move || probe_ref(container, timeout)));
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|panic| -> Result<bool> {
+                    Err(anyhow::anyhow!(
+                        "Runner.Worker readiness probe panicked: {:?}",
+                        panic
+                    ))
+                })
+            })
+            .collect()
+    });
+    if let Some(name) = deadline_expired {
+        return Err(anyhow::Error::msg(format!(
+            "Runner.Worker readiness budget expired before inspecting {name}"
+        )));
+    }
+
     let mut executing = 0;
-    for container in owned {
-        let timeout = readiness_probe_timeout_until(deadline, now()).with_context(|| {
-            format!(
-                "Runner.Worker readiness budget expired before inspecting {}",
-                container.name
-            )
-        })?;
-        if probe(container, timeout)? {
-            executing += 1;
+    for result in probe_results {
+        match result {
+            Ok(true) => executing += 1,
+            Ok(false) => {}
+            Err(err) => return Err(err),
         }
     }
     Ok(executing)
@@ -3568,6 +3713,7 @@ fn executing_runner_count_from_containers(
 ) -> Result<u32> {
     #[cfg(test)]
     {
+        use std::sync::atomic::{AtomicU32, Ordering};
         let owned = current_prefix_containers(containers, cfg);
         let configured = TEST_EXECUTING_RUNNER_COUNTS
             .lock()
@@ -3576,21 +3722,42 @@ fn executing_runner_count_from_containers(
             .expect("test must explicitly configure Runner.Worker readiness")
             .pop_front()
             .expect("test Runner.Worker readiness sequence exhausted");
-        let mut remaining = match configured {
-            Ok(count) => count.min(owned.len() as u32),
-            Err(error) => return Err(anyhow::Error::msg(error)),
-        };
-        executing_runner_count_with_probe(
-            cfg,
-            containers,
-            deadline,
-            Instant::now,
-            |_container, _timeout| {
-                let present = remaining > 0;
-                remaining = remaining.saturating_sub(1);
-                Ok(present)
-            },
-        )
+        // Probe closures must be `Fn + Sync` for parallel readiness probes
+        // (production fan-out via `std::thread::scope`). Wrap the
+        // monotonically-decreasing remaining counter in an atomic so the
+        // `Fn + Sync` bound is satisfied without altering the
+        // first-`count`-true-then-false semantics the existing tests
+        // (and the original sequential code) relied on. Use
+        // `fetch_update` (not `fetch_sub`) so the counter saturates at zero
+        // — parallel threads can race past zero where the sequential version
+        // could not, and a wrapping subtraction would spuriously report
+        // post-zero probes as "ready".
+        match configured {
+            Ok(count) => {
+                let remaining = AtomicU32::new(count.min(owned.len() as u32));
+                executing_runner_count_with_probe(
+                    cfg,
+                    containers,
+                    deadline,
+                    Instant::now,
+                    move |_container, _timeout| {
+                        // Atomically: if `remaining > 0`, decrement and
+                        // return Ok(prev) where prev > 0; else return
+                        // Ok(false) without mutating the counter.
+                        let present = remaining
+                            .fetch_update(
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                                |x| if x > 0 { Some(x - 1) } else { None },
+                            )
+                            .map(|prev| prev > 0)
+                            .unwrap_or(false);
+                        Ok(present)
+                    },
+                )
+            }
+            Err(error) => Err(anyhow::Error::msg(error)),
+        }
     }
 
     #[cfg(not(test))]
@@ -3612,11 +3779,21 @@ fn executing_runner_count_from_containers(
             )
             .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
             if !out.status.success() {
-                bail!(
-                    "docker top failed for {}: {}",
-                    container.name,
-                    String::from_utf8_lossy(&out.stderr)
-                );
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // Bead jleechan-95jk root-cause: a container that is GONE
+                // (docker top: "No such container") is not a probe failure
+                // — it is definitive evidence that the readiness pass does
+                // not include this slot. Returning Ok(false) keeps the rest
+                // of the readiness evidence (the other 9/10 slots) usable
+                // and lets the settling loop reconcile promptly without
+                // waiting out the 30s shared budget on a container that was
+                // never going to come back. Genuine failures (timeout,
+                // daemon error, transient I/O) still propagate so the
+                // settling loop reports incomplete evidence.
+                if docker_top_container_absent(&stderr) {
+                    return Ok(false);
+                }
+                bail!("docker top failed for {}: {}", container.name, stderr);
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
             Ok(runner_present(&stdout))
@@ -6137,6 +6314,67 @@ minimum_isolation = "container"
         ));
     }
 
+    /// Bead jleechan-95jk / 2026-10-03 throughput doc: distinguish Listener
+    /// vs Worker in diagnostics. `runner_activity_state` returns the precise
+    /// three-state split; `runner_present` (above) is the boolean "ready"
+    /// view that the readiness count continues to use.
+    #[test]
+    fn runner_activity_state_distinguishes_busy_vs_ready_idle() {
+        // Worker only → Busy (executing a job right now).
+        assert_eq!(
+            runner_activity_state("PID COMMAND\n202 Runner.Worker\n"),
+            RunnerActivityState::Busy
+        );
+        // Listener only → ReadyIdle (registered, polling for work).
+        assert_eq!(
+            runner_activity_state("PID COMMAND\n101 Runner.Listener\n"),
+            RunnerActivityState::ReadyIdle
+        );
+        // Both Worker and Listener → Busy wins (the worker is the live job).
+        assert_eq!(
+            runner_activity_state("PID COMMAND\n1 Runner.Listener\n2 Runner.Worker\n"),
+            RunnerActivityState::Busy
+        );
+        // Neither → Unknown (broken container, runner process died).
+        assert_eq!(
+            runner_activity_state("PID COMMAND\n101 NotRunner.Workerish\n"),
+            RunnerActivityState::Unknown
+        );
+        assert_eq!(
+            runner_activity_state("PID COMMAND\n"),
+            RunnerActivityState::Unknown
+        );
+    }
+
+    /// Bead jleechan-95jk root-cause: a docker top that returns "No such
+    /// container" is a definitive signal that the container is GONE — not a
+    /// probe failure. The readiness probe converts it to Ok(false) (so the
+    /// readiness pass is not invalidated by one absent slot) and the
+    /// release_stale_slots path converts it to LocalRunnerActivity::Absent
+    /// (so the slot can be reclaimed). This test pins the stderr classifier
+    /// that both paths share.
+    #[test]
+    fn docker_top_container_absent_classifies_only_no_such_container() {
+        // Canonical docker engine message.
+        assert!(docker_top_container_absent(
+            "Error response from daemon: No such container: ez-runner-c-3"
+        ));
+        // Some plugin paths historically report "No such object".
+        assert!(docker_top_container_absent(
+            "Error: No such object: ez-runner-c-3"
+        ));
+        // Genuine probe failures must NOT classify as absence.
+        assert!(!docker_top_container_absent("Error response from daemon: context deadline exceeded"));
+        assert!(!docker_top_container_absent(""));
+        assert!(!docker_top_container_absent(
+            "Error response from daemon: permission denied while trying to connect to the Docker daemon socket"
+        ));
+        // "No such container" inside a longer log line still matches.
+        assert!(docker_top_container_absent(
+            "level=error msg=\"No such container: ez-runner-c-3 (docker top)\""
+        ));
+    }
+
     #[test]
     fn readiness_probe_timeout_caps_at_three_seconds_and_preserves_sub_three_seconds() {
         assert_eq!(
@@ -6168,15 +6406,26 @@ minimum_isolation = "container"
             start + LOCAL_READINESS_BUDGET,
         ]
         .into_iter();
-        let mut launched = Vec::new();
+        // Probe is `Fn + Sync` (parallel dispatch via `std::thread::scope`),
+        // so its captures must be thread-safe. `Arc<Mutex<Vec>>` is the
+        // smallest such wrapper that preserves the per-call `push` semantics
+        // the original sequential test relied on; a sort-by-name lets us
+        // assert on the (name, timeout) pairs without depending on which
+        // spawned thread acquired the mutex first.
+        let launched: std::sync::Arc<std::sync::Mutex<Vec<(String, Duration)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launched_inside = launched.clone();
 
         let result = executing_runner_count_with_probe(
             &cfg,
             &containers,
             deadline,
             || clock.next().unwrap(),
-            |container, timeout| {
-                launched.push((container.name.clone(), timeout));
+            move |container, timeout| {
+                launched_inside
+                    .lock()
+                    .unwrap()
+                    .push((container.name.clone(), timeout));
                 Ok(true)
             },
         );
@@ -6185,6 +6434,11 @@ minimum_isolation = "container"
             result.unwrap_err().to_string().contains("ez-org-runner-4"),
             "the fourth container must be rejected after the shared deadline"
         );
+        let mut launched = Arc::try_unwrap(launched)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        launched.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             launched,
             vec![
@@ -6192,7 +6446,7 @@ minimum_isolation = "container"
                 ("ez-org-runner-2".to_string(), Duration::from_secs(3)),
                 ("ez-org-runner-3".to_string(), Duration::from_secs(2)),
             ],
-            "sequential top probes must cap normally, shorten at the tail, and not launch after expiry"
+            "parallel top probes must cap normally, shorten at the tail, and not launch after expiry"
         );
     }
 
@@ -6201,6 +6455,111 @@ minimum_isolation = "container"
         let now = Instant::now();
         let deadline = now - Duration::from_secs(1);
         assert_eq!(remaining_until_deadline(deadline, now), None);
+    }
+
+    /// Bead jleechan-95jk: the headline win of parallel readiness probes.
+    /// Six simulated 1s-each probes should fit in roughly 1s wall-clock,
+    /// not 6s. Sequential probes previously could spend up to 30s on a
+    /// 10-container Linux host when every top call hit the 3s timeout.
+    /// This test runs real sleeping probes (no docker dependency) inside
+    /// `executing_runner_count_with_probe`'s parallel-spawn machinery and
+    /// asserts the total is bounded by the slowest probe plus overhead.
+    #[test]
+    fn parallel_readiness_probes_share_wall_clock_within_max_probe() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Instant;
+        let cfg = cfg_with(6, "ez-org-runner");
+        let containers: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let probe_cost = Duration::from_millis(50);
+        let probes_done = std::sync::Arc::new(AtomicU32::new(0));
+        let probes_inside = probes_done.clone();
+
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, timeout| {
+                // Sleep for the configured probe cost, never more than the
+                // probe timeout itself.
+                std::thread::sleep(probe_cost.min(timeout));
+                probes_inside.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.unwrap(), 6, "all six probes should return ready");
+        assert_eq!(
+            probes_done.load(Ordering::SeqCst),
+            6,
+            "all six probes should have completed"
+        );
+        // Parallel wall-clock budget: the slowest single probe (probe_cost)
+        // plus reasonable scheduling overhead. Sequential 6x50ms would be
+        // ~300ms; parallel should be well under 250ms (half the sequential
+        // budget) on any reasonable CI host.
+        assert!(
+            elapsed < probe_cost * 4 + Duration::from_millis(100),
+            "parallel probes ran sequentially (elapsed={:?}, probe_cost={:?})",
+            elapsed,
+            probe_cost
+        );
+    }
+
+    /// Bead jleechan-95jk: even with parallel probes, the deadline is still
+    /// shared. If a probe's own budget is exceeded mid-flight, the next
+    /// container's probe should not be launched. This pins the
+    /// spawn-then-break semantics introduced when the readiness loop became
+    /// parallel (previously sequential `?` exited on the first timeout).
+    #[test]
+    fn parallel_readiness_probes_respect_per_probe_timeout() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let cfg = cfg_with(3, "ez-org-runner");
+        let containers: Vec<_> = (1..=3)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        // Deadline permits exactly two 1s probes; the third container's
+        // `now()` will read past the deadline and reject the slot name.
+        let deadline = start + Duration::from_secs(2);
+        let mut clock = [
+            start,
+            start + Duration::from_secs(1),
+            start + Duration::from_secs(2),
+        ]
+        .into_iter();
+        let launches = std::sync::Arc::new(AtomicU32::new(0));
+        let launches_inside = launches.clone();
+
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            || clock.next().unwrap(),
+            move |_container, timeout| {
+                launches_inside.fetch_add(1, Ordering::SeqCst);
+                Ok(timeout > Duration::ZERO)
+            },
+        );
+
+        let err_str = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an Err result, got Ok"),
+        };
+        assert!(
+            err_str.contains("ez-org-runner-3"),
+            "the third container (whose `now()` past the deadline) must be the rejected name; got: {err_str}"
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            2,
+            "only the first two probes must have spawned"
+        );
     }
 
     #[test]
@@ -7138,6 +7497,54 @@ minimum_isolation = "container"
                 .assignments
                 .contains_key("1"),
             "the slot must remain owned when local activity is unknown"
+        );
+    }
+
+    /// Bead jleechan-95jk root-cause: a slot whose local container is GONE
+    /// (docker top: "No such container") past the grace window must reclaim,
+    /// NOT stay fail-safe Unknown. The 2026-10-03 throughput doc evidences
+    /// this on Linux journal: "keeping slot 3 because docker top says No
+    /// such container despite snapshot omission". `LocalRunnerActivity::Absent`
+    /// is the new fourth state (alongside Busy/Idle/Unknown) that tells
+    /// `release_stale_slots` the container is definitively gone and the
+    /// slot can be released.
+    #[test]
+    fn release_stale_slots_reclaims_when_local_container_is_absent() {
+        let _env = TestEnv::new("stale_absent_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // The container name is reported as locally-known (consistent with
+        // a recent snapshot taken before it died), but the activity probe
+        // returns Absent because docker top says "No such container".
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "a slot whose local container is gone (Absent) past the grace window must reclaim"
+        );
+        assert!(
+            !read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "slot 1 must be released when the local container has been confirmed gone"
         );
     }
 
