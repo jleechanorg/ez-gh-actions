@@ -2889,6 +2889,12 @@ fn runner_name_for(cfg: &Config, slot: u32) -> String {
 /// the local host when docker runs inside a VM (Colima/Lima/Docker Desktop)
 /// or on a remote context. Limits must respect the daemon, not the host.
 pub fn daemon_capacity() -> Option<(f64, u64)> {
+    #[cfg(test)]
+    {
+        if let Some(override_cap) = TEST_DAEMON_CAPACITY.lock().unwrap().clone() {
+            return override_cap;
+        }
+    }
     let mut cmd = docker_cmd();
     cmd.args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"]);
     let out = run_docker(cmd, "reading docker daemon capacity").ok()?;
@@ -2898,6 +2904,10 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
     let mem_bytes: u64 = parts.next()?.parse().ok()?;
     Some((ncpu, mem_bytes / 1024 / 1024))
 }
+
+#[cfg(test)]
+static TEST_DAEMON_CAPACITY: std::sync::Mutex<Option<Option<(f64, u64)>>> =
+    std::sync::Mutex::new(None);
 
 /// Lane-I (Round-3 swarm): read PSI cgroup-v2 memory pressure (`some` line)
 /// from `source` and host `MemAvailable`. Returns `(pressure_pct,
@@ -3520,14 +3530,20 @@ fn start_one_with_generate_at_slot(
     ) -> Result<(String, u64)>,
 ) -> Result<(String, String)> {
     require_host_containment(cfg)?;
+    // Validate cpu_burst BEFORE any mutation: even the pre_rm container
+    // cleanup below is a docker invocation, so an unsupported burst
+    // must refuse before we touch any container or call generate_jitconfig.
+    // effective_limits returns Err when cpu_burst=true but daemon is not
+    // VM-contained OR daemon_capacity() returned no finite positive ncpu;
+    // we map_err to preserve the human-readable message up to start_one's
+    // caller (start_missing_runners, ensure_count_outcome, the journal).
+    let (cpus, memory_mb) = effective_limits(cfg).map_err(anyhow::Error::msg)?;
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
     let mut pre_rm = docker_cmd();
     pre_rm.args(["rm", "-f", &runner_name]);
     let _ = run_docker(pre_rm, "pre-start rm -f").ok();
-
-    let (cpus, memory_mb) = effective_limits(cfg).map_err(anyhow::Error::msg)?;
     // Build the set of GitHub runner_ids we own (slot file = host ownership).
     // Pass it to generate_jitconfig so a name collision during the 409
     // self-heal can be reclaimed as one of ours regardless of GitHub's
@@ -7669,6 +7685,74 @@ minimum_isolation = "container"
             assignments.assignments.is_empty(),
             "slot reserved by start_one should be cleaned up when docker run fails"
         );
+    }
+
+    /// Production start_one rejection regression (root review): an
+    /// unsupported cpu_burst configuration (burst=true with either
+    /// unverified-VM daemon OR unknown capacity) must refuse BEFORE any
+    /// container mutation (no `docker rm -f` pre-clean) and BEFORE the
+    /// JIT callback (`generate_jitconfig`). The Serve precheck only
+    /// catches this at startup; if the operator flips the config mid-run
+    /// OR capacity disappears after startup, the production start_one
+    /// path is the second line of defense. This test pins the
+    /// `pre-check-before-mutation` ordering by forcing both refusal
+    /// conditions (unknown capacity AND a non-VM-detected host) — on
+    /// either branch the rejection must run before docker is invoked.
+    #[test]
+    fn start_one_rejects_unsupported_burst_before_any_mutation_or_jit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _env = TestEnv::new("start_one_burst_unknown_capacity");
+        cpu_probe_overrides::set(Some(true));
+
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.cpu_burst = true;
+
+        // Force daemon_capacity() to return None so the inner
+        // effective_limits runs the no-capacity refusal branch (the VM
+        // refusal branch would otherwise fire first on a non-VM test
+        // host — both branches must satisfy the no-mutation invariant,
+        // but driving the no-capacity path makes the test deterministic
+        // regardless of the host's daemon_in_vm result).
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = Some(None);
+
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-burst-no-mutation-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        // The fake docker MUST still be installed even though we expect
+        // zero invocations — the rejection must happen before any
+        // docker_cmd() is even built. If a docker invocation DID happen
+        // it would log to this file and the assertion below would fail.
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let jit_calls = AtomicUsize::new(0);
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            jit_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(("jit-token".into(), 1))
+        })
+        .expect_err("cpu_burst with unknown capacity must return Err from start_one");
+
+        assert!(
+            err.to_string().contains("cpu_burst"),
+            "Err must mention cpu_burst so operators can diagnose the misconfig; got: {err:#}"
+        );
+        assert_eq!(
+            jit_calls.load(Ordering::SeqCst),
+            0,
+            "generate_jitconfig MUST NOT be invoked when cpu_burst is unsupported; \
+             otherwise the runner could register on GitHub while the spawn is refused"
+        );
+
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        assert!(
+            captured.is_empty(),
+            "start_one_with_generate_at_slot must execute zero docker invocations when \
+             cpu_burst is unsupported; the rejected path must run BEFORE pre_rm. \
+             Captured args:\n{captured}"
+        );
+
+        // Cleanup so a later test sees the real daemon_capacity path.
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
     }
 
     /// Fake `docker` script that captures its full argv to `capture_path`
