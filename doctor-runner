@@ -547,11 +547,22 @@ if [ "$PLATFORM" = "linux" ]; then
   fi
   PANIC_TIMEOUT=$(sysctl -n kernel.panic 2>/dev/null || echo unknown)
   PANIC_ON_OOPS=$(sysctl -n kernel.panic_on_oops 2>/dev/null || echo unknown)
-  if [ "$PANIC_TIMEOUT" != "0" ] || [ "$PANIC_ON_OOPS" != "0" ]; then
+  # kernel.panic != 0 is an automatic reboot timer: always BAD. panic_on_oops=1
+  # is the operator-approved kdump crash-capture design (kdump-config sets it
+  # when it loads the crash kernel; bead bd-dea.10) and is OK only while the
+  # crash kernel is actually loaded (KEXEC_CRASH_LOADED_PATH overridable for tests).
+  KEXEC_CRASH_LOADED_PATH="${KEXEC_CRASH_LOADED_PATH:-/sys/kernel/kexec_crash_loaded}"
+  KEXEC_CRASH_LOADED=$(cat "$KEXEC_CRASH_LOADED_PATH" 2>/dev/null || echo 0)
+  if [ "$PANIC_TIMEOUT" != "0" ]; then
     bad "kernel auto-recovery is armed (kernel.panic=${PANIC_TIMEOUT}, kernel.panic_on_oops=${PANIC_ON_OOPS}); operator must disarm it"
     HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
-  else
+  elif [ "$PANIC_ON_OOPS" = "0" ]; then
     ok "kernel panic and oops auto-recovery are disabled"
+  elif [ "$PANIC_ON_OOPS" = "1" ] && [ "$KEXEC_CRASH_LOADED" = "1" ]; then
+    ok "kernel.panic_on_oops=1 with crash kernel loaded: oops -> kdump crash capture; kernel.panic=0 so no automatic reboot timer"
+  else
+    bad "kernel auto-recovery is armed (kernel.panic=${PANIC_TIMEOUT}, kernel.panic_on_oops=${PANIC_ON_OOPS}, kexec_crash_loaded=${KEXEC_CRASH_LOADED}); operator must disarm it"
+    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
   fi
 fi
 
@@ -699,7 +710,9 @@ set -e
 JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
 JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
 JOBLEVEL_OLDEST_QUEUED_MIN="0"
-[ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ] && JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT")
+if [ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ]; then
+  JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT") || JOBLEVEL_OLDEST_QUEUED_MIN="?"
+fi
 
 # Count fetch failures recorded by the (subshell) builder. Run-list failures
 # and per-run jobs failures counted separately for the diagnostic message.
@@ -723,12 +736,14 @@ fi
 QUEUE_TAIL_BAD=0
 QUEUE_QUEUED_STALE=0
 if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
+  # `|| QUEUE_RC=$?` keeps errexit suppressed inside the sourced body even if
+  # it re-arms `set -e`: this section must never abort sections 9/10.
+  QUEUE_RC=0
   set +e
   # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/scripts/queue-health.sh"
-  QUEUE_RC=$?
+  source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   set -e
-  [ "$QUEUE_RC" -eq 1 ] && QUEUE_TAIL_BAD=1
+  if [ "$QUEUE_RC" -ne 0 ]; then QUEUE_TAIL_BAD=1; fi  # 1 = tail exceeded, 2 = unmeasurable (UNPROVEN)
 else
   section "8. GitHub Actions queue health"
   warn "scripts/queue-health.sh missing — queue metrics skipped"
@@ -1191,24 +1206,48 @@ REMOTE_DOWN_SLOTS=()
 # SLOT_PROOF_CRITICAL so the verdict flips to `bad` (the "fleet healthy"
 # ok() line cannot survive an unreachable half of the fleet).
 REMOTE_UNREACHABLE=0
+REMOTE_CONFIG_UNPROVEN=0
+if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"; else DEFAULT_REMOTE_COUNT="$DEFAULT_MAC_RUNNER_COUNT"; fi
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
-  if [ -z "$REMOTE_PREFIX" ]; then
-    if [ "$PLATFORM" = "macos" ]; then
-      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^name_prefix' ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
-      REMOTE_PREFIX="${REMOTE_PREFIX:-ez-runner-c}"
-    else
-      REMOTE_PREFIX=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^name_prefix' ~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
-      REMOTE_PREFIX="${REMOTE_PREFIX:-ez-mac-runner-e}"
-    fi
+  # Config lookup: one retry with a longer timeout. A failed read leaves the
+  # value EMPTY (never a hardcoded guess) -> remote fleet marked UNPROVEN below.
+  if [ "$PLATFORM" = "macos" ]; then
+    _rcfg_files='~/.config/ezgha/config.toml'
+  else
+    _rcfg_files='~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml'
   fi
-  if [ -z "$REMOTE_COUNT" ]; then
-    if [ "$PLATFORM" = "macos" ]; then
-      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^count\s*=' ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
-      REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"
-    else
-      REMOTE_COUNT=$(timeout 4 ssh -o ConnectTimeout=3 -o BatchMode=yes "$REMOTE_HOST" "grep -E '^count\s*=' ~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' \"\''" 2>/dev/null || true)
-      REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
-    fi
+  _remote_cfg_get() {  # $1 = grep pattern
+    local _t _v
+    for _t in 4 10; do
+      _v=$(timeout "$_t" ssh -o ConnectTimeout=$((_t - 1)) -o BatchMode=yes "$REMOTE_HOST" "grep -hE '$1' $_rcfg_files 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//; s/[^A-Za-z0-9_.-]//g'" 2>/dev/null) || _v=""
+      if [ -n "$_v" ]; then printf '%s' "$_v"; return 0; fi
+    done
+    return 0
+  }
+  [ -n "$REMOTE_PREFIX" ] || REMOTE_PREFIX=$(_remote_cfg_get '^name_prefix')
+  _remote_count_src="config"
+  if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); else _remote_count_src="override"; fi
+  if [ -z "$REMOTE_PREFIX" ] || [ -z "$REMOTE_COUNT" ]; then
+    REMOTE_CONFIG_UNPROVEN=1
+    REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
+    [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -ge "$DEFAULT_REMOTE_COUNT" ] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+    REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
+    bad "$REMOTE_LABEL remote config (name_prefix/count) could not be read over SSH after retry — remote fleet UNPROVEN (counted as $REMOTE_COUNT DOWN contract slot(s), no slot names guessed; fix SSH or set the MAC_RUNNER_NAME_PREFIX/MAC_RUNNER_COUNT or REMOTE_LINUX_PREFIX/REMOTE_LINUX_COUNT overrides)"
+    _unproven_idx=1
+    while [ "$_unproven_idx" -le "$REMOTE_COUNT" ]; do
+      REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unproven_idx} (unproven)")
+      _unproven_idx=$((_unproven_idx + 1))
+    done
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
+  else
+  # A count below the fleet contract (from config OR an env override) is
+  # underprovisioning, not the expected capacity: flag it and inspect the
+  # contract number of slots so the missing slot shows DOWN. Overrides may
+  # raise the count or set the prefix, never lower the contract.
+  if ! [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] || [ "$REMOTE_COUNT" -lt "$DEFAULT_REMOTE_COUNT" ]; then
+    bad "$REMOTE_LABEL remote $_remote_count_src count $REMOTE_COUNT is below the fleet contract $DEFAULT_REMOTE_COUNT — underprovisioned"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
+    REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
   fi
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
   REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
@@ -1224,6 +1263,7 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
     bad "$REMOTE_LABEL IDLE-STARVED (oldest queued job ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#REMOTE_IDLE_SLOTS[@]} slot(s): ${REMOTE_IDLE_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_IDLE_SLOTS[@]}))
   fi
+  fi
 else
   printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
   # Synthesize per-slot DOWN entries for every remote slot we cannot prove.
@@ -1236,6 +1276,13 @@ else
   # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
   # `ok` to `bad` so an unreachable host can never silently green.
   REMOTE_UNREACHABLE=1
+  # No override and no config lookup: fall back to the contract count and a
+  # placeholder prefix so the verdict always goes non-green and no slot name
+  # is ever built from an empty prefix.
+  REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
+  # Never below the contract (an explicit 0 must not zero out the criticals).
+  [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -ge "$DEFAULT_REMOTE_COUNT" ] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+  REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
   _unreach_idx=1
   while [ "$_unreach_idx" -le "$REMOTE_COUNT" ]; do
     REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unreach_idx} (unreachable)")
@@ -1273,7 +1320,21 @@ STARVE_WINDOW="${STARVE_WINDOW:-10}"
 SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$LOCAL_CONFIG_FILE" 2>/dev/null)
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
 STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
-if [ "$PLATFORM" = "linux" ]; then
+# The heartbeat is the "queue monitor:" line, which the daemon only emits when
+# [queue_monitor] enabled = true; with it disabled, zero samples is expected.
+# Real TOML parse (header/inline comments, quoting). A missing table or key is
+# false, the daemon's QueueMonitorConfig default; an unparseable config prints
+# "unknown", which keeps the heartbeat check running (fail closed).
+QUEUE_MONITOR_ENABLED=$(python3 -c 'import sys, tomllib
+try:
+    cfg = tomllib.load(open(sys.argv[1], "rb"))
+except Exception:
+    print("unknown"); sys.exit(0)
+qm = cfg.get("queue_monitor", {})
+print("true" if isinstance(qm, dict) and qm.get("enabled", False) is True else "false")' "$LOCAL_CONFIG_FILE" 2>/dev/null || echo unknown)
+if [ "$PLATFORM" = "linux" ] && [ "$QUEUE_MONITOR_ENABLED" = "false" ]; then
+  info "serve-loop heartbeat signal skipped: [queue_monitor] enabled = false in $LOCAL_CONFIG_FILE, so the daemon emits no 'queue monitor:' lines; per-slot proof above is the liveness signal"
+elif [ "$PLATFORM" = "linux" ]; then
   read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN HEARTBEAT_SAMPLE_COUNT < <(
     journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
       | compute_heartbeat_gap
