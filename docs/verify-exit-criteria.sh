@@ -357,6 +357,13 @@ oomctl_lists_actions_slice() {
     '
 }
 
+# Host-docker has one required PSI admission target: actions.slice is the
+# host's runner aggregate.  A legacy user-scope timer may be present for
+# VM-backed deployments, but it cannot hide a missing oomd enrollment here.
+host_docker_requires_actions_oomctl() {
+    [ "$(uname -s)" = "Linux" ] && ! daemon_in_vm
+}
+
 cpu_controller_available() {
     if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
         if grep -qw 'cpu' /sys/fs/cgroup/cgroup.controllers; then
@@ -501,6 +508,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         kdump) verify_kdump_pstore ;;
         host_docker_envelope) verify_host_docker_envelope ;;
         oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
+        host_docker_actions_oomctl) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
@@ -1072,7 +1080,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     # (verify_host_docker_envelope); app-lima-vm.slice's VM-backed 38G term
     # belongs only to the VM-backed sum below.
     MODERN_HOST_DOCKER=0
-    if [ "$(uname -s)" = "Linux" ] && ! daemon_in_vm; then
+    if host_docker_requires_actions_oomctl; then
         MODERN_HOST_DOCKER=1
     fi
     MODERN_MAX_TOTAL_MB=0
@@ -1455,7 +1463,7 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
 fi
 
 # --- Option B: psi-oom-watcher.timer enrolled with a real shed path -----
-if [ "$PSI_OK" != "1" ]; then
+if [ "$PSI_OK" != "1" ] && ! host_docker_requires_actions_oomctl; then
     TIMER_ENABLED=$(systemctl --user is-enabled psi-oom-watcher.timer 2>/dev/null || true)
     TIMER_ACTIVE=$(systemctl --user is-active psi-oom-watcher.timer 2>/dev/null || true)
     PSI_SCRIPT=""
@@ -1504,6 +1512,9 @@ if [ "$PSI_OK" != "1" ]; then
     OOMD_BUT_NO_CGROUP=""
     if [ "$OOMD_ACTIVE" = "1" ] && [ "$OOMD_ENROLLED" = "0" ]; then
         OOMD_BUT_NO_CGROUP=" NOTE: systemd-oomd is active at ${OOMD_SCOPE}-scope but oomctl reports zero monitored cgroups — this is the exact 'oomd running but no cgroup enrolled' shape that allowed the 2026-07-10 host crash. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice (e.g. user.slice, system.slice) so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list, or set ManagedOOMPreference=avoid/omit on slices you want protected from oom-kill, or wire scripts/host/psi-oom-watcher.sh into psi-oom-watcher.timer as a user-scope backstop (per bead ez-gh-actions-0725)."
+    fi
+    if host_docker_requires_actions_oomctl; then
+        fail "Gate 8 (3) host-docker PSI admission requires oomctl to list /actions.slice under 'Memory Pressure Monitored CGroups:'; psi-oom-watcher.timer is not an acceptable fallback. Verify the actions.slice ManagedOOMMemoryPressure=kill and ManagedOOMMemoryPressureLimit=80% policy is live.${OOMD_BUT_NO_CGROUP}"
     fi
     fail "Gate 8 (3) PSI admission is not wired up with a real shed action: oomd has no enrolled cgroup, AND psi-oom-watcher.timer is either not enabled+active or its script contains no kill/systemctl-stop/qemu-lima-docker shed path. Remediation: enroll scripts/host/psi-oom-watcher.sh via a user-scope .timer (per bead ez-gh-actions-0725), OR set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list.${OOMD_BUT_NO_CGROUP}"
 fi

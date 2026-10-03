@@ -142,16 +142,17 @@ ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its
 #     safe for a <= 4 GiB guest. `limactl list` reports lima.yaml, not the
 #     running VM, so the running size comes from the colima QEMU's `-m` (MiB);
 #     any state the check cannot establish refuses before any write.
-lima_case() { # name yaml-memory limactl-status(Running|Stopped|ERROR) qemu-m-MiB(or -) expect(pass|refuse)
-  local root="$WORK/lima_$1"
+lima_case() { # name yaml-memory(or - for no lima.yaml) limactl-status(Running|Stopped|ERROR) qemu-m-MiB(or -) expect(pass|refuse) [limactl-.memory JSON, or - to omit]
+  local root="$WORK/lima_$1" memory_json=',"memory":4294967296'
+  case "${6:-}" in '') ;; -) memory_json='' ;; *) memory_json=",\"memory\":$6" ;; esac
   setup_fixture "$root"
   mkdir -p "$root/lima/colima"
-  printf 'cpus: 4\nmemory: "%s"\n' "$2" > "$root/lima/colima/lima.yaml"
+  [ "$2" = - ] || printf 'cpus: 4\nmemory: %s\n' "$2" > "$root/lima/colima/lima.yaml"
   cat > "$root/bin/limactl" <<LIMA_EOF
 #!/usr/bin/env bash
 [ "\$1 \$2 \$3" = "list --json colima" ] || exit 1
 [ "$3" = ERROR ] && { echo 'level=fatal msg="boom"' >&2; exit 1; }
-printf '{"name":"colima","status":"%s","memory":4294967296}\n' "$3"
+printf '{"name":"colima","status":"%s"%s}\n' "$3" '$memory_json'
 LIMA_EOF
   chmod +x "$root/bin/limactl"
   if [ "$4" != - ]; then
@@ -181,6 +182,21 @@ lima_case limactl_error 4GiB ERROR - refuse
 grep -q "FAIL lima guest memory unknown" "$WORK/lima_limactl_error.log" || fail "failed limactl query did not fail closed: $(cat "$WORK/lima_limactl_error.log")"
 lima_case running_no_qemu 4GiB Running - refuse
 grep -q "FAIL lima guest memory unknown" "$WORK/lima_running_no_qemu.log" || fail "Running VM without a QEMU process did not fail closed"
+# limactl's configured .memory (bytes) is validated too: absent, malformed
+# or > 4 GiB refuses even when lima.yaml and QEMU say 4 GiB.
+lima_case limactl_mem_missing 4GiB Stopped - refuse -
+grep -q "FAIL lima guest memory unknown (limactl" "$WORK/lima_limactl_mem_missing.log" || fail "absent limactl .memory did not fail closed: $(cat "$WORK/lima_limactl_mem_missing.log")"
+lima_case limactl_mem_malformed 4GiB Stopped - refuse '"4GiB"'
+grep -q "FAIL lima guest memory unknown (limactl" "$WORK/lima_limactl_mem_malformed.log" || fail "malformed limactl .memory did not fail closed: $(cat "$WORK/lima_limactl_mem_malformed.log")"
+lima_case limactl_mem_8g 4GiB Running 4096 refuse 8589934592
+grep -q "FAIL lima guest memory 8589934592 > 4GiB" "$WORK/lima_limactl_mem_8g.log" || fail "limactl .memory 8 GiB did not refuse"
+# Unparseable sizes and a missing lima.yaml refuse with a diagnostic, not silently.
+lima_case yaml_unparseable 8G Stopped - refuse
+grep -q "FAIL lima guest memory unknown (unparseable memory: 8G" "$WORK/lima_yaml_unparseable.log" || fail "unparseable lima.yaml memory exited without a diagnostic: $(cat "$WORK/lima_yaml_unparseable.log")"
+lima_case qemu_m_unparseable 4GiB Running 8x refuse
+grep -q "FAIL lima guest memory unknown (colima QEMU" "$WORK/lima_qemu_m_unparseable.log" || fail "unparseable QEMU -m exited without a diagnostic: $(cat "$WORK/lima_qemu_m_unparseable.log")"
+lima_case yaml_missing_stopped - Stopped - refuse
+grep -q "FAIL lima guest memory unknown (.*lima.yaml" "$WORK/lima_yaml_missing_stopped.log" || fail "instance without lima.yaml passed with nothing proven: $(cat "$WORK/lima_yaml_missing_stopped.log")"
 ok "apply-host-containment-release1.sh refuses the host-docker QEMU ceiling while the Lima guest is above 4 GiB"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.

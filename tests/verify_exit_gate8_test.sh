@@ -222,6 +222,23 @@ if run_oomctl "$TMP/oomctl-empty.txt"; then
   fail "/actions.slice only under Swap (pressure lists /user.slice) must not pass"
 fi
 
+# Host-docker has a narrower contract than VM-backed deployments: the
+# runner aggregate itself must appear under oomctl's pressure list.  A legacy
+# user timer may exist, but cannot substitute for this live enrollment.
+run_host_docker_oomctl() {
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=host_docker_actions_oomctl \
+  VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE="$1" \
+    bash "$VERIFY" >/dev/null 2>&1
+}
+run_host_docker_oomctl "$TMP/oomctl-enrolled.txt" \
+  || fail "host-docker /actions.slice pressure enrollment should pass"
+if run_host_docker_oomctl "$TMP/oomctl-empty.txt"; then
+  fail "host-docker must reject a timer-substitutable oomctl result without /actions.slice"
+fi
+grep -Fq 'if [ "$PSI_OK" != "1" ] && ! host_docker_requires_actions_oomctl; then' "$VERIFY" \
+  || fail "host-docker Gate 8 (3) still permits the psi-oom-watcher timer fallback"
+
 # Kdump/pstore verification is diagnostic-only. It must be quiet on a healthy
 # fixture, fail closed on an unhealthy fixture, and never invoke a remediation
 # hook (including the retired compatibility environment variable).

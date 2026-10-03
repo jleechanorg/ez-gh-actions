@@ -6,9 +6,12 @@
 # Configured size: `memory:` in the lima.yaml lima-vm@colima starts from.
 # Running size: the `-m <MiB>` of the colima QEMU process (the one whose
 # cmdline references the instance directory). `limactl list --json` .memory
-# mirrors lima.yaml, not the running VM, so limactl is only used for status.
-# Any state this cannot establish (failed limactl query, Running VM without a
-# readable QEMU) refuses. No instance directory and no colima QEMU passes.
+# mirrors lima.yaml, not the running VM: it is validated as a third
+# (configured) source, and limactl's status decides whether a QEMU must exist.
+# Any state this cannot establish (failed limactl query, absent/malformed
+# .memory, missing lima.yaml, Running VM without a readable QEMU, unparseable
+# size) refuses with a diagnostic. No instance directory and no colima QEMU
+# passes.
 # LIMACTL / LIMA_YAML / LIMA_PROC_ROOT override the sources for fixtures.
 set -euo pipefail
 
@@ -57,7 +60,7 @@ for comm in "$PROC_ROOT"/[0-9]*/comm; do
   mem=""
   for ((i = 0; i < ${#args[@]}; i++)); do
     if [ "${args[$i]}" = -m ] && [ $((i + 1)) -lt ${#args[@]} ]; then
-      mem="$(qemu_m_to_bytes "${args[$((i + 1))]}")"
+      mem="$(qemu_m_to_bytes "${args[$((i + 1))]}")" || mem=""
     fi
   done
   [ -n "$mem" ] || unknown "colima QEMU ${comm%/comm} has no parseable -m"
@@ -70,21 +73,25 @@ if [ ! -e "$INSTANCE_DIR" ] && [ "${#running[@]}" -eq 0 ]; then
 fi
 
 values=()
-if [ -f "$LIMA_YAML" ]; then
-  yaml_mem="$(awk '/^memory:/ {print $2; exit}' "$LIMA_YAML")"
-  [ -n "$yaml_mem" ] || unknown "${LIMA_YAML} has no memory: line"
-  bytes="$(yaml_to_bytes "$yaml_mem")"
-  [ -n "$bytes" ] || unknown "unparseable memory: ${yaml_mem} in ${LIMA_YAML}"
-  values+=("$bytes")
-fi
+[ -f "$LIMA_YAML" ] || unknown "instance ${INSTANCE_DIR} exists but ${LIMA_YAML} is missing"
+yaml_mem="$(awk '/^memory:/ {print $2; exit}' "$LIMA_YAML")"
+[ -n "$yaml_mem" ] || unknown "${LIMA_YAML} has no memory: line"
+bytes="$(yaml_to_bytes "$yaml_mem")" || bytes=""
+[ -n "$bytes" ] || unknown "unparseable memory: ${yaml_mem} in ${LIMA_YAML}"
+values+=("$bytes")
 
 command -v "$LIMACTL" >/dev/null 2>&1 || unknown "limactl not found for instance ${INSTANCE_DIR}"
-status="$("$LIMACTL" list --json colima 2>/dev/null \
-  | python3 -c 'import json,sys
+# Prints "<status> <memory-bytes>"; .memory must be a JSON integer.
+limactl_out="$("$LIMACTL" list --json colima 2>/dev/null)" || unknown "limactl list --json colima failed"
+read -r status limactl_mem < <(python3 -c 'import json,sys
 rows = [json.loads(l) for l in sys.stdin if l.strip()]
-print(rows[0]["status"] if len(rows) == 1 and rows[0].get("status") else "")' 2>/dev/null)" \
-  || unknown "limactl list --json colima failed"
-[ -n "$status" ] || unknown "limactl list --json colima returned no status"
+row = rows[0] if len(rows) == 1 else {}
+mem = row.get("memory")
+ok = isinstance(mem, int) and not isinstance(mem, bool) and mem > 0
+print(row.get("status") or "-", mem if ok else "-")' <<<"$limactl_out" 2>/dev/null || echo "- -")
+[ "$status" != - ] || unknown "limactl list --json colima returned no status"
+[ "$limactl_mem" != - ] || unknown "limactl list --json colima .memory is absent or not integer bytes"
+values+=("$limactl_mem")
 if [ "$status" = Running ] && [ "${#running[@]}" -eq 0 ]; then
   unknown "colima is Running but no colima QEMU process was found"
 fi
