@@ -48,6 +48,13 @@ for f in Cargo.lock Cargo.toml build.rs; do
   out=$(gate0 "$base") && fail "$f change must fail Gate 0" || true
 done
 
+# Must not depend on the caller's cwd: a src/ change seen from a subdirectory
+# (pathspecs resolve relative to cwd) must still fail.
+rc=0
+out=$(cd "$REPO/docs" && VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=gate0 \
+  VERIFY_EXIT_CRITERIA_DEPLOYED_SHA="$DEPLOYED" bash "$VERIFY" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || fail "src change must fail Gate 0 when run from a subdirectory"
+
 # Build-input change followed by a revert has an empty endpoint diff but the
 # deployed binary may have been built from the intermediate tree: must fail.
 git -C "$REPO" checkout -q -b rev-branch

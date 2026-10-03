@@ -176,8 +176,14 @@ cat > "$TMP/timerbin/systemctl" <<'EOF2'
 [ "${1:-}" = "--user" ] && shift
 case "${1:-}" in
   is-enabled|is-active)
-    for t in ${STUB_ENABLED_TIMERS:-}; do [ "$t" = "${2:-}" ] && exit 0; done
-    exit 1 ;;
+    if [ -n "${STUB_SYSTEMCTL_BROKEN:-}" ]; then
+      echo "Failed to connect to bus: No medium found" >&2; exit 1
+    fi
+    for t in ${STUB_ENABLED_TIMERS:-}; do [ "$t" = "${2:-}" ] && { echo enabled; exit 0; }; done
+    if [ -n "${STUB_ABSENT:-}" ]; then
+      echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1
+    fi
+    echo disabled; exit 1 ;;
 esac
 exit 1
 EOF2
@@ -195,6 +201,17 @@ timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="psi-oom-watcher.tim
 [ "$timers_rc" -ne 0 ] || fail "enabled psi-oom-watcher.timer must fail Gate 8 (policy: disabled)"
 grep -Fq 'psi-oom-watcher.timer' <<<"$timers_out" \
   || fail "psi timer failure omitted diagnostic: $timers_out"
+# A broken user manager (query failure, not a known disabled/absent state)
+# must fail closed rather than read as "timer disabled".
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "systemctl query failure must fail Gate 8 closed"
+# An absent unit (No such file) is a known-disabled state and passes.
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || fail "absent psi-oom-watcher.timer must pass"
 [ "$(grep -c 'agent-scope-reaper' "$VERIFY")" -eq 0 ] \
   || fail "verifier still references deleted agent-scope-reaper"
 

@@ -421,15 +421,24 @@ verify_fresh_canary() {
 # Gate 8 timer policy: the orphan-scope reaper timer was deleted and psi-oom-watcher is
 # disabled by policy (install.sh), so the PSI watcher timer must NOT be enabled.
 verify_modern_timers() {
-    if systemctl --user is-enabled psi-oom-watcher.timer >/dev/null 2>&1; then
-        fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)"
-    fi
+    local state
+    state=$(systemctl --user is-enabled psi-oom-watcher.timer 2>&1 | head -1 || true)
+    case "$state" in
+        enabled|enabled-runtime)
+            fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)" ;;
+        disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+        *"No such file"*|*"not found"*|*"does not exist"*) ;;
+        *)
+            # Query failure (e.g. lost user-manager bus): never read as "disabled".
+            fail "Gate 8 modern envelope: could not determine psi-oom-watcher.timer state (got: ${state:-<empty>})" ;;
+    esac
     return 0
 }
 
 # Gate 0: the deployed SHA may trail HEAD only by commits touching no build
 # input of the binary (bead ez-gh-actions-eqx).
-GATE0_BUILD_INPUTS="src Cargo.toml Cargo.lock build.rs"
+# :(top) makes the pathspecs repo-root-relative regardless of the caller cwd.
+GATE0_BUILD_INPUTS=":(top)src :(top)Cargo.toml :(top)Cargo.lock :(top)build.rs"
 verify_deployed_sha() {
     local deployed="$1" head_sha changed
     head_sha=$(git rev-parse --short HEAD)
