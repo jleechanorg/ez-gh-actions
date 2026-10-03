@@ -91,10 +91,18 @@ setup_passing_fixture "$FIXTURE_PASS"
 PATH="$FIXTURE_PASS/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet || fail "passing fixture failed assertion"
 ok "assert-host-containment-release1.sh passes valid fixture"
 
-# 2. Test memory below floor (65,011,711 KiB)
+# 2a. Kernel-reserve tolerance: jeff-ubuntu's real 64 GiB MemTotal passes the floor
+FIXTURE_MEM_TOL="$WORK/mem_tol"
+setup_passing_fixture "$FIXTURE_MEM_TOL"
+printf 'MemTotal:       64856928 kB\n' > "$FIXTURE_MEM_TOL/proc/meminfo"
+PATH="$FIXTURE_MEM_TOL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_TOL" --require-fleet > "$WORK/mem_tol.log" 2>&1 \
+  || { cat "$WORK/mem_tol.log" >&2; fail "assertion rejected MemTotal 64856928 KiB (64 GiB host) within kernel-reserve tolerance"; }
+ok "assert-host-containment-release1.sh accepts 64 GiB host MemTotal (64856928 KiB)"
+
+# 2. Test memory below floor (60 GiB = 62,914,560 KiB)
 FIXTURE_MEM_FAIL="$WORK/mem_fail"
 setup_passing_fixture "$FIXTURE_MEM_FAIL"
-printf 'MemTotal:       65011711 kB\n' > "$FIXTURE_MEM_FAIL/proc/meminfo"
+printf 'MemTotal:       62914560 kB\n' > "$FIXTURE_MEM_FAIL/proc/meminfo"
 if PATH="$FIXTURE_MEM_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_FAIL" --require-fleet > "$WORK/mem_fail.log" 2>&1; then
   fail "assertion passed when MemTotal was below floor"
 fi
