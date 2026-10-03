@@ -67,7 +67,13 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
-  is-active) [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1 ;;
+  is-active)
+    if [ "${2:-}" = agent-scope-reaper.service ]; then
+      echo inactive
+      exit 3
+    fi
+    [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1
+    ;;
   daemon-reload|start|set-property) echo "systemctl-$1" >> "$EVENT_LOG"; exit 0 ;;
   *) exit 0 ;;
 esac

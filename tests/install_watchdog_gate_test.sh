@@ -16,6 +16,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_SCRIPT="${INSTALL_SCRIPT:-${REPO_ROOT}/install.sh}"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "${WORK}"' EXIT
@@ -29,7 +30,7 @@ fail() {
 # ── 1. Build a minimal, docs/-less copy of the tree install.sh needs ─────────
 TEMP_REPO="${WORK}/repo"
 mkdir -p "${TEMP_REPO}/systemd" "${TEMP_REPO}/scripts/host"
-cp "${REPO_ROOT}/install.sh" "${TEMP_REPO}/install.sh"
+cp "${INSTALL_SCRIPT}" "${TEMP_REPO}/install.sh"
 cp "${REPO_ROOT}"/systemd/ezgha-*.service "${REPO_ROOT}"/systemd/ezgha-*.timer "${TEMP_REPO}/systemd/" 2>/dev/null || true
 cp "${REPO_ROOT}"/systemd/app-lima-vm.slice \
    "${REPO_ROOT}"/systemd/agents.slice \
@@ -154,7 +155,22 @@ case "${sub}" in
     [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ] && exit 0 || exit 1
     ;;
   is-active)
-    exit 1
+    if [ "${STUB_REAPER_BUS_FAILURE:-0}" = 1 ] && [ "${1:-}" = agent-scope-reaper.service ]; then
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    fi
+    if [ "${STUB_REAPER_ACTIVE:-0}" = 1 ] && [ "${1:-}" = agent-scope-reaper.service ]; then
+      echo active
+      exit 0
+    fi
+    echo inactive
+    exit 3
+    ;;
+  stop)
+    if [ "${STUB_REAPER_STOP_FAIL:-0}" = 1 ] && [ "${1:-}" = agent-scope-reaper.service ]; then
+      exit 1
+    fi
+    exit 0
     ;;
   daemon-reload)
     exit 0
@@ -236,6 +252,44 @@ for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-h
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
   fi
+done
+
+# ── Case D: never delete reaper files while its service remains active ───────
+HOME_D="${WORK}/home_d"
+STATE_D="${WORK}/state_d"
+mkdir -p "${HOME_D}/.config/systemd/user" "${HOME_D}/.local/libexec/ezgha" "${STATE_D}"
+touch "${HOME_D}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_D}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_D}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_REAPER_STOP_FAIL=1 STUB_REAPER_ACTIVE=1 run_install "${HOME_D}" "${STATE_D}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case D: installer must fail when agent-scope-reaper remains active"
+for stale in \
+  "${HOME_D}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_D}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_D}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case D: active reaper artifact was deleted: $stale"
+done
+grep -Fq 'refusing to remove agent-scope-reaper files' "${HOME_D}/install.log" \
+  || fail "Case D: installer omitted active-reaper refusal"
+
+# An unavailable user-manager bus is not evidence that the old service stopped.
+HOME_E="${WORK}/home_e"
+STATE_E="${WORK}/state_e"
+mkdir -p "${HOME_E}/.config/systemd/user" "${HOME_E}/.local/libexec/ezgha" "${STATE_E}"
+touch "${HOME_E}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_E}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_REAPER_BUS_FAILURE=1 run_install "${HOME_E}" "${STATE_E}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case E: installer must fail closed when reaper service state cannot be queried"
+for stale in \
+  "${HOME_E}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_E}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case E: reaper artifact was deleted after state-query failure: $stale"
 done
 
 # ── Case C: macOS path removes the leftover fleet watchdog LaunchAgent ───────

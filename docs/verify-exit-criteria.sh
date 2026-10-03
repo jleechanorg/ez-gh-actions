@@ -451,10 +451,13 @@ verify_deployed_sha() {
         fail "Deployed binary SHA ($deployed) is not an ancestor of HEAD ($head_sha). Run cargo install --path ."
         return 1
     fi
-    # Inspect every commit in deployed..HEAD, not just the endpoint trees, so a
-    # build-input change that was later reverted is still caught.
+    # Inspect every reachable commit and every merge-parent diff, not just the
+    # endpoint trees. A build-input change later reverted, or made only while
+    # resolving a merge, still means the deployed binary may be stale.
     # shellcheck disable=SC2086
-    changed=$(git log --name-only --format= "$deployed..HEAD" -- $GATE0_BUILD_INPUTS | sort -u)
+    changed=$(while IFS= read -r commit; do
+        git diff-tree --no-commit-id --name-only -r --root -m "$commit" -- $GATE0_BUILD_INPUTS
+    done < <(git rev-list "$deployed..HEAD") | sort -u)
     if [ -n "$changed" ]; then
         fail "Deployed binary SHA ($deployed) differs from HEAD ($head_sha) in build inputs: $(echo "$changed" | tr '\n' ' '). Run cargo install --path ."
         return 1
@@ -1017,6 +1020,7 @@ if [ "$(uname -s)" = "Linux" ]; then
         fail "Gate 8: every managed runner must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
     fi
     echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
+    verify_modern_timers
 fi
 if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
    && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
@@ -1138,7 +1142,6 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
     fi
 
-    verify_modern_timers
     for dropin in \
         ao-daemon.service.d/20-automation-slice.conf \
         ao-orchestrator.service.d/20-automation-slice.conf \

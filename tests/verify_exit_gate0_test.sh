@@ -68,6 +68,25 @@ git -C "$REPO" add -A && git -C "$REPO" commit -qm revert
 rc=0; out=$(gate0 "$rbase") || rc=$?
 [ "$rc" -ne 0 ] || fail "src change then revert after deployed SHA must fail"
 
+# A merge resolution can itself alter a build input even if neither side branch
+# did. Default `git log --name-only` omits merge diffs, so Gate 0 must inspect
+# the merge against each parent rather than trusting path-limited log output.
+git -C "$REPO" checkout -q -B merge-main "$rbase"
+merge_deployed=$(git -C "$REPO" rev-parse --short HEAD)
+echo main > "$REPO/docs/merge-main.md"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm merge-main-docs
+git -C "$REPO" checkout -q -b merge-side "$merge_deployed"
+echo side > "$REPO/docs/merge-side.md"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm merge-side-docs
+git -C "$REPO" checkout -q merge-main
+git -C "$REPO" merge --no-ff --no-commit merge-side >/dev/null
+echo '// merge resolution build input' >> "$REPO/src/main.rs"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm merge-resolution-build-input
+rc=0; out=$(gate0 "$merge_deployed") || rc=$?
+[ "$rc" -ne 0 ] || fail "build-input change in a merge resolution must fail Gate 0"
+grep -Fq 'src/main.rs' <<<"$out" \
+  || fail "merge-resolution failure omitted changed build input: $out"
+
 # A sibling (non-ancestor) deployed SHA must fail even if trees match on inputs.
 git -C "$REPO" checkout -q -b sibling "$rbase"
 echo sib > "$REPO/docs/sib.md"

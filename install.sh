@@ -750,9 +750,19 @@ FSTRIM_EOF
     # ez-gh-actions-8o81): heal any previously installed copy.
     systemctl --user disable --now agent-scope-reaper.timer 2>/dev/null || true
     systemctl --user stop agent-scope-reaper.service 2>/dev/null || true
-    rm -f "${USER_UNIT_DIR}/agent-scope-reaper.service" \
-          "${USER_UNIT_DIR}/agent-scope-reaper.timer" \
-          "${SCRIPTS_DIR}/agent-scope-reaper.sh"
+    reaper_state_rc=0
+    reaper_state=$(systemctl --user is-active agent-scope-reaper.service 2>&1) || reaper_state_rc=$?
+    case "${reaper_state}" in
+      inactive|failed|not-found)
+        rm -f "${USER_UNIT_DIR}/agent-scope-reaper.service" \
+              "${USER_UNIT_DIR}/agent-scope-reaper.timer" \
+              "${SCRIPTS_DIR}/agent-scope-reaper.sh"
+        ;;
+      *)
+        bad "refusing to remove agent-scope-reaper files: is-active rc=${reaper_state_rc}, output=${reaper_state:-<unavailable>}"
+        exit 1
+        ;;
+    esac
     rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" \
           "${USER_UNIT_DIR}/psi-oom-watcher.timer" \
           "${USER_UNIT_DIR}/ezgha.service.d/10-oomd-omit.conf"

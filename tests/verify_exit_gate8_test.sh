@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERIFY="$ROOT/docs/verify-exit-criteria.sh"
+VERIFY="${VERIFY:-$ROOT/docs/verify-exit-criteria.sh}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -189,6 +189,55 @@ esac
 exit 1
 EOF2
 chmod +x "$TMP/timerbin/systemctl"
+
+# Exercise the real Linux Gate 8 pre-envelope block with no modern-envelope
+# files. The helper-only cases below are insufficient: this proves the actual
+# branch calls the policy before optional local-envelope detection.
+run_gate8_pre_envelope() {
+  local gate_header modern_start gate_start timer_start timer_end original_fail
+  gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
+  modern_start=$(grep -n '^if \[ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" \]' "$VERIFY" | cut -d: -f1)
+  gate_start=$(awk -v min="$gate_header" -v max="$modern_start" \
+    'NR >= min && NR < max && /^if \[ "\$\(uname -s\)" = "Linux" \]; then$/ { print NR; exit }' "$VERIFY")
+  timer_start=$(grep -n '^verify_modern_timers() {' "$VERIFY" | cut -d: -f1)
+  timer_end=$(awk -v start="$timer_start" 'NR > start && /^}$/ { print NR; exit }' "$VERIFY")
+  [ -n "$gate_start" ] && [ -n "$timer_start" ] && [ -n "$timer_end" ] \
+    || fail "could not extract Gate 8 Linux pre-envelope timer policy"
+
+  original_fail=$(declare -f fail)
+  GATE8_POLICY_FAILURE=""
+  CONFIG_FILE="$TMP/valid.toml"
+  fail() { GATE8_POLICY_FAILURE="$*"; }
+  uname() { echo Linux; }
+  verify_platform_actions_slice() { return 0; }
+  daemon_in_vm() { return 1; }
+  verify_managed_runners_in_actions_slice() { return 0; }
+  eval "$(sed -n "${timer_start},${timer_end}p" "$VERIFY")"
+  eval "$(sed -n "${gate_start},$((modern_start - 1))p" "$VERIFY")"
+  GATE8_POLICY_RESULT="$GATE8_POLICY_FAILURE"
+  eval "$original_fail"
+}
+
+PATH="$TMP/timerbin:$PATH"
+unset STUB_NOTFOUND STUB_ABSENT STUB_SYSTEMCTL_BROKEN STUB_BROKEN_MSG
+STUB_ENABLED_TIMERS="psi-oom-watcher.timer"
+export STUB_ENABLED_TIMERS
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] \
+  || fail "enabled PSI timer must fail through Gate 8 before optional envelope detection"
+grep -Fq 'psi-oom-watcher.timer' <<<"$GATE8_POLICY_RESULT" \
+  || fail "pre-envelope timer failure omitted diagnostic: $GATE8_POLICY_RESULT"
+STUB_ENABLED_TIMERS=""
+run_gate8_pre_envelope
+[ -z "$GATE8_POLICY_RESULT" ] \
+  || fail "disabled PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
+STUB_ABSENT=1
+export STUB_ABSENT
+run_gate8_pre_envelope
+[ -z "$GATE8_POLICY_RESULT" ] \
+  || fail "absent PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
+unset STUB_ABSENT
+
 timers_rc=0
 timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="" \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
