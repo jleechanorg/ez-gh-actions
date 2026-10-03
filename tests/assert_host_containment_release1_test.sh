@@ -36,8 +36,8 @@ setup_passing_fixture() {
   printf 'cpuset cpu io memory pids\n' > "$root/sys/fs/cgroup/cgroup.controllers"
 
   # actions.slice cgroup limits
-  printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
-  printf '30064771072\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
+  printf '26843545600\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
+  printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
   printf '0\n' > "$root/sys/fs/cgroup/actions.slice/memory.swap.max"
   printf '6000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
@@ -57,7 +57,7 @@ setup_passing_fixture() {
   # agents.slice and automation.slice in user units
   printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/agents.slice"
-  printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=8G\nMemoryMax=9G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/automation.slice"
 
   # Mock docker command

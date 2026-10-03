@@ -2523,9 +2523,9 @@ static TEST_USER_MANAGER_OOM_PROPERTIES: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
 
 #[cfg(target_os = "linux")]
-const HOST_ACTIONS_MEMORY_HIGH_BYTES: u64 = 26 * 1024 * 1024 * 1024;
+const HOST_ACTIONS_MEMORY_HIGH_BYTES: u64 = 25 * 1024 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const HOST_ACTIONS_MEMORY_MAX_BYTES: u64 = 28 * 1024 * 1024 * 1024;
+const HOST_ACTIONS_MEMORY_MAX_BYTES: u64 = 26 * 1024 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const HOST_ACTIONS_PIDS_MAX: u64 = 6000;
 #[cfg(target_os = "linux")]
@@ -6650,8 +6650,8 @@ minimum_isolation = "container"
     fn write_actions_slice_fixture(root: &Path) {
         let slice = root.join("actions.slice");
         std::fs::create_dir_all(&slice).unwrap();
-        std::fs::write(slice.join("memory.high"), "27917287424\n").unwrap();
-        std::fs::write(slice.join("memory.max"), "30064771072\n").unwrap();
+        std::fs::write(slice.join("memory.high"), "26843545600\n").unwrap();
+        std::fs::write(slice.join("memory.max"), "27917287424\n").unwrap();
         std::fs::write(slice.join("memory.swap.max"), "0\n").unwrap();
         std::fs::write(slice.join("pids.max"), "6000\n").unwrap();
         std::fs::write(slice.join("cpu.max"), "2000000 100000\n").unwrap();
