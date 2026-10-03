@@ -13,9 +13,13 @@ while [ "$#" -gt 0 ]; do
 done
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# 62 GiB (65011712 KiB) minus a 512 MiB (524288 KiB) tolerance. Firmware/kernel
+# reservations make MemTotal read well below installed RAM (jeff-ubuntu: 64856928 KiB
+# of 64 GiB), ~151 MiB under the 62 GiB floor; the tolerance absorbs that.
+MEM_TOTAL_FLOOR_KIB=$((65011712 - 524288))
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
-[ "$mem_total_kib" -ge 65011712 ] || fail "host MemTotal (${mem_total_kib} KiB) is below the required 62-GiB floor (65011712 KiB)"
+[ "$mem_total_kib" -ge "$MEM_TOTAL_FLOOR_KIB" ] || fail "host MemTotal (${mem_total_kib} KiB) is below the required 62-GiB floor (${MEM_TOTAL_FLOOR_KIB} KiB incl. 512-MiB kernel-reserve tolerance)"
 
 [ -f "$ROOT/sys/devices/system/cpu/online" ] || fail "missing cpu/online"
 cpu_count=0; IFS=',' read -r -a cpu_ranges < "$ROOT/sys/devices/system/cpu/online"
