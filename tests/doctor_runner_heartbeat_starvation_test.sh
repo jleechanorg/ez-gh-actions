@@ -49,6 +49,8 @@ version = 1
 serve_tick_seconds = 30
 name_prefix = "ez-runner-c"
 count = 16
+[queue_monitor]
+enabled = true
 EOF
 
 # Extract the real compute_heartbeat_gap() function definition from
@@ -196,6 +198,8 @@ version = 1
 serve_tick_seconds = 20
 name_prefix = "ez-runner-c"
 count = 16
+[queue_monitor]
+enabled = true
 EOF
 FIXTURE_D=$(
   qm_line "$BASE" 4192142
@@ -209,6 +213,8 @@ version = 1
 serve_tick_seconds = 30
 name_prefix = "ez-runner-c"
 count = 16
+[queue_monitor]
+enabled = true  # the heartbeat line only exists when the monitor runs
 EOF
 
 # Case (e): codex adversarial review 2026-07-10 (finding 1, P1) -- ZERO
@@ -247,6 +253,21 @@ count = 16
 enabled = false
 EOF2
 run_case "zero-samples-queue-monitor-disabled-not-critical" "$FIXTURE_E" "no" "0" "active" || OVERALL_PASS=false
+
+# Cases (i)-(l): the daemon defaults queue_monitor.enabled to false when the
+# table or key is missing, and TOML allows inline comments. Each of these
+# means no heartbeat lines, so zero samples must NOT be critical.
+for qm_case in "no-table|" "no-key|[queue_monitor]
+repo = \"jleechanorg/worldarchitect.ai\"" "inline-comment-false|[queue_monitor]
+enabled = false # disabled on purpose" "spaced-header|[ queue_monitor ]
+enabled=false"; do
+  qm_label="${qm_case%%|*}"; qm_body="${qm_case#*|}"
+  printf 'version = 1\n[runner]\nserve_tick_seconds = 30\nname_prefix = "ez-runner-c"\ncount = 16\n%s\n' "$qm_body" > "$CONFIG_DIR/config.toml"
+  run_case "zero-samples-queue-monitor-${qm_label}-not-critical" "$FIXTURE_E" "no" "0" "active" || OVERALL_PASS=false
+done
+# Case (m): enabled = true with an inline comment still runs the check.
+printf 'version = 1\n[runner]\nserve_tick_seconds = 30\nname_prefix = "ez-runner-c"\ncount = 16\n[queue_monitor]\nenabled = true # on\n' > "$CONFIG_DIR/config.toml"
+run_case "zero-samples-queue-monitor-enabled-inline-comment-critical" "$FIXTURE_E" "yes" "0" "active" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
