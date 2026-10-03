@@ -265,6 +265,13 @@ enabled=false"; do
   printf 'version = 1\n[runner]\nserve_tick_seconds = 30\nname_prefix = "ez-runner-c"\ncount = 16\n%s\n' "$qm_body" > "$CONFIG_DIR/config.toml"
   run_case "zero-samples-queue-monitor-${qm_label}-not-critical" "$FIXTURE_E" "no" "0" "active" || OVERALL_PASS=false
 done
+# Case (n): a comment after the table header is valid TOML; enabled = true
+# there must still run the check (codex review round 3).
+printf 'version = 1\n[runner]\nserve_tick_seconds = 30\nname_prefix = "ez-runner-c"\ncount = 16\n[queue_monitor] # monitored\nenabled = true\n' > "$CONFIG_DIR/config.toml"
+run_case "zero-samples-queue-monitor-header-comment-enabled-critical" "$FIXTURE_E" "yes" "0" "active" || OVERALL_PASS=false
+# Case (o): an unparseable config must not skip the check (fail closed).
+printf 'version = 1\n[runner\nenabled = false\n' > "$CONFIG_DIR/config.toml"
+run_case "zero-samples-unparseable-config-critical" "$FIXTURE_E" "yes" "0" "active" || OVERALL_PASS=false
 # Case (m): enabled = true with an inline comment still runs the check.
 printf 'version = 1\n[runner]\nserve_tick_seconds = 30\nname_prefix = "ez-runner-c"\ncount = 16\n[queue_monitor]\nenabled = true # on\n' > "$CONFIG_DIR/config.toml"
 run_case "zero-samples-queue-monitor-enabled-inline-comment-critical" "$FIXTURE_E" "yes" "0" "active" || OVERALL_PASS=false
