@@ -57,7 +57,7 @@ setup_passing_fixture() {
   # agents.slice and automation.slice in user units
   printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/agents.slice"
-  printf '[Slice]\nMemoryHigh=4G\nMemoryMax=6G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/automation.slice"
 
   # Mock docker command
@@ -161,5 +161,54 @@ if PATH="$FIXTURE_ANCESTRY_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_ANC
 fi
 grep -q "FAIL: container PID not beneath /actions.slice" "$WORK/ancestry_fail.log" || fail "missing ancestry failure message"
 ok "assert-host-containment-release1.sh rejects runner container outside actions.slice"
+
+# Live systemd property checks (normally only when --root is /): answer
+# `systemctl show -p P --value -- U` from a table and run them against the
+# passing fixture with CONTAINMENT_LIVE_SYSTEMD=1.
+write_props() {
+  local auto_high="$1" auto_max="$2" uid; uid="$(id -u)"
+  cat <<PROPS
+agents.slice MemoryHigh 19327352832
+agents.slice MemoryMax 21474836480
+agents.slice MemorySwapMax 2147483648
+automation.slice MemoryHigh ${auto_high}
+automation.slice MemoryMax ${auto_max}
+automation.slice MemorySwapMax 1073741824
+user@${uid}.service ManagedOOMMemoryPressure auto
+user@${uid}.service ManagedOOMSwap auto
+user@${uid}.service ManagedOOMPreference none
+user@${uid}.service OOMScoreAdjust 0
+-.slice ManagedOOMMemoryPressure auto
+user.slice ManagedOOMMemoryPressure auto
+app.slice ManagedOOMMemoryPressure auto
+session.slice ManagedOOMMemoryPressure auto
+PROPS
+}
+PROPS_BIN="$WORK/props-bin"
+mkdir -p "$PROPS_BIN"
+cat > "$PROPS_BIN/systemctl" <<'SHIM'
+#!/usr/bin/env bash
+prop="" unit=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prop="$2"; shift 2 ;;
+    --) unit="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
+SHIM
+chmod +x "$PROPS_BIN/systemctl"
+write_props 8589934592 10737418240 > "$WORK/props_ok.txt"
+CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+  "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1 \
+  || fail "live systemd checks rejected 8G/10G automation.slice: $(tail -3 "$WORK/live_ok.log")"
+write_props 4294967296 6442450944 > "$WORK/props_old.txt"
+if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+  "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old.log" 2>&1; then
+  fail "live systemd checks accepted the old 4G/6G automation.slice"
+fi
+grep -q "automation.slice MemoryHigh ('4294967296') != '8589934592'" "$WORK/live_old.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
+ok "assert-host-containment-release1.sh live checks accept 8G/10G and reject 4G/6G automation.slice"
 
 echo "ASSERT_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

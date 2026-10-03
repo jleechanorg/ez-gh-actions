@@ -124,4 +124,53 @@ fi
 [ ! -f "$ACTIONS_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before actions usage gate"
 ok "apply-host-containment-release1.sh aborts before lowering actions.slice beneath live use"
 
+# Live user-systemd branch (normally only when --root is /): run it against a
+# fixture with CONTAINMENT_LIVE_SYSTEMD=1 and check the persistent
+# set-property calls replace any older automation.slice limits.
+LIVE_ROOT="$WORK/live"
+setup_fixture "$LIVE_ROOT"
+# The apply script finishes by running the assert script, whose live branch
+# queries properties: log every call and answer `show` with what the
+# set-property calls in the live branch establish.
+uid="$(id -u)"
+cat > "$WORK/live_props.txt" <<PROPS
+agents.slice MemoryHigh 19327352832
+agents.slice MemoryMax 21474836480
+agents.slice MemorySwapMax 2147483648
+automation.slice MemoryHigh 8589934592
+automation.slice MemoryMax 10737418240
+automation.slice MemorySwapMax 1073741824
+user@${uid}.service ManagedOOMMemoryPressure auto
+user@${uid}.service ManagedOOMSwap auto
+user@${uid}.service ManagedOOMPreference none
+user@${uid}.service OOMScoreAdjust 0
+-.slice ManagedOOMMemoryPressure auto
+user.slice ManagedOOMMemoryPressure auto
+app.slice ManagedOOMMemoryPressure auto
+session.slice ManagedOOMMemoryPressure auto
+PROPS
+cat > "$LIVE_ROOT/bin/systemctl" <<'SHIM'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "${SYSTEMCTL_LOG:-/dev/null}"
+prop="" unit="" show=0
+for a in "$@"; do [ "$a" = show ] && show=1; done
+[ "$show" = 1 ] || exit 0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p) prop="$2"; shift 2 ;;
+    --) unit="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
+SHIM
+chmod +x "$LIVE_ROOT/bin/systemctl"
+CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$WORK/live_sys.log" PATH="$LIVE_ROOT/bin:$PATH" \
+  "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
+grep -qx "systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
+  || fail "live apply did not set automation.slice to 8G/10G: $(grep automation "$WORK/live_sys.log" || echo none)"
+grep -qx "systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
+  || fail "live apply did not set agents.slice limits"
+ok "apply-host-containment-release1.sh live branch persists automation.slice 8G/10G via set-property"
+
 echo "APPLY_HOST_CONTAINMENT_RELEASE1_TEST: PASS"
