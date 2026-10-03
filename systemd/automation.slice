@@ -1,9 +1,11 @@
 # automation.slice — finite budget for orchestration/watchdog automation.
 # measured margin: the slice also holds every AO-spawned worker scope
 # (tmux-spawn-*.scope inherit Slice= from ao-daemon.service), whose observed
-# unthrottled peak is 5.7 GiB (2026-10-02; the 2026-08-25 figure of 3.0 GiB
-# was daemons only). 8G leaves 2.3 GiB before MemoryHigh and 4.3 GiB before
-# MemoryMax; swap/tasks are finite too. At 4G the slice sat permanently
+# demand grows with the number of AO workers: 5.7 GiB with ~30 worker scopes,
+# and by evening on 2026-10-02 it reached the 8G MemoryHigh with ~90 (the
+# 2026-08-25 figure of 3.0 GiB was daemons only). At 8G it throttles
+# without paging out; 10G MemoryMax leaves 2 GiB before OOM. swap/tasks are
+# finite too. At 4G the slice sat permanently
 # throttled (9.0M memory.events high), and its PSI, aggregated at
 # user.slice, tripped the ezgha admission gate and drained the runner
 # fleet to 0/10 (beads ez-gh-actions-u3c5, ez-gh-actions-6w33).
