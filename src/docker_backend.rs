@@ -4477,7 +4477,14 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // while a job is executing, so using it here would classify a healthy idle
     // Listener-only fleet as missing and create a permanent settle/reconcile loop.
     let alive = current_prefix_containers(&containers, cfg).len() as u32;
+    // Resolve before the full-fleet return so the source is logged at
+    // startup even when every runner is already present.
+    let pressure_source = admission_pressure_source(cfg);
+    log_pressure_source_change(&pressure_source);
     if alive >= cfg.runner.count {
+        *ADMISSION_PAUSE_EPISODE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
             missing: 0,
@@ -4601,8 +4608,6 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // either read fails. Once a reserve is configured, probe failure is a
     // fail-closed admission error. The hysteresis window is read+rotated as
     // one Mutex guard.
-    let pressure_source = admission_pressure_source(cfg);
-    log_pressure_source_change(&pressure_source);
     let admission_probe = memory_pressure_pct(&pressure_source);
     let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
     let host_reserve_bytes = cfg.runner.host_reserve_mb.saturating_mul(1024 * 1024);
@@ -9112,6 +9117,44 @@ minimum_isolation = "container"
             *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
             cfg.limits.cgroup_parent = None;
             assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn h_full_fleet_tick_logs_source_and_ends_pause_episode() {
+            let env = TestEnv::new("u3c5_h_full");
+            let root = env.path.with_file_name("cgroot");
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root.clone());
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            let mut cfg = cfg_with(2, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
+                managed_container("ez-runner-c-1"),
+                managed_container("ez-runner-c-2"),
+            ]);
+            *LAST_PRESSURE_SOURCE.lock().unwrap() = None;
+            *ADMISSION_PAUSE_EPISODE.lock().unwrap() = Some(AdmissionPauseEpisode {
+                since: Instant::now(),
+                alerted: false,
+            });
+
+            let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+            assert_eq!(outcome.missing, 0);
+            assert_eq!(
+                LAST_PRESSURE_SOURCE.lock().unwrap().clone(),
+                Some(format!(
+                    "admission pressure source: {0}/actions.slice/memory.pressure high={0}/actions.slice/memory.high (host-docker)",
+                    root.display()
+                ))
+            );
+            assert!(
+                ADMISSION_PAUSE_EPISODE.lock().unwrap().is_none(),
+                "a full fleet is not paused; the episode must end"
+            );
         }
 
         #[cfg(target_os = "linux")]
