@@ -91,6 +91,7 @@ run_remote() {  # $1 = queued count, $2 = oldest queued minutes
     fetch_respawn_log_window() { echo ""; }
     journal_has_respawn_evidence() { echo 0; }
     job_evidence_for_runner() { echo job; }
+    sleep() { echo SLEEP; }
     eval "$REMOTE_FUNCS"
     eval "$REMOTE_VERDICT"
     echo "CRITICAL=$SLOT_PROOF_CRITICAL EXEC=${#REMOTE_EXECUTING_SLOTS[@]} IDLE=${#REMOTE_IDLE_SLOTS[@]} DOWN=${#REMOTE_DOWN_SLOTS[@]}"
@@ -138,6 +139,7 @@ check "remote idle->absent->executing (recycle blink): not critical" "grep -q 'C
 
 setseq rslot-1 IDLE ABSENT ABSENT
 out=$(run_remote 12 9)
+check "remote idle->absent waits a SECOND persistence delay before the re-probe (2 sleeps)" "[ \$(grep -c '^SLEEP' <<<\"\$out\") -eq 2 ]"
 check "remote idle->absent->absent: persistent DOWN critical" "grep -q 'CRITICAL=1 EXEC=0 IDLE=0 DOWN=1' <<<\"\$out\""
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
