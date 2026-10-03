@@ -820,6 +820,7 @@ CYCLING_SLOTS=()
 # queue that reads a healthy fleet as IDLE-STARVED, so first-pass IDLE slots
 # get the same one re-sample after the same delay (shared sleep with DOWN).
 _FIRST_IDLE=()
+_IDLE_TO_DOWN=0
 if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
   _FIRST_IDLE=("${IDLE_SLOTS[@]}")
 fi
@@ -830,11 +831,17 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ] || [ "${#_FIRST_IDLE[@]}" -gt 0 ]; then
     IDLE_SLOTS=()
     for _name in "${_FIRST_IDLE[@]}"; do
       case "$(classify_local_slot "$_name")" in
-        DOWN)      DOWN_SLOTS+=("$_name") ;;   # absent now: follows the DOWN path below
+        DOWN)      DOWN_SLOTS+=("$_name"); _IDLE_TO_DOWN=1 ;;   # absent now: follows the DOWN path below
         IDLE)      IDLE_SLOTS+=("$_name") ;;
         EXECUTING) EXECUTING_SLOTS+=("$_name") ;;
       esac
     done
+    # An idle->absent slot has only ONE absent sample; DOWN needs two samples
+    # a persistence delay apart, so wait once more before the DOWN loop below
+    # re-samples it (a normal recycle blink must not read as DOWN).
+    if [ "$_IDLE_TO_DOWN" -eq 1 ]; then
+      sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
+    fi
   fi
   _PERSISTENT_DOWN=()
   _BLINKED=()
@@ -1071,7 +1078,7 @@ list_slot_work() {
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
   printf "\n  %s (%d configured):\n" "$label" "$count"
   local -a slot_state=()
-  local i name jobline has_down=0 has_idle=0
+  local i name jobline has_down=0 has_idle=0 idle_to_down=0
 
   if [ "$host" = "localhost" ] && [ -n "${LOCAL_SLOT_STATE_TABLE:-}" ] \
      && [ "$prefix" = "${RUNNER_NAME_PREFIX:-}" ] && [ "$count" = "${CONFIGURED_COUNT:-}" ]; then
@@ -1101,8 +1108,23 @@ list_slot_work() {
             # Re-sampled state wins: EXECUTING clears, IDLE stays, absent
             # follows the DOWN path (journal cross-check below).
             slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
-            [ "${slot_state[i]}" = "DOWN" ] && has_down=1
+            if [ "${slot_state[i]}" = "DOWN" ]; then
+              has_down=1; idle_to_down=1
+              slot_state[i]="IDLE_DOWN"          # one absent sample so far
+            fi
             ;;
+        esac
+      done
+      # idle->absent has only ONE absent sample; DOWN needs two a persistence
+      # delay apart, so wait again and re-probe before it can count as DOWN.
+      if [ "$idle_to_down" -eq 1 ]; then
+        sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
+      fi
+      for i in $(seq 1 "$count"); do
+        [ "${slot_state[i]}" != "IDLE_DOWN" ] && continue
+        case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+          DOWN) slot_state[i]="DOWN" ;;
+          *)    slot_state[i]="CYCLING" ;;
         esac
       done
       # Journal cross-check (ez-gh-actions-5n0h): a slot still containerless

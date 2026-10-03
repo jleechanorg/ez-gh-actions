@@ -70,6 +70,7 @@ run_local() {  # $1 = queued count, $2 = oldest queued minutes; slot seqs preset
     fetch_respawn_log_window() { echo ""; }
     journal_has_respawn_evidence() { echo 0; }
     HOST_LABEL=test
+    sleep() { echo SLEEP; }
     eval "$LOCAL_SAMPLE"
     eval "$LOCAL_VERDICT"
     echo "CRITICAL=$SLOT_PROOF_CRITICAL EXEC=${#EXECUTING_SLOTS[@]} IDLE=${#IDLE_SLOTS[@]} DOWN=${#DOWN_SLOTS[@]}"
@@ -109,6 +110,15 @@ setseq slot-1 IDLE ABSENT
 out=$(run_local 12 9)
 check "local idle->absent: follows DOWN path (critical DOWN, not IDLE-STARVED)" "grep -q 'BAD DOWN' <<<\"\$out\" && ! grep -q 'IDLE-STARVED' <<<\"\$out\" && grep -q 'CRITICAL=1 EXEC=0 IDLE=0 DOWN=1' <<<\"\$out\""
 
+setseq slot-1 IDLE ABSENT EXEC
+out=$(run_local 12 9)
+check "local idle->absent->executing (recycle blink): not critical" "grep -q 'CRITICAL=0 EXEC=1 IDLE=0 DOWN=0' <<<\"\$out\" && ! grep -q '^BAD' <<<\"\$out\""
+
+setseq slot-1 IDLE ABSENT ABSENT
+out=$(run_local 12 9)
+check "local idle->absent waits a SECOND persistence delay before the DOWN re-sample (2 sleeps)" "[ \$(grep -c '^SLEEP' <<<\"\$out\") -eq 2 ]"
+check "local idle->absent->absent: persistent DOWN critical" "grep -q 'CRITICAL=1 EXEC=0 IDLE=0 DOWN=1' <<<\"\$out\""
+
 # ---- remote half ----
 setseq rslot-1 IDLE EXEC
 out=$(run_remote 12 9)
@@ -121,5 +131,13 @@ check "remote idle->idle with starved queue: IDLE-STARVED critical" "grep -q 'BA
 setseq rslot-1 IDLE ABSENT
 out=$(run_remote 12 9)
 check "remote idle->absent: follows DOWN path" "grep -q 'CRITICAL=1 EXEC=0 IDLE=0 DOWN=1' <<<\"\$out\" && grep -q 'BAD .*DOWN' <<<\"\$out\" && ! grep -q 'IDLE-STARVED' <<<\"\$out\""
+
+setseq rslot-1 IDLE ABSENT EXEC
+out=$(run_remote 12 9)
+check "remote idle->absent->executing (recycle blink): not critical" "grep -q 'CRITICAL=0 EXEC=0 IDLE=0 DOWN=0' <<<\"\$out\" && ! grep -q '^BAD' <<<\"\$out\""
+
+setseq rslot-1 IDLE ABSENT ABSENT
+out=$(run_remote 12 9)
+check "remote idle->absent->absent: persistent DOWN critical" "grep -q 'CRITICAL=1 EXEC=0 IDLE=0 DOWN=1' <<<\"\$out\""
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
