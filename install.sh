@@ -705,12 +705,12 @@ FSTRIM_EOF
     else
       info "guest fstrim.timer override skipped — colima not installed or default profile not running"
     fi
-    # Clear any legacy watchdog plist on macOS
+    # Remove the deleted fleet watchdog (it ran every 120 s with
+    # EZGHA_WATCHDOG_ALLOW_RESTART=1): unload it even if the plist is already
+    # gone, then delete the plist and the stale libexec script.
     watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
-    if [ -f "${watchdog_plist}" ]; then
-      launchctl unload "${watchdog_plist}" 2>/dev/null || true
-      rm -f "${watchdog_plist}"
-    fi
+    launchctl bootout "gui/$(id -u)/org.jleechanorg.ezgha-watchdog" 2>/dev/null || true
+    rm -f "${watchdog_plist}" "${HOME}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux: copy the systemd units with @SCRIPTS_DIR@ / @HOME@ placeholders substituted
     USER_UNIT_DIR="${HOME}/.config/systemd/user"

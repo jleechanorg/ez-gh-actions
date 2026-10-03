@@ -222,6 +222,16 @@ for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containme
   fi
 done
 
+# ── Case C: macOS path removes the leftover fleet watchdog LaunchAgent ───────
+# (static: the macOS branch needs launchctl/colima and is not drivable here)
+for needle in \
+  'launchctl bootout "gui/$(id -u)/org.jleechanorg.ezgha-watchdog"' \
+  'rm -f "${watchdog_plist}"' \
+  'ezgha-fleet-watchdog.sh'; do
+  grep -qF -- "${needle}" "${REPO_ROOT}/install.sh" \
+    || fail "Case C: install.sh macOS path lacks watchdog removal: ${needle}"
+done
+
 # ── Case B: uninstall removes host controls and restored CLI symlinks ─────────
 HOME_B="${WORK}/home_b"
 STATE_B="${WORK}/state_b"
