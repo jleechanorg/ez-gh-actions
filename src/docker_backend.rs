@@ -2945,6 +2945,7 @@ impl PressureSource {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn runner_cgroup(dir: &Path) -> Self {
         Self {
             psi_path: dir.join("memory.pressure"),
