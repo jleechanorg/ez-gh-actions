@@ -418,6 +418,15 @@ verify_fresh_canary() {
     pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
+# Gate 8 timer policy: the orphan-scope reaper timer was deleted and psi-oom-watcher is
+# disabled by policy (install.sh), so the PSI watcher timer must NOT be enabled.
+verify_modern_timers() {
+    if systemctl --user is-enabled psi-oom-watcher.timer >/dev/null 2>&1; then
+        fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)"
+    fi
+    return 0
+}
+
 # Gate 0: the deployed SHA may trail HEAD only by commits touching no build
 # input of the binary (bead ez-gh-actions-eqx).
 GATE0_BUILD_INPUTS="src Cargo.toml Cargo.lock build.rs"
@@ -446,6 +455,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         containers) verify_managed_runners_in_actions_slice ;;
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
+        modern_timers) verify_modern_timers ;;
         gate0) verify_deployed_sha "${VERIFY_EXIT_CRITERIA_DEPLOYED_SHA:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
@@ -1113,12 +1123,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
     fi
 
-    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-        if ! systemctl --user is-enabled "$timer" >/dev/null 2>&1 \
-           || ! systemctl --user is-active "$timer" >/dev/null 2>&1; then
-            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
-        fi
-    done
+    verify_modern_timers
     for dropin in \
         ao-daemon.service.d/20-automation-slice.conf \
         ao-orchestrator.service.d/20-automation-slice.conf \

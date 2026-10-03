@@ -165,4 +165,37 @@ grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
 [ ! -e "$TMP/remediation-was-called" ] \
   || fail "read-only kdump target invoked forbidden remediation"
 
+# Gate 8 obsolete-timer loop: agent-scope-reaper was deleted and the PSI
+# watcher is disabled by policy (install.sh), so the verifier must NOT demand
+# either timer be enabled+active, and must fail if psi-oom-watcher.timer is
+# enabled (policy drift).
+mkdir -p "$TMP/timerbin"
+cat > "$TMP/timerbin/systemctl" <<'EOF2'
+#!/usr/bin/env bash
+# stub: is-enabled/is-active answer from $STUB_ENABLED_TIMERS (space list)
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled|is-active)
+    for t in ${STUB_ENABLED_TIMERS:-}; do [ "$t" = "${2:-}" ] && exit 0; done
+    exit 1 ;;
+esac
+exit 1
+EOF2
+chmod +x "$TMP/timerbin/systemctl"
+timers_rc=0
+timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" 2>&1) || timers_rc=$?
+[ "$timers_rc" -eq 0 ] \
+  || fail "no reaper/psi timers enabled must pass Gate 8 timer check (rc=$timers_rc): $timers_out"
+timers_rc=0
+timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="psi-oom-watcher.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" 2>&1) || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "enabled psi-oom-watcher.timer must fail Gate 8 (policy: disabled)"
+grep -Fq 'psi-oom-watcher.timer' <<<"$timers_out" \
+  || fail "psi timer failure omitted diagnostic: $timers_out"
+[ "$(grep -c 'agent-scope-reaper' "$VERIFY")" -eq 0 ] \
+  || fail "verifier still references deleted agent-scope-reaper"
+
 echo "VERIFY_EXIT_GATE8_TEST: PASS"

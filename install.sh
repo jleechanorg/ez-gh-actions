@@ -737,7 +737,7 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
@@ -746,11 +746,13 @@ FSTRIM_EOF
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
-    for unit in agent-scope-reaper.service agent-scope-reaper.timer; do
-      sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
-          -e "s|@HOME@|${HOME_DIR}|g" \
-          "${UNIT_DIR}/${unit}" > "${USER_UNIT_DIR}/${unit}"
-    done
+    # agent-scope-reaper was deleted (it killed live cursor-agent, bead
+    # ez-gh-actions-8o81): heal any previously installed copy.
+    systemctl --user disable --now agent-scope-reaper.timer 2>/dev/null || true
+    systemctl --user stop agent-scope-reaper.service 2>/dev/null || true
+    rm -f "${USER_UNIT_DIR}/agent-scope-reaper.service" \
+          "${USER_UNIT_DIR}/agent-scope-reaper.timer" \
+          "${SCRIPTS_DIR}/agent-scope-reaper.sh"
     rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" \
           "${USER_UNIT_DIR}/psi-oom-watcher.timer" \
           "${USER_UNIT_DIR}/ezgha.service.d/10-oomd-omit.conf"
@@ -861,8 +863,7 @@ EOF
     # Auxiliary mutation loops are opt-out by policy. Keep their tracked units
     # installed for manual diagnostics, but heal prior enabled state.
     for pair in \
-      "ezgha-queue-reaper.timer ezgha-queue-reaper.service" \
-      "agent-scope-reaper.timer agent-scope-reaper.service"; do
+      "ezgha-queue-reaper.timer ezgha-queue-reaper.service"; do
       timer="${pair%% *}"
       service="${pair#* }"
       if systemctl --user disable --now "${timer}" 2>/dev/null \

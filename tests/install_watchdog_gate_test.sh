@@ -34,8 +34,6 @@ cp "${REPO_ROOT}"/systemd/ezgha-*.service "${REPO_ROOT}"/systemd/ezgha-*.timer "
 cp "${REPO_ROOT}"/systemd/app-lima-vm.slice \
    "${REPO_ROOT}"/systemd/agents.slice \
    "${REPO_ROOT}"/systemd/automation.slice \
-   "${REPO_ROOT}"/systemd/agent-scope-reaper.service \
-   "${REPO_ROOT}"/systemd/agent-scope-reaper.timer \
    "${TEMP_REPO}/systemd/"
 mkdir -p "${TEMP_REPO}/systemd/host"
 cp -r "${REPO_ROOT}/systemd/host"/* "${TEMP_REPO}/systemd/host/" 2>/dev/null || true
@@ -61,7 +59,7 @@ for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
-for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+for name in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
   if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
     cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
   fi
@@ -179,6 +177,11 @@ mkdir -p "${HOME_A}/.config/systemd/user" "${STATE_A}"
 touch "${STATE_A}/ezgha-watchdog.timer.enabled" # simulate prior installation
 touch "${HOME_A}/.config/systemd/user/ezgha-watchdog.timer"
 touch "${HOME_A}/.config/systemd/user/ezgha-watchdog.service"
+# Previously installed copies of the deleted agent-scope-reaper must be removed.
+touch "${HOME_A}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_A}/.config/systemd/user/agent-scope-reaper.timer"
+mkdir -p "${HOME_A}/.local/libexec/ezgha"
+touch "${HOME_A}/.local/libexec/ezgha/agent-scope-reaper.sh"
 run_install "${HOME_A}" "${STATE_A}"
 
 if [ -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
@@ -203,20 +206,23 @@ else
 fi
 
 # Host crash controls are source-controlled and rendered into stable paths.
-for unit in app-lima-vm.slice agents.slice automation.slice \
-            agent-scope-reaper.service agent-scope-reaper.timer; do
+for unit in app-lima-vm.slice agents.slice automation.slice; do
   if [ ! -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
     fail "Case A: host control unit was not installed: ${unit}"
   fi
 done
 
-for unit in psi-oom-watcher.service psi-oom-watcher.timer; do
+for unit in psi-oom-watcher.service psi-oom-watcher.timer \
+            agent-scope-reaper.service agent-scope-reaper.timer; do
   if [ -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
     fail "Case A: deprecated host control unit was not removed: ${unit}"
   fi
 done
 
-for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+if [ -e "${HOME_A}/.local/libexec/ezgha/agent-scope-reaper.sh" ]; then
+  fail "Case A: stale agent-scope-reaper.sh was not removed"
+fi
+for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
   fi
@@ -231,6 +237,9 @@ for needle in \
   grep -qF -- "${needle}" "${REPO_ROOT}/install.sh" \
     || fail "Case C: install.sh macOS path lacks watchdog removal: ${needle}"
 done
+if grep -q 'agent-scope-reaper.timer' "${REPO_ROOT}/docs/verify-exit-criteria.sh"; then
+  fail "Case C: verifier still requires agent-scope-reaper.timer"
+fi
 
 # ── Case B: uninstall removes host controls and restored CLI symlinks ─────────
 HOME_B="${WORK}/home_b"
@@ -244,7 +253,7 @@ if [ ! -L "${HOME_B}/.local/bin/codex" ] || [ "$(readlink "${HOME_B}/.local/bin/
   fail "Case B: uninstall did not restore the pre-existing codex symlink"
 fi
 if [ -e "${HOME_B}/.config/systemd/user/agents.slice" ] || \
-   [ -e "${HOME_B}/.config/systemd/user/agent-scope-reaper.timer" ]; then
+   [ -e "${HOME_B}/.config/systemd/user/automation.slice" ]; then
   fail "Case B: uninstall left host-control units behind"
 fi
 
