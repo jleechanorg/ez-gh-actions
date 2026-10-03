@@ -2832,27 +2832,168 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
 }
 
 /// Lane-I (Round-3 swarm): read PSI cgroup-v2 memory pressure (`some` line)
-/// and host `MemAvailable`. Returns `(pressure_pct, available_bytes)`. Pure
-/// helper — no global state, no I/O beyond reading two small sysfs/proc
-/// files. Refuses to start a new runner when the host is already under
-/// sustained memory pressure, even if disk-floor is healthy (the
-/// `min_free_disk_gb` guard alone did not save the host from the 2026-07-12
-/// crash). Default cgroup path is `user.slice` because that's where the
-/// daemon is most likely to live; an `Err` is returned if `/proc/self/cgroup`
-/// cannot be parsed AND `user.slice` is unreadable, so a misconfigured host
-/// fails loud rather than silently admitting a runaway job.
-pub fn memory_pressure_pct() -> Result<(f64, u64)> {
-    memory_pressure_pct_from(DEFAULT_PRESSURE_PATH, &read_meminfo_available)
+/// from `source` and host `MemAvailable`. Returns `(pressure_pct,
+/// available_bytes)`. Refuses to start a new runner when memory pressure is
+/// sustained, even if disk-floor is healthy (the `min_free_disk_gb` guard
+/// alone did not save the host from the 2026-07-12 crash). There is no
+/// fallback between sources: an unreadable pressure, `memory.current`,
+/// `memory.high` or MemAvailable file is an `Err`, which the caller treats as
+/// a probe failure (fail-closed once `runner.host_reserve_mb > 0`).
+pub fn memory_pressure_pct(source: &PressureSource) -> Result<(f64, u64)> {
+    read_admission_pressure(source, &read_meminfo_available)
 }
 
 const DEFAULT_PRESSURE_PATH: &str = "/sys/fs/cgroup/user.slice/memory.pressure";
 
+/// Where the admission gate reads memory pressure. The legacy source is
+/// `user.slice`, which aggregates every sibling slice: on 2026-10-01/02 a
+/// throttled `automation.slice` held it at 55-79% and paused admission for
+/// hours with 36 GiB available (bead ez-gh-actions-u3c5). On the Linux
+/// host-docker backend the runner aggregate cgroup (`limits.cgroup_parent`)
+/// is used instead, and its PSI only counts while that cgroup is within 10%
+/// of its own `memory.high`, so one container thrashing against its
+/// per-container limit cannot pause the fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PressureSource {
+    psi_path: PathBuf,
+    /// `(memory.current, memory.high)` of the runner cgroup; `None` is the
+    /// ungated legacy source.
+    gate: Option<(PathBuf, PathBuf)>,
+}
+
+impl PressureSource {
+    fn fallback() -> Self {
+        Self {
+            psi_path: PathBuf::from(DEFAULT_PRESSURE_PATH),
+            gate: None,
+        }
+    }
+
+    fn runner_cgroup(dir: &Path) -> Self {
+        Self {
+            psi_path: dir.join("memory.pressure"),
+            gate: Some((dir.join("memory.current"), dir.join("memory.high"))),
+        }
+    }
+
+    fn describe(&self) -> String {
+        let psi = self.psi_path.display();
+        match &self.gate {
+            Some((_, high)) => format!(
+                "admission pressure source: {psi} high={} (host-docker)",
+                high.display()
+            ),
+            None => format!("admission pressure source: {psi} high=none (fallback)"),
+        }
+    }
+}
+
+/// Pick the admission pressure source for this tick. Only a Linux host whose
+/// canonical docker daemon shares the host kernel (not Colima/VM-backed) and
+/// that configures `limits.cgroup_parent` uses the runner cgroup.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn admission_pressure_source(cfg: &Config) -> PressureSource {
+    #[cfg(target_os = "linux")]
+    if let Some(parent) = cfg.limits.cgroup_parent.as_deref() {
+        if !is_macos_host() && !host_containment_daemon_in_vm() {
+            return PressureSource::runner_cgroup(&host_actions_cgroup_root().join(parent));
+        }
+    }
+    PressureSource::fallback()
+}
+
+static LAST_PRESSURE_SOURCE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Log the resolved source once at startup and whenever it changes. A change
+/// also clears the hysteresis window so samples from different sources are
+/// never compared.
+fn log_pressure_source_change(source: &PressureSource) {
+    let desc = source.describe();
+    let mut last = LAST_PRESSURE_SOURCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if last.as_deref() != Some(desc.as_str()) {
+        eprintln!("{desc}");
+        *last = Some(desc);
+        *PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner()) = [None; 5];
+    }
+}
+
+/// Read a cgroup-v2 byte value; `max` (no limit) is `None`.
+fn read_cgroup_bytes(path: &Path) -> Result<Option<u64>> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = raw.trim();
+    if raw == "max" {
+        return Ok(None);
+    }
+    raw.parse::<u64>()
+        .map(Some)
+        .with_context(|| format!("unparseable cgroup value {raw:?} in {}", path.display()))
+}
+
+fn read_admission_pressure(
+    source: &PressureSource,
+    read_meminfo: &dyn Fn() -> Option<u64>,
+) -> Result<(f64, u64)> {
+    let (pct, available) = memory_pressure_pct_from(&source.psi_path, read_meminfo)?;
+    let Some((current_path, high_path)) = &source.gate else {
+        return Ok((pct, available));
+    };
+    let current = read_cgroup_bytes(current_path)?
+        .with_context(|| format!("{} reported no value", current_path.display()))?;
+    // `memory.high = max` means the runner cgroup has no throttle to thrash
+    // against, so its PSI never gates; MemAvailable still does.
+    let near_high = read_cgroup_bytes(high_path)?
+        .is_some_and(|high| u128::from(current) * 10 >= u128::from(high) * 9);
+    // Below 90% of memory.high the sample is 0 so neither the absolute nor
+    // the 5-tick rising branch of `eval_admission` can fire on it.
+    Ok((if near_high { pct } else { 0.0 }, available))
+}
+
+/// A continuous admission pause. The headroom alert fires at most once per
+/// episode; the episode ends on the first admitted tick.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionPauseEpisode {
+    since: Instant,
+    alerted: bool,
+}
+
+const ADMISSION_PAUSE_ALERT_AFTER: Duration = Duration::from_secs(10 * 60);
+
+static ADMISSION_PAUSE_EPISODE: Mutex<Option<AdmissionPauseEpisode>> = Mutex::new(None);
+
+/// Track the pause episode and return `true` exactly once per episode, when
+/// admission has been continuously paused for `ADMISSION_PAUSE_ALERT_AFTER`
+/// while MemAvailable still has headroom (the 2026-10-01 fleet drained
+/// silently all day under exactly this condition).
+fn admission_pause_alert_due(
+    episode: &mut Option<AdmissionPauseEpisode>,
+    now: Instant,
+    paused: bool,
+    headroom: bool,
+) -> bool {
+    if !paused {
+        *episode = None;
+        return false;
+    }
+    let ep = episode.get_or_insert(AdmissionPauseEpisode {
+        since: now,
+        alerted: false,
+    });
+    if ep.alerted || !headroom || now.duration_since(ep.since) < ADMISSION_PAUSE_ALERT_AFTER {
+        return false;
+    }
+    ep.alerted = true;
+    true
+}
+
 fn memory_pressure_pct_from(
-    pressure_path: &str,
+    pressure_path: &Path,
     read_meminfo: &dyn Fn() -> Option<u64>,
 ) -> Result<(f64, u64)> {
     let pressure_raw = std::fs::read_to_string(pressure_path)
-        .with_context(|| format!("reading memory pressure at {pressure_path}"))?;
+        .with_context(|| format!("reading memory pressure at {}", pressure_path.display()))?;
     // PSI cgroup-v2 line format:
     //   some avg10=1.23 avg60=4.56 avg300=2.34 total=...
     // We use `avg10` (the most recent 10s window) — short enough to react
@@ -2869,7 +3010,8 @@ fn memory_pressure_pct_from(
             }
         }
     }
-    let pressure_pct = pct.with_context(|| format!("no `some avg10=` line in {pressure_path}"))?;
+    let pressure_pct =
+        pct.with_context(|| format!("no `some avg10=` line in {}", pressure_path.display()))?;
     let available_bytes =
         read_meminfo().with_context(|| "could not read MemAvailable from /proc/meminfo")?;
     Ok((pressure_pct, available_bytes))
@@ -4338,7 +4480,14 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // while a job is executing, so using it here would classify a healthy idle
     // Listener-only fleet as missing and create a permanent settle/reconcile loop.
     let alive = current_prefix_containers(&containers, cfg).len() as u32;
+    // Resolve before the full-fleet return so the source is logged at
+    // startup even when every runner is already present.
+    let pressure_source = admission_pressure_source(cfg);
+    log_pressure_source_change(&pressure_source);
     if alive >= cfg.runner.count {
+        *ADMISSION_PAUSE_EPISODE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
             missing: 0,
@@ -4462,21 +4611,19 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // either read fails. Once a reserve is configured, probe failure is a
     // fail-closed admission error. The hysteresis window is read+rotated as
     // one Mutex guard.
-    let admission_probe = memory_pressure_pct();
+    let admission_probe = memory_pressure_pct(&pressure_source);
+    let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
+    let host_reserve_bytes = cfg.runner.host_reserve_mb.saturating_mul(1024 * 1024);
     let admission_decision: Result<(), String> = {
         let mut window = PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
         match &admission_probe {
-            Ok((pct, available)) => {
-                let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
-                let host_reserve_bytes = cfg.runner.host_reserve_mb.saturating_mul(1024 * 1024);
-                eval_admission(
-                    *pct,
-                    *available,
-                    runner_bytes,
-                    host_reserve_bytes,
-                    &mut window,
-                )
-            }
+            Ok((pct, available)) => eval_admission(
+                *pct,
+                *available,
+                runner_bytes,
+                host_reserve_bytes,
+                &mut window,
+            ),
             Err(e) => {
                 // Preserve the legacy fail-open behavior only when no
                 // physical-host reserve is configured. Once an operator has
@@ -4501,6 +4648,20 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             }
         }
     };
+    let headroom_bytes = host_reserve_bytes.saturating_add(runner_bytes.saturating_mul(4));
+    let available = admission_probe
+        .as_ref()
+        .ok()
+        .map(|(_, available)| *available);
+    let headroom = available.is_some_and(|available| available >= headroom_bytes);
+    let headroom_alert_due = admission_pause_alert_due(
+        &mut ADMISSION_PAUSE_EPISODE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+        Instant::now(),
+        admission_decision.is_err(),
+        headroom,
+    );
     if let Err(reason) = admission_decision {
         let _ = alert::notify(
             cfg,
@@ -4509,6 +4670,21 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             "Runner pool paused: memory pressure",
             &format!("refusing to spawn runners: {reason}"),
         );
+        if headroom_alert_due {
+            let avail_mb = available.unwrap_or(0) / 1024 / 1024;
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.admission_paused_with_headroom",
+                Severity::Critical,
+                "Runner pool paused 10+ minutes with memory headroom",
+                &format!(
+                    "admission has been paused for at least 10 minutes while MemAvailable {avail_mb} MB \
+                     >= host reserve + 4x runner memory ({} MB); last reason: {reason}; {}",
+                    headroom_bytes / 1024 / 1024,
+                    pressure_source.describe()
+                ),
+            );
+        }
         return Ok(admission_paused_outcome(
             cfg.runner.count.saturating_sub(alive),
             reason,
@@ -8729,6 +8905,320 @@ minimum_isolation = "container"
             assert!(
                 err.contains("PSE hysteresis: pressure rising 5 consecutive ticks"),
                 "refusal message must cite hysteresis, got: {err}"
+            );
+        }
+    }
+
+    /// Bead ez-gh-actions-u3c5: the admission gate reads the runner
+    /// aggregate cgroup on the Linux host-docker backend and only counts its
+    /// PSI while that cgroup is within 10% of its own `memory.high`.
+    mod admission_pressure_source_tests {
+        use super::*;
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const RUNNER_BYTES: u64 = 2500 * 1024 * 1024;
+        const RESERVE_BYTES: u64 = 8 * GIB;
+        const HIGH: u64 = 26 * GIB;
+
+        fn cgroup_dir(label: &str, psi: f64, current: Option<u64>, high: Option<&str>) -> PathBuf {
+            let dir = tmp_path(label).with_file_name("cg");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("memory.pressure"),
+                format!(
+                    "some avg10={psi:.2} avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                ),
+            )
+            .unwrap();
+            if let Some(current) = current {
+                std::fs::write(dir.join("memory.current"), format!("{current}\n")).unwrap();
+            }
+            if let Some(high) = high {
+                std::fs::write(dir.join("memory.high"), format!("{high}\n")).unwrap();
+            }
+            dir
+        }
+
+        fn decide(dir: &Path, window: &mut [Option<f64>; 5]) -> Result<(), String> {
+            let source = PressureSource::runner_cgroup(dir);
+            let (pct, available) = read_admission_pressure(&source, &|| Some(36 * GIB)).unwrap();
+            eval_admission(pct, available, RUNNER_BYTES, RESERVE_BYTES, window)
+        }
+
+        #[test]
+        fn a_sibling_slice_pressure_does_not_pause_when_runner_cgroup_is_calm() {
+            // user.slice-style sibling at 70% must be irrelevant: the runner
+            // cgroup itself reads 0 even though it sits near its high.
+            let user_slice = cgroup_dir("u3c5_a_user", 70.0, None, None);
+            let legacy =
+                memory_pressure_pct_from(&user_slice.join("memory.pressure"), &|| Some(36 * GIB))
+                    .unwrap();
+            assert_eq!(legacy.0, 70.0, "fixture: sibling pressure is 70%");
+            let runner = cgroup_dir(
+                "u3c5_a_runner",
+                0.0,
+                Some(HIGH / 100 * 95),
+                Some(&HIGH.to_string()),
+            );
+            let mut window = [None; 5];
+            assert_eq!(decide(&runner, &mut window), Ok(()));
+        }
+
+        #[test]
+        fn b_runner_cgroup_pressure_below_ninety_pct_of_high_admits() {
+            let runner = cgroup_dir(
+                "u3c5_b",
+                70.0,
+                Some(HIGH / 100 * 40),
+                Some(&HIGH.to_string()),
+            );
+            let mut window = [None; 5];
+            assert_eq!(decide(&runner, &mut window), Ok(()));
+        }
+
+        #[test]
+        fn c_runner_cgroup_pressure_at_ninety_pct_of_high_refuses() {
+            let runner = cgroup_dir(
+                "u3c5_c",
+                70.0,
+                Some((HIGH * 9).div_ceil(10)),
+                Some(&HIGH.to_string()),
+            );
+            let mut window = [None; 5];
+            let err = decide(&runner, &mut window).unwrap_err();
+            assert!(err.contains("70.0% > 50%"), "got: {err}");
+        }
+
+        #[test]
+        fn f_rising_window_below_ninety_pct_of_high_admits_every_tick() {
+            let mut window = [None; 5];
+            for (tick, psi) in [10.0, 20.0, 30.0, 40.0, 49.0].into_iter().enumerate() {
+                let runner = cgroup_dir(
+                    &format!("u3c5_f_{tick}"),
+                    psi,
+                    Some(HIGH / 100 * 40),
+                    Some(&HIGH.to_string()),
+                );
+                assert_eq!(
+                    decide(&runner, &mut window),
+                    Ok(()),
+                    "tick {tick} psi {psi}"
+                );
+            }
+        }
+
+        #[test]
+        fn g_unreadable_runner_cgroup_files_are_probe_errors() {
+            let no_high = cgroup_dir("u3c5_g_high", 70.0, Some(HIGH / 100 * 95), None);
+            let err = read_admission_pressure(&PressureSource::runner_cgroup(&no_high), &|| {
+                Some(36 * GIB)
+            })
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("memory.high"), "got: {err:#}");
+            let missing = tmp_path("u3c5_g_psi").with_file_name("absent-cgroup");
+            let err = read_admission_pressure(&PressureSource::runner_cgroup(&missing), &|| {
+                Some(36 * GIB)
+            })
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("memory.pressure"),
+                "got: {err:#}"
+            );
+        }
+
+        #[test]
+        fn describe_names_runner_cgroup_and_fallback_sources() {
+            assert_eq!(
+                PressureSource::runner_cgroup(Path::new("/sys/fs/cgroup/actions.slice")).describe(),
+                "admission pressure source: /sys/fs/cgroup/actions.slice/memory.pressure high=/sys/fs/cgroup/actions.slice/memory.high (host-docker)"
+            );
+            assert_eq!(
+                PressureSource::fallback().describe(),
+                "admission pressure source: /sys/fs/cgroup/user.slice/memory.pressure high=none (fallback)"
+            );
+        }
+
+        #[test]
+        fn e_headroom_alert_fires_once_per_pause_episode() {
+            let start = Instant::now();
+            let mut episode = None;
+            let at = |secs: u64| start + Duration::from_secs(secs);
+            assert!(!admission_pause_alert_due(&mut episode, at(0), true, true));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(599),
+                true,
+                true
+            ));
+            assert!(admission_pause_alert_due(&mut episode, at(600), true, true));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(660),
+                true,
+                true
+            ));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(3600),
+                true,
+                true
+            ));
+            // Admission resumes: the episode ends and a new one re-arms.
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(3660),
+                false,
+                true
+            ));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(3700),
+                true,
+                true
+            ));
+            assert!(admission_pause_alert_due(
+                &mut episode,
+                at(4300),
+                true,
+                true
+            ));
+            // No headroom: a long pause is the gate doing its job, no alert.
+            let mut tight = None;
+            assert!(!admission_pause_alert_due(&mut tight, at(0), true, false));
+            assert!(!admission_pause_alert_due(
+                &mut tight,
+                at(1200),
+                true,
+                false
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn d_source_selection_uses_runner_cgroup_only_on_host_docker() {
+            let env = TestEnv::new("u3c5_d");
+            let root = env.path.with_file_name("cgroot");
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root.clone());
+            let mut cfg = cfg_with(10, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            assert_eq!(
+                admission_pressure_source(&cfg).describe(),
+                format!(
+                    "admission pressure source: {0}/actions.slice/memory.pressure high={0}/actions.slice/memory.high (host-docker)",
+                    root.display()
+                )
+            );
+
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
+            assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(true);
+            assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            cfg.limits.cgroup_parent = None;
+            assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+        }
+
+        #[test]
+        fn i_source_change_resets_hysteresis_window() {
+            let _env = TestEnv::new("u3c5_i_switch");
+            let rising = [Some(10.0), Some(20.0), Some(30.0), Some(40.0), None];
+            *LAST_PRESSURE_SOURCE.lock().unwrap() = Some(PressureSource::fallback().describe());
+            *PRESSURE_WINDOW.lock().unwrap() = rising;
+            let runner = PressureSource::runner_cgroup(Path::new("/sys/fs/cgroup/actions.slice"));
+
+            log_pressure_source_change(&runner);
+            assert_eq!(
+                *PRESSURE_WINDOW.lock().unwrap(),
+                [None; 5],
+                "fallback samples must not feed runner-cgroup hysteresis"
+            );
+
+            // Same source again: the window is left alone.
+            *PRESSURE_WINDOW.lock().unwrap() = rising;
+            log_pressure_source_change(&runner);
+            assert_eq!(*PRESSURE_WINDOW.lock().unwrap(), rising);
+            *PRESSURE_WINDOW.lock().unwrap() = [None; 5];
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn h_full_fleet_tick_logs_source_and_ends_pause_episode() {
+            let env = TestEnv::new("u3c5_h_full");
+            let root = env.path.with_file_name("cgroot");
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root.clone());
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            let mut cfg = cfg_with(2, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
+                managed_container("ez-runner-c-1"),
+                managed_container("ez-runner-c-2"),
+            ]);
+            *LAST_PRESSURE_SOURCE.lock().unwrap() = None;
+            *ADMISSION_PAUSE_EPISODE.lock().unwrap() = Some(AdmissionPauseEpisode {
+                since: Instant::now(),
+                alerted: false,
+            });
+
+            let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+            assert_eq!(outcome.missing, 0);
+            assert_eq!(
+                LAST_PRESSURE_SOURCE.lock().unwrap().clone(),
+                Some(format!(
+                    "admission pressure source: {0}/actions.slice/memory.pressure high={0}/actions.slice/memory.high (host-docker)",
+                    root.display()
+                ))
+            );
+            assert!(
+                ADMISSION_PAUSE_EPISODE.lock().unwrap().is_none(),
+                "a full fleet is not paused; the episode must end"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn g_unreadable_runner_memory_high_fails_closed_with_host_reserve() {
+            let env = TestEnv::new("u3c5_g_closed");
+            let root = env.path.with_file_name("cgroot");
+            let slice = root.join("actions.slice");
+            std::fs::create_dir_all(&slice).unwrap();
+            std::fs::write(
+                slice.join("memory.pressure"),
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+            )
+            .unwrap();
+            std::fs::write(slice.join("memory.current"), "1000\n").unwrap();
+            // memory.high deliberately absent.
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root);
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            let mut cfg = cfg_with(1, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+            cfg.runner.host_reserve_mb = 8192;
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+            *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+            *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-runner-c-1".into()]);
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(1)].into());
+
+            let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+            assert!(outcome.started.is_empty(), "must not start: {outcome:?}");
+            let reason = outcome
+                .admission_paused_reason
+                .expect("admission must pause");
+            assert!(
+                reason.contains("host-reserve admission probe failed")
+                    && reason.contains("memory.high"),
+                "got: {reason}"
             );
         }
     }
