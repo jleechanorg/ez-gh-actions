@@ -56,8 +56,9 @@ user_cgroup_dir() {
 }
 
 # Every gate precedes writes or systemd state changes.
-# 62 GiB (65011712 KiB) minus a 512 MiB (524288 KiB) tolerance: the kernel reserves
-# ~150 MiB of a 64 GiB host's RAM, so /proc/meminfo MemTotal reads below the nominal size.
+# 62 GiB (65011712 KiB) minus a 512 MiB (524288 KiB) tolerance. Firmware/kernel
+# reservations make MemTotal read well below installed RAM (jeff-ubuntu: 64856928 KiB
+# of 64 GiB), ~151 MiB under the 62 GiB floor; the tolerance absorbs that.
 MEM_TOTAL_FLOOR_KIB=$((65011712 - 524288))
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "${ROOT}/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not determine MemTotal"

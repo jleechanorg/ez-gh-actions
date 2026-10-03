@@ -99,6 +99,16 @@ PATH="$FIXTURE_MEM_TOL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_TOL" --r
   || { cat "$WORK/mem_tol.log" >&2; fail "assertion rejected MemTotal 64856928 KiB (64 GiB host) within kernel-reserve tolerance"; }
 ok "assert-host-containment-release1.sh accepts 64 GiB host MemTotal (64856928 KiB)"
 
+# 2b. Exact boundary: floor (64487424 KiB) passes, floor-1 fails
+for kib in 64487424 64487423; do
+  FX="$WORK/mem_b_$kib"; setup_passing_fixture "$FX"
+  printf 'MemTotal:       %s kB\n' "$kib" > "$FX/proc/meminfo"
+  if PATH="$FX/bin:$PATH" "$ASSERT_SCRIPT" --root "$FX" --require-fleet > "$WORK/mem_b_$kib.log" 2>&1; then rc=0; else rc=1; fi
+  if [ "$kib" = 64487424 ]; then [ "$rc" = 0 ] || fail "MemTotal at exact floor $kib KiB rejected"
+  else [ "$rc" = 1 ] && grep -q "FAIL: host MemTotal" "$WORK/mem_b_$kib.log" || fail "MemTotal floor-1 $kib KiB accepted"; fi
+done
+ok "assert-host-containment-release1.sh floor boundary is exact (64487424 pass, 64487423 fail)"
+
 # 2. Test memory below floor (60 GiB = 62,914,560 KiB)
 FIXTURE_MEM_FAIL="$WORK/mem_fail"
 setup_passing_fixture "$FIXTURE_MEM_FAIL"

@@ -49,7 +49,7 @@ Implementation proceeds test-first in that order. Every 30 minutes must produce 
 - Bound supported agent CLI descendants and automation under separate user slices.
 - Keep the desktop, user manager, and production workload roots out of `systemd-oomd` victim selection.
 - Fail closed before slot mutation, JIT registration, Docker removal, or Docker creation when effective containment is invalid.
-- Keep every control and activation step git-tracked and portable to another compatible Ubuntu host with at least 62 GiB `MemTotal` and 32 online logical CPUs.
+- Keep every control and activation step git-tracked and portable to another compatible Ubuntu host with at least 62 GiB (minus 512 MiB tolerance) `MemTotal` and 32 online logical CPUs.
 
 ## Non-Goals
 
@@ -68,7 +68,7 @@ Implementation proceeds test-first in that order. Every 30 minutes must produce 
 | user `agents.slice` | 18G | 20G | 2G | 8192 | unchanged | unchanged |
 | user `automation.slice` | 4G | 6G | 1G | 4096 | unchanged | unchanged |
 
-Release 1 aligns the Linux example to the active 2500-MiB-per-runner config and requires exact equality at activation. Ten limits total about 24.41 GiB, below `actions.slice` `MemoryHigh=26G`. The three hard caps total 54 GiB on the measured 62.48-GiB host, leaving about 8.48 GiB outside those workload caps. Release 1 hard-refuses `MemTotal < 62 GiB` (65,011,712 KiB), preserving at least 8 GiB of arithmetic headroom above the cap sum. That remainder is headroom, not a reservation or a global-OOM proof.
+Release 1 aligns the Linux example to the active 2500-MiB-per-runner config and requires exact equality at activation. Ten limits total about 24.41 GiB, below `actions.slice` `MemoryHigh=26G`. The three hard caps total 54 GiB on the measured 62.48-GiB host, leaving about 8.48 GiB outside those workload caps. Release 1 hard-refuses `MemTotal < 64,487,424 KiB` (62 GiB minus a 512-MiB firmware/kernel-reserve tolerance, since MemTotal reads below installed RAM), preserving at least 7.5 GiB of arithmetic headroom above the cap sum. That remainder is headroom, not a reservation or a global-OOM proof.
 
 The agent cap is intentionally higher than the old tracked 10G/12G unit because the measured 17.14-GiB peak would violate that old hard limit. `MemoryHigh=18G` sits about 0.86 GiB above the recorded peak and `MemoryMax=20G` about 2.86 GiB above it, while still preventing the prior 36.7-GiB agent event. Activation also requires current agent use below 18G and automation use below 4G before lowering limits.
 
@@ -214,7 +214,7 @@ Release 2 must treat an already-active Release 1 host policy as its starting sta
 7. Every created managed runner proves actual PID ancestry beneath `/actions.slice`.
 8. Activation never starts a VM, restarts Docker, changes Mac state, stops/removes a runner container, cancels a busy job, or reduces runner count.
 9. During frozen migration, activation issues no lifecycle mutation, preserves every survivor, records independent ephemeral departures, and admits no new ID; after release normal JIT ID churn is allowed while migration converges to ten contained slot names/PIDs within 210 seconds and bootstrap within 600 seconds. Either failure remains contained and explicit.
-10. The implementation, stable activation bundle, rollback, assertion, documented exact sudo authorization prerequisite, and focused tests are git-tracked and reproducible on a compatible fresh Ubuntu host with at least 62 GiB RAM and 32 online logical CPUs; undersized hosts fail read-only preflight.
+10. The implementation, stable activation bundle, rollback, assertion, documented exact sudo authorization prerequisite, and focused tests are git-tracked and reproducible on a compatible fresh Ubuntu host with at least 62 GiB RAM (minus 512 MiB tolerance) and 32 online logical CPUs; undersized hosts fail read-only preflight.
 11. Before legacy service/image/live-auxiliary or Docker/VM actions, `install.sh` builds and verifies a versioned complete release bundle, atomically selects it, and execs activation once; only activation installs the allowlisted Linux service/auxiliary closure, converges timer state, starts the fixed service, and performs a fresh bootstrap image build after finite-boundary proof.
 12. Fixed-profile startup/recovery performs no VM or backend lifecycle action, and canary proof dispatch uses the existing ten-runner fleet rather than a separate daemon.
 13. A bounded 24-hour post-activation report for the two tracked workload repos shows no new exact runner-lost signature/count and local evidence shows no infrastructure OOM relative to baseline; the deployment issue closes only on a passing verdict and remains open on failure or `INCONCLUSIVE`.

@@ -97,12 +97,20 @@ fi
 MEM_TOL_ROOT="$WORK/mem_tol"
 setup_fixture "$MEM_TOL_ROOT"
 printf 'MemTotal:       64856928 kB\n' > "$MEM_TOL_ROOT/proc/meminfo"
-PATH="$MEM_TOL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_TOL_ROOT" > "$WORK/mem_tol.log" 2>&1 || true
-if grep -q "MemTotal" "$WORK/mem_tol.log"; then
-  cat "$WORK/mem_tol.log" >&2
-  fail "apply-host-containment-release1.sh rejected MemTotal 64856928 KiB (64 GiB host) within kernel-reserve tolerance"
-fi
+SYSTEMCTL_LOG="$WORK/mem_tol_sys.log" PATH="$MEM_TOL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_TOL_ROOT" > "$WORK/mem_tol.log" 2>&1 \
+  || { cat "$WORK/mem_tol.log" >&2; fail "apply-host-containment-release1.sh rejected MemTotal 64856928 KiB (64 GiB host) within kernel-reserve tolerance"; }
+[ -f "$MEM_TOL_ROOT/etc/systemd/system/actions.slice" ] || fail "apply did not stage actions.slice for 64 GiB host"
 ok "apply-host-containment-release1.sh accepts 64 GiB host MemTotal (64856928 KiB)"
+
+# 2b. Exact boundary: floor (64487424 KiB) passes the memory gate, floor-1 fails it
+for kib in 64487424 64487423; do
+  FX="$WORK/mem_b_$kib"; setup_fixture "$FX"
+  printf 'MemTotal:       %s kB\n' "$kib" > "$FX/proc/meminfo"
+  if SYSTEMCTL_LOG="$WORK/mem_b_${kib}_sys.log" PATH="$FX/bin:$PATH" "$APPLY_SCRIPT" --root "$FX" > "$WORK/mem_b_$kib.log" 2>&1; then rc=0; else rc=1; fi
+  if [ "$kib" = 64487424 ]; then [ "$rc" = 0 ] || fail "apply rejected MemTotal at exact floor $kib KiB"
+  else [ "$rc" = 1 ] && grep -q "below required 62 GiB floor" "$WORK/mem_b_$kib.log" || fail "apply accepted floor-1 $kib KiB"; fi
+done
+ok "apply-host-containment-release1.sh floor boundary is exact (64487424 pass, 64487423 fail)"
 
 # 2. Pre-mutation gate: memory below floor (60 GiB = 62,914,560 KiB)
 MEM_FAIL_ROOT="$WORK/mem_fail"
