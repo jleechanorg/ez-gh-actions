@@ -44,7 +44,9 @@ check_cgroup_val "$ACTIONS_DIR/cpu.max" "2000000 100000" cpu.max
 io_weight="$(cat "$ACTIONS_DIR/io.weight" 2>/dev/null || true)"
 [[ "$io_weight" =~ (^|[[:space:]])25($|[[:space:]]) ]] || fail "actions.slice io.weight ('$io_weight') does not contain 25"
 
-if [ "$ROOT" = "/" ]; then
+# CONTAINMENT_LIVE_SYSTEMD=1 lets tests run these live systemd checks against a
+# --root fixture with a fake systemctl on PATH.
+if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
   check_user_property() {
     local unit="$1" property="$2" expected="$3" actual
     actual="$(systemctl --user show -p "$property" --value -- "$unit")"

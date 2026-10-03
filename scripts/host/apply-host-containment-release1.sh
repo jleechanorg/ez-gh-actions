@@ -141,7 +141,9 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   install_file "${POLICY_ROOT}/systemd/agents.slice" "${USER_UNIT_DIR}/agents.slice"
   install_file "${POLICY_ROOT}/systemd/automation.slice" "${USER_UNIT_DIR}/automation.slice"
   rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" "${USER_UNIT_DIR}/psi-oom-watcher.timer"
-  if [ "$ROOT" = "/" ]; then
+  # CONTAINMENT_LIVE_SYSTEMD=1 lets tests run the live user-systemd branch
+  # against a --root fixture with a fake systemctl on PATH.
+  if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
     systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
