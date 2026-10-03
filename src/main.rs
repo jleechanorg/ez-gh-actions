@@ -1289,6 +1289,17 @@ fn main() -> Result<()> {
             let cfg = Config::load(&path)?;
             docker_backend::require_host_containment(&cfg)
                 .context("host containment admission failed before serve")?;
+            // Fail-loud cpu_burst precheck (root review): if
+            // limits.cpu_burst=true is requested but the daemon is not
+            // VM-contained or finite positive ncpu is not discovered, bail
+            // here BEFORE any runner mutation rather than letting the first
+            // start_one hit Err mid-spawn.
+            if cfg.limits.cpu_burst {
+                docker_backend::effective_limits(&cfg)
+                    .map_err(|e| anyhow::anyhow!(
+                        "limits.cpu_burst validation failed at serve startup: {e}"
+                    ))?;
+            }
             // Single-instance guard (bead 6gw): flock serve.lock so a second
             // `ezgha serve` refuses immediately instead of racing next_slot's
             // read-modify-write. Auto-released on process death; opt-out via

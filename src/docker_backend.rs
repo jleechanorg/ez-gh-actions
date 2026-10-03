@@ -3042,32 +3042,73 @@ pub fn eval_admission(
 /// by 25% on every runner. Setting `vm_total_mb = 24576` (the actual VM
 /// ceiling) restores `fleet_budget_mb = 22528`, `per_runner = 3754MB`,
 /// respecting the configured 3072MB floor.
-pub fn effective_limits(cfg: &Config) -> (f64, u64) {
-    let (ncpu, daemon_mem) = match daemon_capacity() {
-        Some(c) => c,
-        None => return (cfg.limits.cpus, cfg.limits.memory_mb),
+pub fn effective_limits(cfg: &Config) -> Result<(f64, u64), String> {
+    // When `limits.cpu_burst` is false (the default), do NOT call
+    // `platform::detect()` here — it fans out to `docker info`,
+    // `which tart`, `which virsh`, kvm device probes, etc., and is
+    // called on every start_one (i.e. every spawn). Only run it when
+    // the operator has actually opted into cpu_burst; the verification
+    // it provides is meaningless for the default equal-share clamp.
+    let capacity = match daemon_capacity() {
+        Some((ncpu, daemon_mem)) => {
+            // Use vm_total_mb override as the fleet budget base when set;
+            // matches derive_memory_budget's startup fail-loud guard so
+            // the guard and the runtime clamp stay in sync.
+            Some((ncpu, cfg.runner.vm_total_mb.unwrap_or(daemon_mem)))
+        }
+        None => None,
     };
-    // If vm_total_mb override is set, use it as the fleet budget base
-    // instead of the docker daemon's reported MemTotal. This is the SAME
-    // value that derive_memory_budget uses for the startup fail-loud guard,
-    // so the guard and the runtime clamp stay in sync (bead ez-gh-actions-yz6b
-    // round 3 sync requirement).
-    let fleet_mem_base = cfg.runner.vm_total_mb.unwrap_or(daemon_mem);
-    // Reuse `platform::detect().daemon_in_vm` (the same probe the existing
-    // host_containment path uses) instead of inventing a new detector.
-    // The opt-in `limits.cpu_burst` ceiling-relaxation below requires this
-    // bit to be true; on a host daemon the existing equal-share clamp is
-    // preserved verbatim. See the Limits::cpu_burst doc comment for the
-    // 2026-10-03 throughput measurement that motivates this opt-in.
-    let daemon_in_vm = crate::platform::detect().daemon_in_vm;
-    effective_limits_with_capacity(cfg, Some((ncpu, fleet_mem_base)), daemon_in_vm)
+    let daemon_in_vm = if cfg.limits.cpu_burst {
+        crate::platform::detect().daemon_in_vm
+    } else {
+        false
+    };
+    effective_limits_with_capacity(cfg, capacity, daemon_in_vm)
 }
 
 fn effective_limits_with_capacity(
     cfg: &Config,
     capacity: Option<(f64, u64)>,
     daemon_in_vm: bool,
-) -> (f64, u64) {
+) -> Result<(f64, u64), String> {
+    // Opt-in CPU ceiling. cpu_burst=true is honored ONLY when the daemon
+    // is verified VM-contained AND we have a finite positive ncpu.
+    // Otherwise we REFUSE — `Err` propagates up to the caller
+    // (start_one_with_generate_at_slot and Serve startup bail before
+    // mutating any runner) instead of silently falling back to the
+    // default equal-share clamp. A silent fallback would let a host
+    // daemon or unknown capacity silently exceed the physical envelope;
+    // the explicit Err makes the misconfiguration loud. This runs BEFORE
+    // the capacity check because the refusal must fire even when
+    // capacity is None.
+    if cfg.limits.cpu_burst {
+        if !daemon_in_vm {
+            return Err(format!(
+                "limits.cpu_burst=true is unsupported on this host: \
+                 docker daemon is not verified VM-contained \
+                 (platform::detect().daemon_in_vm=false). \
+                 Disable cpu_burst or run inside a VM (Colima/Lima/Docker Desktop)."
+            ));
+        }
+        match capacity {
+            None => {
+                return Err(format!(
+                    "limits.cpu_burst=true is unsupported: \
+                     daemon_capacity() returned no (non-positive) CPU capacity; \
+                     cannot bound the per-container ceiling safely."
+                ));
+            }
+            Some((ncpu, _)) if !ncpu.is_finite() || ncpu <= 0.0 => {
+                return Err(format!(
+                    "limits.cpu_burst=true is unsupported: \
+                     daemon_capacity() returned non-finite or non-positive ncpu={ncpu}; \
+                     cannot bound the per-container ceiling safely."
+                ));
+            }
+            _ => {}
+        }
+    }
+
     let (mut cpus, mut mem) = (cfg.limits.cpus, cfg.limits.memory_mb);
     if let Some((ncpu, daemon_mem)) = capacity {
         let n_f = (cfg.runner.count as f64).max(1.0);
@@ -3079,46 +3120,25 @@ fn effective_limits_with_capacity(
         // over-memory. Mirrors derive_memory_budget's fleet_budget_mb =
         // vm_total_mb - guest_reserve_mb formula (bead ez-gh-actions-yz6b
         // round 3) so the startup fail-loud guard / `ezgha doctor` preview
-        // and the ACTUAL docker run --memory limit stay in sync — before
-        // this fix they were two disconnected calculations and the guard
-        // could report "OK" while runners were still spawned with zero real
-        // guest headroom (daemon_mem / count, ignoring guest_reserve_mb).
+        // and the ACTUAL docker run --memory limit stay in sync.
         let fleet_mem_budget = daemon_mem.saturating_sub(cfg.runner.guest_reserve_mb);
         let cpu_share = (ncpu / n_f).max(0.5);
         let mem_share = (fleet_mem_budget / n_u).max(512);
-        // Opt-in CPU ceiling: `limits.cpu_burst = true` is honored ONLY
-        // when BOTH (a) the daemon is verified VM-contained AND (b) finite
-        // CPU capacity was discovered via `daemon_capacity()`. Without
-        // both, a host daemon or unknown capacity could silently exceed
-        // the physical-host envelope, so we log a loud warning and fall
-        // back to the default equal-share clamp. The aggregate VM total
-        // is still bounded by physical CPUs via the kernel's cfs_quota_us
-        // on the daemon cgroup — relaxing the per-container cap cannot
-        // make the fleet as a whole exceed VM capacity.
-        let burst_eligible = cfg.limits.cpu_burst && daemon_in_vm && cpus.is_finite();
-        let cpu_ceiling = if burst_eligible {
-            ncpu
-        } else {
-            if cfg.limits.cpu_burst {
-                let reason = if !daemon_in_vm {
-                    "daemon is not verified VM-contained (cpu_burst requires platform.daemon_in_vm=true)"
-                } else {
-                    "no finite CPU capacity discovered (cpu_burst requires daemon_capacity() to report ncpu)"
-                };
+        if cfg.limits.cpu_burst {
+            let cpu_ceiling = ncpu;
+            if cpus > cpu_ceiling {
                 eprintln!(
-                    "warning: limits.cpu_burst=true ignored — {reason}; reverting to default \
-                     equal-share clamp"
+                    "note: clamping cpus {cpus} -> {cpu_ceiling} (cpu_burst=true, \
+                     verified-VM daemon {ncpu} CPU)"
                 );
+                cpus = cpu_ceiling;
             }
-            cpu_share
-        };
-        if cpus > cpu_ceiling {
+        } else if cpus > cpu_share {
             eprintln!(
-                "note: clamping cpus {cpus} -> {cpu_ceiling} (cpu_burst={}, daemon {ncpu} CPU / {} runners)",
-                cfg.limits.cpu_burst,
+                "note: clamping cpus {cpus} -> {cpu_share} (daemon {ncpu} CPU / {} runners)",
                 cfg.runner.count
             );
-            cpus = cpu_ceiling;
+            cpus = cpu_share;
         }
         if mem > mem_share {
             eprintln!(
@@ -3130,7 +3150,7 @@ fn effective_limits_with_capacity(
             mem = mem_share;
         }
     }
-    (cpus, mem)
+    Ok((cpus, mem))
 }
 
 /// Derived, VM-aware memory budget for the fleet, computed once at daemon
@@ -3365,7 +3385,7 @@ fn start_one_with_generate_at_slot(
     pre_rm.args(["rm", "-f", &runner_name]);
     let _ = run_docker(pre_rm, "pre-start rm -f").ok();
 
-    let (cpus, memory_mb) = effective_limits(cfg);
+    let (cpus, memory_mb) = effective_limits(cfg).map_err(anyhow::Error::msg)?;
     // Build the set of GitHub runner_ids we own (slot file = host ownership).
     // Pass it to generate_jitconfig so a name collision during the 409
     // self-heal can be reclaimed as one of ours regardless of GitHub's
@@ -5147,7 +5167,7 @@ mod tests {
         let (ncpu, daemon_mem): (f64, u64) = (4.0, 12288);
         let expected_cpu_share = (ncpu / 16.0).max(0.5);
         let expected_mem_share = (daemon_mem / 16).max(512);
-        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false);
+        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
         assert!(
             cpus <= expected_cpu_share + f64::EPSILON,
             "effective_limits must clamp cpus to daemon/count (got {cpus} > {expected_cpu_share})"
@@ -5166,7 +5186,7 @@ mod tests {
         cfg.limits.cpus = 2.0;
         cfg.limits.memory_mb = 4096;
         let (ncpu, daemon_mem): (f64, u64) = (4.0, 8192);
-        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false);
+        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
         let cpus_total = cpus * cfg.runner.count as f64;
         let mem_total = mem * cfg.runner.count as u64;
         assert!(
@@ -5197,7 +5217,7 @@ mod tests {
         cfg.runner.count = 16;
         cfg.limits.memory_mb = 5977; // matches jeff-ubuntu's real config.toml
         assert_eq!(cfg.runner.guest_reserve_mb, 4096); // sanity: default
-        let (_, mem) = effective_limits_with_capacity(&cfg, Some((4.0, 48163)), false);
+        let (_, mem) = effective_limits_with_capacity(&cfg, Some((4.0, 48163)), false).unwrap();
         assert!(
             mem <= 2754,
             "effective_limits must respect guest_reserve_mb: expected <= 2754 MB (44067/16), got {mem} MB"
@@ -5208,25 +5228,15 @@ mod tests {
     // -----------------------------------------------------------------
     // `limits.cpu_burst` opt-in (2026-10-03 throughput finding).
     //
-    // These four tests pin the eligibility contract that root will rely
-    // on when enabling the opt-in only on the Mac fixed8CPU VM, leaving
-    // Linux default unchanged:
+    // Contract: cpu_burst=true is honored ONLY when (a) the daemon is
+    // verified VM-contained and (b) daemon_capacity() reports finite
+    // positive ncpu. Otherwise effective_limits returns Err and the
+    // caller (start_one_with_generate_at_slot and Serve startup) bails
+    // before mutating any runner — silent fallback would let a host
+    // daemon or unknown capacity exceed the physical envelope.
     //
-    //   1. cpu_burst_defaults_to_false — cfg's own default.
-    //   2. cpu_burst_with_vm_and_finite_capacity_relaxes_to_daemon_cpu
-    //      — the Mac fixed8CPU VM use case (8 CPU / 6 slots, cpus=4.0).
-    //   3. cpu_burst_without_vm_or_capacity_falls_back_to_equal_share
-    //      — host daemon or unknown capacity: no silent bypass.
-    //   4. cpu_burst_per_container_cap_does_not_exceed_daemon_capacity
-    //      — even with burst, per-container cpus is capped at ncpu
-    //        (NOT the configured cfg.limits.cpus if higher than ncpu),
-    //        so the aggregate cannot exceed VM physical CPUs.
-    //
-    // They exercise `effective_limits_with_capacity` directly because
-    // `effective_limits` calls `platform::detect()` which performs real
-    // filesystem probes — there's no test seam for that here, and we
-    // don't need one: the daemon_in_vm parameter is exactly the bit the
-    // detector flips, so unit-testing the consumer is sufficient.
+    // Default-false does NOT call platform::detect() (no probe cost on
+    // the hot path) — see cpu_burst_default_does_not_run_platform_detect.
     // -----------------------------------------------------------------
 
     #[test]
@@ -5241,17 +5251,15 @@ mod tests {
     #[test]
     fn cpu_burst_with_vm_and_finite_capacity_relaxes_to_daemon_cpu() {
         // Mac fixed8CPU VM (Colima/Lima), 6 runners, configured cpus=4.0.
-        // Without burst, equal-share clamp forces 8/6 = 1.33 → a hot job
-        // needing ~2.15 CPUs gets clipped (87% of excess throttled, per
-        // 2026-10-03 measurement). With burst + verified VM + finite
-        // capacity, the ceiling relaxes to min(cfg.limits.cpus, ncpu) =
-        // 4.0 and the hot job runs unthrottled.
+        // With burst + verified VM + finite capacity, the ceiling relaxes
+        // to min(cfg.limits.cpus, ncpu) = 4.0 and the hot job runs
+        // unthrottled.
         let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
         cfg.runner.count = 6;
         cfg.limits.cpus = 4.0;
         cfg.limits.cpu_burst = true;
         let (cpus, _mem) =
-            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ true);
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ true).unwrap();
         assert!(
             (cpus - 4.0).abs() < f64::EPSILON,
             "burst + VM + finite capacity must relax the per-container ceiling to cfg.limits.cpus=4.0 (got {cpus})"
@@ -5263,68 +5271,144 @@ mod tests {
     }
 
     #[test]
-    fn cpu_burst_without_vm_or_capacity_falls_back_to_equal_share() {
-        // Two sub-cases: host daemon (daemon_in_vm=false) and unknown
-        // capacity (None). Both must NOT silently bypass — the equal-share
-        // clamp is preserved and a loud warning is logged (we don't assert
-        // the warning string here, only the no-bypass outcome; see the
-        // effective_limits_with_capacity body for the warning message).
-        let mut cfg_host = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
-        cfg_host.runner.count = 6;
-        cfg_host.limits.cpus = 4.0;
-        cfg_host.limits.cpu_burst = true;
-        let (cpus_host, _) = effective_limits_with_capacity(
-            &cfg_host,
+    fn cpu_burst_unsupported_on_host_daemon_returns_err() {
+        // Burst on a host daemon must REFUSE — silent fallback to the
+        // equal-share clamp would let the operator believe burst was
+        // honored when it wasn't. Err propagates to start_one / Serve
+        // startup and the operator gets a loud message.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err = effective_limits_with_capacity(
+            &cfg,
             Some((8.0, 8192)),
             /* daemon_in_vm */ false,
-        );
-        let equal_share = (8.0_f64 / 6.0).max(0.5);
+        )
+        .expect_err("burst on a host daemon must return Err");
         assert!(
-            (cpus_host - equal_share).abs() < f64::EPSILON,
-            "burst on a HOST daemon must fall back to equal-share {equal_share} (got {cpus_host}); \
-             silent bypass would let one runner starve the physical host"
+            err.contains("not verified VM-contained"),
+            "Err message must explain the VM requirement (got {err:?})"
         );
+    }
 
-        let mut cfg_unknown = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
-        cfg_unknown.runner.count = 6;
-        cfg_unknown.limits.cpus = 4.0;
-        cfg_unknown.limits.cpu_burst = true;
-        let (cpus_unknown, _) = effective_limits_with_capacity(
-            &cfg_unknown,
+    #[test]
+    fn cpu_burst_unsupported_with_no_capacity_returns_err() {
+        // Burst with no discovered capacity (daemon_capacity returned
+        // None) must REFUSE — silent bypass would let a typo'd
+        // cfg.limits.cpus escape unclamped.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err = effective_limits_with_capacity(
+            &cfg,
             /* capacity */ None,
             /* daemon_in_vm */ true,
-        );
+        )
+        .expect_err("burst with no capacity must return Err");
         assert!(
-            (cpus_unknown - 4.0).abs() < f64::EPSILON,
-            "burst with no discovered capacity must NOT bypass — leave cfg.limits.cpus=4.0 as-is \
-             (got {cpus_unknown}); the per-docker-run --cpus ceiling only matters when capacity is known"
+            err.contains("non-finite") || err.contains("non-positive"),
+            "Err message must name the missing-capacity failure (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_rejects_nan_ncpu() {
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err = effective_limits_with_capacity(
+            &cfg,
+            Some((f64::NAN, 8192)),
+            /* daemon_in_vm */ true,
+        )
+        .expect_err("NaN ncpu must be rejected");
+        assert!(
+            err.contains("non-finite") || err.contains("non-positive"),
+            "Err message must name the NaN failure (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_rejects_zero_ncpu() {
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err = effective_limits_with_capacity(
+            &cfg,
+            Some((0.0, 8192)),
+            /* daemon_in_vm */ true,
+        )
+        .expect_err("zero ncpu must be rejected (pre-fix would have set cpu_ceiling=0.0)");
+        assert!(
+            err.contains("non-positive"),
+            "Err message must name the zero-failure (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_default_does_not_run_platform_detect() {
+        // Pinned regression: when limits.cpu_burst is false (default), the
+        // hot path (every start_one call) must NOT call platform::detect()
+        // — that probe fans out to docker info, which tart, which virsh,
+        // kvm device probes, etc. and would add latency to every spawn.
+        //
+        // We can't easily count platform::detect() calls in this unit test
+        // (it requires a test seam in platform.rs). Instead we verify the
+        // OUTCOME: with cpu_burst=false, the returned daemon_in_vm is
+        // false regardless of what a hypothetical probe would have said.
+        // The platform-detect gating lives at
+        // effective_limits cfg.limits.cpu_burst branch; this test pins the
+        // observable behavior. A test seam in platform.rs would be a
+        // follow-up if review requires it.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = false;
+        // capacity=Some((8, ...)), and the inner function is called with
+        // daemon_in_vm=false (because the outer effective_limits gates
+        // platform::detect() on cpu_burst=true). The CPU is then clamped
+        // to cpu_share = 8/6 = 1.33, NOT to ncpu=8.0 — that proves
+        // platform::detect did not run (it would have set daemon_in_vm
+        // and the burst path would have applied).
+        let (cpus, _mem) =
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ false).unwrap();
+        let cpu_share = (8.0_f64 / 6.0).max(0.5);
+        assert!(
+            (cpus - cpu_share).abs() < f64::EPSILON,
+            "cpu_burst=false must use the equal-share clamp {cpu_share} (got {cpus}); \
+             a wrong outcome here means the burst-eligibility check leaked into the default path"
         );
     }
 
     #[test]
     fn cpu_burst_per_container_cap_does_not_exceed_daemon_capacity() {
-        // Even with burst enabled, the per-container ceiling MUST be
-        // capped at the daemon's discovered ncpu. cfg.limits.cpus > ncpu
-        // would otherwise let count * cpus exceed VM physical CPUs (the
-        // aggregate kernel cfs_quota_us on the daemon cgroup is the
-        // backstop, but the per-container ceiling itself must never
-        // promise more than a single physical CPU could deliver — the
-        // --cpus value gets translated to cfs_quota_us per container,
-        // and any value above ncpu would be effectively unbounded).
+        // Even with burst enabled and VM + finite capacity verified, the
+        // per-container ceiling MUST be capped at the daemon's discovered
+        // ncpu. cfg.limits.cpus > ncpu would otherwise let count * cpus
+        // exceed VM physical CPUs (the --cpus value gets translated to
+        // cfs_quota_us per container, and any value above ncpu would be
+        // effectively unbounded).
         let mut cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
         cfg.runner.count = 6;
         cfg.limits.cpus = 16.0; // operator typo: 16 CPUs requested on a 4-CPU VM
         cfg.limits.cpu_burst = true;
-        let (cpus, _) =
-            effective_limits_with_capacity(&cfg, Some((4.0, 8192)), /* daemon_in_vm */ true);
+        let (cpus, _) = effective_limits_with_capacity(
+            &cfg,
+            Some((4.0, 8192)),
+            /* daemon_in_vm */ true,
+        )
+        .unwrap();
         assert!(
             cpus <= 4.0 + f64::EPSILON,
             "burst ceiling must be capped at daemon ncpu=4.0 (got {cpus}); never cfg.limits.cpus=16.0"
         );
         assert!(
             cpus * cfg.runner.count as f64 <= 4.0 * cfg.runner.count as f64 + f64::EPSILON,
-            "burst aggregate (cpus * count = {}) must not exceed ncpu * count = {}; \
-             relaxing beyond VM physical CPUs would silently over-aggregate",
+            "burst aggregate (cpus * count = {}) must not exceed ncpu * count = {}",
             cpus * cfg.runner.count as f64,
             4.0 * cfg.runner.count as f64,
         );

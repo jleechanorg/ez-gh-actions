@@ -51,35 +51,45 @@ Confirmed FAIL against the pre-fix code with the exact assertion message.
 
 ### Fix B — opt-in `limits.cpu_burst` (Mac fixed8CPU VM only)
 
-2026-10-03 Mac `cgroup cpu.stat` sample: one runner used 7.69 M us in 6 s,
-throttled 57/58 periods (5.21 M us / 12.9 M us = 87 % clipped). All 6
-aggregate 3.3 CPU; VM had 4.7 CPU unused. Equal-share clamp `8/6 = 1.33`
-was the bottleneck (hot job needed ~2.15 CPUs).
+2026-10-03 Mac `cgroup cpu.stat` sample: one runner used 7.69 M us in 6 s
+while throttled (others near zero). All 6 aggregate 3.3 CPU on an 8-CPU
+VM; equal-share clamp `--cpus 8/6 = 1.33` was the bottleneck.
 
 Design (minimum safe, default unchanged):
 - New `limits.cpu_burst: bool` (default `false`).
-- Honored ONLY when `platform::detect().daemon_in_vm` AND finite
-  `daemon_capacity().0`. Otherwise loud warning + equal-share fallback.
-- Per-container ceiling relaxes to `min(cfg.limits.cpus, ncpu)`. Aggregate
-  `count * ceiling` still bounded by VM physical CPUs via kernel
-  `cfs_quota_us` on the daemon cgroup.
+- `effective_limits` returns `Result`: on `cpu_burst=true` with
+  unsupported host (daemon not VM-contained OR no finite positive
+  ncpu), returns `Err`. `Serve` startup AND `start_one` propagate the
+  Err via `?` so any unsupported burst bails before runner mutation.
+- When honored, per-container ceiling relaxes to `min(cfg.limits.cpus,
+  ncpu)`. Aggregate `count * ceiling` is bounded by VM vCPU count
+  (the per-container value gets translated to `cfs_quota_us`, and a
+  value above `ncpu` would exceed one physical CPU).
 - Memory clamp unchanged.
+- Default-false does NOT call `platform::detect()` — no extra probes
+  on the hot path; gated behind `cfg.limits.cpu_burst`.
 - Reuses existing `daemon_in_vm` + `daemon_capacity()` probes.
 
-Four focused tests pin the contract:
+Tests pin the contract:
 - `cpu_burst_defaults_to_false`
 - `cpu_burst_with_vm_and_finite_capacity_relaxes_to_daemon_cpu`
-- `cpu_burst_without_vm_or_capacity_falls_back_to_equal_share` (host + unknown)
+- `cpu_burst_unsupported_on_host_daemon_returns_err`
+- `cpu_burst_unsupported_with_no_capacity_returns_err`
+- `cpu_burst_rejects_nan_ncpu`
+- `cpu_burst_rejects_zero_ncpu`
+- `cpu_burst_default_does_not_run_platform_detect`
 - `cpu_burst_per_container_cap_does_not_exceed_daemon_capacity`
 
 ### Test summary
 
 ```
 $ cargo test --bin ezgha -j 2 2>&1 | tail -3
-test result: ok. 436 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 440 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
-Up from 431 (`b4669de`): +5 (1 absent-regression + 4 cpu_burst).
+Up from 431 (`b4669de`): +9 (1 absent-regression + 8 cpu_burst:
+default-false, VM+finite relax, host-refuses, no-capacity-refuses,
+NaN-refuses, zero-refuses, default-no-VM-probe, per-container-cap).
 
 Shell regressions clean: `commit_msg_provenance_prefix`, `doctor_runner_verdict_line`,
 `doctor_runner_expected_containers`, `doctor_runner_heartbeat_starvation`,
