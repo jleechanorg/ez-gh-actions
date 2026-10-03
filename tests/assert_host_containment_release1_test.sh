@@ -105,7 +105,7 @@ for kib in 64487424 64487423; do
   printf 'MemTotal:       %s kB\n' "$kib" > "$FX/proc/meminfo"
   if PATH="$FX/bin:$PATH" "$ASSERT_SCRIPT" --root "$FX" --require-fleet > "$WORK/mem_b_$kib.log" 2>&1; then rc=0; else rc=1; fi
   if [ "$kib" = 64487424 ]; then [ "$rc" = 0 ] || fail "MemTotal at exact floor $kib KiB rejected"
-  else [ "$rc" = 1 ] && grep -q "FAIL: host MemTotal" "$WORK/mem_b_$kib.log" || fail "MemTotal floor-1 $kib KiB accepted"; fi
+  else [ "$rc" = 1 ] && grep -qF "62-GiB floor (64487424 KiB" "$WORK/mem_b_$kib.log" || fail "MemTotal floor-1 $kib KiB accepted"; fi
 done
 ok "assert-host-containment-release1.sh floor boundary is exact (64487424 pass, 64487423 fail)"
 
@@ -116,7 +116,7 @@ printf 'MemTotal:       62914560 kB\n' > "$FIXTURE_MEM_FAIL/proc/meminfo"
 if PATH="$FIXTURE_MEM_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_FAIL" --require-fleet > "$WORK/mem_fail.log" 2>&1; then
   fail "assertion passed when MemTotal was below floor"
 fi
-grep -q "FAIL: host MemTotal" "$WORK/mem_fail.log" || fail "missing expected MemTotal failure message"
+grep -qF "62-GiB floor (64487424 KiB" "$WORK/mem_fail.log" || fail "missing expected MemTotal failure message"
 ok "assert-host-containment-release1.sh rejects memory below 62 GiB floor"
 
 # 3. Test online CPUs below floor (31 online CPUs)
