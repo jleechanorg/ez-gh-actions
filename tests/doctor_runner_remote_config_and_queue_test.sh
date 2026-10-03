@@ -21,7 +21,7 @@ cmd="${*: -1}"
 case "$cmd" in
   true) exit 0 ;;
   *name_prefix*) [ "${FAKE_SSH_CFG:-fail}" = ok ] && { echo "ez-mac-runner-g"; exit 0; }; exit 255 ;;
-  *count*) [ "${FAKE_SSH_CFG:-fail}" = ok ] && { echo 5; exit 0; }; exit 255 ;;
+  *count*) [ "${FAKE_SSH_CFG:-fail}" = ok ] && { echo "${FAKE_SSH_COUNT:-6}"; exit 0; }; exit 255 ;;
 esac
 exit 255
 SH
@@ -33,14 +33,14 @@ BLOCK=$(sed -n '/^REMOTE_UNREACHABLE=0/,/^export REMOTE_UNREACHABLE/p' "$ROOT/do
 run_remote() {  # env assignments passed through the environment
   (
     PATH="$TMP/bin:$PATH"
-    PLATFORM=linux; REMOTE_HOST=macbook; REMOTE_LABEL="macos (macbook)"
+    PLATFORM="${T_PLATFORM:-linux}"; REMOTE_HOST=macbook; REMOTE_LABEL="macos (macbook)"
     REMOTE_PREFIX="${T_PREFIX:-}"; REMOTE_COUNT="${T_COUNT:-}"
     DEFAULT_LINUX_RUNNER_COUNT=10; DEFAULT_MAC_RUNNER_COUNT=6
     SLOT_PROOF_CRITICAL=0; STARVED_PRESENT=0; REMOTE_DOWN_SLOTS=(); REMOTE_EXECUTING_SLOTS=(); REMOTE_IDLE_SLOTS=(); REMOTE_CYCLING_SLOTS=()
     info() { :; }; bad() { echo "BAD $*"; }; ok() { echo "OK $*"; }; warn() { :; }
     list_slot_work() { echo "LIST $1 $2"; LAST_EXECUTING_SLOTS=(); LAST_IDLE_SLOTS=(); LAST_CYCLING_SLOTS=(); LAST_DOWN_SLOTS=(); }
     eval "$BLOCK"
-    echo "CRITICAL=$SLOT_PROOF_CRITICAL DOWN=${#REMOTE_DOWN_SLOTS[@]} UNPROVEN=$REMOTE_CONFIG_UNPROVEN"
+    echo "CRITICAL=$SLOT_PROOF_CRITICAL DOWN=${#REMOTE_DOWN_SLOTS[@]} UNPROVEN=$REMOTE_CONFIG_UNPROVEN NAMES=${REMOTE_DOWN_SLOTS[*]:-}"
   ) 2>&1
 }
 
@@ -52,10 +52,37 @@ check "verdict stays non-green (critical>0), no DOWN slots" "grep -q 'CRITICAL=1
 check "stale hardcoded prefix defaults removed" "! grep -q 'ez-mac-runner-e' '$ROOT/doctor-runner'"
 
 out=$(FAKE_SSH_CFG=ok run_remote)
-check "readable config -> real prefix/count used" "grep -q 'LIST ez-mac-runner-g 5' <<<\"\$out\""
+check "readable config at contract -> real prefix/count used" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && ! grep -q '^BAD' <<<\"\$out\""
+
+# Finding A: config count below the fleet contract (10+5) must not pass.
+out=$(FAKE_SSH_CFG=ok FAKE_SSH_COUNT=5 run_remote)
+check "config count 5 < contract 6 -> [BAD] underprovisioned" "grep -q 'BAD .*remote config count 5 is below the fleet contract 6 — underprovisioned' <<<\"\$out\""
+check "underprovisioned inspects contract (6) slots, not 5" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && ! grep -q 'LIST ez-mac-runner-g 5' <<<\"\$out\""
+check "underprovisioned counts a slot-proof critical" "grep -q 'CRITICAL=1 ' <<<\"\$out\""
 
 out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=5 run_remote)
 check "env overrides bypass lookup" "grep -q 'LIST ez-mac-runner-g 5' <<<\"\$out\" && grep -q 'UNPROVEN=0' <<<\"\$out\""
+
+# Finding A (Linux side): a remote Linux count below 10 is underprovisioned too.
+out=$(FAKE_SSH_CFG=ok FAKE_SSH_COUNT=9 T_PLATFORM=macos run_remote)
+check "linux config count 9 < contract 10 -> [BAD] underprovisioned" "grep -q 'BAD .*remote config count 9 is below the fleet contract 10 — underprovisioned' <<<\"\$out\" && grep -q 'LIST ez-mac-runner-g 10' <<<\"\$out\""
+
+# Explicit env override is an operator decision: not flagged against the contract.
+out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=5 run_remote)
+check "explicit override count 5 not flagged underprovisioned" "! grep -q underprovisioned <<<\"\$out\" && grep -q 'CRITICAL=0 ' <<<\"\$out\""
+
+# Finding B: unreachable remote with empty prefix/count never greens, never builds "-1" names.
+cat > "$TMP/bin/ssh_down" <<'SH'
+#!/usr/bin/env bash
+exit 255
+SH
+chmod +x "$TMP/bin/ssh_down"; cp "$TMP/bin/ssh" "$TMP/bin/ssh_real"; cp "$TMP/bin/ssh_down" "$TMP/bin/ssh"
+out=$(run_remote)
+check "unreachable + no override -> critical >= contract count" "grep -q 'CRITICAL=6 DOWN=6 ' <<<\"\$out\""
+check "unreachable + no override -> no empty-prefix slot names" "! grep -qE 'NAMES=(-| )|[ =]-[0-9]+ \\(unreachable' <<<\"\$out\""
+out=$(T_COUNT=3 run_remote)
+check "unreachable, count but no prefix -> placeholder prefix, critical 3" "grep -q 'CRITICAL=3 DOWN=3 ' <<<\"\$out\" && grep -q 'NAMES=<unknown-prefix>-1 ' <<<\"\$out\" && ! grep -qE '[ =]-[0-9]+ \\(unreachable' <<<\"\$out\""
+cp "$TMP/bin/ssh_real" "$TMP/bin/ssh"
 
 # --- queue block must not abort the caller ---
 cat > "$TMP/bin/gh" <<'SH'

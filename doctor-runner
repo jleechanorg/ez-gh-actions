@@ -1225,13 +1225,22 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
     return 0
   }
   [ -n "$REMOTE_PREFIX" ] || REMOTE_PREFIX=$(_remote_cfg_get '^name_prefix')
-  [ -n "$REMOTE_COUNT" ] || REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*=')
+  _remote_count_from_cfg=0
+  if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); _remote_count_from_cfg=1; fi
   if [ -z "$REMOTE_PREFIX" ] || [ -z "$REMOTE_COUNT" ]; then
     REMOTE_CONFIG_UNPROVEN=1
     REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
     bad "$REMOTE_LABEL remote config (name_prefix/count) could not be read over SSH after retry — remote fleet UNPROVEN (no slot names guessed; fix SSH or set the MAC_RUNNER_NAME_PREFIX/MAC_RUNNER_COUNT or REMOTE_LINUX_PREFIX/REMOTE_LINUX_COUNT overrides)"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
   else
+  # A count READ FROM CONFIG below the fleet contract is underprovisioning, not
+  # the expected capacity: flag it and inspect the contract number of slots so
+  # the missing slot shows DOWN. Explicit env overrides are operator decisions.
+  if [ "$_remote_count_from_cfg" -eq 1 ] && [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -lt "$DEFAULT_REMOTE_COUNT" ]; then
+    bad "$REMOTE_LABEL remote config count $REMOTE_COUNT is below the fleet contract $DEFAULT_REMOTE_COUNT — underprovisioned"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
+    REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+  fi
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
   REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
   REMOTE_IDLE_SLOTS=("${LAST_IDLE_SLOTS[@]}")
@@ -1259,6 +1268,12 @@ else
   # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
   # `ok` to `bad` so an unreachable host can never silently green.
   REMOTE_UNREACHABLE=1
+  # No override and no config lookup: fall back to the contract count and a
+  # placeholder prefix so the verdict always goes non-green and no slot name
+  # is ever built from an empty prefix.
+  REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
+  [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+  REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
   _unreach_idx=1
   while [ "$_unreach_idx" -le "$REMOTE_COUNT" ]; do
     REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unreach_idx} (unreachable)")
