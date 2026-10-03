@@ -3913,7 +3913,7 @@ where
     }
 
     let mut summary = ReadinessSummary::default();
-    for (container, result) in owned.iter().zip(probe_results.into_iter()) {
+    for (container, result) in owned.iter().zip(probe_results) {
         match result {
             Ok(ProbeOutcome::Ready) => summary.ready += 1,
             // NotReady = container alive, runner process died. Settling
