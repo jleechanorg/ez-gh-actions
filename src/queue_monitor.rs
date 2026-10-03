@@ -516,24 +516,41 @@ impl QueueMonitorScheduler {
     /// `false` only when the scheduler has no state to give a worker.
     /// Never blocks.
     pub fn maybe_dispatch(&mut self, cfg: &Config, loop_start: Instant) -> bool {
-        self.collect_finished();
-        if self.in_flight.is_some() {
-            return true;
-        }
-        let Some(mut qm) = self.queue_monitor.take() else {
-            return false;
-        };
-        let Some(mut inv) = self.invariant_sampler.take() else {
-            self.queue_monitor = Some(qm);
-            return false;
-        };
         let cfg = cfg.clone();
-        self.in_flight = Some(thread::spawn(move || {
+        self.dispatch_with(move |mut qm, mut inv| {
             let status = qm
                 .drive_serve_loop_ticks(&cfg, loop_start, &mut inv)
                 .map(|_| ());
             (qm, inv, status)
-        }));
+        })
+    }
+
+    /// Single guard / take / spawn path shared by production
+    /// `maybe_dispatch` and the test seam so the regression tests
+    /// exercise the SAME scheduling logic the serve loop does. The
+    /// worker closure receives the (moved) state pair and returns it
+    /// (possibly mutated) plus a tick status.
+    fn dispatch_with<F>(&mut self, worker: F) -> bool
+    where
+        F: FnOnce(
+                QueueMonitorState,
+                InvariantSamplerState,
+            ) -> (QueueMonitorState, InvariantSamplerState, Result<()>)
+            + Send
+            + 'static,
+    {
+        self.collect_finished();
+        if self.in_flight.is_some() {
+            return true;
+        }
+        let Some(qm) = self.queue_monitor.take() else {
+            return false;
+        };
+        let Some(inv) = self.invariant_sampler.take() else {
+            self.queue_monitor = Some(qm);
+            return false;
+        };
+        self.in_flight = Some(thread::spawn(move || worker(qm, inv)));
         true
     }
 
@@ -576,7 +593,7 @@ impl Default for QueueMonitorScheduler {
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -627,17 +644,27 @@ mod scheduler_tests {
 
     /// State survives a successful tick: dispatch, wait deterministically
     /// for the worker to finish (bounded wait -- no fixed sleep), collect,
-    /// verify scheduler still has both states and can dispatch a second
-    /// worker. Roundtrip integrity.
+    /// verify the scheduler's state pair was preserved by asserting the
+    /// SECOND worker observes the FIRST worker's mutations
+    /// (`last_check`, `consecutive_bad`, REST-backoff
+    /// `rest_budget_skip_ticks_remaining`). Counting closures alone would
+    /// miss a rebuild-on-success regression that loses the worker's
+    /// updates.
     #[test]
     fn scheduler_roundtrips_state_after_success() {
         let qm_witness: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
         let inv_witness: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let consecutive_after_first: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let last_check_after_first: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let skip_after_first: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
         let mut sched = QueueMonitorScheduler::new();
         let qm_w = qm_witness.clone();
         let inv_w = inv_witness.clone();
         let dispatched = sched.maybe_dispatch_with(move |mut qm, mut inv| {
             qm.record_tail_sample(true);
+            qm.record_tail_sample(true);
+            qm.record_tail_sample(true);
+            qm.rest_budget_skip_ticks_remaining = 4;
             inv.last_check = Some(Instant::now());
             qm_w.fetch_add(1, Ordering::SeqCst);
             inv_w.fetch_add(1, Ordering::SeqCst);
@@ -646,12 +673,21 @@ mod scheduler_tests {
         assert!(dispatched);
         wait_until_finished(&mut sched, Duration::from_secs(5));
         assert!(sched.collect_finished());
-        assert_eq!(qm_witness.load(Ordering::SeqCst), 1);
-        assert_eq!(inv_witness.load(Ordering::SeqCst), 1);
-        // Second dispatch works (state pair was returned, no rebuild).
+        // Second dispatch observes the first worker's mutations.
         let qm_w2 = qm_witness.clone();
         let inv_w2 = inv_witness.clone();
+        let consecutive_seen = consecutive_after_first.clone();
+        let last_check_seen = last_check_after_first.clone();
+        let skip_seen = skip_after_first.clone();
         let second = sched.maybe_dispatch_with(move |qm, inv| {
+            consecutive_seen.store(qm.consecutive_bad, Ordering::SeqCst);
+            skip_seen.store(qm.rest_budget_skip_ticks_remaining, Ordering::SeqCst);
+            last_check_seen.store(
+                inv.last_check
+                    .map(|t| t.elapsed().as_nanos() as u64)
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
             qm_w2.fetch_add(1, Ordering::SeqCst);
             inv_w2.fetch_add(1, Ordering::SeqCst);
             (qm, inv, Ok(()))
@@ -661,6 +697,22 @@ mod scheduler_tests {
         assert!(sched.collect_finished());
         assert_eq!(qm_witness.load(Ordering::SeqCst), 2);
         assert_eq!(inv_witness.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            consecutive_after_first.load(Ordering::SeqCst),
+            3,
+            "consecutive_bad=3 from first tick must survive the roundtrip"
+        );
+        assert_eq!(
+            skip_after_first.load(Ordering::SeqCst),
+            4,
+            "rest_budget_skip_ticks_remaining=4 from first tick must survive the roundtrip"
+        );
+        // last_check is a recent Instant -- nanoseconds elapsed is small.
+        let elapsed_ns = last_check_after_first.load(Ordering::SeqCst);
+        assert!(
+            elapsed_ns < Duration::from_secs(5).as_nanos() as u64,
+            "last_check must still be a recent Instant after the roundtrip (elapsed_ns={elapsed_ns})"
+        );
     }
 
     /// Regression: an ordinary Err from a tick must NOT rebuild state.
@@ -669,10 +721,14 @@ mod scheduler_tests {
     #[test]
     fn scheduler_preserves_state_across_ordinary_tick_error() {
         let consecutive_seen: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let skip_seen: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let last_check_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let mut sched = QueueMonitorScheduler::new();
-        let dispatched = sched.maybe_dispatch_with(|mut qm, inv| {
+        let dispatched = sched.maybe_dispatch_with(|mut qm, mut inv| {
             qm.record_tail_sample(true);
             qm.record_tail_sample(true);
+            qm.rest_budget_skip_ticks_remaining = 6;
+            inv.last_check = Some(Instant::now());
             // Simulate a tick that errored (e.g. rate-limited probe).
             // State mutations BEFORE the error must still be visible to
             // the next dispatch -- otherwise backoff is silently lost on
@@ -686,22 +742,41 @@ mod scheduler_tests {
             sched.collect_finished(),
             "ordinary Err still counts as a finished tick"
         );
-        // Next dispatch reads consecutive_bad and stashes it via an atomic
-        // (the atomic is `Send + 'static`, so moving it into the closure
-        // is sound; we read it back via the same handle the closure owns).
-        let seen_for_read = consecutive_seen.clone();
-        let seen_for_worker = consecutive_seen;
+        // Next dispatch reads mutated state and stashes it via atomics
+        // (atomics are `Send + 'static`, so moving them into the closure
+        // is sound; we read them back via clones).
+        let seen_consecutive = consecutive_seen.clone();
+        let seen_skip = skip_seen.clone();
+        let seen_last_check = last_check_seen.clone();
         let dispatched2 = sched.maybe_dispatch_with(move |qm, inv| {
-            seen_for_worker.store(qm.consecutive_bad, Ordering::SeqCst);
+            seen_consecutive.store(qm.consecutive_bad, Ordering::SeqCst);
+            seen_skip.store(qm.rest_budget_skip_ticks_remaining, Ordering::SeqCst);
+            seen_last_check.store(
+                inv.last_check
+                    .map(|t| t.elapsed().as_nanos() as u64)
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
             (qm, inv, Ok(()))
         });
         assert!(dispatched2);
         wait_until_finished(&mut sched, Duration::from_secs(5));
         assert!(sched.collect_finished());
         assert_eq!(
-            seen_for_read.load(Ordering::SeqCst),
+            consecutive_seen.load(Ordering::SeqCst),
             2,
             "two tail_bad=true ticks must survive the intermediate Err tick"
+        );
+        assert_eq!(
+            skip_seen.load(Ordering::SeqCst),
+            6,
+            "rest_budget_skip_ticks_remaining=6 must survive the intermediate Err tick"
+        );
+        // last_check set just before the Err must still be a recent Instant.
+        let elapsed_ns = last_check_seen.load(Ordering::SeqCst);
+        assert!(
+            elapsed_ns < Duration::from_secs(5).as_nanos() as u64,
+            "last_check must survive the intermediate Err tick (elapsed_ns={elapsed_ns})"
         );
     }
 
