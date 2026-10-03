@@ -423,7 +423,7 @@ fi
 # (the current fleet is "10 Linux + 6 Mac"; the Mac half is proven the
 # same way, over SSH, when the host is reachable).
 MAC_HOST="${MAC_HOST:-macbook}"
-MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
+MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-g}"
 MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-6}"
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/null 2>&1; then
   MAC_DOWN_SLOTS=()
@@ -496,7 +496,7 @@ CRITICAL=0
 [ "$SERVICE_STATE" != "active" ]            && CRITICAL=$((CRITICAL+1))
 [ "$COLIMA_STATUS" = "Stopped" ]            && CRITICAL=$((CRITICAL+1))
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
-# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-b-*` fleet
+# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-g-*` fleet
 # counts the same as Linux's `ez-org-runner-*` / `ez-runner-b-*`.)
 ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1 && \
                                           CRITICAL=$((CRITICAL+1))

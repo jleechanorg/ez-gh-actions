@@ -1597,7 +1597,7 @@ fi
 
 # (5) Mac parity probe (bead ez-gh-actions-r3f16) -----------------------------------
 # Round-3 cold review noted that the fleet has a Mac component
-# (ez-mac-runner-b-1..6) but Gate 8 only probes the Linux host's QEMU
+# (ez-mac-runner-g-1..6) but Gate 8 only probes the Linux host's QEMU
 # cgroup. The Mac side runs colima (a Linux VM under QEMU) on macOS; its
 # cgroup tree is INSIDE the colima VM, reachable from the macOS host
 # shell only via `limactl shell colima --`. This probe brings Gate 8's

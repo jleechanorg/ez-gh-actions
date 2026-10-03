@@ -10,7 +10,7 @@ use crate::github;
 
 const FLEET_ORG: &str = "jleechanorg";
 const LINUX_FLEET_PREFIX: &str = "ez-runner-c-";
-const MAC_FLEET_PREFIX: &str = "ez-mac-runner-b-";
+const MAC_FLEET_PREFIX: &str = "ez-mac-runner-g-";
 const LINUX_FLEET_COUNT: u32 = 10;
 const MAC_FLEET_COUNT: u32 = 6;
 const EXPECTED_FLEET_RUNNERS: usize = (LINUX_FLEET_COUNT + MAC_FLEET_COUNT) as usize;
@@ -1700,7 +1700,7 @@ mod tests {
                     busy: true,
                 },
                 FleetRunner {
-                    name: "ez-mac-runner-b-1".into(),
+                    name: "ez-mac-runner-g-1".into(),
                     status: "online".into(),
                     busy: false,
                 },
@@ -1712,7 +1712,7 @@ mod tests {
         let raw = fs::read_to_string(&log).unwrap();
         assert!(raw.contains("\"event_key\":\"queue.idle_runner_mismatch\""));
         assert!(raw.contains("\"severity\":\"CRITICAL\""));
-        assert!(raw.contains("ez-mac-runner-b-1 online false"));
+        assert!(raw.contains("ez-mac-runner-g-1 online false"));
         assert!(raw.contains("missing expected runners: ez-runner-c-2"));
         let _ = fs::remove_dir_all(dir);
     }
@@ -1724,8 +1724,8 @@ mod tests {
             runner("ez-runner-c-2", "online", false),
             runner("ez-runner-c-10", "online", true),
             runner("ez-runner-c-11", "online", true),
-            runner("ez-mac-runner-b-1", "offline", false),
-            runner("ez-mac-runner-b-6", "online", false),
+            runner("ez-mac-runner-g-1", "offline", false),
+            runner("ez-mac-runner-g-6", "online", false),
             runner("ez-canary-runner-b-1", "online", false),
         ];
 
@@ -1738,7 +1738,7 @@ mod tests {
         assert!(stats.missing_names.contains(&"ez-runner-c-3".to_string()));
         assert!(!stats
             .missing_names
-            .contains(&"ez-mac-runner-b-6".to_string()));
+            .contains(&"ez-mac-runner-g-6".to_string()));
         assert!(stats
             .runners
             .iter()
@@ -1746,7 +1746,7 @@ mod tests {
         assert!(stats
             .runners
             .iter()
-            .any(|runner| runner.name == "ez-mac-runner-b-6"));
+            .any(|runner| runner.name == "ez-mac-runner-g-6"));
         assert!(!stats
             .runners
             .iter()
@@ -2100,7 +2100,7 @@ exit 1
             busy_count: EXPECTED_FLEET_RUNNERS - 1,
             idle_count: 0,
             missing_names: vec!["ez-runner-c-10".into()],
-            runners: vec![fleet_runner("ez-mac-runner-b-1", "offline", false)],
+            runners: vec![fleet_runner("ez-mac-runner-g-1", "offline", false)],
         };
         assert_eq!(classify_inv1_failure(&fleet), "missing-registration");
     }

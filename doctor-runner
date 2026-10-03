@@ -1374,7 +1374,7 @@ if [ "$COLIMA_STATUS" = "Stopped" ]; then
   CRITICAL=$((CRITICAL+1))
 fi
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
-# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-b-*` fleet
+# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-g-*` fleet
 # counts the same as Linux's `ez-org-runner-*` / `ez-runner-b-*`.)
 if ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1; then
   bad "verdict: runners-online gate FAILED (no ONLINE runner with prefix '$RUNNER_NAME_PREFIX' found; total=$TOTAL online=$ONLINE offline=$OFFLINE busy=$BUSY)"
