@@ -177,7 +177,7 @@ cat > "$TMP/timerbin/systemctl" <<'EOF2'
 case "${1:-}" in
   is-enabled|is-active)
     if [ -n "${STUB_SYSTEMCTL_BROKEN:-}" ]; then
-      echo "Failed to connect to bus: No medium found" >&2; exit 1
+      echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
     fi
     for t in ${STUB_ENABLED_TIMERS:-}; do [ "$t" = "${2:-}" ] && { echo enabled; exit 0; }; done
     if [ -n "${STUB_NOTFOUND:-}" ]; then echo not-found; exit 4; fi
@@ -209,6 +209,14 @@ PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
   bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
 [ "$timers_rc" -ne 0 ] || fail "systemctl query failure must fail Gate 8 closed"
+# No user session (ssh/cron): the bus error also says "No such file or
+# directory" but is a query failure, not an absent unit.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
+  STUB_BROKEN_MSG="Failed to connect to bus: No such file or directory" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "bus-connect failure ('No such file') must fail Gate 8 closed"
 # An absent unit (No such file) is a known-disabled state and passes.
 PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
