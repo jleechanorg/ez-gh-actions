@@ -283,6 +283,80 @@ daemon_in_vm() {
     [ -n "$daemon_kernel" ] && [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
 }
 
+host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1" 2>/dev/null; }
+# Integer-only size conversion for tracked systemd values (4608M, 5G, 0).
+host_to_bytes() {
+    case "$1" in
+        *G) echo $(( ${1%G} * 1024 * 1024 * 1024 )) ;;
+        *M) echo $(( ${1%M} * 1024 * 1024 )) ;;
+        *K) echo $(( ${1%K} * 1024 )) ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Gate 8 host-docker envelope (bead ez-gh-actions-154k). On a host-docker
+# Linux host the four finite budgets are actions.slice (runners), agents.slice,
+# automation.slice and lima-vm@colima.service (the qdrant-only Colima VM). Their
+# LIVE memory.high/memory.max must equal the tracked host-docker policy and be
+# finite, and the sum of the live memory.max values plus the reserve
+# (max(MemTotal/10, 2048 MB)) must fit MemTotal. Hard maxima are summed once;
+# no memory.high x2 overflow model and no VM-backed 38G term.
+verify_host_docker_envelope() {
+    local policy_root="${VERIFY_EXIT_CRITERIA_POLICY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local cg_root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local meminfo="${VERIFY_EXIT_CRITERIA_MEMINFO:-/proc/meminfo}"
+    local entry unit policy cg want_high want_max live_high live_max
+    local total_mb=0 host_mb reserve_mb terms=""
+    for entry in \
+        "actions.slice|systemd/host/actions.slice" \
+        "agents.slice|systemd/agents.slice" \
+        "automation.slice|systemd/automation.slice" \
+        "lima-vm@colima.service|systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
+        unit="${entry%%|*}"
+        policy="${policy_root}/${entry#*|}"
+        want_high=$(host_to_bytes "$(host_unit_value "$policy" MemoryHigh)")
+        want_max=$(host_to_bytes "$(host_unit_value "$policy" MemoryMax)")
+        case "${want_high}:${want_max}" in
+            :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: tracked ${policy} must set finite integer MemoryHigh/MemoryMax (got high=${want_high:-?} max=${want_max:-?})" ;;
+        esac
+        if [ "$unit" = actions.slice ]; then
+            cg=/actions.slice
+        else
+            cg=$(systemctl --user show -p ControlGroup --value -- "$unit" 2>/dev/null || true)
+        fi
+        [ -n "$cg" ] || fail "Gate 8 host-docker envelope: ${unit} has no live cgroup"
+        live_high=$(cat "${cg_root}${cg}/memory.high" 2>/dev/null || true)
+        live_max=$(cat "${cg_root}${cg}/memory.max" 2>/dev/null || true)
+        case "${live_high}:${live_max}" in
+            :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: ${unit} live memory.high=${live_high:-unreadable} memory.max=${live_max:-unreadable} is not finite (${cg_root}${cg})" ;;
+        esac
+        if [ "$live_high" != "$want_high" ] || [ "$live_max" != "$want_max" ]; then
+            fail "Gate 8 host-docker envelope: ${unit} live memory.high=${live_high} memory.max=${live_max} does not match tracked ${entry#*|} (high=${want_high} max=${want_max})"
+        fi
+        total_mb=$((total_mb + live_max / 1048576))
+        terms="${terms:+${terms} + }${unit}=$((live_max / 1048576))MB"
+    done
+    host_mb=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' "$meminfo" 2>/dev/null || true)
+    case "$host_mb" in ''|*[!0-9]*|0) fail "Gate 8 host-docker envelope: could not read MemTotal from ${meminfo}" ;; esac
+    reserve_mb=$((host_mb / 10))
+    [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
+    if [ $((total_mb + reserve_mb)) -gt "$host_mb" ]; then
+        fail "Gate 8 host-docker envelope: live hard maxima ${total_mb}MB (${terms}) + reserve ${reserve_mb}MB exceed host ${host_mb}MB"
+    fi
+    echo "    [PASS] Gate 8 host-docker envelope: live hard maxima ${total_mb}MB (${terms}) + reserve ${reserve_mb}MB fit host ${host_mb}MB"
+}
+
+# Succeeds when `oomctl` output (stdin) lists /actions.slice under
+# "Memory Pressure Monitored CGroups:" (tab-indented "Path: /actions.slice").
+oomctl_lists_actions_slice() {
+    awk '
+        /^Memory Pressure Monitored CGroups:/ { capturing = 1; next }
+        /^[^[:space:]]/                       { capturing = 0 }
+        capturing && $1 == "Path:" && $2 == "/actions.slice" { found = 1 }
+        END { exit !found }
+    '
+}
+
 cpu_controller_available() {
     if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
         if grep -qw 'cpu' /sys/fs/cgroup/cgroup.controllers; then
@@ -425,6 +499,8 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         containers) verify_managed_runners_in_actions_slice ;;
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
+        host_docker_envelope) verify_host_docker_envelope ;;
+        oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
@@ -992,6 +1068,13 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         esac
     }
 
+    # Host-docker hosts sum their live maxima once in Gate 8 (4)
+    # (verify_host_docker_envelope); app-lima-vm.slice's VM-backed 38G term
+    # belongs only to the VM-backed sum below.
+    MODERN_HOST_DOCKER=0
+    if [ "$(uname -s)" = "Linux" ] && ! daemon_in_vm; then
+        MODERN_HOST_DOCKER=1
+    fi
     MODERN_MAX_TOTAL_MB=0
     for slice in app-lima-vm.slice agents.slice automation.slice; do
         slice_file="${MODERN_UNIT_DIR}/${slice}"
@@ -1050,15 +1133,6 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
     else
         host_unit="${REPO_ROOT}/systemd/host/actions.slice"
-        host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"; }
-        host_to_bytes() {
-            case "$1" in
-                *G) echo $(( ${1%G} * 1024 * 1024 * 1024 )) ;;
-                *M) echo $(( ${1%M} * 1024 * 1024 )) ;;
-                *K) echo $(( ${1%K} * 1024 )) ;;
-                *) echo "$1" ;;
-            esac
-        }
         host_high_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryHigh)")
         host_max_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryMax)")
         host_swap_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemorySwapMax)")
@@ -1087,7 +1161,9 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
     MODERN_RESERVE_MB=$((MODERN_HOST_TOTAL_MB / 10))
     [ "$MODERN_RESERVE_MB" -ge 2048 ] || MODERN_RESERVE_MB=2048
-    if [ $((MODERN_MAX_TOTAL_MB + MODERN_RESERVE_MB)) -gt "$MODERN_HOST_TOTAL_MB" ]; then
+    if [ "$MODERN_HOST_DOCKER" = 1 ]; then
+        echo "    [INFO] host-docker: hard-maxima envelope is checked against live cgroups in Gate 8 (4)"
+    elif [ $((MODERN_MAX_TOTAL_MB + MODERN_RESERVE_MB)) -gt "$MODERN_HOST_TOTAL_MB" ]; then
         fail "Gate 8 modern envelope: hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB exceed host ${MODERN_HOST_TOTAL_MB}MB"
     else
         echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
@@ -1120,7 +1196,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
 fi
 # Remediation primer (printed before probes fire so a cold reader sees
 # the four probes + their fixes):
-#   (1) QEMU slice:    systemd/app-lima-vm.slice (MemoryHigh=38G) must be
+#   (1) QEMU slice:    the mode-selected app-lima-vm.slice (systemd/ VM-backed 34G/38G, systemd/host-docker/ 4608M/5G) must be
 #                      deployed to ~/.config/systemd/user/ AND reloaded
 #                      (systemctl --user daemon-reload); the LIVE leaf
 #                      cgroup's memory.high in /sys/fs/cgroup must be a
@@ -1179,7 +1255,7 @@ if [ "$PROBE_QEMU_SLICE" = "1" ]; then
             fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
         fi
         if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ VM-backed 34G/38G, systemd/host-docker/ 4608M/5G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
         fi
         echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
     fi
@@ -1337,7 +1413,14 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
     # ManagedOOMPreference=avoid/omit, which also enrolls the unit as
     # a candidate for oomd action).
     OOMCTL_OUT="$(oomctl 2>/dev/null || true)"
-    if [ -n "$OOMCTL_OUT" ]; then
+    if [ "$(uname -s)" = "Linux" ] && ! daemon_in_vm; then
+        # Host-docker: the runner aggregate itself must be what oomd watches
+        # (systemd/host/actions.slice: ManagedOOMMemoryPressure=kill at 80%).
+        if printf '%s\n' "$OOMCTL_OUT" | oomctl_lists_actions_slice; then
+            OOMD_ENROLLED=1
+            OOMD_ENROLL_PROOF="oomctl: /actions.slice under Memory Pressure Monitored CGroups"
+        fi
+    elif [ -n "$OOMCTL_OUT" ]; then
         PRESSURE_ENROLLED="$(printf '%s\n' "$OOMCTL_OUT" | awk '
             /^Memory Pressure Monitored CGroups:/ { capturing = 1; next }
             /^Swap Monitored CGroups:/            { capturing = 0 }
@@ -1352,7 +1435,7 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
             OOMD_ENROLL_PROOF="oomctl: pressure=$(printf '%s\n' "$PRESSURE_ENROLLED" | grep -c . || echo 0) swap=$(printf '%s\n' "$SWAP_ENROLLED" | grep -c . || echo 0) cgroup(s) enrolled"
         fi
     fi
-    if [ "$OOMD_ENROLLED" = "0" ]; then
+    if [ "$OOMD_ENROLLED" = "0" ] && { [ "$(uname -s)" != "Linux" ] || daemon_in_vm; }; then
         # Fallback: walk loaded units for an explicit kill/protect opt-in.
         # ManagedOOMMemoryPressure and ManagedOOMSwap are the actual
         # systemd properties (the brief's "ManagedOOM=" is shorthand for
@@ -1471,6 +1554,9 @@ echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /pro
 # slice-ceiling model does not apply.
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "    [SKIP] Gate 8 (4) host-RAM aggregate: macOS — cgroup-v2 not available, host-RAM envelope model is Linux-only"
+elif ! daemon_in_vm; then
+    # Host-docker: sum the four live finite hard maxima once (no x2 model).
+    verify_host_docker_envelope
 else
     HOST_MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
     if ! is_uint "$HOST_MEM_TOTAL_KB" || [ "$HOST_MEM_TOTAL_KB" -eq 0 ]; then
@@ -1490,7 +1576,7 @@ else
         fail "Gate 8 (4) QEMU slice /sys/fs/cgroup${QEMU_CG_PATH}/memory.high is unreadable. Remediation: verify cgroup-v2 fs is mounted and the slice path is correct (got QEMU_CG='$QEMU_CG')."
     fi
     if [ "$QEMU_CEILING_BYTES" = "max" ]; then
-        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ VM-backed 34G/38G, systemd/host-docker/ 4608M/5G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
     fi
     QEMU_CEILING_MB=$(awk -v b="$QEMU_CEILING_BYTES" 'BEGIN { printf "%d\n", b / 1024 / 1024 }')
 

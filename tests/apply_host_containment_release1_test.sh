@@ -16,6 +16,11 @@ bash -n "$APPLY_SCRIPT" || fail "syntax error in scripts/host/apply-host-contain
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+set_slice_mem() { # root slice current file shmem
+  printf '%s\n' "$3" > "$1/sys/fs/cgroup/$2/memory.current"
+  printf 'anon %s\nfile %s\nshmem %s\n' "$(($3 - $4))" "$4" "$5" > "$1/sys/fs/cgroup/$2/memory.stat"
+}
+
 setup_fixture() {
   local root="$1"
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
@@ -27,9 +32,10 @@ setup_fixture() {
   printf '0-31\n' > "$root/sys/devices/system/cpu/online"
   printf 'cpuset cpu io memory pids\n' > "$root/sys/fs/cgroup/cgroup.controllers"
 
-  # Current memory usage under 18G/4G thresholds (e.g. 8 GiB current)
-  printf '8589934592\n' > "$root/sys/fs/cgroup/agents.slice/memory.current"
-  printf '1073741824\n' > "$root/sys/fs/cgroup/automation.slice/memory.current"
+  # Current use under the host-docker thresholds: non-reclaimable
+  # (memory.current - (file - shmem)) <= new MemoryHigh - 1 GiB.
+  set_slice_mem "$root" agents.slice 8589934592 2147483648 0
+  set_slice_mem "$root" automation.slice 1073741824 0 0
 
   # Staged actions.slice cgroup values
   printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
@@ -103,16 +109,62 @@ fi
 [ ! -f "$MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before memory check passed"
 ok "apply-host-containment-release1.sh aborts before mutation when memory is below floor"
 
-# 3. Pre-mutation gate: current agent memory usage >= 18G
-AGENT_MEM_FAIL_ROOT="$WORK/agent_mem_fail"
-setup_fixture "$AGENT_MEM_FAIL_ROOT"
-# 19 GiB current usage
-printf '20401094656\n' > "$AGENT_MEM_FAIL_ROOT/sys/fs/cgroup/agents.slice/memory.current"
-if PATH="$AGENT_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AGENT_MEM_FAIL_ROOT" > "$WORK/agent_mem.log" 2>&1; then
-  fail "apply-host-containment-release1.sh passed when current agent memory usage was above threshold"
-fi
-[ ! -f "$AGENT_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before agent memory check"
-ok "apply-host-containment-release1.sh aborts before mutation when current agent use >= 18G"
+# 3. Pre-mutation gate: non-reclaimable use of each user slice must sit
+#    at least 1 GiB below its new MemoryHigh (agents 13G, automation 7G).
+G=1073741824
+preflight_case() { # name slice current file shmem expect(pass|refuse)
+  local root="$WORK/preflight_$1"
+  setup_fixture "$root"
+  set_slice_mem "$root" "$2" "$3" "$4" "$5"
+  if PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/preflight_$1.log" 2>&1; then
+    [ "$6" = pass ] || fail "preflight $1 passed but should refuse: $(tail -2 "$WORK/preflight_$1.log")"
+  else
+    [ "$6" = refuse ] || fail "preflight $1 refused but should pass: $(tail -2 "$WORK/preflight_$1.log")"
+    [ ! -f "$root/etc/systemd/system/actions.slice" ] || fail "preflight $1 staged files before refusing"
+    [ ! -f "$root/etc/systemd/user/agents.slice" ] || fail "preflight $1 staged user slices before refusing"
+    grep -q "$2" "$WORK/preflight_$1.log" || fail "preflight $1 refusal does not name $2"
+  fi
+}
+# 16G current but 6G of it is reclaimable page cache: 10G <= 12G passes.
+preflight_case agents_cache agents.slice $((16 * G)) $((6 * G)) 0 pass
+# 15G current, 1G file: 14G non-reclaimable > 12G refuses.
+preflight_case agents_anon agents.slice $((15 * G)) $((1 * G)) 0 refuse
+grep -q "agents.slice non-reclaimable 15032385536 bytes > 12884901888" "$WORK/preflight_agents_anon.log" \
+  || fail "agents refusal lacks the measured numbers: $(tail -2 "$WORK/preflight_agents_anon.log")"
+# shmem is not reclaimable: 16G current, 6G file of which 3G shmem -> 13G refuses.
+preflight_case agents_shmem agents.slice $((16 * G)) $((6 * G)) $((3 * G)) refuse
+# automation: 7G current with 2G cache -> 5G <= 6G passes; 7G with 0.5G cache refuses.
+preflight_case automation_cache automation.slice $((7 * G)) $((2 * G)) 0 pass
+preflight_case automation_anon automation.slice $((7 * G)) $((G / 2)) 0 refuse
+ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its non-reclaimable use and changes nothing"
+
+# 3b. Lima guest memory gate: the host-docker QEMU ceiling (4608M/5G) is only
+#     safe for a <= 4 GiB guest; a larger configured guest refuses before any write.
+lima_case() { # name yaml-memory limactl-bytes expect(pass|refuse)
+  local root="$WORK/lima_$1"
+  setup_fixture "$root"
+  mkdir -p "$root/lima/colima"
+  printf 'cpus: 4\nmemory: "%s"\n' "$2" > "$root/lima/colima/lima.yaml"
+  cat > "$root/bin/limactl" <<LIMA_EOF
+#!/usr/bin/env bash
+[ "\$1 \$2 \$3" = "list --json colima" ] || exit 1
+printf '{"name":"colima","status":"Running","memory":%s}\n' "$3"
+LIMA_EOF
+  chmod +x "$root/bin/limactl"
+  if PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/lima_$1.log" 2>&1; then
+    [ "$4" = pass ] || fail "lima $1 passed but should refuse: $(tail -2 "$WORK/lima_$1.log")"
+  else
+    [ "$4" = refuse ] || fail "lima $1 refused but should pass: $(tail -2 "$WORK/lima_$1.log")"
+    [ ! -f "$root/etc/systemd/system/actions.slice" ] || fail "lima $1 staged files before refusing"
+  fi
+}
+lima_case resized 4GiB 4294967296 pass
+lima_case running_8g 4GiB 8589934592 refuse
+grep -qx "FAIL lima guest memory 8589934592 > 4GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" "$WORK/lima_running_8g.log" \
+  || fail "lima refusal message mismatch: $(cat "$WORK/lima_running_8g.log")"
+lima_case yaml_8g 8GiB 4294967296 refuse
+grep -q "FAIL lima guest memory 8589934592 > 4GiB" "$WORK/lima_yaml_8g.log" || fail "lima.yaml 8GiB refusal message missing"
+ok "apply-host-containment-release1.sh refuses the host-docker QEMU ceiling while the Lima guest is above 4 GiB"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
@@ -134,11 +186,11 @@ setup_fixture "$LIVE_ROOT"
 # set-property calls in the live branch establish.
 uid="$(id -u)"
 cat > "$WORK/live_props.txt" <<PROPS
-agents.slice MemoryHigh 19327352832
-agents.slice MemoryMax 21474836480
+agents.slice MemoryHigh 13958643712
+agents.slice MemoryMax 15032385536
 agents.slice MemorySwapMax 2147483648
-automation.slice MemoryHigh 8589934592
-automation.slice MemoryMax 10737418240
+automation.slice MemoryHigh 7516192768
+automation.slice MemoryMax 8589934592
 automation.slice MemorySwapMax 1073741824
 user@${uid}.service ManagedOOMMemoryPressure auto
 user@${uid}.service ManagedOOMSwap auto
@@ -146,6 +198,8 @@ user@${uid}.service ManagedOOMPreference none
 user@${uid}.service OOMScoreAdjust 0
 -.slice ManagedOOMMemoryPressure auto
 user.slice ManagedOOMMemoryPressure auto
+actions.slice ManagedOOMMemoryPressure kill
+actions.slice ManagedOOMMemoryPressureLimit 3435973836
 app.slice ManagedOOMMemoryPressure auto
 session.slice ManagedOOMMemoryPressure auto
 PROPS
@@ -167,10 +221,18 @@ SHIM
 chmod +x "$LIVE_ROOT/bin/systemctl"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$WORK/live_sys.log" PATH="$LIVE_ROOT/bin:$PATH" \
   "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
-grep -qx "systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
-  || fail "live apply did not set automation.slice to 8G/10G: $(grep automation "$WORK/live_sys.log" || echo none)"
-grep -qx "systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
-  || fail "live apply did not set agents.slice limits"
-ok "apply-host-containment-release1.sh live branch persists automation.slice 8G/10G via set-property"
+grep -qx "systemctl --user set-property automation.slice MemoryHigh=7G MemoryMax=8G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
+  || fail "live apply did not set automation.slice to 7G/8G: $(grep automation "$WORK/live_sys.log" || echo none)"
+grep -qx "systemctl --user set-property agents.slice MemoryHigh=13G MemoryMax=14G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
+  || fail "live apply did not set agents.slice to 13G/14G: $(grep agents "$WORK/live_sys.log" || echo none)"
+ok "apply-host-containment-release1.sh live branch persists agents.slice 13G/14G and automation.slice 7G/8G via set-property"
+
+# The root phase enrolls actions.slice with systemd-oomd (kill at 80% pressure);
+# agents.slice and automation.slice are never enrolled with kill.
+grep -Fqx '    systemctl set-property actions.slice ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=80%' "$APPLY_SCRIPT" \
+  || fail "root phase does not enroll actions.slice with ManagedOOMMemoryPressure=kill at 80%"
+! grep -E 'set-property (agents|automation)\.slice.*ManagedOOMMemoryPressure=kill' "$APPLY_SCRIPT" \
+  || fail "agents/automation.slice must not be enrolled with oomd kill"
+ok "apply-host-containment-release1.sh enrolls only actions.slice with oomd kill"
 
 echo "APPLY_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

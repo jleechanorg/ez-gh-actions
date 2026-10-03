@@ -407,11 +407,22 @@ ok "All tests passed"
 
 # A Linux daemon that shares this kernel needs the host aggregate boundary
 # before replacing the binary, building an image, or starting the service.
+HOST_DOCKER_MODE=0
 if [ "$(uname -s)" = "Linux" ]; then
   docker_endpoint="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}"
   docker_kernel="$(env -u DOCKER_CONTEXT DOCKER_HOST="${docker_endpoint}" docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
   [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
   if [ "${docker_kernel}" = "$(uname -r)" ]; then
+    HOST_DOCKER_MODE=1
+    # Host-docker: runners use host Docker, so the colima VM only runs
+    # openclaw-qdrant and is sized to a 4GiB guest (bead ez-gh-actions-154k).
+    # lima-vm@colima starts from this lima.yaml; the new size applies at the
+    # next VM start, and the 5G QEMU ceiling stays refused until it has.
+    lima_yaml="${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml"
+    if [ -f "${lima_yaml}" ] && ! grep -qx 'memory: "4GiB"' "${lima_yaml}"; then
+      sed -i 's/^memory: .*/memory: "4GiB"/' "${lima_yaml}"
+      warn "colima guest memory set to 4GiB in ${lima_yaml}; it takes effect after one VM restart"
+    fi
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
     HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
     mkdir -p "${HOST_CONTROL_DIR}" \
@@ -423,6 +434,7 @@ if [ "$(uname -s)" = "Linux" ]; then
       "${HOST_POLICY_DIR}/systemd/user/session.slice.d"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
     for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done
@@ -737,15 +749,30 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh lima-guest-memory-check.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
     done
 
-    for unit in app-lima-vm.slice agents.slice automation.slice; do
+    for unit in agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
+    # The colima QEMU ceiling follows the deployment mode (bead
+    # ez-gh-actions-154k): VM-backed runners keep 34G/38G; host-docker caps
+    # the qdrant-only 4GiB guest at 4608M/5G, but only once the guest really
+    # runs at <= 4GiB — otherwise the existing ceiling is left unchanged.
+    VM_CEILING_DIR="${UNIT_DIR}"
+    VM_CEILING_PROPS="MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
+    APPLY_VM_CEILING=1
+    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
+      VM_CEILING_DIR="${UNIT_DIR}/host-docker"
+      VM_CEILING_PROPS="MemoryHigh=4608M MemoryMax=5G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
+      if ! "${SCRIPTS_DIR}/lima-guest-memory-check.sh"; then
+        APPLY_VM_CEILING=0
+        warn "host-docker QEMU ceiling not lowered; existing ceiling left unchanged"
+      fi
+    fi
     for unit in agent-scope-reaper.service agent-scope-reaper.timer; do
       sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
           -e "s|@HOME@|${HOME_DIR}|g" \
@@ -762,13 +789,16 @@ FSTRIM_EOF
         "${UNIT_DIR}/${service}.service.d/20-automation-slice.conf" \
         "${dropin_dir}/20-automation-slice.conf"
     done
-    mkdir -p "${USER_UNIT_DIR}/lima-vm@colima.service.d"
-    install -m 0644 \
-      "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-      "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-    install -m 0644 \
-      "${UNIT_DIR}/lima-vm-cpu-ceiling.service" \
-      "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
+    if [ "${APPLY_VM_CEILING}" -eq 1 ]; then
+      mkdir -p "${USER_UNIT_DIR}/lima-vm@colima.service.d"
+      install -m 0644 "${VM_CEILING_DIR}/app-lima-vm.slice" "${USER_UNIT_DIR}/app-lima-vm.slice"
+      install -m 0644 \
+        "${VM_CEILING_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+        "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+      install -m 0644 \
+        "${VM_CEILING_DIR}/lima-vm-cpu-ceiling.service" \
+        "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
+    fi
 
     # Docker's --cgroup-parent=actions.slice places every runner beneath one
     # guest aggregate. Install the tracked slice inside Colima so ten
@@ -840,9 +870,12 @@ EOF
     # Apply the direct QEMU ceiling to an already-running Colima service.
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.
-    if systemctl --user set-property --runtime lima-vm@colima.service \
-         MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null; then
-      ok "live QEMU service memory+CPU ceiling applied"
+    # shellcheck disable=SC2086 # VM_CEILING_PROPS is a property list
+    if [ "${APPLY_VM_CEILING}" -eq 0 ]; then
+      warn "live QEMU ceiling unchanged until the colima guest runs at <= 4GiB"
+    elif systemctl --user set-property --runtime lima-vm@colima.service \
+         ${VM_CEILING_PROPS} 2>/dev/null; then
+      ok "live QEMU service memory+CPU ceiling applied (${VM_CEILING_PROPS})"
     else
       warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
     fi

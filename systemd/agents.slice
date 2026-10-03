@@ -2,9 +2,12 @@
 # (claude/codex/cursor/gemini/etc) and their MCP descendants. Orchestration
 # daemons use the separate automation.slice.
 #
-# Measured margin: 8.10 GiB current use, 17.14 GiB historical peak.
-# MemoryHigh=18G, MemoryMax=20G provides measured margin above 17.14 GiB peak
-# while capping rogue agent spikes.
+# measured margin (2026-10-03, jeff-ubuntu): 17.6 GiB current of which
+# 10.8 GiB anon (the rest reclaimable page cache), 18.3 GiB peak. The
+# 2026-10-03 operator decision (bead ez-gh-actions-154k: cap agent sessions,
+# keep runners) lowered 18G/20G to MemoryHigh=13G, MemoryMax=14G so that
+# actions 28G + agents 14G + automation 8G + VM 5G + 10% reserve fit the
+# 61.9 GiB host. 13G reclaims page cache first; anon keeps 2.2 GiB headroom.
 #
 # Static syntax validation only: `systemd-analyze verify systemd/agents.slice`
 
@@ -13,8 +16,8 @@ Description=Interactive agent CLI processes (claude/codex/cursor/etc) — finite
 Before=slices.target
 
 [Slice]
-MemoryHigh=18G
-MemoryMax=20G
+MemoryHigh=13G
+MemoryMax=14G
 MemorySwapMax=2G
 TasksMax=8192
 MemoryAccounting=yes

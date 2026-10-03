@@ -72,6 +72,15 @@ case "${1:-}" in
   *) exit 0 ;;
 esac
 EOF
+# limactl reports the colima guest size the VM is actually running with.
+cat > "$STUB_BIN/limactl" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1 $2 $3" = "list --json colima" ]; then
+  printf '{"name":"colima","status":"Running","memory":%s}\n' "${LIMA_FIXTURE_MEM:-4294967296}"
+  exit 0
+fi
+exit 1
+EOF
 for agent in codex claude gemini cursor aider cody; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$agent"
 done
@@ -97,8 +106,9 @@ EOF
 chmod +x "$TEMP_REPO/scripts/host/"*containment-release1.sh
 
 HOME_DIR="$WORK/home"
-mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user"
+mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user" "$HOME_DIR/.lima/colima"
 printf '# fixture\n' > "$HOME_DIR/.config/ezgha/config.toml"
+printf 'cpus: 4\nmemory: "8GiB"\n' > "$HOME_DIR/.lima/colima/lima.yaml"
 EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/install.log" 2>&1 || fail "host-Docker fixture install failed"
 
@@ -108,6 +118,32 @@ root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_li
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
+
+# Host-docker mode (bead ez-gh-actions-154k): the colima guest (qdrant only)
+# is resized to 4GiB in the lima.yaml lima-vm@colima starts from, and the
+# QEMU ceiling surfaces come from the host-docker 4608M/5G variants.
+grep -qx 'memory: "4GiB"' "$HOME_DIR/.lima/colima/lima.yaml" \
+  || fail "host-docker install did not set the Lima guest to 4GiB: $(cat "$HOME_DIR/.lima/colima/lima.yaml")"
+HD_UNITS="$HOME_DIR/.config/systemd/user"
+for f in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf; do
+  grep -qx 'MemoryHigh=4608M' "$HD_UNITS/$f" && grep -qx 'MemoryMax=5G' "$HD_UNITS/$f" \
+    || fail "host-docker install did not deploy the 4608M/5G $f"
+done
+grep -q 'MemoryHigh=4608M MemoryMax=5G' "$HD_UNITS/lima-vm-cpu-ceiling.service" \
+  || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that re-applies the wrong ceiling"
+
+# A guest still running above 4 GiB keeps the existing QEMU ceiling (fail closed).
+BIG_HOME="$WORK/big_guest_home"
+mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d"
+printf '# fixture\n' > "$BIG_HOME/.config/ezgha/config.toml"
+printf '[Service]\nMemoryHigh=34G\nMemoryMax=38G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
+  LIMA_FIXTURE_MEM=8589934592 \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1 || fail "big-guest fixture install failed"
+grep -qx 'MemoryMax=38G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "QEMU ceiling was lowered while the Lima guest is 8GiB"
+grep -q 'FAIL lima guest memory 8589934592 > 4GiB' "$WORK/big-install.log" \
+  || fail "big-guest install did not report the Lima guest refusal"
 
 run_failed_phase() {
   local phase="$1"
@@ -143,6 +179,9 @@ grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
 if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
 fi
+# VM-backed mode keeps the 34G/38G QEMU ceiling (runners live in the guest).
+grep -qx 'MemoryMax=38G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "VM-backed install did not deploy the 34G/38G QEMU ceiling"
 
 # Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
 # active-service upgrade path must persist that resolved endpoint before its

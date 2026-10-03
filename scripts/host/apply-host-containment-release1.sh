@@ -48,6 +48,24 @@ check_below() {
   [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid ${label}: ${value}"
   [ "$value" -lt "$limit" ] || fail "${label} (${value} bytes) is at or above its safe activation threshold"
 }
+# Lowering MemoryHigh below a slice's non-reclaimable use (memory.current
+# minus reclaimable page cache, i.e. file - shmem) would throttle it at once,
+# so require 1 GiB of anon headroom below the new MemoryHigh.
+check_non_reclaimable() {
+  local dir="$1" new_high="$2" label="$3" current file shmem limit used value
+  [ -e "${dir}/memory.current" ] || return 0
+  current="$(read_value "${dir}/memory.current")" || fail "could not read ${label} memory.current"
+  [ -f "${dir}/memory.stat" ] || fail "missing ${label} memory.stat at ${dir}"
+  file="$(awk '$1 == "file" {print $2}' "${dir}/memory.stat")"
+  shmem="$(awk '$1 == "shmem" {print $2}' "${dir}/memory.stat")"
+  for value in "$current" "$file" "$shmem"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid ${label} memory accounting: current=${current} file=${file} shmem=${shmem}"
+  done
+  used=$((current - (file - shmem)))
+  limit=$((new_high - 1073741824))
+  [ "$used" -le "$limit" ] \
+    || fail "${label} non-reclaimable ${used} bytes > ${limit} (new MemoryHigh ${new_high} - 1 GiB; current=${current} file=${file} shmem=${shmem}); not lowering"
+}
 user_cgroup_dir() {
   local unit="$1" group
   if [ "$ROOT" != "/" ]; then printf '%s/%s' "$CGROUP_ROOT" "$unit"; return; fi
@@ -73,8 +91,20 @@ check_below "${CGROUP_ROOT}/actions.slice/memory.current" 27917287424 "actions.s
 check_below "${CGROUP_ROOT}/actions.slice/pids.current" 6000 "actions.slice pids.current"
 agents_dir="$(user_cgroup_dir agents.slice || true)"
 automation_dir="$(user_cgroup_dir automation.slice || true)"
-[ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 19327352832 "agents.slice memory.current"
-[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 8589934592 "automation.slice memory.current"
+# New MemoryHigh: agents.slice 13G, automation.slice 7G (bead ez-gh-actions-154k).
+[ -z "$agents_dir" ] || check_non_reclaimable "$agents_dir" 13958643712 agents.slice
+[ -z "$automation_dir" ] || check_non_reclaimable "$automation_dir" 7516192768 automation.slice
+# The user phase leads into install.sh lowering the colima QEMU ceiling to the
+# host-docker 4608M/5G; refuse while the Lima guest is configured or running
+# above 4 GiB. A --root fixture reads its own lima.yaml/limactl.
+if [ "$SYSTEM_PHASE" -eq 0 ]; then
+  if [ "$ROOT" = "/" ]; then
+    "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
+  else
+    LIMACTL="${ROOT}/bin/limactl" LIMA_YAML="${ROOT}/lima/colima/lima.yaml" \
+      "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
+  fi
+fi
 
 install_file() {
   local source="$1" dest="$2"
@@ -113,6 +143,9 @@ if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
     systemctl enable actions.slice
     systemctl start actions.slice
     systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
+    # systemd-oomd kills inside actions.slice (runner jobs) at 80% full
+    # pressure; agents.slice and automation.slice are never enrolled with kill.
+    systemctl set-property actions.slice ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=80%
   fi
 fi
 
@@ -146,8 +179,8 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
-    systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096
+    systemctl --user set-property agents.slice MemoryHigh=13G MemoryMax=14G MemorySwapMax=2G TasksMax=8192
+    systemctl --user set-property automation.slice MemoryHigh=7G MemoryMax=8G MemorySwapMax=1G TasksMax=4096
   fi
 fi
 

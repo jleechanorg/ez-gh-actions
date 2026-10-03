@@ -56,12 +56,13 @@ cp "${REPO_ROOT}"/systemd/lima-vm-cpu-ceiling.service \
    "${TEMP_REPO}/systemd/"
 cp "${REPO_ROOT}"/systemd/guest/actions.slice \
    "${TEMP_REPO}/systemd/guest/"
+cp -r "${REPO_ROOT}/systemd/host-docker" "${TEMP_REPO}/systemd/"
 printf '[package]\nname = "ez-gh-actions"\nversion = "0.0.0"\n' > "${TEMP_REPO}/Cargo.toml"
 for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
-for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh lima-guest-memory-check.sh; do
   if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
     cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
   fi

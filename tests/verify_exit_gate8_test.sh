@@ -107,6 +107,121 @@ qemu_max_line=$(grep -n 'QEMU_CEILING_BYTES.*=' "$VERIFY" | head -1 | cut -d: -f
 grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
   || fail "live max QEMU ceiling is not fail-closed"
 
+# Host-docker envelope (bead ez-gh-actions-154k): live memory.max of
+# actions/agents/automation/lima-vm@colima.service must equal the tracked
+# host-docker policy, be finite, and with the 10% reserve fit MemTotal.
+# Fixture host = jeff-ubuntu's MemTotal (63336 MB, reserve 6333 MB).
+ENV_DIR="$TMP/envelope"
+mkdir -p "$ENV_DIR/bin" "$ENV_DIR/cg/actions.slice" "$ENV_DIR/cg/user/agents.slice" \
+  "$ENV_DIR/cg/user/automation.slice" "$ENV_DIR/cg/user/lima-vm@colima.service"
+printf 'MemTotal:       64856928 kB\n' > "$ENV_DIR/meminfo"
+cat > "$ENV_DIR/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+# `systemctl --user show -p ControlGroup --value -- <unit>` -> /user/<unit>
+for unit in "$@"; do :; done
+printf '/user/%s\n' "$unit"
+EOF
+chmod +x "$ENV_DIR/bin/systemctl"
+set_live() { # unit-dir high max
+  printf '%s\n' "$2" > "$ENV_DIR/cg/$1/memory.high"
+  printf '%s\n' "$3" > "$ENV_DIR/cg/$1/memory.max"
+}
+G=1073741824
+set_live_policy() { # agents_high agents_max automation_high automation_max (GiB)
+  set_live actions.slice $((26 * G)) $((28 * G))
+  set_live user/agents.slice $(($1 * G)) $(($2 * G))
+  set_live user/automation.slice $(($3 * G)) $(($4 * G))
+  set_live user/lima-vm@colima.service $((4608 * 1048576)) $((5 * G))
+}
+run_envelope() { # policy-root
+  PATH="$ENV_DIR/bin:$PATH" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=host_docker_envelope \
+  VERIFY_EXIT_CRITERIA_POLICY_ROOT="$1" \
+  VERIFY_EXIT_CRITERIA_CGROUP_ROOT="$ENV_DIR/cg" \
+  VERIFY_EXIT_CRITERIA_MEMINFO="$ENV_DIR/meminfo" \
+    bash "$VERIFY" 2>&1
+}
+
+# (a) tracked policy 28+14+8+5 = 56320 MB + 6333 MB reserve <= 63336 MB.
+set_live_policy 13 14 7 8
+env_out=$(run_envelope "$ROOT") || fail "host-docker 28+14+8+5 envelope should pass: $env_out"
+grep -Fq '56320MB' <<<"$env_out" || fail "envelope did not sum live maxima to 56320MB: $env_out"
+
+# (b) an unbounded live maximum is rejected, never summed as zero.
+printf 'max\n' > "$ENV_DIR/cg/user/agents.slice/memory.max"
+if env_out=$(run_envelope "$ROOT"); then
+  fail "unbounded agents.slice memory.max should fail: $env_out"
+fi
+grep -Fq 'agents.slice' <<<"$env_out" || fail "unbounded rejection did not name agents.slice: $env_out"
+
+# (c) the pre-154k maxima 28+20+10+5 = 64512 MB over-commit the host even
+#     when live state matches its (old) policy.
+OLD_POLICY="$TMP/old-policy"
+mkdir -p "$OLD_POLICY/systemd/host" "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d"
+cp "$ROOT/systemd/host/actions.slice" "$OLD_POLICY/systemd/host/actions.slice"
+cp "$ROOT/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf" 2>/dev/null \
+  || printf '[Service]\nMemoryHigh=4608M\nMemoryMax=5G\n' \
+       > "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf"
+printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\n' > "$OLD_POLICY/systemd/agents.slice"
+printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\n' > "$OLD_POLICY/systemd/automation.slice"
+set_live_policy 18 20 8 10
+if env_out=$(run_envelope "$OLD_POLICY"); then
+  fail "host-docker 28+20+10+5 envelope should fail: $env_out"
+fi
+grep -Fq 'exceed host' <<<"$env_out" || fail "old maxima did not fail on the envelope sum: $env_out"
+
+# (d) live state that drifted from the tracked policy fails even if it fits.
+set_live_policy 13 14 6 7
+if env_out=$(run_envelope "$ROOT"); then
+  fail "live automation.slice 6G/7G must not match the tracked 7G/8G policy: $env_out"
+fi
+
+# Gate 8 (3): oomd must monitor /actions.slice (real `oomctl` layout).
+cat > "$TMP/oomctl-enrolled.txt" <<'EOF'
+Dry Run: no
+Swap Used Limit: 90.00%
+Default Memory Pressure Limit: 60.00%
+Default Memory Pressure Duration: 20s
+System Context:
+	Memory: Used: 0B Total: 0B
+	Swap: Used: 0B Total: 0B
+Swap Monitored CGroups:
+Memory Pressure Monitored CGroups:
+	Path: /actions.slice
+		Memory Pressure Limit: 80.00%
+		Pressure: Avg10: 0.00 Avg60: 0.00 Avg300: 0.00 Total: 0
+		Current Memory Usage: 7.5G
+		Memory Min: 0B
+		Memory Low: 0B
+		Pgscan: 0
+		Last Pgscan: 0
+EOF
+cat > "$TMP/oomctl-empty.txt" <<'EOF'
+Dry Run: no
+Swap Used Limit: 90.00%
+Default Memory Pressure Limit: 60.00%
+Default Memory Pressure Duration: 20s
+System Context:
+	Memory: Used: 0B Total: 0B
+	Swap: Used: 0B Total: 0B
+Swap Monitored CGroups:
+	Path: /actions.slice
+Memory Pressure Monitored CGroups:
+	Path: /user.slice
+EOF
+run_oomctl() {
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=oomctl_actions \
+  VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE="$1" \
+    bash "$VERIFY" >/dev/null 2>&1
+}
+run_oomctl "$TMP/oomctl-enrolled.txt" || fail "oomctl listing /actions.slice under pressure should pass"
+if run_oomctl "$TMP/oomctl-empty.txt"; then
+  fail "/actions.slice only under Swap (pressure lists /user.slice) must not pass"
+fi
+
 # Kdump/pstore verification is diagnostic-only. It must be quiet on a healthy
 # fixture, fail closed on an unhealthy fixture, and never invoke a remediation
 # hook (including the retired compatibility environment variable).

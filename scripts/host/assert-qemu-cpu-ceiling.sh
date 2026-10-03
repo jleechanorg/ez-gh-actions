@@ -7,13 +7,30 @@
 # 0:: cgroup entry, and inspects only the resulting QEMU_CGROUP_ROOT path
 # (default: /sys/fs/cgroup).  It never scans for, or falls back to, a sibling
 # slice: a bounded unrelated QEMU/cgroup must not make this check pass.
+#
+# The ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
+# vm-backed (runners inside Colima) 34G/38G from systemd/, host-docker (Colima
+# only runs qdrant in a 4 GiB guest) 4608M/5G from systemd/host-docker/.
+# Both tracked variants are always checked; QEMU_CEILING_MODE selects the live
+# bound (default: host-docker when the Docker daemon shares this kernel).
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-DROPIN="${REPO_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
-SLICE="${REPO_ROOT}/systemd/app-lima-vm.slice"
-RUNTIME_UNIT="${REPO_ROOT}/systemd/lima-vm-cpu-ceiling.service"
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+if [ -z "${QEMU_CEILING_MODE:-}" ]; then
+  docker_kernel="$(docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
+  if [ -n "$docker_kernel" ] && [ "$docker_kernel" = "$(uname -r)" ]; then
+    QEMU_CEILING_MODE=host-docker
+  else
+    QEMU_CEILING_MODE=vm-backed
+  fi
+fi
+case "$QEMU_CEILING_MODE" in
+  vm-backed) QEMU_MAX_HIGH=$((34 * 1024 * 1024 * 1024)); QEMU_MAX_MAX=$((38 * 1024 * 1024 * 1024)) ;;
+  host-docker) QEMU_MAX_HIGH=$((4608 * 1024 * 1024)); QEMU_MAX_MAX=$((5 * 1024 * 1024 * 1024)) ;;
+  *) fail "unknown QEMU_CEILING_MODE=${QEMU_CEILING_MODE} (expected vm-backed or host-docker)" ;;
+esac
 
 assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_line() {
@@ -21,26 +38,33 @@ assert_line() {
   grep -Fqx "$line" "$file" || fail "$file missing exact line: $line"
 }
 
-assert_file "$DROPIN"
-assert_file "$SLICE"
-assert_file "$RUNTIME_UNIT"
-for file in "$DROPIN" "$SLICE"; do
-  assert_line "$file" "MemoryHigh=34G"
-  assert_line "$file" "MemoryMax=38G"
-  assert_line "$file" "MemorySwapMax=2G"
-  assert_line "$file" "TasksMax=4096"
-  assert_line "$file" "CPUQuota=1600%"
-done
-assert_line "$DROPIN" "CPUAccounting=yes"
-# install.sh must apply the same finite values to a transient service after a
-# Colima restart; these are static text checks and do not execute install.sh.
-for setting in MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-  grep -Fq "$setting" "${REPO_ROOT}/install.sh" \
-    || fail "install.sh does not apply $setting"
-done
-for setting in MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-  grep -Fq "$setting" "$RUNTIME_UNIT" \
-    || fail "$RUNTIME_UNIT missing $setting"
+for mode in vm-backed host-docker; do
+  case "$mode" in
+    vm-backed) dir="${REPO_ROOT}/systemd"; high=MemoryHigh=34G; max=MemoryMax=38G ;;
+    host-docker) dir="${REPO_ROOT}/systemd/host-docker"; high=MemoryHigh=4608M; max=MemoryMax=5G ;;
+  esac
+  DROPIN="${dir}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+  SLICE="${dir}/app-lima-vm.slice"
+  RUNTIME_UNIT="${dir}/lima-vm-cpu-ceiling.service"
+  assert_file "$DROPIN"
+  assert_file "$SLICE"
+  assert_file "$RUNTIME_UNIT"
+  for file in "$DROPIN" "$SLICE"; do
+    assert_line "$file" "$high"
+    assert_line "$file" "$max"
+    assert_line "$file" "MemorySwapMax=2G"
+    assert_line "$file" "TasksMax=4096"
+    assert_line "$file" "CPUQuota=1600%"
+  done
+  assert_line "$DROPIN" "CPUAccounting=yes"
+  # install.sh must apply the same finite values to a transient service after a
+  # Colima restart; these are static text checks and do not execute install.sh.
+  for setting in "$high" "$max" MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
+    grep -Fq "$setting" "${REPO_ROOT}/install.sh" \
+      || fail "install.sh does not apply $mode $setting"
+    grep -Fq "$setting" "$RUNTIME_UNIT" \
+      || fail "$RUNTIME_UNIT missing $setting"
+  done
 done
 
 if [ "${ASSERT_LIVE_QEMU:-0}" != "1" ]; then
@@ -51,7 +75,7 @@ fi
 QEMU_PROC_ROOT="${QEMU_PROC_ROOT:-/proc}"
 QEMU_CGROUP_ROOT="${QEMU_CGROUP_ROOT:-/sys/fs/cgroup}"
 QEMU_PID="${QEMU_PID:-}"
-export QEMU_PROC_ROOT QEMU_CGROUP_ROOT QEMU_PID
+export QEMU_PROC_ROOT QEMU_CGROUP_ROOT QEMU_PID QEMU_MAX_HIGH QEMU_MAX_MAX
 
 python3 - <<'PY' || fail "live QEMU cgroup ceilings are missing, unbounded, or exceed limits"
 import os
@@ -200,8 +224,8 @@ quota, period = map(int, cpu)
 if period <= 0 or quota <= 0 or quota > 16 * period:
     fail(f"{cg}/cpu.max={' '.join(cpu)} exceeds CPUQuota=1600%")
 
-high = finite_int("memory.high", 34 * 1024**3)
-maximum = finite_int("memory.max", 38 * 1024**3)
+high = finite_int("memory.high", int(os.environ["QEMU_MAX_HIGH"]))
+maximum = finite_int("memory.max", int(os.environ["QEMU_MAX_MAX"]))
 swap = finite_int("memory.swap.max", 2 * 1024**3)
 pids_max = finite_int("pids.max", 4096)
 if high > maximum:
