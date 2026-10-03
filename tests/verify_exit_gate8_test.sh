@@ -172,10 +172,10 @@ grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
 mkdir -p "$TMP/timerbin"
 cat > "$TMP/timerbin/systemctl" <<'EOF2'
 #!/usr/bin/env bash
-# stub: is-enabled/is-active answer from $STUB_ENABLED_TIMERS (space list)
+# stub: is-enabled and is-active have independent fixture states.
 [ "${1:-}" = "--user" ] && shift
 case "${1:-}" in
-  is-enabled|is-active)
+  is-enabled)
     if [ -n "${STUB_SYSTEMCTL_BROKEN:-}" ]; then
       echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
     fi
@@ -185,6 +185,13 @@ case "${1:-}" in
       echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1
     fi
     echo disabled; exit 1 ;;
+  is-active)
+    if [ "${2:-}" = systemd-oomd ]; then echo inactive; exit 3; fi
+    if [ -n "${STUB_ACTIVE_BROKEN:-}" ]; then
+      echo "${STUB_ACTIVE_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    for t in ${STUB_ACTIVE_TIMERS:-}; do [ "$t" = "${2:-}" ] && { echo active; exit 0; }; done
+    echo inactive; exit 3 ;;
 esac
 exit 1
 EOF2
@@ -221,6 +228,7 @@ run_gate8_pre_envelope() {
 PATH="$TMP/timerbin:$PATH"
 unset STUB_NOTFOUND STUB_ABSENT STUB_SYSTEMCTL_BROKEN STUB_BROKEN_MSG
 STUB_ENABLED_TIMERS="psi-oom-watcher.timer"
+STUB_ACTIVE_TIMERS=""
 export STUB_ENABLED_TIMERS
 run_gate8_pre_envelope
 [ -n "$GATE8_POLICY_RESULT" ] \
@@ -238,6 +246,35 @@ run_gate8_pre_envelope
   || fail "absent PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
 unset STUB_ABSENT
 
+# Execute the real later Gate 8 PSI-admission branch with oomd inactive. Its
+# failure must require an enrolled systemd-oomd cgroup only; the retired timer
+# must never be offered as a fallback.
+run_gate8_psi_admission() {
+  local psi_start psi_end original_fail
+  psi_start=$(grep -n '^# (3) PSI admission check' "$VERIFY" | cut -d: -f1)
+  psi_end=$(grep -n '^# (4) Physical-host RAM envelope' "$VERIFY" | cut -d: -f1)
+  [ -n "$psi_start" ] && [ -n "$psi_end" ] \
+    || fail "could not extract the later Gate 8 PSI-admission branch"
+  original_fail=$(declare -f fail)
+  GATE8_PSI_FAILURE=""
+  fail() { GATE8_PSI_FAILURE="$*"; }
+  uname() { echo Linux; }
+  eval "$(sed -n "${psi_start},$((psi_end - 1))p" "$VERIFY")"
+  GATE8_PSI_RESULT="$GATE8_PSI_FAILURE"
+  eval "$original_fail"
+}
+
+STUB_ENABLED_TIMERS=""
+STUB_ACTIVE_TIMERS=""
+unset STUB_ABSENT STUB_NOTFOUND STUB_SYSTEMCTL_BROKEN STUB_ACTIVE_BROKEN
+run_gate8_psi_admission
+[ -n "$GATE8_PSI_RESULT" ] \
+  || fail "unenrolled oomd must fail the later Gate 8 PSI-admission branch"
+grep -Fq 'ManagedOOMMemoryPressure=kill' <<<"$GATE8_PSI_RESULT" \
+  || fail "later Gate 8 PSI failure omitted enrolled-oomd remediation: $GATE8_PSI_RESULT"
+! grep -Fq 'psi-oom-watcher' <<<"$GATE8_PSI_RESULT" \
+  || fail "later Gate 8 PSI failure still offers the retired timer: $GATE8_PSI_RESULT"
+
 timers_rc=0
 timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="" \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
@@ -251,6 +288,15 @@ timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="psi-oom-watcher.tim
 [ "$timers_rc" -ne 0 ] || fail "enabled psi-oom-watcher.timer must fail Gate 8 (policy: disabled)"
 grep -Fq 'psi-oom-watcher.timer' <<<"$timers_out" \
   || fail "psi timer failure omitted diagnostic: $timers_out"
+# Disabled at boot is insufficient: an already-active timer can still launch
+# the retired watcher, so this must fail through the same helper.
+timers_rc=0
+timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="" STUB_ACTIVE_TIMERS="psi-oom-watcher.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" 2>&1) || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "disabled-but-active psi timer must fail Gate 8"
+grep -Fq 'active' <<<"$timers_out" \
+  || fail "disabled-but-active timer failure omitted runtime state: $timers_out"
 # A broken user manager (query failure, not a known disabled/absent state)
 # must fail closed rather than read as "timer disabled".
 timers_rc=0
@@ -258,6 +304,13 @@ PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
   bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
 [ "$timers_rc" -ne 0 ] || fail "systemctl query failure must fail Gate 8 closed"
+# A runtime-state query failure after `is-enabled` says disabled must also
+# fail closed rather than treating the timer as stopped.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ACTIVE_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "active-state query failure must fail Gate 8 closed"
 # No user session (ssh/cron): the bus error also says "No such file or
 # directory" but is a query failure, not an absent unit.
 timers_rc=0
