@@ -68,7 +68,7 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
   is-active) [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1 ;;
-  daemon-reload|start|set-property) echo "systemctl-$1" >> "$EVENT_LOG"; exit 0 ;;
+  daemon-reload|start|set-property|enable) echo "systemctl-$1:$*" >> "$EVENT_LOG"; exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -143,15 +143,18 @@ BIG_PROC="$WORK/big_proc"
 mkdir -p "$BIG_PROC/7777"
 printf 'qemu-system-x86\n' > "$BIG_PROC/7777/comm"
 printf '%s\0' qemu-system-x86_64 -m 8192 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
-printf '[Service]\nMemoryHigh=34G\nMemoryMax=38G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+printf '[Service]\nMemoryHigh=4608M\nMemoryMax=5G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
 env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
   LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1 || fail "big-guest fixture install failed"
-grep -qx 'MemoryMax=38G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-  || fail "QEMU ceiling was lowered while the Lima guest is 8GiB"
+grep -qx 'MemoryMax=5G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "failed guest check replaced the existing host-docker QEMU ceiling"
 grep -q 'FAIL lima guest memory 8589934592 > 4GiB' "$WORK/big-install.log" \
   || fail "big-guest install did not report the Lima guest refusal"
 grep -qx 'memory: "4GiB"' "$BIG_HOME/.lima/colima/lima.yaml" || fail "big-guest install did not resize lima.yaml"
+if grep -Eq '^systemctl-(set-property|enable):.*lima-vm@colima\.service|^systemctl-enable:.*lima-vm-cpu-ceiling\.service' "$WORK/big_events" 2>/dev/null; then
+  fail "failed guest check applied or enabled the stale host-docker ceiling: $(cat "$WORK/big_events")"
+fi
 
 # A lima.yaml without a memory: line gets one (sed alone would change nothing).
 NOMEM_HOME="$WORK/nomem_home"

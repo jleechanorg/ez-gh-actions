@@ -883,8 +883,10 @@ EOF
     else
       warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
     fi
-    if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
+    if [ "${APPLY_VM_CEILING}" -eq 1 ] && systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
       ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
+    elif [ "${APPLY_VM_CEILING}" -eq 0 ]; then
+      warn "lima-vm-cpu-ceiling.service not enabled while guest-memory check refuses the 5G ceiling"
     else
       warn "lima-vm-cpu-ceiling.service not enabled"
     fi
