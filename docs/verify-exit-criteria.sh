@@ -418,6 +418,27 @@ verify_fresh_canary() {
     pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
+# Gate 0: the deployed SHA may trail HEAD only by commits touching no build
+# input of the binary (bead ez-gh-actions-eqx).
+GATE0_BUILD_INPUTS="src Cargo.toml Cargo.lock build.rs"
+verify_deployed_sha() {
+    local deployed="$1" head_sha changed
+    head_sha=$(git rev-parse --short HEAD)
+    [ "$deployed" = "$head_sha" ] && return 0
+    if ! git rev-parse --verify --quiet "${deployed}^{commit}" >/dev/null 2>&1; then
+        fail "Deployed binary SHA ($deployed) is not in this repo's history; HEAD is $head_sha. Run cargo install --path ."
+        return 1
+    fi
+    # shellcheck disable=SC2086
+    changed=$(git diff --name-only "$deployed" HEAD -- $GATE0_BUILD_INPUTS)
+    if [ -n "$changed" ]; then
+        fail "Deployed binary SHA ($deployed) differs from HEAD ($head_sha) in build inputs: $(echo "$changed" | tr '\n' ' '). Run cargo install --path ."
+        return 1
+    fi
+    echo "    [INFO] Gate 0: deployed $deployed trails HEAD $head_sha only by commits touching no build input ($GATE0_BUILD_INPUTS)"
+    return 0
+}
+
 if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
     case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
         config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
@@ -425,6 +446,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         containers) verify_managed_runners_in_actions_slice ;;
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
+        gate0) verify_deployed_sha "${VERIFY_EXIT_CRITERIA_DEPLOYED_SHA:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
@@ -499,9 +521,7 @@ mac_probe() {
 echo "--- Checking Gate 0: Deployed code == committed code ---"
 DEPLOYED_SHA=$(~/.cargo/bin/ezgha --version 2>/dev/null | cut -d'-' -f2 || echo "none")
 CURRENT_SHA=$(git rev-parse --short HEAD)
-if [ "$DEPLOYED_SHA" != "$CURRENT_SHA" ]; then
-    fail "Deployed binary SHA ($DEPLOYED_SHA) does not match current HEAD Git SHA ($CURRENT_SHA). Run cargo install --path ."
-fi
+verify_deployed_sha "$DEPLOYED_SHA"
 
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
 UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -vE 'docs/observe|docs/goals|goals/|.beads/' || true)
@@ -525,7 +545,7 @@ else
     echo "Info: running on feature branch '$CURRENT_BRANCH' (Gate 0 strict main check bypassed)"
 fi
 
-pass "Gate 0: Deployed binary matches HEAD SHA ($CURRENT_SHA)"
+pass "Gate 0: Deployed binary ($DEPLOYED_SHA) matches HEAD ($CURRENT_SHA) or trails it only by non-build-input commits"
 
 # --- Gate 1: Code quality ---
 echo "--- Checking Gate 1: Code quality ---"
