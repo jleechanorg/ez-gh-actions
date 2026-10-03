@@ -180,6 +180,7 @@ case "${1:-}" in
       echo "Failed to connect to bus: No medium found" >&2; exit 1
     fi
     for t in ${STUB_ENABLED_TIMERS:-}; do [ "$t" = "${2:-}" ] && { echo enabled; exit 0; }; done
+    if [ -n "${STUB_NOTFOUND:-}" ]; then echo not-found; exit 4; fi
     if [ -n "${STUB_ABSENT:-}" ]; then
       echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1
     fi
@@ -212,6 +213,11 @@ PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
 PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
   bash "$VERIFY" >/dev/null 2>&1 || fail "absent psi-oom-watcher.timer must pass"
+# systemd 255 prints exactly "not-found" (exit 4) for an absent unit, the
+# normal state once install.sh has deleted the watcher unit files.
+PATH="$TMP/timerbin:$PATH" STUB_NOTFOUND=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || fail "systemd not-found (exit 4) for absent timer must pass"
 [ "$(grep -c 'agent-scope-reaper' "$VERIFY")" -eq 0 ] \
   || fail "verifier still references deleted agent-scope-reaper"
 

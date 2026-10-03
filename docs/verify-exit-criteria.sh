@@ -427,7 +427,7 @@ verify_modern_timers() {
         enabled|enabled-runtime)
             fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)" ;;
         disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
-        *"No such file"*|*"not found"*|*"does not exist"*) ;;
+        not-found|*"No such file"*|*"not found"*|*"does not exist"*) ;;
         *)
             # Query failure (e.g. lost user-manager bus): never read as "disabled".
             fail "Gate 8 modern envelope: could not determine psi-oom-watcher.timer state (got: ${state:-<empty>})" ;;
