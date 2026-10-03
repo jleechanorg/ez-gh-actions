@@ -1295,10 +1295,9 @@ fn main() -> Result<()> {
             // here BEFORE any runner mutation rather than letting the first
             // start_one hit Err mid-spawn.
             if cfg.limits.cpu_burst {
-                docker_backend::effective_limits(&cfg)
-                    .map_err(|e| anyhow::anyhow!(
-                        "limits.cpu_burst validation failed at serve startup: {e}"
-                    ))?;
+                docker_backend::effective_limits(&cfg).map_err(|e| {
+                    anyhow::anyhow!("limits.cpu_burst validation failed at serve startup: {e}")
+                })?;
             }
             // Single-instance guard (bead 6gw): flock serve.lock so a second
             // `ezgha serve` refuses immediately instead of racing next_slot's
@@ -1372,10 +1371,9 @@ fn main() -> Result<()> {
                                 // Unknown (timeout / daemon error) still
                                 // propagates as `Err` below and keeps the
                                 // existing wait-for-evidence behavior.
-                                let decision = if !absent_names.is_empty()
-                                    && executing < cfg.runner.count
-                                {
-                                    eprintln!(
+                                let decision =
+                                    if !absent_names.is_empty() && executing < cfg.runner.count {
+                                        eprintln!(
                                         "runner startup settling: {executing}/{} ready locally \
                                          (listeners or workers), but {} container(s) absent: \
                                          {absent_names:?}; forcing immediate reconciliation \
@@ -1384,10 +1382,10 @@ fn main() -> Result<()> {
                                         absent_names.len(),
                                         MAX_SETTLING_POLLS,
                                     );
-                                    SettlingDecision::Ceiling
-                                } else {
-                                    episode.observe(Instant::now(), executing, cfg.runner.count)
-                                };
+                                        SettlingDecision::Ceiling
+                                    } else {
+                                        episode.observe(Instant::now(), executing, cfg.runner.count)
+                                    };
                                 (decision, episode.attempts, episode.best_executing)
                             };
                             match decision {

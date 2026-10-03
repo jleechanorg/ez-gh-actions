@@ -1052,9 +1052,7 @@ fn local_runner_activity(container_name: &str) -> LocalRunnerActivity {
             if docker_top_container_absent(&stderr) {
                 return LocalRunnerActivity::Absent;
             }
-            eprintln!(
-                "warning: keeping {container_name}: local activity probe failed: {stderr}"
-            );
+            eprintln!("warning: keeping {container_name}: local activity probe failed: {stderr}");
             return LocalRunnerActivity::Unknown;
         }
         Err(err) => {
@@ -2891,8 +2889,8 @@ fn runner_name_for(cfg: &Config, slot: u32) -> String {
 pub fn daemon_capacity() -> Option<(f64, u64)> {
     #[cfg(test)]
     {
-        if let Some(override_cap) = TEST_DAEMON_CAPACITY.lock().unwrap().clone() {
-            return override_cap;
+        if let Some(override_cap) = &*TEST_DAEMON_CAPACITY.lock().unwrap() {
+            return *override_cap;
         }
     }
     let mut cmd = docker_cmd();
@@ -3201,15 +3199,12 @@ pub fn effective_limits(cfg: &Config) -> Result<(f64, u64), String> {
     // called on every start_one (i.e. every spawn). Only run it when
     // the operator has actually opted into cpu_burst; the verification
     // it provides is meaningless for the default equal-share clamp.
-    let capacity = match daemon_capacity() {
-        Some((ncpu, daemon_mem)) => {
-            // Use vm_total_mb override as the fleet budget base when set;
-            // matches derive_memory_budget's startup fail-loud guard so
-            // the guard and the runtime clamp stay in sync.
-            Some((ncpu, cfg.runner.vm_total_mb.unwrap_or(daemon_mem)))
-        }
-        None => None,
-    };
+    let capacity = daemon_capacity().map(|(ncpu, daemon_mem)| {
+        // Use vm_total_mb override as the fleet budget base when set;
+        // matches derive_memory_budget's startup fail-loud guard so
+        // the guard and the runtime clamp stay in sync.
+        (ncpu, cfg.runner.vm_total_mb.unwrap_or(daemon_mem))
+    });
     let daemon_in_vm = if cfg.limits.cpu_burst {
         crate::platform::detect().daemon_in_vm
     } else {
@@ -3235,20 +3230,18 @@ fn effective_limits_with_capacity(
     // capacity is None.
     if cfg.limits.cpu_burst {
         if !daemon_in_vm {
-            return Err(format!(
-                "limits.cpu_burst=true is unsupported on this host: \
+            return Err("limits.cpu_burst=true is unsupported on this host: \
                  docker daemon is not verified VM-contained \
                  (platform::detect().daemon_in_vm=false). \
                  Disable cpu_burst or run inside a VM (Colima/Lima/Docker Desktop)."
-            ));
+                .to_string());
         }
         match capacity {
             None => {
-                return Err(format!(
-                    "limits.cpu_burst=true is unsupported: \
+                return Err("limits.cpu_burst=true is unsupported: \
                      daemon_capacity() returned no (non-positive) CPU capacity; \
                      cannot bound the per-container ceiling safely."
-                ));
+                    .to_string());
             }
             Some((ncpu, _)) if !ncpu.is_finite() || ncpu <= 0.0 => {
                 return Err(format!(
@@ -3901,12 +3894,14 @@ where
         handles
             .into_iter()
             .map(|handle| {
-                handle.join().unwrap_or_else(|panic| -> Result<ProbeOutcome> {
-                    Err(anyhow::anyhow!(
-                        "Runner.Worker readiness probe panicked: {:?}",
-                        panic
-                    ))
-                })
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| -> Result<ProbeOutcome> {
+                        Err(anyhow::anyhow!(
+                            "Runner.Worker readiness probe panicked: {:?}",
+                            panic
+                        ))
+                    })
             })
             .collect()
     });
@@ -3977,13 +3972,10 @@ fn executing_runner_count_from_containers(
                 // monotonically-decreasing ready counter is the same
                 // saturating AtomicU32 used in the original test branch.
                 use std::collections::HashSet;
-                let absent_set: HashSet<String> =
-                    summary.absent.iter().cloned().collect();
-                let absent_inside =
-                    std::sync::Arc::new(std::sync::Mutex::new(absent_set));
+                let absent_set: HashSet<String> = summary.absent.iter().cloned().collect();
+                let absent_inside = std::sync::Arc::new(std::sync::Mutex::new(absent_set));
                 let absent_inside_for_probe = absent_inside.clone();
-                let remaining =
-                    AtomicU32::new(summary.ready.min(owned.len() as u32));
+                let remaining = AtomicU32::new(summary.ready.min(owned.len() as u32));
                 executing_runner_count_with_probe(
                     cfg,
                     containers,
@@ -3996,10 +3988,7 @@ fn executing_runner_count_from_containers(
                         // injected list verbatim, even if the
                         // `summary.ready` count would otherwise have
                         // assigned Ready to this container).
-                        let absent_snap = absent_inside_for_probe
-                            .lock()
-                            .unwrap()
-                            .clone();
+                        let absent_snap = absent_inside_for_probe.lock().unwrap().clone();
                         if absent_snap.contains(&container.name) {
                             return Ok(ProbeOutcome::Absent);
                         }
@@ -4010,11 +3999,13 @@ fn executing_runner_count_from_containers(
                         // parallel-threads race past zero would
                         // otherwise wrap the counter to u32::MAX.
                         let present = remaining
-                            .fetch_update(
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                                |x| if x > 0 { Some(x - 1) } else { None },
-                            )
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                                if x > 0 {
+                                    Some(x - 1)
+                                } else {
+                                    None
+                                }
+                            })
                             .map(|prev| prev > 0)
                             .unwrap_or(false);
                         Ok(if present {
@@ -5244,7 +5235,11 @@ mod tests {
                 .collect(),
         );
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 0, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -5274,7 +5269,11 @@ mod tests {
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 0, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -5294,7 +5293,11 @@ mod tests {
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 0, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -5359,7 +5362,8 @@ mod tests {
         let (ncpu, daemon_mem): (f64, u64) = (4.0, 12288);
         let expected_cpu_share = (ncpu / 16.0).max(0.5);
         let expected_mem_share = (daemon_mem / 16).max(512);
-        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
+        let (cpus, mem) =
+            effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
         assert!(
             cpus <= expected_cpu_share + f64::EPSILON,
             "effective_limits must clamp cpus to daemon/count (got {cpus} > {expected_cpu_share})"
@@ -5378,7 +5382,8 @@ mod tests {
         cfg.limits.cpus = 2.0;
         cfg.limits.memory_mb = 4096;
         let (ncpu, daemon_mem): (f64, u64) = (4.0, 8192);
-        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
+        let (cpus, mem) =
+            effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
         let cpus_total = cpus * cfg.runner.count as f64;
         let mem_total = mem * cfg.runner.count as u64;
         assert!(
@@ -5451,7 +5456,8 @@ mod tests {
         cfg.limits.cpus = 4.0;
         cfg.limits.cpu_burst = true;
         let (cpus, _mem) =
-            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ true).unwrap();
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ true)
+                .unwrap();
         assert!(
             (cpus - 4.0).abs() < f64::EPSILON,
             "burst + VM + finite capacity must relax the per-container ceiling to cfg.limits.cpus=4.0 (got {cpus})"
@@ -5472,12 +5478,9 @@ mod tests {
         cfg.runner.count = 6;
         cfg.limits.cpus = 4.0;
         cfg.limits.cpu_burst = true;
-        let err = effective_limits_with_capacity(
-            &cfg,
-            Some((8.0, 8192)),
-            /* daemon_in_vm */ false,
-        )
-        .expect_err("burst on a host daemon must return Err");
+        let err =
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ false)
+                .expect_err("burst on a host daemon must return Err");
         assert!(
             err.contains("not verified VM-contained"),
             "Err message must explain the VM requirement (got {err:?})"
@@ -5494,9 +5497,7 @@ mod tests {
         cfg.limits.cpus = 4.0;
         cfg.limits.cpu_burst = true;
         let err = effective_limits_with_capacity(
-            &cfg,
-            /* capacity */ None,
-            /* daemon_in_vm */ true,
+            &cfg, /* capacity */ None, /* daemon_in_vm */ true,
         )
         .expect_err("burst with no capacity must return Err");
         assert!(
@@ -5529,12 +5530,9 @@ mod tests {
         cfg.runner.count = 6;
         cfg.limits.cpus = 4.0;
         cfg.limits.cpu_burst = true;
-        let err = effective_limits_with_capacity(
-            &cfg,
-            Some((0.0, 8192)),
-            /* daemon_in_vm */ true,
-        )
-        .expect_err("zero ncpu must be rejected (pre-fix would have set cpu_ceiling=0.0)");
+        let err =
+            effective_limits_with_capacity(&cfg, Some((0.0, 8192)), /* daemon_in_vm */ true)
+                .expect_err("zero ncpu must be rejected (pre-fix would have set cpu_ceiling=0.0)");
         assert!(
             err.contains("non-positive"),
             "Err message must name the zero-failure (got {err:?})"
@@ -5567,7 +5565,8 @@ mod tests {
         // platform::detect did not run (it would have set daemon_in_vm
         // and the burst path would have applied).
         let (cpus, _mem) =
-            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ false).unwrap();
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ false)
+                .unwrap();
         let cpu_share = (8.0_f64 / 6.0).max(0.5);
         assert!(
             (cpus - cpu_share).abs() < f64::EPSILON,
@@ -5588,12 +5587,9 @@ mod tests {
         cfg.runner.count = 6;
         cfg.limits.cpus = 16.0; // operator typo: 16 CPUs requested on a 4-CPU VM
         cfg.limits.cpu_burst = true;
-        let (cpus, _) = effective_limits_with_capacity(
-            &cfg,
-            Some((4.0, 8192)),
-            /* daemon_in_vm */ true,
-        )
-        .unwrap();
+        let (cpus, _) =
+            effective_limits_with_capacity(&cfg, Some((4.0, 8192)), /* daemon_in_vm */ true)
+                .unwrap();
         assert!(
             cpus <= 4.0 + f64::EPSILON,
             "burst ceiling must be capped at daemon ncpu=4.0 (got {cpus}); never cfg.limits.cpus=16.0"
@@ -6621,7 +6617,11 @@ minimum_isolation = "container"
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 3, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 3,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -6669,7 +6669,11 @@ minimum_isolation = "container"
             "must-not-start-in-a-second-batch".into(),
         ]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 4, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 4,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -6718,7 +6722,11 @@ minimum_isolation = "container"
         *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [five_alive.clone(), five_alive].into();
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 5, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 5,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker)
@@ -6788,7 +6796,11 @@ minimum_isolation = "container"
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 4, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 4,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -6860,7 +6872,9 @@ minimum_isolation = "container"
             "Error: No such object: ez-runner-c-3"
         ));
         // Genuine probe failures must NOT classify as absence.
-        assert!(!docker_top_container_absent("Error response from daemon: context deadline exceeded"));
+        assert!(!docker_top_container_absent(
+            "Error response from daemon: context deadline exceeded"
+        ));
         assert!(!docker_top_container_absent(""));
         assert!(!docker_top_container_absent(
             "Error response from daemon: permission denied while trying to connect to the Docker daemon socket"
@@ -6939,10 +6953,7 @@ minimum_isolation = "container"
             result.unwrap_err().to_string().contains("ez-org-runner-4"),
             "the fourth container must be rejected after the shared deadline"
         );
-        let mut launched = Arc::try_unwrap(launched)
-            .unwrap()
-            .into_inner()
-            .unwrap();
+        let mut launched = Arc::try_unwrap(launched).unwrap().into_inner().unwrap();
         launched.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             launched,
@@ -7002,7 +7013,11 @@ minimum_isolation = "container"
         );
         let elapsed = start.elapsed();
 
-        assert_eq!(result.unwrap().ready, 6, "all six probes should return ready");
+        assert_eq!(
+            result.unwrap().ready,
+            6,
+            "all six probes should return ready"
+        );
         assert_eq!(
             probes_done.load(Ordering::SeqCst),
             6,
@@ -7227,10 +7242,7 @@ minimum_isolation = "container"
         absent.sort();
         assert_eq!(
             absent,
-            vec![
-                "ez-org-runner-2".to_string(),
-                "ez-org-runner-4".to_string(),
-            ],
+            vec!["ez-org-runner-2".to_string(), "ez-org-runner-4".to_string(),],
             "absent slots must surface their container names to the settling loop"
         );
     }
@@ -7297,12 +7309,8 @@ minimum_isolation = "container"
         let after_refill: Vec<_> = (1..=6)
             .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
             .collect();
-        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [
-            initial,
-            after_refill.clone(),
-            after_refill.clone(),
-        ]
-        .into();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [initial, after_refill.clone(), after_refill.clone()].into();
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
         // Post-refill probe: slots 1-4 are ready, slots 5-6 are absent
@@ -7312,18 +7320,12 @@ minimum_isolation = "container"
             [
                 Ok(ReadinessSummary {
                     ready: 4,
-                    absent: vec![
-                        "ez-org-runner-5".to_string(),
-                        "ez-org-runner-6".to_string(),
-                    ],
+                    absent: vec!["ez-org-runner-5".to_string(), "ez-org-runner-6".to_string()],
                 }),
                 // Second poll for the settling observe: still absent.
                 Ok(ReadinessSummary {
                     ready: 4,
-                    absent: vec![
-                        "ez-org-runner-5".to_string(),
-                        "ez-org-runner-6".to_string(),
-                    ],
+                    absent: vec!["ez-org-runner-5".to_string(), "ez-org-runner-6".to_string()],
                 }),
             ]
             .into(),
@@ -7390,9 +7392,7 @@ minimum_isolation = "container"
         let absented = local_executing_runner_count(&cfg).unwrap();
         assert_eq!(absented.ready, 4);
         assert_eq!(absented.absent.len(), 2);
-        let ceiling_decision = if !absented.absent.is_empty()
-            && absented.ready < cfg.runner.count
-        {
+        let ceiling_decision = if !absented.absent.is_empty() && absented.ready < cfg.runner.count {
             crate::SettlingDecision::Ceiling
         } else {
             settling
@@ -7464,7 +7464,10 @@ minimum_isolation = "container"
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
             [
                 Err("synthetic post-refill docker top timeout".to_string()),
-                Ok(ReadinessSummary { ready: 6, absent: vec![] }),
+                Ok(ReadinessSummary {
+                    ready: 6,
+                    absent: vec![],
+                }),
             ]
             .into(),
         );
@@ -7562,7 +7565,11 @@ minimum_isolation = "container"
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-            [Ok(ReadinessSummary { ready: 0, absent: vec![] })].into(),
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
         );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -10373,7 +10380,11 @@ minimum_isolation = "container"
             *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
             *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-runner-c-1".into()]);
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
-                [Ok(ReadinessSummary { ready: 1, absent: vec![] })].into(),
+                [Ok(ReadinessSummary {
+                    ready: 1,
+                    absent: vec![],
+                })]
+                .into(),
             );
 
             let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
