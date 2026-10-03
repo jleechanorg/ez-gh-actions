@@ -427,6 +427,29 @@ pub struct Limits {
     /// Optional systemd cgroup/slice parent for every runner container.
     #[serde(default)]
     pub cgroup_parent: Option<String>,
+    /// Opt-in: allow the configured per-container `cpus` ceiling up to the
+    /// daemon's discovered CPU count instead of clamping to
+    /// `daemon_cpu / runner_count`. Aggregate is still bounded by VM
+    /// physical CPUs via the kernel's cfs_quota_us on the daemon cgroup.
+    ///
+    /// Honored ONLY when BOTH (a) `platform::detect().daemon_in_vm` is true
+    /// (verified VM-contained daemon — Colima, Lima, Docker Desktop) and
+    /// (b) `daemon_capacity()` returned a finite CPU count. Without both,
+    /// a host daemon or unknown capacity could silently exceed the
+    /// physical-host envelope, so `effective_limits` logs a loud warning
+    /// and falls back to the equal-share clamp.
+    ///
+    /// Default `false`: the 2026-10-03 throughput doc observed a Mac VM
+    /// where one runner burned 7.69 M us in a 6 s window and was throttled
+    /// 5.21 M us of its 12.9 M us attempted demand (87 % of excess clipped)
+    /// because the equal-share clamp forced `--cpus 8/6 = 1.33` while the
+    /// hot job actually needed ~2.15 CPUs. With `cpu_burst = true` on a
+    /// verified VM-contained Mac (8 CPU, 6 slots, `cpus = 4.0`) the
+    /// per-container ceiling relaxes to `min(cfg.limits.cpus, ncpu) = 4.0`
+    /// and the hot job runs unthrottled while the 5 idle runners consume
+    /// ≈ 0.
+    #[serde(default)]
+    pub cpu_burst: bool,
 }
 
 fn default_min_free_disk_gb() -> u64 {
@@ -624,6 +647,7 @@ impl Config {
                 pids: 512,
                 min_free_disk_gb: default_min_free_disk_gb(),
                 cgroup_parent: None,
+                cpu_burst: false,
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,

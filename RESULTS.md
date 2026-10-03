@@ -1,247 +1,188 @@
-# Runner throughput results — 2026-10-03
+# Runner throughput — 2026-10-03
 
-Branch: `codex/runner-throughput-20261003` (working tree only; no push done
-yet — root owns runtime deploy per repo policy + this session's no-restart
-gate).
+Branch `codex/runner-throughput-20261003` — source-only changes,
+ready for root runtime deployment. Three commits, in order:
 
-This document covers two commits on the branch:
+| Commit | Subject |
+|---|---|
+| `d250267` | runner throughput: parallel readiness probes + busy/idle diagnostics + container-absent reclaim |
+| `b4669de` | runner throughput: 6s probe cap + absent reconcile + drop unused activity enum |
+| `HEAD`   | runner throughput: opt-in cpu_burst + absent-shortage fix (independent-review critical) |
 
-* **Commit 1 — `d250267`** first-pass: parallel readiness probes +
-  Busy/ReadyIdle/Unknown diagnostic split + container-absent reclaim.
-  Original RESULTS.md below preserves that scope.
-* **Commit 2 — pending**: round-2 review feedback. Three fixes:
-  (a) raise per-probe `LOCAL_TOP_TIMEOUT` from 3s to 6s (measured 3.2-4.5s
-      `docker top` latency on Mac under load), with tests pinning the new
-      cap and that overrun probes propagate as `Err` not `Absent`;
-  (b) drop the unused `pub enum RunnerActivityState` + `runner_activity_state`
-      parser; rename the actual settling log lines to "ready locally
-      (listeners or workers)" (the bool `runner_present` view stays — bead
-      jleechan-viff Listener-or-Worker semantics preserved; doctor-runner
-      stays strict `Runner.Worker`);
-  (c) surface absent container names to the settling loop so it forces
-      immediate reconciliation instead of waiting 25s for a slot that
-      `docker top` says "No such container" (bead jleechan-95jk root-cause
-      evidence).
+## Final HEAD for deployment
+
+```
+<pending: SHA printed after this commit lands>
+```
+
+Root owns `cargo install --path .`, `systemctl --user restart ezgha.service`,
+the `~/.config/ezgha/config.toml` edits, and `git push` (no `git add -A`,
+no force push).
 
 ---
 
-## Commit 2 — round-2 review feedback fixes
+## Commit HEAD — post-review critical fix + opt-in cpu_burst
 
-### Fix 1 — `LOCAL_TOP_TIMEOUT` 3s → 6s
+### Fix A — absent slot counts toward shortage, not toward alive
 
-```rust
-// src/docker_backend.rs
-const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(6);
-```
-
-Bead jleechan-95jk measured 3.2-4.5s `docker top` latency on the Mac
-host under load. A 3s cap killed in-flight probes that were still going
-to succeed and reported false "not ready". The parallel fan-out from
-commit 1 keeps the shared 30s readiness budget bounded even with a 6s
-per-probe cap — worst case is one slow probe (6s) plus scheduling
-overhead, NOT 16 sequential 6s.
-
-| Slots | Old sequential | Parallel (3s cap) | Parallel (6s cap) |
-|---|---|---|---|
-| 6 Mac  | 6 × 3s = 18s | ≤ 3s (+ overhead) | ≤ 6s (+ overhead) |
-| 10 Linux | 10 × 3s = 30s (entire budget) | ≤ 3s (+ overhead) | ≤ 6s (+ overhead) |
-
-Tests:
-
-* `readiness_probe_timeout_caps_at_six_seconds_and_preserves_sub_six_seconds`
-  — caps `30s → 6s`, preserves `5s → 5s`, preserves `2s → 2s`,
-  preserves `500ms → 500ms`.
-* `parallel_readiness_probes_complete_between_three_and_six_seconds` —
-  three 5s sleeps all return `Ready`; total elapsed is in `[5s, 7s)`.
-  This was the regression case at 3s: the old cap would have killed
-  these probes mid-sleep.
-* `parallel_readiness_probes_pass_six_second_timeout_argument` — the
-  orchestrator hands the probe a `Duration::from_secs(6)` (not 3s).
-  Companion to the cap test; pins the actual argument value.
-* `parallel_readiness_probe_overrun_propagates_as_err_not_absent` —
-  when the probe respects its timeout argument (the production probe
-  uses `run_docker_with_timeout_at_deadline` which kills the docker
-  process at the cap), the `Err` reaches `run_orchestrator` and is
-  surfaced as `Err`, not silently mapped to `ProbeOutcome::Absent`.
-  Pins the "Unknown safety" half of the bead directive: do not blindly
-  treat all errors as absence.
-* Existing `parallel_readiness_probes_share_wall_clock_within_max_probe`
-  unchanged in spirit; comment updated to reference the 6s cap.
-
-### Fix 2 — drop unused public abstraction, rename actual log lines
-
-Removed:
-
-* `pub enum RunnerActivityState { Busy, ReadyIdle, Unknown }`
-* `fn runner_activity_state(output: &str) -> RunnerActivityState`
-* `runner_activity_state_distinguishes_busy_vs_ready_idle` test
-
-Replaced the daemon's settling log lines in `src/main.rs` from
-`executing locally` to `ready locally (listeners or workers)`:
-
-```
-runner startup settling: 4/6 ready locally (listeners or workers) (poll 3/5)
-runner startup settled:  6/6 ready locally (listeners or workers) after 4 poll(s)
-runner startup settling ceiling reached: 4/6 ready locally (listeners or workers), best 5, 5 poll(s); running monitors before immediate reconciliation
-```
-
-`runner_present` (the bool view) is unchanged: Listener OR Worker counts
-as ready, per bead jleechan-viff. The doctor-runner script keeps its
-strict `Runner.Worker` EXECUTING semantics (only Worker, not Listener,
-counts as EXECUTING) — see `doctor-runner`'s `classify_local_slot`
-function. The two views are now honest:
-
-* **Daemon settling** — "ready locally" = Listener or Worker (one slot
-  can take a job).
-* **Doctor-runner** — "EXECUTING" = Worker only (one slot is currently
-  running a job).
-
-### Fix 3 — surface absent container names to the settling loop
-
-New `pub struct ReadinessSummary { pub ready: u32, pub absent: Vec<String> }`
-returned by `local_executing_runner_count`. The settling loop in
-`src/main.rs` now:
+Independent review of `b4669de` flagged HIGH-severity: post-refill readiness
+computed `alive_after = summary.ready + summary.absent.len()`, so a freshly-
+spawned slot that disappeared before `docker top` could find it (the "No
+such container" race) zeroed the shortage and selected `Recovered`,
+skipping settling and sleeping the full 30 s serve-tick. One-line fix:
 
 ```rust
-let decision = if !absent_names.is_empty() && executing < cfg.runner.count {
-    eprintln!(
-        "runner startup settling: {executing}/{} ready locally \
-         (listeners or workers), but {} container(s) absent: \
-         {absent_names:?}; forcing immediate reconciliation \
-         instead of waiting out the {}-poll settling ceiling",
-        cfg.runner.count, absent_names.len(), MAX_SETTLING_POLLS,
-    );
-    SettlingDecision::Ceiling
-} else {
-    episode.observe(Instant::now(), executing, cfg.runner.count)
-};
+// src/docker_backend.rs:4816
+(cfg.runner.count.saturating_sub(summary.ready), None)
 ```
 
-The crucial user-cited bug was the Linux journal pattern "keeping slot
-3 because docker top says No such container despite snapshot omission"
-at 14:45:50 — the settling loop polled for 25s waiting for the absent
-slot to come back. With `ProbeOutcome::Absent` now propagating the
-container name into `ReadinessSummary.absent`, the settling loop forces
-`SettlingDecision::Ceiling` immediately. `Ceiling` clears the local
-settling episode and `settling_plan` returns `(Duration::ZERO, true)`,
-so the next serve tick runs monitors and a full `ensure_count_outcome`
-without waiting out the 25s ceiling.
+`Unknown safety` preserved: `Err` from the probe still propagates through
+the `Err(error)` arm — only `ProbeOutcome::Absent` is the confirmed-loss
+signal. Pinned by `parallel_readiness_probe_overrun_propagates_as_err_not_absent`.
 
-Genuine `Err` from the probe (timeout, daemon error, transient I/O) is
-**NOT** mapped to `ProbeOutcome::Absent` — it propagates as `Err` and
-the settling loop preserves its existing wait-for-evidence behavior.
-This is the "Unknown safety" half of the bead directive. Pinned by
-`parallel_readiness_probe_overrun_propagates_as_err_not_absent` above.
+New regression test (the missing half of the review's ask):
+`post_refill_absent_container_forces_shortage_and_immediate_reconcile` —
+verifies (a) `remaining_shortage == 2` not 0, (b) `StartSettling` selected,
+(c) settling armed, (d) second poll forces `Ceiling` via main.rs absent-
+aware short circuit, (e) `settling_plan` returns `(Duration::ZERO, true)`.
+Confirmed FAIL against the pre-fix code with the exact assertion message.
 
-New tests:
+### Fix B — opt-in `limits.cpu_burst` (Mac fixed8CPU VM only)
 
-* `readiness_summary_reports_absent_container_names` — 4 containers;
-  slots 2 and 4 return `ProbeOutcome::Absent`, slots 1 and 3 return
-  `Ready`. Asserts `summary.ready == 2` and
-  `summary.absent == ["ez-org-runner-2", "ez-org-runner-4"]` (sorted).
-* `readiness_summary_treats_not_ready_distinct_from_absent` — slot 2
-  returns `ProbeOutcome::NotReady` (container alive, no Runner
-  process). Asserts `summary.ready == 2` and `summary.absent.is_empty()`
-  — NOT conflating NotReady with Absent.
+2026-10-03 Mac `cgroup cpu.stat` sample: one runner used 7.69 M us in 6 s,
+throttled 57/58 periods (5.21 M us / 12.9 M us = 87 % clipped). All 6
+aggregate 3.3 CPU; VM had 4.7 CPU unused. Equal-share clamp `8/6 = 1.33`
+was the bottleneck (hot job needed ~2.15 CPUs).
 
-Post-refill (`ensure_count_outcome`'s `containers_after` recount)
-also uses the new struct: `ready + absent.len()` is the alive count,
-so a freshly-started container that dies before docker-top can find it
-counts toward the remaining shortage instead of leaving settling to
-poll 25s.
+Design (minimum safe, default unchanged):
+- New `limits.cpu_burst: bool` (default `false`).
+- Honored ONLY when `platform::detect().daemon_in_vm` AND finite
+  `daemon_capacity().0`. Otherwise loud warning + equal-share fallback.
+- Per-container ceiling relaxes to `min(cfg.limits.cpus, ncpu)`. Aggregate
+  `count * ceiling` still bounded by VM physical CPUs via kernel
+  `cfs_quota_us` on the daemon cgroup.
+- Memory clamp unchanged.
+- Reuses existing `daemon_in_vm` + `daemon_capacity()` probes.
 
-### Test summary (commit 2)
+Four focused tests pin the contract:
+- `cpu_burst_defaults_to_false`
+- `cpu_burst_with_vm_and_finite_capacity_relaxes_to_daemon_cpu`
+- `cpu_burst_without_vm_or_capacity_falls_back_to_equal_share` (host + unknown)
+- `cpu_burst_per_container_cap_does_not_exceed_daemon_capacity`
+
+### Test summary
 
 ```
 $ cargo test --bin ezgha -j 2 2>&1 | tail -3
-test result: ok. 431 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
+test result: ok. 436 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out
 ```
 
-Up from 427 (commit 1): +5 new tests, −1 removed (`runner_activity_state_distinguishes_busy_vs_ready_idle`).
+Up from 431 (`b4669de`): +5 (1 absent-regression + 4 cpu_burst).
 
-| Test | Pins |
-|---|---|
-| `readiness_probe_timeout_caps_at_six_seconds_and_preserves_sub_six_seconds` | `LOCAL_TOP_TIMEOUT = 6s` (raised from 3s for 3.2-4.5s measured probes) |
-| `parallel_readiness_probes_complete_between_three_and_six_seconds` | 5s sleeps complete under 6s cap (regression case at 3s) |
-| `parallel_readiness_probes_pass_six_second_timeout_argument` | Orchestrator hands the probe exactly `Duration::from_secs(6)` |
-| `parallel_readiness_probe_overrun_propagates_as_err_not_absent` | "Unknown safety": probe `Err` propagates as `Err`, not silently mapped to `Absent` |
-| `readiness_summary_reports_absent_container_names` | Parallel orchestration's `ProbeOutcome::Absent` → `ReadinessSummary.absent` plumbing |
-| `readiness_summary_treats_not_ready_distinct_from_absent` | `NotReady` (alive container, no Runner) is NOT conflated with `Absent` |
-
-Existing shell-test regressions also clean:
-
-```
-$ bash tests/commit_msg_provenance_prefix_test.sh       # PASS
-$ bash tests/doctor_runner_verdict_line_test.sh        # PASS
-$ bash tests/doctor_runner_expected_containers_test.sh  # PASS
-$ bash tests/doctor_runner_heartbeat_starvation_test.sh # PASS
-$ bash tests/doctor_runner_respawn_journal_test.sh      # PASS
-```
-
-Existing unit tests adapted:
-
-* `readiness_probe_timeout_caps_at_three_seconds_*` → renamed to
-  `readiness_probe_timeout_caps_at_six_seconds_*`.
-* `readiness_probes_share_deadline_and_stop_after_it` — per-probe
-  caps updated from 3s to 6s.
-* `parallel_readiness_probes_respect_per_probe_timeout` — probe
-  returns `ProbeOutcome::Ready`/`NotReady` (was `Ok(true)`/`Ok(false)`).
-* `parallel_readiness_probes_share_wall_clock_within_max_probe` —
-  same probe return-type migration; asserts `result.unwrap().ready`
-  (was `result.unwrap()`).
-* `executing_runner_count_from_containers` test branch — same
-  migration; `Ok(present)` becomes
-  `Ok(if present { ProbeOutcome::Ready } else { ProbeOutcome::NotReady })`.
-* `local_worker_readiness_propagates_incomplete_probe_evidence` —
-  unchanged: the configured `Err("synthetic docker top timeout")`
-  propagates through unchanged.
-* `post_refill_incomplete_readiness_preserves_starts_*` —
-  `local_executing_runner_count(&cfg).unwrap().ready` (was `.unwrap()`).
-
-### What was NOT done (out of scope / user-gated)
-
-* No `cargo install` / `systemctl restart` / service touch — root
-  rebuilds Linux then Mac after independent review.
-* No changes to `~/.config/ezgha/config.toml`, runner count, prefix,
-  image, or any host-side process. Source-only.
-* No force push, no `git add -A` (single file staged).
-* No dependency additions.
-* `doctor-runner` was NOT touched — it keeps its strict `Runner.Worker`
-  EXECUTING semantics (the daemon settling view is a separate concern).
-* No removal of `LocalRunnerActivity::Absent` — the per-slot reclaim
-  path in `release_stale_slots` still uses it; the daemon settling
-  short-circuit added here uses the same `docker_top_container_absent`
-  classifier from a different vantage point.
+Shell regressions clean: `commit_msg_provenance_prefix`, `doctor_runner_verdict_line`,
+`doctor_runner_expected_containers`, `doctor_runner_heartbeat_starvation`,
+`doctor_runner_respawn_journal` — all PASS.
 
 ---
 
-## Commit 1 — `d250267` first-pass (parallel probes + diagnostic split + absent reclaim)
+## Final-state runtime notes (root's deployment plan)
 
-### What changed
+### Linux (jeff-ubuntu) — `runner.serve_tick_seconds 20 → 10`
+
+Backed-up exact config edit on `~/.config/ezgha/config.toml`:
+
+```toml
+[runner]
+serve_tick_seconds = 10   # was 20
+```
+
+Then rebuild + restart (Gate 0 SHA match, Gate 3 load-aware check, then
+`systemctl --user restart ezgha.service`).
+
+Observed pre-edit state (justification):
+- Repeated `7/10 Runner.Worker` samples (3 productive slots left idle
+  every cycle).
+- 33 s observed reconcile cycles = `serve_tick_seconds(20) +
+  readiness_probe_serial_drift(13)`; halving the tick to 10 s brings
+  reconcile floor to ~23 s without any new polling code.
+- 20 s configured idle sleep between cycles, no other hot path.
+
+Effect: halves the idle-wait budget, ~50% faster recovery from
+transient slot loss. No polling-code change, no probe cadence change,
+no admission/PSI gate change. Linux default `limits.cpu_burst = false`
+remains (Linux 20-CPU host already has plenty of equal-share headroom).
+
+### Mac (ez-mac-runner-g-1..6) — keep tick 5, enable `cpu_burst = true`
+
+`serve_tick_seconds` stays at 5 (already short; the Mac fixed8CPU VM
+is the probe-latency-bound fleet, not the reconcile-floor-bound one).
+
+Add `cpu_burst = true` to `[limits]` only when root flips it (config
+edit is NOT done by this commit). The Mac fleet is the use case that
+motivates the opt-in: VM 8 CPU / 6 slots with a hot job needing
+~2.15 CPUs gets clipped at equal-share 1.33; burst relaxes to
+`min(cfg.limits.cpus, ncpu) = 4.0` for the verified-VM + finite-capacity
+eligibility path.
+
+### Out of scope / NOT touched
+
+- No `cargo install` / `systemctl restart` / config edits done in this commit.
+- No change to Linux `limits.cpu_burst` (default false, stays).
+- No new platform probes; reuses `daemon_in_vm` + `daemon_capacity()`.
+- `doctor-runner` untouched (its strict `Runner.Worker` semantics are
+  a separate view from daemon settling's "ready locally").
+- No force push, no `git add -A`.
+
+---
+
+## Prior commits (preserved for context)
+
+### `b4669de` — round-2 review feedback
+
+- `LOCAL_TOP_TIMEOUT 3s → 6s` (bead jleechan-95jk: measured 3.2-4.5 s
+  `docker top` latency on Mac under load; 5 new tests including
+  overrun-propagates-as-Err, parallel-completion-under-6s, absent-summary
+  plumbing, NotReady-distinct-from-Absent).
+- Removed unused `pub enum RunnerActivityState` + parser + test.
+- Renamed daemon settling log lines `executing locally` → `ready locally
+  (listeners or workers)`. `runner_present` bool view unchanged.
+- Surfaced absent container names via `ReadinessSummary.absent` so the
+  settling loop forces `Ceiling` instead of waiting out 25 s. Pinned by
+  `readiness_summary_reports_absent_container_names` and
+  `readiness_summary_treats_not_ready_distinct_from_absent`.
+
+### `d250267` — first-pass
+
+- Parallel `docker top` fan-out via `std::thread::scope` (Mac 6×3 s → ≤3 s).
+- `LocalRunnerActivity::{Busy, Unknown, Idle, Absent}` 4-state split.
+- `release_stale_slots` reclaims `Absent` slots immediately with
+  `reason=gh-rejected-container-absent`.
+
+---
+
+## Original `d250267` RESULTS section
 
 #### 1. Parallel readiness probes (Mac 6×3s → ~3s wall-clock)
 
 `executing_runner_count_with_probe` now fans `docker top` out across every
 owned container in parallel via `std::thread::scope` instead of strictly
-sequentially. Per-probe budget is still capped at `LOCAL_TOP_TIMEOUT` (6s
-in commit 2; 3s in commit 1) and the shared `LOCAL_READINESS_BUDGET` (30s)
-is still honored.
+sequentially. Per-probe budget is still capped at `LOCAL_TOP_TIMEOUT`
+(6 s in `b4669de`; 3 s in `d250267`) and the shared `LOCAL_READINESS_BUDGET`
+(30 s) is still honored.
 
 | Slots | Sequential worst-case | Parallel worst-case |
 |---|---|---|
-| 6 Mac  | 6 × 3s = 18s | ≤ 3s (+ overhead) |
-| 10 Linux | 10 × 3s = 30s (entire budget) | ≤ 3s (+ overhead) |
+| 6 Mac  | 6 × 3 s = 18 s | ≤ 3 s (+ overhead) |
+| 10 Linux | 10 × 3 s = 30 s (entire budget) | ≤ 3 s (+ overhead) |
 
 #### 2. Busy / ReadyIdle diagnostic split (no idle-regress)
 
-`LocalRunnerActivity::{Busy, Unknown, Idle, Absent}` and `docker_top_container_absent`
-classifier pin the four-state split. `release_stale_slots` matches `Absent`
-and reclaims immediately with `reason=gh-rejected-container-absent`.
+`LocalRunnerActivity::{Busy, Unknown, Idle, Absent}` and
+`docker_top_container_absent` classifier pin the four-state split.
+`release_stale_slots` matches `Absent` and reclaims immediately.
 
 #### 3. Container-absent reclaim (settling stops waiting on dead slots)
 
-The settling-readiness path treats `Absent` as a normal probe outcome (so
-the other 9/10 slots' evidence stays usable) and surfaces the container
-name to the settling loop (commit 2 expanded this surface area into
-`ReadinessSummary.absent` so the settling loop can force immediate
-reconciliation).
+`Absent` is a normal probe outcome (other 9/10 slots' evidence stays
+usable); container name surfaces to settling via `ReadinessSummary.absent`
+(see `b4669de` for the full plumbing).
