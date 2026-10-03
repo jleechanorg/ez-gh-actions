@@ -297,11 +297,53 @@ expected_effective_cpus() {
 }
 
 daemon_in_vm() {
-    [ "$(uname -s)" = "Darwin" ] && return 0
-    local daemon_kernel host_kernel
+    # VM-containment proof via the docker daemon's own kernel string.
+    # Mirrors src/platform.rs::daemon_in_vm(): the daemon kernel probe
+    # MUST succeed first; an unreachable daemon returns false rather
+    # than a stale "Darwin implies VM" true (regression 2026-10-03:
+    # the prior Darwin-shortcut unconditionally returned true even when
+    # the docker daemon was unreachable, which would have admitted
+    # burst via Gate 3 on a dead-daemon host). On macOS the daemon is
+    # always in a VM (no native Linux containers) so any non-empty
+    # daemon kernel counts; on Linux, the daemon kernel must also
+    # differ from the host kernel (uname -r).
+    local daemon_kernel
     daemon_kernel=$(docker info --format '{{.KernelVersion}}' 2>/dev/null | tr -d '[:space:]' || true)
+    [ -n "$daemon_kernel" ] || return 1
+    if [ "$(uname -s)" = "Darwin" ]; then
+        return 0
+    fi
+    local host_kernel
     host_kernel=$(uname -r | tr -d '[:space:]' || true)
-    [ -n "$daemon_kernel" ] && [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+    [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+}
+
+# Mirror of src/docker_backend.rs::effective_limits_with_capacity's burst
+# branch (lines 3229-3253 in src/docker_backend.rs): when limits.cpu_burst
+# is requested, refuse unless (a) the docker daemon is proven VM-contained
+# via the SAME kernel-proof the Rust guard uses, and (b) docker info
+# reports a finite positive NCPU. Prints the refusal reason on stderr and
+# returns non-zero on refusal. Default-false (LIMIT_CPU_BURST!=true) is
+# accepted unconditionally — equal-share arithmetic applies downstream.
+# Returns the proven NCPU on stdout (only when accepted) so the caller
+# can reuse it without re-probing docker info. Exit status: 0 accepted,
+# 1 refused. Sourced into focused shell tests via awk extraction.
+gate3_burst_preflight() {
+    if [ "${LIMIT_CPU_BURST:-false}" != "true" ]; then
+        return 0
+    fi
+    if ! daemon_in_vm; then
+        echo "limits.cpu_burst=true but docker daemon is not verified VM-contained (daemon_in_vm kernel proof returned false); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    local ncpu
+    ncpu=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    if ! is_uint "$ncpu" || [ "$ncpu" -le 0 ]; then
+        echo "limits.cpu_burst=true but docker info NCPU is not a finite positive integer ('${ncpu:-unavailable}'); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    echo "$ncpu"
+    return 0
 }
 
 cpu_controller_available() {
@@ -666,6 +708,22 @@ MIN_FREE_DISK_GB=$(toml_get_limits min_free_disk_gb 10)
 # existing toml_get_limits helper (not inventing separate semantics)
 # keeps parser behavior aligned with the rest of Gate 3.
 LIMIT_CPU_BURST=$(toml_get_limits cpu_burst false)
+# Burst production guard (Gate 3 must mirror src/docker_backend.rs
+# effective_limits_with_capacity): when limits.cpu_burst=true, refuse
+# if either (a) the docker daemon isn't proven VM-contained via the
+# SAME kernel-proof the Rust guard uses, or (b) daemon NCPU is not
+# finite positive. Silent fallback to the raw cfg.cpus would let an
+# operator believe burst was honored when neither Serve startup nor
+# effective_limits would have admitted it. Default-false leaves both
+# checks unexecuted (equal-share arithmetic still applies). Extracted
+# into gate3_burst_preflight so focused shell tests
+# (tests/verify_exit_gate3_burst_preflight_test.sh) can exercise the
+# same code path without spinning the live fleet; the inline call here
+# uses the same helper so production and tests stay in lockstep.
+GATE3_PROVEN_NCPU=""
+if [ "$LIMIT_CPU_BURST" = "true" ]; then
+    GATE3_PROVEN_NCPU=$(gate3_burst_preflight) || fail "limits.cpu_burst=true preflight refused: $(gate3_burst_preflight 2>&1)"
+fi
 VM_TOTAL_MB=$(toml_get_runner vm_total_mb 0)
 GUEST_RESERVE_MB=$(toml_get_runner guest_reserve_mb 4096)
 RUNNER_FLOOR_MB=$(toml_get_runner runner_floor_mb 3072)
@@ -830,6 +888,13 @@ for slot in $(seq 1 "$COUNT"); do
     if is_uint "$DAEMON_NCPU" && [ "$DAEMON_NCPU" -gt 0 ] && [ "$COUNT" -gt 0 ]; then
         EXPECTED_EFFECTIVE_CPUS=$(expected_effective_cpus \
             "$LIMIT_CPU_BURST" "$LIMIT_CPUS" "$DAEMON_NCPU" "$COUNT")
+    elif [ "$LIMIT_CPU_BURST" = "true" ]; then
+        # Burst path: the preflight above already proved DAEMON_NCPU is
+        # finite positive when cpu_burst=true; reaching here means the
+        # per-slot probe unexpectedly lost the value. Fail loud rather
+        # than silently falling back to raw $LIMIT_CPUS, which would
+        # mask a real probe regression.
+        fail "limits.cpu_burst=true but per-slot DAEMON_NCPU lost its value mid-loop ('$DAEMON_NCPU'); src/docker_backend.rs::effective_limits refused this same config at Serve startup, so the running fleet cannot be in burst mode"
     fi
     # The daemon passes cpus to `docker run --cpus` via format!("{:.2}", cpus)
     # (src/docker_backend.rs) -- 2-decimal rounding BEFORE docker converts it

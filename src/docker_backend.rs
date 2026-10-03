@@ -7773,8 +7773,13 @@ minimum_isolation = "container"
     /// `FailureLadder::record_failure` and open 15-minute circuits on
     /// 3 slots — a whole-fleet config error misclassified as a per-slot
     /// defect. Pin: admission_paused_reason set + slot ledger unchanged.
+    /// Drives the REAL `start_one_with_generate` path (same dependency
+    /// seams as the production refill loop) so removing the
+    /// `map_err(admission_preflight_error)` from start_one's effective_limits
+    /// call would surface here as a generic Err that DOES charge the ladder.
     #[test]
     fn preflight_burst_refusal_does_not_charge_slot_ladder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let env = TestEnv::new("preflight_burst_no_ladder_charge");
         // failure_ladder_path_for falls back to the TEST_SLOT_PATH
         // sibling when cfg.state_dir is None — leave cfg.state_dir unset
@@ -7789,15 +7794,28 @@ minimum_isolation = "container"
         // unsupported-capacity refusal branch (deterministic on any host).
         *TEST_DAEMON_CAPACITY.lock().unwrap() = Some(None);
 
-        let preflight_starter =
+        // Install a fake docker that captures invocations; the rejection
+        // must happen BEFORE pre_rm so the captured log stays empty.
+        let temp_dir =
+            std::env::temp_dir().join(format!("ezgha-burst-refusal-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        // JIT closure MUST NOT be invoked: preflight refuses before any
+        // GitHub registration. Counting calls catches a regression where
+        // someone moves the preflight AFTER generate_jitconfig.
+        let jit_calls = AtomicUsize::new(0);
+        let starter =
             |_cfg: &Config, _backend: Backend, _slot: u32| -> Result<(String, String)> {
-                Err(admission_preflight_error(anyhow::anyhow!(
-                    "limits.cpu_burst=true is unsupported: synthetic preflight refusal"
-                )))
+                start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+                    jit_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(("jit-token".into(), 1))
+                })
             };
 
         let outcome =
-            start_missing_runners_with_starter(&cfg, Backend::Docker, 3, preflight_starter)
+            start_missing_runners_with_starter(&cfg, Backend::Docker, 3, starter)
                 .expect("preflight-refused refill must surface as outcome, not panic");
 
         assert!(
@@ -7808,6 +7826,20 @@ minimum_isolation = "container"
         assert!(
             reason.contains("preflight"),
             "admission_paused_reason must mention 'preflight' (got: {reason:?})"
+        );
+        assert_eq!(
+            jit_calls.load(Ordering::SeqCst),
+            0,
+            "JIT MUST NOT be called when cpu_burst preflight refuses; \
+             a non-zero count means a regression moved effective_limits \
+             after generate_jitconfig (would register on GitHub before refusing)"
+        );
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        assert!(
+            captured.is_empty(),
+            "start_one_with_generate_at_slot must execute zero docker invocations when \
+             cpu_burst preflight refuses; the rejection must run BEFORE pre_rm. \
+             Captured args:\n{captured}"
         );
 
         let ladder_after = FailureLadder::load(&ladder_path)
@@ -7824,6 +7856,7 @@ minimum_isolation = "container"
         );
 
         *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
+        *TEST_DOCKER_BIN.lock().unwrap() = None;
     }
 
     /// Companion regression: a genuine docker-start failure (NOT preflight-typed)
