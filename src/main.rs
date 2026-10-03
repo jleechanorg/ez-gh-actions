@@ -1347,31 +1347,56 @@ fn main() -> Result<()> {
                 watchdog::ping();
                 let (sleep, run_monitors) = if settling.is_some() {
                     match docker_backend::local_executing_runner_count(&cfg) {
-                        Ok(executing) => {
+                        Ok(summary) => {
+                            let executing = summary.ready;
+                            let absent_names = summary.absent;
                             let (decision, attempts, best_executing) = {
                                 let episode = settling.as_mut().expect("checked above");
-                                let decision =
-                                    episode.observe(Instant::now(), executing, cfg.runner.count);
+                                // Bead jleechan-95jk root-cause: if a slot's
+                                // container is GONE (`docker top: No such
+                                // container`), polling for 25s will not bring
+                                // it back. Force immediate reconciliation
+                                // (Ceiling) so the next serve tick calls
+                                // `ensure_count` and respawns. Genuine
+                                // Unknown (timeout / daemon error) still
+                                // propagates as `Err` below and keeps the
+                                // existing wait-for-evidence behavior.
+                                let decision = if !absent_names.is_empty()
+                                    && executing < cfg.runner.count
+                                {
+                                    eprintln!(
+                                        "runner startup settling: {executing}/{} ready locally \
+                                         (listeners or workers), but {} container(s) absent: \
+                                         {absent_names:?}; forcing immediate reconciliation \
+                                         instead of waiting out the {}-poll settling ceiling",
+                                        cfg.runner.count,
+                                        absent_names.len(),
+                                        MAX_SETTLING_POLLS,
+                                    );
+                                    SettlingDecision::Ceiling
+                                } else {
+                                    episode.observe(Instant::now(), executing, cfg.runner.count)
+                                };
                                 (decision, episode.attempts, episode.best_executing)
                             };
                             match decision {
                                 SettlingDecision::Continue => println!(
-                                    "runner startup settling: {executing}/{} executing locally \
-                                     (poll {attempts}/{MAX_SETTLING_POLLS})",
+                                    "runner startup settling: {executing}/{} ready locally \
+                                     (listeners or workers) (poll {attempts}/{MAX_SETTLING_POLLS})",
                                     cfg.runner.count
                                 ),
                                 SettlingDecision::Recovered => {
                                     println!(
-                                        "runner startup settled: {executing}/{} executing locally \
-                                         after {attempts} poll(s)",
+                                        "runner startup settled: {executing}/{} ready locally \
+                                         (listeners or workers) after {attempts} poll(s)",
                                         cfg.runner.count
                                     );
                                     settling_ceilings.record_recovery();
                                 }
                                 SettlingDecision::Ceiling => {
                                     let detail = format!(
-                                        "{executing}/{} executing locally, best {best_executing}, \
-                                         {attempts} poll(s)",
+                                        "{executing}/{} ready locally (listeners or workers), \
+                                         best {best_executing}, {attempts} poll(s)",
                                         cfg.runner.count
                                     );
                                     let escalated = record_settling_ceiling(

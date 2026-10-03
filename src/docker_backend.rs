@@ -63,14 +63,20 @@ const DOCKER_REAPER_QUEUE_ALERT_THRESHOLD: usize = 1;
 const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // Post-refill readiness gets one 30s shared local-Docker budget. At the normal
 // sub-100ms `docker ps`/`docker top` latency this covers all 16 fleet slots;
-// under host pressure, a single probe may use up to 3s and the shared deadline
+// under host pressure a single probe may use up to ~6s and the shared deadline
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
 // full reconciliation. The deadline starts before Docker child-reaper
-// initialization and covers the `ps` plus all `top` probes. The probe budget is
-// far below the 300s watchdog margin.
+// initialization and covers the `ps` plus all `top` probes. The probe budget
+// is far below the 300s watchdog margin.
+//
+// The per-probe `LOCAL_TOP_TIMEOUT` is 6s (not 3s): the 2026-10-03 throughput
+// doc measured 3.2-4.5s `docker top` latency on a Mac host under load — a 3s
+// cap killed in-flight probes that were still going to succeed and reported
+// false "not ready" / "absent". Parallel probes still fit the shared 30s
+// budget (worst case is one slow probe + overhead, not 10 sequential 6s).
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
-const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -3556,9 +3562,9 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
 /// polling GitHub for a job). A container with NEITHER is a real defect
 /// (the runner process died / never started). Bead jleechan-viff: prior code
 /// (`runner_worker_present`) only checked for Worker, which misclassified
-/// idle-but-healthy listeners as "not executing" and triggered false-positive
-/// `runner startup settling ceiling reached: 0/6 executing locally` CRITICAL
-/// during normal idle periods.
+/// idle-but-healthy listeners as "not ready" and triggered false-positive
+/// `runner startup settling ceiling reached: 0/6 ready locally (listeners
+/// or workers)` CRITICAL during normal idle periods.
 fn runner_present(output: &str) -> bool {
     output.lines().skip(1).any(|line| {
         matches!(
@@ -3568,46 +3574,38 @@ fn runner_present(output: &str) -> bool {
     })
 }
 
-/// Three-state diagnostic split of a managed container's runner activity.
+/// Per-probe outcome of a `docker top` Runner readiness probe.
 ///
-/// `Busy` = a `Runner.Worker` process is alive in the container (executing a
-/// GitHub Actions job right now). `ReadyIdle` = only `Runner.Listener` is
-/// alive (registered with GitHub, polling for work). `Unknown` = neither
-/// process is present (the runner has died or never started).
+/// `Ready` = `Runner.Worker` or `Runner.Listener` is alive in the container
+/// (Bead jleechan-viff: the listener is polling for work and the slot IS
+/// operational, so it counts as ready to take jobs alongside an actively
+/// executing Worker).
 ///
-/// This split is purely diagnostic — the daemon's settling/readiness decision
-/// continues to count ReadyIdle as "ready" (the listener is polling for work
-/// and the slot IS operational), while Busy is "actually executing a job
-/// now". Bead jleechan-viff: the prior readiness check ignored listeners
-/// and produced false-positive `settling ceiling reached` CRITICALs on idle
-/// healthy fleets. This enum re-establishes that split without regressing
-/// it. Bead jleechan-95jk / 2026-10-03 throughput doc: distinguish Listener
-/// vs Worker in diagnostics (without breaking idle readiness) is exactly
-/// this enum's purpose.
+/// `NotReady` = `docker top` succeeded but neither Worker nor Listener is
+/// running. The container is still alive; this is a genuine "runner process
+/// died" failure. Settling must NOT infer absence from this.
+///
+/// `Absent` = `docker top` returned `No such container` / `No such object`.
+/// The container is definitively gone — settling reconciles immediately
+/// rather than waiting 25s for a slot that will never come back. This is
+/// the bead jleechan-95jk root-cause fix for "keeping slot 3 because docker
+/// top says No such container despite snapshot omission".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunnerActivityState {
-    Busy,
-    ReadyIdle,
-    Unknown,
+pub enum ProbeOutcome {
+    Ready,
+    NotReady,
+    Absent,
 }
 
-fn runner_activity_state(output: &str) -> RunnerActivityState {
-    let mut has_worker = false;
-    let mut has_listener = false;
-    for line in output.lines().skip(1) {
-        match line.split_whitespace().nth(1) {
-            Some("Runner.Worker") => has_worker = true,
-            Some("Runner.Listener") => has_listener = true,
-            _ => {}
-        }
-    }
-    if has_worker {
-        RunnerActivityState::Busy
-    } else if has_listener {
-        RunnerActivityState::ReadyIdle
-    } else {
-        RunnerActivityState::Unknown
-    }
+/// One readiness-pass result: how many slots are locally ready to take jobs
+/// (Listener or Worker present) plus the names of slots whose container is
+/// definitively gone (`ProbeOutcome::Absent`). The settling loop uses the
+/// `absent` list to force immediate reconciliation instead of polling for
+/// 25s waiting for a container that will not return.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadinessSummary {
+    pub ready: u32,
+    pub absent: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -3637,23 +3635,23 @@ fn executing_runner_count_with_probe<N, P>(
     deadline: Instant,
     mut now: N,
     probe: P,
-) -> Result<u32>
+) -> Result<ReadinessSummary>
 where
     N: FnMut() -> Instant,
-    P: Fn(&ManagedContainer, Duration) -> Result<bool> + Sync,
+    P: Fn(&ManagedContainer, Duration) -> Result<ProbeOutcome> + Sync,
 {
     let owned = current_prefix_containers(containers, cfg);
     if owned.is_empty() {
-        return Ok(0);
+        return Ok(ReadinessSummary::default());
     }
     // Bounded parallelism: spawn one probe per container, capped by the
     // fleet contract (10 Linux + 6 Mac = 16 max — itself under the
     // `DockerChildReaper`'s `DOCKER_REAPER_ACTIVE_CAP` of 64). The shared
     // 30s readiness deadline (`LOCAL_READINESS_BUDGET`) means the worst-case
     // wall-clock cost of this whole readiness pass is bounded by
-    // `LOCAL_TOP_TIMEOUT` (3s) plus deadline overhead — sequential probes
+    // `LOCAL_TOP_TIMEOUT` (6s) plus deadline overhead — sequential probes
     // previously could spend up to 30s on a 10-container Linux host when
-    // every top call hit the 3s timeout (bead jleechan-95jk).
+    // every top call hit its per-probe timeout (bead jleechan-95jk).
     //
     // Spawn-then-break on first deadline expiry: each per-container `now()`
     // call yields the remaining wall-clock budget at dispatch time, and the
@@ -3665,7 +3663,7 @@ where
     // `readiness_probes_share_deadline_and_stop_after_it`).
     let probe_ref = &probe;
     let mut deadline_expired: Option<String> = None;
-    let probe_results: Vec<Result<bool>> = std::thread::scope(|scope| {
+    let probe_results: Vec<Result<ProbeOutcome>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(owned.len());
         for container in &owned {
             let timeout = match readiness_probe_timeout_until(deadline, now()) {
@@ -3680,7 +3678,7 @@ where
         handles
             .into_iter()
             .map(|handle| {
-                handle.join().unwrap_or_else(|panic| -> Result<bool> {
+                handle.join().unwrap_or_else(|panic| -> Result<ProbeOutcome> {
                     Err(anyhow::anyhow!(
                         "Runner.Worker readiness probe panicked: {:?}",
                         panic
@@ -3695,22 +3693,32 @@ where
         )));
     }
 
-    let mut executing = 0;
-    for result in probe_results {
+    let mut summary = ReadinessSummary::default();
+    for (container, result) in owned.iter().zip(probe_results.into_iter()) {
         match result {
-            Ok(true) => executing += 1,
-            Ok(false) => {}
+            Ok(ProbeOutcome::Ready) => summary.ready += 1,
+            // NotReady = container alive, runner process died. Settling
+            // will treat this as "not ready" via the `ready` count being
+            // short, but it is NOT an immediate-reconcile trigger — the
+            // container is still here and may self-heal on the next tick.
+            Ok(ProbeOutcome::NotReady) => {}
+            // Absent = docker top says "No such container". The container
+            // is gone; settling reconciles immediately instead of waiting
+            // 25s for a slot that will never come back (bead jleechan-95jk
+            // root-cause: "keeping slot 3 because docker top says No such
+            // container despite snapshot omission").
+            Ok(ProbeOutcome::Absent) => summary.absent.push(container.name.clone()),
             Err(err) => return Err(err),
         }
     }
-    Ok(executing)
+    Ok(summary)
 }
 
 fn executing_runner_count_from_containers(
     cfg: &Config,
     containers: &[ManagedContainer],
     deadline: Instant,
-) -> Result<u32> {
+) -> Result<ReadinessSummary> {
     #[cfg(test)]
     {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -3742,8 +3750,8 @@ fn executing_runner_count_from_containers(
                     Instant::now,
                     move |_container, _timeout| {
                         // Atomically: if `remaining > 0`, decrement and
-                        // return Ok(prev) where prev > 0; else return
-                        // Ok(false) without mutating the counter.
+                        // return Ok(Ready); else return Ok(NotReady)
+                        // without mutating the counter.
                         let present = remaining
                             .fetch_update(
                                 Ordering::SeqCst,
@@ -3752,7 +3760,11 @@ fn executing_runner_count_from_containers(
                             )
                             .map(|prev| prev > 0)
                             .unwrap_or(false);
-                        Ok(present)
+                        Ok(if present {
+                            ProbeOutcome::Ready
+                        } else {
+                            ProbeOutcome::NotReady
+                        })
                     },
                 )
             }
@@ -3782,31 +3794,38 @@ fn executing_runner_count_from_containers(
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 // Bead jleechan-95jk root-cause: a container that is GONE
                 // (docker top: "No such container") is not a probe failure
-                // — it is definitive evidence that the readiness pass does
-                // not include this slot. Returning Ok(false) keeps the rest
-                // of the readiness evidence (the other 9/10 slots) usable
-                // and lets the settling loop reconcile promptly without
-                // waiting out the 30s shared budget on a container that was
-                // never going to come back. Genuine failures (timeout,
-                // daemon error, transient I/O) still propagate so the
-                // settling loop reports incomplete evidence.
+                // — it is definitive evidence the container is no longer
+                // part of the readiness pass. Returning ProbeOutcome::Absent
+                // surfaces the slot name to the settling loop so it
+                // reconciles immediately instead of polling 25s for a
+                // container that will not come back. Genuine failures
+                // (timeout, daemon error, transient I/O) still propagate as
+                // `Err` so the settling loop reports incomplete evidence.
                 if docker_top_container_absent(&stderr) {
-                    return Ok(false);
+                    return Ok(ProbeOutcome::Absent);
                 }
                 bail!("docker top failed for {}: {}", container.name, stderr);
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
-            Ok(runner_present(&stdout))
+            Ok(if runner_present(&stdout) {
+                ProbeOutcome::Ready
+            } else {
+                ProbeOutcome::NotReady
+            })
         },
     )
 }
 
 /// Cheap local progress signal for a bounded post-refill settling episode.
-/// Normal spawn capacity remains managed-container count because idle healthy
-/// listeners have no Runner.Worker. This path talks only to Docker (`ps` +
-/// bounded `top`); it never lists or mutates GitHub runners, registrations, or
-/// workflow jobs.
-pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
+/// Returns a [`ReadinessSummary`] whose `ready` count is the locally-polled
+/// "ready to take jobs" view (Listener OR Worker per bead jleechan-viff) and
+/// whose `absent` list names slots whose container is definitively gone
+/// (docker top: "No such container"). The settling loop uses the absent
+/// list to force immediate reconciliation instead of waiting 25s for a
+/// slot that will never come back (bead jleechan-95jk root-cause). This
+/// path talks only to Docker (`ps` + bounded `top`); it never lists or
+/// mutates GitHub runners, registrations, or workflow jobs.
+pub fn local_executing_runner_count(cfg: &Config) -> Result<ReadinessSummary> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
     let containers = managed_containers_until_deadline(deadline)?;
     executing_runner_count_from_containers(cfg, &containers, deadline)
@@ -4703,7 +4722,14 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     let readiness_after =
         executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
     let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
-        Ok(alive_after) => (cfg.runner.count.saturating_sub(alive_after), None),
+        Ok(summary) => {
+            // Containers reported by `docker top` as "No such container" are
+            // listed in `docker ps` but actually gone. Treat them as part of
+            // the shortage so the next reconciliation cycle respawns them
+            // instead of polling 25s for them to come back (bead jleechan-95jk).
+            let alive_after = summary.ready + summary.absent.len() as u32;
+            (cfg.runner.count.saturating_sub(alive_after), None)
+        }
         Err(error) => {
             let detail = format!("{error:#}");
             eprintln!(
@@ -6294,8 +6320,8 @@ minimum_isolation = "container"
     /// jobs". The old `runner_worker_present` only checked Worker, which
     /// misclassified idle-but-healthy listeners as "not executing" and
     /// caused false-positive `runner startup settling ceiling reached: 0/6
-    /// executing locally` CRITICALs on idle healthy fleets. This test pins
-    /// the corrected semantics.
+    /// ready locally (listeners or workers)` CRITICALs on idle healthy
+    /// fleets. This test pins the corrected semantics.
     #[test]
     fn runner_present_accepts_listener_or_worker() {
         // Either Runner.Listener OR Runner.Worker → ready.
@@ -6314,44 +6340,14 @@ minimum_isolation = "container"
         ));
     }
 
-    /// Bead jleechan-95jk / 2026-10-03 throughput doc: distinguish Listener
-    /// vs Worker in diagnostics. `runner_activity_state` returns the precise
-    /// three-state split; `runner_present` (above) is the boolean "ready"
-    /// view that the readiness count continues to use.
-    #[test]
-    fn runner_activity_state_distinguishes_busy_vs_ready_idle() {
-        // Worker only → Busy (executing a job right now).
-        assert_eq!(
-            runner_activity_state("PID COMMAND\n202 Runner.Worker\n"),
-            RunnerActivityState::Busy
-        );
-        // Listener only → ReadyIdle (registered, polling for work).
-        assert_eq!(
-            runner_activity_state("PID COMMAND\n101 Runner.Listener\n"),
-            RunnerActivityState::ReadyIdle
-        );
-        // Both Worker and Listener → Busy wins (the worker is the live job).
-        assert_eq!(
-            runner_activity_state("PID COMMAND\n1 Runner.Listener\n2 Runner.Worker\n"),
-            RunnerActivityState::Busy
-        );
-        // Neither → Unknown (broken container, runner process died).
-        assert_eq!(
-            runner_activity_state("PID COMMAND\n101 NotRunner.Workerish\n"),
-            RunnerActivityState::Unknown
-        );
-        assert_eq!(
-            runner_activity_state("PID COMMAND\n"),
-            RunnerActivityState::Unknown
-        );
-    }
-
     /// Bead jleechan-95jk root-cause: a docker top that returns "No such
     /// container" is a definitive signal that the container is GONE — not a
-    /// probe failure. The readiness probe converts it to Ok(false) (so the
-    /// readiness pass is not invalidated by one absent slot) and the
-    /// release_stale_slots path converts it to LocalRunnerActivity::Absent
-    /// (so the slot can be reclaimed). This test pins the stderr classifier
+    /// probe failure. The readiness probe converts it to
+    /// `ProbeOutcome::Absent` (so the readiness pass keeps the other slots'
+    /// evidence usable and the absent slot's name reaches the settling loop
+    /// for immediate reconciliation) and the `release_stale_slots` path
+    /// converts it to `LocalRunnerActivity::Absent` (so the slot can be
+    /// reclaimed). This test pins the stderr classifier
     /// that both paths share.
     #[test]
     fn docker_top_container_absent_classifies_only_no_such_container() {
@@ -6376,10 +6372,19 @@ minimum_isolation = "container"
     }
 
     #[test]
-    fn readiness_probe_timeout_caps_at_three_seconds_and_preserves_sub_three_seconds() {
+    fn readiness_probe_timeout_caps_at_six_seconds_and_preserves_sub_six_seconds() {
+        // Per-probe cap is 6s (was 3s). The 2026-10-03 throughput doc
+        // measured 3.2-4.5s `docker top` latency on Mac under load, so the
+        // previous 3s cap killed in-flight probes that were still going to
+        // succeed and reported false "not ready". Parallel fan-out keeps
+        // the shared 30s readiness budget bounded.
         assert_eq!(
             readiness_probe_timeout(Duration::from_secs(30)),
-            Duration::from_secs(3)
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
         );
         assert_eq!(
             readiness_probe_timeout(Duration::from_secs(2)),
@@ -6426,7 +6431,7 @@ minimum_isolation = "container"
                     .lock()
                     .unwrap()
                     .push((container.name.clone(), timeout));
-                Ok(true)
+                Ok(ProbeOutcome::Ready)
             },
         );
 
@@ -6442,8 +6447,8 @@ minimum_isolation = "container"
         assert_eq!(
             launched,
             vec![
-                ("ez-org-runner-1".to_string(), Duration::from_secs(3)),
-                ("ez-org-runner-2".to_string(), Duration::from_secs(3)),
+                ("ez-org-runner-1".to_string(), Duration::from_secs(6)),
+                ("ez-org-runner-2".to_string(), Duration::from_secs(6)),
                 ("ez-org-runner-3".to_string(), Duration::from_secs(2)),
             ],
             "parallel top probes must cap normally, shorten at the tail, and not launch after expiry"
@@ -6458,12 +6463,16 @@ minimum_isolation = "container"
     }
 
     /// Bead jleechan-95jk: the headline win of parallel readiness probes.
-    /// Six simulated 1s-each probes should fit in roughly 1s wall-clock,
-    /// not 6s. Sequential probes previously could spend up to 30s on a
-    /// 10-container Linux host when every top call hit the 3s timeout.
-    /// This test runs real sleeping probes (no docker dependency) inside
-    /// `executing_runner_count_with_probe`'s parallel-spawn machinery and
-    /// asserts the total is bounded by the slowest probe plus overhead.
+    /// Six simulated 50ms probes should fit in roughly 50ms wall-clock,
+    /// not 300ms. Sequential probes previously could spend up to 30s on a
+    /// 10-container Linux host when every top call hit its per-probe
+    /// timeout (now 6s — the 2026-10-03 throughput doc measured 3.2-4.5s
+    /// `docker top` latency on Mac under load, so the per-probe cap was
+    /// raised from 3s to 6s while keeping the shared 30s readiness budget
+    /// bounded by parallel fan-out). This test runs real sleeping probes
+    /// (no docker dependency) inside `executing_runner_count_with_probe`'s
+    /// parallel-spawn machinery and asserts the total is bounded by the
+    /// slowest probe plus overhead.
     #[test]
     fn parallel_readiness_probes_share_wall_clock_within_max_probe() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -6488,12 +6497,12 @@ minimum_isolation = "container"
                 // probe timeout itself.
                 std::thread::sleep(probe_cost.min(timeout));
                 probes_inside.fetch_add(1, Ordering::SeqCst);
-                Ok(true)
+                Ok(ProbeOutcome::Ready)
             },
         );
         let elapsed = start.elapsed();
 
-        assert_eq!(result.unwrap(), 6, "all six probes should return ready");
+        assert_eq!(result.unwrap().ready, 6, "all six probes should return ready");
         assert_eq!(
             probes_done.load(Ordering::SeqCst),
             6,
@@ -6543,7 +6552,11 @@ minimum_isolation = "container"
             || clock.next().unwrap(),
             move |_container, timeout| {
                 launches_inside.fetch_add(1, Ordering::SeqCst);
-                Ok(timeout > Duration::ZERO)
+                Ok(if timeout > Duration::ZERO {
+                    ProbeOutcome::Ready
+                } else {
+                    ProbeOutcome::NotReady
+                })
             },
         );
 
@@ -6559,6 +6572,202 @@ minimum_isolation = "container"
             launches.load(Ordering::SeqCst),
             2,
             "only the first two probes must have spawned"
+        );
+    }
+
+    /// Bead jleechan-95jk round-2 review feedback: the per-probe timeout was
+    /// raised from 3s to 6s after the 2026-10-03 throughput doc measured
+    /// 3.2-4.5s `docker top` latency on Mac under load. A 5s probe would
+    /// have been killed at the old 3s cap; under 6s it must complete. This
+    /// pins the "sub-cap but past-old-cap" success path so a future tweak
+    /// to `LOCAL_TOP_TIMEOUT` cannot silently regress Mac readiness.
+    #[test]
+    fn parallel_readiness_probes_complete_between_three_and_six_seconds() {
+        let cfg = cfg_with(3, "ez-org-runner");
+        let containers: Vec<_> = (1..=3)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        // 30s deadline leaves plenty of room; each probe sleeps 5s — past
+        // the old 3s cap, under the new 6s cap.
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, _timeout| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(ProbeOutcome::Ready)
+            },
+        );
+
+        let elapsed = start.elapsed();
+        let summary = result.expect("5s probes must complete under the 6s cap");
+        assert_eq!(summary.ready, 3);
+        assert!(summary.absent.is_empty());
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "5s probes must actually sleep, not short-circuit (elapsed={elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "parallel 5s probes must finish well under the per-probe cap (elapsed={elapsed:?})"
+        );
+    }
+
+    /// Bead jleechan-95jk round-2 review feedback: a probe that overruns the
+    /// per-probe cap (production: `run_docker_with_timeout_at_deadline` kills
+    /// the docker process at the cap; the probe returns `Err`) must surface
+    /// as `Err` from the orchestrator so the settling loop treats it as
+    /// incomplete evidence, NOT as `Absent`. This pins the "Unknown safety"
+    /// half of the bead directive: do not blindly treat all errors as
+    /// absence. The probe here respects its `timeout` argument the way the
+    /// production probe does — distinct from
+    /// `parallel_readiness_probes_pass_six_second_timeout_argument` above
+    /// which pins the cap value itself.
+    #[test]
+    fn parallel_readiness_probe_overrun_propagates_as_err_not_absent() {
+        let cfg = cfg_with(2, "ez-org-runner");
+        let containers: Vec<_> = (1..=2)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, timeout| {
+                // Sleep past the timeout — production docker probes are
+                // killed at the cap by `run_docker_with_timeout_at_deadline`.
+                std::thread::sleep(timeout + Duration::from_secs(1));
+                Err(anyhow::anyhow!("docker top timeout"))
+            },
+        );
+
+        let elapsed = start.elapsed();
+        let err = result.expect_err("an overrun probe must surface as Err, not Absent");
+        assert!(err.to_string().contains("docker top timeout"));
+        // Each probe gets a 6s cap, then sleeps 7s. Bounded.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "a probe overrun must stay within the shared budget (elapsed={elapsed:?})"
+        );
+    }
+
+    /// Companion to `parallel_readiness_probes_expire_at_six_second_cap`:
+    /// pin the per-probe timeout argument is exactly 6s (the raised cap),
+    /// not 3s (the old cap). This is the headline review-feedback fix.
+    #[test]
+    fn parallel_readiness_probes_pass_six_second_timeout_argument() {
+        use std::sync::Mutex;
+        let cfg = cfg_with(1, "ez-org-runner");
+        let containers: Vec<_> = (1..=1)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let captured: std::sync::Arc<Mutex<Option<Duration>>> =
+            std::sync::Arc::new(Mutex::new(None));
+        let captured_inside = captured.clone();
+
+        let _ = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, timeout| {
+                *captured_inside.lock().unwrap() = Some(timeout);
+                Ok(ProbeOutcome::Ready)
+            },
+        );
+
+        let observed = captured.lock().unwrap().expect("probe captured a timeout");
+        assert_eq!(
+            observed,
+            Duration::from_secs(6),
+            "per-probe timeout cap must be 6s (raised from 3s for 3.2-4.5s measured probes)"
+        );
+    }
+
+    /// Bead jleechan-95jk root-cause: a slot whose container is GONE
+    /// (docker top: "No such container") must reach the settling loop as an
+    /// `Absent` outcome with the container's name attached, so the loop
+    /// reconciles immediately instead of waiting 25s for a slot that will
+    /// never come back. This pins the parallel orchestration's
+    /// `ProbeOutcome::Absent` → `ReadinessSummary.absent` plumbing.
+    #[test]
+    fn readiness_summary_reports_absent_container_names() {
+        let cfg = cfg_with(4, "ez-org-runner");
+        let containers: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |container, _timeout| {
+                // Slots 2 and 4 are absent (gone); slots 1 and 3 are ready.
+                if container.name.ends_with("2") || container.name.ends_with("4") {
+                    Ok(ProbeOutcome::Absent)
+                } else {
+                    Ok(ProbeOutcome::Ready)
+                }
+            },
+        );
+
+        let summary = result.expect("ready + absent both succeed");
+        assert_eq!(summary.ready, 2, "slots 1 and 3 should be ready");
+        let mut absent = summary.absent.clone();
+        absent.sort();
+        assert_eq!(
+            absent,
+            vec![
+                "ez-org-runner-2".to_string(),
+                "ez-org-runner-4".to_string(),
+            ],
+            "absent slots must surface their container names to the settling loop"
+        );
+    }
+
+    /// Companion to the test above: `ProbeOutcome::NotReady` is the
+    /// genuine broken-container case and is NOT reported as absent. The
+    /// settling loop should NOT trigger immediate reconcile from a
+    /// NotReady probe — the container is still alive and may self-heal.
+    #[test]
+    fn readiness_summary_treats_not_ready_distinct_from_absent() {
+        let cfg = cfg_with(3, "ez-org-runner");
+        let containers: Vec<_> = (1..=3)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |container, _timeout| {
+                if container.name.ends_with("2") {
+                    // Slot 2: container alive, no Runner process (genuine
+                    // "runner died" failure).
+                    Ok(ProbeOutcome::NotReady)
+                } else {
+                    Ok(ProbeOutcome::Ready)
+                }
+            },
+        );
+
+        let summary = result.expect("ready + not-ready both succeed");
+        assert_eq!(summary.ready, 2);
+        assert!(
+            summary.absent.is_empty(),
+            "NotReady must NOT be conflated with Absent (slot 2 is alive)"
         );
     }
 
@@ -6676,7 +6885,7 @@ minimum_isolation = "container"
             "no readiness proof means no reset"
         );
 
-        let executing = local_executing_runner_count(&cfg).unwrap();
+        let executing = local_executing_runner_count(&cfg).unwrap().ready;
         let recovered =
             settling
                 .as_mut()
