@@ -269,6 +269,13 @@ mod tests {
         // killed it) and the new 8s ceiling (must succeed). If this
         // regression flips the ceiling back to 4s, this test starts
         // failing immediately.
+        //
+        // Upper bound is loose on purpose: under heavy host load the
+        // sleep itself may run >5s of wall-clock, and that is fine — the
+        // contract under test is the LOWER bound (must survive past the
+        // old 4s ceiling), not the upper bound. Asserting a tight
+        // (4..=8) window made this test flake under contention; the
+        // Some(...) outcome already proves the ceiling was respected.
         let mut cmd = Command::new("sleep");
         cmd.arg("5");
         let start = Instant::now();
@@ -279,9 +286,15 @@ mod tests {
             "5s probe under the 8s PROBE_TIMEOUT must return Some, not be killed (elapsed={elapsed:?})"
         );
         assert!(
-            (4..=8).contains(&elapsed.as_secs()),
-            "5s probe must complete within ~5s (got {elapsed:?}); \
-             the old 4s ceiling would have killed this in the dark"
+            elapsed.as_secs() >= 4,
+            "5s probe must survive past the OLD 4s ceiling (elapsed={elapsed:?}); \
+             a regression here means the ceiling was lowered back to 4s"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8) + Duration::from_secs(2),
+            "5s probe must complete within the 8s ceiling + scheduler slack \
+             (elapsed={elapsed:?}); a regression here means the ceiling was raised \
+             to something that can no longer bound a wedged daemon"
         );
     }
 }

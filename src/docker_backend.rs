@@ -3459,24 +3459,34 @@ pub fn preview_memory_budget(cfg: &Config) -> MemoryBudgetPreview {
     }
 }
 
-/// Start one ephemeral JIT runner container in a slot the caller has already
-/// reserved (e.g. via `next_slot_excluding`), instead of letting this
-/// function pick the lowest free slot itself. Used by `start_missing_runners`
-/// so a failed slot can be excluded from the next pick within the same batch.
-/// Returns (container_id, runner_name).
+/// Typed admission-preflight error. Carries ANY pre-mutation failure that
+/// must refuse the entire refill without charging any slot's failure
+/// ledger and without triggering per-slot circuits.
+///
+/// Originally named `ControlPlaneStartError` because the only thing that
+/// wrapped it was `generate_jitconfig` (the GitHub JIT call). After
+/// 2026-10-03 the cpu_burst preflight in `effective_limits` was added
+/// upstream of generate_jitconfig — an unsupported burst would otherwise
+/// fall through the generic Err path, hit `FailureLadder::record_failure`,
+/// and open per-slot circuits on every start_one, which is a misclassification
+/// (the slot itself is fine; the whole-fleet config is). Renamed +
+/// broadened so preflight failures (JIT, cpu_burst, future preflight checks)
+/// all share one typed bucket the `start_missing_runners_with_starter`
+/// loop recognizes via `downcast_ref` and converts to
+/// `admission_paused_reason` instead of slot charge.
 #[derive(Debug)]
-struct ControlPlaneStartError(String);
+struct AdmissionPreflightError(String);
 
-impl std::fmt::Display for ControlPlaneStartError {
+impl std::fmt::Display for AdmissionPreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::error::Error for ControlPlaneStartError {}
+impl std::error::Error for AdmissionPreflightError {}
 
-fn control_plane_start_error(error: anyhow::Error) -> anyhow::Error {
-    anyhow::Error::new(ControlPlaneStartError(format!("{error:#}")))
+fn admission_preflight_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(AdmissionPreflightError(format!("{error:#}")))
 }
 
 fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(String, String)> {
@@ -3494,7 +3504,7 @@ fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(Strin
 
     start_one_with_generate_at_slot(cfg, backend, slot, |github, name, labels, owned_ids| {
         github::generate_jitconfig(github, name, labels, owned_ids)
-            .map_err(control_plane_start_error)
+            .map_err(admission_preflight_error)
     })
 }
 
@@ -3537,10 +3547,17 @@ fn start_one_with_generate_at_slot(
     // cleanup below is a docker invocation, so an unsupported burst
     // must refuse before we touch any container or call generate_jitconfig.
     // effective_limits returns Err when cpu_burst=true but daemon is not
-    // VM-contained OR daemon_capacity() returned no finite positive ncpu;
-    // we map_err to preserve the human-readable message up to start_one's
-    // caller (start_missing_runners, ensure_count_outcome, the journal).
-    let (cpus, memory_mb) = effective_limits(cfg).map_err(anyhow::Error::msg)?;
+    // VM-contained OR daemon_capacity() returned no finite positive ncpu.
+    // Map through `admission_preflight_error` so the typed
+    // `AdmissionPreflightError` bucket covers BOTH JIT and effective_limits
+    // preflight; `start_missing_runners_with_starter` recognizes it via
+    // `downcast_ref` and converts it to `admission_paused_reason` instead
+    // of charging the slot's failure ladder (a preflight refusal is a
+    // whole-fleet config error, not a per-slot defect — opening circuits
+    // here would misclassify every slot as broken).
+    let (cpus, memory_mb) = effective_limits(cfg)
+        .map_err(anyhow::Error::msg)
+        .map_err(admission_preflight_error)?;
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
@@ -4676,10 +4693,10 @@ fn start_missing_runners_with_starter(
             }
             Err(e) => {
                 eprintln!("warning: failed to start runner in slot {slot}: {e:#}");
-                if e.downcast_ref::<ControlPlaneStartError>().is_some() {
+                if e.downcast_ref::<AdmissionPreflightError>().is_some() {
                     start_failures += 1;
                     admission_paused_reason = Some(format!(
-                        "GitHub JIT/control-plane start failed; pausing this refill without penalizing slot {slot}: {e:#}"
+                        "admission preflight refused the entire refill without penalizing slot {slot}: {e:#}"
                     ));
                     break;
                 }
@@ -6550,7 +6567,7 @@ minimum_isolation = "container"
                 3,
                 |_cfg, _backend, slot| {
                     release_slot(slot)?;
-                    Err(control_plane_start_error(anyhow::anyhow!(
+                    Err(admission_preflight_error(anyhow::anyhow!(
                         "simulated GitHub secondary rate limit"
                     )))
                 },
@@ -7771,6 +7788,131 @@ minimum_isolation = "container"
 
         // Cleanup so a later test sees the real daemon_capacity path.
         *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
+    }
+
+    /// 2026-10-03 rootclassification: an effective_limits preflight
+    /// refusal (cpu_burst unsupported) must pause the whole refill
+    /// WITHOUT opening per-slot circuits. The loop's downcast on
+    /// `AdmissionPreflightError` is the typed hand-off; a generic Err
+    /// would hit `FailureLadder::record_failure` and 3 slots would open
+    /// 15-minute circuits. Pin:
+    ///   - admission_paused_reason is set
+    ///   - slot failure ledger is unchanged (no per-slot failure timestamps
+    ///     or open_until_epoch_secs)
+    ///   - a follow-up call with a working starter still succeeds (the
+    ///     paused refill did not poison the ledger)
+    #[test]
+    fn preflight_burst_refusal_does_not_charge_slot_ladder() {
+        let env = TestEnv::new("preflight_burst_no_ladder_charge");
+        // TestEnv's TEST_SLOT_PATH redirect places the slot assignments
+        // file at env.path; failure_ladder_path_for falls back to that
+        // sibling when cfg.state_dir is None. Load the ledger from the
+        // canonical sibling.
+        let ladder_path = env.path.with_file_name("failure_ladder.toml");
+
+        let mut cfg = cfg_with(3, "ez-org-runner");
+        cfg.limits.cpu_burst = true;
+        // Do NOT set cfg.state_dir — TestEnv already redirects slot
+        // assignment + failure ladder paths via TEST_SLOT_PATH, and
+        // `failure_ladder_path_for` falls back to the TEST_SLOT_PATH
+        // sibling when cfg.state_dir is None. Setting cfg.state_dir to
+        // env.path (which is the slot_assignments.toml FILE path, not a
+        // directory) was the bug that surfaced as 'Is a directory (os
+        // error 21)' and poisoned the shared TEST_LOCK via Mutex
+        // poisoning — cascading into unrelated reaper tests (observed
+        // 2026-10-03 Linux mirror).
+
+        // Pin daemon_capacity to None so effective_limits runs the
+        // unsupported-capacity refusal branch (deterministic on any host).
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = Some(None);
+
+        // Starter that always returns an AdmissionPreflightError
+        // (the same Err the effective_limits path now produces).
+        let preflight_starter =
+            |_cfg: &Config, _backend: Backend, _slot: u32| -> Result<(String, String)> {
+                Err(admission_preflight_error(anyhow::anyhow!(
+                    "limits.cpu_burst=true is unsupported: synthetic preflight refusal"
+                )))
+            };
+
+        let outcome =
+            start_missing_runners_with_starter(&cfg, Backend::Docker, 3, preflight_starter)
+                .expect("preflight-refused refill must surface as outcome, not panic");
+
+        assert!(
+            outcome.admission_paused_reason.is_some(),
+            "preflight refusal must set admission_paused_reason (got None); \
+             otherwise the serve loop would treat this as a recoverable miss"
+        );
+        let reason = outcome.admission_paused_reason.as_deref().unwrap();
+        assert!(
+            reason.contains("preflight"),
+            "admission_paused_reason must mention 'preflight' so operators see the typed \
+             classification (got: {reason:?})"
+        );
+
+        // The whole batch must have broken on the FIRST preflight refusal
+        // (no slot charge ever recorded). Check the ledger directly.
+        let ladder_after = FailureLadder::load(&ladder_path)
+            .expect("failure ladder must remain loadable after a preflight refusal");
+        assert_eq!(
+            ladder_after.open_slot_count(0),
+            0,
+            "no slot circuit may open from a preflight refusal (open_slot_count={})",
+            ladder_after.open_slot_count(0)
+        );
+        assert!(
+            !ladder_after.fleet_admission_is_paused(0),
+            "fleet admission pause must NOT fire from a single preflight refusal"
+        );
+
+        // Cleanup the test seam.
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
+    }
+
+    /// Counterpart regression: a genuine docker-start failure (NOT
+    /// preflight-typed) MUST still charge the per-slot failure ledger.
+    /// This pins the typed bucket boundary so a future refactor that
+    /// over-broadens the AdmissionPreflightError doesn't accidentally
+    /// silence real start failures.
+    #[test]
+    fn genuine_docker_start_failure_still_charges_slot_ladder() {
+        let env = TestEnv::new("genuine_docker_charges_ladder");
+        let ladder_path = env.path.with_file_name("failure_ladder.toml");
+        let cfg = cfg_with(1, "ez-org-runner");
+
+        // Mirror `repeated_local_start_failures_open_only_the_slot_circuit`:
+        // each starter invocation `release_slot` first so the failed slot is
+        // available for the next call's `next_slot_excluding` (otherwise the
+        // loop bails at the slot allocator on call 2 instead of attempting
+        // a fresh failure). Bail with a generic (non-preflight) error so
+        // the typed bucket boundary is exercised: any future refactor that
+        // over-broadens AdmissionPreflightError would route this through
+        // the admission_paused path and silently keep the slot ledger
+        // empty.
+        for _ in 0..3 {
+            let outcome = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                1,
+                |_cfg, _backend, slot| -> Result<(String, String)> {
+                    release_slot(slot)?;
+                    bail!("simulated local container start failure")
+                },
+            )
+            .expect("synthetic start failures must surface as outcome, not panic");
+            assert_eq!(outcome.start_failures, 1);
+        }
+
+        let ladder_after =
+            FailureLadder::load(&ladder_path).expect("failure ladder must remain loadable");
+        assert!(
+            ladder_after.open_slot_count(0) >= 1,
+            "three real docker-start failures MUST open at least one slot circuit \
+             (open_slot_count={}); otherwise the typed bucket leaked into the \
+             genuine-failure path and silenced real defects",
+            ladder_after.open_slot_count(0)
+        );
     }
 
     /// Fake `docker` script that captures its full argv to `capture_path`

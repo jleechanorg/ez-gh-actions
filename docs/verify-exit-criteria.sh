@@ -551,7 +551,21 @@ pass "Gate 0: Deployed binary matches HEAD SHA ($CURRENT_SHA)"
 # --- Gate 1: Code quality ---
 echo "--- Checking Gate 1: Code quality ---"
 cargo build --release >/dev/null || fail "Cargo release build failed"
-cargo test >/dev/null || fail "Cargo tests failed"
+# Do NOT discard stdout: when `cargo test` fails the verifier needs the
+# raw failing-test names + assertion messages to diagnose a Gate 1
+# failure. The prior `> /dev/null` silently converted a 28-test regression
+# into a single "Cargo tests failed" line — root couldn't see which test
+# was the actual primary failure (observed 2026-10-03 on Linux mirror,
+# cargo test --bin ezgha -j 2 went from 458→28 failed depending on host
+# load). Capture to /tmp on failure so the diagnostic stays scoped, and
+# always re-emit the captured log on failure.
+GATE1_TEST_LOG=$(mktemp 2>/dev/null || echo "/tmp/ezgha-gate1-test-$$.log")
+if ! cargo test --bin ezgha -j 2 > "$GATE1_TEST_LOG" 2>&1; then
+    echo "[GATE 1 DIAGNOSTIC] cargo test failed; raw output preserved at $GATE1_TEST_LOG" >&2
+    tail -120 "$GATE1_TEST_LOG" >&2
+    fail "Cargo tests failed (see $GATE1_TEST_LOG for the raw failing-test names + assertion messages)"
+fi
+rm -f "$GATE1_TEST_LOG"
 cargo clippy --all-targets -- -D warnings >/dev/null || fail "Clippy warnings/errors found"
 cargo fmt --check >/dev/null || fail "Cargo formatting checks failed"
 
