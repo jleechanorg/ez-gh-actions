@@ -180,7 +180,10 @@ RESPAWN_EVIDENCE_WINDOW_MIN="${RESPAWN_EVIDENCE_WINDOW_MIN:-3}"
 # a line ending in "ez-runner-c-10"), else 0.
 journal_has_respawn_evidence() {
   local name="$1"
-  if grep -q "respawned ephemeral runner ${name}\$"; then
+  # Literal (not regex) match anchored at end-of-line: the name may contain
+  # regex metacharacters (bead ez-gh-actions-il81).
+  if awk -v want="respawned ephemeral runner ${name}" \
+       '{ n = length(want); if (length($0) >= n && substr($0, length($0) - n + 1) == want) f = 1 } END { exit !f }'; then
     echo 1
   else
     echo 0
