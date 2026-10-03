@@ -2904,7 +2904,9 @@ fn admission_pressure_source(cfg: &Config) -> PressureSource {
 
 static LAST_PRESSURE_SOURCE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Log the resolved source once at startup and whenever it changes.
+/// Log the resolved source once at startup and whenever it changes. A change
+/// also clears the hysteresis window so samples from different sources are
+/// never compared.
 fn log_pressure_source_change(source: &PressureSource) {
     let desc = source.describe();
     let mut last = LAST_PRESSURE_SOURCE
@@ -2913,6 +2915,7 @@ fn log_pressure_source_change(source: &PressureSource) {
     if last.as_deref() != Some(desc.as_str()) {
         eprintln!("{desc}");
         *last = Some(desc);
+        *PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner()) = [None; 5];
     }
 }
 
@@ -9117,6 +9120,28 @@ minimum_isolation = "container"
             *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
             cfg.limits.cgroup_parent = None;
             assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+        }
+
+        #[test]
+        fn i_source_change_resets_hysteresis_window() {
+            let _env = TestEnv::new("u3c5_i_switch");
+            let rising = [Some(10.0), Some(20.0), Some(30.0), Some(40.0), None];
+            *LAST_PRESSURE_SOURCE.lock().unwrap() = Some(PressureSource::fallback().describe());
+            *PRESSURE_WINDOW.lock().unwrap() = rising;
+            let runner = PressureSource::runner_cgroup(Path::new("/sys/fs/cgroup/actions.slice"));
+
+            log_pressure_source_change(&runner);
+            assert_eq!(
+                *PRESSURE_WINDOW.lock().unwrap(),
+                [None; 5],
+                "fallback samples must not feed runner-cgroup hysteresis"
+            );
+
+            // Same source again: the window is left alone.
+            *PRESSURE_WINDOW.lock().unwrap() = rising;
+            log_pressure_source_change(&runner);
+            assert_eq!(*PRESSURE_WINDOW.lock().unwrap(), rising);
+            *PRESSURE_WINDOW.lock().unwrap() = [None; 5];
         }
 
         #[cfg(target_os = "linux")]
