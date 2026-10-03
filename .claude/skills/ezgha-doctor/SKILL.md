@@ -25,7 +25,7 @@ next, so never stop at the first fix. Check every layer, in order (memory:
    have fought each other (dual-Lima convergence: bead ez-gh-actions-apye).
    A stale-state start failure ("vz driver is running but host agent is not"
    / "already running, ignoring") needs a force-stop + restart cycle —
-   deploy-owner only (`.claude/hooks/vm-lifecycle-guard.sh` blocks it otherwise).
+   deploy-owner only (CLAUDE.md "VM/backend lifecycle is deploy-owner-only").
 2. **Daemon socket wiring**: `/var/run/docker.sock` may be a dead symlink.
    Check the plist: `plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist`
    → `EnvironmentVariables.DOCKER_HOST` must point at the RUNNING VM's socket
