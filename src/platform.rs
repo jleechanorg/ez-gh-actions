@@ -8,7 +8,17 @@ use std::time::Duration;
 /// docker daemon (the common failure mode this tool exists to contain) would
 /// otherwise hang `detect()` — and therefore every ezgha command — forever.
 /// On expiry we kill the probe and treat the capability as absent.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+///
+/// Raised 2026-10-03 from 4s → 8s after a real Colima VM measured
+/// `docker version` 4.99s and `docker info KernelVersion` 5.15s while
+/// within its own deadline (Mac, docker daemon reattaching after a
+/// transient). A 4s ceiling misclassified those legitimate answers as
+/// "unsupported VM" and tripped the cpu_burst Err path in
+/// `effective_limits`, opening per-slot start circuits while the daemon
+/// itself was healthy. 8s leaves room for the observed 5.15s case while
+/// still bounding a truly wedged daemon — the `unknown => reject`
+/// semantics in `effective_limits` are preserved.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Build a Docker command for the endpoint selected during installation.
 /// Services persist that endpoint in `DOCKER_HOST_OVERRIDE`; interactive
@@ -145,6 +155,17 @@ fn daemon_in_vm() -> bool {
     }
 }
 
+/// Public, narrow VM-containment probe — daemon kernel alone on macOS, kernel
+/// diff on Linux. This is the minimal capability `effective_limits` needs
+/// to honor `cpu_burst=true` without fanning out to the full
+/// `detect()` (which also runs kvm/tart/virsh/sysbox and adds latency on
+/// every `start_one`). Added 2026-10-03 so a healthy-but-slow daemon
+/// (observed 5.15s on a Colima cold-reattach) does not trip the burst
+/// rejection path.
+pub fn daemon_in_vm_only() -> bool {
+    daemon_in_vm()
+}
+
 /// Existence alone is not enough: the user must be in the kvm group (or have
 /// an ACL) for the device to be usable, so try to actually open it.
 fn kvm_usable() -> bool {
@@ -237,6 +258,30 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "timeout should fire near the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn capture_succeeds_for_5s_probe_under_8s_ceiling() {
+        // 2026-10-03: real Colima VM measured `docker info
+        // KernelVersion` at 5.15s — must NOT be killed by the platform
+        // probe ceiling. 5s sits between the old 4s ceiling (would have
+        // killed it) and the new 8s ceiling (must succeed). If this
+        // regression flips the ceiling back to 4s, this test starts
+        // failing immediately.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let start = Instant::now();
+        let result = capture_with_timeout(cmd, PROBE_TIMEOUT);
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_some(),
+            "5s probe under the 8s PROBE_TIMEOUT must return Some, not be killed (elapsed={elapsed:?})"
+        );
+        assert!(
+            (4..=8).contains(&elapsed.as_secs()),
+            "5s probe must complete within ~5s (got {elapsed:?}); \
+             the old 4s ceiling would have killed this in the dark"
         );
     }
 }

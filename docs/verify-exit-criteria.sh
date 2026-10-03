@@ -275,6 +275,27 @@ cgroup_has_effective_memory_ceiling() {
     return 1
 }
 
+# Pure CPU clamp arithmetic, factored out of Gate 3 so focused shell tests
+# (tests/verify_exit_gate3_cpu_burst_test.sh) can exercise the four cases
+# without spinning the live fleet:
+#   - default (cpu_burst=false) -> equal-share max(daemon_ncpu / count, 0.5)
+#   - burst (cpu_burst=true)    -> min(cfg.cpus, daemon_ncpu)
+# Both paths return a 2-decimal-rounded value to mirror
+# src/docker_backend.rs's format!("{:.2}", cpus) before NanoCpus conversion.
+# Inputs: $1=cpu_burst ("true"/"false"), $2=cfg.cpus (float),
+# $3=daemon_ncpu (uint>0, caller already checked), $4=count (uint>0).
+# Returns the rounded expected effective cpus on stdout.
+expected_effective_cpus() {
+    local burst="$1" cfg="$2" ncpu="$3" count="$4"
+    if [ "$burst" = "true" ]; then
+        awk -v cfg="$cfg" -v ncpu="$ncpu" 'BEGIN { v = (cfg > ncpu) ? ncpu : cfg; printf "%.2f", v }'
+    else
+        local share
+        share=$(awk -v ncpu="$ncpu" -v count="$count" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
+        awk -v cfg="$cfg" -v share="$share" 'BEGIN { v = (cfg > share) ? share : cfg; printf "%.2f", v }'
+    fi
+}
+
 daemon_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
     local daemon_kernel host_kernel
@@ -627,6 +648,15 @@ LIMIT_MEMORY_MB=$(toml_get_limits memory_mb 0)
 LIMIT_CPUS=$(toml_get_limits cpus 0.50)
 LIMIT_PIDS=$(toml_get_limits pids 1024)
 MIN_FREE_DISK_GB=$(toml_get_limits min_free_disk_gb 10)
+# 2026-10-03: limits.cpu_burst opt-in changes the Gate 3 CPU clamp
+# semantics. Default false keeps the historical equal-share arithmetic
+# (daemon_ncpu / count, .5 floor); true requires a verified VM daemon +
+# finite positive daemon_ncpu and clamps to min(cfg.cpus, daemon_ncpu),
+# 2-decimal-rounded to mirror src/docker_backend.rs's
+# format!("{:.2}", cpus) that converts to NanoCpus. Reading via the
+# existing toml_get_limits helper (not inventing separate semantics)
+# keeps parser behavior aligned with the rest of Gate 3.
+LIMIT_CPU_BURST=$(toml_get_limits cpu_burst false)
 VM_TOTAL_MB=$(toml_get_runner vm_total_mb 0)
 GUEST_RESERVE_MB=$(toml_get_runner guest_reserve_mb 4096)
 RUNNER_FLOOR_MB=$(toml_get_runner runner_floor_mb 3072)
@@ -776,25 +806,30 @@ for slot in $(seq 1 "$COUNT"); do
         fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES below the absolute floor $RUNNER_FLOOR_BYTES bytes (runner_floor_mb=$RUNNER_FLOOR_MB)"
     fi
     # Compute EXACT effective CPU clamp, mirroring src/docker_backend.rs
-    # effective_limits_with_capacity(): the daemon caps per-slot cpus at
-    # max(daemon_ncpu / count, 0.5) whenever that share is BELOW the
-    # configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU VM with 6
-    # runners clamps to 1.667 per slot -- observed live, bead jleechan-ehsi).
-    # Checking the raw configured value here would permanently fail Gate 3
-    # on any host where configured cpus*count exceeds the VM's core count,
-    # even though the daemon's clamp is the intended, safe behavior (same
-    # pattern as the memory clamp above).
+    # effective_limits_with_capacity(). Default (cpu_burst=false) caps
+    # per-slot cpus at max(daemon_ncpu / count, 0.5) whenever that share
+    # is BELOW the configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU
+    # VM with 6 runners clamps to 1.667 per slot -- observed live, bead
+    # jleechan-ehsi). Opt-in (cpu_burst=true, 2026-10-03) caps at
+    # min(cfg.cpus, daemon_ncpu) and requires a verified VM daemon plus
+    # finite positive daemon_ncpu; without that evidence, the burst path
+    # would have refused at serve startup so any value here would also
+    # pass. Memory and PIDs are unchanged from prior commits; only the
+    # CPU arithmetic branches on cpu_burst.
     EXPECTED_EFFECTIVE_CPUS=$LIMIT_CPUS
     DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
     if is_uint "$DAEMON_NCPU" && [ "$DAEMON_NCPU" -gt 0 ] && [ "$COUNT" -gt 0 ]; then
-        CPU_SHARE=$(awk -v ncpu="$DAEMON_NCPU" -v count="$COUNT" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
-        EXPECTED_EFFECTIVE_CPUS=$(awk -v cfg="$LIMIT_CPUS" -v share="$CPU_SHARE" 'BEGIN { print (cfg > share) ? share : cfg }')
+        EXPECTED_EFFECTIVE_CPUS=$(expected_effective_cpus \
+            "$LIMIT_CPU_BURST" "$LIMIT_CPUS" "$DAEMON_NCPU" "$COUNT")
     fi
     # The daemon passes cpus to `docker run --cpus` via format!("{:.2}", cpus)
     # (src/docker_backend.rs) -- 2-decimal rounding BEFORE docker converts it
     # to NanoCpus, e.g. 1.6666666666666667 -> "1.67" -> NanoCpus=1670000000,
     # not the naive full-precision 1666666667. Round here identically or this
-    # check permanently mismatches by the rounding delta.
+    # check permanently mismatches by the rounding delta. Burst path rounds
+    # the same way: min(cfg.cpus, daemon_ncpu) is already a small integer or
+    # half-step; the .2f here is a no-op except in mixed precision cases
+    # (e.g. cfg.cpus=1.333 on ncpu=4 -> 1.33).
     EXPECTED_EFFECTIVE_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.2f", cpus }')
     EXPECTED_EFFECTIVE_NANO_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.0f", cpus * 1000000000 }')
     if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_EFFECTIVE_NANO_CPUS" ]; then

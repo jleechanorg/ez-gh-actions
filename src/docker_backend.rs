@@ -3200,6 +3200,15 @@ pub fn effective_limits(cfg: &Config) -> Result<(f64, u64), String> {
     // called on every start_one (i.e. every spawn). Only run it when
     // the operator has actually opted into cpu_burst; the verification
     // it provides is meaningless for the default equal-share clamp.
+    //
+    // When cpu_burst IS opted in, use the NARROW `daemon_in_vm_only`
+    // probe (one `docker info --format {{.KernelVersion}}` + host
+    // kernel read, ~one process each, bounded by PROBE_TIMEOUT) instead
+    // of full `detect()`. The full detect's kvm/tart/virsh/sysbox fanout
+    // was observed to push the probe past the 4s PROBE_TIMEOUT on a
+    // Colima cold reattach (Mac, 2026-10-03) — the resulting Err then
+    // caused per-slot start circuits to open even though the daemon
+    // itself was healthy. The narrow probe fits the same 8s ceiling.
     let capacity = daemon_capacity().map(|(ncpu, daemon_mem)| {
         // Use vm_total_mb override as the fleet budget base when set;
         // matches derive_memory_budget's startup fail-loud guard so
@@ -3207,7 +3216,7 @@ pub fn effective_limits(cfg: &Config) -> Result<(f64, u64), String> {
         (ncpu, cfg.runner.vm_total_mb.unwrap_or(daemon_mem))
     });
     let daemon_in_vm = if cfg.limits.cpu_burst {
-        crate::platform::detect().daemon_in_vm
+        crate::platform::daemon_in_vm_only()
     } else {
         false
     };
