@@ -4724,8 +4724,9 @@ pub struct EnsureCountOutcome {
     pub remaining_shortage: u32,
     /// Explicit incomplete post-refill readiness evidence. When present,
     /// `remaining_shortage` is only the managed-container shortfall and the
-    /// serve loop must run monitors plus immediate reconciliation instead of
-    /// treating the worker state as recovered.
+    /// serve loop must reconcile on the next iteration instead of treating
+    /// the worker state as recovered (they run async via the
+    /// `QueueMonitorScheduler`).
     pub post_refill_readiness_error: Option<String>,
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
@@ -7422,8 +7423,8 @@ minimum_isolation = "container"
             "Ceiling plan must request zero sleep before the next reconciliation"
         );
         assert!(
-            run_monitors,
-            "Ceiling plan must run monitors before reconciling"
+            !run_monitors,
+            "Ceiling plan must reconcile on the next iteration without synchronous monitors"
         );
     }
 
@@ -7493,8 +7494,8 @@ minimum_isolation = "container"
         assert_eq!(decision, crate::EnsureSuccessDecision::IncompleteReadiness);
         assert_eq!(
             crate::ensure_success_plan(&cfg, decision),
-            (Duration::ZERO, true),
-            "incomplete post-refill evidence must run monitors and add zero sleep before reconciliation"
+            (Duration::ZERO, false),
+            "incomplete post-refill evidence must reconcile on the next iteration without synchronous monitors"
         );
 
         let started_at = Instant::now();

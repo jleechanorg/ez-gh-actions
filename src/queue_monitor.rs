@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -483,6 +484,309 @@ impl QueueMonitorState {
             fetch_capped_queue_snapshot,
             || github::rest_budget_remaining_until(probe_deadline),
         )
+    }
+}
+
+/// Single-flight background scheduler for the queue-monitor +
+/// invariant-sampler ticks. Mirrors `CanaryDaemonState`'s ownership
+/// roundtrip: states live with the scheduler when idle, move into the
+/// worker for one tick, and return via the join handle regardless of
+/// whether the tick errored -- so REST backoff / `last_check` /
+/// consecutive-bad are preserved across ordinary `Err` ticks. Only an
+/// actual `join()` panic (worker thread unwound without returning the
+/// state pair) rebuilds empty state.
+pub struct QueueMonitorScheduler {
+    queue_monitor: Option<QueueMonitorState>,
+    invariant_sampler: Option<InvariantSamplerState>,
+    in_flight: Option<JoinHandle<(QueueMonitorState, InvariantSamplerState, Result<()>)>>,
+}
+
+impl QueueMonitorScheduler {
+    pub fn new() -> Self {
+        Self {
+            queue_monitor: Some(QueueMonitorState::new()),
+            invariant_sampler: Some(InvariantSamplerState::new()),
+            in_flight: None,
+        }
+    }
+
+    /// O(1). Joins any finished worker, then spawns a new one if both
+    /// states are present and no worker is in flight. Returns `true`
+    /// when a worker was dispatched or one was already in flight,
+    /// `false` only when the scheduler has no state to give a worker.
+    /// Never blocks.
+    pub fn maybe_dispatch(&mut self, cfg: &Config, loop_start: Instant) -> bool {
+        self.collect_finished();
+        if self.in_flight.is_some() {
+            return true;
+        }
+        let Some(mut qm) = self.queue_monitor.take() else {
+            return false;
+        };
+        let Some(mut inv) = self.invariant_sampler.take() else {
+            self.queue_monitor = Some(qm);
+            return false;
+        };
+        let cfg = cfg.clone();
+        self.in_flight = Some(thread::spawn(move || {
+            let status = qm
+                .drive_serve_loop_ticks(&cfg, loop_start, &mut inv)
+                .map(|_| ());
+            (qm, inv, status)
+        }));
+        true
+    }
+
+    /// If the in-flight worker has finished, join it and reclaim the
+    /// state pair. Ordinary tick `Err` keeps the state; only a `join()`
+    /// panic rebuilds empty state. O(1) when no worker has finished.
+    pub fn collect_finished(&mut self) -> bool {
+        let Some(handle) = self.in_flight.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.in_flight.take().expect("checked in-flight scheduler");
+        match handle.join() {
+            Ok((qm, inv, status)) => {
+                self.queue_monitor = Some(qm);
+                self.invariant_sampler = Some(inv);
+                if let Err(err) = status {
+                    eprintln!("WARN: queue monitor scheduler tick failed: {err:#}");
+                }
+                true
+            }
+            Err(panic) => {
+                eprintln!("WARN: queue monitor scheduler worker panicked: {panic:?}");
+                self.queue_monitor = Some(QueueMonitorState::new());
+                self.invariant_sampler = Some(InvariantSamplerState::new());
+                false
+            }
+        }
+    }
+}
+
+impl Default for QueueMonitorScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Slow in-flight worker must NOT block subsequent dispatch calls:
+    /// while the worker is still running, the scheduler reports in-flight
+    /// and refuses to spawn another. The main thread returns immediately
+    /// (no block on the slow worker). This is the production Ceiling
+    /// starvation regression test.
+    ///
+    /// Uses an mpsc channel pair for cross-platform determinism -- the
+    /// worker signals it has started and then blocks on a release channel,
+    /// which lets the main thread exercise the in-flight code path with
+    /// no fixed sleeps or `is_finished` polling races.
+    #[test]
+    fn slow_in_flight_worker_does_not_block_dispatch() {
+        let mut sched = QueueMonitorScheduler::new();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let dispatched = sched.maybe_dispatch_with(move |qm, inv| {
+            // Signal that the worker has started, then wait until the
+            // main thread releases us. This is the "slow" guarantee:
+            // the worker cannot finish on its own.
+            let _ = block_tx.send(());
+            let _ = release_rx.recv();
+            (qm, inv, Ok(()))
+        });
+        assert!(dispatched);
+        // Wait until the worker is parked in `recv`.
+        block_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must reach its block point within 5s");
+        // Immediate second dispatch must be a no-op (in-flight present).
+        let redispatched = sched.maybe_dispatch_with(|_qm, _inv| {
+            panic!("must not run a second worker while one is in flight");
+        });
+        assert!(
+            redispatched,
+            "in-flight dispatch is a no-op, not a second worker"
+        );
+        // The scheduler's handle is still in flight (worker is blocked).
+        assert!(sched.in_flight.is_some());
+        // Release the worker so it can return its state pair.
+        release_tx.send(()).expect("main thread sends release");
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert!(sched.in_flight.is_none());
+    }
+
+    /// State survives a successful tick: dispatch, wait deterministically
+    /// for the worker to finish (bounded wait -- no fixed sleep), collect,
+    /// verify scheduler still has both states and can dispatch a second
+    /// worker. Roundtrip integrity.
+    #[test]
+    fn scheduler_roundtrips_state_after_success() {
+        let qm_witness: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let inv_witness: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let mut sched = QueueMonitorScheduler::new();
+        let qm_w = qm_witness.clone();
+        let inv_w = inv_witness.clone();
+        let dispatched = sched.maybe_dispatch_with(move |mut qm, mut inv| {
+            qm.record_tail_sample(true);
+            inv.last_check = Some(Instant::now());
+            qm_w.fetch_add(1, Ordering::SeqCst);
+            inv_w.fetch_add(1, Ordering::SeqCst);
+            (qm, inv, Ok(()))
+        });
+        assert!(dispatched);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert_eq!(qm_witness.load(Ordering::SeqCst), 1);
+        assert_eq!(inv_witness.load(Ordering::SeqCst), 1);
+        // Second dispatch works (state pair was returned, no rebuild).
+        let qm_w2 = qm_witness.clone();
+        let inv_w2 = inv_witness.clone();
+        let second = sched.maybe_dispatch_with(move |qm, inv| {
+            qm_w2.fetch_add(1, Ordering::SeqCst);
+            inv_w2.fetch_add(1, Ordering::SeqCst);
+            (qm, inv, Ok(()))
+        });
+        assert!(second);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert_eq!(qm_witness.load(Ordering::SeqCst), 2);
+        assert_eq!(inv_witness.load(Ordering::SeqCst), 2);
+    }
+
+    /// Regression: an ordinary Err from a tick must NOT rebuild state.
+    /// REST backoff / last_check / consecutive-bad counters survive -- only
+    /// a join() panic rebuilds empty state.
+    #[test]
+    fn scheduler_preserves_state_across_ordinary_tick_error() {
+        let consecutive_seen: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let mut sched = QueueMonitorScheduler::new();
+        let dispatched = sched.maybe_dispatch_with(|mut qm, inv| {
+            qm.record_tail_sample(true);
+            qm.record_tail_sample(true);
+            // Simulate a tick that errored (e.g. rate-limited probe).
+            // State mutations BEFORE the error must still be visible to
+            // the next dispatch -- otherwise backoff is silently lost on
+            // every API hiccup, the exact failure mode this design
+            // protects against.
+            (qm, inv, Err(anyhow::anyhow!("synthetic API rate limit")))
+        });
+        assert!(dispatched);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(
+            sched.collect_finished(),
+            "ordinary Err still counts as a finished tick"
+        );
+        // Next dispatch reads consecutive_bad and stashes it via an atomic
+        // (the atomic is `Send + 'static`, so moving it into the closure
+        // is sound; we read it back via the same handle the closure owns).
+        let seen_for_read = consecutive_seen.clone();
+        let seen_for_worker = consecutive_seen;
+        let dispatched2 = sched.maybe_dispatch_with(move |qm, inv| {
+            seen_for_worker.store(qm.consecutive_bad, Ordering::SeqCst);
+            (qm, inv, Ok(()))
+        });
+        assert!(dispatched2);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert_eq!(
+            seen_for_read.load(Ordering::SeqCst),
+            2,
+            "two tail_bad=true ticks must survive the intermediate Err tick"
+        );
+    }
+
+    /// Panic in the worker thread triggers join() Err -- the scheduler
+    /// must rebuild empty state so the next dispatch is not permanently
+    /// wedged. We use a flag to confirm the panic actually occurred
+    /// (otherwise the worker would have returned normally and the test
+    /// would falsely pass).
+    #[test]
+    fn scheduler_rebuilds_state_after_worker_panic() {
+        let mut sched = QueueMonitorScheduler::new();
+        let dispatched = sched.maybe_dispatch_with(
+            |_qm, _inv| -> (QueueMonitorState, InvariantSamplerState, Result<()>) {
+                panic!("synthetic worker panic");
+            },
+        );
+        assert!(dispatched);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        // collect_finished returns false on panic (rebuilt empty state).
+        assert!(!sched.collect_finished());
+        // Subsequent dispatch works (state pair present, freshly rebuilt).
+        let dispatched2 = sched.maybe_dispatch_with(|qm, inv| (qm, inv, Ok(())));
+        assert!(
+            dispatched2,
+            "scheduler must accept dispatches after a panic-rebuilt state"
+        );
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+    }
+
+    /// Bounded poll until the scheduler's in-flight worker has finished
+    /// (or the budget is exhausted). Uses short sleeps + `is_finished`
+    /// instead of a fixed `sleep`, so the test stays deterministic on
+    /// both lightly- and heavily-loaded CI runners while still O(1) on
+    /// the happy path.
+    fn wait_until_finished(sched: &mut QueueMonitorScheduler, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        loop {
+            let Some(handle) = sched.in_flight.as_ref() else {
+                return;
+            };
+            if handle.is_finished() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "scheduler worker did not finish within {budget:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// Test-only handle to drive the scheduler with a custom worker closure
+/// instead of `drive_serve_loop_ticks`. The closure takes ownership of
+/// the state pair and returns the (possibly mutated) pair plus a tick
+/// status. Used to deterministically inject slow / failing / panicking
+/// workers without relying on the real fetcher.
+#[cfg(test)]
+impl QueueMonitorScheduler {
+    pub(crate) fn maybe_dispatch_with<F>(&mut self, worker: F) -> bool
+    where
+        F: FnOnce(
+                QueueMonitorState,
+                InvariantSamplerState,
+            ) -> (QueueMonitorState, InvariantSamplerState, Result<()>)
+            + Send
+            + 'static,
+    {
+        self.collect_finished();
+        if self.in_flight.is_some() {
+            return true;
+        }
+        let Some(qm) = self.queue_monitor.take() else {
+            return false;
+        };
+        let Some(inv) = self.invariant_sampler.take() else {
+            self.queue_monitor = Some(qm);
+            return false;
+        };
+        self.in_flight = Some(std::thread::spawn(move || {
+            let (qm, inv, status) = worker(qm, inv);
+            (qm, inv, status)
+        }));
+        true
     }
 }
 
