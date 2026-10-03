@@ -48,6 +48,29 @@ for f in Cargo.lock Cargo.toml build.rs; do
   out=$(gate0 "$base") && fail "$f change must fail Gate 0" || true
 done
 
+# Build-input change followed by a revert has an empty endpoint diff but the
+# deployed binary may have been built from the intermediate tree: must fail.
+git -C "$REPO" checkout -q -b rev-branch
+rbase=$(git -C "$REPO" rev-parse --short HEAD)
+cp "$REPO/src/main.rs" "$TMP/main.rs.orig"
+echo '// transient' >> "$REPO/src/main.rs"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm transient
+echo '// transient-built' > "$TMP/marker"
+cp "$TMP/main.rs.orig" "$REPO/src/main.rs"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm revert
+rc=0; out=$(gate0 "$rbase") || rc=$?
+[ "$rc" -ne 0 ] || fail "src change then revert after deployed SHA must fail"
+
+# A sibling (non-ancestor) deployed SHA must fail even if trees match on inputs.
+git -C "$REPO" checkout -q -b sibling "$rbase"
+echo sib > "$REPO/docs/sib.md"
+git -C "$REPO" add -A && git -C "$REPO" commit -qm sibling
+sib=$(git -C "$REPO" rev-parse --short HEAD)
+git -C "$REPO" checkout -q rev-branch
+rc=0; out=$(gate0 "$sib") || rc=$?
+[ "$rc" -ne 0 ] || fail "non-ancestor deployed SHA must fail"
+grep -Fq 'not an ancestor' <<<"$out" || fail "non-ancestor failure omitted diagnostic: $out"
+
 # Unknown deployed SHA (not in history) must fail closed.
 rc=0; out=$(gate0 deadbee) || rc=$?
 [ "$rc" -ne 0 ] || fail "unresolvable deployed SHA must fail"

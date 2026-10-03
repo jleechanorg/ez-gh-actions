@@ -438,8 +438,14 @@ verify_deployed_sha() {
         fail "Deployed binary SHA ($deployed) is not in this repo's history; HEAD is $head_sha. Run cargo install --path ."
         return 1
     fi
+    if ! git merge-base --is-ancestor "$deployed" HEAD; then
+        fail "Deployed binary SHA ($deployed) is not an ancestor of HEAD ($head_sha). Run cargo install --path ."
+        return 1
+    fi
+    # Inspect every commit in deployed..HEAD, not just the endpoint trees, so a
+    # build-input change that was later reverted is still caught.
     # shellcheck disable=SC2086
-    changed=$(git diff --name-only "$deployed" HEAD -- $GATE0_BUILD_INPUTS)
+    changed=$(git log --name-only --format= "$deployed..HEAD" -- $GATE0_BUILD_INPUTS | sort -u)
     if [ -n "$changed" ]; then
         fail "Deployed binary SHA ($deployed) differs from HEAD ($head_sha) in build inputs: $(echo "$changed" | tr '\n' ' '). Run cargo install --path ."
         return 1
@@ -1170,7 +1176,7 @@ fi
 #                      physical host RAM, lower MemoryHigh on
 #                      app-lima-vm.slice, or lower the agent-CLI slice
 #                      MemoryHigh.
-echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) rely on systemd-oomd with an enrolled cgroup (the psi-oom-watcher timer is disabled by policy) (or rely on system systemd-oomd active). (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not

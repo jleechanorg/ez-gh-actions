@@ -182,8 +182,8 @@ journal_has_respawn_evidence() {
   local name="$1"
   # Literal (not regex) match anchored at end-of-line: the name may contain
   # regex metacharacters (bead ez-gh-actions-il81).
-  if awk -v want="respawned ephemeral runner ${name}" \
-       '{ n = length(want); if (length($0) >= n && substr($0, length($0) - n + 1) == want) f = 1 } END { exit !f }'; then
+  if RUNNER_WANT="respawned ephemeral runner ${name}" awk \
+       'BEGIN { want = ENVIRON["RUNNER_WANT"] } { n = length(want); if (length($0) >= n && substr($0, length($0) - n + 1) == want) f = 1 } END { exit !f }'; then
     echo 1
   else
     echo 0
