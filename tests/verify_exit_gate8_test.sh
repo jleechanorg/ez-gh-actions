@@ -118,6 +118,18 @@ cat > "$TMP/forbidden-remediation" <<EOF
 touch "$TMP/remediation-was-called"
 EOF
 chmod +x "$TMP/forbidden-remediation"
+# Exercise the remaining Linux fixtures on every test host.
+mkdir -p "$TMP/linux-bin"
+cat > "$TMP/linux-bin/uname" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = -s ]; then
+  printf 'Linux\n'
+else
+  exec "$(command -v uname)" "\$@"
+fi
+EOF
+chmod +x "$TMP/linux-bin/uname"
+export PATH="$TMP/linux-bin:$PATH"
 healthy_out=$(VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
   VERIFY_EXIT_CRITERIA_TEST_CASE=kdump \
   VERIFY_EXIT_CRITERIA_PSTORE_ROOT="$TMP/pstore" \
@@ -264,7 +276,7 @@ out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACT
 grep -q "selected_tasks=8000" <<<"$out" || fail "14-runner profile must derive TasksMax=8000"
 
 cp "$MODERN/automation.slice" "$TMP/automation.good"
-sed -i 's/^MemoryMax=.*/MemoryMax=broken/' "$MODERN/automation.slice"
+sed -i.bak 's/^MemoryMax=.*/MemoryMax=broken/' "$MODERN/automation.slice"
 if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=1 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 VERIFY_EXIT_CRITERIA_HOST_MB=65000 bash "$VERIFY" >"$TMP/parser-bad.log" 2>&1; then
   fail "production unit parser must reject malformed automation cap"
 fi
@@ -347,7 +359,7 @@ if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/caps.log" 2>&1; then
   fail "wrong live caps must fail canonical predicate"
 fi
 write_props 4831838208 5368709120 > "$TMP/props"
-sed -i 's/^user.slice ManagedOOMMemoryPressure auto$/user.slice ManagedOOMMemoryPressure kill/' "$TMP/props"
+sed -i.bak 's/^user.slice ManagedOOMMemoryPressure auto$/user.slice ManagedOOMMemoryPressure kill/' "$TMP/props"
 if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/kill.log" 2>&1; then
   fail "broad-root kill scope must fail canonical predicate"
 fi
@@ -399,7 +411,7 @@ if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-bad.log" 2>&
   fail "native Gate 8 (3) bypassed canonical live-cap failure"
 fi
 write_props 4831838208 5368709120 > "$TMP/props"
-sed -i 's/^user.slice ManagedOOMMemoryPressure auto$/user.slice ManagedOOMMemoryPressure kill/' "$TMP/props"
+sed -i.bak 's/^user.slice ManagedOOMMemoryPressure auto$/user.slice ManagedOOMMemoryPressure kill/' "$TMP/props"
 if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-kill.log" 2>&1; then
   fail "native selector without wrapper accepted forbidden kill scope"
 fi

@@ -4644,11 +4644,13 @@ impl Drop for AdmissionBatch {
 }
 
 fn admission_batch(cfg: &Config, missing: u32) -> Result<AdmissionBatch> {
-    let mut batch = AdmissionBatch {
+    let batch = AdmissionBatch {
         slots: missing,
         paused: None,
         lock: None,
     };
+    #[cfg(target_os = "linux")]
+    let mut batch = batch;
     #[cfg(target_os = "linux")]
     {
         #[cfg(test)]
