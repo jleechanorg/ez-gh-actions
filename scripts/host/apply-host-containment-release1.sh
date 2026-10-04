@@ -91,7 +91,7 @@ check_below "${CGROUP_ROOT}/actions.slice/memory.current" 27917287424 "actions.s
 check_below "${CGROUP_ROOT}/actions.slice/pids.current" 8000 "actions.slice pids.current"
 agents_dir="$(user_cgroup_dir agents.slice || true)"
 automation_dir="$(user_cgroup_dir automation.slice || true)"
-# New MemoryHigh: agents.slice 10G, automation.slice 4608M (bead ez-gh-actions-154k).
+# User-slice MemoryHigh values are 10G for agents and 4608M for automation.
 [ -z "$agents_dir" ] || check_non_reclaimable "$agents_dir" 10737418240 agents.slice
 [ -z "$automation_dir" ] || check_non_reclaimable "$automation_dir" 4831838208 automation.slice
 # The user phase leads into install.sh lowering the colima QEMU ceiling to the

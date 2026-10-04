@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Fail closed before the host-docker QEMU ceiling (9G/10G) is applied: the
-# colima Lima guest must be configured AND running at <= 8 GiB, otherwise a
-# 10G cap for an 8 GiB guest would OOM-kill QEMU (bead ez-gh-actions-154k).
+# Reject a configured or running Colima guest above 8 GiB before applying the
+# host-docker 10 GiB QEMU ceiling. The ceiling reserves QEMU overhead above
+# the guest size.
 #
 # Configured size: `memory:` in the lima.yaml lima-vm@colima starts from.
 # Running size: the `-m <MiB>` of the colima QEMU process (the one whose

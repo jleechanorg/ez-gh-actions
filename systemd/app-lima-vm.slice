@@ -1,5 +1,4 @@
-# app-lima-vm.slice — budget template for the Colima/Lima VM QEMU process.
-# Part of bead jleechan-aqh (apply and verify limits against the actual QEMU cgroup).
+# app-lima-vm.slice — VM-backed QEMU ceiling.
 #
 # Lima may place the VM in an escaped transient application slice rather than
 # this hierarchical unit. The canonical enforcement therefore also lives in

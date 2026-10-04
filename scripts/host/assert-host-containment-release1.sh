@@ -52,7 +52,7 @@ if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     actual="$(systemctl --user show -p "$property" --value -- "$unit")"
     [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
   }
-  # Host-docker policy (bead ez-gh-actions-154k): agents 10G/12G, automation 4608M/5G.
+  # Host-docker user-slice policy: agents 10G/12G, automation 4608M/5G.
   check_user_property agents.slice MemoryHigh 10737418240
   check_user_property agents.slice MemoryMax 12884901888
   check_user_property agents.slice MemorySwapMax 2147483648

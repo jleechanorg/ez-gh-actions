@@ -8,7 +8,7 @@
 # (default: /sys/fs/cgroup).  It never scans for, or falls back to, a sibling
 # slice: a bounded unrelated QEMU/cgroup must not make this check pass.
 #
-# The ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
+# The ceiling is deployment-mode dependent:
 # vm-backed (runners inside Colima) 34G/38G from systemd/, host-docker (Colima
 # runs an 8 GiB guest) 9G/10G from systemd/host-docker/.
 # Both tracked variants are always checked; QEMU_CEILING_MODE selects the live

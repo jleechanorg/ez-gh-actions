@@ -449,10 +449,9 @@ if [ "$(uname -s)" = "Linux" ]; then
   [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
   if [ "${docker_kernel}" = "$(uname -r)" ]; then
     HOST_DOCKER_MODE=1
-    # Host-docker: runners use host Docker, so the colima VM only runs
-    # openclaw-qdrant and is sized to a 8GiB guest (bead ez-gh-actions-154k).
-    # lima-vm@colima starts from this lima.yaml; the new size applies at the
-    # next VM start, and the 10G QEMU ceiling stays refused until it has.
+    # Host Docker keeps runners under actions.slice and sets the Colima guest
+    # to an 8GiB allocation. lima-vm@colima starts from this lima.yaml; the
+    # 10G QEMU ceiling remains refused until the running guest matches.
     lima_yaml="${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml"
     if [ -f "${lima_yaml}" ] && ! grep -qx 'memory: "8GiB"' "${lima_yaml}"; then
       if grep -q '^memory:' "${lima_yaml}"; then
@@ -797,10 +796,9 @@ FSTRIM_EOF
     for unit in agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
-    # The colima QEMU ceiling follows the deployment mode (bead
-    # ez-gh-actions-154k): VM-backed runners keep 34G/38G; host-docker uses 9G/10G for
-    # the qdrant-only 8GiB guest, but only once the guest really
-    # runs at <= 8GiB — otherwise the existing ceiling is left unchanged.
+    # QEMU ceilings follow deployment mode: VM-backed runners use 34G/38G;
+    # host-docker uses 9G/10G for its 8GiB guest only after the guest check
+    # passes, otherwise the existing ceiling is left unchanged.
     VM_CEILING_DIR="${UNIT_DIR}"
     VM_CEILING_PROPS="MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
     APPLY_VM_CEILING=1
