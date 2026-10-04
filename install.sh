@@ -151,6 +151,26 @@ for arg in "$@"; do
   esac
 done
 
+# ── Preflight watchdog source before any deployment mutation ──────────────────
+watchdog_source="${SCRIPT_DIR}/scripts/ezgha-fleet-watchdog.sh"
+watchdog_has_image_heal_function() {
+  grep -Eq '^[[:space:]]*(function[[:space:]]+)?ensure_runner_image[[:space:]]*\(\)[[:space:]]*\{' "$1" 2>/dev/null
+}
+watchdog_has_relative_dockerfile() {
+  grep -Eq -- '(^|[[:space:]])-f[[:space:]]+(\./)?Dockerfile\.runner([[:space:]]|$)' "$1" 2>/dev/null
+}
+if [ "$(uname -s)" = "Darwin" ] && [ "${WITH_WATCHDOG}" -eq 1 ] &&
+   [ -d "${SCRIPT_DIR}/systemd" ]; then
+  if ! watchdog_has_image_heal_function "${watchdog_source}"; then
+    bad "refusing to install watchdog: ${watchdog_source} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
+    exit 1
+  fi
+  if watchdog_has_relative_dockerfile "${watchdog_source}"; then
+    bad "refusing to install watchdog: ${watchdog_source} uses relative -f Dockerfile.runner (2026-08-20 failure class; see bead jleechan-xlo7)"
+    exit 1
+  fi
+fi
+
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
@@ -624,8 +644,14 @@ PLIST
       # a plist pointing at an older copy of ezgha-fleet-watchdog.sh that has
       # no ensure_runner_image, which is exactly the 2026-07-14 + 2026-07-29
       # outage class (bead jleechan-xlo7).
-      if [[ "${name}" == "watchdog" ]] && ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
+      if [[ "${name}" == "watchdog" ]] && ! watchdog_has_image_heal_function "${exec_path}"; then
         bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
+        rm -f "${plist}"
+        return 1
+      fi
+      # Behavioral sentinel: ensure_runner_image MUST NOT use relative '-f Dockerfile.runner' (the 2026-08-20 failure class)
+      if [[ "${name}" == "watchdog" ]] && watchdog_has_relative_dockerfile "${exec_path}"; then
+        bad "refusing to install ${plist}: ${exec_path} uses relative -f Dockerfile.runner (2026-08-20 failure class; see bead jleechan-xlo7)"
         rm -f "${plist}"
         return 1
       fi

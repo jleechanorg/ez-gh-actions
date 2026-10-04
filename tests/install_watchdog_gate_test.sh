@@ -76,10 +76,18 @@ cp "${REPO_ROOT}"/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf \
 cp "${REPO_ROOT}"/systemd/guest/actions.slice \
    "${TEMP_REPO}/systemd/guest/"
 printf '[package]\nname = "ez-gh-actions"\nversion = "0.0.0"\n' > "${TEMP_REPO}/Cargo.toml"
-for name in ezgha-fleet-watchdog.sh refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
+for name in ezgha-fleet-watchdog.sh refresh_gh_app_token.sh cleanup-stuck-runs.sh \
+            cleanup-mission-output.sh colima-trim-guard.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
+# The Linux cases do not render launchd plists, so give the temporary source a
+# minimal valid watchdog payload for the Darwin cases below.
+cat > "${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh" <<'EOF'
+#!/usr/bin/env bash
+ensure_runner_image() { :; }
+EOF
+chmod +x "${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh"
 for name in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
   cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
 done
@@ -104,6 +112,7 @@ EOF
 
 cat > "${STUB_BIN}/cargo" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CARGO_CAPTURE:-/dev/null}"
 exit 0
 EOF
 
@@ -140,7 +149,33 @@ done
 
 cat > "${STUB_BIN}/uname" <<'EOF'
 #!/usr/bin/env bash
-echo Linux
+echo "${STUB_UNAME:-Linux}"
+EOF
+
+cat > "${STUB_BIN}/launchctl" <<'EOF'
+#!/usr/bin/env bash
+: "${LAUNCHCTL_STATE_DIR:?LAUNCHCTL_STATE_DIR must be exported}"
+printf '%s\n' "$*" >> "${LAUNCHCTL_CAPTURE:-/dev/null}"
+case "${1:-}" in
+  list)
+    for marker in "${LAUNCHCTL_STATE_DIR}"/*.loaded; do
+      [ -f "${marker}" ] || continue
+      printf '0\t0\t%s\n' "$(basename "${marker}" .loaded)"
+    done
+    ;;
+  unload)
+    plist="${2:-}"
+    rm -f "${LAUNCHCTL_STATE_DIR}/$(basename "${plist}" .plist).loaded"
+    ;;
+  load)
+    plist="${@: -1}"
+    touch "${LAUNCHCTL_STATE_DIR}/$(basename "${plist}" .plist).loaded"
+    ;;
+  print)
+    label="${2##*/}"
+    [ -f "${LAUNCHCTL_STATE_DIR}/${label}.loaded" ]
+    ;;
+esac
 EOF
 
 cat > "${STUB_BIN}/systemctl" <<'EOF'
@@ -184,8 +219,12 @@ export PATH="${STUB_BIN}:${PATH}"
 export LIMACTL_CAPTURE="${WORK}/limactl.calls"
 export GUEST_ACTIONS_SLICE_CAPTURE="${WORK}/guest-actions.slice"
 export SYSTEMCTL_CAPTURE="${WORK}/systemctl.calls"
+export LAUNCHCTL_CAPTURE="${WORK}/launchctl.calls"
+export CARGO_CAPTURE="${WORK}/cargo.calls"
 : > "${LIMACTL_CAPTURE}"
 : > "${SYSTEMCTL_CAPTURE}"
+: > "${LAUNCHCTL_CAPTURE}"
+: > "${CARGO_CAPTURE}"
 
 run_install() {
   # $1 = temp HOME, $2 = systemctl state dir, remaining = install.sh args
@@ -194,6 +233,41 @@ run_install() {
   mkdir -p "${state_dir}"
   HOME="${temp_home}" SYSTEMCTL_STATE_DIR="${state_dir}" \
     bash "${TEMP_REPO}/install.sh" --dev "$@" >"${temp_home}/install.log" 2>&1
+}
+
+run_mac_install() {
+  # $1 = temp HOME, $2 = state dir, $3 = launchctl state dir
+  local temp_home="$1" state_dir="$2" launchctl_state="$3"
+  mkdir -p "${temp_home}" "${temp_home}/Library/LaunchAgents" \
+           "${temp_home}/.cargo/bin" "${state_dir}" "${launchctl_state}"
+  cat > "${temp_home}/.cargo/bin/ezgha" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SERVICE_CAPTURE:?}"
+EOF
+  chmod +x "${temp_home}/.cargo/bin/ezgha"
+  HOME="${temp_home}" SYSTEMCTL_STATE_DIR="${state_dir}" \
+    LAUNCHCTL_STATE_DIR="${launchctl_state}" STUB_UNAME=Darwin \
+    LAUNCHCTL_CAPTURE="${launchctl_state}/calls" \
+    CARGO_CAPTURE="${state_dir}/cargo.calls" \
+    SERVICE_CAPTURE="${launchctl_state}/service.calls" \
+    bash "${TEMP_REPO}/install.sh" --dev >"${temp_home}/install.log" 2>&1
+}
+
+prepare_mac_prior_install() {
+  # Seed a deployed payload and loaded service so a rejected candidate must
+  # leave both untouched.
+  local temp_home="$1" launchctl_state="$2" with_config="${3:-0}"
+  mkdir -p "${temp_home}/.local/libexec/ezgha" \
+           "${temp_home}/Library/LaunchAgents" "${launchctl_state}"
+  printf 'previous watchdog payload\n' > \
+    "${temp_home}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
+  printf 'previous watchdog plist\n' > \
+    "${temp_home}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
+  touch "${launchctl_state}/org.jleechanorg.ezgha-watchdog.loaded"
+  if [ "${with_config}" -eq 1 ]; then
+    mkdir -p "${temp_home}/.config/ezgha"
+    printf '[runner]\n' > "${temp_home}/.config/ezgha/config.toml"
+  fi
 }
 
 # ── Case A: default run arms watchdog ────────────────────────────────────────
@@ -314,6 +388,103 @@ if [ ! -f "${STATE_C}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_C}
   fail "Case C: --with-watchdog run failed to also enable token-refresh/queue-reaper timers"
 else
   echo "PASS: Case C: --with-watchdog run still enabled token-refresh + queue-reaper timers"
+fi
+
+# ── Cases F-I: macOS watchdog sentinel validation is pre-mutation ────────────
+# The source candidate is checked before stable payload copy and launchd unload.
+# Each rejected candidate must preserve both the prior script and loaded plist.
+mac_payload="${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh"
+MAC_HOME_F="${WORK}/home_f"
+MAC_STATE_F="${WORK}/state_f"
+MAC_LAUNCHCTL_F="${WORK}/launchctl_f"
+prepare_mac_prior_install "${MAC_HOME_F}" "${MAC_LAUNCHCTL_F}" 1
+cat > "${mac_payload}" <<'EOF'
+#!/usr/bin/env bash
+# ensure_runner_image() { :; }
+EOF
+chmod +x "${mac_payload}"
+payload_before_f="$(cat "${MAC_HOME_F}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
+plist_before_f="$(cat "${MAC_HOME_F}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
+if run_mac_install "${MAC_HOME_F}" "${MAC_STATE_F}" "${MAC_LAUNCHCTL_F}"; then
+  fail "Case F: missing sentinel unexpectedly installed"
+else
+  if [ "$(cat "${MAC_HOME_F}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_f}" ] ||
+     [ "$(cat "${MAC_HOME_F}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_f}" ]; then
+    fail "Case F: missing sentinel changed the payload or plist"
+  elif [ -e "${MAC_STATE_F}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_F}/service.calls" ]; then
+    fail "Case F: missing sentinel reached cargo or the main service"
+  elif [ ! -f "${MAC_LAUNCHCTL_F}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
+    fail "Case F: missing sentinel unloaded the prior watchdog service"
+  elif grep -q 'watchdog' "${MAC_LAUNCHCTL_F}/calls" 2>/dev/null; then
+    fail "Case F: missing sentinel touched the prior watchdog service"
+  else
+    echo "PASS: Case F: missing sentinel preserved watchdog payload and service"
+  fi
+fi
+
+MAC_HOME_G="${WORK}/home_g"
+MAC_STATE_G="${WORK}/state_g"
+MAC_LAUNCHCTL_G="${WORK}/launchctl_g"
+prepare_mac_prior_install "${MAC_HOME_G}" "${MAC_LAUNCHCTL_G}" 1
+printf '%s\n' '#!/usr/bin/env bash' 'ensure_runner_image() { :; }' 'docker '"build -f Dockerfile.runner ." > "${mac_payload}"
+chmod +x "${mac_payload}"
+payload_before_g="$(cat "${MAC_HOME_G}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
+plist_before_g="$(cat "${MAC_HOME_G}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
+if run_mac_install "${MAC_HOME_G}" "${MAC_STATE_G}" "${MAC_LAUNCHCTL_G}"; then
+  fail "Case G: relative Dockerfile.runner sentinel unexpectedly installed"
+else
+  if [ "$(cat "${MAC_HOME_G}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_g}" ] ||
+     [ "$(cat "${MAC_HOME_G}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_g}" ]; then
+    fail "Case G: relative Dockerfile.runner sentinel changed the payload or plist"
+  elif [ -e "${MAC_STATE_G}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_G}/service.calls" ]; then
+    fail "Case G: relative Dockerfile.runner sentinel reached cargo or the main service"
+  elif [ ! -f "${MAC_LAUNCHCTL_G}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
+    fail "Case G: relative Dockerfile.runner sentinel unloaded the prior watchdog service"
+  elif grep -q 'watchdog' "${MAC_LAUNCHCTL_G}/calls" 2>/dev/null; then
+    fail "Case G: relative Dockerfile.runner sentinel touched the prior watchdog service"
+  else
+    echo "PASS: Case G: relative Dockerfile.runner sentinel preserved watchdog payload and service"
+  fi
+fi
+
+MAC_HOME_H="${WORK}/home_h"
+MAC_STATE_H="${WORK}/state_h"
+MAC_LAUNCHCTL_H="${WORK}/launchctl_h"
+prepare_mac_prior_install "${MAC_HOME_H}" "${MAC_LAUNCHCTL_H}"
+printf '%s\n' '#!/usr/bin/env bash' 'ensure_runner_image() { :; }' 'docker '"build -f ./Dockerfile.runner ." > "${mac_payload}"
+chmod +x "${mac_payload}"
+payload_before_h="$(cat "${MAC_HOME_H}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
+plist_before_h="$(cat "${MAC_HOME_H}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
+if run_mac_install "${MAC_HOME_H}" "${MAC_STATE_H}" "${MAC_LAUNCHCTL_H}"; then
+  fail "Case H: ./Dockerfile.runner sentinel unexpectedly installed"
+else
+  if [ "$(cat "${MAC_HOME_H}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_h}" ] ||
+     [ "$(cat "${MAC_HOME_H}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_h}" ]; then
+    fail "Case H: ./Dockerfile.runner sentinel changed the payload or plist"
+  elif [ ! -f "${MAC_LAUNCHCTL_H}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
+    fail "Case H: ./Dockerfile.runner sentinel unloaded the prior watchdog service"
+  elif grep -q 'watchdog' "${MAC_LAUNCHCTL_H}/calls" 2>/dev/null; then
+    fail "Case H: ./Dockerfile.runner sentinel touched the prior watchdog service"
+  else
+    echo "PASS: Case H: ./Dockerfile.runner sentinel preserved watchdog payload and service"
+  fi
+fi
+
+MAC_HOME_I="${WORK}/home_i"
+MAC_STATE_I="${WORK}/state_i"
+MAC_LAUNCHCTL_I="${WORK}/launchctl_i"
+cat > "${mac_payload}" <<'EOF'
+#!/usr/bin/env bash
+ensure_runner_image() { :; }
+EOF
+chmod +x "${mac_payload}"
+run_mac_install "${MAC_HOME_I}" "${MAC_STATE_I}" "${MAC_LAUNCHCTL_I}"
+if ! grep -q 'ensure_runner_image' "${MAC_HOME_I}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh" ||
+   [ ! -f "${MAC_HOME_I}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist" ] ||
+   [ ! -f "${MAC_LAUNCHCTL_I}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
+  fail "Case I: valid watchdog candidate did not install and load successfully"
+else
+  echo "PASS: Case I: valid watchdog candidate installed and loaded successfully"
 fi
 
 # ── Case E: uninstall restores a pre-existing CLI symlink and removes host controls.

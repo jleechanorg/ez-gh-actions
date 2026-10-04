@@ -168,7 +168,7 @@ log() { echo "[$TS] $*"; }
 # path, restart-looping without image-heal). Fail closed so the drift becomes
 # visible immediately instead of masquerading as "watchdog is running".
 # Set EZGHA_WATCHDOG_ALLOW_DRIFT=1 to bypass (recovery only).
-if [[ "$(uname -s)" == "Darwin" ]] && [[ "${EZGHA_WATCHDOG_ALLOW_DRIFT:-0}" -ne 1 ]]; then
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ "$(uname -s)" == "Darwin" ]] && [[ "${EZGHA_WATCHDOG_ALLOW_DRIFT:-0}" -ne 1 ]]; then
   _self_real="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
   case "$_self_real" in
     "$HOME"/.local/libexec/ezgha/ezgha-fleet-watchdog.sh) ;;
@@ -604,14 +604,16 @@ if isinstance(count, int) and count >= 0:
   evaluate_host "linux" "$configured" "$actual" "$slots" do_restart_linux
 }
 
-EXIT=0
-check_mac || EXIT=$?
-check_linux || EXIT=$?
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  EXIT=0
+  check_mac || EXIT=$?
+  check_linux || EXIT=$?
 
-if [[ "$EXIT" -eq 0 ]]; then
-  log "OK: checked hosts at configured count (or restarted this tick)"
-elif [[ "$EXIT" -eq 2 ]]; then
-  log "WARN: one or more hosts missing ezgha or unreachable — manual intervention needed"
+  if [[ "$EXIT" -eq 0 ]]; then
+    log "OK: checked hosts at configured count (or restarted this tick)"
+  elif [[ "$EXIT" -eq 2 ]]; then
+    log "WARN: one or more hosts missing ezgha or unreachable — manual intervention needed"
+  fi
+
+  exit $EXIT
 fi
-
-exit $EXIT
