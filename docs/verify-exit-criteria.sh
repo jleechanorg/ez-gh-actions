@@ -499,33 +499,68 @@ verify_fresh_canary() {
     pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
-# Gate 8 timer policy: install.sh retires both auxiliary mutation loops. Treat
-# a lost user-manager bus as unknown, never disabled.
+# Gate 8 timer policy: both retired timers must be disabled and stopped even
+# when their unit files were already removed from disk.
+verify_retired_timer() {
+    local timer="$1" enabled_state active_state
+    enabled_state=$(systemctl --user is-enabled "$timer" 2>&1 | head -1 || true)
+    case "$enabled_state" in
+        enabled|enabled-runtime)
+            fail "Gate 8 modern envelope: ${timer} is enabled but is retired by policy (install.sh)" ;;
+        # A deleted unit file can remain loaded until its runtime instance
+        # stops, so still verify is-active before accepting this state.
+        not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+        disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+        *)
+            # Query failure (e.g. lost user-manager bus): never read as "disabled".
+            fail "Gate 8 modern envelope: could not determine ${timer} enabled state (got: ${enabled_state:-<empty>})"
+            return 1 ;;
+    esac
+    active_state=$(systemctl --user is-active "$timer" 2>&1 | head -1 || true)
+    case "$active_state" in
+        inactive|failed|not-found) ;;
+        active|activating|deactivating|reloading)
+            fail "Gate 8 modern envelope: ${timer} is ${active_state} but is retired by policy (install.sh)" ;;
+        *)
+            fail "Gate 8 modern envelope: could not determine ${timer} runtime state (got: ${active_state:-<empty>})"
+            return 1 ;;
+    esac
+    return 0
+}
+
 verify_modern_timers() {
-    local timer enabled_state active_state
-    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-        enabled_state=$(systemctl --user is-enabled "$timer" 2>&1 | head -1 || true)
-        case "$enabled_state" in
-            enabled|enabled-runtime)
-                fail "Gate 8 modern envelope: ${timer} is enabled but is disabled by policy (install.sh)" ;;
-            # A deleted unit can remain loaded until its runtime instance
-            # stops, so is-active is always checked below.
-            not-found|"Failed to get unit file state for "*": No such file or directory") ;;
-            disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
-            *)
-                fail "Gate 8 modern envelope: could not determine ${timer} enabled state (got: ${enabled_state:-<empty>})"
-                return 1 ;;
-        esac
-        active_state=$(systemctl --user is-active "$timer" 2>&1 | head -1 || true)
-        case "$active_state" in
-            inactive|failed|not-found) ;;
-            active|activating|deactivating|reloading)
-                fail "Gate 8 modern envelope: ${timer} is ${active_state} but is disabled by policy (install.sh)" ;;
-            *)
-                fail "Gate 8 modern envelope: could not determine ${timer} runtime state (got: ${active_state:-<empty>})"
-                return 1 ;;
-        esac
-    done
+    verify_retired_timer agent-scope-reaper.timer || return 1
+    verify_retired_timer psi-oom-watcher.timer
+}
+
+# Gate 0: the deployed SHA may trail HEAD only by commits touching no build
+# input of the binary (bead ez-gh-actions-eqx).
+# :(top) makes the pathspecs repo-root-relative regardless of the caller cwd.
+GATE0_BUILD_INPUTS=":(top)src :(top)Cargo.toml :(top)Cargo.lock :(top)build.rs"
+verify_deployed_sha() {
+    local deployed="$1" head_sha changed
+    head_sha=$(git rev-parse --short HEAD)
+    [ "$deployed" = "$head_sha" ] && return 0
+    if ! git rev-parse --verify --quiet "${deployed}^{commit}" >/dev/null 2>&1; then
+        fail "Deployed binary SHA ($deployed) is not in this repo's history; HEAD is $head_sha. Run cargo install --path ."
+        return 1
+    fi
+    if ! git merge-base --is-ancestor "$deployed" HEAD; then
+        fail "Deployed binary SHA ($deployed) is not an ancestor of HEAD ($head_sha). Run cargo install --path ."
+        return 1
+    fi
+    # Inspect every reachable commit and every merge-parent diff, not just the
+    # endpoint trees. A build-input change later reverted, or made only while
+    # resolving a merge, still means the deployed binary may be stale.
+    # shellcheck disable=SC2086
+    changed=$(while IFS= read -r commit; do
+        git diff-tree --no-commit-id --name-only -r --root -m "$commit" -- $GATE0_BUILD_INPUTS
+    done < <(git rev-list "$deployed..HEAD") | sort -u)
+    if [ -n "$changed" ]; then
+        fail "Deployed binary SHA ($deployed) differs from HEAD ($head_sha) in build inputs: $(echo "$changed" | tr '\n' ' '). Run cargo install --path ."
+        return 1
+    fi
+    echo "    [INFO] Gate 0: deployed $deployed trails HEAD $head_sha only by commits touching no build input ($GATE0_BUILD_INPUTS)"
     return 0
 }
 
@@ -539,6 +574,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         modern_timers) verify_modern_timers ;;
         host_docker_envelope) verify_host_docker_envelope ;;
         oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
+        gate0) verify_deployed_sha "${VERIFY_EXIT_CRITERIA_DEPLOYED_SHA:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
