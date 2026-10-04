@@ -158,7 +158,20 @@ case "${sub}" in
     exit 0
     ;;
   is-enabled)
-    [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ] && exit 0 || exit 1
+    if in_list "${1:-}" "${STUB_ENABLED_QUERY_FAIL_UNITS:-}"; then
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    fi
+    if in_list "${1:-}" "${STUB_IS_ENABLED_NOT_FOUND_UNITS:-}"; then
+      echo "Failed to get unit file state for ${1}: No such file or directory" >&2
+      exit 1
+    fi
+    if [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ]; then
+      echo enabled
+      exit 0
+    fi
+    echo disabled
+    exit 1
     ;;
   is-active)
     if in_list "${1:-}" "${STUB_QUERY_FAIL_UNITS:-}"; then
@@ -242,6 +255,64 @@ for unit in app-lima-vm.slice agents.slice automation.slice; do
   if [ ! -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
     fail "Case A: host control unit was not installed: ${unit}"
   fi
+done
+
+# A failed disable is safe only when a later query proves the timer is not
+# enabled.  Inactive runtime state alone must not authorize artifact removal.
+HOME_G="${WORK}/home_g"
+STATE_G="${WORK}/state_g"
+mkdir -p "${HOME_G}/.config/systemd/user" "${HOME_G}/.local/libexec/ezgha" "${STATE_G}"
+touch "${HOME_G}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_G}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_G}/.local/libexec/ezgha/agent-scope-reaper.sh" \
+      "${STATE_G}/agent-scope-reaper.timer.enabled"
+install_rc=0
+STUB_DISABLE_FAIL_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_G}" "${STATE_G}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case G: installer must fail when inactive reaper timer remains enabled"
+for stale in \
+  "${HOME_G}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_G}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_G}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case G: enabled reaper artifact was deleted: $stale"
+done
+
+# Failed enabled-state queries are not proof of retirement, even while both
+# units are inactive.
+HOME_H="${WORK}/home_h"
+STATE_H="${WORK}/state_h"
+mkdir -p "${HOME_H}/.config/systemd/user" "${HOME_H}/.local/libexec/ezgha" "${STATE_H}"
+touch "${HOME_H}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_H}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_H}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_ENABLED_QUERY_FAIL_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_H}" "${STATE_H}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case H: installer must fail closed when reaper enabled state cannot be queried"
+for stale in \
+  "${HOME_H}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_H}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_H}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case H: reaper artifact was deleted after enabled-state query failure: $stale"
+done
+
+# A deleted unit file is a valid enabled-state result only when runtime is
+# inactive, which this fixture supplies.
+HOME_I="${WORK}/home_i"
+STATE_I="${WORK}/state_i"
+mkdir -p "${HOME_I}/.config/systemd/user" "${HOME_I}/.local/libexec/ezgha" "${STATE_I}"
+touch "${HOME_I}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_I}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_I}/.local/libexec/ezgha/agent-scope-reaper.sh"
+STUB_IS_ENABLED_NOT_FOUND_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_I}" "${STATE_I}"
+for removed in \
+  "${HOME_I}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_I}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_I}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ ! -e "$removed" ] || fail "Case I: inactive absent reaper artifact survived: $removed"
 done
 
 for unit in psi-oom-watcher.service psi-oom-watcher.timer \

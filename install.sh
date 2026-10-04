@@ -20,9 +20,23 @@ info() { printf '\033[1m%s\033[0m\n' "$1"; }
 # shutdown operations independently, then require known-safe runtime states
 # for both units before their artifacts are removed.
 retire_user_units() {
-  local label="$1" timer="$2" service="$3" unit state state_rc unsafe=0
+  local label="$1" timer="$2" service="$3" unit state state_rc enabled_state enabled_rc unsafe=0
   systemctl --user disable --now "${timer}" 2>/dev/null || true
   systemctl --user stop "${service}" 2>/dev/null || true
+  enabled_rc=0
+  enabled_state=$(systemctl --user is-enabled "${timer}" 2>&1) || enabled_rc=$?
+  case "${enabled_state}" in
+    enabled|enabled-runtime)
+      bad "refusing to remove ${label} files: ${timer} is-enabled rc=${enabled_rc}, output=${enabled_state}"
+      unsafe=1
+      ;;
+    not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+    *)
+      bad "refusing to remove ${label} files: could not determine ${timer} enabled state rc=${enabled_rc}, output=${enabled_state:-<unavailable>}"
+      unsafe=1
+      ;;
+  esac
   for unit in "${timer}" "${service}"; do
     state_rc=0
     state=$(systemctl --user is-active "${unit}" 2>&1) || state_rc=$?
