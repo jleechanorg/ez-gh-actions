@@ -157,7 +157,7 @@ watchdog_has_image_heal_function() {
   grep -Eq '^[[:space:]]*(function[[:space:]]+)?ensure_runner_image[[:space:]]*\(\)[[:space:]]*\{' "$1" 2>/dev/null
 }
 watchdog_has_relative_dockerfile() {
-  grep -Eq -- '(^|[[:space:]])-f[[:space:]]+(\./)?Dockerfile\.runner([[:space:]]|$)' "$1" 2>/dev/null
+  grep -Eq -- "(^|[[:space:]])-f[[:space:]]+[\"']?([^/\$[:space:]][^\$[:space:]]*/)?Dockerfile\\.runner[\"']?([[:space:]]|$)" "$1" 2>/dev/null
 }
 if [ "$(uname -s)" = "Darwin" ] && [ "${WITH_WATCHDOG}" -eq 1 ] &&
    [ -d "${SCRIPT_DIR}/systemd" ]; then

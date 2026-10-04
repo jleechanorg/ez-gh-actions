@@ -39,6 +39,13 @@ for f in ${STAGED_SHELLSCRIPTS}; do
     continue
   fi
 
+  # This test intentionally embeds rejected docker build forms as mocked
+  # installer candidates. Exempt only this exact fixture file; runtime shell
+  # scripts, including every file under scripts/, remain checked below.
+  if [[ "${f}" == "tests/install_watchdog_gate_test.sh" ]]; then
+    continue
+  fi
+
   # Rule 1: 'docker build -f Dockerfile.runner' (relative, no leading
   # slash, no $variable prefix) is the bug class.
   if grep -nE 'docker build -f Dockerfile\.runner([[:space:]]|$)' "${f}" 2>/dev/null \

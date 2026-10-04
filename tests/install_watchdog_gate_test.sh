@@ -31,6 +31,39 @@ fail() {
   PASS=false
 }
 
+# ── Hook regression: reject runtime bad paths, accept deliberate fixtures ────
+# Each case gets a fresh temporary Git index so the repository's real index is
+# never touched. The fixture exemption is exact-path scoped; runtime scripts
+# still exercise the real pre-commit checks.
+run_hook_case() {
+  local name="$1" path="$2" content="$3" expected="$4"
+  local hook_repo="${WORK}/hook-${name}"
+  mkdir -p "${hook_repo}/.githooks" "${hook_repo}/$(dirname "${path}")"
+  git -C "${hook_repo}" init -q
+  cp "${REPO_ROOT}/.githooks/pre-commit" "${hook_repo}/.githooks/pre-commit"
+  chmod +x "${hook_repo}/.githooks/pre-commit"
+  printf '%s\n' "${content}" > "${hook_repo}/${path}"
+  git -C "${hook_repo}" add "${path}"
+  if (cd "${hook_repo}" && .githooks/pre-commit >"${hook_repo}/hook.log" 2>&1); then
+    actual=accept
+  else
+    actual=reject
+  fi
+  if [ "${actual}" != "${expected}" ]; then
+    cat "${hook_repo}/hook.log" >&2
+    fail "Hook case ${name}: expected ${expected}, got ${actual}"
+  else
+    echo "PASS: Hook case ${name}: ${actual}"
+  fi
+}
+
+run_hook_case runtime-bad scripts/runtime.sh \
+  'docker build -f ../Dockerfile.runner .' reject
+run_hook_case fixture-bad tests/install_watchdog_gate_test.sh \
+  'docker build -f ../Dockerfile.runner .' accept
+run_hook_case runtime-absolute scripts/runtime.sh \
+  'docker build -f "$repo_root/Dockerfile.runner" .' accept
+
 INSTALLED_MAC_HOST_ARG="$(
   sed -n 's/.*ezgha-fleet-watchdog\.sh" "--host \([^" ]*\)".*/\1/p' \
     "$REPO_ROOT/install.sh"
@@ -390,7 +423,7 @@ else
   echo "PASS: Case C: --with-watchdog run still enabled token-refresh + queue-reaper timers"
 fi
 
-# ── Cases F-I: macOS watchdog sentinel validation is pre-mutation ────────────
+# ── Cases F-I plus relative-path variants: pre-mutation validation ───────────
 # The source candidate is checked before stable payload copy and launchd unload.
 # Each rejected candidate must preserve both the prior script and loaded plist.
 mac_payload="${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh"
@@ -470,12 +503,66 @@ else
   fi
 fi
 
+MAC_HOME_QUOTED="${WORK}/home_quoted"
+MAC_STATE_QUOTED="${WORK}/state_quoted"
+MAC_LAUNCHCTL_QUOTED="${WORK}/launchctl_quoted"
+prepare_mac_prior_install "${MAC_HOME_QUOTED}" "${MAC_LAUNCHCTL_QUOTED}" 1
+cat > "${mac_payload}" <<'EOF'
+#!/usr/bin/env bash
+ensure_runner_image() { :; }
+docker build -f "./Dockerfile.runner" .
+EOF
+chmod +x "${mac_payload}"
+payload_before_quoted="$(cat "${MAC_HOME_QUOTED}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
+plist_before_quoted="$(cat "${MAC_HOME_QUOTED}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
+if run_mac_install "${MAC_HOME_QUOTED}" "${MAC_STATE_QUOTED}" "${MAC_LAUNCHCTL_QUOTED}"; then
+  fail "Case Q: quoted ./Dockerfile.runner sentinel unexpectedly installed"
+else
+  if [ "$(cat "${MAC_HOME_QUOTED}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_quoted}" ] ||
+     [ "$(cat "${MAC_HOME_QUOTED}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_quoted}" ]; then
+    fail "Case Q: quoted ./Dockerfile.runner sentinel changed the payload or plist"
+  elif [ ! -f "${MAC_LAUNCHCTL_QUOTED}/org.jleechanorg.ezgha-watchdog.loaded" ] ||
+       [ -e "${MAC_STATE_QUOTED}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_QUOTED}/service.calls" ]; then
+    fail "Case Q: quoted ./Dockerfile.runner sentinel mutated deployment state"
+  else
+    echo "PASS: Case Q: quoted ./Dockerfile.runner sentinel preserved watchdog payload and service"
+  fi
+fi
+
+MAC_HOME_PARENT="${WORK}/home_parent"
+MAC_STATE_PARENT="${WORK}/state_parent"
+MAC_LAUNCHCTL_PARENT="${WORK}/launchctl_parent"
+prepare_mac_prior_install "${MAC_HOME_PARENT}" "${MAC_LAUNCHCTL_PARENT}" 1
+cat > "${mac_payload}" <<'EOF'
+#!/usr/bin/env bash
+ensure_runner_image() { :; }
+docker build -f '../Dockerfile.runner' .
+EOF
+chmod +x "${mac_payload}"
+payload_before_parent="$(cat "${MAC_HOME_PARENT}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
+plist_before_parent="$(cat "${MAC_HOME_PARENT}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
+if run_mac_install "${MAC_HOME_PARENT}" "${MAC_STATE_PARENT}" "${MAC_LAUNCHCTL_PARENT}"; then
+  fail "Case P: parent-relative Dockerfile.runner sentinel unexpectedly installed"
+else
+  if [ "$(cat "${MAC_HOME_PARENT}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_parent}" ] ||
+     [ "$(cat "${MAC_HOME_PARENT}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_parent}" ]; then
+    fail "Case P: parent-relative Dockerfile.runner sentinel changed the payload or plist"
+  elif [ ! -f "${MAC_LAUNCHCTL_PARENT}/org.jleechanorg.ezgha-watchdog.loaded" ] ||
+       [ -e "${MAC_STATE_PARENT}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_PARENT}/service.calls" ]; then
+    fail "Case P: parent-relative Dockerfile.runner sentinel mutated deployment state"
+  else
+    echo "PASS: Case P: parent-relative Dockerfile.runner sentinel preserved watchdog payload and service"
+  fi
+fi
+
 MAC_HOME_I="${WORK}/home_i"
 MAC_STATE_I="${WORK}/state_i"
 MAC_LAUNCHCTL_I="${WORK}/launchctl_i"
 cat > "${mac_payload}" <<'EOF'
 #!/usr/bin/env bash
 ensure_runner_image() { :; }
+docker build -f "$dockerfile_path" .
+docker build -f "$repo_root/Dockerfile.runner" .
 EOF
 chmod +x "${mac_payload}"
 run_mac_install "${MAC_HOME_I}" "${MAC_STATE_I}" "${MAC_LAUNCHCTL_I}"
