@@ -893,7 +893,7 @@ EOF
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.
     if systemctl --user set-property --runtime lima-vm@colima.service \
-         MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null; then
+         MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null; then
       ok "live QEMU service memory+CPU ceiling applied"
     else
       warn "live QEMU ceiling not applied — it will take effect on the next Colima start"

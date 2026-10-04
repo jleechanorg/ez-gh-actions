@@ -14,8 +14,8 @@ Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target
 
 [Slice]
-MemoryHigh=8G
-MemoryMax=10G
+MemoryHigh=4G
+MemoryMax=5G
 MemorySwapMax=1G
 TasksMax=4096
 MemoryAccounting=yes

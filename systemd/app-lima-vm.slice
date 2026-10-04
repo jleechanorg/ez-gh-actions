@@ -10,8 +10,8 @@
 # MemoryMax is a finite final containment boundary for a runaway VM. This
 # ordering preserves normal operation while preventing unbounded host impact.
 #
-# 34 GiB was measured against a 31.8 GiB normal QEMU RSS peak, leaving a
-# measured margin of 2.2 GiB before reclaim. MemoryMax=38G is 6.2 GiB above that peak;
+# 9 GiB was measured against a 31.8 GiB normal QEMU RSS peak, leaving a
+# measured margin of 2.2 GiB before reclaim. MemoryMax=10G is 6.2 GiB above that peak;
 # the finite swap/task ceilings bound transient accounting and fork growth.
 # CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
 # (historical 24 is stale). This caps runnable QEMU time; D-state still counts
@@ -23,15 +23,15 @@
 #   systemctl --user restart lima-vm@colima.service
 # Then verify:
 #   cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-lima\\x2dvm.slice/lima-vm@colima.service/memory.high
-# should print 36507222016 (= 34 GiB).
+# should print 36507222016 (= 9 GiB).
 
 [Unit]
-Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (34 GiB)
+Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (9 GiB)
 Before=slices.target
 
 [Slice]
-MemoryHigh=34G
-MemoryMax=38G
+MemoryHigh=9G
+MemoryMax=10G
 MemorySwapMax=2G
 TasksMax=4096
 MemoryAccounting=yes

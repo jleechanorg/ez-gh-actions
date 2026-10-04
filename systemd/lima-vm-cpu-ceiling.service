@@ -9,7 +9,7 @@ PartOf=lima-vm@colima.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/systemctl --user set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%
+ExecStart=/usr/bin/systemctl --user set-property --runtime lima-vm@colima.service MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%
 
 [Install]
 WantedBy=lima-vm@colima.service
