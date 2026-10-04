@@ -140,6 +140,11 @@ if [ "${1:-}" = "--user" ]; then shift; fi
 printf '%s\n' "$*" >> "${SYSTEMCTL_CAPTURE:-/dev/null}"
 sub="${1:-}"
 shift || true
+in_list() {
+  local needle="$1" item
+  for item in ${2:-}; do [ "$item" = "$needle" ] && return 0; done
+  return 1
+}
 case "${sub}" in
   enable)
     [ "${1:-}" = "--now" ] && shift
@@ -148,6 +153,7 @@ case "${sub}" in
     ;;
   disable)
     [ "${1:-}" = "--now" ] && shift
+    if in_list "${1:-}" "${STUB_DISABLE_FAIL_UNITS:-}"; then exit 1; fi
     rm -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled"
     exit 0
     ;;
@@ -155,11 +161,11 @@ case "${sub}" in
     [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ] && exit 0 || exit 1
     ;;
   is-active)
-    if [ "${STUB_REAPER_BUS_FAILURE:-0}" = 1 ] && [ "${1:-}" = agent-scope-reaper.service ]; then
+    if in_list "${1:-}" "${STUB_QUERY_FAIL_UNITS:-}"; then
       echo 'Failed to connect to bus: No medium found' >&2
       exit 1
     fi
-    if [ "${STUB_REAPER_ACTIVE:-0}" = 1 ] && [ "${1:-}" = agent-scope-reaper.service ]; then
+    if in_list "${1:-}" "${STUB_ACTIVE_UNITS:-}"; then
       echo active
       exit 0
     fi
@@ -167,7 +173,7 @@ case "${sub}" in
     exit 3
     ;;
   stop)
-    if [ "${STUB_REAPER_STOP_FAIL:-0}" = 1 ] && [ "${1:-}" = agent-scope-reaper.service ]; then
+    if in_list "${1:-}" "${STUB_STOP_FAIL_UNITS:-}"; then
       exit 1
     fi
     exit 0
@@ -262,7 +268,8 @@ touch "${HOME_D}/.config/systemd/user/agent-scope-reaper.service" \
       "${HOME_D}/.config/systemd/user/agent-scope-reaper.timer" \
       "${HOME_D}/.local/libexec/ezgha/agent-scope-reaper.sh"
 install_rc=0
-STUB_REAPER_STOP_FAIL=1 STUB_REAPER_ACTIVE=1 run_install "${HOME_D}" "${STATE_D}" || install_rc=$?
+STUB_STOP_FAIL_UNITS=agent-scope-reaper.service STUB_ACTIVE_UNITS=agent-scope-reaper.service \
+  run_install "${HOME_D}" "${STATE_D}" || install_rc=$?
 [ "$install_rc" -ne 0 ] \
   || fail "Case D: installer must fail when agent-scope-reaper remains active"
 for stale in \
@@ -274,7 +281,7 @@ done
 grep -Fq 'refusing to remove agent-scope-reaper files' "${HOME_D}/install.log" \
   || fail "Case D: installer omitted active-reaper refusal"
 
-# An unavailable user-manager bus is not evidence that the old service stopped.
+# A reaper timer that remains active is not safe even if its service stopped.
 HOME_E="${WORK}/home_e"
 STATE_E="${WORK}/state_e"
 mkdir -p "${HOME_E}/.config/systemd/user" "${HOME_E}/.local/libexec/ezgha" "${STATE_E}"
@@ -282,14 +289,57 @@ touch "${HOME_E}/.config/systemd/user/agent-scope-reaper.service" \
       "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" \
       "${HOME_E}/.local/libexec/ezgha/agent-scope-reaper.sh"
 install_rc=0
-STUB_REAPER_BUS_FAILURE=1 run_install "${HOME_E}" "${STATE_E}" || install_rc=$?
+STUB_DISABLE_FAIL_UNITS=agent-scope-reaper.timer STUB_ACTIVE_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_E}" "${STATE_E}" || install_rc=$?
 [ "$install_rc" -ne 0 ] \
-  || fail "Case E: installer must fail closed when reaper service state cannot be queried"
+  || fail "Case E: installer must fail when agent-scope-reaper timer remains active"
 for stale in \
   "${HOME_E}/.config/systemd/user/agent-scope-reaper.service" \
   "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" \
   "${HOME_E}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
-  [ -e "$stale" ] || fail "Case E: reaper artifact was deleted after state-query failure: $stale"
+  [ -e "$stale" ] || fail "Case E: reaper artifact was deleted while timer remained active: $stale"
+done
+
+# An unavailable user-manager bus is not evidence that the reaper timer stopped.
+HOME_F="${WORK}/home_f"
+STATE_F="${WORK}/state_f"
+mkdir -p "${HOME_F}/.config/systemd/user" "${HOME_F}/.local/libexec/ezgha" "${STATE_F}"
+touch "${HOME_F}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_F}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_F}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_QUERY_FAIL_UNITS=agent-scope-reaper.timer run_install "${HOME_F}" "${STATE_F}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case F: installer must fail closed when reaper timer state cannot be queried"
+for stale in \
+  "${HOME_F}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_F}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_F}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case F: reaper artifact was deleted after timer query failure: $stale"
+done
+
+# The PSI watcher must be stopped and verified before its retired files vanish.
+for psi_case in active query; do
+  psi_home="${WORK}/home_psi_${psi_case}"
+  psi_state="${WORK}/state_psi_${psi_case}"
+  mkdir -p "${psi_home}/.config/systemd/user"
+  touch "${psi_home}/.config/systemd/user/psi-oom-watcher.service" \
+        "${psi_home}/.config/systemd/user/psi-oom-watcher.timer"
+  install_rc=0
+  if [ "$psi_case" = active ]; then
+    STUB_DISABLE_FAIL_UNITS=psi-oom-watcher.timer STUB_ACTIVE_UNITS=psi-oom-watcher.service \
+      run_install "${psi_home}" "${psi_state}" || install_rc=$?
+  else
+    STUB_QUERY_FAIL_UNITS=psi-oom-watcher.service \
+      run_install "${psi_home}" "${psi_state}" || install_rc=$?
+  fi
+  [ "$install_rc" -ne 0 ] \
+    || fail "Case PSI-${psi_case}: installer must fail before removing unsafe watcher units"
+  for stale in \
+    "${psi_home}/.config/systemd/user/psi-oom-watcher.service" \
+    "${psi_home}/.config/systemd/user/psi-oom-watcher.timer"; do
+    [ -e "$stale" ] || fail "Case PSI-${psi_case}: watcher artifact was deleted unsafely: $stale"
+  done
 done
 
 # ── Case C: macOS path removes the leftover fleet watchdog LaunchAgent ───────
@@ -301,9 +351,6 @@ for needle in \
   grep -qF -- "${needle}" "${REPO_ROOT}/install.sh" \
     || fail "Case C: install.sh macOS path lacks watchdog removal: ${needle}"
 done
-if grep -q 'agent-scope-reaper.timer' "${REPO_ROOT}/docs/verify-exit-criteria.sh"; then
-  fail "Case C: verifier still requires agent-scope-reaper.timer"
-fi
 
 # ── Case B: uninstall removes host controls and restored CLI symlinks ─────────
 HOME_B="${WORK}/home_b"

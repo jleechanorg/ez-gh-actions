@@ -165,10 +165,8 @@ grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
 [ ! -e "$TMP/remediation-was-called" ] \
   || fail "read-only kdump target invoked forbidden remediation"
 
-# Gate 8 obsolete-timer loop: agent-scope-reaper was deleted and the PSI
-# watcher is disabled by policy (install.sh), so the verifier must NOT demand
-# either timer be enabled+active, and must fail if psi-oom-watcher.timer is
-# enabled (policy drift).
+# Gate 8 retires both agent-scope-reaper and the PSI watcher. Neither may be
+# enabled or still active after its unit file was removed.
 mkdir -p "$TMP/timerbin"
 cat > "$TMP/timerbin/systemctl" <<'EOF2'
 #!/usr/bin/env bash
@@ -206,7 +204,7 @@ run_gate8_pre_envelope() {
   modern_start=$(grep -n '^if \[ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" \]' "$VERIFY" | cut -d: -f1)
   gate_start=$(awk -v min="$gate_header" -v max="$modern_start" \
     'NR >= min && NR < max && /^if \[ "\$\(uname -s\)" = "Linux" \]; then$/ { print NR; exit }' "$VERIFY")
-  timer_start=$(grep -n '^verify_modern_timers() {' "$VERIFY" | cut -d: -f1)
+  timer_start=$(grep -n '^verify_retired_timer() {' "$VERIFY" | cut -d: -f1)
   timer_end=$(awk -v start="$timer_start" 'NR > start && /^}$/ { print NR; exit }' "$VERIFY")
   [ -n "$gate_start" ] && [ -n "$timer_start" ] && [ -n "$timer_end" ] \
     || fail "could not extract Gate 8 Linux pre-envelope timer policy"
@@ -220,6 +218,10 @@ run_gate8_pre_envelope() {
   daemon_in_vm() { return 1; }
   verify_managed_runners_in_actions_slice() { return 0; }
   eval "$(sed -n "${timer_start},${timer_end}p" "$VERIFY")"
+  verify_modern_timers() {
+    verify_retired_timer agent-scope-reaper.timer || return 1
+    verify_retired_timer psi-oom-watcher.timer
+  }
   eval "$(sed -n "${gate_start},$((modern_start - 1))p" "$VERIFY")"
   GATE8_POLICY_RESULT="$GATE8_POLICY_FAILURE"
   eval "$original_fail"
@@ -335,12 +337,22 @@ PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_BROKEN=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
   bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
 [ "$timers_rc" -ne 0 ] || fail "absent-file runtime-state query failure must fail Gate 8 closed"
+# The deleted reaper has the same lifecycle requirement: an absent file does
+# not establish that an already-loaded timer has stopped.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_TIMERS="agent-scope-reaper.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file but active reaper timer must fail Gate 8"
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file reaper timer query failure must fail Gate 8 closed"
 # systemd 255 prints exactly "not-found" (exit 4) for an absent unit, the
 # normal state once install.sh has deleted the watcher unit files.
 PATH="$TMP/timerbin:$PATH" STUB_NOTFOUND=1 \
   VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
   bash "$VERIFY" >/dev/null 2>&1 || fail "systemd not-found (exit 4) for absent timer must pass"
-[ "$(grep -c 'agent-scope-reaper' "$VERIFY")" -eq 0 ] \
-  || fail "verifier still references deleted agent-scope-reaper"
 
 echo "VERIFY_EXIT_GATE8_TEST: PASS"

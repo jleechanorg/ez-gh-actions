@@ -68,7 +68,10 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
   is-active)
-    if [ "${2:-}" = agent-scope-reaper.service ]; then
+    if [ "${2:-}" = agent-scope-reaper.timer ] \
+       || [ "${2:-}" = agent-scope-reaper.service ] \
+       || [ "${2:-}" = psi-oom-watcher.timer ] \
+       || [ "${2:-}" = psi-oom-watcher.service ]; then
       echo inactive
       exit 3
     fi
