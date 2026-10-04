@@ -16,6 +16,41 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; }
 warn() { printf '  \033[33m⚠\033[0m %s\n' "$1" >&2; }
 info() { printf '\033[1m%s\033[0m\n' "$1"; }
 
+# Retired units may remain loaded after their files disappear. Attempt both
+# shutdown operations independently, then require known-safe runtime states
+# for both units before their artifacts are removed.
+retire_user_units() {
+  local label="$1" timer="$2" service="$3" unit state state_rc enabled_state enabled_rc unsafe=0
+  systemctl --user disable --now "${timer}" 2>/dev/null || true
+  systemctl --user stop "${service}" 2>/dev/null || true
+  enabled_rc=0
+  enabled_state=$(systemctl --user is-enabled "${timer}" 2>&1) || enabled_rc=$?
+  case "${enabled_state}" in
+    enabled|enabled-runtime)
+      bad "refusing to remove ${label} files: ${timer} is-enabled rc=${enabled_rc}, output=${enabled_state}"
+      unsafe=1
+      ;;
+    not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+    *)
+      bad "refusing to remove ${label} files: could not determine ${timer} enabled state rc=${enabled_rc}, output=${enabled_state:-<unavailable>}"
+      unsafe=1
+      ;;
+  esac
+  for unit in "${timer}" "${service}"; do
+    state_rc=0
+    state=$(systemctl --user is-active "${unit}" 2>&1) || state_rc=$?
+    case "${state}" in
+      inactive|failed|not-found) ;;
+      *)
+        bad "refusing to remove ${label} files: ${unit} is-active rc=${state_rc}, output=${state:-<unavailable>}"
+        unsafe=1
+        ;;
+    esac
+  done
+  [ "${unsafe}" -eq 0 ]
+}
+
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -705,12 +740,12 @@ FSTRIM_EOF
     else
       info "guest fstrim.timer override skipped — colima not installed or default profile not running"
     fi
-    # Clear any legacy watchdog plist on macOS
+    # Remove the deleted fleet watchdog (it ran every 120 s with
+    # EZGHA_WATCHDOG_ALLOW_RESTART=1): unload it even if the plist is already
+    # gone, then delete the plist and the stale libexec script.
     watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
-    if [ -f "${watchdog_plist}" ]; then
-      launchctl unload "${watchdog_plist}" 2>/dev/null || true
-      rm -f "${watchdog_plist}"
-    fi
+    launchctl bootout "gui/$(id -u)/org.jleechanorg.ezgha-watchdog" 2>/dev/null || true
+    rm -f "${watchdog_plist}" "${HOME}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux: copy the systemd units with @SCRIPTS_DIR@ / @HOME@ placeholders substituted
     USER_UNIT_DIR="${HOME}/.config/systemd/user"
@@ -737,7 +772,7 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
@@ -746,11 +781,19 @@ FSTRIM_EOF
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
-    for unit in agent-scope-reaper.service agent-scope-reaper.timer; do
-      sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
-          -e "s|@HOME@|${HOME_DIR}|g" \
-          "${UNIT_DIR}/${unit}" > "${USER_UNIT_DIR}/${unit}"
-    done
+    # agent-scope-reaper was deleted (it killed live cursor-agent, bead
+    # ez-gh-actions-8o81): heal any previously installed copy.
+    if ! retire_user_units agent-scope-reaper agent-scope-reaper.timer agent-scope-reaper.service; then
+      exit 1
+    fi
+    rm -f "${USER_UNIT_DIR}/agent-scope-reaper.service" \
+          "${USER_UNIT_DIR}/agent-scope-reaper.timer" \
+          "${SCRIPTS_DIR}/agent-scope-reaper.sh"
+    # Retire the unsafe PSI watcher before deleting its unit files. Do not let
+    # a timer-disable failure skip the explicit service stop or verification.
+    if ! retire_user_units psi-oom-watcher psi-oom-watcher.timer psi-oom-watcher.service; then
+      exit 1
+    fi
     rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" \
           "${USER_UNIT_DIR}/psi-oom-watcher.timer" \
           "${USER_UNIT_DIR}/ezgha.service.d/10-oomd-omit.conf"
@@ -861,8 +904,7 @@ EOF
     # Auxiliary mutation loops are opt-out by policy. Keep their tracked units
     # installed for manual diagnostics, but heal prior enabled state.
     for pair in \
-      "ezgha-queue-reaper.timer ezgha-queue-reaper.service" \
-      "agent-scope-reaper.timer agent-scope-reaper.service"; do
+      "ezgha-queue-reaper.timer ezgha-queue-reaper.service"; do
       timer="${pair%% *}"
       service="${pair#* }"
       if systemctl --user disable --now "${timer}" 2>/dev/null \
@@ -872,17 +914,6 @@ EOF
         bad "failed to disable auxiliary loop: ${timer} / ${service}"
       fi
     done
-    # Retired after the 2026-08-26 incident where the user-scope PSI watcher
-    # selected Warp's AppImage process as its fallback SIGTERM target. Keep the
-    # tracked script/unit installed for audit and manual diagnostics, but heal
-    # any previously enabled timer and stop an invocation already in flight.
-    if systemctl --user disable --now psi-oom-watcher.timer 2>/dev/null \
-       && systemctl --user stop psi-oom-watcher.service 2>/dev/null; then
-      ok "systemd --user PSI OOM watcher disabled by policy"
-    else
-      bad "failed to disable psi-oom-watcher (run: systemctl --user status psi-oom-watcher.timer psi-oom-watcher.service)"
-    fi
-
     # Clean up any drifted or legacy watchdog units
     if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
       systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null || true
