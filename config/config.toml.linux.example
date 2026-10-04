@@ -1,4 +1,4 @@
-# jeff-ubuntu fleet — 10 runners.
+# jeff-ubuntu fleet — approved 14-runner profile (10-runner rollback also supported).
 # Install: cp config/config.toml.linux.example ~/.config/ezgha/config.toml
 version = 1
 
@@ -9,20 +9,19 @@ target = "jleechanorg"
 [runner]
 name_prefix = "ez-runner-c"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64"]
-count = 10
+count = 14
 image = "ezgha-runner:latest"
-# Colima is provisioned with 36 GiB on this host. Keeping the explicit value
-# makes the physical-host envelope check active instead of relying on daemon
-# auto-detection.
+# Keep the existing VM and host memory envelope; 14 × 2000 MiB remains below
+# the 32768 MiB guest budget after its 4096 MiB reserve.
 vm_total_mb = 36864
 guest_reserve_mb = 4096
-# Reserve 8 GiB of the 62.8 GiB physical host for the host OS and non-runner
-# services (at least max(2 GiB, 10% of physical RAM)). The configured VM total
-# must fit below this envelope.
+runner_floor_mb = 2000
+# Reserve 8 GiB of the existing 62.8 GiB physical host for the host OS and
+# non-runner services. The configured VM total must fit below this envelope.
 host_reserve_mb = 8192
 
 [limits]
-memory_mb = 2500
+memory_mb = 2000
 cpus = 2.0
 pids = 512
 min_free_disk_gb = 10

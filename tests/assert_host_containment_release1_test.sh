@@ -15,9 +15,16 @@ bash -n "$ASSERT_SCRIPT" || fail "syntax error in scripts/host/assert-host-conta
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+grep -q -- '--runner-count' "$ASSERT_SCRIPT" || fail "assert script does not expose the bounded runner-count selector"
+grep -q 'ACTIONS_PIDS_MAX=8000' "$ASSERT_SCRIPT" || fail "assert script does not retain the 14-runner TasksMax=8000 profile"
 
 setup_passing_fixture() {
-  local root="$1"
+  local root="$1" runner_count="${2:-14}" pids_max
+  case "$runner_count" in
+    10) pids_max=6000 ;;
+    14) pids_max=8000 ;;
+    *) fail "test fixture does not support runner count $runner_count" ;;
+  esac
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
            "$root/etc/systemd/system/-.slice.d" \
            "$root/etc/systemd/system/user.slice.d" \
@@ -39,7 +46,7 @@ setup_passing_fixture() {
   printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
   printf '30064771072\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
   printf '0\n' > "$root/sys/fs/cgroup/actions.slice/memory.swap.max"
-  printf '6000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
+  printf '%s\n' "$pids_max" > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
   printf 'default 25\n' > "$root/sys/fs/cgroup/actions.slice/io.weight"
 
@@ -63,11 +70,12 @@ setup_passing_fixture() {
   # Mock docker command
   cat > "$root/bin/docker" <<'DOCKER_EOF'
 #!/usr/bin/env bash
+runner_count=__FIXTURE_RUNNER_COUNT__
 if [ "$1" = "--host" ]; then shift 2; fi
 if [ "$1" = "info" ]; then
   printf '2 systemd\n'
 elif [ "$1" = "ps" ]; then
-  for i in $(seq 1 10); do
+  for i in $(seq 1 "$runner_count"); do
     printf "cid%02d ez-runner-c-%d\n" "$i" "$i"
   done
 elif [ "$1" = "inspect" ]; then
@@ -75,10 +83,12 @@ elif [ "$1" = "inspect" ]; then
   printf '%s\n' "$((10000 + 10#$slot))"
 fi
 DOCKER_EOF
+  sed "s/__FIXTURE_RUNNER_COUNT__/$runner_count/" "$root/bin/docker" > "$root/bin/docker.tmp"
+  mv "$root/bin/docker.tmp" "$root/bin/docker"
   chmod +x "$root/bin/docker"
 
   # Mock /proc/<pid>/cgroup for each container PID
-  for i in $(seq 1 10); do
+  for i in $(seq 1 "$runner_count"); do
     local pid=$((10000 + i))
     mkdir -p "$root/proc/$pid"
     printf "0::/actions.slice/docker-cid%02d.scope\n" "$i" > "$root/proc/$pid/cgroup"
@@ -89,7 +99,12 @@ DOCKER_EOF
 FIXTURE_PASS="$WORK/pass"
 setup_passing_fixture "$FIXTURE_PASS"
 PATH="$FIXTURE_PASS/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet || fail "passing fixture failed assertion"
-ok "assert-host-containment-release1.sh passes valid fixture"
+ok "assert-host-containment-release1.sh passes valid default-14 fixture"
+
+FIXTURE_ROLLBACK="$WORK/rollback"
+setup_passing_fixture "$FIXTURE_ROLLBACK" 10
+PATH="$FIXTURE_ROLLBACK/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_ROLLBACK" --runner-count 10 --require-fleet || fail "assert script rejected explicit 10-runner rollback fixture"
+ok "assert-host-containment-release1.sh accepts explicit 10-runner rollback fixture"
 
 # 2. Test memory below floor (65,011,711 KiB)
 FIXTURE_MEM_FAIL="$WORK/mem_fail"
@@ -140,17 +155,24 @@ if [ "$1" = "--host" ]; then shift 2; fi
 if [ "$1" = "info" ]; then
   printf '2 systemd\n'
 elif [ "$1" = "ps" ]; then
-  for i in $(seq 1 9); do
+  for i in $(seq 1 13); do
     printf "cid%02d ez-runner-c-%d\n" "$i" "$i"
   done
 fi
 DOCKER_EOF
 chmod +x "$FIXTURE_COUNT_FAIL/bin/docker"
 if PATH="$FIXTURE_COUNT_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_COUNT_FAIL" --require-fleet > "$WORK/count_fail.log" 2>&1; then
-  fail "assertion passed when runner container count was 9"
+  fail "assertion passed when runner container count was 13"
 fi
 grep -q "FAIL: runner container count" "$WORK/count_fail.log" || fail "missing runner count failure message"
-ok "assert-host-containment-release1.sh rejects container count != 10"
+ok "assert-host-containment-release1.sh rejects container count != 14"
+
+INVALID_ASSERT_ROOT="$WORK/invalid"
+setup_passing_fixture "$INVALID_ASSERT_ROOT"
+if PATH="$INVALID_ASSERT_ROOT/bin:$PATH" "$ASSERT_SCRIPT" --root "$INVALID_ASSERT_ROOT" --runner-count 12 > "$WORK/invalid_assert.log" 2>&1; then
+  fail "assert-host-containment-release1.sh accepted unsupported runner count 12"
+fi
+ok "assert-host-containment-release1.sh rejects unsupported runner count"
 
 # 7. Test PID not in actions.slice ancestry
 FIXTURE_ANCESTRY_FAIL="$WORK/ancestry_fail"

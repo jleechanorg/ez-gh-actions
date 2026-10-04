@@ -4,14 +4,23 @@ set -euo pipefail
 
 ROOT="/"
 REQUIRE_FLEET=0
+RUNNER_COUNT=14
+fail() { echo "FAIL: $*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) ROOT="$2"; shift 2 ;;
     --require-fleet) REQUIRE_FLEET=1; shift ;;
+    --runner-count)
+      [ "$#" -ge 2 ] || fail "--runner-count requires 10 or 14"
+      RUNNER_COUNT="$2"; shift 2 ;;
     *) echo "FAIL: unknown argument '$1'" >&2; exit 1 ;;
   esac
 done
-fail() { echo "FAIL: $*" >&2; exit 1; }
+case "$RUNNER_COUNT" in
+  10) ACTIONS_PIDS_MAX=6000 ;;
+  14) ACTIONS_PIDS_MAX=8000 ;;
+  *) fail "runner count must be 10 or 14 (got $RUNNER_COUNT)" ;;
+esac
 
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
@@ -39,7 +48,7 @@ check_cgroup_val() {
 check_cgroup_val "$ACTIONS_DIR/memory.high" 27917287424 memory.high
 check_cgroup_val "$ACTIONS_DIR/memory.max" 30064771072 memory.max
 check_cgroup_val "$ACTIONS_DIR/memory.swap.max" 0 memory.swap.max
-check_cgroup_val "$ACTIONS_DIR/pids.max" 6000 pids.max
+check_cgroup_val "$ACTIONS_DIR/pids.max" "$ACTIONS_PIDS_MAX" pids.max
 check_cgroup_val "$ACTIONS_DIR/cpu.max" "2000000 100000" cpu.max
 io_weight="$(cat "$ACTIONS_DIR/io.weight" 2>/dev/null || true)"
 [[ "$io_weight" =~ (^|[[:space:]])25($|[[:space:]]) ]] || fail "actions.slice io.weight ('$io_weight') does not contain 25"
@@ -80,7 +89,7 @@ if [ "$REQUIRE_FLEET" -eq 1 ]; then
   docker_cgroup="$(docker_cmd info --format '{{.CgroupVersion}} {{.CgroupDriver}}' 2>/dev/null || true)"
   [ "$docker_cgroup" = "2 systemd" ] || fail "Docker cgroup mode ('$docker_cgroup') != '2 systemd'"
   mapfile -t containers < <(docker_cmd ps --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 ~ /^ez-runner-c-[0-9]+$/ {print $1 " " $2}')
-  [ "${#containers[@]}" -eq 10 ] || fail "runner container count (${#containers[@]}) != 10"
+  [ "${#containers[@]}" -eq "$RUNNER_COUNT" ] || fail "runner container count (${#containers[@]}) != $RUNNER_COUNT"
   for container in "${containers[@]}"; do
     read -r cid cname <<< "$container"
     cpid="$(docker_cmd inspect --format '{{.State.Pid}}' "$cid" 2>/dev/null || true)"

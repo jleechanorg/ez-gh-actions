@@ -2589,15 +2589,44 @@ static TEST_USER_MANAGER_OOM_PROPERTIES: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
 
 #[cfg(target_os = "linux")]
-const HOST_ACTIONS_MEMORY_HIGH_BYTES: u64 = 26 * 1024 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const HOST_ACTIONS_MEMORY_MAX_BYTES: u64 = 28 * 1024 * 1024 * 1024;
-#[cfg(target_os = "linux")]
-const HOST_ACTIONS_PIDS_MAX: u64 = 6000;
-#[cfg(target_os = "linux")]
 const HOST_ACTIONS_CPU_QUOTA_USEC: u64 = 2_000_000;
 #[cfg(target_os = "linux")]
 const HOST_ACTIONS_CPU_PERIOD_USEC: u64 = 100_000;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct HostActionsProfile {
+    runner_memory_mb: u64,
+    runner_pids: Option<u32>,
+    memory_high_bytes: u64,
+    memory_max_bytes: u64,
+    pids_max: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn host_actions_profile(runner_count: u32) -> Option<HostActionsProfile> {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    match runner_count {
+        // Keep the deployed 10-runner envelope available for rollback.
+        10 => Some(HostActionsProfile {
+            runner_memory_mb: 2500,
+            runner_pids: None,
+            memory_high_bytes: 26 * GIB,
+            memory_max_bytes: 28 * GIB,
+            pids_max: 6000,
+        }),
+        // The 14-runner profile lowers per-job memory while retaining the
+        // current aggregate host memory boundary.
+        14 => Some(HostActionsProfile {
+            runner_memory_mb: 2000,
+            runner_pids: Some(512),
+            memory_high_bytes: 26 * GIB,
+            memory_max_bytes: 28 * GIB,
+            pids_max: 8000,
+        }),
+        _ => None,
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn host_containment_daemon_in_vm() -> bool {
@@ -2645,18 +2674,21 @@ fn read_host_actions_limit(root: &Path, name: &str) -> Result<String> {
 
 /// Confirm the finite cgroup-v2 limits that bound the complete HostDocker fleet.
 #[cfg(target_os = "linux")]
-fn validate_host_actions_slice(root: &Path) -> Result<()> {
+fn validate_host_actions_slice(root: &Path, runner_count: u32) -> Result<()> {
+    let profile = host_actions_profile(runner_count).ok_or_else(|| {
+        anyhow::anyhow!("host containment supports runner counts 10 or 14 (got {runner_count})")
+    })?;
     let memory_high = read_host_actions_limit(root, "memory.high")?;
     let memory_high = memory_high.parse::<u64>().with_context(|| {
         format!(
             "host containment requires finite actions.slice memory.high={} bytes (got {memory_high:?})",
-            HOST_ACTIONS_MEMORY_HIGH_BYTES
+            profile.memory_high_bytes
         )
     })?;
-    if memory_high != HOST_ACTIONS_MEMORY_HIGH_BYTES {
+    if memory_high != profile.memory_high_bytes {
         bail!(
             "host containment requires actions.slice memory.high={} bytes (got {memory_high})",
-            HOST_ACTIONS_MEMORY_HIGH_BYTES
+            profile.memory_high_bytes
         );
     }
 
@@ -2664,13 +2696,13 @@ fn validate_host_actions_slice(root: &Path) -> Result<()> {
     let memory_max = memory_max.parse::<u64>().with_context(|| {
         format!(
             "host containment requires finite actions.slice memory.max={} bytes (got {memory_max:?})",
-            HOST_ACTIONS_MEMORY_MAX_BYTES
+            profile.memory_max_bytes
         )
     })?;
-    if memory_max != HOST_ACTIONS_MEMORY_MAX_BYTES {
+    if memory_max != profile.memory_max_bytes {
         bail!(
             "host containment requires actions.slice memory.max={} bytes (got {memory_max})",
-            HOST_ACTIONS_MEMORY_MAX_BYTES
+            profile.memory_max_bytes
         );
     }
 
@@ -2684,12 +2716,14 @@ fn validate_host_actions_slice(root: &Path) -> Result<()> {
     let pids_max = read_host_actions_limit(root, "pids.max")?;
     let pids_max = pids_max.parse::<u64>().with_context(|| {
         format!(
-            "host containment requires finite actions.slice pids.max={HOST_ACTIONS_PIDS_MAX} (got {pids_max:?})"
+            "host containment requires finite actions.slice pids.max={} (got {pids_max:?})",
+            profile.pids_max
         )
     })?;
-    if pids_max != HOST_ACTIONS_PIDS_MAX {
+    if pids_max != profile.pids_max {
         bail!(
-            "host containment requires actions.slice pids.max={HOST_ACTIONS_PIDS_MAX} (got {pids_max})"
+            "host containment requires actions.slice pids.max={} (got {pids_max})",
+            profile.pids_max
         );
     }
 
@@ -2813,19 +2847,33 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
         if cfg.limits.cgroup_parent.as_deref() != Some("actions.slice") {
             bail!("host containment requires limits.cgroup_parent=actions.slice");
         }
-        if cfg.runner.count != 10 {
+        if host_actions_profile(cfg.runner.count).is_none() {
             bail!(
-                "host containment requires runner count to be exactly 10; configured count is {}",
+                "host containment supports runner counts 10 or 14; configured count is {}",
                 cfg.runner.count
             );
         }
-        if cfg.limits.memory_mb != 2500 {
+        let profile = host_actions_profile(cfg.runner.count)
+            .expect("supported runner profile was checked above");
+        if cfg.limits.memory_mb != profile.runner_memory_mb {
             bail!(
-                "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
+                "host containment requires limits.memory_mb to be exactly {} for runner count {}; configured memory is {}",
+                profile.runner_memory_mb,
+                cfg.runner.count,
                 cfg.limits.memory_mb
             );
         }
-        validate_host_actions_slice(&host_actions_cgroup_root())?;
+        if let Some(pids) = profile.runner_pids {
+            if cfg.limits.pids != pids {
+                bail!(
+                    "host containment requires limits.pids to be exactly {} for runner count {}; configured PID limit is {}",
+                    pids,
+                    cfg.runner.count,
+                    cfg.limits.pids
+                );
+            }
+        }
+        validate_host_actions_slice(&host_actions_cgroup_root(), cfg.runner.count)?;
         require_user_manager_oom_neutrality()?;
     }
     Ok(())
@@ -3866,13 +3914,12 @@ where
         return Ok(ReadinessSummary::default());
     }
     // Bounded parallelism: spawn one probe per container, capped by the
-    // fleet contract (10 Linux + 6 Mac = 16 max — itself under the
+    // current fleet contract (14 Linux + 6 Mac = 20 max — itself under the
     // `DockerChildReaper`'s `DOCKER_REAPER_ACTIVE_CAP` of 64). The shared
     // 30s readiness deadline (`LOCAL_READINESS_BUDGET`) means the worst-case
     // wall-clock cost of this whole readiness pass is bounded by
-    // `LOCAL_TOP_TIMEOUT` (6s) plus deadline overhead — sequential probes
-    // previously could spend up to 30s on a 10-container Linux host when
-    // every top call hit its per-probe timeout (bead jleechan-95jk).
+    // `LOCAL_TOP_TIMEOUT` (6s) plus deadline overhead when every top call hits
+    // its per-probe timeout.
     //
     // Spawn-then-break on first deadline expiry: each per-container `now()`
     // call yields the remaining wall-clock budget at dispatch time, and the
@@ -5623,6 +5670,14 @@ mod tests {
         assert_eq!(budget.fleet_budget_mb, 44067); // 48163 - 4096
         assert_eq!(budget.per_runner_budget_mb, 2754); // 44067 / 16
         assert!(budget.per_runner_budget_mb >= 2048);
+    }
+
+    #[test]
+    fn derive_memory_budget_supports_approved_fourteen_runner_floor() {
+        let budget = derive_memory_budget(36864, 4096, 14, 2000).unwrap();
+        assert_eq!(budget.fleet_budget_mb, 32768);
+        assert_eq!(budget.per_runner_budget_mb, 2340);
+        assert!(derive_memory_budget(36864, 4096, 14, 2500).is_err());
     }
 
     #[test]
@@ -8027,18 +8082,65 @@ minimum_isolation = "container"
         let _env = TestEnv::new("host_containment_refuses_start");
         cpu_probe_overrides::set(Some(true));
 
-        // Count != 10 on Linux must fail containment check before slot allocation
+        // Unsupported counts must fail containment check before slot allocation.
         let mut cfg = cfg_with(2, "ez-org-runner");
         cfg.limits.cgroup_parent = Some("actions.slice".into());
         let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
             Ok(("jit".into(), 4444))
         })
-        .expect_err("start_one must fail closed when Linux runner count is not exactly 10");
+        .expect_err("start_one must fail closed when Linux runner count is unsupported");
         assert!(
             err.to_string().contains("host containment")
-                || err.to_string().contains("count must be exactly 10"),
+                || err.to_string().contains("runner counts 10 or 14"),
             "expected host containment failure; got: {err:#}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_admits_the_fourteen_runner_profile() {
+        let _env = TestEnv::new("host_containment_profile_14");
+        let root = env::temp_dir().join(format!(
+            "ezgha-host-containment-profile-14-{}",
+            std::process::id()
+        ));
+        write_actions_slice_fixture(&root, 14);
+        *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root.clone());
+
+        let mut cfg = cfg_with(14, "ez-runner-c");
+        cfg.limits.memory_mb = 2000;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        require_host_containment(&cfg)
+            .expect("the explicitly bounded 14-runner HostDocker profile must pass admission");
+
+        write_actions_slice_fixture(&root, 10);
+        let mut rollback_cfg = cfg_with(10, "ez-runner-c");
+        rollback_cfg.limits.memory_mb = 2500;
+        rollback_cfg.limits.cpus = 1.0;
+        rollback_cfg.limits.pids = 128;
+        rollback_cfg.limits.cgroup_parent = Some("actions.slice".into());
+        require_host_containment(&rollback_cfg)
+            .expect("the supported 10-runner rollback profile must pass admission");
+
+        write_actions_slice_fixture(&root, 14);
+        let mut wrong_memory = cfg.clone();
+        wrong_memory.limits.memory_mb = 2500;
+        let err = require_host_containment(&wrong_memory)
+            .expect_err("the 14-runner profile must reject 2500 MiB per job");
+        assert!(err.to_string().contains("limits.memory_mb"), "got: {err:#}");
+
+        let mut wrong_pids = cfg.clone();
+        wrong_pids.limits.pids = 513;
+        let err = require_host_containment(&wrong_pids)
+            .expect_err("profiles must reject unapproved per-runner PID limits");
+        assert!(err.to_string().contains("limits.pids"), "got: {err:#}");
+
+        let mut wrong_count = cfg_with(12, "ez-runner-c");
+        wrong_count.limits.cgroup_parent = Some("actions.slice".into());
+        let err = require_host_containment(&wrong_count)
+            .expect_err("arbitrary counts must remain rejected");
+        assert!(err.to_string().contains("runner counts"), "got: {err:#}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -8051,7 +8153,7 @@ minimum_isolation = "container"
         cfg.limits.cgroup_parent = Some("actions.slice".into());
 
         let temp_dir = env::temp_dir().join(format!("ezgha-ancestry-test-{}", std::process::id()));
-        write_actions_slice_fixture(&temp_dir);
+        write_actions_slice_fixture(&temp_dir, 10);
         *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(temp_dir.clone());
         let capture = temp_dir.join("docker-args.log");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -8082,13 +8184,22 @@ minimum_isolation = "container"
     }
 
     #[cfg(target_os = "linux")]
-    fn write_actions_slice_fixture(root: &Path) {
+    fn write_actions_slice_fixture(root: &Path, runner_count: u32) {
+        let profile = host_actions_profile(runner_count).unwrap();
         let slice = root.join("actions.slice");
         std::fs::create_dir_all(&slice).unwrap();
-        std::fs::write(slice.join("memory.high"), "27917287424\n").unwrap();
-        std::fs::write(slice.join("memory.max"), "30064771072\n").unwrap();
+        std::fs::write(
+            slice.join("memory.high"),
+            format!("{}\n", profile.memory_high_bytes),
+        )
+        .unwrap();
+        std::fs::write(
+            slice.join("memory.max"),
+            format!("{}\n", profile.memory_max_bytes),
+        )
+        .unwrap();
         std::fs::write(slice.join("memory.swap.max"), "0\n").unwrap();
-        std::fs::write(slice.join("pids.max"), "6000\n").unwrap();
+        std::fs::write(slice.join("pids.max"), format!("{}\n", profile.pids_max)).unwrap();
         std::fs::write(slice.join("cpu.max"), "2000000 100000\n").unwrap();
     }
 
@@ -8100,29 +8211,45 @@ minimum_isolation = "container"
             "ezgha-host-containment-cgroup-{}",
             std::process::id()
         ));
-        write_actions_slice_fixture(&root);
+        write_actions_slice_fixture(&root, 10);
 
-        validate_host_actions_slice(&root)
-            .expect("the exact finite HostDocker actions.slice boundary must pass admission");
+        validate_host_actions_slice(&root, 10)
+            .expect("the exact 10-runner HostDocker actions.slice boundary must pass admission");
+        write_actions_slice_fixture(&root, 14);
+        validate_host_actions_slice(&root, 14)
+            .expect("the 14-runner profile-specific pids cap must pass admission");
+        let err = validate_host_actions_slice(&root, 10)
+            .expect_err("the 14-runner pids cap must not pass the 10-runner profile");
+        assert!(err.to_string().contains("pids.max"), "got: {err:#}");
 
+        let err = validate_host_actions_slice(&root, 12)
+            .expect_err("arbitrary runner counts must remain unsupported");
+        assert!(err.to_string().contains("runner counts"), "got: {err:#}");
+
+        write_actions_slice_fixture(&root, 10);
         std::fs::write(root.join("actions.slice/memory.high"), "max\n").unwrap();
-        let err = validate_host_actions_slice(&root)
+        let err = validate_host_actions_slice(&root, 10)
             .expect_err("an unbounded memory.high must fail HostDocker admission");
         assert!(
             err.to_string().contains("memory.high"),
             "expected memory.high mismatch; got: {err:#}"
         );
-        write_actions_slice_fixture(&root);
+        write_actions_slice_fixture(&root, 10);
+        std::fs::write(root.join("actions.slice/memory.max"), "max\n").unwrap();
+        let err = validate_host_actions_slice(&root, 10)
+            .expect_err("an unbounded memory.max must fail HostDocker admission");
+        assert!(err.to_string().contains("memory.max"), "got: {err:#}");
+        write_actions_slice_fixture(&root, 10);
         std::fs::remove_file(root.join("actions.slice/pids.max")).unwrap();
-        let err = validate_host_actions_slice(&root)
+        let err = validate_host_actions_slice(&root, 10)
             .expect_err("a missing tracked cgroup file must fail HostDocker admission");
         assert!(
             err.to_string().contains("pids.max"),
             "expected the missing pids.max error; got: {err:#}"
         );
-        write_actions_slice_fixture(&root);
+        write_actions_slice_fixture(&root, 10);
         std::fs::write(root.join("actions.slice/cpu.max"), "max 100000\n").unwrap();
-        let err = validate_host_actions_slice(&root)
+        let err = validate_host_actions_slice(&root, 10)
             .expect_err("a malformed or unlimited cpu.max must fail HostDocker admission");
         assert!(
             err.to_string().contains("cpu.max"),

@@ -22,7 +22,7 @@ assert_line "$ACTIONS_SLICE" "[Slice]"
 assert_line "$ACTIONS_SLICE" "MemoryHigh=26G"
 assert_line "$ACTIONS_SLICE" "MemoryMax=28G"
 assert_line "$ACTIONS_SLICE" "MemorySwapMax=0"
-assert_line "$ACTIONS_SLICE" "TasksMax=6000"
+assert_line "$ACTIONS_SLICE" "TasksMax=8000"
 assert_line "$ACTIONS_SLICE" "CPUQuota=2000%"
 assert_line "$ACTIONS_SLICE" "IOWeight=25"
 assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressure=auto"
@@ -59,7 +59,7 @@ assert_line "$AUTOMATION_SLICE" "MemorySwapMax=1G"
 assert_line "$AUTOMATION_SLICE" "TasksMax=4096"
 assert_line "$AUTOMATION_SLICE" "ManagedOOMMemoryPressure=auto"
 assert_line "$AUTOMATION_SLICE" "ManagedOOMSwap=auto"
-ok "systemd/automation.slice 4G/6G envelope and auto OOM policies"
+ok "systemd/automation.slice 8G/10G envelope and auto OOM policies"
 
 # 3. Boundary drop-ins (6 tracked drop-ins)
 for dropin in \
@@ -81,11 +81,11 @@ assert_line "$USER_SVC_DROPIN" "ManagedOOMPreference=none"
 assert_line "$USER_SVC_DROPIN" "OOMScoreAdjust=0"
 ok "all six boundary drop-ins present and neutral"
 
-# 4. Config alignment (2500 MiB per runner)
+# 4. Config alignment (2000 MiB per runner)
 LINUX_EXAMPLE="$REPO_ROOT/config/config.toml.linux.example"
 assert_file "$LINUX_EXAMPLE"
-grep -q "memory_mb = 2500" "$LINUX_EXAMPLE" || fail "config.toml.linux.example missing 2500 MiB runner memory limit"
-ok "config.toml.linux.example aligned to 2500 MiB per runner"
+grep -q "memory_mb = 2000" "$LINUX_EXAMPLE" || fail "config.toml.linux.example missing 2000 MiB runner memory limit"
+ok "config.toml.linux.example aligned to 2000 MiB per runner"
 
 # 5. Absence of forbidden legacy artifacts and escape hatches
 assert_not_file "$REPO_ROOT/systemd/ezgha.service.d/10-oomd-omit.conf"
