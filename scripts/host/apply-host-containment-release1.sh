@@ -66,7 +66,10 @@ check_below() {
 }
 user_cgroup_dir() {
   local unit="$1" group
-  if [ "$ROOT" != "/" ]; then printf '%s/%s' "$CGROUP_ROOT" "$unit"; return; fi
+  if [ "$ROOT" != "/" ]; then
+    if [ -d "$CGROUP_ROOT/$unit" ]; then printf '%s/%s' "$CGROUP_ROOT" "$unit"; fi
+    return
+  fi
   group="$(systemctl --user show "$unit" -p ControlGroup --value 2>/dev/null || true)"
   [ -n "$group" ] && printf '%s%s' "$CGROUP_ROOT" "$group"
 }
@@ -74,7 +77,11 @@ user_cgroup_dir() {
 # Every gate precedes writes or systemd state changes.
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "${ROOT}/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not determine MemTotal"
-[ "$mem_total_kib" -ge 65011712 ] || fail "MemTotal (${mem_total_kib} KiB) is below required 62 GiB floor"
+hard_limits_sum_kib=$(( (28 + 10 + 12 + 5) * 1024 * 1024 ))
+reserve_kib=$(( mem_total_kib / 10 ))
+[ "$reserve_kib" -ge 2097152 ] || reserve_kib=2097152
+computed_floor_kib=$(( hard_limits_sum_kib + reserve_kib ))
+[ "$mem_total_kib" -ge "$computed_floor_kib" ] || fail "MemTotal (${mem_total_kib} KiB) is below required computed floor (${computed_floor_kib} KiB)"
 [ -f "${ROOT}/sys/devices/system/cpu/online" ] || fail "missing cpu/online"
 cpu_count=0; IFS=',' read -r -a cpu_ranges < "${ROOT}/sys/devices/system/cpu/online"
 for range in "${cpu_ranges[@]}"; do
@@ -89,8 +96,12 @@ check_below "${CGROUP_ROOT}/actions.slice/memory.current" "$ACTIONS_MEMORY_HIGH_
 check_below "${CGROUP_ROOT}/actions.slice/pids.current" "$ACTIONS_PIDS_MAX" "actions.slice pids.current"
 agents_dir="$(user_cgroup_dir agents.slice || true)"
 automation_dir="$(user_cgroup_dir automation.slice || true)"
-[ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 19327352832 "agents.slice memory.current"
-[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 8589934592 "automation.slice memory.current"
+qemu_slice_dir="$(user_cgroup_dir app-lima-vm.slice || true)"
+qemu_svc_dir="$(user_cgroup_dir lima-vm@colima.service || true)"
+[ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 10737418240 "agents.slice memory.current"
+[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 4294967296 "automation.slice memory.current"
+[ -z "$qemu_slice_dir" ] || check_below "${qemu_slice_dir}/memory.current" 9663676416 "app-lima-vm.slice memory.current"
+[ -z "$qemu_svc_dir" ] || check_below "${qemu_svc_dir}/memory.current" 9663676416 "lima-vm@colima.service memory.current"
 
 install_file() {
   local source="$1" dest="$2"
@@ -156,14 +167,19 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   install_file "${POLICY_ROOT}/systemd/user/session.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/session.slice.d/99-ezgha-containment.conf"
   install_file "${POLICY_ROOT}/systemd/agents.slice" "${USER_UNIT_DIR}/agents.slice"
   install_file "${POLICY_ROOT}/systemd/automation.slice" "${USER_UNIT_DIR}/automation.slice"
+  install_file "${POLICY_ROOT}/systemd/app-lima-vm.slice" "${USER_UNIT_DIR}/app-lima-vm.slice"
+  install_file "${POLICY_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
   rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" "${USER_UNIT_DIR}/psi-oom-watcher.timer"
   # CONTAINMENT_LIVE_SYSTEMD=1 lets tests run the live user-systemd branch
   # against a --root fixture with a fake systemctl on PATH.
   if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
-    systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096
+    systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192
+    systemctl --user set-property automation.slice MemoryHigh=4G MemoryMax=5G MemorySwapMax=1G TasksMax=4096
+    if systemctl --user is-active lima-vm@colima.service >/dev/null 2>&1 || [ "$ROOT" != "/" ]; then
+      systemctl --user set-property --runtime lima-vm@colima.service MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null || true
+    fi
   fi
 fi
 

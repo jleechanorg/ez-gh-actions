@@ -24,7 +24,13 @@ esac
 
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
-[ "$mem_total_kib" -ge 65011712 ] || fail "host MemTotal (${mem_total_kib} KiB) is below the required 62-GiB floor (65011712 KiB)"
+# Floor is the computed sum of the four enforced hard limits (Actions 28G + QEMU 10G + Agents 12G + Automation 5G = 55 GiB)
+# plus max(2 GiB, 10% of host MemTotal). Never hardcoded magic 55GiB or old 62GiB.
+hard_limits_sum_kib=$(( (28 + 10 + 12 + 5) * 1024 * 1024 ))
+reserve_kib=$(( mem_total_kib / 10 ))
+[ "$reserve_kib" -ge 2097152 ] || reserve_kib=2097152
+computed_floor_kib=$(( hard_limits_sum_kib + reserve_kib ))
+[ "$mem_total_kib" -ge "$computed_floor_kib" ] || fail "host MemTotal (${mem_total_kib} KiB) is below the required computed floor (${computed_floor_kib} KiB: four hard caps ${hard_limits_sum_kib} KiB + reserve ${reserve_kib} KiB)"
 
 [ -f "$ROOT/sys/devices/system/cpu/online" ] || fail "missing cpu/online"
 cpu_count=0; IFS=',' read -r -a cpu_ranges < "$ROOT/sys/devices/system/cpu/online"
@@ -61,11 +67,11 @@ if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     actual="$(systemctl --user show -p "$property" --value -- "$unit")"
     [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
   }
-  check_user_property agents.slice MemoryHigh 19327352832
-  check_user_property agents.slice MemoryMax 21474836480
+  check_user_property agents.slice MemoryHigh 10737418240
+  check_user_property agents.slice MemoryMax 12884901888
   check_user_property agents.slice MemorySwapMax 2147483648
-  check_user_property automation.slice MemoryHigh 8589934592
-  check_user_property automation.slice MemoryMax 10737418240
+  check_user_property automation.slice MemoryHigh 4294967296
+  check_user_property automation.slice MemoryMax 5368709120
   check_user_property automation.slice MemorySwapMax 1073741824
   check_system_property() {
     local unit="$1" property="$2" expected="$3" actual

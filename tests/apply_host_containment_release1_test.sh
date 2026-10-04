@@ -100,6 +100,8 @@ ok "apply-host-containment-release1.sh rejects invalid runner count before write
 [ -f "$PASS_ROOT/etc/systemd/system/user@.service.d/99-ezgha-containment.conf" ] || fail "user@.service.d drop-in not staged"
 [ -f "$PASS_ROOT/etc/systemd/user/agents.slice" ] || fail "agents.slice not staged to user units"
 [ -f "$PASS_ROOT/etc/systemd/user/automation.slice" ] || fail "automation.slice not staged to user units"
+[ -f "$PASS_ROOT/etc/systemd/user/app-lima-vm.slice" ] || fail "app-lima-vm.slice not staged to user units"
+[ -f "$PASS_ROOT/etc/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ] || fail "QEMU service drop-in not staged to user units"
 ok "apply-host-containment-release1.sh stages policy artifacts and boundary drop-ins"
 
 # Verify [Install] produces persistent boot wiring without touching the host unit graph.
@@ -115,26 +117,55 @@ if [ -n "$HOST_SYSTEMCTL" ]; then
   ok "actions.slice enable creates isolated persistent slices.target boot wiring"
 fi
 
-# 2. Pre-mutation gate: memory below floor
+# 2. Pre-mutation gate: memory below computed floor
 MEM_FAIL_ROOT="$WORK/mem_fail"
 setup_fixture "$MEM_FAIL_ROOT"
-printf 'MemTotal:       65011711 kB\n' > "$MEM_FAIL_ROOT/proc/meminfo"
+printf 'MemTotal:       64079643 kB\n' > "$MEM_FAIL_ROOT/proc/meminfo"
 if PATH="$MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_FAIL_ROOT" > "$WORK/mem_fail.log" 2>&1; then
-  fail "apply-host-containment-release1.sh passed when MemTotal was below floor"
+  fail "apply-host-containment-release1.sh passed when MemTotal was below computed floor"
 fi
 [ ! -f "$MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before memory check passed"
 ok "apply-host-containment-release1.sh aborts before mutation when memory is below floor"
 
-# 3. Pre-mutation gate: current agent memory usage >= 18G
+MEM_BOUNDARY_ROOT="$WORK/mem_boundary"
+setup_fixture "$MEM_BOUNDARY_ROOT"
+printf 'MemTotal:       64079644 kB\n' > "$MEM_BOUNDARY_ROOT/proc/meminfo"
+PATH="$MEM_BOUNDARY_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_BOUNDARY_ROOT" > "$WORK/mem_boundary.log" 2>&1   || fail "apply-host-containment-release1.sh failed when MemTotal was at exact computed floor"
+ok "apply-host-containment-release1.sh succeeds when memory is at exact computed floor"
+
+# 3. Pre-mutation gate: current agent memory usage >= 10G
 AGENT_MEM_FAIL_ROOT="$WORK/agent_mem_fail"
 setup_fixture "$AGENT_MEM_FAIL_ROOT"
-# 19 GiB current usage
-printf '20401094656\n' > "$AGENT_MEM_FAIL_ROOT/sys/fs/cgroup/agents.slice/memory.current"
+# 10 GiB current usage
+printf '10737418240\n' > "$AGENT_MEM_FAIL_ROOT/sys/fs/cgroup/agents.slice/memory.current"
 if PATH="$AGENT_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AGENT_MEM_FAIL_ROOT" > "$WORK/agent_mem.log" 2>&1; then
-  fail "apply-host-containment-release1.sh passed when current agent memory usage was above threshold"
+  fail "apply-host-containment-release1.sh passed when current agent memory usage was at high limit"
 fi
 [ ! -f "$AGENT_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before agent memory check"
-ok "apply-host-containment-release1.sh aborts before mutation when current agent use >= 18G"
+ok "apply-host-containment-release1.sh aborts before mutation when current agent use >= 10G"
+
+# 3b. Pre-mutation gate: current automation memory usage >= 4G
+AUTO_MEM_FAIL_ROOT="$WORK/auto_mem_fail"
+setup_fixture "$AUTO_MEM_FAIL_ROOT"
+# 4 GiB current usage
+printf '4294967296\n' > "$AUTO_MEM_FAIL_ROOT/sys/fs/cgroup/automation.slice/memory.current"
+if PATH="$AUTO_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AUTO_MEM_FAIL_ROOT" > "$WORK/auto_mem.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when current automation memory usage was at high limit"
+fi
+[ ! -f "$AUTO_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before automation memory check"
+ok "apply-host-containment-release1.sh aborts before mutation when current automation use >= 4G"
+
+# 3c. Pre-mutation gate: current QEMU memory usage >= 9G
+QEMU_MEM_FAIL_ROOT="$WORK/qemu_mem_fail"
+setup_fixture "$QEMU_MEM_FAIL_ROOT"
+mkdir -p "$QEMU_MEM_FAIL_ROOT/sys/fs/cgroup/app-lima-vm.slice"
+# 9 GiB current usage
+printf '9663676416\n' > "$QEMU_MEM_FAIL_ROOT/sys/fs/cgroup/app-lima-vm.slice/memory.current"
+if PATH="$QEMU_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$QEMU_MEM_FAIL_ROOT" > "$WORK/qemu_mem.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when current QEMU memory usage was at high limit"
+fi
+[ ! -f "$QEMU_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before QEMU memory check"
+ok "apply-host-containment-release1.sh aborts before mutation when current QEMU use >= 9G"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
@@ -156,11 +187,11 @@ setup_fixture "$LIVE_ROOT"
 # set-property calls in the live branch establish.
 uid="$(id -u)"
 cat > "$WORK/live_props.txt" <<PROPS
-agents.slice MemoryHigh 19327352832
-agents.slice MemoryMax 21474836480
+agents.slice MemoryHigh 10737418240
+agents.slice MemoryMax 12884901888
 agents.slice MemorySwapMax 2147483648
-automation.slice MemoryHigh 8589934592
-automation.slice MemoryMax 10737418240
+automation.slice MemoryHigh 4294967296
+automation.slice MemoryMax 5368709120
 automation.slice MemorySwapMax 1073741824
 user@${uid}.service ManagedOOMMemoryPressure auto
 user@${uid}.service ManagedOOMSwap auto
@@ -189,10 +220,10 @@ SHIM
 chmod +x "$LIVE_ROOT/bin/systemctl"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$WORK/live_sys.log" PATH="$LIVE_ROOT/bin:$PATH" \
   "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
-grep -qx "systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
-  || fail "live apply did not set automation.slice to 8G/10G: $(grep automation "$WORK/live_sys.log" || echo none)"
-grep -qx "systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
+grep -qx "systemctl --user set-property automation.slice MemoryHigh=4G MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
+  || fail "live apply did not set automation.slice to 4G/5G: $(grep automation "$WORK/live_sys.log" || echo none)"
+grep -qx "systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
   || fail "live apply did not set agents.slice limits"
-ok "apply-host-containment-release1.sh live branch persists automation.slice 8G/10G via set-property"
+ok "apply-host-containment-release1.sh live branch persists automation.slice 4G/5G via set-property"
 
 echo "APPLY_HOST_CONTAINMENT_RELEASE1_TEST: PASS"
