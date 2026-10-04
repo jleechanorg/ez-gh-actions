@@ -6,6 +6,9 @@
 # systemd/lima-vm@colima.service.d/99-memory-ceiling.conf, which install.sh
 # deploys directly on the service. Keep both values identical.
 #
+# These are the VM-backed values (runners inside Colima). A host-docker Linux
+# deployment uses systemd/host-docker/ (4608M/5G); install.sh selects by mode.
+#
 # MemoryHigh provides the first response (throttle + reclaim under pressure);
 # MemoryMax is a finite final containment boundary for a runaway VM. This
 # ordering preserves normal operation while preventing unbounded host impact.

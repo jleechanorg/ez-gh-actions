@@ -144,11 +144,36 @@ else
   ok "No user-session kill primitives in active codebase"
 fi
 
-if grep -rnE '^[[:space:]]*ManagedOOM(MemoryPressure|Swap)[[:space:]]*=[[:space:]]*kill' "${REPO_ROOT}/systemd" 2>/dev/null; then
+# Exactly one exemption: systemd/host/actions.slice holds only runner
+# containers (docker-*.scope), never login/agent sessions. systemd-oomd kills
+# the single most-pressured descendant cgroup there (one runner container =
+# one job), which is the repo's smallest-layer-dies rule. Sessions
+# (agents.slice, automation.slice, user@.service) stay forbidden.
+OOMD_KILL_EXEMPT="systemd/host/actions.slice"
+oomd_kill_violations() { # repo-root
+  grep -rnE '^[[:space:]]*ManagedOOM(MemoryPressure|Swap)[[:space:]]*=[[:space:]]*kill' "$1/systemd" 2>/dev/null \
+    | grep -v "^$1/${OOMD_KILL_EXEMPT}:" || true
+}
+violations="$(oomd_kill_violations "${REPO_ROOT}")"
+if [ -n "$violations" ]; then
+  printf '%s\n' "$violations"
   fail "Found ManagedOOMMemoryPressure/ManagedOOMSwap=kill in tracked systemd units (oomd must not kill whole sessions)"
 else
-  ok "No ManagedOOM*=kill in tracked systemd units"
+  ok "No ManagedOOM*=kill in tracked systemd units outside ${OOMD_KILL_EXEMPT}"
 fi
+# The exemption is exact: kill on actions.slice passes, kill on any other
+# systemd/ unit (here a session slice) still fails.
+OOMD_FIXTURE="$(mktemp -d)"
+mkdir -p "${OOMD_FIXTURE}/systemd/host"
+printf '[Slice]\nManagedOOMMemoryPressure=kill\n' > "${OOMD_FIXTURE}/systemd/host/actions.slice"
+[ -z "$(oomd_kill_violations "${OOMD_FIXTURE}")" ] || fail "oomd kill exemption does not cover systemd/host/actions.slice"
+printf '[Slice]\nManagedOOMMemoryPressure=kill\n' > "${OOMD_FIXTURE}/systemd/agents.slice"
+printf '[Slice]\nManagedOOMSwap=kill\n' > "${OOMD_FIXTURE}/systemd/host/actions.slice.bak"
+fixture_violations="$(oomd_kill_violations "${OOMD_FIXTURE}")"
+grep -q '/systemd/agents.slice:' <<<"$fixture_violations" || fail "ManagedOOM*=kill on agents.slice was not caught"
+grep -q '/systemd/host/actions.slice.bak:' <<<"$fixture_violations" || fail "exemption leaked to a non-exact actions.slice path"
+rm -rf "${OOMD_FIXTURE}"
+ok "oomd kill exemption is exactly ${OOMD_KILL_EXEMPT}; other systemd units with kill still fail"
 
 USER_AT_DROPIN="${REPO_ROOT}/systemd/host/user@.service.d/99-ezgha-containment.conf"
 # The last assignment of each key is the effective one; an earlier neutral line must not mask a later override.

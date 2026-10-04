@@ -55,9 +55,9 @@ setup_passing_fixture() {
     > "$root/etc/systemd/system/user@.service.d/99-ezgha-containment.conf"
 
   # agents.slice and automation.slice in user units
-  printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=13G\nMemoryMax=14G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/agents.slice"
-  printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=7G\nMemoryMax=8G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/automation.slice"
 
   # Mock docker command
@@ -166,10 +166,10 @@ ok "assert-host-containment-release1.sh rejects runner container outside actions
 # `systemctl show -p P --value -- U` from a table and run them against the
 # passing fixture with CONTAINMENT_LIVE_SYSTEMD=1.
 write_props() {
-  local auto_high="$1" auto_max="$2" uid; uid="$(id -u)"
+  local agents_high="$1" agents_max="$2" auto_high="$3" auto_max="$4" uid; uid="$(id -u)"
   cat <<PROPS
-agents.slice MemoryHigh 19327352832
-agents.slice MemoryMax 21474836480
+agents.slice MemoryHigh ${agents_high}
+agents.slice MemoryMax ${agents_max}
 agents.slice MemorySwapMax 2147483648
 automation.slice MemoryHigh ${auto_high}
 automation.slice MemoryMax ${auto_max}
@@ -180,6 +180,8 @@ user@${uid}.service ManagedOOMPreference none
 user@${uid}.service OOMScoreAdjust 0
 -.slice ManagedOOMMemoryPressure auto
 user.slice ManagedOOMMemoryPressure auto
+actions.slice ManagedOOMMemoryPressure kill
+actions.slice ManagedOOMMemoryPressureLimit 3435973836
 app.slice ManagedOOMMemoryPressure auto
 session.slice ManagedOOMMemoryPressure auto
 PROPS
@@ -199,16 +201,31 @@ done
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$PROPS_BIN/systemctl"
-write_props 8589934592 10737418240 > "$WORK/props_ok.txt"
+# Host-docker policy (bead ez-gh-actions-154k): agents 13G/14G, automation 7G/8G.
+write_props 13958643712 15032385536 7516192768 8589934592 > "$WORK/props_ok.txt"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1 \
-  || fail "live systemd checks rejected 8G/10G automation.slice: $(tail -3 "$WORK/live_ok.log")"
-write_props 4294967296 6442450944 > "$WORK/props_old.txt"
+  || fail "live systemd checks rejected 13G/14G agents + 7G/8G automation: $(tail -3 "$WORK/live_ok.log")"
+# The pre-154k 18G/20G + 8G/10G maxima over-commit the host-docker envelope.
+write_props 19327352832 21474836480 8589934592 10737418240 > "$WORK/props_old.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old.log" 2>&1; then
-  fail "live systemd checks accepted the old 4G/6G automation.slice"
+  fail "live systemd checks accepted the old 18G/20G agents.slice"
 fi
-grep -q "automation.slice MemoryHigh ('4294967296') != '8589934592'" "$WORK/live_old.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
-ok "assert-host-containment-release1.sh live checks accept 8G/10G and reject 4G/6G automation.slice"
+grep -q "agents.slice MemoryHigh ('19327352832') != '13958643712'" "$WORK/live_old.log" || fail "missing agents.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
+write_props 13958643712 15032385536 8589934592 10737418240 > "$WORK/props_old_auto.txt"
+if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old_auto.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+  "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old_auto.log" 2>&1; then
+  fail "live systemd checks accepted the old 8G/10G automation.slice"
+fi
+grep -q "automation.slice MemoryHigh ('8589934592') != '7516192768'" "$WORK/live_old_auto.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old_auto.log")"
+# actions.slice must be enrolled with oomd kill at 80% pressure.
+sed 's/^actions.slice ManagedOOMMemoryPressure kill$/actions.slice ManagedOOMMemoryPressure auto/' "$WORK/props_ok.txt" > "$WORK/props_oom_auto.txt"
+if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_oom_auto.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+  "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_oom_auto.log" 2>&1; then
+  fail "live systemd checks accepted actions.slice ManagedOOMMemoryPressure=auto"
+fi
+grep -q "actions.slice ManagedOOMMemoryPressure ('auto') != 'kill'" "$WORK/live_oom_auto.log" || fail "missing actions.slice oomd mismatch message: $(tail -2 "$WORK/live_oom_auto.log")"
+ok "assert-host-containment-release1.sh live checks accept the host-docker policy and reject the pre-154k maxima"
 
 echo "ASSERT_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

@@ -16,6 +16,11 @@ bash -n "$APPLY_SCRIPT" || fail "syntax error in scripts/host/apply-host-contain
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+set_slice_mem() { # root slice current file shmem
+  printf '%s\n' "$3" > "$1/sys/fs/cgroup/$2/memory.current"
+  printf 'anon %s\nfile %s\nshmem %s\n' "$(($3 - $4))" "$4" "$5" > "$1/sys/fs/cgroup/$2/memory.stat"
+}
+
 setup_fixture() {
   local root="$1"
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
@@ -27,9 +32,10 @@ setup_fixture() {
   printf '0-31\n' > "$root/sys/devices/system/cpu/online"
   printf 'cpuset cpu io memory pids\n' > "$root/sys/fs/cgroup/cgroup.controllers"
 
-  # Current memory usage under 18G/4G thresholds (e.g. 8 GiB current)
-  printf '8589934592\n' > "$root/sys/fs/cgroup/agents.slice/memory.current"
-  printf '1073741824\n' > "$root/sys/fs/cgroup/automation.slice/memory.current"
+  # Current use under the host-docker thresholds: non-reclaimable
+  # (memory.current - (file - shmem)) <= new MemoryHigh - 1 GiB.
+  set_slice_mem "$root" agents.slice 8589934592 2147483648 0
+  set_slice_mem "$root" automation.slice 1073741824 0 0
 
   # Staged actions.slice cgroup values
   printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
@@ -103,16 +109,109 @@ fi
 [ ! -f "$MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before memory check passed"
 ok "apply-host-containment-release1.sh aborts before mutation when memory is below floor"
 
-# 3. Pre-mutation gate: current agent memory usage >= 18G
-AGENT_MEM_FAIL_ROOT="$WORK/agent_mem_fail"
-setup_fixture "$AGENT_MEM_FAIL_ROOT"
-# 19 GiB current usage
-printf '20401094656\n' > "$AGENT_MEM_FAIL_ROOT/sys/fs/cgroup/agents.slice/memory.current"
-if PATH="$AGENT_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AGENT_MEM_FAIL_ROOT" > "$WORK/agent_mem.log" 2>&1; then
-  fail "apply-host-containment-release1.sh passed when current agent memory usage was above threshold"
-fi
-[ ! -f "$AGENT_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before agent memory check"
-ok "apply-host-containment-release1.sh aborts before mutation when current agent use >= 18G"
+# 3. Pre-mutation gate: non-reclaimable use of each user slice must sit
+#    at least 1 GiB below its new MemoryHigh (agents 13G, automation 7G).
+G=1073741824
+preflight_case() { # name slice current file shmem expect(pass|refuse)
+  local root="$WORK/preflight_$1"
+  setup_fixture "$root"
+  set_slice_mem "$root" "$2" "$3" "$4" "$5"
+  if PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/preflight_$1.log" 2>&1; then
+    [ "$6" = pass ] || fail "preflight $1 passed but should refuse: $(tail -2 "$WORK/preflight_$1.log")"
+  else
+    [ "$6" = refuse ] || fail "preflight $1 refused but should pass: $(tail -2 "$WORK/preflight_$1.log")"
+    [ ! -f "$root/etc/systemd/system/actions.slice" ] || fail "preflight $1 staged files before refusing"
+    [ ! -f "$root/etc/systemd/user/agents.slice" ] || fail "preflight $1 staged user slices before refusing"
+    grep -q "$2" "$WORK/preflight_$1.log" || fail "preflight $1 refusal does not name $2"
+  fi
+}
+# 16G current but 6G of it is reclaimable page cache: 10G <= 12G passes.
+preflight_case agents_cache agents.slice $((16 * G)) $((6 * G)) 0 pass
+# 15G current, 1G file: 14G non-reclaimable > 12G refuses.
+preflight_case agents_anon agents.slice $((15 * G)) $((1 * G)) 0 refuse
+grep -q "agents.slice non-reclaimable 15032385536 bytes > 12884901888" "$WORK/preflight_agents_anon.log" \
+  || fail "agents refusal lacks the measured numbers: $(tail -2 "$WORK/preflight_agents_anon.log")"
+# shmem is not reclaimable: 16G current, 6G file of which 3G shmem -> 13G refuses.
+preflight_case agents_shmem agents.slice $((16 * G)) $((6 * G)) $((3 * G)) refuse
+# automation: 7G current with 2G cache -> 5G <= 6G passes; 7G with 0.5G cache refuses.
+preflight_case automation_cache automation.slice $((7 * G)) $((2 * G)) 0 pass
+preflight_case automation_anon automation.slice $((7 * G)) $((G / 2)) 0 refuse
+ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its non-reclaimable use and changes nothing"
+
+# 3b. Lima guest memory gate: the host-docker QEMU ceiling (4608M/5G) is only
+#     safe for a <= 4 GiB guest. `limactl list` reports lima.yaml, not the
+#     running VM, so the running size comes from the colima QEMU's `-m` (MiB);
+#     any state the check cannot establish refuses before any write.
+lima_case() { # name yaml-memory(or - for no lima.yaml) limactl-status (or __NUMBER__) qemu-m-MiB(or -) expect(pass|refuse) [limactl-.memory JSON, or - to omit]
+  local root="$WORK/lima_$1" memory_json=',"memory":4294967296' status_json
+  case "${6:-}" in '') ;; -) memory_json='' ;; *) memory_json=",\"memory\":$6" ;; esac
+  case "$3" in __NUMBER__) status_json=7 ;; *) status_json="\"$3\"" ;; esac
+  setup_fixture "$root"
+  mkdir -p "$root/lima/colima"
+  [ "$2" = - ] || printf 'cpus: 4\nmemory: %s\n' "$2" > "$root/lima/colima/lima.yaml"
+  cat > "$root/bin/limactl" <<LIMA_EOF
+#!/usr/bin/env bash
+[ "\$1 \$2 \$3" = "list --json colima" ] || exit 1
+[ "$3" = ERROR ] && { echo 'level=fatal msg="boom"' >&2; exit 1; }
+printf '{"name":"colima","status":%s%s}\n' '$status_json' '$memory_json'
+LIMA_EOF
+  chmod +x "$root/bin/limactl"
+  if [ "$4" != - ]; then
+    mkdir -p "$root/proc/7777"
+    printf 'qemu-system-x86\n' > "$root/proc/7777/comm"
+    printf '%s\0' qemu-system-x86_64 -m "$4" -drive "file=$root/lima/colima/diffdisk,if=virtio" > "$root/proc/7777/cmdline"
+  fi
+  if PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/lima_$1.log" 2>&1; then
+    [ "$5" = pass ] || fail "lima $1 passed but should refuse: $(tail -2 "$WORK/lima_$1.log")"
+  else
+    [ "$5" = refuse ] || fail "lima $1 refused but should pass: $(tail -2 "$WORK/lima_$1.log")"
+    [ ! -f "$root/etc/systemd/system/actions.slice" ] || fail "lima $1 staged files before refusing"
+  fi
+}
+lima_case resized_running 4GiB Running 4096 pass
+lima_case resized_stopped 4GiB Stopped - pass
+# Only an exact stopped state is safe without a QEMU proof. Lima's other
+# statuses describe incomplete or broken inspection, so they must fail closed.
+for status_case in Broken Unknown 'Stopped ' __NUMBER__; do
+  case "$status_case" in
+    Broken) status_name=broken_status ;;
+    Unknown) status_name=unknown_status ;;
+    __NUMBER__) status_name=nonstring_status ;;
+    *) status_name=whitespace_status ;;
+  esac
+  lima_case "$status_name" 4GiB "$status_case" - refuse
+  grep -q 'FAIL lima guest memory unknown (limactl.*status' "$WORK/lima_${status_name}.log" \
+    || fail "unsupported Lima status $status_case did not fail closed: $(cat "$WORK/lima_${status_name}.log")"
+done
+# lima.yaml already rewritten to 4GiB but the VM still runs with -m 8192:
+# limactl would report 4294967296 here, the running QEMU is what counts.
+lima_case yaml_rewritten_vm_8g 4GiB Running 8192 refuse
+grep -qx "FAIL lima guest memory 8589934592 > 4GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" "$WORK/lima_yaml_rewritten_vm_8g.log" \
+  || fail "lima refusal message mismatch: $(cat "$WORK/lima_yaml_rewritten_vm_8g.log")"
+lima_case yaml_8g_stopped 8GiB Stopped - refuse
+grep -q "FAIL lima guest memory 8589934592 > 4GiB" "$WORK/lima_yaml_8g_stopped.log" || fail "lima.yaml 8GiB refusal message missing"
+# Unknowable state fails closed: a failed limactl query, or a Running VM
+# whose QEMU process cannot be found.
+lima_case limactl_error 4GiB ERROR - refuse
+grep -q "FAIL lima guest memory unknown" "$WORK/lima_limactl_error.log" || fail "failed limactl query did not fail closed: $(cat "$WORK/lima_limactl_error.log")"
+lima_case running_no_qemu 4GiB Running - refuse
+grep -q "FAIL lima guest memory unknown" "$WORK/lima_running_no_qemu.log" || fail "Running VM without a QEMU process did not fail closed"
+# limactl's configured .memory (bytes) is validated too: absent, malformed
+# or > 4 GiB refuses even when lima.yaml and QEMU say 4 GiB.
+lima_case limactl_mem_missing 4GiB Stopped - refuse -
+grep -q "FAIL lima guest memory unknown (limactl" "$WORK/lima_limactl_mem_missing.log" || fail "absent limactl .memory did not fail closed: $(cat "$WORK/lima_limactl_mem_missing.log")"
+lima_case limactl_mem_malformed 4GiB Stopped - refuse '"4GiB"'
+grep -q "FAIL lima guest memory unknown (limactl" "$WORK/lima_limactl_mem_malformed.log" || fail "malformed limactl .memory did not fail closed: $(cat "$WORK/lima_limactl_mem_malformed.log")"
+lima_case limactl_mem_8g 4GiB Running 4096 refuse 8589934592
+grep -q "FAIL lima guest memory 8589934592 > 4GiB" "$WORK/lima_limactl_mem_8g.log" || fail "limactl .memory 8 GiB did not refuse"
+# Unparseable sizes and a missing lima.yaml refuse with a diagnostic, not silently.
+lima_case yaml_unparseable 8G Stopped - refuse
+grep -q "FAIL lima guest memory unknown (unparseable memory: 8G" "$WORK/lima_yaml_unparseable.log" || fail "unparseable lima.yaml memory exited without a diagnostic: $(cat "$WORK/lima_yaml_unparseable.log")"
+lima_case qemu_m_unparseable 4GiB Running 8x refuse
+grep -q "FAIL lima guest memory unknown (colima QEMU" "$WORK/lima_qemu_m_unparseable.log" || fail "unparseable QEMU -m exited without a diagnostic: $(cat "$WORK/lima_qemu_m_unparseable.log")"
+lima_case yaml_missing_stopped - Stopped - refuse
+grep -q "FAIL lima guest memory unknown (.*lima.yaml" "$WORK/lima_yaml_missing_stopped.log" || fail "instance without lima.yaml passed with nothing proven: $(cat "$WORK/lima_yaml_missing_stopped.log")"
+ok "apply-host-containment-release1.sh refuses the host-docker QEMU ceiling while the Lima guest is above 4 GiB"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
@@ -134,11 +233,11 @@ setup_fixture "$LIVE_ROOT"
 # set-property calls in the live branch establish.
 uid="$(id -u)"
 cat > "$WORK/live_props.txt" <<PROPS
-agents.slice MemoryHigh 19327352832
-agents.slice MemoryMax 21474836480
+agents.slice MemoryHigh 13958643712
+agents.slice MemoryMax 15032385536
 agents.slice MemorySwapMax 2147483648
-automation.slice MemoryHigh 8589934592
-automation.slice MemoryMax 10737418240
+automation.slice MemoryHigh 7516192768
+automation.slice MemoryMax 8589934592
 automation.slice MemorySwapMax 1073741824
 user@${uid}.service ManagedOOMMemoryPressure auto
 user@${uid}.service ManagedOOMSwap auto
@@ -146,6 +245,8 @@ user@${uid}.service ManagedOOMPreference none
 user@${uid}.service OOMScoreAdjust 0
 -.slice ManagedOOMMemoryPressure auto
 user.slice ManagedOOMMemoryPressure auto
+actions.slice ManagedOOMMemoryPressure kill
+actions.slice ManagedOOMMemoryPressureLimit 3435973836
 app.slice ManagedOOMMemoryPressure auto
 session.slice ManagedOOMMemoryPressure auto
 PROPS
@@ -167,10 +268,18 @@ SHIM
 chmod +x "$LIVE_ROOT/bin/systemctl"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$WORK/live_sys.log" PATH="$LIVE_ROOT/bin:$PATH" \
   "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
-grep -qx "systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
-  || fail "live apply did not set automation.slice to 8G/10G: $(grep automation "$WORK/live_sys.log" || echo none)"
-grep -qx "systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
-  || fail "live apply did not set agents.slice limits"
-ok "apply-host-containment-release1.sh live branch persists automation.slice 8G/10G via set-property"
+grep -qx "systemctl --user set-property automation.slice MemoryHigh=7G MemoryMax=8G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
+  || fail "live apply did not set automation.slice to 7G/8G: $(grep automation "$WORK/live_sys.log" || echo none)"
+grep -qx "systemctl --user set-property agents.slice MemoryHigh=13G MemoryMax=14G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
+  || fail "live apply did not set agents.slice to 13G/14G: $(grep agents "$WORK/live_sys.log" || echo none)"
+ok "apply-host-containment-release1.sh live branch persists agents.slice 13G/14G and automation.slice 7G/8G via set-property"
+
+# The root phase enrolls actions.slice with systemd-oomd (kill at 80% pressure);
+# agents.slice and automation.slice are never enrolled with kill.
+grep -Fqx '    systemctl set-property actions.slice ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=80%' "$APPLY_SCRIPT" \
+  || fail "root phase does not enroll actions.slice with ManagedOOMMemoryPressure=kill at 80%"
+! grep -E 'set-property (agents|automation)\.slice.*ManagedOOMMemoryPressure=kill' "$APPLY_SCRIPT" \
+  || fail "agents/automation.slice must not be enrolled with oomd kill"
+ok "apply-host-containment-release1.sh enrolls only actions.slice with oomd kill"
 
 echo "APPLY_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

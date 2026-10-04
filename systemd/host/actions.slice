@@ -9,7 +9,8 @@ MemorySwapMax=0
 TasksMax=6000
 CPUQuota=2000%
 IOWeight=25
-ManagedOOMMemoryPressure=auto
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=80%
 ManagedOOMSwap=auto
 
 [Install]

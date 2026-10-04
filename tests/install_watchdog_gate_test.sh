@@ -56,12 +56,13 @@ cp "${REPO_ROOT}"/systemd/lima-vm-cpu-ceiling.service \
    "${TEMP_REPO}/systemd/"
 cp "${REPO_ROOT}"/systemd/guest/actions.slice \
    "${TEMP_REPO}/systemd/guest/"
+cp -r "${REPO_ROOT}/systemd/host-docker" "${TEMP_REPO}/systemd/"
 printf '[package]\nname = "ez-gh-actions"\nversion = "0.0.0"\n' > "${TEMP_REPO}/Cargo.toml"
 for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
-for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+for name in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh lima-guest-memory-check.sh; do
   if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
     cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
   fi
@@ -131,6 +132,11 @@ if [ "${1:-}" = "--user" ]; then shift; fi
 printf '%s\n' "$*" >> "${SYSTEMCTL_CAPTURE:-/dev/null}"
 sub="${1:-}"
 shift || true
+in_list() {
+  local needle="$1" item
+  for item in ${2:-}; do [ "$item" = "$needle" ] && return 0; done
+  return 1
+}
 case "${sub}" in
   enable)
     [ "${1:-}" = "--now" ] && shift
@@ -139,14 +145,26 @@ case "${sub}" in
     ;;
   disable)
     [ "${1:-}" = "--now" ] && shift
+    if in_list "${1:-}" "${STUB_DISABLE_FAIL_UNITS:-}"; then exit 1; fi
     rm -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled"
     exit 0
     ;;
   is-enabled)
-    [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ] && exit 0 || exit 1
+    if [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ]; then echo enabled; exit 0; fi
+    echo disabled
+    exit 1
     ;;
   is-active)
-    exit 1
+    if in_list "${1:-}" "${STUB_QUERY_FAIL_UNITS:-}"; then
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    fi
+    if in_list "${1:-}" "${STUB_ACTIVE_UNITS:-}"; then
+      echo active
+      exit 0
+    fi
+    echo inactive
+    exit 3
     ;;
   daemon-reload)
     exit 0
@@ -196,6 +214,12 @@ if ! grep -Fqx 'stop ezgha-watchdog.service' "${SYSTEMCTL_CAPTURE}"; then
 else
   echo "PASS: Case A: default install stopped ezgha-watchdog.service"
 fi
+for unit in agent-scope-reaper psi-oom-watcher; do
+  grep -Fqx "disable --now ${unit}.timer" "${SYSTEMCTL_CAPTURE}" \
+    || fail "Case A: default install did not disable ${unit}.timer"
+  grep -Fqx "stop ${unit}.service" "${SYSTEMCTL_CAPTURE}" \
+    || fail "Case A: default install did not stop ${unit}.service"
+done
 if [ -f "${HOME_A}/.local/libexec/ezgha/watchdog-load-repair.sh" ] || [ -f "${HOME_A}/.local/bin/watchdog-load-repair.sh" ]; then
   fail "Case A: watchdog-load-repair.sh was installed"
 else
@@ -220,6 +244,56 @@ for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containme
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
   fi
+done
+
+# Both retired paths stop their timer and service independently and retain
+# artifacts if either runtime state is active or cannot be queried.
+for retired in agent-scope-reaper psi-oom-watcher; do
+  for state in active query; do
+    home="${WORK}/home_${retired}_${state}"
+    state_dir="${WORK}/state_${retired}_${state}"
+    mkdir -p "${home}/.config/systemd/user" "${home}/.local/libexec/ezgha" "${state_dir}"
+    touch "${home}/.config/systemd/user/${retired}.service" \
+          "${home}/.config/systemd/user/${retired}.timer"
+    if [ "${retired}" = agent-scope-reaper ]; then
+      touch "${home}/.local/libexec/ezgha/agent-scope-reaper.sh"
+    fi
+    install_rc=0
+    if [ "${state}" = active ]; then
+      STUB_DISABLE_FAIL_UNITS="${retired}.timer" STUB_ACTIVE_UNITS="${retired}.service" \
+        run_install "${home}" "${state_dir}" || install_rc=$?
+    else
+      STUB_QUERY_FAIL_UNITS="${retired}.timer" \
+        run_install "${home}" "${state_dir}" || install_rc=$?
+    fi
+    [ "${install_rc}" -ne 0 ] \
+      || fail "${retired} ${state}: installer must refuse unsafe retired-unit cleanup"
+    for stale in "${home}/.config/systemd/user/${retired}.service" "${home}/.config/systemd/user/${retired}.timer"; do
+      [ -e "${stale}" ] || fail "${retired} ${state}: installer removed unsafe artifact ${stale}"
+    done
+  done
+done
+
+# A failed disable command is not proof of retirement: even an inactive timer
+# must retain its artifacts if is-enabled still reports enabled.
+for retired in agent-scope-reaper psi-oom-watcher; do
+  home="${WORK}/home_${retired}_enabled"
+  state_dir="${WORK}/state_${retired}_enabled"
+  mkdir -p "${home}/.config/systemd/user" "${home}/.local/libexec/ezgha" "${state_dir}"
+  touch "${home}/.config/systemd/user/${retired}.service" \
+        "${home}/.config/systemd/user/${retired}.timer" \
+        "${state_dir}/${retired}.timer.enabled"
+  if [ "${retired}" = agent-scope-reaper ]; then
+    touch "${home}/.local/libexec/ezgha/agent-scope-reaper.sh"
+  fi
+  install_rc=0
+  STUB_DISABLE_FAIL_UNITS="${retired}.timer" \
+    run_install "${home}" "${state_dir}" || install_rc=$?
+  [ "${install_rc}" -ne 0 ] \
+    || fail "${retired} enabled: installer must reject an enabled timer after failed disable"
+  for stale in "${home}/.config/systemd/user/${retired}.service" "${home}/.config/systemd/user/${retired}.timer"; do
+    [ -e "${stale}" ] || fail "${retired} enabled: installer removed enabled-unit artifact ${stale}"
+  done
 done
 
 # ── Case B: uninstall removes host controls and restored CLI symlinks ─────────
