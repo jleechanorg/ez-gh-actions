@@ -118,6 +118,12 @@ soak is required.
 **Cross-host (Mac)**: jleechan-5rv (P2, re-test after new binary + bxy), jleechan-0q9 (Colima socket flaps), install watchdog binary on Mac host.
 
 ## Recent activity (by day)
+
+- [2026-10-04](activity/2026-10-04.md) — Colima restoration, ghost runner clearance & fleet CPU optimization.
+- [2026-10-03](activity/2026-10-03.md) — runner throughput optimization plan.
+
+- [2026-09-13](activity/2026-09-13.md)
+- [2026-08-30](activity/2026-08-30.md) — parallel value triage and convergence plan for all 15 open ez-gh-actions PRs.
 - [2026-08-01](activity/2026-08-01.md)
 
 - [2026-07-23](activity/2026-07-23.md) — AO ecosystem mission v2 closed (all 6 PRs merged across TS + Go); live Go AO cutover test surfaced the codex-launcher flag bug [jleechan-dkh7](https://github.com/jleechanorg/agent-orchestrator/issues/); harness fully restored to baseline.
