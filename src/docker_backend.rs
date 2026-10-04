@@ -2589,7 +2589,6 @@ static TEST_USER_MANAGER_OOM_PROPERTIES: std::sync::Mutex<Option<String>> =
     std::sync::Mutex::new(None);
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 const HOST_ACTIONS_CPU_QUOTA_USEC: u64 = 2_000_000;
 #[cfg(target_os = "linux")]
 const HOST_ACTIONS_CPU_PERIOD_USEC: u64 = 100_000;
@@ -2598,8 +2597,7 @@ const HOST_ACTIONS_CPU_PERIOD_USEC: u64 = 100_000;
 #[derive(Clone, Copy)]
 struct HostActionsProfile {
     runner_memory_mb: u64,
-    runner_cpus: f64,
-    runner_pids: u32,
+    runner_pids: Option<u32>,
     memory_high_bytes: u64,
     memory_max_bytes: u64,
     pids_max: u64,
@@ -2612,8 +2610,7 @@ fn host_actions_profile(runner_count: u32) -> Option<HostActionsProfile> {
         // Keep the deployed 10-runner envelope available for rollback.
         10 => Some(HostActionsProfile {
             runner_memory_mb: 2500,
-            runner_cpus: 2.0,
-            runner_pids: 512,
+            runner_pids: None,
             memory_high_bytes: 26 * GIB,
             memory_max_bytes: 28 * GIB,
             pids_max: 6000,
@@ -2622,8 +2619,7 @@ fn host_actions_profile(runner_count: u32) -> Option<HostActionsProfile> {
         // current aggregate host memory boundary.
         14 => Some(HostActionsProfile {
             runner_memory_mb: 2000,
-            runner_cpus: 2.0,
-            runner_pids: 512,
+            runner_pids: Some(512),
             memory_high_bytes: 26 * GIB,
             memory_max_bytes: 28 * GIB,
             pids_max: 8000,
@@ -2867,21 +2863,15 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
                 cfg.limits.memory_mb
             );
         }
-        if cfg.limits.cpus != profile.runner_cpus {
-            bail!(
-                "host containment requires limits.cpus to be exactly {} for runner count {}; configured CPUs are {}",
-                profile.runner_cpus,
-                cfg.runner.count,
-                cfg.limits.cpus
-            );
-        }
-        if cfg.limits.pids != profile.runner_pids {
-            bail!(
-                "host containment requires limits.pids to be exactly {} for runner count {}; configured PID limit is {}",
-                profile.runner_pids,
-                cfg.runner.count,
-                cfg.limits.pids
-            );
+        if let Some(pids) = profile.runner_pids {
+            if cfg.limits.pids != pids {
+                bail!(
+                    "host containment requires limits.pids to be exactly {} for runner count {}; configured PID limit is {}",
+                    pids,
+                    cfg.runner.count,
+                    cfg.limits.pids
+                );
+            }
         }
         validate_host_actions_slice(&host_actions_cgroup_root(), cfg.runner.count)?;
         require_user_manager_oom_neutrality()?;
@@ -5684,6 +5674,14 @@ mod tests {
     }
 
     #[test]
+    fn derive_memory_budget_supports_approved_fourteen_runner_floor() {
+        let budget = derive_memory_budget(36864, 4096, 14, 2000).unwrap();
+        assert_eq!(budget.fleet_budget_mb, 32768);
+        assert_eq!(budget.per_runner_budget_mb, 2340);
+        assert!(derive_memory_budget(36864, 4096, 14, 2500).is_err());
+    }
+
+    #[test]
     fn derive_memory_budget_fails_loud_when_floor_unmet() {
         // Same ground-truth VM/reserve/count, but the DEFAULT 3072 MB
         // floor: 16 * 3072 = 49152 > 44067 fleet_budget -> must fail loud,
@@ -8119,6 +8117,8 @@ minimum_isolation = "container"
         write_actions_slice_fixture(&root, 10);
         let mut rollback_cfg = cfg_with(10, "ez-runner-c");
         rollback_cfg.limits.memory_mb = 2500;
+        rollback_cfg.limits.cpus = 1.0;
+        rollback_cfg.limits.pids = 128;
         rollback_cfg.limits.cgroup_parent = Some("actions.slice".into());
         require_host_containment(&rollback_cfg)
             .expect("the supported 10-runner rollback profile must pass admission");
@@ -8135,12 +8135,6 @@ minimum_isolation = "container"
         let err = require_host_containment(&wrong_pids)
             .expect_err("profiles must reject unapproved per-runner PID limits");
         assert!(err.to_string().contains("limits.pids"), "got: {err:#}");
-
-        let mut wrong_cpus = cfg.clone();
-        wrong_cpus.limits.cpus = 3.0;
-        let err = require_host_containment(&wrong_cpus)
-            .expect_err("profiles must reject unapproved per-runner CPU limits");
-        assert!(err.to_string().contains("limits.cpus"), "got: {err:#}");
 
         let mut wrong_count = cfg_with(12, "ez-runner-c");
         wrong_count.limits.cgroup_parent = Some("actions.slice".into());

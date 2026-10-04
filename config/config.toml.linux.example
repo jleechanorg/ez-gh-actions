@@ -15,6 +15,7 @@ image = "ezgha-runner:latest"
 # the 32768 MiB guest budget after its 4096 MiB reserve.
 vm_total_mb = 36864
 guest_reserve_mb = 4096
+runner_floor_mb = 2000
 # Reserve 8 GiB of the existing 62.8 GiB physical host for the host OS and
 # non-runner services. The configured VM total must fit below this envelope.
 host_reserve_mb = 8192
