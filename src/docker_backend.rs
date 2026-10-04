@@ -4627,6 +4627,133 @@ fn notify_failure_ladder_transition(
     }
 }
 
+struct AdmissionBatch {
+    slots: u32,
+    paused: Option<String>,
+    lock: Option<std::fs::File>,
+}
+
+impl Drop for AdmissionBatch {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if let Some(lock) = &self.lock {
+            // Release ownership even while a forked child retains the descriptor.
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn admission_batch(cfg: &Config, missing: u32) -> Result<AdmissionBatch> {
+    let mut batch = AdmissionBatch {
+        slots: missing,
+        paused: None,
+        lock: None,
+    };
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(test)]
+        if *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() == Some(true)
+            && *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() != Some(false)
+        {
+            return Ok(batch);
+        }
+        if missing == 0 || is_macos_host() || host_containment_daemon_in_vm() {
+            return Ok(batch);
+        }
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Native supervisors for this user share admission across state directories.
+        #[cfg(not(test))]
+        let directory = PathBuf::from(env::var("HOME").context("native admission needs HOME")?)
+            .join(".local/state/ezgha");
+        #[cfg(test)]
+        let directory = cfg
+            .state_dir
+            .clone()
+            .context("test admission needs isolated state_dir")?;
+        std::fs::create_dir_all(&directory)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(directory.join("actions-admission.lock"))?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            bail!(
+                "native runner admission lock unavailable: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        batch.lock = Some(lock);
+        let hard: u64 = read_host_actions_limit(&host_actions_cgroup_root(), "memory.max")?
+            .parse()
+            .context("actions.slice memory.max must be finite")?;
+        let new_cap = cfg
+            .limits
+            .memory_mb
+            .checked_mul(1024 * 1024)
+            .filter(|cap| *cap > 0)
+            .context("runner cap must be finite and positive")?;
+        let mut command = docker_cmd();
+        command.args(["ps", "--quiet", "--no-trunc"]);
+        let output = run_docker(command, "listing native admission consumers")?;
+        if !output.status.success() {
+            bail!("native admission listing failed");
+        }
+        let ids: HashSet<String> = std::str::from_utf8(&output.stdout)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let mut used = 0u64;
+        if !ids.is_empty() {
+            let mut command = docker_cmd();
+            command.args(["inspect", "--format", "{\"Id\":{{json .Id}},\"CgroupParent\":{{json .HostConfig.CgroupParent}},\"Memory\":{{json .HostConfig.Memory}}}"]);
+            command.args(&ids);
+            let output = run_docker(command, "inspecting native admission consumers")?;
+            if !output.status.success() {
+                bail!("native admission inspection failed");
+            }
+            #[derive(Deserialize)]
+            #[serde(rename_all = "PascalCase")]
+            struct Consumer {
+                id: String,
+                cgroup_parent: String,
+                memory: u64,
+            }
+            let mut seen = HashSet::new();
+            for line in std::str::from_utf8(&output.stdout)?.lines() {
+                let row: Consumer = serde_json::from_str(line)?;
+                if !ids.contains(&row.id) || !seen.insert(row.id) {
+                    bail!("unknown or duplicate admission container");
+                }
+                let parent = row.cgroup_parent.trim_start_matches('/');
+                if parent == "actions.slice"
+                    || parent.starts_with("actions.slice/")
+                    || (parent.starts_with("actions-") && parent.ends_with(".slice"))
+                {
+                    if row.memory == 0 {
+                        bail!("actions.slice contains an unbounded container");
+                    }
+                    used = used
+                        .checked_add(row.memory)
+                        .context("container memory sum overflow")?;
+                }
+            }
+            if seen != ids {
+                bail!("native admission inspection was incomplete");
+            }
+        }
+        batch.slots =
+            missing.min((hard.saturating_sub(used) / new_cap).min(u32::MAX as u64) as u32);
+        if batch.slots < missing {
+            batch.paused = Some(format!("actions.slice memory permits {} of {missing} starts: existing caps={used}, new cap={new_cap}, parent max={hard}; existing jobs remain running", batch.slots));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cfg;
+    Ok(batch)
+}
+
 fn start_missing_runners_with_starter(
     cfg: &Config,
     backend: Backend,
@@ -4692,8 +4819,18 @@ fn start_missing_runners_with_starter(
             ..StartMissingOutcome::default()
         });
     }
-    let mut admission_paused_reason = None;
-    for _ in 0..missing {
+    let batch = match admission_batch(cfg, missing) {
+        Ok(batch) => batch,
+        Err(error) => {
+            return Ok(StartMissingOutcome {
+                admission_paused_reason: Some(format!("native runner admission paused: {error:#}")),
+                ..StartMissingOutcome::default()
+            })
+        }
+    };
+    let mut admission_paused_reason = batch.paused.clone();
+    // A failed attempt may have created a container, so it still spends capacity.
+    for _ in 0..batch.slots {
         if crate::shutdown::is_requested() {
             eprintln!("shutdown requested; stopping runner spawn mid-batch");
             break;
@@ -6373,6 +6510,188 @@ minimum_isolation = "container"
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(reaped, "supervised reaper must reap after worker restart");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn migration_config(env: &TestEnv) -> Config {
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+        *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+        let mut cfg = cfg_with(14, "ez-runner-c");
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        cfg.limits.memory_mb = 2000;
+        cfg.runner.vm_total_mb = Some(28672);
+        cfg.runner.guest_reserve_mb = 0;
+        cfg.state_dir = Some(env.path.parent().unwrap().into());
+        let root = env.path.parent().unwrap().join("cgroup");
+        write_actions_slice_fixture(&root, 14);
+        *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root);
+        cfg
+    }
+
+    #[cfg(target_os = "linux")]
+    fn migration_docker(env: &TestEnv, caps_mb: &[u64]) -> PathBuf {
+        let dir = env.path.parent().unwrap();
+        let rows: Vec<_> = caps_mb
+            .iter()
+            .enumerate()
+            .map(|(index, cap)| {
+                serde_json::json!({"Id": format!("container{index}"),
+                "CgroupParent": "actions.slice", "Memory": cap * 1024 * 1024})
+            })
+            .collect();
+        std::fs::write(
+            dir.join("caps.jsonl"),
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("ids"),
+            (0..caps_mb.len())
+                .map(|i| format!("container{i}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let capture = dir.join("docker-calls");
+        let script = dir.join("docker");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case " $* " in
+  *" ps "*) cat '{}';;
+  *" inspect "*) cat '{}';;
+  *" info "*) printf '32 64000000000\n';;
+  *) exit 71;;
+esac
+"#,
+                capture.display(),
+                dir.join("ids").display(),
+                dir.join("caps.jsonl").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+        capture
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn migration_refill_admits_only_affordable_legacy_transition() {
+        let env = TestEnv::new("migration_partial");
+        let cfg = migration_config(&env);
+        let capture = migration_docker(&env, &[2500; 10]);
+        let attempts = AtomicUsize::new(0);
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 4, |_, _, slot| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Ok((format!("new-{slot}"), format!("ez-runner-c-{slot}")))
+        })
+        .unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "25000 MiB existing permits one 2000 MiB start under 28672 MiB"
+        );
+        assert_eq!(outcome.started.len(), 1);
+        assert_eq!(outcome.start_failures, 0);
+        assert!(outcome.admission_paused_reason.is_some());
+        let calls = std::fs::read_to_string(capture).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains(" inspect "))
+                .count(),
+            1
+        );
+        assert!(!calls
+            .lines()
+            .any(|line| line.contains(" rm ") || line.contains(" update ")));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn migration_budget_tracks_convergence_and_full_capacity() {
+        let env = TestEnv::new("migration_capacity");
+        let cfg = migration_config(&env);
+        for (caps, requested, expected) in [
+            (vec![], 14, 14),
+            (vec![2000; 14], 1, 0),
+            (vec![2500; 10], 4, 1),
+            ([vec![2500; 9], vec![2000]].concat(), 4, 2),
+            ([vec![2500; 9], vec![2000; 3]].concat(), 2, 0),
+            (vec![2000; 13], 1, 1),
+            (vec![3000; 10], 4, 0),
+        ] {
+            migration_docker(&env, &caps);
+            let batch = admission_batch(&cfg, requested).unwrap();
+            assert_eq!(batch.slots, expected, "caps={caps:?}");
+            assert_eq!(batch.paused.is_some(), expected < requested);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn migration_counts_foreign_actions_consumers_only() {
+        let env = TestEnv::new("migration_foreign");
+        let cfg = migration_config(&env);
+        migration_docker(&env, &[2500; 10]);
+        let path = env.path.parent().unwrap().join("caps.jsonl");
+        let rows = std::fs::read_to_string(&path).unwrap();
+        for parent in ["/actions.slice/foreign", "actions-foreign.slice"] {
+            std::fs::write(&path, rows.replace("actions.slice", parent)).unwrap();
+            assert_eq!(admission_batch(&cfg, 4).unwrap().slots, 1);
+        }
+        std::fs::write(&path, rows.replace("actions.slice", "other.slice")).unwrap();
+        assert_eq!(admission_batch(&cfg, 14).unwrap().slots, 14);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn migration_unknown_caps_refuse_before_starter() {
+        let env = TestEnv::new("migration_unknown");
+        let cfg = migration_config(&env);
+        for rows in [
+            "not json\n",
+            "",
+            "{\"Id\":\"container0\",\"CgroupParent\":\"actions.slice\",\"Memory\":0}\n",
+            "{\"Id\":\"container0\",\"CgroupParent\":\"actions.slice\"}\n",
+            "{\"Id\":\"other\",\"CgroupParent\":\"actions.slice\",\"Memory\":1}\n",
+        ] {
+            migration_docker(&env, &[2500]);
+            std::fs::write(env.path.parent().unwrap().join("caps.jsonl"), rows).unwrap();
+            let outcome =
+                start_missing_runners_with_starter(&cfg, Backend::Docker, 1, |_, _, _| {
+                    panic!("incomplete memory evidence must not reach starter")
+                })
+                .unwrap();
+            assert!(outcome.started.is_empty());
+            assert_eq!(outcome.start_failures, 0);
+            assert!(outcome.admission_paused_reason.is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn migration_failed_attempt_still_consumes_capacity_and_unlocks() {
+        let env = TestEnv::new("migration_failed");
+        let cfg = migration_config(&env);
+        migration_docker(&env, &[2500; 10]);
+        let attempts = AtomicUsize::new(0);
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 4, |_, _, _| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            bail!("start failed after create")
+        })
+        .unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.start_failures, 1);
+        assert!(outcome.admission_paused_reason.is_some());
+        let batch = admission_batch(&cfg, 1).unwrap();
+        assert!(admission_batch(&cfg, 1).is_err());
+        drop(batch);
+        assert!(admission_batch(&cfg, 1).is_ok());
     }
 
     #[test]
