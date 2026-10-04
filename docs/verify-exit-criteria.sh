@@ -1158,14 +1158,14 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] ${slice}: high=${high} max=${max} swap=${swap} tasks=${tasks}"
     done
 
-    # Gate 8 runner aggregate: the ten container limits must be nested inside a
-    # finite actions.slice. Where the docker daemon runs inside Colima (Mac, or a
-    # Linux host with a VM-backed daemon) that slice lives in the guest and is
-    # read through limactl; where the daemon runs on the host (jeff-ubuntu) the
-    # slice is the host's own, and the oracle is the tracked unit
-    # systemd/host/actions.slice, not the guest numbers. Checking the guest from
-    # a host-docker deployment reads "unavailable" and was a false FAIL
-    # (bead ez-gh-actions-1mdp).
+    # Gate 8 runner aggregate: the configured Linux and Mac container limits
+    # must be nested inside a finite actions.slice. Where the docker daemon
+    # runs inside Colima (Mac, or a Linux host with a VM-backed daemon) that
+    # slice lives in the guest and is read through limactl; where the daemon
+    # runs on the host (jeff-ubuntu) the slice is the host's own, and the
+    # oracle is the tracked unit systemd/host/actions.slice, not the guest
+    # numbers. Checking the guest from a host-docker deployment reads
+    # "unavailable" and was a false FAIL (bead ez-gh-actions-1mdp).
     if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
         GUEST_ACTIONS_VALUES=""
         {

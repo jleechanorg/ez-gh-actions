@@ -3914,13 +3914,12 @@ where
         return Ok(ReadinessSummary::default());
     }
     // Bounded parallelism: spawn one probe per container, capped by the
-    // fleet contract (10 Linux + 6 Mac = 16 max — itself under the
+    // current fleet contract (14 Linux + 6 Mac = 20 max — itself under the
     // `DockerChildReaper`'s `DOCKER_REAPER_ACTIVE_CAP` of 64). The shared
     // 30s readiness deadline (`LOCAL_READINESS_BUDGET`) means the worst-case
     // wall-clock cost of this whole readiness pass is bounded by
-    // `LOCAL_TOP_TIMEOUT` (6s) plus deadline overhead — sequential probes
-    // previously could spend up to 30s on a 10-container Linux host when
-    // every top call hit its per-probe timeout (bead jleechan-95jk).
+    // `LOCAL_TOP_TIMEOUT` (6s) plus deadline overhead when every top call hits
+    // its per-probe timeout.
     //
     // Spawn-then-break on first deadline expiry: each per-container `now()`
     // call yields the remaining wall-clock budget at dispatch time, and the
