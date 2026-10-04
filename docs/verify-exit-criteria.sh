@@ -512,6 +512,70 @@ verify_fresh_canary() {
     pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
+
+actions_tasks_max_for_runner_count() {
+    case "$1" in
+        10) printf '6000\n' ;;
+        14) printf '8000\n' ;;
+        *) echo "unsupported runner count for actions.slice profile: $1" >&2; return 1 ;;
+    esac
+}
+
+memory_limit_to_mb() {
+    case "$1" in
+        ''|max|infinity|*[!0-9GMK]) return 1 ;;
+        *G) awk -v v="$1" 'BEGIN {sub(/G$/, "", v); print v * 1024}' ;;
+        *M) awk -v v="$1" 'BEGIN {sub(/M$/, "", v); print v}' ;;
+        *K) awk -v v="$1" 'BEGIN {sub(/K$/, "", v); print int(v / 1024)}' ;;
+        *) awk -v v="$1" 'BEGIN {print int(v / 1024 / 1024)}' ;;
+    esac
+}
+
+native_actions_envelope() {
+    local total_mb="$1" native_actions="$2" actions_unit="$3" runner_count="$4"
+    local selected_tasks actions_max
+    selected_tasks=$(actions_tasks_max_for_runner_count "$runner_count") || return 1
+    if [ "$native_actions" = "1" ]; then
+        actions_max=$(awk -F= '$1 == "MemoryMax" {print $2; exit}' "$actions_unit")
+        actions_max=$(memory_limit_to_mb "$actions_max") || return 1
+        total_mb=$((total_mb + actions_max))
+    fi
+    printf '%s %s\n' "$total_mb" "$selected_tasks"
+}
+
+verify_retired_timer_policy() {
+    local timer load active enabled
+    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+        load=$(systemctl --user show "$timer" -p LoadState --value 2>/dev/null) || return 1
+        active=$(systemctl --user show "$timer" -p ActiveState --value 2>/dev/null) || return 1
+        case "$load" in
+            not-found) [ "$active" = "inactive" ] || return 1 ;;
+            loaded)
+                enabled=$(systemctl --user is-enabled "$timer" 2>&1 || true)
+                [ "$enabled" = "disabled" ] && [ "$active" = "inactive" ] || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+verify_automation_dropins() {
+    local service load dropin root
+    root="${VERIFY_EXIT_CRITERIA_DROPIN_DIR:-}"
+    [ -n "$root" ] || root="$MODERN_UNIT_DIR"
+    for service in ao-daemon ao-orchestrator ai.dark-factory.daemon; do
+        load=$(systemctl --user show "$service.service" -p LoadState --value 2>/dev/null) || return 1
+        case "$load" in
+            not-found) continue ;;
+            loaded)
+                dropin="$root/$service.service.d/20-automation-slice.conf"
+                [ -f "$dropin" ] && grep -q '^Slice=automation.slice$' "$dropin" || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
 if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
     case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
         config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
@@ -520,6 +584,19 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
+        modern_policy)
+            base_mb="$VERIFY_EXIT_CRITERIA_MODERN_BASE_MB"
+            [ -n "$base_mb" ] || base_mb=0
+            policy=$(native_actions_envelope "$base_mb" "$VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS" "$VERIFY_EXIT_CRITERIA_ACTIONS_UNIT" "$VERIFY_EXIT_CRITERIA_RUNNER_COUNT") || exit 1
+            read -r total_mb selected_tasks <<<"$policy"
+            host_mb="$VERIFY_EXIT_CRITERIA_HOST_MB"
+            reserve_mb=$((host_mb / 10))
+            [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
+            [ $((total_mb + reserve_mb)) -le "$host_mb" ] || exit 1
+            verify_retired_timer_policy || exit 1
+            echo "selected_tasks=$selected_tasks"
+            ;;
+        automation_dropins) verify_automation_dropins ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
     exit $?
@@ -1224,14 +1301,16 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         host_max=$(cat /sys/fs/cgroup/actions.slice/memory.max 2>/dev/null || true)
         host_swap=$(cat /sys/fs/cgroup/actions.slice/memory.swap.max 2>/dev/null || true)
         host_tasks=$(cat /sys/fs/cgroup/actions.slice/pids.max 2>/dev/null || true)
-        if [ -z "$host_high_expect" ] || [ -z "$host_max_expect" ] || [ -z "$host_tasks_expect" ] \
-           || [ "${host_high:-}" != "$host_high_expect" ] \
-           || [ "${host_max:-}" != "$host_max_expect" ] \
-           || [ "${host_swap:-}" != "$host_swap_expect" ] \
-           || [ "${host_tasks:-}" != "$host_tasks_expect" ]; then
-            fail "Gate 8 host runner aggregate: live /sys/fs/cgroup/actions.slice (high=${host_high:-unavailable} max=${host_max:-unavailable} swap=${host_swap:-unavailable} tasks=${host_tasks:-unavailable}) does not match the tracked unit ${host_unit} (high=${host_high_expect:-?} max=${host_max_expect:-?} swap=${host_swap_expect:-?} tasks=${host_tasks_expect:-?})"
+        profile=$(native_actions_envelope "$MODERN_MAX_TOTAL_MB" 1 "$host_unit" "$COUNT") || fail "Gate 8 host runner aggregate: could not derive selected actions profile"
+        read -r MODERN_MAX_TOTAL_MB selected_tasks <<<"$profile"
+        if [ -z "$host_high_expect" ] || [ -z "$host_max_expect" ] || [ -z "$selected_tasks" ] \
+           || [ "$host_high" != "$host_high_expect" ] \
+           || [ "$host_max" != "$host_max_expect" ] \
+           || [ "$host_swap" != "$host_swap_expect" ] \
+           || [ "$host_tasks" != "$selected_tasks" ]; then
+            fail "Gate 8 host runner aggregate: live actions.slice does not match selected $COUNT-runner profile (expected high=$host_high_expect max=$host_max_expect swap=$host_swap_expect tasks=$selected_tasks)"
         fi
-        echo "    [PASS] Gate 8 host runner aggregate: live actions.slice matches systemd/host/actions.slice (high=${host_high} max=${host_max} swap=${host_swap} tasks=${host_tasks}); runner membership proven above"
+        echo "    [PASS] Gate 8 host runner aggregate: live actions.slice matches selected $COUNT-runner profile (high=$host_high max=$host_max swap=$host_swap tasks=$host_tasks); runner membership proven above"
     fi
 
     MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
@@ -1243,21 +1322,12 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
     fi
 
-    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-        if ! systemctl --user is-enabled "$timer" >/dev/null 2>&1 \
-           || ! systemctl --user is-active "$timer" >/dev/null 2>&1; then
-            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
-        fi
-    done
-    for dropin in \
-        ao-daemon.service.d/20-automation-slice.conf \
-        ao-orchestrator.service.d/20-automation-slice.conf \
-        ai.dark-factory.daemon.service.d/20-automation-slice.conf; do
-        if [ ! -f "${MODERN_UNIT_DIR}/${dropin}" ] \
-           || ! grep -q '^Slice=automation.slice$' "${MODERN_UNIT_DIR}/${dropin}"; then
-            fail "Gate 8 modern envelope: missing automation drop-in ${dropin}"
-        fi
-    done
+    if ! verify_retired_timer_policy; then
+        fail "Gate 8 modern envelope: retired reaper/PSI timers must be disabled and inactive, or absent"
+    fi
+    if ! verify_automation_dropins; then
+        fail "Gate 8 modern envelope: every installed automation service must have its automation.slice drop-in"
+    fi
     for bin in codex claude gemini; do
         if command -v "$bin" >/dev/null 2>&1; then
             wrapper="${HOME}/.local/bin/${bin}"
@@ -1295,7 +1365,7 @@ fi
 #                      physical host RAM, lower MemoryHigh on
 #                      app-lima-vm.slice, or lower the agent-CLI slice
 #                      MemoryHigh.
-echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) keep retired PSI timers disabled; rely on system systemd-oomd with a non-empty monitored cgroup and a real shed action. (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
