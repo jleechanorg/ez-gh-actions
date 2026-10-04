@@ -693,6 +693,114 @@ mod scheduler_tests {
             .map_or_else(Instant::now, |last| last + config().runner.serve_tick())
     }
 
+    /// Opt-in external-boundary proof: no gh override and no mocked fetcher.
+    /// MAX forces every Known(u32) budget to defer before fleet/alert work;
+    /// Unknown also defers, but fails this test rather than counting as proof.
+    #[test]
+    #[ignore = "requires authenticated real GitHub REST access; run explicitly"]
+    fn live_scheduler_budget_probe_preserves_cadence_and_backoff() {
+        let mut cfg = config();
+        cfg.runner.serve_tick_seconds = crate::config::MIN_SERVE_TICK_SECONDS;
+        cfg.queue_monitor.rest_budget_floor = u32::MAX;
+        let isolated_path = std::env::temp_dir().join(format!(
+            "ezgha-live-scheduler-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        ));
+        cfg.alert.log_path = Some(isolated_path.join("alerts.jsonl"));
+        cfg.invariant_sampler.history_path = Some(isolated_path.join("invariants.jsonl"));
+        assert!(cfg.alert.slack_webhook_url.is_none());
+        assert!(cfg.alert.email_to.is_none());
+        assert!(!cfg.invariant_sampler.enabled);
+        assert!(!isolated_path.exists());
+
+        let mut sched = QueueMonitorScheduler::new();
+        let start = Instant::now();
+        let tick = cfg.runner.serve_tick();
+        eprintln!(
+            "LIVE scheduler epoch={} path=maybe_dispatch->drive_serve_loop_ticks->rest_budget_remaining_until->gh api rate_limit tick_ms={}",
+            unix_now_secs(),
+            tick.as_millis()
+        );
+        for attempt in 1..=REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD {
+            if let Some(last) = sched.last_attempt {
+                std::thread::sleep((last + tick).saturating_duration_since(Instant::now()));
+                assert!(last.elapsed() >= tick);
+            }
+            assert!(sched.maybe_dispatch(&cfg, Instant::now()));
+            let dispatched_at = sched.last_attempt.unwrap();
+            wait_until_finished(
+                &mut sched,
+                github::REST_BUDGET_PROBE_DEADLINE + Duration::from_secs(1),
+            );
+            assert!(sched.collect_finished());
+            let qm = sched.queue_monitor.as_ref().unwrap();
+            assert_eq!(
+                qm.rest_budget_consecutive_floor_hits, attempt,
+                "each attempt requires an actual Known REST budget, never Unknown"
+            );
+            assert!(qm.last_check.is_none());
+            assert!(sched
+                .invariant_sampler
+                .as_ref()
+                .unwrap()
+                .last_check
+                .is_none());
+            let expected_skip = if attempt == REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD {
+                REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS
+            } else {
+                0
+            };
+            assert_eq!(qm.rest_budget_skip_ticks_remaining, expected_skip);
+            eprintln!(
+                "LIVE known_probe={} elapsed_ms={} floor_hits={} skip_ticks={}",
+                attempt,
+                start.elapsed().as_millis(),
+                qm.rest_budget_consecutive_floor_hits,
+                qm.rest_budget_skip_ticks_remaining
+            );
+            for _ in 0..100 {
+                assert!(
+                    dispatched_at.elapsed() < tick,
+                    "live response must leave an early-retry observation window"
+                );
+                assert!(!sched.maybe_dispatch(&cfg, Instant::now()));
+                assert!(sched.in_flight.is_none());
+                assert_eq!(sched.last_attempt, Some(dispatched_at));
+                let qm = sched.queue_monitor.as_ref().unwrap();
+                assert_eq!(qm.rest_budget_consecutive_floor_hits, attempt);
+                assert_eq!(qm.rest_budget_skip_ticks_remaining, expected_skip);
+            }
+            eprintln!("LIVE early_retries=100 workers_dispatched=0 state_unchanged=true");
+        }
+
+        // A real wall-clock tick now consumes one backoff slot without a probe.
+        let last = sched.last_attempt.unwrap();
+        std::thread::sleep((last + tick).saturating_duration_since(Instant::now()));
+        assert!(last.elapsed() >= tick);
+        assert!(sched.maybe_dispatch(&cfg, Instant::now()));
+        wait_until_finished(&mut sched, Duration::from_secs(1));
+        assert!(sched.collect_finished());
+        let qm = sched.queue_monitor.as_ref().unwrap();
+        assert_eq!(
+            qm.rest_budget_consecutive_floor_hits,
+            REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD
+        );
+        assert_eq!(
+            qm.rest_budget_skip_ticks_remaining,
+            REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS - 1
+        );
+        assert!(qm.last_check.is_none());
+        assert!(
+            !isolated_path.exists(),
+            "deferred monitoring must not persist output"
+        );
+        eprintln!(
+            "LIVE backoff_elapsed_ms={} skip_ticks={} external_budget_probes=3 persistent_outputs=0",
+            start.elapsed().as_millis(), qm.rest_budget_skip_ticks_remaining
+        );
+    }
+
     #[test]
     fn disabled_and_not_due_monitors_do_not_spawn() {
         let mut cfg = config();
