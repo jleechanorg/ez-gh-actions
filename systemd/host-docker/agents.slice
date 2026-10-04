@@ -2,6 +2,9 @@
 # (claude/codex/cursor/gemini/etc) and their MCP descendants. Orchestration
 # daemons use the separate automation.slice.
 #
+# Host-docker hard budgets total 55GiB before the host reserve. Admission
+# requires current non-reclaimable use to remain 1GiB below MemoryHigh.
+#
 # Static syntax validation only: `systemd-analyze verify systemd/agents.slice`
 
 [Unit]
@@ -9,8 +12,8 @@ Description=Interactive agent CLI processes (claude/codex/cursor/etc) — finite
 Before=slices.target
 
 [Slice]
-MemoryHigh=18G
-MemoryMax=20G
+MemoryHigh=10G
+MemoryMax=12G
 MemorySwapMax=2G
 TasksMax=8192
 MemoryAccounting=yes

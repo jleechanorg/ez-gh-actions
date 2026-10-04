@@ -22,10 +22,19 @@ assert_file "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-s
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-daemon.service.d/20-automation-slice.conf" || fail "AO drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-orchestrator.service.d/20-automation-slice.conf" || fail "AO orchestrator drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.conf" || fail "dark-factory daemon drop-in does not select automation.slice"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=10G"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=12G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=18G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=20G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "TasksMax=8192"
+for unit in agents.slice automation.slice; do
+  assert_file "$REPO_ROOT/systemd/host-docker/$unit"
+done
+assert_line "$REPO_ROOT/systemd/host-docker/agents.slice" "MemoryHigh=10G"
+assert_line "$REPO_ROOT/systemd/host-docker/agents.slice" "MemoryMax=12G"
+assert_line "$REPO_ROOT/systemd/host-docker/automation.slice" "MemoryHigh=4608M"
+assert_line "$REPO_ROOT/systemd/host-docker/automation.slice" "MemoryMax=5G"
+grep -Fq 'systemd/host-docker/${unit}' "$REPO_ROOT/install.sh" \
+  || fail "host-docker installer policy staging does not select host-mode slices"
 # The QEMU ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
 # VM-backed (runners inside Colima) keeps 34G/38G; host-docker (runners in
 # host Docker, Colima only runs qdrant in an 8 GiB guest) caps it at 9G/10G.
@@ -65,8 +74,8 @@ assert_line "$GUEST_ACTIONS_SLICE" "MemoryHigh=28G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemoryMax=32G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemorySwapMax=0"
 assert_line "$GUEST_ACTIONS_SLICE" "TasksMax=6000"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=4608M"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=5G"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=8G"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=10G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemorySwapMax=1G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "TasksMax=4096"
 ok "finite slice budgets"

@@ -344,8 +344,8 @@ verify_host_docker_envelope() {
     local total_mb=0 host_mb reserve_mb terms=""
     for entry in \
         "actions.slice|systemd/host/actions.slice" \
-        "agents.slice|systemd/agents.slice" \
-        "automation.slice|systemd/automation.slice" \
+        "agents.slice|systemd/host-docker/agents.slice" \
+        "automation.slice|systemd/host-docker/automation.slice" \
         "lima-vm@colima.service|systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
         unit="${entry%%|*}"
         policy="${policy_root}/${entry#*|}"
@@ -849,8 +849,21 @@ elif [ "$PLATFORM" = "macos" ]; then
   [ -f "${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist" ]     || fail "launchd plist missing at ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
 fi
 
-DOCKER_HOST="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
-    || fail "Docker endpoint selection is unknown; cannot verify containment"
+service_docker_endpoint() {
+  local service_env endpoint
+  service_env="$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null || true)"
+  endpoint="$(printf '%s\n' "$service_env" | tr ' ' '\n' | sed -n 's/^DOCKER_HOST_OVERRIDE=//p' | head -1)"
+  printf '%s\n' "${endpoint:-unix:///var/run/docker.sock}"
+}
+
+if [ "$PLATFORM" = "linux" ]; then
+  # The service's persisted override, or native Linux fallback, controls this
+  # verification; ambient operator Docker context is deliberately ignored.
+  DOCKER_HOST="$(service_docker_endpoint)"
+else
+  DOCKER_HOST="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+      || fail "Docker endpoint selection is unknown; cannot verify containment"
+fi
 export DOCKER_HOST
 unset DOCKER_CONTEXT
 docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unreachable"
@@ -1465,31 +1478,18 @@ fi
 QEMU_PID=""
 QEMU_CG=""
 if [ "$PROBE_QEMU_SLICE" = "1" ]; then
-    QEMU_PID=$(pgrep -f 'qemu-system-x86_64' | head -1 || true)
-    if [ -z "$QEMU_PID" ]; then
-        fail "Gate 8 (1) FAIL-CLOSED: no qemu-system-x86_64 process detected on this host. The project's stated goal (physical-host availability) requires that the Colima/Lima VM is provably bounded by an enforced cgroup ceiling; without that process the bound cannot be verified. Remediation: start the Colima VM (limactl start colima, or colima start) — without it Docker daemon has no parent and the per-container limits are unrolled."
-    else
-        # /proc/<pid>/cgroup on cgroup-v2-only hosts is a single line
-        # starting with "0::<path>". Extract the path with grep + cut.
-        QEMU_CG=$(grep '^0::' "/proc/$QEMU_PID/cgroup" 2>/dev/null | head -1 || true)
-        if [ -z "$QEMU_CG" ]; then
-            fail "Gate 8 (1) PID $QEMU_PID has no cgroup-v2 entry in /proc/$QEMU_PID/cgroup. Remediation: ensure the host kernel exposes CONFIG_CGROUP_V2."
-        fi
-        # /proc/<pid>/cgroup escapes '-' as the literal 4-char sequence
-        # '\x2d' on this host, so 'app-lima-vm' written plainly will not
-        # match 'app-lima\x2dvm.slice'. Match on the unit/service name
-        # instead — 'lima-vm' substring catches both 'lima-vm@colima.service'
-        # and 'app-lima\x2dvm.slice'.
-        if ! echo "$QEMU_CG" | grep -q 'lima-vm'; then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
-        fi
-        if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ 34G/38G; systemd/host-docker/ 9G/10G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
-        fi
-        echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
+    # Resolve exactly one QEMU bound to lima-vm@colima.service.
+    if ! QEMU_ASSERTION="$(QEMU_CEILING_MODE="$DOCKER_CONTAINMENT_MODE" ASSERT_LIVE_QEMU=1 \
+        "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)"; then
+        fail "Gate 8 (1) QEMU service-bound assertion failed: $QEMU_ASSERTION"
     fi
+    QEMU_CG_PATH="$(printf '%s\n' "$QEMU_ASSERTION" | sed -n 's/.* cgroup=\([^ ]*\) .*/\1/p' | head -1)"
+    case "$QEMU_CG_PATH" in
+        /sys/fs/cgroup/*) QEMU_CG="0::${QEMU_CG_PATH#/sys/fs/cgroup}" ;;
+        *) fail "Gate 8 (1) QEMU service-bound assertion returned no canonical cgroup path: $QEMU_ASSERTION" ;;
+    esac
+    echo "    [PASS] Gate 8 (1) QEMU service-bound cgroup assertion passed"
 fi
-
 # (2) AO/MCP slice probe --------------------------------------------------------------
 # Identify Agent Orchestrator + MCP daemon processes by argv pattern
 # (comm alone misses python3-spawned MCP servers), then verify each

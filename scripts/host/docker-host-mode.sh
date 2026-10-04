@@ -5,12 +5,9 @@ if [ "${1:-}" = --print-endpoint ]; then print_endpoint=1; shift; fi
 [ "$#" -le 1 ] || { echo "usage: $0 [--print-endpoint] [endpoint]" >&2; exit 2; }
 if [ "$#" -eq 1 ]; then
   endpoint="$1"
-elif [ -n "${DOCKER_CONTEXT:-}" ]; then
-  endpoint="$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}')" \
-    || { echo "unknown endpoint: named context lookup failed" >&2; exit 2; }
-elif [ -n "${DOCKER_HOST:-}" ]; then
-  endpoint="$DOCKER_HOST"
 else
+  # Ask Docker which endpoint it actually selected.  This preserves the
+  # installed CLI's own precedence between DOCKER_HOST and DOCKER_CONTEXT.
   endpoint="$(docker context inspect --format '{{.Endpoints.docker.Host}}')" \
     || { echo "unknown endpoint: active context lookup failed" >&2; exit 2; }
 fi

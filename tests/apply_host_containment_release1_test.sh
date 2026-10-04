@@ -84,7 +84,9 @@ SYSTEMCTL_LOG="$WORK/pass_sys.log" PATH="$PASS_ROOT/bin:$PATH" \
 [ -f "$PASS_ROOT/etc/systemd/system/user@.service.d/99-ezgha-containment.conf" ] || fail "user@.service.d drop-in not staged"
 [ -f "$PASS_ROOT/etc/systemd/user/agents.slice" ] || fail "agents.slice not staged to user units"
 [ -f "$PASS_ROOT/etc/systemd/user/automation.slice" ] || fail "automation.slice not staged to user units"
-ok "apply-host-containment-release1.sh stages policy artifacts and boundary drop-ins"
+grep -Fq "MemoryHigh=10G" "$PASS_ROOT/etc/systemd/user/agents.slice"   || fail "direct repo caller selected the VM-backed agents.slice policy"
+grep -Fq "MemoryHigh=4608M" "$PASS_ROOT/etc/systemd/user/automation.slice"   || fail "direct repo caller selected the VM-backed automation.slice policy"
+ok "apply-host-containment-release1.sh stages host-docker user-slice policies and boundary drop-ins"
 
 # Verify [Install] produces persistent boot wiring without touching the host unit graph.
 HOST_SYSTEMCTL="$(PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v systemctl || true)"

@@ -18,8 +18,10 @@ ok() { echo "OK: $*"; }
 
 if [ -d "${SCRIPT_DIR}/../../systemd/host" ]; then
   POLICY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+  USER_POLICY_ROOT="${POLICY_ROOT}/systemd/host-docker"
 elif [ -d "${SCRIPT_DIR}/host-containment-policy/systemd/host" ]; then
   POLICY_ROOT="${SCRIPT_DIR}/host-containment-policy"
+  USER_POLICY_ROOT="${POLICY_ROOT}/systemd"
 else
   fail "missing tracked host containment policy beside activation script"
 fi
@@ -171,8 +173,8 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   done
   install_file "${POLICY_ROOT}/systemd/user/app.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/app.slice.d/99-ezgha-containment.conf"
   install_file "${POLICY_ROOT}/systemd/user/session.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/session.slice.d/99-ezgha-containment.conf"
-  install_file "${POLICY_ROOT}/systemd/agents.slice" "${USER_UNIT_DIR}/agents.slice"
-  install_file "${POLICY_ROOT}/systemd/automation.slice" "${USER_UNIT_DIR}/automation.slice"
+  install_file "${USER_POLICY_ROOT}/agents.slice" "${USER_UNIT_DIR}/agents.slice"
+  install_file "${USER_POLICY_ROOT}/automation.slice" "${USER_UNIT_DIR}/automation.slice"
   rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" "${USER_UNIT_DIR}/psi-oom-watcher.timer"
   # CONTAINMENT_LIVE_SYSTEMD=1 lets tests run the live user-systemd branch
   # against a --root fixture with a fake systemctl on PATH.

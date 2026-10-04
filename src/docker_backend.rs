@@ -2595,7 +2595,7 @@ const HOST_ACTIONS_MEMORY_HIGH_BYTES: u64 = 26 * 1024 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const HOST_ACTIONS_MEMORY_MAX_BYTES: u64 = 28 * 1024 * 1024 * 1024;
 #[cfg(target_os = "linux")]
-const HOST_ACTIONS_PIDS_MAX: u64 = 6000;
+const HOST_ACTIONS_PIDS_MAX: u64 = 8000;
 #[cfg(target_os = "linux")]
 const HOST_ACTIONS_CPU_QUOTA_USEC: u64 = 2_000_000;
 #[cfg(target_os = "linux")]
@@ -8163,8 +8163,35 @@ minimum_isolation = "container"
         std::fs::write(slice.join("memory.high"), "27917287424\n").unwrap();
         std::fs::write(slice.join("memory.max"), "30064771072\n").unwrap();
         std::fs::write(slice.join("memory.swap.max"), "0\n").unwrap();
-        std::fs::write(slice.join("pids.max"), "6000\n").unwrap();
+        std::fs::write(slice.join("pids.max"), "8000\n").unwrap();
         std::fs::write(slice.join("cpu.max"), "2000000 100000\n").unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_accepts_the_tracked_host_actions_pid_limit() {
+        let _env = TestEnv::new("host_containment_tracked_pid_limit");
+        let root = env::temp_dir().join(format!(
+            "ezgha-host-containment-tracked-pids-{}",
+            std::process::id()
+        ));
+        write_actions_slice_fixture(&root);
+
+        let tracked_tasks_max = include_str!("../systemd/host/actions.slice")
+            .lines()
+            .find_map(|line| line.strip_prefix("TasksMax="))
+            .expect("tracked host actions.slice must define TasksMax")
+            .parse::<u64>()
+            .expect("tracked host actions.slice TasksMax must be numeric");
+        std::fs::write(
+            root.join("actions.slice/pids.max"),
+            format!("{tracked_tasks_max}\n"),
+        )
+        .unwrap();
+
+        validate_host_actions_slice(&root)
+            .expect("validator must accept the tracked host actions.slice PID limit");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

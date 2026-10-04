@@ -1,0 +1,15 @@
+# automation.slice — finite budget for orchestration and its worker scopes.
+# Admission requires current non-reclaimable use to remain 1GiB below
+# MemoryHigh; memory, swap and tasks remain bounded as workers accumulate.
+[Unit]
+Description=Automation and dark-factory processes — bounded host budget
+Before=slices.target
+
+[Slice]
+MemoryHigh=4608M
+MemoryMax=5G
+MemorySwapMax=1G
+TasksMax=4096
+MemoryAccounting=yes
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto

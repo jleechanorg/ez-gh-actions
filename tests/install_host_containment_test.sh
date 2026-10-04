@@ -24,16 +24,12 @@ EOF
 cat > "$STUB_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
 args=" $* "
-if [[ "$args" == *" context inspect explicit-context "* ]]; then
-  echo "unix://$HOME/.colima/default/docker.sock"
-  exit 0
-fi
-if [[ "$args" == *" context inspect remote-context "* ]]; then
-  echo ssh://fixture-remote
-  exit 0
-fi
 if [[ "$args" == *" context inspect "* ]]; then
-  echo unix:///var/run/docker.sock
+  # Docker v29 resolves an explicit DOCKER_HOST before a named context.
+  if [ -n "${DOCKER_HOST:-}" ]; then echo "$DOCKER_HOST";
+  elif [ "${DOCKER_CONTEXT:-}" = remote-context ]; then echo ssh://fixture-remote;
+  elif [ "${DOCKER_CONTEXT:-}" = explicit-context ]; then echo "unix://$HOME/.colima/default/docker.sock";
+  else echo unix:///var/run/docker.sock; fi
   exit 0
 fi
 if [[ "$args" == *" info "* ]]; then
@@ -113,7 +109,7 @@ for agent in codex claude gemini cursor aider cody; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$agent"
 done
 chmod +x "$STUB_BIN"/*
-# Named contexts take precedence over a reachable local Docker socket.
+# A context-only remote endpoint must not fall back to the local socket.
 if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context \
     "$REPO_ROOT/scripts/host/docker-host-mode.sh" >/dev/null 2>&1; then
   fail "remote context was ignored in favor of the local default socket"
@@ -122,13 +118,17 @@ if env -u QEMU_CEILING_MODE EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" \
     DOCKER_CONTEXT=remote-context bash "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" >/dev/null 2>&1; then
   fail "QEMU assertion ignored the selected remote context"
 fi
+# The Linux verifier resolves the endpoint stored in ezgha.service instead
+# of inheriting this shell's remote context. Test the extracted helper with a
+# service override and then its native fallback.
 (
-  export EVENT_LOG PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context
-  fail() { echo "$*" >&2; exit 1; }
-  eval "$(sed -n '/^DOCKER_HOST=.*--print-endpoint/,/^$/p' "$REPO_ROOT/docs/verify-exit-criteria.sh")"
-) > "$WORK/remote-verifier.log" 2>&1 && fail "verifier selected the local socket for a remote context"
-grep -q 'Docker endpoint ownership is unknown' "$WORK/remote-verifier.log" \
-  || fail "verifier did not reject the actual selected remote endpoint"
+  export EVENT_LOG PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context DOCKER_HOST=ssh://ambient
+  systemctl() { printf '%s\n' 'DOCKER_HOST_OVERRIDE=unix:///var/run/docker.sock'; }
+  eval "$(sed -n '/^service_docker_endpoint() {/,/^}/p' "$REPO_ROOT/docs/verify-exit-criteria.sh")"
+  [ "$(service_docker_endpoint)" = unix:///var/run/docker.sock ]     || fail "verifier did not use persisted service Docker endpoint"
+  systemctl() { printf '%s\n' ''; }
+  [ "$(service_docker_endpoint)" = unix:///var/run/docker.sock ]     || fail "verifier did not use native Linux fallback"
+)
 if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" FIXTURE_PROBE_FAIL=1 \
     "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock >/dev/null 2>&1; then
   fail "failed kernel probe with matching stdout was accepted"
@@ -166,6 +166,14 @@ EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME
 
 [ -f "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/host/actions.slice" ] \
   || fail "installed containment policy subtree is incomplete"
+assert_host_policy_slice() {
+  local unit="$1" high="$2" max="$3" file
+  file="$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/$unit"
+  grep -qx "MemoryHigh=$high" "$file" && grep -qx "MemoryMax=$max" "$file" \
+    || fail "host-docker staged policy copied VM-backed values for $unit"
+}
+assert_host_policy_slice agents.slice 10G 12G
+assert_host_policy_slice automation.slice 4608M 5G
 root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
@@ -301,22 +309,59 @@ fi
 grep -qx 'MemoryMax=38G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   || fail "VM-backed install did not deploy the 34G/38G QEMU ceiling"
 
-# Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
-# active-service upgrade path must persist that resolved endpoint before its
-# existing restart, rather than leaving an old unit pointed at native Docker.
+# A host-docker installation leaves next-start guards for its 8GiB guest.
+# Returning to VM-backed Docker must remove only those guards before cargo
+# installation, even if the legacy guest configuration remains larger.
+MIGRATE_HOME="$WORK/migrate_home"
+MIGRATE_EVENTS="$WORK/migrate_events"
+mkdir -p "$MIGRATE_HOME/.config/ezgha" "$MIGRATE_HOME/.lima/colima"
+printf '# fixture\n' > "$MIGRATE_HOME/.config/ezgha/config.toml"
+printf 'memory: "8GiB"\n' > "$MIGRATE_HOME/.lima/colima/lima.yaml"
+env EVENT_LOG="$MIGRATE_EVENTS" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/migrate-host-docker.log" 2>&1 \
+  || fail "host-docker migration setup install failed"
+for unit in lima-vm@colima lima-vm-cpu-ceiling; do
+  guard="$MIGRATE_HOME/.config/systemd/user/$unit.service.d/10-guest-memory-admission.conf"
+  [ -f "$guard" ] || fail "host-docker setup omitted $unit admission guard"
+  printf '# preserve this unrelated drop-in\n' > "$(dirname "$guard")/99-unrelated.conf"
+done
+# This legacy guest is intentionally too large for the former host-docker
+# admission rule. VM-backed mode must not retain that rule.
+printf 'memory: "12GiB"\n' > "$MIGRATE_HOME/.lima/colima/lima.yaml"
+: > "$MIGRATE_EVENTS"
+env EVENT_LOG="$MIGRATE_EVENTS" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
+  DOCKER_HOST="unix://$MIGRATE_HOME/.colima/default/docker.sock" \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/migrate-vm-backed.log" 2>&1 \
+  || fail "VM-backed migration install failed with a legacy large guest"
+for unit in lima-vm@colima lima-vm-cpu-ceiling; do
+  guard="$MIGRATE_HOME/.config/systemd/user/$unit.service.d/10-guest-memory-admission.conf"
+  [ ! -e "$guard" ] || fail "VM-backed migration retained $unit host-docker admission guard"
+  [ -f "$(dirname "$guard")/99-unrelated.conf" ] \
+    || fail "VM-backed migration removed an unrelated $unit drop-in"
+done
+grep -qx 'MemoryMax=38G' "$MIGRATE_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "VM-backed migration did not restore the 34G/38G QEMU policy"
+migrate_reload_line="$(line_of 'systemctl-daemon-reload:daemon-reload')"
+migrate_install_line="$(line_of cargo-install)"
+[ -n "$migrate_reload_line" ] && [ -n "$migrate_install_line" ] && [ "$migrate_reload_line" -lt "$migrate_install_line" ] \
+  || fail "VM-backed migration did not reload systemd after guard cleanup before installation"
+
+# Docker v29 resolves DOCKER_HOST before DOCKER_CONTEXT. The active-service
+# upgrade must persist the CLI-selected host endpoint, not the named context.
 CONTEXT_EVENT_LOG="$WORK/context_events"
 CONTEXT_HOME="$WORK/context_home"
-mkdir -p "$CONTEXT_HOME/.config/ezgha"
+mkdir -p "$CONTEXT_HOME/.config/ezgha" "$CONTEXT_HOME/.lima/colima"
 printf '# fixture\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
+printf 'memory: "8GiB"\n' > "$CONTEXT_HOME/.lima/colima/lima.yaml"
 env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" CARGO_HOME="$CONTEXT_HOME/.cargo" XDG_CONFIG_HOME="$CONTEXT_HOME/.config" \
-  SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///fixture/ignored.sock' \
+  SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///run/docker.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/context-install.log" 2>&1 \
   || fail "named Docker context fixture install failed"
-grep -qx "docker-info:unix://$CONTEXT_HOME/.colima/default/docker.sock" "$CONTEXT_EVENT_LOG" \
-  || fail "DOCKER_CONTEXT did not override DOCKER_HOST during endpoint discovery"
-grep -qx "docker-build:unix://$CONTEXT_HOME/.colima/default/docker.sock" "$CONTEXT_EVENT_LOG" \
-  || fail "image build did not use the resolved named context endpoint"
-if ! grep -qx "install-service:unix://$CONTEXT_HOME/.colima/default/docker.sock" "$CONTEXT_EVENT_LOG"; then
+grep -qx "docker-info:unix:///run/docker.sock" "$CONTEXT_EVENT_LOG" \
+  || fail "DOCKER_HOST did not override DOCKER_CONTEXT during endpoint discovery"
+grep -qx "docker-build:unix:///run/docker.sock" "$CONTEXT_EVENT_LOG" \
+  || fail "image build did not use the CLI-selected host endpoint"
+if ! grep -qx "install-service:unix:///run/docker.sock" "$CONTEXT_EVENT_LOG"; then
   echo "context fixture install log:" >&2
   sed -n '1,120p' "$WORK/context-install.log" >&2 || true
   echo "context fixture events:" >&2

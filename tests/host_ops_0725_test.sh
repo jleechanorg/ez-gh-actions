@@ -69,10 +69,10 @@ else
     fi
   }
   verify_unit "systemd/agents.slice" "${SLICE}" slice_structural_check
-  if ! grep -q '^MemoryHigh=10G$' "${SLICE}" || ! grep -q '^MemoryMax=12G$' "${SLICE}"; then
-    fail "systemd/agents.slice does not carry the documented 10G high / 12G hard envelope"
+  if ! grep -q '^MemoryHigh=18G$' "${SLICE}" || ! grep -q '^MemoryMax=20G$' "${SLICE}"; then
+    fail "systemd/agents.slice does not carry the documented 18G high / 20G hard envelope"
   else
-    ok "systemd/agents.slice has the documented 10G high / 12G hard envelope"
+    ok "systemd/agents.slice has the documented 18G high / 20G hard envelope"
   fi
   if ! grep -q '^ManagedOOMMemoryPressure=auto$' "${SLICE}" || ! grep -q '^ManagedOOMSwap=auto$' "${SLICE}"; then
     fail "systemd/agents.slice missing ManagedOOMMemoryPressure=auto or ManagedOOMSwap=auto"

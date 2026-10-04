@@ -482,8 +482,14 @@ if [ "$(uname -s)" = "Linux" ]; then
     "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
       bad "host-docker guest admission failed before host containment activation"; exit 1;
     }
-    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice; do
+    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
+    done
+    # The staged policy is consumed by the host-docker activation scripts;
+    # retain their approved 10G/12G and 4608M/5G envelope rather than copying
+    # the VM-backed base units.
+    for unit in agents.slice automation.slice; do
+      install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/${unit}" "${HOST_POLICY_DIR}/systemd/${unit}"
     done
     if sudo -n true >/dev/null 2>&1; then
       sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
@@ -495,6 +501,13 @@ if [ "$(uname -s)" = "Linux" ]; then
     fi
     "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" || { bad "host containment user phase failed after root policy activation"; exit 1; }
     ok "host containment activated before binary replacement"
+  else
+    # A previous host-docker installation adds admission guards that enforce
+    # its 8GiB guest contract. VM-backed mode retains the independent 34G/38G
+    # QEMU policy, so remove only those exact guards before installation.
+    rm -f "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+          "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+    systemctl --user daemon-reload || { bad "could not unload host-docker guest admission guards"; exit 1; }
   fi
 fi
 
@@ -802,8 +815,12 @@ FSTRIM_EOF
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
     done
 
+    SLICE_POLICY_DIR="${UNIT_DIR}"
+    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
+      SLICE_POLICY_DIR="${UNIT_DIR}/host-docker"
+    fi
     for unit in agents.slice automation.slice; do
-      install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
+      install -m 0644 "${SLICE_POLICY_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
     # QEMU ceilings follow deployment mode: VM-backed runners use 34G/38G;
     # host-docker uses 9G/10G for its 8GiB guest only after the guest check

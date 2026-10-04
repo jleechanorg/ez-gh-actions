@@ -119,6 +119,10 @@ qemu_max_line=$(grep -n 'QEMU_CEILING_BYTES.*=' "$VERIFY" | head -1 | cut -d: -f
   || fail "live QEMU ceiling probe is missing after modern checks"
 grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
   || fail "live max QEMU ceiling is not fail-closed"
+! grep -Fq "pgrep -f 'qemu-system-x86_64'" "$VERIFY" \
+  || fail "Gate 8 still selects an arbitrary host QEMU"
+grep -Fq 'assert-qemu-cpu-ceiling.sh' "$VERIFY" \
+  || fail "Gate 8 does not reuse the service-bound QEMU assertion"
 
 # Host-docker envelope (bead ez-gh-actions-154k): live memory.max of
 # actions/agents/automation/lima-vm@colima.service must equal the tracked
@@ -177,8 +181,9 @@ cp "$ROOT/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf" 2>/dev/null \
   || printf '[Service]\nMemoryHigh=9G\nMemoryMax=10G\n' \
        > "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf"
-printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\n' > "$OLD_POLICY/systemd/agents.slice"
-printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\n' > "$OLD_POLICY/systemd/automation.slice"
+mkdir -p "$OLD_POLICY/systemd/host-docker"
+printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\n' > "$OLD_POLICY/systemd/host-docker/agents.slice"
+printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\n' > "$OLD_POLICY/systemd/host-docker/automation.slice"
 set_live_policy $((18 * G)) $((20 * G)) $((8 * G)) $((10 * G))
 if env_out=$(run_envelope "$OLD_POLICY"); then
   fail "host-docker 28+20+10+10 envelope should fail: $env_out"
