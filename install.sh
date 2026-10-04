@@ -168,10 +168,11 @@ path = sys.argv[1]
 try:
     try:
         import tomllib
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
     except ModuleNotFoundError:
-        import toml as tomllib
-    with open(path, "rb") as handle:
-        data = tomllib.load(handle)
+        import toml
+        data = toml.load(path)
 except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError):
     print("invalid")
     raise SystemExit(0)

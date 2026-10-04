@@ -10,6 +10,16 @@ STUB_BIN="$WORK/bin"
 EVENT_LOG="$WORK/events"
 mkdir -p "$TEMP_REPO" "$STUB_BIN"
 
+# Force the legacy parser branch while retaining the installed toml package.
+LEGACY_PYTHON="$WORK/legacy-python"
+mkdir -p "$LEGACY_PYTHON"
+cat > "$LEGACY_PYTHON/tomllib.py" <<'EOF'
+raise ModuleNotFoundError("fixture disables tomllib")
+EOF
+TOML_PACKAGE_ROOT="$(python3 -c 'import pathlib, toml; print(pathlib.Path(toml.__file__).resolve().parent.parent)' 2>/dev/null)" \
+  || fail "legacy TOML fallback package is unavailable"
+export PYTHONPATH="$LEGACY_PYTHON:$TOML_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+
 cp "$REPO_ROOT/install.sh" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Dockerfile.runner" "$TEMP_REPO/"
 cp -a "$REPO_ROOT/systemd" "$REPO_ROOT/scripts" "$TEMP_REPO/"
 rm -rf "$TEMP_REPO/docs"
