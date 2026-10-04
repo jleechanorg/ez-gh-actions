@@ -19,12 +19,8 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 if [ -z "${QEMU_CEILING_MODE:-}" ]; then
-  docker_kernel="$(docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
-  if [ -n "$docker_kernel" ] && [ "$docker_kernel" = "$(uname -r)" ]; then
-    QEMU_CEILING_MODE=host-docker
-  else
-    QEMU_CEILING_MODE=vm-backed
-  fi
+  endpoint="${DOCKER_HOST:-unix:///var/run/docker.sock}"
+  QEMU_CEILING_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "$endpoint")"
 fi
 case "$QEMU_CEILING_MODE" in
   vm-backed) QEMU_MAX_HIGH=$((34 * 1024 * 1024 * 1024)); QEMU_MAX_MAX=$((38 * 1024 * 1024 * 1024)) ;;

@@ -15,11 +15,44 @@
 # LIMACTL / LIMA_YAML / LIMA_PROC_ROOT override the sources for fixtures.
 set -euo pipefail
 
+PRINT_YAML=0
+[ "${1:-}" != "--print-yaml" ] || PRINT_YAML=1
+[ "$#" -le 1 ] || { echo "usage: $0 [--print-yaml]" >&2; exit 2; }
 LIMIT=8589934592
 LIMACTL="${LIMACTL:-limactl}"
-LIMA_YAML="${LIMA_YAML:-${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml}"
-INSTANCE_DIR="$(dirname "$LIMA_YAML")"
 PROC_ROOT="${LIMA_PROC_ROOT:-/proc}"
+
+if [ -n "${LIMA_YAML+x}" ]; then
+  INSTANCE_DIR="$(dirname "$LIMA_YAML")"
+else
+  command -v "$LIMACTL" >/dev/null 2>&1 || { echo "FAIL lima guest memory unknown (limactl not found)" >&2; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "FAIL lima guest memory unknown (python3 not found)" >&2; exit 1; }
+  instance_dir="$($LIMACTL list --json colima 2>/dev/null | python3 -c 'import json,sys
+try:
+    rows=[json.loads(line) for line in sys.stdin if line.strip()]
+    if len(rows) == 0:
+        print("NO_INSTANCE")
+        raise SystemExit(0)
+    value=rows[0].get("dir") if len(rows) == 1 and isinstance(rows[0], dict) else None
+    if type(value) is not str or not value.startswith("/") or value.rstrip("/") != value:
+        raise ValueError
+    print(value)
+except (ValueError, json.JSONDecodeError, TypeError, IndexError):
+    raise SystemExit(1)')"     || { echo "FAIL lima guest memory unknown (limactl list --json colima has no authoritative dir)" >&2; exit 1; }
+  if [ "$instance_dir" = NO_INSTANCE ]; then
+    if [ "$PRINT_YAML" -eq 1 ]; then
+      exit 0
+    fi
+    echo "OK: no colima instance reported by limactl"
+    exit 0
+  fi
+  INSTANCE_DIR="$instance_dir"
+  LIMA_YAML="${INSTANCE_DIR}/lima.yaml"
+fi
+if [ "$PRINT_YAML" -eq 1 ]; then
+  printf '%s\n' "$LIMA_YAML"
+  exit 0
+fi
 
 refuse() {
   echo "FAIL lima guest memory $1 > 8GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" >&2

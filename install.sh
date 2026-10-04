@@ -445,15 +445,19 @@ ok "All tests passed"
 HOST_DOCKER_MODE=0
 if [ "$(uname -s)" = "Linux" ]; then
   docker_endpoint="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}"
-  docker_kernel="$(env -u DOCKER_CONTEXT DOCKER_HOST="${docker_endpoint}" docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
-  [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
-  if [ "${docker_kernel}" = "$(uname -r)" ]; then
+  docker_mode="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${docker_endpoint}")"     || { bad "cannot classify selected Docker endpoint"; exit 1; }
+  if [ "${docker_mode}" = host-docker ]; then
     HOST_DOCKER_MODE=1
     # Host Docker keeps runners under actions.slice and sets the Colima guest
     # to an 8GiB allocation. lima-vm@colima starts from this lima.yaml; the
     # 10G QEMU ceiling remains refused until the running guest matches.
-    lima_yaml="${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml"
-    if [ -f "${lima_yaml}" ] && ! grep -qx 'memory: "8GiB"' "${lima_yaml}"; then
+    lima_yaml="${LIMA_YAML:-$("${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" --print-yaml)}" || {
+      bad "cannot resolve the active Lima instance configuration"; exit 1;
+    }
+    if [ -n "${lima_yaml}" ] && [ ! -f "${lima_yaml}" ]; then
+      bad "active Lima configuration is missing: ${lima_yaml}"; exit 1
+    fi
+    if [ -n "${lima_yaml}" ] && ! grep -qx 'memory: "8GiB"' "${lima_yaml}"; then
       if grep -q '^memory:' "${lima_yaml}"; then
         sed -i 's/^memory: .*/memory: "8GiB"/' "${lima_yaml}"
       else
@@ -473,6 +477,12 @@ if [ "$(uname -s)" = "Linux" ]; then
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
+    mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d"
+    install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"       "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
+    systemctl --user daemon-reload 2>/dev/null || true
+    "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
+      bad "host-docker guest admission failed before host containment activation"; exit 1;
+    }
     for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done

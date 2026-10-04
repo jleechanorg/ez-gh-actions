@@ -92,7 +92,7 @@ EOF
 cat > "$STUB_BIN/limactl" <<'EOF'
 #!/usr/bin/env bash
 if [ "$1 $2 $3" = "list --json colima" ]; then
-  printf '{"name":"colima","status":"%s","memory":4294967296}\n' "${LIMA_FIXTURE_STATUS:-Stopped}"
+  printf '{"name":"colima","status":"%s","memory":4294967296,"dir":"%s"}\n' "${LIMA_FIXTURE_STATUS:-Stopped}" "${LIMA_FIXTURE_DIR:-$HOME/.lima/colima}"
   exit 0
 fi
 exit 1
@@ -147,6 +147,12 @@ for f in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf; do
 done
 grep -q 'MemoryHigh=9G MemoryMax=10G' "$HD_UNITS/lima-vm-cpu-ceiling.service" \
   || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that re-applies the wrong 9G/10G ceiling"
+grep -qx 'ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
+  "$HD_UNITS/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+  || fail "host-docker install did not stage the guard-only next-start admission"
+grep -qx 'ExecStart=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
+  "$HD_UNITS/lima-vm-cpu-ceiling.service" \
+  || fail "host-docker reapply unit does not run guest admission first"
 
 # A guest still running at 8 GiB keeps the existing QEMU ceiling (fail closed)
 # even though this same install run rewrote lima.yaml to 8GiB.
@@ -241,4 +247,11 @@ if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG
   cat "$CONTEXT_EVENT_LOG" >&2 || true
   fail "active systemd service refresh did not persist the selected endpoint"
 fi
+# A matching kernel is insufficient for a remote or arbitrary Unix endpoint.
+[ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" ssh://fixture-remote)" = vm-backed ] \
+  || fail "same-kernel remote endpoint was classified as host Docker"
+[ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///fixture/relay.sock)" = vm-backed ] \
+  || fail "arbitrary Unix endpoint was classified as host Docker"
+[ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock)" = host-docker ] \
+  || fail "canonical native endpoint was not classified as host Docker"
 echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"

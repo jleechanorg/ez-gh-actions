@@ -277,10 +277,7 @@ cgroup_has_effective_memory_ceiling() {
 
 daemon_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
-    local daemon_kernel host_kernel
-    daemon_kernel=$(docker info --format '{{.KernelVersion}}' 2>/dev/null | tr -d '[:space:]' || true)
-    host_kernel=$(uname -r | tr -d '[:space:]' || true)
-    [ -n "$daemon_kernel" ] && [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+    "${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${DOCKER_HOST:-unix:///var/run/docker.sock}"         | grep -qx vm-backed
 }
 
 host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1" 2>/dev/null; }
