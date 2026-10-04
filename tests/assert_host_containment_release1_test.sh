@@ -83,7 +83,8 @@ elif [ "$1" = "inspect" ]; then
   printf '%s\n' "$((10000 + 10#$slot))"
 fi
 DOCKER_EOF
-  sed -i "s/__FIXTURE_RUNNER_COUNT__/$runner_count/" "$root/bin/docker"
+  sed "s/__FIXTURE_RUNNER_COUNT__/$runner_count/" "$root/bin/docker" > "$root/bin/docker.tmp"
+  mv "$root/bin/docker.tmp" "$root/bin/docker"
   chmod +x "$root/bin/docker"
 
   # Mock /proc/<pid>/cgroup for each container PID

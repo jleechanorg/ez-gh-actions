@@ -82,10 +82,10 @@ chmod +x "$STUB_BIN"/*
 cat > "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --system-phase ]; then
-  echo root-phase >> "$EVENT_LOG"
+  echo "root-phase:$*" >> "$EVENT_LOG"
   [ "${APPLY_FAIL_ROOT:-0}" = 1 ] && exit 1
 else
-  echo user-phase >> "$EVENT_LOG"
+  echo "user-phase:$*" >> "$EVENT_LOG"
   [ "${APPLY_FAIL_USER:-0}" = 1 ] && exit 1
 fi
 exit 0
@@ -98,16 +98,40 @@ chmod +x "$TEMP_REPO/scripts/host/"*containment-release1.sh
 
 HOME_DIR="$WORK/home"
 mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user"
-printf '# fixture\n' > "$HOME_DIR/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$HOME_DIR/.config/ezgha/config.toml"
 EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/install.log" 2>&1 || fail "host-Docker fixture install failed"
 
 [ -f "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/host/actions.slice" ] \
   || fail "installed containment policy subtree is incomplete"
-root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
+root_line="$(line_of "root-phase:--system-phase --runner-count 14")"; user_line="$(line_of "user-phase:--runner-count 14")"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
+
+ROLLBACK_HOME="$WORK/rollback_home"
+ROLLBACK_LOG="$WORK/rollback_events"
+mkdir -p "$ROLLBACK_HOME/.config/ezgha"
+printf '[runner]\ncount = 10\n' > "$ROLLBACK_HOME/.config/ezgha/config.toml"
+env EVENT_LOG="$ROLLBACK_LOG" PATH="$STUB_BIN:$PATH" HOME="$ROLLBACK_HOME" CARGO_HOME="$ROLLBACK_HOME/.cargo" XDG_CONFIG_HOME="$ROLLBACK_HOME/.config" \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/rollback-install.log" 2>&1 \
+  || fail "10-runner rollback fixture install failed"
+grep -qx 'root-phase:--system-phase --runner-count 10' "$ROLLBACK_LOG" \
+  || fail "10-runner rollback root phase did not receive --runner-count 10"
+grep -qx 'user-phase:--runner-count 10' "$ROLLBACK_LOG" \
+  || fail "10-runner rollback user phase did not receive --runner-count 10"
+
+INVALID_HOME="$WORK/invalid_count_home"
+INVALID_LOG="$WORK/invalid_count_events"
+mkdir -p "$INVALID_HOME/.config/ezgha"
+printf '[runner]\ncount = 12\n' > "$INVALID_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$INVALID_LOG" PATH="$STUB_BIN:$PATH" HOME="$INVALID_HOME" CARGO_HOME="$INVALID_HOME/.cargo" XDG_CONFIG_HOME="$INVALID_HOME/.config" \
+    bash "$TEMP_REPO/install.sh" --dev > "$WORK/invalid-count-install.log" 2>&1; then
+  fail "installer accepted unsupported runner.count=12"
+fi
+if grep -qE '^(root|user)-phase:' "$INVALID_LOG" 2>/dev/null; then
+  fail "invalid runner.count wrote containment phases"
+fi
 
 run_failed_phase() {
   local phase="$1"

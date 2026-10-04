@@ -148,6 +148,56 @@ done
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
+CONFIG_PATH="${CONFIG_DIR}/config.toml"
+
+# Host containment has a bounded profile selector. Read the existing runtime
+# TOML before either privilege phase so rollback config (count=10) receives
+# TasksMax=6000 while the current default/template (count=14) receives 8000.
+# A missing or legacy-unparseable config keeps the installer default of 14;
+# a parsed unsupported count fails closed before containment writes.
+read_config_runner_count() {
+  local config_path="$1"
+  python3 - "$config_path" <<'PYCFG'
+import sys
+
+path = sys.argv[1]
+if not path:
+    print(14)
+    raise SystemExit(0)
+try:
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except ModuleNotFoundError:
+        import toml
+        data = toml.load(path)
+except (OSError, KeyError, TypeError, ValueError):
+    print(14)
+    raise SystemExit(0)
+value = data.get("runner", {}).get("count", 14)
+if isinstance(value, bool) or not isinstance(value, int):
+    print("invalid")
+else:
+    print(value)
+PYCFG
+}
+
+RUNNER_COUNT=14
+if [ "$(uname -s)" = "Linux" ]; then
+  RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
+    bad "could not read runner.count from ${CONFIG_PATH}"
+    exit 1
+  }
+  case "${RUNNER_COUNT}" in
+    10|14) ;;
+    *)
+      bad "runner.count must be 10 or 14 on Linux (got ${RUNNER_COUNT})"
+      exit 1
+      ;;
+  esac
+fi
+
 LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 
 exec 9>"${LOCK_FILE}"
@@ -427,14 +477,14 @@ if [ "$(uname -s)" = "Linux" ]; then
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done
     if sudo -n true >/dev/null 2>&1; then
-      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
     elif command -v pkexec >/dev/null 2>&1; then
-      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
     else
       bad "host containment root phase requires sudo or pkexec"
       exit 1
     fi
-    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" || { bad "host containment user phase failed after root policy activation"; exit 1; }
+    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --runner-count "${RUNNER_COUNT}" || { bad "host containment user phase failed after root policy activation"; exit 1; }
     ok "host containment activated before binary replacement"
   fi
 fi
