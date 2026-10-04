@@ -10,22 +10,25 @@ STUB_BIN="$WORK/bin"
 EVENT_LOG="$WORK/events"
 mkdir -p "$TEMP_REPO" "$STUB_BIN"
 
-# Force the legacy parser branch while retaining the installed toml package.
-LEGACY_PYTHON="$WORK/legacy-python"
-mkdir -p "$LEGACY_PYTHON"
-cat > "$LEGACY_PYTHON/tomllib.py" <<'EOF'
-raise ModuleNotFoundError("fixture disables tomllib")
-EOF
-TOML_PACKAGE_ROOT="$(python3 -c 'import pathlib, toml; print(pathlib.Path(toml.__file__).resolve().parent.parent)' 2>/dev/null)" \
-  || fail "legacy TOML fallback package is unavailable"
-export PYTHONPATH="$LEGACY_PYTHON:$TOML_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-
 cp "$REPO_ROOT/install.sh" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Dockerfile.runner" "$TEMP_REPO/"
 cp -a "$REPO_ROOT/systemd" "$REPO_ROOT/scripts" "$TEMP_REPO/"
 rm -rf "$TEMP_REPO/docs"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 line_of() { grep -n -m1 "^$1$" "$EVENT_LOG" | cut -d: -f1; }
+
+if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
+  if [ -z "${TOML_PACKAGE_ROOT:-}" ]; then
+    echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: SKIP (toml package unavailable)"
+    exit 0
+  fi
+  LEGACY_PYTHON="$WORK/legacy-python"
+  mkdir -p "$LEGACY_PYTHON"
+  cat > "$LEGACY_PYTHON/tomllib.py" <<'EOF'
+raise ModuleNotFoundError("fixture disables tomllib")
+EOF
+  export PYTHONPATH="$LEGACY_PYTHON:$TOML_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 cat > "$STUB_BIN/uname" <<'EOF'
 #!/usr/bin/env bash
@@ -217,4 +220,20 @@ if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG
   cat "$CONTEXT_EVENT_LOG" >&2 || true
   fail "active systemd service refresh did not persist the selected endpoint"
 fi
-echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"
+if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
+  echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: PASS"
+else
+  echo "INSTALL_HOST_CONTAINMENT_NORMAL_TOMLLIB_TEST: PASS"
+  TOML_PACKAGE_ROOT="$(python3 -c 'import pathlib, toml; print(pathlib.Path(toml.__file__).resolve().parent.parent)' 2>/dev/null || true)"
+  if [ -n "$TOML_PACKAGE_ROOT" ]; then
+    if TOML_PACKAGE_ROOT="$TOML_PACKAGE_ROOT" INSTALL_HOST_CONTAINMENT_LEGACY_TOML=1 \
+        bash "$REPO_ROOT/tests/install_host_containment_test.sh" > "$WORK/legacy-toml.log" 2>&1; then
+      cat "$WORK/legacy-toml.log"
+    else
+      cat "$WORK/legacy-toml.log" >&2
+      fail "legacy TOML fallback fixture failed"
+    fi
+  else
+    echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: SKIP (toml package unavailable)"
+  fi
+fi
