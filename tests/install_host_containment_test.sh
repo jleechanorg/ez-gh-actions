@@ -215,9 +215,9 @@ grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
 if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
 fi
-# VM-backed mode keeps the 9G/10G QEMU ceiling (runners live in the guest).
-grep -qx 'MemoryMax=10G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-  || fail "VM-backed install did not deploy the 9G/10G QEMU ceiling"
+# VM-backed mode keeps the 34G/38G QEMU ceiling (runners live in the guest).
+grep -qx 'MemoryMax=38G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "VM-backed install did not deploy the 34G/38G QEMU ceiling"
 
 # Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
 # active-service upgrade path must persist that resolved endpoint before its

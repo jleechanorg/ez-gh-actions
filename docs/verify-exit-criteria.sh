@@ -1265,7 +1265,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
 fi
 # Remediation primer (printed before probes fire so a cold reader sees
 # the four probes + their fixes):
-#   (1) QEMU slice:    the mode-selected app-lima-vm.slice (systemd/ 9G/10G) must be
+#   (1) QEMU slice:    the mode-selected app-lima-vm.slice (systemd/ 34G/38G; systemd/host-docker/ 9G/10G) must be
 #                      deployed to ~/.config/systemd/user/ AND reloaded
 #                      (systemctl --user daemon-reload); the LIVE leaf
 #                      cgroup's memory.high in /sys/fs/cgroup must be a
@@ -1321,7 +1321,7 @@ if [ "$PROBE_QEMU_SLICE" = "1" ]; then
             fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
         fi
         if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ 9G/10G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ 34G/38G; systemd/host-docker/ 9G/10G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
         fi
         echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
     fi
@@ -1596,7 +1596,7 @@ else
         fail "Gate 8 (4) QEMU slice /sys/fs/cgroup${QEMU_CG_PATH}/memory.high is unreadable. Remediation: verify cgroup-v2 fs is mounted and the slice path is correct (got QEMU_CG='$QEMU_CG')."
     fi
     if [ "$QEMU_CEILING_BYTES" = "max" ]; then
-        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ 9G/10G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy the mode-selected app-lima-vm.slice (systemd/ 34G/38G; systemd/host-docker/ 9G/10G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
     fi
     QEMU_CEILING_MB=$(awk -v b="$QEMU_CEILING_BYTES" 'BEGIN { printf "%d\n", b / 1024 / 1024 }')
 

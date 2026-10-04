@@ -27,12 +27,12 @@ assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=12G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "TasksMax=8192"
 # The QEMU ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
-# VM-backed (runners inside Colima) keeps 9G/10G; host-docker (runners in
+# VM-backed (runners inside Colima) keeps 34G/38G; host-docker (runners in
 # host Docker, Colima only runs qdrant in an 8 GiB guest) caps it at 9G/10G.
 # Each of the three tracked surfaces exists in both variants.
 for mode in vm-backed host-docker; do
   case "$mode" in
-    vm-backed) dir="$REPO_ROOT/systemd"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
+    vm-backed) dir="$REPO_ROOT/systemd"; high=MemoryHigh=34G; max=MemoryMax=38G ;;
     host-docker) dir="$REPO_ROOT/systemd/host-docker"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
   esac
   for file in "$dir/app-lima-vm.slice" "$dir/lima-vm@colima.service.d/99-memory-ceiling.conf"; do

@@ -123,11 +123,11 @@ printf '40802189312\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory
 hd_rc=0
 hd_out="$(QEMU_CEILING_MODE=host-docker ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
   QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || hd_rc=$?
-[ "$hd_rc" -ne 0 ] || { echo "FAIL: VM-backed 9G/10G passed the host-docker bound" >&2; exit 1; }
-echo "$hd_out" | grep -q 'memory.high=36507222016 exceeds 4831838208' \
+[ "$hd_rc" -ne 0 ] || { echo "FAIL: VM-backed 34G/38G passed the host-docker bound" >&2; exit 1; }
+echo "$hd_out" | grep -q 'memory.high=36507222016 exceeds 9663676416' \
   || { echo "FAIL: host-docker bound not reported: $hd_out" >&2; exit 1; }
-printf '4831838208\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
-printf '5368709120\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
+printf '9663676416\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
+printf '10737418240\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
 hd_out="$(QEMU_CEILING_MODE=host-docker ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
   QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
   || { echo "FAIL: exact host-docker 9G/10G rejected: $hd_out" >&2; exit 1; }

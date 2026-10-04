@@ -14,7 +14,7 @@
 # ordering preserves normal operation while preventing unbounded host impact.
 #
 # 34 GiB was measured against a 31.8 GiB normal QEMU RSS peak, leaving a
-# measured margin of 2.2 GiB before reclaim. MemoryMax=10G is 6.2 GiB above that peak;
+# measured margin of 2.2 GiB before reclaim. MemoryMax=38G is 6.2 GiB above that peak;
 # the finite swap/task ceilings bound transient accounting and fork growth.
 # CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
 # (historical 24 is stale). This caps runnable QEMU time; D-state still counts
@@ -33,8 +33,8 @@ Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (34 Gi
 Before=slices.target
 
 [Slice]
-MemoryHigh=9G
-MemoryMax=10G
+MemoryHigh=34G
+MemoryMax=38G
 MemorySwapMax=2G
 TasksMax=4096
 MemoryAccounting=yes
