@@ -10,6 +10,19 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Unknown daemon ownership must never select the native-host policy.
+(
+  eval "$(sed -n '/^daemon_in_vm() {/,/^}/p' "$VERIFY")"
+  eval "$(sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY")"
+  export DOCKER_HOST=ssh://unowned-fixture
+  unset DOCKER_CONTAINMENT_MODE
+  if host_docker_requires_actions_oomctl; then
+    fail "unknown Docker endpoint selected host policy"
+  fi
+) || fail "Docker ownership dispatch is unsafe"
+
+DOCKER_CONTAINMENT_MODE=host-docker
+
 cat > "$TMP/valid.toml" <<'EOF'
 [limits]
 cgroup_parent = "actions.slice"

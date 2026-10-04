@@ -277,7 +277,7 @@ cgroup_has_effective_memory_ceiling() {
 
 daemon_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
-    "${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${DOCKER_HOST:-unix:///var/run/docker.sock}"         | grep -qx vm-backed
+    [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = vm-backed ]
 }
 
 host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1" 2>/dev/null; }
@@ -358,7 +358,7 @@ oomctl_lists_actions_slice() {
 # host's runner aggregate.  A legacy user-scope timer may be present for
 # VM-backed deployments, but it cannot hide a missing oomd enrollment here.
 host_docker_requires_actions_oomctl() {
-    [ "$(uname -s)" = "Linux" ] && ! daemon_in_vm
+    [ "$(uname -s)" = "Linux" ] && [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = host-docker ]
 }
 
 cpu_controller_available() {
@@ -738,6 +738,8 @@ elif [ "$PLATFORM" = "macos" ]; then
 fi
 
 docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unreachable"
+DOCKER_CONTAINMENT_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "${DOCKER_HOST:-unix:///var/run/docker.sock}")" \
+    || fail "Docker endpoint ownership is unknown; cannot verify containment"
 
 if [ "$PLATFORM" = "macos" ] && command -v colima >/dev/null 2>&1; then
   colima status 2>&1 | grep -qi "is running"     || fail "Colima VM is not running (run: colima start)"

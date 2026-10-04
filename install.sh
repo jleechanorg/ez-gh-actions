@@ -477,9 +477,13 @@ if [ "$(uname -s)" = "Linux" ]; then
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
-    mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d"
-    install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"       "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
-    systemctl --user daemon-reload 2>/dev/null || true
+    mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d" \
+      "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"
+    install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+      "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
+    install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+      "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+    systemctl --user daemon-reload || { bad "could not load guest admission guards"; exit 1; }
     "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
       bad "host-docker guest admission failed before host containment activation"; exit 1;
     }

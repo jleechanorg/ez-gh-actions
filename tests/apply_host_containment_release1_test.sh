@@ -211,6 +211,29 @@ lima_case yaml_missing_stopped - Stopped - refuse
 grep -q "FAIL lima guest memory unknown (.*lima.yaml" "$WORK/lima_yaml_missing_stopped.log" || fail "instance without lima.yaml passed with nothing proven: $(cat "$WORK/lima_yaml_missing_stopped.log")"
 ok "apply-host-containment-release1.sh refuses the host-docker QEMU ceiling while the Lima guest is above 8 GiB"
 
+# An empty Lima listing cannot hide an owned running Colima process.
+EMPTY_LIMA="$WORK/empty_lima"
+mkdir -p "$EMPTY_LIMA/bin" "$EMPTY_LIMA/proc/7777"
+printf '#!/bin/sh\nexit 0\n' > "$EMPTY_LIMA/bin/limactl"
+chmod +x "$EMPTY_LIMA/bin/limactl"
+printf 'qemu-system-x86\n' > "$EMPTY_LIMA/proc/7777/comm"
+printf '%s\0' qemu-system-x86_64 -m 12288 -drive \
+  "file=$EMPTY_LIMA/colima/diffdisk" > "$EMPTY_LIMA/proc/7777/cmdline"
+for mode in check path; do
+  args=()
+  [ "$mode" != path ] || args=(--print-yaml)
+  if env -u LIMA_YAML LIMACTL="$EMPTY_LIMA/bin/limactl" LIMA_PROC_ROOT="$EMPTY_LIMA/proc" \
+      "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" "${args[@]}" > "$WORK/empty-$mode.log" 2>&1; then
+    fail "empty Lima listing hid a running guest ($mode)"
+  fi
+  grep -q 'FAIL lima guest memory unknown.*owned colima QEMU' "$WORK/empty-$mode.log" \
+    || fail "missing owned-QEMU diagnostic ($mode)"
+done
+mkdir -p "$EMPTY_LIMA/no_proc"
+env -u LIMA_YAML LIMACTL="$EMPTY_LIMA/bin/limactl" LIMA_PROC_ROOT="$EMPTY_LIMA/no_proc" \
+  "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" >/dev/null \
+  || fail "proven absence of a Colima instance was rejected"
+
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
 setup_fixture "$ACTIONS_MEM_FAIL_ROOT"

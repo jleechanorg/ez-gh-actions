@@ -25,16 +25,17 @@ cat > "$STUB_BIN/docker" <<'EOF'
 #!/usr/bin/env bash
 args=" $* "
 if [[ "$args" == *" context inspect explicit-context "* ]]; then
-  echo unix:///fixture/context.sock
+  echo "unix://$HOME/.colima/default/docker.sock"
   exit 0
 fi
 if [[ "$args" == *" info "* ]]; then
   echo "docker-info:${DOCKER_HOST:-}" >> "$EVENT_LOG"
-  if [ "${DOCKER_HOST:-}" = "unix:///fixture/vm.sock" ] || [ "${DOCKER_HOST:-}" = "unix:///fixture/context.sock" ]; then
+  if [[ "${DOCKER_HOST:-}" == *"/.colima/default/docker.sock" ]]; then
     echo fixture-vm-kernel
   else
-    echo fixture-host-kernel
+    echo "${FIXTURE_KERNEL:-fixture-host-kernel}"
   fi
+  [ "${FIXTURE_PROBE_FAIL:-0}" != 1 ] || exit 1
 fi
 if [[ "$args" == *" build "* ]]; then echo "docker-build:${DOCKER_HOST:-}" >> "$EVENT_LOG"; fi
 exit 0
@@ -83,7 +84,10 @@ case "${1:-}" in
       exit 3
     fi
     [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1 ;;
-  daemon-reload|start|set-property|enable) echo "systemctl-$1:$*" >> "$EVENT_LOG"; exit 0 ;;
+  daemon-reload)
+    echo "systemctl-$1:$*" >> "$EVENT_LOG"
+    [ "${FAIL_RELOAD:-0}" != 1 ]; exit $? ;;
+  start|set-property|enable) echo "systemctl-$1:$*" >> "$EVENT_LOG"; exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -101,6 +105,14 @@ for agent in codex claude gemini cursor aider cody; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$agent"
 done
 chmod +x "$STUB_BIN"/*
+if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" FIXTURE_PROBE_FAIL=1 \
+    "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock >/dev/null 2>&1; then
+  fail "failed kernel probe with matching stdout was accepted"
+fi
+if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" FIXTURE_KERNEL=other-kernel \
+    "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock >/dev/null 2>&1; then
+  fail "canonical endpoint with mismatched kernel was accepted as owned"
+fi
 
 # The installer must invoke the staged scripts. These fixtures record the
 # privilege phase and avoid all host systemd/file mutation.
@@ -154,7 +166,7 @@ grep -qx 'ExecStart=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
   "$HD_UNITS/lima-vm-cpu-ceiling.service" \
   || fail "host-docker reapply unit does not run guest admission first"
 
-# A guest still running at 8 GiB keeps the existing QEMU ceiling (fail closed)
+# A guest still running at 12 GiB keeps the existing QEMU ceiling (fail closed)
 # even though this same install run rewrote lima.yaml to 8GiB.
 BIG_HOME="$WORK/big_guest_home"
 mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d" "$BIG_HOME/.lima/colima"
@@ -165,6 +177,14 @@ mkdir -p "$BIG_PROC/7777"
 printf 'qemu-system-x86\n' > "$BIG_PROC/7777/comm"
 printf '%s\0' qemu-system-x86_64 -m 12288 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
 printf '[Service]\nMemoryHigh=9G\nMemoryMax=10G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+cp "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service" "$BIG_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service"
+cp "$BIG_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service" "$WORK/reapply-before"
+cp "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" "$WORK/cap-before"
+# Use the real apply helper with an isolated root: early admission must stop
+# before either phase, without relying on a stubbed apply result.
+cp "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh" "$WORK/apply-fixture"
+cp "$REPO_ROOT/scripts/host/apply-host-containment-release1.sh" "$TEMP_REPO/scripts/host/"
+sed -i "s|^ROOT=\"/\"$|ROOT=\"$WORK/isolated-apply\"|" "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh"
 if env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
   LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1; then
@@ -177,6 +197,36 @@ grep -q 'FAIL lima guest memory 12884901888 > 8GiB' "$WORK/big-install.log" \
 grep -qx 'memory: "8GiB"' "$BIG_HOME/.lima/colima/lima.yaml" || fail "big-guest install did not resize lima.yaml"
 if grep -Eq '^systemctl-(set-property|enable):.*lima-vm@colima\.service|^systemctl-enable:.*lima-vm-cpu-ceiling\.service' "$WORK/big_events" 2>/dev/null; then
   fail "failed guest check applied or enabled the stale host-docker ceiling: $(cat "$WORK/big_events")"
+fi
+
+[ ! -e "$WORK/isolated-apply/etc/systemd/system/actions.slice" ] \
+  || fail "unsafe guest reached the real root apply phase"
+cp "$WORK/apply-fixture" "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh"
+cmp "$WORK/reapply-before" "$BIG_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service" \
+  || fail "unsafe guest changed the existing reapply unit"
+cmp "$WORK/cap-before" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "unsafe guest changed existing cap bytes"
+for unit in lima-vm@colima lima-vm-cpu-ceiling; do
+  grep -qx 'ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
+    "$BIG_HOME/.config/systemd/user/$unit.service.d/10-guest-memory-admission.conf" \
+    || fail "unsafe guest left $unit without a next-start guard"
+done
+if grep -Eq '^root-phase$|^user-phase$|^cargo-install$' "$WORK/big_events"; then
+  fail "unsafe guest reached a containment apply phase or installed the binary"
+fi
+RELOAD_HOME="$WORK/reload_home"
+mkdir -p "$RELOAD_HOME/.config/ezgha" "$RELOAD_HOME/.lima/colima"
+printf 'memory: "8GiB"\n' > "$RELOAD_HOME/.lima/colima/lima.yaml"
+printf '# fixture\n' > "$RELOAD_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$WORK/reload_events" PATH="$STUB_BIN:$PATH" HOME="$RELOAD_HOME" \
+    CARGO_HOME="$RELOAD_HOME/.cargo" XDG_CONFIG_HOME="$RELOAD_HOME/.config" FAIL_RELOAD=1 \
+    bash "$TEMP_REPO/install.sh" --dev > "$WORK/reload.log" 2>&1; then
+  fail "failed guard reload allowed installation"
+fi
+grep -q 'could not load guest admission guards' "$WORK/reload.log" \
+  || fail "guard reload failure was not reported"
+if grep -Eq '^root-phase$|^user-phase$|^cargo-install$' "$WORK/reload_events"; then
+  fail "failed guard reload reached a mutation phase"
 fi
 
 # A lima.yaml without a memory: line gets one (sed alone would change nothing).
@@ -213,12 +263,12 @@ VM_EVENT_LOG="$WORK/vm_events"
 VM_HOME="$WORK/vm_home"
 mkdir -p "$VM_HOME"
 env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" CARGO_HOME="$VM_HOME/.cargo" XDG_CONFIG_HOME="$VM_HOME/.config" \
-  DOCKER_HOST='unix:///fixture/vm.sock' \
+  DOCKER_HOST="unix://$VM_HOME/.colima/default/docker.sock" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/vm-install.log" 2>&1 \
   || fail "explicit VM endpoint fixture install failed"
-grep -qx 'docker-info:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
+grep -qx "docker-info:unix://$VM_HOME/.colima/default/docker.sock" "$VM_EVENT_LOG" \
   || fail "installer did not probe the explicitly selected VM endpoint"
-grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
+grep -qx "docker-build:unix://$VM_HOME/.colima/default/docker.sock" "$VM_EVENT_LOG" \
   || fail "installer did not build on the explicitly selected VM endpoint"
 if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
@@ -238,11 +288,11 @@ env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" C
   SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///fixture/ignored.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/context-install.log" 2>&1 \
   || fail "named Docker context fixture install failed"
-grep -qx 'docker-info:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
+grep -qx "docker-info:unix://$CONTEXT_HOME/.colima/default/docker.sock" "$CONTEXT_EVENT_LOG" \
   || fail "DOCKER_CONTEXT did not override DOCKER_HOST during endpoint discovery"
-grep -qx 'docker-build:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG" \
+grep -qx "docker-build:unix://$CONTEXT_HOME/.colima/default/docker.sock" "$CONTEXT_EVENT_LOG" \
   || fail "image build did not use the resolved named context endpoint"
-if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG"; then
+if ! grep -qx "install-service:unix://$CONTEXT_HOME/.colima/default/docker.sock" "$CONTEXT_EVENT_LOG"; then
   echo "context fixture install log:" >&2
   sed -n '1,120p' "$WORK/context-install.log" >&2 || true
   echo "context fixture events:" >&2
@@ -250,10 +300,12 @@ if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG
   fail "active systemd service refresh did not persist the selected endpoint"
 fi
 # A matching kernel is insufficient for a remote or arbitrary Unix endpoint.
-[ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" ssh://fixture-remote)" = vm-backed ] \
-  || fail "same-kernel remote endpoint was classified as host Docker"
-[ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///fixture/relay.sock)" = vm-backed ] \
-  || fail "arbitrary Unix endpoint was classified as host Docker"
+if PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" ssh://fixture-remote >/dev/null 2>&1; then
+  fail "same-kernel remote endpoint was accepted"
+fi
+if PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///fixture/relay.sock >/dev/null 2>&1; then
+  fail "arbitrary Unix endpoint was accepted"
+fi
 [ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock)" = host-docker ] \
   || fail "canonical native endpoint was not classified as host Docker"
 echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"

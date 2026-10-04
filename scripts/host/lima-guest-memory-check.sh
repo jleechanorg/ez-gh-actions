@@ -22,12 +22,21 @@ LIMIT=8589934592
 LIMACTL="${LIMACTL:-limactl}"
 PROC_ROOT="${LIMA_PROC_ROOT:-/proc}"
 
+refuse() {
+  echo "FAIL lima guest memory $1 > 8GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" >&2
+  exit 1
+}
+unknown() {
+  echo "FAIL lima guest memory unknown ($1): cannot prove the colima guest runs at <= 8GiB; not lowering the QEMU ceiling" >&2
+  exit 1
+}
+
 if [ -n "${LIMA_YAML+x}" ]; then
   INSTANCE_DIR="$(dirname "$LIMA_YAML")"
 else
   command -v "$LIMACTL" >/dev/null 2>&1 || { echo "FAIL lima guest memory unknown (limactl not found)" >&2; exit 1; }
   command -v python3 >/dev/null 2>&1 || { echo "FAIL lima guest memory unknown (python3 not found)" >&2; exit 1; }
-  instance_dir="$($LIMACTL list --json colima 2>/dev/null | python3 -c 'import json,sys
+  instance_dir="$("$LIMACTL" list --json colima 2>/dev/null | python3 -c 'import json,sys
 try:
     rows=[json.loads(line) for line in sys.stdin if line.strip()]
     if len(rows) == 0:
@@ -40,10 +49,19 @@ try:
 except (ValueError, json.JSONDecodeError, TypeError, IndexError):
     raise SystemExit(1)')"     || { echo "FAIL lima guest memory unknown (limactl list --json colima has no authoritative dir)" >&2; exit 1; }
   if [ "$instance_dir" = NO_INSTANCE ]; then
-    if [ "$PRINT_YAML" -eq 1 ]; then
-      exit 0
-    fi
-    echo "OK: no colima instance reported by limactl"
+    for comm in "$PROC_ROOT"/[0-9]*/comm; do
+      [ -r "$comm" ] || continue
+      case "$(cat "$comm" 2>/dev/null)" in qemu-system-*) ;; *) continue ;; esac
+      [ "$(stat -c %u "${comm%/comm}")" = "$(id -u)" ] || continue
+      cmdline_file="${comm%/comm}/cmdline"
+      [ -r "$cmdline_file" ] || unknown "cannot read QEMU command line"
+      mapfile -d '' args < "$cmdline_file" || unknown "cannot read QEMU command line"
+      case " ${args[*]} " in
+        *"/colima/"*) unknown "limactl reports no instance but an owned colima QEMU is running" ;;
+      esac
+    done
+    [ "$PRINT_YAML" -eq 1 ] && exit 0
+    echo "OK: no colima instance reported by limactl and no owned QEMU running"
     exit 0
   fi
   INSTANCE_DIR="$instance_dir"
@@ -53,15 +71,6 @@ if [ "$PRINT_YAML" -eq 1 ]; then
   printf '%s\n' "$LIMA_YAML"
   exit 0
 fi
-
-refuse() {
-  echo "FAIL lima guest memory $1 > 8GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" >&2
-  exit 1
-}
-unknown() {
-  echo "FAIL lima guest memory unknown ($1): cannot prove the colima guest runs at <= 8GiB; not lowering the QEMU ceiling" >&2
-  exit 1
-}
 
 yaml_to_bytes() { # 8GiB | 4096MiB | "8GiB"
   local v="${1//\"/}"
