@@ -1614,6 +1614,7 @@ fn main() -> Result<()> {
                     run_monitors,
                     || {
                         let _ = queue_monitor_scheduler.maybe_dispatch(&cfg, monitor_loop_start);
+                        watchdog::ping();
                     },
                     || {
                         let _ = canary_scheduler.maybe_check(&cfg);
