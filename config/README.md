@@ -8,7 +8,7 @@ machine.
 # MacBook (6× ez-mac-runner-g-*)
 cp config/config.toml.mac.example ~/.config/ezgha/config.toml
 
-# jeff-ubuntu (10× ez-runner-c-*)
+# jeff-ubuntu (14× ez-runner-c-*)
 cp config/config.toml.linux.example ~/.config/ezgha/config.toml
 
 # jeff-ubuntu canary reserved capacity (1× ez-canary-runner-b-*)
@@ -27,8 +27,11 @@ systemctl --user restart ezgha.service
 
 ## Jeff-Ubuntu restore boundary
 
-The production contract is 10 Linux runners. A temporary live count of 5 is
-an incident state, not a second supported template.
+The approved Linux profile is 14 runners at 2000 MiB per job. The existing
+10-runner profile at 2500 MiB per job remains supported for rollback; both use
+the same 26 GiB `MemoryHigh` and 28 GiB `MemoryMax` aggregate cap. A temporary
+live count below the selected profile is an incident state, not a supported
+capacity profile.
 
 For a count-only restoration window, do **not** run `install.sh`: it also
 rebuilds the Docker image, installs units, and restarts the service. Inspect
