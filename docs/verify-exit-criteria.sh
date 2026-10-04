@@ -559,6 +559,109 @@ verify_retired_timer_policy() {
     done
 }
 
+modern_unit_value() {
+    awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"
+}
+
+modern_to_mb() {
+    case "$1" in
+        *G) echo $(( ${1%G} * 1024 )) ;;
+        *M) echo "${1%M}" ;;
+        *K) echo $(( ${1%K} / 1024 )) ;;
+        *[!0-9]*) echo 0 ;;
+        *) echo $(( $1 / 1024 / 1024 )) ;;
+    esac
+}
+
+verify_modern_psi_policy() {
+    local modern_dir="${VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR:-$MODERN_UNIT_DIR}"
+    local actions_unit="${VERIFY_EXIT_CRITERIA_ACTIONS_UNIT:-${REPO_ROOT:-.}/systemd/host/actions.slice}"
+    local killroot_dir="${VERIFY_EXIT_CRITERIA_KILLROOT_DIR:-}"
+
+    # 1. Direct QEMU service dropin and app-lima-vm.slice must exist and be finite
+    local qemu_dropin="${modern_dir}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+    local qemu_slice="${modern_dir}/app-lima-vm.slice"
+    [ -f "$qemu_dropin" ] || return 1
+    [ -f "$qemu_slice" ] || return 1
+    local qemu_high qemu_max qemu_swap qemu_tasks
+    qemu_high=$(modern_unit_value "$qemu_dropin" MemoryHigh)
+    qemu_max=$(modern_unit_value "$qemu_dropin" MemoryMax)
+    qemu_swap=$(modern_unit_value "$qemu_dropin" MemorySwapMax)
+    qemu_tasks=$(modern_unit_value "$qemu_dropin" TasksMax)
+    [ "$qemu_high" = "9G" ] || return 1
+    [ "$qemu_max" = "10G" ] || return 1
+    [ "$qemu_swap" = "2G" ] || return 1
+    [ "$qemu_tasks" = "4096" ] || return 1
+
+    # 2. agents.slice and automation.slice must be finite and match approved caps
+    local agents_slice="${modern_dir}/agents.slice"
+    local auto_slice="${modern_dir}/automation.slice"
+    [ -f "$agents_slice" ] || return 1
+    [ -f "$auto_slice" ] || return 1
+    local ag_high ag_max ag_swap ag_tasks
+    ag_high=$(modern_unit_value "$agents_slice" MemoryHigh)
+    ag_max=$(modern_unit_value "$agents_slice" MemoryMax)
+    ag_swap=$(modern_unit_value "$agents_slice" MemorySwapMax)
+    ag_tasks=$(modern_unit_value "$agents_slice" TasksMax)
+    [ "$ag_high" = "10G" ] || return 1
+    [ "$ag_max" = "12G" ] || return 1
+    [ "$ag_swap" = "2G" ] || return 1
+    [ "$ag_tasks" = "8192" ] || return 1
+
+    local au_high au_max au_swap au_tasks
+    au_high=$(modern_unit_value "$auto_slice" MemoryHigh)
+    au_max=$(modern_unit_value "$auto_slice" MemoryMax)
+    au_swap=$(modern_unit_value "$auto_slice" MemorySwapMax)
+    au_tasks=$(modern_unit_value "$auto_slice" TasksMax)
+    [ "$au_high" = "4G" ] || return 1
+    [ "$au_max" = "5G" ] || return 1
+    [ "$au_swap" = "1G" ] || return 1
+    [ "$au_tasks" = "4096" ] || return 1
+
+    # 3. actions.slice finite boundary
+    [ -f "$actions_unit" ] || return 1
+    local act_high act_max act_swap
+    act_high=$(awk -F= '$1 == "MemoryHigh" {print $2; exit}' "$actions_unit")
+    act_max=$(awk -F= '$1 == "MemoryMax" {print $2; exit}' "$actions_unit")
+    act_swap=$(awk -F= '$1 == "MemorySwapMax" {print $2; exit}' "$actions_unit")
+    [ "$act_high" = "26G" ] || return 1
+    [ "$act_max" = "28G" ] || return 1
+    [ "$act_swap" = "0" ] || return 1
+
+    # 4. Retired timer policy
+    verify_retired_timer_policy || return 1
+
+    # 5. Broad production or desktop roots must NOT be kill targets
+    if [ -n "$killroot_dir" ] && [ -d "$killroot_dir" ]; then
+        if grep -rqE 'ManagedOOM(MemoryPressure|Swap)=kill' "$killroot_dir" 2>/dev/null; then
+            return 1
+        fi
+    fi
+    if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" != "1" ]; then
+        local kill_targets
+        kill_targets="$(systemctl show -.slice user.slice app.slice session.slice             --property=ManagedOOMMemoryPressure,ManagedOOMSwap --value --no-pager 2>/dev/null             | grep -E '^kill$' || true)"
+        [ -z "$kill_targets" ] || return 1
+
+        local uid; uid="$(id -u)"
+        local user_svc_kill
+        user_svc_kill="$(systemctl show "user@${uid}.service"             --property=ManagedOOMMemoryPressure,ManagedOOMSwap --value --no-pager 2>/dev/null             | grep -E '^kill$' || true)"
+        [ -z "$user_svc_kill" ] || return 1
+    fi
+
+    # 6. Existing host assertion (if available and not test mode)
+    if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" != "1" ]; then
+        local assert_cmd=""
+        for candidate in             "${SCRIPTS_DIR:-}/assert-host-containment-release1.sh"             "${REPO_ROOT:-.}/scripts/host/assert-host-containment-release1.sh"             "${HOME}/.local/libexec/ezgha/release1/assert-host-containment-release1.sh"; do
+            if [ -x "$candidate" ]; then assert_cmd="$candidate"; break; fi
+        done
+        if [ -n "$assert_cmd" ]; then
+            "$assert_cmd" --runner-count "${COUNT:-14}" || return 1
+        fi
+    fi
+
+    return 0
+}
+
 verify_automation_dropins() {
     local service load dropin root
     root="${VERIFY_EXIT_CRITERIA_DROPIN_DIR:-}"
@@ -597,6 +700,9 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
             echo "selected_tasks=$selected_tasks"
             ;;
         automation_dropins) verify_automation_dropins ;;
+        psi_admission)
+            verify_modern_psi_policy || exit 1
+            ;;
         *) echo "unknown verifier test case" >&2; exit 2 ;;
     esac
     exit $?
@@ -1201,11 +1307,14 @@ if [ "$(uname -s)" = "Linux" ]; then
     fi
     echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
 fi
+IS_MODERN_ENVELOPE=0
 if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
+   && [ -f "${MODERN_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" ] \
    && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
    && [ -f "${MODERN_UNIT_DIR}/automation.slice" ] \
    && [ -f "${MODERN_WRAPPER}" ] \
    && grep -q '^# ezgha-agent-wrapper$' "${MODERN_WRAPPER}"; then
+    IS_MODERN_ENVELOPE=1
     echo "    [INFO] Gate 8: modern finite host envelope detected"
     modern_unit_value() {
         awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"
@@ -1221,7 +1330,20 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     }
 
     MODERN_MAX_TOTAL_MB=0
-    for slice in app-lima-vm.slice agents.slice automation.slice; do
+    # Enforce direct QEMU service dropin (ModernGate8 sum reflects direct effective service)
+    qemu_dropin="${MODERN_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+    q_high=$(modern_unit_value "$qemu_dropin" MemoryHigh)
+    q_max=$(modern_unit_value "$qemu_dropin" MemoryMax)
+    q_swap=$(modern_unit_value "$qemu_dropin" MemorySwapMax)
+    q_tasks=$(modern_unit_value "$qemu_dropin" TasksMax)
+    if [ -z "$q_high" ] || [ "$q_high" = max ] || [ -z "$q_max" ] || [ "$q_max" = max ] \
+       || [ -z "$q_swap" ] || [ "$q_swap" = max ] || [ -z "$q_tasks" ] || [ "$q_tasks" = infinity ]; then
+        fail "Gate 8 modern envelope: direct QEMU drop-in lacks a finite MemoryHigh/MemoryMax/MemorySwapMax/TasksMax tuple"
+    fi
+    MODERN_MAX_TOTAL_MB=$((MODERN_MAX_TOTAL_MB + $(modern_to_mb "$q_max")))
+    echo "    [PASS] direct QEMU service (lima-vm@colima): high=${q_high} max=${q_max} swap=${q_swap} tasks=${q_tasks}"
+
+    for slice in agents.slice automation.slice; do
         slice_file="${MODERN_UNIT_DIR}/${slice}"
         high=$(modern_unit_value "$slice_file" MemoryHigh)
         max=$(modern_unit_value "$slice_file" MemoryMax)
@@ -1535,7 +1657,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
     PSI_SOURCE="macOS (PSI/systemd-oomd not available)"
 fi
 
-# --- Option A: systemd-oomd with a real, enrolled cgroup -----------------
+if [ "$PSI_OK" != "1" ]; then
+# --- Option A: systemd-oomd with a real, enrolled cgroup (legacy VM path) ---
 OOMD_ACTIVE=0
 OOMD_SCOPE=""
 if systemctl is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
@@ -1589,6 +1712,7 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
         PSI_OK=1
         PSI_SOURCE="systemd-oomd (${OOMD_SCOPE}-scope, ${OOMD_ENROLL_PROOF})"
     fi
+fi
 fi
 
 # --- Option B: psi-oom-watcher.timer enrolled with a real shed path -----

@@ -169,25 +169,32 @@ grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
 # VM nesting, use the selected 10/14 TasksMax contract, and honor the
 # installer-retired timer policy.
 MODERN="$TMP/modern"
-mkdir -p "$MODERN"
+mkdir -p "$MODERN" "$MODERN/lima-vm@colima.service.d"
 cat > "$MODERN/app-lima-vm.slice" <<UNIT
 [Slice]
-MemoryHigh=34G
-MemoryMax=38G
+MemoryHigh=9G
+MemoryMax=10G
+MemorySwapMax=2G
+TasksMax=4096
+UNIT
+cat > "$MODERN/lima-vm@colima.service.d/99-memory-ceiling.conf" <<UNIT
+[Service]
+MemoryHigh=9G
+MemoryMax=10G
 MemorySwapMax=2G
 TasksMax=4096
 UNIT
 cat > "$MODERN/agents.slice" <<UNIT
 [Slice]
-MemoryHigh=18G
-MemoryMax=20G
+MemoryHigh=10G
+MemoryMax=12G
 MemorySwapMax=2G
 TasksMax=8192
 UNIT
 cat > "$MODERN/automation.slice" <<UNIT
 [Slice]
-MemoryHigh=8G
-MemoryMax=10G
+MemoryHigh=4G
+MemoryMax=5G
 MemorySwapMax=1G
 TasksMax=4096
 UNIT
@@ -228,12 +235,19 @@ exit 1
 EOF_SYSTEMCTL
 chmod +x "$TMP/systemctl"
 
-policy_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_policy VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" VERIFY_EXIT_CRITERIA_MODERN_BASE_MB=69632 VERIFY_EXIT_CRITERIA_HOST_MB=80000)
-if ! env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null; then
+# Base MB for 9/10G QEMU (10240), 10/12G agents (12288), 4/5G automation (5120) = 27648 MB.
+# With native actions (28G = 28672 MB), total hard maxima = 56320 MB (55 GiB).
+# In an 80000 MB host, 56320 + 8000 reserve = 64320 <= 80000 -> fits.
+# In a 60000 MB host, 56320 + 6000 reserve = 62320 > 60000 -> exceeds.
+policy_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_policy VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" VERIFY_EXIT_CRITERIA_MODERN_BASE_MB=27648 VERIFY_EXIT_CRITERIA_HOST_MB=60000)
+if ! env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 VERIFY_EXIT_CRITERIA_HOST_MB=80000 bash "$VERIFY" >/dev/null; then
   fail "VM-backed actions must remain nested and disabled retired timers must pass"
 fi
 if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=1 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null 2>&1; then
-  fail "native actions.slice max must be included in hard-envelope arithmetic"
+  fail "native actions.slice max must be included in hard-envelope arithmetic and fail when exceeding host"
+fi
+if ! env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=1 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 VERIFY_EXIT_CRITERIA_HOST_MB=65000 bash "$VERIFY" >/dev/null; then
+  fail "approved 55 GiB budget must fit 65000 MB host (56320 MB + 6500 MB reserve = 62820 MB <= 65000 MB)"
 fi
 if env "${policy_env[@]}" TIMER_MODE=enabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null 2>&1; then
   fail "enabled retired timer must fail policy verification"
@@ -258,6 +272,43 @@ if ! PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TES
 fi
 if PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=automation_dropins VERIFY_EXIT_CRITERIA_DROPIN_DIR="$DROPINS" TIMER_MODE=service-loaded bash "$VERIFY" >/dev/null 2>&1; then
   fail "loaded ao-orchestrator service must require its automation drop-in"
+fi
+
+
+# Gate 8 (3) PSI admission: prove valid finite/auto fails old predicate and passes new predicate,
+# and killroot or missing caps fail.
+cat > "$TMP/oomctl" <<'EOF_OOMCTL'
+#!/usr/bin/env bash
+# Release 1 modern containment sets all ManagedOOM to auto; oomctl has 0 monitored cgroups
+exit 0
+EOF_OOMCTL
+chmod +x "$TMP/oomctl"
+
+psi_test_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=psi_admission VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" TIMER_MODE=disabled)
+
+# 1. Valid finite/auto: must pass new predicate
+if ! env "${psi_test_env[@]}" bash "$VERIFY" >/dev/null 2>&1; then
+  fail "Gate 8 (3) valid finite/auto policy must pass modern predicate"
+fi
+
+# 2. Killroot: must fail
+KILLROOT_DROPIN_DIR="$TMP/killroot_dropins"
+mkdir -p "$KILLROOT_DROPIN_DIR"
+cat > "$KILLROOT_DROPIN_DIR/99-killroot.conf" <<'EOF_KILL'
+[Slice]
+ManagedOOMMemoryPressure=kill
+EOF_KILL
+if env "${psi_test_env[@]}" VERIFY_EXIT_CRITERIA_KILLROOT_DIR="$KILLROOT_DROPIN_DIR" bash "$VERIFY" >/dev/null 2>&1; then
+  fail "Gate 8 (3) killroot must fail modern predicate"
+fi
+
+# 3. Missing/malformed caps: missing direct QEMU drop-in must fail
+BAD_MODERN="$TMP/bad_modern"
+mkdir -p "$BAD_MODERN"
+cp "$MODERN/app-lima-vm.slice" "$MODERN/agents.slice" "$MODERN/automation.slice" "$BAD_MODERN/"
+# Notice: no lima-vm@colima.service.d/99-memory-ceiling.conf
+if env "${psi_test_env[@]}" VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$BAD_MODERN" bash "$VERIFY" >/dev/null 2>&1; then
+  fail "Gate 8 (3) missing direct QEMU service dropin must fail modern predicate"
 fi
 
 echo "VERIFY_EXIT_GATE8_POLICY_TEST: PASS"
