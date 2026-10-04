@@ -33,17 +33,22 @@ the same 26 GiB `MemoryHigh` and 28 GiB `MemoryMax` aggregate cap. A temporary
 live count below the selected profile is an incident state, not a supported
 capacity profile.
 
-For a count-only restoration window, do **not** run `install.sh`: it also
-rebuilds the Docker image, installs units, and restarts the service. Inspect
-the runtime config and `failure_ladder.toml` first, deploy the already-reviewed
-binary separately, change only `runner.count`, and then restart `ezgha.service`
-under explicit operator authorization. An open failure-ladder cooldown is a
-diagnostic signal; do not delete its ledger merely to force ten starts.
+Select all profile values together when switching capacity:
 
-After restart, the exit criterion is ten named Linux slots proven locally with
-`Runner.Worker` via `docker top`, not GitHub API counts. Those deployment and
-verification actions change live machine state and are intentionally outside a
-repository-only preflight.
+| Profile | `runner.count` | `limits.memory_mb` | `runner.runner_floor_mb` | actions `TasksMax` |
+|---------|----------------|--------------------|--------------------------|-------------------|
+| Approved | 14 | 2000 | 2000 | 8000 |
+| Rollback | 10 | 2500 | 2500 | 6000 |
+
+For a capacity switch, inspect the runtime config and `failure_ladder.toml`,
+deploy the reviewed binary and matching profile, then restart `ezgha.service`
+under operator authorization. The broad `install.sh` also rebuilds the image
+and installs unrelated units. Preserve running jobs during a capacity switch;
+new containers inherit the selected per-job limit. An open failure-ladder
+cooldown is a diagnostic signal; preserve its ledger.
+
+After restart, prove every configured Linux slot locally with `Runner.Worker`
+via `docker top`. Repository-only preflight does not establish live capacity.
 
 ## `minimum_isolation` policy
 

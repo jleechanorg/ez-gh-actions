@@ -15,9 +15,17 @@ bash -n "$APPLY_SCRIPT" || fail "syntax error in scripts/host/apply-host-contain
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+grep -q -- '--runner-count' "$APPLY_SCRIPT" || fail "apply script does not expose the bounded runner-count selector"
+grep -q 'TasksMax=8000' "$APPLY_SCRIPT" || fail "apply script does not render the 14-runner TasksMax=8000 profile"
+grep -q 'TasksMax=6000' "$APPLY_SCRIPT" || fail "apply script does not retain the 10-runner TasksMax=6000 rollback profile"
 
 setup_fixture() {
-  local root="$1"
+  local root="$1" runner_count="${2:-14}" pids_max
+  case "$runner_count" in
+    10) pids_max=6000 ;;
+    14) pids_max=8000 ;;
+    *) fail "test fixture does not support runner count $runner_count" ;;
+  esac
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
            "$root/sys/fs/cgroup/agents.slice" "$root/sys/fs/cgroup/automation.slice" \
            "$root/etc/systemd/system" "$root/etc/systemd/user" \
@@ -35,7 +43,7 @@ setup_fixture() {
   printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
   printf '30064771072\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
   printf '0\n' > "$root/sys/fs/cgroup/actions.slice/memory.swap.max"
-  printf '6000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
+  printf '%s\n' "$pids_max" > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
   printf 'default 25\n' > "$root/sys/fs/cgroup/actions.slice/io.weight"
   printf '8589934592\n' > "$root/sys/fs/cgroup/actions.slice/memory.current"
@@ -72,6 +80,20 @@ PASS_ROOT="$WORK/pass"
 setup_fixture "$PASS_ROOT"
 SYSTEMCTL_LOG="$WORK/pass_sys.log" PATH="$PASS_ROOT/bin:$PATH" \
   "$APPLY_SCRIPT" --root "$PASS_ROOT" || fail "apply-host-containment-release1.sh failed on clean fixture"
+
+ROLLBACK_ROOT="$WORK/rollback"
+setup_fixture "$ROLLBACK_ROOT" 10
+SYSTEMCTL_LOG="$WORK/rollback_sys.log" PATH="$ROLLBACK_ROOT/bin:$PATH" \
+  "$APPLY_SCRIPT" --root "$ROLLBACK_ROOT" --runner-count 10 \
+  || fail "apply-host-containment-release1.sh failed for explicit 10-runner rollback"
+ok "apply-host-containment-release1.sh applies the explicit 10-runner rollback profile"
+INVALID_ROOT="$WORK/invalid"
+setup_fixture "$INVALID_ROOT"
+if PATH="$INVALID_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$INVALID_ROOT" --runner-count 12 > "$WORK/invalid.log" 2>&1; then
+  fail "apply-host-containment-release1.sh accepted unsupported runner count 12"
+fi
+[ ! -f "$INVALID_ROOT/etc/systemd/system/actions.slice" ] || fail "invalid runner count mutated the fixture before failing"
+ok "apply-host-containment-release1.sh rejects invalid runner count before writes"
 
 [ -f "$PASS_ROOT/etc/systemd/system/actions.slice" ] || fail "actions.slice was not staged to system units"
 [ -f "$PASS_ROOT/etc/systemd/system/-.slice.d/99-ezgha-containment.conf" ] || fail "-.slice.d drop-in not staged"
