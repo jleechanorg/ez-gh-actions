@@ -52,7 +52,8 @@ case "${1:-}" in
   inspect)
     case "${3:-}" in
       '{{.State.Pid}}') printf '4242\n' ;;
-      *) printf 'true running 4242\n' ;;
+      '{{.State.Running}} {{.State.Status}} {{.State.Pid}}') printf 'true running 4242\n' ;;
+      *) exit 1 ;;
     esac
     ;;
   *) exit 1 ;;
@@ -105,13 +106,18 @@ case "${1:-}" in
   inspect)
     id="${4:-}"
     case "$id" in
-      runner-stopped|runner-stopped-a|runner-stopped-b) printf 'false exited 0\n' ;;
-      runner-live) printf 'true running 4242\n' ;;
-      runner-pid0) printf 'true running 0\n' ;;
-      runner-outside) printf 'true running 4343\n' ;;
-      runner-missing-proc) printf 'true running 4344\n' ;;
-      runner-missing-cgroup) printf 'true running 4345\n' ;;
+      runner-stopped|runner-stopped-a|runner-stopped-b) state='false exited 0' ;;
+      runner-live) state='true running 4242' ;;
+      runner-pid0) state='true running 0' ;;
+      runner-outside) state='true running 4343' ;;
+      runner-missing-proc) state='true running 4344' ;;
+      runner-missing-cgroup) state='true running 4345' ;;
       runner-inspect-failure) exit 1 ;;
+      *) exit 1 ;;
+    esac
+    case "${3:-}" in
+      '{{.State.Pid}}') printf '%s\n' "${state##* }" ;;
+      '{{.State.Running}} {{.State.Status}} {{.State.Pid}}') printf '%s\n' "$state" ;;
       *) exit 1 ;;
     esac
     ;;
