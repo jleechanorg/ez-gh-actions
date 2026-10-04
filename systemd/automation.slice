@@ -1,5 +1,7 @@
 # automation.slice — finite budget for orchestration/watchdog automation.
 # Memory, swap, and task limits bound worker scopes and keep admission finite.
+# Historical peak evidence recorded about 5.7 GiB for automation; it is a
+# prior measurement, not a current live-health measurement.
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target

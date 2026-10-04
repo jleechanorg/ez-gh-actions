@@ -33,6 +33,12 @@ echo "$neg_out" | grep -q 'install.sh does not apply' \
 # cgroup path reported by /proc/<pid>/cgroup rather than selecting a bounded
 # sibling by name.
 PROC="$tmp/proc"; CG="$tmp/cgroup"
+cat > "$tmp/systemctl" <<EOF
+#!/usr/bin/env bash
+printf "%s\\n" "/user.slice/app.slice/lima-vm@colima.service"
+EOF
+chmod +x "$tmp/systemctl"
+export PATH="$tmp:$PATH"
 mkdir -p "$PROC/4242" "$CG/user.slice/app.slice/lima-vm@colima.service" \
   "$CG/user.slice/app.slice/unrelated.scope"
 printf 'qemu-system-x86_64\n' > "$PROC/4242/comm"
@@ -59,6 +65,72 @@ live_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
   || { echo "FAIL: bounded exact fixture rejected: $live_out" >&2; exit 1; }
 echo "$live_out" | grep -q 'pid=4242.*lima-vm@colima.service' \
   || { echo "FAIL: live fixture did not report exact QEMU cgroup: $live_out" >&2; exit 1; }
+
+# A valid descendant of the systemd-reported service cgroup is admitted when
+# its own cgroup.procs contains the explicit QEMU PID.
+mkdir -p "$CG/user.slice/app.slice/lima-vm@colima.service/qemu.scope"
+for f in cpu.max memory.high memory.max memory.swap.max pids.max; do
+  cp "$CG/user.slice/app.slice/lima-vm@colima.service/$f" \
+    "$CG/user.slice/app.slice/lima-vm@colima.service/qemu.scope/$f"
+done
+printf "%s\n" "4242" > "$CG/user.slice/app.slice/lima-vm@colima.service/qemu.scope/cgroup.procs"
+printf "%s\n" "0::/user.slice/app.slice/lima-vm@colima.service/qemu.scope" > "$PROC/4242/cgroup"
+desc_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
+  QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
+  || { echo "FAIL: valid service descendant rejected: $desc_out" >&2; exit 1; }
+echo "$desc_out" | grep -q "qemu.scope" \
+  || { echo "FAIL: descendant cgroup was not reported: $desc_out" >&2; exit 1; }
+printf "%s\n" "0::/user.slice/app.slice/lima-vm@colima.service" > "$PROC/4242/cgroup"
+
+# Empty actual ControlGroup output is fail-closed even when a basename matches.
+cat > "$tmp/systemctl" <<EOF
+#!/usr/bin/env bash
+printf "%s\\n" ""
+EOF
+empty_rc=0
+empty_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
+  QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || empty_rc=$?
+[ "$empty_rc" -ne 0 ] || { echo "FAIL: empty actual ControlGroup passed: $empty_out" >&2; exit 1; }
+echo "$empty_out" | grep -q "ControlGroup" \
+  || { echo "FAIL: empty ControlGroup diagnostic missing: $empty_out" >&2; exit 1; }
+cat > "$tmp/systemctl" <<EOF
+#!/usr/bin/env bash
+printf "%s\\n" "/user.slice/app.slice/lima-vm@colima.service"
+EOF
+
+# Exactly two QEMUs beneath the actual unit must fail closed.
+mkdir -p "$PROC/6262" "$CG/user.slice/app.slice/lima-vm@colima.service/second.scope"
+printf "%s\n" "qemu-system-x86_64" > "$PROC/6262/comm"
+printf "%s\n" "0::/user.slice/app.slice/lima-vm@colima.service/second.scope" > "$PROC/6262/cgroup"
+for f in cpu.max memory.high memory.max memory.swap.max pids.max; do
+  cp "$CG/user.slice/app.slice/lima-vm@colima.service/$f" \
+    "$CG/user.slice/app.slice/lima-vm@colima.service/second.scope/$f"
+done
+printf "%s\n" "6262" > "$CG/user.slice/app.slice/lima-vm@colima.service/second.scope/cgroup.procs"
+two_rc=0
+two_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
+  bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || two_rc=$?
+[ "$two_rc" -ne 0 ] || { echo "FAIL: multiple service QEMUs passed: $two_out" >&2; exit 1; }
+echo "$two_out" | grep -q "expected exactly one" \
+  || { echo "FAIL: multiple-QEMU diagnostic missing: $two_out" >&2; exit 1; }
+rm -rf "$PROC/6262" "$CG/user.slice/app.slice/lima-vm@colima.service/second.scope"
+
+# A same-basename cgroup outside the actual systemd ControlGroup is not
+# accepted merely because its leaf name matches.
+mkdir -p "$PROC/3131" "$CG/user.slice/app.slice/unrelated/lima-vm@colima.service"
+printf "%s\n" "qemu-system-x86_64" > "$PROC/3131/comm"
+printf "%s\n" "0::/user.slice/app.slice/unrelated/lima-vm@colima.service" > "$PROC/3131/cgroup"
+printf "%s\n" "3131" > "$CG/user.slice/app.slice/unrelated/lima-vm@colima.service/cgroup.procs"
+for f in cpu.max memory.high memory.max memory.swap.max pids.max; do
+  cp "$CG/user.slice/app.slice/lima-vm@colima.service/$f" \
+    "$CG/user.slice/app.slice/unrelated/lima-vm@colima.service/$f"
+done
+same_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
+  bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
+  || { echo "FAIL: valid service plus same-basename fixture rejected: $same_out" >&2; exit 1; }
+echo "$same_out" | grep -q "pid=4242" \
+  || { echo "FAIL: same-basename fixture selected unrelated QEMU: $same_out" >&2; exit 1; }
+rm -rf "$PROC/3131" "$CG/user.slice/app.slice/unrelated"
 
 # An explicit PID still requires a QEMU process identity.  A non-QEMU process
 # in the correctly bounded service cgroup must fail closed rather than pass

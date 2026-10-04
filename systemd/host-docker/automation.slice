@@ -1,6 +1,9 @@
 # automation.slice — finite budget for orchestration and its worker scopes.
 # Admission requires current non-reclaimable use to remain 1GiB below
 # MemoryHigh; memory, swap and tasks remain bounded as workers accumulate.
+# The host-docker contract retains actions 28G, agents 12G, automation 5G,
+# and QEMU 10G. Historical automation peak evidence was about 5.7 GiB; it is
+# not a current live-health measurement.
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target

@@ -1,6 +1,9 @@
 # agents.slice — user-scope memory ceiling for interactive agent CLI processes
 # (claude/codex/cursor/gemini/etc) and their MCP descendants. Orchestration
 # daemons use the separate automation.slice.
+# Historical peak evidence recorded about 17.14 GiB for this class of agents;
+# it is a prior measurement, not a current live-health measurement.
+# The current 18G/20G policy requires admission and workload control.
 #
 # Static syntax validation only: `systemd-analyze verify systemd/agents.slice`
 

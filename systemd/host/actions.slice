@@ -1,3 +1,6 @@
+# Host-docker contract: actions 28G, agents 12G, automation 5G, QEMU 10G.
+# These are policy ceilings, not a current live-health measurement.
+
 [Unit]
 Description=Host aggregate boundary for GitHub Actions runner containers
 Before=slices.target

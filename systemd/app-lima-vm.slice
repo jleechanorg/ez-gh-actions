@@ -12,8 +12,10 @@
 # MemoryMax is a finite final containment boundary for a runaway VM. This
 # ordering preserves normal operation while preventing unbounded host impact.
 #
-# 34 GiB was measured against a 31.8 GiB normal QEMU RSS peak, leaving a
-# measured margin of 2.2 GiB before reclaim. MemoryMax=38G is 6.2 GiB above that peak;
+# Historical capture evidence recorded a 31.8 GiB normal QEMU RSS peak, leaving
+# a historical 2.2 GiB margin at MemoryHigh=34G. This is not a new measurement.
+# MemoryMax=38G is 6.2 GiB above that historical peak; current caps still
+# require admission and workload control and are not live-health proof.
 # the finite swap/task ceilings bound transient accounting and fork growth.
 # CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
 # (historical 24 is stale). This caps runnable QEMU time; D-state still counts

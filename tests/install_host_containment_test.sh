@@ -125,6 +125,77 @@ for agent in codex claude gemini cursor aider cody; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$agent"
 done
 chmod +x "$STUB_BIN"/*
+# Exercise the staged guest guard with a minimal PATH before the installer
+# replay. GUEST_GUARD_ONLY=1 exits after this proof without invoking the
+# privilege or service-manager paths in the rest of the fixture.
+GUARD_HOME="$WORK/guard-home"
+GUARD_PROC="$WORK/guard-proc"
+GUARD_PATH="$WORK/guard-path"
+GUARD_RUNTIME="$WORK/guard-runtime"
+mkdir -p "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d" \
+  "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service.d" \
+  "$GUARD_HOME/.lima/colima" "$GUARD_HOME/.local/bin" \
+  "$GUARD_HOME/.local/libexec/ezgha" "$GUARD_PROC" "$GUARD_PATH" "$GUARD_RUNTIME"
+printf 'memory: "8GiB"\n' > "$GUARD_HOME/.lima/colima/lima.yaml"
+: > "$GUARD_RUNTIME/fake-bus"
+cp "$STUB_BIN/systemctl" "$GUARD_PATH/systemctl"
+cp "$STUB_BIN/limactl" "$GUARD_HOME/.local/bin/limactl"
+chmod +x "$GUARD_PATH/systemctl" "$GUARD_HOME/.local/bin/limactl"
+GUARD_MIN_PATH="$GUARD_PATH:/usr/bin:/bin"
+if PATH="$GUARD_MIN_PATH" command -v limactl >/dev/null 2>&1; then
+  fail "guard-only PATH unexpectedly exposed limactl"
+fi
+for source_unit in \
+    "$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+    "$REPO_ROOT/systemd/host-docker/lima-vm-cpu-ceiling.service"; do
+  grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$source_unit" \
+    || fail "source unit does not bind the installed absolute limactl path: $source_unit"
+done
+install -m 0755 "$TEMP_REPO/scripts/host/lima-guest-memory-check.sh" \
+  "$GUARD_HOME/.local/libexec/ezgha/lima-guest-memory-check.sh"
+install -m 0644 \
+  "$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+  "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
+install -m 0644 "$REPO_ROOT/systemd/host-docker/lima-vm-cpu-ceiling.service" \
+  "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service"
+for staged_unit in \
+    "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+    "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service"; do
+  grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$staged_unit" \
+    || fail "staged unit does not preserve the absolute limactl path: $staged_unit"
+  limactl_spec="$(sed -n 's/^Environment=LIMACTL=//p' "$staged_unit")"
+  limactl_path="${limactl_spec//%h/$GUARD_HOME}"
+  [ "$limactl_path" = "$GUARD_HOME/.local/bin/limactl" ] \
+    || fail "staged unit resolved an unexpected limactl path: $limactl_path"
+  unit_name="$(basename "$staged_unit")"
+  env -i HOME="$GUARD_HOME" PATH="$GUARD_MIN_PATH" \
+    XDG_RUNTIME_DIR="$GUARD_RUNTIME" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$GUARD_RUNTIME/fake-bus" \
+    EVENT_LOG="$WORK/guard-events" LIMACTL="$limactl_path" \
+    LIMA_FIXTURE_STATUS=Stopped LIMA_FIXTURE_DIR="$GUARD_HOME/.lima/colima" \
+    LIMA_PROC_ROOT="$GUARD_PROC" \
+    bash "$GUARD_HOME/.local/libexec/ezgha/lima-guest-memory-check.sh" \
+    > "$WORK/$unit_name-minimal-path.log" 2>&1 \
+    || fail "$unit_name guard could not resolve its unit-derived limactl path with minimal PATH"
+  grep -q 'OK: lima guest memory <= 8GiB' "$WORK/$unit_name-minimal-path.log" \
+    || fail "$unit_name guard did not complete normal admission with the unit-derived limactl path"
+done
+if env -i HOME="$GUARD_HOME" PATH="$GUARD_MIN_PATH" \
+    XDG_RUNTIME_DIR="$GUARD_RUNTIME" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$GUARD_RUNTIME/fake-bus" \
+    LIMA_FIXTURE_STATUS=Stopped LIMA_FIXTURE_DIR="$GUARD_HOME/.lima/colima" \
+    LIMA_PROC_ROOT="$GUARD_PROC" \
+    bash "$GUARD_HOME/.local/libexec/ezgha/lima-guest-memory-check.sh" \
+    > "$WORK/no-limactl.log" 2>&1; then
+  fail "guard accepted normal admission without LIMACTL under minimal PATH"
+fi
+grep -q 'limactl not found' "$WORK/no-limactl.log" \
+  || fail "missing LIMACTL control did not fail at the expected PATH boundary"
+echo "INSTALL_HOST_CONTAINMENT_GUEST_GUARD: PASS"
+if [ "${GUEST_GUARD_ONLY:-0}" = 1 ]; then
+  exit 0
+fi
+
 # A context-only remote endpoint must not fall back to the local socket.
 if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context \
     "$REPO_ROOT/scripts/host/docker-host-mode.sh" >/dev/null 2>&1; then

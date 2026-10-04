@@ -4,6 +4,9 @@
 #
 # Host-docker hard budgets total 55GiB before the host reserve. Admission
 # requires current non-reclaimable use to remain 1GiB below MemoryHigh.
+# The host-docker contract is actions 28G + agents 12G + automation 5G +
+# QEMU 10G = 55G before the host reserve. Historical agent peak evidence was
+# about 17.14 GiB; it is not a current live-health measurement.
 #
 # Static syntax validation only: `systemd-analyze verify systemd/agents.slice`
 

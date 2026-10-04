@@ -124,7 +124,9 @@ uninstall() {
   rm -f "${HOME}/.config/systemd/user/ao-daemon.service.d/20-automation-slice.conf" \
         "${HOME}/.config/systemd/user/ao-orchestrator.service.d/20-automation-slice.conf" \
         "${HOME}/.config/systemd/user/ai.dark-factory.daemon.service.d/20-automation-slice.conf" \
-        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+        "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
   rm -f "${HOME}/.local/bin/watchdog-load-repair.sh"
   # Remove only the persistent guest unit. Do not stop the active slice here:
   # existing runner containers may still be attached while uninstall drains.

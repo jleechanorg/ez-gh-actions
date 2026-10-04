@@ -6,6 +6,7 @@ After=lima-vm@colima.service
 PartOf=lima-vm@colima.service
 
 [Service]
+Environment=LIMACTL=%h/.local/bin/limactl
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=%h/.local/libexec/ezgha/lima-guest-memory-check.sh
