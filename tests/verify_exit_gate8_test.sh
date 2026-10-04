@@ -127,11 +127,11 @@ set_live() { # unit-dir high max
   printf '%s\n' "$3" > "$ENV_DIR/cg/$1/memory.max"
 }
 G=1073741824
-set_live_policy() { # agents_high agents_max automation_high automation_max (GiB)
+set_live_policy() { # agents_high agents_max automation_high automation_max (bytes)
   set_live actions.slice $((26 * G)) $((28 * G))
-  set_live user/agents.slice $(($1 * G)) $(($2 * G))
-  set_live user/automation.slice $(($3 * G)) $(($4 * G))
-  set_live user/lima-vm@colima.service $((4608 * 1048576)) $((5 * G))
+  set_live user/agents.slice "$1" "$2"
+  set_live user/automation.slice "$3" "$4"
+  set_live user/lima-vm@colima.service $((9 * G)) $((10 * G))
 }
 run_envelope() { # policy-root
   PATH="$ENV_DIR/bin:$PATH" \
@@ -143,9 +143,9 @@ run_envelope() { # policy-root
     bash "$VERIFY" 2>&1
 }
 
-# (a) tracked policy 28+14+8+5 = 56320 MB + 6333 MB reserve <= 63336 MB.
-set_live_policy 13 14 7 8
-env_out=$(run_envelope "$ROOT") || fail "host-docker 28+14+8+5 envelope should pass: $env_out"
+# (a) tracked policy 28+12+5+10 = 56320 MB + 6333 MB reserve <= 63336 MB.
+set_live_policy $((10 * G)) $((12 * G)) $((4608 * 1048576)) $((5 * G))
+env_out=$(run_envelope "$ROOT") || fail "host-docker 28+12+5+10 envelope should pass: $env_out"
 grep -Fq '56320MB' <<<"$env_out" || fail "envelope did not sum live maxima to 56320MB: $env_out"
 
 # (b) an unbounded live maximum is rejected, never summed as zero.
@@ -162,20 +162,20 @@ mkdir -p "$OLD_POLICY/systemd/host" "$OLD_POLICY/systemd/host-docker/lima-vm@col
 cp "$ROOT/systemd/host/actions.slice" "$OLD_POLICY/systemd/host/actions.slice"
 cp "$ROOT/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf" 2>/dev/null \
-  || printf '[Service]\nMemoryHigh=4608M\nMemoryMax=5G\n' \
+  || printf '[Service]\nMemoryHigh=9G\nMemoryMax=10G\n' \
        > "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf"
 printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\n' > "$OLD_POLICY/systemd/agents.slice"
 printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\n' > "$OLD_POLICY/systemd/automation.slice"
-set_live_policy 18 20 8 10
+set_live_policy $((18 * G)) $((20 * G)) $((8 * G)) $((10 * G))
 if env_out=$(run_envelope "$OLD_POLICY"); then
   fail "host-docker 28+20+10+5 envelope should fail: $env_out"
 fi
 grep -Fq 'exceed host' <<<"$env_out" || fail "old maxima did not fail on the envelope sum: $env_out"
 
 # (d) live state that drifted from the tracked policy fails even if it fits.
-set_live_policy 13 14 6 7
+set_live_policy $((10 * G)) $((12 * G)) $((4 * G)) $((5 * G))
 if env_out=$(run_envelope "$ROOT"); then
-  fail "live automation.slice 6G/7G must not match the tracked 7G/8G policy: $env_out"
+  fail "live automation.slice 6G/7G must not match the tracked 4608M/5G policy: $env_out"
 fi
 
 # Gate 8 (3): oomd must monitor /actions.slice (real `oomctl` layout).

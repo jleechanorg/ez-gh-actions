@@ -5,7 +5,7 @@
 # and by evening on 2026-10-02 it reached the 8G MemoryHigh with ~90 (the
 # 2026-08-25 figure of 3.0 GiB was daemons only). The 2026-10-03 operator
 # decision (bead ez-gh-actions-154k: cap agent sessions, keep runners) capped
-# it at MemoryHigh=7G, MemoryMax=8G (was 8G/10G) to fit the host envelope;
+# it at MemoryHigh=4608M, MemoryMax=5G (was 8G/10G) to fit the host envelope;
 # measured 2026-10-03: 5.5 GiB current, 4.6 GiB anon, 8.0 GiB peak, so the
 # slice will throttle near 7G at its peak. swap/tasks are finite too. At 4G
 # the slice sat permanently throttled (9.0M memory.events high), and its PSI, aggregated at
@@ -16,8 +16,8 @@ Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target
 
 [Slice]
-MemoryHigh=7G
-MemoryMax=8G
+MemoryHigh=4608M
+MemoryMax=5G
 MemorySwapMax=1G
 TasksMax=4096
 MemoryAccounting=yes

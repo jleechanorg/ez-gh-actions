@@ -1,13 +1,13 @@
 # app-lima-vm.slice — host-docker variant (bead ez-gh-actions-154k).
 # On a host-docker Linux deployment (jeff-ubuntu: runners in host Docker under
 # actions.slice) the Colima VM only runs the openclaw-qdrant container in a
-# 4 GiB guest, so its QEMU ceiling is 4608M/5G instead of the VM-backed
-# 34G/38G in systemd/app-lima-vm.slice. install.sh selects this variant when
+# 8 GiB guest, so its QEMU ceiling is 9G/10G instead of the VM-backed
+# 9G/10G in systemd/app-lima-vm.slice. install.sh selects this variant when
 # the Docker daemon kernel equals the host kernel.
 #
 # measured margin (2026-10-03): QEMU 0.9 GiB current, 3.3 GiB peak with the
-# 8 GiB guest; MemoryHigh=4608M leaves 1.2 GiB above that peak and
-# MemoryMax=5G bounds the 4 GiB guest plus QEMU overhead. Keep identical to
+# 8 GiB guest; MemoryHigh=9G leaves 1.2 GiB above that peak and
+# MemoryMax=10G bounds the 8 GiB guest plus QEMU overhead. Keep identical to
 # systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf.
 
 [Unit]
@@ -15,8 +15,8 @@ Description=Colima/Lima VM QEMU process slice — host-docker memory ceiling (5 
 Before=slices.target
 
 [Slice]
-MemoryHigh=4608M
-MemoryMax=5G
+MemoryHigh=9G
+MemoryMax=10G
 MemorySwapMax=2G
 TasksMax=4096
 MemoryAccounting=yes

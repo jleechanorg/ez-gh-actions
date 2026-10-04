@@ -6,7 +6,7 @@
 #
 # POLICY DECISION (panel 2026-07-12, supersedes the original "opt-in" rule
 # captured in systemd/agents.slice on 2026-07-11): every interactive agent
-# CLI session MUST live inside agents.slice's MemoryHigh=13G ceiling so a
+# CLI session MUST live inside agents.slice's MemoryHigh=10G ceiling so a
 # runaway agent cannot OOM-kill the host. The mechanism stays the same
 # (`systemd-run --user --slice=agents.slice --scope -- <cmd>`), but the
 # default flips to AUTO-MIGRATE for already-running sessions.
@@ -37,7 +37,7 @@
 #     hold long-running tool calls may have them cut short; this is
 #     the explicit trade-off vs leaving an uncontained agent free to
 #     OOM the host.
-#   - The MemoryHigh=13G cap is a *soft* ceiling (MemoryHigh not
+#   - The MemoryHigh=10G cap is a *soft* ceiling (MemoryHigh not
 #     MemoryMax), so a misbehaving leaf gets throttled+reclaimed, NOT
 #     SIGKILLed — bead ez-gh-actions-0725 documented this choice for
 #     the same reason and the same property holds here.

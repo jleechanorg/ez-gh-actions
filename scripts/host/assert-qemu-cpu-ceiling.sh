@@ -9,8 +9,8 @@
 # slice: a bounded unrelated QEMU/cgroup must not make this check pass.
 #
 # The ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
-# vm-backed (runners inside Colima) 34G/38G from systemd/, host-docker (Colima
-# only runs qdrant in a 4 GiB guest) 4608M/5G from systemd/host-docker/.
+# vm-backed (runners inside Colima) 9G/10G from systemd/, host-docker (Colima
+# only runs qdrant in a 4 GiB guest) 9G/10G from systemd/host-docker/.
 # Both tracked variants are always checked; QEMU_CEILING_MODE selects the live
 # bound (default: host-docker when the Docker daemon shares this kernel).
 set -euo pipefail
@@ -40,8 +40,8 @@ assert_line() {
 
 for mode in vm-backed host-docker; do
   case "$mode" in
-    vm-backed) dir="${REPO_ROOT}/systemd"; high=MemoryHigh=34G; max=MemoryMax=38G ;;
-    host-docker) dir="${REPO_ROOT}/systemd/host-docker"; high=MemoryHigh=4608M; max=MemoryMax=5G ;;
+    vm-backed) dir="${REPO_ROOT}/systemd"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
+    host-docker) dir="${REPO_ROOT}/systemd/host-docker"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
   esac
   DROPIN="${dir}/lima-vm@colima.service.d/99-memory-ceiling.conf"
   SLICE="${dir}/app-lima-vm.slice"

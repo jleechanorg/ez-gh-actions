@@ -39,7 +39,7 @@ check_cgroup_val() {
 check_cgroup_val "$ACTIONS_DIR/memory.high" 27917287424 memory.high
 check_cgroup_val "$ACTIONS_DIR/memory.max" 30064771072 memory.max
 check_cgroup_val "$ACTIONS_DIR/memory.swap.max" 0 memory.swap.max
-check_cgroup_val "$ACTIONS_DIR/pids.max" 6000 pids.max
+check_cgroup_val "$ACTIONS_DIR/pids.max" 8000 pids.max
 check_cgroup_val "$ACTIONS_DIR/cpu.max" "2000000 100000" cpu.max
 io_weight="$(cat "$ACTIONS_DIR/io.weight" 2>/dev/null || true)"
 [[ "$io_weight" =~ (^|[[:space:]])25($|[[:space:]]) ]] || fail "actions.slice io.weight ('$io_weight') does not contain 25"
@@ -52,12 +52,12 @@ if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     actual="$(systemctl --user show -p "$property" --value -- "$unit")"
     [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
   }
-  # Host-docker policy (bead ez-gh-actions-154k): agents 13G/14G, automation 7G/8G.
-  check_user_property agents.slice MemoryHigh 13958643712
-  check_user_property agents.slice MemoryMax 15032385536
+  # Host-docker policy (bead ez-gh-actions-154k): agents 10G/12G, automation 9G/10G.
+  check_user_property agents.slice MemoryHigh 10737418240
+  check_user_property agents.slice MemoryMax 12884901888
   check_user_property agents.slice MemorySwapMax 2147483648
-  check_user_property automation.slice MemoryHigh 7516192768
-  check_user_property automation.slice MemoryMax 8589934592
+  check_user_property automation.slice MemoryHigh 4831838208
+  check_user_property automation.slice MemoryMax 5368709120
   check_user_property automation.slice MemorySwapMax 1073741824
   check_system_property() {
     local unit="$1" property="$2" expected="$3" actual

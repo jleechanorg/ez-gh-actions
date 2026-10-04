@@ -136,37 +136,37 @@ root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_li
   || fail "root/user containment did not precede binary replacement and image build"
 
 # Host-docker mode (bead ez-gh-actions-154k): the colima guest (qdrant only)
-# is resized to 4GiB in the lima.yaml lima-vm@colima starts from, and the
-# QEMU ceiling surfaces come from the host-docker 4608M/5G variants.
-grep -qx 'memory: "4GiB"' "$HOME_DIR/.lima/colima/lima.yaml" \
-  || fail "host-docker install did not set the Lima guest to 4GiB: $(cat "$HOME_DIR/.lima/colima/lima.yaml")"
+# is resized to 8GiB in the lima.yaml lima-vm@colima starts from, and the
+# QEMU ceiling surfaces preserve the deployed 9G/10G policy.
+grep -qx 'memory: "8GiB"' "$HOME_DIR/.lima/colima/lima.yaml" \
+  || fail "host-docker install did not set the Lima guest to 8GiB: $(cat "$HOME_DIR/.lima/colima/lima.yaml")"
 HD_UNITS="$HOME_DIR/.config/systemd/user"
 for f in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf; do
-  grep -qx 'MemoryHigh=4608M' "$HD_UNITS/$f" && grep -qx 'MemoryMax=5G' "$HD_UNITS/$f" \
-    || fail "host-docker install did not deploy the 4608M/5G $f"
+  grep -qx 'MemoryHigh=9G' "$HD_UNITS/$f" && grep -qx 'MemoryMax=10G' "$HD_UNITS/$f" \
+    || fail "host-docker install did not deploy the 9G/10G $f"
 done
-grep -q 'MemoryHigh=4608M MemoryMax=5G' "$HD_UNITS/lima-vm-cpu-ceiling.service" \
-  || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that re-applies the wrong ceiling"
+grep -q 'MemoryHigh=9G MemoryMax=10G' "$HD_UNITS/lima-vm-cpu-ceiling.service" \
+  || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that re-applies the wrong 9G/10G ceiling"
 
 # A guest still running at 8 GiB keeps the existing QEMU ceiling (fail closed)
-# even though this same install run rewrote lima.yaml to 4GiB.
+# even though this same install run rewrote lima.yaml to 8GiB.
 BIG_HOME="$WORK/big_guest_home"
 mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d" "$BIG_HOME/.lima/colima"
 printf '# fixture\n' > "$BIG_HOME/.config/ezgha/config.toml"
-printf 'cpus: 4\nmemory: "8GiB"\n' > "$BIG_HOME/.lima/colima/lima.yaml"
+printf 'cpus: 4\nmemory: "12GiB"\n' > "$BIG_HOME/.lima/colima/lima.yaml"
 BIG_PROC="$WORK/big_proc"
 mkdir -p "$BIG_PROC/7777"
 printf 'qemu-system-x86\n' > "$BIG_PROC/7777/comm"
-printf '%s\0' qemu-system-x86_64 -m 8192 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
-printf '[Service]\nMemoryHigh=4608M\nMemoryMax=5G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+printf '%s\0' qemu-system-x86_64 -m 12288 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
+printf '[Service]\nMemoryHigh=9G\nMemoryMax=10G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
 env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
   LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1 || fail "big-guest fixture install failed"
-grep -qx 'MemoryMax=5G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+grep -qx 'MemoryMax=10G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   || fail "failed guest check replaced the existing host-docker QEMU ceiling"
-grep -q 'FAIL lima guest memory 8589934592 > 4GiB' "$WORK/big-install.log" \
+grep -q 'FAIL lima guest memory 12884901888 > 8GiB' "$WORK/big-install.log" \
   || fail "big-guest install did not report the Lima guest refusal"
-grep -qx 'memory: "4GiB"' "$BIG_HOME/.lima/colima/lima.yaml" || fail "big-guest install did not resize lima.yaml"
+grep -qx 'memory: "8GiB"' "$BIG_HOME/.lima/colima/lima.yaml" || fail "big-guest install did not resize lima.yaml"
 if grep -Eq '^systemctl-(set-property|enable):.*lima-vm@colima\.service|^systemctl-enable:.*lima-vm-cpu-ceiling\.service' "$WORK/big_events" 2>/dev/null; then
   fail "failed guest check applied or enabled the stale host-docker ceiling: $(cat "$WORK/big_events")"
 fi
@@ -178,8 +178,8 @@ printf '# fixture\n' > "$NOMEM_HOME/.config/ezgha/config.toml"
 printf 'cpus: 4\n' > "$NOMEM_HOME/.lima/colima/lima.yaml"
 env EVENT_LOG="$WORK/nomem_events" PATH="$STUB_BIN:$PATH" HOME="$NOMEM_HOME" CARGO_HOME="$NOMEM_HOME/.cargo" XDG_CONFIG_HOME="$NOMEM_HOME/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/nomem-install.log" 2>&1 || fail "no-memory-line fixture install failed"
-grep -qx 'memory: "4GiB"' "$NOMEM_HOME/.lima/colima/lima.yaml" \
-  || fail "lima.yaml without memory: was not set to 4GiB: $(cat "$NOMEM_HOME/.lima/colima/lima.yaml")"
+grep -qx 'memory: "8GiB"' "$NOMEM_HOME/.lima/colima/lima.yaml" \
+  || fail "lima.yaml without memory: was not set to 8GiB: $(cat "$NOMEM_HOME/.lima/colima/lima.yaml")"
 
 run_failed_phase() {
   local phase="$1"
@@ -215,9 +215,9 @@ grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
 if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
 fi
-# VM-backed mode keeps the 34G/38G QEMU ceiling (runners live in the guest).
-grep -qx 'MemoryMax=38G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-  || fail "VM-backed install did not deploy the 34G/38G QEMU ceiling"
+# VM-backed mode keeps the 9G/10G QEMU ceiling (runners live in the guest).
+grep -qx 'MemoryMax=10G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "VM-backed install did not deploy the 9G/10G QEMU ceiling"
 
 # Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
 # active-service upgrade path must persist that resolved endpoint before its

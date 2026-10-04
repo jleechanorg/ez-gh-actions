@@ -450,17 +450,17 @@ if [ "$(uname -s)" = "Linux" ]; then
   if [ "${docker_kernel}" = "$(uname -r)" ]; then
     HOST_DOCKER_MODE=1
     # Host-docker: runners use host Docker, so the colima VM only runs
-    # openclaw-qdrant and is sized to a 4GiB guest (bead ez-gh-actions-154k).
+    # openclaw-qdrant and is sized to a 8GiB guest (bead ez-gh-actions-154k).
     # lima-vm@colima starts from this lima.yaml; the new size applies at the
     # next VM start, and the 5G QEMU ceiling stays refused until it has.
     lima_yaml="${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml"
-    if [ -f "${lima_yaml}" ] && ! grep -qx 'memory: "4GiB"' "${lima_yaml}"; then
+    if [ -f "${lima_yaml}" ] && ! grep -qx 'memory: "8GiB"' "${lima_yaml}"; then
       if grep -q '^memory:' "${lima_yaml}"; then
-        sed -i 's/^memory: .*/memory: "4GiB"/' "${lima_yaml}"
+        sed -i 's/^memory: .*/memory: "8GiB"/' "${lima_yaml}"
       else
-        printf 'memory: "4GiB"\n' >> "${lima_yaml}"
+        printf 'memory: "8GiB"\n' >> "${lima_yaml}"
       fi
-      warn "colima guest memory set to 4GiB in ${lima_yaml}; it takes effect after one VM restart"
+      warn "colima guest memory set to 8GiB in ${lima_yaml}; it takes effect after one VM restart"
     fi
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
     HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
@@ -798,15 +798,15 @@ FSTRIM_EOF
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
     # The colima QEMU ceiling follows the deployment mode (bead
-    # ez-gh-actions-154k): VM-backed runners keep 34G/38G; host-docker caps
-    # the qdrant-only 4GiB guest at 4608M/5G, but only once the guest really
-    # runs at <= 4GiB — otherwise the existing ceiling is left unchanged.
+    # ez-gh-actions-154k): QEMU policy is 9G/10G in both modes; host-docker retains
+    # the qdrant-only 8GiB guest at 9G/10G, but only once the guest really
+    # runs at <= 8GiB — otherwise the existing ceiling is left unchanged.
     VM_CEILING_DIR="${UNIT_DIR}"
-    VM_CEILING_PROPS="MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
+    VM_CEILING_PROPS="MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
     APPLY_VM_CEILING=1
     if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
       VM_CEILING_DIR="${UNIT_DIR}/host-docker"
-      VM_CEILING_PROPS="MemoryHigh=4608M MemoryMax=5G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
+      VM_CEILING_PROPS="MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
       if ! "${SCRIPTS_DIR}/lima-guest-memory-check.sh"; then
         APPLY_VM_CEILING=0
         warn "host-docker QEMU ceiling not lowered; existing ceiling left unchanged"
@@ -917,7 +917,7 @@ EOF
     # runtime property closes the upgrade window without restarting the VM.
     # shellcheck disable=SC2086 # VM_CEILING_PROPS is a property list
     if [ "${APPLY_VM_CEILING}" -eq 0 ]; then
-      warn "live QEMU ceiling unchanged until the colima guest runs at <= 4GiB"
+      warn "live QEMU ceiling unchanged until the colima guest runs at <= 8GiB"
     elif systemctl --user set-property --runtime lima-vm@colima.service \
          ${VM_CEILING_PROPS} 2>/dev/null; then
       ok "live QEMU service memory+CPU ceiling applied (${VM_CEILING_PROPS})"

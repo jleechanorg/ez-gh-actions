@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fail closed before the host-docker QEMU ceiling (4608M/5G) is applied: the
-# colima Lima guest must be configured AND running at <= 4 GiB, otherwise a
+# colima Lima guest must be configured AND running at <= 8 GiB, otherwise a
 # 5G cap on an 8 GiB guest would OOM-kill QEMU (bead ez-gh-actions-154k).
 #
 # Configured size: `memory:` in the lima.yaml lima-vm@colima starts from.
@@ -15,22 +15,22 @@
 # LIMACTL / LIMA_YAML / LIMA_PROC_ROOT override the sources for fixtures.
 set -euo pipefail
 
-LIMIT=4294967296
+LIMIT=8589934592
 LIMACTL="${LIMACTL:-limactl}"
 LIMA_YAML="${LIMA_YAML:-${LIMA_HOME:-${HOME}/.lima}/colima/lima.yaml}"
 INSTANCE_DIR="$(dirname "$LIMA_YAML")"
 PROC_ROOT="${LIMA_PROC_ROOT:-/proc}"
 
 refuse() {
-  echo "FAIL lima guest memory $1 > 4GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" >&2
+  echo "FAIL lima guest memory $1 > 8GiB: resize the guest and restart the VM once before lowering the QEMU ceiling" >&2
   exit 1
 }
 unknown() {
-  echo "FAIL lima guest memory unknown ($1): cannot prove the colima guest runs at <= 4GiB; not lowering the QEMU ceiling" >&2
+  echo "FAIL lima guest memory unknown ($1): cannot prove the colima guest runs at <= 8GiB; not lowering the QEMU ceiling" >&2
   exit 1
 }
 
-yaml_to_bytes() { # 4GiB | 4096MiB | "4GiB"
+yaml_to_bytes() { # 8GiB | 4096MiB | "8GiB"
   local v="${1//\"/}"
   v="${v//\'/}"
   case "$v" in
@@ -114,4 +114,4 @@ values+=("${running[@]}")
 for value in "${values[@]}"; do
   [ "$value" -le "$LIMIT" ] || refuse "$value"
 done
-echo "OK: lima guest memory <= 4GiB (status=${status}; ${values[*]})"
+echo "OK: lima guest memory <= 8GiB (status=${status}; ${values[*]})"

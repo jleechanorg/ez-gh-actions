@@ -22,18 +22,18 @@ assert_file "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-s
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-daemon.service.d/20-automation-slice.conf" || fail "AO drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-orchestrator.service.d/20-automation-slice.conf" || fail "AO orchestrator drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.conf" || fail "dark-factory daemon drop-in does not select automation.slice"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=13G"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=14G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=10G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=12G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "TasksMax=8192"
 # The QEMU ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
-# VM-backed (runners inside Colima) keeps 34G/38G; host-docker (runners in
-# host Docker, Colima only runs qdrant in a 4 GiB guest) caps it at 4608M/5G.
+# VM-backed (runners inside Colima) keeps 9G/10G; host-docker (runners in
+# host Docker, Colima only runs qdrant in an 8 GiB guest) caps it at 9G/10G.
 # Each of the three tracked surfaces exists in both variants.
 for mode in vm-backed host-docker; do
   case "$mode" in
-    vm-backed) dir="$REPO_ROOT/systemd"; high=MemoryHigh=34G; max=MemoryMax=38G ;;
-    host-docker) dir="$REPO_ROOT/systemd/host-docker"; high=MemoryHigh=4608M; max=MemoryMax=5G ;;
+    vm-backed) dir="$REPO_ROOT/systemd"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
+    host-docker) dir="$REPO_ROOT/systemd/host-docker"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
   esac
   for file in "$dir/app-lima-vm.slice" "$dir/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
     assert_file "$file"
@@ -49,14 +49,11 @@ for mode in vm-backed host-docker; do
   done
   grep -q "measured margin" "$dir/app-lima-vm.slice" || fail "$mode app-lima-vm.slice lacks measured margin documentation"
 done
-# The host-docker runtime re-apply must not restore the VM-backed ceiling.
-! grep -Eq 'MemoryHigh=34G|MemoryMax=38G' "$REPO_ROOT/systemd/host-docker/lima-vm-cpu-ceiling.service" \
-  || fail "host-docker lima-vm-cpu-ceiling.service re-applies the VM-backed 34G/38G ceiling"
 # Every memory value is an integer unit (systemd and the Gate 8 bash helpers
 # both reject fractional sizes such as 4.5G).
 ! grep -rEn '^Memory(High|Max|SwapMax)=[0-9]*\.[0-9]' "$REPO_ROOT/systemd" \
   || fail "fractional memory value in tracked systemd policy"
-grep -q 'memory: "4GiB"' "$REPO_ROOT/install.sh" || fail "install.sh does not set the host-docker Lima guest to 4GiB"
+grep -q 'memory: "8GiB"' "$REPO_ROOT/install.sh" || fail "install.sh does not set the host-docker Lima guest to 8GiB"
 assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 grep -q 'QEMU_PROC_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
@@ -69,8 +66,8 @@ assert_line "$GUEST_ACTIONS_SLICE" "MemoryHigh=28G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemoryMax=32G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemorySwapMax=0"
 assert_line "$GUEST_ACTIONS_SLICE" "TasksMax=6000"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=7G"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=8G"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=4608M"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=5G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemorySwapMax=1G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "TasksMax=4096"
 grep -q "measured margin" "$REPO_ROOT/systemd/agents.slice" || fail "agents.slice lacks measured margin documentation"

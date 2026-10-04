@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export REPO_ROOT
 # Live bounds are mode-dependent (bead ez-gh-actions-154k): VM-backed keeps
-# 34G/38G, host-docker caps the qemu-only Colima VM at 4608M/5G.  Pin the mode
+# 9G/10G, host-docker caps the qemu-only Colima VM at 9G/10G.  Pin the mode
 # so fixtures never depend on this host's docker daemon.
 export QEMU_CEILING_MODE=vm-backed
 out="$(bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh")"
@@ -117,20 +117,20 @@ echo "$bound_out" | grep -q 'memory.max=.*exceeds' \
   || { echo "FAIL: negative memory.max bound was not reported: $bound_out" >&2; exit 1; }
 
 # Host-docker mode: the same 38 GiB-class VM-backed values exceed the
-# 4608M/5G host-docker bound, and the exact host-docker values pass.
+# 9G/10G host-docker bound, and the exact host-docker values pass.
 printf '36507222016\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
 printf '40802189312\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
 hd_rc=0
 hd_out="$(QEMU_CEILING_MODE=host-docker ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
   QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || hd_rc=$?
-[ "$hd_rc" -ne 0 ] || { echo "FAIL: VM-backed 34G/38G passed the host-docker bound" >&2; exit 1; }
+[ "$hd_rc" -ne 0 ] || { echo "FAIL: VM-backed 9G/10G passed the host-docker bound" >&2; exit 1; }
 echo "$hd_out" | grep -q 'memory.high=36507222016 exceeds 4831838208' \
   || { echo "FAIL: host-docker bound not reported: $hd_out" >&2; exit 1; }
 printf '4831838208\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
 printf '5368709120\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
 hd_out="$(QEMU_CEILING_MODE=host-docker ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
   QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
-  || { echo "FAIL: exact host-docker 4608M/5G rejected: $hd_out" >&2; exit 1; }
+  || { echo "FAIL: exact host-docker 9G/10G rejected: $hd_out" >&2; exit 1; }
 bad_rc=0
 QEMU_CEILING_MODE=bogus bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" >/dev/null 2>&1 || bad_rc=$?
 [ "$bad_rc" -ne 0 ] || { echo "FAIL: unknown QEMU_CEILING_MODE accepted" >&2; exit 1; }

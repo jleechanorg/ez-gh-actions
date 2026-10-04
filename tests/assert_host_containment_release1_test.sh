@@ -39,7 +39,7 @@ setup_passing_fixture() {
   printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
   printf '30064771072\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
   printf '0\n' > "$root/sys/fs/cgroup/actions.slice/memory.swap.max"
-  printf '6000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
+  printf '8000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
   printf 'default 25\n' > "$root/sys/fs/cgroup/actions.slice/io.weight"
 
@@ -55,9 +55,9 @@ setup_passing_fixture() {
     > "$root/etc/systemd/system/user@.service.d/99-ezgha-containment.conf"
 
   # agents.slice and automation.slice in user units
-  printf '[Slice]\nMemoryHigh=13G\nMemoryMax=14G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=10G\nMemoryMax=12G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/agents.slice"
-  printf '[Slice]\nMemoryHigh=7G\nMemoryMax=8G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=4608M\nMemoryMax=5G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/automation.slice"
 
   # Mock docker command
@@ -201,24 +201,24 @@ done
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$PROPS_BIN/systemctl"
-# Host-docker policy (bead ez-gh-actions-154k): agents 13G/14G, automation 7G/8G.
-write_props 13958643712 15032385536 7516192768 8589934592 > "$WORK/props_ok.txt"
+# Host-docker policy (bead ez-gh-actions-154k): agents 10G/12G, automation 9G/10G.
+write_props 10737418240 12884901888 4831838208 5368709120 > "$WORK/props_ok.txt"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1 \
   || fail "live systemd checks rejected 13G/14G agents + 7G/8G automation: $(tail -3 "$WORK/live_ok.log")"
 # The pre-154k 18G/20G + 8G/10G maxima over-commit the host-docker envelope.
-write_props 19327352832 21474836480 8589934592 10737418240 > "$WORK/props_old.txt"
+write_props 19327352832 21474836480 5368709120 10737418240 > "$WORK/props_old.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old.log" 2>&1; then
   fail "live systemd checks accepted the old 18G/20G agents.slice"
 fi
-grep -q "agents.slice MemoryHigh ('19327352832') != '13958643712'" "$WORK/live_old.log" || fail "missing agents.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
-write_props 13958643712 15032385536 8589934592 10737418240 > "$WORK/props_old_auto.txt"
+grep -q "agents.slice MemoryHigh ('19327352832') != '10737418240'" "$WORK/live_old.log" || fail "missing agents.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
+write_props 10737418240 12884901888 5368709120 10737418240 > "$WORK/props_old_auto.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old_auto.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old_auto.log" 2>&1; then
   fail "live systemd checks accepted the old 8G/10G automation.slice"
 fi
-grep -q "automation.slice MemoryHigh ('8589934592') != '7516192768'" "$WORK/live_old_auto.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old_auto.log")"
+grep -q "automation.slice MemoryHigh ('5368709120') != '4831838208'" "$WORK/live_old_auto.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old_auto.log")"
 # actions.slice must be enrolled with oomd kill at 80% pressure.
 sed 's/^actions.slice ManagedOOMMemoryPressure kill$/actions.slice ManagedOOMMemoryPressure auto/' "$WORK/props_ok.txt" > "$WORK/props_oom_auto.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_oom_auto.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \

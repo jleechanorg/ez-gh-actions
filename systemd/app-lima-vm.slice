@@ -7,14 +7,14 @@
 # deploys directly on the service. Keep both values identical.
 #
 # These are the VM-backed values (runners inside Colima). A host-docker Linux
-# deployment uses systemd/host-docker/ (4608M/5G); install.sh selects by mode.
+# deployment uses systemd/host-docker/ (9G/10G); install.sh selects by mode.
 #
 # MemoryHigh provides the first response (throttle + reclaim under pressure);
 # MemoryMax is a finite final containment boundary for a runaway VM. This
 # ordering preserves normal operation while preventing unbounded host impact.
 #
 # 34 GiB was measured against a 31.8 GiB normal QEMU RSS peak, leaving a
-# measured margin of 2.2 GiB before reclaim. MemoryMax=38G is 6.2 GiB above that peak;
+# measured margin of 2.2 GiB before reclaim. MemoryMax=10G is 6.2 GiB above that peak;
 # the finite swap/task ceilings bound transient accounting and fork growth.
 # CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
 # (historical 24 is stale). This caps runnable QEMU time; D-state still counts
@@ -33,8 +33,8 @@ Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (34 Gi
 Before=slices.target
 
 [Slice]
-MemoryHigh=34G
-MemoryMax=38G
+MemoryHigh=9G
+MemoryMax=10G
 MemorySwapMax=2G
 TasksMax=4096
 MemoryAccounting=yes

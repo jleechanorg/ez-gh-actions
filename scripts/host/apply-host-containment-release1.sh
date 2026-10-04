@@ -88,15 +88,15 @@ for controller in cpu memory pids io; do
   grep -qw "$controller" "${CGROUP_ROOT}/cgroup.controllers" 2>/dev/null || fail "missing required cgroup v2 controller: ${controller}"
 done
 check_below "${CGROUP_ROOT}/actions.slice/memory.current" 27917287424 "actions.slice memory.current"
-check_below "${CGROUP_ROOT}/actions.slice/pids.current" 6000 "actions.slice pids.current"
+check_below "${CGROUP_ROOT}/actions.slice/pids.current" 8000 "actions.slice pids.current"
 agents_dir="$(user_cgroup_dir agents.slice || true)"
 automation_dir="$(user_cgroup_dir automation.slice || true)"
-# New MemoryHigh: agents.slice 13G, automation.slice 7G (bead ez-gh-actions-154k).
-[ -z "$agents_dir" ] || check_non_reclaimable "$agents_dir" 13958643712 agents.slice
-[ -z "$automation_dir" ] || check_non_reclaimable "$automation_dir" 7516192768 automation.slice
+# New MemoryHigh: agents.slice 10G, automation.slice 4608M (bead ez-gh-actions-154k).
+[ -z "$agents_dir" ] || check_non_reclaimable "$agents_dir" 10737418240 agents.slice
+[ -z "$automation_dir" ] || check_non_reclaimable "$automation_dir" 4831838208 automation.slice
 # The user phase leads into install.sh lowering the colima QEMU ceiling to the
-# host-docker 4608M/5G; refuse while the Lima guest is configured or running
-# above 4 GiB. A --root fixture reads its own lima.yaml/limactl.
+# host-docker 9G/10G; refuse while the Lima guest is configured or running
+# above 8 GiB. A --root fixture reads its own lima.yaml/limactl.
 if [ "$SYSTEM_PHASE" -eq 0 ]; then
   if [ "$ROOT" = "/" ]; then
     "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
@@ -142,7 +142,7 @@ if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
       || fail "user manager OOM score adjustment did not become 0"
     systemctl enable actions.slice
     systemctl start actions.slice
-    systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
+    systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=8000 CPUQuota=2000% IOWeight=25
     # systemd-oomd kills inside actions.slice (runner jobs) at 80% full
     # pressure; agents.slice and automation.slice are never enrolled with kill.
     systemctl set-property actions.slice ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=80%
@@ -179,8 +179,8 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
-    systemctl --user set-property agents.slice MemoryHigh=13G MemoryMax=14G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=7G MemoryMax=8G MemorySwapMax=1G TasksMax=4096
+    systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192
+    systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096
   fi
 fi
 
