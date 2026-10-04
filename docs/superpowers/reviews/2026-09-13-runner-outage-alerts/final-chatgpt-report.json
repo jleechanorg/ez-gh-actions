@@ -1,0 +1,21 @@
+{
+  "authenticated": true,
+  "composer_writable": true,
+  "context_deficiency_complaints": [],
+  "disk_location": "/private/tmp/ezgha-alert-web-review/reviews/chatgpt_review.md",
+  "packet_attachments": {
+    "2026-09-13-runner-outage-alerts-design.md": 24070,
+    "2026-09-13-runner-outage-alerts.md": 19054
+  },
+  "packet_echo_verified": true,
+  "reason": null,
+  "response": "VERDICT: APPROVED with notes\n\nREASONING: At base revision 0f0eae2925dee384540c803791c249ed00e2f7a3, I read the complete frozen 2026-09-13-runner-outage-alerts-design.md and 2026-09-13-runner-outage-alerts.md; the uploaded bytes match the supplied SHA-256 digests. Under \u201cObservations and failure semantics,\u201d the design now explicitly requires \u201cone dedicated worker thread\u201d on jeff-ubuntu with its own 60-second schedule/shutdown, disables the old serve-loop fetch, bounds one in-flight fetch, and makes absent/stale queue evidence UNKNOWN rather than silently healthy, which closes the earlier producer/timing ambiguity. \n\n2026-09-13-runner-outage-alerts\u2026\n\n Under \u201cTiming, incidents and recovery,\u201d the two-good-sample startup/post-gap rule (\u201crequires two fresh passing samples before the first success heartbeat\u201d) plus the generation-scoped outbox written \u201cBEFORE each transition request\u201d provide a coherent crash/reboot/gap/replay state machine without claiming exactly-once delivery. \n\n2026-09-13-runner-outage-alerts\u2026\n\n Task 6 also makes migration ownership explicit: Linux OnFailure/ExecStopPost retain local diagnostics while their overlapping fleet-availability remote page is disabled, so the hosted check alone owns availability Down/Up and the migration test must prove only one availability incident. \n\n2026-09-13-runner-outage-alerts\n\n Delivery evidence is now appropriately layered: Task 4 rejects HTTP-200 ignored responses unless the stripped body is exactly OK, and Task 7 separately requires actual Slack AND mailbox receipts rather than treating fake adapters or provider acceptance as human-delivery proof; current Healthchecks documentation confirms both the ignored-200 behavior and the usefulness of independent notification integrations. \n\n2026-09-13-runner-outage-alerts +1\n\n \nHealthchecks.io\n+1\n The only substantive note is credential scope for the clause requiring Management API verification of \u201cboth integrations\u201d: Healthchecks\u2019 current v3 API omits channels from read-only-key check responses and does not permit read-only keys to list integrations, so implementation must explicitly use and securely contain an appropriately authorized project credential or choose another authorized linkage-verification path; because account/permission resolution is already an activation precondition, this is not a material architecture or execution-plan blocker. \n\n2026-09-13-runner-outage-alerts\u2026\n\n \nHealthchecks.io\n\nRISK: The main residual risk is securely satisfying the external provider/integration audit and real-receipt permissions\u2014particularly the Management API privilege needed to verify channel linkage\u2014without broadening credential exposure onto the monitored hosts.\n\nCONFIDENCE: high\n\nCOVERAGE: 2026-09-13-runner-outage-alerts-design.md; 2026-09-13-runner-outage-alerts.md\n\nWEB SOURCES: Healthchecks Pinging API\n \u2014 confirms successful ping semantics and HTTP-200 not found/rate limited responses that must not be treated as acceptance; Healthchecks Management API v3\n \u2014 confirms check/channel inspection capabilities and that read-only keys omit channels; Healthchecks notification configuration\n \u2014 confirms multiple independent integrations and account-wide hourly/daily down reminders.",
+  "share_url": "not obtained: automated driver",
+  "site": "chatgpt",
+  "transport": "chrome_headless_cookies",
+  "upload_verified": true,
+  "visible_attachment_names": [
+    "2026-09-13-runner-outage-alerts-design.md",
+    "2026-09-13-runner-outage-alerts.md"
+  ]
+}

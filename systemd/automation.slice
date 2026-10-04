@@ -1,16 +1,13 @@
-# automation.slice — finite budget for orchestration/watchdog automation.
-# Memory, swap, and task limits bound worker scopes and keep admission finite.
-# Measured margin: automation used about 5.7 GiB with roughly 30 worker scopes
-# and reached the 8G MemoryHigh with roughly 90; at 4G it remained throttled
-# and its PSI admission signal drained the fleet. These are historical
-# measurements, not a current live-health measurement.
+# automation.slice — finite budget for orchestration automation.
+# measured margin: the approved 5G cap is 3.01 GiB below the observed 8.01 GiB peak.
+# Activation requires usage below 4608M; later growth may throttle or OOM.
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target
 
 [Slice]
-MemoryHigh=8G
-MemoryMax=10G
+MemoryHigh=4608M
+MemoryMax=5G
 MemorySwapMax=1G
 TasksMax=4096
 MemoryAccounting=yes

@@ -17,6 +17,19 @@ rm -rf "$TEMP_REPO/docs"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 line_of() { grep -n -m1 "^$1$" "$EVENT_LOG" | cut -d: -f1; }
 
+if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
+  if [ -z "${TOML_PACKAGE_ROOT:-}" ]; then
+    echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: SKIP (toml package unavailable)"
+    exit 0
+  fi
+  LEGACY_PYTHON="$WORK/legacy-python"
+  mkdir -p "$LEGACY_PYTHON"
+  cat > "$LEGACY_PYTHON/tomllib.py" <<'EOF'
+raise ModuleNotFoundError("fixture disables tomllib")
+EOF
+  export PYTHONPATH="$LEGACY_PYTHON:$TOML_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 cat > "$STUB_BIN/uname" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in -r) echo fixture-host-kernel ;; *) echo Linux ;; esac
@@ -72,16 +85,24 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
+  enable)
+    if [ "${SYSTEMCTL_REAPPLY_FAIL:-0}" = 1 ] && [[ " $* " == *" lima-vm-cpu-ceiling.service "* ]]; then
+      echo reapply-enable-failed >> "$EVENT_LOG"
+      exit 1
+    fi
+    exit 0 ;;
+  show)
+    if [[ " $* " == *" -p ActiveState "* ]]; then
+      echo inactive
+    elif [ -n "${SYSTEMCTL_CGROUP_PATH:-}" ] && [[ "$*" == *"lima-vm@colima.service"* ]]; then
+      printf '%s\n' "$SYSTEMCTL_CGROUP_PATH"
+    fi
+    exit 0 ;;
   is-enabled)
     if [ "${2:-}" = agent-scope-reaper.timer ] \
        || [ "${2:-}" = psi-oom-watcher.timer ]; then
       echo disabled
       exit 1
-    fi
-    exit 0 ;;
-  show)
-    if [ -n "${SYSTEMCTL_CGROUP_PATH:-}" ] && [[ "$*" == *"lima-vm@colima.service"* ]]; then
-      printf '%s\n' "$SYSTEMCTL_CGROUP_PATH"
     fi
     exit 0 ;;
   is-active)
@@ -145,22 +166,18 @@ GUARD_MIN_PATH="$GUARD_PATH:/usr/bin:/bin"
 if PATH="$GUARD_MIN_PATH" command -v limactl >/dev/null 2>&1; then
   fail "guard-only PATH unexpectedly exposed limactl"
 fi
-for source_unit in \
-    "$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
-    "$REPO_ROOT/systemd/host-docker/lima-vm-cpu-ceiling.service"; do
-  grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$source_unit" \
-    || fail "source unit does not bind the installed absolute limactl path: $source_unit"
-done
+GUEST_DROPIN="$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"
+grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$GUEST_DROPIN" \
+  || fail "source unit does not bind the installed absolute limactl path: $GUEST_DROPIN"
 install -m 0755 "$TEMP_REPO/scripts/host/lima-guest-memory-check.sh" \
   "$GUARD_HOME/.local/libexec/ezgha/lima-guest-memory-check.sh"
-install -m 0644 \
-  "$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+install -m 0644 "$GUEST_DROPIN" \
   "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
-install -m 0644 "$REPO_ROOT/systemd/host-docker/lima-vm-cpu-ceiling.service" \
-  "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service"
+install -m 0644 "$GUEST_DROPIN" \
+  "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
 for staged_unit in \
     "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
-    "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service"; do
+    "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"; do
   grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$staged_unit" \
     || fail "staged unit does not preserve the absolute limactl path: $staged_unit"
   limactl_spec="$(sed -n 's/^Environment=LIMACTL=//p' "$staged_unit")"
@@ -201,10 +218,6 @@ if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context \
     "$REPO_ROOT/scripts/host/docker-host-mode.sh" >/dev/null 2>&1; then
   fail "remote context was ignored in favor of the local default socket"
 fi
-if env -u QEMU_CEILING_MODE EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" \
-    DOCKER_CONTEXT=remote-context bash "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" >/dev/null 2>&1; then
-  fail "QEMU assertion ignored the selected remote context"
-fi
 # The Linux verifier resolves the endpoint stored in ezgha.service instead
 # of inheriting this shell's remote context. Test the extracted helper with a
 # service override and then its native fallback.
@@ -231,10 +244,10 @@ fi
 cat > "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --system-phase ]; then
-  echo root-phase >> "$EVENT_LOG"
+  echo "root-phase:$*" >> "$EVENT_LOG"
   [ "${APPLY_FAIL_ROOT:-0}" = 1 ] && exit 1
 else
-  echo user-phase >> "$EVENT_LOG"
+  echo "user-phase:$*" >> "$EVENT_LOG"
   [ "${APPLY_FAIL_USER:-0}" = 1 ] && exit 1
 fi
 exit 0
@@ -248,7 +261,7 @@ chmod +x "$TEMP_REPO/scripts/host/"*containment-release1.sh
 HOME_DIR="$WORK/home"
 HOST_OVERRIDE_DIR="$WORK/host-overrides"
 mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user" "$HOME_DIR/.lima/colima" "$HOST_OVERRIDE_DIR"
-printf '# fixture\n' > "$HOME_DIR/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$HOME_DIR/.config/ezgha/config.toml"
 printf 'cpus: 4\nmemory: "8GiB"\n' > "$HOME_DIR/.lima/colima/lima.yaml"
 printf 'set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192\n' > "$HOST_OVERRIDE_DIR/agents.slice"
 printf 'set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096\n' > "$HOST_OVERRIDE_DIR/automation.slice"
@@ -261,7 +274,7 @@ assert_host_policy_slice() {
   local unit="$1" high="$2" max="$3" file
   file="$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/$unit"
   grep -qx "MemoryHigh=$high" "$file" && grep -qx "MemoryMax=$max" "$file" \
-    || fail "host-docker staged policy copied VM-backed values for $unit"
+    || fail "staged policy does not contain the tracked $high/$max budget for $unit"
 }
 assert_host_policy_slice agents.slice 10G 12G
 assert_host_policy_slice automation.slice 4608M 5G
@@ -280,7 +293,11 @@ assert_persisted_slice() {
 }
 assert_persisted_slice "$HOST_OVERRIDE_DIR" agents.slice 10G 12G 2G 8192
 assert_persisted_slice "$HOST_OVERRIDE_DIR" automation.slice 4608M 5G 1G 4096
-root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
+for policy in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
+  cmp "$REPO_ROOT/systemd/$policy" "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/$policy" || fail "missing or stale installed $policy"
+done
+cmp "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh" "$HOME_DIR/.local/libexec/ezgha/qemu-ceiling-guard.sh" || fail "missing installed QEMU guard"
+root_line="$(line_of "root-phase:--system-phase --runner-count 14")"; user_line="$(line_of "user-phase:--runner-count 14")"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
@@ -303,20 +320,19 @@ for f in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf; do
   grep -qx 'MemoryHigh=9G' "$HD_UNITS/$f" && grep -qx 'MemoryMax=10G' "$HD_UNITS/$f" \
     || fail "host-docker install did not deploy the 9G/10G $f"
 done
-grep -q 'MemoryHigh=9G MemoryMax=10G' "$HD_UNITS/lima-vm-cpu-ceiling.service" \
-  || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that re-applies the wrong 9G/10G ceiling"
-grep -qx 'ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
-  "$HD_UNITS/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
-  || fail "host-docker install did not stage the guard-only next-start admission"
-grep -qx 'ExecStart=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
-  "$HD_UNITS/lima-vm-cpu-ceiling.service" \
-  || fail "host-docker reapply unit does not run guest admission first"
+grep -qx "ExecStart=$HOME_DIR/.local/libexec/ezgha/qemu-ceiling-guard.sh --apply" "$HD_UNITS/lima-vm-cpu-ceiling.service" \
+  || fail "host-docker install deployed a lima-vm-cpu-ceiling.service that does not use the shared QEMU guard"
+for unit in lima-vm@colima lima-vm-cpu-ceiling; do
+  grep -qx 'ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
+    "$HD_UNITS/$unit.service.d/10-guest-memory-admission.conf" \
+    || fail "host-docker install did not stage $unit guest admission before start"
+done
 
 # A guest still running at 12 GiB keeps the existing QEMU ceiling (fail closed)
 # even though this same install run rewrote lima.yaml to 8GiB.
 BIG_HOME="$WORK/big_guest_home"
 mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d" "$BIG_HOME/.lima/colima"
-printf '# fixture\n' > "$BIG_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$BIG_HOME/.config/ezgha/config.toml"
 printf 'cpus: 4\nmemory: "12GiB"\n' > "$BIG_HOME/.lima/colima/lima.yaml"
 BIG_PROC="$WORK/big_proc"
 BIG_CGROUP="$WORK/big_cgroup"
@@ -367,7 +383,7 @@ fi
 RELOAD_HOME="$WORK/reload_home"
 mkdir -p "$RELOAD_HOME/.config/ezgha" "$RELOAD_HOME/.lima/colima"
 printf 'memory: "8GiB"\n' > "$RELOAD_HOME/.lima/colima/lima.yaml"
-printf '# fixture\n' > "$RELOAD_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$RELOAD_HOME/.config/ezgha/config.toml"
 if env EVENT_LOG="$WORK/reload_events" PATH="$STUB_BIN:$PATH" HOME="$RELOAD_HOME" \
     CARGO_HOME="$RELOAD_HOME/.cargo" XDG_CONFIG_HOME="$RELOAD_HOME/.config" FAIL_RELOAD=1 \
     bash "$TEMP_REPO/install.sh" --dev > "$WORK/reload.log" 2>&1; then
@@ -382,19 +398,44 @@ fi
 # A lima.yaml without a memory: line gets one (sed alone would change nothing).
 NOMEM_HOME="$WORK/nomem_home"
 mkdir -p "$NOMEM_HOME/.config/ezgha" "$NOMEM_HOME/.lima/colima"
-printf '# fixture\n' > "$NOMEM_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$NOMEM_HOME/.config/ezgha/config.toml"
 printf 'cpus: 4\n' > "$NOMEM_HOME/.lima/colima/lima.yaml"
 env EVENT_LOG="$WORK/nomem_events" PATH="$STUB_BIN:$PATH" HOME="$NOMEM_HOME" CARGO_HOME="$NOMEM_HOME/.cargo" XDG_CONFIG_HOME="$NOMEM_HOME/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/nomem-install.log" 2>&1 || fail "no-memory-line fixture install failed"
 grep -qx 'memory: "8GiB"' "$NOMEM_HOME/.lima/colima/lima.yaml" \
   || fail "lima.yaml without memory: was not set to 8GiB: $(cat "$NOMEM_HOME/.lima/colima/lima.yaml")"
 
+ROLLBACK_HOME="$WORK/rollback_home"
+ROLLBACK_LOG="$WORK/rollback_events"
+mkdir -p "$ROLLBACK_HOME/.config/ezgha" "$ROLLBACK_HOME/.lima/colima"
+printf 'memory: "8GiB"\n' > "$ROLLBACK_HOME/.lima/colima/lima.yaml"
+printf '[runner]\ncount = 10\n' > "$ROLLBACK_HOME/.config/ezgha/config.toml"
+env EVENT_LOG="$ROLLBACK_LOG" PATH="$STUB_BIN:$PATH" HOME="$ROLLBACK_HOME" CARGO_HOME="$ROLLBACK_HOME/.cargo" XDG_CONFIG_HOME="$ROLLBACK_HOME/.config" \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/rollback-install.log" 2>&1 \
+  || fail "10-runner rollback fixture install failed"
+grep -qx 'root-phase:--system-phase --runner-count 10' "$ROLLBACK_LOG" \
+  || fail "10-runner rollback root phase did not receive --runner-count 10"
+grep -qx 'user-phase:--runner-count 10' "$ROLLBACK_LOG" \
+  || fail "10-runner rollback user phase did not receive --runner-count 10"
+
+INVALID_HOME="$WORK/invalid_count_home"
+INVALID_LOG="$WORK/invalid_count_events"
+mkdir -p "$INVALID_HOME/.config/ezgha"
+printf '[runner]\ncount = 12\n' > "$INVALID_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$INVALID_LOG" PATH="$STUB_BIN:$PATH" HOME="$INVALID_HOME" CARGO_HOME="$INVALID_HOME/.cargo" XDG_CONFIG_HOME="$INVALID_HOME/.config" \
+    bash "$TEMP_REPO/install.sh" --dev > "$WORK/invalid-count-install.log" 2>&1; then
+  fail "installer accepted unsupported runner.count=12"
+fi
+if grep -qE '^(root|user)-phase:' "$INVALID_LOG" 2>/dev/null; then
+  fail "invalid runner.count wrote containment phases"
+fi
+
 run_failed_phase() {
   local phase="$1"
   local home="$WORK/${phase}_home"
   local log="$WORK/${phase}_events"
   mkdir -p "$home/.config/ezgha"
-  printf '# fixture\n' > "$home/.config/ezgha/config.toml"
+  printf '[runner]\ncount = 14\n' > "$home/.config/ezgha/config.toml"
   if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" "APPLY_FAIL_${phase^^}=1" \
       bash "$TEMP_REPO/install.sh" --dev > "$WORK/${phase}.log" 2>&1; then
     fail "${phase} phase failure still allowed installation"
@@ -408,7 +449,7 @@ run_failed_phase user
 
 SLICE_FAIL_HOME="$WORK/slice_fail_home"
 mkdir -p "$SLICE_FAIL_HOME/.config/ezgha" "$SLICE_FAIL_HOME/.lima/colima"
-printf '# fixture\n' > "$SLICE_FAIL_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$SLICE_FAIL_HOME/.config/ezgha/config.toml"
 printf 'memory: "8GiB"\n' > "$SLICE_FAIL_HOME/.lima/colima/lima.yaml"
 if env EVENT_LOG="$WORK/slice_fail_events" PATH="$STUB_BIN:$PATH" \
     HOME="$SLICE_FAIL_HOME" CARGO_HOME="$SLICE_FAIL_HOME/.cargo" \
@@ -426,7 +467,8 @@ grep -q 'could not apply selected agents.slice budget' "$WORK/slice-fail.log" \
 # host, so host-Docker containment is intentionally not activated.
 VM_EVENT_LOG="$WORK/vm_events"
 VM_HOME="$WORK/vm_home"
-mkdir -p "$VM_HOME"
+mkdir -p "$VM_HOME/.config/ezgha"
+printf '[runner]\ncount = 12\n' > "$VM_HOME/.config/ezgha/config.toml"
 env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" CARGO_HOME="$VM_HOME/.cargo" XDG_CONFIG_HOME="$VM_HOME/.config" \
   DOCKER_HOST="unix://$VM_HOME/.colima/default/docker.sock" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/vm-install.log" 2>&1 \
@@ -435,12 +477,12 @@ grep -qx "docker-info:unix://$VM_HOME/.colima/default/docker.sock" "$VM_EVENT_LO
   || fail "installer did not probe the explicitly selected VM endpoint"
 grep -qx "docker-build:unix://$VM_HOME/.colima/default/docker.sock" "$VM_EVENT_LOG" \
   || fail "installer did not build on the explicitly selected VM endpoint"
-if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
+if grep -qE '^(root|user)-phase:' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
 fi
-# VM-backed mode keeps the 34G/38G QEMU ceiling (runners live in the guest).
-grep -qx 'MemoryMax=38G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-  || fail "VM-backed install did not deploy the 34G/38G QEMU ceiling"
+# VM-backed mode installs the same tracked 9G/10G QEMU ceiling.
+grep -qx 'MemoryMax=10G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "VM-backed install did not deploy the tracked 9G/10G QEMU ceiling"
 
 # A host-docker installation leaves next-start guards for its 8GiB guest.
 # Returning to VM-backed Docker must remove only those guards before cargo
@@ -449,7 +491,7 @@ MIGRATE_HOME="$WORK/migrate_home"
 MIGRATE_EVENTS="$WORK/migrate_events"
 MIGRATE_OVERRIDES="$WORK/migrate-overrides"
 mkdir -p "$MIGRATE_HOME/.config/ezgha" "$MIGRATE_HOME/.lima/colima" "$MIGRATE_OVERRIDES"
-printf '# fixture\n' > "$MIGRATE_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$MIGRATE_HOME/.config/ezgha/config.toml"
 printf 'memory: "8GiB"\n' > "$MIGRATE_HOME/.lima/colima/lima.yaml"
 printf 'set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192\n' > "$MIGRATE_OVERRIDES/agents.slice"
 printf 'set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096\n' > "$MIGRATE_OVERRIDES/automation.slice"
@@ -465,10 +507,13 @@ for unit in lima-vm@colima lima-vm-cpu-ceiling; do
   [ -f "$guard" ] || fail "host-docker setup omitted $unit admission guard"
   printf '# preserve this unrelated drop-in\n' > "$(dirname "$guard")/99-unrelated.conf"
 done
-# This legacy guest is intentionally too large for the former host-docker
-# admission rule. VM-backed mode must not retain that rule.
+# This legacy guest is intentionally too large for the host-docker admission
+# rule. VM-backed mode must not retain that rule.
 printf 'memory: "12GiB"\n' > "$MIGRATE_HOME/.lima/colima/lima.yaml"
 : > "$MIGRATE_EVENTS"
+# Reintroduce stale user.control overrides; the VM-backed install must replace them too.
+printf 'set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192\n' > "$MIGRATE_OVERRIDES/agents.slice"
+printf 'set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096\n' > "$MIGRATE_OVERRIDES/automation.slice"
 env EVENT_LOG="$MIGRATE_EVENTS" SYSTEMCTL_OVERRIDE_DIR="$MIGRATE_OVERRIDES" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
   DOCKER_HOST="unix://$MIGRATE_HOME/.colima/default/docker.sock" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/migrate-vm-backed.log" 2>&1 \
@@ -479,33 +524,49 @@ for unit in lima-vm@colima lima-vm-cpu-ceiling; do
   [ -f "$(dirname "$guard")/99-unrelated.conf" ] \
     || fail "VM-backed migration removed an unrelated $unit drop-in"
 done
-grep -qx 'MemoryMax=38G' "$MIGRATE_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-  || fail "VM-backed migration did not restore the 34G/38G QEMU policy"
-grep -Fqx "set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
+grep -qx 'MemoryMax=10G' "$MIGRATE_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  || fail "VM-backed migration did not install the tracked 9G/10G QEMU policy"
+grep -Fqx "set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
   || fail "VM-backed migration did not overwrite the stale agents.slice user.control override"
-grep -Fqx "set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_OVERRIDES/automation.slice" \
+grep -Fqx "set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_OVERRIDES/automation.slice" \
   || fail "VM-backed migration did not overwrite the stale automation.slice user.control override"
-grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_EVENTS" \
-  || fail "VM-backed migration did not reapply the selected agents.slice live budget"
-grep -qx "systemctl-set-property:set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_EVENTS" \
-  || fail "VM-backed migration did not reapply the selected automation.slice live budget"
+grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_EVENTS" \
+  || fail "VM-backed migration did not reapply the tracked agents.slice live budget"
+grep -qx "systemctl-set-property:set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_EVENTS" \
+  || fail "VM-backed migration did not reapply the tracked automation.slice live budget"
 migrate_final_reload_line="$(grep -n '^systemctl-daemon-reload:daemon-reload$' "$MIGRATE_EVENTS" | tail -1 | cut -d: -f1)"
 migrate_final_agents_line="$(grep -n '^systemctl-set-property:set-property agents.slice ' "$MIGRATE_EVENTS" | tail -1 | cut -d: -f1)"
 [ -n "$migrate_final_reload_line" ] && [ -n "$migrate_final_agents_line" ] && [ "$migrate_final_reload_line" -lt "$migrate_final_agents_line" ] \
   || fail "VM-backed migration slice budgets were applied before the final user-unit reload"
-assert_installed_slice "$MIGRATE_HOME" agents.slice 18G 20G
-assert_installed_slice "$MIGRATE_HOME" automation.slice 8G 10G
+assert_installed_slice "$MIGRATE_HOME" agents.slice 10G 12G
+assert_installed_slice "$MIGRATE_HOME" automation.slice 4608M 5G
 migrate_reload_line="$(line_of 'systemctl-daemon-reload:daemon-reload')"
 migrate_install_line="$(line_of cargo-install)"
 [ -n "$migrate_reload_line" ] && [ -n "$migrate_install_line" ] && [ "$migrate_reload_line" -lt "$migrate_install_line" ] \
   || fail "VM-backed migration did not reload systemd after guard cleanup before installation"
+
+run_invalid_config() {
+  local name="$1" contents="$2"
+  local home="$WORK/${name}_home" log="$WORK/${name}_events"
+  mkdir -p "$home/.config/ezgha"
+  printf '%s' "$contents" > "$home/.config/ezgha/config.toml"
+  if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" \
+      bash "$TEMP_REPO/install.sh" --dev > "$WORK/${name}.log" 2>&1; then
+    fail "installer accepted present invalid config ${name}"
+  fi
+  if grep -qE '^(root|user)-phase:' "$log" 2>/dev/null; then
+    fail "present invalid config ${name} wrote containment phases"
+  fi
+}
+run_invalid_config malformed $'runner = [\n'
+run_invalid_config missing_count $'[runner]\n'
 
 # Docker v29 resolves DOCKER_HOST before DOCKER_CONTEXT. The active-service
 # upgrade must persist the CLI-selected host endpoint, not the named context.
 CONTEXT_EVENT_LOG="$WORK/context_events"
 CONTEXT_HOME="$WORK/context_home"
 mkdir -p "$CONTEXT_HOME/.config/ezgha" "$CONTEXT_HOME/.lima/colima"
-printf '# fixture\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
 printf 'memory: "8GiB"\n' > "$CONTEXT_HOME/.lima/colima/lima.yaml"
 env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" CARGO_HOME="$CONTEXT_HOME/.cargo" XDG_CONFIG_HOME="$CONTEXT_HOME/.config" \
   SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///run/docker.sock' \
@@ -531,4 +592,32 @@ if PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///
 fi
 [ "$(PATH="$STUB_BIN:$PATH" "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock)" = host-docker ] \
   || fail "canonical native endpoint was not classified as host Docker"
-echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"
+REAPPLY_HOME="$WORK/reapply_home"
+REAPPLY_LOG="$WORK/reapply_events"
+mkdir -p "$REAPPLY_HOME/.config/ezgha" "$REAPPLY_HOME/.lima/colima"
+printf 'memory: "8GiB"\n' > "$REAPPLY_HOME/.lima/colima/lima.yaml"
+printf '[runner]\ncount = 14\n' > "$REAPPLY_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$REAPPLY_LOG" PATH="$STUB_BIN:$PATH" HOME="$REAPPLY_HOME" CARGO_HOME="$REAPPLY_HOME/.cargo" XDG_CONFIG_HOME="$REAPPLY_HOME/.config" \
+    SYSTEMCTL_REAPPLY_FAIL=1 bash "$TEMP_REPO/install.sh" --dev > "$WORK/reapply-install.log" 2>&1; then
+  fail "failed required QEMU reapply service enable allowed successful installation"
+fi
+grep -qx reapply-enable-failed "$REAPPLY_LOG" || fail "fixture missed reapply enable failure"
+grep -q 'lima-vm-cpu-ceiling.service not enabled' "$WORK/reapply-install.log" || fail "required reapply failure was not reported"
+
+if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
+  echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: PASS"
+else
+  echo "INSTALL_HOST_CONTAINMENT_NORMAL_TOMLLIB_TEST: PASS"
+  TOML_PACKAGE_ROOT="$(python3 -c 'import pathlib, toml; print(pathlib.Path(toml.__file__).resolve().parent.parent)' 2>/dev/null || true)"
+  if [ -n "$TOML_PACKAGE_ROOT" ]; then
+    if TOML_PACKAGE_ROOT="$TOML_PACKAGE_ROOT" INSTALL_HOST_CONTAINMENT_LEGACY_TOML=1 \
+        bash "$REPO_ROOT/tests/install_host_containment_test.sh" > "$WORK/legacy-toml.log" 2>&1; then
+      cat "$WORK/legacy-toml.log"
+    else
+      cat "$WORK/legacy-toml.log" >&2
+      fail "legacy TOML fallback fixture failed"
+    fi
+  else
+    echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: SKIP (toml package unavailable)"
+  fi
+fi

@@ -22,46 +22,29 @@ assert_file "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-s
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-daemon.service.d/20-automation-slice.conf" || fail "AO drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-orchestrator.service.d/20-automation-slice.conf" || fail "AO orchestrator drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.conf" || fail "dark-factory daemon drop-in does not select automation.slice"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=18G"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=20G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=10G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=12G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "TasksMax=8192"
-for unit in agents.slice automation.slice; do
-  assert_file "$REPO_ROOT/systemd/host-docker/$unit"
+assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemoryHigh=9G"
+assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemoryMax=10G"
+assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemorySwapMax=2G"
+assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "TasksMax=4096"
+assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "CPUQuota=1600%"
+QEMU_DROPIN="$REPO_ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+assert_file "$QEMU_DROPIN"
+assert_line "$QEMU_DROPIN" "MemoryHigh=9G"
+assert_line "$QEMU_DROPIN" "MemoryMax=10G"
+assert_line "$QEMU_DROPIN" "MemorySwapMax=2G"
+assert_line "$QEMU_DROPIN" "TasksMax=4096"
+assert_line "$QEMU_DROPIN" "CPUQuota=1600%"
+assert_file "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service"
+assert_line "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service" 'ExecStart=@SCRIPTS_DIR@/qemu-ceiling-guard.sh --apply'
+assert_file "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh"
+for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
+  grep -Fq "$setting" "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh" \
+    || fail "shared QEMU guard missing $setting"
 done
-assert_line "$REPO_ROOT/systemd/host-docker/agents.slice" "MemoryHigh=10G"
-assert_line "$REPO_ROOT/systemd/host-docker/agents.slice" "MemoryMax=12G"
-assert_line "$REPO_ROOT/systemd/host-docker/automation.slice" "MemoryHigh=4608M"
-assert_line "$REPO_ROOT/systemd/host-docker/automation.slice" "MemoryMax=5G"
-grep -Fq 'systemd/host-docker/${unit}' "$REPO_ROOT/install.sh" \
-  || fail "host-docker installer policy staging does not select host-mode slices"
-# The QEMU ceiling is deployment-mode dependent (bead ez-gh-actions-154k):
-# VM-backed (runners inside Colima) keeps 34G/38G; host-docker (runners in
-# host Docker, Colima only runs qdrant in an 8 GiB guest) caps it at 9G/10G.
-# Each of the three tracked surfaces exists in both variants.
-for mode in vm-backed host-docker; do
-  case "$mode" in
-    vm-backed) dir="$REPO_ROOT/systemd"; high=MemoryHigh=34G; max=MemoryMax=38G ;;
-    host-docker) dir="$REPO_ROOT/systemd/host-docker"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
-  esac
-  for file in "$dir/app-lima-vm.slice" "$dir/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
-    assert_file "$file"
-    for line in "$high" "$max" MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-      assert_line "$file" "$line"
-    done
-  done
-  assert_file "$dir/lima-vm-cpu-ceiling.service"
-  for setting in "$high" "$max" MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-    grep -Fq "$setting" "$dir/lima-vm-cpu-ceiling.service" \
-      || fail "$mode lima-vm-cpu-ceiling.service missing $setting"
-    grep -Fq "$setting" "$REPO_ROOT/install.sh" || fail "install.sh does not apply $mode $setting"
-  done
-done
-# Every memory value is an integer unit (systemd and the Gate 8 bash helpers
-# both reject fractional sizes such as 4.5G).
-! grep -rEn '^Memory(High|Max|SwapMax)=[0-9]*\.[0-9]' "$REPO_ROOT/systemd" \
-  || fail "fractional memory value in tracked systemd policy"
-grep -q 'memory: "8GiB"' "$REPO_ROOT/install.sh" || fail "install.sh does not set the host-docker Lima guest to 8GiB"
 assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 grep -q 'QEMU_PROC_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
@@ -74,15 +57,23 @@ assert_line "$GUEST_ACTIONS_SLICE" "MemoryHigh=28G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemoryMax=32G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemorySwapMax=0"
 assert_line "$GUEST_ACTIONS_SLICE" "TasksMax=6000"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=8G"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=10G"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=4608M"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=5G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemorySwapMax=1G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "TasksMax=4096"
-grep -q "Measured margin" "$REPO_ROOT/systemd/automation.slice" \
-  || fail "automation.slice lacks measured-margin documentation"
-grep -q "Historical load" "$REPO_ROOT/systemd/host-docker/automation.slice" \
-  || fail "host-docker automation.slice lacks historical-load documentation"
-ok "finite slice budgets and measured-margin documentation"
+grep -q "measured margin" "$REPO_ROOT/systemd/agents.slice" || fail "agents.slice lacks measured margin documentation"
+grep -q "measured margin" "$REPO_ROOT/systemd/app-lima-vm.slice" || fail "app-lima-vm.slice lacks measured margin documentation"
+grep -q "measured margin" "$REPO_ROOT/systemd/automation.slice" || fail "automation.slice lacks measured margin documentation"
+ok "slice budgets and measured-margin documentation"
+# Every memory value is an integer unit (systemd and the Gate 8 bash helpers
+# both reject fractional sizes such as 4.5G).
+! grep -rEn '^Memory(High|Max|SwapMax)=[0-9]*\.[0-9]' "$REPO_ROOT/systemd" \
+  || fail "fractional memory value in tracked systemd policy"
+grep -q 'memory: "8GiB"' "$REPO_ROOT/install.sh" || fail "install.sh does not set the host-docker Lima guest to 8GiB"
+GUEST_ADMISSION="$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"
+assert_file "$GUEST_ADMISSION"
+assert_line "$GUEST_ADMISSION" "ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh"
+ok "host-docker guest admission guard tracked"
 
 LAUNCH="$REPO_ROOT/scripts/host/agent-scoped-launch.sh"
 assert_file "$LAUNCH"

@@ -3,10 +3,6 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export REPO_ROOT
-# Live bounds are mode-dependent (bead ez-gh-actions-154k): VM-backed keeps
-# 34G/38G, host-docker caps the qemu-only Colima VM at 9G/10G.  Pin the mode
-# so fixtures never depend on this host's docker daemon.
-export QEMU_CEILING_MODE=vm-backed
 out="$(bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh")"
 echo "$out" | grep -q 'PASS: tracked QEMU ceilings present' \
   || { echo "FAIL: expected tracked PASS, got: $out" >&2; exit 1; }
@@ -18,14 +14,12 @@ cp "${REPO_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   "$tmp/systemd/lima-vm@colima.service.d/"
 cp "${REPO_ROOT}/systemd/app-lima-vm.slice" "$tmp/systemd/"
 cp "${REPO_ROOT}/systemd/lima-vm-cpu-ceiling.service" "$tmp/systemd/"
-[ -d "${REPO_ROOT}/systemd/host-docker" ] \
-  || { echo "FAIL: missing tracked host-docker QEMU ceiling variants (systemd/host-docker)" >&2; exit 1; }
-cp -R "${REPO_ROOT}/systemd/host-docker" "$tmp/systemd/"
-# install.sh grep is required; copy a stub without CPUQuota to force FAIL.
+mkdir -p "$tmp"
+# Missing installer delegation must fail.
 printf '#!/bin/sh\n# no CPUQuota here\n' > "$tmp/install.sh"
 neg_rc=0
 neg_out="$(REPO_ROOT="$tmp" bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || neg_rc=$?
-[ "$neg_rc" -ne 0 ] || { echo "FAIL: stub install.sh without CPUQuota should fail" >&2; exit 1; }
+[ "$neg_rc" -ne 0 ] || { echo "FAIL: stub install.sh without helper delegation should fail" >&2; exit 1; }
 echo "$neg_out" | grep -q 'install.sh does not apply' \
   || { echo "FAIL: expected install.sh FAIL line, got: $neg_out" >&2; exit 1; }
 
@@ -46,8 +40,8 @@ printf '0::/user.slice/app.slice/lima-vm@colima.service\n' > "$PROC/4242/cgroup"
 printf '4242\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/cgroup.procs"
 printf '9999\n' > "$CG/user.slice/app.slice/unrelated.scope/cgroup.procs"
 printf '1600000 100000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/cpu.max"
-printf '30000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
-printf '38000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
+printf '9000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
+printf '10000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
 printf '2000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.swap.max"
 printf '4096\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/pids.max"
 for f in cpu.max memory.high memory.max memory.swap.max pids.max; do
@@ -173,38 +167,20 @@ sibling_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" 
 echo "$sibling_out" | grep -q 'cgroup path does not exist' \
   || { echo "FAIL: missing exact cgroup was not rejected: $sibling_out" >&2; exit 1; }
 
-# Negative bound: the exact cgroup exists but memory.max exceeds 38 GiB.
+# Negative bound: the exact cgroup exists but memory.max exceeds 10 GiB.
 mkdir -p "$CG/user.slice/app.slice/lima-vm@colima.service"
 printf '4242\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/cgroup.procs"
 printf '1600000 100000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/cpu.max"
-printf '30000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
+printf '9000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
 printf '42000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
 printf '2000000000\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.swap.max"
 printf '4096\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/pids.max"
 bound_rc=0
 bound_out="$(ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
   QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || bound_rc=$?
-[ "$bound_rc" -ne 0 ] || { echo "FAIL: memory.max above 38 GiB incorrectly passed" >&2; exit 1; }
+[ "$bound_rc" -ne 0 ] || { echo "FAIL: memory.max above 10 GiB incorrectly passed" >&2; exit 1; }
 echo "$bound_out" | grep -q 'memory.max=.*exceeds' \
   || { echo "FAIL: negative memory.max bound was not reported: $bound_out" >&2; exit 1; }
 
-# Host-docker mode: the same 38 GiB-class VM-backed values exceed the
-# 9G/10G host-docker bound, and the exact host-docker values pass.
-printf '36507222016\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
-printf '40802189312\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
-hd_rc=0
-hd_out="$(QEMU_CEILING_MODE=host-docker ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
-  QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || hd_rc=$?
-[ "$hd_rc" -ne 0 ] || { echo "FAIL: VM-backed 34G/38G passed the host-docker bound" >&2; exit 1; }
-echo "$hd_out" | grep -q 'memory.high=36507222016 exceeds 9663676416' \
-  || { echo "FAIL: host-docker bound not reported: $hd_out" >&2; exit 1; }
-printf '9663676416\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.high"
-printf '10737418240\n' > "$CG/user.slice/app.slice/lima-vm@colima.service/memory.max"
-hd_out="$(QEMU_CEILING_MODE=host-docker ASSERT_LIVE_QEMU=1 QEMU_PROC_ROOT="$PROC" QEMU_CGROUP_ROOT="$CG" \
-  QEMU_PID=4242 bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" \
-  || { echo "FAIL: exact host-docker 9G/10G rejected: $hd_out" >&2; exit 1; }
-bad_rc=0
-QEMU_CEILING_MODE=bogus bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" >/dev/null 2>&1 || bad_rc=$?
-[ "$bad_rc" -ne 0 ] || { echo "FAIL: unknown QEMU_CEILING_MODE accepted" >&2; exit 1; }
-
+bash "${REPO_ROOT}/tests/qemu_ceiling_guard_test.sh"
 echo "ASSERT_QEMU_CPU_CEILING_TEST: PASS"

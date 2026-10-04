@@ -1,23 +1,18 @@
-# app-lima-vm.slice — VM-backed QEMU ceiling.
+# app-lima-vm.slice — budget template for the Colima/Lima VM QEMU process.
+# Part of bead jleechan-aqh (apply and verify limits against the actual QEMU cgroup).
 #
 # Lima may place the VM in an escaped transient application slice rather than
 # this hierarchical unit. The canonical enforcement therefore also lives in
 # systemd/lima-vm@colima.service.d/99-memory-ceiling.conf, which install.sh
 # deploys directly on the service. Keep both values identical.
 #
-# These are the VM-backed values (runners inside Colima). A host-docker Linux
-# deployment uses systemd/host-docker/ (9G/10G); install.sh selects by mode.
-#
 # MemoryHigh provides the first response (throttle + reclaim under pressure);
 # MemoryMax is a finite final containment boundary for a runaway VM. This
 # ordering preserves normal operation while preventing unbounded host impact.
 #
-# Historical capture evidence recorded a 31.8 GiB normal QEMU RSS peak, leaving
-# a historical 2.2 GiB margin at MemoryHigh=34G. This is not a new measurement.
-# MemoryMax=38G is 6.2 GiB above that historical peak; current caps still
-# require admission and workload control and are not live-health proof.
-# the finite swap/task ceilings bound transient accounting and fork growth.
-# CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
+# MemoryHigh=9G provides a bounded soft ceiling with measured margin before the
+# MemoryMax=10G hard limit; the finite swap/task ceilings bound transient accounting
+# and fork growth. CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
 # (historical 24 is stale). This caps runnable QEMU time; D-state still counts
 # toward loadavg.
 #
@@ -26,16 +21,16 @@
 #   systemctl --user daemon-reload
 #   systemctl --user restart lima-vm@colima.service
 # Then verify:
-#   cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-lima\\x2dvm.slice/lima-vm@colima.service/memory.high
-# should print 36507222016 (= 34 GiB).
+#   cat /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/app-lima\x2dvm.slice/lima-vm@colima.service/memory.high
+# should print 9663676416 (= 9 GiB).
 
 [Unit]
-Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (34 GiB)
+Description=Colima/Lima VM QEMU process slice — enforced memory ceiling (9 GiB)
 Before=slices.target
 
 [Slice]
-MemoryHigh=34G
-MemoryMax=38G
+MemoryHigh=9G
+MemoryMax=10G
 MemorySwapMax=2G
 TasksMax=4096
 MemoryAccounting=yes

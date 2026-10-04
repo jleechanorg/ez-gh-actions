@@ -185,6 +185,48 @@ done
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
+CONFIG_PATH="${CONFIG_DIR}/config.toml"
+
+# Host containment has a bounded profile selector. The selected Linux profile is
+# read only after Docker is classified as native host Docker, so VM-contained
+# daemons do not need a host containment profile. A missing config is the
+# first-install case and uses the current default of 14; a present config must
+# explicitly contain a valid bounded runner.count so rollback cannot be hidden.
+read_config_runner_count() {
+  local config_path="$1"
+  if [ ! -f "${config_path}" ]; then
+    printf '14\n'
+    return 0
+  fi
+  python3 - "${config_path}" <<'PYCFG'
+import sys
+
+path = sys.argv[1]
+try:
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except ModuleNotFoundError:
+        import toml
+        data = toml.load(path)
+except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError):
+    print("invalid")
+    raise SystemExit(0)
+runner = data.get("runner")
+if not isinstance(runner, dict) or "count" not in runner:
+    print("invalid")
+else:
+    value = runner["count"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        print("invalid")
+    else:
+        print(value)
+PYCFG
+}
+
+RUNNER_COUNT=14
+
 LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 
 exec 9>"${LOCK_FILE}"
@@ -444,6 +486,17 @@ if [ "$(uname -s)" = "Linux" ]; then
   docker_mode="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${docker_endpoint}")"     || { bad "cannot classify selected Docker endpoint"; exit 1; }
   if [ "${docker_mode}" = host-docker ]; then
     HOST_DOCKER_MODE=1
+    RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
+      bad "could not read runner.count from ${CONFIG_PATH}"
+      exit 1
+    }
+    case "${RUNNER_COUNT}" in
+      10|14) ;;
+      *)
+        bad "runner.count must be 10 or 14 on Linux (got ${RUNNER_COUNT})"
+        exit 1
+        ;;
+    esac
     # Host Docker keeps runners under actions.slice and sets the Colima guest
     # to an 8GiB allocation. lima-vm@colima starts from this lima.yaml; the
     # 10G QEMU ceiling remains refused until the running guest matches.
@@ -469,9 +522,11 @@ if [ "$(uname -s)" = "Linux" ]; then
       "${HOST_POLICY_DIR}/systemd/host/user-.slice.d" \
       "${HOST_POLICY_DIR}/systemd/host/user@.service.d" \
       "${HOST_POLICY_DIR}/systemd/user/app.slice.d" \
-      "${HOST_POLICY_DIR}/systemd/user/session.slice.d"
+      "${HOST_POLICY_DIR}/systemd/user/session.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/lima-vm@colima.service.d"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/qemu-ceiling-guard.sh" "${HOST_CONTROL_DIR}/qemu-ceiling-guard.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
     mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d" \
       "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"
@@ -483,29 +538,23 @@ if [ "$(uname -s)" = "Linux" ]; then
     "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
       bad "host-docker guest admission failed before host containment activation"; exit 1;
     }
-    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf; do
+    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done
-    # The staged policy is consumed by the host-docker activation scripts;
-    # retain their approved 10G/12G and 4608M/5G envelope rather than copying
-    # the VM-backed base units.
-    for unit in agents.slice automation.slice; do
-      install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/${unit}" "${HOST_POLICY_DIR}/systemd/${unit}"
-    done
     if sudo -n true >/dev/null 2>&1; then
-      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
     elif command -v pkexec >/dev/null 2>&1; then
-      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
     else
       bad "host containment root phase requires sudo or pkexec"
       exit 1
     fi
-    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" || { bad "host containment user phase failed after root policy activation"; exit 1; }
+    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --runner-count "${RUNNER_COUNT}" || { bad "host containment user phase failed after root policy activation"; exit 1; }
     ok "host containment activated before binary replacement"
   else
     # A previous host-docker installation adds admission guards that enforce
-    # its 8GiB guest contract. VM-backed mode retains the independent 34G/38G
-    # QEMU policy, so remove only those exact guards before installation.
+    # its 8GiB guest contract. VM-backed mode does not use that guest
+    # contract, so remove only those exact guards before installation.
     rm -f "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
           "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
     systemctl --user daemon-reload || { bad "could not unload host-docker guest admission guards"; exit 1; }
@@ -589,7 +638,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 # ── Auto-install or restart ezgha service if config exists ────────────────────
-CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
 if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
@@ -810,32 +858,26 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh lima-guest-memory-check.sh; do
+    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh qemu-ceiling-guard.sh lima-guest-memory-check.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
     done
 
-    SLICE_POLICY_DIR="${UNIT_DIR}"
-    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
-      SLICE_POLICY_DIR="${UNIT_DIR}/host-docker"
-    fi
-    for unit in agents.slice automation.slice; do
-      install -m 0644 "${SLICE_POLICY_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" || {
+      bad "refusing to install QEMU ceiling: live usage exceeds threshold or cgroup is unreadable"
+      exit 1
+    }
+    for unit in app-lima-vm.slice agents.slice automation.slice; do
+      install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
-    # QEMU ceilings follow deployment mode: VM-backed runners use 34G/38G;
-    # host-docker uses 9G/10G for its 8GiB guest only after the guest check
-    # passes, otherwise the existing ceiling is left unchanged.
-    VM_CEILING_DIR="${UNIT_DIR}"
-    VM_CEILING_PROPS="MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
-    APPLY_VM_CEILING=1
+    # Host-docker mode also requires the 8GiB guest contract before the 10G
+    # QEMU ceiling is installed; the early containment phase enforced it too.
     if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
-      VM_CEILING_DIR="${UNIT_DIR}/host-docker"
-      VM_CEILING_PROPS="MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%"
-      if ! "${SCRIPTS_DIR}/lima-guest-memory-check.sh"; then
-        APPLY_VM_CEILING=0
-        warn "host-docker QEMU ceiling not lowered; existing ceiling left unchanged"
-      fi
+      "${SCRIPTS_DIR}/lima-guest-memory-check.sh" || {
+        bad "refusing to install QEMU ceiling: host-docker guest admission failed"
+        exit 1
+      }
     fi
     # agent-scope-reaper was deleted (it killed live cursor-agent, bead
     # ez-gh-actions-8o81): heal any previously installed copy.
@@ -859,16 +901,12 @@ FSTRIM_EOF
         "${UNIT_DIR}/${service}.service.d/20-automation-slice.conf" \
         "${dropin_dir}/20-automation-slice.conf"
     done
-    if [ "${APPLY_VM_CEILING}" -eq 1 ]; then
-      mkdir -p "${USER_UNIT_DIR}/lima-vm@colima.service.d"
-      install -m 0644 "${VM_CEILING_DIR}/app-lima-vm.slice" "${USER_UNIT_DIR}/app-lima-vm.slice"
-      install -m 0644 \
-        "${VM_CEILING_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
-        "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-      install -m 0644 \
-        "${VM_CEILING_DIR}/lima-vm-cpu-ceiling.service" \
-        "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
-    fi
+    mkdir -p "${USER_UNIT_DIR}/lima-vm@colima.service.d"
+    install -m 0644 \
+      "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+      "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+    sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+        "${UNIT_DIR}/lima-vm-cpu-ceiling.service" > "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
 
     # Docker's --cgroup-parent=actions.slice places every runner beneath one
     # guest aggregate. Install the tracked slice inside Colima so ten
@@ -937,16 +975,11 @@ EOF
     rm -f "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
 
     systemctl --user daemon-reload 2>/dev/null || { bad "could not reload installed user units"; exit 1; }
-    # Reapply the selected budgets after copying the unit files. A prior
+    # Reapply the tracked budgets after copying the unit files. A prior
     # systemctl --user set-property writes user.control drop-ins that survive
-    # unit replacement, so the selected mode must win during every install.
-    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
-      AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192)
-      AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
-    else
-      AGENTS_SLICE_PROPS=(MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192)
-      AUTOMATION_SLICE_PROPS=(MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096)
-    fi
+    # unit replacement, so the tracked values must win during every install.
+    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192)
+    AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
     if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
       bad "could not apply selected agents.slice budget"
       exit 1
@@ -958,21 +991,15 @@ EOF
     # Apply the direct QEMU ceiling to an already-running Colima service.
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.
-    # shellcheck disable=SC2086 # VM_CEILING_PROPS is a property list
-    if [ "${APPLY_VM_CEILING}" -eq 0 ]; then
-      warn "live QEMU ceiling unchanged until the colima guest runs at <= 8GiB"
-    elif systemctl --user set-property --runtime lima-vm@colima.service \
-         ${VM_CEILING_PROPS} 2>/dev/null; then
-      ok "live QEMU service memory+CPU ceiling applied (${VM_CEILING_PROPS})"
-    else
-      warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
-    fi
-    if [ "${APPLY_VM_CEILING}" -eq 1 ] && systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --apply || {
+      bad "failed to apply and verify live QEMU service memory+CPU ceiling"
+      exit 1
+    }
+    if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
       ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
-    elif [ "${APPLY_VM_CEILING}" -eq 0 ]; then
-      warn "lima-vm-cpu-ceiling.service not enabled while guest-memory check refuses the 10G ceiling"
     else
-      warn "lima-vm-cpu-ceiling.service not enabled"
+      bad "lima-vm-cpu-ceiling.service not enabled"
+      exit 1
     fi
     for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then

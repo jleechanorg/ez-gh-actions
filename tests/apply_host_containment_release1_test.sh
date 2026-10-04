@@ -15,6 +15,9 @@ bash -n "$APPLY_SCRIPT" || fail "syntax error in scripts/host/apply-host-contain
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+grep -q -- '--runner-count' "$APPLY_SCRIPT" || fail "apply script does not expose the bounded runner-count selector"
+grep -q 'TasksMax=8000' "$APPLY_SCRIPT" || fail "apply script does not render the 14-runner TasksMax=8000 profile"
+grep -q 'TasksMax=6000' "$APPLY_SCRIPT" || fail "apply script does not retain the 10-runner TasksMax=6000 rollback profile"
 
 set_slice_mem() { # root slice current file shmem
   printf '%s\n' "$3" > "$1/sys/fs/cgroup/$2/memory.current"
@@ -22,9 +25,15 @@ set_slice_mem() { # root slice current file shmem
 }
 
 setup_fixture() {
-  local root="$1"
+  local root="$1" runner_count="${2:-14}" pids_max
+  case "$runner_count" in
+    10) pids_max=6000 ;;
+    14) pids_max=8000 ;;
+    *) fail "test fixture does not support runner count $runner_count" ;;
+  esac
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
            "$root/sys/fs/cgroup/agents.slice" "$root/sys/fs/cgroup/automation.slice" \
+           "$root/sys/fs/cgroup/app-lima-vm.slice" "$root/sys/fs/cgroup/lima-vm@colima.service" \
            "$root/etc/systemd/system" "$root/etc/systemd/user" \
            "$root/bin" "$root/var/lock"
 
@@ -32,16 +41,18 @@ setup_fixture() {
   printf '0-31\n' > "$root/sys/devices/system/cpu/online"
   printf 'cpuset cpu io memory pids\n' > "$root/sys/fs/cgroup/cgroup.controllers"
 
-  # Current use under the host-docker thresholds: non-reclaimable
+  # Current use under the 10G/4.5G/9G thresholds; non-reclaimable
   # (memory.current - (file - shmem)) <= new MemoryHigh - 1 GiB.
   set_slice_mem "$root" agents.slice 5368709120 2147483648 0
   set_slice_mem "$root" automation.slice 1073741824 0 0
+  printf '1073741824\n' > "$root/sys/fs/cgroup/app-lima-vm.slice/memory.current"
+  printf '1073741824\n' > "$root/sys/fs/cgroup/lima-vm@colima.service/memory.current"
 
   # Staged actions.slice cgroup values
   printf '27917287424\n' > "$root/sys/fs/cgroup/actions.slice/memory.high"
   printf '30064771072\n' > "$root/sys/fs/cgroup/actions.slice/memory.max"
   printf '0\n' > "$root/sys/fs/cgroup/actions.slice/memory.swap.max"
-  printf '8000\n' > "$root/sys/fs/cgroup/actions.slice/pids.max"
+  printf '%s\n' "$pids_max" > "$root/sys/fs/cgroup/actions.slice/pids.max"
   printf '2000000 100000\n' > "$root/sys/fs/cgroup/actions.slice/cpu.max"
   printf 'default 25\n' > "$root/sys/fs/cgroup/actions.slice/io.weight"
   printf '5368709120\n' > "$root/sys/fs/cgroup/actions.slice/memory.current"
@@ -79,14 +90,30 @@ setup_fixture "$PASS_ROOT"
 SYSTEMCTL_LOG="$WORK/pass_sys.log" PATH="$PASS_ROOT/bin:$PATH" \
   "$APPLY_SCRIPT" --root "$PASS_ROOT" || fail "apply-host-containment-release1.sh failed on clean fixture"
 
+ROLLBACK_ROOT="$WORK/rollback"
+setup_fixture "$ROLLBACK_ROOT" 10
+SYSTEMCTL_LOG="$WORK/rollback_sys.log" PATH="$ROLLBACK_ROOT/bin:$PATH" \
+  "$APPLY_SCRIPT" --root "$ROLLBACK_ROOT" --runner-count 10 \
+  || fail "apply-host-containment-release1.sh failed for explicit 10-runner rollback"
+ok "apply-host-containment-release1.sh applies the explicit 10-runner rollback profile"
+INVALID_ROOT="$WORK/invalid"
+setup_fixture "$INVALID_ROOT"
+if PATH="$INVALID_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$INVALID_ROOT" --runner-count 12 > "$WORK/invalid.log" 2>&1; then
+  fail "apply-host-containment-release1.sh accepted unsupported runner count 12"
+fi
+[ ! -f "$INVALID_ROOT/etc/systemd/system/actions.slice" ] || fail "invalid runner count mutated the fixture before failing"
+ok "apply-host-containment-release1.sh rejects invalid runner count before writes"
+
 [ -f "$PASS_ROOT/etc/systemd/system/actions.slice" ] || fail "actions.slice was not staged to system units"
 [ -f "$PASS_ROOT/etc/systemd/system/-.slice.d/99-ezgha-containment.conf" ] || fail "-.slice.d drop-in not staged"
 [ -f "$PASS_ROOT/etc/systemd/system/user@.service.d/99-ezgha-containment.conf" ] || fail "user@.service.d drop-in not staged"
 [ -f "$PASS_ROOT/etc/systemd/user/agents.slice" ] || fail "agents.slice not staged to user units"
 [ -f "$PASS_ROOT/etc/systemd/user/automation.slice" ] || fail "automation.slice not staged to user units"
-grep -Fq "MemoryHigh=10G" "$PASS_ROOT/etc/systemd/user/agents.slice"   || fail "direct repo caller selected the VM-backed agents.slice policy"
-grep -Fq "MemoryHigh=4608M" "$PASS_ROOT/etc/systemd/user/automation.slice"   || fail "direct repo caller selected the VM-backed automation.slice policy"
-ok "apply-host-containment-release1.sh stages host-docker user-slice policies and boundary drop-ins"
+[ -f "$PASS_ROOT/etc/systemd/user/app-lima-vm.slice" ] || fail "app-lima-vm.slice not staged to user units"
+[ -f "$PASS_ROOT/etc/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ] || fail "QEMU service drop-in not staged to user units"
+grep -Fq "MemoryHigh=10G" "$PASS_ROOT/etc/systemd/user/agents.slice" || fail "agents.slice staged without the tracked 10G policy"
+grep -Fq "MemoryHigh=4608M" "$PASS_ROOT/etc/systemd/user/automation.slice" || fail "automation.slice staged without the tracked 4608M policy"
+ok "apply-host-containment-release1.sh stages policy artifacts and boundary drop-ins"
 
 # Verify [Install] produces persistent boot wiring without touching the host unit graph.
 HOST_SYSTEMCTL="$(PATH=/usr/sbin:/usr/bin:/sbin:/bin command -v systemctl || true)"
@@ -101,12 +128,12 @@ if [ -n "$HOST_SYSTEMCTL" ]; then
   ok "actions.slice enable creates isolated persistent slices.target boot wiring"
 fi
 
-# 2. Pre-mutation gate: memory below floor
+# 2. Pre-mutation gate: memory below computed floor
 MEM_FAIL_ROOT="$WORK/mem_fail"
 setup_fixture "$MEM_FAIL_ROOT"
-printf 'MemTotal:       65011711 kB\n' > "$MEM_FAIL_ROOT/proc/meminfo"
+printf 'MemTotal:       64079643 kB\n' > "$MEM_FAIL_ROOT/proc/meminfo"
 if PATH="$MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_FAIL_ROOT" > "$WORK/mem_fail.log" 2>&1; then
-  fail "apply-host-containment-release1.sh passed when MemTotal was below floor"
+  fail "apply-host-containment-release1.sh passed when MemTotal was below computed floor"
 fi
 [ ! -f "$MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before memory check passed"
 ok "apply-host-containment-release1.sh aborts before mutation when memory is below floor"
@@ -114,6 +141,7 @@ ok "apply-host-containment-release1.sh aborts before mutation when memory is bel
 # 3. Pre-mutation gate: non-reclaimable use of each user slice must sit
 #    at least 1 GiB below its new MemoryHigh (agents 10G, automation 4608M).
 G=1073741824
+M=1048576
 preflight_case() { # name slice current file shmem expect(pass|refuse)
   local root="$WORK/preflight_$1"
   setup_fixture "$root"
@@ -127,17 +155,19 @@ preflight_case() { # name slice current file shmem expect(pass|refuse)
     grep -q "$2" "$WORK/preflight_$1.log" || fail "preflight $1 refusal does not name $2"
   fi
 }
-# 15G current minus 6G reclaimable cache reaches the 9G admission threshold.
-preflight_case agents_cache agents.slice $((15 * G)) $((6 * G)) 0 pass
-# 12G current minus 1G reclaimable cache exceeds the 9G admission threshold.
-preflight_case agents_anon agents.slice $((12 * G)) $((1 * G)) 0 refuse
-grep -q "agents.slice non-reclaimable 11811160064 bytes > 9663676416" "$WORK/preflight_agents_anon.log" \
+# Every case stays below the raw MemoryHigh guard (agents 10G, automation
+# 4608M) so only the non-reclaimable rule decides.
+# 9.5G current minus 1G reclaimable cache stays under the 9G admission threshold.
+preflight_case agents_cache agents.slice $((9728 * M)) $((1024 * M)) 0 pass
+# 9.5G current minus 205M reclaimable cache exceeds the 9G admission threshold.
+preflight_case agents_anon agents.slice $((9728 * M)) $((205 * M)) 0 refuse
+grep -q "agents.slice non-reclaimable 9985589248 bytes > 9663676416" "$WORK/preflight_agents_anon.log" \
   || fail "agents refusal lacks the measured numbers: $(tail -2 "$WORK/preflight_agents_anon.log")"
-# shmem is not reclaimable: 16G current, 6G file of which 3G shmem -> 13G refuses.
-preflight_case agents_shmem agents.slice $((16 * G)) $((6 * G)) $((3 * G)) refuse
-# automation: 4G minus 0.5G cache meets admission; 5G minus 0.5G refuses.
-preflight_case automation_cache automation.slice $((4 * G)) $((G / 2)) 0 pass
-preflight_case automation_anon automation.slice $((5 * G)) $((G / 2)) 0 refuse
+# shmem is not reclaimable: 9.5G current, 1G file of which 700M shmem -> 9404M refuses.
+preflight_case agents_shmem agents.slice $((9728 * M)) $((1024 * M)) $((700 * M)) refuse
+# automation: 4G minus 0.5G cache meets the 3.5G admission threshold; 4500M minus 0.5G refuses.
+preflight_case automation_cache automation.slice $((4096 * M)) $((512 * M)) 0 pass
+preflight_case automation_anon automation.slice $((4500 * M)) $((512 * M)) 0 refuse
 ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its non-reclaimable use and changes nothing"
 
 # 3b. Lima guest memory gate: the host-docker QEMU ceiling (9G/10G) is only
@@ -373,6 +403,59 @@ fi
 grep -q 'capped unit' "$WORK/dual_empty_control_group.log" \
   || fail "empty ControlGroup refusal did not identify missing ownership"
 
+MEM_BOUNDARY_ROOT="$WORK/mem_boundary"
+setup_fixture "$MEM_BOUNDARY_ROOT"
+printf 'MemTotal:       64079644 kB\n' > "$MEM_BOUNDARY_ROOT/proc/meminfo"
+PATH="$MEM_BOUNDARY_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_BOUNDARY_ROOT" > "$WORK/mem_boundary.log" 2>&1   || fail "apply-host-containment-release1.sh failed when MemTotal was at exact computed floor"
+ok "apply-host-containment-release1.sh succeeds when memory is at exact computed floor"
+
+# 3c. Pre-mutation gate: current agent memory usage >= 10G
+AGENT_MEM_FAIL_ROOT="$WORK/agent_mem_fail"
+setup_fixture "$AGENT_MEM_FAIL_ROOT"
+# 10 GiB current usage
+printf '10737418240\n' > "$AGENT_MEM_FAIL_ROOT/sys/fs/cgroup/agents.slice/memory.current"
+if PATH="$AGENT_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AGENT_MEM_FAIL_ROOT" > "$WORK/agent_mem.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when current agent memory usage was at high limit"
+fi
+[ ! -f "$AGENT_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before agent memory check"
+ok "apply-host-containment-release1.sh aborts before mutation when current agent use >= 10G"
+
+# 3d. Pre-mutation gate: current automation memory usage >= 4.5G
+AUTO_MEM_FAIL_ROOT="$WORK/auto_mem_fail"
+setup_fixture "$AUTO_MEM_FAIL_ROOT"
+# 4.5 GiB current usage (4608M = 4831838208 bytes)
+printf '4831838208\n' > "$AUTO_MEM_FAIL_ROOT/sys/fs/cgroup/automation.slice/memory.current"
+if PATH="$AUTO_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$AUTO_MEM_FAIL_ROOT" > "$WORK/auto_mem.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when current automation memory usage was at high limit"
+fi
+[ ! -f "$AUTO_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before automation memory check"
+ok "apply-host-containment-release1.sh aborts before mutation when current automation use >= 4.5G"
+
+# 3e. Pre-mutation gate: current QEMU memory usage >= 9G (proof of highusage no writes)
+QEMU_MEM_FAIL_ROOT="$WORK/qemu_mem_fail"
+setup_fixture "$QEMU_MEM_FAIL_ROOT"
+mkdir -p "$QEMU_MEM_FAIL_ROOT/sys/fs/cgroup/lima-vm@colima.service"
+# 9 GiB current usage
+printf '9663676416\n' > "$QEMU_MEM_FAIL_ROOT/sys/fs/cgroup/lima-vm@colima.service/memory.current"
+if PATH="$QEMU_MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$QEMU_MEM_FAIL_ROOT" > "$WORK/qemu_mem.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when current QEMU memory usage was at high limit"
+fi
+[ ! -f "$QEMU_MEM_FAIL_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files before QEMU memory check"
+[ ! -f "$QEMU_MEM_FAIL_ROOT/etc/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ] || fail "wrote drop-in when QEMU memory was at high limit"
+ok "apply-host-containment-release1.sh aborts before mutation when current QEMU use >= 9G (proof highusage no writes)"
+
+# 3f. Pre-mutation gate: missing/unreadable current usage refusal for active service
+QEMU_UNREADABLE_ROOT="$WORK/qemu_unreadable"
+setup_fixture "$QEMU_UNREADABLE_ROOT"
+# Active cgroup directory exists but memory.current is missing
+rm -f "$QEMU_UNREADABLE_ROOT/sys/fs/cgroup/lima-vm@colima.service/memory.current"
+if CONTAINMENT_ACTIVE_UNITS="lima-vm@colima.service" PATH="$QEMU_UNREADABLE_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$QEMU_UNREADABLE_ROOT" > "$WORK/qemu_unreadable.log" 2>&1; then
+  fail "apply-host-containment-release1.sh passed when active QEMU service lacked memory.current"
+fi
+[ ! -f "$QEMU_UNREADABLE_ROOT/etc/systemd/system/actions.slice" ] || fail "staged files when active QEMU service memory.current was missing"
+[ ! -f "$QEMU_UNREADABLE_ROOT/etc/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ] || fail "wrote dropin when active QEMU memory.current missing"
+ok "apply-host-containment-release1.sh refuses activation when active service memory.current is missing/unreadable"
+
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
 setup_fixture "$ACTIONS_MEM_FAIL_ROOT"
@@ -394,26 +477,48 @@ setup_fixture "$LIVE_ROOT"
 uid="$(id -u)"
 cat > "$WORK/live_props.txt" <<PROPS
 lima-vm@colima.service ControlGroup
+agents.slice ActiveState active
+automation.slice ActiveState active
+app-lima-vm.slice ActiveState active
+actions.slice ManagedOOMMemoryPressure kill
+actions.slice ManagedOOMMemoryPressureLimit 3435973836
+actions.slice ManagedOOMSwap auto
+lima-vm@colima.service ActiveState active
 agents.slice MemoryHigh 10737418240
 agents.slice MemoryMax 12884901888
 agents.slice MemorySwapMax 2147483648
+agents.slice TasksMax 8192
+agents.slice ManagedOOMMemoryPressure auto
+agents.slice ManagedOOMSwap auto
 automation.slice MemoryHigh 4831838208
 automation.slice MemoryMax 5368709120
 automation.slice MemorySwapMax 1073741824
+automation.slice TasksMax 4096
+automation.slice ManagedOOMMemoryPressure auto
+automation.slice ManagedOOMSwap auto
+lima-vm@colima.service MemoryHigh 9663676416
+lima-vm@colima.service MemoryMax 10737418240
+lima-vm@colima.service MemorySwapMax 2147483648
+lima-vm@colima.service TasksMax 4096
+lima-vm@colima.service CPUQuotaPerSecUSec 16s
+lima-vm@colima.service CPUQuota 1600%
 user@${uid}.service ManagedOOMMemoryPressure auto
 user@${uid}.service ManagedOOMSwap auto
 user@${uid}.service ManagedOOMPreference none
 user@${uid}.service OOMScoreAdjust 0
 -.slice ManagedOOMMemoryPressure auto
+-.slice ManagedOOMSwap auto
 user.slice ManagedOOMMemoryPressure auto
-actions.slice ManagedOOMMemoryPressure kill
-actions.slice ManagedOOMMemoryPressureLimit 3435973836
+user.slice ManagedOOMSwap auto
 app.slice ManagedOOMMemoryPressure auto
+app.slice ManagedOOMSwap auto
 session.slice ManagedOOMMemoryPressure auto
+session.slice ManagedOOMSwap auto
 PROPS
 cat > "$LIVE_ROOT/bin/systemctl" <<'SHIM'
 #!/usr/bin/env bash
 echo "systemctl $*" >> "${SYSTEMCTL_LOG:-/dev/null}"
+[ "${QUERY_FAIL:-0}" = 0 ] || exit 1
 prop="" unit="" show=0
 for a in "$@"; do [ "$a" = show ] && show=1; done
 [ "$show" = 1 ] || exit 0
@@ -421,7 +526,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -p) prop="$2"; shift 2 ;;
     --) unit="$2"; shift 2 ;;
-    *) shift ;;
+    --*) shift ;;
+    show|--user) shift ;;
+    *) unit="$1"; shift ;;
   esac
 done
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
@@ -443,4 +550,13 @@ grep -Fqx '    systemctl set-property actions.slice ManagedOOMMemoryPressure=kil
   || fail "agents/automation.slice must not be enrolled with oomd kill"
 ok "apply-host-containment-release1.sh enrolls only actions.slice with oomd kill"
 
+QUERY_ROOT="$WORK/query_failure"
+setup_fixture "$QUERY_ROOT"
+cp "$LIVE_ROOT/bin/systemctl" "$QUERY_ROOT/bin/systemctl"
+if QUERY_FAIL=1 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMCTL_LOG="$WORK/query.log" PATH="$QUERY_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$QUERY_ROOT" > "$WORK/query.out" 2>&1; then
+  fail "failed ActiveState query accepted"
+fi
+[ ! -f "$QUERY_ROOT/etc/systemd/system/actions.slice" ] || fail "failed query wrote policy"
+if grep -q set-property "$WORK/query.log"; then fail "failed query wrote limits"; fi
+grep -q 'cannot query agents.slice ActiveState' "$WORK/query.out" || fail "query failure did not reach intended gate"
 echo "APPLY_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

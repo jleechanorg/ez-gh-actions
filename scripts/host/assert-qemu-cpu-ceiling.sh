@@ -8,24 +8,16 @@
 # (default: /sys/fs/cgroup).  It never scans for, or falls back to, a sibling
 # slice: a bounded unrelated QEMU/cgroup must not make this check pass.
 #
-# The ceiling is deployment-mode dependent:
-# vm-backed (runners inside Colima) 34G/38G from systemd/, host-docker (Colima
-# runs an 8 GiB guest) 9G/10G from systemd/host-docker/.
-# Both tracked variants are always checked; QEMU_CEILING_MODE selects the live
-# bound (default: host-docker when the Docker daemon shares this kernel).
+# The tracked ceiling is 9G/10G in every deployment mode (systemd/).
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
-
-if [ -z "${QEMU_CEILING_MODE:-}" ]; then
-  QEMU_CEILING_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh")"
-fi
-case "$QEMU_CEILING_MODE" in
-  vm-backed) QEMU_MAX_HIGH=$((34 * 1024 * 1024 * 1024)); QEMU_MAX_MAX=$((38 * 1024 * 1024 * 1024)) ;;
-  host-docker) QEMU_MAX_HIGH=$((9 * 1024 * 1024 * 1024)); QEMU_MAX_MAX=$((10 * 1024 * 1024 * 1024)) ;;
-  *) fail "unknown QEMU_CEILING_MODE=${QEMU_CEILING_MODE} (expected vm-backed or host-docker)" ;;
-esac
+QEMU_MAX_HIGH=$((9 * 1024 * 1024 * 1024))
+QEMU_MAX_MAX=$((10 * 1024 * 1024 * 1024))
+DROPIN="${REPO_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+SLICE="${REPO_ROOT}/systemd/app-lima-vm.slice"
+RUNTIME_UNIT="${REPO_ROOT}/systemd/lima-vm-cpu-ceiling.service"
 
 assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_line() {
@@ -33,33 +25,25 @@ assert_line() {
   grep -Fqx "$line" "$file" || fail "$file missing exact line: $line"
 }
 
-for mode in vm-backed host-docker; do
-  case "$mode" in
-    vm-backed) dir="${REPO_ROOT}/systemd"; high=MemoryHigh=34G; max=MemoryMax=38G ;;
-    host-docker) dir="${REPO_ROOT}/systemd/host-docker"; high=MemoryHigh=9G; max=MemoryMax=10G ;;
-  esac
-  DROPIN="${dir}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-  SLICE="${dir}/app-lima-vm.slice"
-  RUNTIME_UNIT="${dir}/lima-vm-cpu-ceiling.service"
-  assert_file "$DROPIN"
-  assert_file "$SLICE"
-  assert_file "$RUNTIME_UNIT"
-  for file in "$DROPIN" "$SLICE"; do
-    assert_line "$file" "$high"
-    assert_line "$file" "$max"
-    assert_line "$file" "MemorySwapMax=2G"
-    assert_line "$file" "TasksMax=4096"
-    assert_line "$file" "CPUQuota=1600%"
-  done
-  assert_line "$DROPIN" "CPUAccounting=yes"
-  # install.sh must apply the same finite values to a transient service after a
-  # Colima restart; these are static text checks and do not execute install.sh.
-  for setting in "$high" "$max" MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-    grep -Fq "$setting" "${REPO_ROOT}/install.sh" \
-      || fail "install.sh does not apply $mode $setting"
-    grep -Fq "$setting" "$RUNTIME_UNIT" \
-      || fail "$RUNTIME_UNIT missing $setting"
-  done
+assert_file "$DROPIN"
+assert_file "$SLICE"
+assert_file "$RUNTIME_UNIT"
+for file in "$DROPIN" "$SLICE"; do
+  assert_line "$file" "MemoryHigh=9G"
+  assert_line "$file" "MemoryMax=10G"
+  assert_line "$file" "MemorySwapMax=2G"
+  assert_line "$file" "TasksMax=4096"
+  assert_line "$file" "CPUQuota=1600%"
+done
+assert_line "$DROPIN" "CPUAccounting=yes"
+# All callers use the same guarded runtime writer.
+assert_line "$RUNTIME_UNIT" 'ExecStart=@SCRIPTS_DIR@/qemu-ceiling-guard.sh --apply'
+grep -Fq '"${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --apply' "${REPO_ROOT}/install.sh" \
+  || fail "install.sh does not apply the shared QEMU guard"
+GUARD="${REPO_ROOT}/scripts/host/qemu-ceiling-guard.sh"
+assert_file "$GUARD"
+for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
+  grep -Fq "$setting" "$GUARD" || fail "$GUARD missing $setting"
 done
 
 if [ "${ASSERT_LIVE_QEMU:-0}" != "1" ]; then
