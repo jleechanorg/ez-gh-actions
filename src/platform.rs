@@ -8,7 +8,17 @@ use std::time::Duration;
 /// docker daemon (the common failure mode this tool exists to contain) would
 /// otherwise hang `detect()` — and therefore every ezgha command — forever.
 /// On expiry we kill the probe and treat the capability as absent.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+///
+/// Raised 2026-10-03 from 4s → 8s after a real Colima VM measured
+/// `docker version` 4.99s and `docker info KernelVersion` 5.15s while
+/// within its own deadline (Mac, docker daemon reattaching after a
+/// transient). A 4s ceiling misclassified those legitimate answers as
+/// "unsupported VM" and tripped the cpu_burst Err path in
+/// `effective_limits`, opening per-slot start circuits while the daemon
+/// itself was healthy. 8s leaves room for the observed 5.15s case while
+/// still bounding a truly wedged daemon — the `unknown => reject`
+/// semantics in `effective_limits` are preserved.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Build a Docker command for the endpoint selected during installation.
 /// Services persist that endpoint in `DOCKER_HOST_OVERRIDE`; interactive
@@ -117,18 +127,24 @@ pub fn detect() -> Platform {
     }
 }
 
-/// A daemon kernel different from the host kernel proves the daemon runs on a
-/// different machine — in practice a local VM (Colima/Lima/Docker Desktop) or
-/// a remote host. On macOS the daemon is always in a VM (macOS has no native
-/// Linux containers), so any Linux daemon kernel counts.
+/// VM-containment proof via the docker daemon's own kernel string.
+/// Returns `true` only when a real `docker info --format {{.KernelVersion}}`
+/// succeeds AND, on Linux, the daemon kernel differs from the host kernel
+/// (`uname -r`). On macOS the daemon is always in a VM (no native Linux
+/// containers) so any non-empty daemon kernel counts — but the daemon
+/// kernel probe must STILL succeed first; an unreachable daemon returns
+/// `false` rather than a stale "Darwin implies VM" true (regression
+/// 2026-10-03 review: the old `cfg!(target_os = "macos")` short-circuit
+/// silently admitted burst on a host whose docker daemon was unreachable,
+/// which `effective_limits`'s burst path would then have passed through).
 fn daemon_in_vm() -> bool {
     let mut docker_info = docker_command();
     docker_info.args(["info", "--format", "{{.KernelVersion}}"]);
-    let daemon_kernel = capture(docker_info)
+    let Some(daemon_kernel) = capture(docker_info)
         .filter(|(ok, _)| *ok)
         .map(|(_, out)| String::from_utf8_lossy(&out).trim().to_string())
-        .filter(|s| !s.is_empty());
-    let Some(daemon_kernel) = daemon_kernel else {
+        .filter(|s| !s.is_empty())
+    else {
         return false;
     };
     if cfg!(target_os = "macos") {
@@ -136,13 +152,22 @@ fn daemon_in_vm() -> bool {
     }
     let mut uname = Command::new("uname");
     uname.arg("-r");
-    let host_kernel = capture(uname)
+    let Some(host_kernel) = capture(uname)
         .filter(|(ok, _)| *ok)
-        .map(|(_, out)| String::from_utf8_lossy(&out).trim().to_string());
-    match host_kernel {
-        Some(h) => !h.is_empty() && h != daemon_kernel,
-        None => false,
-    }
+        .map(|(_, out)| String::from_utf8_lossy(&out).trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    host_kernel != daemon_kernel
+}
+
+/// Public, narrow VM-containment probe used by `effective_limits` for
+/// the cpu_burst admission guard. Same semantics as `daemon_in_vm`;
+/// exposed `pub` so the production guard test can exercise the actual
+/// probe path.
+pub fn daemon_in_vm_only() -> bool {
+    daemon_in_vm()
 }
 
 /// Existence alone is not enough: the user must be in the kvm group (or have
@@ -237,6 +262,33 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "timeout should fire near the deadline, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn capture_succeeds_for_5s_probe_under_8s_ceiling() {
+        // Real Colima VM measured `docker info KernelVersion` at 5.15s
+        // (2026-10-03) — must NOT be killed by the platform probe ceiling.
+        // 5s sits between the old 4s ceiling (would have killed it) and
+        // the new 8s ceiling (must succeed). If this regression flips
+        // the ceiling back to 4s, this test starts failing immediately.
+        // Only the lower bound is pinned: the upper bound is
+        // scheduler-sensitive (heavy host load can let `sleep 5` drift
+        // past 5s wall-clock) and the Some(...) outcome already proves
+        // the ceiling was respected.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let start = Instant::now();
+        let result = capture_with_timeout(cmd, PROBE_TIMEOUT);
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_some(),
+            "5s probe under the 8s PROBE_TIMEOUT must return Some, not be killed (elapsed={elapsed:?})"
+        );
+        assert!(
+            elapsed.as_secs() >= 4,
+            "5s probe must survive past the OLD 4s ceiling (elapsed={elapsed:?}); \
+             a regression here means the ceiling was lowered back to 4s"
         );
     }
 }
