@@ -111,7 +111,15 @@ else:
         data = tomllib.load(f)
 
 value = data["runner"].get(key, default)
-print(value)
+# Render booleans as TOML-spec lowercase (not Python's True/False) so the
+# downstream gate can compare against 'true'/'false' without parsing.
+# Strings/nums print unchanged. Regression 2026-10-03: live Mac verifier
+# printed 'True' here, which silently desynced from LIMIT_CPU_BURST=true
+# comparisons in gate3_burst_preflight and Gate 3's CPU arithmetic branch.
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -135,7 +143,10 @@ except ModuleNotFoundError:
     data = toml.load(path)
 
 value = data.get(key, default)
-print(value)
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -175,7 +186,12 @@ else:
         data = tomllib.load(f)
 
 value = data["limits"].get(key, default)
-print(value)
+# Render booleans as TOML-spec lowercase (see toml_get_runner comment
+# for the live-Mac-regression rationale — 2026-10-03).
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
