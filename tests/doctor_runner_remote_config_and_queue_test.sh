@@ -35,7 +35,7 @@ run_remote() {  # env assignments passed through the environment
     PATH="$TMP/bin:$PATH"
     PLATFORM="${T_PLATFORM:-linux}"; REMOTE_HOST=macbook; REMOTE_LABEL="macos (macbook)"
     REMOTE_PREFIX="${T_PREFIX:-}"; REMOTE_COUNT="${T_COUNT:-}"
-    DEFAULT_LINUX_RUNNER_COUNT=10; DEFAULT_MAC_RUNNER_COUNT=6
+    DEFAULT_LINUX_RUNNER_COUNT=14; DEFAULT_MAC_RUNNER_COUNT=6
     SLOT_PROOF_CRITICAL=0; STARVED_PRESENT=0; REMOTE_DOWN_SLOTS=(); REMOTE_EXECUTING_SLOTS=(); REMOTE_IDLE_SLOTS=(); REMOTE_CYCLING_SLOTS=()
     info() { :; }; bad() { echo "BAD $*"; }; ok() { echo "OK $*"; }; warn() { :; }
     list_slot_work() { echo "LIST $1 $2"; LAST_EXECUTING_SLOTS=(); LAST_IDLE_SLOTS=(); LAST_CYCLING_SLOTS=(); LAST_DOWN_SLOTS=(); }
@@ -54,7 +54,7 @@ check "stale hardcoded prefix defaults removed" "! grep -q 'ez-mac-runner-e' '$R
 out=$(FAKE_SSH_CFG=ok run_remote)
 check "readable config at contract -> real prefix/count used" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && ! grep -q '^BAD' <<<\"\$out\""
 
-# Finding A: config count below the fleet contract (10+5) must not pass.
+# Finding A: a remote Mac count of 5 below the six-slot contract must not pass.
 out=$(FAKE_SSH_CFG=ok FAKE_SSH_COUNT=5 run_remote)
 check "config count 5 < contract 6 -> [BAD] underprovisioned" "grep -q 'BAD .*remote config count 5 is below the fleet contract 6 — underprovisioned' <<<\"\$out\""
 check "underprovisioned inspects contract (6) slots, not 5" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && ! grep -q 'LIST ez-mac-runner-g 5' <<<\"\$out\""
@@ -63,9 +63,9 @@ check "underprovisioned counts a slot-proof critical" "grep -q 'CRITICAL=1 ' <<<
 out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=6 run_remote)
 check "env overrides (prefix+count at contract) bypass lookup" "grep -q 'LIST ez-mac-runner-g 6' <<<\"\$out\" && grep -q 'UNPROVEN=0' <<<\"\$out\""
 
-# Finding A (Linux side): a remote Linux count below 10 is underprovisioned too.
-out=$(FAKE_SSH_CFG=ok FAKE_SSH_COUNT=9 T_PLATFORM=macos run_remote)
-check "linux config count 9 < contract 10 -> [BAD] underprovisioned" "grep -q 'BAD .*remote config count 9 is below the fleet contract 10 — underprovisioned' <<<\"\$out\" && grep -q 'LIST ez-mac-runner-g 10' <<<\"\$out\""
+# Finding A (Linux side): a remote Linux count below 14 is underprovisioned too.
+out=$(FAKE_SSH_CFG=ok FAKE_SSH_COUNT=13 T_PLATFORM=macos run_remote)
+check "linux config count 13 < contract 14 -> [BAD] underprovisioned" "grep -q 'BAD .*remote config count 13 is below the fleet contract 14 — underprovisioned' <<<\"\$out\" && grep -q 'LIST ez-mac-runner-g 14' <<<\"\$out\""
 
 # Item 2: an explicit override below the contract is flagged too (it may raise the count, never lower it).
 out=$(FAKE_SSH_CFG=fail T_PREFIX=ez-mac-runner-g T_COUNT=5 run_remote)

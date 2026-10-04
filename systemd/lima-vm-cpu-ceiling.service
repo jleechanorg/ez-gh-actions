@@ -9,7 +9,7 @@ PartOf=lima-vm@colima.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/systemctl --user set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%
+ExecStart=@SCRIPTS_DIR@/qemu-ceiling-guard.sh --apply
 
 [Install]
 WantedBy=lima-vm@colima.service

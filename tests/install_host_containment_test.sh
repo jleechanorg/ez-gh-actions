@@ -17,6 +17,19 @@ rm -rf "$TEMP_REPO/docs"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 line_of() { grep -n -m1 "^$1$" "$EVENT_LOG" | cut -d: -f1; }
 
+if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
+  if [ -z "${TOML_PACKAGE_ROOT:-}" ]; then
+    echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: SKIP (toml package unavailable)"
+    exit 0
+  fi
+  LEGACY_PYTHON="$WORK/legacy-python"
+  mkdir -p "$LEGACY_PYTHON"
+  cat > "$LEGACY_PYTHON/tomllib.py" <<'EOF'
+raise ModuleNotFoundError("fixture disables tomllib")
+EOF
+  export PYTHONPATH="$LEGACY_PYTHON:$TOML_PACKAGE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+fi
+
 cat > "$STUB_BIN/uname" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in -r) echo fixture-host-kernel ;; *) echo Linux ;; esac
@@ -67,7 +80,33 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
-  is-active) [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1 ;;
+  enable)
+    if [ "${SYSTEMCTL_REAPPLY_FAIL:-0}" = 1 ] && [[ " $* " == *" lima-vm-cpu-ceiling.service "* ]]; then
+      echo reapply-enable-failed >> "$EVENT_LOG"
+      exit 1
+    fi
+    exit 0 ;;
+  show)
+    if [[ " $* " == *" -p ActiveState "* ]]; then echo inactive; fi
+    exit 0 ;;
+  is-enabled)
+    if [ "${2:-}" = agent-scope-reaper.timer ] \
+       || [ "${2:-}" = psi-oom-watcher.timer ]; then
+      echo disabled
+      exit 1
+    fi
+    exit 1
+    ;;
+  is-active)
+    if [ "${2:-}" = agent-scope-reaper.timer ] \
+       || [ "${2:-}" = agent-scope-reaper.service ] \
+       || [ "${2:-}" = psi-oom-watcher.timer ] \
+       || [ "${2:-}" = psi-oom-watcher.service ]; then
+      echo inactive
+      exit 3
+    fi
+    [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1
+    ;;
   daemon-reload|start|set-property) echo "systemctl-$1" >> "$EVENT_LOG"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -82,10 +121,10 @@ chmod +x "$STUB_BIN"/*
 cat > "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --system-phase ]; then
-  echo root-phase >> "$EVENT_LOG"
+  echo "root-phase:$*" >> "$EVENT_LOG"
   [ "${APPLY_FAIL_ROOT:-0}" = 1 ] && exit 1
 else
-  echo user-phase >> "$EVENT_LOG"
+  echo "user-phase:$*" >> "$EVENT_LOG"
   [ "${APPLY_FAIL_USER:-0}" = 1 ] && exit 1
 fi
 exit 0
@@ -98,23 +137,51 @@ chmod +x "$TEMP_REPO/scripts/host/"*containment-release1.sh
 
 HOME_DIR="$WORK/home"
 mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user"
-printf '# fixture\n' > "$HOME_DIR/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$HOME_DIR/.config/ezgha/config.toml"
 EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/install.log" 2>&1 || fail "host-Docker fixture install failed"
 
 [ -f "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/host/actions.slice" ] \
   || fail "installed containment policy subtree is incomplete"
-root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
+for policy in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
+  cmp "$REPO_ROOT/systemd/$policy" "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/$policy" || fail "missing or stale installed $policy"
+done
+cmp "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh" "$HOME_DIR/.local/libexec/ezgha/qemu-ceiling-guard.sh" || fail "missing installed QEMU guard"
+root_line="$(line_of "root-phase:--system-phase --runner-count 14")"; user_line="$(line_of "user-phase:--runner-count 14")"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
+
+ROLLBACK_HOME="$WORK/rollback_home"
+ROLLBACK_LOG="$WORK/rollback_events"
+mkdir -p "$ROLLBACK_HOME/.config/ezgha"
+printf '[runner]\ncount = 10\n' > "$ROLLBACK_HOME/.config/ezgha/config.toml"
+env EVENT_LOG="$ROLLBACK_LOG" PATH="$STUB_BIN:$PATH" HOME="$ROLLBACK_HOME" CARGO_HOME="$ROLLBACK_HOME/.cargo" XDG_CONFIG_HOME="$ROLLBACK_HOME/.config" \
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/rollback-install.log" 2>&1 \
+  || fail "10-runner rollback fixture install failed"
+grep -qx 'root-phase:--system-phase --runner-count 10' "$ROLLBACK_LOG" \
+  || fail "10-runner rollback root phase did not receive --runner-count 10"
+grep -qx 'user-phase:--runner-count 10' "$ROLLBACK_LOG" \
+  || fail "10-runner rollback user phase did not receive --runner-count 10"
+
+INVALID_HOME="$WORK/invalid_count_home"
+INVALID_LOG="$WORK/invalid_count_events"
+mkdir -p "$INVALID_HOME/.config/ezgha"
+printf '[runner]\ncount = 12\n' > "$INVALID_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$INVALID_LOG" PATH="$STUB_BIN:$PATH" HOME="$INVALID_HOME" CARGO_HOME="$INVALID_HOME/.cargo" XDG_CONFIG_HOME="$INVALID_HOME/.config" \
+    bash "$TEMP_REPO/install.sh" --dev > "$WORK/invalid-count-install.log" 2>&1; then
+  fail "installer accepted unsupported runner.count=12"
+fi
+if grep -qE '^(root|user)-phase:' "$INVALID_LOG" 2>/dev/null; then
+  fail "invalid runner.count wrote containment phases"
+fi
 
 run_failed_phase() {
   local phase="$1"
   local home="$WORK/${phase}_home"
   local log="$WORK/${phase}_events"
   mkdir -p "$home/.config/ezgha"
-  printf '# fixture\n' > "$home/.config/ezgha/config.toml"
+  printf '[runner]\ncount = 14\n' > "$home/.config/ezgha/config.toml"
   if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" "APPLY_FAIL_${phase^^}=1" \
       bash "$TEMP_REPO/install.sh" --dev > "$WORK/${phase}.log" 2>&1; then
     fail "${phase} phase failure still allowed installation"
@@ -131,7 +198,8 @@ run_failed_phase user
 # host, so host-Docker containment is intentionally not activated.
 VM_EVENT_LOG="$WORK/vm_events"
 VM_HOME="$WORK/vm_home"
-mkdir -p "$VM_HOME"
+mkdir -p "$VM_HOME/.config/ezgha"
+printf '[runner]\ncount = 12\n' > "$VM_HOME/.config/ezgha/config.toml"
 env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" CARGO_HOME="$VM_HOME/.cargo" XDG_CONFIG_HOME="$VM_HOME/.config" \
   DOCKER_HOST='unix:///fixture/vm.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/vm-install.log" 2>&1 \
@@ -140,9 +208,25 @@ grep -qx 'docker-info:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
   || fail "installer did not probe the explicitly selected VM endpoint"
 grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
   || fail "installer did not build on the explicitly selected VM endpoint"
-if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
+if grep -qE '^(root|user)-phase:' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
 fi
+
+run_invalid_config() {
+  local name="$1" contents="$2"
+  local home="$WORK/${name}_home" log="$WORK/${name}_events"
+  mkdir -p "$home/.config/ezgha"
+  printf '%s' "$contents" > "$home/.config/ezgha/config.toml"
+  if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" \
+      bash "$TEMP_REPO/install.sh" --dev > "$WORK/${name}.log" 2>&1; then
+    fail "installer accepted present invalid config ${name}"
+  fi
+  if grep -qE '^(root|user)-phase:' "$log" 2>/dev/null; then
+    fail "present invalid config ${name} wrote containment phases"
+  fi
+}
+run_invalid_config malformed $'runner = [\n'
+run_invalid_config missing_count $'[runner]\n'
 
 # Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
 # active-service upgrade path must persist that resolved endpoint before its
@@ -150,7 +234,7 @@ fi
 CONTEXT_EVENT_LOG="$WORK/context_events"
 CONTEXT_HOME="$WORK/context_home"
 mkdir -p "$CONTEXT_HOME/.config/ezgha"
-printf '# fixture\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
 env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" CARGO_HOME="$CONTEXT_HOME/.cargo" XDG_CONFIG_HOME="$CONTEXT_HOME/.config" \
   SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///fixture/ignored.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/context-install.log" 2>&1 \
@@ -166,4 +250,31 @@ if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG
   cat "$CONTEXT_EVENT_LOG" >&2 || true
   fail "active systemd service refresh did not persist the selected endpoint"
 fi
-echo "INSTALL_HOST_CONTAINMENT_TEST: PASS"
+REAPPLY_HOME="$WORK/reapply_home"
+REAPPLY_LOG="$WORK/reapply_events"
+mkdir -p "$REAPPLY_HOME/.config/ezgha"
+printf '[runner]\ncount = 14\n' > "$REAPPLY_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$REAPPLY_LOG" PATH="$STUB_BIN:$PATH" HOME="$REAPPLY_HOME" CARGO_HOME="$REAPPLY_HOME/.cargo" XDG_CONFIG_HOME="$REAPPLY_HOME/.config" \
+    SYSTEMCTL_REAPPLY_FAIL=1 bash "$TEMP_REPO/install.sh" --dev > "$WORK/reapply-install.log" 2>&1; then
+  fail "failed required QEMU reapply service enable allowed successful installation"
+fi
+grep -qx reapply-enable-failed "$REAPPLY_LOG" || fail "fixture missed reapply enable failure"
+grep -q 'lima-vm-cpu-ceiling.service not enabled' "$WORK/reapply-install.log" || fail "required reapply failure was not reported"
+
+if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
+  echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: PASS"
+else
+  echo "INSTALL_HOST_CONTAINMENT_NORMAL_TOMLLIB_TEST: PASS"
+  TOML_PACKAGE_ROOT="$(python3 -c 'import pathlib, toml; print(pathlib.Path(toml.__file__).resolve().parent.parent)' 2>/dev/null || true)"
+  if [ -n "$TOML_PACKAGE_ROOT" ]; then
+    if TOML_PACKAGE_ROOT="$TOML_PACKAGE_ROOT" INSTALL_HOST_CONTAINMENT_LEGACY_TOML=1 \
+        bash "$REPO_ROOT/tests/install_host_containment_test.sh" > "$WORK/legacy-toml.log" 2>&1; then
+      cat "$WORK/legacy-toml.log"
+    else
+      cat "$WORK/legacy-toml.log" >&2
+      fail "legacy TOML fallback fixture failed"
+    fi
+  else
+    echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: SKIP (toml package unavailable)"
+  fi
+fi

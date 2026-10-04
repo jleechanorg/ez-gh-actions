@@ -25,22 +25,21 @@ assert_file "$DROPIN"
 assert_file "$SLICE"
 assert_file "$RUNTIME_UNIT"
 for file in "$DROPIN" "$SLICE"; do
-  assert_line "$file" "MemoryHigh=34G"
-  assert_line "$file" "MemoryMax=38G"
+  assert_line "$file" "MemoryHigh=9G"
+  assert_line "$file" "MemoryMax=10G"
   assert_line "$file" "MemorySwapMax=2G"
   assert_line "$file" "TasksMax=4096"
   assert_line "$file" "CPUQuota=1600%"
 done
 assert_line "$DROPIN" "CPUAccounting=yes"
-# install.sh must apply the same finite values to a transient service after a
-# Colima restart; these are static text checks and do not execute install.sh.
-for setting in MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-  grep -Fq "$setting" "${REPO_ROOT}/install.sh" \
-    || fail "install.sh does not apply $setting"
-done
-for setting in MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-  grep -Fq "$setting" "$RUNTIME_UNIT" \
-    || fail "$RUNTIME_UNIT missing $setting"
+# All callers use the same guarded runtime writer.
+assert_line "$RUNTIME_UNIT" 'ExecStart=@SCRIPTS_DIR@/qemu-ceiling-guard.sh --apply'
+grep -Fq '"${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --apply' "${REPO_ROOT}/install.sh" \
+  || fail "install.sh does not apply the shared QEMU guard"
+GUARD="${REPO_ROOT}/scripts/host/qemu-ceiling-guard.sh"
+assert_file "$GUARD"
+for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
+  grep -Fq "$setting" "$GUARD" || fail "$GUARD missing $setting"
 done
 
 if [ "${ASSERT_LIVE_QEMU:-0}" != "1" ]; then
@@ -200,8 +199,8 @@ quota, period = map(int, cpu)
 if period <= 0 or quota <= 0 or quota > 16 * period:
     fail(f"{cg}/cpu.max={' '.join(cpu)} exceeds CPUQuota=1600%")
 
-high = finite_int("memory.high", 34 * 1024**3)
-maximum = finite_int("memory.max", 38 * 1024**3)
+high = finite_int("memory.high", 9 * 1024**3)
+maximum = finite_int("memory.max", 10 * 1024**3)
 swap = finite_int("memory.swap.max", 2 * 1024**3)
 pids_max = finite_int("pids.max", 4096)
 if high > maximum:

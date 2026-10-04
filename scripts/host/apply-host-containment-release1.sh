@@ -6,15 +6,31 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="/"
 SYSTEM_PHASE=0
+RUNNER_COUNT=14
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { echo "OK: $*"; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) ROOT="$2"; shift 2 ;;
     --system-phase) SYSTEM_PHASE=1; shift ;;
+    --runner-count)
+      [ "$#" -ge 2 ] || fail "--runner-count requires 10 or 14"
+      RUNNER_COUNT="$2"; shift 2 ;;
     *) echo "FAIL: unknown argument '$1'" >&2; exit 1 ;;
   esac
 done
-fail() { echo "FAIL: $*" >&2; exit 1; }
-ok() { echo "OK: $*"; }
+case "$RUNNER_COUNT" in
+  10)
+    ACTIONS_PIDS_MAX=6000
+    ACTIONS_PIDS_PROPERTY="TasksMax=6000"
+    ;;
+  14)
+    ACTIONS_PIDS_MAX=8000
+    ACTIONS_PIDS_PROPERTY="TasksMax=8000"
+    ;;
+  *) fail "runner count must be 10 or 14 (got $RUNNER_COUNT)" ;;
+esac
+ACTIONS_MEMORY_HIGH_BYTES=27917287424
 
 if [ -d "${SCRIPT_DIR}/../../systemd/host" ]; then
   POLICY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -50,7 +66,10 @@ check_below() {
 }
 user_cgroup_dir() {
   local unit="$1" group
-  if [ "$ROOT" != "/" ]; then printf '%s/%s' "$CGROUP_ROOT" "$unit"; return; fi
+  if [ "$ROOT" != "/" ]; then
+    if [ -d "$CGROUP_ROOT/$unit" ]; then printf '%s/%s' "$CGROUP_ROOT" "$unit"; fi
+    return
+  fi
   group="$(systemctl --user show "$unit" -p ControlGroup --value 2>/dev/null || true)"
   [ -n "$group" ] && printf '%s%s' "$CGROUP_ROOT" "$group"
 }
@@ -58,7 +77,38 @@ user_cgroup_dir() {
 # Every gate precedes writes or systemd state changes.
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "${ROOT}/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not determine MemTotal"
-[ "$mem_total_kib" -ge 65011712 ] || fail "MemTotal (${mem_total_kib} KiB) is below required 62 GiB floor"
+
+parse_mem_kib() {
+  local val="$1"
+  [[ "$val" =~ ^[1-9][0-9]*[GgMmKk]?$ ]] || return 1
+  case "$val" in
+    *G|*g) echo $(( ${val%[Gg]} * 1024 * 1024 )) ;;
+    *M|*m) echo $(( ${val%[Mm]} * 1024 )) ;;
+    *K|*k) echo $(( ${val%[Kk]} )) ;;
+    *[!0-9]*) return 1 ;;
+    *) echo $(( val / 1024 )) ;;
+  esac
+}
+extract_unit_max_kib() {
+  local file="$1" val kib
+  [ -f "$file" ] || fail "missing policy unit: $file"
+  val="$(awk -F= '$1 == "MemoryMax" {print $2; exit}' "$file" 2>/dev/null || true)"
+  [ -n "$val" ] || fail "policy unit $file missing MemoryMax"
+  kib="$(parse_mem_kib "$val" || true)"
+  [[ "$kib" =~ ^[1-9][0-9]*$ ]] || fail "policy unit $file has invalid MemoryMax ($val)"
+  echo "$kib"
+}
+
+actions_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/host/actions.slice")"
+qemu_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf")"
+agents_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/agents.slice")"
+auto_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/automation.slice")"
+
+hard_limits_sum_kib=$(( actions_max_kib + qemu_max_kib + agents_max_kib + auto_max_kib ))
+reserve_kib=$(( mem_total_kib / 10 ))
+[ "$reserve_kib" -ge 2097152 ] || reserve_kib=2097152
+computed_floor_kib=$(( hard_limits_sum_kib + reserve_kib ))
+[ "$mem_total_kib" -ge "$computed_floor_kib" ] || fail "MemTotal (${mem_total_kib} KiB) is below required computed floor (${computed_floor_kib} KiB)"
 [ -f "${ROOT}/sys/devices/system/cpu/online" ] || fail "missing cpu/online"
 cpu_count=0; IFS=',' read -r -a cpu_ranges < "${ROOT}/sys/devices/system/cpu/online"
 for range in "${cpu_ranges[@]}"; do
@@ -69,12 +119,46 @@ done
 for controller in cpu memory pids io; do
   grep -qw "$controller" "${CGROUP_ROOT}/cgroup.controllers" 2>/dev/null || fail "missing required cgroup v2 controller: ${controller}"
 done
-check_below "${CGROUP_ROOT}/actions.slice/memory.current" 27917287424 "actions.slice memory.current"
-check_below "${CGROUP_ROOT}/actions.slice/pids.current" 6000 "actions.slice pids.current"
-agents_dir="$(user_cgroup_dir agents.slice || true)"
-automation_dir="$(user_cgroup_dir automation.slice || true)"
-[ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 19327352832 "agents.slice memory.current"
-[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 8589934592 "automation.slice memory.current"
+check_below "${CGROUP_ROOT}/actions.slice/memory.current" "$ACTIONS_MEMORY_HIGH_BYTES" "actions.slice memory.current"
+check_below "${CGROUP_ROOT}/actions.slice/pids.current" "$ACTIONS_PIDS_MAX" "actions.slice pids.current"
+guard_unit_memory() {
+  local unit="$1" limit_bytes="$2" name="$3"
+  local is_active=0 state manager=systemctl
+  # The privileged phase changes system units only; user checks run as the user.
+  if [ "$ROOT" = / ] && [ "$SYSTEM_PHASE" -eq 1 ]; then return 0; fi
+  if [ "$ROOT" = / ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
+    if [ "$ROOT" != / ]; then manager="$ROOT/bin/systemctl"; fi
+    state="$("$manager" --user show "$unit" -p ActiveState --value)" \
+      || fail "cannot query $unit ActiveState"
+    case "$state" in
+      active|activating|reloading|deactivating) is_active=1 ;;
+      inactive|failed) ;;
+      *) fail "unrecognized $unit ActiveState: $state" ;;
+    esac
+  elif [[ " ${CONTAINMENT_ACTIVE_UNITS:-} " == *" ${unit} "* ]] || [ -d "$CGROUP_ROOT/$unit" ]; then
+    is_active=1
+  fi
+
+  local udir
+  udir="$(user_cgroup_dir "$unit" || true)"
+  if [ "$is_active" -eq 1 ]; then
+    [ -n "$udir" ] || fail "active $name has no resolved cgroup directory"
+    [ -f "${udir}/memory.current" ] || fail "active $name missing memory.current at ${udir}/memory.current"
+    check_below "${udir}/memory.current" "$limit_bytes" "$name"
+  elif [ -n "$udir" ] && [ -f "${udir}/memory.current" ]; then
+    check_below "${udir}/memory.current" "$limit_bytes" "$name"
+  fi
+}
+
+guard_unit_memory agents.slice 10737418240 "agents.slice memory.current"
+guard_unit_memory automation.slice 4831838208 "automation.slice memory.current"
+guard_unit_memory app-lima-vm.slice 9663676416 "app-lima-vm.slice memory.current"
+guard_unit_memory lima-vm@colima.service 9663676416 "lima-vm@colima.service memory.current"
+if [ "$ROOT" = / ] && [ "$SYSTEM_PHASE" -eq 1 ]; then
+  runuser -u "$(id -nu "$DEPLOY_UID")" -- env XDG_RUNTIME_DIR="/run/user/${DEPLOY_UID}" "${SCRIPT_DIR}/qemu-ceiling-guard.sh"
+else
+  "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT"
+fi
 
 install_file() {
   local source="$1" dest="$2"
@@ -112,7 +196,7 @@ if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
       || fail "user manager OOM score adjustment did not become 0"
     systemctl enable actions.slice
     systemctl start actions.slice
-    systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 TasksMax=6000 CPUQuota=2000% IOWeight=25
+    systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 "$ACTIONS_PIDS_PROPERTY" CPUQuota=2000% IOWeight=25
   fi
 fi
 
@@ -140,20 +224,24 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   install_file "${POLICY_ROOT}/systemd/user/session.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/session.slice.d/99-ezgha-containment.conf"
   install_file "${POLICY_ROOT}/systemd/agents.slice" "${USER_UNIT_DIR}/agents.slice"
   install_file "${POLICY_ROOT}/systemd/automation.slice" "${USER_UNIT_DIR}/automation.slice"
+  sed "s|@SCRIPTS_DIR@|${SCRIPT_DIR}|g" "${POLICY_ROOT}/systemd/lima-vm-cpu-ceiling.service" > "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
+  install_file "${POLICY_ROOT}/systemd/app-lima-vm.slice" "${USER_UNIT_DIR}/app-lima-vm.slice"
+  install_file "${POLICY_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
   rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" "${USER_UNIT_DIR}/psi-oom-watcher.timer"
   # CONTAINMENT_LIVE_SYSTEMD=1 lets tests run the live user-systemd branch
   # against a --root fixture with a fake systemctl on PATH.
   if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
-    systemctl --user set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096
+    systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192
+    systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096
+    "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT" --apply
   fi
 fi
 
 if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   ASSERT_SCRIPT="${SCRIPT_DIR}/assert-host-containment-release1.sh"
   [ -x "$ASSERT_SCRIPT" ] || fail "missing sibling assertion script: ${ASSERT_SCRIPT}"
-  "$ASSERT_SCRIPT" --root "$ROOT"
+  "$ASSERT_SCRIPT" --root "$ROOT" --runner-count "$RUNNER_COUNT"
 fi
 ok "Release 1 host containment ${SYSTEM_PHASE:+system }phase applied"
