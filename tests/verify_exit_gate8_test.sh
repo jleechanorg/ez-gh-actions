@@ -663,6 +663,26 @@ source "$TMP/selector.sh"
 [ "$IS_MODERN_ENVELOPE" = 1 ] || fail "native Linux without wrapper fell through to legacy policy"
 (source "$TMP/gate3.sh") >"$TMP/gate3.log" 2>&1   || fail "native Gate 8 (3) rejected hermetic rollback-10 fixture: $(cat "$TMP/gate3.log")"
 grep -q 'Release 1 finite host caps' "$TMP/gate3.log"   || fail "native Gate 8 (3) did not use canonical assertion"
+# The composed native host-docker branch must also require oomctl to monitor
+# /actions.slice. Restore the production helpers (an earlier fixture stubbed
+# host_docker_requires_actions_oomctl) and feed oomctl output from a stub.
+eval "$(sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY")"
+eval "$(sed -n '/^oomctl_lists_actions_slice() {/,/^}/p' "$VERIFY")"
+mkdir -p "$TMP/oomctl-bin"
+printf '#!/usr/bin/env bash\ncat "$OOMCTL_FIXTURE"\n' > "$TMP/oomctl-bin/oomctl"
+chmod +x "$TMP/oomctl-bin/oomctl"
+(DOCKER_CONTAINMENT_MODE=host-docker OOMCTL_FIXTURE="$TMP/oomctl-enrolled.txt" PATH="$TMP/oomctl-bin:$PATH"; export OOMCTL_FIXTURE; source "$TMP/gate3.sh") \
+  >"$TMP/gate3-oomctl.log" 2>&1 || fail "native host-docker Gate 8 (3) rejected oomctl listing /actions.slice: $(cat "$TMP/gate3-oomctl.log")"
+grep -q 'oomctl monitors /actions.slice' "$TMP/gate3-oomctl.log" \
+  || fail "native host-docker Gate 8 (3) did not report the oomctl proof: $(cat "$TMP/gate3-oomctl.log")"
+for oomctl_fixture in oomctl-empty oomctl-none; do
+  if (DOCKER_CONTAINMENT_MODE=host-docker OOMCTL_FIXTURE="$TMP/$oomctl_fixture.txt" PATH="$TMP/oomctl-bin:$PATH"; export OOMCTL_FIXTURE; source "$TMP/gate3.sh") \
+      >"$TMP/gate3-$oomctl_fixture.log" 2>&1; then
+    fail "native host-docker Gate 8 (3) accepted $oomctl_fixture without /actions.slice under memory pressure"
+  fi
+  grep -q 'requires oomctl to list /actions.slice' "$TMP/gate3-$oomctl_fixture.log" \
+    || fail "native host-docker Gate 8 (3) $oomctl_fixture failed for the wrong reason: $(cat "$TMP/gate3-$oomctl_fixture.log")"
+done
 printf 'max\n' > "$FIXTURE/sys/fs/cgroup/actions.slice/memory.max"
 if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-poison.log" 2>&1; then
   fail "native Gate 8 (3) ignored poisoned fixture cgroup"
