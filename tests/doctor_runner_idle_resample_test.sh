@@ -23,7 +23,7 @@ cat > "$TMP/bin/fake_docker" <<'SH'
 verb="$1"; name="$2"
 f="$TMP_SEQ/$name"
 if [ "$verb" = inspect ]; then
-  st=$(head -n1 "$f"); [ "$(wc -l < "$f")" -gt 1 ] && sed -i 1d "$f"
+  st=$(head -n1 "$f"); [ "$(wc -l < "$f")" -gt 1 ] && sed -i.bak 1d "$f"
   echo "$st" > "$TMP_CUR/$name"
   [ "$st" = ABSENT ] && echo false || echo true
 else
