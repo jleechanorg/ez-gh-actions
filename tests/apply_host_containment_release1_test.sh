@@ -159,11 +159,21 @@ printf '{"name":"colima","status":%s%s}\n' '$status_json' '$memory_json'
 LIMA_EOF
   chmod +x "$root/bin/limactl"
   if [ "$4" != - ]; then
-    mkdir -p "$root/proc/7777"
+    mkdir -p "$root/proc/7777" "$root/sys/fs/cgroup/lima-vm@colima.service"
     printf 'qemu-system-x86\n' > "$root/proc/7777/comm"
     printf '%s\0' qemu-system-x86_64 -m "$4" -drive "file=$root/lima/colima/diffdisk,if=virtio" > "$root/proc/7777/cmdline"
+    printf '0::/lima-vm@colima.service\n' > "$root/proc/7777/cgroup"
+    printf '7777\n' > "$root/sys/fs/cgroup/lima-vm@colima.service/cgroup.procs"
+    cat > "$root/bin/systemctl" <<'SYSTEMCTL_EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *show*'lima-vm@colima.service'*) printf '/lima-vm@colima.service\n' ;;
+esac
+exit 0
+SYSTEMCTL_EOF
+    chmod +x "$root/bin/systemctl"
   fi
-  if PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/lima_$1.log" 2>&1; then
+  if QEMU_CGROUP_ROOT="$root/sys/fs/cgroup" PATH="$root/bin:$PATH" "$APPLY_SCRIPT" --root "$root" > "$WORK/lima_$1.log" 2>&1; then
     [ "$5" = pass ] || fail "lima $1 passed but should refuse: $(tail -2 "$WORK/lima_$1.log")"
   else
     [ "$5" = refuse ] || fail "lima $1 refused but should pass: $(tail -2 "$WORK/lima_$1.log")"
@@ -248,11 +258,12 @@ printf '%s\0' qemu-system-x86_64 -m 12288 -drive \
 printf '8888\n' > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/cgroup.procs"
 cat > "$DUAL_LIMA/bin/systemctl" <<'SHIM'
 #!/bin/sh
+[ "${LIMA_EMPTY_CGROUP:-0}" = 1 ] && exit 0
 printf '/fixture/lima-vm@colima.service\n'
 SHIM
 cat > "$DUAL_LIMA/bin/limactl" <<'SHIM'
 #!/bin/sh
-printf '{"status":"Stopped","memory":8589934592}\n'
+printf '{"status":"%s","memory":8589934592}\n' "${LIMA_FIXTURE_STATUS:-Stopped}"
 SHIM
 chmod +x "$DUAL_LIMA/bin/"*
 if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
@@ -279,10 +290,88 @@ if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
 fi
 printf '%s\0' qemu-system-x86_64 -m 8192 -drive \
   "file=$DUAL_LIMA/lima/colima/diffdisk" > "$DUAL_LIMA/proc/8888/cmdline"
+printf '0::/fixture/lima-vm@colima.service/child\n' > "$DUAL_LIMA/proc/8888/cgroup"
 PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
   LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+  LIMA_FIXTURE_STATUS=Running \
   "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" >/dev/null \
   || fail "matching bounded guest in capped unit was rejected"
+
+# A Running VM with a QEMU matching the selected instance but outside the
+# capped service must fail even when the service cgroup itself is empty.
+: > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/child/cgroup.procs"
+mkdir -p "$DUAL_LIMA/cgroup/fixture/unrelated.scope"
+printf '8888\n' > "$DUAL_LIMA/cgroup/fixture/unrelated.scope/cgroup.procs"
+printf '0::/fixture/unrelated.scope\n' > "$DUAL_LIMA/proc/8888/cgroup"
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    LIMA_FIXTURE_STATUS=Running \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" > "$WORK/dual_outside_empty.log" 2>&1; then
+  fail "Running QEMU outside an empty capped service cgroup was accepted"
+fi
+grep -q 'outside capped unit' "$WORK/dual_outside_empty.log" \
+  || fail "outside-QEMU refusal did not identify the capped service"
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" --print-yaml > "$WORK/dual_outside_path.log" 2>&1; then
+  fail "--print-yaml accepted a QEMU outside the capped service"
+fi
+grep -q 'outside capped unit' "$WORK/dual_outside_path.log" \
+  || fail "--print-yaml outside-QEMU refusal did not identify the capped service"
+
+# With exactly one matching QEMU in the capped service, Running is accepted.
+printf '8888\n' > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/child/cgroup.procs"
+printf '0::/fixture/lima-vm@colima.service/child\n' > "$DUAL_LIMA/proc/8888/cgroup"
+PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+  LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+  LIMA_FIXTURE_STATUS=Running \
+  "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" >/dev/null \
+  || fail "exactly one QEMU in the capped service was rejected"
+
+# Two matching QEMUs inside the capped service make Running ownership
+# ambiguous and must fail closed.
+mkdir -p "$DUAL_LIMA/proc/9999"
+printf 'qemu-system-x86\n' > "$DUAL_LIMA/proc/9999/comm"
+printf '%s\0' qemu-system-x86_64 -m 8192 -drive \
+  "file=$DUAL_LIMA/lima/colima/diffdisk" > "$DUAL_LIMA/proc/9999/cmdline"
+printf '0::/fixture/lima-vm@colima.service/child\n' > "$DUAL_LIMA/proc/9999/cgroup"
+printf '8888\n9999\n' > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/child/cgroup.procs"
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    LIMA_FIXTURE_STATUS=Running \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" > "$WORK/dual_two_inside.log" 2>&1; then
+  fail "two matching QEMUs inside the capped service were accepted"
+fi
+grep -q 'multiple QEMU processes' "$WORK/dual_two_inside.log" \
+  || fail "two-inside refusal did not identify ambiguous ownership"
+
+# A second QEMU outside the capped service must not be ignored just because
+# the service-owned QEMU is valid.
+mkdir -p "$DUAL_LIMA/proc/9999"
+printf 'qemu-system-x86\n' > "$DUAL_LIMA/proc/9999/comm"
+printf '%s\0' qemu-system-x86_64 -m 8192 -drive \
+  "file=$DUAL_LIMA/lima/colima/diffdisk" > "$DUAL_LIMA/proc/9999/cmdline"
+printf '0::/fixture/unrelated.scope\n' > "$DUAL_LIMA/proc/9999/cgroup"
+printf '8888\n' > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/child/cgroup.procs"
+printf '9999\n' > "$DUAL_LIMA/cgroup/fixture/unrelated.scope/cgroup.procs"
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    LIMA_FIXTURE_STATUS=Running \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" > "$WORK/dual_second_outside.log" 2>&1; then
+  fail "second QEMU outside the capped service was accepted"
+fi
+grep -q 'outside capped unit' "$WORK/dual_second_outside.log" \
+  || fail "second outside-QEMU refusal did not identify the capped service"
+
+# An empty ControlGroup cannot prove a Running QEMU is covered by the cap.
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    LIMA_FIXTURE_STATUS=Running LIMA_EMPTY_CGROUP=1 \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" > "$WORK/dual_empty_control_group.log" 2>&1; then
+  fail "Running QEMU was accepted with an empty capped ControlGroup"
+fi
+grep -q 'capped unit' "$WORK/dual_empty_control_group.log" \
+  || fail "empty ControlGroup refusal did not identify missing ownership"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"

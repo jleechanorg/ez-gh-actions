@@ -79,6 +79,11 @@ case "${1:-}" in
       exit 1
     fi
     exit 0 ;;
+  show)
+    if [ -n "${SYSTEMCTL_CGROUP_PATH:-}" ] && [[ "$*" == *"lima-vm@colima.service"* ]]; then
+      printf '%s\n' "$SYSTEMCTL_CGROUP_PATH"
+    fi
+    exit 0 ;;
   is-active)
     if [ "${2:-}" = agent-scope-reaper.timer ] \
        || [ "${2:-}" = agent-scope-reaper.service ] \
@@ -91,7 +96,18 @@ case "${1:-}" in
   daemon-reload)
     echo "systemctl-$1:$*" >> "$EVENT_LOG"
     [ "${FAIL_RELOAD:-0}" != 1 ]; exit $? ;;
-  start|set-property|enable) echo "systemctl-$1:$*" >> "$EVENT_LOG"; exit 0 ;;
+  start|set-property|enable)
+    echo "systemctl-$1:$*" >> "$EVENT_LOG"
+    if [ "${FAIL_SLICE_SET:-0}" = 1 ] && [ "$1" = set-property ] \
+       && { [ "${2:-}" = agents.slice ] || [ "${2:-}" = automation.slice ]; }; then
+      exit 1
+    fi
+    if [ "$1" = set-property ] && [ -n "${SYSTEMCTL_OVERRIDE_DIR:-}" ] \
+       && { [ "${2:-}" = agents.slice ] || [ "${2:-}" = automation.slice ]; }; then
+      mkdir -p "$SYSTEMCTL_OVERRIDE_DIR"
+      printf '%s\n' "$*" > "$SYSTEMCTL_OVERRIDE_DIR/$2"
+    fi
+    exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -123,9 +139,10 @@ fi
 # service override and then its native fallback.
 (
   export EVENT_LOG PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context DOCKER_HOST=ssh://ambient
-  systemctl() { printf '%s\n' 'DOCKER_HOST_OVERRIDE=unix:///var/run/docker.sock'; }
+  systemctl() { printf '%s\n' "DOCKER_HOST_OVERRIDE=unix://$HOME/.colima/default/docker.sock"; }
   eval "$(sed -n '/^service_docker_endpoint() {/,/^}/p' "$REPO_ROOT/docs/verify-exit-criteria.sh")"
-  [ "$(service_docker_endpoint)" = unix:///var/run/docker.sock ]     || fail "verifier did not use persisted service Docker endpoint"
+  [ "$(service_docker_endpoint)" = "unix://$HOME/.colima/default/docker.sock" ] \
+    || fail "verifier did not use persisted service Docker endpoint"
   systemctl() { printf '%s\n' ''; }
   [ "$(service_docker_endpoint)" = unix:///var/run/docker.sock ]     || fail "verifier did not use native Linux fallback"
 )
@@ -158,10 +175,13 @@ EOF
 chmod +x "$TEMP_REPO/scripts/host/"*containment-release1.sh
 
 HOME_DIR="$WORK/home"
-mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user" "$HOME_DIR/.lima/colima"
+HOST_OVERRIDE_DIR="$WORK/host-overrides"
+mkdir -p "$HOME_DIR/.config/ezgha" "$HOME_DIR/.config/systemd/user" "$HOME_DIR/.lima/colima" "$HOST_OVERRIDE_DIR"
 printf '# fixture\n' > "$HOME_DIR/.config/ezgha/config.toml"
 printf 'cpus: 4\nmemory: "8GiB"\n' > "$HOME_DIR/.lima/colima/lima.yaml"
-EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" XDG_CONFIG_HOME="$HOME_DIR/.config" \
+printf 'set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192\n' > "$HOST_OVERRIDE_DIR/agents.slice"
+printf 'set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096\n' > "$HOST_OVERRIDE_DIR/automation.slice"
+EVENT_LOG="$EVENT_LOG" SYSTEMCTL_OVERRIDE_DIR="$HOST_OVERRIDE_DIR" PATH="$STUB_BIN:$PATH" HOME="$HOME_DIR" CARGO_HOME="$HOME_DIR/.cargo" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/install.log" 2>&1 || fail "host-Docker fixture install failed"
 
 [ -f "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/host/actions.slice" ] \
@@ -174,10 +194,33 @@ assert_host_policy_slice() {
 }
 assert_host_policy_slice agents.slice 10G 12G
 assert_host_policy_slice automation.slice 4608M 5G
+assert_installed_slice() {
+  local home="$1" unit="$2" high="$3" max="$4" file
+  file="$home/.config/systemd/user/$unit"
+  grep -qx "MemoryHigh=$high" "$file" && grep -qx "MemoryMax=$max" "$file" \
+    || fail "installed $unit does not contain the selected $high/$max policy"
+}
+assert_installed_slice "$HOME_DIR" agents.slice 10G 12G
+assert_installed_slice "$HOME_DIR" automation.slice 4608M 5G
+assert_persisted_slice() {
+  local dir="$1" unit="$2" high="$3" max="$4" swap="$5" tasks="$6"
+  grep -Fqx "set-property $unit MemoryHigh=$high MemoryMax=$max MemorySwapMax=$swap TasksMax=$tasks" \
+    "$dir/$unit" || fail "persisted $unit override did not match the selected budget"
+}
+assert_persisted_slice "$HOST_OVERRIDE_DIR" agents.slice 10G 12G 2G 8192
+assert_persisted_slice "$HOST_OVERRIDE_DIR" automation.slice 4608M 5G 1G 4096
 root_line="$(line_of root-phase)"; user_line="$(line_of user-phase)"; install_line="$(line_of cargo-install)"; build_line="$(grep -n -m1 '^docker-build:' "$EVENT_LOG" | cut -d: -f1)"
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
+grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$EVENT_LOG" \
+  || fail "host-docker install did not reapply the selected agents.slice live budget"
+grep -qx "systemctl-set-property:set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$EVENT_LOG" \
+  || fail "host-docker install did not reapply the selected automation.slice live budget"
+final_reload_line="$(grep -n '^systemctl-daemon-reload:daemon-reload$' "$EVENT_LOG" | tail -1 | cut -d: -f1)"
+final_agents_line="$(grep -n '^systemctl-set-property:set-property agents.slice ' "$EVENT_LOG" | tail -1 | cut -d: -f1)"
+[ -n "$final_reload_line" ] && [ -n "$final_agents_line" ] && [ "$final_reload_line" -lt "$final_agents_line" ] \
+  || fail "host-docker slice budgets were applied before the final user-unit reload"
 
 # Host-docker mode (bead ez-gh-actions-154k): the colima guest (qdrant only)
 # is resized to 8GiB in the lima.yaml lima-vm@colima starts from, and the
@@ -205,9 +248,12 @@ mkdir -p "$BIG_HOME/.config/ezgha" "$BIG_HOME/.config/systemd/user/lima-vm@colim
 printf '# fixture\n' > "$BIG_HOME/.config/ezgha/config.toml"
 printf 'cpus: 4\nmemory: "12GiB"\n' > "$BIG_HOME/.lima/colima/lima.yaml"
 BIG_PROC="$WORK/big_proc"
-mkdir -p "$BIG_PROC/7777"
+BIG_CGROUP="$WORK/big_cgroup"
+mkdir -p "$BIG_PROC/7777" "$BIG_CGROUP/lima-vm@colima.service"
 printf 'qemu-system-x86\n' > "$BIG_PROC/7777/comm"
 printf '%s\0' qemu-system-x86_64 -m 12288 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
+printf '0::/lima-vm@colima.service\n' > "$BIG_PROC/7777/cgroup"
+printf '7777\n' > "$BIG_CGROUP/lima-vm@colima.service/cgroup.procs"
 printf '[Service]\nMemoryHigh=9G\nMemoryMax=10G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
 cp "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service" "$BIG_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service"
 cp "$BIG_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service" "$WORK/reapply-before"
@@ -218,7 +264,8 @@ cp "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh" "$WORK/apply-fix
 cp "$REPO_ROOT/scripts/host/apply-host-containment-release1.sh" "$TEMP_REPO/scripts/host/"
 sed -i "s|^ROOT=\"/\"$|ROOT=\"$WORK/isolated-apply\"|" "$TEMP_REPO/scripts/host/apply-host-containment-release1.sh"
 if env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
-  LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" \
+  LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" QEMU_CGROUP_ROOT="$BIG_CGROUP" \
+  SYSTEMCTL_CGROUP_PATH=/lima-vm@colima.service \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1; then
   fail "big-guest install passed despite pre-activation guest refusal"
 fi
@@ -288,6 +335,21 @@ run_failed_phase() {
 run_failed_phase root
 run_failed_phase user
 
+SLICE_FAIL_HOME="$WORK/slice_fail_home"
+mkdir -p "$SLICE_FAIL_HOME/.config/ezgha" "$SLICE_FAIL_HOME/.lima/colima"
+printf '# fixture\n' > "$SLICE_FAIL_HOME/.config/ezgha/config.toml"
+printf 'memory: "8GiB"\n' > "$SLICE_FAIL_HOME/.lima/colima/lima.yaml"
+if env EVENT_LOG="$WORK/slice_fail_events" PATH="$STUB_BIN:$PATH" \
+    HOME="$SLICE_FAIL_HOME" CARGO_HOME="$SLICE_FAIL_HOME/.cargo" \
+    XDG_CONFIG_HOME="$SLICE_FAIL_HOME/.config" FAIL_SLICE_SET=1 \
+    bash "$TEMP_REPO/install.sh" --dev > "$WORK/slice-fail.log" 2>&1; then
+  fail "slice set-property failure still allowed installation"
+fi
+grep -q 'could not apply selected agents.slice budget' "$WORK/slice-fail.log" \
+  || fail "slice set-property failure was not reported"
+# The binary install precedes user-unit rendering; the setter failure must
+# still abort the installer instead of silently accepting stale live limits.
+
 # An explicitly selected VM daemon must be used consistently for reachability,
 # kernel classification, and image build. Its guest kernel differs from the
 # host, so host-Docker containment is intentionally not activated.
@@ -314,12 +376,19 @@ grep -qx 'MemoryMax=38G' "$VM_HOME/.config/systemd/user/lima-vm@colima.service.d
 # installation, even if the legacy guest configuration remains larger.
 MIGRATE_HOME="$WORK/migrate_home"
 MIGRATE_EVENTS="$WORK/migrate_events"
-mkdir -p "$MIGRATE_HOME/.config/ezgha" "$MIGRATE_HOME/.lima/colima"
+MIGRATE_OVERRIDES="$WORK/migrate-overrides"
+mkdir -p "$MIGRATE_HOME/.config/ezgha" "$MIGRATE_HOME/.lima/colima" "$MIGRATE_OVERRIDES"
 printf '# fixture\n' > "$MIGRATE_HOME/.config/ezgha/config.toml"
 printf 'memory: "8GiB"\n' > "$MIGRATE_HOME/.lima/colima/lima.yaml"
-env EVENT_LOG="$MIGRATE_EVENTS" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
+printf 'set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192\n' > "$MIGRATE_OVERRIDES/agents.slice"
+printf 'set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096\n' > "$MIGRATE_OVERRIDES/automation.slice"
+env EVENT_LOG="$MIGRATE_EVENTS" SYSTEMCTL_OVERRIDE_DIR="$MIGRATE_OVERRIDES" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/migrate-host-docker.log" 2>&1 \
   || fail "host-docker migration setup install failed"
+grep -Fqx "set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
+  || fail "host-docker migration setup did not overwrite the stale agents.slice user.control override"
+grep -Fqx "set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_OVERRIDES/automation.slice" \
+  || fail "host-docker migration setup did not overwrite the stale automation.slice user.control override"
 for unit in lima-vm@colima lima-vm-cpu-ceiling; do
   guard="$MIGRATE_HOME/.config/systemd/user/$unit.service.d/10-guest-memory-admission.conf"
   [ -f "$guard" ] || fail "host-docker setup omitted $unit admission guard"
@@ -329,7 +398,7 @@ done
 # admission rule. VM-backed mode must not retain that rule.
 printf 'memory: "12GiB"\n' > "$MIGRATE_HOME/.lima/colima/lima.yaml"
 : > "$MIGRATE_EVENTS"
-env EVENT_LOG="$MIGRATE_EVENTS" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
+env EVENT_LOG="$MIGRATE_EVENTS" SYSTEMCTL_OVERRIDE_DIR="$MIGRATE_OVERRIDES" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
   DOCKER_HOST="unix://$MIGRATE_HOME/.colima/default/docker.sock" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/migrate-vm-backed.log" 2>&1 \
   || fail "VM-backed migration install failed with a legacy large guest"
@@ -341,6 +410,20 @@ for unit in lima-vm@colima lima-vm-cpu-ceiling; do
 done
 grep -qx 'MemoryMax=38G' "$MIGRATE_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   || fail "VM-backed migration did not restore the 34G/38G QEMU policy"
+grep -Fqx "set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
+  || fail "VM-backed migration did not overwrite the stale agents.slice user.control override"
+grep -Fqx "set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_OVERRIDES/automation.slice" \
+  || fail "VM-backed migration did not overwrite the stale automation.slice user.control override"
+grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_EVENTS" \
+  || fail "VM-backed migration did not reapply the selected agents.slice live budget"
+grep -qx "systemctl-set-property:set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_EVENTS" \
+  || fail "VM-backed migration did not reapply the selected automation.slice live budget"
+migrate_final_reload_line="$(grep -n '^systemctl-daemon-reload:daemon-reload$' "$MIGRATE_EVENTS" | tail -1 | cut -d: -f1)"
+migrate_final_agents_line="$(grep -n '^systemctl-set-property:set-property agents.slice ' "$MIGRATE_EVENTS" | tail -1 | cut -d: -f1)"
+[ -n "$migrate_final_reload_line" ] && [ -n "$migrate_final_agents_line" ] && [ "$migrate_final_reload_line" -lt "$migrate_final_agents_line" ] \
+  || fail "VM-backed migration slice budgets were applied before the final user-unit reload"
+assert_installed_slice "$MIGRATE_HOME" agents.slice 18G 20G
+assert_installed_slice "$MIGRATE_HOME" automation.slice 8G 10G
 migrate_reload_line="$(line_of 'systemctl-daemon-reload:daemon-reload')"
 migrate_install_line="$(line_of cargo-install)"
 [ -n "$migrate_reload_line" ] && [ -n "$migrate_install_line" ] && [ "$migrate_reload_line" -lt "$migrate_install_line" ] \

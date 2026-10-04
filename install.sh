@@ -371,10 +371,9 @@ ensure_colima_docker_daemon() {
 }
 ensure_colima_docker_daemon || true
 DOCKER_HOST_OVERRIDE=""
-# Resolve the Docker endpoint selected by the current shell into an explicit
-# value that can be persisted for the service and reused by every build and
-# runner mutation. Docker documents that DOCKER_CONTEXT overrides DOCKER_HOST,
-# so resolve a named context first; otherwise honor an explicit host socket.
+# Resolve the Docker endpoint selected by the current shell into the explicit
+# value persisted for the service and reused by every build and runner mutation.
+# The host-mode helper owns endpoint precedence and validates the selected owner.
 DOCKER_CTX_HOST="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
   || { bad "cannot resolve selected Docker endpoint"; exit 1; }
 # Strategy 2: probe colima's default location
@@ -935,7 +934,25 @@ EOF
     # Remove any historical repair script
     rm -f "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
 
-    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || { bad "could not reload installed user units"; exit 1; }
+    # Reapply the selected budgets after copying the unit files. A prior
+    # systemctl --user set-property writes user.control drop-ins that survive
+    # unit replacement, so the selected mode must win during every install.
+    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
+      AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192)
+      AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
+    else
+      AGENTS_SLICE_PROPS=(MemoryHigh=18G MemoryMax=20G MemorySwapMax=2G TasksMax=8192)
+      AUTOMATION_SLICE_PROPS=(MemoryHigh=8G MemoryMax=10G MemorySwapMax=1G TasksMax=4096)
+    fi
+    if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
+      bad "could not apply selected agents.slice budget"
+      exit 1
+    fi
+    if ! systemctl --user set-property automation.slice "${AUTOMATION_SLICE_PROPS[@]}"; then
+      bad "could not apply selected automation.slice budget"
+      exit 1
+    fi
     # Apply the direct QEMU ceiling to an already-running Colima service.
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.

@@ -33,17 +33,24 @@ unknown() {
 
 # Bind admission to the service whose QEMU limit will be changed, including
 # nested cgroups. A caller-selected LIMA_HOME cannot hide another live guest.
+CAPPED_UNIT_CGROUP=""
+CAPPED_UNIT_CGROUP_MISSING=0
 check_capped_instance() {
   local unit_cgroup cgroup_dir cgroup_files cgroup_file pid comm_file
   local -a args
   unit_cgroup="$(systemctl --user show -p ControlGroup --value -- lima-vm@colima.service)" \
     || unknown "cannot resolve capped unit cgroup"
-  [ -n "$unit_cgroup" ] || return 0
+  if [ -z "$unit_cgroup" ]; then
+    [ -z "${INSTANCE_DIR:-}" ] && return 0
+    CAPPED_UNIT_CGROUP_MISSING=1
+    return 0
+  fi
   case "$unit_cgroup" in
     /|*../*|*/..) unknown "invalid capped unit cgroup" ;;
     /*) ;;
     *) unknown "invalid capped unit cgroup" ;;
   esac
+  CAPPED_UNIT_CGROUP="$unit_cgroup"
   cgroup_dir="${QEMU_CGROUP_ROOT:-/sys/fs/cgroup}${unit_cgroup}"
   [ -r "$cgroup_dir/cgroup.procs" ] || unknown "cannot read capped unit processes"
   cgroup_files="$(find "$cgroup_dir" -name cgroup.procs -type f -print)" \
@@ -64,6 +71,55 @@ check_capped_instance() {
       esac
     done < "$cgroup_file"
   done <<< "$cgroup_files"
+}
+
+# A QEMU discovered from /proc must be in the exact capped unit cgroup (or a
+# descendant). The service can have an empty root cgroup while a process runs
+# in a sibling; accepting that process would validate a ceiling on another
+# service and leave the selected QEMU uncapped.
+pid_in_capped_unit() {
+  local pid="$1" rel cgroup_procs member
+  if [ -z "$CAPPED_UNIT_CGROUP" ]; then
+    [ "$CAPPED_UNIT_CGROUP_MISSING" -eq 0 ] \
+      || unknown "capped unit has no cgroup"
+    return 1
+  fi
+  [ -r "$PROC_ROOT/$pid/cgroup" ] \
+    || unknown "cannot read QEMU $pid cgroup membership"
+  rel="$(awk -F: '$1 == "0" {print $3; exit}' "$PROC_ROOT/$pid/cgroup")" \
+    || unknown "cannot inspect QEMU $pid cgroup membership"
+  case "$rel" in
+    /|*../*|*/..) unknown "invalid QEMU $pid cgroup path" ;;
+    /*) ;;
+    *) unknown "invalid QEMU $pid cgroup path" ;;
+  esac
+  case "$rel" in
+    "$CAPPED_UNIT_CGROUP"|"$CAPPED_UNIT_CGROUP"/*) ;;
+    *) return 1 ;;
+  esac
+  cgroup_procs="${QEMU_CGROUP_ROOT:-/sys/fs/cgroup}${rel}/cgroup.procs"
+  [ -r "$cgroup_procs" ] || unknown "cannot read QEMU $pid resolved cgroup membership"
+  while IFS= read -r member; do
+    [ "$member" = "$pid" ] && return 0
+  done < "$cgroup_procs"
+  return 1
+}
+
+check_print_yaml_qemu_membership() {
+  local comm pid cmdline_file
+  [ -n "${INSTANCE_DIR:-}" ] || return 0
+  for comm in "$PROC_ROOT"/[0-9]*/comm; do
+    [ -r "$comm" ] || continue
+    case "$(cat "$comm" 2>/dev/null)" in qemu-system-*) ;; *) continue ;; esac
+    pid="${comm%/comm}"
+    pid="${pid##*/}"
+    cmdline_file="$PROC_ROOT/$pid/cmdline"
+    mapfile -d '' args < "$cmdline_file" 2>/dev/null || continue
+    case " ${args[*]} " in *"${INSTANCE_DIR}/"*) ;; *) continue ;; esac
+    if ! pid_in_capped_unit "$pid"; then
+      unknown "colima QEMU $pid is outside capped unit ${CAPPED_UNIT_CGROUP:-<unresolved>}"
+    fi
+  done
 }
 
 if [ -n "${LIMA_YAML+x}" ]; then
@@ -106,6 +162,7 @@ except (ValueError, json.JSONDecodeError, TypeError, IndexError):
 fi
 check_capped_instance
 if [ "$PRINT_YAML" -eq 1 ]; then
+  check_print_yaml_qemu_membership
   printf '%s\n' "$LIMA_YAML"
   exit 0
 fi
@@ -131,12 +188,18 @@ qemu_m_to_bytes() { # QEMU -m: 8192 (MiB) | 8192M | 8G | size=8192M[,...]
 
 # Running colima QEMU processes (cmdline references the instance directory).
 running=()
+running_pids=()
 for comm in "$PROC_ROOT"/[0-9]*/comm; do
   [ -r "$comm" ] || continue
   case "$(cat "$comm" 2>/dev/null)" in qemu-system-*) ;; *) continue ;; esac
-  cmdline_file="${comm%/comm}/cmdline"
+  pid="${comm%/comm}"
+  pid="${pid##*/}"
+  cmdline_file="$PROC_ROOT/$pid/cmdline"
   mapfile -d '' args < "$cmdline_file" 2>/dev/null || continue
   case " ${args[*]} " in *"${INSTANCE_DIR}/"*) ;; *) continue ;; esac
+  if ! pid_in_capped_unit "$pid"; then
+    unknown "colima QEMU $pid is outside capped unit $CAPPED_UNIT_CGROUP"
+  fi
   mem=""
   for ((i = 0; i < ${#args[@]}; i++)); do
     if [ "${args[$i]}" = -m ] && [ $((i + 1)) -lt ${#args[@]} ]; then
@@ -145,6 +208,7 @@ for comm in "$PROC_ROOT"/[0-9]*/comm; do
   done
   [ -n "$mem" ] || unknown "colima QEMU ${comm%/comm} has no parseable -m"
   running+=("$mem")
+  running_pids+=("$pid")
 done
 
 if [ ! -e "$INSTANCE_DIR" ] && [ "${#running[@]}" -eq 0 ]; then
@@ -186,8 +250,14 @@ IFS='|' read -r status limactl_mem extra <<<"$limactl_fields"
 [ -n "${status:-}" ] && [ -n "${limactl_mem:-}" ] && [ -z "${extra:-}" ] \
   || unknown "limactl list --json colima has malformed validated fields"
 values+=("$limactl_mem")
-if [ "$status" = Running ] && [ "${#running[@]}" -eq 0 ]; then
-  unknown "colima is Running but no colima QEMU process was found"
+if [ "$status" = Running ]; then
+  [ "$CAPPED_UNIT_CGROUP_MISSING" -eq 0 ] \
+    || unknown "capped unit has no cgroup for Running Colima QEMU"
+  if [ "${#running[@]}" -eq 0 ]; then
+    unknown "colima is Running but no colima QEMU process was found"
+  fi
+  [ "${#running[@]}" -eq 1 ] \
+    || unknown "colima is Running with multiple QEMU processes (${running_pids[*]})"
 fi
 values+=("${running[@]}")
 
