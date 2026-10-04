@@ -888,6 +888,11 @@ fn run_docker_with_timeout_at_deadline(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT_SLOT_WRITE_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config>) -> Result<()> {
     let path = slot_assignments_path_for(cfg);
     if let Some(parent) = path.parent() {
@@ -901,6 +906,10 @@ fn write_slot_assignments_for(assignments: &SlotAssignments, cfg: Option<&Config
     // is atomic within a directory on POSIX: readers see old-or-new, never torn.
     let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
     std::fs::write(&tmp, raw).with_context(|| format!("write temp {}", tmp.display()))?;
+    #[cfg(test)]
+    if INTERRUPT_SLOT_WRITE_BEFORE_RENAME.with(|interrupt| interrupt.replace(false)) {
+        anyhow::bail!("simulated interruption before slot assignment rename");
+    }
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
@@ -9168,6 +9177,65 @@ minimum_isolation = "container"
         let live = vec![runner_info(1, "ez-org-runner-1")];
         let reclaimed = release_stale_slots_from(&read_slot_assignments().unwrap(), &live).unwrap();
         assert_eq!(reclaimed, 0);
+    }
+
+    #[test]
+    fn interrupted_slot_write_preserves_previous_file_until_rename() {
+        let env = TestEnv::new("interrupted_slot_write");
+        let mut original = SlotAssignments::default();
+        original.assignments.insert("1".into(), "4242".into());
+        write_slot_assignments_for(&original, None).unwrap();
+        let before = std::fs::read(&env.path).unwrap();
+
+        let mut replacement = SlotAssignments::default();
+        replacement.assignments.insert("1".into(), "9898".into());
+        INTERRUPT_SLOT_WRITE_BEFORE_RENAME.with(|interrupt| interrupt.set(true));
+        let result = write_slot_assignments_for(&replacement, None);
+        INTERRUPT_SLOT_WRITE_BEFORE_RENAME.with(|interrupt| interrupt.set(false));
+
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("simulated interruption"));
+        assert_eq!(std::fs::read(&env.path).unwrap(), before);
+        assert_eq!(
+            read_slot_assignments().unwrap().assignments,
+            original.assignments
+        );
+        let tmp = env
+            .path
+            .with_extension(format!("toml.tmp.{}", std::process::id()));
+        let pending: SlotAssignments =
+            toml::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(pending.assignments, replacement.assignments);
+
+        write_slot_assignments_for(&replacement, None).unwrap();
+        assert_eq!(
+            read_slot_assignments().unwrap().assignments,
+            replacement.assignments
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn release_stale_slots_preserves_unparseable_slot_key() {
+        let env = TestEnv::new("unparseable_slot_key");
+        let mut assignments = SlotAssignments::default();
+        assignments.assignments.insert("1".into(), "4242".into());
+        assignments
+            .assignments
+            .insert("broken-slot".into(), "7777".into());
+        write_slot_assignments_for(&assignments, None).unwrap();
+        let before = std::fs::read(&env.path).unwrap();
+        let loaded = read_slot_assignments().unwrap();
+        let live = vec![runner_info(4242, "ez-org-runner-1")];
+
+        assert_eq!(release_stale_slots_from(&loaded, &live).unwrap(), 0);
+        assert_eq!(std::fs::read(&env.path).unwrap(), before);
+        assert_eq!(
+            read_slot_assignments().unwrap().assignments,
+            assignments.assignments
+        );
     }
 
     #[test]
