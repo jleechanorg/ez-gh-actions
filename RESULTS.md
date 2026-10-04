@@ -214,3 +214,15 @@ sequentially. Per-probe budget is still capped at `LOCAL_TOP_TIMEOUT`
 `Absent` is a normal probe outcome (other 9/10 slots' evidence stays
 usable); container name surfaces to settling via `ReadinessSummary.absent`
 (see `b4669de` for the full plumbing).
+
+## Queue scheduler cadence correction (2026-10-04)
+
+The current ceiling plan returns `(Duration::ZERO, false)`; the earlier
+`true` description records the superseded implementation. Queue/invariant
+dispatch now checks each enabled monitor's own due interval before cloning
+configuration or spawning a worker. Attempts are separated by at least
+`runner.serve_tick()`, including unknown/low REST budget, tick errors, and
+OS spawn failures. This keeps tick-counted REST backoff from being compressed
+by zero-sleep ceiling or five-second settling iterations. Fallible named
+thread spawning restores both states on failure; single-flight monitoring
+remains independent of runner refill.
