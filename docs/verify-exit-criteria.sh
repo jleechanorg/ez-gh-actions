@@ -649,9 +649,7 @@ mac_probe() {
 echo "--- Checking Gate 0: Deployed code == committed code ---"
 DEPLOYED_SHA=$(~/.cargo/bin/ezgha --version 2>/dev/null | cut -d'-' -f2 || echo "none")
 CURRENT_SHA=$(git rev-parse --short HEAD)
-if [ "$DEPLOYED_SHA" != "$CURRENT_SHA" ]; then
-    fail "Deployed binary SHA ($DEPLOYED_SHA) does not match current HEAD Git SHA ($CURRENT_SHA). Run cargo install --path ."
-fi
+verify_deployed_sha "$DEPLOYED_SHA"
 
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
 UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -vE 'docs/observe|docs/goals|goals/|.beads/' || true)
@@ -675,7 +673,7 @@ else
     echo "Info: running on feature branch '$CURRENT_BRANCH' (Gate 0 strict main check bypassed)"
 fi
 
-pass "Gate 0: Deployed binary matches HEAD SHA ($CURRENT_SHA)"
+pass "Gate 0: Deployed binary ($DEPLOYED_SHA) matches HEAD ($CURRENT_SHA) or trails it only by non-build-input commits"
 
 # --- Gate 1: Code quality ---
 echo "--- Checking Gate 1: Code quality ---"

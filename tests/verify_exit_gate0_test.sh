@@ -101,4 +101,52 @@ grep -Fq 'not an ancestor' <<<"$out" || fail "non-ancestor failure omitted diagn
 rc=0; out=$(gate0 deadbee) || rc=$?
 [ "$rc" -ne 0 ] || fail "unresolvable deployed SHA must fail"
 
+# The normal verifier path must share verify_deployed_sha's tolerant policy;
+# exercising VERIFY_EXIT_CRITERIA_TEST_MODE=gate0 above alone would miss a
+# stale inline strict-equality check in the normal dispatch.
+NORMAL_REPO="$TMP/normal-repo"
+mkdir -p "$NORMAL_REPO/src" "$NORMAL_REPO/docs"
+git -C "$NORMAL_REPO" init -q
+git -C "$NORMAL_REPO" config user.email t@example.com
+git -C "$NORMAL_REPO" config user.name t
+echo 'fn main(){}' > "$NORMAL_REPO/src/main.rs"
+echo '[package]' > "$NORMAL_REPO/Cargo.toml"
+echo x > "$NORMAL_REPO/Cargo.lock"
+echo a > "$NORMAL_REPO/docs/a.md"
+git -C "$NORMAL_REPO" add -A && git -C "$NORMAL_REPO" commit -qm normal-base
+NORMAL_DEPLOYED=$(git -C "$NORMAL_REPO" rev-parse --short HEAD)
+echo b >> "$NORMAL_REPO/docs/a.md"
+git -C "$NORMAL_REPO" add -A && git -C "$NORMAL_REPO" commit -qm normal-docs-only
+
+normal_gate0() {
+  local home helper_start helper_end gate_start gate_end
+  home="$TMP/normal-home"
+  mkdir -p "$home/.cargo/bin"
+  cat > "$home/.cargo/bin/ezgha" <<EOF
+#!/usr/bin/env bash
+echo "ezgha-$1"
+EOF
+  chmod +x "$home/.cargo/bin/ezgha"
+  helper_start=$(grep -n '^verify_deployed_sha() {' "$VERIFY" | cut -d: -f1)
+  helper_end=$(awk -v start="$helper_start" 'NR > start && /^}$/ { print NR; exit }' "$VERIFY")
+  gate_start=$(grep -n '^# --- Gate 0: Deployed code == committed code ---$' "$VERIFY" | cut -d: -f1)
+  gate_end=$(grep -n '^# --- Gate 1: Code quality ---$' "$VERIFY" | cut -d: -f1)
+  [ -n "$helper_start" ] && [ -n "$helper_end" ] && [ -n "$gate_start" ] && [ -n "$gate_end" ] || fail "could not extract normal Gate 0 dispatch"
+  {
+    echo 'FAILURES=0'
+    echo 'fail() { echo "FAIL: $*" >&2; FAILURES=1; }'
+    echo 'pass() { echo "PASS: $*"; }'
+    grep '^GATE0_BUILD_INPUTS=' "$VERIFY"
+    sed -n "${helper_start},${helper_end}p" "$VERIFY"
+    sed -n "${gate_start},$((gate_end - 1))p" "$VERIFY"
+    echo 'exit "$FAILURES"'
+  } > "$TMP/normal-gate0.sh"
+  (cd "$NORMAL_REPO" && HOME="$home" bash "$TMP/normal-gate0.sh" 2>&1)
+}
+
+rc=0; out=$(normal_gate0 "$NORMAL_DEPLOYED") || rc=$?
+[ "$rc" -eq 0 ] || fail "normal Gate 0 must accept a deployed SHA that trails HEAD only by docs: $out"
+grep -Fq 'matches HEAD (' <<<"$out" \
+  || fail "normal Gate 0 omitted tolerant deployed-SHA pass message: $out"
+
 echo "VERIFY_EXIT_GATE0_TEST: PASS"
