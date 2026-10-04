@@ -77,6 +77,8 @@ const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 // budget (worst case is one slow probe + overhead, not 10 sequential 6s).
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Maximum concurrently executing `docker top` readiness probes.
+const READINESS_PROBE_CONCURRENCY: usize = 16;
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -3922,50 +3924,61 @@ where
     if owned.is_empty() {
         return Ok(ReadinessSummary::default());
     }
-    // Bounded parallelism: spawn one probe per container, capped by the
-    // current fleet contract (14 Linux + 6 Mac = 20 max — itself under the
-    // `DockerChildReaper`'s `DOCKER_REAPER_ACTIVE_CAP` of 64). The shared
-    // 30s readiness deadline (`LOCAL_READINESS_BUDGET`) means the worst-case
-    // wall-clock cost of this whole readiness pass is bounded by
-    // `LOCAL_TOP_TIMEOUT` (6s) plus deadline overhead when every top call hits
-    // its per-probe timeout.
+    // Each host probes at most 16 containers concurrently. The 14 Linux and
+    // 6 Mac runners fit in one batch on their respective hosts; excess
+    // containers use later batches under the shared 30s readiness deadline.
     //
     // Spawn-then-break on first deadline expiry: each per-container `now()`
     // call yields the remaining wall-clock budget at dispatch time, and the
-    // FIRST container whose deadline has expired is rejected (its name is
-    // surfaced for the partial-readiness error); earlier ones keep their
-    // probes running. The probe itself is `Fn + Sync`: production probes are
-    // stateless or use an internal `Mutex`; tests adapt their mutable
-    // captures with `Arc<Mutex<_>>` (see
-    // `readiness_probes_share_deadline_and_stop_after_it`).
+    // first container whose deadline has expired is rejected (its name is
+    // surfaced for the partial-readiness error). The probe itself is `Fn +
+    // Sync. Production probes are stateless or use an internal `Mutex`.
     let probe_ref = &probe;
     let mut deadline_expired: Option<String> = None;
-    let probe_results: Vec<Result<ProbeOutcome>> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(owned.len());
-        for container in &owned {
-            let timeout = match readiness_probe_timeout_until(deadline, now()) {
-                Some(timeout) => timeout,
-                None => {
-                    deadline_expired.get_or_insert_with(|| container.name.clone());
-                    break;
-                }
-            };
-            handles.push(scope.spawn(move || probe_ref(container, timeout)));
+    let probe_results: Vec<Result<ProbeOutcome>> = std::thread::scope(|scope| -> Result<_> {
+        let mut results = Vec::with_capacity(owned.len());
+        let mut next = 0;
+        while next < owned.len() {
+            let mut handles = Vec::with_capacity(READINESS_PROBE_CONCURRENCY);
+            while handles.len() < READINESS_PROBE_CONCURRENCY && next < owned.len() {
+                let container = owned[next];
+                let timeout = match readiness_probe_timeout_until(deadline, now()) {
+                    Some(timeout) => timeout,
+                    None => {
+                        deadline_expired.get_or_insert_with(|| container.name.clone());
+                        break;
+                    }
+                };
+                let name = container.name.clone();
+                let handle = std::thread::Builder::new()
+                    .name("ezgha-readiness-probe".to_string())
+                    .spawn_scoped(scope, move || probe_ref(container, timeout))
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "failed to spawn Runner.Worker readiness probe for {name}: {err}"
+                        )
+                    })?;
+                handles.push(handle);
+                next += 1;
+            }
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| -> Result<ProbeOutcome> {
+                            Err(anyhow::anyhow!(
+                                "Runner.Worker readiness probe panicked: {:?}",
+                                panic
+                            ))
+                        }),
+                );
+            }
+            if deadline_expired.is_some() {
+                break;
+            }
         }
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|panic| -> Result<ProbeOutcome> {
-                        Err(anyhow::anyhow!(
-                            "Runner.Worker readiness probe panicked: {:?}",
-                            panic
-                        ))
-                    })
-            })
-            .collect()
-    });
+        Ok(results)
+    })?;
     if let Some(name) = deadline_expired {
         return Err(anyhow::Error::msg(format!(
             "Runner.Worker readiness budget expired before inspecting {name}"
@@ -7129,6 +7142,67 @@ minimum_isolation = "container"
             "parallel probes ran sequentially (elapsed={:?}, probe_cost={:?})",
             elapsed,
             probe_cost
+        );
+    }
+
+    #[test]
+    fn readiness_probe_fanout_never_exceeds_concurrency_cap() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let count = READINESS_PROBE_CONCURRENCY * 2;
+        let cfg = cfg_with(count as u32, "ez-org-runner");
+        let containers: Vec<_> = (1..=count)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release_inside = release.clone();
+
+        let worker = std::thread::spawn(move || {
+            executing_runner_count_with_probe(
+                &cfg,
+                &containers,
+                Instant::now() + LOCAL_READINESS_BUDGET,
+                Instant::now,
+                move |_container, _timeout| {
+                    started_tx.send(()).expect("test receiver remains live");
+                    let (released, wake) = &*release_inside;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(ProbeOutcome::Ready)
+                },
+            )
+        });
+
+        for _ in 0..READINESS_PROBE_CONCURRENCY {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the first capped probe batch must start");
+        }
+        assert!(
+            matches!(
+                started_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "a stale numeric-prefix fleet must not spawn probe {}/{} before the first batch finishes",
+            READINESS_PROBE_CONCURRENCY + 1,
+            count
+        );
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(
+            worker
+                .join()
+                .expect("readiness worker must not panic")
+                .unwrap()
+                .ready,
+            count as u32,
+            "later batches run after capacity is released"
         );
     }
 

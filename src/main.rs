@@ -823,6 +823,21 @@ fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration,
     }
 }
 
+fn dispatch_async_monitor_ticks<Q, C>(
+    _legacy_run_monitors: bool,
+    mut dispatch_queue: Q,
+    mut dispatch_canary: C,
+) where
+    Q: FnMut(),
+    C: FnMut(),
+{
+    // Queue and canary schedulers independently enforce their own due interval
+    // and single-flight constraints. Ceiling must not suppress either one:
+    // it is a refill-priority signal, not a telemetry/canary pause.
+    dispatch_queue();
+    dispatch_canary();
+}
+
 fn apply_local_settling_decision(
     settling: &mut Option<SettlingEpisode>,
     pending_readiness: &mut bool,
@@ -1595,11 +1610,16 @@ fn main() -> Result<()> {
                 // JoinHandle payload (no Arc<Mutex<>>, no overlap).
                 watchdog::ping();
                 let monitor_loop_start = Instant::now();
-                let _ = queue_monitor_scheduler.maybe_dispatch(&cfg, monitor_loop_start);
-                watchdog::ping();
-                if run_monitors {
-                    let _ = canary_scheduler.maybe_check(&cfg);
-                }
+                dispatch_async_monitor_ticks(
+                    run_monitors,
+                    || {
+                        let _ = queue_monitor_scheduler.maybe_dispatch(&cfg, monitor_loop_start);
+                        watchdog::ping();
+                    },
+                    || {
+                        let _ = canary_scheduler.maybe_check(&cfg);
+                    },
+                );
                 watchdog::ping();
                 // Dead-man's switch: prove the alert pipeline is alive.
                 // Runs once per serve-loop tick regardless of ensure success
@@ -2275,6 +2295,33 @@ mod tests {
             settling_plan(&cfg, SettlingDecision::Recovered),
             (Duration::from_secs(30), true),
             "recovery resumes monitors and the configured cadence"
+        );
+    }
+
+    #[test]
+    fn ceiling_dispatches_async_canary_despite_legacy_monitor_gate() {
+        let cfg = test_config();
+        let (_, run_monitors) = settling_plan(&cfg, SettlingDecision::Ceiling);
+        assert!(
+            !run_monitors,
+            "Ceiling retains zero-sleep refill priority over legacy synchronous monitors"
+        );
+
+        let mut queue_dispatched = false;
+        let mut canary_dispatched = false;
+        dispatch_async_monitor_ticks(
+            run_monitors,
+            || queue_dispatched = true,
+            || canary_dispatched = true,
+        );
+
+        assert!(
+            queue_dispatched,
+            "queue scheduler remains dispatched on Ceiling"
+        );
+        assert!(
+            canary_dispatched,
+            "canary must remain interval-limited but cannot be starved by Ceiling"
         );
     }
 
