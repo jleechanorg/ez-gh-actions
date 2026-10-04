@@ -76,6 +76,13 @@ for name in agent-scoped-launch.sh assert-host-containment-release1.sh apply-hos
   fi
 done
 
+# Record the QEMU guard calls without inspecting or changing live cgroups.
+cat > "${TEMP_REPO}/scripts/host/qemu-ceiling-guard.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'qemu-ceiling-guard:%s\n' "$*" >> "${SYSTEMCTL_CAPTURE:?}"
+EOF
+chmod +x "${TEMP_REPO}/scripts/host/qemu-ceiling-guard.sh"
+
 # ── 2. Stub PATH ───────────────────────────────────────────────────────────
 STUB_BIN="${WORK}/bin"
 mkdir -p "${STUB_BIN}"
@@ -228,6 +235,12 @@ touch "${HOME_A}/.config/systemd/user/agent-scope-reaper.service" \
 mkdir -p "${HOME_A}/.local/libexec/ezgha"
 touch "${HOME_A}/.local/libexec/ezgha/agent-scope-reaper.sh"
 run_install "${HOME_A}" "${STATE_A}"
+
+for args in "" "--apply"; do
+  if ! grep -Fqx "qemu-ceiling-guard:${args}" "${SYSTEMCTL_CAPTURE}"; then
+    fail "Case A: installer skipped QEMU guard invocation: ${args:-check}"
+  fi
+done
 
 if [ -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
   fail "Case A: default run failed to disable ezgha-watchdog.timer"

@@ -18,8 +18,8 @@
 # doctor-runner (via sed, not a re-implementation) so it can't silently
 # drift from the real logic, then exercises it against fixture per-slot
 # counts, asserting:
-#   (a) 1 executing + 15 IDLE-OK with no queue -> NOT critical.
-#   (b) all 10 Linux + 6 Mac configured slots executing -> NOT critical.
+#   (a) 1 executing + 19 IDLE-OK with no queue -> NOT critical.
+#   (b) all 14 Linux + 6 Mac configured slots executing -> NOT critical.
 #   (c) one slot cycling under daemon management -> NOT critical.
 #   (d) one persisted-DOWN slot -> critical.
 #
@@ -56,8 +56,8 @@ if grep -q 'CONTAINER_COUNT:-0}" -lt' "$DOCTOR_SCRIPT"; then
 fi
 
 # The production call must derive the aggregate expected count from both host
-# contracts. Passing local CONFIGURED_COUNT (10 on Linux) would let all six Mac
-# slots be non-executing while 10 >= 10 still greens.
+# contracts. Passing local CONFIGURED_COUNT (14 on Linux) would let all six Mac
+# slots be non-executing while 14 >= 14 still greens.
 if ! grep -Fq 'FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))' "$DOCTOR_SCRIPT"; then
   echo "FAIL: production gate does not derive aggregate local+remote configured count" >&2
   exit 1
@@ -113,17 +113,17 @@ run_case() {
 echo "--- doctor-runner live-slot gate regression ---"
 OVERALL_PASS=true
 
-# A drained queue with 1 executing and 15 IDLE-OK slots is healthy.
-run_case "1exec-15idle-ok-16expected" 1 9 0 0 6 0 16 "no" || OVERALL_PASS=false
+# A drained queue with 1 executing and 19 IDLE-OK slots is healthy.
+run_case "1exec-19idle-ok-20expected" 1 13 0 0 6 0 20 "no" || OVERALL_PASS=false
 
 # Full configured capacity executing remains healthy.
-run_case "10linux-6mac-exec-16expected" 10 0 0 6 0 0 16 "no" || OVERALL_PASS=false
+run_case "14linux-6mac-exec-20expected" 14 0 0 6 0 0 20 "no" || OVERALL_PASS=false
 
 # A journal-confirmed cycling slot remains under daemon management.
-run_case "9linux-exec-1cycling-6mac-idle-16expected" 9 0 1 0 6 0 16 "no" || OVERALL_PASS=false
+run_case "13linux-exec-1cycling-6mac-idle-20expected" 13 0 1 0 6 0 20 "no" || OVERALL_PASS=false
 
 # Persisted remote DOWN slots remain critical.
-run_case "9linux-exec-6mac-idle-1down-16expected" 9 0 0 0 6 0 16 "yes" || OVERALL_PASS=false
+run_case "13linux-exec-6mac-idle-1down-20expected" 13 0 0 0 6 0 20 "yes" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

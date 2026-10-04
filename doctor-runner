@@ -320,7 +320,7 @@ fi
 # Section-scoped count: slot_assignments.toml now carries BOTH [assignments]
 # and [registered_at] sections, one line per slot each (registered_at was
 # added during churn remediation). A whole-file `grep -c '='` therefore
-# double-counts (~28 for a 16-slot fleet) — see ez-gh-actions-nj2j. Count
+# double-counts (~28 for a 14-slot Linux fleet) — see ez-gh-actions-nj2j. Count
 # only lines inside [assignments], never a whole-file grep.
 count_assignments_section() {
   awk '
@@ -765,7 +765,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
 CONFIGURED_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
-DEFAULT_LINUX_RUNNER_COUNT=10
+DEFAULT_LINUX_RUNNER_COUNT=14
 DEFAULT_MAC_RUNNER_COUNT=6
 if [ "$PLATFORM" = "macos" ]; then
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_MAC_RUNNER_COUNT"
@@ -851,7 +851,7 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ] || [ "${#_FIRST_IDLE[@]}" -gt 0 ]; then
   for _name in "${DOWN_SLOTS[@]}"; do
     case "$(classify_local_slot "$_name")" in
       DOWN)      _PERSISTENT_DOWN+=("$_name") ;;
-      IDLE)      IDLE_SLOTS+=("$_name");      _BLINKED+=("$_name") ;;
+      IDLE)      CYCLING_SLOTS+=("$_name");  _BLINKED+=("$_name") ;;
       EXECUTING) EXECUTING_SLOTS+=("$_name"); _BLINKED+=("$_name") ;;
     esac
   done
@@ -1249,9 +1249,9 @@ REMOTE_DOWN_SLOTS=()
 # REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
 # below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
 # printed only a warn() — `configured` then collapsed to the local-only
-# count (e.g. 10 instead of 16, per this repo's current 10-Linux + 6-Mac
+# count (e.g. 14 instead of 20, per this repo's current 14-Linux + 6-Mac
 # contract) so a Linux run with the Mac unreachable reported "fleet
-# healthy: 10/10" instead of "10/16 with 6 down". Treat
+# healthy: 14/14" instead of "14/20 with 6 down". Treat
 # unreachable as the strongest negative signal available (we have ZERO
 # evidence about any of the remote slots, so all of them are unproven):
 # populate REMOTE_DOWN_SLOTS with synthetic names so the verdict gate
@@ -1325,7 +1325,7 @@ else
   # conservatively reported as DOWN. This (a) keeps `configured` at the
   # full expected fleet size (no silent local-only collapse), (b) puts
   # the unreachable slots into the headline `down` count (so a Mac
-  # outage from jeff-ubuntu is reported as 6/16 down, not "0/10 down"),
+  # outage from jeff-ubuntu is reported as 6/20 down, not "0/14 down"),
   # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
   # `ok` to `bad` so an unreachable host can never silently green.
   REMOTE_UNREACHABLE=1
@@ -1499,7 +1499,7 @@ fi
 # CONFIGURED_COUNT), NOT from a whole-file grep of slot_assignments.toml.
 # That file now carries BOTH [assignments] and [registered_at] sections
 # (registered_at added during churn remediation), one line per slot each, so
-# a plain `grep -c '='` double-counts (~28 for a 16-slot fleet) and falsely
+# a plain `grep -c '='` double-counts (~28 for a 14-slot Linux fleet) and falsely
 # tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
 # config.toml is unreadable): count lines within the [assignments] section
 # ONLY, never a whole-file grep.
@@ -1593,7 +1593,7 @@ if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
 fi
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
-# the "16/16 executing" standard — ground truth from docker, not the
+# the "20/20 executing" standard — ground truth from docker, not the
 # GitHub API, so it cannot be fooled by a rate-limited fleet-state query.
 # Per-slot bad() lines already printed above (section 9/10); this is the
 # verdict-level summary tying that evidence to the CRITICAL count.

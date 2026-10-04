@@ -4,10 +4,10 @@
 `ezgha` is a Rust CLI that manages ephemeral self-hosted GitHub Actions runners using Docker JIT registration. One binary; installs as a user systemd service.
 
 ## Fleet capacity standard — no excuses, prove per-slot execution
-The fleet MUST run its full configured capacity: **10 Linux** (ez-runner-c-1..10 on jeff-ubuntu) + **6 Mac** (ez-mac-runner-g-1..6) = **16 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 16/16 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
+The fleet MUST run its full configured capacity: **14 Linux** (ez-runner-c-1..14 on jeff-ubuntu) + **6 Mac** (ez-mac-runner-g-1..6) = **20 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 20/20 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
 - **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returned TRUNCATED/partial data — during the prior 22-runner contract, the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
 - **`./doctor-runner` is authoritative** (`./doctor.sh` is a legacy back-reference, broken on docker 27+). Run it; fix any DOWN (no container) or IDLE-STARVED (queued work waiting at least 5 minutes with no `Runner.Worker`) slot before declaring the fleet healthy.
-- Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 10). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
+- Known failure mode: a rate-limited monitor in the single-threaded serve loop can starve `ensure_count` so runners aren't respawned (fleet silently drops below 14). See beads ez-gh-actions-yrt (backoff/circuit-breaker), zai (dedup), nuk (GitHub App).
 
 ## Key files
 - `src/docker_backend.rs` — core runner lifecycle (slot allocation, container management)
