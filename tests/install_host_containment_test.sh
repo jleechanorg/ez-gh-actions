@@ -80,6 +80,12 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
+  enable)
+    if [ "${SYSTEMCTL_REAPPLY_FAIL:-0}" = 1 ] && [[ " $* " == *" lima-vm-cpu-ceiling.service "* ]]; then
+      echo reapply-enable-failed >> "$EVENT_LOG"
+      exit 1
+    fi
+    exit 0 ;;
   show)
     if [[ " $* " == *" -p ActiveState "* ]]; then echo inactive; fi
     exit 0 ;;
@@ -227,6 +233,17 @@ if ! grep -qx 'install-service:unix:///fixture/context.sock' "$CONTEXT_EVENT_LOG
   cat "$CONTEXT_EVENT_LOG" >&2 || true
   fail "active systemd service refresh did not persist the selected endpoint"
 fi
+REAPPLY_HOME="$WORK/reapply_home"
+REAPPLY_LOG="$WORK/reapply_events"
+mkdir -p "$REAPPLY_HOME/.config/ezgha"
+printf '[runner]\ncount = 14\n' > "$REAPPLY_HOME/.config/ezgha/config.toml"
+if env EVENT_LOG="$REAPPLY_LOG" PATH="$STUB_BIN:$PATH" HOME="$REAPPLY_HOME" CARGO_HOME="$REAPPLY_HOME/.cargo" XDG_CONFIG_HOME="$REAPPLY_HOME/.config" \
+    SYSTEMCTL_REAPPLY_FAIL=1 bash "$TEMP_REPO/install.sh" --dev > "$WORK/reapply-install.log" 2>&1; then
+  fail "failed required QEMU reapply service enable allowed successful installation"
+fi
+grep -qx reapply-enable-failed "$REAPPLY_LOG" || fail "fixture missed reapply enable failure"
+grep -q 'lima-vm-cpu-ceiling.service not enabled' "$WORK/reapply-install.log" || fail "required reapply failure was not reported"
+
 if [ "${INSTALL_HOST_CONTAINMENT_LEGACY_TOML:-0}" = 1 ]; then
   echo "INSTALL_HOST_CONTAINMENT_LEGACY_TOML_TEST: PASS"
 else

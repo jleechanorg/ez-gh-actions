@@ -5425,6 +5425,17 @@ mod tests {
             mem <= expected_mem_share,
             "effective_limits must clamp memory to daemon/count (got {mem} > {expected_mem_share})"
         );
+
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut native: Config =
+            toml::from_str(include_str!("../config/config.toml.linux.example")).unwrap();
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = Some(Some((32.0, 64000)));
+        let approved = effective_limits(&native);
+        native.limits.memory_mb = 2300;
+        let increased = effective_limits(&native);
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
+        assert_eq!(approved.unwrap().1, 2000);
+        assert_eq!(increased.unwrap().1, 2048);
     }
 
     #[test]
@@ -5674,10 +5685,26 @@ mod tests {
 
     #[test]
     fn derive_memory_budget_supports_approved_fourteen_runner_floor() {
-        let budget = derive_memory_budget(36864, 4096, 14, 2000).unwrap();
-        assert_eq!(budget.fleet_budget_mb, 32768);
-        assert_eq!(budget.per_runner_budget_mb, 2340);
-        assert!(derive_memory_budget(36864, 4096, 14, 2500).is_err());
+        let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
+            .expect("tracked native Linux configuration must parse");
+        let budget = derive_memory_budget(
+            cfg.runner.vm_total_mb.unwrap(),
+            cfg.runner.guest_reserve_mb,
+            cfg.runner.count,
+            cfg.runner.runner_floor_mb,
+        )
+        .unwrap();
+        assert_eq!(budget.fleet_budget_mb, 28672);
+        assert_eq!(budget.per_runner_budget_mb, 2048);
+        assert_eq!(u64::from(cfg.runner.count) * cfg.limits.memory_mb, 28000);
+        assert!(u64::from(cfg.runner.count) * cfg.limits.memory_mb <= budget.fleet_budget_mb);
+        assert!(derive_memory_budget(
+            cfg.runner.vm_total_mb.unwrap(),
+            cfg.runner.guest_reserve_mb,
+            cfg.runner.count,
+            2049,
+        )
+        .is_err());
     }
 
     #[test]

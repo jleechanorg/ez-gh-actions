@@ -11,13 +11,13 @@ name_prefix = "ez-runner-c"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64"]
 count = 14
 image = "ezgha-runner:latest"
-# Keep the existing VM and host memory envelope; 14 × 2000 MiB remains below
-# the 32768 MiB guest budget after its 4096 MiB reserve.
-vm_total_mb = 36864
-guest_reserve_mb = 4096
+# The legacy vm_total_mb field pins the native actions.slice pool to 28 GiB.
+# Docker/OS overhead and the separate QEMU VM are outside this runner pool.
+vm_total_mb = 28672
+guest_reserve_mb = 0
 runner_floor_mb = 2000
-# Reserve 8 GiB of the existing 62.8 GiB physical host for the host OS and
-# non-runner services. The configured VM total must fit below this envelope.
+# Retain the host-headroom check; the canonical containment assertion separately
+# checks all four hard caps (55 GiB) plus max(2 GiB, 10% of host RAM) reserve.
 host_reserve_mb = 8192
 
 [limits]

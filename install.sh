@@ -904,7 +904,8 @@ EOF
     if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
       ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
     else
-      warn "lima-vm-cpu-ceiling.service not enabled"
+      bad "lima-vm-cpu-ceiling.service not enabled"
+      exit 1
     fi
     for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then

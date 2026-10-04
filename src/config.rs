@@ -1110,6 +1110,8 @@ minimum_isolation = "container"
             .expect("tracked Linux fleet example must validate");
         assert_eq!(cfg.runner.count, 14);
         assert_eq!(cfg.runner.runner_floor_mb, 2000);
+        assert_eq!(cfg.runner.vm_total_mb, Some(28672));
+        assert_eq!(cfg.runner.guest_reserve_mb, 0);
         assert_eq!(cfg.limits.memory_mb, 2000);
         assert_eq!(cfg.runner.image, "ezgha-runner:latest");
         assert_eq!(cfg.limits.cgroup_parent.as_deref(), Some("actions.slice"));
