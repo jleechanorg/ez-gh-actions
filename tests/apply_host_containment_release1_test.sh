@@ -133,7 +133,7 @@ grep -q "agents.slice non-reclaimable 11811160064 bytes > 9663676416" "$WORK/pre
   || fail "agents refusal lacks the measured numbers: $(tail -2 "$WORK/preflight_agents_anon.log")"
 # shmem is not reclaimable: 16G current, 6G file of which 3G shmem -> 13G refuses.
 preflight_case agents_shmem agents.slice $((16 * G)) $((6 * G)) $((3 * G)) refuse
-# automation: 7G current with 2G cache -> 5G <= 6G passes; 7G with 0.5G cache refuses.
+# automation: 4G minus 0.5G cache meets admission; 5G minus 0.5G refuses.
 preflight_case automation_cache automation.slice $((4 * G)) $((G / 2)) 0 pass
 preflight_case automation_anon automation.slice $((5 * G)) $((G / 2)) 0 refuse
 ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its non-reclaimable use and changes nothing"

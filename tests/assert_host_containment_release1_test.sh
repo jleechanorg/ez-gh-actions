@@ -205,7 +205,7 @@ chmod +x "$PROPS_BIN/systemctl"
 write_props 10737418240 12884901888 4831838208 5368709120 > "$WORK/props_ok.txt"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1 \
-  || fail "live systemd checks rejected 13G/14G agents + 7G/8G automation: $(tail -3 "$WORK/live_ok.log")"
+  || fail "live systemd checks rejected 10G/12G agents + 4608M/5G automation: $(tail -3 "$WORK/live_ok.log")"
 # The pre-154k 18G/20G + 8G/10G maxima over-commit the host-docker envelope.
 write_props 19327352832 21474836480 5368709120 10737418240 > "$WORK/props_old.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \

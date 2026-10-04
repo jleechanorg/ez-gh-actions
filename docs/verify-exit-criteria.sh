@@ -1307,7 +1307,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     }
 
     # Host-docker hosts sum their live maxima once in Gate 8 (4)
-    # (verify_host_docker_envelope); app-lima-vm.slice's 9G/10G term
+    # (verify_host_docker_envelope); app-lima-vm.slice's 34G/38G term
     # belongs only to the VM-backed sum below.
     MODERN_HOST_DOCKER=0
     if host_docker_requires_actions_oomctl; then
