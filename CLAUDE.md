@@ -55,6 +55,13 @@ image = "ezgha-runner:latest"
 ## Reproducibility discipline — no orphaned one-off fixes
 Every fix applied during an incident must land in a **git-tracked** file (`install.sh`, `Dockerfile.runner`, `config/*.toml.example`, this file, README, a `.claude/skills/*` doc, or at minimum a `br` bead with the exact remediation) before the session ends. A fix that exists only as local host state (a manually rebuilt Docker image, a hand-edited `~/Library/LaunchAgents/*.plist`, a one-off `docker build`/`sysctl`/`launchctl` invocation) is **not done** — if this machine were wiped and `./install.sh` re-run on a fresh Mac, every fix from every past incident must reappear automatically. When you fix something live on the host, ask "does `install.sh` (or the daemon/config) reproduce this on a fresh machine?" — if not, encode it there before moving on, not just in a memory file or a bead comment.
 
+## Sentinel checks at install time — behavioral, not presential
+Install-time sentinels (`install.sh:619`, `launchd/install-launchagents.sh:verify_rendered_plist`, `verify_scripts_exist`) MUST check **behavioral correctness**, not just symbol presence. The 2026-08-20 Mac fleet outage (line 366 path bug, 311+ silent REBUILD FAILED over 19 days) shipped because the prior sentinel only did `grep -q 'ensure_runner_image'` — the function existed, the sentinel passed, the underlying build command was silently broken. When adding or modifying any install-time sentinel:
+- ✅ DO assert behavior: run the function in a dry-run/probe mode, assert output, parse a marker file written on success, or invoke a real test (e.g., `bash -n` for syntax + a 1-shot probe invocation)
+- ❌ DO NOT rely solely on `grep -q '<symbol_name>'` or `grep -q '<literal_string>'` — the symbol/string can exist while being broken
+- ✅ DO wire any new sentinel/error path to `alerts.jsonl` (or a future Slack/email sink) — silent install-time failures are exactly the class that triggered the 19-day outage
+- ✅ DO add a real-Docker integration test (Layer 2, see `tests/workspace_mount_symlink_extraction_test.sh` pattern) that exercises the sentinel's claim end-to-end
+
 ## After any commit (IMPORTANT — Gate 0)
 Gate 0 checks that the installed binary's embedded SHA matches the current `HEAD` commit.
 **Every commit — even docs-only — advances HEAD**, so you must always rebuild after committing:
