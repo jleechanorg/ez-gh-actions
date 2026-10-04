@@ -848,7 +848,7 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ] || [ "${#_FIRST_IDLE[@]}" -gt 0 ]; then
   for _name in "${DOWN_SLOTS[@]}"; do
     case "$(classify_local_slot "$_name")" in
       DOWN)      _PERSISTENT_DOWN+=("$_name") ;;
-      IDLE)      IDLE_SLOTS+=("$_name");      _BLINKED+=("$_name") ;;
+      IDLE)      CYCLING_SLOTS+=("$_name");  _BLINKED+=("$_name") ;;
       EXECUTING) EXECUTING_SLOTS+=("$_name"); _BLINKED+=("$_name") ;;
     esac
   done

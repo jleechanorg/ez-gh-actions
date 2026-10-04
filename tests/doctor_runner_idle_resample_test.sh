@@ -73,7 +73,7 @@ run_local() {  # $1 = queued count, $2 = oldest queued minutes; slot seqs preset
     sleep() { echo SLEEP; }
     eval "$LOCAL_SAMPLE"
     eval "$LOCAL_VERDICT"
-    echo "CRITICAL=$SLOT_PROOF_CRITICAL EXEC=${#EXECUTING_SLOTS[@]} IDLE=${#IDLE_SLOTS[@]} DOWN=${#DOWN_SLOTS[@]}"
+    echo "CRITICAL=$SLOT_PROOF_CRITICAL EXEC=${#EXECUTING_SLOTS[@]} IDLE=${#IDLE_SLOTS[@]} DOWN=${#DOWN_SLOTS[@]} CYCLING=${#CYCLING_SLOTS[@]} NAMES=${CYCLING_SLOTS[*]}"
   ) 2>&1
 }
 
@@ -94,7 +94,7 @@ run_remote() {  # $1 = queued count, $2 = oldest queued minutes
     sleep() { echo SLEEP; }
     eval "$REMOTE_FUNCS"
     eval "$REMOTE_VERDICT"
-    echo "CRITICAL=$SLOT_PROOF_CRITICAL EXEC=${#REMOTE_EXECUTING_SLOTS[@]} IDLE=${#REMOTE_IDLE_SLOTS[@]} DOWN=${#REMOTE_DOWN_SLOTS[@]}"
+    echo "CRITICAL=$SLOT_PROOF_CRITICAL EXEC=${#REMOTE_EXECUTING_SLOTS[@]} IDLE=${#REMOTE_IDLE_SLOTS[@]} DOWN=${#REMOTE_DOWN_SLOTS[@]} CYCLING=${#REMOTE_CYCLING_SLOTS[@]} NAMES=${REMOTE_CYCLING_SLOTS[*]}"
   ) 2>&1
 }
 
@@ -106,6 +106,10 @@ check "local idle->executing: not critical, counted EXECUTING" "grep -q 'CRITICA
 setseq slot-1 IDLE IDLE
 out=$(run_local 12 9)
 check "local idle->idle with starved queue: IDLE-STARVED critical" "grep -q 'BAD IDLE-STARVED' <<<\"\$out\" && grep -q 'CRITICAL=1 EXEC=0 IDLE=1 DOWN=0' <<<\"\$out\""
+
+setseq slot-1 ABSENT IDLE
+out=$(run_local 12 9)
+check "local absent->idle (respawned): CYCLING, not IDLE-STARVED" "grep -q 'CRITICAL=0 EXEC=0 IDLE=0 DOWN=0 CYCLING=1 NAMES=slot-1' <<<\"\$out\" && ! grep -q 'IDLE-STARVED' <<<\"\$out\""
 
 setseq slot-1 IDLE ABSENT
 out=$(run_local 12 9)
@@ -128,6 +132,10 @@ check "remote idle->executing: not critical" "grep -q 'CRITICAL=0 EXEC=1 IDLE=0 
 setseq rslot-1 IDLE IDLE
 out=$(run_remote 12 9)
 check "remote idle->idle with starved queue: IDLE-STARVED critical" "grep -q 'BAD .*IDLE-STARVED' <<<\"\$out\" && grep -q 'CRITICAL=1 EXEC=0 IDLE=1 DOWN=0' <<<\"\$out\""
+
+setseq rslot-1 ABSENT IDLE
+out=$(run_remote 12 9)
+check "remote absent->idle (respawned): CYCLING, not IDLE-STARVED" "grep -q 'CRITICAL=0 EXEC=0 IDLE=0 DOWN=0 CYCLING=1 NAMES=rslot-1' <<<\"\$out\" && ! grep -q 'IDLE-STARVED' <<<\"\$out\""
 
 setseq rslot-1 IDLE ABSENT
 out=$(run_remote 12 9)
