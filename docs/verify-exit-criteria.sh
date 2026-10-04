@@ -531,16 +531,46 @@ memory_limit_to_mb() {
     esac
 }
 
-native_actions_envelope() {
-    local total_mb="$1" native_actions="$2" actions_unit="$3" runner_count="$4"
-    local selected_tasks actions_max
-    selected_tasks=$(actions_tasks_max_for_runner_count "$runner_count") || return 1
-    if [ "$native_actions" = "1" ]; then
-        actions_max=$(awk -F= '$1 == "MemoryMax" {print $2; exit}' "$actions_unit")
-        actions_max=$(memory_limit_to_mb "$actions_max") || return 1
-        total_mb=$((total_mb + actions_max))
+modern_envelope_required() {
+    if [ "$(uname -s)" = Linux ] && ! daemon_in_vm; then
+        return 0
     fi
-    printf '%s %s\n' "$total_mb" "$selected_tasks"
+    [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
+        && [ -f "${MODERN_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" ] \
+        && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
+        && [ -f "${MODERN_UNIT_DIR}/automation.slice" ] \
+        && [ -f "${MODERN_WRAPPER}" ] \
+        && grep -q '^# ezgha-agent-wrapper$' "${MODERN_WRAPPER}"
+}
+
+modern_envelope_budget() {
+    local unit_dir="$1" actions_unit="$2" native="$3" count="$4" host_mb="$5"
+    local total_mb=0 selected_tasks reserve_mb unit key value converted max_mb
+    local units=("$unit_dir/lima-vm@colima.service.d/99-memory-ceiling.conf"
+                 "$unit_dir/agents.slice" "$unit_dir/automation.slice")
+    [ -r "$unit_dir/app-lima-vm.slice" ] || return 1
+    [ "$native" != 1 ] || units+=("$actions_unit")
+    selected_tasks=$(actions_tasks_max_for_runner_count "$count") || return 1
+    [[ "$host_mb" =~ ^[1-9][0-9]*$ ]] || return 1
+    for unit in "${units[@]}"; do
+        [ -r "$unit" ] || return 1
+        for key in MemoryHigh MemoryMax MemorySwapMax TasksMax; do
+            value=$(awk -F= -v key="$key" '$1 == key {print $2; exit}' "$unit") || return 1
+            if [ "$key" = TasksMax ]; then
+                [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+            else
+                [[ "$value" =~ ^[0-9]+[GMK]?$ ]] || return 1
+                converted=$(memory_limit_to_mb "$value") || return 1
+                [ "$key" = MemorySwapMax ] || [ "$converted" -gt 0 ] || return 1
+                [ "$key" != MemoryMax ] || max_mb="$converted"
+            fi
+        done
+        total_mb=$((total_mb + max_mb))
+    done
+    reserve_mb=$((host_mb / 10))
+    [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
+    [ $((total_mb + reserve_mb)) -le "$host_mb" ] || return 1
+    printf '%s %s %s\n' "$total_mb" "$selected_tasks" "$reserve_mb"
 }
 
 verify_retired_timer_policy() {
@@ -595,14 +625,8 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         kdump) verify_kdump_pstore ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         modern_policy)
-            base_mb="$VERIFY_EXIT_CRITERIA_MODERN_BASE_MB"
-            [ -n "$base_mb" ] || base_mb=0
-            policy=$(native_actions_envelope "$base_mb" "$VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS" "$VERIFY_EXIT_CRITERIA_ACTIONS_UNIT" "$VERIFY_EXIT_CRITERIA_RUNNER_COUNT") || exit 1
-            read -r total_mb selected_tasks <<<"$policy"
-            host_mb="$VERIFY_EXIT_CRITERIA_HOST_MB"
-            reserve_mb=$((host_mb / 10))
-            [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
-            [ $((total_mb + reserve_mb)) -le "$host_mb" ] || exit 1
+            policy=$(modern_envelope_budget "$VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR" "$VERIFY_EXIT_CRITERIA_ACTIONS_UNIT" "$VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS" "$VERIFY_EXIT_CRITERIA_RUNNER_COUNT" "$VERIFY_EXIT_CRITERIA_HOST_MB") || exit 1
+            read -r total_mb selected_tasks reserve_mb <<<"$policy"
             verify_retired_timer_policy || exit 1
             echo "selected_tasks=$selected_tasks"
             ;;
@@ -1215,54 +1239,15 @@ if [ "$(uname -s)" = "Linux" ]; then
     echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
 fi
 IS_MODERN_ENVELOPE=0
-if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
-   && [ -f "${MODERN_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" ] \
-   && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
-   && [ -f "${MODERN_UNIT_DIR}/automation.slice" ] \
-   && [ -f "${MODERN_WRAPPER}" ] \
-   && grep -q '^# ezgha-agent-wrapper$' "${MODERN_WRAPPER}"; then
+if modern_envelope_required; then
     IS_MODERN_ENVELOPE=1
     echo "    [INFO] Gate 8: modern finite host envelope detected"
-    modern_unit_value() {
-        awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"
-    }
-    modern_to_mb() {
-        case "$1" in
-            *G) echo $(( ${1%G} * 1024 )) ;;
-            *M) echo "${1%M}" ;;
-            *K) echo $(( ${1%K} / 1024 )) ;;
-            *[!0-9]*) echo 0 ;;
-            *) echo $(( $1 / 1024 / 1024 )) ;;
-        esac
-    }
-
-    MODERN_MAX_TOTAL_MB=0
-    # Enforce direct QEMU service dropin (ModernGate8 sum reflects direct effective service)
-    qemu_dropin="${MODERN_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-    q_high=$(modern_unit_value "$qemu_dropin" MemoryHigh)
-    q_max=$(modern_unit_value "$qemu_dropin" MemoryMax)
-    q_swap=$(modern_unit_value "$qemu_dropin" MemorySwapMax)
-    q_tasks=$(modern_unit_value "$qemu_dropin" TasksMax)
-    if [ -z "$q_high" ] || [ "$q_high" = max ] || [ -z "$q_max" ] || [ "$q_max" = max ] \
-       || [ -z "$q_swap" ] || [ "$q_swap" = max ] || [ -z "$q_tasks" ] || [ "$q_tasks" = infinity ]; then
-        fail "Gate 8 modern envelope: direct QEMU drop-in lacks a finite MemoryHigh/MemoryMax/MemorySwapMax/TasksMax tuple"
-    fi
-    MODERN_MAX_TOTAL_MB=$((MODERN_MAX_TOTAL_MB + $(modern_to_mb "$q_max")))
-    echo "    [PASS] direct QEMU service (lima-vm@colima): high=${q_high} max=${q_max} swap=${q_swap} tasks=${q_tasks}"
-
-    for slice in agents.slice automation.slice; do
-        slice_file="${MODERN_UNIT_DIR}/${slice}"
-        high=$(modern_unit_value "$slice_file" MemoryHigh)
-        max=$(modern_unit_value "$slice_file" MemoryMax)
-        swap=$(modern_unit_value "$slice_file" MemorySwapMax)
-        tasks=$(modern_unit_value "$slice_file" TasksMax)
-        if [ -z "$high" ] || [ "$high" = max ] || [ -z "$max" ] || [ "$max" = max ] \
-           || [ -z "$swap" ] || [ "$swap" = max ] || [ -z "$tasks" ] || [ "$tasks" = infinity ]; then
-            fail "Gate 8 modern envelope: ${slice} lacks a finite MemoryHigh/MemoryMax/MemorySwapMax/TasksMax tuple"
-        fi
-        MODERN_MAX_TOTAL_MB=$((MODERN_MAX_TOTAL_MB + $(modern_to_mb "$max")))
-        echo "    [PASS] ${slice}: high=${high} max=${max} swap=${swap} tasks=${tasks}"
-    done
+    MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
+    native_actions=1
+    if daemon_in_vm; then native_actions=0; fi
+    profile=$(modern_envelope_budget "$MODERN_UNIT_DIR" "$REPO_ROOT/systemd/host/actions.slice" "$native_actions" "$COUNT" "$MODERN_HOST_TOTAL_MB") \
+        || fail "Gate 8 modern envelope: required finite unit limits are unreadable, invalid, or exceed host RAM plus reserve"
+    read -r MODERN_MAX_TOTAL_MB selected_tasks MODERN_RESERVE_MB <<<"$profile"
 
     # Gate 8 runner aggregate: the configured Linux and Mac container limits
     # must be nested inside a finite actions.slice. Where the docker daemon
@@ -1330,8 +1315,6 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         host_max=$(cat /sys/fs/cgroup/actions.slice/memory.max 2>/dev/null || true)
         host_swap=$(cat /sys/fs/cgroup/actions.slice/memory.swap.max 2>/dev/null || true)
         host_tasks=$(cat /sys/fs/cgroup/actions.slice/pids.max 2>/dev/null || true)
-        profile=$(native_actions_envelope "$MODERN_MAX_TOTAL_MB" 1 "$host_unit" "$COUNT") || fail "Gate 8 host runner aggregate: could not derive selected actions profile"
-        read -r MODERN_MAX_TOTAL_MB selected_tasks <<<"$profile"
         if [ -z "$host_high_expect" ] || [ -z "$host_max_expect" ] || [ -z "$selected_tasks" ] \
            || [ "$host_high" != "$host_high_expect" ] \
            || [ "$host_max" != "$host_max_expect" ] \
@@ -1342,14 +1325,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] Gate 8 host runner aggregate: live actions.slice matches selected $COUNT-runner profile (high=$host_high max=$host_max swap=$host_swap tasks=$host_tasks); runner membership proven above"
     fi
 
-    MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
-    MODERN_RESERVE_MB=$((MODERN_HOST_TOTAL_MB / 10))
-    [ "$MODERN_RESERVE_MB" -ge 2048 ] || MODERN_RESERVE_MB=2048
-    if [ $((MODERN_MAX_TOTAL_MB + MODERN_RESERVE_MB)) -gt "$MODERN_HOST_TOTAL_MB" ]; then
-        fail "Gate 8 modern envelope: hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB exceed host ${MODERN_HOST_TOTAL_MB}MB"
-    else
-        echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
-    fi
+    echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
 
     if ! verify_retired_timer_policy; then
         fail "Gate 8 modern envelope: retired reaper/PSI timers must be disabled and inactive, or absent"
@@ -1566,6 +1542,7 @@ fi
 
 if [ "$(uname -s)" = "Linux" ] && [ "$IS_MODERN_ENVELOPE" = 1 ] && ! daemon_in_vm; then
     verify_modern_psi_policy || fail "Gate 8 (3): canonical live host containment assertion failed"
+    verify_retired_timer_policy || fail "Gate 8 (3): retired timers must be disabled and inactive, or absent"
     PSI_OK=1
     PSI_SOURCE="Release 1 finite host caps and ManagedOOM=auto"
 fi

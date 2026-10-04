@@ -1,7 +1,6 @@
-# automation.slice — finite budget for orchestration/watchdog automation.
-# measured margin: MemoryHigh=4608M (4.5 GiB) soft throttle provides measured margin
-# below the MemoryMax=5G hard ceiling, bounding transient worker scopes while
-# preventing unbounded host memory consumption.
+# automation.slice — finite budget for orchestration automation.
+# measured margin: the approved 5G cap is 3.01 GiB below the observed 8.01 GiB peak.
+# Activation requires usage below 4608M; later growth may throttle or OOM.
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target

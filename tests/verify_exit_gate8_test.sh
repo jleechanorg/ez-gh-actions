@@ -193,7 +193,7 @@ TasksMax=8192
 UNIT
 cat > "$MODERN/automation.slice" <<UNIT
 [Slice]
-MemoryHigh=4G
+MemoryHigh=4608M
 MemoryMax=5G
 MemorySwapMax=1G
 TasksMax=4096
@@ -235,11 +235,11 @@ exit 1
 EOF_SYSTEMCTL
 chmod +x "$TMP/systemctl"
 
-# Base MB for 9/10G QEMU (10240), 10/12G agents (12288), 4/5G automation (5120) = 27648 MB.
+# Base MB for 9/10G QEMU (10240), 10/12G agents (12288), 4608M/5G automation (5120) = 27648 MB.
 # With native actions (28G = 28672 MB), total hard maxima = 56320 MB (55 GiB).
 # In an 80000 MB host, 56320 + 8000 reserve = 64320 <= 80000 -> fits.
 # In a 60000 MB host, 56320 + 6000 reserve = 62320 > 60000 -> exceeds.
-policy_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_policy VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" VERIFY_EXIT_CRITERIA_MODERN_BASE_MB=27648 VERIFY_EXIT_CRITERIA_HOST_MB=60000)
+policy_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_policy VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" VERIFY_EXIT_CRITERIA_HOST_MB=60000)
 if ! env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 VERIFY_EXIT_CRITERIA_HOST_MB=80000 bash "$VERIFY" >/dev/null; then
   fail "VM-backed actions must remain nested and disabled retired timers must pass"
 fi
@@ -263,6 +263,18 @@ grep -q "selected_tasks=6000" <<<"$out" || fail "10-runner rollback must derive 
 out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 bash "$VERIFY")
 grep -q "selected_tasks=8000" <<<"$out" || fail "14-runner profile must derive TasksMax=8000"
 
+cp "$MODERN/automation.slice" "$TMP/automation.good"
+sed -i 's/^MemoryMax=.*/MemoryMax=broken/' "$MODERN/automation.slice"
+if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=1 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 VERIFY_EXIT_CRITERIA_HOST_MB=65000 bash "$VERIFY" >"$TMP/parser-bad.log" 2>&1; then
+  fail "production unit parser must reject malformed automation cap"
+fi
+cp "$TMP/automation.good" "$MODERN/automation.slice"
+mv "$MODERN/agents.slice" "$TMP/agents.good"
+if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=1 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 VERIFY_EXIT_CRITERIA_HOST_MB=65000 bash "$VERIFY" >"$TMP/parser-missing.log" 2>&1; then
+  fail "production unit parser must reject unreadable agents unit"
+fi
+mv "$TMP/agents.good" "$MODERN/agents.slice"
+
 DROPINS="$TMP/dropins"
 mkdir -p "$DROPINS/ao-daemon.service.d" "$DROPINS/ai.dark-factory.daemon.service.d"
 printf "[Service]\\nSlice=automation.slice\\n" > "$DROPINS/ao-daemon.service.d/20-automation-slice.conf"
@@ -284,6 +296,18 @@ write_props 4831838208 5368709120 > "$TMP/props"
 mkdir -p "$TMP/policy-bin"
 cat > "$TMP/policy-bin/systemctl" <<'SHIM'
 #!/usr/bin/env bash
+if [ "${1:-}" = --user ] && [ "${2:-}" = show ] && [[ "${3:-}" = *.timer ]]; then
+  case "${5:-}" in
+    LoadState) echo loaded ;;
+    ActiveState) echo "${FIXTURE_TIMER_ACTIVE:-inactive}" ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+fi
+if [ "${1:-}" = --user ] && [ "${2:-}" = is-enabled ]; then
+  echo "${FIXTURE_TIMER_ENABLED:-disabled}"
+  exit 1
+fi
 prop="" unit="" scope=system
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -328,15 +352,65 @@ if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/kill.log" 2>&1; then
   fail "broad-root kill scope must fail canonical predicate"
 fi
 write_props 4831838208 5368709120 > "$TMP/props"
-# Execute the actual Gate 8 (3) block, retaining the legacy branch in the source.
+# The fixture wrapper runs the real assertion and only supplies its --root.
+# A rollback-10 fixture also proves this does not depend on the live 14-runner host.
+setup_passing_fixture "$FIXTURE" 10
+COUNT=10
+cat > "$REPO_ROOT/scripts/host/assert-host-containment-release1.sh" <<WRAPPER
+#!/usr/bin/env bash
+exec "$ROOT/scripts/host/assert-host-containment-release1.sh" "\$@" --root "$FIXTURE"
+WRAPPER
+chmod +x "$REPO_ROOT/scripts/host/assert-host-containment-release1.sh"
+# Reject accidental reads from the native host cgroup and meminfo trees.
+REAL_CAT=$(command -v cat)
+REAL_AWK=$(command -v awk)
+cat > "$TMP/policy-bin/cat" <<SHIM
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in /sys/fs/cgroup/*|//sys/fs/cgroup/*|/proc/meminfo|//proc/meminfo) echo forbidden-host-read >&2; exit 97 ;; esac
+done
+exec "$REAL_CAT" "\$@"
+SHIM
+cat > "$TMP/policy-bin/awk" <<SHIM
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in /sys/fs/cgroup/*|//sys/fs/cgroup/*|/proc/meminfo|//proc/meminfo) echo forbidden-host-read >&2; exit 97 ;; esac
+done
+exec "$REAL_AWK" "\$@"
+SHIM
+chmod +x "$TMP/policy-bin/cat" "$TMP/policy-bin/awk"
+eval "$(sed -n '/^modern_envelope_required() {/,/^modern_envelope_budget() {/p' "$VERIFY" | sed '$d')"
+sed -n '/^IS_MODERN_ENVELOPE=0$/,/modern finite host envelope detected/p' "$VERIFY" | sed '$d' > "$TMP/selector.sh"
+echo fi >> "$TMP/selector.sh"
 sed -n '/^PSI_OK=0$/,/^# (4) Physical-host RAM envelope/p' "$VERIFY" > "$TMP/gate3.sh"
-IS_MODERN_ENVELOPE=1
+MODERN_WRAPPER="$TMP/absent-codex-wrapper"
 daemon_in_vm() { return 1; }
-(source "$TMP/gate3.sh") >"$TMP/gate3.log" 2>&1   || fail "native Gate 8 (3) rejected canonical finite/auto policy"
+source "$TMP/selector.sh"
+[ "$IS_MODERN_ENVELOPE" = 1 ] || fail "native Linux without wrapper fell through to legacy policy"
+(source "$TMP/gate3.sh") >"$TMP/gate3.log" 2>&1   || fail "native Gate 8 (3) rejected hermetic rollback-10 fixture: $(cat "$TMP/gate3.log")"
 grep -q 'Release 1 finite host caps' "$TMP/gate3.log"   || fail "native Gate 8 (3) did not use canonical assertion"
+printf 'max\n' > "$FIXTURE/sys/fs/cgroup/actions.slice/memory.max"
+if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-poison.log" 2>&1; then
+  fail "native Gate 8 (3) ignored poisoned fixture cgroup"
+fi
+printf '30064771072\n' > "$FIXTURE/sys/fs/cgroup/actions.slice/memory.max"
 write_props 8589934592 10737418240 > "$TMP/props"
-if (source "$TMP/gate3.sh") >"$TMP/gate3-bad.log" 2>&1; then
+if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-bad.log" 2>&1; then
   fail "native Gate 8 (3) bypassed canonical live-cap failure"
 fi
+write_props 4831838208 5368709120 > "$TMP/props"
+sed -i 's/^user.slice ManagedOOMMemoryPressure auto$/user.slice ManagedOOMMemoryPressure kill/' "$TMP/props"
+if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-kill.log" 2>&1; then
+  fail "native selector without wrapper accepted forbidden kill scope"
+fi
+write_props 4831838208 5368709120 > "$TMP/props"
+export FIXTURE_TIMER_ACTIVE=active FIXTURE_TIMER_ENABLED=enabled
+if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-timer.log" 2>&1; then
+  fail "native selector without wrapper accepted retired timer"
+fi
+unset FIXTURE_TIMER_ACTIVE FIXTURE_TIMER_ENABLED
+daemon_in_vm() { return 0; }
+source "$TMP/selector.sh"
+[ "$IS_MODERN_ENVELOPE" = 0 ] || fail "legacy VM selector changed without modern artifacts"
 echo "VERIFY_EXIT_GATE8_POLICY_TEST: PASS"
 echo "VERIFY_EXIT_GATE8_TEST: PASS"
