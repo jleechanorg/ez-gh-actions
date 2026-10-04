@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERIFY="$ROOT/docs/verify-exit-criteria.sh"
+VERIFY="${VERIFY:-$ROOT/docs/verify-exit-criteria.sh}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 TMP=$(mktemp -d)
@@ -164,5 +164,195 @@ grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
   || fail "read-only kdump target omitted diagnostic: $readonly_out"
 [ ! -e "$TMP/remediation-was-called" ] \
   || fail "read-only kdump target invoked forbidden remediation"
+
+# Gate 8 retires both agent-scope-reaper and the PSI watcher. Neither may be
+# enabled or still active after its unit file was removed.
+mkdir -p "$TMP/timerbin"
+cat > "$TMP/timerbin/systemctl" <<'EOF2'
+#!/usr/bin/env bash
+# stub: is-enabled and is-active have independent fixture states.
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled)
+    if [ -n "${STUB_SYSTEMCTL_BROKEN:-}" ]; then
+      echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    for t in ${STUB_ENABLED_TIMERS:-}; do [ "$t" = "${2:-}" ] && { echo enabled; exit 0; }; done
+    if [ -n "${STUB_NOTFOUND:-}" ]; then echo not-found; exit 4; fi
+    if [ -n "${STUB_ABSENT:-}" ]; then
+      echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1
+    fi
+    echo disabled; exit 1 ;;
+  is-active)
+    if [ "${2:-}" = systemd-oomd ]; then echo inactive; exit 3; fi
+    if [ -n "${STUB_ACTIVE_BROKEN:-}" ]; then
+      echo "${STUB_ACTIVE_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    for t in ${STUB_ACTIVE_TIMERS:-}; do [ "$t" = "${2:-}" ] && { echo active; exit 0; }; done
+    echo inactive; exit 3 ;;
+esac
+exit 1
+EOF2
+chmod +x "$TMP/timerbin/systemctl"
+
+# Exercise the real Linux Gate 8 pre-envelope block with no modern-envelope
+# files. The helper-only cases below are insufficient: this proves the actual
+# branch calls the policy before optional local-envelope detection.
+run_gate8_pre_envelope() {
+  local gate_header modern_start gate_start timer_start timer_end original_fail
+  gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
+  modern_start=$(grep -n '^if \[ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" \]' "$VERIFY" | cut -d: -f1)
+  gate_start=$(awk -v min="$gate_header" -v max="$modern_start" \
+    'NR >= min && NR < max && /^if \[ "\$\(uname -s\)" = "Linux" \]; then$/ { print NR; exit }' "$VERIFY")
+  timer_start=$(grep -n '^verify_retired_timer() {' "$VERIFY" | cut -d: -f1)
+  timer_end=$(awk -v start="$timer_start" 'NR > start && /^}$/ { print NR; exit }' "$VERIFY")
+  [ -n "$gate_start" ] && [ -n "$timer_start" ] && [ -n "$timer_end" ] \
+    || fail "could not extract Gate 8 Linux pre-envelope timer policy"
+
+  original_fail=$(declare -f fail)
+  GATE8_POLICY_FAILURE=""
+  CONFIG_FILE="$TMP/valid.toml"
+  fail() { GATE8_POLICY_FAILURE="$*"; }
+  uname() { echo Linux; }
+  verify_platform_actions_slice() { return 0; }
+  daemon_in_vm() { return 1; }
+  verify_managed_runners_in_actions_slice() { return 0; }
+  eval "$(sed -n "${timer_start},${timer_end}p" "$VERIFY")"
+  verify_modern_timers() {
+    verify_retired_timer agent-scope-reaper.timer || return 1
+    verify_retired_timer psi-oom-watcher.timer
+  }
+  eval "$(sed -n "${gate_start},$((modern_start - 1))p" "$VERIFY")"
+  GATE8_POLICY_RESULT="$GATE8_POLICY_FAILURE"
+  eval "$original_fail"
+}
+
+PATH="$TMP/timerbin:$PATH"
+unset STUB_NOTFOUND STUB_ABSENT STUB_SYSTEMCTL_BROKEN STUB_BROKEN_MSG
+STUB_ENABLED_TIMERS="psi-oom-watcher.timer"
+STUB_ACTIVE_TIMERS=""
+export STUB_ENABLED_TIMERS
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] \
+  || fail "enabled PSI timer must fail through Gate 8 before optional envelope detection"
+grep -Fq 'psi-oom-watcher.timer' <<<"$GATE8_POLICY_RESULT" \
+  || fail "pre-envelope timer failure omitted diagnostic: $GATE8_POLICY_RESULT"
+STUB_ENABLED_TIMERS=""
+run_gate8_pre_envelope
+[ -z "$GATE8_POLICY_RESULT" ] \
+  || fail "disabled PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
+STUB_ABSENT=1
+export STUB_ABSENT
+run_gate8_pre_envelope
+[ -z "$GATE8_POLICY_RESULT" ] \
+  || fail "absent PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
+unset STUB_ABSENT
+
+# Execute the real later Gate 8 PSI-admission branch with oomd inactive. Its
+# failure must require an enrolled systemd-oomd cgroup only; the retired timer
+# must never be offered as a fallback.
+run_gate8_psi_admission() {
+  local psi_start psi_end original_fail
+  psi_start=$(grep -n '^# (3) PSI admission check' "$VERIFY" | cut -d: -f1)
+  psi_end=$(grep -n '^# (4) Physical-host RAM envelope' "$VERIFY" | cut -d: -f1)
+  [ -n "$psi_start" ] && [ -n "$psi_end" ] \
+    || fail "could not extract the later Gate 8 PSI-admission branch"
+  original_fail=$(declare -f fail)
+  GATE8_PSI_FAILURE=""
+  fail() { GATE8_PSI_FAILURE="$*"; }
+  uname() { echo Linux; }
+  eval "$(sed -n "${psi_start},$((psi_end - 1))p" "$VERIFY")"
+  GATE8_PSI_RESULT="$GATE8_PSI_FAILURE"
+  eval "$original_fail"
+}
+
+STUB_ENABLED_TIMERS=""
+STUB_ACTIVE_TIMERS=""
+unset STUB_ABSENT STUB_NOTFOUND STUB_SYSTEMCTL_BROKEN STUB_ACTIVE_BROKEN
+run_gate8_psi_admission
+[ -n "$GATE8_PSI_RESULT" ] \
+  || fail "unenrolled oomd must fail the later Gate 8 PSI-admission branch"
+grep -Fq 'ManagedOOMMemoryPressure=kill' <<<"$GATE8_PSI_RESULT" \
+  || fail "later Gate 8 PSI failure omitted enrolled-oomd remediation: $GATE8_PSI_RESULT"
+! grep -Fq 'psi-oom-watcher' <<<"$GATE8_PSI_RESULT" \
+  || fail "later Gate 8 PSI failure still offers the retired timer: $GATE8_PSI_RESULT"
+
+timers_rc=0
+timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" 2>&1) || timers_rc=$?
+[ "$timers_rc" -eq 0 ] \
+  || fail "no reaper/psi timers enabled must pass Gate 8 timer check (rc=$timers_rc): $timers_out"
+timers_rc=0
+timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="psi-oom-watcher.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" 2>&1) || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "enabled psi-oom-watcher.timer must fail Gate 8 (policy: disabled)"
+grep -Fq 'psi-oom-watcher.timer' <<<"$timers_out" \
+  || fail "psi timer failure omitted diagnostic: $timers_out"
+# Disabled at boot is insufficient: an already-active timer can still launch
+# the retired watcher, so this must fail through the same helper.
+timers_rc=0
+timers_out=$(PATH="$TMP/timerbin:$PATH" STUB_ENABLED_TIMERS="" STUB_ACTIVE_TIMERS="psi-oom-watcher.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" 2>&1) || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "disabled-but-active psi timer must fail Gate 8"
+grep -Fq 'active' <<<"$timers_out" \
+  || fail "disabled-but-active timer failure omitted runtime state: $timers_out"
+# A broken user manager (query failure, not a known disabled/absent state)
+# must fail closed rather than read as "timer disabled".
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "systemctl query failure must fail Gate 8 closed"
+# A runtime-state query failure after `is-enabled` says disabled must also
+# fail closed rather than treating the timer as stopped.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ACTIVE_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "active-state query failure must fail Gate 8 closed"
+# No user session (ssh/cron): the bus error also says "No such file or
+# directory" but is a query failure, not an absent unit.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_SYSTEMCTL_BROKEN=1 \
+  STUB_BROKEN_MSG="Failed to connect to bus: No such file or directory" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "bus-connect failure ('No such file') must fail Gate 8 closed"
+# An absent unit (No such file) is a known-disabled state and passes.
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || fail "absent psi-oom-watcher.timer must pass"
+# A deleted unit file does not prove the previously loaded timer has stopped.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_TIMERS="psi-oom-watcher.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file but active psi timer must fail Gate 8"
+# Likewise, a missing unit file must not bypass a failed runtime-state query.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file runtime-state query failure must fail Gate 8 closed"
+# The deleted reaper has the same lifecycle requirement: an absent file does
+# not establish that an already-loaded timer has stopped.
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_TIMERS="agent-scope-reaper.timer" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file but active reaper timer must fail Gate 8"
+timers_rc=0
+PATH="$TMP/timerbin:$PATH" STUB_ABSENT=1 STUB_ACTIVE_BROKEN=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || timers_rc=$?
+[ "$timers_rc" -ne 0 ] || fail "absent-file reaper timer query failure must fail Gate 8 closed"
+# systemd 255 prints exactly "not-found" (exit 4) for an absent unit, the
+# normal state once install.sh has deleted the watcher unit files.
+PATH="$TMP/timerbin:$PATH" STUB_NOTFOUND=1 \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers \
+  bash "$VERIFY" >/dev/null 2>&1 || fail "systemd not-found (exit 4) for absent timer must pass"
 
 echo "VERIFY_EXIT_GATE8_TEST: PASS"
