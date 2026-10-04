@@ -73,6 +73,7 @@ grep -q 'memory: "8GiB"' "$REPO_ROOT/install.sh" || fail "install.sh does not se
 GUEST_ADMISSION="$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"
 assert_file "$GUEST_ADMISSION"
 assert_line "$GUEST_ADMISSION" "ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh"
+assert_line "$GUEST_ADMISSION" "Environment=LIMACTL=@LIMACTL@"
 ok "host-docker guest admission guard tracked"
 
 LAUNCH="$REPO_ROOT/scripts/host/agent-scoped-launch.sh"

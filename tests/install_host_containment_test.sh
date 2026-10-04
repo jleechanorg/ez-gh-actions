@@ -155,35 +155,37 @@ GUARD_PATH="$WORK/guard-path"
 GUARD_RUNTIME="$WORK/guard-runtime"
 mkdir -p "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d" \
   "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service.d" \
-  "$GUARD_HOME/.lima/colima" "$GUARD_HOME/.local/bin" \
+  "$GUARD_HOME/.lima/colima" "$WORK/guard-lima-bin" \
   "$GUARD_HOME/.local/libexec/ezgha" "$GUARD_PROC" "$GUARD_PATH" "$GUARD_RUNTIME"
 printf 'memory: "8GiB"\n' > "$GUARD_HOME/.lima/colima/lima.yaml"
 : > "$GUARD_RUNTIME/fake-bus"
 cp "$STUB_BIN/systemctl" "$GUARD_PATH/systemctl"
-cp "$STUB_BIN/limactl" "$GUARD_HOME/.local/bin/limactl"
-chmod +x "$GUARD_PATH/systemctl" "$GUARD_HOME/.local/bin/limactl"
+# Lima outside ~/.local/bin (e.g. /usr/local/bin) must still be admitted.
+GUARD_LIMACTL="$WORK/guard-lima-bin/limactl"
+cp "$STUB_BIN/limactl" "$GUARD_LIMACTL"
+chmod +x "$GUARD_PATH/systemctl" "$GUARD_LIMACTL"
 GUARD_MIN_PATH="$GUARD_PATH:/usr/bin:/bin"
 if PATH="$GUARD_MIN_PATH" command -v limactl >/dev/null 2>&1; then
   fail "guard-only PATH unexpectedly exposed limactl"
 fi
 GUEST_DROPIN="$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"
-grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$GUEST_DROPIN" \
-  || fail "source unit does not bind the installed absolute limactl path: $GUEST_DROPIN"
+grep -qx 'Environment=LIMACTL=@LIMACTL@' "$GUEST_DROPIN" \
+  || fail "source unit does not leave the limactl path for the installer to bind: $GUEST_DROPIN"
 install -m 0755 "$TEMP_REPO/scripts/host/lima-guest-memory-check.sh" \
   "$GUARD_HOME/.local/libexec/ezgha/lima-guest-memory-check.sh"
-install -m 0644 "$GUEST_DROPIN" \
-  "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
-install -m 0644 "$GUEST_DROPIN" \
-  "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+# Render exactly as install.sh does.
+render_line="$(grep -F '@LIMACTL@' "$REPO_ROOT/install.sh" | grep -F 'sed -e')"
+[ -n "$render_line" ] || fail "install.sh does not render the limactl placeholder"
+for guard_dir in lima-vm@colima.service.d lima-vm-cpu-ceiling.service.d; do
+  sed -e "s|@LIMACTL@|${GUARD_LIMACTL}|g" "$GUEST_DROPIN" \
+    > "$GUARD_HOME/.config/systemd/user/$guard_dir/10-guest-memory-admission.conf"
+done
 for staged_unit in \
     "$GUARD_HOME/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
     "$GUARD_HOME/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"; do
-  grep -qx 'Environment=LIMACTL=%h/.local/bin/limactl' "$staged_unit" \
-    || fail "staged unit does not preserve the absolute limactl path: $staged_unit"
-  limactl_spec="$(sed -n 's/^Environment=LIMACTL=//p' "$staged_unit")"
-  limactl_path="${limactl_spec//%h/$GUARD_HOME}"
-  [ "$limactl_path" = "$GUARD_HOME/.local/bin/limactl" ] \
-    || fail "staged unit resolved an unexpected limactl path: $limactl_path"
+  grep -qx "Environment=LIMACTL=$GUARD_LIMACTL" "$staged_unit" \
+    || fail "staged unit does not bind the installer's absolute limactl path: $staged_unit"
+  limactl_path="$(sed -n 's/^Environment=LIMACTL=//p' "$staged_unit")"
   unit_name="$(basename "$staged_unit")"
   env -i HOME="$GUARD_HOME" PATH="$GUARD_MIN_PATH" \
     XDG_RUNTIME_DIR="$GUARD_RUNTIME" \
@@ -326,6 +328,8 @@ for unit in lima-vm@colima lima-vm-cpu-ceiling; do
   grep -qx 'ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh' \
     "$HD_UNITS/$unit.service.d/10-guest-memory-admission.conf" \
     || fail "host-docker install did not stage $unit guest admission before start"
+  grep -qx "Environment=LIMACTL=$STUB_BIN/limactl" "$HD_UNITS/$unit.service.d/10-guest-memory-admission.conf" \
+    || fail "host-docker install did not bind $unit guest admission to the limactl it resolved"
 done
 
 # A guest still running at 12 GiB keeps the existing QEMU ceiling (fail closed)

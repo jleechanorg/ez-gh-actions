@@ -486,6 +486,17 @@ if [ "$(uname -s)" = "Linux" ]; then
   docker_mode="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${docker_endpoint}")"     || { bad "cannot classify selected Docker endpoint"; exit 1; }
   if [ "${docker_mode}" = host-docker ]; then
     HOST_DOCKER_MODE=1
+    # The guest-admission drop-ins run under systemd's minimal PATH, so bind
+    # them to the same absolute limactl this installer uses for admission.
+    LIMACTL_BIN="$(command -v limactl || true)"
+    case "${LIMACTL_BIN}" in
+      /*) ;;
+      *) bad "host-docker guest admission requires limactl on PATH"; exit 1 ;;
+    esac
+    case "${LIMACTL_BIN}" in
+      *[[:space:]%\\\"\|]*) bad "limactl path is not safe for a systemd drop-in: ${LIMACTL_BIN}"; exit 1 ;;
+    esac
+    export LIMACTL="${LIMACTL_BIN}"
     RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
       bad "could not read runner.count from ${CONFIG_PATH}"
       exit 1
@@ -530,10 +541,13 @@ if [ "$(uname -s)" = "Linux" ]; then
     install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
     mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d" \
       "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"
-    install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
-      "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf"
-    install -m 0644 "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
-      "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+    for guard_dir in lima-vm@colima.service.d lima-vm-cpu-ceiling.service.d; do
+      guard="${HOME}/.config/systemd/user/${guard_dir}/10-guest-memory-admission.conf"
+      sed -e "s|@LIMACTL@|${LIMACTL_BIN}|g" \
+        "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" > "${guard}"
+      grep -qx "Environment=LIMACTL=${LIMACTL_BIN}" "${guard}" && ! grep -q '@[A-Z_]*@' "${guard}" \
+        || { bad "could not render guest admission guard ${guard}"; exit 1; }
+    done
     systemctl --user daemon-reload || { bad "could not load guest admission guards"; exit 1; }
     "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
       bad "host-docker guest admission failed before host containment activation"; exit 1;
