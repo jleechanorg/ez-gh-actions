@@ -165,4 +165,100 @@ grep -Fq 'not on a verifiably writable mount' <<<"$readonly_out" \
 [ ! -e "$TMP/remediation-was-called" ] \
   || fail "read-only kdump target invoked forbidden remediation"
 
+# Policy helpers must account for native host-Docker actions.slice, preserve
+# VM nesting, use the selected 10/14 TasksMax contract, and honor the
+# installer-retired timer policy.
+MODERN="$TMP/modern"
+mkdir -p "$MODERN"
+cat > "$MODERN/app-lima-vm.slice" <<UNIT
+[Slice]
+MemoryHigh=34G
+MemoryMax=38G
+MemorySwapMax=2G
+TasksMax=4096
+UNIT
+cat > "$MODERN/agents.slice" <<UNIT
+[Slice]
+MemoryHigh=18G
+MemoryMax=20G
+MemorySwapMax=2G
+TasksMax=8192
+UNIT
+cat > "$MODERN/automation.slice" <<UNIT
+[Slice]
+MemoryHigh=8G
+MemoryMax=10G
+MemorySwapMax=1G
+TasksMax=4096
+UNIT
+cat > "$TMP/actions.slice" <<UNIT
+[Slice]
+MemoryHigh=26G
+MemoryMax=28G
+MemorySwapMax=0
+TasksMax=8000
+UNIT
+cat > "$TMP/systemctl" <<'EOF_SYSTEMCTL'
+#!/usr/bin/env bash
+case "${1:-}" in
+  --user) shift ;;
+esac
+if [ "${1:-}" = show ]; then
+  unit="${2:-}"
+  case "${TIMER_MODE:-disabled}:$unit:${4:-}" in
+    disabled:*:LoadState) echo loaded ;;
+    disabled:*:ActiveState) echo inactive ;;
+    enabled:*:LoadState) echo loaded ;;
+    enabled:*:ActiveState) echo active ;;
+    absent:*:LoadState) echo not-found ;;
+    absent:*:ActiveState) echo inactive ;;
+    unreadable:*) exit 1 ;;
+    service-absent:ao-orchestrator.service:LoadState) echo not-found ;;
+    service-absent:*:LoadState) echo loaded ;;
+    service-absent:*:ActiveState) echo inactive ;;
+    service-loaded:*:LoadState) echo loaded ;;
+    service-loaded:*:ActiveState) echo inactive ;;
+    *) exit 1 ;;
+  esac
+  exit 0
+elif [ "${1:-}" = is-enabled ]; then
+  case "${TIMER_MODE:-disabled}" in disabled) echo disabled; exit 1 ;; enabled) echo enabled ;; *) exit 1 ;; esac
+fi
+exit 1
+EOF_SYSTEMCTL
+chmod +x "$TMP/systemctl"
+
+policy_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_policy VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" VERIFY_EXIT_CRITERIA_MODERN_BASE_MB=69632 VERIFY_EXIT_CRITERIA_HOST_MB=80000)
+if ! env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null; then
+  fail "VM-backed actions must remain nested and disabled retired timers must pass"
+fi
+if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=1 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null 2>&1; then
+  fail "native actions.slice max must be included in hard-envelope arithmetic"
+fi
+if env "${policy_env[@]}" TIMER_MODE=enabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null 2>&1; then
+  fail "enabled retired timer must fail policy verification"
+fi
+if env "${policy_env[@]}" TIMER_MODE=unreadable VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null 2>&1; then
+  fail "unreadable retired timer state must fail closed"
+fi
+if ! env "${policy_env[@]}" TIMER_MODE=absent VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY" >/dev/null; then
+  fail "absent retired timer must be accepted as retired"
+fi
+out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 bash "$VERIFY")
+grep -q "selected_tasks=6000" <<<"$out" || fail "10-runner rollback must derive TasksMax=6000"
+out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 bash "$VERIFY")
+grep -q "selected_tasks=8000" <<<"$out" || fail "14-runner profile must derive TasksMax=8000"
+
+DROPINS="$TMP/dropins"
+mkdir -p "$DROPINS/ao-daemon.service.d" "$DROPINS/ai.dark-factory.daemon.service.d"
+printf "[Service]\\nSlice=automation.slice\\n" > "$DROPINS/ao-daemon.service.d/20-automation-slice.conf"
+printf "[Service]\\nSlice=automation.slice\\n" > "$DROPINS/ai.dark-factory.daemon.service.d/20-automation-slice.conf"
+if ! PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=automation_dropins VERIFY_EXIT_CRITERIA_DROPIN_DIR="$DROPINS" TIMER_MODE=service-absent bash "$VERIFY" >/dev/null; then
+  fail "not-found ao-orchestrator service must not require its drop-in"
+fi
+if PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=automation_dropins VERIFY_EXIT_CRITERIA_DROPIN_DIR="$DROPINS" TIMER_MODE=service-loaded bash "$VERIFY" >/dev/null 2>&1; then
+  fail "loaded ao-orchestrator service must require its automation drop-in"
+fi
+
+echo "VERIFY_EXIT_GATE8_POLICY_TEST: PASS"
 echo "VERIFY_EXIT_GATE8_TEST: PASS"
