@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.jleechanorg.ezgha-queue-trimmer</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@SCRIPTS_DIR@/trim-queued-runs.sh</string>
+        <string>--apply</string>
+        <string>--min-pr-age-hours</string>
+        <string>2</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@HOME@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+        <key>MIN_PR_AGE_HOURS</key>
+        <string>2</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/.local/state/ezgha/queue-trimmer.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/.local/state/ezgha/queue-trimmer.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

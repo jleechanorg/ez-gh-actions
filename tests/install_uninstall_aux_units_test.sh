@@ -79,6 +79,7 @@ for unit in ezgha.service \
             lima-vm-cpu-ceiling.service \
             ezgha-token-refresh.service ezgha-token-refresh.timer \
             ezgha-queue-reaper.service ezgha-queue-reaper.timer \
+            ezgha-queue-trimmer.service ezgha-queue-trimmer.timer \
             ezgha-watchdog.service ezgha-watchdog.timer \
             ezgha-runner-dashboard.service ezgha-runner-dashboard.timer \
             ezgha-colima-trim.service ezgha-colima-trim.timer \
@@ -98,7 +99,7 @@ HOME="${HOME_T}" SYSTEMCTL_LOG="${SYSTEMCTL_LOG}" \
 
 # ── Assertions ─────────────────────────────────────────────────────────────
 
-for aux in token-refresh queue-reaper watchdog runner-dashboard colima-trim mission-output-cleanup; do
+for aux in token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup; do
   if grep -q "disable --now ezgha-${aux}.timer" "${SYSTEMCTL_LOG}"; then
     echo "PASS: uninstall disabled ezgha-${aux}.timer"
   else
