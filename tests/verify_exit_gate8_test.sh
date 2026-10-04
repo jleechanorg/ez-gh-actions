@@ -49,7 +49,7 @@ cat > "$TMP/docker" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
   ps) printf 'runner-1\n' ;;
-  inspect) printf '4242\n' ;;
+  inspect) printf 'true running 4242\n' ;;
   *) exit 1 ;;
 esac
 EOF
@@ -71,6 +71,79 @@ if PATH="$TMP:$PATH" \
    bash "$VERIFY" >/dev/null 2>&1; then
   fail "runner outside actions.slice should fail"
 fi
+
+# Gate-8 turnover fixtures use one atomic inspect response for running/status/PID.
+mkdir -p "$TMP/race-proc/4242" "$TMP/race-cgroup/actions.slice/live.scope"
+printf '0::/actions.slice/live.scope\n' > "$TMP/race-proc/4242/cgroup"
+mkdir -p "$TMP/race-proc/4343" "$TMP/race-cgroup/actions.slice"
+printf '0::/user.slice/runner.scope\n' > "$TMP/race-proc/4343/cgroup"
+mkdir -p "$TMP/race-proc/4345"
+printf '0::/actions.slice/missing.scope\n' > "$TMP/race-proc/4345/cgroup"
+cat > "$TMP/docker-race" <<'EOF_RACE'
+#!/usr/bin/env bash
+set -e
+case "${1:-}" in
+  ps)
+    case "${DOCKER_SCENARIO:-mixed}" in
+      mixed) printf '%s\n' runner-stopped runner-live ;;
+      all-exited) printf '%s\n' runner-stopped-a runner-stopped-b ;;
+      empty) : ;;
+      running-pid0) printf '%s\n' runner-pid0 ;;
+      outside) printf '%s\n' runner-outside ;;
+      missing-proc) printf '%s\n' runner-missing-proc ;;
+      missing-cgroup) printf '%s\n' runner-missing-cgroup ;;
+      inspect-failure) printf '%s\n' runner-inspect-failure ;;
+      docker-failure) exit 1 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  inspect)
+    id="${4:-}"
+    case "$id" in
+      runner-stopped|runner-stopped-a|runner-stopped-b) printf 'false exited 0\n' ;;
+      runner-live) printf 'true running 4242\n' ;;
+      runner-pid0) printf 'true running 0\n' ;;
+      runner-outside) printf 'true running 4343\n' ;;
+      runner-missing-proc) printf 'true running 4344\n' ;;
+      runner-missing-cgroup) printf 'true running 4345\n' ;;
+      runner-inspect-failure) exit 1 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+EOF_RACE
+chmod +x "$TMP/docker-race"
+
+run_container_case() {
+  local scenario="$1" expected="$2" output rc
+  output=''
+  rc=0
+  output=$(PATH="$TMP:$PATH" DOCKER_SCENARIO="$scenario" \
+    VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+    VERIFY_EXIT_CRITERIA_TEST_CASE=containers \
+    VERIFY_EXIT_CRITERIA_PROC_ROOT="$TMP/race-proc" \
+    VERIFY_EXIT_CRITERIA_CGROUP_ROOT="$TMP/race-cgroup" \
+    bash "$VERIFY" 2>&1) || rc=$?
+  if [ "$expected" = pass ]; then
+    [ "$rc" -eq 0 ] || fail "$scenario should pass: $output"
+  else
+    [ "$rc" -ne 0 ] || fail "$scenario should fail closed"
+  fi
+}
+
+# The stopped PID-0 container may be observed during turnover, but a live
+# peer must still be positively inspected and contained.
+PATH="$TMP:$PATH" ln -sf "$TMP/docker-race" "$TMP/docker"
+run_container_case mixed pass
+run_container_case all-exited fail
+run_container_case empty fail
+run_container_case running-pid0 fail
+run_container_case outside fail
+run_container_case missing-proc fail
+run_container_case missing-cgroup fail
+run_container_case inspect-failure fail
+run_container_case docker-failure fail
 
 # A finite parent slice is the effective recursive ceiling even when a child
 # scope retains its default memory.high=max.
