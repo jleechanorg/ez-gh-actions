@@ -49,7 +49,12 @@ cat > "$TMP/docker" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
   ps) printf 'runner-1\n' ;;
-  inspect) printf 'true running 4242\n' ;;
+  inspect)
+    case "${3:-}" in
+      '{{.State.Pid}}') printf '4242\n' ;;
+      *) printf 'true running 4242\n' ;;
+    esac
+    ;;
   *) exit 1 ;;
 esac
 EOF
