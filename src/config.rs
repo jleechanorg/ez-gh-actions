@@ -427,6 +427,13 @@ pub struct Limits {
     /// Optional systemd cgroup/slice parent for every runner container.
     #[serde(default)]
     pub cgroup_parent: Option<String>,
+    /// Opt-in: relax the per-container `cpus` ceiling from
+    /// `daemon_ncpu / runner_count` to `min(cfg.limits.cpus, daemon_ncpu)`.
+    /// Honored ONLY when the daemon is verified VM-contained AND finite
+    /// positive ncpu is discovered; otherwise `effective_limits` returns
+    /// `Err` and `Serve` bails before mutating any runner. Default `false`.
+    #[serde(default)]
+    pub cpu_burst: bool,
 }
 
 fn default_min_free_disk_gb() -> u64 {
@@ -624,6 +631,7 @@ impl Config {
                 pids: 512,
                 min_free_disk_gb: default_min_free_disk_gb(),
                 cgroup_parent: None,
+                cpu_burst: false,
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
