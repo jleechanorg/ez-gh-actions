@@ -816,8 +816,26 @@ fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration,
     match decision {
         SettlingDecision::Continue => (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false),
         SettlingDecision::Recovered => (cfg.runner.serve_tick(), true),
-        SettlingDecision::Ceiling => (Duration::ZERO, true),
+        // Ceiling: zero sleep, no synchronous monitor drive. Monitor
+        // ticks run async via QueueMonitorScheduler so a slow `gh api`
+        // child cannot block the next ensure_count.
+        SettlingDecision::Ceiling => (Duration::ZERO, false),
     }
+}
+
+fn dispatch_async_monitor_ticks<Q, C>(
+    _legacy_run_monitors: bool,
+    mut dispatch_queue: Q,
+    mut dispatch_canary: C,
+) where
+    Q: FnMut(),
+    C: FnMut(),
+{
+    // Queue and canary schedulers independently enforce their own due interval
+    // and single-flight constraints. Ceiling must not suppress either one:
+    // it is a refill-priority signal, not a telemetry/canary pause.
+    dispatch_queue();
+    dispatch_canary();
 }
 
 fn apply_local_settling_decision(
@@ -1312,6 +1330,21 @@ fn main() -> Result<()> {
             // with After=lima-vm@colima.service the Docker socket may not be
             // ready for a few seconds after limactl start exits.
             let backend = wait_for_backend(&cfg, Duration::from_secs(120))?;
+            // Fail-loud cpu_burst precheck (root review): if
+            // limits.cpu_burst=true is requested but the daemon is not
+            // VM-contained or finite positive ncpu is not discovered, bail
+            // here BEFORE any runner mutation rather than letting the first
+            // start_one hit Err mid-spawn. Placed AFTER wait_for_backend so a
+            // cold Colima VM that took >4s on its first `docker info` (Mac,
+            // 2026-10-03) has time to settle into a steady state instead of
+            // tripping the rejection path on a transient probe. Bounded by
+            // PROBE_TIMEOUT (8s as of this commit); still BEFORE any runner
+            // mutation so a genuinely unsupported burst never spawns.
+            if cfg.limits.cpu_burst {
+                docker_backend::effective_limits(&cfg).map_err(|e| {
+                    anyhow::anyhow!("limits.cpu_burst validation failed at serve startup: {e}")
+                })?;
+            }
             // VM-aware memory budget derivation + fail-loud guard (bead
             // ez-gh-actions-yz6b). See docker_backend::resolve_and_log_memory_budget.
             docker_backend::resolve_and_log_memory_budget(&cfg)
@@ -1324,8 +1357,12 @@ fn main() -> Result<()> {
             );
             let _watchdog_heartbeat = mark_service_ready_and_start_watchdog();
             let mut backend_recovery = BackendRecoveryState::new();
-            let mut queue_monitor = queue_monitor::QueueMonitorState::new();
-            let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
+            // Async monitor ticks: QueueMonitorScheduler dispatches
+            // drive_serve_loop_ticks on a worker thread (returns the
+            // state pair via the JoinHandle payload, no Arc<Mutex<>>).
+            // Replaces the synchronous 75 s monitor drive that blocked
+            // ensure_count after every Ceiling.
+            let mut queue_monitor_scheduler = queue_monitor::QueueMonitorScheduler::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             let mut settling: Option<SettlingEpisode> = None;
@@ -1347,31 +1384,55 @@ fn main() -> Result<()> {
                 watchdog::ping();
                 let (sleep, run_monitors) = if settling.is_some() {
                     match docker_backend::local_executing_runner_count(&cfg) {
-                        Ok(executing) => {
+                        Ok(summary) => {
+                            let executing = summary.ready;
+                            let absent_names = summary.absent;
                             let (decision, attempts, best_executing) = {
                                 let episode = settling.as_mut().expect("checked above");
+                                // Bead jleechan-95jk root-cause: if a slot's
+                                // container is GONE (`docker top: No such
+                                // container`), polling for 25s will not bring
+                                // it back. Force immediate reconciliation
+                                // (Ceiling) so the next serve tick calls
+                                // `ensure_count` and respawns. Genuine
+                                // Unknown (timeout / daemon error) still
+                                // propagates as `Err` below and keeps the
+                                // existing wait-for-evidence behavior.
                                 let decision =
-                                    episode.observe(Instant::now(), executing, cfg.runner.count);
+                                    if !absent_names.is_empty() && executing < cfg.runner.count {
+                                        eprintln!(
+                                        "runner startup settling: {executing}/{} ready locally \
+                                         (listeners or workers), but {} container(s) absent: \
+                                         {absent_names:?}; forcing immediate reconciliation \
+                                         instead of waiting out the {}-poll settling ceiling",
+                                        cfg.runner.count,
+                                        absent_names.len(),
+                                        MAX_SETTLING_POLLS,
+                                    );
+                                        SettlingDecision::Ceiling
+                                    } else {
+                                        episode.observe(Instant::now(), executing, cfg.runner.count)
+                                    };
                                 (decision, episode.attempts, episode.best_executing)
                             };
                             match decision {
                                 SettlingDecision::Continue => println!(
-                                    "runner startup settling: {executing}/{} executing locally \
-                                     (poll {attempts}/{MAX_SETTLING_POLLS})",
+                                    "runner startup settling: {executing}/{} ready locally \
+                                     (listeners or workers) (poll {attempts}/{MAX_SETTLING_POLLS})",
                                     cfg.runner.count
                                 ),
                                 SettlingDecision::Recovered => {
                                     println!(
-                                        "runner startup settled: {executing}/{} executing locally \
-                                         after {attempts} poll(s)",
+                                        "runner startup settled: {executing}/{} ready locally \
+                                         (listeners or workers) after {attempts} poll(s)",
                                         cfg.runner.count
                                     );
                                     settling_ceilings.record_recovery();
                                 }
                                 SettlingDecision::Ceiling => {
                                     let detail = format!(
-                                        "{executing}/{} executing locally, best {best_executing}, \
-                                         {attempts} poll(s)",
+                                        "{executing}/{} ready locally (listeners or workers), \
+                                         best {best_executing}, {attempts} poll(s)",
                                         cfg.runner.count
                                     );
                                     let escalated = record_settling_ceiling(
@@ -1381,7 +1442,8 @@ fn main() -> Result<()> {
                                     );
                                     eprintln!(
                                         "{}: runner startup settling ceiling reached: {detail}; \
-                                         running monitors before immediate reconciliation",
+                                         queue-monitor ticks dispatched async, \
+                                         reconcile on next iteration",
                                         if escalated { "CRITICAL" } else { "WARN" }
                                     );
                                 }
@@ -1399,7 +1461,8 @@ fn main() -> Result<()> {
                             let escalated =
                                 record_settling_ceiling(&cfg, &mut settling_ceilings, &detail);
                             eprintln!(
-                                "{}: {detail}; running monitors before immediate reconciliation",
+                                "{}: {detail}; queue-monitor ticks dispatched async, \
+                                 reconcile on next iteration",
                                 if escalated { "CRITICAL" } else { "WARN" }
                             );
                             apply_local_settling_decision(
@@ -1538,33 +1601,25 @@ fn main() -> Result<()> {
                 if shutdown::is_requested() {
                     break;
                 }
-                if run_monitors {
-                    watchdog::ping();
-                    // Fresh budget base for monitor ticks: respawn pacing may
-                    // legitimately spend minutes before this point, and that
-                    // time must not count against SERVE_LOOP_TIME_BUDGET.
-                    let monitor_loop_start = Instant::now();
-                    // Drive both ticks through the unified fetch dedup path
-                    // (see `QueueMonitorState::drive_serve_loop_ticks`):
-                    // the queue monitor's starvation/idle-mismatch alerting
-                    // and the invariant sampler's INV-1/INV-2 sampling share
-                    // one fleet fetch and one fetch per distinct repo per
-                    // iteration, instead of doubling both. Calling
-                    // `maybe_check` + `maybe_sample` independently (the
-                    // previous shape) is preserved as a public API but the
-                    // serve loop no longer uses it.
-                    let _ = run_tick("queue monitor + invariant sampler drive", || {
-                        queue_monitor
-                            .drive_serve_loop_ticks(
-                                &cfg,
-                                monitor_loop_start,
-                                &mut invariant_sampler,
-                            )
-                            .map(|_results| None::<()>)
-                    });
-                    watchdog::ping();
-                    let _ = canary_scheduler.maybe_check(&cfg);
-                }
+                // Async dispatch on EVERY serve iteration (not gated by run_monitors):
+                // the scheduler's internal due timer + single-flight
+                // guarantee already bound it, and gating it would let a
+                // run of short Ceiling/Recovered cycles starve queue +
+                // invariant telemetry for the entire run. Worker thread
+                // runs one iteration and returns the state pair via the
+                // JoinHandle payload (no Arc<Mutex<>>, no overlap).
+                watchdog::ping();
+                let monitor_loop_start = Instant::now();
+                dispatch_async_monitor_ticks(
+                    run_monitors,
+                    || {
+                        let _ = queue_monitor_scheduler.maybe_dispatch(&cfg, monitor_loop_start);
+                        watchdog::ping();
+                    },
+                    || {
+                        let _ = canary_scheduler.maybe_check(&cfg);
+                    },
+                );
                 watchdog::ping();
                 // Dead-man's switch: prove the alert pipeline is alive.
                 // Runs once per serve-loop tick regardless of ensure success
@@ -2244,6 +2299,33 @@ mod tests {
     }
 
     #[test]
+    fn ceiling_dispatches_async_canary_despite_legacy_monitor_gate() {
+        let cfg = test_config();
+        let (_, run_monitors) = settling_plan(&cfg, SettlingDecision::Ceiling);
+        assert!(
+            !run_monitors,
+            "Ceiling retains zero-sleep refill priority over legacy synchronous monitors"
+        );
+
+        let mut queue_dispatched = false;
+        let mut canary_dispatched = false;
+        dispatch_async_monitor_ticks(
+            run_monitors,
+            || queue_dispatched = true,
+            || canary_dispatched = true,
+        );
+
+        assert!(
+            queue_dispatched,
+            "queue scheduler remains dispatched on Ceiling"
+        );
+        assert!(
+            canary_dispatched,
+            "canary must remain interval-limited but cannot be starved by Ceiling"
+        );
+    }
+
+    #[test]
     fn settling_episode_reconciles_immediately_when_execution_regresses() {
         let started_at = Instant::now();
         let mut episode = SettlingEpisode::start(started_at, 5);
@@ -2257,8 +2339,8 @@ mod tests {
         cfg.runner.serve_tick_seconds = 30;
         assert_eq!(
             settling_plan(&cfg, decision),
-            (Duration::ZERO, true),
-            "lost executing capacity must run monitors and reconcile without another settling sleep"
+            (Duration::ZERO, false),
+            "lost executing capacity must reconcile on the next iteration without synchronous monitors"
         );
     }
 
@@ -2275,7 +2357,7 @@ mod tests {
     }
 
     #[test]
-    fn settling_episode_ceiling_guarantees_monitor_then_immediate_reconcile() {
+    fn settling_episode_ceiling_reconciles_immediately_without_synchronous_monitors() {
         let mut cfg = test_config();
         cfg.runner.serve_tick_seconds = 30;
         let started_at = Instant::now();
@@ -2292,10 +2374,47 @@ mod tests {
         assert_eq!(ceiling, SettlingDecision::Ceiling);
         assert_eq!(episode.attempts, MAX_SETTLING_POLLS);
         assert!(!episode.is_active());
+        // Ceiling plan: zero sleep, no synchronous monitor drive. Queue
+        // monitor ticks now run async via QueueMonitorScheduler so a
+        // slow `gh api` child cannot block the next ensure_count.
         assert_eq!(
             settling_plan(&cfg, ceiling),
-            (Duration::ZERO, true),
-            "the bounded episode must run monitors and add no sleep before the next expensive reconciliation"
+            (Duration::ZERO, false),
+            "the bounded episode must reconcile on the next iteration without synchronous monitors"
+        );
+    }
+
+    /// Direct-reconcile integration assertion: every Ceiling path
+    /// (settling + ensure_success::IncompleteReadiness) must hand the
+    /// serve loop a plan of `(Duration::ZERO, false)`. This is the
+    /// production fix for the Mac refill starvation where a slow
+    /// `gh api actions/runs/.../jobs` child blocked the synchronous
+    /// 75 s monitor drive that ran BEFORE ensure_count on every Ceiling
+    /// event. With `(0, false)` the next serve-loop iteration hits
+    /// `ensure_count_outcome` without first waiting on the monitor
+    /// block.
+    #[test]
+    fn ceiling_plan_reconciles_directly_without_monitors() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        // Every Ceiling-emitting decision must yield the same
+        // zero-sleep / no-monitors plan.
+        let settle_ceiling = settling_plan(&cfg, SettlingDecision::Ceiling);
+        assert_eq!(settle_ceiling, (Duration::ZERO, false));
+        let ensure_ceiling = ensure_success_plan(&cfg, EnsureSuccessDecision::IncompleteReadiness);
+        assert_eq!(ensure_ceiling, (Duration::ZERO, false));
+        // And the two non-Ceiling decisions stay unchanged.
+        assert_eq!(
+            settling_plan(&cfg, SettlingDecision::Continue),
+            (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+        );
+        assert_eq!(
+            settling_plan(&cfg, SettlingDecision::Recovered),
+            (cfg.runner.serve_tick(), true)
+        );
+        assert_eq!(
+            ensure_success_plan(&cfg, EnsureSuccessDecision::AdmissionPaused),
+            (cfg.runner.serve_tick(), true)
         );
     }
 
@@ -2332,8 +2451,8 @@ mod tests {
             );
             assert_eq!(
                 settling_plan(&cfg, decision),
-                (Duration::ZERO, true),
-                "ceiling must run monitors before the full reconciliation"
+                (Duration::ZERO, false),
+                "ceiling must reconcile on the next iteration without synchronous monitors"
             );
 
             let full_container_decision = ensure_success_decision_with_pending_readiness(

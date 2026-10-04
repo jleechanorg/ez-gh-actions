@@ -55,6 +55,11 @@ jobs:
           bash tests/cleanup_stuck_runs_multirepo_test.sh
           bash tests/cleanup_stuck_runs_race_skip_test.sh
           bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
+      - name: Exit criteria CPU burst regressions
+        run: |
+          bash tests/verify_exit_gate3_cpu_burst_test.sh
+          bash tests/verify_exit_gate3_burst_preflight_test.sh
+          bash tests/verify_exit_toml_parser_integration_test.sh
       - name: Doctor-runner regression tests
         run: |
           bash tests/doctor_runner_expected_containers_test.sh

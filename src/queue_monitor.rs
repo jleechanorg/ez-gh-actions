@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
@@ -483,6 +485,701 @@ impl QueueMonitorState {
             fetch_capped_queue_snapshot,
             || github::rest_budget_remaining_until(probe_deadline),
         )
+    }
+}
+
+/// Single-flight background scheduler for the queue-monitor +
+/// invariant-sampler ticks. Mirrors `CanaryDaemonState`'s ownership
+/// roundtrip: states live with the scheduler when idle, move into the
+/// worker for one tick, and return via the join handle regardless of
+/// whether the tick errored -- so REST backoff / `last_check` /
+/// consecutive-bad are preserved across ordinary `Err` ticks. Only an
+/// actual `join()` panic (worker thread unwound without returning the
+/// state pair) rebuilds empty state.
+type MonitorResult = (QueueMonitorState, InvariantSamplerState, Result<()>);
+type MonitorTask = Box<dyn FnOnce() -> MonitorResult + Send>;
+
+pub struct QueueMonitorScheduler {
+    queue_monitor: Option<QueueMonitorState>,
+    invariant_sampler: Option<InvariantSamplerState>,
+    in_flight: Option<JoinHandle<MonitorResult>>,
+    last_attempt: Option<Instant>,
+}
+
+impl QueueMonitorScheduler {
+    pub fn new() -> Self {
+        Self {
+            queue_monitor: Some(QueueMonitorState::new()),
+            invariant_sampler: Some(InvariantSamplerState::new()),
+            in_flight: None,
+            last_attempt: None,
+        }
+    }
+
+    /// Collect finished work and dispatch only due monitors, at most once
+    /// per serve tick. An active worker never blocks runner replenishment.
+    pub fn maybe_dispatch(&mut self, cfg: &Config, loop_start: Instant) -> bool {
+        self.dispatch_with(cfg, Instant::now(), move |cfg, mut qm, mut inv| {
+            let status = qm
+                .drive_serve_loop_ticks(&cfg, loop_start, &mut inv)
+                .map(|_| ());
+            (qm, inv, status)
+        })
+    }
+
+    fn dispatch_with<F>(&mut self, cfg: &Config, now: Instant, worker: F) -> bool
+    where
+        F: FnOnce(Config, QueueMonitorState, InvariantSamplerState) -> MonitorResult
+            + Send
+            + 'static,
+    {
+        self.dispatch_with_spawner(cfg, now, worker, |task| {
+            thread::Builder::new()
+                .name("queue-monitor".into())
+                .spawn(task)
+        })
+    }
+
+    // The fallible spawn seam exercises the production state handoff on OS errors.
+    fn dispatch_with_spawner<F, S>(
+        &mut self,
+        cfg: &Config,
+        now: Instant,
+        worker: F,
+        spawn: S,
+    ) -> bool
+    where
+        F: FnOnce(Config, QueueMonitorState, InvariantSamplerState) -> MonitorResult
+            + Send
+            + 'static,
+        S: FnOnce(MonitorTask) -> std::io::Result<JoinHandle<MonitorResult>>,
+    {
+        self.collect_finished();
+        if self.in_flight.is_some() {
+            return true;
+        }
+        if self
+            .last_attempt
+            .is_some_and(|last| now.saturating_duration_since(last) < cfg.runner.serve_tick())
+        {
+            return false;
+        }
+        let (Some(qm), Some(inv)) = (&self.queue_monitor, &self.invariant_sampler) else {
+            return false;
+        };
+        let due = |enabled: bool, last: Option<Instant>, seconds| {
+            enabled
+                && last.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= Duration::from_secs(seconds)
+                })
+        };
+        if !due(
+            cfg.queue_monitor.enabled,
+            qm.last_check,
+            cfg.queue_monitor.check_interval_seconds,
+        ) && !due(
+            cfg.invariant_sampler.enabled,
+            inv.last_check,
+            cfg.invariant_sampler.check_interval_seconds,
+        ) {
+            return false;
+        }
+
+        // Count attempts, including deferred probes and failed spawns, so
+        // zero-sleep refill iterations cannot compress REST backoff ticks.
+        self.last_attempt = Some(now);
+        let states = Arc::new(Mutex::new(Some((
+            self.queue_monitor.take().expect("checked queue state"),
+            self.invariant_sampler
+                .take()
+                .expect("checked invariant state"),
+        ))));
+        let worker_states = Arc::clone(&states);
+        let cfg = cfg.clone();
+        match spawn(Box::new(move || {
+            let (qm, inv) = worker_states
+                .lock()
+                .expect("state handoff lock")
+                .take()
+                .expect("worker state");
+            worker(cfg, qm, inv)
+        })) {
+            Ok(handle) => {
+                self.in_flight = Some(handle);
+                true
+            }
+            Err(err) => {
+                let (qm, inv) = states
+                    .lock()
+                    .expect("state handoff lock")
+                    .take()
+                    .expect("unstarted worker state");
+                self.queue_monitor = Some(qm);
+                self.invariant_sampler = Some(inv);
+                eprintln!("WARN: queue monitor worker spawn failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// If the in-flight worker has finished, join it and reclaim the
+    /// state pair. Ordinary tick `Err` keeps the state; only a `join()`
+    /// panic rebuilds empty state. O(1) when no worker has finished.
+    pub fn collect_finished(&mut self) -> bool {
+        let Some(handle) = self.in_flight.as_ref() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let handle = self.in_flight.take().expect("checked in-flight scheduler");
+        match handle.join() {
+            Ok((qm, inv, status)) => {
+                self.queue_monitor = Some(qm);
+                self.invariant_sampler = Some(inv);
+                if let Err(err) = status {
+                    eprintln!("WARN: queue monitor scheduler tick failed: {err:#}");
+                }
+                true
+            }
+            Err(panic) => {
+                eprintln!("WARN: queue monitor scheduler worker panicked: {panic:?}");
+                self.queue_monitor = Some(QueueMonitorState::new());
+                self.invariant_sampler = Some(InvariantSamplerState::new());
+                false
+            }
+        }
+    }
+}
+
+impl Default for QueueMonitorScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn config() -> Config {
+        let mut cfg = Config::defaults_for(
+            &crate::platform::Platform {
+                os: "linux",
+                arch: "x86_64",
+                kvm_usable: false,
+                has_tart: false,
+                has_virsh: false,
+                docker_ok: true,
+                sysbox_runtime: false,
+                daemon_in_vm: false,
+                total_mem_mb: 8192,
+                cpus: 4,
+            },
+            "owner/repo".into(),
+            Scope::Repo,
+        );
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = false;
+        cfg
+    }
+
+    fn next_attempt(sched: &QueueMonitorScheduler) -> Instant {
+        sched
+            .last_attempt
+            .map_or_else(Instant::now, |last| last + config().runner.serve_tick())
+    }
+
+    /// Opt-in external-boundary proof: no gh override and no mocked fetcher.
+    /// MAX forces every Known(u32) budget to defer before fleet/alert work;
+    /// Unknown also defers, but fails this test rather than counting as proof.
+    #[test]
+    #[ignore = "requires authenticated real GitHub REST access; run explicitly"]
+    fn live_scheduler_budget_probe_preserves_cadence_and_backoff() {
+        let mut cfg = config();
+        cfg.runner.serve_tick_seconds = crate::config::MIN_SERVE_TICK_SECONDS;
+        cfg.queue_monitor.rest_budget_floor = u32::MAX;
+        let isolated_path = std::env::temp_dir().join(format!(
+            "ezgha-live-scheduler-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        ));
+        cfg.alert.log_path = Some(isolated_path.join("alerts.jsonl"));
+        cfg.invariant_sampler.history_path = Some(isolated_path.join("invariants.jsonl"));
+        assert!(cfg.alert.slack_webhook_url.is_none());
+        assert!(cfg.alert.email_to.is_none());
+        assert!(!cfg.invariant_sampler.enabled);
+        assert!(!isolated_path.exists());
+
+        let mut sched = QueueMonitorScheduler::new();
+        let start = Instant::now();
+        let tick = cfg.runner.serve_tick();
+        eprintln!(
+            "LIVE scheduler epoch={} path=maybe_dispatch->drive_serve_loop_ticks->rest_budget_remaining_until->gh api rate_limit tick_ms={}",
+            unix_now_secs(),
+            tick.as_millis()
+        );
+        for attempt in 1..=REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD {
+            if let Some(last) = sched.last_attempt {
+                std::thread::sleep((last + tick).saturating_duration_since(Instant::now()));
+                assert!(last.elapsed() >= tick);
+            }
+            assert!(sched.maybe_dispatch(&cfg, Instant::now()));
+            let dispatched_at = sched.last_attempt.unwrap();
+            wait_until_finished(
+                &mut sched,
+                github::REST_BUDGET_PROBE_DEADLINE + Duration::from_secs(1),
+            );
+            assert!(sched.collect_finished());
+            let qm = sched.queue_monitor.as_ref().unwrap();
+            assert_eq!(
+                qm.rest_budget_consecutive_floor_hits, attempt,
+                "each attempt requires an actual Known REST budget, never Unknown"
+            );
+            assert!(qm.last_check.is_none());
+            assert!(sched
+                .invariant_sampler
+                .as_ref()
+                .unwrap()
+                .last_check
+                .is_none());
+            let expected_skip = if attempt == REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD {
+                REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS
+            } else {
+                0
+            };
+            assert_eq!(qm.rest_budget_skip_ticks_remaining, expected_skip);
+            eprintln!(
+                "LIVE known_probe={} elapsed_ms={} floor_hits={} skip_ticks={}",
+                attempt,
+                start.elapsed().as_millis(),
+                qm.rest_budget_consecutive_floor_hits,
+                qm.rest_budget_skip_ticks_remaining
+            );
+            for _ in 0..100 {
+                assert!(
+                    dispatched_at.elapsed() < tick,
+                    "live response must leave an early-retry observation window"
+                );
+                assert!(!sched.maybe_dispatch(&cfg, Instant::now()));
+                assert!(sched.in_flight.is_none());
+                assert_eq!(sched.last_attempt, Some(dispatched_at));
+                let qm = sched.queue_monitor.as_ref().unwrap();
+                assert_eq!(qm.rest_budget_consecutive_floor_hits, attempt);
+                assert_eq!(qm.rest_budget_skip_ticks_remaining, expected_skip);
+            }
+            eprintln!("LIVE early_retries=100 workers_dispatched=0 state_unchanged=true");
+        }
+
+        // A real wall-clock tick now consumes one backoff slot without a probe.
+        let last = sched.last_attempt.unwrap();
+        std::thread::sleep((last + tick).saturating_duration_since(Instant::now()));
+        assert!(last.elapsed() >= tick);
+        assert!(sched.maybe_dispatch(&cfg, Instant::now()));
+        wait_until_finished(&mut sched, Duration::from_secs(1));
+        assert!(sched.collect_finished());
+        let qm = sched.queue_monitor.as_ref().unwrap();
+        assert_eq!(
+            qm.rest_budget_consecutive_floor_hits,
+            REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD
+        );
+        assert_eq!(
+            qm.rest_budget_skip_ticks_remaining,
+            REST_BUDGET_FLOOR_HIT_BACKOFF_TICKS - 1
+        );
+        assert!(qm.last_check.is_none());
+        assert!(
+            !isolated_path.exists(),
+            "deferred monitoring must not persist output"
+        );
+        eprintln!(
+            "LIVE backoff_elapsed_ms={} skip_ticks={} external_budget_probes=3 persistent_outputs=0",
+            start.elapsed().as_millis(), qm.rest_budget_skip_ticks_remaining
+        );
+    }
+
+    #[test]
+    fn disabled_and_not_due_monitors_do_not_spawn() {
+        let mut cfg = config();
+        cfg.queue_monitor.enabled = false;
+        let now = Instant::now();
+        let mut sched = QueueMonitorScheduler::new();
+        assert!(!sched.maybe_dispatch(&cfg, now));
+        cfg.queue_monitor.enabled = true;
+        cfg.invariant_sampler.enabled = true;
+        cfg.queue_monitor.check_interval_seconds = 60;
+        cfg.invariant_sampler.check_interval_seconds = 120;
+        sched.queue_monitor.as_mut().unwrap().last_check = Some(now);
+        sched.invariant_sampler.as_mut().unwrap().last_check = Some(now);
+        assert!(
+            !sched.dispatch_with(&cfg, now + Duration::from_secs(59), |_, _, _| panic!(
+                "not due"
+            ))
+        );
+        assert!(sched.in_flight.is_none());
+        assert!(sched.last_attempt.is_none());
+
+        // Each consumer can become due independently of the other.
+        for (queue_age, invariant_age) in [(60, 0), (0, 120)] {
+            let mut sched = QueueMonitorScheduler::new();
+            sched.queue_monitor.as_mut().unwrap().last_check =
+                Some(now - Duration::from_secs(queue_age));
+            sched.invariant_sampler.as_mut().unwrap().last_check =
+                Some(now - Duration::from_secs(invariant_age));
+            assert!(sched.dispatch_with(&cfg, now, |_cfg, qm, inv| (qm, inv, Ok(()))));
+            wait_until_finished(&mut sched, Duration::from_secs(5));
+            assert!(sched.collect_finished());
+        }
+    }
+
+    #[test]
+    fn deferred_budget_attempts_keep_wall_clock_cadence() {
+        for unknown in [true, false] {
+            let cfg = config();
+            let mut sched = QueueMonitorScheduler::new();
+            let probes = Arc::new(AtomicU32::new(0));
+            let start = Instant::now();
+            let tick = cfg.runner.serve_tick();
+            for attempt in 0..12 {
+                let now = start + tick * attempt;
+                let counter = Arc::clone(&probes);
+                assert!(sched.dispatch_with(&cfg, now, move |cfg, mut qm, mut inv| {
+                    let result = qm
+                        .drive_with_fetcher(
+                            &cfg,
+                            now,
+                            &mut inv,
+                            |_| panic!("deferred budget must not fetch fleet"),
+                            |_, _, _, _| panic!("deferred budget must not fetch repos"),
+                            || {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                if unknown {
+                                    github::RestBudgetProbe::Unknown
+                                } else {
+                                    github::RestBudgetProbe::Known(0)
+                                }
+                            },
+                        )
+                        .map(|_| ());
+                    (qm, inv, result)
+                }));
+                wait_until_finished(&mut sched, Duration::from_secs(5));
+                // Exercise automatic collection in the production dispatch seam.
+                for offset in [
+                    Duration::ZERO,
+                    Duration::from_millis(1),
+                    tick - Duration::from_nanos(1),
+                ] {
+                    assert!(
+                        !sched.dispatch_with(&cfg, now + offset, |_, _, _| panic!("early retry"))
+                    );
+                    assert!(sched.in_flight.is_none());
+                }
+                assert!(sched.queue_monitor.as_ref().unwrap().last_check.is_none());
+            }
+            if unknown {
+                assert_eq!(probes.load(Ordering::SeqCst), 12);
+            } else {
+                // Low budget enters the existing tick-counted skip window.
+                assert!(probes.load(Ordering::SeqCst) < 12);
+                assert!(probes.load(Ordering::SeqCst) >= REST_BUDGET_FLOOR_HIT_BACKOFF_THRESHOLD);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_spawn_restores_state_and_throttles_retry() {
+        let cfg = config();
+        let mut sched = QueueMonitorScheduler::new();
+        let now = Instant::now();
+        sched.queue_monitor.as_mut().unwrap().consecutive_bad = 7;
+        sched
+            .queue_monitor
+            .as_mut()
+            .unwrap()
+            .rest_budget_skip_ticks_remaining = 3;
+        sched.invariant_sampler.as_mut().unwrap().last_check = Some(now);
+        assert!(!sched.dispatch_with_spawner(
+            &cfg,
+            now,
+            |_, _, _| panic!("failed spawn cannot run"),
+            |_task| Err(std::io::Error::other("synthetic task exhaustion")),
+        ));
+        assert!(sched.in_flight.is_none());
+        assert_eq!(sched.queue_monitor.as_ref().unwrap().consecutive_bad, 7);
+        assert_eq!(
+            sched
+                .queue_monitor
+                .as_ref()
+                .unwrap()
+                .rest_budget_skip_ticks_remaining,
+            3
+        );
+        assert_eq!(
+            sched.invariant_sampler.as_ref().unwrap().last_check,
+            Some(now)
+        );
+        assert!(!sched.dispatch_with(
+            &cfg,
+            now + cfg.runner.serve_tick() - Duration::from_nanos(1),
+            |_, _, _| panic!("spawn failure must retain cadence")
+        ));
+        assert!(
+            sched.dispatch_with(&cfg, now + cfg.runner.serve_tick(), |_, qm, inv| {
+                assert_eq!(qm.consecutive_bad, 7);
+                assert_eq!(qm.rest_budget_skip_ticks_remaining, 3);
+                (qm, inv, Ok(()))
+            })
+        );
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+    }
+
+    /// Slow in-flight worker must NOT block subsequent dispatch calls:
+    /// while the worker is still running, the scheduler reports in-flight
+    /// and refuses to spawn another. The main thread returns immediately
+    /// (no block on the slow worker). This is the production Ceiling
+    /// starvation regression test.
+    ///
+    /// Uses an mpsc channel pair for cross-platform determinism -- the
+    /// worker signals it has started and then blocks on a release channel,
+    /// which lets the main thread exercise the in-flight code path with
+    /// no fixed sleeps or `is_finished` polling races.
+    #[test]
+    fn slow_in_flight_worker_does_not_block_dispatch() {
+        let mut sched = QueueMonitorScheduler::new();
+        let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let dispatched =
+            sched.dispatch_with(&config(), next_attempt(&sched), move |_cfg, qm, inv| {
+                // Signal that the worker has started, then wait until the
+                // main thread releases us. This is the "slow" guarantee:
+                // the worker cannot finish on its own.
+                let _ = block_tx.send(());
+                let _ = release_rx.recv();
+                (qm, inv, Ok(()))
+            });
+        assert!(dispatched);
+        // Wait until the worker is parked in `recv`.
+        block_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker must reach its block point within 5s");
+        // Immediate second dispatch must be a no-op (in-flight present).
+        let redispatched =
+            sched.dispatch_with(&config(), next_attempt(&sched), |_cfg, _qm, _inv| {
+                panic!("must not run a second worker while one is in flight");
+            });
+        assert!(
+            redispatched,
+            "in-flight dispatch is a no-op, not a second worker"
+        );
+        // The scheduler's handle is still in flight (worker is blocked).
+        assert!(sched.in_flight.is_some());
+        // Release the worker so it can return its state pair.
+        release_tx.send(()).expect("main thread sends release");
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert!(sched.in_flight.is_none());
+    }
+
+    /// State survives a successful tick: dispatch, wait deterministically
+    /// for the worker to finish (bounded wait -- no fixed sleep), collect,
+    /// verify the scheduler's state pair was preserved by asserting the
+    /// SECOND worker observes the FIRST worker's mutations
+    /// (`last_check`, `consecutive_bad`, REST-backoff
+    /// `rest_budget_skip_ticks_remaining`). Counting closures alone would
+    /// miss a rebuild-on-success regression that loses the worker's
+    /// updates.
+    #[test]
+    fn scheduler_roundtrips_state_after_success() {
+        let qm_witness: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let inv_witness: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+        let consecutive_after_first: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let last_check_after_first: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let skip_after_first: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let mut sched = QueueMonitorScheduler::new();
+        let qm_w = qm_witness.clone();
+        let inv_w = inv_witness.clone();
+        let dispatched = sched.dispatch_with(
+            &config(),
+            next_attempt(&sched),
+            move |_cfg, mut qm, mut inv| {
+                qm.record_tail_sample(true);
+                qm.record_tail_sample(true);
+                qm.record_tail_sample(true);
+                qm.rest_budget_skip_ticks_remaining = 4;
+                inv.last_check = Some(Instant::now());
+                qm_w.fetch_add(1, Ordering::SeqCst);
+                inv_w.fetch_add(1, Ordering::SeqCst);
+                (qm, inv, Ok(()))
+            },
+        );
+        assert!(dispatched);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        // Second dispatch observes the first worker's mutations.
+        let qm_w2 = qm_witness.clone();
+        let inv_w2 = inv_witness.clone();
+        let consecutive_seen = consecutive_after_first.clone();
+        let last_check_seen = last_check_after_first.clone();
+        let skip_seen = skip_after_first.clone();
+        let second = sched.dispatch_with(&config(), next_attempt(&sched), move |_cfg, qm, inv| {
+            consecutive_seen.store(qm.consecutive_bad, Ordering::SeqCst);
+            skip_seen.store(qm.rest_budget_skip_ticks_remaining, Ordering::SeqCst);
+            last_check_seen.store(
+                inv.last_check
+                    .map(|t| t.elapsed().as_nanos() as u64)
+                    .unwrap_or(u64::MAX),
+                Ordering::SeqCst,
+            );
+            qm_w2.fetch_add(1, Ordering::SeqCst);
+            inv_w2.fetch_add(1, Ordering::SeqCst);
+            (qm, inv, Ok(()))
+        });
+        assert!(second);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert_eq!(qm_witness.load(Ordering::SeqCst), 2);
+        assert_eq!(inv_witness.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            consecutive_after_first.load(Ordering::SeqCst),
+            3,
+            "consecutive_bad=3 from first tick must survive the roundtrip"
+        );
+        assert_eq!(
+            skip_after_first.load(Ordering::SeqCst),
+            4,
+            "rest_budget_skip_ticks_remaining=4 from first tick must survive the roundtrip"
+        );
+        // last_check is a recent Instant -- nanoseconds elapsed is small.
+        let elapsed_ns = last_check_after_first.load(Ordering::SeqCst);
+        assert!(
+            elapsed_ns < Duration::from_secs(5).as_nanos() as u64,
+            "last_check must still be a recent Instant after the roundtrip (elapsed_ns={elapsed_ns})"
+        );
+    }
+
+    /// Regression: an ordinary Err from a tick must NOT rebuild state.
+    /// REST backoff / last_check / consecutive-bad counters survive -- only
+    /// a join() panic rebuilds empty state.
+    #[test]
+    fn scheduler_preserves_state_across_ordinary_tick_error() {
+        let consecutive_seen: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let skip_seen: Arc<AtomicU32> = Arc::new(AtomicU32::new(u32::MAX));
+        let last_check_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let mut sched = QueueMonitorScheduler::new();
+        let dispatched =
+            sched.dispatch_with(&config(), next_attempt(&sched), |_cfg, mut qm, mut inv| {
+                qm.record_tail_sample(true);
+                qm.record_tail_sample(true);
+                qm.rest_budget_skip_ticks_remaining = 6;
+                inv.last_check = Some(Instant::now());
+                // Simulate a tick that errored (e.g. rate-limited probe).
+                // State mutations BEFORE the error must still be visible to
+                // the next dispatch -- otherwise backoff is silently lost on
+                // every API hiccup, the exact failure mode this design
+                // protects against.
+                (qm, inv, Err(anyhow::anyhow!("synthetic API rate limit")))
+            });
+        assert!(dispatched);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(
+            sched.collect_finished(),
+            "ordinary Err still counts as a finished tick"
+        );
+        // Next dispatch reads mutated state and stashes it via atomics
+        // (atomics are `Send + 'static`, so moving them into the closure
+        // is sound; we read them back via clones).
+        let seen_consecutive = consecutive_seen.clone();
+        let seen_skip = skip_seen.clone();
+        let seen_last_check = last_check_seen.clone();
+        let dispatched2 =
+            sched.dispatch_with(&config(), next_attempt(&sched), move |_cfg, qm, inv| {
+                seen_consecutive.store(qm.consecutive_bad, Ordering::SeqCst);
+                seen_skip.store(qm.rest_budget_skip_ticks_remaining, Ordering::SeqCst);
+                seen_last_check.store(
+                    inv.last_check
+                        .map(|t| t.elapsed().as_nanos() as u64)
+                        .unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+                (qm, inv, Ok(()))
+            });
+        assert!(dispatched2);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+        assert_eq!(
+            consecutive_seen.load(Ordering::SeqCst),
+            2,
+            "two tail_bad=true ticks must survive the intermediate Err tick"
+        );
+        assert_eq!(
+            skip_seen.load(Ordering::SeqCst),
+            6,
+            "rest_budget_skip_ticks_remaining=6 must survive the intermediate Err tick"
+        );
+        // last_check set just before the Err must still be a recent Instant.
+        let elapsed_ns = last_check_seen.load(Ordering::SeqCst);
+        assert!(
+            elapsed_ns < Duration::from_secs(5).as_nanos() as u64,
+            "last_check must survive the intermediate Err tick (elapsed_ns={elapsed_ns})"
+        );
+    }
+
+    /// Panic in the worker thread triggers join() Err -- the scheduler
+    /// must rebuild empty state so the next dispatch is not permanently
+    /// wedged. We use a flag to confirm the panic actually occurred
+    /// (otherwise the worker would have returned normally and the test
+    /// would falsely pass).
+    #[test]
+    fn scheduler_rebuilds_state_after_worker_panic() {
+        let mut sched = QueueMonitorScheduler::new();
+        let dispatched = sched.dispatch_with(
+            &config(),
+            next_attempt(&sched),
+            |_cfg, _qm, _inv| -> (QueueMonitorState, InvariantSamplerState, Result<()>) {
+                panic!("synthetic worker panic");
+            },
+        );
+        assert!(dispatched);
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        // collect_finished returns false on panic (rebuilt empty state).
+        assert!(!sched.collect_finished());
+        // Subsequent dispatch works (state pair present, freshly rebuilt).
+        let dispatched2 = sched.dispatch_with(&config(), next_attempt(&sched), |_cfg, qm, inv| {
+            (qm, inv, Ok(()))
+        });
+        assert!(
+            dispatched2,
+            "scheduler must accept dispatches after a panic-rebuilt state"
+        );
+        wait_until_finished(&mut sched, Duration::from_secs(5));
+        assert!(sched.collect_finished());
+    }
+
+    /// Bounded poll until the scheduler's in-flight worker has finished
+    /// (or the budget is exhausted). Uses short sleeps + `is_finished`
+    /// instead of a fixed `sleep`, so the test stays deterministic on
+    /// both lightly- and heavily-loaded CI runners while still O(1) on
+    /// the happy path.
+    fn wait_until_finished(sched: &mut QueueMonitorScheduler, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        loop {
+            let Some(handle) = sched.in_flight.as_ref() else {
+                return;
+            };
+            if handle.is_finished() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "scheduler worker did not finish within {budget:?}"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 

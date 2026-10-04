@@ -12,7 +12,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # Unknown daemon ownership must never select the native-host policy.
 (
-  eval "$(sed -n '/^daemon_in_vm() {/,/^}/p' "$VERIFY")"
+  eval "$(sed -n '/^containment_in_vm() {/,/^}/p' "$VERIFY")"
   eval "$(sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY")"
   export DOCKER_HOST=ssh://unowned-fixture
   unset DOCKER_CONTAINMENT_MODE
@@ -286,7 +286,7 @@ run_gate8_pre_envelope() {
   fail() { GATE8_POLICY_FAILURE="$*"; }
   uname() { echo Linux; }
   verify_platform_actions_slice() { return 0; }
-  daemon_in_vm() { return 1; }
+  containment_in_vm() { return 1; }
   verify_managed_runners_in_actions_slice() { return 0; }
   eval "$(sed -n "${retired_start},${helper_end}p" "$VERIFY")"
   eval "$(sed -n "${gate_start},$((modern_start - 1))p" "$VERIFY")" || true
@@ -335,7 +335,7 @@ run_gate8_psi_admission() {
   GATE8_PSI_FAILURE=""
   fail() { GATE8_PSI_FAILURE="$*"; }
   uname() { echo Linux; }
-  daemon_in_vm() { return 1; }
+  containment_in_vm() { return 1; }
   host_docker_requires_actions_oomctl() { return 1; }
   eval "$(sed -n "${psi_start},$((psi_end - 1))p" "$VERIFY")"
   GATE8_PSI_RESULT="$GATE8_PSI_FAILURE"
@@ -468,7 +468,7 @@ run_gate8_pre_envelope() {
   fail() { GATE8_POLICY_FAILURE="$*"; }
   uname() { echo Linux; }
   verify_platform_actions_slice() { return 0; }
-  daemon_in_vm() { return 1; }
+  containment_in_vm() { return 1; }
   verify_managed_runners_in_actions_slice() { return 0; }
   eval "$(sed -n "${timer_start},${timer_end}p" "$VERIFY")"
   verify_modern_timers() {

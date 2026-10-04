@@ -111,7 +111,15 @@ else:
         data = tomllib.load(f)
 
 value = data["runner"].get(key, default)
-print(value)
+# Render booleans as TOML-spec lowercase (not Python's True/False) so the
+# downstream gate can compare against 'true'/'false' without parsing.
+# Strings/nums print unchanged. Regression 2026-10-03: live Mac verifier
+# printed 'True' here, which silently desynced from LIMIT_CPU_BURST=true
+# comparisons in gate3_burst_preflight and Gate 3's CPU arithmetic branch.
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -135,7 +143,10 @@ except ModuleNotFoundError:
     data = toml.load(path)
 
 value = data.get(key, default)
-print(value)
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -175,7 +186,12 @@ else:
         data = tomllib.load(f)
 
 value = data["limits"].get(key, default)
-print(value)
+# Render booleans as TOML-spec lowercase (see toml_get_runner comment
+# for the live-Mac-regression rationale — 2026-10-03).
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -275,7 +291,29 @@ cgroup_has_effective_memory_ceiling() {
     return 1
 }
 
-daemon_in_vm() {
+# Pure CPU clamp arithmetic, factored out of Gate 3 so focused shell tests
+# (tests/verify_exit_gate3_cpu_burst_test.sh) can exercise the four cases
+# without spinning the live fleet:
+#   - default (cpu_burst=false) -> equal-share max(daemon_ncpu / count, 0.5)
+#   - burst (cpu_burst=true)    -> min(cfg.cpus, daemon_ncpu)
+# Both paths return a 2-decimal-rounded value to mirror
+# src/docker_backend.rs's format!("{:.2}", cpus) before NanoCpus conversion.
+# Inputs: $1=cpu_burst ("true"/"false"), $2=cfg.cpus (float),
+# $3=daemon_ncpu (uint>0, caller already checked), $4=count (uint>0).
+# Returns the rounded expected effective cpus on stdout.
+expected_effective_cpus() {
+    local burst="$1" cfg="$2" ncpu="$3" count="$4"
+    if [ "$burst" = "true" ]; then
+        awk -v cfg="$cfg" -v ncpu="$ncpu" 'BEGIN { v = (cfg > ncpu) ? ncpu : cfg; printf "%.2f", v }'
+    else
+        local share
+        share=$(awk -v ncpu="$ncpu" -v count="$count" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
+        awk -v cfg="$cfg" -v share="$share" 'BEGIN { v = (cfg > share) ? share : cfg; printf "%.2f", v }'
+    fi
+}
+
+# Local containment ownership is stricter than the Rust CPU-burst VM proof.
+containment_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
     [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = vm-backed ]
 }
@@ -359,6 +397,71 @@ oomctl_lists_actions_slice() {
 # VM-backed deployments, but it cannot hide a missing oomd enrollment here.
 host_docker_requires_actions_oomctl() {
     [ "$(uname -s)" = "Linux" ] && [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = host-docker ]
+}
+
+daemon_in_vm() {
+    # VM-containment proof via the docker daemon's own kernel string.
+    # Mirrors src/platform.rs::daemon_in_vm(): the daemon kernel probe
+    # MUST succeed (exit 0 AND non-empty output) before the Darwin
+    # shortcut; a nonzero exit with nonempty stdout is NOT success — it
+    # is a half-failed probe that the prior `|| true` accepted silently
+    # (regression 2026-10-03, root review of 0d743: daemon_kernel
+    # carrying stderr text would have matched the daemon_in_vm branch and
+    # silently admitted burst on a half-broken daemon). On macOS the
+    # daemon is always in a VM (no native Linux containers) so any
+    # non-empty daemon kernel counts; on Linux the daemon kernel must
+    # also differ from the host kernel (uname -r).
+    local daemon_kernel_raw daemon_kernel
+    if ! daemon_kernel_raw=$(docker info --format '{{.KernelVersion}}' 2>/dev/null); then
+        return 1
+    fi
+    daemon_kernel=$(printf '%s' "$daemon_kernel_raw" | tr -d '[:space:]')
+    [ -n "$daemon_kernel" ] || return 1
+    if [ "$(uname -s)" = "Darwin" ]; then
+        return 0
+    fi
+    local host_kernel_raw host_kernel
+    if ! host_kernel_raw=$(uname -r 2>/dev/null); then
+        return 1
+    fi
+    host_kernel=$(printf '%s' "$host_kernel_raw" | tr -d '[:space:]')
+    [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+}
+
+# Mirror of src/docker_backend.rs::effective_limits_with_capacity's burst
+# branch (lines 3229-3253 in src/docker_backend.rs): when limits.cpu_burst
+# is requested, refuse unless (a) the docker daemon is proven VM-contained
+# via the SAME kernel-proof the Rust guard uses, and (b) docker info
+# reports a finite positive NCPU. Prints the refusal reason on stderr and
+# returns non-zero on refusal. Default-false (LIMIT_CPU_BURST!=true) is
+# accepted unconditionally — equal-share arithmetic applies downstream.
+# Returns the proven NCPU on stdout (only when accepted) so the caller
+# can reuse it without re-probing docker info. Exit status: 0 accepted,
+# 1 refused. Sourced into focused shell tests via awk extraction.
+gate3_burst_preflight() {
+    if [ "${LIMIT_CPU_BURST:-false}" != "true" ]; then
+        return 0
+    fi
+    if ! daemon_in_vm; then
+        echo "limits.cpu_burst=true but docker daemon is not verified VM-contained (daemon_in_vm kernel proof returned false); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    local ncpu_raw ncpu
+    # Require exit 0 AND non-empty output — a nonzero exit with a stale
+    # value cached in stdout would otherwise leak into is_uint and either
+    # silently coerce or trip a misleading "not finite positive integer"
+    # error rather than the actual probe failure.
+    if ! ncpu_raw=$(docker info --format '{{.NCPU}}' 2>/dev/null); then
+        echo "limits.cpu_burst=true but docker info --format {{.NCPU}} exited non-zero (probe failure); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    ncpu=$(printf '%s' "$ncpu_raw" | tr -d '[:space:]')
+    if ! is_uint "$ncpu" || [ "$ncpu" -le 0 ]; then
+        echo "limits.cpu_burst=true but docker info NCPU is not a finite positive integer ('${ncpu:-unavailable}'); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    echo "$ncpu"
+    return 0
 }
 
 cpu_controller_available() {
@@ -675,7 +778,16 @@ pass "Gate 0: Deployed binary ($DEPLOYED_SHA) matches HEAD ($CURRENT_SHA) or tra
 # --- Gate 1: Code quality ---
 echo "--- Checking Gate 1: Code quality ---"
 cargo build --release >/dev/null || fail "Cargo release build failed"
-cargo test >/dev/null || fail "Cargo tests failed"
+# Preserve raw test output on failure so the diagnostic surfaces the
+# actual primary failure (a single 'Cargo tests failed' line was the
+# pre-existing root-cause-of-unknown-status problem).
+GATE1_TEST_LOG=$(mktemp 2>/dev/null || echo "/tmp/ezgha-gate1-test-$$.log")
+if ! cargo test > "$GATE1_TEST_LOG" 2>&1; then
+    echo "[GATE 1 DIAGNOSTIC] cargo test failed; raw output preserved at $GATE1_TEST_LOG" >&2
+    tail -120 "$GATE1_TEST_LOG" >&2
+    fail "Cargo tests failed (see $GATE1_TEST_LOG for the raw failing-test names + assertion messages)"
+fi
+rm -f "$GATE1_TEST_LOG"
 cargo clippy --all-targets -- -D warnings >/dev/null || fail "Clippy warnings/errors found"
 cargo fmt --check >/dev/null || fail "Cargo formatting checks failed"
 
@@ -774,6 +886,31 @@ LIMIT_MEMORY_MB=$(toml_get_limits memory_mb 0)
 LIMIT_CPUS=$(toml_get_limits cpus 0.50)
 LIMIT_PIDS=$(toml_get_limits pids 1024)
 MIN_FREE_DISK_GB=$(toml_get_limits min_free_disk_gb 10)
+# 2026-10-03: limits.cpu_burst opt-in changes the Gate 3 CPU clamp
+# semantics. Default false keeps the historical equal-share arithmetic
+# (daemon_ncpu / count, .5 floor); true requires a verified VM daemon +
+# finite positive daemon_ncpu and clamps to min(cfg.cpus, daemon_ncpu),
+# 2-decimal-rounded to mirror src/docker_backend.rs's
+# format!("{:.2}", cpus) that converts to NanoCpus. Reading via the
+# existing toml_get_limits helper (not inventing separate semantics)
+# keeps parser behavior aligned with the rest of Gate 3.
+LIMIT_CPU_BURST=$(toml_get_limits cpu_burst false)
+# Burst production guard (Gate 3 must mirror src/docker_backend.rs
+# effective_limits_with_capacity): when limits.cpu_burst=true, refuse
+# if either (a) the docker daemon isn't proven VM-contained via the
+# SAME kernel-proof the Rust guard uses, or (b) daemon NCPU is not
+# finite positive. Silent fallback to the raw cfg.cpus would let an
+# operator believe burst was honored when neither Serve startup nor
+# effective_limits would have admitted it. Default-false leaves both
+# checks unexecuted (equal-share arithmetic still applies). Extracted
+# into gate3_burst_preflight so focused shell tests
+# (tests/verify_exit_gate3_burst_preflight_test.sh) can exercise the
+# same code path without spinning the live fleet; the inline call here
+# uses the same helper so production and tests stay in lockstep.
+GATE3_PROVEN_NCPU=""
+if [ "$LIMIT_CPU_BURST" = "true" ]; then
+    GATE3_PROVEN_NCPU=$(gate3_burst_preflight) || fail "limits.cpu_burst=true preflight refused: $(gate3_burst_preflight 2>&1)"
+fi
 VM_TOTAL_MB=$(toml_get_runner vm_total_mb 0)
 GUEST_RESERVE_MB=$(toml_get_runner guest_reserve_mb 4096)
 RUNNER_FLOOR_MB=$(toml_get_runner runner_floor_mb 3072)
@@ -816,7 +953,7 @@ if [ "$EXPECTED_MEMORY_BYTES" -le 0 ]; then
     fail "Computed expected memory bytes must be > 0 (limits.memory_mb='$LIMIT_MEMORY_MB')"
 fi
 
-if ! daemon_in_vm; then
+if ! containment_in_vm; then
     if ! cpu_controller_available; then
         fail "CPU controller check failed: this host does not expose a usable cpu cgroup controller"
     fi
@@ -923,25 +1060,48 @@ for slot in $(seq 1 "$COUNT"); do
         fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES below the absolute floor $RUNNER_FLOOR_BYTES bytes (runner_floor_mb=$RUNNER_FLOOR_MB)"
     fi
     # Compute EXACT effective CPU clamp, mirroring src/docker_backend.rs
-    # effective_limits_with_capacity(): the daemon caps per-slot cpus at
-    # max(daemon_ncpu / count, 0.5) whenever that share is BELOW the
-    # configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU VM with 6
-    # runners clamps to 1.667 per slot -- observed live, bead jleechan-ehsi).
-    # Checking the raw configured value here would permanently fail Gate 3
-    # on any host where configured cpus*count exceeds the VM's core count,
-    # even though the daemon's clamp is the intended, safe behavior (same
-    # pattern as the memory clamp above).
+    # effective_limits_with_capacity(). Default (cpu_burst=false) caps
+    # per-slot cpus at max(daemon_ncpu / count, 0.5) whenever that share
+    # is BELOW the configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU
+    # VM with 6 runners clamps to 1.667 per slot -- observed live, bead
+    # jleechan-ehsi). Opt-in (cpu_burst=true, 2026-10-03) caps at
+    # min(cfg.cpus, daemon_ncpu) and requires a verified VM daemon plus
+    # finite positive daemon_ncpu; without that evidence, the burst path
+    # would have refused at serve startup so any value here would also
+    # pass. Memory and PIDs are unchanged from prior commits; only the
+    # CPU arithmetic branches on cpu_burst.
     EXPECTED_EFFECTIVE_CPUS=$LIMIT_CPUS
-    DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    if [ "$LIMIT_CPU_BURST" = "true" ]; then
+        # Burst path: reuse the GATE3_PROVEN_NCPU snapshot captured at
+        # the top of Gate 3 by gate3_burst_preflight (which already
+        # required exit 0 + finite positive NCPU). Re-probing docker
+        # info per-slot would (a) duplicate work for every slot and
+        # (b) accept a half-failed probe that the preflight would
+        # have caught — by definition it can't disagree with the
+        # snapshot taken at Gate 3 start, so trust it.
+        DAEMON_NCPU=$GATE3_PROVEN_NCPU
+    else
+        DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    fi
     if is_uint "$DAEMON_NCPU" && [ "$DAEMON_NCPU" -gt 0 ] && [ "$COUNT" -gt 0 ]; then
-        CPU_SHARE=$(awk -v ncpu="$DAEMON_NCPU" -v count="$COUNT" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
-        EXPECTED_EFFECTIVE_CPUS=$(awk -v cfg="$LIMIT_CPUS" -v share="$CPU_SHARE" 'BEGIN { print (cfg > share) ? share : cfg }')
+        EXPECTED_EFFECTIVE_CPUS=$(expected_effective_cpus \
+            "$LIMIT_CPU_BURST" "$LIMIT_CPUS" "$DAEMON_NCPU" "$COUNT")
+    elif [ "$LIMIT_CPU_BURST" = "true" ]; then
+        # Burst path: the preflight above already proved DAEMON_NCPU is
+        # finite positive when cpu_burst=true; reaching here means the
+        # snapshot unexpectedly lost the value. Fail loud rather than
+        # silently falling back to raw $LIMIT_CPUS, which would mask a
+        # real probe regression.
+        fail "limits.cpu_burst=true but per-slot DAEMON_NCPU snapshot is empty ('$DAEMON_NCPU'); src/docker_backend.rs::effective_limits refused this same config at Serve startup, so the running fleet cannot be in burst mode"
     fi
     # The daemon passes cpus to `docker run --cpus` via format!("{:.2}", cpus)
     # (src/docker_backend.rs) -- 2-decimal rounding BEFORE docker converts it
     # to NanoCpus, e.g. 1.6666666666666667 -> "1.67" -> NanoCpus=1670000000,
     # not the naive full-precision 1666666667. Round here identically or this
-    # check permanently mismatches by the rounding delta.
+    # check permanently mismatches by the rounding delta. Burst path rounds
+    # the same way: min(cfg.cpus, daemon_ncpu) is already a small integer or
+    # half-step; the .2f here is a no-op except in mixed precision cases
+    # (e.g. cfg.cpus=1.333 on ncpu=4 -> 1.33).
     EXPECTED_EFFECTIVE_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.2f", cpus }')
     EXPECTED_EFFECTIVE_NANO_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.0f", cpus * 1000000000 }')
     if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_EFFECTIVE_NANO_CPUS" ]; then
@@ -1111,7 +1271,7 @@ if [ "$(uname -s)" = "Linux" ]; then
     if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
         fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
     fi
-    if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
+    if containment_in_vm && command -v limactl >/dev/null 2>&1; then
         if ! verify_guest_managed_runners_in_actions_slice; then
             fail "Gate 8: every managed runner in the Docker VM must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
         fi
@@ -1172,7 +1332,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     # systemd/host/actions.slice, not the guest numbers. Checking the guest from
     # a host-docker deployment reads "unavailable" and was a false FAIL
     # (bead ez-gh-actions-1mdp).
-    if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
+    if containment_in_vm && command -v limactl >/dev/null 2>&1; then
         GUEST_ACTIONS_VALUES=""
         {
             GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
@@ -1294,7 +1454,7 @@ echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/
 # jeff-ubuntu), QEMU runs at host scope and IS reachable via
 # /proc/<qemu>/cgroup, so we still probe. On every other combo, we probe.
 PROBE_QEMU_SLICE=1
-if [ "$(uname -s)" = "Darwin" ] && daemon_in_vm; then
+if [ "$(uname -s)" = "Darwin" ] && containment_in_vm; then
     PROBE_QEMU_SLICE=0
     echo "    [SKIP] Gate 8 (1) QEMU slice probe: daemon-in-VM on macOS (Lima VM cgroup not reachable from macOS shell)"
 fi
@@ -1475,7 +1635,7 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
     # ManagedOOMPreference=avoid/omit, which also enrolls the unit as
     # a candidate for oomd action).
     OOMCTL_OUT="$(oomctl 2>/dev/null || true)"
-    if [ "$(uname -s)" = "Linux" ] && ! daemon_in_vm; then
+    if [ "$(uname -s)" = "Linux" ] && ! containment_in_vm; then
         # Host-docker: the runner aggregate itself must be what oomd watches
         # (systemd/host/actions.slice: ManagedOOMMemoryPressure=kill at 80%).
         if printf '%s\n' "$OOMCTL_OUT" | oomctl_lists_actions_slice; then
@@ -1497,7 +1657,7 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
             OOMD_ENROLL_PROOF="oomctl: pressure=$(printf '%s\n' "$PRESSURE_ENROLLED" | grep -c . || echo 0) swap=$(printf '%s\n' "$SWAP_ENROLLED" | grep -c . || echo 0) cgroup(s) enrolled"
         fi
     fi
-    if [ "$OOMD_ENROLLED" = "0" ] && { [ "$(uname -s)" != "Linux" ] || daemon_in_vm; }; then
+    if [ "$OOMD_ENROLLED" = "0" ] && { [ "$(uname -s)" != "Linux" ] || containment_in_vm; }; then
         # Fallback: walk loaded units for an explicit kill/protect opt-in.
         # ManagedOOMMemoryPressure and ManagedOOMSwap are the actual
         # systemd properties (the brief's "ManagedOOM=" is shorthand for
@@ -1573,7 +1733,7 @@ echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /pro
 # slice-ceiling model does not apply.
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "    [SKIP] Gate 8 (4) host-RAM aggregate: macOS — cgroup-v2 not available, host-RAM envelope model is Linux-only"
-elif ! daemon_in_vm; then
+elif ! containment_in_vm; then
     # Host-docker: sum the four live finite hard maxima once (no x2 model).
     verify_host_docker_envelope
 else
