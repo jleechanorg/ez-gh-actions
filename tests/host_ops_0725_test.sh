@@ -4,7 +4,7 @@
 # This test NEVER starts/enables anything live -- it only checks syntax and structural wiring.
 #
 # Checks:
-#   1. systemd/agents.slice -- valid unit syntax, 18G/20G envelope, auto OOM policies.
+#   1. systemd/agents.slice -- valid unit syntax, 10G/12G envelope, auto OOM policies.
 #   2. scripts/host/agent-scoped-launch.sh -- valid bash syntax (bash -n), no AGENT_SLICE_OPT_OUT.
 #   3. legacy escape hatches and watcher/exemption artifacts are strictly absent:
 #      - scripts/host/psi-oom-watcher.sh
@@ -56,7 +56,7 @@ verify_unit() {
   "${fallback_fn}"
 }
 
-# ── 1. agents.slice syntax and 18G/20G envelope ──────────────────────────────
+# ── 1. agents.slice syntax and 10G/12G envelope ──────────────────────────────
 SLICE="${REPO_ROOT}/systemd/agents.slice"
 if [ ! -f "${SLICE}" ]; then
   fail "systemd/agents.slice does not exist"
@@ -69,10 +69,10 @@ else
     fi
   }
   verify_unit "systemd/agents.slice" "${SLICE}" slice_structural_check
-  if ! grep -q '^MemoryHigh=18G$' "${SLICE}" || ! grep -q '^MemoryMax=20G$' "${SLICE}"; then
-    fail "systemd/agents.slice does not carry the documented 18G high / 20G hard envelope"
+  if ! grep -q '^MemoryHigh=10G$' "${SLICE}" || ! grep -q '^MemoryMax=12G$' "${SLICE}"; then
+    fail "systemd/agents.slice does not carry the documented 10G high / 12G hard envelope"
   else
-    ok "systemd/agents.slice has the documented 18G high / 20G hard envelope"
+    ok "systemd/agents.slice has the documented 10G high / 12G hard envelope"
   fi
   if ! grep -q '^ManagedOOMMemoryPressure=auto$' "${SLICE}" || ! grep -q '^ManagedOOMSwap=auto$' "${SLICE}"; then
     fail "systemd/agents.slice missing ManagedOOMMemoryPressure=auto or ManagedOOMSwap=auto"

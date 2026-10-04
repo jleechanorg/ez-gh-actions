@@ -183,6 +183,48 @@ done
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
+CONFIG_PATH="${CONFIG_DIR}/config.toml"
+
+# Host containment has a bounded profile selector. The selected Linux profile is
+# read only after Docker is classified as native host Docker, so VM-contained
+# daemons do not need a host containment profile. A missing config is the
+# first-install case and uses the current default of 14; a present config must
+# explicitly contain a valid bounded runner.count so rollback cannot be hidden.
+read_config_runner_count() {
+  local config_path="$1"
+  if [ ! -f "${config_path}" ]; then
+    printf '14\n'
+    return 0
+  fi
+  python3 - "${config_path}" <<'PYCFG'
+import sys
+
+path = sys.argv[1]
+try:
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except ModuleNotFoundError:
+        import toml
+        data = toml.load(path)
+except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError):
+    print("invalid")
+    raise SystemExit(0)
+runner = data.get("runner")
+if not isinstance(runner, dict) or "count" not in runner:
+    print("invalid")
+else:
+    value = runner["count"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        print("invalid")
+    else:
+        print(value)
+PYCFG
+}
+
+RUNNER_COUNT=14
+
 LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 
 exec 9>"${LOCK_FILE}"
@@ -447,6 +489,17 @@ if [ "$(uname -s)" = "Linux" ]; then
   docker_kernel="$(env -u DOCKER_CONTEXT DOCKER_HOST="${docker_endpoint}" docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
   [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
   if [ "${docker_kernel}" = "$(uname -r)" ]; then
+    RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
+      bad "could not read runner.count from ${CONFIG_PATH}"
+      exit 1
+    }
+    case "${RUNNER_COUNT}" in
+      10|14) ;;
+      *)
+        bad "runner.count must be 10 or 14 on Linux (got ${RUNNER_COUNT})"
+        exit 1
+        ;;
+    esac
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
     HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
     mkdir -p "${HOST_CONTROL_DIR}" \
@@ -455,21 +508,23 @@ if [ "$(uname -s)" = "Linux" ]; then
       "${HOST_POLICY_DIR}/systemd/host/user-.slice.d" \
       "${HOST_POLICY_DIR}/systemd/host/user@.service.d" \
       "${HOST_POLICY_DIR}/systemd/user/app.slice.d" \
-      "${HOST_POLICY_DIR}/systemd/user/session.slice.d"
+      "${HOST_POLICY_DIR}/systemd/user/session.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/lima-vm@colima.service.d"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
-    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice; do
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/qemu-ceiling-guard.sh" "${HOST_CONTROL_DIR}/qemu-ceiling-guard.sh"
+    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done
     if sudo -n true >/dev/null 2>&1; then
-      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
     elif command -v pkexec >/dev/null 2>&1; then
-      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase
+      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
     else
       bad "host containment root phase requires sudo or pkexec"
       exit 1
     fi
-    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" || { bad "host containment user phase failed after root policy activation"; exit 1; }
+    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --runner-count "${RUNNER_COUNT}" || { bad "host containment user phase failed after root policy activation"; exit 1; }
     ok "host containment activated before binary replacement"
   fi
 fi
@@ -551,7 +606,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 # ── Auto-install or restart ezgha service if config exists ────────────────────
-CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
 if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
@@ -772,12 +826,16 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh qemu-ceiling-guard.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
     done
 
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" || {
+      bad "refusing to install QEMU ceiling: live usage exceeds threshold or cgroup is unreadable"
+      exit 1
+    }
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
@@ -809,9 +867,8 @@ FSTRIM_EOF
     install -m 0644 \
       "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
       "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-    install -m 0644 \
-      "${UNIT_DIR}/lima-vm-cpu-ceiling.service" \
-      "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
+    sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+        "${UNIT_DIR}/lima-vm-cpu-ceiling.service" > "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
 
     # Docker's --cgroup-parent=actions.slice places every runner beneath one
     # guest aggregate. Install the tracked slice inside Colima so ten
@@ -883,16 +940,15 @@ EOF
     # Apply the direct QEMU ceiling to an already-running Colima service.
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.
-    if systemctl --user set-property --runtime lima-vm@colima.service \
-         MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null; then
-      ok "live QEMU service memory+CPU ceiling applied"
-    else
-      warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
-    fi
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --apply || {
+      bad "failed to apply and verify live QEMU service memory+CPU ceiling"
+      exit 1
+    }
     if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
       ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
     else
-      warn "lima-vm-cpu-ceiling.service not enabled"
+      bad "lima-vm-cpu-ceiling.service not enabled"
+      exit 1
     fi
     for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
