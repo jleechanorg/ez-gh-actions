@@ -899,17 +899,28 @@ for slot in $(seq 1 "$COUNT"); do
     # pass. Memory and PIDs are unchanged from prior commits; only the
     # CPU arithmetic branches on cpu_burst.
     EXPECTED_EFFECTIVE_CPUS=$LIMIT_CPUS
-    DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    if [ "$LIMIT_CPU_BURST" = "true" ]; then
+        # Burst path: reuse the GATE3_PROVEN_NCPU snapshot captured at
+        # the top of Gate 3 by gate3_burst_preflight (which already
+        # required exit 0 + finite positive NCPU). Re-probing docker
+        # info per-slot would (a) duplicate work for every slot and
+        # (b) accept a half-failed probe that the preflight would
+        # have caught — by definition it can't disagree with the
+        # snapshot taken at Gate 3 start, so trust it.
+        DAEMON_NCPU=$GATE3_PROVEN_NCPU
+    else
+        DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    fi
     if is_uint "$DAEMON_NCPU" && [ "$DAEMON_NCPU" -gt 0 ] && [ "$COUNT" -gt 0 ]; then
         EXPECTED_EFFECTIVE_CPUS=$(expected_effective_cpus \
             "$LIMIT_CPU_BURST" "$LIMIT_CPUS" "$DAEMON_NCPU" "$COUNT")
     elif [ "$LIMIT_CPU_BURST" = "true" ]; then
         # Burst path: the preflight above already proved DAEMON_NCPU is
         # finite positive when cpu_burst=true; reaching here means the
-        # per-slot probe unexpectedly lost the value. Fail loud rather
-        # than silently falling back to raw $LIMIT_CPUS, which would
-        # mask a real probe regression.
-        fail "limits.cpu_burst=true but per-slot DAEMON_NCPU lost its value mid-loop ('$DAEMON_NCPU'); src/docker_backend.rs::effective_limits refused this same config at Serve startup, so the running fleet cannot be in burst mode"
+        # snapshot unexpectedly lost the value. Fail loud rather than
+        # silently falling back to raw $LIMIT_CPUS, which would mask a
+        # real probe regression.
+        fail "limits.cpu_burst=true but per-slot DAEMON_NCPU snapshot is empty ('$DAEMON_NCPU'); src/docker_backend.rs::effective_limits refused this same config at Serve startup, so the running fleet cannot be in burst mode"
     fi
     # The daemon passes cpus to `docker run --cpus` via format!("{:.2}", cpus)
     # (src/docker_backend.rs) -- 2-decimal rounding BEFORE docker converts it

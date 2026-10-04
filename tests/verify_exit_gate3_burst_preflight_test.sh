@@ -236,4 +236,16 @@ run_case_uname "case8 (NCPU nonzero+nonempty)" \
 grep -nq 'GATE3_PROVEN_NCPU=$(gate3_burst_preflight)' "$VERIFY" \
   || fail "Gate 3 must capture gate3_burst_preflight output via GATE3_PROVEN_NCPU=\$(gate3_burst_preflight) — declaration references alone are not sufficient (found no assignment)"
 
+# Burst path must REUSE the GATE3_PROVEN_NCPU snapshot for the per-slot
+# arithmetic instead of re-probing `docker info` (which would duplicate
+# work and accept a half-failed probe the preflight would have caught).
+# Default-false is allowed to re-probe because it never goes through
+# gate3_burst_preflight. Verify the EXACT variable reference appears in
+# the verifier (the simpler grep is preferred — the prior test used awk
+# that had to track scoping across an `if/elif/fi` ladder and proved
+# fragile; if a future refactor moves the assignment or changes the
+# variable name this fails immediately).
+grep -q 'DAEMON_NCPU=$GATE3_PROVEN_NCPU' "$VERIFY" \
+  || fail "Gate 3 burst branch must reuse \$GATE3_PROVEN_NCPU snapshot for per-slot DAEMON_NCPU (re-probing docker info would duplicate work and accept a half-failed probe the preflight caught)"
+
 echo "VERIFY_EXIT_GATE3_BURST_PREFLIGHT_TEST: PASS"

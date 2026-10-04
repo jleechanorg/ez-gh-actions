@@ -7806,17 +7806,15 @@ minimum_isolation = "container"
         // GitHub registration. Counting calls catches a regression where
         // someone moves the preflight AFTER generate_jitconfig.
         let jit_calls = AtomicUsize::new(0);
-        let starter =
-            |_cfg: &Config, _backend: Backend, _slot: u32| -> Result<(String, String)> {
-                start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
-                    jit_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(("jit-token".into(), 1))
-                })
-            };
+        let starter = |_cfg: &Config, _backend: Backend, _slot: u32| -> Result<(String, String)> {
+            start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+                jit_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(("jit-token".into(), 1))
+            })
+        };
 
-        let outcome =
-            start_missing_runners_with_starter(&cfg, Backend::Docker, 3, starter)
-                .expect("preflight-refused refill must surface as outcome, not panic");
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 3, starter)
+            .expect("preflight-refused refill must surface as outcome, not panic");
 
         assert!(
             outcome.admission_paused_reason.is_some(),
