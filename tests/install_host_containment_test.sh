@@ -89,7 +89,24 @@ case "${1:-}" in
   show)
     if [[ " $* " == *" -p ActiveState "* ]]; then echo inactive; fi
     exit 0 ;;
-  is-active) [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1 ;;
+  is-enabled)
+    if [ "${2:-}" = agent-scope-reaper.timer ] \
+       || [ "${2:-}" = psi-oom-watcher.timer ]; then
+      echo disabled
+      exit 1
+    fi
+    exit 1
+    ;;
+  is-active)
+    if [ "${2:-}" = agent-scope-reaper.timer ] \
+       || [ "${2:-}" = agent-scope-reaper.service ] \
+       || [ "${2:-}" = psi-oom-watcher.timer ] \
+       || [ "${2:-}" = psi-oom-watcher.service ]; then
+      echo inactive
+      exit 3
+    fi
+    [ "${SYSTEMCTL_ACTIVE:-0}" = 1 ] && exit 0 || exit 1
+    ;;
   daemon-reload|start|set-property) echo "systemctl-$1" >> "$EVENT_LOG"; exit 0 ;;
   *) exit 0 ;;
 esac

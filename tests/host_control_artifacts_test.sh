@@ -91,20 +91,10 @@ if grep -q 'AGENT_SLICE_OPT_OUT' "$LAUNCH"; then
 fi
 ok "generic scoped launcher enforces slice confinement with no opt-out"
 
-REAPER="$REPO_ROOT/scripts/host/agent-scope-reaper.sh"
-assert_file "$REAPER"; bash -n "$REAPER"
-assert_file "$REPO_ROOT/systemd/agent-scope-reaper.service"
-assert_file "$REPO_ROOT/systemd/agent-scope-reaper.timer"
-grep -q 'grace' "$REAPER" || fail "reaper lacks grace period"
-grep -q 'primary' "$REAPER" || fail "reaper lacks primary CLI check"
-printf '%s\n' 'agent-old.scope|100' 'agent-young.scope|950' 'agent-live.scope|100' 'not-agent.scope|100' > "$STUB/scopes"
-AGENT_SCOPE_UNIT_FIXTURE="$STUB/scopes" AGENT_SCOPE_NOW_EPOCH=1000 \
-  AGENT_SCOPE_GRACE_SECONDS=100 AGENT_SCOPE_PRIMARY_MAP='agent-old.scope=0,agent-live.scope=1' AGENT_SCOPE_DRY_RUN=1 \
-  AGENT_SCOPE_REAPER_LOG="$STUB/reaper.log" "$REAPER"
-grep -q '"unit":"agent-old.scope".*"action":"would-stop"' "$STUB/reaper.log" || fail "reaper did not identify aged orphan"
-grep -q '"unit":"agent-young.scope".*"action":"keep"' "$STUB/reaper.log" || fail "reaper did not honor grace period"
-grep -q '"unit":"agent-live.scope".*"action":"defer"' "$STUB/reaper.log" || fail "reaper did not inspect each scope independently"
-ok "orphan reaper artifacts"
+for gone in scripts/host/agent-scope-reaper.sh systemd/agent-scope-reaper.service systemd/agent-scope-reaper.timer; do
+  [ ! -e "$REPO_ROOT/$gone" ] || fail "deleted agent-scope-reaper artifact still present: $gone"
+done
+ok "orphan reaper artifacts removed"
 
 for forbidden_file in \
   "$REPO_ROOT/systemd/ezgha.service.d/10-oomd-omit.conf" \
