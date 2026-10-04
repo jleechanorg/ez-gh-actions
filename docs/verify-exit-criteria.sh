@@ -499,6 +499,47 @@ verify_fresh_canary() {
     pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
+# Gate 8 timer policy: the reaper remains required, while install.sh retires
+# psi-oom-watcher. Treat a lost user-manager bus as unknown, never disabled.
+verify_modern_timers() {
+    local enabled_state active_state
+    for timer in agent-scope-reaper.timer; do
+        enabled_state=$(systemctl --user is-enabled "$timer" 2>&1 | head -1 || true)
+        active_state=$(systemctl --user is-active "$timer" 2>&1 | head -1 || true)
+        case "$enabled_state" in enabled|enabled-runtime) ;; *)
+            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
+            return 1
+        esac
+        if [ "$active_state" != "active" ]; then
+            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
+            return 1
+        fi
+    done
+
+    enabled_state=$(systemctl --user is-enabled psi-oom-watcher.timer 2>&1 | head -1 || true)
+    case "$enabled_state" in
+        enabled|enabled-runtime)
+            fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)" ;;
+        # A deleted unit can remain loaded until its runtime instance stops,
+        # so is-active is always checked below.
+        not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+        disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+        *)
+            fail "Gate 8 modern envelope: could not determine psi-oom-watcher.timer enabled state (got: ${enabled_state:-<empty>})"
+            return 1 ;;
+    esac
+    active_state=$(systemctl --user is-active psi-oom-watcher.timer 2>&1 | head -1 || true)
+    case "$active_state" in
+        inactive|failed|not-found) ;;
+        active|activating|deactivating|reloading)
+            fail "Gate 8 modern envelope: psi-oom-watcher.timer is ${active_state} but is disabled by policy (install.sh)" ;;
+        *)
+            fail "Gate 8 modern envelope: could not determine psi-oom-watcher.timer runtime state (got: ${active_state:-<empty>})"
+            return 1 ;;
+    esac
+    return 0
+}
+
 if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
     case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
         config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
@@ -506,6 +547,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         containers) verify_managed_runners_in_actions_slice ;;
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
+        modern_timers) verify_modern_timers ;;
         host_docker_envelope) verify_host_docker_envelope ;;
         oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
@@ -1055,6 +1097,9 @@ if [ "$(uname -s)" = "Linux" ]; then
         fail "Gate 8: every managed runner must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
     fi
     echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
+    # This policy precedes optional modern-envelope detection: a retired
+    # watcher must not be obscured by incomplete local unit files.
+    verify_modern_timers
 fi
 if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
    && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
@@ -1176,12 +1221,6 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
         echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
     fi
 
-    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-        if ! systemctl --user is-enabled "$timer" >/dev/null 2>&1 \
-           || ! systemctl --user is-active "$timer" >/dev/null 2>&1; then
-            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
-        fi
-    done
     for dropin in \
         ao-daemon.service.d/20-automation-slice.conf \
         ao-orchestrator.service.d/20-automation-slice.conf \
@@ -1213,10 +1252,7 @@ fi
 #                      MemoryHigh; currently ao-daemon.service has
 #                      memory.high=max and contains the AO daemon + MCP
 #                      servers uncontained.
-#   (3) PSI admission: enroll scripts/host/psi-oom-watcher.sh via a
-#                      user-scope .timer, OR rely on systemd-oomd active
-#                      at any scope (default policy on Ubuntu 24.04
-#                      manages user.slice automatically).
+#   (3) PSI admission: systemd-oomd must have a real enrolled cgroup.
 #   (4) Aggregate:     physical_host_RAM >= QEMU slice ceiling (read from
 #                      /sys/fs/cgroup${QEMU_CG}/memory.high) + AO/MCP slice
 #                      ceilings (sum across unique slice paths) + mandatory
@@ -1228,7 +1264,7 @@ fi
 #                      physical host RAM, lower MemoryHigh on
 #                      app-lima-vm.slice, or lower the agent-CLI slice
 #                      MemoryHigh.
-echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) enroll a real cgroup with systemd-oomd. (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
@@ -1377,12 +1413,9 @@ else
 fi
 
 # (3) PSI admission check --------------------------------------------------------------
-# Either a real cgroup is enrolled with systemd-oomd (ManagedOOM
+# A real cgroup must be enrolled with systemd-oomd (ManagedOOM
 # MemoryPressure/Swap explicitly opted in, OR oomctl reports a
-# non-empty "Memory Pressure Monitored CGroups:" list), OR
-# psi-oom-watcher.timer is enrolled AND the script it invokes actually
-# contains a real shed action path (kill / systemctl stop / qemu-lima-
-# docker shed, not a no-op journal logger). One of the two MUST be live;
+# non-empty "Memory Pressure Monitored CGroups:" list). This MUST be live;
 # the previous version of this check accepted "systemd-oomd active"
 # alone, which fails to detect the 2026-07-10 host-crash failure mode
 # where oomd was running but no cgroup was actually enrolled for
@@ -1461,61 +1494,15 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
     fi
 fi
 
-# --- Option B: psi-oom-watcher.timer enrolled with a real shed path -----
-if [ "$PSI_OK" != "1" ] && ! host_docker_requires_actions_oomctl; then
-    TIMER_ENABLED=$(systemctl --user is-enabled psi-oom-watcher.timer 2>/dev/null || true)
-    TIMER_ACTIVE=$(systemctl --user is-active psi-oom-watcher.timer 2>/dev/null || true)
-    PSI_SCRIPT=""
-    # Resolve the actual script path the timer invokes. Prefer
-    # systemctl cat (resolves ExecStart on this host); fall back to the
-    # repo's expected path. Bail to "" if neither yields a readable
-    # file — the gate must not trust an unverified path.
-    if [ "$TIMER_ENABLED" = "enabled" ] && [ "$TIMER_ACTIVE" = "active" ]; then
-        TIMER_UNIT_FILE=$(systemctl --user cat psi-oom-watcher.timer 2>/dev/null \
-            | awk '/^ExecStart=/ { sub(/^ExecStart=/, ""); print; exit }' || true)
-        if [ -n "$TIMER_UNIT_FILE" ] && [ -r "$TIMER_UNIT_FILE" ]; then
-            PSI_SCRIPT="$TIMER_UNIT_FILE"
-        elif [ -r "${SCRIPTS_DIR:-}/psi-oom-watcher.sh" ]; then
-            PSI_SCRIPT="${SCRIPTS_DIR}/psi-oom-watcher.sh"
-        fi
-        SHED_PROOF=""
-        if [ -n "$PSI_SCRIPT" ] && [ -r "$PSI_SCRIPT" ]; then
-            # "Real shed action" = the script can actually terminate
-            # something under sustained pressure. Patterns accepted:
-            #   - kill / pkill (any process termination)
-            #   - systemctl stop/kill (slice/unit termination)
-            #   - qemu/lima/colima/docker stop|kill|shutdown|qemu-monitor
-            #     (the brief's explicit example class — VM/container shed)
-            # A no-op watcher that only logs to journal must NOT pass.
-            if grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
-                | grep -Eq '\b(kill|pkill)\b[[:space:]]' \
-                || grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
-                    | grep -Eq 'systemctl[[:space:]]+(stop|kill)' \
-                || grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
-                    | grep -Eq '(qemu|lima|colima|docker)[[:space:]]+(stop|kill|shutdown|qemu-monitor-command)'; then
-                SHED_PROOF="script=${PSI_SCRIPT##*/} contains real shed action (kill/systemctl-stop/qemu-lima-docker shed)"
-            fi
-        fi
-        if [ -n "$SHED_PROOF" ]; then
-            PSI_OK=1
-            PSI_SOURCE="psi-oom-watcher.timer (user-scope, ${SHED_PROOF})"
-        fi
-    fi
-fi
-
 if [ "$PSI_OK" != "1" ]; then
-    # Distinguish the two failure shapes so the operator knows which
-    # remediation applies. The oomd-only failure is the exact one that
-    # produced the 2026-07-10 host crash; the script failure is the
-    # "watcher is enrolled but does nothing" shape.
     OOMD_BUT_NO_CGROUP=""
     if [ "$OOMD_ACTIVE" = "1" ] && [ "$OOMD_ENROLLED" = "0" ]; then
-        OOMD_BUT_NO_CGROUP=" NOTE: systemd-oomd is active at ${OOMD_SCOPE}-scope but oomctl reports zero monitored cgroups — this is the exact 'oomd running but no cgroup enrolled' shape that allowed the 2026-07-10 host crash. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice (e.g. user.slice, system.slice) so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list, or set ManagedOOMPreference=avoid/omit on slices you want protected from oom-kill, or wire scripts/host/psi-oom-watcher.sh into psi-oom-watcher.timer as a user-scope backstop (per bead ez-gh-actions-0725)."
+        OOMD_BUT_NO_CGROUP=" NOTE: systemd-oomd is active at ${OOMD_SCOPE}-scope but oomctl reports zero monitored cgroups — this is the exact 'oomd running but no cgroup enrolled' shape that allowed the 2026-07-10 host crash. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice (e.g. user.slice, system.slice) so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list, or set ManagedOOMPreference=avoid/omit on slices you want protected from oom-kill."
     fi
     if host_docker_requires_actions_oomctl; then
-        fail "Gate 8 (3) host-docker PSI admission requires oomctl to list /actions.slice under 'Memory Pressure Monitored CGroups:'; psi-oom-watcher.timer is not an acceptable fallback. Verify the actions.slice ManagedOOMMemoryPressure=kill and ManagedOOMMemoryPressureLimit=80% policy is live.${OOMD_BUT_NO_CGROUP}"
+        fail "Gate 8 (3) host-docker PSI admission requires oomctl to list /actions.slice under 'Memory Pressure Monitored CGroups:'. Verify the actions.slice ManagedOOMMemoryPressure=kill and ManagedOOMMemoryPressureLimit=80% policy is live.${OOMD_BUT_NO_CGROUP}"
     fi
-    fail "Gate 8 (3) PSI admission is not wired up with a real shed action: oomd has no enrolled cgroup, AND psi-oom-watcher.timer is either not enabled+active or its script contains no kill/systemctl-stop/qemu-lima-docker shed path. Remediation: enroll scripts/host/psi-oom-watcher.sh via a user-scope .timer (per bead ez-gh-actions-0725), OR set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list.${OOMD_BUT_NO_CGROUP}"
+    fail "Gate 8 (3) PSI admission requires systemd-oomd with a real enrolled cgroup. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list.${OOMD_BUT_NO_CGROUP}"
 fi
 PSI_AVG10=$(awk '/^full/ {for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) {gsub("avg10=", "", $i); print $i; exit}}' /proc/pressure/memory 2>/dev/null || echo "?")
 echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /proc/pressure/memory full avg10=${PSI_AVG10}%)"

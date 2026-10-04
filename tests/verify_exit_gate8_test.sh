@@ -226,63 +226,123 @@ if run_oomctl "$TMP/oomctl-empty.txt"; then
   fail "/actions.slice only under Swap (pressure lists /user.slice) must not pass"
 fi
 
-# Exercise the actual inline Gate 8 (3) branch. The timer is deliberately
-# enabled, active, and points to a script with a real `kill` shed path.
-# Host-docker still must fail without /actions.slice; VM-backed retains the
-# timer fallback when oomd has no enrolled cgroups.
-PSI_BIN="$TMP/psi-bin"
-mkdir -p "$PSI_BIN"
-cat > "$PSI_BIN/docker" <<'EOF'
+# Gate 8 timer policy is executed before optional envelope detection. The
+# reaper remains enabled+active on L4; psi-oom-watcher must be disabled and
+# inactive because install.sh retires it.
+TIMER_BIN="$TMP/timer-bin"
+mkdir -p "$TIMER_BIN"
+cat > "$TIMER_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
-[ "$1" = info ] || exit 1
-if [ "${PSI_MODE:?}" = host ]; then uname -r; else printf 'guest-kernel\n'; fi
-EOF
-cat > "$PSI_BIN/oomctl" <<'EOF'
-#!/usr/bin/env bash
-cat "${PSI_OOMCTL_FIXTURE:?}"
-EOF
-cat > "$TMP/psi-shed.sh" <<'EOF'
-#!/usr/bin/env bash
-kill -0 "$$"
-EOF
-cat > "$PSI_BIN/systemctl" <<EOF
-#!/usr/bin/env bash
-case "\$*" in
-  'is-active systemd-oomd') printf 'active\\n' ;;
-  *'--user is-enabled psi-oom-watcher.timer'*) printf 'enabled\\n' ;;
-  *'--user is-active psi-oom-watcher.timer'*) printf 'active\\n' ;;
-  *'--user cat psi-oom-watcher.timer'*) printf 'ExecStart=%s\\n' '$TMP/psi-shed.sh' ;;
-  *) exit 0 ;;
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled)
+    if [ "${2:-}" = psi-oom-watcher.timer ] && [ -n "${STUB_ENABLED_BROKEN:-}" ]; then
+      echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    if [ "${2:-}" = agent-scope-reaper.timer ]; then echo "${STUB_REAPER_ENABLED:-enabled}"; exit 0; fi
+    if [ -n "${STUB_PSI_ENABLED:-}" ]; then echo enabled; exit 0; fi
+    if [ -n "${STUB_ABSENT:-}" ]; then echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1; fi
+    if [ -n "${STUB_NOTFOUND:-}" ]; then echo not-found; exit 4; fi
+    echo disabled; exit 1 ;;
+  is-active)
+    if [ "${2:-}" = systemd-oomd ]; then echo inactive; exit 3; fi
+    if [ "${2:-}" = psi-oom-watcher.timer ] && [ -n "${STUB_ACTIVE_BROKEN:-}" ]; then
+      echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    if [ "${2:-}" = agent-scope-reaper.timer ]; then echo "${STUB_REAPER_ACTIVE:-active}"; exit 0; fi
+    if [ -n "${STUB_PSI_ACTIVE:-}" ]; then echo active; exit 0; fi
+    echo inactive; exit 3 ;;
 esac
+exit 1
 EOF
-chmod +x "$PSI_BIN/docker" "$PSI_BIN/oomctl" "$PSI_BIN/systemctl" "$TMP/psi-shed.sh"
-PSI_BLOCK="$TMP/gate8-psi-block.sh"
-{
-  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail'
-  printf '%s\n' 'fail() { echo "FAIL: $*" >&2; exit 1; }'
-  sed -n '/^daemon_in_vm() {/,/^}/p' "$VERIFY"
-  sed -n '/^oomctl_lists_actions_slice() {/,/^}/p' "$VERIFY"
-  sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY"
-  sed -n '/^# (3) PSI admission check/,/^# (4) Physical-host RAM envelope/{/^# (4) Physical-host RAM envelope/d;p}' "$VERIFY"
-} > "$PSI_BLOCK"
-chmod +x "$PSI_BLOCK"
-run_gate8_psi() { # mode oomctl-fixture
-  PATH="$PSI_BIN:$PATH" PSI_MODE="$1" PSI_OOMCTL_FIXTURE="$2" \
-    bash "$PSI_BLOCK" 2>&1
+chmod +x "$TIMER_BIN/systemctl"
+
+# Run the real Linux pre-envelope Gate 8 dispatch, not only the helper.
+run_gate8_pre_envelope() {
+  local gate_header modern_start gate_start helper_start helper_end saved_fail
+  export STUB_REAPER_ENABLED STUB_REAPER_ACTIVE STUB_PSI_ENABLED STUB_PSI_ACTIVE \
+    STUB_ABSENT STUB_NOTFOUND STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN STUB_BROKEN_MSG
+  gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
+  modern_start=$(grep -n '^if \[ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" \]' "$VERIFY" | cut -d: -f1)
+  gate_start=$(awk -v min="$gate_header" -v max="$modern_start" 'NR >= min && NR < max && /^if \[ "\$\(uname -s\)" = "Linux" \]; then$/ { print NR; exit }' "$VERIFY")
+  helper_start=$(grep -n '^verify_modern_timers() {' "$VERIFY" | cut -d: -f1)
+  helper_end=$(awk -v start="$helper_start" 'NR > start && /^}$/ { print NR; exit }' "$VERIFY")
+  [ -n "$gate_start" ] && [ -n "$helper_start" ] && [ -n "$helper_end" ] || fail "could not extract Gate 8 timer dispatch"
+  saved_fail=$(declare -f fail)
+  GATE8_POLICY_FAILURE=""
+  CONFIG_FILE="$TMP/valid.toml"
+  fail() { GATE8_POLICY_FAILURE="$*"; }
+  uname() { echo Linux; }
+  verify_platform_actions_slice() { return 0; }
+  daemon_in_vm() { return 1; }
+  verify_managed_runners_in_actions_slice() { return 0; }
+  eval "$(sed -n "${helper_start},${helper_end}p" "$VERIFY")"
+  eval "$(sed -n "${gate_start},$((modern_start - 1))p" "$VERIFY")" || true
+  GATE8_POLICY_RESULT="$GATE8_POLICY_FAILURE"
+  eval "$saved_fail"
 }
-host_pass=$(run_gate8_psi host "$TMP/oomctl-enrolled.txt") \
-  || fail "host-docker /actions.slice pressure enrollment should pass: $host_pass"
-grep -Fq 'oomctl: /actions.slice under Memory Pressure Monitored CGroups' <<<"$host_pass" \
-  || fail "host-docker pass did not use the /actions.slice oomctl branch: $host_pass"
-if host_fail=$(run_gate8_psi host "$TMP/oomctl-empty.txt"); then
-  fail "host-docker Gate 8 (3) accepted an active psi timer without /actions.slice"
+
+PATH="$TIMER_BIN:$PATH"
+unset STUB_PSI_ENABLED STUB_PSI_ACTIVE STUB_ABSENT STUB_NOTFOUND STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN
+run_gate8_pre_envelope
+[ -z "$GATE8_POLICY_RESULT" ] || fail "healthy reaper + disabled PSI must pass pre-envelope dispatch: $GATE8_POLICY_RESULT"
+STUB_PSI_ENABLED=1
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "enabled PSI timer must fail before optional envelope detection"
+grep -Fq 'psi-oom-watcher.timer' <<<"$GATE8_POLICY_RESULT" || fail "enabled PSI failure omitted timer: $GATE8_POLICY_RESULT"
+unset STUB_PSI_ENABLED
+STUB_ABSENT=1 STUB_PSI_ACTIVE=1
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "absent PSI unit but active runtime must fail"
+unset STUB_ABSENT STUB_PSI_ACTIVE
+STUB_ENABLED_BROKEN=1
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "enabled-state bus failure must fail closed"
+STUB_BROKEN_MSG="Failed to connect to bus: No such file or directory"
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "bus failure with 'No such file' must fail closed"
+unset STUB_ENABLED_BROKEN
+unset STUB_BROKEN_MSG
+STUB_ACTIVE_BROKEN=1
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "active-state bus failure must fail closed"
+unset STUB_ACTIVE_BROKEN
+
+# Execute the real later PSI admission branch. With oomd inactive it must not
+# revive the retired timer as a fallback or remediation.
+run_gate8_psi_admission() {
+  local psi_start psi_end saved_fail
+  psi_start=$(grep -n '^# (3) PSI admission check' "$VERIFY" | cut -d: -f1)
+  psi_end=$(grep -n '^# (4) Physical-host RAM envelope' "$VERIFY" | cut -d: -f1)
+  [ -n "$psi_start" ] && [ -n "$psi_end" ] || fail "could not extract Gate 8 PSI admission"
+  saved_fail=$(declare -f fail)
+  GATE8_PSI_FAILURE=""
+  fail() { GATE8_PSI_FAILURE="$*"; }
+  uname() { echo Linux; }
+  daemon_in_vm() { return 1; }
+  host_docker_requires_actions_oomctl() { return 1; }
+  eval "$(sed -n "${psi_start},$((psi_end - 1))p" "$VERIFY")"
+  GATE8_PSI_RESULT="$GATE8_PSI_FAILURE"
+  eval "$saved_fail"
+}
+run_gate8_psi_admission
+[ -n "$GATE8_PSI_RESULT" ] || fail "unenrolled oomd must fail the later PSI-admission branch"
+grep -Fq 'ManagedOOMMemoryPressure=kill' <<<"$GATE8_PSI_RESULT" || fail "PSI failure omitted enrolled-oomd remediation: $GATE8_PSI_RESULT"
+! grep -Fq 'psi-oom-watcher' <<<"$GATE8_PSI_RESULT" || fail "later PSI branch still offers retired timer: $GATE8_PSI_RESULT"
+
+# Test mode covers the helper independently, including the retained reaper.
+timer_out=$(PATH="$TIMER_BIN:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1) || fail "healthy reaper + disabled PSI failed test mode: $timer_out"
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_REAPER_ACTIVE=inactive VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  fail "inactive L4 reaper must fail: $timer_out"
 fi
-grep -Fq 'psi-oom-watcher.timer is not an acceptable fallback' <<<"$host_fail" \
-  || fail "host-docker rejection did not name the rejected timer fallback: $host_fail"
-vm_pass=$(run_gate8_psi vm "$TMP/oomctl-none.txt") \
-  || fail "VM-backed Gate 8 (3) should retain the active psi timer fallback: $vm_pass"
-grep -Fq 'psi-oom-watcher.timer (user-scope' <<<"$vm_pass" \
-  || fail "VM-backed pass did not use the timer fallback: $vm_pass"
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_PSI_ACTIVE=1 VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  fail "disabled but active PSI timer must fail: $timer_out"
+fi
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_NOTFOUND=1 VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  : # systemd's not-found is a valid disabled PSI state
+else
+  fail "not-found PSI timer must pass: $timer_out"
+fi
 
 # Kdump/pstore verification is diagnostic-only. It must be quiet on a healthy
 # fixture, fail closed on an unhealthy fixture, and never invoke a remediation
