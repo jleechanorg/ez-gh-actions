@@ -20,15 +20,11 @@ Because GitHub Actions workflows bind strictly to labels (`runs-on: [self-hosted
 ### Step 1: Verify Ghost Runner Contention
 OPERATOR-ONLY: Run:
 ```bash
-GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 GH_PAGER="" timeout 15s gh api /orgs/jleechanorg/actions/runners | jq '.runners[] | select(.status == "offline" and .busy == true)'
-```
-If one or more runners are locked in `offline` + `busy: true`, note their prefix (e.g. `ez-mac-runner-g`) and their runner IDs. For a complete
-corroborating response when more than one page may exist, use:
-```bash
 GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 GH_PAGER="" timeout 15s \
   gh api --paginate --slurp '/orgs/jleechanorg/actions/runners?per_page=100' \
   | jq '.[].runners[] | select(.status == "offline" and .busy == true)'
 ```
+If one or more runners are locked in `offline` + `busy: true`, note their prefix (e.g. `ez-mac-runner-g`) and their runner IDs.
 The GitHub response only corroborates the suspected registrations; local
 `docker ps`/`docker top` evidence remains the capacity and execution source of
 truth.
