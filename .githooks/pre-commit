@@ -13,7 +13,6 @@
 # This hook catches any future regression of the same class BEFORE it
 # can be committed. See:
 #   - .claude/skills/install-gate-checks/SKILL.md (behavioral sentinel pattern)
-#   - .github/workflows/install-sentinel.yml (CI behavioral checks)
 #   - commit b3fe954 (the original fix)
 #   - bead jleechan-zgvz (line 366 bug + follow-ups)
 #

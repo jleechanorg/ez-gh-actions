@@ -1,0 +1,15 @@
+# Re-apply lima-vm CPU/memory ceiling after Colima start.
+# Drop-ins can lose the race on user-session boot; set-property --runtime is
+# the proven live path (2026-08-26). No VM restart.
+[Unit]
+Description=ezgha lima-vm CPU/memory ceiling (runtime reapply)
+After=lima-vm@colima.service
+PartOf=lima-vm@colima.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemctl --user set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%
+
+[Install]
+WantedBy=lima-vm@colima.service

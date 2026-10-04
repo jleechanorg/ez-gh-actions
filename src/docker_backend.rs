@@ -1,21 +1,20 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::CString;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
-use std::sync::Mutex;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::alert::{self, Severity};
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::failure_ladder::{FailureLadder, FailureLadderPolicy, FailureLadderTransition};
 use crate::github;
 use crate::platform::Platform;
 use crate::quarantine::{self, QuarantineEntry, QuarantineReason, QuarantineTable};
@@ -23,6 +22,7 @@ use crate::reaper;
 use crate::watchdog;
 
 const MANAGED_LABEL: &str = "ezgha=managed";
+const FAILURE_LADDER_PATH_ENV: &str = "EZGHA_FAILURE_LADDER_PATH";
 
 /// Pinned image used by the in-daemon cgroup-probe (`docker run --rm`).
 /// Pinning prevents (a) a `latest` tag drift breaking the probe when
@@ -41,32 +41,44 @@ const DISK_MEASURE_STRIKES: u32 = 2;
 /// observability-only: `limits.min_free_disk_gb` remains the admission floor.
 const MACOS_HOST_DISK_PRESSURE_ALERT_GB: u64 = 40;
 static CONSECUTIVE_DISK_NONE: AtomicU32 = AtomicU32::new(0);
+/// Once a failure-ladder transition cannot be persisted, the on-disk ledger
+/// is stale and the daemon must not admit another external start against it.
+/// This latch intentionally lasts for the daemon lifetime; process restart is
+/// the explicit recovery condition that re-establishes a fresh persistence
+/// contract before admission resumes.
+static FAILURE_LADDER_PERSISTENCE_FAILED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+fn reset_failure_ladder_admission_latch_for_tests() {
+    FAILURE_LADDER_PERSISTENCE_FAILED.store(false, Ordering::SeqCst);
+}
 const CPUS_REQUIRE_CPU_CONTROLLER_ERR: &str = "refusing to start runner: Docker CPU cgroup controller is unavailable on this Linux host; cannot enforce --cpus safely.";
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(45);
-// Post-refill readiness gets one 5s shared local-Docker budget. At the normal
-// sub-100ms `docker ps`/`docker top` latency this covers all 22 fleet slots;
-// under host pressure, a single probe may use up to 1s and the shared deadline
+const DOCKER_CLEANUP_RESERVE: Duration = Duration::from_millis(50);
+/// The scheduler polls each owned child without blocking, so one stalled child
+/// cannot monopolize the scheduler. This cap bounds retained child state and
+/// leaves excess requests queued for the next poll cycle.
+const DOCKER_REAPER_ACTIVE_CAP: usize = 64;
+const DOCKER_REAPER_QUEUE_ALERT_THRESHOLD: usize = 1;
+const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// Post-refill readiness gets one 30s shared local-Docker budget. At the normal
+// sub-100ms `docker ps`/`docker top` latency this covers all 16 fleet slots;
+// under host pressure a single probe may use up to ~6s and the shared deadline
 // may expire before all slots are inspected. That is explicit incomplete
 // evidence, never false recovery: the caller runs monitors and an immediate
-// full reconciliation. The probe budget is far below the 300s watchdog margin.
+// full reconciliation. The deadline starts before Docker child-reaper
+// initialization and covers the `ps` plus all `top` probes. The probe budget
+// is far below the 300s watchdog margin.
 //
-// Bead jleechan-viff follow-up (2026-08-01): the previous 5s budget was
-// insufficient for 6 sequential `docker top` calls (each capped at
-// `LOCAL_TOP_TIMEOUT: 1s`; 6 × 1s = 6s ≯ 5s) under host pressure — caused
-// the budget-exhausted path to fire on the 6th container, emitting a
-// false-positive CRITICAL even though the runner-present fix (PR #112) was
-// already in place. Raised to 30s so 6 probes comfortably fit (6 × 1s = 6s
-// + safety margin) and the runner-present check actually runs to completion.
-// Still well under the 300s watchdog margin.
-//
-// 2026-08-26: Under sustained Mac host load (6 heavy Docker containers),
-// `docker top` consistently exceeds 1s, causing `LOCAL_TOP_TIMEOUT` to fire
-// on every readiness poll → cascade CRITICAL alerts → SettlingDecision::Ceiling
-// → runner respawn blocked → fleet drops below capacity. Raised per-call cap
-// to 3s (6 × 3s = 18s ≤ 30s budget; still far below 300s watchdog).
+// The per-probe `LOCAL_TOP_TIMEOUT` is 6s (not 3s): the 2026-10-03 throughput
+// doc measured 3.2-4.5s `docker top` latency on a Mac host under load — a 3s
+// cap killed in-flight probes that were still going to succeed and reported
+// false "not ready" / "absent". Parallel probes still fit the shared 30s
+// budget (worst case is one slow probe + overhead, not 10 sequential 6s).
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
-#[cfg(not(test))]
-const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(3);
+const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Maximum concurrently executing `docker top` readiness probes.
+const READINESS_PROBE_CONCURRENCY: usize = 16;
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -90,8 +102,15 @@ static TEST_IS_MACOS_HOST: std::sync::Mutex<Option<bool>> = std::sync::Mutex::ne
 #[cfg(test)]
 static TEST_START_ONE_NAMES: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 #[cfg(test)]
+/// Per-test queue of `Result<ReadinessSummary, String>` values consumed by
+/// `executing_runner_count_from_containers`'s `#[cfg(test)]` branch. Each
+/// `pop_front` configures one call. Tests inject `ReadinessSummary { ready,
+/// absent }` so post-refill and settling-loop regressions can simulate
+/// absent-container races — the round-2 review failure (bead jleechan-95jk
+/// root-cause): absent slots must surface as shortage > 0 so the settling
+/// episode fires (Recovered would silently skip it and sleep 30s).
 static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<
-    Option<std::collections::VecDeque<std::result::Result<u32, String>>>,
+    Option<std::collections::VecDeque<std::result::Result<ReadinessSummary, String>>>,
 > = std::sync::Mutex::new(None);
 /// Overrides the binary name/path used to build every `docker` `Command` in
 /// this module. Unlike mutating the process-wide `PATH` env var (which any
@@ -103,6 +122,11 @@ static TEST_EXECUTING_RUNNER_COUNTS: std::sync::Mutex<
 /// `start_one_releases_slot_on_docker_run_failure` for the only user.
 #[cfg(test)]
 static TEST_DOCKER_BIN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_DOCKER_REAPER_PANIC_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static TEST_DOCKER_REAPER_PANIC_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Test seam for `docker_cpu_controller_available`. When a test installs
 /// `Some(b)` via `cpu_probe_overrides::set`, the public function returns `b`
@@ -381,7 +405,7 @@ fn live_runners_last_run_id(live_runners: &[github::RunnerInfo], runner_id: u64)
 fn container_peak_rss_mb(container_name: &str) -> u64 {
     // `docker stats` parses cleanly with `--no-stream --format '{{.MemUsage}}'`
     // which yields strings like "123.4MiB / 7.7GiB" or "0B / 7.7GiB".
-    let out = match std::process::Command::new("docker")
+    let out = match docker_cmd()
         .args([
             "stats",
             "--no-stream",
@@ -508,7 +532,298 @@ fn quarantine_corrupt_slot_file(path: &Path, cause: &impl std::fmt::Display) {
     );
 }
 
-fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+fn reap_killed_child_until_deadline(
+    mut child: std::process::Child,
+    deadline: Instant,
+) -> Option<std::process::Child> {
+    let _ = child.kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return None,
+            Err(_) => return Some(child),
+            Ok(None) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Some(child);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
+}
+
+struct DockerReapRequest {
+    child: std::process::Child,
+    detail: String,
+}
+
+struct DockerReapQueue {
+    pending: Mutex<VecDeque<DockerReapRequest>>,
+    wake: Condvar,
+    active: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct DockerChildReaper {
+    queue: Arc<DockerReapQueue>,
+}
+
+static DOCKER_CHILD_REAPER: Mutex<Option<DockerChildReaper>> = Mutex::new(None);
+
+fn try_wait_owned_docker_child(request: &mut DockerReapRequest) -> bool {
+    match request.child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(error) => {
+            eprintln!(
+                "warning: Docker child wait failed while {}; retaining ownership for retry: {error}",
+                request.detail
+            );
+            false
+        }
+    }
+}
+
+impl DockerReapQueue {
+    fn enqueue(&self, request: DockerReapRequest) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.push_back(request);
+        let pending_len = pending.len();
+        let active = self.active.load(Ordering::Relaxed);
+        if active >= DOCKER_REAPER_ACTIVE_CAP && pending_len >= DOCKER_REAPER_QUEUE_ALERT_THRESHOLD
+        {
+            eprintln!(
+                "warning: Docker child reaper is saturated ({active} active waits, {pending_len} queued); stalled child waits may need operator investigation"
+            );
+        }
+        self.wake.notify_one();
+    }
+
+    fn worker_finished(&self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn take_next(&self) -> Option<DockerReapRequest> {
+        if self.active.load(Ordering::Relaxed) >= DOCKER_REAPER_ACTIVE_CAP {
+            return None;
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let request = pending.pop_front()?;
+        self.active.fetch_add(1, Ordering::Relaxed);
+        Some(request)
+    }
+
+    fn next(&self) -> DockerReapRequest {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            #[cfg(test)]
+            if TEST_DOCKER_REAPER_PANIC_ONCE.swap(false, Ordering::SeqCst) {
+                TEST_DOCKER_REAPER_PANIC_COUNT.fetch_add(1, Ordering::SeqCst);
+                panic!("injected Docker child reaper worker panic");
+            }
+            if self.active.load(Ordering::Relaxed) < DOCKER_REAPER_ACTIVE_CAP {
+                if let Some(request) = pending.pop_front() {
+                    self.active.fetch_add(1, Ordering::Relaxed);
+                    return request;
+                }
+            }
+            pending = self
+                .wake
+                .wait(pending)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn wait_for_work(&self, timeout: Duration) {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if pending.is_empty() {
+            let _ = self
+                .wake
+                .wait_timeout(pending, timeout)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+fn docker_child_reaper_worker(
+    queue: Arc<DockerReapQueue>,
+    ready_sender: Option<mpsc::SyncSender<()>>,
+) {
+    if let Some(ready_sender) = ready_sender {
+        if ready_sender.send(()).is_err() {
+            return;
+        }
+    }
+    let mut active = VecDeque::new();
+    loop {
+        if active.is_empty() {
+            active.push_back(queue.next());
+        }
+        while active.len() < DOCKER_REAPER_ACTIVE_CAP {
+            let Some(request) = queue.take_next() else {
+                break;
+            };
+            active.push_back(request);
+        }
+
+        let poll_count = active.len();
+        for _ in 0..poll_count {
+            let mut request = active.pop_front().expect("active reaper request missing");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                try_wait_owned_docker_child(&mut request)
+            }));
+            match outcome {
+                Ok(true) => queue.worker_finished(),
+                Ok(false) => active.push_back(request),
+                Err(_) => {
+                    eprintln!(
+                        "warning: Docker child wait panicked while {}; retaining ownership for retry",
+                        request.detail
+                    );
+                    active.push_back(request);
+                }
+            }
+        }
+
+        queue.wait_for_work(DOCKER_REAPER_POLL_INTERVAL);
+    }
+}
+
+fn docker_child_reaper_supervisor(
+    queue: Arc<DockerReapQueue>,
+    ready_sender: Option<mpsc::SyncSender<()>>,
+) {
+    let mut first_worker = true;
+    loop {
+        let worker_queue = Arc::clone(&queue);
+        let worker_ready_sender = if first_worker {
+            ready_sender.clone()
+        } else {
+            None
+        };
+        first_worker = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            docker_child_reaper_worker(worker_queue, worker_ready_sender);
+        }));
+        match result {
+            Ok(()) => return,
+            Err(_) => {
+                eprintln!(
+                    "error: Docker child reaper worker panicked; restarting supervisor worker"
+                );
+            }
+        }
+    }
+}
+
+fn initialize_docker_child_reaper() -> std::result::Result<DockerChildReaper, String> {
+    let queue = Arc::new(DockerReapQueue {
+        pending: Mutex::new(VecDeque::new()),
+        wake: Condvar::new(),
+        active: AtomicUsize::new(0),
+    });
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let worker_queue = Arc::clone(&queue);
+    std::thread::Builder::new()
+        .name("ezgha-docker-reaper".to_owned())
+        .spawn(move || docker_child_reaper_supervisor(worker_queue, Some(ready_sender)))
+        .map_err(|error| format!("failed to start Docker child reaper: {error}"))?;
+    ready_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|error| format!("Docker child reaper failed readiness verification: {error}"))?;
+    Ok(DockerChildReaper { queue })
+}
+
+fn get_or_initialize_docker_child_reaper(
+    cache: &Mutex<Option<DockerChildReaper>>,
+    initialize: impl FnOnce() -> std::result::Result<DockerChildReaper, String>,
+) -> Result<DockerChildReaper> {
+    let mut cached = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(reaper) = cached.as_ref() {
+        return Ok(reaper.clone());
+    }
+    let reaper = initialize().map_err(|error| anyhow::anyhow!(error))?;
+    *cached = Some(reaper.clone());
+    Ok(reaper)
+}
+
+fn docker_child_reaper() -> Result<DockerChildReaper> {
+    get_or_initialize_docker_child_reaper(&DOCKER_CHILD_REAPER, initialize_docker_child_reaper)
+}
+
+impl DockerChildReaper {
+    fn enqueue(&self, request: DockerReapRequest) {
+        self.queue.enqueue(request);
+    }
+}
+
+fn docker_timeout<T>(
+    child: std::process::Child,
+    detail: &str,
+    timeout: Duration,
+    deadline: Instant,
+    reaper: &DockerChildReaper,
+) -> Result<T> {
+    if let Some(child) = reap_killed_child_until_deadline(child, deadline) {
+        reaper.enqueue(DockerReapRequest {
+            child,
+            detail: detail.to_owned(),
+        });
+    }
+    bail!(
+        "docker CLI timed out after {}ms while {detail}",
+        timeout.as_millis()
+    );
+}
+
+fn run_docker_with_timeout(cmd: Command, detail: &str, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    run_docker_with_timeout_at_deadline(cmd, detail, timeout, deadline, docker_child_reaper())
+}
+
+#[cfg(test)]
+fn run_docker_with_timeout_after_reaper_init(
+    cmd: Command,
+    detail: &str,
+    timeout: Duration,
+    reaper: Result<DockerChildReaper>,
+) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    run_docker_with_timeout_at_deadline(cmd, detail, timeout, deadline, reaper)
+}
+
+fn run_docker_with_timeout_at_deadline(
+    mut cmd: Command,
+    detail: &str,
+    timeout: Duration,
+    deadline: Instant,
+    reaper: Result<DockerChildReaper>,
+) -> Result<Output> {
+    let reaper = reaper?;
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        bail!(
+            "docker CLI timed out after {}ms while {detail}",
+            timeout.as_millis()
+        );
+    }
+    // Keep a bounded cleanup window inside the command budget. Reads and
+    // normal process reaping stop at this phase deadline; timeout cleanup can
+    // then kill and reap until the single absolute command deadline.
+    let phase_deadline = deadline - timeout.min(DOCKER_CLEANUP_RESERVE);
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -536,24 +851,38 @@ fn run_docker_with_timeout(mut cmd: Command, detail: &str, timeout: Duration) ->
         let _ = tx_err.send(buf);
     });
 
-    let stdout = match rx_out.recv_timeout(timeout) {
+    let stdout = match rx_out.recv_timeout(phase_deadline.saturating_duration_since(Instant::now()))
+    {
         Ok(buf) => buf,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "docker CLI timed out after {}ms while {detail}",
-                timeout.as_millis()
-            );
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return docker_timeout(child, detail, timeout, deadline, &reaper);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+    let stderr = match rx_err.recv_timeout(phase_deadline.saturating_duration_since(Instant::now()))
+    {
+        Ok(buf) => buf,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return docker_timeout(child, detail, timeout, deadline, &reaper);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Vec::new(),
+    };
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let remaining = phase_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return docker_timeout(child, detail, timeout, deadline, &reaper);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("wait for docker CLI during {detail}"));
+            }
         }
     };
-    let stderr = rx_err
-        .recv_timeout(Duration::from_secs(5))
-        .unwrap_or_default();
-
-    let status = child
-        .wait()
-        .with_context(|| format!("wait for docker CLI during {detail}"))?;
     Ok(Output {
         status,
         stdout,
@@ -685,6 +1014,62 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     assignments.assignments.remove(&key);
     assignments.registered_at.remove(&key);
     write_slot_assignments_for(&assignments, cfg)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRunnerActivity {
+    Busy,
+    Idle,
+    Unknown,
+    /// `docker top` reported the container no longer exists ("No such
+    /// container"). Distinct from `Unknown`: an absent container is a
+    /// definitive signal that the slot's local state has been torn down,
+    /// so `release_stale_slots` can safely reclaim. Genuine probe failures
+    /// (timeout, daemon error, transient I/O) remain `Unknown` and stay
+    /// fail-safe per bead jleechan-95jk root-cause analysis: do not blindly
+    /// treat all errors as absence.
+    Absent,
+}
+
+/// True if `docker top` stderr indicates the container is gone. Docker
+/// reports a missing container with "No such container" (the standard
+/// engine message since at least docker 20) and historically "No such
+/// object" in some plugin paths. Anything else (timeout, daemon error,
+/// I/O failure) is a transient/systemic failure that stays fail-safe.
+fn docker_top_container_absent(stderr: &str) -> bool {
+    stderr.contains("No such container") || stderr.contains("No such object")
+}
+
+fn local_runner_activity(container_name: &str) -> LocalRunnerActivity {
+    let mut cmd = docker_cmd();
+    cmd.args(["top", container_name, "-eo", "pid,comm"]);
+    let out = match run_docker_with_timeout(
+        cmd,
+        "checking local runner activity before stale reclaim",
+        LOCAL_TOP_TIMEOUT,
+    ) {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if docker_top_container_absent(&stderr) {
+                return LocalRunnerActivity::Absent;
+            }
+            eprintln!("warning: keeping {container_name}: local activity probe failed: {stderr}");
+            return LocalRunnerActivity::Unknown;
+        }
+        Err(err) => {
+            eprintln!("warning: keeping {container_name}: local activity probe failed: {err:#}");
+            return LocalRunnerActivity::Unknown;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if runner_worker_present(&stdout) {
+        LocalRunnerActivity::Busy
+    } else if runner_present(&stdout) {
+        LocalRunnerActivity::Idle
+    } else {
+        LocalRunnerActivity::Unknown
+    }
 }
 
 /// Release slots whose recorded `runner_id` no longer corresponds to a live
@@ -973,6 +1358,42 @@ fn release_stale_slots_from_with_containers_for(
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
 ) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        cfg,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        local_runner_activity,
+    )
+}
+
+#[cfg(test)]
+fn release_stale_slots_from_with_containers_and_activity(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        None,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        activity_probe,
+    )
+}
+
+fn release_stale_slots_from_with_containers_and_activity_for(
+    cfg: Option<&Config>,
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
     }
@@ -1056,48 +1477,83 @@ fn release_stale_slots_from_with_containers_for(
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
-                            // Beyond the grace window: GH has permanently
-                            // rejected/reaped the registration (e.g. duplicate-
-                            // name collision, server-side cleanup, or a registration
-                            // that silently failed and was never going to land).
-                            // The local container is untracked on GH and the slot
-                            // would otherwise be held forever. Force reclaim so a
-                            // fresh allocation cycle can claim it. The container
-                            // itself is left alone — it will be reaped by the next
-                            // ezgha serve tick as orphaned, and any in-flight job
-                            // it was running has already been lost (GH shows the
-                            // runner as offline/busy in this state).
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                            let wall_secs = now_epoch_secs();
-                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
-                            // Bead jleechan-tv58: surface the in-flight run_id
-                            // (when GH shows one) and the local container's peak
-                            // RSS so an operator can correlate this reclaim to
-                            // a real job. Both are best-effort forensic data:
-                            // `last_run_id=0` and `peak_rss_mb=0` are valid
-                            // signals ("GitHub didn't surface runId" / "no
-                            // container / docker stats failed"), NOT failures.
-                            let last_run_id =
-                                live_runners_last_run_id(live_runners, rid).unwrap_or(0);
-                            let peak_rss_mb = container_peak_rss_mb(&expected_name);
-                            eprintln!(
-                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} still exists)"
-                            );
-                            record_reclaim(
-                                slot,
-                                ReclaimRecord {
-                                    monotonic_secs: 0.0,
-                                    wall_secs,
-                                    slot: slot_n,
-                                    runner_id: rid,
-                                    last_run_id,
-                                    peak_rss_mb,
-                                    in_grace: false,
-                                    reason: "gh-rejected-past-grace".to_string(),
-                                },
-                            );
-                            release_slot_for(cfg, slot_n)?;
-                            reclaimed += 1;
+                            match activity_probe(&expected_name) {
+                                LocalRunnerActivity::Busy => {
+                                    eprintln!(
+                                        "warning: keeping slot {slot_n}: local container {expected_name} has Runner.Worker while GH snapshot omits registration {rid} (elapsed {elapsed}s); refusing destructive reclaim"
+                                    );
+                                }
+                                LocalRunnerActivity::Unknown => {
+                                    eprintln!(
+                                        "warning: keeping slot {slot_n}: local activity for {expected_name} is unknown while GH snapshot omits registration {rid} (elapsed {elapsed}s); failing safe"
+                                    );
+                                }
+                                LocalRunnerActivity::Absent => {
+                                    // Bead jleechan-95jk root-cause: a slot
+                                    // that is "gh-missing-but-locally-tracked"
+                                    // and whose local container is GONE
+                                    // (docker top: No such container) must
+                                    // reclaim immediately, not wait out the
+                                    // grace window. The previous code treated
+                                    // this as Unknown and the slot stayed
+                                    // reserved even though the container was
+                                    // already gone, blocking reconciliation.
+                                    let wall_secs = now_epoch_secs();
+                                    let monotonic_secs =
+                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let last_run_id =
+                                        live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                                    let peak_rss_mb = 0u64;
+                                    eprintln!(
+                                        "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-container-absent (docker top: No such container for {expected_name})"
+                                    );
+                                    record_reclaim(
+                                        slot,
+                                        ReclaimRecord {
+                                            monotonic_secs: 0.0,
+                                            wall_secs,
+                                            slot: slot_n,
+                                            runner_id: rid,
+                                            last_run_id,
+                                            peak_rss_mb,
+                                            in_grace: false,
+                                            reason: "gh-rejected-container-absent".to_string(),
+                                        },
+                                    );
+                                    release_slot_for(cfg, slot_n)?;
+                                    reclaimed += 1;
+                                }
+                                LocalRunnerActivity::Idle => {
+                                    // A proven listener with no GitHub registration
+                                    // can never receive another job. Recycling it is
+                                    // safe; a Worker or inconclusive probe is kept.
+                                    let wall_secs = now_epoch_secs();
+                                    let monotonic_secs =
+                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let last_run_id =
+                                        live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                                    let peak_rss_mb = container_peak_rss_mb(&expected_name);
+                                    eprintln!(
+                                        "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-rejected-past-grace (local container {expected_name} is idle)"
+                                    );
+                                    record_reclaim(
+                                        slot,
+                                        ReclaimRecord {
+                                            monotonic_secs: 0.0,
+                                            wall_secs,
+                                            slot: slot_n,
+                                            runner_id: rid,
+                                            last_run_id,
+                                            peak_rss_mb,
+                                            in_grace: false,
+                                            reason: "gh-rejected-past-grace".to_string(),
+                                        },
+                                    );
+                                    release_slot_for(cfg, slot_n)?;
+                                    reclaimed += 1;
+                                }
+                            }
                         }
                     }
                     Some(_) => {
@@ -1901,7 +2357,7 @@ pub fn prepull_probe_image() {
     std::thread::Builder::new()
         .name("ezgha-probe-prepull".into())
         .spawn(|| {
-            let out = Command::new("docker")
+            let out = docker_cmd()
                 .args(["pull", PROBE_IMAGE])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::piped())
@@ -1970,7 +2426,7 @@ fn probe_docker_cpu_controller_available() -> bool {
             // timeout fails closed (the daemon already fails closed on
             // any other probe error), so the safety contract is
             // unchanged.
-            let mut cmd = Command::new("docker");
+            let mut cmd = docker_cmd();
             cmd.args([
                 "run", "--rm", "--cgroupns=host", "--network=none",
                 probe_img, "sh", "-c",
@@ -2104,15 +2560,319 @@ fn parse_controller_probe(bytes: &[u8]) -> bool {
 /// module to a fake script without touching the process-wide `PATH` env var
 /// (which is shared with every other thread/test in the binary). Production
 /// behavior is unchanged: always `Command::new("docker")`, resolved via the
-/// real `PATH`.
+/// real `PATH`. Endpoint selection is owned by `platform` so startup probes
+/// and runner mutation always address the same daemon.
 fn docker_cmd() -> Command {
     #[cfg(test)]
     {
         if let Some(bin) = TEST_DOCKER_BIN.lock().unwrap().clone() {
-            return Command::new(bin);
+            let mut cmd = Command::new(bin);
+            crate::platform::configure_docker_endpoint(&mut cmd);
+            return cmd;
         }
     }
-    Command::new("docker")
+    crate::platform::docker_command()
+}
+
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_OVERRIDE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_CGROUP_ROOT: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_HOST_CONTAINMENT_DAEMON_IN_VM: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_CONTAINER_ANCESTRY_OVERRIDE: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_USER_MANAGER_OOM_PROPERTIES: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_MEMORY_HIGH_BYTES: u64 = 26 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_MEMORY_MAX_BYTES: u64 = 28 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_PIDS_MAX: u64 = 6000;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_CPU_QUOTA_USEC: u64 = 2_000_000;
+#[cfg(target_os = "linux")]
+const HOST_ACTIONS_CPU_PERIOD_USEC: u64 = 100_000;
+
+#[cfg(target_os = "linux")]
+fn host_containment_daemon_in_vm() -> bool {
+    #[cfg(test)]
+    if let Some(in_vm) = *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() {
+        return in_vm;
+    }
+
+    // This must use the same canonical endpoint as runner mutation. The
+    // ambient Docker context can point at Colima or a remote daemon while
+    // `docker_cmd` later creates containers on the host socket.
+    let host_kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|kernel| kernel.trim().to_owned())
+        .filter(|kernel| !kernel.is_empty());
+    let mut cmd = docker_cmd();
+    cmd.args(["info", "--format", "{{.KernelVersion}}"]);
+    let daemon_kernel = run_docker(
+        cmd,
+        "checking canonical Docker daemon kernel for containment",
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    .filter(|kernel| !kernel.is_empty());
+    matches!((host_kernel, daemon_kernel), (Some(host), Some(daemon)) if host != daemon)
+}
+
+#[cfg(target_os = "linux")]
+fn host_actions_cgroup_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap().clone() {
+        return root;
+    }
+    PathBuf::from("/sys/fs/cgroup")
+}
+
+#[cfg(target_os = "linux")]
+fn read_host_actions_limit(root: &Path, name: &str) -> Result<String> {
+    let path = root.join("actions.slice").join(name);
+    std::fs::read_to_string(&path)
+        .with_context(|| format!("host containment requires readable {}", path.display()))
+        .map(|value| value.trim().to_owned())
+}
+
+/// Confirm the finite cgroup-v2 limits that bound the complete HostDocker fleet.
+#[cfg(target_os = "linux")]
+fn validate_host_actions_slice(root: &Path) -> Result<()> {
+    let memory_high = read_host_actions_limit(root, "memory.high")?;
+    let memory_high = memory_high.parse::<u64>().with_context(|| {
+        format!(
+            "host containment requires finite actions.slice memory.high={} bytes (got {memory_high:?})",
+            HOST_ACTIONS_MEMORY_HIGH_BYTES
+        )
+    })?;
+    if memory_high != HOST_ACTIONS_MEMORY_HIGH_BYTES {
+        bail!(
+            "host containment requires actions.slice memory.high={} bytes (got {memory_high})",
+            HOST_ACTIONS_MEMORY_HIGH_BYTES
+        );
+    }
+
+    let memory_max = read_host_actions_limit(root, "memory.max")?;
+    let memory_max = memory_max.parse::<u64>().with_context(|| {
+        format!(
+            "host containment requires finite actions.slice memory.max={} bytes (got {memory_max:?})",
+            HOST_ACTIONS_MEMORY_MAX_BYTES
+        )
+    })?;
+    if memory_max != HOST_ACTIONS_MEMORY_MAX_BYTES {
+        bail!(
+            "host containment requires actions.slice memory.max={} bytes (got {memory_max})",
+            HOST_ACTIONS_MEMORY_MAX_BYTES
+        );
+    }
+
+    let memory_swap_max = read_host_actions_limit(root, "memory.swap.max")?;
+    if memory_swap_max != "0" {
+        bail!(
+            "host containment requires actions.slice memory.swap.max=0 (got {memory_swap_max:?})"
+        );
+    }
+
+    let pids_max = read_host_actions_limit(root, "pids.max")?;
+    let pids_max = pids_max.parse::<u64>().with_context(|| {
+        format!(
+            "host containment requires finite actions.slice pids.max={HOST_ACTIONS_PIDS_MAX} (got {pids_max:?})"
+        )
+    })?;
+    if pids_max != HOST_ACTIONS_PIDS_MAX {
+        bail!(
+            "host containment requires actions.slice pids.max={HOST_ACTIONS_PIDS_MAX} (got {pids_max})"
+        );
+    }
+
+    let cpu_max = read_host_actions_limit(root, "cpu.max")?;
+    let mut cpu_max_parts = cpu_max.split_whitespace();
+    let quota = cpu_max_parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok());
+    let period = cpu_max_parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok());
+    if quota != Some(HOST_ACTIONS_CPU_QUOTA_USEC)
+        || period != Some(HOST_ACTIONS_CPU_PERIOD_USEC)
+        || cpu_max_parts.next().is_some()
+    {
+        bail!(
+            "host containment requires actions.slice cpu.max={} {} (got {cpu_max:?})",
+            HOST_ACTIONS_CPU_QUOTA_USEC,
+            HOST_ACTIONS_CPU_PERIOD_USEC
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_user_manager_oom_properties(properties: &str) -> Result<()> {
+    let values: BTreeMap<&str, &str> = properties
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    for (name, expected) in [
+        ("ManagedOOMMemoryPressure", "auto"),
+        ("ManagedOOMSwap", "auto"),
+        ("ManagedOOMPreference", "none"),
+        ("OOMScoreAdjust", "0"),
+    ] {
+        let actual = values.get(name).copied();
+        if actual != Some(expected) {
+            bail!(
+                "host containment requires user manager {name}={expected} (got {})",
+                actual.unwrap_or("missing")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_user_manager_oom_neutrality() -> Result<()> {
+    #[cfg(test)]
+    if let Some(properties) = TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap().clone() {
+        return validate_user_manager_oom_properties(&properties);
+    }
+
+    // SAFETY: geteuid has no preconditions and does not dereference Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    let mut cmd = Command::new("systemctl");
+    cmd.args([
+        "show",
+        &format!("user@{uid}.service"),
+        "--property=ManagedOOMMemoryPressure",
+        "--property=ManagedOOMSwap",
+        "--property=ManagedOOMPreference",
+        "--property=OOMScoreAdjust",
+    ]);
+    let out = run_docker_with_timeout(
+        cmd,
+        "reading user manager OOM policy for host containment",
+        DOCKER_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        bail!(
+            "host containment could not read user manager OOM policy: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    validate_user_manager_oom_properties(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn is_actions_slice_descendant(cgroup_content: &str) -> bool {
+    cgroup_content.lines().any(|line| {
+        line.rsplit_once(':')
+            .is_some_and(|(_, path)| path.starts_with("/actions.slice/"))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn parse_container_pid_for_ancestry(container_id: &str, stdout: &str) -> Result<u32> {
+    let pid = stdout.trim().parse::<u32>().with_context(|| {
+        format!(
+            "container PID ancestry inspection returned an invalid PID for {container_id}: {stdout:?}"
+        )
+    })?;
+    if pid == 0 {
+        bail!("container PID ancestry inspection returned PID 0 for {container_id}");
+    }
+    Ok(pid)
+}
+
+/// Require Release 1 host containment before any Linux runner creation or mutation.
+pub fn require_host_containment(_cfg: &Config) -> Result<()> {
+    if is_macos_host() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    {
+        if let Some(true) = *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() {
+            return Ok(());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cfg = _cfg;
+        if host_containment_daemon_in_vm() {
+            return Ok(());
+        }
+        if cfg.policy.minimum_isolation != crate::config::IsolationLevel::Container {
+            bail!("host containment requires policy.minimum_isolation=container");
+        }
+        if cfg.limits.cgroup_parent.as_deref() != Some("actions.slice") {
+            bail!("host containment requires limits.cgroup_parent=actions.slice");
+        }
+        if cfg.runner.count != 10 {
+            bail!(
+                "host containment requires runner count to be exactly 10; configured count is {}",
+                cfg.runner.count
+            );
+        }
+        if cfg.limits.memory_mb != 2500 {
+            bail!(
+                "host containment requires limits.memory_mb to be exactly 2500; configured memory is {}",
+                cfg.limits.memory_mb
+            );
+        }
+        validate_host_actions_slice(&host_actions_cgroup_root())?;
+        require_user_manager_oom_neutrality()?;
+    }
+    Ok(())
+}
+
+/// Require that a freshly created container PID is located beneath /actions.slice.
+pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let container_id = _container_id;
+        // A canonical Docker endpoint backed by a VM reports guest PIDs that
+        // do not exist in this host's /proc. The host cgroup assertion is only
+        // meaningful for the native HostDocker profile; VM admission keeps its
+        // existing behavior without claiming host-level ancestry verification.
+        if host_containment_daemon_in_vm() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(allowed) = *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() {
+            if allowed {
+                return Ok(());
+            }
+            bail!("container PID ancestry not beneath /actions.slice");
+        }
+        let mut cmd = docker_cmd();
+        cmd.args(["inspect", "--format", "{{.State.Pid}}", container_id]);
+        let out = run_docker(cmd, "inspect container pid for ancestry check")?;
+        if !out.status.success() {
+            bail!(
+                "container PID ancestry inspection failed for {container_id}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let pid = parse_container_pid_for_ancestry(container_id, &stdout)?;
+        let cgroup_path = format!("/proc/{pid}/cgroup");
+        let cgroup_content = std::fs::read_to_string(&cgroup_path)
+            .with_context(|| format!("container PID {pid} has no readable cgroup path"))?;
+        if !is_actions_slice_descendant(&cgroup_content) {
+            bail!(
+                "container PID {pid} is not beneath /actions.slice; cgroup content: {cgroup_content}"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Process-wide guard so `print_doctor`'s warning prints at most once per
@@ -2129,6 +2889,12 @@ fn runner_name_for(cfg: &Config, slot: u32) -> String {
 /// the local host when docker runs inside a VM (Colima/Lima/Docker Desktop)
 /// or on a remote context. Limits must respect the daemon, not the host.
 pub fn daemon_capacity() -> Option<(f64, u64)> {
+    #[cfg(test)]
+    {
+        if let Some(override_cap) = &*TEST_DAEMON_CAPACITY.lock().unwrap() {
+            return *override_cap;
+        }
+    }
     let mut cmd = docker_cmd();
     cmd.args(["info", "--format", "{{.NCPU}} {{.MemTotal}}"]);
     let out = run_docker(cmd, "reading docker daemon capacity").ok()?;
@@ -2139,28 +2905,174 @@ pub fn daemon_capacity() -> Option<(f64, u64)> {
     Some((ncpu, mem_bytes / 1024 / 1024))
 }
 
+#[cfg(test)]
+static TEST_DAEMON_CAPACITY: std::sync::Mutex<Option<Option<(f64, u64)>>> =
+    std::sync::Mutex::new(None);
+
 /// Lane-I (Round-3 swarm): read PSI cgroup-v2 memory pressure (`some` line)
-/// and host `MemAvailable`. Returns `(pressure_pct, available_bytes)`. Pure
-/// helper — no global state, no I/O beyond reading two small sysfs/proc
-/// files. Refuses to start a new runner when the host is already under
-/// sustained memory pressure, even if disk-floor is healthy (the
-/// `min_free_disk_gb` guard alone did not save the host from the 2026-07-12
-/// crash). Default cgroup path is `user.slice` because that's where the
-/// daemon is most likely to live; an `Err` is returned if `/proc/self/cgroup`
-/// cannot be parsed AND `user.slice` is unreadable, so a misconfigured host
-/// fails loud rather than silently admitting a runaway job.
-pub fn memory_pressure_pct() -> Result<(f64, u64)> {
-    memory_pressure_pct_from(DEFAULT_PRESSURE_PATH, &read_meminfo_available)
+/// from `source` and host `MemAvailable`. Returns `(pressure_pct,
+/// available_bytes)`. Refuses to start a new runner when memory pressure is
+/// sustained, even if disk-floor is healthy (the `min_free_disk_gb` guard
+/// alone did not save the host from the 2026-07-12 crash). There is no
+/// fallback between sources: an unreadable pressure, `memory.current`,
+/// `memory.high` or MemAvailable file is an `Err`, which the caller treats as
+/// a probe failure (fail-closed once `runner.host_reserve_mb > 0`).
+pub fn memory_pressure_pct(source: &PressureSource) -> Result<(f64, u64)> {
+    read_admission_pressure(source, &read_meminfo_available)
 }
 
 const DEFAULT_PRESSURE_PATH: &str = "/sys/fs/cgroup/user.slice/memory.pressure";
 
+/// Where the admission gate reads memory pressure. The legacy source is
+/// `user.slice`, which aggregates every sibling slice: on 2026-10-01/02 a
+/// throttled `automation.slice` held it at 55-79% and paused admission for
+/// hours with 36 GiB available (bead ez-gh-actions-u3c5). On the Linux
+/// host-docker backend the runner aggregate cgroup (`limits.cgroup_parent`)
+/// is used instead, and its PSI only counts while that cgroup is within 10%
+/// of its own `memory.high`, so one container thrashing against its
+/// per-container limit cannot pause the fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PressureSource {
+    psi_path: PathBuf,
+    /// `(memory.current, memory.high)` of the runner cgroup; `None` is the
+    /// ungated legacy source.
+    gate: Option<(PathBuf, PathBuf)>,
+}
+
+impl PressureSource {
+    fn fallback() -> Self {
+        Self {
+            psi_path: PathBuf::from(DEFAULT_PRESSURE_PATH),
+            gate: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn runner_cgroup(dir: &Path) -> Self {
+        Self {
+            psi_path: dir.join("memory.pressure"),
+            gate: Some((dir.join("memory.current"), dir.join("memory.high"))),
+        }
+    }
+
+    fn describe(&self) -> String {
+        let psi = self.psi_path.display();
+        match &self.gate {
+            Some((_, high)) => format!(
+                "admission pressure source: {psi} high={} (host-docker)",
+                high.display()
+            ),
+            None => format!("admission pressure source: {psi} high=none (fallback)"),
+        }
+    }
+}
+
+/// Pick the admission pressure source for this tick. Only a Linux host whose
+/// canonical docker daemon shares the host kernel (not Colima/VM-backed) and
+/// that configures `limits.cgroup_parent` uses the runner cgroup.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+fn admission_pressure_source(cfg: &Config) -> PressureSource {
+    #[cfg(target_os = "linux")]
+    if let Some(parent) = cfg.limits.cgroup_parent.as_deref() {
+        if !is_macos_host() && !host_containment_daemon_in_vm() {
+            return PressureSource::runner_cgroup(&host_actions_cgroup_root().join(parent));
+        }
+    }
+    PressureSource::fallback()
+}
+
+static LAST_PRESSURE_SOURCE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Log the resolved source once at startup and whenever it changes. A change
+/// also clears the hysteresis window so samples from different sources are
+/// never compared.
+fn log_pressure_source_change(source: &PressureSource) {
+    let desc = source.describe();
+    let mut last = LAST_PRESSURE_SOURCE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if last.as_deref() != Some(desc.as_str()) {
+        eprintln!("{desc}");
+        *last = Some(desc);
+        *PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner()) = [None; 5];
+    }
+}
+
+/// Read a cgroup-v2 byte value; `max` (no limit) is `None`.
+fn read_cgroup_bytes(path: &Path) -> Result<Option<u64>> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = raw.trim();
+    if raw == "max" {
+        return Ok(None);
+    }
+    raw.parse::<u64>()
+        .map(Some)
+        .with_context(|| format!("unparseable cgroup value {raw:?} in {}", path.display()))
+}
+
+fn read_admission_pressure(
+    source: &PressureSource,
+    read_meminfo: &dyn Fn() -> Option<u64>,
+) -> Result<(f64, u64)> {
+    let (pct, available) = memory_pressure_pct_from(&source.psi_path, read_meminfo)?;
+    let Some((current_path, high_path)) = &source.gate else {
+        return Ok((pct, available));
+    };
+    let current = read_cgroup_bytes(current_path)?
+        .with_context(|| format!("{} reported no value", current_path.display()))?;
+    // `memory.high = max` means the runner cgroup has no throttle to thrash
+    // against, so its PSI never gates; MemAvailable still does.
+    let near_high = read_cgroup_bytes(high_path)?
+        .is_some_and(|high| u128::from(current) * 10 >= u128::from(high) * 9);
+    // Below 90% of memory.high the sample is 0 so neither the absolute nor
+    // the 5-tick rising branch of `eval_admission` can fire on it.
+    Ok((if near_high { pct } else { 0.0 }, available))
+}
+
+/// A continuous admission pause. The headroom alert fires at most once per
+/// episode; the episode ends on the first admitted tick.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionPauseEpisode {
+    since: Instant,
+    alerted: bool,
+}
+
+const ADMISSION_PAUSE_ALERT_AFTER: Duration = Duration::from_secs(10 * 60);
+
+static ADMISSION_PAUSE_EPISODE: Mutex<Option<AdmissionPauseEpisode>> = Mutex::new(None);
+
+/// Track the pause episode and return `true` exactly once per episode, when
+/// admission has been continuously paused for `ADMISSION_PAUSE_ALERT_AFTER`
+/// while MemAvailable still has headroom (the 2026-10-01 fleet drained
+/// silently all day under exactly this condition).
+fn admission_pause_alert_due(
+    episode: &mut Option<AdmissionPauseEpisode>,
+    now: Instant,
+    paused: bool,
+    headroom: bool,
+) -> bool {
+    if !paused {
+        *episode = None;
+        return false;
+    }
+    let ep = episode.get_or_insert(AdmissionPauseEpisode {
+        since: now,
+        alerted: false,
+    });
+    if ep.alerted || !headroom || now.duration_since(ep.since) < ADMISSION_PAUSE_ALERT_AFTER {
+        return false;
+    }
+    ep.alerted = true;
+    true
+}
+
 fn memory_pressure_pct_from(
-    pressure_path: &str,
+    pressure_path: &Path,
     read_meminfo: &dyn Fn() -> Option<u64>,
 ) -> Result<(f64, u64)> {
     let pressure_raw = std::fs::read_to_string(pressure_path)
-        .with_context(|| format!("reading memory pressure at {pressure_path}"))?;
+        .with_context(|| format!("reading memory pressure at {}", pressure_path.display()))?;
     // PSI cgroup-v2 line format:
     //   some avg10=1.23 avg60=4.56 avg300=2.34 total=...
     // We use `avg10` (the most recent 10s window) — short enough to react
@@ -2177,7 +3089,8 @@ fn memory_pressure_pct_from(
             }
         }
     }
-    let pressure_pct = pct.with_context(|| format!("no `some avg10=` line in {pressure_path}"))?;
+    let pressure_pct =
+        pct.with_context(|| format!("no `some avg10=` line in {}", pressure_path.display()))?;
     let available_bytes =
         read_meminfo().with_context(|| "could not read MemAvailable from /proc/meminfo")?;
     Ok((pressure_pct, available_bytes))
@@ -2282,21 +3195,65 @@ pub fn eval_admission(
 /// by 25% on every runner. Setting `vm_total_mb = 24576` (the actual VM
 /// ceiling) restores `fleet_budget_mb = 22528`, `per_runner = 3754MB`,
 /// respecting the configured 3072MB floor.
-pub fn effective_limits(cfg: &Config) -> (f64, u64) {
-    let (ncpu, daemon_mem) = match daemon_capacity() {
-        Some(c) => c,
-        None => return (cfg.limits.cpus, cfg.limits.memory_mb),
+pub fn effective_limits(cfg: &Config) -> Result<(f64, u64), String> {
+    // cpu_burst=false (default): skip platform probes entirely. cpu_burst=true:
+    // run the NARROW `daemon_in_vm_only` probe (single docker daemon kernel
+    // read, bounded by PROBE_TIMEOUT) instead of full `detect()`.
+    let capacity = daemon_capacity().map(|(ncpu, daemon_mem)| {
+        // vm_total_mb override as the fleet budget base when set;
+        // matches derive_memory_budget's startup fail-loud guard so
+        // the guard and the runtime clamp stay in sync.
+        (ncpu, cfg.runner.vm_total_mb.unwrap_or(daemon_mem))
+    });
+    let daemon_in_vm = if cfg.limits.cpu_burst {
+        crate::platform::daemon_in_vm_only()
+    } else {
+        false
     };
-    // If vm_total_mb override is set, use it as the fleet budget base
-    // instead of the docker daemon's reported MemTotal. This is the SAME
-    // value that derive_memory_budget uses for the startup fail-loud guard,
-    // so the guard and the runtime clamp stay in sync (bead ez-gh-actions-yz6b
-    // round 3 sync requirement).
-    let fleet_mem_base = cfg.runner.vm_total_mb.unwrap_or(daemon_mem);
-    effective_limits_with_capacity(cfg, Some((ncpu, fleet_mem_base)))
+    effective_limits_with_capacity(cfg, capacity, daemon_in_vm)
 }
 
-fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) -> (f64, u64) {
+fn effective_limits_with_capacity(
+    cfg: &Config,
+    capacity: Option<(f64, u64)>,
+    daemon_in_vm: bool,
+) -> Result<(f64, u64), String> {
+    // Opt-in CPU ceiling. cpu_burst=true is honored ONLY when the daemon
+    // is verified VM-contained AND we have a finite positive ncpu.
+    // Otherwise we REFUSE — `Err` propagates up to the caller
+    // (start_one_with_generate_at_slot and Serve startup bail before
+    // mutating any runner) instead of silently falling back to the
+    // default equal-share clamp. A silent fallback would let a host
+    // daemon or unknown capacity silently exceed the physical envelope;
+    // the explicit Err makes the misconfiguration loud. This runs BEFORE
+    // the capacity check because the refusal must fire even when
+    // capacity is None.
+    if cfg.limits.cpu_burst {
+        if !daemon_in_vm {
+            return Err("limits.cpu_burst=true is unsupported on this host: \
+                 docker daemon is not verified VM-contained \
+                 (platform::detect().daemon_in_vm=false). \
+                 Disable cpu_burst or run inside a VM (Colima/Lima/Docker Desktop)."
+                .to_string());
+        }
+        match capacity {
+            None => {
+                return Err("limits.cpu_burst=true is unsupported: \
+                     daemon_capacity() returned no (non-positive) CPU capacity; \
+                     cannot bound the per-container ceiling safely."
+                    .to_string());
+            }
+            Some((ncpu, _)) if !ncpu.is_finite() || ncpu <= 0.0 => {
+                return Err(format!(
+                    "limits.cpu_burst=true is unsupported: \
+                     daemon_capacity() returned non-finite or non-positive ncpu={ncpu}; \
+                     cannot bound the per-container ceiling safely."
+                ));
+            }
+            _ => {}
+        }
+    }
+
     let (mut cpus, mut mem) = (cfg.limits.cpus, cfg.limits.memory_mb);
     if let Some((ncpu, daemon_mem)) = capacity {
         let n_f = (cfg.runner.count as f64).max(1.0);
@@ -2308,16 +3265,22 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
         // over-memory. Mirrors derive_memory_budget's fleet_budget_mb =
         // vm_total_mb - guest_reserve_mb formula (bead ez-gh-actions-yz6b
         // round 3) so the startup fail-loud guard / `ezgha doctor` preview
-        // and the ACTUAL docker run --memory limit stay in sync — before
-        // this fix they were two disconnected calculations and the guard
-        // could report "OK" while runners were still spawned with zero real
-        // guest headroom (daemon_mem / count, ignoring guest_reserve_mb).
+        // and the ACTUAL docker run --memory limit stay in sync.
         let fleet_mem_budget = daemon_mem.saturating_sub(cfg.runner.guest_reserve_mb);
         let cpu_share = (ncpu / n_f).max(0.5);
         let mem_share = (fleet_mem_budget / n_u).max(512);
-        if cpus > cpu_share {
+        if cfg.limits.cpu_burst {
+            let cpu_ceiling = ncpu;
+            if cpus > cpu_ceiling {
+                eprintln!(
+                    "note: clamping cpus {cpus} -> {cpu_ceiling} (cpu_burst=true, \
+                     verified-VM daemon {ncpu} CPU)"
+                );
+                cpus = cpu_ceiling;
+            }
+        } else if cpus > cpu_share {
             eprintln!(
-                "note: clamping cpus {cpus} -> {cpu_share} (daemon {ncpu} / {} runners)",
+                "note: clamping cpus {cpus} -> {cpu_share} (daemon {ncpu} CPU / {} runners)",
                 cfg.runner.count
             );
             cpus = cpu_share;
@@ -2332,7 +3295,7 @@ fn effective_limits_with_capacity(cfg: &Config, capacity: Option<(f64, u64)>) ->
             mem = mem_share;
         }
     }
-    (cpus, mem)
+    Ok((cpus, mem))
 }
 
 /// Derived, VM-aware memory budget for the fleet, computed once at daemon
@@ -2486,11 +3449,26 @@ pub fn preview_memory_budget(cfg: &Config) -> MemoryBudgetPreview {
     }
 }
 
-/// Start one ephemeral JIT runner container in a slot the caller has already
-/// reserved (e.g. via `next_slot_excluding`), instead of letting this
-/// function pick the lowest free slot itself. Used by `start_missing_runners`
-/// so a failed slot can be excluded from the next pick within the same batch.
-/// Returns (container_id, runner_name).
+/// Typed admission-preflight error: a pre-mutation failure (JIT, cpu_burst,
+/// future preflight checks) that must refuse the entire refill without
+/// charging any slot's failure ladder. The refill loop recognizes this via
+/// `downcast_ref` and converts it to `admission_paused_reason` instead of
+/// slot charge.
+#[derive(Debug)]
+struct AdmissionPreflightError(String);
+
+impl std::fmt::Display for AdmissionPreflightError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AdmissionPreflightError {}
+
+fn admission_preflight_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(AdmissionPreflightError(format!("{error:#}")))
+}
+
 fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(String, String)> {
     #[cfg(test)]
     {
@@ -2504,7 +3482,10 @@ fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(Strin
         }
     }
 
-    start_one_with_generate_at_slot(cfg, backend, slot, github::generate_jitconfig)
+    start_one_with_generate_at_slot(cfg, backend, slot, |github, name, labels, owned_ids| {
+        github::generate_jitconfig(github, name, labels, owned_ids)
+            .map_err(admission_preflight_error)
+    })
 }
 
 /// Test-only convenience wrapper: allocates the next free slot itself (via
@@ -2541,14 +3522,28 @@ fn start_one_with_generate_at_slot(
         &HashSet<u64>,
     ) -> Result<(String, u64)>,
 ) -> Result<(String, String)> {
+    require_host_containment(cfg)?;
+    // Validate cpu_burst BEFORE any mutation: even the pre_rm container
+    // cleanup below is a docker invocation, so an unsupported burst
+    // must refuse before we touch any container or call generate_jitconfig.
+    // effective_limits returns Err when cpu_burst=true but daemon is not
+    // VM-contained OR daemon_capacity() returned no finite positive ncpu.
+    // Map through `admission_preflight_error` so the typed
+    // `AdmissionPreflightError` bucket covers BOTH JIT and effective_limits
+    // preflight; `start_missing_runners_with_starter` recognizes it via
+    // `downcast_ref` and converts it to `admission_paused_reason` instead
+    // of charging the slot's failure ladder (a preflight refusal is a
+    // whole-fleet config error, not a per-slot defect — opening circuits
+    // here would misclassify every slot as broken).
+    let (cpus, memory_mb) = effective_limits(cfg)
+        .map_err(anyhow::Error::msg)
+        .map_err(admission_preflight_error)?;
     let runner_name = runner_name_for(cfg, slot);
 
     // Clean up any stale container left behind in this slot (failsafe against name conflicts)
     let mut pre_rm = docker_cmd();
     pre_rm.args(["rm", "-f", &runner_name]);
     let _ = run_docker(pre_rm, "pre-start rm -f").ok();
-
-    let (cpus, memory_mb) = effective_limits(cfg);
     // Build the set of GitHub runner_ids we own (slot file = host ownership).
     // Pass it to generate_jitconfig so a name collision during the 409
     // self-heal can be reclaimed as one of ours regardless of GitHub's
@@ -2703,6 +3698,14 @@ fn start_one_with_generate_at_slot(
         );
     }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if let Err(err) = require_container_actions_ancestry(&container_id) {
+        let mut rm_cmd = docker_cmd();
+        rm_cmd.args(["rm", "-f", &runner_name]);
+        let _ = run_docker(rm_cmd, "post-start ancestry compensation rm -f");
+        let _ = github::remove_runner(&cfg.github, runner_id);
+        let _ = release_slot_for(Some(cfg), slot);
+        return Err(err);
+    }
     Ok((container_id, runner_name))
 }
 
@@ -2727,6 +3730,10 @@ static TEST_MANAGED_CONTAINER_SNAPSHOTS: std::sync::Mutex<
 > = std::sync::Mutex::new(std::collections::VecDeque::new());
 
 fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedContainer>> {
+    managed_containers_until_deadline(Instant::now() + timeout)
+}
+
+fn managed_containers_until_deadline(deadline: Instant) -> Result<Vec<ManagedContainer>> {
     #[cfg(test)]
     if let Some(containers) = TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap().pop_front() {
         return Ok(containers);
@@ -2745,7 +3752,16 @@ fn managed_containers_with_timeout(timeout: Duration) -> Result<Vec<ManagedConta
         "--format",
         "json",
     ]);
-    let out = run_docker_with_timeout(cmd, "listing managed containers", timeout)?;
+    let timeout = remaining_until_deadline(deadline, Instant::now())
+        .context("docker ps readiness budget expired before spawning")?;
+    let probe_deadline = (Instant::now() + timeout).min(deadline);
+    let out = run_docker_with_timeout_at_deadline(
+        cmd,
+        "listing managed containers",
+        timeout,
+        probe_deadline,
+        docker_child_reaper(),
+    )?;
     if !out.status.success() {
         bail!("docker ps failed: {}", String::from_utf8_lossy(&out.stderr));
     }
@@ -2769,9 +3785,9 @@ pub fn managed_containers() -> Result<Vec<ManagedContainer>> {
 /// polling GitHub for a job). A container with NEITHER is a real defect
 /// (the runner process died / never started). Bead jleechan-viff: prior code
 /// (`runner_worker_present`) only checked for Worker, which misclassified
-/// idle-but-healthy listeners as "not executing" and triggered false-positive
-/// `runner startup settling ceiling reached: 0/6 executing locally` CRITICAL
-/// during normal idle periods.
+/// idle-but-healthy listeners as "not ready" and triggered false-positive
+/// `runner startup settling ceiling reached: 0/6 ready locally (listeners
+/// or workers)` CRITICAL during normal idle periods.
 fn runner_present(output: &str) -> bool {
     output.lines().skip(1).any(|line| {
         matches!(
@@ -2779,6 +3795,40 @@ fn runner_present(output: &str) -> bool {
             Some("Runner.Worker" | "Runner.Listener")
         )
     })
+}
+
+/// Per-probe outcome of a `docker top` Runner readiness probe.
+///
+/// `Ready` = `Runner.Worker` or `Runner.Listener` is alive in the container
+/// (Bead jleechan-viff: the listener is polling for work and the slot IS
+/// operational, so it counts as ready to take jobs alongside an actively
+/// executing Worker).
+///
+/// `NotReady` = `docker top` succeeded but neither Worker nor Listener is
+/// running. The container is still alive; this is a genuine "runner process
+/// died" failure. Settling must NOT infer absence from this.
+///
+/// `Absent` = `docker top` returned `No such container` / `No such object`.
+/// The container is definitively gone — settling reconciles immediately
+/// rather than waiting 25s for a slot that will never come back. This is
+/// the bead jleechan-95jk root-cause fix for "keeping slot 3 because docker
+/// top says No such container despite snapshot omission".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Ready,
+    NotReady,
+    Absent,
+}
+
+/// One readiness-pass result: how many slots are locally ready to take jobs
+/// (Listener or Worker present) plus the names of slots whose container is
+/// definitively gone (`ProbeOutcome::Absent`). The settling loop uses the
+/// `absent` list to force immediate reconciliation instead of polling for
+/// 25s waiting for a container that will not return.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadinessSummary {
+    pub ready: u32,
+    pub absent: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -2789,70 +3839,262 @@ fn runner_worker_present(output: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some("Runner.Worker"))
 }
 
+fn remaining_until_deadline(deadline: Instant, now: Instant) -> Option<Duration> {
+    let remaining = deadline.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn readiness_probe_timeout(remaining: Duration) -> Duration {
+    remaining.min(LOCAL_TOP_TIMEOUT)
+}
+
+fn readiness_probe_timeout_until(deadline: Instant, now: Instant) -> Option<Duration> {
+    remaining_until_deadline(deadline, now).map(readiness_probe_timeout)
+}
+
+fn executing_runner_count_with_probe<N, P>(
+    cfg: &Config,
+    containers: &[ManagedContainer],
+    deadline: Instant,
+    mut now: N,
+    probe: P,
+) -> Result<ReadinessSummary>
+where
+    N: FnMut() -> Instant,
+    P: Fn(&ManagedContainer, Duration) -> Result<ProbeOutcome> + Sync,
+{
+    let owned = current_prefix_containers(containers, cfg);
+    if owned.is_empty() {
+        return Ok(ReadinessSummary::default());
+    }
+    // Bounded parallelism: the normal fleet contract is 10 Linux + 6 Mac,
+    // but a stale or misconfigured numeric-prefix fleet must not turn one
+    // readiness pass into an unbounded thread and `docker top` fan-out. The
+    // shared 30s readiness deadline (`LOCAL_READINESS_BUDGET`) still bounds
+    // the whole pass, while the normal fleet retains one-batch parallelism.
+    //
+    // Spawn-then-break on first deadline expiry: each per-container `now()`
+    // call yields the remaining wall-clock budget at dispatch time, and the
+    // first container whose deadline has expired is rejected (its name is
+    // surfaced for the partial-readiness error). The probe itself is `Fn +
+    // Sync. Production probes are stateless or use an internal `Mutex`.
+    let probe_ref = &probe;
+    let mut deadline_expired: Option<String> = None;
+    let probe_results: Vec<Result<ProbeOutcome>> = std::thread::scope(|scope| -> Result<_> {
+        let mut results = Vec::with_capacity(owned.len());
+        let mut next = 0;
+        while next < owned.len() {
+            let mut handles = Vec::with_capacity(READINESS_PROBE_CONCURRENCY);
+            while handles.len() < READINESS_PROBE_CONCURRENCY && next < owned.len() {
+                let container = owned[next];
+                let timeout = match readiness_probe_timeout_until(deadline, now()) {
+                    Some(timeout) => timeout,
+                    None => {
+                        deadline_expired.get_or_insert_with(|| container.name.clone());
+                        break;
+                    }
+                };
+                let name = container.name.clone();
+                let handle = std::thread::Builder::new()
+                    .name("ezgha-readiness-probe".to_string())
+                    .spawn_scoped(scope, move || probe_ref(container, timeout))
+                    .map_err(|err| {
+                        anyhow::anyhow!(
+                            "failed to spawn Runner.Worker readiness probe for {name}: {err}"
+                        )
+                    })?;
+                handles.push(handle);
+                next += 1;
+            }
+            for handle in handles {
+                results.push(
+                    handle
+                        .join()
+                        .unwrap_or_else(|panic| -> Result<ProbeOutcome> {
+                            Err(anyhow::anyhow!(
+                                "Runner.Worker readiness probe panicked: {:?}",
+                                panic
+                            ))
+                        }),
+                );
+            }
+            if deadline_expired.is_some() {
+                break;
+            }
+        }
+        Ok(results)
+    })?;
+    if let Some(name) = deadline_expired {
+        return Err(anyhow::Error::msg(format!(
+            "Runner.Worker readiness budget expired before inspecting {name}"
+        )));
+    }
+
+    let mut summary = ReadinessSummary::default();
+    for (container, result) in owned.iter().zip(probe_results) {
+        match result {
+            Ok(ProbeOutcome::Ready) => summary.ready += 1,
+            // NotReady = container alive, runner process died. Settling
+            // will treat this as "not ready" via the `ready` count being
+            // short, but it is NOT an immediate-reconcile trigger — the
+            // container is still here and may self-heal on the next tick.
+            Ok(ProbeOutcome::NotReady) => {}
+            // Absent = docker top says "No such container". The container
+            // is gone; settling reconciles immediately instead of waiting
+            // 25s for a slot that will never come back (bead jleechan-95jk
+            // root-cause: "keeping slot 3 because docker top says No such
+            // container despite snapshot omission").
+            Ok(ProbeOutcome::Absent) => summary.absent.push(container.name.clone()),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(summary)
+}
+
 fn executing_runner_count_from_containers(
     cfg: &Config,
     containers: &[ManagedContainer],
     deadline: Instant,
-) -> Result<u32> {
-    let owned = current_prefix_containers(containers, cfg);
+) -> Result<ReadinessSummary> {
     #[cfg(test)]
     {
-        let _ = deadline;
-        let mut counts = TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap();
-        let count = counts
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let owned = current_prefix_containers(containers, cfg);
+        let configured = TEST_EXECUTING_RUNNER_COUNTS
+            .lock()
+            .unwrap()
             .as_mut()
             .expect("test must explicitly configure Runner.Worker readiness")
             .pop_front()
-            .expect("test Runner.Worker readiness sequence exhausted")
-            .map_err(anyhow::Error::msg)?;
-        Ok(count.min(owned.len() as u32))
+            .expect("test Runner.Worker readiness sequence exhausted");
+        // Probe closures must be `Fn + Sync` for parallel readiness probes
+        // (production fan-out via `std::thread::scope`). Wrap the
+        // monotonically-decreasing remaining counter in an atomic so the
+        // `Fn + Sync` bound is satisfied without altering the
+        // first-`count`-true-then-false semantics the existing tests
+        // (and the original sequential code) relied on. Use
+        // `fetch_update` (not `fetch_sub`) so the counter saturates at zero
+        // — parallel threads can race past zero where the sequential version
+        // could not, and a wrapping subtraction would spuriously report
+        // post-zero probes as "ready".
+        match configured {
+            Ok(summary) => {
+                // Independent review (round 2): the test seam used to
+                // inject a single `u32` ready count, which could not model
+                // the absent-container race the post-refill fix is meant
+                // to catch (bead jleechan-95jk root-cause). Inject the full
+                // `ReadinessSummary { ready, absent }` and have the probe
+                // closure return `Absent` for absent-named containers
+                // before falling back to the first-`ready`-true count
+                // semantics the original tests relied on. Absent-name
+                // lookups are O(1) via a HashSet snapshot; the
+                // monotonically-decreasing ready counter is the same
+                // saturating AtomicU32 used in the original test branch.
+                use std::collections::HashSet;
+                let absent_set: HashSet<String> = summary.absent.iter().cloned().collect();
+                let absent_inside = std::sync::Arc::new(std::sync::Mutex::new(absent_set));
+                let absent_inside_for_probe = absent_inside.clone();
+                let remaining = AtomicU32::new(summary.ready.min(owned.len() as u32));
+                executing_runner_count_with_probe(
+                    cfg,
+                    containers,
+                    deadline,
+                    Instant::now,
+                    move |container, _timeout| {
+                        // Absent-name matches win before the ready-counter
+                        // so the orchestrator records them in
+                        // `summary.absent` (preserving the test's
+                        // injected list verbatim, even if the
+                        // `summary.ready` count would otherwise have
+                        // assigned Ready to this container).
+                        let absent_snap = absent_inside_for_probe.lock().unwrap().clone();
+                        if absent_snap.contains(&container.name) {
+                            return Ok(ProbeOutcome::Absent);
+                        }
+                        // Atomically: if `remaining > 0`, decrement and
+                        // return Ok(Ready); else return Ok(NotReady)
+                        // without mutating the counter. `fetch_update`
+                        // (not `fetch_sub`) saturates at zero — the
+                        // parallel-threads race past zero would
+                        // otherwise wrap the counter to u32::MAX.
+                        let present = remaining
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
+                                if x > 0 {
+                                    Some(x - 1)
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|prev| prev > 0)
+                            .unwrap_or(false);
+                        Ok(if present {
+                            ProbeOutcome::Ready
+                        } else {
+                            ProbeOutcome::NotReady
+                        })
+                    },
+                )
+            }
+            Err(error) => Err(anyhow::Error::msg(error)),
+        }
     }
 
     #[cfg(not(test))]
-    let mut executing = 0;
-    #[cfg(not(test))]
-    for container in owned {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!(
-                "Runner.Worker readiness budget expired before inspecting {}",
-                container.name
-            );
-        }
-        let mut cmd = docker_cmd();
-        cmd.args(["top", &container.id, "-eo", "pid,comm"]);
-        let timeout = remaining.min(LOCAL_TOP_TIMEOUT);
-        let out = run_docker_with_timeout(cmd, "checking Runner.Worker readiness", timeout)
+    executing_runner_count_with_probe(
+        cfg,
+        containers,
+        deadline,
+        Instant::now,
+        |container, timeout| {
+            let mut cmd = docker_cmd();
+            cmd.args(["top", &container.id, "-eo", "pid,comm"]);
+            let probe_deadline = (Instant::now() + timeout).min(deadline);
+            let out = run_docker_with_timeout_at_deadline(
+                cmd,
+                "checking Runner.Worker readiness",
+                timeout,
+                probe_deadline,
+                docker_child_reaper(),
+            )
             .with_context(|| format!("inspect Runner.Worker for {}", container.name))?;
-        if !out.status.success() {
-            bail!(
-                "docker top failed for {}: {}",
-                container.name,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if runner_present(&stdout) {
-            // Bead jleechan-viff: previously `runner_worker_present` only —
-            // misclassified idle listeners as "not executing" and triggered
-            // false-positive settling-ceiling CRITICAL. New `runner_present`
-            // accepts Runner.Worker (job in flight) OR Runner.Listener
-            // (registered + idle) as "ready to take jobs".
-            executing += 1;
-        }
-    }
-    #[cfg(not(test))]
-    Ok(executing)
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                // Bead jleechan-95jk root-cause: a container that is GONE
+                // (docker top: "No such container") is not a probe failure
+                // — it is definitive evidence the container is no longer
+                // part of the readiness pass. Returning ProbeOutcome::Absent
+                // surfaces the slot name to the settling loop so it
+                // reconciles immediately instead of polling 25s for a
+                // container that will not come back. Genuine failures
+                // (timeout, daemon error, transient I/O) still propagate as
+                // `Err` so the settling loop reports incomplete evidence.
+                if docker_top_container_absent(&stderr) {
+                    return Ok(ProbeOutcome::Absent);
+                }
+                bail!("docker top failed for {}: {}", container.name, stderr);
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            Ok(if runner_present(&stdout) {
+                ProbeOutcome::Ready
+            } else {
+                ProbeOutcome::NotReady
+            })
+        },
+    )
 }
 
 /// Cheap local progress signal for a bounded post-refill settling episode.
-/// Normal spawn capacity remains managed-container count because idle healthy
-/// listeners have no Runner.Worker. This path talks only to Docker (`ps` +
-/// bounded `top`); it never lists or mutates GitHub runners, registrations, or
-/// workflow jobs.
-pub fn local_executing_runner_count(cfg: &Config) -> Result<u32> {
+/// Returns a [`ReadinessSummary`] whose `ready` count is the locally-polled
+/// "ready to take jobs" view (Listener OR Worker per bead jleechan-viff) and
+/// whose `absent` list names slots whose container is definitively gone
+/// (docker top: "No such container"). The settling loop uses the absent
+/// list to force immediate reconciliation instead of waiting 25s for a
+/// slot that will never come back (bead jleechan-95jk root-cause). This
+/// path talks only to Docker (`ps` + bounded `top`); it never lists or
+/// mutates GitHub runners, registrations, or workflow jobs.
+pub fn local_executing_runner_count(cfg: &Config) -> Result<ReadinessSummary> {
     let deadline = Instant::now() + LOCAL_READINESS_BUDGET;
-    let containers = managed_containers_with_timeout(LOCAL_READINESS_BUDGET)?;
+    let containers = managed_containers_until_deadline(deadline)?;
     executing_runner_count_from_containers(cfg, &containers, deadline)
 }
 
@@ -3181,120 +4423,30 @@ fn drain_inflight_registrations_inner(
     summary
 }
 
-/// Parse the available disk space in GB from `df -Pk /` output.
-///
-/// POSIX `df -P` guarantees:
-///   `Filesystem 1024-blocks Used Available Capacity Mounted on`
-///   `<fs> <total_kb> <used_kb> <avail_kb> <cap%> <mount>`
-///
-/// We search for the `Filesystem` header to tolerate any docker engine / CLI
-/// noise (such as image pull progress lines) that might precede the table.
-fn parse_df_avail_gb(stdout: &[u8]) -> Option<u64> {
-    let text = String::from_utf8_lossy(stdout);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let data_line = if let Some(hdr_idx) = lines.iter().position(|l| l.starts_with("Filesystem")) {
-        lines.get(hdr_idx + 1)?
-    } else {
-        lines.get(1)?
-    };
-    let avail_kb: u64 = data_line.split_whitespace().nth(3)?.parse().ok()?;
-    Some(avail_kb / 1024 / 1024)
-}
-
-/// List running container names from the local docker daemon.
-fn running_containers() -> Vec<String> {
-    let mut cmd = docker_cmd();
-    cmd.args(["ps", "--format", "{{.Names}}"]);
-    let out = match run_docker(cmd, "listing running containers") {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-/// Prioritize container candidates for disk measurement.
-/// Dedicated anchor container (`ezgha-image-anchor`) is tried first since it is
-/// long-lived and does not churn. Active runners are tried next, followed by any
-/// other running container on the daemon.
-fn prioritize_containers(mut containers: Vec<String>) -> Vec<String> {
-    containers.sort_by_key(|c| {
-        if c == "ezgha-image-anchor" {
-            0
-        } else if c.contains("runner") || c.starts_with("ez-") {
-            1
-        } else {
-            2
-        }
-    });
-    containers
-}
-
-fn df_exec_container(container: &str) -> Option<u64> {
-    let mut cmd = docker_cmd();
-    cmd.args(["exec", container, "df", "-Pk", "/"]);
-    let out = run_docker(cmd, "measuring docker daemon free disk via exec").ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_df_avail_gb(&out.stdout)
-}
-
-fn df_run_image(image: &str) -> Option<u64> {
-    let mut cmd = docker_cmd();
-    cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
-    let out = run_docker(cmd, "measuring docker daemon free disk via run").ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_df_avail_gb(&out.stdout)
-}
-
 /// Free disk in GB as seen by the docker DAEMON, measured from inside a
 /// container: the container's root overlay lives on the daemon's storage, so
 /// this is the disk runner jobs will actually fill. A host-side `df` would
 /// read the wrong filesystem whenever the daemon is a VM (Colima/Lima/Desktop).
-///
-/// Decoupled from runner image presence:
-/// 1. If any running container exists (such as `ezgha-image-anchor` or any active
-///    runner container), query `df -Pk /` via `docker exec <container_name> df -Pk /`.
-///    This takes <30ms, creates zero containers, and is immune to missing runner images.
-/// 2. If no running container is available, run `docker run --rm --entrypoint df <image> -Pk /`.
-/// 3. If running `<image>` fails, fall back to probe image `PROBE_IMAGE` (`alpine:3.19`).
 pub fn free_disk_gb(image: &str) -> Option<u64> {
     #[cfg(test)]
     if let Some(free) = *TEST_FREE_DISK_GB.lock().unwrap() {
         return free;
     }
 
-    // 1. Check running containers first (exec is faster and doesn't create/destroy containers).
-    let running = running_containers();
-    for container in prioritize_containers(running) {
-        if let Some(free) = df_exec_container(&container) {
-            return Some(free);
-        }
-    }
-
-    // 2. Fall back to docker run with the configured runner image.
-    if let Some(free) = df_run_image(image) {
-        return Some(free);
-    }
-
-    // 3. Fall back to probe image if runner image is missing or failed to run.
-    if image != PROBE_IMAGE {
-        if let Some(free) = df_run_image(PROBE_IMAGE) {
-            return Some(free);
-        }
-    }
-
-    None
+    let mut cmd = docker_cmd();
+    cmd.args(["run", "--rm", "--entrypoint", "df", image, "-Pk", "/"]);
+    let out = run_docker(cmd, "measuring docker daemon free disk")
+        .ok()
+        .filter(|o| o.status.success())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let avail_kb: u64 = stdout
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(avail_kb / 1024 / 1024)
 }
 
 /// Free space on the outer host filesystem that backs Docker's storage.
@@ -3354,6 +4506,70 @@ fn start_missing_runners(
 struct StartMissingOutcome {
     started: Vec<String>,
     start_failures: u32,
+    admission_paused_reason: Option<String>,
+}
+
+fn failure_ladder_policy(cfg: &Config) -> FailureLadderPolicy {
+    FailureLadderPolicy {
+        slot_failure_threshold: cfg.failure_ladder.slot_failure_threshold,
+        slot_window_secs: cfg.failure_ladder.slot_failure_window_secs,
+        slot_cooldown_secs: cfg.failure_ladder.slot_cooldown_secs,
+        // Keep the default policy usable for legacy/small one- and two-slot
+        // configs while ensuring the fleet circuit is never impossible.
+        fleet_open_slots_threshold: cfg
+            .failure_ladder
+            .fleet_open_slot_threshold
+            .min(cfg.runner.count.max(1)),
+        fleet_cooldown_secs: cfg.failure_ladder.fleet_cooldown_secs,
+    }
+}
+
+fn failure_ladder_path_for(cfg: &Config) -> PathBuf {
+    if let Ok(path) = env::var(FAILURE_LADDER_PATH_ENV) {
+        return PathBuf::from(path);
+    }
+    if let Some(state_dir) = &cfg.state_dir {
+        return state_dir.join("failure_ladder.toml");
+    }
+    slot_assignments_path_for(Some(cfg)).with_file_name("failure_ladder.toml")
+}
+
+fn notify_failure_ladder_transition(
+    cfg: &Config,
+    transition: &FailureLadderTransition,
+    open_slots: usize,
+) {
+    if transition.slot_opened {
+        let slot = transition.slot.expect("slot-open transition has a slot");
+        let _ = alert::notify(
+            cfg,
+            &format!("runner_pool.slot_circuit.{slot}"),
+            Severity::Warning,
+            "Runner slot circuit opened",
+            &format!(
+                "slot {slot} reached the local-start failure threshold; excluding only that slot for {} seconds while sibling slots remain eligible",
+                cfg.failure_ladder.slot_cooldown_secs
+            ),
+        );
+    }
+    if transition.fleet_opened {
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.fleet_admission_circuit",
+            Severity::Critical,
+            "Runner fleet admission paused",
+            &format!(
+                "{open_slots} distinct slot circuits are open; pausing only new runner starts for {} seconds. Existing jobs continue, and ezgha will not stop the VM or host",
+                cfg.failure_ladder.fleet_cooldown_secs
+            ),
+        );
+    }
+    if transition.slot_closed || transition.fleet_closed {
+        eprintln!(
+            "info: runner failure circuit recovered (slot={:?}, slot_closed={}, fleet_closed={})",
+            transition.slot, transition.slot_closed, transition.fleet_closed
+        );
+    }
 }
 
 fn start_missing_runners_with_starter(
@@ -3362,10 +4578,66 @@ fn start_missing_runners_with_starter(
     missing: u32,
     starter: impl Fn(&Config, Backend, u32) -> Result<(String, String)>,
 ) -> Result<StartMissingOutcome> {
+    if FAILURE_LADDER_PERSISTENCE_FAILED.load(Ordering::SeqCst) {
+        let reason =
+            "failure-ladder persistence previously failed; runner admission remains paused until daemon restart";
+        eprintln!("warning: {reason}");
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(reason.into()),
+            ..StartMissingOutcome::default()
+        });
+    }
     let mut started = Vec::new();
     let mut start_failures = 0;
     let mut last_err = None;
-    let mut failed_slots: HashSet<u32> = HashSet::new();
+    let path = failure_ladder_path_for(cfg);
+    let policy = failure_ladder_policy(cfg);
+    let mut ladder = match FailureLadder::load(&path) {
+        Ok(ladder) => ladder,
+        Err(err) => {
+            let reason = format!(
+                "failure-ladder state is unreadable; failing closed without starting runners: {err:#}"
+            );
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.failure_ladder_state",
+                Severity::Critical,
+                "Runner admission paused: failure-ladder state unreadable",
+                &reason,
+            );
+            return Ok(StartMissingOutcome {
+                admission_paused_reason: Some(reason),
+                ..StartMissingOutcome::default()
+            });
+        }
+    };
+    let now = now_epoch_secs();
+    let mut failed_slots: HashSet<u32> = ladder.excluded_slots(now);
+    if ladder.fleet_admission_is_paused(now) {
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(format!(
+                "fleet admission circuit is open with {} slot circuit(s); existing jobs remain running",
+                ladder.open_slot_count(now)
+            )),
+            ..StartMissingOutcome::default()
+        });
+    }
+    // Prove that the current ledger can still be durably persisted before any
+    // external JIT/Docker start.  A transition save can race with filesystem
+    // failure after this point, so the daemon-lifetime latch below remains
+    // necessary; this preflight closes the first-attempt fail-open window.
+    if let Err(err) = ladder.save(&path) {
+        FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+        let reason = format!(
+            "could not preflight failure-ladder persistence; runner admission remains paused until daemon restart: {err:#}"
+        );
+        eprintln!("warning: {reason}");
+        return Ok(StartMissingOutcome {
+            admission_paused_reason: Some(reason),
+            ..StartMissingOutcome::default()
+        });
+    }
+    let mut admission_paused_reason = None;
     for _ in 0..missing {
         if crate::shutdown::is_requested() {
             eprintln!("shutdown requested; stopping runner spawn mid-batch");
@@ -3375,7 +4647,16 @@ fn start_missing_runners_with_starter(
         let slot = match next_slot_excluding(cfg, &failed_slots) {
             Ok(Some(slot)) => slot,
             Ok(None) => {
-                eprintln!("info: no free runner slot yet; registration turnover is still settling");
+                if ladder.open_slot_count(now_epoch_secs()) > 0 {
+                    admission_paused_reason = Some(format!(
+                        "{} runner slot circuit(s) are cooling down; sibling slots are occupied or settling",
+                        ladder.open_slot_count(now_epoch_secs())
+                    ));
+                } else {
+                    eprintln!(
+                        "info: no free runner slot yet; registration turnover is still settling"
+                    );
+                }
                 break;
             }
             Err(e) => {
@@ -3386,12 +4667,56 @@ fn start_missing_runners_with_starter(
             }
         };
         match starter(cfg, backend, slot) {
-            Ok((_, name)) => started.push(name),
+            Ok((_, name)) => {
+                started.push(name);
+                let transition = ladder.record_success(slot, now_epoch_secs());
+                if let Err(err) = ladder.save(&path) {
+                    FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+                    admission_paused_reason = Some(format!(
+                        "could not persist failure-ladder recovery; pausing further starts: {err:#}"
+                    ));
+                    break;
+                }
+                notify_failure_ladder_transition(
+                    cfg,
+                    &transition,
+                    ladder.open_slot_count(now_epoch_secs()),
+                );
+            }
             Err(e) => {
                 eprintln!("warning: failed to start runner in slot {slot}: {e:#}");
+                if e.downcast_ref::<AdmissionPreflightError>().is_some() {
+                    start_failures += 1;
+                    admission_paused_reason = Some(format!(
+                        "admission preflight refused the entire refill without penalizing slot {slot}: {e:#}"
+                    ));
+                    break;
+                }
                 failed_slots.insert(slot);
                 start_failures += 1;
-                last_err = Some(e);
+                let transition = ladder.record_failure(policy, slot, now_epoch_secs())?;
+                if let Err(err) = ladder.save(&path) {
+                    FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+                    admission_paused_reason = Some(format!(
+                        "could not persist failure-ladder failure; pausing further starts: {err:#}"
+                    ));
+                    break;
+                }
+                notify_failure_ladder_transition(
+                    cfg,
+                    &transition,
+                    ladder.open_slot_count(now_epoch_secs()),
+                );
+                if transition.slot_opened {
+                    debug_assert!(ladder.slot_is_open(slot, now_epoch_secs()));
+                }
+                if ladder.fleet_admission_is_paused(now_epoch_secs()) {
+                    admission_paused_reason = Some(format!(
+                        "fleet admission circuit opened after {} distinct slot circuits; existing jobs remain running",
+                        ladder.open_slot_count(now_epoch_secs())
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -3404,6 +4729,7 @@ fn start_missing_runners_with_starter(
     Ok(StartMissingOutcome {
         started,
         start_failures,
+        admission_paused_reason,
     })
 }
 
@@ -3416,12 +4742,16 @@ pub struct EnsureCountOutcome {
     pub remaining_shortage: u32,
     /// Explicit incomplete post-refill readiness evidence. When present,
     /// `remaining_shortage` is only the managed-container shortfall and the
-    /// serve loop must run monitors plus immediate reconciliation instead of
-    /// treating the worker state as recovered.
+    /// serve loop must reconcile on the next iteration instead of treating
+    /// the worker state as recovered (they run async via the
+    /// `QueueMonitorScheduler`).
     pub post_refill_readiness_error: Option<String>,
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
     pub start_failures: u32,
+    /// A deliberate admission refusal is not a backend failure and must not
+    /// trigger a Colima restart. Existing jobs continue to run.
+    pub admission_paused_reason: Option<String>,
 }
 
 impl EnsureCountOutcome {
@@ -3433,15 +4763,31 @@ impl EnsureCountOutcome {
     }
 }
 
-/// Ensure `count` managed runner containers are alive; start the shortfall.
-/// Refuses to spawn when either the outer host or daemon disk is below its
-/// floor — disk exhaustion is the dominant self-hosted runner failure mode,
-/// and spawning more work onto a full disk makes the incident worse.
-pub fn ensure_count(cfg: &Config, backend: Backend) -> Result<Vec<String>> {
-    Ok(ensure_count_outcome(cfg, backend)?.started)
+fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome {
+    EnsureCountOutcome {
+        started: Vec::new(),
+        missing,
+        remaining_shortage: missing,
+        post_refill_readiness_error: None,
+        start_failures: 0,
+        admission_paused_reason: Some(reason),
+    }
 }
 
 pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
+    if let Err(err) = require_host_containment(cfg) {
+        let _ = alert::notify(
+            cfg,
+            "runner_pool.host_containment_failed",
+            Severity::Critical,
+            "Runner pool paused: host containment failed",
+            &format!("Host containment validation failed: {err:#}"),
+        );
+        return Ok(admission_paused_outcome(
+            cfg.runner.count,
+            format!("Host containment admission failed: {err:#}"),
+        ));
+    }
     // Reconcile stale slot assignments before we look at container counts:
     // a daemon crash between `next_slot` and the container coming up leaves a
     // reservation that would otherwise wedge `next_slot` forever ("all N
@@ -3456,13 +4802,21 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // while a job is executing, so using it here would classify a healthy idle
     // Listener-only fleet as missing and create a permanent settle/reconcile loop.
     let alive = current_prefix_containers(&containers, cfg).len() as u32;
+    // Resolve before the full-fleet return so the source is logged at
+    // startup even when every runner is already present.
+    let pressure_source = admission_pressure_source(cfg);
+    log_pressure_source_change(&pressure_source);
     if alive >= cfg.runner.count {
+        *ADMISSION_PAUSE_EPISODE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         return Ok(EnsureCountOutcome {
             started: Vec::new(),
             missing: 0,
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             start_failures: 0,
+            admission_paused_reason: None,
         });
     }
     let host_floor_gb = cfg.limits.min_free_disk_gb;
@@ -3478,9 +4832,12 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                     cfg.github.target
                 ),
             );
-            bail!(
-                "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
-            );
+            return Ok(admission_paused_outcome(
+                cfg.runner.count.saturating_sub(alive),
+                format!(
+                    "only {free} GB free on the host filesystem (floor: {host_floor_gb} GB) — refusing to spawn runners; reclaim host space first"
+                ),
+            ));
         }
         Some(free) => {
             if is_macos_host() && free < MACOS_HOST_DISK_PRESSURE_ALERT_GB {
@@ -3507,9 +4864,10 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                     cfg.github.target
                 ),
             );
-            bail!(
-                "could not measure host filesystem free disk — refusing to spawn runners until measurement recovers"
-            );
+            return Ok(admission_paused_outcome(
+                cfg.runner.count.saturating_sub(alive),
+                "could not measure host filesystem free disk — refusing to spawn runners until measurement recovers".into(),
+            ));
         }
     }
     match free_disk_gb(&cfg.runner.image) {
@@ -3526,13 +4884,13 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                     cfg.github.target
                 ),
             );
-            bail!(
-                "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; \
-                 reclaim space first. Do NOT run docker system/image prune: with the fleet idle it \
-                 deletes the required ezgha-runner:latest image (2026-07-14 incident); \
-                 prefer `docker builder prune` and container/log cleanup",
-                cfg.limits.min_free_disk_gb
-            );
+            return Ok(admission_paused_outcome(
+                cfg.runner.count.saturating_sub(alive),
+                format!(
+                    "only {free} GB free on docker's filesystem (floor: {} GB) — refusing to spawn runners; reclaim space first. Do NOT run docker system/image prune: with the fleet idle it deletes the required ezgha-runner:latest image (2026-07-14 incident); prefer `docker builder prune` and container/log cleanup",
+                    cfg.limits.min_free_disk_gb
+                ),
+            ));
         }
         Some(_) => {
             CONSECUTIVE_DISK_NONE.store(0, Ordering::Relaxed);
@@ -3550,11 +4908,12 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                         cfg.github.target
                     ),
                 );
-                bail!(
-                    "could not measure daemon free disk for {n} cycles in a row — \
-                     refusing to spawn runners until disk measurement recovers \
-                     (image missing? df broken? daemon wedged?)"
-                );
+                return Ok(admission_paused_outcome(
+                    cfg.runner.count.saturating_sub(alive),
+                    format!(
+                        "could not measure daemon free disk for {n} cycles in a row — refusing to spawn runners until disk measurement recovers (image missing? df broken? daemon wedged?)"
+                    ),
+                ));
             }
             eprintln!(
                 "warning: could not measure daemon free disk ({n}/{DISK_MEASURE_STRIKES} strikes) \
@@ -3574,21 +4933,19 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // either read fails. Once a reserve is configured, probe failure is a
     // fail-closed admission error. The hysteresis window is read+rotated as
     // one Mutex guard.
-    let admission_probe = memory_pressure_pct();
+    let admission_probe = memory_pressure_pct(&pressure_source);
+    let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
+    let host_reserve_bytes = cfg.runner.host_reserve_mb.saturating_mul(1024 * 1024);
     let admission_decision: Result<(), String> = {
         let mut window = PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
         match &admission_probe {
-            Ok((pct, available)) => {
-                let runner_bytes = cfg.limits.memory_mb.saturating_mul(1024 * 1024);
-                let host_reserve_bytes = cfg.runner.host_reserve_mb.saturating_mul(1024 * 1024);
-                eval_admission(
-                    *pct,
-                    *available,
-                    runner_bytes,
-                    host_reserve_bytes,
-                    &mut window,
-                )
-            }
+            Ok((pct, available)) => eval_admission(
+                *pct,
+                *available,
+                runner_bytes,
+                host_reserve_bytes,
+                &mut window,
+            ),
             Err(e) => {
                 // Preserve the legacy fail-open behavior only when no
                 // physical-host reserve is configured. Once an operator has
@@ -3613,6 +4970,20 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             }
         }
     };
+    let headroom_bytes = host_reserve_bytes.saturating_add(runner_bytes.saturating_mul(4));
+    let available = admission_probe
+        .as_ref()
+        .ok()
+        .map(|(_, available)| *available);
+    let headroom = available.is_some_and(|available| available >= headroom_bytes);
+    let headroom_alert_due = admission_pause_alert_due(
+        &mut ADMISSION_PAUSE_EPISODE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+        Instant::now(),
+        admission_decision.is_err(),
+        headroom,
+    );
     if let Err(reason) = admission_decision {
         let _ = alert::notify(
             cfg,
@@ -3621,7 +4992,25 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             "Runner pool paused: memory pressure",
             &format!("refusing to spawn runners: {reason}"),
         );
-        bail!("{reason}");
+        if headroom_alert_due {
+            let avail_mb = available.unwrap_or(0) / 1024 / 1024;
+            let _ = alert::notify(
+                cfg,
+                "runner_pool.admission_paused_with_headroom",
+                Severity::Critical,
+                "Runner pool paused 10+ minutes with memory headroom",
+                &format!(
+                    "admission has been paused for at least 10 minutes while MemAvailable {avail_mb} MB \
+                     >= host reserve + 4x runner memory ({} MB); last reason: {reason}; {}",
+                    headroom_bytes / 1024 / 1024,
+                    pressure_source.describe()
+                ),
+            );
+        }
+        return Ok(admission_paused_outcome(
+            cfg.runner.count.saturating_sub(alive),
+            reason,
+        ));
     }
     let missing = cfg.runner.count - alive;
     let refill = start_missing_runners(cfg, backend, missing);
@@ -3629,14 +5018,26 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     let _ = release_stale_slots(cfg);
 
     let refill = refill?;
-    let containers_after = managed_containers().context("post-refill local container recount")?;
-    let readiness_after = executing_runner_count_from_containers(
-        cfg,
-        &containers_after,
-        Instant::now() + LOCAL_READINESS_BUDGET,
-    );
+    let readiness_deadline = Instant::now() + LOCAL_READINESS_BUDGET;
+    let containers_after = managed_containers_until_deadline(readiness_deadline)
+        .context("post-refill local container recount")?;
+    let readiness_after =
+        executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
     let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
-        Ok(alive_after) => (cfg.runner.count.saturating_sub(alive_after), None),
+        Ok(summary) => {
+            // Independent review (round 2, bead jleechan-95jk fix verified):
+            // a vanished container (docker top: "No such container") must
+            // count toward the shortage, NOT be treated as alive. If we
+            // counted absent as alive (`ready + absent.len()`), a freshly
+            // spawned slot that died mid-probe would zero out the shortage
+            // and the daemon would pick `Recovered`, skipping the settling
+            // episode that surfaces the absent name — and sleeping the
+            // full serve-tick (30s) before reconciling. Counting from
+            // `ready` only keeps `remaining_shortage > 0` honest and
+            // makes the settling loop's new absent-aware immediate
+            // reconcile (commit b4669de main.rs:1354-1379) actually fire.
+            (cfg.runner.count.saturating_sub(summary.ready), None)
+        }
         Err(error) => {
             let detail = format!("{error:#}");
             eprintln!(
@@ -3656,6 +5057,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         remaining_shortage,
         post_refill_readiness_error,
         start_failures: refill.start_failures,
+        admission_paused_reason: refill.admission_paused_reason,
     };
     if outcome.is_partial_failure() {
         eprintln!(
@@ -3721,20 +5123,39 @@ mod tests {
         cfg
     }
 
+    #[test]
+    fn fleet_circuit_threshold_is_reachable_for_small_legacy_fleets() {
+        let one = cfg_with(1, "ez-org-runner");
+        let two = cfg_with(2, "ez-org-runner");
+        assert_eq!(failure_ladder_policy(&one).fleet_open_slots_threshold, 1);
+        assert_eq!(failure_ladder_policy(&two).fleet_open_slots_threshold, 2);
+    }
+
     /// Lock + redirect the slot assignments path for the duration of a test.
     /// Always pair with `_lock` to avoid races with other tests in the same
     /// binary.
     struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
         path: PathBuf,
+        docker_host_override: Option<std::ffi::OsString>,
     }
 
     impl TestEnv {
         fn new(label: &str) -> Self {
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let docker_host_override = env::var_os("DOCKER_HOST_OVERRIDE");
+            env::remove_var("DOCKER_HOST_OVERRIDE");
+            reset_failure_ladder_admission_latch_for_tests();
+            crate::failure_ladder::reset_test_save_failure();
             let path = tmp_path(label);
             *TEST_SLOT_PATH.lock().unwrap() = Some(path.clone());
             *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+            *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() =
+                Some(label != "host_containment_ancestry");
+            *TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap() = Some(
+                "ManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\nManagedOOMPreference=none\nOOMScoreAdjust=0\n"
+                    .to_owned(),
+            );
             // Bead jleechan-uurm: also reset the reclaim ring buffer +
             // daemon-start instant — both live in a process-wide OnceLock
             // (not in TEST_SLOT_PATH) so without this reset a test that
@@ -3756,7 +5177,17 @@ mod tests {
                 .map(|p| p.join("quarantined_slots.toml"))
                 .unwrap_or_else(|| PathBuf::from("quarantined_slots.toml"));
             std::env::set_var("EZGHA_QUARANTINE_PATH", &qpath);
-            Self { _lock: lock, path }
+            if label.starts_with("host_containment") {
+                *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(false);
+                *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            } else {
+                *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            }
+            Self {
+                _lock: lock,
+                path,
+                docker_host_override,
+            }
         }
     }
 
@@ -3772,12 +5203,24 @@ mod tests {
             *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = None;
             *TEST_START_ONE_NAMES.lock().unwrap() = None;
             *TEST_DOCKER_BIN.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = None;
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = None;
+            *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = None;
+            *TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap() = None;
+            reset_failure_ladder_admission_latch_for_tests();
+            crate::failure_ladder::reset_test_save_failure();
             // Drop the cpu-probe test seam so the next test sees a clean
             // override state instead of a value leaked from this test.
             cpu_probe_overrides::set(None);
             // Clear the quarantine redirect set in new() (TEST_LOCK is
             // still held here, so no other test can observe the gap).
             std::env::remove_var("EZGHA_QUARANTINE_PATH");
+            if let Some(value) = &self.docker_host_override {
+                std::env::set_var("DOCKER_HOST_OVERRIDE", value);
+            } else {
+                std::env::remove_var("DOCKER_HOST_OVERRIDE");
+            }
             let _ = std::fs::remove_file(&self.path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
@@ -3791,210 +5234,6 @@ mod tests {
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = None;
 
         assert!(host_free_disk_gb().is_some());
-    }
-
-    #[test]
-    fn parse_df_avail_gb_parses_standard_and_pull_prefixed_output() {
-        // 1. Standard df output: 86665296 KB -> 82 GB
-        let standard = b"Filesystem     1024-blocks     Used Available Capacity Mounted on\noverlay          102624184 10699728  86665296      11% /\n";
-        assert_eq!(parse_df_avail_gb(standard), Some(82));
-
-        // 2. Output with preceding docker pull progress / logs
-        let with_pull = b"Unable to find image 'alpine:3.19' locally\n3.19: Pulling from library/alpine\n5711127a7748: Pull complete\nDigest: sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1\nStatus: Downloaded newer image for alpine:3.19\nFilesystem           1024-blocks    Used Available Capacity Mounted on\noverlay              102624184  12462156  84902868  13% /\n";
-        assert_eq!(parse_df_avail_gb(with_pull), Some(80));
-
-        // 3. Malformed / empty / incomplete
-        assert_eq!(parse_df_avail_gb(b""), None);
-        assert_eq!(parse_df_avail_gb(b"Filesystem 1024-blocks\n"), None);
-        assert_eq!(
-            parse_df_avail_gb(
-                b"Filesystem 1024-blocks Used Available Capacity Mounted on\noverlay abc def\n"
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn prioritize_containers_orders_anchor_then_runners_then_others() {
-        let containers = vec![
-            "hermes-mem0".to_string(),
-            "ez-mac-runner-g-2".to_string(),
-            "ezgha-image-anchor".to_string(),
-            "ez-mac-runner-g-1".to_string(),
-            "unrelated-db".to_string(),
-        ];
-        let prioritized = prioritize_containers(containers);
-        assert_eq!(
-            prioritized,
-            vec![
-                "ezgha-image-anchor".to_string(),
-                "ez-mac-runner-g-2".to_string(),
-                "ez-mac-runner-g-1".to_string(),
-                "hermes-mem0".to_string(),
-                "unrelated-db".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn free_disk_gb_queries_running_container_via_exec_and_prioritizes_anchor() {
-        let _env = TestEnv::new("free_disk_gb_exec");
-        *TEST_FREE_DISK_GB.lock().unwrap() = None;
-
-        let temp_dir =
-            std::env::temp_dir().join(format!("ezgha-free-disk-exec-{}", std::process::id()));
-        let capture = temp_dir.join("docker-args.log");
-        let script = temp_dir.join("docker");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo "$*" >> "{capture}"
-case "$*" in
-    ps*)
-        echo "ez-mac-runner-1"
-        echo "ezgha-image-anchor"
-        exit 0
-        ;;
-    *"exec ezgha-image-anchor df -Pk /"*)
-        echo "Filesystem     1024-blocks     Used Available Capacity Mounted on"
-        echo "overlay          104857600 20971520  83886080      20% /"
-        exit 0
-        ;;
-    *)
-        echo "unexpected command: $*" >&2
-        exit 1
-        ;;
-esac
-"#,
-                capture = capture.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
-
-        let free = free_disk_gb("nonexistent-runner:latest");
-        assert_eq!(free, Some(80));
-
-        let logged = std::fs::read_to_string(&capture).unwrap();
-        let lines: Vec<&str> = logged.lines().collect();
-        assert!(lines[0].starts_with("ps"));
-        assert!(lines[1].contains("exec ezgha-image-anchor df -Pk /"));
-        assert!(!logged.contains("run "));
-    }
-
-    #[test]
-    fn free_disk_gb_falls_back_to_run_image_when_no_containers_running() {
-        let _env = TestEnv::new("free_disk_gb_run_image");
-        *TEST_FREE_DISK_GB.lock().unwrap() = None;
-
-        let temp_dir =
-            std::env::temp_dir().join(format!("ezgha-free-disk-run-{}", std::process::id()));
-        let capture = temp_dir.join("docker-args.log");
-        let script = temp_dir.join("docker");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo "$*" >> "{capture}"
-case "$*" in
-    ps*)
-        exit 0
-        ;;
-    *"run --rm --entrypoint df my-runner:v1 -Pk /"*)
-        echo "Filesystem     1024-blocks     Used Available Capacity Mounted on"
-        echo "overlay          104857600 20971520  73400320      20% /"
-        exit 0
-        ;;
-    *)
-        echo "unexpected command: $*" >&2
-        exit 1
-        ;;
-esac
-"#,
-                capture = capture.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
-
-        let free = free_disk_gb("my-runner:v1");
-        assert_eq!(free, Some(70));
-
-        let logged = std::fs::read_to_string(&capture).unwrap();
-        assert!(logged.contains("run --rm --entrypoint df my-runner:v1 -Pk /"));
-        assert!(!logged.contains(PROBE_IMAGE));
-    }
-
-    #[test]
-    fn free_disk_gb_falls_back_to_probe_image_when_runner_image_fails() {
-        let _env = TestEnv::new("free_disk_gb_probe_fallback");
-        *TEST_FREE_DISK_GB.lock().unwrap() = None;
-
-        let temp_dir =
-            std::env::temp_dir().join(format!("ezgha-free-disk-probe-{}", std::process::id()));
-        let capture = temp_dir.join("docker-args.log");
-        let script = temp_dir.join("docker");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo "$*" >> "{capture}"
-case "$*" in
-    ps*)
-        exit 0
-        ;;
-    *"missing-runner:latest"*)
-        echo "Unable to find image 'missing-runner:latest' locally" >&2
-        exit 1
-        ;;
-    *"{probe}"*)
-        echo "Filesystem     1024-blocks     Used Available Capacity Mounted on"
-        echo "overlay          104857600 20971520  62914560      20% /"
-        exit 0
-        ;;
-    *)
-        echo "unexpected command: $*" >&2
-        exit 1
-        ;;
-esac
-"#,
-                capture = capture.display(),
-                probe = PROBE_IMAGE
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
-
-        let free = free_disk_gb("missing-runner:latest");
-        assert_eq!(free, Some(60));
-
-        let logged = std::fs::read_to_string(&capture).unwrap();
-        assert!(logged.contains("run --rm --entrypoint df missing-runner:latest -Pk /"));
-        assert!(logged.contains(&format!("run --rm --entrypoint df {PROBE_IMAGE} -Pk /")));
-    }
-
-    #[test]
-    fn free_disk_gb_returns_none_when_all_fail() {
-        let _env = TestEnv::new("free_disk_gb_all_fail");
-        *TEST_FREE_DISK_GB.lock().unwrap() = None;
-
-        let temp_dir =
-            std::env::temp_dir().join(format!("ezgha-free-disk-fail-{}", std::process::id()));
-        let script = temp_dir.join("docker");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(&script, b"#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
-
-        let free = free_disk_gb("broken-image:latest");
-        assert_eq!(free, None);
     }
 
     #[test]
@@ -4015,7 +5254,13 @@ esac
                 .map(|slot| format!("ez-org-runner-{slot}"))
                 .collect(),
         );
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -4043,7 +5288,13 @@ esac
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(39));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -4061,7 +5312,13 @@ esac
         *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(5));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -4080,11 +5337,14 @@ esac
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
 
-        let err = ensure_count_outcome(&cfg, Backend::Docker).unwrap_err();
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
-        let message = format!("{err:#}");
+        let message = outcome
+            .admission_paused_reason
+            .expect("disk floor is a deliberate admission pause, not a backend error");
         assert!(message.contains("host filesystem"));
         assert!(message.contains("floor: 5 GB"));
+        assert_eq!(outcome.start_failures, 0);
         assert_eq!(
             TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
             1,
@@ -4122,7 +5382,8 @@ esac
         let (ncpu, daemon_mem): (f64, u64) = (4.0, 12288);
         let expected_cpu_share = (ncpu / 16.0).max(0.5);
         let expected_mem_share = (daemon_mem / 16).max(512);
-        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)));
+        let (cpus, mem) =
+            effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
         assert!(
             cpus <= expected_cpu_share + f64::EPSILON,
             "effective_limits must clamp cpus to daemon/count (got {cpus} > {expected_cpu_share})"
@@ -4141,7 +5402,8 @@ esac
         cfg.limits.cpus = 2.0;
         cfg.limits.memory_mb = 4096;
         let (ncpu, daemon_mem): (f64, u64) = (4.0, 8192);
-        let (cpus, mem) = effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)));
+        let (cpus, mem) =
+            effective_limits_with_capacity(&cfg, Some((ncpu, daemon_mem)), false).unwrap();
         let cpus_total = cpus * cfg.runner.count as f64;
         let mem_total = mem * cfg.runner.count as u64;
         assert!(
@@ -4172,12 +5434,192 @@ esac
         cfg.runner.count = 16;
         cfg.limits.memory_mb = 5977; // matches jeff-ubuntu's real config.toml
         assert_eq!(cfg.runner.guest_reserve_mb, 4096); // sanity: default
-        let (_, mem) = effective_limits_with_capacity(&cfg, Some((4.0, 48163)));
+        let (_, mem) = effective_limits_with_capacity(&cfg, Some((4.0, 48163)), false).unwrap();
         assert!(
             mem <= 2754,
             "effective_limits must respect guest_reserve_mb: expected <= 2754 MB (44067/16), got {mem} MB"
         );
         assert!(mem >= 512); // floor still applies
+    }
+
+    // -----------------------------------------------------------------
+    // `limits.cpu_burst` opt-in (2026-10-03 throughput finding).
+    //
+    // Contract: cpu_burst=true is honored ONLY when (a) the daemon is
+    // verified VM-contained and (b) daemon_capacity() reports finite
+    // positive ncpu. Otherwise effective_limits returns Err and the
+    // caller (start_one_with_generate_at_slot and Serve startup) bails
+    // before mutating any runner — silent fallback would let a host
+    // daemon or unknown capacity exceed the physical envelope.
+    //
+    // Default-false does NOT call platform::detect() (no probe cost on
+    // the hot path) — see cpu_burst_default_does_not_run_platform_detect.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cpu_burst_defaults_to_false() {
+        let cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
+        assert!(
+            !cfg.limits.cpu_burst,
+            "limits.cpu_burst MUST default to false — root owns enabling it (Mac fixed8CPU only)"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_with_vm_and_finite_capacity_relaxes_to_daemon_cpu() {
+        // Mac fixed8CPU VM (Colima/Lima), 6 runners, configured cpus=4.0.
+        // With burst + verified VM + finite capacity, the ceiling relaxes
+        // to min(cfg.limits.cpus, ncpu) = 4.0 and the hot job runs
+        // unthrottled.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let (cpus, _mem) =
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ true)
+                .unwrap();
+        assert!(
+            (cpus - 4.0).abs() < f64::EPSILON,
+            "burst + VM + finite capacity must relax the per-container ceiling to cfg.limits.cpus=4.0 (got {cpus})"
+        );
+        assert!(
+            cpus > (8.0 / 6.0) + f64::EPSILON,
+            "burst must exceed the equal-share clamp (8/6 = 1.33); without burst the hot job is clipped"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_unsupported_on_host_daemon_returns_err() {
+        // Burst on a host daemon must REFUSE — silent fallback to the
+        // equal-share clamp would let the operator believe burst was
+        // honored when it wasn't. Err propagates to start_one / Serve
+        // startup and the operator gets a loud message.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err =
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ false)
+                .expect_err("burst on a host daemon must return Err");
+        assert!(
+            err.contains("not verified VM-contained"),
+            "Err message must explain the VM requirement (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_unsupported_with_no_capacity_returns_err() {
+        // Burst with no discovered capacity (daemon_capacity returned
+        // None) must REFUSE — silent bypass would let a typo'd
+        // cfg.limits.cpus escape unclamped.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err = effective_limits_with_capacity(
+            &cfg, /* capacity */ None, /* daemon_in_vm */ true,
+        )
+        .expect_err("burst with no capacity must return Err");
+        assert!(
+            err.contains("non-finite") || err.contains("non-positive"),
+            "Err message must name the missing-capacity failure (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_rejects_nan_ncpu() {
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err = effective_limits_with_capacity(
+            &cfg,
+            Some((f64::NAN, 8192)),
+            /* daemon_in_vm */ true,
+        )
+        .expect_err("NaN ncpu must be rejected");
+        assert!(
+            err.contains("non-finite") || err.contains("non-positive"),
+            "Err message must name the NaN failure (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_rejects_zero_ncpu() {
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = true;
+        let err =
+            effective_limits_with_capacity(&cfg, Some((0.0, 8192)), /* daemon_in_vm */ true)
+                .expect_err("zero ncpu must be rejected (pre-fix would have set cpu_ceiling=0.0)");
+        assert!(
+            err.contains("non-positive"),
+            "Err message must name the zero-failure (got {err:?})"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_default_does_not_run_platform_detect() {
+        // Pinned regression: when limits.cpu_burst is false (default), the
+        // hot path (every start_one call) must NOT call platform::detect()
+        // — that probe fans out to docker info, which tart, which virsh,
+        // kvm device probes, etc. and would add latency to every spawn.
+        //
+        // We can't easily count platform::detect() calls in this unit test
+        // (it requires a test seam in platform.rs). Instead we verify the
+        // OUTCOME: with cpu_burst=false, the returned daemon_in_vm is
+        // false regardless of what a hypothetical probe would have said.
+        // The platform-detect gating lives at
+        // effective_limits cfg.limits.cpu_burst branch; this test pins the
+        // observable behavior. A test seam in platform.rs would be a
+        // follow-up if review requires it.
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 8), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 4.0;
+        cfg.limits.cpu_burst = false;
+        // capacity=Some((8, ...)), and the inner function is called with
+        // daemon_in_vm=false (because the outer effective_limits gates
+        // platform::detect() on cpu_burst=true). The CPU is then clamped
+        // to cpu_share = 8/6 = 1.33, NOT to ncpu=8.0 — that proves
+        // platform::detect did not run (it would have set daemon_in_vm
+        // and the burst path would have applied).
+        let (cpus, _mem) =
+            effective_limits_with_capacity(&cfg, Some((8.0, 8192)), /* daemon_in_vm */ false)
+                .unwrap();
+        let cpu_share = (8.0_f64 / 6.0).max(0.5);
+        assert!(
+            (cpus - cpu_share).abs() < f64::EPSILON,
+            "cpu_burst=false must use the equal-share clamp {cpu_share} (got {cpus}); \
+             a wrong outcome here means the burst-eligibility check leaked into the default path"
+        );
+    }
+
+    #[test]
+    fn cpu_burst_per_container_cap_does_not_exceed_daemon_capacity() {
+        // Even with burst enabled and VM + finite capacity verified, the
+        // per-container ceiling MUST be capped at the daemon's discovered
+        // ncpu. cfg.limits.cpus > ncpu would otherwise let count * cpus
+        // exceed VM physical CPUs (the --cpus value gets translated to
+        // cfs_quota_us per container, and any value above ncpu would be
+        // effectively unbounded).
+        let mut cfg = Config::defaults_for(&fake_platform(8192, 4), "o/r".into(), Scope::Repo);
+        cfg.runner.count = 6;
+        cfg.limits.cpus = 16.0; // operator typo: 16 CPUs requested on a 4-CPU VM
+        cfg.limits.cpu_burst = true;
+        let (cpus, _) =
+            effective_limits_with_capacity(&cfg, Some((4.0, 8192)), /* daemon_in_vm */ true)
+                .unwrap();
+        assert!(
+            cpus <= 4.0 + f64::EPSILON,
+            "burst ceiling must be capped at daemon ncpu=4.0 (got {cpus}); never cfg.limits.cpus=16.0"
+        );
+        assert!(
+            cpus * cfg.runner.count as f64 <= 4.0 * cfg.runner.count as f64 + f64::EPSILON,
+            "burst aggregate (cpus * count = {}) must not exceed ncpu * count = {}",
+            cpus * cfg.runner.count as f64,
+            4.0 * cfg.runner.count as f64,
+        );
     }
 
     #[test]
@@ -4490,6 +5932,360 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn docker_top_deadline_includes_reaper_initialization_and_has_no_extra_budget() {
+        let _env = TestEnv::new("docker_top_deadline");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-docker-top-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        for (label, top_delay, succeeds) in [("within", "0.2", true), ("over", "5.0", false)] {
+            let script = temp_dir.join(format!("docker-{label}"));
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"top\" ]; then\n    sleep {top_delay}\n    printf 'PID COMMAND\\n1 Runner.Worker\\n'\n    break\n  fi\ndone\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+            let mut cmd = docker_cmd();
+            cmd.args(["top", "runner-1", "-eo", "pid,comm"]);
+            let started = Instant::now();
+            let deadline = started + Duration::from_secs(3);
+            std::thread::sleep(Duration::from_secs(1));
+            let reaper = Ok(DockerChildReaper {
+                queue: Arc::new(DockerReapQueue {
+                    pending: Mutex::new(VecDeque::new()),
+                    wake: Condvar::new(),
+                    active: AtomicUsize::new(0),
+                }),
+            });
+            let result = run_docker_with_timeout_at_deadline(
+                cmd,
+                "fake docker top readiness",
+                Duration::from_secs(3),
+                deadline,
+                reaper,
+            );
+
+            assert_eq!(result.is_ok(), succeeds, "top delay {top_delay}s");
+            if !succeeds {
+                assert!(
+                    result.unwrap_err().to_string().contains("timed out"),
+                    "over-deadline docker top must fail closed"
+                );
+            }
+        }
+
+        let marker = temp_dir.join("must-not-start");
+        let script = temp_dir.join("docker-expired");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho started > {}\n", marker.to_string_lossy()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+        let mut cmd = docker_cmd();
+        cmd.args(["top", "runner-1", "-eo", "pid,comm"]);
+        let expired_deadline = Instant::now() - Duration::from_millis(1);
+        let reaper = Ok(DockerChildReaper {
+            queue: Arc::new(DockerReapQueue {
+                pending: Mutex::new(VecDeque::new()),
+                wake: Condvar::new(),
+                active: AtomicUsize::new(0),
+            }),
+        });
+        assert!(run_docker_with_timeout_at_deadline(
+            cmd,
+            "expired fake docker top readiness",
+            Duration::from_secs(3),
+            expired_deadline,
+            reaper,
+        )
+        .is_err());
+        assert!(
+            !marker.exists(),
+            "docker top must not start after its deadline"
+        );
+    }
+
+    #[test]
+    fn run_docker_timeout_covers_stderr_and_reaping() {
+        let pid_path = tmp_path("docker_timeout_pid").with_extension("pid");
+        let start = Instant::now();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo $$ > \"$1\"; exec 1>&-; exec /bin/sleep 30",
+            "sh",
+            pid_path.to_str().unwrap(),
+        ]);
+        let result = run_docker_with_timeout(
+            cmd,
+            "hung docker command with closed stdout simulation",
+            Duration::from_secs(1),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "hung command should timeout");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "stderr and process reaping must share the deadline, got {:?}",
+            elapsed
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "timed-out child must eventually be reaped");
+    }
+
+    #[test]
+    fn killed_docker_child_is_reaped_within_cleanup_window() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        assert!(
+            reap_killed_child_until_deadline(child, Instant::now() + Duration::from_secs(1))
+                .is_none(),
+            "child must be reaped"
+        );
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "timed-out child must be killed and reaped"
+        );
+    }
+
+    #[test]
+    fn reaper_retries_transient_wait_without_dropping_owner() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("0.05")
+            .spawn()
+            .unwrap();
+        let mut req = DockerReapRequest {
+            child,
+            detail: "test transient wait".to_string(),
+        };
+        assert!(!try_wait_owned_docker_child(&mut req));
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(try_wait_owned_docker_child(&mut req));
+    }
+
+    #[test]
+    fn reaper_initialization_failure_prevents_child_spawn() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let marker = tmp_path("reaper_init_failure").with_extension("spawned");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "echo spawned > \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+        ]);
+        let init_failure: Result<DockerChildReaper> =
+            Err(anyhow::anyhow!("injected Docker child reaper init failure"));
+        let result = run_docker_with_timeout_after_reaper_init(
+            cmd,
+            "reaper initialization failure test",
+            Duration::from_secs(1),
+            init_failure,
+        );
+        assert!(result.is_err());
+        assert!(
+            !marker.exists(),
+            "command must not spawn when reaper initialization fails"
+        );
+    }
+
+    #[test]
+    fn reaper_initialization_retries_after_transient_failure() {
+        let cache = Mutex::new(None);
+        let attempts = AtomicU32::new(0);
+        let initialize = || {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err("injected transient reaper initialization failure".to_owned());
+            }
+            Ok(DockerChildReaper {
+                queue: Arc::new(DockerReapQueue {
+                    pending: Mutex::new(VecDeque::new()),
+                    wake: Condvar::new(),
+                    active: AtomicUsize::new(0),
+                }),
+            })
+        };
+
+        assert!(get_or_initialize_docker_child_reaper(&cache, initialize).is_err());
+        assert!(get_or_initialize_docker_child_reaper(&cache, initialize).is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reaper_supervisor_exits_after_readiness_receiver_is_dropped() {
+        let queue = Arc::new(DockerReapQueue {
+            pending: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+            active: AtomicUsize::new(0),
+        });
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        drop(ready_receiver);
+        let (done_sender, done_receiver) = mpsc::sync_channel(0);
+
+        std::thread::spawn(move || {
+            docker_child_reaper_supervisor(queue, Some(ready_sender));
+            let _ = done_sender.send(());
+        });
+
+        assert!(
+            done_receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "a timed-out initialization must not leave an orphan reaper thread"
+        );
+    }
+
+    #[test]
+    fn background_reaper_eventually_reaps_transferred_child() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        child.kill().unwrap();
+        docker_child_reaper().unwrap().enqueue(DockerReapRequest {
+            child,
+            detail: "background reaper test".to_owned(),
+        });
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "background reaper must eventually reap its child");
+    }
+
+    #[test]
+    fn stalled_reaper_wait_does_not_block_later_child() {
+        let _lock = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reaper = initialize_docker_child_reaper().unwrap();
+        let mut stalled_pids = Vec::new();
+        for index in 0..4 {
+            let first = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            stalled_pids.push(first.id() as libc::pid_t);
+            reaper.enqueue(DockerReapRequest {
+                child: first,
+                detail: format!("stalled reaper wait test (child {index})"),
+            });
+        }
+        let stalled_waits_started = (0..100).any(|_| {
+            let pending_empty = reaper
+                .queue
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty();
+            if pending_empty && reaper.queue.active.load(Ordering::Relaxed) == 4 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            false
+        });
+        assert!(
+            stalled_waits_started,
+            "four stalled children must be owned by the reaper before the fifth arrives"
+        );
+
+        let mut fifth = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let fifth_pid = fifth.id() as libc::pid_t;
+        fifth.kill().unwrap();
+        reaper.enqueue(DockerReapRequest {
+            child: fifth,
+            detail: "stalled reaper wait test (fifth child)".to_owned(),
+        });
+
+        let mut fifth_reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(fifth_pid, 0) } != 0 {
+                fifth_reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for pid in stalled_pids {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            fifth_reaped,
+            "four stalled waits must not block reaping a later killed child"
+        );
+    }
+
+    #[test]
+    fn supervised_reaper_recovers_after_worker_panic() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let reaper = docker_child_reaper().unwrap();
+        let panic_count = TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst);
+        TEST_DOCKER_REAPER_PANIC_ONCE.store(true, Ordering::SeqCst);
+        reaper.queue.wake.notify_one();
+        for _ in 0..100 {
+            if TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst) > panic_count {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst) > panic_count,
+            "reaper worker should observe the injected panic"
+        );
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id() as libc::pid_t;
+        child.kill().unwrap();
+        reaper.enqueue(DockerReapRequest {
+            child,
+            detail: "supervised reaper recovery test".to_owned(),
+        });
+
+        let mut reaped = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reaped, "supervised reaper must reap after worker restart");
+    }
+
+    #[test]
     fn start_missing_runners_starts_full_shortfall_directly() {
         // Regression guard for the po2 throttle removal (watchdog relaxed to
         // max-load-1=96 on 2026-07-07): with N missing and N successful
@@ -4606,6 +6402,227 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn repeated_local_start_failures_open_only_the_slot_circuit() {
+        let env = TestEnv::new("persistent_slot_circuit");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        for _ in 0..3 {
+            let attempts_for_starter = std::sync::Arc::clone(&attempts);
+            let outcome = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                1,
+                move |_cfg, _backend, slot| {
+                    attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                    release_slot(slot)?;
+                    bail!("simulated local container start failure")
+                },
+            )
+            .expect("local start failures are a bounded partial outcome");
+            assert_eq!(outcome.start_failures, 1);
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        let state_path = env.path.with_file_name("failure_ladder.toml");
+        let ladder = FailureLadder::load(&state_path).unwrap();
+        assert!(ladder.slot_is_open(1, now_epoch_secs()));
+
+        let attempts_for_starter = std::sync::Arc::clone(&attempts);
+        let paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            1,
+            move |_cfg, _backend, _slot| {
+                attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                unreachable!("an open slot circuit must be excluded before start")
+            },
+        )
+        .unwrap();
+        assert!(paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn failure_ladder_save_failure_latches_admission_across_reconciliation_ticks() {
+        let _env = TestEnv::new("failure_ladder_save_failure_latch");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+        let state_path = failure_ladder_path_for(&cfg);
+        FailureLadder::default()
+            .save(&state_path)
+            .expect("baseline ledger should be durable before the injected failure");
+        // Save #1 above is the baseline.  Save #2 is the preflight and must
+        // succeed; save #3 records the local-start failure and is injected to
+        // fail after the external starter has run exactly once.
+        crate::failure_ladder::set_test_save_failure_on_call(Some(3));
+
+        let first = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release_slot(slot)?;
+                bail!("simulated local container start failure")
+            }
+        })
+        .expect("save failure should become a bounded admission pause");
+        assert_eq!(first.start_failures, 1);
+        assert!(first
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("could not persist failure-ladder failure")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // The old ledger is still readable, but its failed transition was not
+        // persisted.  A subsequent serve tick must remain fail-closed rather
+        // than re-invoking JIT/Docker admission against that stale ledger.
+        let second = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, _slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                unreachable!("latched admission must not invoke the starter")
+            }
+        })
+        .expect("latched admission should be a bounded pause");
+        assert!(second
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("failure-ladder persistence")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Clearing the injected save error is not enough: recovery is an
+        // explicit daemon-lifetime condition (process restart), represented
+        // here by the test-only latch reset.
+        crate::failure_ladder::reset_test_save_failure();
+        let still_paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            1,
+            |_cfg, _backend, _slot| unreachable!("latch must survive save recovery alone"),
+        )
+        .expect("latch should remain closed until explicit recovery");
+        assert!(still_paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        reset_failure_ladder_admission_latch_for_tests();
+        let recovered = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                release_slot(slot)?;
+                bail!("post-restart simulated local start failure")
+            }
+        })
+        .expect("explicit restart-equivalent reset should reopen admission");
+        assert_eq!(recovered.start_failures, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn failure_ladder_preflight_save_failure_blocks_external_starter() {
+        let _env = TestEnv::new("failure_ladder_preflight_save_failure");
+        let cfg = cfg_with(1, "ez-org-runner");
+        let state_path = failure_ladder_path_for(&cfg);
+        FailureLadder::default()
+            .save(&state_path)
+            .expect("baseline ledger should be durable before the injected failure");
+        // Save #1 above is the baseline; fail the preflight save (#2).
+        crate::failure_ladder::set_test_save_failure_on_call(Some(2));
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 1, {
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_cfg, _backend, _slot| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                unreachable!("failed persistence preflight must precede external admission")
+            }
+        })
+        .expect("preflight failure should become a bounded admission pause");
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.start_failures, 0);
+        assert!(outcome
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("preflight")));
+    }
+
+    #[test]
+    fn github_jit_failures_do_not_penalize_healthy_slots() {
+        let env = TestEnv::new("control_plane_not_slot_failure");
+        let cfg = cfg_with(3, "ez-org-runner");
+
+        for _ in 0..6 {
+            let outcome = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                3,
+                |_cfg, _backend, slot| {
+                    release_slot(slot)?;
+                    Err(admission_preflight_error(anyhow::anyhow!(
+                        "simulated GitHub secondary rate limit"
+                    )))
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome.start_failures, 1);
+            assert!(outcome
+                .admission_paused_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("without penalizing slot")));
+        }
+
+        let state_path = env.path.with_file_name("failure_ladder.toml");
+        let ladder = FailureLadder::load(&state_path).unwrap();
+        assert_eq!(ladder.open_slot_count(now_epoch_secs()), 0);
+        assert!(ladder.excluded_slots(now_epoch_secs()).is_empty());
+        assert!(!ladder.fleet_admission_is_paused(now_epoch_secs()));
+    }
+
+    #[test]
+    fn three_distinct_slot_circuits_pause_all_new_admission() {
+        let _env = TestEnv::new("persistent_fleet_circuit");
+        let cfg = cfg_with(3, "ez-org-runner");
+        let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut last = StartMissingOutcome::default();
+        for _ in 0..9 {
+            let attempts_for_starter = std::sync::Arc::clone(&attempts);
+            last = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                1,
+                move |_cfg, _backend, slot| {
+                    attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                    release_slot(slot)?;
+                    bail!("simulated systemic local start failure")
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 9);
+        assert!(last
+            .admission_paused_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("fleet admission circuit opened")));
+
+        let attempts_for_starter = std::sync::Arc::clone(&attempts);
+        let paused = start_missing_runners_with_starter(
+            &cfg,
+            Backend::Docker,
+            3,
+            move |_cfg, _backend, _slot| {
+                attempts_for_starter.fetch_add(1, Ordering::SeqCst);
+                unreachable!("fleet circuit must close admission before allocation")
+            },
+        )
+        .unwrap();
+        assert!(paused.admission_paused_reason.is_some());
+        assert_eq!(attempts.load(Ordering::SeqCst), 9);
+    }
+
+    #[test]
     fn ensure_count_real_wiring_computes_missing_before_start_missing() {
         let _env = TestEnv::new("ensure_count_wiring");
         let cfg = cfg_with(5, "ez-org-runner");
@@ -4619,14 +6636,20 @@ minimum_isolation = "container"
         ]);
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-4".into(), "ez-org-runner-5".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(3)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 3,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
-        let started = ensure_count(&cfg, Backend::Docker).unwrap();
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
         assert_eq!(
-            started,
+            outcome.started,
             vec!["ez-org-runner-4", "ez-org-runner-5"],
-            "ensure_count must compute missing=count-alive using only current-prefix containers"
+            "ensure_count_outcome must compute missing=count-alive using only current-prefix containers"
         );
         assert!(
             TEST_START_ONE_NAMES
@@ -4665,7 +6688,13 @@ minimum_isolation = "container"
             "ez-org-runner-6".into(),
             "must-not-start-in-a-second-batch".into(),
         ]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(4)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 4,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -4712,7 +6741,13 @@ minimum_isolation = "container"
         ];
         *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [five_alive.clone(), five_alive].into();
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["must-not-start".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(5)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 5,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker)
             .expect("an exited one-job container with a settling registration is pending turnover");
@@ -4780,7 +6815,13 @@ minimum_isolation = "container"
         *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
         *TEST_START_ONE_NAMES.lock().unwrap() =
             Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(4)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 4,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -4811,8 +6852,8 @@ minimum_isolation = "container"
     /// jobs". The old `runner_worker_present` only checked Worker, which
     /// misclassified idle-but-healthy listeners as "not executing" and
     /// caused false-positive `runner startup settling ceiling reached: 0/6
-    /// executing locally` CRITICALs on idle healthy fleets. This test pins
-    /// the corrected semantics.
+    /// ready locally (listeners or workers)` CRITICALs on idle healthy
+    /// fleets. This test pins the corrected semantics.
     #[test]
     fn runner_present_accepts_listener_or_worker() {
         // Either Runner.Listener OR Runner.Worker → ready.
@@ -4829,6 +6870,641 @@ minimum_isolation = "container"
         assert!(!runner_present(
             "PID COMMAND\n202 NotRunner.Workerish\n203 NotRunner.Listenerish\n"
         ));
+    }
+
+    /// Bead jleechan-95jk root-cause: a docker top that returns "No such
+    /// container" is a definitive signal that the container is GONE — not a
+    /// probe failure. The readiness probe converts it to
+    /// `ProbeOutcome::Absent` (so the readiness pass keeps the other slots'
+    /// evidence usable and the absent slot's name reaches the settling loop
+    /// for immediate reconciliation) and the `release_stale_slots` path
+    /// converts it to `LocalRunnerActivity::Absent` (so the slot can be
+    /// reclaimed). This test pins the stderr classifier
+    /// that both paths share.
+    #[test]
+    fn docker_top_container_absent_classifies_only_no_such_container() {
+        // Canonical docker engine message.
+        assert!(docker_top_container_absent(
+            "Error response from daemon: No such container: ez-runner-c-3"
+        ));
+        // Some plugin paths historically report "No such object".
+        assert!(docker_top_container_absent(
+            "Error: No such object: ez-runner-c-3"
+        ));
+        // Genuine probe failures must NOT classify as absence.
+        assert!(!docker_top_container_absent(
+            "Error response from daemon: context deadline exceeded"
+        ));
+        assert!(!docker_top_container_absent(""));
+        assert!(!docker_top_container_absent(
+            "Error response from daemon: permission denied while trying to connect to the Docker daemon socket"
+        ));
+        // "No such container" inside a longer log line still matches.
+        assert!(docker_top_container_absent(
+            "level=error msg=\"No such container: ez-runner-c-3 (docker top)\""
+        ));
+    }
+
+    #[test]
+    fn readiness_probe_timeout_caps_at_six_seconds_and_preserves_sub_six_seconds() {
+        // Per-probe cap is 6s (was 3s). The 2026-10-03 throughput doc
+        // measured 3.2-4.5s `docker top` latency on Mac under load, so the
+        // previous 3s cap killed in-flight probes that were still going to
+        // succeed and reported false "not ready". Parallel fan-out keeps
+        // the shared 30s readiness budget bounded.
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(30)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            readiness_probe_timeout(Duration::from_millis(500)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn readiness_probes_share_deadline_and_stop_after_it() {
+        let cfg = cfg_with(4, "ez-org-runner");
+        let containers: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let mut clock = [
+            start,
+            start + Duration::from_secs(2),
+            start + Duration::from_secs(28),
+            start + LOCAL_READINESS_BUDGET,
+        ]
+        .into_iter();
+        // Probe is `Fn + Sync` (parallel dispatch via `std::thread::scope`),
+        // so its captures must be thread-safe. `Arc<Mutex<Vec>>` is the
+        // smallest such wrapper that preserves the per-call `push` semantics
+        // the original sequential test relied on; a sort-by-name lets us
+        // assert on the (name, timeout) pairs without depending on which
+        // spawned thread acquired the mutex first.
+        let launched: std::sync::Arc<std::sync::Mutex<Vec<(String, Duration)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launched_inside = launched.clone();
+
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            || clock.next().unwrap(),
+            move |container, timeout| {
+                launched_inside
+                    .lock()
+                    .unwrap()
+                    .push((container.name.clone(), timeout));
+                Ok(ProbeOutcome::Ready)
+            },
+        );
+
+        assert!(
+            result.unwrap_err().to_string().contains("ez-org-runner-4"),
+            "the fourth container must be rejected after the shared deadline"
+        );
+        let mut launched = Arc::try_unwrap(launched).unwrap().into_inner().unwrap();
+        launched.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            launched,
+            vec![
+                ("ez-org-runner-1".to_string(), Duration::from_secs(6)),
+                ("ez-org-runner-2".to_string(), Duration::from_secs(6)),
+                ("ez-org-runner-3".to_string(), Duration::from_secs(2)),
+            ],
+            "parallel top probes must cap normally, shorten at the tail, and not launch after expiry"
+        );
+    }
+
+    #[test]
+    fn readiness_budget_does_not_spawn_docker_ps_after_expiry() {
+        let now = Instant::now();
+        let deadline = now - Duration::from_secs(1);
+        assert_eq!(remaining_until_deadline(deadline, now), None);
+    }
+
+    /// Bead jleechan-95jk: the headline win of parallel readiness probes.
+    /// Six simulated 50ms probes should fit in roughly 50ms wall-clock,
+    /// not 300ms. Sequential probes previously could spend up to 30s on a
+    /// 10-container Linux host when every top call hit its per-probe
+    /// timeout (now 6s — the 2026-10-03 throughput doc measured 3.2-4.5s
+    /// `docker top` latency on Mac under load, so the per-probe cap was
+    /// raised from 3s to 6s while keeping the shared 30s readiness budget
+    /// bounded by parallel fan-out). This test runs real sleeping probes
+    /// (no docker dependency) inside `executing_runner_count_with_probe`'s
+    /// parallel-spawn machinery and asserts the total is bounded by the
+    /// slowest probe plus overhead.
+    #[test]
+    fn parallel_readiness_probes_share_wall_clock_within_max_probe() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Instant;
+        let cfg = cfg_with(6, "ez-org-runner");
+        let containers: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let probe_cost = Duration::from_millis(50);
+        let probes_done = std::sync::Arc::new(AtomicU32::new(0));
+        let probes_inside = probes_done.clone();
+
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, timeout| {
+                // Sleep for the configured probe cost, never more than the
+                // probe timeout itself.
+                std::thread::sleep(probe_cost.min(timeout));
+                probes_inside.fetch_add(1, Ordering::SeqCst);
+                Ok(ProbeOutcome::Ready)
+            },
+        );
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            result.unwrap().ready,
+            6,
+            "all six probes should return ready"
+        );
+        assert_eq!(
+            probes_done.load(Ordering::SeqCst),
+            6,
+            "all six probes should have completed"
+        );
+        // Parallel wall-clock budget: the slowest single probe (probe_cost)
+        // plus reasonable scheduling overhead. Sequential 6x50ms would be
+        // ~300ms; parallel should be well under 250ms (half the sequential
+        // budget) on any reasonable CI host.
+        assert!(
+            elapsed < probe_cost * 4 + Duration::from_millis(100),
+            "parallel probes ran sequentially (elapsed={:?}, probe_cost={:?})",
+            elapsed,
+            probe_cost
+        );
+    }
+
+    #[test]
+    fn readiness_probe_fanout_never_exceeds_concurrency_cap() {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let count = READINESS_PROBE_CONCURRENCY * 2;
+        let cfg = cfg_with(count as u32, "ez-org-runner");
+        let containers: Vec<_> = (1..=count)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let release_inside = release.clone();
+
+        let worker = std::thread::spawn(move || {
+            executing_runner_count_with_probe(
+                &cfg,
+                &containers,
+                Instant::now() + LOCAL_READINESS_BUDGET,
+                Instant::now,
+                move |_container, _timeout| {
+                    started_tx.send(()).expect("test receiver remains live");
+                    let (released, wake) = &*release_inside;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                    Ok(ProbeOutcome::Ready)
+                },
+            )
+        });
+
+        for _ in 0..READINESS_PROBE_CONCURRENCY {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the first capped probe batch must start");
+        }
+        assert!(
+            matches!(
+                started_rx.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "a stale numeric-prefix fleet must not spawn probe {}/{} before the first batch finishes",
+            READINESS_PROBE_CONCURRENCY + 1,
+            count
+        );
+
+        let (released, wake) = &*release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(
+            worker
+                .join()
+                .expect("readiness worker must not panic")
+                .unwrap()
+                .ready,
+            count as u32,
+            "later batches run after capacity is released"
+        );
+    }
+
+    /// Bead jleechan-95jk: even with parallel probes, the deadline is still
+    /// shared. If a probe's own budget is exceeded mid-flight, the next
+    /// container's probe should not be launched. This pins the
+    /// spawn-then-break semantics introduced when the readiness loop became
+    /// parallel (previously sequential `?` exited on the first timeout).
+    #[test]
+    fn parallel_readiness_probes_respect_per_probe_timeout() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let cfg = cfg_with(3, "ez-org-runner");
+        let containers: Vec<_> = (1..=3)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        // Deadline permits exactly two 1s probes; the third container's
+        // `now()` will read past the deadline and reject the slot name.
+        let deadline = start + Duration::from_secs(2);
+        let mut clock = [
+            start,
+            start + Duration::from_secs(1),
+            start + Duration::from_secs(2),
+        ]
+        .into_iter();
+        let launches = std::sync::Arc::new(AtomicU32::new(0));
+        let launches_inside = launches.clone();
+
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            || clock.next().unwrap(),
+            move |_container, timeout| {
+                launches_inside.fetch_add(1, Ordering::SeqCst);
+                Ok(if timeout > Duration::ZERO {
+                    ProbeOutcome::Ready
+                } else {
+                    ProbeOutcome::NotReady
+                })
+            },
+        );
+
+        let err_str = match &result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected an Err result, got Ok"),
+        };
+        assert!(
+            err_str.contains("ez-org-runner-3"),
+            "the third container (whose `now()` past the deadline) must be the rejected name; got: {err_str}"
+        );
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            2,
+            "only the first two probes must have spawned"
+        );
+    }
+
+    /// Bead jleechan-95jk round-2 review feedback: the per-probe timeout was
+    /// raised from 3s to 6s after the 2026-10-03 throughput doc measured
+    /// 3.2-4.5s `docker top` latency on Mac under load. A 5s probe would
+    /// have been killed at the old 3s cap; under 6s it must complete. This
+    /// pins the "sub-cap but past-old-cap" success path so a future tweak
+    /// to `LOCAL_TOP_TIMEOUT` cannot silently regress Mac readiness.
+    #[test]
+    fn parallel_readiness_probes_complete_between_three_and_six_seconds() {
+        let cfg = cfg_with(3, "ez-org-runner");
+        let containers: Vec<_> = (1..=3)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        // 30s deadline leaves plenty of room; each probe sleeps 5s — past
+        // the old 3s cap, under the new 6s cap.
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, _timeout| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(ProbeOutcome::Ready)
+            },
+        );
+
+        let elapsed = start.elapsed();
+        let summary = result.expect("5s probes must complete under the 6s cap");
+        assert_eq!(summary.ready, 3);
+        assert!(summary.absent.is_empty());
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "5s probes must actually sleep, not short-circuit (elapsed={elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(7),
+            "parallel 5s probes must finish well under the per-probe cap (elapsed={elapsed:?})"
+        );
+    }
+
+    /// Bead jleechan-95jk round-2 review feedback: a probe that overruns the
+    /// per-probe cap (production: `run_docker_with_timeout_at_deadline` kills
+    /// the docker process at the cap; the probe returns `Err`) must surface
+    /// as `Err` from the orchestrator so the settling loop treats it as
+    /// incomplete evidence, NOT as `Absent`. This pins the "Unknown safety"
+    /// half of the bead directive: do not blindly treat all errors as
+    /// absence. The probe here respects its `timeout` argument the way the
+    /// production probe does — distinct from
+    /// `parallel_readiness_probes_pass_six_second_timeout_argument` above
+    /// which pins the cap value itself.
+    #[test]
+    fn parallel_readiness_probe_overrun_propagates_as_err_not_absent() {
+        let cfg = cfg_with(2, "ez-org-runner");
+        let containers: Vec<_> = (1..=2)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, timeout| {
+                // Sleep past the timeout — production docker probes are
+                // killed at the cap by `run_docker_with_timeout_at_deadline`.
+                std::thread::sleep(timeout + Duration::from_secs(1));
+                Err(anyhow::anyhow!("docker top timeout"))
+            },
+        );
+
+        let elapsed = start.elapsed();
+        let err = result.expect_err("an overrun probe must surface as Err, not Absent");
+        assert!(err.to_string().contains("docker top timeout"));
+        // Each probe gets a 6s cap, then sleeps 7s. Bounded.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "a probe overrun must stay within the shared budget (elapsed={elapsed:?})"
+        );
+    }
+
+    /// Companion to `parallel_readiness_probes_expire_at_six_second_cap`:
+    /// pin the per-probe timeout argument is exactly 6s (the raised cap),
+    /// not 3s (the old cap). This is the headline review-feedback fix.
+    #[test]
+    fn parallel_readiness_probes_pass_six_second_timeout_argument() {
+        use std::sync::Mutex;
+        let cfg = cfg_with(1, "ez-org-runner");
+        let containers: Vec<_> = (1..=1)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let captured: std::sync::Arc<Mutex<Option<Duration>>> =
+            std::sync::Arc::new(Mutex::new(None));
+        let captured_inside = captured.clone();
+
+        let _ = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |_container, timeout| {
+                *captured_inside.lock().unwrap() = Some(timeout);
+                Ok(ProbeOutcome::Ready)
+            },
+        );
+
+        let observed = captured.lock().unwrap().expect("probe captured a timeout");
+        assert_eq!(
+            observed,
+            Duration::from_secs(6),
+            "per-probe timeout cap must be 6s (raised from 3s for 3.2-4.5s measured probes)"
+        );
+    }
+
+    /// Bead jleechan-95jk root-cause: a slot whose container is GONE
+    /// (docker top: "No such container") must reach the settling loop as an
+    /// `Absent` outcome with the container's name attached, so the loop
+    /// reconciles immediately instead of waiting 25s for a slot that will
+    /// never come back. This pins the parallel orchestration's
+    /// `ProbeOutcome::Absent` → `ReadinessSummary.absent` plumbing.
+    #[test]
+    fn readiness_summary_reports_absent_container_names() {
+        let cfg = cfg_with(4, "ez-org-runner");
+        let containers: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |container, _timeout| {
+                // Slots 2 and 4 are absent (gone); slots 1 and 3 are ready.
+                if container.name.ends_with("2") || container.name.ends_with("4") {
+                    Ok(ProbeOutcome::Absent)
+                } else {
+                    Ok(ProbeOutcome::Ready)
+                }
+            },
+        );
+
+        let summary = result.expect("ready + absent both succeed");
+        assert_eq!(summary.ready, 2, "slots 1 and 3 should be ready");
+        let mut absent = summary.absent.clone();
+        absent.sort();
+        assert_eq!(
+            absent,
+            vec!["ez-org-runner-2".to_string(), "ez-org-runner-4".to_string(),],
+            "absent slots must surface their container names to the settling loop"
+        );
+    }
+
+    /// Companion to the test above: `ProbeOutcome::NotReady` is the
+    /// genuine broken-container case and is NOT reported as absent. The
+    /// settling loop should NOT trigger immediate reconcile from a
+    /// NotReady probe — the container is still alive and may self-heal.
+    #[test]
+    fn readiness_summary_treats_not_ready_distinct_from_absent() {
+        let cfg = cfg_with(3, "ez-org-runner");
+        let containers: Vec<_> = (1..=3)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let start = Instant::now();
+        let deadline = start + LOCAL_READINESS_BUDGET;
+        let result = executing_runner_count_with_probe(
+            &cfg,
+            &containers,
+            deadline,
+            Instant::now,
+            move |container, _timeout| {
+                if container.name.ends_with("2") {
+                    // Slot 2: container alive, no Runner process (genuine
+                    // "runner died" failure).
+                    Ok(ProbeOutcome::NotReady)
+                } else {
+                    Ok(ProbeOutcome::Ready)
+                }
+            },
+        );
+
+        let summary = result.expect("ready + not-ready both succeed");
+        assert_eq!(summary.ready, 2);
+        assert!(
+            summary.absent.is_empty(),
+            "NotReady must NOT be conflated with Absent (slot 2 is alive)"
+        );
+    }
+
+    /// Independent review (round 2) regression: post-refill readiness that
+    /// reports a freshly-spawned container as `Absent` (docker top: "No
+    /// such container" race) MUST count that container toward the
+    /// remaining shortage, NOT toward alive-after. The pre-fix code
+    /// (`ready + absent.len()`) made `remaining_shortage = 0`, selected
+    /// `EnsureSuccessDecision::Recovered`, skipped the settling episode
+    /// that surfaces the absent name, and slept the full 30s serve-tick —
+    /// the daemon stayed unaware the slot was gone for the next 30s. This
+    /// test pins both halves: (a) shortage > 0 → StartSettling, and (b)
+    /// the settling poll that still sees the absent name returns
+    /// `Ceiling` (immediate reconcile) instead of `Continue` (wait 25s).
+    #[test]
+    fn post_refill_absent_container_forces_shortage_and_immediate_reconcile() {
+        let _env = TestEnv::new("post_refill_absent_shortage");
+        let cfg = cfg_with(6, "ez-org-runner");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        // 4 initial containers → 2 missing. The refill (managed by the
+        // test infra) starts slots 5 and 6 — those are the ones whose
+        // containers we then mark as `Absent` for the post-refill probe.
+        let initial: Vec<_> = (1..=4)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        let after_refill: Vec<_> = (1..=6)
+            .map(|slot| managed_container(&format!("ez-org-runner-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [initial, after_refill.clone(), after_refill.clone()].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-org-runner-5".into(), "ez-org-runner-6".into()]);
+        // Post-refill probe: slots 1-4 are ready, slots 5-6 are absent
+        // (they were just spawned but `docker top` says "No such
+        // container" — the race the review caught).
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [
+                Ok(ReadinessSummary {
+                    ready: 4,
+                    absent: vec!["ez-org-runner-5".to_string(), "ez-org-runner-6".to_string()],
+                }),
+                // Second poll for the settling observe: still absent.
+                Ok(ReadinessSummary {
+                    ready: 4,
+                    absent: vec!["ez-org-runner-5".to_string(), "ez-org-runner-6".to_string()],
+                }),
+            ]
+            .into(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+        // (a) Half of the regression: shortage must be > 0 because the
+        // absent slots are not alive. The pre-fix bug made this 0
+        // because the code did `ready + absent.len()` for `alive_after`.
+        assert_eq!(
+            outcome.started.len(),
+            2,
+            "the 2 freshly-started slots are recorded as started"
+        );
+        assert_eq!(
+            outcome.remaining_shortage, 2,
+            "absent containers count toward shortage, NOT toward alive (round-2 review fix)"
+        );
+        assert!(
+            outcome.post_refill_readiness_error.is_none(),
+            "absent is a normal probe outcome, not an Err (Unknown safety preserved)"
+        );
+
+        let mut pending_readiness = false;
+        let decision = crate::ensure_success_decision_with_pending_readiness(
+            crate::ensure_success_decision(&cfg, &outcome),
+            pending_readiness,
+        );
+        assert_eq!(
+            decision,
+            crate::EnsureSuccessDecision::StartSettling { executing: 4 },
+            "remaining_shortage > 0 → StartSettling (pre-fix bug selected Recovered and slept 30s)"
+        );
+
+        let started_at = Instant::now();
+        let mut settling = None;
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            started_at,
+            decision,
+        );
+        assert!(
+            settling
+                .as_ref()
+                .is_some_and(crate::SettlingEpisode::is_active),
+            "StartSettling must arm the local settling episode"
+        );
+
+        // (b) Second half: when the settling poll still sees the absent
+        // names, the loop must force Ceiling (immediate reconcile) rather
+        // than Continue (wait out the 25s grace). The pre-fix settling
+        // path had no way to surface this and would have polled until
+        // MAX_SETTLING_POLLS / MAX_SETTLING_DURATION elapsed.
+        //
+        // The local settling observer in main.rs uses the
+        // `ReadinessSummary { ready, absent }` returned by
+        // `local_executing_runner_count` to force immediate reconcile.
+        // `SettlingEpisode::observe` itself only sees `executing` (the
+        // ready count), so we exercise the absent-aware forcing the same
+        // way main.rs does: a fresh readiness summary with non-empty
+        // `absent` and `ready < target` triggers `SettlingDecision::Ceiling`.
+        let absented = local_executing_runner_count(&cfg).unwrap();
+        assert_eq!(absented.ready, 4);
+        assert_eq!(absented.absent.len(), 2);
+        let ceiling_decision = if !absented.absent.is_empty() && absented.ready < cfg.runner.count {
+            crate::SettlingDecision::Ceiling
+        } else {
+            settling
+                .as_mut()
+                .unwrap()
+                .observe(Instant::now(), absented.ready, cfg.runner.count)
+        };
+        assert_eq!(
+            ceiling_decision,
+            crate::SettlingDecision::Ceiling,
+            "absent names from post-refill readiness must force Ceiling (immediate reconcile)"
+        );
+        crate::apply_local_settling_decision(
+            &mut settling,
+            &mut pending_readiness,
+            ceiling_decision,
+        );
+        assert!(
+            settling.is_none(),
+            "Ceiling clears the local settling episode so the next tick reconciles immediately"
+        );
+        let (sleep, run_monitors) = crate::settling_plan(&cfg, ceiling_decision);
+        assert_eq!(
+            sleep,
+            Duration::ZERO,
+            "Ceiling plan must request zero sleep before the next reconciliation"
+        );
+        assert!(
+            !run_monitors,
+            "Ceiling plan must reconcile on the next iteration without synchronous monitors"
+        );
     }
 
     #[test]
@@ -4869,7 +7545,10 @@ minimum_isolation = "container"
         *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
             [
                 Err("synthetic post-refill docker top timeout".to_string()),
-                Ok(6),
+                Ok(ReadinessSummary {
+                    ready: 6,
+                    absent: vec![],
+                }),
             ]
             .into(),
         );
@@ -4894,8 +7573,8 @@ minimum_isolation = "container"
         assert_eq!(decision, crate::EnsureSuccessDecision::IncompleteReadiness);
         assert_eq!(
             crate::ensure_success_plan(&cfg, decision),
-            (Duration::ZERO, true),
-            "incomplete post-refill evidence must run monitors and add zero sleep before reconciliation"
+            (Duration::ZERO, false),
+            "incomplete post-refill evidence must reconcile on the next iteration without synchronous monitors"
         );
 
         let started_at = Instant::now();
@@ -4945,7 +7624,7 @@ minimum_isolation = "container"
             "no readiness proof means no reset"
         );
 
-        let executing = local_executing_runner_count(&cfg).unwrap();
+        let executing = local_executing_runner_count(&cfg).unwrap().ready;
         let recovered =
             settling
                 .as_mut()
@@ -4966,7 +7645,13 @@ minimum_isolation = "container"
         *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
         *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
         *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-org-runner-1".into()]);
-        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some([Ok(0)].into());
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 0,
+                absent: vec![],
+            })]
+            .into(),
+        );
 
         let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
 
@@ -4988,6 +7673,7 @@ minimum_isolation = "container"
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             start_failures: 0,
+            admission_paused_reason: None,
         };
         assert!(
             !outcome.is_partial_failure(),
@@ -5003,6 +7689,7 @@ minimum_isolation = "container"
             remaining_shortage: 1,
             post_refill_readiness_error: None,
             start_failures: 1,
+            admission_paused_reason: None,
         };
         assert!(
             outcome.is_partial_failure(),
@@ -5051,7 +7738,7 @@ minimum_isolation = "container"
             // reliable here — other tests in this same binary (e.g.
             // `alert.rs`'s `PATH`-mutating tests) can transiently replace or
             // empty PATH on another thread while this script executes.
-            b"#!/bin/sh\nif [ \"$1\" = \"run\" ]; then echo \"docker run failed: simulation\" >&2; exit 1; else exit 0; fi\n",
+            b"#!/bin/sh\ncase \" $* \" in *\" run \"*) echo \"docker run failed: simulation\" >&2; exit 1;; *) exit 0;; esac\n",
         )
         .unwrap();
         // Use `set_permissions` directly instead of shelling out to `chmod`
@@ -5088,6 +7775,203 @@ minimum_isolation = "container"
         );
     }
 
+    /// Production start_one rejection regression (root review): an
+    /// unsupported cpu_burst configuration (burst=true with either
+    /// unverified-VM daemon OR unknown capacity) must refuse BEFORE any
+    /// container mutation (no `docker rm -f` pre-clean) and BEFORE the
+    /// JIT callback (`generate_jitconfig`). The Serve precheck only
+    /// catches this at startup; if the operator flips the config mid-run
+    /// OR capacity disappears after startup, the production start_one
+    /// path is the second line of defense. This test pins the
+    /// `pre-check-before-mutation` ordering by forcing both refusal
+    /// conditions (unknown capacity AND a non-VM-detected host) — on
+    /// either branch the rejection must run before docker is invoked.
+    #[test]
+    fn start_one_rejects_unsupported_burst_before_any_mutation_or_jit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _env = TestEnv::new("start_one_burst_unknown_capacity");
+        cpu_probe_overrides::set(Some(true));
+
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.cpu_burst = true;
+
+        // Force daemon_capacity() to return None so the inner
+        // effective_limits runs the no-capacity refusal branch (the VM
+        // refusal branch would otherwise fire first on a non-VM test
+        // host — both branches must satisfy the no-mutation invariant,
+        // but driving the no-capacity path makes the test deterministic
+        // regardless of the host's daemon_in_vm result).
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = Some(None);
+
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-burst-no-mutation-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        // The fake docker MUST still be installed even though we expect
+        // zero invocations — the rejection must happen before any
+        // docker_cmd() is even built. If a docker invocation DID happen
+        // it would log to this file and the assertion below would fail.
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        let jit_calls = AtomicUsize::new(0);
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            jit_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(("jit-token".into(), 1))
+        })
+        .expect_err("cpu_burst with unknown capacity must return Err from start_one");
+
+        assert!(
+            err.to_string().contains("cpu_burst"),
+            "Err must mention cpu_burst so operators can diagnose the misconfig; got: {err:#}"
+        );
+        assert_eq!(
+            jit_calls.load(Ordering::SeqCst),
+            0,
+            "generate_jitconfig MUST NOT be invoked when cpu_burst is unsupported; \
+             otherwise the runner could register on GitHub while the spawn is refused"
+        );
+
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        assert!(
+            captured.is_empty(),
+            "start_one_with_generate_at_slot must execute zero docker invocations when \
+             cpu_burst is unsupported; the rejected path must run BEFORE pre_rm. \
+             Captured args:\n{captured}"
+        );
+
+        // Cleanup so a later test sees the real daemon_capacity path.
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
+    }
+
+    /// cpu_burst preflight refusal must pause the whole refill WITHOUT
+    /// opening per-slot circuits. A generic Err would hit
+    /// `FailureLadder::record_failure` and open 15-minute circuits on
+    /// 3 slots — a whole-fleet config error misclassified as a per-slot
+    /// defect. Pin: admission_paused_reason set + slot ledger unchanged.
+    /// Drives the REAL `start_one_with_generate` path (same dependency
+    /// seams as the production refill loop) so removing the
+    /// `map_err(admission_preflight_error)` from start_one's effective_limits
+    /// call would surface here as a generic Err that DOES charge the ladder.
+    #[test]
+    fn preflight_burst_refusal_does_not_charge_slot_ladder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let env = TestEnv::new("preflight_burst_no_ladder_charge");
+        // failure_ladder_path_for falls back to the TEST_SLOT_PATH
+        // sibling when cfg.state_dir is None — leave cfg.state_dir unset
+        // (setting it to env.path, a file path, poisoned TEST_LOCK and
+        // cascaded into unrelated reaper tests, observed 2026-10-03).
+        let ladder_path = env.path.with_file_name("failure_ladder.toml");
+
+        let mut cfg = cfg_with(3, "ez-org-runner");
+        cfg.limits.cpu_burst = true;
+
+        // Pin daemon_capacity to None so effective_limits runs the
+        // unsupported-capacity refusal branch (deterministic on any host).
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = Some(None);
+
+        // Install a fake docker that captures invocations; the rejection
+        // must happen BEFORE pre_rm so the captured log stays empty.
+        let temp_dir =
+            std::env::temp_dir().join(format!("ezgha-burst-refusal-{}", std::process::id()));
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        // JIT closure MUST NOT be invoked: preflight refuses before any
+        // GitHub registration. Counting calls catches a regression where
+        // someone moves the preflight AFTER generate_jitconfig.
+        let jit_calls = AtomicUsize::new(0);
+        let starter = |_cfg: &Config, _backend: Backend, _slot: u32| -> Result<(String, String)> {
+            start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+                jit_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(("jit-token".into(), 1))
+            })
+        };
+
+        let outcome = start_missing_runners_with_starter(&cfg, Backend::Docker, 3, starter)
+            .expect("preflight-refused refill must surface as outcome, not panic");
+
+        assert!(
+            outcome.admission_paused_reason.is_some(),
+            "preflight refusal must set admission_paused_reason (got None)"
+        );
+        let reason = outcome.admission_paused_reason.as_deref().unwrap();
+        assert!(
+            reason.contains("preflight"),
+            "admission_paused_reason must mention 'preflight' (got: {reason:?})"
+        );
+        assert_eq!(
+            jit_calls.load(Ordering::SeqCst),
+            0,
+            "JIT MUST NOT be called when cpu_burst preflight refuses; \
+             a non-zero count means a regression moved effective_limits \
+             after generate_jitconfig (would register on GitHub before refusing)"
+        );
+        let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+        assert!(
+            captured.is_empty(),
+            "start_one_with_generate_at_slot must execute zero docker invocations when \
+             cpu_burst preflight refuses; the rejection must run BEFORE pre_rm. \
+             Captured args:\n{captured}"
+        );
+
+        let ladder_after = FailureLadder::load(&ladder_path)
+            .expect("failure ladder must remain loadable after a preflight refusal");
+        assert_eq!(
+            ladder_after.open_slot_count(0),
+            0,
+            "no slot circuit may open from a preflight refusal (open_slot_count={})",
+            ladder_after.open_slot_count(0)
+        );
+        assert!(
+            !ladder_after.fleet_admission_is_paused(0),
+            "fleet admission pause must NOT fire from a single preflight refusal"
+        );
+
+        *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
+        *TEST_DOCKER_BIN.lock().unwrap() = None;
+    }
+
+    /// Companion regression: a genuine docker-start failure (NOT preflight-typed)
+    /// MUST still charge the per-slot failure ledger. Pins the typed bucket
+    /// boundary so a future refactor cannot over-broaden AdmissionPreflightError
+    /// and silence real defects.
+    #[test]
+    fn genuine_docker_start_failure_still_charges_slot_ladder() {
+        let env = TestEnv::new("genuine_docker_charges_ladder");
+        let ladder_path = env.path.with_file_name("failure_ladder.toml");
+        let cfg = cfg_with(1, "ez-org-runner");
+
+        // Mirror `repeated_local_start_failures_open_only_the_slot_circuit`:
+        // each starter invocation `release_slot` first so the failed slot is
+        // available for the next call's `next_slot_excluding`. Bail with a
+        // generic (non-preflight) error so the typed bucket boundary is
+        // exercised.
+        for _ in 0..3 {
+            let outcome = start_missing_runners_with_starter(
+                &cfg,
+                Backend::Docker,
+                1,
+                |_cfg, _backend, slot| -> Result<(String, String)> {
+                    release_slot(slot)?;
+                    bail!("simulated local container start failure")
+                },
+            )
+            .expect("synthetic start failures must surface as outcome, not panic");
+            assert_eq!(outcome.start_failures, 1);
+        }
+
+        let ladder_after =
+            FailureLadder::load(&ladder_path).expect("failure ladder must remain loadable");
+        assert!(
+            ladder_after.open_slot_count(0) >= 1,
+            "three real docker-start failures MUST open at least one slot circuit \
+             (open_slot_count={}); otherwise the typed bucket leaked into the \
+             genuine-failure path and silenced real defects",
+            ladder_after.open_slot_count(0)
+        );
+    }
+
     /// Fake `docker` script that captures its full argv to `capture_path`
     /// (one line per invocation) and, for `run`, prints a fake container ID
     /// to stdout so `start_one_with_generate` sees a successful start.
@@ -5100,7 +7984,7 @@ minimum_isolation = "container"
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = \"run\" ]; then echo fakecontaineridabc123; fi\nexit 0\n",
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \" $* \" in *\" run \"*) echo fakecontaineridabc123;; esac\nexit 0\n",
                 capture_path.to_string_lossy()
             ),
         )
@@ -5132,7 +8016,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains(&format!("{}:/opt/wheelhouse:ro", wheelhouse_dir.display())),
@@ -5145,10 +8029,12 @@ minimum_isolation = "container"
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn configured_cgroup_parent_is_emitted_on_runner_start() {
         let _env = TestEnv::new("cgroup_parent");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
         cfg.limits.cgroup_parent = Some("actions.slice".into());
         let temp_dir =
             env::temp_dir().join(format!("ezgha-cgroup-parent-test-{}", std::process::id()));
@@ -5161,15 +8047,218 @@ minimum_isolation = "container"
         })
         .expect("start_one should succeed");
 
-        let run_line = std::fs::read_to_string(&capture)
-            .unwrap()
+        let run_content = std::fs::read_to_string(&capture).unwrap();
+        let run_line = run_content
             .lines()
-            .find(|line| line.starts_with("run "))
-            .expect("a docker run invocation should have been logged")
-            .to_string();
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("--cgroup-parent actions.slice"),
             "configured cgroup parent must be passed to every runner: {run_line}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            run_line.contains("--host unix:///var/run/docker.sock"),
+            "Linux host docker invocations must explicitly pass canonical socket: {run_line}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn explicit_docker_host_override_is_emitted_on_runner_start() {
+        let _env = TestEnv::new("explicit_docker_host_override");
+        cpu_probe_overrides::set(Some(true));
+        std::env::set_var("DOCKER_HOST_OVERRIDE", "unix:///run/ezgha-selected-vm.sock");
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-explicit-docker-host-test-{}",
+            std::process::id()
+        ));
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect("start_one should use the explicitly selected Docker endpoint");
+
+        let run_content = std::fs::read_to_string(&capture).unwrap();
+        let run_line = run_content
+            .lines()
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains("--host unix:///run/ezgha-selected-vm.sock"),
+            "explicit Docker endpoint must be preserved for runner mutation: {run_line}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_refuses_start_when_profile_mismatches_or_uncontained() {
+        let _env = TestEnv::new("host_containment_refuses_start");
+        cpu_probe_overrides::set(Some(true));
+
+        // Count != 10 on Linux must fail containment check before slot allocation
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err("start_one must fail closed when Linux runner count is not exactly 10");
+        assert!(
+            err.to_string().contains("host containment")
+                || err.to_string().contains("count must be exactly 10"),
+            "expected host containment failure; got: {err:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_verifies_pid_ancestry_under_actions_slice() {
+        let _env = TestEnv::new("host_containment_ancestry");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(10, "ez-org-runner");
+        cfg.limits.memory_mb = 2500;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+
+        let temp_dir = env::temp_dir().join(format!("ezgha-ancestry-test-{}", std::process::id()));
+        write_actions_slice_fixture(&temp_dir);
+        *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(temp_dir.clone());
+        let capture = temp_dir.join("docker-args.log");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let script = temp_dir.join("docker");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\ncase \" $* \" in *\" run \"*) echo bad_ancestry_cid;; esac\nexit 0\n",
+                capture.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        // When container PID is not beneath /actions.slice, start_one must fail and clean up slot
+        let err = start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 4444))
+        })
+        .expect_err(
+            "start_one must fail closed when container ancestry is not beneath /actions.slice",
+        );
+        assert!(
+            err.to_string().contains("actions.slice") || err.to_string().contains("ancestry"),
+            "expected ancestry failure; got: {err:#}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_actions_slice_fixture(root: &Path) {
+        let slice = root.join("actions.slice");
+        std::fs::create_dir_all(&slice).unwrap();
+        std::fs::write(slice.join("memory.high"), "27917287424\n").unwrap();
+        std::fs::write(slice.join("memory.max"), "30064771072\n").unwrap();
+        std::fs::write(slice.join("memory.swap.max"), "0\n").unwrap();
+        std::fs::write(slice.join("pids.max"), "6000\n").unwrap();
+        std::fs::write(slice.join("cpu.max"), "2000000 100000\n").unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_requires_exact_live_actions_slice_limits() {
+        let _env = TestEnv::new("host_containment_live_slice");
+        let root = env::temp_dir().join(format!(
+            "ezgha-host-containment-cgroup-{}",
+            std::process::id()
+        ));
+        write_actions_slice_fixture(&root);
+
+        validate_host_actions_slice(&root)
+            .expect("the exact finite HostDocker actions.slice boundary must pass admission");
+
+        std::fs::write(root.join("actions.slice/memory.high"), "max\n").unwrap();
+        let err = validate_host_actions_slice(&root)
+            .expect_err("an unbounded memory.high must fail HostDocker admission");
+        assert!(
+            err.to_string().contains("memory.high"),
+            "expected memory.high mismatch; got: {err:#}"
+        );
+        write_actions_slice_fixture(&root);
+        std::fs::remove_file(root.join("actions.slice/pids.max")).unwrap();
+        let err = validate_host_actions_slice(&root)
+            .expect_err("a missing tracked cgroup file must fail HostDocker admission");
+        assert!(
+            err.to_string().contains("pids.max"),
+            "expected the missing pids.max error; got: {err:#}"
+        );
+        write_actions_slice_fixture(&root);
+        std::fs::write(root.join("actions.slice/cpu.max"), "max 100000\n").unwrap();
+        let err = validate_host_actions_slice(&root)
+            .expect_err("a malformed or unlimited cpu.max must fail HostDocker admission");
+        assert!(
+            err.to_string().contains("cpu.max"),
+            "expected cpu.max mismatch; got: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_rejects_missing_or_non_descendant_cgroup_paths() {
+        let _env = TestEnv::new("host_containment_cgroup_path");
+        assert!(
+            !is_actions_slice_descendant("0::/actions.slice"),
+            "the slice itself is not a runner scope"
+        );
+        assert!(
+            !is_actions_slice_descendant("0::/other.slice/actions.slice/runner.scope"),
+            "a substring match outside the actions slice must not pass"
+        );
+        assert!(
+            is_actions_slice_descendant("0::/actions.slice/docker-abc.scope"),
+            "a direct actions.slice descendant must pass"
+        );
+        assert!(
+            parse_container_pid_for_ancestry("runner", "0\n").is_err(),
+            "PID zero must fail closed"
+        );
+        assert!(
+            parse_container_pid_for_ancestry("runner", "not-a-pid\n").is_err(),
+            "an unreadable inspect value must fail closed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_backed_docker_skips_host_pid_ancestry_probe() {
+        let _env = TestEnv::new("host_containment_vm_ancestry");
+        *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
+        *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = Some(false);
+
+        require_container_actions_ancestry("guest-container")
+            .expect("guest PID ancestry must not be read through the host /proc");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_requires_neutral_user_manager_oom_policy() {
+        let _env = TestEnv::new("host_containment_user_manager_oom");
+        validate_user_manager_oom_properties(
+            "ManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\nManagedOOMPreference=none\nOOMScoreAdjust=0\n",
+        )
+        .expect("the neutral user manager OOM policy must pass containment admission");
+
+        let err = validate_user_manager_oom_properties(
+            "ManagedOOMMemoryPressure=kill\nManagedOOMSwap=auto\nManagedOOMPreference=none\nOOMScoreAdjust=0\n",
+        )
+        .expect_err("a user manager pressure-kill policy must fail containment admission");
+        assert!(
+            err.to_string().contains("ManagedOOMMemoryPressure"),
+            "expected the pressure policy mismatch; got: {err:#}"
         );
     }
 
@@ -5198,7 +8287,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             !run_line.contains("/opt/wheelhouse"),
@@ -5228,7 +8317,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         let expected_runner_workspace = workspace_root.join("ez-org-runner-1");
         assert!(
@@ -5279,7 +8368,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         for shadowed in ["_actions", "_temp", "_tool"] {
             let expected = format!("--tmpfs /home/runner/_work/{shadowed}:exec");
@@ -5332,7 +8421,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             run_line.contains("-e EZGHA_VIRTIOFS_WORKSPACE=1"),
@@ -5367,7 +8456,7 @@ minimum_isolation = "container"
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
-            .find(|l| l.starts_with("run "))
+            .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
         assert!(
             !run_line.contains("/home/runner/_work"),
@@ -5453,9 +8542,8 @@ minimum_isolation = "container"
     fn release_stale_slots_releases_slot_when_runner_id_not_in_live_but_container_exists_past_grace(
     ) {
         // Mirrors the keep test above but with the slot's `registered_at`
-        // backdated past REGISTRATION_GRACE_WINDOW. The original
-        // keep-forever behavior is the bug; the new contract is "keep
-        // within the grace window, force-reclaim after".
+        // backdated past REGISTRATION_GRACE_WINDOW. A proven idle listener is
+        // safe to recycle because its GitHub registration no longer exists.
         let _env = TestEnv::new("stale_running_container_past_grace");
         let cfg = cfg_with(2, "ez-org-runner");
         let _slot = next_slot(&cfg).unwrap();
@@ -5470,11 +8558,12 @@ minimum_isolation = "container"
 
         let live = vec![runner_info(9999, "ez-org-runner-2")];
         let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
-        let reclaimed = release_stale_slots_from_with_containers(
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
             &read_slot_assignments().unwrap(),
             &live,
             &cfg.runner.name_prefix,
             Some(&local_names),
+            |_| LocalRunnerActivity::Idle,
         )
         .unwrap();
 
@@ -5486,6 +8575,127 @@ minimum_isolation = "container"
         assert!(
             !assignments.assignments.contains_key("1"),
             "slot 1 should be released (assignments row deleted)"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_busy_local_runner_when_gh_snapshot_omits_it_past_grace() {
+        let _env = TestEnv::new("stale_busy_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Busy,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "a local Runner.Worker must not be reclaimed from a single missing-GitHub snapshot"
+        );
+        assert_eq!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .get("1")
+                .map(String::as_str),
+            Some("4242"),
+            "the busy slot must remain owned until the local job finishes"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_local_runner_when_activity_probe_is_unknown() {
+        let _env = TestEnv::new("stale_unknown_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Unknown,
+        )
+        .unwrap();
+
+        assert_eq!(reclaimed, 0, "an inconclusive local probe must fail safe");
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "the slot must remain owned when local activity is unknown"
+        );
+    }
+
+    /// Bead jleechan-95jk root-cause: a slot whose local container is GONE
+    /// (docker top: "No such container") past the grace window must reclaim,
+    /// NOT stay fail-safe Unknown. The 2026-10-03 throughput doc evidences
+    /// this on Linux journal: "keeping slot 3 because docker top says No
+    /// such container despite snapshot omission". `LocalRunnerActivity::Absent`
+    /// is the new fourth state (alongside Busy/Idle/Unknown) that tells
+    /// `release_stale_slots` the container is definitively gone and the
+    /// slot can be released.
+    #[test]
+    fn release_stale_slots_reclaims_when_local_container_is_absent() {
+        let _env = TestEnv::new("stale_absent_container_past_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // The container name is reported as locally-known (consistent with
+        // a recent snapshot taken before it died), but the activity probe
+        // returns Absent because docker top says "No such container".
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &live,
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "a slot whose local container is gone (Absent) past the grace window must reclaim"
+        );
+        assert!(
+            !read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "slot 1 must be released when the local container has been confirmed gone"
         );
     }
 
@@ -5906,6 +9116,7 @@ minimum_isolation = "container"
     #[test]
     fn disk_measure_strike_counter_bails_after_threshold() {
         use std::sync::atomic::Ordering;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Reset before and after to be hermetic.
         CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
         // First miss is tolerated (warn, no bail).
@@ -5927,6 +9138,7 @@ minimum_isolation = "container"
     #[test]
     fn disk_measure_strike_counter_resets_on_success() {
         use std::sync::atomic::Ordering;
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         CONSECUTIVE_DISK_NONE.store(0, Ordering::SeqCst);
         // Drive a miss then a "Some" (modeled as the reset the production path
         // performs after a successful read).
@@ -7075,6 +10287,326 @@ minimum_isolation = "container"
             assert!(
                 err.contains("PSE hysteresis: pressure rising 5 consecutive ticks"),
                 "refusal message must cite hysteresis, got: {err}"
+            );
+        }
+    }
+
+    /// Bead ez-gh-actions-u3c5: the admission gate reads the runner
+    /// aggregate cgroup on the Linux host-docker backend and only counts its
+    /// PSI while that cgroup is within 10% of its own `memory.high`.
+    mod admission_pressure_source_tests {
+        use super::*;
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const RUNNER_BYTES: u64 = 2500 * 1024 * 1024;
+        const RESERVE_BYTES: u64 = 8 * GIB;
+        const HIGH: u64 = 26 * GIB;
+
+        fn cgroup_dir(label: &str, psi: f64, current: Option<u64>, high: Option<&str>) -> PathBuf {
+            let dir = tmp_path(label).with_file_name("cg");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("memory.pressure"),
+                format!(
+                    "some avg10={psi:.2} avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                ),
+            )
+            .unwrap();
+            if let Some(current) = current {
+                std::fs::write(dir.join("memory.current"), format!("{current}\n")).unwrap();
+            }
+            if let Some(high) = high {
+                std::fs::write(dir.join("memory.high"), format!("{high}\n")).unwrap();
+            }
+            dir
+        }
+
+        fn decide(dir: &Path, window: &mut [Option<f64>; 5]) -> Result<(), String> {
+            let source = PressureSource::runner_cgroup(dir);
+            let (pct, available) = read_admission_pressure(&source, &|| Some(36 * GIB)).unwrap();
+            eval_admission(pct, available, RUNNER_BYTES, RESERVE_BYTES, window)
+        }
+
+        #[test]
+        fn a_sibling_slice_pressure_does_not_pause_when_runner_cgroup_is_calm() {
+            // user.slice-style sibling at 70% must be irrelevant: the runner
+            // cgroup itself reads 0 even though it sits near its high.
+            let user_slice = cgroup_dir("u3c5_a_user", 70.0, None, None);
+            let legacy =
+                memory_pressure_pct_from(&user_slice.join("memory.pressure"), &|| Some(36 * GIB))
+                    .unwrap();
+            assert_eq!(legacy.0, 70.0, "fixture: sibling pressure is 70%");
+            let runner = cgroup_dir(
+                "u3c5_a_runner",
+                0.0,
+                Some(HIGH / 100 * 95),
+                Some(&HIGH.to_string()),
+            );
+            let mut window = [None; 5];
+            assert_eq!(decide(&runner, &mut window), Ok(()));
+        }
+
+        #[test]
+        fn b_runner_cgroup_pressure_below_ninety_pct_of_high_admits() {
+            let runner = cgroup_dir(
+                "u3c5_b",
+                70.0,
+                Some(HIGH / 100 * 40),
+                Some(&HIGH.to_string()),
+            );
+            let mut window = [None; 5];
+            assert_eq!(decide(&runner, &mut window), Ok(()));
+        }
+
+        #[test]
+        fn c_runner_cgroup_pressure_at_ninety_pct_of_high_refuses() {
+            let runner = cgroup_dir(
+                "u3c5_c",
+                70.0,
+                Some((HIGH * 9).div_ceil(10)),
+                Some(&HIGH.to_string()),
+            );
+            let mut window = [None; 5];
+            let err = decide(&runner, &mut window).unwrap_err();
+            assert!(err.contains("70.0% > 50%"), "got: {err}");
+        }
+
+        #[test]
+        fn f_rising_window_below_ninety_pct_of_high_admits_every_tick() {
+            let mut window = [None; 5];
+            for (tick, psi) in [10.0, 20.0, 30.0, 40.0, 49.0].into_iter().enumerate() {
+                let runner = cgroup_dir(
+                    &format!("u3c5_f_{tick}"),
+                    psi,
+                    Some(HIGH / 100 * 40),
+                    Some(&HIGH.to_string()),
+                );
+                assert_eq!(
+                    decide(&runner, &mut window),
+                    Ok(()),
+                    "tick {tick} psi {psi}"
+                );
+            }
+        }
+
+        #[test]
+        fn g_unreadable_runner_cgroup_files_are_probe_errors() {
+            let no_high = cgroup_dir("u3c5_g_high", 70.0, Some(HIGH / 100 * 95), None);
+            let err = read_admission_pressure(&PressureSource::runner_cgroup(&no_high), &|| {
+                Some(36 * GIB)
+            })
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("memory.high"), "got: {err:#}");
+            let missing = tmp_path("u3c5_g_psi").with_file_name("absent-cgroup");
+            let err = read_admission_pressure(&PressureSource::runner_cgroup(&missing), &|| {
+                Some(36 * GIB)
+            })
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("memory.pressure"),
+                "got: {err:#}"
+            );
+        }
+
+        #[test]
+        fn describe_names_runner_cgroup_and_fallback_sources() {
+            assert_eq!(
+                PressureSource::runner_cgroup(Path::new("/sys/fs/cgroup/actions.slice")).describe(),
+                "admission pressure source: /sys/fs/cgroup/actions.slice/memory.pressure high=/sys/fs/cgroup/actions.slice/memory.high (host-docker)"
+            );
+            assert_eq!(
+                PressureSource::fallback().describe(),
+                "admission pressure source: /sys/fs/cgroup/user.slice/memory.pressure high=none (fallback)"
+            );
+        }
+
+        #[test]
+        fn e_headroom_alert_fires_once_per_pause_episode() {
+            let start = Instant::now();
+            let mut episode = None;
+            let at = |secs: u64| start + Duration::from_secs(secs);
+            assert!(!admission_pause_alert_due(&mut episode, at(0), true, true));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(599),
+                true,
+                true
+            ));
+            assert!(admission_pause_alert_due(&mut episode, at(600), true, true));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(660),
+                true,
+                true
+            ));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(3600),
+                true,
+                true
+            ));
+            // Admission resumes: the episode ends and a new one re-arms.
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(3660),
+                false,
+                true
+            ));
+            assert!(!admission_pause_alert_due(
+                &mut episode,
+                at(3700),
+                true,
+                true
+            ));
+            assert!(admission_pause_alert_due(
+                &mut episode,
+                at(4300),
+                true,
+                true
+            ));
+            // No headroom: a long pause is the gate doing its job, no alert.
+            let mut tight = None;
+            assert!(!admission_pause_alert_due(&mut tight, at(0), true, false));
+            assert!(!admission_pause_alert_due(
+                &mut tight,
+                at(1200),
+                true,
+                false
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn d_source_selection_uses_runner_cgroup_only_on_host_docker() {
+            let env = TestEnv::new("u3c5_d");
+            let root = env.path.with_file_name("cgroot");
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root.clone());
+            let mut cfg = cfg_with(10, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            assert_eq!(
+                admission_pressure_source(&cfg).describe(),
+                format!(
+                    "admission pressure source: {0}/actions.slice/memory.pressure high={0}/actions.slice/memory.high (host-docker)",
+                    root.display()
+                )
+            );
+
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
+            assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(true);
+            assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            cfg.limits.cgroup_parent = None;
+            assert_eq!(admission_pressure_source(&cfg), PressureSource::fallback());
+        }
+
+        #[test]
+        fn i_source_change_resets_hysteresis_window() {
+            let _env = TestEnv::new("u3c5_i_switch");
+            let rising = [Some(10.0), Some(20.0), Some(30.0), Some(40.0), None];
+            *LAST_PRESSURE_SOURCE.lock().unwrap() = Some(PressureSource::fallback().describe());
+            *PRESSURE_WINDOW.lock().unwrap() = rising;
+            let runner = PressureSource::runner_cgroup(Path::new("/sys/fs/cgroup/actions.slice"));
+
+            log_pressure_source_change(&runner);
+            assert_eq!(
+                *PRESSURE_WINDOW.lock().unwrap(),
+                [None; 5],
+                "fallback samples must not feed runner-cgroup hysteresis"
+            );
+
+            // Same source again: the window is left alone.
+            *PRESSURE_WINDOW.lock().unwrap() = rising;
+            log_pressure_source_change(&runner);
+            assert_eq!(*PRESSURE_WINDOW.lock().unwrap(), rising);
+            *PRESSURE_WINDOW.lock().unwrap() = [None; 5];
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn h_full_fleet_tick_logs_source_and_ends_pause_episode() {
+            let env = TestEnv::new("u3c5_h_full");
+            let root = env.path.with_file_name("cgroot");
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root.clone());
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            let mut cfg = cfg_with(2, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![
+                managed_container("ez-runner-c-1"),
+                managed_container("ez-runner-c-2"),
+            ]);
+            *LAST_PRESSURE_SOURCE.lock().unwrap() = None;
+            *ADMISSION_PAUSE_EPISODE.lock().unwrap() = Some(AdmissionPauseEpisode {
+                since: Instant::now(),
+                alerted: false,
+            });
+
+            let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+            assert_eq!(outcome.missing, 0);
+            assert_eq!(
+                LAST_PRESSURE_SOURCE.lock().unwrap().clone(),
+                Some(format!(
+                    "admission pressure source: {0}/actions.slice/memory.pressure high={0}/actions.slice/memory.high (host-docker)",
+                    root.display()
+                ))
+            );
+            assert!(
+                ADMISSION_PAUSE_EPISODE.lock().unwrap().is_none(),
+                "a full fleet is not paused; the episode must end"
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn g_unreadable_runner_memory_high_fails_closed_with_host_reserve() {
+            let env = TestEnv::new("u3c5_g_closed");
+            let root = env.path.with_file_name("cgroot");
+            let slice = root.join("actions.slice");
+            std::fs::create_dir_all(&slice).unwrap();
+            std::fs::write(
+                slice.join("memory.pressure"),
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+            )
+            .unwrap();
+            std::fs::write(slice.join("memory.current"), "1000\n").unwrap();
+            // memory.high deliberately absent.
+            *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(root);
+            *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
+            *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+            *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+            let mut cfg = cfg_with(1, "ez-runner-c");
+            cfg.limits.cgroup_parent = Some("actions.slice".into());
+            cfg.runner.host_reserve_mb = 8192;
+            *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+            *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+            *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(Vec::new());
+            *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-runner-c-1".into()]);
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+                [Ok(ReadinessSummary {
+                    ready: 1,
+                    absent: vec![],
+                })]
+                .into(),
+            );
+
+            let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+
+            assert!(outcome.started.is_empty(), "must not start: {outcome:?}");
+            let reason = outcome
+                .admission_paused_reason
+                .expect("admission must pause");
+            assert!(
+                reason.contains("host-reserve admission probe failed")
+                    && reason.contains("memory.high"),
+                "got: {reason}"
             );
         }
     }

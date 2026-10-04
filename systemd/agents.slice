@@ -1,41 +1,22 @@
 # agents.slice — user-scope memory ceiling for interactive agent CLI processes
 # (claude/codex/cursor/gemini/etc) and their MCP descendants. Orchestration
-# daemons use the separate automation.slice. Part of bead ez-gh-actions-0725.
+# daemons use the separate automation.slice.
 #
-# HOW A PROCESS JOINS THIS SLICE:
-#   install.sh replaces installed agent CLI entry points with reversible
-#   wrappers. Each future CLI launch delegates to agent-scoped-launch.sh,
-#   which creates a named transient scope under agents.slice. Existing live
-#   sessions are not killed or relaunched during installation. The explicit
-#   escape hatch is AGENT_SLICE_OPT_OUT=1 for a single launch.
+# Measured margin: 8.10 GiB current use, 17.14 GiB historical peak.
+# MemoryHigh=18G, MemoryMax=20G provides measured margin above 17.14 GiB peak
+# while capping rogue agent spikes.
 #
-# WHY FINITE HIGH/MAX: MemoryHigh begins reclaim and throttling at the
-# measured margin; MemoryMax is a final finite containment boundary. Together
-# they bound both gradual pressure and runaway descendants without relying on
-# an unbounded user-scope cgroup. The launcher keeps MCP descendants in this
-# same scope so the aggregate budget remains enforceable.
-#
-# BLAST RADIUS / NORMAL PEAK / SAFE MARGIN (required by repo CLAUDE.md
-# "Safety & Monitoring Principles" for any new threshold):
-#   - Measured normal peak for this slice was 7.4 GiB (p95, 25-29 CLI
-#     processes) in the July incident sample. MemoryHigh=10G leaves a
-#     measured margin of 2.6 GiB before reclaim; MemoryMax=12G leaves 4.6 GiB
-#     beyond that peak for accounting variance. Swap and task ceilings are
-#     finite as well, so a runaway cannot page or fork without bound.
-#   - This ceiling applies only to processes launched through the installed
-#     wrappers into this slice; it has zero effect on the
-#     ezgha daemon, the Colima VM, or any process not opted in.
-#
-# Static syntax validation only (no live start/enable performed by this
-# commit): `systemd-analyze verify systemd/agents.slice`
+# Static syntax validation only: `systemd-analyze verify systemd/agents.slice`
 
 [Unit]
 Description=Interactive agent CLI processes (claude/codex/cursor/etc) — finite memory budget
 Before=slices.target
 
 [Slice]
-MemoryHigh=10G
-MemoryMax=12G
+MemoryHigh=18G
+MemoryMax=20G
 MemorySwapMax=2G
 TasksMax=8192
 MemoryAccounting=yes
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto

@@ -13,6 +13,9 @@
 # 34 GiB was measured against a 31.8 GiB normal QEMU RSS peak, leaving a
 # measured margin of 2.2 GiB before reclaim. MemoryMax=38G is 6.2 GiB above that peak;
 # the finite swap/task ceilings bound transient accounting and fork growth.
+# CPUQuota=1600% (16 CPUs) on a 32-thread host. Live watchdog max-load-1 is 96
+# (historical 24 is stale). This caps runnable QEMU time; D-state still counts
+# toward loadavg.
 #
 # Installation (no sudo, user-scope):
 #   cp systemd/app-lima-vm.slice ~/.config/systemd/user/
@@ -32,3 +35,5 @@ MemoryMax=38G
 MemorySwapMax=2G
 TasksMax=4096
 MemoryAccounting=yes
+CPUAccounting=yes
+CPUQuota=1600%

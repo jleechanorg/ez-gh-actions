@@ -76,6 +76,7 @@ HOME_T="${WORK}/home"
 mkdir -p "${HOME_T}/.config/systemd/user" "${HOME_T}/.local/libexec/ezgha"
 
 for unit in ezgha.service \
+            lima-vm-cpu-ceiling.service \
             ezgha-token-refresh.service ezgha-token-refresh.timer \
             ezgha-queue-reaper.service ezgha-queue-reaper.timer \
             ezgha-watchdog.service ezgha-watchdog.timer \
@@ -123,6 +124,18 @@ if [ -f "${HOME_T}/.config/systemd/user/ezgha.service" ]; then
   fail "main ezgha.service unit file survived uninstall"
 else
   echo "PASS: main ezgha.service unit file removed"
+fi
+
+if grep -q "disable --now lima-vm-cpu-ceiling.service" "${SYSTEMCTL_LOG}"; then
+  echo "PASS: uninstall disabled lima-vm-cpu-ceiling.service"
+else
+  fail "uninstall did NOT disable lima-vm-cpu-ceiling.service"
+fi
+
+if [ -f "${HOME_T}/.config/systemd/user/lima-vm-cpu-ceiling.service" ]; then
+  fail "lima-vm-cpu-ceiling.service survived uninstall"
+else
+  echo "PASS: lima-vm-cpu-ceiling.service removed"
 fi
 
 if [ -d "${HOME_T}/.local/libexec/ezgha" ]; then

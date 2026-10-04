@@ -21,6 +21,21 @@ jobs:
         run: cargo build --all-targets
       - name: Test
         run: cargo test
+      - name: Layer-2 failure-ladder real-binary regression test
+        run: bash tests/ezgha_start_failure_ladder_layer2_test.sh
+      - name: Stop/serve state-lock real-binary regression test
+        run: bash tests/ezgha_stop_serve_lock_test.sh
+      - name: Layer-2 serve-loop failure-ladder regression test
+        env:
+          EZGHA_SERVE_LAYER2_ARTIFACT_DIR: ${{ runner.temp }}/ezgha-serve-layer2
+        run: bash tests/ezgha_serve_failure_ladder_layer2_test.sh "$EZGHA_SERVE_LAYER2_ARTIFACT_DIR"
+      - name: Upload Layer-2 serve-loop diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ezgha-serve-layer2-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ezgha-serve-layer2
+          if-no-files-found: error
       - name: Runner dashboard contract tests
         run: |
           python3 -m unittest tests/runner_dashboard_snapshot_test.py
@@ -28,7 +43,6 @@ jobs:
           bash tests/runner_dashboard_host_probe_test.sh
           bash tests/runner_dashboard_publisher_test.sh
           bash tests/runner_dashboard_launchd_install_test.sh
-          bash tests/watchdog_reboot_stale_state_test.sh
           bash tests/install_watchdog_gate_test.sh
           bash tests/install_uninstall_aux_units_test.sh
       - name: Mac trim guard shell regressions
@@ -41,14 +55,24 @@ jobs:
           bash tests/cleanup_stuck_runs_multirepo_test.sh
           bash tests/cleanup_stuck_runs_race_skip_test.sh
           bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
+      - name: Exit criteria CPU burst regressions
+        run: |
+          bash tests/verify_exit_gate3_cpu_burst_test.sh
+          bash tests/verify_exit_gate3_burst_preflight_test.sh
+          bash tests/verify_exit_toml_parser_integration_test.sh
       - name: Doctor-runner regression tests
         run: |
           bash tests/doctor_runner_expected_containers_test.sh
           bash tests/doctor_runner_heartbeat_starvation_test.sh
           bash tests/doctor_runner_host_pressure_test.sh
+          bash tests/doctor_runner_host_lifecycle_test.sh
+          bash tests/doctor_runner_idle_resample_test.sh
           bash tests/doctor_runner_live_slot_gate_test.sh
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
+          bash tests/doctor_runner_remote_config_and_queue_test.sh
+          bash tests/doctor_runner_unreachable_remote_test.sh
+          bash tests/doctor_runner_verdict_line_test.sh
       - name: Slot-drift reclaim correlation regression test (bead jleechan-tv58)
         # Hermetic test (no Docker daemon, no GitHub auth required). Runs
         # the production `release_stale_slots_from_with_containers` path
@@ -65,11 +89,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Host-ops, GitHub App token, and PR-payload regression tests
         run: |
+          bash tests/host_crash_containment_release1_artifacts_test.sh
+          bash tests/assert_host_containment_release1_test.sh
+          bash tests/apply_host_containment_release1_test.sh
+          bash tests/install_host_containment_test.sh
           bash tests/host_ops_0725_test.sh
+          bash tests/host_control_artifacts_test.sh
+          bash tests/forbid_host_reboot_primitives_test.sh
+          bash tests/assert_qemu_cpu_ceiling_test.sh
           bash tests/integrate_pr_payload_regression_test.sh
           bash tests/launchd_docker_host_consumers_test.sh
           bash tests/refresh_gh_app_token_timeout_test.sh
           bash tests/verify_other_error_report.sh
+          bash tests/verify_exit_gate0_test.sh
+          bash tests/verify_exit_gate8_test.sh
       - name: Install Python test-only dependencies
         run: pip install -r tests/requirements.txt
       - name: Mint-token and job-outcome-monitor Python regression tests

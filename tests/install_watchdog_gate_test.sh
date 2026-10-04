@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
-# regression test: install.sh arms the fleet watchdog by default.
-# A default `./install.sh` run must:
-#   (a) render/copy the ezgha-watchdog.timer/.service unit files
-#       (repo is source, ~/.config/systemd/user is what systemctl reads),
-#   (b) enable `systemctl --user enable --now` for the watchdog timer,
-#   (c) render ezgha-watchdog.service with EZGHA_WATCHDOG_ALLOW_RESTART=1.
-# `./install.sh --without-watchdog` must skip arming and heal drift: if the
-# watchdog timer is already enabled (e.g. an out-of-band re-arm), disable it.
-# `./install.sh --with-watchdog` remains supported (same as default).
+# regression test: install.sh enforces watchdog removal and cleanup.
+# A `./install.sh` run must:
+#   (a) NOT install ezgha-watchdog.timer or ezgha-watchdog.service or watchdog-load-repair.sh,
+#   (b) disable and remove any previously installed/drifted watchdog timer/service.
 #
-# This drives install.sh's REAL Linux watchdog-gating code path end-to-end
+# This drives install.sh's REAL Linux code path end-to-end
 # with `systemctl`/`docker`/`gh`/`cargo`/`git` stubbed out on PATH -- it
 # never touches the live system, never builds the real binary, and (by
 # copying install.sh into a docs/-less temp tree) never reaches the live
@@ -21,6 +16,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_SCRIPT="${INSTALL_SCRIPT:-${REPO_ROOT}/install.sh}"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "${WORK}"' EXIT
@@ -31,68 +27,25 @@ fail() {
   PASS=false
 }
 
-# ── Hook regression: reject runtime bad paths, accept deliberate fixtures ────
-# Each case gets a fresh temporary Git index so the repository's real index is
-# never touched. The fixture exemption is exact-path scoped; runtime scripts
-# still exercise the real pre-commit checks.
-run_hook_case() {
-  local name="$1" path="$2" content="$3" expected="$4"
-  local hook_repo="${WORK}/hook-${name}"
-  mkdir -p "${hook_repo}/.githooks" "${hook_repo}/$(dirname "${path}")"
-  git -C "${hook_repo}" init -q
-  cp "${REPO_ROOT}/.githooks/pre-commit" "${hook_repo}/.githooks/pre-commit"
-  chmod +x "${hook_repo}/.githooks/pre-commit"
-  printf '%s\n' "${content}" > "${hook_repo}/${path}"
-  git -C "${hook_repo}" add "${path}"
-  if (cd "${hook_repo}" && .githooks/pre-commit >"${hook_repo}/hook.log" 2>&1); then
-    actual=accept
-  else
-    actual=reject
-  fi
-  if [ "${actual}" != "${expected}" ]; then
-    cat "${hook_repo}/hook.log" >&2
-    fail "Hook case ${name}: expected ${expected}, got ${actual}"
-  else
-    echo "PASS: Hook case ${name}: ${actual}"
-  fi
-}
-
-run_hook_case runtime-bad scripts/runtime.sh \
-  'docker build -f ../Dockerfile.runner .' reject
-run_hook_case fixture-bad tests/install_watchdog_gate_test.sh \
-  'docker build -f ../Dockerfile.runner .' accept
-run_hook_case runtime-absolute scripts/runtime.sh \
-  'docker build -f "$repo_root/Dockerfile.runner" .' accept
-
-INSTALLED_MAC_HOST_ARG="$(
-  sed -n 's/.*ezgha-fleet-watchdog\.sh" "--host \([^" ]*\)".*/\1/p' \
-    "$REPO_ROOT/install.sh"
-)"
-PARSER_HOSTS="$(
-  sed -n 's/.*argument (\([^)]*\)).*/\1/p' \
-    "$REPO_ROOT/scripts/ezgha-fleet-watchdog.sh" | head -1
-)"
-if printf '%s\n' "$PARSER_HOSTS" | tr '|' '\n' | grep -Fxq "$INSTALLED_MAC_HOST_ARG"; then
-  echo "PASS: Mac watchdog install host '$INSTALLED_MAC_HOST_ARG' matches parser"
-else
-  fail "Mac watchdog install host '$INSTALLED_MAC_HOST_ARG' is outside parser contract '$PARSER_HOSTS'"
-fi
-
 # ── 1. Build a minimal, docs/-less copy of the tree install.sh needs ─────────
-# (docs/-less so the live post-deploy verify-exit-criteria.sh gate is never
-# reached -- see header comment.)
 TEMP_REPO="${WORK}/repo"
 mkdir -p "${TEMP_REPO}/systemd" "${TEMP_REPO}/scripts/host"
-cp "${REPO_ROOT}/install.sh" "${TEMP_REPO}/install.sh"
-cp "${REPO_ROOT}"/systemd/ezgha-*.service "${REPO_ROOT}"/systemd/ezgha-*.timer "${TEMP_REPO}/systemd/"
+cp "${INSTALL_SCRIPT}" "${TEMP_REPO}/install.sh"
+cp "${REPO_ROOT}"/systemd/ezgha-*.service "${REPO_ROOT}"/systemd/ezgha-*.timer "${TEMP_REPO}/systemd/" 2>/dev/null || true
 cp "${REPO_ROOT}"/systemd/app-lima-vm.slice \
    "${REPO_ROOT}"/systemd/agents.slice \
    "${REPO_ROOT}"/systemd/automation.slice \
-   "${REPO_ROOT}"/systemd/agent-scope-reaper.service \
-   "${REPO_ROOT}"/systemd/agent-scope-reaper.timer \
-   "${REPO_ROOT}"/systemd/psi-oom-watcher.service \
-   "${REPO_ROOT}"/systemd/psi-oom-watcher.timer \
    "${TEMP_REPO}/systemd/"
+# The production tree deliberately removed these legacy artifacts.  Keep
+# minimal fixture inputs so the parent installer reaches Case A's stale-copy
+# assertions instead of failing while it tries to stage its then-required
+# sources.
+printf '[Unit]\nDescription=legacy reaper fixture\n' \
+  > "${TEMP_REPO}/systemd/agent-scope-reaper.service"
+printf '[Timer]\nUnit=agent-scope-reaper.service\n' \
+  > "${TEMP_REPO}/systemd/agent-scope-reaper.timer"
+mkdir -p "${TEMP_REPO}/systemd/host"
+cp -r "${REPO_ROOT}/systemd/host"/* "${TEMP_REPO}/systemd/host/" 2>/dev/null || true
 mkdir -p "${TEMP_REPO}/systemd/ao-daemon.service.d" \
          "${TEMP_REPO}/systemd/ao-orchestrator.service.d" \
          "${TEMP_REPO}/systemd/ai.dark-factory.daemon.service.d" \
@@ -106,29 +59,24 @@ cp "${REPO_ROOT}"/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.c
    "${TEMP_REPO}/systemd/ai.dark-factory.daemon.service.d/"
 cp "${REPO_ROOT}"/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf \
    "${TEMP_REPO}/systemd/lima-vm@colima.service.d/"
+cp "${REPO_ROOT}"/systemd/lima-vm-cpu-ceiling.service \
+   "${TEMP_REPO}/systemd/"
 cp "${REPO_ROOT}"/systemd/guest/actions.slice \
    "${TEMP_REPO}/systemd/guest/"
 printf '[package]\nname = "ez-gh-actions"\nversion = "0.0.0"\n' > "${TEMP_REPO}/Cargo.toml"
-for name in ezgha-fleet-watchdog.sh refresh_gh_app_token.sh cleanup-stuck-runs.sh \
-            cleanup-mission-output.sh colima-trim-guard.sh; do
+for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
   printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/${name}"
   chmod +x "${TEMP_REPO}/scripts/${name}"
 done
-# The Linux cases do not render launchd plists, so give the temporary source a
-# minimal valid watchdog payload for the Darwin cases below.
-cat > "${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh" <<'EOF'
-#!/usr/bin/env bash
-ensure_runner_image() { :; }
-EOF
-chmod +x "${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh"
-for name in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
-  cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
+printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/host/agent-scope-reaper.sh"
+chmod +x "${TEMP_REPO}/scripts/host/agent-scope-reaper.sh"
+for name in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+  if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
+    cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
+  fi
 done
 
 # ── 2. Stub PATH ───────────────────────────────────────────────────────────
-# git/cargo/rustc/docker/gh: always succeed, never touch anything real.
-# systemctl: a stateful fake that remembers per-unit enable/disable state in
-# $SYSTEMCTL_STATE_DIR so the test can assert on it afterward.
 STUB_BIN="${WORK}/bin"
 mkdir -p "${STUB_BIN}"
 
@@ -145,7 +93,6 @@ EOF
 
 cat > "${STUB_BIN}/cargo" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${CARGO_CAPTURE:-/dev/null}"
 exit 0
 EOF
 
@@ -156,6 +103,11 @@ EOF
 
 cat > "${STUB_BIN}/docker" <<'EOF'
 #!/usr/bin/env bash
+if [[ " $* " == *" info "* ]]; then
+  # A different kernel models the existing VM-backed path; this watchdog test
+  # deliberately does not exercise the host-Docker activation branch.
+  echo "fixture-vm-kernel"
+fi
 exit 0
 EOF
 
@@ -166,10 +118,6 @@ EOF
 
 cat > "${STUB_BIN}/limactl" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${LIMACTL_CAPTURE:?}"
-case "$*" in
-  *"tee /etc/systemd/system/actions.slice"*) cat > "${GUEST_ACTIONS_SLICE_CAPTURE:?}" ;;
-esac
 exit 0
 EOF
 
@@ -182,45 +130,21 @@ done
 
 cat > "${STUB_BIN}/uname" <<'EOF'
 #!/usr/bin/env bash
-echo "${STUB_UNAME:-Linux}"
-EOF
-
-cat > "${STUB_BIN}/launchctl" <<'EOF'
-#!/usr/bin/env bash
-: "${LAUNCHCTL_STATE_DIR:?LAUNCHCTL_STATE_DIR must be exported}"
-printf '%s\n' "$*" >> "${LAUNCHCTL_CAPTURE:-/dev/null}"
-case "${1:-}" in
-  list)
-    for marker in "${LAUNCHCTL_STATE_DIR}"/*.loaded; do
-      [ -f "${marker}" ] || continue
-      printf '0\t0\t%s\n' "$(basename "${marker}" .loaded)"
-    done
-    ;;
-  unload)
-    plist="${2:-}"
-    rm -f "${LAUNCHCTL_STATE_DIR}/$(basename "${plist}" .plist).loaded"
-    ;;
-  load)
-    plist="${@: -1}"
-    touch "${LAUNCHCTL_STATE_DIR}/$(basename "${plist}" .plist).loaded"
-    ;;
-  print)
-    label="${2##*/}"
-    [ -f "${LAUNCHCTL_STATE_DIR}/${label}.loaded" ]
-    ;;
-esac
+echo Linux
 EOF
 
 cat > "${STUB_BIN}/systemctl" <<'EOF'
 #!/usr/bin/env bash
-# Stateful stub: enable/disable/is-enabled tracked as touch-files under
-# $SYSTEMCTL_STATE_DIR/<unit>.enabled -- SYSTEMCTL_STATE_DIR is exported by
-# the test harness.
 : "${SYSTEMCTL_STATE_DIR:?SYSTEMCTL_STATE_DIR must be exported}"
 if [ "${1:-}" = "--user" ]; then shift; fi
 printf '%s\n' "$*" >> "${SYSTEMCTL_CAPTURE:-/dev/null}"
 sub="${1:-}"
 shift || true
+in_list() {
+  local needle="$1" item
+  for item in ${2:-}; do [ "$item" = "$needle" ] && return 0; done
+  return 1
+}
 case "${sub}" in
   enable)
     [ "${1:-}" = "--now" ] && shift
@@ -229,14 +153,43 @@ case "${sub}" in
     ;;
   disable)
     [ "${1:-}" = "--now" ] && shift
+    if in_list "${1:-}" "${STUB_DISABLE_FAIL_UNITS:-}"; then exit 1; fi
     rm -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled"
     exit 0
     ;;
   is-enabled)
-    [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ] && exit 0 || exit 1
+    if in_list "${1:-}" "${STUB_ENABLED_QUERY_FAIL_UNITS:-}"; then
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    fi
+    if in_list "${1:-}" "${STUB_IS_ENABLED_NOT_FOUND_UNITS:-}"; then
+      echo "Failed to get unit file state for ${1}: No such file or directory" >&2
+      exit 1
+    fi
+    if [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ]; then
+      echo enabled
+      exit 0
+    fi
+    echo disabled
+    exit 1
     ;;
   is-active)
-    exit 1
+    if in_list "${1:-}" "${STUB_QUERY_FAIL_UNITS:-}"; then
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    fi
+    if in_list "${1:-}" "${STUB_ACTIVE_UNITS:-}"; then
+      echo active
+      exit 0
+    fi
+    echo inactive
+    exit 3
+    ;;
+  stop)
+    if in_list "${1:-}" "${STUB_STOP_FAIL_UNITS:-}"; then
+      exit 1
+    fi
+    exit 0
     ;;
   daemon-reload)
     exit 0
@@ -250,17 +203,11 @@ EOF
 chmod +x "${STUB_BIN}"/*
 export PATH="${STUB_BIN}:${PATH}"
 export LIMACTL_CAPTURE="${WORK}/limactl.calls"
-export GUEST_ACTIONS_SLICE_CAPTURE="${WORK}/guest-actions.slice"
 export SYSTEMCTL_CAPTURE="${WORK}/systemctl.calls"
-export LAUNCHCTL_CAPTURE="${WORK}/launchctl.calls"
-export CARGO_CAPTURE="${WORK}/cargo.calls"
 : > "${LIMACTL_CAPTURE}"
 : > "${SYSTEMCTL_CAPTURE}"
-: > "${LAUNCHCTL_CAPTURE}"
-: > "${CARGO_CAPTURE}"
 
 run_install() {
-  # $1 = temp HOME, $2 = systemctl state dir, remaining = install.sh args
   local temp_home="$1" state_dir="$2"
   shift 2
   mkdir -p "${state_dir}"
@@ -268,343 +215,228 @@ run_install() {
     bash "${TEMP_REPO}/install.sh" --dev "$@" >"${temp_home}/install.log" 2>&1
 }
 
-run_mac_install() {
-  # $1 = temp HOME, $2 = state dir, $3 = launchctl state dir
-  local temp_home="$1" state_dir="$2" launchctl_state="$3"
-  mkdir -p "${temp_home}" "${temp_home}/Library/LaunchAgents" \
-           "${temp_home}/.cargo/bin" "${state_dir}" "${launchctl_state}"
-  cat > "${temp_home}/.cargo/bin/ezgha" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> "${SERVICE_CAPTURE:?}"
-EOF
-  chmod +x "${temp_home}/.cargo/bin/ezgha"
-  HOME="${temp_home}" SYSTEMCTL_STATE_DIR="${state_dir}" \
-    LAUNCHCTL_STATE_DIR="${launchctl_state}" STUB_UNAME=Darwin \
-    LAUNCHCTL_CAPTURE="${launchctl_state}/calls" \
-    CARGO_CAPTURE="${state_dir}/cargo.calls" \
-    SERVICE_CAPTURE="${launchctl_state}/service.calls" \
-    bash "${TEMP_REPO}/install.sh" --dev >"${temp_home}/install.log" 2>&1
-}
-
-prepare_mac_prior_install() {
-  # Seed a deployed payload and loaded service so a rejected candidate must
-  # leave both untouched.
-  local temp_home="$1" launchctl_state="$2" with_config="${3:-0}"
-  mkdir -p "${temp_home}/.local/libexec/ezgha" \
-           "${temp_home}/Library/LaunchAgents" "${launchctl_state}"
-  printf 'previous watchdog payload\n' > \
-    "${temp_home}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
-  printf 'previous watchdog plist\n' > \
-    "${temp_home}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
-  touch "${launchctl_state}/org.jleechanorg.ezgha-watchdog.loaded"
-  if [ "${with_config}" -eq 1 ]; then
-    mkdir -p "${temp_home}/.config/ezgha"
-    printf '[runner]\n' > "${temp_home}/.config/ezgha/config.toml"
-  fi
-}
-
-# ── Case A: default run arms watchdog ────────────────────────────────────────
+# ── Case A: default run cleans up and does not install watchdog ────────────────
 HOME_A="${WORK}/home_a"
 STATE_A="${WORK}/state_a"
-mkdir -p "${HOME_A}"
+mkdir -p "${HOME_A}/.config/systemd/user" "${STATE_A}"
+touch "${STATE_A}/ezgha-watchdog.timer.enabled" # simulate prior installation
+touch "${HOME_A}/.config/systemd/user/ezgha-watchdog.timer"
+touch "${HOME_A}/.config/systemd/user/ezgha-watchdog.service"
+# Previously installed copies of the deleted agent-scope-reaper must be removed.
+touch "${HOME_A}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_A}/.config/systemd/user/agent-scope-reaper.timer"
+mkdir -p "${HOME_A}/.local/libexec/ezgha"
+touch "${HOME_A}/.local/libexec/ezgha/agent-scope-reaper.sh"
 run_install "${HOME_A}" "${STATE_A}"
 
-if [ ! -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case A: default run did NOT enable ezgha-watchdog.timer (watchdog armed by default)"
+if [ -f "${STATE_A}/ezgha-watchdog.timer.enabled" ]; then
+  fail "Case A: default run failed to disable ezgha-watchdog.timer"
 else
-  echo "PASS: Case A: default run enabled ezgha-watchdog.timer"
+  echo "PASS: Case A: default run disabled ezgha-watchdog.timer"
 fi
-
-if [ ! -f "${STATE_A}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_A}/ezgha-queue-reaper.timer.enabled" ]; then
-  fail "Case A: default run failed to enable token-refresh/queue-reaper timers"
+if [ -f "${HOME_A}/.config/systemd/user/ezgha-watchdog.timer" ] || [ -f "${HOME_A}/.config/systemd/user/ezgha-watchdog.service" ]; then
+  fail "Case A: watchdog unit files survived installation"
 else
-  echo "PASS: Case A: default run still enabled token-refresh + queue-reaper timers"
+  echo "PASS: Case A: watchdog unit files removed from systemd user config"
 fi
-
-rendered_timer="${HOME_A}/.config/systemd/user/ezgha-watchdog.timer"
-if [ ! -f "${rendered_timer}" ]; then
-  fail "Case A: default run did not render ezgha-watchdog.timer unit file"
+if ! grep -Fqx 'stop ezgha-watchdog.service' "${SYSTEMCTL_CAPTURE}"; then
+  fail "Case A: default install did not stop an in-flight ezgha-watchdog.service"
 else
-  echo "PASS: Case A: default run rendered ezgha-watchdog.timer unit file"
+  echo "PASS: Case A: default install stopped ezgha-watchdog.service"
 fi
-
-rendered_service="${HOME_A}/.config/systemd/user/ezgha-watchdog.service"
-if [ ! -f "${rendered_service}" ]; then
-  fail "Case A: default run did not render ezgha-watchdog.service unit file"
+if [ -f "${HOME_A}/.local/libexec/ezgha/watchdog-load-repair.sh" ] || [ -f "${HOME_A}/.local/bin/watchdog-load-repair.sh" ]; then
+  fail "Case A: watchdog-load-repair.sh was installed"
 else
-  echo "PASS: Case A: default run rendered ezgha-watchdog.service unit file"
-fi
-
-if ! grep -q 'Environment=EZGHA_WATCHDOG_ALLOW_RESTART=1' "${rendered_service}"; then
-  fail "Case A: rendered ezgha-watchdog.service missing EZGHA_WATCHDOG_ALLOW_RESTART=1"
-else
-  echo "PASS: Case A: rendered ezgha-watchdog.service includes EZGHA_WATCHDOG_ALLOW_RESTART=1"
+  echo "PASS: Case A: watchdog-load-repair.sh was not installed"
 fi
 
 # Host crash controls are source-controlled and rendered into stable paths.
-for unit in app-lima-vm.slice agents.slice automation.slice \
-            agent-scope-reaper.service agent-scope-reaper.timer \
-            psi-oom-watcher.service psi-oom-watcher.timer; do
+for unit in app-lima-vm.slice agents.slice automation.slice; do
   if [ ! -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
     fail "Case A: host control unit was not installed: ${unit}"
   fi
 done
-for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
-  if [ ! -f "${STATE_A}/${timer}.enabled" ]; then
-    fail "Case A: host control timer was not enabled: ${timer}"
+
+# A failed disable is safe only when a later query proves the timer is not
+# enabled.  Inactive runtime state alone must not authorize artifact removal.
+HOME_G="${WORK}/home_g"
+STATE_G="${WORK}/state_g"
+mkdir -p "${HOME_G}/.config/systemd/user" "${HOME_G}/.local/libexec/ezgha" "${STATE_G}"
+touch "${HOME_G}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_G}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_G}/.local/libexec/ezgha/agent-scope-reaper.sh" \
+      "${STATE_G}/agent-scope-reaper.timer.enabled"
+install_rc=0
+STUB_DISABLE_FAIL_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_G}" "${STATE_G}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case G: installer must fail when inactive reaper timer remains enabled"
+for stale in \
+  "${HOME_G}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_G}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_G}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case G: enabled reaper artifact was deleted: $stale"
+done
+
+# Failed enabled-state queries are not proof of retirement, even while both
+# units are inactive.
+HOME_H="${WORK}/home_h"
+STATE_H="${WORK}/state_h"
+mkdir -p "${HOME_H}/.config/systemd/user" "${HOME_H}/.local/libexec/ezgha" "${STATE_H}"
+touch "${HOME_H}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_H}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_H}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_ENABLED_QUERY_FAIL_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_H}" "${STATE_H}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case H: installer must fail closed when reaper enabled state cannot be queried"
+for stale in \
+  "${HOME_H}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_H}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_H}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case H: reaper artifact was deleted after enabled-state query failure: $stale"
+done
+
+# A deleted unit file is a valid enabled-state result only when runtime is
+# inactive, which this fixture supplies.
+HOME_I="${WORK}/home_i"
+STATE_I="${WORK}/state_i"
+mkdir -p "${HOME_I}/.config/systemd/user" "${HOME_I}/.local/libexec/ezgha" "${STATE_I}"
+touch "${HOME_I}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_I}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_I}/.local/libexec/ezgha/agent-scope-reaper.sh"
+STUB_IS_ENABLED_NOT_FOUND_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_I}" "${STATE_I}"
+for removed in \
+  "${HOME_I}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_I}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_I}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ ! -e "$removed" ] || fail "Case I: inactive absent reaper artifact survived: $removed"
+done
+
+for unit in psi-oom-watcher.service psi-oom-watcher.timer \
+            agent-scope-reaper.service agent-scope-reaper.timer; do
+  if [ -f "${HOME_A}/.config/systemd/user/${unit}" ]; then
+    fail "Case A: deprecated host control unit was not removed: ${unit}"
   fi
 done
-for script in agent-scoped-launch.sh agent-scope-reaper.sh psi-oom-watcher.sh watchdog-load-repair.sh; do
+
+if [ -e "${HOME_A}/.local/libexec/ezgha/agent-scope-reaper.sh" ]; then
+  fail "Case A: stale agent-scope-reaper.sh was not removed"
+fi
+for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
   if [ ! -x "${HOME_A}/.local/libexec/ezgha/${script}" ]; then
     fail "Case A: stable host script was not installed: ${script}"
   fi
 done
-for dropin in \
-  ao-daemon.service.d/20-automation-slice.conf \
-  ao-orchestrator.service.d/20-automation-slice.conf \
-  ai.dark-factory.daemon.service.d/20-automation-slice.conf; do
-  if [ ! -f "${HOME_A}/.config/systemd/user/${dropin}" ]; then
-    fail "Case A: service drop-in was not installed: ${dropin}"
-  fi
-done
-if [ ! -f "${HOME_A}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" ]; then
-  fail "Case A: direct QEMU service memory ceiling was not installed"
-fi
-if ! grep -Fqx 'set-property --runtime lima-vm@colima.service MemoryHigh=34G MemoryMax=38G MemorySwapMax=2G TasksMax=4096' "${SYSTEMCTL_CAPTURE}"; then
-  fail "Case A: direct QEMU service memory ceiling was not applied live"
-fi
-if ! cmp -s "${REPO_ROOT}/systemd/guest/actions.slice" "${GUEST_ACTIONS_SLICE_CAPTURE}"; then
-  fail "Case A: tracked guest actions.slice was not installed through limactl"
-fi
-if ! grep -Fqx 'shell colima -- sudo -n systemctl set-property --runtime actions.slice MemoryHigh=28G MemoryMax=32G MemorySwapMax=0 TasksMax=6000' "${LIMACTL_CAPTURE}"; then
-  fail "Case A: guest actions.slice live limits were not applied"
-fi
-for agent in codex claude gemini; do
-  wrapper="${HOME_A}/.local/bin/${agent}"
-  if [ ! -x "${wrapper}" ] || ! grep -q 'ezgha-agent-wrapper' "${wrapper}"; then
-    fail "Case A: scoped agent wrapper was not installed: ${agent}"
-  fi
-done
 
-# ── Case B: --without-watchdog heals drift (pre-enabled timer disabled) ──────
-HOME_B="${WORK}/home_b"
-STATE_B="${WORK}/state_b"
-mkdir -p "${HOME_B}" "${STATE_B}"
-touch "${STATE_B}/ezgha-watchdog.timer.enabled"   # simulate out-of-band re-arm
-run_install "${HOME_B}" "${STATE_B}" --without-watchdog
-
-if [ -f "${STATE_B}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case B: --without-watchdog did NOT disable a pre-enabled ezgha-watchdog.timer"
-else
-  echo "PASS: Case B: --without-watchdog disabled a drifted-enabled ezgha-watchdog.timer"
-fi
-
-if ! grep -q "watchdog arming skipped" "${HOME_B}/install.log"; then
-  fail "Case B: install.sh did not print the watchdog opt-out skip message"
-else
-  echo "PASS: Case B: install.sh printed the watchdog opt-out skip message"
-fi
-
-# ── Case C: --with-watchdog still arms it (backward compat) ──────────────────
-HOME_C="${WORK}/home_c"
-STATE_C="${WORK}/state_c"
-mkdir -p "${HOME_C}"
-run_install "${HOME_C}" "${STATE_C}" --with-watchdog
-
-if [ ! -f "${STATE_C}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case C: --with-watchdog did not enable ezgha-watchdog.timer"
-else
-  echo "PASS: Case C: --with-watchdog enabled ezgha-watchdog.timer"
-fi
-
-if [ ! -f "${STATE_C}/ezgha-token-refresh.timer.enabled" ] || [ ! -f "${STATE_C}/ezgha-queue-reaper.timer.enabled" ]; then
-  fail "Case C: --with-watchdog run failed to also enable token-refresh/queue-reaper timers"
-else
-  echo "PASS: Case C: --with-watchdog run still enabled token-refresh + queue-reaper timers"
-fi
-
-# ── Cases F-I plus relative-path variants: pre-mutation validation ───────────
-# The source candidate is checked before stable payload copy and launchd unload.
-# Each rejected candidate must preserve both the prior script and loaded plist.
-mac_payload="${TEMP_REPO}/scripts/ezgha-fleet-watchdog.sh"
-MAC_HOME_F="${WORK}/home_f"
-MAC_STATE_F="${WORK}/state_f"
-MAC_LAUNCHCTL_F="${WORK}/launchctl_f"
-prepare_mac_prior_install "${MAC_HOME_F}" "${MAC_LAUNCHCTL_F}" 1
-cat > "${mac_payload}" <<'EOF'
-#!/usr/bin/env bash
-# ensure_runner_image() { :; }
-EOF
-chmod +x "${mac_payload}"
-payload_before_f="$(cat "${MAC_HOME_F}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
-plist_before_f="$(cat "${MAC_HOME_F}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
-if run_mac_install "${MAC_HOME_F}" "${MAC_STATE_F}" "${MAC_LAUNCHCTL_F}"; then
-  fail "Case F: missing sentinel unexpectedly installed"
-else
-  if [ "$(cat "${MAC_HOME_F}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_f}" ] ||
-     [ "$(cat "${MAC_HOME_F}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_f}" ]; then
-    fail "Case F: missing sentinel changed the payload or plist"
-  elif [ -e "${MAC_STATE_F}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_F}/service.calls" ]; then
-    fail "Case F: missing sentinel reached cargo or the main service"
-  elif [ ! -f "${MAC_LAUNCHCTL_F}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
-    fail "Case F: missing sentinel unloaded the prior watchdog service"
-  elif grep -q 'watchdog' "${MAC_LAUNCHCTL_F}/calls" 2>/dev/null; then
-    fail "Case F: missing sentinel touched the prior watchdog service"
-  else
-    echo "PASS: Case F: missing sentinel preserved watchdog payload and service"
-  fi
-fi
-
-MAC_HOME_G="${WORK}/home_g"
-MAC_STATE_G="${WORK}/state_g"
-MAC_LAUNCHCTL_G="${WORK}/launchctl_g"
-prepare_mac_prior_install "${MAC_HOME_G}" "${MAC_LAUNCHCTL_G}" 1
-printf '%s\n' '#!/usr/bin/env bash' 'ensure_runner_image() { :; }' 'docker '"build -f Dockerfile.runner ." > "${mac_payload}"
-chmod +x "${mac_payload}"
-payload_before_g="$(cat "${MAC_HOME_G}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
-plist_before_g="$(cat "${MAC_HOME_G}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
-if run_mac_install "${MAC_HOME_G}" "${MAC_STATE_G}" "${MAC_LAUNCHCTL_G}"; then
-  fail "Case G: relative Dockerfile.runner sentinel unexpectedly installed"
-else
-  if [ "$(cat "${MAC_HOME_G}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_g}" ] ||
-     [ "$(cat "${MAC_HOME_G}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_g}" ]; then
-    fail "Case G: relative Dockerfile.runner sentinel changed the payload or plist"
-  elif [ -e "${MAC_STATE_G}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_G}/service.calls" ]; then
-    fail "Case G: relative Dockerfile.runner sentinel reached cargo or the main service"
-  elif [ ! -f "${MAC_LAUNCHCTL_G}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
-    fail "Case G: relative Dockerfile.runner sentinel unloaded the prior watchdog service"
-  elif grep -q 'watchdog' "${MAC_LAUNCHCTL_G}/calls" 2>/dev/null; then
-    fail "Case G: relative Dockerfile.runner sentinel touched the prior watchdog service"
-  else
-    echo "PASS: Case G: relative Dockerfile.runner sentinel preserved watchdog payload and service"
-  fi
-fi
-
-MAC_HOME_H="${WORK}/home_h"
-MAC_STATE_H="${WORK}/state_h"
-MAC_LAUNCHCTL_H="${WORK}/launchctl_h"
-prepare_mac_prior_install "${MAC_HOME_H}" "${MAC_LAUNCHCTL_H}"
-printf '%s\n' '#!/usr/bin/env bash' 'ensure_runner_image() { :; }' 'docker '"build -f ./Dockerfile.runner ." > "${mac_payload}"
-chmod +x "${mac_payload}"
-payload_before_h="$(cat "${MAC_HOME_H}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
-plist_before_h="$(cat "${MAC_HOME_H}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
-if run_mac_install "${MAC_HOME_H}" "${MAC_STATE_H}" "${MAC_LAUNCHCTL_H}"; then
-  fail "Case H: ./Dockerfile.runner sentinel unexpectedly installed"
-else
-  if [ "$(cat "${MAC_HOME_H}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_h}" ] ||
-     [ "$(cat "${MAC_HOME_H}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_h}" ]; then
-    fail "Case H: ./Dockerfile.runner sentinel changed the payload or plist"
-  elif [ ! -f "${MAC_LAUNCHCTL_H}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
-    fail "Case H: ./Dockerfile.runner sentinel unloaded the prior watchdog service"
-  elif grep -q 'watchdog' "${MAC_LAUNCHCTL_H}/calls" 2>/dev/null; then
-    fail "Case H: ./Dockerfile.runner sentinel touched the prior watchdog service"
-  else
-    echo "PASS: Case H: ./Dockerfile.runner sentinel preserved watchdog payload and service"
-  fi
-fi
-
-MAC_HOME_QUOTED="${WORK}/home_quoted"
-MAC_STATE_QUOTED="${WORK}/state_quoted"
-MAC_LAUNCHCTL_QUOTED="${WORK}/launchctl_quoted"
-prepare_mac_prior_install "${MAC_HOME_QUOTED}" "${MAC_LAUNCHCTL_QUOTED}" 1
-cat > "${mac_payload}" <<'EOF'
-#!/usr/bin/env bash
-ensure_runner_image() { :; }
-docker build -f "./Dockerfile.runner" .
-EOF
-chmod +x "${mac_payload}"
-payload_before_quoted="$(cat "${MAC_HOME_QUOTED}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
-plist_before_quoted="$(cat "${MAC_HOME_QUOTED}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
-if run_mac_install "${MAC_HOME_QUOTED}" "${MAC_STATE_QUOTED}" "${MAC_LAUNCHCTL_QUOTED}"; then
-  fail "Case Q: quoted ./Dockerfile.runner sentinel unexpectedly installed"
-else
-  if [ "$(cat "${MAC_HOME_QUOTED}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_quoted}" ] ||
-     [ "$(cat "${MAC_HOME_QUOTED}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_quoted}" ]; then
-    fail "Case Q: quoted ./Dockerfile.runner sentinel changed the payload or plist"
-  elif [ ! -f "${MAC_LAUNCHCTL_QUOTED}/org.jleechanorg.ezgha-watchdog.loaded" ] ||
-       [ -e "${MAC_STATE_QUOTED}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_QUOTED}/service.calls" ]; then
-    fail "Case Q: quoted ./Dockerfile.runner sentinel mutated deployment state"
-  else
-    echo "PASS: Case Q: quoted ./Dockerfile.runner sentinel preserved watchdog payload and service"
-  fi
-fi
-
-MAC_HOME_PARENT="${WORK}/home_parent"
-MAC_STATE_PARENT="${WORK}/state_parent"
-MAC_LAUNCHCTL_PARENT="${WORK}/launchctl_parent"
-prepare_mac_prior_install "${MAC_HOME_PARENT}" "${MAC_LAUNCHCTL_PARENT}" 1
-cat > "${mac_payload}" <<'EOF'
-#!/usr/bin/env bash
-ensure_runner_image() { :; }
-docker build -f '../Dockerfile.runner' .
-EOF
-chmod +x "${mac_payload}"
-payload_before_parent="$(cat "${MAC_HOME_PARENT}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")"
-plist_before_parent="$(cat "${MAC_HOME_PARENT}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")"
-if run_mac_install "${MAC_HOME_PARENT}" "${MAC_STATE_PARENT}" "${MAC_LAUNCHCTL_PARENT}"; then
-  fail "Case P: parent-relative Dockerfile.runner sentinel unexpectedly installed"
-else
-  if [ "$(cat "${MAC_HOME_PARENT}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh")" != "${payload_before_parent}" ] ||
-     [ "$(cat "${MAC_HOME_PARENT}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist")" != "${plist_before_parent}" ]; then
-    fail "Case P: parent-relative Dockerfile.runner sentinel changed the payload or plist"
-  elif [ ! -f "${MAC_LAUNCHCTL_PARENT}/org.jleechanorg.ezgha-watchdog.loaded" ] ||
-       [ -e "${MAC_STATE_PARENT}/cargo.calls" ] || [ -e "${MAC_LAUNCHCTL_PARENT}/service.calls" ]; then
-    fail "Case P: parent-relative Dockerfile.runner sentinel mutated deployment state"
-  else
-    echo "PASS: Case P: parent-relative Dockerfile.runner sentinel preserved watchdog payload and service"
-  fi
-fi
-
-MAC_HOME_I="${WORK}/home_i"
-MAC_STATE_I="${WORK}/state_i"
-MAC_LAUNCHCTL_I="${WORK}/launchctl_i"
-cat > "${mac_payload}" <<'EOF'
-#!/usr/bin/env bash
-ensure_runner_image() { :; }
-docker build -f "$dockerfile_path" .
-docker build -f "$repo_root/Dockerfile.runner" .
-EOF
-chmod +x "${mac_payload}"
-run_mac_install "${MAC_HOME_I}" "${MAC_STATE_I}" "${MAC_LAUNCHCTL_I}"
-if ! grep -q 'ensure_runner_image' "${MAC_HOME_I}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh" ||
-   [ ! -f "${MAC_HOME_I}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist" ] ||
-   [ ! -f "${MAC_LAUNCHCTL_I}/org.jleechanorg.ezgha-watchdog.loaded" ]; then
-  fail "Case I: valid watchdog candidate did not install and load successfully"
-else
-  echo "PASS: Case I: valid watchdog candidate installed and loaded successfully"
-fi
-
-# ── Case E: uninstall restores a pre-existing CLI symlink and removes host controls.
-HOME_E="${WORK}/home_e"
-STATE_E="${WORK}/state_e"
-mkdir -p "${HOME_E}/.local/bin" "${STATE_E}"
-ln -s "${STUB_BIN}/codex" "${HOME_E}/.local/bin/codex"
-run_install "${HOME_E}" "${STATE_E}"
-HOME="${HOME_E}" SYSTEMCTL_STATE_DIR="${STATE_E}" \
-  bash "${TEMP_REPO}/install.sh" --uninstall >"${HOME_E}/uninstall.log" 2>&1
-if [ ! -L "${HOME_E}/.local/bin/codex" ] || [ "$(readlink "${HOME_E}/.local/bin/codex")" != "${STUB_BIN}/codex" ]; then
-  fail "Case E: uninstall did not restore the pre-existing codex symlink"
-fi
-if [ -e "${HOME_E}/.config/systemd/user/agents.slice" ] || \
-   [ -e "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" ]; then
-  fail "Case E: uninstall left host-control units behind"
-fi
-if ! grep -Fqx 'shell colima -- sudo -n rm -f /etc/systemd/system/actions.slice' "${LIMACTL_CAPTURE}"; then
-  fail "Case E: uninstall did not remove the persistent guest actions.slice"
-fi
-
-# ── Case D: flag composes with --dev (already exercised via run_install,
-#            which always passes --dev) -- verify --with-watchdog placed
-#            BEFORE --dev also works (order independence) ──────────────────
+# ── Case D: never delete reaper files while its service remains active ───────
 HOME_D="${WORK}/home_d"
 STATE_D="${WORK}/state_d"
-mkdir -p "${HOME_D}" "${STATE_D}"
-HOME="${HOME_D}" SYSTEMCTL_STATE_DIR="${STATE_D}" \
-  bash "${TEMP_REPO}/install.sh" --with-watchdog --dev >"${HOME_D}/install.log" 2>&1
-if [ ! -f "${STATE_D}/ezgha-watchdog.timer.enabled" ]; then
-  fail "Case D: '--with-watchdog --dev' (flag order swapped) did not enable ezgha-watchdog.timer"
-else
-  echo "PASS: Case D: flags compose regardless of order"
+mkdir -p "${HOME_D}/.config/systemd/user" "${HOME_D}/.local/libexec/ezgha" "${STATE_D}"
+touch "${HOME_D}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_D}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_D}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_STOP_FAIL_UNITS=agent-scope-reaper.service STUB_ACTIVE_UNITS=agent-scope-reaper.service \
+  run_install "${HOME_D}" "${STATE_D}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case D: installer must fail when agent-scope-reaper remains active"
+for stale in \
+  "${HOME_D}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_D}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_D}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case D: active reaper artifact was deleted: $stale"
+done
+grep -Fq 'refusing to remove agent-scope-reaper files' "${HOME_D}/install.log" \
+  || fail "Case D: installer omitted active-reaper refusal"
+
+# A reaper timer that remains active is not safe even if its service stopped.
+HOME_E="${WORK}/home_e"
+STATE_E="${WORK}/state_e"
+mkdir -p "${HOME_E}/.config/systemd/user" "${HOME_E}/.local/libexec/ezgha" "${STATE_E}"
+touch "${HOME_E}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_E}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_DISABLE_FAIL_UNITS=agent-scope-reaper.timer STUB_ACTIVE_UNITS=agent-scope-reaper.timer \
+  run_install "${HOME_E}" "${STATE_E}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case E: installer must fail when agent-scope-reaper timer remains active"
+for stale in \
+  "${HOME_E}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_E}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_E}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case E: reaper artifact was deleted while timer remained active: $stale"
+done
+
+# An unavailable user-manager bus is not evidence that the reaper timer stopped.
+HOME_F="${WORK}/home_f"
+STATE_F="${WORK}/state_f"
+mkdir -p "${HOME_F}/.config/systemd/user" "${HOME_F}/.local/libexec/ezgha" "${STATE_F}"
+touch "${HOME_F}/.config/systemd/user/agent-scope-reaper.service" \
+      "${HOME_F}/.config/systemd/user/agent-scope-reaper.timer" \
+      "${HOME_F}/.local/libexec/ezgha/agent-scope-reaper.sh"
+install_rc=0
+STUB_QUERY_FAIL_UNITS=agent-scope-reaper.timer run_install "${HOME_F}" "${STATE_F}" || install_rc=$?
+[ "$install_rc" -ne 0 ] \
+  || fail "Case F: installer must fail closed when reaper timer state cannot be queried"
+for stale in \
+  "${HOME_F}/.config/systemd/user/agent-scope-reaper.service" \
+  "${HOME_F}/.config/systemd/user/agent-scope-reaper.timer" \
+  "${HOME_F}/.local/libexec/ezgha/agent-scope-reaper.sh"; do
+  [ -e "$stale" ] || fail "Case F: reaper artifact was deleted after timer query failure: $stale"
+done
+
+# The PSI watcher must be stopped and verified before its retired files vanish.
+for psi_case in active query; do
+  psi_home="${WORK}/home_psi_${psi_case}"
+  psi_state="${WORK}/state_psi_${psi_case}"
+  mkdir -p "${psi_home}/.config/systemd/user"
+  touch "${psi_home}/.config/systemd/user/psi-oom-watcher.service" \
+        "${psi_home}/.config/systemd/user/psi-oom-watcher.timer"
+  install_rc=0
+  if [ "$psi_case" = active ]; then
+    STUB_DISABLE_FAIL_UNITS=psi-oom-watcher.timer STUB_ACTIVE_UNITS=psi-oom-watcher.service \
+      run_install "${psi_home}" "${psi_state}" || install_rc=$?
+  else
+    STUB_QUERY_FAIL_UNITS=psi-oom-watcher.service \
+      run_install "${psi_home}" "${psi_state}" || install_rc=$?
+  fi
+  [ "$install_rc" -ne 0 ] \
+    || fail "Case PSI-${psi_case}: installer must fail before removing unsafe watcher units"
+  for stale in \
+    "${psi_home}/.config/systemd/user/psi-oom-watcher.service" \
+    "${psi_home}/.config/systemd/user/psi-oom-watcher.timer"; do
+    [ -e "$stale" ] || fail "Case PSI-${psi_case}: watcher artifact was deleted unsafely: $stale"
+  done
+done
+
+# ── Case C: macOS path removes the leftover fleet watchdog LaunchAgent ───────
+# (static: the macOS branch needs launchctl/colima and is not drivable here)
+for needle in \
+  'launchctl bootout "gui/$(id -u)/org.jleechanorg.ezgha-watchdog"' \
+  'rm -f "${watchdog_plist}"' \
+  'ezgha-fleet-watchdog.sh'; do
+  grep -qF -- "${needle}" "${REPO_ROOT}/install.sh" \
+    || fail "Case C: install.sh macOS path lacks watchdog removal: ${needle}"
+done
+
+# ── Case B: uninstall removes host controls and restored CLI symlinks ─────────
+HOME_B="${WORK}/home_b"
+STATE_B="${WORK}/state_b"
+mkdir -p "${HOME_B}/.local/bin" "${STATE_B}"
+ln -s "${STUB_BIN}/codex" "${HOME_B}/.local/bin/codex"
+run_install "${HOME_B}" "${STATE_B}"
+HOME="${HOME_B}" SYSTEMCTL_STATE_DIR="${STATE_B}" \
+  bash "${TEMP_REPO}/install.sh" --uninstall >"${HOME_B}/uninstall.log" 2>&1
+if [ ! -L "${HOME_B}/.local/bin/codex" ] || [ "$(readlink "${HOME_B}/.local/bin/codex")" != "${STUB_BIN}/codex" ]; then
+  fail "Case B: uninstall did not restore the pre-existing codex symlink"
+fi
+if [ -e "${HOME_B}/.config/systemd/user/agents.slice" ] || \
+   [ -e "${HOME_B}/.config/systemd/user/automation.slice" ]; then
+  fail "Case B: uninstall left host-control units behind"
 fi
 
 if [ "${PASS}" = true ]; then

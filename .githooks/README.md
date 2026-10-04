@@ -20,9 +20,9 @@ relative `-f Dockerfile.runner` (or any other `docker build -f
 Background: the 2026-08-20 Mac fleet outage was caused by
 `scripts/ezgha-fleet-watchdog.sh:366` using a relative
 `-f Dockerfile.runner` which Docker resolved against launchd's
-cwd-of-/. The hook catches the same class of regression at commit
-time (companion to `.github/workflows/install-sentinel.yml` which
-catches it at PR time).
+cwd-of-/. The watchdog has since been removed (#133/#162); the hook
+still catches the same class of regression in any shell script at
+commit time.
 
 Opt in with:
 
@@ -34,7 +34,6 @@ Bypass (emergency only): `git commit --no-verify`.
 
 Companion artifacts:
 - `.claude/skills/install-gate-checks/SKILL.md` — behavioral sentinel pattern
-- `.github/workflows/install-sentinel.yml` — CI behavioral checks
 - commit `b3fe954` — the original line 366 fix (Aug 2026)
 - bead `jleechan-zgvz` — line 366 bug + 5 follow-up safety gaps
 

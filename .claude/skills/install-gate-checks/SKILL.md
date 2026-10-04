@@ -27,7 +27,7 @@ The sentinel passed because `ensure_runner_image` was present. The function was 
 ## When to use
 
 Use this skill BEFORE adding or modifying:
-- Any `install.sh` sentinel (currently `install.sh:619`, the watchdog function-presence check)
+- Any `install.sh` sentinel (the original watchdog function-presence check was removed with the watchdog itself in #133/#162; the lesson applies to every future sentinel)
 - Any `launchd/install-launchagents.sh:verify_rendered_plist` or `verify_scripts_exist` check
 - Any pre-commit hook that gates script installation
 - Any sentinel that claims "the script will work" via string match
@@ -79,7 +79,7 @@ When reviewing any new install-time sentinel, REJECT if you see:
 
 ## Real-Docker integration test pattern
 
-`tests/watchdog_ensure_runner_image_test.sh` (the companion test to this skill) exercises the sentinel's claim end-to-end:
+The retired `tests/watchdog_ensure_runner_image_test.sh` (removed with the watchdog) showed the pattern by exercising the sentinel's claim end-to-end:
 - Removes `ezgha-runner:latest` from local docker
 - Invokes `ensure_runner_image` in dry-run + probe mode
 - Asserts the image is rebuilt
