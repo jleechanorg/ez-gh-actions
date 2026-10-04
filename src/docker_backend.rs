@@ -4940,6 +4940,9 @@ pub struct EnsureCountOutcome {
     /// the worker state as recovered (they run async via the
     /// `QueueMonitorScheduler`).
     pub post_refill_readiness_error: Option<String>,
+    /// Configured runners present before refill but absent from the successful
+    /// post-refill inventory.
+    pub post_refill_capacity_lost: Vec<String>,
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
     pub start_failures: u32,
@@ -4963,6 +4966,7 @@ fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome 
         missing,
         remaining_shortage: missing,
         post_refill_readiness_error: None,
+        post_refill_capacity_lost: Vec::new(),
         start_failures: 0,
         admission_paused_reason: Some(reason),
     }
@@ -4992,6 +4996,14 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
     let containers = managed_containers()?;
+    let configured_names: HashSet<String> = (1..=cfg.runner.count)
+        .map(|slot| runner_name_for(cfg, slot))
+        .collect();
+    let initial_witnesses: HashSet<String> = current_prefix_containers(&containers, cfg)
+        .into_iter()
+        .filter(|container| configured_names.contains(&container.name))
+        .map(|container| container.name.clone())
+        .collect();
     // Container presence owns normal spawn capacity. Runner.Worker exists only
     // while a job is executing, so using it here would classify a healthy idle
     // Listener-only fleet as missing and create a permanent settle/reconcile loop.
@@ -5009,6 +5021,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             missing: 0,
             remaining_shortage: 0,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         });
@@ -5215,6 +5228,15 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     let readiness_deadline = Instant::now() + LOCAL_READINESS_BUDGET;
     let containers_after = managed_containers_until_deadline(readiness_deadline)
         .context("post-refill local container recount")?;
+    let post_refill_names: HashSet<&str> = current_prefix_containers(&containers_after, cfg)
+        .into_iter()
+        .map(|container| container.name.as_str())
+        .collect();
+    let mut post_refill_capacity_lost: Vec<String> = initial_witnesses
+        .into_iter()
+        .filter(|name| !post_refill_names.contains(name.as_str()))
+        .collect();
+    post_refill_capacity_lost.sort();
     let readiness_after =
         executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
     let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
@@ -5250,6 +5272,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         missing,
         remaining_shortage,
         post_refill_readiness_error,
+        post_refill_capacity_lost,
         start_failures: refill.start_failures,
         admission_paused_reason: refill.admission_paused_reason,
     };
@@ -7317,6 +7340,217 @@ esac
     }
 
     #[test]
+    fn post_refill_inventory_loss_forces_immediate_reconcile() {
+        let _env = TestEnv::new("post_refill_inventory_loss");
+        let cfg = cfg_with(14, "ez-runner-c");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+
+        // Initial inventory witnesses slots 1..12. The refill successfully
+        // starts 13 and 14, but the post-refill inventory contains only 1..11.
+        // Only pre-existing slot 12 is the intended lifecycle witness.
+        // Fresh starts 13/14 must not contribute to that future trigger.
+        let initial: Vec<_> = (1..=12)
+            .map(|slot| managed_container(&format!("ez-runner-c-{slot}")))
+            .collect();
+        let post_refill: Vec<_> = (1..=11)
+            .map(|slot| managed_container(&format!("ez-runner-c-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, post_refill].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-runner-c-13".into(), "ez-runner-c-14".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 11,
+                absent: vec![],
+            })]
+            .into(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert_eq!(outcome.started, vec!["ez-runner-c-13", "ez-runner-c-14"]);
+        assert_eq!(outcome.missing, 2);
+        assert_eq!(outcome.remaining_shortage, 3);
+        assert_eq!(outcome.post_refill_capacity_lost, vec!["ez-runner-c-12"]);
+
+        let decision = crate::ensure_success_decision(&cfg, &outcome);
+        assert_eq!(
+            decision,
+            crate::EnsureSuccessDecision::PostRefillCapacityLost
+        );
+        assert_eq!(
+            crate::ensure_success_plan(&cfg, decision),
+            (Duration::ZERO, false)
+        );
+        let mut settling = Some(crate::SettlingEpisode::start(Instant::now(), 11));
+        let mut pending_readiness = false;
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            Instant::now(),
+            decision,
+        );
+        assert!(settling.is_none() && pending_readiness);
+    }
+
+    #[test]
+    fn post_refill_loss_excludes_unconfigured_names_and_not_ready_witnesses() {
+        let _env = TestEnv::new("post_refill_loss_bounds");
+        let cfg = cfg_with(3, "ez-runner-c");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+
+        let initial = vec![
+            managed_container("ez-runner-c-1"),
+            managed_container("ez-runner-c-4"),
+        ];
+        let after_refill = vec![
+            managed_container("ez-runner-c-1"),
+            managed_container("ez-runner-c-2"),
+        ];
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [initial, after_refill].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-runner-c-2".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 1,
+                absent: vec![],
+            })]
+            .into(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert!(
+            outcome.post_refill_capacity_lost.is_empty(),
+            "out-of-range names and a still-present NotReady witness are not losses"
+        );
+    }
+
+    #[test]
+    fn post_refill_inventory_loss_survives_readiness_error() {
+        let _env = TestEnv::new("post_refill_loss_readiness_error");
+        let cfg = cfg_with(2, "ez-runner-c");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [vec![managed_container("ez-runner-c-1")], Vec::new()].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec!["ez-runner-c-2".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() =
+            Some([Err("synthetic docker top timeout".to_string())].into());
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert_eq!(outcome.post_refill_capacity_lost, vec!["ez-runner-c-1"]);
+        assert!(outcome.post_refill_readiness_error.is_some());
+        assert_eq!(
+            crate::ensure_success_decision(&cfg, &outcome),
+            crate::EnsureSuccessDecision::PostRefillCapacityLost,
+            "confirmed inventory loss precedes a later readiness probe failure"
+        );
+    }
+
+    #[test]
+    fn newly_started_then_absent_slots_keep_current_settling_cadence() {
+        let _env = TestEnv::new("new_start_absent_settling_cadence");
+        let cfg = cfg_with(14, "ez-runner-c");
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+
+        // Slots 1..11 are present both before and after this refill. Slots
+        // 12..14 are freshly started and disappear before recount, so a
+        // post-refill trigger based only on initial inventory must not treat
+        // them as lifecycle witnesses.
+        let steady: Vec<_> = (1..=11)
+            .map(|slot| managed_container(&format!("ez-runner-c-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [steady.clone(), steady].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-runner-c-12".into(),
+            "ez-runner-c-13".into(),
+            "ez-runner-c-14".into(),
+        ]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 11,
+                absent: vec![],
+            })]
+            .into(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert!(outcome.post_refill_capacity_lost.is_empty());
+        let decision = crate::ensure_success_decision(&cfg, &outcome);
+        assert_eq!(
+            decision,
+            crate::EnsureSuccessDecision::StartSettling { executing: 11 },
+            "fresh starts that disappear before recount retain the existing settling path"
+        );
+        assert_eq!(
+            crate::ensure_success_plan(&cfg, decision),
+            (Duration::from_secs(5), false),
+            "fresh-start turnover keeps the local five-second cadence"
+        );
+
+        let started_at = Instant::now();
+        let mut settling = None;
+        let mut pending_readiness = false;
+        crate::apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            started_at,
+            decision,
+        );
+        let episode = settling.as_mut().expect("settling remains armed");
+        for seconds in [5, 10, 15, 20] {
+            assert_eq!(
+                episode.observe(
+                    started_at + Duration::from_secs(seconds),
+                    11,
+                    cfg.runner.count
+                ),
+                crate::SettlingDecision::Continue,
+                "fresh-start turnover must not bypass the existing grace period"
+            );
+        }
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(25), 11, cfg.runner.count),
+            crate::SettlingDecision::Ceiling,
+            "the fifth poll retains the existing 25-second ceiling"
+        );
+
+        // A fresh allocator state models the next full reconciliation after
+        // that ceiling. The same newly-started-only disappearance must remain
+        // on the settling path again; it cannot become an immediate loop.
+        *TEST_SLOT_PATH.lock().unwrap() = Some(tmp_path("new_start_absent_second_cycle"));
+        let second_steady: Vec<_> = (1..=11)
+            .map(|slot| managed_container(&format!("ez-runner-c-{slot}")))
+            .collect();
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() =
+            [second_steady.clone(), second_steady].into();
+        *TEST_START_ONE_NAMES.lock().unwrap() = Some(vec![
+            "ez-runner-c-12".into(),
+            "ez-runner-c-13".into(),
+            "ez-runner-c-14".into(),
+        ]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 11,
+                absent: vec![],
+            })]
+            .into(),
+        );
+        let second = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert!(second.post_refill_capacity_lost.is_empty());
+        assert_eq!(
+            crate::ensure_success_decision(&cfg, &second),
+            crate::EnsureSuccessDecision::StartSettling { executing: 11 },
+            "a consecutive new-start-only loss retains settling rather than zero-sleep retry"
+        );
+    }
+
+    #[test]
     fn readiness_probe_timeout_caps_at_six_seconds_and_preserves_sub_six_seconds() {
         // Per-probe cap is 6s (was 3s). The 2026-10-03 throughput doc
         // measured 3.2-4.5s `docker top` latency on Mac under load, so the
@@ -7846,6 +8080,8 @@ esac
         let decision = crate::ensure_success_decision_with_pending_readiness(
             crate::ensure_success_decision(&cfg, &outcome),
             pending_readiness,
+            false,
+            0,
         );
         assert_eq!(
             decision,
@@ -7980,6 +8216,8 @@ esac
         let decision = crate::ensure_success_decision_with_pending_readiness(
             crate::ensure_success_decision(&cfg, &outcome),
             pending_readiness,
+            false,
+            0,
         );
         assert_eq!(decision, crate::EnsureSuccessDecision::IncompleteReadiness);
         assert_eq!(
@@ -8012,6 +8250,8 @@ esac
         let full_container_decision = crate::ensure_success_decision_with_pending_readiness(
             crate::ensure_success_decision(&cfg, &misleading_full_container_outcome),
             pending_readiness,
+            false,
+            0,
         );
         assert_eq!(
             full_container_decision,
@@ -8083,6 +8323,7 @@ esac
             missing: 2,
             remaining_shortage: 0,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -8099,6 +8340,7 @@ esac
             missing: 2,
             remaining_shortage: 1,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 1,
             admission_paused_reason: None,
         };
