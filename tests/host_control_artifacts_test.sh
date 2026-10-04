@@ -78,7 +78,11 @@ assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=8G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=10G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemorySwapMax=1G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "TasksMax=4096"
-ok "finite slice budgets"
+grep -q "Measured margin" "$REPO_ROOT/systemd/automation.slice" \
+  || fail "automation.slice lacks measured-margin documentation"
+grep -q "Historical load" "$REPO_ROOT/systemd/host-docker/automation.slice" \
+  || fail "host-docker automation.slice lacks historical-load documentation"
+ok "finite slice budgets and measured-margin documentation"
 
 LAUNCH="$REPO_ROOT/scripts/host/agent-scoped-launch.sh"
 assert_file "$LAUNCH"

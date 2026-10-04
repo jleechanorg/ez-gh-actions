@@ -4,8 +4,9 @@
 # preserving unrelated user drop-ins.
 #
 # This drives the real --uninstall path with every destructive executable
-# resolved to an exact fixture stub before invocation. The fixture clears
-# inherited environment state and uses a fake user bus address.
+# resolved to an exact fixture stub before invocation. Do not run install.sh
+# against a live system: this test is stubs only. The fixture clears inherited
+# environment state and uses a fake user bus address.
 #
 # Platform selection is stubbed: uname reports Linux and launchctl is a
 # tripwire, so the fixture cannot reach a live macOS service manager.

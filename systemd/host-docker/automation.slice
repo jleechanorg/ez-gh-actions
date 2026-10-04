@@ -2,8 +2,10 @@
 # Admission requires current non-reclaimable use to remain 1GiB below
 # MemoryHigh; memory, swap and tasks remain bounded as workers accumulate.
 # The host-docker contract retains actions 28G, agents 12G, automation 5G,
-# and QEMU 10G. Historical automation peak evidence was about 5.7 GiB; it is
-# not a current live-health measurement.
+# and QEMU 10G. Historical load reached about 5.7 GiB with roughly 30 worker
+# scopes and 8G MemoryHigh with roughly 90; at 4G it remained throttled and
+# its PSI admission signal drained the fleet. The smaller 4608M/5G margin
+# therefore depends on current admission; these are not live-health readings.
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target

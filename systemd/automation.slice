@@ -1,7 +1,9 @@
 # automation.slice — finite budget for orchestration/watchdog automation.
 # Memory, swap, and task limits bound worker scopes and keep admission finite.
-# Historical peak evidence recorded about 5.7 GiB for automation; it is a
-# prior measurement, not a current live-health measurement.
+# Measured margin: automation used about 5.7 GiB with roughly 30 worker scopes
+# and reached the 8G MemoryHigh with roughly 90; at 4G it remained throttled
+# and its PSI admission signal drained the fleet. These are historical
+# measurements, not a current live-health measurement.
 [Unit]
 Description=Automation and dark-factory processes — bounded host budget
 Before=slices.target
