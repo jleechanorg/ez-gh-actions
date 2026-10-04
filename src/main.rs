@@ -736,6 +736,7 @@ fn ensure_outcome_may_credit_deadman(outcome: &docker_backend::EnsureCountOutcom
     outcome.admission_paused_reason.is_none()
         && !outcome.is_partial_failure()
         && outcome.post_refill_readiness_error.is_none()
+        && outcome.post_refill_capacity_lost.is_empty()
         && outcome.remaining_shortage == 0
 }
 
@@ -862,6 +863,7 @@ fn apply_local_settling_decision(
 enum EnsureSuccessDecision {
     StartSettling { executing: u32 },
     Recovered,
+    PostRefillCapacityLost,
     IncompleteReadiness,
     AdmissionPaused,
 }
@@ -880,7 +882,10 @@ fn start_command_disposition(
 ) -> StartCommandDisposition {
     if outcome.admission_paused_reason.is_some() {
         StartCommandDisposition::AdmissionPaused
-    } else if outcome.start_failures > 0 || outcome.post_refill_readiness_error.is_some() {
+    } else if outcome.start_failures > 0
+        || outcome.post_refill_readiness_error.is_some()
+        || !outcome.post_refill_capacity_lost.is_empty()
+    {
         StartCommandDisposition::Incomplete
     } else if !outcome.started.is_empty() {
         StartCommandDisposition::Started
@@ -897,6 +902,8 @@ fn ensure_success_decision(
 ) -> EnsureSuccessDecision {
     if outcome.admission_paused_reason.is_some() {
         EnsureSuccessDecision::AdmissionPaused
+    } else if !outcome.post_refill_capacity_lost.is_empty() {
+        EnsureSuccessDecision::PostRefillCapacityLost
     } else if outcome.post_refill_readiness_error.is_some() {
         EnsureSuccessDecision::IncompleteReadiness
     } else if outcome.remaining_shortage > 0 {
@@ -914,7 +921,10 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
             settling_plan(cfg, SettlingDecision::Continue)
         }
         EnsureSuccessDecision::Recovered => settling_plan(cfg, SettlingDecision::Recovered),
-        EnsureSuccessDecision::IncompleteReadiness => settling_plan(cfg, SettlingDecision::Ceiling),
+        EnsureSuccessDecision::PostRefillCapacityLost
+        | EnsureSuccessDecision::IncompleteReadiness => {
+            settling_plan(cfg, SettlingDecision::Ceiling)
+        }
         EnsureSuccessDecision::AdmissionPaused => (cfg.runner.serve_tick(), true),
     }
 }
@@ -922,8 +932,14 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
 fn ensure_success_decision_with_pending_readiness(
     decision: EnsureSuccessDecision,
     pending_readiness: bool,
+    previous_post_refill_capacity_loss_immediate: bool,
+    executing: u32,
 ) -> EnsureSuccessDecision {
-    if pending_readiness && decision == EnsureSuccessDecision::Recovered {
+    if previous_post_refill_capacity_loss_immediate
+        && decision == EnsureSuccessDecision::PostRefillCapacityLost
+    {
+        EnsureSuccessDecision::StartSettling { executing }
+    } else if pending_readiness && decision == EnsureSuccessDecision::Recovered {
         EnsureSuccessDecision::StartSettling { executing: 0 }
     } else {
         decision
@@ -941,7 +957,8 @@ fn apply_ensure_success_decision(
             *settling = Some(SettlingEpisode::start(now, executing));
             *pending_readiness = true;
         }
-        EnsureSuccessDecision::IncompleteReadiness => {
+        EnsureSuccessDecision::PostRefillCapacityLost
+        | EnsureSuccessDecision::IncompleteReadiness => {
             *settling = None;
             *pending_readiness = true;
         }
@@ -1367,6 +1384,7 @@ fn main() -> Result<()> {
             let mut ensure_fail_streak = 0u32;
             let mut settling: Option<SettlingEpisode> = None;
             let mut pending_readiness = false;
+            let mut previous_post_refill_capacity_loss_immediate = false;
             let mut settling_ceilings = SettlingCeilingState::default();
             let mut deadman = alert::DeadManState::new(Instant::now());
 
@@ -1483,14 +1501,41 @@ fn main() -> Result<()> {
                                 &mut ensure_fail_streak,
                                 &outcome,
                             );
+                            let raw_decision = ensure_success_decision(&cfg, &outcome);
                             let decision = ensure_success_decision_with_pending_readiness(
-                                ensure_success_decision(&cfg, &outcome),
+                                raw_decision,
                                 pending_readiness,
+                                previous_post_refill_capacity_loss_immediate,
+                                cfg.runner.count.saturating_sub(outcome.remaining_shortage),
                             );
+                            previous_post_refill_capacity_loss_immediate =
+                                decision == EnsureSuccessDecision::PostRefillCapacityLost;
+                            if raw_decision == EnsureSuccessDecision::PostRefillCapacityLost
+                                && decision != raw_decision
+                            {
+                                eprintln!(
+                                    "post-refill configured runner loss repeated; entering existing settling cadence"
+                                );
+                            }
                             match decision {
                                 EnsureSuccessDecision::StartSettling { .. } => {}
                                 EnsureSuccessDecision::Recovered => {
                                     settling_ceilings.record_recovery();
+                                }
+                                EnsureSuccessDecision::PostRefillCapacityLost => {
+                                    let detail = format!(
+                                        "post-refill configured runner(s) disappeared: {:?}",
+                                        outcome.post_refill_capacity_lost
+                                    );
+                                    let escalated = record_settling_ceiling(
+                                        &cfg,
+                                        &mut settling_ceilings,
+                                        &detail,
+                                    );
+                                    eprintln!(
+                                        "{}: {detail}; reconcile on next iteration",
+                                        if escalated { "CRITICAL" } else { "WARN" }
+                                    );
                                 }
                                 EnsureSuccessDecision::IncompleteReadiness => {
                                     let detail = format!(
@@ -1545,6 +1590,7 @@ fn main() -> Result<()> {
                             plan
                         }
                         Err(e) => {
+                            previous_post_refill_capacity_loss_immediate = false;
                             ensure_fail_streak += 1;
                             eprintln!("ensure_count failed (will retry): {e:#}");
                             notify_ensure_failure(
@@ -2063,6 +2109,7 @@ mod tests {
             missing: 4,
             remaining_shortage: 3,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 3,
             admission_paused_reason: None,
         };
@@ -2083,6 +2130,7 @@ mod tests {
             missing: 2,
             remaining_shortage: 0,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -2109,6 +2157,7 @@ mod tests {
             missing: 10,
             remaining_shortage: 10,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 0,
             admission_paused_reason: Some("fleet circuit open".into()),
         };
@@ -2155,6 +2204,7 @@ mod tests {
                 missing,
                 remaining_shortage,
                 post_refill_readiness_error: post_refill_readiness_error.map(str::to_owned),
+                post_refill_capacity_lost: Vec::new(),
                 start_failures,
                 admission_paused_reason: admission_paused_reason.map(str::to_owned),
             }
@@ -2210,6 +2260,7 @@ mod tests {
             missing: 10,
             remaining_shortage: 10,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 1,
             admission_paused_reason: Some("GitHub JIT/control-plane start failed".into()),
         };
@@ -2230,6 +2281,7 @@ mod tests {
             missing: 1,
             remaining_shortage: 0,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -2250,6 +2302,89 @@ mod tests {
         impaired = healthy;
         impaired.admission_paused_reason = Some("fleet circuit open".into());
         assert!(!ensure_outcome_may_credit_deadman(&impaired));
+    }
+
+    #[test]
+    fn post_refill_loss_is_paced_before_a_second_immediate_reconcile() {
+        let mut cfg = test_config();
+        cfg.runner.count = 14;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-runner-c-13".into(), "ez-runner-c-14".into()],
+            missing: 2,
+            remaining_shortage: 3,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec!["ez-runner-c-12".into()],
+            start_failures: 0,
+            admission_paused_reason: None,
+        };
+
+        let first = ensure_success_decision(&cfg, &outcome);
+        assert_eq!(first, EnsureSuccessDecision::PostRefillCapacityLost);
+        assert_eq!(ensure_success_plan(&cfg, first), (Duration::ZERO, false));
+        let previous_post_refill_capacity_loss_immediate =
+            first == EnsureSuccessDecision::PostRefillCapacityLost;
+
+        let second = ensure_success_decision_with_pending_readiness(
+            ensure_success_decision(&cfg, &outcome),
+            true,
+            previous_post_refill_capacity_loss_immediate,
+            cfg.runner.count.saturating_sub(outcome.remaining_shortage),
+        );
+        assert_eq!(
+            second,
+            EnsureSuccessDecision::StartSettling { executing: 11 }
+        );
+        assert_eq!(
+            ensure_success_plan(&cfg, second),
+            (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+        );
+        assert!(!matches!(
+            second,
+            EnsureSuccessDecision::PostRefillCapacityLost
+        ));
+        let previous_post_refill_capacity_loss_immediate =
+            second == EnsureSuccessDecision::PostRefillCapacityLost;
+        let third = ensure_success_decision_with_pending_readiness(
+            ensure_success_decision(&cfg, &outcome),
+            true,
+            previous_post_refill_capacity_loss_immediate,
+            cfg.runner.count.saturating_sub(outcome.remaining_shortage),
+        );
+        assert_eq!(third, EnsureSuccessDecision::PostRefillCapacityLost);
+
+        let started_at = Instant::now();
+        let mut settling = None;
+        let mut pending_readiness = false;
+        apply_ensure_success_decision(&mut settling, &mut pending_readiness, started_at, second);
+        let episode = settling.as_mut().expect("paced loss starts settling");
+        for seconds in [5, 10, 15, 20] {
+            assert_eq!(
+                episode.observe(
+                    started_at + Duration::from_secs(seconds),
+                    11,
+                    cfg.runner.count
+                ),
+                SettlingDecision::Continue
+            );
+        }
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(25), 11, cfg.runner.count),
+            SettlingDecision::Ceiling
+        );
+        assert!(pending_readiness);
+        assert_eq!(
+            start_command_disposition(&outcome),
+            StartCommandDisposition::Incomplete
+        );
+        assert!(!ensure_outcome_may_credit_deadman(&outcome));
+
+        let mut paused = outcome.clone();
+        paused.admission_paused_reason = Some("fleet circuit open".into());
+        assert_eq!(
+            ensure_success_decision(&cfg, &paused),
+            EnsureSuccessDecision::AdmissionPaused,
+            "admission pause retains priority over witnessed loss"
+        );
     }
 
     #[test]
@@ -2458,6 +2593,8 @@ mod tests {
             let full_container_decision = ensure_success_decision_with_pending_readiness(
                 EnsureSuccessDecision::Recovered,
                 pending_readiness,
+                false,
+                0,
             );
             assert_eq!(
                 full_container_decision,
