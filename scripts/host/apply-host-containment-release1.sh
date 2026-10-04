@@ -77,7 +77,34 @@ user_cgroup_dir() {
 # Every gate precedes writes or systemd state changes.
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "${ROOT}/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not determine MemTotal"
-hard_limits_sum_kib=$(( (28 + 10 + 12 + 5) * 1024 * 1024 ))
+
+parse_mem_kib() {
+  local val="$1"
+  [[ "$val" =~ ^[1-9][0-9]*[GgMmKk]?$ ]] || return 1
+  case "$val" in
+    *G|*g) echo $(( ${val%[Gg]} * 1024 * 1024 )) ;;
+    *M|*m) echo $(( ${val%[Mm]} * 1024 )) ;;
+    *K|*k) echo $(( ${val%[Kk]} )) ;;
+    *[!0-9]*) return 1 ;;
+    *) echo $(( val / 1024 )) ;;
+  esac
+}
+extract_unit_max_kib() {
+  local file="$1" val kib
+  [ -f "$file" ] || fail "missing policy unit: $file"
+  val="$(awk -F= '$1 == "MemoryMax" {print $2; exit}' "$file" 2>/dev/null || true)"
+  [ -n "$val" ] || fail "policy unit $file missing MemoryMax"
+  kib="$(parse_mem_kib "$val" || true)"
+  [[ "$kib" =~ ^[1-9][0-9]*$ ]] || fail "policy unit $file has invalid MemoryMax ($val)"
+  echo "$kib"
+}
+
+actions_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/host/actions.slice")"
+qemu_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf")"
+agents_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/agents.slice")"
+auto_max_kib="$(extract_unit_max_kib "${POLICY_ROOT}/systemd/automation.slice")"
+
+hard_limits_sum_kib=$(( actions_max_kib + qemu_max_kib + agents_max_kib + auto_max_kib ))
 reserve_kib=$(( mem_total_kib / 10 ))
 [ "$reserve_kib" -ge 2097152 ] || reserve_kib=2097152
 computed_floor_kib=$(( hard_limits_sum_kib + reserve_kib ))
@@ -94,14 +121,44 @@ for controller in cpu memory pids io; do
 done
 check_below "${CGROUP_ROOT}/actions.slice/memory.current" "$ACTIONS_MEMORY_HIGH_BYTES" "actions.slice memory.current"
 check_below "${CGROUP_ROOT}/actions.slice/pids.current" "$ACTIONS_PIDS_MAX" "actions.slice pids.current"
-agents_dir="$(user_cgroup_dir agents.slice || true)"
-automation_dir="$(user_cgroup_dir automation.slice || true)"
-qemu_slice_dir="$(user_cgroup_dir app-lima-vm.slice || true)"
-qemu_svc_dir="$(user_cgroup_dir lima-vm@colima.service || true)"
-[ -z "$agents_dir" ] || check_below "${agents_dir}/memory.current" 10737418240 "agents.slice memory.current"
-[ -z "$automation_dir" ] || check_below "${automation_dir}/memory.current" 4294967296 "automation.slice memory.current"
-[ -z "$qemu_slice_dir" ] || check_below "${qemu_slice_dir}/memory.current" 9663676416 "app-lima-vm.slice memory.current"
-[ -z "$qemu_svc_dir" ] || check_below "${qemu_svc_dir}/memory.current" 9663676416 "lima-vm@colima.service memory.current"
+guard_unit_memory() {
+  local unit="$1" limit_bytes="$2" name="$3"
+  local is_active=0 state manager=systemctl
+  # The privileged phase changes system units only; user checks run as the user.
+  if [ "$ROOT" = / ] && [ "$SYSTEM_PHASE" -eq 1 ]; then return 0; fi
+  if [ "$ROOT" = / ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
+    if [ "$ROOT" != / ]; then manager="$ROOT/bin/systemctl"; fi
+    state="$("$manager" --user show "$unit" -p ActiveState --value)" \
+      || fail "cannot query $unit ActiveState"
+    case "$state" in
+      active|activating|reloading|deactivating) is_active=1 ;;
+      inactive|failed) ;;
+      *) fail "unrecognized $unit ActiveState: $state" ;;
+    esac
+  elif [[ " ${CONTAINMENT_ACTIVE_UNITS:-} " == *" ${unit} "* ]] || [ -d "$CGROUP_ROOT/$unit" ]; then
+    is_active=1
+  fi
+
+  local udir
+  udir="$(user_cgroup_dir "$unit" || true)"
+  if [ "$is_active" -eq 1 ]; then
+    [ -n "$udir" ] || fail "active $name has no resolved cgroup directory"
+    [ -f "${udir}/memory.current" ] || fail "active $name missing memory.current at ${udir}/memory.current"
+    check_below "${udir}/memory.current" "$limit_bytes" "$name"
+  elif [ -n "$udir" ] && [ -f "${udir}/memory.current" ]; then
+    check_below "${udir}/memory.current" "$limit_bytes" "$name"
+  fi
+}
+
+guard_unit_memory agents.slice 10737418240 "agents.slice memory.current"
+guard_unit_memory automation.slice 4831838208 "automation.slice memory.current"
+guard_unit_memory app-lima-vm.slice 9663676416 "app-lima-vm.slice memory.current"
+guard_unit_memory lima-vm@colima.service 9663676416 "lima-vm@colima.service memory.current"
+if [ "$ROOT" = / ] && [ "$SYSTEM_PHASE" -eq 1 ]; then
+  runuser -u "$(id -nu "$DEPLOY_UID")" -- env XDG_RUNTIME_DIR="/run/user/${DEPLOY_UID}" "${SCRIPT_DIR}/qemu-ceiling-guard.sh"
+else
+  "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT"
+fi
 
 install_file() {
   local source="$1" dest="$2"
@@ -167,6 +224,7 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   install_file "${POLICY_ROOT}/systemd/user/session.slice.d/99-ezgha-containment.conf" "${USER_UNIT_DIR}/session.slice.d/99-ezgha-containment.conf"
   install_file "${POLICY_ROOT}/systemd/agents.slice" "${USER_UNIT_DIR}/agents.slice"
   install_file "${POLICY_ROOT}/systemd/automation.slice" "${USER_UNIT_DIR}/automation.slice"
+  sed "s|@SCRIPTS_DIR@|${SCRIPT_DIR}|g" "${POLICY_ROOT}/systemd/lima-vm-cpu-ceiling.service" > "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
   install_file "${POLICY_ROOT}/systemd/app-lima-vm.slice" "${USER_UNIT_DIR}/app-lima-vm.slice"
   install_file "${POLICY_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
   rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" "${USER_UNIT_DIR}/psi-oom-watcher.timer"
@@ -176,10 +234,8 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
     systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192
-    systemctl --user set-property automation.slice MemoryHigh=4G MemoryMax=5G MemorySwapMax=1G TasksMax=4096
-    if systemctl --user is-active lima-vm@colima.service >/dev/null 2>&1 || [ "$ROOT" != "/" ]; then
-      systemctl --user set-property --runtime lima-vm@colima.service MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null || true
-    fi
+    systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096
+    "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT" --apply
   fi
 fi
 

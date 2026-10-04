@@ -275,41 +275,68 @@ if PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_
 fi
 
 
-# Gate 8 (3) PSI admission: prove valid finite/auto fails old predicate and passes new predicate,
-# and killroot or missing caps fail.
-cat > "$TMP/oomctl" <<'EOF_OOMCTL'
+# Exercise the mandatory canonical assertion with its existing real-root fixtures.
+eval "$(sed -n '/^setup_passing_fixture() {/,/^# 1\. Test clean passing fixture/p' "$ROOT/tests/assert_host_containment_release1_test.sh" | sed '$d')"
+eval "$(sed -n '/^write_props() {/,/^PROPS_BIN=/p' "$ROOT/tests/assert_host_containment_release1_test.sh" | sed '$d')"
+FIXTURE="$TMP/assert-root"
+setup_passing_fixture "$FIXTURE"
+write_props 4831838208 5368709120 > "$TMP/props"
+mkdir -p "$TMP/policy-bin"
+cat > "$TMP/policy-bin/systemctl" <<'SHIM'
 #!/usr/bin/env bash
-# Release 1 modern containment sets all ManagedOOM to auto; oomctl has 0 monitored cgroups
-exit 0
-EOF_OOMCTL
-chmod +x "$TMP/oomctl"
-
-psi_test_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=psi_admission VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" TIMER_MODE=disabled)
-
-# 1. Valid finite/auto: must pass new predicate
-if ! env "${psi_test_env[@]}" bash "$VERIFY" >/dev/null 2>&1; then
-  fail "Gate 8 (3) valid finite/auto policy must pass modern predicate"
+prop="" unit="" scope=system
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --user) scope=user; shift ;;
+    -p) prop="$2"; shift 2 ;;
+    --) unit="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$unit:$scope" in
+  app.slice:system|session.slice:system|actions.slice:user|user.slice:user|-.slice:user) exit 1 ;;
+esac
+awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
+SHIM
+chmod +x "$TMP/policy-bin/systemctl"
+# Source only the production predicate; pass the canonical assertion's --root.
+eval "$(sed -n '/^verify_retired_timer_policy() {/,/^verify_automation_dropins() {/p' "$VERIFY" | sed '$d')"
+MODERN_UNIT_DIR="$MODERN"
+export VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice"
+REPO_ROOT="$TMP/no-repository"
+COUNT=14
+if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/absent.log" 2>&1; then
+  fail "missing mandatory assertion must fail closed"
 fi
-
-# 2. Killroot: must fail
-KILLROOT_DROPIN_DIR="$TMP/killroot_dropins"
-mkdir -p "$KILLROOT_DROPIN_DIR"
-cat > "$KILLROOT_DROPIN_DIR/99-killroot.conf" <<'EOF_KILL'
-[Slice]
-ManagedOOMMemoryPressure=kill
-EOF_KILL
-if env "${psi_test_env[@]}" VERIFY_EXIT_CRITERIA_KILLROOT_DIR="$KILLROOT_DROPIN_DIR" bash "$VERIFY" >/dev/null 2>&1; then
-  fail "Gate 8 (3) killroot must fail modern predicate"
+mkdir -p "$REPO_ROOT/scripts/host"
+cp "$ROOT/scripts/host/assert-host-containment-release1.sh" "$REPO_ROOT/scripts/host/"
+chmod 000 "$REPO_ROOT/scripts/host/assert-host-containment-release1.sh"
+if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/unreadable.log" 2>&1; then
+  fail "unreadable mandatory assertion must fail closed"
 fi
-
-# 3. Missing/malformed caps: missing direct QEMU drop-in must fail
-BAD_MODERN="$TMP/bad_modern"
-mkdir -p "$BAD_MODERN"
-cp "$MODERN/app-lima-vm.slice" "$MODERN/agents.slice" "$MODERN/automation.slice" "$BAD_MODERN/"
-# Notice: no lima-vm@colima.service.d/99-memory-ceiling.conf
-if env "${psi_test_env[@]}" VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$BAD_MODERN" bash "$VERIFY" >/dev/null 2>&1; then
-  fail "Gate 8 (3) missing direct QEMU service dropin must fail modern predicate"
+chmod 755 "$REPO_ROOT/scripts/host/assert-host-containment-release1.sh"
+export CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$TMP/props"
+export PATH="$TMP/policy-bin:$FIXTURE/bin:$PATH"
+(verify_modern_psi_policy --root "$FIXTURE") >"$TMP/valid.log" 2>&1   || fail "canonical finite/auto predicate rejected valid fixture: $(cat "$TMP/valid.log")"
+write_props 8589934592 10737418240 > "$TMP/props"
+if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/caps.log" 2>&1; then
+  fail "wrong live caps must fail canonical predicate"
 fi
-
+write_props 4831838208 5368709120 > "$TMP/props"
+sed -i 's/^user.slice ManagedOOMMemoryPressure auto$/user.slice ManagedOOMMemoryPressure kill/' "$TMP/props"
+if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/kill.log" 2>&1; then
+  fail "broad-root kill scope must fail canonical predicate"
+fi
+write_props 4831838208 5368709120 > "$TMP/props"
+# Execute the actual Gate 8 (3) block, retaining the legacy branch in the source.
+sed -n '/^PSI_OK=0$/,/^# (4) Physical-host RAM envelope/p' "$VERIFY" > "$TMP/gate3.sh"
+IS_MODERN_ENVELOPE=1
+daemon_in_vm() { return 1; }
+(source "$TMP/gate3.sh") >"$TMP/gate3.log" 2>&1   || fail "native Gate 8 (3) rejected canonical finite/auto policy"
+grep -q 'Release 1 finite host caps' "$TMP/gate3.log"   || fail "native Gate 8 (3) did not use canonical assertion"
+write_props 8589934592 10737418240 > "$TMP/props"
+if (source "$TMP/gate3.sh") >"$TMP/gate3-bad.log" 2>&1; then
+  fail "native Gate 8 (3) bypassed canonical live-cap failure"
+fi
 echo "VERIFY_EXIT_GATE8_POLICY_TEST: PASS"
 echo "VERIFY_EXIT_GATE8_TEST: PASS"

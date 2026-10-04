@@ -35,7 +35,6 @@ setup_passing_fixture() {
            "$root/etc/systemd/user" \
            "$root/bin" "$root/state"
 
-  # Host memory floor (65,011,712 KiB = 62 GiB floor)
   printf 'MemTotal:       65512304 kB\nMemFree:        30000000 kB\n' > "$root/proc/meminfo"
   # Online CPUs (32 online CPUs)
   printf '0-31\n' > "$root/sys/devices/system/cpu/online"
@@ -62,9 +61,9 @@ setup_passing_fixture() {
     > "$root/etc/systemd/system/user@.service.d/99-ezgha-containment.conf"
 
   # agents.slice and automation.slice in user units
-  printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=10G\nMemoryMax=12G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/agents.slice"
-  printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=4608M\nMemoryMax=5G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/automation.slice"
 
   # Mock docker command
@@ -207,20 +206,38 @@ ok "assert-host-containment-release1.sh rejects runner container outside actions
 write_props() {
   local auto_high="$1" auto_max="$2" uid; uid="$(id -u)"
   cat <<PROPS
+actions.slice ManagedOOMMemoryPressure auto
+actions.slice ManagedOOMSwap auto
 agents.slice MemoryHigh 10737418240
 agents.slice MemoryMax 12884901888
 agents.slice MemorySwapMax 2147483648
+agents.slice TasksMax 8192
+agents.slice ManagedOOMMemoryPressure auto
+agents.slice ManagedOOMSwap auto
 automation.slice MemoryHigh ${auto_high}
 automation.slice MemoryMax ${auto_max}
 automation.slice MemorySwapMax 1073741824
+automation.slice TasksMax 4096
+automation.slice ManagedOOMMemoryPressure auto
+automation.slice ManagedOOMSwap auto
+lima-vm@colima.service MemoryHigh 9663676416
+lima-vm@colima.service MemoryMax 10737418240
+lima-vm@colima.service MemorySwapMax 2147483648
+lima-vm@colima.service TasksMax 4096
+lima-vm@colima.service CPUQuotaPerSecUSec 16s
+lima-vm@colima.service CPUQuota 1600%
 user@${uid}.service ManagedOOMMemoryPressure auto
 user@${uid}.service ManagedOOMSwap auto
 user@${uid}.service ManagedOOMPreference none
 user@${uid}.service OOMScoreAdjust 0
 -.slice ManagedOOMMemoryPressure auto
+-.slice ManagedOOMSwap auto
 user.slice ManagedOOMMemoryPressure auto
+user.slice ManagedOOMSwap auto
 app.slice ManagedOOMMemoryPressure auto
+app.slice ManagedOOMSwap auto
 session.slice ManagedOOMMemoryPressure auto
+session.slice ManagedOOMSwap auto
 PROPS
 }
 PROPS_BIN="$WORK/props-bin"
@@ -238,16 +255,26 @@ done
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$PROPS_BIN/systemctl"
-write_props 4294967296 5368709120 > "$WORK/props_ok.txt"
+write_props 4831838208 5368709120 > "$WORK/props_ok.txt"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
-  "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1 \
-  || fail "live systemd checks rejected 4G/5G automation.slice: $(tail -3 "$WORK/live_ok.log")"
+  "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1\
+  || fail "live systemd checks rejected 4608M/5G automation.slice: $(cat "$WORK/live_ok.log")"
 write_props 8589934592 10737418240 > "$WORK/props_old.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old.log" 2>&1; then
   fail "live systemd checks accepted the old 8G/10G automation.slice"
 fi
-grep -q "automation.slice MemoryHigh ('8589934592') != '4294967296'" "$WORK/live_old.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
-ok "assert-host-containment-release1.sh live checks accept 4G/5G and reject 8G/10G automation.slice"
+grep -q "automation.slice MemoryHigh ('8589934592') != '4831838208'" "$WORK/live_old.log" || fail "missing automation.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
+ok "assert-host-containment-release1.sh live checks accept 4608M/5G and reject 8G/10G automation.slice"
+
+for property in ManagedOOMMemoryPressure ManagedOOMSwap; do
+  sed "s/actions.slice $property auto/actions.slice $property kill/" "$WORK/props_ok.txt" > "$WORK/props_kill.txt"
+  if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_kill.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+      "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" > "$WORK/live_kill.log" 2>&1; then
+    fail "live systemd checks accepted actions.slice $property=kill"
+  fi
+  grep -q "actions.slice $property" "$WORK/live_kill.log" || fail "wrong failure for actions.slice kill policy"
+done
+ok "actions.slice kill policies are rejected"
 
 echo "ASSERT_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

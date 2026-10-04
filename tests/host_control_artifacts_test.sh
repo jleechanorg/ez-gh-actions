@@ -39,9 +39,11 @@ assert_line "$QEMU_DROPIN" "MemorySwapMax=2G"
 assert_line "$QEMU_DROPIN" "TasksMax=4096"
 assert_line "$QEMU_DROPIN" "CPUQuota=1600%"
 assert_file "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service"
+assert_line "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service" 'ExecStart=@SCRIPTS_DIR@/qemu-ceiling-guard.sh --apply'
+assert_file "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh"
 for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600%; do
-  grep -Fq "$setting" "$REPO_ROOT/systemd/lima-vm-cpu-ceiling.service" \
-    || fail "lima-vm-cpu-ceiling.service missing $setting"
+  grep -Fq "$setting" "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh" \
+    || fail "shared QEMU guard missing $setting"
 done
 assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
@@ -55,7 +57,7 @@ assert_line "$GUEST_ACTIONS_SLICE" "MemoryHigh=28G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemoryMax=32G"
 assert_line "$GUEST_ACTIONS_SLICE" "MemorySwapMax=0"
 assert_line "$GUEST_ACTIONS_SLICE" "TasksMax=6000"
-assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=4G"
+assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=4608M"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=5G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemorySwapMax=1G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "TasksMax=4096"

@@ -559,107 +559,14 @@ verify_retired_timer_policy() {
     done
 }
 
-modern_unit_value() {
-    awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"
-}
-
-modern_to_mb() {
-    case "$1" in
-        *G) echo $(( ${1%G} * 1024 )) ;;
-        *M) echo "${1%M}" ;;
-        *K) echo $(( ${1%K} / 1024 )) ;;
-        *[!0-9]*) echo 0 ;;
-        *) echo $(( $1 / 1024 / 1024 )) ;;
-    esac
-}
-
 verify_modern_psi_policy() {
-    local modern_dir="${VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR:-$MODERN_UNIT_DIR}"
-    local actions_unit="${VERIFY_EXIT_CRITERIA_ACTIONS_UNIT:-${REPO_ROOT:-.}/systemd/host/actions.slice}"
-    local killroot_dir="${VERIFY_EXIT_CRITERIA_KILLROOT_DIR:-}"
-
-    # 1. Direct QEMU service dropin and app-lima-vm.slice must exist and be finite
-    local qemu_dropin="${modern_dir}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-    local qemu_slice="${modern_dir}/app-lima-vm.slice"
-    [ -f "$qemu_dropin" ] || return 1
-    [ -f "$qemu_slice" ] || return 1
-    local qemu_high qemu_max qemu_swap qemu_tasks
-    qemu_high=$(modern_unit_value "$qemu_dropin" MemoryHigh)
-    qemu_max=$(modern_unit_value "$qemu_dropin" MemoryMax)
-    qemu_swap=$(modern_unit_value "$qemu_dropin" MemorySwapMax)
-    qemu_tasks=$(modern_unit_value "$qemu_dropin" TasksMax)
-    [ "$qemu_high" = "9G" ] || return 1
-    [ "$qemu_max" = "10G" ] || return 1
-    [ "$qemu_swap" = "2G" ] || return 1
-    [ "$qemu_tasks" = "4096" ] || return 1
-
-    # 2. agents.slice and automation.slice must be finite and match approved caps
-    local agents_slice="${modern_dir}/agents.slice"
-    local auto_slice="${modern_dir}/automation.slice"
-    [ -f "$agents_slice" ] || return 1
-    [ -f "$auto_slice" ] || return 1
-    local ag_high ag_max ag_swap ag_tasks
-    ag_high=$(modern_unit_value "$agents_slice" MemoryHigh)
-    ag_max=$(modern_unit_value "$agents_slice" MemoryMax)
-    ag_swap=$(modern_unit_value "$agents_slice" MemorySwapMax)
-    ag_tasks=$(modern_unit_value "$agents_slice" TasksMax)
-    [ "$ag_high" = "10G" ] || return 1
-    [ "$ag_max" = "12G" ] || return 1
-    [ "$ag_swap" = "2G" ] || return 1
-    [ "$ag_tasks" = "8192" ] || return 1
-
-    local au_high au_max au_swap au_tasks
-    au_high=$(modern_unit_value "$auto_slice" MemoryHigh)
-    au_max=$(modern_unit_value "$auto_slice" MemoryMax)
-    au_swap=$(modern_unit_value "$auto_slice" MemorySwapMax)
-    au_tasks=$(modern_unit_value "$auto_slice" TasksMax)
-    [ "$au_high" = "4G" ] || return 1
-    [ "$au_max" = "5G" ] || return 1
-    [ "$au_swap" = "1G" ] || return 1
-    [ "$au_tasks" = "4096" ] || return 1
-
-    # 3. actions.slice finite boundary
-    [ -f "$actions_unit" ] || return 1
-    local act_high act_max act_swap
-    act_high=$(awk -F= '$1 == "MemoryHigh" {print $2; exit}' "$actions_unit")
-    act_max=$(awk -F= '$1 == "MemoryMax" {print $2; exit}' "$actions_unit")
-    act_swap=$(awk -F= '$1 == "MemorySwapMax" {print $2; exit}' "$actions_unit")
-    [ "$act_high" = "26G" ] || return 1
-    [ "$act_max" = "28G" ] || return 1
-    [ "$act_swap" = "0" ] || return 1
-
-    # 4. Retired timer policy
-    verify_retired_timer_policy || return 1
-
-    # 5. Broad production or desktop roots must NOT be kill targets
-    if [ -n "$killroot_dir" ] && [ -d "$killroot_dir" ]; then
-        if grep -rqE 'ManagedOOM(MemoryPressure|Swap)=kill' "$killroot_dir" 2>/dev/null; then
-            return 1
-        fi
+    local repo_root="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local assert_cmd="$repo_root/scripts/host/assert-host-containment-release1.sh"
+    if [ ! -r "$assert_cmd" ] || [ ! -x "$assert_cmd" ]; then
+        echo "Mandatory host containment assertion is unavailable: $assert_cmd" >&2
+        return 1
     fi
-    if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" != "1" ]; then
-        local kill_targets
-        kill_targets="$(systemctl show -.slice user.slice app.slice session.slice             --property=ManagedOOMMemoryPressure,ManagedOOMSwap --value --no-pager 2>/dev/null             | grep -E '^kill$' || true)"
-        [ -z "$kill_targets" ] || return 1
-
-        local uid; uid="$(id -u)"
-        local user_svc_kill
-        user_svc_kill="$(systemctl show "user@${uid}.service"             --property=ManagedOOMMemoryPressure,ManagedOOMSwap --value --no-pager 2>/dev/null             | grep -E '^kill$' || true)"
-        [ -z "$user_svc_kill" ] || return 1
-    fi
-
-    # 6. Existing host assertion (if available and not test mode)
-    if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" != "1" ]; then
-        local assert_cmd=""
-        for candidate in             "${SCRIPTS_DIR:-}/assert-host-containment-release1.sh"             "${REPO_ROOT:-.}/scripts/host/assert-host-containment-release1.sh"             "${HOME}/.local/libexec/ezgha/release1/assert-host-containment-release1.sh"; do
-            if [ -x "$candidate" ]; then assert_cmd="$candidate"; break; fi
-        done
-        if [ -n "$assert_cmd" ]; then
-            "$assert_cmd" --runner-count "${COUNT:-14}" || return 1
-        fi
-    fi
-
-    return 0
+    "$assert_cmd" --runner-count "${COUNT:-14}" "$@"
 }
 
 verify_automation_dropins() {
@@ -1462,7 +1369,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
 fi
 # Remediation primer (printed before probes fire so a cold reader sees
 # the four probes + their fixes):
-#   (1) QEMU slice:    systemd/app-lima-vm.slice (MemoryHigh=38G) must be
+#   (1) QEMU slice:    systemd/app-lima-vm.slice (finite approved memory limits) must be
 #                      deployed to ~/.config/systemd/user/ AND reloaded
 #                      (systemctl --user daemon-reload); the LIVE leaf
 #                      cgroup's memory.high in /sys/fs/cgroup must be a
@@ -1487,7 +1394,7 @@ fi
 #                      physical host RAM, lower MemoryHigh on
 #                      app-lima-vm.slice, or lower the agent-CLI slice
 #                      MemoryHigh.
-echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) keep retired PSI timers disabled; rely on system systemd-oomd with a non-empty monitored cgroup and a real shed action. (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live limits and the computed host reserve. Native Release 1 requires ManagedOOM=auto and retired PSI timers; VM-backed legacy policy is checked separately."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
@@ -1521,7 +1428,7 @@ if [ "$PROBE_QEMU_SLICE" = "1" ]; then
             fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
         fi
         if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy systemd/app-lima-vm.slice (finite approved memory limits) to ~/.config/systemd/user/, have the deploy owner reconcile the approved live limits without restarting the VM."
         fi
         echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
     fi
@@ -1558,7 +1465,7 @@ else
                   }
               }')
     if [ -n "$AO_MCP_BAD" ]; then
-        fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite MemoryHigh (~20G) so the Agent Orchestrator + MCP daemons cannot OOM the host."
+        fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite approved memory ceiling so the Agent Orchestrator + MCP daemons cannot OOM the host."
     fi
     AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
                   {
@@ -1655,6 +1562,12 @@ if [ "$(uname -s)" = "Darwin" ]; then
     echo "    [SKIP] Gate 8 (3) PSI admission check: macOS — PSI and systemd-oomd not available"
     PSI_OK=1
     PSI_SOURCE="macOS (PSI/systemd-oomd not available)"
+fi
+
+if [ "$(uname -s)" = "Linux" ] && [ "$IS_MODERN_ENVELOPE" = 1 ] && ! daemon_in_vm; then
+    verify_modern_psi_policy || fail "Gate 8 (3): canonical live host containment assertion failed"
+    PSI_OK=1
+    PSI_SOURCE="Release 1 finite host caps and ManagedOOM=auto"
 fi
 
 if [ "$PSI_OK" != "1" ]; then
@@ -1834,7 +1747,7 @@ else
         fail "Gate 8 (4) QEMU slice /sys/fs/cgroup${QEMU_CG_PATH}/memory.high is unreadable. Remediation: verify cgroup-v2 fs is mounted and the slice path is correct (got QEMU_CG='$QEMU_CG')."
     fi
     if [ "$QEMU_CEILING_BYTES" = "max" ]; then
-        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy systemd/app-lima-vm.slice (finite approved memory limits) to ~/.config/systemd/user/, have the deploy owner reconcile the approved live limits without restarting the VM."
     fi
     QEMU_CEILING_MB=$(awk -v b="$QEMU_CEILING_BYTES" 'BEGIN { printf "%d\n", b / 1024 / 1024 }')
 

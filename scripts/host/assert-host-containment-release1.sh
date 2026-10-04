@@ -24,9 +24,19 @@ esac
 
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null || true)"
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
-# Floor is the computed sum of the four enforced hard limits (Actions 28G + QEMU 10G + Agents 12G + Automation 5G = 55 GiB)
-# plus max(2 GiB, 10% of host MemTotal). Never hardcoded magic 55GiB or old 62GiB.
-hard_limits_sum_kib=$(( (28 + 10 + 12 + 5) * 1024 * 1024 ))
+
+# Floor is the computed sum of the four enforced hard limits
+# (Actions 28G + QEMU 10G + Agents 12G + Automation 5G = 55 GiB)
+# plus max(2 GiB, 10% of host MemTotal).
+ENFORCED_ACTIONS_MAX_BYTES=30064771072
+ENFORCED_QEMU_MAX_BYTES=10737418240
+ENFORCED_AGENTS_MAX_BYTES=12884901888
+ENFORCED_AUTOMATION_MAX_BYTES=5368709120
+
+for b in "$ENFORCED_ACTIONS_MAX_BYTES" "$ENFORCED_QEMU_MAX_BYTES" "$ENFORCED_AGENTS_MAX_BYTES" "$ENFORCED_AUTOMATION_MAX_BYTES"; do
+  [[ "$b" =~ ^[1-9][0-9]*$ ]] || fail "enforced memory limit must be a positive integer"
+done
+hard_limits_sum_kib=$(( (ENFORCED_ACTIONS_MAX_BYTES + ENFORCED_QEMU_MAX_BYTES + ENFORCED_AGENTS_MAX_BYTES + ENFORCED_AUTOMATION_MAX_BYTES) / 1024 ))
 reserve_kib=$(( mem_total_kib / 10 ))
 [ "$reserve_kib" -ge 2097152 ] || reserve_kib=2097152
 computed_floor_kib=$(( hard_limits_sum_kib + reserve_kib ))
@@ -52,7 +62,7 @@ check_cgroup_val() {
   [ "$actual" = "$expected" ] || fail "actions.slice $name ('$actual') != '$expected'"
 }
 check_cgroup_val "$ACTIONS_DIR/memory.high" 27917287424 memory.high
-check_cgroup_val "$ACTIONS_DIR/memory.max" 30064771072 memory.max
+check_cgroup_val "$ACTIONS_DIR/memory.max" "$ENFORCED_ACTIONS_MAX_BYTES" memory.max
 check_cgroup_val "$ACTIONS_DIR/memory.swap.max" 0 memory.swap.max
 check_cgroup_val "$ACTIONS_DIR/pids.max" "$ACTIONS_PIDS_MAX" pids.max
 check_cgroup_val "$ACTIONS_DIR/cpu.max" "2000000 100000" cpu.max
@@ -68,25 +78,68 @@ if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
   }
   check_user_property agents.slice MemoryHigh 10737418240
-  check_user_property agents.slice MemoryMax 12884901888
+  check_user_property agents.slice MemoryMax "$ENFORCED_AGENTS_MAX_BYTES"
   check_user_property agents.slice MemorySwapMax 2147483648
-  check_user_property automation.slice MemoryHigh 4294967296
-  check_user_property automation.slice MemoryMax 5368709120
+  check_user_property agents.slice TasksMax 8192
+  check_user_property agents.slice ManagedOOMMemoryPressure auto
+  check_user_property agents.slice ManagedOOMSwap auto
+
+  check_user_property automation.slice MemoryHigh 4831838208
+  check_user_property automation.slice MemoryMax "$ENFORCED_AUTOMATION_MAX_BYTES"
   check_user_property automation.slice MemorySwapMax 1073741824
+  check_user_property automation.slice TasksMax 4096
+  check_user_property automation.slice ManagedOOMMemoryPressure auto
+  check_user_property automation.slice ManagedOOMSwap auto
+
+  check_user_property lima-vm@colima.service MemoryHigh 9663676416
+  check_user_property lima-vm@colima.service MemoryMax "$ENFORCED_QEMU_MAX_BYTES"
+  check_user_property lima-vm@colima.service MemorySwapMax 2147483648
+  check_user_property lima-vm@colima.service TasksMax 4096
+  actual_quota="$(systemctl --user show -p CPUQuotaPerSecUSec --value -- lima-vm@colima.service 2>/dev/null || true)"
+  [ -n "$actual_quota" ] || actual_quota="$(systemctl --user show -p CPUQuota --value -- lima-vm@colima.service 2>/dev/null || true)"
+  case "$actual_quota" in
+    16s|1600%) ;;
+    *) fail "lima-vm@colima.service CPUQuota ('$actual_quota') != '16s' / '1600%'" ;;
+  esac
+
   check_system_property() {
     local unit="$1" property="$2" expected="$3" actual
     actual="$(systemctl show -p "$property" --value -- "$unit")"
     [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
   }
+  check_system_property actions.slice ManagedOOMMemoryPressure auto
+  check_system_property actions.slice ManagedOOMSwap auto
   deploy_uid="$(id -u)"
   check_system_property "user@${deploy_uid}.service" ManagedOOMMemoryPressure auto
   check_system_property "user@${deploy_uid}.service" ManagedOOMSwap auto
   check_system_property "user@${deploy_uid}.service" ManagedOOMPreference none
   check_system_property "user@${deploy_uid}.service" OOMScoreAdjust 0
   check_system_property -.slice ManagedOOMMemoryPressure auto
+  check_system_property -.slice ManagedOOMSwap auto
   check_system_property user.slice ManagedOOMMemoryPressure auto
+  check_system_property user.slice ManagedOOMSwap auto
   check_user_property app.slice ManagedOOMMemoryPressure auto
+  check_user_property app.slice ManagedOOMSwap auto
   check_user_property session.slice ManagedOOMMemoryPressure auto
+  check_user_property session.slice ManagedOOMSwap auto
+
+  check_no_kill() {
+    local scope="$1" unit="$2" press swap
+    if [ "$scope" = "user" ]; then
+      press="$(systemctl --user show -p ManagedOOMMemoryPressure --value -- "$unit" 2>/dev/null || true)"
+      swap="$(systemctl --user show -p ManagedOOMSwap --value -- "$unit" 2>/dev/null || true)"
+    else
+      press="$(systemctl show -p ManagedOOMMemoryPressure --value -- "$unit" 2>/dev/null || true)"
+      swap="$(systemctl show -p ManagedOOMSwap --value -- "$unit" 2>/dev/null || true)"
+    fi
+    [ "$press" != "kill" ] || fail "forbidden kill policy on $unit (ManagedOOMMemoryPressure=kill)"
+    [ "$swap" != "kill" ] || fail "forbidden kill policy on $unit (ManagedOOMSwap=kill)"
+  }
+  check_no_kill system -.slice
+  check_no_kill system user.slice
+  check_no_kill system "user@${deploy_uid}.service"
+  check_no_kill user app.slice
+  check_no_kill user session.slice
 fi
 
 if [ "$REQUIRE_FLEET" -eq 1 ]; then

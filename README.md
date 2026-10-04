@@ -47,12 +47,13 @@ document the intended controls; they do not close those live gaps.
 
 ## Linux HostDocker crash containment
 
-On the 62-GiB/32-CPU Linux host profile, `install.sh` activates the tracked
+On Linux hosts with at least 32 CPUs and enough RAM for the 55-GiB hard-limit
+budget plus max(2 GiB, 10% of MemTotal) reserve, `install.sh` activates the tracked
 containment policy before starting the runner service. System policy installation
 requires administrator authentication. The runner fleet uses `actions.slice`
 with a 26-GiB memory high watermark, a 28-GiB hard limit, zero swap, 8,000 tasks,
-and a 20-CPU aggregate quota. Agent and automation slices have separate 20-GiB
-and 6-GiB hard limits. Broad desktop/user slices are removed from direct OOMD
+and a 20-CPU aggregate quota. The VM, agent, and automation slices have separate 10-GiB,
+12-GiB, and 5-GiB hard limits. Broad desktop/user slices are removed from direct OOMD
 pressure targeting; individual workload limits remain enforced by the kernel.
 
 Activation checks current workload usage before lowering limits, and does not

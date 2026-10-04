@@ -473,10 +473,12 @@ if [ "$(uname -s)" = "Linux" ]; then
       "${HOST_POLICY_DIR}/systemd/host/user-.slice.d" \
       "${HOST_POLICY_DIR}/systemd/host/user@.service.d" \
       "${HOST_POLICY_DIR}/systemd/user/app.slice.d" \
-      "${HOST_POLICY_DIR}/systemd/user/session.slice.d"
+      "${HOST_POLICY_DIR}/systemd/user/session.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/lima-vm@colima.service.d"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
-    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice; do
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/qemu-ceiling-guard.sh" "${HOST_CONTROL_DIR}/qemu-ceiling-guard.sh"
+    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done
     if sudo -n true >/dev/null 2>&1; then
@@ -789,12 +791,16 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+    for script in agent-scoped-launch.sh agent-scope-reaper.sh assert-host-containment-release1.sh apply-host-containment-release1.sh qemu-ceiling-guard.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
     done
 
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" || {
+      bad "refusing to install QEMU ceiling: live usage exceeds threshold or cgroup is unreadable"
+      exit 1
+    }
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
@@ -818,9 +824,8 @@ FSTRIM_EOF
     install -m 0644 \
       "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
       "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
-    install -m 0644 \
-      "${UNIT_DIR}/lima-vm-cpu-ceiling.service" \
-      "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
+    sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+        "${UNIT_DIR}/lima-vm-cpu-ceiling.service" > "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
 
     # Docker's --cgroup-parent=actions.slice places every runner beneath one
     # guest aggregate. Install the tracked slice inside Colima so ten
@@ -892,12 +897,10 @@ EOF
     # Apply the direct QEMU ceiling to an already-running Colima service.
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.
-    if systemctl --user set-property --runtime lima-vm@colima.service \
-         MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuota=1600% 2>/dev/null; then
-      ok "live QEMU service memory+CPU ceiling applied"
-    else
-      warn "live QEMU ceiling not applied — it will take effect on the next Colima start"
-    fi
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --apply || {
+      bad "failed to apply and verify live QEMU service memory+CPU ceiling"
+      exit 1
+    }
     if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
       ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
     else
