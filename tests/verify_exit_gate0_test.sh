@@ -12,7 +12,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
 mkdir -p "$REPO/src" "$REPO/docs"
-git -C "$REPO" init -q
+git -C "$REPO" init -q -b fixture
 git -C "$REPO" config user.email t@example.com
 git -C "$REPO" config user.name t
 echo 'fn main(){}' > "$REPO/src/main.rs"
@@ -106,7 +106,7 @@ rc=0; out=$(gate0 deadbee) || rc=$?
 # stale inline strict-equality check in the normal dispatch.
 NORMAL_REPO="$TMP/normal-repo"
 mkdir -p "$NORMAL_REPO/src" "$NORMAL_REPO/docs"
-git -C "$NORMAL_REPO" init -q
+git -C "$NORMAL_REPO" init -q -b fixture
 git -C "$NORMAL_REPO" config user.email t@example.com
 git -C "$NORMAL_REPO" config user.name t
 echo 'fn main(){}' > "$NORMAL_REPO/src/main.rs"

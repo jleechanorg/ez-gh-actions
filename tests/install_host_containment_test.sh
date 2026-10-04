@@ -28,6 +28,14 @@ if [[ "$args" == *" context inspect explicit-context "* ]]; then
   echo "unix://$HOME/.colima/default/docker.sock"
   exit 0
 fi
+if [[ "$args" == *" context inspect remote-context "* ]]; then
+  echo ssh://fixture-remote
+  exit 0
+fi
+if [[ "$args" == *" context inspect "* ]]; then
+  echo unix:///var/run/docker.sock
+  exit 0
+fi
 if [[ "$args" == *" info "* ]]; then
   echo "docker-info:${DOCKER_HOST:-}" >> "$EVENT_LOG"
   if [[ "${DOCKER_HOST:-}" == *"/.colima/default/docker.sock" ]]; then
@@ -105,6 +113,22 @@ for agent in codex claude gemini cursor aider cody; do
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/$agent"
 done
 chmod +x "$STUB_BIN"/*
+# Named contexts take precedence over a reachable local Docker socket.
+if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context \
+    "$REPO_ROOT/scripts/host/docker-host-mode.sh" >/dev/null 2>&1; then
+  fail "remote context was ignored in favor of the local default socket"
+fi
+if env -u QEMU_CEILING_MODE EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" \
+    DOCKER_CONTEXT=remote-context bash "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" >/dev/null 2>&1; then
+  fail "QEMU assertion ignored the selected remote context"
+fi
+(
+  export EVENT_LOG PATH="$STUB_BIN:$PATH" DOCKER_CONTEXT=remote-context
+  fail() { echo "$*" >&2; exit 1; }
+  eval "$(sed -n '/^DOCKER_HOST=.*--print-endpoint/,/^$/p' "$REPO_ROOT/docs/verify-exit-criteria.sh")"
+) > "$WORK/remote-verifier.log" 2>&1 && fail "verifier selected the local socket for a remote context"
+grep -q 'Docker endpoint ownership is unknown' "$WORK/remote-verifier.log" \
+  || fail "verifier did not reject the actual selected remote endpoint"
 if EVENT_LOG="$EVENT_LOG" PATH="$STUB_BIN:$PATH" FIXTURE_PROBE_FAIL=1 \
     "$REPO_ROOT/scripts/host/docker-host-mode.sh" unix:///var/run/docker.sock >/dev/null 2>&1; then
   fail "failed kernel probe with matching stdout was accepted"

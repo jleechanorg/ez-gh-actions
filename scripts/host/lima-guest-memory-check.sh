@@ -31,6 +31,41 @@ unknown() {
   exit 1
 }
 
+# Bind admission to the service whose QEMU limit will be changed, including
+# nested cgroups. A caller-selected LIMA_HOME cannot hide another live guest.
+check_capped_instance() {
+  local unit_cgroup cgroup_dir cgroup_files cgroup_file pid comm_file
+  local -a args
+  unit_cgroup="$(systemctl --user show -p ControlGroup --value -- lima-vm@colima.service)" \
+    || unknown "cannot resolve capped unit cgroup"
+  [ -n "$unit_cgroup" ] || return 0
+  case "$unit_cgroup" in
+    /|*../*|*/..) unknown "invalid capped unit cgroup" ;;
+    /*) ;;
+    *) unknown "invalid capped unit cgroup" ;;
+  esac
+  cgroup_dir="${QEMU_CGROUP_ROOT:-/sys/fs/cgroup}${unit_cgroup}"
+  [ -r "$cgroup_dir/cgroup.procs" ] || unknown "cannot read capped unit processes"
+  cgroup_files="$(find "$cgroup_dir" -name cgroup.procs -type f -print)" \
+    || unknown "cannot enumerate capped unit descendants"
+  while IFS= read -r cgroup_file; do
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || unknown "invalid capped unit PID"
+      [ -d "$PROC_ROOT/$pid" ] || continue
+      comm_file="$PROC_ROOT/$pid/comm"
+      [ -r "$comm_file" ] || unknown "cannot inspect capped unit PID $pid"
+      case "$(cat "$comm_file")" in qemu-system-*) ;; *) continue ;; esac
+      mapfile -d '' args < "$PROC_ROOT/$pid/cmdline" \
+        || unknown "cannot inspect capped unit QEMU $pid"
+      [ -n "${INSTANCE_DIR:-}" ] || unknown "capped unit QEMU has no resolved Lima instance"
+      case " ${args[*]} " in
+        *"${INSTANCE_DIR}/"*) ;;
+        *) unknown "capped unit QEMU $pid belongs to a different Lima instance" ;;
+      esac
+    done < "$cgroup_file"
+  done <<< "$cgroup_files"
+}
+
 if [ -n "${LIMA_YAML+x}" ]; then
   INSTANCE_DIR="$(dirname "$LIMA_YAML")"
 else
@@ -49,6 +84,8 @@ try:
 except (ValueError, json.JSONDecodeError, TypeError, IndexError):
     raise SystemExit(1)')"     || { echo "FAIL lima guest memory unknown (limactl list --json colima has no authoritative dir)" >&2; exit 1; }
   if [ "$instance_dir" = NO_INSTANCE ]; then
+    INSTANCE_DIR=""
+    check_capped_instance
     for comm in "$PROC_ROOT"/[0-9]*/comm; do
       [ -r "$comm" ] || continue
       case "$(cat "$comm" 2>/dev/null)" in qemu-system-*) ;; *) continue ;; esac
@@ -67,6 +104,7 @@ except (ValueError, json.JSONDecodeError, TypeError, IndexError):
   INSTANCE_DIR="$instance_dir"
   LIMA_YAML="${INSTANCE_DIR}/lima.yaml"
 fi
+check_capped_instance
 if [ "$PRINT_YAML" -eq 1 ]; then
   printf '%s\n' "$LIMA_YAML"
   exit 0

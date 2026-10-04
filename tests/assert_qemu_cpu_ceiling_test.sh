@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export REPO_ROOT
 # Live bounds are mode-dependent (bead ez-gh-actions-154k): VM-backed keeps
-# 9G/10G, host-docker caps the qemu-only Colima VM at 9G/10G.  Pin the mode
+# 34G/38G, host-docker caps the qemu-only Colima VM at 9G/10G.  Pin the mode
 # so fixtures never depend on this host's docker daemon.
 export QEMU_CEILING_MODE=vm-backed
 out="$(bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh")"

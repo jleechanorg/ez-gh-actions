@@ -1,6 +1,6 @@
 # app-lima-vm.slice — host-docker QEMU ceiling.
 # Host Docker keeps runners under actions.slice; the Colima VM uses an 8 GiB
-# guest. The measured margin is 5.7 GiB above a 3.3 GiB observed QEMU peak.
+# guest. The limits reserve space above the guest allocation for QEMU.
 # MemoryMax=10G bounds the guest and QEMU overhead. Keep these values aligned
 # with systemd/host-docker/lima-vm@colima.service.d/99-memory-ceiling.conf.
 

@@ -375,13 +375,8 @@ DOCKER_HOST_OVERRIDE=""
 # value that can be persisted for the service and reused by every build and
 # runner mutation. Docker documents that DOCKER_CONTEXT overrides DOCKER_HOST,
 # so resolve a named context first; otherwise honor an explicit host socket.
-if [ -n "${DOCKER_CONTEXT:-}" ]; then
-  DOCKER_CTX_HOST=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
-elif [ -n "${DOCKER_HOST:-}" ]; then
-  DOCKER_CTX_HOST="$DOCKER_HOST"
-else
-  DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
-fi
+DOCKER_CTX_HOST="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+  || { bad "cannot resolve selected Docker endpoint"; exit 1; }
 # Strategy 2: probe colima's default location
 DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
 # Strategy 3: probe docker desktop's socket
@@ -939,7 +934,7 @@ EOF
     if [ "${APPLY_VM_CEILING}" -eq 1 ] && systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
       ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
     elif [ "${APPLY_VM_CEILING}" -eq 0 ]; then
-      warn "lima-vm-cpu-ceiling.service not enabled while guest-memory check refuses the 5G ceiling"
+      warn "lima-vm-cpu-ceiling.service not enabled while guest-memory check refuses the 10G ceiling"
     else
       warn "lima-vm-cpu-ceiling.service not enabled"
     fi

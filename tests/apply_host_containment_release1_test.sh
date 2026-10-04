@@ -125,9 +125,9 @@ preflight_case() { # name slice current file shmem expect(pass|refuse)
     grep -q "$2" "$WORK/preflight_$1.log" || fail "preflight $1 refusal does not name $2"
   fi
 }
-# 16G current but 6G of it is reclaimable page cache: 10G <= 12G passes.
+# 15G current minus 6G reclaimable cache reaches the 9G admission threshold.
 preflight_case agents_cache agents.slice $((15 * G)) $((6 * G)) 0 pass
-# 15G current, 1G file: 14G non-reclaimable > 12G refuses.
+# 12G current minus 1G reclaimable cache exceeds the 9G admission threshold.
 preflight_case agents_anon agents.slice $((12 * G)) $((1 * G)) 0 refuse
 grep -q "agents.slice non-reclaimable 11811160064 bytes > 9663676416" "$WORK/preflight_agents_anon.log" \
   || fail "agents refusal lacks the measured numbers: $(tail -2 "$WORK/preflight_agents_anon.log")"
@@ -138,7 +138,7 @@ preflight_case automation_cache automation.slice $((4 * G)) $((G / 2)) 0 pass
 preflight_case automation_anon automation.slice $((5 * G)) $((G / 2)) 0 refuse
 ok "apply-host-containment-release1.sh refuses to lower a user slice beneath its non-reclaimable use and changes nothing"
 
-# 3b. Lima guest memory gate: the host-docker QEMU ceiling (4608M/5G) is only
+# 3b. Lima guest memory gate: the host-docker QEMU ceiling (9G/10G) is only
 #     safe for a <= 8 GiB guest. `limactl list` reports lima.yaml, not the
 #     running VM, so the running size comes from the colima QEMU's `-m` (MiB);
 #     any state the check cannot establish refuses before any write.
@@ -215,14 +215,15 @@ ok "apply-host-containment-release1.sh refuses the host-docker QEMU ceiling whil
 EMPTY_LIMA="$WORK/empty_lima"
 mkdir -p "$EMPTY_LIMA/bin" "$EMPTY_LIMA/proc/7777"
 printf '#!/bin/sh\nexit 0\n' > "$EMPTY_LIMA/bin/limactl"
-chmod +x "$EMPTY_LIMA/bin/limactl"
+printf '#!/bin/sh\nexit 0\n' > "$EMPTY_LIMA/bin/systemctl"
+chmod +x "$EMPTY_LIMA/bin/limactl" "$EMPTY_LIMA/bin/systemctl"
 printf 'qemu-system-x86\n' > "$EMPTY_LIMA/proc/7777/comm"
 printf '%s\0' qemu-system-x86_64 -m 12288 -drive \
   "file=$EMPTY_LIMA/colima/diffdisk" > "$EMPTY_LIMA/proc/7777/cmdline"
 for mode in check path; do
   args=()
   [ "$mode" != path ] || args=(--print-yaml)
-  if env -u LIMA_YAML LIMACTL="$EMPTY_LIMA/bin/limactl" LIMA_PROC_ROOT="$EMPTY_LIMA/proc" \
+  if env -u LIMA_YAML PATH="$EMPTY_LIMA/bin:$PATH" LIMACTL="$EMPTY_LIMA/bin/limactl" LIMA_PROC_ROOT="$EMPTY_LIMA/proc" \
       "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" "${args[@]}" > "$WORK/empty-$mode.log" 2>&1; then
     fail "empty Lima listing hid a running guest ($mode)"
   fi
@@ -230,9 +231,56 @@ for mode in check path; do
     || fail "missing owned-QEMU diagnostic ($mode)"
 done
 mkdir -p "$EMPTY_LIMA/no_proc"
-env -u LIMA_YAML LIMACTL="$EMPTY_LIMA/bin/limactl" LIMA_PROC_ROOT="$EMPTY_LIMA/no_proc" \
+env -u LIMA_YAML PATH="$EMPTY_LIMA/bin:$PATH" LIMACTL="$EMPTY_LIMA/bin/limactl" LIMA_PROC_ROOT="$EMPTY_LIMA/no_proc" \
   "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" >/dev/null \
   || fail "proven absence of a Colima instance was rejected"
+
+# The unit being capped must belong to the same Lima instance as the caller.
+DUAL_LIMA="$WORK/dual_lima"
+mkdir -p "$DUAL_LIMA/bin" "$DUAL_LIMA/lima/colima" "$DUAL_LIMA/proc/8888" \
+  "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service"
+printf 'memory: "8GiB"\n' > "$DUAL_LIMA/lima/colima/lima.yaml"
+printf 'qemu-system-x86\n' > "$DUAL_LIMA/proc/8888/comm"
+printf '%s\0' qemu-system-x86_64 -m 12288 -drive \
+  "file=$DUAL_LIMA/other/colima/diffdisk" > "$DUAL_LIMA/proc/8888/cmdline"
+printf '8888\n' > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/cgroup.procs"
+cat > "$DUAL_LIMA/bin/systemctl" <<'SHIM'
+#!/bin/sh
+printf '/fixture/lima-vm@colima.service\n'
+SHIM
+cat > "$DUAL_LIMA/bin/limactl" <<'SHIM'
+#!/bin/sh
+printf '{"status":"Stopped","memory":8589934592}\n'
+SHIM
+chmod +x "$DUAL_LIMA/bin/"*
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" > "$WORK/dual_lima.log" 2>&1; then
+  fail "caller-selected stopped instance hid a different running guest in the capped unit"
+fi
+grep -q 'FAIL lima guest memory unknown.*capped unit' "$WORK/dual_lima.log" \
+  || fail "dual-Lima refusal did not identify the capped unit mismatch"
+
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" --print-yaml > "$WORK/dual_path.log" 2>&1; then
+  fail "wrong-instance configuration path was offered to the installer"
+fi
+mkdir -p "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/child"
+mv "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/cgroup.procs" \
+  "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/child/cgroup.procs"
+: > "$DUAL_LIMA/cgroup/fixture/lima-vm@colima.service/cgroup.procs"
+if PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+    LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+    "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" > "$WORK/dual_nested.log" 2>&1; then
+  fail "nested capped cgroup hid a different running guest"
+fi
+printf '%s\0' qemu-system-x86_64 -m 8192 -drive \
+  "file=$DUAL_LIMA/lima/colima/diffdisk" > "$DUAL_LIMA/proc/8888/cmdline"
+PATH="$DUAL_LIMA/bin:$PATH" LIMA_YAML="$DUAL_LIMA/lima/colima/lima.yaml" \
+  LIMA_PROC_ROOT="$DUAL_LIMA/proc" QEMU_CGROUP_ROOT="$DUAL_LIMA/cgroup" \
+  "$REPO_ROOT/scripts/host/lima-guest-memory-check.sh" >/dev/null \
+  || fail "matching bounded guest in capped unit was rejected"
 
 # 4. Pre-mutation gate: do not lower actions.slice beneath live use.
 ACTIONS_MEM_FAIL_ROOT="$WORK/actions_mem_fail"
@@ -254,6 +302,7 @@ setup_fixture "$LIVE_ROOT"
 # set-property calls in the live branch establish.
 uid="$(id -u)"
 cat > "$WORK/live_props.txt" <<PROPS
+lima-vm@colima.service ControlGroup
 agents.slice MemoryHigh 10737418240
 agents.slice MemoryMax 12884901888
 agents.slice MemorySwapMax 2147483648

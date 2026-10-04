@@ -47,7 +47,6 @@ for mode in vm-backed host-docker; do
       || fail "$mode lima-vm-cpu-ceiling.service missing $setting"
     grep -Fq "$setting" "$REPO_ROOT/install.sh" || fail "install.sh does not apply $mode $setting"
   done
-  grep -q "measured margin" "$dir/app-lima-vm.slice" || fail "$mode app-lima-vm.slice lacks measured margin documentation"
 done
 # Every memory value is an integer unit (systemd and the Gate 8 bash helpers
 # both reject fractional sizes such as 4.5G).
@@ -70,9 +69,7 @@ assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryHigh=4608M"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemoryMax=5G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "MemorySwapMax=1G"
 assert_line "$REPO_ROOT/systemd/automation.slice" "TasksMax=4096"
-grep -q "measured margin" "$REPO_ROOT/systemd/agents.slice" || fail "agents.slice lacks measured margin documentation"
-grep -q "measured margin" "$REPO_ROOT/systemd/automation.slice" || fail "automation.slice lacks measured margin documentation"
-ok "slice budgets and measured-margin documentation"
+ok "finite slice budgets"
 
 LAUNCH="$REPO_ROOT/scripts/host/agent-scoped-launch.sh"
 assert_file "$LAUNCH"

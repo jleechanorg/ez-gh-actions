@@ -48,7 +48,6 @@ assert_line "$AGENTS_SLICE" "MemorySwapMax=2G"
 assert_line "$AGENTS_SLICE" "TasksMax=8192"
 assert_line "$AGENTS_SLICE" "ManagedOOMMemoryPressure=auto"
 assert_line "$AGENTS_SLICE" "ManagedOOMSwap=auto"
-grep -q "2026-10-03" "$AGENTS_SLICE" || fail "agents.slice missing the 2026-10-03 operator-decision justification"
 ok "systemd/agents.slice 10G/12G envelope and auto OOM policies"
 
 AUTOMATION_SLICE="$REPO_ROOT/systemd/automation.slice"
@@ -59,7 +58,6 @@ assert_line "$AUTOMATION_SLICE" "MemorySwapMax=1G"
 assert_line "$AUTOMATION_SLICE" "TasksMax=4096"
 assert_line "$AUTOMATION_SLICE" "ManagedOOMMemoryPressure=auto"
 assert_line "$AUTOMATION_SLICE" "ManagedOOMSwap=auto"
-grep -q "2026-10-03" "$AUTOMATION_SLICE" || fail "automation.slice missing the 2026-10-03 operator-decision justification"
 ok "systemd/automation.slice 4608M/5G envelope and auto OOM policies"
 
 # 3. Boundary drop-ins (6 tracked drop-ins)

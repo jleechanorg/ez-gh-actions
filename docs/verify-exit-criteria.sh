@@ -849,8 +849,12 @@ elif [ "$PLATFORM" = "macos" ]; then
   [ -f "${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist" ]     || fail "launchd plist missing at ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
 fi
 
+DOCKER_HOST="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+    || fail "Docker endpoint selection is unknown; cannot verify containment"
+export DOCKER_HOST
+unset DOCKER_CONTEXT
 docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unreachable"
-DOCKER_CONTAINMENT_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "${DOCKER_HOST:-unix:///var/run/docker.sock}")" \
+DOCKER_CONTAINMENT_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "$DOCKER_HOST")" \
     || fail "Docker endpoint ownership is unknown; cannot verify containment"
 
 if [ "$PLATFORM" = "macos" ] && command -v colima >/dev/null 2>&1; then

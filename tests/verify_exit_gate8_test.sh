@@ -168,7 +168,7 @@ if env_out=$(run_envelope "$ROOT"); then
 fi
 grep -Fq 'agents.slice' <<<"$env_out" || fail "unbounded rejection did not name agents.slice: $env_out"
 
-# (c) the pre-154k maxima 28+20+10+5 = 64512 MB over-commit the host even
+# (c) maxima of 28+20+10+10 = 69632 MB over-commit the host even
 #     when live state matches its (old) policy.
 OLD_POLICY="$TMP/old-policy"
 mkdir -p "$OLD_POLICY/systemd/host" "$OLD_POLICY/systemd/host-docker/lima-vm@colima.service.d"
@@ -181,14 +181,14 @@ printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\n' > "$OLD_POLICY/systemd/agents.
 printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\n' > "$OLD_POLICY/systemd/automation.slice"
 set_live_policy $((18 * G)) $((20 * G)) $((8 * G)) $((10 * G))
 if env_out=$(run_envelope "$OLD_POLICY"); then
-  fail "host-docker 28+20+10+5 envelope should fail: $env_out"
+  fail "host-docker 28+20+10+10 envelope should fail: $env_out"
 fi
 grep -Fq 'exceed host' <<<"$env_out" || fail "old maxima did not fail on the envelope sum: $env_out"
 
 # (d) live state that drifted from the tracked policy fails even if it fits.
 set_live_policy $((10 * G)) $((12 * G)) $((4 * G)) $((5 * G))
 if env_out=$(run_envelope "$ROOT"); then
-  fail "live automation.slice 6G/7G must not match the tracked 4608M/5G policy: $env_out"
+  fail "live automation.slice 4G/5G must not match the tracked 4608M/5G policy: $env_out"
 fi
 
 # Gate 8 (3): oomd must monitor /actions.slice (real `oomctl` layout).
@@ -451,7 +451,7 @@ chmod +x "$TMP/timerbin/systemctl"
 # Exercise the real Linux Gate 8 pre-envelope block with no modern-envelope
 # files. The helper-only cases below are insufficient: this proves the actual
 # branch calls the policy before optional local-envelope detection.
-run_gate8_pre_envelope() {
+run_gate8_timer_fixture_pre_envelope() {
   local gate_header modern_start gate_start timer_start timer_end original_fail
   gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
   modern_start=$(grep -n '^if \[ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" \]' "$VERIFY" | cut -d: -f1)
@@ -485,18 +485,18 @@ unset STUB_NOTFOUND STUB_ABSENT STUB_SYSTEMCTL_BROKEN STUB_BROKEN_MSG
 STUB_ENABLED_TIMERS="psi-oom-watcher.timer"
 STUB_ACTIVE_TIMERS=""
 export STUB_ENABLED_TIMERS
-run_gate8_pre_envelope
+run_gate8_timer_fixture_pre_envelope
 [ -n "$GATE8_POLICY_RESULT" ] \
   || fail "enabled PSI timer must fail through Gate 8 before optional envelope detection"
 grep -Fq 'psi-oom-watcher.timer' <<<"$GATE8_POLICY_RESULT" \
   || fail "pre-envelope timer failure omitted diagnostic: $GATE8_POLICY_RESULT"
 STUB_ENABLED_TIMERS=""
-run_gate8_pre_envelope
+run_gate8_timer_fixture_pre_envelope
 [ -z "$GATE8_POLICY_RESULT" ] \
   || fail "disabled PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
 STUB_ABSENT=1
 export STUB_ABSENT
-run_gate8_pre_envelope
+run_gate8_timer_fixture_pre_envelope
 [ -z "$GATE8_POLICY_RESULT" ] \
   || fail "absent PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
 unset STUB_ABSENT

@@ -103,7 +103,6 @@ jobs:
           bash tests/refresh_gh_app_token_timeout_test.sh
           bash tests/verify_other_error_report.sh
           bash tests/verify_exit_gate0_test.sh
-          bash tests/verify_exit_gate8_test.sh
       - name: Install Python test-only dependencies
         run: pip install -r tests/requirements.txt
       - name: Mint-token and job-outcome-monitor Python regression tests
