@@ -277,26 +277,73 @@ verify_managed_runners_in_actions_slice() {
     }
 }
 
+GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT='ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}" 2>/dev/null) || {
+    echo "could not list managed runner containers" >&2
+    exit 1
+}
+test -n "$ids" || {
+    echo "no managed runner containers found" >&2
+    exit 1
+}
+live_found=0
+for id in $ids; do
+    test -n "$id" || continue
+    inspect=$(docker inspect -f "{{.State.Running}} {{.State.Status}} {{.State.Pid}}" "$id" 2>/dev/null) || {
+        echo "managed runner $id could not be inspected" >&2
+        exit 1
+    }
+    running="" status="" pid="" extra=""
+    read -r running status pid extra <<EOF
+$inspect
+EOF
+    if [ -z "$running" ] || [ -z "$status" ] || [ -z "$pid" ] || [ -n "$extra" ]; then
+        echo "managed runner $id returned malformed state: ${inspect:-unavailable}" >&2
+        exit 1
+    fi
+    case "$running:$status:$pid" in
+        false:exited:0) continue ;;
+        true:running:0|true:running:''|true:running:|true:running:*[!0-9]*)
+            echo "managed runner $id has invalid live PID: $pid" >&2
+            exit 1
+            ;;
+        true:running:*) live_found=1 ;;
+        *)
+            echo "managed runner $id has unverified state: $inspect" >&2
+            exit 1
+            ;;
+    esac
+    raw=$(grep "^0::" "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
+    path=${raw#0::}
+    case "$path" in
+        /actions.slice|/actions.slice/*) ;;
+        *)
+            echo "managed runner $id (pid=$pid) is outside actions.slice: ${path:-unavailable}" >&2
+            exit 1
+            ;;
+    esac
+    test -d "/sys/fs/cgroup$path" || {
+        echo "managed runner $id cgroup is not materialized under /sys/fs/cgroup: $path" >&2
+        exit 1
+    }
+done
+if [ "$live_found" -ne 1 ]; then
+    echo "no positively inspected live managed runner containers found" >&2
+    exit 1
+fi
+'
+
 verify_guest_managed_runners_in_actions_slice() {
     command -v limactl >/dev/null 2>&1 || {
         echo "limactl is unavailable for the Docker VM cgroup probe" >&2
         return 1
     }
-    limactl shell colima -- sh -lc '
-        test -d /sys/fs/cgroup/actions.slice || exit 1
-        ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}")
-        test -n "$ids" || exit 1
-        for id in $ids; do
-            pid=$(docker inspect -f "{{.State.Pid}}" "$id") || exit 1
-            raw=$(grep "^0::" "/proc/$pid/cgroup" | head -1) || exit 1
-            path=${raw#0::}
-            case "$path" in
-                /actions.slice|/actions.slice/*) ;;
-                *) exit 1 ;;
-            esac
-            test -d "/sys/fs/cgroup$path" || exit 1
-        done
-    ' >/dev/null 2>&1
+    limactl shell colima -- sh -lc "
+        test -d /sys/fs/cgroup/actions.slice || {
+            echo '/sys/fs/cgroup/actions.slice is missing' >&2
+            exit 1
+        }
+        $GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT
+    " >/dev/null
 }
 
 cgroup_has_effective_memory_ceiling() {
@@ -784,6 +831,7 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
         platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
         containers) verify_managed_runners_in_actions_slice ;;
+        guest_containers) verify_guest_managed_runners_in_actions_slice ;;
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
         modern_timers) verify_modern_timers ;;
@@ -1446,26 +1494,15 @@ if modern_envelope_required; then
     if containment_in_vm && command -v limactl >/dev/null 2>&1; then
         GUEST_ACTIONS_VALUES=""
         {
-            GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
+            GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc "
                 test -f /etc/systemd/system/actions.slice || exit 1
                 cat /sys/fs/cgroup/actions.slice/memory.high
                 cat /sys/fs/cgroup/actions.slice/memory.max
                 cat /sys/fs/cgroup/actions.slice/memory.swap.max
                 cat /sys/fs/cgroup/actions.slice/pids.max
-                ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}") || exit 1
-                test -n "$ids" || exit 1
-                for id in $ids; do
-                    pid=$(docker inspect -f "{{.State.Pid}}" "$id") || exit 1
-                    raw=$(grep "^0::" "/proc/$pid/cgroup" | head -1) || exit 1
-                    path=${raw#0::}
-                    case "$path" in
-                        /actions.slice|/actions.slice/*) ;;
-                        *) exit 1 ;;
-                    esac
-                    test -d "/sys/fs/cgroup$path" || exit 1
-                done
+                $GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT
                 echo RUNNERS=actions.slice
-            ' 2>/dev/null | tr '\n' ' ' || true)
+            " 2>/dev/null | tr '\n' ' ' || true)
         }
         read -r guest_high guest_max guest_swap guest_tasks guest_runners _ <<<"${GUEST_ACTIONS_VALUES}"
         if [ "${guest_high:-}" != 30064771072 ] \

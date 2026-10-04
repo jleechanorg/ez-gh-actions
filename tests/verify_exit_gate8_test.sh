@@ -107,11 +107,12 @@ case "${1:-}" in
       mixed) printf '%s\n' runner-stopped runner-live ;;
       all-exited) printf '%s\n' runner-stopped-a runner-stopped-b ;;
       empty) : ;;
-      running-pid0) printf '%s\n' runner-pid0 ;;
+      running-pid0|running-PID0) printf '%s\n' runner-pid0 ;;
+      malformed-state) printf '%s\n' runner-malformed ;;
       outside) printf '%s\n' runner-outside ;;
       missing-proc) printf '%s\n' runner-missing-proc ;;
       missing-cgroup) printf '%s\n' runner-missing-cgroup ;;
-      inspect-failure) printf '%s\n' runner-inspect-failure ;;
+      inspect-failure|inspect-error) printf '%s\n' runner-inspect-failure ;;
       docker-failure) exit 1 ;;
       *) exit 1 ;;
     esac
@@ -122,6 +123,7 @@ case "${1:-}" in
       runner-stopped|runner-stopped-a|runner-stopped-b) state='false exited 0' ;;
       runner-live) state='true running 4242' ;;
       runner-pid0) state='true running 0' ;;
+      runner-malformed) state='corrupt' ;;
       runner-outside) state='true running 4343' ;;
       runner-missing-proc) state='true running 4344' ;;
       runner-missing-cgroup) state='true running 4345' ;;
@@ -163,11 +165,127 @@ run_container_case mixed pass
 run_container_case all-exited fail
 run_container_case empty fail
 run_container_case running-pid0 fail
+run_container_case running-PID0 fail
+run_container_case malformed-state fail
 run_container_case outside fail
 run_container_case missing-proc fail
 run_container_case missing-cgroup fail
 run_container_case inspect-failure fail
+run_container_case inspect-error fail
 run_container_case docker-failure fail
+
+# Hermetic fake limactl transport for guest cgroup & container probes.
+cat > "$TMP/limactl" <<'EOF_LIMA'
+#!/usr/bin/env bash
+set -e
+if [ "${1:-}" != "shell" ] || [ "${2:-}" != "colima" ]; then
+  echo "fake limactl: unexpected arguments: $*" >&2
+  exit 1
+fi
+shift 2
+if [ "${1:-}" = "--" ]; then shift; fi
+if [ "${1:-}" != "sh" ] || [ "${2:-}" != "-lc" ]; then
+  echo "fake limactl: expected 'sh -lc <cmd>', got: $*" >&2
+  exit 1
+fi
+cmd="$3"
+
+if [ -n "${GUEST_CGROUP_ROOT:-}" ]; then
+  cmd="${cmd//\/sys\/fs\/cgroup/$GUEST_CGROUP_ROOT}"
+fi
+if [ -n "${GUEST_PROC_ROOT:-}" ]; then
+  cmd="${cmd//\/proc/$GUEST_PROC_ROOT}"
+fi
+if [ -n "${GUEST_SYSTEMD_ROOT:-}" ]; then
+  cmd="${cmd//\/etc\/systemd\/system/$GUEST_SYSTEMD_ROOT}"
+fi
+
+if [ -n "${GUEST_TRANSPORT_ERR_LOG:-}" ]; then
+  exec 2> >(tee "$GUEST_TRANSPORT_ERR_LOG" >&2)
+fi
+exec sh -c "$cmd"
+EOF_LIMA
+chmod +x "$TMP/limactl"
+
+mkdir -p "$TMP/guest-systemd"
+touch "$TMP/guest-systemd/actions.slice"
+printf '30064771072\n' > "$TMP/race-cgroup/actions.slice/memory.high"
+printf '34359738368\n' > "$TMP/race-cgroup/actions.slice/memory.max"
+printf '0\n' > "$TMP/race-cgroup/actions.slice/memory.swap.max"
+printf '6000\n' > "$TMP/race-cgroup/actions.slice/pids.max"
+
+eval "$(sed -n "/^GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT=/,/^'/p" "$VERIFY")"
+eval "$(sed -n '/^verify_guest_managed_runners_in_actions_slice() {/,/^}/p' "$VERIFY")"
+GUEST_AGG_SRC=$(sed -n '/GUEST_ACTIONS_VALUES=""/,/Gate 8 guest runner aggregate: high=28G/p' "$VERIFY")
+
+run_guest_container_case() {
+  local scenario="$1" expected="$2" expected_diag="${3:-}" output rc transport_err
+  output=''
+  rc=0
+  transport_err="$TMP/guest_transport_err.log"
+  rm -f "$transport_err"
+  output=$(PATH="$TMP:$PATH" \
+    DOCKER_SCENARIO="$scenario" \
+    GUEST_CGROUP_ROOT="$TMP/race-cgroup" \
+    GUEST_PROC_ROOT="$TMP/race-proc" \
+    GUEST_TRANSPORT_ERR_LOG="$transport_err" \
+    GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT="${GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT:-}" \
+    verify_guest_managed_runners_in_actions_slice 2>&1) || rc=$?
+  local err_msg
+  err_msg=$(cat "$transport_err" 2>/dev/null || true)
+  if [ "$expected" = pass ]; then
+    [ "$rc" -eq 0 ] || fail "guest container $scenario should pass (rc=$rc, output='$output', guest_err='$err_msg')"
+  else
+    [ "$rc" -ne 0 ] || fail "guest container $scenario should fail closed"
+    if [ -n "$expected_diag" ]; then
+      local combined="$output $err_msg"
+      grep -Fq "$expected_diag" <<<"$combined" || fail "guest container $scenario expected diagnostic '$expected_diag', got: '$combined'"
+    fi
+  fi
+}
+
+run_guest_aggregate_case() {
+  local scenario="$1" expected="$2" output rc
+  output=''
+  rc=0
+  output=$(
+    export PATH="$TMP:$PATH"
+    export DOCKER_SCENARIO="$scenario"
+    export GUEST_CGROUP_ROOT="$TMP/race-cgroup"
+    export GUEST_PROC_ROOT="$TMP/race-proc"
+    export GUEST_SYSTEMD_ROOT="$TMP/guest-systemd"
+    export GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT="${GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT:-}"
+    fail() { echo "FAIL: $*" >&2; exit 1; }
+    eval "$GUEST_AGG_SRC" 2>&1
+  ) || rc=$?
+  if [ "$expected" = pass ]; then
+    [ "$rc" -eq 0 ] || fail "guest aggregate $scenario should pass: $output"
+  else
+    [ "$rc" -ne 0 ] || fail "guest aggregate $scenario should fail closed"
+  fi
+}
+
+# (a) Guest managed runner helper cases
+run_guest_container_case mixed pass
+run_guest_container_case all-exited fail "no positively inspected live managed runner containers found"
+run_guest_container_case empty fail "no managed runner containers found"
+run_guest_container_case inspect-error fail "could not be inspected"
+run_guest_container_case running-PID0 fail "invalid live PID: 0"
+run_guest_container_case malformed-state fail "returned malformed state"
+run_guest_container_case outside fail "is outside actions.slice"
+run_guest_container_case missing-proc fail "outside actions.slice: unavailable"
+run_guest_container_case missing-cgroup fail "is not materialized under"
+
+# (b) Guest aggregate runner traversal cases
+run_guest_aggregate_case mixed pass
+run_guest_aggregate_case all-exited fail
+run_guest_aggregate_case empty fail
+run_guest_aggregate_case inspect-error fail
+run_guest_aggregate_case running-PID0 fail
+run_guest_aggregate_case malformed-state fail
+run_guest_aggregate_case outside fail
+run_guest_aggregate_case missing-proc fail
+run_guest_aggregate_case missing-cgroup fail
 
 # A finite parent slice is the effective recursive ceiling even when a child
 # scope retains its default memory.high=max.
