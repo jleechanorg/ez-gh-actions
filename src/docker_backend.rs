@@ -4072,6 +4072,7 @@ fn executing_runner_count_from_containers(
                         // (not `fetch_sub`) saturates at zero — the
                         // parallel-threads race past zero would
                         // otherwise wrap the counter to u32::MAX.
+                        #[allow(deprecated)]
                         let present = remaining
                             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
                                 if x > 0 {
