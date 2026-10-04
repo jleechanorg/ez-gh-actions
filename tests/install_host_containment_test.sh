@@ -67,6 +67,13 @@ cat > "$STUB_BIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = --user ]; then shift; fi
 case "${1:-}" in
+  is-enabled)
+    if [ "${2:-}" = agent-scope-reaper.timer ] \
+       || [ "${2:-}" = psi-oom-watcher.timer ]; then
+      echo disabled
+      exit 1
+    fi
+    exit 0 ;;
   is-active)
     if [ "${2:-}" = agent-scope-reaper.timer ] \
        || [ "${2:-}" = agent-scope-reaper.service ] \

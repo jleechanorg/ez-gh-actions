@@ -150,7 +150,9 @@ case "${sub}" in
     exit 0
     ;;
   is-enabled)
-    [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ] && exit 0 || exit 1
+    if [ -f "${SYSTEMCTL_STATE_DIR}/${1}.enabled" ]; then echo enabled; exit 0; fi
+    echo disabled
+    exit 1
     ;;
   is-active)
     if in_list "${1:-}" "${STUB_QUERY_FAIL_UNITS:-}"; then
@@ -269,6 +271,28 @@ for retired in agent-scope-reaper psi-oom-watcher; do
     for stale in "${home}/.config/systemd/user/${retired}.service" "${home}/.config/systemd/user/${retired}.timer"; do
       [ -e "${stale}" ] || fail "${retired} ${state}: installer removed unsafe artifact ${stale}"
     done
+  done
+done
+
+# A failed disable command is not proof of retirement: even an inactive timer
+# must retain its artifacts if is-enabled still reports enabled.
+for retired in agent-scope-reaper psi-oom-watcher; do
+  home="${WORK}/home_${retired}_enabled"
+  state_dir="${WORK}/state_${retired}_enabled"
+  mkdir -p "${home}/.config/systemd/user" "${home}/.local/libexec/ezgha" "${state_dir}"
+  touch "${home}/.config/systemd/user/${retired}.service" \
+        "${home}/.config/systemd/user/${retired}.timer" \
+        "${state_dir}/${retired}.timer.enabled"
+  if [ "${retired}" = agent-scope-reaper ]; then
+    touch "${home}/.local/libexec/ezgha/agent-scope-reaper.sh"
+  fi
+  install_rc=0
+  STUB_DISABLE_FAIL_UNITS="${retired}.timer" \
+    run_install "${home}" "${state_dir}" || install_rc=$?
+  [ "${install_rc}" -ne 0 ] \
+    || fail "${retired} enabled: installer must reject an enabled timer after failed disable"
+  for stale in "${home}/.config/systemd/user/${retired}.service" "${home}/.config/systemd/user/${retired}.timer"; do
+    [ -e "${stale}" ] || fail "${retired} enabled: installer removed enabled-unit artifact ${stale}"
   done
 done
 
