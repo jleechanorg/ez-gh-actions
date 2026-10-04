@@ -138,7 +138,7 @@ run_failed_phase() {
   local home="$WORK/${phase}_home"
   local log="$WORK/${phase}_events"
   mkdir -p "$home/.config/ezgha"
-  printf '# fixture\n' > "$home/.config/ezgha/config.toml"
+  printf '[runner]\ncount = 14\n' > "$home/.config/ezgha/config.toml"
   if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" "APPLY_FAIL_${phase^^}=1" \
       bash "$TEMP_REPO/install.sh" --dev > "$WORK/${phase}.log" 2>&1; then
     fail "${phase} phase failure still allowed installation"
@@ -155,7 +155,8 @@ run_failed_phase user
 # host, so host-Docker containment is intentionally not activated.
 VM_EVENT_LOG="$WORK/vm_events"
 VM_HOME="$WORK/vm_home"
-mkdir -p "$VM_HOME"
+mkdir -p "$VM_HOME/.config/ezgha"
+printf '[runner]\ncount = 12\n' > "$VM_HOME/.config/ezgha/config.toml"
 env EVENT_LOG="$VM_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$VM_HOME" CARGO_HOME="$VM_HOME/.cargo" XDG_CONFIG_HOME="$VM_HOME/.config" \
   DOCKER_HOST='unix:///fixture/vm.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/vm-install.log" 2>&1 \
@@ -164,9 +165,25 @@ grep -qx 'docker-info:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
   || fail "installer did not probe the explicitly selected VM endpoint"
 grep -qx 'docker-build:unix:///fixture/vm.sock' "$VM_EVENT_LOG" \
   || fail "installer did not build on the explicitly selected VM endpoint"
-if grep -q '^root-phase$\|^user-phase$' "$VM_EVENT_LOG"; then
+if grep -qE '^(root|user)-phase:' "$VM_EVENT_LOG"; then
   fail "VM endpoint was misclassified as native HostDocker"
 fi
+
+run_invalid_config() {
+  local name="$1" contents="$2"
+  local home="$WORK/${name}_home" log="$WORK/${name}_events"
+  mkdir -p "$home/.config/ezgha"
+  printf '%s' "$contents" > "$home/.config/ezgha/config.toml"
+  if env EVENT_LOG="$log" PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" \
+      bash "$TEMP_REPO/install.sh" --dev > "$WORK/${name}.log" 2>&1; then
+    fail "installer accepted present invalid config ${name}"
+  fi
+  if grep -qE '^(root|user)-phase:' "$log" 2>/dev/null; then
+    fail "present invalid config ${name} wrote containment phases"
+  fi
+}
+run_invalid_config malformed $'runner = [\n'
+run_invalid_config missing_count $'[runner]\n'
 
 # Docker documents DOCKER_CONTEXT as higher precedence than DOCKER_HOST. The
 # active-service upgrade path must persist that resolved endpoint before its
@@ -174,7 +191,7 @@ fi
 CONTEXT_EVENT_LOG="$WORK/context_events"
 CONTEXT_HOME="$WORK/context_home"
 mkdir -p "$CONTEXT_HOME/.config/ezgha"
-printf '# fixture\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
+printf '[runner]\ncount = 14\n' > "$CONTEXT_HOME/.config/ezgha/config.toml"
 env EVENT_LOG="$CONTEXT_EVENT_LOG" PATH="$STUB_BIN:$PATH" HOME="$CONTEXT_HOME" CARGO_HOME="$CONTEXT_HOME/.cargo" XDG_CONFIG_HOME="$CONTEXT_HOME/.config" \
   SYSTEMCTL_ACTIVE=1 DOCKER_CONTEXT='explicit-context' DOCKER_HOST='unix:///fixture/ignored.sock' \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/context-install.log" 2>&1 \

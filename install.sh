@@ -150,53 +150,44 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
 CONFIG_PATH="${CONFIG_DIR}/config.toml"
 
-# Host containment has a bounded profile selector. Read the existing runtime
-# TOML before either privilege phase so rollback config (count=10) receives
-# TasksMax=6000 while the current default/template (count=14) receives 8000.
-# A missing or legacy-unparseable config keeps the installer default of 14;
-# a parsed unsupported count fails closed before containment writes.
+# Host containment has a bounded profile selector. The selected Linux profile is
+# read only after Docker is classified as native host Docker, so VM-contained
+# daemons do not need a host containment profile. A missing config is the
+# first-install case and uses the current default of 14; a present config must
+# explicitly contain a valid bounded runner.count so rollback cannot be hidden.
 read_config_runner_count() {
   local config_path="$1"
-  python3 - "$config_path" <<'PYCFG'
+  if [ ! -f "${config_path}" ]; then
+    printf '14\n'
+    return 0
+  fi
+  python3 - "${config_path}" <<'PYCFG'
 import sys
 
 path = sys.argv[1]
-if not path:
-    print(14)
-    raise SystemExit(0)
 try:
     try:
         import tomllib
-        with open(path, "rb") as handle:
-            data = tomllib.load(handle)
     except ModuleNotFoundError:
-        import toml
-        data = toml.load(path)
-except (OSError, KeyError, TypeError, ValueError):
-    print(14)
+        import toml as tomllib
+    with open(path, "rb") as handle:
+        data = tomllib.load(handle)
+except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError):
+    print("invalid")
     raise SystemExit(0)
-value = data.get("runner", {}).get("count", 14)
-if isinstance(value, bool) or not isinstance(value, int):
+runner = data.get("runner")
+if not isinstance(runner, dict) or "count" not in runner:
     print("invalid")
 else:
-    print(value)
+    value = runner["count"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        print("invalid")
+    else:
+        print(value)
 PYCFG
 }
 
 RUNNER_COUNT=14
-if [ "$(uname -s)" = "Linux" ]; then
-  RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
-    bad "could not read runner.count from ${CONFIG_PATH}"
-    exit 1
-  }
-  case "${RUNNER_COUNT}" in
-    10|14) ;;
-    *)
-      bad "runner.count must be 10 or 14 on Linux (got ${RUNNER_COUNT})"
-      exit 1
-      ;;
-  esac
-fi
 
 LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 
@@ -462,6 +453,17 @@ if [ "$(uname -s)" = "Linux" ]; then
   docker_kernel="$(env -u DOCKER_CONTEXT DOCKER_HOST="${docker_endpoint}" docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
   [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
   if [ "${docker_kernel}" = "$(uname -r)" ]; then
+    RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
+      bad "could not read runner.count from ${CONFIG_PATH}"
+      exit 1
+    }
+    case "${RUNNER_COUNT}" in
+      10|14) ;;
+      *)
+        bad "runner.count must be 10 or 14 on Linux (got ${RUNNER_COUNT})"
+        exit 1
+        ;;
+    esac
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
     HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
     mkdir -p "${HOST_CONTROL_DIR}" \
@@ -566,7 +568,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 # ── Auto-install or restart ezgha service if config exists ────────────────────
-CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
 if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
