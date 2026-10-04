@@ -224,16 +224,39 @@ verify_managed_runners_in_actions_slice() {
         return 1
     }
     local ids
-    ids=$(docker ps --filter label=ezgha=managed --format '{{.ID}}' 2>/dev/null || true)
+    if ! ids=$(docker ps --filter label=ezgha=managed --format '{{.ID}}' 2>/dev/null); then
+        echo "could not list managed runner containers" >&2
+        return 1
+    fi
     [ -n "$ids" ] || {
         echo "no managed runner containers found" >&2
         return 1
     }
-    local id pid raw path
+    local id inspect running status pid raw path extra live_found=0
     while IFS= read -r id; do
         [ -n "$id" ] || continue
-        pid=$(docker inspect -f '{{.State.Pid}}' "$id" 2>/dev/null || true)
-        [ -n "$pid" ] || { echo "managed runner $id has no host PID" >&2; return 1; }
+        inspect=$(docker inspect -f '{{.State.Running}} {{.State.Status}} {{.State.Pid}}' "$id" 2>/dev/null) || {
+            echo "managed runner $id could not be inspected" >&2
+            return 1
+        }
+        running='' status='' pid='' extra=''
+        read -r running status pid extra <<<"$inspect" || true
+        [ -n "$running" ] && [ -n "$status" ] && [ -n "$pid" ] && [ -z "${extra:-}" ] || {
+            echo "managed runner $id returned malformed state: ${inspect:-unavailable}" >&2
+            return 1
+        }
+        case "$running:$status:$pid" in
+            false:exited:0) continue ;;
+            true:running:0|true:running:''|true:running:*[!0-9]*)
+                echo "managed runner $id has invalid live PID: $pid" >&2
+                return 1
+                ;;
+            true:running:*) live_found=1 ;;
+            *)
+                echo "managed runner $id has unverified state: $inspect" >&2
+                return 1
+                ;;
+        esac
         raw=$(grep '^0::' "${proc_root}/${pid}/cgroup" 2>/dev/null | head -1 || true)
         path="${raw#0::}"
         case "$path" in
@@ -248,6 +271,10 @@ verify_managed_runners_in_actions_slice() {
             return 1
         }
     done <<< "$ids"
+    [ "$live_found" -eq 1 ] || {
+        echo "no positively inspected live managed runner containers found" >&2
+        return 1
+    }
 }
 
 verify_guest_managed_runners_in_actions_slice() {
