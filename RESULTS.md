@@ -21,6 +21,22 @@ Root owns `cargo install --path .`, `systemctl --user restart ezgha.service`,
 the `~/.config/ezgha/config.toml` edits, and `git push` (no `git add -A`,
 no force push).
 
+## 2026-10-04 correction — current source and CPU-burst interpretation
+
+The `907ecda` deployment-head label below is historical. This document
+records a commit series; deployment must pin the current source with
+`git rev-parse HEAD` rather than treat an earlier prose SHA as authoritative.
+
+The earlier aggregate-CPU statement was incorrect. With opt-in
+`limits.cpu_burst = true`, each container receives a finite individual ceiling
+of `min(cfg.limits.cpus, daemon_ncpu)` only after VM and finite-capacity
+validation. The sum of those ceilings may exceed VM vCPU count (for example,
+six 4-CPU ceilings on an 8-vCPU VM); they are not an aggregate reservation.
+Actual concurrent execution remains bounded by the verified finite VM CPU
+supply and its scheduler. This can increase runnable-container contention, and
+no measured performance gain is claimed here. Default-false behavior and the
+memory clamp are unchanged.
+
 ---
 
 ## Commit `907ecda` — post-review critical fix + opt-in cpu_burst
