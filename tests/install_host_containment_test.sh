@@ -165,9 +165,11 @@ mkdir -p "$BIG_PROC/7777"
 printf 'qemu-system-x86\n' > "$BIG_PROC/7777/comm"
 printf '%s\0' qemu-system-x86_64 -m 12288 -drive "file=$BIG_HOME/.lima/colima/diffdisk,if=virtio" > "$BIG_PROC/7777/cmdline"
 printf '[Service]\nMemoryHigh=9G\nMemoryMax=10G\n' > "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
-env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
+if env EVENT_LOG="$WORK/big_events" PATH="$STUB_BIN:$PATH" HOME="$BIG_HOME" CARGO_HOME="$BIG_HOME/.cargo" XDG_CONFIG_HOME="$BIG_HOME/.config" \
   LIMA_FIXTURE_STATUS=Running LIMA_PROC_ROOT="$BIG_PROC" \
-  bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1 || fail "big-guest fixture install failed"
+  bash "$TEMP_REPO/install.sh" --dev > "$WORK/big-install.log" 2>&1; then
+  fail "big-guest install passed despite pre-activation guest refusal"
+fi
 grep -qx 'MemoryMax=10G' "$BIG_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   || fail "failed guest check replaced the existing host-docker QEMU ceiling"
 grep -q 'FAIL lima guest memory 12884901888 > 8GiB' "$WORK/big-install.log" \
