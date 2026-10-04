@@ -16,6 +16,26 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; }
 warn() { printf '  \033[33m⚠\033[0m %s\n' "$1" >&2; }
 info() { printf '\033[1m%s\033[0m\n' "$1"; }
 
+# Retired auxiliary units may remain loaded after their files disappear.
+# Stop each half independently, then prove both are inactive before cleanup.
+retire_user_units() {
+  local label="$1" timer="$2" service="$3" unit state state_rc unsafe=0
+  systemctl --user disable --now "${timer}" 2>/dev/null || true
+  systemctl --user stop "${service}" 2>/dev/null || true
+  for unit in "${timer}" "${service}"; do
+    state_rc=0
+    state=$(systemctl --user is-active "${unit}" 2>&1) || state_rc=$?
+    case "${state}" in
+      inactive|failed|not-found) ;;
+      *)
+        bad "refusing to retire ${label}: ${unit} is-active rc=${state_rc}, output=${state:-<unavailable>}"
+        unsafe=1
+        ;;
+    esac
+  done
+  [ "${unsafe}" -eq 0 ]
+}
+
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -782,6 +802,9 @@ FSTRIM_EOF
           -e "s|@HOME@|${HOME_DIR}|g" \
           "${UNIT_DIR}/${unit}" > "${USER_UNIT_DIR}/${unit}"
     done
+    if ! retire_user_units psi-oom-watcher psi-oom-watcher.timer psi-oom-watcher.service; then
+      exit 1
+    fi
     rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" \
           "${USER_UNIT_DIR}/psi-oom-watcher.timer" \
           "${USER_UNIT_DIR}/ezgha.service.d/10-oomd-omit.conf"
@@ -899,9 +922,7 @@ EOF
     done
     # Auxiliary mutation loops are opt-out by policy. Keep their tracked units
     # installed for manual diagnostics, but heal prior enabled state.
-    for pair in \
-      "ezgha-queue-reaper.timer ezgha-queue-reaper.service" \
-      "agent-scope-reaper.timer agent-scope-reaper.service"; do
+    for pair in "ezgha-queue-reaper.timer ezgha-queue-reaper.service"; do
       timer="${pair%% *}"
       service="${pair#* }"
       if systemctl --user disable --now "${timer}" 2>/dev/null \
@@ -911,17 +932,9 @@ EOF
         bad "failed to disable auxiliary loop: ${timer} / ${service}"
       fi
     done
-    # Retired after the 2026-08-26 incident where the user-scope PSI watcher
-    # selected Warp's AppImage process as its fallback SIGTERM target. Keep the
-    # tracked script/unit installed for audit and manual diagnostics, but heal
-    # any previously enabled timer and stop an invocation already in flight.
-    if systemctl --user disable --now psi-oom-watcher.timer 2>/dev/null \
-       && systemctl --user stop psi-oom-watcher.service 2>/dev/null; then
-      ok "systemd --user PSI OOM watcher disabled by policy"
-    else
-      bad "failed to disable psi-oom-watcher (run: systemctl --user status psi-oom-watcher.timer psi-oom-watcher.service)"
+    if ! retire_user_units agent-scope-reaper agent-scope-reaper.timer agent-scope-reaper.service; then
+      exit 1
     fi
-
     # Clean up any drifted or legacy watchdog units
     if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
       systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null || true

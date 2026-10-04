@@ -499,44 +499,33 @@ verify_fresh_canary() {
     pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
 }
 
-# Gate 8 timer policy: the reaper remains required, while install.sh retires
-# psi-oom-watcher. Treat a lost user-manager bus as unknown, never disabled.
+# Gate 8 timer policy: install.sh retires both auxiliary mutation loops. Treat
+# a lost user-manager bus as unknown, never disabled.
 verify_modern_timers() {
-    local enabled_state active_state
-    for timer in agent-scope-reaper.timer; do
+    local timer enabled_state active_state
+    for timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
         enabled_state=$(systemctl --user is-enabled "$timer" 2>&1 | head -1 || true)
-        active_state=$(systemctl --user is-active "$timer" 2>&1 | head -1 || true)
-        case "$enabled_state" in enabled|enabled-runtime) ;; *)
-            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
-            return 1
+        case "$enabled_state" in
+            enabled|enabled-runtime)
+                fail "Gate 8 modern envelope: ${timer} is enabled but is disabled by policy (install.sh)" ;;
+            # A deleted unit can remain loaded until its runtime instance
+            # stops, so is-active is always checked below.
+            not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+            disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+            *)
+                fail "Gate 8 modern envelope: could not determine ${timer} enabled state (got: ${enabled_state:-<empty>})"
+                return 1 ;;
         esac
-        if [ "$active_state" != "active" ]; then
-            fail "Gate 8 modern envelope: ${timer} is not enabled and active"
-            return 1
-        fi
+        active_state=$(systemctl --user is-active "$timer" 2>&1 | head -1 || true)
+        case "$active_state" in
+            inactive|failed|not-found) ;;
+            active|activating|deactivating|reloading)
+                fail "Gate 8 modern envelope: ${timer} is ${active_state} but is disabled by policy (install.sh)" ;;
+            *)
+                fail "Gate 8 modern envelope: could not determine ${timer} runtime state (got: ${active_state:-<empty>})"
+                return 1 ;;
+        esac
     done
-
-    enabled_state=$(systemctl --user is-enabled psi-oom-watcher.timer 2>&1 | head -1 || true)
-    case "$enabled_state" in
-        enabled|enabled-runtime)
-            fail "Gate 8 modern envelope: psi-oom-watcher.timer is enabled but is disabled by policy (install.sh)" ;;
-        # A deleted unit can remain loaded until its runtime instance stops,
-        # so is-active is always checked below.
-        not-found|"Failed to get unit file state for "*": No such file or directory") ;;
-        disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
-        *)
-            fail "Gate 8 modern envelope: could not determine psi-oom-watcher.timer enabled state (got: ${enabled_state:-<empty>})"
-            return 1 ;;
-    esac
-    active_state=$(systemctl --user is-active psi-oom-watcher.timer 2>&1 | head -1 || true)
-    case "$active_state" in
-        inactive|failed|not-found) ;;
-        active|activating|deactivating|reloading)
-            fail "Gate 8 modern envelope: psi-oom-watcher.timer is ${active_state} but is disabled by policy (install.sh)" ;;
-        *)
-            fail "Gate 8 modern envelope: could not determine psi-oom-watcher.timer runtime state (got: ${active_state:-<empty>})"
-            return 1 ;;
-    esac
     return 0
 }
 

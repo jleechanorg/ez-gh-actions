@@ -226,9 +226,9 @@ if run_oomctl "$TMP/oomctl-empty.txt"; then
   fail "/actions.slice only under Swap (pressure lists /user.slice) must not pass"
 fi
 
-# Gate 8 timer policy is executed before optional envelope detection. The
-# reaper remains enabled+active on L4; psi-oom-watcher must be disabled and
-# inactive because install.sh retires it.
+# Gate 8 timer policy is executed before optional envelope detection. Both
+# auxiliary mutation timers must be disabled and inactive because install.sh
+# retires them.
 TIMER_BIN="$TMP/timer-bin"
 mkdir -p "$TIMER_BIN"
 cat > "$TIMER_BIN/systemctl" <<'EOF'
@@ -236,21 +236,19 @@ cat > "$TIMER_BIN/systemctl" <<'EOF'
 [ "${1:-}" = "--user" ] && shift
 case "${1:-}" in
   is-enabled)
-    if [ "${2:-}" = psi-oom-watcher.timer ] && [ -n "${STUB_ENABLED_BROKEN:-}" ]; then
+    if [ -n "${STUB_ENABLED_BROKEN:-}" ] && { [ -z "${STUB_BROKEN_TIMER:-}" ] || [ "${2:-}" = "${STUB_BROKEN_TIMER}" ]; }; then
       echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
     fi
-    if [ "${2:-}" = agent-scope-reaper.timer ]; then echo "${STUB_REAPER_ENABLED:-enabled}"; exit 0; fi
-    if [ -n "${STUB_PSI_ENABLED:-}" ]; then echo enabled; exit 0; fi
+    for timer in ${STUB_ENABLED_TIMERS:-}; do [ "$timer" = "${2:-}" ] && { echo enabled; exit 0; }; done
     if [ -n "${STUB_ABSENT:-}" ]; then echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1; fi
     if [ -n "${STUB_NOTFOUND:-}" ]; then echo not-found; exit 4; fi
     echo disabled; exit 1 ;;
   is-active)
     if [ "${2:-}" = systemd-oomd ]; then echo inactive; exit 3; fi
-    if [ "${2:-}" = psi-oom-watcher.timer ] && [ -n "${STUB_ACTIVE_BROKEN:-}" ]; then
+    if [ -n "${STUB_ACTIVE_BROKEN:-}" ] && { [ -z "${STUB_BROKEN_TIMER:-}" ] || [ "${2:-}" = "${STUB_BROKEN_TIMER}" ]; }; then
       echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
     fi
-    if [ "${2:-}" = agent-scope-reaper.timer ]; then echo "${STUB_REAPER_ACTIVE:-active}"; exit 0; fi
-    if [ -n "${STUB_PSI_ACTIVE:-}" ]; then echo active; exit 0; fi
+    for timer in ${STUB_ACTIVE_TIMERS:-}; do [ "$timer" = "${2:-}" ] && { echo active; exit 0; }; done
     echo inactive; exit 3 ;;
 esac
 exit 1
@@ -260,8 +258,8 @@ chmod +x "$TIMER_BIN/systemctl"
 # Run the real Linux pre-envelope Gate 8 dispatch, not only the helper.
 run_gate8_pre_envelope() {
   local gate_header modern_start gate_start helper_start helper_end saved_fail
-  export STUB_REAPER_ENABLED STUB_REAPER_ACTIVE STUB_PSI_ENABLED STUB_PSI_ACTIVE \
-    STUB_ABSENT STUB_NOTFOUND STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN STUB_BROKEN_MSG
+  export STUB_ENABLED_TIMERS STUB_ACTIVE_TIMERS STUB_ABSENT STUB_NOTFOUND \
+    STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN STUB_BROKEN_TIMER STUB_BROKEN_MSG
   gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
   modern_start=$(grep -n '^if \[ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" \]' "$VERIFY" | cut -d: -f1)
   gate_start=$(awk -v min="$gate_header" -v max="$modern_start" 'NR >= min && NR < max && /^if \[ "\$\(uname -s\)" = "Linux" \]; then$/ { print NR; exit }' "$VERIFY")
@@ -283,19 +281,22 @@ run_gate8_pre_envelope() {
 }
 
 PATH="$TIMER_BIN:$PATH"
-unset STUB_PSI_ENABLED STUB_PSI_ACTIVE STUB_ABSENT STUB_NOTFOUND STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN
+unset STUB_ENABLED_TIMERS STUB_ACTIVE_TIMERS STUB_ABSENT STUB_NOTFOUND STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN STUB_BROKEN_TIMER
 run_gate8_pre_envelope
-[ -z "$GATE8_POLICY_RESULT" ] || fail "healthy reaper + disabled PSI must pass pre-envelope dispatch: $GATE8_POLICY_RESULT"
-STUB_PSI_ENABLED=1
-run_gate8_pre_envelope
-[ -n "$GATE8_POLICY_RESULT" ] || fail "enabled PSI timer must fail before optional envelope detection"
-grep -Fq 'psi-oom-watcher.timer' <<<"$GATE8_POLICY_RESULT" || fail "enabled PSI failure omitted timer: $GATE8_POLICY_RESULT"
-unset STUB_PSI_ENABLED
-STUB_ABSENT=1 STUB_PSI_ACTIVE=1
-run_gate8_pre_envelope
-[ -n "$GATE8_POLICY_RESULT" ] || fail "absent PSI unit but active runtime must fail"
-unset STUB_ABSENT STUB_PSI_ACTIVE
+[ -z "$GATE8_POLICY_RESULT" ] || fail "both disabled timers must pass pre-envelope dispatch: $GATE8_POLICY_RESULT"
+for retired_timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+  STUB_ENABLED_TIMERS="$retired_timer"
+  run_gate8_pre_envelope
+  [ -n "$GATE8_POLICY_RESULT" ] || fail "enabled ${retired_timer} must fail before optional envelope detection"
+  grep -Fq "$retired_timer" <<<"$GATE8_POLICY_RESULT" || fail "enabled timer failure omitted ${retired_timer}: $GATE8_POLICY_RESULT"
+  unset STUB_ENABLED_TIMERS
+  STUB_ABSENT=1 STUB_ACTIVE_TIMERS="$retired_timer"
+  run_gate8_pre_envelope
+  [ -n "$GATE8_POLICY_RESULT" ] || fail "absent ${retired_timer} unit but active runtime must fail"
+  unset STUB_ABSENT STUB_ACTIVE_TIMERS
+done
 STUB_ENABLED_BROKEN=1
+STUB_BROKEN_TIMER=psi-oom-watcher.timer
 run_gate8_pre_envelope
 [ -n "$GATE8_POLICY_RESULT" ] || fail "enabled-state bus failure must fail closed"
 STUB_BROKEN_MSG="Failed to connect to bus: No such file or directory"
@@ -304,9 +305,10 @@ run_gate8_pre_envelope
 unset STUB_ENABLED_BROKEN
 unset STUB_BROKEN_MSG
 STUB_ACTIVE_BROKEN=1
+STUB_BROKEN_TIMER=agent-scope-reaper.timer
 run_gate8_pre_envelope
 [ -n "$GATE8_POLICY_RESULT" ] || fail "active-state bus failure must fail closed"
-unset STUB_ACTIVE_BROKEN
+unset STUB_ACTIVE_BROKEN STUB_BROKEN_TIMER
 
 # Execute the real later PSI admission branch. With oomd inactive it must not
 # revive the retired timer as a fallback or remediation.
@@ -330,12 +332,12 @@ run_gate8_psi_admission
 grep -Fq 'ManagedOOMMemoryPressure=kill' <<<"$GATE8_PSI_RESULT" || fail "PSI failure omitted enrolled-oomd remediation: $GATE8_PSI_RESULT"
 ! grep -Fq 'psi-oom-watcher' <<<"$GATE8_PSI_RESULT" || fail "later PSI branch still offers retired timer: $GATE8_PSI_RESULT"
 
-# Test mode covers the helper independently, including the retained reaper.
-timer_out=$(PATH="$TIMER_BIN:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1) || fail "healthy reaper + disabled PSI failed test mode: $timer_out"
-if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_REAPER_ACTIVE=inactive VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
-  fail "inactive L4 reaper must fail: $timer_out"
+# Test mode covers the shared disabled/inactive policy independently.
+timer_out=$(PATH="$TIMER_BIN:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1) || fail "both disabled timers failed test mode: $timer_out"
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_ACTIVE_TIMERS=agent-scope-reaper.timer VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  fail "disabled but active reaper timer must fail: $timer_out"
 fi
-if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_PSI_ACTIVE=1 VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_ACTIVE_TIMERS=psi-oom-watcher.timer VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
   fail "disabled but active PSI timer must fail: $timer_out"
 fi
 if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_NOTFOUND=1 VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
