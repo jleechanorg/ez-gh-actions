@@ -72,12 +72,12 @@ LIMIT_CPU_BURST="$val"
     LIMIT_CPU_BURST="$val"
     daemon_in_vm() { return 1; }   # intentionally false to test the VM refusal branch
     set +e
-    out=$(gate3_burst_preflight 2>/tmp/case1_err)
+    out=$(gate3_burst_preflight 2>"$TMP/case1_err")
     rc=$?
     set -e
     [ "$rc" -eq 1 ] || fail "case1: preflight must refuse (LIMIT_CPU_BURST='$val' + non-VM); got rc=$rc"
-    grep -q 'not verified VM-contained' /tmp/case1_err \
-      || fail "case1 stderr missing 'not verified VM-contained' (got: $(cat /tmp/case1_err))"
+    grep -q 'not verified VM-contained' "$TMP/case1_err" \
+      || fail "case1 stderr missing 'not verified VM-contained' (got: $(cat "$TMP/case1_err"))"
     # CRITICAL: the prior bug caused 'True' to flow into the comparison,
     # which would NOT match `[ \"\$LIMIT_CPU_BURST\" = \"true\" ]` and
     # would silently fall through to the equal-share arithmetic instead
@@ -99,9 +99,32 @@ write_toml "false"
 # Remove cpu_burst from the [limits] section entirely to exercise the
 # default-value path. Default is a TOML bool 'true' (the literal Python
 # source — but the helper now renders that as 'true' lowercase too).
-sed -i '/^cpu_burst/d' "$TMP/config.toml"
+# Portable sed (Mac BSD sed and GNU sed both accept a positional
+# expression but disagree on `-i` without an arg): write to a temp then
+# move into place. This is the same pattern the install.sh fleet
+# scripts use; -i without arg silently failed on Mac (live Mac test
+# hit `sed: 1: ...: invalid command f`).
+sed '/^cpu_burst/d' "$TMP/config.toml" > "$TMP/config.toml.stripped"
+mv "$TMP/config.toml.stripped" "$TMP/config.toml"
 val=$(toml_get_limits cpu_burst true)
 [ "$val" = "true" ] || fail "toml_get_limits(missing, default='true') must print 'true', got '$val' (regression: prior code printed 'True')"
+
+# --- Case 3b: cpu_burst missing → default 'false' (production default) ------
+# Mirrors the Rust runtime default (limits.cpu_burst = false per
+# src/config.rs); the verifier must default-false the same way so an
+# operator deleting the field does not silently engage burst.
+write_toml "true"
+sed '/^cpu_burst/d' "$TMP/config.toml" > "$TMP/config.toml.stripped"
+mv "$TMP/config.toml.stripped" "$TMP/config.toml"
+val=$(toml_get_limits cpu_burst false)
+[ "$val" = "false" ] || fail "toml_get_limits(missing, default='false') must print 'false', got '$val' (regression: prior code printed 'False')"
+# Drive the preflight — must short-circuit on the default-false value,
+# which would NOT have happened with the bug (the comparison `!= 'true'`
+# would have evaluated `'False' != 'true'` = true → entered the burst
+# branch and refused at the VM check instead of short-circuiting).
+LIMIT_CPU_BURST="$val" out=$(gate3_burst_preflight) \
+  || fail "case3b: preflight must accept (LIMIT_CPU_BURST='$val' default-false); rc=$?"
+[ -z "$out" ] || fail "case3b: preflight stdout must be empty on default-false (got '$out')"
 
 # --- Case 4: non-boolean values unchanged (cpus, memory_mb, pids) ------------
 write_toml "true"
