@@ -8636,6 +8636,34 @@ esac
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn host_containment_accepts_the_tracked_host_actions_pid_limit() {
+        let _env = TestEnv::new("host_containment_tracked_pid_limit");
+        let root = env::temp_dir().join(format!(
+            "ezgha-host-containment-tracked-pids-{}",
+            std::process::id()
+        ));
+        write_actions_slice_fixture(&root, 14);
+
+        let tracked_tasks_max = include_str!("../systemd/host/actions.slice")
+            .lines()
+            .find_map(|line| line.strip_prefix("TasksMax="))
+            .expect("tracked host actions.slice must define TasksMax")
+            .parse::<u64>()
+            .expect("tracked host actions.slice TasksMax must be numeric");
+        std::fs::write(
+            root.join("actions.slice/pids.max"),
+            format!("{tracked_tasks_max}\n"),
+        )
+        .unwrap();
+
+        // The tracked unit ships the default 14-runner profile's task ceiling.
+        validate_host_actions_slice(&root, 14)
+            .expect("validator must accept the tracked host actions.slice PID limit");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn host_containment_requires_exact_live_actions_slice_limits() {
         let _env = TestEnv::new("host_containment_live_slice");
         let root = env::temp_dir().join(format!(

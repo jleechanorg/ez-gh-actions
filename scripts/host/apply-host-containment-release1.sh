@@ -64,6 +64,24 @@ check_below() {
   [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid ${label}: ${value}"
   [ "$value" -lt "$limit" ] || fail "${label} (${value} bytes) is at or above its safe activation threshold"
 }
+# Lowering MemoryHigh below a slice's non-reclaimable use (memory.current
+# minus reclaimable page cache, i.e. file - shmem) would throttle it at once,
+# so require 1 GiB of anon headroom below the new MemoryHigh.
+check_non_reclaimable() {
+  local dir="$1" new_high="$2" label="$3" current file shmem limit used value
+  [ -e "${dir}/memory.current" ] || return 0
+  current="$(read_value "${dir}/memory.current")" || fail "could not read ${label} memory.current"
+  [ -f "${dir}/memory.stat" ] || fail "missing ${label} memory.stat at ${dir}"
+  file="$(awk '$1 == "file" {print $2}' "${dir}/memory.stat")"
+  shmem="$(awk '$1 == "shmem" {print $2}' "${dir}/memory.stat")"
+  for value in "$current" "$file" "$shmem"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || fail "invalid ${label} memory accounting: current=${current} file=${file} shmem=${shmem}"
+  done
+  used=$((current - (file - shmem)))
+  limit=$((new_high - 1073741824))
+  [ "$used" -le "$limit" ] \
+    || fail "${label} non-reclaimable ${used} bytes > ${limit} (new MemoryHigh ${new_high} - 1 GiB; current=${current} file=${file} shmem=${shmem}); not lowering"
+}
 user_cgroup_dir() {
   local unit="$1" group
   if [ "$ROOT" != "/" ]; then
@@ -159,6 +177,22 @@ if [ "$ROOT" = / ] && [ "$SYSTEM_PHASE" -eq 1 ]; then
 else
   "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT"
 fi
+agents_dir="$(user_cgroup_dir agents.slice || true)"
+automation_dir="$(user_cgroup_dir automation.slice || true)"
+# User-slice MemoryHigh values are 10G for agents and 4608M for automation.
+[ -z "$agents_dir" ] || check_non_reclaimable "$agents_dir" 10737418240 agents.slice
+[ -z "$automation_dir" ] || check_non_reclaimable "$automation_dir" 4831838208 automation.slice
+# The user phase leads into install.sh lowering the colima QEMU ceiling to the
+# host-docker 9G/10G; refuse while the Lima guest is configured or running
+# above 8 GiB. A --root fixture reads its own lima.yaml/limactl.
+if [ "$SYSTEM_PHASE" -eq 0 ]; then
+  if [ "$ROOT" = "/" ]; then
+    "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
+  else
+    LIMACTL="${ROOT}/bin/limactl" LIMA_YAML="${ROOT}/lima/colima/lima.yaml" LIMA_PROC_ROOT="${ROOT}/proc" \
+      "${SCRIPT_DIR}/lima-guest-memory-check.sh" || exit 1
+  fi
+fi
 
 install_file() {
   local source="$1" dest="$2"
@@ -197,6 +231,9 @@ if [ "$SYSTEM_PHASE" -eq 1 ] || [ "$ROOT" != "/" ]; then
     systemctl enable actions.slice
     systemctl start actions.slice
     systemctl set-property actions.slice MemoryHigh=26G MemoryMax=28G MemorySwapMax=0 "$ACTIONS_PIDS_PROPERTY" CPUQuota=2000% IOWeight=25
+    # systemd-oomd kills inside actions.slice (runner jobs) at 80% full
+    # pressure; agents.slice and automation.slice are never enrolled with kill.
+    systemctl set-property actions.slice ManagedOOMMemoryPressure=kill ManagedOOMMemoryPressureLimit=80%
   fi
 fi
 

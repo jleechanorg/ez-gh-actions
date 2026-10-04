@@ -70,7 +70,7 @@ for name in refresh_gh_app_token.sh cleanup-stuck-runs.sh; do
 done
 printf '#!/usr/bin/env bash\ntrue\n' > "${TEMP_REPO}/scripts/host/agent-scope-reaper.sh"
 chmod +x "${TEMP_REPO}/scripts/host/agent-scope-reaper.sh"
-for name in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh; do
+for name in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh lima-guest-memory-check.sh docker-host-mode.sh; do
   if [ -f "${REPO_ROOT}/scripts/host/${name}" ]; then
     cp "${REPO_ROOT}/scripts/host/${name}" "${TEMP_REPO}/scripts/host/${name}"
   fi
@@ -110,8 +110,11 @@ EOF
 
 cat > "${STUB_BIN}/docker" <<'EOF'
 #!/usr/bin/env bash
+if [[ " $* " == *" context inspect "* ]]; then
+  echo "unix://$HOME/.colima/default/docker.sock"
+fi
 if [[ " $* " == *" info "* ]]; then
-  # A different kernel models the existing VM-backed path; this watchdog test
+  # The Colima socket models the existing VM-backed path; this watchdog test
   # deliberately does not exercise the host-Docker activation branch.
   echo "fixture-vm-kernel"
 fi

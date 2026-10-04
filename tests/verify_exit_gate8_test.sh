@@ -10,6 +10,19 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# Unknown daemon ownership must never select the native-host policy.
+(
+  eval "$(sed -n '/^containment_in_vm() {/,/^}/p' "$VERIFY")"
+  eval "$(sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY")"
+  export DOCKER_HOST=ssh://unowned-fixture
+  unset DOCKER_CONTAINMENT_MODE
+  if host_docker_requires_actions_oomctl; then
+    fail "unknown Docker endpoint selected host policy"
+  fi
+) || fail "Docker ownership dispatch is unsafe"
+
+DOCKER_CONTAINMENT_MODE=host-docker
+
 cat > "$TMP/valid.toml" <<'EOF'
 [limits]
 cgroup_parent = "actions.slice"
@@ -190,6 +203,249 @@ qemu_max_line=$(grep -n 'QEMU_CEILING_BYTES.*=' "$VERIFY" | head -1 | cut -d: -f
   || fail "live QEMU ceiling probe is missing after modern checks"
 grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
   || fail "live max QEMU ceiling is not fail-closed"
+! grep -Fq "pgrep -f 'qemu-system-x86_64'" "$VERIFY" \
+  || fail "Gate 8 still selects an arbitrary host QEMU"
+grep -Fq 'assert-qemu-cpu-ceiling.sh' "$VERIFY" \
+  || fail "Gate 8 does not reuse the service-bound QEMU assertion"
+
+# Host-docker envelope (bead ez-gh-actions-154k): live memory.max of
+# actions/agents/automation/lima-vm@colima.service must equal the tracked
+# host-docker policy, be finite, and with the 10% reserve fit MemTotal.
+# Fixture host = jeff-ubuntu's MemTotal (63336 MB, reserve 6333 MB).
+ENV_DIR="$TMP/envelope"
+mkdir -p "$ENV_DIR/bin" "$ENV_DIR/cg/actions.slice" "$ENV_DIR/cg/user/agents.slice" \
+  "$ENV_DIR/cg/user/automation.slice" "$ENV_DIR/cg/user/lima-vm@colima.service"
+printf 'MemTotal:       64856928 kB\n' > "$ENV_DIR/meminfo"
+cat > "$ENV_DIR/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+# `systemctl --user show -p ControlGroup --value -- <unit>` -> /user/<unit>
+for unit in "$@"; do :; done
+printf '/user/%s\n' "$unit"
+EOF
+chmod +x "$ENV_DIR/bin/systemctl"
+set_live() { # unit-dir high max
+  printf '%s\n' "$2" > "$ENV_DIR/cg/$1/memory.high"
+  printf '%s\n' "$3" > "$ENV_DIR/cg/$1/memory.max"
+}
+G=1073741824
+set_live_policy() { # agents_high agents_max automation_high automation_max (bytes)
+  set_live actions.slice $((26 * G)) $((28 * G))
+  set_live user/agents.slice "$1" "$2"
+  set_live user/automation.slice "$3" "$4"
+  set_live user/lima-vm@colima.service $((9 * G)) $((10 * G))
+}
+run_envelope() { # policy-root
+  PATH="$ENV_DIR/bin:$PATH" \
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=host_docker_envelope \
+  VERIFY_EXIT_CRITERIA_POLICY_ROOT="$1" \
+  VERIFY_EXIT_CRITERIA_CGROUP_ROOT="$ENV_DIR/cg" \
+  VERIFY_EXIT_CRITERIA_MEMINFO="$ENV_DIR/meminfo" \
+    bash "$VERIFY" 2>&1
+}
+
+# (a) tracked policy 28+12+5+10 = 56320 MB + 6333 MB reserve <= 63336 MB.
+set_live_policy $((10 * G)) $((12 * G)) $((4608 * 1048576)) $((5 * G))
+env_out=$(run_envelope "$ROOT") || fail "host-docker 28+12+5+10 envelope should pass: $env_out"
+grep -Fq '56320MB' <<<"$env_out" || fail "envelope did not sum live maxima to 56320MB: $env_out"
+
+# (b) an unbounded live maximum is rejected, never summed as zero.
+printf 'max\n' > "$ENV_DIR/cg/user/agents.slice/memory.max"
+if env_out=$(run_envelope "$ROOT"); then
+  fail "unbounded agents.slice memory.max should fail: $env_out"
+fi
+grep -Fq 'agents.slice' <<<"$env_out" || fail "unbounded rejection did not name agents.slice: $env_out"
+
+# (c) maxima of 28+20+10+10 = 69632 MB over-commit the host even
+#     when live state matches its (old) policy.
+OLD_POLICY="$TMP/old-policy"
+mkdir -p "$OLD_POLICY/systemd/host" "$OLD_POLICY/systemd/lima-vm@colima.service.d"
+cp "$ROOT/systemd/host/actions.slice" "$OLD_POLICY/systemd/host/actions.slice"
+cp "$ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  "$OLD_POLICY/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+printf '[Slice]\nMemoryHigh=18G\nMemoryMax=20G\n' > "$OLD_POLICY/systemd/agents.slice"
+printf '[Slice]\nMemoryHigh=8G\nMemoryMax=10G\n' > "$OLD_POLICY/systemd/automation.slice"
+set_live_policy $((18 * G)) $((20 * G)) $((8 * G)) $((10 * G))
+if env_out=$(run_envelope "$OLD_POLICY"); then
+  fail "host-docker 28+20+10+10 envelope should fail: $env_out"
+fi
+grep -Fq 'exceed host' <<<"$env_out" || fail "old maxima did not fail on the envelope sum: $env_out"
+
+# (d) live state that drifted from the tracked policy fails even if it fits.
+set_live_policy $((10 * G)) $((12 * G)) $((4 * G)) $((5 * G))
+if env_out=$(run_envelope "$ROOT"); then
+  fail "live automation.slice 4G/5G must not match the tracked 4608M/5G policy: $env_out"
+fi
+
+# Gate 8 (3): oomd must monitor /actions.slice (real `oomctl` layout).
+cat > "$TMP/oomctl-enrolled.txt" <<'EOF'
+Dry Run: no
+Swap Used Limit: 90.00%
+Default Memory Pressure Limit: 60.00%
+Default Memory Pressure Duration: 20s
+System Context:
+	Memory: Used: 0B Total: 0B
+	Swap: Used: 0B Total: 0B
+Swap Monitored CGroups:
+Memory Pressure Monitored CGroups:
+	Path: /actions.slice
+		Memory Pressure Limit: 80.00%
+		Pressure: Avg10: 0.00 Avg60: 0.00 Avg300: 0.00 Total: 0
+		Current Memory Usage: 7.5G
+		Memory Min: 0B
+		Memory Low: 0B
+		Pgscan: 0
+		Last Pgscan: 0
+EOF
+cat > "$TMP/oomctl-empty.txt" <<'EOF'
+Dry Run: no
+Swap Used Limit: 90.00%
+Default Memory Pressure Limit: 60.00%
+Default Memory Pressure Duration: 20s
+System Context:
+	Memory: Used: 0B Total: 0B
+	Swap: Used: 0B Total: 0B
+Swap Monitored CGroups:
+	Path: /actions.slice
+Memory Pressure Monitored CGroups:
+	Path: /user.slice
+EOF
+cat > "$TMP/oomctl-none.txt" <<'EOF'
+Dry Run: no
+Memory Pressure Monitored CGroups:
+EOF
+run_oomctl() {
+  VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
+  VERIFY_EXIT_CRITERIA_TEST_CASE=oomctl_actions \
+  VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE="$1" \
+    bash "$VERIFY" >/dev/null 2>&1
+}
+run_oomctl "$TMP/oomctl-enrolled.txt" || fail "oomctl listing /actions.slice under pressure should pass"
+if run_oomctl "$TMP/oomctl-empty.txt"; then
+  fail "/actions.slice only under Swap (pressure lists /user.slice) must not pass"
+fi
+
+# Gate 8 timer policy is executed before optional envelope detection. Both
+# auxiliary mutation timers must be disabled and inactive because install.sh
+# retires them.
+TIMER_BIN="$TMP/timer-bin"
+mkdir -p "$TIMER_BIN"
+cat > "$TIMER_BIN/systemctl" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = "--user" ] && shift
+case "${1:-}" in
+  is-enabled)
+    if [ -n "${STUB_ENABLED_BROKEN:-}" ] && { [ -z "${STUB_BROKEN_TIMER:-}" ] || [ "${2:-}" = "${STUB_BROKEN_TIMER}" ]; }; then
+      echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    for timer in ${STUB_ENABLED_TIMERS:-}; do [ "$timer" = "${2:-}" ] && { echo enabled; exit 0; }; done
+    if [ -n "${STUB_ABSENT:-}" ]; then echo "Failed to get unit file state for ${2:-}: No such file or directory" >&2; exit 1; fi
+    if [ -n "${STUB_NOTFOUND:-}" ]; then echo not-found; exit 4; fi
+    echo disabled; exit 1 ;;
+  is-active)
+    if [ "${2:-}" = systemd-oomd ]; then echo inactive; exit 3; fi
+    if [ -n "${STUB_ACTIVE_BROKEN:-}" ] && { [ -z "${STUB_BROKEN_TIMER:-}" ] || [ "${2:-}" = "${STUB_BROKEN_TIMER}" ]; }; then
+      echo "${STUB_BROKEN_MSG:-Failed to connect to bus: No medium found}" >&2; exit 1
+    fi
+    for timer in ${STUB_ACTIVE_TIMERS:-}; do [ "$timer" = "${2:-}" ] && { echo active; exit 0; }; done
+    echo inactive; exit 3 ;;
+esac
+exit 1
+EOF
+chmod +x "$TIMER_BIN/systemctl"
+
+# Run the real Linux pre-envelope Gate 8 dispatch, not only the helper.
+run_gate8_pre_envelope() {
+  local gate_header modern_start gate_start retired_start helper_start helper_end saved_fail
+  export STUB_ENABLED_TIMERS STUB_ACTIVE_TIMERS STUB_ABSENT STUB_NOTFOUND \
+    STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN STUB_BROKEN_TIMER STUB_BROKEN_MSG
+  gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
+  modern_start=$(grep -n '^IS_MODERN_ENVELOPE=0$' "$VERIFY" | cut -d: -f1)
+  gate_start=$(awk -v min="$gate_header" -v max="$modern_start" 'NR >= min && NR < max && /^if \[ "\$\(uname -s\)" = "Linux" \]; then$/ { print NR; exit }' "$VERIFY")
+  retired_start=$(grep -n '^verify_retired_timer() {' "$VERIFY" | cut -d: -f1)
+  helper_start=$(grep -n '^verify_modern_timers() {' "$VERIFY" | cut -d: -f1)
+  helper_end=$(awk -v start="$helper_start" 'NR > start && /^}$/ { print NR; exit }' "$VERIFY")
+  [ -n "$gate_start" ] && [ -n "$retired_start" ] && [ -n "$helper_start" ] && [ -n "$helper_end" ] || fail "could not extract Gate 8 timer dispatch"
+  saved_fail=$(declare -f fail)
+  GATE8_POLICY_FAILURE=""
+  CONFIG_FILE="$TMP/valid.toml"
+  fail() { GATE8_POLICY_FAILURE="$*"; }
+  uname() { echo Linux; }
+  verify_platform_actions_slice() { return 0; }
+  containment_in_vm() { return 1; }
+  verify_managed_runners_in_actions_slice() { return 0; }
+  eval "$(sed -n "${retired_start},${helper_end}p" "$VERIFY")"
+  eval "$(sed -n "${gate_start},$((modern_start - 1))p" "$VERIFY")" || true
+  GATE8_POLICY_RESULT="$GATE8_POLICY_FAILURE"
+  eval "$saved_fail"
+}
+
+PATH="$TIMER_BIN:$PATH"
+unset STUB_ENABLED_TIMERS STUB_ACTIVE_TIMERS STUB_ABSENT STUB_NOTFOUND STUB_ENABLED_BROKEN STUB_ACTIVE_BROKEN STUB_BROKEN_TIMER
+run_gate8_pre_envelope
+[ -z "$GATE8_POLICY_RESULT" ] || fail "both disabled timers must pass pre-envelope dispatch: $GATE8_POLICY_RESULT"
+for retired_timer in agent-scope-reaper.timer psi-oom-watcher.timer; do
+  STUB_ENABLED_TIMERS="$retired_timer"
+  run_gate8_pre_envelope
+  [ -n "$GATE8_POLICY_RESULT" ] || fail "enabled ${retired_timer} must fail before optional envelope detection"
+  grep -Fq "$retired_timer" <<<"$GATE8_POLICY_RESULT" || fail "enabled timer failure omitted ${retired_timer}: $GATE8_POLICY_RESULT"
+  unset STUB_ENABLED_TIMERS
+  STUB_ABSENT=1 STUB_ACTIVE_TIMERS="$retired_timer"
+  run_gate8_pre_envelope
+  [ -n "$GATE8_POLICY_RESULT" ] || fail "absent ${retired_timer} unit but active runtime must fail"
+  unset STUB_ABSENT STUB_ACTIVE_TIMERS
+done
+STUB_ENABLED_BROKEN=1
+STUB_BROKEN_TIMER=psi-oom-watcher.timer
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "enabled-state bus failure must fail closed"
+STUB_BROKEN_MSG="Failed to connect to bus: No such file or directory"
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "bus failure with 'No such file' must fail closed"
+unset STUB_ENABLED_BROKEN
+unset STUB_BROKEN_MSG
+STUB_ACTIVE_BROKEN=1
+STUB_BROKEN_TIMER=agent-scope-reaper.timer
+run_gate8_pre_envelope
+[ -n "$GATE8_POLICY_RESULT" ] || fail "active-state bus failure must fail closed"
+unset STUB_ACTIVE_BROKEN STUB_BROKEN_TIMER
+
+# Execute the real later PSI admission branch. With oomd inactive it must not
+# revive the retired timer as a fallback or remediation.
+run_gate8_psi_admission() {
+  local psi_start psi_end saved_fail
+  psi_start=$(grep -n '^# (3) PSI admission check' "$VERIFY" | cut -d: -f1)
+  psi_end=$(grep -n '^# (4) Physical-host RAM envelope' "$VERIFY" | cut -d: -f1)
+  [ -n "$psi_start" ] && [ -n "$psi_end" ] || fail "could not extract Gate 8 PSI admission"
+  saved_fail=$(declare -f fail)
+  GATE8_PSI_FAILURE=""
+  fail() { GATE8_PSI_FAILURE="$*"; }
+  uname() { echo Linux; }
+  containment_in_vm() { return 1; }
+  host_docker_requires_actions_oomctl() { return 1; }
+  IS_MODERN_ENVELOPE=0
+  eval "$(sed -n "${psi_start},$((psi_end - 1))p" "$VERIFY")"
+  GATE8_PSI_RESULT="$GATE8_PSI_FAILURE"
+  eval "$saved_fail"
+}
+run_gate8_psi_admission
+[ -n "$GATE8_PSI_RESULT" ] || fail "unenrolled oomd must fail the later PSI-admission branch"
+grep -Fq 'ManagedOOMMemoryPressure=kill' <<<"$GATE8_PSI_RESULT" || fail "PSI failure omitted enrolled-oomd remediation: $GATE8_PSI_RESULT"
+! grep -Fq 'psi-oom-watcher' <<<"$GATE8_PSI_RESULT" || fail "later PSI branch still offers retired timer: $GATE8_PSI_RESULT"
+
+# Test mode covers the shared disabled/inactive policy independently.
+timer_out=$(PATH="$TIMER_BIN:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1) || fail "both disabled timers failed test mode: $timer_out"
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_ACTIVE_TIMERS=agent-scope-reaper.timer VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  fail "disabled but active reaper timer must fail: $timer_out"
+fi
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_ACTIVE_TIMERS=psi-oom-watcher.timer VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  fail "disabled but active PSI timer must fail: $timer_out"
+fi
+if timer_out=$(PATH="$TIMER_BIN:$PATH" STUB_NOTFOUND=1 VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_timers bash "$VERIFY" 2>&1); then
+  : # systemd's not-found is a valid disabled PSI state
+else
+  fail "not-found PSI timer must pass: $timer_out"
+fi
 
 # Kdump/pstore verification is diagnostic-only. It must be quiet on a healthy
 # fixture, fail closed on an unhealthy fixture, and never invoke a remediation
@@ -491,6 +747,26 @@ source "$TMP/selector.sh"
 [ "$IS_MODERN_ENVELOPE" = 1 ] || fail "native Linux without wrapper fell through to legacy policy"
 (source "$TMP/gate3.sh") >"$TMP/gate3.log" 2>&1   || fail "native Gate 8 (3) rejected hermetic rollback-10 fixture: $(cat "$TMP/gate3.log")"
 grep -q 'Release 1 finite host caps' "$TMP/gate3.log"   || fail "native Gate 8 (3) did not use canonical assertion"
+# The composed native host-docker branch must also require oomctl to monitor
+# /actions.slice. Restore the production helpers (an earlier fixture stubbed
+# host_docker_requires_actions_oomctl) and feed oomctl output from a stub.
+eval "$(sed -n '/^host_docker_requires_actions_oomctl() {/,/^}/p' "$VERIFY")"
+eval "$(sed -n '/^oomctl_lists_actions_slice() {/,/^}/p' "$VERIFY")"
+mkdir -p "$TMP/oomctl-bin"
+printf '#!/usr/bin/env bash\ncat "$OOMCTL_FIXTURE"\n' > "$TMP/oomctl-bin/oomctl"
+chmod +x "$TMP/oomctl-bin/oomctl"
+(DOCKER_CONTAINMENT_MODE=host-docker OOMCTL_FIXTURE="$TMP/oomctl-enrolled.txt" PATH="$TMP/oomctl-bin:$PATH"; export OOMCTL_FIXTURE; source "$TMP/gate3.sh") \
+  >"$TMP/gate3-oomctl.log" 2>&1 || fail "native host-docker Gate 8 (3) rejected oomctl listing /actions.slice: $(cat "$TMP/gate3-oomctl.log")"
+grep -q 'oomctl monitors /actions.slice' "$TMP/gate3-oomctl.log" \
+  || fail "native host-docker Gate 8 (3) did not report the oomctl proof: $(cat "$TMP/gate3-oomctl.log")"
+for oomctl_fixture in oomctl-empty oomctl-none; do
+  if (DOCKER_CONTAINMENT_MODE=host-docker OOMCTL_FIXTURE="$TMP/$oomctl_fixture.txt" PATH="$TMP/oomctl-bin:$PATH"; export OOMCTL_FIXTURE; source "$TMP/gate3.sh") \
+      >"$TMP/gate3-$oomctl_fixture.log" 2>&1; then
+    fail "native host-docker Gate 8 (3) accepted $oomctl_fixture without /actions.slice under memory pressure"
+  fi
+  grep -q 'requires oomctl to list /actions.slice' "$TMP/gate3-$oomctl_fixture.log" \
+    || fail "native host-docker Gate 8 (3) $oomctl_fixture failed for the wrong reason: $(cat "$TMP/gate3-$oomctl_fixture.log")"
+done
 printf 'max\n' > "$FIXTURE/sys/fs/cgroup/actions.slice/memory.max"
 if (source "$TMP/selector.sh"; source "$TMP/gate3.sh") >"$TMP/gate3-poison.log" 2>&1; then
   fail "native Gate 8 (3) ignored poisoned fixture cgroup"
@@ -549,7 +825,7 @@ chmod +x "$TMP/timerbin/systemctl"
 # Exercise the real Linux Gate 8 pre-envelope block with no modern-envelope
 # files. The helper-only cases below are insufficient: this proves the actual
 # branch calls the policy before optional local-envelope detection.
-run_gate8_pre_envelope() {
+run_gate8_timer_fixture_pre_envelope() {
   local gate_header modern_start gate_start timer_start timer_end original_fail
   gate_header=$(grep -n '^echo "--- Checking Gate 8: VM/AO/MCP containment ---"$' "$VERIFY" | cut -d: -f1)
   modern_start=$(grep -n '^IS_MODERN_ENVELOPE=0$' "$VERIFY" | cut -d: -f1)
@@ -566,7 +842,7 @@ run_gate8_pre_envelope() {
   fail() { GATE8_POLICY_FAILURE="$*"; }
   uname() { echo Linux; }
   verify_platform_actions_slice() { return 0; }
-  daemon_in_vm() { return 1; }
+  containment_in_vm() { return 1; }
   verify_managed_runners_in_actions_slice() { return 0; }
   eval "$(sed -n "${timer_start},${timer_end}p" "$VERIFY")"
   verify_modern_timers() {
@@ -583,18 +859,18 @@ unset STUB_NOTFOUND STUB_ABSENT STUB_SYSTEMCTL_BROKEN STUB_BROKEN_MSG
 STUB_ENABLED_TIMERS="psi-oom-watcher.timer"
 STUB_ACTIVE_TIMERS=""
 export STUB_ENABLED_TIMERS
-run_gate8_pre_envelope
+run_gate8_timer_fixture_pre_envelope
 [ -n "$GATE8_POLICY_RESULT" ] \
   || fail "enabled PSI timer must fail through Gate 8 before optional envelope detection"
 grep -Fq 'psi-oom-watcher.timer' <<<"$GATE8_POLICY_RESULT" \
   || fail "pre-envelope timer failure omitted diagnostic: $GATE8_POLICY_RESULT"
 STUB_ENABLED_TIMERS=""
-run_gate8_pre_envelope
+run_gate8_timer_fixture_pre_envelope
 [ -z "$GATE8_POLICY_RESULT" ] \
   || fail "disabled PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
 STUB_ABSENT=1
 export STUB_ABSENT
-run_gate8_pre_envelope
+run_gate8_timer_fixture_pre_envelope
 [ -z "$GATE8_POLICY_RESULT" ] \
   || fail "absent PSI timer must pass through Gate 8 before optional envelope detection: $GATE8_POLICY_RESULT"
 unset STUB_ABSENT

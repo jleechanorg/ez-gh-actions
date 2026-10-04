@@ -25,7 +25,8 @@ assert_line "$ACTIONS_SLICE" "MemorySwapMax=0"
 assert_line "$ACTIONS_SLICE" "TasksMax=8000"
 assert_line "$ACTIONS_SLICE" "CPUQuota=2000%"
 assert_line "$ACTIONS_SLICE" "IOWeight=25"
-assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressure=auto"
+assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressure=kill"
+assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressureLimit=80%"
 assert_line "$ACTIONS_SLICE" "ManagedOOMSwap=auto"
 assert_line "$ACTIONS_SLICE" "[Install]"
 assert_line "$ACTIONS_SLICE" "WantedBy=slices.target"
@@ -36,7 +37,7 @@ start_line="$(grep -nF 'systemctl start actions.slice' "$APPLY_SCRIPT" | cut -d:
 [ -n "$enable_line" ] || fail "root containment activation does not persist actions.slice boot wiring"
 [ -n "$start_line" ] || fail "root containment activation does not start actions.slice"
 [ "$enable_line" -lt "$start_line" ] || fail "actions.slice must be enabled before it is started"
-ok "systemd/host/actions.slice finite boundary and auto OOM policies"
+ok "systemd/host/actions.slice finite boundary, oomd kill at 80% pressure"
 
 # 2. User workload slices
 AGENTS_SLICE="$REPO_ROOT/systemd/agents.slice"

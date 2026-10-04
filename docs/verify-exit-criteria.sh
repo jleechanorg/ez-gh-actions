@@ -339,6 +339,93 @@ expected_effective_cpus() {
     fi
 }
 
+# Local containment ownership is stricter than the Rust CPU-burst VM proof.
+containment_in_vm() {
+    [ "$(uname -s)" = "Darwin" ] && return 0
+    [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = vm-backed ]
+}
+
+host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1" 2>/dev/null; }
+# Integer-only size conversion for tracked systemd values (4608M, 5G, 0).
+host_to_bytes() {
+    case "$1" in
+        *G) echo $(( ${1%G} * 1024 * 1024 * 1024 )) ;;
+        *M) echo $(( ${1%M} * 1024 * 1024 )) ;;
+        *K) echo $(( ${1%K} * 1024 )) ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Gate 8 host-docker envelope (bead ez-gh-actions-154k). On a host-docker
+# Linux host the four finite budgets are actions.slice (runners), agents.slice,
+# automation.slice and lima-vm@colima.service (the qdrant-only Colima VM). Their
+# LIVE memory.high/memory.max must equal the tracked host-docker policy and be
+# finite, and the sum of the live memory.max values plus the reserve
+# (max(MemTotal/10, 2048 MB)) must fit MemTotal. Hard maxima are summed once;
+# no memory.high x2 overflow model and no separate app-lima-vm.slice term.
+verify_host_docker_envelope() {
+    local policy_root="${VERIFY_EXIT_CRITERIA_POLICY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local cg_root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local meminfo="${VERIFY_EXIT_CRITERIA_MEMINFO:-/proc/meminfo}"
+    local entry unit policy cg want_high want_max live_high live_max
+    local total_mb=0 host_mb reserve_mb terms=""
+    for entry in \
+        "actions.slice|systemd/host/actions.slice" \
+        "agents.slice|systemd/agents.slice" \
+        "automation.slice|systemd/automation.slice" \
+        "lima-vm@colima.service|systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
+        unit="${entry%%|*}"
+        policy="${policy_root}/${entry#*|}"
+        want_high=$(host_to_bytes "$(host_unit_value "$policy" MemoryHigh)")
+        want_max=$(host_to_bytes "$(host_unit_value "$policy" MemoryMax)")
+        case "${want_high}:${want_max}" in
+            :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: tracked ${policy} must set finite integer MemoryHigh/MemoryMax (got high=${want_high:-?} max=${want_max:-?})" ;;
+        esac
+        if [ "$unit" = actions.slice ]; then
+            cg=/actions.slice
+        else
+            cg=$(systemctl --user show -p ControlGroup --value -- "$unit" 2>/dev/null || true)
+        fi
+        [ -n "$cg" ] || fail "Gate 8 host-docker envelope: ${unit} has no live cgroup"
+        live_high=$(cat "${cg_root}${cg}/memory.high" 2>/dev/null || true)
+        live_max=$(cat "${cg_root}${cg}/memory.max" 2>/dev/null || true)
+        case "${live_high}:${live_max}" in
+            :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: ${unit} live memory.high=${live_high:-unreadable} memory.max=${live_max:-unreadable} is not finite (${cg_root}${cg})" ;;
+        esac
+        if [ "$live_high" != "$want_high" ] || [ "$live_max" != "$want_max" ]; then
+            fail "Gate 8 host-docker envelope: ${unit} live memory.high=${live_high} memory.max=${live_max} does not match tracked ${entry#*|} (high=${want_high} max=${want_max})"
+        fi
+        total_mb=$((total_mb + live_max / 1048576))
+        terms="${terms:+${terms} + }${unit}=$((live_max / 1048576))MB"
+    done
+    host_mb=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' "$meminfo" 2>/dev/null || true)
+    case "$host_mb" in ''|*[!0-9]*|0) fail "Gate 8 host-docker envelope: could not read MemTotal from ${meminfo}" ;; esac
+    reserve_mb=$((host_mb / 10))
+    [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
+    if [ $((total_mb + reserve_mb)) -gt "$host_mb" ]; then
+        fail "Gate 8 host-docker envelope: live hard maxima ${total_mb}MB (${terms}) + reserve ${reserve_mb}MB exceed host ${host_mb}MB"
+    fi
+    echo "    [PASS] Gate 8 host-docker envelope: live hard maxima ${total_mb}MB (${terms}) + reserve ${reserve_mb}MB fit host ${host_mb}MB"
+}
+
+# Succeeds when `oomctl` output (stdin) lists /actions.slice under
+# "Memory Pressure Monitored CGroups:" (tab-indented "Path: /actions.slice").
+oomctl_lists_actions_slice() {
+    awk '
+        /^Memory Pressure Monitored CGroups:/ { capturing = 1; next }
+        /^[^[:space:]]/                       { capturing = 0 }
+        capturing && $1 == "Path:" && $2 == "/actions.slice" { found = 1 }
+        END { exit !found }
+    '
+}
+
+# Host-docker has one required PSI admission target: actions.slice is the
+# host's runner aggregate.  A legacy user-scope timer may be present for
+# VM-backed deployments, but it cannot hide a missing oomd enrollment here.
+host_docker_requires_actions_oomctl() {
+    [ "$(uname -s)" = "Linux" ] && [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = host-docker ]
+}
+
 daemon_in_vm() {
     # VM-containment proof via the docker daemon's own kernel string.
     # Mirrors src/platform.rs::daemon_in_vm(): the daemon kernel probe
@@ -700,6 +787,8 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
         kdump) verify_kdump_pstore ;;
         modern_timers) verify_modern_timers ;;
+        host_docker_envelope) verify_host_docker_envelope ;;
+        oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
         gate0) verify_deployed_sha "${VERIFY_EXIT_CRITERIA_DEPLOYED_SHA:?}" ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         modern_policy)
@@ -885,7 +974,26 @@ elif [ "$PLATFORM" = "macos" ]; then
   [ -f "${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist" ]     || fail "launchd plist missing at ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
 fi
 
+service_docker_endpoint() {
+  local service_env endpoint
+  service_env="$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null || true)"
+  endpoint="$(printf '%s\n' "$service_env" | tr ' ' '\n' | sed -n 's/^DOCKER_HOST_OVERRIDE=//p' | head -1)"
+  printf '%s\n' "${endpoint:-unix:///var/run/docker.sock}"
+}
+
+if [ "$PLATFORM" = "linux" ]; then
+  # The service's persisted override, or native Linux fallback, controls this
+  # verification; ambient operator Docker context is deliberately ignored.
+  DOCKER_HOST="$(service_docker_endpoint)"
+else
+  DOCKER_HOST="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+      || fail "Docker endpoint selection is unknown; cannot verify containment"
+fi
+export DOCKER_HOST
+unset DOCKER_CONTEXT
 docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unreachable"
+DOCKER_CONTAINMENT_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "$DOCKER_HOST")" \
+    || fail "Docker endpoint ownership is unknown; cannot verify containment"
 
 if [ "$PLATFORM" = "macos" ] && command -v colima >/dev/null 2>&1; then
   colima status 2>&1 | grep -qi "is running"     || fail "Colima VM is not running (run: colima start)"
@@ -987,7 +1095,7 @@ if [ "$EXPECTED_MEMORY_BYTES" -le 0 ]; then
     fail "Computed expected memory bytes must be > 0 (limits.memory_mb='$LIMIT_MEMORY_MB')"
 fi
 
-if ! daemon_in_vm; then
+if ! containment_in_vm; then
     if ! cpu_controller_available; then
         fail "CPU controller check failed: this host does not expose a usable cpu cgroup controller"
     fi
@@ -1305,7 +1413,7 @@ if [ "$(uname -s)" = "Linux" ]; then
     if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
         fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
     fi
-    if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
+    if containment_in_vm && command -v limactl >/dev/null 2>&1; then
         if ! verify_guest_managed_runners_in_actions_slice; then
             fail "Gate 8: every managed runner in the Docker VM must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
         fi
@@ -1313,6 +1421,8 @@ if [ "$(uname -s)" = "Linux" ]; then
         fail "Gate 8: every managed runner must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
     fi
     echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
+    # This policy precedes optional modern-envelope detection: a retired
+    # watcher must not be obscured by incomplete local unit files.
     verify_modern_timers
 fi
 IS_MODERN_ENVELOPE=0
@@ -1333,7 +1443,7 @@ if modern_envelope_required; then
     # runs on the host (jeff-ubuntu) the slice is the host's own, and the
     # oracle is the tracked unit systemd/host/actions.slice, not the guest
     # numbers. Host-Docker deployments must inspect the host hierarchy.
-    if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
+    if containment_in_vm && command -v limactl >/dev/null 2>&1; then
         GUEST_ACTIONS_VALUES=""
         {
             GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc '
@@ -1368,15 +1478,6 @@ if modern_envelope_required; then
         echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
     else
         host_unit="${REPO_ROOT}/systemd/host/actions.slice"
-        host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1"; }
-        host_to_bytes() {
-            case "$1" in
-                *G) echo $(( ${1%G} * 1024 * 1024 * 1024 )) ;;
-                *M) echo $(( ${1%M} * 1024 * 1024 )) ;;
-                *K) echo $(( ${1%K} * 1024 )) ;;
-                *) echo "$1" ;;
-            esac
-        }
         host_high_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryHigh)")
         host_max_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryMax)")
         host_swap_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemorySwapMax)")
@@ -1429,9 +1530,7 @@ fi
 #                      MemoryHigh; currently ao-daemon.service has
 #                      memory.high=max and contains the AO daemon + MCP
 #                      servers uncontained.
-#   (3) PSI admission: enroll a real cgroup in systemd-oomd via
-#                      ManagedOOMMemoryPressure/ManagedOOMSwap (default
-#                      policy on Ubuntu 24.04 manages user.slice automatically).
+#   (3) PSI admission: systemd-oomd must have a real enrolled cgroup.
 #   (4) Aggregate:     physical_host_RAM >= QEMU slice ceiling (read from
 #                      /sys/fs/cgroup${QEMU_CG}/memory.high) + AO/MCP slice
 #                      ceilings (sum across unique slice paths) + mandatory
@@ -1443,7 +1542,7 @@ fi
 #                      physical host RAM, lower MemoryHigh on
 #                      app-lima-vm.slice, or lower the agent-CLI slice
 #                      MemoryHigh.
-echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live limits and the computed host reserve. Native Release 1 requires ManagedOOM=auto and retired PSI timers; VM-backed legacy policy requires a cgroup enrolled in systemd-oomd (ManagedOOMMemoryPressure=kill or ManagedOOMSwap=kill)."
+echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live limits and the computed host reserve. Native Release 1 requires actions.slice ManagedOOMMemoryPressure=kill at 80% (listed by oomctl), ManagedOOM=auto on the other host slices, and retired PSI timers; VM-backed legacy policy requires a cgroup enrolled in systemd-oomd (ManagedOOMMemoryPressure=kill or ManagedOOMSwap=kill)."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
@@ -1451,38 +1550,25 @@ echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live lim
 # jeff-ubuntu), QEMU runs at host scope and IS reachable via
 # /proc/<qemu>/cgroup, so we still probe. On every other combo, we probe.
 PROBE_QEMU_SLICE=1
-if [ "$(uname -s)" = "Darwin" ] && daemon_in_vm; then
+if [ "$(uname -s)" = "Darwin" ] && containment_in_vm; then
     PROBE_QEMU_SLICE=0
     echo "    [SKIP] Gate 8 (1) QEMU slice probe: daemon-in-VM on macOS (Lima VM cgroup not reachable from macOS shell)"
 fi
 QEMU_PID=""
 QEMU_CG=""
 if [ "$PROBE_QEMU_SLICE" = "1" ]; then
-    QEMU_PID=$(pgrep -f 'qemu-system-x86_64' | head -1 || true)
-    if [ -z "$QEMU_PID" ]; then
-        fail "Gate 8 (1) FAIL-CLOSED: no qemu-system-x86_64 process detected on this host. The project's stated goal (physical-host availability) requires that the Colima/Lima VM is provably bounded by an enforced cgroup ceiling; without that process the bound cannot be verified. Remediation: start the Colima VM (limactl start colima, or colima start) — without it Docker daemon has no parent and the per-container limits are unrolled."
-    else
-        # /proc/<pid>/cgroup on cgroup-v2-only hosts is a single line
-        # starting with "0::<path>". Extract the path with grep + cut.
-        QEMU_CG=$(grep '^0::' "/proc/$QEMU_PID/cgroup" 2>/dev/null | head -1 || true)
-        if [ -z "$QEMU_CG" ]; then
-            fail "Gate 8 (1) PID $QEMU_PID has no cgroup-v2 entry in /proc/$QEMU_PID/cgroup. Remediation: ensure the host kernel exposes CONFIG_CGROUP_V2."
-        fi
-        # /proc/<pid>/cgroup escapes '-' as the literal 4-char sequence
-        # '\x2d' on this host, so 'app-lima-vm' written plainly will not
-        # match 'app-lima\x2dvm.slice'. Match on the unit/service name
-        # instead — 'lima-vm' substring catches both 'lima-vm@colima.service'
-        # and 'app-lima\x2dvm.slice'.
-        if ! echo "$QEMU_CG" | grep -q 'lima-vm'; then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
-        fi
-        if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy systemd/app-lima-vm.slice (finite approved memory limits) to ~/.config/systemd/user/, have the deploy owner reconcile the approved live limits without restarting the VM."
-        fi
-        echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
+    # Resolve exactly one QEMU bound to lima-vm@colima.service.
+    if ! QEMU_ASSERTION="$(ASSERT_LIVE_QEMU=1 \
+        "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)"; then
+        fail "Gate 8 (1) QEMU service-bound assertion failed: $QEMU_ASSERTION"
     fi
+    QEMU_CG_PATH="$(printf '%s\n' "$QEMU_ASSERTION" | sed -n 's/.* cgroup=\([^ ]*\) .*/\1/p' | head -1)"
+    case "$QEMU_CG_PATH" in
+        /sys/fs/cgroup/*) QEMU_CG="0::${QEMU_CG_PATH#/sys/fs/cgroup}" ;;
+        *) fail "Gate 8 (1) QEMU service-bound assertion returned no canonical cgroup path: $QEMU_ASSERTION" ;;
+    esac
+    echo "    [PASS] Gate 8 (1) QEMU service-bound cgroup assertion passed"
 fi
-
 # (2) AO/MCP slice probe --------------------------------------------------------------
 # Identify Agent Orchestrator + MCP daemon processes by argv pattern
 # (comm alone misses python3-spawned MCP servers), then verify each
@@ -1613,8 +1699,16 @@ fi
 if [ "$(uname -s)" = "Linux" ] && [ "$IS_MODERN_ENVELOPE" = 1 ] && ! daemon_in_vm; then
     verify_modern_psi_policy || fail "Gate 8 (3): canonical live host containment assertion failed"
     verify_modern_timers || fail "Gate 8 (3): retired timers must be disabled and inactive, or absent"
-    PSI_OK=1
     PSI_SOURCE="Release 1 finite host caps and ManagedOOM=auto"
+    if host_docker_requires_actions_oomctl; then
+        # Host-docker: the runner aggregate itself must be what oomd watches
+        # (systemd/host/actions.slice: ManagedOOMMemoryPressure=kill at 80%).
+        if ! oomctl 2>/dev/null | oomctl_lists_actions_slice; then
+            fail "Gate 8 (3) host-docker PSI admission requires oomctl to list /actions.slice under 'Memory Pressure Monitored CGroups:'. Verify the actions.slice ManagedOOMMemoryPressure=kill and ManagedOOMMemoryPressureLimit=80% policy is live."
+        fi
+        PSI_SOURCE="Release 1 finite host caps; oomctl monitors /actions.slice (kill at 80%)"
+    fi
+    PSI_OK=1
 fi
 
 if [ "$PSI_OK" != "1" ]; then
@@ -1729,6 +1823,9 @@ echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /pro
 # slice-ceiling model does not apply.
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "    [SKIP] Gate 8 (4) host-RAM aggregate: macOS — cgroup-v2 not available, host-RAM envelope model is Linux-only"
+elif ! containment_in_vm; then
+    # Host-docker: sum the four live finite hard maxima once (no x2 model).
+    verify_host_docker_envelope
 else
     HOST_MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
     if ! is_uint "$HOST_MEM_TOTAL_KB" || [ "$HOST_MEM_TOTAL_KB" -eq 0 ]; then

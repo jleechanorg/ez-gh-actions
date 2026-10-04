@@ -107,7 +107,10 @@ if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     actual="$(systemctl show -p "$property" --value -- "$unit")"
     [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
   }
-  check_system_property actions.slice ManagedOOMMemoryPressure auto
+  # systemd-oomd kills inside actions.slice (runner jobs) at 80% pressure.
+  check_system_property actions.slice ManagedOOMMemoryPressure kill
+  # systemd 255 reports the limit as a UINT32_MAX fraction: 80% = 3435973836.
+  check_system_property actions.slice ManagedOOMMemoryPressureLimit 3435973836
   check_system_property actions.slice ManagedOOMSwap auto
   deploy_uid="$(id -u)"
   check_system_property "user@${deploy_uid}.service" ManagedOOMMemoryPressure auto
