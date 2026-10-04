@@ -204,10 +204,36 @@ run_case "case6 (accept)" \
    echo 'unexpected docker call: \$*' >&2; exit 99" \
   "0" "" "8"
 
-# Verify Gate 3 actually invokes the helper (so the seam is not orphaned —
-# a refactor that drops the call site would still pass the cases above but
-# would silently bypass the production guard in real verifier runs).
-grep -nq 'gate3_burst_preflight' "$VERIFY" \
-  || fail "Gate 3 must invoke gate3_burst_preflight helper (found no reference)"
+# --- Case 7: KernelVersion probe exits nonzero with nonempty stdout --------
+# Regression for the prior `|| true` swallowing: a half-failed probe that
+# printed something (e.g. a docker daemon warning on stderr that leaked
+# into stdout) would have been accepted by the OLD code; the new code
+# MUST require exit 0 first. Pin: daemon_in_vm returns false → preflight
+# refuses with the VM-containment message, NOT a downstream NCPU error.
+run_case_uname "case7 (KernelVersion nonzero+nonempty)" \
+  "Linux" \
+  "if [ \"\$1\" = \"info\" ] && [ \"\$3\" = \"{{.KernelVersion}}\" ]; then echo 6.17.0-fake; exit 1; fi
+   echo 'unexpected docker call: \$*' >&2; exit 99" \
+  "1" "not verified VM-contained" ""
+
+# --- Case 8: NCPU probe exits nonzero with nonempty stdout ------------------
+# VM proof succeeds (kernel probe OK), then NCPU probe returns nonzero
+# with a stale value. The OLD `|| true` would have leaked the value into
+# is_uint; the new code MUST require exit 0 first and surface the
+# probe-failure message (not a misleading "not finite positive integer").
+run_case_uname "case8 (NCPU nonzero+nonempty)" \
+  "Linux" \
+  "if [ \"\$1\" = \"info\" ] && [ \"\$3\" = \"{{.KernelVersion}}\" ]; then echo 6.17.0-vm; exit 0; fi
+   if [ \"\$1\" = \"info\" ] && [ \"\$3\" = \"{{.NCPU}}\" ]; then echo 4; exit 1; fi
+   echo 'unexpected docker call: \$*' >&2; exit 99" \
+  "1" "exited non-zero" ""
+
+# Verify Gate 3 actually invokes the helper at the production call site —
+# anchor on the GATE3_PROVEN_NCPU assignment (which only happens when the
+# helper is invoked AND its stdout captured). A bare reference to the
+# helper definition would pass this grep but is not what Gate 3 needs;
+# the seam is the assignment, not the declaration.
+grep -nq 'GATE3_PROVEN_NCPU=$(gate3_burst_preflight)' "$VERIFY" \
+  || fail "Gate 3 must capture gate3_burst_preflight output via GATE3_PROVEN_NCPU=\$(gate3_burst_preflight) — declaration references alone are not sufficient (found no assignment)"
 
 echo "VERIFY_EXIT_GATE3_BURST_PREFLIGHT_TEST: PASS"

@@ -299,22 +299,29 @@ expected_effective_cpus() {
 daemon_in_vm() {
     # VM-containment proof via the docker daemon's own kernel string.
     # Mirrors src/platform.rs::daemon_in_vm(): the daemon kernel probe
-    # MUST succeed first; an unreachable daemon returns false rather
-    # than a stale "Darwin implies VM" true (regression 2026-10-03:
-    # the prior Darwin-shortcut unconditionally returned true even when
-    # the docker daemon was unreachable, which would have admitted
-    # burst via Gate 3 on a dead-daemon host). On macOS the daemon is
-    # always in a VM (no native Linux containers) so any non-empty
-    # daemon kernel counts; on Linux, the daemon kernel must also
-    # differ from the host kernel (uname -r).
-    local daemon_kernel
-    daemon_kernel=$(docker info --format '{{.KernelVersion}}' 2>/dev/null | tr -d '[:space:]' || true)
+    # MUST succeed (exit 0 AND non-empty output) before the Darwin
+    # shortcut; a nonzero exit with nonempty stdout is NOT success — it
+    # is a half-failed probe that the prior `|| true` accepted silently
+    # (regression 2026-10-03, root review of 0d743: daemon_kernel
+    # carrying stderr text would have matched the daemon_in_vm branch and
+    # silently admitted burst on a half-broken daemon). On macOS the
+    # daemon is always in a VM (no native Linux containers) so any
+    # non-empty daemon kernel counts; on Linux the daemon kernel must
+    # also differ from the host kernel (uname -r).
+    local daemon_kernel_raw daemon_kernel
+    if ! daemon_kernel_raw=$(docker info --format '{{.KernelVersion}}' 2>/dev/null); then
+        return 1
+    fi
+    daemon_kernel=$(printf '%s' "$daemon_kernel_raw" | tr -d '[:space:]')
     [ -n "$daemon_kernel" ] || return 1
     if [ "$(uname -s)" = "Darwin" ]; then
         return 0
     fi
-    local host_kernel
-    host_kernel=$(uname -r | tr -d '[:space:]' || true)
+    local host_kernel_raw host_kernel
+    if ! host_kernel_raw=$(uname -r 2>/dev/null); then
+        return 1
+    fi
+    host_kernel=$(printf '%s' "$host_kernel_raw" | tr -d '[:space:]')
     [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
 }
 
@@ -336,8 +343,16 @@ gate3_burst_preflight() {
         echo "limits.cpu_burst=true but docker daemon is not verified VM-contained (daemon_in_vm kernel proof returned false); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
         return 1
     fi
-    local ncpu
-    ncpu=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    local ncpu_raw ncpu
+    # Require exit 0 AND non-empty output — a nonzero exit with a stale
+    # value cached in stdout would otherwise leak into is_uint and either
+    # silently coerce or trip a misleading "not finite positive integer"
+    # error rather than the actual probe failure.
+    if ! ncpu_raw=$(docker info --format '{{.NCPU}}' 2>/dev/null); then
+        echo "limits.cpu_burst=true but docker info --format {{.NCPU}} exited non-zero (probe failure); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    ncpu=$(printf '%s' "$ncpu_raw" | tr -d '[:space:]')
     if ! is_uint "$ncpu" || [ "$ncpu" -le 0 ]; then
         echo "limits.cpu_burst=true but docker info NCPU is not a finite positive integer ('${ncpu:-unavailable}'); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
         return 1
