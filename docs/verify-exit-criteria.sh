@@ -1164,8 +1164,7 @@ if [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
     # slice lives in the guest and is read through limactl; where the daemon
     # runs on the host (jeff-ubuntu) the slice is the host's own, and the
     # oracle is the tracked unit systemd/host/actions.slice, not the guest
-    # numbers. Checking the guest from a host-docker deployment reads
-    # "unavailable" and was a false FAIL (bead ez-gh-actions-1mdp).
+    # numbers. Host-Docker deployments must inspect the host hierarchy.
     if daemon_in_vm && command -v limactl >/dev/null 2>&1; then
         GUEST_ACTIONS_VALUES=""
         {
