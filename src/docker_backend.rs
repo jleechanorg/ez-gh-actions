@@ -5028,7 +5028,7 @@ fn post_refill_released_slots(
     // Reuse the allocator's current exclusions without reserving another slot
     // or accepting its fail-soft fallback for uncertain quarantine evidence.
     let quarantine = quarantine::load_quarantine_for(Some(cfg))?.excluded_slots();
-    let ladder = FailureLadder::load(&failure_ladder_path_for(cfg))?;
+    let ladder = FailureLadder::load(failure_ladder_path_for(cfg))?;
     let now = now_epoch_secs();
     if FAILURE_LADDER_PERSISTENCE_FAILED.load(Ordering::SeqCst)
         || ladder.fleet_admission_is_paused(now)
