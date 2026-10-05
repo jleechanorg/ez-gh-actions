@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
-# regression test: install.sh --uninstall must tear down the auxiliary
-# systemd timers/services (token-refresh, queue-reaper, watchdog, dashboard) BEFORE
-# removing ~/.local/libexec/ezgha -- leaving them scheduled against a
-# now-deleted script recreates the exact dead-path-scheduled-job incident
-# class from 2026-07-09 (codex adversarial review 2026-07-10, finding 4).
-# Previously uninstall() disabled only the main ezgha.service + main
-# launchd plist, then `rm -rf`'d libexec, leaving the three aux
-# timers/services still enabled and pointing at deleted scripts.
+# regression test: install.sh --uninstall must disable and remove every
+# auxiliary systemd unit before deleting ~/.local/libexec/ezgha, while
+# preserving unrelated user drop-ins.
 #
-# This drives install.sh's REAL --uninstall code path end-to-end with
-# `systemctl`/`cargo` stubbed out on PATH -- it never touches the live
-# system. Per CLAUDE.md: "Do NOT run install.sh against the live system --
-# stubs only."
+# This drives the real --uninstall path with every destructive executable
+# resolved to an exact fixture stub before invocation. Do not run install.sh
+# against a live system: this test is stubs only. The fixture clears inherited
+# environment state and uses a fake user bus address.
 #
-# Platform selection is also stubbed: uname always reports Linux and a
-# launchctl tripwire proves this test cannot touch the live macOS service
-# manager when it runs on a Mac host.
+# Platform selection is stubbed: uname reports Linux and launchctl is a
+# tripwire, so the fixture cannot reach a live macOS service manager.
 #
 # Usage: bash tests/install_uninstall_aux_units_test.sh
 
@@ -68,8 +62,46 @@ echo "systemctl $*" >> "${SYSTEMCTL_LOG}"
 exit 0
 EOF
 
+cat > "${STUB_BIN}/limactl" <<'EOF'
+#!/usr/bin/env bash
+: "${LIMACTL_LOG:?LIMACTL_LOG must be exported}"
+echo "limactl $*" >> "${LIMACTL_LOG}"
+exit 1
+EOF
+
+cat > "${STUB_BIN}/sudo" <<'EOF'
+#!/usr/bin/env bash
+: "${FORBIDDEN_SUDO_LOG:?FORBIDDEN_SUDO_LOG must be exported}"
+echo "sudo $*" >> "${FORBIDDEN_SUDO_LOG}"
+exit 99
+EOF
+
 chmod +x "${STUB_BIN}"/*
-export PATH="${STUB_BIN}:${PATH}"
+
+preflight_stub_path() {
+  local bin_dir="$1" tool actual
+  for tool in systemctl cargo limactl uname launchctl sudo; do
+    actual="$(PATH="${bin_dir}:/usr/bin:/bin" command -v "${tool}" || true)"
+    [ "${actual}" = "${bin_dir}/${tool}" ] || {
+      echo "FAIL: ${tool} resolved to ${actual:-<missing>}, expected ${bin_dir}/${tool}" >&2
+      return 1
+    }
+  done
+}
+
+if ! preflight_stub_path "${STUB_BIN}"; then
+  echo "FAIL: fixture executable preflight rejected the intended stub set" >&2
+  exit 1
+fi
+BAD_STUB_BIN="${WORK}/misnamed-bin"
+mkdir -p "${BAD_STUB_BIN}"
+ln -s "${STUB_BIN}/systemctl" "${BAD_STUB_BIN}/systemctl-misnamed"
+if preflight_stub_path "${BAD_STUB_BIN}"; then
+  echo "FAIL: misnamed fixture stub was accepted before installer invocation" >&2
+  exit 1
+else
+  echo "PASS: misnamed fixture stub rejected before installer invocation"
+fi
 
 # ── Seed a fully "installed" state ────────────────────────────────────────
 HOME_T="${WORK}/home"
@@ -87,15 +119,37 @@ for unit in ezgha.service \
   printf '[Unit]\nDescription=stub\n' > "${HOME_T}/.config/systemd/user/${unit}"
 done
 printf '#!/usr/bin/env bash\ntrue\n' > "${HOME_T}/.local/libexec/ezgha/cleanup-stuck-runs.sh"
+for guard_dir in \
+    "${HOME_T}/.config/systemd/user/lima-vm@colima.service.d" \
+    "${HOME_T}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"; do
+  mkdir -p "${guard_dir}"
+  printf 'owned guard\n' > "${guard_dir}/10-guest-memory-admission.conf"
+  printf 'unrelated drop-in\n' > "${guard_dir}/99-unrelated.conf"
+done
 
 SYSTEMCTL_LOG="${WORK}/systemctl.log"
 : > "${SYSTEMCTL_LOG}"
 FORBIDDEN_LAUNCHCTL_LOG="${WORK}/launchctl.log"
 : > "${FORBIDDEN_LAUNCHCTL_LOG}"
 
-HOME="${HOME_T}" SYSTEMCTL_LOG="${SYSTEMCTL_LOG}" \
-  FORBIDDEN_LAUNCHCTL_LOG="${FORBIDDEN_LAUNCHCTL_LOG}" \
-  bash "${TEMP_REPO}/install.sh" --uninstall > "${WORK}/uninstall.log" 2>&1 || true
+RUNTIME_DIR="${WORK}/runtime"
+mkdir -p "${RUNTIME_DIR}"
+: > "${RUNTIME_DIR}/fake-bus"
+LIMACTL_LOG="${WORK}/limactl.log"
+FORBIDDEN_SUDO_LOG="${WORK}/sudo.log"
+: > "${LIMACTL_LOG}" "${FORBIDDEN_SUDO_LOG}"
+env -i \
+  "HOME=${HOME_T}" \
+  "CARGO_HOME=${HOME_T}/.cargo" \
+  "XDG_CONFIG_HOME=${HOME_T}/.config" \
+  "XDG_RUNTIME_DIR=${RUNTIME_DIR}" \
+  "DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/fake-bus" \
+  "PATH=${STUB_BIN}:/usr/bin:/bin" \
+  "SYSTEMCTL_LOG=${SYSTEMCTL_LOG}" \
+  "LIMACTL_LOG=${LIMACTL_LOG}" \
+  "FORBIDDEN_LAUNCHCTL_LOG=${FORBIDDEN_LAUNCHCTL_LOG}" \
+  "FORBIDDEN_SUDO_LOG=${FORBIDDEN_SUDO_LOG}" \
+  /bin/bash "${TEMP_REPO}/install.sh" --uninstall > "${WORK}/uninstall.log" 2>&1
 
 # ── Assertions ─────────────────────────────────────────────────────────────
 
@@ -139,6 +193,21 @@ else
   echo "PASS: lima-vm-cpu-ceiling.service removed"
 fi
 
+for guard_dir in \
+    "${HOME_T}/.config/systemd/user/lima-vm@colima.service.d" \
+    "${HOME_T}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"; do
+  if [ -e "${guard_dir}/10-guest-memory-admission.conf" ]; then
+    fail "owned guest admission drop-in survived uninstall: ${guard_dir}"
+  else
+    echo "PASS: owned guest admission drop-in removed: ${guard_dir}"
+  fi
+  if [ ! -f "${guard_dir}/99-unrelated.conf" ]; then
+    fail "unrelated drop-in was removed: ${guard_dir}"
+  else
+    echo "PASS: unrelated drop-in preserved: ${guard_dir}"
+  fi
+done
+
 if [ -d "${HOME_T}/.local/libexec/ezgha" ]; then
   fail "libexec script dir survived uninstall (should be rm -rf'd)"
 else
@@ -155,6 +224,12 @@ if [ -s "${FORBIDDEN_LAUNCHCTL_LOG}" ]; then
   fail "uninstall invoked forbidden live-platform launchctl path"
 else
   echo "PASS: Linux platform stub prevented launchctl invocation"
+fi
+
+if [ -s "${FORBIDDEN_SUDO_LOG}" ]; then
+  fail "uninstall invoked forbidden sudo path"
+else
+  echo "PASS: uninstall did not invoke forbidden sudo path"
 fi
 
 if [ "${PASS}" = true ]; then

@@ -124,7 +124,9 @@ uninstall() {
   rm -f "${HOME}/.config/systemd/user/ao-daemon.service.d/20-automation-slice.conf" \
         "${HOME}/.config/systemd/user/ao-orchestrator.service.d/20-automation-slice.conf" \
         "${HOME}/.config/systemd/user/ai.dark-factory.daemon.service.d/20-automation-slice.conf" \
-        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf"
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+        "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
   rm -f "${HOME}/.local/bin/watchdog-load-repair.sh"
   # Remove only the persistent guest unit. Do not stop the active slice here:
   # existing runner containers may still be attached while uninstall drains.
@@ -413,17 +415,11 @@ ensure_colima_docker_daemon() {
 }
 ensure_colima_docker_daemon || true
 DOCKER_HOST_OVERRIDE=""
-# Resolve the Docker endpoint selected by the current shell into an explicit
-# value that can be persisted for the service and reused by every build and
-# runner mutation. Docker documents that DOCKER_CONTEXT overrides DOCKER_HOST,
-# so resolve a named context first; otherwise honor an explicit host socket.
-if [ -n "${DOCKER_CONTEXT:-}" ]; then
-  DOCKER_CTX_HOST=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
-elif [ -n "${DOCKER_HOST:-}" ]; then
-  DOCKER_CTX_HOST="$DOCKER_HOST"
-else
-  DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
-fi
+# Resolve the Docker endpoint selected by the current shell into the explicit
+# value persisted for the service and reused by every build and runner mutation.
+# The host-mode helper owns endpoint precedence and validates the selected owner.
+DOCKER_CTX_HOST="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+  || { bad "cannot resolve selected Docker endpoint"; exit 1; }
 # Strategy 2: probe colima's default location
 DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
 # Strategy 3: probe docker desktop's socket
@@ -484,11 +480,23 @@ ok "All tests passed"
 
 # A Linux daemon that shares this kernel needs the host aggregate boundary
 # before replacing the binary, building an image, or starting the service.
+HOST_DOCKER_MODE=0
 if [ "$(uname -s)" = "Linux" ]; then
   docker_endpoint="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}"
-  docker_kernel="$(env -u DOCKER_CONTEXT DOCKER_HOST="${docker_endpoint}" docker info --format '{{.KernelVersion}}' 2>/dev/null || true)"
-  [ -n "${docker_kernel}" ] || { bad "cannot determine selected Docker daemon kernel; refusing uncontained Linux deployment"; exit 1; }
-  if [ "${docker_kernel}" = "$(uname -r)" ]; then
+  docker_mode="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${docker_endpoint}")"     || { bad "cannot classify selected Docker endpoint"; exit 1; }
+  if [ "${docker_mode}" = host-docker ]; then
+    HOST_DOCKER_MODE=1
+    # The guest-admission drop-ins run under systemd's minimal PATH, so bind
+    # them to the same absolute limactl this installer uses for admission.
+    LIMACTL_BIN="$(command -v limactl || true)"
+    case "${LIMACTL_BIN}" in
+      /*) ;;
+      *) bad "host-docker guest admission requires limactl on PATH"; exit 1 ;;
+    esac
+    case "${LIMACTL_BIN}" in
+      *[[:space:]%\\\"\|]*) bad "limactl path is not safe for a systemd drop-in: ${LIMACTL_BIN}"; exit 1 ;;
+    esac
+    export LIMACTL="${LIMACTL_BIN}"
     RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
       bad "could not read runner.count from ${CONFIG_PATH}"
       exit 1
@@ -500,6 +508,23 @@ if [ "$(uname -s)" = "Linux" ]; then
         exit 1
         ;;
     esac
+    # Host Docker keeps runners under actions.slice and sets the Colima guest
+    # to an 8GiB allocation. lima-vm@colima starts from this lima.yaml; the
+    # 10G QEMU ceiling remains refused until the running guest matches.
+    lima_yaml="${LIMA_YAML:-$("${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" --print-yaml)}" || {
+      bad "cannot resolve the active Lima instance configuration"; exit 1;
+    }
+    if [ -n "${lima_yaml}" ] && [ ! -f "${lima_yaml}" ]; then
+      bad "active Lima configuration is missing: ${lima_yaml}"; exit 1
+    fi
+    if [ -n "${lima_yaml}" ] && ! grep -qx 'memory: "8GiB"' "${lima_yaml}"; then
+      if grep -q '^memory:' "${lima_yaml}"; then
+        sed -i 's/^memory: .*/memory: "8GiB"/' "${lima_yaml}"
+      else
+        printf 'memory: "8GiB"\n' >> "${lima_yaml}"
+      fi
+      warn "colima guest memory set to 8GiB in ${lima_yaml}; it takes effect after one VM restart"
+    fi
     HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
     HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
     mkdir -p "${HOST_CONTROL_DIR}" \
@@ -513,6 +538,20 @@ if [ "$(uname -s)" = "Linux" ]; then
     install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
     install -m 0755 "${SCRIPT_DIR}/scripts/host/qemu-ceiling-guard.sh" "${HOST_CONTROL_DIR}/qemu-ceiling-guard.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
+    mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d" \
+      "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"
+    for guard_dir in lima-vm@colima.service.d lima-vm-cpu-ceiling.service.d; do
+      guard="${HOME}/.config/systemd/user/${guard_dir}/10-guest-memory-admission.conf"
+      sed -e "s|@LIMACTL@|${LIMACTL_BIN}|g" \
+        "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" > "${guard}"
+      grep -qx "Environment=LIMACTL=${LIMACTL_BIN}" "${guard}" && ! grep -q '@[A-Z_]*@' "${guard}" \
+        || { bad "could not render guest admission guard ${guard}"; exit 1; }
+    done
+    systemctl --user daemon-reload || { bad "could not load guest admission guards"; exit 1; }
+    "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
+      bad "host-docker guest admission failed before host containment activation"; exit 1;
+    }
     for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
       install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
     done
@@ -526,6 +565,13 @@ if [ "$(uname -s)" = "Linux" ]; then
     fi
     "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --runner-count "${RUNNER_COUNT}" || { bad "host containment user phase failed after root policy activation"; exit 1; }
     ok "host containment activated before binary replacement"
+  else
+    # A previous host-docker installation adds admission guards that enforce
+    # its 8GiB guest contract. VM-backed mode does not use that guest
+    # contract, so remove only those exact guards before installation.
+    rm -f "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+          "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+    systemctl --user daemon-reload || { bad "could not unload host-docker guest admission guards"; exit 1; }
   fi
 fi
 
@@ -827,7 +873,7 @@ FSTRIM_EOF
 
     # Host-wide reliability controls. Keep executable paths stable and render
     # all templates from tracked source; no live service or VM is restarted.
-    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh qemu-ceiling-guard.sh; do
+    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh qemu-ceiling-guard.sh lima-guest-memory-check.sh; do
       source_script="${SCRIPT_DIR}/scripts/host/${script}"
       [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
       install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
@@ -840,6 +886,14 @@ FSTRIM_EOF
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
+    # Host-docker mode also requires the 8GiB guest contract before the 10G
+    # QEMU ceiling is installed; the early containment phase enforced it too.
+    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
+      "${SCRIPTS_DIR}/lima-guest-memory-check.sh" || {
+        bad "refusing to install QEMU ceiling: host-docker guest admission failed"
+        exit 1
+      }
+    fi
     # agent-scope-reaper was deleted (it killed live cursor-agent, bead
     # ez-gh-actions-8o81): heal any previously installed copy.
     if ! retire_user_units agent-scope-reaper agent-scope-reaper.timer agent-scope-reaper.service; then
@@ -848,8 +902,6 @@ FSTRIM_EOF
     rm -f "${USER_UNIT_DIR}/agent-scope-reaper.service" \
           "${USER_UNIT_DIR}/agent-scope-reaper.timer" \
           "${SCRIPTS_DIR}/agent-scope-reaper.sh"
-    # Retire the unsafe PSI watcher before deleting its unit files. Do not let
-    # a timer-disable failure skip the explicit service stop or verification.
     if ! retire_user_units psi-oom-watcher psi-oom-watcher.timer psi-oom-watcher.service; then
       exit 1
     fi
@@ -937,7 +989,20 @@ EOF
     # Remove any historical repair script
     rm -f "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
 
-    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || { bad "could not reload installed user units"; exit 1; }
+    # Reapply the tracked budgets after copying the unit files. A prior
+    # systemctl --user set-property writes user.control drop-ins that survive
+    # unit replacement, so the tracked values must win during every install.
+    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192)
+    AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
+    if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
+      bad "could not apply selected agents.slice budget"
+      exit 1
+    fi
+    if ! systemctl --user set-property automation.slice "${AUTOMATION_SLICE_PROPS[@]}"; then
+      bad "could not apply selected automation.slice budget"
+      exit 1
+    fi
     # Apply the direct QEMU ceiling to an already-running Colima service.
     # The tracked drop-in supplies the same values after the next boot; the
     # runtime property closes the upgrade window without restarting the VM.

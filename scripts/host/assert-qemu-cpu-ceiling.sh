@@ -7,13 +7,17 @@
 # 0:: cgroup entry, and inspects only the resulting QEMU_CGROUP_ROOT path
 # (default: /sys/fs/cgroup).  It never scans for, or falls back to, a sibling
 # slice: a bounded unrelated QEMU/cgroup must not make this check pass.
+#
+# The tracked ceiling is 9G/10G in every deployment mode (systemd/).
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+fail() { echo "FAIL: $*" >&2; exit 1; }
+QEMU_MAX_HIGH=$((9 * 1024 * 1024 * 1024))
+QEMU_MAX_MAX=$((10 * 1024 * 1024 * 1024))
 DROPIN="${REPO_ROOT}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
 SLICE="${REPO_ROOT}/systemd/app-lima-vm.slice"
 RUNTIME_UNIT="${REPO_ROOT}/systemd/lima-vm-cpu-ceiling.service"
-fail() { echo "FAIL: $*" >&2; exit 1; }
 
 assert_file() { [ -f "$1" ] || fail "missing $1"; }
 assert_line() {
@@ -50,28 +54,54 @@ fi
 QEMU_PROC_ROOT="${QEMU_PROC_ROOT:-/proc}"
 QEMU_CGROUP_ROOT="${QEMU_CGROUP_ROOT:-/sys/fs/cgroup}"
 QEMU_PID="${QEMU_PID:-}"
-export QEMU_PROC_ROOT QEMU_CGROUP_ROOT QEMU_PID
+export QEMU_PROC_ROOT QEMU_CGROUP_ROOT QEMU_PID QEMU_MAX_HIGH QEMU_MAX_MAX
 
 python3 - <<'PY' || fail "live QEMU cgroup ceilings are missing, unbounded, or exceed limits"
 import os
 import re
+import subprocess
 import sys
 
 proc_root = os.environ["QEMU_PROC_ROOT"].rstrip("/") or "/"
 cgroup_root = os.environ["QEMU_CGROUP_ROOT"].rstrip("/") or "/"
 requested_pid = os.environ.get("QEMU_PID", "").strip()
-service_cgroup = "lima-vm@colima.service"
+service_unit = "lima-vm@colima.service"
+
 
 def read(path):
     with open(path, encoding="utf-8") as handle:
         return handle.read().strip()
 
+
 def fail(message):
     print(f"FAIL: {message}", file=sys.stderr)
     raise SystemExit(1)
 
+
+def safe_cgroup_path(value, label):
+    if not value or not value.startswith("/") or "\x00" in value:
+        fail(f"{label} has no safe cgroup-v2 path: {value!r}")
+    parts = value.split("/")[1:]
+    if any(part in ("", ".", "..") for part in parts):
+        fail(f"{label} has unsafe cgroup path: {value!r}")
+    return value
+
+
+def actual_service_cgroup():
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ControlGroup", "--value", "--", service_unit],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot resolve {service_unit} ControlGroup: {exc}")
+    return safe_cgroup_path(result.stdout.strip(), f"{service_unit} ControlGroup")
+
+
 def qemu_comm(pid, *, required):
-    """Read a process name, optionally failing when /proc races away."""
     try:
         comm = read(os.path.join(proc_root, pid, "comm"))
     except OSError as exc:
@@ -80,7 +110,70 @@ def qemu_comm(pid, *, required):
         return None
     return comm if comm.startswith("qemu-system-x86") else None
 
-def candidate_pids():
+
+def cgroup_rel(pid, *, required):
+    try:
+        lines = read(os.path.join(proc_root, pid, "cgroup")).splitlines()
+    except OSError as exc:
+        if required:
+            fail(f"cannot read {proc_root}/{pid}/cgroup: {exc}")
+        return None
+    rel = None
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0":
+            rel = fields[2]
+            break
+    if rel is None:
+        if required:
+            fail(f"QEMU pid {pid} has no cgroup-v2 0:: path")
+        return None
+    if not rel.startswith("/") or "\x00" in rel:
+        if required:
+            fail(f"QEMU pid {pid} has unsafe cgroup path: {rel!r}")
+        return None
+    parts = rel.split("/")[1:]
+    if any(part in ("", ".", "..") for part in parts):
+        if required:
+            fail(f"QEMU pid {pid} has unsafe cgroup path: {rel!r}")
+        return None
+    return rel
+
+
+def under_service(rel, service_cgroup):
+    return rel == service_cgroup or rel.startswith(service_cgroup.rstrip("/") + "/")
+
+
+def cgroup_for(pid, service_cgroup, *, required):
+    rel = cgroup_rel(pid, required=required)
+    if rel is None:
+        return None
+    if not under_service(rel, service_cgroup):
+        if required:
+            fail(
+                f"QEMU pid {pid} cgroup is outside {service_unit} ControlGroup "
+                f"{service_cgroup}: {rel!r}"
+            )
+        return None
+    path = os.path.join(cgroup_root, *rel.split("/")[1:])
+    if not os.path.isdir(path):
+        if required:
+            fail(f"QEMU pid {pid} cgroup path does not exist: {path}")
+        return None
+    try:
+        procs = read(os.path.join(path, "cgroup.procs")).split()
+    except OSError as exc:
+        if required:
+            fail(f"cannot verify QEMU pid {pid} membership at {path}: {exc}")
+        return None
+    if pid not in procs:
+        if required:
+            fail(f"QEMU pid {pid} is not a member of its resolved cgroup {path}")
+        return None
+    return path
+
+
+def candidate_pids(service_cgroup):
     if requested_pid:
         if not requested_pid.isdigit() or int(requested_pid) <= 0:
             fail(f"invalid QEMU_PID={requested_pid!r}")
@@ -94,6 +187,7 @@ def candidate_pids():
                 f"QEMU_PID={requested_pid} is not qemu-system-x86 "
                 f"(comm={actual_comm!r})"
             )
+        cgroup_for(requested_pid, service_cgroup, required=True)
         return [requested_pid]
     try:
         pids = sorted((name for name in os.listdir(proc_root) if name.isdigit()), key=int)
@@ -103,79 +197,22 @@ def candidate_pids():
     for pid in pids:
         if qemu_comm(pid, required=False) is None:
             continue
-        # Do not let an unrelated bounded QEMU satisfy this probe.  Resolve
-        # candidates by their own cgroup identity and require exactly one
-        # process in the lima-vm@colima.service cgroup.  Races while reading
-        # /proc are treated as non-matches; an absent/ambiguous service then
-        # fails closed below.
-        try:
-            cgroup_lines = read(os.path.join(proc_root, pid, "cgroup")).splitlines()
-        except OSError:
-            continue
-        rel = None
-        for line in cgroup_lines:
-            fields = line.split(":", 2)
-            if len(fields) == 3 and fields[0] == "0":
-                rel = fields[2]
-                break
-        if not rel or not rel.startswith("/") or "\x00" in rel:
-            continue
-        parts = rel.split("/")[1:]
-        if any(part in ("", ".", "..") for part in parts):
-            continue
-        if parts and parts[-1] == service_cgroup:
+        if cgroup_for(pid, service_cgroup, required=False) is not None:
             matches.append(pid)
     if len(matches) != 1:
         if not matches:
-            fail(f"no qemu-system-x86 process verifiably belongs to {service_cgroup}")
+            fail(f"no qemu-system-x86 process belongs to {service_unit} ControlGroup {service_cgroup}")
         fail(
-            f"expected exactly one qemu-system-x86 process in {service_cgroup}, "
-            f"found {len(matches)} ({', '.join(matches)})"
+            f"expected exactly one qemu-system-x86 process under {service_unit} "
+            f"ControlGroup {service_cgroup}, found {len(matches)} ({', '.join(matches)})"
         )
     return matches
 
-def cgroup_for(pid):
-    try:
-        lines = read(os.path.join(proc_root, pid, "cgroup")).splitlines()
-    except OSError as exc:
-        fail(f"cannot read {proc_root}/{pid}/cgroup: {exc}")
-    rel = None
-    for line in lines:
-        fields = line.split(":", 2)
-        if len(fields) == 3 and fields[0] == "0":
-            rel = fields[2]
-            break
-    if not rel or not rel.startswith("/") or "\x00" in rel:
-        fail(f"QEMU pid {pid} has no cgroup-v2 0:: path")
-    # /proc cgroup paths are absolute within cgroupfs.  Reject traversal and
-    # inspect exactly this path; no basename/sibling discovery is permitted.
-    parts = rel.split("/")[1:]
-    if any(part in ("", ".", "..") for part in parts):
-        fail(f"unsafe cgroup path {rel!r}")
-    if not parts or parts[-1] != service_cgroup:
-        fail(
-            f"QEMU pid {pid} cgroup is not {service_cgroup}: "
-            f"{rel!r}"
-        )
-    path = os.path.join(cgroup_root, *parts)
-    if not os.path.isdir(path):
-        fail(f"QEMU pid {pid} cgroup path does not exist: {path}")
-    try:
-        procs = read(os.path.join(path, "cgroup.procs")).split()
-    except OSError as exc:
-        fail(f"cannot verify QEMU pid {pid} membership at {path}: {exc}")
-    if pid not in procs:
-        fail(f"QEMU pid {pid} is not a member of its resolved cgroup {path}")
-    return path
-
-pids = candidate_pids()
-if not pids:
-    fail("no qemu-system-x86 process")
-if requested_pid and not os.path.exists(os.path.join(proc_root, requested_pid, "comm")):
-    fail(f"QEMU_PID={requested_pid} does not exist under {proc_root}")
-
+service_cgroup = actual_service_cgroup()
+pids = candidate_pids(service_cgroup)
 pid = pids[0]
-cg = cgroup_for(pid)
+cg = cgroup_for(pid, service_cgroup, required=True)
+
 
 def finite_int(name, maximum):
     try:
@@ -199,8 +236,8 @@ quota, period = map(int, cpu)
 if period <= 0 or quota <= 0 or quota > 16 * period:
     fail(f"{cg}/cpu.max={' '.join(cpu)} exceeds CPUQuota=1600%")
 
-high = finite_int("memory.high", 9 * 1024**3)
-maximum = finite_int("memory.max", 10 * 1024**3)
+high = finite_int("memory.high", int(os.environ["QEMU_MAX_HIGH"]))
+maximum = finite_int("memory.max", int(os.environ["QEMU_MAX_MAX"]))
 swap = finite_int("memory.swap.max", 2 * 1024**3)
 pids_max = finite_int("pids.max", 4096)
 if high > maximum:
@@ -208,6 +245,7 @@ if high > maximum:
 print(
     f"PASS: live QEMU pid={pid} cgroup={cg} "
     f"cpu.max={quota} {period} memory.high={high} memory.max={maximum} "
-    f"memory.swap.max={swap} pids.max={pids_max}"
+    f"memory.swap.max={swap} pids.max={pids_max} "
+    f"service_cgroup={service_cgroup}"
 )
 PY

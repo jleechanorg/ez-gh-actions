@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # agent-cli-scoped.sh — opt-IN wrapper that launches a command inside the
 # `agents.slice` systemd --user slice (see systemd/agents.slice for the
-# MemoryHigh=20G rationale and blast-radius statement). Part of bead
-# ez-gh-actions-0725 (panel decision on ez-gh-actions-ah94, Tier 1 do-now #2).
+# selected agents.slice policy and blast-radius statement).
 #
 # USAGE:
 #   scripts/host/agent-cli-scoped.sh claude --dangerously-skip-permissions
@@ -58,7 +57,7 @@ fi
 
 if [ "$#" -eq 0 ]; then
   echo "usage: $(basename "$0") [--auto-attach] <command> [args...]" >&2
-  echo "  launches <command> inside the agents.slice systemd --user slice (MemoryHigh=18G, MemoryMax=20G)." >&2
+  echo "  launches <command> inside the selected agents.slice systemd --user policy." >&2
   echo "  --auto-attach            flag indicating the caller migrated an existing session" >&2
   exit 2
 fi

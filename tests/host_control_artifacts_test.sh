@@ -65,6 +65,16 @@ grep -q "measured margin" "$REPO_ROOT/systemd/agents.slice" || fail "agents.slic
 grep -q "measured margin" "$REPO_ROOT/systemd/app-lima-vm.slice" || fail "app-lima-vm.slice lacks measured margin documentation"
 grep -q "measured margin" "$REPO_ROOT/systemd/automation.slice" || fail "automation.slice lacks measured margin documentation"
 ok "slice budgets and measured-margin documentation"
+# Every memory value is an integer unit (systemd and the Gate 8 bash helpers
+# both reject fractional sizes such as 4.5G).
+! grep -rEn '^Memory(High|Max|SwapMax)=[0-9]*\.[0-9]' "$REPO_ROOT/systemd" \
+  || fail "fractional memory value in tracked systemd policy"
+grep -q 'memory: "8GiB"' "$REPO_ROOT/install.sh" || fail "install.sh does not set the host-docker Lima guest to 8GiB"
+GUEST_ADMISSION="$REPO_ROOT/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf"
+assert_file "$GUEST_ADMISSION"
+assert_line "$GUEST_ADMISSION" "ExecStartPre=%h/.local/libexec/ezgha/lima-guest-memory-check.sh"
+assert_line "$GUEST_ADMISSION" "Environment=LIMACTL=@LIMACTL@"
+ok "host-docker guest admission guard tracked"
 
 LAUNCH="$REPO_ROOT/scripts/host/agent-scoped-launch.sh"
 assert_file "$LAUNCH"
