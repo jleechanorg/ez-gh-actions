@@ -1,5 +1,5 @@
 [Unit]
-Description=Clean stale ezgha/AO mission worktree outputs every 1 hour
+Description=Clean stale ezgha/AO mission checkout outputs every 1 hour
 
 [Timer]
 OnBootSec=5min
