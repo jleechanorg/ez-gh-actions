@@ -7455,6 +7455,7 @@ esac
     #[test]
     #[cfg(target_os = "linux")]
     fn post_refill_released_slot_requests_immediate_reconcile() {
+        let _qlock = crate::quarantine::tests::test_lock();
         let env = TestEnv::new("post_refill_released_slot");
         let dir = env.path.parent().unwrap();
         // TestEnv paths can recur after a test process PID is recycled.
@@ -8196,6 +8197,7 @@ esac
     #[test]
     #[cfg(target_os = "linux")]
     fn post_refill_released_slot_full_path_boundaries() {
+        let _qlock = crate::quarantine::tests::test_lock();
         for case in [
             "released",
             "empty",
@@ -8219,6 +8221,7 @@ esac
 
     #[test]
     fn post_refill_released_slot_requires_complete_named_evidence() {
+        let _qlock = crate::quarantine::tests::test_lock();
         let _env = TestEnv::new("released_evidence");
         let cfg = cfg_with(3, "runner");
         let before = SlotAssignments {
