@@ -87,7 +87,7 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard colima-trim mission-output-cleanup"
+  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -786,6 +786,7 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 2"
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
@@ -1024,7 +1025,9 @@ EOF
     done
     # Auxiliary mutation loops are opt-out by policy. Keep their tracked units
     # installed for manual diagnostics, but heal prior enabled state.
-    for pair in "ezgha-queue-reaper.timer ezgha-queue-reaper.service"; do
+    for pair in \
+      "ezgha-queue-reaper.timer ezgha-queue-reaper.service" \
+      "ezgha-queue-trimmer.timer ezgha-queue-trimmer.service"; do
       timer="${pair%% *}"
       service="${pair#* }"
       if systemctl --user disable --now "${timer}" 2>/dev/null \
