@@ -45,6 +45,7 @@ jobs:
           bash tests/runner_dashboard_launchd_install_test.sh
           bash tests/install_watchdog_gate_test.sh
           bash tests/install_uninstall_aux_units_test.sh
+          bash tests/systemd_units_install_guard_test.sh
       - name: Mac trim guard shell regressions
         run: |
           bash tests/colima_trim_guard_test.sh

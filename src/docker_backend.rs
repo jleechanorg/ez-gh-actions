@@ -4028,7 +4028,7 @@ fn executing_runner_count_from_containers(
         // `Fn + Sync` bound is satisfied without altering the
         // first-`count`-true-then-false semantics the existing tests
         // (and the original sequential code) relied on. Use
-        // `fetch_update` (not `fetch_sub`) so the counter saturates at zero
+        // a CAS loop (not `fetch_sub`) so the counter saturates at zero
         // — parallel threads can race past zero where the sequential version
         // could not, and a wrapping subtraction would spuriously report
         // post-zero probes as "ready".
@@ -4068,20 +4068,30 @@ fn executing_runner_count_from_containers(
                         }
                         // Atomically: if `remaining > 0`, decrement and
                         // return Ok(Ready); else return Ok(NotReady)
-                        // without mutating the counter. `fetch_update`
+                        // without mutating the counter. A CAS loop
                         // (not `fetch_sub`) saturates at zero — the
                         // parallel-threads race past zero would
-                        // otherwise wrap the counter to u32::MAX.
-                        let present = remaining
-                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
-                                if x > 0 {
-                                    Some(x - 1)
-                                } else {
-                                    None
+                        // otherwise wrap the counter to u32::MAX. Not
+                        // `fetch_update`/`try_update`: the former is
+                        // deprecated on rustc 1.99, the latter is
+                        // unavailable on older stable toolchains.
+                        let present = {
+                            let mut cur = remaining.load(Ordering::SeqCst);
+                            loop {
+                                if cur == 0 {
+                                    break false;
                                 }
-                            })
-                            .map(|prev| prev > 0)
-                            .unwrap_or(false);
+                                match remaining.compare_exchange_weak(
+                                    cur,
+                                    cur - 1,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                ) {
+                                    Ok(_) => break true,
+                                    Err(actual) => cur = actual,
+                                }
+                            }
+                        };
                         Ok(if present {
                             ProbeOutcome::Ready
                         } else {
