@@ -37,10 +37,12 @@ class RunnerPostJobWorkspacePruneTest(unittest.TestCase):
             "GITHUB_RUN_ATTEMPT": "1",
             "GITHUB_JOB": "build",
         }
+        # Production shape: actions/runner RunnerSettings DataMember names are
+        # PascalCase and the live .runner stores Ephemeral as the string "True".
         self.settings = {
-            "agentName": self.env["RUNNER_NAME"],
-            "workFolder": "_work",
-            "ephemeral": True,
+            "AgentName": self.env["RUNNER_NAME"],
+            "WorkFolder": "_work",
+            "Ephemeral": "True",
         }
         self.config = self.home / ".runner"
         self.write_settings()
@@ -93,14 +95,14 @@ class RunnerPostJobWorkspacePruneTest(unittest.TestCase):
                 return self.fixture_mounts[identity]
         return 1
 
-    def add_mount(self, path, kind="ext4"):
+    def add_mount(self, path, kind="ext4", root="/"):
         # Linux mountinfo escapes spaces, tabs, newlines, and backslashes.
         escaped = str(path).replace("\\", "\\134").replace(" ", "\\040")
         metadata = path.stat()
         identity = len(self.fixture_mounts) + 2
         self.fixture_mounts[(metadata.st_dev, metadata.st_ino)] = identity
         with self.mounts.open("a") as stream:
-            stream.write(f"{identity} 1 0:2 / {escaped} rw - {kind} fixture rw\n")
+            stream.write(f"{identity} 1 0:2 {root} {escaped} rw - {kind} fixture rw\n")
 
     def test_completed_job_only_removes_allowlisted_contents_and_is_idempotent(self):
         self.assertIn("completed", self.run_cleanup())
@@ -128,7 +130,7 @@ class RunnerPostJobWorkspacePruneTest(unittest.TestCase):
                 self.assert_checkout_untouched()
 
     def test_missing_bad_or_non_ephemeral_runner_configuration_fails_closed(self):
-        for content in ("", "not json", "[]", "{}", json.dumps(dict(self.settings, ephemeral=False)), json.dumps(dict(self.settings, workFolder="../_work")), json.dumps(dict(self.settings, agentName="other"))):
+        for content in ("", "not json", "[]", "{}", json.dumps(dict(self.settings, Ephemeral="False")), json.dumps(dict(self.settings, Ephemeral=False)), json.dumps(dict(self.settings, Ephemeral="yes")), json.dumps(dict(self.settings, WorkFolder="../_work")), json.dumps(dict(self.settings, AgentName="other"))):
             with self.subTest(content=content):
                 self.config.write_text(content)
                 self.assertIn("skipped", self.run_cleanup())
@@ -136,6 +138,20 @@ class RunnerPostJobWorkspacePruneTest(unittest.TestCase):
         self.config.unlink()
         self.assertIn("skipped", self.run_cleanup())
         self.assert_checkout_untouched()
+
+    def test_production_runner_configuration_shape_is_accepted(self):
+        self.assertEqual(self.settings["Ephemeral"], "True")
+        self.assertIn("completed", self.run_cleanup())
+        self.assertEqual(list(self.workspace.parent.iterdir()), [])
+        self.assert_preserved()
+
+    def test_lowercase_boolean_runner_configuration_is_also_accepted(self):
+        self.settings = {"agentName": self.env["RUNNER_NAME"], "workFolder": "_work", "ephemeral": True}
+        self.write_settings()
+        self.kept[self.config] = self.config.read_bytes()
+        self.assertIn("completed", self.run_cleanup())
+        self.assertEqual(list(self.workspace.parent.iterdir()), [])
+        self.assert_preserved()
 
     def test_symlinked_config_is_not_read(self):
         outside = Path(self.directory.name) / "config"
@@ -183,6 +199,34 @@ class RunnerPostJobWorkspacePruneTest(unittest.TestCase):
             self.add_mount(self.work / name, "tmpfs")
         self.assertIn("completed", self.run_cleanup())
         self.assertEqual(list((self.work / "_tool").iterdir()), [])
+        self.assert_preserved()
+
+    def test_tmpfs_bind_of_shared_subtree_is_preserved(self):
+        for name in ("_actions", "_temp"):
+            self.add_mount(self.work / name, "tmpfs")
+        self.add_mount(self.work / "_tool", "tmpfs", root="/shared/subtree")
+        self.assertIn("partial", self.run_cleanup())
+        self.assertTrue((self.work / "_tool/python/bin/python").is_file())
+        self.assertFalse((self.work / "_actions/action/index.js").exists())
+        self.assert_preserved()
+
+    def test_directory_replaced_between_stat_and_open_is_preserved(self):
+        original_open = self.prune.os.open
+        raced = False
+
+        def replace_on_open(path, flags, *args, **kwargs):
+            nonlocal raced
+            if path == "build" and kwargs.get("dir_fd") is not None and not raced:
+                raced = True
+                (self.workspace / "build").rename(self.workspace / "build-old")
+                (self.workspace / "build").mkdir()
+                (self.workspace / "build/newcomer").write_text("replacement")
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(self.prune.os, "open", side_effect=replace_on_open):
+            self.assertIn("partial", self.run_cleanup())
+        self.assertTrue(raced)
+        self.assertEqual((self.workspace / "build/newcomer").read_text(), "replacement")
         self.assert_preserved()
 
     def test_nested_mount_is_preserved_including_same_device_bind_mount(self):

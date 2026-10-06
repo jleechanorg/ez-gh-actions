@@ -49,8 +49,8 @@ def mount_points():
         mount_id_value = int(fields[0])
         if mount_id_value <= 0 or mount_id_value in mounts:
             raise ValueError("invalid mount identity")
-        mounts[mount_id_value] = (Path(path), filesystem[0])
-    if not any(path == Path("/") for path, _ in mounts.values()):
+        mounts[mount_id_value] = (Path(path), filesystem[0], fields[3])
+    if not any(path == Path("/") for path, _, _ in mounts.values()):
         raise ValueError("missing root mount")
     return mounts
 
@@ -102,11 +102,16 @@ def job_workspace(environ):
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
                 raise ValueError("unknown runner configuration owner")
             settings = json.loads(stream.read(65537))
+    # actions/runner writes PascalCase keys (RunnerSettings DataMembers) and
+    # the live file stores Ephemeral as the string "True"; accept both shapes.
+    if isinstance(settings, dict):
+        settings = {str(key).lower(): value for key, value in settings.items()}
+    ephemeral = settings.get("ephemeral") if isinstance(settings, dict) else None
     if not isinstance(settings, dict) or not (
-        settings.get("ephemeral") is True
-        and settings.get("workFolder") == "_work"
-        and settings.get("agentName")
-        and settings["agentName"] == environ.get("RUNNER_NAME")
+        (ephemeral is True or (isinstance(ephemeral, str) and ephemeral.lower() == "true"))
+        and settings.get("workfolder") == "_work"
+        and settings.get("agentname")
+        and settings["agentname"] == environ.get("RUNNER_NAME")
     ):
         raise ValueError("not this ephemeral runner")
     return workspace
@@ -161,10 +166,11 @@ def clean_target(path, mounts, work_mount, *, cache=False, keep=()):
             target_mount = mount_id(fd)
             # Work-root bind mounts are supported. Below that root, only the
             # exact tmpfs cache mounts already identified in mountinfo may be
-            # emptied. Unknown/replaced mounts fail closed, including mounts
-            # arriving between the mountinfo snapshot and opening this target.
+            # emptied, and only when root is "/" (a fresh tmpfs, not a bind of a
+            # shared tmpfs subtree). Unknown/replaced mounts fail closed,
+            # including mounts arriving between the snapshot and this open.
             if target_mount != work_mount and not (
-                cache and mounts.get(target_mount) == (path, "tmpfs")
+                cache and mounts.get(target_mount) == (path, "tmpfs", "/")
             ):
                 return False
             return empty_directory(fd, target_mount, keep)
