@@ -36,6 +36,8 @@ jobs:
           name: ezgha-serve-layer2-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ezgha-serve-layer2
           if-no-files-found: error
+      - name: Post-job workspace cleanup fixture tests
+        run: python3 -m unittest tests/runner_post_job_workspace_prune_test.py
       - name: Runner dashboard contract tests
         run: |
           python3 -m unittest tests/runner_dashboard_snapshot_test.py
