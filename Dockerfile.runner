@@ -53,4 +53,11 @@ RUN apt-get update && python3 -m venv /opt/playwright-deps-venv \
 COPY docker/tar-workspace-wrapper.sh /usr/local/bin/tar
 RUN chmod 0755 /usr/local/bin/tar
 
+# Run after action post steps/cache saves, while the ephemeral runner still
+# owns its workspace. Never wait for the replacement runner to reclaim it.
+COPY docker/runner-post-job-workspace-prune.py /usr/local/libexec/ezgha/
+COPY docker/runner-post-job-workspace-prune.sh /usr/local/libexec/ezgha/
+RUN chmod 0755 /usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh
+ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh
+
 USER runner
