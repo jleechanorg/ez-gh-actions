@@ -78,7 +78,7 @@ const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(6);
 /// Maximum concurrently executing `docker top` readiness probes.
-const READINESS_PROBE_CONCURRENCY: usize = 16;
+const READINESS_PROBE_CONCURRENCY: usize = 20;
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -2627,9 +2627,18 @@ fn host_actions_profile(runner_count: u32) -> Option<HostActionsProfile> {
             pids_max: 6000,
         }),
         // The 14-runner profile lowers per-job memory while retaining the
-        // current aggregate host memory boundary.
+        // current aggregate host memory boundary. Available for rollback.
         14 => Some(HostActionsProfile {
             runner_memory_mb: 2000,
+            runner_pids: Some(512),
+            memory_high_bytes: 26 * GIB,
+            memory_max_bytes: 28 * GIB,
+            pids_max: 8000,
+        }),
+        // The 20-runner profile scales the fleet to 20 while retaining the
+        // current aggregate host memory boundary (28 GiB).
+        20 => Some(HostActionsProfile {
+            runner_memory_mb: 1400,
             runner_pids: Some(512),
             memory_high_bytes: 26 * GIB,
             memory_max_bytes: 28 * GIB,
@@ -2687,7 +2696,7 @@ fn read_host_actions_limit(root: &Path, name: &str) -> Result<String> {
 #[cfg(target_os = "linux")]
 fn validate_host_actions_slice(root: &Path, runner_count: u32) -> Result<()> {
     let profile = host_actions_profile(runner_count).ok_or_else(|| {
-        anyhow::anyhow!("host containment supports runner counts 10 or 14 (got {runner_count})")
+        anyhow::anyhow!("host containment supports runner counts 10, 14, or 20 (got {runner_count})")
     })?;
     let memory_high = read_host_actions_limit(root, "memory.high")?;
     let memory_high = memory_high.parse::<u64>().with_context(|| {
@@ -2860,7 +2869,7 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
         }
         if host_actions_profile(cfg.runner.count).is_none() {
             bail!(
-                "host containment supports runner counts 10 or 14; configured count is {}",
+                "host containment supports runner counts 10, 14, or 20; configured count is {}",
                 cfg.runner.count
             );
         }
@@ -3924,8 +3933,8 @@ where
     if owned.is_empty() {
         return Ok(ReadinessSummary::default());
     }
-    // Each host probes at most 16 containers concurrently. The 14 Linux and
-    // 6 Mac runners fit in one batch on their respective hosts; excess
+    // Each host probes at most 20 containers concurrently. The 20 Linux and
+    // 4 Mac runners fit in one batch on their respective hosts; excess
     // containers use later batches under the shared 30s readiness deadline.
     //
     // Spawn-then-break on first deadline expiry: each per-container `now()`
@@ -5628,8 +5637,8 @@ mod tests {
         native.limits.memory_mb = 2300;
         let increased = effective_limits(&native);
         *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
-        assert_eq!(approved.unwrap().1, 2000);
-        assert_eq!(increased.unwrap().1, 2048);
+        assert_eq!(approved.unwrap().1, 1400);
+        assert_eq!(increased.unwrap().1, 1433);
     }
 
     #[test]
@@ -5878,7 +5887,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_memory_budget_supports_approved_fourteen_runner_floor() {
+    fn derive_memory_budget_supports_approved_twenty_runner_floor() {
         let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
             .expect("tracked native Linux configuration must parse");
         let budget = derive_memory_budget(
@@ -5889,14 +5898,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(budget.fleet_budget_mb, 28672);
-        assert_eq!(budget.per_runner_budget_mb, 2048);
+        assert_eq!(budget.per_runner_budget_mb, 1433);
         assert_eq!(u64::from(cfg.runner.count) * cfg.limits.memory_mb, 28000);
         assert!(u64::from(cfg.runner.count) * cfg.limits.memory_mb <= budget.fleet_budget_mb);
         assert!(derive_memory_budget(
             cfg.runner.vm_total_mb.unwrap(),
             cfg.runner.guest_reserve_mb,
             cfg.runner.count,
-            2049,
+            1434,
         )
         .is_err());
     }
@@ -8774,7 +8783,7 @@ esac
         .expect_err("start_one must fail closed when Linux runner count is unsupported");
         assert!(
             err.to_string().contains("host containment")
-                || err.to_string().contains("runner counts 10 or 14"),
+                || err.to_string().contains("runner counts 10, 14, or 20"),
             "expected host containment failure; got: {err:#}"
         );
     }
@@ -8804,6 +8813,13 @@ esac
         rollback_cfg.limits.cgroup_parent = Some("actions.slice".into());
         require_host_containment(&rollback_cfg)
             .expect("the supported 10-runner rollback profile must pass admission");
+
+        write_actions_slice_fixture(&root, 20);
+        let mut cfg20 = cfg_with(20, "ez-runner-c");
+        cfg20.limits.memory_mb = 1400;
+        cfg20.limits.cgroup_parent = Some("actions.slice".into());
+        require_host_containment(&cfg20)
+            .expect("the explicitly bounded 20-runner HostDocker profile must pass admission");
 
         write_actions_slice_fixture(&root, 14);
         let mut wrong_memory = cfg.clone();
@@ -8929,6 +8945,9 @@ esac
         write_actions_slice_fixture(&root, 14);
         validate_host_actions_slice(&root, 14)
             .expect("the 14-runner profile-specific pids cap must pass admission");
+        write_actions_slice_fixture(&root, 20);
+        validate_host_actions_slice(&root, 20)
+            .expect("the 20-runner profile-specific pids cap must pass admission");
         let err = validate_host_actions_slice(&root, 10)
             .expect_err("the 14-runner pids cap must not pass the 10-runner profile");
         assert!(err.to_string().contains("pids.max"), "got: {err:#}");

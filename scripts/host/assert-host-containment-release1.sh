@@ -4,14 +4,14 @@ set -euo pipefail
 
 ROOT="/"
 REQUIRE_FLEET=0
-RUNNER_COUNT=14
+RUNNER_COUNT=20
 fail() { echo "FAIL: $*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) ROOT="$2"; shift 2 ;;
     --require-fleet) REQUIRE_FLEET=1; shift ;;
     --runner-count)
-      [ "$#" -ge 2 ] || fail "--runner-count requires 10 or 14"
+      [ "$#" -ge 2 ] || fail "--runner-count requires 10, 14, or 20"
       RUNNER_COUNT="$2"; shift 2 ;;
     *) echo "FAIL: unknown argument '$1'" >&2; exit 1 ;;
   esac
@@ -19,7 +19,8 @@ done
 case "$RUNNER_COUNT" in
   10) ACTIONS_PIDS_MAX=6000 ;;
   14) ACTIONS_PIDS_MAX=8000 ;;
-  *) fail "runner count must be 10 or 14 (got $RUNNER_COUNT)" ;;
+  20) ACTIONS_PIDS_MAX=8000 ;;
+  *) fail "runner count must be 10, 14, or 20 (got $RUNNER_COUNT)" ;;
 esac
 
 mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null || true)"

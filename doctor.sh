@@ -368,7 +368,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot local execution proof (docker top, LOCAL-ONLY)"
 CONFIGURED_COUNT=$(awk -F'=' '/^[[:space:]]*count/ {split($2, a, "#"); gsub(/[^0-9]/,"",a[1]); print a[1]; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
-CONFIGURED_COUNT="${CONFIGURED_COUNT:-14}"
+CONFIGURED_COUNT="${CONFIGURED_COUNT:-20}"
 
 classify_local_slot() {
   # Echoes one of: DOWN | IDLE | EXECUTING for container name "$1".
@@ -420,11 +420,11 @@ fi
 [ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "executing right now: ${EXECUTING_SLOTS[*]}"
 
 # Optional Mac fleet probe via SSH — best-effort, never fatal if unreachable
-# (the current fleet is "14 Linux + 6 Mac"; the Mac half is proven the
+# (the current fleet is "20 Linux + 4 Mac"; the Mac half is proven the
 # same way, over SSH, when the host is reachable).
 MAC_HOST="${MAC_HOST:-macbook}"
-MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-g}"
-MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-6}"
+MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}"
+MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-4}"
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/null 2>&1; then
   MAC_DOWN_SLOTS=()
   MAC_IDLE_SLOTS=()

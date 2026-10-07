@@ -69,7 +69,7 @@ separate deploy-owner checks; a code change alone does not update running images
 
 ## Host-survival failure ladder (Jeff-Ubuntu)
 
-The production capacity contract is **14 Linux runners plus 6 Mac runners**; the explicit 10-runner Linux profile remains available for rollback.
+The production capacity contract is **20 Linux runners plus 4 Mac runners**; the explicit 14-runner and 10-runner Linux profiles remain available for rollback.
 Any observed Linux shortfall is a live failure, not a reduced contract, and the
 host-survival verdict remains **FAIL** until the live criteria in the
 [Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md) pass together.
@@ -93,7 +93,7 @@ stopping the VM or changing physical-host lifecycle state requires an operator.
 
 The still-open live gaps are whole-home 9p/virtfs, removal of boot-enabled host-lifecycle
 automation and panic auto-recovery settings, one armed crashkernel with kdump loaded on
-the current boot, and stable proof of all 14 Linux slots executing. Repository checks
+the current boot, and stable proof of all 20 Linux slots executing. Repository checks
 document the intended controls; they do not close those live gaps.
 
 ## Linux HostDocker crash containment
@@ -112,7 +112,7 @@ restart the desktop or Docker. Conflicting local unlimited overrides must be
 resolved before activation can pass. The daemon checks effective containment
 before admitting Linux host work; merely installing unit files is insufficient.
 The read-only `scripts/host/assert-host-containment-release1.sh` verifies policy;
-its `--require-fleet` option additionally verifies all fourteen runner PIDs belong to
+its `--require-fleet` option additionally verifies all twenty runner PIDs belong to
 the aggregate slice. These controls contain resource exhaustion; they do not
 prove immunity to kernel, driver, hardware, or power failures.
 
