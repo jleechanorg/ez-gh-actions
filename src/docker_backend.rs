@@ -2696,7 +2696,9 @@ fn read_host_actions_limit(root: &Path, name: &str) -> Result<String> {
 #[cfg(target_os = "linux")]
 fn validate_host_actions_slice(root: &Path, runner_count: u32) -> Result<()> {
     let profile = host_actions_profile(runner_count).ok_or_else(|| {
-        anyhow::anyhow!("host containment supports runner counts 10, 14, or 20 (got {runner_count})")
+        anyhow::anyhow!(
+            "host containment supports runner counts 10, 14, or 20 (got {runner_count})"
+        )
     })?;
     let memory_high = read_host_actions_limit(root, "memory.high")?;
     let memory_high = memory_high.parse::<u64>().with_context(|| {
