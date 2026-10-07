@@ -67,20 +67,20 @@ grep -Fq 'CONFIG_RUNNER_COUNT=$(read_config_runner_count ' "$DOCTOR_SCRIPT" || {
   echo "FAIL: verdict derivation does not use read_config_runner_count()" >&2
   exit 1
 }
-grep -Fq 'DEFAULT_LINUX_RUNNER_COUNT=14' "$DOCTOR_SCRIPT" || {
-  echo "FAIL: Linux fallback count is not the current 14-runner contract" >&2
+grep -Fq 'DEFAULT_LINUX_RUNNER_COUNT=20' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: Linux fallback count is not the current 20-runner contract" >&2
   exit 1
 }
-grep -Fq 'DEFAULT_MAC_RUNNER_COUNT=6' "$DOCTOR_SCRIPT" || {
-  echo "FAIL: macOS fallback count is not the current 6-runner contract" >&2
+grep -Fq 'DEFAULT_MAC_RUNNER_COUNT=4' "$DOCTOR_SCRIPT" || {
+  echo "FAIL: macOS fallback count is not the current 4-runner contract" >&2
   exit 1
 }
 grep -Eq 'REMOTE_COUNT=.*DEFAULT_LINUX_RUNNER_COUNT' "$DOCTOR_SCRIPT" || {
-  echo "FAIL: remote Linux fallback count is not the current 14-runner contract" >&2
+  echo "FAIL: remote Linux fallback count is not the current 20-runner contract" >&2
   exit 1
 }
-grep -Fq 'CONFIGURED_COUNT="${CONFIGURED_COUNT:-14}"' "$LEGACY_DOCTOR_SCRIPT" || {
-  echo "FAIL: legacy doctor fallback count is not the current 14-runner contract" >&2
+grep -Fq 'CONFIGURED_COUNT="${CONFIGURED_COUNT:-20}"' "$LEGACY_DOCTOR_SCRIPT" || {
+  echo "FAIL: legacy doctor fallback count is not the current 20-runner contract" >&2
   exit 1
 }
 
@@ -191,8 +191,8 @@ run_case "config-missing-section-scoped-fallback" "no" "16" || OVERALL_PASS=fals
 
 # Cases 3-4: with neither config nor slot assignments available, use the
 # platform-selected default instead of silently treating every host as macOS.
-run_platform_default_case "linux-platform-default" "14" || OVERALL_PASS=false
-run_platform_default_case "macos-platform-default" "6" || OVERALL_PASS=false
+run_platform_default_case "linux-platform-default" "20" || OVERALL_PASS=false
+run_platform_default_case "macos-platform-default" "4" || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

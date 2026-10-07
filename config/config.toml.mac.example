@@ -1,7 +1,6 @@
-# MacBook fleet — 6 runners, Colima-backed docker.
+# MacBook fleet — 4 runners, Colima-backed docker.
 # Colima VM must be 8 CPU / 22 GiB (colima start --cpu 8 --memory 22):
-# 6 x runner_floor_mb (3072) + guest_reserve_mb (2048) = 20480 MB, and a
-# 20 GiB VM only exposes 19958 MB, so the daemon refuses 6 runners there.
+# 4 x runner_floor_mb (3072) + guest_reserve_mb (2048) = 14336 MB.
 # Install: cp config/config.toml.mac.example ~/.config/ezgha/config.toml
 version = 1
 
@@ -11,9 +10,9 @@ target = "jleechanorg"
 
 [runner]
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "macOS", "ARM64"]
-count = 6
+count = 4
 image = "ezgha-runner:latest"
-name_prefix = "ez-mac-runner-g"
+name_prefix = "ez-mac-runner-h"
 guest_reserve_mb = 2048
 # Opt-in shared pip wheelhouse (bead jleechan-93cf): mounted read-only into
 # every runner container at /opt/wheelhouse with PIP_FIND_LINKS pointed at

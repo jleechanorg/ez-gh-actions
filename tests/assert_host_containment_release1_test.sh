@@ -19,10 +19,11 @@ grep -q -- '--runner-count' "$ASSERT_SCRIPT" || fail "assert script does not exp
 grep -q 'ACTIONS_PIDS_MAX=8000' "$ASSERT_SCRIPT" || fail "assert script does not retain the 14-runner TasksMax=8000 profile"
 
 setup_passing_fixture() {
-  local root="$1" runner_count="${2:-14}" pids_max
+  local root="$1" runner_count="${2:-20}" pids_max
   case "$runner_count" in
     10) pids_max=6000 ;;
     14) pids_max=8000 ;;
+    20) pids_max=8000 ;;
     *) fail "test fixture does not support runner count $runner_count" ;;
   esac
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
@@ -98,7 +99,12 @@ DOCKER_EOF
 FIXTURE_PASS="$WORK/pass"
 setup_passing_fixture "$FIXTURE_PASS"
 PATH="$FIXTURE_PASS/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet || fail "passing fixture failed assertion"
-ok "assert-host-containment-release1.sh passes valid default-14 fixture"
+ok "assert-host-containment-release1.sh passes valid default-20 fixture"
+
+FIXTURE_ROLLBACK_14="$WORK/rollback_14"
+setup_passing_fixture "$FIXTURE_ROLLBACK_14" 14
+PATH="$FIXTURE_ROLLBACK_14/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_ROLLBACK_14" --runner-count 14 --require-fleet || fail "assert script rejected explicit 14-runner rollback fixture"
+ok "assert-host-containment-release1.sh accepts explicit 14-runner rollback fixture"
 
 FIXTURE_ROLLBACK="$WORK/rollback"
 setup_passing_fixture "$FIXTURE_ROLLBACK" 10
@@ -181,7 +187,7 @@ if PATH="$FIXTURE_COUNT_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_COUNT_
   fail "assertion passed when runner container count was 13"
 fi
 grep -q "FAIL: runner container count" "$WORK/count_fail.log" || fail "missing runner count failure message"
-ok "assert-host-containment-release1.sh rejects container count != 14"
+ok "assert-host-containment-release1.sh rejects container count != 20"
 
 INVALID_ASSERT_ROOT="$WORK/invalid"
 setup_passing_fixture "$INVALID_ASSERT_ROOT"

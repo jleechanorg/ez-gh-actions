@@ -12,9 +12,9 @@ use crate::github;
 
 const FLEET_ORG: &str = "jleechanorg";
 const LINUX_FLEET_PREFIX: &str = "ez-runner-c-";
-const MAC_FLEET_PREFIX: &str = "ez-mac-runner-g-";
-const LINUX_FLEET_COUNT: u32 = 14;
-const MAC_FLEET_COUNT: u32 = 6;
+const MAC_FLEET_PREFIX: &str = "ez-mac-runner-h-";
+const LINUX_FLEET_COUNT: u32 = 20;
+const MAC_FLEET_COUNT: u32 = 4;
 const EXPECTED_FLEET_RUNNERS: usize = (LINUX_FLEET_COUNT + MAC_FLEET_COUNT) as usize;
 
 /// Repos the E1 ironclad exit criterion requires watching for INV-1/INV-2,
@@ -2397,7 +2397,7 @@ mod tests {
                     busy: true,
                 },
                 FleetRunner {
-                    name: "ez-mac-runner-g-1".into(),
+                    name: "ez-mac-runner-h-1".into(),
                     status: "online".into(),
                     busy: false,
                 },
@@ -2409,34 +2409,34 @@ mod tests {
         let raw = fs::read_to_string(&log).unwrap();
         assert!(raw.contains("\"event_key\":\"queue.idle_runner_mismatch\""));
         assert!(raw.contains("\"severity\":\"CRITICAL\""));
-        assert!(raw.contains("ez-mac-runner-g-1 online false"));
+        assert!(raw.contains("ez-mac-runner-h-1 online false"));
         assert!(raw.contains("missing expected runners: ez-runner-c-2"));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn fleet_stats_counts_exact_20_runner_pool_only() {
+    fn fleet_stats_counts_exact_24_runner_pool_only() {
         let runners = vec![
             runner("ez-runner-c-1", "online", true),
             runner("ez-runner-c-2", "online", false),
             runner("ez-runner-c-10", "online", true),
             runner("ez-runner-c-11", "online", true),
-            runner("ez-runner-c-14", "online", true),
-            runner("ez-mac-runner-g-1", "offline", false),
-            runner("ez-mac-runner-g-6", "online", false),
+            runner("ez-runner-c-20", "online", true),
+            runner("ez-mac-runner-h-1", "offline", false),
+            runner("ez-mac-runner-h-4", "online", false),
             runner("ez-canary-runner-b-1", "online", false),
         ];
 
         let stats = fleet_runner_stats(runners);
 
-        assert_eq!(stats.expected_total, 20);
+        assert_eq!(stats.expected_total, 24);
         assert_eq!(stats.registered_count, 7);
         assert_eq!(stats.busy_count, 4);
         assert_eq!(stats.idle_count, 2);
         assert!(stats.missing_names.contains(&"ez-runner-c-3".to_string()));
         assert!(!stats
             .missing_names
-            .contains(&"ez-mac-runner-g-6".to_string()));
+            .contains(&"ez-mac-runner-h-4".to_string()));
         assert!(stats
             .runners
             .iter()
@@ -2444,11 +2444,11 @@ mod tests {
         assert!(stats
             .runners
             .iter()
-            .any(|runner| runner.name == "ez-mac-runner-g-6"));
+            .any(|runner| runner.name == "ez-mac-runner-h-4"));
         assert!(stats
             .runners
             .iter()
-            .any(|runner| runner.name == "ez-runner-c-14"));
+            .any(|runner| runner.name == "ez-runner-c-20"));
         assert!(stats
             .runners
             .iter()
@@ -2802,7 +2802,7 @@ exit 1
             busy_count: EXPECTED_FLEET_RUNNERS - 1,
             idle_count: 0,
             missing_names: vec!["ez-runner-c-10".into()],
-            runners: vec![fleet_runner("ez-mac-runner-g-1", "offline", false)],
+            runners: vec![fleet_runner("ez-mac-runner-h-1", "offline", false)],
         };
         assert_eq!(classify_inv1_failure(&fleet), "missing-registration");
     }

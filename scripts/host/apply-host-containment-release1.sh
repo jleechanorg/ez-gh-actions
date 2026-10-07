@@ -6,7 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="/"
 SYSTEM_PHASE=0
-RUNNER_COUNT=14
+RUNNER_COUNT=20
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "OK: $*"; }
 while [ "$#" -gt 0 ]; do
@@ -14,7 +14,7 @@ while [ "$#" -gt 0 ]; do
     --root) ROOT="$2"; shift 2 ;;
     --system-phase) SYSTEM_PHASE=1; shift ;;
     --runner-count)
-      [ "$#" -ge 2 ] || fail "--runner-count requires 10 or 14"
+      [ "$#" -ge 2 ] || fail "--runner-count requires 10, 14, or 20"
       RUNNER_COUNT="$2"; shift 2 ;;
     *) echo "FAIL: unknown argument '$1'" >&2; exit 1 ;;
   esac
@@ -28,7 +28,11 @@ case "$RUNNER_COUNT" in
     ACTIONS_PIDS_MAX=8000
     ACTIONS_PIDS_PROPERTY="TasksMax=8000"
     ;;
-  *) fail "runner count must be 10 or 14 (got $RUNNER_COUNT)" ;;
+  20)
+    ACTIONS_PIDS_MAX=8000
+    ACTIONS_PIDS_PROPERTY="TasksMax=8000"
+    ;;
+  *) fail "runner count must be 10, 14, or 20 (got $RUNNER_COUNT)" ;;
 esac
 ACTIONS_MEMORY_HIGH_BYTES=27917287424
 

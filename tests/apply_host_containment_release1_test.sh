@@ -25,10 +25,11 @@ set_slice_mem() { # root slice current file shmem
 }
 
 setup_fixture() {
-  local root="$1" runner_count="${2:-14}" pids_max
+  local root="$1" runner_count="${2:-20}" pids_max
   case "$runner_count" in
     10) pids_max=6000 ;;
     14) pids_max=8000 ;;
+    20) pids_max=8000 ;;
     *) fail "test fixture does not support runner count $runner_count" ;;
   esac
   mkdir -p "$root/proc" "$root/sys/devices/system/cpu" "$root/sys/fs/cgroup/actions.slice" \
