@@ -225,7 +225,7 @@ else:
 PYCFG
 }
 
-RUNNER_COUNT=14
+RUNNER_COUNT=20
 
 LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 
@@ -502,9 +502,9 @@ if [ "$(uname -s)" = "Linux" ]; then
       exit 1
     }
     case "${RUNNER_COUNT}" in
-      10|14) ;;
+      10|14|20) ;;
       *)
-        bad "runner.count must be 10 or 14 on Linux (got ${RUNNER_COUNT})"
+        bad "runner.count must be 10, 14, or 20 on Linux (got ${RUNNER_COUNT})"
         exit 1
         ;;
     esac

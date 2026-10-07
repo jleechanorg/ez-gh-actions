@@ -734,6 +734,8 @@ out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACT
 grep -q "selected_tasks=6000" <<<"$out" || fail "10-runner rollback must derive TasksMax=6000"
 out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 bash "$VERIFY")
 grep -q "selected_tasks=8000" <<<"$out" || fail "14-runner profile must derive TasksMax=8000"
+out=$(env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=20 bash "$VERIFY")
+grep -q "selected_tasks=8000" <<<"$out" || fail "20-runner profile must derive TasksMax=8000"
 
 cp "$MODERN/automation.slice" "$TMP/automation.good"
 sed -i.bak 's/^MemoryMax=.*/MemoryMax=broken/' "$MODERN/automation.slice"

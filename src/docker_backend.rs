@@ -78,7 +78,7 @@ const DOCKER_REAPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const LOCAL_READINESS_BUDGET: Duration = Duration::from_secs(30);
 const LOCAL_TOP_TIMEOUT: Duration = Duration::from_secs(6);
 /// Maximum concurrently executing `docker top` readiness probes.
-const READINESS_PROBE_CONCURRENCY: usize = 16;
+const READINESS_PROBE_CONCURRENCY: usize = 20;
 
 /// Lane-I (Round-3 swarm): rolling 5-tick window of PSI memory-pressure
 /// percentages, read newest-at-tail. Mutated by `ensure_count_outcome` on
@@ -2627,9 +2627,18 @@ fn host_actions_profile(runner_count: u32) -> Option<HostActionsProfile> {
             pids_max: 6000,
         }),
         // The 14-runner profile lowers per-job memory while retaining the
-        // current aggregate host memory boundary.
+        // current aggregate host memory boundary. Available for rollback.
         14 => Some(HostActionsProfile {
             runner_memory_mb: 2000,
+            runner_pids: Some(512),
+            memory_high_bytes: 26 * GIB,
+            memory_max_bytes: 28 * GIB,
+            pids_max: 8000,
+        }),
+        // The 20-runner profile scales the fleet to 20 while retaining the
+        // current aggregate host memory boundary (28 GiB).
+        20 => Some(HostActionsProfile {
+            runner_memory_mb: 1400,
             runner_pids: Some(512),
             memory_high_bytes: 26 * GIB,
             memory_max_bytes: 28 * GIB,
@@ -2687,7 +2696,9 @@ fn read_host_actions_limit(root: &Path, name: &str) -> Result<String> {
 #[cfg(target_os = "linux")]
 fn validate_host_actions_slice(root: &Path, runner_count: u32) -> Result<()> {
     let profile = host_actions_profile(runner_count).ok_or_else(|| {
-        anyhow::anyhow!("host containment supports runner counts 10 or 14 (got {runner_count})")
+        anyhow::anyhow!(
+            "host containment supports runner counts 10, 14, or 20 (got {runner_count})"
+        )
     })?;
     let memory_high = read_host_actions_limit(root, "memory.high")?;
     let memory_high = memory_high.parse::<u64>().with_context(|| {
@@ -2860,7 +2871,7 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
         }
         if host_actions_profile(cfg.runner.count).is_none() {
             bail!(
-                "host containment supports runner counts 10 or 14; configured count is {}",
+                "host containment supports runner counts 10, 14, or 20; configured count is {}",
                 cfg.runner.count
             );
         }
@@ -3924,8 +3935,8 @@ where
     if owned.is_empty() {
         return Ok(ReadinessSummary::default());
     }
-    // Each host probes at most 16 containers concurrently. The 14 Linux and
-    // 6 Mac runners fit in one batch on their respective hosts; excess
+    // Each host probes at most 20 containers concurrently. The 20 Linux and
+    // 4 Mac runners fit in one batch on their respective hosts; excess
     // containers use later batches under the shared 30s readiness deadline.
     //
     // Spawn-then-break on first deadline expiry: each per-container `now()`
@@ -4570,6 +4581,8 @@ fn start_missing_runners(
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StartMissingOutcome {
     started: Vec<String>,
+    /// Every allocated slot in this batch, including failed starts.
+    attempted_slots: HashSet<u32>,
     start_failures: u32,
     admission_paused_reason: Option<String>,
 }
@@ -4782,6 +4795,7 @@ fn start_missing_runners_with_starter(
         });
     }
     let mut started = Vec::new();
+    let mut attempted_slots = HashSet::new();
     let mut start_failures = 0;
     let mut last_err = None;
     let path = failure_ladder_path_for(cfg);
@@ -4870,6 +4884,7 @@ fn start_missing_runners_with_starter(
                 break;
             }
         };
+        attempted_slots.insert(slot);
         match starter(cfg, backend, slot) {
             Ok((_, name)) => {
                 started.push(name);
@@ -4932,6 +4947,7 @@ fn start_missing_runners_with_starter(
     }
     Ok(StartMissingOutcome {
         started,
+        attempted_slots,
         start_failures,
         admission_paused_reason,
     })
@@ -4953,6 +4969,10 @@ pub struct EnsureCountOutcome {
     /// Configured runners present before refill but absent from the successful
     /// post-refill inventory.
     pub post_refill_capacity_lost: Vec<String>,
+    /// Named nonempty reservations held before the batch and freed by its
+    /// trailing release, absent locally and currently eligible for allocation.
+    /// This proves newly available slots, not prior running containers.
+    pub post_refill_slots_released: Vec<String>,
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
     pub start_failures: u32,
@@ -4977,9 +4997,80 @@ fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome 
         remaining_shortage: missing,
         post_refill_readiness_error: None,
         post_refill_capacity_lost: Vec::new(),
+        post_refill_slots_released: Vec::new(),
         start_failures: 0,
         admission_paused_reason: Some(reason),
     }
+}
+
+// Evidence-only reads must not use the allocator's corrupt/missing-file
+// recovery: unknown state is not proof that a reservation became vacant.
+fn release_slot_snapshot(cfg: &Config) -> Option<SlotAssignments> {
+    let path = slot_assignments_path_for(Some(cfg));
+    let snapshot = (|| -> Result<SlotAssignments> {
+        let raw = std::fs::read_to_string(&path)?;
+        Ok(toml::from_str(&raw)?)
+    })();
+    match snapshot {
+        Ok(snapshot) => Some(snapshot),
+        Err(err) => {
+            eprintln!(
+                "debug: released-slot evidence unavailable at {}: {err:#}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+fn post_refill_released_slots(
+    cfg: &Config,
+    before_batch: Option<&SlotAssignments>,
+    before_release: Option<&SlotAssignments>,
+    after_release: Option<&SlotAssignments>,
+    attempted_slots: &HashSet<u32>,
+    post_refill_names: &HashSet<&str>,
+) -> Result<Vec<String>> {
+    let (Some(before_batch), Some(before_release), Some(after_release)) =
+        (before_batch, before_release, after_release)
+    else {
+        return Ok(Vec::new());
+    };
+    // Reuse the allocator's current exclusions without reserving another slot
+    // or accepting its fail-soft fallback for uncertain quarantine evidence.
+    let quarantine = quarantine::load_quarantine_for(Some(cfg))?.excluded_slots();
+    let ladder = FailureLadder::load(failure_ladder_path_for(cfg))?;
+    let now = now_epoch_secs();
+    if FAILURE_LADDER_PERSISTENCE_FAILED.load(Ordering::SeqCst)
+        || ladder.fleet_admission_is_paused(now)
+    {
+        return Ok(Vec::new());
+    }
+    let ladder_excluded = ladder.excluded_slots(now);
+    let mut released = Vec::new();
+    for slot in 1..=cfg.runner.count {
+        let key = slot.to_string();
+        let Some(id) = before_batch.assignments.get(&key) else {
+            continue;
+        };
+        // Empty reservations and malformed IDs do not establish this event.
+        // A valid JIT ID does not imply a prior running container.
+        if id.parse::<u64>().is_err()
+            || before_release.assignments.get(&key) != Some(id)
+            || after_release.assignments.contains_key(&key)
+            || attempted_slots.contains(&slot)
+            || quarantine.contains(&slot)
+            || ladder_excluded.contains(&slot)
+        {
+            continue;
+        }
+        let name = runner_name_for(cfg, slot);
+        if !post_refill_names.contains(name.as_str()) {
+            released.push(name);
+        }
+    }
+    released.sort();
+    Ok(released)
 }
 
 pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
@@ -5032,6 +5123,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         });
@@ -5230,9 +5322,18 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         ));
     }
     let missing = cfg.runner.count - alive;
+    let before_batch = release_slot_snapshot(cfg);
     let refill = start_missing_runners(cfg, backend, missing);
-    // Release any failed reservations from this cycle
-    let _ = release_stale_slots(cfg);
+    let before_release = release_slot_snapshot(cfg);
+    // release_stale_slots may repair a corrupt quarantine table; do not turn
+    // that fail-soft recovery into affirmative availability evidence.
+    let release_eligibility_known = quarantine::load_quarantine_for(Some(cfg)).is_ok();
+    // Release any failed reservations from this cycle. A failed release does
+    // not establish availability, even if it partially changed local state.
+    let release_succeeded = release_stale_slots(cfg).is_ok();
+    let after_release = (release_succeeded && release_eligibility_known)
+        .then(|| release_slot_snapshot(cfg))
+        .flatten();
 
     let refill = refill?;
     let readiness_deadline = Instant::now() + LOCAL_READINESS_BUDGET;
@@ -5247,6 +5348,18 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         .filter(|name| !post_refill_names.contains(name.as_str()))
         .collect();
     post_refill_capacity_lost.sort();
+    let post_refill_slots_released = post_refill_released_slots(
+        cfg,
+        before_batch.as_ref(),
+        before_release.as_ref(),
+        after_release.as_ref(),
+        &refill.attempted_slots,
+        &post_refill_names,
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("warning: post-refill allocation eligibility unknown: {err:#}");
+        Vec::new()
+    });
     let readiness_after =
         executing_runner_count_from_containers(cfg, &containers_after, readiness_deadline);
     let (remaining_shortage, post_refill_readiness_error) = match readiness_after {
@@ -5283,6 +5396,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         remaining_shortage,
         post_refill_readiness_error,
         post_refill_capacity_lost,
+        post_refill_slots_released,
         start_failures: refill.start_failures,
         admission_paused_reason: refill.admission_paused_reason,
     };
@@ -5628,8 +5742,8 @@ mod tests {
         native.limits.memory_mb = 2300;
         let increased = effective_limits(&native);
         *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
-        assert_eq!(approved.unwrap().1, 2000);
-        assert_eq!(increased.unwrap().1, 2048);
+        assert_eq!(approved.unwrap().1, 1400);
+        assert_eq!(increased.unwrap().1, 1433);
     }
 
     #[test]
@@ -5878,7 +5992,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_memory_budget_supports_approved_fourteen_runner_floor() {
+    fn derive_memory_budget_supports_approved_twenty_runner_floor() {
         let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
             .expect("tracked native Linux configuration must parse");
         let budget = derive_memory_budget(
@@ -5889,14 +6003,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(budget.fleet_budget_mb, 28672);
-        assert_eq!(budget.per_runner_budget_mb, 2048);
+        assert_eq!(budget.per_runner_budget_mb, 1433);
         assert_eq!(u64::from(cfg.runner.count) * cfg.limits.memory_mb, 28000);
         assert!(u64::from(cfg.runner.count) * cfg.limits.memory_mb <= budget.fleet_budget_mb);
         assert!(derive_memory_budget(
             cfg.runner.vm_total_mb.unwrap(),
             cfg.runner.guest_reserve_mb,
             cfg.runner.count,
-            2049,
+            1434,
         )
         .is_err());
     }
@@ -7350,6 +7464,844 @@ esac
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn post_refill_released_slot_requests_immediate_reconcile() {
+        let _qlock = crate::quarantine::tests::test_lock();
+        let env = TestEnv::new("post_refill_released_slot");
+        let dir = env.path.parent().unwrap();
+        // TestEnv paths can recur after a test process PID is recycled.
+        for file in [
+            "calls",
+            "started-c10",
+            "at-c10-jit.toml",
+            "at-second-release.toml",
+        ] {
+            let _ = std::fs::remove_file(dir.join(file));
+        }
+        let mut cfg = cfg_with(14, "ez-runner-c");
+        cfg.state_dir = Some(dir.into());
+        cfg.runner.host_reserve_mb = 0;
+        cfg.limits.memory_mb = 1;
+        cfg.limits.cpu_burst = false;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+        *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+        cpu_probe_overrides::set(Some(true));
+        let cgroup = dir.join("cgroup");
+        write_actions_slice_fixture(&cgroup, 14);
+        std::fs::write(cgroup.join("actions.slice/memory.current"), "0\n").unwrap();
+        std::fs::write(
+            cgroup.join("actions.slice/memory.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(cgroup);
+
+        // Real release, allocation and start functions; all state is isolated.
+        // c4 is already missing locally but still has a matching online GH
+        // registration at the first release. c10 is the only vacant slot.
+        let mut assignments = SlotAssignments::default();
+        for slot in (1..=14).filter(|slot| *slot != 10) {
+            assignments
+                .assignments
+                .insert(slot.to_string(), (1000 + slot).to_string());
+            assignments
+                .registered_at
+                .insert(slot.to_string(), now_epoch_secs());
+        }
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+        for (file, after) in [("before.json", false), ("after.json", true)] {
+            let runners: Vec<_> = (1..=14)
+                .filter(|slot| if after { *slot != 4 } else { *slot != 10 })
+                .map(|slot| {
+                    serde_json::json!({
+                        "id": 1000 + slot,
+                        "name": format!("ez-runner-c-{slot}"),
+                        "status": "online",
+                        "busy": true
+                    })
+                })
+                .collect();
+            std::fs::write(
+                dir.join(file),
+                serde_json::json!([{"total_count": runners.len(), "runners": runners}]).to_string(),
+            )
+            .unwrap();
+            let containers = (1..=14)
+                .filter(|slot| *slot != 4 && (after || *slot != 10))
+                .map(|slot| {
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "ID": format!("container-{slot}"),
+                            "Names": format!("ez-runner-c-{slot}"),
+                            "State": "running", "RunningFor": "one minute"
+                        })
+                    )
+                })
+                .collect::<String>();
+            std::fs::write(
+                dir.join(if after { "after.jsonl" } else { "before.jsonl" }),
+                containers,
+            )
+            .unwrap();
+        }
+        let gh = dir.join("fake-gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin
+cd '{}'
+printf 'gh %s\n' "$*" >> calls
+case "$*" in
+  'api --paginate --slurp '*'/actions/runners'*)
+    if [ -f started-c10 ]; then
+      cp slot_assignments.toml at-second-release.toml
+      cat after.json
+    else
+      cat before.json
+    fi;;
+  'api -X POST '*'/actions/runners/generate-jitconfig '*'name=ez-runner-c-10 '*)
+    cp slot_assignments.toml at-c10-jit.toml
+    printf '%s\n' '{{"encoded_jit_config":"synthetic-jit","runner":{{"id":1010}}}}';;
+  *) echo unexpected-gh-call >&2; exit 71;;
+esac
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _gh_guard = crate::github::with_gh_exe(gh.to_str().unwrap());
+        let _token_guard = crate::github::with_gh_token_file(dir.join("no-token"));
+        let docker = dir.join("fake-docker");
+        std::fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin
+cd '{}'
+if [ "${{1:-}}" = --host ]; then shift 2; fi
+printf 'docker %s\n' "$*" >> calls
+case "$*" in
+  'ps --filter label=ezgha=managed --format json')
+    if [ -f started-c10 ]; then cat after.jsonl; else cat before.jsonl; fi;;
+  'stats '*) exit 0;;
+  'ps --quiet --no-trunc') exit 0;;
+  'info '*) printf '32 64000000000\n';;
+  'rm -f ez-runner-c-10') exit 0;;
+  'run -d --rm --name ez-runner-c-10 '*)
+    : > started-c10
+    printf 'container-10\n';;
+  *) echo unexpected-docker-call >&2; exit 71;;
+esac
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(docker.to_string_lossy().into_owned());
+        // Test builds require the existing readiness seam. It drives the real
+        // inventory-filtered probe fanout, and cannot invent an absent name
+        // for c4, which is never in these docker-ps results.
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            (0..6)
+                .map(|_| {
+                    Ok(ReadinessSummary {
+                        ready: 13,
+                        absent: vec![],
+                    })
+                })
+                .collect(),
+        );
+
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert_eq!(outcome.started, vec!["ez-runner-c-10"]);
+        assert_eq!(outcome.missing, 2);
+        assert_eq!(outcome.remaining_shortage, 1);
+        assert_eq!(outcome.start_failures, 0);
+        assert!(outcome.admission_paused_reason.is_none());
+        assert!(outcome.post_refill_readiness_error.is_none());
+        let at_jit: SlotAssignments =
+            toml::from_str(&std::fs::read_to_string(dir.join("at-c10-jit.toml")).unwrap()).unwrap();
+        assert_eq!(
+            at_jit.assignments.get("4").map(String::as_str),
+            Some("1004")
+        );
+        assert_eq!(at_jit.assignments.get("10").map(String::as_str), Some(""));
+        let at_second: SlotAssignments =
+            toml::from_str(&std::fs::read_to_string(dir.join("at-second-release.toml")).unwrap())
+                .unwrap();
+        assert_eq!(
+            at_second.assignments.get("4").map(String::as_str),
+            Some("1004")
+        );
+        assert_eq!(
+            at_second.assignments.get("10").map(String::as_str),
+            Some("1010")
+        );
+        let after_second = read_slot_assignments_for(Some(&cfg)).unwrap();
+        assert!(!after_second.assignments.contains_key("4"));
+        assert_eq!(
+            after_second.assignments.get("10").map(String::as_str),
+            Some("1010")
+        );
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("gh api --paginate"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("docker run -d"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("generate-jitconfig"))
+                .count(),
+            1
+        );
+        assert!(!calls.contains("--name ez-runner-c-4 "));
+        eprintln!("COMMAND TRACE:\n{calls}");
+        eprintln!("C4 RESERVED AT C10 JIT=1004; C10 RESERVED EMPTY; C10 ID AFTER START=1010; C4 RELEASED AFTER BATCH");
+        eprintln!("OUTCOME: {outcome:?}");
+
+        let decision = crate::ensure_success_decision_with_pending_readiness(
+            crate::ensure_success_decision(&cfg, &outcome),
+            false,
+            false,
+            13,
+        );
+        let plan = crate::ensure_success_plan(&cfg, decision);
+        eprintln!("SERVE DECISION: {decision:?}; PLAN: {plan:?}");
+        if matches!(decision, crate::EnsureSuccessDecision::StartSettling { .. }) {
+            let start = Instant::now();
+            let mut settling = None;
+            let mut pending = false;
+            crate::apply_ensure_success_decision(&mut settling, &mut pending, start, decision);
+            for seconds in [5, 10, 15, 20, 25] {
+                let summary = local_executing_runner_count(&cfg).unwrap();
+                assert_eq!(summary.ready, 13);
+                assert!(summary.absent.is_empty());
+                let observed = settling.as_mut().unwrap().observe(
+                    start + Duration::from_secs(seconds),
+                    summary.ready,
+                    cfg.runner.count,
+                );
+                eprintln!(
+                    "SERVE POLL +{seconds}s: ready={}, absent={:?}, decision={observed:?}",
+                    summary.ready, summary.absent
+                );
+                assert_eq!(
+                    observed,
+                    if seconds < 25 {
+                        crate::SettlingDecision::Continue
+                    } else {
+                        crate::SettlingDecision::Ceiling
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            plan,
+            (Duration::ZERO, false),
+            "a configured reservation released after the sole start batch must request the next bounded reconciliation"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn released_slot_full_path_case(case: &str) {
+        let env = TestEnv::new(&format!("released_boundary_{case}"));
+        let dir = env.path.parent().unwrap();
+        // TestEnv paths can recur after a test process PID is recycled.
+        for file in [
+            "calls",
+            "started-c10",
+            "at-c10-jit.toml",
+            "at-second-release.toml",
+            // These cases deliberately corrupt/open their own ledgers.
+            // Clear them too when a test-process PID/path is recycled.
+            "failure_ladder.toml",
+            "quarantined_slots.toml",
+        ] {
+            let _ = std::fs::remove_file(dir.join(file));
+        }
+        let mut cfg = cfg_with(14, "ez-runner-c");
+        cfg.state_dir = Some(dir.into());
+        cfg.runner.host_reserve_mb = 0;
+        cfg.limits.memory_mb = 1;
+        cfg.limits.cpu_burst = false;
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_IS_MACOS_HOST.lock().unwrap() = Some(false);
+        *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(false);
+        cpu_probe_overrides::set(Some(true));
+        let cgroup = dir.join("cgroup");
+        write_actions_slice_fixture(&cgroup, 14);
+        std::fs::write(cgroup.join("actions.slice/memory.current"), "0\n").unwrap();
+        std::fs::write(
+            cgroup.join("actions.slice/memory.pressure"),
+            "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        )
+        .unwrap();
+        *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = Some(cgroup);
+
+        // Real release, allocation and start functions; all state is isolated.
+        // c4 is already missing locally but still has a matching online GH
+        // registration at the first release. c10 is the only vacant slot.
+        let mut assignments = SlotAssignments::default();
+        for slot in (1..=14).filter(|slot| *slot != 10) {
+            assignments
+                .assignments
+                .insert(slot.to_string(), (1000 + slot).to_string());
+            assignments
+                .registered_at
+                .insert(slot.to_string(), now_epoch_secs());
+        }
+        if case == "failed_fresh" {
+            assignments.assignments.remove("11");
+            assignments.registered_at.remove("11");
+        }
+        if case == "empty" {
+            assignments.assignments.insert("4".into(), String::new());
+        }
+        if case == "out_of_range" {
+            assignments.assignments.insert("15".into(), "1015".into());
+        }
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+        for (file, after) in [("before.json", false), ("after.json", true)] {
+            let runners: Vec<_> = (1..=14)
+                .filter(|slot| if after { *slot != 4 } else { *slot != 10 })
+                .map(|slot| {
+                    serde_json::json!({
+                        "id": 1000 + slot,
+                        "name": format!("ez-runner-c-{slot}"),
+                        "status": "online",
+                        "busy": true
+                    })
+                })
+                .collect();
+            std::fs::write(
+                dir.join(file),
+                serde_json::json!([{"total_count": runners.len(), "runners": runners}]).to_string(),
+            )
+            .unwrap();
+            let containers = (1..=14)
+                .filter(|slot| *slot != 4 && (after || *slot != 10))
+                .map(|slot| {
+                    format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "ID": format!("container-{slot}"),
+                            "Names": format!("ez-runner-c-{slot}"),
+                            "State": "running", "RunningFor": "one minute"
+                        })
+                    )
+                })
+                .collect::<String>();
+            std::fs::write(
+                dir.join(if after { "after.jsonl" } else { "before.jsonl" }),
+                containers,
+            )
+            .unwrap();
+        }
+        let gh = dir.join("fake-gh");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin
+cd '{}'
+printf 'gh %s\n' "$*" >> calls
+case "$*" in
+  'api --paginate --slurp '*'/actions/runners'*)
+    if [ -f started-c10 ]; then
+      cp slot_assignments.toml at-second-release.toml
+      cat after.json
+    else
+      cat before.json
+    fi;;
+  'api -X POST '*'/actions/runners/generate-jitconfig '*'name=ez-runner-c-10 '*)
+    cp slot_assignments.toml at-c10-jit.toml
+    printf '%s\n' '{{"encoded_jit_config":"synthetic-jit","runner":{{"id":1010}}}}';;
+  *) echo unexpected-gh-call >&2; exit 71;;
+esac
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _gh_guard = crate::github::with_gh_exe(gh.to_str().unwrap());
+        let _token_guard = crate::github::with_gh_token_file(dir.join("no-token"));
+        let docker = dir.join("fake-docker");
+        std::fs::write(
+            &docker,
+            format!(
+                r#"#!/bin/sh
+set -eu
+PATH=/usr/bin:/bin
+cd '{}'
+if [ "${{1:-}}" = --host ]; then shift 2; fi
+printf 'docker %s\n' "$*" >> calls
+case "$*" in
+  'ps --filter label=ezgha=managed --format json')
+    if [ -f started-c10 ]; then cat after.jsonl; else cat before.jsonl; fi;;
+  'stats '*) exit 0;;
+  'ps --quiet --no-trunc') exit 0;;
+  'info '*) printf '32 64000000000\n';;
+  'rm -f ez-runner-c-10') exit 0;;
+  'run -d --rm --name ez-runner-c-10 '*)
+    : > started-c10
+    printf 'container-10\n';;
+  *) echo unexpected-docker-call >&2; exit 71;;
+esac
+"#,
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(docker.to_string_lossy().into_owned());
+        // Test builds require the existing readiness seam. It drives the real
+        // inventory-filtered probe fanout, and cannot invent an absent name
+        // for c4, which is never in these docker-ps results.
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            (0..6)
+                .map(|_| {
+                    Ok(ReadinessSummary {
+                        ready: 13,
+                        absent: vec![],
+                    })
+                })
+                .collect(),
+        );
+
+        // Each case changes only external-boundary fixture state. The real
+        // release/allocation/start/recount and serve decisions remain in use.
+        let after_start = match case {
+            "empty" => {
+                assignments.registered_at.insert("4".into(), 0);
+                "cp injected.toml slot_assignments.toml"
+            }
+            "already_vacant" => {
+                assignments.assignments.remove("4");
+                "cp injected.toml slot_assignments.toml"
+            }
+            "replacement_id" => {
+                assignments.assignments.insert("4".into(), "2004".into());
+                "cp injected.toml slot_assignments.toml"
+            }
+            "unknown_slots" => "printf 'invalid = [' > slot_assignments.toml",
+            "unknown_quarantine" => "printf 'invalid = [' > quarantined_slots.toml",
+            "unknown_ladder" => "printf 'invalid = [' > failure_ladder.toml",
+            _ => "true",
+        };
+        assignments.assignments.insert("10".into(), "1010".into());
+        std::fs::write(
+            dir.join("injected.toml"),
+            toml::to_string(&assignments).unwrap(),
+        )
+        .unwrap();
+        let script = std::fs::read_to_string(&docker).unwrap();
+        std::fs::write(
+            &docker,
+            script.replace(
+                ": > started-c10",
+                &format!(": > started-c10\n    {after_start}"),
+            ),
+        )
+        .unwrap();
+        if matches!(case, "already_vacant" | "unknown_slots") {
+            // Make the sole batch one attempt, so the external state mutation
+            // occurs after its last allocation and before trailing release.
+            let mut rows = std::fs::read_to_string(dir.join("before.jsonl")).unwrap();
+            rows.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "ID": "initial-4", "Names": "ez-runner-c-4",
+                    "State": "running", "RunningFor": "one minute"
+                })
+            ));
+            std::fs::write(dir.join("before.jsonl"), rows).unwrap();
+        }
+        if case == "same_name_present" {
+            let mut rows = std::fs::read_to_string(dir.join("after.jsonl")).unwrap();
+            rows.push_str(&format!(
+                "{}\n",
+                serde_json::json!({
+                    "ID": "replacement-4", "Names": "ez-runner-c-4",
+                    "State": "running", "RunningFor": "one second"
+                })
+            ));
+            std::fs::write(dir.join("after.jsonl"), rows).unwrap();
+        }
+        if case == "still_reserved" {
+            std::fs::copy(dir.join("before.json"), dir.join("after.json")).unwrap();
+        }
+        if case == "out_of_range" {
+            // Hold the out-of-range reservation across the first release.
+            let mut json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("before.json")).unwrap())
+                    .unwrap();
+            json[0]["runners"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": 1015, "name": "ez-runner-c-15", "status": "online", "busy": true
+                }));
+            json[0]["total_count"] = serde_json::json!(14);
+            std::fs::write(dir.join("before.json"), json.to_string()).unwrap();
+        }
+        if case == "quarantined" || case == "ladder" {
+            // Introduce the exclusion only after the sole start, proving
+            // eligibility is evaluated at the release/recount boundary.
+            if case == "quarantined" {
+                let mut table = QuarantineTable::default();
+                table.upsert(QuarantineEntry {
+                    slot: 4,
+                    runner_id: 1004,
+                    runner_name: "ez-runner-c-4".into(),
+                    first_seen_epoch_secs: now_epoch_secs(),
+                    attempt_count: 0,
+                    last_attempt_epoch_secs: now_epoch_secs(),
+                    reason: QuarantineReason::Locked422,
+                });
+                std::fs::write(dir.join("excluded.toml"), toml::to_string(&table).unwrap())
+                    .unwrap();
+                // The existing reconciliation removes an orphan quarantine.
+                // Reintroduce it on the post-release inventory, like an
+                // independent allocator update, without extra GitHub calls.
+                let script = std::fs::read_to_string(&docker).unwrap();
+                std::fs::write(&docker, script.replace(
+                    "if [ -f started-c10 ]; then cat after.jsonl; else cat before.jsonl; fi",
+                    "if [ -f started-c10 ]; then cp excluded.toml quarantined_slots.toml; cat after.jsonl; else cat before.jsonl; fi"
+                )).unwrap();
+            } else {
+                let mut ladder = FailureLadder::default();
+                let mut policy = failure_ladder_policy(&cfg);
+                policy.slot_failure_threshold = 1;
+                ladder.record_failure(policy, 4, now_epoch_secs()).unwrap();
+                std::fs::write(dir.join("excluded.toml"), toml::to_string(&ladder).unwrap())
+                    .unwrap();
+                let script = std::fs::read_to_string(&docker).unwrap();
+                std::fs::write(&docker, script.replace(
+                    "if [ -f started-c10 ]; then cat after.jsonl; else cat before.jsonl; fi",
+                    "if [ -f started-c10 ]; then cp excluded.toml failure_ladder.toml; cat after.jsonl; else cat before.jsonl; fi"
+                )).unwrap();
+            }
+        }
+        if case == "unknown_ladder" {
+            let script = std::fs::read_to_string(&gh).unwrap();
+            std::fs::write(&gh, script.replace("cp slot_assignments.toml at-second-release.toml", "cp slot_assignments.toml at-second-release.toml\n      printf 'invalid = [' > failure_ladder.toml")).unwrap();
+        }
+        if case == "unknown_inventory" {
+            let script = std::fs::read_to_string(&docker).unwrap();
+            std::fs::write(&docker, script.replace(
+                "if [ -f started-c10 ]; then cat after.jsonl; else cat before.jsonl; fi",
+                "if [ -f started-c10 ]; then echo inventory-unavailable >&2; exit 71; else cat before.jsonl; fi"
+            )).unwrap();
+        }
+        if case == "readiness_error" {
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() =
+                Some(vec![Err("readiness unavailable".into())].into());
+        }
+        if case == "failed_fresh" {
+            // Two fresh vacancies: c10's real Docker start fails after JIT
+            // registration; c11 succeeds later in the same bounded batch.
+            // c4 stays reserved until the trailing release, independently.
+            for (file, removed) in [("before.json", 11), ("after.json", 10)] {
+                let mut json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(dir.join(file)).unwrap())
+                        .unwrap();
+                let runners = json[0]["runners"].as_array_mut().unwrap();
+                runners.retain(|runner| runner["id"] != 1000 + removed);
+                let count = runners.len();
+                json[0]["total_count"] = serde_json::json!(count);
+                std::fs::write(dir.join(file), json.to_string()).unwrap();
+            }
+            for (file, removed) in [("before.jsonl", 11), ("after.jsonl", 10)] {
+                let rows = std::fs::read_to_string(dir.join(file)).unwrap();
+                let rows = rows
+                    .lines()
+                    .filter(|line| {
+                        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                        row["Names"] != format!("ez-runner-c-{removed}")
+                    })
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>();
+                std::fs::write(dir.join(file), rows).unwrap();
+            }
+            let script = std::fs::read_to_string(&gh).unwrap();
+            std::fs::write(&gh, script.replace(
+                "  *) echo unexpected-gh-call",
+                "  'api -X POST '*'/actions/runners/generate-jitconfig '*'name=ez-runner-c-11 '*) printf '%s\n' '{\"encoded_jit_config\":\"synthetic-jit\",\"runner\":{\"id\":1011}}';;\n  'api -X DELETE '*'/actions/runners/1010') exit 0;;\n  *) echo unexpected-gh-call"
+            )).unwrap();
+            let script = std::fs::read_to_string(&docker).unwrap();
+            let script = script.replace(
+                "  'rm -f ez-runner-c-10')",
+                "  'rm -f ez-runner-c-10'|'rm -f ez-runner-c-11')",
+            ).replace(
+                "  'run -d --rm --name ez-runner-c-10 '*)",
+                "  'run -d --rm --name ez-runner-c-10 '*) echo synthetic-fresh-start-failure >&2; exit 71;;\n  'run -d --rm --name ez-runner-c-11 '*)",
+            ).replace("printf 'container-10\\n'", "printf 'container-11\\n'");
+            std::fs::write(&docker, script).unwrap();
+            *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+                vec![Ok(ReadinessSummary {
+                    ready: 12,
+                    absent: vec![],
+                })]
+                .into(),
+            );
+        }
+        let result = ensure_count_outcome(&cfg, Backend::Docker);
+        if case == "unknown_inventory" {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("post-refill local container recount"));
+        } else {
+            let outcome = result.unwrap();
+            let eligible = matches!(
+                case,
+                "released" | "out_of_range" | "readiness_error" | "failed_fresh"
+            );
+            assert_eq!(
+                outcome.post_refill_slots_released,
+                if eligible {
+                    vec!["ez-runner-c-4"]
+                } else {
+                    vec![]
+                },
+                "case={case}: {outcome:?}"
+            );
+            assert_eq!(
+                outcome.post_refill_capacity_lost,
+                if matches!(case, "already_vacant" | "unknown_slots") {
+                    vec!["ez-runner-c-4"]
+                } else {
+                    vec![]
+                },
+                "case={case}"
+            );
+            assert_eq!(
+                outcome.start_failures,
+                u32::from(case == "failed_fresh"),
+                "new uncertainty must not manufacture a backend failure: {case}"
+            );
+            let decision = crate::ensure_success_decision(&cfg, &outcome);
+            assert_eq!(
+                decision == crate::EnsureSuccessDecision::PostRefillSlotsReleased,
+                eligible,
+                "case={case}"
+            );
+            assert_eq!(
+                outcome.started,
+                if case == "failed_fresh" {
+                    vec!["ez-runner-c-11"]
+                } else {
+                    vec!["ez-runner-c-10"]
+                }
+            );
+            if case == "failed_fresh" {
+                assert_eq!(outcome.missing, 3);
+                assert_eq!(outcome.remaining_shortage, 2);
+                assert!(outcome.admission_paused_reason.is_none());
+                assert!(outcome.is_partial_failure());
+                assert!(!outcome
+                    .post_refill_slots_released
+                    .iter()
+                    .any(|name| name == "ez-runner-c-10"));
+                let slots = read_slot_assignments_for(Some(&cfg)).unwrap();
+                assert!(!slots.assignments.contains_key("4"));
+                assert!(!slots.assignments.contains_key("10"));
+                assert_eq!(
+                    slots.assignments.get("11").map(String::as_str),
+                    Some("1011")
+                );
+                assert_eq!(
+                    crate::start_command_disposition(&outcome),
+                    crate::StartCommandDisposition::Incomplete
+                );
+                let mut streak = 0;
+                cfg.alert.failure_alert_threshold = 99;
+                assert!(crate::apply_ensure_outcome_to_failure_streak(
+                    &cfg,
+                    Backend::Docker,
+                    &mut streak,
+                    &outcome
+                ));
+                assert_eq!(streak, 1);
+                let paced =
+                    crate::ensure_success_decision_with_pending_readiness(decision, true, true, 12);
+                assert_eq!(
+                    paced,
+                    crate::EnsureSuccessDecision::StartSettling { executing: 12 }
+                );
+                assert_eq!(
+                    crate::ensure_success_plan(&cfg, paced),
+                    (
+                        Duration::from_secs(crate::config::MIN_SERVE_TICK_SECONDS),
+                        false
+                    )
+                );
+            }
+            eprintln!("BOUNDARY {case}: {outcome:?}; decision={decision:?}");
+        }
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        if case == "failed_fresh" {
+            let attempts: Vec<_> = calls
+                .lines()
+                .filter(|line| line.starts_with("docker run -d"))
+                .collect();
+            assert_eq!(attempts.len(), 2);
+            assert!(attempts[0].contains("--name ez-runner-c-10 "));
+            assert!(attempts[1].contains("--name ez-runner-c-11 "));
+            assert_eq!(
+                calls
+                    .lines()
+                    .filter(|line| line.starts_with("gh api -X DELETE"))
+                    .count(),
+                1
+            );
+            eprintln!("FAILED-FRESH COMMAND TRACE:\n{calls}");
+        }
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("gh api --paginate"))
+                .count(),
+            2,
+            "case={case}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("docker run -d"))
+                .count(),
+            if case == "failed_fresh" { 2 } else { 1 },
+            "case={case}"
+        );
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.contains("generate-jitconfig"))
+                .count(),
+            if case == "failed_fresh" { 2 } else { 1 },
+            "case={case}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn post_refill_released_slot_full_path_boundaries() {
+        let _qlock = crate::quarantine::tests::test_lock();
+        for case in [
+            "released",
+            "empty",
+            "already_vacant",
+            "replacement_id",
+            "unknown_slots",
+            "unknown_quarantine",
+            "unknown_ladder",
+            "same_name_present",
+            "still_reserved",
+            "out_of_range",
+            "quarantined",
+            "ladder",
+            "unknown_inventory",
+            "readiness_error",
+            "failed_fresh",
+        ] {
+            released_slot_full_path_case(case);
+        }
+    }
+
+    #[test]
+    fn post_refill_released_slot_requires_complete_named_evidence() {
+        let _qlock = crate::quarantine::tests::test_lock();
+        let _env = TestEnv::new("released_evidence");
+        let cfg = cfg_with(3, "runner");
+        let before = SlotAssignments {
+            assignments: [("1".into(), "1001".into())].into(),
+            ..Default::default()
+        };
+        let vacant = SlotAssignments::default();
+        let names = HashSet::new();
+        let attempted = HashSet::new();
+        assert_eq!(
+            post_refill_released_slots(
+                &cfg,
+                Some(&before),
+                Some(&before),
+                Some(&vacant),
+                &attempted,
+                &names
+            )
+            .unwrap(),
+            vec!["runner-1"]
+        );
+        for (a, b, c) in [
+            (None, Some(&before), Some(&vacant)),
+            (Some(&before), None, Some(&vacant)),
+            (Some(&before), Some(&before), None),
+        ] {
+            assert!(
+                post_refill_released_slots(&cfg, a, b, c, &attempted, &names)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(post_refill_released_slots(
+            &cfg,
+            Some(&before),
+            Some(&before),
+            Some(&vacant),
+            &[1].into(),
+            &names
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            post_refill_released_slots(
+                &cfg,
+                Some(&vacant),
+                Some(&before),
+                Some(&vacant),
+                &attempted,
+                &names
+            )
+            .unwrap()
+            .is_empty(),
+            "new reservations are excluded"
+        );
+        FAILURE_LADDER_PERSISTENCE_FAILED.store(true, Ordering::SeqCst);
+        assert!(post_refill_released_slots(
+            &cfg,
+            Some(&before),
+            Some(&before),
+            Some(&vacant),
+            &attempted,
+            &names
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
     fn post_refill_inventory_loss_forces_immediate_reconcile() {
         let _env = TestEnv::new("post_refill_inventory_loss");
         let cfg = cfg_with(14, "ez-runner-c");
@@ -8334,6 +9286,7 @@ esac
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -8351,6 +9304,7 @@ esac
             remaining_shortage: 1,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 1,
             admission_paused_reason: None,
         };
@@ -8774,7 +9728,7 @@ esac
         .expect_err("start_one must fail closed when Linux runner count is unsupported");
         assert!(
             err.to_string().contains("host containment")
-                || err.to_string().contains("runner counts 10 or 14"),
+                || err.to_string().contains("runner counts 10, 14, or 20"),
             "expected host containment failure; got: {err:#}"
         );
     }
@@ -8804,6 +9758,13 @@ esac
         rollback_cfg.limits.cgroup_parent = Some("actions.slice".into());
         require_host_containment(&rollback_cfg)
             .expect("the supported 10-runner rollback profile must pass admission");
+
+        write_actions_slice_fixture(&root, 20);
+        let mut cfg20 = cfg_with(20, "ez-runner-c");
+        cfg20.limits.memory_mb = 1400;
+        cfg20.limits.cgroup_parent = Some("actions.slice".into());
+        require_host_containment(&cfg20)
+            .expect("the explicitly bounded 20-runner HostDocker profile must pass admission");
 
         write_actions_slice_fixture(&root, 14);
         let mut wrong_memory = cfg.clone();
@@ -8929,6 +9890,9 @@ esac
         write_actions_slice_fixture(&root, 14);
         validate_host_actions_slice(&root, 14)
             .expect("the 14-runner profile-specific pids cap must pass admission");
+        write_actions_slice_fixture(&root, 20);
+        validate_host_actions_slice(&root, 20)
+            .expect("the 20-runner profile-specific pids cap must pass admission");
         let err = validate_host_actions_slice(&root, 10)
             .expect_err("the 14-runner pids cap must not pass the 10-runner profile");
         assert!(err.to_string().contains("pids.max"), "got: {err:#}");

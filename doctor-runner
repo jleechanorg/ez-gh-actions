@@ -765,8 +765,8 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
 CONFIGURED_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
-DEFAULT_LINUX_RUNNER_COUNT=14
-DEFAULT_MAC_RUNNER_COUNT=6
+DEFAULT_LINUX_RUNNER_COUNT=20
+DEFAULT_MAC_RUNNER_COUNT=4
 if [ "$PLATFORM" = "macos" ]; then
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_MAC_RUNNER_COUNT"
 else
@@ -1249,9 +1249,9 @@ REMOTE_DOWN_SLOTS=()
 # REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
 # below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
 # printed only a warn() — `configured` then collapsed to the local-only
-# count (e.g. 14 instead of 20, per this repo's current 14-Linux + 6-Mac
+# count (e.g. 20 instead of 24, per this repo's current 20-Linux + 4-Mac
 # contract) so a Linux run with the Mac unreachable reported "fleet
-# healthy: 14/14" instead of "14/20 with 6 down". Treat
+# healthy: 20/20" instead of "20/24 with 4 down". Treat
 # unreachable as the strongest negative signal available (we have ZERO
 # evidence about any of the remote slots, so all of them are unproven):
 # populate REMOTE_DOWN_SLOTS with synthetic names so the verdict gate

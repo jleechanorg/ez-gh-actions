@@ -678,6 +678,7 @@ actions_tasks_max_for_runner_count() {
     case "$1" in
         10) printf '6000\n' ;;
         14) printf '8000\n' ;;
+        20) printf '8000\n' ;;
         *) echo "unsupported runner count for actions.slice profile: $1" >&2; return 1 ;;
     esac
 }

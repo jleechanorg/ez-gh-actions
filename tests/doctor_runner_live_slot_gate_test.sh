@@ -118,6 +118,8 @@ run_case "1exec-19idle-ok-20expected" 1 13 0 0 6 0 20 "no" || OVERALL_PASS=false
 
 # Full configured capacity executing remains healthy.
 run_case "14linux-6mac-exec-20expected" 14 0 0 6 0 0 20 "no" || OVERALL_PASS=false
+run_case "20linux-4mac-exec-24expected" 20 0 0 4 0 0 24 "no" || OVERALL_PASS=false
+run_case "1exec-23idle-ok-24expected" 1 19 0 0 4 0 24 "no" || OVERALL_PASS=false
 
 # A journal-confirmed cycling slot remains under daemon management.
 run_case "13linux-exec-1cycling-6mac-idle-20expected" 13 0 1 0 6 0 20 "no" || OVERALL_PASS=false
