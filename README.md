@@ -16,6 +16,57 @@ The full design — including the 32-agent adversarial review that shaped v1 —
 [DESIGN.md](DESIGN.md). A static architecture diagram is at
 [`docs/architecture.svg`](docs/architecture.svg).
 
+## Completed-job workspace cleanup
+
+The custom runner image configures GitHub's
+[`ACTIONS_RUNNER_HOOK_JOB_COMPLETED`](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/run-scripts)
+hook. After workflow steps and action post steps (including cache uploads), it
+empties the completed job's `/home/runner/_work/<repo>/*` pipeline directory
+(including its default `<repo>/<repo>` checkout and custom sibling checkouts)
+and transient `_actions`, `_temp`, and `_tool` contents. This reclaims the
+per-runner host-mounted workspace before a replacement runner is scheduled,
+including when a slot remains idle. The existing ephemeral container removal
+and next-start workspace preparation are unchanged.
+
+The hook requires a matching ephemeral `.runner` identity, `_work` configuration,
+job context, and the exact default workspace layout. It fails closed on unknown
+ownership or symlinked workspace ancestors. Other repositories' pipeline trees,
+`_PipelineMapping`,
+runner installation/configuration (`.runner`, `.credentials*`, `.env`, `.path`,
+`config.sh`, binaries), `_diag`, shared pip caches, and wheelhouses are preserved.
+No diagnostics cap is introduced. The hook's `_temp/_runner_file_commands` and
+`_temp/_github_workflow` bookkeeping remains until the runner finishes processing
+its hook. Target roots are kept, including the existing tmpfs cache mounts.
+
+Deletion uses directory-relative file descriptors without following symlinks;
+descriptor mount IDs preserve nested mounts, including renamed or newly added
+same-filesystem bind mounts. Missing mount identity fails closed. Only the
+three known cache roots may be emptied when mounted as tmpfs. Other mounted
+cache/checkout paths are retained. A nondefault `RUNNER_TOOL_CACHE` is left alone.
+The root and deletion scope cannot be broadened through environment variables.
+This hook is for the image's one-job-per-runner layout, not a shared-workspace
+janitor; arbitrary custom pipeline layouts and other repositories' workspaces are
+deliberately outside its scope.
+
+Cleanup runs as the existing runner user, without elevated privileges, permission
+changes, Docker/VM operations, or service restarts. Failures/permissions leave a
+`partial` or `skipped` message in the job's **Complete runner** log rather than
+changing the workflow result. The synchronous hook has a 60-second budget, then
+up to five seconds before forced termination of its cleanup process only. Large
+or inaccessible trees can remain partially populated; the budget is a bound,
+not a claim that all production workspace sizes have been measured. Hard-killed
+containers may never invoke the hook and still rely on existing lifecycle cleanup.
+
+Hermetic regression coverage (temporary directories only; no Docker or live fleet):
+
+```bash
+python3 -m unittest tests/runner_post_job_workspace_prune_test.py
+```
+
+The tests exercise cleanup and the shell hook with a fixture installation, plus
+image/CI wiring. Building the updated image and validating a real job remain
+separate deploy-owner checks; a code change alone does not update running images.
+
 ## Host-survival failure ladder (Jeff-Ubuntu)
 
 The production capacity contract is **14 Linux runners plus 6 Mac runners**; the explicit 10-runner Linux profile remains available for rollback.
