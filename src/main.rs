@@ -737,6 +737,7 @@ fn ensure_outcome_may_credit_deadman(outcome: &docker_backend::EnsureCountOutcom
         && !outcome.is_partial_failure()
         && outcome.post_refill_readiness_error.is_none()
         && outcome.post_refill_capacity_lost.is_empty()
+        && outcome.post_refill_slots_released.is_empty()
         && outcome.remaining_shortage == 0
 }
 
@@ -864,6 +865,7 @@ enum EnsureSuccessDecision {
     StartSettling { executing: u32 },
     Recovered,
     PostRefillCapacityLost,
+    PostRefillSlotsReleased,
     IncompleteReadiness,
     AdmissionPaused,
 }
@@ -885,6 +887,7 @@ fn start_command_disposition(
     } else if outcome.start_failures > 0
         || outcome.post_refill_readiness_error.is_some()
         || !outcome.post_refill_capacity_lost.is_empty()
+        || !outcome.post_refill_slots_released.is_empty()
     {
         StartCommandDisposition::Incomplete
     } else if !outcome.started.is_empty() {
@@ -904,6 +907,8 @@ fn ensure_success_decision(
         EnsureSuccessDecision::AdmissionPaused
     } else if !outcome.post_refill_capacity_lost.is_empty() {
         EnsureSuccessDecision::PostRefillCapacityLost
+    } else if !outcome.post_refill_slots_released.is_empty() {
+        EnsureSuccessDecision::PostRefillSlotsReleased
     } else if outcome.post_refill_readiness_error.is_some() {
         EnsureSuccessDecision::IncompleteReadiness
     } else if outcome.remaining_shortage > 0 {
@@ -922,6 +927,7 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
         }
         EnsureSuccessDecision::Recovered => settling_plan(cfg, SettlingDecision::Recovered),
         EnsureSuccessDecision::PostRefillCapacityLost
+        | EnsureSuccessDecision::PostRefillSlotsReleased
         | EnsureSuccessDecision::IncompleteReadiness => {
             settling_plan(cfg, SettlingDecision::Ceiling)
         }
@@ -929,15 +935,22 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
     }
 }
 
+impl EnsureSuccessDecision {
+    fn immediate_capacity_reconcile(self) -> bool {
+        matches!(
+            self,
+            Self::PostRefillCapacityLost | Self::PostRefillSlotsReleased
+        )
+    }
+}
+
 fn ensure_success_decision_with_pending_readiness(
     decision: EnsureSuccessDecision,
     pending_readiness: bool,
-    previous_post_refill_capacity_loss_immediate: bool,
+    previous_post_refill_capacity_immediate: bool,
     executing: u32,
 ) -> EnsureSuccessDecision {
-    if previous_post_refill_capacity_loss_immediate
-        && decision == EnsureSuccessDecision::PostRefillCapacityLost
-    {
+    if previous_post_refill_capacity_immediate && decision.immediate_capacity_reconcile() {
         EnsureSuccessDecision::StartSettling { executing }
     } else if pending_readiness && decision == EnsureSuccessDecision::Recovered {
         EnsureSuccessDecision::StartSettling { executing: 0 }
@@ -958,6 +971,7 @@ fn apply_ensure_success_decision(
             *pending_readiness = true;
         }
         EnsureSuccessDecision::PostRefillCapacityLost
+        | EnsureSuccessDecision::PostRefillSlotsReleased
         | EnsureSuccessDecision::IncompleteReadiness => {
             *settling = None;
             *pending_readiness = true;
@@ -1384,7 +1398,7 @@ fn main() -> Result<()> {
             let mut ensure_fail_streak = 0u32;
             let mut settling: Option<SettlingEpisode> = None;
             let mut pending_readiness = false;
-            let mut previous_post_refill_capacity_loss_immediate = false;
+            let mut previous_post_refill_capacity_immediate = false;
             let mut settling_ceilings = SettlingCeilingState::default();
             let mut deadman = alert::DeadManState::new(Instant::now());
 
@@ -1505,16 +1519,16 @@ fn main() -> Result<()> {
                             let decision = ensure_success_decision_with_pending_readiness(
                                 raw_decision,
                                 pending_readiness,
-                                previous_post_refill_capacity_loss_immediate,
+                                previous_post_refill_capacity_immediate,
                                 cfg.runner.count.saturating_sub(outcome.remaining_shortage),
                             );
-                            previous_post_refill_capacity_loss_immediate =
-                                decision == EnsureSuccessDecision::PostRefillCapacityLost;
-                            if raw_decision == EnsureSuccessDecision::PostRefillCapacityLost
+                            previous_post_refill_capacity_immediate =
+                                decision.immediate_capacity_reconcile();
+                            if raw_decision.immediate_capacity_reconcile()
                                 && decision != raw_decision
                             {
                                 eprintln!(
-                                    "post-refill configured runner loss repeated; entering existing settling cadence"
+                                    "post-refill capacity reconciliation repeated; entering existing settling cadence"
                                 );
                             }
                             match decision {
@@ -1535,6 +1549,12 @@ fn main() -> Result<()> {
                                     eprintln!(
                                         "{}: {detail}; reconcile on next iteration",
                                         if escalated { "CRITICAL" } else { "WARN" }
+                                    );
+                                }
+                                EnsureSuccessDecision::PostRefillSlotsReleased => {
+                                    eprintln!(
+                                        "post-refill reservation(s) became allocatable: {:?}; reconcile on next iteration",
+                                        outcome.post_refill_slots_released
                                     );
                                 }
                                 EnsureSuccessDecision::IncompleteReadiness => {
@@ -1590,7 +1610,7 @@ fn main() -> Result<()> {
                             plan
                         }
                         Err(e) => {
-                            previous_post_refill_capacity_loss_immediate = false;
+                            previous_post_refill_capacity_immediate = false;
                             ensure_fail_streak += 1;
                             eprintln!("ensure_count failed (will retry): {e:#}");
                             notify_ensure_failure(
@@ -2110,6 +2130,7 @@ mod tests {
             remaining_shortage: 3,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 3,
             admission_paused_reason: None,
         };
@@ -2131,6 +2152,7 @@ mod tests {
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -2158,6 +2180,7 @@ mod tests {
             remaining_shortage: 10,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
             admission_paused_reason: Some("fleet circuit open".into()),
         };
@@ -2205,6 +2228,7 @@ mod tests {
                 remaining_shortage,
                 post_refill_readiness_error: post_refill_readiness_error.map(str::to_owned),
                 post_refill_capacity_lost: Vec::new(),
+                post_refill_slots_released: Vec::new(),
                 start_failures,
                 admission_paused_reason: admission_paused_reason.map(str::to_owned),
             }
@@ -2261,6 +2285,7 @@ mod tests {
             remaining_shortage: 10,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 1,
             admission_paused_reason: Some("GitHub JIT/control-plane start failed".into()),
         };
@@ -2282,6 +2307,7 @@ mod tests {
             remaining_shortage: 0,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -2305,6 +2331,116 @@ mod tests {
     }
 
     #[test]
+    fn post_refill_released_slots_share_one_capacity_pacing_budget() {
+        let cfg = test_config();
+        // Every ordering, including mixed signals in a single outcome, uses
+        // the same bool as the actual serve call site.
+        for first in 0..3 {
+            for second in 0..3 {
+                let mut previous_immediate = false;
+                // 0: original loss only; 1: released slot only; 2: both.
+                for (index, mode) in [first, second, (second + 1) % 3].into_iter().enumerate() {
+                    let outcome = docker_backend::EnsureCountOutcome {
+                        started: vec![],
+                        missing: 2,
+                        remaining_shortage: 1,
+                        post_refill_readiness_error: None,
+                        post_refill_capacity_lost: if mode != 1 {
+                            vec!["runner-1".into()]
+                        } else {
+                            vec![]
+                        },
+                        post_refill_slots_released: if mode != 0 {
+                            vec!["runner-2".into()]
+                        } else {
+                            vec![]
+                        },
+                        start_failures: 0,
+                        admission_paused_reason: None,
+                    };
+                    let raw = ensure_success_decision(&cfg, &outcome);
+                    let decision = ensure_success_decision_with_pending_readiness(
+                        raw,
+                        true,
+                        previous_immediate,
+                        13,
+                    );
+                    previous_immediate = decision.immediate_capacity_reconcile();
+                    assert_eq!(previous_immediate, index != 1);
+                    assert_eq!(
+                        ensure_success_plan(&cfg, decision).0,
+                        if index == 1 {
+                            Duration::from_secs(config::MIN_SERVE_TICK_SECONDS)
+                        } else {
+                            Duration::ZERO
+                        }
+                    );
+                    let mut settling = None;
+                    let mut pending = false;
+                    apply_ensure_success_decision(
+                        &mut settling,
+                        &mut pending,
+                        Instant::now(),
+                        decision,
+                    );
+                    assert!(pending);
+                    assert_eq!(settling.is_some(), index == 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_refill_released_slots_preserve_pause_cli_deadman_and_failure_accounting() {
+        let cfg = test_config();
+        let mut outcome = docker_backend::EnsureCountOutcome {
+            started: vec![],
+            missing: 1,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec!["runner-1".into()],
+            start_failures: 0,
+            admission_paused_reason: None,
+        };
+        assert!(!ensure_outcome_may_credit_deadman(&outcome));
+        assert_eq!(
+            start_command_disposition(&outcome),
+            StartCommandDisposition::Incomplete
+        );
+        let mut streak = 0;
+        assert!(!apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut streak,
+            &outcome
+        ));
+        assert_eq!(streak, 0);
+        outcome.post_refill_readiness_error = Some("unknown worker state".into());
+        assert_eq!(
+            ensure_success_decision(&cfg, &outcome),
+            EnsureSuccessDecision::PostRefillSlotsReleased
+        );
+        outcome.admission_paused_reason = Some("operator admission pause".into());
+        let decision = ensure_success_decision_with_pending_readiness(
+            ensure_success_decision(&cfg, &outcome),
+            true,
+            true,
+            13,
+        );
+        assert_eq!(decision, EnsureSuccessDecision::AdmissionPaused);
+        assert_eq!(
+            ensure_success_plan(&cfg, decision),
+            (cfg.runner.serve_tick(), true)
+        );
+        assert_eq!(
+            start_command_disposition(&outcome),
+            StartCommandDisposition::AdmissionPaused
+        );
+        assert!(!ensure_outcome_may_credit_deadman(&outcome));
+    }
+
+    #[test]
     fn post_refill_loss_is_paced_before_a_second_immediate_reconcile() {
         let mut cfg = test_config();
         cfg.runner.count = 14;
@@ -2314,6 +2450,7 @@ mod tests {
             remaining_shortage: 3,
             post_refill_readiness_error: None,
             post_refill_capacity_lost: vec!["ez-runner-c-12".into()],
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
             admission_paused_reason: None,
         };
@@ -2321,13 +2458,13 @@ mod tests {
         let first = ensure_success_decision(&cfg, &outcome);
         assert_eq!(first, EnsureSuccessDecision::PostRefillCapacityLost);
         assert_eq!(ensure_success_plan(&cfg, first), (Duration::ZERO, false));
-        let previous_post_refill_capacity_loss_immediate =
+        let previous_post_refill_capacity_immediate =
             first == EnsureSuccessDecision::PostRefillCapacityLost;
 
         let second = ensure_success_decision_with_pending_readiness(
             ensure_success_decision(&cfg, &outcome),
             true,
-            previous_post_refill_capacity_loss_immediate,
+            previous_post_refill_capacity_immediate,
             cfg.runner.count.saturating_sub(outcome.remaining_shortage),
         );
         assert_eq!(
@@ -2342,12 +2479,12 @@ mod tests {
             second,
             EnsureSuccessDecision::PostRefillCapacityLost
         ));
-        let previous_post_refill_capacity_loss_immediate =
+        let previous_post_refill_capacity_immediate =
             second == EnsureSuccessDecision::PostRefillCapacityLost;
         let third = ensure_success_decision_with_pending_readiness(
             ensure_success_decision(&cfg, &outcome),
             true,
-            previous_post_refill_capacity_loss_immediate,
+            previous_post_refill_capacity_immediate,
             cfg.runner.count.saturating_sub(outcome.remaining_shortage),
         );
         assert_eq!(third, EnsureSuccessDecision::PostRefillCapacityLost);
