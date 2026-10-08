@@ -4976,6 +4976,7 @@ pub struct EnsureCountOutcome {
     /// Actual JIT/Docker/allocator failures, excluding occupied reservations
     /// that are still settling after a one-job container exits.
     pub start_failures: u32,
+    pub reclaimed: u32,
     /// A deliberate admission refusal is not a backend failure and must not
     /// trigger a Colima restart. Existing jobs continue to run.
     pub admission_paused_reason: Option<String>,
@@ -4999,6 +5000,7 @@ fn admission_paused_outcome(missing: u32, reason: String) -> EnsureCountOutcome 
         post_refill_capacity_lost: Vec::new(),
         post_refill_slots_released: Vec::new(),
         start_failures: 0,
+        reclaimed: 0,
         admission_paused_reason: Some(reason),
     }
 }
@@ -5092,7 +5094,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     // reservation that would otherwise wedge `next_slot` forever ("all N
     // runner slot(s) are currently in use"). `serve` calls this on a 30s
     // loop, so the host self-heals on the next tick.
-    let _ = release_stale_slots(cfg);
+    let reclaimed = release_stale_slots(cfg).unwrap_or(0) as u32;
     // Print the host-kernel warning at most once per process — `serve` would
     // otherwise re-emit it every 30s.
     DOCTOR_PRINTED.call_once(|| print_doctor(&crate::platform::detect()));
@@ -5125,6 +5127,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed,
             admission_paused_reason: None,
         });
     }
@@ -5398,6 +5401,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         post_refill_capacity_lost,
         post_refill_slots_released,
         start_failures: refill.start_failures,
+        reclaimed,
         admission_paused_reason: refill.admission_paused_reason,
     };
     if outcome.is_partial_failure() {
@@ -9288,6 +9292,7 @@ esac
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
         assert!(
@@ -9306,6 +9311,7 @@ esac
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 1,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
         assert!(

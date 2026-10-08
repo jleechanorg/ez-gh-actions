@@ -1694,6 +1694,7 @@ fn report_queue_health(
 ) -> Result<()> {
     report_stale_queue(cfg, repo, stats)?;
     report_idle_runner_mismatch(cfg, repo, stats)?;
+    report_busy_but_not_accepting_jobs(cfg, repo, stats)?;
     if !stats.tail_bad {
         println!(
             "queue monitor: {repo} queued_jobs={} fresh={} stale={} in_progress_jobs={} max_job_age={:.1}m threshold={}m",
@@ -1761,6 +1762,38 @@ fn report_queue_health(
         stats.tail_warn_minutes,
     );
     alert::notify(cfg, event_key, severity, subject, &body)?;
+    eprintln!("warning: {body}");
+    Ok(())
+}
+
+fn report_busy_but_not_accepting_jobs(cfg: &Config, repo: &str, stats: &QueueStats) -> Result<()> {
+    if !stats.tail_bad {
+        return Ok(());
+    }
+    let Some(fleet) = stats.fleet.as_ref() else {
+        return Ok(());
+    };
+    if fleet.busy_count < fleet.expected_total {
+        return Ok(());
+    }
+
+    let subject = "Runners appear busy but queue is starving";
+    let body = format!(
+        "Fleet {} appears fully busy ({} of {} expected runners) but {} has jobs queued for >{} minutes.\n\nThis indicates jobs are wedged, runners are ignoring new work, or the GitHub API is misreporting runner status.\n\n{}",
+        cfg.github.target,
+        fleet.busy_count,
+        fleet.expected_total,
+        repo,
+        stats.tail_warn_minutes,
+        fleet.runner_table()
+    );
+    alert::notify(
+        cfg,
+        "queue.starvation.busy_but_starving",
+        Severity::Critical,
+        subject,
+        &body,
+    )?;
     eprintln!("warning: {body}");
     Ok(())
 }

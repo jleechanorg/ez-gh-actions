@@ -729,6 +729,44 @@ fn apply_ensure_outcome_to_failure_streak(
     } else {
         *ensure_fail_streak = 0;
     }
+    if outcome.start_failures >= cfg.alert.registration_burst_threshold {
+        let subject = "Runner registration failure burst";
+        let body = format!(
+            "{} registration failure(s) in a single refill pass (threshold: {}) for target {}. This often indicates a GitHub API outage or network drop.",
+            outcome.start_failures,
+            cfg.alert.registration_burst_threshold,
+            cfg.github.target
+        );
+        if let Err(err) = alert::notify(
+            cfg,
+            "serve.ensure_count.registration_burst",
+            Severity::Warning,
+            subject,
+            &body,
+        ) {
+            eprintln!("WARN: alert send error: {err:#}");
+        }
+    }
+
+    if outcome.reclaimed >= cfg.alert.reclaim_burst_threshold {
+        let subject = "Runner slot reclaim burst";
+        let body = format!(
+            "{} slot(s) reclaimed in a single pass (threshold: {}) for target {}. This suggests runners are failing to register, jobs are wedging, or starvation.",
+            outcome.reclaimed,
+            cfg.alert.reclaim_burst_threshold,
+            cfg.github.target
+        );
+        if let Err(err) = alert::notify(
+            cfg,
+            "serve.ensure_count.reclaim_burst",
+            Severity::Warning,
+            subject,
+            &body,
+        ) {
+            eprintln!("WARN: alert send error: {err:#}");
+        }
+    }
+
     partial_failure
 }
 
@@ -2132,6 +2170,7 @@ mod tests {
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 3,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
@@ -2154,6 +2193,7 @@ mod tests {
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
@@ -2182,6 +2222,7 @@ mod tests {
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed: 0,
             admission_paused_reason: Some("fleet circuit open".into()),
         };
 
@@ -2230,6 +2271,7 @@ mod tests {
                 post_refill_capacity_lost: Vec::new(),
                 post_refill_slots_released: Vec::new(),
                 start_failures,
+                reclaimed: 0,
                 admission_paused_reason: admission_paused_reason.map(str::to_owned),
             }
         };
@@ -2287,6 +2329,7 @@ mod tests {
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 1,
+            reclaimed: 0,
             admission_paused_reason: Some("GitHub JIT/control-plane start failed".into()),
         };
 
@@ -2309,6 +2352,7 @@ mod tests {
             post_refill_capacity_lost: Vec::new(),
             post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
         assert!(ensure_outcome_may_credit_deadman(&healthy));
@@ -2356,6 +2400,7 @@ mod tests {
                             vec![]
                         },
                         start_failures: 0,
+                        reclaimed: 0,
                         admission_paused_reason: None,
                     };
                     let raw = ensure_success_decision(&cfg, &outcome);
@@ -2401,6 +2446,7 @@ mod tests {
             post_refill_capacity_lost: vec![],
             post_refill_slots_released: vec!["runner-1".into()],
             start_failures: 0,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
         assert!(!ensure_outcome_may_credit_deadman(&outcome));
@@ -2452,6 +2498,7 @@ mod tests {
             post_refill_capacity_lost: vec!["ez-runner-c-12".into()],
             post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed: 0,
             admission_paused_reason: None,
         };
 
@@ -3255,5 +3302,96 @@ mod tests {
             "invariant sampler tick",
             || Ok(None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod burst_alert_tests {
+    use super::*;
+    use crate::docker_backend::EnsureCountOutcome;
+    use std::fs;
+
+    fn test_config_with_log() -> (
+        crate::config::Config,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let mut cfg = crate::config::Config::defaults_for(
+            &crate::platform::Platform {
+                os: "linux",
+                arch: "x86_64",
+                kvm_usable: false,
+                has_tart: false,
+                has_virsh: false,
+                docker_ok: true,
+                sysbox_runtime: false,
+                daemon_in_vm: false,
+                total_mem_mb: 8192,
+                cpus: 4,
+            },
+            "owner/repo".into(),
+            crate::config::Scope::Repo,
+        );
+        let dir = std::env::temp_dir().join("ezgha-alert-test");
+        let log = dir.join("alert.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+        (cfg, dir, log)
+    }
+
+    #[test]
+    fn registration_burst_emits_alert() {
+        let (mut cfg, _dir, log) = test_config_with_log();
+
+        cfg.alert.registration_burst_threshold = 3;
+        let mut streak = 0;
+        let outcome = EnsureCountOutcome {
+            started: vec![],
+            missing: 5,
+            remaining_shortage: 5,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec![],
+            start_failures: 4, // Exceeds threshold of 3
+            reclaimed: 0,
+            admission_paused_reason: None,
+        };
+        apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut streak,
+            &outcome,
+        );
+
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("registration_burst"));
+        assert!(raw.contains("registration failure(s) in a single refill pass"));
+    }
+
+    #[test]
+    fn reclaim_burst_emits_alert() {
+        let (mut cfg, _dir, log) = test_config_with_log();
+        cfg.alert.reclaim_burst_threshold = 3;
+        let mut streak = 0;
+        let outcome = EnsureCountOutcome {
+            started: vec![],
+            missing: 5,
+            remaining_shortage: 5,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec![],
+            start_failures: 0,
+            reclaimed: 4, // Exceeds threshold of 3
+            admission_paused_reason: None,
+        };
+        apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut streak,
+            &outcome,
+        );
+
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("reclaim_burst"));
+        assert!(raw.contains("slot(s) reclaimed in a single pass"));
     }
 }

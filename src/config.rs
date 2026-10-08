@@ -94,6 +94,12 @@ pub struct AlertConfig {
     /// pipeline is still alive. Set to 0 to disable.
     #[serde(default = "default_deadman_threshold_seconds")]
     pub deadman_threshold_seconds: u64,
+    /// Alert when registration failures exceed this burst threshold.
+    #[serde(default = "default_registration_burst_threshold")]
+    pub registration_burst_threshold: u32,
+    /// Alert when reclaim loops exceed this burst threshold.
+    #[serde(default = "default_reclaim_burst_threshold")]
+    pub reclaim_burst_threshold: u32,
 }
 
 impl Default for AlertConfig {
@@ -106,6 +112,8 @@ impl Default for AlertConfig {
             email_from: None,
             log_path: None,
             deadman_threshold_seconds: default_deadman_threshold_seconds(),
+            registration_burst_threshold: default_registration_burst_threshold(),
+            reclaim_burst_threshold: default_reclaim_burst_threshold(),
         }
     }
 }
@@ -114,7 +122,11 @@ impl Default for AlertConfig {
 #[serde(deny_unknown_fields)]
 pub struct QueueMonitorConfig {
     /// Enable daemon-side queued GitHub Actions run monitoring.
-    #[serde(default)]
+    ///
+    /// **Blast Radius Note**: When enabled, this actively polls the GitHub API for queued workflows.
+    /// Under severe API rate-limiting conditions, this secondary polling could compete with the
+    /// core runner provisioning loop for budget, though the client is configured to back off.
+    #[serde(default = "default_queue_monitor_enabled")]
     pub enabled: bool,
     /// Repository to monitor as `owner/repo`. Defaults to `github.target` for repo-scoped configs.
     pub repo: Option<String>,
@@ -147,7 +159,7 @@ pub struct QueueMonitorConfig {
 impl Default for QueueMonitorConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_queue_monitor_enabled(),
             repo: None,
             tail_warn_minutes: default_queue_tail_warn_minutes(),
             check_interval_seconds: default_queue_check_interval_seconds(),
@@ -472,6 +484,18 @@ fn default_deadman_threshold_seconds() -> u64 {
     3600
 }
 
+fn default_registration_burst_threshold() -> u32 {
+    5
+}
+
+fn default_reclaim_burst_threshold() -> u32 {
+    5
+}
+
+fn default_queue_monitor_enabled() -> bool {
+    true
+}
+
 fn default_queue_tail_warn_minutes() -> u64 {
     20
 }
@@ -645,6 +669,8 @@ impl Config {
                 email_from: None,
                 log_path: None,
                 deadman_threshold_seconds: default_deadman_threshold_seconds(),
+                registration_burst_threshold: default_registration_burst_threshold(),
+                reclaim_burst_threshold: default_reclaim_burst_threshold(),
             },
             queue_monitor: QueueMonitorConfig::default(),
             canary: CanaryConfig::default(),
@@ -990,7 +1016,7 @@ minimum_isolation = "container"
         assert_eq!(tiny.limits.cpus, 1.0);
         assert_eq!(tiny.alert.failure_alert_threshold, 3);
         assert_eq!(tiny.alert.alert_cooldown_secs, 900);
-        assert!(!tiny.queue_monitor.enabled);
+        assert!(tiny.queue_monitor.enabled);
         assert_eq!(tiny.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
         assert_eq!(tiny.queue_monitor.stale_hours, 8);
@@ -1265,6 +1291,7 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = false;
         assert!(cfg.validate().is_ok());
     }
 
@@ -1273,6 +1300,7 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = false;
         cfg.queue_monitor.enabled = true;
         assert!(cfg.validate().is_err());
         cfg.queue_monitor.repo = Some("owner/repo".into());
@@ -1315,6 +1343,7 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = false;
         cfg.canary.enabled = true;
         assert!(cfg.validate().is_err());
         cfg.canary.repo = Some("owner/repo".into());
@@ -1367,7 +1396,7 @@ pids = 512
 minimum_isolation = "container"
 "#;
         let cfg = load_from_str(raw, "legacy-no-queue-monitor").unwrap();
-        assert!(!cfg.queue_monitor.enabled);
+        assert!(cfg.queue_monitor.enabled);
         assert_eq!(cfg.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(cfg.queue_monitor.check_interval_seconds, 300);
         assert!(!cfg.canary.enabled);

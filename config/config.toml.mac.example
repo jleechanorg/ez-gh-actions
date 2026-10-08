@@ -60,3 +60,6 @@ min_free_disk_gb = 10
 # Colima = docker-in-VM, but backend isolation is still "container".
 # Do NOT set "vm" here — serve fail-closes on daemon blips.
 minimum_isolation = "container"
+
+[queue_monitor]
+enabled = false
