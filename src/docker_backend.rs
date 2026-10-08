@@ -7778,7 +7778,11 @@ esac
                 .insert(slot.to_string(), (1000 + slot).to_string());
             assignments.registered_at.insert(
                 slot.to_string(),
-                now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+                if case == "empty" && slot == 4 {
+                    now_epoch_secs()
+                } else {
+                    now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1
+                },
             );
         }
         if case == "failed_fresh" {
