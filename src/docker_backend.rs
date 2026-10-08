@@ -7515,9 +7515,10 @@ esac
             assignments
                 .assignments
                 .insert(slot.to_string(), (1000 + slot).to_string());
-            assignments
-                .registered_at
-                .insert(slot.to_string(), now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1);
+            assignments.registered_at.insert(
+                slot.to_string(),
+                now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+            );
         }
         write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
         for (file, after) in [("before.json", false), ("after.json", true)] {
@@ -7775,9 +7776,10 @@ esac
             assignments
                 .assignments
                 .insert(slot.to_string(), (1000 + slot).to_string());
-            assignments
-                .registered_at
-                .insert(slot.to_string(), now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1);
+            assignments.registered_at.insert(
+                slot.to_string(),
+                now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+            );
         }
         if case == "failed_fresh" {
             assignments.assignments.remove("11");
