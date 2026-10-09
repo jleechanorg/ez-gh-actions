@@ -3,7 +3,7 @@
 # accumulate in /private/tmp/worldarchitect.ai/ and /private/tmp/wa-missions/ (or /tmp equivalents).
 #
 # Background:
-#   Each `ez-mac-runner-b-*` self-hosted GitHub Actions runner spawns a fresh
+#   Each `ez-mac-runner-g-*` self-hosted GitHub Actions runner spawns a fresh
 #   worktree + writes app.log / llm_forensics.jsonl / per-task scratch under
 #   /private/tmp/<project-name>/. The runner image does not clean up after
 #   itself; with `count = 6` configured runners, ~25 GB accumulates in days.
@@ -12,7 +12,7 @@
 #   - Only targets known mission output directories and prefixes (no user dirs touched)
 #   - Only removes subdirs whose mtime is >= MIN_AGE_HOURS (default 48h)
 #   - Skips subdirs whose name matches an active ezgha-runner marker
-#     (ez-mac-runner-b-*, wf_*, wa-*)
+#     (ez-mac-runner-g-*, ez-mac-runner-b-*, wf_*, wa-*)
 #   - Skips subdirs that have open file handles (lsof)
 #   - Default DRY-RUN, --apply to actually remove
 #   - Logs every action to ~/.local/state/ezgha/mission-output-cleanup.log
@@ -76,6 +76,7 @@ done
 # (an active runner's worktree) and NEVER removed. Adjust here if you add
 # new runner name patterns.
 ACTIVE_PREFIXES=(
+  "ez-mac-runner-g"
   "ez-mac-runner-b"
   "wf_"
   "wa-"

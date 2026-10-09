@@ -4,8 +4,8 @@ Easy **isolated** self-hosted GitHub Actions runners. One Rust binary that:
 
 - runs each job in a **fresh ephemeral runner** (GitHub JIT registration — one job, then
   the runner deregisters and its container is removed),
-- applies **hard resource limits** (memory, CPUs, PIDs) so a runaway job can't take the
-  host down,
+- applies **hard resource limits** (memory, CPUs, PIDs) to bound an individual job's
+  container; aggregate limits and the outer VM bound the fleet,
 - **prefers the strongest isolation the host can deliver** (VM backends on the roadmap;
   Docker and Docker+sysbox today) and **fails closed** when policy demands more than
   the host offers,
@@ -15,6 +15,106 @@ Easy **isolated** self-hosted GitHub Actions runners. One Rust binary that:
 The full design — including the 32-agent adversarial review that shaped v1 — lives in
 [DESIGN.md](DESIGN.md). A static architecture diagram is at
 [`docs/architecture.svg`](docs/architecture.svg).
+
+## Completed-job workspace cleanup
+
+The custom runner image configures GitHub's
+[`ACTIONS_RUNNER_HOOK_JOB_COMPLETED`](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/run-scripts)
+hook. After workflow steps and action post steps (including cache uploads), it
+empties the completed job's `/home/runner/_work/<repo>/*` pipeline directory
+(including its default `<repo>/<repo>` checkout and custom sibling checkouts)
+and transient `_actions`, `_temp`, and `_tool` contents. This reclaims the
+per-runner host-mounted workspace before a replacement runner is scheduled,
+including when a slot remains idle. The existing ephemeral container removal
+and next-start workspace preparation are unchanged.
+
+The hook requires a matching ephemeral `.runner` identity, `_work` configuration,
+job context, and the exact default workspace layout. It fails closed on unknown
+ownership or symlinked workspace ancestors. Other repositories' pipeline trees,
+`_PipelineMapping`,
+runner installation/configuration (`.runner`, `.credentials*`, `.env`, `.path`,
+`config.sh`, binaries), `_diag`, shared pip caches, and wheelhouses are preserved.
+No diagnostics cap is introduced. The hook's `_temp/_runner_file_commands` and
+`_temp/_github_workflow` bookkeeping remains until the runner finishes processing
+its hook. Target roots are kept, including the existing tmpfs cache mounts.
+
+Deletion uses directory-relative file descriptors without following symlinks;
+descriptor mount IDs preserve nested mounts, including renamed or newly added
+same-filesystem bind mounts. Missing mount identity fails closed. Only the
+three known cache roots may be emptied when mounted as tmpfs. Other mounted
+cache/checkout paths are retained. A nondefault `RUNNER_TOOL_CACHE` is left alone.
+The root and deletion scope cannot be broadened through environment variables.
+This hook is for the image's one-job-per-runner layout, not a shared-workspace
+janitor; arbitrary custom pipeline layouts and other repositories' workspaces are
+deliberately outside its scope.
+
+Cleanup runs as the existing runner user, without elevated privileges, permission
+changes, Docker/VM operations, or service restarts. Failures/permissions leave a
+`partial` or `skipped` message in the job's **Complete runner** log rather than
+changing the workflow result. The synchronous hook has a 60-second budget, then
+up to five seconds before forced termination of its cleanup process only. Large
+or inaccessible trees can remain partially populated; the budget is a bound,
+not a claim that all production workspace sizes have been measured. Hard-killed
+containers may never invoke the hook and still rely on existing lifecycle cleanup.
+
+Hermetic regression coverage (temporary directories only; no Docker or live fleet):
+
+```bash
+python3 -m unittest tests/runner_post_job_workspace_prune_test.py
+```
+
+The tests exercise cleanup and the shell hook with a fixture installation, plus
+image/CI wiring. Building the updated image and validating a real job remain
+separate deploy-owner checks; a code change alone does not update running images.
+
+## Host-survival failure ladder (Jeff-Ubuntu)
+
+The production capacity contract is **20 Linux runners plus 4 Mac runners**; the explicit 14-runner and 10-runner Linux profiles remain available for rollback.
+Any observed Linux shortfall is a live failure, not a reduced contract, and the
+host-survival verdict remains **FAIL** until the live criteria in the
+[Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md) pass together.
+
+Containment is an ordered recovery policy, not a literal proof that a container or VM
+can never affect the physical host:
+
+| Failure scope | Owner | Response |
+|---|---|---|
+| Job | Runner/container limits | Fail the job or container first. |
+| Repeated slot start failures | `ezgha` persistent circuit ledger | Open only that slot's circuit; other eligible slots continue. |
+| Several open slot circuits | `ezgha` admission policy | Pause new admissions; existing jobs are not force-stopped. |
+| Sustained host pressure after admission closes | `ezgha` admission policy and finite cgroups | Stop admitting work; let individual jobs/containers fail within their limits. |
+| VM failure | VM supervisor and operator | Contain the failure to the VM; automated runner code does not control physical-host lifecycle. |
+| Physical host | Operator only | No repository automation may restart, shut down, or deliberately panic the host. |
+
+The daemon retains its existing bounded ability to **start** an unreachable Docker/Colima
+backend after a genuine reachability failure. Admission pauses and local runner-start
+failures do not enter that recovery path. Automated recovery ends at child boundaries;
+stopping the VM or changing physical-host lifecycle state requires an operator.
+
+The still-open live gaps are whole-home 9p/virtfs, removal of boot-enabled host-lifecycle
+automation and panic auto-recovery settings, one armed crashkernel with kdump loaded on
+the current boot, and stable proof of all 20 Linux slots executing. Repository checks
+document the intended controls; they do not close those live gaps.
+
+## Linux HostDocker crash containment
+
+On Linux hosts with at least 32 CPUs and enough RAM for the 55-GiB hard-limit
+budget plus max(2 GiB, 10% of MemTotal) reserve, `install.sh` activates the tracked
+containment policy before starting the runner service. System policy installation
+requires administrator authentication. The runner fleet uses `actions.slice`
+with a 26-GiB memory high watermark, a 28-GiB hard limit, zero swap, 8,000 tasks,
+and a 20-CPU aggregate quota. The VM, agent, and automation slices have separate 10-GiB,
+12-GiB, and 5-GiB hard limits. Broad desktop/user slices are removed from direct OOMD
+pressure targeting; individual workload limits remain enforced by the kernel.
+
+Activation checks current workload usage before lowering limits, and does not
+restart the desktop or Docker. Conflicting local unlimited overrides must be
+resolved before activation can pass. The daemon checks effective containment
+before admitting Linux host work; merely installing unit files is insufficient.
+The read-only `scripts/host/assert-host-containment-release1.sh` verifies policy;
+its `--require-fleet` option additionally verifies all twenty runner PIDs belong to
+the aggregate slice. These controls contain resource exhaustion; they do not
+prove immunity to kernel, driver, hardware, or power failures.
 
 ## How isolation works
 
@@ -112,8 +212,9 @@ that is the point of composing them.
   removed by `--rm` on exit.
 - **What enforces isolation**:
   - **Linux cgroups** — hard ceilings on memory (`--memory` + `--memory-swap`),
-    CPU (`--cpus`), and process count (`--pids-limit`). A runaway job dies inside
-    its cgroup; the host can't be OOM-killed by a single job.
+    CPU (`--cpus`), and process count (`--pids-limit`). A runaway job is constrained
+    to its cgroup budget; that budget is necessary but not by itself a host-survival
+    proof.
   - **Linux namespaces** — PID, mount, network, UTS, IPC, user. The runner sees
     only its own processes, mounts, hostname, network namespace.
   - **`--security-opt no-new-privileges`** — blocks setuid binaries and capability
@@ -165,8 +266,9 @@ that is the point of composing them.
     directly; they would first need to break out of the VM (a much harder,
     rarer, and more-researched class of bug).
   - **VM resource limits** — the hypervisor can cap VM RAM, vCPUs, and disk.
-    The container cannot exhaust the host's resources; it can only exhaust
-    the VM's quota.
+    With finite, correctly applied outer limits this bounds the guest's direct
+    allocation, but it does not prove all host-side effects are contained (for
+    example, shared 9p/page-cache behavior still needs live verification).
   - **VM network isolation** — the VM's network is bridged or NAT'd through
     the host. A container cannot bind to the host's IP directly.
 - **Detection by `ezgha`**: `ezgha doctor` (and `init`) compares the daemon's
@@ -178,9 +280,9 @@ that is the point of composing them.
   This is how `ezgha` automatically satisfies `policy.minimum_isolation = "vm"`
   without you having to wire it up manually.
 - **What it does NOT enforce**: VM escape is a real (rare) attack class.
-  `ezgha` does not claim VM-escape immunity; it claims the **host blast-radius**
-  is bounded by the VM (at worst, the attacker reaches the VM's userspace, not
-  your host kernel).
+  `ezgha` does not claim VM-escape immunity or a literal host-survival guarantee.
+  The VM is an additional boundary whose effectiveness depends on the deployed
+  hypervisor limits, mounts, and host controls.
 - **Configuration knobs**: standard Colima/Lima/QEMU config; `ezgha` only needs
   the docker daemon reachable.
 
@@ -360,12 +462,12 @@ policy violation is a hard error (fail closed).
 
 **Daemon-in-VM reclassification.** For `policy.minimum_isolation = "vm"`, a Docker
 backend counts as VM-grade containment when the daemon itself runs inside a VM — the
-common desktop/dev setups (Colima, Lima, Docker Desktop) — because the host blast
-radius is then bounded by the VM, not just the cgroup. We detect this by comparing the
+common desktop/dev setups (Colima, Lima, Docker Desktop) — because it adds a VM
+boundary beyond the cgroup. We detect this by comparing the
 daemon's kernel (`docker info`) against the host kernel (`uname`): a mismatch means
 containers execute against a different kernel, i.e. inside a VM. Per-job isolation is
-still container-grade in this case; the guarantee the policy makes is **host blast
-radius**. A bare-metal Docker daemon (kernels match) stays container-tier and is
+still container-grade in this case; this policy classification is not a live
+host-survival proof. A bare-metal Docker daemon (kernels match) stays container-tier and is
 **refused** under a `vm` policy, so the fail-closed contract holds on Linux servers
 where Docker shares the host kernel.
 

@@ -12,36 +12,20 @@ This skill drives the **doctor-runner** script that ships at the repo root, plus
 - "the runners are not up" / "ezgha is broken" / "GitHub Actions isn't taking tasks"
 - service showing `failed (Result 'exit-code')`
 - journal full of `ensure_count failed (will retry): … runner with the name already exists`
-- worldarchitect.ai fleet page shows fewer than 16 `ez-org-runner-*` runners online
+- worldarchitect.ai fleet page shows fewer than 14 `ez-org-runner-*` runners online
 
-## Step 0 — Mac host: check ALL FIVE layers (2026-07-14 outage lesson)
+## Step 0 — Mac host: check all four runner layers
 
 On the Mac, "runners down" is usually SEVERAL stacked causes — each masks the
 next, so never stop at the first fix. Check every layer, in order (memory:
 `mac-fleet-outage-causal-chain-2026-07-14`).
-
-> ⚠️ **RUN THESE TWO COMMANDS FIRST on any Mac fleet-down symptom — they take 5s and surface the
-> #1 recurring harness-layer-present-but-broken failure** (bead `jleechan-xlo7`,
-> recurred 2026-07-14 → 2026-07-29):
->
-> ```bash
-> plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist | grep ProgramArguments.1
-> grep -c ensure_runner_image ~/.local/libexec/ezgha/ezgha-fleet-watchdog.sh
-> ```
->
-> **Healthy:** `ProgramArguments.1` is `~/.local/libexec/ezgha/ezgha-fleet-watchdog.sh` AND
-> `grep` returns `≥1`. **Drift:** if `ProgramArguments.1` contains `worldarchitect.ai`, `worktree`,
-> or a repo path — the deployed watchdog is an OLDER copy that doesn't have the image-heal function,
-> and restart-loops the daemon without ever rebuilding `ezgha-runner:latest`. Fix: re-run
-> `./install.sh` to regenerate the plist. The same applies to other launchd agents — any
-> `ProgramArguments[1]` pointing outside `~/.local/libexec/ezgha/` is a drift defect.
 
 1. **VM state — BOTH lima homes**: `colima list` (profile home `~/.colima`)
    AND `limactl list` (home `~/.lima`) — two independent instances exist and
    have fought each other (dual-Lima convergence: bead ez-gh-actions-apye).
    A stale-state start failure ("vz driver is running but host agent is not"
    / "already running, ignoring") needs a force-stop + restart cycle —
-   deploy-owner only (`.claude/hooks/vm-lifecycle-guard.sh` blocks it otherwise).
+   deploy-owner only (CLAUDE.md "VM/backend lifecycle is deploy-owner-only").
 2. **Daemon socket wiring**: `/var/run/docker.sock` may be a dead symlink.
    Check the plist: `plutil -p ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist`
    → `EnvironmentVariables.DOCKER_HOST` must point at the RUNNING VM's socket
@@ -60,16 +44,6 @@ next, so never stop at the first fix. Check every layer, in order (memory:
    idle deletes it (in-use images survive, the idle runner image does not).
    Rebuild: `docker build -f Dockerfile.runner -t ezgha-runner:latest .`
    Bead jleechan-kobt.
-5. **Watchdog reality check**: the deployed watchdog may be a divergent copy
-   (2026-07-14 + 2026-07-29: plist invoked an old 221-line script from another
-   repo that only LOGS its remediation, restart-looping without ever calling
-   `ensure_runner_image`). See the bolded callout above — `plutil ProgramArguments.1`
-   + `grep ensure_runner_image` is the 5-second verification. As of 2026-07-29,
-   the watchdog itself does a startup self-check (exits 78 on drift), so a
-   drift event also surfaces as `WATCHDOG PLIST DRIFT` in
-   `~/Library/Logs/ezgha-watchdog-launchd.log` instead of going silent.
-   Beads jleechan-yib3, jleechan-xlo7.
-
 Per-slot end-state proof after recovery: `docker top <c> | grep -E 'Runner\.(Listener|Worker)'`
 for every container — ephemeral churn (containers seconds old, Worker already
 present) is HEALTHY under queue backlog.
@@ -83,7 +57,7 @@ bash "$(git rev-parse --show-toplevel)/doctor-runner --prove"  # + live canary: 
 
 Read the verdict AND the exit code. `--prove` is the strongest evidence — it
 dispatches a fresh `ezgha-selftest` and confirms `runner_name` is
-`configured prefix (e.g. `ez-mac-runner-b-*`, `ez-runner-b-*`) with `conclusion=success`. The gate also checks a
+`configured prefix (e.g. `ez-mac-runner-g-*`, `ez-runner-c-*`) with `conclusion=success`. The gate also checks a
 real-execution proof (≥1 of the last 6 runs succeeded on our fleet) and a
 time-windowed error count (last 3 min, not last 200 lines — a since-recovered
 incident won't keep it red). If `fleet healthy` and exit 0, you're done — stop.
@@ -91,9 +65,9 @@ If `fleet unhealthy`, continue. **Never restart-loop the service** — see
 `docs/harness-early-victory-5whys.md`. **Before any `systemctl --user restart
 ezgha.service`, check `uptime` (1-min load) and `docker ps --filter
 label=ezgha=managed | wc -l` (container count) — skip the restart if load_1min
-> 12 or live containers are below 75% of configured capacity (fewer than 8
-> on the 10-runner Linux host), since a mass cold respawn has twice tripped this
-host's watchdog (`max-load-1 = 24`) into a full reboot on 2026-07-07.**
+> 12 or live containers are below 75% of configured capacity (fewer than 11
+> on the default 14-runner Linux host; use fewer than 8 when the explicit 10-runner rollback profile is selected, because a mass cold respawn increases pressure
+> and can interrupt in-flight registrations and operator sessions.**
 
 
 
@@ -145,7 +119,7 @@ The doctor groups failures into 10 sections (9 legacy + section 10 explicit-work
    ```
    (This is the standard reset; slot-recon PR shipped with v0.1.x makes the loop self-heal.)
 5. **GitHub org runner fleet** — `ez-org-runner-N` should all be `online` at GitHub. If only some: see "Missing daemon, runner alive" below.
-6. **live docker containers** — all configured containers should be present: 10/10 on Linux or 6/6 on Mac, with the `ezgha=managed` label.
+6. **live docker containers** — all configured containers should be present: 14/14 on Linux or 6/6 on Mac, with the `ezgha=managed` label.
 9. **per-slot local execution proof** — see "Step 2b" below. This is the ironclad, GitHub-API-independent enforcement of "N/N runners actually executing."
 
 ### Step 2b — Per-slot activity truth (section 9, ironclad gate)
@@ -154,7 +128,7 @@ Sections 5/6 ("online" at GitHub, container count) can both be **fooled by a
 GitHub API rate limit** — "online"/"busy" flags go stale or the query itself
 fails, and container *count* alone can't tell idle apart from executing. A
 naive `docker logs | grep "Listening for Jobs"` check is worse: it reads a
-fully-busy fleet as 0/16 healthy, because an EXECUTING runner doesn't print
+fully-busy fleet as 0/20 healthy, because an EXECUTING runner doesn't print
 that line while it's running a job (observed 2026-07-09: 0/19 "listening"
 while 9 jobs were in_progress — the motivating defect for this section).
 
@@ -174,7 +148,7 @@ four states:
 - **IDLE-OK** — idle, and either nothing is queued or the queue has been
   non-empty for less than the threshold. Healthy, not a defect.
 - **EXECUTING** — `Runner.Worker` present. This is the actual per-slot proof
-  the mission's "16/16 executing" standard requires. Section 10 attributes
+  the mission's "20/20 executing" standard requires. Section 10 attributes
   each EXECUTING slot to a real job (name + repo + elapsed + run URL) via
   the GitHub **jobs** API (`runs/{id}/jobs`, matched on `runner_name`) — the
   workflow-run object itself has no `runner_id`/`runner_name` field, so a
@@ -194,7 +168,7 @@ that adds a new `github::api_json(...)` call in that path (instead of
 `api_json_until`) would silently reopen the starvation hole.
 
 Env overrides: `MAC_HOST` (default `macbook`), `MAC_RUNNER_NAME_PREFIX`
-(default `ez-mac-runner-b`), `MAC_RUNNER_COUNT` (default `6`),
+(default: read from the Mac's config.toml), `MAC_RUNNER_COUNT` (default: read from config; the 6-runner contract is the floor),
 `STARVE_WINDOW` (minutes, default `10`), `STARVE_GAP_WARN_SECONDS`
 (default `150`).
 
@@ -231,9 +205,9 @@ Some deletes return 422 ("Runner X is currently running a job and cannot be dele
 
 ezgha v0.1.x: this used to be permanent. With slot-recon merged, the loop self-heals as long as you let ezgha run. The 409 just means "this slot name already exists on GitHub"; once the existing daemon dies or its job completes, the next call to `release_stale_slots` will free the local slot. **Wait 60-120 s; do NOT keep restarting ezgha, that just amplifies the noise.**
 
-### "All 16 are busy and I can't delete them"
+### "All 20 are busy and I can't delete them"
 
-This is the GOOD state during a CI wave. Wait for worldarchitect's jobs to drain. doctor-runner exit code 1 here is misleading; the real signal is in section 5 (all 16 `ez-org-runner-N` listed as `online`).
+This is the GOOD state during a CI wave. Wait for worldarchitect's jobs to drain. doctor-runner exit code 1 here is misleading; the real signal is in section 5 (all 20 `ez-org-runner-N` listed as `online`).
 
 ## Step 4 — Verify health
 
@@ -254,7 +228,7 @@ When `doctor-runner` exits 1 **or** queue tail > `QUEUE_TAIL_WARN_MIN` (20m):
 
 1. Invoke `/harness` (read `~/.claude/skills/harness-engineering/SKILL.md`)
 2. Classify: silent degradation | missing validation | repeated manual fix
-3. Check: Is external watchdog masking slot drift? Is systemd unit stale? Are zombie queued runs polluting metrics?
+3. Check: Is a stale supervisor unit masking slot drift? Are zombie queued runs polluting metrics?
 4. Propose durable harness fixes — not just `systemctl restart`
 
 See `docs/harness-early-victory-5whys.md` for why restart-looping is forbidden.
@@ -294,8 +268,8 @@ Do not use interpolated `--body "$payload"` for Markdown content.
 
 ## Important context
 
-- ezgha slots live at `${XDG_CONFIG_HOME:-~/.config}/ezgha/slot_assignments.toml`. The 16-slot capacity is set by `~/.config/ezgha/config.toml` `runner.count`.
-- The colima VM (4-cpu/12GB) is the docker daemon host. Restarting it kills all 16 ezgha containers. Only restart if the VM is in `Stopped` state.
+- ezgha slots live at `${XDG_CONFIG_HOME:-~/.config}/ezgha/slot_assignments.toml`. The 20-slot capacity is set by `~/.config/ezgha/config.toml` `runner.count`.
+- The colima VM (4-cpu/12GB) is the docker daemon host. Restarting it kills all 20 ezgha containers. Only restart if the VM is in `Stopped` state.
 - mac ARM64 `org-runner-mac-*` runners persist independently of this Linux host. WARN-level only; deleting them via API does not stop their macOS hosts from re-registering.
 - For jobs that show `runner_name: "GitHub Actions NNNNNNNN"` (a 10-digit id), that's GitHub-hosted — not ezgha's problem.
 

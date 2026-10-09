@@ -121,19 +121,19 @@ run_case() {
 echo "--- doctor-runner verdict-line summary regression ---"
 OVERALL_PASS=true
 
-# Case (a): 10 local (8 executing + 2 idle, no starvation, matching this
-# repo's current 10-Linux contract) + 6 remote (6 executing, current
-# 6-Mac contract) = 16 configured. The two idle slots are IDLE-OK when the
+# Case (a): 14 local (12 executing + 2 idle, no starvation, matching the
+# current 14-Linux contract) + 6 remote (6 executing, current
+# 6-Mac contract) = 20 configured. The two idle slots are IDLE-OK when the
 # queue is not starved, so the live-slot gate keeps this healthy.
-run_case "local8exec-2idle-remote6exec-bucket-math" \
-  8 2 0 0  6 0 0 0  0 \
-  16 16 14 2 0 0 0 || OVERALL_PASS=false
+run_case "local18exec-2idle-remote4exec-bucket-math" \
+  18 2 0 0  4 0 0 0  0 \
+  24 24 22 2 0 0 0 || OVERALL_PASS=false
 
 # Case (b): same as (a) but starvation present -- the 2 local idle slots
 # must reclassify from idle-ok to idle-starved, not vanish.
-run_case "local8exec-2idle-remote6exec-starved" \
-  8 2 0 0  6 0 0 0  1 \
-  16 16 14 0 2 0 0 || OVERALL_PASS=false
+run_case "local18exec-2idle-remote4exec-starved" \
+  18 2 0 0  4 0 0 0  1 \
+  24 24 22 0 2 0 0 || OVERALL_PASS=false
 
 # Case (c): 2 local DOWN + 1 remote DOWN, 1 local CYCLING (mid-respawn,
 # journal-confirmed). PROVES the fix: cycling is its own bucket, NOT
@@ -145,19 +145,19 @@ run_case "local-2down-1cycling-remote-1down" \
   23 23 16 3 0 3 1 || OVERALL_PASS=false
 
 # Case (d): unreachable-remote regression (P1 #2 from PR #64 cold review).
-# Remote host unreachable -> 6 remote slots are UNPROVEN, so they
-# contribute as DOWN. `configured` must stay at the full 16 (NOT collapse
-# to local-only 10), and `down` must include all 6 unreachable slots.
+# Remote host unreachable -> 4 remote slots are UNPROVEN, so they
+# contribute as DOWN. `configured` must stay at the full 24 (NOT collapse
+# to local-only 20), and `down` must include all 4 unreachable slots.
 # Fleet-capacity numbers match this repo's CURRENT CLAUDE.md contract
-# (10 Linux + 6 Mac = 16), not the prior 16 Linux + 6 Mac = 22 contract.
+# (20 Linux + 4 Mac = 24), not the prior 14 Linux + 6 Mac = 20 contract.
 # This mirrors what doctor-runner now does at the unreachable branch:
 # it synthesizes REMOTE_DOWN_SLOTS entries so the verdict gate sees
 # REMOTE_COUNT down slots. Driving this through compute_verdict_summary
 # directly proves the math doesn't silently lose the unreachable half
 # of the fleet.
-run_case "local-10exec-remote-unreachable-6down" \
-  10 0 0 0  0 0 6 0  0 \
-  16 16 10 0 0 6 0 || OVERALL_PASS=false
+run_case "local-20exec-remote-unreachable-4down" \
+  20 0 0 0  0 0 4 0  0 \
+  24 24 20 0 0 4 0 || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then

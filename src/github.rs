@@ -339,6 +339,23 @@ fn is_transient_json_parse_response(stdout: &str, stderr: &str) -> bool {
     stderr_lower.contains("unexpected end of json input") && matches!(stdout.trim(), "" | "[]")
 }
 
+fn is_transient_network_response(stdout: &str, stderr: &str) -> bool {
+    let lower = format!("{stdout} {stderr}").to_ascii_lowercase();
+    lower.contains("i/o timeout")
+        || lower.contains("tls handshake timeout")
+        || lower.contains("connection reset by peer")
+        || lower.contains("connection refused")
+        || lower.contains("network is unreachable")
+        || lower.contains("context deadline exceeded")
+        || lower.contains("client.timeout exceeded")
+        || lower.contains("unexpected eof")
+        || lower.contains("broken pipe")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+}
+
 fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
     let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -367,6 +384,9 @@ fn classify_retry_delay(out: &std::process::Output) -> Option<Duration> {
         );
     }
     if is_transient_json_parse_response(&stdout, &stderr) {
+        return Some(GH_RETRY_BASE_DELAY);
+    }
+    if is_transient_network_response(&stdout, &stderr) {
         return Some(GH_RETRY_BASE_DELAY);
     }
     None
@@ -2420,6 +2440,29 @@ exit 0
         let delay = classify_retry_delay(&out)
             .expect("empty-body gh JSON parse failures should be retried");
         assert_eq!(delay, GH_RETRY_BASE_DELAY);
+    }
+
+    #[test]
+    fn transient_network_failure_is_retried() {
+        for err_msg in [
+            "Get \"https://api.github.com/...\": dial tcp 172.182.252.137:443: i/o timeout\n",
+            "net/http: TLS handshake timeout\n",
+            "read: connection reset by peer\n",
+            "connect: connection refused\n",
+            "HTTP 502: Bad Gateway\n",
+            "HTTP 503: Service Unavailable\n",
+            "context deadline exceeded\n",
+        ] {
+            let out = std::process::Output {
+                status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+                stdout: Vec::new(),
+                stderr: err_msg.as_bytes().to_vec(),
+            };
+            let delay = classify_retry_delay(&out).unwrap_or_else(|| {
+                panic!("transient network failure should be retried: {err_msg}")
+            });
+            assert_eq!(delay, GH_RETRY_BASE_DELAY);
+        }
     }
 
     #[test]

@@ -1,0 +1,9 @@
+[Unit]
+Description=Trim stale, draft, and superseded GitHub Actions queued runs
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@SCRIPTS_DIR@/trim-queued-runs.sh --apply --min-pr-age-hours 2
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin

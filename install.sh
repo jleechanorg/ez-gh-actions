@@ -1,18 +1,10 @@
 #!/usr/bin/env bash
 # install.sh — install ez-gh-actions (ezgha) and, optionally, its user service.
 # Idempotent, no sudo. Re-run any time to upgrade the binary.
-#   ./install.sh                  install / upgrade ezgha and arm the fleet
-#                                  watchdog by default (ezgha-watchdog.timer on
-#                                  Linux, the launchd watchdog agent on macOS).
-#                                  Restart is enabled (EZGHA_WATCHDOG_ALLOW_RESTART=1).
-#   ./install.sh --without-watchdog  install / upgrade but skip arming the
-#                                  watchdog; on Linux, any drifted-enabled
-#                                  ezgha-watchdog.timer is disabled.
-#   ./install.sh --with-watchdog  explicit opt-in (same as default; kept for
-#                                  backward compatibility)
+#   ./install.sh                  install / upgrade ezgha
 #   ./install.sh --uninstall      remove ezgha + its user service (config left in place)
 #   ./install.sh --dev            bypass production git-state checks (local development)
-# Flags compose, e.g.: ./install.sh --dev --without-watchdog
+# Flags compose, e.g.: ./install.sh --dev
 set -euo pipefail
 
 REPO_URL="https://github.com/jleechanorg/ez-gh-actions"
@@ -24,6 +16,41 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1" >&2; }
 warn() { printf '  \033[33m⚠\033[0m %s\n' "$1" >&2; }
 info() { printf '\033[1m%s\033[0m\n' "$1"; }
 
+# Retired units may remain loaded after their files disappear. Attempt both
+# shutdown operations independently, then require known-safe runtime states
+# for both units before their artifacts are removed.
+retire_user_units() {
+  local label="$1" timer="$2" service="$3" unit state state_rc enabled_state enabled_rc unsafe=0
+  systemctl --user disable --now "${timer}" 2>/dev/null || true
+  systemctl --user stop "${service}" 2>/dev/null || true
+  enabled_rc=0
+  enabled_state=$(systemctl --user is-enabled "${timer}" 2>&1) || enabled_rc=$?
+  case "${enabled_state}" in
+    enabled|enabled-runtime)
+      bad "refusing to remove ${label} files: ${timer} is-enabled rc=${enabled_rc}, output=${enabled_state}"
+      unsafe=1
+      ;;
+    not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+    disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+    *)
+      bad "refusing to remove ${label} files: could not determine ${timer} enabled state rc=${enabled_rc}, output=${enabled_state:-<unavailable>}"
+      unsafe=1
+      ;;
+  esac
+  for unit in "${timer}" "${service}"; do
+    state_rc=0
+    state=$(systemctl --user is-active "${unit}" 2>&1) || state_rc=$?
+    case "${state}" in
+      inactive|failed|not-found) ;;
+      *)
+        bad "refusing to remove ${label} files: ${unit} is-active rc=${state_rc}, output=${state:-<unavailable>}"
+        unsafe=1
+        ;;
+    esac
+  done
+  [ "${unsafe}" -eq 0 ]
+}
+
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,7 +60,12 @@ uninstall() {
   info "Uninstalling ${BIN}"
   if command -v systemctl >/dev/null 2>&1; then
     systemctl --user disable --now ezgha.service 2>/dev/null || true
-    rm -f "${HOME}/.config/systemd/user/ezgha.service"
+    # This oneshot is enabled under lima-vm@colima.service and reapplies
+    # runtime QEMU limits whenever Colima starts. Remove its enablement and
+    # unit on uninstall so ezgha leaves no host-control policy behind.
+    systemctl --user disable --now lima-vm-cpu-ceiling.service 2>/dev/null || true
+    rm -f "${HOME}/.config/systemd/user/ezgha.service" \
+          "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service"
     systemctl --user daemon-reload 2>/dev/null || true
     ok "systemd --user service removed"
   fi
@@ -55,7 +87,7 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper watchdog runner-dashboard colima-trim mission-output-cleanup"
+  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -65,6 +97,47 @@ uninstall() {
     done
     systemctl --user daemon-reload 2>/dev/null || true
   fi
+
+  # Restore agent CLI entry points that were replaced by scoped wrappers.
+  # Backups live under libexec so uninstall must restore them before removing
+  # that directory.
+  for agent in codex claude gemini cursor aider cody; do
+    wrapper="${HOME}/.local/bin/${agent}"
+    backup="${HOME}/.local/libexec/ezgha/wrapper-backups/${agent}"
+    if [ -f "${wrapper}" ] && grep -q '^# ezgha-agent-wrapper$' "${wrapper}"; then
+      rm -f "${wrapper}"
+      if [ -e "${backup}" ] || [ -L "${backup}" ]; then
+        mv "${backup}" "${wrapper}"
+      fi
+    fi
+  done
+  for unit in agent-scope-reaper.timer psi-oom-watcher.timer; do
+    systemctl --user disable --now "${unit}" 2>/dev/null || true
+  done
+  rm -f "${HOME}/.config/systemd/user/agent-scope-reaper.service" \
+        "${HOME}/.config/systemd/user/agent-scope-reaper.timer" \
+        "${HOME}/.config/systemd/user/psi-oom-watcher.service" \
+        "${HOME}/.config/systemd/user/psi-oom-watcher.timer" \
+        "${HOME}/.config/systemd/user/app-lima-vm.slice" \
+        "${HOME}/.config/systemd/user/agents.slice" \
+        "${HOME}/.config/systemd/user/automation.slice"
+  rm -f "${HOME}/.config/systemd/user/ao-daemon.service.d/20-automation-slice.conf" \
+        "${HOME}/.config/systemd/user/ao-orchestrator.service.d/20-automation-slice.conf" \
+        "${HOME}/.config/systemd/user/ai.dark-factory.daemon.service.d/20-automation-slice.conf" \
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+        "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+        "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+  rm -f "${HOME}/.local/bin/watchdog-load-repair.sh"
+  # Remove only the persistent guest unit. Do not stop the active slice here:
+  # existing runner containers may still be attached while uninstall drains.
+  if command -v limactl >/dev/null 2>&1; then
+    if limactl shell colima -- sudo -n rm -f /etc/systemd/system/actions.slice >/dev/null 2>&1; then
+      limactl shell colima -- sudo -n systemctl daemon-reload >/dev/null 2>&1 || true
+    else
+      warn "could not remove persistent Colima guest actions.slice"
+    fi
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
   if [ "$(uname -s)" = "Darwin" ]; then
     for aux in ${AUX_NAMES}; do
       aux_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-${aux}.plist"
@@ -92,7 +165,6 @@ uninstall() {
 }
 
 DEV_MODE=0
-WITH_WATCHDOG=1
 for arg in "$@"; do
   case "${arg}" in
     --uninstall|-u)
@@ -101,11 +173,8 @@ for arg in "$@"; do
     --dev|-d)
       DEV_MODE=1
       ;;
-    --with-watchdog)
-      WITH_WATCHDOG=1
-      ;;
-    --without-watchdog)
-      WITH_WATCHDOG=0
+    --with-watchdog|--without-watchdog)
+      : # deprecated / removed flags
       ;;
     *)
       : # ignore unrecognized args (back-compat with prior permissive parsing)
@@ -116,6 +185,48 @@ done
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
+CONFIG_PATH="${CONFIG_DIR}/config.toml"
+
+# Host containment has a bounded profile selector. The selected Linux profile is
+# read only after Docker is classified as native host Docker, so VM-contained
+# daemons do not need a host containment profile. A missing config is the
+# first-install case and uses the current default of 14; a present config must
+# explicitly contain a valid bounded runner.count so rollback cannot be hidden.
+read_config_runner_count() {
+  local config_path="$1"
+  if [ ! -f "${config_path}" ]; then
+    printf '14\n'
+    return 0
+  fi
+  python3 - "${config_path}" <<'PYCFG'
+import sys
+
+path = sys.argv[1]
+try:
+    try:
+        import tomllib
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except ModuleNotFoundError:
+        import toml
+        data = toml.load(path)
+except (ImportError, ModuleNotFoundError, OSError, TypeError, ValueError):
+    print("invalid")
+    raise SystemExit(0)
+runner = data.get("runner")
+if not isinstance(runner, dict) or "count" not in runner:
+    print("invalid")
+else:
+    value = runner["count"]
+    if isinstance(value, bool) or not isinstance(value, int):
+        print("invalid")
+    else:
+        print(value)
+PYCFG
+}
+
+RUNNER_COUNT=20
+
 LOCK_FILE="${CONFIG_DIR}/deploy.lock"
 
 exec 9>"${LOCK_FILE}"
@@ -245,6 +356,13 @@ fi
 #      or has no ha.sock — same root cause, the _lima dir was wiped
 #      by hand or by another tool, but a stale 'colima' instance record
 #      is still registered with limactl.
+is_socket_alive() {
+  # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
+  local sock="$1"
+  [ -S "$sock" ] || return 1
+  env -u DOCKER_CONTEXT DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
+}
+
 ensure_colima_docker_daemon() {
   # Only relevant on macOS where Colima is the docker host.
   [ "$(uname -s)" = "Darwin" ] || return 0
@@ -297,20 +415,16 @@ ensure_colima_docker_daemon() {
 }
 ensure_colima_docker_daemon || true
 DOCKER_HOST_OVERRIDE=""
-# Strategy 1: trust the active docker context
-DOCKER_CTX_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+# Resolve the Docker endpoint selected by the current shell into the explicit
+# value persisted for the service and reused by every build and runner mutation.
+# The host-mode helper owns endpoint precedence and validates the selected owner.
+DOCKER_CTX_HOST="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+  || { bad "cannot resolve selected Docker endpoint"; exit 1; }
 # Strategy 2: probe colima's default location
 DOCKER_COLIMA_SOCK="${HOME}/.colima/default/docker.sock"
 # Strategy 3: probe docker desktop's socket
 DOCKER_DESKTOP_SOCK="${HOME}/.docker/run/docker.sock"
 DOCKER_DEFAULT_SOCK="/var/run/docker.sock"
-
-is_socket_alive() {
-  # Returns 0 if $1 is a unix socket that responds to docker ping; non-zero otherwise.
-  local sock="$1"
-  [ -S "$sock" ] || return 1
-  DOCKER_HOST="unix://$sock" docker version >/dev/null 2>&1
-}
 
 if [ -n "$DOCKER_CTX_HOST" ] && [ "$DOCKER_CTX_HOST" != "unix://$DOCKER_DEFAULT_SOCK" ]; then
   # Active docker context already points at a non-default socket — export it
@@ -329,7 +443,7 @@ fi
 export DOCKER_HOST_OVERRIDE
 
 if command -v docker >/dev/null 2>&1; then
-  if [ -n "${DOCKER_HOST_OVERRIDE}" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" docker version >/dev/null 2>&1; then
+  if [ -n "${DOCKER_HOST_OVERRIDE}" ] && env -u DOCKER_CONTEXT DOCKER_HOST="${DOCKER_HOST_OVERRIDE}" docker version >/dev/null 2>&1; then
     ok "docker daemon reachable via ${DOCKER_HOST_OVERRIDE}"
   elif [ -z "${DOCKER_HOST_OVERRIDE}" ] && docker version >/dev/null 2>&1; then
     ok "docker daemon reachable"
@@ -364,6 +478,103 @@ if ! cargo test >/dev/null 2>&1; then
 fi
 ok "All tests passed"
 
+# A Linux daemon that shares this kernel needs the host aggregate boundary
+# before replacing the binary, building an image, or starting the service.
+HOST_DOCKER_MODE=0
+if [ "$(uname -s)" = "Linux" ]; then
+  docker_endpoint="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}"
+  docker_mode="$("${SCRIPT_DIR}/scripts/host/docker-host-mode.sh" "${docker_endpoint}")"     || { bad "cannot classify selected Docker endpoint"; exit 1; }
+  if [ "${docker_mode}" = host-docker ]; then
+    HOST_DOCKER_MODE=1
+    # The guest-admission drop-ins run under systemd's minimal PATH, so bind
+    # them to the same absolute limactl this installer uses for admission.
+    LIMACTL_BIN="$(command -v limactl || true)"
+    case "${LIMACTL_BIN}" in
+      /*) ;;
+      *) bad "host-docker guest admission requires limactl on PATH"; exit 1 ;;
+    esac
+    case "${LIMACTL_BIN}" in
+      *[[:space:]%\\\"\|]*) bad "limactl path is not safe for a systemd drop-in: ${LIMACTL_BIN}"; exit 1 ;;
+    esac
+    export LIMACTL="${LIMACTL_BIN}"
+    RUNNER_COUNT="$(read_config_runner_count "${CONFIG_PATH}")" || {
+      bad "could not read runner.count from ${CONFIG_PATH}"
+      exit 1
+    }
+    case "${RUNNER_COUNT}" in
+      10|14|20) ;;
+      *)
+        bad "runner.count must be 10, 14, or 20 on Linux (got ${RUNNER_COUNT})"
+        exit 1
+        ;;
+    esac
+    # Host Docker keeps runners under actions.slice and sets the Colima guest
+    # to an 8GiB allocation. lima-vm@colima starts from this lima.yaml; the
+    # 10G QEMU ceiling remains refused until the running guest matches.
+    lima_yaml="${LIMA_YAML:-$("${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" --print-yaml)}" || {
+      bad "cannot resolve the active Lima instance configuration"; exit 1;
+    }
+    if [ -n "${lima_yaml}" ] && [ ! -f "${lima_yaml}" ]; then
+      bad "active Lima configuration is missing: ${lima_yaml}"; exit 1
+    fi
+    if [ -n "${lima_yaml}" ] && ! grep -qx 'memory: "8GiB"' "${lima_yaml}"; then
+      if grep -q '^memory:' "${lima_yaml}"; then
+        sed -i 's/^memory: .*/memory: "8GiB"/' "${lima_yaml}"
+      else
+        printf 'memory: "8GiB"\n' >> "${lima_yaml}"
+      fi
+      warn "colima guest memory set to 8GiB in ${lima_yaml}; it takes effect after one VM restart"
+    fi
+    HOST_CONTROL_DIR="${HOME}/.local/libexec/ezgha"
+    HOST_POLICY_DIR="${HOST_CONTROL_DIR}/host-containment-policy"
+    mkdir -p "${HOST_CONTROL_DIR}" \
+      "${HOST_POLICY_DIR}/systemd/host/-.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/host/user.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/host/user-.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/host/user@.service.d" \
+      "${HOST_POLICY_DIR}/systemd/user/app.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/user/session.slice.d" \
+      "${HOST_POLICY_DIR}/systemd/lima-vm@colima.service.d"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/apply-host-containment-release1.sh" "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/assert-host-containment-release1.sh" "${HOST_CONTROL_DIR}/assert-host-containment-release1.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/qemu-ceiling-guard.sh" "${HOST_CONTROL_DIR}/qemu-ceiling-guard.sh"
+    install -m 0755 "${SCRIPT_DIR}/scripts/host/lima-guest-memory-check.sh" "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh"
+    mkdir -p "${HOME}/.config/systemd/user/lima-vm@colima.service.d" \
+      "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d"
+    for guard_dir in lima-vm@colima.service.d lima-vm-cpu-ceiling.service.d; do
+      guard="${HOME}/.config/systemd/user/${guard_dir}/10-guest-memory-admission.conf"
+      sed -e "s|@LIMACTL@|${LIMACTL_BIN}|g" \
+        "${SCRIPT_DIR}/systemd/host-docker/lima-vm@colima.service.d/10-guest-memory-admission.conf" > "${guard}"
+      grep -qx "Environment=LIMACTL=${LIMACTL_BIN}" "${guard}" && ! grep -q '@[A-Z_]*@' "${guard}" \
+        || { bad "could not render guest admission guard ${guard}"; exit 1; }
+    done
+    systemctl --user daemon-reload || { bad "could not load guest admission guards"; exit 1; }
+    "${HOST_CONTROL_DIR}/lima-guest-memory-check.sh" || {
+      bad "host-docker guest admission failed before host containment activation"; exit 1;
+    }
+    for policy in host/actions.slice host/-.slice.d/99-ezgha-containment.conf host/user.slice.d/99-ezgha-containment.conf host/user-.slice.d/99-ezgha-containment.conf host/user@.service.d/99-ezgha-containment.conf user/app.slice.d/99-ezgha-containment.conf user/session.slice.d/99-ezgha-containment.conf agents.slice automation.slice app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
+      install -m 0644 "${SCRIPT_DIR}/systemd/${policy}" "${HOST_POLICY_DIR}/systemd/${policy}"
+    done
+    if sudo -n true >/dev/null 2>&1; then
+      sudo -n "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
+    elif command -v pkexec >/dev/null 2>&1; then
+      pkexec "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --system-phase --runner-count "${RUNNER_COUNT}"
+    else
+      bad "host containment root phase requires sudo or pkexec"
+      exit 1
+    fi
+    "${HOST_CONTROL_DIR}/apply-host-containment-release1.sh" --runner-count "${RUNNER_COUNT}" || { bad "host containment user phase failed after root policy activation"; exit 1; }
+    ok "host containment activated before binary replacement"
+  else
+    # A previous host-docker installation adds admission guards that enforce
+    # its 8GiB guest contract. VM-backed mode does not use that guest
+    # contract, so remove only those exact guards before installation.
+    rm -f "${HOME}/.config/systemd/user/lima-vm@colima.service.d/10-guest-memory-admission.conf" \
+          "${HOME}/.config/systemd/user/lima-vm-cpu-ceiling.service.d/10-guest-memory-admission.conf"
+    systemctl --user daemon-reload || { bad "could not unload host-docker guest admission guards"; exit 1; }
+  fi
+fi
+
 info "Installing ${BIN}"
 if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/Cargo.toml" ]; then
   cargo install --path "${SCRIPT_DIR}"
@@ -380,7 +591,7 @@ fi
 # so a fresh VM (new machine, `colima delete && colima start`, disk-pressure
 # recreation) has no way to get it back except this step. Idempotent: a
 # no-op rebuild of an unchanged Dockerfile.runner is a fast cache hit.
-if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" docker version >/dev/null 2>&1; then
+if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && env -u DOCKER_CONTEXT DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}" docker version >/dev/null 2>&1; then
   info "Building ezgha-runner:latest from Dockerfile.runner"
   # DOCKER_BUILDKIT=0 (legacy builder): BuildKit's build-context network path
   # hit a reproducible "python3-venv has no installation candidate" apt
@@ -388,7 +599,7 @@ if [ -f "${SCRIPT_DIR}/Dockerfile.runner" ] && DOCKER_HOST="${DOCKER_HOST_OVERRI
   # builder and a plain `docker run ... apt-get install` both succeeded
   # immediately (bead jleechan-bl0n, 2026-07-16). Root cause not fully
   # isolated; defaulting to the legacy builder here is the proven-reliable path.
-  if DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" DOCKER_BUILDKIT=0 \
+  if env -u DOCKER_CONTEXT DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-unix://${DOCKER_DEFAULT_SOCK}}" DOCKER_BUILDKIT=0 \
       docker build -f "${SCRIPT_DIR}/Dockerfile.runner" -t ezgha-runner:latest "${SCRIPT_DIR}" \
       >/tmp/ezgha-runner-build.log 2>&1; then
     ok "ezgha-runner:latest built"
@@ -441,7 +652,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 # ── Auto-install or restart ezgha service if config exists ────────────────────
-CONFIG_PATH="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha/config.toml"
 if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
@@ -461,7 +671,7 @@ if [ -f "${CONFIG_PATH}" ]; then
     else
       info "Installing ezgha service..."
     fi
-    DOCKER_HOST="${DOCKER_HOST_OVERRIDE:-${DOCKER_HOST:-}}" "${CARGO_BIN}/${BIN}" install-service
+    DOCKER_HOST_OVERRIDE="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
     # Drift check (after install-service rewrote the plist from scratch
     # based on the daemon binary's compiled-in template).
     _plist_hash_after=""
@@ -474,40 +684,41 @@ if [ -f "${CONFIG_PATH}" ]; then
     fi
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
-    _unit_path="${HOME}/.config/systemd/user/ezgha.service"
-    _unit_hash_before=""
-    if [ -f "${_unit_path}" ]; then
-      _unit_hash_before="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
-    fi
-    if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
-      info "Restarting systemd service..."
-      systemctl --user restart ezgha.service
-      ok "ezgha service restarted via systemd"
-    else
-      info "Installing ezgha service..."
-      "${CARGO_BIN}/${BIN}" install-service
-      ok "ezgha service installed and started via systemd"
-    fi
-    # Drift check (after install-service rewrote the unit file from scratch).
-    # If the unit file changed AND the service is NOT currently active, the
-    # operator must `systemctl --user daemon-reload` before the next start —
-    # otherwise systemd uses the cached pre-reload unit, defeating the whole
-    # point of regenerating it (this is the production 2026-07-06 lesson).
-    _unit_hash_after=""
-    if [ -f "${_unit_path}" ]; then
-      _unit_hash_after="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
-    fi
-    if [ -n "${_unit_hash_before}" ] && [ -n "${_unit_hash_after}" ] \
-       && [ "${_unit_hash_before}" != "${_unit_hash_after}" ] \
-       && ! systemctl --user is-active ezgha.service >/dev/null 2>&1; then
-      warn "systemd --user unit file changed during install-service and the service is NOT active. Run: systemctl --user daemon-reload && systemctl --user start ezgha.service"
-    fi
+    # Linux containment is activated below before image build or service
+    # lifecycle mutation. This branch deliberately records intent only.
+    LINUX_SERVICE_PENDING=1
   fi
 fi
 
-# ── Install auxiliary systemd / launchd units (watchdog, token-refresh, queue-reaper, dashboard, colima-trim) ─
+if [ "${LINUX_SERVICE_PENDING:-0}" -eq 1 ]; then
+  _unit_path="${HOME}/.config/systemd/user/ezgha.service"
+  _unit_hash_before=""
+  if [ -f "${_unit_path}" ]; then
+    _unit_hash_before="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
+  fi
+  if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+    info "Refreshing systemd service endpoint after containment activation..."
+    DOCKER_HOST_OVERRIDE="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
+    info "Restarting systemd service after containment activation..."
+    systemctl --user restart ezgha.service
+    ok "ezgha service restarted via systemd"
+  else
+    info "Installing ezgha service after containment activation..."
+    "${CARGO_BIN}/${BIN}" install-service
+    ok "ezgha service installed and started via systemd"
+  fi
+  _unit_hash_after=""
+  if [ -f "${_unit_path}" ]; then
+    _unit_hash_after="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
+  fi
+  if [ -n "${_unit_hash_before}" ] && [ -n "${_unit_hash_after}" ] \
+     && [ "${_unit_hash_before}" != "${_unit_hash_after}" ]; then
+    warn "systemd unit changed during install-service; verify daemon-reload before any later start"
+  fi
+fi
+
+# ── Install auxiliary systemd / launchd units (token-refresh, queue-reaper, dashboard, colima-trim) ─
 # These auxiliary units keep the ezgha fleet observable and healthy between deploys:
-#   - ezgha-watchdog:        enforces configured runner count (handles po2 pacing deadlock)
 #   - ezgha-token-refresh:   rotates the GitHub App installation token on a 45min timer
 #                            (prevents the jleechan-wzk 401-on-key-rotation failure)
 #   - ezgha-queue-reaper:    cancels stuck CI runs that exceed the 20min tail threshold
@@ -567,29 +778,12 @@ PLIST
       cat >> "${plist}" <<PLIST
   </array>
 PLIST
-      # EnvironmentVariables: DOCKER_HOST when detected; watchdog always gets
-      # EZGHA_WATCHDOG_ALLOW_RESTART=1 (restart enabled by default).
-      if [ -n "${DOCKER_HOST_OVERRIDE}" ] || [ "${name}" = "watchdog" ]; then
+      # EnvironmentVariables: DOCKER_HOST when detected.
+      if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
         cat >> "${plist}" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
-PLIST
-        if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
-          printf '    <key>DOCKER_HOST</key><string>%s</string>\n' "${DOCKER_HOST_OVERRIDE}" >> "${plist}"
-        fi
-        if [ "${name}" = "watchdog" ]; then
-          printf '    <key>EZGHA_WATCHDOG_ALLOW_RESTART</key><string>1</string>\n' >> "${plist}"
-          # EZGHA_REPO_ROOT: ensure_runner_image() needs to locate
-          # Dockerfile.runner from its deployed libexec path. After the
-          # 2026-07-31 recurrence (load-gated restart, image stays missing
-          # under sustained high host load), this env var is what lets
-          # the unconditional rebuild actually find a Dockerfile. Mirrored
-          # manually on the live plist via `plutil -insert`; doing it here
-          # so the next install.sh run carries it forward instead of
-          # regressing to the load-gated failure mode.
-          printf '    <key>EZGHA_REPO_ROOT</key><string>%s</string>\n' "${SCRIPT_DIR}" >> "${plist}"
-        fi
-        cat >> "${plist}" <<PLIST
+    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>
   </dict>
 PLIST
       fi
@@ -611,16 +805,6 @@ PLIST
         rm -f "${plist}"
         return 1
       fi
-      # Sentinel verification: the deployed watchdog script MUST contain the
-      # image-heal function — without this check, install.sh silently installs
-      # a plist pointing at an older copy of ezgha-fleet-watchdog.sh that has
-      # no ensure_runner_image, which is exactly the 2026-07-14 + 2026-07-29
-      # outage class (bead jleechan-xlo7).
-      if [[ "${name}" == "watchdog" ]] && ! grep -q 'ensure_runner_image' "${exec_path}" 2>/dev/null; then
-        bad "refusing to install ${plist}: ${exec_path} is missing ensure_runner_image sentinel (image-heal class regression; see bead jleechan-xlo7)"
-        rm -f "${plist}"
-        return 1
-      fi
       if ! launchctl load -w "${plist}"; then
         bad "launchctl failed to load ${plist}"
         rm -f "${plist}"
@@ -636,6 +820,7 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
+    install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 2"
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
@@ -690,20 +875,12 @@ FSTRIM_EOF
     else
       info "guest fstrim.timer override skipped — colima not installed or default profile not running"
     fi
-    # Watchdog: armed by default (restart enabled via EZGHA_WATCHDOG_ALLOW_RESTART=1
-    # in install_macos_plist). Pass --without-watchdog to skip arming.
+    # Remove the deleted fleet watchdog (it ran every 120 s with
+    # EZGHA_WATCHDOG_ALLOW_RESTART=1): unload it even if the plist is already
+    # gone, then delete the plist and the stale libexec script.
     watchdog_plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-watchdog.plist"
-    if [ "${WITH_WATCHDOG}" -eq 1 ]; then
-      install_macos_plist "watchdog" "120" "${SCRIPTS_DIR}/ezgha-fleet-watchdog.sh" "--host mac"
-      ok "watchdog armed (restart enabled)"
-    else
-      info "watchdog arming skipped (--without-watchdog)"
-      if [ -f "${watchdog_plist}" ]; then
-        launchctl unload "${watchdog_plist}" 2>/dev/null || true
-        rm -f "${watchdog_plist}"
-        ok "disabled drifted-loaded watchdog plist (--without-watchdog)"
-      fi
-    fi
+    launchctl bootout "gui/$(id -u)/org.jleechanorg.ezgha-watchdog" 2>/dev/null || true
+    rm -f "${watchdog_plist}" "${HOME}/.local/libexec/ezgha/ezgha-fleet-watchdog.sh"
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux: copy the systemd units with @SCRIPTS_DIR@ / @HOME@ placeholders substituted
     USER_UNIT_DIR="${HOME}/.config/systemd/user"
@@ -726,33 +903,180 @@ FSTRIM_EOF
         continue
       fi
     done
-    systemctl --user daemon-reload 2>/dev/null || true
-    for timer in ezgha-token-refresh.timer ezgha-queue-reaper.timer ezgha-mission-output-cleanup.timer; do
+
+
+    # Host-wide reliability controls. Keep executable paths stable and render
+    # all templates from tracked source; no live service or VM is restarted.
+    for script in agent-scoped-launch.sh assert-host-containment-release1.sh apply-host-containment-release1.sh qemu-ceiling-guard.sh lima-guest-memory-check.sh; do
+      source_script="${SCRIPT_DIR}/scripts/host/${script}"
+      [ -f "${source_script}" ] || { bad "missing host control script: ${source_script}"; exit 1; }
+      install -m 0755 "${source_script}" "${SCRIPTS_DIR}/${script}"
+    done
+
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" || {
+      bad "refusing to install QEMU ceiling: live usage exceeds threshold or cgroup is unreadable"
+      exit 1
+    }
+    for unit in app-lima-vm.slice agents.slice automation.slice; do
+      install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
+    done
+    # Host-docker mode also requires the 8GiB guest contract before the 10G
+    # QEMU ceiling is installed; the early containment phase enforced it too.
+    if [ "${HOST_DOCKER_MODE}" -eq 1 ]; then
+      "${SCRIPTS_DIR}/lima-guest-memory-check.sh" || {
+        bad "refusing to install QEMU ceiling: host-docker guest admission failed"
+        exit 1
+      }
+    fi
+    # agent-scope-reaper was deleted (it killed live cursor-agent, bead
+    # ez-gh-actions-8o81): heal any previously installed copy.
+    if ! retire_user_units agent-scope-reaper agent-scope-reaper.timer agent-scope-reaper.service; then
+      exit 1
+    fi
+    rm -f "${USER_UNIT_DIR}/agent-scope-reaper.service" \
+          "${USER_UNIT_DIR}/agent-scope-reaper.timer" \
+          "${SCRIPTS_DIR}/agent-scope-reaper.sh"
+    if ! retire_user_units psi-oom-watcher psi-oom-watcher.timer psi-oom-watcher.service; then
+      exit 1
+    fi
+    rm -f "${USER_UNIT_DIR}/psi-oom-watcher.service" \
+          "${USER_UNIT_DIR}/psi-oom-watcher.timer" \
+          "${USER_UNIT_DIR}/ezgha.service.d/10-oomd-omit.conf"
+
+    for service in ao-daemon ao-orchestrator ai.dark-factory.daemon; do
+      dropin_dir="${USER_UNIT_DIR}/${service}.service.d"
+      mkdir -p "${dropin_dir}"
+      install -m 0644 \
+        "${UNIT_DIR}/${service}.service.d/20-automation-slice.conf" \
+        "${dropin_dir}/20-automation-slice.conf"
+    done
+    mkdir -p "${USER_UNIT_DIR}/lima-vm@colima.service.d"
+    install -m 0644 \
+      "${UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+      "${USER_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf"
+    sed -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+        "${UNIT_DIR}/lima-vm-cpu-ceiling.service" > "${USER_UNIT_DIR}/lima-vm-cpu-ceiling.service"
+
+    # Docker's --cgroup-parent=actions.slice places every runner beneath one
+    # guest aggregate. Install the tracked slice inside Colima so ten
+    # individually bounded containers cannot consume the guest's 4G reserve.
+    guest_actions_slice="${UNIT_DIR}/guest/actions.slice"
+    if command -v limactl >/dev/null 2>&1 && [ -f "${guest_actions_slice}" ]; then
+      if limactl shell colima -- sudo -n tee /etc/systemd/system/actions.slice \
+          < "${guest_actions_slice}" >/dev/null 2>&1; then
+        if limactl shell colima -- sudo -n systemctl daemon-reload >/dev/null 2>&1 &&
+           limactl shell colima -- sudo -n systemctl start actions.slice >/dev/null 2>&1 &&
+           limactl shell colima -- sudo -n systemctl set-property --runtime actions.slice \
+             MemoryHigh=28G MemoryMax=32G MemorySwapMax=0 TasksMax=6000 >/dev/null 2>&1; then
+          ok "Colima guest actions.slice installed and bounded"
+        else
+          warn "guest actions.slice installed but live limits could not be applied"
+        fi
+      else
+        warn "guest actions.slice skipped — colima is unavailable or guest sudo is not passwordless"
+      fi
+    else
+      info "guest actions.slice skipped — limactl or tracked unit unavailable"
+    fi
+    # Remove the superseded 20G agents.slice AO drop-in from earlier releases.
+    rm -f "${USER_UNIT_DIR}/ao-daemon.service.d/memory.conf"
+
+    install_agent_wrapper() {
+      local agent="$1" dest real backup tmp real_q
+      dest="${HOME_DIR}/.local/bin/${agent}"
+      backup="${SCRIPTS_DIR}/wrapper-backups/${agent}"
+      # `type -P` ignores shell functions named codex/claude and returns only
+      # an executable path. `command -v` can return the bare function name,
+      # which readlink then mis-resolves relative to the repo checkout.
+      real="$(type -P "${agent}" 2>/dev/null || true)"
+      [ -n "${real}" ] || return 0
+      mkdir -p "${HOME_DIR}/.local/bin" "${SCRIPTS_DIR}/wrapper-backups"
+      if [ -f "${dest}" ] && grep -q '^# ezgha-agent-wrapper$' "${dest}"; then
+        if [ -e "${backup}" ] || [ -L "${backup}" ]; then
+          real="$(readlink -f "${backup}" 2>/dev/null || true)"
+        else
+          real="$(sed -n 's/^# real-bin: //p' "${dest}" | head -1)"
+        fi
+      else
+        real="$(readlink -f "${real}" 2>/dev/null || printf '%s' "${real}")"
+        if [ -e "${dest}" ] || [ -L "${dest}" ]; then
+          cp -a "${dest}" "${backup}"
+        fi
+      fi
+      [ -n "${real}" ] || { bad "could not resolve real ${agent} binary"; return 1; }
+      printf -v real_q '%q' "${real}"
+      tmp="$(mktemp "${HOME_DIR}/.local/bin/.${agent}.ezgha.XXXXXX")"
+      cat > "${tmp}" <<EOF
+#!/usr/bin/env bash
+# ezgha-agent-wrapper
+# real-bin: ${real}
+REAL_BIN=${real_q}
+exec "\${HOME}/.local/libexec/ezgha/agent-scoped-launch.sh" "${agent}" "\${REAL_BIN}" "\$@"
+EOF
+      chmod 0755 "${tmp}"
+      mv -f "${tmp}" "${dest}"
+    }
+    for agent in codex claude gemini cursor aider cody; do
+      install_agent_wrapper "${agent}"
+    done
+
+    # Remove any historical repair script
+    rm -f "${HOME_DIR}/.local/bin/watchdog-load-repair.sh"
+
+    systemctl --user daemon-reload 2>/dev/null || { bad "could not reload installed user units"; exit 1; }
+    # Reapply the tracked budgets after copying the unit files. A prior
+    # systemctl --user set-property writes user.control drop-ins that survive
+    # unit replacement, so the tracked values must win during every install.
+    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192)
+    AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
+    if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
+      bad "could not apply selected agents.slice budget"
+      exit 1
+    fi
+    if ! systemctl --user set-property automation.slice "${AUTOMATION_SLICE_PROPS[@]}"; then
+      bad "could not apply selected automation.slice budget"
+      exit 1
+    fi
+    # Apply the direct QEMU ceiling to an already-running Colima service.
+    # The tracked drop-in supplies the same values after the next boot; the
+    # runtime property closes the upgrade window without restarting the VM.
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --apply || {
+      bad "failed to apply and verify live QEMU service memory+CPU ceiling"
+      exit 1
+    }
+    if systemctl --user enable --now lima-vm-cpu-ceiling.service 2>/dev/null; then
+      ok "lima-vm-cpu-ceiling.service enabled (reapplies CPUQuota on Colima start)"
+    else
+      bad "lima-vm-cpu-ceiling.service not enabled"
+      exit 1
+    fi
+    for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user timer enabled: ${timer}"
       else
         bad "failed to enable ${timer} (run: systemctl --user status ${timer})"
       fi
     done
-    # ezgha-watchdog.timer: armed by default (restart enabled via
-    # Environment=EZGHA_WATCHDOG_ALLOW_RESTART=1 in ezgha-watchdog.service).
-    # Pass --without-watchdog to skip arming and heal drift.
-    if [ "${WITH_WATCHDOG}" -eq 1 ]; then
-      if systemctl --user enable --now ezgha-watchdog.timer 2>/dev/null; then
-        ok "systemd --user timer enabled: ezgha-watchdog.timer (restart enabled)"
+    # Auxiliary mutation loops are opt-out by policy. Keep their tracked units
+    # installed for manual diagnostics, but heal prior enabled state.
+    for pair in \
+      "ezgha-queue-reaper.timer ezgha-queue-reaper.service" \
+      "ezgha-queue-trimmer.timer ezgha-queue-trimmer.service"; do
+      timer="${pair%% *}"
+      service="${pair#* }"
+      if systemctl --user disable --now "${timer}" 2>/dev/null \
+         && systemctl --user stop "${service}" 2>/dev/null; then
+        ok "systemd --user auxiliary loop disabled: ${timer}"
       else
-        bad "failed to enable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
+        bad "failed to disable auxiliary loop: ${timer} / ${service}"
       fi
-    else
-      info "watchdog arming skipped (--without-watchdog)"
-      if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
-        if systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null; then
-          ok "disabled drifted-enabled ezgha-watchdog.timer (--without-watchdog)"
-        else
-          bad "failed to disable ezgha-watchdog.timer (run: systemctl --user status ezgha-watchdog.timer)"
-        fi
-      fi
+    done
+    # Clean up any drifted or legacy watchdog units
+    if systemctl --user is-enabled ezgha-watchdog.timer >/dev/null 2>&1; then
+      systemctl --user disable --now ezgha-watchdog.timer 2>/dev/null || true
     fi
+    systemctl --user stop ezgha-watchdog.service 2>/dev/null || true
+    rm -f "${USER_UNIT_DIR}/ezgha-watchdog.timer" "${USER_UNIT_DIR}/ezgha-watchdog.service"
   fi
 fi
 
