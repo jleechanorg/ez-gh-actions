@@ -1,0 +1,15 @@
+# automation.slice — finite budget for orchestration automation.
+# measured margin: the approved 5G cap is 3.01 GiB below the observed 8.01 GiB peak.
+# Activation requires usage below 4608M; later growth may throttle or OOM.
+[Unit]
+Description=Automation and dark-factory processes — bounded host budget
+Before=slices.target
+
+[Slice]
+MemoryHigh=4608M
+MemoryMax=5G
+MemorySwapMax=1G
+TasksMax=4096
+MemoryAccounting=yes
+ManagedOOMMemoryPressure=auto
+ManagedOOMSwap=auto

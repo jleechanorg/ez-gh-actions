@@ -2,20 +2,20 @@
 # regression test: when the REMOTE half of the fleet is unreachable via SSH,
 # the verdict must (a) keep `configured` at the FULL expected fleet size
 # (not silently collapse to local-only), (b) count every unreachable slot
-# in the `down` bucket (so the headline reads "10/16 healthy, 6 down"
-# instead of "10/10 healthy"), and (c) flip the verdict from `ok` to
+# in the `down` bucket (so the headline reads "20/24 healthy, 4 down"
+# instead of "20/20 healthy"), and (c) flip the verdict from `ok` to
 # `bad` (an unreachable half of the fleet cannot silently green).
 #
 # P1 #2 from PR #64 cold review: the prior code's unreachable branch
 # left REMOTE_EXECUTING_SLOTS/IDLE_SLOTS/CYCLING_SLOTS/DOWN_SLOTS=()
 # empty, so the call site's `configured = sum(local) + sum(remote)`
 # collapsed to local-only. A Linux run with Mac unreachable reported
-# `fleet healthy: 10/10 healthy: 10 executing ... 0 down` instead of
-# `10/16 healthy: 10 executing ... 6 down`.
+# `fleet healthy: 14/14 healthy: 14 executing ... 0 down` instead of
+# `14/20 healthy: 14 executing ... 6 down`.
 #
 # Fleet-capacity numbers here match this repo's CURRENT CLAUDE.md contract
-# (10 Linux + 6 Mac = 16 total, doctor-runner's DEFAULT_LINUX_RUNNER_COUNT=10
-# / DEFAULT_MAC_RUNNER_COUNT=6), NOT the prior 16 Linux + 6 Mac = 22 contract
+# (20 Linux + 4 Mac = 24 total, doctor-runner's DEFAULT_LINUX_RUNNER_COUNT=20
+# / DEFAULT_MAC_RUNNER_COUNT=4), NOT the prior 16 Linux + 6 Mac = 22 contract
 # this file originally shipped with.
 #
 # This test extracts two real fragments from doctor-runner and exercises
@@ -69,8 +69,8 @@ fi
 
 # --- Assertion 3: end-to-end math via compute_verdict_summary ---
 # Drive the actual function from doctor-runner with the inputs the
-# unreachable branch produces: 10 local EXECUTING (current 10-Linux
-# contract), 0 remote known (all 6 remote Mac slots are unproven ->
+# unreachable branch produces: 20 local EXECUTING (current 20-Linux
+# contract), 0 remote known (all 4 remote Mac slots are unproven ->
 # counted as DOWN).
 FUNC_START=$(grep -n '^compute_verdict_summary() {' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1)
 if [ -z "$FUNC_START" ]; then
@@ -82,30 +82,30 @@ else
   FUNC_SRC=$(sed -n "${FUNC_START},${FUNC_END}p" "$DOCTOR_SCRIPT")
 
   eval "$FUNC_SRC"
-  out=$(compute_verdict_summary 10 0 0 0  0 0 6 0 0)
+  out=$(compute_verdict_summary 20 0 0 0  0 0 4 0 0)
   read -r total configured executing idle_ok idle_starved down cycling <<< "$out"
 
   echo "  [unreachable-remote-math] total=$total configured=$configured executing=$executing cycling=$cycling idle_ok=$idle_ok idle_starved=$idle_starved down=$down"
 
-  # configured MUST be 16 (local 10 + remote unproven 6), NOT 10. If this
-  # reads 10 the unreachable-remote fix has regressed.
-  if [ "$configured" -ne 16 ]; then
-    echo "FAIL: configured=$configured, expected 16 (P1 #2 regression -- configured collapsed to local-only)" >&2
+  # configured MUST be 24 (local 20 + remote unproven 4), NOT 20. If this
+  # reads 20 the unreachable-remote fix has regressed.
+  if [ "$configured" -ne 24 ]; then
+    echo "FAIL: configured=$configured, expected 24 (P1 #2 regression -- configured collapsed to local-only)" >&2
     OVERALL_PASS=false
   fi
-  # down MUST be 6 (the unreachable remote slots). Pre-fix this was 0.
-  if [ "$down" -ne 6 ]; then
-    echo "FAIL: down=$down, expected 6 (P1 #2 regression -- unreachable slots not counted as down)" >&2
+  # down MUST be 4 (the unreachable remote slots). Pre-fix this was 0.
+  if [ "$down" -ne 4 ]; then
+    echo "FAIL: down=$down, expected 4 (P1 #2 regression -- unreachable slots not counted as down)" >&2
     OVERALL_PASS=false
   fi
-  # executing MUST be 10 (only the proven local slots).
-  if [ "$executing" -ne 10 ]; then
-    echo "FAIL: executing=$executing, expected 10 (unreachable slots must NOT inflate executing)" >&2
+  # executing MUST be 20 (only the proven local slots).
+  if [ "$executing" -ne 20 ]; then
+    echo "FAIL: executing=$executing, expected 20 (unreachable slots must NOT inflate executing)" >&2
     OVERALL_PASS=false
   fi
-  # total = configured when no idle/cycling/starved slots (10+6 = 16).
-  if [ "$total" -ne 16 ]; then
-    echo "FAIL: total=$total, expected 16" >&2
+  # total = configured when no idle/cycling/starved slots (20+4 = 24).
+  if [ "$total" -ne 24 ]; then
+    echo "FAIL: total=$total, expected 24" >&2
     OVERALL_PASS=false
   fi
 fi

@@ -19,7 +19,7 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
         <key>MIN_AGE_HOURS</key>
-        <string>4</string>
+        <string>48</string>
     </dict>
     <key>StartInterval</key>
     <integer>3600</integer>

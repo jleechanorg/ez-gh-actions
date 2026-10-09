@@ -111,7 +111,15 @@ else:
         data = tomllib.load(f)
 
 value = data["runner"].get(key, default)
-print(value)
+# Render booleans as TOML-spec lowercase (not Python's True/False) so the
+# downstream gate can compare against 'true'/'false' without parsing.
+# Strings/nums print unchanged. Regression 2026-10-03: live Mac verifier
+# printed 'True' here, which silently desynced from LIMIT_CPU_BURST=true
+# comparisons in gate3_burst_preflight and Gate 3's CPU arithmetic branch.
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -135,7 +143,10 @@ except ModuleNotFoundError:
     data = toml.load(path)
 
 value = data.get(key, default)
-print(value)
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
@@ -175,16 +186,356 @@ else:
         data = tomllib.load(f)
 
 value = data["limits"].get(key, default)
-print(value)
+# Render booleans as TOML-spec lowercase (see toml_get_runner comment
+# for the live-Mac-regression rationale — 2026-10-03).
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
 PY
 }
 
-daemon_in_vm() {
+# Gate-8 cgroup-parent checks are kept as small helpers so focused regression
+# tests can exercise the live evidence path without running every verifier
+# gate. In production the roots default to the real /proc and cgroup mounts;
+# VERIFY_EXIT_CRITERIA_* overrides are test-only fixture seams.
+verify_configured_actions_slice() {
+    local config_path="$1"
+    CONFIG_FILE="$config_path"
+    local parent
+    parent=$(toml_get_limits cgroup_parent "" 2>/dev/null || true)
+    [ "$parent" = "actions.slice" ] || {
+        echo "limits.cgroup_parent must be actions.slice (got '${parent:-unset}')" >&2
+        return 1
+    }
+}
+
+verify_platform_actions_slice() {
+    local platform="$1" config_path="$2"
+    [ "$platform" = Linux ] || return 0
+    verify_configured_actions_slice "$config_path"
+}
+
+verify_managed_runners_in_actions_slice() {
+    local cgroup_root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local proc_root="${VERIFY_EXIT_CRITERIA_PROC_ROOT:-/proc}"
+    [ -d "${cgroup_root}/actions.slice" ] || {
+        echo "${cgroup_root}/actions.slice is missing" >&2
+        return 1
+    }
+    local ids
+    if ! ids=$(docker ps --filter label=ezgha=managed --format '{{.ID}}' 2>/dev/null); then
+        echo "could not list managed runner containers" >&2
+        return 1
+    fi
+    [ -n "$ids" ] || {
+        echo "no managed runner containers found" >&2
+        return 1
+    }
+    local id inspect running status pid raw path extra live_found=0
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        inspect=$(docker inspect -f '{{.State.Running}} {{.State.Status}} {{.State.Pid}}' "$id" 2>/dev/null) || {
+            echo "managed runner $id could not be inspected" >&2
+            return 1
+        }
+        running='' status='' pid='' extra=''
+        read -r running status pid extra <<<"$inspect" || true
+        [ -n "$running" ] && [ -n "$status" ] && [ -n "$pid" ] && [ -z "${extra:-}" ] || {
+            echo "managed runner $id returned malformed state: ${inspect:-unavailable}" >&2
+            return 1
+        }
+        case "$running:$status:$pid" in
+            false:exited:0) continue ;;
+            true:running:0|true:running:''|true:running:*[!0-9]*)
+                echo "managed runner $id has invalid live PID: $pid" >&2
+                return 1
+                ;;
+            true:running:*) live_found=1 ;;
+            *)
+                echo "managed runner $id has unverified state: $inspect" >&2
+                return 1
+                ;;
+        esac
+        raw=$(grep '^0::' "${proc_root}/${pid}/cgroup" 2>/dev/null | head -1 || true)
+        path="${raw#0::}"
+        case "$path" in
+            /actions.slice|/actions.slice/*) ;;
+            *)
+                echo "managed runner $id (pid=$pid) is outside actions.slice: ${path:-unavailable}" >&2
+                return 1
+                ;;
+        esac
+        [ -d "${cgroup_root}${path}" ] || {
+            echo "managed runner $id cgroup is not materialized under ${cgroup_root}: $path" >&2
+            return 1
+        }
+    done <<< "$ids"
+    [ "$live_found" -eq 1 ] || {
+        echo "no positively inspected live managed runner containers found" >&2
+        return 1
+    }
+}
+
+GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT='ids=$(docker ps --filter label=ezgha=managed --format "{{.ID}}" 2>/dev/null) || {
+    echo "could not list managed runner containers" >&2
+    exit 1
+}
+test -n "$ids" || {
+    echo "no managed runner containers found" >&2
+    exit 1
+}
+live_found=0
+for id in $ids; do
+    test -n "$id" || continue
+    inspect=$(docker inspect -f "{{.State.Running}} {{.State.Status}} {{.State.Pid}}" "$id" 2>/dev/null) || {
+        echo "managed runner $id could not be inspected" >&2
+        exit 1
+    }
+    running="" status="" pid="" extra=""
+    read -r running status pid extra <<EOF
+$inspect
+EOF
+    if [ -z "$running" ] || [ -z "$status" ] || [ -z "$pid" ] || [ -n "$extra" ]; then
+        echo "managed runner $id returned malformed state: ${inspect:-unavailable}" >&2
+        exit 1
+    fi
+    case "$running:$status:$pid" in
+        false:exited:0) continue ;;
+        true:running:0|true:running:''|true:running:|true:running:*[!0-9]*)
+            echo "managed runner $id has invalid live PID: $pid" >&2
+            exit 1
+            ;;
+        true:running:*) live_found=1 ;;
+        *)
+            echo "managed runner $id has unverified state: $inspect" >&2
+            exit 1
+            ;;
+    esac
+    raw=$(grep "^0::" "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
+    path=${raw#0::}
+    case "$path" in
+        /actions.slice|/actions.slice/*) ;;
+        *)
+            echo "managed runner $id (pid=$pid) is outside actions.slice: ${path:-unavailable}" >&2
+            exit 1
+            ;;
+    esac
+    test -d "/sys/fs/cgroup$path" || {
+        echo "managed runner $id cgroup is not materialized under /sys/fs/cgroup: $path" >&2
+        exit 1
+    }
+done
+if [ "$live_found" -ne 1 ]; then
+    echo "no positively inspected live managed runner containers found" >&2
+    exit 1
+fi
+'
+
+verify_guest_managed_runners_in_actions_slice() {
+    command -v limactl >/dev/null 2>&1 || {
+        echo "limactl is unavailable for the Docker VM cgroup probe" >&2
+        return 1
+    }
+    limactl shell colima -- sh -lc "
+        test -d /sys/fs/cgroup/actions.slice || {
+            echo '/sys/fs/cgroup/actions.slice is missing' >&2
+            exit 1
+        }
+        $GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT
+    " >/dev/null
+}
+
+cgroup_has_effective_memory_ceiling() {
+    local current="${1#0::}"
+    local root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    case "$current" in /*) ;; *) return 1 ;; esac
+    local high max
+    while :; do
+        high=$(cat "${root}${current}/memory.high" 2>/dev/null || true)
+        max=$(cat "${root}${current}/memory.max" 2>/dev/null || true)
+        if { [ -n "$high" ] && [ "$high" != max ]; } \
+           || { [ -n "$max" ] && [ "$max" != max ]; }; then
+            return 0
+        fi
+        [ "$current" = / ] && break
+        current="${current%/*}"
+        [ -n "$current" ] || current=/
+    done
+    return 1
+}
+
+# Pure CPU clamp arithmetic, factored out of Gate 3 so focused shell tests
+# (tests/verify_exit_gate3_cpu_burst_test.sh) can exercise the four cases
+# without spinning the live fleet:
+#   - default (cpu_burst=false) -> equal-share max(daemon_ncpu / count, 0.5)
+#   - burst (cpu_burst=true)    -> min(cfg.cpus, daemon_ncpu)
+# Both paths return a 2-decimal-rounded value to mirror
+# src/docker_backend.rs's format!("{:.2}", cpus) before NanoCpus conversion.
+# Inputs: $1=cpu_burst ("true"/"false"), $2=cfg.cpus (float),
+# $3=daemon_ncpu (uint>0, caller already checked), $4=count (uint>0).
+# Returns the rounded expected effective cpus on stdout.
+expected_effective_cpus() {
+    local burst="$1" cfg="$2" ncpu="$3" count="$4"
+    if [ "$burst" = "true" ]; then
+        awk -v cfg="$cfg" -v ncpu="$ncpu" 'BEGIN { v = (cfg > ncpu) ? ncpu : cfg; printf "%.2f", v }'
+    else
+        local share
+        share=$(awk -v ncpu="$ncpu" -v count="$count" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
+        awk -v cfg="$cfg" -v share="$share" 'BEGIN { v = (cfg > share) ? share : cfg; printf "%.2f", v }'
+    fi
+}
+
+# Local containment ownership is stricter than the Rust CPU-burst VM proof.
+containment_in_vm() {
     [ "$(uname -s)" = "Darwin" ] && return 0
-    local daemon_kernel host_kernel
-    daemon_kernel=$(docker info --format '{{.KernelVersion}}' 2>/dev/null | tr -d '[:space:]' || true)
-    host_kernel=$(uname -r | tr -d '[:space:]' || true)
-    [ -n "$daemon_kernel" ] && [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+    [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = vm-backed ]
+}
+
+host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1" 2>/dev/null; }
+# Integer-only size conversion for tracked systemd values (4608M, 5G, 0).
+host_to_bytes() {
+    case "$1" in
+        *G) echo $(( ${1%G} * 1024 * 1024 * 1024 )) ;;
+        *M) echo $(( ${1%M} * 1024 * 1024 )) ;;
+        *K) echo $(( ${1%K} * 1024 )) ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Gate 8 host-docker envelope (bead ez-gh-actions-154k). On a host-docker
+# Linux host the four finite budgets are actions.slice (runners), agents.slice,
+# automation.slice and lima-vm@colima.service (the qdrant-only Colima VM). Their
+# LIVE memory.high/memory.max must equal the tracked host-docker policy and be
+# finite, and the sum of the live memory.max values plus the reserve
+# (max(MemTotal/10, 2048 MB)) must fit MemTotal. Hard maxima are summed once;
+# no memory.high x2 overflow model and no separate app-lima-vm.slice term.
+verify_host_docker_envelope() {
+    local policy_root="${VERIFY_EXIT_CRITERIA_POLICY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local cg_root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
+    local meminfo="${VERIFY_EXIT_CRITERIA_MEMINFO:-/proc/meminfo}"
+    local entry unit policy cg want_high want_max live_high live_max
+    local total_mb=0 host_mb reserve_mb terms=""
+    for entry in \
+        "actions.slice|systemd/host/actions.slice" \
+        "agents.slice|systemd/agents.slice" \
+        "automation.slice|systemd/automation.slice" \
+        "lima-vm@colima.service|systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
+        unit="${entry%%|*}"
+        policy="${policy_root}/${entry#*|}"
+        want_high=$(host_to_bytes "$(host_unit_value "$policy" MemoryHigh)")
+        want_max=$(host_to_bytes "$(host_unit_value "$policy" MemoryMax)")
+        case "${want_high}:${want_max}" in
+            :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: tracked ${policy} must set finite integer MemoryHigh/MemoryMax (got high=${want_high:-?} max=${want_max:-?})" ;;
+        esac
+        if [ "$unit" = actions.slice ]; then
+            cg=/actions.slice
+        else
+            cg=$(systemctl --user show -p ControlGroup --value -- "$unit" 2>/dev/null || true)
+        fi
+        [ -n "$cg" ] || fail "Gate 8 host-docker envelope: ${unit} has no live cgroup"
+        live_high=$(cat "${cg_root}${cg}/memory.high" 2>/dev/null || true)
+        live_max=$(cat "${cg_root}${cg}/memory.max" 2>/dev/null || true)
+        case "${live_high}:${live_max}" in
+            :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: ${unit} live memory.high=${live_high:-unreadable} memory.max=${live_max:-unreadable} is not finite (${cg_root}${cg})" ;;
+        esac
+        if [ "$live_high" != "$want_high" ] || [ "$live_max" != "$want_max" ]; then
+            fail "Gate 8 host-docker envelope: ${unit} live memory.high=${live_high} memory.max=${live_max} does not match tracked ${entry#*|} (high=${want_high} max=${want_max})"
+        fi
+        total_mb=$((total_mb + live_max / 1048576))
+        terms="${terms:+${terms} + }${unit}=$((live_max / 1048576))MB"
+    done
+    host_mb=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' "$meminfo" 2>/dev/null || true)
+    case "$host_mb" in ''|*[!0-9]*|0) fail "Gate 8 host-docker envelope: could not read MemTotal from ${meminfo}" ;; esac
+    reserve_mb=$((host_mb / 10))
+    [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
+    if [ $((total_mb + reserve_mb)) -gt "$host_mb" ]; then
+        fail "Gate 8 host-docker envelope: live hard maxima ${total_mb}MB (${terms}) + reserve ${reserve_mb}MB exceed host ${host_mb}MB"
+    fi
+    echo "    [PASS] Gate 8 host-docker envelope: live hard maxima ${total_mb}MB (${terms}) + reserve ${reserve_mb}MB fit host ${host_mb}MB"
+}
+
+# Succeeds when `oomctl` output (stdin) lists /actions.slice under
+# "Memory Pressure Monitored CGroups:" (tab-indented "Path: /actions.slice").
+oomctl_lists_actions_slice() {
+    awk '
+        /^Memory Pressure Monitored CGroups:/ { capturing = 1; next }
+        /^[^[:space:]]/                       { capturing = 0 }
+        capturing && $1 == "Path:" && $2 == "/actions.slice" { found = 1 }
+        END { exit !found }
+    '
+}
+
+# Host-docker has one required PSI admission target: actions.slice is the
+# host's runner aggregate.  A legacy user-scope timer may be present for
+# VM-backed deployments, but it cannot hide a missing oomd enrollment here.
+host_docker_requires_actions_oomctl() {
+    [ "$(uname -s)" = "Linux" ] && [ "${DOCKER_CONTAINMENT_MODE:-unknown}" = host-docker ]
+}
+
+daemon_in_vm() {
+    # VM-containment proof via the docker daemon's own kernel string.
+    # Mirrors src/platform.rs::daemon_in_vm(): the daemon kernel probe
+    # MUST succeed (exit 0 AND non-empty output) before the Darwin
+    # shortcut; a nonzero exit with nonempty stdout is NOT success — it
+    # is a half-failed probe that the prior `|| true` accepted silently
+    # (regression 2026-10-03, root review of 0d743: daemon_kernel
+    # carrying stderr text would have matched the daemon_in_vm branch and
+    # silently admitted burst on a half-broken daemon). On macOS the
+    # daemon is always in a VM (no native Linux containers) so any
+    # non-empty daemon kernel counts; on Linux the daemon kernel must
+    # also differ from the host kernel (uname -r).
+    local daemon_kernel_raw daemon_kernel
+    if ! daemon_kernel_raw=$(docker info --format '{{.KernelVersion}}' 2>/dev/null); then
+        return 1
+    fi
+    daemon_kernel=$(printf '%s' "$daemon_kernel_raw" | tr -d '[:space:]')
+    [ -n "$daemon_kernel" ] || return 1
+    if [ "$(uname -s)" = "Darwin" ]; then
+        return 0
+    fi
+    local host_kernel_raw host_kernel
+    if ! host_kernel_raw=$(uname -r 2>/dev/null); then
+        return 1
+    fi
+    host_kernel=$(printf '%s' "$host_kernel_raw" | tr -d '[:space:]')
+    [ -n "$host_kernel" ] && [ "$daemon_kernel" != "$host_kernel" ]
+}
+
+# Mirror of src/docker_backend.rs::effective_limits_with_capacity's burst
+# branch (lines 3229-3253 in src/docker_backend.rs): when limits.cpu_burst
+# is requested, refuse unless (a) the docker daemon is proven VM-contained
+# via the SAME kernel-proof the Rust guard uses, and (b) docker info
+# reports a finite positive NCPU. Prints the refusal reason on stderr and
+# returns non-zero on refusal. Default-false (LIMIT_CPU_BURST!=true) is
+# accepted unconditionally — equal-share arithmetic applies downstream.
+# Returns the proven NCPU on stdout (only when accepted) so the caller
+# can reuse it without re-probing docker info. Exit status: 0 accepted,
+# 1 refused. Sourced into focused shell tests via awk extraction.
+gate3_burst_preflight() {
+    if [ "${LIMIT_CPU_BURST:-false}" != "true" ]; then
+        return 0
+    fi
+    if ! daemon_in_vm; then
+        echo "limits.cpu_burst=true but docker daemon is not verified VM-contained (daemon_in_vm kernel proof returned false); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    local ncpu_raw ncpu
+    # Require exit 0 AND non-empty output — a nonzero exit with a stale
+    # value cached in stdout would otherwise leak into is_uint and either
+    # silently coerce or trip a misleading "not finite positive integer"
+    # error rather than the actual probe failure.
+    if ! ncpu_raw=$(docker info --format '{{.NCPU}}' 2>/dev/null); then
+        echo "limits.cpu_burst=true but docker info --format {{.NCPU}} exited non-zero (probe failure); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    ncpu=$(printf '%s' "$ncpu_raw" | tr -d '[:space:]')
+    if ! is_uint "$ncpu" || [ "$ncpu" -le 0 ]; then
+        echo "limits.cpu_burst=true but docker info NCPU is not a finite positive integer ('${ncpu:-unavailable}'); src/docker_backend.rs::effective_limits refuses this same config at Serve startup" >&2
+        return 1
+    fi
+    echo "$ncpu"
+    return 0
 }
 
 cpu_controller_available() {
@@ -230,24 +581,28 @@ daemon_overlay_free_disk_gb() {
     echo $((avail_kb / 1024 / 1024))
 }
 
+kdump_target_mount_is_writable() {
+    local target="$1" mount_options
+    if [ "${VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS+x}" = x ]; then
+        mount_options="$VERIFY_EXIT_CRITERIA_KDUMP_MOUNT_OPTIONS"
+    else
+        command -v findmnt >/dev/null 2>&1 || return 1
+        mount_options="$(findmnt -n -o OPTIONS --target "$target" 2>/dev/null)" || return 1
+    fi
+    case ",$mount_options," in
+        *,rw,*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 verify_kdump_pstore() {
     [ "$(uname -s)" = "Linux" ] || return 0
-    cat <<'REMEDIATE'
-[FAIL] Crash capture is not active on this host. The project's stated goal
-       (physical-host availability) cannot be proven without it.
-
-REPRODUCIBLE REMEDIATION:
-    1. sudo bash scripts/host/configure-grub-kdump.sh    # already-prepared, transactional, survives failure
-    2. sudo reboot                                     # required; GRUB + crashkernel=2G only take effect after reboot
-    3. ./docs/verify-exit-criteria.sh                  # re-run; this gate will turn green once /sys/kernel/kexec_crash_loaded == 1
-                                                       # After reboot, kexec_crash_loaded should read 1.
-
-OPERATIONAL PROOF (separate from this gate's check):
-    Once rebooted, run scripts/host/crash-capture-verify.sh --force (after --dry-run)
-    to confirm a vmcore lands in /var/crash; this is the OPERATIONAL proof that kdump works.
-    Then run scripts/host/crash-capture-verify.sh --verify <stamp> --no-trigger after
-    the post-panic reboot to close bead ez-gh-actions-r3f15.
-REMEDIATE
+    local pstore_root="${VERIFY_EXIT_CRITERIA_PSTORE_ROOT:-/sys/fs/pstore}"
+    local kexec_crash_loaded_path="${VERIFY_EXIT_CRITERIA_KEXEC_CRASH_LOADED_PATH:-/sys/kernel/kexec_crash_loaded}"
+    local kdump_dir="${VERIFY_EXIT_CRITERIA_KDUMP_DIR:-/var/crash}"
+    kdump_fail() {
+        fail "$1"
+    }
     # (1) /proc/sys/kernel/core_pattern is the USERSpace core-dump pattern;
     #     it routes only userspace coredumps (SIGSEGV in a process), NOT
     #     kernel panics. Kdump dumps kernel panics via kexec-loaded crash
@@ -263,39 +618,247 @@ REMEDIATE
     #     "physical-host availability" goal benefits from having at least
     #     one panic-time capture path beyond kdump alone. Keeping it checked
     #     here is intentional; it is independent of core_pattern.
-    if [ ! -d /sys/fs/pstore ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/fs/pstore is not mounted (no firmware/pstore crash logs can survive a panic)"
+    if [ ! -d "$pstore_root" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $pstore_root is not mounted (no firmware/pstore crash logs can survive a panic)"
     fi
     # (3) Kernel-panic capture lives in /sys/kernel/kexec_crash_loaded:
     #     when kdump has kexec-loaded the crash kernel, this reads '1'.
-    #     If the kernel was rebooted after running configure-grub-kdump.sh
-    #     but kexec_crash_loaded is still 0, the crash kernel did NOT load
-    #     — either GRUB picked the wrong cmdline or crashkernel= is wrong.
-    if [ ! -f /sys/kernel/kexec_crash_loaded ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is missing (kdump kernel never installed)"
+    #     A value other than 1 means the crash kernel is not armed on this
+    #     running boot. This verifier reports that state but never changes
+    #     boot configuration or host lifecycle state.
+    if [ ! -f "$kexec_crash_loaded_path" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is missing (kdump kernel never installed)"
     fi
-    if [ "$(cat /sys/kernel/kexec_crash_loaded 2>/dev/null || echo 0)" != "1" ]; then
-        fail "Crash capture FAIL-CLOSED: /sys/kernel/kexec_crash_loaded is not '1' (kdump kernel is not loaded into the running kernel)"
+    if [ "$(cat "$kexec_crash_loaded_path" 2>/dev/null || echo 0)" != "1" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kexec_crash_loaded_path is not '1' (kdump kernel is not loaded into the running kernel)"
     fi
-    # (4) /var/crash is the kdump-tools default destination on debian/ubuntu.
-    #     If the directory is missing OR not writable by root, the vmcore
-    #     file cannot land and the panic capture is silently lost (kexec
+    # (4) /var/crash is the kdump-tools default destination on Debian/Ubuntu.
+    #     Kdump writes as root, so testing `-w` as the unprivileged verifier
+    #     would reject a normal root-owned mode-0755 directory. Instead,
+    #     require that the directory exists and its containing mount is rw.
+    #     If the directory is missing or the mount is read-only, the vmcore
+    #     cannot land and the panic capture is silently lost (kexec
     #     loads the crash kernel, then the crash kernel mounts the root
     #     filesystem and writes here; if this path is unwritable, kdump
-    #     fails its post-reboot handshake and produces no vmcore).
-    KDUMP_DIR=/var/crash
-    if [ ! -d "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR does not exist; kdump has no dump target. Remediation: install kdump-tools (apt-get install kdump-tools) or run scripts/host/configure-grub-kdump.sh which prepares the path."
+    #     produces no vmcore).
+    if [ ! -d "$kdump_dir" ]; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir does not exist; kdump has no dump target. Operator action is required outside this verifier."
     fi
-    if [ ! -w "$KDUMP_DIR" ]; then
-        fail "Crash capture FAIL-CLOSED: $KDUMP_DIR is not writable by root; kernel cannot save vmcores here."
+    if ! kdump_target_mount_is_writable "$kdump_dir"; then
+        kdump_fail "Crash capture FAIL-CLOSED: $kdump_dir is not on a verifiably writable mount; kernel cannot save vmcores here."
     fi
 }
 
-# Verify the cgroup v2 leaf cgroup for the given raw /proc/<pid>/cgroup line
-# (including the optional leading "0::") has a finite memory ceiling in
-# /sys/fs/cgroup (memory.high or memory.max != "max"). Returns 0 if the leaf
-# is bounded, 1 if it is unbounded OR cannot be read. On failure, the offending
+verify_fresh_canary() {
+    local canary_config="$1"
+    local canary_timeout_seconds="${2:-600}"
+    local ezgha_bin="${VERIFY_EXIT_CRITERIA_EZGHA_BIN:-$HOME/.cargo/bin/ezgha}"
+    if [ ! -f "$canary_config" ]; then
+        fail "Gate 4: canary config file not found at $canary_config"
+    fi
+    local canary_name_prefix canary_out canary_run_id canary_runner canary_tts
+    canary_name_prefix=$(CONFIG_FILE="$canary_config" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
+    if ! canary_out=$("$ezgha_bin" --config "$canary_config" canary-once --timeout-seconds "$canary_timeout_seconds" 2>&1); then
+        echo "$canary_out"
+        fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${canary_name_prefix}-* using $canary_config"
+    fi
+    echo "$canary_out"
+    canary_run_id=$(echo "$canary_out" | jq -r '.run_id // empty' 2>/dev/null || true)
+    canary_runner=$(echo "$canary_out" | jq -r '.runner_name // empty' 2>/dev/null || true)
+    canary_tts=$(echo "$canary_out" | jq -r '.time_to_start_seconds // empty' 2>/dev/null || true)
+    if [ -z "$canary_run_id" ] || [ -z "$canary_runner" ]; then
+        fail "Gate 4: canary output lacked run_id or runner_name"
+    fi
+    echo "    [INFO] Fresh canary run $canary_run_id started on $canary_runner in ${canary_tts:-?}s"
+    pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $canary_config"
+}
+
+
+actions_tasks_max_for_runner_count() {
+    case "$1" in
+        10) printf '6000\n' ;;
+        14) printf '8000\n' ;;
+        20) printf '8000\n' ;;
+        *) echo "unsupported runner count for actions.slice profile: $1" >&2; return 1 ;;
+    esac
+}
+
+memory_limit_to_mb() {
+    case "$1" in
+        ''|max|infinity|*[!0-9GMK]) return 1 ;;
+        *G) awk -v v="$1" 'BEGIN {sub(/G$/, "", v); print v * 1024}' ;;
+        *M) awk -v v="$1" 'BEGIN {sub(/M$/, "", v); print v}' ;;
+        *K) awk -v v="$1" 'BEGIN {sub(/K$/, "", v); print int(v / 1024)}' ;;
+        *) awk -v v="$1" 'BEGIN {print int(v / 1024 / 1024)}' ;;
+    esac
+}
+
+modern_envelope_required() {
+    if [ "$(uname -s)" = Linux ] && ! daemon_in_vm; then
+        return 0
+    fi
+    [ -f "${MODERN_UNIT_DIR}/app-lima-vm.slice" ] \
+        && [ -f "${MODERN_UNIT_DIR}/lima-vm@colima.service.d/99-memory-ceiling.conf" ] \
+        && [ -f "${MODERN_UNIT_DIR}/agents.slice" ] \
+        && [ -f "${MODERN_UNIT_DIR}/automation.slice" ] \
+        && [ -f "${MODERN_WRAPPER}" ] \
+        && grep -q '^# ezgha-agent-wrapper$' "${MODERN_WRAPPER}"
+}
+
+modern_envelope_budget() {
+    local unit_dir="$1" actions_unit="$2" native="$3" count="$4" host_mb="$5"
+    local total_mb=0 selected_tasks reserve_mb unit key value converted max_mb
+    local units=("$unit_dir/lima-vm@colima.service.d/99-memory-ceiling.conf"
+                 "$unit_dir/agents.slice" "$unit_dir/automation.slice")
+    [ -r "$unit_dir/app-lima-vm.slice" ] || return 1
+    [ "$native" != 1 ] || units+=("$actions_unit")
+    selected_tasks=$(actions_tasks_max_for_runner_count "$count") || return 1
+    [[ "$host_mb" =~ ^[1-9][0-9]*$ ]] || return 1
+    for unit in "${units[@]}"; do
+        [ -r "$unit" ] || return 1
+        for key in MemoryHigh MemoryMax MemorySwapMax TasksMax; do
+            value=$(awk -F= -v key="$key" '$1 == key {print $2; exit}' "$unit") || return 1
+            if [ "$key" = TasksMax ]; then
+                [[ "$value" =~ ^[1-9][0-9]*$ ]] || return 1
+            else
+                [[ "$value" =~ ^[0-9]+[GMK]?$ ]] || return 1
+                converted=$(memory_limit_to_mb "$value") || return 1
+                [ "$key" = MemorySwapMax ] || [ "$converted" -gt 0 ] || return 1
+                [ "$key" != MemoryMax ] || max_mb="$converted"
+            fi
+        done
+        total_mb=$((total_mb + max_mb))
+    done
+    reserve_mb=$((host_mb / 10))
+    [ "$reserve_mb" -ge 2048 ] || reserve_mb=2048
+    [ $((total_mb + reserve_mb)) -le "$host_mb" ] || return 1
+    printf '%s %s %s\n' "$total_mb" "$selected_tasks" "$reserve_mb"
+}
+
+# Gate 8 timer policy: both retired timers must be disabled and stopped even
+# when their unit files were already removed from disk.
+verify_retired_timer() {
+    local timer="$1" enabled_state active_state
+    enabled_state=$(systemctl --user is-enabled "$timer" 2>&1 | head -1 || true)
+    case "$enabled_state" in
+        enabled|enabled-runtime)
+            fail "Gate 8 modern envelope: ${timer} is enabled but is retired by policy (install.sh)" ;;
+        # A deleted unit file can remain loaded until its runtime instance
+        # stops, so still verify is-active before accepting this state.
+        not-found|"Failed to get unit file state for "*": No such file or directory") ;;
+        disabled|masked|masked-runtime|linked|linked-runtime|static|indirect|generated|alias|transient) ;;
+        *)
+            # Query failure (e.g. lost user-manager bus): never read as "disabled".
+            fail "Gate 8 modern envelope: could not determine ${timer} enabled state (got: ${enabled_state:-<empty>})"
+            return 1 ;;
+    esac
+    active_state=$(systemctl --user is-active "$timer" 2>&1 | head -1 || true)
+    case "$active_state" in
+        inactive|failed|not-found) ;;
+        active|activating|deactivating|reloading)
+            fail "Gate 8 modern envelope: ${timer} is ${active_state} but is retired by policy (install.sh)" ;;
+        *)
+            fail "Gate 8 modern envelope: could not determine ${timer} runtime state (got: ${active_state:-<empty>})"
+            return 1 ;;
+    esac
+    return 0
+}
+
+verify_modern_timers() {
+    verify_retired_timer agent-scope-reaper.timer || return 1
+    verify_retired_timer psi-oom-watcher.timer
+}
+
+verify_modern_psi_policy() {
+    local repo_root="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local assert_cmd="$repo_root/scripts/host/assert-host-containment-release1.sh"
+    if [ ! -r "$assert_cmd" ] || [ ! -x "$assert_cmd" ]; then
+        echo "Mandatory host containment assertion is unavailable: $assert_cmd" >&2
+        return 1
+    fi
+    "$assert_cmd" --runner-count "${COUNT:-14}" "$@"
+}
+
+verify_automation_dropins() {
+    local service load dropin root
+    root="${VERIFY_EXIT_CRITERIA_DROPIN_DIR:-}"
+    [ -n "$root" ] || root="$MODERN_UNIT_DIR"
+    for service in ao-daemon ao-orchestrator ai.dark-factory.daemon; do
+        load=$(systemctl --user show "$service.service" -p LoadState --value 2>/dev/null) || return 1
+        case "$load" in
+            not-found) continue ;;
+            loaded)
+                dropin="$root/$service.service.d/20-automation-slice.conf"
+                [ -f "$dropin" ] && grep -q '^Slice=automation.slice$' "$dropin" || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+# Gate 0: the deployed SHA may trail HEAD only by commits touching no build
+# input of the binary (bead ez-gh-actions-eqx).
+# :(top) makes the pathspecs repo-root-relative regardless of the caller cwd.
+GATE0_BUILD_INPUTS=":(top)src :(top)Cargo.toml :(top)Cargo.lock :(top)build.rs"
+verify_deployed_sha() {
+    local deployed="$1" head_sha changed
+    head_sha=$(git rev-parse --short HEAD)
+    [ "$deployed" = "$head_sha" ] && return 0
+    if ! git rev-parse --verify --quiet "${deployed}^{commit}" >/dev/null 2>&1; then
+        fail "Deployed binary SHA ($deployed) is not in this repo's history; HEAD is $head_sha. Run cargo install --path ."
+        return 1
+    fi
+    if ! git merge-base --is-ancestor "$deployed" HEAD; then
+        fail "Deployed binary SHA ($deployed) is not an ancestor of HEAD ($head_sha). Run cargo install --path ."
+        return 1
+    fi
+    # Inspect every reachable commit and every merge-parent diff, not just the
+    # endpoint trees. A build-input change later reverted, or made only while
+    # resolving a merge, still means the deployed binary may be stale.
+    # shellcheck disable=SC2086
+    changed=$(while IFS= read -r commit; do
+        git diff-tree --no-commit-id --name-only -r --root -m "$commit" -- $GATE0_BUILD_INPUTS
+    done < <(git rev-list "$deployed..HEAD") | sort -u)
+    if [ -n "$changed" ]; then
+        fail "Deployed binary SHA ($deployed) differs from HEAD ($head_sha) in build inputs: $(echo "$changed" | tr '\n' ' '). Run cargo install --path ."
+        return 1
+    fi
+    echo "    [INFO] Gate 0: deployed $deployed trails HEAD $head_sha only by commits touching no build input ($GATE0_BUILD_INPUTS)"
+    return 0
+}
+
+if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
+    case "${VERIFY_EXIT_CRITERIA_TEST_CASE:-}" in
+        config) verify_configured_actions_slice "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        platform_config) verify_platform_actions_slice "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_CONFIG:?}" ;;
+        containers) verify_managed_runners_in_actions_slice ;;
+        guest_containers) verify_guest_managed_runners_in_actions_slice ;;
+        cgroup_ceiling) cgroup_has_effective_memory_ceiling "${VERIFY_EXIT_CRITERIA_CGROUP_PATH:?}" ;;
+        kdump) verify_kdump_pstore ;;
+        modern_timers) verify_modern_timers ;;
+        host_docker_envelope) verify_host_docker_envelope ;;
+        oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
+        gate0) verify_deployed_sha "${VERIFY_EXIT_CRITERIA_DEPLOYED_SHA:?}" ;;
+        canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
+        modern_policy)
+            policy=$(modern_envelope_budget "$VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR" "$VERIFY_EXIT_CRITERIA_ACTIONS_UNIT" "$VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS" "$VERIFY_EXIT_CRITERIA_RUNNER_COUNT" "$VERIFY_EXIT_CRITERIA_HOST_MB") || exit 1
+            read -r total_mb selected_tasks reserve_mb <<<"$policy"
+            verify_modern_timers || exit 1
+            echo "selected_tasks=$selected_tasks"
+            ;;
+        automation_dropins) verify_automation_dropins ;;
+        psi_admission)
+            verify_modern_psi_policy || exit 1
+            ;;
+        *) echo "unknown verifier test case" >&2; exit 2 ;;
+    esac
+    exit $?
+fi
+
+# Verify the cgroup v2 path for the given raw /proc/<pid>/cgroup line
+# (including the optional leading "0::") has a finite effective memory ceiling
+# in its ancestry. Returns 0 if the process is recursively bounded, 1 if its
+# whole ancestry is unbounded or unreadable. On failure, the offending
 # cgroup path (and which file was max/unreadable) is printed on stdout so the
 # cold reader sees exactly which cgroup is missing the ceiling.
 #
@@ -309,20 +872,9 @@ REMEDIATE
 cgroup_leaf_has_memory_ceiling() {
     local cg_raw="$1"
     [ -z "$cg_raw" ] && return 1
-    cg_raw="${cg_raw#0::}"  # strip cgroup-v2 "0::" prefix if present
-    local sysfs="/sys/fs/cgroup"
-    local leaf_high leaf_max
-    leaf_high=$(cat "${sysfs}${cg_raw}/memory.high" 2>/dev/null || echo "")
-    leaf_max=$(cat "${sysfs}${cg_raw}/memory.max" 2>/dev/null || echo "")
-    if [ -z "$leaf_high" ] && [ -z "$leaf_max" ]; then
-        echo "${cg_raw} (cgroup files unreadable)"
-        return 1
-    fi
-    if [ "$leaf_high" = "max" ] && [ "$leaf_max" = "max" ]; then
-        echo "${cg_raw} (memory.high=max memory.max=max)"
-        return 1
-    fi
-    return 0
+    if cgroup_has_effective_memory_ceiling "$cg_raw"; then return 0; fi
+    echo "${cg_raw#0::} (no finite memory.high or memory.max in cgroup ancestry)"
+    return 1
 }
 
 # Probe the Colima/Lima VM running on a remote Mac host. Returns 0 if the
@@ -371,9 +923,7 @@ mac_probe() {
 echo "--- Checking Gate 0: Deployed code == committed code ---"
 DEPLOYED_SHA=$(~/.cargo/bin/ezgha --version 2>/dev/null | cut -d'-' -f2 || echo "none")
 CURRENT_SHA=$(git rev-parse --short HEAD)
-if [ "$DEPLOYED_SHA" != "$CURRENT_SHA" ]; then
-    fail "Deployed binary SHA ($DEPLOYED_SHA) does not match current HEAD Git SHA ($CURRENT_SHA). Run cargo install --path ."
-fi
+verify_deployed_sha "$DEPLOYED_SHA"
 
 CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
 UNCOMMITTED=$(git status --porcelain 2>/dev/null | grep -vE 'docs/observe|docs/goals|goals/|.beads/' || true)
@@ -397,12 +947,21 @@ else
     echo "Info: running on feature branch '$CURRENT_BRANCH' (Gate 0 strict main check bypassed)"
 fi
 
-pass "Gate 0: Deployed binary matches HEAD SHA ($CURRENT_SHA)"
+pass "Gate 0: Deployed binary ($DEPLOYED_SHA) matches HEAD ($CURRENT_SHA) or trails it only by non-build-input commits"
 
 # --- Gate 1: Code quality ---
 echo "--- Checking Gate 1: Code quality ---"
 cargo build --release >/dev/null || fail "Cargo release build failed"
-cargo test >/dev/null || fail "Cargo tests failed"
+# Preserve raw test output on failure so the diagnostic surfaces the
+# actual primary failure (a single 'Cargo tests failed' line was the
+# pre-existing root-cause-of-unknown-status problem).
+GATE1_TEST_LOG=$(mktemp 2>/dev/null || echo "/tmp/ezgha-gate1-test-$$.log")
+if ! cargo test > "$GATE1_TEST_LOG" 2>&1; then
+    echo "[GATE 1 DIAGNOSTIC] cargo test failed; raw output preserved at $GATE1_TEST_LOG" >&2
+    tail -120 "$GATE1_TEST_LOG" >&2
+    fail "Cargo tests failed (see $GATE1_TEST_LOG for the raw failing-test names + assertion messages)"
+fi
+rm -f "$GATE1_TEST_LOG"
 cargo clippy --all-targets -- -D warnings >/dev/null || fail "Clippy warnings/errors found"
 cargo fmt --check >/dev/null || fail "Cargo formatting checks failed"
 
@@ -464,7 +1023,26 @@ elif [ "$PLATFORM" = "macos" ]; then
   [ -f "${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist" ]     || fail "launchd plist missing at ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
 fi
 
+service_docker_endpoint() {
+  local service_env endpoint
+  service_env="$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null || true)"
+  endpoint="$(printf '%s\n' "$service_env" | tr ' ' '\n' | sed -n 's/^DOCKER_HOST_OVERRIDE=//p' | head -1)"
+  printf '%s\n' "${endpoint:-unix:///var/run/docker.sock}"
+}
+
+if [ "$PLATFORM" = "linux" ]; then
+  # The service's persisted override, or native Linux fallback, controls this
+  # verification; ambient operator Docker context is deliberately ignored.
+  DOCKER_HOST="$(service_docker_endpoint)"
+else
+  DOCKER_HOST="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" --print-endpoint)" \
+      || fail "Docker endpoint selection is unknown; cannot verify containment"
+fi
+export DOCKER_HOST
+unset DOCKER_CONTEXT
 docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unreachable"
+DOCKER_CONTAINMENT_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "$DOCKER_HOST")" \
+    || fail "Docker endpoint ownership is unknown; cannot verify containment"
 
 if [ "$PLATFORM" = "macos" ] && command -v colima >/dev/null 2>&1; then
   colima status 2>&1 | grep -qi "is running"     || fail "Colima VM is not running (run: colima start)"
@@ -499,6 +1077,31 @@ LIMIT_MEMORY_MB=$(toml_get_limits memory_mb 0)
 LIMIT_CPUS=$(toml_get_limits cpus 0.50)
 LIMIT_PIDS=$(toml_get_limits pids 1024)
 MIN_FREE_DISK_GB=$(toml_get_limits min_free_disk_gb 10)
+# 2026-10-03: limits.cpu_burst opt-in changes the Gate 3 CPU clamp
+# semantics. Default false keeps the historical equal-share arithmetic
+# (daemon_ncpu / count, .5 floor); true requires a verified VM daemon +
+# finite positive daemon_ncpu and clamps to min(cfg.cpus, daemon_ncpu),
+# 2-decimal-rounded to mirror src/docker_backend.rs's
+# format!("{:.2}", cpus) that converts to NanoCpus. Reading via the
+# existing toml_get_limits helper (not inventing separate semantics)
+# keeps parser behavior aligned with the rest of Gate 3.
+LIMIT_CPU_BURST=$(toml_get_limits cpu_burst false)
+# Burst production guard (Gate 3 must mirror src/docker_backend.rs
+# effective_limits_with_capacity): when limits.cpu_burst=true, refuse
+# if either (a) the docker daemon isn't proven VM-contained via the
+# SAME kernel-proof the Rust guard uses, or (b) daemon NCPU is not
+# finite positive. Silent fallback to the raw cfg.cpus would let an
+# operator believe burst was honored when neither Serve startup nor
+# effective_limits would have admitted it. Default-false leaves both
+# checks unexecuted (equal-share arithmetic still applies). Extracted
+# into gate3_burst_preflight so focused shell tests
+# (tests/verify_exit_gate3_burst_preflight_test.sh) can exercise the
+# same code path without spinning the live fleet; the inline call here
+# uses the same helper so production and tests stay in lockstep.
+GATE3_PROVEN_NCPU=""
+if [ "$LIMIT_CPU_BURST" = "true" ]; then
+    GATE3_PROVEN_NCPU=$(gate3_burst_preflight) || fail "limits.cpu_burst=true preflight refused: $(gate3_burst_preflight 2>&1)"
+fi
 VM_TOTAL_MB=$(toml_get_runner vm_total_mb 0)
 GUEST_RESERVE_MB=$(toml_get_runner guest_reserve_mb 4096)
 RUNNER_FLOOR_MB=$(toml_get_runner runner_floor_mb 3072)
@@ -541,7 +1144,7 @@ if [ "$EXPECTED_MEMORY_BYTES" -le 0 ]; then
     fail "Computed expected memory bytes must be > 0 (limits.memory_mb='$LIMIT_MEMORY_MB')"
 fi
 
-if ! daemon_in_vm; then
+if ! containment_in_vm; then
     if ! cpu_controller_available; then
         fail "CPU controller check failed: this host does not expose a usable cpu cgroup controller"
     fi
@@ -573,8 +1176,8 @@ EXPECTED_RUNNING=0
 # ⇒ headroom = 2768 MiB (≈2.7 GiB) for host reserve / cgroup overhead / sibling slots.
 # Prior value 3100 × 10 = 31000 MiB (≈30.3 GiB) ⇒ only 1768 MiB (≈1.7 GiB) headroom
 # (too tight under load). Lowering memory_mb from 3100 → 3000 widens the safety
-# margin so the host-watchdog (`max-load-1 = 24`) is less likely to trip under
-# aggregate memory pressure. Restart pending deploy-owner (single-writer rule).
+# margin so aggregate runner memory remains inside the finite VM envelope.
+# Deployment remains pending the designated deploy-owner (single-writer rule).
 for slot in $(seq 1 "$COUNT"); do
     SLOT_NAME="${NAME_PREFIX}-${slot}"
     retry=0
@@ -648,25 +1251,48 @@ for slot in $(seq 1 "$COUNT"); do
         fail "slot $SLOT_NAME memory limit $SLOT_MEMORY_BYTES below the absolute floor $RUNNER_FLOOR_BYTES bytes (runner_floor_mb=$RUNNER_FLOOR_MB)"
     fi
     # Compute EXACT effective CPU clamp, mirroring src/docker_backend.rs
-    # effective_limits_with_capacity(): the daemon caps per-slot cpus at
-    # max(daemon_ncpu / count, 0.5) whenever that share is BELOW the
-    # configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU VM with 6
-    # runners clamps to 1.667 per slot -- observed live, bead jleechan-ehsi).
-    # Checking the raw configured value here would permanently fail Gate 3
-    # on any host where configured cpus*count exceeds the VM's core count,
-    # even though the daemon's clamp is the intended, safe behavior (same
-    # pattern as the memory clamp above).
+    # effective_limits_with_capacity(). Default (cpu_burst=false) caps
+    # per-slot cpus at max(daemon_ncpu / count, 0.5) whenever that share
+    # is BELOW the configured limits.cpus (e.g. limits.cpus=4 on a 10-vCPU
+    # VM with 6 runners clamps to 1.667 per slot -- observed live, bead
+    # jleechan-ehsi). Opt-in (cpu_burst=true, 2026-10-03) caps at
+    # min(cfg.cpus, daemon_ncpu) and requires a verified VM daemon plus
+    # finite positive daemon_ncpu; without that evidence, the burst path
+    # would have refused at serve startup so any value here would also
+    # pass. Memory and PIDs are unchanged from prior commits; only the
+    # CPU arithmetic branches on cpu_burst.
     EXPECTED_EFFECTIVE_CPUS=$LIMIT_CPUS
-    DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    if [ "$LIMIT_CPU_BURST" = "true" ]; then
+        # Burst path: reuse the GATE3_PROVEN_NCPU snapshot captured at
+        # the top of Gate 3 by gate3_burst_preflight (which already
+        # required exit 0 + finite positive NCPU). Re-probing docker
+        # info per-slot would (a) duplicate work for every slot and
+        # (b) accept a half-failed probe that the preflight would
+        # have caught — by definition it can't disagree with the
+        # snapshot taken at Gate 3 start, so trust it.
+        DAEMON_NCPU=$GATE3_PROVEN_NCPU
+    else
+        DAEMON_NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || true)
+    fi
     if is_uint "$DAEMON_NCPU" && [ "$DAEMON_NCPU" -gt 0 ] && [ "$COUNT" -gt 0 ]; then
-        CPU_SHARE=$(awk -v ncpu="$DAEMON_NCPU" -v count="$COUNT" 'BEGIN { s = ncpu / count; if (s < 0.5) s = 0.5; printf "%.6f", s }')
-        EXPECTED_EFFECTIVE_CPUS=$(awk -v cfg="$LIMIT_CPUS" -v share="$CPU_SHARE" 'BEGIN { print (cfg > share) ? share : cfg }')
+        EXPECTED_EFFECTIVE_CPUS=$(expected_effective_cpus \
+            "$LIMIT_CPU_BURST" "$LIMIT_CPUS" "$DAEMON_NCPU" "$COUNT")
+    elif [ "$LIMIT_CPU_BURST" = "true" ]; then
+        # Burst path: the preflight above already proved DAEMON_NCPU is
+        # finite positive when cpu_burst=true; reaching here means the
+        # snapshot unexpectedly lost the value. Fail loud rather than
+        # silently falling back to raw $LIMIT_CPUS, which would mask a
+        # real probe regression.
+        fail "limits.cpu_burst=true but per-slot DAEMON_NCPU snapshot is empty ('$DAEMON_NCPU'); src/docker_backend.rs::effective_limits refused this same config at Serve startup, so the running fleet cannot be in burst mode"
     fi
     # The daemon passes cpus to `docker run --cpus` via format!("{:.2}", cpus)
     # (src/docker_backend.rs) -- 2-decimal rounding BEFORE docker converts it
     # to NanoCpus, e.g. 1.6666666666666667 -> "1.67" -> NanoCpus=1670000000,
     # not the naive full-precision 1666666667. Round here identically or this
-    # check permanently mismatches by the rounding delta.
+    # check permanently mismatches by the rounding delta. Burst path rounds
+    # the same way: min(cfg.cpus, daemon_ncpu) is already a small integer or
+    # half-step; the .2f here is a no-op except in mixed precision cases
+    # (e.g. cfg.cpus=1.333 on ncpu=4 -> 1.33).
     EXPECTED_EFFECTIVE_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.2f", cpus }')
     EXPECTED_EFFECTIVE_NANO_CPUS=$(awk -v cpus="$EXPECTED_EFFECTIVE_CPUS" 'BEGIN { printf "%.0f", cpus * 1000000000 }')
     if [ "$SLOT_NANO_CPUS" -ne "$EXPECTED_EFFECTIVE_NANO_CPUS" ]; then
@@ -754,31 +1380,15 @@ pass "Gate 3: Full local per-slot capacity and envelope enforcement proof passed
 echo "--- Checking Gate 4: Real job execution ---"
 CANARY_TIMEOUT_SECONDS="${CANARY_TIMEOUT_SECONDS:-600}"
 CANARY_CONFIG="${CANARY_CONFIG_FILE:-$CONFIG_FILE}"
-if [ ! -f "$CANARY_CONFIG" ]; then
-    fail "Gate 4: canary config file not found at $CANARY_CONFIG"
-fi
-CANARY_NAME_PREFIX=$(CONFIG_FILE="$CANARY_CONFIG" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
-if ! CANARY_OUT=$(~/.cargo/bin/ezgha --config "$CANARY_CONFIG" canary-once --timeout-seconds "$CANARY_TIMEOUT_SECONDS" 2>&1); then
-    echo "$CANARY_OUT"
-    fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${CANARY_NAME_PREFIX}-* using $CANARY_CONFIG"
-fi
-echo "$CANARY_OUT"
-CANARY_RUN_ID=$(echo "$CANARY_OUT" | jq -r '.run_id // empty' 2>/dev/null || true)
-CANARY_RUNNER=$(echo "$CANARY_OUT" | jq -r '.runner_name // empty' 2>/dev/null || true)
-CANARY_TTS=$(echo "$CANARY_OUT" | jq -r '.time_to_start_seconds // empty' 2>/dev/null || true)
-if [ -z "$CANARY_RUN_ID" ] || [ -z "$CANARY_RUNNER" ]; then
-    fail "Gate 4: canary output lacked run_id or runner_name"
-fi
-echo "    [INFO] Fresh canary run $CANARY_RUN_ID started on $CANARY_RUNNER in ${CANARY_TTS:-?}s"
-pass "Gate 4: Fresh nonce-tracked canary ran successfully on the ezgha fleet using $CANARY_CONFIG"
+verify_fresh_canary "$CANARY_CONFIG" "$CANARY_TIMEOUT_SECONDS"
 
 # --- Gate 7: Monitoring ---
 echo "--- Checking Gate 7: Monitoring ---"
 if [ "$PLATFORM" = "linux" ]; then
-    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-watchdog/ || $2 ~ /ezgha-watchdog/ || $3 ~ /ezgha-watchdog/ || $0 ~ /ezgha-watchdog/' || true)
-    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-watchdog.timer 2>/dev/null || true)
-    TIMER_ACTIVE=$(systemctl --user is-active ezgha-watchdog.timer 2>/dev/null || true)
-    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-watchdog.service 2>/dev/null || true)
+    MONITOR_TASKS=$(systemctl --user list-timers --all 2>/dev/null | awk '$1 ~ /ezgha-token-refresh/ || $2 ~ /ezgha-token-refresh/ || $3 ~ /ezgha-token-refresh/ || $0 ~ /ezgha-token-refresh/' || true)
+    TIMER_ENABLED=$(systemctl --user is-enabled ezgha-token-refresh.timer 2>/dev/null || true)
+    TIMER_ACTIVE=$(systemctl --user is-active ezgha-token-refresh.timer 2>/dev/null || true)
+    SERVICE_ACTIVE=$(systemctl --user is-active ezgha-token-refresh.service 2>/dev/null || true)
     if [ -z "$MONITOR_TASKS" ] || [ "$TIMER_ENABLED" != "enabled" ] || [ "$TIMER_ACTIVE" != "active" ]; then
         fail "Gate 7: Monitoring timer not properly installed/enabled/active (timers: '$MONITOR_TASKS', enabled: '$TIMER_ENABLED', active: '$TIMER_ACTIVE', service: '$SERVICE_ACTIVE')"
     fi
@@ -789,10 +1399,15 @@ if [ "$PLATFORM" = "linux" ]; then
     # Gate 8 elsewhere). If the unit IS present but PSI_SHED_CHAIN is
     # empty, we FAIL — that is the exact cold-review-flagged
     # regression this gate exists to prevent.
+    # `systemctl show` prints an `Environment=` line even for a unit that does not
+    # exist (LoadState=not-found), which read as "installed with an empty chain" and
+    # failed this gate on hosts where the watcher was never installed. Check the
+    # load state first; only a loaded unit can be missing its PSI_SHED_CHAIN.
+    PSI_OOM_LOAD="$(systemctl --user show psi-oom-watcher.service -p LoadState --value 2>/dev/null || true)"
     PSI_OOM_ENV="$(systemctl --user show psi-oom-watcher.service -p Environment 2>/dev/null || true)"
     PSI_OOM_PRESENT="no"
     PSI_OOM_CHAIN=""
-    if [ -n "${PSI_OOM_ENV}" ]; then
+    if [ "${PSI_OOM_LOAD}" = "loaded" ] && [ -n "${PSI_OOM_ENV}" ]; then
         PSI_OOM_PRESENT="yes"
         # Extract the PSI_SHED_CHAIN= substring (handles both quoted and
         # ambient forms, plus the surrounding Environment=VALUE list).
@@ -830,20 +1445,120 @@ pass "Gate 7: Automated monitoring scheduled and alert delivery verified"
 
 # --- Gate 8: VM/AO/MCP containment (process-level backstop; bead jleechan-aqh) ---
 # Why this gate exists: the project's stated goal is physical-host
-# availability (prevent watchdog reboots). Per-container clamps in Gate 3
+# availability (prevent unconstrained process memory growth). Per-container clamps in Gate 3
 # cover individual Docker containers, but they do NOT bound (a) the QEMU
 # process running the Colima/Lima VM (host-side, outside the container
 # envelope), (b) the Agent Orchestrator and MCP daemons (which run as
 # user-scope processes with no enforced cgroup ceiling), or (c) the
-# aggregate memory demand across all three. The 2026-07-10 watchdog
-# reboot had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
+# aggregate memory demand across all three. The 2026-07-10 incident
+# had QEMU OOM-killed at ~37.6 GiB with no aggregate cap in
 # place. This gate makes the absence of any of those constraints a
 # verifier-level fail-closed, citing the four remediation paths so the
 # cold reader sees them at the top of the gate output.
 echo "--- Checking Gate 8: VM/AO/MCP containment ---"
+MODERN_UNIT_DIR="${HOME}/.config/systemd/user"
+MODERN_WRAPPER="${HOME}/.local/bin/codex"
+if [ "$(uname -s)" = "Linux" ]; then
+    if ! verify_platform_actions_slice Linux "$CONFIG_FILE"; then
+        fail "Gate 8: active Linux config must set limits.cgroup_parent = actions.slice"
+    fi
+    if containment_in_vm && command -v limactl >/dev/null 2>&1; then
+        if ! verify_guest_managed_runners_in_actions_slice; then
+            fail "Gate 8: every managed runner in the Docker VM must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
+        fi
+    elif ! verify_managed_runners_in_actions_slice; then
+        fail "Gate 8: every managed runner must be inside the live /sys/fs/cgroup/actions.slice hierarchy"
+    fi
+    echo "    [PASS] Gate 8: config and managed runners use live actions.slice hierarchy"
+    # This policy precedes optional modern-envelope detection: a retired
+    # watcher must not be obscured by incomplete local unit files.
+    verify_modern_timers
+fi
+IS_MODERN_ENVELOPE=0
+if modern_envelope_required; then
+    IS_MODERN_ENVELOPE=1
+    echo "    [INFO] Gate 8: modern finite host envelope detected"
+    MODERN_HOST_TOTAL_MB=$(awk '/^MemTotal:/ {print int($2 / 1024); exit}' /proc/meminfo)
+    native_actions=1
+    if daemon_in_vm; then native_actions=0; fi
+    profile=$(modern_envelope_budget "$MODERN_UNIT_DIR" "$REPO_ROOT/systemd/host/actions.slice" "$native_actions" "$COUNT" "$MODERN_HOST_TOTAL_MB") \
+        || fail "Gate 8 modern envelope: required finite unit limits are unreadable, invalid, or exceed host RAM plus reserve"
+    read -r MODERN_MAX_TOTAL_MB selected_tasks MODERN_RESERVE_MB <<<"$profile"
+
+    # Gate 8 runner aggregate: the configured Linux and Mac container limits
+    # must be nested inside a finite actions.slice. Where the docker daemon
+    # runs inside Colima (Mac, or a Linux host with a VM-backed daemon) that
+    # slice lives in the guest and is read through limactl; where the daemon
+    # runs on the host (jeff-ubuntu) the slice is the host's own, and the
+    # oracle is the tracked unit systemd/host/actions.slice, not the guest
+    # numbers. Host-Docker deployments must inspect the host hierarchy.
+    if containment_in_vm && command -v limactl >/dev/null 2>&1; then
+        GUEST_ACTIONS_VALUES=""
+        {
+            GUEST_ACTIONS_VALUES=$(limactl shell colima -- sh -lc "
+                test -f /etc/systemd/system/actions.slice || exit 1
+                cat /sys/fs/cgroup/actions.slice/memory.high
+                cat /sys/fs/cgroup/actions.slice/memory.max
+                cat /sys/fs/cgroup/actions.slice/memory.swap.max
+                cat /sys/fs/cgroup/actions.slice/pids.max
+                $GUEST_RUNNERS_ACTIONS_SLICE_SCRIPT
+                echo RUNNERS=actions.slice
+            " 2>/dev/null | tr '\n' ' ' || true)
+        }
+        read -r guest_high guest_max guest_swap guest_tasks guest_runners _ <<<"${GUEST_ACTIONS_VALUES}"
+        if [ "${guest_high:-}" != 30064771072 ] \
+           || [ "${guest_max:-}" != 34359738368 ] \
+           || [ "${guest_swap:-}" != 0 ] \
+           || [ "${guest_tasks:-}" != 6000 ] \
+           || [ "${guest_runners:-}" != "RUNNERS=actions.slice" ]; then
+            fail "Gate 8 guest runner aggregate: expected live high=28G max=32G swap=0 tasks=6000 and every runner in actions.slice, got high=${guest_high:-unavailable} max=${guest_max:-unavailable} swap=${guest_swap:-unavailable} tasks=${guest_tasks:-unavailable} runners=${guest_runners:-unavailable}"
+        fi
+        echo "    [PASS] Gate 8 guest runner aggregate: high=28G max=32G swap=0 tasks=6000"
+    else
+        host_unit="${REPO_ROOT}/systemd/host/actions.slice"
+        host_high_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryHigh)")
+        host_max_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemoryMax)")
+        host_swap_expect=$(host_to_bytes "$(host_unit_value "$host_unit" MemorySwapMax)")
+        host_tasks_expect=$(host_unit_value "$host_unit" TasksMax)
+        # The tracked unit must itself be finite: an unbounded value would otherwise
+        # "match" an unbounded live slice and pass a gate whose point is the bound.
+        for v in "$host_high_expect" "$host_max_expect" "$host_swap_expect" "$host_tasks_expect"; do
+            case "$v" in
+                ''|max|infinity|*[!0-9]*) fail "Gate 8 host runner aggregate: tracked ${host_unit} must set finite numeric MemoryHigh/MemoryMax/MemorySwapMax/TasksMax (got high=${host_high_expect:-?} max=${host_max_expect:-?} swap=${host_swap_expect:-?} tasks=${host_tasks_expect:-?})" ;;
+            esac
+        done
+        host_high=$(cat /sys/fs/cgroup/actions.slice/memory.high 2>/dev/null || true)
+        host_max=$(cat /sys/fs/cgroup/actions.slice/memory.max 2>/dev/null || true)
+        host_swap=$(cat /sys/fs/cgroup/actions.slice/memory.swap.max 2>/dev/null || true)
+        host_tasks=$(cat /sys/fs/cgroup/actions.slice/pids.max 2>/dev/null || true)
+        if [ -z "$host_high_expect" ] || [ -z "$host_max_expect" ] || [ -z "$selected_tasks" ] \
+           || [ "$host_high" != "$host_high_expect" ] \
+           || [ "$host_max" != "$host_max_expect" ] \
+           || [ "$host_swap" != "$host_swap_expect" ] \
+           || [ "$host_tasks" != "$selected_tasks" ]; then
+            fail "Gate 8 host runner aggregate: live actions.slice does not match selected $COUNT-runner profile (expected high=$host_high_expect max=$host_max_expect swap=$host_swap_expect tasks=$selected_tasks)"
+        fi
+        echo "    [PASS] Gate 8 host runner aggregate: live actions.slice matches selected $COUNT-runner profile (high=$host_high max=$host_max swap=$host_swap tasks=$host_tasks); runner membership proven above"
+    fi
+
+    echo "    [PASS] hard maxima ${MODERN_MAX_TOTAL_MB}MB + reserve ${MODERN_RESERVE_MB}MB fit host ${MODERN_HOST_TOTAL_MB}MB"
+
+    if ! verify_automation_dropins; then
+        fail "Gate 8 modern envelope: every installed automation service must have its automation.slice drop-in"
+    fi
+    for bin in codex claude gemini; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            wrapper="${HOME}/.local/bin/${bin}"
+            if [ ! -f "$wrapper" ] || ! grep -q '^# ezgha-agent-wrapper$' "$wrapper"; then
+                fail "Gate 8 modern envelope: installed ${bin} is not routed through the scoped wrapper"
+            fi
+        fi
+    done
+    echo "    [PASS] Gate 8: modern hard host envelope and future-session containment installed"
+fi
 # Remediation primer (printed before probes fire so a cold reader sees
 # the four probes + their fixes):
-#   (1) QEMU slice:    systemd/app-lima-vm.slice (MemoryHigh=38G) must be
+#   (1) QEMU slice:    systemd/app-lima-vm.slice (finite approved memory limits) must be
 #                      deployed to ~/.config/systemd/user/ AND reloaded
 #                      (systemctl --user daemon-reload); the LIVE leaf
 #                      cgroup's memory.high in /sys/fs/cgroup must be a
@@ -853,10 +1568,7 @@ echo "--- Checking Gate 8: VM/AO/MCP containment ---"
 #                      MemoryHigh; currently ao-daemon.service has
 #                      memory.high=max and contains the AO daemon + MCP
 #                      servers uncontained.
-#   (3) PSI admission: enroll scripts/host/psi-oom-watcher.sh via a
-#                      user-scope .timer, OR rely on systemd-oomd active
-#                      at any scope (default policy on Ubuntu 24.04
-#                      manages user.slice automatically).
+#   (3) PSI admission: systemd-oomd must have a real enrolled cgroup.
 #   (4) Aggregate:     physical_host_RAM >= QEMU slice ceiling (read from
 #                      /sys/fs/cgroup${QEMU_CG}/memory.high) + AO/MCP slice
 #                      ceilings (sum across unique slice paths) + mandatory
@@ -868,7 +1580,7 @@ echo "--- Checking Gate 8: VM/AO/MCP containment ---"
 #                      physical host RAM, lower MemoryHigh on
 #                      app-lima-vm.slice, or lower the agent-CLI slice
 #                      MemoryHigh.
-echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user restart lima-vm@colima. (2) install agent-CLI slice per ez-gh-actions-0725; ensure ao-daemon.service has a finite MemoryHigh. (3) systemctl --user enable --now psi-oom-watcher.timer (or rely on system systemd-oomd active). (4) ensure QEMU slice + AO/MCP slice ceilings + mandatory host reserve (max(2G, 10% host RAM)) fit within /proc/meminfo MemTotal; if not, raise host RAM, lower MemoryHigh on app-lima-vm.slice, or lower the agent-CLI slice MemoryHigh."
+echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live limits and the computed host reserve. Native Release 1 requires actions.slice ManagedOOMMemoryPressure=kill at 80% (listed by oomctl), ManagedOOM=auto on the other host slices, and retired PSI timers; VM-backed legacy policy requires a cgroup enrolled in systemd-oomd (ManagedOOMMemoryPressure=kill or ManagedOOMSwap=kill)."
 
 # (1) QEMU cgroup probe --------------------------------------------------------------
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
@@ -876,38 +1588,25 @@ echo "    [REMEDIATION] (1) cp systemd/app-lima-vm.slice ~/.config/systemd/user/
 # jeff-ubuntu), QEMU runs at host scope and IS reachable via
 # /proc/<qemu>/cgroup, so we still probe. On every other combo, we probe.
 PROBE_QEMU_SLICE=1
-if [ "$(uname -s)" = "Darwin" ] && daemon_in_vm; then
+if [ "$(uname -s)" = "Darwin" ] && containment_in_vm; then
     PROBE_QEMU_SLICE=0
     echo "    [SKIP] Gate 8 (1) QEMU slice probe: daemon-in-VM on macOS (Lima VM cgroup not reachable from macOS shell)"
 fi
 QEMU_PID=""
 QEMU_CG=""
 if [ "$PROBE_QEMU_SLICE" = "1" ]; then
-    QEMU_PID=$(pgrep -f 'qemu-system-x86_64' | head -1 || true)
-    if [ -z "$QEMU_PID" ]; then
-        fail "Gate 8 (1) FAIL-CLOSED: no qemu-system-x86_64 process detected on this host. The project's stated goal (physical-host availability) requires that the Colima/Lima VM is provably bounded by an enforced cgroup ceiling; without that process the bound cannot be verified. Remediation: start the Colima VM (limactl start colima, or colima start) — without it Docker daemon has no parent and the per-container limits are unrolled."
-    else
-        # /proc/<pid>/cgroup on cgroup-v2-only hosts is a single line
-        # starting with "0::<path>". Extract the path with grep + cut.
-        QEMU_CG=$(grep '^0::' "/proc/$QEMU_PID/cgroup" 2>/dev/null | head -1 || true)
-        if [ -z "$QEMU_CG" ]; then
-            fail "Gate 8 (1) PID $QEMU_PID has no cgroup-v2 entry in /proc/$QEMU_PID/cgroup. Remediation: ensure the host kernel exposes CONFIG_CGROUP_V2."
-        fi
-        # /proc/<pid>/cgroup escapes '-' as the literal 4-char sequence
-        # '\x2d' on this host, so 'app-lima-vm' written plainly will not
-        # match 'app-lima\x2dvm.slice'. Match on the unit/service name
-        # instead — 'lima-vm' substring catches both 'lima-vm@colima.service'
-        # and 'app-lima\x2dvm.slice'.
-        if ! echo "$QEMU_CG" | grep -q 'lima-vm'; then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) cgroup is '$QEMU_CG' — expected to contain 'lima-vm'. Remediation: migrate lima-vm@colima.service to the app-lima-vm.slice defined in systemd/app-lima-vm.slice."
-        fi
-        if ! QEMU_BAD=$(cgroup_leaf_has_memory_ceiling "$QEMU_CG"); then
-            fail "Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup is unbounded: $QEMU_BAD. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
-        fi
-        echo "    [PASS] Gate 8 (1) QEMU (pid=$QEMU_PID) leaf cgroup has a finite memory ceiling"
+    # Resolve exactly one QEMU bound to lima-vm@colima.service.
+    if ! QEMU_ASSERTION="$(ASSERT_LIVE_QEMU=1 \
+        "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)"; then
+        fail "Gate 8 (1) QEMU service-bound assertion failed: $QEMU_ASSERTION"
     fi
+    QEMU_CG_PATH="$(printf '%s\n' "$QEMU_ASSERTION" | sed -n 's/.* cgroup=\([^ ]*\) .*/\1/p' | head -1)"
+    case "$QEMU_CG_PATH" in
+        /sys/fs/cgroup/*) QEMU_CG="0::${QEMU_CG_PATH#/sys/fs/cgroup}" ;;
+        *) fail "Gate 8 (1) QEMU service-bound assertion returned no canonical cgroup path: $QEMU_ASSERTION" ;;
+    esac
+    echo "    [PASS] Gate 8 (1) QEMU service-bound cgroup assertion passed"
 fi
-
 # (2) AO/MCP slice probe --------------------------------------------------------------
 # Identify Agent Orchestrator + MCP daemon processes by argv pattern
 # (comm alone misses python3-spawned MCP servers), then verify each
@@ -923,12 +1622,6 @@ else
         cg=$(grep '^0::' "/proc/$pid/cgroup" 2>/dev/null | head -1 || true)
         [ -z "$cg" ] && continue
         comm=$(cat "/proc/$pid/comm" 2>/dev/null || echo "?")
-        # /user@<uid>.service/ is the unbounded user session — fail-closed.
-        if echo "$cg" | grep -qE '/user@[0-9]+\.service/'; then
-            AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid}) "
-            AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
-            continue
-        fi
         if ! LEAF_CHECK=$(cgroup_leaf_has_memory_ceiling "$cg"); then
             AO_MCP_BAD="${AO_MCP_BAD}${comm}(pid=${pid},$LEAF_CHECK) "
             AO_MCP_BAD_COUNT=$((AO_MCP_BAD_COUNT + 1))
@@ -945,7 +1638,7 @@ else
                   }
               }')
     if [ -n "$AO_MCP_BAD" ]; then
-        fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite MemoryHigh (~20G) so the Agent Orchestrator + MCP daemons cannot OOM the host."
+        fail "Gate 8 (2) AO/MCP processes running without enforced slice ceiling (n=${AO_MCP_BAD_COUNT}): $AO_MCP_BAD. Remediation: per bead ez-gh-actions-0725, wrap ao-daemon.service in an agent-CLI slice with a finite approved memory ceiling so the Agent Orchestrator + MCP daemons cannot OOM the host."
     fi
     AO_MCP_TOTAL=$(ps -u "$(id -u)" -o args= --no-headers 2>/dev/null | awk '
                   {
@@ -975,16 +1668,12 @@ fi
 #     the requirement is waived (operators who have not installed an
 #     agent CLI do not need to enroll anything).
 #   - If ANY candidate is on PATH, then agents.slice MUST have at least
-#     one enrolled leaf (transient scope-* or service-* child), AND
-#     every enrolled leaf's memory.high MUST be a finite value (an
-#     "unbounded leaf within a bounded slice" is the exact failure
-#     shape that motivated this probe — the slice's own MemoryHigh
-#     applies to the SUM of its children, so a leaf with memory.high=
-#     max inside agents.slice defeats the parent cap).
-#   - The ao-daemon.service drop-in at
-#     systemd/ao-daemon-memory-cap.service.d/memory.conf installs
-#     Slice=agents.slice + MemoryHigh=20G on the daemon; the script
-#     scripts/host/agent-auto-migrate.sh enrolls interactive sessions.
+#     one enrolled leaf (transient scope-* or service-* child), and the
+#     slice must have a finite recursive memory ceiling. Child scopes may
+#     retain memory.high=max: cgroup-v2 still applies the finite parent to
+#     the aggregate of every descendant.
+#   - install.sh routes future CLI launches through agent-scoped-launch.sh;
+#     existing sessions are intentionally not killed during installation.
 AGENT_CLI_BINARIES="claude codex gemini cursor aider cody"
 AGENT_CLI_FOUND=""
 AGENT_CLI_MISSING=""
@@ -1009,38 +1698,27 @@ else
     SYSFS="/sys/fs/cgroup"
     AGENT_SLICE_BASE="${SYSFS}/user.slice/user-$(id -u).slice/user@$(id -u).service/agents.slice"
     AGENT_LEAF_COUNT=0
-    AGENT_UNBOUNDED_LEAVES=""
     if [ -d "${AGENT_SLICE_BASE}" ]; then
         # Enumerate immediate child cgroups of the slice.
         while IFS= read -r leaf_dir; do
             [ -d "$leaf_dir" ] || continue
             AGENT_LEAF_COUNT=$((AGENT_LEAF_COUNT + 1))
-            leaf_high=$(cat "${leaf_dir}/memory.high" 2>/dev/null || echo "?")
-            # Treat "max" AND "unreadable" as unbounded; the helper
-            # cgroup_leaf_has_memory_ceiling accepts both. Either shape
-            # means the leaf has no enforced ceiling.
-            if [ "$leaf_high" = "max" ] || [ "$leaf_high" = "?" ]; then
-                leaf_name=$(basename "$leaf_dir")
-                AGENT_UNBOUNDED_LEAVES="${AGENT_UNBOUNDED_LEAVES}${leaf_name}(memory.high=${leaf_high}) "
-            fi
         done < <(find "${AGENT_SLICE_BASE}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true)
     fi
     if [ "$AGENT_LEAF_COUNT" -eq 0 ]; then
         fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: agent-CLI binaries on PATH (${AGENT_CLI_FOUND}) but ${AGENT_SLICE_BASE} has zero enrolled leaves. Remediation: per bead ez-gh-actions-0725 (round-3 policy: AUTO-MIGRATE with --opt-out), run 'scripts/host/agent-auto-migrate.sh apply' to relaunch matching PIDs into the slice, OR install systemd/ao-daemon-memory-cap.service.d/memory.conf to enroll the ao-daemon.service so the slice has at least one service-* leaf. The AGENT_SLICE_OPT_OUT=1 env-var escape hatch exists for explicit opt-OUT per session."
     fi
-    if [ -n "$AGENT_UNBOUNDED_LEAVES" ]; then
-        fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: slice has ${AGENT_LEAF_COUNT} leaf(ves) but ${AGENT_UNBOUNDED_LEAVES}are unbounded (memory.high=max). The parent slice's MemoryHigh applies to the SUM of children, so a leaf with memory.high=max defeats the aggregate cap. Remediation: copy systemd/ao-daemon-memory-cap.service.d/memory.conf to ~/.config/systemd/user/ao-daemon.service.d/ and ensure every interactive agent-CLI session enrolls via scripts/host/agent-auto-migrate.sh (which delegates to systemd-run --user --slice=agents.slice --scope -- <cmd>). Per bead ez-gh-actions-0725."
+    AGENT_SLICE_CG="${AGENT_SLICE_BASE#${SYSFS}}"
+    if ! cgroup_has_effective_memory_ceiling "$AGENT_SLICE_CG"; then
+        fail "Gate 8 (2.5) agents.slice enrollment FAIL-CLOSED: slice has ${AGENT_LEAF_COUNT} leaf(ves) but no finite memory.high/memory.max in its cgroup ancestry."
     fi
-    echo "    [PASS] Gate 8 (2.5) agents.slice enrollment: ${AGENT_LEAF_COUNT} leaf(ves) enrolled (all memory.high finite); agent-CLI on PATH: ${AGENT_CLI_FOUND}"
+    echo "    [PASS] Gate 8 (2.5) agents.slice enrollment: ${AGENT_LEAF_COUNT} leaf(ves) enrolled under a finite aggregate ceiling; agent-CLI on PATH: ${AGENT_CLI_FOUND}"
 fi
 
 # (3) PSI admission check --------------------------------------------------------------
-# Either a real cgroup is enrolled with systemd-oomd (ManagedOOM
+# A real cgroup must be enrolled with systemd-oomd (ManagedOOM
 # MemoryPressure/Swap explicitly opted in, OR oomctl reports a
-# non-empty "Memory Pressure Monitored CGroups:" list), OR
-# psi-oom-watcher.timer is enrolled AND the script it invokes actually
-# contains a real shed action path (kill / systemctl stop / qemu-lima-
-# docker shed, not a no-op journal logger). One of the two MUST be live;
+# non-empty "Memory Pressure Monitored CGroups:" list). This MUST be live;
 # the previous version of this check accepted "systemd-oomd active"
 # alone, which fails to detect the 2026-07-10 host-crash failure mode
 # where oomd was running but no cgroup was actually enrolled for
@@ -1056,7 +1734,23 @@ if [ "$(uname -s)" = "Darwin" ]; then
     PSI_SOURCE="macOS (PSI/systemd-oomd not available)"
 fi
 
-# --- Option A: systemd-oomd with a real, enrolled cgroup -----------------
+if [ "$(uname -s)" = "Linux" ] && [ "$IS_MODERN_ENVELOPE" = 1 ] && ! daemon_in_vm; then
+    verify_modern_psi_policy || fail "Gate 8 (3): canonical live host containment assertion failed"
+    verify_modern_timers || fail "Gate 8 (3): retired timers must be disabled and inactive, or absent"
+    PSI_SOURCE="Release 1 finite host caps and ManagedOOM=auto"
+    if host_docker_requires_actions_oomctl; then
+        # Host-docker: the runner aggregate itself must be what oomd watches
+        # (systemd/host/actions.slice: ManagedOOMMemoryPressure=kill at 80%).
+        if ! oomctl 2>/dev/null | oomctl_lists_actions_slice; then
+            fail "Gate 8 (3) host-docker PSI admission requires oomctl to list /actions.slice under 'Memory Pressure Monitored CGroups:'. Verify the actions.slice ManagedOOMMemoryPressure=kill and ManagedOOMMemoryPressureLimit=80% policy is live."
+        fi
+        PSI_SOURCE="Release 1 finite host caps; oomctl monitors /actions.slice (kill at 80%)"
+    fi
+    PSI_OK=1
+fi
+
+if [ "$PSI_OK" != "1" ]; then
+# --- systemd-oomd with a real, enrolled cgroup (legacy VM path) ------------
 OOMD_ACTIVE=0
 OOMD_SCOPE=""
 if systemctl is-active systemd-oomd 2>/dev/null | grep -q '^active'; then
@@ -1111,59 +1805,14 @@ if [ "$OOMD_ACTIVE" = "1" ]; then
         PSI_SOURCE="systemd-oomd (${OOMD_SCOPE}-scope, ${OOMD_ENROLL_PROOF})"
     fi
 fi
-
-# --- Option B: psi-oom-watcher.timer enrolled with a real shed path -----
-if [ "$PSI_OK" != "1" ]; then
-    TIMER_ENABLED=$(systemctl --user is-enabled psi-oom-watcher.timer 2>/dev/null || true)
-    TIMER_ACTIVE=$(systemctl --user is-active psi-oom-watcher.timer 2>/dev/null || true)
-    PSI_SCRIPT=""
-    # Resolve the actual script path the timer invokes. Prefer
-    # systemctl cat (resolves ExecStart on this host); fall back to the
-    # repo's expected path. Bail to "" if neither yields a readable
-    # file — the gate must not trust an unverified path.
-    if [ "$TIMER_ENABLED" = "enabled" ] && [ "$TIMER_ACTIVE" = "active" ]; then
-        TIMER_UNIT_FILE=$(systemctl --user cat psi-oom-watcher.timer 2>/dev/null \
-            | awk '/^ExecStart=/ { sub(/^ExecStart=/, ""); print; exit }' || true)
-        if [ -n "$TIMER_UNIT_FILE" ] && [ -r "$TIMER_UNIT_FILE" ]; then
-            PSI_SCRIPT="$TIMER_UNIT_FILE"
-        elif [ -r "${SCRIPTS_DIR:-}/psi-oom-watcher.sh" ]; then
-            PSI_SCRIPT="${SCRIPTS_DIR}/psi-oom-watcher.sh"
-        fi
-        SHED_PROOF=""
-        if [ -n "$PSI_SCRIPT" ] && [ -r "$PSI_SCRIPT" ]; then
-            # "Real shed action" = the script can actually terminate
-            # something under sustained pressure. Patterns accepted:
-            #   - kill / pkill (any process termination)
-            #   - systemctl stop/kill (slice/unit termination)
-            #   - qemu/lima/colima/docker stop|kill|shutdown|qemu-monitor
-            #     (the brief's explicit example class — VM/container shed)
-            # A no-op watcher that only logs to journal must NOT pass.
-            if grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
-                | grep -Eq '\b(kill|pkill)\b[[:space:]]' \
-                || grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
-                    | grep -Eq 'systemctl[[:space:]]+(stop|kill)' \
-                || grep -Ev '^[[:space:]]*#' "$PSI_SCRIPT" 2>/dev/null \
-                    | grep -Eq '(qemu|lima|colima|docker)[[:space:]]+(stop|kill|shutdown|qemu-monitor-command)'; then
-                SHED_PROOF="script=${PSI_SCRIPT##*/} contains real shed action (kill/systemctl-stop/qemu-lima-docker shed)"
-            fi
-        fi
-        if [ -n "$SHED_PROOF" ]; then
-            PSI_OK=1
-            PSI_SOURCE="psi-oom-watcher.timer (user-scope, ${SHED_PROOF})"
-        fi
-    fi
 fi
 
 if [ "$PSI_OK" != "1" ]; then
-    # Distinguish the two failure shapes so the operator knows which
-    # remediation applies. The oomd-only failure is the exact one that
-    # produced the 2026-07-10 host crash; the script failure is the
-    # "watcher is enrolled but does nothing" shape.
     OOMD_BUT_NO_CGROUP=""
     if [ "$OOMD_ACTIVE" = "1" ] && [ "$OOMD_ENROLLED" = "0" ]; then
-        OOMD_BUT_NO_CGROUP=" NOTE: systemd-oomd is active at ${OOMD_SCOPE}-scope but oomctl reports zero monitored cgroups — this is the exact 'oomd running but no cgroup enrolled' shape that allowed the 2026-07-10 host crash. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice (e.g. user.slice, system.slice) so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list, or set ManagedOOMPreference=avoid/omit on slices you want protected from oom-kill, or wire scripts/host/psi-oom-watcher.sh into psi-oom-watcher.timer as a user-scope backstop (per bead ez-gh-actions-0725)."
+        OOMD_BUT_NO_CGROUP=" NOTE: systemd-oomd is active at ${OOMD_SCOPE}-scope but oomctl reports zero monitored cgroups — this is the exact 'oomd running but no cgroup enrolled' shape that allowed the 2026-07-10 host crash. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice (e.g. user.slice, system.slice) so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list, or set ManagedOOMPreference=avoid/omit on slices you want protected from oom-kill."
     fi
-    fail "Gate 8 (3) PSI admission is not wired up with a real shed action: oomd has no enrolled cgroup, AND psi-oom-watcher.timer is either not enabled+active or its script contains no kill/systemctl-stop/qemu-lima-docker shed path. Remediation: enroll scripts/host/psi-oom-watcher.sh via a user-scope .timer (per bead ez-gh-actions-0725), OR set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list.${OOMD_BUT_NO_CGROUP}"
+    fail "Gate 8 (3) PSI admission requires systemd-oomd with a real enrolled cgroup. Remediation: set ManagedOOMMemoryPressure=kill / ManagedOOMSwap=kill on a top-level slice so oomctl reports a non-empty 'Memory Pressure Monitored CGroups:' list.${OOMD_BUT_NO_CGROUP}"
 fi
 PSI_AVG10=$(awk '/^full/ {for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) {gsub("avg10=", "", $i); print $i; exit}}' /proc/pressure/memory 2>/dev/null || echo "?")
 echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /proc/pressure/memory full avg10=${PSI_AVG10}%)"
@@ -1212,6 +1861,9 @@ echo "    [PASS] Gate 8 (3) PSI admission wired up via $PSI_SOURCE (current /pro
 # slice-ceiling model does not apply.
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "    [SKIP] Gate 8 (4) host-RAM aggregate: macOS — cgroup-v2 not available, host-RAM envelope model is Linux-only"
+elif ! containment_in_vm; then
+    # Host-docker: sum the four live finite hard maxima once (no x2 model).
+    verify_host_docker_envelope
 else
     HOST_MEM_TOTAL_KB=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
     if ! is_uint "$HOST_MEM_TOTAL_KB" || [ "$HOST_MEM_TOTAL_KB" -eq 0 ]; then
@@ -1231,7 +1883,7 @@ else
         fail "Gate 8 (4) QEMU slice /sys/fs/cgroup${QEMU_CG_PATH}/memory.high is unreadable. Remediation: verify cgroup-v2 fs is mounted and the slice path is correct (got QEMU_CG='$QEMU_CG')."
     fi
     if [ "$QEMU_CEILING_BYTES" = "max" ]; then
-        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy systemd/app-lima-vm.slice (MemoryHigh=38G) to ~/.config/systemd/user/, run 'systemctl --user daemon-reload', then restart lima-vm@colima so the new slice is applied."
+        fail "Gate 8 (4) QEMU slice ceiling is 'max' (unbounded) — the VM has no enforced upper bound on host RAM and could exhaust it. Remediation: deploy systemd/app-lima-vm.slice (finite approved memory limits) to ~/.config/systemd/user/, have the deploy owner reconcile the approved live limits without restarting the VM."
     fi
     QEMU_CEILING_MB=$(awk -v b="$QEMU_CEILING_BYTES" 'BEGIN { printf "%d\n", b / 1024 / 1024 }')
 
@@ -1338,7 +1990,7 @@ fi
 
 # (5) Mac parity probe (bead ez-gh-actions-r3f16) -----------------------------------
 # Round-3 cold review noted that the fleet has a Mac component
-# (ez-mac-runner-b-1..6) but Gate 8 only probes the Linux host's QEMU
+# (ez-mac-runner-g-1..6) but Gate 8 only probes the Linux host's QEMU
 # cgroup. The Mac side runs colima (a Linux VM under QEMU) on macOS; its
 # cgroup tree is INSIDE the colima VM, reachable from the macOS host
 # shell only via `limactl shell colima --`. This probe brings Gate 8's
@@ -1373,117 +2025,17 @@ fi
 
 pass "Gate 8: VM/AO/MCP containment enforced (bead jleechan-aqh)"
 
-# --- Gate 9: Controlled host-pressure proof (bead ez-gh-actions-bjpk, R3 lane L) ---
-# This gate invokes scripts/host/host-pressure-proof.sh — the executable
-# proof that the three host-reliability lanes (I: PSI/hysteresis admission
-# refusal in src/docker_backend.rs::eval_admission; J: 4-stage
-# drain→reclaim→verify→escalate shed chain in
-# scripts/host/psi-oom-watcher.sh; K: kernel-panic harness in
-# scripts/host/crash-capture-verify.sh) work together under live pressure
-# without OOM, watchdog reboot, or QEMU cgroup ceiling breach.
-#
-# r3f8 cold-review fix (round-4): a dry-run is a precondition check, NOT a
-# pressure proof. The previous Gate 9 wired `--dry-run` as the DEFAULT and
-# PASSed on its exit 0 — which meant the gate could report green without
-# ever applying real pressure. The fix flips the default: the script now
-# exits 64 from --dry-run (refusal, "proof not attempted"); the verifier
-# Gate 9 treats exit 64 as FAIL unless HPP_LIVE=1 is explicitly set.
-#
-# r3f9 enforcement: any canary failure, runner-count loss > 10%, or missing
-# admission-refusal alert now aborts the live proof (exit 1). The script
-# also enforces runner_count concurrency (no hardcoded 3).
-#
-# Two modes:
-#   * DEFAULT (HPP_LIVE != 1): the verifier invokes --dry-run, expects
-#     exit 64, prints a SKIP notice, and FAILs Gate 9. Normal CI hits this
-#     path unless the operator opts in with HPP_LIVE=1.
-#   * LIVE (HPP_LIVE=1): the verifier invokes --live with HPP_LIVE=1 set;
-#     requires exit 0 for PASS. Operator-gated — pressures the host for
-#     ~60s with stress-ng inside agents.slice, dispatches runner_count
-#     concurrent canaries, enforces any-canary-fail / runner-loss >10% /
-#     missing-admission-refusal / OOM / recovery-fail. NEVER auto-enable
-#     in CI without an explicit operator ack that the live host is fair
-#     game.
-#
-# The script also exits 33 ("HPP_LIVE=1 required") if invoked with no flag
-# and no env. The verifier treats 33 as "proof not attempted" too, so a
-# missing-env invocation fails Gate 9.
-#
-# Mac parity (bead ez-gh-actions-r3f16): --mac-hostname is forwarded on
-# both paths so the script can probe the Mac fleet (ssh reachable, colima
-# running, etc.) and the live path can dispatch Mac canaries.
-#
-# Dry-run / refusal timeout defaults to 180s. Live mode defaults to 600s
-# (HPP_TIMEOUT overrides both).
-echo "--- Checking Gate 9: Controlled host-pressure proof (r3f8 dry-run-as-PASS removed) ---"
-if [ "$(uname -s)" = "Darwin" ]; then
-    echo "    [SKIP] Gate 9: host-pressure proof: macOS — stress-ng inside agents.slice is Linux-only"
-    pass "Gate 9: Controlled host-pressure proof (skipped on macOS)"
-else
-HPP_SCRIPT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/scripts/host/host-pressure-proof.sh"
-if [ ! -x "${HPP_SCRIPT}" ]; then
-    fail "Gate 9: host-pressure-proof.sh not found or not executable at ${HPP_SCRIPT}"
+# --- Gate 9: synthetic pressure harness prohibition ---
+# Host-safety validation must not create the failure it is trying to detect.
+# The retired live pressure harness could allocate many GiB and dispatch a
+# concurrent runner burst. Gate 9 runs the hermetic policy regression instead.
+# It proves repository policy only; it is not a live host-survival proof.
+echo "--- Checking Gate 9: Host-lifecycle safety policy ---"
+HOST_SAFETY_TEST="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/tests/forbid_host_reboot_primitives_test.sh"
+if ! bash "${HOST_SAFETY_TEST}"; then
+    fail "Gate 9: host-lifecycle safety policy regression failed"
 fi
-HPP_MAC_HOSTNAME_VAL="${MAC_HOSTNAME:-macbook}"
-HPP_PROOF_OUTPUT=""
-HPP_PROOF_RC=0
-# Always invoke the script (so missing preconditions surface as a hard FAIL
-# regardless of mode). The verifier selects mode by setting HPP_LIVE.
-if [ "${HPP_LIVE:-0}" = "1" ]; then
-    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-600}"
-    # Live: forward HPP_LIVE into the script env. --live sets it inside too,
-    # but forwarding here makes the intent explicit at the verifier boundary.
-    if ! HPP_PROOF_OUTPUT=$(HPP_LIVE=1 timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --live --timeout-seconds "${HPP_TIMEOUT_VAL}" --mac-hostname "${HPP_MAC_HOSTNAME_VAL}" 2>&1); then
-        HPP_PROOF_RC=$?
-    fi
-else
-    # Default mode: invoke --dry-run. The script exits 64 by design (r3f8).
-    HPP_TIMEOUT_VAL="${HPP_TIMEOUT:-180}"
-    if ! HPP_PROOF_OUTPUT=$(timeout "${HPP_TIMEOUT_VAL}s" "${HPP_SCRIPT}" --dry-run --mac-hostname "${HPP_MAC_HOSTNAME_VAL}" 2>&1); then
-        HPP_PROOF_RC=$?
-    fi
-fi
-echo "${HPP_PROOF_OUTPUT}"
-# Classify the script's exit code.
-if [ "${HPP_LIVE:-0}" = "1" ]; then
-    case "${HPP_PROOF_RC}" in
-        0)
-            pass "Gate 9: Host absorbed + recovered from controlled pressure (HPP_LIVE=1, r3f9 enforcement active: any canary fail / runner-loss > 10% / missing admission refusal / OOM / recovery-fail → exit 1)"
-            ;;
-        2)
-            fail "Gate 9: HPP_LIVE=1 was set but precondition check failed (exit 2). See host-pressure-proof output above — apply the remediation it printed (start QEMU, enroll agents.slice, install stress-ng, Mac ssh unreachable, etc.)."
-            ;;
-        64|33)
-            fail "Gate 9: HPP_LIVE=1 was set but the script returned ${HPP_PROOF_RC} (refusal). Treat as a script wiring bug — live mode should never refuse on an authorized invocation."
-            ;;
-        *)
-            fail "Gate 9: live host-pressure-proof exited ${HPP_PROOF_RC} — host did not absorb + recover from controlled pressure within budget (Linux path and/or Mac canary burst failed; r3f9 enforcer active)"
-            ;;
-    esac
-else
-    # Default mode: --dry-run is expected to exit 64. Anything other than 64
-    # is a real failure (precondition fail exits 2, e.g. agents.slice not
-    # enrolled; HPP_LIVE missing on default invocation exits 33).
-    case "${HPP_PROOF_RC}" in
-        64)
-            # Expected refusal. Gate 9 FAILs by default (per r3f8) — the
-            # dry-run is NOT a proof. Operator must opt in with HPP_LIVE=1.
-            echo "    [SKIP] dry-run does not prove pressure; set HPP_LIVE=1 (or pass --live) to authorize the live burst"
-            fail "Gate 9: proof not attempted (HPP_LIVE=1 not set). Default invocation only verifies preconditions; only HPP_LIVE=1 + exit 0 counts as a Gate 9 PASS."
-            ;;
-        33)
-            # Distinct refusal: defaulted invocation hit the HPP_LIVE env gate.
-            fail "Gate 9: host-pressure-proof exited 33 (HPP_LIVE=1 required). Default invocation cannot be authorized without HPP_LIVE=1 in the env, OR pass --live explicitly."
-            ;;
-        2)
-            fail "Gate 9: dry-run precondition check failed (exit 2). See host-pressure-proof output above — apply the remediation it printed (start QEMU, enroll agents.slice, install stress-ng, Mac ssh unreachable, etc.)."
-            ;;
-        *)
-            fail "Gate 9: dry-run returned unexpected exit ${HPP_PROOF_RC}. Expected 64 (refusal). Inspect host-pressure-proof.sh output above."
-            ;;
-    esac
-fi
-fi
+pass "Gate 9: Host-lifecycle safety policy is enforced"
 
 # --- Gate 10: GitHub API budget ---
 echo "--- Checking Gate 10: GitHub API budget ---"
@@ -1497,5 +2049,5 @@ fi
 pass "Gate 10: GitHub API budget is healthy ($REMAINING_API/$LIMIT_API remaining)"
 
 echo "==================================================="
-echo -e "${GREEN}ALL AUTO GATES PASS EXCELLENTLY!${NC}"
+echo -e "${GREEN}ALL AUTOMATED CHECKS PASSED; LIVE HOST SURVIVAL IS NOT PROVED${NC}"
 exit 0

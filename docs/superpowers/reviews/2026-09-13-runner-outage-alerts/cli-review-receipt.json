@@ -1,0 +1,33 @@
+{
+  "status": "completed",
+  "base_sha": "0f0eae2925dee384540c803791c249ed00e2f7a3",
+  "content_digest": "b8b1d5ae6640fcd3cf2be5f941eefb52a6a2198adf1b68e7df2f6ed78c5eae95",
+  "source_guard_changed_components": [],
+  "cleanup": {
+    "success": true,
+    "error": null,
+    "path": "/var/folders/j0/byd1z6px50v88lf679bgt0h00000gn/T/ezgha-advice-round2-jngtwz_d"
+  },
+  "started": 1789331409.1568902,
+  "ended": 1789331704.067455,
+  "reviewers": {
+    "codex": {
+      "status": "success",
+      "exit_code": 0,
+      "started": 1789331477.807124,
+      "ended": 1789331683.9802182
+    },
+    "cursor": {
+      "status": "success",
+      "exit_code": 0,
+      "started": 1789331477.799804,
+      "ended": 1789331671.997779
+    },
+    "opus": {
+      "status": "unavailable",
+      "reason": "weekly limit; shim and direct retries failed in round1; no unchanged quota retry"
+    }
+  },
+  "raw_receipt": "/Users/jleechan/.claude/state/advice/runs/ezgha-alert-design-final-133001/receipt.json",
+  "supervision_limitation": "Repeated 0.5s ps probes timed out under high host load; descendant termination not verified by runner. Review exits and full-text verdicts succeeded."
+}

@@ -11,6 +11,7 @@ mod backend;
 mod canary;
 mod config;
 mod docker_backend;
+mod failure_ladder;
 mod github;
 mod lima_convergence;
 mod platform;
@@ -136,6 +137,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         write_backup: bool,
     },
+    /// Render Release 1 main service unit to stdout
+    RenderRelease1Service,
+    /// Render Release 1 alert service unit to stdout
+    RenderRelease1AlertService,
     /// Dump recent reclaim-history records from the in-memory ring buffer
     /// (bead jleechan-uurm, first-wave Path-1 race investigation jleechan-9yx8).
     /// Most-recent-first across all slots when `--slot` is omitted; scoped to
@@ -190,7 +195,7 @@ fn log_skipped_stronger_backends(skipped_stronger: &[backend::Backend], backend:
 }
 
 fn docker_reachable() -> bool {
-    std::process::Command::new("docker")
+    platform::docker_command()
         .args(["info", "--format", "{{.ServerVersion}}"])
         .output()
         .map(|o| o.status.success())
@@ -199,6 +204,8 @@ fn docker_reachable() -> bool {
 
 fn choose_backend(cfg: &config::Config) -> Result<backend::Backend> {
     let plat = platform::detect();
+    cfg.validate_host_envelope(plat.total_mem_mb)
+        .context("physical host memory envelope validation failed")?;
     match backend::select(&plat, cfg.policy.minimum_isolation) {
         Selection::Chosen {
             backend,
@@ -714,10 +721,62 @@ fn apply_ensure_outcome_to_failure_streak(
             outcome.missing
         );
         notify_ensure_failure(cfg, backend, *ensure_fail_streak, &detail);
+    } else if outcome.admission_paused_reason.is_some() {
+        // A deliberate fail-closed pause with no new start failure is not
+        // backend recovery. Preserve the prior streak until a genuinely
+        // healthy ensure resets it; monitors still run during the pause.
+        return false;
     } else {
         *ensure_fail_streak = 0;
     }
+    if outcome.start_failures >= cfg.alert.registration_burst_threshold {
+        let subject = "Runner registration failure burst";
+        let body = format!(
+            "{} registration failure(s) in a single refill pass (threshold: {}) for target {}. This often indicates a GitHub API outage or network drop.",
+            outcome.start_failures,
+            cfg.alert.registration_burst_threshold,
+            cfg.github.target
+        );
+        if let Err(err) = alert::notify(
+            cfg,
+            "serve.ensure_count.registration_burst",
+            Severity::Warning,
+            subject,
+            &body,
+        ) {
+            eprintln!("WARN: alert send error: {err:#}");
+        }
+    }
+
+    if outcome.reclaimed >= cfg.alert.reclaim_burst_threshold {
+        let subject = "Runner slot reclaim burst";
+        let body = format!(
+            "{} slot(s) reclaimed in a single pass (threshold: {}) for target {}. This suggests runners are failing to register, jobs are wedging, or starvation.",
+            outcome.reclaimed,
+            cfg.alert.reclaim_burst_threshold,
+            cfg.github.target
+        );
+        if let Err(err) = alert::notify(
+            cfg,
+            "serve.ensure_count.reclaim_burst",
+            Severity::Warning,
+            subject,
+            &body,
+        ) {
+            eprintln!("WARN: alert send error: {err:#}");
+        }
+    }
+
     partial_failure
+}
+
+fn ensure_outcome_may_credit_deadman(outcome: &docker_backend::EnsureCountOutcome) -> bool {
+    outcome.admission_paused_reason.is_none()
+        && !outcome.is_partial_failure()
+        && outcome.post_refill_readiness_error.is_none()
+        && outcome.post_refill_capacity_lost.is_empty()
+        && outcome.post_refill_slots_released.is_empty()
+        && outcome.remaining_shortage == 0
 }
 
 // Five 5s local-only polls cover the observed 20-25s runner startup tail.
@@ -765,15 +824,23 @@ impl SettlingEpisode {
             return SettlingDecision::Ceiling;
         };
         self.attempts += 1;
+        if executing >= target {
+            self.started_at = None;
+            return SettlingDecision::Recovered;
+        }
+        // A successful local count regression means ephemeral capacity was lost
+        // while this local-only episode was polling. End the episode so the
+        // caller runs monitors and ensure_count immediately; this does not
+        // restart the service, Docker backend, VM, or host.
+        if executing < self.best_executing {
+            self.started_at = None;
+            return SettlingDecision::Ceiling;
+        }
         if executing > self.best_executing {
             self.best_executing = executing;
             self.stagnant_polls = 0;
         } else {
             self.stagnant_polls += 1;
-        }
-        if executing >= target {
-            self.started_at = None;
-            return SettlingDecision::Recovered;
         }
         if self.attempts >= MAX_SETTLING_POLLS
             || now.saturating_duration_since(started_at) >= MAX_SETTLING_DURATION
@@ -789,8 +856,26 @@ fn settling_plan(cfg: &config::Config, decision: SettlingDecision) -> (Duration,
     match decision {
         SettlingDecision::Continue => (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false),
         SettlingDecision::Recovered => (cfg.runner.serve_tick(), true),
-        SettlingDecision::Ceiling => (Duration::ZERO, true),
+        // Ceiling: zero sleep, no synchronous monitor drive. Monitor
+        // ticks run async via QueueMonitorScheduler so a slow `gh api`
+        // child cannot block the next ensure_count.
+        SettlingDecision::Ceiling => (Duration::ZERO, false),
     }
+}
+
+fn dispatch_async_monitor_ticks<Q, C>(
+    _legacy_run_monitors: bool,
+    mut dispatch_queue: Q,
+    mut dispatch_canary: C,
+) where
+    Q: FnMut(),
+    C: FnMut(),
+{
+    // Queue and canary schedulers independently enforce their own due interval
+    // and single-flight constraints. Ceiling must not suppress either one:
+    // it is a refill-priority signal, not a telemetry/canary pause.
+    dispatch_queue();
+    dispatch_canary();
 }
 
 fn apply_local_settling_decision(
@@ -817,14 +902,52 @@ fn apply_local_settling_decision(
 enum EnsureSuccessDecision {
     StartSettling { executing: u32 },
     Recovered,
+    PostRefillCapacityLost,
+    PostRefillSlotsReleased,
     IncompleteReadiness,
+    AdmissionPaused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartCommandDisposition {
+    AtCapacity,
+    Started,
+    AdmissionPaused,
+    PendingShortage,
+    Incomplete,
+}
+
+fn start_command_disposition(
+    outcome: &docker_backend::EnsureCountOutcome,
+) -> StartCommandDisposition {
+    if outcome.admission_paused_reason.is_some() {
+        StartCommandDisposition::AdmissionPaused
+    } else if outcome.start_failures > 0
+        || outcome.post_refill_readiness_error.is_some()
+        || !outcome.post_refill_capacity_lost.is_empty()
+        || !outcome.post_refill_slots_released.is_empty()
+    {
+        StartCommandDisposition::Incomplete
+    } else if !outcome.started.is_empty() {
+        StartCommandDisposition::Started
+    } else if outcome.remaining_shortage == 0 {
+        StartCommandDisposition::AtCapacity
+    } else {
+        StartCommandDisposition::PendingShortage
+    }
 }
 
 fn ensure_success_decision(
     cfg: &config::Config,
     outcome: &docker_backend::EnsureCountOutcome,
 ) -> EnsureSuccessDecision {
-    if outcome.post_refill_readiness_error.is_some() {
+    if outcome.admission_paused_reason.is_some() {
+        EnsureSuccessDecision::AdmissionPaused
+    } else if !outcome.post_refill_capacity_lost.is_empty() {
+        EnsureSuccessDecision::PostRefillCapacityLost
+    } else if !outcome.post_refill_slots_released.is_empty() {
+        EnsureSuccessDecision::PostRefillSlotsReleased
+    } else if outcome.post_refill_readiness_error.is_some() {
         EnsureSuccessDecision::IncompleteReadiness
     } else if outcome.remaining_shortage > 0 {
         EnsureSuccessDecision::StartSettling {
@@ -841,15 +964,33 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
             settling_plan(cfg, SettlingDecision::Continue)
         }
         EnsureSuccessDecision::Recovered => settling_plan(cfg, SettlingDecision::Recovered),
-        EnsureSuccessDecision::IncompleteReadiness => settling_plan(cfg, SettlingDecision::Ceiling),
+        EnsureSuccessDecision::PostRefillCapacityLost
+        | EnsureSuccessDecision::PostRefillSlotsReleased
+        | EnsureSuccessDecision::IncompleteReadiness => {
+            settling_plan(cfg, SettlingDecision::Ceiling)
+        }
+        EnsureSuccessDecision::AdmissionPaused => (cfg.runner.serve_tick(), true),
+    }
+}
+
+impl EnsureSuccessDecision {
+    fn immediate_capacity_reconcile(self) -> bool {
+        matches!(
+            self,
+            Self::PostRefillCapacityLost | Self::PostRefillSlotsReleased
+        )
     }
 }
 
 fn ensure_success_decision_with_pending_readiness(
     decision: EnsureSuccessDecision,
     pending_readiness: bool,
+    previous_post_refill_capacity_immediate: bool,
+    executing: u32,
 ) -> EnsureSuccessDecision {
-    if pending_readiness && decision == EnsureSuccessDecision::Recovered {
+    if previous_post_refill_capacity_immediate && decision.immediate_capacity_reconcile() {
+        EnsureSuccessDecision::StartSettling { executing }
+    } else if pending_readiness && decision == EnsureSuccessDecision::Recovered {
         EnsureSuccessDecision::StartSettling { executing: 0 }
     } else {
         decision
@@ -867,9 +1008,16 @@ fn apply_ensure_success_decision(
             *settling = Some(SettlingEpisode::start(now, executing));
             *pending_readiness = true;
         }
-        EnsureSuccessDecision::IncompleteReadiness => {
+        EnsureSuccessDecision::PostRefillCapacityLost
+        | EnsureSuccessDecision::PostRefillSlotsReleased
+        | EnsureSuccessDecision::IncompleteReadiness => {
             *settling = None;
             *pending_readiness = true;
+        }
+        EnsureSuccessDecision::AdmissionPaused => {
+            *settling = None;
+            // Retain any prior incomplete-readiness evidence while admission
+            // is closed; a pause is not proof that workers recovered.
         }
         EnsureSuccessDecision::Recovered => {
             *settling = None;
@@ -1175,17 +1323,59 @@ fn main() -> Result<()> {
             if let Some(c) = count {
                 cfg.runner.count = *c;
             }
+            docker_backend::require_host_containment(&cfg)
+                .context("host containment admission failed before start")?;
+            // `start` mutates the same slot assignments and failure-ladder
+            // ledger as `serve`; serialize both commands across the entire
+            // read-modify-write sequence.
+            let _state_lock = acquire_serve_lock(&cfg).context("acquire runner-state lock")?;
             let backend = choose_backend(&cfg)?;
-            let started = docker_backend::ensure_count(&cfg, backend)?;
-            if started.is_empty() {
-                println!("already at capacity ({} runners)", cfg.runner.count);
-            }
-            for name in started {
+            let outcome = docker_backend::ensure_count_outcome(&cfg, backend)?;
+            for name in &outcome.started {
                 println!("started ephemeral runner {name} [{}]", backend.name());
+            }
+            match start_command_disposition(&outcome) {
+                StartCommandDisposition::AtCapacity => {
+                    println!("already at capacity ({} runners)", cfg.runner.count);
+                }
+                StartCommandDisposition::Started => {
+                    if outcome.remaining_shortage > 0 {
+                        println!(
+                            "refill started; {} runner(s) are still becoming locally ready",
+                            outcome.remaining_shortage
+                        );
+                    }
+                }
+                StartCommandDisposition::AdmissionPaused => bail!(
+                    "runner admission paused with {} runner(s) still missing: {}",
+                    outcome.remaining_shortage,
+                    outcome
+                        .admission_paused_reason
+                        .as_deref()
+                        .expect("paused disposition requires a reason")
+                ),
+                StartCommandDisposition::PendingShortage => bail!(
+                    "runner refill is pending with {} runner(s) still missing; no new runner was started (slot turnover may still be settling)",
+                    outcome.remaining_shortage
+                ),
+                StartCommandDisposition::Incomplete => bail!(
+                    "runner refill incomplete: started {} of {} missing runner(s), {} local start failure(s), {} runner(s) still not ready{}",
+                    outcome.started.len(),
+                    outcome.missing,
+                    outcome.start_failures,
+                    outcome.remaining_shortage,
+                    outcome
+                        .post_refill_readiness_error
+                        .as_deref()
+                        .map(|error| format!("; readiness evidence: {error}"))
+                        .unwrap_or_default()
+                ),
             }
         }
         Commands::Serve => {
             let cfg = Config::load(&path)?;
+            docker_backend::require_host_containment(&cfg)
+                .context("host containment admission failed before serve")?;
             // Single-instance guard (bead 6gw): flock serve.lock so a second
             // `ezgha serve` refuses immediately instead of racing next_slot's
             // read-modify-write. Auto-released on process death; opt-out via
@@ -1209,6 +1399,21 @@ fn main() -> Result<()> {
             // with After=lima-vm@colima.service the Docker socket may not be
             // ready for a few seconds after limactl start exits.
             let backend = wait_for_backend(&cfg, Duration::from_secs(120))?;
+            // Fail-loud cpu_burst precheck (root review): if
+            // limits.cpu_burst=true is requested but the daemon is not
+            // VM-contained or finite positive ncpu is not discovered, bail
+            // here BEFORE any runner mutation rather than letting the first
+            // start_one hit Err mid-spawn. Placed AFTER wait_for_backend so a
+            // cold Colima VM that took >4s on its first `docker info` (Mac,
+            // 2026-10-03) has time to settle into a steady state instead of
+            // tripping the rejection path on a transient probe. Bounded by
+            // PROBE_TIMEOUT (8s as of this commit); still BEFORE any runner
+            // mutation so a genuinely unsupported burst never spawns.
+            if cfg.limits.cpu_burst {
+                docker_backend::effective_limits(&cfg).map_err(|e| {
+                    anyhow::anyhow!("limits.cpu_burst validation failed at serve startup: {e}")
+                })?;
+            }
             // VM-aware memory budget derivation + fail-loud guard (bead
             // ez-gh-actions-yz6b). See docker_backend::resolve_and_log_memory_budget.
             docker_backend::resolve_and_log_memory_budget(&cfg)
@@ -1221,12 +1426,17 @@ fn main() -> Result<()> {
             );
             let _watchdog_heartbeat = mark_service_ready_and_start_watchdog();
             let mut backend_recovery = BackendRecoveryState::new();
-            let mut queue_monitor = queue_monitor::QueueMonitorState::new();
-            let mut invariant_sampler = queue_monitor::InvariantSamplerState::new();
+            // Async monitor ticks: QueueMonitorScheduler dispatches
+            // drive_serve_loop_ticks on a worker thread (returns the
+            // state pair via the JoinHandle payload, no Arc<Mutex<>>).
+            // Replaces the synchronous 75 s monitor drive that blocked
+            // ensure_count after every Ceiling.
+            let mut queue_monitor_scheduler = queue_monitor::QueueMonitorScheduler::new();
             let mut canary_scheduler = canary::CanaryDaemonState::new();
             let mut ensure_fail_streak = 0u32;
             let mut settling: Option<SettlingEpisode> = None;
             let mut pending_readiness = false;
+            let mut previous_post_refill_capacity_immediate = false;
             let mut settling_ceilings = SettlingCeilingState::default();
             let mut deadman = alert::DeadManState::new(Instant::now());
 
@@ -1244,31 +1454,55 @@ fn main() -> Result<()> {
                 watchdog::ping();
                 let (sleep, run_monitors) = if settling.is_some() {
                     match docker_backend::local_executing_runner_count(&cfg) {
-                        Ok(executing) => {
+                        Ok(summary) => {
+                            let executing = summary.ready;
+                            let absent_names = summary.absent;
                             let (decision, attempts, best_executing) = {
                                 let episode = settling.as_mut().expect("checked above");
+                                // Bead jleechan-95jk root-cause: if a slot's
+                                // container is GONE (`docker top: No such
+                                // container`), polling for 25s will not bring
+                                // it back. Force immediate reconciliation
+                                // (Ceiling) so the next serve tick calls
+                                // `ensure_count` and respawns. Genuine
+                                // Unknown (timeout / daemon error) still
+                                // propagates as `Err` below and keeps the
+                                // existing wait-for-evidence behavior.
                                 let decision =
-                                    episode.observe(Instant::now(), executing, cfg.runner.count);
+                                    if !absent_names.is_empty() && executing < cfg.runner.count {
+                                        eprintln!(
+                                        "runner startup settling: {executing}/{} ready locally \
+                                         (listeners or workers), but {} container(s) absent: \
+                                         {absent_names:?}; forcing immediate reconciliation \
+                                         instead of waiting out the {}-poll settling ceiling",
+                                        cfg.runner.count,
+                                        absent_names.len(),
+                                        MAX_SETTLING_POLLS,
+                                    );
+                                        SettlingDecision::Ceiling
+                                    } else {
+                                        episode.observe(Instant::now(), executing, cfg.runner.count)
+                                    };
                                 (decision, episode.attempts, episode.best_executing)
                             };
                             match decision {
                                 SettlingDecision::Continue => println!(
-                                    "runner startup settling: {executing}/{} executing locally \
-                                     (poll {attempts}/{MAX_SETTLING_POLLS})",
+                                    "runner startup settling: {executing}/{} ready locally \
+                                     (listeners or workers) (poll {attempts}/{MAX_SETTLING_POLLS})",
                                     cfg.runner.count
                                 ),
                                 SettlingDecision::Recovered => {
                                     println!(
-                                        "runner startup settled: {executing}/{} executing locally \
-                                         after {attempts} poll(s)",
+                                        "runner startup settled: {executing}/{} ready locally \
+                                         (listeners or workers) after {attempts} poll(s)",
                                         cfg.runner.count
                                     );
                                     settling_ceilings.record_recovery();
                                 }
                                 SettlingDecision::Ceiling => {
                                     let detail = format!(
-                                        "{executing}/{} executing locally, best {best_executing}, \
-                                         {attempts} poll(s)",
+                                        "{executing}/{} ready locally (listeners or workers), \
+                                         best {best_executing}, {attempts} poll(s)",
                                         cfg.runner.count
                                     );
                                     let escalated = record_settling_ceiling(
@@ -1278,7 +1512,8 @@ fn main() -> Result<()> {
                                     );
                                     eprintln!(
                                         "{}: runner startup settling ceiling reached: {detail}; \
-                                         running monitors before immediate reconciliation",
+                                         queue-monitor ticks dispatched async, \
+                                         reconcile on next iteration",
                                         if escalated { "CRITICAL" } else { "WARN" }
                                     );
                                 }
@@ -1296,7 +1531,8 @@ fn main() -> Result<()> {
                             let escalated =
                                 record_settling_ceiling(&cfg, &mut settling_ceilings, &detail);
                             eprintln!(
-                                "{}: {detail}; running monitors before immediate reconciliation",
+                                "{}: {detail}; queue-monitor ticks dispatched async, \
+                                 reconcile on next iteration",
                                 if escalated { "CRITICAL" } else { "WARN" }
                             );
                             apply_local_settling_decision(
@@ -1310,20 +1546,54 @@ fn main() -> Result<()> {
                 } else {
                     match docker_backend::ensure_count_outcome(&cfg, backend) {
                         Ok(outcome) => {
+                            let deadman_credit = ensure_outcome_may_credit_deadman(&outcome);
                             apply_ensure_outcome_to_failure_streak(
                                 &cfg,
                                 backend,
                                 &mut ensure_fail_streak,
                                 &outcome,
                             );
+                            let raw_decision = ensure_success_decision(&cfg, &outcome);
                             let decision = ensure_success_decision_with_pending_readiness(
-                                ensure_success_decision(&cfg, &outcome),
+                                raw_decision,
                                 pending_readiness,
+                                previous_post_refill_capacity_immediate,
+                                cfg.runner.count.saturating_sub(outcome.remaining_shortage),
                             );
+                            previous_post_refill_capacity_immediate =
+                                decision.immediate_capacity_reconcile();
+                            if raw_decision.immediate_capacity_reconcile()
+                                && decision != raw_decision
+                            {
+                                eprintln!(
+                                    "post-refill capacity reconciliation repeated; entering existing settling cadence"
+                                );
+                            }
                             match decision {
                                 EnsureSuccessDecision::StartSettling { .. } => {}
                                 EnsureSuccessDecision::Recovered => {
                                     settling_ceilings.record_recovery();
+                                }
+                                EnsureSuccessDecision::PostRefillCapacityLost => {
+                                    let detail = format!(
+                                        "post-refill configured runner(s) disappeared: {:?}",
+                                        outcome.post_refill_capacity_lost
+                                    );
+                                    let escalated = record_settling_ceiling(
+                                        &cfg,
+                                        &mut settling_ceilings,
+                                        &detail,
+                                    );
+                                    eprintln!(
+                                        "{}: {detail}; reconcile on next iteration",
+                                        if escalated { "CRITICAL" } else { "WARN" }
+                                    );
+                                }
+                                EnsureSuccessDecision::PostRefillSlotsReleased => {
+                                    eprintln!(
+                                        "post-refill reservation(s) became allocatable: {:?}; reconcile on next iteration",
+                                        outcome.post_refill_slots_released
+                                    );
                                 }
                                 EnsureSuccessDecision::IncompleteReadiness => {
                                     let detail = format!(
@@ -1344,6 +1614,15 @@ fn main() -> Result<()> {
                                         if escalated { "CRITICAL" } else { "WARN" }
                                     );
                                 }
+                                EnsureSuccessDecision::AdmissionPaused => {
+                                    eprintln!(
+                                        "runner admission remains paused: {}",
+                                        outcome
+                                            .admission_paused_reason
+                                            .as_deref()
+                                            .expect("decision requires admission pause reason")
+                                    );
+                                }
                             }
                             apply_ensure_success_decision(
                                 &mut settling,
@@ -1355,12 +1634,13 @@ fn main() -> Result<()> {
                             for name in outcome.started {
                                 println!("respawned ephemeral runner {name}");
                             }
-                            // A successful ensure_count is itself a "pipeline is
-                            // alive" signal — a healthy fleet should not need to
-                            // fire alerts to prove liveness. Bump the dead-man
-                            // clock so the threshold counts overall daemon
-                            // liveness, not just alert throughput.
-                            deadman.record_delivery(Instant::now());
+                            // Only a fully evidenced healthy ensure is a
+                            // "pipeline is alive" signal. Pauses, partial
+                            // starts, shortages, and incomplete readiness must
+                            // not reset the dead-man clock.
+                            if deadman_credit {
+                                deadman.record_delivery(Instant::now());
+                            }
                             // Respawn cadence: configurable via [runner]
                             // serve_tick_seconds (default 30, 5s floor). A
                             // bounded local-only settling episode follows a
@@ -1368,6 +1648,7 @@ fn main() -> Result<()> {
                             plan
                         }
                         Err(e) => {
+                            previous_post_refill_capacity_immediate = false;
                             ensure_fail_streak += 1;
                             eprintln!("ensure_count failed (will retry): {e:#}");
                             notify_ensure_failure(
@@ -1424,33 +1705,25 @@ fn main() -> Result<()> {
                 if shutdown::is_requested() {
                     break;
                 }
-                if run_monitors {
-                    watchdog::ping();
-                    // Fresh budget base for monitor ticks: respawn pacing may
-                    // legitimately spend minutes before this point, and that
-                    // time must not count against SERVE_LOOP_TIME_BUDGET.
-                    let monitor_loop_start = Instant::now();
-                    // Drive both ticks through the unified fetch dedup path
-                    // (see `QueueMonitorState::drive_serve_loop_ticks`):
-                    // the queue monitor's starvation/idle-mismatch alerting
-                    // and the invariant sampler's INV-1/INV-2 sampling share
-                    // one fleet fetch and one fetch per distinct repo per
-                    // iteration, instead of doubling both. Calling
-                    // `maybe_check` + `maybe_sample` independently (the
-                    // previous shape) is preserved as a public API but the
-                    // serve loop no longer uses it.
-                    let _ = run_tick("queue monitor + invariant sampler drive", || {
-                        queue_monitor
-                            .drive_serve_loop_ticks(
-                                &cfg,
-                                monitor_loop_start,
-                                &mut invariant_sampler,
-                            )
-                            .map(|_results| None::<()>)
-                    });
-                    watchdog::ping();
-                    let _ = canary_scheduler.maybe_check(&cfg);
-                }
+                // Async dispatch on EVERY serve iteration (not gated by run_monitors):
+                // the scheduler's internal due timer + single-flight
+                // guarantee already bound it, and gating it would let a
+                // run of short Ceiling/Recovered cycles starve queue +
+                // invariant telemetry for the entire run. Worker thread
+                // runs one iteration and returns the state pair via the
+                // JoinHandle payload (no Arc<Mutex<>>, no overlap).
+                watchdog::ping();
+                let monitor_loop_start = Instant::now();
+                dispatch_async_monitor_ticks(
+                    run_monitors,
+                    || {
+                        let _ = queue_monitor_scheduler.maybe_dispatch(&cfg, monitor_loop_start);
+                        watchdog::ping();
+                    },
+                    || {
+                        let _ = canary_scheduler.maybe_check(&cfg);
+                    },
+                );
                 watchdog::ping();
                 // Dead-man's switch: prove the alert pipeline is alive.
                 // Runs once per serve-loop tick regardless of ensure success
@@ -1487,6 +1760,10 @@ fn main() -> Result<()> {
         }
         Commands::Stop => {
             let cfg = Config::load(&path)?;
+            // `stop` mutates the same slot assignments and runner
+            // registrations as `serve`/`start`; serialize the entire
+            // read-modify-write sequence so cleanup cannot race a refill.
+            let _state_lock = acquire_serve_lock(&cfg).context("acquire runner-state lock")?;
             let n = docker_backend::stop_all(&cfg)?;
             println!("removed {n} managed container(s); deregistered idle ezgha runners");
         }
@@ -1696,6 +1973,12 @@ fn main() -> Result<()> {
                 }))?
             );
         }
+        Commands::RenderRelease1Service => {
+            println!("{}", service::render_release1_service());
+        }
+        Commands::RenderRelease1AlertService => {
+            println!("{}", service::render_release1_alert_service());
+        }
     }
     Ok(())
 }
@@ -1744,7 +2027,7 @@ fn ok(b: bool) -> &'static str {
 }
 
 /// Acquire an advisory `flock(2)` on `<config_dir>/ezgha/serve.lock` to
-/// prevent two `ezgha serve` instances from racing on the slot file. The
+/// prevent `ezgha serve` and `ezgha start` from racing on mutable runner state. The
 /// helper returns a `ServeLock` guard; dropping the `Option<File>` inside
 /// closes the fd and releases the flock automatically (also happens when
 /// the process dies). Tests opt out with `EZGHA_SKIP_LOCK=1`.
@@ -1791,8 +2074,8 @@ fn acquire_serve_lock(cfg: &config::Config) -> Result<ServeLock> {
         let e = std::io::Error::last_os_error();
         match e.kind() {
             ErrorKind::WouldBlock => bail!(
-                "another ezgha serve is running (lock held at {}); \
-                 refusing to start. Set EZGHA_SKIP_LOCK=1 to bypass (tests only).",
+                "another stateful ezgha runner command is active (lock held at {}); \
+                 refusing to race it. Set EZGHA_SKIP_LOCK=1 to bypass (tests only).",
                 path.display()
             ),
             _ => return Err(e.into()),
@@ -1845,6 +2128,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn runner_state_lock_refuses_concurrent_mutator_for_same_config() {
+        let base =
+            std::env::temp_dir().join(format!("ezgha-runner-state-lock-{}", std::process::id()));
+        let mut cfg = test_config();
+        cfg.state_dir = Some(base.clone());
+
+        let first = acquire_serve_lock(&cfg).expect("first state mutator lock");
+        let err = match acquire_serve_lock(&cfg) {
+            Ok(_) => panic!("second mutator must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("stateful ezgha runner command"));
+
+        drop(first);
+        acquire_serve_lock(&cfg).expect("lock must recover when first guard drops");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1865,7 +2167,11 @@ mod tests {
             missing: 4,
             remaining_shortage: 3,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 3,
+            reclaimed: 0,
+            admission_paused_reason: None,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1884,7 +2190,11 @@ mod tests {
             missing: 2,
             remaining_shortage: 0,
             post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
             start_failures: 0,
+            reclaimed: 0,
+            admission_paused_reason: None,
         };
         let was_partial = apply_ensure_outcome_to_failure_streak(
             &cfg,
@@ -1896,6 +2206,368 @@ mod tests {
         assert_eq!(
             ensure_fail_streak, 0,
             "non-partial ensure_count success resets the serve alert streak"
+        );
+    }
+
+    #[test]
+    fn deliberate_admission_pause_does_not_start_settling_or_backend_failure_streak() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 99;
+        let mut ensure_fail_streak = 2;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 10,
+            remaining_shortage: 10,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
+            start_failures: 0,
+            reclaimed: 0,
+            admission_paused_reason: Some("fleet circuit open".into()),
+        };
+
+        assert!(!apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut ensure_fail_streak,
+            &outcome,
+        ));
+        assert_eq!(ensure_fail_streak, 2);
+        assert_eq!(
+            ensure_success_decision(&cfg, &outcome),
+            EnsureSuccessDecision::AdmissionPaused
+        );
+        assert_eq!(
+            ensure_success_plan(&cfg, EnsureSuccessDecision::AdmissionPaused),
+            (cfg.runner.serve_tick(), true),
+            "intentional pauses must keep queue/health monitors running"
+        );
+
+        let mut settling = Some(SettlingEpisode::start(Instant::now(), 0));
+        let mut pending_readiness = true;
+        apply_ensure_success_decision(
+            &mut settling,
+            &mut pending_readiness,
+            Instant::now(),
+            EnsureSuccessDecision::AdmissionPaused,
+        );
+        assert!(settling.is_none());
+        assert!(pending_readiness);
+    }
+
+    #[test]
+    fn start_command_never_reports_shortage_or_pause_as_at_capacity() {
+        let outcome = |started: Vec<&str>,
+                       missing,
+                       remaining_shortage,
+                       start_failures,
+                       admission_paused_reason: Option<&str>,
+                       post_refill_readiness_error: Option<&str>| {
+            docker_backend::EnsureCountOutcome {
+                started: started.into_iter().map(str::to_owned).collect(),
+                missing,
+                remaining_shortage,
+                post_refill_readiness_error: post_refill_readiness_error.map(str::to_owned),
+                post_refill_capacity_lost: Vec::new(),
+                post_refill_slots_released: Vec::new(),
+                start_failures,
+                reclaimed: 0,
+                admission_paused_reason: admission_paused_reason.map(str::to_owned),
+            }
+        };
+
+        assert_eq!(
+            start_command_disposition(&outcome(vec![], 0, 0, 0, None, None)),
+            StartCommandDisposition::AtCapacity
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(
+                vec![],
+                10,
+                10,
+                0,
+                Some("fleet circuit open"),
+                None,
+            )),
+            StartCommandDisposition::AdmissionPaused
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(vec![], 10, 10, 0, None, None)),
+            StartCommandDisposition::PendingShortage
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(vec!["runner-1"], 10, 9, 1, None, None)),
+            StartCommandDisposition::Incomplete
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(
+                vec!["runner-1"],
+                1,
+                1,
+                0,
+                None,
+                Some("docker top timed out"),
+            )),
+            StartCommandDisposition::Incomplete
+        );
+        assert_eq!(
+            start_command_disposition(&outcome(vec!["runner-1"], 1, 1, 0, None, None)),
+            StartCommandDisposition::Started
+        );
+    }
+
+    #[test]
+    fn paused_control_plane_failure_still_advances_failure_streak() {
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 99;
+        let mut ensure_fail_streak = 0;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: Vec::new(),
+            missing: 10,
+            remaining_shortage: 10,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
+            start_failures: 1,
+            reclaimed: 0,
+            admission_paused_reason: Some("GitHub JIT/control-plane start failed".into()),
+        };
+
+        assert!(apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut ensure_fail_streak,
+            &outcome,
+        ));
+        assert_eq!(ensure_fail_streak, 1);
+    }
+
+    #[test]
+    fn deadman_credit_requires_fully_healthy_ensure_evidence() {
+        let healthy = docker_backend::EnsureCountOutcome {
+            started: vec!["runner-1".into()],
+            missing: 1,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: Vec::new(),
+            post_refill_slots_released: Vec::new(),
+            start_failures: 0,
+            reclaimed: 0,
+            admission_paused_reason: None,
+        };
+        assert!(ensure_outcome_may_credit_deadman(&healthy));
+
+        let mut impaired = healthy.clone();
+        impaired.remaining_shortage = 1;
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+
+        impaired = healthy.clone();
+        impaired.start_failures = 1;
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+
+        impaired = healthy.clone();
+        impaired.post_refill_readiness_error = Some("docker top timed out".into());
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+
+        impaired = healthy;
+        impaired.admission_paused_reason = Some("fleet circuit open".into());
+        assert!(!ensure_outcome_may_credit_deadman(&impaired));
+    }
+
+    #[test]
+    fn post_refill_released_slots_share_one_capacity_pacing_budget() {
+        let cfg = test_config();
+        // Every ordering, including mixed signals in a single outcome, uses
+        // the same bool as the actual serve call site.
+        for first in 0..3 {
+            for second in 0..3 {
+                let mut previous_immediate = false;
+                // 0: original loss only; 1: released slot only; 2: both.
+                for (index, mode) in [first, second, (second + 1) % 3].into_iter().enumerate() {
+                    let outcome = docker_backend::EnsureCountOutcome {
+                        started: vec![],
+                        missing: 2,
+                        remaining_shortage: 1,
+                        post_refill_readiness_error: None,
+                        post_refill_capacity_lost: if mode != 1 {
+                            vec!["runner-1".into()]
+                        } else {
+                            vec![]
+                        },
+                        post_refill_slots_released: if mode != 0 {
+                            vec!["runner-2".into()]
+                        } else {
+                            vec![]
+                        },
+                        start_failures: 0,
+                        reclaimed: 0,
+                        admission_paused_reason: None,
+                    };
+                    let raw = ensure_success_decision(&cfg, &outcome);
+                    let decision = ensure_success_decision_with_pending_readiness(
+                        raw,
+                        true,
+                        previous_immediate,
+                        13,
+                    );
+                    previous_immediate = decision.immediate_capacity_reconcile();
+                    assert_eq!(previous_immediate, index != 1);
+                    assert_eq!(
+                        ensure_success_plan(&cfg, decision).0,
+                        if index == 1 {
+                            Duration::from_secs(config::MIN_SERVE_TICK_SECONDS)
+                        } else {
+                            Duration::ZERO
+                        }
+                    );
+                    let mut settling = None;
+                    let mut pending = false;
+                    apply_ensure_success_decision(
+                        &mut settling,
+                        &mut pending,
+                        Instant::now(),
+                        decision,
+                    );
+                    assert!(pending);
+                    assert_eq!(settling.is_some(), index == 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_refill_released_slots_preserve_pause_cli_deadman_and_failure_accounting() {
+        let cfg = test_config();
+        let mut outcome = docker_backend::EnsureCountOutcome {
+            started: vec![],
+            missing: 1,
+            remaining_shortage: 0,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec!["runner-1".into()],
+            start_failures: 0,
+            reclaimed: 0,
+            admission_paused_reason: None,
+        };
+        assert!(!ensure_outcome_may_credit_deadman(&outcome));
+        assert_eq!(
+            start_command_disposition(&outcome),
+            StartCommandDisposition::Incomplete
+        );
+        let mut streak = 0;
+        assert!(!apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut streak,
+            &outcome
+        ));
+        assert_eq!(streak, 0);
+        outcome.post_refill_readiness_error = Some("unknown worker state".into());
+        assert_eq!(
+            ensure_success_decision(&cfg, &outcome),
+            EnsureSuccessDecision::PostRefillSlotsReleased
+        );
+        outcome.admission_paused_reason = Some("operator admission pause".into());
+        let decision = ensure_success_decision_with_pending_readiness(
+            ensure_success_decision(&cfg, &outcome),
+            true,
+            true,
+            13,
+        );
+        assert_eq!(decision, EnsureSuccessDecision::AdmissionPaused);
+        assert_eq!(
+            ensure_success_plan(&cfg, decision),
+            (cfg.runner.serve_tick(), true)
+        );
+        assert_eq!(
+            start_command_disposition(&outcome),
+            StartCommandDisposition::AdmissionPaused
+        );
+        assert!(!ensure_outcome_may_credit_deadman(&outcome));
+    }
+
+    #[test]
+    fn post_refill_loss_is_paced_before_a_second_immediate_reconcile() {
+        let mut cfg = test_config();
+        cfg.runner.count = 14;
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: vec!["ez-runner-c-13".into(), "ez-runner-c-14".into()],
+            missing: 2,
+            remaining_shortage: 3,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec!["ez-runner-c-12".into()],
+            post_refill_slots_released: Vec::new(),
+            start_failures: 0,
+            reclaimed: 0,
+            admission_paused_reason: None,
+        };
+
+        let first = ensure_success_decision(&cfg, &outcome);
+        assert_eq!(first, EnsureSuccessDecision::PostRefillCapacityLost);
+        assert_eq!(ensure_success_plan(&cfg, first), (Duration::ZERO, false));
+        let previous_post_refill_capacity_immediate =
+            first == EnsureSuccessDecision::PostRefillCapacityLost;
+
+        let second = ensure_success_decision_with_pending_readiness(
+            ensure_success_decision(&cfg, &outcome),
+            true,
+            previous_post_refill_capacity_immediate,
+            cfg.runner.count.saturating_sub(outcome.remaining_shortage),
+        );
+        assert_eq!(
+            second,
+            EnsureSuccessDecision::StartSettling { executing: 11 }
+        );
+        assert_eq!(
+            ensure_success_plan(&cfg, second),
+            (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+        );
+        assert!(!matches!(
+            second,
+            EnsureSuccessDecision::PostRefillCapacityLost
+        ));
+        let previous_post_refill_capacity_immediate =
+            second == EnsureSuccessDecision::PostRefillCapacityLost;
+        let third = ensure_success_decision_with_pending_readiness(
+            ensure_success_decision(&cfg, &outcome),
+            true,
+            previous_post_refill_capacity_immediate,
+            cfg.runner.count.saturating_sub(outcome.remaining_shortage),
+        );
+        assert_eq!(third, EnsureSuccessDecision::PostRefillCapacityLost);
+
+        let started_at = Instant::now();
+        let mut settling = None;
+        let mut pending_readiness = false;
+        apply_ensure_success_decision(&mut settling, &mut pending_readiness, started_at, second);
+        let episode = settling.as_mut().expect("paced loss starts settling");
+        for seconds in [5, 10, 15, 20] {
+            assert_eq!(
+                episode.observe(
+                    started_at + Duration::from_secs(seconds),
+                    11,
+                    cfg.runner.count
+                ),
+                SettlingDecision::Continue
+            );
+        }
+        assert_eq!(
+            episode.observe(started_at + Duration::from_secs(25), 11, cfg.runner.count),
+            SettlingDecision::Ceiling
+        );
+        assert!(pending_readiness);
+        assert_eq!(
+            start_command_disposition(&outcome),
+            StartCommandDisposition::Incomplete
+        );
+        assert!(!ensure_outcome_may_credit_deadman(&outcome));
+
+        let mut paused = outcome.clone();
+        paused.admission_paused_reason = Some("fleet circuit open".into());
+        assert_eq!(
+            ensure_success_decision(&cfg, &paused),
+            EnsureSuccessDecision::AdmissionPaused,
+            "admission pause retains priority over witnessed loss"
         );
     }
 
@@ -1946,7 +2618,65 @@ mod tests {
     }
 
     #[test]
-    fn settling_episode_ceiling_guarantees_monitor_then_immediate_reconcile() {
+    fn ceiling_dispatches_async_canary_despite_legacy_monitor_gate() {
+        let cfg = test_config();
+        let (_, run_monitors) = settling_plan(&cfg, SettlingDecision::Ceiling);
+        assert!(
+            !run_monitors,
+            "Ceiling retains zero-sleep refill priority over legacy synchronous monitors"
+        );
+
+        let mut queue_dispatched = false;
+        let mut canary_dispatched = false;
+        dispatch_async_monitor_ticks(
+            run_monitors,
+            || queue_dispatched = true,
+            || canary_dispatched = true,
+        );
+
+        assert!(
+            queue_dispatched,
+            "queue scheduler remains dispatched on Ceiling"
+        );
+        assert!(
+            canary_dispatched,
+            "canary must remain interval-limited but cannot be starved by Ceiling"
+        );
+    }
+
+    #[test]
+    fn settling_episode_reconciles_immediately_when_execution_regresses() {
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 5);
+
+        let decision = episode.observe(started_at + Duration::from_secs(5), 4, 6);
+
+        assert_eq!(decision, SettlingDecision::Ceiling);
+        assert_eq!(episode.attempts, 1);
+        assert!(!episode.is_active());
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        assert_eq!(
+            settling_plan(&cfg, decision),
+            (Duration::ZERO, false),
+            "lost executing capacity must reconcile on the next iteration without synchronous monitors"
+        );
+    }
+
+    #[test]
+    fn settling_episode_target_recovery_wins_over_best_count_regression() {
+        let started_at = Instant::now();
+        let mut episode = SettlingEpisode::start(started_at, 7);
+
+        let decision = episode.observe(started_at + Duration::from_secs(5), 6, 6);
+
+        assert_eq!(decision, SettlingDecision::Recovered);
+        assert_eq!(episode.attempts, 1);
+        assert!(!episode.is_active());
+    }
+
+    #[test]
+    fn settling_episode_ceiling_reconciles_immediately_without_synchronous_monitors() {
         let mut cfg = test_config();
         cfg.runner.serve_tick_seconds = 30;
         let started_at = Instant::now();
@@ -1963,10 +2693,47 @@ mod tests {
         assert_eq!(ceiling, SettlingDecision::Ceiling);
         assert_eq!(episode.attempts, MAX_SETTLING_POLLS);
         assert!(!episode.is_active());
+        // Ceiling plan: zero sleep, no synchronous monitor drive. Queue
+        // monitor ticks now run async via QueueMonitorScheduler so a
+        // slow `gh api` child cannot block the next ensure_count.
         assert_eq!(
             settling_plan(&cfg, ceiling),
-            (Duration::ZERO, true),
-            "the bounded episode must run monitors and add no sleep before the next expensive reconciliation"
+            (Duration::ZERO, false),
+            "the bounded episode must reconcile on the next iteration without synchronous monitors"
+        );
+    }
+
+    /// Direct-reconcile integration assertion: every Ceiling path
+    /// (settling + ensure_success::IncompleteReadiness) must hand the
+    /// serve loop a plan of `(Duration::ZERO, false)`. This is the
+    /// production fix for the Mac refill starvation where a slow
+    /// `gh api actions/runs/.../jobs` child blocked the synchronous
+    /// 75 s monitor drive that ran BEFORE ensure_count on every Ceiling
+    /// event. With `(0, false)` the next serve-loop iteration hits
+    /// `ensure_count_outcome` without first waiting on the monitor
+    /// block.
+    #[test]
+    fn ceiling_plan_reconciles_directly_without_monitors() {
+        let mut cfg = test_config();
+        cfg.runner.serve_tick_seconds = 30;
+        // Every Ceiling-emitting decision must yield the same
+        // zero-sleep / no-monitors plan.
+        let settle_ceiling = settling_plan(&cfg, SettlingDecision::Ceiling);
+        assert_eq!(settle_ceiling, (Duration::ZERO, false));
+        let ensure_ceiling = ensure_success_plan(&cfg, EnsureSuccessDecision::IncompleteReadiness);
+        assert_eq!(ensure_ceiling, (Duration::ZERO, false));
+        // And the two non-Ceiling decisions stay unchanged.
+        assert_eq!(
+            settling_plan(&cfg, SettlingDecision::Continue),
+            (Duration::from_secs(config::MIN_SERVE_TICK_SECONDS), false)
+        );
+        assert_eq!(
+            settling_plan(&cfg, SettlingDecision::Recovered),
+            (cfg.runner.serve_tick(), true)
+        );
+        assert_eq!(
+            ensure_success_plan(&cfg, EnsureSuccessDecision::AdmissionPaused),
+            (cfg.runner.serve_tick(), true)
         );
     }
 
@@ -2003,13 +2770,15 @@ mod tests {
             );
             assert_eq!(
                 settling_plan(&cfg, decision),
-                (Duration::ZERO, true),
-                "ceiling must run monitors before the full reconciliation"
+                (Duration::ZERO, false),
+                "ceiling must reconcile on the next iteration without synchronous monitors"
             );
 
             let full_container_decision = ensure_success_decision_with_pending_readiness(
                 EnsureSuccessDecision::Recovered,
                 pending_readiness,
+                false,
+                0,
             );
             assert_eq!(
                 full_container_decision,
@@ -2533,5 +3302,96 @@ mod tests {
             "invariant sampler tick",
             || Ok(None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod burst_alert_tests {
+    use super::*;
+    use crate::docker_backend::EnsureCountOutcome;
+    use std::fs;
+
+    fn test_config_with_log() -> (
+        crate::config::Config,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let mut cfg = crate::config::Config::defaults_for(
+            &crate::platform::Platform {
+                os: "linux",
+                arch: "x86_64",
+                kvm_usable: false,
+                has_tart: false,
+                has_virsh: false,
+                docker_ok: true,
+                sysbox_runtime: false,
+                daemon_in_vm: false,
+                total_mem_mb: 8192,
+                cpus: 4,
+            },
+            "owner/repo".into(),
+            crate::config::Scope::Repo,
+        );
+        let dir = std::env::temp_dir().join("ezgha-alert-test");
+        let log = dir.join("alert.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+        (cfg, dir, log)
+    }
+
+    #[test]
+    fn registration_burst_emits_alert() {
+        let (mut cfg, _dir, log) = test_config_with_log();
+
+        cfg.alert.registration_burst_threshold = 3;
+        let mut streak = 0;
+        let outcome = EnsureCountOutcome {
+            started: vec![],
+            missing: 5,
+            remaining_shortage: 5,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec![],
+            start_failures: 4, // Exceeds threshold of 3
+            reclaimed: 0,
+            admission_paused_reason: None,
+        };
+        apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut streak,
+            &outcome,
+        );
+
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("registration_burst"));
+        assert!(raw.contains("registration failure(s) in a single refill pass"));
+    }
+
+    #[test]
+    fn reclaim_burst_emits_alert() {
+        let (mut cfg, _dir, log) = test_config_with_log();
+        cfg.alert.reclaim_burst_threshold = 3;
+        let mut streak = 0;
+        let outcome = EnsureCountOutcome {
+            started: vec![],
+            missing: 5,
+            remaining_shortage: 5,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec![],
+            start_failures: 0,
+            reclaimed: 4, // Exceeds threshold of 3
+            admission_paused_reason: None,
+        };
+        apply_ensure_outcome_to_failure_streak(
+            &cfg,
+            backend::Backend::Docker,
+            &mut streak,
+            &outcome,
+        );
+
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("reclaim_burst"));
+        assert!(raw.contains("slot(s) reclaimed in a single pass"));
     }
 }
