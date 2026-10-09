@@ -180,7 +180,10 @@ RESPAWN_EVIDENCE_WINDOW_MIN="${RESPAWN_EVIDENCE_WINDOW_MIN:-3}"
 # a line ending in "ez-runner-c-10"), else 0.
 journal_has_respawn_evidence() {
   local name="$1"
-  if grep -q "respawned ephemeral runner ${name}\$"; then
+  # Literal (not regex) match anchored at end-of-line: the name may contain
+  # regex metacharacters (bead ez-gh-actions-il81).
+  if RUNNER_WANT="respawned ephemeral runner ${name}" awk \
+       'BEGIN { want = ENVIRON["RUNNER_WANT"] } { n = length(want); if (length($0) >= n && substr($0, length($0) - n + 1) == want) f = 1 } END { exit !f }'; then
     echo 1
   else
     echo 0
@@ -305,11 +308,19 @@ LOOP_FAILS=$(recent_logs "$LOOP_WINDOW" | grep -c 'ensure_count failed' || true)
 LAST_LOOP=$(recent_logs "$LOOP_WINDOW" | tail -n 1 | cut -c1-40 || true)
 info "ensure_count failed occurrences in last ${LOOP_WINDOW} min: $LOOP_FAILS"
 info "most recent log line: $LAST_LOOP"
-SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+if [ "$PLATFORM" = "macos" ]; then
+  LOCAL_CONFIG_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml"
+  [ -f "$LOCAL_CONFIG_FILE" ] || LOCAL_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+  SLOT_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/slot_assignments.toml"
+  [ -f "$SLOT_FILE" ] || SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+else
+  LOCAL_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+  SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+fi
 # Section-scoped count: slot_assignments.toml now carries BOTH [assignments]
 # and [registered_at] sections, one line per slot each (registered_at was
 # added during churn remediation). A whole-file `grep -c '='` therefore
-# double-counts (~28 for a 16-slot fleet) — see ez-gh-actions-nj2j. Count
+# double-counts (~28 for a 14-slot Linux fleet) — see ez-gh-actions-nj2j. Count
 # only lines inside [assignments], never a whole-file grep.
 count_assignments_section() {
   awk '
@@ -326,13 +337,13 @@ else
   info "slot_assignments.toml absent (no reservations)"
 fi
 
-# Read the configured runner name prefix from ~/.config/ezgha/config.toml.
+# Read the configured runner name prefix from config.toml.
 # Different platforms/stacks use different prefixes: jeff-ubuntu Linux uses
 # `ez-org-runner` (legacy) or `ez-runner-b` (after prefix rename PR #8143),
 # Mac uses `ez-mac-runner` and may collide so suffixes like `-b` get added
 # by next_slot to avoid GitHub-side 422s. The doctor must accept ALL of
 # these, not a single hardcoded `ez-org-`.
-RUNNER_NAME_PREFIX=$(awk -F'"' '/^name_prefix/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+RUNNER_NAME_PREFIX=$(grep -E '^name_prefix' "$LOCAL_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' "\x27')
 if [ -z "$RUNNER_NAME_PREFIX" ]; then
   # Legacy / missing config: fall back to `ez-org-runner` (the pre-#8143 default).
   RUNNER_NAME_PREFIX="ez-org-runner"
@@ -342,7 +353,7 @@ info "configured runner name prefix: $RUNNER_NAME_PREFIX"
 
 # Policy vs backend: catch minimum_isolation=vm on hosts where docker blips
 # leave backend at container-only (Mac colima socket flake → serve fail-closed).
-POLICY_MIN=$(awk -F'"' '/^minimum_isolation/ {print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+POLICY_MIN=$(grep -E '^minimum_isolation' "$LOCAL_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' "\x27')
 if [ -n "$POLICY_MIN" ]; then
   info "configured minimum_isolation: $POLICY_MIN"
   if recent_logs 10 | grep -q 'policy requires vm isolation but best available backend is docker'; then
@@ -526,6 +537,38 @@ if [ "${SETTLING_HITS:-0}" -gt 3 ] 2>/dev/null; then
   warn "daemon logged $SETTLING_HITS 'settling ceiling reached' warning(s) in the $PRESSURE_LOG_SCOPE -- container respawns are running slower than expected, consistent with host congestion above"
 fi
 
+# --- D3. forbidden host lifecycle authority (read-only) ------------------
+HOST_LIFECYCLE_CRITICAL=0
+if [ "$PLATFORM" = "linux" ]; then
+  section "6c. forbidden host lifecycle authority"
+  if systemctl is-active --quiet watchdog.service 2>/dev/null || \
+     systemctl is-enabled --quiet watchdog.service 2>/dev/null; then
+    bad "system watchdog.service is active or boot-enabled; physical-host lifecycle authority must be operator-only"
+    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
+  else
+    ok "system watchdog.service is inactive and not boot-enabled"
+  fi
+  PANIC_TIMEOUT=$(sysctl -n kernel.panic 2>/dev/null || echo unknown)
+  PANIC_ON_OOPS=$(sysctl -n kernel.panic_on_oops 2>/dev/null || echo unknown)
+  # kernel.panic != 0 is an automatic reboot timer: always BAD. panic_on_oops=1
+  # is the operator-approved kdump crash-capture design (kdump-config sets it
+  # when it loads the crash kernel; bead bd-dea.10) and is OK only while the
+  # crash kernel is actually loaded (KEXEC_CRASH_LOADED_PATH overridable for tests).
+  KEXEC_CRASH_LOADED_PATH="${KEXEC_CRASH_LOADED_PATH:-/sys/kernel/kexec_crash_loaded}"
+  KEXEC_CRASH_LOADED=$(cat "$KEXEC_CRASH_LOADED_PATH" 2>/dev/null || echo 0)
+  if [ "$PANIC_TIMEOUT" != "0" ]; then
+    bad "kernel auto-recovery is armed (kernel.panic=${PANIC_TIMEOUT}, kernel.panic_on_oops=${PANIC_ON_OOPS}); operator must disarm it"
+    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
+  elif [ "$PANIC_ON_OOPS" = "0" ]; then
+    ok "kernel panic and oops auto-recovery are disabled"
+  elif [ "$PANIC_ON_OOPS" = "1" ] && [ "$KEXEC_CRASH_LOADED" = "1" ]; then
+    ok "kernel.panic_on_oops=1 with crash kernel loaded: oops -> kdump crash capture; kernel.panic=0 so no automatic reboot timer"
+  else
+    bad "kernel auto-recovery is armed (kernel.panic=${PANIC_TIMEOUT}, kernel.panic_on_oops=${PANIC_ON_OOPS}, kexec_crash_loaded=${KEXEC_CRASH_LOADED}); operator must disarm it"
+    HOST_LIFECYCLE_CRITICAL=$((HOST_LIFECYCLE_CRITICAL + 1))
+  fi
+fi
+
 # --- E. recent routing proof: jobs REALLY ran on the configured fleet -----
 # "online" is not "working". This section proves recent GitHub Actions jobs
 # were actually EXECUTED by configured-prefix runners by reading each run's
@@ -542,11 +585,11 @@ while read -r rid; do
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]]; then
+  if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; then
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
   else
-    warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-*)"
+    warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-* / ez-*)"
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
 info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
@@ -578,11 +621,11 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}" ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]]; } && [ "$conc" = "success" ]; then
+    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
     else
-      bad "canary run $cid: $conc on $rn (expected success on ${RUNNER_NAME_PREFIX}-*)"
+      bad "canary run $cid: $conc on $rn (expected success on our fleet ez-*)"
     fi
   fi
 fi
@@ -670,7 +713,9 @@ set -e
 JOBLEVEL_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
 JOBLEVEL_INPROG_COUNT="${JOBLEVEL_INPROG_COUNT:-0}"
 JOBLEVEL_OLDEST_QUEUED_MIN="0"
-[ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ] && JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT")
+if [ -n "${JOBLEVEL_OLDEST_QUEUED_AT:-}" ]; then
+  JOBLEVEL_OLDEST_QUEUED_MIN=$(iso_elapsed_min "$JOBLEVEL_OLDEST_QUEUED_AT") || JOBLEVEL_OLDEST_QUEUED_MIN="?"
+fi
 
 # Count fetch failures recorded by the (subshell) builder. Run-list failures
 # and per-run jobs failures counted separately for the diagnostic message.
@@ -694,12 +739,14 @@ fi
 QUEUE_TAIL_BAD=0
 QUEUE_QUEUED_STALE=0
 if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
+  # `|| QUEUE_RC=$?` keeps errexit suppressed inside the sourced body even if
+  # it re-arms `set -e`: this section must never abort sections 9/10.
+  QUEUE_RC=0
   set +e
   # shellcheck source=/dev/null
-  source "$SCRIPT_DIR/scripts/queue-health.sh"
-  QUEUE_RC=$?
+  source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   set -e
-  [ "$QUEUE_RC" -eq 1 ] && QUEUE_TAIL_BAD=1
+  if [ "$QUEUE_RC" -ne 0 ]; then QUEUE_TAIL_BAD=1; fi  # 1 = tail exceeded, 2 = unmeasurable (UNPROVEN)
 else
   section "8. GitHub Actions queue health"
   warn "scripts/queue-health.sh missing — queue metrics skipped"
@@ -717,9 +764,9 @@ fi
 # not just however many containers happen to exist — so a slot that never
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
-CONFIGURED_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
-DEFAULT_LINUX_RUNNER_COUNT=10
-DEFAULT_MAC_RUNNER_COUNT=6
+CONFIGURED_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
+DEFAULT_LINUX_RUNNER_COUNT=20
+DEFAULT_MAC_RUNNER_COUNT=4
 if [ "$PLATFORM" = "macos" ]; then
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_MAC_RUNNER_COUNT"
 else
@@ -771,15 +818,40 @@ done
 # normal ephemeral recycle, classified by their second-sample state.
 DOWN_PERSISTENCE_WAIT_SECONDS="${DOWN_PERSISTENCE_WAIT_SECONDS:-30}"
 CYCLING_SLOTS=()
-if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
-  info "first-pass DOWN candidates (${DOWN_SLOTS[*]}) — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s to filter normal ephemeral recycling"
+# IDLE re-sample (bead ez-gh-actions-9m8z): a container 1-2s old is idle only
+# because GitHub has not assigned it a job yet. With short jobs and a deep
+# queue that reads a healthy fleet as IDLE-STARVED, so first-pass IDLE slots
+# get the same one re-sample after the same delay (shared sleep with DOWN).
+_FIRST_IDLE=()
+_IDLE_TO_DOWN=0
+if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
+  _FIRST_IDLE=("${IDLE_SLOTS[@]}")
+fi
+if [ "${#DOWN_SLOTS[@]}" -gt 0 ] || [ "${#_FIRST_IDLE[@]}" -gt 0 ]; then
+  info "first-pass DOWN (${DOWN_SLOTS[*]:-none}) / IDLE (${_FIRST_IDLE[*]:-none}) candidates — re-sampling in ${DOWN_PERSISTENCE_WAIT_SECONDS}s to filter normal ephemeral recycling and fresh-container pickup lag"
   sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
+  if [ "${#_FIRST_IDLE[@]}" -gt 0 ]; then
+    IDLE_SLOTS=()
+    for _name in "${_FIRST_IDLE[@]}"; do
+      case "$(classify_local_slot "$_name")" in
+        DOWN)      DOWN_SLOTS+=("$_name"); _IDLE_TO_DOWN=1 ;;   # absent now: follows the DOWN path below
+        IDLE)      IDLE_SLOTS+=("$_name") ;;
+        EXECUTING) EXECUTING_SLOTS+=("$_name") ;;
+      esac
+    done
+    # An idle->absent slot has only ONE absent sample; DOWN needs two samples
+    # a persistence delay apart, so wait once more before the DOWN loop below
+    # re-samples it (a normal recycle blink must not read as DOWN).
+    if [ "$_IDLE_TO_DOWN" -eq 1 ]; then
+      sleep "$DOWN_PERSISTENCE_WAIT_SECONDS"
+    fi
+  fi
   _PERSISTENT_DOWN=()
   _BLINKED=()
   for _name in "${DOWN_SLOTS[@]}"; do
     case "$(classify_local_slot "$_name")" in
       DOWN)      _PERSISTENT_DOWN+=("$_name") ;;
-      IDLE)      IDLE_SLOTS+=("$_name");      _BLINKED+=("$_name") ;;
+      IDLE)      CYCLING_SLOTS+=("$_name");  _BLINKED+=("$_name") ;;
       EXECUTING) EXECUTING_SLOTS+=("$_name"); _BLINKED+=("$_name") ;;
     esac
   done
@@ -1009,7 +1081,7 @@ list_slot_work() {
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
   printf "\n  %s (%d configured):\n" "$label" "$count"
   local -a slot_state=()
-  local i name jobline has_down=0
+  local i name jobline has_down=0 has_idle=0 idle_to_down=0
 
   if [ "$host" = "localhost" ] && [ -n "${LOCAL_SLOT_STATE_TABLE:-}" ] \
      && [ "$prefix" = "${RUNNER_NAME_PREFIX:-}" ] && [ "$count" = "${CONFIGURED_COUNT:-}" ]; then
@@ -1022,15 +1094,40 @@ list_slot_work() {
     for i in $(seq 1 "$count"); do
       slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
       [ "${slot_state[i]}" = "DOWN" ] && has_down=1
+      [ "${slot_state[i]}" = "IDLE" ] && has_idle=1
     done
-    if [ "$has_down" -eq 1 ]; then
-      info "$label: first-pass DOWN candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895)"
+    if [ "$has_down" -eq 1 ] || [ "$has_idle" -eq 1 ]; then
+      info "$label: first-pass DOWN/IDLE candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895) and fresh-container job-pickup lag (bead ez-gh-actions-9m8z)"
       sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
       for i in $(seq 1 "$count"); do
-        [ "${slot_state[i]}" != "DOWN" ] && continue
+        case "${slot_state[i]}" in
+          DOWN)
+            case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+              DOWN) : ;;                            # persisted both docker samples — check journal next
+              *)    slot_state[i]="CYCLING" ;;      # back Up — normal respawn, not a defect
+            esac
+            ;;
+          IDLE)
+            # Re-sampled state wins: EXECUTING clears, IDLE stays, absent
+            # follows the DOWN path (journal cross-check below).
+            slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+            if [ "${slot_state[i]}" = "DOWN" ]; then
+              has_down=1; idle_to_down=1
+              slot_state[i]="IDLE_DOWN"          # one absent sample so far
+            fi
+            ;;
+        esac
+      done
+      # idle->absent has only ONE absent sample; DOWN needs two a persistence
+      # delay apart, so wait again and re-probe before it can count as DOWN.
+      if [ "$idle_to_down" -eq 1 ]; then
+        sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
+      fi
+      for i in $(seq 1 "$count"); do
+        [ "${slot_state[i]}" != "IDLE_DOWN" ] && continue
         case "$(probe_slot_state "$host" "${prefix}-${i}")" in
-          DOWN) : ;;                                # persisted both docker samples — check journal next
-          *)    slot_state[i]="CYCLING" ;;          # back Up — normal respawn, not a defect
+          DOWN) slot_state[i]="DOWN" ;;
+          *)    slot_state[i]="CYCLING" ;;
         esac
       done
       # Journal cross-check (ez-gh-actions-5n0h): a slot still containerless
@@ -1136,13 +1233,13 @@ list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 # cross-check) are now the only remote sample taken.
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
-  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
-  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-$DEFAULT_LINUX_RUNNER_COUNT}"
+  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-}"
+  REMOTE_COUNT="${REMOTE_LINUX_COUNT:-}"
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
-  REMOTE_COUNT="${MAC_RUNNER_COUNT:-$DEFAULT_MAC_RUNNER_COUNT}"
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-}"
+  REMOTE_COUNT="${MAC_RUNNER_COUNT:-}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
 REMOTE_EXECUTING_SLOTS=()
@@ -1152,9 +1249,9 @@ REMOTE_DOWN_SLOTS=()
 # REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
 # below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
 # printed only a warn() — `configured` then collapsed to the local-only
-# count (e.g. 10 instead of 16, per this repo's current 10-Linux + 6-Mac
+# count (e.g. 20 instead of 24, per this repo's current 20-Linux + 4-Mac
 # contract) so a Linux run with the Mac unreachable reported "fleet
-# healthy: 10/10" instead of "10/16 with 6 down". Treat
+# healthy: 20/20" instead of "20/24 with 4 down". Treat
 # unreachable as the strongest negative signal available (we have ZERO
 # evidence about any of the remote slots, so all of them are unproven):
 # populate REMOTE_DOWN_SLOTS with synthetic names so the verdict gate
@@ -1162,7 +1259,49 @@ REMOTE_DOWN_SLOTS=()
 # SLOT_PROOF_CRITICAL so the verdict flips to `bad` (the "fleet healthy"
 # ok() line cannot survive an unreachable half of the fleet).
 REMOTE_UNREACHABLE=0
+REMOTE_CONFIG_UNPROVEN=0
+if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"; else DEFAULT_REMOTE_COUNT="$DEFAULT_MAC_RUNNER_COUNT"; fi
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
+  # Config lookup: one retry with a longer timeout. A failed read leaves the
+  # value EMPTY (never a hardcoded guess) -> remote fleet marked UNPROVEN below.
+  if [ "$PLATFORM" = "macos" ]; then
+    _rcfg_files='~/.config/ezgha/config.toml'
+  else
+    _rcfg_files='~/Library/Application\ Support/org.jleechanorg.ezgha/config.toml ~/.config/ezgha/config.toml'
+  fi
+  _remote_cfg_get() {  # $1 = grep pattern
+    local _t _v
+    for _t in 4 10; do
+      _v=$(timeout "$_t" ssh -o ConnectTimeout=$((_t - 1)) -o BatchMode=yes "$REMOTE_HOST" "grep -hE '$1' $_rcfg_files 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//; s/[^A-Za-z0-9_.-]//g'" 2>/dev/null) || _v=""
+      if [ -n "$_v" ]; then printf '%s' "$_v"; return 0; fi
+    done
+    return 0
+  }
+  [ -n "$REMOTE_PREFIX" ] || REMOTE_PREFIX=$(_remote_cfg_get '^name_prefix')
+  _remote_count_src="config"
+  if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); else _remote_count_src="override"; fi
+  if [ -z "$REMOTE_PREFIX" ] || [ -z "$REMOTE_COUNT" ]; then
+    REMOTE_CONFIG_UNPROVEN=1
+    REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
+    [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -ge "$DEFAULT_REMOTE_COUNT" ] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+    REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
+    bad "$REMOTE_LABEL remote config (name_prefix/count) could not be read over SSH after retry — remote fleet UNPROVEN (counted as $REMOTE_COUNT DOWN contract slot(s), no slot names guessed; fix SSH or set the MAC_RUNNER_NAME_PREFIX/MAC_RUNNER_COUNT or REMOTE_LINUX_PREFIX/REMOTE_LINUX_COUNT overrides)"
+    _unproven_idx=1
+    while [ "$_unproven_idx" -le "$REMOTE_COUNT" ]; do
+      REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unproven_idx} (unproven)")
+      _unproven_idx=$((_unproven_idx + 1))
+    done
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
+  else
+  # A count below the fleet contract (from config OR an env override) is
+  # underprovisioning, not the expected capacity: flag it and inspect the
+  # contract number of slots so the missing slot shows DOWN. Overrides may
+  # raise the count or set the prefix, never lower the contract.
+  if ! [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] || [ "$REMOTE_COUNT" -lt "$DEFAULT_REMOTE_COUNT" ]; then
+    bad "$REMOTE_LABEL remote $_remote_count_src count $REMOTE_COUNT is below the fleet contract $DEFAULT_REMOTE_COUNT — underprovisioned"
+    SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
+    REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+  fi
   list_slot_work "$REMOTE_PREFIX" "$REMOTE_COUNT" "$REMOTE_HOST" "$REMOTE_LABEL"
   REMOTE_EXECUTING_SLOTS=("${LAST_EXECUTING_SLOTS[@]}")
   REMOTE_IDLE_SLOTS=("${LAST_IDLE_SLOTS[@]}")
@@ -1177,6 +1316,7 @@ if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/
     bad "$REMOTE_LABEL IDLE-STARVED (oldest queued job ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#REMOTE_IDLE_SLOTS[@]} slot(s): ${REMOTE_IDLE_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_IDLE_SLOTS[@]}))
   fi
+  fi
 else
   printf "\n  %s: not reachable via SSH — per-slot work inventory skipped\n" "$REMOTE_LABEL"
   # Synthesize per-slot DOWN entries for every remote slot we cannot prove.
@@ -1185,10 +1325,17 @@ else
   # conservatively reported as DOWN. This (a) keeps `configured` at the
   # full expected fleet size (no silent local-only collapse), (b) puts
   # the unreachable slots into the headline `down` count (so a Mac
-  # outage from jeff-ubuntu is reported as 6/16 down, not "0/10 down"),
+  # outage from jeff-ubuntu is reported as 6/20 down, not "0/14 down"),
   # and (c) via SLOT_PROOF_CRITICAL below, forces the verdict from
   # `ok` to `bad` so an unreachable host can never silently green.
   REMOTE_UNREACHABLE=1
+  # No override and no config lookup: fall back to the contract count and a
+  # placeholder prefix so the verdict always goes non-green and no slot name
+  # is ever built from an empty prefix.
+  REMOTE_COUNT="${REMOTE_COUNT:-$DEFAULT_REMOTE_COUNT}"
+  # Never below the contract (an explicit 0 must not zero out the criticals).
+  [[ "$REMOTE_COUNT" =~ ^[0-9]+$ ]] && [ "$REMOTE_COUNT" -ge "$DEFAULT_REMOTE_COUNT" ] || REMOTE_COUNT="$DEFAULT_REMOTE_COUNT"
+  REMOTE_PREFIX="${REMOTE_PREFIX:-<unknown-prefix>}"
   _unreach_idx=1
   while [ "$_unreach_idx" -le "$REMOTE_COUNT" ]; do
     REMOTE_DOWN_SLOTS+=("${REMOTE_PREFIX}-${_unreach_idx} (unreachable)")
@@ -1223,10 +1370,24 @@ export REMOTE_UNREACHABLE
 # Linux-only: journalctl timestamps every line; macOS's redirected launchd
 # log files carry no per-line timestamp to diff.
 STARVE_WINDOW="${STARVE_WINDOW:-10}"
-SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
+SERVE_TICK_SECONDS=$(awk -F'=' '/^serve_tick_seconds/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$LOCAL_CONFIG_FILE" 2>/dev/null)
 SERVE_TICK_SECONDS="${SERVE_TICK_SECONDS:-30}"
 STARVE_GAP_WARN_SECONDS=$((SERVE_TICK_SECONDS * 8))
-if [ "$PLATFORM" = "linux" ]; then
+# The heartbeat is the "queue monitor:" line, which the daemon only emits when
+# [queue_monitor] enabled = true; with it disabled, zero samples is expected.
+# Real TOML parse (header/inline comments, quoting). A missing table or key is
+# false, the daemon's QueueMonitorConfig default; an unparseable config prints
+# "unknown", which keeps the heartbeat check running (fail closed).
+QUEUE_MONITOR_ENABLED=$(python3 -c 'import sys, tomllib
+try:
+    cfg = tomllib.load(open(sys.argv[1], "rb"))
+except Exception:
+    print("unknown"); sys.exit(0)
+qm = cfg.get("queue_monitor", {})
+print("true" if isinstance(qm, dict) and qm.get("enabled", False) is True else "false")' "$LOCAL_CONFIG_FILE" 2>/dev/null || echo unknown)
+if [ "$PLATFORM" = "linux" ] && [ "$QUEUE_MONITOR_ENABLED" = "false" ]; then
+  info "serve-loop heartbeat signal skipped: [queue_monitor] enabled = false in $LOCAL_CONFIG_FILE, so the daemon emits no 'queue monitor:' lines; per-slot proof above is the liveness signal"
+elif [ "$PLATFORM" = "linux" ]; then
   read -r MAX_HEARTBEAT_GAP RESTART_BOUNDARY_SEEN HEARTBEAT_SAMPLE_COUNT < <(
     journalctl --user -u ezgha.service --since "${STARVE_WINDOW} minutes ago" -o short-unix --no-pager 2>/dev/null \
       | compute_heartbeat_gap
@@ -1258,6 +1419,45 @@ fi
 
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
+# BEGIN host-aware failure remediation (hermetically extracted by
+# tests/doctor_runner_host_lifecycle_test.sh).
+emit_failure_remediation() {
+  local fleet_critical="$1" host_critical="$2" platform="$3"
+
+  if [ "$fleet_critical" -gt 0 ]; then
+    bad "fleet unhealthy: $fleet_critical critical check(s) failed"
+  fi
+  if [ "$host_critical" -gt 0 ]; then
+    bad "physical-host lifecycle policy FAILED ($host_critical operator-owned setting(s); see section 6c)"
+    echo "  Operator action is required outside ezgha; doctor-runner will not mutate host lifecycle settings."
+  fi
+  if [ "$fleet_critical" -le 0 ]; then
+    return
+  fi
+
+  if [ "$host_critical" -gt 0 ]; then
+    echo "  Host lifecycle findings are separate; the child-layer remediation below does not address them."
+  fi
+  echo
+  echo "Suggested child-layer remediation (platform=$platform):"
+  if [ "$platform" = "linux" ]; then
+    echo "  1. Stop and restart ezgha:  systemctl --user restart ezgha.service"
+  elif [ "$platform" = "macos" ]; then
+    echo "  1. Stop and restart ezgha:  launchctl kickstart -k gui/$(id -u)/org.jleechanorg.ezgha"
+    echo "     (or reload plist:        launchctl unload ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist && launchctl load -w ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist)"
+  else
+    echo "  1. Stop and restart ezgha via your platform's service manager"
+  fi
+  echo "  2. Reset slot file:          rm ~/.config/ezgha/slot_assignments.toml"
+  if command -v colima >/dev/null 2>&1; then
+    echo "  3. Start colima if down:     colima start"
+  elif command -v limactl >/dev/null 2>&1; then
+    echo "  3. Start lima if down:       limactl start <name>"
+  fi
+  echo "  4. Re-run ./doctor.sh --detail after each step"
+}
+# END host-aware failure remediation
+
 # Job-level queue counts (fresh-only, from section F1b's single job-map
 # fetch) — printed for BOTH healthy and unhealthy verdicts so the queue
 # state is never hidden behind a green light. A degraded map prints as
@@ -1288,7 +1488,7 @@ if [ "$COLIMA_STATUS" = "Stopped" ]; then
   CRITICAL=$((CRITICAL+1))
 fi
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
-# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-b-*` fleet
+# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-g-*` fleet
 # counts the same as Linux's `ez-org-runner-*` / `ez-runner-b-*`.)
 if ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1; then
   bad "verdict: runners-online gate FAILED (no ONLINE runner with prefix '$RUNNER_NAME_PREFIX' found; total=$TOTAL online=$ONLINE offline=$OFFLINE busy=$BUSY)"
@@ -1299,11 +1499,11 @@ fi
 # CONFIGURED_COUNT), NOT from a whole-file grep of slot_assignments.toml.
 # That file now carries BOTH [assignments] and [registered_at] sections
 # (registered_at added during churn remediation), one line per slot each, so
-# a plain `grep -c '='` double-counts (~28 for a 16-slot fleet) and falsely
+# a plain `grep -c '='` double-counts (~28 for a 14-slot Linux fleet) and falsely
 # tripped this gate — see ez-gh-actions-nj2j. Fallback (only when
 # config.toml is unreadable): count lines within the [assignments] section
 # ONLY, never a whole-file grep.
-CONFIG_RUNNER_COUNT=$(read_config_runner_count "$HOME/.config/ezgha/config.toml" 2>/dev/null || true)
+CONFIG_RUNNER_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
 if [ -n "${CONFIG_RUNNER_COUNT:-}" ]; then
   EXPECTED_CONTAINERS="${EXPECTED_CONTAINERS:-$CONFIG_RUNNER_COUNT}"
 elif [ -f "$SLOT_FILE" ]; then
@@ -1393,7 +1593,7 @@ if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
 fi
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
-# the "16/16 executing" standard — ground truth from docker, not the
+# the "20/20 executing" standard — ground truth from docker, not the
 # GitHub API, so it cannot be fooled by a rate-limited fleet-state query.
 # Per-slot bad() lines already printed above (section 9/10); this is the
 # verdict-level summary tying that evidence to the CRITICAL count.
@@ -1411,25 +1611,8 @@ if [ "${GH_TOKEN_STALE_CRITICAL:-0}" -gt 0 ]; then
   CRITICAL=$((CRITICAL + GH_TOKEN_STALE_CRITICAL))
 fi
 
-if [ "$CRITICAL" -gt 0 ]; then
-  bad "fleet unhealthy: $CRITICAL critical check(s) failed"
-  echo
-  echo "Suggested remediation (platform=$PLATFORM):"
-  if [ "$PLATFORM" = "linux" ]; then
-    echo "  1. Stop and restart ezgha:  systemctl --user restart ezgha.service"
-  elif [ "$PLATFORM" = "macos" ]; then
-    echo "  1. Stop and restart ezgha:  launchctl kickstart -k gui/$(id -u)/org.jleechanorg.ezgha"
-    echo "     (or reload plist:        launchctl unload ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist && launchctl load -w ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist)"
-  else
-    echo "  1. Stop and restart ezgha via your platform's service manager"
-  fi
-  echo "  2. Reset slot file:          rm ~/.config/ezgha/slot_assignments.toml"
-  if command -v colima >/dev/null 2>&1; then
-    echo "  3. Start colima if down:     colima start"
-  elif command -v limactl >/dev/null 2>&1; then
-    echo "  3. Start lima if down:       limactl start <name>"
-  fi
-  echo "  4. Re-run ./doctor.sh --detail after each step"
+if [ "$CRITICAL" -gt 0 ] || [ "${HOST_LIFECYCLE_CRITICAL:-0}" -gt 0 ]; then
+  emit_failure_remediation "$CRITICAL" "${HOST_LIFECYCLE_CRITICAL:-0}" "$PLATFORM"
   exit 1
 fi
 # compute_verdict_summary() aggregates the per-slot LOCAL TRUTH (section 9:

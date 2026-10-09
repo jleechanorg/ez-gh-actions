@@ -1,4 +1,4 @@
-# jeff-ubuntu fleet — 10 runners.
+# jeff-ubuntu fleet — approved 20-runner profile (14-runner and 10-runner rollback also supported).
 # Install: cp config/config.toml.linux.example ~/.config/ezgha/config.toml
 version = 1
 
@@ -9,16 +9,47 @@ target = "jleechanorg"
 [runner]
 name_prefix = "ez-runner-c"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64"]
-count = 10
+count = 20
 image = "ezgha-runner:latest"
+# The legacy vm_total_mb field pins the native actions.slice pool to 28 GiB.
+# Docker/OS overhead and the separate QEMU VM are outside this runner pool.
+vm_total_mb = 28672
+guest_reserve_mb = 0
+runner_floor_mb = 1400
+# Retain the host-headroom check; the canonical containment assertion separately
+# checks all four hard caps (55 GiB) plus max(2 GiB, 10% of host RAM) reserve.
+host_reserve_mb = 8192
 
 [limits]
-memory_mb = 3000
-cpus = 2.0
+memory_mb = 1400
+cpus = 1.6
 pids = 512
 min_free_disk_gb = 10
+cgroup_parent = "actions.slice"
 
 [policy]
 # Native linux docker = container isolation. "vm" only if daemon is VM-contained
 # and you want fail-closed enforcement when backend drops below vm.
 minimum_isolation = "container"
+
+# Local start failures collapse inward before they can become a fleet or VM
+# restart storm. Open one slot after 3 failures in 10 minutes; pause all new
+# admission only after 3 distinct slot circuits are open. Existing jobs keep
+# running, and these circuits never stop Colima or the physical host.
+[failure_ladder]
+slot_failure_threshold = 3
+slot_failure_window_secs = 600
+slot_cooldown_secs = 900
+fleet_open_slot_threshold = 3
+fleet_cooldown_secs = 600
+
+# Read-only auxiliary observers stay opt-in on Linux so they cannot compete
+# with the core serve reconciliation loop or become host-pressure voters.
+[queue_monitor]
+enabled = false
+
+[canary]
+enabled = false
+
+[invariant_sampler]
+enabled = false

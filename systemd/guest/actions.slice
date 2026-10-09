@@ -1,0 +1,10 @@
+[Unit]
+Description=Aggregate memory envelope for GitHub Actions runner containers
+
+[Slice]
+# The Colima VM has 36G. Keep 4G outside the runner aggregate for the guest
+# kernel, Docker daemon, and host services; start reclaim before the hard cap.
+MemoryHigh=28G
+MemoryMax=32G
+MemorySwapMax=0
+TasksMax=6000

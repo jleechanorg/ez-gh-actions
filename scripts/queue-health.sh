@@ -15,7 +15,12 @@
 # 01:11:49 and picked up immediately (zero runner wait). Standalone runs
 # (no job map in the environment) fall back to the run-level max, labeled
 # as such.
-set -euo pipefail
+# Strict mode only when run standalone. When sourced by doctor-runner this
+# would re-arm errexit in the parent and let the trailing `[ .. ] && _qh_finish 1`
+# (a non-zero return by design) abort the whole doctor before section 10.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  set -euo pipefail
+fi
 
 # When sourced by doctor.sh, use return — never exit the parent.
 _qh_finish() {
@@ -23,6 +28,7 @@ _qh_finish() {
   if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     exit "$code"
   fi
+  set +e
   return "$code"
 }
 
@@ -38,18 +44,19 @@ info() { printf '  [..]   %s\n' "$*"; }
 
 if ! command -v gh >/dev/null 2>&1; then
   bad "gh CLI not found — cannot measure queue health"
-  _qh_finish 2
+  _qh_finish 2; return 2
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   bad "python3 not found — cannot measure queue health"
-  _qh_finish 2
+  _qh_finish 2; return 2
 fi
 
 section "8. GitHub Actions queue health ($QUEUE_REPO)"
 
 export QUEUE_REPO QUEUE_TAIL_WARN_MIN STALE_HOURS
 
-eval "$(python3 <<'PY'
+_qh_py_rc=0
+_qh_py_out=$(python3 <<'PY'
 import json, os, subprocess, datetime, statistics
 
 repo = os.environ["QUEUE_REPO"]
@@ -141,7 +148,12 @@ runlevel_exceeded = 1 if mx > tail_warn else 0
 print(f'export QUEUE_RUNLEVEL_TAIL_EXCEEDED={runlevel_exceeded}')
 print(f'export QUEUE_STALE_ZOMBIES={1 if len(stale) > 0 else 0}')
 PY
-)"
+) || _qh_py_rc=$?
+if [ "${_qh_py_rc:-0}" -ne 0 ]; then
+  bad "queue metrics unavailable: GitHub API read failed (python exit ${_qh_py_rc}) — queue health UNPROVEN"
+  _qh_finish 2; return 2
+fi
+eval "$_qh_py_out"
 
 info "workflow runs in_progress: $QUEUE_IN_PROGRESS"
 info "workflow runs queued (total): $QUEUE_QUEUED_TOTAL (fresh <${STALE_HOURS}h: $QUEUE_QUEUED_FRESH, stale zombies: $QUEUE_QUEUED_STALE)"
@@ -210,5 +222,7 @@ if [ "${QUEUE_QUEUED_STALE:-0}" -gt 0 ]; then
   info "oldest stale: id=$QUEUE_OLDEST_STALE_ID name=$QUEUE_OLDEST_STALE_NAME branch=$QUEUE_OLDEST_STALE_BRANCH age=${QUEUE_OLDEST_STALE_AGE_DAYS}d created=$QUEUE_OLDEST_STALE_CREATED"
 fi
 
-[ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && _qh_finish 1
+if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
+  _qh_finish 1
+fi
 _qh_finish 0

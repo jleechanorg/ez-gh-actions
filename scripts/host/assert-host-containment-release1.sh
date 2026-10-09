@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Read-only Release 1 host-containment assertion.
+set -euo pipefail
+
+ROOT="/"
+REQUIRE_FLEET=0
+RUNNER_COUNT=20
+fail() { echo "FAIL: $*" >&2; exit 1; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root) ROOT="$2"; shift 2 ;;
+    --require-fleet) REQUIRE_FLEET=1; shift ;;
+    --runner-count)
+      [ "$#" -ge 2 ] || fail "--runner-count requires 10, 14, or 20"
+      RUNNER_COUNT="$2"; shift 2 ;;
+    *) echo "FAIL: unknown argument '$1'" >&2; exit 1 ;;
+  esac
+done
+case "$RUNNER_COUNT" in
+  10) ACTIONS_PIDS_MAX=6000 ;;
+  14) ACTIONS_PIDS_MAX=8000 ;;
+  20) ACTIONS_PIDS_MAX=8000 ;;
+  *) fail "runner count must be 10, 14, or 20 (got $RUNNER_COUNT)" ;;
+esac
+
+mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null || true)"
+[[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
+
+# Floor is the computed sum of the four enforced hard limits
+# (Actions 28G + QEMU 10G + Agents 12G + Automation 5G = 55 GiB)
+# plus max(2 GiB, 10% of host MemTotal).
+ENFORCED_ACTIONS_MAX_BYTES=30064771072
+ENFORCED_QEMU_MAX_BYTES=10737418240
+ENFORCED_AGENTS_MAX_BYTES=12884901888
+ENFORCED_AUTOMATION_MAX_BYTES=5368709120
+
+for b in "$ENFORCED_ACTIONS_MAX_BYTES" "$ENFORCED_QEMU_MAX_BYTES" "$ENFORCED_AGENTS_MAX_BYTES" "$ENFORCED_AUTOMATION_MAX_BYTES"; do
+  [[ "$b" =~ ^[1-9][0-9]*$ ]] || fail "enforced memory limit must be a positive integer"
+done
+hard_limits_sum_kib=$(( (ENFORCED_ACTIONS_MAX_BYTES + ENFORCED_QEMU_MAX_BYTES + ENFORCED_AGENTS_MAX_BYTES + ENFORCED_AUTOMATION_MAX_BYTES) / 1024 ))
+reserve_kib=$(( mem_total_kib / 10 ))
+[ "$reserve_kib" -ge 2097152 ] || reserve_kib=2097152
+computed_floor_kib=$(( hard_limits_sum_kib + reserve_kib ))
+[ "$mem_total_kib" -ge "$computed_floor_kib" ] || fail "host MemTotal (${mem_total_kib} KiB) is below the required computed floor (${computed_floor_kib} KiB: four hard caps ${hard_limits_sum_kib} KiB + reserve ${reserve_kib} KiB)"
+
+[ -f "$ROOT/sys/devices/system/cpu/online" ] || fail "missing cpu/online"
+cpu_count=0; IFS=',' read -r -a cpu_ranges < "$ROOT/sys/devices/system/cpu/online"
+for range in "${cpu_ranges[@]}"; do
+  if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then cpu_count=$((cpu_count + BASH_REMATCH[2] - BASH_REMATCH[1] + 1));
+  elif [[ "$range" =~ ^[0-9]+$ ]]; then cpu_count=$((cpu_count + 1)); fi
+done
+[ "$cpu_count" -ge 32 ] || fail "host online logical CPUs (${cpu_count}) is below the required 32-CPU floor (32)"
+for controller in cpu io memory pids; do
+  grep -qw "$controller" "$ROOT/sys/fs/cgroup/cgroup.controllers" 2>/dev/null || fail "cgroup.controllers missing required controller: $controller"
+done
+
+ACTIONS_DIR="$ROOT/sys/fs/cgroup/actions.slice"
+[ -d "$ACTIONS_DIR" ] || fail "actions.slice cgroup missing at $ACTIONS_DIR"
+check_cgroup_val() {
+  local file="$1" expected="$2" name="$3" actual
+  [ -f "$file" ] || fail "missing $name at $file"
+  actual="$(cat "$file")"
+  [ "$actual" = "$expected" ] || fail "actions.slice $name ('$actual') != '$expected'"
+}
+check_cgroup_val "$ACTIONS_DIR/memory.high" 27917287424 memory.high
+check_cgroup_val "$ACTIONS_DIR/memory.max" "$ENFORCED_ACTIONS_MAX_BYTES" memory.max
+check_cgroup_val "$ACTIONS_DIR/memory.swap.max" 0 memory.swap.max
+check_cgroup_val "$ACTIONS_DIR/pids.max" "$ACTIONS_PIDS_MAX" pids.max
+check_cgroup_val "$ACTIONS_DIR/cpu.max" "2000000 100000" cpu.max
+io_weight="$(cat "$ACTIONS_DIR/io.weight" 2>/dev/null || true)"
+[[ "$io_weight" =~ (^|[[:space:]])25($|[[:space:]]) ]] || fail "actions.slice io.weight ('$io_weight') does not contain 25"
+
+# CONTAINMENT_LIVE_SYSTEMD=1 lets tests run these live systemd checks against a
+# --root fixture with a fake systemctl on PATH.
+if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
+  check_user_property() {
+    local unit="$1" property="$2" expected="$3" actual
+    actual="$(systemctl --user show -p "$property" --value -- "$unit")"
+    [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
+  }
+  check_user_property agents.slice MemoryHigh 10737418240
+  check_user_property agents.slice MemoryMax "$ENFORCED_AGENTS_MAX_BYTES"
+  check_user_property agents.slice MemorySwapMax 2147483648
+  check_user_property agents.slice TasksMax 8192
+  check_user_property agents.slice ManagedOOMMemoryPressure auto
+  check_user_property agents.slice ManagedOOMSwap auto
+
+  check_user_property automation.slice MemoryHigh 4831838208
+  check_user_property automation.slice MemoryMax "$ENFORCED_AUTOMATION_MAX_BYTES"
+  check_user_property automation.slice MemorySwapMax 1073741824
+  check_user_property automation.slice TasksMax 4096
+  check_user_property automation.slice ManagedOOMMemoryPressure auto
+  check_user_property automation.slice ManagedOOMSwap auto
+
+  check_user_property lima-vm@colima.service MemoryHigh 9663676416
+  check_user_property lima-vm@colima.service MemoryMax "$ENFORCED_QEMU_MAX_BYTES"
+  check_user_property lima-vm@colima.service MemorySwapMax 2147483648
+  check_user_property lima-vm@colima.service TasksMax 4096
+  actual_quota="$(systemctl --user show -p CPUQuotaPerSecUSec --value -- lima-vm@colima.service 2>/dev/null || true)"
+  [ -n "$actual_quota" ] || actual_quota="$(systemctl --user show -p CPUQuota --value -- lima-vm@colima.service 2>/dev/null || true)"
+  case "$actual_quota" in
+    16s|1600%) ;;
+    *) fail "lima-vm@colima.service CPUQuota ('$actual_quota') != '16s' / '1600%'" ;;
+  esac
+
+  check_system_property() {
+    local unit="$1" property="$2" expected="$3" actual
+    actual="$(systemctl show -p "$property" --value -- "$unit")"
+    [ "$actual" = "$expected" ] || fail "${unit} ${property} ('$actual') != '$expected'"
+  }
+  # systemd-oomd kills inside actions.slice (runner jobs) at 80% pressure.
+  check_system_property actions.slice ManagedOOMMemoryPressure kill
+  # systemd 255 reports the limit as a UINT32_MAX fraction: 80% = 3435973836.
+  check_system_property actions.slice ManagedOOMMemoryPressureLimit 3435973836
+  check_system_property actions.slice ManagedOOMSwap auto
+  deploy_uid="$(id -u)"
+  check_system_property "user@${deploy_uid}.service" ManagedOOMMemoryPressure auto
+  check_system_property "user@${deploy_uid}.service" ManagedOOMSwap auto
+  check_system_property "user@${deploy_uid}.service" ManagedOOMPreference none
+  check_system_property "user@${deploy_uid}.service" OOMScoreAdjust 0
+  check_system_property -.slice ManagedOOMMemoryPressure auto
+  check_system_property -.slice ManagedOOMSwap auto
+  check_system_property user.slice ManagedOOMMemoryPressure auto
+  check_system_property user.slice ManagedOOMSwap auto
+  check_user_property app.slice ManagedOOMMemoryPressure auto
+  check_user_property app.slice ManagedOOMSwap auto
+  check_user_property session.slice ManagedOOMMemoryPressure auto
+  check_user_property session.slice ManagedOOMSwap auto
+
+  check_no_kill() {
+    local scope="$1" unit="$2" press swap
+    if [ "$scope" = "user" ]; then
+      press="$(systemctl --user show -p ManagedOOMMemoryPressure --value -- "$unit" 2>/dev/null || true)"
+      swap="$(systemctl --user show -p ManagedOOMSwap --value -- "$unit" 2>/dev/null || true)"
+    else
+      press="$(systemctl show -p ManagedOOMMemoryPressure --value -- "$unit" 2>/dev/null || true)"
+      swap="$(systemctl show -p ManagedOOMSwap --value -- "$unit" 2>/dev/null || true)"
+    fi
+    [ "$press" != "kill" ] || fail "forbidden kill policy on $unit (ManagedOOMMemoryPressure=kill)"
+    [ "$swap" != "kill" ] || fail "forbidden kill policy on $unit (ManagedOOMSwap=kill)"
+  }
+  check_no_kill system -.slice
+  check_no_kill system user.slice
+  check_no_kill system "user@${deploy_uid}.service"
+  check_no_kill user app.slice
+  check_no_kill user session.slice
+fi
+
+if [ "$REQUIRE_FLEET" -eq 1 ]; then
+  command -v docker >/dev/null 2>&1 || fail "docker command not available on PATH"
+  docker_cmd() { env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock "$@"; }
+  docker_cgroup="$(docker_cmd info --format '{{.CgroupVersion}} {{.CgroupDriver}}' 2>/dev/null || true)"
+  [ "$docker_cgroup" = "2 systemd" ] || fail "Docker cgroup mode ('$docker_cgroup') != '2 systemd'"
+  mapfile -t containers < <(docker_cmd ps --format '{{.ID}} {{.Names}}' 2>/dev/null | awk '$2 ~ /^ez-runner-c-[0-9]+$/ {print $1 " " $2}')
+  [ "${#containers[@]}" -eq "$RUNNER_COUNT" ] || fail "runner container count (${#containers[@]}) != $RUNNER_COUNT"
+  for container in "${containers[@]}"; do
+    read -r cid cname <<< "$container"
+    cpid="$(docker_cmd inspect --format '{{.State.Pid}}' "$cid" 2>/dev/null || true)"
+    [[ "$cpid" =~ ^[1-9][0-9]*$ ]] || fail "could not resolve live PID for runner container ${cname} (${cid})"
+    cgroup_file="$ROOT/proc/$cpid/cgroup"
+    [ -f "$cgroup_file" ] || fail "missing cgroup record for runner container ${cname} PID ${cpid}"
+    cg_content="$(cat "$cgroup_file")"
+    [[ "$cg_content" =~ ^0::/actions\.slice/ ]] || fail "container PID not beneath /actions.slice (container $cname PID $cpid has cgroup: $cg_content)"
+  done
+fi
+
+echo "OK: host containment Release 1 verified"

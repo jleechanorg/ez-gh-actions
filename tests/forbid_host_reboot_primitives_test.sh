@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Fail-closed test forbidding physical-host reboot/shutdown primitives and watchdog-driven forced restarts.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+FAILURES=0
+fail() {
+  echo "FAIL: $*" >&2
+  FAILURES=$((FAILURES + 1))
+}
+
+ok() {
+  echo "OK: $*"
+}
+
+# 1. Assert forbidden files do not exist in the repository
+FORBIDDEN_FILES=(
+  "scripts/ezgha-fleet-watchdog.sh"
+  "scripts/host/apply-cfs-nohz-panic-stop.sh"
+  "scripts/host/apply-watchdog-no-reboot-vote.sh"
+  "scripts/host/assert-no-host-reboot-vote.sh"
+  "scripts/host/configure-grub-kdump.sh"
+  "scripts/host/crash-capture-verify.sh"
+  "scripts/host/kdump-remediation.sh"
+  "scripts/host/watchdog-load-repair.sh"
+  "config/watchdog.conf"
+  "config/sysctl.d/99-ezgha-oops-reboot.conf"
+  "config/grub.d/zz-ezgha-nohz-panic.cfg"
+  "systemd/ezgha-watchdog.service"
+  "systemd/ezgha-watchdog.timer"
+  "docs/watchdog.md"
+  "scripts/host/host-pressure-proof.sh"
+  "tests/apply_cfs_nohz_panic_stop_test.sh"
+  "tests/apply_watchdog_no_reboot_vote_test.sh"
+  "tests/assert_no_host_reboot_vote_test.sh"
+  "tests/configure_grub_kdump_retired_test.sh"
+  "tests/watchdog_reboot_stale_state_test.sh"
+)
+
+for rel in "${FORBIDDEN_FILES[@]}"; do
+  if [ -e "${REPO_ROOT}/${rel}" ]; then
+    fail "Forbidden file exists in repo: ${rel}"
+  fi
+done
+
+if [ "$FAILURES" -eq 0 ]; then
+  ok "No forbidden files exist in repo"
+fi
+
+# 2. Assert active operational documents and verifiers do not point operators
+# at retired host-lifecycle automation. Historical incident records may retain
+# names for provenance, so keep this list deliberately bounded.
+FORBIDDEN_ACTIVE_REFERENCES=(
+  "scripts/host/kdump-remediation.sh"
+  "scripts/host/apply-watchdog-no-reboot-vote.sh"
+  "scripts/host/assert-no-host-reboot-vote.sh"
+  "scripts/host/watchdog-load-repair.sh"
+  "systemd/ezgha-watchdog.service"
+  "systemd/ezgha-watchdog.timer"
+  "scripts/host/host-pressure-proof.sh"
+)
+ACTIVE_DOCUMENTS=(
+  "README.md"
+  "DESIGN.md"
+  "docs/verify-exit-criteria.sh"
+  "docs/superpowers/plans/2026-08-26-borg-failure-ladder.md"
+  ".claude/skills/ezgha-doctor/SKILL.md"
+  ".claude/commands/doctor-ezactions.md"
+)
+
+for rel in "${FORBIDDEN_ACTIVE_REFERENCES[@]}"; do
+  if grep -Fn -- "$rel" "${ACTIVE_DOCUMENTS[@]/#/${REPO_ROOT}/}" 2>/dev/null; then
+    fail "Active operational guidance references retired host automation: ${rel}"
+  fi
+done
+
+# 3. Scan active code (src/, scripts/, systemd/, install.sh) for forbidden host reboot / forced-panic primitives
+# Forbidden patterns in executable / configuration files:
+# - sysrq trigger (echo c > /proc/sysrq-trigger, etc.)
+# - host reboot/shutdown commands (systemctl reboot, /sbin/reboot, shutdown -r, poweroff, etc.)
+# - panic configuration (kernel.panic = 10, etc.)
+
+TARGETS=(
+  "${REPO_ROOT}/src"
+  "${REPO_ROOT}/scripts"
+  "${REPO_ROOT}/systemd"
+  "${REPO_ROOT}/install.sh"
+)
+
+# Read-only diagnostics in doctor-runner may name these settings, but the
+# doctor must never mutate them or invoke a physical-host lifecycle action.
+MUTATION_TARGETS=(
+  "${TARGETS[@]}"
+  "${REPO_ROOT}/doctor-runner"
+  "${REPO_ROOT}/doctor.sh"
+)
+
+# grep exits 2 when any operand is missing, which an `if grep` reads as "no match";
+# keep only existing paths so a deleted target cannot make every check pass silently.
+existing_paths() { local p; for p in "$@"; do [ -e "$p" ] && printf '%s\n' "$p"; done; return 0; }
+mapfile -t TARGETS < <(existing_paths "${TARGETS[@]}")
+mapfile -t MUTATION_TARGETS < <(existing_paths "${MUTATION_TARGETS[@]}")
+
+# Search for /proc/sysrq-trigger
+if grep -rnw "${TARGETS[@]}" -e 'sysrq-trigger' 2>/dev/null; then
+  fail "Found forbidden sysrq-trigger reference in active codebase"
+else
+  ok "No sysrq-trigger references in active codebase"
+fi
+
+# Search for kernel.panic sysctl or forced panic settings
+if grep -rnw "${TARGETS[@]}" -e 'kernel.panic' -e 'panic_on_oops' 2>/dev/null; then
+  fail "Found forbidden kernel.panic / panic_on_oops reference in active codebase"
+else
+  ok "No kernel.panic / panic_on_oops references in active codebase"
+fi
+
+# Search for host shutdown/reboot invocations
+# Note: we exclude comments or legitimate string names like 'reboot' in error logs if any, but grep for direct executions
+if grep -rnE '(systemctl[[:space:]]+(reboot|poweroff|halt)|/sbin/reboot|/sbin/shutdown|/sbin/poweroff|/sbin/halt)' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
+  fail "Found forbidden systemctl reboot/shutdown/poweroff/halt invocation"
+else
+  ok "No host reboot/shutdown invocations in active codebase"
+fi
+
+if grep -rnE '(sysctl[[:space:]]+(-w[[:space:]]+)?kernel\.panic(_on_oops)?=|/proc/sys/(kernel/)?(panic|panic_on_oops)|sysrq-trigger)' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
+  fail "Found forbidden host panic mutation in active codebase or doctor-runner"
+else
+  ok "No host panic mutations in active codebase or doctor-runner"
+fi
+
+# Search for active ezgha-watchdog service/timer references in systemd / install
+if grep -rnE 'systemctl[[:space:]]+--user[[:space:]]+(enable|start)[[:space:]]+.*ezgha-watchdog' "${TARGETS[@]}" 2>/dev/null; then
+  fail "Found active enablement of ezgha-watchdog in systemd/install"
+else
+  ok "No active enablement of ezgha-watchdog in systemd/install"
+fi
+
+# 4. ezgha must never kill the user session or its manager, and must keep user@ oomd-neutral (bd-dea).
+if grep -rnE '(loginctl[[:space:]]+(terminate|kill)-(user|session)|"(terminate|kill)-(user|session)"|systemctl[[:space:]]+(--user[[:space:]]+exit|(stop|kill|restart)[[:space:]]+user@)|kill[[:space:]]+(-[A-Za-z0-9]+|-s[[:space:]]+[A-Za-z0-9]+)[[:space:]]+(--[[:space:]]*)?-1([^0-9]|$)|kill[[:space:]]+--[[:space:]]+-1([^0-9]|$)|(libc::)?kill\([[:space:]]*-1[[:space:]]*,|pkill[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-[uU][[:space:]]|killall[[:space:]]+(-[A-Za-z0-9]+[[:space:]]+)*-u[[:space:]]|Command::new\("(loginctl|pkill|killall)"\))' "${MUTATION_TARGETS[@]}" 2>/dev/null; then
+  fail "Found forbidden user-session kill primitive"
+else
+  ok "No user-session kill primitives in active codebase"
+fi
+
+# Exactly one exemption: systemd/host/actions.slice holds only runner
+# containers (docker-*.scope), never login/agent sessions. systemd-oomd kills
+# the single most-pressured descendant cgroup there (one runner container =
+# one job), which is the repo's smallest-layer-dies rule. Sessions
+# (agents.slice, automation.slice, user@.service) stay forbidden.
+OOMD_KILL_EXEMPT="systemd/host/actions.slice"
+oomd_kill_violations() { # repo-root
+  grep -rnE '^[[:space:]]*ManagedOOM(MemoryPressure|Swap)[[:space:]]*=[[:space:]]*kill' "$1/systemd" 2>/dev/null \
+    | grep -v "^$1/${OOMD_KILL_EXEMPT}:" || true
+}
+violations="$(oomd_kill_violations "${REPO_ROOT}")"
+if [ -n "$violations" ]; then
+  printf '%s\n' "$violations"
+  fail "Found ManagedOOMMemoryPressure/ManagedOOMSwap=kill in tracked systemd units (oomd must not kill whole sessions)"
+else
+  ok "No ManagedOOM*=kill in tracked systemd units outside ${OOMD_KILL_EXEMPT}"
+fi
+# The exemption is exact: kill on actions.slice passes, kill on any other
+# systemd/ unit (here a session slice) still fails.
+OOMD_FIXTURE="$(mktemp -d)"
+mkdir -p "${OOMD_FIXTURE}/systemd/host"
+printf '[Slice]\nManagedOOMMemoryPressure=kill\n' > "${OOMD_FIXTURE}/systemd/host/actions.slice"
+[ -z "$(oomd_kill_violations "${OOMD_FIXTURE}")" ] || fail "oomd kill exemption does not cover systemd/host/actions.slice"
+printf '[Slice]\nManagedOOMMemoryPressure=kill\n' > "${OOMD_FIXTURE}/systemd/agents.slice"
+printf '[Slice]\nManagedOOMSwap=kill\n' > "${OOMD_FIXTURE}/systemd/host/actions.slice.bak"
+fixture_violations="$(oomd_kill_violations "${OOMD_FIXTURE}")"
+grep -q '/systemd/agents.slice:' <<<"$fixture_violations" || fail "ManagedOOM*=kill on agents.slice was not caught"
+grep -q '/systemd/host/actions.slice.bak:' <<<"$fixture_violations" || fail "exemption leaked to a non-exact actions.slice path"
+rm -rf "${OOMD_FIXTURE}"
+ok "oomd kill exemption is exactly ${OOMD_KILL_EXEMPT}; other systemd units with kill still fail"
+
+USER_AT_DROPIN="${REPO_ROOT}/systemd/host/user@.service.d/99-ezgha-containment.conf"
+# The last assignment of each key is the effective one; an earlier neutral line must not mask a later override.
+for line in 'ManagedOOMMemoryPressure=auto' 'ManagedOOMSwap=auto' 'ManagedOOMPreference=none' 'OOMScoreAdjust=0'; do
+  key="${line%%=*}"
+  effective="$( { grep -E "^[[:space:]]*${key}[[:space:]]*=" "$USER_AT_DROPIN" 2>/dev/null || true; } | tail -1 | tr -d '[:space:]')"
+  if [ "$effective" != "$line" ]; then
+    fail "user@ containment drop-in effective ${key} is '${effective#*=}', expected '${line#*=}'"
+  fi
+done
+
+if [ "$FAILURES" -gt 0 ]; then
+  echo "FORBID_HOST_REBOOT_PRIMITIVES_TEST: FAILED ($FAILURES failures)" >&2
+  exit 1
+fi
+
+echo "FORBID_HOST_REBOOT_PRIMITIVES_TEST: PASS"
