@@ -13,11 +13,13 @@ The guard does not stop already-running jobs. Once a later check sees both
 locations at or above the same 30 GiB floor, runner admission resumes; the guard
 has no separate resume threshold or hysteresis.
 
-The 30 GiB floor is based on observed Mac free space of 35–46 GiB during normal
-operation and roughly 9 GiB of peak writes across the four-runner fleet. If
-admission pauses at the floor while those jobs finish, about 20 GiB remains for
-their writes. This is an admission threshold, not a guarantee that running jobs
-cannot consume more disk. Linux templates and the Rust default remain at 10 GiB.
+Mac free-space observations ranged from 35–46 GiB; this is an observed range,
+not a stable baseline. A four-job snapshot showed 9.23 GB (about 8.60 GiB) of
+current writable-layer data. That point-in-time footprint is not a maximum or
+cumulative write total. For scale only, a comparable additional 8.60 GiB of
+growth after the 30 GiB floor is reached would leave about 21 GiB free. Actual
+job growth can differ, so this is not a guarantee or a bound. Linux templates
+and the Rust default remain at 10 GiB.
 
 ```bash
 # MacBook (4× ez-mac-runner-h-*)
