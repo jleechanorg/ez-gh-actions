@@ -320,6 +320,54 @@ struct SlotAssignments {
 /// reclaimed within two `release_stale_slots` ticks (30s cadence).
 const REGISTRATION_GRACE_WINDOW: Duration = Duration::from_secs(60);
 
+/// Single-pass entry instant for the reclaim path (bead ez-gh-actions-qz5j,
+/// refactor for GH#50 / jleechan-a87n). Pre-fix the reclaim decision loop
+/// re-read `now_epoch_secs()` / `ensure_daemon_start().elapsed()` at every
+/// site — between the first and last read wall-clock advances, so the
+/// `wall_secs`/`elapsed_secs`/`monotonic_ts` values emitted by adjacent
+/// records in the same pass could disagree. That is TOCTOU-prone: it
+/// guarantees flakiness across second-boundaries and makes ring-buffer
+/// records uncorrelatable from a single entry instant.
+///
+/// Post-fix: construct one `ReclaimContext::now()` at the top of
+/// `release_stale_slots_from_with_containers_for` and pass it down to every
+/// helper. Helpers MUST use `ctx.wall_secs` / `ctx.monotonic_secs` for every
+/// grace-window, `elapsed_secs`, and `recorded-into-ReclaimRecord` time —
+/// never a fresh clock read. Other production call sites
+/// (`next_slot`, `record_slot_runner_id_for`) keep their independent reads
+/// because those are separate events, not part of a single reclaim pass.
+#[derive(Debug, Clone, Copy)]
+pub struct ReclaimContext {
+    /// Wall-clock unix epoch seconds captured at construction.
+    pub wall_secs: u64,
+    /// Monotonic seconds since daemon start, captured at construction.
+    pub monotonic_secs: f64,
+}
+
+impl ReclaimContext {
+    /// Construct a context with the current wall + monotonic clocks at
+    /// call time. Used as the entry-instant for one reclaim pass.
+    pub fn now() -> Self {
+        let wall_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+        Self {
+            wall_secs,
+            monotonic_secs,
+        }
+    }
+
+    /// Seconds elapsed between `registered_at` (epoch seconds) and the
+    /// captured `wall_secs`, when present. Saturated at 0 to match the
+    /// pre-fix `seconds_since_registered` behavior used by the log lines.
+    #[allow(dead_code)] // available for future callers; tests use it too
+    pub fn seconds_since(&self, registered_at: Option<u64>) -> u64 {
+        registered_at.map_or(0, |r| self.wall_secs.saturating_sub(r))
+    }
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -328,29 +376,42 @@ fn now_epoch_secs() -> u64 {
 }
 
 /// True if `slot`'s `registered_at` timestamp is within `REGISTRATION_GRACE_WINDOW`
-/// of now. Missing entries (no timestamp recorded) are NOT in the grace
+/// of `wall_secs`. Missing entries (no timestamp recorded) are NOT in the grace
 /// window — the fix only ever narrows what gets reaped, never widens it, so a
 /// slot file predating this field behaves exactly as before.
-fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str) -> bool {
+///
+/// Bead ez-gh-actions-qz5j (GH#50 / jleechan-a87n): callers pass the entry
+/// `ctx.wall_secs` instead of re-reading `now_epoch_secs()` at every site —
+/// every grace-window check in a single reclaim pass must share the entry
+/// instant. Non-reclaim call sites pass `now_epoch_secs()` to preserve
+/// the original behavior (those sites are not part of a single pass).
+fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str, wall_secs: u64) -> bool {
     let Some(&registered_at) = assignments.registered_at.get(slot) else {
         return false;
     };
-    now_epoch_secs().saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
+    wall_secs.saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
 }
 
 /// Seconds elapsed since `slot`'s `registered_at` timestamp, if recorded.
 /// Used to log how close a grace-window skip-reap decision was to the
 /// boundary, rather than just the fixed window size.
-fn seconds_since_registered(assignments: &SlotAssignments, slot: &str) -> Option<u64> {
+///
+/// Bead ez-gh-actions-qz5j: callers pass `ctx.wall_secs` (entry instant) so
+/// all `elapsed_secs` values logged in a single pass share the same origin.
+fn seconds_since_registered(
+    assignments: &SlotAssignments,
+    slot: &str,
+    wall_secs: u64,
+) -> Option<u64> {
     let &registered_at = assignments.registered_at.get(slot)?;
-    Some(now_epoch_secs().saturating_sub(registered_at))
+    Some(wall_secs.saturating_sub(registered_at))
 }
 
 /// True if `slot`'s `assignments[id_str]` is empty (a `next_slot_excluding`
 /// reservation that has not yet been filled by `record_slot_runner_id_for`)
 /// AND the `registered_at` timestamp written by `next_slot_excluding` is
-/// within `REGISTRATION_GRACE_WINDOW`. This protects the JIT round-trip
-/// window — between `next_slot_excluding` (writes empty id) and
+/// within `REGISTRATION_GRACE_WINDOW` of `wall_secs`. This protects the JIT
+/// round-trip window — between `next_slot_excluding` (writes empty id) and
 /// `record_slot_runner_id_for` (writes the runner_id + `registered_at`) — from
 /// being reaped by Path 1's empty-id branch in `release_stale_slots`.
 ///
@@ -362,10 +423,14 @@ fn seconds_since_registered(assignments: &SlotAssignments, slot: &str) -> Option
 /// `start_one_with_generate_at_slot` whose `generate_jitconfig` succeeded but
 /// whose `docker run` had not yet landed could be reaped mid-flight, causing
 /// the next cycle to allocate a fresh runner_id (slot-file flap).
+///
+/// Bead ez-gh-actions-qz5j: callers pass `ctx.wall_secs` (entry instant) so
+/// the empty-id grace check is fixed at the entry of the reclaim pass.
 fn empty_id_reservation_in_grace_window(
     assignments: &SlotAssignments,
     slot: &str,
     id_str: &str,
+    wall_secs: u64,
 ) -> bool {
     if !id_str.is_empty() {
         return false;
@@ -373,7 +438,7 @@ fn empty_id_reservation_in_grace_window(
     let Some(&registered_at) = assignments.registered_at.get(slot) else {
         return false;
     };
-    now_epoch_secs().saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
+    wall_secs.saturating_sub(registered_at) < REGISTRATION_GRACE_WINDOW.as_secs()
 }
 
 /// Look up the in-flight `run_id` for `runner_id` from `live_runners`. Returns
@@ -1149,12 +1214,19 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
     if let Some(names) = &local_container_names {
         reap_stale_peak_rss_entries(names);
     }
+    // Bead ez-gh-actions-qz5j (GH#50 / jleechan-a87n): construct the
+    // single-pass entry instant ONCE here and thread it through every
+    // helper for the rest of this tick. Pre-fix each helper re-read
+    // `now_epoch_secs()` / `ensure_daemon_start().elapsed()` independently,
+    // which is TOCTOU-prone across wall-second / monotonic boundaries.
+    let ctx = ReclaimContext::now();
     let reclaimed = release_stale_slots_from_with_containers_for(
         Some(cfg),
         &assignments,
         &live_runners,
         &cfg.runner.name_prefix,
         local_container_names.as_ref(),
+        &ctx,
     )?;
     let mut reclaimed = reclaimed;
     // Load (or initialize) the quarantine table. A corrupt file degrades to
@@ -1235,6 +1307,7 @@ pub fn release_stale_slots(cfg: &Config) -> Result<usize> {
             &live_runners,
             &cfg.runner.name_prefix,
             local_names,
+            &ctx,
         ) {
             eprintln!(
                 "warning: removing stale offline/idle registration {runner_name} (id {runner_id}) with no local container — slot entry was already released by Path 1"
@@ -1351,12 +1424,17 @@ fn release_stale_slots_from_with_containers(
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
 ) -> Result<usize> {
+    // Tests don't construct a ReclaimContext themselves — they let the
+    // wrapper build one at the call site so each test runs in its own
+    // entry instant. Production callers (release_stale_slots) do the same.
+    let ctx = ReclaimContext::now();
     release_stale_slots_from_with_containers_for(
         None,
         assignments,
         live_runners,
         runner_prefix,
         local_container_names,
+        &ctx,
     )
 }
 
@@ -1366,6 +1444,7 @@ fn release_stale_slots_from_with_containers_for(
     live_runners: &[github::RunnerInfo],
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
+    ctx: &ReclaimContext,
 ) -> Result<usize> {
     release_stale_slots_from_with_containers_and_activity_for(
         cfg,
@@ -1374,6 +1453,7 @@ fn release_stale_slots_from_with_containers_for(
         runner_prefix,
         local_container_names,
         local_runner_activity,
+        ctx,
     )
 }
 
@@ -1392,6 +1472,7 @@ fn release_stale_slots_from_with_containers_and_activity(
         runner_prefix,
         local_container_names,
         activity_probe,
+        &ReclaimContext::now(),
     )
 }
 
@@ -1402,6 +1483,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
     mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    ctx: &ReclaimContext,
 ) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
@@ -1431,10 +1513,15 @@ fn release_stale_slots_from_with_containers_and_activity_for(
             // concurrent `start_one_with_generate_at_slot` is still between
             // `next_slot_excluding` (`:393-401`) and `record_slot_runner_id_for`
             // (`:2115`), causing slot-file flap.
-            let in_grace = empty_id_reservation_in_grace_window(assignments, slot, id_str);
-            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-            let wall_secs = now_epoch_secs();
-            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+            let in_grace =
+                empty_id_reservation_in_grace_window(assignments, slot, id_str, ctx.wall_secs);
+            let elapsed = seconds_since_registered(assignments, slot, ctx.wall_secs).unwrap_or(0);
+            // Bead ez-gh-actions-qz5j: use the entry-instant wall_secs /
+            // monotonic_secs from `ReclaimContext`. Pre-fix this site read
+            // the clock independently and could disagree with the other
+            // sites in the same pass across a wall-second boundary.
+            let wall_secs = ctx.wall_secs;
+            let monotonic_secs = ctx.monotonic_secs;
             if in_grace {
                 eprintln!(
                     "debug: release_stale_slots: skipping empty-id slot {slot_n} (registered_at={elapsed}s ago, within {}s grace window; monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs})",
@@ -1479,14 +1566,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 match local_container_names {
                     Some(local_names) if local_names.contains(&expected_name) => {
-                        if slot_in_grace_window(assignments, slot) {
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (within {}s JIT-propagation grace window; elapsed {elapsed}s)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
                             match activity_probe(&expected_name) {
                                 LocalRunnerActivity::Busy => {
                                     eprintln!(
@@ -1508,9 +1599,8 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                                     // this as Unknown and the slot stayed
                                     // reserved even though the container was
                                     // already gone, blocking reconciliation.
-                                    let wall_secs = now_epoch_secs();
-                                    let monotonic_secs =
-                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let wall_secs = ctx.wall_secs;
+                                    let monotonic_secs = ctx.monotonic_secs;
                                     let last_run_id =
                                         live_runners_last_run_id(live_runners, rid).unwrap_or(0);
                                     let peak_rss_mb = 0u64;
@@ -1537,9 +1627,8 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                                     // A proven listener with no GitHub registration
                                     // can never receive another job. Recycling it is
                                     // safe; a Worker or inconclusive probe is kept.
-                                    let wall_secs = now_epoch_secs();
-                                    let monotonic_secs =
-                                        ensure_daemon_start().elapsed().as_secs_f64();
+                                    let wall_secs = ctx.wall_secs;
+                                    let monotonic_secs = ctx.monotonic_secs;
                                     let last_run_id =
                                         live_runners_last_run_id(live_runners, rid).unwrap_or(0);
                                     let peak_rss_mb = container_peak_rss_mb(&expected_name);
@@ -1569,9 +1658,11 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         // The recorded runner_id is no longer registered on GitHub
                         // (server-side reap, manual removal, or a stale entry from a
                         // prior host) and no local container exists, so reclaim.
-                        let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                        let wall_secs = now_epoch_secs();
-                        let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                        let elapsed =
+                            seconds_since_registered(assignments, slot, ctx.wall_secs).unwrap_or(0);
+                        // Bead ez-gh-actions-qz5j: entry instant, not a fresh read.
+                        let wall_secs = ctx.wall_secs;
+                        let monotonic_secs = ctx.monotonic_secs;
                         // Bead jleechan-tv58: surface `last_run_id`. There is NO
                         // local container here (that's the whole point of this
                         // branch), so `peak_rss_mb` is forced to 0 — the field
@@ -1598,8 +1689,10 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         reclaimed += 1;
                     }
                     None => {
-                        if slot_in_grace_window(assignments, slot) {
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: docker ps failed locally so container existence for {expected_name} is unknown while GH registration {rid} is absent (within {}s grace window; elapsed {elapsed}s)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
@@ -1611,9 +1704,12 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                             // The caller already logged the docker-ps failure earlier
                             // in the serve loop; we just reclaim here so the slot
                             // doesn't become a permanent dead reservation.
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                            let wall_secs = now_epoch_secs();
-                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
+                            // Bead ez-gh-actions-qz5j: entry instant, not a fresh read.
+                            let wall_secs = ctx.wall_secs;
+                            let monotonic_secs = ctx.monotonic_secs;
                             // Bead jleechan-tv58: surface `last_run_id` when
                             // available. `peak_rss_mb` stays 0 here because we
                             // reach this branch precisely because `docker ps`
@@ -1646,9 +1742,11 @@ fn release_stale_slots_from_with_containers_and_activity_for(
             } else if let Some(runner) = live_runners.iter().find(|r| r.id == rid) {
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 if !runner_prefix.is_empty() && runner.name != expected_name {
-                    let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                    let wall_secs = now_epoch_secs();
-                    let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                    let elapsed =
+                        seconds_since_registered(assignments, slot, ctx.wall_secs).unwrap_or(0);
+                    // Bead ez-gh-actions-qz5j: entry instant, not a fresh read.
+                    let wall_secs = ctx.wall_secs;
+                    let monotonic_secs = ctx.monotonic_secs;
                     // Bead jleechan-tv58: name-mismatch means the slot owns a
                     // runner_id, but that runner is binding to a different
                     // name on GitHub. `last_run_id` may still be present from
@@ -1682,16 +1780,21 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         && !runner.busy
                         && !local_names.contains(&expected_name)
                     {
-                        if slot_in_grace_window(assignments, slot) {
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered {elapsed}s ago (within {}s JIT-propagation grace window)",
                                 REGISTRATION_GRACE_WINDOW.as_secs()
                             );
                         } else {
-                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                            let wall_secs = now_epoch_secs();
-                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
+                            // Bead ez-gh-actions-qz5j: entry instant, not a fresh read.
+                            let wall_secs = ctx.wall_secs;
+                            let monotonic_secs = ctx.monotonic_secs;
                             // Bead jleechan-tv58: offline-idle runner without a
                             // local container is the canonical dead-registration
                             // case. The runner has no in-flight job (offline+!busy)
@@ -1794,6 +1897,7 @@ fn offline_not_busy_owned_missing_container_registrations(
     live_runners: &[github::RunnerInfo],
     runner_prefix: &str,
     local_container_names: &HashSet<String>,
+    ctx: &ReclaimContext,
 ) -> Vec<(u64, String)> {
     if runner_prefix.is_empty() {
         // Without a prefix there is no ownership gate — refuse to enumerate
@@ -1825,10 +1929,14 @@ fn offline_not_busy_owned_missing_container_registrations(
         // writes, so a slot Path 1 just released this tick still has its
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
-        if slot_in_grace_window(assignments, slot) {
-            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-            let wall_secs = now_epoch_secs();
-            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+            let elapsed = seconds_since_registered(assignments, slot, ctx.wall_secs).unwrap_or(0);
+            // Bead ez-gh-actions-qz5j: use the entry-instant wall_secs /
+            // monotonic_secs from `ReclaimContext`. Pre-fix this site read
+            // the clock independently and could disagree with the other
+            // sites in the same pass across a wall-second boundary.
+            let wall_secs = ctx.wall_secs;
+            let monotonic_secs = ctx.monotonic_secs;
             eprintln!(
                 "info: release_stale_slots (Path 4): skipping reap of {} (id {}) — registered_at {elapsed}s ago (within {}s grace window; monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs})",
                 runner.name,
@@ -11125,6 +11233,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert_eq!(
             reapable,
@@ -11146,6 +11255,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert!(
             reapable.is_empty(),
@@ -11167,6 +11277,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert!(
             reapable.is_empty(),
@@ -11187,6 +11298,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert!(
             reapable.is_empty(),
@@ -11209,6 +11321,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert!(
             reapable.is_empty(),
@@ -11317,6 +11430,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert!(
             reapable.is_empty(),
@@ -11339,6 +11453,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert_eq!(
             reapable,
@@ -11371,6 +11486,7 @@ esac
             &live,
             "ez-org-runner",
             &local_names,
+            &ReclaimContext::now(),
         );
         assert_eq!(
             qbl_candidates,
@@ -13070,11 +13186,11 @@ esac
         // Within the grace window — the just-reserved slot should be
         // considered in-grace.
         assert!(
-            slot_in_grace_window(&assignments, &key),
+            slot_in_grace_window(&assignments, &key, now_epoch_secs()),
             "slot must be in grace window immediately after next_slot reservation (registered_at={registered_at})"
         );
         // elapsed_secs should be near zero (the test takes microseconds).
-        let elapsed = seconds_since_registered(&assignments, &key).unwrap();
+        let elapsed = seconds_since_registered(&assignments, &key, now_epoch_secs()).unwrap();
         assert!(elapsed <= 5, "elapsed_secs should be near 0, got {elapsed}");
     }
 
@@ -13408,6 +13524,207 @@ esac
             0
         );
     }
+
+    // ================= Bead ez-gh-actions-qz5j (GH#50) tests =================
+    // The reclaim decision loop historically re-read `now_epoch_secs()` /
+    // `ensure_daemon_start().elapsed()` at every site, which is TOCTOU-prone:
+    // between the first read and the last read, real wall-clock advances, so
+    // the `wall_secs` and `monotonic_ts` recorded into adjacent logs/records
+    // in the same pass can disagree — making it impossible to correlate
+    // them or to reason about grace-window boundaries from the ring buffer.
+    //
+    // The fix computes `now_wall` and `now_monotonic` ONCE at the entry of
+    // the reclaim pass into a `ReclaimContext` struct and threads it down
+    // through helpers. These three tests pin the post-fix invariants; they
+    // are RED pre-fix (the struct doesn't exist yet — these tests will fail
+    // to compile until ReclaimContext is introduced, then they assert
+    // structural invariants on it).
+
+    /// The `ReclaimContext` struct MUST exist (post-fix), and its
+    /// `wall_secs` field MUST equal the wall-clock at construction
+    /// (within a sub-second tolerance). Pre-fix this struct does not
+    /// exist — this test fails to compile until the refactor lands.
+    /// Post-fix it proves the entry instant is captured exactly once.
+    #[test]
+    fn reclaim_context_captures_wall_secs_at_construction() {
+        let pre = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ctx = ReclaimContext::now();
+        let post = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // wall_secs captured at construction must lie within the [pre, post]
+        // window of wall-clock reads — bounded by construction time only,
+        // never re-read afterward. Pre-fix the struct doesn't exist; the
+        // test fails to compile.
+        assert!(
+            ctx.wall_secs >= pre && ctx.wall_secs <= post,
+            "ReclaimContext::now().wall_secs={} must lie within [{}, {}] \
+             (read once at construction, never re-read). bead ez-gh-actions-qz5j",
+            ctx.wall_secs,
+            pre,
+            post
+        );
+    }
+
+    /// All `wall_secs` values recorded by a SINGLE `release_stale_slots` pass
+    /// MUST equal `ctx.wall_secs` from the entry instant — pre-fix they were
+    /// read independently at each site and could disagree across the wall
+    /// second boundary. We exercise this by recording 3 in-grace empty-id
+    /// reservations and verifying all three records share the same wall_secs
+    /// value (the entry instant reads once, threaded through the loop).
+    ///
+    /// Pre-fix this test is observably flaky in CI: when 3 sequential
+    /// `now_epoch_secs()` calls straddle a wall-second boundary, the values
+    /// differ (recorded as different `wall_secs` in the ring buffer).
+    #[test]
+    fn release_stale_slots_records_single_wall_secs_across_pass() {
+        // Force the producer pass to straddle a second boundary by sleeping
+        // up to ~1.0s before each slot allocation. With three
+        // `next_slot()` calls spaced ~330ms apart, the inner loop runs
+        // across a wall-second boundary probabilistically — but more
+        // importantly, even WITHOUT the sleep, pre-fix each iteration's
+        // `now_epoch_secs()` reads wall clock independently, so the three
+        // recorded wall_secs are allowed to disagree; post-fix they MUST
+        // equal the entry instant.
+        let _env = TestEnv::new("qz5j_single_wall_secs");
+        let cfg = cfg_with(3, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = next_slot(&cfg).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = next_slot(&cfg).unwrap();
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &[],
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "all three are in-grace empty-id; nothing reaped"
+        );
+
+        let mut slot_wall: Vec<(String, u64)> = Vec::new();
+        for slot in ["1", "2", "3"] {
+            let history = snapshot_reclaim(Some(slot));
+            assert_eq!(history.len(), 1, "slot {slot} must have exactly one record");
+            slot_wall.push((slot.to_string(), history[0].1.wall_secs));
+        }
+        let first = slot_wall[0].1;
+        for (slot, w) in &slot_wall {
+            assert_eq!(
+                *w, first,
+                "slot {slot} recorded wall_secs={w} but slot 1 recorded wall_secs={first}; \
+                 all entries from a single reclaim pass must equal the entry instant \
+                 (bead ez-gh-actions-qz5j)"
+            );
+        }
+    }
+
+    /// A slot whose `registered_at` is within the grace window at ENTRY must
+    /// remain classified as `in_grace=true` throughout the pass — the grace
+    /// check is keyed on the entry instant, not on a re-read of the wall
+    /// clock at every record site. Pre-fix the helper functions each
+    /// re-called `now_epoch_secs()`, so a slow second-boundary crossing
+    /// could flip a borderline slot from grace-skip to reclaim mid-pass.
+    /// Post-fix the same `ctx.wall_secs` is used for every grace check in
+    /// the pass.
+    #[test]
+    fn release_stale_slots_grace_classification_uses_entry_instant() {
+        let _env = TestEnv::new("qz5j_grace_uses_entry_instant");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _ = next_slot(&cfg).unwrap();
+        // registered_at was just written by next_slot (within grace),
+        // so the empty-id branch must classify this as in_grace=true and
+        // emit a `empty-id-grace-skip` record.
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &[],
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            reclaimed, 0,
+            "slot 1 was registered moments ago by next_slot; must not be reaped"
+        );
+
+        let history = snapshot_reclaim(Some("1"));
+        assert_eq!(history.len(), 1);
+        let (_, rec) = &history[0];
+        assert!(
+            rec.in_grace,
+            "grace-window check must use entry instant; in_grace must be true \
+             (bead ez-gh-actions-qz5j). reason={}",
+            rec.reason
+        );
+        assert_eq!(
+            rec.reason, "empty-id-grace-skip",
+            "expected the grace-skip branch; got {}",
+            rec.reason
+        );
+    }
+    #[test]
+    fn activity_probe_reclaims_use_captured_entry_timestamps() {
+        let _env = TestEnv::new("captured_activity_timestamps");
+        let cfg = cfg_with(2, "ez-org-runner");
+        next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+        next_slot(&cfg).unwrap();
+        record_slot_runner_id(2, 4243).unwrap();
+        let ctx = ReclaimContext {
+            wall_secs: 1_000_000,
+            monotonic_secs: 12.5,
+        };
+        let mut assignments = read_slot_assignments().unwrap();
+        for slot in ["1", "2"] {
+            assignments.registered_at.insert(
+                slot.to_string(),
+                ctx.wall_secs - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+            );
+        }
+        let local_names =
+            HashSet::from(["ez-org-runner-1".to_string(), "ez-org-runner-2".to_string()]);
+        let reclaimed = release_stale_slots_from_with_containers_and_activity_for(
+            Some(&cfg),
+            &assignments,
+            &[],
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |name| {
+                if name.ends_with("-1") {
+                    LocalRunnerActivity::Idle
+                } else {
+                    LocalRunnerActivity::Absent
+                }
+            },
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(reclaimed, 2);
+        for slot in ["1", "2"] {
+            let history = snapshot_reclaim(Some(slot));
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].1.wall_secs, ctx.wall_secs);
+            // The ring records event time; the shared wall clock is the pass boundary.
+            assert_eq!(
+                history[0].1.reason,
+                if slot == "1" {
+                    "gh-rejected-past-grace"
+                } else {
+                    "gh-rejected-container-absent"
+                }
+            );
+            assert!(!history[0].1.in_grace);
+        }
+    }
+
+    // ================= End bead ez-gh-actions-qz5j tests =================
 
     /// Bead jleechan-uurm: the ring buffer must cap at RECLAIM_RING_CAP
     /// entries per slot (FIFO eviction). Diagnostic window is small —
