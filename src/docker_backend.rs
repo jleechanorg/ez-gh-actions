@@ -6467,7 +6467,7 @@ minimum_isolation = "container"
 
     #[test]
     fn reaper_initialization_failure_prevents_child_spawn() {
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let marker = tmp_path("reaper_init_failure").with_extension("spawned");
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.args([
@@ -6627,7 +6627,7 @@ minimum_isolation = "container"
 
     #[test]
     fn supervised_reaper_recovers_after_worker_panic() {
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let reaper = docker_child_reaper().unwrap();
         let panic_count = TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst);
         TEST_DOCKER_REAPER_PANIC_ONCE.store(true, Ordering::SeqCst);
