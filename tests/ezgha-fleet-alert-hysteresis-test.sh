@@ -119,10 +119,11 @@ run_cell() {
     SLOT_FILE="$slot_file" \
     STATE_DIR="$state_dir" \
     ALERT_SINK=none \
+    EZGHA_EXPECTED_CAPACITY=0 \
     "$SCRIPT"
   )"
   rc=$?
-  actual_reason="$(printf '%s\n' "$actual_payload" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -1)"
+  actual_reason="$(printf '%s\n' "$actual_payload" | sed -nE 's/.*"evidence":"([^"]*)".*/\1/p' | head -1)"
 
   if [[ "$rc" -ne "$expected_rc" ]]; then
     fail "${name}: expected exit ${expected_rc}, got ${rc}; payload=${actual_payload}"
@@ -174,10 +175,11 @@ run_cell_short_degraded() {
     SLOT_FILE="$slot_file" \
     STATE_DIR="$state_dir" \
     ALERT_SINK=none \
+    EZGHA_EXPECTED_CAPACITY=0 \
     "$SCRIPT"
   )"
   rc=$?
-  actual_reason="$(printf '%s\n' "$actual_payload" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -1)"
+  actual_reason="$(printf '%s\n' "$actual_payload" | sed -nE 's/.*"evidence":"([^"]*)".*/\1/p' | head -1)"
   if [[ "$rc" -ne "$expected_rc" ]]; then
     fail "${name}: expected exit ${expected_rc}, got ${rc}; payload=${actual_payload}"
   elif [[ "$actual_reason" != "$expected_reason" ]]; then
@@ -226,10 +228,11 @@ run_cell_long_degraded() {
     SLOT_FILE="$slot_file" \
     STATE_DIR="$state_dir" \
     ALERT_SINK=none \
+    EZGHA_EXPECTED_CAPACITY=0 \
     "$SCRIPT"
   )"
   rc=$?
-  actual_reason="$(printf '%s\n' "$actual_payload" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -1)"
+  actual_reason="$(printf '%s\n' "$actual_payload" | sed -nE 's/.*"evidence":"([^"]*)".*/\1/p' | head -1)"
   if [[ "$rc" -ne "$expected_rc" ]]; then
     fail "${name}: expected exit ${expected_rc}, got ${rc}; payload=${actual_payload}"
   elif [[ "$actual_reason" != "$expected_reason" ]]; then
@@ -263,10 +266,11 @@ run_cell_both_degraded() {
     SLOT_FILE="$slot_file" \
     STATE_DIR="$state_dir" \
     ALERT_SINK=none \
+    EZGHA_EXPECTED_CAPACITY=0 \
     "$SCRIPT"
   )"
   rc=$?
-  actual_reason="$(printf '%s\n' "$actual_payload" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -1)"
+  actual_reason="$(printf '%s\n' "$actual_payload" | sed -nE 's/.*"evidence":"([^"]*)".*/\1/p' | head -1)"
   if [[ "$rc" -ne "$expected_rc" ]]; then
     fail "${name}: expected exit ${expected_rc}, got ${rc}; payload=${actual_payload}"
   elif [[ "$actual_reason" != "$expected_reason" ]]; then
@@ -301,10 +305,11 @@ run_cell_slot_override() {
     STATE_DIR="$state_dir" \
     SLOT_CAPACITY=4 \
     ALERT_SINK=none \
+    EZGHA_EXPECTED_CAPACITY=0 \
     "$SCRIPT"
   )"
   rc=$?
-  actual_reason="$(printf '%s\n' "$actual_payload" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -1)"
+  actual_reason="$(printf '%s\n' "$actual_payload" | sed -nE 's/.*"evidence":"([^"]*)".*/\1/p' | head -1)"
   if [[ "$rc" -ne "$expected_rc" ]]; then
     fail "${name}: expected exit ${expected_rc}, got ${rc}; payload=${actual_payload}"
   elif [[ "$actual_reason" != "$expected_reason" ]]; then
@@ -343,10 +348,11 @@ LOG
     SLOT_FILE="$slot_file" \
     STATE_DIR="$state_dir" \
     ALERT_SINK=none \
+    EZGHA_EXPECTED_CAPACITY=0 \
     "$SCRIPT"
   )"
   rc=$?
-  actual_reason="$(printf '%s\n' "$actual_payload" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -1)"
+  actual_reason="$(printf '%s\n' "$actual_payload" | sed -nE 's/.*"evidence":"([^"]*)".*/\1/p' | head -1)"
   if [[ "$rc" -ne 0 ]]; then
     fail "${name}: idle fleet must NOT alert (rc=${rc}, reason=${actual_reason})"
   elif [[ "$actual_reason" != "all-windows-ok" ]]; then
