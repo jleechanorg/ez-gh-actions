@@ -1569,33 +1569,42 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         // The recorded runner_id is no longer registered on GitHub
                         // (server-side reap, manual removal, or a stale entry from a
                         // prior host) and no local container exists, so reclaim.
-                        let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                        let wall_secs = now_epoch_secs();
-                        let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
-                        // Bead jleechan-tv58: surface `last_run_id`. There is NO
-                        // local container here (that's the whole point of this
-                        // branch), so `peak_rss_mb` is forced to 0 — the field
-                        // is structurally present, just empty for this reason.
-                        let last_run_id = live_runners_last_run_id(live_runners, rid).unwrap_or(0);
-                        let peak_rss_mb = 0u64;
-                        eprintln!(
-                            "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-missing-no-local-container"
-                        );
-                        record_reclaim(
-                            slot,
-                            ReclaimRecord {
-                                monotonic_secs: 0.0,
-                                wall_secs,
-                                slot: slot_n,
-                                runner_id: rid,
-                                last_run_id,
-                                peak_rss_mb,
-                                in_grace: false,
-                                reason: "gh-missing-no-local-container".to_string(),
-                            },
-                        );
-                        release_slot_for(cfg, slot_n)?;
-                        reclaimed += 1;
+                        if slot_in_grace_window(assignments, slot) {
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            eprintln!(
+                                "info: keeping slot {slot_n}: runner_id {rid} is missing from GitHub and no local container exists, but it was registered {elapsed}s ago (within {}s grace window)",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                        } else {
+                            let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
+                            let wall_secs = now_epoch_secs();
+                            let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
+                            // Bead jleechan-tv58: surface `last_run_id`. There is NO
+                            // local container here (that's the whole point of this
+                            // branch), so `peak_rss_mb` is forced to 0 — the field
+                            // is structurally present, just empty for this reason.
+                            let last_run_id =
+                                live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                            let peak_rss_mb = 0u64;
+                            eprintln!(
+                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-missing-no-local-container"
+                            );
+                            record_reclaim(
+                                slot,
+                                ReclaimRecord {
+                                    monotonic_secs: 0.0,
+                                    wall_secs,
+                                    slot: slot_n,
+                                    runner_id: rid,
+                                    last_run_id,
+                                    peak_rss_mb,
+                                    in_grace: false,
+                                    reason: "gh-missing-no-local-container".to_string(),
+                                },
+                            );
+                            release_slot_for(cfg, slot_n)?;
+                            reclaimed += 1;
+                        }
                     }
                     None => {
                         if slot_in_grace_window(assignments, slot) {
@@ -7510,9 +7519,10 @@ esac
             assignments
                 .assignments
                 .insert(slot.to_string(), (1000 + slot).to_string());
-            assignments
-                .registered_at
-                .insert(slot.to_string(), now_epoch_secs());
+            assignments.registered_at.insert(
+                slot.to_string(),
+                now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+            );
         }
         write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
         for (file, after) in [("before.json", false), ("after.json", true)] {
@@ -7770,9 +7780,14 @@ esac
             assignments
                 .assignments
                 .insert(slot.to_string(), (1000 + slot).to_string());
-            assignments
-                .registered_at
-                .insert(slot.to_string(), now_epoch_secs());
+            assignments.registered_at.insert(
+                slot.to_string(),
+                if case == "empty" && slot == 4 {
+                    now_epoch_secs()
+                } else {
+                    now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1
+                },
+            );
         }
         if case == "failed_fresh" {
             assignments.assignments.remove("11");
@@ -10592,6 +10607,13 @@ esac
         let _slot = next_slot(&cfg).unwrap();
         record_slot_runner_id(1, 4242).unwrap();
 
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, None).unwrap();
+
         let live = vec![runner_info(9999, "ez-org-runner-2")];
         // Use an explicit (empty) local-container set rather than the
         // `release_stale_slots_from` helper's `None`: post-B2-fix, `None`
@@ -10616,6 +10638,30 @@ esac
             "slot 1 must be removed; got: {:?}",
             a.assignments
         );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_slot_when_runner_id_not_in_live_within_grace() {
+        let _env = TestEnv::new("stale_keeps_within_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "must NOT reclaim within grace window (Path-1 timing race)"
+        );
+        let a = read_slot_assignments().unwrap();
+        assert!(a.assignments.contains_key("1"));
     }
 
     #[test]
