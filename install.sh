@@ -655,12 +655,33 @@ fi
 if [ -f "${CONFIG_PATH}" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
+    # Drift detection (GH#15 / bead jleechan-r00n): capture the loaded plist's
+    # hash BEFORE install-service so we can warn the operator if the
+    # freshly-regenerated plist differs — a unit drift is the exact failure
+    # mode that left a stale plist missing WatchdogSec=60 in production on
+    # 2026-07-06 (the daemon got killed every 60s by systemd watchdog
+    # because the new binary emitted sd_notify heartbeats the old plist
+    # didn't ask for).
+    _plist_hash_before=""
+    if [ -f "${plist}" ]; then
+      _plist_hash_before="$(shasum -a 256 "${plist}" 2>/dev/null | awk '{print $1}')"
+    fi
     if [ -f "${plist}" ] && launchctl list 2>/dev/null | grep -q "org.jleechanorg.ezgha"; then
       info "Regenerating launchd agent..."
     else
       info "Installing ezgha service..."
     fi
     DOCKER_HOST_OVERRIDE="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
+    # Drift check (after install-service rewrote the plist from scratch
+    # based on the daemon binary's compiled-in template).
+    _plist_hash_after=""
+    if [ -f "${plist}" ]; then
+      _plist_hash_after="$(shasum -a 256 "${plist}" 2>/dev/null | awk '{print $1}')"
+    fi
+    if [ -n "${_plist_hash_before}" ] && [ -n "${_plist_hash_after}" ] \
+       && [ "${_plist_hash_before}" != "${_plist_hash_after}" ]; then
+      warn "launchd plist changed during install-service (daemon was NOT active; this would normally be safe, but if you restart later, double-check plutil ${plist} still matches daemon expectations)"
+    fi
     ok "ezgha service installed and started via launchd"
   elif command -v systemctl >/dev/null 2>&1; then
     # Linux containment is activated below before image build or service
@@ -670,6 +691,11 @@ if [ -f "${CONFIG_PATH}" ]; then
 fi
 
 if [ "${LINUX_SERVICE_PENDING:-0}" -eq 1 ]; then
+  _unit_path="${HOME}/.config/systemd/user/ezgha.service"
+  _unit_hash_before=""
+  if [ -f "${_unit_path}" ]; then
+    _unit_hash_before="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
+  fi
   if systemctl --user is-active ezgha.service >/dev/null 2>&1; then
     info "Refreshing systemd service endpoint after containment activation..."
     DOCKER_HOST_OVERRIDE="${DOCKER_HOST_OVERRIDE}" "${CARGO_BIN}/${BIN}" install-service
@@ -680,6 +706,14 @@ if [ "${LINUX_SERVICE_PENDING:-0}" -eq 1 ]; then
     info "Installing ezgha service after containment activation..."
     "${CARGO_BIN}/${BIN}" install-service
     ok "ezgha service installed and started via systemd"
+  fi
+  _unit_hash_after=""
+  if [ -f "${_unit_path}" ]; then
+    _unit_hash_after="$(shasum -a 256 "${_unit_path}" 2>/dev/null | awk '{print $1}')"
+  fi
+  if [ -n "${_unit_hash_before}" ] && [ -n "${_unit_hash_after}" ] \
+     && [ "${_unit_hash_before}" != "${_unit_hash_after}" ]; then
+    warn "systemd unit changed during install-service; verify daemon-reload before any later start"
   fi
 fi
 
