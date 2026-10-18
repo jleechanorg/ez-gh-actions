@@ -4,6 +4,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=@SCRIPTS_DIR@/trim-queued-runs.sh --apply --min-pr-age-hours 2
+ExecStart=@SCRIPTS_DIR@/trim-queued-runs.sh --apply --min-pr-age-hours 1.5
 Environment=HOME=@HOME@
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin

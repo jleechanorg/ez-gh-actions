@@ -2,7 +2,7 @@
 # trim-queued-runs.sh — periodically trim redundant or stale queued CI runs.
 #
 # Cancels queued runs in target repos matching any of:
-#   1. PR not modified in >= MIN_PR_AGE_HOURS (default: 2 hours).
+#   1. PR not modified in >= MIN_PR_AGE_HOURS (default: 1.5 hours).
 #   2. PR is in DRAFT state (drafts should not block ready PRs).
 #   3. Superseded commit: remote branch HEAD has advanced past the run's commit.
 #
@@ -20,7 +20,7 @@
 #
 # Env overrides:
 #   QUEUE_REPOS="owner/repo1 owner/repo2"
-#   MIN_PR_AGE_HOURS=2
+#   MIN_PR_AGE_HOURS=1.5
 #   TRIM_DRAFTS=1
 #   TRIM_SUPERSEDED=1
 #   CANCEL_VERIFY_WAIT_S=10
@@ -39,7 +39,7 @@ fi
 
 DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions"
 QUEUE_REPOS="${QUEUE_REPOS:-$DEFAULT_QUEUE_REPOS}"
-MIN_PR_AGE_HOURS="${MIN_PR_AGE_HOURS:-2}"
+MIN_PR_AGE_HOURS="${MIN_PR_AGE_HOURS:-1.5}"
 TRIM_DRAFTS="${TRIM_DRAFTS:-1}"
 TRIM_SUPERSEDED="${TRIM_SUPERSEDED:-1}"
 CANCEL_VERIFY_WAIT_S="${CANCEL_VERIFY_WAIT_S:-10}"

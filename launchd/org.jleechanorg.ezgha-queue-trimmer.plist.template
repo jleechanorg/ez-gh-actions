@@ -10,7 +10,7 @@
     (jleechanorg/worldarchitect.ai and jleechanorg/ez-gh-actions).
 
   Trimming criteria:
-    1. Unmodified PRs: PR last commit/activity is older than 2 hours.
+    1. Unmodified PRs: PR last commit/activity is older than 1.5 hours.
     2. Draft PRs: PR is in DRAFT state.
     3. Superseded commits: branch HEAD has moved past the run's commit.
 
@@ -31,7 +31,7 @@
         <string>@SCRIPTS_DIR@/trim-queued-runs.sh</string>
         <string>--apply</string>
         <string>--min-pr-age-hours</string>
-        <string>2</string>
+        <string>1.5</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -44,7 +44,7 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
         <key>MIN_PR_AGE_HOURS</key>
-        <string>2</string>
+        <string>1.5</string>
     </dict>
 
     <key>StartInterval</key>
