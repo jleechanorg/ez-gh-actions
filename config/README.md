@@ -27,19 +27,23 @@ systemctl --user restart ezgha.service
 
 ## Jeff-Ubuntu restore boundary
 
-The approved Linux profile is 20 runners at 1400 MiB per job. The existing
-14-runner profile at 2000 MiB per job and 10-runner profile at 2500 MiB per job
-remain supported for rollback; all three use the same 26 GiB `MemoryHigh` and
-28 GiB `MemoryMax` aggregate cap. A temporary live count below the selected
-profile is an incident state, not a supported capacity profile.
+The approved Linux profile is 14 runners at 2000 MiB per job (since 2026-10-18;
+see the capacity-contract bead — the 20 @ 1400 MiB profile was retired after
+runner jobs OOM-died at 1400 MiB with host swap saturated). The 10-runner
+profile at 2500 MiB per job remains supported for rollback; both use the same
+26 GiB `MemoryHigh` and 28 GiB `MemoryMax` aggregate cap. The restoration target
+is 16 @ 1750 MiB inside the same envelope, gated on the `ez-gh-actions-sa8c`
+host-OOM policy landing plus reclaimed host memory. A temporary live count
+below the selected profile is an incident state, not a supported capacity
+profile.
 
 Select all profile values together when switching capacity:
 
 | Profile | `runner.count` | `limits.memory_mb` | `runner.runner_floor_mb` | actions `TasksMax` |
 |---------|----------------|--------------------|--------------------------|-------------------|
-| Approved | 20 | 1400 | 1400 | 8000 |
-| Rollback (14) | 14 | 2000 | 2000 | 8000 |
+| Approved | 14 | 2000 | 2000 | 8000 |
 | Rollback (10) | 10 | 2500 | 2500 | 6000 |
+| Restoration (16) | 16 | 1750 | 1750 | 8000 |
 
 For a capacity switch, inspect the runtime config and `failure_ladder.toml`,
 deploy the reviewed binary and matching profile, then restart `ezgha.service`

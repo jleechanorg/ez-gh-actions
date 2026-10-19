@@ -69,7 +69,7 @@ separate deploy-owner checks; a code change alone does not update running images
 
 ## Host-survival failure ladder (Jeff-Ubuntu)
 
-The production capacity contract is **20 Linux runners plus 4 Mac runners**; the explicit 14-runner and 10-runner Linux profiles remain available for rollback.
+The production capacity contract is **14 Linux runners plus 4 Mac runners (18 total, since 2026-10-18 — see the capacity-contract bead)**; the 10-runner Linux profile remains available for rollback, and 16 @ 1750 MiB is the restoration target once the `ez-gh-actions-sa8c` host-OOM policy lands.
 Any observed Linux shortfall is a live failure, not a reduced contract, and the
 host-survival verdict remains **FAIL** until the live criteria in the
 [Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md) pass together.
@@ -93,7 +93,7 @@ stopping the VM or changing physical-host lifecycle state requires an operator.
 
 The still-open live gaps are whole-home 9p/virtfs, removal of boot-enabled host-lifecycle
 automation and panic auto-recovery settings, one armed crashkernel with kdump loaded on
-the current boot, and stable proof of all 20 Linux slots executing. Repository checks
+the current boot, and stable proof of all 14 Linux slots executing. Repository checks
 document the intended controls; they do not close those live gaps.
 
 ## Linux HostDocker crash containment
