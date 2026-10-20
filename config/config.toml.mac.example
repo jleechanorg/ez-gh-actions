@@ -54,7 +54,7 @@ guest_reserve_mb = 2048
 memory_mb = 3072
 cpus = 1.0
 pids = 512
-min_free_disk_gb = 10
+min_free_disk_gb = 30
 
 [policy]
 # Colima = docker-in-VM, but backend isolation is still "container".

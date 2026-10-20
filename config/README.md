@@ -4,6 +4,23 @@ Reference `config.toml` files for the two production ezgha hosts. These are **no
 auto-installed — copy to `~/.config/ezgha/config.toml` after editing limits for your
 machine.
 
+## Mac disk admission floor
+
+The Mac template sets `limits.min_free_disk_gb = 30`. This uses ezgha's existing
+disk admission guard: when either the Docker volume or outer host filesystem is
+below the configured floor, the next reconciliation skips new runner starts.
+The guard does not stop already-running jobs. Once a later check sees both
+locations at or above the same 30 GiB floor, runner admission resumes; the guard
+has no separate resume threshold or hysteresis.
+
+Mac free-space observations ranged from 35–46 GiB; this is an observed range,
+not a stable baseline. A four-job snapshot showed 9.23 GB (about 8.60 GiB) of
+current writable-layer data. That point-in-time footprint is not a maximum or
+cumulative write total. For scale only, a comparable additional 8.60 GiB of
+growth after the 30 GiB floor is reached would leave about 21 GiB free. Actual
+job growth can differ, so this is not a guarantee or a bound. Linux templates
+and the Rust default remain at 10 GiB.
+
 ```bash
 # MacBook (4× ez-mac-runner-h-*)
 cp config/config.toml.mac.example ~/.config/ezgha/config.toml

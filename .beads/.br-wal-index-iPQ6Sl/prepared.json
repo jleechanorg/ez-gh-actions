@@ -1,0 +1,10 @@
+{
+  "schema_version": "br.wal_index.quarantine.v1",
+  "database_path": "/Users/jleechan/projects_other/ez-gh-actions/.beads/beads.db",
+  "reason": "initialized-zero-page-wal-index",
+  "main_sha256": "b7c8dd624029b52bc143e2e2c6e5fae64f86ff9a4db4b6e6f32ee4809cc11f32",
+  "wal_sha256": "01054c4c94ffc0994ac06f30ad20a0d7366c500353ce2ee8b8b706b09b490b60",
+  "shm_sha256": "75f25efbeb8860ba480b4375315a990c7d9d9479412be52e559762623ca5dd53",
+  "retained_index": "/Users/jleechan/projects_other/ez-gh-actions/.beads/.br-wal-index-iPQ6Sl/poisoned-shm",
+  "completion_marker": "quarantine-complete.json"
+}

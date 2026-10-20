@@ -92,11 +92,41 @@ SHORT_WINDOW_SEC="${SHORT_WINDOW_SEC:-300}"
 LONG_WINDOW_SEC="${LONG_WINDOW_SEC:-3600}"
 MIN_RECLAIMS_SHORT="${MIN_RECLAIMS_SHORT:-3}"
 MIN_RECLAIMS_LONG="${MIN_RECLAIMS_LONG:-10}"
+detect_slot_file() {
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    local mac_slot="$HOME/Library/Application Support/org.jleechanorg.ezgha/slot_assignments.toml"
+    if [[ -f "$mac_slot" ]]; then
+      echo "$mac_slot"
+      return 0
+    fi
+  fi
+  echo "$HOME/.config/ezgha/slot_assignments.toml"
+}
+
+detect_slot_capacity() {
+  local cfg=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    cfg="$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml"
+    [[ -f "$cfg" ]] || cfg="$HOME/.config/ezgha/config.toml"
+  else
+    cfg="$HOME/.config/ezgha/config.toml"
+  fi
+  if [[ -f "$cfg" ]]; then
+    local c
+    c=$(grep -E '^[[:space:]]*count[[:space:]]*=' "$cfg" | head -1 | awk -F'=' '{print $2}' | tr -d '[:space:]' | grep -Eo '^[0-9]+' || true)
+    if [[ -n "$c" && "$c" =~ ^[0-9]+$ ]]; then
+      echo "$c"
+      return 0
+    fi
+  fi
+  echo "16"
+}
+
 DAEMON_STDERR_LOG="${DAEMON_STDERR_LOG:-/tmp/ezgha-launchd-stderr.log}"
-SLOT_FILE="${SLOT_FILE:-$HOME/.config/ezgha/slot_assignments.toml}"
+SLOT_FILE="${SLOT_FILE:-$(detect_slot_file)}"
 STATE_DIR="${STATE_DIR:-$HOME/.local/state/ezgha/alert}"
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
-SLOT_CAPACITY="${SLOT_CAPACITY:-16}"
+SLOT_CAPACITY="${SLOT_CAPACITY:-$(detect_slot_capacity)}"
 TAIL_LOCK_TIMEOUT_SEC="${TAIL_LOCK_TIMEOUT_SEC:-10}"
 ALERT_HOST="${ALERT_HOST:-$(hostname -s 2>/dev/null || echo unknown)}"
 
@@ -180,21 +210,19 @@ tail_with_lock() {
 }
 
 # Count reclaim events in a stdin stream (the tail of the stderr log).
-# Two regex families are recognized:
-#   - PR #109 structured:  release_stale_slots reclaimed (?: empty-id slot| slot \d+: runner_id=)
-#   - pre-PR-#109 fallback:  runner ez-.* reclaimed — peak RSS
-# We strip the log lines to a binary "is-reclaim / not-reclaim" decision.
+# Anomalous reclaims indicate degraded runners (e.g. gh-rejected-past-grace,
+# gh-rejected-container-absent, empty-id-reclaim, docker-ps-failed).
+# Excludes normal ephemeral job completions (reason=gh-missing-no-local-container)
+# and summary lines (e.g. "reclaimed 1 stale slot(s)").
 count_reclaim_events() {
-  grep -cE '(release_stale_slots reclaimed|reclaimed — peak RSS)' || true
+  grep -E 'release_stale_slots reclaimed (empty-id slot|slot [0-9]+:)' \
+    | grep -v 'reason=gh-missing-no-local-container' \
+    | wc -l | tr -d ' ' || true
 }
 
 # Filter stdin (log stream) to lines whose monotonic/wall timestamp falls
 # within the last $window_sec seconds. We extract wall_ts= when present
-# (PR #109 format); otherwise we count the line as recent (best-effort
-# fallback for pre-PR-#109 logs — degraded, but the alert script's job
-# is to fire when there's been a lot of reclaim activity, not to be
-# perfectly windowed). For PR #109 lines without wall_ts (shouldn't
-# happen, but defensive), we count them as recent.
+# (PR #109 format).
 filter_within_window() {
   local window_sec="$1" now_epoch="$2"
   local cutoff=$(( now_epoch - window_sec ))
@@ -205,14 +233,6 @@ filter_within_window() {
     if [[ "$line" =~ wall_ts=([0-9]+) ]]; then
       ts="${BASH_REMATCH[1]}"
       if (( ts >= cutoff )); then
-        keep=1
-      fi
-    elif [[ "$line" =~ reclaimed\ -\ peak\ RSS ]]; then
-      # Pre-PR-#109 fallback: no timestamp. Best-effort: assume recent
-      # only if the line is within the last window_sec seconds of the
-      # file's mtime. We approximate by checking that the file itself
-      # was modified recently (passed in via env var WINDOW_LOG_MTIME).
-      if [[ "${WINDOW_LOG_MTIME:-0}" -ge $(( now_epoch - window_sec )) ]]; then
         keep=1
       fi
     fi
@@ -230,18 +250,27 @@ slot_file_health() {
     echo "missing"
     return 1
   fi
-  # Count entries in any `runner_ids = [ ... ]` block (this is the shape
-  # ezgha writes today; the script also accepts `assigned = N` shorthand).
-  # Use grep to find the line, then extract digits between [ and ].
+  # Count entries in [assignments] table (production ezgha shape),
+  # or in any `runner_ids = [ ... ]` block (test/synthetic shape).
   local count
   count="$(
-    {
-      grep -E '^[[:space:]]*runner_ids[[:space:]]*=' "$path" 2>/dev/null || true
-    } | head -1 \
-    | sed -nE 's/.*\[([^]]*)\].*/\1/p' \
-    | tr ',' '\n' \
-    | grep -cE '^[[:space:]]*[0-9]+[[:space:]]*$' || true
+    awk '
+      /^\[assignments\]/ { in_sec=1; next }
+      /^\[/              { in_sec=0 }
+      in_sec && /^[0-9]+[[:space:]]*=/ { c++ }
+      END { if (c > 0) print c }
+    ' "$path" 2>/dev/null || true
   )"
+  if [[ -z "$count" || ! "$count" =~ ^[0-9]+$ ]]; then
+    count="$(
+      {
+        grep -E '^[[:space:]]*runner_ids[[:space:]]*=' "$path" 2>/dev/null || true
+      } | head -1 \
+      | sed -nE 's/.*\[([^]]*)\].*/\1/p' \
+      | tr ',' '\n' \
+      | grep -cE '^[[:space:]]*[0-9]+[[:space:]]*$' || true
+    )"
+  fi
   if [[ ! "$count" =~ ^[0-9]+$ ]] || (( count < capacity )); then
     echo "degraded:${count:-0}"
     return 1

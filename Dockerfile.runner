@@ -60,4 +60,27 @@ COPY docker/runner-post-job-workspace-prune.sh /usr/local/libexec/ezgha/
 RUN chmod 0755 /usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh
 ENV ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/usr/local/libexec/ezgha/runner-post-job-workspace-prune.sh
 
+# Preinstall the Node 20 runtime used by setup-node. Keep the standard runner
+# tool-cache layout and ownership so setup-node can hit this version or install
+# a later/missing version without writing into the workspace tmpfs.
+# Hashes are from https://nodejs.org/dist/v20.20.2/SHASUMS256.txt.
+ARG TARGETARCH
+ENV RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+RUN set -eux; \
+    target_arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$target_arch" in \
+      amd64) node_arch=x64; node_sha256=19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b ;; \
+      arm64) node_arch=arm64; node_sha256=47ef73d543ecf6eb19435f6c03a0ac4809b3bf0dd6b26c7c571efc2a6572a74d ;; \
+      *) echo "unsupported target architecture: $target_arch" >&2; exit 1 ;; \
+    esac; \
+    node_archive="node-v20.20.2-linux-${node_arch}.tar.gz"; \
+    curl -fsSL "https://nodejs.org/dist/v20.20.2/${node_archive}" -o "/tmp/${node_archive}"; \
+    echo "${node_sha256}  /tmp/${node_archive}" | sha256sum -c -; \
+    node_path="${RUNNER_TOOL_CACHE}/node/20.20.2/${node_arch}"; \
+    mkdir -p "$node_path"; \
+    tar -xzf "/tmp/${node_archive}" --strip-components=1 -C "$node_path"; \
+    touch "${RUNNER_TOOL_CACHE}/node/20.20.2/${node_arch}.complete"; \
+    chown -R runner:runner "$RUNNER_TOOL_CACHE"; \
+    rm "/tmp/${node_archive}"
+
 USER runner
