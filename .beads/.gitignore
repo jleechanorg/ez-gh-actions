@@ -13,3 +13,7 @@ last-touched
 *-fsqlite-ns-use
 *.vacuum-wal-cert*
 *.fsqlite-migration-state
+# br runtime lock/WAL-recovery artifacts must never be committed
+# (machine-local absolute paths + binary shm; found committed by PR #181 review)
+.br-*.lock
+.br-wal-index-*/
