@@ -1,0 +1,57 @@
+{
+  "subject": "Mac and Linux runner outage alerts final design and implementation plan",
+  "evaluated_git_head": "0f0eae2925dee384540c803791c249ed00e2f7a3",
+  "transport": "chrome_headless_cookies",
+  "transport_assertion": "allowed with fallback_reason=aside_unavailable",
+  "uploaded_files": [
+    {
+      "name": "2026-09-13-runner-outage-alerts-design.md",
+      "path": "/tmp/ezgha-alert-web-review/final/2026-09-13-runner-outage-alerts-design.md",
+      "bytes": 24070,
+      "sha256": "f61c8a8793d64c9557722e205a4a7949283455151e8b2fa59954f2606c89c6d3",
+      "kind": "document"
+    },
+    {
+      "name": "2026-09-13-runner-outage-alerts.md",
+      "path": "/tmp/ezgha-alert-web-review/final/2026-09-13-runner-outage-alerts.md",
+      "bytes": 19054,
+      "sha256": "1620d74ab3ca712607c74426ed3775645677d33147f4fb77df989a11c9365c99",
+      "kind": "document"
+    }
+  ],
+  "seats": {
+    "chatgpt": {
+      "status": "ok",
+      "verdict": "APPROVED with notes",
+      "confidence": "high",
+      "composer_attachment_names": [
+        "2026-09-13-runner-outage-alerts-design.md",
+        "2026-09-13-runner-outage-alerts.md"
+      ],
+      "attachments_verified": true,
+      "packet_echo_verified": true,
+      "context_complaints": "PASS: 0 complaints",
+      "share_url": "not obtained: automated driver",
+      "full_review": "/tmp/ezgha-alert-web-review/final-chatgpt-review.md",
+      "report": "/tmp/ezgha-alert-web-review/final-chatgpt-report.json"
+    },
+    "gemini": {
+      "status": "unavailable",
+      "reason": "login_required during isolated-headless preflight; no review submitted",
+      "report": "/tmp/ezgha-alert-web-review/transport-preflight.json"
+    },
+    "perplexity": {
+      "status": "unavailable",
+      "reason": "upload_login_required on the initial clean chat and required one clean-chat retry. Playwright MCP import failed and localhost:9222 was HTTP 404, not a Chrome DevTools endpoint.",
+      "initial_report": "/tmp/ezgha-alert-web-review/perplexity-report.json",
+      "retry_report": "/tmp/ezgha-alert-web-review/perplexity-retry-report.json",
+      "fallback_probe": "/tmp/ezgha-alert-web-review/perplexity-fallback-probe.md"
+    }
+  },
+  "round_two_capture": {
+    "status": "incomplete",
+    "reason": "ChatGPT final-byte precursor displayed both attachments but response was not observed; bounded exact-title recovery found no matching titled chat, so no verdict was accepted.",
+    "report": "/tmp/ezgha-alert-web-review/round2-chatgpt-report.json",
+    "recovery": "/tmp/ezgha-alert-web-review/round2-chatgpt-recovery.json"
+  }
+}

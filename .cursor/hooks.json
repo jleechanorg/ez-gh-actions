@@ -2,7 +2,7 @@
   "hooks": {
     "preToolUse": [
       {
-        "command": "bash /home/jleechan/.local/bin/conflict-warn-pre-tool.sh"
+        "command": "bash $HOME/.local/bin/conflict-warn-pre-tool.sh"
       }
     ],
     "subagentStart": [

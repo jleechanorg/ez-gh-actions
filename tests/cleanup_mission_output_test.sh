@@ -40,10 +40,19 @@ mkdir -p "${ACTIVE_DIR}"
 touch "${ACTIVE_DIR}/app.log"
 touch -t 202501011200.00 "${ACTIVE_DIR}"
 
+# 4. Active Mac runner dirs (current g prefix and legacy b prefix), old and idle
+ACTIVE_G_DIR="${TMP_MOCK}/ez-mac-runner-g-3"
+ACTIVE_B_DIR="${TMP_MOCK}/ez-mac-runner-b-3"
+mkdir -p "${ACTIVE_G_DIR}" "${ACTIVE_B_DIR}"
+touch "${ACTIVE_G_DIR}/app.log" "${ACTIVE_B_DIR}/app.log"
+touch -t 202501011200.00 "${ACTIVE_G_DIR}" "${ACTIVE_B_DIR}"
+
 # Resolve canonical paths (resolving any /tmp or /var/folders symlinks)
 OLD_DIR=$(cd -P "${OLD_DIR}" && pwd -P)
 RECENT_DIR=$(cd -P "${RECENT_DIR}" && pwd -P)
 ACTIVE_DIR=$(cd -P "${ACTIVE_DIR}" && pwd -P)
+ACTIVE_G_DIR=$(cd -P "${ACTIVE_G_DIR}" && pwd -P)
+ACTIVE_B_DIR=$(cd -P "${ACTIVE_B_DIR}" && pwd -P)
 TMP_MOCK_CANONICAL=$(cd -P "${TMP_MOCK}" && pwd -P)
 
 # Create mocked script pointing CANDIDATE_ROOTS exclusively to TMP_MOCK_CANONICAL
@@ -91,6 +100,14 @@ if [ -d "${ACTIVE_DIR}" ]; then
 else
   fail "--apply deleted active marker directory"
 fi
+
+for d in "${ACTIVE_G_DIR}" "${ACTIVE_B_DIR}"; do
+  if [ -d "${d}" ]; then
+    echo "PASS: --apply preserved active Mac runner directory ${d##*/}"
+  else
+    fail "--apply deleted active Mac runner directory ${d##*/}"
+  fi
+done
 
 manifest_count=$(find "${HOME_MOCK}/.local/state/ezgha/mission-output-archives" -type f -name "*.manifest" | wc -l | tr -d ' ')
 if [ "${manifest_count}" -gt 0 ]; then

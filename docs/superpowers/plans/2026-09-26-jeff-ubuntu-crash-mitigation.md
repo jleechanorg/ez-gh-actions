@@ -1,0 +1,808 @@
+# Jeff-Ubuntu Crash Mitigation Implementation Plan
+
+> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+
+**Goal:** Install crash-capture logging, the favored-core cap, a vmcore triage script, and a scheduled soak on Jeff-Ubuntu, then run maintenance window W and the S1 soak defined in `docs/superpowers/specs/2026-09-26-jeff-ubuntu-crash-mitigation-design.md` (the "spec").
+
+**Architecture:** All host artifacts are git-tracked in `~/projects_other/user_scope` (spec E19/E20): a sysctl drop-in, a modprobe file, a systemd system unit plus script for the cap, a MacBook launchd receiver template, a user timer for `soakctl watch`, and a `crash` batch triage script. Root-phase installation is one script that a human runs with sudo; every asserter is read-only and prints `PASS`/`FAIL` tokens the spec's criteria consume.
+
+**Tech Stack:** bash, systemd (system + user), sysctl, netconsole/netpoll, launchd (MacBook), `crash` 8.0.4 + Ubuntu dbgsym, `soakctl`, pytest (user_scope test convention).
+
+**Implemented in user_scope PR #56** (branch `feat/jeff-ubuntu-crash-capture`, merged 126c1fb) **and PR #57** (bd-lck: durable pre-S1 record, `assert-off`, soak-watch `FAVORED_CORE_EXPECT` switch; merged) **and PR #58** (the `/run` revert value is seeded from the durable record after a reboot; merged). Tests live in per-task files there, not in one shared `tests/test_crash_capture_artifacts.py` as the task blocks below originally showed: `tests/test_crash_capture_sysctl.py`, `tests/test_favored_core_cap.py`, `tests/test_netconsole_artifacts.py`, `tests/test_soak_watch.py`, `tests/test_vmcore_triage.py`, `tests/test_install_crash_capture.py` (56 tests, root-free). Where a task block's test snippet and the PR differ, the PR is canonical.
+
+**Preconditions (spec § 11):** P1 sudo for Tasks 7–9; P2 human present for W1/W3; P3 `eno2` adjacency (Task 4, under sudo in W0); P5 dbgsym with matching Build ID (Task 6, no root) is a hard gate before W3; P6a (SysRq proof) and P6b (lockup/panic sysctls) operator approvals.
+
+**Bead discipline:** commit prefix `claude/claude-fable-5-1:`; commit + push only; the deploy steps (Tasks 7–9) are run by the deploy-owner with the human, never by a dispatched sub-agent (ez-gh-actions CLAUDE.md single-writer rule applies to host mutation too).
+
+---
+
+## Task 1: Sysctl drop-in + assert script (user_scope)
+
+**Files:**
+- Create: `config/sysctl.d/90-jeff-ubuntu-crash-capture.conf`
+- Create: `scripts/assert-crash-capture.sh`
+- Test: `tests/test_crash_capture_artifacts.py`
+
+**Step 1: Write the failing test**
+
+```python
+# tests/test_crash_capture_artifacts.py
+import pathlib, re, subprocess
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+EXPECTED = {
+    "kernel.panic_on_oops": "1",
+    "kernel.softlockup_panic": "1",
+    "kernel.hardlockup_panic": "1",
+    "kernel.panic": "10",
+    "kernel.hung_task_panic": "0",
+}
+
+def _parse(path):
+    out = {}
+    for line in path.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if "=" in line:
+            k, v = (s.strip() for s in line.split("=", 1))
+            out[k] = v
+    return out
+
+def test_sysctl_file_sets_exactly_the_capture_keys():
+    got = _parse(ROOT / "config/sysctl.d/90-jeff-ubuntu-crash-capture.conf")
+    assert got == EXPECTED
+
+def test_assert_script_is_readonly_and_tokenized():
+    src = (ROOT / "scripts/assert-crash-capture.sh").read_text()
+    assert "sysctl -w" not in src and "/proc/sys" not in src
+    assert re.search(r'echo "PASS C1"', src) and "FAIL C1" in src
+
+def test_assert_script_bash_syntax():
+    subprocess.run(["bash", "-n", str(ROOT / "scripts/assert-crash-capture.sh")], check=True)
+```
+
+**Step 2: Run test to verify it fails**
+
+Run: `cd ~/projects_other/user_scope && python3 -m pytest tests/test_crash_capture_artifacts.py -q`
+Expected: FAIL with `FileNotFoundError`.
+
+**Step 3: Write the artifacts**
+
+```
+# config/sysctl.d/90-jeff-ubuntu-crash-capture.conf
+# Jeff-Ubuntu crash capture (bd-dea.10, spec D2/D3). kdump-config already forces
+# panic_on_oops=1; stated here so a kdump-tools change cannot silently flip it.
+kernel.panic_on_oops = 1
+kernel.softlockup_panic = 1
+kernel.hardlockup_panic = 1
+kernel.panic = 10
+kernel.hung_task_panic = 0
+```
+
+```bash
+#!/usr/bin/env bash
+# scripts/assert-crash-capture.sh — read-only check of spec criteria C1/C2
+# (bd-dea.10, docs/superpowers/specs/2026-09-26-jeff-ubuntu-crash-mitigation-design.md).
+#
+# Usage: assert-crash-capture.sh [--pre]
+#   (no args)  Check C1 (sysctl drop-in present + the five lockup/panic
+#              sysctls effective), then C2 (kdump armed with a >= 1.5 GiB
+#              crash-kernel reservation).
+#   --pre      Check ONLY C2. Used at spec window W2, before the lockup-panic
+#              sysctls are installed (the C1 sysctls land later, at W4).
+#
+# Read-only: never invokes a sysctl write mode and never writes into procfs.
+# The env overrides below let tests point this script at fake files/binaries
+# instead of live host state.
+set -euo pipefail
+
+SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf}"
+KEXEC_LOADED_FILE="${KEXEC_LOADED_FILE:-/sys/kernel/kexec_crash_loaded}"
+KEXEC_SIZE_FILE="${KEXEC_SIZE_FILE:-/sys/kernel/kexec_crash_size}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+C2_MIN_BYTES=1610612736 # 1.5 GiB, spec C2
+
+pre_only=0
+case "${1:-}" in
+  --pre) pre_only=1 ;;
+  "") ;;
+  *)
+    echo "usage: $0 [--pre]" >&2
+    exit 2
+    ;;
+esac
+
+check_c1() {
+  [ -f "$SYSCTL_FILE" ] || { echo "FAIL C1-file $SYSCTL_FILE missing"; exit 1; }
+  # The lockup panics only mean something if the detectors themselves are on.
+  for kv in watchdog:1 nmi_watchdog:1 soft_watchdog:1 panic_on_oops:1 softlockup_panic:1 hardlockup_panic:1 panic:10 hung_task_panic:0; do
+    k=${kv%%:*}
+    want=${kv##*:}
+    got=$("$SYSCTL_BIN" -n "kernel.$k" 2>/dev/null) || { echo "FAIL C1 kernel.$k unreadable"; exit 1; }
+    [ "$got" = "$want" ] || { echo "FAIL C1 kernel.$k=$got want $want"; exit 1; }
+  done
+  echo "PASS C1"
+}
+
+check_c2() {
+  [ -f "$KEXEC_LOADED_FILE" ] || { echo "FAIL C2-file $KEXEC_LOADED_FILE missing"; exit 1; }
+  [ -f "$KEXEC_SIZE_FILE" ] || { echo "FAIL C2-file $KEXEC_SIZE_FILE missing"; exit 1; }
+  loaded=$(cat "$KEXEC_LOADED_FILE" 2>/dev/null) || { echo "FAIL C2 $KEXEC_LOADED_FILE unreadable"; exit 1; }
+  size=$(cat "$KEXEC_SIZE_FILE" 2>/dev/null) || { echo "FAIL C2 $KEXEC_SIZE_FILE unreadable"; exit 1; }
+  [ "$loaded" = "1" ] || { echo "FAIL C2 kexec_crash_loaded=$loaded want 1"; exit 1; }
+  case "$size" in
+    ''|*[!0-9]*) echo "FAIL C2 kexec_crash_size=$size not numeric"; exit 1 ;;
+  esac
+  [ "$size" -ge "$C2_MIN_BYTES" ] || { echo "FAIL C2 kexec_crash_size=$size want >= $C2_MIN_BYTES"; exit 1; }
+  echo "PASS C2"
+}
+
+if [ "$pre_only" -eq 1 ]; then
+  check_c2
+else
+  check_c1
+  check_c2
+fi
+```
+
+**Step 4: Run test to verify it passes**
+
+Run: `python3 -m pytest tests/test_crash_capture_artifacts.py -q` → `3 passed`.
+
+**Step 5: Commit**
+
+```bash
+git add config/sysctl.d/90-jeff-ubuntu-crash-capture.conf scripts/assert-crash-capture.sh tests/test_crash_capture_artifacts.py
+git commit -m "claude/claude-fable-5-1: add Jeff-Ubuntu crash-capture sysctl drop-in and asserter (bd-dea.10)"
+```
+
+---
+
+## Task 2: Favored-core cap script + system unit
+
+**Files:**
+- Create: `scripts/favored-core-cap.sh`
+- Create: `systemd/favored-core-cap.service`
+- Modify: `tests/test_crash_capture_artifacts.py` (append)
+
+**Step 1: Append failing tests**
+
+```python
+def test_favored_core_cap_script_modes(tmp_path):
+    # Simulate sysfs so the script is testable without root.
+    for c in range(4):
+        d = tmp_path / f"cpu{c}/cpufreq"; d.mkdir(parents=True)
+        (d / "cpuinfo_max_freq").write_text("5800000\n")
+        (d / "scaling_max_freq").write_text("5800000\n")
+    (tmp_path / "cpu1/cpufreq/scaling_max_freq").write_text("5400000\n")   # a pre-existing lower limit must survive revert
+    env = {"FAVORED_CORE_SYSFS": str(tmp_path), "FAVORED_CORE_SAVE_DIR": str(tmp_path / "save"), "PATH": "/usr/bin:/bin"}
+    s = str(ROOT / "scripts/favored-core-cap.sh")
+    r = subprocess.run([s, "assert"], env=env, capture_output=True, text=True)
+    assert r.returncode == 1 and "FAIL S1-cap" in r.stdout
+    subprocess.run([s, "apply"], env=env, check=True)
+    assert (tmp_path / "cpu3/cpufreq/scaling_max_freq").read_text().strip() == "5500000"
+    r = subprocess.run([s, "assert"], env=env, capture_output=True, text=True)
+    assert r.returncode == 0 and r.stdout.startswith("PASS S1-cap")
+    subprocess.run([s, "revert"], env=env, check=True)
+    assert (tmp_path / "cpu0/cpufreq/scaling_max_freq").read_text().strip() == "5800000"
+    assert (tmp_path / "cpu1/cpufreq/scaling_max_freq").read_text().strip() == "5400000"
+
+def test_favored_core_unit_is_oneshot_with_revert():
+    u = (ROOT / "systemd/favored-core-cap.service").read_text()
+    assert "Type=oneshot" in u and "RemainAfterExit=yes" in u
+    assert "ExecStart=/usr/local/libexec/favored-core-cap.sh apply" in u
+    assert "ExecStop=/usr/local/libexec/favored-core-cap.sh revert" in u
+```
+
+**Step 2: Run** → FAIL (script missing).
+
+**Step 3: Write**
+
+```bash
+#!/usr/bin/env bash
+# scripts/favored-core-cap.sh — cap the two TVB favored cores (cpu0-3) to the
+# common P-core bin. Experiment S1 of bd-dea.10. Modes: apply | revert | assert | assert-off.
+# assert-off (S3 reverse test): every CPU is back at its PRE-S1 limit, recorded durably by
+# the first apply under /var/lib/favored-core-cap (survives reboots, unlike the /run save file).
+set -euo pipefail
+SYSFS="${FAVORED_CORE_SYSFS:-/sys/devices/system/cpu}"
+CAP_KHZ="${FAVORED_CORE_CAP_KHZ:-5500000}"
+CPUS="${FAVORED_CORE_CPUS:-0 1 2 3}"
+mode="${1:-assert}"
+SAVE_DIR="${FAVORED_CORE_SAVE_DIR:-/run/favored-core-cap}"   # original limits, restored on revert
+DURABLE_DIR="${FAVORED_CORE_DURABLE_DIR:-/var/lib/favored-core-cap}"   # pre-S1 limits, written once, survive reboots
+if [ -z "${CPUS//[[:space:]]/}" ]; then
+  echo "FAIL S1-cap FAVORED_CORE_CPUS is empty/whitespace-only"
+  exit 1
+fi
+for c in $CPUS; do
+  f="$SYSFS/cpu$c/cpufreq"
+  case "$mode" in
+    apply)  [ -f "$f/scaling_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
+            mkdir -p "$SAVE_DIR" "$DURABLE_DIR"
+            rec="$DURABLE_DIR/cpu$c"
+            # The whole per-CPU step runs under one lock, so concurrent applies serialize:
+            # the /run save file and the durable pre-S1 record are each written exactly once
+            # (create-exclusive), any write failure is fatal BEFORE the cap is applied, and an
+            # existing empty record (interrupted write) stops the run instead of being replaced.
+            if ! (
+              flock -x 9
+              # Order matters: validate/create the durable pre-S1 record FIRST, so an empty record
+              # (interrupted write) aborts before anything is written to /run; then seed the /run
+              # revert value from that record. /run is empty after every reboot, so a boot-time
+              # apply on an already-capped core must never record the capped value as the thing
+              # to restore.
+              if [ -e "$rec" ]; then
+                [ -s "$rec" ] || { echo "FAIL S1-cap cpu$c durable record $rec is empty (interrupted write); inspect before re-applying"; exit 1; }
+              else
+                ( set -C; cat "$f/scaling_max_freq" > "$rec" ) 2>/dev/null || { echo "FAIL S1-cap cpu$c could not write durable record $rec; cap NOT applied"; exit 1; }
+                [ -s "$rec" ] || { echo "FAIL S1-cap cpu$c durable record $rec empty after write; cap NOT applied"; exit 1; }
+              fi
+              [ -f "$SAVE_DIR/cpu$c" ] || cp "$rec" "$SAVE_DIR/cpu$c" || { echo "FAIL S1-cap cpu$c could not write $SAVE_DIR/cpu$c; cap NOT applied"; exit 1; }
+              cur=$(cat "$f/scaling_max_freq")
+              # Non-increasing: never raise a limit that is already below the cap.
+              if [ "$cur" -gt "$CAP_KHZ" ]; then echo "$CAP_KHZ" > "$f/scaling_max_freq"; fi
+            ) 9>"$DURABLE_DIR/.lock"; then exit 1; fi ;;
+    revert) [ -f "$f/cpuinfo_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
+            if [ -f "$SAVE_DIR/cpu$c" ]; then
+              cat "$SAVE_DIR/cpu$c" > "$f/scaling_max_freq"
+              rm -f "$SAVE_DIR/cpu$c"
+            else
+              # No saved value (never applied, or /run lost): leave the limit as it is.
+              # Raising it to cpuinfo_max_freq could undo a pre-existing lower limit.
+              echo "revert: cpu$c has no saved limit; leaving scaling_max_freq=$(cat "$f/scaling_max_freq") unchanged"
+            fi ;;
+    assert) [ -f "$f/scaling_max_freq" ] || { echo "FAIL S1-cap cpu$c cpufreq path missing: $f"; exit 1; }
+            got=$(cat "$f/scaling_max_freq")
+            # Capped means at or below the cap (a pre-existing lower limit is still capped).
+            [ "$got" -le "$CAP_KHZ" ] || { echo "FAIL S1-cap cpu$c scaling_max_freq=$got want <= $CAP_KHZ"; exit 1; } ;;
+    assert-off)
+            [ -f "$f/scaling_max_freq" ] || { echo "FAIL S3-capoff cpu$c cpufreq path missing: $f"; exit 1; }
+            [ -s "$DURABLE_DIR/cpu$c" ] || { echo "FAIL S3-capoff cpu$c no pre-S1 record in $DURABLE_DIR"; exit 1; }
+            [ -f "$SAVE_DIR/cpu$c" ] && { echo "FAIL S3-capoff cpu$c /run save file still present (cap not reverted)"; exit 1; }
+            got=$(cat "$f/scaling_max_freq"); want=$(cat "$DURABLE_DIR/cpu$c")
+            [ "$got" = "$want" ] || { echo "FAIL S3-capoff cpu$c scaling_max_freq=$got want pre-S1 $want"; exit 1; } ;;
+    *) echo "usage: $0 apply|revert|assert|assert-off" >&2; exit 2 ;;
+  esac
+done
+[ "$mode" = assert ] && echo "PASS S1-cap cpus=[$CPUS] khz<=$CAP_KHZ"
+[ "$mode" = assert-off ] && echo "PASS S3-capoff cpus=[$CPUS] at pre-S1 limits"
+exit 0
+```
+
+```ini
+# systemd/favored-core-cap.service
+# systemd/favored-core-cap.service
+[Unit]
+Description=Cap TVB favored cores cpu0-3 to 5.5 GHz (bd-dea.10 experiment S1)
+# Deliberately no After= on the install target: WantedBy plus After on the same target is an ordering cycle.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/favored-core-cap.sh apply
+ExecStop=/usr/local/libexec/favored-core-cap.sh revert
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Step 4: Run** `python3 -m pytest tests/test_crash_capture_artifacts.py -q` → `5 passed`.
+
+**Step 5: Commit** `claude/claude-fable-5-1: add favored-core cap script and unit (bd-dea.10 S1)`.
+
+---
+
+## Task 3: netconsole unit + MacBook receiver
+
+**Files:**
+- Create: `scripts/netconsole-eno2.sh`
+- Create: `systemd/netconsole-eno2.service`
+- Create: `config/netconsole/com.jleechan.netconsole-receiver.plist.template`
+- Create: `scripts/netconsole-receiver.sh` (MacBook side)
+- Modify: `tests/test_crash_capture_artifacts.py` (append)
+
+Design (spec D2.4, revised twice): no NetworkManager connection on `eno2`; the unit adds a `/32` host address (the kernel documents `src-ip` as an interface address) and sets the link up; the target MAC defaults to broadcast with an explicit `NETCONSOLE_TGT_MAC` override for switches that suppress broadcast; the module is loaded by a unit ordered after the `eno2` device, never by `modules-load.d`.
+
+**Step 1: Append failing tests**
+
+```python
+def test_netconsole_script_has_no_mac_and_no_nm():
+    src = (ROOT / "scripts/netconsole-eno2.sh").read_text()
+    assert "netconsole=+6666@" in src and "/eno2,6666@192.168.254.199/" in src
+    assert not re.search(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", src)   # no hardcoded MAC
+    assert "nmcli" not in src and "ip link set" in src and "ip addr replace" in src and "/32" in src
+    assert "arp_ignore=1" in src and "arp_announce=2" in src   # ARP flux guard, spec D2.4
+    subprocess.run(["bash", "-n", str(ROOT / "scripts/netconsole-eno2.sh")], check=True)
+
+def test_netconsole_unit_orders_after_device():
+    u = (ROOT / "systemd/netconsole-eno2.service").read_text()
+    assert "After=sys-subsystem-net-devices-eno2.device" in u
+    assert "BindsTo=sys-subsystem-net-devices-eno2.device" in u
+    assert "EnvironmentFile=-/etc/default/netconsole-eno2" in u
+    assert "ExecStart=/usr/local/libexec/netconsole-eno2.sh" in u
+
+def test_netconsole_receiver_template_uses_home_placeholder():
+    t = (ROOT / "config/netconsole/com.jleechan.netconsole-receiver.plist.template").read_text()
+    assert "@HOME@" in t and "KeepAlive" in t and "6666" in t
+```
+
+**Step 2: Run** → FAIL.
+
+**Step 3: Write**
+
+```bash
+#!/usr/bin/env bash
+# scripts/netconsole-eno2.sh — load netconsole on the idle wired NIC (bd-dea.10 D2.4).
+# The /32 source address lives on the interface (kernel docs: src-ip is an interface address);
+# target MAC omitted => Ethernet broadcast, so a rotating MacBook MAC cannot break delivery.
+set -euo pipefail
+
+DEV="${NETCONSOLE_DEV:-eno2}"
+SRC="${NETCONSOLE_SRC_IP:-192.168.254.130}"
+TGT="${NETCONSOLE_TGT_IP:-192.168.254.199}"
+TGT_MAC="${NETCONSOLE_TGT_MAC:-}"        # empty => Ethernet broadcast (switches may suppress; T4 proves)
+
+# Overridable so this script is testable without root (fake binaries + a scratch kmsg path).
+IP_BIN="${IP_BIN:-ip}"
+MODPROBE_BIN="${MODPROBE_BIN:-modprobe}"
+KMSG_PATH="${KMSG_PATH:-/dev/kmsg}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+WIFI="${NETCONSOLE_WIFI_DEV:-wlp0s20f3}"
+
+# "ip link set" brings the NIC up; "ip addr replace" adds a /32 host address
+# (kernel docs: src-ip must be an interface address; /32 adds no subnet route).
+mode="${1:-start}"
+if [ "$mode" = stop ]; then
+  # Undo everything start did: module, the /32, and the ARP sysctls (host default is 0).
+  "$MODPROBE_BIN" -r netconsole || true
+  "$IP_BIN" addr del "${SRC}/32" dev "$DEV" 2>/dev/null || true
+  "$SYSCTL_BIN" -q -w "net.ipv4.conf.${DEV}.arp_ignore=0" "net.ipv4.conf.${DEV}.arp_announce=0" "net.ipv4.conf.${WIFI}.arp_ignore=0"
+  exit 0
+fi
+# ARP hygiene first (spec D2.4): the host runs arp_ignore=0/arp_announce=0, so a second NIC on the
+# same segment would answer ARP for the Wi-Fi address and flap the router's entry mid-soak.
+"$SYSCTL_BIN" -q -w "net.ipv4.conf.${DEV}.arp_ignore=1" "net.ipv4.conf.${DEV}.arp_announce=2" "net.ipv4.conf.${WIFI}.arp_ignore=1"
+"$IP_BIN" link set "$DEV" up
+"$IP_BIN" addr replace "${SRC}/32" dev "$DEV"
+"$MODPROBE_BIN" netconsole "netconsole=+6666@${SRC}/${DEV},6666@${TGT}/${TGT_MAC}"
+echo "netconsole-eno2: loaded $(date +%s)" > "$KMSG_PATH"
+```
+
+```ini
+# systemd/netconsole-eno2.service
+[Unit]
+Description=netconsole over eno2 to the MacBook receiver (bd-dea.10 D2.4)
+BindsTo=sys-subsystem-net-devices-eno2.device
+After=sys-subsystem-net-devices-eno2.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/netconsole-eno2
+ExecStart=/usr/local/libexec/netconsole-eno2.sh
+ExecStop=/usr/local/libexec/netconsole-eno2.sh stop
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+#!/usr/bin/env bash
+# scripts/netconsole-receiver.sh — MacBook UDP sink for Jeff-Ubuntu netconsole.
+set -euo pipefail
+LOG="${NETCONSOLE_LOG:-$HOME/Library/Logs/netconsole-jeff-ubuntu.log}"
+mkdir -p "$(dirname "$LOG")"
+exec nc -ukl 6666 >> "$LOG"
+```
+
+```xml
+<!-- config/netconsole/com.jleechan.netconsole-receiver.plist.template -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.jleechan.netconsole-receiver</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>@HOME@/.local/libexec/netconsole-receiver.sh</string>
+  </array>
+  <key>EnvironmentVariables</key><dict><key>NETCONSOLE_LOG</key><string>@HOME@/Library/Logs/netconsole-jeff-ubuntu.log</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/netconsole-receiver.stderr.log</string>
+</dict></plist>
+```
+
+**Step 4: Run tests** → `8 passed`.
+
+**Step 5: Commit** `claude/claude-fable-5-1: add netconsole-eno2 unit and MacBook receiver template (bd-dea.10 D2.4)`.
+
+---
+
+## Task 4: eno2 adjacency probe (Step 1 at W0b, Step 2 at W2; root) — decides whether netconsole ships
+
+**Step 0 (W0, read-only, gates everything below):** netconsole is off by default for S1 (spec D2.4): run `grep -c nbcon /proc/kallsyms` and `journalctl -k -b 0 | grep -i "netconsole.*nbcon"`; unless both show the running kernel's netconsole is NBCON-converted (netpoll decoupled from the printing context), record `netconsole: UNAVAILABLE (netpoll not proven scheduler-safe on $(uname -r))` on bd-dea.10, treat C7 as WAIVED, and stop here. On 2026-09-28 this host was already in the waived state (MacBook unreachable), so Step 0 is the reason the waiver stands even after the MacBook returns.
+
+**Step 1 (OPERATOR-ONLY, root, window W0, only if Step 0 passed):** `apt-get install -y iputils-arping` (not installed on the host), then duplicate-address detection, `ip link set eno2 up && arping -D -c 3 -I eno2 192.168.254.130` — any reply means the address is taken (ICMP silence is not proof; a host may ignore ping); abort and pick another `/32`. Then `ip addr replace 192.168.254.130/32 dev eno2 && arping -c 3 -I eno2 192.168.254.199`; a reply proves L2 adjacency.
+
+**Step 2 (OPERATOR-ONLY, W2, after Task 7 installs the unit):** probe delivery both ways: first with broadcast (default), then, if the MacBook log shows nothing within 5 s of `echo probe > /dev/kmsg`, with `NETCONSOLE_TGT_MAC=<current MacBook en0 MAC>` in the unit's environment. Record in bd-dea.10: `netconsole: OK (broadcast|mac)` or `netconsole: UNAVAILABLE (<reason>)`. If UNAVAILABLE, criterion C7 is recorded as `WAIVED (netconsole unavailable: <reason>)` with the bd-dea.10 comment as evidence (spec § 10), D2.4 is dropped **and the unit is taken down so nothing unproven stays active through the soak**: OPERATOR-ONLY `systemctl disable --now netconsole-eno2.service` (its `ExecStop` runs `netconsole-eno2.sh stop`: module unloaded, `/32` deleted, ARP sysctls back to 0); verify `systemctl is-enabled netconsole-eno2.service` prints `disabled` and `ip -br addr show eno2` shows no address. W5 then records `netconsole=WAIVED` from the inactive unit. Nothing else blocks.
+
+---
+
+## Task 5: `soak-watch` user timer
+
+**Files:**
+- Create: `systemd/user/soak-watch.service`, `systemd/user/soak-watch.timer`
+- Modify: `tests/test_crash_capture_artifacts.py` (append)
+
+**Step 1: Test**
+
+```python
+def test_soak_watch_timer_every_5_min():
+    t = (ROOT / "systemd/user/soak-watch.timer").read_text()
+    s = (ROOT / "systemd/user/soak-watch.service").read_text()
+    assert "OnUnitActiveSec=5min" in t and "WantedBy=timers.target" in t
+    assert "ExecStart=%h/.local/bin/soakctl watch" in s
+    assert "favored-core-cap.sh assert" in s and "CAP-DRIFT" in s
+```
+
+**Step 2:** FAIL. **Step 3: Write**
+
+```ini
+# systemd/user/soak-watch.service
+[Unit]
+Description=soakctl watch (updates soak beads, records crash-as-data)
+
+[Service]
+Type=oneshot
+# Cap-drift guard (spec Q14/C8): a silently lost cap would misattribute a crash.
+# FAVORED_CORE_EXPECT=on (S1, default) checks the cap is present; =off (S3) checks the pre-S1 limits are back.
+EnvironmentFile=-%h/.config/soak-watch.env
+# $$ makes systemd pass a literal $ to sh, so the shell (not systemd, which has no :- default syntax) expands the variable.
+ExecStart=/bin/sh -c 'm=assert; [ "$${FAVORED_CORE_EXPECT:-on}" = off ] && m=assert-off; /usr/local/libexec/favored-core-cap.sh "$$m" || echo "CAP-DRIFT expect=$${FAVORED_CORE_EXPECT:-on} $$(date -u +%%FT%%TZ)"'
+ExecStart=%h/.local/bin/soakctl watch
+```
+
+```ini
+# systemd/user/soak-watch.timer
+[Unit]
+Description=Run soakctl watch every 5 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+```
+
+**Step 4:** `8 passed`. Install (no root): `install -m 0644 systemd/user/soak-watch.* ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now soak-watch.timer`. Verify: `systemctl --user list-timers | grep soak-watch`. Also close the stale soak: `soakctl close cfs-cgroupdisable-16runners-20260703 --reason "superseded by bd-dea.10 S1"`.
+
+**Step 5: Commit** `claude/claude-fable-5-1: schedule soakctl watch as a user timer (bd-dea.10 D4)`.
+
+---
+
+## Task 6: vmcore triage script + dbgsym fetch (no root)
+
+**Files:**
+- Create: `scripts/vmcore-triage.sh`
+- Modify: `tests/test_crash_capture_artifacts.py` (append)
+
+**Step 1: Tests** — implemented as `tests/test_vmcore_triage.py` in user_scope PR #56 (per-task test files replaced the plan's original shared `tests/test_crash_capture_artifacts.py`). It drives the script with a fake `crash` binary (`CRASH_BIN`) that emits canned `bt` output per `FAKE_CRASH_VARIANT`: `sysrq`, `human-review`, `distinct-addrs`, `single-space-rip`, `no-panic`, `panic-then-fail`, `valid-symbol`. The canned outputs contain real-shaped panic-machinery frames (`#0 machine_kexec`, `#1 __crash_kexec`, `#2 asm_exc_page_fault`), an `[exception RIP: …]` block with a `RIP: <hex>  RSP:` register line, and post-exception frames with distinct bracket (stack) and `at` (instruction) addresses, so the frame-selection awk, the `at`-address extraction, the RIP regex (two-space and single-space forms), the valid-symbol branch, the SysRq short-circuit-after-disassembly, the nonzero `crash` exit, and the sudo `vmlinux` fallback are each exercised end-to-end. Tests:
+
+```
+test_script_never_classifies_and_documents_taxonomy
+test_script_is_syntactically_valid_bash
+test_missing_dump_is_inconclusive_and_exits_nonzero
+test_missing_vmlinux_is_inconclusive_and_exits_nonzero
+test_sysrq_induced_capture_short_circuits_with_exit_zero
+test_human_review_required_reports_dis_r_and_exits_zero
+test_ret_extraction_uses_at_instruction_addr_not_bracket_stack_addr
+test_rip_extraction_tolerates_single_space_before_rsp
+test_crash_could_not_load_when_no_panic_line
+test_vmlinux_default_path_uses_invoking_users_home_under_sudo
+test_crash_nonzero_exit_after_panic_header_is_could_not_load
+test_valid_symbol_exception_disassembles_to_the_exception_rip
+```
+
+**Step 2:** FAIL. **Step 3: Write**
+
+```bash
+#!/usr/bin/env bash
+# scripts/vmcore-triage.sh <dump.<ts>> [vmlinux]
+#
+# Prints the spec § 5 evidence blocks from `crash` and ends with an
+# INCONCLUSIVE line; a human applies the § 5 table and a second reviewer
+# concurs (C12). This script NEVER classifies a crash as
+# CONTROL-FLOW-MISMATCH / BAD-TARGET-CONSUMED / UAF-SUPPORTED — that
+# judgment is spec § 5's, made by a human reading the evidence report.
+#
+# Testability: set CRASH_BIN to point at a fake `crash` binary (tests use
+# one that echoes canned output) instead of the real /usr/bin/crash, so this
+# script is exercisable without a real vmcore.
+# Intentionally omits -e (unlike every sibling script's `set -euo pipefail`):
+# the frame/RIP/fault `grep -m1 -oE` extractions below (lines ~46-58) are
+# expected to return no match on some real `crash` output shapes, and an
+# empty extraction must fall through to the INCONCLUSIVE/human-review path
+# below rather than aborting the script. The PANIC:/crash-could-not-load
+# checks already fail safely without -e.
+set -uo pipefail
+
+dump="${1:-}"
+kver="$(uname -r)"
+# Dumps are root-owned, so this often runs under sudo where $HOME is /root; look in the invoking user's home too.
+owner_home="$(getent passwd "${SUDO_USER:-${USER:-}}" 2>/dev/null | cut -d: -f6)"
+owner_home="${owner_home:-$HOME}"
+vmlinux="${2:-${VMLINUX:-$owner_home/.local/share/vmlinux/vmlinux-$kver}}"
+crash_bin="${CRASH_BIN:-crash}"
+out="${TRIAGE_OUT:-$HOME/.local/state/vmcore-triage}"
+mkdir -p "$out"
+rep="$out/triage-$(date +%Y%m%dT%H%M%S).txt"
+
+[ -r "$dump" ] || { echo "VERDICT: INCONCLUSIVE reason=dump-unreadable $dump"; exit 1; }
+[ -r "$vmlinux" ] || { echo "VERDICT: INCONCLUSIVE reason=vmlinux-missing $vmlinux (Task 6 step 4)"; exit 1; }
+
+"$crash_bin" -s "$vmlinux" "$dump" > "$rep" 2>&1 <<'EOF'
+sys
+log | tail -120
+bt
+bt -e
+bt -f
+kmem -s | grep -E "cfs_rq|task_group|cgroup|psi|kmalloc-(64|96|128|192|256|512)"
+ps -A | head -40
+runq
+quit
+EOF
+crash_rc=$?
+# A PANIC: header followed by a nonzero exit (e.g. crash failed to read task data)
+# is not a loaded dump; do not report partial output as evidence.
+[ "$crash_rc" -eq 0 ] || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load exit=$crash_rc report=$rep"; exit 1; }
+grep -q "PANIC:" "$rep" || { echo "VERDICT: INCONCLUSIVE reason=crash-could-not-load report=$rep"; exit 1; }
+
+# Which frame? For the panicking task `crash` numbers the panic machinery first
+# (#0 machine_kexec, #1 __crash_kexec, ... asm_exc_page_fault) and then prints the
+# interrupted context as an "[exception RIP: ...]" block followed by its saved
+# registers. The frame we need — the caller whose return address sits right after
+# the call that reached the bad RIP — is the FIRST frame printed AFTER that block.
+# In `bt` output the bracketed value is the frame's STACK address; the instruction
+# (return) address is the one after "at", which is what `dis -r` needs.
+ret=$(awk '/\[exception RIP:/{f=1; next} f && /^ *#[0-9]+ .* at ffffffff[0-9a-f]+/{ match($0, / at ffffffff[0-9a-f]+/); print substr($0, RSTART+4, RLENGTH-4); exit }' "$rep")
+frame_source="first-frame-after-exception-block"
+# The heuristic holds when the exception RIP is NOT a valid text address (our class:
+# 0x283, 0x0, a freed page): crash cannot synthesize a frame for it, so the first frame
+# after the block carries the caller's return address. When the exception RIP resolves
+# to a real symbol, the faulting instruction is at the exception RIP; handled below.
+exc=$(grep -m1 -oE "\[exception RIP: [^]]*\]" "$rep")
+valid_symbol_exception=0
+case "$exc" in
+  ""|*"unknown or invalid address"*) ;;
+  *) valid_symbol_exception=1 ;;
+esac
+if [ -z "$ret" ]; then
+  # No exception block (e.g. crash on a non-panic task or truncated bt): fall back to
+  # frame #1 and say so, because #1 may be panic machinery — the human must check.
+  ret=$(grep -m1 -E "^ *#1 " "$rep" | grep -oE " at ffffffff[0-9a-f]+" | awk '{print $2}')
+  frame_source="fallback-frame-1-verify-manually"
+fi
+# RIP: prefer the saved-register line of the exception block ("RIP: <hex>  RSP: ...",
+# any run of whitespace before RSP:); fall back to the oops form "RIP: 0010:0x283" /
+# "RIP: 0010:sym+0x10" only when its tail is bare hex (unresolved symbol).
+rip=$(grep -m1 -oE "RIP: [0-9a-f]+[[:space:]]+RSP:" "$rep" | awk '{print $2}')
+if [ -z "$rip" ]; then
+  rip=$(grep -m1 -oE "RIP: [0-9a-f]{4}:(0x)?[0-9a-f]+" "$rep" | awk -F: '{print $3}' | sed 's/^0x//')
+fi
+# When the exception RIP resolves to a real symbol, the faulting instruction is at the
+# exception RIP itself, so disassemble up to and including it. Which function the first
+# post-exception frame belongs to is NOT asserted here (in crash's x86_64 bt it is often
+# the caller, taken from the return address at the exception RSP): confirm by hand.
+if [ "$valid_symbol_exception" = 1 ] && [ -n "$rip" ]; then
+  ret="$rip"
+  frame_source="exception-rip-is-a-valid-symbol:disassembling-to-the-faulting-instruction"
+fi
+fault=$(grep -m1 -oE "address: (0x)?[0-9a-f]+" "$rep" | awk '{print $2}')
+
+{
+  echo "### call-site disassembly [frame_source=$frame_source] ret=$ret rip=$rip fault=$fault"
+  echo "### dis -r ADDR disassembles from the routine start UP TO AND INCLUDING ADDR: the LAST line is the"
+  echo "### instruction at the saved return PC; the TRANSFER (call/jmp) is the line immediately BEFORE it."
+  [ -n "$ret" ]   && echo "### command: dis -r $ret"
+  [ -n "$rip" ]   && echo "### command: kmem $rip"
+  [ -n "$fault" ] && echo "### command: kmem $fault"
+  [ -n "$ret" ]   || echo "### NOTE: no return address extracted; dis -r skipped"
+  [ -n "$rip" ]   || echo "### NOTE: no RIP extracted; kmem RIP skipped"
+  [ -n "$fault" ] || echo "### NOTE: no fault address extracted; kmem fault skipped"
+  {
+    [ -n "$ret" ]   && echo "dis -r $ret"
+    [ -n "$rip" ]   && echo "kmem $rip"
+    [ -n "$fault" ] && echo "kmem $fault"
+    echo "quit"
+  } | "$crash_bin" -s "$vmlinux" "$dump" 2>&1
+  second_rc=$?
+  [ "$second_rc" -eq 0 ] || echo "### NOTE: second crash run exited $second_rc; the block above may be incomplete"
+} >> "$rep"
+
+if grep -q "sysrq_handle_crash" "$rep"; then
+  echo "VERDICT: INCONCLUSIVE reason=sysrq-induced (capture proof, not a real crash) report=$rep"
+  exit 0
+fi
+
+echo "evidence: $rep"
+echo "apply spec § 5: compare RIP=$rip with the register/immediate that supplied the transfer target (see the [exception RIP:] register block printed by bt, bt -e, and the dis -r block, whose transfer is the line BEFORE the last; frame_source=$frame_source); for memory-sourced operands run: $crash_bin -s $vmlinux $dump  then  rd -x <addr> 1"
+echo "VERDICT: INCONCLUSIVE reason=human-review-required report=$rep"
+exit 0
+```
+
+**Step 4:** tests pass. Fetch the dbgsym without root and verify the Build ID (hard gate W0a):
+
+```bash
+mkdir -p ~/.local/share/vmlinux && cd /tmp
+# Primary: list the ddebs pool, pick whichever of the two names exists (pull-lp-ddebs is not installed here), download it, then extract:
+POOL="http://ddebs.ubuntu.com/pool/main/l/linux-hwe-6.17/"
+DDEB=$(curl -fsSL "$POOL" | grep -oE 'linux-image-(unsigned-)?6\.17\.0-29-generic-dbgsym_[^"]+_amd64\.ddeb' | sort -u | head -1)
+[ -n "$DDEB" ] || { echo "no 6.17.0-29 dbgsym in the pool: P5 unmet"; exit 1; }
+curl -fLo "/tmp/$DDEB" "$POOL$DDEB"                      # ~1 GiB
+dpkg -x "/tmp/$DDEB" /tmp/dbg && cp /tmp/dbg/usr/lib/debug/boot/vmlinux-6.17.0-29-generic ~/.local/share/vmlinux/
+# Build-ID match against the running kernel:
+readelf -n ~/.local/share/vmlinux/vmlinux-6.17.0-29-generic | grep -o "Build ID: [0-9a-f]*"
+python3 - <<'PY'
+import struct; d=open('/sys/kernel/notes','rb').read(); o=0
+while o+12<=len(d):
+    n,s,t=struct.unpack('<III',d[o:o+12]); name=d[o+12:o+12+n].rstrip(b'\0'); desc=d[o+12+((n+3)&~3):o+12+((n+3)&~3)+s]
+    if name==b'GNU' and t==3: print('running Build ID:',desc.hex())
+    o+=12+((n+3)&~3)+((s+3)&~3)
+PY
+```
+Expected: the two Build IDs are identical; otherwise P5 is unmet and W3 must not run. Then (root) `sudo crash -s ~/.local/share/vmlinux/vmlinux-6.17.0-29-generic <<< 'sys' | head -5` must print the `KERNEL:`/`RELEASE:` block: the installed `crash` 8.0.4 was patched for 6.14 HWE dumps, not 6.17, so its ability to read this kernel is proven here, not assumed.
+
+**Step 5: Commit** `claude/claude-fable-5-1: add vmcore triage evidence script for bd-dea.10 § 5`.
+
+---
+
+## Task 7: Root-phase installer (human runs with sudo) — spec W2
+
+Precondition P6b: the operator has approved the lockup/panic sysctls in a live message and W3 (P6a) passed; otherwise run with `--no-panic-sysctls`, which skips the sysctl file.
+
+**Files:**
+- Create: `scripts/install-crash-capture.sh`
+- Modify: `tests/test_crash_capture_artifacts.py` (append: `bash -n` + assert it never calls `reboot`/`shutdown`/`sysrq-trigger`)
+
+```bash
+#!/usr/bin/env bash
+# scripts/install-crash-capture.sh — root phase for bd-dea.10 D1/D2 artifacts.
+# OPERATOR-ONLY: sudo bash scripts/install-crash-capture.sh [--with-netconsole] [--no-panic-sysctls]
+#
+# Testable without root: DESTDIR-style overrides let tests redirect every
+# install target and stub the systemctl/sysctl binaries.
+#   SYSCTL_D=<dir>       default /etc/sysctl.d
+#   LIBEXEC_DIR=<dir>    default /usr/local/libexec
+#   SYSTEMD_DIR=<dir>    default /etc/systemd/system
+#   SYSTEMCTL_BIN=<bin>  default systemctl
+#   SYSCTL_BIN=<bin>     default sysctl
+#   SKIP_ROOT_CHECK=1    skip the `id -u` == 0 check (tests only)
+set -euo pipefail
+
+[ "${SKIP_ROOT_CHECK:-0}" = "1" ] || [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 2; }
+
+R="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SYSCTL_D="${SYSCTL_D:-/etc/sysctl.d}"
+LIBEXEC_DIR="${LIBEXEC_DIR:-/usr/local/libexec}"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+SYSCTL_BIN="${SYSCTL_BIN:-sysctl}"
+
+with_nc=0
+no_sysctl=0
+for a in "$@"; do
+  case "$a" in
+    --with-netconsole) with_nc=1 ;;
+    --no-panic-sysctls) no_sysctl=1 ;;
+    *) echo "unknown argument: $a" >&2; exit 2 ;;
+  esac
+done
+
+if [ "$no_sysctl" = 0 ]; then
+  install -D -m 0644 "$R/config/sysctl.d/90-jeff-ubuntu-crash-capture.conf" \
+    "$SYSCTL_D/90-jeff-ubuntu-crash-capture.conf"
+  "$SYSCTL_BIN" --system >/dev/null
+else
+  # A stale drop-in from an earlier approved install must not survive a declined P6b.
+  stale="$SYSCTL_D/90-jeff-ubuntu-crash-capture.conf"
+  if [ -f "$stale" ]; then
+    rm -f "$stale"
+    # Do not leave the panic settings live on a declined path: restore the host's
+    # pre-P6b values (spec E8: softlockup_panic=0, hardlockup_panic=0, panic=0;
+    # panic_on_oops is owned by kdump-config and is left alone).
+    "$SYSCTL_BIN" -q -w kernel.softlockup_panic=0 kernel.hardlockup_panic=0 kernel.panic=0
+    echo "WARNING: removed stale $stale and restored kernel.softlockup_panic=0 kernel.hardlockup_panic=0 kernel.panic=0 (pre-P6b values)"
+  fi
+fi
+
+install -D -m 0755 "$R/scripts/favored-core-cap.sh" "$LIBEXEC_DIR/favored-core-cap.sh"
+install -D -m 0644 "$R/systemd/favored-core-cap.service" "$SYSTEMD_DIR/favored-core-cap.service"
+
+if [ "$with_nc" = 1 ]; then
+  install -D -m 0755 "$R/scripts/netconsole-eno2.sh" "$LIBEXEC_DIR/netconsole-eno2.sh"
+  install -D -m 0644 "$R/systemd/netconsole-eno2.service" "$SYSTEMD_DIR/netconsole-eno2.service"
+fi
+
+"$SYSTEMCTL_BIN" daemon-reload
+[ "$with_nc" = 1 ] && "$SYSTEMCTL_BIN" enable --now netconsole-eno2.service
+
+echo "installed; favored-core-cap.service is NOT enabled yet (W4 does that after the SysRq-c proof)"
+```
+
+Run order inside window W (spec § D4), every step OPERATOR-ONLY: W2 `sudo bash scripts/install-crash-capture.sh --with-netconsole --no-panic-sysctls` (drop `--with-netconsole` if Task 4 said UNAVAILABLE) → C7 probe → W3 SysRq proof → W4 `sudo bash scripts/install-crash-capture.sh` (adds the sysctl file; **only if P6b approved**, otherwise skip) → `bash scripts/assert-crash-capture.sh` (or `--pre` on the declined path). MacBook side: `scp scripts/netconsole-receiver.sh macbook:~/.local/libexec/` and install the plist per `~/.claude/skills/launchd-plist-template/SKILL.md` (substitute `@HOME@`, `launchctl bootstrap gui/$(id -u) …`).
+
+**Commit** `claude/claude-fable-5-1: add root-phase crash-capture installer (bd-dea.10 W2)`.
+
+---
+
+## Task 8: Maintenance window W0–W4 (human + deploy-owner; not scriptable by design)
+
+Order is a gate ladder; do not skip forward.
+
+0. **W0 gates:** (a) Task 6 step 4 Build-ID match printed and the live-mode `crash` check passed; (b) `apt-get install -y iputils-arping`, then Task 4 step 1 result recorded; (c) OPERATOR-ONLY: edit `/etc/default/grub.d/kdump-tools.cfg` so the crashkernel words read `crashkernel=1536M,high crashkernel=128M,low`, run `update-grub`, keep the `.bak-<date>` copy the earlier fixes left.
+1. **W1 memtest:** drain so that it survives the window's reboots: `systemctl --user disable --now ezgha.service` (enabled unit + `Linger=yes` would otherwise restart the fleet on every reboot); confirm `systemctl --user is-enabled ezgha.service` prints `disabled` and container count 0; `bash scripts/queue_memtest.sh` (existing) → OPERATOR-ONLY: reboot into Memtest86+ (the human triggers the reboot; never an agent) → ≥ 4 passes → photo → comment on bd-memtest501. **Any error: hard stop** — do not continue to W1b/W2/W3; open the RAM path (bd-hwpath28) and end the window.
+2. **W1b BIOS (operator may decline, spec § 7):** set the CPU power limits to Intel Default Settings (PL1 = 125 W; leave PL2 = 253 W and TVB); photograph the screen; after boot `cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw` must print 125000000 → C11. If declined: comment `PL1 declined` on bd-dea.10, use `PL1=253W-declined` in the W5 config string, and read the S3 outcome with its cap-only branch.
+3. **W2:** verify `kexec_crash_loaded=1` and `kexec_crash_size ≥ 1610612736`; run Task 7 with `--no-panic-sysctls`; C7 probe.
+4. **W3 SysRq-c proof** (requires P6a; still drained — re-check `docker ps --filter label=ezgha=managed` = 0 and the unit still disabled after the memtest reboot; human watching). OPERATOR-ONLY, typed by the human, never scripted: as root enable SysRq and write the character `c` to the SysRq trigger file under `/proc`. Expect: crash kernel boots, `kdump-tools-dump.service` writes `/var/crash/<ts>/dump.<ts>`, host returns on its own. After return: C2, C3, C4 (if the kdump kernel's boot is not persisted in the journal as `-b -1`, C4 fails closed; the fallback evidence is `/var/crash/<ts>/dmesg.<ts>` written by kdump-tools, which the operator records instead), then `scripts/vmcore-triage.sh /var/crash/<ts>/dump.<ts>` → `VERDICT: INCONCLUSIVE reason=sysrq-induced`; the report must show `PANIC:`, `sysrq_handle_crash` in `bt`, a `bt -e` section and a `dis -r` header with `frame_source=` (the fallback label is expected: a SysRq panic has no exception block), and load in `crash` without a "do not match" error → C10. If no dump or `crash` rejects it: fix the named gap (reservation, dbgsym, `crash`/`makedumpfile` version), reboot, repeat **once** (P6a covers two attempts in total; a third needs a new live approval); record the outcome in bd-dea.10. Do not repeat the SysRq for a missing exception block: that is the expected shape of a SysRq dump. On success record on the bead exactly: `br --db /home/jleechan/projects_other/user_scope/.beads/beads.db comments add bd-dea.10 "W3 PASS dump=/var/crash/<ts>/dump.<ts>"` — Task 9 binds its capture-proof field to that record.
+5. **W4 (OPERATOR-ONLY; bd-lck is merged as user_scope PR #57 and installed, so `apply` writes the durable `/var/lib/favored-core-cap/cpuN` record C5 checks):** if the operator approved P6b (and W3 passed), run Task 7 again without `--no-panic-sysctls` → C1; if P6b was declined, do NOT rerun Task 7, run `scripts/assert-crash-capture.sh --pre` → C2 and record it on the bead: `br --db /home/jleechan/projects_other/user_scope/.beads/beads.db comments add bd-dea.10 "P6b declined"` (Task 9 reads that record; the W5 config string is derived from it); if P6a was declined, record C3/C4/C10 as `WAIVED (P6a declined)`; `sudo systemctl enable --now favored-core-cap.service && /usr/local/libexec/favored-core-cap.sh assert` → C5; `sudo cat /sys/kernel/debug/x86/sched_itmt_enabled` must print `Y` → C6.
+
+---
+
+## Task 9: W5 — start the fleet and the soak
+
+```bash
+systemctl --user enable --now ezgha.service        # re-enable: W1 disabled it so the drain survived reboots
+sleep 120 && ./doctor-runner                       # C9: 10 slots, none DOWN / IDLE-STARVED
+# Resolve the soak provenance from LIVE state. Every field has exactly two legitimate states,
+# each backed by a record; anything else ABORTS (no unexpected state is ever relabelled).
+BEADS=/home/jleechan/projects_other/user_scope/.beads/beads.db
+notes=$(br --db "$BEADS" show bd-dea.10 2>/dev/null)
+# PL1: 125 W, or 253 W only with an explicit "PL1 declined" record on bd-dea.10.
+pl1_uw=$(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw)
+case "$pl1_uw" in
+  125000000) pl1="PL1=125W" ;;
+  253000000) echo "$notes" | grep -q "PL1 declined" && pl1="PL1=253W-declined" || { echo "ABORT: PL1 is 253 W but bd-dea.10 has no 'PL1 declined' record (W1b not done or not recorded)"; exit 1; } ;;
+  *) echo "ABORT: unexpected PL1 $pl1_uw uW"; exit 1 ;;
+esac
+# Lockup panics: all three on (P6b approved, file present) or all three at the E8 values with no file (P6b declined, recorded); partial drift aborts.
+sl=$(sysctl -n kernel.softlockup_panic); hl=$(sysctl -n kernel.hardlockup_panic); kp=$(sysctl -n kernel.panic); f=/etc/sysctl.d/90-jeff-ubuntu-crash-capture.conf
+if [ "$sl$hl$kp" = "1110" ] && [ -f "$f" ]; then panics="lockup-panics=on"
+elif [ "$sl$hl$kp" = "000" ] && [ ! -f "$f" ] && echo "$notes" | grep -q "P6b declined"; then panics="lockup-panics=P6b-declined"
+else echo "ABORT: lockup-panic state softlockup=$sl hardlockup=$hl panic=$kp file=$([ -f "$f" ] && echo present || echo absent) matches neither the approved nor the recorded-declined state"; exit 1; fi
+[ "$(sysctl -n kernel.watchdog)$(sysctl -n kernel.nmi_watchdog)$(sysctl -n kernel.soft_watchdog)" = "111" ] || { echo "ABORT: a lockup detector is off"; exit 1; }
+# Cap, capture, netconsole: each must be in a proven state or an explicitly recorded waived state.
+/usr/local/libexec/favored-core-cap.sh assert || { echo "ABORT: cap not applied (W4 incomplete)"; exit 1; }
+for c in 0 1 2 3; do [ -s /var/lib/favored-core-cap/cpu$c ] || { echo "ABORT: no durable pre-S1 record for cpu$c"; exit 1; }; done
+[ "$(cat /sys/kernel/kexec_crash_loaded)" = 1 ] || { echo "ABORT: kdump not armed"; exit 1; }
+[ "$(cat /sys/kernel/kexec_crash_size)" -ge 1610612736 ] || { echo "ABORT: crashkernel reservation below 1.5 GiB (W0c reboot missing)"; exit 1; }
+# Capture proof: bound to the exact W3 record (written by Task 8 step 4 after C3/C4/C10), not to any dump on disk.
+w3dump=$(echo "$notes" | grep -oE "W3 PASS dump=/var/crash/[^ ]+" | tail -1 | cut -d= -f2)
+if [ -n "$w3dump" ] && [ -s "$w3dump" ]; then capture="capture-proof=W3:$(basename "$(dirname "$w3dump")")"
+elif echo "$notes" | grep -q "P6a declined"; then capture="capture-proof=WAIVED-P6a"
+else echo "ABORT: no 'W3 PASS dump=' record with an existing dump, and no 'P6a declined' record"; exit 1; fi
+ncs=$(systemctl is-active netconsole-eno2.service 2>/dev/null || true); nce=$(systemctl is-enabled netconsole-eno2.service 2>/dev/null || true)
+# on: active+enabled. WAIVED: not active, and the unit is either disabled or was never installed
+# (is-enabled prints not-found), with an UNAVAILABLE record. A unit that exists but failed aborts.
+if [ "$ncs" = active ] && [ "$nce" = enabled ]; then nc="netconsole=on"
+elif [ "$ncs" != active ] && { [ "$nce" = disabled ] || [ "$nce" = not-found ]; } && echo "$notes" | grep -q "netconsole: UNAVAILABLE"; then nc="netconsole=WAIVED"
+else echo "ABORT: netconsole unit is $ncs/$nce without a matching record (a failed unit is not a waiver)"; exit 1; fi
+soakctl start "favcore-cap-5500-10runners-$(date +%Y%m%d)" --target 400 --bead bd-dea.10 \
+  --config "$(uname -r) nohz=off; $pl1; cpu0-3 scaling_max<=5.5GHz; 10 ephemeral runners; $panics; $capture; kdump armed $(( $(cat /sys/kernel/kexec_crash_size) / 1048576 ))MiB; $nc"
+soakctl status                                     # C8 (timer from Task 5 must be active)
+```
+
+Record the start in bd-dea.10 and in `~/roadmap/jeff-ubuntu/design-2026-09-26-crash-mitigation.md` § Status.
+
+---
+
+## Task 10: After a crash or at 200 h / 400 h — decision execution
+
+- **Crash:** within 24 h run Task 6's script on the newest dump, apply spec § 5 steps 1–2 to the report (reconstruct the transfer from the `dis -r` block, checking `frame_source=`; compare `RIP` with the exception-frame register or re-read immediate/trampoline; for UAF-SUPPORTED, demonstrate the lifetime violation with `kmem`, list walks, and the pre-crash teardown log), and post `S1 CLASS <CONTROL-FLOW-MISMATCH|BAD-TARGET-CONSUMED|UAF-SUPPORTED> <n>` or `S1 INCONCLUSIVE <gap>` with the report path to bd-dea.10. Ask Codex to re-read the same report and add a concurring or dissenting `br` comment (C12). Conclusion beads (S2a kernel branch, S2c BIOS/RMA) open only under spec § 5 step 3: SOFTWARE-SUPPORTED needs two UAF-SUPPORTED dumps or one matching a named upstream fix; HARDWARE-SUPPORTED needs two CONTROL-FLOW-MISMATCH dumps **and** CPU-specific non-vmcore corroboration. A single class never opens S2a or S2c. Exploratory single-variable steps (S2d ITMT off, S2e C-state clamp) follow the spec's S1 outcome table instead (§ D4), each as a new soak after closing S1. The soak clock records elapsed as data.
+- **200 h checkpoint clean:** do not close or restart the soak (`soakctl` resets `started_epoch` on restart, which would push promotion to 600 h); record the checkpoint in bd-dea.10 and continue toward the 400 h target.
+- **400 h clean:** post `S1 CLEAN 400h` and open the S3 reverse-test bead (bd-lck landed before W4, so the durable pre-S1 record exists). S3 transition, OPERATOR-ONLY: `sudo systemctl disable --now favored-core-cap.service` (ExecStop reverts to the saved limits; disabled = no re-apply at boot; proof: `systemctl is-enabled` prints `disabled` and `favored-core-cap.sh assert-off` prints `PASS S3-capoff`, meaning every cpu0–3 `scaling_max_freq` equals the pre-S1 limit recorded at W4 in `/var/lib/favored-core-cap/cpuN` — not necessarily `cpuinfo_max_freq`, since Task 2 deliberately preserves a pre-existing lower limit — and no `/run/favored-core-cap/cpuN` save file remains), set `FAVORED_CORE_EXPECT=off` for soak-watch so every tick proves the off state, start a new soak named `favcore-off-<date>` with `cap=off` and PL1 as recorded in the S1 config (`125W` or `253W-declined`), target 400 h. Interpret S3 exactly as the spec's S1 outcome table (§ D4, "400 h clean" row): a returning crash on cpu0–3 puts the cap back permanently and yields a § 5 class; the S3 return is an experimental outcome, not corroboration, and S2c/RMA opens only under § 5 step 3's full condition (two mismatch dumps plus a decoded core-bank MCE or diagnostic-tool FAIL); a clean 400 h S3 with PL1 restored records "PL1 alone was sufficient" as a hypothesis and opens no S2c/RMA; a clean 400 h cap-only S3 (PL1 declined) is inconclusive and the next variable is S2e. Do not open S2c at this point.
+
+---
+
+## Task 11: Bookkeeping
+
+- user_scope: `br --db .beads/beads.db comments add bd-dea.10 "<design paths, W schedule, precondition status>"`; close bd-postreboot28 into S2a; note bd-py7 blocked on the S1 verdict; note bd-microcode ranked below S2c (spec § 6).
+- roadmap: update `~/roadmap/jeff-ubuntu/design-2026-09-26-crash-mitigation.md` § Status after each task; append to `~/roadmap/nextsteps-2026-08-01-jeff-ubuntu-crash.md` when W runs.
+- ez-gh-actions: `bash tests/forbid_host_reboot_primitives_test.sh` must still print `PASS` (C13) — this repo only carries the two design documents.

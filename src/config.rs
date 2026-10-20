@@ -22,6 +22,11 @@ pub struct Config {
     pub runner: RunnerConfig,
     pub limits: Limits,
     pub policy: Policy,
+    /// Persistent per-slot and fleet-wide admission circuit policy. This is
+    /// intentionally separate from alert streaks: it controls whether new
+    /// containers may be started, never VM or host lifecycle.
+    #[serde(default)]
+    pub failure_ladder: FailureLadderConfig,
     #[serde(default)]
     pub alert: AlertConfig,
     #[serde(default)]
@@ -30,6 +35,41 @@ pub struct Config {
     pub canary: CanaryConfig,
     #[serde(default)]
     pub invariant_sampler: InvariantSamplerConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FailureLadderConfig {
+    /// Failed local starts for one slot within the rolling window before its
+    /// circuit opens.
+    #[serde(default = "default_slot_failure_threshold")]
+    pub slot_failure_threshold: u32,
+    /// Rolling window used to count local start failures.
+    #[serde(default = "default_slot_failure_window_secs")]
+    pub slot_failure_window_secs: u64,
+    /// How long an opened slot is excluded from allocation.
+    #[serde(default = "default_slot_cooldown_secs")]
+    pub slot_cooldown_secs: u64,
+    /// Concurrent distinct open slots that pause all new admissions. At
+    /// runtime this is capped to the configured runner count for small legacy
+    /// fleets, so the default of three remains reachable for 1-2 slot configs.
+    #[serde(default = "default_fleet_open_slot_threshold")]
+    pub fleet_open_slot_threshold: u32,
+    /// How long a fleet admission pause lasts before a gradual retry.
+    #[serde(default = "default_fleet_cooldown_secs")]
+    pub fleet_cooldown_secs: u64,
+}
+
+impl Default for FailureLadderConfig {
+    fn default() -> Self {
+        Self {
+            slot_failure_threshold: default_slot_failure_threshold(),
+            slot_failure_window_secs: default_slot_failure_window_secs(),
+            slot_cooldown_secs: default_slot_cooldown_secs(),
+            fleet_open_slot_threshold: default_fleet_open_slot_threshold(),
+            fleet_cooldown_secs: default_fleet_cooldown_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +94,12 @@ pub struct AlertConfig {
     /// pipeline is still alive. Set to 0 to disable.
     #[serde(default = "default_deadman_threshold_seconds")]
     pub deadman_threshold_seconds: u64,
+    /// Alert when registration failures exceed this burst threshold.
+    #[serde(default = "default_registration_burst_threshold")]
+    pub registration_burst_threshold: u32,
+    /// Alert when reclaim loops exceed this burst threshold.
+    #[serde(default = "default_reclaim_burst_threshold")]
+    pub reclaim_burst_threshold: u32,
 }
 
 impl Default for AlertConfig {
@@ -66,6 +112,8 @@ impl Default for AlertConfig {
             email_from: None,
             log_path: None,
             deadman_threshold_seconds: default_deadman_threshold_seconds(),
+            registration_burst_threshold: default_registration_burst_threshold(),
+            reclaim_burst_threshold: default_reclaim_burst_threshold(),
         }
     }
 }
@@ -74,7 +122,11 @@ impl Default for AlertConfig {
 #[serde(deny_unknown_fields)]
 pub struct QueueMonitorConfig {
     /// Enable daemon-side queued GitHub Actions run monitoring.
-    #[serde(default)]
+    ///
+    /// **Blast Radius Note**: When enabled, this actively polls the GitHub API for queued workflows.
+    /// Under severe API rate-limiting conditions, this secondary polling could compete with the
+    /// core runner provisioning loop for budget, though the client is configured to back off.
+    #[serde(default = "default_queue_monitor_enabled")]
     pub enabled: bool,
     /// Repository to monitor as `owner/repo`. Defaults to `github.target` for repo-scoped configs.
     pub repo: Option<String>,
@@ -107,7 +159,7 @@ pub struct QueueMonitorConfig {
 impl Default for QueueMonitorConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_queue_monitor_enabled(),
             repo: None,
             tail_warn_minutes: default_queue_tail_warn_minutes(),
             check_interval_seconds: default_queue_check_interval_seconds(),
@@ -269,6 +321,11 @@ pub struct RunnerConfig {
     /// headroom (bead ez-gh-actions-yz6b, 2026-07-10 swap-thrash incident).
     #[serde(default = "default_guest_reserve_mb")]
     pub guest_reserve_mb: u64,
+    /// Physical-host RAM reserved outside the Docker VM. A configured
+    /// `vm_total_mb` must fit within `physical host RAM - host_reserve_mb`.
+    /// Zero preserves behavior for configurations written before this field.
+    #[serde(default)]
+    pub host_reserve_mb: u64,
     /// Minimum memory a single runner may be budgeted before the daemon
     /// refuses to start rather than silently clamping lower. Research-
     /// validated for this fleet's jest+playwright+rust workloads — do not
@@ -379,6 +436,16 @@ pub struct Limits {
     /// Disk exhaustion is the dominant self-hosted runner failure mode.
     #[serde(default = "default_min_free_disk_gb")]
     pub min_free_disk_gb: u64,
+    /// Optional systemd cgroup/slice parent for every runner container.
+    #[serde(default)]
+    pub cgroup_parent: Option<String>,
+    /// Opt-in: relax the per-container `cpus` ceiling from
+    /// `daemon_ncpu / runner_count` to `min(cfg.limits.cpus, daemon_ncpu)`.
+    /// Honored ONLY when the daemon is verified VM-contained AND finite
+    /// positive ncpu is discovered; otherwise `effective_limits` returns
+    /// `Err` and `Serve` bails before mutating any runner. Default `false`.
+    #[serde(default)]
+    pub cpu_burst: bool,
 }
 
 fn default_min_free_disk_gb() -> u64 {
@@ -389,12 +456,44 @@ fn default_failure_alert_threshold() -> u32 {
     3
 }
 
+fn default_slot_failure_threshold() -> u32 {
+    3
+}
+
+fn default_slot_failure_window_secs() -> u64 {
+    600
+}
+
+fn default_slot_cooldown_secs() -> u64 {
+    900
+}
+
+fn default_fleet_open_slot_threshold() -> u32 {
+    3
+}
+
+fn default_fleet_cooldown_secs() -> u64 {
+    600
+}
+
 fn default_alert_cooldown_seconds() -> u64 {
     900
 }
 
 fn default_deadman_threshold_seconds() -> u64 {
     3600
+}
+
+fn default_registration_burst_threshold() -> u32 {
+    5
+}
+
+fn default_reclaim_burst_threshold() -> u32 {
+    5
+}
+
+fn default_queue_monitor_enabled() -> bool {
+    true
 }
 
 fn default_queue_tail_warn_minutes() -> u64 {
@@ -544,6 +643,7 @@ impl Config {
                 serve_tick_seconds: default_serve_tick_seconds(),
                 vm_total_mb: None,
                 guest_reserve_mb: default_guest_reserve_mb(),
+                host_reserve_mb: 0,
                 runner_floor_mb: default_runner_floor_mb(),
                 wheelhouse_host_path: None,
                 pip_cache_host_path: None,
@@ -554,10 +654,13 @@ impl Config {
                 cpus,
                 pids: 512,
                 min_free_disk_gb: default_min_free_disk_gb(),
+                cgroup_parent: None,
+                cpu_burst: false,
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
             },
+            failure_ladder: FailureLadderConfig::default(),
             alert: AlertConfig {
                 failure_alert_threshold: default_failure_alert_threshold(),
                 alert_cooldown_secs: default_alert_cooldown_seconds(),
@@ -566,6 +669,8 @@ impl Config {
                 email_from: None,
                 log_path: None,
                 deadman_threshold_seconds: default_deadman_threshold_seconds(),
+                registration_burst_threshold: default_registration_burst_threshold(),
+                reclaim_burst_threshold: default_reclaim_burst_threshold(),
             },
             queue_monitor: QueueMonitorConfig::default(),
             canary: CanaryConfig::default(),
@@ -619,6 +724,9 @@ impl Config {
         if self.limits.pids < 1 {
             anyhow::bail!("limits.pids must be at least 1 (got {})", self.limits.pids);
         }
+        if let Some(parent) = &self.limits.cgroup_parent {
+            validate_cgroup_parent(parent)?;
+        }
         require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
         if self.runner.count < 1 {
             anyhow::bail!(
@@ -639,6 +747,26 @@ impl Config {
         require_at_least_one(
             "alert.failure_alert_threshold",
             self.alert.failure_alert_threshold as u64,
+        )?;
+        require_at_least_one(
+            "failure_ladder.slot_failure_threshold",
+            self.failure_ladder.slot_failure_threshold as u64,
+        )?;
+        require_at_least_one(
+            "failure_ladder.slot_failure_window_secs",
+            self.failure_ladder.slot_failure_window_secs,
+        )?;
+        require_at_least_one(
+            "failure_ladder.slot_cooldown_secs",
+            self.failure_ladder.slot_cooldown_secs,
+        )?;
+        require_at_least_one(
+            "failure_ladder.fleet_open_slot_threshold",
+            self.failure_ladder.fleet_open_slot_threshold as u64,
+        )?;
+        require_at_least_one(
+            "failure_ladder.fleet_cooldown_secs",
+            self.failure_ladder.fleet_cooldown_secs,
         )?;
         require_at_least_one("alert.alert_cooldown_secs", self.alert.alert_cooldown_secs)?;
         require_non_empty_path("alert.log_path", &self.alert.log_path)?;
@@ -721,6 +849,37 @@ impl Config {
         Ok(())
     }
 
+    /// Fail closed when an explicitly configured Docker VM would consume the
+    /// physical host's reserved envelope. The check is separate from the
+    /// syntactic/semantic config validation because callers must supply the
+    /// physical host capacity and should only apply it when a VM total is
+    /// configured (the legacy auto-detected path remains unchanged).
+    pub fn validate_host_envelope(&self, physical_host_mem_mb: u64) -> Result<()> {
+        self.validate()?;
+        let Some(vm_total_mb) = self.runner.vm_total_mb else {
+            return Ok(());
+        };
+        let available = physical_host_mem_mb
+            .checked_sub(self.runner.host_reserve_mb)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runner.host_reserve_mb ({}) exceeds physical host memory ({} MB)",
+                    self.runner.host_reserve_mb,
+                    physical_host_mem_mb
+                )
+            })?;
+        if vm_total_mb > available {
+            anyhow::bail!(
+                "configured VM total ({} MB) exceeds physical host envelope ({} MB total − {} MB reserve = {} MB)",
+                vm_total_mb,
+                physical_host_mem_mb,
+                self.runner.host_reserve_mb,
+                available
+            );
+        }
+        Ok(())
+    }
+
     pub fn load(path: &PathBuf) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("no config at {} — run `ezgha init` first", path.display()))?;
@@ -746,6 +905,26 @@ impl Config {
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
+}
+
+/// Check that a cgroup parent is one safe systemd unit/slice component.
+/// Docker accepts arbitrary cgroup paths, so reject separators, whitespace,
+/// and path traversal rather than passing an unsafe hierarchy to the daemon.
+fn validate_cgroup_parent(parent: &str) -> Result<()> {
+    if parent.is_empty() || parent.trim() != parent || parent == "." || parent == ".." {
+        anyhow::bail!(
+            "limits.cgroup_parent must be a non-empty systemd cgroup/slice name without surrounding whitespace"
+        );
+    }
+    if !parent
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@'))
+    {
+        anyhow::bail!(
+            "limits.cgroup_parent contains unsafe characters; use a single systemd cgroup/slice name"
+        );
+    }
+    Ok(())
 }
 
 fn is_owner_repo(value: &str) -> bool {
@@ -799,6 +978,7 @@ minimum_isolation = "container"
             serve_tick_seconds: 20,
             vm_total_mb: None,
             guest_reserve_mb: default_guest_reserve_mb(),
+            host_reserve_mb: 0,
             runner_floor_mb: default_runner_floor_mb(),
             wheelhouse_host_path: None,
             pip_cache_host_path: None,
@@ -836,7 +1016,7 @@ minimum_isolation = "container"
         assert_eq!(tiny.limits.cpus, 1.0);
         assert_eq!(tiny.alert.failure_alert_threshold, 3);
         assert_eq!(tiny.alert.alert_cooldown_secs, 900);
-        assert!(!tiny.queue_monitor.enabled);
+        assert!(tiny.queue_monitor.enabled);
         assert_eq!(tiny.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
         assert_eq!(tiny.queue_monitor.stale_hours, 8);
@@ -894,6 +1074,125 @@ minimum_isolation = "container"
     #[test]
     fn valid_config_passes_validation() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn failure_ladder_defaults_are_bounded_and_legacy_compatible() {
+        let cfg = valid_config();
+        assert_eq!(cfg.failure_ladder.slot_failure_threshold, 3);
+        assert_eq!(cfg.failure_ladder.slot_failure_window_secs, 600);
+        assert_eq!(cfg.failure_ladder.slot_cooldown_secs, 900);
+        assert_eq!(cfg.failure_ladder.fleet_open_slot_threshold, 3);
+        assert_eq!(cfg.failure_ladder.fleet_cooldown_secs, 600);
+
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 10
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let loaded = load_from_str(raw, "legacy-failure-ladder").unwrap();
+        assert_eq!(loaded.failure_ladder, FailureLadderConfig::default());
+    }
+
+    #[test]
+    fn failure_ladder_rejects_zero_boundaries() {
+        let mut cfg = valid_config();
+        cfg.failure_ladder.slot_failure_threshold = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.slot_failure_window_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.slot_cooldown_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.fleet_open_slot_threshold = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid_config();
+        cfg.failure_ladder.fleet_cooldown_secs = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn linux_fleet_example_preserves_twenty_runner_bounded_contract() {
+        let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
+            .expect("tracked Linux fleet example must parse");
+        cfg.validate()
+            .expect("tracked Linux fleet example must validate");
+        assert_eq!(cfg.runner.count, 20);
+        assert_eq!(cfg.runner.runner_floor_mb, 1400);
+        assert_eq!(cfg.runner.vm_total_mb, Some(28672));
+        assert_eq!(cfg.runner.guest_reserve_mb, 0);
+        assert_eq!(cfg.limits.memory_mb, 1400);
+        assert_eq!(cfg.limits.cpus, 1.6);
+        assert_eq!(cfg.limits.pids, 512);
+        assert_eq!(cfg.runner.image, "ezgha-runner:latest");
+        assert_eq!(cfg.limits.cgroup_parent.as_deref(), Some("actions.slice"));
+        assert_eq!(cfg.failure_ladder, FailureLadderConfig::default());
+    }
+
+    #[test]
+    fn legacy_config_without_host_reserve_or_cgroup_parent_still_loads() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 10
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg = load_from_str(raw, "legacy-host-reserve").unwrap();
+        assert_eq!(cfg.runner.host_reserve_mb, 0);
+        assert_eq!(cfg.limits.cgroup_parent, None);
+    }
+
+    #[test]
+    fn cgroup_parent_accepts_systemd_slice_name() {
+        let mut cfg = valid_config();
+        cfg.limits.cgroup_parent = Some("actions.slice".into());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn cgroup_parent_rejects_path_and_whitespace_injection() {
+        let mut cfg = valid_config();
+        for parent in ["", " ", "actions.slice/child", "../escape", "actions slice"] {
+            cfg.limits.cgroup_parent = Some(parent.into());
+            assert!(cfg.validate().is_err(), "unsafe parent: {parent:?}");
+        }
+    }
+
+    #[test]
+    fn host_envelope_rejects_vm_total_above_physical_host_minus_reserve() {
+        let mut cfg = valid_config();
+        cfg.runner.vm_total_mb = Some(60_000);
+        cfg.runner.host_reserve_mb = 4_096;
+        assert!(cfg.validate_host_envelope(64_000).is_err());
+        cfg.runner.vm_total_mb = Some(59_000);
+        assert!(cfg.validate_host_envelope(64_000).is_ok());
     }
 
     #[test]
@@ -992,6 +1291,7 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = false;
         assert!(cfg.validate().is_ok());
     }
 
@@ -1000,6 +1300,7 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = false;
         cfg.queue_monitor.enabled = true;
         assert!(cfg.validate().is_err());
         cfg.queue_monitor.repo = Some("owner/repo".into());
@@ -1042,6 +1343,7 @@ minimum_isolation = "container"
         let mut cfg = valid_config();
         cfg.github.scope = Scope::Org;
         cfg.github.target = "myorg".into();
+        cfg.queue_monitor.enabled = false;
         cfg.canary.enabled = true;
         assert!(cfg.validate().is_err());
         cfg.canary.repo = Some("owner/repo".into());
@@ -1094,7 +1396,7 @@ pids = 512
 minimum_isolation = "container"
 "#;
         let cfg = load_from_str(raw, "legacy-no-queue-monitor").unwrap();
-        assert!(!cfg.queue_monitor.enabled);
+        assert!(cfg.queue_monitor.enabled);
         assert_eq!(cfg.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(cfg.queue_monitor.check_interval_seconds, 300);
         assert!(!cfg.canary.enabled);

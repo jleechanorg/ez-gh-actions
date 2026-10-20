@@ -368,7 +368,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot local execution proof (docker top, LOCAL-ONLY)"
 CONFIGURED_COUNT=$(awk -F'=' '/^[[:space:]]*count/ {split($2, a, "#"); gsub(/[^0-9]/,"",a[1]); print a[1]; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
-CONFIGURED_COUNT="${CONFIGURED_COUNT:-10}"
+CONFIGURED_COUNT="${CONFIGURED_COUNT:-20}"
 
 classify_local_slot() {
   # Echoes one of: DOWN | IDLE | EXECUTING for container name "$1".
@@ -420,11 +420,11 @@ fi
 [ "${#EXECUTING_SLOTS[@]}" -gt 0 ] && ok "executing right now: ${EXECUTING_SLOTS[*]}"
 
 # Optional Mac fleet probe via SSH — best-effort, never fatal if unreachable
-# (the current fleet is "10 Linux + 6 Mac"; the Mac half is proven the
+# (the current fleet is "20 Linux + 4 Mac"; the Mac half is proven the
 # same way, over SSH, when the host is reachable).
 MAC_HOST="${MAC_HOST:-macbook}"
-MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-b}"
-MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-6}"
+MAC_RUNNER_NAME_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}"
+MAC_RUNNER_COUNT="${MAC_RUNNER_COUNT:-4}"
 if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$MAC_HOST" true >/dev/null 2>&1; then
   MAC_DOWN_SLOTS=()
   MAC_IDLE_SLOTS=()
@@ -490,57 +490,13 @@ else
   warn "serve-loop starvation signal skipped on $PLATFORM (no per-line timestamps in launchd log redirect)"
 fi
 
-# === 10. host watchdog configuration ===
-WATCHDOG_CRITICAL=0
-if [ "$PLATFORM" = "linux" ]; then
-  section "10. host watchdog configuration"
-  if [ -f "/etc/watchdog.conf" ]; then
-    # Extract watchdog parameters, stripping leading/trailing whitespace
-    max_load_1=$(grep -E '^\s*max-load-1\s*=' /etc/watchdog.conf | awk -F= '{print $2}' | tr -d '[:space:]')
-    repair_bin=$(grep -E '^\s*repair-binary\s*=' /etc/watchdog.conf | awk -F= '{print $2}' | tr -d '[:space:]')
-    
-    if [ -n "$max_load_1" ]; then
-      info "watchdog max-load-1 set to: $max_load_1"
-      if [ "$max_load_1" -lt 96 ]; then
-        warn "watchdog max-load-1 ($max_load_1) is below recommended safety ceiling of 96 (danger of reboot during mass respawn)."
-      else
-        ok "watchdog max-load-1 ($max_load_1) has safe headroom (>=96)"
-      fi
-    else
-      warn "watchdog max-load-1 not configured in /etc/watchdog.conf (default host limits apply)."
-    fi
-
-    if [ -n "$repair_bin" ]; then
-      info "watchdog repair-binary set to: $repair_bin"
-      # resolve ~ or env vars in path if any
-      resolved_repair_bin="${repair_bin/#\~/$HOME}"
-      if [ -f "$resolved_repair_bin" ]; then
-        if [ -x "$resolved_repair_bin" ]; then
-          ok "watchdog repair-binary is present and executable: $resolved_repair_bin"
-        else
-          bad "watchdog repair-binary exists but is not executable: $resolved_repair_bin"
-          WATCHDOG_CRITICAL=$((WATCHDOG_CRITICAL+1))
-        fi
-      else
-        bad "watchdog repair-binary file does not exist: $resolved_repair_bin"
-        WATCHDOG_CRITICAL=$((WATCHDOG_CRITICAL+1))
-      fi
-    else
-      warn "watchdog repair-binary not configured in /etc/watchdog.conf."
-    fi
-  else
-    warn "/etc/watchdog.conf not found."
-  fi
-fi
-
 # --- G. verdict ----------------------------------------------------------
 section "verdict"
 CRITICAL=0
-[ "${WATCHDOG_CRITICAL:-0}" -gt 0 ]         && CRITICAL=$((CRITICAL + WATCHDOG_CRITICAL))
 [ "$SERVICE_STATE" != "active" ]            && CRITICAL=$((CRITICAL+1))
 [ "$COLIMA_STATUS" = "Stopped" ]            && CRITICAL=$((CRITICAL+1))
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
-# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-b-*` fleet
+# `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-g-*` fleet
 # counts the same as Linux's `ez-org-runner-*` / `ez-runner-b-*`.)
 ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1 && \
                                           CRITICAL=$((CRITICAL+1))
@@ -575,7 +531,7 @@ fi
 [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ] && CRITICAL=$((CRITICAL+1))
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
-# the "16/16 executing" standard — ground truth from docker, not the
+# the "20/20 executing" standard — ground truth from docker, not the
 # GitHub API, so it cannot be fooled by a rate-limited fleet-state query.
 [ "${SLOT_PROOF_CRITICAL:-0}" -gt 0 ] && CRITICAL=$((CRITICAL + SLOT_PROOF_CRITICAL))
 

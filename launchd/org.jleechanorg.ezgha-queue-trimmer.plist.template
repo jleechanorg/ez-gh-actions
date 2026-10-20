@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  org.jleechanorg.ezgha-queue-trimmer
+
+  Purpose:
+    Runs scripts/trim-queued-runs.sh every 900s (15 minutes) to cancel
+    redundant or stale queued GitHub Actions runs across target repos
+    (jleechanorg/worldarchitect.ai and jleechanorg/ez-gh-actions).
+
+  Trimming criteria:
+    1. Unmodified PRs: PR last commit/activity is older than 2 hours.
+    2. Draft PRs: PR is in DRAFT state.
+    3. Superseded commits: branch HEAD has moved past the run's commit.
+
+  Safety invariants:
+    - Deploy workflows (deploy-production, auto-deploy-dev) are strictly protected.
+    - Runs on main/master branches are strictly protected.
+    - In-progress runs are never touched.
+    - Status is rechecked immediately before cancel to prevent races with runner pickups.
+    - Verifies cancellation and falls back to force-cancel if a run stays queued.
+-->
+<dict>
+    <key>Label</key>
+    <string>org.jleechanorg.ezgha-queue-trimmer</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@SCRIPTS_DIR@/trim-queued-runs.sh</string>
+        <string>--apply</string>
+        <string>--min-pr-age-hours</string>
+        <string>2</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@HOME@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+        <key>MIN_PR_AGE_HOURS</key>
+        <string>2</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/.local/state/ezgha/queue-trimmer.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/.local/state/ezgha/queue-trimmer.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

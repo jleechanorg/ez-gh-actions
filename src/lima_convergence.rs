@@ -30,7 +30,7 @@
 //!   (7) tests — `mod tests` covers (1)(2)(5) with filesystem fixtures
 //!
 //! NOT addressed here (out of scope; cannot be done from this binary):
-//!   (6) sustained 16/16 proof — requires live fleet reconciliation, owned by
+//!   (6) sustained 20/20 proof — requires live fleet reconciliation, owned by
 //!       the deploy-owner, NEVER by the factory
 
 use serde::{Deserialize, Serialize};

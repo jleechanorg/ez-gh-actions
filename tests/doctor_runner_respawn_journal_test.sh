@@ -119,6 +119,17 @@ run_case "no-match-superstring-collision-avoided-down" "$FIXTURE_B" "ez-runner-c
 # silently become "assume healthy".
 run_case "empty-log-fail-safe-down" "" "ez-runner-c-7" "0" || OVERALL_PASS=false
 
+# Cases (d)/(e): a runner name containing regex metacharacters must be matched
+# literally (ez-gh-actions-il81). "." must not match any character, and an
+# unbalanced "[" must neither error out nor match.
+FIXTURE_D=$(log_line "12:33:10" "ezXrunner-c-7")
+run_case "metachar-dot-not-wildcard-down" "$FIXTURE_D" "ez.runner-c-7" "0" || OVERALL_PASS=false
+FIXTURE_D2=$(log_line "12:33:10" "ez.runner-c-7")
+run_case "metachar-dot-literal-match-cycling" "$FIXTURE_D2" "ez.runner-c-7" "1" || OVERALL_PASS=false
+FIXTURE_E=$(log_line "12:33:10" "ez[runner-c-7")
+run_case "metachar-bracket-literal-match-cycling" "$FIXTURE_E" "ez[runner-c-7" "1" || OVERALL_PASS=false
+run_case "metachar-bracket-no-match-down" "$FIXTURE_B" "ez[runner-c-7" "0" || OVERALL_PASS=false
+
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
   echo "REGRESSION_TEST: PASS"

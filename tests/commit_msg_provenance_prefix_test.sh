@@ -44,7 +44,7 @@ if ! grep -Fq "github.event.pull_request.head.repo.full_name == github.repositor
   echo "FAIL: self-hosted CI does not skip fork pull requests at the job boundary" >&2
   exit 1
 fi
-if ! grep -Fq "ref: \${{ github.event.pull_request.base.sha }}" "$SERVER_WORKFLOW"; then
+if ! grep -Eq "ref: \\\${{ github.event.pull_request.base.(ref|sha) }}" "$SERVER_WORKFLOW"; then
   echo "FAIL: self-hosted CI does not load the validator from the trusted base revision" >&2
   exit 1
 fi

@@ -54,14 +54,14 @@ When this command is invoked, immediately execute the following steps:
    * Read `~/.claude/commands/harness.md` and `~/.claude/skills/harness-engineering/SKILL.md`
    * Produce full harness analysis (5 Whys technical + agent path)
    * Classify failure: silent degradation | missing validation | repeated manual fix | etc.
-   * Propose durable fixes (doctor-runner, skill, verify-exit-criteria gate, watchdog script)
+   * Propose durable fixes at the process/container/VM boundary (doctor-runner, skill, or a hermetic verify-exit-criteria gate)
 
 3. **If unhealthy, perform diagnostics**:
    * Inspect which critical checks failed (sections 1–10)
    * Check supervisor: `systemctl --user status ezgha.service` (Linux) or `launchctl print gui/$(id -u)/org.jleechanorg.ezgha` (macOS)
    * Check docker: `docker ps --filter label=ezgha=managed`
    * Check logs: `journalctl --user -n 50 -u ezgha.service` or `/tmp/ezgha-launchd-stderr.log`
-   * Check external watchdog: `tail -20 /tmp/ezgha-watchdog-stdout.log`
+   * Confirm repository automation has no physical-host lifecycle authority; host recovery is operator-only
 
 4. **Execute named remediation** (only when safe — do not restart-loop):
    * **Service inactive**: `ezgha install-service` then restart supervisor

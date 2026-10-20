@@ -1,0 +1,11 @@
+[Unit]
+Description=Trim stale, draft, and superseded GitHub Actions queued runs periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=ezgha-queue-trimmer.service
+
+[Install]
+WantedBy=timers.target

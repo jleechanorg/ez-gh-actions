@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Static structural regression test for Release 1 finite host containment policy artifacts.
+# This test is shell-only and never modifies, starts, or stops host units or services.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+ok() { echo "OK: $*"; }
+
+assert_file() { [ -f "$1" ] || fail "missing required artifact: $1"; }
+assert_not_file() { [ ! -e "$1" ] || fail "forbidden artifact must not exist: $1"; }
+assert_line() {
+  local file="$1" line="$2"
+  grep -Fqx "$line" "$file" || fail "$file missing exact line: $line"
+}
+
+# 1. System actions.slice finite policy
+ACTIONS_SLICE="$REPO_ROOT/systemd/host/actions.slice"
+assert_file "$ACTIONS_SLICE"
+assert_line "$ACTIONS_SLICE" "[Slice]"
+assert_line "$ACTIONS_SLICE" "MemoryHigh=26G"
+assert_line "$ACTIONS_SLICE" "MemoryMax=28G"
+assert_line "$ACTIONS_SLICE" "MemorySwapMax=0"
+assert_line "$ACTIONS_SLICE" "TasksMax=8000"
+assert_line "$ACTIONS_SLICE" "CPUQuota=2000%"
+assert_line "$ACTIONS_SLICE" "IOWeight=25"
+assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressure=kill"
+assert_line "$ACTIONS_SLICE" "ManagedOOMMemoryPressureLimit=80%"
+assert_line "$ACTIONS_SLICE" "ManagedOOMSwap=auto"
+assert_line "$ACTIONS_SLICE" "[Install]"
+assert_line "$ACTIONS_SLICE" "WantedBy=slices.target"
+
+APPLY_SCRIPT="$REPO_ROOT/scripts/host/apply-host-containment-release1.sh"
+enable_line="$(grep -nF 'systemctl enable actions.slice' "$APPLY_SCRIPT" | cut -d: -f1)"
+start_line="$(grep -nF 'systemctl start actions.slice' "$APPLY_SCRIPT" | cut -d: -f1)"
+[ -n "$enable_line" ] || fail "root containment activation does not persist actions.slice boot wiring"
+[ -n "$start_line" ] || fail "root containment activation does not start actions.slice"
+[ "$enable_line" -lt "$start_line" ] || fail "actions.slice must be enabled before it is started"
+ok "systemd/host/actions.slice finite boundary, oomd kill at 80% pressure"
+
+# 2. User workload slices
+AGENTS_SLICE="$REPO_ROOT/systemd/agents.slice"
+assert_file "$AGENTS_SLICE"
+assert_line "$AGENTS_SLICE" "MemoryHigh=10G"
+assert_line "$AGENTS_SLICE" "MemoryMax=12G"
+assert_line "$AGENTS_SLICE" "MemorySwapMax=2G"
+assert_line "$AGENTS_SLICE" "TasksMax=8192"
+assert_line "$AGENTS_SLICE" "ManagedOOMMemoryPressure=auto"
+assert_line "$AGENTS_SLICE" "ManagedOOMSwap=auto"
+grep -q "requires usage below 10G" "$AGENTS_SLICE" || fail "agents.slice missing activation headroom requirement"
+grep -q "6.25 GiB below the observed 18.25 GiB peak" "$AGENTS_SLICE" || fail "agents.slice missing the approved reduction below its observed peak"
+ok "systemd/agents.slice 10G/12G envelope and auto OOM policies"
+
+AUTOMATION_SLICE="$REPO_ROOT/systemd/automation.slice"
+assert_file "$AUTOMATION_SLICE"
+assert_line "$AUTOMATION_SLICE" "MemoryHigh=4608M"
+assert_line "$AUTOMATION_SLICE" "MemoryMax=5G"
+assert_line "$AUTOMATION_SLICE" "MemorySwapMax=1G"
+assert_line "$AUTOMATION_SLICE" "TasksMax=4096"
+assert_line "$AUTOMATION_SLICE" "ManagedOOMMemoryPressure=auto"
+assert_line "$AUTOMATION_SLICE" "ManagedOOMSwap=auto"
+ok "systemd/automation.slice 4608M/5G envelope and auto OOM policies"
+
+QEMU_SLICE="$REPO_ROOT/systemd/app-lima-vm.slice"
+assert_file "$QEMU_SLICE"
+assert_line "$QEMU_SLICE" "MemoryHigh=9G"
+assert_line "$QEMU_SLICE" "MemoryMax=10G"
+assert_line "$QEMU_SLICE" "MemorySwapMax=2G"
+assert_line "$QEMU_SLICE" "TasksMax=4096"
+assert_line "$QEMU_SLICE" "CPUQuota=1600%"
+ok "systemd/app-lima-vm.slice 9G/10G envelope"
+
+QEMU_DROPIN="$REPO_ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+assert_file "$QEMU_SLICE"
+assert_line "$QEMU_SLICE" "MemoryHigh=9G"
+assert_line "$QEMU_SLICE" "MemoryMax=10G"
+assert_line "$QEMU_SLICE" "MemorySwapMax=2G"
+assert_line "$QEMU_SLICE" "TasksMax=4096"
+assert_line "$QEMU_SLICE" "CPUQuota=1600%"
+ok "systemd/lima-vm@colima.service.d/99-memory-ceiling.conf 9G/10G dropin"
+
+
+# 3. Boundary drop-ins (6 tracked drop-ins)
+for dropin in \
+  "$REPO_ROOT/systemd/host/-.slice.d/99-ezgha-containment.conf" \
+  "$REPO_ROOT/systemd/host/user.slice.d/99-ezgha-containment.conf" \
+  "$REPO_ROOT/systemd/host/user-.slice.d/99-ezgha-containment.conf" \
+  "$REPO_ROOT/systemd/user/app.slice.d/99-ezgha-containment.conf" \
+  "$REPO_ROOT/systemd/user/session.slice.d/99-ezgha-containment.conf"; do
+  assert_file "$dropin"
+  assert_line "$dropin" "ManagedOOMMemoryPressure=auto"
+  assert_line "$dropin" "ManagedOOMSwap=auto"
+done
+
+USER_SVC_DROPIN="$REPO_ROOT/systemd/host/user@.service.d/99-ezgha-containment.conf"
+assert_file "$USER_SVC_DROPIN"
+assert_line "$USER_SVC_DROPIN" "ManagedOOMMemoryPressure=auto"
+assert_line "$USER_SVC_DROPIN" "ManagedOOMSwap=auto"
+assert_line "$USER_SVC_DROPIN" "ManagedOOMPreference=none"
+assert_line "$USER_SVC_DROPIN" "OOMScoreAdjust=0"
+ok "all six boundary drop-ins present and neutral"
+
+# 4. Config alignment (1400 MiB per runner)
+LINUX_EXAMPLE="$REPO_ROOT/config/config.toml.linux.example"
+assert_file "$LINUX_EXAMPLE"
+grep -q "memory_mb = 1400" "$LINUX_EXAMPLE" || fail "config.toml.linux.example missing 1400 MiB runner memory limit"
+ok "config.toml.linux.example aligned to 1400 MiB per runner"
+
+# 5. Absence of forbidden legacy artifacts and escape hatches
+assert_not_file "$REPO_ROOT/systemd/ezgha.service.d/10-oomd-omit.conf"
+assert_not_file "$REPO_ROOT/systemd/psi-oom-watcher.service"
+assert_not_file "$REPO_ROOT/systemd/psi-oom-watcher.timer"
+assert_not_file "$REPO_ROOT/scripts/host/psi-oom-watcher.sh"
+assert_not_file "$REPO_ROOT/config/config.toml.linux-canary.example"
+
+for launcher in "$REPO_ROOT/scripts/host/agent-scoped-launch.sh" "$REPO_ROOT/scripts/host/agent-cli-scoped.sh"; do
+  if [ -f "$launcher" ]; then
+    if grep -q "AGENT_SLICE_OPT_OUT" "$launcher"; then
+      fail "forbidden AGENT_SLICE_OPT_OUT escape hatch found in $launcher"
+    fi
+  fi
+done
+ok "forbidden legacy escape hatches and watcher/exemption units strictly absent"
+
+echo "HOST_CRASH_CONTAINMENT_RELEASE1_ARTIFACTS_TEST: PASS"
