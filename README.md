@@ -69,7 +69,7 @@ separate deploy-owner checks; a code change alone does not update running images
 
 ## Host-survival failure ladder (Jeff-Ubuntu)
 
-The production capacity contract is **14 Linux runners plus 4 Mac runners (18 total, since 2026-10-18 — see bead jleechan-qbcm)**; the 10-runner Linux profile remains available for rollback, and 16 @ 1750 MiB is the restoration target once the `ez-gh-actions-sa8c` host-OOM policy lands.
+The production capacity contract is **14 Linux runners plus 4 Mac runners (18 total, since 2026-10-18 — see bead jleechan-eldq)**; the 10-runner Linux profile remains available for rollback, and 16 @ 1750 MiB is the restoration target once the `ez-gh-actions-sa8c` host-OOM policy lands.
 Any observed Linux shortfall is a live failure, not a reduced contract, and the
 host-survival verdict remains **FAIL** until the live criteria in the
 [Borg failure-ladder plan](docs/superpowers/plans/2026-08-26-borg-failure-ladder.md) pass together.

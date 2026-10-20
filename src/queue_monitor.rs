@@ -13,7 +13,7 @@ use crate::github;
 const FLEET_ORG: &str = "jleechanorg";
 const LINUX_FLEET_PREFIX: &str = "ez-runner-c-";
 const MAC_FLEET_PREFIX: &str = "ez-mac-runner-h-";
-// Capacity contract 2026-10-18 (bead jleechan-qbcm): Linux fleet
+// Capacity contract 2026-10-18 (bead jleechan-eldq): Linux fleet
 // reduced 20 -> 14, paired with raising per-runner memory 1400 -> 2000 MiB inside the
 // same 28 GiB aggregate envelope. Rationale: runner-container jobs (vitest) OOM-died
 // at 1400 MiB while the host swap pool was saturated; the fleet never settled above

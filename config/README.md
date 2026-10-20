@@ -45,7 +45,7 @@ systemctl --user restart ezgha.service
 ## Jeff-Ubuntu restore boundary
 
 The approved Linux profile is 14 runners at 2000 MiB per job (since 2026-10-18;
-see bead jleechan-qbcm — the 20 @ 1400 MiB profile was retired after
+see bead jleechan-eldq — the 20 @ 1400 MiB profile was retired after
 runner jobs OOM-died at 1400 MiB with host swap saturated). The 10-runner
 profile at 2500 MiB per job remains supported for rollback; both use the same
 26 GiB `MemoryHigh` and 28 GiB `MemoryMax` aggregate cap. The restoration target
