@@ -56,29 +56,8 @@ jobs:
           set -euo pipefail
           cargo install --path . --root /tmp/ezgha-install --locked --quiet
 
+      - name: Binary SHA verifier regressions
+        run: bash tests/check_built_binary_sha_test.sh
+
       - name: Compare installed binary SHA vs HEAD
-        run: |
-          set -euo pipefail
-          HEAD_SHA="$(git rev-parse HEAD)"
-          # The --version output format is set in src/main.rs:31:
-          #   `ezgha <CARGO_PKG_VERSION>-<GIT_SHA>-<rustc-target-triple>`
-          # Extract the 7-40 hex SHA segment between the first two '-'
-          # delimiters.
-          INSTALLED_SHA="$(
-            /tmp/ezgha-install/bin/ezgha --version \
-              | sed -n 's/.*-\([0-9a-f]\{7,40\}\)-.*/\1/p' \
-              | head -1
-          )"
-          if [ -z "${INSTALLED_SHA}" ]; then
-            echo "FAIL: could not extract a SHA from 'ezgha --version' output." >&2
-            /tmp/ezgha-install/bin/ezgha --version >&2
-            exit 1
-          fi
-          echo "HEAD_SHA=${HEAD_SHA}"
-          echo "INSTALLED_SHA=${INSTALLED_SHA}"
-          if [ "${INSTALLED_SHA}" != "${HEAD_SHA}" ]; then
-            echo "FAIL: ezgha binary-drift on HEAD ${HEAD_SHA}: installed binary embeds SHA ${INSTALLED_SHA}." >&2
-            echo "      This means a non-default cargo build pipeline produced the artifact; investigate build.rs / --locked usage." >&2
-            exit 1
-          fi
-          echo "PASS: installed binary SHA matches HEAD"
+        run: bash scripts/check_built_binary_sha.sh /tmp/ezgha-install/bin/ezgha
