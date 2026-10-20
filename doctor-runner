@@ -765,7 +765,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
 CONFIGURED_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
-DEFAULT_LINUX_RUNNER_COUNT=20
+DEFAULT_LINUX_RUNNER_COUNT=14
 DEFAULT_MAC_RUNNER_COUNT=4
 if [ "$PLATFORM" = "macos" ]; then
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_MAC_RUNNER_COUNT"

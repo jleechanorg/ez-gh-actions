@@ -1282,7 +1282,7 @@ pub struct InvariantSample {
     pub inv1: bool,
     pub inv2: bool,
     /// Populated only when `inv1` is false. One of "missing-registration"
-    /// (fewer than the expected 20 runners are registered at all),
+    /// (fewer than the expected 18 runners are registered at all),
     /// "offline-respawning" (registered but not all online -- JIT
     /// deregister/respawn churn, see docs/ed8-fleet-churn-root-cause-*.md),
     /// or "genuinely-idle" (fully registered and online, but not picking up
