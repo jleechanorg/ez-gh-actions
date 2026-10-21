@@ -368,7 +368,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot local execution proof (docker top, LOCAL-ONLY)"
 CONFIGURED_COUNT=$(awk -F'=' '/^[[:space:]]*count/ {split($2, a, "#"); gsub(/[^0-9]/,"",a[1]); print a[1]; exit}' "$HOME/.config/ezgha/config.toml" 2>/dev/null)
-CONFIGURED_COUNT="${CONFIGURED_COUNT:-14}"
+CONFIGURED_COUNT="${CONFIGURED_COUNT:-16}"
 
 classify_local_slot() {
   # Echoes one of: DOWN | IDLE | EXECUTING for container name "$1".
