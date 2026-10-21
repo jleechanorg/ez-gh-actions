@@ -2,7 +2,10 @@
 # (claude/codex/cursor/gemini/etc) and their MCP descendants. Orchestration
 # daemons use the separate automation.slice.
 #
-# measured margin: the approved 12G cap is 6.25 GiB below the observed 18.25 GiB peak.
+# measured margin: the 11.5G cap (R1 cap-fit amendment 2026-10-21, bead
+# jleechan-r1-cap-fit-amendment-byee) keeps ~6.75 GiB below the observed 18.25 GiB
+# peak; the 512 MiB shave makes the four-cap profile + 10% reserve fit the real
+# 60.9 GiB host (12G left the activation assert short by 244174 KiB).
 # Activation requires usage below 10G; later growth may throttle or OOM.
 #
 # Static syntax validation only: `systemd-analyze verify systemd/agents.slice`
@@ -13,7 +16,7 @@ Before=slices.target
 
 [Slice]
 MemoryHigh=10G
-MemoryMax=12G
+MemoryMax=11.5G
 MemorySwapMax=2G
 TasksMax=8192
 MemoryAccounting=yes

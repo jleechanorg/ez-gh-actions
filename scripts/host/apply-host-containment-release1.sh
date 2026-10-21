@@ -274,7 +274,7 @@ if [ "$SYSTEM_PHASE" -eq 0 ] || [ "$ROOT" != "/" ]; then
   if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
     systemctl --user daemon-reload
     systemctl --user start agents.slice automation.slice
-    systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192
+    systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=11.5G MemorySwapMax=2G TasksMax=8192
     systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096
     "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT" --apply
   fi
