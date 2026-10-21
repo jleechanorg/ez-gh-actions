@@ -3,12 +3,22 @@
 #
 # Cancels queued runs in target repos matching any of:
 #   1. PR not modified in >= MIN_PR_AGE_HOURS (default: 1.5 hours).
-#   2. PR is in DRAFT state (drafts should not block ready PRs).
-#   3. Superseded commit: remote branch HEAD has advanced past the run's commit.
+#   2. PR is in DRAFT state AND also stale (>= MIN_PR_AGE_HOURS since the
+#      last code/update). Fresh CI on an actively-worked draft is kept — the
+#      trim intent is abandoned drafts, not active ones (2026-10-21 fix:
+#      the old form cancelled fresh CI reruns on draft PRs within seconds).
+#   3. Superseded commit: remote branch HEAD has advanced past the run's
+#      commit — EXCEPT workflow_dispatch runs (deliberately dispatched at a
+#      specific SHA by an operator; a later push does not make them
+#      obsolete) and EXCEPT when the branch head moved less than
+#      SUPERSEDED_HEAD_GRACE_MIN minutes ago (the push->dispatch->push race
+#      cancelled three capacity probes mid-flight on 2026-10-21, churning
+#      JIT runners; bead jleechan-fleet-respawn-churn-ietw).
 #
 # Safety invariants:
 #   - In-progress runs are NEVER touched.
 #   - Deploy workflows (deploy-production, auto-deploy-dev) are NEVER touched.
+#   - workflow_dispatch runs are NEVER superseded-cancelled (any head state).
 #   - Status is rechecked immediately before cancellation to prevent races.
 #   - Dry-run by default; requires --apply to perform cancellations.
 #
@@ -23,6 +33,7 @@
 #   MIN_PR_AGE_HOURS=1.5
 #   TRIM_DRAFTS=1
 #   TRIM_SUPERSEDED=1
+#   SUPERSEDED_HEAD_GRACE_MIN=10
 #   CANCEL_VERIFY_WAIT_S=10
 set -euo pipefail
 
@@ -42,6 +53,7 @@ QUEUE_REPOS="${QUEUE_REPOS:-$DEFAULT_QUEUE_REPOS}"
 MIN_PR_AGE_HOURS="${MIN_PR_AGE_HOURS:-1.5}"
 TRIM_DRAFTS="${TRIM_DRAFTS:-1}"
 TRIM_SUPERSEDED="${TRIM_SUPERSEDED:-1}"
+SUPERSEDED_HEAD_GRACE_MIN="${SUPERSEDED_HEAD_GRACE_MIN:-10}"
 CANCEL_VERIFY_WAIT_S="${CANCEL_VERIFY_WAIT_S:-10}"
 DRY_RUN=1
 
@@ -100,7 +112,7 @@ if ! command -v gh >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
-export MIN_PR_AGE_HOURS TRIM_DRAFTS TRIM_SUPERSEDED CANCEL_VERIFY_WAIT_S DRY_RUN
+export MIN_PR_AGE_HOURS TRIM_DRAFTS TRIM_SUPERSEDED SUPERSEDED_HEAD_GRACE_MIN CANCEL_VERIFY_WAIT_S DRY_RUN
 
 FAILED_REPOS=()
 REPO_COUNT=0
@@ -120,6 +132,7 @@ import time
 
 repo = os.environ["QUEUE_REPO"]
 min_pr_age_hours = float(os.environ["MIN_PR_AGE_HOURS"])
+superseded_head_grace_min = float(os.environ["SUPERSEDED_HEAD_GRACE_MIN"])
 trim_drafts = os.environ.get("TRIM_DRAFTS", "1") == "1"
 trim_superseded = os.environ.get("TRIM_SUPERSEDED", "1") == "1"
 dry = os.environ.get("DRY_RUN") == "1"
@@ -259,24 +272,37 @@ for r in eligible_runs:
     run_sha = r.get("head_sha")
     remote_head = info["remote_head"]
     pr = info["pr"]
+    run_name = r.get("name") or f"id={r['id']}"
 
-    # Reason 1: Superseded commit on branch
+    # Reason 1: Superseded commit on branch.
+    # Guards (bead jleechan-fleet-respawn-churn-ietw, 2026-10-21):
+    #   - workflow_dispatch runs are deliberately dispatched at a specific
+    #     SHA by an operator; a later push never supersedes them.
+    #   - Head-age grace: if the branch head moved less than
+    #     SUPERSEDED_HEAD_GRACE_MIN minutes ago, the run may be part of a
+    #     deliberate push->dispatch verification cycle — skip until the head
+    #     is provably older than the grace window. Unknown head date falls
+    #     back to the pre-fix cancel behavior (dedup purpose preserved).
     if trim_superseded and remote_head and run_sha and run_sha != remote_head:
+        run_event = r.get("event")
+        if run_event == "workflow_dispatch":
+            print(f"protected {r['id']} ({run_name}) on branch '{b}': workflow_dispatch runs are never superseded-cancelled")
+            continue
+        if remote_head not in commit_dates:
+            commit_dates[remote_head] = get_commit_date(remote_head)
+        head_dt = commit_dates.get(remote_head)
+        if head_dt is not None and (now - head_dt).total_seconds() < superseded_head_grace_min * 60:
+            print(f"protected {r['id']} ({run_name}) on branch '{b}': branch head moved < {superseded_head_grace_min:g} min ago (superseded head-age grace)")
+            continue
         candidates.append((r, f"superseded_commit (run_sha={run_sha[:8]} != branch_head={remote_head[:8]})"))
         continue
 
     if not pr:
         continue
 
-    # Reason 2: Draft PR
-    if trim_drafts and pr.get("isDraft"):
-        candidates.append((r, f"draft_pr (PR #{pr['number']} is draft)"))
-        continue
-
-    # Reason 3: PR not modified in last MIN_PR_AGE_HOURS
     pr_updated_str = pr.get("updatedAt", "")
     pr_updated_dt = datetime.datetime.fromisoformat(pr_updated_str.replace("Z", "+00:00")) if pr_updated_str else None
-    
+
     # Check commit committer date
     if run_sha not in commit_dates:
         commit_dates[run_sha] = get_commit_date(run_sha)
@@ -284,11 +310,23 @@ for r in eligible_runs:
 
     # Consider unmodified if commit date is >= min_pr_age_hours old
     ref_dt = commit_dt or pr_updated_dt
-    if ref_dt:
-        age_hours = (now - ref_dt).total_seconds() / 3600.0
-        if age_hours >= min_pr_age_hours:
-            candidates.append((r, f"unmodified_pr (PR #{pr['number']} last code/update was {age_hours:.1f}h ago >= {min_pr_age_hours:g}h)"))
+    age_hours = (now - ref_dt).total_seconds() / 3600.0 if ref_dt else None
+    stale = age_hours is not None and age_hours >= min_pr_age_hours
+
+    # Reason 2: Draft PR — only when the draft is ALSO stale. A fresh push
+    # to an actively-worked draft PR keeps its CI (the pre-fix form
+    # cancelled fresh CI reruns on active draft PRs, 2026-10-21).
+    if trim_drafts and pr.get("isDraft"):
+        if stale:
+            candidates.append((r, f"draft_pr (PR #{pr['number']} is draft, stale {age_hours:.1f}h)"))
             continue
+        print(f"protected {r['id']} ({run_name}) on branch '{b}': draft PR #{pr['number']} is fresh ({age_hours:.1f}h) — not trimmed")
+        continue
+
+    # Reason 3: PR not modified in last MIN_PR_AGE_HOURS
+    if stale:
+        candidates.append((r, f"unmodified_pr (PR #{pr['number']} last code/update was {age_hours:.1f}h ago >= {min_pr_age_hours:g}h)"))
+        continue
 
 print(f"candidates_identified: {len(candidates)}")
 
