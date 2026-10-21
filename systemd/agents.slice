@@ -2,10 +2,10 @@
 # (claude/codex/cursor/gemini/etc) and their MCP descendants. Orchestration
 # daemons use the separate automation.slice.
 #
-# measured margin: the 11776M (11.5 GiB) cap (R1 cap-fit amendment 2026-10-21,
-# bead jleechan-r1-cap-fit-amendment-byee) keeps ~6.75 GiB below the observed
-# 18.25 GiB peak; the 512 MiB shave makes the four-cap profile + 10% reserve
-# fit the real 60.9 GiB host (12G left the activation assert short 244174 KiB).
+# measured margin: the 11776M (11.5 GiB) cap keeps 6.75 GiB below the observed 18.25 GiB peak
+# (R1 cap-fit amendment 2026-10-21, bead jleechan-r1-cap-fit-amendment-byee);
+# the 512 MiB shave makes the four-cap profile + 10% reserve fit the real
+# 60.9 GiB host (12G left the activation assert short 244174 KiB).
 # Integer-MiB form because parse_mem_kib accepts whole-number units only.
 # Activation requires usage below 10G; later growth may throttle or OOM.
 #
