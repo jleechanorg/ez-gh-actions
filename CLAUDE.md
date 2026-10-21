@@ -104,6 +104,31 @@ systemctl --user restart ezgha.service
 systemctl --user status ezgha.service
 ```
 
+### Investigating an unattributed restart (GH#42)
+Every restart of `ezgha.service` driven by `install.sh` emits a structured
+attribution line on stderr immediately before the restart itself:
+
+```
+INFO ezgha restart_attribution ts=<ISO8601> pid=<PID> ppid=<PPID> session=<user> reason="<text>" invocation="<argv>"
+```
+
+If you find a clean restart in `journalctl --user -u ezgha.service` with no
+attribution line, that means a third-party invoker (`admin@example.com`'s
+manual `systemctl --user restart`, a `cron` script, the ezgha-watchdog, a
+planner session, etc.) restarted the unit outside `install.sh` -- audit the
+host's `~/.bash_history`, `journalctl _COMM=systemctl`, and any
+`~/.local/libexec/ezgha/*` jobs that touch the unit. To look it up:
+
+```bash
+# Linux
+journalctl --user -u ezgha.service | grep restart_attribution
+# macOS
+log show --predicate 'process == "ezgha"' --info | grep restart_attribution
+```
+
+`EZGHA_RESTART_REASON` is honored if a future script wants to override the
+default `install-sh auto-restart` text.
+
 ### Colima VM down
 ```bash
 limactl start colima
