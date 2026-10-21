@@ -70,9 +70,10 @@ mod tests {
     #[test]
     fn measured_envelope_derives_threshold_and_rounds_up() {
         // ceil(6 * 75 / 60) = 8; 30 + 8 + 4 + 3 = 45, not a round-number guess.
-        assert_eq!(policy().high_water_gib(30).unwrap(), 45);
+        let high = policy().high_water_gib(30).unwrap();
+        assert_eq!(high, 45);
         // Conditional worst-case delayed depletion + active growth leaves reserve.
-        assert!(45 - 8 - 4 >= 30 + 3);
+        assert!(high - 8 - 4 >= 30 + 3);
     }
     #[test]
     fn invalid_and_overflow_envelopes_refused() {
