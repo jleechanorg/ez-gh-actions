@@ -436,6 +436,9 @@ pub struct Limits {
     /// Disk exhaustion is the dominant self-hosted runner failure mode.
     #[serde(default = "default_min_free_disk_gb")]
     pub min_free_disk_gb: u64,
+    /// Opt-in recovery envelope; absent preserves existing admission behavior.
+    #[serde(default)]
+    pub disk_recovery: Option<crate::disk_recovery::DiskRecovery>,
     /// Optional systemd cgroup/slice parent for every runner container.
     #[serde(default)]
     pub cgroup_parent: Option<String>,
@@ -654,6 +657,7 @@ impl Config {
                 cpus,
                 pids: 512,
                 min_free_disk_gb: default_min_free_disk_gb(),
+                disk_recovery: None,
                 cgroup_parent: None,
                 cpu_burst: false,
             },
@@ -728,6 +732,9 @@ impl Config {
             validate_cgroup_parent(parent)?;
         }
         require_at_least_one("limits.min_free_disk_gb", self.limits.min_free_disk_gb)?;
+        if let Some(recovery) = &self.limits.disk_recovery {
+            recovery.high_water_gib(self.limits.min_free_disk_gb)?;
+        }
         if self.runner.count < 1 {
             anyhow::bail!(
                 "runner.count must be at least 1 (got {})",

@@ -2994,7 +2994,15 @@ static TEST_DAEMON_CAPACITY: std::sync::Mutex<Option<Option<(f64, u64)>>> =
 /// fallback between sources: an unreadable pressure, `memory.current`,
 /// `memory.high` or MemAvailable file is an `Err`, which the caller treats as
 /// a probe failure (fail-closed once `runner.host_reserve_mb > 0`).
+#[cfg(test)]
+static TEST_RECOVERY_PRESSURE: Mutex<Option<std::result::Result<(f64, u64), String>>> =
+    Mutex::new(None);
+
 pub fn memory_pressure_pct(source: &PressureSource) -> Result<(f64, u64)> {
+    #[cfg(test)]
+    if let Some(result) = TEST_RECOVERY_PRESSURE.lock().unwrap().as_ref() {
+        return result.clone().map_err(anyhow::Error::msg);
+    }
     read_admission_pressure(source, &read_meminfo_available)
 }
 
@@ -4556,7 +4564,16 @@ fn host_free_disk_gb() -> Option<u64> {
     } else {
         "/"
     };
-    let path = CString::new(path).ok()?;
+    free_disk_at_path(Path::new(path))
+}
+
+fn free_disk_at_path(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(free) = *TEST_HOST_FREE_DISK_GB.lock().unwrap() {
+        return free;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: `path` is a live NUL-terminated CString and `stats` points to a
     // valid writable `statvfs` value for the duration of the call.
@@ -5084,7 +5101,40 @@ fn post_refill_released_slots(
     Ok(released)
 }
 
+// One daemon owns a configured fleet through the existing serve/slot locks.
+// This local latch is deliberately conservative after restart/config changes.
+static DISK_RECOVERY_LATCH: Mutex<(String, crate::disk_recovery::RecoveryLatch)> = Mutex::new((
+    String::new(),
+    crate::disk_recovery::RecoveryLatch { open: false },
+));
+
 pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
+    let Some(policy) = &cfg.limits.disk_recovery else {
+        return ensure_count_outcome_inner(cfg, backend);
+    };
+    let high = policy.high_water_gib(cfg.limits.min_free_disk_gb)?;
+    let key = serde_json::to_string(cfg)?;
+    let mut state = DISK_RECOVERY_LATCH
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if state.0 != key {
+        *state = (key, crate::disk_recovery::RecoveryLatch::default());
+    }
+    let mut effective = cfg.clone();
+    effective.limits.min_free_disk_gb = state.1.floor(cfg.limits.min_free_disk_gb, high);
+    let result = ensure_count_outcome_inner(&effective, backend);
+    match &result {
+        Ok(outcome) if outcome.admission_paused_reason.is_none() && !outcome.started.is_empty() => {
+            state.1.observe(true)
+        }
+        Ok(outcome) if outcome.missing == 0 => {} // Full fleet is not a fresh measurement.
+        _ => state.1.observe(false),
+    }
+    result
+}
+
+fn ensure_count_outcome_inner(cfg: &Config, backend: Backend) -> Result<EnsureCountOutcome> {
+    let admission_started = Instant::now();
     if let Err(err) = require_host_containment(cfg) {
         let _ = alert::notify(
             cfg,
@@ -5141,6 +5191,12 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         });
     }
     let host_floor_gb = cfg.limits.min_free_disk_gb;
+    if let Some(policy) = &cfg.limits.disk_recovery {
+        if !free_disk_at_path(&policy.scratch_root).is_some_and(|free| free >= host_floor_gb) {
+            return Ok(admission_paused_outcome(cfg.runner.count.saturating_sub(alive),
+                format!("managed scratch filesystem unavailable or below recovery threshold {host_floor_gb} GiB")));
+        }
+    }
     match host_free_disk_gb() {
         Some(free) if free < host_floor_gb => {
             let _ = alert::notify(
@@ -5218,7 +5274,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
         }
         None => {
             let n = CONSECUTIVE_DISK_NONE.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= DISK_MEASURE_STRIKES {
+            if n >= DISK_MEASURE_STRIKES || cfg.limits.disk_recovery.is_some() {
                 let _ = alert::notify(
                     cfg,
                     "runner_pool.disk_measurement_unavailable",
@@ -5260,6 +5316,11 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     let admission_decision: Result<(), String> = {
         let mut window = PRESSURE_WINDOW.lock().unwrap_or_else(|p| p.into_inner());
         match &admission_probe {
+            Ok((pct, _))
+                if cfg.limits.disk_recovery.is_some() && (!pct.is_finite() || *pct < 0.0) =>
+            {
+                Err("disk recovery memory pressure measurement is invalid".into())
+            }
             Ok((pct, available)) => eval_admission(
                 *pct,
                 *available,
@@ -5275,7 +5336,7 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
                 // that safety contract.
                 window.rotate_left(1);
                 window[4] = Some(0.0);
-                if cfg.runner.host_reserve_mb > 0 {
+                if cfg.runner.host_reserve_mb > 0 || cfg.limits.disk_recovery.is_some() {
                     Err(format!(
                         "host-reserve admission probe failed; refusing new start: {e:#}"
                     ))
@@ -5335,7 +5396,22 @@ pub fn ensure_count_outcome(cfg: &Config, backend: Backend) -> Result<EnsureCoun
     }
     let missing = cfg.runner.count - alive;
     let before_batch = release_slot_snapshot(cfg);
-    let refill = start_missing_runners(cfg, backend, missing);
+    if let Some(policy) = &cfg.limits.disk_recovery {
+        if admission_started.elapsed().as_secs() >= policy.detection_and_dispatch_delay_secs {
+            return Ok(admission_paused_outcome(
+                missing,
+                "disk recovery measurement/dispatch budget expired".into(),
+            ));
+        }
+    }
+    // Re-probe both budgets before each additional runner, rather than using one
+    // MemAvailable/disk snapshot to admit an entire missing fleet.
+    let batch = if cfg.limits.disk_recovery.is_some() {
+        missing.min(1)
+    } else {
+        missing
+    };
+    let refill = start_missing_runners(cfg, backend, batch);
     let before_release = release_slot_snapshot(cfg);
     // release_stale_slots may repair a corrupt quarantine table; do not turn
     // that fail-soft recovery into affirmative availability evidence.
@@ -5477,6 +5553,108 @@ mod tests {
         cfg
     }
 
+    fn recovery_cfg() -> Config {
+        let mut cfg = cfg_with(2, "ez-recovery");
+        cfg.limits.min_free_disk_gb = 30;
+        cfg.limits.disk_recovery = Some(crate::disk_recovery::DiskRecovery {
+            scratch_root: "/tmp".into(),
+            aggregate_burn_gib_per_minute: 6,
+            detection_and_dispatch_delay_secs: 75,
+            active_job_growth_gib: 4,
+            protected_reserve_gib: 3,
+        });
+        cfg
+    }
+
+    #[test]
+    fn disk_recovery_requires_joint_memory_and_disk() {
+        let _env = TestEnv::new("disk_recovery_joint");
+        let cfg = recovery_cfg();
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![]);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(44));
+        *TEST_RECOVERY_PRESSURE.lock().unwrap() = Some(Ok((0.0, u64::MAX)));
+        assert!(ensure_count_outcome(&cfg, Backend::Docker)
+            .unwrap()
+            .admission_paused_reason
+            .is_some());
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_RECOVERY_PRESSURE.lock().unwrap() = Some(Ok((0.0, 1)));
+        assert!(ensure_count_outcome(&cfg, Backend::Docker)
+            .unwrap()
+            .admission_paused_reason
+            .unwrap()
+            .contains("memory"));
+        assert_eq!(DISK_RECOVERY_LATCH.lock().unwrap().1.floor(30, 45), 45);
+    }
+
+    #[test]
+    fn disk_recovery_successful_paced_refill_and_repause() {
+        let _env = TestEnv::new("disk_recovery_success");
+        let cfg = recovery_cfg();
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_RECOVERY_PRESSURE.lock().unwrap() = Some(Ok((0.0, u64::MAX)));
+        let after = vec![managed_container("ez-recovery-1")];
+        *TEST_MANAGED_CONTAINER_SNAPSHOTS.lock().unwrap() = [vec![], after.clone()].into();
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(after);
+        *TEST_START_ONE_NAMES.lock().unwrap() =
+            Some(vec!["ez-recovery-1".into(), "ez-recovery-2".into()]);
+        *TEST_EXECUTING_RUNNER_COUNTS.lock().unwrap() = Some(
+            [Ok(ReadinessSummary {
+                ready: 1,
+                absent: vec![],
+            })]
+            .into(),
+        );
+        let outcome = ensure_count_outcome(&cfg, Backend::Docker).unwrap();
+        assert_eq!(outcome.started, vec!["ez-recovery-1"]);
+        assert_eq!(outcome.missing, 2);
+        assert_eq!(
+            TEST_START_ONE_NAMES.lock().unwrap().as_ref().unwrap().len(),
+            1
+        );
+        assert_eq!(DISK_RECOVERY_LATCH.lock().unwrap().1.floor(30, 45), 30);
+        assert_eq!(
+            crate::ensure_success_decision(&cfg, &outcome),
+            crate::EnsureSuccessDecision::PacedRefill
+        );
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(29));
+        assert!(ensure_count_outcome(&cfg, Backend::Docker)
+            .unwrap()
+            .admission_paused_reason
+            .is_some());
+        assert_eq!(DISK_RECOVERY_LATCH.lock().unwrap().1.floor(30, 45), 45);
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(40));
+        assert!(ensure_count_outcome(&cfg, Backend::Docker)
+            .unwrap()
+            .admission_paused_reason
+            .is_some());
+    }
+
+    #[test]
+    fn disk_recovery_unknown_measurement_closes_legacy_fail_open() {
+        let _env = TestEnv::new("disk_recovery_unknown");
+        let cfg = recovery_cfg();
+        *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = Some(0);
+        *TEST_MANAGED_CONTAINERS.lock().unwrap() = Some(vec![]);
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_HOST_FREE_DISK_GB.lock().unwrap() = Some(Some(100));
+        *TEST_RECOVERY_PRESSURE.lock().unwrap() = Some(Err("unavailable".into()));
+        assert!(ensure_count_outcome(&cfg, Backend::Docker)
+            .unwrap()
+            .admission_paused_reason
+            .is_some());
+        *TEST_FREE_DISK_GB.lock().unwrap() = Some(None);
+        *TEST_RECOVERY_PRESSURE.lock().unwrap() = Some(Ok((0.0, u64::MAX)));
+        assert!(ensure_count_outcome(&cfg, Backend::Docker)
+            .unwrap()
+            .admission_paused_reason
+            .is_some());
+    }
+
     #[test]
     fn fleet_circuit_threshold_is_reachable_for_small_legacy_fleets() {
         let one = cfg_with(1, "ez-org-runner");
@@ -5516,6 +5694,11 @@ mod tests {
             // expects an empty buffer would see leftover records from
             // earlier tests in the same `cargo test` invocation.
             reset_reclaim_state_for_tests();
+            *TEST_RECOVERY_PRESSURE.lock().unwrap() = None;
+            *DISK_RECOVERY_LATCH.lock().unwrap() = (
+                String::new(),
+                crate::disk_recovery::RecoveryLatch::default(),
+            );
             // Redirect the quarantine table into the test's temp dir.
             // Without this, tests whose cfg has no state_dir fall through
             // to the REAL global XDG path (~/.config/ezgha/
@@ -5547,6 +5730,7 @@ mod tests {
 
     impl Drop for TestEnv {
         fn drop(&mut self) {
+            *TEST_RECOVERY_PRESSURE.lock().unwrap() = None;
             *TEST_SLOT_PATH.lock().unwrap() = None;
             *TEST_RELEASE_STALE_SLOTS_RESULT.lock().unwrap() = None;
             *TEST_FREE_DISK_GB.lock().unwrap() = None;
