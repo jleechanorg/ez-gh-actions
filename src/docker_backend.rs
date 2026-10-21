@@ -5755,8 +5755,8 @@ mod tests {
         native.limits.memory_mb = 2300;
         let increased = effective_limits(&native);
         *TEST_DAEMON_CAPACITY.lock().unwrap() = None;
-        assert_eq!(approved.unwrap().1, 2000);
-        assert_eq!(increased.unwrap().1, 2048);
+        assert_eq!(approved.unwrap().1, 1750);
+        assert_eq!(increased.unwrap().1, 1792);
     }
 
     #[test]
@@ -6005,7 +6005,7 @@ mod tests {
     }
 
     #[test]
-    fn derive_memory_budget_supports_approved_fourteen_runner_floor() {
+    fn derive_memory_budget_supports_approved_sixteen_runner_floor() {
         let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
             .expect("tracked native Linux configuration must parse");
         let budget = derive_memory_budget(
@@ -6016,7 +6016,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(budget.fleet_budget_mb, 28672);
-        assert_eq!(budget.per_runner_budget_mb, 2048);
+        assert_eq!(budget.per_runner_budget_mb, 1792);
         assert_eq!(u64::from(cfg.runner.count) * cfg.limits.memory_mb, 28000);
         assert!(u64::from(cfg.runner.count) * cfg.limits.memory_mb <= budget.fleet_budget_mb);
         assert!(derive_memory_budget(

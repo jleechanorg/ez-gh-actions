@@ -101,11 +101,12 @@ assert_line "$USER_SVC_DROPIN" "ManagedOOMPreference=none"
 assert_line "$USER_SVC_DROPIN" "OOMScoreAdjust=0"
 ok "all six boundary drop-ins present and neutral"
 
-# 4. Config alignment (2000 MiB per runner — 2026-10-18 contract, bead jleechan-qbcm)
+# 4. Config alignment (1750 MiB per runner — 2026-10-21 restoration contract, 16 @ 1750;
+#    from bead jleechan-eldq via the operator restoration directive)
 LINUX_EXAMPLE="$REPO_ROOT/config/config.toml.linux.example"
 assert_file "$LINUX_EXAMPLE"
-grep -q "memory_mb = 2000" "$LINUX_EXAMPLE" || fail "config.toml.linux.example missing 2000 MiB runner memory limit"
-ok "config.toml.linux.example aligned to 2000 MiB per runner"
+grep -q "memory_mb = 1750" "$LINUX_EXAMPLE" || fail "config.toml.linux.example missing 1750 MiB runner memory limit"
+ok "config.toml.linux.example aligned to 1750 MiB per runner (16-runner restoration profile)"
 
 # 5. Absence of forbidden legacy artifacts and escape hatches
 assert_not_file "$REPO_ROOT/systemd/ezgha.service.d/10-oomd-omit.conf"

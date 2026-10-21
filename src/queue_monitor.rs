@@ -13,13 +13,14 @@ use crate::github;
 const FLEET_ORG: &str = "jleechanorg";
 const LINUX_FLEET_PREFIX: &str = "ez-runner-c-";
 const MAC_FLEET_PREFIX: &str = "ez-mac-runner-h-";
-// Capacity contract 2026-10-18 (bead jleechan-eldq): Linux fleet
-// reduced 20 -> 14, paired with raising per-runner memory 1400 -> 2000 MiB inside the
-// same 28 GiB aggregate envelope. Rationale: runner-container jobs (vitest) OOM-died
-// at 1400 MiB while the host swap pool was saturated; the fleet never settled above
-// ~18/20 at the old profile. Restoration target is 16 @ 1750 MiB (same envelope),
-// gated on the sa8c host-OOM policy landing plus reclaimed host memory.
-const LINUX_FLEET_COUNT: u32 = 14;
+// Capacity contract 2026-10-21 RESTORATION (beads jleechan-eldq + the operator
+// directive "drive to 16"): Linux fleet restored 14 -> 16, paired with lowering
+// per-runner memory 2000 -> 1750 MiB inside the same 28 GiB aggregate envelope
+// (16 x 1750 = 28000 = 14 x 2000). Precondition: the sa8c host-OOM containment
+// policy is live (R1 cap-fit amendment bead jleechan-r1-cap-fit-amendment-byee
+// closes the 244174 KiB profile/host gap) and the scratch reclaimer (uh1h)
+// holds the host disk floor.
+const LINUX_FLEET_COUNT: u32 = 16;
 const MAC_FLEET_COUNT: u32 = 4;
 const EXPECTED_FLEET_RUNNERS: usize = (LINUX_FLEET_COUNT + MAC_FLEET_COUNT) as usize;
 
@@ -2454,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_stats_counts_exact_18_runner_pool_only() {
+    fn fleet_stats_counts_exact_20_runner_pool_only() {
         let runners = vec![
             runner("ez-runner-c-1", "online", true),
             runner("ez-runner-c-2", "online", false),
@@ -2468,7 +2469,7 @@ mod tests {
 
         let stats = fleet_runner_stats(runners);
 
-        assert_eq!(stats.expected_total, 18);
+        assert_eq!(stats.expected_total, 20);
         assert_eq!(stats.registered_count, 6);
         assert_eq!(stats.busy_count, 3);
         assert_eq!(stats.idle_count, 2);
@@ -2484,9 +2485,9 @@ mod tests {
             .runners
             .iter()
             .any(|runner| runner.name == "ez-mac-runner-h-4"));
-        // c-20 shares the Linux prefix but exceeds the 14-slot pool (1..=14):
-        // with the 2026-10-18 contract it must be filtered OUT exactly like
-        // the canary below.
+        // c-20 shares the Linux prefix but exceeds the 16-slot pool (1..=16):
+        // with the 2026-10-21 restoration contract it must be filtered OUT
+        // exactly like the canary below.
         assert!(!stats
             .runners
             .iter()

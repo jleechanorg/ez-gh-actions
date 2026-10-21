@@ -320,7 +320,7 @@ fi
 # Section-scoped count: slot_assignments.toml now carries BOTH [assignments]
 # and [registered_at] sections, one line per slot each (registered_at was
 # added during churn remediation). A whole-file `grep -c '='` therefore
-# double-counts (~28 for a 14-slot Linux fleet) — see ez-gh-actions-nj2j. Count
+# double-counts (~30 for a 16-slot Linux fleet) — see ez-gh-actions-nj2j. Count
 # only lines inside [assignments], never a whole-file grep.
 count_assignments_section() {
   awk '
@@ -765,7 +765,7 @@ fi
 # got a container at all (DOWN) is reported by name, not silently absent.
 section "9. per-slot activity truth (docker top, LOCAL-ONLY) — EXECUTING/IDLE-OK/IDLE-STARVED/DOWN"
 CONFIGURED_COUNT=$(read_config_runner_count "$LOCAL_CONFIG_FILE" 2>/dev/null || true)
-DEFAULT_LINUX_RUNNER_COUNT=14
+DEFAULT_LINUX_RUNNER_COUNT=16
 DEFAULT_MAC_RUNNER_COUNT=4
 if [ "$PLATFORM" = "macos" ]; then
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_MAC_RUNNER_COUNT"
