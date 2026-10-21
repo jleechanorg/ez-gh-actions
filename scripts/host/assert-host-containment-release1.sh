@@ -27,11 +27,14 @@ mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null 
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
 
 # Floor is the computed sum of the four enforced hard limits
-# (Actions 28G + QEMU 10G + Agents 12G + Automation 5G = 55 GiB)
+# (Actions 28G + QEMU 10G + Agents 11.5G + Automation 5G = 54.5 GiB)
+# R1 cap-fit amendment 2026-10-21 (bead jleechan-r1-cap-fit-amendment-byee):
+# agents 12G -> 11.5G so caps + max(2G, 10% MemTotal) reserve fits the real
+# 60.9 GiB host; prior profile needed 64052514 KiB vs MemTotal 63808340.
 # plus max(2 GiB, 10% of host MemTotal).
 ENFORCED_ACTIONS_MAX_BYTES=30064771072
 ENFORCED_QEMU_MAX_BYTES=10737418240
-ENFORCED_AGENTS_MAX_BYTES=12884901888
+ENFORCED_AGENTS_MAX_BYTES=12348030976
 ENFORCED_AUTOMATION_MAX_BYTES=5368709120
 
 for b in "$ENFORCED_ACTIONS_MAX_BYTES" "$ENFORCED_QEMU_MAX_BYTES" "$ENFORCED_AGENTS_MAX_BYTES" "$ENFORCED_AUTOMATION_MAX_BYTES"; do
