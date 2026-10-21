@@ -171,15 +171,15 @@ static SLOT_ASSIGNMENTS_MISSING_WARNED: Once = Once::new();
 ///
 /// Max entries per slot is small (16) because the diagnosis window for a
 /// given flap is minutes, not hours; a larger cap would just hold noise.
-/// Daemon start is captured at the first `record_reclaim` call so the
-/// `monotonic_ts` field is comparable across processes.
+/// Daemon start is captured on first use by `ReclaimContext::now()`;
+/// monotonic timestamps are comparable within the process.
 const RECLAIM_RING_CAP: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReclaimRecord {
     /// Monotonic seconds since daemon start (matches `Instant::elapsed`).
     pub monotonic_secs: f64,
-    /// Wall-clock unix epoch seconds (`now_epoch_secs()` at record time).
+    /// Wall-clock unix epoch seconds captured at reclaim-pass entry.
     pub wall_secs: u64,
     /// Slot that was reclaimed (or skipped) — as the user-facing slot number.
     pub slot: u32,
@@ -224,10 +224,8 @@ fn reclaim_ring() -> &'static std::sync::Mutex<
 /// Record a reclaim decision (or grace-window skip) into the per-slot ring.
 /// `slot_key` is the stringified slot number ("1".."16"). When the deque
 /// reaches `RECLAIM_RING_CAP`, the oldest entry is evicted FIFO so memory is
-/// bounded regardless of churn.
-pub fn record_reclaim(slot_key: &str, mut rec: ReclaimRecord) {
-    let start = ensure_daemon_start();
-    rec.monotonic_secs = start.elapsed().as_secs_f64();
+/// bounded regardless of churn. Preserve the caller's captured pass timestamps.
+pub fn record_reclaim(slot_key: &str, rec: ReclaimRecord) {
     if let Ok(mut ring) = reclaim_ring().lock() {
         let entry = ring.entry(slot_key.to_string()).or_default();
         if entry.len() >= RECLAIM_RING_CAP {
@@ -1530,7 +1528,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                 record_reclaim(
                     slot,
                     ReclaimRecord {
-                        monotonic_secs: 0.0, // filled in by record_reclaim
+                        monotonic_secs,
                         wall_secs,
                         slot: slot_n,
                         runner_id: 0,
@@ -1549,7 +1547,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
             record_reclaim(
                 slot,
                 ReclaimRecord {
-                    monotonic_secs: 0.0, // filled in by record_reclaim
+                    monotonic_secs,
                     wall_secs,
                     slot: slot_n,
                     runner_id: 0,
@@ -1610,7 +1608,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                                     record_reclaim(
                                         slot,
                                         ReclaimRecord {
-                                            monotonic_secs: 0.0,
+                                            monotonic_secs,
                                             wall_secs,
                                             slot: slot_n,
                                             runner_id: rid,
@@ -1638,7 +1636,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                                     record_reclaim(
                                         slot,
                                         ReclaimRecord {
-                                            monotonic_secs: 0.0,
+                                            monotonic_secs,
                                             wall_secs,
                                             slot: slot_n,
                                             runner_id: rid,
@@ -1658,35 +1656,46 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         // The recorded runner_id is no longer registered on GitHub
                         // (server-side reap, manual removal, or a stale entry from a
                         // prior host) and no local container exists, so reclaim.
-                        let elapsed =
-                            seconds_since_registered(assignments, slot, ctx.wall_secs).unwrap_or(0);
-                        // Bead ez-gh-actions-qz5j: entry instant, not a fresh read.
-                        let wall_secs = ctx.wall_secs;
-                        let monotonic_secs = ctx.monotonic_secs;
-                        // Bead jleechan-tv58: surface `last_run_id`. There is NO
-                        // local container here (that's the whole point of this
-                        // branch), so `peak_rss_mb` is forced to 0 — the field
-                        // is structurally present, just empty for this reason.
-                        let last_run_id = live_runners_last_run_id(live_runners, rid).unwrap_or(0);
-                        let peak_rss_mb = 0u64;
-                        eprintln!(
-                            "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-missing-no-local-container"
-                        );
-                        record_reclaim(
-                            slot,
-                            ReclaimRecord {
-                                monotonic_secs: 0.0,
-                                wall_secs,
-                                slot: slot_n,
-                                runner_id: rid,
-                                last_run_id,
-                                peak_rss_mb,
-                                in_grace: false,
-                                reason: "gh-missing-no-local-container".to_string(),
-                            },
-                        );
-                        release_slot_for(cfg, slot_n)?;
-                        reclaimed += 1;
+                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
+                            eprintln!(
+                                "info: keeping slot {slot_n}: runner_id {rid} is missing from GitHub and no local container exists, but it was registered {elapsed}s ago (within {}s grace window)",
+                                REGISTRATION_GRACE_WINDOW.as_secs()
+                            );
+                        } else {
+                            let elapsed =
+                                seconds_since_registered(assignments, slot, ctx.wall_secs)
+                                    .unwrap_or(0);
+                            let wall_secs = ctx.wall_secs;
+                            let monotonic_secs = ctx.monotonic_secs;
+                            // Bead jleechan-tv58: surface `last_run_id`. There is NO
+                            // local container here (that's the whole point of this
+                            // branch), so `peak_rss_mb` is forced to 0 — the field
+                            // is structurally present, just empty for this reason.
+                            let last_run_id =
+                                live_runners_last_run_id(live_runners, rid).unwrap_or(0);
+                            let peak_rss_mb = 0u64;
+                            eprintln!(
+                                "info: release_stale_slots reclaimed slot {slot_n}: runner_id={rid} last_run_id={last_run_id} monotonic_ts={monotonic_secs:.3} wall_ts={wall_secs} elapsed_secs={elapsed} peak_rss_mb={peak_rss_mb} in_grace=false reason=gh-missing-no-local-container"
+                            );
+                            record_reclaim(
+                                slot,
+                                ReclaimRecord {
+                                    monotonic_secs,
+                                    wall_secs,
+                                    slot: slot_n,
+                                    runner_id: rid,
+                                    last_run_id,
+                                    peak_rss_mb,
+                                    in_grace: false,
+                                    reason: "gh-missing-no-local-container".to_string(),
+                                },
+                            );
+                            release_slot_for(cfg, slot_n)?;
+                            reclaimed += 1;
+                        }
                     }
                     None => {
                         if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
@@ -1724,7 +1733,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                             record_reclaim(
                                 slot,
                                 ReclaimRecord {
-                                    monotonic_secs: 0.0,
+                                    monotonic_secs,
                                     wall_secs,
                                     slot: slot_n,
                                     runner_id: rid,
@@ -1763,7 +1772,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                     record_reclaim(
                         slot,
                         ReclaimRecord {
-                            monotonic_secs: 0.0,
+                            monotonic_secs,
                             wall_secs,
                             slot: slot_n,
                             runner_id: rid,
@@ -1812,7 +1821,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                             record_reclaim(
                                 slot,
                                 ReclaimRecord {
-                                    monotonic_secs: 0.0,
+                                    monotonic_secs,
                                     wall_secs,
                                     slot: slot_n,
                                     runner_id: rid,
@@ -1949,7 +1958,7 @@ fn offline_not_busy_owned_missing_container_registrations(
                 record_reclaim(
                     slot,
                     ReclaimRecord {
-                        monotonic_secs: 0.0,
+                        monotonic_secs,
                         wall_secs,
                         slot: slot_n,
                         runner_id: runner.id,
@@ -6575,7 +6584,7 @@ minimum_isolation = "container"
 
     #[test]
     fn reaper_initialization_failure_prevents_child_spawn() {
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let marker = tmp_path("reaper_init_failure").with_extension("spawned");
         let mut cmd = std::process::Command::new("/bin/sh");
         cmd.args([
@@ -6735,7 +6744,7 @@ minimum_isolation = "container"
 
     #[test]
     fn supervised_reaper_recovers_after_worker_panic() {
-        let _lock = TEST_LOCK.lock().unwrap();
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let reaper = docker_child_reaper().unwrap();
         let panic_count = TEST_DOCKER_REAPER_PANIC_COUNT.load(Ordering::SeqCst);
         TEST_DOCKER_REAPER_PANIC_ONCE.store(true, Ordering::SeqCst);
@@ -7618,9 +7627,10 @@ esac
             assignments
                 .assignments
                 .insert(slot.to_string(), (1000 + slot).to_string());
-            assignments
-                .registered_at
-                .insert(slot.to_string(), now_epoch_secs());
+            assignments.registered_at.insert(
+                slot.to_string(),
+                now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+            );
         }
         write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
         for (file, after) in [("before.json", false), ("after.json", true)] {
@@ -7878,9 +7888,14 @@ esac
             assignments
                 .assignments
                 .insert(slot.to_string(), (1000 + slot).to_string());
-            assignments
-                .registered_at
-                .insert(slot.to_string(), now_epoch_secs());
+            assignments.registered_at.insert(
+                slot.to_string(),
+                if case == "empty" && slot == 4 {
+                    now_epoch_secs()
+                } else {
+                    now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1
+                },
+            );
         }
         if case == "failed_fresh" {
             assignments.assignments.remove("11");
@@ -10700,6 +10715,13 @@ esac
         let _slot = next_slot(&cfg).unwrap();
         record_slot_runner_id(1, 4242).unwrap();
 
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments.registered_at.insert(
+            "1".to_string(),
+            now_epoch_secs() - REGISTRATION_GRACE_WINDOW.as_secs() - 1,
+        );
+        write_slot_assignments_for(&assignments, None).unwrap();
+
         let live = vec![runner_info(9999, "ez-org-runner-2")];
         // Use an explicit (empty) local-container set rather than the
         // `release_stale_slots_from` helper's `None`: post-B2-fix, `None`
@@ -10724,6 +10746,30 @@ esac
             "slot 1 must be removed; got: {:?}",
             a.assignments
         );
+    }
+
+    #[test]
+    fn release_stale_slots_keeps_slot_when_runner_id_not_in_live_within_grace() {
+        let _env = TestEnv::new("stale_keeps_within_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let reclaimed = release_stale_slots_from_with_containers(
+            &read_slot_assignments().unwrap(),
+            &live,
+            "",
+            Some(&HashSet::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "must NOT reclaim within grace window (Path-1 timing race)"
+        );
+        let a = read_slot_assignments().unwrap();
+        assert!(a.assignments.contains_key("1"));
     }
 
     #[test]
@@ -13259,7 +13305,7 @@ esac
         assert_eq!(rec.reason, "empty-id-grace-skip");
         assert!(
             rec.monotonic_secs >= 0.0,
-            "monotonic_secs must be filled by record_reclaim"
+            "monotonic_secs must be captured by the reclaim pass"
         );
     }
 
@@ -13711,7 +13757,7 @@ esac
             let history = snapshot_reclaim(Some(slot));
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].1.wall_secs, ctx.wall_secs);
-            // The ring records event time; the shared wall clock is the pass boundary.
+            assert_eq!(history[0].1.monotonic_secs, ctx.monotonic_secs);
             assert_eq!(
                 history[0].1.reason,
                 if slot == "1" {
@@ -13738,7 +13784,7 @@ esac
             record_reclaim(
                 "7",
                 ReclaimRecord {
-                    monotonic_secs: 0.0,
+                    monotonic_secs: i as f64,
                     wall_secs: now_epoch_secs() + i as u64,
                     slot: 7,
                     runner_id: 0,

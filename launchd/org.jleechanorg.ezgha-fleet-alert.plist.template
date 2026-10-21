@@ -60,9 +60,7 @@
     <!-- Override SLACK_WEBHOOK_URL via launchctl setenv or env-vars plist
          if Slack routing is desired (see scripts/ezgha-fleet-alert.sh). -->
     <key>DAEMON_STDERR_LOG</key>
-    <string>@HOME@/Library/Logs/ezgha-launchd-stderr.log</string>
-    <key>SLOT_FILE</key>
-    <string>@HOME@/.config/ezgha/slot_assignments.toml</string>
+    <string>/tmp/ezgha-launchd-stderr.log</string>
     <key>STATE_DIR</key>
     <string>@HOME@/.local/state/ezgha/alert</string>
   </dict>

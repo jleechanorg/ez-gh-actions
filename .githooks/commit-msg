@@ -10,6 +10,7 @@
 #   claude/<model-id>:    Claude Code native session
 #   claudem/<model-id>:   MiniMax CLI / MiniMax-M3 family
 #   claudew/<model-id>:   Wafer CLI / GLM family
+#   pi/<model-id>:        pi coding agent harness (the pi CLI runtime)
 #   gemini/<model-id>:    Gemini CLI
 #   codex/<model-id>:     Codex CLI
 #   cursor/<model>:       Cursor / OpenCode
@@ -52,7 +53,7 @@ fi
 # `/<model-id>` segment before the ':' — the slash and model-id are NOT
 # optional, otherwise bare "claude: fix" (no model) or "humane: tweak" (word
 # that merely starts with "human") would incorrectly pass.
-allowed_re='^(claude|claudem|claudew|gemini|codex|cursor|ao)/[a-zA-Z0-9._-]+:[[:space:]]'
+allowed_re='^(claude|claudem|claudew|gemini|codex|cursor|ao|pi)/[a-zA-Z0-9._-]+:[[:space:]]'
 human_re='^human:[[:space:]]'
 
 # Merge commits are produced by git itself and should be allowed through
@@ -90,6 +91,7 @@ tag" rule, every commit subject MUST start with one of:
   claude/<model-id>:    Claude Code native
   claudem/<model-id>:   MiniMax / MiniMax-M3 family
   claudew/<model-id>:   Wafer / GLM family
+  pi/<model-id>:        pi coding agent harness
   gemini/<model-id>:    Gemini CLI
   codex/<model-id>:     Codex CLI
   cursor/<model>:       Cursor / OpenCode
