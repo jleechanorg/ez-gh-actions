@@ -1,0 +1,63 @@
+name: Binary SHA Drift Check
+
+# Server-side companion to the local .githooks/pre-push hook.
+#
+# Builds the binary from the pushed HEAD, captures the SHA embedded in
+# `ezgha --version`, and asserts it matches `git rev-parse HEAD`. Catches
+# any case where a binary with a stale SHA reaches main (e.g. a commit
+# skipped the local hook, or a squash-merge bypassed the hook contract).
+#
+# Companion surface: tests/install_binary_drift_test.sh (Layer 1) covers
+# the local hook; this workflow is the server-side Layer 2.
+#
+# Reference: GH#103, bead jleechan-zs0j.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Built binary SHA matches HEAD
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-binary-sha-drift-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-binary-sha-drift-
+
+      - name: Build & install ezgha
+        run: |
+          set -euo pipefail
+          cargo install --path . --root /tmp/ezgha-install --locked --quiet
+
+      - name: Binary SHA verifier regressions
+        run: bash tests/check_built_binary_sha_test.sh
+
+      - name: Compare installed binary SHA vs HEAD
+        run: bash scripts/check_built_binary_sha.sh /tmp/ezgha-install/bin/ezgha
