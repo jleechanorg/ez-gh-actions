@@ -539,9 +539,9 @@ CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$
   "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
 grep -qx "systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
   || fail "live apply did not set automation.slice to 4608M/5G: $(grep automation "$WORK/live_sys.log" || echo none)"
-grep -qx "systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=11.5G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
-  || fail "live apply did not set agents.slice to 10G/11.5G: $(grep agents "$WORK/live_sys.log" || echo none)"
-ok "apply-host-containment-release1.sh live branch persists agents.slice 10G/11.5G and automation.slice 4608M/5G via set-property"
+grep -qx "systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
+  || fail "live apply did not set agents.slice to 10G/11776M: $(grep agents "$WORK/live_sys.log" || echo none)"
+ok "apply-host-containment-release1.sh live branch persists agents.slice 10G/11776M and automation.slice 4608M/5G via set-property"
 
 # The root phase enrolls actions.slice with systemd-oomd (kill at 80% pressure);
 # agents.slice and automation.slice are never enrolled with kill.

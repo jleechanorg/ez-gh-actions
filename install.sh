@@ -993,7 +993,7 @@ EOF
     # Reapply the tracked budgets after copying the unit files. A prior
     # systemctl --user set-property writes user.control drop-ins that survive
     # unit replacement, so the tracked values must win during every install.
-    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=11.5G MemorySwapMax=2G TasksMax=8192)
+    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192)
     AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
     if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
       bad "could not apply selected agents.slice budget"
