@@ -68,3 +68,73 @@ Work block: multi-day fleet operations on `jleechanorg/ez-gh-actions` (repo `/Us
 ## Roadmap pointer
 
 - Appended `roadmap/activity/2026-10-20.md` (new date; README "Recent activity" date link added).
+
+---
+
+# Nextsteps — addendum — 2026-10-20 evening (PR #181 review cycle + Linux resource triage)
+
+## Table of contents (addendum)
+
+- [Executive summary (evening)](#executive-summary-evening)
+- [Context (evening)](#context-evening)
+- [Bead index (evening)](#bead-index-evening)
+- [Work queue (evening)](#work-queue-evening)
+- [Timeline and parallel lanes (evening)](#timeline-and-parallel-lanes-evening)
+- [PR / merge state (evening)](#pr--merge-state-evening)
+- [Learnings pointer (evening)](#learnings-pointer-evening)
+- [Roadmap pointer (evening)](#roadmap-pointer-evening)
+
+## Executive summary (evening)
+
+- Outcomes: PR #183 (pi/ provenance gate) MERGED; PR #181 driven through 5 review rounds — all round-2/3 blockers fixed at head 6de65b7 (doctor-runner fallback alignment, PR-body honesty, credential incident resolved with server-side-deletion receipts, flat checksum manifest); Opus APPROVED at 6de65b7; jeff-ubuntu triaged through a disk+memory tug-of-war (~37G reclaimed, 39 gated idle-scratch removals, recurring E2E leak killed 3x).
+- Risks: PR #181 merge blocked on Dot round-5 reply (shared composer busy) + ER PASS (raw simultaneous-pass artifact form); Linux fleet capacity oscillates on the disk/memory floors during heavy evenings until the reclaimer + leak fix land.
+- Next: implement the pressure-gated scratch reclaimer + admission hysteresis (config-only), fix the a11 E2E leak in the worldarchitect repo, then re-run the PR #181 review quorum.
+- Beads: [jleechan-uh1h](beads) (scratch reclaimer), [jleechan-fufd](beads) (E2E leak), [jleechan-eldq](beads) (contract record), [jleechan-2o14](beads) (Mac VM).
+
+## Context (evening)
+
+Continuation of the 2026-10-20 capacity-contract block. PR #181 (head 6de65b7, all CI green) went through the full /ready gate chain with a 4-reviewer fan (Codex, Opus, Dot, ER). A credential incident in evidence bundle v3 (unredacted --jitconfig in raw docker top output) was caught by Codex, resolved (gist deleted, comm-only captures, 16/16 registration-deletion receipts proving HTTP 404). In parallel, jeff-ubuntu alternated between disk and memory admission gates under an evening CI burst.
+
+## Bead index (evening)
+
+| Bead | Title | Link |
+|------|-------|------|
+| jleechan-uh1h | Linux disk oscillation at 30G floor; same-day scratch lacks auto-reclaim tier | [br show jleechan-uh1h](https://github.com/jleechanorg/ez-gh-actions) |
+| jleechan-fufd | a11-private-relevance-e2e leaks to 8GB+ RSS, starves host (3 kills/evening) | [br show jleechan-fufd](https://github.com/jleechanorg/ez-gh-actions) |
+| jleechan-eldq | 18-runner capacity contract record (recreated from tombstoned jleechan-qbcm) | [br show jleechan-eldq](https://github.com/jleechanorg/ez-gh-actions) |
+| jleechan-2o14 | Mac colima VM right-size (16GiB done) + trim-guard repair (open) | [br show jleechan-2o14](https://github.com/jleechanorg/ez-gh-actions) |
+
+## Work queue (evening)
+
+1. **Implement the pressure-gated scratch reclaimer** ([jleechan-uh1h](https://github.com/jleechanorg/ez-gh-actions)): a small timer/daemon applying the proven gates (no writes in 25-30 min + zero lsof open handles) to /tmp trees >250M when free < 35G, plus **admission hysteresis** (pause below 30G, resume above 40G — config-only change) to stop the flap. Acceptance: an evening 70-job burst holds >= 11/14 executing without manual sweeps.
+2. **Fix the a11-private-relevance-e2e memory leak** ([jleechan-fufd](https://github.com/jleechanorg/ez-gh-actions)) in jleechanorg/worldarchitect.ai: profile the 8GB growth, cap or fix. Acceptance: suite stays under 2G RSS through a full run.
+3. **Close PR #181's review quorum**: poll the Dot round-5 reply (packet sent, verified; composer was busy with another session's reviews); re-run ER against bundle v7 (flat manifest fixed) once the Linux fleet can produce the raw simultaneous-pass artifact; then update the Advice Approval section, undraft, and merge under the operator's standing conditional.
+4. **After merge: rebuild both machines** from merged main (Gate 0: cargo test, install, restart, verify-exit-criteria on both hosts), and restore the jeff-ubuntu checkout to main.
+5. **Repair the dead colima-trim guard + trim cadence** (still open from [jleechan-2o14](https://github.com/jleechanorg/ez-gh-actions)).
+
+## Timeline and parallel lanes (evening)
+
+| Elapsed estimate | Lane / owner | Scope / dependencies | Deliverable / proof |
+|---|---|---|---|
+| +0–1 h | Lane 1 — reclaimer + hysteresis ([jleechan-uh1h](https://github.com/jleechanorg/ez-gh-actions)) | ez-gh-actions repo, disjoint from Lane 2 | Timer installed; burst-hold proof |
+| +0–2 h (parallel) | Lane 2 — E2E leak profile+fix ([jleechan-fufd](https://github.com/jleechanorg/ez-gh-actions)) | worldarchitect.ai repo | RSS-capped suite |
+| +0–2 h (parallel) | Lane 3 — PR #181 quorum close | poll dot; ER re-run; no repo change | 2+ APPROVED + ER PASS at 6de65b7 |
+| +1–2 h | Lane 4 — merge + rebuild both hosts | after Lane 3 | 18/18 executing on merged-main binaries |
+
+- Critical path: Lane 3 → Lane 4; Lanes 1-2 independent.
+- Concurrency ceiling: 3-4 lanes; binding limits: the shared dot composer (Lane 3) and jeff-ubuntu host load (Lane 1 testing).
+- Milestones relative to execution start: +20m reclaimer drafted; +40m E2E leak profiled; +60m quorum status; hourly rollups while active.
+- Execution start: pending authorized resumption; this handoff does not start it.
+
+## PR / merge state (evening)
+
+- https://github.com/jleechanorg/ez-gh-actions/pull/181 — **OPEN** (draft), head 6de65b7, MERGEABLE, all CI green. NOT merged: dot round-5 pending + ER PASS outstanding. Operator approval stands conditional on those gates.
+- https://github.com/jleechanorg/ez-gh-actions/pull/183 — **MERGED** (pi/ provenance gate fix).
+
+## Learnings pointer (evening)
+
+- `~/roadmap/learnings-2026-10.md` — section `2026-10-20 — Linux host resource tug-of-war: gates work, whack-a-mole doesn't scale`.
+
+## Roadmap pointer (evening)
+
+- Appended `roadmap/activity/2026-10-20.md` (same-date entry; README link already added earlier today).
