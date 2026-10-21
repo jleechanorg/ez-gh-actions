@@ -168,6 +168,94 @@ class ReclaimerTest(unittest.TestCase):
             terminal=lambda *a: True, unused=lambda *a: True, contained=lambda *a: False), [])
         self.assertTrue(path.exists())
 
+    def test_mount_audit_refuses_same_device_directory_and_file_mounts(self):
+        # Hermetic fdinfo model, not a privileged bind-mount integration test.
+        for directory in (False, True):
+            with self.subTest(directory=directory):
+                with self.lease() as lease:
+                    child = lease.path / 'nested'
+                    child.mkdir() if directory else child.write_text('mounted')
+                original = sr.mount_id
+                def synthetic_mount(fd):
+                    if os.fstat(fd).st_ino == child.stat().st_ino:
+                        return original(fd) + 1
+                    return original(fd)
+                with patch.object(sr, 'mount_id', side_effect=synthetic_mount):
+                    self.assertNotIn(lease.identifier, self.reclaim())
+                self.assertTrue(child.exists())
+
+    def test_mount_replacement_during_external_probe_is_excluded(self):
+        with self.lease() as lease:
+            child = lease.path / 'nested'
+            child.mkdir()
+        replaced = False
+        original = sr.mount_id
+        def synthetic_mount(fd):
+            value = original(fd)
+            return value + 1 if replaced and os.fstat(fd).st_ino == child.stat().st_ino else value
+        def probe(*args):
+            nonlocal replaced
+            replaced = True
+            return True
+        with patch.object(sr, 'mount_id', side_effect=synthetic_mount):
+            self.assertEqual(sr.reclaim(self.root, low_bytes=100, free_bytes=lambda: 10,
+                terminal=probe, unused=lambda *a: True, contained=lambda *a: True), [])
+        self.assertTrue(child.exists())
+
+    def test_symlink_ancestor_refused_by_descriptor_audit(self):
+        with self.lease() as lease:
+            path = lease.path
+        alias = Path(self.tmp.name) / 'alias'
+        alias.symlink_to(self.root, target_is_directory=True)
+        # Direct helper also rejects an ancestor above an otherwise real root.
+        with self.assertRaises(OSError):
+            sr.audit_mount_tree(alias / 'trees' / path.name, (path.stat().st_dev, path.stat().st_ino))
+
+    def test_missing_mount_identity_fails_closed(self):
+        with self.lease() as lease:
+            path = lease.path
+        with patch.object(sr, 'mount_id', side_effect=ValueError('missing fdinfo')):
+            self.assertEqual(self.reclaim(), [])
+        self.assertTrue(path.exists())
+
+    def test_mount_scan_budget_is_bounded_and_nondestructive(self):
+        with self.lease() as lease:
+            path = lease.path
+            (path / 'one').mkdir()
+            (path / 'one' / 'two').mkdir()
+        identity = (path.stat().st_dev, path.stat().st_ino)
+        self.assertFalse(sr.audit_mount_tree(path, identity, max_entries=1))
+        self.assertFalse(sr.audit_mount_tree(path, identity, max_depth=0))
+        self.assertTrue((path / 'one' / 'two').is_dir())
+
+    def test_nested_symlink_and_special_file_never_opened_for_io(self):
+        with self.lease() as lease:
+            path = lease.path
+            os.mkfifo(path / 'pipe')
+        self.assertEqual(self.reclaim(), [lease.identifier])
+        (path / 'link').symlink_to(Path(self.tmp.name))
+        self.assertEqual(self.reclaim(), [])
+        self.assertTrue((path / 'pipe').exists())
+
+    def test_lifecycle_observations_never_authorize_apply(self):
+        # Hook exit, leader exit and empty-scope snapshots cannot prove closed
+        # admission. Even all positive diagnostics retain the hard refusal.
+        for observation in ('successful_job_completed_hook', 'leader_exited', 'scope_empty'):
+            with self.subTest(observation=observation):
+                with self.assertRaisesRegex(ValueError, 'deletion unavailable'):
+                    sr.reclaim(self.root, low_bytes=100, apply=True,
+                        terminal=lambda *a: True, unused=lambda *a: True,
+                        contained=lambda *a: True,
+                        free_bytes=lambda: self.fail('apply must refuse before probes'))
+
+    def test_collected_scope_is_unknown_not_terminal(self):
+        with self.lease() as lease:
+            path = lease.path
+        with patch.object(sr, '_scope_info', side_effect=FileNotFoundError('collected scope')):
+            self.assertEqual(sr.reclaim(self.root, low_bytes=100, free_bytes=lambda: 10,
+                terminal=lambda *a: True, unused=lambda *a: True), [])
+        self.assertTrue(path.exists())
+
     def test_job_identity_and_terminal_status(self):
         from subprocess import CompletedProcess
         import json

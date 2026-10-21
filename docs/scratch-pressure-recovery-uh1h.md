@@ -42,6 +42,26 @@ error/diagnostic as unknown. It reports candidate IDs, never authorization to
 delete. Legacy trees, symlinks, replacement inodes, busy locks, and unknown probes
 are excluded. No credentials are read or installed by tests.
 
+## Existing integration points and remaining trust gap
+
+The audit-only traversal follows the descriptor/mount-ID semantics in
+`docker/runner-post-job-workspace-prune.py` without invoking or importing its
+cleanup code. Two scans (before and after external probes) have per-tree entry/depth
+budgets, not wall-clock or whole-audit time bounds. Filesystem calls can block.
+They are snapshots, not atomic protection: mutations or new mounts can escape detection during or
+after traversal. Actual deletion
+would have to retain safe descriptors and permanent writer exclusion throughout.
+
+The Dockerfile's `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` is not a lifecycle closure
+signal: Runner.Worker is still executing that hook. Its textual `GITHUB_JOB` is
+not the numeric Actions job ID. `start_one_with_generate_at_slot` supplies a
+runner registration ID and container ID, but its runner-name workspace is reused.
+Neither is an immutable scratch lease. `agent-scoped-launch.sh` uses a collected
+user scope with no retained terminal callback or non-escape proof; collection
+cannot be interpreted as successful closure. No existing producer of the reported
+host session-scratch trees is identified by this patch. Actions and agent-session
+adapters require separate identity models, and neither is wired by this draft.
+
 ## Opt-in daemon admission hysteresis
 
 Existing configs omit `limits.disk_recovery`, preserving existing behavior.
@@ -107,7 +127,15 @@ native capacity safeguards; validate the effective cgroup budget before rollout.
 - lsof failures: nonempty stderr, nonstandard status, and probe exception tests.
 - Reuse: replacement inode, symlink, and competing retained-lock tests.
 - Detached descendants: populated-scope negative test. Permanent scope closure,
-  escape prevention, mount safety, and race-safe actual deletion remain BLOCKED.
+  escape prevention and race-safe actual deletion remain BLOCKED.
+- Mount snapshot audit: no-follow descriptor traversal, kernel mount IDs (including
+  regular-file and same-device directory mounts), post-probe recheck, and bounded
+  10,000-entry/64-level traversal. Hermetic mount-ID mocks cover crossings and
+  replacement; no privileged mount integration or live deletion is claimed.
+  Symlink ancestors/descendants and unknown mount evidence are refused.
+- Lifecycle negatives: completed-hook/leader exit and an empty scope never unlock
+  `--apply`; a collected/missing scope is unknown. These tests preserve the
+  disabled boundary, not an implemented terminal-controller protocol.
 - Overshoot: pure checked-arithmetic envelope test, no live bound claimed.
 - Joint disk/memory: daemon-path tests for high-water disk and low/unknown memory;
   existing PSI tests remain relevant. Real fleet envelope not measured here.

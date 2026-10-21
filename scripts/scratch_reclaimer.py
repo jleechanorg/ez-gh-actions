@@ -23,6 +23,88 @@ REPO = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 CGROUP_ROOT = Path('/sys/fs/cgroup')
 
 
+# Descriptor traversal follows the existing runner workspace auditor's semantics,
+# but intentionally imports none of its deletion behavior.
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+@contextmanager
+def open_directory(path):
+    """Pin an absolute directory without following any symlink ancestor."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('canonical absolute directory required')
+    fd = os.open('/', DIR_FLAGS)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def mount_id(fd):
+    """Kernel descriptor mount identity distinguishes same-device bind mounts."""
+    for line in Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines():
+        if line.startswith('mnt_id:'):
+            value = int(line.split(':', 1)[1])
+            if value > 0:
+                return value
+    raise ValueError('missing descriptor mount identity')
+
+
+def audit_mount_tree(path, identity, *, max_entries=10000, max_depth=64):
+    """Read-only, bounded mount snapshot, never permanent writer exclusion.
+
+    Refuse any nested mount (including a mounted regular file), symlink, changed
+    inode, missing mount evidence, or exhausted scan budget. A workload can still
+    change a tree during or after traversal: this is NOT deletion authority.
+    """
+    remaining = max_entries
+    def scan(fd, expected_mount, depth):
+        nonlocal remaining
+        if depth > max_depth or mount_id(fd) != expected_mount:
+            return False
+        before = os.fstat(fd)
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                remaining -= 1
+                if remaining < 0:
+                    return False
+                info = entry.stat(follow_symlinks=False)
+                # O_PATH pins special files without opening devices or blocking
+                # on FIFOs. Symlinks are refused, never traversed.
+                child = os.open(entry.name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                try:
+                    pinned = os.fstat(child)
+                    if (info.st_dev, info.st_ino) != (pinned.st_dev, pinned.st_ino) or mount_id(child) != expected_mount or stat.S_ISLNK(pinned.st_mode):
+                        return False
+                    if stat.S_ISDIR(pinned.st_mode):
+                        directory = os.open(entry.name, DIR_FLAGS, dir_fd=fd)
+                        try:
+                            opened = os.fstat(directory)
+                            if (opened.st_dev, opened.st_ino) != (pinned.st_dev, pinned.st_ino) or not scan(directory, expected_mount, depth + 1):
+                                return False
+                        finally:
+                            os.close(directory)
+                finally:
+                    os.close(child)
+        after = os.fstat(fd)
+        return (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns)
+
+    path = Path(path)
+    with open_directory(path.parent) as parent:
+        expected_mount = mount_id(parent)
+        fd = os.open(path.name, DIR_FLAGS, dir_fd=parent)
+        try:
+            info = os.fstat(fd)
+            return (info.st_dev, info.st_ino) == identity and scan(fd, expected_mount, 0)
+        finally:
+            os.close(fd)
+
+
 def _private_directory(path):
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -201,6 +283,8 @@ def reclaim(root, *, low_bytes, free_bytes=None, terminal=terminal_job,
                 info = path.lstat()
                 if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != (marker['device'], marker['inode']):
                     continue
+                if not audit_mount_tree(path, (info.st_dev, info.st_ino)):
+                    continue
                 if not terminal(marker['repository'], marker['job_id']) or not contained(marker['scope']) or not unused(path):
                     continue
                 # Revalidate identities after external probes while still owning
@@ -208,8 +292,11 @@ def reclaim(root, *, low_bytes, free_bytes=None, terminal=terminal_job,
                 latest = path.lstat()
                 if (latest.st_dev, latest.st_ino, latest.st_mode, latest.st_mtime_ns, latest.st_ctime_ns) != (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns, info.st_ctime_ns) or _marker(root, identifier) != marker or not contained(marker['scope']):
                     continue
+                if not audit_mount_tree(path, (info.st_dev, info.st_ino)):
+                    continue
                 # Candidate only: no rename, unlink or deletion implementation.
-                # A controller must still prove lifetime closure and mount safety.
+                # A controller must still prove lifetime closure and retain safe
+                # descriptor/mount handling through any future deletion phase.
                 candidates.append(identifier)
         except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             # Unknown state remains on disk. No fail-open fallback and no scan
