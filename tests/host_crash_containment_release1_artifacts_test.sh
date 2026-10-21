@@ -49,7 +49,7 @@ assert_line "$AGENTS_SLICE" "TasksMax=8192"
 assert_line "$AGENTS_SLICE" "ManagedOOMMemoryPressure=auto"
 assert_line "$AGENTS_SLICE" "ManagedOOMSwap=auto"
 grep -q "requires usage below 10G" "$AGENTS_SLICE" || fail "agents.slice missing activation headroom requirement"
-grep -q "6.25 GiB below the observed 18.25 GiB peak" "$AGENTS_SLICE" || fail "agents.slice missing the approved reduction below its observed peak"
+grep -q "6.75 GiB below the observed 18.25 GiB peak" "$AGENTS_SLICE" || fail "agents.slice missing the approved reduction below its observed peak"
 ok "systemd/agents.slice 10G/11776M envelope and auto OOM policies"
 
 AUTOMATION_SLICE="$REPO_ROOT/systemd/automation.slice"
