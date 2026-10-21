@@ -362,10 +362,11 @@ run_envelope() { # policy-root
     bash "$VERIFY" 2>&1
 }
 
-# (a) tracked policy 28+12+5+10 = 56320 MB + 6333 MB reserve <= 63336 MB.
-set_live_policy $((10 * G)) $((12 * G)) $((4608 * 1048576)) $((5 * G))
-env_out=$(run_envelope "$ROOT") || fail "host-docker 28+12+5+10 envelope should pass: $env_out"
-grep -Fq '56320MB' <<<"$env_out" || fail "envelope did not sum live maxima to 56320MB: $env_out"
+# (a) tracked policy 28+11776M+5+10 = 55808 MB (54.5 GiB, R1 cap-fit amendment
+# 2026-10-21, bead jleechan-r1-cap-fit-amendment-byee) + 6333 MB reserve <= 63336 MB.
+set_live_policy $((10 * G)) $((11776 * 1048576)) $((4608 * 1048576)) $((5 * G))
+env_out=$(run_envelope "$ROOT") || fail "host-docker 28+11776M+5+10 envelope should pass: $env_out"
+grep -Fq '55808MB' <<<"$env_out" || fail "envelope did not sum live maxima to 55808MB: $env_out"
 
 # (b) an unbounded live maximum is rejected, never summed as zero.
 printf 'max\n' > "$ENV_DIR/cg/user/agents.slice/memory.max"
@@ -390,7 +391,7 @@ fi
 grep -Fq 'exceed host' <<<"$env_out" || fail "old maxima did not fail on the envelope sum: $env_out"
 
 # (d) live state that drifted from the tracked policy fails even if it fits.
-set_live_policy $((10 * G)) $((12 * G)) $((4 * G)) $((5 * G))
+set_live_policy $((10 * G)) $((11776 * 1048576)) $((4 * G)) $((5 * G))
 if env_out=$(run_envelope "$ROOT"); then
   fail "live automation.slice 4G/5G must not match the tracked 4608M/5G policy: $env_out"
 fi
