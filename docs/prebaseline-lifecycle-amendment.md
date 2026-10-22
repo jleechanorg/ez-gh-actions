@@ -1,0 +1,27 @@
+# Bounded repair: loss of pre-existing containers during refill
+
+Context source: cbbbbaaf844883d14e997275d0df7c3316089933. Only src/docker_backend.rs and src/main.rs production code plus their existing inline tests. Earlier broad expected-minus-inventory and successful-start witness proposals are withdrawn; their raw reviews remain historical.
+
+## Proven failure and smallest fix
+Fresh direct ensure_count RED: initial inventory c1..12; successful starts c13/c14; post-refill inventory c1..11. Current code seeds settling best=11 and continues for25s because it never saw the pre-refill loss. Raw /home/jleechan/mirror/operations/capacity-missing-slot-amendment.E9V4nb/prebaseline-RED-output.txt. The lost PRE-EXISTING c12 alone is enough to justify immediate reconciliation. New starts c13/c14 are NOT witnesses for this trigger.
+
+Add EnsureCountOutcome.post_refill_capacity_lost: Vec<String>, containing ONLY exact configured names present in the initial successful Docker inventory but absent from the successful post-refill inventory in the SAME ensure_count_outcome call. Use runner_name_for(cfg, slot) for1..=count; deterministic deduplicated ordering. Do not include refill.started unless the name independently existed in the initial inventory (a same-name replacement present afterward is not lost). Empty initial witnesses => empty loss list, even if every new start exits immediately. No global current_prefix_containers behavior change, no per-episode state.
+
+Initialize empty for at-capacity/admission return paths. A failed post-inventory stays Err, never converted to absence. A successful inventory can prove loss while later top fails; retain both fields/facts. NotReady is not loss. Foreign, malformed and out-of-range names cannot enter witnesses; this does not repair the separate existing numeric-capacity issue xn1w.
+
+## Exact consumer contract
+Add EnsureSuccessDecision::PostRefillCapacityLost. Admission pause has first priority, including a mid-refill admission_paused_reason; it still sleeps the configured serve_tick even with witnessed loss. Otherwise confirmed loss precedes readiness error, shortage and recovered. New plan maps to existing Ceiling zero sleep. Apply clears settling and keeps pending_readiness=true, matching IncompleteReadiness. Serve logs exact lost names and invokes existing record_settling_ceiling; do not falsely describe a probe error. start_command_disposition returns Incomplete with existing bail/nonzero status for loss. ensure_outcome_may_credit_deadman returns false for loss. Preserve original error and failure-ladder accounting.
+
+## Cadence and blast radius
+Only a pre-existing local container disappearing DURING refill accelerates the next reconciliation. Zero-sleep control flow and one existing start batch per iteration already exist for observed readiness regression and top-race absence. Never-present, quarantined, failed-start-only, or newly-started-then-absent slots retain their present settling/ceiling timing; they cannot supply this trigger repeatedly. Initial inventory must first contain a name for it to become a witness. A successful new start absent before recount does NOT force immediate retry.
+
+Bound: this patch adds zero GitHub calls inside an ensure_count invocation, adds no second start batch, and changes only the time until a subsequent existing invocation. At the14-slot Linux target there are at most14 initial witnesses and the existing missing-slot allocation bound per batch is unchanged. Additional invocation rate depends on real pre-existing container lifetimes, just as current readiness-regression reconciliation does. No measured GitHub secondary-limit margin is asserted; actual API usage is validated by the original fleet queue/canary observation after authorized deployment. Do not invent a numerical provider quota or add a new throttle/framework. Keep the current14Linux+6Mac capacity and all host admission gates.
+
+## Mandatory validation
+1. Direct RED becomes GREEN: same initial/start/post snapshots, assert loss exactly[c12] (notc13,c14), decision loss, zero-sleep plan, no active settling,pending true.
+2. Newly-started-then-absent crash pattern across consecutive cycles with no initial witnesses MUST remain StartSettling and the current5s poll/25s ceiling pacing; no immediate reconcile from new starts. Include failed-start, never-present and quarantined-style omissions as non-witnesses.
+3. Initial witness remains present but NotReady => no loss; exact-name bounds/empty witness/dedup; initial name removed while another new ready container masks numeric ready count still reports actual loss.
+4. Inventory Err remains Err; successful inventory loss plus top Err retains both and chooses loss; admission dominates even with loss; CLI disposition/deadman do not claim recovery.
+5. Existing top-race Absent and subsequent readiness-regression tests stay unchanged. Run scoped tests, then cargo test/fmt/clippy on Linux, independent correctness review before final evidence. Reuse fixtures/helpers, no new framework.
+
+No production edit accompanies this plan. Workers commit+push only when green; no cargo install, daemon restart or formal verifier. Root alone handles later promotion under separate merge authorization and existing load/capacity gates. Original formal90s canary,20-worker bracket,31sample30min acceptance and evidence publication remain unchanged; this is repair-plan approval only, not code or fleet PASS.
