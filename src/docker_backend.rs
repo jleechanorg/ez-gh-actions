@@ -387,6 +387,27 @@ fn retain_started_activity_after_grace_probe(
     ) || (in_grace_before_probe && !matches!(activity, Some(LocalRunnerActivity::Absent)))
 }
 
+/// Probe a successfully-started container only when the live registration is
+/// still the assignment that recorded the successful start. Path 4 runs after
+/// Path 1 and may be past the grace boundary, so Busy and Unknown must remain
+/// vetoes for this current assignment even then.
+fn started_container_activity_for_current_assignment(
+    assignments: &SlotAssignments,
+    slot: &str,
+    runner_id: u64,
+    container_name: &str,
+    activity_probe: &mut impl FnMut(&str) -> LocalRunnerActivity,
+) -> Option<LocalRunnerActivity> {
+    let current_assignment = assignments.assignments.get(slot)?;
+    if current_assignment.is_empty()
+        || current_assignment != &runner_id.to_string()
+        || !assignments.container_started_at.contains_key(slot)
+    {
+        return None;
+    }
+    Some(activity_probe(container_name))
+}
+
 /// True if `slot`'s `assignments[id_str]` is empty (a `next_slot_excluding`
 /// reservation that has not yet been filled by `record_slot_runner_id_for`)
 /// AND the `registered_at` timestamp written by `next_slot_excluding` is
@@ -1975,12 +1996,12 @@ fn offline_not_busy_owned_missing_container_registrations_for(
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
         let in_grace_before_probe = grace_check(assignments, slot);
-        let started_activity = started_container_activity_if_in_grace_with_state(
+        let started_activity = started_container_activity_for_current_assignment(
             assignments,
             slot,
+            runner.id,
             &runner.name,
             &mut activity_probe,
-            in_grace_before_probe,
         );
         if retain_started_activity_after_grace_probe(in_grace_before_probe, started_activity) {
             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
@@ -11546,13 +11567,12 @@ esac
     // --- bead ez-gh-actions-5ki: registration grace window ---
 
     #[test]
-    fn path4_outer_reap_does_not_delete_busy_or_unknown_after_grace_boundary() {
-        // Path 4 is downstream of Path 1 and uses its pre-release snapshot.
-        // A probe may begin in grace and cross the boundary before the
-        // candidate reaches remove_runner; Busy and Unknown must still veto
-        // the destructive registration cleanup.
+    fn path1_to_path4_reap_does_not_delete_busy_or_unknown_after_grace_boundary() {
+        // Path 1 observes the assignment during grace and retains it after a
+        // Busy/Unknown probe. Path 4 then runs past grace on the same snapshot;
+        // it must fresh-probe the current started assignment before deletion.
         for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
-            let _env = TestEnv::new(&format!("outer_boundary_path4_{activity:?}"));
+            let _env = TestEnv::new(&format!("outer_boundary_path1_path4_{activity:?}"));
             let cfg = cfg_with(2, "ez-org-runner");
             let _slot = next_slot(&cfg).unwrap();
             record_slot_runner_id(1, 4242).unwrap();
@@ -11561,7 +11581,32 @@ esac
             let assignments = read_slot_assignments().unwrap();
             let live = vec![s9d_runner(4242, "ez-org-runner-1", "offline", false)];
             let local_names = HashSet::new();
-            let mut grace_checks = 0;
+            let mut path1_grace_checks = 0;
+            let path1_reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &assignments,
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    path1_grace_checks += 1;
+                    path1_grace_checks == 1
+                },
+            )
+            .unwrap();
+            assert_eq!(path1_reclaimed, 0, "Path 1 must retain {activity:?}");
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "Path 1 must leave the {activity:?} assignment owned"
+            );
+
+            // Path 4 is the production registration-delete decision. Its
+            // grace seam is now past the boundary, so only the current
+            // assignment's fresh Busy/Unknown proof can veto deletion.
+            let mut path4_grace_checks = 0;
             let candidates = offline_not_busy_owned_missing_container_registrations_for(
                 &assignments,
                 &live,
@@ -11569,25 +11614,16 @@ esac
                 &local_names,
                 |_| activity,
                 |_, _| {
-                    grace_checks += 1;
-                    grace_checks == 1
+                    path4_grace_checks += 1;
+                    false
                 },
             );
-
-            // This is the production Path 4 delete boundary: only IDs returned
-            // by the candidate helper are passed to github::remove_runner.
-            let mut delete_calls = Vec::new();
-            for (runner_id, _) in candidates {
-                delete_calls.push(runner_id);
-            }
             assert!(
-                delete_calls.is_empty(),
-                "Path 4 must issue zero DELETEs for {activity:?} across the grace boundary"
+                candidates.is_empty(),
+                "sequential Path 1 -> Path 4 must issue zero DELETE/cancel candidates for {activity:?}"
             );
-            assert_eq!(
-                grace_checks, 1,
-                "Path 4 must capture grace once before probing"
-            );
+            assert_eq!(path1_grace_checks, 1);
+            assert_eq!(path4_grace_checks, 1);
         }
     }
 
