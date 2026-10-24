@@ -1926,6 +1926,24 @@ fn offline_not_busy_owned_missing_container_registrations(
     runner_prefix: &str,
     local_container_names: &HashSet<String>,
 ) -> Vec<(u64, String)> {
+    offline_not_busy_owned_missing_container_registrations_for(
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        local_runner_activity,
+        slot_in_grace_window,
+    )
+}
+
+fn offline_not_busy_owned_missing_container_registrations_for(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: &HashSet<String>,
+    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    mut grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
+) -> Vec<(u64, String)> {
     if runner_prefix.is_empty() {
         // Without a prefix there is no ownership gate — refuse to enumerate
         // candidates rather than risk reaping someone else's runner.
@@ -1956,7 +1974,15 @@ fn offline_not_busy_owned_missing_container_registrations(
         // writes, so a slot Path 1 just released this tick still has its
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
-        if slot_in_grace_window(assignments, slot) {
+        let in_grace_before_probe = grace_check(assignments, slot);
+        let started_activity = started_container_activity_if_in_grace_with_state(
+            assignments,
+            slot,
+            &runner.name,
+            &mut activity_probe,
+            in_grace_before_probe,
+        );
+        if retain_started_activity_after_grace_probe(in_grace_before_probe, started_activity) {
             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
             let wall_secs = now_epoch_secs();
             let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
@@ -11518,6 +11544,52 @@ esac
     }
 
     // --- bead ez-gh-actions-5ki: registration grace window ---
+
+    #[test]
+    fn path4_outer_reap_does_not_delete_busy_or_unknown_after_grace_boundary() {
+        // Path 4 is downstream of Path 1 and uses its pre-release snapshot.
+        // A probe may begin in grace and cross the boundary before the
+        // candidate reaches remove_runner; Busy and Unknown must still veto
+        // the destructive registration cleanup.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("outer_boundary_path4_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let assignments = read_slot_assignments().unwrap();
+            let live = vec![s9d_runner(4242, "ez-org-runner-1", "offline", false)];
+            let local_names = HashSet::new();
+            let mut grace_checks = 0;
+            let candidates = offline_not_busy_owned_missing_container_registrations_for(
+                &assignments,
+                &live,
+                &cfg.runner.name_prefix,
+                &local_names,
+                |_| activity,
+                |_, _| {
+                    grace_checks += 1;
+                    grace_checks == 1
+                },
+            );
+
+            // This is the production Path 4 delete boundary: only IDs returned
+            // by the candidate helper are passed to github::remove_runner.
+            let mut delete_calls = Vec::new();
+            for (runner_id, _) in candidates {
+                delete_calls.push(runner_id);
+            }
+            assert!(
+                delete_calls.is_empty(),
+                "Path 4 must issue zero DELETEs for {activity:?} across the grace boundary"
+            );
+            assert_eq!(
+                grace_checks, 1,
+                "Path 4 must capture grace once before probing"
+            );
+        }
+    }
 
     #[test]
     fn gh_missing_missing_inventory_keeps_busy_and_unknown_after_grace_boundary() {
