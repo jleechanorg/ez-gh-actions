@@ -12,6 +12,10 @@ mkdir -p "$TMP/bin" "$TMP/remote-home"
 cat > "$TMP/bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
+  '--user show ezgha.service -p LoadState --value')
+    [ "${SYSTEMCTL_FAIL:-0}" = 1 ] && exit 1
+    printf '%s\n' "${UNIT_LOAD_STATE:-loaded}"
+    ;;
   '--user show ezgha.service -p Environment --value')
     [ "${SYSTEMCTL_FAIL:-0}" = 1 ] && exit 1
     printf '%s\n' "${UNIT_ENV:-}"
@@ -56,10 +60,10 @@ FUNCTIONS="$(sed -n '/^REMOTE_DOCKER_HOST_CACHE=/,/^list_slot_work() {/p' "$ROOT
 [ -n "$FUNCTIONS" ] || { echo 'FAIL: remote endpoint/probe functions not found'; exit 1; }
 
 run_case() (
-  local unit_env="$1" systemctl_fail="$2" host="$3"
+  local unit_env="$1" systemctl_fail="$2" host="$3" unit_load_state="${4:-loaded}"
   : > "$DOCKER_CALLS"
   PATH="$TMP/bin:$PATH"
-  export UNIT_ENV="$unit_env" SYSTEMCTL_FAIL="$systemctl_fail"
+  export UNIT_ENV="$unit_env" SYSTEMCTL_FAIL="$systemctl_fail" UNIT_LOAD_STATE="$unit_load_state"
   REMOTE_DOCKER_HOST_CACHE="" REMOTE_DOCKER_HOST_CACHED_FOR=""
   bad() { printf '  [BAD] %s\n' "$*"; }
   eval "$FUNCTIONS"
@@ -97,6 +101,20 @@ grep -qi 'endpoint.*unresolved\|unresolved.*endpoint' "$TMP/systemctl-failed.err
   echo 'FAIL: missing explicit unresolved-endpoint diagnostic'; cat "$TMP/systemctl-failed.err"; exit 1;
 }
 echo 'PASS: failed systemctl lookup is unresolved/DOWN and issues no docker probe'
+
+# systemctl show may succeed for a missing unit and return an empty
+# Environment. That must not be mistaken for the loaded unit's native socket.
+set +e
+missing_unit_state="$(run_case '' 0 linux-host not-found 2>"$TMP/systemd-unit-missing.err")"
+missing_unit_rc=$?
+set -e
+[ "$missing_unit_rc" -eq 0 ] || { echo "FAIL: missing unit lookup aborted probe (rc=$missing_unit_rc)"; exit 1; }
+[ "$missing_unit_state" = DOWN ] || { echo "FAIL: missing systemd unit should count as DOWN, got $missing_unit_state"; exit 1; }
+[ ! -s "$DOCKER_CALLS" ] || { echo 'FAIL: Docker was probed when systemd unit was not loaded'; cat "$DOCKER_CALLS"; exit 1; }
+grep -qi 'endpoint.*unresolved\|unresolved.*endpoint' "$TMP/systemd-unit-missing.err" || {
+  echo 'FAIL: missing unit lacked explicit unresolved-endpoint diagnostic'; cat "$TMP/systemd-unit-missing.err"; exit 1;
+}
+echo 'PASS: systemd LoadState=not-found is unresolved/DOWN and issues no docker probe'
 
 # Keep the established macOS launchd endpoint behavior.
 mac_result="$(run_case '' 0 mac-host 2>"$TMP/mac.err")"

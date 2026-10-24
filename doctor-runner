@@ -1028,6 +1028,8 @@ remote_docker_env() {
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
       plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
+      unit_load_state=$(systemctl --user show ezgha.service -p LoadState --value 2>/dev/null) || exit 1
+      [ "$unit_load_state" = loaded ] || exit 1
       service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
       endpoint=$(printf "%s\n" "$service_env" | tr " " "\n" | sed -n "s/^DOCKER_HOST_OVERRIDE=//p" | head -1)
       case "$endpoint" in
