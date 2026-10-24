@@ -75,6 +75,7 @@ jobs:
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
           bash tests/doctor_runner_remote_config_and_queue_test.sh
+          bash tests/doctor_runner_service_docker_endpoint_test.sh
           bash tests/doctor_runner_unreachable_remote_test.sh
           bash tests/doctor_runner_verdict_line_test.sh
       - name: Slot-drift reclaim correlation regression test (bead jleechan-tv58)
