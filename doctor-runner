@@ -1011,9 +1011,10 @@ job_evidence_for_runner() {
 # unix:///Users/jleechan/.colima/default/docker.sock; every remote probe
 # queried the wrong daemon and reported 5/6 DOWN while 6 containers existed
 # on the daemon's socket. macOS: read EnvironmentVariables.DOCKER_HOST from
-# the launchd plist (the daemon's source of truth). Linux: the systemd unit
-# environment or native socket fallback. The manager's show-environment is
-# unrelated to a unit's Environment= and may be empty or stale.
+# the launchd plist (the daemon's source of truth). Linux: match
+# src/platform.rs by using only a nonblank DOCKER_HOST_OVERRIDE from the
+# systemd unit, then the native socket. DOCKER_HOST and DOCKER_CONTEXT are
+# interactive-client settings and are not the daemon's endpoint.
 REMOTE_DOCKER_HOST_CACHE=""
 REMOTE_DOCKER_HOST_CACHED_FOR=""
 remote_docker_env() {
@@ -1025,15 +1026,21 @@ remote_docker_env() {
   local dh
   dh=$(timeout 8 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" '
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
-      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
+      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
-      service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null)
-      endpoint=$(printf "%s\n" "$service_env" | tr " " "\n" | sed -n "s/^DOCKER_HOST=//p" | head -1)
-      if [ -z "$endpoint" ]; then
-        endpoint=$(printf "%s\n" "$service_env" | tr " " "\n" | sed -n "s/^DOCKER_HOST_OVERRIDE=//p" | head -1)
-      fi
-      if [ -n "$endpoint" ]; then printf "%s" "$endpoint"; else printf "unix:///var/run/docker.sock"; fi
-    fi' 2>/dev/null) || dh=""
+      service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
+      endpoint=$(printf "%s\n" "$service_env" | tr " " "\n" | sed -n "s/^DOCKER_HOST_OVERRIDE=//p" | head -1)
+      case "$endpoint" in
+        *[![:space:]]*) printf "%s" "$endpoint" ;;
+        *) printf "unix:///var/run/docker.sock" ;;
+      esac
+    else
+      exit 1
+    fi' 2>/dev/null) || {
+      REMOTE_DOCKER_HOST_CACHE=""
+      REMOTE_DOCKER_HOST_CACHED_FOR=""
+      return 1
+    }
   if [ -n "$dh" ]; then
     REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
   else
@@ -1051,7 +1058,11 @@ probe_slot_state() {
   if [ "$host" = "localhost" ]; then
     running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
   else
-    denv=$(remote_docker_env "$host")
+    if ! denv=$(remote_docker_env "$host"); then
+      bad "$host Docker endpoint unresolved — slot $name counted DOWN without a Docker probe" >&2
+      echo "DOWN"
+      return 0
+    fi
     running=$(ssh -o ConnectTimeout=4 "$host" "${denv}docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
   fi
   if [ "$running" != "true" ]; then
