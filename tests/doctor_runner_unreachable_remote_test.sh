@@ -2,8 +2,8 @@
 # regression test: when the REMOTE half of the fleet is unreachable via SSH,
 # the verdict must (a) keep `configured` at the FULL expected fleet size
 # (not silently collapse to local-only), (b) count every unreachable slot
-# in the `down` bucket (so the headline reads "20/24 healthy, 4 down"
-# instead of "20/20 healthy"), and (c) flip the verdict from `ok` to
+# in the `down` bucket (so the headline reads "14/18 healthy, 4 down"
+# instead of "14/14 healthy"), and (c) flip the verdict from `ok` to
 # `bad` (an unreachable half of the fleet cannot silently green).
 #
 # P1 #2 from PR #64 cold review: the prior code's unreachable branch

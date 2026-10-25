@@ -3,6 +3,7 @@
 Rolling operational notes for the `ezgha` self-hosted runner daemon.
 
 ## Recent activity (by day)
+- [2026-10-20](activity/2026-10-20.md)
 
 - [2026-09-01](activity/2026-09-01.md) — Release 1 planning closed; six sequential TDD beads and a hard execution ceiling now lead directly to implementation.
 - [2026-08-30](activity/2026-08-30.md) — watchdog authority removed; child-layer fleet churn remains under investigation.

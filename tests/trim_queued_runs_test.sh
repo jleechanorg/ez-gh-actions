@@ -54,6 +54,14 @@ if [[ "$*" == *"ls-remote"* ]]; then
     printf 'youngsha333\trefs/heads/feature/young\n'
     exit 0
   fi
+  if [[ "$*" == *"refs/heads/feature/freshhead"* ]]; then
+    printf 'freshhead999\trefs/heads/feature/freshhead\n'
+    exit 0
+  fi
+  if [[ "$*" == *"refs/heads/feature/freshdraft"* ]]; then
+    printf 'freshdraft444\trefs/heads/feature/freshdraft\n'
+    exit 0
+  fi
   if [[ "$*" == *"refs/heads/feature/deploy"* ]]; then
     printf 'deploysha444\trefs/heads/feature/deploy\n'
     exit 0
@@ -71,6 +79,7 @@ chmod +x "${STUB_BIN}/git"
 NOW_TS="$(python3 -c "import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat())")"
 OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=5)).isoformat())")"
 YOUNG_TS="$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=30)).isoformat())")"
+FRESH_TS="$(python3 -c "import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)).isoformat())")"
 
 # Create stub gh
 cat > "${STUB_BIN}/gh" <<EOF
@@ -146,6 +155,34 @@ if [[ "\$1" == "api" && "\$*" == *"status=queued"* ]]; then
       "head_sha": "racesha555",
       "status": "queued",
       "html_url": "https://github.com/mock/repo/actions/runs/107"
+    },
+    {
+      "id": 108,
+      "name": "Capacity Proof Load Test",
+      "path": ".github/workflows/capacity-proof.yml",
+      "head_branch": "feature/superseded",
+      "head_sha": "oldrunsha000",
+      "event": "workflow_dispatch",
+      "status": "queued",
+      "html_url": "https://github.com/mock/repo/actions/runs/108"
+    },
+    {
+      "id": 109,
+      "name": "CI Fresh Head",
+      "path": ".github/workflows/ci.yml",
+      "head_branch": "feature/freshhead",
+      "head_sha": "oldsha999",
+      "status": "queued",
+      "html_url": "https://github.com/mock/repo/actions/runs/109"
+    },
+    {
+      "id": 110,
+      "name": "CI Fresh Draft",
+      "path": ".github/workflows/ci.yml",
+      "head_branch": "feature/freshdraft",
+      "head_sha": "freshdraft444",
+      "status": "queued",
+      "html_url": "https://github.com/mock/repo/actions/runs/110"
     }
   ]
 }
@@ -182,6 +219,12 @@ JSON
 JSON
     exit 0
   fi
+  if [[ "\$*" == *"feature/freshdraft"* ]]; then
+    cat <<JSON
+[{"number": 406, "title": "Fresh Draft feature", "isDraft": true, "updatedAt": "${YOUNG_TS}", "headRefOid": "freshdraft444"}]
+JSON
+    exit 0
+  fi
   if [[ "\$*" == *"feature/superseded"* ]]; then
     cat <<JSON
 [{"number": 405, "title": "Superseded feature", "isDraft": false, "updatedAt": "${YOUNG_TS}", "headRefOid": "newhead123"}]
@@ -193,6 +236,14 @@ JSON
 fi
 
 # Commit date queries
+if [[ "\$1" == "api" && "\$*" == *"commits/freshhead999"* ]]; then
+  printf '${FRESH_TS}\n'
+  exit 0
+fi
+if [[ "\$1" == "api" && "\$*" == *"commits/freshdraft444"* ]]; then
+  printf '${YOUNG_TS}\n'
+  exit 0
+fi
 if [[ "\$1" == "api" && "\$*" == *"commits/oldsha222"* ]]; then
   printf '${OLD_TS}\n'
   exit 0
@@ -275,6 +326,22 @@ if grep -q "would cancel 106" <<<"$output_dry"; then
   echo "FAIL: run 106 (young PR) should NOT be a candidate" >&2
   exit 1
 fi
+if ! grep -q "protected 108 .* workflow_dispatch runs are never superseded-cancelled" <<<"$output_dry"; then
+  echo "FAIL: run 108 (workflow_dispatch) not protected in dry-run" >&2
+  exit 1
+fi
+if ! grep -q "protected 109 .*head-age grace" <<<"$output_dry"; then
+  echo "FAIL: run 109 (fresh branch head) not protected by head-age grace" >&2
+  exit 1
+fi
+if ! grep -q "protected 110 .* draft PR #406 is fresh" <<<"$output_dry"; then
+  echo "FAIL: run 110 (fresh draft PR) not protected" >&2
+  exit 1
+fi
+if grep -q "would cancel 108\|would cancel 109\|would cancel 110" <<<"$output_dry"; then
+  echo "FAIL: protected runs 108/109/110 must never be cancel candidates" >&2
+  exit 1
+fi
 
 # Ensure dry-run never invoked cancel endpoint
 if grep -q "/cancel" "${GH_LOG}"; then
@@ -327,6 +394,10 @@ if grep -q "runs/107/cancel" "${GH_LOG}"; then
 fi
 if grep -q "runs/101/cancel" "${GH_LOG}" || grep -q "runs/102/cancel" "${GH_LOG}" || grep -q "runs/106/cancel" "${GH_LOG}"; then
   echo "FAIL: protected runs were cancelled!" >&2
+  exit 1
+fi
+if grep -q "runs/108/cancel" "${GH_LOG}" || grep -q "runs/109/cancel" "${GH_LOG}" || grep -q "runs/110/cancel" "${GH_LOG}"; then
+  echo "FAIL: protected runs 108/109/110 were cancelled!" >&2
   exit 1
 fi
 

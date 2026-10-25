@@ -1129,16 +1129,16 @@ minimum_isolation = "container"
     }
 
     #[test]
-    fn linux_fleet_example_preserves_twenty_runner_bounded_contract() {
+    fn linux_fleet_example_preserves_fourteen_runner_bounded_contract() {
         let cfg: Config = toml::from_str(include_str!("../config/config.toml.linux.example"))
             .expect("tracked Linux fleet example must parse");
         cfg.validate()
             .expect("tracked Linux fleet example must validate");
-        assert_eq!(cfg.runner.count, 20);
-        assert_eq!(cfg.runner.runner_floor_mb, 1400);
+        assert_eq!(cfg.runner.count, 14);
+        assert_eq!(cfg.runner.runner_floor_mb, 2000);
         assert_eq!(cfg.runner.vm_total_mb, Some(28672));
         assert_eq!(cfg.runner.guest_reserve_mb, 0);
-        assert_eq!(cfg.limits.memory_mb, 1400);
+        assert_eq!(cfg.limits.memory_mb, 2000);
         assert_eq!(cfg.limits.cpus, 1.6);
         assert_eq!(cfg.limits.pids, 512);
         assert_eq!(cfg.runner.image, "ezgha-runner:latest");

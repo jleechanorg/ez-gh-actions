@@ -13,7 +13,13 @@ use crate::github;
 const FLEET_ORG: &str = "jleechanorg";
 const LINUX_FLEET_PREFIX: &str = "ez-runner-c-";
 const MAC_FLEET_PREFIX: &str = "ez-mac-runner-h-";
-const LINUX_FLEET_COUNT: u32 = 20;
+// Capacity contract 2026-10-18 (bead jleechan-eldq): Linux fleet
+// reduced 20 -> 14, paired with raising per-runner memory 1400 -> 2000 MiB inside the
+// same 28 GiB aggregate envelope. Rationale: runner-container jobs (vitest) OOM-died
+// at 1400 MiB while the host swap pool was saturated; the fleet never settled above
+// ~18/20 at the old profile. Restoration target is 16 @ 1750 MiB (same envelope),
+// gated on the sa8c host-OOM policy landing plus reclaimed host memory.
+const LINUX_FLEET_COUNT: u32 = 14;
 const MAC_FLEET_COUNT: u32 = 4;
 const EXPECTED_FLEET_RUNNERS: usize = (LINUX_FLEET_COUNT + MAC_FLEET_COUNT) as usize;
 
@@ -1276,7 +1282,7 @@ pub struct InvariantSample {
     pub inv1: bool,
     pub inv2: bool,
     /// Populated only when `inv1` is false. One of "missing-registration"
-    /// (fewer than the expected 20 runners are registered at all),
+    /// (fewer than the expected 18 runners are registered at all),
     /// "offline-respawning" (registered but not all online -- JIT
     /// deregister/respawn churn, see docs/ed8-fleet-churn-root-cause-*.md),
     /// or "genuinely-idle" (fully registered and online, but not picking up
@@ -2448,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn fleet_stats_counts_exact_24_runner_pool_only() {
+    fn fleet_stats_counts_exact_18_runner_pool_only() {
         let runners = vec![
             runner("ez-runner-c-1", "online", true),
             runner("ez-runner-c-2", "online", false),
@@ -2462,9 +2468,9 @@ mod tests {
 
         let stats = fleet_runner_stats(runners);
 
-        assert_eq!(stats.expected_total, 24);
-        assert_eq!(stats.registered_count, 7);
-        assert_eq!(stats.busy_count, 4);
+        assert_eq!(stats.expected_total, 18);
+        assert_eq!(stats.registered_count, 6);
+        assert_eq!(stats.busy_count, 3);
         assert_eq!(stats.idle_count, 2);
         assert!(stats.missing_names.contains(&"ez-runner-c-3".to_string()));
         assert!(!stats
@@ -2478,7 +2484,10 @@ mod tests {
             .runners
             .iter()
             .any(|runner| runner.name == "ez-mac-runner-h-4"));
-        assert!(stats
+        // c-20 shares the Linux prefix but exceeds the 14-slot pool (1..=14):
+        // with the 2026-10-18 contract it must be filtered OUT exactly like
+        // the canary below.
+        assert!(!stats
             .runners
             .iter()
             .any(|runner| runner.name == "ez-runner-c-20"));
