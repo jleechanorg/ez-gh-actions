@@ -145,7 +145,11 @@ struct SlackApiResponse {
 
 pub fn resolve_slack_target(cfg: &AlertConfig) -> Option<SlackTarget> {
     // 1. Explicit bot token in config
-    if let Some(token) = cfg.slack_bot_token.as_ref().filter(|s| !s.trim().is_empty()) {
+    if let Some(token) = cfg
+        .slack_bot_token
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
         let channel = cfg
             .slack_channel
             .clone()
@@ -160,7 +164,11 @@ pub fn resolve_slack_target(cfg: &AlertConfig) -> Option<SlackTarget> {
     }
 
     // 2. Explicit webhook url in config (backwards compatibility)
-    if let Some(url) = cfg.slack_webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
+    if let Some(url) = cfg
+        .slack_webhook_url
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
         return Some(SlackTarget::Webhook(url.clone()));
     }
 
@@ -175,10 +183,7 @@ pub fn resolve_slack_target(cfg: &AlertConfig) -> Option<SlackTarget> {
             .or_else(|| std::env::var("HERMES_MONITOR_SLACK_TARGET").ok())
             .or_else(|| std::env::var("SLACK_CHANNEL").ok());
         if let Some(ch) = channel.filter(|s| !s.trim().is_empty()) {
-            return Some(SlackTarget::BotToken {
-                token,
-                channel: ch,
-            });
+            return Some(SlackTarget::BotToken { token, channel: ch });
         }
     }
 
@@ -1133,8 +1138,12 @@ mod tests {
         let payload = slack_bot_payload("C0AJ3SD5C79", "pool low", "body", Severity::Warning);
         let args = slack_bot_curl_args("xoxb-test-token", &payload);
         assert!(args.iter().any(|arg| arg == "--fail-with-body"));
-        assert!(args.iter().any(|arg| arg == "Authorization: Bearer xoxb-test-token"));
-        assert!(args.iter().any(|arg| arg == "https://slack.com/api/chat.postMessage"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "Authorization: Bearer xoxb-test-token"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "https://slack.com/api/chat.postMessage"));
         assert!(args.windows(2).any(|w| w == ["--connect-timeout", "5"]));
         assert!(args.windows(2).any(|w| w == ["--max-time", "15"]));
     }
@@ -1257,7 +1266,9 @@ mod tests {
         cfg.slack_webhook_url = Some("https://hooks.slack.com/services/explicit".into());
         assert_eq!(
             resolve_slack_target(&cfg),
-            Some(SlackTarget::Webhook("https://hooks.slack.com/services/explicit".into()))
+            Some(SlackTarget::Webhook(
+                "https://hooks.slack.com/services/explicit".into()
+            ))
         );
 
         // Config slack_bot_token takes precedence
@@ -1293,14 +1304,8 @@ mod tests {
         with_fake_path(&dir, || {
             // notify_delivery must NOT report success when external transport fails,
             // even though log_path wrote successfully!
-            let delivered = notify_delivery(
-                &cfg,
-                "test.ext_fail",
-                Severity::Critical,
-                "sub",
-                "body",
-            )
-            .unwrap();
+            let delivered =
+                notify_delivery(&cfg, "test.ext_fail", Severity::Critical, "sub", "body").unwrap();
             assert!(
                 !delivered,
                 "local log write must NOT count as successful delivery when external channel failed"

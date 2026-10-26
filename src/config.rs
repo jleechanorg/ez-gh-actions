@@ -1529,7 +1529,10 @@ slack_bot_token = "xoxb-test-token"
 slack_channel = "C0AJ3SD5C79"
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
-        assert_eq!(cfg.alert.slack_bot_token.as_deref(), Some("xoxb-test-token"));
+        assert_eq!(
+            cfg.alert.slack_bot_token.as_deref(),
+            Some("xoxb-test-token")
+        );
         assert_eq!(cfg.alert.slack_channel.as_deref(), Some("C0AJ3SD5C79"));
         assert_eq!(cfg.alert.slack_webhook_url, None);
     }
