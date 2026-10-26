@@ -25,7 +25,7 @@ done
 
 # Fixture roots never invoke the host systemd manager.
 SYSTEMCTL=systemctl
-if [ "$ROOT" != / ] && [ -x "$ROOT/bin/systemctl" ]; then SYSTEMCTL="$ROOT/bin/systemctl"; fi
+if [ "$ROOT" != / ]; then SYSTEMCTL="$ROOT/bin/systemctl"; fi
 ACTIVE=0
 if [ "$ROOT" = / ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
   state="$("$SYSTEMCTL" --user show "$UNIT" -p ActiveState --value)" || fail "cannot query $UNIT ActiveState"
@@ -44,10 +44,15 @@ fi
 is_active() { [ "$ACTIVE" -eq 1 ]; }
 
 qemu_process_present() {
-  command -v pgrep >/dev/null 2>&1 || fail "cannot verify stray QEMU processes: pgrep is unavailable"
-  pgrep -x qemu-system-x86_64 >/dev/null 2>&1 \
-    || pgrep -x qemu-system-x86 >/dev/null 2>&1 \
-    || pgrep -x qemu-system-aarch64 >/dev/null 2>&1
+  command -v ps >/dev/null 2>&1 || fail "cannot verify stray QEMU processes: ps is unavailable"
+  local comms
+  comms="$(ps -eo comm= 2>/dev/null)" || fail "cannot query process names for stray QEMU detection"
+  while IFS= read -r comm; do
+    case "$comm" in
+      qemu-system-*) return 0 ;;
+    esac
+  done <<<"$comms"
+  return 1
 }
 
 runtime_state() {

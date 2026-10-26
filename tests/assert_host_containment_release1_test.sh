@@ -271,6 +271,12 @@ esac
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$PROPS_BIN/systemctl"
+# Live fixture calls must remain isolated from the host systemctl binary.
+cat > "$FIXTURE_PASS/bin/systemctl" <<EOF_FIXTURE_SYSTEMCTL
+#!/usr/bin/env bash
+exec "$PROPS_BIN/systemctl" "\$@"
+EOF_FIXTURE_SYSTEMCTL
+chmod +x "$FIXTURE_PASS/bin/systemctl"
 # Host-docker policy: agents 10G/11776M (11.5 GiB, R1 cap-fit amendment), automation 4608M/5G.
 write_props 10737418240 12348030976 4831838208 5368709120 > "$WORK/props_ok.txt"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
@@ -323,16 +329,16 @@ if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= QEMU
 fi
 ok "assert-host-containment-release1.sh fails closed on QEMU service query failure"
 
-STRAY_BIN="$WORK/stray-pgrep-bin"
+STRAY_BIN="$WORK/stray-ps-bin"
 mkdir -p "$STRAY_BIN"
-cat > "$STRAY_BIN/pgrep" <<'EOF_PGREP'
+cat > "$STRAY_BIN/ps" <<'EOF_PS'
 #!/usr/bin/env bash
 case "$*" in
-  *qemu-system-x86_64*) exit 0 ;;
-  *) exit 1 ;;
+  *'comm='*) printf 'bash\nqemu-system-aarc\n'; exit 0 ;;
+  *) exit 2 ;;
 esac
-EOF_PGREP
-chmod +x "$STRAY_BIN/pgrep"
+EOF_PS
+chmod +x "$STRAY_BIN/ps"
 if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= \
     CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$STRAY_BIN:$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
     "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_qemu_stray.log" 2>&1; then
@@ -340,5 +346,31 @@ if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= \
 fi
 grep -q 'stray QEMU process' "$WORK/live_qemu_stray.log" || fail "stray QEMU failure lacked a precise diagnostic"
 ok "assert-host-containment-release1.sh rejects stray QEMU with inactive VM service"
+
+QUERY_BIN="$WORK/query-fail-ps-bin"
+mkdir -p "$QUERY_BIN"
+cat > "$QUERY_BIN/ps" <<'EOF_PS_FAIL'
+#!/usr/bin/env bash
+exit 2
+EOF_PS_FAIL
+chmod +x "$QUERY_BIN/ps"
+if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= \
+    CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$QUERY_BIN:$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+    "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_qemu_ps_fail.log" 2>&1; then
+  fail "process-name query failure was accepted"
+fi
+grep -q 'cannot query process names' "$WORK/live_qemu_ps_fail.log" || fail "process-name query failure lacked a precise diagnostic"
+ok "assert-host-containment-release1.sh fails closed on process-name query failure"
+
+mv "$FIXTURE_PASS/bin/systemctl" "$WORK/fixture-systemctl.saved"
+if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= \
+    CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+    "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_qemu_missing_systemctl.log" 2>&1; then
+  fail "missing fixture systemctl binary reached the host systemctl"
+fi
+grep -q 'cannot query lima-vm@colima.service ActiveState' "$WORK/live_qemu_missing_systemctl.log" \
+  || fail "missing fixture systemctl failure lacked a precise diagnostic"
+mv "$WORK/fixture-systemctl.saved" "$FIXTURE_PASS/bin/systemctl"
+ok "assert-host-containment-release1.sh keeps missing fixture systemctl isolated"
 
 echo "ASSERT_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

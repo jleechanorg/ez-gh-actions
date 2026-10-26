@@ -402,14 +402,14 @@ fi
 grep -Fq 'could not establish QEMU service state' <<<"$env_out" \
   || fail "QEMU query failure lacked a precise diagnostic: $env_out"
 
-cat > "$ENV_DIR/bin/pgrep" <<'EOF_PGREP'
+cat > "$ENV_DIR/bin/ps" <<'EOF_PS'
 #!/usr/bin/env bash
 case "$*" in
-  *qemu-system-x86_64*) exit 0 ;;
-  *) exit 1 ;;
+  *'comm='*) printf 'bash\nqemu-system-aarc\n'; exit 0 ;;
+  *) exit 2 ;;
 esac
-EOF_PGREP
-chmod +x "$ENV_DIR/bin/pgrep"
+EOF_PS
+chmod +x "$ENV_DIR/bin/ps"
 if env_out=$(QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= run_envelope "$ROOT"); then
   fail "stray QEMU process should fail closed with inactive VM service: $env_out"
 fi
@@ -862,6 +862,11 @@ esac
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$TMP/policy-bin/systemctl"
+cat > "$FIXTURE/bin/systemctl" <<EOF_FIXTURE_SYSTEMCTL
+#!/usr/bin/env bash
+exec "$TMP/policy-bin/systemctl" "\$@"
+EOF_FIXTURE_SYSTEMCTL
+chmod +x "$FIXTURE/bin/systemctl"
 # Source only the production predicate; pass the canonical assertion's --root.
 eval "$(sed -n '/^verify_retired_timer() {/,/^verify_automation_dropins() {/p' "$VERIFY" | sed '$d')"
 MODERN_UNIT_DIR="$MODERN"
