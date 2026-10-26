@@ -23,7 +23,7 @@ grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-daemon.service.d/20-au
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ao-orchestrator.service.d/20-automation-slice.conf" || fail "AO orchestrator drop-in does not select automation.slice"
 grep -q '^Slice=automation.slice$' "$REPO_ROOT/systemd/ai.dark-factory.daemon.service.d/20-automation-slice.conf" || fail "dark-factory daemon drop-in does not select automation.slice"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryHigh=10G"
-assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=12G"
+assert_line "$REPO_ROOT/systemd/agents.slice" "MemoryMax=11776M"
 assert_line "$REPO_ROOT/systemd/agents.slice" "MemorySwapMax=2G"
 assert_line "$REPO_ROOT/systemd/agents.slice" "TasksMax=8192"
 assert_line "$REPO_ROOT/systemd/app-lima-vm.slice" "MemoryHigh=9G"
@@ -45,6 +45,15 @@ for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuo
   grep -Fq "$setting" "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh" \
     || fail "shared QEMU guard missing $setting"
 done
+grep -Fq 'qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976' "$REPO_ROOT/install.sh" \
+  || fail "install.sh does not guard agents.slice before lowering MemoryMax"
+agents_guard_line="$(grep -n -m1 'qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976' "$REPO_ROOT/install.sh" | cut -d: -f1)"
+agents_copy_line="$(grep -n -m1 'install -m 0644.*\${UNIT_DIR}/\${unit}.*\${USER_UNIT_DIR}/\${unit}' "$REPO_ROOT/install.sh" | cut -d: -f1)"
+[ -n "$agents_guard_line" ] && [ -n "$agents_copy_line" ] && [ "$agents_guard_line" -lt "$agents_copy_line" ] \
+  || fail "install.sh agents.slice preflight occurs after candidate unit copy"
+grep -Fq 'qemu-ceiling-guard.sh" --root "$ROOT" --unit agents.slice --threshold "$AGENTS_MEMORY_MAX_BYTES"' \
+  "$REPO_ROOT/scripts/host/apply-host-containment-release1.sh" \
+  || fail "apply-host-containment-release1.sh does not guard agents.slice before lowering MemoryMax"
 assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 grep -q 'QEMU_PROC_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \

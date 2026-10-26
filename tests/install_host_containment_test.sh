@@ -278,7 +278,7 @@ assert_host_policy_slice() {
   grep -qx "MemoryHigh=$high" "$file" && grep -qx "MemoryMax=$max" "$file" \
     || fail "staged policy does not contain the tracked $high/$max budget for $unit"
 }
-assert_host_policy_slice agents.slice 10G 12G
+assert_host_policy_slice agents.slice 10G 11776M
 assert_host_policy_slice automation.slice 4608M 5G
 assert_installed_slice() {
   local home="$1" unit="$2" high="$3" max="$4" file
@@ -286,14 +286,14 @@ assert_installed_slice() {
   grep -qx "MemoryHigh=$high" "$file" && grep -qx "MemoryMax=$max" "$file" \
     || fail "installed $unit does not contain the selected $high/$max policy"
 }
-assert_installed_slice "$HOME_DIR" agents.slice 10G 12G
+assert_installed_slice "$HOME_DIR" agents.slice 10G 11776M
 assert_installed_slice "$HOME_DIR" automation.slice 4608M 5G
 assert_persisted_slice() {
   local dir="$1" unit="$2" high="$3" max="$4" swap="$5" tasks="$6"
   grep -Fqx "set-property $unit MemoryHigh=$high MemoryMax=$max MemorySwapMax=$swap TasksMax=$tasks" \
     "$dir/$unit" || fail "persisted $unit override did not match the selected budget"
 }
-assert_persisted_slice "$HOST_OVERRIDE_DIR" agents.slice 10G 12G 2G 8192
+assert_persisted_slice "$HOST_OVERRIDE_DIR" agents.slice 10G 11776M 2G 8192
 assert_persisted_slice "$HOST_OVERRIDE_DIR" automation.slice 4608M 5G 1G 4096
 for policy in app-lima-vm.slice lima-vm@colima.service.d/99-memory-ceiling.conf lima-vm-cpu-ceiling.service; do
   cmp "$REPO_ROOT/systemd/$policy" "$HOME_DIR/.local/libexec/ezgha/host-containment-policy/systemd/$policy" || fail "missing or stale installed $policy"
@@ -303,7 +303,7 @@ root_line="$(line_of "root-phase:--system-phase --runner-count 14")"; user_line=
 [ -n "$root_line" ] && [ -n "$user_line" ] && [ -n "$install_line" ] && [ -n "$build_line" ] || fail "missing containment or install event"
 [ "$root_line" -lt "$user_line" ] && [ "$user_line" -lt "$install_line" ] && [ "$install_line" -lt "$build_line" ] \
   || fail "root/user containment did not precede binary replacement and image build"
-grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$EVENT_LOG" \
+grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192" "$EVENT_LOG" \
   || fail "host-docker install did not reapply the selected agents.slice live budget"
 grep -qx "systemctl-set-property:set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$EVENT_LOG" \
   || fail "host-docker install did not reapply the selected automation.slice live budget"
@@ -311,6 +311,67 @@ final_reload_line="$(grep -n '^systemctl-daemon-reload:daemon-reload$' "$EVENT_L
 final_agents_line="$(grep -n '^systemctl-set-property:set-property agents.slice ' "$EVENT_LOG" | tail -1 | cut -d: -f1)"
 [ -n "$final_reload_line" ] && [ -n "$final_agents_line" ] && [ "$final_reload_line" -lt "$final_agents_line" ] \
   || fail "host-docker slice budgets were applied before the final user-unit reload"
+
+# The agents cap preflight must run before candidate user units are copied or
+# the final daemon reload. Exercise the VM-backed Linux path so no earlier
+# host-containment phase can mask the ordering proof.
+QEMU_GUARD_REAL="$WORK/qemu-ceiling-guard.real"
+cp "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh" "$QEMU_GUARD_REAL"
+cat > "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" --unit agents.slice "* ]]; then
+  echo "agents-guard:${AGENTS_GUARD_MODE:-safe}" >> "${EVENT_LOG:?}"
+  case "${AGENTS_GUARD_MODE:-safe}" in
+    unsafe|unreadable) exit 1 ;;
+  esac
+fi
+exec "${QEMU_GUARD_REAL:?}" "$@"
+EOF
+chmod +x "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh"
+
+run_agent_guard_fixture() {
+  local name="$1" mode="$2" home="$WORK/agent_guard_${1}_home" events="$WORK/agent_guard_${1}_events"
+  mkdir -p "$home/.config/ezgha" "$home/.config/systemd/user" "$home/.lima/colima"
+  printf '[runner]\ncount = 14\n' > "$home/.config/ezgha/config.toml"
+  printf 'memory: "8GiB"\n' > "$home/.lima/colima/lima.yaml"
+  printf '[Unit]\nDescription=pre-existing agents slice\n\n[Slice]\nMemoryHigh=10G\nMemoryMax=12G\n' \
+    > "$home/.config/systemd/user/agents.slice"
+  cp "$home/.config/systemd/user/agents.slice" "$WORK/agent_guard_${name}_before"
+  if env EVENT_LOG="$events" QEMU_GUARD_REAL="$QEMU_GUARD_REAL" AGENTS_GUARD_MODE="$mode" \
+      PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" \
+      DOCKER_HOST="unix://$home/.colima/default/docker.sock" \
+      bash "$TEMP_REPO/install.sh" --dev > "$WORK/agent_guard_${name}.log" 2>&1; then
+    [ "$mode" = safe ] || fail "unsafe agents guard $name allowed installation"
+  elif [ "$mode" = safe ]; then
+    fail "safe agents guard fixture failed: $(tail -5 "$WORK/agent_guard_${name}.log")"
+  fi
+  grep -Fqx "agents-guard:$mode" "$events" || fail "agents guard did not run in $mode fixture"
+  local guard_line post_guard_events
+  guard_line="$(grep -n -m1 "^agents-guard:$mode$" "$events" | cut -d: -f1)"
+  post_guard_events="$(tail -n +"$guard_line" "$events")"
+  if [ "$mode" = safe ]; then
+    grep -qx 'MemoryMax=11776M' "$home/.config/systemd/user/agents.slice" \
+      || fail "safe agents guard did not install the candidate agents.slice"
+    grep -q '^systemctl-daemon-reload:' <<<"$post_guard_events" || fail "safe agents guard skipped final daemon reload"
+    grep -q '^systemctl-set-property:set-property agents.slice ' <<<"$post_guard_events" \
+      || fail "safe agents guard skipped agents.slice cap application"
+  else
+    cmp "$WORK/agent_guard_${name}_before" "$home/.config/systemd/user/agents.slice" \
+      || fail "unsafe agents guard $name replaced the existing agents.slice"
+    if grep -Eq '^systemctl-daemon-reload:|^systemctl-set-property:' <<<"$post_guard_events"; then
+      fail "unsafe agents guard $name reached daemon reload or cap-setting after preflight: $post_guard_events"
+    fi
+    if grep -q '^cargo-install$' <<<"$post_guard_events"; then
+      fail "unsafe agents guard $name installed the binary after preflight"
+    fi
+  fi
+}
+run_agent_guard_fixture safe safe
+run_agent_guard_fixture unsafe unsafe
+run_agent_guard_fixture unreadable unreadable
+cp "$QEMU_GUARD_REAL" "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh"
+chmod +x "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh"
+echo "OK: installer agents.slice preflight runs before candidate unit copy and final cap writes"
 
 # Host-docker mode (bead ez-gh-actions-154k): the colima guest (qdrant only)
 # is resized to 8GiB in the lima.yaml lima-vm@colima starts from, and the
@@ -502,7 +563,7 @@ printf 'set-property automation.slice MemoryHigh=8G MemoryMax=10G MemorySwapMax=
 env EVENT_LOG="$MIGRATE_EVENTS" SYSTEMCTL_OVERRIDE_DIR="$MIGRATE_OVERRIDES" PATH="$STUB_BIN:$PATH" HOME="$MIGRATE_HOME" CARGO_HOME="$MIGRATE_HOME/.cargo" XDG_CONFIG_HOME="$MIGRATE_HOME/.config" \
   bash "$TEMP_REPO/install.sh" --dev > "$WORK/migrate-host-docker.log" 2>&1 \
   || fail "host-docker migration setup install failed"
-grep -Fqx "set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
+grep -Fqx "set-property agents.slice MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
   || fail "host-docker migration setup did not overwrite the stale agents.slice user.control override"
 grep -Fqx "set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_OVERRIDES/automation.slice" \
   || fail "host-docker migration setup did not overwrite the stale automation.slice user.control override"
@@ -530,11 +591,11 @@ for unit in lima-vm@colima lima-vm-cpu-ceiling; do
 done
 grep -qx 'MemoryMax=10G' "$MIGRATE_HOME/.config/systemd/user/lima-vm@colima.service.d/99-memory-ceiling.conf" \
   || fail "VM-backed migration did not install the tracked 9G/10G QEMU policy"
-grep -Fqx "set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
+grep -Fqx "set-property agents.slice MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192" "$MIGRATE_OVERRIDES/agents.slice" \
   || fail "VM-backed migration did not overwrite the stale agents.slice user.control override"
 grep -Fqx "set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_OVERRIDES/automation.slice" \
   || fail "VM-backed migration did not overwrite the stale automation.slice user.control override"
-grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$MIGRATE_EVENTS" \
+grep -qx "systemctl-set-property:set-property agents.slice MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192" "$MIGRATE_EVENTS" \
   || fail "VM-backed migration did not reapply the tracked agents.slice live budget"
 grep -qx "systemctl-set-property:set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$MIGRATE_EVENTS" \
   || fail "VM-backed migration did not reapply the tracked automation.slice live budget"
@@ -542,7 +603,7 @@ migrate_final_reload_line="$(grep -n '^systemctl-daemon-reload:daemon-reload$' "
 migrate_final_agents_line="$(grep -n '^systemctl-set-property:set-property agents.slice ' "$MIGRATE_EVENTS" | tail -1 | cut -d: -f1)"
 [ -n "$migrate_final_reload_line" ] && [ -n "$migrate_final_agents_line" ] && [ "$migrate_final_reload_line" -lt "$migrate_final_agents_line" ] \
   || fail "VM-backed migration slice budgets were applied before the final user-unit reload"
-assert_installed_slice "$MIGRATE_HOME" agents.slice 10G 12G
+assert_installed_slice "$MIGRATE_HOME" agents.slice 10G 11776M
 assert_installed_slice "$MIGRATE_HOME" automation.slice 4608M 5G
 migrate_reload_line="$(line_of 'systemctl-daemon-reload:daemon-reload')"
 migrate_install_line="$(line_of cargo-install)"
