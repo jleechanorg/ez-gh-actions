@@ -263,6 +263,11 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+case "$prop" in
+  LoadState) [ "${QEMU_QUERY_FAIL:-0}" = 1 ] && exit 1; echo "${QEMU_LOAD_STATE:-loaded}"; exit 0 ;;
+  ActiveState) [ "${QEMU_QUERY_FAIL:-0}" = 1 ] && exit 1; echo "${QEMU_ACTIVE_STATE:-active}"; exit 0 ;;
+  ControlGroup) [ "${QEMU_QUERY_FAIL:-0}" = 1 ] && exit 1; printf '%s\n' "${QEMU_CONTROL_GROUP-/lima-vm@colima.service}"; exit 0 ;;
+esac
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$PROPS_BIN/systemctl"
@@ -301,5 +306,39 @@ if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_swap_kill.txt" PATH="$P
 fi
 grep -q "actions.slice ManagedOOMSwap ('kill') != 'auto'" "$WORK/live_swap_kill.log" || fail "wrong failure for actions.slice swap kill policy: $(tail -2 "$WORK/live_swap_kill.log")"
 ok "actions.slice swap kill policy is rejected"
+
+# Native Docker with an explicitly inactive/not-found VM must skip only the
+# QEMU live-property checks; the finite tracked drop-in remains source-checked.
+if ! QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= \
+    CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+    "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_qemu_inactive.log" 2>&1; then
+  fail "inactive native VM incorrectly failed containment assertion: $(tail -3 "$WORK/live_qemu_inactive.log")"
+fi
+ok "assert-host-containment-release1.sh skips live QEMU properties only for confirmed inactive VM"
+
+if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= QEMU_QUERY_FAIL=1 \
+    CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+    "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_qemu_query_fail.log" 2>&1; then
+  fail "QEMU service query failure was accepted"
+fi
+ok "assert-host-containment-release1.sh fails closed on QEMU service query failure"
+
+STRAY_BIN="$WORK/stray-pgrep-bin"
+mkdir -p "$STRAY_BIN"
+cat > "$STRAY_BIN/pgrep" <<'EOF_PGREP'
+#!/usr/bin/env bash
+case "$*" in
+  *qemu-system-x86_64*) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF_PGREP
+chmod +x "$STRAY_BIN/pgrep"
+if QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= \
+    CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$STRAY_BIN:$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
+    "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_qemu_stray.log" 2>&1; then
+  fail "stray QEMU process was accepted with inactive VM service"
+fi
+grep -q 'stray QEMU process' "$WORK/live_qemu_stray.log" || fail "stray QEMU failure lacked a precise diagnostic"
+ok "assert-host-containment-release1.sh rejects stray QEMU with inactive VM service"
 
 echo "ASSERT_HOST_CONTAINMENT_RELEASE1_TEST: PASS"

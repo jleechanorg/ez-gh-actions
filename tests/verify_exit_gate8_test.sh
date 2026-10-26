@@ -338,7 +338,18 @@ cat > "$ENV_DIR/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 # `systemctl --user show -p ControlGroup --value -- <unit>` -> /user/<unit>
 for unit in "$@"; do :; done
-printf '/user/%s\n' "$unit"
+if [ "${QEMU_QUERY_FAIL:-0}" = 1 ]; then exit 1; fi
+case "$*" in
+  *'-p LoadState'*) printf '%s\n' "${QEMU_LOAD_STATE:-loaded}" ;;
+  *'-p ActiveState'*) printf '%s\n' "${QEMU_ACTIVE_STATE:-active}" ;;
+  *'-p ControlGroup'*)
+    case "$unit" in
+      lima-vm@colima.service) printf '%s\n' "${QEMU_CONTROL_GROUP-/user/$unit}" ;;
+      *) printf '/user/%s\n' "$unit" ;;
+    esac
+    ;;
+  *) printf '/user/%s\n' "$unit" ;;
+esac
 EOF
 chmod +x "$ENV_DIR/bin/systemctl"
 set_live() { # unit-dir high max
@@ -367,6 +378,44 @@ run_envelope() { # policy-root
 set_live_policy $((10 * G)) $((11776 * 1048576)) $((4608 * 1048576)) $((5 * G))
 env_out=$(run_envelope "$ROOT") || fail "host-docker 28+11776M+5+10 envelope should pass: $env_out"
 grep -Fq '55808MB' <<<"$env_out" || fail "envelope did not sum live maxima to 55808MB: $env_out"
+
+# Native Docker with an explicitly inactive/not-found VM omits only the live
+# QEMU cgroup; the tracked QEMU policy remains required and the three active
+# host caps plus reserve still fit.
+env_out=$(QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= run_envelope "$ROOT") \
+  || fail "inactive native VM should pass without a live QEMU cgroup: $env_out"
+grep -Fq '45568MB' <<<"$env_out" || fail "inactive native envelope did not sum 28G+11776M+5G: $env_out"
+
+# An active VM without a live cgroup remains a hard failure.
+rm -rf "$ENV_DIR/cg/user/lima-vm@colima.service"
+if env_out=$(run_envelope "$ROOT"); then
+  fail "active VM without a live cgroup should fail: $env_out"
+fi
+grep -Eq 'lima-vm@colima.service (has no live cgroup|live memory.high=unreadable)' <<<"$env_out" \
+  || fail "active missing-cgroup failure lacked a precise diagnostic: $env_out"
+mkdir -p "$ENV_DIR/cg/user/lima-vm@colima.service"
+set_live user/lima-vm@colima.service $((9 * G)) $((10 * G))
+
+if env_out=$(QEMU_QUERY_FAIL=1 run_envelope "$ROOT"); then
+  fail "QEMU service query failure should fail closed: $env_out"
+fi
+grep -Fq 'could not establish QEMU service state' <<<"$env_out" \
+  || fail "QEMU query failure lacked a precise diagnostic: $env_out"
+
+cat > "$ENV_DIR/bin/pgrep" <<'EOF_PGREP'
+#!/usr/bin/env bash
+case "$*" in
+  *qemu-system-x86_64*) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF_PGREP
+chmod +x "$ENV_DIR/bin/pgrep"
+if env_out=$(QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= run_envelope "$ROOT"); then
+  fail "stray QEMU process should fail closed with inactive VM service: $env_out"
+fi
+grep -Fq 'stray QEMU process' <<<"$env_out" \
+  || fail "stray QEMU failure lacked a precise diagnostic: $env_out"
+rm -f "$ENV_DIR/bin/pgrep"
 
 # (b) an unbounded live maximum is rejected, never summed as zero.
 printf 'max\n' > "$ENV_DIR/cg/user/agents.slice/memory.max"
@@ -750,6 +799,11 @@ if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTION
   fail "production unit parser must reject unreadable agents unit"
 fi
 mv "$TMP/agents.good" "$MODERN/agents.slice"
+mv "$MODERN/lima-vm@colima.service.d/99-memory-ceiling.conf" "$TMP/qemu.good"
+if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 VERIFY_EXIT_CRITERIA_HOST_MB=65000 bash "$VERIFY" >"$TMP/parser-missing-qemu.log" 2>&1; then
+  fail "production unit parser must reject missing future QEMU cap policy"
+fi
+mv "$TMP/qemu.good" "$MODERN/lima-vm@colima.service.d/99-memory-ceiling.conf"
 
 DROPINS="$TMP/dropins"
 mkdir -p "$DROPINS/ao-daemon.service.d" "$DROPINS/ai.dark-factory.daemon.service.d"
@@ -797,6 +851,11 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+case "$prop" in
+  LoadState) echo loaded; exit 0 ;;
+  ActiveState) echo active; exit 0 ;;
+  ControlGroup) echo /lima-vm@colima.service; exit 0 ;;
+esac
 case "$unit:$scope" in
   app.slice:system|session.slice:system|actions.slice:user|user.slice:user|-.slice:user) exit 1 ;;
 esac
@@ -814,6 +873,7 @@ if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/absent.log" 2>&1; then
 fi
 mkdir -p "$REPO_ROOT/scripts/host"
 cp "$ROOT/scripts/host/assert-host-containment-release1.sh" "$REPO_ROOT/scripts/host/"
+cp "$ROOT/scripts/host/qemu-ceiling-guard.sh" "$REPO_ROOT/scripts/host/"
 chmod 000 "$REPO_ROOT/scripts/host/assert-host-containment-release1.sh"
 if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/unreadable.log" 2>&1; then
   fail "unreadable mandatory assertion must fail closed"

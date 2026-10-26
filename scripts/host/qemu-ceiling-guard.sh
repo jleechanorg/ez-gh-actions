@@ -7,7 +7,7 @@ set -euo pipefail
 UNIT="lima-vm@colima.service"
 THRESHOLD_BYTES=9663676416 # 9 GiB
 ROOT="/"
-ACTION="guard" # guard, apply, or assert-effective
+ACTION="guard" # guard, apply, assert-effective, or runtime-state
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -18,13 +18,14 @@ while [ "$#" -gt 0 ]; do
     --threshold) THRESHOLD_BYTES="$2"; shift 2 ;;
     --apply) ACTION="apply"; shift ;;
     --assert-effective) ACTION="assert-effective"; shift ;;
+    --runtime-state) ACTION="runtime-state"; shift ;;
     *) fail "unknown argument '$1'" ;;
   esac
 done
 
 # Fixture roots never invoke the host systemd manager.
 SYSTEMCTL=systemctl
-if [ "$ROOT" != / ]; then SYSTEMCTL="$ROOT/bin/systemctl"; fi
+if [ "$ROOT" != / ] && [ -x "$ROOT/bin/systemctl" ]; then SYSTEMCTL="$ROOT/bin/systemctl"; fi
 ACTIVE=0
 if [ "$ROOT" = / ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
   state="$("$SYSTEMCTL" --user show "$UNIT" -p ActiveState --value)" || fail "cannot query $UNIT ActiveState"
@@ -41,6 +42,71 @@ else
   done
 fi
 is_active() { [ "$ACTIVE" -eq 1 ]; }
+
+qemu_process_present() {
+  command -v pgrep >/dev/null 2>&1 || fail "cannot verify stray QEMU processes: pgrep is unavailable"
+  pgrep -x qemu-system-x86_64 >/dev/null 2>&1 \
+    || pgrep -x qemu-system-x86 >/dev/null 2>&1 \
+    || pgrep -x qemu-system-aarch64 >/dev/null 2>&1
+}
+
+runtime_state() {
+  local load state group
+  if [ "$ROOT" != / ] && [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ] && [ -n "${QEMU_RUNTIME_STATE:-}" ]; then
+    case "$QEMU_RUNTIME_STATE" in
+      active) printf 'active\n'; return 0 ;;
+      inactive) if qemu_process_present; then fail "stray QEMU process exists while $UNIT is inactive"; fi; printf 'inactive\n'; return 0 ;;
+      *) fail "unrecognized QEMU_RUNTIME_STATE: $QEMU_RUNTIME_STATE" ;;
+    esac
+  fi
+  if [ "$ROOT" != / ] && [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" != 1 ]; then
+    local candidate
+    if [[ " ${CONTAINMENT_ACTIVE_UNITS:-} " == *" ${UNIT} "* ]]; then
+      for candidate in "$ROOT/sys/fs/cgroup/$UNIT" "$ROOT/sys/fs/cgroup/app-lima-vm.slice/$UNIT" "$ROOT/sys/fs/cgroup/app.slice/$UNIT"; do
+        [ -d "$candidate" ] || continue
+        printf 'active\n'
+        return 0
+      done
+      fail "active $UNIT has no resolved cgroup"
+    fi
+    for candidate in "$ROOT/sys/fs/cgroup/$UNIT" "$ROOT/sys/fs/cgroup/app-lima-vm.slice/$UNIT" "$ROOT/sys/fs/cgroup/app.slice/$UNIT"; do
+      [ ! -d "$candidate" ] || fail "$UNIT has a cgroup but no active unit state"
+    done
+    if qemu_process_present; then
+      fail "stray QEMU process exists while $UNIT has no active unit state"
+    fi
+    printf 'inactive\n'
+    return 0
+  fi
+  load="$($SYSTEMCTL --user show -p LoadState --value -- "$UNIT")" \
+    || fail "cannot query $UNIT LoadState"
+  state="$($SYSTEMCTL --user show -p ActiveState --value -- "$UNIT")" \
+    || fail "cannot query $UNIT ActiveState"
+  group="$($SYSTEMCTL --user show -p ControlGroup --value -- "$UNIT")" \
+    || fail "cannot query $UNIT ControlGroup"
+  case "$state" in
+    active|activating|reloading|deactivating)
+      case "$load" in
+        loaded) : ;;
+        *) fail "$UNIT has active state '$state' with unrecognized LoadState '$load'" ;;
+      esac
+      [ -n "$group" ] || fail "active $UNIT has no resolved cgroup"
+      printf 'active\n'
+      ;;
+    inactive|dead)
+      case "$load" in
+        loaded|not-found|failed|masked) : ;;
+        *) fail "$UNIT has inactive state '$state' with unrecognized LoadState '$load'" ;;
+      esac
+      [ -z "$group" ] || fail "$UNIT is inactive but still has a non-empty ControlGroup ($group)"
+      if qemu_process_present; then
+        fail "stray QEMU process exists while $UNIT is inactive without a cgroup"
+      fi
+      printf 'inactive\n'
+      ;;
+    *) fail "unrecognized $UNIT ActiveState: $state" ;;
+  esac
+}
 
 resolve_cgroup_dir() {
   if [ "$ROOT" != "/" ]; then
@@ -95,6 +161,9 @@ assert_effective_values() {
 }
 
 case "$ACTION" in
+  runtime-state)
+    runtime_state
+    ;;
   guard)
     guard_live_usage
     ;;
