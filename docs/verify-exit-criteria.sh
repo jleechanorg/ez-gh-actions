@@ -165,6 +165,22 @@ container_state_is_running() {
     [ "$raw" = "true" ]
 }
 
+# A stopped Lima/Colima VM matters only when Docker is using that VM's
+# endpoint. Native host Docker must not be coupled to an unrelated VM.
+verify_vm_state_for_docker_mode() {
+  local platform="$1" containment_mode="$2" lima_status
+  [ "$containment_mode" = "vm-backed" ] || return 0
+
+  if [ "$platform" = "macos" ] && command -v colima >/dev/null 2>&1; then
+    colima status 2>&1 | grep -qi "is running" \
+      || { echo "Colima VM is not running (run: colima start)" >&2; return 1; }
+  elif command -v limactl >/dev/null 2>&1; then
+    lima_status=$(limactl list 2>/dev/null | awk 'NR==2 {print $2}')
+    [ "$lima_status" = "Running" ] \
+      || { echo "Colima/Lima VM is stopped (status: $lima_status)" >&2; return 1; }
+  fi
+}
+
 toml_get_limits() {
     local key="$1"
     local default="${2:-}"
@@ -839,6 +855,9 @@ if [ "${VERIFY_EXIT_CRITERIA_TEST_MODE:-0}" = "1" ]; then
         host_docker_envelope) verify_host_docker_envelope ;;
         oomctl_actions) oomctl_lists_actions_slice < "${VERIFY_EXIT_CRITERIA_OOMCTL_FIXTURE:?}" ;;
         gate0) verify_deployed_sha "${VERIFY_EXIT_CRITERIA_DEPLOYED_SHA:?}" ;;
+        gate2_vm_state)
+            verify_vm_state_for_docker_mode "${VERIFY_EXIT_CRITERIA_PLATFORM:?}" "${VERIFY_EXIT_CRITERIA_DOCKER_MODE:?}"
+            ;;
         canary) verify_fresh_canary "${VERIFY_EXIT_CRITERIA_CANARY_CONFIG:?}" "${VERIFY_EXIT_CRITERIA_CANARY_TIMEOUT_SECONDS:-600}" ;;
         modern_policy)
             policy=$(modern_envelope_budget "$VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR" "$VERIFY_EXIT_CRITERIA_ACTIONS_UNIT" "$VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS" "$VERIFY_EXIT_CRITERIA_RUNNER_COUNT" "$VERIFY_EXIT_CRITERIA_HOST_MB") || exit 1
@@ -1044,11 +1063,8 @@ docker info --format '{{.ServerVersion}}' >/dev/null || fail "Docker daemon unre
 DOCKER_CONTAINMENT_MODE="$("${REPO_ROOT}/scripts/host/docker-host-mode.sh" "$DOCKER_HOST")" \
     || fail "Docker endpoint ownership is unknown; cannot verify containment"
 
-if [ "$PLATFORM" = "macos" ] && command -v colima >/dev/null 2>&1; then
-  colima status 2>&1 | grep -qi "is running"     || fail "Colima VM is not running (run: colima start)"
-elif command -v limactl >/dev/null 2>&1; then
-  COLIMA_STATUS=$(limactl list 2>/dev/null | awk 'NR==2 {print $2}')
-  [ "$COLIMA_STATUS" = "Running" ] || fail "Colima/Lima VM is stopped (status: $COLIMA_STATUS)"
+if ! VM_STATE_ERROR=$(verify_vm_state_for_docker_mode "$PLATFORM" "$DOCKER_CONTAINMENT_MODE" 2>&1); then
+  fail "$VM_STATE_ERROR"
 fi
 pass "Gate 2: Service active and Docker/Colima daemon up (platform=$PLATFORM)"
 
