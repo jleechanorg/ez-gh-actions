@@ -291,7 +291,7 @@ run_guest_aggregate_case missing-cgroup fail
 # scope retains its default memory.high=max.
 mkdir -p "$TMP/effective-cgroup/agents.slice/agent.scope"
 printf '10737418240\n' > "$TMP/effective-cgroup/agents.slice/memory.high"
-printf '12884901888\n' > "$TMP/effective-cgroup/agents.slice/memory.max"
+printf '12348030976\n' > "$TMP/effective-cgroup/agents.slice/memory.max"
 printf 'max\n' > "$TMP/effective-cgroup/agents.slice/agent.scope/memory.high"
 printf 'max\n' > "$TMP/effective-cgroup/agents.slice/agent.scope/memory.max"
 VERIFY_EXIT_CRITERIA_TEST_MODE=1 \
@@ -362,10 +362,11 @@ run_envelope() { # policy-root
     bash "$VERIFY" 2>&1
 }
 
-# (a) tracked policy 28+12+5+10 = 56320 MB + 6333 MB reserve <= 63336 MB.
-set_live_policy $((10 * G)) $((12 * G)) $((4608 * 1048576)) $((5 * G))
-env_out=$(run_envelope "$ROOT") || fail "host-docker 28+12+5+10 envelope should pass: $env_out"
-grep -Fq '56320MB' <<<"$env_out" || fail "envelope did not sum live maxima to 56320MB: $env_out"
+# (a) tracked policy 28+11776M+5+10 = 55808 MB (54.5 GiB, R1 cap-fit amendment
+# 2026-10-21, bead jleechan-r1-cap-fit-amendment-byee) + 6333 MB reserve <= 63336 MB.
+set_live_policy $((10 * G)) $((11776 * 1048576)) $((4608 * 1048576)) $((5 * G))
+env_out=$(run_envelope "$ROOT") || fail "host-docker 28+11776M+5+10 envelope should pass: $env_out"
+grep -Fq '55808MB' <<<"$env_out" || fail "envelope did not sum live maxima to 55808MB: $env_out"
 
 # (b) an unbounded live maximum is rejected, never summed as zero.
 printf 'max\n' > "$ENV_DIR/cg/user/agents.slice/memory.max"
@@ -390,7 +391,7 @@ fi
 grep -Fq 'exceed host' <<<"$env_out" || fail "old maxima did not fail on the envelope sum: $env_out"
 
 # (d) live state that drifted from the tracked policy fails even if it fits.
-set_live_policy $((10 * G)) $((12 * G)) $((4 * G)) $((5 * G))
+set_live_policy $((10 * G)) $((11776 * 1048576)) $((4 * G)) $((5 * G))
 if env_out=$(run_envelope "$ROOT"); then
   fail "live automation.slice 4G/5G must not match the tracked 4608M/5G policy: $env_out"
 fi
@@ -657,7 +658,7 @@ UNIT
 cat > "$MODERN/agents.slice" <<UNIT
 [Slice]
 MemoryHigh=10G
-MemoryMax=12G
+MemoryMax=11776M
 MemorySwapMax=2G
 TasksMax=8192
 UNIT
@@ -707,10 +708,11 @@ exit 1
 EOF_SYSTEMCTL
 chmod +x "$TMP/systemctl"
 
-# Base MB for 9/10G QEMU (10240), 10/12G agents (12288), 4608M/5G automation (5120) = 27648 MB.
-# With native actions (28G = 28672 MB), total hard maxima = 56320 MB (55 GiB).
-# In an 80000 MB host, 56320 + 8000 reserve = 64320 <= 80000 -> fits.
-# In a 60000 MB host, 56320 + 6000 reserve = 62320 > 60000 -> exceeds.
+# Base MB for 9/10G QEMU (10240), 10G/11776M agents (11776), 4608M/5G automation (5120) = 27136 MB.
+# With native actions (28G = 28672 MB), total hard maxima = 55808 MB (54.5 GiB; R1 cap-fit
+# amendment 2026-10-21, bead jleechan-r1-cap-fit-amendment-byee).
+# In an 80000 MB host, 55808 + 8000 reserve = 63808 <= 80000 -> fits.
+# In a 60000 MB host, 55808 + 6000 reserve = 61808 > 60000 -> exceeds.
 policy_env=(PATH="$TMP:$PATH" VERIFY_EXIT_CRITERIA_TEST_MODE=1 VERIFY_EXIT_CRITERIA_TEST_CASE=modern_policy VERIFY_EXIT_CRITERIA_MODERN_UNIT_DIR="$MODERN" VERIFY_EXIT_CRITERIA_ACTIONS_UNIT="$TMP/actions.slice" VERIFY_EXIT_CRITERIA_HOST_MB=60000)
 if ! env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=10 VERIFY_EXIT_CRITERIA_HOST_MB=80000 bash "$VERIFY" >/dev/null; then
   fail "VM-backed actions must remain nested and disabled retired timers must pass"

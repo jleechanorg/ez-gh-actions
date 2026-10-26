@@ -62,7 +62,7 @@ setup_passing_fixture() {
     > "$root/etc/systemd/system/user@.service.d/99-ezgha-containment.conf"
 
   # agents.slice and automation.slice in user units
-  printf '[Slice]\nMemoryHigh=10G\nMemoryMax=12G\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
+  printf '[Slice]\nMemoryHigh=10G\nMemoryMax=11776M\nMemorySwapMax=2G\nTasksMax=8192\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/agents.slice"
   printf '[Slice]\nMemoryHigh=4608M\nMemoryMax=5G\nMemorySwapMax=1G\nTasksMax=4096\nManagedOOMMemoryPressure=auto\nManagedOOMSwap=auto\n' \
     > "$root/etc/systemd/user/automation.slice"
@@ -111,32 +111,34 @@ setup_passing_fixture "$FIXTURE_ROLLBACK" 10
 PATH="$FIXTURE_ROLLBACK/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_ROLLBACK" --runner-count 10 --require-fleet || fail "assert script rejected explicit 10-runner rollback fixture"
 ok "assert-host-containment-release1.sh accepts explicit 10-runner rollback fixture"
 
-# 2. Test memory floor boundary (computed: 55 GiB hard limits + max(2GiB, 10% MemTotal))
-# At boundary (64,079,644 KiB): 57,671,680 + 6,407,964 = 64,079,644 KiB (PASS)
-# Above boundary (64,079,645 KiB): 57,671,680 + 6,407,964 = 64,079,644 <= 64,079,645 KiB (PASS)
-# Below boundary (64,079,643 KiB): 57,671,680 + 6,407,964 = 64,079,644 > 64,079,643 KiB (FAIL)
+# 2. Test memory floor boundary (computed: 54.5 GiB hard limits + max(2GiB, 10% MemTotal))
+# R1 cap-fit amendment 2026-10-21 (agents.slice 12G -> 11776M, bead
+# jleechan-r1-cap-fit-amendment-byee): caps sum 57,147,392 KiB.
+# At boundary (63,497,102 KiB): 57,147,392 + 6,349,710 = 63,497,102 KiB (PASS)
+# Above boundary (63,497,103 KiB): floor 63,497,102 <= 63,497,103 KiB (PASS)
+# Below boundary (63,497,101 KiB): floor 63,497,102 > 63,497,101 KiB (FAIL)
 FIXTURE_MEM_FAIL="$WORK/mem_fail"
 setup_passing_fixture "$FIXTURE_MEM_FAIL"
-printf 'MemTotal:       64079643 kB\n' > "$FIXTURE_MEM_FAIL/proc/meminfo"
+printf 'MemTotal:       63497101 kB\n' > "$FIXTURE_MEM_FAIL/proc/meminfo"
 if PATH="$FIXTURE_MEM_FAIL/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_FAIL" --require-fleet > "$WORK/mem_fail.log" 2>&1; then
   fail "assertion passed when MemTotal was below computed floor"
 fi
 grep -q "FAIL: host MemTotal" "$WORK/mem_fail.log" || fail "missing expected MemTotal failure message"
-ok "assert-host-containment-release1.sh rejects memory below computed floor (64079643 KiB)"
+ok "assert-host-containment-release1.sh rejects memory below computed floor (63497101 KiB)"
 
 FIXTURE_MEM_BOUNDARY="$WORK/mem_boundary"
 setup_passing_fixture "$FIXTURE_MEM_BOUNDARY"
-printf 'MemTotal:       64079644 kB\n' > "$FIXTURE_MEM_BOUNDARY/proc/meminfo"
+printf 'MemTotal:       63497102 kB\n' > "$FIXTURE_MEM_BOUNDARY/proc/meminfo"
 PATH="$FIXTURE_MEM_BOUNDARY/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_BOUNDARY" --require-fleet \
-  || fail "assertion rejected memory at exact computed floor (64079644 KiB)"
-ok "assert-host-containment-release1.sh accepts memory at exact computed floor (64079644 KiB)"
+  || fail "assertion rejected memory at exact computed floor (63497102 KiB)"
+ok "assert-host-containment-release1.sh accepts memory at exact computed floor (63497102 KiB)"
 
 FIXTURE_MEM_ABOVE="$WORK/mem_above"
 setup_passing_fixture "$FIXTURE_MEM_ABOVE"
-printf 'MemTotal:       64079645 kB\n' > "$FIXTURE_MEM_ABOVE/proc/meminfo"
+printf 'MemTotal:       63497103 kB\n' > "$FIXTURE_MEM_ABOVE/proc/meminfo"
 PATH="$FIXTURE_MEM_ABOVE/bin:$PATH" "$ASSERT_SCRIPT" --root "$FIXTURE_MEM_ABOVE" --require-fleet \
-  || fail "assertion rejected memory above exact computed floor (64079645 KiB)"
-ok "assert-host-containment-release1.sh accepts memory above exact computed floor (64079645 KiB)"
+  || fail "assertion rejected memory above exact computed floor (63497103 KiB)"
+ok "assert-host-containment-release1.sh accepts memory above exact computed floor (63497103 KiB)"
 
 # 3. Test online CPUs below floor (31 online CPUs)
 FIXTURE_CPU_FAIL="$WORK/cpu_fail"
@@ -210,7 +212,7 @@ ok "assert-host-containment-release1.sh rejects runner container outside actions
 # `systemctl show -p P --value -- U` from a table and run them against the
 # passing fixture with CONTAINMENT_LIVE_SYSTEMD=1.
 write_props() { # [agents_high agents_max] auto_high auto_max
-  local agents_high=10737418240 agents_max=12884901888 auto_high auto_max uid; uid="$(id -u)"
+  local agents_high=10737418240 agents_max=12348030976 auto_high auto_max uid; uid="$(id -u)"
   if [ "$#" -eq 4 ]; then agents_high="$1" agents_max="$2"; shift 2; fi
   auto_high="$1" auto_max="$2"
   cat <<PROPS
@@ -264,11 +266,11 @@ done
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$PROPS_BIN/systemctl"
-# Host-docker policy: agents 10G/12G, automation 4608M/5G.
-write_props 10737418240 12884901888 4831838208 5368709120 > "$WORK/props_ok.txt"
+# Host-docker policy: agents 10G/11776M (11.5 GiB, R1 cap-fit amendment), automation 4608M/5G.
+write_props 10737418240 12348030976 4831838208 5368709120 > "$WORK/props_ok.txt"
 CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_ok.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_ok.log" 2>&1 \
-  || fail "live systemd checks rejected 10G/12G agents + 4608M/5G automation: $(tail -3 "$WORK/live_ok.log")"
+  || fail "live systemd checks rejected 10G/11776M agents + 4608M/5G automation: $(tail -3 "$WORK/live_ok.log")"
 # The pre-154k 18G/20G + 8G/10G maxima over-commit the host-docker envelope.
 write_props 19327352832 21474836480 5368709120 10737418240 > "$WORK/props_old.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
@@ -276,7 +278,7 @@ if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old.txt" PATH="$PROPS_B
   fail "live systemd checks accepted the old 18G/20G agents.slice"
 fi
 grep -q "agents.slice MemoryHigh ('19327352832') != '10737418240'" "$WORK/live_old.log" || fail "missing agents.slice MemoryHigh mismatch message: $(tail -2 "$WORK/live_old.log")"
-write_props 10737418240 12884901888 5368709120 10737418240 > "$WORK/props_old_auto.txt"
+write_props 10737418240 12348030976 5368709120 10737418240 > "$WORK/props_old_auto.txt"
 if CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/props_old_auto.txt" PATH="$PROPS_BIN:$FIXTURE_PASS/bin:$PATH" \
   "$ASSERT_SCRIPT" --root "$FIXTURE_PASS" --require-fleet > "$WORK/live_old_auto.log" 2>&1; then
   fail "live systemd checks accepted the old 8G/10G automation.slice"

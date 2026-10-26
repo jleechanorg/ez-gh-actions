@@ -132,7 +132,7 @@ fi
 # 2. Pre-mutation gate: memory below computed floor
 MEM_FAIL_ROOT="$WORK/mem_fail"
 setup_fixture "$MEM_FAIL_ROOT"
-printf 'MemTotal:       64079643 kB\n' > "$MEM_FAIL_ROOT/proc/meminfo"
+printf 'MemTotal:       63497101 kB\n' > "$MEM_FAIL_ROOT/proc/meminfo"
 if PATH="$MEM_FAIL_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_FAIL_ROOT" > "$WORK/mem_fail.log" 2>&1; then
   fail "apply-host-containment-release1.sh passed when MemTotal was below computed floor"
 fi
@@ -406,7 +406,7 @@ grep -q 'capped unit' "$WORK/dual_empty_control_group.log" \
 
 MEM_BOUNDARY_ROOT="$WORK/mem_boundary"
 setup_fixture "$MEM_BOUNDARY_ROOT"
-printf 'MemTotal:       64079644 kB\n' > "$MEM_BOUNDARY_ROOT/proc/meminfo"
+printf 'MemTotal:       63497102 kB\n' > "$MEM_BOUNDARY_ROOT/proc/meminfo"
 PATH="$MEM_BOUNDARY_ROOT/bin:$PATH" "$APPLY_SCRIPT" --root "$MEM_BOUNDARY_ROOT" > "$WORK/mem_boundary.log" 2>&1   || fail "apply-host-containment-release1.sh failed when MemTotal was at exact computed floor"
 ok "apply-host-containment-release1.sh succeeds when memory is at exact computed floor"
 
@@ -486,7 +486,7 @@ actions.slice ManagedOOMMemoryPressureLimit 3435973836
 actions.slice ManagedOOMSwap auto
 lima-vm@colima.service ActiveState active
 agents.slice MemoryHigh 10737418240
-agents.slice MemoryMax 12884901888
+agents.slice MemoryMax 12348030976
 agents.slice MemorySwapMax 2147483648
 agents.slice TasksMax 8192
 agents.slice ManagedOOMMemoryPressure auto
@@ -539,9 +539,9 @@ CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$
   "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
 grep -qx "systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
   || fail "live apply did not set automation.slice to 4608M/5G: $(grep automation "$WORK/live_sys.log" || echo none)"
-grep -qx "systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
-  || fail "live apply did not set agents.slice to 10G/12G: $(grep agents "$WORK/live_sys.log" || echo none)"
-ok "apply-host-containment-release1.sh live branch persists agents.slice 10G/12G and automation.slice 4608M/5G via set-property"
+grep -qx "systemctl --user set-property agents.slice MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192" "$WORK/live_sys.log" \
+  || fail "live apply did not set agents.slice to 10G/11776M: $(grep agents "$WORK/live_sys.log" || echo none)"
+ok "apply-host-containment-release1.sh live branch persists agents.slice 10G/11776M and automation.slice 4608M/5G via set-property"
 
 # The root phase enrolls actions.slice with systemd-oomd (kill at 80% pressure);
 # agents.slice and automation.slice are never enrolled with kill.
