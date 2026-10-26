@@ -36,7 +36,11 @@ fn alert_state() -> &'static Mutex<HashMap<String, Instant>> {
 
 #[cfg(test)]
 pub(crate) fn clear_alert_state() {
-    alert_state().lock().unwrap().clear();
+    let _test_lock = test_lock_if_needed();
+    alert_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 #[cfg(test)]
@@ -422,6 +426,9 @@ pub fn notify_delivery(
     subject: &str,
     body: &str,
 ) -> Result<bool> {
+    #[cfg(test)]
+    let _test_lock = test_lock_if_needed();
+
     if !configured_channels(&cfg.alert) {
         return Ok(false);
     }
@@ -521,6 +528,9 @@ fn deadman_clock() -> &'static Mutex<Option<Instant>> {
 }
 
 fn bump_deadman_clock(when: Instant) {
+    #[cfg(test)]
+    let _test_lock = test_lock_if_needed();
+
     // Recover from poison: a previous test that panicked while holding the
     // lock should not break the production alert path. The clock is a
     // monotonically-advancing timestamp, so the stale value is still safe.
@@ -533,9 +543,11 @@ fn bump_deadman_clock(when: Instant) {
 
 #[cfg(test)]
 pub(crate) fn clear_deadman_clock() {
-    if let Ok(mut guard) = deadman_clock().lock() {
-        *guard = None;
-    }
+    let _test_lock = test_lock_if_needed();
+    let mut guard = deadman_clock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
 }
 
 /// Per-instance dead-man tracker used by the serve loop. `now` is supplied by
@@ -617,14 +629,45 @@ pub fn notify(
 }
 
 #[cfg(test)]
-pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+thread_local! {
+    static TEST_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestLockGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestLockGuard {
+    fn drop(&mut self) {
+        TEST_LOCK_HELD.with(|held| held.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_lock() -> TestLockGuard {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TEST_LOCK_HELD.with(|held| held.set(true));
+    TestLockGuard { _guard: guard }
+}
+
+#[cfg(test)]
+fn test_lock_if_needed() -> Option<TestLockGuard> {
+    if TEST_LOCK_HELD.with(|held| held.get()) {
+        None
+    } else {
+        Some(test_lock())
+    }
 }
 
 #[cfg(test)]
 pub(crate) struct EnvVarGuard {
-    saved: Vec<(String, Option<String>)>,
+    saved: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
 }
 
 #[cfg(test)]
@@ -632,7 +675,7 @@ impl EnvVarGuard {
     pub(crate) fn new(vars: &[&str]) -> Self {
         let mut saved = Vec::new();
         for &var in vars {
-            saved.push((var.to_string(), std::env::var(var).ok()));
+            saved.push((var.into(), std::env::var_os(var)));
         }
         Self { saved }
     }
@@ -642,11 +685,8 @@ impl EnvVarGuard {
             std::env::remove_var(var);
         }
     }
-}
 
-#[cfg(test)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
+    fn restore(&self) {
         for (var, val) in &self.saved {
             match val {
                 Some(v) => std::env::set_var(var, v),
@@ -657,9 +697,26 @@ impl Drop for EnvVarGuard {
 }
 
 #[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct TestContext {
-    _lock: std::sync::MutexGuard<'static, ()>,
     _env: EnvVarGuard,
+    _lock: TestLockGuard,
+}
+
+#[cfg(test)]
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        // Restore process-global environment state while the test lock is
+        // still held. This prevents a waiting test from observing a stale
+        // value in the handoff between environment and lock cleanup.
+        self._env.restore();
+    }
 }
 
 #[cfg(test)]
@@ -672,11 +729,12 @@ pub(crate) fn test_context() -> TestContext {
         "HERMES_SLACK_BOT_TOKEN",
         "SLACK_CHANNEL",
         "HERMES_MONITOR_SLACK_TARGET",
+        "EZGHA_ALERT_DRY_RUN",
     ]);
     env.remove_all();
     TestContext {
-        _lock: lock,
         _env: env,
+        _lock: lock,
     }
 }
 
@@ -685,7 +743,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
+    use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -721,20 +781,125 @@ mod tests {
     }
 
     fn with_fake_path<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        let original_path = std::env::var_os("PATH");
-        let original_dry_run = std::env::var_os("EZGHA_ALERT_DRY_RUN");
-        std::env::set_var("PATH", dir);
-        std::env::remove_var("EZGHA_ALERT_DRY_RUN");
+        let env = EnvVarGuard::new(&["PATH", "EZGHA_ALERT_DRY_RUN"]);
+        let mut paths = vec![dir.to_path_buf()];
+        if let Some(original_path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&original_path));
+        }
+        let fake_path = std::env::join_paths(paths).expect("fake PATH must be joinable");
+        env.remove_all();
+        std::env::set_var("PATH", fake_path);
         let result = f();
-        match original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-        match original_dry_run {
-            Some(value) => std::env::set_var("EZGHA_ALERT_DRY_RUN", value),
-            None => std::env::remove_var("EZGHA_ALERT_DRY_RUN"),
-        }
+        drop(env);
         result
+    }
+
+    #[test]
+    fn with_fake_path_prefixes_dependencies_and_restores_after_panic() {
+        let _ctx = test_context();
+        let dir = unique_temp_dir("fake-path-panic");
+        fs::create_dir_all(&dir).unwrap();
+        let original_path = std::env::var_os("PATH");
+        std::env::set_var("EZGHA_ALERT_DRY_RUN", "sentinel");
+
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_fake_path(&dir, || {
+                let current_path = std::env::var_os("PATH").expect("PATH must be set");
+                let current_paths: Vec<_> = std::env::split_paths(&current_path).collect();
+                let original_paths: Vec<_> = original_path
+                    .as_ref()
+                    .map(|path| std::env::split_paths(path).collect())
+                    .unwrap_or_default();
+                assert_eq!(current_paths.first(), Some(&dir));
+                assert_eq!(&current_paths[1..], original_paths.as_slice());
+                assert!(std::env::var_os("EZGHA_ALERT_DRY_RUN").is_none());
+                panic!("exercise fake PATH cleanup");
+            });
+        }));
+
+        let panic_payload = panic_result.expect_err("expected the helper closure to panic");
+        assert_eq!(
+            panic_payload.downcast_ref::<&'static str>().copied(),
+            Some("exercise fake PATH cleanup")
+        );
+        assert_eq!(std::env::var_os("PATH"), original_path);
+        assert_eq!(
+            std::env::var_os("EZGHA_ALERT_DRY_RUN"),
+            Some(std::ffi::OsString::from("sentinel"))
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_var_guard_preserves_unset_empty_unicode_and_non_utf8_values() {
+        const KEY: &str = "EZGHA_ALERT_ENV_GUARD_REGRESSION";
+        let original = std::env::var_os(KEY);
+        let values = [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("héllo")),
+            Some(OsString::from_vec(vec![b'n', 0x80, b'f'])),
+        ];
+
+        for value in &values {
+            match value {
+                Some(value) => std::env::set_var(KEY, value),
+                None => std::env::remove_var(KEY),
+            }
+            {
+                let guard = EnvVarGuard::new(&[KEY]);
+                guard.remove_all();
+                assert!(std::env::var_os(KEY).is_none());
+            }
+            assert_eq!(std::env::var_os(KEY).as_ref(), value.as_ref());
+        }
+
+        let panic_value = OsString::from_vec(vec![b'p', 0xff, b'n']);
+        std::env::set_var(KEY, &panic_value);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = EnvVarGuard::new(&[KEY]);
+            guard.remove_all();
+            assert!(std::env::var_os(KEY).is_none());
+            panic!("exercise non-UTF-8 environment cleanup");
+        }));
+        let panic_payload = panic_result.expect_err("expected the guard closure to panic");
+        assert_eq!(
+            panic_payload.downcast_ref::<&'static str>().copied(),
+            Some("exercise non-UTF-8 environment cleanup")
+        );
+        assert_eq!(std::env::var_os(KEY), Some(panic_value));
+
+        match original {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+    }
+
+    #[test]
+    fn test_context_restores_environment_before_releasing_lock() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let observed = {
+            let ctx = test_context();
+            // Read the pre-context value from the guard snapshot while the
+            // test lock is held; the live variable is intentionally cleared.
+            let expected = ctx
+                ._env
+                .saved
+                .iter()
+                .find(|(key, _)| key.as_os_str() == std::ffi::OsStr::new("EZGHA_ALERT_DRY_RUN"))
+                .and_then(|(_, value)| value.clone());
+            std::env::set_var("EZGHA_ALERT_DRY_RUN", "sentinel");
+            let handle = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _lock = test_lock();
+                std::env::var_os("EZGHA_ALERT_DRY_RUN")
+            });
+            started_rx.recv().unwrap();
+            drop(ctx);
+            (handle.join().unwrap(), expected)
+        };
+
+        assert_eq!(observed.0, observed.1);
     }
 
     fn logged_invocations(path: &Path) -> usize {
@@ -759,9 +924,7 @@ mod tests {
         cfg.alert.alert_cooldown_secs = 1;
         cfg.alert.slack_webhook_url = Some("http://example.invalid/".into());
 
-        let original_path = std::env::var_os("PATH");
         std::env::set_var("EZGHA_ALERT_DRY_RUN", "1");
-        std::env::set_var("PATH", "/nonexistent");
         assert!(notify(&cfg, "same", Severity::Warning, "t", "b").is_ok());
         assert!(notify(&cfg, "same", Severity::Warning, "t", "b").is_ok());
 
@@ -770,11 +933,6 @@ mod tests {
             !state,
             "event should be in cooldown after back-to-back alerts"
         );
-
-        match original_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
     }
 
     #[test]
