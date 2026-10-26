@@ -667,7 +667,7 @@ fn test_lock_if_needed() -> Option<TestLockGuard> {
 
 #[cfg(test)]
 pub(crate) struct EnvVarGuard {
-    saved: Vec<(String, Option<String>)>,
+    saved: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
 }
 
 #[cfg(test)]
@@ -675,7 +675,7 @@ impl EnvVarGuard {
     pub(crate) fn new(vars: &[&str]) -> Self {
         let mut saved = Vec::new();
         for &var in vars {
-            saved.push((var.to_string(), std::env::var(var).ok()));
+            saved.push((var.into(), std::env::var_os(var)));
         }
         Self { saved }
     }
@@ -685,11 +685,8 @@ impl EnvVarGuard {
             std::env::remove_var(var);
         }
     }
-}
 
-#[cfg(test)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
+    fn restore(&self) {
         for (var, val) in &self.saved {
             match val {
                 Some(v) => std::env::set_var(var, v),
@@ -700,9 +697,26 @@ impl Drop for EnvVarGuard {
 }
 
 #[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+#[cfg(test)]
 pub(crate) struct TestContext {
-    _lock: TestLockGuard,
     _env: EnvVarGuard,
+    _lock: TestLockGuard,
+}
+
+#[cfg(test)]
+impl Drop for TestContext {
+    fn drop(&mut self) {
+        // Restore process-global environment state while the test lock is
+        // still held. This prevents a waiting test from observing a stale
+        // value in the handoff between environment and lock cleanup.
+        self._env.restore();
+    }
 }
 
 #[cfg(test)]
@@ -719,8 +733,8 @@ pub(crate) fn test_context() -> TestContext {
     ]);
     env.remove_all();
     TestContext {
-        _lock: lock,
         _env: env,
+        _lock: lock,
     }
 }
 
@@ -729,7 +743,9 @@ mod tests {
     use super::*;
     use crate::config::{Config, Scope};
     use crate::platform::Platform;
+    use std::ffi::OsString;
     use std::fs;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -801,13 +817,82 @@ mod tests {
             });
         }));
 
-        assert!(panic_result.is_err());
+        let panic_payload = panic_result.expect_err("expected the helper closure to panic");
+        assert_eq!(
+            panic_payload.downcast_ref::<&'static str>().copied(),
+            Some("exercise fake PATH cleanup")
+        );
         assert_eq!(std::env::var_os("PATH"), original_path);
         assert_eq!(
             std::env::var_os("EZGHA_ALERT_DRY_RUN"),
             Some(std::ffi::OsString::from("sentinel"))
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_var_guard_preserves_unset_empty_unicode_and_non_utf8_values() {
+        const KEY: &str = "EZGHA_ALERT_ENV_GUARD_REGRESSION";
+        let original = std::env::var_os(KEY);
+        let values = [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("héllo")),
+            Some(OsString::from_vec(vec![b'n', 0x80, b'f'])),
+        ];
+
+        for value in &values {
+            match value {
+                Some(value) => std::env::set_var(KEY, value),
+                None => std::env::remove_var(KEY),
+            }
+            {
+                let guard = EnvVarGuard::new(&[KEY]);
+                guard.remove_all();
+                assert!(std::env::var_os(KEY).is_none());
+            }
+            assert_eq!(std::env::var_os(KEY).as_ref(), value.as_ref());
+        }
+
+        let panic_value = OsString::from_vec(vec![b'p', 0xff, b'n']);
+        std::env::set_var(KEY, &panic_value);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = EnvVarGuard::new(&[KEY]);
+            guard.remove_all();
+            assert!(std::env::var_os(KEY).is_none());
+            panic!("exercise non-UTF-8 environment cleanup");
+        }));
+        let panic_payload = panic_result.expect_err("expected the guard closure to panic");
+        assert_eq!(
+            panic_payload.downcast_ref::<&'static str>().copied(),
+            Some("exercise non-UTF-8 environment cleanup")
+        );
+        assert_eq!(std::env::var_os(KEY), Some(panic_value));
+
+        match original {
+            Some(value) => std::env::set_var(KEY, value),
+            None => std::env::remove_var(KEY),
+        }
+    }
+
+    #[test]
+    fn test_context_restores_environment_before_releasing_lock() {
+        let original = std::env::var_os("EZGHA_ALERT_DRY_RUN");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let observed = {
+            let ctx = test_context();
+            std::env::set_var("EZGHA_ALERT_DRY_RUN", "sentinel");
+            let handle = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _lock = test_lock();
+                std::env::var_os("EZGHA_ALERT_DRY_RUN")
+            });
+            started_rx.recv().unwrap();
+            drop(ctx);
+            handle.join().unwrap()
+        };
+
+        assert_eq!(observed, original);
     }
 
     fn logged_invocations(path: &Path) -> usize {
