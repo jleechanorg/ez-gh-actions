@@ -309,6 +309,13 @@ struct SlotAssignments {
     /// window active" — never blocks a reap, only ever adds one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registered_at: BTreeMap<String, u64>,
+    /// Slot index -> unix-epoch-seconds when the current assignment's Docker
+    /// container start returned success. This witness is deliberately distinct
+    /// from `registered_at`: a fresh JIT reservation with no started container
+    /// retains its propagation grace, while a container that did start and is
+    /// now definitively absent can release the slot immediately.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    container_started_at: BTreeMap<String, u64>,
 }
 
 /// Grace window (bead ez-gh-actions-5ki): a registration recorded within this
@@ -344,6 +351,61 @@ fn slot_in_grace_window(assignments: &SlotAssignments, slot: &str) -> bool {
 fn seconds_since_registered(assignments: &SlotAssignments, slot: &str) -> Option<u64> {
     let &registered_at = assignments.registered_at.get(slot)?;
     Some(now_epoch_secs().saturating_sub(registered_at))
+}
+
+/// Return the fresh local activity proof needed to bypass the JIT grace window
+/// for a slot whose current assignment has successfully started a container.
+/// A missing witness, an empty reservation, or a probe result other than
+/// Absent never authorizes a grace-window reclaim.
+fn started_container_activity_if_in_grace_with_state(
+    assignments: &SlotAssignments,
+    slot: &str,
+    container_name: &str,
+    activity_probe: &mut impl FnMut(&str) -> LocalRunnerActivity,
+    in_grace: bool,
+) -> Option<LocalRunnerActivity> {
+    let current_assignment = assignments.assignments.get(slot)?;
+    if current_assignment.is_empty()
+        || !assignments.container_started_at.contains_key(slot)
+        || !in_grace
+    {
+        return None;
+    }
+    Some(activity_probe(container_name))
+}
+
+/// Preserve a fresh started container when an activity probe crosses the grace
+/// boundary. Busy and Unknown are always fail-safe; Absent remains the only
+/// activity proof that authorizes an in-grace reclaim.
+fn retain_started_activity_after_grace_probe(
+    in_grace_before_probe: bool,
+    activity: Option<LocalRunnerActivity>,
+) -> bool {
+    matches!(
+        activity,
+        Some(LocalRunnerActivity::Busy) | Some(LocalRunnerActivity::Unknown)
+    ) || (in_grace_before_probe && !matches!(activity, Some(LocalRunnerActivity::Absent)))
+}
+
+/// Probe a successfully-started container only when the live registration is
+/// still the assignment that recorded the successful start. Path 4 runs after
+/// Path 1 and may be past the grace boundary, so Busy and Unknown must remain
+/// vetoes for this current assignment even then.
+fn started_container_activity_for_current_assignment(
+    assignments: &SlotAssignments,
+    slot: &str,
+    runner_id: u64,
+    container_name: &str,
+    activity_probe: &mut impl FnMut(&str) -> LocalRunnerActivity,
+) -> Option<LocalRunnerActivity> {
+    let current_assignment = assignments.assignments.get(slot)?;
+    if current_assignment.is_empty()
+        || current_assignment != &runner_id.to_string()
+        || !assignments.container_started_at.contains_key(slot)
+    {
+        return None;
+    }
+    Some(activity_probe(container_name))
 }
 
 /// True if `slot`'s `assignments[id_str]` is empty (a `next_slot_excluding`
@@ -985,6 +1047,7 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
             // both racing the same slot. See first-wave report for full
             // race diagram; this is the post-2026-07-08 fix (1a9baf4)
             // extension.
+            assignments.container_started_at.remove(&key);
             assignments.registered_at.insert(key, now_epoch_secs());
             write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(Some(slot));
@@ -1006,7 +1069,29 @@ fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) ->
     assignments
         .assignments
         .insert(key.clone(), runner_id.to_string());
+    assignments.container_started_at.remove(&key);
     assignments.registered_at.insert(key, now_epoch_secs());
+    write_slot_assignments_for(&assignments, cfg)
+}
+
+fn record_container_started_for(
+    cfg: Option<&Config>,
+    slot: u32,
+    expected_runner_id: u64,
+) -> Result<()> {
+    let mut assignments = read_slot_assignments_for(cfg)?;
+    let key = slot.to_string();
+    let Some(runner_id) = assignments.assignments.get(&key) else {
+        bail!("cannot record container start for unassigned slot {slot}");
+    };
+    if runner_id != &expected_runner_id.to_string() {
+        bail!(
+            "cannot record container start for slot {slot}: current runner id {runner_id} differs from expected {expected_runner_id}"
+        );
+    }
+    assignments
+        .container_started_at
+        .insert(key, now_epoch_secs());
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -1022,6 +1107,7 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     let key = slot.to_string();
     assignments.assignments.remove(&key);
     assignments.registered_at.remove(&key);
+    assignments.container_started_at.remove(&key);
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -1374,6 +1460,7 @@ fn release_stale_slots_from_with_containers_for(
         runner_prefix,
         local_container_names,
         local_runner_activity,
+        slot_in_grace_window,
     )
 }
 
@@ -1392,6 +1479,27 @@ fn release_stale_slots_from_with_containers_and_activity(
         runner_prefix,
         local_container_names,
         activity_probe,
+        slot_in_grace_window,
+    )
+}
+
+#[cfg(test)]
+fn release_stale_slots_from_with_containers_and_activity_with_grace(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
+) -> Result<usize> {
+    release_stale_slots_from_with_containers_and_activity_for(
+        None,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        activity_probe,
+        grace_check,
     )
 }
 
@@ -1402,6 +1510,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
     mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    mut grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
 ) -> Result<usize> {
     if assignments.assignments.is_empty() {
         return Ok(0);
@@ -1479,7 +1588,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 match local_container_names {
                     Some(local_names) if local_names.contains(&expected_name) => {
-                        if slot_in_grace_window(assignments, slot) {
+                        let in_grace_before_probe = grace_check(assignments, slot);
+                        let started_activity = started_container_activity_if_in_grace_with_state(
+                            assignments,
+                            slot,
+                            &expected_name,
+                            &mut activity_probe,
+                            in_grace_before_probe,
+                        );
+                        if retain_started_activity_after_grace_probe(
+                            in_grace_before_probe,
+                            started_activity,
+                        ) {
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: local container {expected_name} still exists while GH registration {rid} is absent (within {}s JIT-propagation grace window; elapsed {elapsed}s)",
@@ -1487,7 +1607,8 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                             );
                         } else {
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
-                            match activity_probe(&expected_name) {
+                            match started_activity.unwrap_or_else(|| activity_probe(&expected_name))
+                            {
                                 LocalRunnerActivity::Busy => {
                                     eprintln!(
                                         "warning: keeping slot {slot_n}: local container {expected_name} has Runner.Worker while GH snapshot omits registration {rid} (elapsed {elapsed}s); refusing destructive reclaim"
@@ -1569,7 +1690,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         // The recorded runner_id is no longer registered on GitHub
                         // (server-side reap, manual removal, or a stale entry from a
                         // prior host) and no local container exists, so reclaim.
-                        if slot_in_grace_window(assignments, slot) {
+                        let in_grace_before_probe = grace_check(assignments, slot);
+                        let started_activity = started_container_activity_if_in_grace_with_state(
+                            assignments,
+                            slot,
+                            &expected_name,
+                            &mut activity_probe,
+                            in_grace_before_probe,
+                        );
+                        if retain_started_activity_after_grace_probe(
+                            in_grace_before_probe,
+                            started_activity,
+                        ) {
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: runner_id {rid} is missing from GitHub and no local container exists, but it was registered {elapsed}s ago (within {}s grace window)",
@@ -1691,7 +1823,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         && !runner.busy
                         && !local_names.contains(&expected_name)
                     {
-                        if slot_in_grace_window(assignments, slot) {
+                        let in_grace_before_probe = grace_check(assignments, slot);
+                        let started_activity = started_container_activity_if_in_grace_with_state(
+                            assignments,
+                            slot,
+                            &expected_name,
+                            &mut activity_probe,
+                            in_grace_before_probe,
+                        );
+                        if retain_started_activity_after_grace_probe(
+                            in_grace_before_probe,
+                            started_activity,
+                        ) {
                             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
                             eprintln!(
                                 "info: keeping slot {slot_n}: runner {expected_name} (id {rid}) is offline/idle with no local container but was registered {elapsed}s ago (within {}s JIT-propagation grace window)",
@@ -1804,6 +1947,24 @@ fn offline_not_busy_owned_missing_container_registrations(
     runner_prefix: &str,
     local_container_names: &HashSet<String>,
 ) -> Vec<(u64, String)> {
+    offline_not_busy_owned_missing_container_registrations_for(
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        local_runner_activity,
+        slot_in_grace_window,
+    )
+}
+
+fn offline_not_busy_owned_missing_container_registrations_for(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: &HashSet<String>,
+    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    mut grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
+) -> Vec<(u64, String)> {
     if runner_prefix.is_empty() {
         // Without a prefix there is no ownership gate — refuse to enumerate
         // candidates rather than risk reaping someone else's runner.
@@ -1834,7 +1995,15 @@ fn offline_not_busy_owned_missing_container_registrations(
         // writes, so a slot Path 1 just released this tick still has its
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
-        if slot_in_grace_window(assignments, slot) {
+        let in_grace_before_probe = grace_check(assignments, slot);
+        let started_activity = started_container_activity_for_current_assignment(
+            assignments,
+            slot,
+            runner.id,
+            &runner.name,
+            &mut activity_probe,
+        );
+        if retain_started_activity_after_grace_probe(in_grace_before_probe, started_activity) {
             let elapsed = seconds_since_registered(assignments, slot).unwrap_or(0);
             let wall_secs = now_epoch_secs();
             let monotonic_secs = ensure_daemon_start().elapsed().as_secs_f64();
@@ -3772,6 +3941,14 @@ fn start_one_with_generate_at_slot(
         bail!(
             "docker run failed: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Docker has now confirmed a successful start. Persist the witness before
+    // returning so a same-tick reconciliation can distinguish a never-started
+    // JIT propagation gap from a container that completed and disappeared.
+    if let Err(err) = record_container_started_for(Some(cfg), slot, runner_id) {
+        eprintln!(
+            "warning: Docker start succeeded for slot {slot}, but recording its start witness failed: {err}; retaining the normal JIT grace window"
         );
     }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -9411,6 +9588,10 @@ esac
             assignments.assignments.is_empty(),
             "slot reserved by start_one should be cleaned up when docker run fails"
         );
+        assert!(
+            assignments.container_started_at.is_empty(),
+            "failed docker run must not leave a container-start witness"
+        );
     }
 
     /// Production start_one rejection regression (root review): an
@@ -9650,6 +9831,14 @@ esac
             Ok(("jit".into(), 1111))
         })
         .expect("start_one should succeed");
+
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .contains_key("1"),
+            "a successful docker run must persist a start witness for the current slot"
+        );
 
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
@@ -10445,6 +10634,119 @@ esac
                 .contains_key("1"),
             "slot 1 must be released when the local container has been confirmed gone"
         );
+    }
+
+    /// A container that successfully started and then disappeared must free
+    /// its slot immediately, even while the JIT registration grace window is
+    /// still open. The serialized witness is deliberately injected here so
+    /// this regression test remains meaningful against the pre-fix binary:
+    /// the old code ignores the unknown field and incorrectly keeps the slot.
+    #[test]
+    fn release_stale_slots_keeps_fresh_never_started_container_within_grace() {
+        let _env = TestEnv::new("fresh_never_started_container_within_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        // No container-start witness exists: a fresh JIT reservation must
+        // retain its propagation grace even if a fresh probe reports Absent.
+        let local_names = HashSet::new();
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &[],
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "a never-started current assignment must retain the grace window"
+        );
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "the never-started assignment must remain reserved during grace"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_reclaims_started_absent_container_within_grace() {
+        let _env = TestEnv::new("started_absent_container_within_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let path = slot_assignments_path_for(Some(&cfg));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{raw}\n[container_started_at]\n1 = {}\n", now_epoch_secs()),
+        )
+        .unwrap();
+
+        let local_names = HashSet::new();
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &[],
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "a witnessed started container confirmed absent must release its slot during grace"
+        );
+        assert_eq!(
+            next_slot(&cfg).unwrap(),
+            1,
+            "the released slot must be immediately available to the allocator"
+        );
+    }
+
+    #[test]
+    fn started_container_grace_reclaim_keeps_busy_and_unknown_activity_safe() {
+        let _env = TestEnv::new("started_container_grace_activity_safety");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments
+            .container_started_at
+            .insert("1".to_string(), now_epoch_secs());
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // The inventory is a stale snapshot that still names the container.
+        // Fresh Busy and Unknown probes must both retain the assignment.
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let reclaimed = release_stale_slots_from_with_containers_and_activity(
+                &read_slot_assignments().unwrap(),
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+            )
+            .unwrap();
+            assert_eq!(
+                reclaimed, 0,
+                "fresh {activity:?} activity must retain a witnessed started slot"
+            );
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "fresh {activity:?} activity must leave the slot owned"
+            );
+        }
     }
 
     #[test]
@@ -11263,6 +11565,157 @@ esac
     }
 
     // --- bead ez-gh-actions-5ki: registration grace window ---
+
+    #[test]
+    fn path1_to_path4_reap_does_not_delete_busy_or_unknown_after_grace_boundary() {
+        // Path 1 observes the assignment during grace and retains it after a
+        // Busy/Unknown probe. Path 4 then runs past grace on the same snapshot;
+        // it must fresh-probe the current started assignment before deletion.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("outer_boundary_path1_path4_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let assignments = read_slot_assignments().unwrap();
+            let live = vec![s9d_runner(4242, "ez-org-runner-1", "offline", false)];
+            let local_names = HashSet::new();
+            let mut path1_grace_checks = 0;
+            let path1_reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &assignments,
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    path1_grace_checks += 1;
+                    path1_grace_checks == 1
+                },
+            )
+            .unwrap();
+            assert_eq!(path1_reclaimed, 0, "Path 1 must retain {activity:?}");
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "Path 1 must leave the {activity:?} assignment owned"
+            );
+
+            // Path 4 is the production registration-delete decision. Its
+            // grace seam is now past the boundary, so only the current
+            // assignment's fresh Busy/Unknown proof can veto deletion.
+            let mut path4_grace_checks = 0;
+            let candidates = offline_not_busy_owned_missing_container_registrations_for(
+                &assignments,
+                &live,
+                &cfg.runner.name_prefix,
+                &local_names,
+                |_| activity,
+                |_, _| {
+                    path4_grace_checks += 1;
+                    false
+                },
+            );
+            assert!(
+                candidates.is_empty(),
+                "sequential Path 1 -> Path 4 must issue zero DELETE/cancel candidates for {activity:?}"
+            );
+            assert_eq!(path1_grace_checks, 1);
+            assert_eq!(path4_grace_checks, 1);
+        }
+    }
+
+    #[test]
+    fn gh_missing_missing_inventory_keeps_busy_and_unknown_after_grace_boundary() {
+        // The activity probe starts during grace; the injected second grace
+        // check expires afterward. Both fail-safe outcomes must retain the
+        // current assignment through the real reconciliation routine.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("boundary_gh_missing_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let mut grace_checks = 0;
+            let local_names = HashSet::new();
+            let reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &read_slot_assignments().unwrap(),
+                &[],
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    grace_checks += 1;
+                    grace_checks == 1
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                reclaimed, 0,
+                "GH-missing + missing-inventory must retain {activity:?} across the grace boundary"
+            );
+            assert_eq!(
+                grace_checks, 1,
+                "the pre-probe grace state must be captured once"
+            );
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "GH-missing + missing-inventory must leave the {activity:?} assignment owned"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_idle_missing_inventory_keeps_busy_and_unknown_after_grace_boundary() {
+        // Same boundary race for an offline+idle GitHub registration, through
+        // the real reconciliation routine and with no local inventory entry.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("boundary_offline_idle_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let live = vec![s9d_runner(4242, "ez-org-runner-1", "offline", false)];
+            let local_names = HashSet::new();
+            let mut grace_checks = 0;
+            let reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &read_slot_assignments().unwrap(),
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    grace_checks += 1;
+                    grace_checks == 1
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                reclaimed, 0,
+                "offline-idle + missing-inventory must retain {activity:?} across the grace boundary"
+            );
+            assert_eq!(
+                grace_checks, 1,
+                "the pre-probe grace state must be captured once"
+            );
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "offline-idle + missing-inventory must leave the {activity:?} assignment owned"
+            );
+        }
+    }
 
     #[test]
     fn ensure_count_respawn_within_grace_window_is_not_reaped_by_release_stale_slots() {
@@ -13084,6 +13537,53 @@ esac
         // still pick slot 2 — NOT panic, NOT bail.
         let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         assert_eq!(chosen, 2);
+    }
+
+    #[test]
+    fn container_started_witness_lifecycle_is_current_assignment_scoped() {
+        let _env = TestEnv::new("container_started_witness_lifecycle");
+        let cfg = cfg_with(2, "ez-org-runner");
+        assert_eq!(next_slot(&cfg).unwrap(), 1);
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let assignments = read_slot_assignments().unwrap();
+        assert!(
+            assignments.container_started_at.is_empty(),
+            "JIT success alone must not create a Docker start witness"
+        );
+        assert!(
+            record_container_started_for(Some(&cfg), 1, 5252).is_err(),
+            "a stale Docker start result must not witness a replaced assignment"
+        );
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .is_empty(),
+            "a mismatched runner id must not create a witness"
+        );
+        record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+        // Replacing the GitHub runner id starts a new current assignment and
+        // must invalidate the old container-start witness.
+        record_slot_runner_id(1, 5252).unwrap();
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .is_empty(),
+            "runner-id replacement must clear the previous assignment witness"
+        );
+
+        record_container_started_for(Some(&cfg), 1, 5252).unwrap();
+        release_slot(1).unwrap();
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .is_empty(),
+            "slot release must clear the container-start witness"
+        );
     }
 
     /// Bead jleechan-uurm: regression test for the empty-id Path-1 race.
