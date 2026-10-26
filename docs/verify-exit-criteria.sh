@@ -1623,6 +1623,10 @@ echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live lim
 # jeff-ubuntu), QEMU runs at host scope and IS reachable via
 # /proc/<qemu>/cgroup, so we still probe. Native Docker skips only when the
 # optional VM is explicitly inactive/not-found/dead with no stray QEMU.
+if ! QEMU_STATIC_ASSERTION="$(ASSERT_LIVE_QEMU=0 \
+    "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)"; then
+    fail "Gate 8 (1) tracked QEMU policy assertion failed: ${QEMU_STATIC_ASSERTION}"
+fi
 PROBE_QEMU_SLICE=1
 if [ "$(uname -s)" = "Darwin" ] && containment_in_vm; then
     PROBE_QEMU_SLICE=0
