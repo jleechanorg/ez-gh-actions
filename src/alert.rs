@@ -880,9 +880,14 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let observed = {
             let ctx = test_context();
-            // Snapshot the expected value only after test_context has
-            // acquired the lock and cleared the guarded environment.
-            let expected = std::env::var_os("EZGHA_ALERT_DRY_RUN");
+            // Read the pre-context value from the guard snapshot while the
+            // test lock is held; the live variable is intentionally cleared.
+            let expected = ctx
+                ._env
+                .saved
+                .iter()
+                .find(|(key, _)| key.as_os_str() == std::ffi::OsStr::new("EZGHA_ALERT_DRY_RUN"))
+                .and_then(|(_, value)| value.clone());
             std::env::set_var("EZGHA_ALERT_DRY_RUN", "sentinel");
             let handle = std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
