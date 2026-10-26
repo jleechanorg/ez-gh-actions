@@ -877,10 +877,12 @@ mod tests {
 
     #[test]
     fn test_context_restores_environment_before_releasing_lock() {
-        let original = std::env::var_os("EZGHA_ALERT_DRY_RUN");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let observed = {
             let ctx = test_context();
+            // Snapshot the expected value only after test_context has
+            // acquired the lock and cleared the guarded environment.
+            let expected = std::env::var_os("EZGHA_ALERT_DRY_RUN");
             std::env::set_var("EZGHA_ALERT_DRY_RUN", "sentinel");
             let handle = std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
@@ -889,10 +891,10 @@ mod tests {
             });
             started_rx.recv().unwrap();
             drop(ctx);
-            handle.join().unwrap()
+            (handle.join().unwrap(), expected)
         };
 
-        assert_eq!(observed, original);
+        assert_eq!(observed.0, observed.1);
     }
 
     fn logged_invocations(path: &Path) -> usize {
