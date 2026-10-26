@@ -3252,6 +3252,7 @@ mod tests {
 
     #[test]
     fn test_alert_requires_configured_channel() {
+        let _ctx = alert::test_context();
         let cfg = test_config();
         let err = run_test_alert(&cfg, "unit.no_channel").unwrap_err();
         assert!(err.to_string().contains("no alert channels configured"));
@@ -3259,7 +3260,7 @@ mod tests {
 
     #[test]
     fn test_alert_writes_configured_log_channel() {
-        alert::clear_alert_state();
+        let _ctx = alert::test_context();
         let mut cfg = test_config();
         let dir = unique_temp_dir("alert-test");
         let log = dir.join("alerts.jsonl");

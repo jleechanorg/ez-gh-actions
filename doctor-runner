@@ -1011,8 +1011,10 @@ job_evidence_for_runner() {
 # unix:///Users/jleechan/.colima/default/docker.sock; every remote probe
 # queried the wrong daemon and reported 5/6 DOWN while 6 containers existed
 # on the daemon's socket. macOS: read EnvironmentVariables.DOCKER_HOST from
-# the launchd plist (the daemon's source of truth). Linux: the systemd unit
-# env or default socket. Empty result = bare `docker` (unchanged behavior).
+# the launchd plist (the daemon's source of truth). Linux: match
+# src/platform.rs by using only a nonblank DOCKER_HOST_OVERRIDE from the
+# systemd unit, then the native socket. DOCKER_HOST and DOCKER_CONTEXT are
+# interactive-client settings and are not the daemon's endpoint.
 REMOTE_DOCKER_HOST_CACHE=""
 REMOTE_DOCKER_HOST_CACHED_FOR=""
 remote_docker_env() {
@@ -1024,12 +1026,26 @@ remote_docker_env() {
   local dh
   dh=$(timeout 8 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" '
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
-      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
+      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
-      systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1
-    fi' 2>/dev/null) || dh=""
+      unit_load_state=$(systemctl --user show ezgha.service -p LoadState --value 2>/dev/null) || exit 1
+      [ "$unit_load_state" = loaded ] || exit 1
+      service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
+      # Parse quoted systemctl assignments as data, never as shell code.
+      endpoint=$(printf "%s\n" "$service_env" | python3 -c "import shlex,sys; items=shlex.split(sys.stdin.read()); print(next((x.split(\"=\",1)[1] for x in items if x.startswith(\"DOCKER_HOST_OVERRIDE=\")),\"\"),end=\"\")") || exit 1
+      case "$endpoint" in
+        *[![:space:]]*) printf "%s" "$endpoint" ;;
+        *) printf "unix:///var/run/docker.sock" ;;
+      esac
+    else
+      exit 1
+    fi' 2>/dev/null) || {
+      REMOTE_DOCKER_HOST_CACHE=""
+      REMOTE_DOCKER_HOST_CACHED_FOR=""
+      return 1
+    }
   if [ -n "$dh" ]; then
-    REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
+    printf -v REMOTE_DOCKER_HOST_CACHE 'DOCKER_HOST=%q ' "$dh"
   else
     REMOTE_DOCKER_HOST_CACHE=""
   fi
@@ -1038,14 +1054,19 @@ remote_docker_env() {
 }
 
 probe_slot_state() {
-  # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1"
+  # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1".
+  # Return status 2 distinguishes an unresolved endpoint from a missing container.
   # (localhost = local docker, anything else = ssh against the remote
   # DAEMON's docker endpoint — see remote_docker_env).
   local host="$1" name="$2" running work denv
   if [ "$host" = "localhost" ]; then
     running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
   else
-    denv=$(remote_docker_env "$host")
+    if ! denv=$(remote_docker_env "$host"); then
+      bad "$host Docker endpoint unresolved — slot $name counted DOWN without a Docker probe" >&2
+      echo "DOWN"
+      return 2
+    fi
     running=$(ssh -o ConnectTimeout=4 "$host" "${denv}docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
   fi
   if [ "$running" != "true" ]; then
@@ -1081,7 +1102,7 @@ list_slot_work() {
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
   printf "\n  %s (%d configured):\n" "$label" "$count"
   local -a slot_state=()
-  local i name jobline has_down=0 has_idle=0 idle_to_down=0
+  local i name jobline second_state third_state has_down=0 has_idle=0 idle_to_down=0
 
   if [ "$host" = "localhost" ] && [ -n "${LOCAL_SLOT_STATE_TABLE:-}" ] \
      && [ "$prefix" = "${RUNNER_NAME_PREFIX:-}" ] && [ "$count" = "${CONFIGURED_COUNT:-}" ]; then
@@ -1092,7 +1113,7 @@ list_slot_work() {
     done
   else
     for i in $(seq 1 "$count"); do
-      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
       [ "${slot_state[i]}" = "DOWN" ] && has_down=1
       [ "${slot_state[i]}" = "IDLE" ] && has_idle=1
     done
@@ -1102,7 +1123,11 @@ list_slot_work() {
       for i in $(seq 1 "$count"); do
         case "${slot_state[i]}" in
           DOWN)
-            case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+            if ! second_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
+              slot_state[i]="UNRESOLVED_DOWN"
+              continue
+            fi
+            case "$second_state" in
               DOWN) : ;;                            # persisted both docker samples — check journal next
               *)    slot_state[i]="CYCLING" ;;      # back Up — normal respawn, not a defect
             esac
@@ -1110,7 +1135,7 @@ list_slot_work() {
           IDLE)
             # Re-sampled state wins: EXECUTING clears, IDLE stays, absent
             # follows the DOWN path (journal cross-check below).
-            slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+            slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
             if [ "${slot_state[i]}" = "DOWN" ]; then
               has_down=1; idle_to_down=1
               slot_state[i]="IDLE_DOWN"          # one absent sample so far
@@ -1125,7 +1150,11 @@ list_slot_work() {
       fi
       for i in $(seq 1 "$count"); do
         [ "${slot_state[i]}" != "IDLE_DOWN" ] && continue
-        case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+        if ! third_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
+          slot_state[i]="UNRESOLVED_DOWN"
+          continue
+        fi
+        case "$third_state" in
           DOWN) slot_state[i]="DOWN" ;;
           *)    slot_state[i]="CYCLING" ;;
         esac
@@ -1206,6 +1235,11 @@ list_slot_work() {
         _down_evidence="no container across both samples AND no respawn activity in daemon log for ${RESPAWN_EVIDENCE_WINDOW_MIN}m — critical"
         [ "${_respawn_fetch_failed:-0}" -eq 1 ] && _down_evidence="${_down_evidence} (respawn-log fetch failed)"
         printf "    %-22s %-13s %s\n" "$name" "DOWN" "$_down_evidence"
+        ;;
+      UNRESOLVED_DOWN)
+        dn=$((dn+1))
+        LAST_DOWN_SLOTS+=("$name")
+        printf "    %-22s %-13s %s\n" "$name" "DOWN" "remote Docker endpoint unresolved; no Docker probe issued"
         ;;
     esac
   done
