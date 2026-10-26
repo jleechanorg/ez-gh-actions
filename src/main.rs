@@ -2810,7 +2810,7 @@ mod tests {
 
     #[test]
     fn repeated_settling_ceilings_alert_at_threshold_and_reset_only_on_recovery() {
-        alert::clear_alert_state();
+        let _ctx = alert::test_context();
         let mut cfg = test_config();
         cfg.alert.failure_alert_threshold = 3;
         let dir = unique_temp_dir("settling-ceiling-alert");
