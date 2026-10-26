@@ -478,13 +478,14 @@ setup_fixture "$LIVE_ROOT"
 uid="$(id -u)"
 cat > "$WORK/live_props.txt" <<PROPS
 lima-vm@colima.service ControlGroup
+lima-vm@colima.service LoadState loaded
+lima-vm@colima.service ActiveState active
 agents.slice ActiveState active
 automation.slice ActiveState active
 app-lima-vm.slice ActiveState active
 actions.slice ManagedOOMMemoryPressure kill
 actions.slice ManagedOOMMemoryPressureLimit 3435973836
 actions.slice ManagedOOMSwap auto
-lima-vm@colima.service ActiveState active
 agents.slice MemoryHigh 10737418240
 agents.slice MemoryMax 12348030976
 agents.slice MemorySwapMax 2147483648
@@ -535,7 +536,7 @@ done
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$LIVE_ROOT/bin/systemctl"
-CONTAINMENT_LIVE_SYSTEMD=1 SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$WORK/live_sys.log" PATH="$LIVE_ROOT/bin:$PATH" \
+CONTAINMENT_LIVE_SYSTEMD=1 QEMU_RUNTIME_STATE=active SYSTEMD_PROPS="$WORK/live_props.txt" SYSTEMCTL_LOG="$WORK/live_sys.log" PATH="$LIVE_ROOT/bin:$PATH" \
   "$APPLY_SCRIPT" --root "$LIVE_ROOT" > "$WORK/live.log" 2>&1 || fail "live-systemd apply failed: $(tail -3 "$WORK/live.log")"
 grep -qx "systemctl --user set-property automation.slice MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096" "$WORK/live_sys.log" \
   || fail "live apply did not set automation.slice to 4608M/5G: $(grep automation "$WORK/live_sys.log" || echo none)"

@@ -23,6 +23,27 @@ neg_out="$(REPO_ROOT="$tmp" bash "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceil
 echo "$neg_out" | grep -q 'install.sh does not apply' \
   || { echo "FAIL: expected install.sh FAIL line, got: $neg_out" >&2; exit 1; }
 
+# Static policy checks remain mandatory even when the VM is inactive. Missing
+# CPUQuota must fail before any live-state decision can skip the QEMU probe.
+cp "$REPO_ROOT/install.sh" "$tmp/install.sh"
+sed -i '/^CPUQuota=/d' "$tmp/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+neg_rc=0
+neg_out="$(REPO_ROOT="$tmp" bash "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || neg_rc=$?
+[ "$neg_rc" -ne 0 ] || { echo "FAIL: missing tracked CPUQuota was accepted" >&2; exit 1; }
+echo "$neg_out" | grep -q 'CPUQuota=1600%' \
+  || { echo "FAIL: missing CPUQuota diagnostic was not precise: $neg_out" >&2; exit 1; }
+
+# The runtime writer delegation is also static policy, not an optional live
+# QEMU check; an inactive VM must not hide missing --apply wiring.
+cp "$REPO_ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  "$tmp/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+sed -i '/ExecStart=.*qemu-ceiling-guard.sh --apply/d' "$tmp/systemd/lima-vm-cpu-ceiling.service"
+neg_rc=0
+neg_out="$(REPO_ROOT="$tmp" bash "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)" || neg_rc=$?
+[ "$neg_rc" -ne 0 ] || { echo "FAIL: missing QEMU runtime-writer delegation was accepted" >&2; exit 1; }
+echo "$neg_out" | grep -q 'lima-vm-cpu-ceiling.service missing exact line' \
+  || { echo "FAIL: missing runtime-writer diagnostic was not precise: $neg_out" >&2; exit 1; }
+
 # Fully injected cgroup-v2 fixture.  The assertion must follow the exact
 # cgroup path reported by /proc/<pid>/cgroup rather than selecting a bounded
 # sibling by name.

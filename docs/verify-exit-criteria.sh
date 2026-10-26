@@ -409,6 +409,12 @@ containment_in_vm() {
 }
 
 host_unit_value() { awk -F= -v key="$2" '$1 == key {print $2; exit}' "$1" 2>/dev/null; }
+qemu_vm_runtime_state() {
+    local repo_root="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+    local guard="${repo_root}/scripts/host/qemu-ceiling-guard.sh"
+    [ -x "$guard" ] || fail "QEMU runtime-state helper is unavailable: $guard"
+    "$guard" --runtime-state
+}
 # Integer-only size conversion for tracked systemd values (4608M, 5G, 0).
 host_to_bytes() {
     case "$1" in
@@ -420,23 +426,36 @@ host_to_bytes() {
 }
 
 # Gate 8 host-docker envelope (bead ez-gh-actions-154k). On a host-docker
-# Linux host the four finite budgets are actions.slice (runners), agents.slice,
-# automation.slice and lima-vm@colima.service (the qdrant-only Colima VM). Their
-# LIVE memory.high/memory.max must equal the tracked host-docker policy and be
-# finite, and the sum of the live memory.max values plus the reserve
-# (max(MemTotal/10, 2048 MB)) must fit MemTotal. Hard maxima are summed once;
-# no memory.high x2 overflow model and no separate app-lima-vm.slice term.
+# Linux host the always-live finite budgets are actions.slice (runners),
+# agents.slice, and automation.slice. The optional lima-vm@colima.service
+# (qdrant-only Colima VM) is added only when its service is active and its
+# cgroup is present. Tracked future VM limits remain mandatory and finite.
+# Every live memory.high/memory.max must equal policy, and the sum of live
+# memory.max values plus reserve (max(MemTotal/10, 2048 MB)) must fit MemTotal.
+# Hard maxima are summed once; no memory.high x2 overflow model and no separate
+# app-lima-vm.slice term.
 verify_host_docker_envelope() {
     local policy_root="${VERIFY_EXIT_CRITERIA_POLICY_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
     local cg_root="${VERIFY_EXIT_CRITERIA_CGROUP_ROOT:-/sys/fs/cgroup}"
     local meminfo="${VERIFY_EXIT_CRITERIA_MEMINFO:-/proc/meminfo}"
-    local entry unit policy cg want_high want_max live_high live_max
+    local entry unit policy cg want_high want_max live_high live_max qemu_state
     local total_mb=0 host_mb reserve_mb terms=""
-    for entry in \
+    local -a entries=(
         "actions.slice|systemd/host/actions.slice" \
         "agents.slice|systemd/agents.slice" \
-        "automation.slice|systemd/automation.slice" \
-        "lima-vm@colima.service|systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"; do
+        "automation.slice|systemd/automation.slice"
+    )
+    # The configured QEMU drop-in remains mandatory even when the optional VM
+    # is unused; only its live cgroup is conditional on an active VM.
+    policy="${policy_root}/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+    want_high=$(host_to_bytes "$(host_unit_value "$policy" MemoryHigh)")
+    want_max=$(host_to_bytes "$(host_unit_value "$policy" MemoryMax)")
+    case "${want_high}:${want_max}" in
+        :*|*:|*[!0-9:]*) fail "Gate 8 host-docker envelope: tracked ${policy} must set finite integer MemoryHigh/MemoryMax (got high=${want_high:-?} max=${want_max:-?})" ;;
+    esac
+    qemu_state=$(qemu_vm_runtime_state) || fail "Gate 8 host-docker envelope: could not establish QEMU service state"
+    [ "$qemu_state" = inactive ] || entries+=("lima-vm@colima.service|systemd/lima-vm@colima.service.d/99-memory-ceiling.conf")
+    for entry in "${entries[@]}"; do
         unit="${entry%%|*}"
         policy="${policy_root}/${entry#*|}"
         want_high=$(host_to_bytes "$(host_unit_value "$policy" MemoryHigh)")
@@ -1602,11 +1621,23 @@ echo "    [REMEDIATION] Have the deploy owner reconcile approved finite live lim
 # Skip when daemon-in-VM AND on macOS — the Lima VM cgroup tree is not
 # reachable from a macOS shell. On Linux + daemon-in-VM (typical
 # jeff-ubuntu), QEMU runs at host scope and IS reachable via
-# /proc/<qemu>/cgroup, so we still probe. On every other combo, we probe.
+# /proc/<qemu>/cgroup, so we still probe. Native Docker skips only when the
+# optional VM is explicitly inactive/not-found/dead with no stray QEMU.
+if ! QEMU_STATIC_ASSERTION="$(ASSERT_LIVE_QEMU=0 \
+    "${REPO_ROOT}/scripts/host/assert-qemu-cpu-ceiling.sh" 2>&1)"; then
+    fail "Gate 8 (1) tracked QEMU policy assertion failed: ${QEMU_STATIC_ASSERTION}"
+fi
 PROBE_QEMU_SLICE=1
 if [ "$(uname -s)" = "Darwin" ] && containment_in_vm; then
     PROBE_QEMU_SLICE=0
     echo "    [SKIP] Gate 8 (1) QEMU slice probe: daemon-in-VM on macOS (Lima VM cgroup not reachable from macOS shell)"
+else
+    QEMU_VM_RUNTIME_STATE="$(qemu_vm_runtime_state)" \
+        || fail "Gate 8 (1) QEMU service state could not be established"
+    if [ "$QEMU_VM_RUNTIME_STATE" = inactive ]; then
+        PROBE_QEMU_SLICE=0
+        echo "    [SKIP] Gate 8 (1) QEMU slice probe: native Docker host has no active Colima VM"
+    fi
 fi
 QEMU_PID=""
 QEMU_CG=""

@@ -326,6 +326,91 @@ grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
 grep -Fq 'assert-qemu-cpu-ceiling.sh' "$VERIFY" \
   || fail "Gate 8 does not reuse the service-bound QEMU assertion"
 
+# The inactive native-VM path may skip only live cgroup inspection.  The
+# tracked future policy assertion must still execute first, or an invalid
+# CPUQuota/runtime-writer policy would pass solely because the optional VM is
+# currently unused.  Exercise the real Gate-8 QEMU section against a small,
+# hermetic fixture rather than checking for source text that could be placed
+# after the branch.
+make_qemu_gate8_fixture() {
+  local fixture="$1"
+  mkdir -p "$fixture/bin" "$fixture/scripts/host" \
+    "$fixture/systemd/lima-vm@colima.service.d"
+  cp "$ROOT/install.sh" "$fixture/install.sh"
+  cp "$ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" "$fixture/scripts/host/"
+  cp "$ROOT/scripts/host/qemu-ceiling-guard.sh" "$fixture/scripts/host/"
+  cp "$ROOT/systemd/app-lima-vm.slice" "$fixture/systemd/app-lima-vm.slice"
+  cp "$ROOT/systemd/lima-vm-cpu-ceiling.service" "$fixture/systemd/lima-vm-cpu-ceiling.service"
+  cp "$ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+    "$fixture/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+  chmod +x "$fixture/scripts/host/"*.sh
+  cat > "$fixture/bin/systemctl" <<'EOF_QEMU_SYSTEMCTL'
+#!/usr/bin/env bash
+case "$*" in
+  *'-p ActiveState'*) printf 'inactive\n' ;;
+  *'-p LoadState'*) printf 'not-found\n' ;;
+  *'-p ControlGroup'*) printf '\n' ;;
+  *) exit 1 ;;
+esac
+EOF_QEMU_SYSTEMCTL
+  cat > "$fixture/bin/ps" <<'EOF_QEMU_PS'
+#!/usr/bin/env bash
+[ "$*" = '-eo comm=' ] || exit 2
+printf 'bash\n'
+EOF_QEMU_PS
+  chmod +x "$fixture/bin/systemctl" "$fixture/bin/ps"
+}
+
+run_qemu_gate8_section() {
+  local verify_file="$1" fixture="$2" output rc=0 qemu_section
+  output=$(
+    {
+      set -euo pipefail
+      export REPO_ROOT="$fixture"
+      export PATH="$fixture/bin:$PATH"
+      export CONTAINMENT_LIVE_SYSTEMD=1 QEMU_RUNTIME_STATE=inactive
+      fail() { echo "FAIL: $*" >&2; exit 1; }
+      uname() { echo Linux; }
+      containment_in_vm() { return 1; }
+      eval "$(sed -n '/^qemu_vm_runtime_state() {/,/^}/p' "$verify_file")"
+      qemu_section="$(sed -n '/^# (1) QEMU cgroup probe/,/^# (2) AO\/MCP slice probe/{/^# (2) AO\/MCP slice probe/d;p;}' "$verify_file")"
+      eval "$qemu_section"
+    } 2>&1
+  ) || rc=$?
+  printf '%s\n' "$output"
+  return "$rc"
+}
+
+QEMU_SECTION_DIR="$TMP/qemu-inactive-section"
+make_qemu_gate8_fixture "$QEMU_SECTION_DIR"
+qemu_out=$(run_qemu_gate8_section "$VERIFY" "$QEMU_SECTION_DIR") \
+  || fail "valid inactive native-VM Gate-8 QEMU section should pass: $qemu_out"
+grep -Fq 'native Docker host has no active Colima VM' <<<"$qemu_out" \
+  || fail "inactive QEMU fixture did not take the explicit skip path: $qemu_out"
+
+# Removing the future CPU policy must fail even though the live VM probe is
+# skipped.  This catches the prior implementation, which entered the inactive
+# branch before invoking assert-qemu-cpu-ceiling.sh.
+sed -i '/^CPUQuota=1600%$/d' \
+  "$QEMU_SECTION_DIR/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+if qemu_out=$(run_qemu_gate8_section "$VERIFY" "$QEMU_SECTION_DIR"); then
+  fail "inactive QEMU fixture accepted a missing tracked CPUQuota: $qemu_out"
+fi
+grep -Fq 'tracked QEMU policy assertion failed' <<<"$qemu_out" \
+  || fail "missing CPUQuota failure did not come from the static Gate-8 assertion: $qemu_out"
+
+# Restore the policy and remove the shared runtime writer delegation.  This
+# must fail for the same reason, proving future enforcement remains required.
+cp "$ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  "$QEMU_SECTION_DIR/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+sed -i '/^ExecStart=@SCRIPTS_DIR@\/qemu-ceiling-guard.sh --apply$/d' \
+  "$QEMU_SECTION_DIR/systemd/lima-vm-cpu-ceiling.service"
+if qemu_out=$(run_qemu_gate8_section "$VERIFY" "$QEMU_SECTION_DIR"); then
+  fail "inactive QEMU fixture accepted a missing runtime writer: $qemu_out"
+fi
+grep -Fq 'tracked QEMU policy assertion failed' <<<"$qemu_out" \
+  || fail "missing runtime writer failure did not come from the static Gate-8 assertion: $qemu_out"
+
 # Host-docker envelope (bead ez-gh-actions-154k): live memory.max of
 # actions/agents/automation/lima-vm@colima.service must equal the tracked
 # host-docker policy, be finite, and with the 10% reserve fit MemTotal.
@@ -338,7 +423,18 @@ cat > "$ENV_DIR/bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 # `systemctl --user show -p ControlGroup --value -- <unit>` -> /user/<unit>
 for unit in "$@"; do :; done
-printf '/user/%s\n' "$unit"
+if [ "${QEMU_QUERY_FAIL:-0}" = 1 ]; then exit 1; fi
+case "$*" in
+  *'-p LoadState'*) printf '%s\n' "${QEMU_LOAD_STATE:-loaded}" ;;
+  *'-p ActiveState'*) printf '%s\n' "${QEMU_ACTIVE_STATE:-active}" ;;
+  *'-p ControlGroup'*)
+    case "$unit" in
+      lima-vm@colima.service) printf '%s\n' "${QEMU_CONTROL_GROUP-/user/$unit}" ;;
+      *) printf '/user/%s\n' "$unit" ;;
+    esac
+    ;;
+  *) printf '/user/%s\n' "$unit" ;;
+esac
 EOF
 chmod +x "$ENV_DIR/bin/systemctl"
 set_live() { # unit-dir high max
@@ -367,6 +463,44 @@ run_envelope() { # policy-root
 set_live_policy $((10 * G)) $((11776 * 1048576)) $((4608 * 1048576)) $((5 * G))
 env_out=$(run_envelope "$ROOT") || fail "host-docker 28+11776M+5+10 envelope should pass: $env_out"
 grep -Fq '55808MB' <<<"$env_out" || fail "envelope did not sum live maxima to 55808MB: $env_out"
+
+# Native Docker with an explicitly inactive/not-found VM omits only the live
+# QEMU cgroup; the tracked QEMU policy remains required and the three active
+# host caps plus reserve still fit.
+env_out=$(QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= run_envelope "$ROOT") \
+  || fail "inactive native VM should pass without a live QEMU cgroup: $env_out"
+grep -Fq '45568MB' <<<"$env_out" || fail "inactive native envelope did not sum 28G+11776M+5G: $env_out"
+
+# An active VM without a live cgroup remains a hard failure.
+rm -rf "$ENV_DIR/cg/user/lima-vm@colima.service"
+if env_out=$(run_envelope "$ROOT"); then
+  fail "active VM without a live cgroup should fail: $env_out"
+fi
+grep -Eq 'lima-vm@colima.service (has no live cgroup|live memory.high=unreadable)' <<<"$env_out" \
+  || fail "active missing-cgroup failure lacked a precise diagnostic: $env_out"
+mkdir -p "$ENV_DIR/cg/user/lima-vm@colima.service"
+set_live user/lima-vm@colima.service $((9 * G)) $((10 * G))
+
+if env_out=$(QEMU_QUERY_FAIL=1 run_envelope "$ROOT"); then
+  fail "QEMU service query failure should fail closed: $env_out"
+fi
+grep -Fq 'could not establish QEMU service state' <<<"$env_out" \
+  || fail "QEMU query failure lacked a precise diagnostic: $env_out"
+
+cat > "$ENV_DIR/bin/ps" <<'EOF_PS'
+#!/usr/bin/env bash
+case "$*" in
+  *'comm='*) printf 'bash\nqemu-system-aarc\n'; exit 0 ;;
+  *) exit 2 ;;
+esac
+EOF_PS
+chmod +x "$ENV_DIR/bin/ps"
+if env_out=$(QEMU_LOAD_STATE=not-found QEMU_ACTIVE_STATE=inactive QEMU_CONTROL_GROUP= run_envelope "$ROOT"); then
+  fail "stray QEMU process should fail closed with inactive VM service: $env_out"
+fi
+grep -Fq 'stray QEMU process' <<<"$env_out" \
+  || fail "stray QEMU failure lacked a precise diagnostic: $env_out"
+rm -f "$ENV_DIR/bin/pgrep"
 
 # (b) an unbounded live maximum is rejected, never summed as zero.
 printf 'max\n' > "$ENV_DIR/cg/user/agents.slice/memory.max"
@@ -750,6 +884,11 @@ if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTION
   fail "production unit parser must reject unreadable agents unit"
 fi
 mv "$TMP/agents.good" "$MODERN/agents.slice"
+mv "$MODERN/lima-vm@colima.service.d/99-memory-ceiling.conf" "$TMP/qemu.good"
+if env "${policy_env[@]}" TIMER_MODE=disabled VERIFY_EXIT_CRITERIA_NATIVE_ACTIONS=0 VERIFY_EXIT_CRITERIA_RUNNER_COUNT=14 VERIFY_EXIT_CRITERIA_HOST_MB=65000 bash "$VERIFY" >"$TMP/parser-missing-qemu.log" 2>&1; then
+  fail "production unit parser must reject missing future QEMU cap policy"
+fi
+mv "$TMP/qemu.good" "$MODERN/lima-vm@colima.service.d/99-memory-ceiling.conf"
 
 DROPINS="$TMP/dropins"
 mkdir -p "$DROPINS/ao-daemon.service.d" "$DROPINS/ai.dark-factory.daemon.service.d"
@@ -797,12 +936,22 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+case "$prop" in
+  LoadState) echo loaded; exit 0 ;;
+  ActiveState) echo active; exit 0 ;;
+  ControlGroup) echo /lima-vm@colima.service; exit 0 ;;
+esac
 case "$unit:$scope" in
   app.slice:system|session.slice:system|actions.slice:user|user.slice:user|-.slice:user) exit 1 ;;
 esac
 awk -v u="$unit" -v p="$prop" '$1==u && $2==p {print $3; found=1} END {exit !found}' "$SYSTEMD_PROPS"
 SHIM
 chmod +x "$TMP/policy-bin/systemctl"
+cat > "$FIXTURE/bin/systemctl" <<EOF_FIXTURE_SYSTEMCTL
+#!/usr/bin/env bash
+exec "$TMP/policy-bin/systemctl" "\$@"
+EOF_FIXTURE_SYSTEMCTL
+chmod +x "$FIXTURE/bin/systemctl"
 # Source only the production predicate; pass the canonical assertion's --root.
 eval "$(sed -n '/^verify_retired_timer() {/,/^verify_automation_dropins() {/p' "$VERIFY" | sed '$d')"
 MODERN_UNIT_DIR="$MODERN"
@@ -814,6 +963,7 @@ if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/absent.log" 2>&1; then
 fi
 mkdir -p "$REPO_ROOT/scripts/host"
 cp "$ROOT/scripts/host/assert-host-containment-release1.sh" "$REPO_ROOT/scripts/host/"
+cp "$ROOT/scripts/host/qemu-ceiling-guard.sh" "$REPO_ROOT/scripts/host/"
 chmod 000 "$REPO_ROOT/scripts/host/assert-host-containment-release1.sh"
 if (verify_modern_psi_policy --root "$FIXTURE") >"$TMP/unreadable.log" 2>&1; then
   fail "unreadable mandatory assertion must fail closed"
