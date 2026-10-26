@@ -3,7 +3,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
-mkdir -p "$WORK/bin" "$WORK/sys/fs/cgroup/lima-vm@colima.service"
+mkdir -p "$WORK/bin" "$WORK/sys/fs/cgroup/lima-vm@colima.service" "$WORK/sys/fs/cgroup/agents.slice"
 export LOG="$WORK/events"
 cat > "$WORK/bin/systemctl" <<'SHIM'
 #!/usr/bin/env bash
@@ -21,7 +21,17 @@ esac
 SHIM
 chmod +x "$WORK/bin/systemctl"
 printf '1073741824\n' > "$WORK/sys/fs/cgroup/lima-vm@colima.service/memory.current"
+printf '1073741824\n' > "$WORK/sys/fs/cgroup/agents.slice/memory.current"
 run() { CONTAINMENT_LIVE_SYSTEMD=1 "$REPO/scripts/host/qemu-ceiling-guard.sh" --root "$WORK" --apply; }
+run_agents() { CONTAINMENT_LIVE_SYSTEMD=1 "$REPO/scripts/host/qemu-ceiling-guard.sh" --root "$WORK" --unit agents.slice --threshold 12348030976; }
+run_agents || fail 'safe agents.slice guard failed'
+printf '12348030976\n' > "$WORK/sys/fs/cgroup/agents.slice/memory.current"
+if run_agents; then fail 'high agents.slice current accepted'; fi
+rm "$WORK/sys/fs/cgroup/agents.slice/memory.current"
+if run_agents; then fail 'missing agents.slice current accepted'; fi
+printf 'invalid\n' > "$WORK/sys/fs/cgroup/agents.slice/memory.current"
+if run_agents; then fail 'invalid agents.slice current accepted'; fi
+printf '1073741824\n' > "$WORK/sys/fs/cgroup/agents.slice/memory.current"
 run || fail 'safe apply failed'
 grep -q set-property "$LOG" || fail 'safe apply did not write'
 : > "$LOG"

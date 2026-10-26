@@ -35,6 +35,7 @@ case "$RUNNER_COUNT" in
   *) fail "runner count must be 10, 14, or 20 (got $RUNNER_COUNT)" ;;
 esac
 ACTIONS_MEMORY_HIGH_BYTES=27917287424
+AGENTS_MEMORY_MAX_BYTES=12348030976 # 11776M
 
 if [ -d "${SCRIPT_DIR}/../../systemd/host" ]; then
   POLICY_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -177,8 +178,12 @@ guard_unit_memory automation.slice 4831838208 "automation.slice memory.current"
 guard_unit_memory app-lima-vm.slice 9663676416 "app-lima-vm.slice memory.current"
 guard_unit_memory lima-vm@colima.service 9663676416 "lima-vm@colima.service memory.current"
 if [ "$ROOT" = / ] && [ "$SYSTEM_PHASE" -eq 1 ]; then
-  runuser -u "$(id -nu "$DEPLOY_UID")" -- env XDG_RUNTIME_DIR="/run/user/${DEPLOY_UID}" "${SCRIPT_DIR}/qemu-ceiling-guard.sh"
+  runuser -u "$(id -nu "$DEPLOY_UID")" -- env XDG_RUNTIME_DIR="/run/user/${DEPLOY_UID}" \
+    "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --unit agents.slice --threshold "$AGENTS_MEMORY_MAX_BYTES"
+  runuser -u "$(id -nu "$DEPLOY_UID")" -- env XDG_RUNTIME_DIR="/run/user/${DEPLOY_UID}" \
+    "${SCRIPT_DIR}/qemu-ceiling-guard.sh"
 else
+  "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT" --unit agents.slice --threshold "$AGENTS_MEMORY_MAX_BYTES"
   "${SCRIPT_DIR}/qemu-ceiling-guard.sh" --root "$ROOT"
 fi
 agents_dir="$(user_cgroup_dir agents.slice || true)"

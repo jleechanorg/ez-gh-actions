@@ -45,6 +45,11 @@ for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuo
   grep -Fq "$setting" "$REPO_ROOT/scripts/host/qemu-ceiling-guard.sh" \
     || fail "shared QEMU guard missing $setting"
 done
+grep -Fq 'qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976' "$REPO_ROOT/install.sh" \
+  || fail "install.sh does not guard agents.slice before lowering MemoryMax"
+grep -Fq 'qemu-ceiling-guard.sh" --root "$ROOT" --unit agents.slice --threshold "$AGENTS_MEMORY_MAX_BYTES"' \
+  "$REPO_ROOT/scripts/host/apply-host-containment-release1.sh" \
+  || fail "apply-host-containment-release1.sh does not guard agents.slice before lowering MemoryMax"
 assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 grep -q 'QEMU_PROC_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
