@@ -883,6 +883,10 @@ FSTRIM_EOF
       bad "refusing to install QEMU ceiling: live usage exceeds threshold or cgroup is unreadable"
       exit 1
     }
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976 || {
+      bad "refusing to lower agents.slice MemoryMax: live usage exceeds 11776M or cgroup is unreadable"
+      exit 1
+    }
     for unit in app-lima-vm.slice agents.slice automation.slice; do
       install -m 0644 "${UNIT_DIR}/${unit}" "${USER_UNIT_DIR}/${unit}"
     done
@@ -995,10 +999,6 @@ EOF
     # unit replacement, so the tracked values must win during every install.
     AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192)
     AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
-    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976 || {
-      bad "refusing to lower agents.slice MemoryMax: live usage exceeds 11776M or cgroup is unreadable"
-      exit 1
-    }
     if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
       bad "could not apply selected agents.slice budget"
       exit 1

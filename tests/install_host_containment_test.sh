@@ -312,6 +312,67 @@ final_agents_line="$(grep -n '^systemctl-set-property:set-property agents.slice 
 [ -n "$final_reload_line" ] && [ -n "$final_agents_line" ] && [ "$final_reload_line" -lt "$final_agents_line" ] \
   || fail "host-docker slice budgets were applied before the final user-unit reload"
 
+# The agents cap preflight must run before candidate user units are copied or
+# the final daemon reload. Exercise the VM-backed Linux path so no earlier
+# host-containment phase can mask the ordering proof.
+QEMU_GUARD_REAL="$WORK/qemu-ceiling-guard.real"
+cp "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh" "$QEMU_GUARD_REAL"
+cat > "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *" --unit agents.slice "* ]]; then
+  echo "agents-guard:${AGENTS_GUARD_MODE:-safe}" >> "${EVENT_LOG:?}"
+  case "${AGENTS_GUARD_MODE:-safe}" in
+    unsafe|unreadable) exit 1 ;;
+  esac
+fi
+exec "${QEMU_GUARD_REAL:?}" "$@"
+EOF
+chmod +x "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh"
+
+run_agent_guard_fixture() {
+  local name="$1" mode="$2" home="$WORK/agent_guard_${1}_home" events="$WORK/agent_guard_${1}_events"
+  mkdir -p "$home/.config/ezgha" "$home/.config/systemd/user" "$home/.lima/colima"
+  printf '[runner]\ncount = 14\n' > "$home/.config/ezgha/config.toml"
+  printf 'memory: "8GiB"\n' > "$home/.lima/colima/lima.yaml"
+  printf '[Unit]\nDescription=pre-existing agents slice\n\n[Slice]\nMemoryHigh=10G\nMemoryMax=12G\n' \
+    > "$home/.config/systemd/user/agents.slice"
+  cp "$home/.config/systemd/user/agents.slice" "$WORK/agent_guard_${name}_before"
+  if env EVENT_LOG="$events" QEMU_GUARD_REAL="$QEMU_GUARD_REAL" AGENTS_GUARD_MODE="$mode" \
+      PATH="$STUB_BIN:$PATH" HOME="$home" CARGO_HOME="$home/.cargo" XDG_CONFIG_HOME="$home/.config" \
+      DOCKER_HOST="unix://$home/.colima/default/docker.sock" \
+      bash "$TEMP_REPO/install.sh" --dev > "$WORK/agent_guard_${name}.log" 2>&1; then
+    [ "$mode" = safe ] || fail "unsafe agents guard $name allowed installation"
+  elif [ "$mode" = safe ]; then
+    fail "safe agents guard fixture failed: $(tail -5 "$WORK/agent_guard_${name}.log")"
+  fi
+  grep -Fqx "agents-guard:$mode" "$events" || fail "agents guard did not run in $mode fixture"
+  local guard_line post_guard_events
+  guard_line="$(grep -n -m1 "^agents-guard:$mode$" "$events" | cut -d: -f1)"
+  post_guard_events="$(tail -n +"$guard_line" "$events")"
+  if [ "$mode" = safe ]; then
+    grep -qx 'MemoryMax=11776M' "$home/.config/systemd/user/agents.slice" \
+      || fail "safe agents guard did not install the candidate agents.slice"
+    grep -q '^systemctl-daemon-reload:' <<<"$post_guard_events" || fail "safe agents guard skipped final daemon reload"
+    grep -q '^systemctl-set-property:set-property agents.slice ' <<<"$post_guard_events" \
+      || fail "safe agents guard skipped agents.slice cap application"
+  else
+    cmp "$WORK/agent_guard_${name}_before" "$home/.config/systemd/user/agents.slice" \
+      || fail "unsafe agents guard $name replaced the existing agents.slice"
+    if grep -Eq '^systemctl-daemon-reload:|^systemctl-set-property:' <<<"$post_guard_events"; then
+      fail "unsafe agents guard $name reached daemon reload or cap-setting after preflight: $post_guard_events"
+    fi
+    if grep -q '^cargo-install$' <<<"$post_guard_events"; then
+      fail "unsafe agents guard $name installed the binary after preflight"
+    fi
+  fi
+}
+run_agent_guard_fixture safe safe
+run_agent_guard_fixture unsafe unsafe
+run_agent_guard_fixture unreadable unreadable
+cp "$QEMU_GUARD_REAL" "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh"
+chmod +x "$TEMP_REPO/scripts/host/qemu-ceiling-guard.sh"
+echo "OK: installer agents.slice preflight runs before candidate unit copy and final cap writes"
+
 # Host-docker mode (bead ez-gh-actions-154k): the colima guest (qdrant only)
 # is resized to 8GiB in the lima.yaml lima-vm@colima starts from, and the
 # QEMU ceiling surfaces preserve the deployed 9G/10G policy.

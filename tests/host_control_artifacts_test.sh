@@ -47,6 +47,10 @@ for setting in MemoryHigh=9G MemoryMax=10G MemorySwapMax=2G TasksMax=4096 CPUQuo
 done
 grep -Fq 'qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976' "$REPO_ROOT/install.sh" \
   || fail "install.sh does not guard agents.slice before lowering MemoryMax"
+agents_guard_line="$(grep -n -m1 'qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976' "$REPO_ROOT/install.sh" | cut -d: -f1)"
+agents_copy_line="$(grep -n -m1 'install -m 0644.*\${UNIT_DIR}/\${unit}.*\${USER_UNIT_DIR}/\${unit}' "$REPO_ROOT/install.sh" | cut -d: -f1)"
+[ -n "$agents_guard_line" ] && [ -n "$agents_copy_line" ] && [ "$agents_guard_line" -lt "$agents_copy_line" ] \
+  || fail "install.sh agents.slice preflight occurs after candidate unit copy"
 grep -Fq 'qemu-ceiling-guard.sh" --root "$ROOT" --unit agents.slice --threshold "$AGENTS_MEMORY_MAX_BYTES"' \
   "$REPO_ROOT/scripts/host/apply-host-containment-release1.sh" \
   || fail "apply-host-containment-release1.sh does not guard agents.slice before lowering MemoryMax"
