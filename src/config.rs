@@ -83,6 +83,12 @@ pub struct AlertConfig {
     pub alert_cooldown_secs: u64,
     /// Optional Slack Incoming Webhook URL.
     pub slack_webhook_url: Option<String>,
+    /// Optional Slack Bot User OAuth Token (xoxb-...).
+    #[serde(default)]
+    pub slack_bot_token: Option<String>,
+    /// Optional Slack Channel ID or Name (e.g. C0AJ3SD5C79 or #channel).
+    #[serde(default)]
+    pub slack_channel: Option<String>,
     /// Optional email destination; requires `sendmail` in PATH.
     pub email_to: Option<String>,
     /// Optional sender address for `sendmail`.
@@ -108,6 +114,8 @@ impl Default for AlertConfig {
             failure_alert_threshold: default_failure_alert_threshold(),
             alert_cooldown_secs: default_alert_cooldown_seconds(),
             slack_webhook_url: None,
+            slack_bot_token: None,
+            slack_channel: None,
             email_to: None,
             email_from: None,
             log_path: None,
@@ -665,6 +673,8 @@ impl Config {
                 failure_alert_threshold: default_failure_alert_threshold(),
                 alert_cooldown_secs: default_alert_cooldown_seconds(),
                 slack_webhook_url: None,
+                slack_bot_token: None,
+                slack_channel: None,
                 email_to: None,
                 email_from: None,
                 log_path: None,
@@ -1016,6 +1026,9 @@ minimum_isolation = "container"
         assert_eq!(tiny.limits.cpus, 1.0);
         assert_eq!(tiny.alert.failure_alert_threshold, 3);
         assert_eq!(tiny.alert.alert_cooldown_secs, 900);
+        assert_eq!(tiny.alert.slack_webhook_url, None);
+        assert_eq!(tiny.alert.slack_bot_token, None);
+        assert_eq!(tiny.alert.slack_channel, None);
         assert!(tiny.queue_monitor.enabled);
         assert_eq!(tiny.queue_monitor.tail_warn_minutes, 20);
         assert_eq!(tiny.queue_monitor.check_interval_seconds, 300);
@@ -1492,5 +1505,32 @@ pids = 512
 minimum_isolation = "container"
 "#;
         assert!(load_from_str(raw, "ver").is_err());
+    }
+
+    #[test]
+    fn alert_config_deserializes_slack_bot_token_and_channel() {
+        let raw = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "img:latest"
+[limits]
+memory_mb = 2048
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+[alert]
+slack_bot_token = "xoxb-test-token"
+slack_channel = "C0AJ3SD5C79"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.alert.slack_bot_token.as_deref(), Some("xoxb-test-token"));
+        assert_eq!(cfg.alert.slack_channel.as_deref(), Some("C0AJ3SD5C79"));
+        assert_eq!(cfg.alert.slack_webhook_url, None);
     }
 }

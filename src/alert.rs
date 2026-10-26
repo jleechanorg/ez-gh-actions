@@ -77,10 +77,19 @@ fn slack_payload(subject: &str, body: &str, severity: Severity) -> String {
     )
 }
 
+fn slack_bot_payload(channel: &str, subject: &str, body: &str, severity: Severity) -> String {
+    let text = format!("[ez-gh-actions:{}] {}\n{}", severity, subject, body);
+    serde_json::json!({
+        "channel": channel,
+        "text": text,
+    })
+    .to_string()
+}
+
 fn slack_curl_args(url: &str, payload: &str) -> Vec<String> {
     [
         "-sS",
-        "--fail",
+        "--fail-with-body",
         "--connect-timeout",
         ALERT_CONNECT_TIMEOUT_SECS,
         "--max-time",
@@ -88,7 +97,7 @@ fn slack_curl_args(url: &str, payload: &str) -> Vec<String> {
         "-X",
         "POST",
         "-H",
-        "Content-Type: application/json",
+        "Content-Type: application/json; charset=utf-8",
         "--data",
         payload,
         url,
@@ -96,6 +105,90 @@ fn slack_curl_args(url: &str, payload: &str) -> Vec<String> {
     .into_iter()
     .map(str::to_string)
     .collect()
+}
+
+fn slack_bot_curl_args(token: &str, payload: &str) -> Vec<String> {
+    [
+        "-sS",
+        "--fail-with-body",
+        "--connect-timeout",
+        ALERT_CONNECT_TIMEOUT_SECS,
+        "--max-time",
+        ALERT_MAX_TIME_SECS,
+        "-X",
+        "POST",
+        "-H",
+        &format!("Authorization: Bearer {token}"),
+        "-H",
+        "Content-Type: application/json; charset=utf-8",
+        "--data",
+        payload,
+        "https://slack.com/api/chat.postMessage",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlackTarget {
+    Webhook(String),
+    BotToken { token: String, channel: String },
+}
+
+#[derive(serde::Deserialize)]
+struct SlackApiResponse {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+pub fn resolve_slack_target(cfg: &AlertConfig) -> Option<SlackTarget> {
+    // 1. Explicit bot token in config
+    if let Some(token) = cfg.slack_bot_token.as_ref().filter(|s| !s.trim().is_empty()) {
+        let channel = cfg
+            .slack_channel
+            .clone()
+            .or_else(|| std::env::var("HERMES_MONITOR_SLACK_TARGET").ok())
+            .or_else(|| std::env::var("SLACK_CHANNEL").ok());
+        if let Some(ch) = channel.filter(|s| !s.trim().is_empty()) {
+            return Some(SlackTarget::BotToken {
+                token: token.clone(),
+                channel: ch,
+            });
+        }
+    }
+
+    // 2. Explicit webhook url in config (backwards compatibility)
+    if let Some(url) = cfg.slack_webhook_url.as_ref().filter(|s| !s.trim().is_empty()) {
+        return Some(SlackTarget::Webhook(url.clone()));
+    }
+
+    // 3. Fallback to environment variables if neither is explicitly in config
+    let env_token = std::env::var("SLACK_BOT_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("HERMES_SLACK_BOT_TOKEN").ok());
+    if let Some(token) = env_token.filter(|s| !s.trim().is_empty()) {
+        let channel = cfg
+            .slack_channel
+            .clone()
+            .or_else(|| std::env::var("HERMES_MONITOR_SLACK_TARGET").ok())
+            .or_else(|| std::env::var("SLACK_CHANNEL").ok());
+        if let Some(ch) = channel.filter(|s| !s.trim().is_empty()) {
+            return Some(SlackTarget::BotToken {
+                token,
+                channel: ch,
+            });
+        }
+    }
+
+    None
+}
+
+pub fn has_slack_configured(cfg: &AlertConfig) -> bool {
+    cfg.slack_webhook_url.is_some()
+        || cfg.slack_bot_token.is_some()
+        || resolve_slack_target(cfg).is_some()
 }
 
 fn wait_child_with_timeout(
@@ -145,26 +238,83 @@ fn run_command_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Outpu
     wait_child_with_timeout(child, timeout, "running alert command")
 }
 
-fn send_slack(url: &str, subject: &str, body: &str, severity: Severity) -> Result<()> {
-    let payload = slack_payload(subject, body, severity);
-
+fn send_slack_target(
+    target: &SlackTarget,
+    subject: &str,
+    body: &str,
+    severity: Severity,
+) -> Result<()> {
     if is_dry_run() {
-        eprintln!("{}", slack_dry_run_message(url, &payload));
+        match target {
+            SlackTarget::Webhook(url) => {
+                let payload = slack_payload(subject, body, severity);
+                eprintln!("{}", slack_dry_run_message(url, &payload));
+            }
+            SlackTarget::BotToken { channel, .. } => {
+                let payload = slack_bot_payload(channel, subject, body, severity);
+                eprintln!("[dry-run] would send slack alert to channel {channel}: {payload}");
+            }
+        }
         return Ok(());
     }
 
     let mut cmd = Command::new("curl");
-    cmd.args(slack_curl_args(url, &payload));
+    let is_webhook = match target {
+        SlackTarget::Webhook(url) => {
+            let payload = slack_payload(subject, body, severity);
+            cmd.args(slack_curl_args(url, &payload));
+            true
+        }
+        SlackTarget::BotToken { token, channel } => {
+            let payload = slack_bot_payload(channel, subject, body, severity);
+            cmd.args(slack_bot_curl_args(token, &payload));
+            false
+        }
+    };
+
     let out = run_command_with_timeout(cmd, ALERT_COMMAND_TIMEOUT)
         .context("failed to invoke curl for slack alert")?;
+
     if !out.status.success() {
-        anyhow::bail!(
-            "slack webhook call failed with status {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = match (stderr.trim(), stdout.trim()) {
+            (e, o) if !e.is_empty() && !o.is_empty() => format!("{e} (body: {o})"),
+            (e, _) if !e.is_empty() => e.to_string(),
+            (_, o) if !o.is_empty() => format!("body: {o}"),
+            _ => "unknown error".to_string(),
+        };
+        let label = if is_webhook {
+            "slack webhook call"
+        } else {
+            "slack bot call"
+        };
+        anyhow::bail!("{label} failed with status {}: {}", out.status, detail);
     }
+
+    // For Slack API (chat.postMessage), Slack returns HTTP 200 with {"ok":false,"error":"..."} on failure.
+    if !is_webhook {
+        if let Ok(resp) = serde_json::from_slice::<SlackApiResponse>(&out.stdout) {
+            if !resp.ok {
+                anyhow::bail!(
+                    "slack bot call failed: {}",
+                    resp.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
+    }
+
     Ok(())
+}
+
+#[allow(dead_code)]
+fn send_slack(url: &str, subject: &str, body: &str, severity: Severity) -> Result<()> {
+    send_slack_target(
+        &SlackTarget::Webhook(url.to_string()),
+        subject,
+        body,
+        severity,
+    )
 }
 
 fn slack_dry_run_message(_url: &str, payload: &str) -> String {
@@ -255,7 +405,7 @@ fn send_log(
 }
 
 pub fn configured_channels(cfg: &AlertConfig) -> bool {
-    cfg.slack_webhook_url.is_some() || cfg.email_to.is_some() || cfg.log_path.is_some()
+    has_slack_configured(cfg) || cfg.email_to.is_some() || cfg.log_path.is_some()
 }
 
 /// Send an alert and return whether any configured transport delivered it.
@@ -276,17 +426,26 @@ pub fn notify_delivery(
         return Ok(false);
     }
 
-    let mut delivered = false;
+    let mut external_configured = false;
+    let mut external_delivered = false;
+    let mut log_delivered = false;
 
-    if let Some(slack_url) = cfg.alert.slack_webhook_url.as_deref() {
-        match send_slack(slack_url, subject, body, severity) {
-            Ok(()) => delivered = true,
-            Err(err) => {
-                eprintln!("WARN: slack alert send failed: {err:#}");
+    if has_slack_configured(&cfg.alert) {
+        external_configured = true;
+        if let Some(target) = resolve_slack_target(&cfg.alert) {
+            match send_slack_target(&target, subject, body, severity) {
+                Ok(()) => external_delivered = true,
+                Err(err) => {
+                    eprintln!("WARN: slack alert send failed: {err:#}");
+                }
             }
+        } else {
+            eprintln!("WARN: slack alert configured but target could not be resolved (missing token or channel)");
         }
     }
+
     if let Some(email_to) = cfg.alert.email_to.as_deref() {
+        external_configured = true;
         match send_email(
             cfg.alert.email_from.as_deref(),
             email_to,
@@ -294,24 +453,33 @@ pub fn notify_delivery(
             body,
             severity,
         ) {
-            Ok(()) => delivered = true,
+            Ok(()) => external_delivered = true,
             Err(err) => {
                 eprintln!("WARN: email alert send failed: {err:#}");
             }
         }
     }
+
     if let Some(log_path) = cfg.alert.log_path.as_deref() {
         match send_log(log_path, event_key, subject, body, severity) {
-            Ok(()) => delivered = true,
+            Ok(()) => log_delivered = true,
             Err(err) => {
                 eprintln!("WARN: file alert send failed: {err:#}");
             }
         }
     }
+
+    let delivered = if external_configured {
+        external_delivered
+    } else {
+        log_delivered
+    };
+
     if delivered {
         record_sent(event_key);
         bump_deadman_clock(Instant::now());
     }
+
     Ok(delivered)
 }
 
@@ -444,6 +612,70 @@ pub fn notify(
 }
 
 #[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    saved: Vec<(String, Option<String>)>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn new(vars: &[&str]) -> Self {
+        let mut saved = Vec::new();
+        for &var in vars {
+            saved.push((var.to_string(), std::env::var(var).ok()));
+        }
+        Self { saved }
+    }
+
+    pub(crate) fn remove_all(&self) {
+        for (var, _) in &self.saved {
+            std::env::remove_var(var);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (var, val) in &self.saved {
+            match val {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestContext {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _env: EnvVarGuard,
+}
+
+#[cfg(test)]
+pub(crate) fn test_context() -> TestContext {
+    let lock = test_lock();
+    clear_alert_state();
+    clear_deadman_clock();
+    let env = EnvVarGuard::new(&[
+        "SLACK_BOT_TOKEN",
+        "HERMES_SLACK_BOT_TOKEN",
+        "SLACK_CHANNEL",
+        "HERMES_MONITOR_SLACK_TARGET",
+    ]);
+    env.remove_all();
+    TestContext {
+        _lock: lock,
+        _env: env,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, Scope};
@@ -451,13 +683,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     fn platform() -> Platform {
         Platform {
@@ -512,10 +738,10 @@ mod tests {
 
     #[test]
     fn alert_is_noop_without_channels() {
-        let _guard = test_lock();
-        clear_alert_state();
+        let _ctx = test_context();
         let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
         cfg.alert.slack_webhook_url = None;
+        cfg.alert.slack_bot_token = None;
         cfg.alert.email_to = None;
 
         assert!(notify(&cfg, "noop", Severity::Info, "x", "y").is_ok());
@@ -523,8 +749,7 @@ mod tests {
 
     #[test]
     fn cooldown_blocks_repeated_events() {
-        let _guard = test_lock();
-        clear_alert_state();
+        let _ctx = test_context();
         let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
         cfg.alert.alert_cooldown_secs = 1;
         cfg.alert.slack_webhook_url = Some("http://example.invalid/".into());
@@ -549,8 +774,7 @@ mod tests {
 
     #[test]
     fn failed_delivery_does_not_consume_cooldown() {
-        let _guard = test_lock();
-        clear_alert_state();
+        let _ctx = test_context();
         let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
         cfg.alert.alert_cooldown_secs = 60;
         cfg.alert.slack_webhook_url = Some("https://hooks.slack.test/T/fail".into());
@@ -593,8 +817,7 @@ mod tests {
 
     #[test]
     fn one_successful_transport_consumes_cooldown() {
-        let _guard = test_lock();
-        clear_alert_state();
+        let _ctx = test_context();
         let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
         cfg.alert.alert_cooldown_secs = 60;
         cfg.alert.slack_webhook_url = Some("https://hooks.slack.test/T/fail".into());
@@ -637,8 +860,7 @@ mod tests {
 
     #[test]
     fn file_log_channel_writes_jsonl_and_consumes_cooldown() {
-        let _guard = test_lock();
-        clear_alert_state();
+        let _ctx = test_context();
         let mut cfg = Config::defaults_for(&platform(), "jleechanorg".into(), Scope::Org);
         cfg.alert.alert_cooldown_secs = 60;
         let dir = unique_temp_dir("file-log");
@@ -698,7 +920,7 @@ mod tests {
     fn slack_curl_args_include_hard_timeouts() {
         let payload = slack_payload("pool low", "body", Severity::Warning);
         let args = slack_curl_args("https://hooks.slack.test/T/ABC", &payload);
-        assert!(args.iter().any(|arg| arg == "--fail"));
+        assert!(args.iter().any(|arg| arg == "--fail-with-body"));
         assert!(args.windows(2).any(|w| w == ["--connect-timeout", "5"]));
         assert!(args.windows(2).any(|w| w == ["--max-time", "15"]));
     }
@@ -719,12 +941,12 @@ mod tests {
 
     #[test]
     fn slack_http_error_status_is_delivery_failure() {
-        let _guard = test_lock();
+        let _ctx = test_context();
         let dir = unique_temp_dir("slack-http-error");
         fs::create_dir_all(&dir).unwrap();
         write_executable(
             &dir.join("curl"),
-            "#!/bin/sh\ncase \" $* \" in\n  *' --fail '*) exit 22 ;;\n  *) exit 0 ;;\nesac\n",
+            "#!/bin/sh\ncase \" $* \" in\n  *' --fail-with-body '*) exit 22 ;;\n  *) exit 0 ;;\nesac\n",
         );
 
         with_fake_path(&dir, || {
@@ -734,7 +956,7 @@ mod tests {
                 "body",
                 Severity::Warning,
             )
-            .expect_err("curl --fail HTTP errors should fail slack delivery");
+            .expect_err("curl --fail-with-body HTTP errors should fail slack delivery");
             assert!(err.to_string().contains("slack webhook call failed"));
         });
         let _ = fs::remove_dir_all(dir);
@@ -771,9 +993,7 @@ mod tests {
 
     #[test]
     fn deadman_disabled_when_threshold_is_zero() {
-        let _guard = test_lock();
-        clear_alert_state();
-        clear_deadman_clock();
+        let _ctx = test_context();
         let mut state = DeadManState::new(Instant::now());
         let cfg = deadman_test_config(0);
 
@@ -784,9 +1004,7 @@ mod tests {
 
     #[test]
     fn deadman_does_not_fire_when_recent_alert_was_delivered() {
-        let _guard = test_lock();
-        clear_alert_state();
-        clear_deadman_clock();
+        let _ctx = test_context();
         let start = Instant::now();
         let mut state = DeadManState::new(start);
         state.record_delivery(start);
@@ -799,9 +1017,7 @@ mod tests {
 
     #[test]
     fn deadman_fires_after_threshold_with_no_delivery() {
-        let _guard = test_lock();
-        clear_alert_state();
-        clear_deadman_clock();
+        let _ctx = test_context();
         let dir = unique_temp_dir("deadman-fire");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("alerts.jsonl");
@@ -834,9 +1050,7 @@ mod tests {
 
     #[test]
     fn deadman_successful_self_test_resets_pipeline_alive_timer() {
-        let _guard = test_lock();
-        clear_alert_state();
-        clear_deadman_clock();
+        let _ctx = test_context();
         let dir = unique_temp_dir("deadman-reset");
         fs::create_dir_all(&dir).unwrap();
         let log = dir.join("alerts.jsonl");
@@ -861,9 +1075,7 @@ mod tests {
 
     #[test]
     fn deadman_failed_self_test_keeps_pipeline_dead() {
-        let _guard = test_lock();
-        clear_alert_state();
-        clear_deadman_clock();
+        let _ctx = test_context();
         let dir = unique_temp_dir("deadman-keep-dead");
         fs::create_dir_all(&dir).unwrap();
         // Configure ONLY a Slack channel with a curl shim that always fails.
@@ -902,11 +1114,10 @@ mod tests {
 
     #[test]
     fn deadman_no_channels_configured_is_noop() {
-        let _guard = test_lock();
-        clear_alert_state();
-        clear_deadman_clock();
+        let _ctx = test_context();
         let mut cfg = deadman_test_config(60);
         cfg.alert.slack_webhook_url = None;
+        cfg.alert.slack_bot_token = None;
         cfg.alert.email_to = None;
         cfg.alert.log_path = None;
 
@@ -915,5 +1126,253 @@ mod tests {
         let fired = state.check(&cfg, start + Duration::from_secs(86_400));
 
         assert!(!fired, "no channels = no self-test attempt");
+    }
+
+    #[test]
+    fn slack_bot_curl_args_include_auth_header_and_hard_timeouts() {
+        let payload = slack_bot_payload("C0AJ3SD5C79", "pool low", "body", Severity::Warning);
+        let args = slack_bot_curl_args("xoxb-test-token", &payload);
+        assert!(args.iter().any(|arg| arg == "--fail-with-body"));
+        assert!(args.iter().any(|arg| arg == "Authorization: Bearer xoxb-test-token"));
+        assert!(args.iter().any(|arg| arg == "https://slack.com/api/chat.postMessage"));
+        assert!(args.windows(2).any(|w| w == ["--connect-timeout", "5"]));
+        assert!(args.windows(2).any(|w| w == ["--max-time", "15"]));
+    }
+
+    #[test]
+    fn slack_bot_delivery_succeeds_and_verifies_payload() {
+        let _ctx = test_context();
+        let dir = unique_temp_dir("slack-bot-success");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("invocations.log");
+        write_executable(
+            &dir.join("curl"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '{{\"ok\":true}}'\nexit 0\n",
+                log.display()
+            ),
+        );
+
+        let target = SlackTarget::BotToken {
+            token: "xoxb-test-123".into(),
+            channel: "C0AJ3SD5C79".into(),
+        };
+
+        with_fake_path(&dir, || {
+            let res = send_slack_target(&target, "test sub", "test body", Severity::Info);
+            assert!(res.is_ok());
+        });
+
+        let recorded = fs::read_to_string(&log).unwrap();
+        assert!(recorded.contains("Authorization: Bearer xoxb-test-123"));
+        assert!(recorded.contains("https://slack.com/api/chat.postMessage"));
+        assert!(recorded.contains("--fail-with-body"));
+        assert!(recorded.contains("C0AJ3SD5C79"));
+        assert!(recorded.contains("test sub"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn slack_bot_api_error_in_http_200_fails_delivery() {
+        let _ctx = test_context();
+        let dir = unique_temp_dir("slack-bot-api-error");
+        fs::create_dir_all(&dir).unwrap();
+        write_executable(
+            &dir.join("curl"),
+            "#!/bin/sh\nprintf '{\"ok\":false,\"error\":\"channel_not_found\"}'\nexit 0\n",
+        );
+
+        let target = SlackTarget::BotToken {
+            token: "xoxb-test-123".into(),
+            channel: "C_INVALID".into(),
+        };
+
+        with_fake_path(&dir, || {
+            let err = send_slack_target(&target, "test sub", "test body", Severity::Info)
+                .expect_err("ok:false in 200 body must fail delivery");
+            assert!(err.to_string().contains("channel_not_found"));
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn slack_fail_with_body_prints_error_body_on_failure() {
+        let _ctx = test_context();
+        let dir = unique_temp_dir("slack-fail-body");
+        fs::create_dir_all(&dir).unwrap();
+        // Simulate curl --fail-with-body: exits with 22, body in stdout, curl error in stderr
+        write_executable(
+            &dir.join("curl"),
+            "#!/bin/sh\nprintf '{\"ok\":false,\"error\":\"invalid_auth\"}'\nprintf 'curl: (22) The requested URL returned error: 403\\n' >&2\nexit 22\n",
+        );
+
+        let target = SlackTarget::Webhook("https://hooks.slack.test/T/fail".into());
+
+        with_fake_path(&dir, || {
+            let err = send_slack_target(&target, "test sub", "test body", Severity::Warning)
+                .expect_err("curl failure must return error");
+            let err_msg = err.to_string();
+            assert!(
+                err_msg.contains("invalid_auth"),
+                "error message must contain HTTP response body: {err_msg}"
+            );
+            assert!(err_msg.contains("22"));
+        });
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_slack_target_environment_fallbacks_and_precedence() {
+        let _ctx = test_context();
+        let mut cfg = AlertConfig::default();
+
+        // No config, no env => None
+        assert_eq!(resolve_slack_target(&cfg), None);
+
+        // Env SLACK_BOT_TOKEN and SLACK_CHANNEL fallback
+        std::env::set_var("SLACK_BOT_TOKEN", "xoxb-env-token");
+        std::env::set_var("SLACK_CHANNEL", "C_ENV");
+        assert_eq!(
+            resolve_slack_target(&cfg),
+            Some(SlackTarget::BotToken {
+                token: "xoxb-env-token".into(),
+                channel: "C_ENV".into(),
+            })
+        );
+
+        // HERMES env vars fallback
+        std::env::remove_var("SLACK_BOT_TOKEN");
+        std::env::remove_var("SLACK_CHANNEL");
+        std::env::set_var("HERMES_SLACK_BOT_TOKEN", "xoxb-hermes-token");
+        std::env::set_var("HERMES_MONITOR_SLACK_TARGET", "C_HERMES");
+        assert_eq!(
+            resolve_slack_target(&cfg),
+            Some(SlackTarget::BotToken {
+                token: "xoxb-hermes-token".into(),
+                channel: "C_HERMES".into(),
+            })
+        );
+
+        // Config slack_webhook_url takes precedence over env fallback
+        cfg.slack_webhook_url = Some("https://hooks.slack.com/services/explicit".into());
+        assert_eq!(
+            resolve_slack_target(&cfg),
+            Some(SlackTarget::Webhook("https://hooks.slack.com/services/explicit".into()))
+        );
+
+        // Config slack_bot_token takes precedence
+        cfg.slack_bot_token = Some("xoxb-cfg-token".into());
+        cfg.slack_channel = Some("C_CFG".into());
+        assert_eq!(
+            resolve_slack_target(&cfg),
+            Some(SlackTarget::BotToken {
+                token: "xoxb-cfg-token".into(),
+                channel: "C_CFG".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn deadman_external_channel_failure_not_masked_by_local_log() {
+        let _ctx = test_context();
+        let dir = unique_temp_dir("deadman-ext-fail");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("alerts.jsonl");
+
+        // Curl fails, but log write succeeds
+        write_executable(&dir.join("curl"), "#!/bin/sh\nexit 22\n");
+
+        let mut cfg = deadman_test_config(60);
+        cfg.alert.slack_webhook_url = Some("https://hooks.slack.test/T/fail".into());
+        cfg.alert.log_path = Some(log.clone());
+
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        let later = start + Duration::from_secs(120);
+
+        with_fake_path(&dir, || {
+            // notify_delivery must NOT report success when external transport fails,
+            // even though log_path wrote successfully!
+            let delivered = notify_delivery(
+                &cfg,
+                "test.ext_fail",
+                Severity::Critical,
+                "sub",
+                "body",
+            )
+            .unwrap();
+            assert!(
+                !delivered,
+                "local log write must NOT count as successful delivery when external channel failed"
+            );
+
+            // Dead-man clock must NOT have been updated
+            assert!(
+                deadman_clock().lock().unwrap().is_none(),
+                "deadman clock must not be bumped when external channel failed"
+            );
+
+            // Dead-man self-test must also report failure and preserve dead state
+            let check_fired = state.check(&cfg, later);
+            assert!(
+                !check_fired,
+                "dead-man check must fail when external channel fails"
+            );
+
+            // Subsequent check still considers pipeline dead
+            let retry_fired = state.check(&cfg, later + Duration::from_secs(1));
+            assert!(
+                !retry_fired,
+                "dead-man must continue failing until external channel succeeds"
+            );
+        });
+
+        // The file log was still written for local diagnostics
+        let raw = fs::read_to_string(&log).unwrap();
+        assert!(raw.contains("test.ext_fail"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deadman_external_channel_success_resets_clock() {
+        let _ctx = test_context();
+        let dir = unique_temp_dir("deadman-ext-success");
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("alerts.jsonl");
+
+        // Curl succeeds
+        write_executable(
+            &dir.join("curl"),
+            "#!/bin/sh\nprintf '{\"ok\":true}'\nexit 0\n",
+        );
+
+        let mut cfg = deadman_test_config(60);
+        cfg.alert.slack_bot_token = Some("xoxb-test".into());
+        cfg.alert.slack_channel = Some("C_TEST".into());
+        cfg.alert.log_path = Some(log.clone());
+
+        let start = Instant::now();
+        let mut state = DeadManState::new(start);
+        let later = start + Duration::from_secs(120);
+
+        with_fake_path(&dir, || {
+            let check_fired = state.check(&cfg, later);
+            assert!(
+                check_fired,
+                "dead-man check must succeed when external channel succeeds"
+            );
+
+            assert!(
+                deadman_clock().lock().unwrap().is_some(),
+                "deadman clock must be bumped when external channel succeeds"
+            );
+
+            // Once reset, immediately checking at same instant does not fire
+            assert!(
+                !state.check(&cfg, later),
+                "successful delivery resets alive timer"
+            );
+        });
+        let _ = fs::remove_dir_all(dir);
     }
 }
