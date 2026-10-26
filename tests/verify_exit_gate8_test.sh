@@ -326,6 +326,91 @@ grep -Fq 'if [ "$QEMU_CEILING_BYTES" = "max" ]' "$VERIFY" \
 grep -Fq 'assert-qemu-cpu-ceiling.sh' "$VERIFY" \
   || fail "Gate 8 does not reuse the service-bound QEMU assertion"
 
+# The inactive native-VM path may skip only live cgroup inspection.  The
+# tracked future policy assertion must still execute first, or an invalid
+# CPUQuota/runtime-writer policy would pass solely because the optional VM is
+# currently unused.  Exercise the real Gate-8 QEMU section against a small,
+# hermetic fixture rather than checking for source text that could be placed
+# after the branch.
+make_qemu_gate8_fixture() {
+  local fixture="$1"
+  mkdir -p "$fixture/bin" "$fixture/scripts/host" \
+    "$fixture/systemd/lima-vm@colima.service.d"
+  cp "$ROOT/install.sh" "$fixture/install.sh"
+  cp "$ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" "$fixture/scripts/host/"
+  cp "$ROOT/scripts/host/qemu-ceiling-guard.sh" "$fixture/scripts/host/"
+  cp "$ROOT/systemd/app-lima-vm.slice" "$fixture/systemd/app-lima-vm.slice"
+  cp "$ROOT/systemd/lima-vm-cpu-ceiling.service" "$fixture/systemd/lima-vm-cpu-ceiling.service"
+  cp "$ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+    "$fixture/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+  chmod +x "$fixture/scripts/host/"*.sh
+  cat > "$fixture/bin/systemctl" <<'EOF_QEMU_SYSTEMCTL'
+#!/usr/bin/env bash
+case "$*" in
+  *'-p ActiveState'*) printf 'inactive\n' ;;
+  *'-p LoadState'*) printf 'not-found\n' ;;
+  *'-p ControlGroup'*) printf '\n' ;;
+  *) exit 1 ;;
+esac
+EOF_QEMU_SYSTEMCTL
+  cat > "$fixture/bin/ps" <<'EOF_QEMU_PS'
+#!/usr/bin/env bash
+[ "$*" = '-eo comm=' ] || exit 2
+printf 'bash\n'
+EOF_QEMU_PS
+  chmod +x "$fixture/bin/systemctl" "$fixture/bin/ps"
+}
+
+run_qemu_gate8_section() {
+  local verify_file="$1" fixture="$2" output rc=0 qemu_section
+  output=$(
+    {
+      set -euo pipefail
+      export REPO_ROOT="$fixture"
+      export PATH="$fixture/bin:$PATH"
+      export CONTAINMENT_LIVE_SYSTEMD=1 QEMU_RUNTIME_STATE=inactive
+      fail() { echo "FAIL: $*" >&2; exit 1; }
+      uname() { echo Linux; }
+      containment_in_vm() { return 1; }
+      eval "$(sed -n '/^qemu_vm_runtime_state() {/,/^}/p' "$verify_file")"
+      qemu_section="$(sed -n '/^# (1) QEMU cgroup probe/,/^# (2) AO\/MCP slice probe/{/^# (2) AO\/MCP slice probe/d;p;}' "$verify_file")"
+      eval "$qemu_section"
+    } 2>&1
+  ) || rc=$?
+  printf '%s\n' "$output"
+  return "$rc"
+}
+
+QEMU_SECTION_DIR="$TMP/qemu-inactive-section"
+make_qemu_gate8_fixture "$QEMU_SECTION_DIR"
+qemu_out=$(run_qemu_gate8_section "$VERIFY" "$QEMU_SECTION_DIR") \
+  || fail "valid inactive native-VM Gate-8 QEMU section should pass: $qemu_out"
+grep -Fq 'native Docker host has no active Colima VM' <<<"$qemu_out" \
+  || fail "inactive QEMU fixture did not take the explicit skip path: $qemu_out"
+
+# Removing the future CPU policy must fail even though the live VM probe is
+# skipped.  This catches the prior implementation, which entered the inactive
+# branch before invoking assert-qemu-cpu-ceiling.sh.
+sed -i '/^CPUQuota=1600%$/d' \
+  "$QEMU_SECTION_DIR/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+if qemu_out=$(run_qemu_gate8_section "$VERIFY" "$QEMU_SECTION_DIR"); then
+  fail "inactive QEMU fixture accepted a missing tracked CPUQuota: $qemu_out"
+fi
+grep -Fq 'tracked QEMU policy assertion failed' <<<"$qemu_out" \
+  || fail "missing CPUQuota failure did not come from the static Gate-8 assertion: $qemu_out"
+
+# Restore the policy and remove the shared runtime writer delegation.  This
+# must fail for the same reason, proving future enforcement remains required.
+cp "$ROOT/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf" \
+  "$QEMU_SECTION_DIR/systemd/lima-vm@colima.service.d/99-memory-ceiling.conf"
+sed -i '/^ExecStart=@SCRIPTS_DIR@\/qemu-ceiling-guard.sh --apply$/d' \
+  "$QEMU_SECTION_DIR/systemd/lima-vm-cpu-ceiling.service"
+if qemu_out=$(run_qemu_gate8_section "$VERIFY" "$QEMU_SECTION_DIR"); then
+  fail "inactive QEMU fixture accepted a missing runtime writer: $qemu_out"
+fi
+grep -Fq 'tracked QEMU policy assertion failed' <<<"$qemu_out" \
+  || fail "missing runtime writer failure did not come from the static Gate-8 assertion: $qemu_out"
+
 # Host-docker envelope (bead ez-gh-actions-154k): live memory.max of
 # actions/agents/automation/lima-vm@colima.service must equal the tracked
 # host-docker policy, be finite, and with the 10% reserve fit MemTotal.

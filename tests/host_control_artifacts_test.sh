@@ -56,10 +56,6 @@ grep -Fq 'qemu-ceiling-guard.sh" --root "$ROOT" --unit agents.slice --threshold 
   || fail "apply-host-containment-release1.sh does not guard agents.slice before lowering MemoryMax"
 assert_file "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
 bash -n "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh"
-grep -q 'ASSERT_LIVE_QEMU=0' "$REPO_ROOT/docs/verify-exit-criteria.sh" \
-  || fail "Gate 8 does not run the static QEMU assertion before the inactive-VM branch"
-grep -q 'assert-qemu-cpu-ceiling.sh' "$REPO_ROOT/docs/verify-exit-criteria.sh" \
-  || fail "Gate 8 does not invoke the tracked QEMU assertion"
 grep -q 'QEMU_PROC_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
   || fail "QEMU assertion lacks injected proc-root fixture support"
 grep -q 'QEMU_CGROUP_ROOT' "$REPO_ROOT/scripts/host/assert-qemu-cpu-ceiling.sh" \
