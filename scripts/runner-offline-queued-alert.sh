@@ -23,7 +23,7 @@ MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
 STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/runner_offline_queued_${RUNNER}.json}"
 mkdir -p "$(dirname "$STATE_FILE")"
 GH_BIN="${GH_BIN:-gh}"
-GCLOUD_BIN="${GCLOUD_BIN:-$(command -v gcloud || true)}"
+GCLOUD_BIN="${GCLOUD_BIN-$(command -v gcloud || true)}"
 DRY_RUN=0 SIMULATE=0 TEST_SMS=0
 for a in "$@"; do
   case "$a" in
