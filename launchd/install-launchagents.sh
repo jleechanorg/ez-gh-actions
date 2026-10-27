@@ -120,6 +120,7 @@ install_scripts() {
   for asset in index.html style.css dashboard.js; do
     install -m 0644 "${REPO_PATH}/dashboard/${asset}" "${DASHBOARD_DIR}/${asset}"
   done
+  install -m 0644 "${REPO_PATH}/launchd/runner-offline-queued-sms-policy.json" "${SCRIPTS_DIR}/runner-offline-queued-sms-policy.json"
   echo "scripts installed: ${SCRIPTS_DIR}"
 }
 

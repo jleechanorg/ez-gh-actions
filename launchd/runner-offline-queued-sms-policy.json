@@ -1,20 +1,10 @@
 {
   "displayName": "[CRITICAL] Runner offline with queued runs: SMS (metric)",
   "documentation": {"content": "A watched self-hosted runner (default worldai-testflight-native-mac) is not online while workflow runs are queued. Source: ez-gh-actions scripts/runner-offline-queued-alert.sh. TEST entries have jsonPayload.status=TEST.", "mimeType": "text/markdown"},
-  "combiner": "OR",
-  "severity": "CRITICAL",
-  "conditions": [{
-    "displayName": "runner_offline_queued_alert_count > 0",
-    "conditionThreshold": {
-      "filter": "metric.type=\"logging.googleapis.com/user/runner_offline_queued_alert_count\" AND resource.type=\"global\"",
-      "comparison": "COMPARISON_GT",
-      "thresholdValue": 0,
-      "duration": "0s",
-      "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_DELTA"}],
-      "trigger": {"count": 1}
-    }
-  }],
-  "alertStrategy": {"autoClose": "1800s", "notificationPrompts": ["OPENED"]},
-  "notificationChannels": ["projects/worldarchitecture-ai/notificationChannels/17167119139665448890"],
-  "enabled": true
+  "combiner": "OR", "severity": "CRITICAL", "conditions": [{"displayName": "runner_offline_queued_alert_count > 0", "conditionThreshold": {
+    "filter": "metric.type=\"logging.googleapis.com/user/runner_offline_queued_alert_count\" AND resource.type=\"global\"",
+    "comparison": "COMPARISON_GT", "thresholdValue": 0, "duration": "0s",
+    "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_DELTA"}], "trigger": {"count": 1}
+  }}], "alertStrategy": {"autoClose": "1800s", "notificationPrompts": ["OPENED"]},
+  "notificationChannels": ["projects/worldarchitecture-ai/notificationChannels/17167119139665448890"], "enabled": true
 }
