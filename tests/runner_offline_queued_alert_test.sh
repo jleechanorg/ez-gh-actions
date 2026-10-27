@@ -68,3 +68,8 @@ STATE_FILE="$W/state-k.json" GH_BIN="$W/gh" GCLOUD_BIN="" PATH=/usr/bin:/bin \
 [ "$rc" = 3 ] || fail "missing gcloud must exit 3, got $rc"
 [ ! -f "$W/state-k.json" ] || fail "missing gcloud must not write throttle state"
 pass "missing gcloud fails loudly with no state"
+# --ensure-gcp-policy must invoke stub gcloud to ensure logging metric and monitoring policy
+run l --ensure-gcp-policy
+grep -q "logging metrics create runner_offline_queued_alert_count" "$W/log-l" || fail "--ensure-gcp-policy must ensure logging metric"
+grep -q "alpha monitoring policies create" "$W/log-l" || fail "--ensure-gcp-policy must ensure monitoring policy"
+pass "ensure-gcp-policy ensures metric and policy"

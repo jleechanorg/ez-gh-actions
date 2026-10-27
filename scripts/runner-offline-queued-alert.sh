@@ -4,12 +4,15 @@
 # stayed offline ~10h and every iOS TestFlight push queued).
 #
 # Reuses the existing GCP path: an ERROR entry in Cloud Logging log
-# `ezgha-runner-alerts` (project worldarchitecture-ai) trips the alert policy that
-# texts the operator and posts to Slack. Throttled to one text per COOLDOWN_SEC.
+# `ezgha-runner-alerts` (project worldarchitecture-ai) increments the log-based
+# counter metric `runner_offline_queued_alert_count`, which drives
+# `[CRITICAL] Runner offline with queued runs: SMS (metric)` (SMS) alongside the
+# `ezgha-runner-alerts` Slack policy. Throttled to one text per COOLDOWN_SEC.
 #
-# Usage: runner-offline-queued-alert.sh [--dry-run] [--simulate-offline] [--test-sms]
-#   --simulate-offline  treat the runner as offline and runs as queued (detector proof)
-#   --test-sms          write one clearly labelled TEST entry and exit
+# Usage: runner-offline-queued-alert.sh [--dry-run] [--simulate-offline] [--test-sms] [--ensure-gcp-policy]
+#   --simulate-offline   treat the runner as offline and runs as queued (detector proof)
+#   --test-sms           write one clearly labelled TEST entry and exit
+#   --ensure-gcp-policy  ensure the GCP logging metric and SMS alert policy exist and exit
 # Env: ALERT_REPO ALERT_RUNNER ALERT_WORKFLOW MIN_QUEUED_MIN COOLDOWN_SEC STATE_FILE GH_BIN GCLOUD_BIN
 #      MAX_API_FAILURES (consecutive gh failures before a "monitor blind" alert)
 set -euo pipefail
@@ -24,10 +27,10 @@ STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/runner_offline_queued_${RUNNE
 mkdir -p "$(dirname "$STATE_FILE")"
 GH_BIN="${GH_BIN:-gh}"
 GCLOUD_BIN="${GCLOUD_BIN-$(command -v gcloud || true)}"
-DRY_RUN=0 SIMULATE=0 TEST_SMS=0
+DRY_RUN=0 SIMULATE=0 TEST_SMS=0 ENSURE_POLICY=0
 for a in "$@"; do
   case "$a" in
-    --dry-run) DRY_RUN=1 ;; --simulate-offline) SIMULATE=1 ;; --test-sms) TEST_SMS=1 ;;
+    --dry-run) DRY_RUN=1 ;; --simulate-offline) SIMULATE=1 ;; --test-sms) TEST_SMS=1 ;; --ensure-gcp-policy) ENSURE_POLICY=1 ;;
     *) echo "unknown arg: $a" >&2; exit 64 ;;
   esac
 done
@@ -37,6 +40,63 @@ if [ "$DRY_RUN" -eq 0 ] && [ -z "$GCLOUD_BIN" ]; then
 fi
 
 NOW_EPOCH=$(date +%s); NOW_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+if [ "$ENSURE_POLICY" -eq 1 ]; then
+  METRIC_FILTER='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR'
+  METRIC_DESC="ERROR entries from runner-offline-queued-alert (drives SMS policy)"
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  POLICY_FILE="${POLICY_FILE:-$SCRIPT_DIR/../launchd/runner-offline-queued-sms-policy.json}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[$NOW_ISO] [dry-run] would ensure logging metric runner_offline_queued_alert_count and alert policy [CRITICAL] Runner offline with queued runs: SMS (metric) from $POLICY_FILE"
+    exit 0
+  fi
+  "$GCLOUD_BIN" logging metrics create runner_offline_queued_alert_count \
+    --description="$METRIC_DESC" --log-filter="$METRIC_FILTER" \
+    --project=worldarchitecture-ai --account=jleechan@gmail.com 2>/dev/null ||
+  "$GCLOUD_BIN" logging metrics update runner_offline_queued_alert_count \
+    --description="$METRIC_DESC" --log-filter="$METRIC_FILTER" \
+    --project=worldarchitecture-ai --account=jleechan@gmail.com
+  TMP_POLICY=""
+  if [ ! -f "$POLICY_FILE" ]; then
+    TMP_POLICY="$(mktemp)"
+    trap 'rm -f "${TMP_POLICY:?}"' EXIT
+    cat > "$TMP_POLICY" <<'EOF'
+{
+  "displayName": "[CRITICAL] Runner offline with queued runs: SMS (metric)",
+  "documentation": {"content": "A watched self-hosted runner (default worldai-testflight-native-mac) is not online while workflow runs are queued. Source: ez-gh-actions scripts/runner-offline-queued-alert.sh. TEST entries have jsonPayload.status=TEST.", "mimeType": "text/markdown"},
+  "combiner": "OR",
+  "severity": "CRITICAL",
+  "conditions": [{
+    "displayName": "runner_offline_queued_alert_count > 0",
+    "conditionThreshold": {
+      "filter": "metric.type=\"logging.googleapis.com/user/runner_offline_queued_alert_count\" AND resource.type=\"global\"",
+      "comparison": "COMPARISON_GT",
+      "thresholdValue": 0,
+      "duration": "0s",
+      "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_DELTA"}],
+      "trigger": {"count": 1}
+    }
+  }],
+  "alertStrategy": {"autoClose": "1800s", "notificationPrompts": ["OPENED"]},
+  "notificationChannels": ["projects/worldarchitecture-ai/notificationChannels/17167119139665448890"],
+  "enabled": true
+}
+EOF
+    POLICY_FILE="$TMP_POLICY"
+  fi
+  EXISTING_POLICY=$("$GCLOUD_BIN" alpha monitoring policies list \
+    --project=worldarchitecture-ai --account=jleechan@gmail.com \
+    --filter='displayName="[CRITICAL] Runner offline with queued runs: SMS (metric)"' \
+    --format='value(name)' | head -1)
+  if [ -n "$EXISTING_POLICY" ]; then
+    "$GCLOUD_BIN" alpha monitoring policies update "$EXISTING_POLICY" \
+      --policy-from-file="$POLICY_FILE" --project=worldarchitecture-ai --account=jleechan@gmail.com
+  else
+    "$GCLOUD_BIN" alpha monitoring policies create \
+      --policy-from-file="$POLICY_FILE" --project=worldarchitecture-ai --account=jleechan@gmail.com
+  fi
+  exit 0
+fi
 
 emit() { # severity status message
   local payload
