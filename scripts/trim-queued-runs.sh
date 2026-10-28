@@ -37,7 +37,7 @@ if [[ -z "${GH_TOKEN:-}" && -f "${HOME}/.config/ezgha/gh_token" ]]; then
   fi
 fi
 
-DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions"
+DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions jleechanorg/worldai_frontend"
 QUEUE_REPOS="${QUEUE_REPOS:-$DEFAULT_QUEUE_REPOS}"
 MIN_PR_AGE_HOURS="${MIN_PR_AGE_HOURS:-2}"
 TRIM_DRAFTS="${TRIM_DRAFTS:-1}"
@@ -231,26 +231,36 @@ branch_info = {}
 commit_dates = {}
 
 for b in branches:
-    if b in ("main", "master"):
-        continue
     remote_head = get_remote_head(b)
     pr_data = None
-    try:
-        prs = gh_json(["pr", "list", "--repo", repo, "--head", b, "--state", "open", "--json", "number,title,isDraft,updatedAt,headRefOid"])
-        if prs:
-            pr_data = prs[0]
-    except Exception:
-        pass
+    if b not in ("main", "master"):
+        try:
+            prs = gh_json(["pr", "list", "--repo", repo, "--head", b, "--state", "open", "--json", "number,title,isDraft,updatedAt,headRefOid"])
+            if prs:
+                pr_data = prs[0]
+        except Exception:
+            pass
     branch_info[b] = {
         "remote_head": remote_head,
         "pr": pr_data,
     }
 
+# Find newest queued ios-testflight run on main/master to avoid cancelling the current candidate
+newest_testflight_main_id = {}
+for r in eligible_runs:
+    if (r.get("path") == ".github/workflows/ios-testflight.yml" and
+            r.get("head_branch") in ("main", "master") and
+            r.get("event", "push") == "push"):
+        hb = r.get("head_branch")
+        cur_max = newest_testflight_main_id.get(hb, -1)
+        if r.get("id", 0) > cur_max:
+            newest_testflight_main_id[hb] = r.get("id", 0)
+
 candidates = []
 
 for r in eligible_runs:
     b = r.get("head_branch")
-    if not b or b in ("main", "master"):
+    if not b:
         continue
     info = branch_info.get(b)
     if not info:
@@ -259,6 +269,24 @@ for r in eligible_runs:
     run_sha = r.get("head_sha")
     remote_head = info["remote_head"]
     pr = info["pr"]
+
+    # Special case: iOS TestFlight runs on main/master
+    if r.get("path") == ".github/workflows/ios-testflight.yml" and b in ("main", "master"):
+        if trim_superseded and r.get("event", "push") == "push":
+            max_id = newest_testflight_main_id.get(b)
+            is_superseded_sha = bool(remote_head and run_sha and run_sha != remote_head)
+            is_superseded_queue = bool(max_id and r.get("id", 0) < max_id)
+            if is_superseded_sha or is_superseded_queue:
+                reasons = []
+                if is_superseded_sha:
+                    reasons.append(f"run_sha={run_sha[:8]} != remote_head={remote_head[:8]}")
+                if is_superseded_queue:
+                    reasons.append(f"newer_queued_id={max_id}")
+                candidates.append((r, f"superseded_main_build ({', '.join(reasons)})"))
+        continue
+
+    if b in ("main", "master"):
+        continue
 
     # Reason 1: Superseded commit on branch
     if trim_superseded and remote_head and run_sha and run_sha != remote_head:
