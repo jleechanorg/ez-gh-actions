@@ -121,6 +121,7 @@ PATTERNS: list[dict] = [
     {
         "file": "skills/clean/SKILL.md",
         "expect": "exact",
+        "absent_is_ok": True,   # superseded by the git-probe generation below
         "old": "2. **Setup the Clean Room**: Create a fresh directory `/tmp/repro-cb-<issue_id>-<timestamp>`.",
         "new": '2. **Setup the Clean Room**: Create a fresh directory under the scratch root: '
                f'`"$({RESOLVER} clean-room)/repro-cb-<issue_id>-<timestamp>"`.',
@@ -220,6 +221,55 @@ PATTERNS: list[dict] = [
         "old": 'export REPO_DIR="/tmp/claude_commands_repo_fresh"',
         "new": f'export SCRATCH="$({RESOLVER} exportcommands 2>/dev/null || echo /tmp)"\n'
                'export REPO_DIR="$SCRATCH/claude_commands_repo_fresh"',
+    },
+    # ── second generation: probe scratch before trusting it for git work ────
+    # fuse2fs (the Linux scratch mount) rejects `open(O_CREAT|O_EXCL|O_RDWR, 0444)`,
+    # which is exactly how git creates a loose object, so git clone/add/commit fail
+    # with EACCES there while plain writes succeed. Verified 2026-10-28 on
+    # jeff-ubuntu `~/.local/share/disk-magician/volumes/scratch.ext4` (fuse2fs) and
+    # reproduced at syscall level: mode 0444 -> EACCES, mode 0644 -> OK. Bead
+    # jleechan-tshq tracks the mount defect; these guards keep lanes working meanwhile.
+    {
+        "file": "skills/clonefix/SKILL.md",
+        "expect": "exact",
+        "absent_is_ok": True,
+        "old": '>    SCRATCH="$(' + RESOLVER + ' clonefix 2>/dev/null || echo /tmp)"\n'
+               '>    CLONE_DIR="$(mktemp -d "${SCRATCH}/${repo_name}_clonefix_XXXXXX")"',
+        "new": '>    SCRATCH="$(' + RESOLVER + ' clonefix 2>/dev/null)"\n'
+               '>    # A fuse2fs scratch volume (Linux) rejects git\'s loose-object create\n'
+               '>    # (open O_CREAT|O_EXCL|O_RDWR mode 0444 -> EACCES), so probe it first.\n'
+               '>    if [ -z "$SCRATCH" ] || ! { _p="$SCRATCH/.gitprobe.$$"; mkdir -p "$_p" && : > "$_p/f" && git -C "$_p" init -q . && git -C "$_p" add f && rm -rf "$_p"; } 2>/dev/null; then\n'
+               '>      SCRATCH="${TMPDIR:-/tmp}"\n'
+               '>    fi\n'
+               '>    CLONE_DIR="$(mktemp -d "${SCRATCH}/${repo_name}_clonefix_XXXXXX")"',
+    },
+    {
+        "file": "skills/clonefix/SKILL.md",
+        "expect": "exact",
+        "absent_is_ok": True,
+        "old": '1. **Create unique clone directory**: `"$(' + RESOLVER + ' clonefix)/{repo_name}_clonefix_{timestamp}"`',
+        "new": '1. **Create unique clone directory** (probe the root first: on Linux the fuse2fs scratch volume rejects git\'s 0444 loose-object create, so fall back to `${TMPDIR:-/tmp}`):\n'
+               '   ```bash\n'
+               '   SCRATCH="$(' + RESOLVER + ' clonefix 2>/dev/null)"\n'
+               '   if [ -z "$SCRATCH" ] || ! { _p="$SCRATCH/.gitprobe.$$"; mkdir -p "$_p" && : > "$_p/f" && git -C "$_p" init -q . && git -C "$_p" add f && rm -rf "$_p"; } 2>/dev/null; then\n'
+               '     SCRATCH="${TMPDIR:-/tmp}"\n'
+               '   fi\n'
+               '   CLONE_DIR="$SCRATCH/{repo_name}_clonefix_{timestamp}"\n'
+               '   ```',
+    },
+    {
+        "file": "skills/clean/SKILL.md",
+        "expect": "exact",
+        "absent_is_ok": True,
+        "old": '2. **Setup the Clean Room**: Create a fresh directory under the scratch root: `"$(' + RESOLVER + ' clean-room)/repro-cb-<issue_id>-<timestamp>"`.',
+        "new": '2. **Setup the Clean Room**: resolve the scratch root, probe it, then create the clean room (on Linux the fuse2fs scratch volume rejects git\'s 0444 loose-object create, so fall back to `${TMPDIR:-/tmp}` rather than breaking the repro):\n'
+               '   ```bash\n'
+               '   SCRATCH="$(' + RESOLVER + ' clean-room 2>/dev/null)"\n'
+               '   if [ -z "$SCRATCH" ] || ! { _p="$SCRATCH/.gitprobe.$$"; mkdir -p "$_p" && : > "$_p/f" && git -C "$_p" init -q . && git -C "$_p" add f && rm -rf "$_p"; } 2>/dev/null; then\n'
+               '     SCRATCH="${TMPDIR:-/tmp}"\n'
+               '   fi\n'
+               '   CLEAN_ROOM="$SCRATCH/repro-cb-<issue_id>-<timestamp>"\n'
+               '   ```',
     },
 ]
 

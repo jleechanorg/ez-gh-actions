@@ -81,6 +81,8 @@ grep -q 'SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh clonef
 grep -q "Clone Repository to the scratch root" "$FIX/skills/clonefix/SKILL.md" || fail "legacy heading must be rewritten"
 grep -q "/tmp/{repo_name}_clonefix_proof" "$FIX/skills/clonefix/SKILL.md" && fail "legacy proof token must be gone"
 grep -q "inside the resolved scratch root" "$FIX/skills/clean/SKILL.md" || fail "clean-room description must be rewritten"
+grep -q ".gitprobe" "$FIX/skills/clonefix/SKILL.md" || fail "git-based producers must probe the scratch root (fuse2fs rejects 0444 loose-object create)"
+grep -q ".gitprobe" "$FIX/skills/clean/SKILL.md" || fail "clean-room must probe the scratch root too"
 grep -q 'scratch-dir.sh smoke-tests' "$FIX/skills/testing-infrastructure/SKILL.md" || fail "smoke-test results path must resolve scratch"
 bash --version >/dev/null && bash -n "$FIX/scripts/testerc.sh"
 pass "apply rewrites producers to the scratch resolver with a /tmp fallback"

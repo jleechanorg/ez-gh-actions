@@ -163,6 +163,12 @@ KB-scale temp files (export exclusion lists, status markers, watchdog logs) inte
 `/tmp`; only workspace and capture producers are migrated. Never relocate an existing live
 workspace — moving a checkout invalidates absolute git worktree/config paths.
 
+**Linux caveat (bead jleechan-tshq).** The Linux scratch volume is mounted with `fuse2fs`, which
+rejects `open(O_CREAT|O_EXCL|O_RDWR, 0444)` — exactly how git creates a loose object — so
+`git clone`/`add`/`commit` fail there with `EACCES` while plain writes succeed. macOS is unaffected
+(`/Volumes/diskm-scratch` is APFS). Everything git-based therefore probes the root before trusting
+it and falls back to `${TMPDIR:-/tmp}` until the mount defect is fixed.
+
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**:
   - No script, daemon, test, or automation in this repo may invoke or instruct physical-host reboot, shutdown, or forced panic primitives (`reboot`, `shutdown`, `poweroff`, `halt`, `init 0/6`, `/proc/sysrq-trigger`, `kernel.panic=10`, etc.).
