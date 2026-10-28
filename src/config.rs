@@ -945,54 +945,6 @@ impl Config {
 /// Check that a cgroup parent is one safe systemd unit/slice component.
 /// Docker accepts arbitrary cgroup paths, so reject separators, whitespace,
 /// and path traversal rather than passing an unsafe hierarchy to the daemon.
-/// FUSE filesystem types that cannot host the runner workspace.
-///
-/// Why this exists (2026-10-28 incident): the runner bind-mounts
-/// `runner.workspace_host_path/<runner_name>` at `/home/runner/_work`, and at
-/// job setup the upstream runner deletes and recreates `_work/_actions`
-/// (`Runner.Worker`/ActionManager), while git creates loose objects with
-/// `open(O_CREAT|O_EXCL|O_RDWR, 0444)`. A FUSE mount satisfies neither: the
-/// delete fails with `Device or resource busy: '/home/runner/_work/_actions'`
-/// so every job dies in "Set up job" before a single step runs, and the 0444
-/// create fails with EACCES so clone-based lanes break too. Both were observed
-/// live when the Disk Magician Scratch image was mounted through the bundled
-/// fuse2fs helper instead of the fstab `ext4 loop,user` kernel mount.
-/// Detecting it at config-validation time turns 20 silently-dead runners into
-/// one startup error that names the remedy.
-fn workspace_fstype_rejection(fstype: &str, path: &str) -> Option<String> {
-    let fstype = fstype.trim();
-    if !(fstype.starts_with("fuse") || fstype == "fuseblk") {
-        return None;
-    }
-    Some(format!(
-        "runner.workspace_host_path '{path}' is on a FUSE filesystem ('{fstype}'). The GitHub \
-         runner deletes and recreates `_work/_actions` at job setup and git writes 0444 loose \
-         objects there, so a FUSE mount makes every job fail with \"Device or resource busy: \
-         '/home/runner/_work/_actions'\" in \"Set up job\" (and clone-based steps fail with \
-         EACCES). Mount the workspace with the kernel driver instead - for the Disk Magician \
-         Scratch image use its fstab entry (`ext4 loop,user,noauto`): `umount {path} && mount \
-         {path}`, then confirm `findmnt -no FSTYPE -T {path}` prints `ext4`."
-    ))
-}
-
-/// Reject a workspace root that lives on a FUSE mount; fail open when the probe
-/// itself is unavailable so a missing `findmnt` can never block the daemon.
-fn validate_workspace_filesystem(path: &str) -> Result<()> {
-    let bin = std::env::var("EZGHA_FINDMNT_BIN").unwrap_or_else(|_| "findmnt".to_string());
-    let output = match std::process::Command::new(&bin)
-        .args(["-no", "FSTYPE", "-T", path])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return Ok(()),
-    };
-    let fstype = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    match workspace_fstype_rejection(&fstype, path) {
-        Some(message) => anyhow::bail!(message),
-        None => Ok(()),
-    }
-}
-
 fn validate_cgroup_parent(parent: &str) -> Result<()> {
     if parent.is_empty() || parent.trim() != parent || parent == "." || parent == ".." {
         anyhow::bail!(
@@ -1008,6 +960,71 @@ fn validate_cgroup_parent(parent: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Reject a `findmnt` FSTYPE listing that shows the workspace on FUSE.
+///
+/// Why this exists (2026-10-28 incident): the runner bind-mounts
+/// `runner.workspace_host_path/<runner_name>` at `/home/runner/_work`, and at
+/// job setup the upstream runner deletes and recreates `_work/_actions`
+/// (`Runner.Worker`/ActionManager), while git creates loose objects with
+/// `open(O_CREAT|O_EXCL|O_RDWR, 0444)`. A FUSE mount satisfies neither: the
+/// delete fails with `Device or resource busy: '/home/runner/_work/_actions'`
+/// so every job dies in "Set up job" before a single step runs, and the 0444
+/// create fails with EACCES so clone-based steps break too. Both were observed
+/// live while the Disk Magician Scratch image was mounted through the bundled
+/// fuse2fs helper instead of its kernel ext4 loop mount. Detecting it at
+/// config-validation time turns 20 silently-dead runners into one startup
+/// error.
+///
+/// Every reported line is checked, not just the first: `findmnt -T` prints one
+/// line per stacked mount, and the FUSE layer is usually *below* the kernel
+/// mount in that listing, so a first-line-only check would miss it.
+fn workspace_fstype_rejection(mount_output: &str, path: &str) -> Option<String> {
+    let offending = mount_output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.starts_with("fuse"))?;
+    Some(format!(
+        "runner.workspace_host_path '{path}' is on a FUSE filesystem ('{offending}'). The GitHub \
+         runner deletes and recreates _work/_actions when it sets up a job, and git writes 0444 \
+         loose objects there; a FUSE mount fails both, so every job dies in \"Set up job\" with \
+         \"Device or resource busy\" and git-based steps fail with EACCES. This workspace must \
+         live on a kernel-mounted filesystem - the Disk Magician scratch image is declared as an \
+         ext4 loop mount in /etc/fstab - and the filesystem type reported for that path must read \
+         ext4 before the daemon starts."
+    ))
+}
+
+/// Reject a workspace root that lives on a FUSE mount.
+///
+/// Fail open when the probe cannot produce a verdict (missing `findmnt`, a
+/// non-Linux host, or a probe that outlives its budget): blocking daemon
+/// startup on a capability probe would be the self-outage this guard exists to
+/// prevent. The unverified case is announced on stderr so it is never silent.
+fn validate_workspace_filesystem(path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        anyhow::bail!("runner.workspace_host_path must not be empty when configured");
+    }
+    let bin = std::env::var("EZGHA_FINDMNT_BIN").unwrap_or_else(|_| "findmnt".to_string());
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(["-n", "-o", "FSTYPE", "-T", path]);
+    match crate::platform::capture_with_timeout(cmd, std::time::Duration::from_secs(5)) {
+        Some((true, stdout)) => {
+            let listing = String::from_utf8_lossy(&stdout);
+            match workspace_fstype_rejection(&listing, path) {
+                Some(message) => anyhow::bail!(message),
+                None => Ok(()),
+            }
+        }
+        _ => {
+            eprintln!(
+                "warning: could not verify the filesystem type of runner.workspace_host_path \
+                 '{path}' via {bin}; continuing without the FUSE workspace guard"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn is_owner_repo(value: &str) -> bool {
@@ -1684,53 +1701,143 @@ slack_channel = "C0AJ3SD5C79"
     #[test]
     fn workspace_fstype_rejection_blocks_fuse_mounts() {
         // The 2026-10-28 outage shape: workspace on a FUSE volume made every job
-        // die in "Set up job" with EBUSY on _work/_actions.
-        for fstype in ["fuse.ext4", "fuse2fs", "fuse", "fuseblk", " fuse.ext4 "] {
-            let message = workspace_fstype_rejection(fstype, "/home/user/Scratch")
-                .unwrap_or_else(|| panic!("{fstype} must be rejected as a workspace filesystem"));
+        // die in "Set up job" with EBUSY on _work/_actions. Stacked-mount listings
+        // must be caught too, where the FUSE layer is not the first line.
+        for listing in [
+            "fuse.ext4",
+            "fuse2fs",
+            "fuse",
+            "fuseblk",
+            "  fuse.ext4  ",
+            "ext4\nfuse.ext4",
+            "overlay\nfuse.gvfsd-fuse\n",
+        ] {
+            let message =
+                workspace_fstype_rejection(listing, "/home/user/Scratch").unwrap_or_else(|| {
+                    panic!("{listing:?} must be rejected as a workspace filesystem")
+                });
             assert!(
                 message.contains("Device or resource busy"),
                 "rejection must name the observed failure: {message}"
             );
             assert!(
-                message.contains("findmnt -no FSTYPE"),
-                "rejection must name the verification command: {message}"
+                message.contains("ext4 loop mount"),
+                "rejection must describe the kernel-mount remedy: {message}"
             );
+            // Repo rule: error strings must never embed a runnable command.
+            for forbidden in ["umount", "mount -o", "&&", "findmnt -no"] {
+                assert!(
+                    !message.contains(forbidden),
+                    "error text must describe remediation, not embed {forbidden:?}: {message}"
+                );
+            }
         }
     }
 
     #[test]
     fn workspace_fstype_rejection_allows_kernel_filesystems() {
-        for fstype in ["ext4", "xfs", "btrfs", "overlay", "tmpfs", ""] {
+        for listing in [
+            "ext4",
+            "xfs",
+            "btrfs",
+            "overlay",
+            "tmpfs",
+            "virtiofs",
+            "ext4\noverlay",
+            "",
+            "   \n",
+        ] {
             assert!(
-                workspace_fstype_rejection(fstype, "/home/user/Scratch").is_none(),
-                "{fstype} must be accepted as a workspace filesystem"
+                workspace_fstype_rejection(listing, "/home/user/Scratch").is_none(),
+                "{listing:?} must be accepted as a workspace filesystem"
             );
         }
     }
 
-    #[test]
-    fn validate_workspace_filesystem_probes_the_mount_type() {
+    /// Write a `findmnt` stub that prints `STUB_FSTYPE` and exits `STUB_EXIT`.
+    fn findmnt_stub(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        let stub = dir.join("findmnt");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nprintf '%s\\n' \"$STUB_FSTYPE\"\nexit \"${STUB_EXIT:-0}\"\n",
+        )
+        .expect("write findmnt stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        stub
+    }
+
+    #[test]
+    fn validate_workspace_filesystem_rejects_fuse_accepts_ext4_and_fails_open() {
+        let _lock = crate::alert::test_lock();
+        let _env =
+            crate::alert::EnvVarGuard::new(&["EZGHA_FINDMNT_BIN", "STUB_FSTYPE", "STUB_EXIT"]);
         let dir = std::env::temp_dir().join(format!("ezgha-wsfs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let stub = dir.join("findmnt");
-        std::fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' \"$STUB_FSTYPE\"\n").expect("stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let stub = findmnt_stub(&dir);
         std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
 
+        // Rejects the failing state.
         std::env::set_var("STUB_FSTYPE", "fuse.ext4");
+        std::env::remove_var("STUB_EXIT");
         let err = validate_workspace_filesystem("/home/user/Scratch")
             .expect_err("a FUSE workspace must be rejected")
             .to_string();
         assert!(err.contains("FUSE filesystem"), "{err}");
 
+        // Accepts the repaired state.
         std::env::set_var("STUB_FSTYPE", "ext4");
         validate_workspace_filesystem("/home/user/Scratch")
             .expect("a kernel-mounted workspace must be accepted");
 
-        std::env::remove_var("EZGHA_FINDMNT_BIN");
-        std::env::remove_var("STUB_FSTYPE");
+        // Fails open (never blocks startup) when the probe itself fails.
+        std::env::set_var("STUB_EXIT", "1");
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("an unverifiable workspace must not block startup");
+
+        // Fails open when the probe is missing entirely.
+        std::env::set_var("EZGHA_FINDMNT_BIN", stub.with_file_name("does-not-exist"));
+        std::env::set_var("STUB_EXIT", "0");
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("a missing probe must not block startup");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_validate_rejects_a_fuse_backed_workspace() {
+        let _lock = crate::alert::test_lock();
+        let _env = crate::alert::EnvVarGuard::new(&["EZGHA_FINDMNT_BIN", "STUB_FSTYPE"]);
+        let dir = std::env::temp_dir().join(format!("ezgha-wsfs-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let stub = findmnt_stub(&dir);
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+
+        std::env::set_var("STUB_FSTYPE", "fuse.ext4");
+        let mut cfg = valid_config();
+        cfg.runner.workspace_host_path = Some("/home/user/Scratch".into());
+        let err = cfg
+            .validate()
+            .expect_err("Config::validate must reject a FUSE-backed workspace")
+            .to_string();
+        assert!(err.contains("runner.workspace_host_path"), "{err}");
+
+        std::env::set_var("STUB_FSTYPE", "ext4");
+        cfg.validate()
+            .expect("Config::validate must accept a kernel-mounted workspace");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_validate_rejects_a_blank_workspace_path() {
+        let mut cfg = valid_config();
+        cfg.runner.workspace_host_path = Some("   ".into());
+        let err = cfg
+            .validate()
+            .expect_err("a blank workspace path must be rejected")
+            .to_string();
+        assert!(err.contains("must not be empty"), "{err}");
     }
 }
