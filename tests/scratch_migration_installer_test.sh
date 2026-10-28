@@ -54,8 +54,10 @@ pass "dry-run reports the plan, writes nothing, skips absent files"
 
 # ── 2. Ambiguity and drift fail closed, and unsafe files are untouched ─────
 fixture_clean
-# duplicate one exact snippet -> ambiguous
-grep '^description:' "$FIX/skills/clean/SKILL.md" >> "$FIX/skills/clean/SKILL.md"
+# duplicate one exact snippet -> ambiguous. Read first, then append: GNU grep refuses
+# to write a file into itself ("input file is also the output"), BSD grep does not.
+dup_line="$(grep '^description:' "$FIX/skills/clean/SKILL.md")"
+printf '%s\n' "$dup_line" >> "$FIX/skills/clean/SKILL.md"
 # a file a human rewrote -> drift (neither old nor new text)
 echo "something a human rewrote" > "$FIX/skills/testing-infrastructure/SKILL.md"
 rc=$(run --apply)
