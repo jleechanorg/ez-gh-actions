@@ -43,6 +43,8 @@ STUB_RUNNERS_JSON=$(runner online) STUB_RUNS_JSON=$(runs "iOS TestFlight" "$old"
 grep -q "severity=INFO" "$W/log-a" || fail "recovery must write INFO"; pass "recovery logged"
 STUB_RUNNERS_JSON=$(runner online) STUB_RUNS_JSON=$(runs "iOS TestFlight" "$old") run b
 [ "$(sent b)" = 0 ] || fail "online runner must not alert"; pass "online no alert"
+MAX_ONLINE_QUEUED_MIN=20 STUB_RUNNERS_JSON=$(runner online) STUB_RUNS_JSON=$(runs "iOS TestFlight" "$old") run m
+[ "$(sent m)" = 1 ] || fail "online runner with stalled queue must alert"; grep -q "stalled" "$W/log-m" || fail "alert log must mention stalled"; pass "online + stalled queue alerts"
 STUB_RUNNERS_JSON=$(runner offline) STUB_RUNS_JSON='{"workflow_runs":[]}' run c
 [ "$(sent c)" = 0 ] || fail "empty queue must not alert"; pass "offline + empty queue no alert"
 STUB_RUNNERS_JSON=$(runner offline) STUB_RUNS_JSON=$(runs "iOS TestFlight" "$new") run d

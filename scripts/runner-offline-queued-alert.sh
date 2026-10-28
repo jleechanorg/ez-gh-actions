@@ -12,13 +12,14 @@
 #   --simulate-offline  treat the runner as offline and runs as queued (detector proof)
 #   --test-sms          write one clearly labelled TEST entry and exit
 #   --ensure-gcp-policy ensure the GCP logging metric and SMS alert policy exist and exit
-# Env: ALERT_REPO ALERT_RUNNER ALERT_WORKFLOW MIN_QUEUED_MIN COOLDOWN_SEC STATE_FILE GH_BIN GCLOUD_BIN
-#      MAX_API_FAILURES (consecutive gh failures before a "monitor blind" alert)
+# Env: ALERT_REPO ALERT_RUNNER ALERT_WORKFLOW MIN_QUEUED_MIN MAX_ONLINE_QUEUED_MIN COOLDOWN_SEC STATE_FILE
+#      GH_BIN GCLOUD_BIN MAX_API_FAILURES (consecutive gh failures before a "monitor blind" alert)
 set -euo pipefail
 
 REPO="${ALERT_REPO:-jleechanorg/worldai_frontend}"
 RUNNER="${ALERT_RUNNER:-worldai-testflight-native-mac}"
 MIN_QUEUED_MIN="${MIN_QUEUED_MIN:-10}"
+MAX_ONLINE_QUEUED_MIN="${MAX_ONLINE_QUEUED_MIN:-45}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-1800}"
 WORKFLOW="${ALERT_WORKFLOW-iOS TestFlight}" # only runs of this workflow count; empty = all
 MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
@@ -111,8 +112,14 @@ else
   fi
 fi
 
+MSG=""
 if [ "$RUNNER_STATUS" != online ] && [ "$QUEUED" -gt 0 ] && [ "$OLDEST_MIN" -ge "$MIN_QUEUED_MIN" ]; then
   MSG="$RUNNER is $RUNNER_STATUS in $REPO with $QUEUED queued run(s), oldest ${OLDEST_MIN}m"
+elif [ "$RUNNER_STATUS" = online ] && [ "$QUEUED" -gt 0 ] && [ "$OLDEST_MIN" -ge "$MAX_ONLINE_QUEUED_MIN" ]; then
+  MSG="$RUNNER is online in $REPO but queue is stalled: $QUEUED queued run(s), oldest ${OLDEST_MIN}m (>=${MAX_ONLINE_QUEUED_MIN}m; likely wedged build)"
+fi
+
+if [ -n "$MSG" ]; then
   echo "[$NOW_ISO] ALERT: $MSG" >&2
   if [ "$PREV" = FAIL ] && [ $((NOW_EPOCH - LAST_SENT)) -lt "$COOLDOWN_SEC" ]; then
     echo "[$NOW_ISO] throttled" >&2; exit 1
