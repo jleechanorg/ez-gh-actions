@@ -46,4 +46,6 @@ jobs:
           fi
           printf 'scratch workspace marker: path=%s bytes=%s sha256=%s\n' \
             "$marker" "$(wc -c < "$marker" | tr -d ' ')" "$marker_sha"
+          printf 'scratch witness hold: 15 seconds\n'
+          sleep 15
           echo "ephemeral runner proof: this job ran, the runner will now deregister"
