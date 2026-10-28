@@ -50,6 +50,35 @@ meaningless on a host whose Docker *is* the VM's Docker and it made a 4x3072 MiB
 fleet fail admission by 181 MiB. `doctor-runner` from the controlling host is the
 authoritative health check; container count alone is not proof of a working fleet.
 
+## Capacity: how many runners fit
+
+The daemon derives the ceiling itself; do not guess:
+
+```
+fleet_budget_mb = vm_total_mb - guest_reserve_mb     (total auto-detected when unset)
+max_count       = floor(fleet_budget_mb / runner_floor_mb)
+per-container   = memory_mb (clamped to budget/count), cpus = NCPU/count (floored at 0.5)
+```
+
+Measured on four cmux Cloud microVMs (2026-10-28), with `runner_floor_mb = 1400` — the
+per-job figure the 20-runner Linux fleet runs; going below it reproduces the under-floor
+clamp OOM class (bead `ez-gh-actions-yz6b`):
+
+| host | mem total | NCPU | count | per-job mem / cpus |
+|---|---|---|---|---|
+| 16 GiB | 16203 MB | 8 | 11 | 1400 MB / 0.73 |
+| 8 GiB | 8011 MB | 4 | 5 | 1400 MB / 0.8 |
+
+Rules of thumb:
+- Raising `count` only changes slot count; `runner_floor_mb` sets the ceiling, and the
+  daemon clamps `memory_mb`/`cpus` per runner to the fleet share automatically.
+- **Disk is the other ceiling.** A slot needs ~0.5-1.5 GB of workspace churn per running
+  job; when free space drops to `limits.min_free_disk_gb` admission pauses until it
+  recovers (that is protection, not a fault). A 16 GiB host with ~11 GiB free and a 6 GB
+  floor may therefore run fewer concurrent heavy jobs than its memory budget allows.
+- `dockerd` caches `NCPU` at start. A VM booted at a smaller size keeps reporting that
+  smaller count until the daemon restarts, which silently halves per-runner CPU.
+
 ## Verification that actually counts
 
 A registered runner is not a working runner. Acceptance for a new host is a real
