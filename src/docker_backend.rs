@@ -10047,11 +10047,15 @@ esac
         // the host happens to report virtualization without the operator assertion.
         let mut cfg = cfg_with(4, "ez-cloud-runner");
         cfg.limits.cgroup_parent = None;
-        assert_eq!(cfg.policy.host_containment, crate::config::HostContainment::Auto);
+        assert_eq!(
+            cfg.policy.host_containment,
+            crate::config::HostContainment::Auto
+        );
         let err = require_host_containment(&cfg)
             .expect_err("auto policy must keep requiring actions.slice containment");
         assert!(
-            err.to_string().contains("limits.cgroup_parent=actions.slice"),
+            err.to_string()
+                .contains("limits.cgroup_parent=actions.slice"),
             "expected the actions.slice requirement; got: {err:#}"
         );
     }

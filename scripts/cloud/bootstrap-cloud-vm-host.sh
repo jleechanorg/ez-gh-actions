@@ -100,9 +100,30 @@ open(path, "w").writelines(out)
 PY
 grep -E '^(count|name_prefix) =|host_containment' "$HOME/.config/ezgha/config.toml"
 
-step "7. GitHub App installation token"
-"$REPO_DIR/scripts/refresh_gh_app_token.sh" --key-path "$KEY_PATH" || true
+step "7. GitHub App installation token (mint + 45-minute refresh timer)"
+# On its own this is NOT enough: the installation token expires after 1 hour, and
+# a stale token makes every `gh` call fail with 401 "Bad credentials" so no slot
+# can register. The timer below re-mints it every 45 minutes and the daemon
+# re-reads the file on every gh call, so no restart is needed.
+SCRIPTS_DIR="$HOME/.local/libexec/ezgha"
+mkdir -p "$SCRIPTS_DIR" "$HOME/.config/systemd/user"
+install -m 0755 "$REPO_DIR/scripts/refresh_gh_app_token.sh" \
+  "$REPO_DIR/scripts/mint_gh_app_token.py" "$SCRIPTS_DIR/"
+sed "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$REPO_DIR/systemd/ezgha-token-refresh.service" \
+  > "$HOME/.config/systemd/user/ezgha-token-refresh.service"
+sed "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$REPO_DIR/systemd/ezgha-token-refresh.timer" \
+  > "$HOME/.config/systemd/user/ezgha-token-refresh.timer"
+if grep -q '@SCRIPTS_DIR@' "$HOME/.config/systemd/user/ezgha-token-refresh.service"; then
+  echo "unrendered @SCRIPTS_DIR@ placeholder in the token-refresh unit"; exit 1
+fi
+systemctl --user daemon-reload
+systemctl --user enable --now ezgha-token-refresh.timer
+systemctl --user start ezgha-token-refresh.service
+sleep 3
+systemctl --user is-active ezgha-token-refresh.timer
 ls -l "$HOME/.config/ezgha/gh_token"
+GH_TOKEN="$(cat "$HOME/.config/ezgha/gh_token")" gh api /orgs/jleechanorg/actions/runners?per_page=1 \
+  --jq '"gh app token ok, org runners: \(.total_count)"'
 
 step "8. install + start the user service"
 ezgha install-service
