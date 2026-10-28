@@ -42,8 +42,12 @@ HOST_TAG=a RUNNER_COUNT=4 NAME_PREFIX=ez-cloud-runner-a \
   REF=main ./scripts/cloud/bootstrap-cloud-vm-host.sh
 ```
 
-Sizing: budget ~1.4 GiB per runner plus host headroom — 4 runners on 16 GiB /
-8 vCPU, 2 on 8 GiB / 4 vCPU. `doctor-runner` from the controlling host is the
+Sizing: the fleet budget is `vm_total_mb - guest_reserve_mb` (auto-detected total
+when `vm_total_mb` is unset) and each runner reserves `runner_floor_mb` (3072 by
+default), so 4 runners fit a 16 GiB / 8 vCPU machine and 2 fit an 8 GiB / 4 vCPU
+machine. Set `guest_reserve_mb = 0` there: the 4 GiB Lima guest reserve is
+meaningless on a host whose Docker *is* the VM's Docker and it made a 4x3072 MiB
+fleet fail admission by 181 MiB. `doctor-runner` from the controlling host is the
 authoritative health check; container count alone is not proof of a working fleet.
 
 ## Verification that actually counts

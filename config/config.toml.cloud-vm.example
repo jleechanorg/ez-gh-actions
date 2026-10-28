@@ -17,10 +17,14 @@ target = "jleechanorg"
 [runner]
 name_prefix = "ez-cloud-runner"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64", "cmux-cloud"]
-# Size the count to the VM: 1400 MiB per runner + host headroom. 4 on a
-# 16 GiB / 8 vCPU machine, 2 on an 8 GiB / 4 vCPU machine.
+# Size the count to the VM: `runner_floor_mb` (3072 default) per runner plus host
+# headroom. 4 on a 16 GiB / 8 vCPU machine, 2 on an 8 GiB / 4 vCPU machine.
 count = 4
 image = "ezgha-runner:latest"
+# There is no Lima/Colima guest here — the daemon's Docker *is* this VM's Docker,
+# so the 4 GiB guest reserve would only shrink the fleet budget (it made a
+# 4x3072 MiB fleet fail admission on a 16 GiB machine by 181 MiB).
+guest_reserve_mb = 0
 
 [limits]
 memory_mb = 1400
