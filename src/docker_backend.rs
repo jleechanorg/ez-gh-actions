@@ -3935,40 +3935,21 @@ fn start_one_with_generate_at_slot(
                 // mount so the image's /usr/local/bin/tar wrapper
                 // (docker/tar-workspace-wrapper.sh) knows to guard tar
                 // extractions under /home/runner/_work -- the checkout path
-                // (_work/<owner>/<repo>) is NOT covered by the tmpfs shadows
-                // below and remains exposed to the same symlink-corruption
+                // (_work/<owner>/<repo>) remains on the host mount and is
+                // protected by the wrapper from the symlink-corruption
                 // bug whenever a workflow step tar-extracts an archive
                 // containing a symlink there (npm ci, release tarballs,
                 // docker save/load, etc). See
                 // tests/workspace_mount_symlink_extraction_test.sh step 4.
                 cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
-                // Shadow the three fixed actions-runner-internal subdirs with
-                // tmpfs (bead jleechan-93cf regression, 2026-07-19): tar
-                // extraction of an archive containing a symlink corrupts the
-                // symlink into a 0-byte, mode-000, unreadable file when the
-                // destination is this virtiofs-backed bind mount on
-                // Colima/Mac -- confirmed live with actions/setup-python's
-                // own tarball (which the runner extracts into _actions when
-                // downloading the action) and reproduced in
-                // tests/workspace_mount_symlink_extraction_test.sh. A plain
-                // `ln -s` on the mount works fine and extraction into the
-                // container's own overlay filesystem works fine -- only
-                // tar-extracting a real archive onto virtiofs corrupts
-                // symlink members. _actions/_temp/_tool are the runner's own
-                // action-repo and tool-download caches, always these three
-                // names, never needing host persistence for the disk-churn
-                // goal this mount exists for (checkouts/build scratch live
-                // directly under _work/<owner>/<repo>, unaffected by this).
-                // `:exec` is required -- Docker's default tmpfs mount
-                // options include `noexec`, but `_tool` stores installed
-                // tool runtimes (e.g. setup-python's Python binary) that
-                // the job then executes directly from this path. Without
-                // `:exec` those runtimes fail with rc126 "Permission
-                // denied" even though extraction itself succeeds (bead
-                // jleechan-krow, found via adversarial review of this fix).
-                for shadowed in ["_actions", "_temp", "_tool"] {
-                    cmd.args(["--tmpfs", &format!("/home/runner/_work/{shadowed}:exec")]);
-                }
+                // Keep _actions, _temp, and _tool as ordinary directories in
+                // the workspace bind. The upstream runner deletes _actions
+                // at job setup (Runner.Worker/ActionManager.cs); mounting
+                // tmpfs over that directory makes the deletion fail with
+                // EBUSY before the job can start. The image's tar wrapper
+                // guards extracts anywhere under _work, including these
+                // directories, so nested mounts are not needed for the
+                // virtiofs symlink-extraction workaround.
             }
         }
     }
@@ -10389,20 +10370,13 @@ esac
     }
 
     #[test]
-    fn workspace_mount_shadows_actions_temp_tool_with_tmpfs() {
-        // Regression test for the 2026-07-19 live incident (bead
-        // jleechan-93cf): tar extraction of an archive containing a symlink
-        // corrupts the symlink into an unreadable 0-byte mode-000 file when
-        // the destination is this virtiofs-backed workspace bind mount on
-        // Colima/Mac -- confirmed with actions/setup-python's own tarball,
-        // reproduced end-to-end in
-        // tests/workspace_mount_symlink_extraction_test.sh. GitHub's own
-        // actions-runner extracts downloaded action repos and tools into
-        // exactly these three fixed subdirectory names, so shadowing them
-        // with tmpfs keeps that extraction off virtiofs entirely while the
-        // disk-churn win this mount exists for (checkouts/build scratch,
-        // which live directly under _work/<owner>/<repo>) is unaffected.
-        let _env = TestEnv::new("workspace_mount_tmpfs_shadow");
+    fn workspace_mount_keeps_runner_internal_directories_removable() {
+        // Regression test for the workspace mount contract (bead
+        // jleechan-5tvb): the image tar wrapper guards extracts into all
+        // _work directories. Keep runner internals as ordinary workspace
+        // children because Actions/ActionManager deletes _actions at job
+        // setup; a nested mount there makes that deletion fail with EBUSY.
+        let _env = TestEnv::new("workspace_mount_internal_dirs_removable");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(1, "ez-org-runner");
         let temp_dir =
@@ -10425,23 +10399,21 @@ esac
             .lines()
             .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
-        for shadowed in ["_actions", "_temp", "_tool"] {
-            let expected = format!("--tmpfs /home/runner/_work/{shadowed}:exec");
+        for runner_dir in ["_actions", "_temp", "_tool"] {
+            let unexpected = format!("--tmpfs /home/runner/_work/{runner_dir}");
             assert!(
-                run_line.contains(&expected),
-                "run args should tmpfs-shadow {shadowed} with executable runtimes enabled; \
-                 got: {run_line}"
+                !run_line.contains(&unexpected),
+                "runner-owned {runner_dir} must remain deletable during job setup; \
+                 a nested mount causes EBUSY: {run_line}"
             );
         }
     }
 
     #[test]
     fn workspace_mount_sets_virtiofs_env_for_tar_wrapper() {
-        // Regression test for the WIDENED understanding of bead jleechan-93cf
-        // (2026-07-19 follow-up): the tmpfs-shadow fix above only protects
-        // the three fixed runner-internal cache dirs. Real job checkouts
-        // under _work/<owner>/<repo> -- the dominant disk-churn win this
-        // mount exists for -- are NOT shadowed and remain exposed to the
+        // Regression test for the complete workspace guard (bead
+        // jleechan-5tvb): real job checkouts under _work/<owner>/<repo> --
+        // the dominant disk-churn win this mount exists for -- remain exposed to the
         // same virtiofs symlink-extraction corruption whenever a workflow
         // step tar-extracts an archive containing a symlink there (npm ci,
         // downloaded release tarballs, docker save/load, etc; confirmed live

@@ -18,7 +18,7 @@
 # (all of which have symlinks somewhere in their extracted tree) at a 41%
 # (13/32) Mac job failure rate before this test existed.
 #
-# WIDENED understanding (2026-07-19/20 follow-up): the corruption is not
+# Follow-up understanding (2026-07-19/20): the corruption is not
 # limited to the three GitHub-Actions-runner-internal cache dirs. ANY
 # tar extraction of an archive containing a symlink onto this mount is
 # affected, including under the real checkout path
@@ -26,30 +26,23 @@
 # downloaded release tarballs, `docker save`/`load`, and git submodule
 # tarballs. Step 4 below reproduces this specifically and proves the fix.
 #
-# Two-part fix:
-#  1. The daemon shadows the three fixed GitHub-Actions-runner-internal
-#     subdirectories (_work/_actions, _work/_temp, _work/_tool) with tmpfs
-#     mounts layered inside the workspace bind, so the runner's own
-#     action-repo/tool-cache extraction never touches virtiofs.
-#  2. A `/usr/local/bin/tar` wrapper baked into the runner image
-#     (docker/tar-workspace-wrapper.sh) covers the rest of the mount: when
-#     the daemon flags a container with EZGHA_VIRTIOFS_WORKSPACE=1 (see
-#     docker_backend.rs), any tar EXTRACT destined for /home/runner/_work
-#     is staged on the container's own tmpfs/overlay /tmp first, then
-#     `cp -a` (safe syscalls) into the real destination. This preserves
-#     the disk-churn-reduction goal the mount exists for (checkouts/build
-#     scratch never touch tmpfs) while fixing symlink corruption
-#     everywhere tar is used on the mount, not just the three cache dirs.
+# Workspace fix: a `/usr/local/bin/tar` wrapper baked into the runner image
+# (docker/tar-workspace-wrapper.sh) stages every extraction under _work on
+# the container overlay before copying it to virtiofs. The daemon flags the
+# workspace mount with EZGHA_VIRTIOFS_WORKSPACE=1. Keep _actions, _temp,
+# and _tool as ordinary directories within _work: Runner.Worker deletes
+# _actions at job setup, and deleting a nested mount there fails with EBUSY.
 #
 # Usage: bash tests/workspace_mount_symlink_extraction_test.sh
 #
 # Requires: docker reachable (DOCKER_HOST must point at the real daemon
 # socket on Colima/Mac hosts), ezgha-runner:latest image present (rebuild
-# with `DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t
-# ezgha-runner:latest .` after any change to docker/tar-workspace-wrapper.sh
+# with `DOCKER_BUILDKIT=0 docker build --file="$repo_root/Dockerfile.runner" -t
+# ezgha-runner:latest "$repo_root"` after any change to docker/tar-workspace-wrapper.sh
 # so step 4 exercises the current wrapper, not a stale image).
 
 set -u
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 PASS=0
 FAIL=0
@@ -65,7 +58,7 @@ fi
 
 IMAGE="${EZGHA_TEST_IMAGE:-ezgha-runner:latest}"
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-  echo "SKIP: ${IMAGE} not present locally -- build it first (docker build -f Dockerfile.runner -t ezgha-runner:latest .)"
+  echo "SKIP: ${IMAGE} not present locally -- build it first (docker build --file=\"${repo_root}/Dockerfile.runner\" -t ezgha-runner:latest \"${repo_root}\")"
   exit 0
 fi
 
@@ -125,11 +118,11 @@ fi
 echo "=== 2. Diagnostic: raw virtiofs bind mount ROOT still corrupts symlinks (informational, NOT a pass/fail gate) ==="
 # This is the underlying Colima/vz virtiofs limitation itself, at the mount
 # root -- the fix below does not (and does not need to) touch this, since
-# job checkouts are git-based, not tar-with-symlinks, and only the three
-# fixed runner-internal cache dirs are shadowed. Kept here purely so a
+# the tar wrapper only changes extraction calls when its workspace flag is
+# set. Kept here purely so a
 # future reader can see the raw bug still exists upstream, unfixed at the
-# platform level, and confirm the fix works by SCOPE (shadowed subdirs
-# only), not by accident (bug silently going away everywhere).
+# platform level, and confirm the fix works by the wrapper flag rather than
+# by accident (bug silently going away everywhere).
 HOST_WORKSPACE="${WORKDIR}/host-workspace"
 mkdir -p "${HOST_WORKSPACE}"
 MOUNT_OUT=$(docker run --rm \
@@ -142,45 +135,56 @@ MOUNT_OUT=$(docker run --rm \
   ' 2>&1)
 echo "${MOUNT_OUT}" | sed 's/^/    /'
 if printf '%s' "${MOUNT_OUT}" | grep -q "Permission denied"; then
-  info "confirmed: raw virtiofs bind mount root still corrupts symlink extraction (expected -- unfixed, out of scope; the fix shadows only _actions/_temp/_tool, tested in step 3)"
+  info "confirmed: raw virtiofs bind mount root still corrupts symlink extraction (expected without the tar-wrapper flag)"
 elif printf '%s' "${MOUNT_OUT}" | grep -q "real content"; then
-  info "raw mount root extraction succeeded -- underlying virtiofs bug may have been fixed upstream (Colima/vz update?); re-evaluate whether the tmpfs shadow is still needed"
+  info "raw mount root extraction succeeded -- underlying virtiofs bug may have been fixed upstream (Colima/vz update?)"
 else
   bad "unexpected output extracting into the workspace bind mount root: ${MOUNT_OUT}"
 fi
 
-echo "=== 3. Fix verification: all runner-internal tmpfs shadows support extraction and execution ==="
+echo "=== 3. Fix verification: runner-internal directories can be cleared and used on the workspace mount ==="
+for runner_dir in _actions _temp _tool; do
+  mkdir -p "${HOST_WORKSPACE}/${runner_dir}"
+  echo "stale runner data" > "${HOST_WORKSPACE}/${runner_dir}/runner-setup-stale"
+done
 FIXED_OUT=$(docker run --rm \
+  -e EZGHA_VIRTIOFS_WORKSPACE=1 \
   -v "${WORKDIR}/repro.tar.gz:/tmp/repro.tar.gz:ro" \
   -v "${HOST_WORKSPACE}:/home/runner/_work" \
-  --tmpfs /home/runner/_work/_actions:exec \
-  --tmpfs /home/runner/_work/_temp:exec \
-  --tmpfs /home/runner/_work/_tool:exec \
   "${IMAGE}" sh -c '
-    mkdir -p /home/runner/_work/_actions/cache-test && cd /home/runner/_work/_actions/cache-test
-    tar -xzf /tmp/repro.tar.gz 2>&1
-    echo "---read---"
-    cat pkg/data/inner/target.txt 2>&1
-    for shadowed in _actions _temp _tool; do
-      probe="/home/runner/_work/${shadowed}/ezgha-exec-probe"
-      printf "#!/bin/sh\necho exec-%s-ok\n" "${shadowed}" > "${probe}"
+    set -u
+    for runner_dir in _actions _temp _tool; do
+      target="/home/runner/_work/${runner_dir}"
+      delete_rc=0
+      rm -rf "${target}" || delete_rc=$?
+      echo "delete-${runner_dir}-rc=${delete_rc}"
+      mkdir -p "${target}"
+      probe="${target}/ezgha-exec-probe"
+      printf "#!/bin/sh\necho exec-%s-ok\n" "${runner_dir}" > "${probe}"
       chmod 0755 "${probe}"
       "${probe}"
     done
+    mkdir -p /home/runner/_work/_actions/cache-test
+    cd /home/runner/_work/_actions/cache-test
+    tar -xzf /tmp/repro.tar.gz 2>&1
+    echo "---read---"
+    cat pkg/data/inner/target.txt 2>&1
   ' 2>&1)
 echo "${FIXED_OUT}" | sed 's/^/    /'
-if printf '%s' "${FIXED_OUT}" | grep -q "real content" \
+if printf '%s' "${FIXED_OUT}" | grep -q "delete-_actions-rc=0" \
+  && printf '%s' "${FIXED_OUT}" | grep -q "delete-_temp-rc=0" \
+  && printf '%s' "${FIXED_OUT}" | grep -q "delete-_tool-rc=0" \
+  && printf '%s' "${FIXED_OUT}" | grep -q "real content" \
   && printf '%s' "${FIXED_OUT}" | grep -q "exec-_actions-ok" \
   && printf '%s' "${FIXED_OUT}" | grep -q "exec-_temp-ok" \
   && printf '%s' "${FIXED_OUT}" | grep -q "exec-_tool-ok"; then
-  ok "tmpfs-shadowed _actions/_temp/_tool: extraction and executable probes succeeded"
+  ok "runner setup can delete/recreate _actions/_temp/_tool and guarded extraction succeeds"
 else
-  bad "tmpfs-shadowed extraction/execution unexpectedly failed: ${FIXED_OUT}"
+  bad "runner internal directory cleanup or guarded extraction failed: ${FIXED_OUT}"
 fi
 
 echo "=== 4. Fix verification: checkout-path (_work/<owner>/<repo>) extraction is now guarded by the tar wrapper ==="
-# This is the WIDENED scope this test now covers: real job checkouts, not
-# just the three tmpfs-shadowed cache dirs from step 3. First prove the
+# This is the scope this test covers: real job checkouts. First prove the
 # raw exposure still exists without the flag (RED), then prove the
 # wrapper fixes it with the daemon's flag set (GREEN) -- exactly the
 # EZGHA_VIRTIOFS_WORKSPACE=1 env var docker_backend.rs sets whenever
