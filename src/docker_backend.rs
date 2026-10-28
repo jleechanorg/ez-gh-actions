@@ -3766,6 +3766,42 @@ fn admission_preflight_error(error: anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(AdmissionPreflightError(format!("{error:#}")))
 }
 
+fn reset_runner_workspace(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove stale runner workspace at {}", path.display()));
+        }
+    }
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("create runner workspace at {}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect runner workspace at {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!(
+            "runner workspace path is not a real directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_runner_workspace_group(path: &Path) -> Result<u32> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("read runner workspace metadata at {}", path.display()))?;
+    let group_id = metadata.gid();
+    // Restrict access to the daemon owner and the runner's matching
+    // supplementary group. Setgid keeps new host files in the workspace group.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2770))
+        .with_context(|| format!("set runner workspace permissions at {}", path.display()))?;
+    Ok(group_id)
+}
+
 fn start_one_at_slot(cfg: &Config, backend: Backend, slot: u32) -> Result<(String, String)> {
     #[cfg(test)]
     {
@@ -3925,31 +3961,58 @@ fn start_one_with_generate_at_slot(
         let workspace_root = std::path::Path::new(workspace_root);
         if workspace_root.is_dir() {
             let runner_workspace = workspace_root.join(&runner_name);
-            let _ = std::fs::remove_dir_all(&runner_workspace);
-            if std::fs::create_dir_all(&runner_workspace).is_ok() {
-                cmd.args([
-                    "-v",
-                    &format!("{}:/home/runner/_work", runner_workspace.to_string_lossy()),
-                ]);
-                // Flag this container as having the virtiofs-backed workspace
-                // mount so the image's /usr/local/bin/tar wrapper
-                // (docker/tar-workspace-wrapper.sh) knows to guard tar
-                // extractions under /home/runner/_work -- the checkout path
-                // (_work/<owner>/<repo>) remains on the host mount and is
-                // protected by the wrapper from the symlink-corruption
-                // bug whenever a workflow step tar-extracts an archive
-                // containing a symlink there (npm ci, release tarballs,
-                // docker save/load, etc). See
-                // tests/workspace_mount_symlink_extraction_test.sh step 4.
-                cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
-                // Keep _actions, _temp, and _tool as ordinary directories in
-                // the workspace bind. The upstream runner deletes _actions
-                // at job setup (Runner.Worker/ActionManager.cs); mounting
-                // tmpfs over that directory makes the deletion fail with
-                // EBUSY before the job can start. The image's tar wrapper
-                // guards extracts anywhere under _work, including these
-                // directories, so nested mounts are not needed for the
-                // virtiofs symlink-extraction workaround.
+            if let Err(error) = reset_runner_workspace(&runner_workspace) {
+                eprintln!(
+                    "warning: unable to clear runner workspace at {}; using the container-local workspace: {error:#}",
+                    runner_workspace.display()
+                );
+            } else {
+                #[cfg(target_os = "linux")]
+                let workspace_group_id = match prepare_runner_workspace_group(&runner_workspace) {
+                    Ok(group_id) => Some(group_id),
+                    Err(error) => {
+                        eprintln!(
+                            "warning: unable to prepare runner workspace group access at {}: {error:#}; using the container-local workspace",
+                            runner_workspace.display()
+                        );
+                        None
+                    }
+                };
+                // Linux uses a supplementary group for the bind-mounted host
+                // workspace. Keep the existing mount behavior elsewhere.
+                #[cfg(not(target_os = "linux"))]
+                let workspace_group_id = Some(0_u32);
+
+                // The workspace is an optional disk-churn optimization. If its
+                // access cannot be prepared safely, leave it unmounted so the
+                // runner can use its ephemeral container workspace.
+                if let Some(_workspace_group_id) = workspace_group_id {
+                    #[cfg(target_os = "linux")]
+                    cmd.args(["--group-add", &_workspace_group_id.to_string()]);
+                    cmd.args([
+                        "-v",
+                        &format!("{}:/home/runner/_work", runner_workspace.to_string_lossy()),
+                    ]);
+                    // Flag this container as having the virtiofs-backed workspace
+                    // mount so the image's /usr/local/bin/tar wrapper
+                    // (docker/tar-workspace-wrapper.sh) knows to guard tar
+                    // extractions under /home/runner/_work -- the checkout path
+                    // (_work/<owner>/<repo>) remains on the host mount and is
+                    // protected by the wrapper from the symlink-corruption
+                    // bug whenever a workflow step tar-extracts an archive
+                    // containing a symlink there (npm ci, release tarballs,
+                    // docker save/load, etc). See
+                    // tests/workspace_mount_symlink_extraction_test.sh step 4.
+                    cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
+                    // Keep _actions, _temp, and _tool as ordinary directories in
+                    // the workspace bind. The upstream runner deletes _actions
+                    // at job setup (Runner.Worker/ActionManager.cs); mounting
+                    // tmpfs over that directory makes the deletion fail with
+                    // EBUSY before the job can start. The image's tar wrapper
+                    // guards extracts anywhere under _work, including these
+                    // directories, so nested mounts are not needed for the
+                    // virtiofs symlink-extraction workaround.
+                }
             }
         }
     }
@@ -10367,6 +10430,157 @@ esac
             expected_runner_workspace.is_dir(),
             "the per-runner workspace subdir should have been created on the host"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_mount_grants_runner_the_host_workspace_group() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _env = TestEnv::new("workspace_mount_group_access");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        let temp_dir =
+            env::temp_dir().join(format!("ezgha-workspace-group-test-{}", std::process::id()));
+        let workspace_root = temp_dir.join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 3336))
+        })
+        .expect("start_one should succeed");
+
+        let runner_workspace = workspace_root.join("ez-org-runner-1");
+        let metadata = std::fs::metadata(&runner_workspace).unwrap();
+        assert_eq!(
+            metadata.mode() & 0o7777,
+            0o2770,
+            "the isolated workspace must be group-writable, setgid, and closed to others"
+        );
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains(&format!("--group-add {}", metadata.gid())),
+            "the runner must join the host workspace group to write through the bind mount; got: {run_line}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workspace_mount_is_skipped_when_stale_workspace_cannot_be_removed() {
+        let _env = TestEnv::new("workspace_mount_unremovable_stale_data");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(1, "ez-org-runner");
+        let temp_dir = env::temp_dir().join(format!(
+            "ezgha-workspace-stale-permission-test-{}",
+            std::process::id()
+        ));
+        let workspace_root = temp_dir.join("workspace-root");
+        let runner_workspace = workspace_root.join("ez-org-runner-1");
+        let blocked = runner_workspace.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("stale-job-data"), b"previous job").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Confirm the real host filesystem refuses to remove this workspace;
+        // then restore it and rebuild the same failure condition for the code path.
+        assert!(
+            std::fs::remove_dir_all(&runner_workspace).is_err(),
+            "the restrictive nested directory must make cleanup fail"
+        );
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&runner_workspace).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("stale-job-data"), b"previous job").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        cfg.runner.workspace_host_path = Some(workspace_root.to_string_lossy().into_owned());
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 3337))
+        })
+        .expect("workspace cleanup failure should not prevent runner startup");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|line| line.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        let mounted = run_line.contains("/home/runner/_work");
+
+        // Restore the nested directory before checking its preserved contents or cleanup.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let stale_data_preserved = blocked.join("stale-job-data").exists();
+        std::fs::remove_dir_all(&runner_workspace).unwrap();
+
+        assert!(
+            stale_data_preserved && !mounted,
+            "stale workspace data must not be mounted: mounted={mounted}, stale_data_preserved={stale_data_preserved}, args={run_line}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires Docker and the configured ezgha runner image"]
+    fn workspace_mount_is_writable_by_runner_user() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _env = TestEnv::new("workspace_bind_mount_permission_docker");
+        let test_root = _env.path.parent().unwrap().join("runner-workspace");
+        std::fs::create_dir_all(&test_root).unwrap();
+        let group_id = prepare_runner_workspace_group(&test_root).unwrap();
+        let workspace = format!("{}:/home/runner/_work", test_root.display());
+        let group_arg = group_id.to_string();
+        let mut command = docker_cmd();
+        command.args([
+            "run",
+            "--rm",
+            "--pull=never",
+            "--group-add",
+            &group_arg,
+            "-v",
+            &workspace,
+            "--entrypoint",
+            "/bin/sh",
+            "ezgha-runner:latest",
+            "-c",
+            "id && printf runner-can-write > /home/runner/_work/probe.txt",
+        ]);
+        let output = run_docker(command, "workspace mount permissions integration")
+            .expect("Docker should start the configured runner image with the workspace mount");
+        assert!(
+            output.status.success(),
+            "the runner identity must write through the actual host bind mount: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("uid=1001("),
+            "the probe must run as the configured runner UID: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read(test_root.join("probe.txt")).unwrap(),
+            b"runner-can-write"
+        );
+        let created = std::fs::metadata(test_root.join("probe.txt")).unwrap();
+        assert_eq!(
+            created.gid(),
+            group_id,
+            "new files inherit the workspace group"
+        );
+        std::fs::remove_file(test_root.join("probe.txt")).unwrap();
+        std::fs::remove_dir(&test_root).unwrap();
     }
 
     #[test]
