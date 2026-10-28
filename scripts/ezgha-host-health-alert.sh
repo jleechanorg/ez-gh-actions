@@ -121,23 +121,25 @@ if [ "$ENSURE_POLICIES" -eq 1 ]; then
     exit 3
   fi
   GCP_ARGS=(--project="$GCP_PROJECT" --account="$GCP_ACCOUNT")
-  ensure_policy() { # name filter-file-style doc subject
+  ensure_policy() { # name cause doc subject
     local name="$1" cause="$2" doc="$3" subject="$4"
     local cond_filter="logName=\"projects/${GCP_PROJECT}/logs/${LOG_NAME}\" AND severity>=ERROR AND jsonPayload.cause=\"${cause}\""
     local policy_file; policy_file="$(mktemp)"
-    cat > "$policy_file" <<POLICY
-{
-  "displayName": "${name}",
-  "documentation": {"content": "${doc}", "mimeType": "text/markdown", "subject": "${subject}"},
-  "combiner": "OR",
-  "severity": "CRITICAL",
-  "conditions": [{"displayName": "ezgha ${cause} failure entry", "conditionMatchedLog": {"filter": "${cond_filter}"}}],
-  "alertStrategy": {"autoClose": "1800s", "notificationRateLimit": {"period": "300s"}},
-  "notificationChannels": ${ALERT_CHANNELS},
-  "enabled": true,
-  "userLabels": {"component": "ezgha-runners", "severity": "critical", "cause": "${cause}"}
-}
-POLICY
+    jq -n \
+      --arg name "$name" --arg doc "$doc" --arg subject "$subject" \
+      --arg filter "$cond_filter" --arg cause "$cause" \
+      --argjson channels "$ALERT_CHANNELS" \
+      '{
+        displayName: $name,
+        documentation: {content: $doc, mimeType: "text/markdown", subject: $subject},
+        combiner: "OR",
+        severity: "CRITICAL",
+        conditions: [{displayName: ("ezgha " + $cause + " failure entry"), conditionMatchedLog: {filter: $filter}}],
+        alertStrategy: {autoClose: "1800s", notificationRateLimit: {period: "300s"}},
+        notificationChannels: $channels,
+        enabled: true,
+        userLabels: {component: "ezgha-runners", severity: "critical", cause: $cause}
+      }' > "$policy_file"
     if [ "$DRY_RUN" -eq 1 ]; then
       echo "[$NOW_ISO] [dry-run] would ensure policy '$name' (filter: $cond_filter)"
       rm -f "$policy_file"; return 0
