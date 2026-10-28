@@ -570,6 +570,25 @@ pub struct Policy {
     /// Refuse to start when the best available backend is weaker than this.
     /// "vm" > "container". Fail closed instead of silently degrading.
     pub minimum_isolation: IsolationLevel,
+    /// How this host's *native* Docker is contained. `auto` (default) keeps the
+    /// existing rule: a daemon whose Docker shares the bare-metal host kernel
+    /// must run runners beneath `limits.cgroup_parent = "actions.slice"`.
+    /// `vm` declares that the Docker host is itself a VM (a cloud microVM), so
+    /// the VM — not a cgroup slice — is the isolation boundary. It is honored
+    /// only when the CPU actually reports virtualization; on a bare-metal host
+    /// it is a fail-closed startup refusal, never a waiver.
+    #[serde(default)]
+    pub host_containment: HostContainment,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HostContainment {
+    /// Native bare-metal Docker needs the `actions.slice` host boundary.
+    #[default]
+    Auto,
+    /// The native Docker host is itself a VM; the VM is the boundary.
+    Vm,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -667,6 +686,7 @@ impl Config {
             },
             policy: Policy {
                 minimum_isolation: IsolationLevel::Container,
+                host_containment: HostContainment::Auto,
             },
             failure_ladder: FailureLadderConfig::default(),
             alert: AlertConfig {

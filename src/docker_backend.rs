@@ -3083,6 +3083,14 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
         if host_containment_daemon_in_vm() {
             return Ok(());
         }
+        if cfg.policy.host_containment == crate::config::HostContainment::Vm {
+            if host_reports_virtualization() {
+                return Ok(());
+            }
+            bail!(
+                "policy.host_containment = \"vm\" requires a virtualized host, but this kernel reports no hypervisor; run the daemon inside the VM or leave host_containment at its default (actions.slice containment)"
+            );
+        }
         if cfg.policy.minimum_isolation != crate::config::IsolationLevel::Container {
             bail!("host containment requires policy.minimum_isolation=container");
         }
@@ -3122,15 +3130,16 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
 }
 
 /// Require that a freshly created container PID is located beneath /actions.slice.
-pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
+pub fn require_container_actions_ancestry(_cfg: &Config, _container_id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let container_id = _container_id;
         // A canonical Docker endpoint backed by a VM reports guest PIDs that
         // do not exist in this host's /proc. The host cgroup assertion is only
-        // meaningful for the native HostDocker profile; VM admission keeps its
-        // existing behavior without claiming host-level ancestry verification.
-        if host_containment_daemon_in_vm() {
+        // meaningful for the native HostDocker profile; VM admission (Colima or
+        // an explicitly declared microVM host) keeps its existing behavior
+        // without claiming host-level ancestry verification.
+        if daemon_is_vm_contained(_cfg) {
             return Ok(());
         }
         #[cfg(test)]
@@ -3262,7 +3271,7 @@ impl PressureSource {
 fn admission_pressure_source(cfg: &Config) -> PressureSource {
     #[cfg(target_os = "linux")]
     if let Some(parent) = cfg.limits.cgroup_parent.as_deref() {
-        if !is_macos_host() && !host_containment_daemon_in_vm() {
+        if !is_macos_host() && !daemon_is_vm_contained(cfg) {
             return PressureSource::runner_cgroup(&host_actions_cgroup_root().join(parent));
         }
     }
@@ -3994,7 +4003,7 @@ fn start_one_with_generate_at_slot(
         );
     }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if let Err(err) = require_container_actions_ancestry(&container_id) {
+    if let Err(err) = require_container_actions_ancestry(cfg, &container_id) {
         let mut rm_cmd = docker_cmd();
         rm_cmd.args(["rm", "-f", &runner_name]);
         let _ = run_docker(rm_cmd, "post-start ancestry compensation rm -f");
@@ -4910,7 +4919,7 @@ fn admission_batch(cfg: &Config, missing: u32) -> Result<AdmissionBatch> {
         {
             return Ok(batch);
         }
-        if missing == 0 || is_macos_host() || host_containment_daemon_in_vm() {
+        if missing == 0 || is_macos_host() || daemon_is_vm_contained(cfg) {
             return Ok(batch);
         }
         use std::os::fd::AsRawFd;
@@ -10280,7 +10289,7 @@ esac
         *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
         *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = Some(false);
 
-        require_container_actions_ancestry("guest-container")
+        require_container_actions_ancestry(&cfg, "guest-container")
             .expect("guest PID ancestry must not be read through the host /proc");
     }
 
