@@ -39,7 +39,7 @@ EOF
 - Results saved to `/tmp/repo/branch/smoke_tests/`
 EOF
 }
-run() { python3 "$INSTALLER" --root "$FIX" "$@" >"$W/out" 2>"$W/err"; echo $?; }
+run() { python3 "$INSTALLER" --root "$FIX" --scratch-git "${SCRATCH_GIT:-no}" "$@" >"$W/out" 2>"$W/err"; echo $?; }
 
 # ── 1. Dry-run reports the plan and writes nothing ─────────────────────────
 fixture_clean
@@ -81,15 +81,27 @@ grep -q 'SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh clonef
 grep -q "Clone Repository to the scratch root" "$FIX/skills/clonefix/SKILL.md" || fail "legacy heading must be rewritten"
 grep -q "/tmp/{repo_name}_clonefix_proof" "$FIX/skills/clonefix/SKILL.md" && fail "legacy proof token must be gone"
 grep -q "inside the resolved scratch root" "$FIX/skills/clean/SKILL.md" || fail "clean-room description must be rewritten"
-grep -q ".gitprobe" "$FIX/skills/clonefix/SKILL.md" || fail "git-based producers must probe the scratch root (fuse2fs rejects 0444 loose-object create)"
-grep -q ".gitprobe" "$FIX/skills/clean/SKILL.md" || fail "clean-room must probe the scratch root too"
+grep -qF '${TMPDIR:-/tmp}' "$FIX/skills/clonefix/SKILL.md" || fail "on a git-incapable scratch volume, clonefix must fall back to ${TMPDIR:-/tmp}"
+grep -qF '${TMPDIR:-/tmp}' "$FIX/skills/clean/SKILL.md" || fail "clean-room must fall back too on a git-incapable volume"
+grep -q "jleechan-tshq" "$FIX/skills/clonefix/SKILL.md" || fail "the fallback must cite the fuse2fs bead"
 grep -q 'scratch-dir.sh smoke-tests' "$FIX/skills/testing-infrastructure/SKILL.md" || fail "smoke-test results path must resolve scratch"
 bash --version >/dev/null && bash -n "$FIX/scripts/testerc.sh"
 pass "apply rewrites producers to the scratch resolver with a /tmp fallback"
 
+# ── 3b. A git-capable scratch volume keeps clone producers on scratch ─────
+fixture_clean
+SCRATCH_GIT=yes run --apply >/dev/null
+grep -q 'scratch-dir.sh clonefix' "$FIX/skills/clonefix/SKILL.md" || fail "git-capable host must keep clonefix on scratch"
+grep -qF '${TMPDIR:-/tmp}' "$FIX/skills/clonefix/SKILL.md" && fail "git-capable host must not fall back to /tmp"
+grep -q 'not-needed' "$W/out" || fail "verdict must be reported in the run output"
+pass "git-capable volume keeps clone producers on scratch"
+
 # ── 4. Re-running is idempotent ───────────────────────────────────────────
 sum_before=$(shasum "$FIX/scripts/testerc.sh" "$FIX/skills/clonefix/SKILL.md" "$FIX/skills/clean/SKILL.md" "$FIX/skills/testing-infrastructure/SKILL.md" | awk '{print $1}' | tr '\n' ' ')
-rc=$(run --apply)
+fixture_clean
+SCRATCH_GIT=no run --apply >/dev/null   # build the git-incapable end state once
+sum_before=$(shasum "$FIX/scripts/testerc.sh" "$FIX/skills/clonefix/SKILL.md" "$FIX/skills/clean/SKILL.md" "$FIX/skills/testing-infrastructure/SKILL.md" | awk '{print $1}' | tr '\n' ' ')
+rc=$(SCRATCH_GIT=no run --apply)
 [ "$rc" = "0" ] || fail "second apply must exit 0 (got $rc)"
 grep -q "already-migrated" "$W/out" || fail "second apply must report already-migrated"
 sum_after=$(shasum "$FIX/scripts/testerc.sh" "$FIX/skills/clonefix/SKILL.md" "$FIX/skills/clean/SKILL.md" "$FIX/skills/testing-infrastructure/SKILL.md" | awk '{print $1}' | tr '\n' ' ')

@@ -44,7 +44,10 @@ import argparse
 import json
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 
 RESOLVER = "~/.claude/skills/scratch-space/scripts/scratch-dir.sh"
 
@@ -222,59 +225,81 @@ PATTERNS: list[dict] = [
         "new": f'export SCRATCH="$({RESOLVER} exportcommands 2>/dev/null || echo /tmp)"\n'
                'export REPO_DIR="$SCRATCH/claude_commands_repo_fresh"',
     },
-    # ── second generation: probe scratch before trusting it for git work ────
-    # fuse2fs (the Linux scratch mount) rejects `open(O_CREAT|O_EXCL|O_RDWR, 0444)`,
-    # which is exactly how git creates a loose object, so git clone/add/commit fail
-    # with EACCES there while plain writes succeed. Verified 2026-10-28 on
-    # jeff-ubuntu `~/.local/share/disk-magician/volumes/scratch.ext4` (fuse2fs) and
-    # reproduced at syscall level: mode 0444 -> EACCES, mode 0644 -> OK. Bead
-    # jleechan-tshq tracks the mount defect; these guards keep lanes working meanwhile.
+    # ── second generation: git-based producers when the scratch volume cannot host git ─
+    # The Linux scratch volume is fuse2fs, which rejects `open(O_CREAT|O_EXCL|O_RDWR, 0444)` -
+    # exactly how git creates a loose object - so git clone/add/commit fail with EACCES there
+    # while plain writes succeed (bead jleechan-tshq). The installer probes the host once
+    # (see --scratch-git) and, when the probe fails, leaves these producers on ${TMPDIR:-/tmp}
+    # rather than pointing a lane at a filesystem that cannot hold a repository.
     {
         "file": "skills/clonefix/SKILL.md",
         "expect": "exact",
         "absent_is_ok": True,
+        "git_incapable_only": True,
         "old": '>    SCRATCH="$(' + RESOLVER + ' clonefix 2>/dev/null || echo /tmp)"\n'
                '>    CLONE_DIR="$(mktemp -d "${SCRATCH}/${repo_name}_clonefix_XXXXXX")"',
-        "new": '>    SCRATCH="$(' + RESOLVER + ' clonefix 2>/dev/null)"\n'
-               '>    # A fuse2fs scratch volume (Linux) rejects git\'s loose-object create\n'
-               '>    # (open O_CREAT|O_EXCL|O_RDWR mode 0444 -> EACCES), so probe it first.\n'
-               '>    if [ -z "$SCRATCH" ] || ! { _p="$SCRATCH/.gitprobe.$$"; mkdir -p "$_p" && : > "$_p/f" && git -C "$_p" init -q . && git -C "$_p" add f && rm -rf "$_p"; } 2>/dev/null; then\n'
-               '>      SCRATCH="${TMPDIR:-/tmp}"\n'
-               '>    fi\n'
+        "new": '>    # This host scratch volume cannot host a git repository (fuse2fs rejects the\n'
+               '>    # 0444 loose-object create; bead jleechan-tshq), so clone into system temp.\n'
+               '>    SCRATCH="${TMPDIR:-/tmp}"\n'
                '>    CLONE_DIR="$(mktemp -d "${SCRATCH}/${repo_name}_clonefix_XXXXXX")"',
     },
     {
         "file": "skills/clonefix/SKILL.md",
         "expect": "exact",
         "absent_is_ok": True,
+        "git_incapable_only": True,
         "old": '1. **Create unique clone directory**: `"$(' + RESOLVER + ' clonefix)/{repo_name}_clonefix_{timestamp}"`',
-        "new": '1. **Create unique clone directory** (probe the root first: on Linux the fuse2fs scratch volume rejects git\'s 0444 loose-object create, so fall back to `${TMPDIR:-/tmp}`):\n'
-               '   ```bash\n'
-               '   SCRATCH="$(' + RESOLVER + ' clonefix 2>/dev/null)"\n'
-               '   if [ -z "$SCRATCH" ] || ! { _p="$SCRATCH/.gitprobe.$$"; mkdir -p "$_p" && : > "$_p/f" && git -C "$_p" init -q . && git -C "$_p" add f && rm -rf "$_p"; } 2>/dev/null; then\n'
-               '     SCRATCH="${TMPDIR:-/tmp}"\n'
-               '   fi\n'
-               '   CLONE_DIR="$SCRATCH/{repo_name}_clonefix_{timestamp}"\n'
-               '   ```',
+        "new": '1. **Create unique clone directory**: `"${TMPDIR:-/tmp}/{repo_name}_clonefix_{timestamp}"` - this host scratch volume cannot host a git repository (fuse2fs rejects the 0444 loose-object create; bead jleechan-tshq).',
     },
     {
         "file": "skills/clean/SKILL.md",
         "expect": "exact",
         "absent_is_ok": True,
+        "git_incapable_only": True,
         "old": '2. **Setup the Clean Room**: Create a fresh directory under the scratch root: `"$(' + RESOLVER + ' clean-room)/repro-cb-<issue_id>-<timestamp>"`.',
-        "new": '2. **Setup the Clean Room**: resolve the scratch root, probe it, then create the clean room (on Linux the fuse2fs scratch volume rejects git\'s 0444 loose-object create, so fall back to `${TMPDIR:-/tmp}` rather than breaking the repro):\n'
-               '   ```bash\n'
-               '   SCRATCH="$(' + RESOLVER + ' clean-room 2>/dev/null)"\n'
-               '   if [ -z "$SCRATCH" ] || ! { _p="$SCRATCH/.gitprobe.$$"; mkdir -p "$_p" && : > "$_p/f" && git -C "$_p" init -q . && git -C "$_p" add f && rm -rf "$_p"; } 2>/dev/null; then\n'
-               '     SCRATCH="${TMPDIR:-/tmp}"\n'
-               '   fi\n'
-               '   CLEAN_ROOM="$SCRATCH/repro-cb-<issue_id>-<timestamp>"\n'
-               '   ```',
+        "new": '2. **Setup the Clean Room**: Create a fresh directory `"${TMPDIR:-/tmp}/repro-cb-<issue_id>-<timestamp>"` - this host scratch volume cannot host a git repository (fuse2fs rejects the 0444 loose-object create; bead jleechan-tshq).',
     },
 ]
 
 STATUS_ORDER = ["migrated", "would-migrate", "already-migrated", "missing",
-                "not-applicable", "drift", "ambiguous"]
+                "not-applicable", "not-needed", "drift", "ambiguous"]
+
+
+def probe_scratch_git_capable() -> tuple[bool, str, str]:
+    """Can this host's scratch volume host a git repository?
+
+    Returns (capable, root, detail). The Linux scratch volume is fuse2fs, which rejects
+    `open(O_CREAT|O_EXCL|O_RDWR, 0444)` — the exact call git makes when creating a loose
+    object — so `git init` succeeds there but `git add` fails with EACCES (bead
+    jleechan-tshq). Probing `git add`, not just `git init`, is what distinguishes the two.
+    Cleanup happens in Python (shutil), so no shell `rm -rf <variable>` is ever needed.
+    """
+    resolver = pathlib.Path.home() / ".claude/skills/scratch-space/scripts/scratch-dir.sh"
+    if not resolver.exists():
+        return False, "(none)", "no scratch resolver on this host"
+    try:
+        out = subprocess.run([str(resolver), "gitprobe"], capture_output=True, text=True, timeout=60)
+        root = (out.stdout or "").strip()
+    except Exception as exc:  # noqa: BLE001 - any failure means "do not trust it"
+        return False, "(none)", f"resolver failed: {exc}"
+    if not root:
+        return False, "(none)", "resolver returned no path"
+    tmp = ""
+    try:
+        pathlib.Path(root).mkdir(parents=True, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix=".gitprobe.", dir=root)
+        (pathlib.Path(tmp) / "f").write_text("x")
+        for args in (["git", "-C", tmp, "init", "-q", "."], ["git", "-C", tmp, "add", "f"]):
+            res = subprocess.run(args, capture_output=True, text=True)
+            if res.returncode != 0:
+                detail = (res.stderr or res.stdout or "git failed").strip().splitlines()
+                return False, root, detail[0][:200] if detail else "git failed"
+        return True, root, "git init+add succeeded"
+    except Exception as exc:  # noqa: BLE001
+        return False, root, str(exc)[:200]
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def classify(path: pathlib.Path, pattern: dict) -> tuple[str, str]:
@@ -318,6 +343,8 @@ def main(argv: list[str]) -> int:
                     help="Claude home to migrate (default: ~/.claude)")
     ap.add_argument("--apply", action="store_true", help="write changes (default is dry-run)")
     ap.add_argument("--json", dest="json_path", help="write a machine-readable report here")
+    ap.add_argument("--scratch-git", choices=("auto", "yes", "no"), default="auto",
+                    help="whether the scratch volume can host a git repository (default: probe)")
     args = ap.parse_args(argv)
 
     root = pathlib.Path(os.path.expanduser(args.root))
@@ -325,10 +352,22 @@ def main(argv: list[str]) -> int:
         print(f"FATAL: root is not a directory: {root}", file=sys.stderr)
         return 2
 
+    if args.scratch_git == "auto":
+        scratch_git, scratch_root, scratch_detail = probe_scratch_git_capable()
+    elif args.scratch_git == "yes":
+        scratch_git, scratch_root, scratch_detail = True, "(forced)", "--scratch-git yes"
+    else:
+        scratch_git, scratch_root, scratch_detail = False, "(forced)", "--scratch-git no"
+    print(f"scratch volume {scratch_root}: git-capable={scratch_git} ({scratch_detail})")
+
     results = []
     pending = 0
     problems = []
     for pattern in PATTERNS:
+        if pattern.get("git_incapable_only") and scratch_git:
+            results.append({"file": pattern["file"], "expect": pattern["expect"],
+                            "status": "not-needed", "detail": "scratch can host git here"})
+            continue
         path = root / pattern["file"]
         status, detail = classify(path, pattern)
         if status == "pending":
@@ -358,7 +397,9 @@ def main(argv: list[str]) -> int:
             print(f"  {status}: {f} — {detail}", file=sys.stderr)
     if args.json_path:
         pathlib.Path(os.path.expanduser(args.json_path)).write_text(
-            json.dumps({"root": str(root), "mode": mode, "results": results, "problems":
+            json.dumps({"root": str(root), "mode": mode,
+                        "scratch_git_capable": scratch_git, "scratch_root": scratch_root,
+                        "results": results, "problems":
                         [{"file": f, "status": s, "detail": d} for f, s, d in problems]}, indent=1))
     return 1 if problems else 0
 
