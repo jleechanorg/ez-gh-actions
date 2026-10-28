@@ -135,6 +135,34 @@ Self-heal any failures found before reporting.
 ## /harness command  
 Running `/harness` executes `./docs/verify-exit-criteria.sh` and audits all gates. Report PASS/FAIL per gate.
 
+## Scratch, not /tmp, for agent workspaces (bead jleechan-0yic)
+
+`/tmp` lives on the root filesystem that the runner-admission floor protects: on 2026-10-28
+jeff-ubuntu hit 14 GB free with 232 GB of stale agent scratch in `/tmp`, ezgha correctly paused
+admission, and the fleet drained from 20 to 3 runners. The Disk Magician scratch volume is a
+separate, sparse, quota-bounded filesystem (`/Volumes/diskm-scratch` on macOS, `~/Scratch` on
+Linux), so scratch growth there cannot starve CI admission.
+
+Every workspace- and capture-scale producer must therefore resolve its root:
+
+```bash
+SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh <purpose> 2>/dev/null || echo /tmp)"
+```
+
+`scripts/install_scratch_migration.py` is the git-tracked encoding of that migration: it applies
+the pattern set to a host's `~/.claude`, idempotently, and refuses to guess when a file has drifted
+or a pattern is ambiguous.
+
+```bash
+./scripts/install_scratch_migration.py                    # dry-run, prints the plan
+./scripts/install_scratch_migration.py --apply            # migrate this host
+./scripts/install_scratch_migration.py --root <dir> --json report.json
+```
+
+KB-scale temp files (export exclusion lists, status markers, watchdog logs) intentionally stay in
+`/tmp`; only workspace and capture producers are migrated. Never relocate an existing live
+workspace — moving a checkout invalidates absolute git worktree/config paths.
+
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**:
   - No script, daemon, test, or automation in this repo may invoke or instruct physical-host reboot, shutdown, or forced panic primitives (`reboot`, `shutdown`, `poweroff`, `halt`, `init 0/6`, `/proc/sysrq-trigger`, `kernel.panic=10`, etc.).
