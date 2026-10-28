@@ -168,6 +168,30 @@ rejects `open(O_CREAT|O_EXCL|O_RDWR, 0444)` — exactly how git creates a loose 
 `git clone`/`add`/`commit` fail there with `EACCES` while plain writes succeed. macOS is unaffected
 (`/Volumes/diskm-scratch` is APFS). Everything git-based therefore probes the root before trusting
 it and falls back to `${TMPDIR:-/tmp}` until the mount defect is fixed.
+## Host-health SMS classification (bead jleechan-v8ms)
+`scripts/ezgha-host-health-alert.sh` runs every 2 minutes on jeff-ubuntu (crontab, installed by
+`scripts/install-host-health-alert-cron.sh`) and via the launchd agent
+`org.jleechanorg.ezgha-host-health-alert` on the Mac. It writes to the Cloud Logging log
+`ezgha-runner-alerts`, which feeds two cause-scoped GCP SMS policies:
+
+- `cause=fleet` → `[CRITICAL] ezgha: GitHub Actions Runners Down Alert` (service down, docker
+  unreachable, 0 local/peer runner containers, peer host unreachable). This is the only case that
+  legitimately means "runners down".
+- `cause=disk` → logged at WARNING while the breach is inside the self-heal window
+  (`HEALTH_ALERT_DISK_PAGE_AFTER_MIN`, 15 min) because ezgha's disk admission pause plus the
+  scratch reclaimer normally clear it; escalates to ERROR and pages
+  `[CRITICAL] ezgha: host disk below safety floor` only when the breach persists past that window
+  or free space drops under `HEALTH_ALERT_DISK_EMERGENCY_GB` (15 GB).
+
+Consequence of the 2026-10-28 incident this classifies: a disk verdict used to be written as
+`status=DOWN`/`severity=ERROR`, so the single "Runners Down" policy matched it and paged the
+operator every ~10 minutes for three hours while 16-19/20 runners were online and executing jobs.
+The 30-minute throttle never engaged because the state file lived in `/tmp` and the scratch
+reclaimer archived it; state now lives under `$HOME/.local/state/ezgha/`.
+
+Apply the policies (idempotent) with `./scripts/ezgha-host-health-alert.sh --ensure-policies`.
+Audit a verdict without touching GCP using `--dry-run` plus the `HEALTH_ALERT_*` env overrides
+documented in the script header.
 
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**:
