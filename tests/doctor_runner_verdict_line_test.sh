@@ -182,7 +182,7 @@ case "$*" in
     if [ "$FAKE_TARGET" = mapjobs ]; then
       json='{"workflow_runs":[{"id":4,"html_url":"https://example.invalid/run/4","created_at":"2099-01-01T00:00:00Z"}]}'
     fi ;;
-  *actions/runs/4/jobs*) target=mapjobs; json='{"jobs":[{"status":"in_progress","name":"test","runner_name":"ez-runner-c-1","html_url":"https://example.invalid/job/4","created_at":"2099-01-01T00:00:00Z"}]}' ;;
+  *actions/runs/4/jobs*) target=mapjobs; json='{"jobs":[{"status":"in_progress","name":"test","runner_name":"ez-runner-c-1","html_url":"https://example.invalid/job/4","created_at":"2099-01-01T00:00:00Z","started_at":"2099-01-01T00:00:01Z"}]}' ;;
   *actions/runs/*/jobs*) target=jobs; json='{"jobs":[{"runner_name":"ez-runner-c-1","conclusion":"success"}]}' ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
 esac
@@ -193,6 +193,15 @@ if [ "$FAKE_TARGET" = "$target" ]; then
     long_error) printf '%02000d\n' 0; echo 'gh: HTTP 403: partial response' >&2; exit 1 ;;
     malformed) echo 'not JSON'; exit 0 ;;
     schema) echo '{}'; exit 0 ;;
+    missing_runner) json=$(printf '%s' "$json" | jq 'del(.jobs[0].runner_name)') ;;
+    unknown_status) json=$(printf '%s' "$json" | jq '.jobs[0].status = "nonsense"') ;;
+    invalid_runner) json=$(printf '%s' "$json" | jq '.jobs[0].runner_name = 42') ;;
+    missing_name) json=$(printf '%s' "$json" | jq 'del(.jobs[0].name)') ;;
+    missing_started) json=$(printf '%s' "$json" | jq 'del(.jobs[0].started_at)') ;;
+    invalid_started) json=$(printf '%s' "$json" | jq '.jobs[0].started_at = 42') ;;
+    queued_null) json=$(printf '%s' "$json" | jq '.jobs[0] |= (.status = "queued" | .runner_name = null | .started_at = null)') ;;
+    queued_empty) json=$(printf '%s' "$json" | jq '.jobs[0] |= (.status = "queued" | .runner_name = "" | .started_at = null)') ;;
+    status_*) json=$(printf '%s' "$json" | jq --arg status "${FAKE_REPLY#status_}" '.jobs[0].status = $status') ;;
     empty)
       case "$target" in
         runners) json='{"runners":[]}' ;;
@@ -242,6 +251,7 @@ SH
   sed -n '/^# --- C\. GitHub-side/,/^# --- D\. live docker/p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^section "7\. real job/,/^# --- F1b\./p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^EXPLICIT_WORK_REPOS=/,/^# --- F2\./p' "$DOCTOR_SCRIPT" | sed '$d'
+  printf '%s\n' 'printf "JOBMAP queued=%s errors=%s\n" "$JOBLEVEL_QUEUED_COUNT" "$JOBLEVEL_FETCH_ERRORS"'
   sed -n '/^CRITICAL=0$/,$p' "$DOCTOR_SCRIPT"
 } >> "$HARNESS"
 bash -n "$HARNESS"
@@ -265,8 +275,14 @@ api_case() {
     if [[ "$reply" = *error ]] && ! grep -q 'HTTP 403' "$out"; then
       echo "FAIL: $label lost actual error"; OVERALL_PASS=false; return
     fi
+    if [ "$target" = mapjobs ] && ! grep -q 'JOBMAP .*errors=[1-9]' "$out"; then
+      echo "FAIL: $label missing job-map failure ledger entry"; OVERALL_PASS=false; return
+    fi
   elif [ "$expected" -eq 0 ]; then
     grep -q 'fleet healthy: 24/24' "$out" || { echo "FAIL: $label missing local truth"; OVERALL_PASS=false; return; }
+    if [[ "$reply" = queued_* ]] && ! grep -q 'JOBMAP queued=1 errors=0' "$out"; then
+      echo "FAIL: $label unassigned queued job was dropped"; OVERALL_PASS=false; return
+    fi
   elif [ "$local_state" != healthy ]; then
     grep -q 'per-slot execution-proof gate FAILED' "$out" || { echo "FAIL: $label lost local failure"; OVERALL_PASS=false; return; }
   else
@@ -285,6 +301,14 @@ api_case jobs pages 2
 for target in runners recent jobs; do api_case "$target" empty 1; done
 api_case none healthy 0
 api_case mapjobs healthy 0
+for reply in missing_runner unknown_status invalid_runner missing_name missing_started invalid_started; do
+  api_case mapjobs "$reply" 2
+done
+api_case mapjobs missing_runner 1 down
+api_case mapjobs unknown_status 1 starved
+api_case mapjobs queued_null 0
+api_case mapjobs queued_empty 0
+for status in queued in_progress completed waiting requested pending; do api_case mapjobs "status_$status" 0; done
 api_case runners pages 0
 api_case none healthy 2 queue_unknown
 api_case runners error 1 down

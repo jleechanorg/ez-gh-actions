@@ -757,7 +757,12 @@ build_runner_job_index() {
       runs_json="$GH_JSON"
       while IFS=$'\t' read -r rid run_url; do
         [ -z "$rid" ] && continue
-        gh_json "job-map jobs $repo $rid" 'type == "object" and (.jobs | type == "array") and all(.jobs[]; (.status | type == "string") and (.html_url | type == "string") and (.created_at | type == "string"))' api "repos/$repo/actions/runs/$rid/jobs" >&2 || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+        gh_json "job-map jobs $repo $rid" 'type == "object" and (.jobs | type == "array") and all(.jobs[];
+          has("runner_name") and (.runner_name == null or (.runner_name | type == "string"))
+          and (.name | type == "string")
+          and (.status | IN("queued", "in_progress", "completed", "waiting", "requested", "pending"))
+          and (.html_url | type == "string") and (.created_at | type == "string")
+          and has("started_at") and (.started_at == null or (.started_at | type == "string")))' api "repos/$repo/actions/runs/$rid/jobs" >&2 || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
         jobs_json="$GH_JSON"
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
