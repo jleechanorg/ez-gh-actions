@@ -2771,6 +2771,9 @@ static TEST_HOST_CONTAINMENT_CGROUP_ROOT: std::sync::Mutex<Option<PathBuf>> =
 static TEST_HOST_CONTAINMENT_DAEMON_IN_VM: std::sync::Mutex<Option<bool>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
+static TEST_HOST_REPORTS_VIRTUALIZATION: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
 static TEST_CONTAINER_ANCESTRY_OVERRIDE: std::sync::Mutex<Option<bool>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
@@ -2851,6 +2854,45 @@ fn host_containment_daemon_in_vm() -> bool {
     .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     .filter(|kernel| !kernel.is_empty());
     matches!((host_kernel, daemon_kernel), (Some(host), Some(daemon)) if host != daemon)
+}
+
+/// True when the caller explicitly declared that this daemon's native Docker host
+/// is itself a VM (`policy.host_containment = "vm"`) **and** the kernel agrees the
+/// host is virtualized. Both halves are required: the declaration alone can never
+/// waive containment on bare metal.
+#[cfg(target_os = "linux")]
+fn host_containment_vm_boundary_asserted(cfg: &Config) -> bool {
+    cfg.policy.host_containment == crate::config::HostContainment::Vm
+        && host_reports_virtualization()
+}
+
+/// Kernel-level virtualization probe. A guest exposes the `hypervisor` CPUID flag
+/// (KVM, Xen, Hyper-V, VMware) in `/proc/cpuinfo`, and Xen also publishes
+/// `/sys/hypervisor/type`. No external tool is required.
+#[cfg(target_os = "linux")]
+fn host_reports_virtualization() -> bool {
+    #[cfg(test)]
+    if let Some(flag) = *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() {
+        return flag;
+    }
+    if Path::new("/sys/hypervisor/type").exists() {
+        return true;
+    }
+    match std::fs::read_to_string("/proc/cpuinfo") {
+        Ok(cpuinfo) => cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("flags"))
+            .any(|line| line.split_whitespace().any(|flag| flag == "hypervisor")),
+        Err(_) => false,
+    }
+}
+
+/// Single predicate for "this daemon is already bounded by a VM": either its
+/// Docker daemon runs on a different kernel (Colima/Lima, remote VM socket) or an
+/// operator declared the native Docker host is itself a microVM.
+#[cfg(target_os = "linux")]
+fn daemon_is_vm_contained(cfg: &Config) -> bool {
+    host_containment_daemon_in_vm() || host_containment_vm_boundary_asserted(cfg)
 }
 
 #[cfg(target_os = "linux")]
@@ -3041,6 +3083,14 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
         if host_containment_daemon_in_vm() {
             return Ok(());
         }
+        if cfg.policy.host_containment == crate::config::HostContainment::Vm {
+            if host_reports_virtualization() {
+                return Ok(());
+            }
+            bail!(
+                "policy.host_containment = \"vm\" requires a virtualized host, but this kernel reports no hypervisor; run the daemon inside the VM or leave host_containment at its default (actions.slice containment)"
+            );
+        }
         if cfg.policy.minimum_isolation != crate::config::IsolationLevel::Container {
             bail!("host containment requires policy.minimum_isolation=container");
         }
@@ -3080,15 +3130,16 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
 }
 
 /// Require that a freshly created container PID is located beneath /actions.slice.
-pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
+pub fn require_container_actions_ancestry(_cfg: &Config, _container_id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let container_id = _container_id;
         // A canonical Docker endpoint backed by a VM reports guest PIDs that
         // do not exist in this host's /proc. The host cgroup assertion is only
-        // meaningful for the native HostDocker profile; VM admission keeps its
-        // existing behavior without claiming host-level ancestry verification.
-        if host_containment_daemon_in_vm() {
+        // meaningful for the native HostDocker profile; VM admission (Colima or
+        // an explicitly declared microVM host) keeps its existing behavior
+        // without claiming host-level ancestry verification.
+        if daemon_is_vm_contained(_cfg) {
             return Ok(());
         }
         #[cfg(test)]
@@ -3220,7 +3271,7 @@ impl PressureSource {
 fn admission_pressure_source(cfg: &Config) -> PressureSource {
     #[cfg(target_os = "linux")]
     if let Some(parent) = cfg.limits.cgroup_parent.as_deref() {
-        if !is_macos_host() && !host_containment_daemon_in_vm() {
+        if !is_macos_host() && !daemon_is_vm_contained(cfg) {
             return PressureSource::runner_cgroup(&host_actions_cgroup_root().join(parent));
         }
     }
@@ -3952,7 +4003,7 @@ fn start_one_with_generate_at_slot(
         );
     }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if let Err(err) = require_container_actions_ancestry(&container_id) {
+    if let Err(err) = require_container_actions_ancestry(cfg, &container_id) {
         let mut rm_cmd = docker_cmd();
         rm_cmd.args(["rm", "-f", &runner_name]);
         let _ = run_docker(rm_cmd, "post-start ancestry compensation rm -f");
@@ -4868,7 +4919,7 @@ fn admission_batch(cfg: &Config, missing: u32) -> Result<AdmissionBatch> {
         {
             return Ok(batch);
         }
-        if missing == 0 || is_macos_host() || host_containment_daemon_in_vm() {
+        if missing == 0 || is_macos_host() || daemon_is_vm_contained(cfg) {
             return Ok(batch);
         }
         use std::os::fd::AsRawFd;
@@ -5737,6 +5788,7 @@ mod tests {
             *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = None;
             *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = None;
             *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = None;
+            *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = None;
             *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = None;
             *TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap() = None;
             reset_failure_ladder_admission_latch_for_tests();
@@ -9945,6 +9997,71 @@ esac
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn host_containment_admits_explicit_vm_boundary_host() {
+        let _env = TestEnv::new("host_containment_vm_boundary");
+        cpu_probe_overrides::set(Some(true));
+        *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = Some(true);
+
+        // A cloud microVM host: native docker, no actions.slice, arbitrary count.
+        let mut cfg = cfg_with(4, "ez-cloud-runner");
+        cfg.limits.cgroup_parent = None;
+        cfg.policy.host_containment = crate::config::HostContainment::Vm;
+        require_host_containment(&cfg)
+            .expect("an explicitly declared VM boundary host must pass admission");
+        assert!(
+            daemon_is_vm_contained(&cfg),
+            "VM boundary hosts must be treated as VM-contained everywhere"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_refuses_vm_boundary_on_non_virtualized_host() {
+        let _env = TestEnv::new("host_containment_vm_boundary_bare_metal");
+        cpu_probe_overrides::set(Some(true));
+        *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = Some(false);
+
+        let mut cfg = cfg_with(4, "ez-cloud-runner");
+        cfg.limits.cgroup_parent = None;
+        cfg.policy.host_containment = crate::config::HostContainment::Vm;
+        let err = require_host_containment(&cfg)
+            .expect_err("a bare-metal host must not be able to waive containment");
+        assert!(
+            err.to_string().contains("host_containment = \"vm\"")
+                || err.to_string().contains("virtualized"),
+            "expected a fail-closed virtualization refusal; got: {err:#}"
+        );
+        assert!(
+            !daemon_is_vm_contained(&cfg),
+            "a non-virtualized host must never be treated as VM-contained"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_vm_boundary_still_requires_matching_kernel_or_assertion() {
+        let _env = TestEnv::new("host_containment_auto_unchanged");
+        *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = Some(true);
+
+        // Default policy stays fail-closed on native bare-metal docker even when
+        // the host happens to report virtualization without the operator assertion.
+        let mut cfg = cfg_with(4, "ez-cloud-runner");
+        cfg.limits.cgroup_parent = None;
+        assert_eq!(
+            cfg.policy.host_containment,
+            crate::config::HostContainment::Auto
+        );
+        let err = require_host_containment(&cfg)
+            .expect_err("auto policy must keep requiring actions.slice containment");
+        assert!(
+            err.to_string()
+                .contains("limits.cgroup_parent=actions.slice"),
+            "expected the actions.slice requirement; got: {err:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn host_containment_admits_the_fourteen_runner_profile() {
         let _env = TestEnv::new("host_containment_profile_14");
         let root = env::temp_dir().join(format!(
@@ -10175,8 +10292,9 @@ esac
         let _env = TestEnv::new("host_containment_vm_ancestry");
         *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
         *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = Some(false);
+        let cfg = cfg_with(4, "ez-cloud-runner");
 
-        require_container_actions_ancestry("guest-container")
+        require_container_actions_ancestry(&cfg, "guest-container")
             .expect("guest PID ancestry must not be read through the host /proc");
     }
 

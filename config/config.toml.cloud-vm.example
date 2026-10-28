@@ -1,0 +1,46 @@
+# Cloud microVM runner host (cmux Cloud / any native-Docker VM).
+#
+# The daemon's Docker runs *inside* this VM on this VM's own kernel, so there is
+# no separate bare-metal host to bound with `actions.slice`. The VM itself is the
+# isolation boundary: `host_containment = "vm"` tells containment admission to
+# treat the machine as VM-contained. That declaration is only honored when the
+# CPU actually reports virtualization; on bare metal `serve` refuses to start.
+#
+# Install: cp config/config.toml.cloud-vm.example ~/.config/ezgha/config.toml
+# See docs/cloud-vm-hosts.md and scripts/cloud/bootstrap-cloud-vm-host.sh.
+version = 1
+
+[github]
+scope = "org"
+target = "jleechanorg"
+
+[runner]
+name_prefix = "ez-cloud-runner"
+labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64", "cmux-cloud"]
+# Size the count to the VM: `runner_floor_mb` (3072 default) per runner plus host
+# headroom. 4 on a 16 GiB / 8 vCPU machine, 2 on an 8 GiB / 4 vCPU machine.
+count = 4
+image = "ezgha-runner:latest"
+# There is no Lima/Colima guest here — the daemon's Docker *is* this VM's Docker,
+# so the 4 GiB guest reserve would only shrink the fleet budget (it made a
+# 4x3072 MiB fleet fail admission on a 16 GiB machine by 181 MiB).
+guest_reserve_mb = 0
+
+[limits]
+memory_mb = 1400
+cpus = 1.6
+pids = 512
+min_free_disk_gb = 10
+
+[policy]
+minimum_isolation = "container"
+host_containment = "vm"
+
+[queue_monitor]
+enabled = false
+
+[canary]
+enabled = false
+
+[invariant_sampler]
+enabled = false

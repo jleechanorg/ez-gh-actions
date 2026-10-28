@@ -75,6 +75,19 @@ via `docker top`. Repository-only preflight does not establish live capacity.
 | Mac (Colima) | `container` | Colima runs docker inside a VM, but ezgha's backend isolation level is still `container`. `minimum_isolation = "vm"` causes serve to **fail-closed** when the daemon blips to container-only. |
 | Linux (native docker) | `container` | Bare-metal docker on the host kernel; strongest available backend is `container`. Use `vm` only if you have a VM-contained daemon **and** want fail-closed enforcement. |
 
+## `host_containment` policy
+
+How this host's **native** Docker is contained. Default `auto` is the historical
+behavior; nothing changes unless it is set explicitly.
+
+| Value | Meaning |
+|-------|---------|
+| `auto` (default) | A native-Docker host must run runners under `limits.cgroup_parent = "actions.slice"` with the 10/14/20-runner HostDocker profile. A daemon on a different kernel (Colima/Lima) is already VM-contained and is exempt. |
+| `vm` | The native Docker host is itself a VM (a cloud microVM), so the VM — not a cgroup slice — is the isolation boundary. Honored **only** when the CPU reports virtualization; on a host that reports none, `serve` refuses to start. Requires no `cgroup_parent` and accepts any runner count. |
+
+See [docs/cloud-vm-hosts.md](../docs/cloud-vm-hosts.md) and
+`config/config.toml.cloud-vm.example` for the cloud microVM shape.
+
 **Image:** always `ezgha-runner:latest` (built from `Dockerfile.runner`), not the bare upstream `actions-runner` image.
 
 ## Canary verifier config
