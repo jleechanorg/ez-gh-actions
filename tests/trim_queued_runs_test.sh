@@ -14,6 +14,7 @@
 # Usage: bash tests/trim_queued_runs_test.sh
 
 set -euo pipefail
+unset BASH_ENV || true
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -60,6 +61,10 @@ if [[ "$*" == *"ls-remote"* ]]; then
   fi
   if [[ "$*" == *"refs/heads/feature/race"* ]]; then
     printf 'racesha555\trefs/heads/feature/race\n'
+    exit 0
+  fi
+  if [[ "$*" == *"refs/heads/main"* ]]; then
+    printf 'mainsha000\trefs/heads/main\n'
     exit 0
   fi
 fi
@@ -146,6 +151,26 @@ if [[ "\$1" == "api" && "\$*" == *"status=queued"* ]]; then
       "head_sha": "racesha555",
       "status": "queued",
       "html_url": "https://github.com/mock/repo/actions/runs/107"
+    },
+    {
+      "id": 108,
+      "name": "iOS TestFlight Superseded",
+      "path": ".github/workflows/ios-testflight.yml",
+      "head_branch": "main",
+      "head_sha": "oldtestflightsha",
+      "event": "push",
+      "status": "queued",
+      "html_url": "https://github.com/mock/repo/actions/runs/108"
+    },
+    {
+      "id": 109,
+      "name": "iOS TestFlight Latest",
+      "path": ".github/workflows/ios-testflight.yml",
+      "head_branch": "main",
+      "head_sha": "mainsha000",
+      "event": "push",
+      "status": "queued",
+      "html_url": "https://github.com/mock/repo/actions/runs/109"
     }
   ]
 }
@@ -246,10 +271,12 @@ echo "$output_dry"
 # - 104 (draft PR #401)
 # - 105 (old unmodified PR #402)
 # - 107 (old unmodified PR #404)
+# - 108 (superseded iOS TestFlight on main)
 # Protected:
 # - 101 (deploy-production.yml)
 # - 102 (main branch)
 # - 106 (young PR, age 30m < 2h)
+# - 109 (latest iOS TestFlight on main)
 
 if ! grep -q "would cancel 103 .* superseded_commit" <<<"$output_dry"; then
   echo "FAIL: candidate 103 (superseded) missing from dry-run" >&2
@@ -263,6 +290,10 @@ if ! grep -q "would cancel 105 .* unmodified_pr" <<<"$output_dry"; then
   echo "FAIL: candidate 105 (unmodified) missing from dry-run" >&2
   exit 1
 fi
+if ! grep -q "would cancel 108 .* superseded_main_build" <<<"$output_dry"; then
+  echo "FAIL: candidate 108 (superseded main build) missing from dry-run" >&2
+  exit 1
+fi
 if grep -q "would cancel 101" <<<"$output_dry"; then
   echo "FAIL: run 101 (deploy-production.yml) should NEVER be a candidate" >&2
   exit 1
@@ -273,6 +304,10 @@ if grep -q "would cancel 102" <<<"$output_dry"; then
 fi
 if grep -q "would cancel 106" <<<"$output_dry"; then
   echo "FAIL: run 106 (young PR) should NOT be a candidate" >&2
+  exit 1
+fi
+if grep -q "would cancel 109" <<<"$output_dry"; then
+  echo "FAIL: run 109 (latest main TestFlight) should NOT be a candidate" >&2
   exit 1
 fi
 
@@ -288,7 +323,7 @@ echo "=== Test 2: Apply mode ==="
 output_apply="$(./scripts/trim-queued-runs.sh --apply)"
 echo "$output_apply"
 
-# Run 103, 104, 105 should be cancelled
+# Run 103, 104, 105, 108 should be cancelled
 if ! grep -q "cancelled 103 .* superseded_commit" <<<"$output_apply"; then
   echo "FAIL: run 103 not cancelled in apply mode" >&2
   exit 1
@@ -299,6 +334,10 @@ if ! grep -q "cancelled 104 .* draft_pr" <<<"$output_apply"; then
 fi
 if ! grep -q "cancelled 105 .* unmodified_pr" <<<"$output_apply"; then
   echo "FAIL: run 105 not cancelled in apply mode" >&2
+  exit 1
+fi
+if ! grep -q "cancelled 108 .* superseded_main_build" <<<"$output_apply"; then
+  echo "FAIL: run 108 not cancelled in apply mode" >&2
   exit 1
 fi
 
@@ -321,11 +360,15 @@ if ! grep -q "runs/105/cancel" "${GH_LOG}"; then
   echo "FAIL: gh cancel not called for 105" >&2
   exit 1
 fi
+if ! grep -q "runs/108/cancel" "${GH_LOG}"; then
+  echo "FAIL: gh cancel not called for 108" >&2
+  exit 1
+fi
 if grep -q "runs/107/cancel" "${GH_LOG}"; then
   echo "FAIL: gh cancel was called for raced run 107!" >&2
   exit 1
 fi
-if grep -q "runs/101/cancel" "${GH_LOG}" || grep -q "runs/102/cancel" "${GH_LOG}" || grep -q "runs/106/cancel" "${GH_LOG}"; then
+if grep -q "runs/101/cancel" "${GH_LOG}" || grep -q "runs/102/cancel" "${GH_LOG}" || grep -q "runs/106/cancel" "${GH_LOG}" || grep -q "runs/109/cancel" "${GH_LOG}"; then
   echo "FAIL: protected runs were cancelled!" >&2
   exit 1
 fi
