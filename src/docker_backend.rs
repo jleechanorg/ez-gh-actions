@@ -10288,6 +10288,7 @@ esac
         let _env = TestEnv::new("host_containment_vm_ancestry");
         *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
         *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = Some(false);
+        let cfg = cfg_with(4, "ez-cloud-runner");
 
         require_container_actions_ancestry(&cfg, "guest-container")
             .expect("guest PID ancestry must not be read through the host /proc");
