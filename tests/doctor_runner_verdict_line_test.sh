@@ -161,7 +161,7 @@ run_case "local-20exec-remote-unreachable-4down" \
 
 # API proof regression (jleechan-6vlf). Exercise extracted production sections,
 # including their final exit status, with no Docker, SSH, or provider access.
-SCRATCH="${DOCTOR_WORKER_OUTPUT:-$("$HOME/.claude/skills/scratch-space/scripts/scratch-dir.sh" doctor-api-test)}"
+SCRATCH="${DOCTOR_WORKER_OUTPUT:-${DISKM_SCRATCH:-${TMPDIR:-/tmp}}}"
 API_TMP=$(mktemp -d "$SCRATCH/verdict-api.XXXXXX")
 mkdir -p "$API_TMP/bin"
 cat > "$API_TMP/bin/gh" <<'SH'
