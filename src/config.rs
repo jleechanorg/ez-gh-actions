@@ -1183,6 +1183,77 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn legacy_config_without_host_containment_defaults_to_auto() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 4
+image = "img:latest"
+[limits]
+memory_mb = 1400
+cpus = 1.6
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let cfg = load_from_str(raw, "legacy-host-containment").unwrap();
+        assert_eq!(cfg.policy.host_containment, HostContainment::Auto);
+    }
+
+    #[test]
+    fn host_containment_parses_vm_boundary() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 4
+image = "img:latest"
+[limits]
+memory_mb = 1400
+cpus = 1.6
+pids = 512
+[policy]
+minimum_isolation = "container"
+host_containment = "vm"
+"#;
+        let cfg = load_from_str(raw, "vm-host-containment").unwrap();
+        assert_eq!(cfg.policy.host_containment, HostContainment::Vm);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn host_containment_rejects_unknown_boundary() {
+        let raw = r#"
+version = 1
+[github]
+scope = "repo"
+target = "owner/repo"
+[runner]
+labels = ["self-hosted"]
+count = 4
+image = "img:latest"
+[limits]
+memory_mb = 1400
+cpus = 1.6
+pids = 512
+[policy]
+minimum_isolation = "container"
+host_containment = "bare-metal"
+"#;
+        assert!(
+            load_from_str(raw, "bad-host-containment").is_err(),
+            "an unknown host_containment value must fail closed"
+        );
+    }
+
+    #[test]
     fn cgroup_parent_accepts_systemd_slice_name() {
         let mut cfg = valid_config();
         cfg.limits.cgroup_parent = Some("actions.slice".into());
