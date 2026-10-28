@@ -163,23 +163,33 @@ run_case "local-20exec-remote-unreachable-4down" \
 # including their final exit status, with no Docker, SSH, or provider access.
 SCRATCH="${DOCTOR_WORKER_OUTPUT:-${DISKM_SCRATCH:-${TMPDIR:-/tmp}}}"
 API_TMP=$(mktemp -d "$SCRATCH/verdict-api.XXXXXX")
-mkdir -p "$API_TMP/bin" "$API_TMP/home"
+mkdir -p "$API_TMP/bin" "$API_TMP/home/.config/ezgha"
+printf 'synthetic-test-token\n' > "$API_TMP/home/.config/ezgha/gh_token"
 # Synthetic contract fixtures; no live workflow or runner evidence is used.
 if [ "$(uname -s)" = Darwin ]; then
   OLD_AT=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ)
+  TEN_AT=$(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ)
+  ONE_AT=$(date -u -v-1M +%Y-%m-%dT%H:%M:%SZ)
 else
   OLD_AT=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+  TEN_AT=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+  ONE_AT=$(date -u -d '1 minute ago' +%Y-%m-%dT%H:%M:%SZ)
 fi
 cat > "$API_TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -eu
 printf '%s\n' "$*" >> "$FAKE_CALLS"
 case "$*" in
-  *orgs/*/actions/runners*) target=runners; json='{"runners":[{"name":"ez-runner-c-1","status":"online","busy":true}]}' ;;
+  *orgs/*/actions/runners*)
+    target=runners; json='{"runners":[{"name":"ez-runner-c-1","status":"online","busy":true}]}'
+    if [[ "$*" = *' -i '* ]]; then target=token; json='HTTP/2.0 200 OK'; fi ;;
   *workflow\ run*) target=dispatch; json='' ;;
-  *run\ view*) target=view; json='{"status":"completed","conclusion":"success"}' ;;
+  *run\ view*)
+    target=view; json='{"status":"completed","conclusion":"success"}'
+    if [ "$FAKE_SCENARIO" = failed_canary ]; then json='{"status":"completed","conclusion":"failure"}'; fi ;;
   *run\ list*)
     target=recent; json='[{"databaseId":3}]'
+    if [[ "$FAKE_SCENARIO" = recent_* ]]; then json='[{"databaseId":3},{"databaseId":5}]'; fi
     if [[ "$*" == *'-L 1 '* ]]; then
       if [ -f "$FAKE_STATE" ]; then target=poll; json='[{"databaseId":2}]'
       else target=baseline; json='[{"databaseId":1}]'; touch "$FAKE_STATE"; fi
@@ -188,7 +198,14 @@ case "$*" in
     target=queue; json='{"workflow_runs":[],"total_count":0}'
     if [ "$LOCAL_STATE" = queue_unknown ]; then echo 'gh: HTTP 403: queue unavailable' >&2; exit 1; fi
     if [ "$FAKE_SCENARIO" != empty ] && [[ "$*" == *status=queued* ]]; then
-      json=$(jq -nc --arg at "$FAKE_OLD_AT" '{workflow_runs:[{id:4,name:"concurrency-blocked",head_branch:"test",created_at:$at}]}')
+      json=$(jq -nc --arg at "$FAKE_OLD_AT" '{total_count:1,workflow_runs:[{id:4,name:"concurrency-blocked",head_branch:"test",created_at:$at}]}')
+    fi
+    if [ "$FAKE_TARGET" = queue_queued ] && [[ "$*" == *status=queued* ]]; then target=queue_queued; fi
+    if [ "$FAKE_TARGET" = queue_progress ] && [[ "$*" == *status=in_progress* ]]; then target=queue_progress; fi
+    if [ "$FAKE_TARGET" = queue_later ] && [[ "$*" == *status=queued* ]]; then
+      if [[ "$*" == *'page=1' ]]; then
+        json=$(jq -nc --arg at "$FAKE_OLD_AT" '{total_count:101,workflow_runs:[range(100) | {id:(.+1),name:"queued",head_branch:"test",created_at:$at}]}')
+      else target=queue_later; fi
     fi ;;
   *actions/runs\?*)
     target=mapruns; json='{"workflow_runs":[]}'
@@ -198,12 +215,20 @@ case "$*" in
     fi ;;
   *actions/runs/4/jobs*)
     target=mapjobs; json='{"jobs":[{"status":"in_progress","name":"test","runner_name":"ez-runner-c-1","html_url":"https://example.invalid/job/4","created_at":"2099-01-01T00:00:00Z","started_at":"2099-01-01T00:00:01Z"}]}'
-    if [ "$FAKE_SCENARIO" = job_wait ]; then
+    if [[ "$FAKE_SCENARIO" = job_wait* ]]; then
       json=$(printf '%s' "$json" | jq --arg at "$FAKE_OLD_AT" '.jobs[0] |= (.status = "queued" | .created_at = $at | .runner_name = null | .started_at = null)')
     fi ;;
-  *actions/runs/*/jobs*) target=jobs; json='{"jobs":[{"runner_name":"ez-runner-c-1","conclusion":"success"}]}' ;;
+  *actions/runs/*/jobs*)
+    target=jobs; json='{"jobs":[{"runner_name":"ez-runner-c-1","conclusion":"success"}]}'
+    if [[ "$FAKE_SCENARIO" = recent_failed* ]]; then json=$(printf '%s' "$json" | jq '.jobs[0].conclusion = "failure"'); fi
+    if [[ "$FAKE_SCENARIO" = recent_*_mixed ]] && [[ "$*" = */5/jobs ]]; then
+      echo 'gh: HTTP 403: second recent run unavailable' >&2; exit 1
+    fi ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
 esac
+if [[ "$FAKE_SCENARIO" = *_mixed ]] && [[ "$*" = *repos/test/other/* ]] && [ "$FAKE_TARGET" = "$target" ]; then
+  echo 'gh: HTTP 403: other repository unavailable' >&2; exit 1
+fi
 if [ "$FAKE_TARGET" = "$target" ]; then
   case "$FAKE_REPLY" in
     error) echo 'gh: HTTP 403: API rate limit exceeded' >&2; exit 1 ;;
@@ -211,6 +236,22 @@ if [ "$FAKE_TARGET" = "$target" ]; then
     long_error) printf '%02000d\n' 0; echo 'gh: HTTP 403: partial response' >&2; exit 1 ;;
     malformed) echo 'not JSON'; exit 0 ;;
     schema) echo '{}'; exit 0 ;;
+    null) json=null ;;
+    array) json='[]' ;;
+    null_runs) json='{"workflow_runs":null,"total_count":0}' ;;
+    object_runs) json='{"workflow_runs":{},"total_count":0}' ;;
+    invalid_count) json='{"workflow_runs":[],"total_count":"0"}' ;;
+    negative_count) json='{"workflow_runs":[],"total_count":-1}' ;;
+    boolean_count) json='{"workflow_runs":[],"total_count":true}' ;;
+    null_member) json=$(printf '%s' "$json" | jq 'if type == "array" then [null] elif has("status") then .status = null else with_entries(if (.value | type) == "array" then .value = [null] else . end) end') ;;
+    denied) echo 'HTTP/2.0 401 Unauthorized'; exit 1 ;;
+    rate_limited) echo 'HTTP/2.0 429 Too Many Requests'; exit 1 ;;
+    invalid_record) json='{"workflow_runs":[{"id":"4"}],"total_count":1}' ;;
+    bad_timestamp) json='{"workflow_runs":[{"id":4,"name":"test","head_branch":"test","created_at":"2026-10-28T00:00:00"}],"total_count":1}' ;;
+    missing_conclusion) json=$(printf '%s' "$json" | jq 'del(.conclusion)') ;;
+    bad_conclusion) json=$(printf '%s' "$json" | jq '.conclusion = 42') ;;
+    empty_body) exit 0 ;;
+    bad_page) printf '%s\n{}\n' "$json"; exit 0 ;;
     missing_runner) json=$(printf '%s' "$json" | jq 'del(.jobs[0].runner_name)') ;;
     unknown_status) json=$(printf '%s' "$json" | jq '.jobs[0].status = "nonsense"') ;;
     invalid_runner) json=$(printf '%s' "$json" | jq '.jobs[0].runner_name = 42') ;;
@@ -261,6 +302,7 @@ read_config_runner_count() { echo 20; }
 emit_failure_remediation() { echo "FAILURE critical=$1"; }
 ORG=test; EZGHA_REPO=test/repo; RUNNER_NAME_PREFIX=ez-runner-c
 PLATFORM=linux; EXPLICIT_WORK_REPOS=test/repo
+if [[ "$FAKE_SCENARIO" = *_mixed ]]; then EXPLICIT_WORK_REPOS+=' test/other'; fi
 SERVICE_STATE=active; COLIMA_STATUS=NotInstalled
 LOCAL_CONFIG_FILE=unused; SLOT_FILE=unused; DEFAULT_CONFIGURED_COUNT=20
 LOCAL_COUNT=20; REMOTE_COUNT=4; CONTAINER_COUNT=20
@@ -284,6 +326,7 @@ SH
 {
   printf 'SCRIPT_DIR=%q\n' "$REPO_ROOT"
   sed -n '/^API_UNVERIFIED=0$/,/^# --- end GitHub response helper/p' "$DOCTOR_SCRIPT"
+  sed -n '/^section "4b\./,/^# --- C\./p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^# --- C\. GitHub-side/,/^# --- D\. live docker/p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^section "7\. real job/,/^# --- F1b\./p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^EXPLICIT_WORK_REPOS=/,/^# --- F2\./p' "$DOCTOR_SCRIPT" | sed '$d'
@@ -310,12 +353,13 @@ bash -n "$HARNESS"
 
 api_case() {
   local target="$1" reply="$2" expected="$3" local_state="${4:-healthy}" prove="${5:-0}" scenario="${6:-empty}"
-  local label="$target-$reply-$local_state-prove$prove-$scenario" rc=0 out
+  local label="$target-$reply-$local_state-prove$prove-$scenario" rc=0 out at="$OLD_AT"
+  case "$scenario" in job_wait_10*) at="$TEN_AT" ;; job_wait_1_*) at="$ONE_AT" ;; esac
   out="$API_TMP/$label.log"
   # Distinct state per case; the fake canary baseline and poll cannot collide.
   PATH="$API_TMP/bin:$PATH" TMPDIR="$API_TMP" FAKE_STATE="$API_TMP/$label.state" \
     HOME="$API_TMP/home" XDG_CONFIG_HOME="$API_TMP/home/.config" XDG_STATE_HOME="$API_TMP/home/.local/state" \
-    FAKE_CALLS="$API_TMP/$label.calls" FAKE_OLD_AT="$OLD_AT" FAKE_SCENARIO="$scenario" \
+    FAKE_CALLS="$API_TMP/$label.calls" FAKE_OLD_AT="$at" FAKE_SCENARIO="$scenario" \
     FAKE_TARGET="$target" FAKE_REPLY="$reply" LOCAL_STATE="$local_state" PROVE="$prove" \
     bash "$HARNESS" > "$out" 2>&1 || rc=$?
   if [ "$rc" -ne "$expected" ] || grep -Eq 'UNEXPECTED LIVE PROBE|unexpected gh call:' "$out"; then
@@ -349,7 +393,15 @@ api_case() {
      ! grep -q 'ez-runner-c-20 *IDLE-UNVERIFIED *job queue evidence unavailable' "$out"; then
     echo "FAIL: $label inventory claimed idle health without job proof"; cat "$out"; OVERALL_PASS=false; return
   fi
-  if [ "$scenario" = job_wait ] && ! grep -q 'QUEUE rc=0 bad=1 STARVED=1' "$out"; then
+  if [ "$scenario" = recent_success_mixed ] && ! grep -q 'confirmed successes=1' "$out"; then
+    echo "FAIL: $label erased confirmed recent success"; cat "$out"; OVERALL_PASS=false; return
+  fi
+  if [[ "$scenario" = job_wait_10* ]] && [ "$expected" -eq 1 ]; then
+    if ! grep -q 'bad=0 STARVED=1' "$out"; then
+      echo "FAIL: $label lost independent starvation proof"; cat "$out"; OVERALL_PASS=false; return
+    fi
+  elif [[ "$scenario" = job_wait* ]] && [ "$expected" -eq 1 ] &&
+     ! grep -Eq 'QUEUE rc=[01] bad=1 STARVED=1' "$out"; then
     echo "FAIL: $label bypassed proven queue/starvation failure"; cat "$out"; OVERALL_PASS=false; return
   fi
   echo "PASS: $label exit=$rc"
@@ -396,6 +448,77 @@ for target in mapruns mapjobs; do
   for reply in empty_created bad_created old_bad_created normalized_created zero_year_created; do api_case "$target" "$reply" 2; done
 done
 for reply in empty_started bad_started; do api_case mapjobs "$reply" 2; done
+
+# Retain positive job evidence when another repository/status fetch is unknown.
+for target in mapruns mapjobs; do
+  for state in healthy idle remote_idle; do
+    api_case "$target" mixed 1 "$state" 0 job_wait_mixed
+    api_case "$target" mixed 2 "$state" 0 concurrency_mixed
+  done
+done
+# Every workflow-run ingress rejects schema-invalid successful HTTP responses.
+for target in queue queue_queued queue_progress queue_later; do
+  for reply in error malformed schema null array null_runs object_runs invalid_count negative_count boolean_count null_member invalid_record bad_timestamp; do
+    api_case "$target" "$reply" 2
+    api_case "$target" "$reply" 1 down
+    api_case "$target" "$reply" 1 idle 0 job_wait
+  done
+done
+# Unknowns at unrelated ingress points cannot suppress an observed job failure.
+for target in runners recent jobs baseline dispatch poll view; do
+  prove=0; [[ "$target" = baseline || "$target" = dispatch || "$target" = poll || "$target" = view ]] && prove=1
+  api_case "$target" error 1 idle "$prove" job_wait
+done
+for target in runners recent jobs mapruns mapjobs baseline poll view; do
+  prove=0; [[ "$target" = baseline || "$target" = poll || "$target" = view ]] && prove=1
+  for reply in empty_body null null_member bad_page; do
+    api_case "$target" "$reply" 2 healthy "$prove"
+    api_case "$target" "$reply" 1 down "$prove"
+  done
+done
+for reply in missing_conclusion bad_conclusion; do api_case view "$reply" 2 healthy 1; done
+api_case jobs error 1 healthy 1 failed_canary
+api_case none healthy 1 healthy 1 failed_canary
+api_case runners error 1 healthy 1 failed_canary
+api_case recent error 1 healthy 1 failed_canary
+api_case queue error 1 healthy 1 failed_canary
+api_case none healthy 2 healthy 0 recent_success_mixed
+api_case none healthy 2 healthy 0 recent_failed_mixed
+api_case none healthy 1 healthy 0 recent_failed_complete
+for target in mapruns mapjobs; do
+  api_case "$target" mixed 2 healthy 0 job_wait_10_mixed
+  for state in idle remote_idle; do
+    api_case "$target" mixed 1 "$state" 0 job_wait_10_mixed
+    api_case "$target" mixed 2 "$state" 0 job_wait_1_mixed
+  done
+done
+api_case none healthy 0 healthy 0 job_wait_10
+api_case none healthy 1 idle 0 job_wait_10
+api_case none healthy 0 idle 0 job_wait_1_complete
+for reply in error partial long_error malformed denied rate_limited; do
+  expected=2; [ "$reply" != denied ] || expected=1
+  api_case token "$reply" "$expected"
+  api_case token "$reply" 1 down
+done
+
+# Standalone callers traverse the same response validator without a job map.
+for target in queue_queued queue_progress queue_later; do
+  for reply in healthy schema null_runs invalid_count invalid_record bad_timestamp; do
+    expected=2; [ "$reply" != healthy ] || expected=0
+    label="standalone-$target-$reply"; rc=0
+    PATH="$API_TMP/bin:$PATH" HOME="$API_TMP/home" TMPDIR="$API_TMP" \
+      XDG_CONFIG_HOME="$API_TMP/home/.config" XDG_STATE_HOME="$API_TMP/home/.local/state" \
+      FAKE_CALLS="$API_TMP/$label.calls" FAKE_STATE="$API_TMP/$label.state" \
+      FAKE_OLD_AT="$ONE_AT" FAKE_TARGET="$target" FAKE_REPLY="$reply" \
+      FAKE_SCENARIO=empty LOCAL_STATE=healthy \
+      bash "$REPO_ROOT/scripts/queue-health.sh" > "$API_TMP/$label.log" 2>&1 || rc=$?
+    if [ "$rc" -eq "$expected" ] && ! grep -q 'unexpected gh call:' "$API_TMP/$label.log"; then
+      echo "PASS: $label exit=$rc"
+    else
+      echo "FAIL: $label rc=$rc expected=$expected"; cat "$API_TMP/$label.log"; OVERALL_PASS=false
+    fi
+  done
+done
 
 echo "API receipts: $API_TMP"
 echo "--- summary ---"

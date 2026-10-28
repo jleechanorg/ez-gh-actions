@@ -48,6 +48,11 @@ API_UNVERIFIED=0
 gh_json() {
   local label="$1" valid="$2" rc=0 pages=false arg diagnostic
   shift 2
+  if [ "${GH_TOKEN_LIVE_UNAVAILABLE:-0}" -eq 1 ]; then
+    warn "$label UNVERIFIED (token live-check unavailable; no additional request)"
+    GH_JSON=""
+    return 1
+  fi
   for arg in "$@"; do
     if [ "$arg" = --paginate ]; then pages=true; fi
   done
@@ -451,13 +456,25 @@ fi
 if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN_STATUS" = "warn" ]; }; then
   # awk NR==1 (no exit) consumes gh's full output — `| head -1` here made gh
   # take SIGPIPE under pipefail and killed the whole script with exit 141.
-  GH_TOKEN_LIVE_HTTP=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>/dev/null | awk 'NR==1{print $2}')
-  if [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
+  GH_TOKEN_LIVE_RC=0
+  GH_TOKEN_LIVE_RESPONSE=$(GH_TOKEN="$(cat "$GH_TOKEN_PATH" 2>/dev/null)" gh api -i "orgs/$ORG/actions/runners?per_page=1" 2>&1) || GH_TOKEN_LIVE_RC=$?
+  GH_TOKEN_LIVE_HTTP=$(printf '%s\n' "$GH_TOKEN_LIVE_RESPONSE" | awk 'NR==1 && /^HTTP\// {print $2}')
+  GH_TOKEN_LIVE_UNAVAILABLE=0
+  if [ "$GH_TOKEN_LIVE_RC" -ne 0 ] || [ "$GH_TOKEN_LIVE_HTTP" != 200 ]; then
+    GH_TOKEN_LIVE_UNAVAILABLE=1
+  fi
+  if [ "$GH_TOKEN_LIVE_RC" -eq 0 ] && [ "$GH_TOKEN_LIVE_HTTP" = "200" ]; then
     ok "gh_token live-check: 200 against orgs/$ORG/actions/runners (mtime freshness confirmed by a real call, not just a clock)"
-  else
+  elif [ "$GH_TOKEN_LIVE_HTTP" = "401" ]; then
     bad "gh_token live-check FAILED: mtime says '$GH_TOKEN_STATUS' (age ${GH_TOKEN_AGE_MIN}m) but a live API call using this exact token returned HTTP ${GH_TOKEN_LIVE_HTTP:-<no response>}, not 200 — token is cryptographically dead (likely signed by a rotated-out private key, see bead jleechan-wzk) even though its mtime looks fine"
     GH_TOKEN_STATUS="live_check_failed"
     GH_TOKEN_STALE_CRITICAL=1
+  else
+    if [ "${#GH_TOKEN_LIVE_RESPONSE}" -gt 400 ]; then
+      GH_TOKEN_LIVE_RESPONSE="${GH_TOKEN_LIVE_RESPONSE:0:180} ... ${GH_TOKEN_LIVE_RESPONSE: -200}"
+    fi
+    warn "gh_token live-check UNVERIFIED (gh exit $GH_TOKEN_LIVE_RC, HTTP ${GH_TOKEN_LIVE_HTTP:-<no response>}): $GH_TOKEN_LIVE_RESPONSE"
+    API_UNVERIFIED=$((API_UNVERIFIED + 1))
   fi
 fi
 # --- C. GitHub-side runner fleet ----------------------------------------
@@ -674,10 +691,13 @@ if [ "$PROVE" = "1" ]; then
     bad "canary never appeared — dispatch failed or no runner picked it up"
   else
     for _ in $(seq 1 18); do
-      if ! gh_json "canary run $cid" 'type == "object" and (.status | IN("completed", "in_progress", "queued", "waiting", "requested", "pending"))' run view "$cid" -R "$EZGHA_REPO" --json status,conclusion; then
+      if ! gh_json "canary run $cid" 'type == "object" and (.status | IN("completed", "in_progress", "queued", "waiting", "requested", "pending")) and has("conclusion") and (.conclusion == null or (.conclusion | type == "string"))' run view "$cid" -R "$EZGHA_REPO" --json status,conclusion; then
         CANARY_UNVERIFIED=1; break
       fi
       st=$(printf '%s' "$GH_JSON" | jq -r '.status')
+      if [ "$st" = completed ] && printf '%s' "$GH_JSON" | jq -e '.conclusion != null and .conclusion != "success"' >/dev/null; then
+        CANARY_OK=0
+      fi
       [ "$st" = "completed" ] && break
       sleep 10
     done
@@ -685,7 +705,7 @@ if [ "$PROVE" = "1" ]; then
     jobs="$GH_JSON"
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
+    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ] && [ "$CANARY_OK" != 0 ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
     else
@@ -722,8 +742,8 @@ RUNNER_JOB_INDEX_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-doctor-jobmap.XXXXXX" 2>/d
 # indistinguishable from a genuinely drained queue (JOBLEVEL_QUEUED_COUNT=0,
 # oldest=0m) and the section-8 gate would report GREEN under the exact
 # API-truncation hazard documented in CLAUDE.md. Health gates must fail
-# honest, never silent-green: any fetch error leaves job-level queue and
-# starvation proof unknown; run age cannot prove runner wait.
+# honest, never silent-green: fetch errors leave completeness unknown;
+# validated jobs remain lower bounds. Run age cannot prove runner wait.
 JOBMAP_ERRORS_FILE="${RUNNER_JOB_INDEX_FILE}.errors"
 : > "$JOBMAP_ERRORS_FILE"
 trap 'rm -f "$RUNNER_JOB_INDEX_FILE" "$JOBMAP_ERRORS_FILE"' EXIT
@@ -807,21 +827,14 @@ JOBLEVEL_FETCH_ERRORS=$(( ${JOBLEVEL_RUNLIST_ERRORS:-0} + ${JOBLEVEL_JOBS_ERRORS
 API_UNVERIFIED=$((API_UNVERIFIED + JOBLEVEL_FETCH_ERRORS))
 export JOBLEVEL_FETCH_ERRORS JOBLEVEL_RUNLIST_ERRORS JOBLEVEL_JOBS_ERRORS
 if [ "$JOBLEVEL_FETCH_ERRORS" -gt 0 ]; then
-  # Degraded map: counts are UNKNOWN, not zero. Consumers must not infer
-  # runner starvation from run age, which includes concurrency wait.
-  JOBLEVEL_OLDEST_QUEUED_MIN="?"
-  warn "job map DEGRADED: ${JOBLEVEL_FETCH_ERRORS} fetch error(s) (${JOBLEVEL_RUNLIST_ERRORS} run-list, ${JOBLEVEL_JOBS_ERRORS} per-run jobs) — job-level queue counts are UNKNOWN, not zero; queue/starvation proof UNVERIFIED"
+  warn "job map DEGRADED: ${JOBLEVEL_FETCH_ERRORS} fetch error(s) (${JOBLEVEL_RUNLIST_ERRORS} run-list, ${JOBLEVEL_JOBS_ERRORS} per-run jobs) — observed jobs are lower bounds; completeness UNVERIFIED"
 fi
 
 # --- F2. GitHub Actions queue health (saturation / tail latency) ----------
 QUEUE_TAIL_BAD=0
 QUEUE_QUEUED_STALE=0
 QUEUE_RC=0
-if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-?}" = "?" ]; then
-  section "8. GitHub Actions queue health"
-  warn "queue health UNVERIFIED (job map unavailable; run age cannot prove runner wait)"
-  QUEUE_RC=2
-elif [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
+if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   # `|| QUEUE_RC=$?` keeps errexit suppressed inside the sourced body even if
   # it re-arms `set -e`: this section must never abort sections 9/10.
   QUEUE_RC=0
@@ -829,7 +842,6 @@ elif [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   # shellcheck source=/dev/null
   source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   set -e
-  if [ "$QUEUE_RC" -ne 0 ]; then QUEUE_TAIL_BAD=1; fi  # 1 = tail exceeded, 2 = unmeasurable (UNPROVEN)
 else
   section "8. GitHub Actions queue health"
   warn "scripts/queue-health.sh missing — queue metrics skipped"
@@ -1008,19 +1020,16 @@ for _name in "${DOWN_SLOTS[@]}"; do LOCAL_SLOT_STATE_TABLE+="$_name DOWN"$'\n'; 
 # correct sustained-duration signal. Unavailable job proof leaves starvation
 # UNVERIFIED; run age cannot replace it. DOWN is always a defect.
 IDLE_STARVED_THRESHOLD_MIN="${IDLE_STARVED_THRESHOLD_MIN:-5}"
-# Degraded/unusable job map ("?" age or any fetch error) means job-level
-# counts are UNKNOWN. Never turn concurrency/staged-gate wait into proof
-# that a queued job is waiting for a runner.
-if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-?}" = "?" ]; then
-  STARVE_QUEUED_COUNT=0
-  STARVE_OLDEST_MIN="?"
-else
-  STARVE_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
-  STARVE_OLDEST_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN:-0}"
-fi
+# Observed queued jobs prove starvation even when other fetches fail.
+STARVE_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
+STARVE_OLDEST_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN:-?}"
 STARVED_PRESENT=0
 if [ "$STARVE_OLDEST_MIN" != "?" ] && [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ] && awk -v a="${STARVE_OLDEST_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
   STARVED_PRESENT=1
+fi
+# A lower bound below the threshold cannot prove the whole queue healthy.
+if [ "$STARVED_PRESENT" -eq 0 ] && [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  STARVE_OLDEST_MIN="?"
 fi
 
 SLOT_PROOF_CRITICAL=0
@@ -1582,7 +1591,7 @@ emit_failure_remediation() {
 # state is never hidden behind a green light. A degraded map prints as
 # UNKNOWN, never as a reassuring "0 queued".
 if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
-  echo "  queue: UNKNOWN — job map degraded (${JOBLEVEL_FETCH_ERRORS} fetch errors); queue/starvation proof UNVERIFIED"
+  echo "  queue: at least ${JOBLEVEL_QUEUED_COUNT:-0} queued job(s) (oldest observed ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m); completeness UNKNOWN (${JOBLEVEL_FETCH_ERRORS} fetch errors)"
 elif [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
   echo "  queue: ${JOBLEVEL_QUEUED_COUNT} queued job(s) (oldest ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 else
@@ -1705,7 +1714,10 @@ elif [ "${REAL_ON_FLEET:-0}" -lt 1 ]; then
   CRITICAL=$((CRITICAL+1))
 fi
 # canary gate (only when --prove): the live job must have run on our fleet
-if [ "$PROVE" = "1" ] && [ "$CANARY_UNVERIFIED" -eq 1 ]; then
+if [ "$PROVE" = "1" ] && [ "$CANARY_OK" = 0 ]; then
+  bad "verdict: canary gate FAILED (completed run has a non-success conclusion)"
+  CRITICAL=$((CRITICAL+1))
+elif [ "$PROVE" = "1" ] && [ "$CANARY_UNVERIFIED" -eq 1 ]; then
   warn "verdict: canary gate UNVERIFIED (dispatch/run/job evidence unavailable)"
 elif [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]; then
   bad "verdict: canary gate FAILED (--prove requested but no successful run confirmed on ${RUNNER_NAME_PREFIX}-* — see section 7b above)"
