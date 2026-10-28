@@ -24,12 +24,26 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Prove execution environment
+        env:
+          CANARY_NONCE: ${{ inputs.nonce || github.run_id }}
         run: |
-          echo "canary nonce: ${{ inputs.nonce }}"
+          set -euo pipefail
+          echo "canary nonce: $CANARY_NONCE"
           echo "runner name: $RUNNER_NAME"
           echo "hostname: $(hostname)"
           uname -a
           nproc
           cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo "no cgroup file"
           cat /sys/fs/cgroup/pids.max 2>/dev/null || true
+          marker="$GITHUB_WORKSPACE/.ezgha-selftest-marker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s\n' "$CANARY_NONCE" > "$marker"
+          readback=$(cat "$marker")
+          test "$readback" = "$CANARY_NONCE"
+          if command -v sha256sum >/dev/null 2>&1; then
+            marker_sha=$(sha256sum "$marker" | awk '{print $1}')
+          else
+            marker_sha=$(shasum -a 256 "$marker" | awk '{print $1}')
+          fi
+          printf 'scratch workspace marker: path=%s bytes=%s sha256=%s\n' \
+            "$marker" "$(wc -c < "$marker" | tr -d ' ')" "$marker_sha"
           echo "ephemeral runner proof: this job ran, the runner will now deregister"
