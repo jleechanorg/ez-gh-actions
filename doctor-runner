@@ -42,6 +42,31 @@ warn() { printf '  [WARN] %s\n' "$*"; }
 bad() { printf '  [BAD]  %s\n' "$*"; }
 info() { printf '  [..]   %s\n' "$*"; }
 
+# Capture transport status before parsing; missing proof is never an empty fleet.
+# Call directly (not in a subshell) so the unverified count reaches the verdict.
+API_UNVERIFIED=0
+gh_json() {
+  local label="$1" valid="$2" rc=0 pages=false arg diagnostic
+  shift 2
+  for arg in "$@"; do
+    if [ "$arg" = --paginate ]; then pages=true; fi
+  done
+  GH_JSON=$(gh "$@" 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    diagnostic="$GH_JSON"
+    if [ "${#diagnostic}" -gt 400 ]; then diagnostic="${GH_JSON:0:180} ... ${GH_JSON: -200}"; fi
+    warn "$label UNVERIFIED (gh exit $rc): $diagnostic"
+  elif ! printf '%s' "$GH_JSON" | jq -se "length > 0 and (length == 1 or $pages) and all(.[]; $valid)" >/dev/null 2>&1; then
+    warn "$label UNVERIFIED (invalid JSON response): ${GH_JSON:0:400}"
+  else
+    return 0
+  fi
+  API_UNVERIFIED=$((API_UNVERIFIED + 1))
+  GH_JSON=""
+  return 1
+}
+# --- end GitHub response helper -----------------------------------------
+
 # Parse the authoritative [runner].count with Python's TOML parser. The old
 # awk removed every non-digit from the whole assignment tail, so digits in an
 # inline comment (for example a resize date) were appended to the real value;
@@ -436,7 +461,11 @@ if [ -f "$GH_TOKEN_PATH" ] && { [ "$GH_TOKEN_STATUS" = "fresh" ] || [ "$GH_TOKEN
 fi
 # --- C. GitHub-side runner fleet ----------------------------------------
 section "5. GitHub org runner fleet ($ORG)"
-RAW=$($(command -v gh) api "orgs/$ORG/actions/runners" --paginate 2>/dev/null || echo '{"runners":[]}')
+RUNNERS_VERIFIED=0
+RAW=""; TOTAL=unknown; ONLINE=unknown; OFFLINE=unknown; BUSY=unknown
+if gh_json "runner list" 'type == "object" and (.runners | type == "array") and all(.runners[]; (.name | type == "string") and (.status == "online" or .status == "offline") and (.busy | type == "boolean"))' api "orgs/$ORG/actions/runners" --paginate; then
+RUNNERS_VERIFIED=1
+RAW=$(printf '%s' "$GH_JSON" | jq -s '{runners: [.[].runners[]]}')
 TOTAL=$(echo "$RAW" | jq '.total_count // (.runners | length)')
 ONLINE=$(echo "$RAW" | jq '[.runners[] | select(.status=="online")] | length')
 OFFLINE=$(echo "$RAW" | jq '[.runners[] | select(.status=="offline")] | length')
@@ -459,6 +488,7 @@ if [ -n "$COLIMA_RUNNERS" ]; then
   echo "$COLIMA_RUNNERS" | while read -r n s; do
     warn "colima: $n $s"
   done
+fi
 fi
 
 # --- D. live docker containers ------------------------------------------
@@ -579,10 +609,19 @@ section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
 REAL_TOTAL=0
+REAL_UNVERIFIED=0
+JOBS_VALID='type == "object" and (.jobs | type == "array") and all(.jobs[]; has("runner_name") and has("conclusion") and (.runner_name == null or (.runner_name | type == "string")) and (.conclusion == null or (.conclusion | type == "string")))'
+RUNS_VALID='type == "array" and all(.[]; (.databaseId | type == "number" and . > 0 and floor == .))'
+if gh_json "recent run list" "$RUNS_VALID" run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId; then
+RECENT_RUN_IDS=$(printf '%s' "$GH_JSON" | jq -r '.[].databaseId')
 while read -r rid; do
   [ -z "$rid" ] && continue
   REAL_TOTAL=$((REAL_TOTAL+1))
-  jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
+  if ! gh_json "jobs for run $rid" "$JOBS_VALID" api "repos/$EZGHA_REPO/actions/runs/$rid/jobs"; then
+    REAL_UNVERIFIED=1
+    continue
+  fi
+  jobs="$GH_JSON"
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
   if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; then
@@ -591,34 +630,58 @@ while read -r rid; do
   else
     warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-* / ez-*)"
   fi
-done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
-info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+done <<< "$RECENT_RUN_IDS"
+else
+  REAL_UNVERIFIED=1
+fi
+if [ "$REAL_UNVERIFIED" -eq 1 ]; then
+  warn "real job-execution proof UNVERIFIED (incomplete API evidence; confirmed successes=$REAL_ON_FLEET)"
+else
+  info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+fi
 
 # --- E2. optional live canary: dispatch a job and prove it runs NOW ------
 # `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
 # then confirms the runner_name matches the configured prefix and conclusion=success.
 # This is the strongest "handled for real, right now" proof.
 CANARY_OK=""
+CANARY_UNVERIFIED=0
 if [ "$PROVE" = "1" ]; then
   section "7b. live canary (dispatch + verify a job runs on our fleet NOW)"
-  before=$($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)
-  $(command -v gh) workflow run ezgha-selftest -R "$EZGHA_REPO" >/dev/null 2>&1
+  if gh_json "canary baseline" "$RUNS_VALID" run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId; then
+  before=$(printf '%s' "$GH_JSON" | jq -r '.[0].databaseId // 0')
+  dispatch_rc=0
+  dispatch_error=$(gh workflow run ezgha-selftest -R "$EZGHA_REPO" 2>&1) || dispatch_rc=$?
+  if [ "$dispatch_rc" -ne 0 ]; then
+    warn "canary dispatch UNVERIFIED (gh exit $dispatch_rc): ${dispatch_error:0:400}"
+    CANARY_UNVERIFIED=1
+    API_UNVERIFIED=$((API_UNVERIFIED + 1))
+  else
   info "dispatched canary; waiting for a new run to appear + complete (up to 180s)..."
   cid=""
   for _ in $(seq 1 18); do
     sleep 10
-    latest=$($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId --jq '.[0].databaseId // 0' 2>/dev/null)
+    if ! gh_json "canary run list" "$RUNS_VALID" run list -R "$EZGHA_REPO" -w ezgha-selftest -L 1 --json databaseId; then
+      CANARY_UNVERIFIED=1; break
+    fi
+    latest=$(printf '%s' "$GH_JSON" | jq -r '.[0].databaseId // 0')
     [ "$latest" != "$before" ] && [ "$latest" != "0" ] && { cid="$latest"; break; }
   done
-  if [ -z "$cid" ]; then
+  if [ "$CANARY_UNVERIFIED" -eq 1 ]; then
+    : # Missing API evidence must not become a failed canary.
+  elif [ -z "$cid" ]; then
     bad "canary never appeared — dispatch failed or no runner picked it up"
   else
     for _ in $(seq 1 18); do
-      st=$($(command -v gh) run view "$cid" -R "$EZGHA_REPO" --json status,conclusion --jq '.status' 2>/dev/null)
+      if ! gh_json "canary run $cid" 'type == "object" and (.status | IN("completed", "in_progress", "queued", "waiting", "requested", "pending"))' run view "$cid" -R "$EZGHA_REPO" --json status,conclusion; then
+        CANARY_UNVERIFIED=1; break
+      fi
+      st=$(printf '%s' "$GH_JSON" | jq -r '.status')
       [ "$st" = "completed" ] && break
       sleep 10
     done
-    jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
+    if [ "$CANARY_UNVERIFIED" -eq 0 ] && gh_json "canary jobs $cid" "$JOBS_VALID" api "repos/$EZGHA_REPO/actions/runs/$cid/jobs"; then
+    jobs="$GH_JSON"
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
     if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
@@ -627,6 +690,13 @@ if [ "$PROVE" = "1" ]; then
     else
       bad "canary run $cid: $conc on $rn (expected success on our fleet ez-*)"
     fi
+    else
+      CANARY_UNVERIFIED=1
+    fi
+  fi
+  fi
+  else
+    CANARY_UNVERIFIED=1
   fi
 fi
 
@@ -683,10 +753,12 @@ build_runner_job_index() {
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
-      runs_json=$(gh api "repos/$repo/actions/runs?status=$status&per_page=50" 2>/dev/null) || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
+      gh_json "job-map runs $repo $status" 'type == "object" and (.workflow_runs | type == "array") and all(.workflow_runs[]; (.id | type == "number") and (.html_url | type == "string") and (.created_at | type == "string"))' api "repos/$repo/actions/runs?status=$status&per_page=50" >&2 || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
+      runs_json="$GH_JSON"
       while IFS=$'\t' read -r rid run_url; do
         [ -z "$rid" ] && continue
-        jobs_json=$(gh api "repos/$repo/actions/runs/$rid/jobs" 2>/dev/null) || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+        gh_json "job-map jobs $repo $rid" 'type == "object" and (.jobs | type == "array") and all(.jobs[]; (.status | type == "string") and (.html_url | type == "string") and (.created_at | type == "string"))' api "repos/$repo/actions/runs/$rid/jobs" >&2 || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+        jobs_json="$GH_JSON"
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
            | {runner_name, job_name: .name, status, repo: $repo, run_url: $run_url, html_url, started_at, created_at}' 2>/dev/null
@@ -726,6 +798,7 @@ if [ -s "$JOBMAP_ERRORS_FILE" ]; then
   JOBLEVEL_JOBS_ERRORS=$(grep -c '^jobs' "$JOBMAP_ERRORS_FILE" 2>/dev/null || true)
 fi
 JOBLEVEL_FETCH_ERRORS=$(( ${JOBLEVEL_RUNLIST_ERRORS:-0} + ${JOBLEVEL_JOBS_ERRORS:-0} ))
+API_UNVERIFIED=$((API_UNVERIFIED + JOBLEVEL_FETCH_ERRORS))
 export JOBLEVEL_FETCH_ERRORS JOBLEVEL_RUNLIST_ERRORS JOBLEVEL_JOBS_ERRORS
 if [ "$JOBLEVEL_FETCH_ERRORS" -gt 0 ]; then
   # Degraded map: counts are UNKNOWN, not zero. "?" makes every consumer
@@ -1524,7 +1597,9 @@ fi
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
 # `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-g-*` fleet
 # counts the same as Linux's `ez-org-runner-*` / `ez-runner-b-*`.)
-if ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1; then
+if [ "$RUNNERS_VERIFIED" -eq 0 ]; then
+  warn "verdict: runners-online gate UNVERIFIED (runner list unavailable; local slot truth unchanged)"
+elif ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1; then
   bad "verdict: runners-online gate FAILED (no ONLINE runner with prefix '$RUNNER_NAME_PREFIX' found; total=$TOTAL online=$ONLINE offline=$OFFLINE busy=$BUSY)"
   CRITICAL=$((CRITICAL+1))
 fi
@@ -1599,7 +1674,9 @@ fi
 # actually matters when the fleet is dark). PR #4 (release_stale_slots) will
 # fix the underlying collision; until that lands in main, do not fail the
 # fleet over a transient reconcile miss.
-if [ "$LOOP_FAILS" -gt 3 ]; then
+if [ "$LOOP_FAILS" -gt 3 ] && [ "$RUNNERS_VERIFIED" -eq 0 ]; then
+  warn "verdict: ensure_count-loop gate UNVERIFIED ($LOOP_FAILS errors; runner list unavailable)"
+elif [ "$LOOP_FAILS" -gt 3 ]; then
   HEALTHY_RUNNERS=$(echo "$RAW" | jq -r --arg pfx "$RUNNER_NAME_PREFIX" '[.runners[] | select(.name | startswith($pfx)) | select(.status=="online")] | length')
   if [ "${HEALTHY_RUNNERS:-0}" -lt 1 ]; then
     CRITICAL=$((CRITICAL+1))
@@ -1609,19 +1686,26 @@ if [ "$LOOP_FAILS" -gt 3 ]; then
   fi
 fi
 # real-execution gate: at least one recent job must have succeeded on our fleet
-if [ "${REAL_ON_FLEET:-0}" -lt 1 ]; then
+if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$REAL_UNVERIFIED" -eq 1 ]; then
+  warn "verdict: real-execution gate UNVERIFIED (recent run/job evidence unavailable)"
+elif [ "${REAL_ON_FLEET:-0}" -lt 1 ]; then
   bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on our fleet)"
   CRITICAL=$((CRITICAL+1))
 fi
 # canary gate (only when --prove): the live job must have run on our fleet
-if [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]; then
+if [ "$PROVE" = "1" ] && [ "$CANARY_UNVERIFIED" -eq 1 ]; then
+  warn "verdict: canary gate UNVERIFIED (dispatch/run/job evidence unavailable)"
+elif [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]; then
   bad "verdict: canary gate FAILED (--prove requested but no successful run confirmed on ${RUNNER_NAME_PREFIX}-* — see section 7b above)"
   CRITICAL=$((CRITICAL+1))
 fi
 # queue tail gate: oldest fresh queued JOB waiting > QUEUE_TAIL_WARN_MIN means
 # saturated/mis-routing. JOB-level (job created_at -> now), not run age — run
 # age includes concurrency/staged-gate wait and false-alarmed (2026-07-10).
-if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
+if [ "${QUEUE_RC:-0}" -eq 2 ]; then
+  warn "verdict: queue-tail gate UNVERIFIED (queue evidence unavailable; see section 8)"
+  API_UNVERIFIED=$((API_UNVERIFIED + 1))
+elif [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
   bad "verdict: queue-tail gate FAILED (QUEUE_TAIL_BAD=1 — oldest fresh queued job wait exceeded ${QUEUE_TAIL_WARN_MIN}m threshold; see section 8 above)"
   CRITICAL=$((CRITICAL+1))
 fi
@@ -1648,6 +1732,10 @@ fi
 if [ "$CRITICAL" -gt 0 ] || [ "${HOST_LIFECYCLE_CRITICAL:-0}" -gt 0 ]; then
   emit_failure_remediation "$CRITICAL" "${HOST_LIFECYCLE_CRITICAL:-0}" "$PLATFORM"
   exit 1
+fi
+if [ "$API_UNVERIFIED" -gt 0 ]; then
+  warn "verdict: UNVERIFIED ($API_UNVERIFIED GitHub request(s) unavailable or invalid; no overall healthy verdict)"
+  exit 2
 fi
 # compute_verdict_summary() aggregates the per-slot LOCAL TRUTH (section 9:
 # EXECUTING_SLOTS/IDLE_SLOTS/DOWN_SLOTS/CYCLING_SLOTS, already 2-sample

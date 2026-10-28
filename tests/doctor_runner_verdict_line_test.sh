@@ -159,6 +159,143 @@ run_case "local-20exec-remote-unreachable-4down" \
   20 0 0 0  0 0 4 0  0 \
   24 24 20 0 0 4 0 || OVERALL_PASS=false
 
+# API proof regression (jleechan-6vlf). Exercise extracted production sections,
+# including their final exit status, with no Docker, SSH, or provider access.
+SCRATCH="${DOCTOR_WORKER_OUTPUT:-$("$HOME/.claude/skills/scratch-space/scripts/scratch-dir.sh" doctor-api-test)}"
+API_TMP=$(mktemp -d "$SCRATCH/verdict-api.XXXXXX")
+mkdir -p "$API_TMP/bin"
+cat > "$API_TMP/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+case "$*" in
+  *orgs/*/actions/runners*) target=runners; json='{"runners":[{"name":"ez-runner-c-1","status":"online","busy":true}]}' ;;
+  *workflow\ run*) target=dispatch; json='' ;;
+  *run\ view*) target=view; json='{"status":"completed","conclusion":"success"}' ;;
+  *run\ list*)
+    target=recent; json='[{"databaseId":3}]'
+    if [[ "$*" == *'-L 1 '* ]]; then
+      if [ -f "$FAKE_STATE" ]; then target=poll; json='[{"databaseId":2}]'
+      else target=baseline; json='[{"databaseId":1}]'; touch "$FAKE_STATE"; fi
+    fi ;;
+  *actions/runs\?*)
+    target=mapruns; json='{"workflow_runs":[]}'
+    if [ "$FAKE_TARGET" = mapjobs ]; then
+      json='{"workflow_runs":[{"id":4,"html_url":"https://example.invalid/run/4","created_at":"2099-01-01T00:00:00Z"}]}'
+    fi ;;
+  *actions/runs/4/jobs*) target=mapjobs; json='{"jobs":[{"status":"in_progress","name":"test","runner_name":"ez-runner-c-1","html_url":"https://example.invalid/job/4","created_at":"2099-01-01T00:00:00Z"}]}' ;;
+  *actions/runs/*/jobs*) target=jobs; json='{"jobs":[{"runner_name":"ez-runner-c-1","conclusion":"success"}]}' ;;
+  *) echo "unexpected gh call: $*" >&2; exit 99 ;;
+esac
+if [ "$FAKE_TARGET" = "$target" ]; then
+  case "$FAKE_REPLY" in
+    error) echo 'gh: HTTP 403: API rate limit exceeded' >&2; exit 1 ;;
+    partial) printf '%s\n' "$json"; echo 'gh: HTTP 403: partial response' >&2; exit 1 ;;
+    long_error) printf '%02000d\n' 0; echo 'gh: HTTP 403: partial response' >&2; exit 1 ;;
+    malformed) echo 'not JSON'; exit 0 ;;
+    schema) echo '{}'; exit 0 ;;
+    empty)
+      case "$target" in
+        runners) json='{"runners":[]}' ;;
+        recent) json='[]' ;;
+        jobs) json='{"jobs":[]}' ;;
+      esac ;;
+    pages) printf '%s\n' "$json" "$json"; exit 0 ;;
+  esac
+fi
+printf '%s\n' "$json"
+SH
+chmod +x "$API_TMP/bin/gh"
+# Fail closed if a future extraction accidentally reaches local probe commands.
+for tool in docker ssh; do
+  printf '#!/usr/bin/env bash\necho "UNEXPECTED LIVE PROBE" >&2\nexit 99\n' > "$API_TMP/bin/$tool"
+  chmod +x "$API_TMP/bin/$tool"
+done
+
+HARNESS="$API_TMP/harness.sh"
+cat > "$HARNESS" <<'SH'
+set -euo pipefail
+section() { :; }; info() { echo "INFO $*"; }; ok() { echo "OK $*"; }
+warn() { echo "WARN $*"; }; bad() { echo "BAD $*"; }
+sleep() { :; }
+read_config_runner_count() { echo 20; }
+emit_failure_remediation() { echo "FAILURE critical=$1"; }
+ORG=test; EZGHA_REPO=test/repo; RUNNER_NAME_PREFIX=ez-runner-c
+PLATFORM=linux; EXPLICIT_WORK_REPOS=test/repo
+SERVICE_STATE=active; COLIMA_STATUS=NotInstalled
+LOCAL_CONFIG_FILE=unused; SLOT_FILE=unused; DEFAULT_CONFIGURED_COUNT=20
+LOCAL_COUNT=20; REMOTE_COUNT=4; CONTAINER_COUNT=20
+LOOP_FAILS=4; LOOP_WINDOW=3; QUEUE_TAIL_WARN_MIN=20
+QUEUE_TAIL_BAD=0; QUEUE_RC=0; HOST_LIFECYCLE_CRITICAL=0
+GH_TOKEN_STALE_CRITICAL=0; SLOT_PROOF_CRITICAL=0
+EXECUTING_SLOTS=(); IDLE_SLOTS=(); DOWN_SLOTS=(); CYCLING_SLOTS=()
+REMOTE_EXECUTING_SLOTS=(m1 m2 m3 m4)
+REMOTE_IDLE_SLOTS=(); REMOTE_DOWN_SLOTS=(); REMOTE_CYCLING_SLOTS=()
+for n in $(seq 1 20); do EXECUTING_SLOTS+=("c$n"); done
+case "$LOCAL_STATE" in
+  down) unset 'EXECUTING_SLOTS[19]'; DOWN_SLOTS=(c20); SLOT_PROOF_CRITICAL=1 ;;
+  starved) unset 'EXECUTING_SLOTS[19]'; IDLE_SLOTS=(c20); SLOT_PROOF_CRITICAL=1 ;;
+  queue_unknown) QUEUE_RC=2; QUEUE_TAIL_BAD=1 ;;
+esac
+SH
+{
+  sed -n '/^API_UNVERIFIED=0$/,/^# --- end GitHub response helper/p' "$DOCTOR_SCRIPT"
+  sed -n '/^# --- C\. GitHub-side/,/^# --- D\. live docker/p' "$DOCTOR_SCRIPT" | sed '$d'
+  sed -n '/^section "7\. real job/,/^# --- F1b\./p' "$DOCTOR_SCRIPT" | sed '$d'
+  sed -n '/^EXPLICIT_WORK_REPOS=/,/^# --- F2\./p' "$DOCTOR_SCRIPT" | sed '$d'
+  sed -n '/^CRITICAL=0$/,$p' "$DOCTOR_SCRIPT"
+} >> "$HARNESS"
+bash -n "$HARNESS"
+
+api_case() {
+  local target="$1" reply="$2" expected="$3" local_state="${4:-healthy}" prove="${5:-0}"
+  local label="$target-$reply-$local_state-prove$prove" rc=0 out
+  out="$API_TMP/$label.log"
+  # Distinct state per case; the fake canary baseline and poll cannot collide.
+  PATH="$API_TMP/bin:$PATH" TMPDIR="$API_TMP" FAKE_STATE="$API_TMP/$label.state" \
+    FAKE_TARGET="$target" FAKE_REPLY="$reply" LOCAL_STATE="$local_state" PROVE="$prove" \
+    bash "$HARNESS" > "$out" 2>&1 || rc=$?
+  if [ "$rc" -ne "$expected" ] || grep -q 'UNEXPECTED LIVE PROBE' "$out"; then
+    echo "FAIL: $label rc=$rc expected=$expected"; cat "$out"; OVERALL_PASS=false; return
+  fi
+  if [ "$expected" -eq 2 ]; then
+    if ! grep -q 'verdict: UNVERIFIED' "$out" ||
+       grep -Eq 'fleet healthy:|runners-online gate FAILED|real-execution gate FAILED|canary gate FAILED|total=0 online=0' "$out"; then
+      echo "FAIL: $label fabricated proof/failure"; cat "$out"; OVERALL_PASS=false; return
+    fi
+    if [[ "$reply" = *error ]] && ! grep -q 'HTTP 403' "$out"; then
+      echo "FAIL: $label lost actual error"; OVERALL_PASS=false; return
+    fi
+  elif [ "$expected" -eq 0 ]; then
+    grep -q 'fleet healthy: 24/24' "$out" || { echo "FAIL: $label missing local truth"; OVERALL_PASS=false; return; }
+  elif [ "$local_state" != healthy ]; then
+    grep -q 'per-slot execution-proof gate FAILED' "$out" || { echo "FAIL: $label lost local failure"; OVERALL_PASS=false; return; }
+  else
+    grep -q 'gate FAILED' "$out" || { echo "FAIL: $label empty response did not fail"; OVERALL_PASS=false; return; }
+  fi
+  echo "PASS: $label exit=$rc"
+}
+
+for target in runners recent jobs mapruns mapjobs; do
+  for reply in error malformed schema; do api_case "$target" "$reply" 2; done
+done
+api_case runners partial 2
+api_case runners long_error 2
+api_case recent pages 2
+api_case jobs pages 2
+for target in runners recent jobs; do api_case "$target" empty 1; done
+api_case none healthy 0
+api_case mapjobs healthy 0
+api_case runners pages 0
+api_case none healthy 2 queue_unknown
+api_case runners error 1 down
+api_case runners error 1 starved
+for target in baseline dispatch poll view jobs; do
+  api_case "$target" error 2 healthy 1
+  if [ "$target" != dispatch ]; then api_case "$target" malformed 2 healthy 1; fi
+done
+api_case none healthy 0 healthy 1
+
+echo "API receipts: $API_TMP"
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
   echo "REGRESSION_TEST: PASS"
