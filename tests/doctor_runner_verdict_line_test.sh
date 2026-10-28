@@ -163,10 +163,17 @@ run_case "local-20exec-remote-unreachable-4down" \
 # including their final exit status, with no Docker, SSH, or provider access.
 SCRATCH="${DOCTOR_WORKER_OUTPUT:-${DISKM_SCRATCH:-${TMPDIR:-/tmp}}}"
 API_TMP=$(mktemp -d "$SCRATCH/verdict-api.XXXXXX")
-mkdir -p "$API_TMP/bin"
+mkdir -p "$API_TMP/bin" "$API_TMP/home"
+# Synthetic contract fixtures; no live workflow or runner evidence is used.
+if [ "$(uname -s)" = Darwin ]; then
+  OLD_AT=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ)
+else
+  OLD_AT=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+fi
 cat > "$API_TMP/bin/gh" <<'SH'
 #!/usr/bin/env bash
 set -eu
+printf '%s\n' "$*" >> "$FAKE_CALLS"
 case "$*" in
   *orgs/*/actions/runners*) target=runners; json='{"runners":[{"name":"ez-runner-c-1","status":"online","busy":true}]}' ;;
   *workflow\ run*) target=dispatch; json='' ;;
@@ -177,12 +184,23 @@ case "$*" in
       if [ -f "$FAKE_STATE" ]; then target=poll; json='[{"databaseId":2}]'
       else target=baseline; json='[{"databaseId":1}]'; touch "$FAKE_STATE"; fi
     fi ;;
+  *actions/runs\?*per_page=100*|*actions/runs\?*per_page=1)
+    target=queue; json='{"workflow_runs":[],"total_count":0}'
+    if [ "$LOCAL_STATE" = queue_unknown ]; then echo 'gh: HTTP 403: queue unavailable' >&2; exit 1; fi
+    if [ "$FAKE_SCENARIO" != empty ] && [[ "$*" == *status=queued* ]]; then
+      json=$(jq -nc --arg at "$FAKE_OLD_AT" '{workflow_runs:[{id:4,name:"concurrency-blocked",head_branch:"test",created_at:$at}]}')
+    fi ;;
   *actions/runs\?*)
     target=mapruns; json='{"workflow_runs":[]}'
-    if [ "$FAKE_TARGET" = mapjobs ]; then
+    if [ "$FAKE_TARGET" = mapjobs ] || [ "$FAKE_SCENARIO" != empty ]; then
       json='{"workflow_runs":[{"id":4,"html_url":"https://example.invalid/run/4","created_at":"2099-01-01T00:00:00Z"}]}'
+      if [ "$FAKE_SCENARIO" != empty ]; then json=$(printf '%s' "$json" | jq --arg at "$FAKE_OLD_AT" '.workflow_runs[0].created_at = $at'); fi
     fi ;;
-  *actions/runs/4/jobs*) target=mapjobs; json='{"jobs":[{"status":"in_progress","name":"test","runner_name":"ez-runner-c-1","html_url":"https://example.invalid/job/4","created_at":"2099-01-01T00:00:00Z","started_at":"2099-01-01T00:00:01Z"}]}' ;;
+  *actions/runs/4/jobs*)
+    target=mapjobs; json='{"jobs":[{"status":"in_progress","name":"test","runner_name":"ez-runner-c-1","html_url":"https://example.invalid/job/4","created_at":"2099-01-01T00:00:00Z","started_at":"2099-01-01T00:00:01Z"}]}'
+    if [ "$FAKE_SCENARIO" = job_wait ]; then
+      json=$(printf '%s' "$json" | jq --arg at "$FAKE_OLD_AT" '.jobs[0] |= (.status = "queued" | .created_at = $at | .runner_name = null | .started_at = null)')
+    fi ;;
   *actions/runs/*/jobs*) target=jobs; json='{"jobs":[{"runner_name":"ez-runner-c-1","conclusion":"success"}]}' ;;
   *) echo "unexpected gh call: $*" >&2; exit 99 ;;
 esac
@@ -199,6 +217,19 @@ if [ "$FAKE_TARGET" = "$target" ]; then
     missing_name) json=$(printf '%s' "$json" | jq 'del(.jobs[0].name)') ;;
     missing_started) json=$(printf '%s' "$json" | jq 'del(.jobs[0].started_at)') ;;
     invalid_started) json=$(printf '%s' "$json" | jq '.jobs[0].started_at = 42') ;;
+    empty_created|bad_created|old_bad_created|normalized_created|zero_year_created)
+      at=''; [ "$FAKE_REPLY" != bad_created ] || at=not-a-timestamp
+      [ "$FAKE_REPLY" != old_bad_created ] || at=0000-invalid
+      [ "$FAKE_REPLY" != normalized_created ] || at=2026-02-31T00:00:00Z
+      [ "$FAKE_REPLY" != zero_year_created ] || at=0000-01-01T00:00:00Z
+      if [ "$target" = mapruns ]; then
+        json=$(jq -nc --arg at "$at" '{workflow_runs:[{id:4,html_url:"https://example.invalid/run/4",created_at:$at}]}')
+      else
+        json=$(printf '%s' "$json" | jq --arg at "$at" '.jobs[0].created_at = $at')
+      fi ;;
+    empty_started|bad_started)
+      at=''; [ "$FAKE_REPLY" != bad_started ] || at=not-a-timestamp
+      json=$(printf '%s' "$json" | jq --arg at "$at" '.jobs[0].started_at = $at') ;;
     queued_null) json=$(printf '%s' "$json" | jq '.jobs[0] |= (.status = "queued" | .runner_name = null | .started_at = null)') ;;
     queued_empty) json=$(printf '%s' "$json" | jq '.jobs[0] |= (.status = "queued" | .runner_name = "" | .started_at = null)') ;;
     status_*) json=$(printf '%s' "$json" | jq --arg status "${FAKE_REPLY#status_}" '.jobs[0].status = $status') ;;
@@ -233,49 +264,72 @@ PLATFORM=linux; EXPLICIT_WORK_REPOS=test/repo
 SERVICE_STATE=active; COLIMA_STATUS=NotInstalled
 LOCAL_CONFIG_FILE=unused; SLOT_FILE=unused; DEFAULT_CONFIGURED_COUNT=20
 LOCAL_COUNT=20; REMOTE_COUNT=4; CONTAINER_COUNT=20
+REMOTE_LABEL=fixture-mac
+QUEUE_REPO=test/repo; STALE_HOURS=8
+RESPAWN_EVIDENCE_WINDOW_MIN=3
 LOOP_FAILS=4; LOOP_WINDOW=3; QUEUE_TAIL_WARN_MIN=20
 QUEUE_TAIL_BAD=0; QUEUE_RC=0; HOST_LIFECYCLE_CRITICAL=0
 GH_TOKEN_STALE_CRITICAL=0; SLOT_PROOF_CRITICAL=0
 EXECUTING_SLOTS=(); IDLE_SLOTS=(); DOWN_SLOTS=(); CYCLING_SLOTS=()
 REMOTE_EXECUTING_SLOTS=(m1 m2 m3 m4)
 REMOTE_IDLE_SLOTS=(); REMOTE_DOWN_SLOTS=(); REMOTE_CYCLING_SLOTS=()
-for n in $(seq 1 20); do EXECUTING_SLOTS+=("c$n"); done
+for n in $(seq 1 20); do EXECUTING_SLOTS+=("ez-runner-c-$n"); done
 case "$LOCAL_STATE" in
-  down) unset 'EXECUTING_SLOTS[19]'; DOWN_SLOTS=(c20); SLOT_PROOF_CRITICAL=1 ;;
-  starved) unset 'EXECUTING_SLOTS[19]'; IDLE_SLOTS=(c20); SLOT_PROOF_CRITICAL=1 ;;
-  queue_unknown) QUEUE_RC=2; QUEUE_TAIL_BAD=1 ;;
+  down) unset 'EXECUTING_SLOTS[19]'; DOWN_SLOTS=(ez-runner-c-20) ;;
+  idle) unset 'EXECUTING_SLOTS[19]'; IDLE_SLOTS=(ez-runner-c-20) ;;
+  remote_down) unset 'REMOTE_EXECUTING_SLOTS[3]'; REMOTE_DOWN_SLOTS=(m4) ;;
+  remote_idle) unset 'REMOTE_EXECUTING_SLOTS[3]'; REMOTE_IDLE_SLOTS=(m4) ;;
 esac
 SH
 {
+  printf 'SCRIPT_DIR=%q\n' "$REPO_ROOT"
   sed -n '/^API_UNVERIFIED=0$/,/^# --- end GitHub response helper/p' "$DOCTOR_SCRIPT"
   sed -n '/^# --- C\. GitHub-side/,/^# --- D\. live docker/p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^section "7\. real job/,/^# --- F1b\./p' "$DOCTOR_SCRIPT" | sed '$d'
   sed -n '/^EXPLICIT_WORK_REPOS=/,/^# --- F2\./p' "$DOCTOR_SCRIPT" | sed '$d'
   printf '%s\n' 'printf "JOBMAP queued=%s errors=%s\n" "$JOBLEVEL_QUEUED_COUNT" "$JOBLEVEL_FETCH_ERRORS"'
+  sed -n '/^# --- F2\./,/^# --- F3\./p' "$DOCTOR_SCRIPT" | sed '$d'
+  sed -n '/^IDLE_STARVED_THRESHOLD_MIN=/,/^# --- F4\./p' "$DOCTOR_SCRIPT" | sed '$d'
+  # Render the real local inventory using cached fixture states, with no probes.
+  sed -n '/^LOCAL_SLOT_STATE_TABLE=""$/,/^# IDLE is only/p' "$DOCTOR_SCRIPT" | sed '$d'
+  sed -n '/^job_evidence_for_runner() {/,/^}/p' "$DOCTOR_SCRIPT"
+  sed -n '/^list_slot_work() {/,/^# Local fleet —/p' "$DOCTOR_SCRIPT" | sed '$d'
+  cat <<'SH'
+CONFIGURED_COUNT=$LOCAL_COUNT
+list_slot_work "$RUNNER_NAME_PREFIX" "$LOCAL_COUNT" localhost fixture-local
+SH
+  # The remote critical checks consume fixture slots, without SSH/probes.
+  sed -n '/^  if \[ "${#REMOTE_DOWN_SLOTS\[@\]}"/,/^  fi$/p' "$DOCTOR_SCRIPT"
+  sed -n '/^  if \[ "${#REMOTE_IDLE_SLOTS\[@\]}"/,/^  fi$/p' "$DOCTOR_SCRIPT"
+  cat <<'SH'
+printf "QUEUE rc=%s bad=%s STARVED=%s\n" "$QUEUE_RC" "$QUEUE_TAIL_BAD" "$STARVED_PRESENT"
+SH
   sed -n '/^CRITICAL=0$/,$p' "$DOCTOR_SCRIPT"
 } >> "$HARNESS"
 bash -n "$HARNESS"
 
 api_case() {
-  local target="$1" reply="$2" expected="$3" local_state="${4:-healthy}" prove="${5:-0}"
-  local label="$target-$reply-$local_state-prove$prove" rc=0 out
+  local target="$1" reply="$2" expected="$3" local_state="${4:-healthy}" prove="${5:-0}" scenario="${6:-empty}"
+  local label="$target-$reply-$local_state-prove$prove-$scenario" rc=0 out
   out="$API_TMP/$label.log"
   # Distinct state per case; the fake canary baseline and poll cannot collide.
   PATH="$API_TMP/bin:$PATH" TMPDIR="$API_TMP" FAKE_STATE="$API_TMP/$label.state" \
+    HOME="$API_TMP/home" XDG_CONFIG_HOME="$API_TMP/home/.config" XDG_STATE_HOME="$API_TMP/home/.local/state" \
+    FAKE_CALLS="$API_TMP/$label.calls" FAKE_OLD_AT="$OLD_AT" FAKE_SCENARIO="$scenario" \
     FAKE_TARGET="$target" FAKE_REPLY="$reply" LOCAL_STATE="$local_state" PROVE="$prove" \
     bash "$HARNESS" > "$out" 2>&1 || rc=$?
-  if [ "$rc" -ne "$expected" ] || grep -q 'UNEXPECTED LIVE PROBE' "$out"; then
+  if [ "$rc" -ne "$expected" ] || grep -Eq 'UNEXPECTED LIVE PROBE|unexpected gh call:' "$out"; then
     echo "FAIL: $label rc=$rc expected=$expected"; cat "$out"; OVERALL_PASS=false; return
   fi
   if [ "$expected" -eq 2 ]; then
     if ! grep -q 'verdict: UNVERIFIED' "$out" ||
-       grep -Eq 'fleet healthy:|runners-online gate FAILED|real-execution gate FAILED|canary gate FAILED|total=0 online=0' "$out"; then
+       grep -Eq 'fleet healthy:|gate FAILED|IDLE-STARVED|total=0 online=0|\[BAD\].*queue tail' "$out"; then
       echo "FAIL: $label fabricated proof/failure"; cat "$out"; OVERALL_PASS=false; return
     fi
     if [[ "$reply" = *error ]] && ! grep -q 'HTTP 403' "$out"; then
       echo "FAIL: $label lost actual error"; OVERALL_PASS=false; return
     fi
-    if [ "$target" = mapjobs ] && ! grep -q 'JOBMAP .*errors=[1-9]' "$out"; then
+    if [[ "$target" = mapjobs || "$target" = mapruns ]] && ! grep -q 'JOBMAP .*errors=[1-9]' "$out"; then
       echo "FAIL: $label missing job-map failure ledger entry"; OVERALL_PASS=false; return
     fi
   elif [ "$expected" -eq 0 ]; then
@@ -287,6 +341,16 @@ api_case() {
     grep -q 'per-slot execution-proof gate FAILED' "$out" || { echo "FAIL: $label lost local failure"; OVERALL_PASS=false; return; }
   else
     grep -q 'gate FAILED' "$out" || { echo "FAIL: $label empty response did not fail"; OVERALL_PASS=false; return; }
+  fi
+  if [ "$expected" -eq 0 ] && ! grep -q '8. GitHub Actions queue health' "$out"; then
+    echo "FAIL: $label bypassed actual queue health"; OVERALL_PASS=false; return
+  fi
+  if [ "$expected" -eq 2 ] && [ "$local_state" = idle ] && [ "$target" = mapjobs ] &&
+     ! grep -q 'ez-runner-c-20 *IDLE-UNVERIFIED *job queue evidence unavailable' "$out"; then
+    echo "FAIL: $label inventory claimed idle health without job proof"; cat "$out"; OVERALL_PASS=false; return
+  fi
+  if [ "$scenario" = job_wait ] && ! grep -q 'QUEUE rc=0 bad=1 STARVED=1' "$out"; then
+    echo "FAIL: $label bypassed proven queue/starvation failure"; cat "$out"; OVERALL_PASS=false; return
   fi
   echo "PASS: $label exit=$rc"
 }
@@ -305,19 +369,33 @@ for reply in missing_runner unknown_status invalid_runner missing_name missing_s
   api_case mapjobs "$reply" 2
 done
 api_case mapjobs missing_runner 1 down
-api_case mapjobs unknown_status 1 starved
+api_case mapjobs unknown_status 2 idle
 api_case mapjobs queued_null 0
 api_case mapjobs queued_empty 0
 for status in queued in_progress completed waiting requested pending; do api_case mapjobs "status_$status" 0; done
 api_case runners pages 0
 api_case none healthy 2 queue_unknown
 api_case runners error 1 down
-api_case runners error 1 starved
+api_case runners error 2 idle
 for target in baseline dispatch poll view jobs; do
   api_case "$target" error 2 healthy 1
   if [ "$target" != dispatch ]; then api_case "$target" malformed 2 healthy 1; fi
 done
 api_case none healthy 0 healthy 1
+
+# Rejection counterexamples must traverse the real queue and starvation blocks.
+for state in healthy idle remote_idle; do
+  api_case mapjobs error 2 "$state" 0 concurrency
+done
+for state in down remote_down; do api_case mapjobs error 1 "$state" 0 concurrency; done
+api_case none healthy 0 healthy 0 concurrency
+api_case none healthy 1 healthy 0 job_wait
+api_case none healthy 1 idle 0 job_wait
+api_case none healthy 1 remote_idle 0 job_wait
+for target in mapruns mapjobs; do
+  for reply in empty_created bad_created old_bad_created normalized_created zero_year_created; do api_case "$target" "$reply" 2; done
+done
+for reply in empty_started bad_started; do api_case mapjobs "$reply" 2; done
 
 echo "API receipts: $API_TMP"
 echo "--- summary ---"

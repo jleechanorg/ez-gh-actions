@@ -56,7 +56,8 @@ gh_json() {
     diagnostic="$GH_JSON"
     if [ "${#diagnostic}" -gt 400 ]; then diagnostic="${GH_JSON:0:180} ... ${GH_JSON: -200}"; fi
     warn "$label UNVERIFIED (gh exit $rc): $diagnostic"
-  elif ! printf '%s' "$GH_JSON" | jq -se "length > 0 and (length == 1 or $pages) and all(.[]; $valid)" >/dev/null 2>&1; then
+  elif ! printf '%s' "$GH_JSON" | jq -se "def age_timestamp: . == (fromdateiso8601 | todateiso8601);
+    length > 0 and (length == 1 or $pages) and all(.[]; $valid)" >/dev/null 2>&1; then
     warn "$label UNVERIFIED (invalid JSON response): ${GH_JSON:0:400}"
   else
     return 0
@@ -721,8 +722,8 @@ RUNNER_JOB_INDEX_FILE=$(mktemp "${TMPDIR:-/tmp}/ezgha-doctor-jobmap.XXXXXX" 2>/d
 # indistinguishable from a genuinely drained queue (JOBLEVEL_QUEUED_COUNT=0,
 # oldest=0m) and the section-8 gate would report GREEN under the exact
 # API-truncation hazard documented in CLAUDE.md. Health gates must fail
-# honest, never silent-green: any fetch error degrades the job map to
-# "unknown" and forces the run-level fallback path.
+# honest, never silent-green: any fetch error leaves job-level queue and
+# starvation proof unknown; run age cannot prove runner wait.
 JOBMAP_ERRORS_FILE="${RUNNER_JOB_INDEX_FILE}.errors"
 : > "$JOBMAP_ERRORS_FILE"
 trap 'rm -f "$RUNNER_JOB_INDEX_FILE" "$JOBMAP_ERRORS_FILE"' EXIT
@@ -753,7 +754,7 @@ build_runner_job_index() {
   fi
   for repo in $EXPLICIT_WORK_REPOS; do
     for status in in_progress queued; do
-      gh_json "job-map runs $repo $status" 'type == "object" and (.workflow_runs | type == "array") and all(.workflow_runs[]; (.id | type == "number") and (.html_url | type == "string") and (.created_at | type == "string"))' api "repos/$repo/actions/runs?status=$status&per_page=50" >&2 || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
+      gh_json "job-map runs $repo $status" 'type == "object" and (.workflow_runs | type == "array") and all(.workflow_runs[]; (.id | type == "number") and (.html_url | type == "string") and (.created_at | age_timestamp))' api "repos/$repo/actions/runs?status=$status&per_page=50" >&2 || { echo "runlist $repo $status" >> "$JOBMAP_ERRORS_FILE"; continue; }
       runs_json="$GH_JSON"
       while IFS=$'\t' read -r rid run_url; do
         [ -z "$rid" ] && continue
@@ -761,8 +762,8 @@ build_runner_job_index() {
           has("runner_name") and (.runner_name == null or (.runner_name | type == "string"))
           and (.name | type == "string")
           and (.status | IN("queued", "in_progress", "completed", "waiting", "requested", "pending"))
-          and (.html_url | type == "string") and (.created_at | type == "string")
-          and has("started_at") and (.started_at == null or (.started_at | type == "string")))' api "repos/$repo/actions/runs/$rid/jobs" >&2 || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
+          and (.html_url | type == "string") and (.created_at | age_timestamp)
+          and has("started_at") and (.started_at == null or (.started_at | age_timestamp)))' api "repos/$repo/actions/runs/$rid/jobs" >&2 || { echo "jobs $repo $rid" >> "$JOBMAP_ERRORS_FILE"; continue; }
         jobs_json="$GH_JSON"
         printf '%s' "$jobs_json" | jq -c --arg repo "$repo" --arg run_url "$run_url" \
           '.jobs[]? | select(.status=="in_progress" or .status=="queued")
@@ -806,17 +807,21 @@ JOBLEVEL_FETCH_ERRORS=$(( ${JOBLEVEL_RUNLIST_ERRORS:-0} + ${JOBLEVEL_JOBS_ERRORS
 API_UNVERIFIED=$((API_UNVERIFIED + JOBLEVEL_FETCH_ERRORS))
 export JOBLEVEL_FETCH_ERRORS JOBLEVEL_RUNLIST_ERRORS JOBLEVEL_JOBS_ERRORS
 if [ "$JOBLEVEL_FETCH_ERRORS" -gt 0 ]; then
-  # Degraded map: counts are UNKNOWN, not zero. "?" makes every consumer
-  # (section 8 tail gate, section 9 starvation inputs, verdict queue line)
-  # take its run-level fallback path instead of trusting a silently-empty map.
+  # Degraded map: counts are UNKNOWN, not zero. Consumers must not infer
+  # runner starvation from run age, which includes concurrency wait.
   JOBLEVEL_OLDEST_QUEUED_MIN="?"
-  warn "job map DEGRADED: ${JOBLEVEL_FETCH_ERRORS} fetch error(s) (${JOBLEVEL_RUNLIST_ERRORS} run-list, ${JOBLEVEL_JOBS_ERRORS} per-run jobs) — job-level queue counts are UNKNOWN, not zero; run-level fallback will govern the queue gate"
+  warn "job map DEGRADED: ${JOBLEVEL_FETCH_ERRORS} fetch error(s) (${JOBLEVEL_RUNLIST_ERRORS} run-list, ${JOBLEVEL_JOBS_ERRORS} per-run jobs) — job-level queue counts are UNKNOWN, not zero; queue/starvation proof UNVERIFIED"
 fi
 
 # --- F2. GitHub Actions queue health (saturation / tail latency) ----------
 QUEUE_TAIL_BAD=0
 QUEUE_QUEUED_STALE=0
-if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
+QUEUE_RC=0
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-?}" = "?" ]; then
+  section "8. GitHub Actions queue health"
+  warn "queue health UNVERIFIED (job map unavailable; run age cannot prove runner wait)"
+  QUEUE_RC=2
+elif [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   # `|| QUEUE_RC=$?` keeps errexit suppressed inside the sourced body even if
   # it re-arms `set -e`: this section must never abort sections 9/10.
   QUEUE_RC=0
@@ -1000,23 +1005,21 @@ for _name in "${DOWN_SLOTS[@]}"; do LOCAL_SLOT_STATE_TABLE+="$_name DOWN"$'\n'; 
 # like the section-8 tail gate did (2026-07-10 run 29060462908: 33.4m
 # run-queued, zero runner wait). JOBLEVEL_OLDEST_QUEUED_MIN is how long the
 # oldest fresh queued JOB has actually been waiting for a runner — the
-# correct sustained-duration signal. Falls back to section 8's run-level
-# values only if the job-map lookup produced no usable number. DOWN is
-# always a defect regardless of queue state.
+# correct sustained-duration signal. Unavailable job proof leaves starvation
+# UNVERIFIED; run age cannot replace it. DOWN is always a defect.
 IDLE_STARVED_THRESHOLD_MIN="${IDLE_STARVED_THRESHOLD_MIN:-5}"
 # Degraded/unusable job map ("?" age or any fetch error) means job-level
-# counts are UNKNOWN — fall back to section 8's run-level values for BOTH
-# inputs (a job-level count of 0 from a truncated fan-out must never
-# suppress a starvation signal the run-level data can still see).
+# counts are UNKNOWN. Never turn concurrency/staged-gate wait into proof
+# that a queued job is waiting for a runner.
 if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-?}" = "?" ]; then
-  STARVE_QUEUED_COUNT="${QUEUE_QUEUED_FRESH:-0}"
-  STARVE_OLDEST_MIN="${QUEUE_OLDEST_FRESH_AGE_MIN:-0}"
+  STARVE_QUEUED_COUNT=0
+  STARVE_OLDEST_MIN="?"
 else
   STARVE_QUEUED_COUNT="${JOBLEVEL_QUEUED_COUNT:-0}"
   STARVE_OLDEST_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN:-0}"
 fi
 STARVED_PRESENT=0
-if [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ] && awk -v a="${STARVE_OLDEST_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
+if [ "$STARVE_OLDEST_MIN" != "?" ] && [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ] && awk -v a="${STARVE_OLDEST_MIN:-0}" -v t="$IDLE_STARVED_THRESHOLD_MIN" 'BEGIN{exit !(a>=t)}'; then
   STARVED_PRESENT=1
 fi
 
@@ -1028,7 +1031,9 @@ if [ "${#DOWN_SLOTS[@]}" -gt 0 ]; then
   SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#DOWN_SLOTS[@]}))
 fi
 if [ "${#IDLE_SLOTS[@]}" -gt 0 ]; then
-  if [ "$STARVED_PRESENT" -eq 1 ]; then
+  if [ "$STARVE_OLDEST_MIN" = "?" ]; then
+    warn "IDLE-UNVERIFIED (job queue evidence unavailable): ${IDLE_SLOTS[*]}"
+  elif [ "$STARVED_PRESENT" -eq 1 ]; then
     bad "IDLE-STARVED (${STARVE_QUEUED_COUNT} jobs queued, oldest job waiting ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold) — ${#IDLE_SLOTS[@]} slot(s): ${IDLE_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#IDLE_SLOTS[@]}))
   elif [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ]; then
@@ -1294,7 +1299,9 @@ list_slot_work() {
         # 4-state model: IDLE-OK (nothing queued, or queued but under the
         # sustained-starvation threshold) vs IDLE-STARVED (queue has been
         # non-empty for >= IDLE_STARVED_THRESHOLD_MIN minutes — see section 9).
-        if [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
+        if [ "${STARVE_OLDEST_MIN:-?}" = "?" ]; then
+          printf "    %-22s %-13s %s\n" "$name" "IDLE-UNVERIFIED" "job queue evidence unavailable"
+        elif [ "${STARVED_PRESENT:-0}" -eq 1 ]; then
           printf "    %-22s %-13s %s\n" "$name" "IDLE-STARVED" "${STARVE_QUEUED_COUNT} fresh queued jobs, oldest job waiting ${STARVE_OLDEST_MIN}m >= ${IDLE_STARVED_THRESHOLD_MIN}m threshold"
         elif [ "${STARVE_QUEUED_COUNT:-0}" -gt 0 ]; then
           printf "    %-22s %-13s %s\n" "$name" "IDLE-OK" "${STARVE_QUEUED_COUNT} job(s) queued ${STARVE_OLDEST_MIN}m < ${IDLE_STARVED_THRESHOLD_MIN}m threshold (not yet starved)"
@@ -1575,7 +1582,7 @@ emit_failure_remediation() {
 # state is never hidden behind a green light. A degraded map prints as
 # UNKNOWN, never as a reassuring "0 queued".
 if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
-  echo "  queue: UNKNOWN — job map degraded (${JOBLEVEL_FETCH_ERRORS} fetch errors); section-8 run-level fallback governed the queue gate"
+  echo "  queue: UNKNOWN — job map degraded (${JOBLEVEL_FETCH_ERRORS} fetch errors); queue/starvation proof UNVERIFIED"
 elif [ "${JOBLEVEL_QUEUED_COUNT:-0}" -gt 0 ]; then
   echo "  queue: ${JOBLEVEL_QUEUED_COUNT} queued job(s) (oldest ${JOBLEVEL_OLDEST_QUEUED_MIN:-?}m) | ${JOBLEVEL_INPROG_COUNT:-0} in-progress job(s)"
 else
