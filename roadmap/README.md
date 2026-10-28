@@ -119,6 +119,7 @@ soak is required.
 
 ## Recent activity (by day)
 
+- [2026-10-28](activity/2026-10-28.md) — Linux fleet disk recovery (fleet drained twice to 0/20), disk-vs-fleet alert classification, and tracked /tmp -> scratch migration installer.
 - [2026-10-04](activity/2026-10-04.md) — Colima restoration, ghost runner clearance & fleet CPU optimization.
 - [2026-10-03](activity/2026-10-03.md) — runner throughput optimization plan.
 
