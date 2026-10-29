@@ -39,7 +39,10 @@
 #   EZGHA_RUN_SDK_TMPFS_CANARY=1 EZGHA_SDK_VERSION=<version> \
 #   EZGHA_SDK_ARCHIVE_URL=https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-<version>-linux-x86_64.tar.gz \
 #   EZGHA_SDK_SHA256=<official-sha256> \
+#   EZGHA_SDK_MEMORY_MB=1400 \
 #   bash tests/workspace_mount_symlink_extraction_test.sh
+# EZGHA_SDK_MEMORY_MB defaults to 3072; supply 1400 to test the Linux runner
+# profile. Both modes require at least 512 MiB of remaining cgroup memory.
 # This mode requires the official archive SHA-256, skips the default virtiofs
 # suite, and uses one named, auto-removed Docker container.
 #
@@ -109,16 +112,24 @@ run_sdk_tmpfs_canary() {
     echo "Expected: ${expected_url}" >&2
     return 2
   fi
-
+  sdk_memory_mb="${EZGHA_SDK_MEMORY_MB:-3072}"
+  if [[ ! "${sdk_memory_mb}" =~ ^[1-9][0-9]*$ ]] \
+    || (( ${#sdk_memory_mb} > 5 )) \
+    || (( sdk_memory_mb > 65536 )); then
+    echo "FAIL: EZGHA_SDK_MEMORY_MB must be a positive integer no greater than 65536" >&2
+    return 2
+  fi
   container_name="ezgha-sdk-tmpfs-canary-$$"
   if docker container inspect "${container_name}" >/dev/null 2>&1; then
     echo "FAIL: refusing to touch pre-existing container ${container_name}" >&2
     return 2
   fi
+  image_id=$(docker image inspect --format '{{.Id}}' "${IMAGE}")
   docker_env=(
     -e "EZGHA_SDK_VERSION=${EZGHA_SDK_VERSION}"
     -e "EZGHA_SDK_ARCHIVE_URL=${EZGHA_SDK_ARCHIVE_URL}"
     -e "EZGHA_SDK_SHA256=${EZGHA_SDK_SHA256}"
+    -e "EZGHA_SDK_MEMORY_MB=${sdk_memory_mb}"
   )
   cleanup_sdk_canary() {
     docker rm -f "${container_name}" >/dev/null 2>&1 || true
@@ -127,10 +138,11 @@ run_sdk_tmpfs_canary() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  echo "=== SDK tmpfs canary: version=${EZGHA_SDK_VERSION} image_arch=${image_arch} memory=3072MiB swap=0 ==="
+  echo "=== SDK tmpfs canary: version=${EZGHA_SDK_VERSION} image_arch=${image_arch} memory=${sdk_memory_mb}MiB swap=0 ==="
+  echo "runner_image_id=${image_id}"
   echo "Archive: ${EZGHA_SDK_ARCHIVE_URL}"
   docker run --pull=never --rm --name "${container_name}" \
-    --memory=3072m --memory-swap=3072m \
+    --memory="${sdk_memory_mb}m" --memory-swap="${sdk_memory_mb}m" \
     --tmpfs /home/runner/_work/_temp:exec \
     --entrypoint /bin/bash \
     -e EZGHA_VIRTIOFS_WORKSPACE=1 \
@@ -145,6 +157,11 @@ run_sdk_tmpfs_canary() {
       test ! -e "${actions}"
       mkdir -p "${actions}"
       echo "actions_removable=true"
+      tar_path=/usr/local/bin/tar
+      test "$(command -v tar)" = "${tar_path}"
+      tar_wrapper_sha256=$(sha256sum "${tar_path}" | awk "{ print \$1 }")
+      echo "executed_tar_wrapper_path=${tar_path}"
+      echo "executed_tar_wrapper_sha256=${tar_wrapper_sha256}"
 
       download_dir="${temp_root}/download"
       extract_dir="${temp_root}/extract"
@@ -168,9 +185,9 @@ run_sdk_tmpfs_canary() {
       gcloud="${sdk_dir}/bin/gcloud"
       test -x "${gcloud}"
       actual_version=$("${gcloud}" --version | sed -n "1s/^Google Cloud SDK //p")
-      test "${actual_version}" = "${EZGHA_SDK_VERSION}"
       echo "gcloud_executable=true"
       echo "gcloud_version=${actual_version}"
+      test "${actual_version}" = "${EZGHA_SDK_VERSION}"
       echo "tmpfs_df_begin"
       df -PT -B1 "${temp_root}"
       echo "tmpfs_df_end"
@@ -193,14 +210,19 @@ run_sdk_tmpfs_canary() {
         echo "FAIL: no readable cgroup memory peak/limit counters" >&2
         exit 1
       fi
-      test "${memory_max}" -eq 3221225472
-      remaining_bytes=$((memory_max - memory_peak))
-      echo "tmpfs_used_bytes=${tmpfs_used_bytes}"
-      echo "tmpfs_du_bytes=${tmpfs_du_bytes}"
+      expected_memory_max=$((EZGHA_SDK_MEMORY_MB * 1024 * 1024))
       echo "cgroup_version=${cgroup_version}"
       echo "cgroup_memory_peak_bytes=${memory_peak}"
       echo "cgroup_memory_max_bytes=${memory_max}"
+      echo "requested_memory_max_bytes=${expected_memory_max}"
       echo "cgroup_memory_current_bytes=${memory_current}"
+      if [[ "${memory_max}" -ne "${expected_memory_max}" ]]; then
+        echo "FAIL: cgroup memory max does not match requested ${EZGHA_SDK_MEMORY_MB} MiB" >&2
+        exit 1
+      fi
+      remaining_bytes=$((memory_max - memory_peak))
+      echo "tmpfs_used_bytes=${tmpfs_used_bytes}"
+      echo "tmpfs_du_bytes=${tmpfs_du_bytes}"
       echo "cgroup_memory_remaining_bytes=${remaining_bytes}"
       if (( remaining_bytes < 536870912 )); then
         echo "FAIL: remaining cgroup memory margin is below 512 MiB" >&2
