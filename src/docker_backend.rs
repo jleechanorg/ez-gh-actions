@@ -3943,13 +3943,12 @@ fn start_one_with_generate_at_slot(
                 // tests/workspace_mount_symlink_extraction_test.sh step 4.
                 cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
                 // Keep _actions ordinary: the runner deletes it at job setup,
-                // and removing a nested mount fails with EBUSY. Keep _temp and
-                // _tool on executable tmpfs so SDK extraction avoids virtiofs
-                // and downloaded runtimes can execute there. The tar wrapper
-                // still guards workspace-checkout extracts on the bind.
-                for shadowed in ["_temp", "_tool"] {
-                    cmd.args(["--tmpfs", &format!("/home/runner/_work/{shadowed}:exec")]);
-                }
+                // and removing a nested mount fails with EBUSY. setup-gcloud
+                // extracts the SDK under _temp, so keep only that directory
+                // on executable tmpfs. This image configures
+                // RUNNER_TOOL_CACHE=/opt/hostedtoolcache, so _tool is unused.
+                // The tar wrapper still guards workspace-checkout extracts.
+                cmd.args(["--tmpfs", "/home/runner/_work/_temp:exec"]);
             }
         }
     }
@@ -10370,12 +10369,12 @@ esac
     }
 
     #[test]
-    fn workspace_mount_shadows_temp_and_tool_but_keeps_actions_removable() {
+    fn workspace_mount_shadows_temp_only_and_keeps_actions_tool_ordinary() {
         // Regression coverage for setup-gcloud SDK extraction on virtiofs:
-        // keep _temp and _tool on Linux tmpfs, while _actions
-        // remains an ordinary directory because ActionManager deletes it
-        // during job setup and cannot remove a nested mount (EBUSY).
-        let _env = TestEnv::new("workspace_mount_temp_tool_tmpfs_actions_ordinary");
+        // _temp uses Linux tmpfs. _actions remains ordinary so ActionManager
+        // can delete it, and _tool remains ordinary because this image's
+        // RUNNER_TOOL_CACHE is configured outside _work.
+        let _env = TestEnv::new("workspace_mount_temp_tmpfs_actions_tool_ordinary");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(1, "ez-org-runner");
         let temp_dir =
@@ -10398,17 +10397,19 @@ esac
             .lines()
             .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
-        for runner_dir in ["_temp", "_tool"] {
-            let expected = format!("--tmpfs /home/runner/_work/{runner_dir}:exec");
-            assert!(
-                run_line.contains(&expected),
-                "runner-internal {runner_dir} must use executable tmpfs to keep SDK extraction \
-                 off virtiofs; got: {run_line}"
-            );
-        }
+        let temp_tmpfs = "--tmpfs /home/runner/_work/_temp:exec";
+        assert!(
+            run_line.contains(temp_tmpfs),
+            "_temp must use executable tmpfs to keep SDK extraction off virtiofs; got: {run_line}"
+        );
         assert!(
             !run_line.contains("--tmpfs /home/runner/_work/_actions"),
             "_actions must stay an ordinary workspace directory so ActionManager can delete it: \
+             {run_line}"
+        );
+        assert!(
+            !run_line.contains("--tmpfs /home/runner/_work/_tool"),
+            "_tool is unused by this image's RUNNER_TOOL_CACHE and must stay ordinary: \
              {run_line}"
         );
     }
