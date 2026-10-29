@@ -35,9 +35,9 @@
 # tmpfs for setup-gcloud's SDK extraction.
 #
 # Usage: bash tests/workspace_mount_symlink_extraction_test.sh
-# SDK peak canary (separate explicit mode; requires a pinned version and URL):
+# SDK peak canary (separate explicit mode; requires a pinned version, official URL and SHA):
 #   EZGHA_RUN_SDK_TMPFS_CANARY=1 EZGHA_SDK_VERSION=<version> \
-#   EZGHA_SDK_ARCHIVE_URL=https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-<version>-linux-x86_64.tar.gz \
+#   EZGHA_SDK_ARCHIVE_URL=https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz \
 #   EZGHA_SDK_SHA256=<official-sha256> \
 #   EZGHA_SDK_MEMORY_MB=1400 \
 #   bash tests/workspace_mount_symlink_extraction_test.sh
@@ -110,10 +110,14 @@ run_sdk_tmpfs_canary() {
     arm64) sdk_arch=arm ;;
     *) echo "FAIL: unsupported runner image architecture: ${image_arch}" >&2; return 2 ;;
   esac
-  expected_url="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-${EZGHA_SDK_VERSION}-linux-${sdk_arch}.tar.gz"
-  if [[ "${EZGHA_SDK_ARCHIVE_URL}" != "${expected_url}" ]]; then
-    echo "FAIL: archive URL does not match the official pinned SDK version/architecture" >&2
-    echo "Expected: ${expected_url}" >&2
+  archive_prefix="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/"
+  expected_action_url="${archive_prefix}google-cloud-sdk-${EZGHA_SDK_VERSION}-linux-${sdk_arch}.tar.gz"
+  expected_docs_url="${archive_prefix}google-cloud-cli-linux-${sdk_arch}.tar.gz"
+  if [[ "${EZGHA_SDK_ARCHIVE_URL}" != "${expected_action_url}" \
+    && "${EZGHA_SDK_ARCHIVE_URL}" != "${expected_docs_url}" ]]; then
+    echo "FAIL: archive URL must match the versioned setup-gcloud archive or documented official CLI URL" >&2
+    echo "Expected one of: ${expected_action_url}" >&2
+    echo "               ${expected_docs_url}" >&2
     return 2
   fi
   sdk_memory_mb="${EZGHA_SDK_MEMORY_MB:-3072}"
@@ -145,6 +149,7 @@ run_sdk_tmpfs_canary() {
   echo "=== SDK tmpfs canary: version=${EZGHA_SDK_VERSION} image_arch=${image_arch} memory=${sdk_memory_mb}MiB swap=0 ==="
   echo "runner_image_id=${image_id}"
   echo "Archive: ${EZGHA_SDK_ARCHIVE_URL}"
+  echo "archive_sha256_expected=${EZGHA_SDK_SHA256}"
   echo "canary_parent_work_fixture=/home/runner/_work:rw,mode=1777,size=16m (extra test mount; not the daemon bind)"
   echo "canary_sdk_tmpfs=/home/runner/_work/_temp:exec (proposed nested mount)"
   echo "workspace_host_path_bind=absent (fixture only; no daemon-arg or Mac virtiofs proof)"
@@ -188,7 +193,13 @@ run_sdk_tmpfs_canary() {
       archive="${download_dir}/google-cloud-sdk.tar.gz"
       curl --fail --location --silent --show-error \
         "${EZGHA_SDK_ARCHIVE_URL}" --output "${archive}"
-      printf "%s  %s\n" "${EZGHA_SDK_SHA256}" "${archive}" | sha256sum --check --status
+      archive_sha256_actual=$(sha256sum "${archive}" | awk "{ print \$1 }")
+      echo "archive_sha256_actual=${archive_sha256_actual}"
+      echo "archive_sha256_expected=${EZGHA_SDK_SHA256}"
+      if [[ "${archive_sha256_actual}" != "${EZGHA_SDK_SHA256}" ]]; then
+        echo "FAIL: downloaded official archive bytes do not match the caller-pinned SHA-256" >&2
+        exit 1
+      fi
       echo "archive_sha256_verified=true"
 
       # Match setup-gcloud v2.1.0 extraction flags recorded in the failed job.
