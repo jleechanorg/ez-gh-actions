@@ -3942,15 +3942,11 @@ fn start_one_with_generate_at_slot(
                 // docker save/load, etc). See
                 // tests/workspace_mount_symlink_extraction_test.sh step 4.
                 cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
-                // Keep _actions, _temp, and _tool as ordinary directories in
-                // the workspace bind. The upstream runner deletes _actions
-                // at job setup (Runner.Worker/ActionManager.cs); mounting
-                // tmpfs over that directory makes the deletion fail with
-                // EBUSY before the job can start. _temp and _tool still need
-                // tmpfs: setup-gcloud extracts its SDK under _temp and tool
-                // runtimes are executed from _tool, so keep them off virtiofs
-                // and preserve executable permissions. The image tar wrapper
-                // continues to guard _actions and workspace-checkout extracts.
+                // Keep _actions ordinary: the runner deletes it at job setup,
+                // and removing a nested mount fails with EBUSY. Keep _temp and
+                // _tool on executable tmpfs so SDK extraction avoids virtiofs
+                // and downloaded runtimes can execute there. The tar wrapper
+                // still guards workspace-checkout extracts on the bind.
                 for shadowed in ["_temp", "_tool"] {
                     cmd.args(["--tmpfs", &format!("/home/runner/_work/{shadowed}:exec")]);
                 }
@@ -10375,8 +10371,8 @@ esac
 
     #[test]
     fn workspace_mount_shadows_temp_and_tool_but_keeps_actions_removable() {
-        // Regression coverage for the two setup-gcloud SDK install failures
-        // on virtiofs: keep _temp and _tool on Linux tmpfs, while _actions
+        // Regression coverage for setup-gcloud SDK extraction on virtiofs:
+        // keep _temp and _tool on Linux tmpfs, while _actions
         // remains an ordinary directory because ActionManager deletes it
         // during job setup and cannot remove a nested mount (EBUSY).
         let _env = TestEnv::new("workspace_mount_temp_tool_tmpfs_actions_ordinary");
