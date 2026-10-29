@@ -49,7 +49,7 @@ pub fn configure_docker_endpoint(cmd: &mut Command) {
 /// The child is spawned and its stdout drained on a helper thread; the caller
 /// blocks on `recv_timeout`. On expiry we `kill()` the child (which unblocks
 /// the reader thread via EOF) and reap it so nothing leaks.
-pub(crate) fn capture_with_timeout(mut cmd: Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
+fn capture_with_timeout(mut cmd: Command, timeout: Duration) -> Option<(bool, Vec<u8>)> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -942,24 +942,78 @@ impl Config {
     }
 }
 
-/// Check that a cgroup parent is one safe systemd unit/slice component.
-/// Docker accepts arbitrary cgroup paths, so reject separators, whitespace,
-/// and path traversal rather than passing an unsafe hierarchy to the daemon.
-fn validate_cgroup_parent(parent: &str) -> Result<()> {
-    if parent.is_empty() || parent.trim() != parent || parent == "." || parent == ".." {
-        anyhow::bail!(
-            "limits.cgroup_parent must be a non-empty systemd cgroup/slice name without surrounding whitespace"
-        );
-    }
-    if !parent
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@'))
+/// Outcome of the `findmnt` probe.
+enum FstypeProbe {
+    /// findmnt named the filesystem serving the path.
+    Reported(String),
+    /// No verdict: missing binary, non-zero exit, empty output, or a probe that
+    /// outlived its budget. The caller fails open and announces it.
+    Unverified(String),
+}
+
+/// How long the filesystem probe may run before it is abandoned.
+///
+/// Startup must never hinge on a filesystem call: `stat(2)` on a wedged FUSE or
+/// network mount can park a child in an uninterruptible wait indefinitely, so
+/// this is a hard ceiling rather than a hint. `EZGHA_WORKSPACE_PROBE_TIMEOUT_MS`
+/// lets tests drive the timeout path without sleeping for seconds.
+fn workspace_probe_budget() -> std::time::Duration {
+    std::env::var("EZGHA_WORKSPACE_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(5))
+}
+
+/// Ask `findmnt` which filesystem serves `path`, bounded end to end.
+///
+/// Deliberately not built on `platform::capture_with_timeout`: that helper waits
+/// without a deadline once the child's stdout closes, and again after a kill, so
+/// a child wedged in an uninterruptible filesystem wait could still hold the
+/// caller. Here the child is polled against the budget, killed on expiry, and
+/// reaped on a detached thread so nothing blocks daemon startup.
+fn probe_workspace_fstype(bin: &str, path: &str) -> FstypeProbe {
+    use std::io::Read;
+
+    let mut child = match std::process::Command::new(bin)
+        .args(["-n", "-o", "FSTYPE", "-T", path])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     {
-        anyhow::bail!(
-            "limits.cgroup_parent contains unsafe characters; use a single systemd cgroup/slice name"
-        );
+        Ok(child) => child,
+        Err(err) => return FstypeProbe::Unverified(format!("cannot run {bin}: {err}")),
+    };
+    let deadline = std::time::Instant::now() + workspace_probe_budget();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return FstypeProbe::Unverified(format!("{bin} exited with {status}"));
+                }
+                let mut buffer = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    let _ = stdout.read_to_end(&mut buffer);
+                }
+                let listing = String::from_utf8_lossy(&buffer).trim().to_string();
+                if listing.is_empty() {
+                    return FstypeProbe::Unverified(format!("{bin} reported no filesystem type"));
+                }
+                return FstypeProbe::Reported(listing);
+            }
+            Ok(None) => {}
+            Err(err) => return FstypeProbe::Unverified(format!("cannot wait for {bin}: {err}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return FstypeProbe::Unverified(format!("{bin} exceeded its probe budget"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    Ok(())
 }
 
 /// Reject a `findmnt` FSTYPE listing that shows the workspace on FUSE.
@@ -971,15 +1025,15 @@ fn validate_cgroup_parent(parent: &str) -> Result<()> {
 /// `open(O_CREAT|O_EXCL|O_RDWR, 0444)`. A FUSE mount satisfies neither: the
 /// delete fails with `Device or resource busy: '/home/runner/_work/_actions'`
 /// so every job dies in "Set up job" before a single step runs, and the 0444
-/// create fails with EACCES so clone-based steps break too. Both were observed
+/// create fails with EACCES so git-based steps break too. Both were observed
 /// live while the Disk Magician Scratch image was mounted through the bundled
 /// fuse2fs helper instead of its kernel ext4 loop mount. Detecting it at
 /// config-validation time turns 20 silently-dead runners into one startup
 /// error.
 ///
-/// Every reported line is checked, not just the first: `findmnt -T` prints one
-/// line per stacked mount, and the FUSE layer is usually *below* the kernel
-/// mount in that listing, so a first-line-only check would miss it.
+/// `findmnt -T` reports the single filesystem serving the path; every non-empty
+/// line is still checked defensively so a wrapper (or future findmnt behaviour)
+/// that prints several entries cannot slip a FUSE entry past a first-line test.
 fn workspace_fstype_rejection(mount_output: &str, path: &str) -> Option<String> {
     let offending = mount_output
         .lines()
@@ -999,32 +1053,48 @@ fn workspace_fstype_rejection(mount_output: &str, path: &str) -> Option<String> 
 /// Reject a workspace root that lives on a FUSE mount.
 ///
 /// Fail open when the probe cannot produce a verdict (missing `findmnt`, a
-/// non-Linux host, or a probe that outlives its budget): blocking daemon
-/// startup on a capability probe would be the self-outage this guard exists to
-/// prevent. The unverified case is announced on stderr so it is never silent.
+/// non-Linux host, empty output, or a probe that outlives its budget): blocking
+/// daemon startup on a capability probe would be the self-outage this guard
+/// exists to prevent. The unverified case is announced on stderr so a silent
+/// pass can never be mistaken for a verified kernel mount.
 fn validate_workspace_filesystem(path: &str) -> Result<()> {
     if path.trim().is_empty() {
         anyhow::bail!("runner.workspace_host_path must not be empty when configured");
     }
     let bin = std::env::var("EZGHA_FINDMNT_BIN").unwrap_or_else(|_| "findmnt".to_string());
-    let mut cmd = std::process::Command::new(&bin);
-    cmd.args(["-n", "-o", "FSTYPE", "-T", path]);
-    match crate::platform::capture_with_timeout(cmd, std::time::Duration::from_secs(5)) {
-        Some((true, stdout)) => {
-            let listing = String::from_utf8_lossy(&stdout);
-            match workspace_fstype_rejection(&listing, path) {
-                Some(message) => anyhow::bail!(message),
-                None => Ok(()),
-            }
-        }
-        _ => {
+    match probe_workspace_fstype(&bin, path) {
+        FstypeProbe::Reported(listing) => match workspace_fstype_rejection(&listing, path) {
+            Some(message) => anyhow::bail!(message),
+            None => Ok(()),
+        },
+        FstypeProbe::Unverified(reason) => {
             eprintln!(
                 "warning: could not verify the filesystem type of runner.workspace_host_path \
-                 '{path}' via {bin}; continuing without the FUSE workspace guard"
+                 '{path}' ({reason}); continuing without the FUSE workspace guard"
             );
             Ok(())
         }
     }
+}
+
+/// Check that a cgroup parent is one safe systemd unit/slice component.
+/// Docker accepts arbitrary cgroup paths, so reject separators, whitespace,
+/// and path traversal rather than passing an unsafe hierarchy to the daemon.
+fn validate_cgroup_parent(parent: &str) -> Result<()> {
+    if parent.is_empty() || parent.trim() != parent || parent == "." || parent == ".." {
+        anyhow::bail!(
+            "limits.cgroup_parent must be a non-empty systemd cgroup/slice name without surrounding whitespace"
+        );
+    }
+    if !parent
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'@'))
+    {
+        anyhow::bail!(
+            "limits.cgroup_parent contains unsafe characters; use a single systemd cgroup/slice name"
+        );
+    }
+    Ok(())
 }
 
 fn is_owner_repo(value: &str) -> bool {
@@ -1698,11 +1768,47 @@ slack_channel = "C0AJ3SD5C79"
         assert_eq!(cfg.alert.slack_webhook_url, None);
     }
 
+    /// Owns the temporary directory the probe stubs live in; removed on drop so a
+    /// failing assertion cannot leave debris behind.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ezgha-wsfs-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write a `findmnt` stub honouring `STUB_FSTYPE`, `STUB_EXIT` and `STUB_SLEEP`.
+    fn findmnt_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.join("findmnt");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ -z \"${STUB_SLEEP:-}\" ] || sleep \"$STUB_SLEEP\"\n\
+             printf '%s\\n' \"${STUB_FSTYPE:-}\"\nexit \"${STUB_EXIT:-0}\"\n",
+        )
+        .expect("write findmnt stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        stub
+    }
+
     #[test]
     fn workspace_fstype_rejection_blocks_fuse_mounts() {
-        // The 2026-10-28 outage shape: workspace on a FUSE volume made every job
-        // die in "Set up job" with EBUSY on _work/_actions. Stacked-mount listings
-        // must be caught too, where the FUSE layer is not the first line.
+        // The 2026-10-28 outage shape: a FUSE workspace made every job die in
+        // "Set up job" with EBUSY on _work/_actions.
         for listing in [
             "fuse.ext4",
             "fuse2fs",
@@ -1710,7 +1816,6 @@ slack_channel = "C0AJ3SD5C79"
             "fuseblk",
             "  fuse.ext4  ",
             "ext4\nfuse.ext4",
-            "overlay\nfuse.gvfsd-fuse\n",
         ] {
             let message =
                 workspace_fstype_rejection(listing, "/home/user/Scratch").unwrap_or_else(|| {
@@ -1724,11 +1829,12 @@ slack_channel = "C0AJ3SD5C79"
                 message.contains("ext4 loop mount"),
                 "rejection must describe the kernel-mount remedy: {message}"
             );
-            // Repo rule: error strings must never embed a runnable command.
+            // Repo rule: error strings must describe remediation, never embed a
+            // runnable command for the next agent to execute.
             for forbidden in ["umount", "mount -o", "&&", "findmnt -no"] {
                 assert!(
                     !message.contains(forbidden),
-                    "error text must describe remediation, not embed {forbidden:?}: {message}"
+                    "error text must not embed {forbidden:?}: {message}"
                 );
             }
         }
@@ -1754,31 +1860,15 @@ slack_channel = "C0AJ3SD5C79"
         }
     }
 
-    /// Write a `findmnt` stub that prints `STUB_FSTYPE` and exits `STUB_EXIT`.
-    fn findmnt_stub(dir: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let stub = dir.join("findmnt");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\nprintf '%s\\n' \"$STUB_FSTYPE\"\nexit \"${STUB_EXIT:-0}\"\n",
-        )
-        .expect("write findmnt stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod stub");
-        stub
-    }
-
     #[test]
     fn validate_workspace_filesystem_rejects_fuse_accepts_ext4_and_fails_open() {
         let _lock = crate::alert::test_lock();
         let _env =
             crate::alert::EnvVarGuard::new(&["EZGHA_FINDMNT_BIN", "STUB_FSTYPE", "STUB_EXIT"]);
-        let dir = std::env::temp_dir().join(format!("ezgha-wsfs-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let stub = findmnt_stub(&dir);
+        let dir = TempDir::new("probe");
+        let stub = findmnt_stub(dir.path());
         std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
 
-        // Rejects the failing state.
         std::env::set_var("STUB_FSTYPE", "fuse.ext4");
         std::env::remove_var("STUB_EXIT");
         let err = validate_workspace_filesystem("/home/user/Scratch")
@@ -1786,32 +1876,57 @@ slack_channel = "C0AJ3SD5C79"
             .to_string();
         assert!(err.contains("FUSE filesystem"), "{err}");
 
-        // Accepts the repaired state.
         std::env::set_var("STUB_FSTYPE", "ext4");
         validate_workspace_filesystem("/home/user/Scratch")
             .expect("a kernel-mounted workspace must be accepted");
 
-        // Fails open (never blocks startup) when the probe itself fails.
+        // Fail open when the probe exits non-zero ...
         std::env::set_var("STUB_EXIT", "1");
         validate_workspace_filesystem("/home/user/Scratch")
             .expect("an unverifiable workspace must not block startup");
 
-        // Fails open when the probe is missing entirely.
-        std::env::set_var("EZGHA_FINDMNT_BIN", stub.with_file_name("does-not-exist"));
+        // ... when it reports nothing ...
         std::env::set_var("STUB_EXIT", "0");
+        std::env::set_var("STUB_FSTYPE", "");
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("an empty probe result must not block startup");
+
+        // ... and when it is missing entirely.
+        std::env::set_var("EZGHA_FINDMNT_BIN", stub.with_file_name("does-not-exist"));
         validate_workspace_filesystem("/home/user/Scratch")
             .expect("a missing probe must not block startup");
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn validate_workspace_filesystem_abandons_a_hung_probe() {
+        let _lock = crate::alert::test_lock();
+        let _env = crate::alert::EnvVarGuard::new(&[
+            "EZGHA_FINDMNT_BIN",
+            "STUB_SLEEP",
+            "EZGHA_WORKSPACE_PROBE_TIMEOUT_MS",
+        ]);
+        let dir = TempDir::new("hung");
+        let stub = findmnt_stub(dir.path());
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+        std::env::set_var("STUB_SLEEP", "30");
+        std::env::set_var("EZGHA_WORKSPACE_PROBE_TIMEOUT_MS", "100");
+
+        let started = std::time::Instant::now();
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("a hung probe must fail open, not block startup");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a hung probe must be abandoned at the budget (took {:?})",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn config_validate_rejects_a_fuse_backed_workspace() {
         let _lock = crate::alert::test_lock();
         let _env = crate::alert::EnvVarGuard::new(&["EZGHA_FINDMNT_BIN", "STUB_FSTYPE"]);
-        let dir = std::env::temp_dir().join(format!("ezgha-wsfs-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let stub = findmnt_stub(&dir);
+        let dir = TempDir::new("cfg");
+        let stub = findmnt_stub(dir.path());
         std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
 
         std::env::set_var("STUB_FSTYPE", "fuse.ext4");
@@ -1826,8 +1941,6 @@ slack_channel = "C0AJ3SD5C79"
         std::env::set_var("STUB_FSTYPE", "ext4");
         cfg.validate()
             .expect("Config::validate must accept a kernel-mounted workspace");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
