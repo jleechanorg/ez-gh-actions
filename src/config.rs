@@ -965,6 +965,23 @@ fn workspace_probe_budget() -> std::time::Duration {
         .unwrap_or_else(|| std::time::Duration::from_secs(5))
 }
 
+/// Read a child's stdout without trusting it to close.
+///
+/// `read_to_end` blocks until every writer closes the pipe, and a descendant that
+/// inherited stdout keeps it open after the child itself exits - so a plain read
+/// can outlive the probe budget even when the direct child is done. Returns
+/// `None` when the pipe did not close in time, which the caller treats as an
+/// unverified probe.
+fn read_bounded_stdout(mut stdout: impl std::io::Read + Send + 'static) -> Option<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        let _ = sender.send(buffer);
+    });
+    receiver.recv_timeout(workspace_probe_budget()).ok()
+}
+
 /// Ask `findmnt` which filesystem serves `path`, bounded end to end.
 ///
 /// Deliberately not built on `platform::capture_with_timeout`: that helper waits
@@ -973,8 +990,6 @@ fn workspace_probe_budget() -> std::time::Duration {
 /// caller. Here the child is polled against the budget, killed on expiry, and
 /// reaped on a detached thread so nothing blocks daemon startup.
 fn probe_workspace_fstype(bin: &str, path: &str) -> FstypeProbe {
-    use std::io::Read;
-
     let mut child = match std::process::Command::new(bin)
         .args(["-n", "-o", "FSTYPE", "-T", path])
         .stdin(std::process::Stdio::null())
@@ -992,10 +1007,15 @@ fn probe_workspace_fstype(bin: &str, path: &str) -> FstypeProbe {
                 if !status.success() {
                     return FstypeProbe::Unverified(format!("{bin} exited with {status}"));
                 }
-                let mut buffer = Vec::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    let _ = stdout.read_to_end(&mut buffer);
-                }
+                let buffer = match child.stdout.take().map(read_bounded_stdout) {
+                    Some(Some(buffer)) => buffer,
+                    Some(None) => {
+                        return FstypeProbe::Unverified(format!(
+                            "{bin} left stdout open past its probe budget"
+                        ));
+                    }
+                    None => Vec::new(),
+                };
                 let listing = String::from_utf8_lossy(&buffer).trim().to_string();
                 if listing.is_empty() {
                     return FstypeProbe::Unverified(format!("{bin} reported no filesystem type"));
@@ -1044,10 +1064,21 @@ fn workspace_fstype_rejection(mount_output: &str, path: &str) -> Option<String> 
          runner deletes and recreates _work/_actions when it sets up a job, and git writes 0444 \
          loose objects there; a FUSE mount fails both, so every job dies in \"Set up job\" with \
          \"Device or resource busy\" and git-based steps fail with EACCES. This workspace must \
-         live on a kernel-mounted filesystem - the Disk Magician scratch image is declared as an \
-         ext4 loop mount in /etc/fstab - and the filesystem type reported for that path must read \
-         ext4 before the daemon starts."
+         live on a kernel-mounted filesystem. The Disk Magician scratch image is expected to be an \
+         ext4 loop mount; for that volume the reported type reads ext4, while any other \
+         kernel filesystem is also acceptable."
     ))
+}
+
+/// The announcement emitted when no filesystem verdict was obtained.
+///
+/// Kept as a function so a test can assert the wording: a silent fail-open would
+/// let an unverified workspace be mistaken for a verified kernel mount.
+fn unverified_workspace_warning(path: &str, reason: &str) -> String {
+    format!(
+        "warning: could not verify the filesystem type of runner.workspace_host_path '{path}' \
+         ({reason}); continuing without the FUSE workspace guard"
+    )
 }
 
 /// Reject a workspace root that lives on a FUSE mount.
@@ -1068,10 +1099,7 @@ fn validate_workspace_filesystem(path: &str) -> Result<()> {
             None => Ok(()),
         },
         FstypeProbe::Unverified(reason) => {
-            eprintln!(
-                "warning: could not verify the filesystem type of runner.workspace_host_path \
-                 '{path}' ({reason}); continuing without the FUSE workspace guard"
-            );
+            eprintln!("{}", unverified_workspace_warning(path, &reason));
             Ok(())
         }
     }
@@ -1890,6 +1918,11 @@ slack_channel = "C0AJ3SD5C79"
         std::env::set_var("STUB_FSTYPE", "");
         validate_workspace_filesystem("/home/user/Scratch")
             .expect("an empty probe result must not block startup");
+        let warning = unverified_workspace_warning("/home/user/Scratch", "no filesystem type");
+        assert!(
+            warning.contains("could not verify") && warning.contains("FUSE workspace guard"),
+            "the unverified case must be announced, not silent: {warning}"
+        );
 
         // ... and when it is missing entirely.
         std::env::set_var("EZGHA_FINDMNT_BIN", stub.with_file_name("does-not-exist"));
@@ -1917,6 +1950,38 @@ slack_channel = "C0AJ3SD5C79"
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "a hung probe must be abandoned at the budget (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn probe_abandons_a_pipe_held_open_by_a_surviving_descendant() {
+        let _lock = crate::alert::test_lock();
+        let _env = crate::alert::EnvVarGuard::new(&[
+            "EZGHA_FINDMNT_BIN",
+            "EZGHA_WORKSPACE_PROBE_TIMEOUT_MS",
+        ]);
+        let dir = TempDir::new("pipe");
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.path().join("findmnt");
+        // The direct child exits at once; its backgrounded descendant inherits the
+        // stdout pipe and sleeps well past the budget, so an unbounded
+        // read_to_end would block here.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n( sleep 30 ) &\nprintf '%s\\n' ext4\nexit 0\n",
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+        std::env::set_var("EZGHA_WORKSPACE_PROBE_TIMEOUT_MS", "150");
+
+        let started = std::time::Instant::now();
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("an inherited-pipe probe must fail open, not block startup");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an inherited pipe must not extend startup (took {:?})",
             started.elapsed()
         );
     }
