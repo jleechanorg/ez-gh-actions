@@ -45,6 +45,10 @@
 # profile. Both modes require at least 512 MiB of remaining cgroup memory.
 # This mode requires the official archive SHA-256, skips the default virtiofs
 # suite, and uses one named, auto-removed Docker container.
+# Canary fixture only: an extra `/home/runner/_work` tmpfs (`mode=1777`, 16 MiB)
+# provides a writable parent in the existing image; `_temp` remains its own
+# nested executable tmpfs. This parent tmpfs is not the daemon's production
+# workspace bind and does not reproduce Mac Colima/virtiofs.
 #
 # Requires: docker reachable (DOCKER_HOST must point at the real daemon
 # socket on Colima/Mac hosts), ezgha-runner:latest image present (rebuild
@@ -141,17 +145,32 @@ run_sdk_tmpfs_canary() {
   echo "=== SDK tmpfs canary: version=${EZGHA_SDK_VERSION} image_arch=${image_arch} memory=${sdk_memory_mb}MiB swap=0 ==="
   echo "runner_image_id=${image_id}"
   echo "Archive: ${EZGHA_SDK_ARCHIVE_URL}"
+  echo "canary_parent_work_fixture=/home/runner/_work:rw,mode=1777,size=16m (extra test mount; not the daemon bind)"
+  echo "canary_sdk_tmpfs=/home/runner/_work/_temp:exec (proposed nested mount)"
+  echo "workspace_host_path_bind=absent (fixture only; no daemon-arg or Mac virtiofs proof)"
   docker run --pull=never --rm --name "${container_name}" \
     --memory="${sdk_memory_mb}m" --memory-swap="${sdk_memory_mb}m" \
+    --tmpfs /home/runner/_work:rw,mode=1777,size=16m \
     --tmpfs /home/runner/_work/_temp:exec \
     --entrypoint /bin/bash \
     -e EZGHA_VIRTIOFS_WORKSPACE=1 \
     -e RUNNER_TEMP=/home/runner/_work/_temp \
     "${docker_env[@]}" "${IMAGE}" -euo pipefail -c '
+      work_root=/home/runner/_work
       temp_root=/home/runner/_work/_temp
+      work_fs=$(df -PT "${work_root}" | awk "NR == 2 { print \$2 }")
+      work_mode=$(stat -c %a "${work_root}")
+      test "${work_fs}" = tmpfs
+      test "${work_mode}" = 1777
+      echo "canary_parent_work_filesystem=${work_fs}"
+      echo "canary_parent_work_mode=${work_mode}"
       mkdir -p "${temp_root}"
       actions=/home/runner/_work/_actions
       mkdir -p "${actions}/canary"
+      if grep -Fq " /home/runner/_work/_actions " /proc/mounts; then
+        echo "FAIL: _actions must remain an ordinary directory, not a mount" >&2
+        exit 1
+      fi
       printf "removable\n" > "${actions}/canary/probe"
       rm -rf "${actions}"
       test ! -e "${actions}"
