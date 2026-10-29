@@ -3946,10 +3946,14 @@ fn start_one_with_generate_at_slot(
                 // the workspace bind. The upstream runner deletes _actions
                 // at job setup (Runner.Worker/ActionManager.cs); mounting
                 // tmpfs over that directory makes the deletion fail with
-                // EBUSY before the job can start. The image's tar wrapper
-                // guards extracts anywhere under _work, including these
-                // directories, so nested mounts are not needed for the
-                // virtiofs symlink-extraction workaround.
+                // EBUSY before the job can start. _temp and _tool still need
+                // tmpfs: setup-gcloud extracts its SDK under _temp and tool
+                // runtimes are executed from _tool, so keep them off virtiofs
+                // and preserve executable permissions. The image tar wrapper
+                // continues to guard _actions and workspace-checkout extracts.
+                for shadowed in ["_temp", "_tool"] {
+                    cmd.args(["--tmpfs", &format!("/home/runner/_work/{shadowed}:exec")]);
+                }
             }
         }
     }
@@ -10370,13 +10374,12 @@ esac
     }
 
     #[test]
-    fn workspace_mount_keeps_runner_internal_directories_removable() {
-        // Regression test for the workspace mount contract (bead
-        // jleechan-5tvb): the image tar wrapper guards extracts into all
-        // _work directories. Keep runner internals as ordinary workspace
-        // children because Actions/ActionManager deletes _actions at job
-        // setup; a nested mount there makes that deletion fail with EBUSY.
-        let _env = TestEnv::new("workspace_mount_internal_dirs_removable");
+    fn workspace_mount_shadows_temp_and_tool_but_keeps_actions_removable() {
+        // Regression coverage for the two setup-gcloud SDK install failures
+        // on virtiofs: keep _temp and _tool on Linux tmpfs, while _actions
+        // remains an ordinary directory because ActionManager deletes it
+        // during job setup and cannot remove a nested mount (EBUSY).
+        let _env = TestEnv::new("workspace_mount_temp_tool_tmpfs_actions_ordinary");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(1, "ez-org-runner");
         let temp_dir =
@@ -10399,14 +10402,19 @@ esac
             .lines()
             .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
-        for runner_dir in ["_actions", "_temp", "_tool"] {
-            let unexpected = format!("--tmpfs /home/runner/_work/{runner_dir}");
+        for runner_dir in ["_temp", "_tool"] {
+            let expected = format!("--tmpfs /home/runner/_work/{runner_dir}:exec");
             assert!(
-                !run_line.contains(&unexpected),
-                "runner-owned {runner_dir} must remain deletable during job setup; \
-                 a nested mount causes EBUSY: {run_line}"
+                run_line.contains(&expected),
+                "runner-internal {runner_dir} must use executable tmpfs to keep SDK extraction \
+                 off virtiofs; got: {run_line}"
             );
         }
+        assert!(
+            !run_line.contains("--tmpfs /home/runner/_work/_actions"),
+            "_actions must stay an ordinary workspace directory so ActionManager can delete it: \
+             {run_line}"
+        );
     }
 
     #[test]
