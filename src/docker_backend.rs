@@ -5694,17 +5694,19 @@ mod tests {
         assert_eq!(failure_ladder_policy(&two).fleet_open_slots_threshold, 2);
     }
 
-    /// Lock + redirect the slot assignments path for the duration of a test.
-    /// Always pair with `_lock` to avoid races with other tests in the same
-    /// binary.
+    /// Lock + redirect the slot assignments and quarantine paths for the
+    /// duration of a test.
     struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
+        _quarantine_lock: std::sync::MutexGuard<'static, ()>,
         path: PathBuf,
+        quarantine_path: PathBuf,
         docker_host_override: Option<std::ffi::OsString>,
     }
 
     impl TestEnv {
         fn new(label: &str) -> Self {
+            let quarantine_lock = crate::quarantine::tests::test_lock();
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let docker_host_override = env::var_os("DOCKER_HOST_OVERRIDE");
             env::remove_var("DOCKER_HOST_OVERRIDE");
@@ -5747,8 +5749,10 @@ mod tests {
                 *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
             }
             Self {
+                _quarantine_lock: quarantine_lock,
                 _lock: lock,
                 path,
+                quarantine_path: qpath,
                 docker_host_override,
             }
         }
@@ -5786,10 +5790,28 @@ mod tests {
                 std::env::remove_var("DOCKER_HOST_OVERRIDE");
             }
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.quarantine_path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+    }
+
+    #[test]
+    fn test_env_removes_quarantine_file_before_parent_directory() {
+        let (slot_path, quarantine_path, parent) = {
+            let env = TestEnv::new("quarantine_cleanup");
+            std::fs::write(&env.quarantine_path, "fixture data").unwrap();
+            (
+                env.path.clone(),
+                env.quarantine_path.clone(),
+                env.path.parent().unwrap().to_path_buf(),
+            )
+        };
+
+        assert!(!slot_path.exists());
+        assert!(!quarantine_path.exists());
+        assert!(!parent.exists());
     }
 
     #[test]
@@ -6378,6 +6400,7 @@ minimum_isolation = "container"
 
     #[test]
     fn state_dir_isolates_slot_assignments_between_configs() {
+        let _qlock = crate::quarantine::tests::test_lock();
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *TEST_SLOT_PATH.lock().unwrap() = None;
         let base =
@@ -7689,7 +7712,6 @@ esac
     #[test]
     #[cfg(target_os = "linux")]
     fn post_refill_released_slot_requests_immediate_reconcile() {
-        let _qlock = crate::quarantine::tests::test_lock();
         let env = TestEnv::new("post_refill_released_slot");
         let dir = env.path.parent().unwrap();
         // TestEnv paths can recur after a test process PID is recycled.
@@ -8437,7 +8459,6 @@ esac
     #[test]
     #[cfg(target_os = "linux")]
     fn post_refill_released_slot_full_path_boundaries() {
-        let _qlock = crate::quarantine::tests::test_lock();
         for case in [
             "released",
             "empty",
@@ -8461,7 +8482,6 @@ esac
 
     #[test]
     fn post_refill_released_slot_requires_complete_named_evidence() {
-        let _qlock = crate::quarantine::tests::test_lock();
         let _env = TestEnv::new("released_evidence");
         let cfg = cfg_with(3, "runner");
         let before = SlotAssignments {
@@ -13098,7 +13118,6 @@ esac
     /// a tick.
     #[test]
     fn quarantine_state_explicit_on_first_422_detection() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("first_422");
         let (_env, cfg, assignments) = quarantine_test_setup(
             "first_422_state",
             "ez-org-runner",
@@ -13160,7 +13179,6 @@ esac
     /// (collect_repo_runs + cancel + poll cascade) per tick.
     #[test]
     fn quarantine_bounds_api_volume_per_tick() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("bound_api");
         let (_env, cfg, _assignments) = quarantine_test_setup(
             "bound_api_volume",
             "ez-org-runner",
@@ -13254,7 +13272,6 @@ esac
     /// cancel/poll cascade.
     #[test]
     fn quarantine_does_not_reissue_reaper_attempts_on_subsequent_ticks() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("no_re_reclaim");
         let (_env, cfg, assignments) = quarantine_test_setup(
             "no_re_reclaim",
             "ez-org-runner",
@@ -13348,7 +13365,6 @@ esac
     /// acceptance criterion.
     #[test]
     fn quarantine_auto_recovers_when_runner_appears_online() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("recover_online");
         let (_env, cfg, assignments) = quarantine_test_setup(
             "recover_online",
             "ez-org-runner",
@@ -13445,7 +13461,6 @@ esac
     /// quarantine logic).
     #[test]
     fn quarantine_does_not_swallow_rqb9_idle_no_registration_path() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("not_rqb9");
         let _env = TestEnv::new("not_rqb9_path");
         let cfg = cfg_with(2, "ez-org-runner");
         let _ = next_slot(&cfg).unwrap();
@@ -13504,7 +13519,6 @@ esac
     /// This is the "continue filling all other slots" acceptance.
     #[test]
     fn next_slot_excluding_skips_quarantined_slots_and_fills_others() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("skip_quarantine");
         let _env = TestEnv::new("skip_quarantine_slots");
         let cfg = cfg_with(3, "ez-org-runner");
 
@@ -13559,7 +13573,6 @@ esac
     /// never tries to spawn INTO a wedged slot (no 409 self-heal churn).
     #[test]
     fn next_slot_excluding_keeps_skipping_quarantined_slots_across_calls() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("repeat_skip");
         let _env = TestEnv::new("repeat_skip");
         let cfg = cfg_with(4, "ez-org-runner");
         // Reserve slots 1 and 2, mark them recorded (so they're "occupied"
@@ -13612,7 +13625,6 @@ esac
     /// wedge the entire daemon.
     #[test]
     fn next_slot_excluding_tolerates_corrupt_quarantine_file() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("corrupt_q");
         let _env = TestEnv::new("corrupt_q");
         let cfg = cfg_with(2, "ez-org-runner");
         let _ = next_slot(&cfg).unwrap();
