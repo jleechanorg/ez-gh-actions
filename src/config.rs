@@ -861,6 +861,11 @@ impl Config {
             anyhow::bail!("canary.poll_interval_seconds must be <= canary.poll_timeout_seconds");
         }
         require_non_empty_path("canary.history_path", &self.canary.history_path)?;
+        // A FUSE-backed runner workspace breaks every job before it starts; see
+        // `validate_workspace_filesystem` for the 2026-10-28 incident.
+        if let Some(workspace_host_path) = &self.runner.workspace_host_path {
+            validate_workspace_filesystem(workspace_host_path)?;
+        }
         if self.invariant_sampler.check_interval_seconds == 0
             || self.invariant_sampler.check_interval_seconds
                 > maximum_invariant_check_interval_seconds()
@@ -934,6 +939,169 @@ impl Config {
         std::fs::rename(&tmp, path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
+    }
+}
+
+/// Outcome of the `findmnt` probe.
+enum FstypeProbe {
+    /// findmnt named the filesystem serving the path.
+    Reported(String),
+    /// No verdict: missing binary, non-zero exit, empty output, or a probe that
+    /// outlived its budget. The caller fails open and announces it.
+    Unverified(String),
+}
+
+/// How long the filesystem probe may run before it is abandoned.
+///
+/// Startup must never hinge on a filesystem call: `stat(2)` on a wedged FUSE or
+/// network mount can park a child in an uninterruptible wait indefinitely, so
+/// this is a hard ceiling rather than a hint. `EZGHA_WORKSPACE_PROBE_TIMEOUT_MS`
+/// lets tests drive the timeout path without sleeping for seconds.
+fn workspace_probe_budget() -> std::time::Duration {
+    std::env::var("EZGHA_WORKSPACE_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_secs(5))
+}
+
+/// Read a child's stdout without trusting it to close.
+///
+/// `read_to_end` blocks until every writer closes the pipe, and a descendant that
+/// inherited stdout keeps it open after the child itself exits - so a plain read
+/// can outlive the probe budget even when the direct child is done. Returns
+/// `None` when the pipe did not close in time, which the caller treats as an
+/// unverified probe.
+fn read_bounded_stdout(mut stdout: impl std::io::Read + Send + 'static) -> Option<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        let _ = sender.send(buffer);
+    });
+    receiver.recv_timeout(workspace_probe_budget()).ok()
+}
+
+/// Ask `findmnt` which filesystem serves `path`, bounded end to end.
+///
+/// Deliberately not built on `platform::capture_with_timeout`: that helper waits
+/// without a deadline once the child's stdout closes, and again after a kill, so
+/// a child wedged in an uninterruptible filesystem wait could still hold the
+/// caller. Here the child is polled against the budget, killed on expiry, and
+/// reaped on a detached thread so nothing blocks daemon startup.
+fn probe_workspace_fstype(bin: &str, path: &str) -> FstypeProbe {
+    let mut child = match std::process::Command::new(bin)
+        .args(["-n", "-o", "FSTYPE", "-T", path])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => return FstypeProbe::Unverified(format!("cannot run {bin}: {err}")),
+    };
+    let deadline = std::time::Instant::now() + workspace_probe_budget();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return FstypeProbe::Unverified(format!("{bin} exited with {status}"));
+                }
+                let buffer = match child.stdout.take().map(read_bounded_stdout) {
+                    Some(Some(buffer)) => buffer,
+                    Some(None) => {
+                        return FstypeProbe::Unverified(format!(
+                            "{bin} left stdout open past its probe budget"
+                        ));
+                    }
+                    None => Vec::new(),
+                };
+                let listing = String::from_utf8_lossy(&buffer).trim().to_string();
+                if listing.is_empty() {
+                    return FstypeProbe::Unverified(format!("{bin} reported no filesystem type"));
+                }
+                return FstypeProbe::Reported(listing);
+            }
+            Ok(None) => {}
+            Err(err) => return FstypeProbe::Unverified(format!("cannot wait for {bin}: {err}")),
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return FstypeProbe::Unverified(format!("{bin} exceeded its probe budget"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Reject a `findmnt` FSTYPE listing that shows the workspace on FUSE.
+///
+/// Why this exists (2026-10-28 incident): the runner bind-mounts
+/// `runner.workspace_host_path/<runner_name>` at `/home/runner/_work`, and at
+/// job setup the upstream runner deletes and recreates `_work/_actions`
+/// (`Runner.Worker`/ActionManager), while git creates loose objects with
+/// `open(O_CREAT|O_EXCL|O_RDWR, 0444)`. A FUSE mount satisfies neither: the
+/// delete fails with `Device or resource busy: '/home/runner/_work/_actions'`
+/// so every job dies in "Set up job" before a single step runs, and the 0444
+/// create fails with EACCES so git-based steps break too. Both were observed
+/// live while the Disk Magician Scratch image was mounted through the bundled
+/// fuse2fs helper instead of its kernel ext4 loop mount. Detecting it at
+/// config-validation time turns 20 silently-dead runners into one startup
+/// error.
+///
+/// `findmnt -T` reports the single filesystem serving the path; every non-empty
+/// line is still checked defensively so a wrapper (or future findmnt behaviour)
+/// that prints several entries cannot slip a FUSE entry past a first-line test.
+fn workspace_fstype_rejection(mount_output: &str, path: &str) -> Option<String> {
+    let offending = mount_output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && line.starts_with("fuse"))?;
+    Some(format!(
+        "runner.workspace_host_path '{path}' is on a FUSE filesystem ('{offending}'). The GitHub \
+         runner deletes and recreates _work/_actions when it sets up a job, and git writes 0444 \
+         loose objects there; a FUSE mount fails both, so every job dies in \"Set up job\" with \
+         \"Device or resource busy\" and git-based steps fail with EACCES. This workspace must \
+         live on a kernel-mounted filesystem. The Disk Magician scratch image is expected to be an \
+         ext4 loop mount; for that volume the reported type reads ext4, while any other \
+         kernel filesystem is also acceptable."
+    ))
+}
+
+/// The announcement emitted when no filesystem verdict was obtained.
+///
+/// Kept as a function so a test can assert the wording: a silent fail-open would
+/// let an unverified workspace be mistaken for a verified kernel mount.
+fn unverified_workspace_warning(path: &str, reason: &str) -> String {
+    format!(
+        "warning: could not verify the filesystem type of runner.workspace_host_path '{path}' \
+         ({reason}); continuing without the FUSE workspace guard"
+    )
+}
+
+/// Reject a workspace root that lives on a FUSE mount.
+///
+/// Fail open when the probe cannot produce a verdict (missing `findmnt`, a
+/// non-Linux host, empty output, or a probe that outlives its budget): blocking
+/// daemon startup on a capability probe would be the self-outage this guard
+/// exists to prevent. The unverified case is announced on stderr so a silent
+/// pass can never be mistaken for a verified kernel mount.
+fn validate_workspace_filesystem(path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        anyhow::bail!("runner.workspace_host_path must not be empty when configured");
+    }
+    let bin = std::env::var("EZGHA_FINDMNT_BIN").unwrap_or_else(|_| "findmnt".to_string());
+    match probe_workspace_fstype(&bin, path) {
+        FstypeProbe::Reported(listing) => match workspace_fstype_rejection(&listing, path) {
+            Some(message) => anyhow::bail!(message),
+            None => Ok(()),
+        },
+        FstypeProbe::Unverified(reason) => {
+            eprintln!("{}", unverified_workspace_warning(path, &reason));
+            Ok(())
+        }
     }
 }
 
@@ -1626,5 +1794,228 @@ slack_channel = "C0AJ3SD5C79"
         );
         assert_eq!(cfg.alert.slack_channel.as_deref(), Some("C0AJ3SD5C79"));
         assert_eq!(cfg.alert.slack_webhook_url, None);
+    }
+
+    /// Owns the temporary directory the probe stubs live in; removed on drop so a
+    /// failing assertion cannot leave debris behind.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ezgha-wsfs-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write a `findmnt` stub honouring `STUB_FSTYPE`, `STUB_EXIT` and `STUB_SLEEP`.
+    fn findmnt_stub(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.join("findmnt");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n[ -z \"${STUB_SLEEP:-}\" ] || sleep \"$STUB_SLEEP\"\n\
+             printf '%s\\n' \"${STUB_FSTYPE:-}\"\nexit \"${STUB_EXIT:-0}\"\n",
+        )
+        .expect("write findmnt stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        stub
+    }
+
+    #[test]
+    fn workspace_fstype_rejection_blocks_fuse_mounts() {
+        // The 2026-10-28 outage shape: a FUSE workspace made every job die in
+        // "Set up job" with EBUSY on _work/_actions.
+        for listing in [
+            "fuse.ext4",
+            "fuse2fs",
+            "fuse",
+            "fuseblk",
+            "  fuse.ext4  ",
+            "ext4\nfuse.ext4",
+        ] {
+            let message =
+                workspace_fstype_rejection(listing, "/home/user/Scratch").unwrap_or_else(|| {
+                    panic!("{listing:?} must be rejected as a workspace filesystem")
+                });
+            assert!(
+                message.contains("Device or resource busy"),
+                "rejection must name the observed failure: {message}"
+            );
+            assert!(
+                message.contains("ext4 loop mount"),
+                "rejection must describe the kernel-mount remedy: {message}"
+            );
+            // Repo rule: error strings must describe remediation, never embed a
+            // runnable command for the next agent to execute.
+            for forbidden in ["umount", "mount -o", "&&", "findmnt -no"] {
+                assert!(
+                    !message.contains(forbidden),
+                    "error text must not embed {forbidden:?}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_fstype_rejection_allows_kernel_filesystems() {
+        for listing in [
+            "ext4",
+            "xfs",
+            "btrfs",
+            "overlay",
+            "tmpfs",
+            "virtiofs",
+            "ext4\noverlay",
+            "",
+            "   \n",
+        ] {
+            assert!(
+                workspace_fstype_rejection(listing, "/home/user/Scratch").is_none(),
+                "{listing:?} must be accepted as a workspace filesystem"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_workspace_filesystem_rejects_fuse_accepts_ext4_and_fails_open() {
+        let _lock = crate::alert::test_lock();
+        let _env =
+            crate::alert::EnvVarGuard::new(&["EZGHA_FINDMNT_BIN", "STUB_FSTYPE", "STUB_EXIT"]);
+        let dir = TempDir::new("probe");
+        let stub = findmnt_stub(dir.path());
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+
+        std::env::set_var("STUB_FSTYPE", "fuse.ext4");
+        std::env::remove_var("STUB_EXIT");
+        let err = validate_workspace_filesystem("/home/user/Scratch")
+            .expect_err("a FUSE workspace must be rejected")
+            .to_string();
+        assert!(err.contains("FUSE filesystem"), "{err}");
+
+        std::env::set_var("STUB_FSTYPE", "ext4");
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("a kernel-mounted workspace must be accepted");
+
+        // Fail open when the probe exits non-zero ...
+        std::env::set_var("STUB_EXIT", "1");
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("an unverifiable workspace must not block startup");
+
+        // ... when it reports nothing ...
+        std::env::set_var("STUB_EXIT", "0");
+        std::env::set_var("STUB_FSTYPE", "");
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("an empty probe result must not block startup");
+        let warning = unverified_workspace_warning("/home/user/Scratch", "no filesystem type");
+        assert!(
+            warning.contains("could not verify") && warning.contains("FUSE workspace guard"),
+            "the unverified case must be announced, not silent: {warning}"
+        );
+
+        // ... and when it is missing entirely.
+        std::env::set_var("EZGHA_FINDMNT_BIN", stub.with_file_name("does-not-exist"));
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("a missing probe must not block startup");
+    }
+
+    #[test]
+    fn validate_workspace_filesystem_abandons_a_hung_probe() {
+        let _lock = crate::alert::test_lock();
+        let _env = crate::alert::EnvVarGuard::new(&[
+            "EZGHA_FINDMNT_BIN",
+            "STUB_SLEEP",
+            "EZGHA_WORKSPACE_PROBE_TIMEOUT_MS",
+        ]);
+        let dir = TempDir::new("hung");
+        let stub = findmnt_stub(dir.path());
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+        std::env::set_var("STUB_SLEEP", "30");
+        std::env::set_var("EZGHA_WORKSPACE_PROBE_TIMEOUT_MS", "100");
+
+        let started = std::time::Instant::now();
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("a hung probe must fail open, not block startup");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a hung probe must be abandoned at the budget (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn probe_abandons_a_pipe_held_open_by_a_surviving_descendant() {
+        let _lock = crate::alert::test_lock();
+        let _env = crate::alert::EnvVarGuard::new(&[
+            "EZGHA_FINDMNT_BIN",
+            "EZGHA_WORKSPACE_PROBE_TIMEOUT_MS",
+        ]);
+        let dir = TempDir::new("pipe");
+        use std::os::unix::fs::PermissionsExt;
+        let stub = dir.path().join("findmnt");
+        // The direct child exits at once; its backgrounded descendant inherits the
+        // stdout pipe and sleeps well past the budget, so an unbounded
+        // read_to_end would block here.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n( sleep 30 ) &\nprintf '%s\\n' ext4\nexit 0\n",
+        )
+        .expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+        std::env::set_var("EZGHA_WORKSPACE_PROBE_TIMEOUT_MS", "150");
+
+        let started = std::time::Instant::now();
+        validate_workspace_filesystem("/home/user/Scratch")
+            .expect("an inherited-pipe probe must fail open, not block startup");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an inherited pipe must not extend startup (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn config_validate_rejects_a_fuse_backed_workspace() {
+        let _lock = crate::alert::test_lock();
+        let _env = crate::alert::EnvVarGuard::new(&["EZGHA_FINDMNT_BIN", "STUB_FSTYPE"]);
+        let dir = TempDir::new("cfg");
+        let stub = findmnt_stub(dir.path());
+        std::env::set_var("EZGHA_FINDMNT_BIN", &stub);
+
+        std::env::set_var("STUB_FSTYPE", "fuse.ext4");
+        let mut cfg = valid_config();
+        cfg.runner.workspace_host_path = Some("/home/user/Scratch".into());
+        let err = cfg
+            .validate()
+            .expect_err("Config::validate must reject a FUSE-backed workspace")
+            .to_string();
+        assert!(err.contains("runner.workspace_host_path"), "{err}");
+
+        std::env::set_var("STUB_FSTYPE", "ext4");
+        cfg.validate()
+            .expect("Config::validate must accept a kernel-mounted workspace");
+    }
+
+    #[test]
+    fn config_validate_rejects_a_blank_workspace_path() {
+        let mut cfg = valid_config();
+        cfg.runner.workspace_host_path = Some("   ".into());
+        let err = cfg
+            .validate()
+            .expect_err("a blank workspace path must be rejected")
+            .to_string();
+        assert!(err.contains("must not be empty"), "{err}");
     }
 }
