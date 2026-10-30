@@ -31,10 +31,14 @@ It is not a bypass:
   only on a VM dedicated to runner work — another tenant's workload is outside the
   boundary you are claiming. (A Xen dom0 also exposes `/sys/hypervisor/type` while
   effectively being the host, so the probe alone is not a licence to relax anything on
-  bare metal.);
+  bare metal);
 - the default (`auto`) keeps the existing `actions.slice` requirement, so bare-metal and
   Colima hosts are unchanged (a daemon on a different kernel was already treated as
-  VM-contained and is checked first).
+  VM-contained and is checked first);
+- the running daemon re-checks containment every tick and pauses admission with a
+  `Critical` `runner_pool.host_containment_failed` alert if it stops holding, and a
+  `serve` refused at startup under `Restart=on-failure` gives up after
+  `StartLimitBurst=5` within 300 s.
 
 ### What `vm` actually waives — know what you are giving up
 
@@ -58,10 +62,10 @@ short, because the probe runs after the `alive >= count` early return
 (`test -e /sys/fs/cgroup/user.slice/memory.pressure` tells you which case you are in).
 On a stock Ubuntu VM with PSI enabled the file **does** exist, so the gate is active — and
 it samples `user.slice`, which does not contain the runners (Docker scopes them under
-`system.slice`). There the separate, unconditional
-`MemAvailable < 2 × per-runner memory` check (2.8 GiB at 1400 MiB runners) still applies,
-which a host running at its memory ceiling cannot satisfy, so refills can pause under
-load. The gate fails *open* only because
+`system.slice`). Wherever the PSI read *does* succeed, `eval_admission` additionally
+applies a `MemAvailable < 2 × per-runner memory` test (2.8 GiB at 1400 MiB runners), which
+a host running at its memory ceiling cannot satisfy, so refills can pause under load. When
+the PSI file is missing, that test is skipped along with the probe. The gate fails *open* only because
 `runner.host_reserve_mb` is 0 (the default, and unset in the example). **Setting a
 non-zero `host_reserve_mb` on this host shape makes a PSI probe failure fail closed and
 freezes admission**, so leave it at 0 here.
@@ -74,8 +78,12 @@ transport works — for cmux Cloud, `cmux vm push`, or `cmux vm push --secret <i
 
 It assumes, and does not install: Ubuntu with a systemd **user** manager (it runs
 `loginctl enable-linger` and `systemctl --user`), Docker already installed and usable by
-this user, passwordless `sudo -n`, plus `python3`, `git`, `curl` and `gh`. Missing any of
-these fails part-way through with the step number in `~/ezgha-bootstrap-<tag>.log`.
+this user, passwordless `sudo -n`, a C linker and `make` for `cargo install`
+(`build-essential` — the rustup minimal profile does not bring one), plus `python3`, `git`,
+`curl`, `gh`, and the Python modules `mint_gh_app_token.py` imports: `jwt` (PyJWT) with
+`cryptography` for RS256, and `requests`. The token-refresh step runs under `set -e`, so a
+missing module stops the bootstrap at that step. Each step number is in
+`~/ezgha-bootstrap-<tag>.log`.
 
 ```sh
 # on the VM, after placing ~/.config/ezgha/app_private_key.pem (mode 600) and a
@@ -121,8 +129,10 @@ proof of a valid budget — the check is only logged when it actually runs:
 
 ```sh
 journalctl --user -u ezgha.service | grep 'memory budget:'
-grep -qw hypervisor /proc/cpuinfo || test -e /sys/hypervisor/type   # virtualization probe
-``` `cpu_burst = true` is refused unless `platform::daemon_in_vm_only()`
+grep '^flags' /proc/cpuinfo | grep -qw hypervisor || test -e /sys/hypervisor/type
+```
+
+`cpu_burst = true` is refused unless `platform::daemon_in_vm_only()`
 verifies a VM, and that detection only compares kernels — a same-kernel microVM does not
 qualify, so leave `cpu_burst` off here.
 
@@ -149,7 +159,8 @@ That deployment was 11 + 5 + 5 + 5 = **26 slots**.
 1400 is the per-job figure the 20-runner Linux fleet runs; going below the floor
 reproduces the under-floor clamp OOM class (bead `ez-gh-actions-yz6b`). "Measured" means
 MemTotal and NCPU came from `docker info` and the counts follow the formulas; 26
-dispatched jobs then completed successfully across those 26 slots. The selftest workflow
+dispatched jobs then completed successfully on the cloud pool (they were matched by the
+shared `cmux-cloud` label, so each placement was not confirmed per slot). The selftest workflow
 runs for seconds, so that is **not** evidence of 26 simultaneous long jobs.
 
 ### Guest reserve
@@ -187,10 +198,12 @@ memory pool; the CLI takes 4-256 GiB in 4 GiB steps and cannot shrink).
 
 `docker info --format '{{.NCPU}}'` is fixed at daemon start. A VM created small and
 resized later keeps reporting the old value — observed as `NCPU=2` on 8-vCPU hosts, which
-silently cut every runner to `2/count` CPUs — and because the CPU formula floors at 0.5,
-a 2-CPU report on an 11-runner host *requests* 5.5 CPUs, i.e. oversubscription, not merely
-a smaller share. Compare against `nproc --all` (plain `nproc` reflects the caller's
-affinity mask); on a mismatch,
+cut every runner's CPU share. The formula floors at 0.5, so a stale `NCPU=2` on an
+11-runner 8-vCPU host pins each runner at **0.5 CPU instead of 0.73** — an
+under-allocation, not oversubscription (the real host has 8 vCPU). Treat "fixed at daemon
+start" as the observed behaviour on these hosts rather than a documented guarantee.
+Compare against `nproc --all` (plain `nproc` reflects the caller's affinity mask); on a
+mismatch,
 restarting `docker` re-reads the real count, but that is a deploy-owner action that
 restarts every runner on the host (and their jobs).
 
@@ -208,15 +221,19 @@ A registered runner is not a working runner, and `cmux-cloud` is shared by every
 VM, so a job is not proof about *this* host until its placement is confirmed. The
 selftest also finishes in seconds, which makes `docker top` a race.
 
+Run these from the operator's machine, not from the VM: the bootstrap installs a GitHub
+App installation token, and `gh api /user` (and `gh run` as the app) does not work under
+it. Prefer the host-specific label from the section above so the job cannot land elsewhere:
+
 ```sh
 gh workflow run selftest.yml -R jleechanorg/ez-gh-actions \
-  -f runs_on_json='["self-hosted","cmux-cloud"]'
-# `gh workflow run` prints no run id; find the newest one, then confirm WHICH host took it
-# (the name must match this host's NAME_PREFIX):
-gh run list -R jleechanorg/ez-gh-actions --workflow selftest.yml -L1 \
-  --event workflow_dispatch --user "$(gh api /user --jq .login)"
+  -f runs_on_json='["self-hosted","cmux-cloud-<host>"]'
+# `gh workflow run` prints no run id; take the newest dispatch, then confirm the placement:
+gh run list -R jleechanorg/ez-gh-actions --workflow selftest.yml -L1 --event workflow_dispatch
 gh run view <run-id> -R jleechanorg/ez-gh-actions --log | grep 'Runner name:'
 ```
+
+The name must match this host's `NAME_PREFIX`.
 
 For a per-host health read, run the container check on the VM itself:
 
