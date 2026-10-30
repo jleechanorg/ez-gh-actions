@@ -132,7 +132,9 @@ pass "min-age override honored, live protection independent of age"
 # 6. A producer-API failure must fail closed (delete nothing).
 VICTIM="${SCR}/worldai-ios-release-555-1"
 aged "${VICTIM}"
-STUB_GH_FAIL=1 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+rc=0
+STUB_GH_FAIL=1 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
+[ "${rc}" -ne 0 ] || fail "a gh that errors must exit non-zero (green no-op is not acceptable)"
 [ -d "${VICTIM}" ] || fail "gh failure must delete nothing"
 # ... and an absent gh must fail LOUDLY (preflight) rather than run a no-op.
 rc=0
@@ -194,8 +196,9 @@ rc=0; GH_BIN="${GH}" SCRATCH_ROOT="${W}/home-link" bash "${S}" --apply >/dev/nul
 [ "${rc}" -ne 0 ] || fail "must refuse a symlink to HOME"
 pass "HOME refusals not bypassable"
 
-# 11. Missing pgrep must fail closed: with pgrep absent from PATH and a live
-#     process referencing the dir only in argv, nothing may be deleted.
+# 11. An argv-only reference must protect the tree even when pgrep is not on PATH
+#     (the binary is resolved absolutely). Genuine tool absence is covered by
+#     test 13's loud preflight.
 SHIM="${W}/shim"; mkdir -p "${SHIM}"
 # Everything the reaper may exec EXCEPT pgrep, so the missing-pgrep path is
 # isolated. `ps`/`lsof` stay present: with them absent the script would fail
@@ -230,7 +233,7 @@ grep -q "=== start" "${SHIM_LOG}" || { cat "${SHIM_LOG}" >&2; fail "no-pgrep shi
 [ -d "${NOLIVE}" ] || fail "missing pgrep must fail closed (dir deleted while a live process referenced it)"
 grep -q "SKIP in-use" "${SHIM_LOG}" || fail "no-pgrep run must report the tree as in-use"
 kill "${NOPGREP_PID}" 2>/dev/null || true
-pass "missing pgrep fails closed"
+pass "argv reference protected without pgrep on PATH"
 
 # 12. A deferred consumer that holds the path ONLY in an environment variable (no
 #     argv entry, no open fd, foreign cwd) must still protect the tree.

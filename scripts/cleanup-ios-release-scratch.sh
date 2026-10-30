@@ -28,6 +28,9 @@
 #   - Only runs whose producer reports `completed`/`success` are reaped. Failed
 #     and cancelled runs are retained on purpose: their scratch is the cheapest
 #     debugging evidence for a broken build, and their count is small.
+#   - A process that inherited the path in its environment and outlives every run
+#     (a long-lived build daemon) pins that directory forever: the env scan keeps
+#     skipping it. That fails safe (leaks, never deletes) and is visible in the log.
 #   - Default DRY-RUN; --apply performs removals.
 #   - Removal is a direct rm of the validated path. There is deliberately no
 #     quarantine directory: $HOME and the Scratch volume are different
@@ -158,6 +161,12 @@ if [[ -n "${missing_tools}" ]]; then
   echo "FATAL: missing required tool(s) for a safe run:${missing_tools} — refusing to run rather than silently declining every candidate. Check the scheduler's PATH (macOS keeps lsof in /usr/sbin)." >&2
   exit 4
 fi
+# Presence is not usability: an unauthenticated gh would make every candidate
+# "not proven completed", i.e. a silent no-op that exits 0. Check auth up front.
+if ! "${GH_BIN}" auth status >/dev/null 2>&1; then
+  echo "FATAL: 'gh auth status' failed — cannot verify producer run completion, so nothing could ever be reaped. Refusing to run a green no-op; re-authenticate gh for this user." >&2
+  exit 4
+fi
 
 STATE_DIR="${HOME}/.local/state/ezgha"
 LOG="${STATE_DIR}/ios-release-cleanup.log"
@@ -233,7 +242,7 @@ take_liveness_snapshot() {
 log() {
   local tag="APPLY"
   if [[ "${DRY_RUN}" == "true" ]]; then tag="DRY-RUN"; fi
-  printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "${tag}" "$*" | tee -a "${LOG}"
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "${tag}" "$*" | tee -a "${LOG}" || true
 }
 
 # Returns the mtime epoch seconds, or empty when it cannot be read. Callers must
@@ -305,7 +314,6 @@ dir_is_referenced() {
   # A missing pgrep means argv cannot be inspected at all - "cannot verify", so
   # treat as in use. A pgrep that EXISTS but errors (rc >= 2) is also
   # unverifiable; only rc 1 ("no process matched") means "no argv reference".
-  [[ -n "${PGREP_BIN}" ]] || return 0
   local pgrep_rc=0
   "${PGREP_BIN}" -f -- "${base}" >/dev/null 2>&1 || pgrep_rc=$?
   if [[ ${pgrep_rc} -eq 0 ]]; then
@@ -420,9 +428,9 @@ while IFS= read -r -d '' d; do
   # metadata record; the bytes are disposable scratch whose artifacts were
   # published by the workflow before cleanup.
   if "${RM_BIN}" -rf -- "$d" 2>/dev/null; then
-    log "  REMOVED: ${d} (${sz_kb}K, ${age_h}h old)"
     removed=$((removed+1)); freed_kb=$((freed_kb + sz_kb))
-    echo "${d}  ${sz_kb}K  ${age_h}h" >> "${MANIFEST}"
+    echo "${d}  ${sz_kb}K  ${age_h}h" >> "${MANIFEST}" || true
+    log "  REMOVED: ${d} (${sz_kb}K, ${age_h}h old)"
   else
     log "  FAIL (remove failed): ${d}"
   fi
