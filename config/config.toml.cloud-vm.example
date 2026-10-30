@@ -17,8 +17,9 @@ target = "jleechanorg"
 [runner]
 name_prefix = "ez-cloud-runner"
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64", "cmux-cloud"]
-# Size the count to the VM: `runner_floor_mb` (3072 default) per runner plus host
-# headroom. 4 on a 16 GiB / 8 vCPU machine, 2 on an 8 GiB / 4 vCPU machine.
+# Deliberately conservative starting point. With the 512/1400 values below the
+# ceiling is 11 on a 16 GiB / 8 vCPU host and 5 on an 8 GiB / 4 vCPU host
+# (docs/cloud-vm-hosts.md). Raise it only after reading that formula.
 count = 4
 image = "ezgha-runner:latest"
 # The 4 GiB Lima guest reserve is too big here (the daemon's Docker *is* this VM's
