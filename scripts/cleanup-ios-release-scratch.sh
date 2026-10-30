@@ -43,6 +43,14 @@ set -euo pipefail
 DRY_RUN=true
 MIN_AGE_HOURS="${MIN_AGE_HOURS:-48}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-}"
+# The workflow that owns these directories. Each run directory carries its run
+# id, so the reaper can require positive evidence that the run FINISHED instead
+# of inferring it from age plus a momentary process scan.
+PRODUCER_REPO="${PRODUCER_REPO:-jleechanorg/worldai_frontend}"
+GH_BIN="${GH_BIN:-gh}"
+# Hard cap on deletions per invocation. The predicate is already narrow; this
+# bounds the blast radius of a single unattended run regardless.
+MAX_DELETIONS="${MAX_DELETIONS:-10}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +59,10 @@ while [[ $# -gt 0 ]]; do
     --min-age-hours=*) MIN_AGE_HOURS="${1#*=}"; shift ;;
     --scratch-root)    SCRATCH_ROOT="$2"; shift 2 ;;
     --scratch-root=*)  SCRATCH_ROOT="${1#*=}"; shift ;;
+    --repo)            PRODUCER_REPO="$2"; shift 2 ;;
+    --repo=*)          PRODUCER_REPO="${1#*=}"; shift ;;
+    --max-deletions)   MAX_DELETIONS="$2"; shift 2 ;;
+    --max-deletions=*) MAX_DELETIONS="${1#*=}"; shift ;;
     -h|--help)         sed -n '2,45p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -106,6 +118,23 @@ get_mtime() {
   stat -f%m "${target}" 2>/dev/null || stat -c%Y "${target}" 2>/dev/null || true
 }
 
+# Positive completion signal: ask the producer whether that exact run+attempt is
+# finished. Fails closed - an unreadable/absent `gh`, an API error, or any status
+# other than "completed" means "do not delete". Age and process checks remain as
+# defence in depth, but they can never establish completion on their own: a run
+# can sit between build, upload and receipt steps with no process touching the
+# tree, and writes inside existing children need not refresh the parent mtime.
+run_is_completed() {
+  local run_id="$1" attempt="$2" out rc=0
+  command -v "${GH_BIN}" >/dev/null 2>&1 || return 1
+  out="$(
+    "${GH_BIN}" api "repos/${PRODUCER_REPO}/actions/runs/${run_id}" \
+      -q '[.status, (.run_attempt|tostring)] | @tsv' 2>/dev/null
+  )" || rc=$?
+  [[ ${rc} -eq 0 ]] || return 1
+  [[ "${out}" == "completed"$'\t'"${attempt}" ]]
+}
+
 # A dir is live if any process command line mentions it. Cheap process-table
 # scan via pgrep -f, deliberately not `lsof +D` — these trees hold tens of
 # thousands of files and lsof walks the whole tree per candidate.
@@ -138,7 +167,12 @@ dir_is_referenced() {
   # file rather than a shell variable: the full lsof listing is ~10 MB here.
   command -v lsof >/dev/null 2>&1 || return 0
   snapshot="$(mktemp "${TMPDIR:-/tmp}/iosrel-lsof.XXXXXX" 2>/dev/null)" || return 0
-  lsof -w -n -Fn >"${snapshot}" 2>/dev/null || true
+  # A failed or empty scan proves nothing about liveness. Treat it as "in use"
+  # so a broken scanner skips deletion instead of authorising it.
+  if ! lsof -w -n -Fn >"${snapshot}" 2>/dev/null || [[ ! -s "${snapshot}" ]]; then
+    rm -f "${snapshot}"
+    return 0
+  fi
   for p in "${target}" "${real}"; do
     # lsof prefixes each path with "n", so an exact cwd is "n<path>"; anything
     # deeper matches the "<path>/" prefix.
@@ -176,6 +210,14 @@ while IFS= read -r -d '' d; do
     skipped=$((skipped+1)); continue
   fi
 
+  run_id="${base#worldai-ios-release-}"
+  run_id="${run_id%-*}"
+  attempt="${base##*-}"
+  if ! run_is_completed "${run_id}" "${attempt}"; then
+    log "  SKIP run not proven completed in ${PRODUCER_REPO} (fail closed): ${base}"
+    skipped=$((skipped+1)); continue
+  fi
+
   if dir_is_referenced "$d"; then
     log "  SKIP in-use (live process references it): ${base}"
     skipped=$((skipped+1)); continue
@@ -186,6 +228,19 @@ while IFS= read -r -d '' d; do
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "  DRY-RUN would remove: ${d} (${sz_kb}K, ${age_h}h old)"
     continue
+  fi
+
+  if [[ "${removed}" -ge "${MAX_DELETIONS}" ]]; then
+    log "  SKIP deletion cap reached (${MAX_DELETIONS}/run): ${base}"
+    skipped=$((skipped+1)); continue
+  fi
+
+  # Re-check immediately before the irreversible step. The size probe above
+  # widens the window between "not in use" and "deleted", and directories are
+  # named per run+attempt so nothing else can legitimately (re)enter one.
+  if dir_is_referenced "$d"; then
+    log "  SKIP in-use (re-check before removal): ${base}"
+    skipped=$((skipped+1)); continue
   fi
 
   # Direct removal, no quarantine directory. A quarantine dir under $HOME sits

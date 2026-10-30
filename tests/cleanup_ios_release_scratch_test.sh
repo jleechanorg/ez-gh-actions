@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Hermetic coverage for scripts/cleanup-ios-release-scratch.sh.
-# Verifies dry-run is non-destructive, --apply removes only aged, correctly
-# named, non-live per-run TestFlight release dirs, and that unsafe Scratch
-# roots are refused. Touches only a mktemp sandbox.
+#
+# Verifies: dry-run is non-destructive; --apply removes only a dir that is aged,
+# correctly named, proven COMPLETED by the producer API, and referenced by no
+# live process; a live process whose cwd is inside the tree is protected even
+# when the path is absent from argv and even through macOS's /var -> /private/var
+# symlink alias; an in-progress run and any gh failure are never deleted; the
+# deletion cap is honored; no quarantine copy is ever made under HOME; unsafe
+# Scratch roots are refused.
+#
+# Touches only a mktemp sandbox. `gh` is stubbed through GH_BIN.
 #
 # Usage: bash tests/cleanup_ios_release_scratch_test.sh
 
@@ -21,16 +28,38 @@ mkdir -p "${HOME}"
 SCR="${W}/scratch"
 mkdir -p "${SCR}"
 
+# --- producer-API stub -------------------------------------------------------
+# Prints "<status>\t<run_attempt>" for the run id embedded in the API path.
+mkdir -p "${W}/bin"
+cat > "${W}/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+[ -z "${STUB_GH_FAIL:-}" ] || exit 4
+id=""
+for a in "$@"; do case "$a" in repos/*/actions/runs/*) id="${a##*/}" ;; esac; done
+case "${id}" in
+  999) printf 'in_progress\t1' ;;
+  *)   printf 'completed\t1' ;;
+esac
+STUB
+chmod +x "${W}/bin/gh"
+GH="${W}/bin/gh"
+
 aged() { mkdir -p "$1"; touch -t 202401010000 "$1"; }
 
 OLD_OK="${SCR}/worldai-ios-release-111-1"
 mkdir -p "${OLD_OK}"
-# Write content BEFORE ageing the dir: adding a directory entry bumps its mtime.
+# Write content BEFORE ageing: adding a directory entry bumps the dir mtime.
 head -c 2048 /dev/zero > "${OLD_OK}/blob"
 touch -t 202401010000 "${OLD_OK}"
 
 OLD_LIVE="${SCR}/worldai-ios-release-222-1"
 aged "${OLD_LIVE}"
+
+OLD_CWD="${SCR}/worldai-ios-release-444-1"
+aged "${OLD_CWD}"
+
+IN_PROGRESS="${SCR}/worldai-ios-release-999-1"
+aged "${IN_PROGRESS}"
 
 OLD_BADNAME="${SCR}/worldai-ios-release-notanumber-1"
 aged "${OLD_BADNAME}"
@@ -41,14 +70,12 @@ mkdir -p "${RECENT}"
 UNRELATED="${SCR}/unrelated-dir"
 aged "${UNRELATED}"
 
-OLD_CWD="${SCR}/worldai-ios-release-444-1"
-aged "${OLD_CWD}"
-
-# Two live processes, two different detection paths:
+# Two live processes, two detection paths:
 #  (a) the path is in argv (a build invoked with the directory as an argument);
-#  (b) the path is NOT in argv at all - the process simply has its working
-#      directory inside the tree, which is the realistic long-build case and the
-#      exact false negative an argv-only scan produces.
+#  (b) the path is NOT in argv - the process merely has its working directory
+#      inside the tree. This is the realistic long-build case and the exact
+#      false negative an argv-only scan produces. It also exercises the macOS
+#      /var -> /private/var alias, because mktemp lives under /var/folders.
 # Compound commands, not `bash -c 'sleep 60'`: with a simple command bash execs
 # into it and the argument/cwd association is lost.
 bash -c 'while :; do sleep 1; done' "${OLD_LIVE}" &
@@ -56,24 +83,21 @@ LIVE_PID=$!
 ( cd "${OLD_CWD}" && exec bash -c 'while :; do sleep 1; done' ) &
 CWD_PID=$!
 sleep 0.5
-# Prove the cwd case really has no path in argv before relying on it.
 ps -o args= -p "${CWD_PID}" | grep -Fq "${OLD_CWD}" && fail "test setup: cwd-only process must not carry the path in argv"
 
+run() { GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" PRODUCER_REPO="jleechanorg/worldai_frontend" bash "${S}" "$@"; }
+
 # 1. Dry-run must change nothing.
-SCRATCH_ROOT="${SCR}" bash "${S}" >/dev/null
+run >/dev/null
 [ -d "${OLD_OK}" ] || fail "dry-run must not remove anything"
 pass "dry-run is non-destructive"
 
-# 2. --apply removes only the aged, correctly named, unreferenced dir.
-SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+# 2. --apply removes only the aged, correctly named, completed, unreferenced dir.
+run --apply >/dev/null
 [ ! -d "${OLD_OK}" ] || fail "aged completed release dir must be removed"
 [ -d "${OLD_LIVE}" ] || fail "dir referenced from a live process argv must be kept"
 [ -d "${OLD_CWD}" ] || fail "dir containing a live process working directory must be kept"
-# No quarantine copy may be created under HOME: HOME and the Scratch volume are
-# different filesystems, so a "quarantine" move would copy gigabytes onto the
-# root disk before deleting them.
-[ -z "$(find "${HOME}" -maxdepth 6 -name 'quarantine-*' -print -quit 2>/dev/null)" ] \
-  || fail "must not create a quarantine directory under HOME"
+[ -d "${IN_PROGRESS}" ] || fail "an unfinished run must never be removed, however old"
 [ -d "${OLD_BADNAME}" ] || fail "unrecognized dir name must be kept"
 [ -d "${RECENT}" ] || fail "recent release dir must be kept"
 [ -d "${UNRELATED}" ] || fail "non release-scratch dir must be kept"
@@ -84,27 +108,57 @@ grep -qs "worldai-ios-release-111-1" "${HOME}/.local/state/ezgha/ios-release-arc
   || fail "removal must be recorded in the manifest"
 pass "removal recorded in manifest"
 
-# 4. MIN_AGE_HOURS is honored (0 admits the recent dir, live one still protected).
-SCRATCH_ROOT="${SCR}" bash "${S}" --apply --min-age-hours 0 >/dev/null
+# 4. No cross-device quarantine copy may be created under HOME (HOME and the
+#    Scratch volume are different filesystems, so a "quarantine" move would copy
+#    gigabytes onto the root disk before deleting them).
+[ -z "$(find "${HOME}" -maxdepth 6 -name 'quarantine-*' -print -quit 2>/dev/null)" ] \
+  || fail "must not create a quarantine directory under HOME"
+pass "no quarantine copy under HOME"
+
+# 5. MIN_AGE_HOURS is honored (0 admits the recent dir; live ones stay protected).
+GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" PRODUCER_REPO="jleechanorg/worldai_frontend" \
+  bash "${S}" --apply --min-age-hours 0 >/dev/null
 [ ! -d "${RECENT}" ] || fail "--min-age-hours 0 must admit the recent dir"
 [ -d "${OLD_LIVE}" ] || fail "live-referenced dir must stay protected regardless of age"
 [ -d "${OLD_CWD}" ] || fail "cwd-referenced dir must stay protected regardless of age"
 pass "min-age override honored, live protection independent of age"
 
-# 5. Unsafe Scratch roots are refused.
+# 6. A producer-API failure must fail closed (delete nothing).
+VICTIM="${SCR}/worldai-ios-release-555-1"
+aged "${VICTIM}"
+STUB_GH_FAIL=1 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+[ -d "${VICTIM}" ] || fail "gh failure must delete nothing"
+# ... and an absent gh must also fail closed.
+GH_BIN="${W}/bin/does-not-exist" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+[ -d "${VICTIM}" ] || fail "absent gh must delete nothing"
+pass "producer-API failure and absent gh both fail closed"
+# Retire the probe dir (empty) so the cap test below starts from a clean slate;
+# otherwise this eligible dir would consume the single deletion slot.
+rmdir "${VICTIM}"
+
+# 7. Deletion cap is enforced.
+CAPA="${SCR}/worldai-ios-release-666-1"; aged "${CAPA}"
+CAPB="${SCR}/worldai-ios-release-667-1"; aged "${CAPB}"
+run --apply --max-deletions 1 >/dev/null
+remaining=0
+[ -d "${CAPA}" ] && remaining=$((remaining+1))
+[ -d "${CAPB}" ] && remaining=$((remaining+1))
+[ "${remaining}" -eq 1 ] || fail "deletion cap must remove exactly one of the two (removed $((2-remaining)))"
+pass "deletion cap enforced"
+
+# 8. Unsafe Scratch roots are refused.
 for bad in "/" "relative/path"; do
   rc=0
-  SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
+  GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
   [ "${rc}" -ne 0 ] || fail "must refuse Scratch root '${bad}'"
 done
 rc=0
-SCRATCH_ROOT="${HOME}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
+GH_BIN="${GH}" SCRATCH_ROOT="${HOME}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
 [ "${rc}" -ne 0 ] || fail "must refuse HOME as a Scratch root"
-# Unresolvable root (no SCRATCH_ROOT, no diskm on PATH) must fail closed rather
-# than fall back to a guessed path.
+# No SCRATCH_ROOT at all must fail closed rather than guess a path.
 rc=0
 env -u SCRATCH_ROOT PATH=/usr/bin:/bin bash "${S}" --apply >/dev/null 2>&1 || rc=$?
-[ "${rc}" -ne 0 ] || fail "must fail closed when the Scratch root cannot be resolved"
+[ "${rc}" -ne 0 ] || fail "must fail closed when the Scratch root is absent"
 pass "unsafe Scratch roots refused"
 
 echo "all cleanup-ios-release-scratch tests passed"

@@ -236,6 +236,16 @@ case "$action" in
         # firing hourly at a target this host can no longer resolve.
         if [[ -f "${dest}" ]]; then
           launchctl unload "${dest}" 2>/dev/null || true
+          # Verify the stop instead of assuming it: a still-loaded hourly
+          # --apply job with an old root is worse than no unit at all. `bootout`
+          # by label is the reliable stop when `unload` is a no-op.
+          if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+            launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+          fi
+          if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+            echo "ERROR: ${label} is still loaded and could not be stopped; refusing to continue with an unverifiable unit" >&2
+            exit 1
+          fi
           rm -f "${dest}"
           echo "UNLOADED and removed stale ${label} — its Scratch root can no longer be resolved" >&2
         fi
