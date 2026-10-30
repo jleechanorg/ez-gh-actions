@@ -105,6 +105,12 @@ if [[ "${SCRATCH_ROOT}" == "${HOME}" || "${ROOT_CANON_CHECK}" == "${HOME_CANON}"
   echo "FATAL: refusing to treat HOME (or an alias of it) as a Scratch root" >&2
   exit 3
 fi
+# "/.", a symlink to "/", and similar aliases canonicalise to "/" and slip past the
+# literal case guard above. Refuse the canonical form explicitly.
+if [[ "${ROOT_CANON_CHECK}" == "/" ]]; then
+  echo "FATAL: refusing a Scratch root that resolves to / ('${SCRATCH_ROOT}')" >&2
+  exit 3
+fi
 if [[ ! -d "${SCRATCH_ROOT}" ]]; then
   echo "FATAL: Scratch root does not exist: ${SCRATCH_ROOT}" >&2
   exit 3
@@ -359,7 +365,7 @@ dir_is_referenced() {
   return 1
 }
 
-scanned=0; removed=0; skipped=0; freed_kb=0
+scanned=0; removed=0; skipped=0; failed=0; freed_kb=0
 
 log "=== start (DRY_RUN=${DRY_RUN} MIN_AGE_HOURS=${MIN_AGE_HOURS} SCRATCH_ROOT=${SCRATCH_ROOT}) ==="
 
@@ -432,9 +438,15 @@ while IFS= read -r -d '' d; do
     echo "${d}  ${sz_kb}K  ${age_h}h" >> "${MANIFEST}" || true
     log "  REMOVED: ${d} (${sz_kb}K, ${age_h}h old)"
   else
+    failed=$((failed+1))
     log "  FAIL (remove failed): ${d}"
   fi
 done < <(find "${SCRATCH_ROOT}" -mindepth 1 -maxdepth 1 -type d -name 'worldai-ios-release-*' -print0 2>/dev/null || true)
 
-log "=== summary: scanned=${scanned} removed=${removed} skipped=${skipped} freed=${freed_kb}K ==="
+log "=== summary: scanned=${scanned} removed=${removed} skipped=${skipped} failed=${failed} freed=${freed_kb}K ==="
+# A run that could not remove something is NOT a clean run: exit non-zero so the
+# scheduler sees a partial failure instead of a green no-op.
+if (( failed > 0 )); then
+  exit 5
+fi
 exit 0

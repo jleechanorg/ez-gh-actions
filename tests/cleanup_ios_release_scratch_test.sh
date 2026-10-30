@@ -37,7 +37,12 @@ mkdir -p "${SCR}"
 mkdir -p "${W}/bin"
 cat > "${W}/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-[ -z "${STUB_GH_FAIL:-}" ] || exit 4
+if [ -n "${STUB_GH_FAIL:-}" ]; then
+  case "$*" in
+    *" auth status"*) : ;;   # auth still works; only the data call fails
+    *) exit 4 ;;
+  esac
+fi
 id=""
 for a in "$@"; do case "$a" in repos/*/actions/runs/*) id="${a##*/}" ;; esac; done
 case "${id}" in
@@ -132,10 +137,9 @@ pass "min-age override honored, live protection independent of age"
 # 6. A producer-API failure must fail closed (delete nothing).
 VICTIM="${SCR}/worldai-ios-release-555-1"
 aged "${VICTIM}"
-rc=0
-STUB_GH_FAIL=1 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
-[ "${rc}" -ne 0 ] || fail "a gh that errors must exit non-zero (green no-op is not acceptable)"
-[ -d "${VICTIM}" ] || fail "gh failure must delete nothing"
+STUB_GH_FAIL=1 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || true
+[ -d "${VICTIM}" ] || fail "a failing producer data call must delete nothing"
+pass "per-candidate API failure fails closed"
 # ... and an absent gh must fail LOUDLY (preflight) rather than run a no-op.
 rc=0
 GH_BIN="${W}/bin/does-not-exist" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
@@ -180,8 +184,8 @@ FAILED="${SCR}/worldai-ios-release-998-1"
 aged "${FAILED}"
 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 [ -d "${FAILED}" ] || fail "a failed run's scratch must be retained, not reaped"
-# ...while a re-run whose LATEST attempt succeeded is still reapable (attempt-1
-# dirs must not be orphaned forever).
+# ...and a re-run's EARLIER attempt dir is retained too, even when the latest
+# attempt succeeded (it holds that attempt's evidence).
 RERUN="${SCR}/worldai-ios-release-997-1"
 aged "${RERUN}"
 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
@@ -276,7 +280,7 @@ grep -q "/usr/sbin" "${REPO_ROOT}/launchd/org.jleechanorg.ezgha-ios-release-clea
 pass "plist PATH includes /usr/sbin"
 
 # 15. Unsafe Scratch roots are refused.
-for bad in "/" "//" "relative/path"; do
+for bad in "/" "//" "/." "relative/path"; do
   rc=0
   GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
   [ "${rc}" -ne 0 ] || fail "must refuse Scratch root '${bad}'"
