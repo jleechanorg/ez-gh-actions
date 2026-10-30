@@ -121,11 +121,43 @@ SCRATCH_ROOT="${CANONICAL_ROOT}"
 # launchd, sudo, a container) that wrapper exits 127, which would abort the run
 # immediately after a successful summary and report a healthy cleanup as failed.
 # The system binary is deterministic in every one of those contexts.
-RM_BIN=""
-for candidate in /bin/rm /usr/bin/rm; do
-  [[ -x "${candidate}" ]] && { RM_BIN="${candidate}"; break; }
+resolve_bin() {
+  # $1 = tool name; remaining args = candidate absolute paths to try first.
+  local tool="$1"; shift
+  local candidate
+  for candidate in "$@"; do
+    [[ -x "${candidate}" ]] && { printf '%s' "${candidate}"; return 0; }
+  done
+  command -v "${tool}" 2>/dev/null || true
+}
+
+RM_BIN="${RM_BIN:-$(resolve_bin rm /bin/rm /usr/bin/rm)}"
+# macOS keeps lsof in /usr/sbin and pgrep in /usr/bin. Resolving them explicitly
+# means a plist whose PATH omits /usr/sbin cannot silently paralyse the reaper:
+# without lsof every candidate would fail closed and nothing would ever be reaped.
+# The *_BIN overrides let an operator point at a different binary, and let the
+# test suite prove that a genuinely missing scanner fails loudly.
+LSOF_BIN="${LSOF_BIN:-$(resolve_bin lsof /usr/sbin/lsof /usr/bin/lsof /bin/lsof)}"
+PGREP_BIN="${PGREP_BIN:-$(resolve_bin pgrep /usr/bin/pgrep /bin/pgrep)}"
+[[ -n "${RM_BIN}" ]] || RM_BIN="rm"
+
+# Preflight. Every tool below is load-bearing for the safety predicate, and each
+# one fails closed when absent - which means a missing tool turns this reaper into
+# a silent no-op that still exits 0 and looks healthy. Fail loudly instead so the
+# scheduler/alerting sees a broken job rather than a clean one.
+missing_tools=""
+for spec in "find:$(command -v find)" "stat:$(command -v stat)" "du:$(command -v du)" \
+            "awk:$(command -v awk)" "grep:$(command -v grep)" "mktemp:$(command -v mktemp)" \
+            "ps:$(command -v ps)" "lsof:${LSOF_BIN}" "pgrep:${PGREP_BIN}" "rm:${RM_BIN}" \
+            "gh:$(command -v "${GH_BIN}" 2>/dev/null)"; do
+  name="${spec%%:*}"
+  path="${spec#*:}"
+  [[ -n "${path}" && -x "${path}" ]] || missing_tools="${missing_tools} ${name}"
 done
-[[ -n "${RM_BIN}" ]] || RM_BIN="$(command -v rm 2>/dev/null || echo rm)"
+if [[ -n "${missing_tools}" ]]; then
+  echo "FATAL: missing required tool(s) for a safe run:${missing_tools} — refusing to run rather than silently declining every candidate. Check the scheduler's PATH (macOS keeps lsof in /usr/sbin)." >&2
+  exit 4
+fi
 
 STATE_DIR="${HOME}/.local/state/ezgha"
 LOG="${STATE_DIR}/ios-release-cleanup.log"
@@ -189,10 +221,10 @@ take_env_snapshot() {
 }
 
 take_liveness_snapshot() {
-  command -v lsof >/dev/null 2>&1 || return 1
+  [[ -n "${LSOF_BIN}" ]] || return 1
   [[ -n "${LIVENESS_SNAPSHOT}" ]] && "${RM_BIN}" -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
   LIVENESS_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/iosrel-lsof.XXXXXX" 2>/dev/null)" || { LIVENESS_SNAPSHOT=""; return 1; }
-  if ! lsof -w -n -Fn >"${LIVENESS_SNAPSHOT}" 2>/dev/null || [[ ! -s "${LIVENESS_SNAPSHOT}" ]]; then
+  if ! "${LSOF_BIN}" -w -n -Fn >"${LIVENESS_SNAPSHOT}" 2>/dev/null || [[ ! -s "${LIVENESS_SNAPSHOT}" ]]; then
     return 1
   fi
   return 0
@@ -273,9 +305,9 @@ dir_is_referenced() {
   # A missing pgrep means argv cannot be inspected at all - "cannot verify", so
   # treat as in use. A pgrep that EXISTS but errors (rc >= 2) is also
   # unverifiable; only rc 1 ("no process matched") means "no argv reference".
-  command -v pgrep >/dev/null 2>&1 || return 0
+  [[ -n "${PGREP_BIN}" ]] || return 0
   local pgrep_rc=0
-  pgrep -f -- "${base}" >/dev/null 2>&1 || pgrep_rc=$?
+  "${PGREP_BIN}" -f -- "${base}" >/dev/null 2>&1 || pgrep_rc=$?
   if [[ ${pgrep_rc} -eq 0 ]]; then
     return 0
   elif [[ ${pgrep_rc} -ne 1 ]]; then

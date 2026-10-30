@@ -39,7 +39,7 @@
         <key>HOME</key>
         <string>@HOME@</string>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:@HOME@/.local/bin</string>
         <key>MIN_AGE_HOURS</key>
         <string>48</string>
         <key>SCRATCH_ROOT</key>

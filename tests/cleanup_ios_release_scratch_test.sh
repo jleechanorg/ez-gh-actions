@@ -134,8 +134,10 @@ VICTIM="${SCR}/worldai-ios-release-555-1"
 aged "${VICTIM}"
 STUB_GH_FAIL=1 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 [ -d "${VICTIM}" ] || fail "gh failure must delete nothing"
-# ... and an absent gh must also fail closed.
-GH_BIN="${W}/bin/does-not-exist" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+# ... and an absent gh must fail LOUDLY (preflight) rather than run a no-op.
+rc=0
+GH_BIN="${W}/bin/does-not-exist" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
+[ "${rc}" -ne 0 ] || fail "absent gh must exit non-zero so the scheduler sees a broken job"
 [ -d "${VICTIM}" ] || fail "absent gh must delete nothing"
 pass "producer-API failure and absent gh both fail closed"
 # Retire the probe dir (empty) so the cap test below starts from a clean slate;
@@ -244,7 +246,33 @@ GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 kill "${ENV_PID}" 2>/dev/null || true
 pass "environment-held path protected"
 
-# 13. Unsafe Scratch roots are refused.
+# 13. A genuinely missing scanner must FAIL LOUDLY, not silently decline every
+#     candidate. (This is the production paralysis agy found: the launchd PATH
+#     omitted /usr/sbin, lsof was unresolvable, every candidate "failed closed"
+#     and the hourly job still exited 0 looking healthy.) The scanner binaries are
+#     resolved absolutely and overridable, so absence is simulated by pointing the
+#     override at a path that does not exist.
+rc=0
+LSOF_BIN="${W}/bin/no-such-lsof" GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" \
+  bash "${S}" --apply >"${W}/noscan.log" 2>&1 || rc=$?
+[ "${rc}" -ne 0 ] || fail "a missing scanner must exit non-zero, not report a clean run"
+grep -q "missing required tool" "${W}/noscan.log" || { cat "${W}/noscan.log" >&2; fail "missing-scanner failure must name the tool"; }
+grep -q "lsof" "${W}/noscan.log" || fail "missing-scanner failure must name lsof"
+# The same must hold when pgrep is the missing one.
+rc=0
+PGREP_BIN="${W}/bin/no-such-pgrep" GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" \
+  bash "${S}" --apply >"${W}/noscan2.log" 2>&1 || rc=$?
+[ "${rc}" -ne 0 ] || fail "missing pgrep must exit non-zero"
+grep -q "pgrep" "${W}/noscan2.log" || fail "missing-scanner failure must name pgrep"
+pass "missing scanner fails loudly"
+
+# 14. The launchd unit's PATH must contain the directory that provides lsof on
+#     macOS (/usr/sbin); omitting it paralysed production once already.
+grep -q "/usr/sbin" "${REPO_ROOT}/launchd/org.jleechanorg.ezgha-ios-release-cleanup.plist.template" \
+  || fail "plist PATH must include /usr/sbin (macOS keeps lsof there)"
+pass "plist PATH includes /usr/sbin"
+
+# 15. Unsafe Scratch roots are refused.
 for bad in "/" "//" "relative/path"; do
   rc=0
   GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
