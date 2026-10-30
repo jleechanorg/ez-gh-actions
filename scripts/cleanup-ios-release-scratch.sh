@@ -85,6 +85,9 @@ fi
 # indefinitely in a launchd session (measured 2026-10-30), and a deletion tool
 # must not introduce an unbounded hang into an unattended hourly job. Absent a
 # root, this fails closed below.
+# Collapse repeated leading/trailing slashes so "//" cannot masquerade as a valid
+# absolute root and then canonicalise to "/".
+while [[ "${SCRATCH_ROOT}" == *//* ]]; do SCRATCH_ROOT="${SCRATCH_ROOT//\/\//\/}"; done
 case "${SCRATCH_ROOT}" in
   ""|/)        echo "FATAL: refusing invalid Scratch root '${SCRATCH_ROOT:-unset}'" >&2; exit 3 ;;
   /*)          ;;
@@ -199,10 +202,17 @@ dir_is_referenced() {
   # spelling, and it is globally unique per run+attempt, so a match here can only
   # be this tree. Matching a full path missed the /var form and deleted a live
   # tree during development of this check.
-  # A missing pgrep means argv cannot be inspected at all; that is "cannot
-  # verify", i.e. in use, not "not referenced".
+  # A missing pgrep means argv cannot be inspected at all - "cannot verify", so
+  # treat as in use. A pgrep that EXISTS but errors (rc >= 2) is also
+  # unverifiable; only rc 1 ("no process matched") means "no argv reference".
   command -v pgrep >/dev/null 2>&1 || return 0
-  pgrep -f -- "${base}" >/dev/null 2>&1 && return 0
+  local pgrep_rc=0
+  pgrep -f -- "${base}" >/dev/null 2>&1 || pgrep_rc=$?
+  if [[ ${pgrep_rc} -eq 0 ]]; then
+    return 0
+  elif [[ ${pgrep_rc} -ne 1 ]]; then
+    return 0
+  fi
 
   # (b) open-file / cwd scan. An argv scan alone misses a long build whose cwd is
   # inside the tree. `lsof -Fn` lists a path per open fd and cwd without walking
@@ -272,7 +282,7 @@ while IFS= read -r -d '' d; do
   # `awk` sums every line into ONE number: with pipefail a `du` that exits 1 on
   # an unreadable file still emitted partial output, and an `|| echo 0` fallback
   # appended a second line that crashed the later arithmetic AFTER the rm.
-  sz_kb="$(du -sk "$d" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  sz_kb="$( { du -sk "$d" 2>/dev/null || true; } | awk '{s+=$1} END{print s+0}' )"
   [[ "${sz_kb}" =~ ^[0-9]+$ ]] || sz_kb=0
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "  DRY-RUN would remove: ${d} (${sz_kb}K, ${age_h}h old)"

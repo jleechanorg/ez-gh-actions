@@ -79,7 +79,8 @@ fi
 # sed replacement text treats & (whole match) and the | delimiter specially, and
 # a literal backslash needs doubling. Escape all three so a legal Scratch root or
 # HOME containing them renders verbatim instead of corrupting the plist.
-sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+sed_escape() { xml_escape "$1" | sed -e 's/[\\&|]/\\&/g'; }
 HOME_SED="$(sed_escape "${HOME}")"
 SCRIPTS_DIR_SED="$(sed_escape "${SCRIPTS_DIR}")"
 SCRATCH_ROOT_SED="$(sed_escape "${SCRATCH_ROOT_RESOLVED}")"

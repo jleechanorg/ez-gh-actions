@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="${REPO_ROOT}/scripts/cleanup-ios-release-scratch.sh"
 
 W="$(mktemp -d)"
-trap 'rm -rf "${W:?}"; for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; true' EXIT
+trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; rm -rf "${W:?}" || true' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -191,7 +191,7 @@ pass "HOME refusals not bypassable"
 # 11. Missing pgrep must fail closed: with pgrep absent from PATH and a live
 #     process referencing the dir only in argv, nothing may be deleted.
 SHIM="${W}/shim"; mkdir -p "${SHIM}"
-for tool in stat find du awk grep date mktemp basename rm mkdir tee cat pwd sed lsof head tr env; do
+for tool in bash sh stat find du awk grep date mktemp basename rm mkdir tee cat pwd sed head tr env sleep; do
   t="$(command -v "${tool}" 2>/dev/null || true)"
   [ -n "${t}" ] && ln -sfn "${t}" "${SHIM}/${tool}"
 done
@@ -201,13 +201,20 @@ mkdir -p "${NOLIVE}"; touch -t 202401010000 "${NOLIVE}"
 bash -c 'while :; do sleep 1; done' "${NOLIVE}" &
 NOPGREP_PID=$!
 sleep 0.3
-PATH="${SHIM}" GH_BIN="${SHIM}/gh" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || true
+SHIM_LOG="${W}/shim-run.log"
+PATH="${SHIM}" GH_BIN="${SHIM}/gh" SCRATCH_ROOT="${SCR}" /bin/bash "${S}" --apply >"${SHIM_LOG}" 2>&1
+rc=$?
+# Prove the reaper really executed under the shim (it must have produced a start
+# line and a summary) rather than silently failing to start.
+[ "${rc}" -eq 0 ] || { cat "${SHIM_LOG}" >&2; fail "reaper did not run cleanly under the no-pgrep shim (rc=${rc})"; }
+grep -q "=== start" "${SHIM_LOG}" || { cat "${SHIM_LOG}" >&2; fail "no-pgrep shim run produced no start line"; }
 [ -d "${NOLIVE}" ] || fail "missing pgrep must fail closed (dir deleted while a live process referenced it)"
+grep -q "SKIP in-use" "${SHIM_LOG}" || fail "no-pgrep run must report the tree as in-use"
 kill "${NOPGREP_PID}" 2>/dev/null || true
 pass "missing pgrep fails closed"
 
 # 12. Unsafe Scratch roots are refused.
-for bad in "/" "relative/path"; do
+for bad in "/" "//" "relative/path"; do
   rc=0
   GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
   [ "${rc}" -ne 0 ] || fail "must refuse Scratch root '${bad}'"
