@@ -22,12 +22,12 @@ It is not a bypass:
 
 - it is honored **only** when the kernel reports virtualization (`hypervisor` CPUID flag
   in `/proc/cpuinfo`, or `/sys/hypervisor/type`);
-- on a host that reports no virtualization, `serve` refuses to start with
+- on a host that reports no virtualization, `serve`/`start` refuses with
   `policy.host_containment = "vm" requires a virtualized host …`;
 - the probe proves the machine *is* a VM, not that the VM belongs to the runners. It looks
   for `hypervisor` on `flags` lines in `/proc/cpuinfo`; arm64 guests print `Features`
   instead, so an arm64 microVM fails closed unless `/sys/hypervisor/type` exists. The
-  labels and measurements here assume X64; Use it
+  The labels and measurements here assume X64. Use it
   only on a VM dedicated to runner work — another tenant's workload is outside the
   boundary you are claiming. (A Xen dom0 also exposes `/sys/hypervisor/type` while
   effectively being the host, so the probe alone is not a licence to relax anything on
@@ -40,7 +40,9 @@ It is not a bypass:
 
 Everything the bare-metal branch enforces is skipped, not just the slice name:
 
-- `policy.minimum_isolation = container` (the fail-closed backend assertion);
+- the requirement that `policy.minimum_isolation` be exactly `container`
+  (`backend::select` still enforces the configured level — `vm` only drops the
+  "must equal container" rule, it does not waive isolation);
 - `limits.cgroup_parent = "actions.slice"` and the fixed 10/14/20-runner count profile
   with its exact `memory_mb`/`pids` values;
 - `validate_host_actions_slice` (the live cgroup cap check);
@@ -50,9 +52,16 @@ Everything the bare-metal branch enforces is skipped, not just the slice name:
 
 The admission memory-pressure gate changes shape: `PressureSource::fallback()` reads
 `/sys/fs/cgroup/user.slice/memory.pressure` (`DEFAULT_PRESSURE_PATH`), not the runner
-cgroup. On these VMs that file does not exist, so the gate is inactive and the daemon
-logs a probe warning — but only on ticks where the fleet is short, because the probe
-runs after the `alive >= count` early return. The gate fails *open* only because
+cgroup. On the cmux Cloud hosts measured on 2026-10-28 that file does not exist, so the gate is
+inactive there and the daemon logs a probe warning — but only on ticks where the fleet is
+short, because the probe runs after the `alive >= count` early return
+(`test -e /sys/fs/cgroup/user.slice/memory.pressure` tells you which case you are in).
+On a stock Ubuntu VM with PSI enabled the file **does** exist, so the gate is active — and
+it samples `user.slice`, which does not contain the runners (Docker scopes them under
+`system.slice`). There the separate, unconditional
+`MemAvailable < 2 × per-runner memory` check (2.8 GiB at 1400 MiB runners) still applies,
+which a host running at its memory ceiling cannot satisfy, so refills can pause under
+load. The gate fails *open* only because
 `runner.host_reserve_mb` is 0 (the default, and unset in the example). **Setting a
 non-zero `host_reserve_mb` on this host shape makes a PSI probe failure fail closed and
 freezes admission**, so leave it at 0 here.
@@ -60,7 +69,13 @@ freezes admission**, so leave it at 0 here.
 ## Bring-up
 
 The bootstrap clones the repository itself, so get the script onto the VM first (any
-transport works — for cmux Cloud, `cmux vm push`):
+transport works — for cmux Cloud, `cmux vm push`, or `cmux vm push --secret <id> key.pem
+~/.config/ezgha/app_private_key.pem` for the key).
+
+It assumes, and does not install: Ubuntu with a systemd **user** manager (it runs
+`loginctl enable-linger` and `systemctl --user`), Docker already installed and usable by
+this user, passwordless `sudo -n`, plus `python3`, `git`, `curl` and `gh`. Missing any of
+these fails part-way through with the step number in `~/ezgha-bootstrap-<tag>.log`.
 
 ```sh
 # on the VM, after placing ~/.config/ezgha/app_private_key.pem (mode 600) and a
@@ -74,7 +89,8 @@ Re-running the script **overwrites** `~/.config/ezgha/config.toml` from
 hand edit — added labels, a different reserve, changed limits — is lost. Put host-specific
 values in the example before running, or reapply them after.
 
-`RUNNER_COUNT` must not exceed the host's ceiling. The script checks that before
+`RUNNER_COUNT` must not exceed the host's **memory** ceiling (disk is not checked by the
+script — see below). The script checks that before
 restarting the daemon and fails with the arithmetic instead of a restart loop. It also
 installs the 45-minute GitHub App token-refresh timer — without it the one-hour
 installation token expires, every `gh` call returns `Bad credentials (HTTP 401)`, and the
@@ -101,12 +117,19 @@ per-container cpu = min(limits.cpus, max(NCPU / count, 0.5))
 
 `resolve_and_log_memory_budget` downgrades that refusal to a warning when `vm_total_mb`
 is unset **and** the `docker info` probe fails, so a successful start is not by itself
-proof of a valid budget. `cpu_burst = true` is refused unless `platform::daemon_in_vm_only()`
+proof of a valid budget — the check is only logged when it actually runs:
+
+```sh
+journalctl --user -u ezgha.service | grep 'memory budget:'
+grep -qw hypervisor /proc/cpuinfo || test -e /sys/hypervisor/type   # virtualization probe
+``` `cpu_burst = true` is refused unless `platform::daemon_in_vm_only()`
 verifies a VM, and that detection only compares kernels — a same-kernel microVM does not
 qualify, so leave `cpu_burst` off here.
 
 Below the ceiling, raising `count` has two effects: more slots, and a **smaller CPU and
-memory share for every runner**. Above it, `serve` will not start at all.
+memory share for every runner** — with the example config `memory_mb` equals
+`runner_floor_mb`, so the memory share stays at 1400 at any count at or below the ceiling
+and only CPU shrinks. Above the ceiling, `serve` will not start at all.
 
 **Defaults vs the example.** Code defaults are `runner_floor_mb = 3072` and
 `guest_reserve_mb = 4096`; with those a 16 GiB host caps at
@@ -142,7 +165,8 @@ safe for a different reason — they sit inside a pinned 28 GiB `actions.slice` 
 ### Disk is the other ceiling
 
 A running job needs roughly 0.5-1.5 GB of workspace churn. Admission pauses when free
-space is **strictly below** `limits.min_free_disk_gb` (default 10 GB, whole GB) on the
+space is **strictly below** `limits.min_free_disk_gb` (default 10 GB; the probe truncates
+to whole GiB, not GB) on the
 host filesystem or on Docker's filesystem. Only **new** spawns stop — running jobs
 continue — and a `Critical` alert fires.
 
@@ -163,7 +187,10 @@ memory pool; the CLI takes 4-256 GiB in 4 GiB steps and cannot shrink).
 
 `docker info --format '{{.NCPU}}'` is fixed at daemon start. A VM created small and
 resized later keeps reporting the old value — observed as `NCPU=2` on 8-vCPU hosts, which
-silently cut every runner to `2/count` CPUs. Compare against `nproc`; on a mismatch,
+silently cut every runner to `2/count` CPUs — and because the CPU formula floors at 0.5,
+a 2-CPU report on an 11-runner host *requests* 5.5 CPUs, i.e. oversubscription, not merely
+a smaller share. Compare against `nproc --all` (plain `nproc` reflects the caller's
+affinity mask); on a mismatch,
 restarting `docker` re-reads the real count, but that is a deploy-owner action that
 restarts every runner on the host (and their jobs).
 
@@ -186,7 +213,8 @@ gh workflow run selftest.yml -R jleechanorg/ez-gh-actions \
   -f runs_on_json='["self-hosted","cmux-cloud"]'
 # `gh workflow run` prints no run id; find the newest one, then confirm WHICH host took it
 # (the name must match this host's NAME_PREFIX):
-gh run list -R jleechanorg/ez-gh-actions --workflow selftest.yml -L1
+gh run list -R jleechanorg/ez-gh-actions --workflow selftest.yml -L1 \
+  --event workflow_dispatch --user "$(gh api /user --jq .login)"
 gh run view <run-id> -R jleechanorg/ez-gh-actions --log | grep 'Runner name:'
 ```
 
