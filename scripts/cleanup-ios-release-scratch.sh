@@ -87,7 +87,7 @@ fi
 # root, this fails closed below.
 # Collapse repeated leading/trailing slashes so "//" cannot masquerade as a valid
 # absolute root and then canonicalise to "/".
-while [[ "${SCRATCH_ROOT}" == *//* ]]; do SCRATCH_ROOT="${SCRATCH_ROOT//\/\//\/}"; done
+SCRATCH_ROOT="$(printf '%s' "${SCRATCH_ROOT}" | sed 's#//*#/#g')"
 case "${SCRATCH_ROOT}" in
   ""|/)        echo "FATAL: refusing invalid Scratch root '${SCRATCH_ROOT:-unset}'" >&2; exit 3 ;;
   /*)          ;;
@@ -116,6 +116,17 @@ CANONICAL_ROOT="$(cd -P -- "${SCRATCH_ROOT}" 2>/dev/null && pwd -P)" || {
 }
 SCRATCH_ROOT="${CANONICAL_ROOT}"
 
+# Resolve rm explicitly. A PATH `rm` is frequently a guard/wrapper script that
+# resolves its own helpers through $HOME; invoked with HOME overridden (tests,
+# launchd, sudo, a container) that wrapper exits 127, which would abort the run
+# immediately after a successful summary and report a healthy cleanup as failed.
+# The system binary is deterministic in every one of those contexts.
+RM_BIN=""
+for candidate in /bin/rm /usr/bin/rm; do
+  [[ -x "${candidate}" ]] && { RM_BIN="${candidate}"; break; }
+done
+[[ -n "${RM_BIN}" ]] || RM_BIN="$(command -v rm 2>/dev/null || echo rm)"
+
 STATE_DIR="${HOME}/.local/state/ezgha"
 LOG="${STATE_DIR}/ios-release-cleanup.log"
 MANIFEST_DIR="${STATE_DIR}/ios-release-archives"
@@ -129,30 +140,57 @@ find "${MANIFEST_DIR}" -maxdepth 1 -type f -name 'ios-release-cleanup-*.manifest
 # snapshot is taken once per run and only refreshed immediately before each
 # removal - not once per candidate, which would be O(candidates) walks per hour.
 LIVENESS_SNAPSHOT=""
+GH_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/iosrel-gh.XXXXXX" 2>/dev/null)" || GH_OUT_FILE=""
 snapshot_cleanup() {
-  [[ -n "${LIVENESS_SNAPSHOT}" ]] && rm -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
-  [[ -n "${ENV_SNAPSHOT}" ]] && rm -f "${ENV_SNAPSHOT}" 2>/dev/null
+  [[ -n "${LIVENESS_SNAPSHOT}" ]] && "${RM_BIN}" -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
+  [[ -n "${ENV_SNAPSHOT}" ]] && "${RM_BIN}" -f "${ENV_SNAPSHOT}" 2>/dev/null
+  [[ -n "${GH_OUT_FILE}" ]] && "${RM_BIN}" -f "${GH_OUT_FILE}" 2>/dev/null
   return 0
 }
-trap snapshot_cleanup EXIT INT TERM
+trap snapshot_cleanup EXIT
+# Separate handlers: `trap ... TERM` that only cleans up lets the script carry on
+# after SIGTERM, so `launchctl stop` would not interrupt an in-flight --apply run
+# until launchd escalates to SIGKILL.
+trap 'snapshot_cleanup; exit 143' TERM
+trap 'snapshot_cleanup; exit 130' INT
 
 ENV_SNAPSHOT=""
 take_env_snapshot() {
-  command -v ps >/dev/null 2>&1 || return 1
-  [[ -n "${ENV_SNAPSHOT}" ]] && rm -f "${ENV_SNAPSHOT}" 2>/dev/null
-  ENV_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/iosrel-ps.XXXXXX" 2>/dev/null)" || { ENV_SNAPSHOT=""; return 1; }
-  # macOS `ps -E` appends each process's environment to its args line; without it
-  # a deferred consumer holding the path in an exported variable is invisible to
-  # argv matching and to lsof (no open fd, foreign cwd).
-  if ! ps -Eww -A -o args= >"${ENV_SNAPSHOT}" 2>/dev/null || [[ ! -s "${ENV_SNAPSHOT}" ]]; then
-    return 1
-  fi
+  [[ -n "${ENV_SNAPSHOT}" ]] && "${RM_BIN}" -f "${ENV_SNAPSHOT}" 2>/dev/null
+  ENV_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/iosrel-env.XXXXXX" 2>/dev/null)" || { ENV_SNAPSHOT=""; return 1; }
+  # Correlate a deferred consumer that holds the path in an EXPORTED VARIABLE: no
+  # argv entry, no open fd, foreign cwd, so argv and lsof scans both miss it.
+  # The mechanism is platform-specific:
+  #   macOS - `ps -Eww` appends each process's environment to its args line.
+  #   Linux - `ps -E` is a BSD-only option that errors out ("unsupported SysV
+  #           option") and yields nothing, so read /proc/<pid>/environ instead.
+  # A silently empty snapshot must be a SCAN ERROR (skip the candidate), never
+  # "no match" - otherwise every candidate looks unreferenced.
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin)
+      ps -Eww -A -o args= >"${ENV_SNAPSHOT}" 2>/dev/null || return 1
+      ;;
+    *)
+      : >"${ENV_SNAPSHOT}" || return 1
+      for envfile in /proc/[0-9]*/environ; do
+        [[ -r "${envfile}" ]] || continue
+        # Non-dumpable / other-user processes report 0400 and still refuse the
+        # read; run the read in a subshell so the shell's own redirect error is
+        # suppressed instead of flooding the hourly job's log.
+        { tr '\0' '\n' <"${envfile}" >>"${ENV_SNAPSHOT}"; } 2>/dev/null || true
+      done
+      ;;
+  esac
+  # Self-check: the snapshot must exist, be non-empty, and actually contain
+  # environment entries (KEY=VALUE). Anything else is a failed scan.
+  [[ -s "${ENV_SNAPSHOT}" ]] || return 1
+  grep -q '=' "${ENV_SNAPSHOT}" 2>/dev/null || return 1
   return 0
 }
 
 take_liveness_snapshot() {
   command -v lsof >/dev/null 2>&1 || return 1
-  [[ -n "${LIVENESS_SNAPSHOT}" ]] && rm -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
+  [[ -n "${LIVENESS_SNAPSHOT}" ]] && "${RM_BIN}" -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
   LIVENESS_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/iosrel-lsof.XXXXXX" 2>/dev/null)" || { LIVENESS_SNAPSHOT=""; return 1; }
   if ! lsof -w -n -Fn >"${LIVENESS_SNAPSHOT}" 2>/dev/null || [[ ! -s "${LIVENESS_SNAPSHOT}" ]]; then
     return 1
@@ -181,21 +219,33 @@ get_mtime() {
 # can sit between build, upload and receipt steps with no process touching the
 # tree, and writes inside existing children need not refresh the parent mtime.
 run_is_completed() {
-  local run_id="$1" out rc=0 status conclusion
+  local run_id="$1" dir_attempt="$2" out rc=0 status conclusion
   command -v "${GH_BIN}" >/dev/null 2>&1 || return 1
-  out="$(
-    "${GH_BIN}" api "repos/${PRODUCER_REPO}/actions/runs/${run_id}" \
-      -q '[.status, (.conclusion // ""), (.run_attempt|tostring)] | @tsv' 2>/dev/null
-  )" || rc=$?
+  [[ -n "${GH_OUT_FILE}" ]] || return 1
+  # Bounded wait: `gh` has no per-call timeout and this host can be extremely
+  # loaded. macOS has no `timeout(1)`, so poll the child and kill it on expiry;
+  # an expired call is "cannot verify", i.e. skip.
+  local deadline=$(( SECONDS + 25 ))
+  "${GH_BIN}" api "repos/${PRODUCER_REPO}/actions/runs/${run_id}" \
+      -q '[.status, (.conclusion // ""), (.run_attempt|tostring)] | @tsv' 2>/dev/null > "${GH_OUT_FILE}" &
+  local gh_pid=$!
+  while kill -0 "${gh_pid}" 2>/dev/null && (( SECONDS < deadline )); do sleep 1; done
+  if kill -0 "${gh_pid}" 2>/dev/null; then
+    kill "${gh_pid}" 2>/dev/null || true
+    return 1
+  fi
+  wait "${gh_pid}" || rc=$?
   [[ ${rc} -eq 0 ]] || return 1
+  out="$(cat "${GH_OUT_FILE}" 2>/dev/null || true)"
   IFS=$'\t' read -r status conclusion _attempt <<<"${out}"
   # Only a SUCCESSFUL run is reaped. "completed" alone also covers failed and
   # cancelled runs, whose scratch may still be wanted for diagnosis - those are
   # retained deliberately (documented retention rule; see header).
-  # The attempt is recorded but not compared: the API reports the LATEST attempt,
-  # so requiring equality would permanently orphan attempt-1 dirs of a re-run
-  # run, while a latest attempt that is not successful still skips deletion.
-  [[ "${status}" == "completed" && "${conclusion}" == "success" ]]
+  # Only the LATEST attempt of a successful run is reaped. A re-run's earlier
+  # attempt directory is retained: it holds that attempt's failure evidence, and
+  # it falls under the same "failed runs are retained" rule. The cost is that
+  # re-run attempt-1 dirs are not reclaimed; re-runs are rare.
+  [[ "${status}" == "completed" && "${conclusion}" == "success" && "${dir_attempt}" == "${_attempt}" ]]
 }
 
 # A dir is live if any process command line mentions it. Cheap process-table
@@ -337,7 +387,7 @@ while IFS= read -r -d '' d; do
   # to fill the volume that gates runner admission. The manifest below is the
   # metadata record; the bytes are disposable scratch whose artifacts were
   # published by the workflow before cleanup.
-  if rm -rf -- "$d" 2>/dev/null; then
+  if "${RM_BIN}" -rf -- "$d" 2>/dev/null; then
     log "  REMOVED: ${d} (${sz_kb}K, ${age_h}h old)"
     removed=$((removed+1)); freed_kb=$((freed_kb + sz_kb))
     echo "${d}  ${sz_kb}K  ${age_h}h" >> "${MANIFEST}"

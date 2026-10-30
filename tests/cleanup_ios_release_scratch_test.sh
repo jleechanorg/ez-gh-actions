@@ -19,7 +19,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="${REPO_ROOT}/scripts/cleanup-ios-release-scratch.sh"
 
 W="$(mktemp -d)"
-trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}" "${ENV_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; rm -rf "${W:?}" || true' EXIT
+# Use the real system rm: this host's PATH `rm` may be a guard wrapper that
+# resolves its own helpers through $HOME, which this test deliberately overrides.
+RM_BIN=/bin/rm
+[ -x "${RM_BIN}" ] || RM_BIN=/usr/bin/rm
+trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}" "${ENV_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; "${RM_BIN}" -rf "${W:?}" || true' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -177,8 +181,8 @@ GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 RERUN="${SCR}/worldai-ios-release-997-1"
 aged "${RERUN}"
 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
-[ ! -d "${RERUN}" ] || fail "a re-run whose latest attempt succeeded must be reaped"
-pass "failed runs retained, re-run attempts still reaped"
+[ -d "${RERUN}" ] || fail "a re-run's EARLIER attempt dir must be retained (failure evidence)"
+pass "failed runs and earlier re-run attempts retained"
 
 # 10. $HOME refusals cannot be bypassed by a trailing slash or a symlink to HOME.
 rc=0; GH_BIN="${GH}" SCRATCH_ROOT="${HOME}/" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
@@ -191,9 +195,18 @@ pass "HOME refusals not bypassable"
 # 11. Missing pgrep must fail closed: with pgrep absent from PATH and a live
 #     process referencing the dir only in argv, nothing may be deleted.
 SHIM="${W}/shim"; mkdir -p "${SHIM}"
-for tool in bash sh stat find du awk grep date mktemp basename rm mkdir tee cat pwd sed head tr env sleep; do
-  t="$(command -v "${tool}" 2>/dev/null || true)"
-  [ -n "${t}" ] && ln -sfn "${t}" "${SHIM}/${tool}"
+# Everything the reaper may exec EXCEPT pgrep, so the missing-pgrep path is
+# isolated. `ps`/`lsof` stay present: with them absent the script would fail
+# closed for a different reason and the assertion would prove nothing.
+# Resolve from SYSTEM directories, not `command -v`: on this host `rm` resolves to
+# a guard wrapper script whose own interpreter is absent from the restricted PATH,
+# which exec-fails with 127 and would make this case test the wrapper instead of
+# the reaper's missing-pgrep behaviour.
+for tool in bash sh stat find du awk grep date mktemp basename rm mkdir tee cat pwd sed head tr \
+            env sleep uname kill ls readlink ps lsof wc cut sort; do
+  for d in /bin /usr/bin /usr/sbin /sbin /opt/homebrew/bin; do
+    if [ -x "${d}/${tool}" ]; then ln -sfn "${d}/${tool}" "${SHIM}/${tool}"; break; fi
+  done
 done
 ln -sfn "${GH}" "${SHIM}/gh"
 NOLIVE="${SCR}/worldai-ios-release-996-1"
@@ -202,8 +215,12 @@ bash -c 'while :; do sleep 1; done' "${NOLIVE}" &
 NOPGREP_PID=$!
 sleep 0.3
 SHIM_LOG="${W}/shim-run.log"
-PATH="${SHIM}" GH_BIN="${SHIM}/gh" SCRATCH_ROOT="${SCR}" /bin/bash "${S}" --apply >"${SHIM_LOG}" 2>&1
-rc=$?
+rc=0
+# `env -u BASH_ENV`: a developer shell that exports BASH_ENV would source its own
+# rc file under this restricted PATH and fail with 127 for reasons unrelated to
+# the reaper. The case under test must be the missing `pgrep`, nothing else.
+env -u BASH_ENV PATH="${SHIM}" GH_BIN="${SHIM}/gh" SCRATCH_ROOT="${SCR}" \
+  /bin/bash "${S}" --apply >"${SHIM_LOG}" 2>&1 || rc=$?
 # Prove the reaper really executed under the shim (it must have produced a start
 # line and a summary) rather than silently failing to start.
 [ "${rc}" -eq 0 ] || { cat "${SHIM_LOG}" >&2; fail "reaper did not run cleanly under the no-pgrep shim (rc=${rc})"; }
