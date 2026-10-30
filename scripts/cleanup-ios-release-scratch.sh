@@ -129,8 +129,26 @@ find "${MANIFEST_DIR}" -maxdepth 1 -type f -name 'ios-release-cleanup-*.manifest
 # snapshot is taken once per run and only refreshed immediately before each
 # removal - not once per candidate, which would be O(candidates) walks per hour.
 LIVENESS_SNAPSHOT=""
-snapshot_cleanup() { [[ -n "${LIVENESS_SNAPSHOT}" ]] && rm -f "${LIVENESS_SNAPSHOT}" 2>/dev/null; return 0; }
+snapshot_cleanup() {
+  [[ -n "${LIVENESS_SNAPSHOT}" ]] && rm -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
+  [[ -n "${ENV_SNAPSHOT}" ]] && rm -f "${ENV_SNAPSHOT}" 2>/dev/null
+  return 0
+}
 trap snapshot_cleanup EXIT INT TERM
+
+ENV_SNAPSHOT=""
+take_env_snapshot() {
+  command -v ps >/dev/null 2>&1 || return 1
+  [[ -n "${ENV_SNAPSHOT}" ]] && rm -f "${ENV_SNAPSHOT}" 2>/dev/null
+  ENV_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/iosrel-ps.XXXXXX" 2>/dev/null)" || { ENV_SNAPSHOT=""; return 1; }
+  # macOS `ps -E` appends each process's environment to its args line; without it
+  # a deferred consumer holding the path in an exported variable is invisible to
+  # argv matching and to lsof (no open fd, foreign cwd).
+  if ! ps -Eww -A -o args= >"${ENV_SNAPSHOT}" 2>/dev/null || [[ ! -s "${ENV_SNAPSHOT}" ]]; then
+    return 1
+  fi
+  return 0
+}
 
 take_liveness_snapshot() {
   command -v lsof >/dev/null 2>&1 || return 1
@@ -236,6 +254,16 @@ dir_is_referenced() {
   done
   # Form-independent backstop: any listed path containing this unique basename.
   if grep -Fq -- "/${base}" "${LIVENESS_SNAPSHOT}"; then
+    return 0
+  fi
+
+  # (c) environment scan. A deferred consumer (an uploader waiting to publish the
+  # .ipa, say) can hold the path in an exported variable: no argv, no open fd,
+  # foreign cwd. Reproduced by review before this check existed.
+  if [[ "${refresh}" == "1" || -z "${ENV_SNAPSHOT}" || ! -s "${ENV_SNAPSHOT}" ]]; then
+    take_env_snapshot || return 0
+  fi
+  if grep -Fq -- "${base}" "${ENV_SNAPSHOT}"; then
     return 0
   fi
   return 1

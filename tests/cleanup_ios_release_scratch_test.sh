@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="${REPO_ROOT}/scripts/cleanup-ios-release-scratch.sh"
 
 W="$(mktemp -d)"
-trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; rm -rf "${W:?}" || true' EXIT
+trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}" "${ENV_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; rm -rf "${W:?}" || true' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -213,7 +213,21 @@ grep -q "SKIP in-use" "${SHIM_LOG}" || fail "no-pgrep run must report the tree a
 kill "${NOPGREP_PID}" 2>/dev/null || true
 pass "missing pgrep fails closed"
 
-# 12. Unsafe Scratch roots are refused.
+# 12. A deferred consumer that holds the path ONLY in an environment variable (no
+#     argv entry, no open fd, foreign cwd) must still protect the tree.
+ENVHELD="${SCR}/worldai-ios-release-995-1"
+mkdir -p "${ENVHELD}"; touch -t 202401010000 "${ENVHELD}"
+MY_ARTIFACT="${ENVHELD}" bash -c 'export MY_ARTIFACT; while :; do sleep 1; done' &
+ENV_PID=$!
+sleep 0.4
+# Prove the setup really has no argv reference before relying on it.
+ps -o args= -p "${ENV_PID}" | grep -Fq "worldai-ios-release-995" && fail "test setup: env-held path must not appear in argv"
+GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+[ -d "${ENVHELD}" ] || fail "an env-held (deferred consumer) reference must be protected"
+kill "${ENV_PID}" 2>/dev/null || true
+pass "environment-held path protected"
+
+# 13. Unsafe Scratch roots are refused.
 for bad in "/" "//" "relative/path"; do
   rc=0
   GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
