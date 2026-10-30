@@ -25,6 +25,9 @@
 #     hung/multi-hour run, the only realistic path to an aged-but-live dir).
 #   - The Scratch root is validated: must resolve to an existing absolute
 #     directory and must not be / or $HOME.
+#   - Only runs whose producer reports `completed`/`success` are reaped. Failed
+#     and cancelled runs are retained on purpose: their scratch is the cheapest
+#     debugging evidence for a broken build, and their count is small.
 #   - Default DRY-RUN; --apply performs removals.
 #   - Removal is a direct rm of the validated path. There is deliberately no
 #     quarantine directory: $HOME and the Scratch volume are different
@@ -87,11 +90,15 @@ case "${SCRATCH_ROOT}" in
   /*)          ;;
   *)           echo "FATAL: refusing non-absolute Scratch root '${SCRATCH_ROOT}'" >&2; exit 3 ;;
 esac
-if [[ "${SCRATCH_ROOT}" == "${HOME}" ]]; then
-  echo "FATAL: refusing to treat HOME as a Scratch root" >&2
+# Strip the trailing slash BEFORE the HOME comparison: "${HOME}/" slipped past a
+# literal test and then canonicalised to HOME itself.
+SCRATCH_ROOT="${SCRATCH_ROOT%/}"
+HOME_CANON="$(cd -P -- "${HOME}" 2>/dev/null && pwd -P)" || HOME_CANON="${HOME}"
+ROOT_CANON_CHECK="$(cd -P -- "${SCRATCH_ROOT}" 2>/dev/null && pwd -P)" || ROOT_CANON_CHECK="${SCRATCH_ROOT}"
+if [[ "${SCRATCH_ROOT}" == "${HOME}" || "${ROOT_CANON_CHECK}" == "${HOME_CANON}" ]]; then
+  echo "FATAL: refusing to treat HOME (or an alias of it) as a Scratch root" >&2
   exit 3
 fi
-SCRATCH_ROOT="${SCRATCH_ROOT%/}"
 if [[ ! -d "${SCRATCH_ROOT}" ]]; then
   echo "FATAL: Scratch root does not exist: ${SCRATCH_ROOT}" >&2
   exit 3
@@ -153,14 +160,21 @@ get_mtime() {
 # can sit between build, upload and receipt steps with no process touching the
 # tree, and writes inside existing children need not refresh the parent mtime.
 run_is_completed() {
-  local run_id="$1" attempt="$2" out rc=0
+  local run_id="$1" out rc=0 status conclusion
   command -v "${GH_BIN}" >/dev/null 2>&1 || return 1
   out="$(
     "${GH_BIN}" api "repos/${PRODUCER_REPO}/actions/runs/${run_id}" \
-      -q '[.status, (.run_attempt|tostring)] | @tsv' 2>/dev/null
+      -q '[.status, (.conclusion // ""), (.run_attempt|tostring)] | @tsv' 2>/dev/null
   )" || rc=$?
   [[ ${rc} -eq 0 ]] || return 1
-  [[ "${out}" == "completed"$'\t'"${attempt}" ]]
+  IFS=$'\t' read -r status conclusion _attempt <<<"${out}"
+  # Only a SUCCESSFUL run is reaped. "completed" alone also covers failed and
+  # cancelled runs, whose scratch may still be wanted for diagnosis - those are
+  # retained deliberately (documented retention rule; see header).
+  # The attempt is recorded but not compared: the API reports the LATEST attempt,
+  # so requiring equality would permanently orphan attempt-1 dirs of a re-run
+  # run, while a latest attempt that is not successful still skips deletion.
+  [[ "${status}" == "completed" && "${conclusion}" == "success" ]]
 }
 
 # A dir is live if any process command line mentions it. Cheap process-table
@@ -185,9 +199,10 @@ dir_is_referenced() {
   # spelling, and it is globally unique per run+attempt, so a match here can only
   # be this tree. Matching a full path missed the /var form and deleted a live
   # tree during development of this check.
-  if command -v pgrep >/dev/null 2>&1; then
-    pgrep -f -- "${base}" >/dev/null 2>&1 && return 0
-  fi
+  # A missing pgrep means argv cannot be inspected at all; that is "cannot
+  # verify", i.e. in use, not "not referenced".
+  command -v pgrep >/dev/null 2>&1 || return 0
+  pgrep -f -- "${base}" >/dev/null 2>&1 && return 0
 
   # (b) open-file / cwd scan. An argv scan alone misses a long build whose cwd is
   # inside the tree. `lsof -Fn` lists a path per open fd and cwd without walking
@@ -254,8 +269,11 @@ while IFS= read -r -d '' d; do
     skipped=$((skipped+1)); continue
   fi
 
-  sz_kb="$(du -sk "$d" 2>/dev/null | awk '{print $1}' || echo 0)"
-  sz_kb="${sz_kb:-0}"
+  # `awk` sums every line into ONE number: with pipefail a `du` that exits 1 on
+  # an unreadable file still emitted partial output, and an `|| echo 0` fallback
+  # appended a second line that crashed the later arithmetic AFTER the rm.
+  sz_kb="$(du -sk "$d" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+  [[ "${sz_kb}" =~ ^[0-9]+$ ]] || sz_kb=0
   if [[ "${DRY_RUN}" == "true" ]]; then
     log "  DRY-RUN would remove: ${d} (${sz_kb}K, ${age_h}h old)"
     continue

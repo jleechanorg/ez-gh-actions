@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="${REPO_ROOT}/scripts/cleanup-ios-release-scratch.sh"
 
 W="$(mktemp -d)"
-trap 'rm -rf "${W:?}"; for p in "${LIVE_PID:-}" "${CWD_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; true' EXIT
+trap 'rm -rf "${W:?}"; for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; true' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -37,8 +37,10 @@ cat > "${W}/bin/gh" <<'STUB'
 id=""
 for a in "$@"; do case "$a" in repos/*/actions/runs/*) id="${a##*/}" ;; esac; done
 case "${id}" in
-  999) printf 'in_progress\t1' ;;
-  *)   printf 'completed\t1' ;;
+  999) printf 'in_progress\t\t1' ;;
+  998) printf 'completed\tfailure\t1' ;;
+  997) printf 'completed\tsuccess\t2' ;;   # re-run: dir carries attempt 1
+  *)   printf 'completed\tsuccess\t1' ;;
 esac
 STUB
 chmod +x "${W}/bin/gh"
@@ -165,7 +167,46 @@ GH_BIN="${GH}" SCRATCH_ROOT="${LINK_ROOT}" bash "${S}" --apply >/dev/null
 kill "${LINK_PID}" 2>/dev/null || true
 pass "symlinked Scratch root traversed and still safe"
 
-# 9. Unsafe Scratch roots are refused.
+# 9. Failed and cancelled runs are RETAINED (their scratch is debugging evidence).
+FAILED="${SCR}/worldai-ios-release-998-1"
+aged "${FAILED}"
+GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+[ -d "${FAILED}" ] || fail "a failed run's scratch must be retained, not reaped"
+# ...while a re-run whose LATEST attempt succeeded is still reapable (attempt-1
+# dirs must not be orphaned forever).
+RERUN="${SCR}/worldai-ios-release-997-1"
+aged "${RERUN}"
+GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+[ ! -d "${RERUN}" ] || fail "a re-run whose latest attempt succeeded must be reaped"
+pass "failed runs retained, re-run attempts still reaped"
+
+# 10. $HOME refusals cannot be bypassed by a trailing slash or a symlink to HOME.
+rc=0; GH_BIN="${GH}" SCRATCH_ROOT="${HOME}/" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
+[ "${rc}" -ne 0 ] || fail "must refuse HOME with a trailing slash"
+ln -sfn "${HOME}" "${W}/home-link"
+rc=0; GH_BIN="${GH}" SCRATCH_ROOT="${W}/home-link" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
+[ "${rc}" -ne 0 ] || fail "must refuse a symlink to HOME"
+pass "HOME refusals not bypassable"
+
+# 11. Missing pgrep must fail closed: with pgrep absent from PATH and a live
+#     process referencing the dir only in argv, nothing may be deleted.
+SHIM="${W}/shim"; mkdir -p "${SHIM}"
+for tool in stat find du awk grep date mktemp basename rm mkdir tee cat pwd sed lsof head tr env; do
+  t="$(command -v "${tool}" 2>/dev/null || true)"
+  [ -n "${t}" ] && ln -sfn "${t}" "${SHIM}/${tool}"
+done
+ln -sfn "${GH}" "${SHIM}/gh"
+NOLIVE="${SCR}/worldai-ios-release-996-1"
+mkdir -p "${NOLIVE}"; touch -t 202401010000 "${NOLIVE}"
+bash -c 'while :; do sleep 1; done' "${NOLIVE}" &
+NOPGREP_PID=$!
+sleep 0.3
+PATH="${SHIM}" GH_BIN="${SHIM}/gh" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null 2>&1 || true
+[ -d "${NOLIVE}" ] || fail "missing pgrep must fail closed (dir deleted while a live process referenced it)"
+kill "${NOPGREP_PID}" 2>/dev/null || true
+pass "missing pgrep fails closed"
+
+# 12. Unsafe Scratch roots are refused.
 for bad in "/" "relative/path"; do
   rc=0
   GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
