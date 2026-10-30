@@ -109,6 +109,31 @@ systemctl --user status ezgha.service
 limactl start colima
 ```
 
+### `colima start` fails: `failed to run attach disk "colima", in use by instance "colima"`
+
+Symptom: the daemon exits with `no usable backend found — docker daemon is not
+reachable`, the launchd job disappears from `launchctl list`, and every later
+`colima start` fails within a second with the attach-disk fatal above. 0/N mac
+runners, indefinitely.
+
+Root cause: a `colima start`/`restart` killed mid-flight leaves the Lima data
+disk locked (`~/.colima/_lima/_disks/colima/in_use_by`), so no subsequent start
+can attach it. The daemon's own restart path can create this state: its
+`BACKEND_RESTART_COMMAND_TIMEOUT` (45s) is shorter than a cold vz boot plus
+provisioning, so on a host that has just rebooted the daemon kills its own
+recovery attempt and wedges the VM. Observed 2026-10-29: reboot at 16:12, disk
+locked at 18:42, fleet at 0/4 mac runners until 18:53.
+
+OPERATOR-ONLY remediation (verify the instance really is stopped first with
+`LIMA_HOME=~/.colima/_lima limactl list`):
+```bash
+LIMA_HOME=~/.colima/_lima limactl disk unlock colima
+colima start            # ~30s when the lock is the only problem
+ezgha install-service    # relaunch the daemon once docker is reachable
+```
+Never kill a `colima start` on a short timeout — that is what creates this
+lock. Tracked by bead jleechan-9p0g.
+
 ### Runner dashboard publisher recovery
 - **launchd load failure:** a failed first install removes its candidate; a
   failed upgrade restores and attempts to reload the prior plist. Fix the

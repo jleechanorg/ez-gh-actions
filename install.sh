@@ -788,6 +788,18 @@ PLIST
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
     install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 2"
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
+    # Reclaims stale per-run iOS TestFlight release scratch
+    # (`<scratch>/worldai-ios-release-<run>-<attempt>`). The TestFlight workflow
+    # cleans only its signing key, so each run permanently left ~2.4 GB behind:
+    # measured 2026-10-30 at 24 dirs / 49 GB, leaving the Scratch volume (which
+    # also backs runner.workspace_host_path) at 2.0 GiB free mid-build.
+    #
+    # Installed through launchd/install-launchagents.sh, not install_macos_plist:
+    # this unit needs the host's Scratch root resolved at install time (see the
+    # SCRATCH_ROOT note there), and that installer substitutes it.
+    if ! bash "${SCRIPT_DIR}/launchd/install-launchagents.sh" install org.jleechanorg.ezgha-ios-release-cleanup; then
+      warn "iOS release-scratch reaper not installed — stale worldai-ios-release-* dirs will accumulate on the Scratch volume"
+    fi
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
     # ── Guest-native fstrim cadence — the actual root cause fix, not just the guard ──

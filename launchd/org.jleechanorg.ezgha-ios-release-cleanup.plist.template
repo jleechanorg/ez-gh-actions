@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reclaims stale per-run iOS TestFlight release scratch under the Scratch
+  volume (`worldai-ios-release-<run>-<attempt>`).
+
+  The "iOS TestFlight" workflow in jleechanorg/worldai_frontend builds its
+  DerivedData, .xcarchive and exported .ipa inside
+  `<diskm scratch-dir>/worldai-ios-release-<run>-<attempt>` and its final step
+  cleans only the signing key, never the release root. Measured 2026-10-30:
+  24 such dirs / 49 GB left a 200 GiB volume at 2.0 GiB free while the
+  in-flight run itself still needed ~2.4 GB, and that same volume backs
+  runner.workspace_host_path for the mac runner fleet. Bead: jleechan-nvke.
+
+  Safety: the script only matches that exact name pattern directly under the
+  resolved Scratch root, only dirs at least MIN_AGE_HOURS old (default 48h,
+  an in-flight run is minutes old), and skips any dir referenced by a live
+  process. Dry-run is the default; this unit passes the apply flag.
+
+  Portability note: the script resolves the Scratch root via `diskm
+  scratch-dir`, so PATH below must include the directory that provides diskm.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.jleechanorg.ezgha-ios-release-cleanup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@SCRIPTS_DIR@/cleanup-ios-release-scratch.sh</string>
+        <string>--apply</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@HOME@</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+        <key>MIN_AGE_HOURS</key>
+        <string>48</string>
+        <key>SCRATCH_ROOT</key>
+        <string>@SCRATCH_ROOT@</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>@HOME@/.local/state/ezgha/ios-release-cleanup-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/.local/state/ezgha/ios-release-cleanup-launchd.log</string>
+    <key>ThrottleInterval</key>
+    <integer>600</integer>
+</dict>
+</plist>

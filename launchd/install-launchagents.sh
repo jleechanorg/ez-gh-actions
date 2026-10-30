@@ -51,6 +51,28 @@ if [[ "$action" == "install" && -n "$label_filter" ]]; then
   fi
 fi
 
+# Templates that need this host's Scratch root (currently only the iOS
+# release-scratch reaper) must NOT call `diskm scratch-dir` from launchd:
+# measured 2026-10-30, that python uv-tool call spins indefinitely in a launchd
+# session (it answers in ~4s interactively), which wedged the first installed
+# copy of the job. Resolve it here, once, at install time, and substitute it.
+# Fail closed: an unresolved root leaves @SCRATCH_ROOT@ in the rendered plist,
+# which the placeholder guard below already rejects.
+SCRATCH_ROOT_RESOLVED=""
+if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
+  if command -v diskm >/dev/null 2>&1; then
+    SCRATCH_ROOT_RESOLVED="$(diskm scratch-dir 2>/dev/null || true)"
+    SCRATCH_ROOT_RESOLVED="${SCRATCH_ROOT_RESOLVED%/}"
+  fi
+  case "${SCRATCH_ROOT_RESOLVED}" in
+    /*) ;;
+    *)
+      echo "ERROR: could not resolve this host's Scratch root (diskm scratch-dir returned '${SCRATCH_ROOT_RESOLVED}'); refusing to install a reaper with no target" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 # Guard: fail loudly if a rendered plist still references a repo/worktree
 # checkout path or has an unsubstituted @...@ placeholder left in it. A
 # passing guard here is what would have caught the ez-gh-actions-sa1t
@@ -206,7 +228,8 @@ case "$action" in
         DASHBOARD_PLIST_CANDIDATE="${candidate}"
         DASHBOARD_PLIST_BACKUP="${backup}"
       fi
-      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$candidate"
+      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
+          -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_RESOLVED}|g" "$tmpl" > "$candidate"
       if [[ "${label}" == "${DASHBOARD_LABEL}" && -n "${DOCKER_HOST_OVERRIDE:-}" ]]; then
         python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" <<'PY'
 import plistlib
