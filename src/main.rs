@@ -10,6 +10,7 @@ mod alert;
 mod backend;
 mod canary;
 mod config;
+mod disk_recovery;
 mod docker_backend;
 mod failure_ladder;
 mod github;
@@ -900,6 +901,7 @@ fn apply_local_settling_decision(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnsureSuccessDecision {
+    PacedRefill,
     StartSettling { executing: u32 },
     Recovered,
     PostRefillCapacityLost,
@@ -915,6 +917,18 @@ enum StartCommandDisposition {
     AdmissionPaused,
     PendingShortage,
     Incomplete,
+}
+
+fn paced_start_pending(enabled: bool, missing: u32, started: usize) -> bool {
+    enabled && started > 0 && (started as u64) < u64::from(missing)
+}
+
+#[test]
+fn disk_recovery_paced_cli_does_not_report_unlaunched_runners_ready() {
+    assert!(paced_start_pending(true, 3, 1));
+    assert!(!paced_start_pending(true, 1, 1));
+    assert!(!paced_start_pending(true, 3, 0));
+    assert!(!paced_start_pending(false, 3, 1));
 }
 
 fn start_command_disposition(
@@ -949,6 +963,12 @@ fn ensure_success_decision(
         EnsureSuccessDecision::PostRefillSlotsReleased
     } else if outcome.post_refill_readiness_error.is_some() {
         EnsureSuccessDecision::IncompleteReadiness
+    } else if paced_start_pending(
+        cfg.limits.disk_recovery.is_some(),
+        outcome.missing,
+        outcome.started.len(),
+    ) {
+        EnsureSuccessDecision::PacedRefill
     } else if outcome.remaining_shortage > 0 {
         EnsureSuccessDecision::StartSettling {
             executing: cfg.runner.count.saturating_sub(outcome.remaining_shortage),
@@ -969,7 +989,9 @@ fn ensure_success_plan(cfg: &config::Config, decision: EnsureSuccessDecision) ->
         | EnsureSuccessDecision::IncompleteReadiness => {
             settling_plan(cfg, SettlingDecision::Ceiling)
         }
-        EnsureSuccessDecision::AdmissionPaused => (cfg.runner.serve_tick(), true),
+        EnsureSuccessDecision::AdmissionPaused | EnsureSuccessDecision::PacedRefill => {
+            (cfg.runner.serve_tick(), true)
+        }
     }
 }
 
@@ -1011,6 +1033,10 @@ fn apply_ensure_success_decision(
         EnsureSuccessDecision::PostRefillCapacityLost
         | EnsureSuccessDecision::PostRefillSlotsReleased
         | EnsureSuccessDecision::IncompleteReadiness => {
+            *settling = None;
+            *pending_readiness = true;
+        }
+        EnsureSuccessDecision::PacedRefill => {
             *settling = None;
             *pending_readiness = true;
         }
@@ -1334,6 +1360,13 @@ fn main() -> Result<()> {
             for name in &outcome.started {
                 println!("started ephemeral runner {name} [{}]", backend.name());
             }
+            if paced_start_pending(
+                cfg.limits.disk_recovery.is_some(),
+                outcome.missing,
+                outcome.started.len(),
+            ) {
+                bail!("paced disk-recovery start is partial: started {} of {} missing runners; remaining runners were not launched. Use serve or repeat start for fresh joint admission checks", outcome.started.len(), outcome.missing);
+            }
             match start_command_disposition(&outcome) {
                 StartCommandDisposition::AtCapacity => {
                     println!("already at capacity ({} runners)", cfg.runner.count);
@@ -1571,6 +1604,9 @@ fn main() -> Result<()> {
                             }
                             match decision {
                                 EnsureSuccessDecision::StartSettling { .. } => {}
+                                EnsureSuccessDecision::PacedRefill => {
+                                    eprintln!("disk recovery pacing: remaining unlaunched capacity will be reconsidered after fresh admission measurements");
+                                }
                                 EnsureSuccessDecision::Recovered => {
                                     settling_ceilings.record_recovery();
                                 }
@@ -2484,6 +2520,39 @@ mod tests {
             StartCommandDisposition::AdmissionPaused
         );
         assert!(!ensure_outcome_may_credit_deadman(&outcome));
+    }
+
+    #[test]
+    fn disk_recovery_paced_refill_is_not_a_startup_ceiling() {
+        let mut cfg = test_config();
+        cfg.limits.disk_recovery = Some(crate::disk_recovery::DiskRecovery {
+            scratch_root: "/tmp".into(),
+            aggregate_burn_gib_per_minute: 6,
+            detection_and_dispatch_delay_secs: 75,
+            active_job_growth_gib: 4,
+            protected_reserve_gib: 3,
+        });
+        let outcome = docker_backend::EnsureCountOutcome {
+            started: vec!["runner-1".into()],
+            missing: 3,
+            remaining_shortage: 2,
+            post_refill_readiness_error: None,
+            post_refill_capacity_lost: vec![],
+            post_refill_slots_released: vec![],
+            start_failures: 0,
+            reclaimed: 0,
+            admission_paused_reason: None,
+        };
+        let decision = ensure_success_decision(&cfg, &outcome);
+        assert_eq!(decision, EnsureSuccessDecision::PacedRefill);
+        assert_eq!(
+            ensure_success_plan(&cfg, decision),
+            (cfg.runner.serve_tick(), true)
+        );
+        let mut settling = None;
+        let mut pending = false;
+        apply_ensure_success_decision(&mut settling, &mut pending, Instant::now(), decision);
+        assert!(settling.is_none() && pending);
     }
 
     #[test]

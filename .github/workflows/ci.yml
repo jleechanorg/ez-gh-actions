@@ -118,6 +118,8 @@ jobs:
           python3 -m unittest tests/verify_mint_no_retry_on_4xx.py
           python3 -m unittest tests/verify_mint_retry.py
           python3 -m unittest tests/job_outcome_monitor_test.py
+      - name: Scratch eligibility audit safety tests
+        run: python3 -m unittest discover -s tests -p test_scratch_reclaimer.py -v
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Format
