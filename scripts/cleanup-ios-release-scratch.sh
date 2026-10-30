@@ -26,9 +26,11 @@
 #   - The Scratch root is validated: must resolve to an existing absolute
 #     directory and must not be / or $HOME.
 #   - Default DRY-RUN; --apply performs removals.
-#   - Removals go through a quarantine rename first, mirroring
-#     cleanup-mission-output.sh, and every action is written to a manifest plus
-#     the state log.
+#   - Removal is a direct rm of the validated path. There is deliberately no
+#     quarantine directory: $HOME and the Scratch volume are different
+#     filesystems, so a "quarantine" move would copy up to 2.4 GB per run onto
+#     the root disk before deleting it. A metadata manifest plus the state log
+#     record every action.
 #
 # Usage: cleanup-ios-release-scratch.sh [--apply] [--min-age-hours N] [--scratch-root PATH]
 #   --apply             actually remove eligible dirs (default: dry-run)
@@ -94,6 +96,15 @@ if [[ ! -d "${SCRATCH_ROOT}" ]]; then
   echo "FATAL: Scratch root does not exist: ${SCRATCH_ROOT}" >&2
   exit 3
 fi
+# Canonicalise. BSD `find "$root" -maxdepth 1` does not traverse a root that is
+# itself a symlink without a trailing slash, and comparing lsof's canonical
+# paths against a non-canonical root would never match.
+SCRATCH_ROOT_INPUT="${SCRATCH_ROOT}"
+CANONICAL_ROOT="$(cd -P -- "${SCRATCH_ROOT}" 2>/dev/null && pwd -P)" || {
+  echo "FATAL: could not canonicalise Scratch root: ${SCRATCH_ROOT}" >&2
+  exit 3
+}
+SCRATCH_ROOT="${CANONICAL_ROOT}"
 
 STATE_DIR="${HOME}/.local/state/ezgha"
 LOG="${STATE_DIR}/ios-release-cleanup.log"
@@ -103,6 +114,23 @@ MANIFEST="${MANIFEST_DIR}/ios-release-cleanup-$(date -u +%Y%m%dT%H%M%SZ).manifes
 
 # Manifests are bookkeeping; keep a month of them.
 find "${MANIFEST_DIR}" -maxdepth 1 -type f -name 'ios-release-cleanup-*.manifest' -mtime +30 -delete 2>/dev/null || true
+
+# Liveness scanning costs a full process-table walk (~3.3 s on this host), so a
+# snapshot is taken once per run and only refreshed immediately before each
+# removal - not once per candidate, which would be O(candidates) walks per hour.
+LIVENESS_SNAPSHOT=""
+snapshot_cleanup() { [[ -n "${LIVENESS_SNAPSHOT}" ]] && rm -f "${LIVENESS_SNAPSHOT}" 2>/dev/null; return 0; }
+trap snapshot_cleanup EXIT INT TERM
+
+take_liveness_snapshot() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  [[ -n "${LIVENESS_SNAPSHOT}" ]] && rm -f "${LIVENESS_SNAPSHOT}" 2>/dev/null
+  LIVENESS_SNAPSHOT="$(mktemp "${TMPDIR:-/tmp}/iosrel-lsof.XXXXXX" 2>/dev/null)" || { LIVENESS_SNAPSHOT=""; return 1; }
+  if ! lsof -w -n -Fn >"${LIVENESS_SNAPSHOT}" 2>/dev/null || [[ ! -s "${LIVENESS_SNAPSHOT}" ]]; then
+    return 1
+  fi
+  return 0
+}
 
 log() {
   local tag="APPLY"
@@ -144,44 +172,47 @@ run_is_completed() {
 # pgrep never matches its own process. If pgrep is unavailable we fail closed
 # (treat as referenced) rather than risk deleting a live run's tree.
 dir_is_referenced() {
-  local target="$1" real snapshot p
-  # Canonical form of the candidate. On macOS /var, /tmp and /etc are symlinks
-  # into /private, so lsof reports "/private/var/..." for a process whose cwd is
-  # "/var/...". Comparing only the literal string silently misses a live process
-  # - reproduced 2026-10-30 before this canonicalisation existed. Unknown
-  # canonical form means we cannot verify liveness, so fail closed (skip).
+  local target="$1" refresh="${2:-0}" real base alias p
+  # Canonical form. On macOS /var, /tmp and /etc are symlinks into /private, so
+  # lsof reports "/private/var/..." for a process whose cwd is "/var/...", while
+  # a process may carry either spelling in its argv. Unknown canonical form
+  # means liveness cannot be verified: fail closed.
   real="$(cd -P -- "${target}" 2>/dev/null && pwd -P)" || return 0
+  base="$(basename "${target}")"
 
+  # (a) argv scan. Match the unique directory basename, not a full path: the
+  # basename ("worldai-ios-release-<run>-<attempt>") is identical in every alias
+  # spelling, and it is globally unique per run+attempt, so a match here can only
+  # be this tree. Matching a full path missed the /var form and deleted a live
+  # tree during development of this check.
   if command -v pgrep >/dev/null 2>&1; then
-    # (a) argv scan. pgrep never matches itself, unlike a piped grep.
-    pgrep -f -- "${target}" >/dev/null 2>&1 && return 0
-    if [[ "${real}" != "${target}" ]] && pgrep -f -- "${real}" >/dev/null 2>&1; then
-      return 0
-    fi
+    pgrep -f -- "${base}" >/dev/null 2>&1 && return 0
   fi
 
-  # (b) open-file / cwd scan. An argv-only scan misses the realistic case: a
-  # long build whose cwd is inside the tree with the path absent from argv.
-  # `lsof -Fn` lists a path per open fd and cwd without walking the tree (that
-  # is `lsof +D`, which would be O(files) per candidate). Stream to a snapshot
-  # file rather than a shell variable: the full lsof listing is ~10 MB here.
-  command -v lsof >/dev/null 2>&1 || return 0
-  snapshot="$(mktemp "${TMPDIR:-/tmp}/iosrel-lsof.XXXXXX" 2>/dev/null)" || return 0
-  # A failed or empty scan proves nothing about liveness. Treat it as "in use"
-  # so a broken scanner skips deletion instead of authorising it.
-  if ! lsof -w -n -Fn >"${snapshot}" 2>/dev/null || [[ ! -s "${snapshot}" ]]; then
-    rm -f "${snapshot}"
-    return 0
+  # (b) open-file / cwd scan. An argv scan alone misses a long build whose cwd is
+  # inside the tree. `lsof -Fn` lists a path per open fd and cwd without walking
+  # the tree (`lsof +D` would be O(files) per candidate).
+  if [[ "${refresh}" == "1" || -z "${LIVENESS_SNAPSHOT}" || ! -s "${LIVENESS_SNAPSHOT}" ]]; then
+    # A failed or empty scan proves nothing about liveness: treat it as in use so
+    # a broken scanner skips deletion instead of authorising it.
+    take_liveness_snapshot || return 0
   fi
-  for p in "${target}" "${real}"; do
+  alias=""
+  if [[ -n "${SCRATCH_ROOT_INPUT:-}" && "${SCRATCH_ROOT_INPUT}" != "${SCRATCH_ROOT}" ]]; then
+    alias="${SCRATCH_ROOT_INPUT}${real#"${SCRATCH_ROOT}"}"
+  fi
+  for p in "${target}" "${real}" "${alias}"; do
+    [[ -n "${p}" ]] || continue
     # lsof prefixes each path with "n", so an exact cwd is "n<path>"; anything
     # deeper matches the "<path>/" prefix.
-    if grep -Fq -- "${p}/" "${snapshot}" || grep -Fxq -- "n${p}" "${snapshot}"; then
-      rm -f "${snapshot}"
+    if grep -Fq -- "${p}/" "${LIVENESS_SNAPSHOT}" || grep -Fxq -- "n${p}" "${LIVENESS_SNAPSHOT}"; then
       return 0
     fi
   done
-  rm -f "${snapshot}"
+  # Form-independent backstop: any listed path containing this unique basename.
+  if grep -Fq -- "/${base}" "${LIVENESS_SNAPSHOT}"; then
+    return 0
+  fi
   return 1
 }
 
@@ -238,7 +269,7 @@ while IFS= read -r -d '' d; do
   # Re-check immediately before the irreversible step. The size probe above
   # widens the window between "not in use" and "deleted", and directories are
   # named per run+attempt so nothing else can legitimately (re)enter one.
-  if dir_is_referenced "$d"; then
+  if dir_is_referenced "$d" 1; then
     log "  SKIP in-use (re-check before removal): ${base}"
     skipped=$((skipped+1)); continue
   fi

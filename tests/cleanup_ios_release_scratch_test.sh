@@ -146,7 +146,26 @@ remaining=0
 [ "${remaining}" -eq 1 ] || fail "deletion cap must remove exactly one of the two (removed $((2-remaining)))"
 pass "deletion cap enforced"
 
-# 8. Unsafe Scratch roots are refused.
+# 8. A SYMLINKED Scratch root must still be traversed and must still protect a
+#    live tree. BSD `find <symlink> -maxdepth 1` does not traverse a symlink root
+#    without a trailing slash, so this also guards the canonicalisation step.
+LINK_ROOT="${W}/scratch-link"
+ln -s "${SCR}" "${LINK_ROOT}"
+LINK_TARGET="${SCR}/worldai-ios-release-777-1"
+aged "${LINK_TARGET}"
+GH_BIN="${GH}" SCRATCH_ROOT="${LINK_ROOT}" bash "${S}" --apply >/dev/null
+[ ! -d "${LINK_TARGET}" ] || fail "a symlinked Scratch root must still be traversed (aged completed dir not removed)"
+LINK_LIVE="${SCR}/worldai-ios-release-778-1"
+aged "${LINK_LIVE}"
+bash -c 'while :; do sleep 1; done' "${LINK_LIVE}" &
+LINK_PID=$!
+sleep 0.3
+GH_BIN="${GH}" SCRATCH_ROOT="${LINK_ROOT}" bash "${S}" --apply >/dev/null
+[ -d "${LINK_LIVE}" ] || fail "a symlinked Scratch root must still protect a live dir"
+kill "${LINK_PID}" 2>/dev/null || true
+pass "symlinked Scratch root traversed and still safe"
+
+# 9. Unsafe Scratch roots are refused.
 for bad in "/" "relative/path"; do
   rc=0
   GH_BIN="${GH}" SCRATCH_ROOT="${bad}" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
