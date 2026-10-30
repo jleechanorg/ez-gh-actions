@@ -29,11 +29,26 @@
 # Workspace fix: a `/usr/local/bin/tar` wrapper baked into the runner image
 # (docker/tar-workspace-wrapper.sh) stages every extraction under _work on
 # the container overlay before copying it to virtiofs. The daemon flags the
-# workspace mount with EZGHA_VIRTIOFS_WORKSPACE=1. Keep _actions, _temp,
-# and _tool as ordinary directories within _work: Runner.Worker deletes
-# _actions at job setup, and deleting a nested mount there fails with EBUSY.
+# workspace mount with EZGHA_VIRTIOFS_WORKSPACE=1. Keep _actions and _tool
+# ordinary: the runner deletes _actions at job setup, and this image configures
+# RUNNER_TOOL_CACHE outside _work. The daemon mounts only _temp as executable
+# tmpfs for setup-gcloud's SDK extraction.
 #
 # Usage: bash tests/workspace_mount_symlink_extraction_test.sh
+# SDK peak canary (separate explicit mode; requires a pinned version, official URL and SHA):
+#   EZGHA_RUN_SDK_TMPFS_CANARY=1 EZGHA_SDK_VERSION=<version> \
+#   EZGHA_SDK_ARCHIVE_URL=https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz \
+#   EZGHA_SDK_SHA256=<official-sha256> \
+#   EZGHA_SDK_MEMORY_MB=1400 \
+#   bash tests/workspace_mount_symlink_extraction_test.sh
+# EZGHA_SDK_MEMORY_MB defaults to 3072; supply 1400 to test the Linux runner
+# profile. Both modes require at least 512 MiB of remaining cgroup memory.
+# This mode requires the official archive SHA-256, skips the default virtiofs
+# suite, and uses one named, auto-removed Docker container.
+# Canary fixture only: an extra `/home/runner/_work` tmpfs (`mode=1777`, 16 MiB)
+# provides a writable parent in the existing image; `_temp` remains its own
+# nested executable tmpfs. This parent tmpfs is not the daemon's production
+# workspace bind and does not reproduce Mac Colima/virtiofs.
 #
 # Requires: docker reachable (DOCKER_HOST must point at the real daemon
 # socket on Colima/Mac hosts), ezgha-runner:latest image present (rebuild
@@ -51,15 +66,205 @@ info()  { printf '  [..] %s\n' "$1"; }
 ok()    { printf '  [OK] %s\n' "$1"; PASS=$((PASS + 1)); }
 bad()   { printf '  [FAIL] %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
+SDK_TMPFS_CANARY="${EZGHA_RUN_SDK_TMPFS_CANARY:-0}"
+if [[ "${SDK_TMPFS_CANARY}" != "0" && "${SDK_TMPFS_CANARY}" != "1" ]]; then
+  echo "FAIL: EZGHA_RUN_SDK_TMPFS_CANARY must be 0 or 1" >&2
+  exit 2
+fi
+
 if ! docker version >/dev/null 2>&1; then
+  if [[ "${SDK_TMPFS_CANARY}" == "1" ]]; then
+    echo "FAIL: SDK tmpfs canary requires a reachable Docker daemon" >&2
+    exit 1
+  fi
   echo "SKIP: docker daemon unreachable (set DOCKER_HOST if using Colima) -- cannot run this integration test"
   exit 0
 fi
 
 IMAGE="${EZGHA_TEST_IMAGE:-ezgha-runner:latest}"
 if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
+  if [[ "${SDK_TMPFS_CANARY}" == "1" ]]; then
+    echo "FAIL: SDK tmpfs canary requires the existing image ${IMAGE}; refusing to pull or build" >&2
+    exit 1
+  fi
   echo "SKIP: ${IMAGE} not present locally -- build it first (docker build --file=\"${repo_root}/Dockerfile.runner\" -t ezgha-runner:latest \"${repo_root}\")"
   exit 0
+fi
+
+run_sdk_tmpfs_canary() {
+  : "${EZGHA_SDK_VERSION:?set EZGHA_SDK_VERSION to the pinned Google Cloud SDK version}"
+  : "${EZGHA_SDK_ARCHIVE_URL:?set EZGHA_SDK_ARCHIVE_URL to the pinned version official Linux archive}"
+  : "${EZGHA_SDK_SHA256:?set EZGHA_SDK_SHA256 to the official archive SHA-256}"
+  if [[ ! "${EZGHA_SDK_VERSION}" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+    echo "FAIL: invalid pinned SDK version: ${EZGHA_SDK_VERSION}" >&2
+    return 2
+  fi
+  if [[ -n "${EZGHA_SDK_SHA256:-}" && ! "${EZGHA_SDK_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "FAIL: EZGHA_SDK_SHA256 must be 64 hexadecimal characters" >&2
+    return 2
+  fi
+
+  image_arch=$(docker image inspect --format '{{.Architecture}}' "${IMAGE}")
+  case "${image_arch}" in
+    amd64) sdk_arch=x86_64 ;;
+    arm64) sdk_arch=arm ;;
+    *) echo "FAIL: unsupported runner image architecture: ${image_arch}" >&2; return 2 ;;
+  esac
+  archive_prefix="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/"
+  expected_action_url="${archive_prefix}google-cloud-sdk-${EZGHA_SDK_VERSION}-linux-${sdk_arch}.tar.gz"
+  expected_docs_url="${archive_prefix}google-cloud-cli-linux-${sdk_arch}.tar.gz"
+  if [[ "${EZGHA_SDK_ARCHIVE_URL}" != "${expected_action_url}" \
+    && "${EZGHA_SDK_ARCHIVE_URL}" != "${expected_docs_url}" ]]; then
+    echo "FAIL: archive URL must match the versioned setup-gcloud archive or documented official CLI URL" >&2
+    echo "Expected one of: ${expected_action_url}" >&2
+    echo "               ${expected_docs_url}" >&2
+    return 2
+  fi
+  sdk_memory_mb="${EZGHA_SDK_MEMORY_MB:-3072}"
+  if [[ ! "${sdk_memory_mb}" =~ ^[1-9][0-9]*$ ]] \
+    || (( ${#sdk_memory_mb} > 5 )) \
+    || (( sdk_memory_mb > 65536 )); then
+    echo "FAIL: EZGHA_SDK_MEMORY_MB must be a positive integer no greater than 65536" >&2
+    return 2
+  fi
+  container_name="ezgha-sdk-tmpfs-canary-$$"
+  if docker container inspect "${container_name}" >/dev/null 2>&1; then
+    echo "FAIL: refusing to touch pre-existing container ${container_name}" >&2
+    return 2
+  fi
+  image_id=$(docker image inspect --format '{{.Id}}' "${IMAGE}")
+  docker_env=(
+    -e "EZGHA_SDK_VERSION=${EZGHA_SDK_VERSION}"
+    -e "EZGHA_SDK_ARCHIVE_URL=${EZGHA_SDK_ARCHIVE_URL}"
+    -e "EZGHA_SDK_SHA256=${EZGHA_SDK_SHA256}"
+    -e "EZGHA_SDK_MEMORY_MB=${sdk_memory_mb}"
+  )
+  cleanup_sdk_canary() {
+    docker rm -f "${container_name}" >/dev/null 2>&1 || true
+  }
+  trap cleanup_sdk_canary EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  echo "=== SDK tmpfs canary: version=${EZGHA_SDK_VERSION} image_arch=${image_arch} memory=${sdk_memory_mb}MiB swap=0 ==="
+  echo "runner_image_id=${image_id}"
+  echo "Archive: ${EZGHA_SDK_ARCHIVE_URL}"
+  echo "archive_sha256_expected=${EZGHA_SDK_SHA256}"
+  echo "canary_parent_work_fixture=/home/runner/_work:rw,mode=1777,size=16m (extra test mount; not the daemon bind)"
+  echo "canary_sdk_tmpfs=/home/runner/_work/_temp:exec (proposed nested mount)"
+  echo "workspace_host_path_bind=absent (fixture only; no daemon-arg or Mac virtiofs proof)"
+  docker run --pull=never --rm --name "${container_name}" \
+    --memory="${sdk_memory_mb}m" --memory-swap="${sdk_memory_mb}m" \
+    --tmpfs /home/runner/_work:rw,mode=1777,size=16m \
+    --tmpfs /home/runner/_work/_temp:exec \
+    --entrypoint /bin/bash \
+    -e EZGHA_VIRTIOFS_WORKSPACE=1 \
+    -e RUNNER_TEMP=/home/runner/_work/_temp \
+    "${docker_env[@]}" "${IMAGE}" -euo pipefail -c '
+      work_root=/home/runner/_work
+      temp_root=/home/runner/_work/_temp
+      work_fs=$(df -PT "${work_root}" | awk "NR == 2 { print \$2 }")
+      work_mode=$(stat -c %a "${work_root}")
+      test "${work_fs}" = tmpfs
+      test "${work_mode}" = 1777
+      echo "canary_parent_work_filesystem=${work_fs}"
+      echo "canary_parent_work_mode=${work_mode}"
+      mkdir -p "${temp_root}"
+      actions=/home/runner/_work/_actions
+      mkdir -p "${actions}/canary"
+      if grep -Fq " /home/runner/_work/_actions " /proc/mounts; then
+        echo "FAIL: _actions must remain an ordinary directory, not a mount" >&2
+        exit 1
+      fi
+      printf "removable\n" > "${actions}/canary/probe"
+      rm -rf "${actions}"
+      test ! -e "${actions}"
+      mkdir -p "${actions}"
+      echo "actions_removable=true"
+      tar_path=/usr/local/bin/tar
+      test "$(command -v tar)" = "${tar_path}"
+      tar_wrapper_sha256=$(sha256sum "${tar_path}" | awk "{ print \$1 }")
+      echo "executed_tar_wrapper_path=${tar_path}"
+      echo "executed_tar_wrapper_sha256=${tar_wrapper_sha256}"
+
+      download_dir="${temp_root}/download"
+      extract_dir="${temp_root}/extract"
+      mkdir -p "${download_dir}" "${extract_dir}"
+      archive="${download_dir}/google-cloud-sdk.tar.gz"
+      curl --fail --location --silent --show-error \
+        "${EZGHA_SDK_ARCHIVE_URL}" --output "${archive}"
+      archive_sha256_actual=$(sha256sum "${archive}" | awk "{ print \$1 }")
+      echo "archive_sha256_actual=${archive_sha256_actual}"
+      echo "archive_sha256_expected=${EZGHA_SDK_SHA256}"
+      if [[ "${archive_sha256_actual}" != "${EZGHA_SDK_SHA256}" ]]; then
+        echo "FAIL: downloaded official archive bytes do not match the caller-pinned SHA-256" >&2
+        exit 1
+      fi
+      echo "archive_sha256_verified=true"
+
+      # Match setup-gcloud v2.1.0 extraction flags recorded in the failed job.
+      tar xz --warning=no-unknown-keyword --overwrite -f "${archive}" -C "${extract_dir}"
+      sdk_dir=""
+      for candidate in google-cloud-sdk google-cloud-cli; do
+        if [[ -x "${extract_dir}/${candidate}/bin/gcloud" ]]; then
+          sdk_dir="${extract_dir}/${candidate}"
+          break
+        fi
+      done
+      test -n "${sdk_dir}"
+      gcloud="${sdk_dir}/bin/gcloud"
+      test -x "${gcloud}"
+      actual_version=$("${gcloud}" --version | sed -n "1s/^Google Cloud SDK //p")
+      echo "gcloud_executable=true"
+      echo "gcloud_version=${actual_version}"
+      test "${actual_version}" = "${EZGHA_SDK_VERSION}"
+      echo "tmpfs_df_begin"
+      df -PT -B1 "${temp_root}"
+      echo "tmpfs_df_end"
+      fs_type=$(df -PT "${temp_root}" | awk "NR == 2 { print \$2 }")
+      test "${fs_type}" = tmpfs
+      tmpfs_used_bytes=$(df -P -B1 "${temp_root}" | awk "NR == 2 { print \$3 }")
+      tmpfs_du_bytes=$(du -sb "${temp_root}" | awk "{ print \$1 }")
+
+      if [[ -r /sys/fs/cgroup/memory.peak && -r /sys/fs/cgroup/memory.max ]]; then
+        cgroup_version=2
+        memory_peak=$(cat /sys/fs/cgroup/memory.peak)
+        memory_max=$(cat /sys/fs/cgroup/memory.max)
+        memory_current=$(cat /sys/fs/cgroup/memory.current)
+      elif [[ -r /sys/fs/cgroup/memory/memory.max_usage_in_bytes && -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+        cgroup_version=1
+        memory_peak=$(cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes)
+        memory_max=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+        memory_current=$(cat /sys/fs/cgroup/memory/memory.usage_in_bytes)
+      else
+        echo "FAIL: no readable cgroup memory peak/limit counters" >&2
+        exit 1
+      fi
+      expected_memory_max=$((EZGHA_SDK_MEMORY_MB * 1024 * 1024))
+      echo "cgroup_version=${cgroup_version}"
+      echo "cgroup_memory_peak_bytes=${memory_peak}"
+      echo "cgroup_memory_max_bytes=${memory_max}"
+      echo "requested_memory_max_bytes=${expected_memory_max}"
+      echo "cgroup_memory_current_bytes=${memory_current}"
+      if [[ "${memory_max}" -ne "${expected_memory_max}" ]]; then
+        echo "FAIL: cgroup memory max does not match requested ${EZGHA_SDK_MEMORY_MB} MiB" >&2
+        exit 1
+      fi
+      remaining_bytes=$((memory_max - memory_peak))
+      echo "tmpfs_used_bytes=${tmpfs_used_bytes}"
+      echo "tmpfs_du_bytes=${tmpfs_du_bytes}"
+      echo "cgroup_memory_remaining_bytes=${remaining_bytes}"
+      if (( remaining_bytes < 536870912 )); then
+        echo "FAIL: remaining cgroup memory margin is below 512 MiB" >&2
+        exit 1
+      fi
+      echo "remaining_memory_margin_at_least_512MiB=true"
+    '
+}
+
+if [[ "${SDK_TMPFS_CANARY}" == "1" ]]; then
+  run_sdk_tmpfs_canary
+  exit $?
 fi
 
 # Must live under a Colima virtiofs-allowlisted path (`colima ssh -- mount |
@@ -142,7 +347,7 @@ else
   bad "unexpected output extracting into the workspace bind mount root: ${MOUNT_OUT}"
 fi
 
-echo "=== 3. Fix verification: runner-internal directories can be cleared and used on the workspace mount ==="
+echo "=== 3. Bind-fixture check: _actions is removable; _temp/_tool fixtures remain usable ==="
 for runner_dir in _actions _temp _tool; do
   mkdir -p "${HOST_WORKSPACE}/${runner_dir}"
   echo "stale runner data" > "${HOST_WORKSPACE}/${runner_dir}/runner-setup-stale"
@@ -178,7 +383,7 @@ if printf '%s' "${FIXED_OUT}" | grep -q "delete-_actions-rc=0" \
   && printf '%s' "${FIXED_OUT}" | grep -q "exec-_actions-ok" \
   && printf '%s' "${FIXED_OUT}" | grep -q "exec-_temp-ok" \
   && printf '%s' "${FIXED_OUT}" | grep -q "exec-_tool-ok"; then
-  ok "runner setup can delete/recreate _actions/_temp/_tool and guarded extraction succeeds"
+  ok "bind fixtures preserve _actions removability and guarded extraction behavior"
 else
   bad "runner internal directory cleanup or guarded extraction failed: ${FIXED_OUT}"
 fi
