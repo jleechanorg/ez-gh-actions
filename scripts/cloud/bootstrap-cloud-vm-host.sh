@@ -100,6 +100,28 @@ open(path, "w").writelines(out)
 PY
 grep -E '^(count|name_prefix) =|host_containment' "$HOME/.config/ezgha/config.toml"
 
+step "6b. refuse a count the memory budget cannot hold"
+# `serve` would refuse to start anyway; fail here with the arithmetic instead of a
+# daemon restart loop. Mirrors derive_memory_budget in src/docker_backend.rs.
+python3 - "$HOME/.config/ezgha/config.toml" <<'PYCHK'
+import re, subprocess, sys
+cfg = open(sys.argv[1]).read()
+def val(key, default=None):
+    m = re.search(rf'(?m)^{key}\s*=\s*(\S+)', cfg)
+    return m.group(1) if m else default
+count = int(val('count'))
+floor = int(val('runner_floor_mb', '3072'))
+reserve = int(val('guest_reserve_mb', '4096'))
+mem = int(subprocess.run(['docker', 'info', '--format', '{{.MemTotal}}'],
+                         capture_output=True, text=True, check=True).stdout.strip()) // 1048576
+budget = mem - reserve
+ceiling = budget // floor
+print(f"budget={budget}MB (mem {mem} - reserve {reserve}), floor={floor}MB, ceiling={ceiling}")
+if count > ceiling:
+    sys.exit(f"count {count} exceeds the {ceiling}-runner ceiling: "
+             f"{count} x {floor} = {count * floor} MB > {budget} MB budget")
+PYCHK
+
 step "7. GitHub App installation token (mint + 45-minute refresh timer)"
 # On its own this is NOT enough: the installation token expires after 1 hour, and
 # a stale token makes every `gh` call fail with 401 "Bad credentials" so no slot

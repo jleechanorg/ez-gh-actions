@@ -21,10 +21,15 @@ labels = ["self-hosted", "self-hosted-mikey", "ezgha", "Linux", "X64", "cmux-clo
 # headroom. 4 on a 16 GiB / 8 vCPU machine, 2 on an 8 GiB / 4 vCPU machine.
 count = 4
 image = "ezgha-runner:latest"
-# There is no Lima/Colima guest here — the daemon's Docker *is* this VM's Docker,
-# so the 4 GiB guest reserve would only shrink the fleet budget (it made a
-# 4x3072 MiB fleet fail admission on a 16 GiB machine by 181 MiB).
-guest_reserve_mb = 0
+# The 4 GiB Lima guest reserve is too big here (the daemon's Docker *is* this VM's
+# Docker), but zero is wrong too: dockerd, the guest OS and the daemon itself still
+# need memory. 512 MiB keeps `count x runner_floor_mb` inside the budget:
+#   (16203 - 512) / 1400 = 11 runners on 16 GiB, (8011 - 512) / 1400 = 5 on 8 GiB.
+guest_reserve_mb = 512
+# Per-runner reservation used by the budget check (see docs/cloud-vm-hosts.md).
+# 1400 is the per-job figure the 20-runner Linux fleet runs; the default of 3072
+# would cap a 16 GiB host at 4 runners. Keep this in step with the docs.
+runner_floor_mb = 1400
 
 [limits]
 memory_mb = 1400

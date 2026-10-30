@@ -24,6 +24,11 @@ not exist, and the fixed 10/14/20-runner HostDocker profile does not fit an
   flag in `/proc/cpuinfo`, or `/sys/hypervisor/type`);
 - on a host that reports no virtualization, `serve` refuses to start with
   `policy.host_containment = "vm" requires a virtualized host …`;
+- the probe proves the machine *is* a VM, not that the VM belongs to the runners. Set
+  this only on a VM dedicated to runner work — on shared hardware another tenant's
+  container is outside the boundary you are claiming. (A Xen dom0 also exposes
+  `/sys/hypervisor/type` while effectively being the host, so the probe alone is not a
+  licence to relax anything on bare metal);
 - the default (`auto`) keeps the existing `actions.slice` requirement, so nothing
   changes for the established bare-metal fleet;
 - a daemon whose Docker runs on a different kernel (Colima/Lima) is unaffected —
@@ -42,40 +47,62 @@ HOST_TAG=a RUNNER_COUNT=4 NAME_PREFIX=ez-cloud-runner-a \
   REF=main ./scripts/cloud/bootstrap-cloud-vm-host.sh
 ```
 
-Sizing: the fleet budget is `vm_total_mb - guest_reserve_mb` (auto-detected total
-when `vm_total_mb` is unset) and each runner reserves `runner_floor_mb` (3072 by
-default), so 4 runners fit a 16 GiB / 8 vCPU machine and 2 fit an 8 GiB / 4 vCPU
-machine. Set `guest_reserve_mb = 0` there: the 4 GiB Lima guest reserve is
-meaningless on a host whose Docker *is* the VM's Docker and it made a 4x3072 MiB
-fleet fail admission by 181 MiB. `doctor-runner` from the controlling host is the
-authoritative health check; container count alone is not proof of a working fleet.
+Sizing: see [Capacity](#capacity-how-many-runners-fit). `doctor-runner` from the
+controlling host is the authoritative health check; container count alone is not proof
+of a working fleet.
 
 ## Capacity: how many runners fit
 
-The daemon derives the ceiling itself; do not guess:
+**The operator picks `runner.count`; the daemon does not compute one.** `serve` refuses
+to start when the configured fleet does not fit the memory budget
+(`derive_memory_budget`, `src/docker_backend.rs`):
 
 ```
-fleet_budget_mb = vm_total_mb - guest_reserve_mb     (total auto-detected when unset)
-max_count       = floor(fleet_budget_mb / runner_floor_mb)
-per-container   = memory_mb (clamped to budget/count), cpus = NCPU/count (floored at 0.5)
+refusing to start: memory budget shortfall: … required_mb=… shortfall_mb=…
 ```
 
-Measured on four cmux Cloud microVMs (2026-10-28), with `runner_floor_mb = 1400` — the
-per-job figure the 20-runner Linux fleet runs; going below it reproduces the under-floor
-clamp OOM class (bead `ez-gh-actions-yz6b`):
+so the largest count it will accept is
 
-| host | mem total | NCPU | count | per-job mem / cpus |
-|---|---|---|---|---|
-| 16 GiB | 16203 MB | 8 | 11 | 1400 MB / 0.73 |
-| 8 GiB | 8011 MB | 4 | 5 | 1400 MB / 0.8 |
+```
+fleet_budget_mb   = vm_total_mb - guest_reserve_mb      (vm_total_mb auto-detected when unset)
+count_ceiling     = floor(fleet_budget_mb / runner_floor_mb)
+per-container mem = min(limits.memory_mb, fleet_budget_mb / count)   (floor 512 MB)
+per-container cpu = min(limits.cpus,     max(NCPU / count, 0.5))
+```
+
+`resolve_and_log_memory_budget` downgrades that refusal to a warning when `vm_total_mb`
+is unset **and** the `docker info` probe fails, so a host whose Docker is unreachable at
+startup is not proof of a valid budget.
+
+Below the ceiling, raising `count` has two effects: more slots, and a **smaller CPU and
+memory share for every runner** (the formulas above). Above it, `serve` will not start
+at all.
+
+Values measured on four cmux Cloud microVMs (2026-10-28) with `runner_floor_mb = 1400`
+and `guest_reserve_mb = 512` — 1400 because it is the per-job figure the 20-runner Linux
+fleet runs, and going below the floor reproduces the under-floor clamp OOM class (bead
+`ez-gh-actions-yz6b`). "Measured" here means MemTotal and NCPU were read from
+`docker info` and the count was derived from the formulas; 26 dispatched jobs then
+completed across the resulting slots (a 5-second workflow, so this is not evidence of 26
+*simultaneous* long jobs):
+
+| host | mem total | NCPU | count | count ceiling | per-job mem / cpus |
+|---|---|---|---|---|---|
+| 16 GiB | 16203 MB | 8 | 11 | 11 | 1400 MB / 0.73 |
+| 8 GiB | 8011 MB | 4 | 5 | 5 | 1400 MB / 0.8 |
 
 Rules of thumb:
-- Raising `count` only changes slot count; `runner_floor_mb` sets the ceiling, and the
-  daemon clamps `memory_mb`/`cpus` per runner to the fleet share automatically.
-- **Disk is the other ceiling.** A slot needs ~0.5-1.5 GB of workspace churn per running
-  job; when free space drops to `limits.min_free_disk_gb` admission pauses until it
-  recovers (that is protection, not a fault). A 16 GiB host with ~11 GiB free and a 6 GB
-  floor may therefore run fewer concurrent heavy jobs than its memory budget allows.
+- Keep `guest_reserve_mb` non-zero. It is the memory set aside for dockerd, the guest OS
+  and the daemon itself, and a cloud VM still runs all three. At 11 × 1400 of 16203 MB
+  only ~800 MB would remain; 512 MB is the smallest reserve that still fits those counts.
+  The Linux fleet's 1400 MB runners are safe for a different reason — they run inside a
+  pinned 28 GiB `actions.slice` with `memory.high`/`memory.max` caps on a much larger
+  host — which a microVM has neither.
+- **Disk is the other ceiling.** A running job needs roughly 0.5-1.5 GB of workspace
+  churn. Admission pauses when free space is strictly below `limits.min_free_disk_gb`
+  (default 10 GB) on the host filesystem or Docker's; only **new** spawns stop, running
+  jobs continue, and a critical alert fires. Size the volume for
+  `count × ~1.5 GB` above the floor, not for the memory budget alone.
 - `dockerd` caches `NCPU` at start. A VM booted at a smaller size keeps reporting that
   smaller count until the daemon restarts, which silently halves per-runner CPU.
 
