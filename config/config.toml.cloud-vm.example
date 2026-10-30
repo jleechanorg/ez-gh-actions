@@ -28,8 +28,9 @@ image = "ezgha-runner:latest"
 #   (16203 - 512) / 1400 = 11 runners on 16 GiB, (8011 - 512) / 1400 = 5 on 8 GiB.
 guest_reserve_mb = 512
 # Per-runner reservation used by the budget check (see docs/cloud-vm-hosts.md).
-# 1400 is the per-job figure the 20-runner Linux fleet runs; the default of 3072
-# would cap a 16 GiB host at 4 runners. Keep this in step with the docs.
+# 1400 is the per-job figure the 20-runner Linux fleet runs. With the code defaults
+# (runner_floor_mb = 3072, guest_reserve_mb = 4096) a 16 GiB host caps at 3 runners.
+# Keep this in step with docs/cloud-vm-hosts.md.
 runner_floor_mb = 1400
 
 [limits]

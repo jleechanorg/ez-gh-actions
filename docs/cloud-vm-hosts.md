@@ -24,7 +24,10 @@ It is not a bypass:
   in `/proc/cpuinfo`, or `/sys/hypervisor/type`);
 - on a host that reports no virtualization, `serve` refuses to start with
   `policy.host_containment = "vm" requires a virtualized host …`;
-- the probe proves the machine *is* a VM, not that the VM belongs to the runners. Use it
+- the probe proves the machine *is* a VM, not that the VM belongs to the runners. It looks
+  for `hypervisor` on `flags` lines in `/proc/cpuinfo`; arm64 guests print `Features`
+  instead, so an arm64 microVM fails closed unless `/sys/hypervisor/type` exists. The
+  labels and measurements here assume X64; Use it
   only on a VM dedicated to runner work — another tenant's workload is outside the
   boundary you are claiming. (A Xen dom0 also exposes `/sys/hypervisor/type` while
   effectively being the host, so the probe alone is not a licence to relax anything on
@@ -45,10 +48,14 @@ Everything the bare-metal branch enforces is skipped, not just the slice name:
 - the post-start container PID-ancestry assertion;
 - host admission pacing.
 
-The admission memory-pressure gate also degrades: it falls back to system-wide PSI
-instead of sampling the runner cgroup, because the runner cgroup does not exist here.
-On these VMs the PSI file is missing entirely, so that gate is inactive and the daemon
-logs it every tick.
+The admission memory-pressure gate changes shape: `PressureSource::fallback()` reads
+`/sys/fs/cgroup/user.slice/memory.pressure` (`DEFAULT_PRESSURE_PATH`), not the runner
+cgroup. On these VMs that file does not exist, so the gate is inactive and the daemon
+logs a probe warning — but only on ticks where the fleet is short, because the probe
+runs after the `alive >= count` early return. The gate fails *open* only because
+`runner.host_reserve_mb` is 0 (the default, and unset in the example). **Setting a
+non-zero `host_reserve_mb` on this host shape makes a PSI probe failure fail closed and
+freezes admission**, so leave it at 0 here.
 
 ## Bring-up
 
@@ -61,6 +68,11 @@ transport works — for cmux Cloud, `cmux vm push`):
 HOST_TAG=a RUNNER_COUNT=4 NAME_PREFIX=ez-cloud-runner-a \
   REF=main ./scripts/cloud/bootstrap-cloud-vm-host.sh
 ```
+
+Re-running the script **overwrites** `~/.config/ezgha/config.toml` from
+`config/config.toml.cloud-vm.example` and patches only `count` and `name_prefix`, so any
+hand edit — added labels, a different reserve, changed limits — is lost. Put host-specific
+values in the example before running, or reapply them after.
 
 `RUNNER_COUNT` must not exceed the host's ceiling. The script checks that before
 restarting the daemon and fails with the arithmetic instead of a restart loop. It also
@@ -89,7 +101,7 @@ per-container cpu = min(limits.cpus, max(NCPU / count, 0.5))
 
 `resolve_and_log_memory_budget` downgrades that refusal to a warning when `vm_total_mb`
 is unset **and** the `docker info` probe fails, so a successful start is not by itself
-proof of a valid budget. `cpu_burst = true` is refused unless `platform::daemon_in_vm()`
+proof of a valid budget. `cpu_burst = true` is refused unless `platform::daemon_in_vm_only()`
 verifies a VM, and that detection only compares kernels — a same-kernel microVM does not
 qualify, so leave `cpu_burst` off here.
 
@@ -102,18 +114,20 @@ memory share for every runner**. Above it, `serve` will not start at all.
 ships `runner_floor_mb = 1400`, `guest_reserve_mb = 512`, `limits.memory_mb = 1400` and
 `limits.cpus = 1.6`, and keeps `count = 4` as a deliberately conservative starting
 point. The table below is the arithmetic for **that** example on the hosts measured on
-2026-10-28 (totals in MiB, as `docker info` reports them):
+2026-10-28, with totals in MiB derived from `docker info`'s `MemTotal` bytes:
 
 | host | MemTotal | NCPU | count | ceiling | per-job mem / cpus |
 |---|---|---|---|---|---|
-| 16 GiB (2 hosts) | 16203 MiB | 8 | 11 | 11 | 1400 MiB / 0.73 |
-| 8 GiB (2 hosts) | 8011 MiB | 4 | 5 | 5 | 1400 MiB / 0.8 |
+| 16 GiB (one host) | 16203 MiB | 8 | 11 | 11 | 1400 MiB / 0.73 |
+| 8 GiB (three hosts) | 8011 MiB | 4 | 5 | 5 | 1400 MiB / 0.8 |
+
+That deployment was 11 + 5 + 5 + 5 = **26 slots**.
 
 1400 is the per-job figure the 20-runner Linux fleet runs; going below the floor
 reproduces the under-floor clamp OOM class (bead `ez-gh-actions-yz6b`). "Measured" means
 MemTotal and NCPU came from `docker info` and the counts follow the formulas; 26
-dispatched jobs then completed across the resulting 26 slots. The selftest workflow runs
-for seconds, so that is **not** evidence of 26 simultaneous long jobs.
+dispatched jobs then completed successfully across those 26 slots. The selftest workflow
+runs for seconds, so that is **not** evidence of 26 simultaneous long jobs.
 
 ### Guest reserve
 
@@ -129,16 +143,21 @@ safe for a different reason — they sit inside a pinned 28 GiB `actions.slice` 
 
 A running job needs roughly 0.5-1.5 GB of workspace churn. Admission pauses when free
 space is **strictly below** `limits.min_free_disk_gb` (default 10 GB, whole GB) on the
-host filesystem or on Docker's filesystem, or when the measurement itself fails
-(`host_disk_measurement_unavailable`). Only **new** spawns stop — running jobs continue —
-and a `Critical` alert fires. Size the volume for `count × ~1.5 GB` above the floor plus
+host filesystem or on Docker's filesystem. Only **new** spawns stop — running jobs
+continue — and a `Critical` alert fires.
+
+The two measurement failures behave differently: a failed host-filesystem probe pauses
+admission immediately (`host_disk_measurement_unavailable`), while a failed Docker-filesystem
+probe pauses only after two consecutive failures (`DISK_MEASURE_STRIKES = 2`). That second
+probe runs `df` **inside `ezgha-runner:latest`**, so a deleted runner image also surfaces
+as a measurement failure. Size the volume for `count × ~1.5 GB` above the floor plus
 the runner image (~4 GB), not for the memory budget alone.
 
 Recovering from a pause: **do not prune Docker images** — that deletes
 `ezgha-runner:latest` and the daemon cannot spawn until it is rebuilt. Free space with
 builder-cache and stopped-container/log cleanup, or grow the volume
 (`cmux vm resize <id> --disk <N>G`; disk is per-machine and is not part of the vCPU or
-memory pool).
+memory pool; the CLI takes 4-256 GiB in 4 GiB steps and cannot shrink).
 
 ### `dockerd` caches NCPU
 
@@ -165,7 +184,9 @@ selftest also finishes in seconds, which makes `docker top` a race.
 ```sh
 gh workflow run selftest.yml -R jleechanorg/ez-gh-actions \
   -f runs_on_json='["self-hosted","cmux-cloud"]'
-# then confirm WHICH host took it (must match this host's NAME_PREFIX):
+# `gh workflow run` prints no run id; find the newest one, then confirm WHICH host took it
+# (the name must match this host's NAME_PREFIX):
+gh run list -R jleechanorg/ez-gh-actions --workflow selftest.yml -L1
 gh run view <run-id> -R jleechanorg/ez-gh-actions --log | grep 'Runner name:'
 ```
 
