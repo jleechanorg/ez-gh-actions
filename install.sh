@@ -182,6 +182,30 @@ for arg in "$@"; do
   esac
 done
 
+# ── Self-outage guard (AGENTS.md: Self-Outage Prevention Principle) ───────────
+# This script stops and reinstalls ezgha.service partway through. Under `set -e`
+# any later failure used to exit with the fleet still stopped. Observed
+# 2026-10-29: an install run started from another host stopped ezgha.service at
+# 20:20:39 and the daemon stayed inactive for ~3 hours, draining all 20
+# ephemeral runners to zero — each runner exits after one job and only the
+# daemon respawns them, so a stopped daemon reads as a silently empty fleet.
+# Restore the pre-deploy runtime state whenever a non-uninstall run exits
+# non-zero. `--uninstall` exits from inside the loop above, before this point.
+EZGHA_SERVICE_WAS_ACTIVE=0
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+  EZGHA_SERVICE_WAS_ACTIVE=1
+fi
+restore_service_after_failed_deploy() {
+  local rc=$?
+  if [ "${rc}" -ne 0 ] && [ "${EZGHA_SERVICE_WAS_ACTIVE:-0}" -eq 1 ] \
+     && ! systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+    printf '  \033[33m⚠\033[0m deploy exited rc=%s with ezgha.service stopped; restoring pre-deploy runtime state\n' "${rc}" >&2
+    systemctl --user start ezgha.service 2>/dev/null || true
+  fi
+}
+trap restore_service_after_failed_deploy EXIT
+
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
 mkdir -p "${CONFIG_DIR}"
