@@ -23,7 +23,7 @@ W="$(mktemp -d)"
 # resolves its own helpers through $HOME, which this test deliberately overrides.
 RM_BIN=/bin/rm
 [ -x "${RM_BIN}" ] || RM_BIN=/usr/bin/rm
-trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}" "${ENV_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; "${RM_BIN}" -rf "${W:?}" || true' EXIT
+trap 'for p in "${LIVE_PID:-}" "${CWD_PID:-}" "${LINK_PID:-}" "${NOPGREP_PID:-}" "${ENV_PID:-}" "${FD_PID:-}"; do [ -n "$p" ] && { kill "$p" 2>/dev/null || true; }; done; "${RM_BIN}" -rf "${W:?}" || true' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -252,6 +252,22 @@ GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 [ -d "${ENVHELD}" ] || fail "an env-held (deferred consumer) reference must be protected"
 kill "${ENV_PID}" 2>/dev/null || true
 pass "environment-held path protected"
+
+# 12b. An OPEN FILE DESCRIPTOR into the tree must protect it, with argv clean, cwd
+#      outside the tree and no environment reference - i.e. only the lsof fd scan
+#      can catch this shape. (The reviewer flagged that "open fd" was claimed but
+#      never isolated in a test.)
+OPENFD="${SCR}/worldai-ios-release-993-1"
+mkdir -p "${OPENFD}/deep"; echo data > "${OPENFD}/deep/f"
+( cd "${OPENFD}/deep" && exec 3<f && cd / && exec bash -c 'while :; do sleep 1; done' ) &
+FD_PID=$!
+sleep 0.5
+ps -o args= -p "${FD_PID}" | grep -Fq "worldai-ios-release-993" && fail "test setup: fd-only process must not carry the path in argv"
+ps -o args= -p "${FD_PID}" | grep -Fq "OPENFD" && fail "test setup: fd-only process must not carry the path in argv"
+GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
+[ -d "${OPENFD}" ] || fail "an open file descriptor into the tree must protect it"
+kill "${FD_PID}" 2>/dev/null || true
+pass "open file descriptor protected"
 
 # 13. A genuinely missing scanner must FAIL LOUDLY, not silently decline every
 #     candidate. (This is the production paralysis agy found: the launchd PATH
