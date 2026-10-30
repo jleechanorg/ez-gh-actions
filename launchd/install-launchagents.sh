@@ -56,10 +56,15 @@ fi
 # measured 2026-10-30, that python uv-tool call spins indefinitely in a launchd
 # session (it answers in ~4s interactively), which wedged the first installed
 # copy of the job. Resolve it here, once, at install time, and substitute it.
-# Fail closed: an unresolved root leaves @SCRATCH_ROOT@ in the rendered plist,
-# which the placeholder guard below already rejects.
+#
+# If it cannot be resolved (no diskm, e.g. CI), the affected template is SKIPPED
+# rather than loaded with an unsubstituted placeholder: a reaper with no target
+# would either do nothing or hang. A targeted install of that label still fails
+# loudly; a bulk install carries on and reports it.
 SCRATCH_ROOT_RESOLVED=""
+SCRATCH_ROOT_REQUIRED=0
 if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
+  SCRATCH_ROOT_REQUIRED=1
   if command -v diskm >/dev/null 2>&1; then
     SCRATCH_ROOT_RESOLVED="$(diskm scratch-dir 2>/dev/null || true)"
     SCRATCH_ROOT_RESOLVED="${SCRATCH_ROOT_RESOLVED%/}"
@@ -67,8 +72,8 @@ if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
   case "${SCRATCH_ROOT_RESOLVED}" in
     /*) ;;
     *)
-      echo "ERROR: could not resolve this host's Scratch root (diskm scratch-dir returned '${SCRATCH_ROOT_RESOLVED}'); refusing to install a reaper with no target" >&2
-      exit 2
+      SCRATCH_ROOT_RESOLVED=""
+      echo "WARNING: could not resolve this host's Scratch root (diskm scratch-dir returned empty or diskm is absent) — any template requiring @SCRATCH_ROOT@ will be skipped" >&2
       ;;
   esac
 fi
@@ -219,6 +224,14 @@ case "$action" in
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"
+      if grep -q '@SCRATCH_ROOT@' "$tmpl" && [[ -z "${SCRATCH_ROOT_RESOLVED}" ]]; then
+        if [[ -n "${label_filter}" ]]; then
+          echo "ERROR: ${label} needs this host's Scratch root (diskm scratch-dir) and it could not be resolved; refusing to install a unit with no target" >&2
+          exit 2
+        fi
+        echo "SKIPPED: ${label} — no resolvable Scratch root on this host" >&2
+        continue
+      fi
       dest="${TARGET_DIR}/${label}.plist"
       candidate="${dest}.candidate.$$"
       backup="${dest}.backup.$$"
