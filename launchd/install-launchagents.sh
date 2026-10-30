@@ -62,9 +62,7 @@ fi
 # would either do nothing or hang. A targeted install of that label still fails
 # loudly; a bulk install carries on and reports it.
 SCRATCH_ROOT_RESOLVED=""
-SCRATCH_ROOT_REQUIRED=0
 if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
-  SCRATCH_ROOT_REQUIRED=1
   if command -v diskm >/dev/null 2>&1; then
     SCRATCH_ROOT_RESOLVED="$(diskm scratch-dir 2>/dev/null || true)"
     SCRATCH_ROOT_RESOLVED="${SCRATCH_ROOT_RESOLVED%/}"
@@ -77,6 +75,14 @@ if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
       ;;
   esac
 fi
+
+# sed replacement text treats & (whole match) and the | delimiter specially, and
+# a literal backslash needs doubling. Escape all three so a legal Scratch root or
+# HOME containing them renders verbatim instead of corrupting the plist.
+sed_escape() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+HOME_SED="$(sed_escape "${HOME}")"
+SCRIPTS_DIR_SED="$(sed_escape "${SCRIPTS_DIR}")"
+SCRATCH_ROOT_SED="$(sed_escape "${SCRATCH_ROOT_RESOLVED}")"
 
 # Guard: fail loudly if a rendered plist still references a repo/worktree
 # checkout path or has an unsubstituted @...@ placeholder left in it. A
@@ -224,7 +230,15 @@ case "$action" in
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"
+      dest="${TARGET_DIR}/${label}.plist"
       if grep -q '@SCRATCH_ROOT@' "$tmpl" && [[ -z "${SCRATCH_ROOT_RESOLVED}" ]]; then
+        # A previously installed copy must not survive this state: it would keep
+        # firing hourly at a target this host can no longer resolve.
+        if [[ -f "${dest}" ]]; then
+          launchctl unload "${dest}" 2>/dev/null || true
+          rm -f "${dest}"
+          echo "UNLOADED and removed stale ${label} — its Scratch root can no longer be resolved" >&2
+        fi
         if [[ -n "${label_filter}" ]]; then
           echo "ERROR: ${label} needs this host's Scratch root (diskm scratch-dir) and it could not be resolved; refusing to install a unit with no target" >&2
           exit 2
@@ -232,7 +246,6 @@ case "$action" in
         echo "SKIPPED: ${label} — no resolvable Scratch root on this host" >&2
         continue
       fi
-      dest="${TARGET_DIR}/${label}.plist"
       candidate="${dest}.candidate.$$"
       backup="${dest}.backup.$$"
       had_prior=0
@@ -241,8 +254,8 @@ case "$action" in
         DASHBOARD_PLIST_CANDIDATE="${candidate}"
         DASHBOARD_PLIST_BACKUP="${backup}"
       fi
-      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" \
-          -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_RESOLVED}|g" "$tmpl" > "$candidate"
+      sed -e "s|@HOME@|${HOME_SED}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR_SED}|g" \
+          -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_SED}|g" "$tmpl" > "$candidate"
       if [[ "${label}" == "${DASHBOARD_LABEL}" && -n "${DOCKER_HOST_OVERRIDE:-}" ]]; then
         python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" <<'PY'
 import plistlib

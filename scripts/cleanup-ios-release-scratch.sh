@@ -63,11 +63,11 @@ fi
 
 # Resolve the Scratch root the same way the workflow does. Never guess /tmp:
 # a wrong root here would either do nothing or, worse, match unrelated trees.
-if [[ -z "${SCRATCH_ROOT}" ]]; then
-  if command -v diskm >/dev/null 2>&1; then
-    SCRATCH_ROOT="$(diskm scratch-dir 2>/dev/null || true)"
-  fi
-fi
+# The root is supplied by the unit (install-time substitution) or the caller.
+# There is deliberately NO `diskm scratch-dir` fallback here: that call spins
+# indefinitely in a launchd session (measured 2026-10-30), and a deletion tool
+# must not introduce an unbounded hang into an unattended hourly job. Absent a
+# root, this fails closed below.
 case "${SCRATCH_ROOT}" in
   ""|/)        echo "FATAL: refusing invalid Scratch root '${SCRATCH_ROOT:-unset}'" >&2; exit 3 ;;
   /*)          ;;
@@ -98,9 +98,12 @@ log() {
   printf '%s [%s] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "${tag}" "$*" | tee -a "${LOG}"
 }
 
+# Returns the mtime epoch seconds, or empty when it cannot be read. Callers must
+# treat empty as "unsafe, skip": falling back to 0 would make a directory look
+# ~56 years old and defeat the only age-based guard this tool has.
 get_mtime() {
   local target="$1"
-  stat -f%m "${target}" 2>/dev/null || stat -c%Y "${target}" 2>/dev/null || echo 0
+  stat -f%m "${target}" 2>/dev/null || stat -c%Y "${target}" 2>/dev/null || true
 }
 
 # A dir is live if any process command line mentions it. Cheap process-table
@@ -112,9 +115,40 @@ get_mtime() {
 # pgrep never matches its own process. If pgrep is unavailable we fail closed
 # (treat as referenced) rather than risk deleting a live run's tree.
 dir_is_referenced() {
-  local target="$1"
-  command -v pgrep >/dev/null 2>&1 || return 0
-  pgrep -f -- "${target}" >/dev/null 2>&1
+  local target="$1" real snapshot p
+  # Canonical form of the candidate. On macOS /var, /tmp and /etc are symlinks
+  # into /private, so lsof reports "/private/var/..." for a process whose cwd is
+  # "/var/...". Comparing only the literal string silently misses a live process
+  # - reproduced 2026-10-30 before this canonicalisation existed. Unknown
+  # canonical form means we cannot verify liveness, so fail closed (skip).
+  real="$(cd -P -- "${target}" 2>/dev/null && pwd -P)" || return 0
+
+  if command -v pgrep >/dev/null 2>&1; then
+    # (a) argv scan. pgrep never matches itself, unlike a piped grep.
+    pgrep -f -- "${target}" >/dev/null 2>&1 && return 0
+    if [[ "${real}" != "${target}" ]] && pgrep -f -- "${real}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  # (b) open-file / cwd scan. An argv-only scan misses the realistic case: a
+  # long build whose cwd is inside the tree with the path absent from argv.
+  # `lsof -Fn` lists a path per open fd and cwd without walking the tree (that
+  # is `lsof +D`, which would be O(files) per candidate). Stream to a snapshot
+  # file rather than a shell variable: the full lsof listing is ~10 MB here.
+  command -v lsof >/dev/null 2>&1 || return 0
+  snapshot="$(mktemp "${TMPDIR:-/tmp}/iosrel-lsof.XXXXXX" 2>/dev/null)" || return 0
+  lsof -w -n -Fn >"${snapshot}" 2>/dev/null || true
+  for p in "${target}" "${real}"; do
+    # lsof prefixes each path with "n", so an exact cwd is "n<path>"; anything
+    # deeper matches the "<path>/" prefix.
+    if grep -Fq -- "${p}/" "${snapshot}" || grep -Fxq -- "n${p}" "${snapshot}"; then
+      rm -f "${snapshot}"
+      return 0
+    fi
+  done
+  rm -f "${snapshot}"
+  return 1
 }
 
 scanned=0; removed=0; skipped=0; freed_kb=0
@@ -131,6 +165,10 @@ while IFS= read -r -d '' d; do
   fi
 
   mtime="$(get_mtime "$d")"
+  if [[ -z "${mtime}" ]]; then
+    log "  SKIP unreadable mtime (fail closed): ${base}"
+    skipped=$((skipped+1)); continue
+  fi
   now="$(date +%s)"
   age_h=$(( (now - mtime) / 3600 ))
   if (( age_h < MIN_AGE_HOURS )); then
@@ -150,16 +188,17 @@ while IFS= read -r -d '' d; do
     continue
   fi
 
-  qdir="$(mktemp -d "${MANIFEST_DIR}/quarantine-XXXXXX")"
-  if mv "$d" "${qdir}/" 2>/dev/null; then
+  # Direct removal, no quarantine directory. A quarantine dir under $HOME sits
+  # on a DIFFERENT filesystem than the Scratch volume, so `mv` would degrade to
+  # a full cross-device copy of up to 2.4 GB per run onto the root disk before
+  # deleting it - the opposite of what this job is for, and a self-inflicted way
+  # to fill the volume that gates runner admission. The manifest below is the
+  # metadata record; the bytes are disposable scratch whose artifacts were
+  # published by the workflow before cleanup.
+  if rm -rf -- "$d" 2>/dev/null; then
     log "  REMOVED: ${d} (${sz_kb}K, ${age_h}h old)"
     removed=$((removed+1)); freed_kb=$((freed_kb + sz_kb))
-    echo "${d}  ${sz_kb}K  ${qdir}/${base}  ${age_h}h" >> "${MANIFEST}"
-    rm -rf "${qdir}" 2>/dev/null || true
-  elif rm -rf "$d" 2>/dev/null; then
-    log "  REMOVED (direct): ${d} (${sz_kb}K, ${age_h}h old)"
-    removed=$((removed+1)); freed_kb=$((freed_kb + sz_kb))
-    echo "${d}  ${sz_kb}K  direct_rm  ${age_h}h" >> "${MANIFEST}"
+    echo "${d}  ${sz_kb}K  ${age_h}h" >> "${MANIFEST}"
   else
     log "  FAIL (remove failed): ${d}"
   fi

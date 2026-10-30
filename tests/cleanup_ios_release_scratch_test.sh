@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="${REPO_ROOT}/scripts/cleanup-ios-release-scratch.sh"
 
 W="$(mktemp -d)"
-trap 'rm -rf "${W:?}"; [ -n "${LIVE_PID:-}" ] && kill "${LIVE_PID}" 2>/dev/null || true' EXIT
+trap 'rm -rf "${W:?}"; for p in "${LIVE_PID:-}" "${CWD_PID:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; true' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
@@ -41,12 +41,23 @@ mkdir -p "${RECENT}"
 UNRELATED="${SCR}/unrelated-dir"
 aged "${UNRELATED}"
 
-# A live process that references OLD_LIVE by path: the hung/multi-hour-run case.
-# Compound command, not `bash -c 'sleep 60'`: with a simple command bash execs
-# into it and the path argument disappears from the process table.
+OLD_CWD="${SCR}/worldai-ios-release-444-1"
+aged "${OLD_CWD}"
+
+# Two live processes, two different detection paths:
+#  (a) the path is in argv (a build invoked with the directory as an argument);
+#  (b) the path is NOT in argv at all - the process simply has its working
+#      directory inside the tree, which is the realistic long-build case and the
+#      exact false negative an argv-only scan produces.
+# Compound commands, not `bash -c 'sleep 60'`: with a simple command bash execs
+# into it and the argument/cwd association is lost.
 bash -c 'while :; do sleep 1; done' "${OLD_LIVE}" &
 LIVE_PID=$!
-sleep 0.3
+( cd "${OLD_CWD}" && exec bash -c 'while :; do sleep 1; done' ) &
+CWD_PID=$!
+sleep 0.5
+# Prove the cwd case really has no path in argv before relying on it.
+ps -o args= -p "${CWD_PID}" | grep -Fq "${OLD_CWD}" && fail "test setup: cwd-only process must not carry the path in argv"
 
 # 1. Dry-run must change nothing.
 SCRATCH_ROOT="${SCR}" bash "${S}" >/dev/null
@@ -56,7 +67,13 @@ pass "dry-run is non-destructive"
 # 2. --apply removes only the aged, correctly named, unreferenced dir.
 SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 [ ! -d "${OLD_OK}" ] || fail "aged completed release dir must be removed"
-[ -d "${OLD_LIVE}" ] || fail "dir referenced by a live process must be kept"
+[ -d "${OLD_LIVE}" ] || fail "dir referenced from a live process argv must be kept"
+[ -d "${OLD_CWD}" ] || fail "dir containing a live process working directory must be kept"
+# No quarantine copy may be created under HOME: HOME and the Scratch volume are
+# different filesystems, so a "quarantine" move would copy gigabytes onto the
+# root disk before deleting them.
+[ -z "$(find "${HOME}" -maxdepth 6 -name 'quarantine-*' -print -quit 2>/dev/null)" ] \
+  || fail "must not create a quarantine directory under HOME"
 [ -d "${OLD_BADNAME}" ] || fail "unrecognized dir name must be kept"
 [ -d "${RECENT}" ] || fail "recent release dir must be kept"
 [ -d "${UNRELATED}" ] || fail "non release-scratch dir must be kept"
@@ -71,6 +88,7 @@ pass "removal recorded in manifest"
 SCRATCH_ROOT="${SCR}" bash "${S}" --apply --min-age-hours 0 >/dev/null
 [ ! -d "${RECENT}" ] || fail "--min-age-hours 0 must admit the recent dir"
 [ -d "${OLD_LIVE}" ] || fail "live-referenced dir must stay protected regardless of age"
+[ -d "${OLD_CWD}" ] || fail "cwd-referenced dir must stay protected regardless of age"
 pass "min-age override honored, live protection independent of age"
 
 # 5. Unsafe Scratch roots are refused.

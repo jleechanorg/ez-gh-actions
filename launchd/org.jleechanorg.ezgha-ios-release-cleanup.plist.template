@@ -17,8 +17,10 @@
   an in-flight run is minutes old), and skips any dir referenced by a live
   process. Dry-run is the default; this unit passes the apply flag.
 
-  Portability note: the script resolves the Scratch root via `diskm
-  scratch-dir`, so PATH below must include the directory that provides diskm.
+  The Scratch root is substituted into EnvironmentVariables at INSTALL time by
+  launchd/install-launchagents.sh (it must not be resolved at runtime: `diskm
+  scratch-dir` spins indefinitely in a launchd session). The script itself has
+  no resolver fallback and fails closed without SCRATCH_ROOT.
 -->
 <plist version="1.0">
 <dict>
