@@ -87,7 +87,11 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup"
+  # Every launchd agent this installer can create must be listed here: uninstall
+  # unloads each before removing ~/.local/libexec/ezgha, so an omitted name leaves
+  # a loaded hourly job pointing at a deleted script (the dead-path class this
+  # file already documents above).
+  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup ios-release-cleanup"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -814,6 +818,21 @@ PLIST
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
+
+    # Reclaims stale per-run iOS TestFlight release scratch
+    # (`<scratch>/worldai-ios-release-<run>-<attempt>`) for another repository's
+    # workflow, which cleans only its signing key - measured 2026-10-30 at 24 dirs
+    # / 49 GB, leaving the Scratch volume (shared with runner.workspace_host_path)
+    # at 2.0 GiB free mid-build.
+    #
+    # Installed through launchd/install-launchagents.sh because the unit needs the
+    # host's Scratch root resolved at INSTALL time (see the SCRATCH_ROOT note there).
+    # Deliberately non-fatal and placed after the safety units above: this is a
+    # cross-repo cleanup job, and it must never abort a fresh-machine install or
+    # stop the Colima disk guard from being installed.
+    if ! bash "${SCRIPT_DIR}/launchd/install-launchagents.sh" install org.jleechanorg.ezgha-ios-release-cleanup; then
+      warn "iOS release-scratch reaper not installed (Scratch root unresolved?) — stale worldai-ios-release-* dirs on the Scratch volume will accumulate. OPERATOR-ONLY remediation: install that single launchd label through the repo's launchd template installer."
+    fi
     # ── Guest-native fstrim cadence — the actual root cause fix, not just the guard ──
     # colima-trim-guard.sh is a host-side EMERGENCY safety net (fires only when
     # host free space drops below 40GiB) and has twice proven unreliable (stale

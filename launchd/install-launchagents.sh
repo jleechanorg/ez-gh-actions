@@ -51,6 +51,40 @@ if [[ "$action" == "install" && -n "$label_filter" ]]; then
   fi
 fi
 
+# Templates that need this host's Scratch root (currently only the iOS
+# release-scratch reaper) must NOT call `diskm scratch-dir` from launchd:
+# measured 2026-10-30, that python uv-tool call spins indefinitely in a launchd
+# session (it answers in ~4s interactively), which wedged the first installed
+# copy of the job. Resolve it here, once, at install time, and substitute it.
+#
+# If it cannot be resolved (no diskm, e.g. CI), the affected template is SKIPPED
+# rather than loaded with an unsubstituted placeholder: a reaper with no target
+# would either do nothing or hang. A targeted install of that label still fails
+# loudly; a bulk install carries on and reports it.
+SCRATCH_ROOT_RESOLVED=""
+if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
+  if command -v diskm >/dev/null 2>&1; then
+    SCRATCH_ROOT_RESOLVED="$(diskm scratch-dir 2>/dev/null || true)"
+    SCRATCH_ROOT_RESOLVED="${SCRATCH_ROOT_RESOLVED%/}"
+  fi
+  case "${SCRATCH_ROOT_RESOLVED}" in
+    /*) ;;
+    *)
+      SCRATCH_ROOT_RESOLVED=""
+      echo "WARNING: could not resolve this host's Scratch root (diskm scratch-dir returned empty or diskm is absent) — any template requiring @SCRATCH_ROOT@ will be skipped" >&2
+      ;;
+  esac
+fi
+
+# sed replacement text treats & (whole match) and the | delimiter specially, and
+# a literal backslash needs doubling. Escape all three so a legal Scratch root or
+# HOME containing them renders verbatim instead of corrupting the plist.
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+sed_escape() { xml_escape "$1" | sed -e 's/[\\&|]/\\&/g'; }
+HOME_SED="$(sed_escape "${HOME}")"
+SCRIPTS_DIR_SED="$(sed_escape "${SCRIPTS_DIR}")"
+SCRATCH_ROOT_SED="$(sed_escape "${SCRATCH_ROOT_RESOLVED}")"
+
 # Guard: fail loudly if a rendered plist still references a repo/worktree
 # checkout path or has an unsubstituted @...@ placeholder left in it. A
 # passing guard here is what would have caught the ez-gh-actions-sa1t
@@ -198,6 +232,31 @@ case "$action" in
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"
       dest="${TARGET_DIR}/${label}.plist"
+      if grep -q '@SCRATCH_ROOT@' "$tmpl" && [[ -z "${SCRATCH_ROOT_RESOLVED}" ]]; then
+        # A previously installed copy must not survive this state: it would keep
+        # firing hourly at a target this host can no longer resolve.
+        if [[ -f "${dest}" ]]; then
+          launchctl unload "${dest}" 2>/dev/null || true
+          # Verify the stop instead of assuming it: a still-loaded hourly
+          # --apply job with an old root is worse than no unit at all. `bootout`
+          # by label is the reliable stop when `unload` is a no-op.
+          if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+            launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+          fi
+          if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+            echo "ERROR: ${label} is still loaded and could not be stopped; refusing to continue with an unverifiable unit" >&2
+            exit 1
+          fi
+          rm -f "${dest}"
+          echo "UNLOADED and removed stale ${label} — its Scratch root can no longer be resolved" >&2
+        fi
+        if [[ -n "${label_filter}" ]]; then
+          echo "ERROR: ${label} needs this host's Scratch root (diskm scratch-dir) and it could not be resolved; refusing to install a unit with no target" >&2
+          exit 2
+        fi
+        echo "SKIPPED: ${label} — no resolvable Scratch root on this host" >&2
+        continue
+      fi
       candidate="${dest}.candidate.$$"
       backup="${dest}.backup.$$"
       had_prior=0
@@ -206,7 +265,8 @@ case "$action" in
         DASHBOARD_PLIST_CANDIDATE="${candidate}"
         DASHBOARD_PLIST_BACKUP="${backup}"
       fi
-      sed -e "s|@HOME@|${HOME}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR}|g" "$tmpl" > "$candidate"
+      sed -e "s|@HOME@|${HOME_SED}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR_SED}|g" \
+          -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_SED}|g" "$tmpl" > "$candidate"
       if [[ "${label}" == "${DASHBOARD_LABEL}" && -n "${DOCKER_HOST_OVERRIDE:-}" ]]; then
         python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" <<'PY'
 import plistlib
