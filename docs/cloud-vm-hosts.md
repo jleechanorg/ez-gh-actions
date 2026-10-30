@@ -26,10 +26,9 @@ It is not a bypass:
   `policy.host_containment = "vm" requires a virtualized host …`;
 - the probe proves the machine *is* a VM, not that the VM belongs to the runners. It looks
   for `hypervisor` on `flags` lines in `/proc/cpuinfo`; arm64 guests print `Features`
-  instead, so an arm64 microVM fails closed unless `/sys/hypervisor/type` exists. The
-  The labels and measurements here assume X64. Use it
+  instead, so an arm64 microVM fails closed unless `/sys/hypervisor/type` exists. Use it
   only on a VM dedicated to runner work — another tenant's workload is outside the
-  boundary you are claiming. (A Xen dom0 also exposes `/sys/hypervisor/type` while
+  boundary you are claiming. (The labels and measurements in this document assume X64.) (A Xen dom0 also exposes `/sys/hypervisor/type` while
   effectively being the host, so the probe alone is not a licence to relax anything on
   bare metal);
 - the default (`auto`) keeps the existing `actions.slice` requirement, so bare-metal and
