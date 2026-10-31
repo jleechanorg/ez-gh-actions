@@ -13,9 +13,11 @@
   runner.workspace_host_path for the mac runner fleet. Bead: jleechan-nvke.
 
   Safety: the script only matches that exact name pattern directly under the
-  resolved Scratch root, only dirs at least MIN_AGE_HOURS old (default 48h,
-  an in-flight run is minutes old), and skips any dir referenced by a live
-  process. Dry-run is the default; this unit passes the apply flag.
+  resolved Scratch root, only dirs at least MIN_AGE_HOURS old (default 4h;
+  a TestFlight run takes ~35 min, so that is ~7x margin, and the real guard is
+  the producer's completed+success signal plus the three liveness scans), and
+  skips any dir referenced by a live process. Dry-run is the default; this unit
+  passes the apply flag.
 
   The Scratch root is substituted into EnvironmentVariables at INSTALL time by
   launchd/install-launchagents.sh (it must not be resolved at runtime: `diskm
@@ -41,7 +43,7 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:@HOME@/.local/bin</string>
         <key>MIN_AGE_HOURS</key>
-        <string>48</string>
+        <string>4</string>
         <key>SCRATCH_ROOT</key>
         <string>@SCRATCH_ROOT@</string>
     </dict>

@@ -19,8 +19,12 @@
 # Safety:
 #   - Only directories matching `worldai-ios-release-<digits>-<digits>` directly
 #     under the resolved Scratch root are considered.
-#   - Only dirs whose mtime is at least MIN_AGE_HOURS old (default 48h) are
-#     eligible; an in-flight TestFlight run is minutes old, never days.
+#   - Only dirs whose mtime is at least MIN_AGE_HOURS old (default 4h) are
+#     eligible. A TestFlight run takes ~35 min end to end, so 4h is ~7x margin;
+#     the real safety property is the producer completion signal below plus the
+#     three liveness scans, not the age floor. (Observed arrival rate is ~1 run
+#     per hour at ~2.4 GB each, so a long age floor refills the shared 200 GiB
+#     Scratch volume faster than anything becomes eligible.)
 #   - A dir referenced by any live process command line is skipped (covers a
 #     hung/multi-hour run, the only realistic path to an aged-but-live dir).
 #   - The Scratch root is validated: must resolve to an existing absolute
@@ -28,6 +32,13 @@
 #   - Only runs whose producer reports `completed`/`success` are reaped. Failed
 #     and cancelled runs are retained on purpose: their scratch is the cheapest
 #     debugging evidence for a broken build, and their count is small.
+#   - The run's LATEST attempt is reaped on the MIN_AGE_HOURS floor. An EARLIER
+#     attempt directory of an otherwise successful run (a re-run superseded it)
+#     is reaped only once it is also older than MIN_AGE_HOURS_RERUN (default
+#     168h = 7 days), a long grace so the superseded attempt's tree stays
+#     available as evidence for a week without being pinned forever. The
+#     producer's success signal is still required for both: a re-run whose run
+#     ultimately failed keeps every attempt dir.
 #   - A process that inherited the path in its environment and outlives every run
 #     (a long-lived build daemon) pins that directory forever: the env scan keeps
 #     skipping it. That fails safe (leaks, never deletes) and is visible in the log.
@@ -40,8 +51,13 @@
 #
 # Usage: cleanup-ios-release-scratch.sh [--apply] [--min-age-hours N] [--scratch-root PATH]
 #   --apply             actually remove eligible dirs (default: dry-run)
-#   --min-age-hours N   override the 48h default (env MIN_AGE_HOURS also works)
+#   --min-age-hours N   override the 4h default (env MIN_AGE_HOURS also works)
 #   --scratch-root P    override Scratch root resolution (env SCRATCH_ROOT too)
+#
+# Environment:
+#   MIN_AGE_HOURS         age floor for a run's LATEST attempt dir (default 4)
+#   MIN_AGE_HOURS_RERUN   age floor for an EARLIER attempt dir of a successful
+#                         run (default 168 = 7 days)
 #
 # Invoked by:
 #   macOS launchd: org.jleechanorg.ezgha-ios-release-cleanup (hourly)
@@ -49,7 +65,11 @@
 set -euo pipefail
 
 DRY_RUN=true
-MIN_AGE_HOURS="${MIN_AGE_HOURS:-48}"
+MIN_AGE_HOURS="${MIN_AGE_HOURS:-4}"
+# Grace applied to a superseded (non-latest) attempt dir of a successful run.
+# Longer than the latest-attempt floor on purpose: that tree is the debugging
+# evidence of an attempt that was re-run, not of the run's final outcome.
+MIN_AGE_HOURS_RERUN="${MIN_AGE_HOURS_RERUN:-168}"
 SCRATCH_ROOT="${SCRATCH_ROOT:-}"
 # The workflow that owns these directories. Each run directory carries its run
 # id, so the reaper can require positive evidence that the run FINISHED instead
@@ -71,13 +91,17 @@ while [[ $# -gt 0 ]]; do
     --repo=*)          PRODUCER_REPO="${1#*=}"; shift ;;
     --max-deletions)   MAX_DELETIONS="$2"; shift 2 ;;
     --max-deletions=*) MAX_DELETIONS="${1#*=}"; shift ;;
-    -h|--help)         sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help)         sed -n '2,60p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 if ! [[ "${MIN_AGE_HOURS}" =~ ^[0-9]+$ ]]; then
   echo "FATAL: --min-age-hours must be a non-negative integer, got '${MIN_AGE_HOURS}'" >&2
+  exit 2
+fi
+if ! [[ "${MIN_AGE_HOURS_RERUN}" =~ ^[0-9]+$ ]]; then
+  echo "FATAL: MIN_AGE_HOURS_RERUN must be a non-negative integer, got '${MIN_AGE_HOURS_RERUN}'" >&2
   exit 2
 fi
 
@@ -259,14 +283,17 @@ get_mtime() {
   stat -f%m "${target}" 2>/dev/null || stat -c%Y "${target}" 2>/dev/null || true
 }
 
-# Positive completion signal: ask the producer whether that exact run+attempt is
-# finished. Fails closed - an unreadable/absent `gh`, an API error, or any status
-# other than "completed" means "do not delete". Age and process checks remain as
-# defence in depth, but they can never establish completion on their own: a run
-# can sit between build, upload and receipt steps with no process touching the
-# tree, and writes inside existing children need not refresh the parent mtime.
-run_is_completed() {
-  local run_id="$1" dir_attempt="$2" out rc=0 status conclusion
+# Positive completion signal: ask the producer whether that exact run is
+# finished and successful. Fails closed - an unreadable/absent `gh`, an API
+# error, or any status other than completed+success means "do not delete".
+#
+# Prints the run's LATEST attempt number on stdout when the producer reports
+# `completed` AND `success`; returns non-zero otherwise. Which attempt directory
+# may then be reaped is the caller's retention decision (MIN_AGE_HOURS for the
+# latest attempt, MIN_AGE_HOURS_RERUN for a superseded one), so this function
+# only answers "did the run end successfully, and which attempt is current".
+run_completed_attempt() {
+  local run_id="$1" out rc=0 status conclusion attempt
   command -v "${GH_BIN}" >/dev/null 2>&1 || return 1
   [[ -n "${GH_OUT_FILE}" ]] || return 1
   # Bounded wait: `gh` has no per-call timeout and this host can be extremely
@@ -284,15 +311,17 @@ run_is_completed() {
   wait "${gh_pid}" || rc=$?
   [[ ${rc} -eq 0 ]] || return 1
   out="$(cat "${GH_OUT_FILE}" 2>/dev/null || true)"
-  IFS=$'\t' read -r status conclusion _attempt <<<"${out}"
+  IFS=$'\t' read -r status conclusion attempt <<<"${out}"
   # Only a SUCCESSFUL run is reaped. "completed" alone also covers failed and
   # cancelled runs, whose scratch may still be wanted for diagnosis - those are
-  # retained deliberately (documented retention rule; see header).
-  # Only the LATEST attempt of a successful run is reaped. A re-run's earlier
-  # attempt directory is retained: it holds that attempt's failure evidence, and
-  # it falls under the same "failed runs are retained" rule. The cost is that
-  # re-run attempt-1 dirs are not reclaimed; re-runs are rare.
-  [[ "${status}" == "completed" && "${conclusion}" == "success" && "${dir_attempt}" == "${_attempt}" ]]
+  # retained deliberately (documented retention rule; see header). Age and
+  # process checks remain as defence in depth, but they can never establish
+  # completion on their own: a run can sit between build, upload and receipt
+  # steps with no process touching the tree, and writes inside existing children
+  # need not refresh the parent mtime.
+  [[ "${status}" == "completed" && "${conclusion}" == "success" ]] || return 1
+  [[ "${attempt}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${attempt}"
 }
 
 # A dir is live if any process command line mentions it. Cheap process-table
@@ -367,7 +396,13 @@ dir_is_referenced() {
 
 scanned=0; removed=0; skipped=0; failed=0; freed_kb=0
 
-log "=== start (DRY_RUN=${DRY_RUN} MIN_AGE_HOURS=${MIN_AGE_HOURS} SCRATCH_ROOT=${SCRATCH_ROOT}) ==="
+# Human-readable form of the re-run grace for the SKIP log line: whole days when
+# the knob is a whole number of days (the 168h default reads as "7d"), exact
+# hours otherwise, so the message always matches the configured value.
+RERUN_GRACE_LABEL="$(( MIN_AGE_HOURS_RERUN / 24 ))d"
+(( MIN_AGE_HOURS_RERUN % 24 == 0 )) || RERUN_GRACE_LABEL="${MIN_AGE_HOURS_RERUN}h"
+
+log "=== start (DRY_RUN=${DRY_RUN} MIN_AGE_HOURS=${MIN_AGE_HOURS} MIN_AGE_HOURS_RERUN=${MIN_AGE_HOURS_RERUN} SCRATCH_ROOT=${SCRATCH_ROOT}) ==="
 
 while IFS= read -r -d '' d; do
   base="$(basename "$d")"
@@ -393,8 +428,17 @@ while IFS= read -r -d '' d; do
   run_id="${base#worldai-ios-release-}"
   run_id="${run_id%-*}"
   attempt="${base##*-}"
-  if ! run_is_completed "${run_id}" "${attempt}"; then
+  latest_attempt=""
+  if ! latest_attempt="$(run_completed_attempt "${run_id}")"; then
     log "  SKIP run not proven completed in ${PRODUCER_REPO} (fail closed): ${base}"
+    skipped=$((skipped+1)); continue
+  fi
+  # A superseded attempt dir (the run has since been re-run) is the evidence of
+  # an attempt that is no longer current. It is reaped, but only past the much
+  # longer MIN_AGE_HOURS_RERUN floor - otherwise it stayed pinned forever even
+  # though the run as a whole succeeded and nothing will ever touch it again.
+  if [[ "${attempt}" != "${latest_attempt}" ]] && (( age_h < MIN_AGE_HOURS_RERUN )); then
+    log "  SKIP earlier attempt younger than ${RERUN_GRACE_LABEL} (${age_h}h < ${MIN_AGE_HOURS_RERUN}h, latest=${latest_attempt}): ${base}"
     skipped=$((skipped+1)); continue
   fi
 
