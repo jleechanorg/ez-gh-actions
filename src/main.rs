@@ -413,25 +413,115 @@ impl BackendRecoveryState {
     }
 }
 
-fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Result<bool> {
+/// Outcome of one backend-recovery command. The output is captured (rather than
+/// discarded) so a failure can be *classified* instead of only counted: Lima's
+/// "in use by instance" attach-disk fatal is a recoverable stale lock, not a
+/// generic start failure (bead jleechan-9p0g).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CommandOutcome {
+    success: bool,
+    /// Combined stdout+stderr, tail-capped at `COMMAND_OUTPUT_TAIL_CAP` bytes.
+    /// The tail is what matters: a fatal is the last thing written.
+    output: String,
+}
+
+/// Cap on how much command output is read back. Colima/limactl fatals are a few
+/// lines; the cap only bounds memory if a command goes chatty.
+const COMMAND_OUTPUT_TAIL_CAP: u64 = 8 * 1024;
+
+fn command_capture_path() -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "ezgha-command-capture-{}-{seq}.log",
+        std::process::id()
+    ))
+}
+
+/// Last non-empty line of captured output, trimmed and length-capped — enough for
+/// a journal line or an alert body to name the failure.
+fn command_output_summary(output: &str) -> String {
+    const CAP: usize = 300;
+    let line = output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    line.chars().take(CAP).collect()
+}
+
+fn read_capture_tail(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    if len > COMMAND_OUTPUT_TAIL_CAP {
+        let _ = file.seek(SeekFrom::Start(len - COMMAND_OUTPUT_TAIL_CAP));
+    }
+    let mut buffer = Vec::new();
+    let _ = file.read_to_end(&mut buffer);
+    String::from_utf8_lossy(&buffer).into_owned()
+}
+
+/// Run `cmd` with `args` and `env`, capturing combined stdout+stderr, killing the
+/// whole process group if the command outlives `timeout`.
+fn run_command_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    env: &[(&str, std::ffi::OsString)],
+    timeout: Duration,
+) -> Result<CommandOutcome> {
+    // Output goes to a temp file, not a pipe: a piped child that fills the pipe
+    // buffer blocks before we can observe its exit, so the poll loop below would
+    // kill a command that had already finished.
+    let capture_path = command_capture_path();
+    let capture = {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Owner-only: the captured output names host paths and VM state.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&capture_path).with_context(|| {
+            format!(
+                "failed to create command capture file {}",
+                capture_path.display()
+            )
+        })?
+    };
+    let stdout = capture
+        .try_clone()
+        .with_context(|| format!("failed to duplicate the capture file for {cmd}"))?;
     let mut command = Command::new(cmd);
     command
         .args(args)
+        .envs(
+            env.iter()
+                .map(|(key, value)| (*key, value.as_os_str().to_owned())),
+        )
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(capture));
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to execute {cmd}"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = std::fs::remove_file(&capture_path);
+            return Err(err).with_context(|| format!("failed to execute {cmd}"));
+        }
+    };
     let start = Instant::now();
-    loop {
+    let status = loop {
         if let Some(status) = child
             .try_wait()
             .with_context(|| format!("failed to poll {cmd}"))?
         {
-            return Ok(status.success());
+            break status;
         }
         if start.elapsed() >= timeout {
             #[cfg(unix)]
@@ -440,13 +530,27 @@ fn run_restart_command_with_timeout(cmd: &str, args: &[&str], timeout: Duration)
             }
             let _ = child.kill();
             let _ = child.wait();
-            bail!(
-                "{cmd} restart command timed out after {}s",
-                timeout.as_secs()
-            );
+            let _ = std::fs::remove_file(&capture_path);
+            bail!("{cmd} command timed out after {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    let output = read_capture_tail(&capture_path);
+    let _ = std::fs::remove_file(&capture_path);
+    Ok(CommandOutcome {
+        success: status.success(),
+        output,
+    })
+}
+
+/// Restart-command runner used by production: the same machinery, no extra
+/// environment.
+fn run_restart_command_with_timeout(
+    cmd: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<CommandOutcome> {
+    run_command_with_timeout(cmd, args, &[], timeout)
 }
 
 /// Timing knobs for `attempt_backend_restart_with`, factored out of the hardcoded
@@ -548,17 +652,144 @@ fn backend_restart_commands(os: &str) -> &'static [RestartCommand] {
     }
 }
 
-fn attempt_backend_restart_with<R, H>(
+/// Marker Lima prints when it refuses to attach a data disk that a previous,
+/// killed start still holds:
+///
+/// ```text
+/// fatal: failed to run attach disk "colima", in use by instance "colima"
+/// ```
+///
+/// The lock lives at `$LIMA_HOME/_disks/<disk>/in_use_by`; while it exists every
+/// start fails in under a second, so the daemon never recovers on its own — the
+/// 2026-10-29 incident (bead jleechan-9p0g).
+const STALE_DISK_LOCK_MARKER: &str = "in use by instance";
+
+/// Extract the disk name a stale-lock fatal names, or `None` when the output is
+/// not that fatal. In Colima's default layout the disk is named after the
+/// instance, which is why `limactl disk unlock <name>` addresses it either way.
+fn stale_disk_lock_disk_name(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .find(|line| line.contains(STALE_DISK_LOCK_MARKER))?;
+    quoted_after(line, "attach disk ").or_else(|| quoted_after(line, "instance "))
+}
+
+fn quoted_after(line: &str, marker: &str) -> Option<String> {
+    let rest = line.split(marker).nth(1)?;
+    let rest = &rest[rest.find('"')? + 1..];
+    let name = rest[..rest.find('"')?].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// What a stale-lock recovery did, kept distinct from a generic start failure so
+/// the journal and the alert channel name this failure mode explicitly (bead
+/// jleechan-9p0g item 3). Whether the start then recovered is
+/// `BackendRestartOutcome::recovered`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaleLockOutcome {
+    /// The stale disk lock was cleared; one start retry followed.
+    Unlocked,
+    /// `limactl disk unlock` itself failed, so nothing was retried.
+    UnlockFailed(String),
+    /// Deliberately not unlocked — the instance reported Running, or its state
+    /// could not be confirmed. Unlocking a disk a live instance is using is
+    /// corruption, not recovery.
+    NotUnlocked(String),
+}
+
+/// Result of one backend-restart attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackendRestartOutcome {
+    recovered: bool,
+    stale_lock: Option<StaleLockOutcome>,
+}
+
+/// `limactl list` is a local read of the Lima state dir; a hung one must not eat
+/// the caller's restart budget, so it gets its own short ceiling.
+const LIMA_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Colima's Lima home, which is where the stale `in_use_by` lock lives — the same
+/// path the 2026-10-29 recovery used
+/// (`LIMA_HOME=~/.colima/_lima limactl disk unlock colima`).
+const COLIMA_LIMA_HOME_RELATIVE: &str = ".colima/_lima";
+
+/// Interpret `limactl list --format '{{.Status}}'`: `Some(true)` means running
+/// (never unlock), `Some(false)` means stopped, `None` means unrecognized — which
+/// callers must treat as unsafe rather than guess. Line-based so a trailing newline
+/// or a filter that matched more than one entry still parses; if any entry reports
+/// `Running`, the answer is "running", because that is the safe direction.
+fn interpret_limactl_status(status: &str) -> Option<bool> {
+    let running = status.lines().any(|line| line.trim() == "Running");
+    let stopped = status.lines().any(|line| line.trim() == "Stopped");
+    match (running, stopped) {
+        (true, _) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => None,
+    }
+}
+
+/// Is the Lima instance actually running? Fails closed: a non-zero exit or an
+/// unrecognized status is an error, so the caller refuses to unlock.
+fn lima_instance_running(instance: &str) -> Result<bool> {
+    let outcome = run_command_with_timeout(
+        "limactl",
+        &["list", instance, "--format", "{{.Status}}"],
+        &[],
+        LIMA_STATE_PROBE_TIMEOUT,
+    )?;
+    if !outcome.success {
+        bail!(
+            "limactl list {instance} exited non-zero: {}",
+            command_output_summary(&outcome.output)
+        );
+    }
+    interpret_limactl_status(&outcome.output).ok_or_else(|| {
+        anyhow::anyhow!(
+            "limactl list {instance} reported an unrecognized status: {}",
+            command_output_summary(&outcome.output)
+        )
+    })
+}
+
+/// The operator recovery from the 2026-10-29 incident, automated:
+/// `LIMA_HOME=~/.colima/_lima limactl disk unlock <disk>`.
+fn run_limactl_disk_unlock(disk: &str, timeout: Duration) -> Result<CommandOutcome> {
+    let lima_home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("~"))
+        .join(COLIMA_LIMA_HOME_RELATIVE);
+    run_command_with_timeout(
+        "limactl",
+        &["disk", "unlock", disk],
+        &[("LIMA_HOME", lima_home.into_os_string())],
+        timeout,
+    )
+}
+
+/// Try each backend restart command in turn. When a failure's output carries
+/// Lima's stale-disk-lock fatal, unlock that disk once and retry the same command
+/// once (bead jleechan-9p0g): a killed cold boot leaves the lock behind and, while
+/// it exists, every later start fails instantly.
+///
+/// `instance_running` guards the unlock — a disk a live instance is using must
+/// never be unlocked — and `unlock_disk` runs behind the same command-timeout
+/// machinery as the restart commands themselves.
+fn attempt_backend_restart_with<R, H, P, U>(
     commands: &[RestartCommand],
     deadline: Option<Instant>,
     timing: BackendRestartTiming,
     mut run: R,
     mut backend_healthy: H,
-) -> Result<bool>
+    mut instance_running: P,
+    mut unlock_disk: U,
+) -> Result<BackendRestartOutcome>
 where
-    R: FnMut(&str, &[&str], Duration) -> Result<bool>,
+    R: FnMut(&str, &[&str], Duration) -> Result<CommandOutcome>,
     H: FnMut() -> bool,
+    P: FnMut(&str) -> Result<bool>,
+    U: FnMut(&str, Duration) -> Result<CommandOutcome>,
 {
+    let mut stale_lock: Option<StaleLockOutcome> = None;
     for (cmd, args) in commands {
         let timeout = match timing.clamped_restart_timeout(deadline) {
             Some(t) => t,
@@ -568,29 +799,14 @@ where
                      (fail-fast — avoiding a restart the outer deadline would kill mid-flight)",
                     timing.min_budget
                 );
-                return Ok(false);
+                return Ok(BackendRestartOutcome {
+                    recovered: false,
+                    stale_lock,
+                });
             }
         };
-        match run(cmd, args, timeout) {
-            Ok(true) => {
-                let health_timeout = timing.clamped_health_poll_timeout(deadline);
-                if poll_backend_healthy(
-                    &mut backend_healthy,
-                    health_timeout,
-                    timing.health_poll_interval,
-                ) {
-                    return Ok(true);
-                }
-                eprintln!(
-                    "{cmd} restart command returned success but Docker did not become \
-                     reachable within {:?}",
-                    health_timeout
-                );
-                return Ok(false);
-            }
-            Ok(false) => {
-                eprintln!("{cmd} exists but restart returned non-zero ({:?})", args);
-            }
+        let outcome = match run(cmd, args, timeout) {
+            Ok(outcome) => outcome,
             Err(err) => {
                 if let Some(io) = err.downcast_ref::<std::io::Error>() {
                     if io.kind() == std::io::ErrorKind::NotFound {
@@ -598,17 +814,166 @@ where
                     }
                 }
                 eprintln!("{cmd} restart command failed: {err:#}");
+                continue;
+            }
+        };
+        if outcome.success {
+            let health_timeout = timing.clamped_health_poll_timeout(deadline);
+            if poll_backend_healthy(
+                &mut backend_healthy,
+                health_timeout,
+                timing.health_poll_interval,
+            ) {
+                return Ok(BackendRestartOutcome {
+                    recovered: true,
+                    stale_lock,
+                });
+            }
+            eprintln!(
+                "{cmd} restart command returned success but Docker did not become \
+                 reachable within {:?}",
+                health_timeout
+            );
+            return Ok(BackendRestartOutcome {
+                recovered: false,
+                stale_lock,
+            });
+        }
+        eprintln!(
+            "{cmd} exists but restart returned non-zero ({:?}): {}",
+            args,
+            command_output_summary(&outcome.output)
+        );
+        let Some(disk) = stale_disk_lock_disk_name(&outcome.output) else {
+            continue;
+        };
+        if stale_lock.is_some() {
+            eprintln!(
+                "stale Lima disk lock on \"{disk}\": already unlocked once during this attempt; \
+                 not unlocking again"
+            );
+            continue;
+        }
+        // Blast-radius guard: only clear a lock the instance itself is not using.
+        match instance_running(&disk) {
+            Ok(true) => {
+                let reason = format!("instance \"{disk}\" reports Running");
+                eprintln!("stale Lima disk lock on \"{disk}\": {reason} — refusing to unlock");
+                return Ok(BackendRestartOutcome {
+                    recovered: false,
+                    stale_lock: Some(StaleLockOutcome::NotUnlocked(reason)),
+                });
+            }
+            Ok(false) => {}
+            Err(err) => {
+                let reason = format!("instance state could not be confirmed: {err:#}");
+                eprintln!("stale Lima disk lock on \"{disk}\": {reason} — refusing to unlock");
+                return Ok(BackendRestartOutcome {
+                    recovered: false,
+                    stale_lock: Some(StaleLockOutcome::NotUnlocked(reason)),
+                });
+            }
+        }
+        eprintln!(
+            "stale Lima disk lock on \"{disk}\": instance is stopped; unlocking and retrying \
+             {cmd} once"
+        );
+        let unlock_timeout = match timing.clamped_restart_timeout(deadline) {
+            Some(t) => t,
+            None => {
+                let reason = format!(
+                    "remaining startup budget below {:?} floor, so the unlock was not attempted",
+                    timing.min_budget
+                );
+                eprintln!("stale Lima disk lock on \"{disk}\": {reason}");
+                return Ok(BackendRestartOutcome {
+                    recovered: false,
+                    stale_lock: Some(StaleLockOutcome::NotUnlocked(reason)),
+                });
+            }
+        };
+        let unlock_failure = match unlock_disk(&disk, unlock_timeout) {
+            Ok(unlock) if unlock.success => None,
+            Ok(unlock) => {
+                let summary = command_output_summary(&unlock.output);
+                Some(if summary.is_empty() {
+                    format!("limactl disk unlock {disk} exited non-zero with no output")
+                } else {
+                    summary
+                })
+            }
+            Err(err) => Some(format!("{err:#}")),
+        };
+        if let Some(detail) = unlock_failure {
+            eprintln!("stale Lima disk lock; unlock failed: {detail}");
+            return Ok(BackendRestartOutcome {
+                recovered: false,
+                stale_lock: Some(StaleLockOutcome::UnlockFailed(detail)),
+            });
+        }
+        stale_lock = Some(StaleLockOutcome::Unlocked);
+        // Exactly one retry: the lock is either cleared now, or this is a real
+        // failure for the remaining commands / the next attempt to handle.
+        let retry_timeout = match timing.clamped_restart_timeout(deadline) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "stale Lima disk lock; unlocked but remaining startup budget is below the \
+                     {:?} floor — not retrying {cmd}",
+                    timing.min_budget
+                );
+                continue;
+            }
+        };
+        match run(cmd, args, retry_timeout) {
+            Ok(retry) if retry.success => {
+                let health_timeout = timing.clamped_health_poll_timeout(deadline);
+                if poll_backend_healthy(
+                    &mut backend_healthy,
+                    health_timeout,
+                    timing.health_poll_interval,
+                ) {
+                    eprintln!(
+                        "stale Lima disk lock; unlocked and retried: {cmd} recovered the backend"
+                    );
+                    return Ok(BackendRestartOutcome {
+                        recovered: true,
+                        stale_lock,
+                    });
+                }
+                eprintln!(
+                    "stale Lima disk lock; unlocked and retried, but Docker did not become \
+                     reachable within {:?}",
+                    health_timeout
+                );
+                return Ok(BackendRestartOutcome {
+                    recovered: false,
+                    stale_lock,
+                });
+            }
+            Ok(retry) => {
+                eprintln!(
+                    "stale Lima disk lock; unlocked and retried, but {cmd} still returned \
+                     non-zero: {}",
+                    command_output_summary(&retry.output)
+                );
+            }
+            Err(err) => {
+                eprintln!("stale Lima disk lock; unlocked and retried, but {cmd} failed: {err:#}");
             }
         }
     }
-    Ok(false)
+    Ok(BackendRestartOutcome {
+        recovered: false,
+        stale_lock,
+    })
 }
 
 /// `deadline` is the caller's own outer budget (e.g. wait_for_backend's startup
 /// window), if any. `None` means "no outer deadline to protect" — used by the main
 /// serve loop, which is not time-boxed the way service startup is (out of scope for
 /// this fix; see bead jleechan-9c7l finding #3).
-fn attempt_backend_restart(deadline: Option<Instant>) -> Result<bool> {
+fn attempt_backend_restart(deadline: Option<Instant>) -> Result<BackendRestartOutcome> {
     let platform = platform::detect();
     attempt_backend_restart_with(
         backend_restart_commands(platform.os),
@@ -616,6 +981,8 @@ fn attempt_backend_restart(deadline: Option<Instant>) -> Result<bool> {
         BackendRestartTiming::PRODUCTION,
         run_restart_command_with_timeout,
         docker_reachable,
+        lima_instance_running,
+        run_limactl_disk_unlock,
     )
 }
 
@@ -633,6 +1000,43 @@ fn backend_restart_can_help(selection: &Selection) -> bool {
 /// `deadline` is forwarded to `attempt_backend_restart` — `Some(_)` when the caller
 /// has its own outer time budget to protect (e.g. wait_for_backend's startup window),
 /// `None` for callers with no such budget (e.g. the main serve loop).
+/// Name the stale-Lima-disk-lock failure mode distinctly in the journal and the
+/// alert channel: the operator response (unlock the Lima data disk) has nothing in
+/// common with "the start failed" (bead jleechan-9p0g item 3).
+fn notify_stale_lima_disk_lock(cfg: &config::Config, stale: &StaleLockOutcome, recovered: bool) {
+    let (event_key, severity, subject, detail) = match stale {
+        StaleLockOutcome::Unlocked if recovered => (
+            "serve.backend.restart.stale_lima_disk_lock.recovered",
+            Severity::Info,
+            "stale Lima disk lock; unlocked and retried",
+            "a killed backend start left the Lima data disk locked; ezgha unlocked it and the retried start recovered the backend".to_string(),
+        ),
+        StaleLockOutcome::Unlocked => (
+            "serve.backend.restart.stale_lima_disk_lock.retry_failed",
+            Severity::Critical,
+            "stale Lima disk lock; unlocked and retried, start still failing",
+            "ezgha cleared the stale Lima disk lock but the single retried backend start did not recover the backend".to_string(),
+        ),
+        StaleLockOutcome::UnlockFailed(detail) => (
+            "serve.backend.restart.stale_lima_disk_lock.unlock_failed",
+            Severity::Critical,
+            "stale Lima disk lock; unlock failed",
+            format!("ezgha detected a stale Lima disk lock but could not clear it: {detail}"),
+        ),
+        StaleLockOutcome::NotUnlocked(reason) => (
+            "serve.backend.restart.stale_lima_disk_lock.not_unlocked",
+            Severity::Warning,
+            "stale Lima disk lock; not unlocked",
+            format!("ezgha detected a stale Lima disk lock but did not unlock it: {reason}"),
+        ),
+    };
+    eprintln!("{subject}: {detail}");
+    let body = format!("{detail} (target {})", cfg.github.target);
+    if let Err(err) = alert::notify(cfg, event_key, severity, subject, &body) {
+        eprintln!("WARN: alert send error: {err:#}");
+    }
+}
+
 fn maybe_restart_backend(
     cfg: &config::Config,
     recovery: &mut BackendRecoveryState,
@@ -651,27 +1055,31 @@ fn maybe_restart_backend(
         return false;
     }
     match attempt_backend_restart(deadline) {
-        Ok(true) => {
-            let subject = "Backend restart attempted";
-            let body = format!(
-                "attempted backend runtime restart for {} after backend selection/reachability failure",
-                cfg.github.target
-            );
-            if let Err(err) = alert::notify(
-                cfg,
-                "serve.backend.restart.attempted",
-                Severity::Info,
-                subject,
-                &body,
-            ) {
-                eprintln!("WARN: alert send error: {err:#}");
+        Ok(outcome) => {
+            if let Some(stale) = &outcome.stale_lock {
+                notify_stale_lima_disk_lock(cfg, stale, outcome.recovered);
             }
-            eprintln!("restarted backend runtime and will retry quickly");
-            true
-        }
-        Ok(false) => {
-            eprintln!("backend restart command paths were unavailable or returned non-zero");
-            false
+            if outcome.recovered {
+                let subject = "Backend restart attempted";
+                let body = format!(
+                    "attempted backend runtime restart for {} after backend selection/reachability failure",
+                    cfg.github.target
+                );
+                if let Err(err) = alert::notify(
+                    cfg,
+                    "serve.backend.restart.attempted",
+                    Severity::Info,
+                    subject,
+                    &body,
+                ) {
+                    eprintln!("WARN: alert send error: {err:#}");
+                }
+                eprintln!("restarted backend runtime and will retry quickly");
+                true
+            } else {
+                eprintln!("backend restart command paths were unavailable or returned non-zero");
+                false
+            }
         }
         Err(err) => {
             eprintln!("backend restart command failed: {err:#}");
@@ -2941,39 +3349,55 @@ mod tests {
         health_poll_interval: Duration::from_millis(2),
     };
 
+    /// Instance-state probe for restart tests that do not exercise stale-lock
+    /// recovery: the instance reports stopped.
+    fn stopped_instance(_: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Unlock for restart tests that must never unlock: reaching it is a bug, so it
+    /// fails the test loudly instead of silently doing nothing.
+    fn unreachable_unlock(_: &str, _: Duration) -> Result<CommandOutcome> {
+        panic!("unlock must not run when no stale disk lock was detected")
+    }
+
     #[test]
     fn restart_command_success_is_not_backend_recovery_without_docker() {
         let commands: &[RestartCommand] =
             &[("colima", &["start"]), ("limactl", &["start", "colima"])];
         let mut attempts = 0;
-        let recovered = attempt_backend_restart_with(
+        let outcome = attempt_backend_restart_with(
             commands,
             None,
             FAST_TEST_TIMING,
             |_, _, _| {
                 attempts += 1;
-                Ok(true)
+                Ok(succeeded())
             },
             || false,
+            stopped_instance,
+            unreachable_unlock,
         )
         .unwrap();
 
-        assert!(!recovered);
+        assert!(!outcome.recovered);
         assert_eq!(attempts, 1);
     }
 
     #[test]
     fn restart_reports_recovery_only_after_docker_is_reachable() {
         let commands: &[RestartCommand] = &[("colima", &["start"])];
-        let recovered = attempt_backend_restart_with(
+        let outcome = attempt_backend_restart_with(
             commands,
             None,
             FAST_TEST_TIMING,
-            |_, _, _| Ok(true),
+            |_, _, _| Ok(succeeded()),
             || true,
+            stopped_instance,
+            unreachable_unlock,
         )
         .unwrap();
-        assert!(recovered);
+        assert!(outcome.recovered);
     }
 
     #[test]
@@ -2997,9 +3421,11 @@ mod tests {
             FAST_TEST_TIMING,
             |_, _, timeout| {
                 observed_timeout = Some(timeout);
-                Ok(true)
+                Ok(succeeded())
             },
             || true,
+            stopped_instance,
+            unreachable_unlock,
         );
         let observed = observed_timeout.expect("run should have been called");
         assert!(
@@ -3024,9 +3450,11 @@ mod tests {
             FAST_TEST_TIMING,
             |_, _, timeout| {
                 observed_timeout = Some(timeout);
-                Ok(true)
+                Ok(succeeded())
             },
             || true,
+            stopped_instance,
+            unreachable_unlock,
         );
         assert_eq!(observed_timeout, Some(FAST_TEST_TIMING.command_ceiling));
     }
@@ -3044,11 +3472,14 @@ mod tests {
             FAST_TEST_TIMING,
             |_, _, _| {
                 attempts += 1;
-                Ok(true)
+                Ok(succeeded())
             },
             || true,
+            stopped_instance,
+            unreachable_unlock,
         )
-        .unwrap();
+        .unwrap()
+        .recovered;
         assert!(!recovered);
         assert_eq!(
             attempts, 0,
@@ -3067,11 +3498,14 @@ mod tests {
             FAST_TEST_TIMING,
             |_, _, _| {
                 attempts += 1;
-                Ok(true)
+                Ok(succeeded())
             },
             || true,
+            stopped_instance,
+            unreachable_unlock,
         )
-        .unwrap();
+        .unwrap()
+        .recovered;
         assert!(!recovered);
         assert_eq!(attempts, 0);
     }
@@ -3089,13 +3523,16 @@ mod tests {
             commands,
             None,
             FAST_TEST_TIMING,
-            |_, _, _| Ok(true),
+            |_, _, _| Ok(succeeded()),
             || {
                 probes += 1;
                 probes >= 3
             },
+            stopped_instance,
+            unreachable_unlock,
         )
-        .unwrap();
+        .unwrap()
+        .recovered;
         assert!(recovered);
         assert_eq!(probes, 3);
     }
@@ -3108,13 +3545,16 @@ mod tests {
             commands,
             None,
             FAST_TEST_TIMING,
-            |_, _, _| Ok(true),
+            |_, _, _| Ok(succeeded()),
             || {
                 probes += 1;
                 false
             },
+            stopped_instance,
+            unreachable_unlock,
         )
-        .unwrap();
+        .unwrap()
+        .recovered;
         assert!(!recovered);
         assert!(
             probes > 1,
@@ -3133,24 +3573,285 @@ mod tests {
         );
     }
 
+    // --- stale Lima disk lock recovery (bead jleechan-9p0g) ---
+
+    /// Verbatim fatal from the 2026-10-29 incident: after the daemon's own
+    /// backend-restart timeout killed a cold vz boot mid-flight, every later
+    /// `colima start` failed in under a second with this, because
+    /// `~/.colima/_lima/_disks/colima/in_use_by` still named the instance.
+    const STALE_LOCK_FATAL: &str =
+        "fatal: failed to run attach disk \"colima\", in use by instance \"colima\"";
+
+    fn failed(output: &str) -> CommandOutcome {
+        CommandOutcome {
+            success: false,
+            output: output.to_string(),
+        }
+    }
+
+    fn succeeded() -> CommandOutcome {
+        CommandOutcome {
+            success: true,
+            output: String::new(),
+        }
+    }
+
+    #[test]
+    fn stale_disk_lock_is_detected_from_the_real_lima_fatal() {
+        assert_eq!(
+            stale_disk_lock_disk_name(STALE_LOCK_FATAL).as_deref(),
+            Some("colima")
+        );
+        // limactl writes its own diagnostics ahead of the fatal on the same
+        // stream, so detection must scan lines rather than match the whole output.
+        let noisy = format!(
+            "time=\"2026-10-29T18:42:00+11:00\" level=info msg=booting\n{STALE_LOCK_FATAL}\n"
+        );
+        assert_eq!(stale_disk_lock_disk_name(&noisy).as_deref(), Some("colima"));
+    }
+
+    #[test]
+    fn stale_disk_lock_is_not_detected_for_other_start_failures() {
+        assert_eq!(
+            stale_disk_lock_disk_name("FATA[0003] error starting the VM: exit status 1"),
+            None
+        );
+        assert_eq!(stale_disk_lock_disk_name(""), None);
+    }
+
+    #[test]
+    fn backend_restart_unlocks_stale_lima_disk_and_retries_the_start_once() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let mut starts = 0;
+        let mut unlocks: Vec<(String, Duration)> = Vec::new();
+        let outcome = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                starts += 1;
+                Ok(if starts == 1 {
+                    failed(STALE_LOCK_FATAL)
+                } else {
+                    succeeded()
+                })
+            },
+            || true,
+            |_| Ok(false),
+            |disk, timeout| {
+                unlocks.push((disk.to_string(), timeout));
+                Ok(succeeded())
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.recovered);
+        assert_eq!(starts, 2, "the start must be retried exactly once");
+        assert_eq!(unlocks.len(), 1, "exactly one unlock");
+        assert_eq!(unlocks[0].0, "colima");
+        assert_eq!(
+            unlocks[0].1, FAST_TEST_TIMING.command_ceiling,
+            "the unlock must run behind the same command-timeout machinery"
+        );
+        assert_eq!(outcome.stale_lock, Some(StaleLockOutcome::Unlocked));
+    }
+
+    #[test]
+    fn backend_restart_does_not_unlock_when_the_failure_is_something_else() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let mut starts = 0;
+        let mut unlocks = 0;
+        let mut probes = 0;
+        let outcome = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                starts += 1;
+                Ok(failed("FATA[0003] error starting the VM: exit status 1"))
+            },
+            || true,
+            |_| {
+                probes += 1;
+                Ok(false)
+            },
+            |_, _| {
+                unlocks += 1;
+                Ok(succeeded())
+            },
+        )
+        .unwrap();
+
+        assert!(!outcome.recovered);
+        assert_eq!(starts, 1, "a generic failure must not be retried");
+        assert_eq!(unlocks, 0, "a generic failure must not unlock anything");
+        assert_eq!(probes, 0, "a generic failure must not probe instance state");
+        assert_eq!(outcome.stale_lock, None);
+    }
+
+    #[test]
+    fn backend_restart_does_not_unlock_while_the_instance_reports_running() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let mut starts = 0;
+        let mut unlocks = 0;
+        let outcome = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                starts += 1;
+                Ok(failed(STALE_LOCK_FATAL))
+            },
+            || true,
+            |_| Ok(true),
+            |_, _| {
+                unlocks += 1;
+                Ok(succeeded())
+            },
+        )
+        .unwrap();
+
+        assert!(!outcome.recovered);
+        assert_eq!(starts, 1, "a running instance must never be retried");
+        assert_eq!(
+            unlocks, 0,
+            "unlocking a disk a live instance is using would corrupt it"
+        );
+        assert!(
+            matches!(outcome.stale_lock, Some(StaleLockOutcome::NotUnlocked(_))),
+            "expected a not-unlocked reason, got {:?}",
+            outcome.stale_lock
+        );
+    }
+
+    #[test]
+    fn backend_restart_does_not_unlock_when_instance_state_is_unconfirmed() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let mut unlocks = 0;
+        let outcome = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| Ok(failed(STALE_LOCK_FATAL)),
+            || true,
+            |_| bail!("limactl list colima exited non-zero: no such instance"),
+            |_, _| {
+                unlocks += 1;
+                Ok(succeeded())
+            },
+        )
+        .unwrap();
+
+        assert!(!outcome.recovered);
+        assert_eq!(unlocks, 0, "unknown instance state must fail closed");
+        assert!(
+            matches!(outcome.stale_lock, Some(StaleLockOutcome::NotUnlocked(_))),
+            "expected a not-unlocked reason, got {:?}",
+            outcome.stale_lock
+        );
+    }
+
+    #[test]
+    fn backend_restart_surfaces_a_distinct_reason_when_the_unlock_fails() {
+        let commands: &[RestartCommand] = &[("colima", &["start"])];
+        let mut starts = 0;
+        let outcome = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                starts += 1;
+                Ok(failed(STALE_LOCK_FATAL))
+            },
+            || true,
+            |_| Ok(false),
+            |_, _| Ok(failed("fatal: disk \"colima\" not found")),
+        )
+        .unwrap();
+
+        assert!(!outcome.recovered);
+        assert_eq!(starts, 1, "a failed unlock must not retry the start");
+        match &outcome.stale_lock {
+            Some(StaleLockOutcome::UnlockFailed(detail)) => {
+                assert!(
+                    detail.contains("not found"),
+                    "unlock failure detail must reach the log: {detail}"
+                );
+            }
+            other => panic!("expected UnlockFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backend_restart_unlocks_at_most_once_across_the_fallback_chain() {
+        // Linux tries systemctl then limactl. Both hit the same stale lock, so a
+        // bounded single unlock must cover the whole chain — unbounded per-command
+        // retries would burn BACKEND_RESTART_MAX_ATTEMPTS on a real failure.
+        let commands: &[RestartCommand] = &[
+            ("systemctl", &["--user", "start", "lima-vm@colima.service"]),
+            ("limactl", &["start", "colima"]),
+        ];
+        let mut starts = 0;
+        let mut unlocks = 0;
+        let outcome = attempt_backend_restart_with(
+            commands,
+            None,
+            FAST_TEST_TIMING,
+            |_, _, _| {
+                starts += 1;
+                Ok(failed(STALE_LOCK_FATAL))
+            },
+            || true,
+            |_| Ok(false),
+            |_, _| {
+                unlocks += 1;
+                Ok(succeeded())
+            },
+        )
+        .unwrap();
+
+        assert!(!outcome.recovered);
+        assert_eq!(unlocks, 1, "only one unlock per restart attempt");
+        assert_eq!(starts, 3, "1 start + 1 retry + 1 fallback command");
+        assert_eq!(outcome.stale_lock, Some(StaleLockOutcome::Unlocked));
+    }
+
+    #[test]
+    fn limactl_status_parsing_only_treats_running_as_unsafe_to_unlock() {
+        assert_eq!(interpret_limactl_status("Running"), Some(true));
+        assert_eq!(interpret_limactl_status("Stopped\n"), Some(false));
+        assert_eq!(
+            interpret_limactl_status("Stopped\nRunning\n"),
+            Some(true),
+            "any running entry makes unlocking unsafe"
+        );
+        assert_eq!(
+            interpret_limactl_status("Broken"),
+            None,
+            "an unknown state must fail closed at the call site"
+        );
+    }
+
     #[test]
     fn restart_command_reports_success() {
-        assert!(run_restart_command_with_timeout(
-            "/bin/sh",
-            &["-c", "exit 0"],
-            Duration::from_secs(1)
-        )
-        .unwrap());
+        assert!(
+            run_restart_command_with_timeout("/bin/sh", &["-c", "exit 0"], Duration::from_secs(1))
+                .unwrap()
+                .success
+        );
     }
 
     #[test]
     fn restart_command_reports_nonzero() {
-        assert!(!run_restart_command_with_timeout(
-            "/bin/sh",
-            &["-c", "exit 17"],
-            Duration::from_secs(1)
-        )
-        .unwrap());
+        assert!(
+            !run_restart_command_with_timeout(
+                "/bin/sh",
+                &["-c", "exit 17"],
+                Duration::from_secs(1)
+            )
+            .unwrap()
+            .success
+        );
     }
 
     #[test]
