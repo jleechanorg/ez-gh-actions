@@ -38,6 +38,10 @@ DASHBOARD_PLIST_BACKUP=""
 DASHBOARD_HAD_PRIOR=0
 DASHBOARD_PRIOR_UNLOADED=false
 DASHBOARD_REPLACEMENT_INSTALLED=false
+# Wall-clock bound on the install-time `diskm scratch-dir` resolution below.
+# Normal answer is ~3-4s; this only exists so one hung resolver cannot stall an
+# interactive ./install.sh forever.
+DISKM_SCRATCH_DIR_TIMEOUT_SECONDS=15
 
 action="${1:-status}"
 label_filter="${2:-}"
@@ -51,20 +55,66 @@ if [[ "$action" == "install" && -n "$label_filter" ]]; then
   fi
 fi
 
+# Run a command with a wall-clock bound. macOS ships no timeout(1), so bound it
+# here: background the command, poll once a second, and kill it on expiry.
+# Returns the command's own exit status when it finishes in time, or 124 (the
+# convention timeout(1) uses) when the bound expires; stdout is replayed only on
+# success, so a killed command contributes no partial output.
+#
+# The bound kills the backgrounded pid itself. Today's `diskm` is a shebang
+# script, so that pid IS the interpreter running it; a resolver that instead
+# forked a grandchild would outlive the kill.
+run_bounded() {
+  local seconds="$1"
+  shift
+  local out pid rc elapsed=0
+  out="$(mktemp "${TMPDIR:-/tmp}/ezgha-bounded-output.XXXXXX")"
+  "$@" >"$out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [[ "$elapsed" -ge "$seconds" ]]; then
+      # TERM first, KILL only if it is still there a second later (a uv-tool
+      # python can sit in an uninterruptible read).
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      rm -f "$out"
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  rc=0
+  wait "$pid" || rc=$?
+  cat "$out"
+  rm -f "$out"
+  return "$rc"
+}
+
 # Templates that need this host's Scratch root (currently only the iOS
 # release-scratch reaper) must NOT call `diskm scratch-dir` from launchd:
 # measured 2026-10-30, that python uv-tool call spins indefinitely in a launchd
 # session (it answers in ~4s interactively), which wedged the first installed
-# copy of the job. Resolve it here, once, at install time, and substitute it.
+# copy of the job. Resolve it here, once, at install time, and substitute it —
+# under a bound, so one hung resolver cannot stall an interactive ./install.sh.
 #
 # If it cannot be resolved (no diskm, e.g. CI), the affected template is SKIPPED
 # rather than loaded with an unsubstituted placeholder: a reaper with no target
 # would either do nothing or hang. A targeted install of that label still fails
-# loudly; a bulk install carries on and reports it.
+# loudly; a bulk install carries on and reports it. Same outcome when the call
+# overruns its bound: unresolved is unresolved.
 SCRATCH_ROOT_RESOLVED=""
 if grep -lq '@SCRATCH_ROOT@' "${templates[@]}" 2>/dev/null; then
   if command -v diskm >/dev/null 2>&1; then
-    SCRATCH_ROOT_RESOLVED="$(diskm scratch-dir 2>/dev/null || true)"
+    resolve_rc=0
+    SCRATCH_ROOT_RESOLVED="$(run_bounded "${DISKM_SCRATCH_DIR_TIMEOUT_SECONDS}" diskm scratch-dir)" || resolve_rc=$?
+    if [[ "${resolve_rc}" -eq 124 ]]; then
+      echo "WARNING: diskm scratch-dir did not answer within ${DISKM_SCRATCH_DIR_TIMEOUT_SECONDS}s and was killed — refusing to block the install on it" >&2
+    fi
+    if [[ "${resolve_rc}" -ne 0 ]]; then
+      SCRATCH_ROOT_RESOLVED=""
+    fi
     SCRATCH_ROOT_RESOLVED="${SCRATCH_ROOT_RESOLVED%/}"
   fi
   case "${SCRATCH_ROOT_RESOLVED}" in
