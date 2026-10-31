@@ -3,7 +3,10 @@
 #
 # Verifies: dry-run is non-destructive; --apply removes only a dir that is aged,
 # correctly named, proven COMPLETED by the producer API, and referenced by no
-# live process; a live process whose cwd is inside the tree is protected even
+# live process; the 4h retention default is what an unset MIN_AGE_HOURS actually
+# applies and matches the launchd unit's value; a superseded (earlier) attempt of
+# a successful run is retained inside the MIN_AGE_HOURS_RERUN grace and reaped
+# past it; a live process whose cwd is inside the tree is protected even
 # when the path is absent from argv and even through macOS's /var -> /private/var
 # symlink alias; an in-progress run and any gh failure are never deleted; the
 # deletion cap is honored; no quarantine copy is ever made under HOME; unsafe
@@ -48,7 +51,8 @@ for a in "$@"; do case "$a" in repos/*/actions/runs/*) id="${a##*/}" ;; esac; do
 case "${id}" in
   999) printf 'in_progress\t\t1' ;;
   998) printf 'completed\tfailure\t1' ;;
-  997) printf 'completed\tsuccess\t2' ;;   # re-run: dir carries attempt 1
+  992) printf 'completed\tsuccess\t2' ;;   # re-run: earlier attempt INSIDE the 7d rerun grace
+  994) printf 'completed\tsuccess\t2' ;;   # re-run: earlier attempt past / near the rerun grace
   *)   printf 'completed\tsuccess\t1' ;;
 esac
 STUB
@@ -56,6 +60,17 @@ chmod +x "${W}/bin/gh"
 GH="${W}/bin/gh"
 
 aged() { mkdir -p "$1"; touch -t 202401010000 "$1"; }
+
+# Age a dir to N hours before now. The retention knobs are hour-based, so the
+# cases that prove which floor applied need real "now - Nh" mtimes rather than a
+# fixed date that is always far past every floor. Local time on purpose: BSD/GNU
+# `touch -t` parse the stamp as local, so a `date -u` stamp would land hours off.
+aged_hours_ago() {
+  local hours="$1" dest="$2" stamp
+  mkdir -p "${dest}"
+  stamp="$(date -v-"${hours}"H +%Y%m%d%H%M 2>/dev/null || date -d "${hours} hours ago" +%Y%m%d%H%M)"
+  touch -t "${stamp}" "${dest}"
+}
 
 OLD_OK="${SCR}/worldai-ios-release-111-1"
 mkdir -p "${OLD_OK}"
@@ -184,13 +199,40 @@ FAILED="${SCR}/worldai-ios-release-998-1"
 aged "${FAILED}"
 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
 [ -d "${FAILED}" ] || fail "a failed run's scratch must be retained, not reaped"
-# ...and a re-run's EARLIER attempt dir is retained too, even when the latest
-# attempt succeeded (it holds that attempt's evidence).
-RERUN="${SCR}/worldai-ios-release-997-1"
-aged "${RERUN}"
-GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >/dev/null
-[ -d "${RERUN}" ] || fail "a re-run's EARLIER attempt dir must be retained (failure evidence)"
-pass "failed runs and earlier re-run attempts retained"
+pass "failed runs retained"
+
+# 9b. A re-run's EARLIER attempt dir is retained while it is inside the
+#     MIN_AGE_HOURS_RERUN grace (168h = 7d). It used to be pinned forever; the
+#     measured cost was 2 dirs / ~5 GB that nothing could ever reclaim.
+RERUN_YOUNG="${SCR}/worldai-ios-release-992-1"   # producer says latest attempt = 2
+aged_hours_ago 48 "${RERUN_YOUNG}"
+env -u MIN_AGE_HOURS_RERUN GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" \
+  bash "${S}" --apply >"${W}/rerun-young.log" 2>&1
+[ -d "${RERUN_YOUNG}" ] || fail "an earlier attempt inside the 7d grace must be retained"
+grep -q "SKIP earlier attempt younger than 7d" "${W}/rerun-young.log" \
+  || { cat "${W}/rerun-young.log" >&2; fail "the earlier-attempt skip must name the 7d grace rule"; }
+pass "earlier attempt inside the 7d grace retained (rule logged)"
+
+# 9c. ...and the same shape IS reaped once past the grace, because the run as a
+#     whole succeeded: nothing will ever touch that superseded tree again.
+RERUN_OLD="${SCR}/worldai-ios-release-994-1"     # producer says latest attempt = 2
+aged_hours_ago 240 "${RERUN_OLD}"                # 10 days > 7-day grace
+env -u MIN_AGE_HOURS_RERUN GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" \
+  bash "${S}" --apply >/dev/null
+[ ! -d "${RERUN_OLD}" ] || fail "an earlier attempt past the 7d grace must be reaped"
+pass "earlier attempt past the 7d grace reaped"
+
+# 9d. The grace is a knob, not a constant: raising it past a dir's age retains
+#     that earlier attempt again, and the log reports the configured value.
+RERUN_WIDE="${SCR}/worldai-ios-release-994-1"    # same re-run shape as 9c
+aged_hours_ago 240 "${RERUN_WIDE}"
+MIN_AGE_HOURS_RERUN=360 GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" \
+  bash "${S}" --apply >"${W}/rerun-wide.log" 2>&1
+[ -d "${RERUN_WIDE}" ] || fail "MIN_AGE_HOURS_RERUN=360 must retain a 240h earlier attempt"
+grep -q "SKIP earlier attempt younger than 15d" "${W}/rerun-wide.log" \
+  || { cat "${W}/rerun-wide.log" >&2; fail "the skip log must report the configured grace (360h = 15d)"; }
+rmdir "${RERUN_WIDE}"
+pass "MIN_AGE_HOURS_RERUN override honored and logged"
 
 # 10. $HOME refusals cannot be bypassed by a trailing slash or a symlink to HOME.
 rc=0; GH_BIN="${GH}" SCRATCH_ROOT="${HOME}/" bash "${S}" --apply >/dev/null 2>&1 || rc=$?
@@ -294,6 +336,32 @@ pass "missing scanner fails loudly"
 grep -q "/usr/sbin" "${REPO_ROOT}/launchd/org.jleechanorg.ezgha-ios-release-cleanup.plist.template" \
   || fail "plist PATH must include /usr/sbin (macOS keeps lsof there)"
 pass "plist PATH includes /usr/sbin"
+
+# 14b. The unit's MIN_AGE_HOURS must equal the script's own default, so the two
+#      places that define the retention floor cannot drift apart.
+script_age_default="$(sed -n 's/^MIN_AGE_HOURS="\${MIN_AGE_HOURS:-\([0-9][0-9]*\)}"$/\1/p' "${S}")"
+[ -n "${script_age_default}" ] || fail "could not read MIN_AGE_HOURS default from the script header"
+plist_age_default="$(awk '/<key>MIN_AGE_HOURS<\/key>/{getline; gsub(/[^0-9]/, ""); print; exit}' \
+  "${REPO_ROOT}/launchd/org.jleechanorg.ezgha-ios-release-cleanup.plist.template")"
+[ "${plist_age_default}" = "${script_age_default}" ] \
+  || fail "plist MIN_AGE_HOURS (${plist_age_default}) must match the script default (${script_age_default})"
+[ "${script_age_default}" = "4" ] || fail "the retention default must be 4h, got ${script_age_default}h"
+pass "plist MIN_AGE_HOURS matches the script default (4h)"
+
+# 14c. The 4h floor must be what an unset MIN_AGE_HOURS actually applies: a 6h
+#      dir is eligible, a 2h dir is not. (The unit sets the value explicitly, so
+#      a drift between the padded default and real behaviour would otherwise go
+#      unnoticed until an operator unset it.)
+OLD_6H="${SCR}/worldai-ios-release-810-1"
+aged_hours_ago 6 "${OLD_6H}"
+YOUNG_2H="${SCR}/worldai-ios-release-811-1"
+aged_hours_ago 2 "${YOUNG_2H}"
+env -u MIN_AGE_HOURS GH_BIN="${GH}" SCRATCH_ROOT="${SCR}" bash "${S}" --apply >"${W}/default-age.log" 2>&1
+[ ! -d "${OLD_6H}" ] || { cat "${W}/default-age.log" >&2; fail "a 6h dir must be reaped under the 4h default"; }
+[ -d "${YOUNG_2H}" ] || fail "a 2h dir must be retained under the 4h default"
+grep -q "MIN_AGE_HOURS=4 " "${W}/default-age.log" \
+  || { cat "${W}/default-age.log" >&2; fail "the start line must report the effective 4h default"; }
+pass "unset MIN_AGE_HOURS really applies the 4h default"
 
 # 15. Unsafe Scratch roots are refused.
 for bad in "/" "//" "/." "relative/path"; do
