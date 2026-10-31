@@ -118,11 +118,23 @@ runners, indefinitely.
 
 Root cause: a `colima start`/`restart` killed mid-flight leaves the Lima data
 disk locked (`~/.colima/_lima/_disks/colima/in_use_by`), so no subsequent start
-can attach it. The daemon's own restart path can create this state: its
-`BACKEND_RESTART_COMMAND_TIMEOUT` (45s) is shorter than a cold vz boot plus
-provisioning, so on a host that has just rebooted the daemon kills its own
-recovery attempt and wedges the VM. Observed 2026-10-29: reboot at 16:12, disk
-locked at 18:42, fleet at 0/4 mac runners until 18:53.
+can attach it. The daemon's own restart path can create this state: at the time
+of the incident its `BACKEND_RESTART_COMMAND_TIMEOUT` (45s) was shorter than a
+cold vz boot plus provisioning, so on a host that had just rebooted the daemon
+killed its own recovery attempt and wedged the VM. Observed 2026-10-29: reboot at
+16:12, disk locked at 18:42, fleet at 0/4 mac runners until 18:53.
+
+Automatic recovery (since bead jleechan-9p0g): the ceiling is now 120s (clamped
+to whatever remains of the caller's startup budget), and when a restart command
+fails with the attach-disk fatal while `limactl list` reports the instance
+stopped, the daemon clears that one disk lock and retries the start exactly
+once. It never unlocks a disk an instance reports `Running` (that is corruption,
+not recovery), and it names the outcome in the journal and the alert channel:
+`stale Lima disk lock; unlocked and retried` (event key
+`serve.backend.restart.stale_lima_disk_lock.recovered`/`.retry_failed`),
+`stale Lima disk lock; unlock failed` (`.unlock_failed`), or
+`stale Lima disk lock; not unlocked` (`.not_unlocked`). The operator steps below
+remain the fallback when the unlock itself fails.
 
 OPERATOR-ONLY remediation (verify the instance really is stopped first with
 `LIMA_HOME=~/.colima/_lima limactl list`):
