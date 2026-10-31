@@ -44,7 +44,7 @@ fail() {
 # launchctl stub in every PATH variant: records invocations and keeps a tiny
 # loaded-label state so `print` reports registration truthfully — the installer
 # verifies a load registered the label and verifies a stop actually stopped it.
-for variant in fast hang fail; do
+for variant in fast hang fork fail; do
   mkdir -p "${WORK}/bin-${variant}"
   cat > "${WORK}/bin-${variant}/launchctl" <<'EOF'
 #!/usr/bin/env bash
@@ -86,6 +86,15 @@ cat > "${WORK}/bin-hang/diskm" <<'EOF'
 : > "${DISKM_MARKER:?}"
 exec sleep 3600
 EOF
+# (b2) forks: the direct child starts a long-lived grandchild, so killing only the
+# parent leaves a stray process behind. The bound must signal the whole tree.
+cat > "${WORK}/bin-fork/diskm" <<'EOF'
+#!/usr/bin/env bash
+: > "${DISKM_MARKER:?}"
+sleep 3600 &
+echo $! > "${DISKM_GRANDCHILD_PID:?}"
+sleep 3600
+EOF
 # (c) fails: no root, same fail-closed outcome as (b).
 cat > "${WORK}/bin-fail/diskm" <<'EOF'
 #!/usr/bin/env bash
@@ -111,13 +120,13 @@ run_installer() {
   # bound, nothing else.
   if [[ -n "${label}" ]]; then
     env -u BASH_ENV HOME="${HOME_T}" PATH="${WORK}/bin-${variant}:/usr/bin:/bin" \
-      DISKM_MARKER="${DISKM_MARKER}" LAUNCHCTL_LOG="${LAUNCHCTL_LOG}" \
-      LAUNCHCTL_STATE="${LAUNCHCTL_STATE}" \
+      DISKM_MARKER="${DISKM_MARKER}" DISKM_GRANDCHILD_PID="${DISKM_GRANDCHILD_PID:-}" \
+      LAUNCHCTL_LOG="${LAUNCHCTL_LOG}" LAUNCHCTL_STATE="${LAUNCHCTL_STATE}" \
       bash "${INSTALLER}" install "${label}" >"${LOG}" 2>&1 &
   else
     env -u BASH_ENV HOME="${HOME_T}" PATH="${WORK}/bin-${variant}:/usr/bin:/bin" \
-      DISKM_MARKER="${DISKM_MARKER}" LAUNCHCTL_LOG="${LAUNCHCTL_LOG}" \
-      LAUNCHCTL_STATE="${LAUNCHCTL_STATE}" \
+      DISKM_MARKER="${DISKM_MARKER}" DISKM_GRANDCHILD_PID="${DISKM_GRANDCHILD_PID:-}" \
+      LAUNCHCTL_LOG="${LAUNCHCTL_LOG}" LAUNCHCTL_STATE="${LAUNCHCTL_STATE}" \
       bash "${INSTALLER}" install >"${LOG}" 2>&1 &
   fi
   pid=$!
@@ -164,6 +173,24 @@ run_installer fail
 [[ -f "${DISKM_MARKER}" ]] || fail "the failing fake diskm was never invoked"
 [[ ! -e "${REAPER_PLIST}" ]] || fail "a unit with an unresolvable Scratch root was installed"
 [[ -f "${COMPANION_PLIST}" ]] || fail "bulk install did not continue past the failing resolver"
+
+# ── (b2) forking resolver: bounded AND no stray grandchild left behind ──────
+DISKM_GRANDCHILD_PID="${WORK}/grandchild.pid"
+export DISKM_GRANDCHILD_PID
+run_installer fork
+[[ "${INSTALL_RC}" -eq 0 ]] || fail "forking diskm: installer exited ${INSTALL_RC}, expected 0"
+[[ -f "${DISKM_MARKER}" ]] || fail "the forking fake diskm was never invoked"
+if [[ -f "${DISKM_GRANDCHILD_PID}" ]]; then
+  grandchild="$(cat "${DISKM_GRANDCHILD_PID}")"
+  # Give the kernel a moment to reap, then assert the grandchild is gone.
+  sleep 1
+  if kill -0 "${grandchild}" 2>/dev/null; then
+    kill -KILL "${grandchild}" 2>/dev/null || true
+    fail "a forked grandchild (pid ${grandchild}) survived the bound - the whole tree must be signalled"
+  fi
+fi
+[[ ! -e "${REAPER_PLIST}" ]] || fail "a unit with no resolvable Scratch root was left installed"
+[[ -f "${COMPANION_PLIST}" ]] || fail "bulk install did not continue past the forking resolver"
 
 # ── (d) targeted install of that label still fails loudly ───────────────────
 run_installer fail "${REAPER_LABEL}"

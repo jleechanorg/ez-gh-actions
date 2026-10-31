@@ -69,15 +69,32 @@ run_bounded() {
   shift
   local out pid rc elapsed=0
   out="$(mktemp "${TMPDIR:-/tmp}/ezgha-bounded-output.XXXXXX")"
-  "$@" >"$out" 2>/dev/null &
+  # Own process group for the child (job control inside a subshell), so a bound
+  # expiry can signal the WHOLE tree. A wrapper that forks (a shell or python stub
+  # that starts a real worker) otherwise leaves that grandchild running after the
+  # direct child is killed - bounded install, but a stray process.
+  ( set -m 2>/dev/null; exec "$@" ) >"$out" 2>/dev/null &
   pid=$!
+  # Signal the child's process group when it has one (pgid == pid), else the pid.
+  # Depth-first: snapshot the children BEFORE killing the parent, otherwise they
+  # are reparented to init and become unreachable from here. `set -m` does not
+  # reliably give a script's child its own process group, so the group signal is
+  # best-effort and the recursive walk is what actually guarantees the tree dies.
+  kill_tree() {
+    local signal="$1" p="$2" child
+    kill -"$signal" -"$p" 2>/dev/null || true
+    for child in $(pgrep -P "$p" 2>/dev/null || true); do
+      kill_tree "$signal" "$child"
+    done
+    kill -"$signal" "$p" 2>/dev/null || true
+  }
   while kill -0 "$pid" 2>/dev/null; do
     if [[ "$elapsed" -ge "$seconds" ]]; then
       # TERM first, KILL only if it is still there a second later (a uv-tool
       # python can sit in an uninterruptible read).
-      kill -TERM "$pid" 2>/dev/null || true
+      kill_tree TERM "$pid"
       sleep 1
-      kill -KILL "$pid" 2>/dev/null || true
+      kill_tree KILL "$pid"
       wait "$pid" 2>/dev/null || true
       rm -f "$out"
       return 124
