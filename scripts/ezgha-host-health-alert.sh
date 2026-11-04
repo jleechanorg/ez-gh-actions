@@ -91,7 +91,7 @@ DOCKER_BIN="${DOCKER_BIN:-docker}"
 # ── Policy definitions (single source of truth, used by --ensure-policies) ────
 FLEET_POLICY_NAME="[CRITICAL] ezgha: GitHub Actions Runners Down Alert"
 FLEET_POLICY_SUBJECT="[CRITICAL] ezgha runner fleet down"
-FLEET_POLICY_DOC="The ezgha runner fleet on this host cannot run jobs (service down, docker unreachable, 0 runner containers, or the peer host is unreachable). Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"fleet\". Disk-floor breaches are NOT this alert; see '[CRITICAL] ezgha: host disk below safety floor'."
+FLEET_POLICY_DOC="The ezgha runner fleet on this host cannot run jobs (service down, docker unreachable, or 0 runner containers on this host, or a recent daemon CRITICAL such as an admission pause). A degraded PEER host is explicitly NOT this alert (cause=\"peer\", WARNING). Disk-floor breaches are NOT this alert; see '[CRITICAL] ezgha: host disk below safety floor'. Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"fleet\"."
 DISK_POLICY_NAME="[CRITICAL] ezgha: host disk below safety floor"
 DISK_POLICY_SUBJECT="[CRITICAL] ezgha host disk below safety floor"
 DISK_POLICY_DOC="Host free space has been under the ezgha admission floor for the sustained window (or below the emergency floor), so runner admission is paused. Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"disk\"."
@@ -107,6 +107,17 @@ PEER_DISK_FLOOR_GB="${HEALTH_ALERT_PEER_DISK_FLOOR_GB:-30}"
 DISK_EMERGENCY_GB="${HEALTH_ALERT_DISK_EMERGENCY_GB:-15}"
 DISK_PAGE_AFTER_MIN="${HEALTH_ALERT_DISK_PAGE_AFTER_MIN:-15}"
 COOLDOWN_SEC="${HEALTH_ALERT_COOLDOWN_SEC:-1800}"
+
+# Slack→SMS escalation. The daemon writes every Slack alert it sends to
+# alerts.jsonl; a CRITICAL entry there means the daemon itself decided something
+# is badly wrong (admission paused, refill stuck, queue starvation). Until now
+# that verdict only reached Slack, so a 15-hour zero-runner fleet (2026-11-04,
+# runner image missing → "disk measurement unavailable", 4914 paused cycles)
+# paged nobody. Promote a recent daemon CRITICAL into cause=fleet so it reaches
+# the SMS policy. Window and file are overridable for the hermetic tests.
+ALERTS_JSONL="${HEALTH_ALERT_ALERTS_FILE:-$HOME/.local/state/ezgha/alerts.jsonl}"
+SLACK_CRITICAL_WINDOW_MIN="${HEALTH_ALERT_SLACK_CRITICAL_WINDOW_MIN:-15}"
+SLACK_ESCALATE="${HEALTH_ALERT_SLACK_ESCALATE:-1}"
 
 STATE_DIR="${HEALTH_ALERT_STATE_DIR:-$HOME/.local/state/ezgha}"
 mkdir -p "$STATE_DIR"
@@ -163,6 +174,12 @@ fi
 
 FLEET_FAILS=()
 DISK_FAILS=()
+# Peer-host failures are NOT this host's fleet outage. They used to be appended
+# to FLEET_FAILS, so a down Mac paged the "GitHub Actions Runners Down" policy
+# every 30 minutes while 20 healthy Linux containers were running (observed
+# continuously 2026-11-04). Peer verdicts carry their own cause and never reach
+# the fleet policy filter (severity>=ERROR AND cause="fleet").
+PEER_FAILS=()
 
 # ── 1. Local Service Check ───────────────────────────────────────────────────
 SERVICE_OK="${HEALTH_ALERT_SERVICE_OK:-}"
@@ -241,16 +258,16 @@ if [ -n "$PEER_OK" ]; then
   PEER_CNT="${HEALTH_ALERT_PEER_CONTAINERS:-4}"
   PEER_FREE="${HEALTH_ALERT_PEER_FREE_GB:-100}"
   if [ "$PEER_OK" != "1" ]; then
-    FLEET_FAILS+=("peer($PEER_NAME): host unreachable over LAN and Tailscale")
+    PEER_FAILS+=("peer($PEER_NAME): host unreachable over LAN and Tailscale")
   else
     if [ "$PEER_SERVICE" != "active" ]; then
-      FLEET_FAILS+=("peer($PEER_NAME): ezgha service is ${PEER_SERVICE}")
+      PEER_FAILS+=("peer($PEER_NAME): ezgha service is ${PEER_SERVICE}")
     fi
     if [ "$PEER_CNT" -eq 0 ]; then
-      FLEET_FAILS+=("peer($PEER_NAME): 0 runner containers running")
+      PEER_FAILS+=("peer($PEER_NAME): 0 runner containers running")
     fi
     if [ "$PEER_FREE" -lt "$PEER_DISK_FLOOR_GB" ]; then
-      DISK_FAILS+=("peer($PEER_NAME): disk space critical: ${PEER_FREE}GB free (floor: ${PEER_DISK_FLOOR_GB}GB)")
+      PEER_FAILS+=("peer($PEER_NAME): disk space critical: ${PEER_FREE}GB free (floor: ${PEER_DISK_FLOOR_GB}GB)")
     fi
   fi
 elif [ "$PLATFORM" = "Linux" ]; then
@@ -258,14 +275,14 @@ elif [ "$PLATFORM" = "Linux" ]; then
   PEER_RES=""
   if PEER_RES=$(timeout 6 ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=no "$PEER_NAME" "$PEER_CMD" 2>/dev/null); then
     if [ "$PEER_RES" != "0" ]; then
-      FLEET_FAILS+=("peer($PEER_NAME): ezgha process not running")
+      PEER_FAILS+=("peer($PEER_NAME): ezgha process not running")
     fi
   elif PEER_RES=$(timeout 6 ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=no 100.67.70.24 "$PEER_CMD" 2>/dev/null); then
     if [ "$PEER_RES" != "0" ]; then
-      FLEET_FAILS+=("peer($PEER_NAME): ezgha process not running (via Tailscale)")
+      PEER_FAILS+=("peer($PEER_NAME): ezgha process not running (via Tailscale)")
     fi
   else
-    FLEET_FAILS+=("peer($PEER_NAME): host unreachable over LAN and Tailscale")
+    PEER_FAILS+=("peer($PEER_NAME): host unreachable over LAN and Tailscale")
   fi
 elif [ "$PLATFORM" = "Darwin" ]; then
   PEER_PROBE='
@@ -280,7 +297,7 @@ elif [ "$PLATFORM" = "Darwin" ]; then
   elif PEER_OUT=$(timeout 6 ssh -o ConnectTimeout=4 -o BatchMode=yes "${PEER_NAME}-ts" "$PEER_PROBE" 2>/dev/null); then
     :
   else
-    FLEET_FAILS+=("peer($PEER_NAME): host unreachable over LAN and Tailscale")
+    PEER_FAILS+=("peer($PEER_NAME): host unreachable over LAN and Tailscale")
   fi
 
   if [ -n "$PEER_OUT" ]; then
@@ -291,13 +308,33 @@ elif [ "$PLATFORM" = "Darwin" ]; then
     PEER_CNT=$(printf '%d' "$PEER_CNT" 2>/dev/null || echo 0)
 
     if [ "$PEER_SVC" != "active" ]; then
-      FLEET_FAILS+=("peer($PEER_NAME): ezgha.service is $PEER_SVC")
+      PEER_FAILS+=("peer($PEER_NAME): ezgha.service is $PEER_SVC")
     fi
     if [ "$PEER_CNT" -eq 0 ]; then
-      FLEET_FAILS+=("peer($PEER_NAME): 0 runner containers running")
+      PEER_FAILS+=("peer($PEER_NAME): 0 runner containers running")
     fi
     if [ "$PEER_FREE" -lt "$PEER_DISK_FLOOR_GB" ]; then
-      DISK_FAILS+=("peer($PEER_NAME): disk space critical: ${PEER_FREE}GB free (floor: ${PEER_DISK_FLOOR_GB}GB)")
+      PEER_FAILS+=("peer($PEER_NAME): disk space critical: ${PEER_FREE}GB free (floor: ${PEER_DISK_FLOOR_GB}GB)")
+    fi
+  fi
+fi
+
+# ── 4b. Slack CRITICAL → SMS escalation ──────────────────────────────────────
+# The daemon records every Slack alert it sends in alerts.jsonl. A CRITICAL there
+# is a verdict the container/disk probes can miss entirely — an admission pause
+# with the unit still "active" looks healthy from the outside, and on 2026-11-04
+# that exact shape (runner image missing) sat at 0 runners for 15 hours while the
+# only record was a Slack message nobody read. Promote a recent daemon CRITICAL
+# into cause=fleet so it crosses the SMS policy's filter.
+if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
+  RECENT_CRIT=$(tail -400 "$ALERTS_JSONL" 2>/dev/null | grep '"severity":"CRITICAL"' | tail -1)
+  if [ -n "$RECENT_CRIT" ]; then
+    CRIT_TS=$(printf '%s' "$RECENT_CRIT" | sed -n 's/.*"ts_unix":[[:space:]]*\([0-9]*\).*/\1/p')
+    CRIT_KEY=$(printf '%s' "$RECENT_CRIT" | sed -n 's/.*"event_key":[[:space:]]*"\([^"]*\)".*/\1/p')
+    CRIT_TS="${CRIT_TS:-0}"
+    CRIT_AGE_MIN=$(( (NOW_EPOCH - CRIT_TS) / 60 ))
+    if [ "$CRIT_TS" -gt 0 ] && [ "$CRIT_AGE_MIN" -ge 0 ] && [ "$CRIT_AGE_MIN" -le "$SLACK_CRITICAL_WINDOW_MIN" ]; then
+      FLEET_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY:-unknown})")
     fi
   fi
 fi
@@ -350,6 +387,7 @@ json_checks() { printf '%s\n' "$@" | jq -R . | jq -s .; }
 
 FLEET_COUNT=${#FLEET_FAILS[@]}
 DISK_COUNT=${#DISK_FAILS[@]}
+PEER_COUNT=${#PEER_FAILS[@]}
 DISK_SINCE=$PREV_DISK_SINCE
 NOW_LAST_FLEET=$PREV_LAST_SENT_FLEET
 NOW_LAST_DISK=$PREV_LAST_SENT_DISK
@@ -357,7 +395,11 @@ EXIT_CODE=0
 
 if [ "$FLEET_COUNT" -gt 0 ]; then
   # ── Fleet is genuinely down: page, subject "Runners Down". ────────────────
-  EXIT_CODE=1
+  # Exit status contract: a *verdict* is a successful probe, so this exits 0.
+  # Exit non-zero is reserved for "the probe itself could not run". Recording a
+  # monitoring verdict as a job failure made the macOS launchd agent show
+  # "last exit 1" permanently, which is indistinguishable from a dead agent.
+  EXIT_CODE=0
   REASONS=$(IFS='; '; echo "${FLEET_FAILS[*]}")
   if [ "$DISK_COUNT" -gt 0 ]; then
     REASONS="${REASONS}; $(IFS='; '; echo "${DISK_FAILS[*]}")"
@@ -378,9 +420,24 @@ if [ "$FLEET_COUNT" -gt 0 ]; then
   exit "$EXIT_CODE"
 fi
 
+if [ "$PEER_COUNT" -gt 0 ]; then
+  # ── Peer-only degradation: reported, never a fleet page. ──────────────────
+  # This host is running jobs; the peer is not. Emit on transition only so a
+  # long peer outage does not write a log entry every 2 minutes.
+  PEER_REASONS=$(IFS='; '; echo "${PEER_FAILS[*]}")
+  echo "[$NOW_ISO] PEER DEGRADED on $HOST (local: $CONTAINER_COUNT containers, ${FREE_GB}GB free; cause=peer, no page): $PEER_REASONS" >&2
+  if [ "$PREV_STATUS" != "PEER" ]; then
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"peer", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "${PEER_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    emit WARNING "$PAYLOAD"
+  fi
+  save_state "PEER" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
+  exit 0
+fi
+
 if [ "$DISK_COUNT" -gt 0 ]; then
   # ── Fleet healthy, disk under floor: log, page only on a sustained breach. ─
-  EXIT_CODE=1
+  EXIT_CODE=0
   if [ "$DISK_SINCE" -eq 0 ]; then DISK_SINCE=$NOW_EPOCH; fi
   BREACH_MIN=$(( (NOW_EPOCH - DISK_SINCE) / 60 ))
   REASONS=$(IFS='; '; echo "${DISK_FAILS[*]}")
@@ -414,7 +471,7 @@ fi
 # ── Healthy ─────────────────────────────────────────────────────────────────
 echo "[$NOW_ISO] MUTUAL HEALTH CHECK OK on $HOST (Local: $CONTAINER_COUNT containers, ${FREE_GB}GB free; Peer healthy)"
 
-if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS" = "DISK" ] || [ "$PREV_STATUS" = "DEGRADED" ]; then
+if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS" = "DISK" ] || [ "$PREV_STATUS" = "DEGRADED" ] || [ "$PREV_STATUS" = "PEER" ]; then
   echo "[$NOW_ISO] Host $HOST and peer have recovered! Emitting recovery log to GCP..."
   RECOVERED_CAUSES=()
   case "$PREV_STATUS" in
@@ -422,6 +479,9 @@ if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS
   esac
   case "$PREV_STATUS" in
     DISK|DEGRADED|FAIL) RECOVERED_CAUSES+=("disk") ;;
+  esac
+  case "$PREV_STATUS" in
+    PEER) RECOVERED_CAUSES+=("peer") ;;
   esac
   for cause in "${RECOVERED_CAUSES[@]}"; do
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \

@@ -31,6 +31,7 @@ run() { # case free_gb containers [extra env...]
     HEALTH_ALERT_SERVICE_OK=1 HEALTH_ALERT_PEER_OK=1 \
     HEALTH_ALERT_PEER_FREE_GB=100 HEALTH_ALERT_PEER_CONTAINERS=4 HEALTH_ALERT_PEER_SERVICE=active \
     HEALTH_ALERT_FREE_GB="$free" HEALTH_ALERT_CONTAINER_COUNT="$cnt" \
+    HEALTH_ALERT_ALERTS_FILE="$W/alerts-none.jsonl" \
     "$@" "$S" >"$W/out-$case" 2>"$W/err-$case" || true
 }
 errors() { if [ -f "$W/log-$1" ]; then grep -c -- "--severity=ERROR" "$W/log-$1" || true; else echo 0; fi; }
@@ -109,5 +110,41 @@ pass "policy ensure (dry-run) declares fleet + disk policies"
 grep -q 'jsonPayload.cause=\\"fleet\\"' "$S" || fail "fleet policy filter must be cause-scoped"
 grep -q 'jsonPayload.cause=\\"disk\\"' "$S" || fail "disk policy filter must be cause-scoped"
 pass "policy filters are cause-scoped"
+
+# ── 11. A degraded PEER must never page as cause=fleet ──────────────────────
+# Regression: 2026-11-04 the Mac being down paged "GitHub Actions Runners Down"
+# every 30 minutes while 20 healthy Linux containers were running.
+run peerdown 100 18 HEALTH_ALERT_PEER_OK=0
+[ "$(errors peerdown)" = 0 ] || fail "peer host down must not page the fleet policy"
+[ "$(warnings peerdown)" = 1 ] || fail "peer host down must still be recorded at WARNING"
+grep -q '"cause":"peer"' "$W/log-peerdown" || fail "peer verdict must carry cause=peer"
+grep -q '"status":"DEGRADED"' "$W/log-peerdown" || fail "peer verdict must be DEGRADED, not DOWN"
+pass "peer-only failure reports cause=peer at WARNING, never a fleet page"
+
+# ── 12. A recent daemon CRITICAL escalates to the SMS path ──────────────────
+AL="$W/alerts.jsonl"
+printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"paused","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$AL"
+run crit 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
+[ "$(errors crit)" = 1 ] || fail "a recent daemon CRITICAL must escalate to an ERROR (SMS) entry"
+grep -q '"cause":"fleet"' "$W/log-crit" || fail "escalation must use cause=fleet so the SMS policy matches"
+grep -q 'daemon CRITICAL alert' "$W/log-crit" || fail "escalation payload must name the daemon alert"
+pass "recent Slack CRITICAL escalates into the SMS cause=fleet path"
+
+printf '{"body":"x","event_key":"old","severity":"CRITICAL","subject":"old","ts_unix":%s}\n' "$(( NOW - 7200 ))" > "$AL"
+run critold 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
+[ "$(errors critold)" = 0 ] || fail "a CRITICAL older than the window must not page"
+pass "stale daemon CRITICAL stays silent"
+
+# ── 13. A verdict is a successful probe: exit 0, so launchd/cron stays green ─
+state_dir ex; json_log OK 0 > "$W/state-ex/host-health-alert-testhost.json"
+set +e
+env GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-ex" HEALTH_ALERT_HOST="testhost" HEALTH_ALERT_PLATFORM="Linux" \
+  HEALTH_ALERT_STATE_DIR="$W/state-ex" HEALTH_ALERT_SERVICE_OK=1 HEALTH_ALERT_PEER_OK=1 \
+  HEALTH_ALERT_FREE_GB=100 HEALTH_ALERT_CONTAINER_COUNT=0 \
+  HEALTH_ALERT_ALERTS_FILE="$W/alerts-none.jsonl" "$S" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" = 0 ] || fail "a fleet-down verdict must exit 0 (probe succeeded), got rc=$rc"
+pass "verdicts exit 0; non-zero is reserved for a probe that could not run"
 
 echo "ALL PASS"
