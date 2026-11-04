@@ -75,9 +75,9 @@ OPTOUT_SRC="${OPTOUT_SRC}"$'\nfi'
 # probed its own slots, so the parked host stayed "4 DOWN" and exited
 # unhealthy even with the opt-out set. Whichever leg the opt-out names must be
 # zeroed, and that includes the leg the script is running on.
-LOCAL_START=$(grep -n '^LOCAL_OPTED_OUT=0$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
+LOCAL_START=$(grep -n '^if \[ "\$LOCAL_DISABLED" -eq 1 \]; then$' "$DOCTOR_SCRIPT" | tail -1 | cut -d: -f1 || true)
 if [ -z "$LOCAL_START" ]; then
-  echo "FAIL: could not locate 'LOCAL_OPTED_OUT=0' block in $DOCTOR_SCRIPT" >&2
+  echo "FAIL: could not locate the LOCAL_DISABLED zeroing block in $DOCTOR_SCRIPT" >&2
   echo "      (PR #214 codex P0: the parked host's OWN leg must be zeroed too)" >&2
   exit 1
 fi
@@ -212,6 +212,15 @@ run_local_case() {
   local CONFIGURED_COUNT="$configured"
   if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
   export "${env_name}=${env_val}"
+  # LOCAL_DISABLED is the single shared decision (declared at the top of
+  # doctor-runner, before the host-lifecycle sections). Recompute it here the
+  # same way production does, so the local block under test reads it exactly as
+  # the real script would.
+  local LOCAL_DISABLED=0
+  case "$PLATFORM" in
+    macos) [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
+    linux) [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
+  esac
 
   eval "$LOCAL_SRC"
 

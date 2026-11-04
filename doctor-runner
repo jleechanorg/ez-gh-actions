@@ -859,21 +859,12 @@ else
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"
 fi
 CONFIGURED_COUNT="${CONFIGURED_COUNT:-$DEFAULT_CONFIGURED_COUNT}"
-# INTENTIONAL LOCAL OPT-OUT of this host's own fleet (bead jleechan-hxz0).
-# The remote opt-out alone left a real gap: a doctor run ON the parked Mac
-# still enumerated and probed its own four local slots, so the parked host
-# stayed "4 DOWN" and exited unhealthy even with the opt-out set. Whichever
-# leg the opt-out names must be zeroed, and that includes the leg this
-# script is running on. Set by the same declaration block that sets
-# REMOTE_DISABLED, so one env var parks one platform consistently no matter
-# which host runs the doctor. Declared, never inferred (see that block).
-LOCAL_OPTED_OUT=0
-if [ "$PLATFORM" = "macos" ]; then
-  [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && LOCAL_OPTED_OUT=1
-else
-  [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && LOCAL_OPTED_OUT=1
-fi
-if [ "$LOCAL_OPTED_OUT" -eq 1 ]; then
+# LOCAL_DISABLED (declared once at the top, before the host-lifecycle sections)
+# is the single source of truth for "this host is the parked leg". Do NOT
+# recompute the same decision here under a second name: an earlier revision had
+# both LOCAL_DISABLED and LOCAL_OPTED_OUT encoding it, which is two places to
+# get wrong (ponytail review, PR #214).
+if [ "$LOCAL_DISABLED" -eq 1 ]; then
   # This host is the parked one: expect zero slots, probe nothing, and let the
   # verdict's denominator reflect the effective (empty) contract.
   CONFIGURED_COUNT=0
