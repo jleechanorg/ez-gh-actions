@@ -823,7 +823,16 @@ if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   # shellcheck source=/dev/null
   source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   set -e
-  if [ "$QUEUE_RC" -ne 0 ]; then QUEUE_TAIL_BAD=1; fi  # 1 = tail exceeded, 2 = unmeasurable (UNPROVEN)
+  # Preserve the script's own 1-vs-2 distinction: 1 = tail genuinely exceeded,
+  # 2 = metrics UNMEASURABLE (GitHub API read failed / rate-limited). Collapsing
+  # both to 1 reported an exhausted API quota as "oldest queued job exceeded
+  # 20m", which is a false claim about the queue -- measured live on 2026-11-04
+  # at 0/5000 quota. Only 1 is a queue-tail defect; 2 is UNPROVEN, not bad.
+  if [ "${QUEUE_RC:-0}" -eq 1 ]; then
+    QUEUE_TAIL_BAD=1
+  elif [ "${QUEUE_RC:-0}" -ne 0 ]; then
+    QUEUE_TAIL_UNPROVEN=1
+  fi
 else
   section "8. GitHub Actions queue health"
   warn "scripts/queue-health.sh missing — queue metrics skipped"
@@ -1762,6 +1771,11 @@ fi
 if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
   bad "verdict: queue-tail gate FAILED (QUEUE_TAIL_BAD=1 — oldest fresh queued job wait exceeded ${QUEUE_TAIL_WARN_MIN}m threshold; see section 8 above)"
   CRITICAL=$((CRITICAL+1))
+elif [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ]; then
+  # Not a defect and not a pass: the queue could not be measured (rate limit /
+  # API failure). Say UNPROVEN so nobody reads a quota wall as a healthy queue
+  # OR as a queue-tail defect (bead jleechan-hxz0, measured 2026-11-04).
+  warn "verdict: queue-tail gate UNPROVEN (metrics unavailable — GitHub API read failed; see section 8 above). Not counted as a queue-tail defect; re-run when quota recovers."
 fi
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of

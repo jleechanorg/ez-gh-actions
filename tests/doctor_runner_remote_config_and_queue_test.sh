@@ -129,12 +129,16 @@ qout=$(
   JOBLEVEL_QUEUED_COUNT=3 JOBLEVEL_OLDEST_QUEUED_MIN=45 JOBLEVEL_FETCH_ERRORS=0
   export JOBLEVEL_QUEUED_COUNT JOBLEVEL_OLDEST_QUEUED_MIN JOBLEVEL_FETCH_ERRORS
   eval "$QSNIP"
-  echo "REACHED_NEXT_SECTION QUEUE_RC=$QUEUE_RC QUEUE_TAIL_BAD=$QUEUE_TAIL_BAD"
+  echo "REACHED_NEXT_SECTION QUEUE_RC=$QUEUE_RC QUEUE_TAIL_BAD=${QUEUE_TAIL_BAD:-0} QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}"
 ) 2>&1
 rc=$?
 set -e
 check "failing gh: doctor continues past queue block (rc=0)" "[ $rc -eq 0 ]"
-check "failing gh: next section reached, queue block non-green (QUEUE_RC=2)" "grep -q 'REACHED_NEXT_SECTION QUEUE_RC=2 QUEUE_TAIL_BAD=1' <<<\"\$qout\""
+# An unmeasurable queue (API read failure / rate limit) is UNPROVEN, NOT a
+# queue-tail defect. Collapsing QUEUE_RC=2 into QUEUE_TAIL_BAD=1 reported an
+# exhausted GitHub quota as "oldest queued job exceeded 20m" -- a false claim
+# about the queue, measured live 2026-11-04 at 0/5000 quota (jleechan-hxz0).
+check "failing gh: unmeasurable queue is UNPROVEN, not a tail defect" "grep -q 'REACHED_NEXT_SECTION QUEUE_RC=2 QUEUE_TAIL_BAD=0 QUEUE_TAIL_UNPROVEN=1' <<<\"\$qout\""
 check "failing gh: no unbound-variable abort" "! grep -q 'unbound variable' <<<\"\$qout\""
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
