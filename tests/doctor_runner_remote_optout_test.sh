@@ -70,6 +70,24 @@ OPTOUT_SRC=$(sed -n "${OPTOUT_START},$((OPTOUT_END - 1))p" "$DOCTOR_SCRIPT")
 # complete statement. (The opt-out arm itself is what we then exercise.)
 OPTOUT_SRC="${OPTOUT_SRC}"$'\nfi'
 
+# The LOCAL opt-out decision block. A remote-only opt-out left a real gap
+# (codex P0 on PR #214): a doctor run ON the parked host still enumerated and
+# probed its own slots, so the parked host stayed "4 DOWN" and exited
+# unhealthy even with the opt-out set. Whichever leg the opt-out names must be
+# zeroed, and that includes the leg the script is running on.
+LOCAL_START=$(grep -n '^LOCAL_OPTED_OUT=0$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
+if [ -z "$LOCAL_START" ]; then
+  echo "FAIL: could not locate 'LOCAL_OPTED_OUT=0' block in $DOCTOR_SCRIPT" >&2
+  echo "      (PR #214 codex P0: the parked host's OWN leg must be zeroed too)" >&2
+  exit 1
+fi
+LOCAL_END=$(awk -v s="$LOCAL_START" 'NR>s && /^HOST_LABEL=/{print NR; exit}' "$DOCTOR_SCRIPT")
+if [ -z "$LOCAL_END" ]; then
+  echo "FAIL: could not locate HOST_LABEL= after the local opt-out block" >&2
+  exit 1
+fi
+LOCAL_SRC=$(sed -n "${LOCAL_START},$((LOCAL_END - 1))p" "$DOCTOR_SCRIPT")
+
 # --- structural guards: the opt-out must exist and stay explicit ------------
 
 if ! grep -Fq 'MAC_RUNNER_DISABLED' "$DOCTOR_SCRIPT"; then
@@ -179,6 +197,49 @@ run_case "mac-down-without-optout" "linux" "MAC_RUNNER_DISABLED" "0" 4 4 5 || OV
 
 # (d) A non-"1" value must not activate the opt-out (no truthiness accidents).
 run_case "mac-down-optout-yes-is-not-enabled" "linux" "MAC_RUNNER_DISABLED" "yes" 4 4 5 || OVERALL_PASS=false
+
+# --- local leg: the parked host's OWN fleet ---------------------------------
+# PR #214 codex P0: a remote-only opt-out left a doctor run ON the parked host
+# still enumerating and probing its own slots, so the parked host itself stayed
+# "4 DOWN" and exited unhealthy. These cases replay the real local decision
+# block and assert the local expected count collapses to 0 when, and only
+# when, this host is the platform the opt-out names.
+run_local_case() {
+  local label="$1" platform="$2" env_name="$3" env_val="$4"
+  local configured="$5" expect_local_count="$6"
+
+  local PLATFORM="$platform"
+  local CONFIGURED_COUNT="$configured"
+  if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
+  export "${env_name}=${env_val}"
+
+  eval "$LOCAL_SRC"
+
+  local PASS=true
+  if [ "$CONFIGURED_COUNT" -ne "$expect_local_count" ]; then
+    echo "  [$label] expected local CONFIGURED_COUNT=$expect_local_count got $CONFIGURED_COUNT -- FAIL"
+    PASS=false
+  fi
+  if [ "$PASS" = "true" ]; then
+    printf '  [%s] local configured=%s (expected %s) -- PASS\n' \
+      "$label" "$CONFIGURED_COUNT" "$expect_local_count"
+    return 0
+  fi
+  return 1
+}
+
+# Doctor ON the parked Mac, opt-out set -> this host expects 0 slots.
+run_local_case "mac-host-parked-local" "macos" "MAC_RUNNER_DISABLED" "1" 4 0 || OVERALL_PASS=false
+
+# Doctor on Linux with MAC_RUNNER_DISABLED set -> Linux is NOT parked; keep 20.
+# (Guards against one env var zeroing the wrong platform's local leg.)
+run_local_case "linux-host-mac-parked-local-untouched" "linux" "MAC_RUNNER_DISABLED" "1" 20 20 || OVERALL_PASS=false
+
+# Doctor ON Linux with the Linux leg parked -> 0 slots locally.
+run_local_case "linux-host-parked-local" "linux" "REMOTE_LINUX_DISABLED" "1" 20 0 || OVERALL_PASS=false
+
+# Default (no opt-out): the local leg keeps its configured count.
+run_local_case "mac-host-default-local" "macos" "MAC_RUNNER_DISABLED" "0" 4 4 || OVERALL_PASS=false
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
