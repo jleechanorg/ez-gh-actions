@@ -1295,7 +1295,39 @@ REMOTE_DOWN_SLOTS=()
 REMOTE_UNREACHABLE=0
 REMOTE_CONFIG_UNPROVEN=0
 if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"; else DEFAULT_REMOTE_COUNT="$DEFAULT_MAC_RUNNER_COUNT"; fi
-if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
+# INTENTIONAL REMOTE OPT-OUT (bead jleechan-hxz0). A deliberately parked
+# platform is a DECISION, not an outage, and the two must never render the
+# same way: an operator who turns the Mac fleet off would otherwise get
+# "4 slot(s) DOWN" plus 4 slot-proof criticals forever, so a genuinely
+# healthy 20/20 Linux fleet reads RED and nothing can tell a deliberate
+# suspension from a crashed host.
+#
+# The opt-out is an EXPLICIT declaration (env var), never inferred from live
+# state: a daemon that died on its own also reads as "not running", so
+# reading launchd/docker here would silently absorb real outages.
+#   MAC_RUNNER_DISABLED=1        (from a macOS doctor or a Linux doctor)
+#   REMOTE_LINUX_DISABLED=1      (from a macOS doctor, parking the Linux leg)
+# Set it only while a platform is intentionally parked, and say so in the
+# fleet-capacity record (AGENTS.md) together with what restores it.
+REMOTE_DISABLED=0
+if [ "$PLATFORM" = "macos" ]; then
+  [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && REMOTE_DISABLED=1
+else
+  [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && REMOTE_DISABLED=1
+fi
+if [ "$REMOTE_DISABLED" -eq 1 ]; then
+  # Do not consult the remote host at all: an opt-out asserts the platform
+  # SHOULD have zero slots, so there is nothing to inventory and nothing to
+  # prove. No DOWN entries, no criticals, and REMOTE_COUNT stays 0 so the
+  # verdict's denominator matches the effective contract.
+  REMOTE_COUNT=0
+  REMOTE_PREFIX="${REMOTE_PREFIX:-<disabled>}"
+  ok "$REMOTE_LABEL intentionally DISABLED (operator opt-out) — 0 slot(s) expected, excluded from the fleet contract; unset the opt-out to require proof"
+  REMOTE_EXECUTING_SLOTS=()
+  REMOTE_IDLE_SLOTS=()
+  REMOTE_CYCLING_SLOTS=()
+  REMOTE_DOWN_SLOTS=()
+elif timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   # Config lookup: one retry with a longer timeout. A failed read leaves the
   # value EMPTY (never a hardcoded guess) -> remote fleet marked UNPROVEN below.
   if [ "$PLATFORM" = "macos" ]; then
@@ -1379,6 +1411,7 @@ else
   SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
 fi
 export REMOTE_UNREACHABLE
+export REMOTE_DISABLED
 
 # Serve-loop-heartbeat signal: the largest gap between consecutive
 # "queue monitor:" journal lines (same-PID only — see compute_heartbeat_gap
@@ -1581,6 +1614,10 @@ compute_live_slot_critical() {
   printf '%d %d\n' "$live_n" "$critical"
 }
 FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))
+# Name the disabled leg in the verdict so a reader can tell "20/20 with the Mac
+# parked" from "20/24 with 4 broken" — those must never look identical.
+REMOTE_LEG_NOTE=""
+[ "${REMOTE_DISABLED:-0}" -eq 1 ] && REMOTE_LEG_NOTE=" (${REMOTE_LABEL} intentionally disabled)"
 read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
   compute_live_slot_critical \
     "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
@@ -1588,7 +1625,7 @@ read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
     "$FLEET_CONFIGURED_COUNT"
 )
 if [ "${LIVE_SLOT_CRITICAL:-0}" -eq 1 ]; then
-  bad "verdict: live-slot gate FAILED (managed live slots = ${FLEET_LIVE_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote; executing=$(( ${#EXECUTING_SLOTS[@]} + ${#REMOTE_EXECUTING_SLOTS[@]} )), idle-ok=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
+  bad "verdict: live-slot gate FAILED (managed live slots = ${FLEET_LIVE_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote${REMOTE_LEG_NOTE}; executing=$(( ${#EXECUTING_SLOTS[@]} + ${#REMOTE_EXECUTING_SLOTS[@]} )), idle-ok=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise
