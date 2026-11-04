@@ -1216,13 +1216,18 @@ list_slot_work() {
 
   if [ "$host" = "localhost" ] && [ -n "${LOCAL_SLOT_STATE_TABLE:-}" ] \
      && [ "$prefix" = "${RUNNER_NAME_PREFIX:-}" ] && [ "$count" = "${CONFIGURED_COUNT:-}" ]; then
-    for i in $(seq 1 "$count"); do
+    # `seq 1 0` prints "1 0" (counts DOWN), so a zero count would fabricate
+    # phantom slots "-1"/"-0". Enumerate only when there is something to
+    # enumerate (bead jleechan-hxz0: a parked host has count=0).
+    for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
       name="${prefix}-${i}"
       slot_state[i]=$(printf '%s\n' "$LOCAL_SLOT_STATE_TABLE" | awk -v n="$name" '$1==n{print $2; exit}')
       [ -z "${slot_state[i]:-}" ] && slot_state[i]="DOWN"
     done
   else
-    for i in $(seq 1 "$count"); do
+    for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
       slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
       [ "${slot_state[i]}" = "DOWN" ] && has_down=1
       [ "${slot_state[i]}" = "IDLE" ] && has_idle=1
@@ -1230,7 +1235,8 @@ list_slot_work() {
     if [ "$has_down" -eq 1 ] || [ "$has_idle" -eq 1 ]; then
       info "$label: first-pass DOWN/IDLE candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895) and fresh-container job-pickup lag (bead ez-gh-actions-9m8z)"
       sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
-      for i in $(seq 1 "$count"); do
+      for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
         case "${slot_state[i]}" in
           DOWN)
             if ! second_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
@@ -1258,7 +1264,8 @@ list_slot_work() {
       if [ "$idle_to_down" -eq 1 ]; then
         sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
       fi
-      for i in $(seq 1 "$count"); do
+      for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
         [ "${slot_state[i]}" != "IDLE_DOWN" ] && continue
         if ! third_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
           slot_state[i]="UNRESOLVED_DOWN"
@@ -1288,7 +1295,8 @@ list_slot_work() {
         _log=""
         _respawn_fetch_failed=1
       fi
-      for i in $(seq 1 "$count"); do
+      for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
         [ "${slot_state[i]}" != "DOWN" ] && continue
         name="${prefix}-${i}"
         if [ -n "$_log" ] && [ "$(printf '%s\n' "$_log" | journal_has_respawn_evidence "$name")" = "1" ]; then
@@ -1304,7 +1312,8 @@ list_slot_work() {
   LAST_DOWN_SLOTS=()
   local exec_n=0 idl=0 dn=0 cyc=0
   printf "    %-22s %-13s %s\n" "SLOT" "STATE" "EVIDENCE"
-  for i in $(seq 1 "$count"); do
+  for i in $(seq 1 "$count" 2>/dev/null); do
+    [ "$count" -gt 0 ] || break
     name="${prefix}-${i}"
     case "${slot_state[i]:-DOWN}" in
       EXECUTING)
@@ -1862,6 +1871,15 @@ read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDI
     "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_DOWN_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
     "${STARVED_PRESENT:-0}"
 )
+# An UNPROVEN input may never masquerade as a clean bill of health. Every gate
+# above passed, but if the queue could not be measured we cannot claim the fleet
+# is healthy -- say so and exit non-zero so callers/CI cannot read a quota wall
+# as a green fleet (codex P0 on PR #214; measured live at 0/5000 quota).
+if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ]; then
+  warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT queue/API evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, API_UNVERIFIED=${API_UNVERIFIED:-0}) — NOT a healthy verdict; re-run when GitHub API quota recovers"
+  info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
+  exit 3
+fi
 ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
 info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0
