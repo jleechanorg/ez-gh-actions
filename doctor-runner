@@ -676,43 +676,59 @@ fi
 export REMOTE_PREFIX
 
 # BEGIN parked-leg helpers
-# --- single source of truth: is this runner's leg intentionally parked? -------
+# --- single source of truth: does this runner belong to an intentionally
+# --- parked leg? -------------------------------------------------------------
 # A parked ("intentionally DISABLED") leg must never contribute execution proof.
-# Eight review rounds each found one more place that decided this inline, and the
-# copies drifted (a config-less host resolves its prefix to ez-org-runner, which
-# stopped matching real ez-mac-runner-h-* runners). One helper, one rule, called
-# from every consumer.
+# Eight review rounds each found one more place that decided this inline and the
+# copies drifted, so there is exactly ONE rule now, used by every consumer.
 #
-# Rule: a runner belongs to a leg if its name starts with ANY prefix known to
-# identify that leg -- the platform default, the historical variants, and the
-# legacy ez-org-runner fallback -- not just the one resolved on this host.
-leg_known_prefixes() { # $1=platform
-  if [ "$1" = "macos" ]; then
-    printf '%s\n' "ez-mac-runner-h" "ez-mac-runner" "ez-mac-runner-g" "ez-org-runner"
-  else
-    printf '%s\n' "ez-runner-c" "ez-runner-b" "ez-org-runner"
+# Attribution must use the CONFIGURED prefix, not a hardcoded list: a host may
+# legitimately be configured with any name_prefix (e.g. ci-macos), and a fixed
+# list both missed those and put ez-org-runner in BOTH legs, so parking one
+# platform wrongly rejected the other's legacy runners (codex P0 at d6234e3).
+#
+#   parked_leg_prefixes  -> the configured prefix(es) identifying a parked leg
+#   runner_from_parked_leg <name>
+#
+# The parked leg's identity is the prefix resolved for that leg on this host.
+# The enabled leg is then "anything else that is on our fleet", which the
+# caller tests separately with runner_on_our_fleet.
+parked_leg_prefixes() { # prints the configured prefixes of the PARKED leg(s)
+  local _other
+  if [ "${LOCAL_DISABLED:-0}" -eq 1 ]; then
+    printf '%s\n' "${RUNNER_NAME_PREFIX:-}"
+  fi
+  if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then
+    # The remote leg's configured prefix, if the SSH config read has populated
+    # it by now; otherwise fall back to this host's env override or default.
+    if [ "$PLATFORM" = "macos" ]; then
+      _other="${REMOTE_PREFIX:-${REMOTE_LINUX_PREFIX:-ez-runner-c}}"
+    else
+      _other="${REMOTE_PREFIX:-${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}}"
+    fi
+    printf '%s\n' "$_other"
   fi
 }
 
-runner_in_leg() { # $1=runner name, $2=platform
-  local _n="$1" _p="$2" _cand
-  [ -n "$_n" ] || return 1
+runner_from_parked_leg() { # $1=runner name
+  local _rn="$1" _cand
+  [ -n "$_rn" ] || return 1
   while IFS= read -r _cand; do
     [ -n "$_cand" ] || continue
-    [[ "$_n" == "${_cand}"* ]] && return 0
-  done < <(leg_known_prefixes "$_p")
+    [[ "$_rn" == "${_cand}"* ]] && return 0
+  done < <(parked_leg_prefixes)
   return 1
 }
 
-runner_from_parked_leg() { # $1=runner name -- uses PLATFORM + the opt-out decisions
+# Is this runner a member of OUR fleet at all (either leg, any known shape)?
+# Deliberately permissive: it decides "count this as a candidate proof", and the
+# parked-leg exclusion above removes capacity that is intentionally not running.
+runner_on_our_fleet() { # $1=runner name
   local _rn="$1"
-  if [ "${LOCAL_DISABLED:-0}" -eq 1 ] && runner_in_leg "$_rn" "$PLATFORM"; then
-    return 0
-  fi
-  if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then
-    if [ "$PLATFORM" = "macos" ]; then runner_in_leg "$_rn" "linux" && return 0
-    else runner_in_leg "$_rn" "macos" && return 0; fi
-  fi
+  [ -n "$_rn" ] || return 1
+  [[ "$_rn" == "ez-"* ]] && return 0
+  [ -n "${RUNNER_NAME_PREFIX:-}" ] && [[ "$_rn" == "${RUNNER_NAME_PREFIX}"* ]] && return 0
+  [ -n "${REMOTE_PREFIX:-}" ] && [[ "$_rn" == "${REMOTE_PREFIX}"* ]] && return 0
   return 1
 }
 # END parked-leg helpers
@@ -736,12 +752,8 @@ while read -r rid; do
   # an earlier revision did, and on a parked-local host it rejected the enabled
   # remote leg's successful jobs (codex P0 at 609e288). The rule is therefore
   # negative: exclude a known-parked leg, accept everything else on the fleet.
-  _local_prefix="${RUNNER_NAME_PREFIX:-}"
-  _remote_prefix="${REMOTE_PREFIX:-}"
   _is_fleet=0
-  [[ "$rn" == "ez-"* ]] && _is_fleet=1
-  if [ -n "$_local_prefix" ] && [[ "$rn" == "${_local_prefix}"* ]]; then _is_fleet=1; fi
-  if [ -n "$_remote_prefix" ] && [[ "$rn" == "${_remote_prefix}"* ]]; then _is_fleet=1; fi
+  if runner_on_our_fleet "$rn"; then _is_fleet=1; fi
   # Delegated to the single canonical helper (see runner_from_parked_leg).
   _parked_leg=0
   if runner_from_parked_leg "$rn"; then _parked_leg=1; fi

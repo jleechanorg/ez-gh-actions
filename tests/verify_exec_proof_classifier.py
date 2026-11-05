@@ -54,7 +54,7 @@ cases = [
     # label, LOCAL_DISABLED, REMOTE_DISABLED, REMOTE_COUNT, local_pfx, remote_pfx, runner, expect, host_platform
     ("macos parked, Linux remote success counts", 1, 0, "", "ez-org-runner", "", "ez-runner-c-3", 1, "macos"),
     ("macos parked, Linux remote success counts (count set)", 1, 0, 20, "ez-org-runner", "ez-runner-c", "ez-runner-c-3", 1, "macos"),
-    ("macos parked, Mac legacy success rejected", 1, 0, 20, "ez-org-runner", "ez-runner-c", "ez-mac-runner-h-1", 0, "macos"),
+    ("macos parked (configured ez-org-runner), its own legacy run rejected", 1, 0, 20, "ez-org-runner", "ez-runner-c", "ez-org-runner-1", 0, "macos"),
     ("linux active, Linux success", 0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1, "linux"),
     ("linux host, remote Mac parked, Mac success rejected", 0, 1, 0, "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0, "linux"),
     ("non-fleet runner rejected", 0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "gh-hosted-1", 0, "linux"),
@@ -63,6 +63,11 @@ cases = [
     # default before section 7 and REMOTE_COUNT is still empty.
     ("linux doctor + MAC parked, Mac success rejected", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0, "linux"),
     ("linux doctor + MAC parked, Linux success counts", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1, "linux"),
+    # codex P0 at d6234e3: a CONFIGURED custom prefix must still be recognised
+    # as the parked leg, and ez-org-runner must not leak across both legs.
+    ("macos parked with CUSTOM prefix ci-macos, its run rejected", 1, 0, "", "ci-macos", "", "ci-macos-1", 0, "macos"),
+    ("macos parked with CUSTOM prefix ci-macos, Linux run counts", 1, 0, 20, "ci-macos", "ez-runner-c", "ez-runner-c-3", 1, "macos"),
+    ("linux active, legacy ez-org-runner success counts", 0, 0, 0, "ez-org-runner", "ez-mac-runner-h", "ez-org-runner-2", 1, "linux"),
 ]
 
 fail = 0
