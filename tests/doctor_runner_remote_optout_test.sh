@@ -54,7 +54,11 @@ FUNC_SRC=$(sed -n "${FUNC_START},${FUNC_END}p" "$DOCTOR_SCRIPT")
 # The opt-out decision block, bounded by its REMOTE_DISABLED=0 marker and the
 # `elif timeout ...` line that begins the real SSH branch. Extracting it keeps
 # this test honest: if the production block changes shape, the test notices.
-OPTOUT_START=$(grep -n '^REMOTE_DISABLED=0$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
+# Anchor on the consumer block, NOT on the `REMOTE_DISABLED=0` declaration.
+# The declaration is hoisted above section 7 for ordering reasons, so anchoring
+# there now spans ~850 lines (including live `gh` calls) instead of the block
+# under test.
+OPTOUT_START=$(grep -n '^if \[ "${REMOTE_DISABLED:-0}" -eq 1 \]; then$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
 if [ -z "$OPTOUT_START" ]; then
   echo "FAIL: could not locate 'REMOTE_DISABLED=0' opt-out block in $DOCTOR_SCRIPT" >&2
   exit 1
@@ -124,14 +128,30 @@ run_case() {
   [ "$platform" = "macos" ] && REMOTE_LABEL="linux (jeff-ubuntu)"
   local PLATFORM="$platform"
   local REMOTE_COUNT="$remote_count"
+  # Seed every global the extracted opt-out block can touch. It is replayed
+  # under this script's `set -u`, so an unseeded reference aborts the case with
+  # 'unbound variable' instead of testing anything (CI caught EZGHA_REPO and
+  # LOCAL_DISABLED this way).
+  local EZGHA_REPO="jleechanorg/ez-gh-actions"
+  local LOCAL_DISABLED=0
+  local RUNNER_NAME_PREFIX="ez-runner-c"
+  # Only the arm under test is set; the other leg's opt-out stays unset so a
+  # cross-wired opt-out fails here. Must precede the REMOTE_DISABLED mapping.
+  if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
+  export "${env_name}=${env_val}"
+  # REMOTE_DISABLED is decided by the hoisted declaration block, which the test
+  # no longer extracts (it now anchors on the consumer). Mirror production's
+  # mapping so the consumer under test sees the same value the real script would.
+  local REMOTE_DISABLED=0
+  if [ "$platform" = "macos" ]; then
+    if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
+  else
+    if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
+  fi
   local SLOT_PROOF_CRITICAL=0
   local REMOTE_EXECUTING_SLOTS=() REMOTE_IDLE_SLOTS=()
   local REMOTE_CYCLING_SLOTS=() REMOTE_DOWN_SLOTS=()
 
-  # Only the arm under test is set; the other leg's opt-out stays unset so a
-  # cross-wired opt-out fails here.
-  if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
-  export "${env_name}=${env_val}"
 
   eval "$OPTOUT_SRC"
 
