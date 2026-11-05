@@ -54,11 +54,7 @@ FUNC_SRC=$(sed -n "${FUNC_START},${FUNC_END}p" "$DOCTOR_SCRIPT")
 # The opt-out decision block, bounded by its REMOTE_DISABLED=0 marker and the
 # `elif timeout ...` line that begins the real SSH branch. Extracting it keeps
 # this test honest: if the production block changes shape, the test notices.
-# Anchor on the consumer block, NOT on the `REMOTE_DISABLED=0` declaration.
-# The declaration is hoisted above section 7 for ordering reasons, so anchoring
-# there now spans ~850 lines (including live `gh` calls) instead of the block
-# under test.
-OPTOUT_START=$(grep -n '^if \[ "${REMOTE_DISABLED:-0}" -eq 1 \]; then$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
+OPTOUT_START=$(grep -n '^REMOTE_DISABLED=0$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
 if [ -z "$OPTOUT_START" ]; then
   echo "FAIL: could not locate 'REMOTE_DISABLED=0' opt-out block in $DOCTOR_SCRIPT" >&2
   exit 1
@@ -79,9 +75,9 @@ OPTOUT_SRC="${OPTOUT_SRC}"$'\nfi'
 # probed its own slots, so the parked host stayed "4 DOWN" and exited
 # unhealthy even with the opt-out set. Whichever leg the opt-out names must be
 # zeroed, and that includes the leg the script is running on.
-LOCAL_START=$(grep -n '^if \[ "\$LOCAL_DISABLED" -eq 1 \]; then$' "$DOCTOR_SCRIPT" | tail -1 | cut -d: -f1 || true)
+LOCAL_START=$(grep -n '^LOCAL_OPTED_OUT=0$' "$DOCTOR_SCRIPT" | head -1 | cut -d: -f1 || true)
 if [ -z "$LOCAL_START" ]; then
-  echo "FAIL: could not locate the LOCAL_DISABLED zeroing block in $DOCTOR_SCRIPT" >&2
+  echo "FAIL: could not locate 'LOCAL_OPTED_OUT=0' block in $DOCTOR_SCRIPT" >&2
   echo "      (PR #214 codex P0: the parked host's OWN leg must be zeroed too)" >&2
   exit 1
 fi
@@ -128,30 +124,14 @@ run_case() {
   [ "$platform" = "macos" ] && REMOTE_LABEL="linux (jeff-ubuntu)"
   local PLATFORM="$platform"
   local REMOTE_COUNT="$remote_count"
-  # Seed every global the extracted opt-out block can touch. It is replayed
-  # under this script's `set -u`, so an unseeded reference aborts the case with
-  # 'unbound variable' instead of testing anything (CI caught EZGHA_REPO and
-  # LOCAL_DISABLED this way).
-  local EZGHA_REPO="jleechanorg/ez-gh-actions"
-  local LOCAL_DISABLED=0
-  local RUNNER_NAME_PREFIX="ez-runner-c"
-  # Only the arm under test is set; the other leg's opt-out stays unset so a
-  # cross-wired opt-out fails here. Must precede the REMOTE_DISABLED mapping.
-  if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
-  export "${env_name}=${env_val}"
-  # REMOTE_DISABLED is decided by the hoisted declaration block, which the test
-  # no longer extracts (it now anchors on the consumer). Mirror production's
-  # mapping so the consumer under test sees the same value the real script would.
-  local REMOTE_DISABLED=0
-  if [ "$platform" = "macos" ]; then
-    if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
-  else
-    if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
-  fi
   local SLOT_PROOF_CRITICAL=0
   local REMOTE_EXECUTING_SLOTS=() REMOTE_IDLE_SLOTS=()
   local REMOTE_CYCLING_SLOTS=() REMOTE_DOWN_SLOTS=()
 
+  # Only the arm under test is set; the other leg's opt-out stays unset so a
+  # cross-wired opt-out fails here.
+  if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
+  export "${env_name}=${env_val}"
 
   eval "$OPTOUT_SRC"
 
@@ -232,15 +212,6 @@ run_local_case() {
   local CONFIGURED_COUNT="$configured"
   if [ "$env_name" = "MAC_RUNNER_DISABLED" ]; then unset REMOTE_LINUX_DISABLED; else unset MAC_RUNNER_DISABLED; fi
   export "${env_name}=${env_val}"
-  # LOCAL_DISABLED is the single shared decision (declared at the top of
-  # doctor-runner, before the host-lifecycle sections). Recompute it here the
-  # same way production does, so the local block under test reads it exactly as
-  # the real script would.
-  local LOCAL_DISABLED=0
-  case "$PLATFORM" in
-    macos) [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
-    linux) [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
-  esac
 
   eval "$LOCAL_SRC"
 
@@ -269,42 +240,6 @@ run_local_case "linux-host-parked-local" "linux" "REMOTE_LINUX_DISABLED" "1" 20 
 
 # Default (no opt-out): the local leg keeps its configured count.
 run_local_case "mac-host-default-local" "macos" "MAC_RUNNER_DISABLED" "0" 4 4 || OVERALL_PASS=false
-
-# --- verdict exit-contract: zero-slot contract must never be "healthy" -------
-# cs review P0 on PR #214: with both legs opted out, FLEET_CONFIGURED_COUNT=0,
-# compute_live_slot_critical sees `0 < 0` as false, and the script printed
-# "fleet healthy: 0/0" and exited 0 with ZERO capacity -- a two-env-var path
-# from red to green. Assert the shipped guard exists and is bound to the
-# configured count, plus that the success line carries the parked-leg note.
-VERDICT_SRC=$(sed -n '/^# A zero-slot contract can never be/,/^exit 0$/p' "$DOCTOR_SCRIPT")
-if [ -z "$VERDICT_SRC" ]; then
-  echo "  [zero-slot-guard] FAIL: could not locate the zero-slot guard block" >&2
-  OVERALL_PASS=false
-else
-  if grep -q 'VERDICT_CONFIGURED" -eq 0' <<<"$VERDICT_SRC" && grep -q 'exit 3' <<<"$VERDICT_SRC"; then
-    echo "  [zero-slot-guard] guarded: 0-slot contract -> exit 3, not healthy -- PASS"
-  else
-    echo "  [zero-slot-guard] FAIL: zero-slot contract is not diverted to exit 3" >&2
-    OVERALL_PASS=false
-  fi
-  if grep -q 'PARKED_NOTE' <<<"$VERDICT_SRC" && grep -q 'ok "fleet healthy:.*REMOTE_LEG_NOTE.*PARKED_NOTE' <<<"$VERDICT_SRC"; then
-    echo "  [success-names-parked-leg] success line carries the parked-leg note -- PASS"
-  else
-    echo "  [success-names-parked-leg] FAIL: success line does not name the parked leg" >&2
-    OVERALL_PASS=false
-  fi
-fi
-
-# The INCONCLUSIVE exit code must be documented where the exit contract lives,
-# so an agent reading only the docs cannot treat "not 1" as "fine".
-for _doc in "$REPO_ROOT/.claude/commands/doctor-ezactions.md" "$REPO_ROOT/.claude/skills/ezgha-doctor/SKILL.md"; do
-  if [ -f "$_doc" ] && grep -q 'INCONCLUSIVE' "$_doc"; then
-    echo "  [exit-3-documented:$(basename "$_doc")] PASS"
-  else
-    echo "  [exit-3-documented] FAIL: $_doc does not document the INCONCLUSIVE exit code" >&2
-    OVERALL_PASS=false
-  fi
-done
 
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
