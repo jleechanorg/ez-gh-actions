@@ -73,6 +73,7 @@ jobs:
       - name: Doctor-runner regression tests
         run: |
           bash tests/doctor_runner_expected_containers_test.sh
+          bash tests/doctor_runner_heartbeat_parked_exempt_test.sh
           bash tests/doctor_runner_heartbeat_starvation_test.sh
           bash tests/doctor_runner_host_pressure_test.sh
           bash tests/doctor_runner_host_lifecycle_test.sh
