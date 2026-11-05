@@ -13,6 +13,10 @@ DOC="$REPO/doctor-runner"
 DECL=$(awk '/^# WHO is parked, decided before any consumer/{f=1} f{print} f&&/^export REMOTE_PREFIX$/{exit}' "$DOC")
 [ -n "$DECL" ] || { echo "FAIL: could not extract the hoisted opt-out block"; exit 1; }
 
+# --- canonical parked-leg helpers (delimited by sentinels) ------------------
+HELPERS=$(awk '/BEGIN parked-leg helpers/{f=1;next} /END parked-leg helpers/{exit} f' "$DOC")
+[ -n "$HELPERS" ] || { echo "FAIL: could not extract the parked-leg helpers"; exit 1; }
+
 # --- extract section 7's classifier -----------------------------------------
 CLS=$(awk '/^  # Count a success as execution proof only/{f=1} f{print} f&&/^  fi$/ && prev_done{exit} {prev_done=($0 ~ /^  fi$/)}' "$DOC")
 # simpler: take through the last "fi" before the read-loop "done < <("
@@ -44,6 +48,7 @@ echo "--- P0: parked-leg exclusion works in production order ---"
 got=$(PLATFORM=linux MAC_RUNNER_DISABLED=1 bash -c "$(echo "$DECL" | grep -v '^#')
   REAL_ON_FLEET=0; rid=1; rn=ez-mac-runner-h-1; conc=success
   ok(){ :; }; warn(){ :; }
+$HELPERS
 $CLS
 printf '%s' \"\$REAL_ON_FLEET\"")
 check "linux doctor + MAC parked: Mac success REJECTED" "$got" "0"
@@ -51,6 +56,7 @@ check "linux doctor + MAC parked: Mac success REJECTED" "$got" "0"
 got=$(PLATFORM=linux MAC_RUNNER_DISABLED=1 bash -c "$(echo "$DECL" | grep -v '^#')
   REAL_ON_FLEET=0; rid=1; rn=ez-runner-c-3; conc=success
   ok(){ :; }; warn(){ :; }
+$HELPERS
 $CLS
 printf '%s' \"\$REAL_ON_FLEET\"")
 check "linux doctor + MAC parked: Linux success ACCEPTED" "$got" "1"
@@ -59,6 +65,7 @@ check "linux doctor + MAC parked: Linux success ACCEPTED" "$got" "1"
 got=$(PLATFORM=macos REMOTE_LINUX_DISABLED=1 bash -c "$(echo "$DECL" | grep -v '^#')
   REAL_ON_FLEET=0; rid=1; rn=ez-runner-c-3; conc=success
   ok(){ :; }; warn(){ :; }
+$HELPERS
 $CLS
 printf '%s' \"\$REAL_ON_FLEET\"")
 check "macos doctor + Linux parked: Linux success REJECTED" "$got" "0"
@@ -68,6 +75,7 @@ if [ -n "$CAN" ]; then
   got=$(PLATFORM=linux MAC_RUNNER_DISABLED=1 bash -c "$(echo "$DECL" | grep -v '^#')
     CANARY_OK=''; cid=1; rn=ez-mac-runner-h-1; conc=success
     ok(){ :; }; bad(){ :; }
+$HELPERS
 $CAN
 printf '%s' \"\${CANARY_OK:-0}\"")
   check "linux doctor + MAC parked: canary on Mac REJECTED" "$got" "0"

@@ -675,6 +675,48 @@ if [ -z "${REMOTE_PREFIX:-}" ]; then
 fi
 export REMOTE_PREFIX
 
+# BEGIN parked-leg helpers
+# --- single source of truth: is this runner's leg intentionally parked? -------
+# A parked ("intentionally DISABLED") leg must never contribute execution proof.
+# Eight review rounds each found one more place that decided this inline, and the
+# copies drifted (a config-less host resolves its prefix to ez-org-runner, which
+# stopped matching real ez-mac-runner-h-* runners). One helper, one rule, called
+# from every consumer.
+#
+# Rule: a runner belongs to a leg if its name starts with ANY prefix known to
+# identify that leg -- the platform default, the historical variants, and the
+# legacy ez-org-runner fallback -- not just the one resolved on this host.
+leg_known_prefixes() { # $1=platform
+  if [ "$1" = "macos" ]; then
+    printf '%s\n' "ez-mac-runner-h" "ez-mac-runner" "ez-mac-runner-g" "ez-org-runner"
+  else
+    printf '%s\n' "ez-runner-c" "ez-runner-b" "ez-org-runner"
+  fi
+}
+
+runner_in_leg() { # $1=runner name, $2=platform
+  local _n="$1" _p="$2" _cand
+  [ -n "$_n" ] || return 1
+  while IFS= read -r _cand; do
+    [ -n "$_cand" ] || continue
+    [[ "$_n" == "${_cand}"* ]] && return 0
+  done < <(leg_known_prefixes "$_p")
+  return 1
+}
+
+runner_from_parked_leg() { # $1=runner name -- uses PLATFORM + the opt-out decisions
+  local _rn="$1"
+  if [ "${LOCAL_DISABLED:-0}" -eq 1 ] && runner_in_leg "$_rn" "$PLATFORM"; then
+    return 0
+  fi
+  if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then
+    if [ "$PLATFORM" = "macos" ]; then runner_in_leg "$_rn" "linux" && return 0
+    else runner_in_leg "$_rn" "macos" && return 0; fi
+  fi
+  return 1
+}
+# END parked-leg helpers
+
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
@@ -700,39 +742,9 @@ while read -r rid; do
   [[ "$rn" == "ez-"* ]] && _is_fleet=1
   if [ -n "$_local_prefix" ] && [[ "$rn" == "${_local_prefix}"* ]]; then _is_fleet=1; fi
   if [ -n "$_remote_prefix" ] && [[ "$rn" == "${_remote_prefix}"* ]]; then _is_fleet=1; fi
-  # Positively-parked exclusions. Match against EVERY prefix we know belongs to
-  # that leg -- the resolved one, the platform default, and the legacy
-  # ez-org-runner fallback used when config is absent -- because a host with no
-  # config resolves its prefix to ez-org-runner, which would otherwise let a
-  # real ez-mac-runner-h-* success escape the exclusion (codex P0 at 8ac5919).
+  # Delegated to the single canonical helper (see runner_from_parked_leg).
   _parked_leg=0
-  _leg_prefixes() { # $1=platform -> prefixes that identify that leg
-    local p="$1"
-    if [ "$p" = "macos" ]; then
-      printf '%s\n' "ez-mac-runner-h" "ez-mac-runner" "ez-mac-runner-g" "ez-org-runner"
-    else
-      printf '%s\n' "ez-runner-c" "ez-runner-b" "ez-org-runner"
-    fi
-  }
-  _matches_parked() { # $1=runner name, $2=platform
-    local n="$1" p="$2" cand
-    # The leg's own resolved prefix is authoritative when it names the platform.
-    while IFS= read -r cand; do
-      [ -n "$cand" ] || continue
-      [[ "$n" == "${cand}"* ]] && return 0
-    done < <(_leg_prefixes "$p")
-    return 1
-  }
-  if [ "${LOCAL_DISABLED:-0}" -eq 1 ] && _matches_parked "$rn" "$PLATFORM"; then
-    _parked_leg=1
-  fi
-  if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then
-    if [ "$PLATFORM" = "macos" ]; then
-      _matches_parked "$rn" "linux" && _parked_leg=1
-    else
-      _matches_parked "$rn" "macos" && _parked_leg=1
-    fi
-  fi
+  if runner_from_parked_leg "$rn"; then _parked_leg=1; fi
   if [ "$_is_fleet" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
     ok "run $rid: $conc on $rn (our fleet)"
     if [ "$conc" = "success" ]; then REAL_ON_FLEET=$((REAL_ON_FLEET+1)); fi
@@ -784,30 +796,9 @@ if [ "$PROVE" = "1" ]; then
     # here let a --prove canary that landed on a disabled leg report "fleet is
     # handling real jobs NOW" for capacity that is intentionally not running
     # (Dot /advice P2 at 5b2e4f3).
-    # Same known-prefix set as section 7: a parked leg must be recognised even
-    # when this host's config is absent and the prefix fell back to
-    # ez-org-runner (codex P0 at 8ac5919).
+    # Same canonical decision as section 7.
     _cn_parked=0
-    _cn_prefixes() {
-      if [ "$1" = "macos" ]; then
-        printf '%s\n' "ez-mac-runner-h" "ez-mac-runner" "ez-mac-runner-g" "ez-org-runner"
-      else
-        printf '%s\n' "ez-runner-c" "ez-runner-b" "ez-org-runner"
-      fi
-    }
-    _cn_match() {
-      local n="$1" cand
-      while IFS= read -r cand; do
-        [ -n "$cand" ] || continue
-        [[ "$n" == "${cand}"* ]] && return 0
-      done < <(_cn_prefixes "$2")
-      return 1
-    }
-    if [ "${LOCAL_DISABLED:-0}" -eq 1 ] && _cn_match "$rn" "$PLATFORM"; then _cn_parked=1; fi
-    if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then
-      if [ "$PLATFORM" = "macos" ]; then _cn_match "$rn" "linux" && _cn_parked=1
-      else _cn_match "$rn" "macos" && _cn_parked=1; fi
-    fi
+    if runner_from_parked_leg "$rn"; then _cn_parked=1; fi
     if [ "$_cn_parked" -eq 1 ]; then
       bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
     elif { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then

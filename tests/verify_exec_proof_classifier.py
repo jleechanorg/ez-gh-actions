@@ -33,7 +33,22 @@ if end is None:
     sys.exit(1)
 
 block = "\n".join(l for l in lines[start:end + 1] if not l.strip().startswith("#"))
-print(f"extracted {end - start + 1} lines (through line {end + 1})")
+
+# The classifier now delegates the parked-leg decision to canonical helpers
+# defined above section 7. Include them so the replay exercises the REAL rule
+# rather than an undefined function.
+# The canonical helpers are delimited by explicit sentinels so extraction cannot
+# drift as their bodies change.
+helper_start = next(
+    i for i, l in enumerate(lines) if "BEGIN parked-leg helpers" in l
+)
+helper_end = next(
+    i for i, l in enumerate(lines) if "END parked-leg helpers" in l
+)
+helpers = "\n".join(lines[helper_start:helper_end + 1])
+block = helpers + "\n" + block
+print(f"extracted classifier {end - start + 1} lines + helpers "
+      f"{helper_end - helper_start + 1} lines")
 
 cases = [
     # label, LOCAL_DISABLED, REMOTE_DISABLED, REMOTE_COUNT, local_pfx, remote_pfx, runner, expect, host_platform
