@@ -43,6 +43,11 @@ cases = [
     ("linux active, Linux success",                    0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1),
     ("remote leg parked, remote success rejected",     0, 1, 0, "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0),
     ("non-fleet runner rejected",                      0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "gh-hosted-1", 0),
+    # codex P0 at 5b2e4f3: a Linux doctor with the Mac parked, exercising the
+    # real production order where REMOTE_PREFIX is resolved from the platform
+    # default before section 7 and REMOTE_COUNT is still empty.
+    ("linux doctor + MAC parked, default remote pfx, Mac success", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0),
+    ("linux doctor + MAC parked, default remote pfx, Linux success", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1),
 ]
 
 fail = 0

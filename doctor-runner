@@ -651,6 +651,19 @@ fi
 # fleet. A completed run whose runner_name does not match RUNNER_NAME_PREFIX
 # means the job went to a retired fleet / GitHub-hosted / somewhere else.
 
+# Resolve the remote leg's PREFIX before section 7. Attribution needs it to tell
+# "this run came from the parked remote leg" from "this run came from the enabled
+# local leg"; leaving it empty until section 10 let a parked Mac's successes
+# count toward Linux's execution proof (codex P0 at 5b2e4f3). The prefix is
+# deterministic from the platform and env, so no SSH read is required here --
+# only REMOTE_COUNT needs section 10's config lookup.
+if [ "$PLATFORM" = "macos" ]; then
+  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
+else
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}"
+fi
+export REMOTE_PREFIX
+
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
@@ -1415,12 +1428,12 @@ list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 # (codex P0 at 609e288).
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
-  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-}"
+  REMOTE_PREFIX="${REMOTE_PREFIX:-${REMOTE_LINUX_PREFIX:-ez-runner-c}}"
   REMOTE_COUNT="${REMOTE_LINUX_COUNT:-}"
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-}"
+  REMOTE_PREFIX="${REMOTE_PREFIX:-${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}}"
   REMOTE_COUNT="${MAC_RUNNER_COUNT:-}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
