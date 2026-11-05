@@ -1492,7 +1492,7 @@ if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_C
 #   REMOTE_LINUX_DISABLED=1      (from a macOS doctor, parking the Linux leg)
 # Set it only while a platform is intentionally parked, and say so in the
 # fleet-capacity record (AGENTS.md) together with what restores it.
-if [ "$REMOTE_DISABLED" -eq 1 ]; then
+if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then
   # Do not consult the remote host at all: an opt-out asserts the platform
   # SHOULD have zero slots, so there is nothing to inventory and nothing to
   # prove. No DOWN entries, no criticals, and REMOTE_COUNT stays 0 so the
