@@ -89,8 +89,8 @@ esac
 #   REMOTE_LINUX_DISABLED=1   parks the Linux leg (from a macOS or Linux doctor)
 LOCAL_DISABLED=0
 case "$PLATFORM" in
-  macos) [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
-  linux) [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
+  macos) if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then LOCAL_DISABLED=1; fi ;;
+  linux) if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then LOCAL_DISABLED=1; fi ;;
 esac
 
 source "$SCRIPT_DIR/scripts/launchd-service-docker-endpoint.sh"
@@ -654,12 +654,6 @@ section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
 REAL_TOTAL=0
-if [ "$LOCAL_DISABLED" -eq 1 ]; then
-  # A parked leg has no registrations by definition, so no run can ever be
-  # attributed to it. Requiring execution proof from a deliberately empty fleet
-  # is the same defect as requiring it from a DOWN slot: state the truth instead.
-  ok "real job-execution proof NOT REQUIRED — $PLATFORM leg intentionally DISABLED (operator opt-out), so it has no runners to execute on; unset the opt-out to require proof"
-else
 while read -r rid; do
   [ -z "$rid" ] && continue
   REAL_TOTAL=$((REAL_TOTAL+1))
@@ -674,8 +668,15 @@ while read -r rid; do
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
 info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+if [ "$LOCAL_DISABLED" -eq 1 ]; then
+  # NOTE: the loop above deliberately still runs when a leg is parked. It matches
+  # BOTH fleets (${RUNNER_NAME_PREFIX}-* and ${REMOTE_PREFIX}/ez-*), so it is the
+  # proof for the leg that is still ENABLED -- skipping it entirely would report
+  # a parked Mac as healthy while Linux had no successful selftest at all (codex
+  # P0 at b9cac5d). Only the VERDICT gate below is exempted, and only because a
+  # parked leg cannot contribute a registration of its own.
+  info "parked leg $PLATFORM contributes no executions; the count above covers the enabled leg(s)"
 fi
-# end of the parked-host gate for section 7 (bead jleechan-hxz0)
 
 # --- E2. optional live canary: dispatch a job and prove it runs NOW ------
 # `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
@@ -1426,10 +1427,13 @@ if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_C
 # Set it only while a platform is intentionally parked, and say so in the
 # fleet-capacity record (AGENTS.md) together with what restores it.
 REMOTE_DISABLED=0
+# Explicit `if` blocks, never `[ .. ] && VAR=1`: a false test returns 1, and
+# under `set -o errexit` that can abort the whole script (codex P0 at b9cac5d
+# surfaced it via the extracted-block harness).
 if [ "$PLATFORM" = "macos" ]; then
-  [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && REMOTE_DISABLED=1
+  if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
 else
-  [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && REMOTE_DISABLED=1
+  if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
 fi
 if [ "$REMOTE_DISABLED" -eq 1 ]; then
   # Do not consult the remote host at all: an opt-out asserts the platform
@@ -1737,7 +1741,7 @@ FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))
 # Name the disabled leg in the verdict so a reader can tell "20/20 with the Mac
 # parked" from "20/24 with 4 broken" — those must never look identical.
 REMOTE_LEG_NOTE=""
-[ "${REMOTE_DISABLED:-0}" -eq 1 ] && REMOTE_LEG_NOTE=" (${REMOTE_LABEL} intentionally disabled)"
+if [ "${REMOTE_DISABLED:-0}" -eq 1 ]; then REMOTE_LEG_NOTE=" (${REMOTE_LABEL} intentionally disabled)"; fi
 read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
   compute_live_slot_critical \
     "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
@@ -1765,8 +1769,11 @@ if [ "$LOOP_FAILS" -gt 3 ]; then
     warn "ensure_count failed $LOOP_FAILS times in last ${LOOP_WINDOW}m (transient reconcile miss; $HEALTHY_RUNNERS healthy runners online)"
   fi
 fi
-# real-execution gate: at least one recent job must have succeeded on our fleet
-if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$LOCAL_DISABLED" -ne 1 ]; then
+# real-execution gate: at least one recent job must have succeeded on our fleet.
+# Exempted ONLY when there is nothing left to prove -- i.e. the local leg is
+# parked AND the remote leg is parked/absent too. A parked local leg alone still
+# requires proof from the enabled remote leg (codex P0 at b9cac5d).
+if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && { [ "$LOCAL_DISABLED" -ne 1 ] || [ "${REMOTE_COUNT:-0}" -gt 0 ]; }; then
   bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on our fleet)"
   CRITICAL=$((CRITICAL+1))
 fi
@@ -1876,8 +1883,12 @@ read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDI
 # above passed, but if the queue could not be measured we cannot claim the fleet
 # is healthy -- say so and exit non-zero so callers/CI cannot read a quota wall
 # as a green fleet (codex P0 on PR #214; measured live at 0/5000 quota).
-if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ]; then
-  warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT queue/API evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, API_UNVERIFIED=${API_UNVERIFIED:-0}) — NOT a healthy verdict; re-run when GitHub API quota recovers"
+# JOBLEVEL_FETCH_ERRORS is the live ledger of failed GitHub API reads (run-list
+# and per-run job fetches). An earlier revision tested API_UNVERIFIED, which is
+# assigned nowhere in this repo, so the guard was inert and a degraded job map
+# could still print a healthy verdict (codex P1 at b9cac5d).
+if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
+  warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT queue/API evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, JOBLEVEL_FETCH_ERRORS=${JOBLEVEL_FETCH_ERRORS:-0}) — NOT a healthy verdict; re-run when GitHub API quota recovers"
   info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
   exit 3
 fi
@@ -1896,7 +1907,7 @@ fi
 # confusion bead jleechan-hxz0 exists to end; REMOTE_LEG_NOTE was previously
 # only wired into the failure branch (cs review P0 on PR #214).
 PARKED_NOTE=""
-[ "${LOCAL_DISABLED:-0}" -eq 1 ] && PARKED_NOTE=" (${HOST_LABEL} leg intentionally disabled)"
+if [ "${LOCAL_DISABLED:-0}" -eq 1 ]; then PARKED_NOTE=" (${HOST_LABEL} leg intentionally disabled)"; fi
 ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down${REMOTE_LEG_NOTE}${PARKED_NOTE}"
 info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0
