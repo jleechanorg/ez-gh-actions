@@ -62,9 +62,17 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   if [ ! -f "$POLICY_FILE" ]; then echo "FATAL: policy file not found: $POLICY_FILE" >&2; exit 4; fi
   [ "$DRY_RUN" -eq 0 ] || { echo "[$NOW_ISO] [dry-run] would ensure metric runner_offline_queued_alert_count and Slack policy from $POLICY_FILE"; exit 0; }
   GCP_ARGS=(--project=worldarchitecture-ai --account=jleechan@gmail.com)
-  METRIC_ARGS=(runner_offline_queued_alert_count --description="ERROR entries from runner-offline-queued-alert (drives Slack policy)"
-    --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR' "${GCP_ARGS[@]}")
+  # The historical metric name says "offline", so a STALLED alert (runner
+  # ONLINE, queue wedged) read as an offline-runner incident. Keep the existing
+  # metric for OFFLINE -- its name is then accurate -- and add a correctly-named
+  # one for STALLED. Backwards compatible: an existing policy on the old metric
+  # keeps firing for OFFLINE.
+  METRIC_ARGS=(runner_offline_queued_alert_count --description="ERROR entries for an OFFLINE runner with queued runs (drives SMS policy)"
+    --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR AND jsonPayload.status="OFFLINE"' "${GCP_ARGS[@]}")
+  STALLED_METRIC_ARGS=(runner_online_queue_stalled_alert_count --description="ERROR entries for an ONLINE runner whose queue is stalled (drives SMS policy)"
+    --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR AND jsonPayload.status="STALLED"' "${GCP_ARGS[@]}")
   "$GCLOUD_BIN" logging metrics create "${METRIC_ARGS[@]}" 2>/dev/null || "$GCLOUD_BIN" logging metrics update "${METRIC_ARGS[@]}"
+  "$GCLOUD_BIN" logging metrics create "${STALLED_METRIC_ARGS[@]}" 2>/dev/null || "$GCLOUD_BIN" logging metrics update "${STALLED_METRIC_ARGS[@]}"
   POLICY_NAME="$(jq -r '.displayName' "$POLICY_FILE")"
   LEGACY_POLICY_NAME="[CRITICAL] Runner offline with queued runs: SMS (metric)"
   CURRENT_POLICIES=$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
@@ -164,11 +172,22 @@ else
   fi
 fi
 
+# Two DIFFERENT failures were sharing one status and one metric:
+#   OFFLINE  - the runner is not online and work is waiting on it
+#   STALLED  - the runner IS online but the queue has stopped moving
+# Both emitted status=DOWN into runner_offline_queued_alert_count, so an SMS
+# titled "runner offline with queued runs" arrived while the runner was
+# demonstrably online and busy (2026-11-05 09:45Z, oldest 48m, runner online the
+# whole time). The status now names what actually happened, and the metric
+# filter matches both so no alert is lost.
+ALERT_KIND=""
 MSG=""
 if [ "$RUNNER_STATUS" != online ] && [ "$QUEUED" -gt 0 ] && [ "$OLDEST_MIN" -ge "$MIN_QUEUED_MIN" ]; then
+  ALERT_KIND=OFFLINE
   MSG="$RUNNER is $RUNNER_STATUS in $REPO with $QUEUED queued run(s), oldest ${OLDEST_MIN}m"
 elif [ "$RUNNER_STATUS" = online ] && [ "$QUEUED" -gt 0 ] && [ "$OLDEST_MIN" -ge "$MAX_ONLINE_QUEUED_MIN" ]; then
-  MSG="$RUNNER is online in $REPO but queue is stalled: $QUEUED queued run(s), oldest ${OLDEST_MIN}m (>=${MAX_ONLINE_QUEUED_MIN}m; likely wedged build)"
+  ALERT_KIND=STALLED
+  MSG="$RUNNER is ONLINE but the queue is stalled: $QUEUED queued run(s), oldest ${OLDEST_MIN}m (>=${MAX_ONLINE_QUEUED_MIN}m; likely wedged build, not an offline runner)"
 fi
 
 if [ -n "$MSG" ]; then
@@ -176,7 +195,7 @@ if [ -n "$MSG" ]; then
   if [ "$PREV" = FAIL ] && [ $((NOW_EPOCH - LAST_SENT)) -lt "$COOLDOWN_SEC" ]; then
     echo "[$NOW_ISO] throttled" >&2; exit 1
   fi
-  emit ERROR DOWN "$MSG"
+  emit ERROR "$ALERT_KIND" "$MSG"
   save FAIL "$NOW_EPOCH" 0
   exit 1
 fi
