@@ -116,14 +116,17 @@ if [ "$TEST_SMS" -eq 1 ]; then
   exit 0
 fi
 
-PREV=OK; LAST_SENT=0; API_FAILS=0
+PREV=OK; LAST_SENT=0; API_FAILS=0; LAST_BLIND=0
 if [ -f "$STATE_FILE" ]; then
   PREV=$(jq -r '.status // "OK"' "$STATE_FILE" 2>/dev/null || echo OK)
   LAST_SENT=$(jq -r '.last_sent // 0' "$STATE_FILE" 2>/dev/null || echo 0)
   API_FAILS=$(jq -r '.api_failures // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+  LAST_BLIND=$(jq -r '.last_blind // 0' "$STATE_FILE" 2>/dev/null || echo 0)
 fi
-save() { # status last_sent api_failures
-  [ "$DRY_RUN" -eq 1 ] || jq -nc --arg s "$1" --argjson t "$2" --argjson f "$3" '{status:$s,last_sent:$t,api_failures:$f}' > "$STATE_FILE"
+save() { # status last_sent api_failures [last_blind]
+  local lb="${4:-${LAST_BLIND:-0}}"
+  [ "$DRY_RUN" -eq 1 ] || jq -nc --arg s "$1" --argjson t "$2" --argjson f "$3" --argjson b "$lb" \
+    '{status:$s,last_sent:$t,api_failures:$f,last_blind:$b}' > "$STATE_FILE"
 }
 
 if [ "$SIMULATE" -eq 1 ]; then
@@ -134,7 +137,7 @@ elif ! RUNNER_STATUS=$("$GH_BIN" api "repos/$REPO/actions/runners" --paginate \
       --jq ".workflow_runs[] | select(\"$WORKFLOW\" == \"\" or .name == \"$WORKFLOW\") | .created_at" | sort); then
   API_FAILS=$((API_FAILS + 1))
   echo "[$NOW_ISO] WARN: gh API failed ($API_FAILS consecutive); no verdict this cycle" >&2
-  if [ "$API_FAILS" -ge "$MAX_API_FAILURES" ] && [ $((NOW_EPOCH - LAST_SENT)) -ge "$COOLDOWN_SEC" ]; then
+  if [ "$API_FAILS" -ge "$MAX_API_FAILURES" ] && [ $((NOW_EPOCH - LAST_BLIND)) -ge "$COOLDOWN_SEC" ]; then
     # NOTE: an earlier revision emitted ERROR here, which incremented the
     # runner_offline_queued_alert_count metric and sent an SMS titled
     # "runner offline with queued runs" for a monitor that simply could not
@@ -142,7 +145,11 @@ elif ! RUNNER_STATUS=$("$GH_BIN" api "repos/$REPO/actions/runners" --paginate \
     # reuse that metric: WARNING keeps it in the log for diagnostics while
     # leaving the outage counter meaning what its name says.
     emit WARNING BLIND "runner monitor cannot reach GitHub for $API_FAILS consecutive checks ($RUNNER in $REPO unverified)"
-    LAST_SENT=$NOW_EPOCH
+    # Advance ONLY the diagnostic timestamp. Advancing LAST_SENT here made a
+    # genuine DOWN alert arriving inside the same cooldown look "throttled" and
+    # suppressed it -- blindness and an outage are independent events (codex P1
+    # on PR #214).
+    LAST_BLIND=$NOW_EPOCH
   fi
   save "$PREV" "$LAST_SENT" "$API_FAILS"
   exit 2
