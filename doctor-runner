@@ -651,16 +651,27 @@ fi
 # fleet. A completed run whose runner_name does not match RUNNER_NAME_PREFIX
 # means the job went to a retired fleet / GitHub-hosted / somewhere else.
 
-# Resolve the remote leg's PREFIX before section 7. Attribution needs it to tell
-# "this run came from the parked remote leg" from "this run came from the enabled
-# local leg"; leaving it empty until section 10 let a parked Mac's successes
-# count toward Linux's execution proof (codex P0 at 5b2e4f3). The prefix is
-# deterministic from the platform and env, so no SSH read is required here --
-# only REMOTE_COUNT needs section 10's config lookup.
+# WHO is parked, decided before any consumer. Execution-proof classification
+# (section 7) and the --prove canary both read REMOTE_DISABLED, and section 10
+# assigns it far too late for either -- codex caught this same ordering class
+# twice (5b2e4f3, ab90d52). Only the declaration lives here; the per-slot remote
+# inventory stays in section 10, where the SSH config read belongs.
+REMOTE_DISABLED=0
+# Explicit `if` blocks, never `[ .. ] && VAR=1`: a false test returns 1, and
+# under `set -o errexit` that can abort the whole script (codex P0 at b9cac5d
+# surfaced it via the extracted-block harness).
 if [ "$PLATFORM" = "macos" ]; then
-  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
+  if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
 else
-  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}"
+  if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
+fi
+
+# Best-effort remote prefix so a run can be attributed to a leg before section
+# 10's SSH read. That lookup is `[ -n "$REMOTE_PREFIX" ] || ...`, so an explicit
+# override still wins and the configured value is still read authoritatively.
+if [ -z "${REMOTE_PREFIX:-}" ]; then
+  if [ "$PLATFORM" = "macos" ]; then REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
+  else REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}"; fi
 fi
 export REMOTE_PREFIX
 
@@ -1439,12 +1450,12 @@ list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 # (codex P0 at 609e288).
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
-  REMOTE_PREFIX="${REMOTE_PREFIX:-${REMOTE_LINUX_PREFIX:-ez-runner-c}}"
+  REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-}"
   REMOTE_COUNT="${REMOTE_LINUX_COUNT:-}"
   REMOTE_LABEL="linux ($REMOTE_HOST)"
 else
   REMOTE_HOST="${EXPLICIT_WORK_HOST:-macbook}"
-  REMOTE_PREFIX="${REMOTE_PREFIX:-${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}}"
+  REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-}"
   REMOTE_COUNT="${MAC_RUNNER_COUNT:-}"
   REMOTE_LABEL="macos ($REMOTE_HOST)"
 fi
@@ -1481,15 +1492,6 @@ if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_C
 #   REMOTE_LINUX_DISABLED=1      (from a macOS doctor, parking the Linux leg)
 # Set it only while a platform is intentionally parked, and say so in the
 # fleet-capacity record (AGENTS.md) together with what restores it.
-REMOTE_DISABLED=0
-# Explicit `if` blocks, never `[ .. ] && VAR=1`: a false test returns 1, and
-# under `set -o errexit` that can abort the whole script (codex P0 at b9cac5d
-# surfaced it via the extracted-block harness).
-if [ "$PLATFORM" = "macos" ]; then
-  if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
-else
-  if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then REMOTE_DISABLED=1; fi
-fi
 if [ "$REMOTE_DISABLED" -eq 1 ]; then
   # Do not consult the remote host at all: an opt-out asserts the platform
   # SHOULD have zero slots, so there is nothing to inventory and nothing to
