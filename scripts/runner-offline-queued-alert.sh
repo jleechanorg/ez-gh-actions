@@ -29,6 +29,16 @@ STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/runner_offline_queued_${RUNNE
 mkdir -p "$(dirname "$STATE_FILE")"
 GH_BIN="${GH_BIN:-gh}"
 GCLOUD_BIN="${GCLOUD_BIN-$(command -v gcloud || true)}"
+# Use the GitHub App installation token when no GH_TOKEN is already set. Without
+# this the job authenticates as the operator's personal user token and competes
+# for the shared 5,000/hour quota; on 2026-11-04 that quota hit 0 and the monitor
+# went BLIND for 8 consecutive cycles, paging "runners down" while every runner
+# was healthy. The App token (~10k/hour) is minted for exactly this purpose.
+# Read-only use of an existing credential; falls back silently when absent.
+if [ -z "${GH_TOKEN:-}" ] && [ -r "$HOME/.config/ezgha/gh_token" ]; then
+  GH_TOKEN=$(cat "$HOME/.config/ezgha/gh_token" 2>/dev/null || true)
+  [ -n "$GH_TOKEN" ] && export GH_TOKEN
+fi
 DRY_RUN=0 SIMULATE=0 TEST_SMS=0 ENSURE_POLICY=0
 for a in "$@"; do
   case "$a" in
@@ -125,7 +135,13 @@ elif ! RUNNER_STATUS=$("$GH_BIN" api "repos/$REPO/actions/runners" --paginate \
   API_FAILS=$((API_FAILS + 1))
   echo "[$NOW_ISO] WARN: gh API failed ($API_FAILS consecutive); no verdict this cycle" >&2
   if [ "$API_FAILS" -ge "$MAX_API_FAILURES" ] && [ $((NOW_EPOCH - LAST_SENT)) -ge "$COOLDOWN_SEC" ]; then
-    emit ERROR BLIND "runner monitor cannot reach GitHub for $API_FAILS consecutive checks ($RUNNER in $REPO unverified)"
+    # NOTE: an earlier revision emitted ERROR here, which incremented the
+    # runner_offline_queued_alert_count metric and sent an SMS titled
+    # "runner offline with queued runs" for a monitor that simply could not
+    # reach the API. Blindness never observes runner state, so it must not
+    # reuse that metric: WARNING keeps it in the log for diagnostics while
+    # leaving the outage counter meaning what its name says.
+    emit WARNING BLIND "runner monitor cannot reach GitHub for $API_FAILS consecutive checks ($RUNNER in $REPO unverified)"
     LAST_SENT=$NOW_EPOCH
   fi
   save "$PREV" "$LAST_SENT" "$API_FAILS"
