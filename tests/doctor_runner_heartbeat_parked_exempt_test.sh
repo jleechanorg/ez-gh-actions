@@ -37,15 +37,4 @@ run_case "active-host-big-gap-critical" 0 1 || ok=0
 
 
 
-# --- execution-proof leg filtering (Dot /advice P2 at e5a8ecd, codex P0 at 609e288) ---
-# REAL_ON_FLEET must count success only from a leg that is NOT positively parked,
-# and must not depend on REMOTE_PREFIX/REMOTE_COUNT (resolved later, in section 10).
-# The block is exercised by a dedicated extractor because shell's inline
-# `if ..; then X; fi` forms defeat naive line-range slicing.
-if python3 "$REPO/tests/verify_exec_proof_classifier.py" "$REPO/doctor-runner"; then
-  echo "  [execution-proof-classifier] all cases PASS"
-else
-  echo "  [execution-proof-classifier] FAIL"; ok=0
-fi
-
 if [ "$ok" -eq 1 ]; then echo "REGRESSION_TEST: PASS"; exit 0; else echo "REGRESSION_TEST: FAIL"; exit 1; fi

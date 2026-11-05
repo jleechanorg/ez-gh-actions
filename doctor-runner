@@ -1595,7 +1595,10 @@ elif [ "$PLATFORM" = "linux" ]; then
   if [ "${HEARTBEAT_SAMPLE_COUNT:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
     bad "serve-loop heartbeat: no queue-monitor samples in ${STARVE_WINDOW}m while service is active — loop silent or logging broken"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
-  elif [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
+  # A parked leg has no serve loop by definition, so an old gap in its log is
+  # not starvation. Requires LOCAL_DISABLED -ne 1 explicitly; an active host
+  # with the same gap still fails (both arms pinned by the regression test).
+  elif [ "${LOCAL_DISABLED:-0}" -ne 1 ] && [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
     bad "serve-loop starvation: queue-monitor heartbeat gap ${MAX_HEARTBEAT_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS}) within a single daemon PID — the serve loop has stalled, not restarted (see ez-gh-actions-wxfl, replacing the respawn-gap heuristic from ez-gh-actions-yrt/g3o; threshold raised 5x->8x in ez-gh-actions-5n0h after a 99s busy-tick gap nearly tripped the old 100s threshold)"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
   fi
