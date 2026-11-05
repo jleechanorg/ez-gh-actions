@@ -272,6 +272,15 @@ if [ "$LOCAL_DISABLED" -eq 1 ]; then
   HEARTBEAT_SAMPLE_COUNT=0
 fi
 
+count_assignments_section() {
+  awk '
+    /^\[assignments\]/ { in_section=1; next }
+    /^\[/               { in_section=0 }
+    in_section && /=/   { c++ }
+    END                 { print c+0 }
+  ' "$1" 2>/dev/null
+}
+
 # --- A. local daemon + service ------------------------------------------
 # A parked host legitimately has no service, daemon, colima VM, registrations
 # or containers; that absence is the DECISION, not a defect. So the whole
@@ -394,14 +403,6 @@ fi
 # added during churn remediation). A whole-file `grep -c '='` therefore
 # double-counts (~28 for a 14-slot Linux fleet) — see ez-gh-actions-nj2j. Count
 # only lines inside [assignments], never a whole-file grep.
-count_assignments_section() {
-  awk '
-    /^\[assignments\]/ { in_section=1; next }
-    /^\[/               { in_section=0 }
-    in_section && /=/   { c++ }
-    END                 { print c+0 }
-  ' "$1" 2>/dev/null
-}
 if [ -f "$SLOT_FILE" ]; then
   ASSIGNED=$(count_assignments_section "$SLOT_FILE")
   ok "slot_assignments.toml present ($ASSIGNED slots reserved)"
