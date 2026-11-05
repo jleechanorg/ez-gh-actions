@@ -37,29 +37,15 @@ run_case "active-host-big-gap-critical" 0 1 || ok=0
 
 
 
-# --- execution-proof leg filtering (Dot /advice P2 at e5a8ecd) --------------
-# REAL_ON_FLEET must count success only from an ENABLED leg. Matching any
-# "ez-*" let a parked Mac's only successful job satisfy the gate for 20 idle
-# Linux slots.
-PROOF_SRC=$(awk '/^  # Classify the run by WHICH leg/{f=1} f{print} f&&/^  fi$/{exit}' "$REPO/doctor-runner")
-if [ -z "$PROOF_SRC" ]; then
-  echo "  [execution-proof-filter] FAIL: could not extract the classification block"; ok=0
+# --- execution-proof leg filtering (Dot /advice P2 at e5a8ecd, codex P0 at 609e288) ---
+# REAL_ON_FLEET must count success only from a leg that is NOT positively parked,
+# and must not depend on REMOTE_PREFIX/REMOTE_COUNT (resolved later, in section 10).
+# The block is exercised by a dedicated extractor because shell's inline
+# `if ..; then X; fi` forms defeat naive line-range slicing.
+if python3 "$REPO/tests/verify_exec_proof_classifier.py" "$REPO/doctor-runner"; then
+  echo "  [execution-proof-classifier] all cases PASS"
 else
-  proof_case() { # label local_disabled remote_count local_pfx remote_pfx runner expect
-    local label="$1" LD="$2" RC="$3" lp="$4" rp="$5" rn="$6" exp="$7" got
-    got=$(LOCAL_DISABLED="$LD" REMOTE_COUNT="$RC" RUNNER_NAME_PREFIX="$lp" REMOTE_PREFIX="$rp" \
-          REAL_ON_FLEET=0 rid=1 rn="$rn" conc=success \
-          bash -c 'ok(){ :; }; warn(){ :; }; '"$PROOF_SRC"'; printf "%s" "$REAL_ON_FLEET"')
-    if [ "${got:-x}" = "$exp" ]; then
-      printf '  [%s] PROOF=%s (expect %s) -- PASS\n' "$label" "$got" "$exp"
-    else
-      printf '  [%s] PROOF=%s (expect %s) -- FAIL\n' "$label" "$got" "$exp"; ok=0
-    fi
-  }
-  echo "--- execution proof is filtered to enabled legs ---"
-  proof_case "mac-parked+linux-success-counts"  1 20 "ez-mac-runner-h" "ez-runner-c"  "ez-runner-c-3"     1
-  proof_case "mac-parked+mac-success-ignored"   1 20 "ez-mac-runner-h" "ez-runner-c"  "ez-mac-runner-h-1" 0
-  proof_case "linux-active+linux-success"       0  0 "ez-runner-c"     "ez-mac-runner-h" "ez-runner-c-3"  1
+  echo "  [execution-proof-classifier] FAIL"; ok=0
 fi
 
 if [ "$ok" -eq 1 ]; then echo "REGRESSION_TEST: PASS"; exit 0; else echo "REGRESSION_TEST: FAIL"; exit 1; fi

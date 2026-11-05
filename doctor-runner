@@ -650,6 +650,7 @@ fi
 # jobs API and confirming the runner_name that handled it belongs to our
 # fleet. A completed run whose runner_name does not match RUNNER_NAME_PREFIX
 # means the job went to a retired fleet / GitHub-hosted / somewhere else.
+
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
@@ -660,25 +661,34 @@ while read -r rid; do
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  # Classify the run by WHICH leg executed it, then count success only for a
-  # leg that is actually ENABLED. Matching any `ez-*` let a parked Mac's only
-  # successful job satisfy the gate for 20 idle Linux slots -- the reverse of
-  # the parked-local gap, found as P2 by the /advice Dot seat at e5a8ecd.
+  # Count a success as execution proof only when it did NOT come from a leg we
+  # positively know is parked.
+  #
+  # Ordering matters here: the authoritative remote leg (REMOTE_PREFIX /
+  # REMOTE_COUNT) is resolved over SSH in section 10, which runs AFTER this
+  # section. So this must never REQUIRE the remote variables to be populated --
+  # an earlier revision did, and on a parked-local host it rejected the enabled
+  # remote leg's successful jobs (codex P0 at 609e288). The rule is therefore
+  # negative: exclude a known-parked leg, accept everything else on the fleet.
   _local_prefix="${RUNNER_NAME_PREFIX:-}"
   _remote_prefix="${REMOTE_PREFIX:-}"
-  _ran_on_local=0; _ran_on_remote=0
-  if [ -n "$_local_prefix" ] && [[ "$rn" == "${_local_prefix}"* ]]; then _ran_on_local=1; fi
-  if [ -n "$_remote_prefix" ] && [[ "$rn" == "${_remote_prefix}"* ]] && [ "$_ran_on_local" -eq 0 ]; then _ran_on_remote=1; fi
-  # A run on a leg that is NOT parked is proof. `ez-*` with no leg attribution
-  # stays accepted only when both legs are enabled (unknown-but-plausible fleet).
-  _leg_enabled=0
-  if [ "$_ran_on_local" -eq 1 ] && [ "$LOCAL_DISABLED" -ne 1 ]; then _leg_enabled=1; fi
-  if [ "$_ran_on_remote" -eq 1 ] && [ "${REMOTE_COUNT:-0}" -gt 0 ]; then _leg_enabled=1; fi
-  if [ "$_leg_enabled" -eq 1 ]; then
-    ok "run $rid: $conc on $rn (enabled leg)"
+  _is_fleet=0
+  [[ "$rn" == "ez-"* ]] && _is_fleet=1
+  if [ -n "$_local_prefix" ] && [[ "$rn" == "${_local_prefix}"* ]]; then _is_fleet=1; fi
+  if [ -n "$_remote_prefix" ] && [[ "$rn" == "${_remote_prefix}"* ]]; then _is_fleet=1; fi
+  # Positively-parked exclusions.
+  _parked_leg=0
+  if [ "${LOCAL_DISABLED:-0}" -eq 1 ] && [ -n "$_local_prefix" ] && [[ "$rn" == "${_local_prefix}"* ]]; then
+    _parked_leg=1
+  fi
+  if [ "${REMOTE_DISABLED:-0}" -eq 1 ] && [ -n "$_remote_prefix" ] && [[ "$rn" == "${_remote_prefix}"* ]]; then
+    _parked_leg=1
+  fi
+  if [ "$_is_fleet" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
+    ok "run $rid: $conc on $rn (our fleet)"
     if [ "$conc" = "success" ]; then REAL_ON_FLEET=$((REAL_ON_FLEET+1)); fi
-  elif [[ "$rn" == "ez-"* ]]; then
-    warn "run $rid: $conc on $rn (fleet member, but that leg is parked/absent -- not execution proof)"
+  elif [ "$_parked_leg" -eq 1 ]; then
+    warn "run $rid: $conc on $rn (fleet member, but that leg is parked -- not execution proof)"
   else
     warn "run $rid: $conc on $rn (NOT a managed fleet runner)"
   fi
@@ -1398,6 +1408,11 @@ list_slot_work "$LOCAL_PREFIX" "$LOCAL_COUNT" "localhost" "$HOST_LABEL"
 # gates said 1-3 down"). list_slot_work's LAST_*_SLOTS globals (populated
 # during this ONE call, including its own 2-sample resample and journal
 # cross-check) are now the only remote sample taken.
+# Resolve WHICH platform is the remote leg BEFORE section 7. The execution-proof
+# classifier there attributes each run to a leg (local vs remote prefix) and can
+# only do that if these are already set; section 10 previously initialized them
+# later, so a parked-local host rejected the enabled remote leg's successes
+# (codex P0 at 609e288).
 if [ "$PLATFORM" = "macos" ]; then
   REMOTE_HOST="${REMOTE_LINUX_HOST:-jeff-ubuntu}"
   REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-}"
