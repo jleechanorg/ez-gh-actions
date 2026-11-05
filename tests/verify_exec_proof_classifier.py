@@ -36,24 +36,24 @@ block = "\n".join(l for l in lines[start:end + 1] if not l.strip().startswith("#
 print(f"extracted {end - start + 1} lines (through line {end + 1})")
 
 cases = [
-    # label, LOCAL_DISABLED, REMOTE_DISABLED, REMOTE_COUNT, local_pfx, remote_pfx, runner, expect
-    ("parked-local, remote vars UNSET, Linux success", 1, 0, "", "ez-mac-runner-h", "", "ez-runner-c-3", 1),
-    ("parked-local, remote resolved, Linux success",   1, 0, 20, "ez-mac-runner-h", "ez-runner-c", "ez-runner-c-3", 1),
-    ("parked-local, parked-Mac success rejected",      1, 0, 20, "ez-mac-runner-h", "ez-runner-c", "ez-mac-runner-h-1", 0),
-    ("linux active, Linux success",                    0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1),
-    ("remote leg parked, remote success rejected",     0, 1, 0, "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0),
-    ("non-fleet runner rejected",                      0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "gh-hosted-1", 0),
+    # label, LOCAL_DISABLED, REMOTE_DISABLED, REMOTE_COUNT, local_pfx, remote_pfx, runner, expect, host_platform
+    ("macos parked, Linux remote success counts", 1, 0, "", "ez-org-runner", "", "ez-runner-c-3", 1, "macos"),
+    ("macos parked, Linux remote success counts (count set)", 1, 0, 20, "ez-org-runner", "ez-runner-c", "ez-runner-c-3", 1, "macos"),
+    ("macos parked, Mac legacy success rejected", 1, 0, 20, "ez-org-runner", "ez-runner-c", "ez-mac-runner-h-1", 0, "macos"),
+    ("linux active, Linux success", 0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1, "linux"),
+    ("linux host, remote Mac parked, Mac success rejected", 0, 1, 0, "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0, "linux"),
+    ("non-fleet runner rejected", 0, 0, 0, "ez-runner-c", "ez-mac-runner-h", "gh-hosted-1", 0, "linux"),
     # codex P0 at 5b2e4f3: a Linux doctor with the Mac parked, exercising the
     # real production order where REMOTE_PREFIX is resolved from the platform
     # default before section 7 and REMOTE_COUNT is still empty.
-    ("linux doctor + MAC parked, default remote pfx, Mac success", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0),
-    ("linux doctor + MAC parked, default remote pfx, Linux success", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1),
+    ("linux doctor + MAC parked, Mac success rejected", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-mac-runner-h-1", 0, "linux"),
+    ("linux doctor + MAC parked, Linux success counts", 0, 1, "", "ez-runner-c", "ez-mac-runner-h", "ez-runner-c-3", 1, "linux"),
 ]
 
 fail = 0
-for label, LD, RD, RC, lp, rp, rn, exp in cases:
+for label, LD, RD, RC, lp, rp, rn, exp, plat in cases:
     script = f"""set -euo pipefail
-LOCAL_DISABLED={LD}; REMOTE_DISABLED={RD}; REMOTE_COUNT={RC}
+PLATFORM='{plat}'; LOCAL_DISABLED={LD}; REMOTE_DISABLED={RD}; REMOTE_COUNT={RC}
 RUNNER_NAME_PREFIX='{lp}'; REMOTE_PREFIX='{rp}'
 REAL_ON_FLEET=0; rid=1; rn='{rn}'; conc=success
 ok(){{ :; }}; warn(){{ :; }}
