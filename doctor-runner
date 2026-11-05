@@ -744,7 +744,18 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
+    # Apply the SAME parked-leg exclusion as section 7. Accepting any ez-*
+    # here let a --prove canary that landed on a disabled leg report "fleet is
+    # handling real jobs NOW" for capacity that is intentionally not running
+    # (Dot /advice P2 at 5b2e4f3).
+    _cn_local="${RUNNER_NAME_PREFIX:-}"
+    _cn_remote="${REMOTE_PREFIX:-}"
+    _cn_parked=0
+    if [ "${LOCAL_DISABLED:-0}" -eq 1 ] && [ -n "$_cn_local" ] && [[ "$rn" == "${_cn_local}"* ]]; then _cn_parked=1; fi
+    if [ "${REMOTE_DISABLED:-0}" -eq 1 ] && [ -n "$_cn_remote" ] && [[ "$rn" == "${_cn_remote}"* ]]; then _cn_parked=1; fi
+    if [ "$_cn_parked" -eq 1 ]; then
+      bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
+    elif { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
     else
