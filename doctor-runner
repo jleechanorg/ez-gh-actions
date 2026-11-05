@@ -267,6 +267,15 @@ if [ "$LOCAL_DISABLED" -eq 1 ]; then
   HEARTBEAT_SAMPLE_COUNT=0
 fi
 
+count_assignments_section() {
+  awk '
+    /^\[assignments\]/ { in_section=1; next }
+    /^\[/               { in_section=0 }
+    in_section && /=/   { c++ }
+    END                 { print c+0 }
+  ' "$1" 2>/dev/null
+}
+
 # --- A. local daemon + service ------------------------------------------
 # A parked host legitimately has no service, daemon, colima VM, registrations
 # or containers; that absence is the DECISION, not a defect. So the whole
@@ -389,14 +398,6 @@ fi
 # added during churn remediation). A whole-file `grep -c '='` therefore
 # double-counts (~28 for a 14-slot Linux fleet) — see ez-gh-actions-nj2j. Count
 # only lines inside [assignments], never a whole-file grep.
-count_assignments_section() {
-  awk '
-    /^\[assignments\]/ { in_section=1; next }
-    /^\[/               { in_section=0 }
-    in_section && /=/   { c++ }
-    END                 { print c+0 }
-  ' "$1" 2>/dev/null
-}
 if [ -f "$SLOT_FILE" ]; then
   ASSIGNED=$(count_assignments_section "$SLOT_FILE")
   ok "slot_assignments.toml present ($ASSIGNED slots reserved)"
@@ -1881,6 +1882,16 @@ read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDI
 if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ]; then
   warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT queue/API evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, API_UNVERIFIED=${API_UNVERIFIED:-0}) — NOT a healthy verdict; re-run when GitHub API quota recovers"
   info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
+  exit 3
+fi
+# A zero-slot contract can never be "healthy": with both legs opted out,
+# FLEET_CONFIGURED_COUNT is 0 and the live-slot gate reads `0 < 0` as false, so
+# the script would print "fleet healthy: 0/0" and exit 0 with ZERO capacity --
+# a two-env-var path from red to green. Zero expected slots is a configuration
+# statement, not a health result, and it must match the documented exit-3
+# contract in .claude/commands/doctor-ezactions.md.
+if [ "$VERDICT_CONFIGURED" -eq 0 ]; then
+  warn "fleet INCONCLUSIVE: every leg is opted out (0 slot(s) expected) — nothing was verified, so this is NOT a healthy verdict. Unset MAC_RUNNER_DISABLED / REMOTE_LINUX_DISABLED to require proof."
   exit 3
 fi
 ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
