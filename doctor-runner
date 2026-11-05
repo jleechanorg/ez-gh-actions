@@ -660,11 +660,27 @@ while read -r rid; do
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; then
-    ok "run $rid: $conc on $rn (our fleet)"
-    [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
+  # Classify the run by WHICH leg executed it, then count success only for a
+  # leg that is actually ENABLED. Matching any `ez-*` let a parked Mac's only
+  # successful job satisfy the gate for 20 idle Linux slots -- the reverse of
+  # the parked-local gap, found as P2 by the /advice Dot seat at e5a8ecd.
+  _local_prefix="${RUNNER_NAME_PREFIX:-}"
+  _remote_prefix="${REMOTE_PREFIX:-}"
+  _ran_on_local=0; _ran_on_remote=0
+  if [ -n "$_local_prefix" ] && [[ "$rn" == "${_local_prefix}"* ]]; then _ran_on_local=1; fi
+  if [ -n "$_remote_prefix" ] && [[ "$rn" == "${_remote_prefix}"* ]] && [ "$_ran_on_local" -eq 0 ]; then _ran_on_remote=1; fi
+  # A run on a leg that is NOT parked is proof. `ez-*` with no leg attribution
+  # stays accepted only when both legs are enabled (unknown-but-plausible fleet).
+  _leg_enabled=0
+  if [ "$_ran_on_local" -eq 1 ] && [ "$LOCAL_DISABLED" -ne 1 ]; then _leg_enabled=1; fi
+  if [ "$_ran_on_remote" -eq 1 ] && [ "${REMOTE_COUNT:-0}" -gt 0 ]; then _leg_enabled=1; fi
+  if [ "$_leg_enabled" -eq 1 ]; then
+    ok "run $rid: $conc on $rn (enabled leg)"
+    if [ "$conc" = "success" ]; then REAL_ON_FLEET=$((REAL_ON_FLEET+1)); fi
+  elif [[ "$rn" == "ez-"* ]]; then
+    warn "run $rid: $conc on $rn (fleet member, but that leg is parked/absent -- not execution proof)"
   else
-    warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-* / ez-*)"
+    warn "run $rid: $conc on $rn (NOT a managed fleet runner)"
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
 info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
