@@ -51,7 +51,7 @@ present) is HEALTHY under queue backlog.
 ## Step 1 — Establish the baseline
 
 ```bash
-bash "$(git rev-parse --show-toplevel)/doctor-runner"          # health gate, exit 0 = healthy
+bash "$(git rev-parse --show-toplevel)/doctor-runner"          # health gate, exit 0 = healthy; 3 = INCONCLUSIVE (not a pass)
 bash "$(git rev-parse --show-toplevel)/doctor-runner --prove"  # + live canary: dispatch a real job, verify it runs on ez-org-runner-*
 ```
 

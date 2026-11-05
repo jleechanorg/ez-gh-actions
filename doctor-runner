@@ -1871,6 +1871,22 @@ if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ]; th
   info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
   exit 3
 fi
-ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
+# A zero-slot contract can never be "healthy". With both legs opted out,
+# CONFIGURED_COUNT and REMOTE_COUNT are both 0, so FLEET_CONFIGURED_COUNT=0 and
+# compute_live_slot_critical sees `0 < 0` as false -- the live-slot gate passes
+# and the script would print "fleet healthy: 0/0" and exit 0 with ZERO capacity.
+# That is a two-env-var path from red to green (cs review P0 on PR #214).
+# Zero expected slots is a configuration statement, not a health result.
+if [ "$VERDICT_CONFIGURED" -eq 0 ]; then
+  warn "fleet INCONCLUSIVE: every leg is opted out (0 slot(s) expected) — nothing was verified, so this is NOT a healthy verdict. Unset MAC_RUNNER_DISABLED / REMOTE_LINUX_DISABLED to require proof."
+  exit 3
+fi
+# Name the parked leg on the SUCCESS line too. Without this, "fleet healthy:
+# 20/20" is indistinguishable from "20/24 with 4 broken", which is the exact
+# confusion bead jleechan-hxz0 exists to end; REMOTE_LEG_NOTE was previously
+# only wired into the failure branch (cs review P0 on PR #214).
+PARKED_NOTE=""
+[ "${LOCAL_DISABLED:-0}" -eq 1 ] && PARKED_NOTE=" (${HOST_LABEL} leg intentionally disabled)"
+ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down${REMOTE_LEG_NOTE}${PARKED_NOTE}"
 info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0

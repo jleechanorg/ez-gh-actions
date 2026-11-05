@@ -250,6 +250,42 @@ run_local_case "linux-host-parked-local" "linux" "REMOTE_LINUX_DISABLED" "1" 20 
 # Default (no opt-out): the local leg keeps its configured count.
 run_local_case "mac-host-default-local" "macos" "MAC_RUNNER_DISABLED" "0" 4 4 || OVERALL_PASS=false
 
+# --- verdict exit-contract: zero-slot contract must never be "healthy" -------
+# cs review P0 on PR #214: with both legs opted out, FLEET_CONFIGURED_COUNT=0,
+# compute_live_slot_critical sees `0 < 0` as false, and the script printed
+# "fleet healthy: 0/0" and exited 0 with ZERO capacity -- a two-env-var path
+# from red to green. Assert the shipped guard exists and is bound to the
+# configured count, plus that the success line carries the parked-leg note.
+VERDICT_SRC=$(sed -n '/^# A zero-slot contract can never be/,/^exit 0$/p' "$DOCTOR_SCRIPT")
+if [ -z "$VERDICT_SRC" ]; then
+  echo "  [zero-slot-guard] FAIL: could not locate the zero-slot guard block" >&2
+  OVERALL_PASS=false
+else
+  if grep -q 'VERDICT_CONFIGURED" -eq 0' <<<"$VERDICT_SRC" && grep -q 'exit 3' <<<"$VERDICT_SRC"; then
+    echo "  [zero-slot-guard] guarded: 0-slot contract -> exit 3, not healthy -- PASS"
+  else
+    echo "  [zero-slot-guard] FAIL: zero-slot contract is not diverted to exit 3" >&2
+    OVERALL_PASS=false
+  fi
+  if grep -q 'PARKED_NOTE' <<<"$VERDICT_SRC" && grep -q 'ok "fleet healthy:.*REMOTE_LEG_NOTE.*PARKED_NOTE' <<<"$VERDICT_SRC"; then
+    echo "  [success-names-parked-leg] success line carries the parked-leg note -- PASS"
+  else
+    echo "  [success-names-parked-leg] FAIL: success line does not name the parked leg" >&2
+    OVERALL_PASS=false
+  fi
+fi
+
+# The INCONCLUSIVE exit code must be documented where the exit contract lives,
+# so an agent reading only the docs cannot treat "not 1" as "fine".
+for _doc in "$REPO_ROOT/.claude/commands/doctor-ezactions.md" "$REPO_ROOT/.claude/skills/ezgha-doctor/SKILL.md"; do
+  if [ -f "$_doc" ] && grep -q 'INCONCLUSIVE' "$_doc"; then
+    echo "  [exit-3-documented:$(basename "$_doc")] PASS"
+  else
+    echo "  [exit-3-documented] FAIL: $_doc does not document the INCONCLUSIVE exit code" >&2
+    OVERALL_PASS=false
+  fi
+done
+
 echo "--- summary ---"
 if [ "$OVERALL_PASS" = "true" ]; then
   echo "REGRESSION_TEST: PASS"
