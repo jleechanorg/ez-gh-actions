@@ -18,7 +18,7 @@ cat > "$TMP/gcloud" <<'STUB'
 printf '%s\n' "$*" >> "${GCLOUD_LOG:?}"
 for arg in "$@"; do
   case "$arg" in
-    --policy-from-file=*) cat "${arg#*=}" >> "${GCLOUD_LOG:?}"; cp "${arg#*=}" "${POLICY_CAPTURE:?}" ;;
+    --policy-from-file=*) cat "${arg#*=}" >> "${GCLOUD_LOG:?}"; jq -c . "${arg#*=}" >> "${POLICY_HISTORY:?}"; cp "${arg#*=}" "${POLICY_CAPTURE:?}" ;;
   esac
 done
 STUB
@@ -26,10 +26,10 @@ chmod +x "$TMP/gh" "$TMP/gcloud"
 run() {
   if [ "${DEBUG_TEST:-0}" = 1 ]; then
     GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" STATE_FILE="$TMP/state.json" \
-      RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" "$SCRIPT" "$@"
+      RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" "$SCRIPT" "$@" >/dev/null 2>&1
   else
     GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" STATE_FILE="$TMP/state.json" \
-      RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" \
+      RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" \
       "$SCRIPT" "$@" >/dev/null 2>&1
   fi
 }
@@ -87,11 +87,136 @@ grep -q 'BLIND' "$TMP/gcloud.log" || fail "repeated API failures must emit BLIND
 grep -q '"status":"BLIND"' "$TMP/gcloud.log" || fail "BLIND diagnostic status must remain distinct"
 pass "API blindness is surfaced separately"
 
-# The alert policy installer must target only this monitor's ERROR events.
+# The policy installer keeps per-run alerts Slack-only and adds a separate SMS streak policy.
+: > "$TMP/policy-history.jsonl"
 run --ensure-gcp-policy
-grep -q 'ios-testflight-run-alert' "$TMP/gcloud.log" || fail "policy setup must select TestFlight alert source"
-jq -e '.conditions | length == 1 and any(.[]; (.conditionMatchedLog.filter | contains("jsonPayload.status=\"RUN_FAILED\"") and contains("jsonPayload.status=\"RUN_STUCK\"") and contains("severity>=ERROR") and contains("jsonPayload.status=\"BLIND\"") and contains("severity>=WARNING")))' "$TMP/policy.json" >/dev/null || fail "policy must use one condition for run and blind alerts"
-pass "policy setup is scoped to TestFlight monitor"
+[ "$(wc -l < "$TMP/policy-history.jsonl" | tr -d ' ')" = 2 ] || fail "policy setup must ensure both independent policies"
+jq -se 'any(.[]; (.displayName | contains("run monitor")) and (.notificationChannels == ["projects/worldarchitecture-ai/notificationChannels/14071650426226468737"]) and (.conditions[0].conditionMatchedLog.filter | contains("RUN_FAILED") and contains("RUN_STUCK") and contains("BLIND"))) and any(.[]; (.displayName | contains("consecutive failures")) and (.notificationChannels == ["projects/worldarchitecture-ai/notificationChannels/17167119139665448890"]) and (.conditions[0].conditionMatchedLog.filter | contains("SMS_FAILURE_STREAK") and contains("failure_streak>=3") and contains("jleechanorg/worldai_frontend") and contains("ios-testflight.yml")))' "$TMP/policy-history.jsonl" >/dev/null || fail "policies must route current run statuses to Slack and thresholded streaks to SMS"
+pass "policy setup separates Slack run alerts from SMS streak escalation"
+
+# A success later in the same first API batch suppresses historical escalation.
+BATCH_STATE="$TMP/batch-state.json"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":704,"run_number":4,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"success","created_at":"$new","updated_at":"$new"},
+ {"id":703,"run_number":3,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":702,"run_number":2,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":701,"run_number":1,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" STATE_FILE="$BATCH_STATE" RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/batch-gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" "$SCRIPT" >/dev/null 2>&1
+[ "$(grep -c 'SMS_FAILURE_STREAK' "$TMP/batch-gcloud.log" || true)" = 0 ] || fail "success later in the same first API batch must suppress historical streak SMS"
+[ "$(jq -r '.failure_streak // 0' "$BATCH_STATE")" = 0 ] || fail "same-batch recovery must leave the current streak at zero"
+pass "same-batch newer success suppresses historical escalation"
+
+# Consecutive failure streak: completed push builds in run order.
+STREAK_STATE="$TMP/streak-state.json"
+streak_run() {
+ GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" STATE_FILE="$STREAK_STATE" RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/streak-gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" "$SCRIPT" >/dev/null 2>&1
+}
+streak_sms_count() { [ -f "$TMP/streak-gcloud.log" ] && grep -c 'SMS_FAILURE_STREAK' "$TMP/streak-gcloud.log" || echo 0; }
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":503,"run_number":3,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":502,"run_number":2,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":501,"run_number":1,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+streak_run || true
+[ "$(streak_sms_count)" = 1 ] || fail "third distinct completed push failure must emit one streak escalation"
+grep 'SMS_FAILURE_STREAK' "$TMP/streak-gcloud.log" | grep -Eq '"failure_streak":3([,}])' || fail "streak escalation must include failure_streak=3"
+streak_run || true
+[ "$(streak_sms_count)" = 1 ] || fail "repeated polling must not duplicate an active streak SMS"
+pass "third failure escalates once with structured streak count"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":504,"run_number":4,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":503,"run_number":3,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":502,"run_number":2,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+streak_run || true
+[ "$(streak_sms_count)" = 1 ] || fail "fourth failure must not repeat escalation"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":505,"run_number":5,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"success","created_at":"$new","updated_at":"$new"},
+ {"id":504,"run_number":4,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":503,"run_number":3,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 0 ] || fail "newer success must reset streak"
+[ "$(streak_sms_count)" = 1 ] || fail "success reset must not emit SMS"
+pass "fourth failure is quiet and newer success resets streak"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":510,"run_number":10,"run_attempt":1,"event":"workflow_dispatch","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$new","updated_at":"$new"},
+ {"id":509,"run_number":9,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"cancelled","created_at":"$new","updated_at":"$new"},
+ {"id":508,"run_number":8,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"skipped","created_at":"$new","updated_at":"$new"},
+ {"id":507,"run_number":7,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"neutral","created_at":"$new","updated_at":"$new"},
+ {"id":506,"run_number":6,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$new","updated_at":"$new"}
+]}
+EOF
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 1 ] || fail "manual, cancelled, and older failures must not override latest eligible outcome"
+[ "$(streak_sms_count)" = 1 ] || fail "non-qualified events must not trigger SMS"
+pass "manual dispatch and cancellation do not qualify"
+
+# Late completion joins a streak until a newer success anchors it; API blindness preserves it.
+STREAK_STATE="$TMP/order-state.json"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":612,"run_number":12,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":611,"run_number":11,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":610,"run_number":10,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"in_progress","conclusion":null,"created_at":"$old"}
+]}
+EOF
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 2 ] || fail "two completed failures after pending run 10 must be retained"
+GH_STUB_FAIL=1 streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 2 ] || fail "GitHub API failure must preserve the known streak"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":612,"run_number":12,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":611,"run_number":11,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"},
+ {"id":610,"run_number":10,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 3 ] || fail "late run 10 failure must join 11/12 when no newer success exists"
+[ "$(streak_sms_count)" = 2 ] || fail "late third failure must emit one additional streak SMS"
+grep 'SMS_FAILURE_STREAK' "$TMP/streak-gcloud.log" | tail -1 | grep -q '"run_id":"612"' || fail "late failure escalation must identify latest run 12"
+pass "late failure completes the streak and API errors preserve state"
+
+# A previously observed newer success prevents an older late failure from reopening a streak.
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":613,"run_number":13,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"success","created_at":"$new","updated_at":"$new"}
+]}
+EOF
+streak_run || true
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":610,"run_number":10,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 0 ] || fail "late old failure after newer success must not reopen streak"
+[ "$(streak_sms_count)" = 2 ] || fail "old failure after success must not page"
+pass "newer success closes the late-completion window"
+
+# Distinct rerun attempts count once each; polling either attempt is idempotent.
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":614,"run_number":14,"run_attempt":2,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"timed_out","created_at":"$new","updated_at":"$new"},
+ {"id":614,"run_number":14,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"failure","created_at":"$new","updated_at":"$new"}
+]}
+EOF
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 2 ] || fail "two attempts of one workflow run must be separate deduplicated outcomes"
+streak_run || true
+[ "$(jq -r .failure_streak "$STREAK_STATE")" = 2 ] || fail "repeated polling must not recount rerun attempts"
+pass "rerun attempts are distinct and polling remains idempotent"
 
 # Dry run may read state but must not create or rewrite persistent state.
 before="$(shasum -a 256 "$TMP/state.json")"
@@ -100,6 +225,8 @@ after="$(shasum -a 256 "$TMP/state.json")"
 [ "$before" = "$after" ] || fail "--dry-run rewrote the existing state file"
 STATE_FILE="$TMP/missing-state.json" GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" \
   RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" \
-  "$SCRIPT" --ensure-gcp-policy --dry-run >/dev/null 2>&1
+  "$SCRIPT" --ensure-gcp-policy --dry-run > "$TMP/policy-preview.jsonl"
 [ ! -e "$TMP/missing-state.json" ] || fail "policy dry-run created persistent state"
+[ "$(wc -l < "$TMP/policy-preview.jsonl" | tr -d ' ')" = 2 ] || fail "policy dry-run must print both exact policy JSON documents"
+jq -se 'length == 2' "$TMP/policy-preview.jsonl" >/dev/null || fail "policy dry-run output must be parseable JSON per line"
 pass "dry-run does not mutate state"

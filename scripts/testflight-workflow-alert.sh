@@ -33,39 +33,56 @@ if [ "$DRY_RUN" -eq 0 ] && [ -z "$GCLOUD_BIN" ]; then
 fi
 
 if [ "$ENSURE_POLICY" -eq 1 ]; then
-  [ "$DRY_RUN" -eq 1 ] || [ -n "$GCLOUD_BIN" ] || { echo "FATAL: gcloud not found" >&2; exit 3; }
-  POLICY_FILE="$(mktemp)"
-  trap 'rm -f "$POLICY_FILE"' EXIT
-  jq -n --arg source "$SOURCE" --arg log "$LOG_NAME" \
-    --arg project "$GCP_PROJECT" \
-    '(. as $unused | "logName=\"projects/"+$project+"/logs/"+$log+"\" AND jsonPayload.source=\""+$source+"\"") as $common |
+  POLICY_RUN_FILE="$(mktemp)"
+  POLICY_SMS_FILE="$(mktemp)"
+  trap 'rm -f "$POLICY_RUN_FILE" "$POLICY_SMS_FILE"' EXIT
+  jq -n --arg source "$SOURCE" --arg log "$LOG_NAME" --arg project "$GCP_PROJECT" \
+    '("logName=\"projects/"+$project+"/logs/"+$log+"\" AND jsonPayload.source=\""+$source+"\"") as $common |
     {displayName:"[CRITICAL] WorldAI iOS TestFlight run monitor alert",
-      documentation:{content:"An iOS TestFlight GitHub Actions run failed, exceeded its run-time threshold, or the monitor cannot verify GitHub state. Source: ez-gh-actions scripts/testflight-workflow-alert.sh; see the linked GitHub run in the log entry.",mimeType:"text/markdown"},
+      documentation:{content:"An iOS TestFlight run failed, exceeded its run-time threshold, or the monitor cannot verify GitHub state.",mimeType:"text/markdown"},
       combiner:"OR",severity:"CRITICAL",
       conditions:[{displayName:"TestFlight run failure, stuck, or monitor blind",conditionMatchedLog:{filter:("("+$common+" AND severity>=ERROR AND (jsonPayload.status=\"RUN_FAILED\" OR jsonPayload.status=\"RUN_STUCK\")) OR ("+$common+" AND jsonPayload.status=\"BLIND\" AND severity>=WARNING)")}}],
       alertStrategy:{autoClose:"1800s",notificationRateLimit:{period:"300s"}},
-      notificationChannels:["projects/worldarchitecture-ai/notificationChannels/14071650426226468737","projects/worldarchitecture-ai/notificationChannels/17167119139665448890"],
-      enabled:true,userLabels:{component:"worldai-testflight",severity:"critical"}}' > "$POLICY_FILE"
-  if [ "$DRY_RUN" -eq 1 ]; then echo "[$NOW_ISO] [dry-run] would ensure named TestFlight run alert policy"; exit 0; fi
-  GCP_ARGS=(--project="$GCP_PROJECT" --account="$GCP_ACCOUNT")
-  existing="$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
-    --filter='displayName="[CRITICAL] WorldAI iOS TestFlight run monitor alert"' --format='value(name)' 2>/dev/null | head -1)"
-  if [ -n "$existing" ]; then
-    "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null
-    echo "[$NOW_ISO] updated TestFlight run alert policy"
-  else
-    "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null
-    echo "[$NOW_ISO] created TestFlight run alert policy"
+      notificationChannels:["projects/worldarchitecture-ai/notificationChannels/14071650426226468737"],
+      enabled:true,userLabels:{component:"worldai-testflight",severity:"critical"}}' > "$POLICY_RUN_FILE"
+  jq -n --arg source "$SOURCE" --arg log "$LOG_NAME" --arg project "$GCP_PROJECT" --arg repo "$REPO" --arg workflow "$WORKFLOW" \
+    '("logName=\"projects/"+$project+"/logs/"+$log+"\" AND jsonPayload.source=\""+$source+"\"") as $common |
+    {displayName:"[CRITICAL] WorldAI iOS TestFlight consecutive failures",
+      documentation:{content:"Three or more consecutive automatic TestFlight builds failed.",mimeType:"text/markdown"},
+      combiner:"OR",severity:"CRITICAL",
+      conditions:[{displayName:"TestFlight consecutive build failures",conditionMatchedLog:{filter:($common+" AND severity>=ERROR AND jsonPayload.status=\"SMS_FAILURE_STREAK\" AND jsonPayload.failure_streak>=3 AND jsonPayload.repo=\""+$repo+"\" AND jsonPayload.workflow=\""+$workflow+"\"")}}],
+      alertStrategy:{autoClose:"1800s",notificationRateLimit:{period:"300s"}},
+      notificationChannels:["projects/worldarchitecture-ai/notificationChannels/17167119139665448890"],
+      enabled:true,userLabels:{component:"worldai-testflight",severity:"critical"}}' > "$POLICY_SMS_FILE"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    jq -c . "$POLICY_RUN_FILE"
+    jq -c . "$POLICY_SMS_FILE"
+    exit 0
   fi
+  [ -n "$GCLOUD_BIN" ] || { echo "FATAL: gcloud not found" >&2; exit 3; }
+  GCP_ARGS=(--project="$GCP_PROJECT" --account="$GCP_ACCOUNT")
+  for policy_file in "$POLICY_RUN_FILE" "$POLICY_SMS_FILE"; do
+    display_name="$(jq -r .displayName "$policy_file")"
+    existing="$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
+      --filter="displayName=\"$display_name\"" --format='value(name)' 2>/dev/null | head -1)"
+    if [ -n "$existing" ]; then
+      "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$policy_file" "${GCP_ARGS[@]}" >/dev/null
+      echo "[$NOW_ISO] updated policy '$display_name'"
+    else
+      "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$policy_file" "${GCP_ARGS[@]}" >/dev/null
+      echo "[$NOW_ISO] created policy '$display_name'"
+    fi
+  done
   exit 0
 fi
 
-emit() { # severity status run_id attempt message url sha
-  local severity="$1" status="$2" run_id="$3" attempt="$4" message="$5" url="$6" sha="$7" payload
+emit() { # severity status run_id attempt message url sha [failure_streak]
+  local severity="$1" status="$2" run_id="$3" attempt="$4" message="$5" url="$6" sha="$7" streak payload
+  if [ "$#" -ge 8 ]; then streak="$8"; else streak=""; fi
   payload="$(jq -nc --arg source "$SOURCE" --arg status "$status" --arg sev "$severity" \
     --arg repo "$REPO" --arg workflow "$WORKFLOW" --arg id "$run_id" --arg attempt "$attempt" \
-    --arg message "$message" --arg url "$url" --arg sha "$sha" --arg ts "$NOW_ISO" \
-    '{source:$source,status:$status,severity:$sev,repo:$repo,workflow:$workflow,run_id:$id,attempt:$attempt,message:$message,url:$url,head_sha:$sha,ts:$ts}')"
+    --arg message "$message" --arg url "$url" --arg sha "$sha" --arg ts "$NOW_ISO" --arg streak "$streak" \
+    '({source:$source,status:$status,severity:$sev,repo:$repo,workflow:$workflow,run_id:$id,attempt:$attempt,message:$message,url:$url,head_sha:$sha,ts:$ts} | if $streak == "" then . else . + {failure_streak:($streak|tonumber)} end)')"
   if [ "$DRY_RUN" -eq 1 ]; then echo "[$NOW_ISO] [dry-run] $payload"
   else "$GCLOUD_BIN" logging write "$LOG_NAME" "$payload" --payload-type=json --severity="$severity" --project="$GCP_PROJECT" --account="$GCP_ACCOUNT" >/dev/null; fi
 }
@@ -82,12 +99,12 @@ if [ -z "${GH_TOKEN:-}" ] && [ -r "$HOME/.config/ezgha/gh_token" ]; then
 fi
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp" "$tmp.encoded" "$tmp.rows" "$tmp.err" "$tmp.state" "$tmp.next"' EXIT
+trap 'rm -f "$tmp" "$tmp.encoded" "$tmp.rows" "$tmp.streak_rows" "$tmp.err" "$tmp.state" "$tmp.snapshot" "$tmp.next"' EXIT
 if [ "$DRY_RUN" -eq 1 ]; then
-  # Keep every dry-run state mutation in the disposable run directory.
-  if [ -r "$STATE_FILE" ]; then cp "$STATE_FILE" "$tmp.state"
-  else printf '%s\n' '{"seen":{},"api_failures":0,"last_blind":0}' > "$tmp.state"; fi
-  STATE_FILE="$tmp.state"
+  # Keep every dry-run state mutation in a separate disposable snapshot.
+  if [ -r "$STATE_FILE" ]; then cp "$STATE_FILE" "$tmp.snapshot"
+  else printf '%s\n' '{"seen":{},"api_failures":0,"last_blind":0}' > "$tmp.snapshot"; fi
+  STATE_FILE="$tmp.snapshot"
 else
   mkdir -p "$(dirname "$STATE_FILE")"
   if [ ! -f "$STATE_FILE" ]; then printf '%s\n' '{"seen":{},"api_failures":0,"last_blind":0}' > "$STATE_FILE"; fi
@@ -107,14 +124,15 @@ if ! "$GH_BIN" api "repos/$REPO/actions/workflows/$WORKFLOW/runs?per_page=100" -
   echo "[$NOW_ISO] WARN: GitHub API failed ($failures consecutive); release state unknown" >&2
   exit 2
 fi
-jq -r '[.id, .run_attempt, (.status // "-"), (.conclusion // "-"), (.name // "-"), (.run_started_at // .created_at // "-"), (.updated_at // .created_at // "-"), (.html_url // "-"), (.head_sha // "-")] | @tsv' \
+jq -r '[.id, (.run_number // "-"), .run_attempt, (.event // "-"), (.status // "-"), (.conclusion // "-"), (.name // "-"), (.run_started_at // .created_at // "-"), (.updated_at // .created_at // "-"), (.html_url // "-"), (.head_sha // "-")] | @tsv' \
   "$tmp" > "$tmp.rows"
+jq -sr 'sort_by((.run_number // 0), (.run_attempt // 0))[] | [.id, (.run_number // "-"), .run_attempt, (.event // "-"), (.status // "-"), (.conclusion // "-"), (.html_url // "-"), (.head_sha // "-")] | @tsv' \
+  "$tmp" > "$tmp.streak_rows"
 
-api_failures=0
 jq '.api_failures=0' "$STATE_FILE" > "$tmp.state"; mv "$tmp.state" "$STATE_FILE"
 count="$(wc -l < "$tmp.rows" | tr -d ' ')"
 [ "$count" -le 100 ] || { echo "ERROR: workflow run listing exceeded 100 entries" >&2; exit 1; }
-while IFS=$'\t' read -r id attempt status conclusion name created completed url sha; do
+while IFS=$'\t' read -r id run_number attempt event status conclusion name created completed url sha; do
   [ -n "$id" ] || continue
   [ -n "$id" ] && [ -n "$attempt" ] && [ -n "$created" ] || continue
   # Workflow ID API is authoritative; retain the name check as a fail-safe.
@@ -143,4 +161,53 @@ while IFS=$'\t' read -r id attempt status conclusion name created completed url 
     echo "ERROR: alert sink failed for run $id" >&2; exit 3
   fi
 done < "$tmp.rows"
+
+# Merge completed automatic outcomes in run order so late completions are retained.
+while IFS=$'\t' read -r id run_number attempt event status conclusion url sha; do
+  [ "$status" = completed ] || continue
+  [[ "$run_number" =~ ^[0-9]+$ ]] || continue
+  [[ "$attempt" =~ ^[0-9]+$ ]] || continue
+  [ "$conclusion" != "-" ] || continue
+  success_number="$(jq -r '.streak_last_success_number // 0' "$STATE_FILE")"
+  success_attempt="$(jq -r '.streak_last_success_attempt // 0' "$STATE_FILE")"
+  if [ "$run_number" -lt "$success_number" ] || { [ "$run_number" -eq "$success_number" ] && [ "$attempt" -le "$success_attempt" ]; }; then
+    continue
+  fi
+  if [ "$event" = push ] && [ "$conclusion" = success ]; then
+    jq --argjson number "$run_number" --argjson attempt "$attempt" \
+      '.streak_last_success_number=$number | .streak_last_success_attempt=$attempt | .streak_failures=((.streak_failures // []) | map(select((.run_number > $number) or (.run_number == $number and .attempt > $attempt)))) | .failure_streak=(.streak_failures|length) | .streak_notified=false' \
+      "$STATE_FILE" > "$tmp.state"
+    mv "$tmp.state" "$STATE_FILE"
+    continue
+  fi
+  [ "$event" = push ] || continue
+  case "$conclusion" in failure|timed_out|action_required|startup_failure) ;; *) continue ;; esac
+  if jq -e --arg id "$id" --argjson number "$run_number" --argjson attempt "$attempt" \
+      'any(.streak_failures[]?; .id==$id and .run_number==$number and .attempt==$attempt)' "$STATE_FILE" >/dev/null; then
+    continue
+  fi
+  jq --arg id "$id" --argjson number "$run_number" --argjson attempt "$attempt" --arg url "$url" --arg sha "$sha" \
+    '.streak_failures=(((.streak_failures // []) + [{id:$id,run_number:$number,attempt:$attempt,url:$url,head_sha:$sha}]) | sort_by(.run_number,.attempt) | .[-3:]) | .failure_streak=(.streak_failures|length)' \
+    "$STATE_FILE" > "$tmp.state"
+  mv "$tmp.state" "$STATE_FILE"
+
+done < "$tmp.streak_rows"
+
+# Decide once from the final folded state so a newer success in this response
+# suppresses any threshold reached by older history in the same response.
+streak="$(jq -r '.failure_streak // 0' "$STATE_FILE")"
+notified="$(jq -r '.streak_notified // false' "$STATE_FILE")"
+if [ "$streak" -ge 3 ] && [ "$notified" != true ]; then
+  latest="$(jq -c '.streak_failures[-1] // {}' "$STATE_FILE")"
+  latest_id="$(jq -r '.id // ""' <<<"$latest")"
+  latest_attempt="$(jq -r '.attempt // ""' <<<"$latest")"
+  latest_url="$(jq -r '.url // "-" ' <<<"$latest")"
+  latest_sha="$(jq -r '.head_sha // "-" ' <<<"$latest")"
+  message="TestFlight workflow has at least 3 consecutive failed automatic builds; latest run $latest_id attempt $latest_attempt"
+  if ! emit ERROR SMS_FAILURE_STREAK "$latest_id" "$latest_attempt" "$message" "$latest_url" "$latest_sha" "$streak"; then
+    echo "ERROR: SMS streak alert sink failed at run $latest_id" >&2; exit 3
+  fi
+  jq '.streak_notified=true' "$STATE_FILE" > "$tmp.state"
+  mv "$tmp.state" "$STATE_FILE"
+fi
 echo "[$NOW_ISO] OK: inspected $count recent TestFlight run(s); no new alert"
