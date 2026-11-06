@@ -41,7 +41,7 @@ esac
 STUB
 chmod +x "$W/gh" "$W/gcloud"
 run() { # name args...
-  STATE_FILE="$W/state-$1.json" STUB_LOG="$W/log-$1" STUB_CAPTURE_DIR="${STUB_CAPTURE_DIR:-}" STUB_CURRENT_POLICY="${STUB_CURRENT_POLICY:-}" STUB_LEGACY_POLICY="${STUB_LEGACY_POLICY:-}" GH_BIN="$W/gh" GCLOUD_BIN="${GCLOUD_OVERRIDE-$W/gcloud}" "$S" "${@:2}" >/dev/null 2>&1 || true
+  STATE_FILE="$W/state-$1.json" STUB_LOG="$W/log-$1" STUB_CAPTURE_DIR="${STUB_CAPTURE_DIR:-}" STUB_CURRENT_POLICY="${STUB_CURRENT_POLICY:-}" STUB_LEGACY_POLICY="${STUB_LEGACY_POLICY:-}" GH_BIN="$W/gh" GCLOUD_BIN="${GCLOUD_OVERRIDE-$W/gcloud}" "$BASH" "$S" "${@:2}" >/dev/null 2>&1 || true
 }
 sent() { if [ -f "$W/log-$1" ]; then grep -c "severity=ERROR" "$W/log-$1" || true; else echo 0; fi; }
 old=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
@@ -114,9 +114,10 @@ current_policy_1="projects/worldarchitecture-ai/alertPolicies/990000000000000000
 current_policy_2="projects/worldarchitecture-ai/alertPolicies/9900000000000000002"
 legacy_policy_2="projects/worldarchitecture-ai/alertPolicies/9900000000000000003"
 STUB_CURRENT_POLICY="$current_policy_1
-$current_policy_2" STUB_LEGACY_POLICY="$legacy_policy_2" STUB_LOG="$W/log-converged" \
+$current_policy_2" STUB_LEGACY_POLICY="$legacy_policy_2
+$current_policy_1" STUB_LOG="$W/log-converged" \
   STUB_CAPTURE_DIR="$W/converged-policy-json" STATE_FILE="$W/state-converged.json" \
-  GCLOUD_BIN="$W/gcloud" GH_BIN="$W/gh" "$S" --ensure-gcp-policy > /dev/null 2>&1
+  GCLOUD_BIN="$W/gcloud" GH_BIN="$W/gh" "$BASH" "$S" --ensure-gcp-policy > /dev/null 2>&1
 for policy_id in "$current_policy_1" "$current_policy_2" "$legacy_policy_2"; do
   grep -Fq "alpha monitoring policies update $policy_id" "$W/log-converged" || fail "existing policy $policy_id must be updated in place"
 done
@@ -124,6 +125,6 @@ done
 if grep -q "alpha monitoring policies create" "$W/log-converged"; then fail "existing current + legacy policies must not create another policy"; fi
 jq -e --arg slack "$SLACK_CHANNEL" '.displayName == "[CRITICAL] Runner offline with queued runs" and .notificationChannels == [$slack]' "$W/converged-policy-json/policy.json" > /dev/null || fail "every existing policy update must use the canonical Slack-only definition"
 pass "all existing current and legacy policy matches converge in place without creating duplicates"
-rc=0; STATE_FILE="$W/state-missing-policy.json" POLICY_FILE="$W/nonexistent.json" GCLOUD_BIN="$W/gcloud" "$S" --ensure-gcp-policy >/dev/null 2>&1 || rc=$?
+rc=0; STATE_FILE="$W/state-missing-policy.json" POLICY_FILE="$W/nonexistent.json" GCLOUD_BIN="$W/gcloud" "$BASH" "$S" --ensure-gcp-policy >/dev/null 2>&1 || rc=$?
 [ "$rc" = 4 ] || fail "missing POLICY_FILE must exit 4, got $rc"
 pass "ensure-gcp-policy ensures metric and policy and fails closed on missing file"
