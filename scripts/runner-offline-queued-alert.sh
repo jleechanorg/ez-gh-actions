@@ -68,9 +68,11 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   while IFS= read -r policy_id; do
     [ -n "$policy_id" ] || continue
     duplicate=0
-    for existing_id in "${POLICY_IDS[@]}"; do
-      if [ "$existing_id" = "$policy_id" ]; then duplicate=1; break; fi
-    done
+    if [ "${#POLICY_IDS[@]}" -gt 0 ]; then
+      for existing_id in "${POLICY_IDS[@]}"; do
+        if [ "$existing_id" = "$policy_id" ]; then duplicate=1; break; fi
+      done
+    fi
     [ "$duplicate" -eq 1 ] || POLICY_IDS+=("$policy_id")
   done <<EOF
 $CURRENT_POLICIES
