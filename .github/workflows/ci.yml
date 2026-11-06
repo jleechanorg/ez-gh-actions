@@ -56,6 +56,8 @@ jobs:
           bash tests/ezgha_host_health_alert_classification_test.sh
           bash tests/install_colima_trim_agent_test.sh
           bash tests/cleanup_ios_release_scratch_test.sh
+          bash tests/testflight_workflow_alert_test.sh
+          bash tests/testflight_workflow_alert_install_test.sh
       - name: Cleanup-stuck-runs regression tests
         run: |
           bash tests/cleanup_stuck_runs_force_cancel_test.sh
