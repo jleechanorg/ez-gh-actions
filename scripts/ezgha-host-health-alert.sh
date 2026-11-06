@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ezgha-host-health-alert.sh — Dual-host mutual fleet health monitor & GCP Cloud Monitoring SMS alerter.
+# ezgha-host-health-alert.sh — Dual-host mutual fleet health monitor & GCP Cloud Monitoring Slack notifier.
 #
 # Runs periodically on both Linux (jeff-ubuntu) and macOS (jeffreys-macbook-pro).
 # Mutual monitoring ensures that if either host crashes, loses network, runs out of disk,
@@ -26,7 +26,7 @@
 #                 self-heal a floor breach within minutes. A breach that persists
 #                 past that window, or drops below `DISK_EMERGENCY_GB` (default
 #                 15GB), escalates to ERROR and pages its own policy
-#                 "[CRITICAL] ezgha: host disk below safety floor" — so the SMS
+#                 "[CRITICAL] ezgha: host disk below safety floor" — so the Slack alert
 #                 says disk, never "runners down".
 #
 # 2026-10-28 incident this classifies: a host-disk verdict was written as
@@ -95,7 +95,7 @@ FLEET_POLICY_DOC="The ezgha runner fleet on this host cannot run jobs (service d
 DISK_POLICY_NAME="[CRITICAL] ezgha: host disk below safety floor"
 DISK_POLICY_SUBJECT="[CRITICAL] ezgha host disk below safety floor"
 DISK_POLICY_DOC="Host free space has been under the ezgha admission floor for the sustained window (or below the emergency floor), so runner admission is paused. Source: scripts/ezgha-host-health-alert.sh with jsonPayload.cause=\"disk\"."
-ALERT_CHANNELS='["projects/worldarchitecture-ai/notificationChannels/14071650426226468737", "projects/worldarchitecture-ai/notificationChannels/17167119139665448890"]'
+ALERT_CHANNELS='["projects/worldarchitecture-ai/notificationChannels/14071650426226468737"]'
 
 # ── Thresholds ───────────────────────────────────────────────────────────────
 if [ "$PLATFORM" = "Darwin" ]; then
@@ -108,13 +108,12 @@ DISK_EMERGENCY_GB="${HEALTH_ALERT_DISK_EMERGENCY_GB:-15}"
 DISK_PAGE_AFTER_MIN="${HEALTH_ALERT_DISK_PAGE_AFTER_MIN:-15}"
 COOLDOWN_SEC="${HEALTH_ALERT_COOLDOWN_SEC:-1800}"
 
-# Slack→SMS escalation. The daemon writes every Slack alert it sends to
-# alerts.jsonl; a CRITICAL entry there means the daemon itself decided something
-# is badly wrong (admission paused, refill stuck, queue starvation). Until now
-# that verdict only reached Slack, so a 15-hour zero-runner fleet (2026-11-04,
-# runner image missing → "disk measurement unavailable", 4914 paused cycles)
-# paged nobody. Promote a recent daemon CRITICAL into cause=fleet so it reaches
-# the SMS policy. Window and file are overridable for the hermetic tests.
+# Daemon CRITICAL follow-up. The daemon writes Slack alerts to alerts.jsonl;
+# a CRITICAL entry means the daemon itself decided something is badly wrong
+# (admission paused, refill stuck, queue starvation). Keep this operational
+# signal available through Slack, but do not let it broaden SMS eligibility.
+# Promote a recent daemon CRITICAL into cause=fleet so the Slack policy captures
+# it. Window and file are overridable for hermetic tests.
 ALERTS_JSONL="${HEALTH_ALERT_ALERTS_FILE:-$HOME/.local/state/ezgha/alerts.jsonl}"
 SLACK_CRITICAL_WINDOW_MIN="${HEALTH_ALERT_SLACK_CRITICAL_WINDOW_MIN:-15}"
 SLACK_ESCALATE="${HEALTH_ALERT_SLACK_ESCALATE:-1}"
@@ -319,13 +318,13 @@ elif [ "$PLATFORM" = "Darwin" ]; then
   fi
 fi
 
-# ── 4b. Slack CRITICAL → SMS escalation ──────────────────────────────────────
+# ── 4b. Daemon CRITICAL follow-up ─────────────────────────────────────────
 # The daemon records every Slack alert it sends in alerts.jsonl. A CRITICAL there
 # is a verdict the container/disk probes can miss entirely — an admission pause
 # with the unit still "active" looks healthy from the outside, and on 2026-11-04
 # that exact shape (runner image missing) sat at 0 runners for 15 hours while the
 # only record was a Slack message nobody read. Promote a recent daemon CRITICAL
-# into cause=fleet so it crosses the SMS policy's filter.
+# into cause=fleet so the existing Slack policy carries the operational follow-up.
 if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
   RECENT_CRIT=$(tail -400 "$ALERTS_JSONL" 2>/dev/null | grep '"severity":"CRITICAL"' | tail -1)
   if [ -n "$RECENT_CRIT" ]; then
