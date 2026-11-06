@@ -134,7 +134,7 @@ qout=$(
 rc=$?
 set -e
 check "failing gh: doctor continues past queue block (rc=0)" "[ $rc -eq 0 ]"
-check "failing gh: next section reached, queue block non-green (QUEUE_RC=2)" "grep -q 'REACHED_NEXT_SECTION QUEUE_RC=2 QUEUE_TAIL_BAD=1' <<<\"\$qout\""
+check "failing gh: proven job tail dominates unknown metrics (QUEUE_RC=1)" "grep -q 'REACHED_NEXT_SECTION QUEUE_RC=1 QUEUE_TAIL_BAD=1' <<<\"\$qout\""
 check "failing gh: no unbound-variable abort" "! grep -q 'unbound variable' <<<\"\$qout\""
 
 [ "$FAIL" -eq 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }

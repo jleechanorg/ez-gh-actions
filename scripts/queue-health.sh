@@ -42,13 +42,30 @@ warn() { printf '  [WARN] %s\n' "$*"; }
 bad() { printf '  [BAD]  %s\n' "$*"; }
 info() { printf '  [..]   %s\n' "$*"; }
 
+# Evaluate validated job evidence before any optional run-metrics reads.
+# Incomplete coverage cannot erase a tail already observed above threshold.
+QUEUE_TAIL_BAD=0
+if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "$JOBLEVEL_OLDEST_QUEUED_MIN" != "?" ]; then
+  QUEUE_TAIL_SOURCE="job-level"
+  QUEUE_TAIL_MIN="$JOBLEVEL_OLDEST_QUEUED_MIN"
+  QUEUE_TAIL_N="${JOBLEVEL_QUEUED_COUNT:-0}"
+  if [ "$QUEUE_TAIL_N" -gt 0 ] && awk -v m="$QUEUE_TAIL_MIN" -v t="$QUEUE_TAIL_WARN_MIN" 'BEGIN{exit !(m > t)}'; then
+    QUEUE_TAIL_BAD=1
+    bad "queue tail (job-level) ${QUEUE_TAIL_MIN}m exceeds ${QUEUE_TAIL_WARN_MIN}m — ${QUEUE_TAIL_N} observed queued job(s)"
+  fi
+fi
+if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" = "?" ]; then
+  warn "queue health UNVERIFIED (job-map completeness unknown; observed jobs remain lower bounds; run age cannot prove runner wait)"
+  _qh_finish "$((2 - QUEUE_TAIL_BAD))"; return "$((2 - QUEUE_TAIL_BAD))"
+fi
+
 if ! command -v gh >/dev/null 2>&1; then
   bad "gh CLI not found — cannot measure queue health"
-  _qh_finish 2; return 2
+  _qh_finish "$((2 - QUEUE_TAIL_BAD))"; return "$((2 - QUEUE_TAIL_BAD))"
 fi
 if ! command -v python3 >/dev/null 2>&1; then
   bad "python3 not found — cannot measure queue health"
-  _qh_finish 2; return 2
+  _qh_finish "$((2 - QUEUE_TAIL_BAD))"; return "$((2 - QUEUE_TAIL_BAD))"
 fi
 
 section "8. GitHub Actions queue health ($QUEUE_REPO)"
@@ -64,13 +81,29 @@ tail_warn = float(os.environ["QUEUE_TAIL_WARN_MIN"])
 stale_h = float(os.environ["STALE_HOURS"])
 
 def api(path):
-    return json.loads(subprocess.check_output(["gh", "api", path]))
+    data = json.loads(subprocess.check_output(["gh", "api", path]))
+    if (not isinstance(data, dict)
+            or not isinstance(data.get("workflow_runs"), list)
+            or type(data.get("total_count")) is not int
+            or data["total_count"] < len(data["workflow_runs"])):
+        raise ValueError("invalid workflow-run response")
+    for run in data["workflow_runs"]:
+        if (not isinstance(run, dict) or type(run.get("id")) is not int
+                or run["id"] <= 0 or not isinstance(run.get("name"), str)
+                or "head_branch" not in run
+                or not isinstance(run["head_branch"], (str, type(None)))
+                or not isinstance(run.get("created_at"), str)):
+            raise ValueError("invalid workflow-run record")
+        created = datetime.datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError("workflow-run timestamp has no timezone")
+    return data
 
 runs = []
 page = 1
 while True:
     data = api(f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}")
-    batch = data.get("workflow_runs", [])
+    batch = data["workflow_runs"]
     if not batch:
         break
     runs.extend(batch)
@@ -79,7 +112,7 @@ while True:
     page += 1
 
 in_prog = api(f"repos/{repo}/actions/runs?status=in_progress&per_page=1")
-in_prog_total = in_prog.get("total_count", len(in_prog.get("workflow_runs", [])))
+in_prog_total = in_prog["total_count"]
 
 now = datetime.datetime.now(datetime.timezone.utc)
 stale_cutoff = stale_h * 3600
@@ -151,7 +184,7 @@ PY
 ) || _qh_py_rc=$?
 if [ "${_qh_py_rc:-0}" -ne 0 ]; then
   bad "queue metrics unavailable: GitHub API read failed (python exit ${_qh_py_rc}) — queue health UNPROVEN"
-  _qh_finish 2; return 2
+  _qh_finish "$((2 - QUEUE_TAIL_BAD))"; return "$((2 - QUEUE_TAIL_BAD))"
 fi
 eval "$_qh_py_out"
 
@@ -174,38 +207,15 @@ fi
 # BAD/critical trigger: JOB-level oldest fresh queued-job wait. When sourced
 # by doctor-runner, JOBLEVEL_* come from the section-F1b job map (same
 # STALE_HOURS freshness rule, single fetch across every repo the fleet
-# serves). The job-level branch is taken ONLY when the map is trustworthy:
-# any fetch error (JOBLEVEL_FETCH_ERRORS>0, counted by F1b's failure
-# ledger), an unparseable age ("?"), or the cross-check contradiction below
-# degrades to the run-level fallback — a truncated fan-out yields an empty
-# map that looks exactly like a drained queue, and a health gate must fail
-# honest, never silent-green (CLAUDE.md API-truncation hazard).
-# Standalone invocations have no job map — same run-level fallback, labeled.
-QUEUE_JOBMAP_DEGRADED=0
-if [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ] || [ "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" = "?" ]; then
-  QUEUE_JOBMAP_DEGRADED=1
-fi
-# Cross-check guard: run-level sees fresh queued runs, the job map saw ZERO
-# queued jobs, AND the map had fetch errors — the "empty" map is a
-# truncation artifact contradicted by run-level data. Degraded, never green.
-if [ "${QUEUE_QUEUED_FRESH:-0}" -gt 0 ] && [ "${JOBLEVEL_QUEUED_COUNT:-0}" -eq 0 ] && [ "${JOBLEVEL_FETCH_ERRORS:-0}" -gt 0 ]; then
-  QUEUE_JOBMAP_DEGRADED=1
-fi
-if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "$QUEUE_JOBMAP_DEGRADED" -eq 0 ]; then
-  QUEUE_TAIL_SOURCE="job-level"
-  QUEUE_TAIL_MIN="${JOBLEVEL_OLDEST_QUEUED_MIN}"
-  QUEUE_TAIL_N="${JOBLEVEL_QUEUED_COUNT:-0}"
-else
-  if [ -n "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ] && [ "$QUEUE_JOBMAP_DEGRADED" -eq 1 ]; then
-    warn "job map degraded (${JOBLEVEL_FETCH_ERRORS:-?} fetch errors) — job-level gate unavailable, using run-level"
-  fi
+# serves). Its observed tail was evaluated before the run-metrics reads.
+# Standalone invocations retain their labeled run-level fallback.
+if [ -z "${JOBLEVEL_OLDEST_QUEUED_MIN:-}" ]; then
   QUEUE_TAIL_SOURCE="run-level FALLBACK (no usable job map; may overcount concurrency wait)"
   QUEUE_TAIL_MIN="${QUEUE_MAX_FRESH_MIN:-0}"
   QUEUE_TAIL_N="${QUEUE_QUEUED_FRESH:-0}"
-fi
-QUEUE_TAIL_BAD=0
-if [ "${QUEUE_TAIL_N:-0}" -gt 0 ] && awk -v m="${QUEUE_TAIL_MIN:-0}" -v t="${QUEUE_TAIL_WARN_MIN}" 'BEGIN{exit !(m > t)}'; then
-  QUEUE_TAIL_BAD=1
+  if [ "${QUEUE_TAIL_N:-0}" -gt 0 ] && awk -v m="${QUEUE_TAIL_MIN:-0}" -v t="${QUEUE_TAIL_WARN_MIN}" 'BEGIN{exit !(m > t)}'; then
+    QUEUE_TAIL_BAD=1
+  fi
 fi
 export QUEUE_TAIL_BAD
 if [ "${QUEUE_TAIL_BAD}" -eq 1 ]; then
@@ -223,6 +233,6 @@ if [ "${QUEUE_QUEUED_STALE:-0}" -gt 0 ]; then
 fi
 
 if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
-  _qh_finish 1
+  _qh_finish 1; return 1
 fi
 _qh_finish 0
