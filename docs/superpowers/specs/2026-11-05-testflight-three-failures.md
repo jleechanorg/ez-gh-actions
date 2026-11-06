@@ -6,7 +6,7 @@ Status: implementation specification for existing PR #215
 Send one SMS after three distinct consecutive completed automatic TestFlight push builds fail or time out; a later successful automatic build resets and rearms the escalation.
 
 ## 2. Eligible outcomes
-Read the existing ios-testflight.yml workflow run endpoint. Count only event=push, status=completed, and failure conclusions. Treat success as reset; ignore pending runs, workflow_dispatch, cancellation, skipped, neutral, TEST, BLIND, and RUN_STUCK events. Same run attempts have separate identities.
+Read the existing ios-testflight.yml workflow run endpoint. Count only event=push, status=completed, and conclusion=failure or timed_out. Treat success as reset; ignore pending runs, workflow_dispatch, cancellation, skipped, neutral, TEST, BLIND, and RUN_STUCK events. Same run attempts have separate identities.
 
 ## 3. Ordering and late completion
 Order results by (run_number, run_attempt). Persist at most the latest three distinct failures after the latest successful push outcome. Merge late failures while newer success has not superseded them; a newer success anchors the reset so later-arriving older failures cannot reopen the streak. Polling the same attempt is idempotent.

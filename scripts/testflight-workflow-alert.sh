@@ -126,7 +126,7 @@ if ! "$GH_BIN" api "repos/$REPO/actions/workflows/$WORKFLOW/runs?per_page=100" -
 fi
 jq -r '[.id, (.run_number // "-"), .run_attempt, (.event // "-"), (.status // "-"), (.conclusion // "-"), (.name // "-"), (.run_started_at // .created_at // "-"), (.updated_at // .created_at // "-"), (.html_url // "-"), (.head_sha // "-")] | @tsv' \
   "$tmp" > "$tmp.rows"
-jq -sr 'sort_by((.run_number // 0), (.run_attempt // 0))[] | [.id, (.run_number // "-"), .run_attempt, (.event // "-"), (.status // "-"), (.conclusion // "-"), (.html_url // "-"), (.head_sha // "-")] | @tsv' \
+jq -sr 'sort_by((.run_number // 0), (.run_attempt // 0))[] | [.id, (.run_number // "-"), .run_attempt, (.event // "-"), (.status // "-"), (.conclusion // "-"), (.name // "-"), (.html_url // "-"), (.head_sha // "-")] | @tsv' \
   "$tmp" > "$tmp.streak_rows"
 
 jq '.api_failures=0' "$STATE_FILE" > "$tmp.state"; mv "$tmp.state" "$STATE_FILE"
@@ -163,8 +163,9 @@ while IFS=$'\t' read -r id run_number attempt event status conclusion name creat
 done < "$tmp.rows"
 
 # Merge completed automatic outcomes in run order so late completions are retained.
-while IFS=$'\t' read -r id run_number attempt event status conclusion url sha; do
+while IFS=$'\t' read -r id run_number attempt event status conclusion name url sha; do
   [ "$status" = completed ] || continue
+  [ "$name" = "iOS TestFlight" ] || continue
   [[ "$run_number" =~ ^[0-9]+$ ]] || continue
   [[ "$attempt" =~ ^[0-9]+$ ]] || continue
   [ "$conclusion" != "-" ] || continue
@@ -181,7 +182,7 @@ while IFS=$'\t' read -r id run_number attempt event status conclusion url sha; d
     continue
   fi
   [ "$event" = push ] || continue
-  case "$conclusion" in failure|timed_out|action_required|startup_failure) ;; *) continue ;; esac
+  case "$conclusion" in failure|timed_out) ;; *) continue ;; esac
   if jq -e --arg id "$id" --argjson number "$run_number" --argjson attempt "$attempt" \
       'any(.streak_failures[]?; .id==$id and .run_number==$number and .attempt==$attempt)' "$STATE_FILE" >/dev/null; then
     continue

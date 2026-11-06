@@ -94,6 +94,25 @@ run --ensure-gcp-policy
 jq -se 'any(.[]; (.displayName | contains("run monitor")) and (.notificationChannels == ["projects/worldarchitecture-ai/notificationChannels/14071650426226468737"]) and (.conditions[0].conditionMatchedLog.filter | contains("RUN_FAILED") and contains("RUN_STUCK") and contains("BLIND"))) and any(.[]; (.displayName | contains("consecutive failures")) and (.notificationChannels == ["projects/worldarchitecture-ai/notificationChannels/17167119139665448890"]) and (.conditions[0].conditionMatchedLog.filter | contains("SMS_FAILURE_STREAK") and contains("failure_streak>=3") and contains("jleechanorg/worldai_frontend") and contains("ios-testflight.yml")))' "$TMP/policy-history.jsonl" >/dev/null || fail "policies must route current run statuses to Slack and thresholded streaks to SMS"
 pass "policy setup separates Slack run alerts from SMS streak escalation"
 
+# The streak path repeats the existing workflow-name fail-safe and accepts only build failures/timeouts.
+ELIGIBILITY_STATE="$TMP/eligibility-state.json"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":730,"run_number":1,"run_attempt":1,"event":"push","name":"Unrelated workflow","status":"completed","conclusion":"failure","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" STATE_FILE="$ELIGIBILITY_STATE" RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/eligibility-gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" "$SCRIPT" >/dev/null 2>&1
+[ "$(jq -r '.failure_streak // 0' "$ELIGIBILITY_STATE")" = 0 ] || fail "unrelated run name must not advance the SMS streak"
+cat > "$TMP/runs.json" <<EOF
+{"workflow_runs":[
+ {"id":731,"run_number":2,"run_attempt":1,"event":"push","name":"iOS TestFlight","status":"completed","conclusion":"action_required","created_at":"$failure_old","updated_at":"$failure_old"}
+]}
+EOF
+GH_BIN="$TMP/gh" GCLOUD_BIN="$TMP/gcloud" STATE_FILE="$ELIGIBILITY_STATE" RUNS_FIXTURE="$TMP/runs.json" GCLOUD_LOG="$TMP/eligibility-gcloud.log" GH_CALL_LOG="$TMP/gh-calls.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" "$SCRIPT" >/dev/null 2>&1
+[ "$(jq -r '.failure_streak // 0' "$ELIGIBILITY_STATE")" = 0 ] || fail "action_required must not count as a completed build failure"
+[ "$(grep -c 'SMS_FAILURE_STREAK' "$TMP/eligibility-gcloud.log" || true)" = 0 ] || fail "unrelated or action_required outcomes must not trigger SMS"
+pass "name fail-safe and SMS conclusion whitelist hold"
+
 # A success later in the same first API batch suppresses historical escalation.
 BATCH_STATE="$TMP/batch-state.json"
 cat > "$TMP/runs.json" <<EOF
