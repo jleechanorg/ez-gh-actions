@@ -11,14 +11,13 @@
 #   3. Local host disk space (enforces ezgha 30GB safety floor on Linux, 20GB on Mac)
 #   4. Cross-host peer reachability & peer runner health (over LAN/Tailscale)
 #
-# ── Failure classification (2026-10-28, bead jleechan-v8ms) ───────────────────
-# Every failed check is classified into exactly one cause, and the cause decides
-# whether the operator is paged:
+# ── Failure classification ─────────────────────────────────────────────────
+# Each failed check has one cause; operational alerts route to Slack.
 #
-#   cause=fleet → the runner fleet cannot run anything (service down, docker
-#                 unreachable, 0 local/peer containers, peer host unreachable).
-#                 Severity ERROR ⇒ pages "[CRITICAL] ezgha: GitHub Actions
-#                 Runners Down Alert" (alertPolicies/10378876199383442907).
+#   cause=fleet → the local fleet cannot run jobs (service down, Docker
+#                 unreachable, or no local containers). Severity ERROR notifies
+#                 "[CRITICAL] ezgha: GitHub Actions Runners Down Alert".
+#   cause=peer  → peer-only failures remain WARNING diagnostics.
 #   cause=disk  → free space is under the admission floor but the fleet is
 #                 otherwise healthy. Severity WARNING ⇒ logged, NOT paged, for
 #                 `DISK_PAGE_AFTER_MIN` (default 15) minutes, because ezgha's own
