@@ -22,6 +22,11 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$REPO/scripts/ezgha-host-health-alert.sh"
 [ -f "$SCRIPT" ] || { echo "FAIL: missing $SCRIPT"; exit 1; }
 
+# The launchd job runs /bin/bash (bash 3.2 on macOS, where `set -u` + an empty
+# "${A[@]}" is an unbound-variable error). Use the SAME interpreter so that
+# semantics are exercised, not bypassed by a newer bash on PATH.
+TEST_SHELL="${TEST_SHELL:-/bin/bash}"
+
 FAILED=0
 ok()  { printf '  [%s] PASS\n' "$1"; }
 no()  { printf '  [%s] FAIL: %s\n' "$1" "$2"; FAILED=1; }
@@ -31,7 +36,7 @@ run_case() {
   local label="$1" expect="$2" platform="$3"; shift 3
   local out rc
   out=$(env HEALTH_ALERT_PLATFORM="$platform" "$@" \
-        timeout 90 bash "$SCRIPT" --dry-run 2>&1)
+        timeout 90 "$TEST_SHELL" "$SCRIPT" --dry-run 2>&1)
   rc=$?
 
   if [ "$expect" = "DISABLED" ]; then
@@ -46,6 +51,15 @@ run_case() {
       ok "$label severity=INFO (policy cannot page)"
     else
       no "$label severity" "an ERROR/CRITICAL entry was emitted while parked -- would page"
+    fi
+    # The payload must be well-formed. bash 3.2 (macOS /bin/bash) treats an
+    # EMPTY array expanded as "${A[@]}" under `set -u` as an unbound variable, so
+    # the parked path (no FLEET_FAILS by construction) printed a shell error and
+    # emitted a truncated payload while still LOOKING like DISABLED.
+    if grep -qE 'unbound variable|command not found|syntax error' <<<"$out"; then
+      no "$label payload" "shell diagnostic leaked into the parked run"
+    else
+      ok "$label no shell diagnostics"
     fi
   else
     # Exit status is NOT the signal: main changed the contract so a *verdict* is
@@ -81,7 +95,7 @@ run_case "mac dead, no opt-out -> DOWN (fail closed)" DOWN Darwin \
 healthy_out=$(env HEALTH_ALERT_PLATFORM=Linux HEALTH_ALERT_SERVICE_OK=1 \
   HEALTH_ALERT_CONTAINER_COUNT=20 HEALTH_ALERT_FREE_GB=100 HEALTH_ALERT_PEER_OK=1 \
   HEALTH_ALERT_PEER_CONTAINERS=4 HEALTH_ALERT_PEER_FREE_GB=100 \
-  timeout 90 bash "$SCRIPT" --dry-run 2>&1)
+  timeout 90 "$TEST_SHELL" "$SCRIPT" --dry-run 2>&1)
 healthy_rc=$?
 if [ "$healthy_rc" -eq 0 ] && ! grep -qE 'FLEET DOWN|would dispatch ERROR' <<<"$healthy_out"; then
   ok "linux healthy, no opt-out -> no page"

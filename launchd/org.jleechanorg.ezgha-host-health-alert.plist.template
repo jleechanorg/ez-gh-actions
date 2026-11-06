@@ -17,6 +17,15 @@
     <string>@HOME@/bin:@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>DOCKER_HOST</key>
     <string>unix://@HOME@/.colima/default/docker.sock</string>
+    <!-- Intentionally parked leg (bead jleechan-hxz0). The pager reports
+         DISABLED/INFO instead of DOWN/CRITICAL while this platform is parked on
+         purpose, so parking it does not page "GitHub Actions Runners Down"
+         every two minutes forever. Remove BOTH keys to require proof again
+         (fail-closed default). -->
+    <key>MAC_RUNNER_DISABLED</key>
+    <string>1</string>
+    <key>REMOTE_LINUX_DISABLED</key>
+    <string>1</string>
   </dict>
 
   <key>WorkingDirectory</key>

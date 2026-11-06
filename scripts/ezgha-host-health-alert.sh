@@ -424,8 +424,13 @@ if [ "$LOCAL_LEG_PARKED" -eq 1 ] && [ "$FLEET_COUNT" -eq 0 ]; then
   if [ "$DISK_COUNT" -gt 0 ]; then
     echo "[$NOW_ISO] note: parked host still reports ${FREE_GB}GB free under its floor; pre-existing/independent" >&2
   fi
+  # macOS ships bash 3.2, where expanding an EMPTY array as "${A[@]}" under
+  # `set -u` is an unbound-variable ERROR (fixed only in bash 4.4+). A parked leg
+  # has no FLEET_FAILS by construction, so this is exactly the empty case.
+  # "${A[@]+"${A[@]}"}" expands to nothing when unset/empty and to the elements
+  # otherwise, on both bash 3.2 and 5.x.
   PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DISABLED", "cause":"parked", "severity":"INFO", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-    "$HOST" "$PLATFORM" "$(json_checks "${FLEET_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    "$HOST" "$PLATFORM" "$(json_checks ${FLEET_FAILS[@]+"${FLEET_FAILS[@]}"})" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
   emit INFO "$PAYLOAD"
   save_state "DISABLED" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
   exit "$EXIT_CODE"
