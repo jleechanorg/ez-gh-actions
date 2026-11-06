@@ -14,6 +14,18 @@ fail() { echo "FAIL: $*" >&2; exit 1; }; pass() { echo "PASS: $*"; }
 cat > "$W/gcloud" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_LOG"
+case "$*" in
+  *"alpha monitoring policies list"*) exit 0 ;;
+  *"alpha monitoring policies create"*)
+    policy_file=""
+    for arg in "$@"; do case "$arg" in --policy-from-file=*) policy_file="${arg#--policy-from-file=}" ;; esac; done
+    if [ -n "${STUB_CAPTURE_DIR:-}" ] && [ -r "$policy_file" ]; then
+      mkdir -p "$STUB_CAPTURE_DIR"
+      count=$(find "$STUB_CAPTURE_DIR" -name 'policy-*.json' -type f | wc -l | tr -d ' ')
+      cp "$policy_file" "$STUB_CAPTURE_DIR/policy-$((count + 1)).json"
+    fi
+    ;;
+esac
 STUB
 chmod +x "$W/gcloud"
 
@@ -102,11 +114,28 @@ run healthy 100 18
 pass "healthy run stays silent"
 
 # ── 10. --ensure-policies (dry-run) declares both cause-scoped policies ─────
-DRY_OUT=$(GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-pol" "$S" --ensure-policies --dry-run 2>&1 || true)
+DRY_OUT=$(GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-pol" HEALTH_ALERT_STATE_DIR="$W/state-pol-dry" "$S" --ensure-policies --dry-run 2>&1 || true)
 printf '%s' "$DRY_OUT" | grep -q 'Runners Down Alert' || fail "--ensure-policies must declare the fleet policy"
 printf '%s' "$DRY_OUT" | grep -q 'host disk below safety floor' || fail "--ensure-policies must declare the disk policy"
 [ ! -f "$W/log-pol" ] || fail "--ensure-policies --dry-run must not mutate GCP"
 pass "policy ensure (dry-run) declares fleet + disk policies"
+# A local gcloud stub exercises generated policy JSON without any GCP writes.
+mkdir -p "$W/policy-json"
+GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-pol-create" STUB_CAPTURE_DIR="$W/policy-json" HEALTH_ALERT_STATE_DIR="$W/state-pol-create" "$S" --ensure-policies > /dev/null 2>&1 || fail "stubbed policy generation failed"
+[ "$(find "$W/policy-json" -name 'policy-*.json' -type f | wc -l | tr -d ' ')" = 2 ] || fail "exactly two operational policy documents must be generated"
+SLACK_CHANNEL="projects/worldarchitecture-ai/notificationChannels/14071650426226468737"
+for policy in "$W"/policy-json/policy-*.json; do
+  name=$(jq -r '.displayName' "$policy")
+  case "$name" in
+    *"Runners Down Alert") cause=fleet ;;
+    *"host disk below safety floor") cause=disk ;;
+    *) fail "unexpected generated operational policy: $name" ;;
+  esac
+  jq -e --arg slack "$SLACK_CHANNEL" --arg cause "$cause" \
+    '(.notificationChannels == [$slack] and .enabled == true and .severity == "CRITICAL" and .alertStrategy.autoClose == "1800s" and .alertStrategy.notificationRateLimit.period == "300s") and (.conditions[0].conditionMatchedLog.filter | contains("severity>=ERROR") and contains("jsonPayload.cause=\"" + $cause + "\""))' \
+    "$policy" > /dev/null || fail "$cause policy must preserve its existing enabled predicate and route only to Slack"
+done
+pass "generated fleet + disk policies stay enabled and Slack-only with existing filters/rate limits"
 grep -q 'jsonPayload.cause=\\"fleet\\"' "$S" || fail "fleet policy filter must be cause-scoped"
 grep -q 'jsonPayload.cause=\\"disk\\"' "$S" || fail "disk policy filter must be cause-scoped"
 pass "policy filters are cause-scoped"
@@ -121,14 +150,14 @@ grep -q '"cause":"peer"' "$W/log-peerdown" || fail "peer verdict must carry caus
 grep -q '"status":"DEGRADED"' "$W/log-peerdown" || fail "peer verdict must be DEGRADED, not DOWN"
 pass "peer-only failure reports cause=peer at WARNING, never a fleet page"
 
-# ── 12. A recent daemon CRITICAL escalates to the SMS path ──────────────────
+# ── 12. A recent daemon CRITICAL stays on the operational Slack path ───────
 AL="$W/alerts.jsonl"
 printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"paused","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$AL"
 run crit 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
-[ "$(errors crit)" = 1 ] || fail "a recent daemon CRITICAL must escalate to an ERROR (SMS) entry"
-grep -q '"cause":"fleet"' "$W/log-crit" || fail "escalation must use cause=fleet so the SMS policy matches"
+[ "$(errors crit)" = 1 ] || fail "a recent daemon CRITICAL must remain a critical operational notification"
+grep -q '"cause":"fleet"' "$W/log-crit" || fail "escalation must use cause=fleet so the Slack policy matches"
 grep -q 'daemon CRITICAL alert' "$W/log-crit" || fail "escalation payload must name the daemon alert"
-pass "recent Slack CRITICAL escalates into the SMS cause=fleet path"
+pass "recent Slack CRITICAL remains in the cause=fleet operational path"
 
 printf '{"body":"x","event_key":"old","severity":"CRITICAL","subject":"old","ts_unix":%s}\n' "$(( NOW - 7200 ))" > "$AL"
 run critold 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"

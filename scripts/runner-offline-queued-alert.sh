@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# runner-offline-queued-alert.sh — SMS when a named self-hosted runner is not online
+# runner-offline-queued-alert.sh — Slack notice when a named self-hosted runner is not online
 # while workflow runs sit queued behind it (2026-10-27: worldai-testflight-native-mac
 # stayed offline ~10h and every iOS TestFlight push queued).
 #
 # Reuses the existing GCP path: an ERROR entry in Cloud Logging log
 # `ezgha-runner-alerts` (project worldarchitecture-ai) increments counter metric
-# `runner_offline_queued_alert_count`, driving `[CRITICAL] Runner offline with queued runs: SMS (metric)`
-# (SMS) alongside the `ezgha-runner-alerts` Slack policy. Throttled to one text per COOLDOWN_SEC.
+# `runner_offline_queued_alert_count`, driving the Slack-only policy
+# `[CRITICAL] Runner offline with queued runs` alongside other
+# `ezgha-runner-alerts` diagnostics. This is host-capacity context, not a global
+# production P0. Throttled to one alert per COOLDOWN_SEC.
 #
 # Usage: runner-offline-queued-alert.sh [--dry-run] [--simulate-offline] [--test-sms] [--ensure-gcp-policy]
 #   --simulate-offline  treat the runner as offline and runs as queued (detector proof)
-#   --test-sms          write one clearly labelled TEST entry and exit
-#   --ensure-gcp-policy ensure the GCP logging metric and SMS alert policy exist and exit
+#   --test-sms          legacy flag name; write a TEST entry and exit (policy routes to Slack)
+#   --ensure-gcp-policy ensure the GCP logging metric and Slack alert policy exist and exit
 # Env: ALERT_REPO ALERT_RUNNER ALERT_WORKFLOW MIN_QUEUED_MIN MAX_ONLINE_QUEUED_MIN COOLDOWN_SEC STATE_FILE
 #      GH_BIN GCLOUD_BIN MAX_API_FAILURES (consecutive gh failures before a "monitor blind" alert)
 set -euo pipefail
@@ -48,14 +50,39 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
     [ -f "$POLICY_FILE" ] || POLICY_FILE="$SCRIPT_DIR/../launchd/runner-offline-queued-sms-policy.json"
   fi
   if [ ! -f "$POLICY_FILE" ]; then echo "FATAL: policy file not found: $POLICY_FILE" >&2; exit 4; fi
-  [ "$DRY_RUN" -eq 0 ] || { echo "[$NOW_ISO] [dry-run] would ensure metric runner_offline_queued_alert_count and policy from $POLICY_FILE"; exit 0; }
+  [ "$DRY_RUN" -eq 0 ] || { echo "[$NOW_ISO] [dry-run] would ensure metric runner_offline_queued_alert_count and Slack policy from $POLICY_FILE"; exit 0; }
   GCP_ARGS=(--project=worldarchitecture-ai --account=jleechan@gmail.com)
-  METRIC_ARGS=(runner_offline_queued_alert_count --description="ERROR entries from runner-offline-queued-alert (drives SMS policy)"
+  METRIC_ARGS=(runner_offline_queued_alert_count --description="ERROR entries from runner-offline-queued-alert (drives Slack policy)"
     --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR' "${GCP_ARGS[@]}")
   "$GCLOUD_BIN" logging metrics create "${METRIC_ARGS[@]}" 2>/dev/null || "$GCLOUD_BIN" logging metrics update "${METRIC_ARGS[@]}"
-  EXISTING=$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" --filter='displayName="[CRITICAL] Runner offline with queued runs: SMS (metric)"' --format='value(name)' | head -1)
-  if [ -n "$EXISTING" ]; then "$GCLOUD_BIN" alpha monitoring policies update "$EXISTING" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}"
-  else "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}"; fi
+  POLICY_NAME="$(jq -r '.displayName' "$POLICY_FILE")"
+  LEGACY_POLICY_NAME="[CRITICAL] Runner offline with queued runs: SMS (metric)"
+  CURRENT_POLICIES=$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
+    --filter="displayName=\"${POLICY_NAME}\"" --format='value(name)')
+  LEGACY_POLICIES=$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
+    --filter="displayName=\"${LEGACY_POLICY_NAME}\"" --format='value(name)')
+  # Converge every exact current/legacy match in place. A pre-existing duplicate
+  # policy is still an existing alert the user wants retained; updating all
+  # matches removes SMS routing without creating more policies.
+  POLICY_IDS=()
+  while IFS= read -r policy_id; do
+    [ -n "$policy_id" ] || continue
+    duplicate=0
+    for existing_id in "${POLICY_IDS[@]}"; do
+      if [ "$existing_id" = "$policy_id" ]; then duplicate=1; break; fi
+    done
+    [ "$duplicate" -eq 1 ] || POLICY_IDS+=("$policy_id")
+  done <<EOF
+$CURRENT_POLICIES
+$LEGACY_POLICIES
+EOF
+  if [ "${#POLICY_IDS[@]}" -gt 0 ]; then
+    for policy_id in "${POLICY_IDS[@]}"; do
+      "$GCLOUD_BIN" alpha monitoring policies update "$policy_id" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}"
+    done
+  else
+    "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}"
+  fi
   exit 0
 fi
 
