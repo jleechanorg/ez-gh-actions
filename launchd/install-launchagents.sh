@@ -144,6 +144,15 @@ install_scripts() {
     echo "dashboard payload installed: ${SCRIPTS_DIR}"
     return
   fi
+  if [[ "$label_filter" == "org.jleechanorg.ezgha-testflight-workflow-alert" ]]; then
+    # A label-scoped update must not overwrite other running monitors with
+    # copies from this checkout. In particular, the incumbent queue monitor may
+    # have a newer independently deployed revision.
+    install -m 0755 "${REPO_PATH}/scripts/testflight-workflow-alert.sh" \
+      "${SCRIPTS_DIR}/testflight-workflow-alert.sh"
+    echo "TestFlight alert payload installed: ${SCRIPTS_DIR}/testflight-workflow-alert.sh"
+    return
+  fi
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.
