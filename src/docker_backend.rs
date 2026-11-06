@@ -9450,11 +9450,18 @@ esac
             "incomplete evidence must force the next full reconciliation while remaining pending"
         );
         let mut ceilings = crate::SettlingCeilingState::default();
-        assert!(!crate::record_settling_ceiling(
+        // This test asserts that a tick WITHOUT readiness proof does not reset
+        // the ceiling counter. That is a re-arm/reset property, not a timing
+        // property, so drive the ceiling clock past the sustain window instead
+        // of leaving the call inside it (where it would not count at all).
+        let mut ceiling_clock = std::time::Instant::now();
+        assert!(!crate::record_settling_ceiling_at(
             &cfg,
             &mut ceilings,
-            "synthetic first incomplete episode"
+            "synthetic first incomplete episode",
+            ceiling_clock
         ));
+        ceiling_clock += crate::SETTLING_CEILING_MIN_SUSTAIN + std::time::Duration::from_secs(1);
 
         let misleading_full_container_outcome =
             ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -9481,9 +9488,17 @@ esac
                 .is_some_and(crate::SettlingEpisode::is_active),
             "the completed full reconciliation must rearm local worker proof"
         );
+        // The property under test is that a no-readiness tick does NOT reset the
+        // shortage streak. Assert the streak is still armed rather than pinning
+        // a raw episode count (which the sustain-window gate no longer bumps on
+        // every call).
+        assert!(
+            ceilings.shortfall_since.is_some(),
+            "no readiness proof means no reset: the shortage streak must stay armed"
+        );
         assert_eq!(
-            ceilings.consecutive_ceilings, 1,
-            "no readiness proof means no reset"
+            ceilings.consecutive_ceilings, 0,
+            "a single in-window ceiling must not count toward the threshold"
         );
 
         let executing = local_executing_runner_count(&cfg).unwrap().ready;

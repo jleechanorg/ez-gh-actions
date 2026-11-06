@@ -1026,14 +1026,29 @@ fn apply_ensure_success_decision(
     }
 }
 
+/// How long a shortage must PERSIST before the settling ceiling counts toward
+/// the alert threshold. A busy ephemeral fleet legitimately touches a 19/20
+/// ceiling and re-settles to 20/20 within seconds; before this window existed,
+/// three such self-healing episodes inside ~40s escalated to a CRITICAL
+/// "refill settling remains stuck" while the fleet was fully healthy
+/// (measured 2026-11-05: ceilings at 19:11:39 and 19:12:19, settled 20/20 at
+/// 19:12:32, fleet 20/20, load 2.32 -- bead jleechan-15u5).
+pub const SETTLING_CEILING_MIN_SUSTAIN: Duration = Duration::from_secs(600);
+
 #[derive(Default)]
 struct SettlingCeilingState {
+    /// Episodes that were still short AFTER `SETTLING_CEILING_MIN_SUSTAIN`.
+    /// Only these count toward the alert threshold.
     consecutive_ceilings: u32,
+    /// When the current unbroken shortage streak began (first ceiling that was
+    /// followed by recovery-suppression). `None` means no active streak.
+    shortfall_since: Option<Instant>,
 }
 
 impl SettlingCeilingState {
     fn record_recovery(&mut self) {
         self.consecutive_ceilings = 0;
+        self.shortfall_since = None;
     }
 }
 
@@ -1042,6 +1057,28 @@ fn record_settling_ceiling(
     state: &mut SettlingCeilingState,
     detail: &str,
 ) -> bool {
+    record_settling_ceiling_at(cfg, state, detail, Instant::now())
+}
+
+/// Timing-injectable core of [`record_settling_ceiling`].
+///
+/// The ceiling only counts toward the alert threshold once the shortage has
+/// PERSISTED for `SETTLING_CEILING_MIN_SUSTAIN`. Counting raw episodes let three
+/// self-healing 19/20 blips inside ~40s page a CRITICAL while the fleet was
+/// healthy (bead jleechan-15u5). A genuinely stuck refill keeps hitting the
+/// ceiling for minutes, so it still crosses the threshold -- later, and honestly.
+pub(crate) fn record_settling_ceiling_at(
+    cfg: &config::Config,
+    state: &mut SettlingCeilingState,
+    detail: &str,
+    now: Instant,
+) -> bool {
+    let since = *state.shortfall_since.get_or_insert(now);
+    if now.duration_since(since) < SETTLING_CEILING_MIN_SUSTAIN {
+        // Still inside the sustain window: real turnover, not a stuck refill.
+        return false;
+    }
+
     state.consecutive_ceilings = state.consecutive_ceilings.saturating_add(1);
     let threshold = cfg.alert.failure_alert_threshold.max(1);
     if state.consecutive_ceilings < threshold {
@@ -2742,9 +2779,15 @@ mod tests {
         let mut cfg = test_config();
         cfg.alert.failure_alert_threshold = 3;
         let mut now = Instant::now();
+        // Separate clock for the ceiling state so the sustain-window gate is
+        // stepped deliberately instead of being driven by the polling clock.
+        let mut ceiling_clock = now;
         let mut settling = Some(SettlingEpisode::start(now, 4));
         let mut pending_readiness = true;
         let mut ceilings = SettlingCeilingState::default();
+        // Establish the shortage origin, then step past the sustain window each
+        // iteration: the property under test is re-arming, not the time gate.
+        let _ = record_settling_ceiling_at(&cfg, &mut ceilings, "origin", ceiling_clock);
 
         for expected_ceilings in 1..=3 {
             let mut decision = SettlingDecision::Continue;
@@ -2756,10 +2799,15 @@ mod tests {
                     .observe(now, 4, 6);
             }
             assert_eq!(decision, SettlingDecision::Ceiling);
-            let escalated = record_settling_ceiling(
+            // This test asserts the RE-ARM property (each persistent episode
+            // counts again until a real recovery), not the sustain window. Step
+            // past the window so the timing gate does not mask the re-arm.
+            ceiling_clock += SETTLING_CEILING_MIN_SUSTAIN + Duration::from_secs(1);
+            let escalated = record_settling_ceiling_at(
                 &cfg,
                 &mut ceilings,
                 "synthetic complete 4/6 probe episode",
+                ceiling_clock,
             );
             assert_eq!(escalated, expected_ceilings == 3);
             apply_local_settling_decision(&mut settling, &mut pending_readiness, decision);
@@ -2818,22 +2866,42 @@ mod tests {
         cfg.alert.log_path = Some(log.clone());
         let mut state = SettlingCeilingState::default();
 
-        assert!(!record_settling_ceiling(
+        // A persistent shortage must still alert: advance past the sustain
+        // window before each episode so all three count.
+        let t0 = Instant::now();
+        assert!(!record_settling_ceiling_at(
             &cfg,
             &mut state,
-            "episode 1 stayed at 5/6"
+            "episode 1 stayed at 5/6",
+            t0
         ));
-        assert!(!record_settling_ceiling(
+        // Episode 2 is the FIRST one past the sustain window, so it counts (#1).
+        assert!(!record_settling_ceiling_at(
             &cfg,
             &mut state,
-            "episode 2 stayed at 5/6"
+            "episode 2 stayed at 5/6",
+            t0 + SETTLING_CEILING_MIN_SUSTAIN + Duration::from_secs(1),
         ));
-        assert!(!log.exists(), "first turnover episodes remain non-alerting");
+        assert_eq!(state.consecutive_ceilings, 1);
+        // Episode 3 counts (#2) -- still below the 3 threshold.
+        assert!(!record_settling_ceiling_at(
+            &cfg,
+            &mut state,
+            "episode 3 stayed at 5/6",
+            t0 + SETTLING_CEILING_MIN_SUSTAIN * 2 + Duration::from_secs(2),
+        ));
+        assert_eq!(state.consecutive_ceilings, 2);
+        assert!(
+            !log.exists(),
+            "episodes below the alert threshold stay non-alerting"
+        );
 
-        assert!(record_settling_ceiling(
+        // Episode 4 counts (#3) and crosses the threshold.
+        assert!(record_settling_ceiling_at(
             &cfg,
             &mut state,
-            "episode 3 stayed at 5/6"
+            "episode 4 stayed at 5/6",
+            t0 + SETTLING_CEILING_MIN_SUSTAIN * 3 + Duration::from_secs(3),
         ));
         let raw = std::fs::read_to_string(&log).unwrap();
         assert!(raw.contains("serve.runner_settling.ceiling"));
@@ -2841,12 +2909,50 @@ mod tests {
 
         state.record_recovery();
         assert_eq!(state.consecutive_ceilings, 0);
-        assert!(!record_settling_ceiling(
+        let t1 = t0 + SETTLING_CEILING_MIN_SUSTAIN * 4;
+        assert!(!record_settling_ceiling_at(
             &cfg,
             &mut state,
-            "new streak episode 1"
+            "new streak episode 1",
+            t1
         ));
-        assert_eq!(state.consecutive_ceilings, 1);
+        // Still inside the new sustain window, so it has not counted yet.
+        assert_eq!(state.consecutive_ceilings, 0);
+        assert!(state.shortfall_since.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression for bead jleechan-15u5: self-healing 19/20 turnover must NOT
+    /// page. Measured live 2026-11-05 -- ceilings at 19:11:39 and 19:12:19,
+    /// settled back to 20/20 at 19:12:32, fleet 20/20 at load 2.32, yet three
+    /// such blips inside ~40s escalated to a CRITICAL "refill settling remains
+    /// stuck".
+    #[test]
+    fn self_healing_turnover_within_sustain_window_never_alerts() {
+        let _ctx = alert::test_context();
+        let mut cfg = test_config();
+        cfg.alert.failure_alert_threshold = 3;
+        let dir = unique_temp_dir("settling-ceiling-turnover");
+        let log = dir.join("alerts.jsonl");
+        cfg.alert.log_path = Some(log.clone());
+        let mut state = SettlingCeilingState::default();
+
+        // Ten ceilings inside 40 seconds, each followed by a recovery: exactly
+        // the healthy-churn shape, far exceeding the threshold count.
+        let t0 = Instant::now();
+        for i in 0..10u64 {
+            let at = t0 + Duration::from_secs(i * 4);
+            assert!(
+                !record_settling_ceiling_at(&cfg, &mut state, "19/20 then settled", at),
+                "self-healing ceiling {i} must not alert"
+            );
+            state.record_recovery();
+        }
+        assert!(
+            !log.exists(),
+            "healthy episodic turnover must never write an alert"
+        );
+        assert_eq!(state.consecutive_ceilings, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
