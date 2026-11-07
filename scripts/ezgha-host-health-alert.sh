@@ -523,9 +523,19 @@ if [ "$PEER_COUNT" -gt 0 ]; then
   # long peer outage does not write a log entry every 2 minutes.
   PEER_REASONS=$(IFS='; '; echo "${PEER_FAILS[*]}")
   echo "[$NOW_ISO] PEER DEGRADED on $HOST (local: $CONTAINER_COUNT containers, ${FREE_GB}GB free; cause=peer, no page): $PEER_REASONS" >&2
+  # A coexisting transient daemon CRITICAL must not be dropped just because the
+  # peer is also degraded: this branch returns before the operational-note
+  # branch, so the note would be lost and, if it expired while the peer stayed
+  # down, never forwarded at all (P2 from review). Fold it into the peer payload
+  # so the diagnostic survives without adding a fleet page.
+  PEER_CHECKS=("${PEER_FAILS[@]}")
+  if [ -n "${OPERATIONAL_NOTE:-}" ]; then
+    echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $OPERATIONAL_NOTE" >&2
+    PEER_CHECKS+=("$OPERATIONAL_NOTE")
+  fi
   if [ "$PREV_STATUS" != "PEER" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"peer", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$(json_checks "${PEER_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+      "$HOST" "$PLATFORM" "$(json_checks "${PEER_CHECKS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
     emit WARNING "$PAYLOAD"
   fi
   save_state "PEER" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"

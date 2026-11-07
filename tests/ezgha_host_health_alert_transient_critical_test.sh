@@ -141,4 +141,26 @@ else
   fail "recovery arm produced no log at all"
 fi
 
+# ── 8. A coexisting peer failure must not drop the transient diagnostic ────
+# P2 from review: the peer branch returns before the note branch, so a peer
+# outage plus a recent memory_pressure emitted only the peer WARNING and the
+# transient event vanished from every stream.
+state_dir peerx
+env \
+  GCLOUD_BIN="$W/gcloud" STUB_LOG="$W/log-peerx" \
+  HEALTH_ALERT_HOST="testhost" HEALTH_ALERT_PLATFORM="Linux" \
+  HEALTH_ALERT_STATE_DIR="$W/state-peerx" \
+  HEALTH_ALERT_SERVICE_OK=1 HEALTH_ALERT_PEER_OK=0 \
+  HEALTH_ALERT_FREE_GB=100 HEALTH_ALERT_CONTAINER_COUNT=18 \
+  HEALTH_ALERT_ALERTS_FILE="$W/alerts-mem.jsonl" \
+  "$S" >"$W/out-peerx" 2>"$W/err-peerx" || true
+grep -q 'memory_pressure' "$W/log-peerx" \
+  || { cat "$W/log-peerx" "$W/err-peerx" >&2; fail "a peer failure must not drop the coexisting transient CRITICAL"; }
+grep -q '"cause":"peer"' "$W/log-peerx" \
+  || fail "the peer verdict must remain cause=peer"
+if grep -q '"cause":"fleet"' "$W/log-peerx"; then
+  fail "a transient note beside a peer failure must not page as fleet"
+fi
+pass "a peer failure preserves the transient diagnostic without a fleet page"
+
 echo "ALL PASS: transient daemon CRITICALs no longer masquerade as fleet outages"
