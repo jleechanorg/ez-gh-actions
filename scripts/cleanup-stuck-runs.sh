@@ -271,9 +271,21 @@ def fleet_label_pool(org):
         # the reaper the same way in production.)
         reason = "rate-limited" if is_rate_limited(e) else "API error"
         print(f"unschedulable probe: runner list {reason} for org {org} — label pool UNKNOWN this tick")
+        # A PARTIAL census is not a census: returning the pages collected so far
+        # let the caller treat incomplete data as complete and emit definitive
+        # UNSCHEDULABLE verdicts from it (found in review: page 1 populated,
+        # page 2 HTTP 403, still produced UNSCHEDULABLE ... 0 unverified).
+        # Discard everything and report UNKNOWN.
+        pool = {}
     except (ValueError, KeyError) as e:
-        # Malformed/unexpected JSON is equally non-fatal for an optional probe.
         print(f"unschedulable probe: runner list unparseable for org {org} ({e}) — label pool UNKNOWN this tick")
+        pool = {}
+    else:
+        if page > 20:
+            # Pagination cap reached with every page full: completeness is
+            # unproven, so this is UNKNOWN too, not a full census.
+            print(f"unschedulable probe: runner list exceeded the {20}-page cap for org {org} — label pool UNKNOWN this tick")
+            pool = {}
     UNSCHED_LABEL_CACHE[org] = pool
     return pool
 

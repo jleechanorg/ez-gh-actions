@@ -230,4 +230,46 @@ if grep -q 'UNSCHEDULABLE 970' "$W/pageout"; then
 fi
 pass "runner census follows pagination (no false UNSCHEDULABLE)"
 
+# ── 9. A partial runner census must not yield definitive verdicts ──────────
+# P0 from review: a later-page failure returned the pages collected so far, so
+# page 1 populated + page 2 HTTP 403 still produced a definitive UNSCHEDULABLE
+# plus "0 unverified".
+XHOME="$W/part"; mkdir -p "$XHOME/bin"
+export GH_LOG="$W/part-gh.log"; : > "$GH_LOG"
+cat > "$XHOME/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"actions/runners?per_page=100&page=2"*)
+    echo "gh: API rate limit exceeded (HTTP 403)" >&2
+    exit 1 ;;
+  *"actions/runners?per_page=100&page=1"*)
+    awk 'BEGIN{
+      printf "{\"total_count\":150,\"runners\":["
+      for(i=0;i<100;i++){ if(i>0) printf ","; printf "{\"id\":%d,\"name\":\"r%d\",\"status\":\"online\",\"labels\":[{\"name\":\"self-hosted\"}]}", i, i }
+      printf "]}\n"
+    }'
+    exit 0 ;;
+  *"actions/runs?status=queued"*)
+    printf '{"workflow_runs":[{"id":980,"status":"queued","name":"P","workflow_id":1,"head_branch":"b","run_number":1,"created_at":"%s","html_url":"https://x/980"}]}\n' "${AGE_30M:?}"
+    exit 0 ;;
+  *"/jobs"*)
+    printf '{"jobs":[{"status":"queued","labels":["self-hosted","self-hosted-macos"]}]}\n'
+    exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$XHOME/bin/gh"
+set +e
+env -u BASH_ENV PATH="$XHOME/bin:/usr/bin:/bin:/usr/sbin:/sbin" QUEUE_REPOS="acme/repoX" ORG="acme" \
+  DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 bash "$ROOT/scripts/cleanup-stuck-runs.sh" >"$W/partout" 2>&1
+set -e
+if grep -q 'UNSCHEDULABLE 980' "$W/partout"; then
+  sed -n '1,40p' "$W/partout" >&2
+  fail "a partial runner census must not yield a definitive UNSCHEDULABLE verdict"
+fi
+grep -q 'label pool unavailable this tick' "$W/partout" \
+  || { sed -n '1,40p' "$W/partout" >&2; fail "a partial census must be reported as UNKNOWN"; }
+pass "a partial runner census is reported UNKNOWN, never a verdict"
+
 echo "ALL PASS: unschedulable queued runs are detected and reported, never cancelled"
