@@ -371,26 +371,47 @@ fi
 TRANSIENT_CRIT_KEYS=" runner_pool.memory_pressure "
 OPERATIONAL_NOTE=""
 if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
-  RECENT_CRIT=$(tail -400 "$ALERTS_JSONL" 2>/dev/null | grep '"severity":"CRITICAL"' | tail -1)
-  if [ -n "$RECENT_CRIT" ]; then
-    CRIT_TS=$(printf '%s' "$RECENT_CRIT" | sed -n 's/.*"ts_unix":[[:space:]]*\([0-9]*\).*/\1/p')
-    CRIT_KEY=$(printf '%s' "$RECENT_CRIT" | sed -n 's/.*"event_key":[[:space:]]*"\([^"]*\)".*/\1/p')
-    CRIT_TS="${CRIT_TS:-0}"
-    CRIT_AGE_MIN=$(( (NOW_EPOCH - CRIT_TS) / 60 ))
-    if [ "$CRIT_TS" -gt 0 ] && [ "$CRIT_AGE_MIN" -ge 0 ] && [ "$CRIT_AGE_MIN" -le "$SLACK_CRITICAL_WINDOW_MIN" ]; then
+  # Classify EVERY qualifying recent CRITICAL, not just the newest one.
+  # Selecting only the newest record let a later transient event MASK a genuine
+  # capacity CRITICAL (found in review, bead jleechan-fals-fleet-down-memory-
+  # pressure): with an admission/headroom capacity CRITICAL 2 minutes old and a
+  # memory_pressure 1 minute old, the newest-only read emitted a single
+  # operational WARNING and suppressed the fleet page entirely. The daemon fires
+  # some capacity alerts once per episode, so one later transient event would
+  # have hidden it for the whole window. Transient suppression must only ever
+  # remove a transient key's own claim, never another key's.
+  #
+  # The window is the same; keys are classified independently:
+  #   disk keys      -> cause=disk
+  #   transient keys -> at most one operational note (deduped)
+  #   any other key  -> cause=fleet (fail-closed, unchanged)
+  FIFO_CRITS="$STATE_DIR/.crits.$$"
+  tail -400 "$ALERTS_JSONL" 2>/dev/null \
+    | grep '"severity":"CRITICAL"' > "$FIFO_CRITS" 2>/dev/null || true
+  if [ -s "$FIFO_CRITS" ]; then
+    while IFS= read -r RECENT_CRIT; do
+      CRIT_TS=$(printf '%s' "$RECENT_CRIT" | sed -n 's/.*"ts_unix":[[:space:]]*\([0-9]*\).*/\1/p')
+      CRIT_KEY=$(printf '%s' "$RECENT_CRIT" | sed -n 's/.*"event_key":[[:space:]]*"\([^"]*\)".*/\1/p')
+      CRIT_TS="${CRIT_TS:-0}"
+      CRIT_AGE_MIN=$(( (NOW_EPOCH - CRIT_TS) / 60 ))
+      if [ "$CRIT_TS" -le 0 ] || [ "$CRIT_AGE_MIN" -lt 0 ] || [ "$CRIT_AGE_MIN" -gt "$SLACK_CRITICAL_WINDOW_MIN" ]; then
+        continue
+      fi
       if [ "$CRIT_KEY" = "runner_pool.host_disk_floor" ] || [ "$CRIT_KEY" = "runner_pool.disk_floor" ]; then
         DISK_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY})")
       elif printf '%s' "$TRANSIENT_CRIT_KEYS" | grep -qF " ${CRIT_KEY} "; then
         # Transient admission deferral: existing slots keep executing and it
-        # self-clears. Visible, but not a fleet-down claim (2026-11-07 false page).
-        OPERATIONAL_NOTE="local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY}) — transient admission deferral, ${CONTAINER_COUNT} container(s) present, not a fleet outage"
+        # self-clears. Recorded once, never a fleet-down claim (2026-11-07 page).
+        if [ -z "$OPERATIONAL_NOTE" ]; then
+          OPERATIONAL_NOTE="local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY}) — transient admission deferral, ${CONTAINER_COUNT} container(s) present, not a fleet outage"
+        fi
       else
         FLEET_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY:-unknown})")
       fi
-    fi
+    done < "$FIFO_CRITS"
   fi
+  rm -f "$FIFO_CRITS"
 fi
-
 
 # ── 5. Decision & Alert Dispatch ─────────────────────────────────────────────
 PREV_STATUS="OK"
@@ -556,6 +577,24 @@ echo "[$NOW_ISO] MUTUAL HEALTH CHECK OK on $HOST (Local: $CONTAINER_COUNT contai
 # on transition only so it does not write an entry every poll interval.
 if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $OPERATIONAL_NOTE" >&2
+  # A note must not DISCARD a pending recovery obligation. Reproduced in review:
+  # DOWN -> NOTE -> OK emitted no RECOVERED for either transition, so an outage
+  # that cleared while a note was showing was never reported as recovered.
+  # Emit the outstanding recovery first, then record the note state.
+  case "$PREV_STATUS" in
+    DOWN|FAIL|DISK|DEGRADED|PEER)
+      echo "[$NOW_ISO] Host $HOST recovered (while noting an operational transient); emitting recovery log to GCP..."
+      RECOVERY_CAUSES=()
+      case "$PREV_STATUS" in DOWN|FAIL) RECOVERY_CAUSES+=("fleet") ;; esac
+      case "$PREV_STATUS" in DISK|DEGRADED|FAIL) RECOVERY_CAUSES+=("disk") ;; esac
+      case "$PREV_STATUS" in PEER) RECOVERY_CAUSES+=("peer") ;; esac
+      for cause in ${RECOVERY_CAUSES[@]+"${RECOVERY_CAUSES[@]}"}; do
+        REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+          "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+        emit INFO "$REC_PAYLOAD"
+      done
+      ;;
+  esac
   if [ "$PREV_STATUS" != "NOTE" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"operational", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
       "$HOST" "$PLATFORM" "$(json_checks "$OPERATIONAL_NOTE")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")

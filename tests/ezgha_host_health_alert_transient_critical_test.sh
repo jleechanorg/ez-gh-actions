@@ -81,8 +81,12 @@ grep -q 'memory_pressure' "$(log_of mem)" \
 pass "the transient CRITICAL is still recorded (WARNING, cause=operational, key named)"
 
 # ── 3. A genuine capacity CRITICAL still pages cause=fleet ────────────────
+# NOTE: containers=18 (not 0). With 0 containers the independent 0-container
+# probe forces paging on its own, so the assertion would pass even if the key
+# classification were broken (found in review). Positive containers isolate the
+# key-classification behaviour under test.
 crit_file "$W/alerts-cap.jsonl" "runner_pool.disk_measurement_unavailable"
-run cap 100 0 HEALTH_ALERT_ALERTS_FILE="$W/alerts-cap.jsonl"
+run cap 100 18 HEALTH_ALERT_ALERTS_FILE="$W/alerts-cap.jsonl"
 [ "$(fleet_cause cap)" = 1 ] \
   || { cat "$(log_of cap)" >&2; fail "a capacity CRITICAL with 0 containers must still page cause=fleet"; }
 [ "$(errors cap)" = 1 ] || fail "a capacity CRITICAL must page at ERROR"
@@ -90,7 +94,7 @@ pass "genuine capacity CRITICAL still pages cause=fleet (no over-suppression)"
 
 # ── 4. An unknown key keeps the historical fail-closed page ───────────────
 crit_file "$W/alerts-unk.jsonl" "runner_pool.some_future_capacity_key"
-run unk 100 0 HEALTH_ALERT_ALERTS_FILE="$W/alerts-unk.jsonl"
+run unk 100 18 HEALTH_ALERT_ALERTS_FILE="$W/alerts-unk.jsonl"
 [ "$(fleet_cause unk)" = 1 ] \
   || { cat "$(log_of unk)" >&2; fail "an unrecognized CRITICAL key must not be silently downgraded"; }
 pass "unrecognized CRITICAL key keeps the fail-closed cause=fleet page"
@@ -103,5 +107,38 @@ run mem0 100 0 HEALTH_ALERT_ALERTS_FILE="$W/alerts-mem.jsonl"
 grep -q '0 ezgha runner containers running' "$(log_of mem0)" \
   || fail "the 0-container probe must be the reason cited"
 pass "0-container truth still pages even with a transient CRITICAL present"
+
+# ── 6. A later transient event must NOT mask an earlier capacity CRITICAL ───
+# P0 found in review: classification read only the NEWEST CRITICAL, so a fresh
+# memory_pressure hid an admission/headroom capacity CRITICAL from the window and
+# the fleet page vanished. The daemon fires some capacity alerts once per
+# episode, so this would have suppressed it for the whole window.
+MIXED="$W/alerts-mixed.jsonl"
+printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"cap","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$MIXED"
+printf '{"body":"x","event_key":"runner_pool.memory_pressure","severity":"CRITICAL","subject":"mem","ts_unix":%s}\n' "$(( NOW - 60 ))" >> "$MIXED"
+run mixed 100 18 HEALTH_ALERT_ALERTS_FILE="$MIXED"
+[ "$(errors mixed)" -ge 1 ] \
+  || { cat "$(log_of mixed)" >&2; fail "a later transient CRITICAL must not mask an earlier capacity CRITICAL"; }
+grep -q '"cause":"fleet"' "$(log_of mixed)" \
+  || { cat "$(log_of mixed)" >&2; fail "the capacity CRITICAL must still page as cause=fleet"; }
+grep -q 'disk_measurement_unavailable' "$(log_of mixed)" \
+  || fail "the page must name the capacity key that triggered it"
+pass "a later transient CRITICAL does not mask an earlier capacity CRITICAL"
+
+# ── 7. A note must not discard a pending recovery ──────────────────────────
+# P2 found in review: DOWN -> NOTE -> OK emitted no RECOVERED at all.
+rec_state() { printf '{"status":"DOWN", "last_sent_fleet":0, "last_sent_disk":0, "disk_breach_since":0, "updated_at":"x"}\n' > "$W/state-rec/host-health-alert-testhost.json"; }
+mkdir -p "$W/state-rec"; rec_state
+crit_file "$W/alerts-mem2.jsonl" "runner_pool.memory_pressure"
+run rec 100 18 HEALTH_ALERT_ALERTS_FILE="$W/alerts-mem2.jsonl"
+if [ -f "$W/log-rec" ]; then
+  grep -q '"status":"RECOVERED"' "$W/log-rec" \
+    || { cat "$W/log-rec" >&2; fail "a transition out of DOWN into a note must still emit RECOVERED"; }
+  grep -q '"cause":"fleet"' "$W/log-rec" \
+    || fail "the RECOVERED entry must name the fleet cause that was outstanding"
+  pass "a note does not discard a pending recovery obligation"
+else
+  fail "recovery arm produced no log at all"
+fi
 
 echo "ALL PASS: transient daemon CRITICALs no longer masquerade as fleet outages"
