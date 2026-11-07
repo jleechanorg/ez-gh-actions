@@ -108,4 +108,65 @@ grep -q 'failed: acme/wedges' "$LOG" \
   || { sed -n '1,40p' "$LOG" >&2; fail "summary must name the failed repo"; }
 pass "exit status and summary name the timed-out repo"
 
+# ── 3. Fallback arm: no timeout binary present (P0 found in review) ─────────
+# macOS ships bash 3.2, where "${A[@]}" on an EMPTY array is an unbound-variable
+# error under `set -u`. The fallback path (neither `timeout` nor `gtimeout`)
+# used exactly that form, so every repo pass aborted before python started while
+# the loop still printed "N repo(s) scanned, 0 failed" and exited 0 -- a silent
+# no-op reported as success. Reproduced on /bin/bash 3.2: zero python executions.
+#
+# The script unconditionally APPENDS /opt/homebrew/bin, /usr/local/bin and
+# ~/.local/bin to PATH, so a PATH-stripped environment cannot hide brew's real
+# timeout. To exercise the fallback deterministically, copy the script and pin
+# PATH to exactly one controlled directory, so `timeout`/`gtimeout` are genuinely
+# absent while the test's python3 stub is the only python3.
+# /usr/bin and /bin carry neither timeout nor gtimeout on this host (verified),
+# so a stub dir prepended to exactly those two gives a genuine fallback case.
+FB="$WORK/fallback"
+mkdir -p "$FB"
+FBBIN="$FB/bin"; mkdir -p "$FBBIN"
+# Neutralize the unconditional PATH append in a copy so the stub dir survives.
+# Keep the stub dir FIRST and /usr/bin:/bin for the core tools the script needs.
+sed "s|^PATH=.*$|PATH=\"$FBBIN:/usr/bin:/bin\"|" "$S" > "$FB/trim.sh"
+grep -q "^PATH=\"$FBBIN:/usr/bin:/bin\"$" "$FB/trim.sh" \
+  || fail "fallback arm: could not pin PATH in the copied script"
+chmod +x "$FB/trim.sh"
+
+cat > "$FBBIN/python3" <<'SH'
+#!/bin/bash
+echo "EXECUTED repo=${QUEUE_REPO:-?}"
+exit 0
+SH
+chmod +x "$FBBIN/python3"
+# The script requires `gh` before it runs; provide an inert stub so the arm
+# exercises the timeout fallback rather than failing the preflight.
+printf '#!/bin/bash\nexit 0\n' > "$FBBIN/gh"
+chmod +x "$FBBIN/gh"
+# Prove the fallback condition really holds in the copied environment.
+if PATH="$FBBIN:/usr/bin:/bin" command -v timeout >/dev/null 2>&1; then fail "fallback env still has timeout"; fi
+if PATH="$FBBIN:/usr/bin:/bin" command -v gtimeout >/dev/null 2>&1; then fail "fallback env still has gtimeout"; fi
+
+NT_LOG="$WORK/notimeout.log"
+set +e
+# /bin/bash is 3.2 on macOS -- the version where the empty-array bug appears.
+env -u BASH_ENV \
+  PATH="$FBBIN:/usr/bin:/bin" \
+  QUEUE_REPOS="acme/one acme/two" \
+  DRY_RUN=1 \
+  /bin/bash "$FB/trim.sh" >"$NT_LOG" 2>&1
+NT_RC=$?
+set -e
+
+grep -q 'unbound variable' "$NT_LOG" \
+  && { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: empty-array unbound-variable abort is back (bash 3.2 + set -u)"; }
+
+grep -q 'EXECUTED repo=acme/one' "$NT_LOG" \
+  || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: first repo never executed without a timeout binary"; }
+grep -q 'EXECUTED repo=acme/two' "$NT_LOG" \
+  || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: second repo never executed without a timeout binary"; }
+[ "$NT_RC" -eq 0 ] || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: clean run must exit 0, got $NT_RC"; }
+grep -q 'unbounded' "$NT_LOG" \
+  || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: must warn that the pass is unbounded"; }
+pass "fallback: with no timeout binary, every repo still executes (bash 3.2 safe)"
+
 echo "ALL PASS: trim-queued-runs per-repo pass is bounded and cannot deadlock on a heredoc"

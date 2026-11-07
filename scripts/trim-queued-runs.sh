@@ -390,18 +390,35 @@ for repo in $QUEUE_REPOS; do
   # `timeout` is GNU coreutils on Linux and gtimeout (brew coreutils) on macOS,
   # where plain `timeout` may be absent. Fall back to an unbounded run only if
   # neither exists, rather than silently disabling the cap.
+  #
+  # macOS ships bash 3.2, where expanding an EMPTY array as "${A[@]}" under
+  # `set -u` is an unbound-variable ERROR (fixed only in bash 4.4+). Using
+  # "${TIMEOUT_CMD[@]}" unconditionally therefore aborted EVERY repo pass on a
+  # host without `timeout`, while the loop still printed "N repo(s) scanned,
+  # 0 failed" and exited 0 -- a silent no-op reported as success. Measured on
+  # /bin/bash 3.2 with two repos: zero python executions, exit 0. The
+  # "${A[@]+"${A[@]}"}" form expands to nothing when unset/empty and to the
+  # elements otherwise, on bash 3.2 and 5.x alike, so the fallback actually runs
+  # unbounded instead of doing nothing. Asserted by
+  # tests/trim_queued_runs_bounded_pass_test.sh (no-timeout-binary arm).
+  TIMEOUT_CMD=()
   TIMEOUT_BIN=""
   for candidate in timeout gtimeout; do
-    if command -v "$candidate" >/dev/null 2>&1; then TIMEOUT_BIN="$candidate"; break; fi
+    # `command -v` alone is not enough: it reports a non-executable file on PATH
+    # as a command, so a mode-644 placeholder on PATH would be "found" and then
+    # fail at exec time. Require an actual executable resolved path.
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+      TIMEOUT_CMD=("$resolved" --kill-after=30s "$REPO_TIMEOUT_S")
+      TIMEOUT_BIN="$candidate"
+      break
+    fi
   done
-  if [[ -n "$TIMEOUT_BIN" ]]; then
-    TIMEOUT_CMD=("$TIMEOUT_BIN" --kill-after=30s "$REPO_TIMEOUT_S")
-  else
-    TIMEOUT_CMD=()
+  if [[ ${#TIMEOUT_CMD[@]} -eq 0 ]]; then
     echo "[$repo] WARN: neither timeout nor gtimeout found; repo pass is unbounded" >&2
   fi
 
-  QUEUE_REPO="$repo" "${TIMEOUT_CMD[@]}" python3 -u "$PY_BODY" 2>&1 | sed "s#^#[${repo}] #" || repo_rc=$?
+  QUEUE_REPO="$repo" ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} python3 -u "$PY_BODY" 2>&1 | sed "s#^#[${repo}] #" || repo_rc=$?
 
   if [[ "$repo_rc" -ne 0 ]]; then
     # 124/137 = timeout expired / killed after --kill-after. Name it explicitly:
