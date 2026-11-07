@@ -250,9 +250,17 @@ def fleet_label_pool(org):
                 if name:
                     pool[name] = pool.get(name, 0) + 1
     except subprocess.CalledProcessError as e:
-        if not is_rate_limited(e):
-            raise
-        print(f"unschedulable probe: runner list rate-limited for org {org} — label pool UNKNOWN this tick")
+        # This probe is an OPTIONAL extra signal, so it must never break a reaper
+        # tick. A rate limit, a 403, a missing scope or any other API error just
+        # means "label pool UNKNOWN this tick", which the caller already treats as
+        # "not asserted" rather than a verdict. (Regression: raising here broke
+        # tests whose gh stub rejects unknown invocations, and would have broken
+        # the reaper the same way in production.)
+        reason = "rate-limited" if is_rate_limited(e) else "API error"
+        print(f"unschedulable probe: runner list {reason} for org {org} — label pool UNKNOWN this tick")
+    except (ValueError, KeyError) as e:
+        # Malformed/unexpected JSON is equally non-fatal for an optional probe.
+        print(f"unschedulable probe: runner list unparseable for org {org} ({e}) — label pool UNKNOWN this tick")
     UNSCHED_LABEL_CACHE[org] = pool
     return pool
 
