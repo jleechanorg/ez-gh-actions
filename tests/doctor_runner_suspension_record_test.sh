@@ -90,4 +90,42 @@ grep -q 'INFO:.*suspension record: jleechan-hxz0' <<<"$OUT3" \
   || { sed -n '1,10p' <<<"$OUT3" >&2; fail "unset must default to the owning bead, not warn"; }
 pass "behavioral: unset defaults to the owning bead"
 
+# ── Remote arm: a parked REMOTE leg must also declare its record ────────────
+# P1 from review: the reporting was inside the LOCAL_DISABLED branch only, so a
+# Linux doctor checking a parked Mac printed neither the pointer nor the warning,
+# contradicting the "every parked run" promise in AGENTS.md.
+REMOTE_BLOCK="$(sed -n '1452,1471p' "$D")"
+grep -q 'suspension record' <<<"$REMOTE_BLOCK" \
+  || fail "the REMOTE parked-leg branch does not report the suspension record"
+grep -q 'no suspension record declared for the parked' <<<"$REMOTE_BLOCK" \
+  || fail "the REMOTE parked-leg branch has no missing-record warning"
+pass "structural: the remote parked-leg branch reports the suspension record"
+
+remote_harness() { # value | "unset"
+  local val="$1"
+  {
+    echo 'PLATFORM=linux'
+    if [ "$val" = 'unset' ]; then echo 'unset EZGHA_SUSPENSION_RECORD'; else
+      printf 'EZGHA_SUSPENSION_RECORD=%s\n' "$val"
+    fi
+    echo 'ok() { echo "OK:$*"; }'
+    echo 'info() { echo "INFO:$*"; }'
+    echo 'warn() { echo "WARN:$*"; }'
+    echo 'REMOTE_DISABLED=1'
+    echo 'REMOTE_LABEL="macos(macbook)"'
+    # Strip the leading `if [ "$REMOTE_DISABLED" -eq 1 ]; then` guard and the
+    # trailing `fi`/elif so the branch body runs standalone.
+    sed -n '1452,1471p' "$D"
+  } > "$WORK/remote.sh"
+  bash "$WORK/remote.sh"
+}
+
+ROUT1="$(remote_harness 'jleechan-hxz0')"
+grep -q 'INFO:.*suspension record: jleechan-hxz0' <<<"$ROUT1" \
+  || { sed -n '1,10p' <<<"$ROUT1" >&2; fail "remote arm: a declared record must print a pointer"; }
+ROUT2="$(remote_harness 'none')"
+grep -q 'WARN:.*no suspension record declared for the parked' <<<"$ROUT2" \
+  || { sed -n '1,10p' <<<"$ROUT2" >&2; fail "remote arm: an undeclared record must warn"; }
+pass "behavioral: the remote parked-leg branch prints the pointer and warns when missing"
+
 echo "ALL PASS: a parked leg declares its suspension record or says it is missing"

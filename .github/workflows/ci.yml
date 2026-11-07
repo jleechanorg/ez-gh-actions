@@ -65,6 +65,11 @@ jobs:
           bash tests/cleanup_stuck_runs_multirepo_test.sh
           bash tests/cleanup_stuck_runs_race_skip_test.sh
           bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
+          bash tests/cleanup_stuck_runs_unschedulable_test.sh
+      - name: Queued-run trimmer regressions
+        run: |
+          bash tests/trim_queued_runs_test.sh
+          bash tests/trim_queued_runs_bounded_pass_test.sh
       - name: Exit criteria CPU burst regressions
         run: |
           bash tests/verify_exit_gate2_docker_mode_test.sh
@@ -75,6 +80,7 @@ jobs:
         run: |
           bash tests/doctor_runner_expected_containers_test.sh
           bash tests/doctor_runner_heartbeat_parked_exempt_test.sh
+          bash tests/doctor_runner_suspension_record_test.sh
           bash tests/doctor_runner_heartbeat_starvation_test.sh
           bash tests/doctor_runner_host_pressure_test.sh
           bash tests/doctor_runner_host_lifecycle_test.sh

@@ -32,7 +32,7 @@ trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
-AGE_30M="$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
+export AGE_30M="$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ'))")"
 
 # gh stub. LABEL_POOL=fail simulates a rate-limited runner list.
 cat > "$W/gh" <<SH
@@ -78,7 +78,7 @@ chmod +x "$W/gh"
 GH_LOG="$W/gh.log"; : > "$GH_LOG"; export GH_LOG
 
 run_script() { # [extra env...]
-  env PATH="$W:/usr/bin:/bin:/usr/sbin:/sbin" \
+  env -u BASH_ENV PATH="$W:/usr/bin:/bin:/usr/sbin:/sbin" \
     QUEUE_REPOS="acme/repoX" ORG="acme" \
     DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 \
     "$@" bash "$ROOT/scripts/cleanup-stuck-runs.sh" 2>&1
@@ -121,5 +121,113 @@ if grep -q 'UNSCHEDULABLE' <<<"$OUT_FAIL"; then
   fail "a rate-limited runner list must not produce an unschedulable verdict"
 fi
 pass "rate-limited label pool degrades to 'not asserted', not a false verdict"
+
+# ── 6. A failed job lookup must NOT read as a definitive zero ───────────────
+# P0 from review: job_labels() returned None for both "failed" and "no queued
+# jobs", so an HTTP 403 produced "unschedulable: 0 ... none failed" -- the exact
+# silent-clean diagnostic this lever exists to remove.
+export GH_LOG="$W/failops-gh.log"; : > "$GH_LOG"
+FHOME="$W/failops"; mkdir -p "$FHOME/bin"
+cat > "$FHOME/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$GH_LOG"
+case "$*" in
+  *"orgs/acme/actions/runners"*)
+    printf '{"total_count":1,"runners":[{"id":1,"name":"l1","status":"online","labels":[{"name":"self-hosted"},{"name":"ez-runner-c"}]}]}\n'
+    exit 0 ;;
+  *"actions/runs?status=queued"*)
+    printf '{"workflow_runs":[{"id":950,"status":"queued","name":"P","workflow_id":1,"head_branch":"b","run_number":1,"created_at":"%s","html_url":"https://x/950"}]}\n' "${AGE_30M:?}"
+    exit 0 ;;
+  *"/jobs"*)
+    echo "gh: API rate limit exceeded (HTTP 403)" >&2
+    exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$FHOME/bin/gh"
+FAILLOG="$W/fail.log"
+set +e
+env -u BASH_ENV PATH="$FHOME/bin:/usr/bin:/bin:/usr/sbin:/sbin" QUEUE_REPOS="acme/repoX" ORG="acme" \
+  DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 \
+  bash "$ROOT/scripts/cleanup-stuck-runs.sh" >"$W/failout" 2>&1
+set -e
+grep -q 'UNSCHEDULABLE-UNKNOWN 950' "$W/failout" \
+  || { sed -n '1,40p' "$W/failout" >&2; fail "a failed job lookup must be reported as UNKNOWN, not skipped"; }
+grep -q 'INCOMPLETE' "$W/failout" \
+  || { sed -n '1,40p' "$W/failout" >&2; fail "the summary must flag the scan as INCOMPLETE when lookups failed"; }
+if grep -qE 'unschedulable: 0 queued run\(s\) require a label no online runner advertises; 0 unverified' "$W/failout"; then
+  fail "a failed lookup must never render as a clean zero-unverified result"
+fi
+pass "failed job lookup is reported UNKNOWN and marks the scan INCOMPLETE"
+
+# ── 7. Label matching is case-insensitive (GitHub routes that way) ──────────
+export GH_LOG="$W/case-gh.log"; : > "$GH_LOG"
+CHOME="$W/case"; mkdir -p "$CHOME/bin"
+cat > "$CHOME/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"orgs/acme/actions/runners"*)
+    printf '{"total_count":1,"runners":[{"id":1,"name":"l1","status":"online","labels":[{"name":"SELF-HOSTED"},{"name":"EZ-RUNNER-C"}]}]}\n'
+    exit 0 ;;
+  *"actions/runs?status=queued"*)
+    printf '{"workflow_runs":[{"id":960,"status":"queued","name":"P","workflow_id":1,"head_branch":"b","run_number":1,"created_at":"%s","html_url":"https://x/960"}]}\n' "${AGE_30M:?}"
+    exit 0 ;;
+  *"/jobs"*)
+    printf '{"jobs":[{"status":"queued","labels":["self-hosted","ez-runner-c"]}]}\n'
+    exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$CHOME/bin/gh"
+set +e
+env -u BASH_ENV PATH="$CHOME/bin:/usr/bin:/bin:/usr/sbin:/sbin" QUEUE_REPOS="acme/repoX" ORG="acme" \
+  DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 bash "$ROOT/scripts/cleanup-stuck-runs.sh" >"$W/caseout" 2>&1
+set -e
+if grep -q 'UNSCHEDULABLE 960' "$W/caseout"; then
+  sed -n '1,40p' "$W/caseout" >&2
+  fail "label matching must be case-insensitive; a differently-cased runner satisfies the requirement"
+fi
+pass "label matching is case-insensitive"
+
+# ── 8. Runner census follows pagination ────────────────────────────────────
+export GH_LOG="$W/page-gh.log"; : > "$GH_LOG"
+PHOME="$W/page"; mkdir -p "$PHOME/bin"
+cat > "$PHOME/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  # Match the FULL query suffix: a bare *page=1* pattern also matches page=2
+  # because the leading * is greedy, which silently served page 1 twice.
+  *"orgs/acme/actions/runners?per_page=100&page=2"*)
+    printf '{"total_count":101,"runners":[{"id":999,"name":"needs-macos","status":"online","labels":[{"name":"self-hosted"},{"name":"self-hosted-macos"}]}]}\n'
+    exit 0 ;;
+  *"orgs/acme/actions/runners?per_page=100&page=1"*)
+    awk 'BEGIN{
+      printf "{\"total_count\":101,\"runners\":["
+      for(i=0;i<100;i++){ if(i>0) printf ","; printf "{\"id\":%d,\"name\":\"r%d\",\"status\":\"online\",\"labels\":[{\"name\":\"self-hosted\"}]}", i, i }
+      printf "]}\n"
+    }'
+    exit 0 ;;
+  *"actions/runs?status=queued"*)
+    printf '{"workflow_runs":[{"id":970,"status":"queued","name":"P","workflow_id":1,"head_branch":"b","run_number":1,"created_at":"%s","html_url":"https://x/970"}]}\n' "${AGE_30M:?}"
+    exit 0 ;;
+  *"/jobs"*)
+    printf '{"jobs":[{"status":"queued","labels":["self-hosted","self-hosted-macos"]}]}\n'
+    exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$PHOME/bin/gh"
+set +e
+env -u BASH_ENV PATH="$PHOME/bin:/usr/bin:/bin:/usr/sbin:/sbin" QUEUE_REPOS="acme/repoX" ORG="acme" \
+  DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 bash "$ROOT/scripts/cleanup-stuck-runs.sh" >"$W/pageout" 2>&1
+set -e
+if grep -q 'UNSCHEDULABLE 970' "$W/pageout"; then
+  sed -n '1,40p' "$W/pageout" >&2
+  fail "runner census must follow pagination; a matching runner on page 2 makes the job schedulable"
+fi
+pass "runner census follows pagination (no false UNSCHEDULABLE)"
 
 echo "ALL PASS: unschedulable queued runs are detected and reported, never cancelled"

@@ -233,22 +233,35 @@ ORG = os.environ.get("ORG") or repo.split("/", 1)[0]
 UNSCHED_LABEL_CACHE = {}
 
 def fleet_label_pool(org):
-    """Label -> count of ONLINE org runners advertising it (one API read)."""
+    """Label (lowercased) -> count of ONLINE org runners advertising it.
+
+    Follows every page: the endpoint paginates at 100 and a matching runner on
+    page 2 would otherwise produce a false UNSCHEDULABLE verdict. Label names
+    are compared case-insensitively because that is how GitHub routes work;
+    original spelling is preserved by callers for output.
+    """
     if org in UNSCHED_LABEL_CACHE:
         return UNSCHED_LABEL_CACHE[org]
     pool = {}
+    page = 1
     try:
-        raw = subprocess.check_output(
-            ["gh", "api", f"orgs/{org}/actions/runners?per_page=100"],
-            stderr=subprocess.STDOUT,
-        )
-        for r in json.loads(raw).get("runners", []):
-            if r.get("status") != "online":
-                continue
-            for lbl in r.get("labels", []):
-                name = lbl.get("name")
-                if name:
-                    pool[name] = pool.get(name, 0) + 1
+        while page <= 20:
+            raw = subprocess.check_output(
+                ["gh", "api", f"orgs/{org}/actions/runners?per_page=100&page={page}"],
+                stderr=subprocess.STDOUT,
+            )
+            batch = json.loads(raw).get("runners", [])
+            for r in batch:
+                if r.get("status") != "online":
+                    continue
+                for lbl in r.get("labels", []):
+                    name = lbl.get("name")
+                    if name:
+                        key = name.lower()
+                        pool[key] = pool.get(key, 0) + 1
+            if len(batch) < 100:
+                break
+            page += 1
     except subprocess.CalledProcessError as e:
         # This probe is an OPTIONAL extra signal, so it must never break a reaper
         # tick. A rate limit, a 403, a missing scope or any other API error just
@@ -264,34 +277,52 @@ def fleet_label_pool(org):
     UNSCHED_LABEL_CACHE[org] = pool
     return pool
 
+# Sentinel distinguishing "lookup failed" from "no queued jobs": a failed read
+# must never be reported as a definitive zero. Returning None for both made an
+# API 403 produce "unschedulable: 0 ... (0 failed)" -- the exact silent-clean
+# diagnostic this lever exists to remove (found in review).
+LOOKUP_FAILED = object()
+
 def job_labels(rid):
+    """Queued label sets for a run, or LOOKUP_FAILED if the read did not succeed."""
+    collected = []
+    page = 1
     try:
-        raw = subprocess.check_output(
-            ["gh", "api", f"repos/{repo}/actions/runs/{rid}/jobs"],
-            stderr=subprocess.STDOUT,
-        )
-    except subprocess.CalledProcessError as e:
-        if is_rate_limited(e):
-            return None
-        return None
-    jobs = json.loads(raw).get("jobs", [])
-    return [j.get("labels") or [] for j in jobs if j.get("status") == "queued"]
+        while page <= 20:
+            raw = subprocess.check_output(
+                ["gh", "api",
+                 f"repos/{repo}/actions/runs/{rid}/jobs?per_page=100&page={page}"],
+                stderr=subprocess.STDOUT,
+            )
+            batch = json.loads(raw).get("jobs", [])
+            for j in batch:
+                if j.get("status") == "queued":
+                    collected.append(j.get("labels") or [])
+            if len(batch) < 100:
+                break
+            page += 1
+    except (subprocess.CalledProcessError, ValueError):
+        return LOOKUP_FAILED
+    return collected
 
 if runs and do_unschedulable:
     pool = fleet_label_pool(ORG)
     if pool:
         unschedulable = []
+        unknown = []
         aged = [((now - created_at(x)).total_seconds() / 60, x) for x in runs]
         aged.sort(key=lambda pair: pair[0], reverse=True)
         for age_m, r in aged:
             if age_m < unsched_min:
                 continue
             labelsets = job_labels(r["id"])
-            if not labelsets:
+            if labelsets is LOOKUP_FAILED:
+                # Unknown is NOT zero: name it so a partial scan cannot read clean.
+                unknown.append((age_m, r))
                 continue
             for labels in labelsets:
-                if labels and any(pool.get(lbl, 0) == 0 for lbl in labels):
-                    missing = [lbl for lbl in labels if pool.get(lbl, 0) == 0]
+                missing = [lbl for lbl in labels if pool.get(lbl.lower(), 0) == 0]
+                if labels and missing:
                     unschedulable.append((age_m, r, labels, missing))
                     break
         for age_m, r, labels, missing in unschedulable[:20]:
@@ -300,12 +331,20 @@ if runs and do_unschedulable:
                 f"queued {age_m:.0f}m: requires {labels} but no ONLINE org runner advertises "
                 f"{missing} — {run_url(r)}"
             )
+        for age_m, r in unknown[:20]:
+            print(
+                f"UNSCHEDULABLE-UNKNOWN {r['id']} ({workflow_name(r)}) branch '{branch(r)}' "
+                f"queued {age_m:.0f}m: job lookup FAILED — schedulability NOT verified "
+                f"— {run_url(r)}"
+            )
+        qualifier = " (INCOMPLETE: job lookups failed — see UNSCHEDULABLE-UNKNOWN)" if unknown else ""
         print(
             f"unschedulable: {len(unschedulable)} queued run(s) require a label no online "
-            f"runner advertises (report-only; never cancelled)"
+            f"runner advertises; {len(unknown)} unverified due to lookup failure{qualifier} "
+            f"(report-only; never cancelled)"
         )
     else:
-        print("unschedulable: label pool unavailable this tick — not asserted")
+        print("unschedulable: label pool unavailable this tick — NOT asserted")
 
 def run_status(rid):
     out = subprocess.check_output([
