@@ -346,6 +346,30 @@ fi
 # that exact shape (runner image missing) sat at 0 runners for 15 hours while the
 # only record was a Slack message nobody read. Promote a recent daemon CRITICAL
 # into cause=fleet so the existing Slack policy carries the operational follow-up.
+#
+# An admission pause is NOT always a fleet outage (bead
+# jleechan-fals-fleet-down-memory-pressure). On 2026-11-07 this block promoted a
+# transient `runner_pool.memory_pressure` CRITICAL into cause=fleet and dispatched
+# three "FLEET DOWN" ERRORs at 21:14/21:16/21:18Z while 15-20 containers were
+# actively carrying a Runner.Worker and the daemon logged
+# `runner startup settled: 20/20 ready locally`. The policy this feeds promises
+# the fleet "cannot run jobs"; it was running them.
+# The promotion is therefore keyed on what the daemon CRITICAL actually means:
+#   - disk keys            -> cause=disk (unchanged; separate policy)
+#   - transient admission  -> OPERATIONAL note at WARNING, never a page
+#   - any other CRITICAL   -> cause=fleet (unchanged fail-closed behaviour)
+#
+# Only keys PROVEN to be transient belong in TRANSIENT_CRIT_KEYS. An unknown or
+# future key keeps the historical fail-closed treatment, so this change can only
+# suppress the specific false page it was written for — it cannot silently
+# downgrade a genuine outage the daemon reports under a name nobody anticipated.
+#
+# `runner_pool.memory_pressure` is the one closed set member: it is an admission
+# deferral that leaves existing slots executing and clears on its own (62 such
+# CRITICALs since 2026-11-02 with no observed capacity loss; the 2026-11-07 run
+# had 15-20 Runner.Workers executing during all three false "FLEET DOWN"s).
+TRANSIENT_CRIT_KEYS=" runner_pool.memory_pressure "
+OPERATIONAL_NOTE=""
 if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
   RECENT_CRIT=$(tail -400 "$ALERTS_JSONL" 2>/dev/null | grep '"severity":"CRITICAL"' | tail -1)
   if [ -n "$RECENT_CRIT" ]; then
@@ -356,12 +380,17 @@ if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
     if [ "$CRIT_TS" -gt 0 ] && [ "$CRIT_AGE_MIN" -ge 0 ] && [ "$CRIT_AGE_MIN" -le "$SLACK_CRITICAL_WINDOW_MIN" ]; then
       if [ "$CRIT_KEY" = "runner_pool.host_disk_floor" ] || [ "$CRIT_KEY" = "runner_pool.disk_floor" ]; then
         DISK_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY})")
+      elif printf '%s' "$TRANSIENT_CRIT_KEYS" | grep -qF " ${CRIT_KEY} "; then
+        # Transient admission deferral: existing slots keep executing and it
+        # self-clears. Visible, but not a fleet-down claim (2026-11-07 false page).
+        OPERATIONAL_NOTE="local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY}) — transient admission deferral, ${CONTAINER_COUNT} container(s) present, not a fleet outage"
       else
         FLEET_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY:-unknown})")
       fi
     fi
   fi
 fi
+
 
 # ── 5. Decision & Alert Dispatch ─────────────────────────────────────────────
 PREV_STATUS="OK"
@@ -507,8 +536,12 @@ if [ "$DISK_COUNT" -gt 0 ]; then
     save_state "DISK" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
   else
     echo "[$NOW_ISO] DISK DEGRADED ${BREACH_MIN}m on $HOST (${CONTAINER_COUNT} containers, ${FREE_GB}GB free): $REASONS — within ${DISK_PAGE_AFTER_MIN}m self-heal window, not paging" >&2
+    # Fold the transient daemon CRITICAL into the note list so a suppressed
+    # fleet page is still recorded, without claiming cause=fleet.
+    DISK_NOTE_FAILS=("${DISK_FAILS[@]}")
+    if [ -n "${OPERATIONAL_NOTE:-}" ]; then DISK_NOTE_FAILS+=("$OPERATIONAL_NOTE"); fi
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"disk", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "disk_breach_min":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$(json_checks "${DISK_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$BREACH_MIN" "$NOW_ISO")
+      "$HOST" "$PLATFORM" "$(json_checks "${DISK_NOTE_FAILS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$BREACH_MIN" "$NOW_ISO")
     emit WARNING "$PAYLOAD"
     save_state "DEGRADED" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
   fi
@@ -517,6 +550,20 @@ fi
 
 # ── Healthy ─────────────────────────────────────────────────────────────────
 echo "[$NOW_ISO] MUTUAL HEALTH CHECK OK on $HOST (Local: $CONTAINER_COUNT containers, ${FREE_GB}GB free; Peer healthy)"
+
+# A transient daemon CRITICAL with no other failure must still be recorded, just
+# not as a fleet outage (bead jleechan-fals-fleet-down-memory-pressure). Emit it
+# on transition only so it does not write an entry every poll interval.
+if [ -n "${OPERATIONAL_NOTE:-}" ]; then
+  echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $OPERATIONAL_NOTE" >&2
+  if [ "$PREV_STATUS" != "NOTE" ]; then
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"operational", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "$OPERATIONAL_NOTE")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    emit WARNING "$PAYLOAD"
+  fi
+  save_state "NOTE" 0 0 0
+  exit 0
+fi
 
 if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS" = "DISK" ] || [ "$PREV_STATUS" = "DEGRADED" ] || [ "$PREV_STATUS" = "PEER" ]; then
   echo "[$NOW_ISO] Host $HOST and peer have recovered! Emitting recovery log to GCP..."
