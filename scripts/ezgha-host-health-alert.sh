@@ -179,6 +179,24 @@ DISK_FAILS=()
 # the fleet policy filter (severity>=ERROR AND cause="fleet").
 PEER_FAILS=()
 
+# ── 0. Intentionally parked platform (bead jleechan-hxz0) ────────────────────
+# A deliberately suspended platform is a DECISION, not an outage, and the two
+# must never render the same way. Without this, parking the Mac (launchd
+# disabled + 0 containers + count=4 in config) reads as "runners down" and pages
+# "[CRITICAL] ezgha: GitHub Actions Runners Down Alert" every ~30 minutes,
+# forever -- which is exactly what happened on 2026-11-05.
+#
+# Declared, never inferred: a daemon that CRASHED also reads as "not running",
+# so inferring would silently absorb the real outages this script exists to
+# catch. Unset keeps today's fail-closed behaviour.
+#   MAC_RUNNER_DISABLED=1        parks the macOS leg
+#   REMOTE_LINUX_DISABLED=1      parks the Linux leg
+LOCAL_LEG_PARKED=0
+case "$PLATFORM" in
+  Darwin) if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then LOCAL_LEG_PARKED=1; fi ;;
+  Linux)  if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then LOCAL_LEG_PARKED=1; fi ;;
+esac
+
 # ── 1. Local Service Check ───────────────────────────────────────────────────
 SERVICE_OK="${HEALTH_ALERT_SERVICE_OK:-}"
 if [ -z "$SERVICE_OK" ]; then
@@ -193,7 +211,7 @@ if [ -z "$SERVICE_OK" ]; then
     fi
   fi
 fi
-if [ "$SERVICE_OK" != "1" ]; then
+if [ "$SERVICE_OK" != "1" ] && [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
   if [ "$PLATFORM" = "Linux" ]; then
     FLEET_FAILS+=("local: ezgha.service inactive or failed on systemd")
   else
@@ -209,7 +227,11 @@ if [ -z "$CONTAINER_COUNT" ]; then
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   fi
   if ! timeout 10 "$DOCKER_BIN" info >/dev/null 2>&1; then
-    FLEET_FAILS+=("local: docker daemon unreachable or timed out")
+    # A parked host has no docker running BY CONSTRUCTION, so an unreachable
+    # daemon is the decision, not a defect (bead jleechan-hxz0).
+    if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
+      FLEET_FAILS+=("local: docker daemon unreachable or timed out")
+    fi
     DOCKER_UNREACHABLE=1
     CONTAINER_COUNT=0
   else
@@ -219,7 +241,7 @@ fi
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 # A zero-container fleet is the core fleet-down signal, whichever way the count
 # was obtained (live probe or an audit-mode override).
-if [ "$CONTAINER_COUNT" -eq 0 ] && [ "$DOCKER_UNREACHABLE" -eq 0 ]; then
+if [ "$CONTAINER_COUNT" -eq 0 ] && [ "$DOCKER_UNREACHABLE" -eq 0 ] && [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
   FLEET_FAILS+=("local: 0 ezgha runner containers running")
 fi
 
@@ -390,6 +412,29 @@ DISK_SINCE=$PREV_DISK_SINCE
 NOW_LAST_FLEET=$PREV_LAST_SENT_FLEET
 NOW_LAST_DISK=$PREV_LAST_SENT_DISK
 EXIT_CODE=0
+
+# ── Intentionally parked leg: report DISABLED at INFO, never DOWN/CRITICAL. ──
+# Placed after the fleet-down branch inputs are computed (a parked leg
+# contributed no FLEET_FAILS) and before every page-emitting branch, so a parked
+# host still reports real disk trouble separately while never claiming
+# "runners down". Severity is what actually gates the SMS: the policy matches
+# severity>=ERROR, so INFO cannot page.
+if [ "$LOCAL_LEG_PARKED" -eq 1 ] && [ "$FLEET_COUNT" -eq 0 ]; then
+  echo "[$NOW_ISO] DISABLED: $HOST ($PLATFORM) is intentionally parked (operator opt-out) — 0 slot(s) expected, not an outage" >&2
+  if [ "$DISK_COUNT" -gt 0 ]; then
+    echo "[$NOW_ISO] note: parked host still reports ${FREE_GB}GB free under its floor; pre-existing/independent" >&2
+  fi
+  # macOS ships bash 3.2, where expanding an EMPTY array as "${A[@]}" under
+  # `set -u` is an unbound-variable ERROR (fixed only in bash 4.4+). A parked leg
+  # has no FLEET_FAILS by construction, so this is exactly the empty case.
+  # "${A[@]+"${A[@]}"}" expands to nothing when unset/empty and to the elements
+  # otherwise, on both bash 3.2 and 5.x.
+  PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DISABLED", "cause":"parked", "severity":"INFO", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+    "$HOST" "$PLATFORM" "$(json_checks ${FLEET_FAILS[@]+"${FLEET_FAILS[@]}"})" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+  emit INFO "$PAYLOAD"
+  save_state "DISABLED" "$NOW_LAST_FLEET" "$NOW_LAST_DISK" "$DISK_SINCE"
+  exit "$EXIT_CODE"
+fi
 
 if [ "$FLEET_COUNT" -gt 0 ]; then
   # ── Fleet is genuinely down: page, subject "Runners Down". ────────────────

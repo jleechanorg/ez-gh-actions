@@ -29,6 +29,16 @@ STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/runner_offline_queued_${RUNNE
 mkdir -p "$(dirname "$STATE_FILE")"
 GH_BIN="${GH_BIN:-gh}"
 GCLOUD_BIN="${GCLOUD_BIN-$(command -v gcloud || true)}"
+# Use the GitHub App installation token when no GH_TOKEN is already set. Without
+# this the job authenticates as the operator's personal user token and competes
+# for the shared 5,000/hour quota; on 2026-11-04 that quota hit 0 and the monitor
+# went BLIND for 8 consecutive cycles, paging "runners down" while every runner
+# was healthy. The App token (~10k/hour) is minted for exactly this purpose.
+# Read-only use of an existing credential; falls back silently when absent.
+if [ -z "${GH_TOKEN:-}" ] && [ -r "$HOME/.config/ezgha/gh_token" ]; then
+  GH_TOKEN=$(cat "$HOME/.config/ezgha/gh_token" 2>/dev/null || true)
+  [ -n "$GH_TOKEN" ] && export GH_TOKEN
+fi
 DRY_RUN=0 SIMULATE=0 TEST_SMS=0 ENSURE_POLICY=0
 for a in "$@"; do
   case "$a" in
@@ -52,9 +62,17 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   if [ ! -f "$POLICY_FILE" ]; then echo "FATAL: policy file not found: $POLICY_FILE" >&2; exit 4; fi
   [ "$DRY_RUN" -eq 0 ] || { echo "[$NOW_ISO] [dry-run] would ensure metric runner_offline_queued_alert_count and Slack policy from $POLICY_FILE"; exit 0; }
   GCP_ARGS=(--project=worldarchitecture-ai --account=jleechan@gmail.com)
-  METRIC_ARGS=(runner_offline_queued_alert_count --description="ERROR entries from runner-offline-queued-alert (drives Slack policy)"
-    --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR' "${GCP_ARGS[@]}")
+  # The historical metric name says "offline", so a STALLED alert (runner
+  # ONLINE, queue wedged) read as an offline-runner incident. Keep the existing
+  # metric for OFFLINE -- its name is then accurate -- and add a correctly-named
+  # one for STALLED. Backwards compatible: an existing policy on the old metric
+  # keeps firing for OFFLINE.
+  METRIC_ARGS=(runner_offline_queued_alert_count --description="ERROR entries for an OFFLINE runner with queued runs (drives SMS policy)"
+    --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR AND jsonPayload.status="OFFLINE"' "${GCP_ARGS[@]}")
+  STALLED_METRIC_ARGS=(runner_online_queue_stalled_alert_count --description="ERROR entries for an ONLINE runner whose queue is stalled (drives SMS policy)"
+    --log-filter='logName="projects/worldarchitecture-ai/logs/ezgha-runner-alerts" AND jsonPayload.source="runner-offline-queued-alert" AND severity>=ERROR AND jsonPayload.status="STALLED"' "${GCP_ARGS[@]}")
   "$GCLOUD_BIN" logging metrics create "${METRIC_ARGS[@]}" 2>/dev/null || "$GCLOUD_BIN" logging metrics update "${METRIC_ARGS[@]}"
+  "$GCLOUD_BIN" logging metrics create "${STALLED_METRIC_ARGS[@]}" 2>/dev/null || "$GCLOUD_BIN" logging metrics update "${STALLED_METRIC_ARGS[@]}"
   POLICY_NAME="$(jq -r '.displayName' "$POLICY_FILE")"
   LEGACY_POLICY_NAME="[CRITICAL] Runner offline with queued runs: SMS (metric)"
   CURRENT_POLICIES=$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
@@ -106,14 +124,17 @@ if [ "$TEST_SMS" -eq 1 ]; then
   exit 0
 fi
 
-PREV=OK; LAST_SENT=0; API_FAILS=0
+PREV=OK; LAST_SENT=0; API_FAILS=0; LAST_BLIND=0
 if [ -f "$STATE_FILE" ]; then
   PREV=$(jq -r '.status // "OK"' "$STATE_FILE" 2>/dev/null || echo OK)
   LAST_SENT=$(jq -r '.last_sent // 0' "$STATE_FILE" 2>/dev/null || echo 0)
   API_FAILS=$(jq -r '.api_failures // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+  LAST_BLIND=$(jq -r '.last_blind // 0' "$STATE_FILE" 2>/dev/null || echo 0)
 fi
-save() { # status last_sent api_failures
-  [ "$DRY_RUN" -eq 1 ] || jq -nc --arg s "$1" --argjson t "$2" --argjson f "$3" '{status:$s,last_sent:$t,api_failures:$f}' > "$STATE_FILE"
+save() { # status last_sent api_failures [last_blind]
+  local lb="${4:-${LAST_BLIND:-0}}"
+  [ "$DRY_RUN" -eq 1 ] || jq -nc --arg s "$1" --argjson t "$2" --argjson f "$3" --argjson b "$lb" \
+    '{status:$s,last_sent:$t,api_failures:$f,last_blind:$b}' > "$STATE_FILE"
 }
 
 if [ "$SIMULATE" -eq 1 ]; then
@@ -124,9 +145,19 @@ elif ! RUNNER_STATUS=$("$GH_BIN" api "repos/$REPO/actions/runners" --paginate \
       --jq ".workflow_runs[] | select(\"$WORKFLOW\" == \"\" or .name == \"$WORKFLOW\") | .created_at" | sort); then
   API_FAILS=$((API_FAILS + 1))
   echo "[$NOW_ISO] WARN: gh API failed ($API_FAILS consecutive); no verdict this cycle" >&2
-  if [ "$API_FAILS" -ge "$MAX_API_FAILURES" ] && [ $((NOW_EPOCH - LAST_SENT)) -ge "$COOLDOWN_SEC" ]; then
-    emit ERROR BLIND "runner monitor cannot reach GitHub for $API_FAILS consecutive checks ($RUNNER in $REPO unverified)"
-    LAST_SENT=$NOW_EPOCH
+  if [ "$API_FAILS" -ge "$MAX_API_FAILURES" ] && [ $((NOW_EPOCH - LAST_BLIND)) -ge "$COOLDOWN_SEC" ]; then
+    # NOTE: an earlier revision emitted ERROR here, which incremented the
+    # runner_offline_queued_alert_count metric and sent an SMS titled
+    # "runner offline with queued runs" for a monitor that simply could not
+    # reach the API. Blindness never observes runner state, so it must not
+    # reuse that metric: WARNING keeps it in the log for diagnostics while
+    # leaving the outage counter meaning what its name says.
+    emit WARNING BLIND "runner monitor cannot reach GitHub for $API_FAILS consecutive checks ($RUNNER in $REPO unverified)"
+    # Advance ONLY the diagnostic timestamp. Advancing LAST_SENT here made a
+    # genuine DOWN alert arriving inside the same cooldown look "throttled" and
+    # suppressed it -- blindness and an outage are independent events (codex P1
+    # on PR #214).
+    LAST_BLIND=$NOW_EPOCH
   fi
   save "$PREV" "$LAST_SENT" "$API_FAILS"
   exit 2
@@ -141,11 +172,22 @@ else
   fi
 fi
 
+# Two DIFFERENT failures were sharing one status and one metric:
+#   OFFLINE  - the runner is not online and work is waiting on it
+#   STALLED  - the runner IS online but the queue has stopped moving
+# Both emitted status=DOWN into runner_offline_queued_alert_count, so an SMS
+# titled "runner offline with queued runs" arrived while the runner was
+# demonstrably online and busy (2026-11-05 09:45Z, oldest 48m, runner online the
+# whole time). The status now names what actually happened, and the metric
+# filter matches both so no alert is lost.
+ALERT_KIND=""
 MSG=""
 if [ "$RUNNER_STATUS" != online ] && [ "$QUEUED" -gt 0 ] && [ "$OLDEST_MIN" -ge "$MIN_QUEUED_MIN" ]; then
+  ALERT_KIND=OFFLINE
   MSG="$RUNNER is $RUNNER_STATUS in $REPO with $QUEUED queued run(s), oldest ${OLDEST_MIN}m"
 elif [ "$RUNNER_STATUS" = online ] && [ "$QUEUED" -gt 0 ] && [ "$OLDEST_MIN" -ge "$MAX_ONLINE_QUEUED_MIN" ]; then
-  MSG="$RUNNER is online in $REPO but queue is stalled: $QUEUED queued run(s), oldest ${OLDEST_MIN}m (>=${MAX_ONLINE_QUEUED_MIN}m; likely wedged build)"
+  ALERT_KIND=STALLED
+  MSG="$RUNNER is ONLINE but the queue is stalled: $QUEUED queued run(s), oldest ${OLDEST_MIN}m (>=${MAX_ONLINE_QUEUED_MIN}m; likely wedged build, not an offline runner)"
 fi
 
 if [ -n "$MSG" ]; then
@@ -153,7 +195,7 @@ if [ -n "$MSG" ]; then
   if [ "$PREV" = FAIL ] && [ $((NOW_EPOCH - LAST_SENT)) -lt "$COOLDOWN_SEC" ]; then
     echo "[$NOW_ISO] throttled" >&2; exit 1
   fi
-  emit ERROR DOWN "$MSG"
+  emit ERROR "$ALERT_KIND" "$MSG"
   save FAIL "$NOW_EPOCH" 0
   exit 1
 fi
