@@ -291,7 +291,7 @@ if [ -n "$PEER_OK" ]; then
     fi
   fi
 elif [ "$PLATFORM" = "Linux" ]; then
-  PEER_CMD="pgrep -x ezgha >/dev/null 2>&1; echo \$?"
+  PEER_CMD="pgrep -x ezgha >/dev/null 2>&1 || pgrep -f Runner.Listener >/dev/null 2>&1; echo \$?"
   PEER_RES=""
   if PEER_RES=$(timeout 6 ssh -o ConnectTimeout=4 -o BatchMode=yes -o StrictHostKeyChecking=no "$PEER_NAME" "$PEER_CMD" 2>/dev/null); then
     if [ "$PEER_RES" != "0" ]; then
@@ -354,7 +354,11 @@ if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
     CRIT_TS="${CRIT_TS:-0}"
     CRIT_AGE_MIN=$(( (NOW_EPOCH - CRIT_TS) / 60 ))
     if [ "$CRIT_TS" -gt 0 ] && [ "$CRIT_AGE_MIN" -ge 0 ] && [ "$CRIT_AGE_MIN" -le "$SLACK_CRITICAL_WINDOW_MIN" ]; then
-      FLEET_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY:-unknown})")
+      if [ "$CRIT_KEY" = "runner_pool.host_disk_floor" ] || [ "$CRIT_KEY" = "runner_pool.disk_floor" ]; then
+        DISK_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY})")
+      else
+        FLEET_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY:-unknown})")
+      fi
     fi
   fi
 fi
