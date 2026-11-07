@@ -313,9 +313,31 @@ def job_labels(rid):
             if len(batch) < 100:
                 break
             page += 1
+        else:
+            # Cap reached with every page full: completeness is unproven, so this
+            # must NOT read as "no unschedulable jobs found" (P1 from review).
+            return LOOKUP_FAILED
     except (subprocess.CalledProcessError, ValueError):
         return LOOKUP_FAILED
     return collected
+
+# GitHub-HOSTED runner families. These are provided by GitHub, not by the org's
+# self-hosted fleet, so their absence from the self-hosted census proves nothing
+# about schedulability. Reporting them as UNSCHEDULABLE produced a false verdict
+# on this repository's own `ubuntu-latest` CI (P0 from review). A job is only
+# diagnosable from the census when EVERY label it requires is self-hosted; if it
+# names a hosted family, the census cannot answer for it.
+HOSTED_RUNNER_PREFIXES = (
+    "ubuntu-", "windows-", "macos-", "ubuntu-latest", "windows-latest",
+    "macos-latest", "macos-latest-large", "ubuntu-slim",
+)
+
+def targets_hosted_runners(labels):
+    for lbl in labels:
+        low = (lbl or "").lower()
+        if low in HOSTED_RUNNER_PREFIXES or low.startswith(("ubuntu-", "windows-", "macos-")):
+            return True
+    return False
 
 if runs and do_unschedulable:
     pool = fleet_label_pool(ORG)
@@ -333,8 +355,13 @@ if runs and do_unschedulable:
                 unknown.append((age_m, r))
                 continue
             for labels in labelsets:
+                if not labels:
+                    continue
+                if targets_hosted_runners(labels):
+                    # Hosted-pool job: the self-hosted census cannot judge it.
+                    continue
                 missing = [lbl for lbl in labels if pool.get(lbl.lower(), 0) == 0]
-                if labels and missing:
+                if missing:
                     unschedulable.append((age_m, r, labels, missing))
                     break
         for age_m, r, labels, missing in unschedulable[:20]:

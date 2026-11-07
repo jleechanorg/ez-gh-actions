@@ -272,4 +272,66 @@ grep -q 'label pool unavailable this tick' "$W/partout" \
   || { sed -n '1,40p' "$W/partout" >&2; fail "a partial census must be reported as UNKNOWN"; }
 pass "a partial runner census is reported UNKNOWN, never a verdict"
 
+# ── 10. GitHub-hosted jobs are NOT judged against the self-hosted census ────
+# P0 from review: a queued `ubuntu-latest` job was reported UNSCHEDULABLE because
+# the org's self-hosted census naturally has no such label. This repo's own CI
+# uses ubuntu-latest.
+HHOME="$W/hosted"; mkdir -p "$HHOME/bin"
+export GH_LOG="$W/hosted-gh.log"; : > "$GH_LOG"
+cat > "$HHOME/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"actions/runners?per_page=100&page=1"*)
+    printf '{"total_count":1,"runners":[{"id":1,"name":"l1","status":"online","labels":[{"name":"self-hosted"},{"name":"ez-runner-c"}]}]}\n'
+    exit 0 ;;
+  *"actions/runs?status=queued"*)
+    printf '{"workflow_runs":[{"id":990,"status":"queued","name":"P","workflow_id":1,"head_branch":"b","run_number":1,"created_at":"%s","html_url":"https://x/990"}]}\n' "${AGE_30M:?}"
+    exit 0 ;;
+  *"/jobs"*)
+    printf '{"jobs":[{"status":"queued","labels":["ubuntu-latest"]}]}\n'
+    exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$HHOME/bin/gh"
+set +e
+env -u BASH_ENV PATH="$HHOME/bin:/usr/bin:/bin:/usr/sbin:/sbin" QUEUE_REPOS="acme/repoX" ORG="acme" \
+  DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 bash "$ROOT/scripts/cleanup-stuck-runs.sh" >"$W/hostedout" 2>&1
+set -e
+if grep -q 'UNSCHEDULABLE 990' "$W/hostedout"; then
+  sed -n '1,40p' "$W/hostedout" >&2
+  fail "a GitHub-hosted job must not be reported unschedulable from the self-hosted census"
+fi
+pass "GitHub-hosted jobs are exempt from the self-hosted census verdict"
+
+# ── 11. A hosted label does not mask a genuinely missing self-hosted label ──
+MIXED2="$W/hosted-mixed"; mkdir -p "$MIXED2/bin"
+export GH_LOG="$W/hm-gh.log"; : > "$GH_LOG"
+cat > "$MIXED2/bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *"actions/runners?per_page=100&page=1"*)
+    printf '{"total_count":1,"runners":[{"id":1,"name":"l1","status":"online","labels":[{"name":"self-hosted"},{"name":"ez-runner-c"}]}]}\n'
+    exit 0 ;;
+  *"actions/runs?status=queued"*)
+    printf '{"workflow_runs":[{"id":991,"status":"queued","name":"P","workflow_id":1,"head_branch":"b","run_number":1,"created_at":"%s","html_url":"https://x/991"}]}\n' "${AGE_30M:?}"
+    exit 0 ;;
+  *"/jobs"*)
+    # Self-hosted labels only: still a genuine dead-label case.
+    printf '{"jobs":[{"status":"queued","labels":["self-hosted","self-hosted-macos"]}]}\n'
+    exit 0 ;;
+esac
+exit 0
+SH
+chmod +x "$MIXED2/bin/gh"
+set +e
+env -u BASH_ENV PATH="$MIXED2/bin:/usr/bin:/bin:/usr/sbin:/sbin" QUEUE_REPOS="acme/repoX" ORG="acme" \
+  DRY_RUN=1 CANCEL_VERIFY_WAIT_S=0 STALE_HOURS=8 bash "$ROOT/scripts/cleanup-stuck-runs.sh" >"$W/hmout" 2>&1
+set -e
+grep -q 'UNSCHEDULABLE 991' "$W/hmout" \
+  || { sed -n '1,40p' "$W/hmout" >&2; fail "the hosted exemption must not suppress a real self-hosted dead-label verdict"; }
+pass "the hosted exemption does not suppress genuine self-hosted dead labels"
+
 echo "ALL PASS: unschedulable queued runs are detected and reported, never cancelled"
