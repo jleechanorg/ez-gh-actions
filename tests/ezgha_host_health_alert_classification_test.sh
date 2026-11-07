@@ -164,6 +164,15 @@ run critold 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
 [ "$(errors critold)" = 0 ] || fail "a CRITICAL older than the window must not page"
 pass "stale daemon CRITICAL stays silent"
 
+# ── 12b. Daemon CRITICAL for host_disk_floor routes to cause=disk, never fleet ─
+AL_DISK="$W/alerts-disk.jsonl"
+printf '{"body":"x","event_key":"runner_pool.host_disk_floor","severity":"CRITICAL","subject":"disk floor","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$AL_DISK"
+run critdisk 100 18 HEALTH_ALERT_ALERTS_FILE="$AL_DISK"
+[ "$(errors critdisk)" = 0 ] || fail "fresh daemon host_disk_floor alert must not page as fleet outage"
+[ "$(warnings critdisk)" = 1 ] || fail "fresh daemon host_disk_floor alert must be recorded at WARNING"
+grep -q '"cause":"disk"' "$W/log-critdisk" || fail "daemon host_disk_floor escalation must route to cause=disk"
+pass "recent daemon host_disk_floor routes to cause=disk"
+
 # ── 13. A verdict is a successful probe: exit 0, so launchd/cron stays green ─
 state_dir ex; json_log OK 0 > "$W/state-ex/host-health-alert-testhost.json"
 set +e

@@ -34,7 +34,7 @@ run() {
   fi
 }
 error_count() { [ -f "$TMP/gcloud.log" ] && grep -c 'severity=ERROR' "$TMP/gcloud.log" || echo 0; }
-old="$(date -u -v-60M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '60 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
+old="$(date -u -v-90M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '90 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
 failure_old="$(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)"
 new="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
