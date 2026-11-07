@@ -36,9 +36,11 @@
 #   QUEUE_REPOS="owner/repo1 owner/repo2 ..."  # space-separated; default: see DEFAULT_QUEUE_REPOS below
 #   QUEUE_REPO="owner/repo"                    # single-repo back-compat override (ignored if QUEUE_REPOS set)
 #   CANCEL_VERIFY_WAIT_S=20                    # seconds to wait before force-cancel verify (0 to skip wait, e.g. tests)
+#   DO_UNSCHEDULABLE=1                         # report queued runs whose labels no online runner carries (default 1)
+#   UNSCHED_MIN_AGE_MIN=15                     # only report unschedulable runs queued at least this long
 set -euo pipefail
 
-DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ai_universe jleechanorg/worldai_claw jleechanorg/mctrl_test jleechanorg/jleechanclaw jleechanorg/ai_universe_living_blog jleechanorg/agent-orchestrator jleechanorg/dark-factory jleechanorg/ez-gh-actions"
+DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ai_universe jleechanorg/worldai_claw jleechanorg/mctrl_test jleechanorg/jleechanclaw jleechanorg/ai_universe_living_blog jleechanorg/agent-orchestrator jleechanorg/dark-factory jleechanorg/ez-gh-actions jleechanorg/user_scope"
 QUEUE_REPOS="${QUEUE_REPOS:-${QUEUE_REPO:-$DEFAULT_QUEUE_REPOS}}"
 STALE_HOURS="${STALE_HOURS:-8}"
 FRESH_TAIL_MIN="${FRESH_TAIL_MIN:-45}"
@@ -95,6 +97,8 @@ dry = os.environ.get("DRY_RUN") == "1"
 do_zombies = os.environ.get("DO_ZOMBIES") == "1"
 do_superseded = os.environ.get("DO_SUPERSEDED") == "1"
 do_tail = os.environ.get("DO_TAIL") == "1"
+do_unschedulable = os.environ.get("DO_UNSCHEDULABLE", "1") == "1"
+unsched_min = float(os.environ.get("UNSCHED_MIN_AGE_MIN", "15"))
 verify_wait_s = float(os.environ.get("CANCEL_VERIFY_WAIT_S", "20"))
 
 # Rate-limit resilience (bead jleechan-me9): GitHub applies a SECONDARY
@@ -211,6 +215,89 @@ print(
 )
 print("safety: only status=queued runs are candidates; in_progress runs are ignored")
 print(f"safety: deploy workflows excluded from all cancel levers; protected_deploy_queued={protected_deploy_count}")
+
+# ── UNSCHEDULABLE detection (bead jleechan-user-scope-arm64-dead-label) ─────
+# A queued job whose required label SET no live runner advertises can never be
+# picked up, so every age-based lever above is blind to it: it is neither a
+# zombie (>STALE_HOURS artifacts only) nor superseded (no newer run on the
+# branch) nor a "tail" (the tail lever is opt-in and keyed on age). Measured
+# 2026-11-07: jleechanorg/user_scope held 8 such jobs for 18.6h, all requiring
+# [self-hosted, self-hosted-mikey, self-hosted-macos] when zero runners carried
+# that label, and the queue reaper reported a clean "queued_total=0" scan for
+# that repo because it was not even in DEFAULT_QUEUE_REPOS.
+#
+# Reporting only: this lever NEVER cancels. Cancelling an unschedulable run is a
+# judgement call (the workflow may be mid-fix), so the signal is "here is a job
+# that cannot ever start", which is what a human or an alert needs to know.
+ORG = os.environ.get("ORG") or repo.split("/", 1)[0]
+UNSCHED_LABEL_CACHE = {}
+
+def fleet_label_pool(org):
+    """Label -> count of ONLINE org runners advertising it (one API read)."""
+    if org in UNSCHED_LABEL_CACHE:
+        return UNSCHED_LABEL_CACHE[org]
+    pool = {}
+    try:
+        raw = subprocess.check_output(
+            ["gh", "api", f"orgs/{org}/actions/runners?per_page=100"],
+            stderr=subprocess.STDOUT,
+        )
+        for r in json.loads(raw).get("runners", []):
+            if r.get("status") != "online":
+                continue
+            for lbl in r.get("labels", []):
+                name = lbl.get("name")
+                if name:
+                    pool[name] = pool.get(name, 0) + 1
+    except subprocess.CalledProcessError as e:
+        if not is_rate_limited(e):
+            raise
+        print(f"unschedulable probe: runner list rate-limited for org {org} — label pool UNKNOWN this tick")
+    UNSCHED_LABEL_CACHE[org] = pool
+    return pool
+
+def job_labels(rid):
+    try:
+        raw = subprocess.check_output(
+            ["gh", "api", f"repos/{repo}/actions/runs/{rid}/jobs"],
+            stderr=subprocess.STDOUT,
+        )
+    except subprocess.CalledProcessError as e:
+        if is_rate_limited(e):
+            return None
+        return None
+    jobs = json.loads(raw).get("jobs", [])
+    return [j.get("labels") or [] for j in jobs if j.get("status") == "queued"]
+
+if runs and do_unschedulable:
+    pool = fleet_label_pool(ORG)
+    if pool:
+        unschedulable = []
+        aged = [((now - created_at(x)).total_seconds() / 60, x) for x in runs]
+        aged.sort(key=lambda pair: pair[0], reverse=True)
+        for age_m, r in aged:
+            if age_m < unsched_min:
+                continue
+            labelsets = job_labels(r["id"])
+            if not labelsets:
+                continue
+            for labels in labelsets:
+                if labels and any(pool.get(lbl, 0) == 0 for lbl in labels):
+                    missing = [lbl for lbl in labels if pool.get(lbl, 0) == 0]
+                    unschedulable.append((age_m, r, labels, missing))
+                    break
+        for age_m, r, labels, missing in unschedulable[:20]:
+            print(
+                f"UNSCHEDULABLE {r['id']} ({workflow_name(r)}) branch '{branch(r)}' "
+                f"queued {age_m:.0f}m: requires {labels} but no ONLINE org runner advertises "
+                f"{missing} — {run_url(r)}"
+            )
+        print(
+            f"unschedulable: {len(unschedulable)} queued run(s) require a label no online "
+            f"runner advertises (report-only; never cancelled)"
+        )
+    else:
+        print("unschedulable: label pool unavailable this tick — not asserted")
 
 def run_status(rid):
     out = subprocess.check_output([
