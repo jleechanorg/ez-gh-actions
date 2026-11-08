@@ -22,7 +22,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   set -euo pipefail
 fi
 
-# When sourced by doctor.sh, use return — never exit the parent.
+# When sourced by doctor-runner, use return — never exit the parent.
 _qh_finish() {
   local code="${1:-0}"
   if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

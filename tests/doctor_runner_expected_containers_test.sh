@@ -40,7 +40,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
 
 TEMP_HOME=$(mktemp -d)
-cleanup() { rm -rf "$TEMP_HOME"; }
+ORIG_HOME="$HOME"
+# run_case() sets HOME="$TEMP_HOME"; restore it before deleting, otherwise the local
+# destructive-path guard sees HOME == the deletion target and refuses (observed as a
+# spurious exit 3 in this very test).
+cleanup() { HOME="$ORIG_HOME"; export HOME; rm -rf "${TEMP_HOME:?}"; }
 trap cleanup EXIT
 
 CONFIG_DIR="$TEMP_HOME/.config/ezgha"
