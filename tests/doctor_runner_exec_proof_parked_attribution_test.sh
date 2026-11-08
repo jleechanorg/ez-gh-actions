@@ -287,6 +287,34 @@ grep -q 'REMOTE_PROOF_NOT_RECOUNTED' "$D" \
 GATE2="$(grep -A22 'real-execution gate: at least one recent job' "$D")"
 grep -q 'UNPROVEN' <<<"$GATE2" \
   || fail "the gate must report UNPROVEN for the not-recounted case"
-pass "a late-resolved remote prefix reports UNPROVEN, not a false red"
+
+# BEHAVIOURAL assertion (review P2): drive the REAL gate block and prove that
+# the not-recounted case warns WITHOUT incrementing CRITICAL, while a genuine
+# failure still does increment it. A string grep alone would pass even if the
+# marker were never set or the branch wrongly bumped the critical count.
+GATE_BODY="$(awk '/^_ENABLED_LEG_EXISTS=1$/,/^fi$/' "$D")"
+[ -n "$GATE_BODY" ] || fail "could not extract the execution gate block"
+run_gate() { # real_on_fleet not_recounted parked_local parked_remote
+  {
+    echo 'set -uo pipefail'
+    echo "REAL_ON_FLEET=$1; REAL_TOTAL=1; REMOTE_PROOF_NOT_RECOUNTED=$2"
+    echo "PARKED_LOCAL=$3; PARKED_REMOTE=$4; CRITICAL=0"
+    echo 'warn() { :; }'
+    echo 'bad() { :; }'
+    echo "$GATE_BODY"
+    echo 'echo "CRITICAL=$CRITICAL"'
+  } > "$WORK/gate.sh"
+  bash "$WORK/gate.sh" 2>&1 | sed -n 's/^CRITICAL=//p'
+}
+C_RECOVERED="$(run_gate 0 1 0 1)"
+C_REALFAIL="$(run_gate 0 0 0 1)"
+C_PASS="$(run_gate 3 0 0 1)"
+[ "$C_RECOVERED" = "0" ] \
+  || { fail "not-recounted case must add ZERO criticals (got $C_RECOVERED)"; }
+[ "$C_REALFAIL" = "1" ] \
+  || { fail "a genuine no-proof failure must add exactly one critical (got $C_REALFAIL)"; }
+[ "$C_PASS" = "0" ] \
+  || { fail "a proven fleet must add no critical (got $C_PASS)"; }
+pass "late recovery warns with zero criticals; a real failure still trips it"
 
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
