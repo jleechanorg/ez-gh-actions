@@ -709,17 +709,24 @@ _early_remote_cfg_get() {  # $1 = grep pattern
 # behaviour tested elsewhere. So the early value lives in its own variable and
 # REMOTE_PREFIX is left exactly as this script found it.
 
-# Runner-name matching, mirroring src/docker_backend.rs::runner_name_matches_prefix
-# EXACTLY: a name belongs to a prefix only when it is `prefix-<digits>`.
-#
-# Plain `[[ "$rn" == "${p}"* ]]` is NOT fleet identity: `ez-runner-c` is a prefix
-# of `ez-runner-custom-mac`, so a parked leg's `ez-runner-custom-mac-4` matched an
-# enabled `ez-runner-c` and counted as that leg's proof (review P0, fifth round).
-# The reverse also broke: a parked `ez-runner-c` stole the enabled
-# `ez-runner-ci-1` via the hardcoded family rule.
-#
-# Using the repo's own rule removes the whole class: no family heuristics, no
-# denylist, no platform guessing. `-<digits>` is the structural marker.
+# Mirrors src/docker_backend.rs::runner_name_matches_prefix: a name belongs to a
+# prefix only when it is exactly `prefix-<digits>`. Glob matching is not identity
+# — `ez-runner-c` is a prefix of `ez-runner-custom-mac`.
+# Single attribution decision shared by section 7 and the --prove canary.
+# Echoes: fleet | parked | unattributed  (fleet = counts as execution proof).
+_classify_run_leg() {  # $1 = runner name
+  local _n="$1" _lh=0 _rh=0
+  _runner_matches_prefix "$_n" "${RUNNER_NAME_PREFIX:-}" && _lh=1
+  _runner_matches_prefix "$_n" "${EARLY_REMOTE_PREFIX:-${REMOTE_PREFIX:-}}" && _rh=1
+  if [ "$_lh" -eq 1 ]; then
+    if [ "$PARKED_LOCAL" -eq 1 ]; then printf 'parked'; else printf 'fleet'; fi
+  elif [ "$_rh" -eq 1 ]; then
+    if [ "$PARKED_REMOTE" -eq 1 ]; then printf 'parked'; else printf 'fleet'; fi
+  else
+    printf 'unattributed'
+  fi
+}
+
 _runner_matches_prefix() {  # $1 = runner name, $2 = configured prefix
   local _n="$1" _p="$2" _rest
   [ -n "$_p" ] || return 1
@@ -733,14 +740,15 @@ _runner_matches_prefix() {  # $1 = runner name, $2 = configured prefix
   esac
   return 0
 }
+# Attribution prefix for the proof gates. Unknown stays UNKNOWN: an unreadable
+# remote config must never become a guessed identity, because a guess lets a
+# default-named historical runner be credited to a leg that actually uses some
+# other prefix (review: "a guessed remote default can count as positive
+# execution proof"). REMOTE_PREFIX_UNKNOWN is reported as INCONCLUSIVE instead.
 EARLY_REMOTE_PREFIX="${REMOTE_PREFIX:-${EXPLICIT_REMOTE_PREFIX:-}}"
 if [ -z "$EARLY_REMOTE_PREFIX" ]; then EARLY_REMOTE_PREFIX="$(_early_remote_cfg_get '^name_prefix')"; fi
-if [ -z "$EARLY_REMOTE_PREFIX" ]; then
-  # Unreadable config: fall back to the default spelling. The classifier excludes
-  # BOTH the default and the configured value, so a parked leg cannot slip
-  # through on an unreadable prefix.
-  EARLY_REMOTE_PREFIX="$DEFAULT_REMOTE_PREFIX"
-fi
+REMOTE_PREFIX_UNKNOWN=0
+if [ -z "$EARLY_REMOTE_PREFIX" ]; then REMOTE_PREFIX_UNKNOWN=1; fi
 
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
@@ -760,50 +768,29 @@ fi
 # parked Mac as fine while Linux had no successful selftest at all.
 _LP="${RUNNER_NAME_PREFIX:-}"
 _RP="${EARLY_REMOTE_PREFIX:-${REMOTE_PREFIX:-}}"
+if [ "${REMOTE_PREFIX_UNKNOWN:-0}" -eq 1 ]; then
+  # Unknown remote identity cannot attribute a remote run. Say so instead of
+  # guessing, and let the enabled leg's own successes carry the proof.
+  warn "remote runner prefix UNKNOWN (config unreadable) — remote-leg runs cannot be attributed this tick; INCONCLUSIVE, not proof"
+fi
 while read -r rid; do
   [ -z "$rid" ] && continue
   REAL_TOTAL=$((REAL_TOTAL+1))
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  # ATTRIBUTION POLARITY: when ANY leg is parked, a success must be POSITIVELY
-  # attributable to an ENABLED leg to count. It is not enough to be "not
-  # obviously parked".
-  #
-  # Earlier revisions got this backwards: they accepted any `ez-*` runner and
-  # then subtracted parked families, which is an unbounded denylist. Four review
-  # rounds each found another spelling that slipped through -- a drifted prefix,
-  # an unreadable config, a historical ez-runner-b, a custom ez-custom-mac. Each
-  # fix widened the deny list and left the next hole open.
-  #
-  # Requiring positive membership inverts that: an unattributable name is
-  # INCONCLUSIVE, never proof. That is the honest reading when a leg is parked
-  # and the config cannot vouch for a name.
-  #
-  # When NO leg is parked the historical breadth is kept (any ez-* counts),
-  # because there is nothing to leak proof to.
+  # Positive attribution: a success counts only if it matches an ENABLED leg's
+  # exact prefix. Anything else is INCONCLUSIVE, never proof.
   _any_parked=0
   if [ "$PARKED_LOCAL" -eq 1 ] || [ "$PARKED_REMOTE" -eq 1 ]; then _any_parked=1; fi
 
-  # EXACT identity, using the repo's own `prefix-<digits>` rule. A partial prefix
-  # match is what let `ez-runner-custom-mac-4` prove an enabled `ez-runner-c`.
-  _local_hit=0;   if _runner_matches_prefix "$rn" "$_LP"; then _local_hit=1; fi
-  _remote_hit=0;  if _runner_matches_prefix "$rn" "$_RP"; then _remote_hit=1; fi
-
-  _is_fleet=0
-  _parked_leg=0
-  _unattributed=0
-  if [ "$_local_hit" -eq 1 ]; then
-    if [ "$PARKED_LOCAL" -eq 1 ]; then _parked_leg=1; else _is_fleet=1; fi
-  elif [ "$_remote_hit" -eq 1 ]; then
-    if [ "$PARKED_REMOTE" -eq 1 ]; then _parked_leg=1; else _is_fleet=1; fi
-  elif [ "$_any_parked" -eq 1 ]; then
-    # Not attributable to any known leg while a leg is parked -> INCONCLUSIVE.
-    _unattributed=1
-  elif [[ "$rn" == "ez-"* ]]; then
-    # Nothing parked: keep the historical breadth.
-    _is_fleet=1
-  fi
+  _leg=$(_classify_run_leg "$rn")
+  _is_fleet=0; _parked_leg=0; _unattributed=0
+  case "$_leg" in
+    fleet)        _is_fleet=1 ;;
+    parked)       _parked_leg=1 ;;
+    unattributed) _unattributed=1 ;;
+  esac
   if [ "$_is_fleet" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
@@ -847,29 +834,14 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    # Same EXACT attribution as section 7, via the shared
-    # _runner_matches_prefix rule, so the two proof paths cannot disagree and a
-    # partial prefix cannot steal another leg's success (review P0, fifth round:
-    # the canary's final predicate still used REMOTE_PREFIX/ez-* breadth, so a
-    # configured non-ez enabled prefix counted in section 7 but was rejected here).
-    _cn_local_hit=0;  if _runner_matches_prefix "$rn" "${RUNNER_NAME_PREFIX:-}"; then _cn_local_hit=1; fi
-    _cn_remote_hit=0; if _runner_matches_prefix "$rn" "${EARLY_REMOTE_PREFIX:-}"; then _cn_remote_hit=1; fi
-    _cn_any_parked=0
-    if [ "$PARKED_LOCAL" -eq 1 ] || [ "$PARKED_REMOTE" -eq 1 ]; then _cn_any_parked=1; fi
-
-    _cn_parked=0
-    _cn_enabled=0
-    _cn_unattributed=0
-    if [ "$_cn_local_hit" -eq 1 ]; then
-      if [ "$PARKED_LOCAL" -eq 1 ]; then _cn_parked=1; else _cn_enabled=1; fi
-    elif [ "$_cn_remote_hit" -eq 1 ]; then
-      if [ "$PARKED_REMOTE" -eq 1 ]; then _cn_parked=1; else _cn_enabled=1; fi
-    elif [ "$_cn_any_parked" -eq 1 ]; then
-      _cn_unattributed=1
-    elif [[ "$rn" == "ez-"* ]]; then
-      _cn_enabled=1
-    fi
-
+    # Same exact attribution as section 7, so the two proof paths cannot
+    # disagree about which leg a run belongs to.
+    _cn_leg=$(_classify_run_leg "$rn")
+    _cn_parked=0; _cn_enabled=0
+    case "$_cn_leg" in
+      fleet)  _cn_enabled=1 ;;
+      parked) _cn_parked=1 ;;
+    esac
     if [ "$_cn_parked" -eq 1 ]; then
       bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
     elif [ "$_cn_enabled" -ne 1 ]; then
@@ -1967,10 +1939,6 @@ fi
 # section 10, long after this gate.
 _ENABLED_LEG_EXISTS=1
 if [ "$PARKED_LOCAL" -eq 1 ] && [ "$PARKED_REMOTE" -eq 1 ]; then _ENABLED_LEG_EXISTS=0; fi
-if [ "$PARKED_LOCAL" -eq 1 ] && [ "$PARKED_REMOTE" -eq 0 ] && [ "${REMOTE_COUNT:-0}" -eq 0 ] && [ -z "${EARLY_REMOTE_PREFIX:-}" ]; then
-  # A parked local leg with no remote leg in the contract has nothing enabled.
-  _ENABLED_LEG_EXISTS=0
-fi
 if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$_ENABLED_LEG_EXISTS" -eq 1 ]; then
   bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on an ENABLED leg)"
   CRITICAL=$((CRITICAL+1))

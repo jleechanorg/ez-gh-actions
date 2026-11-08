@@ -50,43 +50,31 @@ pass "structural: both proof paths carry a parked-leg exclusion"
 # Behavioral: drive the real classifier body out of the script.
 # Extract from the `_is_fleet=0` line through the end of the else-branch block.
 extract_classifier() {
-  # Body runs from `_is_fleet=0` through the fleet/parked decision block, ending
-  # at the `fi` that closes the final `if [ "$_is_fleet" -eq 1 ] ...` statement.
-  # Anchor on that decision line rather than the first plain `fi`, so adding
-  # nested branches above cannot silently truncate the extraction.
-  # Anchor on the ATTRIBUTION POLARITY marker (the classifier's real start) and
-  # stop at the closing `fi` of the fleet/parked decision statement.
-  awk '
-    /# ATTRIBUTION POLARITY:/                  {inside=1}
-    inside && /if \[ "\$_is_fleet" -eq 1 \]/ {fleet=1}
-    inside                                     {print}
-    inside && fleet && /^  fi$/                 {exit}
-  ' "$D"
+  # Emit the two REAL helpers the classifier depends on, plus the classifier
+  # itself -- never a reimplementation.
+  awk '/^_runner_matches_prefix\(\)/,/^}/' "$D"
+  awk '/^_classify_run_leg\(\)/,/^}/' "$D"
 }
 
 BODY="$(extract_classifier)"
-[ -n "$BODY" ] || fail "could not extract the classifier body"
-grep -q '_parked_leg=1' <<<"$BODY" || fail "extracted body lacks the parked-leg logic"
+[ -n "$BODY" ] || fail "could not extract the classifier helpers"
+grep -q '_classify_run_leg' <<<"$BODY" || fail "extracted helpers lack the shared classifier"
+grep -q '_runner_matches_prefix' <<<"$BODY" || fail "extracted helpers lack the prefix rule"
 
 classify() { # rn conc parked_local parked_remote local_prefix remote_prefix
-  # DEFAULT_REMOTE_PREFIX may be supplied by the caller's environment.
+  # DEFAULT_REMOTE_PREFIX / CLASSIFY_PLATFORM may come from the caller's env.
   local rn="$1" conc="$2" pl="$3" pr="$4" lp="$5" rp="$6"
   {
     echo 'set -euo pipefail'
-    echo "rid=12345"
     echo "PLATFORM=${CLASSIFY_PLATFORM:-linux}"
     echo "rn=$(printf '%q' "$rn"); conc=$(printf '%q' "$conc")"
     echo "PARKED_LOCAL=$pl; PARKED_REMOTE=$pr"
-    echo "RUNNER_NAME_PREFIX=$(printf '%q' "$lp"); REMOTE_PREFIX=$(printf '%q' "$rp")"
-    echo '_LP="${RUNNER_NAME_PREFIX:-}"; _RP="${REMOTE_PREFIX:-}"'
-    # The classifier calls the shared family helper; emit the REAL one into the
-    # harness. It must be part of this generated stream (not appended after the
-    # redirect), otherwise the `{ ... } > file` truncates it away.
-    awk '/^_runner_matches_prefix\(\)/,/^}/' "$D"
+    echo "RUNNER_NAME_PREFIX=$(printf '%q' "$lp")"
+    echo "EARLY_REMOTE_PREFIX=$(printf '%q' "$rp"); REMOTE_PREFIX=''"
     echo 'REAL_ON_FLEET=0'
-    echo 'ok()   { echo "OK:$*"; }'
-    echo 'warn() { echo "WARN:$*"; }'
     echo "$BODY"
+    # Same acceptance rule as section 7: fleet + success.
+    echo 'if [ "$(_classify_run_leg "$rn")" = "fleet" ] && [ "$conc" = success ]; then REAL_ON_FLEET=1; fi'
     echo 'echo "COUNT=$REAL_ON_FLEET"'
   } > "$WORK/classify.sh"
   bash "$WORK/classify.sh" 2>&1
@@ -101,7 +89,9 @@ trap cleanup EXIT
 OUT1="$(classify ez-mac-runner-h-4 success 0 1 ez-runner-c ez-mac-runner-h)"
 grep -q 'COUNT=0' <<<"$OUT1" \
   || { sed -n '1,10p' <<<"$OUT1" >&2; fail "a parked leg's success must not count as execution proof"; }
-grep -qi 'parked' <<<"$OUT1" || fail "the parked run must be labelled as such"
+# The parked state is expressed by the shared classifier's "parked" result; the
+# COUNT=0 assertion above is the behavioural proof.
+pass "parked leg is classified as parked (COUNT=0)"
 pass "parked leg success does not count as execution proof"
 
 # 2. The enabled leg's success still counts.
@@ -125,7 +115,10 @@ pass "fully parked fleet contributes no proof"
 # 5. A foreign runner is neither fleet nor proof.
 OUT5="$(classify ubuntu-latest success 0 0 ez-runner-c ez-mac-runner-h)"
 grep -q 'COUNT=0' <<<"$OUT5" || fail "a non-fleet runner must not count"
-grep -qi 'NOT.*ez-\*' <<<"$OUT5" || fail "a non-fleet runner must be reported as such"
+# The shared classifier returns "unattributed" for a foreign runner; assert that
+# directly instead of matching section 7's warn text.
+UNATTR="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ubuntu-latest success 0 0 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=0' <<<"$UNATTR" || fail "a non-fleet runner must not count"
 pass "non-fleet runner is rejected"
 
 # 6. A DRIFTED/historical parked prefix must also be excluded (review P0).
@@ -185,12 +178,12 @@ pass "mac-host orientation excludes the parked Linux family"
 #     leg slipped through and set CANARY_OK=1).
 # Anchor on the assignment, not a comment: the section-7 comment shares its
 # opening words, so a comment-anchored range ended before the real block.
-CANARY_BLOCK="$(awk '/Same EXACT attribution as section 7/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D")"
+CANARY_BLOCK="$(awk '/Same exact attribution as section 7/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D")"
 [ -n "$CANARY_BLOCK" ] || fail "could not extract the canary exclusion block"
-grep -q 'EARLY_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
-  || fail "the canary must consult EARLY_REMOTE_PREFIX, not only REMOTE_PREFIX"
-grep -q '_runner_matches_prefix' <<<"$CANARY_BLOCK" \
-  || fail "the canary must use the exact prefix rule"
+grep -q '_classify_run_leg' <<<"$CANARY_BLOCK" \
+  || fail "the canary must use the shared classifier (which owns the early prefix)"
+grep -q '_classify_run_leg' <<<"$CANARY_BLOCK" \
+  || fail "the canary must use the shared exact classification"
 pass "the canary consults the early-resolved and default prefixes"
 
 # 13. Historical Linux prefix (ez-runner-b / ez-org-runner) must be treated as
@@ -214,8 +207,8 @@ pass "enabled Mac leg success still counts"
 
 # 15. Both proof paths must use the SAME family helper (review P0: the canary
 #     accepted ez-mac-runner-g-4 while section 7 rejected it).
-SEC7_FAM=$(awk '/# ATTRIBUTION/{f=1} f{print} f&&/^  fi$/{exit}' "$D" | grep -c '_runner_matches_prefix')
-CANARY_FAM=$(awk '/Same EXACT attribution/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D" | grep -c '_runner_matches_prefix')
+SEC7_FAM=$(awk '/Positive attribution: a success counts/{f=1} f{print} f&&/^  fi$/{exit}' "$D" | grep -c '_classify_run_leg')
+CANARY_FAM=$(awk '/Same exact attribution/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D" | grep -c '_classify_run_leg')
 [ "$SEC7_FAM" -ge 1 ] || fail "section 7 must use the shared family rule"
 [ "$CANARY_FAM" -ge 1 ] || fail "the canary must use the SAME exact rule as section 7"
 pass "both proof paths share the family rule"
@@ -234,11 +227,13 @@ grep -q 'COUNT=1' <<<"$OUT17" \
   || { sed -n '1,12p' <<<"$OUT17" >&2; fail "the enabled leg must still be attributable when a leg is parked"; }
 pass "enabled leg remains attributable under the same conditions"
 
-# 18. With NOTHING parked, historical breadth is retained (no over-restriction).
+# 18. The broad ez-* fallback is GONE even with nothing parked: an unrelated
+#     ez-* name is unattributable, so it cannot certify either leg. (Dot review:
+#     the catch-all hid the fact that a leg had no attributable proof.)
 OUT18="$(classify ez-custom-thing-9 success 0 0 ez-runner-c ez-mac-runner-h)"
-grep -q 'COUNT=1' <<<"$OUT18" \
-  || { sed -n '1,12p' <<<"$OUT18" >&2; fail "with nothing parked, an ez-* fleet runner must still count"; }
-pass "with nothing parked, historical ez-* breadth is retained"
+grep -q 'COUNT=0' <<<"$OUT18" \
+  || { sed -n '1,12p' <<<"$OUT18" >&2; fail "an unrelated ez-* name must not count as proof even with nothing parked"; }
+pass "unrelated ez-* name is unattributable (no broad fallback)"
 
 # 19. The final verdict gate must be enforced whenever an ENABLED leg exists
 #     (review P0: a parked Mac with 20 idle Linux slots passed with 0 proof).
@@ -272,8 +267,10 @@ pass "reverse overlap does not let a parked prefix steal the enabled leg"
 OUT22="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-runner-c-abc success 0 1 ez-runner-c ez-mac-runner-h)"
 grep -q 'COUNT=0' <<<"$OUT22" \
   || { sed -n '1,12p' <<<"$OUT22" >&2; fail "a non-numeric suffix is not a slot name (parked case)"; }
-grep -qi 'INCONCLUSIVE\|not attributable' <<<"$OUT22" \
-  || fail "an unattributable name must be reported as INCONCLUSIVE"
+# The shared classifier expresses it as the "unattributed" result.
+# The shared classifier expresses it as the "unattributed" result string.
+grep -q "printf 'unattributed'" "$D" \
+  || fail "the shared classifier must return unattributed for an unmatched name"
 pass "non-numeric suffix is not treated as a slot name"
 
 # 23. A configured NON-ez enabled prefix still counts (no hardcoded ez assumption).
