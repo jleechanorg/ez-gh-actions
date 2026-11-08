@@ -82,7 +82,7 @@ instant they finish a job, before the respawn lands. Measure **effective capacit
 
 ## Gate 4 — Real job execution (online ≠ working) (AUTO)
 
-- `doctor.sh --prove` exits 0: a freshly dispatched `ezgha-selftest` ran on an
+- `doctor-runner --prove` exits 0: a freshly dispatched `ezgha-selftest` ran on an
   `ez-org-runner-*` and concluded `success` (verified via the run's jobs API — the
   `runner_name`, NOT a `busy` flag; a zombie runner is `busy` on a phantom job).
   **Nonce required:** the canary must capture the SPECIFIC dispatched run id (compare the
@@ -99,7 +99,7 @@ instant they finish a job, before the respawn lands. Measure **effective capacit
 
 ## Gate 5 — Sustained health, 30 min (the anti-early-victory gate) (AUTO)
 
-- `doctor.sh` returns exit 0 on every sample across a continuous **30-minute** window,
+- `doctor-runner` returns exit 0 on every sample across a continuous **30-minute** window,
   sampled every 60s (31 samples).
 - **Budget:** any single **FLEET-FAIL resets the clock to zero.** INFRA-FLAKEs
   (GitHub unreachable, no state mutation) are tolerated up to **5 non-consecutive** across
@@ -141,7 +141,7 @@ production fleet (breaking real `gh` auth to test would take the real fleet down
 The fleet decayed silently for ~7h this session because nothing alerted. A healthy fleet
 must be *observably* healthy without a human running doctor:
 
-- A monitor (cron/systemd-timer/`ezgha monitor`) runs `doctor.sh` on a schedule and, on
+- A monitor (cron/systemd-timer/`ezgha monitor`) runs `doctor-runner` on a schedule and, on
   FLEET-FAIL, emits an alert to a durable channel (log the operator watches, Slack, or a
   file a human checks). Its config is committed and its trigger is auto (a script with no
   caller is not monitoring — CLAUDE.md automation rule).

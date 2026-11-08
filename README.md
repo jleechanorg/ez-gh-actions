@@ -507,11 +507,11 @@ minimum_isolation = "container" # "vm" = refuse to run jobs unless execution is
 ### Fleet health check
 
 ```bash
-./doctor.sh                      # full fleet health check
+./doctor-runner                 # full fleet health check
 ./docs/verify-exit-criteria.sh   # ironclad exit criteria (Gates 0–10)
 ```
 
-`doctor.sh` checks: service liveness, Docker daemon, Colima VM, slot assignments, GitHub
+`doctor-runner` checks: service liveness, Docker daemon, Colima VM, slot assignments, GitHub
 runner fleet status (online/offline/busy), live managed containers, and recent job
 execution proof.
 
