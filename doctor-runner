@@ -753,9 +753,32 @@ while read -r rid; do
   _is_fleet=0
   if [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _is_fleet=1; fi
   if [ -n "$_RP" ] && [[ "$rn" == "${_RP}"* ]]; then _is_fleet=1; fi
-  # Fallback breadth: keep accepting other ez-* fleet runners, which is right for
-  # an enabled leg and harmless for a parked one (the exclusion below wins).
-  if [ "$_is_fleet" -eq 0 ] && [[ "$rn" == "ez-"* ]]; then _is_fleet=1; fi
+  # Fallback breadth for an enabled leg, made SAFE against a parked one.
+  #
+  # A bare `ez-*` fallback admitted a parked leg whose configured prefix could
+  # not be read (config lookup failure) or had drifted: `ez-mac-runner-g-4`
+  # matched `ez-*`, missed every explicit exclusion, and counted as proof
+  # (review P0). So the fallback now refuses any name belonging to a KNOWN
+  # parked LEG FAMILY, determined from the platform rather than from the
+  # possibly-unreadable config.
+  #
+  # Families are structural, not prefix-guessed: the Mac fleet is
+  # `ez-mac-runner-*` and the Linux fleet `ez-runner-c-*`. When a leg is parked,
+  # its family is excluded wholesale -- which covers historical and custom
+  # spellings the config no longer names.
+  if [ "$_is_fleet" -eq 0 ] && [[ "$rn" == "ez-"* ]]; then
+    # This host's own families: macOS -> ez-mac-runner-*, Linux -> ez-runner-c-*.
+    # The OTHER family is the remote leg's.
+    if [ "$PLATFORM" = "macos" ]; then
+      _local_fam="ez-mac-runner"; _remote_fam="ez-runner-c"
+    else
+      _local_fam="ez-runner-c";   _remote_fam="ez-mac-runner"
+    fi
+    _fam_parked=0
+    if [ "$PARKED_LOCAL" -eq 1 ] && [[ "$rn" == "${_local_fam}"* ]]; then _fam_parked=1; fi
+    if [ "$PARKED_REMOTE" -eq 1 ] && [[ "$rn" == "${_remote_fam}"* ]]; then _fam_parked=1; fi
+    if [ "$_fam_parked" -eq 0 ]; then _is_fleet=1; fi
+  fi
   _parked_leg=0
   if [ "$PARKED_LOCAL" -eq 1 ] && [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _parked_leg=1; fi
   # A known-parked REMOTE leg is excluded under BOTH its configured prefix and
@@ -809,11 +832,16 @@ if [ "$PROVE" = "1" ]; then
     # Same parked-leg exclusion as section 7: accepting any ez-* here would let a
     # canary that landed on a DISABLED leg report "fleet is handling real jobs
     # NOW" for capacity that is intentionally not running (bead jleechan-p9uq).
+    # Use the SAME early-resolved prefix as section 7. REMOTE_PREFIX is only
+    # populated later (section 10), so reading it here left the canary blind to a
+    # parked leg whose prefix had drifted -- it accepted ez-mac-runner-g-4 and set
+    # CANARY_OK=1 (review P0).
     _cn_parked=0
     if [ "$PARKED_LOCAL" -eq 1 ] && [ -n "${RUNNER_NAME_PREFIX:-}" ] && [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]]; then _cn_parked=1; fi
+    if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${EARLY_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${EARLY_REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
     if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${REMOTE_PREFIX:-}" ] && [[ "$rn" == "${REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
     # Same widening as section 7: the default spelling of a parked leg is excluded
-    # even when the configured prefix has drifted.
+    # even when the configured prefix has drifted or could not be read.
     if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${DEFAULT_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${DEFAULT_REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
     if [ "$_cn_parked" -eq 1 ]; then
       bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"

@@ -50,13 +50,15 @@ pass "structural: both proof paths carry a parked-leg exclusion"
 # Behavioral: drive the real classifier body out of the script.
 # Extract from the `_is_fleet=0` line through the end of the else-branch block.
 extract_classifier() {
-  # Body runs from `_is_fleet=0` to the closing `fi` of the fleet test, i.e. the
-  # first line matching `^  fi$` AFTER the parked-leg branch. Stop there; the
-  # enclosing `done < <(...)` belongs to the shell, not the classifier.
+  # Body runs from `_is_fleet=0` through the fleet/parked decision block, ending
+  # at the `fi` that closes the final `if [ "$_is_fleet" -eq 1 ] ...` statement.
+  # Anchor on that decision line rather than the first plain `fi`, so adding
+  # nested branches above cannot silently truncate the extraction.
   awk '
-    /^  _is_fleet=0$/  {inside=1}
-    inside            {print}
-    inside && /^  fi$/ {exit}
+    /^  _is_fleet=0$/                      {inside=1}
+    inside && /if \[ "\$_is_fleet" -eq 1 \]/ {fleet=1}
+    inside                                {print}
+    inside && fleet && /^  fi$/           {exit}
   ' "$D"
 }
 
@@ -70,6 +72,7 @@ classify() { # rn conc parked_local parked_remote local_prefix remote_prefix
   {
     echo 'set -euo pipefail'
     echo "rid=12345"
+    echo "PLATFORM=${CLASSIFY_PLATFORM:-linux}"
     echo "rn=$(printf '%q' "$rn"); conc=$(printf '%q' "$conc")"
     echo "PARKED_LOCAL=$pl; PARKED_REMOTE=$pr"
     echo "RUNNER_NAME_PREFIX=$(printf '%q' "$lp"); REMOTE_PREFIX=$(printf '%q' "$rp")"
@@ -148,5 +151,40 @@ if grep -q 'proof NOT REQUIRED' <<<"$SEC7_BLOCK"; then
   fail "section 7 must not skip the proof loop for a parked local leg"
 fi
 pass "section 7 runs the proof loop even when the local leg is parked"
+
+# 9. REVIEW P0: failed config lookup + drifted historical prefix.
+#    When the remote config cannot be read, the early prefix falls back to the
+#    default. A historical `ez-mac-runner-g-4` success must STILL be excluded --
+#    that is what the platform-family rule is for. Without it, `ez-*` admitted it.
+OUT9="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-mac-runner-g-4 success 0 1 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=0' <<<"$OUT9" \
+  || { sed -n '1,12p' <<<"$OUT9" >&2; fail "failed-lookup drift: a historical parked-family success must not count"; }
+pass "failed lookup + drifted historical prefix is excluded by the family rule"
+
+# 10. The family rule must not swallow the ENABLED leg's successes (no over-block).
+OUT10="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-runner-c-3 success 0 1 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=1' <<<"$OUT10" \
+  || { sed -n '1,12p' <<<"$OUT10" >&2; fail "the family rule must not block the enabled leg's successes"; }
+pass "family rule leaves the enabled leg's successes intact"
+
+# 11. Mirror orientation: Mac host, Linux leg parked, a Linux-family success is
+#     excluded while the Mac leg still counts.
+OUT11="$(CLASSIFY_PLATFORM=macos DEFAULT_REMOTE_PREFIX=ez-runner-c classify ez-runner-c-9 success 0 1 ez-mac-runner-h ez-runner-c)"
+grep -q 'COUNT=0' <<<"$OUT11" \
+  || { sed -n '1,12p' <<<"$OUT11" >&2; fail "mac-host orientation: parked Linux-family success must not count"; }
+pass "mac-host orientation excludes the parked Linux family"
+
+# 12. The --prove canary uses the SAME early-resolved prefix (review P0: it read
+#     REMOTE_PREFIX, which is only populated in section 10, so a drifted parked
+#     leg slipped through and set CANARY_OK=1).
+# Anchor on the assignment, not a comment: the section-7 comment shares its
+# opening words, so a comment-anchored range ended before the real block.
+CANARY_BLOCK="$(awk '/_cn_parked=0/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D")"
+[ -n "$CANARY_BLOCK" ] || fail "could not extract the canary exclusion block"
+grep -q 'EARLY_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
+  || fail "the canary must consult EARLY_REMOTE_PREFIX, not only REMOTE_PREFIX"
+grep -q 'DEFAULT_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
+  || fail "the canary must also exclude the default spelling"
+pass "the canary consults the early-resolved and default prefixes"
 
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
