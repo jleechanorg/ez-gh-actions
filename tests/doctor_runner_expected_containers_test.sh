@@ -38,7 +38,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
-LEGACY_DOCTOR_SCRIPT="$REPO_ROOT/doctor.sh"
+# doctor.sh is a deprecation stub now; its former source is preserved verbatim as a
+# fixture, so the legacy-contract assertion below still tests the real baseline rather
+# than a stub that no longer contains any checks.
+LEGACY_DOCTOR_SCRIPT="$REPO_ROOT/tests/fixtures/doctor_sh_baseline.sh"
 
 TEMP_HOME=$(mktemp -d)
 cleanup() { rm -rf "$TEMP_HOME"; }

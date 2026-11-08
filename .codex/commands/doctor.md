@@ -1,6 +1,6 @@
 # /doctor — diagnose and self-heal the ezgha runner fleet
 
-Repo-level command for ez-gh-actions. Runs the `doctor.sh` health check script, analyzes errors, and performs self-healing steps to restore fleet health.
+Repo-level command for ez-gh-actions. Runs the `doctor-runner` health check script, analyzes errors, and performs self-healing steps to restore fleet health.
 
 ## Skill Reference
 * **Diagnostic Skill**: [ezgha-doctor](file:///home/jleechan/projects/ez-gh-actions/.claude/skills/ezgha-doctor/SKILL.md)
@@ -11,9 +11,10 @@ When this command is invoked, immediately execute the following steps:
 
 1. **Run the health check**:
    ```bash
-   bash "$(git rev-parse --show-toplevel)/doctor.sh"
+   bash "$(git rev-parse --show-toplevel)/doctor-runner"
    ```
    Read the output, exit code, and verdict. Exit 0 = healthy; exit 1 = unhealthy.
+   (`doctor.sh` is a deprecated stub that exits 2 — never invoke it.)
 
 2. **If unhealthy, perform diagnostics**:
    * Inspect which of the 6 critical checks failed.
@@ -39,4 +40,4 @@ When this command is invoked, immediately execute the following steps:
      ```
 
 4. **Verify repair**:
-   * Re-run `doctor.sh` to confirm the exit status is now 0.
+   * Re-run `doctor-runner` to confirm the exit status is now 0.
