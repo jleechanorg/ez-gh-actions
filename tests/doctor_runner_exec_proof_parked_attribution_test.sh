@@ -65,6 +65,7 @@ BODY="$(extract_classifier)"
 grep -q '_parked_leg=1' <<<"$BODY" || fail "extracted body lacks the parked-leg logic"
 
 classify() { # rn conc parked_local parked_remote local_prefix remote_prefix
+  # DEFAULT_REMOTE_PREFIX may be supplied by the caller's environment.
   local rn="$1" conc="$2" pl="$3" pr="$4" lp="$5" rp="$6"
   {
     echo 'set -euo pipefail'
@@ -117,5 +118,35 @@ OUT5="$(classify ubuntu-latest success 0 0 ez-runner-c ez-mac-runner-h)"
 grep -q 'COUNT=0' <<<"$OUT5" || fail "a non-fleet runner must not count"
 grep -qi 'NOT.*ez-\*' <<<"$OUT5" || fail "a non-fleet runner must be reported as such"
 pass "non-fleet runner is rejected"
+
+# 6. A DRIFTED/historical parked prefix must also be excluded (review P0).
+#    The first version guessed `ez-mac-runner-h` and only excluded that, so a
+#    `ez-mac-runner-g-4` success fell through to the broad ez-* fallback and
+#    counted as proof for the enabled leg.
+OUT6="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-mac-runner-g-4 success 0 1 ez-runner-c ez-mac-runner-g)"
+grep -q 'COUNT=0' <<<"$OUT6" \
+  || { sed -n '1,10p' <<<"$OUT6" >&2; fail "a drifted parked prefix must still be excluded (default spelling)"; }
+pass "drifted parked prefix is excluded via the default spelling"
+
+# 7. The DEFAULT spelling is excluded even when the configured prefix differs.
+OUT7="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-mac-runner-h-2 success 0 1 ez-runner-c ez-other-prefix)"
+grep -q 'COUNT=0' <<<"$OUT7" \
+  || { sed -n '1,10p' <<<"$OUT7" >&2; fail "the default parked prefix must be excluded even if the configured one differs"; }
+pass "default spelling excluded when configured prefix differs"
+
+# 8. The loop must RUN when this host is parked, so the enabled leg still gets
+#    proof (review P0: the enclosing LOCAL_DISABLED branch skipped it entirely).
+#    Assert on the real section-7 body: the loop is unconditional and the
+#    "NOT REQUIRED" skip is gone from it.
+SEC7_BLOCK="$(awk 'index($0,"section \"7. real job-execution proof"){f=1} f{print} f&&index($0,"real jobs succeeded on our fleet"){exit}' "$D")"
+[ -n "$SEC7_BLOCK" ] || fail "could not extract section 7"
+grep -qi 'loop ALWAYS runs' <<<"$SEC7_BLOCK" \
+  || fail "section 7 must state that the proof loop always runs"
+grep -q 'while read -r rid' <<<"$SEC7_BLOCK" \
+  || fail "section 7 must still contain the proof loop"
+if grep -q 'proof NOT REQUIRED' <<<"$SEC7_BLOCK"; then
+  fail "section 7 must not skip the proof loop for a parked local leg"
+fi
+pass "section 7 runs the proof loop even when the local leg is parked"
 
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
