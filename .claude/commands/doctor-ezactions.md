@@ -15,7 +15,10 @@ When this command is invoked, immediately execute the following steps:
    ```bash
    bash "$(git rev-parse --show-toplevel)/doctor-runner"
    ```
-   Read the output, exit code, and verdict. Exit 0 = healthy; exit 1 = unhealthy.
+   Read the output, exit code, and verdict. Exit 0 = healthy; exit 1 = unhealthy;
+   **exit 3 = INCONCLUSIVE** (every measurable gate passed but queue/API evidence was
+   UNPROVEN, or every runner leg was opted out). Exit 3 is NOT a pass — re-run when
+   GitHub API quota recovers; never treat "not 1" as "fine".
 
    **Section 8 — queue health** (from `scripts/queue-health.sh`):
    - `in_progress` / `queued` counts on `QUEUE_REPO` (default `jleechanorg/worldarchitect.ai`)

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.jleechanorg.ezgha-host-health-alert</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>@SCRIPTS_DIR@/ezgha-host-health-alert.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>@HOME@/bin:@HOME@/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>DOCKER_HOST</key>
+    <string>unix://@HOME@/.colima/default/docker.sock</string>
+    <!-- Intentionally parked leg (bead jleechan-hxz0).
+         The pager can report DISABLED/INFO instead of DOWN/CRITICAL while a
+         platform is parked on purpose, so parking it does not page
+         "GitHub Actions Runners Down" every two minutes forever.
+
+         These keys are DELIBERATELY OMITTED here. A template must not bake in a
+         machine-specific opt-out: shipping them enabled would let a fresh
+         install suppress a genuine outage without any operator decision. Add
+         the one that applies to THIS host to its installed plist, and remove it
+         to require proof again (the fail-closed default):
+
+           <key>MAC_RUNNER_DISABLED</key><string>1</string>   parks the macOS leg
+           <key>REMOTE_LINUX_DISABLED</key><string>1</string> parks the Linux leg
+    -->
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>@HOME@</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/ezgha-host-health-alert.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/ezgha-host-health-alert.log</string>
+
+  <key>StartInterval</key>
+  <integer>120</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>

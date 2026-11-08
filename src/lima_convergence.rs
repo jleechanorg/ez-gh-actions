@@ -567,11 +567,42 @@ mod tests {
         }
     }
 
-    /// Create a fresh tempdir mimicking a Linux HOME. Returns the home dir.
-    fn fake_home() -> PathBuf {
+    /// Every fixture HOME lives under this one container so leftovers are
+    /// easy to find and reap (`/tmp/ezgha-tests/` on both platforms).
+    fn tests_root() -> PathBuf {
+        short_tmp_root().join("ezgha-tests")
+    }
+
+    /// A fixture HOME that is removed when dropped. Callers hold the guard
+    /// for the test's scope; it derefs to `Path`.
+    struct FakeHome(PathBuf);
+
+    impl std::ops::Deref for FakeHome {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FakeHome {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Create a fresh tempdir mimicking a Linux HOME. A killed or crashed
+    /// run cannot run `Drop`, so the first call per process also reaps
+    /// orphans left by earlier runs.
+    fn fake_home() -> FakeHome {
+        static REAP: std::sync::Once = std::sync::Once::new();
+        REAP.call_once(|| {
+            reap_orphans(&tests_root(), ORPHAN_MIN_AGE);
+            // Runs before this container existed leaked straight into the tmp root.
+            reap_orphans(&short_tmp_root(), ORPHAN_MIN_AGE);
+        });
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let dir = short_tmp_root().join(format!(
+        let dir = tests_root().join(format!(
             "ezgha-lima-{}-{}-{}",
             std::process::id(),
             n,
@@ -581,7 +612,260 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
-        dir
+        FakeHome(dir)
+    }
+
+    const ORPHAN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Remove `ezgha-lima-*` dirs under `root` older than `min_age` that have
+    /// no live owner, re-checked right before each removal.
+    fn reap_orphans(root: &Path, min_age: std::time::Duration) {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("ezgha-lima-") {
+                continue;
+            }
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= min_age);
+            if old_enough && !has_live_owner(&path, name) {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    /// True when the creating pid (embedded in the name) is alive, or any
+    /// process has its cwd or an open file inside `dir`. Fails closed: if
+    /// that cannot be determined, the dir counts as owned.
+    fn has_live_owner(dir: &Path, name: &str) -> bool {
+        let pid = name
+            .strip_prefix("ezgha-lima-")
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|p| p.parse::<libc::pid_t>().ok());
+        match pid {
+            // kill(pid, 0) succeeds or fails with EPERM for a live process.
+            Some(pid) if pid > 0 => {
+                if unsafe { libc::kill(pid, 0) } == 0
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                {
+                    return true;
+                }
+            }
+            _ => return true,
+        }
+        process_references(dir)
+    }
+
+    fn process_references(dir: &Path) -> bool {
+        let Ok(procs) = fs::read_dir("/proc") else {
+            // No procfs (macOS): `lsof +D` lists pids with cwd/files inside;
+            // exit 1 with no output is the only "nobody" answer.
+            let out = {
+                let _fork = fork_lock();
+                std::process::Command::new("lsof")
+                    .arg("-t")
+                    .arg("+D")
+                    .arg(dir)
+                    .output()
+            };
+            return match out {
+                Ok(out) => !(out.status.code() == Some(1) && out.stdout.is_empty()),
+                Err(_) => true,
+            };
+        };
+        for proc_entry in procs.flatten() {
+            let pid_dir = proc_entry.path();
+            if !proc_entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            {
+                continue;
+            }
+            // Another user's process cannot be read; it cannot hold this
+            // user's test HOME open without this user's permissions either.
+            if fs::read_link(pid_dir.join("cwd")).is_ok_and(|cwd| cwd.starts_with(dir)) {
+                return true;
+            }
+            if let Ok(fds) = fs::read_dir(pid_dir.join("fd")) {
+                for fd in fds.flatten() {
+                    if fs::read_link(fd.path()).is_ok_and(|target| target.starts_with(dir)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Serializes fork/exec in this module's tests with writes of executable
+    /// fixture scripts: a child forked while another thread holds a script
+    /// open for writing makes exec of that script fail with ETXTBSY.
+    static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fork_lock() -> std::sync::MutexGuard<'static, ()> {
+        FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_script(path: &Path, body: impl AsRef<[u8]>) {
+        use std::os::unix::fs::PermissionsExt;
+        let _fork = fork_lock();
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Set a path's mtime to `age` ago.
+    fn backdate(path: &Path, age: std::time::Duration) {
+        let secs = (SystemTime::now() - age)
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let tv = libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        };
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::utimes(c.as_ptr(), [tv, tv].as_ptr()) }, 0);
+    }
+
+    /// Helper run only as a child process by the reaper tests: create a
+    /// fixture HOME, report its path, then sleep until killed.
+    #[test]
+    #[ignore]
+    fn helper_hold_fake_home() {
+        let Ok(report) = std::env::var("EZGHA_TEST_REPORT") else {
+            return;
+        };
+        let home = fake_home();
+        if std::env::var_os("EZGHA_TEST_CHDIR").is_some() {
+            std::env::set_current_dir(&*home).unwrap();
+        }
+        fs::write(&report, home.as_os_str().as_bytes()).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// Spawn this test binary running `helper_hold_fake_home`; returns the
+    /// child and the fixture HOME it created.
+    fn spawn_holder(chdir: bool) -> (std::process::Child, PathBuf) {
+        fs::create_dir_all(tests_root()).unwrap();
+        let report = tests_root().join(format!("report-{}-{}", std::process::id(), chdir));
+        let _ = fs::remove_file(&report);
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "lima_convergence::tests::helper_hold_fake_home",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("EZGHA_TEST_REPORT", &report)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        if chdir {
+            cmd.env("EZGHA_TEST_CHDIR", "1");
+        }
+        let child = {
+            let _fork = fork_lock();
+            cmd.spawn().unwrap()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Ok(bytes) = fs::read(&report) {
+                if !bytes.is_empty() {
+                    let _ = fs::remove_file(&report);
+                    return (child, PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never reported its HOME"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn fake_home_lives_under_ezgha_tests_and_is_removed_on_drop() {
+        let home = fake_home();
+        let path = home.to_path_buf();
+        assert_eq!(
+            path.parent(),
+            Some(short_tmp_root().join("ezgha-tests").as_path())
+        );
+        assert!(path.is_dir());
+        drop(home);
+        assert!(
+            !path.exists(),
+            "dropping the guard must remove the fixture HOME"
+        );
+    }
+
+    #[test]
+    fn reap_orphans_removes_home_left_by_sigkilled_run() {
+        let (mut child, leaked) = spawn_holder(false);
+        child.kill().unwrap(); // SIGKILL: Drop never runs
+        child.wait().unwrap();
+        assert!(
+            leaked.is_dir(),
+            "SIGKILL must leave the fixture HOME behind"
+        );
+        reap_orphans(&tests_root(), ORPHAN_MIN_AGE);
+        assert!(
+            leaked.is_dir(),
+            "a fresh orphan is kept until it is older than the floor"
+        );
+        backdate(&leaked, ORPHAN_MIN_AGE * 2);
+        reap_orphans(&tests_root(), ORPHAN_MIN_AGE);
+        assert!(
+            !leaked.exists(),
+            "an old orphan with no live owner must be reaped"
+        );
+    }
+
+    #[test]
+    fn reap_orphans_keeps_old_home_with_live_owner() {
+        let (mut child, home) = spawn_holder(true);
+        backdate(&home, ORPHAN_MIN_AGE * 2);
+        reap_orphans(&tests_root(), ORPHAN_MIN_AGE);
+        let kept = home.is_dir();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(kept, "a live process with cwd inside must keep the dir");
+
+        // Same dir, creator now dead, but another process has its cwd inside:
+        // the cwd check alone must keep it.
+        let mut sleeper = {
+            let _fork = fork_lock();
+            std::process::Command::new("sleep")
+                .arg("60")
+                .current_dir(&home)
+                .spawn()
+                .unwrap()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        backdate(&home, ORPHAN_MIN_AGE * 2);
+        reap_orphans(&tests_root(), ORPHAN_MIN_AGE);
+        let kept_by_cwd = home.is_dir();
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert!(
+            kept_by_cwd,
+            "another process's cwd inside must keep the dir"
+        );
+
+        reap_orphans(&tests_root(), ORPHAN_MIN_AGE);
+        assert!(
+            !home.exists(),
+            "once every owner is gone the old dir is reaped"
+        );
     }
 
     /// Plant a fake Lima instance: `<home>/<lima_home>/<instance>/{diffdisk,
@@ -870,20 +1154,16 @@ mod tests {
 
     #[test]
     fn resolve_context_socket_uses_named_context_and_normalizes_unix_endpoint() {
-        use std::os::unix::fs::PermissionsExt;
-
         let home = fake_home();
         let docker = home.join("docker");
         let captured_args = home.join("docker-args.txt");
-        fs::write(
+        write_script(
             &docker,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf 'unix:///tmp/context.sock\\n'\n",
                 captured_args.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         assert_eq!(
             resolve_context_socket_with_docker("lima-colima", &docker),
@@ -897,16 +1177,12 @@ mod tests {
 
     #[test]
     fn resolve_context_socket_rejects_non_unix_endpoint() {
-        use std::os::unix::fs::PermissionsExt;
-
         let home = fake_home();
         let docker = home.join("docker");
-        fs::write(
+        write_script(
             &docker,
             "#!/bin/sh\nprintf 'tcp://docker.example:2376\\n'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         assert_eq!(resolve_context_socket_with_docker("remote", &docker), None);
     }
@@ -927,16 +1203,12 @@ mod tests {
 
     #[test]
     fn backup_provenance_rejects_fallback_after_tcp_context_endpoint() {
-        use std::os::unix::fs::PermissionsExt;
-
         let home = fake_home();
         let docker = home.join("docker");
-        fs::write(
+        write_script(
             &docker,
             "#!/bin/sh\nprintf 'tcp://docker.example:2376\\n'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let resolution = resolve_current_socket_with_docker(
             "remote",

@@ -307,6 +307,13 @@ struct SlotAssignments {
     /// window active" — never blocks a reap, only ever adds one.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registered_at: BTreeMap<String, u64>,
+    /// Slot index -> unix-epoch-seconds when the current assignment's Docker
+    /// container start returned success. This witness is deliberately distinct
+    /// from `registered_at`: a fresh JIT reservation with no started container
+    /// retains its propagation grace, while a container that did start and is
+    /// now definitively absent can release the slot immediately.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    container_started_at: BTreeMap<String, u64>,
 }
 
 /// Grace window (bead ez-gh-actions-5ki): a registration recorded within this
@@ -403,6 +410,61 @@ fn seconds_since_registered(
 ) -> Option<u64> {
     let &registered_at = assignments.registered_at.get(slot)?;
     Some(wall_secs.saturating_sub(registered_at))
+}
+
+/// Return the fresh local activity proof needed to bypass the JIT grace window
+/// for a slot whose current assignment has successfully started a container.
+/// A missing witness, an empty reservation, or a probe result other than
+/// Absent never authorizes a grace-window reclaim.
+fn started_container_activity_if_in_grace_with_state(
+    assignments: &SlotAssignments,
+    slot: &str,
+    container_name: &str,
+    activity_probe: &mut impl FnMut(&str) -> LocalRunnerActivity,
+    in_grace: bool,
+) -> Option<LocalRunnerActivity> {
+    let current_assignment = assignments.assignments.get(slot)?;
+    if current_assignment.is_empty()
+        || !assignments.container_started_at.contains_key(slot)
+        || !in_grace
+    {
+        return None;
+    }
+    Some(activity_probe(container_name))
+}
+
+/// Preserve a fresh started container when an activity probe crosses the grace
+/// boundary. Busy and Unknown are always fail-safe; Absent remains the only
+/// activity proof that authorizes an in-grace reclaim.
+fn retain_started_activity_after_grace_probe(
+    in_grace_before_probe: bool,
+    activity: Option<LocalRunnerActivity>,
+) -> bool {
+    matches!(
+        activity,
+        Some(LocalRunnerActivity::Busy) | Some(LocalRunnerActivity::Unknown)
+    ) || (in_grace_before_probe && !matches!(activity, Some(LocalRunnerActivity::Absent)))
+}
+
+/// Probe a successfully-started container only when the live registration is
+/// still the assignment that recorded the successful start. Path 4 runs after
+/// Path 1 and may be past the grace boundary, so Busy and Unknown must remain
+/// vetoes for this current assignment even then.
+fn started_container_activity_for_current_assignment(
+    assignments: &SlotAssignments,
+    slot: &str,
+    runner_id: u64,
+    container_name: &str,
+    activity_probe: &mut impl FnMut(&str) -> LocalRunnerActivity,
+) -> Option<LocalRunnerActivity> {
+    let current_assignment = assignments.assignments.get(slot)?;
+    if current_assignment.is_empty()
+        || current_assignment != &runner_id.to_string()
+        || !assignments.container_started_at.contains_key(slot)
+    {
+        return None;
+    }
+    Some(activity_probe(container_name))
 }
 
 /// True if `slot`'s `assignments[id_str]` is empty (a `next_slot_excluding`
@@ -1048,6 +1110,7 @@ pub fn next_slot_excluding(cfg: &Config, excluded: &HashSet<u32>) -> Result<Opti
             // both racing the same slot. See first-wave report for full
             // race diagram; this is the post-2026-07-08 fix (1a9baf4)
             // extension.
+            assignments.container_started_at.remove(&key);
             assignments.registered_at.insert(key, now_epoch_secs());
             write_slot_assignments_for(&assignments, Some(cfg))?;
             return Ok(Some(slot));
@@ -1069,7 +1132,29 @@ fn record_slot_runner_id_for(cfg: Option<&Config>, slot: u32, runner_id: u64) ->
     assignments
         .assignments
         .insert(key.clone(), runner_id.to_string());
+    assignments.container_started_at.remove(&key);
     assignments.registered_at.insert(key, now_epoch_secs());
+    write_slot_assignments_for(&assignments, cfg)
+}
+
+fn record_container_started_for(
+    cfg: Option<&Config>,
+    slot: u32,
+    expected_runner_id: u64,
+) -> Result<()> {
+    let mut assignments = read_slot_assignments_for(cfg)?;
+    let key = slot.to_string();
+    let Some(runner_id) = assignments.assignments.get(&key) else {
+        bail!("cannot record container start for unassigned slot {slot}");
+    };
+    if runner_id != &expected_runner_id.to_string() {
+        bail!(
+            "cannot record container start for slot {slot}: current runner id {runner_id} differs from expected {expected_runner_id}"
+        );
+    }
+    assignments
+        .container_started_at
+        .insert(key, now_epoch_secs());
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -1085,6 +1170,7 @@ fn release_slot_for(cfg: Option<&Config>, slot: u32) -> Result<()> {
     let key = slot.to_string();
     assignments.assignments.remove(&key);
     assignments.registered_at.remove(&key);
+    assignments.container_started_at.remove(&key);
     write_slot_assignments_for(&assignments, cfg)
 }
 
@@ -1451,6 +1537,7 @@ fn release_stale_slots_from_with_containers_for(
         runner_prefix,
         local_container_names,
         local_runner_activity,
+        |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
         ctx,
     )
 }
@@ -1463,6 +1550,7 @@ fn release_stale_slots_from_with_containers_and_activity(
     local_container_names: Option<&HashSet<String>>,
     activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
 ) -> Result<usize> {
+    let ctx = ReclaimContext::now();
     release_stale_slots_from_with_containers_and_activity_for(
         None,
         assignments,
@@ -1470,7 +1558,30 @@ fn release_stale_slots_from_with_containers_and_activity(
         runner_prefix,
         local_container_names,
         activity_probe,
-        &ReclaimContext::now(),
+        |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
+        &ctx,
+    )
+}
+
+#[cfg(test)]
+fn release_stale_slots_from_with_containers_and_activity_with_grace(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: Option<&HashSet<String>>,
+    activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
+) -> Result<usize> {
+    let ctx = ReclaimContext::now();
+    release_stale_slots_from_with_containers_and_activity_for(
+        None,
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        activity_probe,
+        grace_check,
+        &ctx,
     )
 }
 
@@ -1481,6 +1592,7 @@ fn release_stale_slots_from_with_containers_and_activity_for(
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
     mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    mut grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
     ctx: &ReclaimContext,
 ) -> Result<usize> {
     if assignments.assignments.is_empty() {
@@ -1564,7 +1676,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                 let expected_name = runner_name_from_prefix(runner_prefix, slot_n);
                 match local_container_names {
                     Some(local_names) if local_names.contains(&expected_name) => {
-                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                        let in_grace_before_probe = grace_check(assignments, slot);
+                        let started_activity = started_container_activity_if_in_grace_with_state(
+                            assignments,
+                            slot,
+                            &expected_name,
+                            &mut activity_probe,
+                            in_grace_before_probe,
+                        );
+                        if retain_started_activity_after_grace_probe(
+                            in_grace_before_probe,
+                            started_activity,
+                        ) {
                             let elapsed =
                                 seconds_since_registered(assignments, slot, ctx.wall_secs)
                                     .unwrap_or(0);
@@ -1576,7 +1699,8 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                             let elapsed =
                                 seconds_since_registered(assignments, slot, ctx.wall_secs)
                                     .unwrap_or(0);
-                            match activity_probe(&expected_name) {
+                            match started_activity.unwrap_or_else(|| activity_probe(&expected_name))
+                            {
                                 LocalRunnerActivity::Busy => {
                                     eprintln!(
                                         "warning: keeping slot {slot_n}: local container {expected_name} has Runner.Worker while GH snapshot omits registration {rid} (elapsed {elapsed}s); refusing destructive reclaim"
@@ -1656,7 +1780,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         // The recorded runner_id is no longer registered on GitHub
                         // (server-side reap, manual removal, or a stale entry from a
                         // prior host) and no local container exists, so reclaim.
-                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                        let in_grace_before_probe = grace_check(assignments, slot);
+                        let started_activity = started_container_activity_if_in_grace_with_state(
+                            assignments,
+                            slot,
+                            &expected_name,
+                            &mut activity_probe,
+                            in_grace_before_probe,
+                        );
+                        if retain_started_activity_after_grace_probe(
+                            in_grace_before_probe,
+                            started_activity,
+                        ) {
                             let elapsed =
                                 seconds_since_registered(assignments, slot, ctx.wall_secs)
                                     .unwrap_or(0);
@@ -1789,7 +1924,18 @@ fn release_stale_slots_from_with_containers_and_activity_for(
                         && !runner.busy
                         && !local_names.contains(&expected_name)
                     {
-                        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+                        let in_grace_before_probe = grace_check(assignments, slot);
+                        let started_activity = started_container_activity_if_in_grace_with_state(
+                            assignments,
+                            slot,
+                            &expected_name,
+                            &mut activity_probe,
+                            in_grace_before_probe,
+                        );
+                        if retain_started_activity_after_grace_probe(
+                            in_grace_before_probe,
+                            started_activity,
+                        ) {
                             let elapsed =
                                 seconds_since_registered(assignments, slot, ctx.wall_secs)
                                     .unwrap_or(0);
@@ -1908,6 +2054,26 @@ fn offline_not_busy_owned_missing_container_registrations(
     local_container_names: &HashSet<String>,
     ctx: &ReclaimContext,
 ) -> Vec<(u64, String)> {
+    offline_not_busy_owned_missing_container_registrations_for(
+        assignments,
+        live_runners,
+        runner_prefix,
+        local_container_names,
+        local_runner_activity,
+        |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
+        ctx,
+    )
+}
+
+fn offline_not_busy_owned_missing_container_registrations_for(
+    assignments: &SlotAssignments,
+    live_runners: &[github::RunnerInfo],
+    runner_prefix: &str,
+    local_container_names: &HashSet<String>,
+    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
+    mut grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
+    ctx: &ReclaimContext,
+) -> Vec<(u64, String)> {
     if runner_prefix.is_empty() {
         // Without a prefix there is no ownership gate — refuse to enumerate
         // candidates rather than risk reaping someone else's runner.
@@ -1938,12 +2104,16 @@ fn offline_not_busy_owned_missing_container_registrations(
         // writes, so a slot Path 1 just released this tick still has its
         // `registered_at` entry for this check.
         let slot = runner.name.strip_prefix(&prefix).unwrap_or("");
-        if slot_in_grace_window(assignments, slot, ctx.wall_secs) {
+        let in_grace_before_probe = grace_check(assignments, slot);
+        let started_activity = started_container_activity_for_current_assignment(
+            assignments,
+            slot,
+            runner.id,
+            &runner.name,
+            &mut activity_probe,
+        );
+        if retain_started_activity_after_grace_probe(in_grace_before_probe, started_activity) {
             let elapsed = seconds_since_registered(assignments, slot, ctx.wall_secs).unwrap_or(0);
-            // Bead ez-gh-actions-qz5j: use the entry-instant wall_secs /
-            // monotonic_secs from `ReclaimContext`. Pre-fix this site read
-            // the clock independently and could disagree with the other
-            // sites in the same pass across a wall-second boundary.
             let wall_secs = ctx.wall_secs;
             let monotonic_secs = ctx.monotonic_secs;
             eprintln!(
@@ -2710,6 +2880,9 @@ static TEST_HOST_CONTAINMENT_CGROUP_ROOT: std::sync::Mutex<Option<PathBuf>> =
 static TEST_HOST_CONTAINMENT_DAEMON_IN_VM: std::sync::Mutex<Option<bool>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
+static TEST_HOST_REPORTS_VIRTUALIZATION: std::sync::Mutex<Option<bool>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
 static TEST_CONTAINER_ANCESTRY_OVERRIDE: std::sync::Mutex<Option<bool>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
@@ -2790,6 +2963,45 @@ fn host_containment_daemon_in_vm() -> bool {
     .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     .filter(|kernel| !kernel.is_empty());
     matches!((host_kernel, daemon_kernel), (Some(host), Some(daemon)) if host != daemon)
+}
+
+/// True when the caller explicitly declared that this daemon's native Docker host
+/// is itself a VM (`policy.host_containment = "vm"`) **and** the kernel agrees the
+/// host is virtualized. Both halves are required: the declaration alone can never
+/// waive containment on bare metal.
+#[cfg(target_os = "linux")]
+fn host_containment_vm_boundary_asserted(cfg: &Config) -> bool {
+    cfg.policy.host_containment == crate::config::HostContainment::Vm
+        && host_reports_virtualization()
+}
+
+/// Kernel-level virtualization probe. A guest exposes the `hypervisor` CPUID flag
+/// (KVM, Xen, Hyper-V, VMware) in `/proc/cpuinfo`, and Xen also publishes
+/// `/sys/hypervisor/type`. No external tool is required.
+#[cfg(target_os = "linux")]
+fn host_reports_virtualization() -> bool {
+    #[cfg(test)]
+    if let Some(flag) = *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() {
+        return flag;
+    }
+    if Path::new("/sys/hypervisor/type").exists() {
+        return true;
+    }
+    match std::fs::read_to_string("/proc/cpuinfo") {
+        Ok(cpuinfo) => cpuinfo
+            .lines()
+            .filter(|line| line.starts_with("flags"))
+            .any(|line| line.split_whitespace().any(|flag| flag == "hypervisor")),
+        Err(_) => false,
+    }
+}
+
+/// Single predicate for "this daemon is already bounded by a VM": either its
+/// Docker daemon runs on a different kernel (Colima/Lima, remote VM socket) or an
+/// operator declared the native Docker host is itself a microVM.
+#[cfg(target_os = "linux")]
+fn daemon_is_vm_contained(cfg: &Config) -> bool {
+    host_containment_daemon_in_vm() || host_containment_vm_boundary_asserted(cfg)
 }
 
 #[cfg(target_os = "linux")]
@@ -2980,6 +3192,14 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
         if host_containment_daemon_in_vm() {
             return Ok(());
         }
+        if cfg.policy.host_containment == crate::config::HostContainment::Vm {
+            if host_reports_virtualization() {
+                return Ok(());
+            }
+            bail!(
+                "policy.host_containment = \"vm\" requires a virtualized host, but this kernel reports no hypervisor; run the daemon inside the VM or leave host_containment at its default (actions.slice containment)"
+            );
+        }
         if cfg.policy.minimum_isolation != crate::config::IsolationLevel::Container {
             bail!("host containment requires policy.minimum_isolation=container");
         }
@@ -3019,15 +3239,16 @@ pub fn require_host_containment(_cfg: &Config) -> Result<()> {
 }
 
 /// Require that a freshly created container PID is located beneath /actions.slice.
-pub fn require_container_actions_ancestry(_container_id: &str) -> Result<()> {
+pub fn require_container_actions_ancestry(_cfg: &Config, _container_id: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let container_id = _container_id;
         // A canonical Docker endpoint backed by a VM reports guest PIDs that
         // do not exist in this host's /proc. The host cgroup assertion is only
-        // meaningful for the native HostDocker profile; VM admission keeps its
-        // existing behavior without claiming host-level ancestry verification.
-        if host_containment_daemon_in_vm() {
+        // meaningful for the native HostDocker profile; VM admission (Colima or
+        // an explicitly declared microVM host) keeps its existing behavior
+        // without claiming host-level ancestry verification.
+        if daemon_is_vm_contained(_cfg) {
             return Ok(());
         }
         #[cfg(test)]
@@ -3159,7 +3380,7 @@ impl PressureSource {
 fn admission_pressure_source(cfg: &Config) -> PressureSource {
     #[cfg(target_os = "linux")]
     if let Some(parent) = cfg.limits.cgroup_parent.as_deref() {
-        if !is_macos_host() && !host_containment_daemon_in_vm() {
+        if !is_macos_host() && !daemon_is_vm_contained(cfg) {
             return PressureSource::runner_cgroup(&host_actions_cgroup_root().join(parent));
         }
     }
@@ -3823,40 +4044,21 @@ fn start_one_with_generate_at_slot(
                 // mount so the image's /usr/local/bin/tar wrapper
                 // (docker/tar-workspace-wrapper.sh) knows to guard tar
                 // extractions under /home/runner/_work -- the checkout path
-                // (_work/<owner>/<repo>) is NOT covered by the tmpfs shadows
-                // below and remains exposed to the same symlink-corruption
+                // (_work/<owner>/<repo>) remains on the host mount and is
+                // protected by the wrapper from the symlink-corruption
                 // bug whenever a workflow step tar-extracts an archive
                 // containing a symlink there (npm ci, release tarballs,
                 // docker save/load, etc). See
                 // tests/workspace_mount_symlink_extraction_test.sh step 4.
                 cmd.args(["-e", "EZGHA_VIRTIOFS_WORKSPACE=1"]);
-                // Shadow the three fixed actions-runner-internal subdirs with
-                // tmpfs (bead jleechan-93cf regression, 2026-07-19): tar
-                // extraction of an archive containing a symlink corrupts the
-                // symlink into a 0-byte, mode-000, unreadable file when the
-                // destination is this virtiofs-backed bind mount on
-                // Colima/Mac -- confirmed live with actions/setup-python's
-                // own tarball (which the runner extracts into _actions when
-                // downloading the action) and reproduced in
-                // tests/workspace_mount_symlink_extraction_test.sh. A plain
-                // `ln -s` on the mount works fine and extraction into the
-                // container's own overlay filesystem works fine -- only
-                // tar-extracting a real archive onto virtiofs corrupts
-                // symlink members. _actions/_temp/_tool are the runner's own
-                // action-repo and tool-download caches, always these three
-                // names, never needing host persistence for the disk-churn
-                // goal this mount exists for (checkouts/build scratch live
-                // directly under _work/<owner>/<repo>, unaffected by this).
-                // `:exec` is required -- Docker's default tmpfs mount
-                // options include `noexec`, but `_tool` stores installed
-                // tool runtimes (e.g. setup-python's Python binary) that
-                // the job then executes directly from this path. Without
-                // `:exec` those runtimes fail with rc126 "Permission
-                // denied" even though extraction itself succeeds (bead
-                // jleechan-krow, found via adversarial review of this fix).
-                for shadowed in ["_actions", "_temp", "_tool"] {
-                    cmd.args(["--tmpfs", &format!("/home/runner/_work/{shadowed}:exec")]);
-                }
+                // Keep _actions, _temp, and _tool as ordinary directories in
+                // the workspace bind. The upstream runner deletes _actions
+                // at job setup (Runner.Worker/ActionManager.cs); mounting
+                // tmpfs over that directory makes the deletion fail with
+                // EBUSY before the job can start. The image's tar wrapper
+                // guards extracts anywhere under _work, including these
+                // directories, so nested mounts are not needed for the
+                // virtiofs symlink-extraction workaround.
             }
         }
     }
@@ -3882,8 +4084,16 @@ fn start_one_with_generate_at_slot(
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    // Docker has now confirmed a successful start. Persist the witness before
+    // returning so a same-tick reconciliation can distinguish a never-started
+    // JIT propagation gap from a container that completed and disappeared.
+    if let Err(err) = record_container_started_for(Some(cfg), slot, runner_id) {
+        eprintln!(
+            "warning: Docker start succeeded for slot {slot}, but recording its start witness failed: {err}; retaining the normal JIT grace window"
+        );
+    }
     let container_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if let Err(err) = require_container_actions_ancestry(&container_id) {
+    if let Err(err) = require_container_actions_ancestry(cfg, &container_id) {
         let mut rm_cmd = docker_cmd();
         rm_cmd.args(["rm", "-f", &runner_name]);
         let _ = run_docker(rm_cmd, "post-start ancestry compensation rm -f");
@@ -4799,7 +5009,7 @@ fn admission_batch(cfg: &Config, missing: u32) -> Result<AdmissionBatch> {
         {
             return Ok(batch);
         }
-        if missing == 0 || is_macos_host() || host_containment_daemon_in_vm() {
+        if missing == 0 || is_macos_host() || daemon_is_vm_contained(cfg) {
             return Ok(batch);
         }
         use std::os::fd::AsRawFd;
@@ -5593,17 +5803,19 @@ mod tests {
         assert_eq!(failure_ladder_policy(&two).fleet_open_slots_threshold, 2);
     }
 
-    /// Lock + redirect the slot assignments path for the duration of a test.
-    /// Always pair with `_lock` to avoid races with other tests in the same
-    /// binary.
+    /// Lock + redirect the slot assignments and quarantine paths for the
+    /// duration of a test.
     struct TestEnv {
         _lock: std::sync::MutexGuard<'static, ()>,
+        _quarantine_lock: std::sync::MutexGuard<'static, ()>,
         path: PathBuf,
+        quarantine_path: PathBuf,
         docker_host_override: Option<std::ffi::OsString>,
     }
 
     impl TestEnv {
         fn new(label: &str) -> Self {
+            let quarantine_lock = crate::quarantine::tests::test_lock();
             let lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let docker_host_override = env::var_os("DOCKER_HOST_OVERRIDE");
             env::remove_var("DOCKER_HOST_OVERRIDE");
@@ -5646,8 +5858,10 @@ mod tests {
                 *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = Some(true);
             }
             Self {
+                _quarantine_lock: quarantine_lock,
                 _lock: lock,
                 path,
+                quarantine_path: qpath,
                 docker_host_override,
             }
         }
@@ -5668,6 +5882,7 @@ mod tests {
             *TEST_HOST_CONTAINMENT_OVERRIDE.lock().unwrap() = None;
             *TEST_HOST_CONTAINMENT_CGROUP_ROOT.lock().unwrap() = None;
             *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = None;
+            *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = None;
             *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = None;
             *TEST_USER_MANAGER_OOM_PROPERTIES.lock().unwrap() = None;
             reset_failure_ladder_admission_latch_for_tests();
@@ -5684,10 +5899,28 @@ mod tests {
                 std::env::remove_var("DOCKER_HOST_OVERRIDE");
             }
             let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&self.quarantine_path);
             if let Some(parent) = self.path.parent() {
                 let _ = std::fs::remove_dir(parent);
             }
         }
+    }
+
+    #[test]
+    fn test_env_removes_quarantine_file_before_parent_directory() {
+        let (slot_path, quarantine_path, parent) = {
+            let env = TestEnv::new("quarantine_cleanup");
+            std::fs::write(&env.quarantine_path, "fixture data").unwrap();
+            (
+                env.path.clone(),
+                env.quarantine_path.clone(),
+                env.path.parent().unwrap().to_path_buf(),
+            )
+        };
+
+        assert!(!slot_path.exists());
+        assert!(!quarantine_path.exists());
+        assert!(!parent.exists());
     }
 
     #[test]
@@ -6276,6 +6509,7 @@ minimum_isolation = "container"
 
     #[test]
     fn state_dir_isolates_slot_assignments_between_configs() {
+        let _qlock = crate::quarantine::tests::test_lock();
         let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         *TEST_SLOT_PATH.lock().unwrap() = None;
         let base =
@@ -7587,7 +7821,6 @@ esac
     #[test]
     #[cfg(target_os = "linux")]
     fn post_refill_released_slot_requests_immediate_reconcile() {
-        let _qlock = crate::quarantine::tests::test_lock();
         let env = TestEnv::new("post_refill_released_slot");
         let dir = env.path.parent().unwrap();
         // TestEnv paths can recur after a test process PID is recycled.
@@ -8335,7 +8568,6 @@ esac
     #[test]
     #[cfg(target_os = "linux")]
     fn post_refill_released_slot_full_path_boundaries() {
-        let _qlock = crate::quarantine::tests::test_lock();
         for case in [
             "released",
             "empty",
@@ -8359,7 +8591,6 @@ esac
 
     #[test]
     fn post_refill_released_slot_requires_complete_named_evidence() {
-        let _qlock = crate::quarantine::tests::test_lock();
         let _env = TestEnv::new("released_evidence");
         let cfg = cfg_with(3, "runner");
         let before = SlotAssignments {
@@ -9328,11 +9559,18 @@ esac
             "incomplete evidence must force the next full reconciliation while remaining pending"
         );
         let mut ceilings = crate::SettlingCeilingState::default();
-        assert!(!crate::record_settling_ceiling(
+        // This test asserts that a tick WITHOUT readiness proof does not reset
+        // the ceiling counter. That is a re-arm/reset property, not a timing
+        // property, so drive the ceiling clock past the sustain window instead
+        // of leaving the call inside it (where it would not count at all).
+        let mut ceiling_clock = std::time::Instant::now();
+        assert!(!crate::record_settling_ceiling_at(
             &cfg,
             &mut ceilings,
-            "synthetic first incomplete episode"
+            "synthetic first incomplete episode",
+            ceiling_clock
         ));
+        ceiling_clock += crate::SETTLING_CEILING_MIN_SUSTAIN + std::time::Duration::from_secs(1);
 
         let misleading_full_container_outcome =
             ensure_count_outcome(&cfg, Backend::Docker).unwrap();
@@ -9359,9 +9597,17 @@ esac
                 .is_some_and(crate::SettlingEpisode::is_active),
             "the completed full reconciliation must rearm local worker proof"
         );
+        // The property under test is that a no-readiness tick does NOT reset the
+        // shortage streak. Assert the streak is still armed rather than pinning
+        // a raw episode count (which the sustain-window gate no longer bumps on
+        // every call).
+        assert!(
+            ceilings.shortfall_since.is_some(),
+            "no readiness proof means no reset: the shortage streak must stay armed"
+        );
         assert_eq!(
-            ceilings.consecutive_ceilings, 1,
-            "no readiness proof means no reset"
+            ceilings.consecutive_ceilings, 0,
+            "a single in-window ceiling must not count toward the threshold"
         );
 
         let executing = local_executing_runner_count(&cfg).unwrap().ready;
@@ -9518,6 +9764,10 @@ esac
         assert!(
             assignments.assignments.is_empty(),
             "slot reserved by start_one should be cleaned up when docker run fails"
+        );
+        assert!(
+            assignments.container_started_at.is_empty(),
+            "failed docker run must not leave a container-start witness"
         );
     }
 
@@ -9759,6 +10009,14 @@ esac
         })
         .expect("start_one should succeed");
 
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .contains_key("1"),
+            "a successful docker run must persist a start witness for the current slot"
+        );
+
         let logged = std::fs::read_to_string(&capture).unwrap();
         let run_line = logged
             .lines()
@@ -9859,6 +10117,71 @@ esac
             err.to_string().contains("host containment")
                 || err.to_string().contains("runner counts 10, 14, or 20"),
             "expected host containment failure; got: {err:#}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_admits_explicit_vm_boundary_host() {
+        let _env = TestEnv::new("host_containment_vm_boundary");
+        cpu_probe_overrides::set(Some(true));
+        *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = Some(true);
+
+        // A cloud microVM host: native docker, no actions.slice, arbitrary count.
+        let mut cfg = cfg_with(4, "ez-cloud-runner");
+        cfg.limits.cgroup_parent = None;
+        cfg.policy.host_containment = crate::config::HostContainment::Vm;
+        require_host_containment(&cfg)
+            .expect("an explicitly declared VM boundary host must pass admission");
+        assert!(
+            daemon_is_vm_contained(&cfg),
+            "VM boundary hosts must be treated as VM-contained everywhere"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_refuses_vm_boundary_on_non_virtualized_host() {
+        let _env = TestEnv::new("host_containment_vm_boundary_bare_metal");
+        cpu_probe_overrides::set(Some(true));
+        *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = Some(false);
+
+        let mut cfg = cfg_with(4, "ez-cloud-runner");
+        cfg.limits.cgroup_parent = None;
+        cfg.policy.host_containment = crate::config::HostContainment::Vm;
+        let err = require_host_containment(&cfg)
+            .expect_err("a bare-metal host must not be able to waive containment");
+        assert!(
+            err.to_string().contains("host_containment = \"vm\"")
+                || err.to_string().contains("virtualized"),
+            "expected a fail-closed virtualization refusal; got: {err:#}"
+        );
+        assert!(
+            !daemon_is_vm_contained(&cfg),
+            "a non-virtualized host must never be treated as VM-contained"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_containment_vm_boundary_still_requires_matching_kernel_or_assertion() {
+        let _env = TestEnv::new("host_containment_auto_unchanged");
+        *TEST_HOST_REPORTS_VIRTUALIZATION.lock().unwrap() = Some(true);
+
+        // Default policy stays fail-closed on native bare-metal docker even when
+        // the host happens to report virtualization without the operator assertion.
+        let mut cfg = cfg_with(4, "ez-cloud-runner");
+        cfg.limits.cgroup_parent = None;
+        assert_eq!(
+            cfg.policy.host_containment,
+            crate::config::HostContainment::Auto
+        );
+        let err = require_host_containment(&cfg)
+            .expect_err("auto policy must keep requiring actions.slice containment");
+        assert!(
+            err.to_string()
+                .contains("limits.cgroup_parent=actions.slice"),
+            "expected the actions.slice requirement; got: {err:#}"
         );
     }
 
@@ -10094,8 +10417,9 @@ esac
         let _env = TestEnv::new("host_containment_vm_ancestry");
         *TEST_HOST_CONTAINMENT_DAEMON_IN_VM.lock().unwrap() = Some(true);
         *TEST_CONTAINER_ANCESTRY_OVERRIDE.lock().unwrap() = Some(false);
+        let cfg = cfg_with(4, "ez-cloud-runner");
 
-        require_container_actions_ancestry("guest-container")
+        require_container_actions_ancestry(&cfg, "guest-container")
             .expect("guest PID ancestry must not be read through the host /proc");
     }
 
@@ -10190,20 +10514,13 @@ esac
     }
 
     #[test]
-    fn workspace_mount_shadows_actions_temp_tool_with_tmpfs() {
-        // Regression test for the 2026-07-19 live incident (bead
-        // jleechan-93cf): tar extraction of an archive containing a symlink
-        // corrupts the symlink into an unreadable 0-byte mode-000 file when
-        // the destination is this virtiofs-backed workspace bind mount on
-        // Colima/Mac -- confirmed with actions/setup-python's own tarball,
-        // reproduced end-to-end in
-        // tests/workspace_mount_symlink_extraction_test.sh. GitHub's own
-        // actions-runner extracts downloaded action repos and tools into
-        // exactly these three fixed subdirectory names, so shadowing them
-        // with tmpfs keeps that extraction off virtiofs entirely while the
-        // disk-churn win this mount exists for (checkouts/build scratch,
-        // which live directly under _work/<owner>/<repo>) is unaffected.
-        let _env = TestEnv::new("workspace_mount_tmpfs_shadow");
+    fn workspace_mount_keeps_runner_internal_directories_removable() {
+        // Regression test for the workspace mount contract (bead
+        // jleechan-5tvb): the image tar wrapper guards extracts into all
+        // _work directories. Keep runner internals as ordinary workspace
+        // children because Actions/ActionManager deletes _actions at job
+        // setup; a nested mount there makes that deletion fail with EBUSY.
+        let _env = TestEnv::new("workspace_mount_internal_dirs_removable");
         cpu_probe_overrides::set(Some(true));
         let mut cfg = cfg_with(1, "ez-org-runner");
         let temp_dir =
@@ -10226,23 +10543,21 @@ esac
             .lines()
             .find(|l| l.contains("run "))
             .expect("a docker run invocation should have been logged");
-        for shadowed in ["_actions", "_temp", "_tool"] {
-            let expected = format!("--tmpfs /home/runner/_work/{shadowed}:exec");
+        for runner_dir in ["_actions", "_temp", "_tool"] {
+            let unexpected = format!("--tmpfs /home/runner/_work/{runner_dir}");
             assert!(
-                run_line.contains(&expected),
-                "run args should tmpfs-shadow {shadowed} with executable runtimes enabled; \
-                 got: {run_line}"
+                !run_line.contains(&unexpected),
+                "runner-owned {runner_dir} must remain deletable during job setup; \
+                 a nested mount causes EBUSY: {run_line}"
             );
         }
     }
 
     #[test]
     fn workspace_mount_sets_virtiofs_env_for_tar_wrapper() {
-        // Regression test for the WIDENED understanding of bead jleechan-93cf
-        // (2026-07-19 follow-up): the tmpfs-shadow fix above only protects
-        // the three fixed runner-internal cache dirs. Real job checkouts
-        // under _work/<owner>/<repo> -- the dominant disk-churn win this
-        // mount exists for -- are NOT shadowed and remain exposed to the
+        // Regression test for the complete workspace guard (bead
+        // jleechan-5tvb): real job checkouts under _work/<owner>/<repo> --
+        // the dominant disk-churn win this mount exists for -- remain exposed to the
         // same virtiofs symlink-extraction corruption whenever a workflow
         // step tar-extracts an archive containing a symlink there (npm ci,
         // downloaded release tarballs, docker save/load, etc; confirmed live
@@ -10553,6 +10868,119 @@ esac
                 .contains_key("1"),
             "slot 1 must be released when the local container has been confirmed gone"
         );
+    }
+
+    /// A container that successfully started and then disappeared must free
+    /// its slot immediately, even while the JIT registration grace window is
+    /// still open. The serialized witness is deliberately injected here so
+    /// this regression test remains meaningful against the pre-fix binary:
+    /// the old code ignores the unknown field and incorrectly keeps the slot.
+    #[test]
+    fn release_stale_slots_keeps_fresh_never_started_container_within_grace() {
+        let _env = TestEnv::new("fresh_never_started_container_within_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        // No container-start witness exists: a fresh JIT reservation must
+        // retain its propagation grace even if a fresh probe reports Absent.
+        let local_names = HashSet::new();
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &[],
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 0,
+            "a never-started current assignment must retain the grace window"
+        );
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .assignments
+                .contains_key("1"),
+            "the never-started assignment must remain reserved during grace"
+        );
+    }
+
+    #[test]
+    fn release_stale_slots_reclaims_started_absent_container_within_grace() {
+        let _env = TestEnv::new("started_absent_container_within_grace");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let path = slot_assignments_path_for(Some(&cfg));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{raw}\n[container_started_at]\n1 = {}\n", now_epoch_secs()),
+        )
+        .unwrap();
+
+        let local_names = HashSet::new();
+        let reclaimed = release_stale_slots_from_with_containers_and_activity(
+            &read_slot_assignments().unwrap(),
+            &[],
+            &cfg.runner.name_prefix,
+            Some(&local_names),
+            |_| LocalRunnerActivity::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reclaimed, 1,
+            "a witnessed started container confirmed absent must release its slot during grace"
+        );
+        assert_eq!(
+            next_slot(&cfg).unwrap(),
+            1,
+            "the released slot must be immediately available to the allocator"
+        );
+    }
+
+    #[test]
+    fn started_container_grace_reclaim_keeps_busy_and_unknown_activity_safe() {
+        let _env = TestEnv::new("started_container_grace_activity_safety");
+        let cfg = cfg_with(2, "ez-org-runner");
+        let _slot = next_slot(&cfg).unwrap();
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let mut assignments = read_slot_assignments().unwrap();
+        assignments
+            .container_started_at
+            .insert("1".to_string(), now_epoch_secs());
+        write_slot_assignments_for(&assignments, Some(&cfg)).unwrap();
+
+        // The inventory is a stale snapshot that still names the container.
+        // Fresh Busy and Unknown probes must both retain the assignment.
+        let live = vec![runner_info(9999, "ez-org-runner-2")];
+        let local_names = HashSet::from(["ez-org-runner-1".to_string()]);
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let reclaimed = release_stale_slots_from_with_containers_and_activity(
+                &read_slot_assignments().unwrap(),
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+            )
+            .unwrap();
+            assert_eq!(
+                reclaimed, 0,
+                "fresh {activity:?} activity must retain a witnessed started slot"
+            );
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "fresh {activity:?} activity must leave the slot owned"
+            );
+        }
     }
 
     #[test]
@@ -11376,6 +11804,158 @@ esac
     }
 
     // --- bead ez-gh-actions-5ki: registration grace window ---
+
+    #[test]
+    fn path1_to_path4_reap_does_not_delete_busy_or_unknown_after_grace_boundary() {
+        // Path 1 observes the assignment during grace and retains it after a
+        // Busy/Unknown probe. Path 4 then runs past grace on the same snapshot;
+        // it must fresh-probe the current started assignment before deletion.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("outer_boundary_path1_path4_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let assignments = read_slot_assignments().unwrap();
+            let live = vec![s9d_runner(4242, "ez-org-runner-1", "offline", false)];
+            let local_names = HashSet::new();
+            let mut path1_grace_checks = 0;
+            let path1_reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &assignments,
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    path1_grace_checks += 1;
+                    path1_grace_checks == 1
+                },
+            )
+            .unwrap();
+            assert_eq!(path1_reclaimed, 0, "Path 1 must retain {activity:?}");
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "Path 1 must leave the {activity:?} assignment owned"
+            );
+
+            // Path 4 is the production registration-delete decision. Its
+            // grace seam is now past the boundary, so only the current
+            // assignment's fresh Busy/Unknown proof can veto deletion.
+            let mut path4_grace_checks = 0;
+            let candidates = offline_not_busy_owned_missing_container_registrations_for(
+                &assignments,
+                &live,
+                &cfg.runner.name_prefix,
+                &local_names,
+                |_| activity,
+                |_, _| {
+                    path4_grace_checks += 1;
+                    false
+                },
+                &ReclaimContext::now(),
+            );
+            assert!(
+                candidates.is_empty(),
+                "sequential Path 1 -> Path 4 must issue zero DELETE/cancel candidates for {activity:?}"
+            );
+            assert_eq!(path1_grace_checks, 1);
+            assert_eq!(path4_grace_checks, 1);
+        }
+    }
+
+    #[test]
+    fn gh_missing_missing_inventory_keeps_busy_and_unknown_after_grace_boundary() {
+        // The activity probe starts during grace; the injected second grace
+        // check expires afterward. Both fail-safe outcomes must retain the
+        // current assignment through the real reconciliation routine.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("boundary_gh_missing_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let mut grace_checks = 0;
+            let local_names = HashSet::new();
+            let reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &read_slot_assignments().unwrap(),
+                &[],
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    grace_checks += 1;
+                    grace_checks == 1
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                reclaimed, 0,
+                "GH-missing + missing-inventory must retain {activity:?} across the grace boundary"
+            );
+            assert_eq!(
+                grace_checks, 1,
+                "the pre-probe grace state must be captured once"
+            );
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "GH-missing + missing-inventory must leave the {activity:?} assignment owned"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_idle_missing_inventory_keeps_busy_and_unknown_after_grace_boundary() {
+        // Same boundary race for an offline+idle GitHub registration, through
+        // the real reconciliation routine and with no local inventory entry.
+        for activity in [LocalRunnerActivity::Busy, LocalRunnerActivity::Unknown] {
+            let _env = TestEnv::new(&format!("boundary_offline_idle_{activity:?}"));
+            let cfg = cfg_with(2, "ez-org-runner");
+            let _slot = next_slot(&cfg).unwrap();
+            record_slot_runner_id(1, 4242).unwrap();
+            record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+            let live = vec![s9d_runner(4242, "ez-org-runner-1", "offline", false)];
+            let local_names = HashSet::new();
+            let mut grace_checks = 0;
+            let reclaimed = release_stale_slots_from_with_containers_and_activity_with_grace(
+                &read_slot_assignments().unwrap(),
+                &live,
+                &cfg.runner.name_prefix,
+                Some(&local_names),
+                |_| activity,
+                |_, _| {
+                    grace_checks += 1;
+                    grace_checks == 1
+                },
+            )
+            .unwrap();
+
+            assert_eq!(
+                reclaimed, 0,
+                "offline-idle + missing-inventory must retain {activity:?} across the grace boundary"
+            );
+            assert_eq!(
+                grace_checks, 1,
+                "the pre-probe grace state must be captured once"
+            );
+            assert!(
+                read_slot_assignments()
+                    .unwrap()
+                    .assignments
+                    .contains_key("1"),
+                "offline-idle + missing-inventory must leave the {activity:?} assignment owned"
+            );
+        }
+    }
 
     #[test]
     fn ensure_count_respawn_within_grace_window_is_not_reaped_by_release_stale_slots() {
@@ -12671,7 +13251,6 @@ esac
     /// a tick.
     #[test]
     fn quarantine_state_explicit_on_first_422_detection() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("first_422");
         let (_env, cfg, assignments) = quarantine_test_setup(
             "first_422_state",
             "ez-org-runner",
@@ -12733,7 +13312,6 @@ esac
     /// (collect_repo_runs + cancel + poll cascade) per tick.
     #[test]
     fn quarantine_bounds_api_volume_per_tick() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("bound_api");
         let (_env, cfg, _assignments) = quarantine_test_setup(
             "bound_api_volume",
             "ez-org-runner",
@@ -12827,7 +13405,6 @@ esac
     /// cancel/poll cascade.
     #[test]
     fn quarantine_does_not_reissue_reaper_attempts_on_subsequent_ticks() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("no_re_reclaim");
         let (_env, cfg, assignments) = quarantine_test_setup(
             "no_re_reclaim",
             "ez-org-runner",
@@ -12921,7 +13498,6 @@ esac
     /// acceptance criterion.
     #[test]
     fn quarantine_auto_recovers_when_runner_appears_online() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("recover_online");
         let (_env, cfg, assignments) = quarantine_test_setup(
             "recover_online",
             "ez-org-runner",
@@ -13018,7 +13594,6 @@ esac
     /// quarantine logic).
     #[test]
     fn quarantine_does_not_swallow_rqb9_idle_no_registration_path() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("not_rqb9");
         let _env = TestEnv::new("not_rqb9_path");
         let cfg = cfg_with(2, "ez-org-runner");
         let _ = next_slot(&cfg).unwrap();
@@ -13077,7 +13652,6 @@ esac
     /// This is the "continue filling all other slots" acceptance.
     #[test]
     fn next_slot_excluding_skips_quarantined_slots_and_fills_others() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("skip_quarantine");
         let _env = TestEnv::new("skip_quarantine_slots");
         let cfg = cfg_with(3, "ez-org-runner");
 
@@ -13132,7 +13706,6 @@ esac
     /// never tries to spawn INTO a wedged slot (no 409 self-heal churn).
     #[test]
     fn next_slot_excluding_keeps_skipping_quarantined_slots_across_calls() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("repeat_skip");
         let _env = TestEnv::new("repeat_skip");
         let cfg = cfg_with(4, "ez-org-runner");
         // Reserve slots 1 and 2, mark them recorded (so they're "occupied"
@@ -13185,7 +13758,6 @@ esac
     /// wedge the entire daemon.
     #[test]
     fn next_slot_excluding_tolerates_corrupt_quarantine_file() {
-        let _qpath = crate::quarantine::tests::TestEnv::new("corrupt_q");
         let _env = TestEnv::new("corrupt_q");
         let cfg = cfg_with(2, "ez-org-runner");
         let _ = next_slot(&cfg).unwrap();
@@ -13200,6 +13772,53 @@ esac
         // still pick slot 2 — NOT panic, NOT bail.
         let chosen = next_slot_excluding(&cfg, &HashSet::new()).unwrap().unwrap();
         assert_eq!(chosen, 2);
+    }
+
+    #[test]
+    fn container_started_witness_lifecycle_is_current_assignment_scoped() {
+        let _env = TestEnv::new("container_started_witness_lifecycle");
+        let cfg = cfg_with(2, "ez-org-runner");
+        assert_eq!(next_slot(&cfg).unwrap(), 1);
+        record_slot_runner_id(1, 4242).unwrap();
+
+        let assignments = read_slot_assignments().unwrap();
+        assert!(
+            assignments.container_started_at.is_empty(),
+            "JIT success alone must not create a Docker start witness"
+        );
+        assert!(
+            record_container_started_for(Some(&cfg), 1, 5252).is_err(),
+            "a stale Docker start result must not witness a replaced assignment"
+        );
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .is_empty(),
+            "a mismatched runner id must not create a witness"
+        );
+        record_container_started_for(Some(&cfg), 1, 4242).unwrap();
+
+        // Replacing the GitHub runner id starts a new current assignment and
+        // must invalidate the old container-start witness.
+        record_slot_runner_id(1, 5252).unwrap();
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .is_empty(),
+            "runner-id replacement must clear the previous assignment witness"
+        );
+
+        record_container_started_for(Some(&cfg), 1, 5252).unwrap();
+        release_slot(1).unwrap();
+        assert!(
+            read_slot_assignments()
+                .unwrap()
+                .container_started_at
+                .is_empty(),
+            "slot release must clear the container-start witness"
+        );
     }
 
     /// Bead jleechan-uurm: regression test for the empty-id Path-1 race.
@@ -13749,6 +14368,7 @@ esac
                     LocalRunnerActivity::Absent
                 }
             },
+            |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
             &ctx,
         )
         .unwrap();

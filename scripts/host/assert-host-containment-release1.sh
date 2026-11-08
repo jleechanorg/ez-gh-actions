@@ -27,11 +27,14 @@ mem_total_kib="$(awk '/^MemTotal:/ {print $2}' "$ROOT/proc/meminfo" 2>/dev/null 
 [[ "$mem_total_kib" =~ ^[0-9]+$ ]] || fail "could not parse MemTotal from $ROOT/proc/meminfo"
 
 # Floor is the computed sum of the four enforced hard limits
-# (Actions 28G + QEMU 10G + Agents 12G + Automation 5G = 55 GiB)
+# (Actions 28G + QEMU 10G + Agents 11.5G + Automation 5G = 54.5 GiB)
+# R1 cap-fit amendment 2026-10-21 (bead jleechan-r1-cap-fit-amendment-byee):
+# agents 12G -> 11.5G so caps + max(2G, 10% MemTotal) reserve fits the real
+# 60.9 GiB host; prior profile needed 64052514 KiB vs MemTotal 63808340.
 # plus max(2 GiB, 10% of host MemTotal).
 ENFORCED_ACTIONS_MAX_BYTES=30064771072
 ENFORCED_QEMU_MAX_BYTES=10737418240
-ENFORCED_AGENTS_MAX_BYTES=12884901888
+ENFORCED_AGENTS_MAX_BYTES=12348030976
 ENFORCED_AUTOMATION_MAX_BYTES=5368709120
 
 for b in "$ENFORCED_ACTIONS_MAX_BYTES" "$ENFORCED_QEMU_MAX_BYTES" "$ENFORCED_AGENTS_MAX_BYTES" "$ENFORCED_AUTOMATION_MAX_BYTES"; do
@@ -92,15 +95,31 @@ if [ "$ROOT" = "/" ] || [ "${CONTAINMENT_LIVE_SYSTEMD:-0}" = 1 ]; then
   check_user_property automation.slice ManagedOOMMemoryPressure auto
   check_user_property automation.slice ManagedOOMSwap auto
 
-  check_user_property lima-vm@colima.service MemoryHigh 9663676416
-  check_user_property lima-vm@colima.service MemoryMax "$ENFORCED_QEMU_MAX_BYTES"
-  check_user_property lima-vm@colima.service MemorySwapMax 2147483648
-  check_user_property lima-vm@colima.service TasksMax 4096
-  actual_quota="$(systemctl --user show -p CPUQuotaPerSecUSec --value -- lima-vm@colima.service 2>/dev/null || true)"
-  [ -n "$actual_quota" ] || actual_quota="$(systemctl --user show -p CPUQuota --value -- lima-vm@colima.service 2>/dev/null || true)"
-  case "$actual_quota" in
-    16s|1600%) ;;
-    *) fail "lima-vm@colima.service CPUQuota ('$actual_quota') != '16s' / '1600%'" ;;
+  qemu_guard="${BASH_SOURCE[0]%/*}/qemu-ceiling-guard.sh"
+  if [ "$ROOT" = / ]; then
+    qemu_runtime_state="$($qemu_guard --runtime-state)" \
+      || fail "could not establish lima-vm@colima.service runtime state"
+  else
+    qemu_runtime_state="$($qemu_guard --root "$ROOT" --runtime-state)" \
+      || fail "could not establish lima-vm@colima.service runtime state"
+  fi
+  case "$qemu_runtime_state" in
+    inactive)
+      : # Native Docker host with no active VM: source policy remains checked elsewhere.
+      ;;
+    active)
+      check_user_property lima-vm@colima.service MemoryHigh 9663676416
+      check_user_property lima-vm@colima.service MemoryMax "$ENFORCED_QEMU_MAX_BYTES"
+      check_user_property lima-vm@colima.service MemorySwapMax 2147483648
+      check_user_property lima-vm@colima.service TasksMax 4096
+      actual_quota="$(systemctl --user show -p CPUQuotaPerSecUSec --value -- lima-vm@colima.service 2>/dev/null || true)"
+      [ -n "$actual_quota" ] || actual_quota="$(systemctl --user show -p CPUQuota --value -- lima-vm@colima.service 2>/dev/null || true)"
+      case "$actual_quota" in
+        16s|1600%) ;;
+        *) fail "lima-vm@colima.service CPUQuota ('$actual_quota') != '16s' / '1600%'" ;;
+      esac
+      ;;
+    *) fail "unexpected lima-vm@colima.service runtime state: $qemu_runtime_state" ;;
   esac
 
   check_system_property() {

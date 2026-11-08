@@ -73,6 +73,26 @@ case "$(uname -s)" in
   *)      PLATFORM="other" ;;
 esac
 
+# INTENTIONAL LOCAL OPT-OUT of THIS host's own fleet (bead jleechan-hxz0).
+# Declared at the very top because it must gate the HOST-LIFECYCLE sections
+# (1-6: service, docker daemon, colima/limactl, runtime state, GitHub
+# registrations, live containers), not just the per-slot inventory further
+# down. A parked host legitimately has no running daemon, no colima VM and no
+# registrations, so without this a doctor run ON the parked host reports
+# `docker daemon unreachable`, `colima VM stopped`, `ezgha.service = disabled`
+# and `no <prefix>-* registrations` and exits unhealthy -- even though the
+# operator parked it deliberately. That was PR #214's codex P0: fixing only
+# the remote leg left the parked host itself unreadable.
+#
+# Declared, never inferred: a host whose daemon CRASHED must keep failing.
+#   MAC_RUNNER_DISABLED=1     parks the macOS leg (from a macOS or Linux doctor)
+#   REMOTE_LINUX_DISABLED=1   parks the Linux leg (from a macOS or Linux doctor)
+LOCAL_DISABLED=0
+case "$PLATFORM" in
+  macos) [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
+  linux) [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && LOCAL_DISABLED=1 ;;
+esac
+
 source "$SCRIPT_DIR/scripts/launchd-service-docker-endpoint.sh"
 use_launchd_service_docker_endpoint "$PLATFORM"
 
@@ -209,7 +229,75 @@ fetch_respawn_log_window() {
   fi
 }
 
+# Resolve the local config path and runner prefix BEFORE the parked-host gate:
+# section 7 (real job-execution proof) still runs on a parked host and needs
+# the prefix. Leaving these inside the gated span made `set -u` abort section 7
+# with `RUNNER_NAME_PREFIX: unbound variable` (found by running the parked Mac).
+if [ "$PLATFORM" = "macos" ]; then
+  LOCAL_CONFIG_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/config.toml"
+  [ -f "$LOCAL_CONFIG_FILE" ] || LOCAL_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+  SLOT_FILE="$HOME/Library/Application Support/org.jleechanorg.ezgha/slot_assignments.toml"
+  [ -f "$SLOT_FILE" ] || SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+else
+  LOCAL_CONFIG_FILE="$HOME/.config/ezgha/config.toml"
+  SLOT_FILE="$HOME/.config/ezgha/slot_assignments.toml"
+fi
+RUNNER_NAME_PREFIX=$(grep -E '^name_prefix' "$LOCAL_CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2 | sed -E 's/#.*//' | tr -d ' "\x27')
+if [ -z "$RUNNER_NAME_PREFIX" ]; then
+  # Legacy / missing config: fall back to `ez-org-runner` (the pre-#8143 default).
+  RUNNER_NAME_PREFIX="ez-org-runner"
+fi
+# Seed the verdict inputs that the parked-host gate would otherwise leave unset
+# (`set -u` aborted with `SERVICE_STATE: unbound variable`). A parked host owns no
+# service and no VM, so "disabled/absent" is the truthful observation; the verdict
+# gates below are explicitly exempted from charging those as defects.
+if [ "$LOCAL_DISABLED" -eq 1 ]; then
+  SERVICE_STATE="disabled-parked"
+  COLIMA_STATUS="NotInstalled"
+  # Section 5's fleet census is skipped for a parked host, but later verdict
+  # gates still read these; seed the truthful "nothing on this leg" values.
+  RAW='{"runners":[]}'
+  TOTAL=0; ONLINE=0; OFFLINE=0; BUSY=0
+  CONTAINER_NAMES=""; CONTAINER_COUNT=0
+  # Section 4 (which computes these) is skipped for a parked host; seed them so
+  # the verdict gates below read a defined value instead of tripping `set -u`.
+  LOOP_FAILS=0; LAST_LOOP=""
+  REAL_ON_FLEET=0; REAL_TOTAL=0
+  QUEUE_TAIL_BAD=0
+  HEARTBEAT_SAMPLE_COUNT=0
+fi
+
+count_assignments_section() {
+  awk '
+    /^\[assignments\]/ { in_section=1; next }
+    /^\[/               { in_section=0 }
+    in_section && /=/   { c++ }
+    END                 { print c+0 }
+  ' "$1" 2>/dev/null
+}
+
 # --- A. local daemon + service ------------------------------------------
+# A parked host legitimately has no service, daemon, colima VM, registrations
+# or containers; that absence is the DECISION, not a defect. So the whole
+# host-lifecycle span (sections 1-6) is gated as one unit — patching individual
+# bad() calls one at a time is how PR #214's codex P0 survived review (the
+# remote leg was fixed while the parked host itself stayed unreadable).
+if [ "$LOCAL_DISABLED" -eq 1 ]; then
+  section "1-6. host lifecycle (parked host)"
+  ok "$PLATFORM host intentionally DISABLED (operator opt-out) — 0 slot(s) expected, no service/daemon/colima/registrations required, and nothing contributed to the fleet contract; unset the opt-out to require proof"
+  # AGENTS.md requires every suspension to carry a start date and a restore
+  # condition so the opt-out cannot quietly become a permanent capacity
+  # reduction. Nothing surfaced a MISSING record before this: the Mac leg sat
+  # parked from 2026-10-29 with no written owner record anywhere, found by the
+  # 2026-11-07 audit. A suspension declaration is expected to name where the
+  # record lives; print it so a reviewer sees the pointer (or its absence).
+  SUSPENSION_RECORD="${EZGHA_SUSPENSION_RECORD-jleechan-hxz0}"
+  if [ -n "$SUSPENSION_RECORD" ] && [ "$SUSPENSION_RECORD" != "none" ]; then
+    info "suspension record: $SUSPENSION_RECORD — it MUST carry the start date and the restore condition (AGENTS.md); verify with: br show $SUSPENSION_RECORD"
+  else
+    warn "no suspension record declared — AGENTS.md requires the start date, restore condition and prerequisites in the owning bead/roadmap note; set EZGHA_SUSPENSION_RECORD=<bead-id> when declaring a parked leg"
+  fi
+else
 section "1. ezgha service"
 SERVICE_STATE=$(probe_service_state)
 case "$SERVICE_STATE" in
@@ -322,14 +410,6 @@ fi
 # added during churn remediation). A whole-file `grep -c '='` therefore
 # double-counts (~28 for a 14-slot Linux fleet) — see ez-gh-actions-nj2j. Count
 # only lines inside [assignments], never a whole-file grep.
-count_assignments_section() {
-  awk '
-    /^\[assignments\]/ { in_section=1; next }
-    /^\[/               { in_section=0 }
-    in_section && /=/   { c++ }
-    END                 { print c+0 }
-  ' "$1" 2>/dev/null
-}
 if [ -f "$SLOT_FILE" ]; then
   ASSIGNED=$(count_assignments_section "$SLOT_FILE")
   ok "slot_assignments.toml present ($ASSIGNED slots reserved)"
@@ -468,6 +548,8 @@ CONTAINER_COUNT=$(docker ps --filter label=ezgha=managed --format '{{.Names}}' 2
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
 info "managed containers running: $CONTAINER_COUNT (expected: configured runner.count)"
 echo "$CONTAINER_NAMES" | head -20
+fi
+# end of the parked-host gate opened at section 1 (bead jleechan-hxz0)
 
 # --- D2. host resource pressure (2026-07-19, user request: "detect these
 # upfront") -----------------------------------------------------------------
@@ -579,6 +661,12 @@ section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
 REAL_TOTAL=0
+if [ "$LOCAL_DISABLED" -eq 1 ]; then
+  # A parked leg has no registrations by definition, so no run can ever be
+  # attributed to it. Requiring execution proof from a deliberately empty fleet
+  # is the same defect as requiring it from a DOWN slot: state the truth instead.
+  ok "real job-execution proof NOT REQUIRED — $PLATFORM leg intentionally DISABLED (operator opt-out), so it has no runners to execute on; unset the opt-out to require proof"
+else
 while read -r rid; do
   [ -z "$rid" ] && continue
   REAL_TOTAL=$((REAL_TOTAL+1))
@@ -593,6 +681,8 @@ while read -r rid; do
   fi
 done < <($(command -v gh) run list -R "$EZGHA_REPO" -w ezgha-selftest -L "$ROUTING_N" --json databaseId --jq '.[].databaseId' 2>/dev/null)
 info "real jobs succeeded on our fleet: $REAL_ON_FLEET / $REAL_TOTAL"
+fi
+# end of the parked-host gate for section 7 (bead jleechan-hxz0)
 
 # --- E2. optional live canary: dispatch a job and prove it runs NOW ------
 # `--prove` dispatches a fresh ezgha-selftest and blocks until it completes,
@@ -746,7 +836,16 @@ if [ -f "$SCRIPT_DIR/scripts/queue-health.sh" ]; then
   # shellcheck source=/dev/null
   source "$SCRIPT_DIR/scripts/queue-health.sh" || QUEUE_RC=$?
   set -e
-  if [ "$QUEUE_RC" -ne 0 ]; then QUEUE_TAIL_BAD=1; fi  # 1 = tail exceeded, 2 = unmeasurable (UNPROVEN)
+  # Preserve the script's own 1-vs-2 distinction: 1 = tail genuinely exceeded,
+  # 2 = metrics UNMEASURABLE (GitHub API read failed / rate-limited). Collapsing
+  # both to 1 reported an exhausted API quota as "oldest queued job exceeded
+  # 20m", which is a false claim about the queue -- measured live on 2026-11-04
+  # at 0/5000 quota. Only 1 is a queue-tail defect; 2 is UNPROVEN, not bad.
+  if [ "${QUEUE_RC:-0}" -eq 1 ]; then
+    QUEUE_TAIL_BAD=1
+  elif [ "${QUEUE_RC:-0}" -ne 0 ]; then
+    QUEUE_TAIL_UNPROVEN=1
+  fi
 else
   section "8. GitHub Actions queue health"
   warn "scripts/queue-health.sh missing — queue metrics skipped"
@@ -773,6 +872,25 @@ else
   DEFAULT_CONFIGURED_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"
 fi
 CONFIGURED_COUNT="${CONFIGURED_COUNT:-$DEFAULT_CONFIGURED_COUNT}"
+# INTENTIONAL LOCAL OPT-OUT of this host's own fleet (bead jleechan-hxz0).
+# The remote opt-out alone left a real gap: a doctor run ON the parked Mac
+# still enumerated and probed its own four local slots, so the parked host
+# stayed "4 DOWN" and exited unhealthy even with the opt-out set. Whichever
+# leg the opt-out names must be zeroed, and that includes the leg this
+# script is running on. Set by the same declaration block that sets
+# REMOTE_DISABLED, so one env var parks one platform consistently no matter
+# which host runs the doctor. Declared, never inferred (see that block).
+LOCAL_OPTED_OUT=0
+if [ "$PLATFORM" = "macos" ]; then
+  [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && LOCAL_OPTED_OUT=1
+else
+  [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && LOCAL_OPTED_OUT=1
+fi
+if [ "$LOCAL_OPTED_OUT" -eq 1 ]; then
+  # This host is the parked one: expect zero slots, probe nothing, and let the
+  # verdict's denominator reflect the effective (empty) contract.
+  CONFIGURED_COUNT=0
+fi
 HOST_LABEL="$PLATFORM ($(hostname -s 2>/dev/null || hostname))"
 
 classify_local_slot() {
@@ -797,7 +915,12 @@ classify_local_slot() {
 DOWN_SLOTS=()
 IDLE_SLOTS=()
 EXECUTING_SLOTS=()
-for _i in $(seq 1 "$CONFIGURED_COUNT"); do
+# `seq 1 0` prints "1 0" (it counts DOWN), so a zero configured count would
+# fabricate two phantom slots named "-1" and "-0" -- exactly what a parked host
+# (CONFIGURED_COUNT=0, bead jleechan-hxz0) triggered: "DOWN (no container) --
+# 2 slot(s): ez-mac-runner-h-1 ez-mac-runner-h-0". Enumerate only when >0.
+for _i in $(seq 1 "$CONFIGURED_COUNT" 2>/dev/null); do
+  [ "$CONFIGURED_COUNT" -gt 0 ] || break
   _name="${RUNNER_NAME_PREFIX}-${_i}"
   case "$(classify_local_slot "$_name")" in
     DOWN)      DOWN_SLOTS+=("$_name") ;;
@@ -1011,8 +1134,10 @@ job_evidence_for_runner() {
 # unix:///Users/jleechan/.colima/default/docker.sock; every remote probe
 # queried the wrong daemon and reported 5/6 DOWN while 6 containers existed
 # on the daemon's socket. macOS: read EnvironmentVariables.DOCKER_HOST from
-# the launchd plist (the daemon's source of truth). Linux: the systemd unit
-# env or default socket. Empty result = bare `docker` (unchanged behavior).
+# the launchd plist (the daemon's source of truth). Linux: match
+# src/platform.rs by using only a nonblank DOCKER_HOST_OVERRIDE from the
+# systemd unit, then the native socket. DOCKER_HOST and DOCKER_CONTEXT are
+# interactive-client settings and are not the daemon's endpoint.
 REMOTE_DOCKER_HOST_CACHE=""
 REMOTE_DOCKER_HOST_CACHED_FOR=""
 remote_docker_env() {
@@ -1024,12 +1149,26 @@ remote_docker_env() {
   local dh
   dh=$(timeout 8 ssh -o ConnectTimeout=4 -o BatchMode=yes "$host" '
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
-      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null
+      plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
-      systemctl --user show-environment 2>/dev/null | sed -n "s/^DOCKER_HOST=//p" | head -1
-    fi' 2>/dev/null) || dh=""
+      unit_load_state=$(systemctl --user show ezgha.service -p LoadState --value 2>/dev/null) || exit 1
+      [ "$unit_load_state" = loaded ] || exit 1
+      service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
+      # Parse quoted systemctl assignments as data, never as shell code.
+      endpoint=$(printf "%s\n" "$service_env" | python3 -c "import shlex,sys; items=shlex.split(sys.stdin.read()); print(next((x.split(\"=\",1)[1] for x in items if x.startswith(\"DOCKER_HOST_OVERRIDE=\")),\"\"),end=\"\")") || exit 1
+      case "$endpoint" in
+        *[![:space:]]*) printf "%s" "$endpoint" ;;
+        *) printf "unix:///var/run/docker.sock" ;;
+      esac
+    else
+      exit 1
+    fi' 2>/dev/null) || {
+      REMOTE_DOCKER_HOST_CACHE=""
+      REMOTE_DOCKER_HOST_CACHED_FOR=""
+      return 1
+    }
   if [ -n "$dh" ]; then
-    REMOTE_DOCKER_HOST_CACHE="DOCKER_HOST='$dh' "
+    printf -v REMOTE_DOCKER_HOST_CACHE 'DOCKER_HOST=%q ' "$dh"
   else
     REMOTE_DOCKER_HOST_CACHE=""
   fi
@@ -1038,14 +1177,19 @@ remote_docker_env() {
 }
 
 probe_slot_state() {
-  # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1"
+  # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1".
+  # Return status 2 distinguishes an unresolved endpoint from a missing container.
   # (localhost = local docker, anything else = ssh against the remote
   # DAEMON's docker endpoint — see remote_docker_env).
   local host="$1" name="$2" running work denv
   if [ "$host" = "localhost" ]; then
     running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
   else
-    denv=$(remote_docker_env "$host")
+    if ! denv=$(remote_docker_env "$host"); then
+      bad "$host Docker endpoint unresolved — slot $name counted DOWN without a Docker probe" >&2
+      echo "DOWN"
+      return 2
+    fi
     running=$(ssh -o ConnectTimeout=4 "$host" "${denv}docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
   fi
   if [ "$running" != "true" ]; then
@@ -1081,28 +1225,38 @@ list_slot_work() {
   local prefix="$1" count="$2" host="${3:-localhost}" label="$4"
   printf "\n  %s (%d configured):\n" "$label" "$count"
   local -a slot_state=()
-  local i name jobline has_down=0 has_idle=0 idle_to_down=0
+  local i name jobline second_state third_state has_down=0 has_idle=0 idle_to_down=0
 
   if [ "$host" = "localhost" ] && [ -n "${LOCAL_SLOT_STATE_TABLE:-}" ] \
      && [ "$prefix" = "${RUNNER_NAME_PREFIX:-}" ] && [ "$count" = "${CONFIGURED_COUNT:-}" ]; then
-    for i in $(seq 1 "$count"); do
+    # `seq 1 0` prints "1 0" (counts DOWN), so a zero count would fabricate
+    # phantom slots "-1"/"-0". Enumerate only when there is something to
+    # enumerate (bead jleechan-hxz0: a parked host has count=0).
+    for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
       name="${prefix}-${i}"
       slot_state[i]=$(printf '%s\n' "$LOCAL_SLOT_STATE_TABLE" | awk -v n="$name" '$1==n{print $2; exit}')
       [ -z "${slot_state[i]:-}" ] && slot_state[i]="DOWN"
     done
   else
-    for i in $(seq 1 "$count"); do
-      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+    for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
+      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
       [ "${slot_state[i]}" = "DOWN" ] && has_down=1
       [ "${slot_state[i]}" = "IDLE" ] && has_idle=1
     done
     if [ "$has_down" -eq 1 ] || [ "$has_idle" -eq 1 ]; then
       info "$label: first-pass DOWN/IDLE candidate(s) — re-sampling once in ${SECTION10_DOWN_RESAMPLE_SECONDS}s to filter normal ephemeral recycling (bead ez-gh-actions-b895) and fresh-container job-pickup lag (bead ez-gh-actions-9m8z)"
       sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
-      for i in $(seq 1 "$count"); do
+      for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
         case "${slot_state[i]}" in
           DOWN)
-            case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+            if ! second_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
+              slot_state[i]="UNRESOLVED_DOWN"
+              continue
+            fi
+            case "$second_state" in
               DOWN) : ;;                            # persisted both docker samples — check journal next
               *)    slot_state[i]="CYCLING" ;;      # back Up — normal respawn, not a defect
             esac
@@ -1110,7 +1264,7 @@ list_slot_work() {
           IDLE)
             # Re-sampled state wins: EXECUTING clears, IDLE stays, absent
             # follows the DOWN path (journal cross-check below).
-            slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}")
+            slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
             if [ "${slot_state[i]}" = "DOWN" ]; then
               has_down=1; idle_to_down=1
               slot_state[i]="IDLE_DOWN"          # one absent sample so far
@@ -1123,9 +1277,14 @@ list_slot_work() {
       if [ "$idle_to_down" -eq 1 ]; then
         sleep "$SECTION10_DOWN_RESAMPLE_SECONDS"
       fi
-      for i in $(seq 1 "$count"); do
+      for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
         [ "${slot_state[i]}" != "IDLE_DOWN" ] && continue
-        case "$(probe_slot_state "$host" "${prefix}-${i}")" in
+        if ! third_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
+          slot_state[i]="UNRESOLVED_DOWN"
+          continue
+        fi
+        case "$third_state" in
           DOWN) slot_state[i]="DOWN" ;;
           *)    slot_state[i]="CYCLING" ;;
         esac
@@ -1149,7 +1308,8 @@ list_slot_work() {
         _log=""
         _respawn_fetch_failed=1
       fi
-      for i in $(seq 1 "$count"); do
+      for i in $(seq 1 "$count" 2>/dev/null); do
+      [ "$count" -gt 0 ] || break
         [ "${slot_state[i]}" != "DOWN" ] && continue
         name="${prefix}-${i}"
         if [ -n "$_log" ] && [ "$(printf '%s\n' "$_log" | journal_has_respawn_evidence "$name")" = "1" ]; then
@@ -1165,7 +1325,8 @@ list_slot_work() {
   LAST_DOWN_SLOTS=()
   local exec_n=0 idl=0 dn=0 cyc=0
   printf "    %-22s %-13s %s\n" "SLOT" "STATE" "EVIDENCE"
-  for i in $(seq 1 "$count"); do
+  for i in $(seq 1 "$count" 2>/dev/null); do
+    [ "$count" -gt 0 ] || break
     name="${prefix}-${i}"
     case "${slot_state[i]:-DOWN}" in
       EXECUTING)
@@ -1206,6 +1367,11 @@ list_slot_work() {
         _down_evidence="no container across both samples AND no respawn activity in daemon log for ${RESPAWN_EVIDENCE_WINDOW_MIN}m — critical"
         [ "${_respawn_fetch_failed:-0}" -eq 1 ] && _down_evidence="${_down_evidence} (respawn-log fetch failed)"
         printf "    %-22s %-13s %s\n" "$name" "DOWN" "$_down_evidence"
+        ;;
+      UNRESOLVED_DOWN)
+        dn=$((dn+1))
+        LAST_DOWN_SLOTS+=("$name")
+        printf "    %-22s %-13s %s\n" "$name" "DOWN" "remote Docker endpoint unresolved; no Docker probe issued"
         ;;
     esac
   done
@@ -1261,7 +1427,49 @@ REMOTE_DOWN_SLOTS=()
 REMOTE_UNREACHABLE=0
 REMOTE_CONFIG_UNPROVEN=0
 if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"; else DEFAULT_REMOTE_COUNT="$DEFAULT_MAC_RUNNER_COUNT"; fi
-if timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
+# INTENTIONAL REMOTE OPT-OUT (bead jleechan-hxz0). A deliberately parked
+# platform is a DECISION, not an outage, and the two must never render the
+# same way: an operator who turns the Mac fleet off would otherwise get
+# "4 slot(s) DOWN" plus 4 slot-proof criticals forever, so a genuinely
+# healthy 20/20 Linux fleet reads RED and nothing can tell a deliberate
+# suspension from a crashed host.
+#
+# The opt-out is an EXPLICIT declaration (env var), never inferred from live
+# state: a daemon that died on its own also reads as "not running", so
+# reading launchd/docker here would silently absorb real outages.
+#   MAC_RUNNER_DISABLED=1        (from a macOS doctor or a Linux doctor)
+#   REMOTE_LINUX_DISABLED=1      (from a macOS doctor, parking the Linux leg)
+# Set it only while a platform is intentionally parked, and say so in the
+# fleet-capacity record (AGENTS.md) together with what restores it.
+REMOTE_DISABLED=0
+if [ "$PLATFORM" = "macos" ]; then
+  [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ] && REMOTE_DISABLED=1
+else
+  [ "${MAC_RUNNER_DISABLED:-0}" = "1" ] && REMOTE_DISABLED=1
+fi
+if [ "$REMOTE_DISABLED" -eq 1 ]; then
+  # Do not consult the remote host at all: an opt-out asserts the platform
+  # SHOULD have zero slots, so there is nothing to inventory and nothing to
+  # prove. No DOWN entries, no criticals, and REMOTE_COUNT stays 0 so the
+  # verdict's denominator matches the effective contract.
+  REMOTE_COUNT=0
+  REMOTE_PREFIX="${REMOTE_PREFIX:-<disabled>}"
+  ok "$REMOTE_LABEL intentionally DISABLED (operator opt-out) — 0 slot(s) expected, excluded from the fleet contract; unset the opt-out to require proof"
+  # The suspension record pointer must appear for a REMOTE parked leg too, not
+  # just when this host is the parked one (found in review: a Linux doctor
+  # checking a parked Mac printed neither the pointer nor the missing-record
+  # warning, contradicting the "every parked run" promise in AGENTS.md).
+  REMOTE_SUSPENSION_RECORD="${EZGHA_SUSPENSION_RECORD-jleechan-hxz0}"
+  if [ -n "$REMOTE_SUSPENSION_RECORD" ] && [ "$REMOTE_SUSPENSION_RECORD" != "none" ]; then
+    info "suspension record: $REMOTE_SUSPENSION_RECORD — it MUST carry the start date and the restore condition (AGENTS.md); verify with: br show $REMOTE_SUSPENSION_RECORD"
+  else
+    warn "no suspension record declared for the parked $REMOTE_LABEL leg — AGENTS.md requires the start date, restore condition and prerequisites in the owning bead/roadmap note; set EZGHA_SUSPENSION_RECORD=<bead-id>"
+  fi
+  REMOTE_EXECUTING_SLOTS=()
+  REMOTE_IDLE_SLOTS=()
+  REMOTE_CYCLING_SLOTS=()
+  REMOTE_DOWN_SLOTS=()
+elif timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/dev/null 2>&1; then
   # Config lookup: one retry with a longer timeout. A failed read leaves the
   # value EMPTY (never a hardcoded guess) -> remote fleet marked UNPROVEN below.
   if [ "$PLATFORM" = "macos" ]; then
@@ -1345,6 +1553,7 @@ else
   SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + REMOTE_COUNT))
 fi
 export REMOTE_UNREACHABLE
+export REMOTE_DISABLED
 
 # Serve-loop-heartbeat signal: the largest gap between consecutive
 # "queue monitor:" journal lines (same-PID only — see compute_heartbeat_gap
@@ -1409,7 +1618,10 @@ elif [ "$PLATFORM" = "linux" ]; then
   if [ "${HEARTBEAT_SAMPLE_COUNT:-0}" -eq 0 ] && [ "$SERVICE_STATE" = "active" ]; then
     bad "serve-loop heartbeat: no queue-monitor samples in ${STARVE_WINDOW}m while service is active — loop silent or logging broken"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
-  elif [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
+  # A parked leg has no serve loop by definition, so an old gap in its log is
+  # not starvation. Requires LOCAL_DISABLED -ne 1 explicitly; an active host
+  # with the same gap still fails (both arms pinned by the regression test).
+  elif [ "${LOCAL_DISABLED:-0}" -ne 1 ] && [ "${MAX_HEARTBEAT_GAP:-0}" -gt "$STARVE_GAP_WARN_SECONDS" ]; then
     bad "serve-loop starvation: queue-monitor heartbeat gap ${MAX_HEARTBEAT_GAP}s exceeds ${STARVE_GAP_WARN_SECONDS}s (8x serve_tick_seconds=${SERVE_TICK_SECONDS}) within a single daemon PID — the serve loop has stalled, not restarted (see ez-gh-actions-wxfl, replacing the respawn-gap heuristic from ez-gh-actions-yrt/g3o; threshold raised 5x->8x in ez-gh-actions-5n0h after a 99s busy-tick gap nearly tripped the old 100s threshold)"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + 1))
   fi
@@ -1479,7 +1691,7 @@ CRITICAL=0
 # self-contained: it prints its own [BAD] with observed-vs-expected values
 # regardless of what upstream sections already printed, so the verdict can
 # never again name a count with no accompanying evidence.
-if [ "$SERVICE_STATE" != "active" ]; then
+if [ "$SERVICE_STATE" != "active" ] && [ "$LOCAL_DISABLED" -ne 1 ]; then
   bad "verdict: service-state gate FAILED (observed=$SERVICE_STATE, expected=active)"
   CRITICAL=$((CRITICAL+1))
 fi
@@ -1490,7 +1702,7 @@ fi
 # Healthy runners are online AND match the configured name prefix. (Was hardcoded
 # `ez-org-`; fixed to use $RUNNER_NAME_PREFIX so Mac's `ez-mac-runner-g-*` fleet
 # counts the same as Linux's `ez-org-runner-*` / `ez-runner-b-*`.)
-if ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1; then
+if [ "$LOCAL_DISABLED" -ne 1 ] && ! echo "$RAW" | jq -e --arg pfx "$RUNNER_NAME_PREFIX" '.runners[] | select(.name | startswith($pfx)) | select(.status=="online")' >/dev/null 2>&1; then
   bad "verdict: runners-online gate FAILED (no ONLINE runner with prefix '$RUNNER_NAME_PREFIX' found; total=$TOTAL online=$ONLINE offline=$OFFLINE busy=$BUSY)"
   CRITICAL=$((CRITICAL+1))
 fi
@@ -1547,6 +1759,10 @@ compute_live_slot_critical() {
   printf '%d %d\n' "$live_n" "$critical"
 }
 FLEET_CONFIGURED_COUNT=$((LOCAL_COUNT + REMOTE_COUNT))
+# Name the disabled leg in the verdict so a reader can tell "20/20 with the Mac
+# parked" from "20/24 with 4 broken" — those must never look identical.
+REMOTE_LEG_NOTE=""
+[ "${REMOTE_DISABLED:-0}" -eq 1 ] && REMOTE_LEG_NOTE=" (${REMOTE_LABEL} intentionally disabled)"
 read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
   compute_live_slot_critical \
     "${#EXECUTING_SLOTS[@]}" "${#IDLE_SLOTS[@]}" "${#CYCLING_SLOTS[@]}" \
@@ -1554,7 +1770,7 @@ read -r FLEET_LIVE_SLOTS LIVE_SLOT_CRITICAL < <(
     "$FLEET_CONFIGURED_COUNT"
 )
 if [ "${LIVE_SLOT_CRITICAL:-0}" -eq 1 ]; then
-  bad "verdict: live-slot gate FAILED (managed live slots = ${FLEET_LIVE_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote; executing=$(( ${#EXECUTING_SLOTS[@]} + ${#REMOTE_EXECUTING_SLOTS[@]} )), idle-ok=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
+  bad "verdict: live-slot gate FAILED (managed live slots = ${FLEET_LIVE_SLOTS}, expected ${FLEET_CONFIGURED_COUNT} across local+remote${REMOTE_LEG_NOTE}; executing=$(( ${#EXECUTING_SLOTS[@]} + ${#REMOTE_EXECUTING_SLOTS[@]} )), idle-ok=$(( ${#IDLE_SLOTS[@]} + ${#REMOTE_IDLE_SLOTS[@]} )), cycling=$(( ${#CYCLING_SLOTS[@]} + ${#REMOTE_CYCLING_SLOTS[@]} )), down=$(( ${#DOWN_SLOTS[@]} + ${#REMOTE_DOWN_SLOTS[@]} )))"
   CRITICAL=$((CRITICAL+1))
 fi
 # LOOP_FAILS is reported as WARN (not CRITICAL) when the fleet is otherwise
@@ -1575,7 +1791,7 @@ if [ "$LOOP_FAILS" -gt 3 ]; then
   fi
 fi
 # real-execution gate: at least one recent job must have succeeded on our fleet
-if [ "${REAL_ON_FLEET:-0}" -lt 1 ]; then
+if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$LOCAL_DISABLED" -ne 1 ]; then
   bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on our fleet)"
   CRITICAL=$((CRITICAL+1))
 fi
@@ -1590,6 +1806,11 @@ fi
 if [ "${QUEUE_TAIL_BAD:-0}" -eq 1 ]; then
   bad "verdict: queue-tail gate FAILED (QUEUE_TAIL_BAD=1 — oldest fresh queued job wait exceeded ${QUEUE_TAIL_WARN_MIN}m threshold; see section 8 above)"
   CRITICAL=$((CRITICAL+1))
+elif [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ]; then
+  # Not a defect and not a pass: the queue could not be measured (rate limit /
+  # API failure). Say UNPROVEN so nobody reads a quota wall as a healthy queue
+  # OR as a queue-tail defect (bead jleechan-hxz0, measured 2026-11-04).
+  warn "verdict: queue-tail gate UNPROVEN (metrics unavailable — GitHub API read failed; see section 8 above). Not counted as a queue-tail defect; re-run when quota recovers."
 fi
 # per-slot local execution proof gate (section 9): DOWN slots, IDLE-with-
 # backlog slots, and serve-loop starvation are the durable enforcement of
@@ -1676,6 +1897,25 @@ read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDI
     "${#REMOTE_EXECUTING_SLOTS[@]}" "${#REMOTE_IDLE_SLOTS[@]}" "${#REMOTE_DOWN_SLOTS[@]}" "${#REMOTE_CYCLING_SLOTS[@]}" \
     "${STARVED_PRESENT:-0}"
 )
+# An UNPROVEN input may never masquerade as a clean bill of health. Every gate
+# above passed, but if the queue could not be measured we cannot claim the fleet
+# is healthy -- say so and exit non-zero so callers/CI cannot read a quota wall
+# as a green fleet (codex P0 on PR #214; measured live at 0/5000 quota).
+if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ]; then
+  warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT queue/API evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, API_UNVERIFIED=${API_UNVERIFIED:-0}) — NOT a healthy verdict; re-run when GitHub API quota recovers"
+  info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
+  exit 3
+fi
+# A zero-slot contract can never be "healthy": with both legs opted out,
+# FLEET_CONFIGURED_COUNT is 0 and the live-slot gate reads `0 < 0` as false, so
+# the script would print "fleet healthy: 0/0" and exit 0 with ZERO capacity --
+# a two-env-var path from red to green. Zero expected slots is a configuration
+# statement, not a health result, and it must match the documented exit-3
+# contract in .claude/commands/doctor-ezactions.md.
+if [ "$VERDICT_CONFIGURED" -eq 0 ]; then
+  warn "fleet INCONCLUSIVE: every leg is opted out (0 slot(s) expected) — nothing was verified, so this is NOT a healthy verdict. Unset MAC_RUNNER_DISABLED / REMOTE_LINUX_DISABLED to require proof."
+  exit 3
+fi
 ok "fleet healthy: $VERDICT_TOTAL/$VERDICT_CONFIGURED healthy: $VERDICT_EXECUTING executing, $VERDICT_CYCLING cycling, $VERDICT_IDLE_OK idle-ok, $VERDICT_IDLE_STARVED idle-starved, $VERDICT_DOWN down"
 info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
 exit 0

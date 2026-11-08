@@ -24,6 +24,7 @@
 #   TRIM_DRAFTS=1
 #   TRIM_SUPERSEDED=1
 #   CANCEL_VERIFY_WAIT_S=10
+#   REPO_TIMEOUT_S=420   per-repo wall-clock cap (see "Bounded per-repo pass")
 set -euo pipefail
 
 PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin"
@@ -37,7 +38,7 @@ if [[ -z "${GH_TOKEN:-}" && -f "${HOME}/.config/ezgha/gh_token" ]]; then
   fi
 fi
 
-DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions"
+DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions jleechanorg/worldai_frontend"
 QUEUE_REPOS="${QUEUE_REPOS:-$DEFAULT_QUEUE_REPOS}"
 MIN_PR_AGE_HOURS="${MIN_PR_AGE_HOURS:-2}"
 TRIM_DRAFTS="${TRIM_DRAFTS:-1}"
@@ -102,15 +103,29 @@ fi
 
 export MIN_PR_AGE_HOURS TRIM_DRAFTS TRIM_SUPERSEDED CANCEL_VERIFY_WAIT_S DRY_RUN
 
-FAILED_REPOS=()
-REPO_COUNT=0
-
-for repo in $QUEUE_REPOS; do
-  [[ -z "$repo" ]] && continue
-  REPO_COUNT=$((REPO_COUNT + 1))
-  repo_rc=0
-
-  QUEUE_REPO="$repo" python3 -u <<'PY' 2>&1 | sed "s#^#[${repo}] #" || repo_rc=$?
+# ── Bounded per-repo pass (bead jleechan-queue-trimmer-heredoc-deadlock) ─────
+# The original shape was `python3 -u <<'PY' ... PY 2>&1 | sed ...`. A heredoc
+# writing into a pipeline deadlocks when the reader on the other end goes away:
+# measured 2026-11-07, this job sat 15h48m in heredoc_write() with 900/900
+# samples in `write()`, its python3 child already gone, while `sed` still held
+# the pipe's read end. `launchctl` reported `state = running, last exit 0` the
+# whole time, so nothing noticed.
+#
+# Two independent changes remove that failure mode:
+#   1. Write the python body to a file and exec it. There is no heredoc writer,
+#      so there is no heredoc_write() to block in. The pipe then belongs to
+#      python3 -> sed, which cannot deadlock on itself.
+#   2. Cap each repo's wall clock. A wedged repo is a FAILED repo (the loop
+#      already tolerates per-repo failure), never an unbounded hang.
+# Both are asserted by tests/trim_queued_runs_bounded_pass_test.sh.
+REPO_TIMEOUT_S="${REPO_TIMEOUT_S:-420}"
+# mktemp template: the X's MUST be last. BSD/macOS mktemp does not substitute a
+# template whose X's are followed by a suffix — it returns the literal path,
+# which made every concurrent tick share one file (caught by
+# tests/trim_queued_runs_test.sh). python does not need a .py suffix.
+PY_BODY="$(mktemp "${TMPDIR:-/tmp}/trim-queued-runs.XXXXXX")"
+trap 'rm -f "${PY_BODY:?}"' EXIT
+cat > "$PY_BODY" <<'PY'
 import datetime
 import json
 import os
@@ -231,26 +246,36 @@ branch_info = {}
 commit_dates = {}
 
 for b in branches:
-    if b in ("main", "master"):
-        continue
     remote_head = get_remote_head(b)
     pr_data = None
-    try:
-        prs = gh_json(["pr", "list", "--repo", repo, "--head", b, "--state", "open", "--json", "number,title,isDraft,updatedAt,headRefOid"])
-        if prs:
-            pr_data = prs[0]
-    except Exception:
-        pass
+    if b not in ("main", "master"):
+        try:
+            prs = gh_json(["pr", "list", "--repo", repo, "--head", b, "--state", "open", "--json", "number,title,isDraft,updatedAt,headRefOid"])
+            if prs:
+                pr_data = prs[0]
+        except Exception:
+            pass
     branch_info[b] = {
         "remote_head": remote_head,
         "pr": pr_data,
     }
 
+# Find newest queued ios-testflight run on main/master to avoid cancelling the current candidate
+newest_testflight_main_id = {}
+for r in eligible_runs:
+    if (r.get("path") == ".github/workflows/ios-testflight.yml" and
+            r.get("head_branch") in ("main", "master") and
+            r.get("event", "push") == "push"):
+        hb = r.get("head_branch")
+        cur_max = newest_testflight_main_id.get(hb, -1)
+        if r.get("id", 0) > cur_max:
+            newest_testflight_main_id[hb] = r.get("id", 0)
+
 candidates = []
 
 for r in eligible_runs:
     b = r.get("head_branch")
-    if not b or b in ("main", "master"):
+    if not b:
         continue
     info = branch_info.get(b)
     if not info:
@@ -259,6 +284,24 @@ for r in eligible_runs:
     run_sha = r.get("head_sha")
     remote_head = info["remote_head"]
     pr = info["pr"]
+
+    # Special case: iOS TestFlight runs on main/master
+    if r.get("path") == ".github/workflows/ios-testflight.yml" and b in ("main", "master"):
+        if trim_superseded and r.get("event", "push") == "push":
+            max_id = newest_testflight_main_id.get(b)
+            is_superseded_sha = bool(remote_head and run_sha and run_sha != remote_head)
+            is_superseded_queue = bool(max_id and r.get("id", 0) < max_id)
+            if is_superseded_sha or is_superseded_queue:
+                reasons = []
+                if is_superseded_sha:
+                    reasons.append(f"run_sha={run_sha[:8]} != remote_head={remote_head[:8]}")
+                if is_superseded_queue:
+                    reasons.append(f"newer_queued_id={max_id}")
+                candidates.append((r, f"superseded_main_build ({', '.join(reasons)})"))
+        continue
+
+    if b in ("main", "master"):
+        continue
 
     # Reason 1: Superseded commit on branch
     if trim_superseded and remote_head and run_sha and run_sha != remote_head:
@@ -335,13 +378,63 @@ if failed:
     sys.exit(1)
 PY
 
+FAILED_REPOS=()
+TIMED_OUT_REPOS=()
+REPO_COUNT=0
+
+for repo in $QUEUE_REPOS; do
+  [[ -z "$repo" ]] && continue
+  REPO_COUNT=$((REPO_COUNT + 1))
+  repo_rc=0
+
+  # `timeout` is GNU coreutils on Linux and gtimeout (brew coreutils) on macOS,
+  # where plain `timeout` may be absent. Fall back to an unbounded run only if
+  # neither exists, rather than silently disabling the cap.
+  #
+  # macOS ships bash 3.2, where expanding an EMPTY array as "${A[@]}" under
+  # `set -u` is an unbound-variable ERROR (fixed only in bash 4.4+). Using
+  # "${TIMEOUT_CMD[@]}" unconditionally therefore aborted EVERY repo pass on a
+  # host without `timeout`, while the loop still printed "N repo(s) scanned,
+  # 0 failed" and exited 0 -- a silent no-op reported as success. Measured on
+  # /bin/bash 3.2 with two repos: zero python executions, exit 0. The
+  # "${A[@]+"${A[@]}"}" form expands to nothing when unset/empty and to the
+  # elements otherwise, on bash 3.2 and 5.x alike, so the fallback actually runs
+  # unbounded instead of doing nothing. Asserted by
+  # tests/trim_queued_runs_bounded_pass_test.sh (no-timeout-binary arm).
+  TIMEOUT_CMD=()
+  TIMEOUT_BIN=""
+  for candidate in timeout gtimeout; do
+    # `command -v` alone is not enough: it reports a non-executable file on PATH
+    # as a command, so a mode-644 placeholder on PATH would be "found" and then
+    # fail at exec time. Require an actual executable resolved path.
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+      TIMEOUT_CMD=("$resolved" --kill-after=30s "$REPO_TIMEOUT_S")
+      TIMEOUT_BIN="$candidate"
+      break
+    fi
+  done
+  if [[ ${#TIMEOUT_CMD[@]} -eq 0 ]]; then
+    echo "[$repo] WARN: neither timeout nor gtimeout found; repo pass is unbounded" >&2
+  fi
+
+  QUEUE_REPO="$repo" ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} python3 -u "$PY_BODY" 2>&1 | sed "s#^#[${repo}] #" || repo_rc=$?
+
   if [[ "$repo_rc" -ne 0 ]]; then
-    echo "[$repo] trim pass FAILED (exit=$repo_rc) — continuing to next repo"
+    # 124/137 = timeout expired / killed after --kill-after. Name it explicitly:
+    # a bounded stall is a distinct defect from a failing pass, and the previous
+    # unbounded shape made it indistinguishable from "still working".
+    if [[ "$repo_rc" -eq 124 || "$repo_rc" -eq 137 ]]; then
+      echo "[$repo] trim pass TIMED OUT after ${REPO_TIMEOUT_S}s (exit=$repo_rc) — continuing to next repo"
+      TIMED_OUT_REPOS+=("$repo")
+    else
+      echo "[$repo] trim pass FAILED (exit=$repo_rc) — continuing to next repo"
+    fi
     FAILED_REPOS+=("$repo")
   fi
 done
 
-echo "=== overall: ${REPO_COUNT} repo(s) scanned, ${#FAILED_REPOS[@]} failed: ${FAILED_REPOS[*]:-none} ==="
+echo "=== overall: ${REPO_COUNT} repo(s) scanned, ${#FAILED_REPOS[@]} failed: ${FAILED_REPOS[*]:-none} (timed out: ${TIMED_OUT_REPOS[*]:-none}) ==="
 if [[ ${#FAILED_REPOS[@]} -gt 0 ]]; then
   exit 1
 fi

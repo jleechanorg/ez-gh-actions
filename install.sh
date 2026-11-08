@@ -87,7 +87,11 @@ uninstall() {
   # 2026-07-10, P1: recreated by an uninstall that doesn't tear these down
   # FIRST). Every removal below is best-effort (|| true) so a missing
   # unit/plist never aborts the uninstall.
-  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup"
+  # Every launchd agent this installer can create must be listed here: uninstall
+  # unloads each before removing ~/.local/libexec/ezgha, so an omitted name leaves
+  # a loaded hourly job pointing at a deleted script (the dead-path class this
+  # file already documents above).
+  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup ios-release-cleanup"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -181,6 +185,30 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# ── Self-outage guard (AGENTS.md: Self-Outage Prevention Principle) ───────────
+# This script stops and reinstalls ezgha.service partway through. Under `set -e`
+# any later failure used to exit with the fleet still stopped. Observed
+# 2026-10-29: an install run started from another host stopped ezgha.service at
+# 20:20:39 and the daemon stayed inactive for ~3 hours, draining all 20
+# ephemeral runners to zero — each runner exits after one job and only the
+# daemon respawns them, so a stopped daemon reads as a silently empty fleet.
+# Restore the pre-deploy runtime state whenever a non-uninstall run exits
+# non-zero. `--uninstall` exits from inside the loop above, before this point.
+EZGHA_SERVICE_WAS_ACTIVE=0
+if command -v systemctl >/dev/null 2>&1 \
+   && systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+  EZGHA_SERVICE_WAS_ACTIVE=1
+fi
+restore_service_after_failed_deploy() {
+  local rc=$?
+  if [ "${rc}" -ne 0 ] && [ "${EZGHA_SERVICE_WAS_ACTIVE:-0}" -eq 1 ] \
+     && ! systemctl --user is-active ezgha.service >/dev/null 2>&1; then
+    printf '  \033[33m⚠\033[0m deploy exited rc=%s with ezgha.service stopped; restoring pre-deploy runtime state\n' "${rc}" >&2
+    systemctl --user start ezgha.service 2>/dev/null || true
+  fi
+}
+trap restore_service_after_failed_deploy EXIT
 
 # ── Acquire deploy lock ───────────────────────────────────────────────────────
 CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/ezgha"
@@ -790,6 +818,21 @@ PLIST
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
+
+    # Reclaims stale per-run iOS TestFlight release scratch
+    # (`<scratch>/worldai-ios-release-<run>-<attempt>`) for another repository's
+    # workflow, which cleans only its signing key - measured 2026-10-30 at 24 dirs
+    # / 49 GB, leaving the Scratch volume (shared with runner.workspace_host_path)
+    # at 2.0 GiB free mid-build.
+    #
+    # Installed through launchd/install-launchagents.sh because the unit needs the
+    # host's Scratch root resolved at INSTALL time (see the SCRATCH_ROOT note there).
+    # Deliberately non-fatal and placed after the safety units above: this is a
+    # cross-repo cleanup job, and it must never abort a fresh-machine install or
+    # stop the Colima disk guard from being installed.
+    if ! bash "${SCRIPT_DIR}/launchd/install-launchagents.sh" install org.jleechanorg.ezgha-ios-release-cleanup; then
+      warn "iOS release-scratch reaper not installed (Scratch root unresolved?) — stale worldai-ios-release-* dirs on the Scratch volume will accumulate. OPERATOR-ONLY remediation: install that single launchd label through the repo's launchd template installer."
+    fi
     # ── Guest-native fstrim cadence — the actual root cause fix, not just the guard ──
     # colima-trim-guard.sh is a host-side EMERGENCY safety net (fires only when
     # host free space drops below 40GiB) and has twice proven unreliable (stale
@@ -881,6 +924,10 @@ FSTRIM_EOF
 
     "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" || {
       bad "refusing to install QEMU ceiling: live usage exceeds threshold or cgroup is unreadable"
+      exit 1
+    }
+    "${SCRIPTS_DIR}/qemu-ceiling-guard.sh" --unit agents.slice --threshold 12348030976 || {
+      bad "refusing to lower agents.slice MemoryMax: live usage exceeds 11776M or cgroup is unreadable"
       exit 1
     }
     for unit in app-lima-vm.slice agents.slice automation.slice; do
@@ -993,7 +1040,7 @@ EOF
     # Reapply the tracked budgets after copying the unit files. A prior
     # systemctl --user set-property writes user.control drop-ins that survive
     # unit replacement, so the tracked values must win during every install.
-    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=12G MemorySwapMax=2G TasksMax=8192)
+    AGENTS_SLICE_PROPS=(MemoryHigh=10G MemoryMax=11776M MemorySwapMax=2G TasksMax=8192)
     AUTOMATION_SLICE_PROPS=(MemoryHigh=4608M MemoryMax=5G MemorySwapMax=1G TasksMax=4096)
     if ! systemctl --user set-property agents.slice "${AGENTS_SLICE_PROPS[@]}"; then
       bad "could not apply selected agents.slice budget"

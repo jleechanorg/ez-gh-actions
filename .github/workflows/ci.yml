@@ -51,21 +51,32 @@ jobs:
       - name: Mac trim guard shell regressions
         run: |
           bash tests/colima_trim_guard_test.sh
+          bash tests/runner_offline_queued_alert_test.sh
+          bash tests/scratch_migration_installer_test.sh
+          bash tests/ezgha_host_health_alert_classification_test.sh
+          bash tests/ezgha_host_health_parked_optout_test.sh
           bash tests/install_colima_trim_agent_test.sh
+          bash tests/cleanup_ios_release_scratch_test.sh
+          bash tests/testflight_workflow_alert_test.sh
+          bash tests/testflight_workflow_alert_install_test.sh
       - name: Cleanup-stuck-runs regression tests
         run: |
           bash tests/cleanup_stuck_runs_force_cancel_test.sh
           bash tests/cleanup_stuck_runs_multirepo_test.sh
           bash tests/cleanup_stuck_runs_race_skip_test.sh
           bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
+          bash tests/cleanup_stuck_runs_unschedulable_test.sh
       - name: Exit criteria CPU burst regressions
         run: |
+          bash tests/verify_exit_gate2_docker_mode_test.sh
           bash tests/verify_exit_gate3_cpu_burst_test.sh
           bash tests/verify_exit_gate3_burst_preflight_test.sh
           bash tests/verify_exit_toml_parser_integration_test.sh
       - name: Doctor-runner regression tests
         run: |
           bash tests/doctor_runner_expected_containers_test.sh
+          bash tests/doctor_runner_heartbeat_parked_exempt_test.sh
+          bash tests/doctor_runner_suspension_record_test.sh
           bash tests/doctor_runner_heartbeat_starvation_test.sh
           bash tests/doctor_runner_host_pressure_test.sh
           bash tests/doctor_runner_host_lifecycle_test.sh
@@ -74,6 +85,8 @@ jobs:
           bash tests/doctor_runner_respawn_fetch_failure_test.sh
           bash tests/doctor_runner_respawn_journal_test.sh
           bash tests/doctor_runner_remote_config_and_queue_test.sh
+          bash tests/doctor_runner_remote_optout_test.sh
+          bash tests/doctor_runner_service_docker_endpoint_test.sh
           bash tests/doctor_runner_unreachable_remote_test.sh
           bash tests/doctor_runner_verdict_line_test.sh
       - name: Slot-drift reclaim correlation regression test (bead jleechan-tv58)
