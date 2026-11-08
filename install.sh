@@ -1097,7 +1097,7 @@ fi
 if [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/docs/verify-exit-criteria.sh" ]; then
   info "Running post-deployment exit criteria checks"
   if ! "${SCRIPT_DIR}/docs/verify-exit-criteria.sh"; then
-    bad "Post-deployment exit criteria checks failed! Please review doctor.sh and logs."
+    bad "Post-deployment exit criteria checks failed! Please review doctor-runner and logs."
     exit 1
   fi
   ok "Post-deployment checks passed"

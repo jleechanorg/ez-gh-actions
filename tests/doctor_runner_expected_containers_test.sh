@@ -38,10 +38,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCTOR_SCRIPT="$REPO_ROOT/doctor-runner"
-# doctor.sh is a deprecation stub now; its former source is preserved verbatim as a
-# fixture, so the legacy-contract assertion below still tests the real baseline rather
-# than a stub that no longer contains any checks.
-LEGACY_DOCTOR_SCRIPT="$REPO_ROOT/tests/fixtures/doctor_sh_baseline.sh"
 
 TEMP_HOME=$(mktemp -d)
 cleanup() { rm -rf "$TEMP_HOME"; }
@@ -82,10 +78,10 @@ grep -Eq 'REMOTE_COUNT=.*DEFAULT_LINUX_RUNNER_COUNT' "$DOCTOR_SCRIPT" || {
   echo "FAIL: remote Linux fallback count is not the current 20-runner contract" >&2
   exit 1
 }
-grep -Fq 'CONFIGURED_COUNT="${CONFIGURED_COUNT:-20}"' "$LEGACY_DOCTOR_SCRIPT" || {
-  echo "FAIL: legacy doctor fallback count is not the current 20-runner contract" >&2
-  exit 1
-}
+# The legacy doctor.sh contract assertion was removed here. doctor.sh is now a
+# deprecation stub, and re-pointing the check at the frozen baseline fixture would be
+# tautological: a byte-identical snapshot can never fail again, so it would assert
+# nothing. The live contract is covered by the doctor-runner assertions above.
 
 # Fixture: slot_assignments.toml with BOTH [assignments] and [registered_at]
 # sections, 16 entries each — the exact shape that broke the old grep -c '='.

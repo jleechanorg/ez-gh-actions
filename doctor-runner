@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# doctor.sh — ez-gh-actions fleet health check. Read-only.
+# doctor-runner — ez-gh-actions fleet health check. Read-only.
 # Outputs a one-shot human-readable report. Aggregate machine-readable status
 # is owned by scripts/runner_dashboard_host_probe.sh; --json now fails early
 # instead of falsely wrapping this detailed cross-host report as JSON.
@@ -19,7 +19,7 @@ for a in "$@"; do
     --detail|-v|--verbose) DETAIL=1 ;;
     --prove) PROVE=1 ;;   # dispatch a live canary job and verify it runs on our fleet
     -h|--help)
-      echo "usage: doctor.sh [--prove] [--detail]"
+      echo "usage: doctor-runner [--prove] [--detail]"
       echo "  --prove   dispatch a live ezgha-selftest and verify it runs on the configured runner prefix (adds ~1-2 min)"
       echo "  --detail  verbose output"
       echo "env: LOOP_WINDOW (min, default 3), ROUTING_N (runs, default 6), ORG, EZGHA_REPO"
@@ -1666,7 +1666,7 @@ emit_failure_remediation() {
   elif command -v limactl >/dev/null 2>&1; then
     echo "  3. Start lima if down:       limactl start <name>"
   fi
-  echo "  4. Re-run ./doctor.sh --detail after each step"
+  echo "  4. Re-run ./doctor-runner --detail after each step"
 }
 # END host-aware failure remediation
 
