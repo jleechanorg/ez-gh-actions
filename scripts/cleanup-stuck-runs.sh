@@ -36,9 +36,11 @@
 #   QUEUE_REPOS="owner/repo1 owner/repo2 ..."  # space-separated; default: see DEFAULT_QUEUE_REPOS below
 #   QUEUE_REPO="owner/repo"                    # single-repo back-compat override (ignored if QUEUE_REPOS set)
 #   CANCEL_VERIFY_WAIT_S=20                    # seconds to wait before force-cancel verify (0 to skip wait, e.g. tests)
+#   DO_UNSCHEDULABLE=1                         # report queued runs whose labels no online runner carries (default 1)
+#   UNSCHED_MIN_AGE_MIN=15                     # only report unschedulable runs queued at least this long
 set -euo pipefail
 
-DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ai_universe jleechanorg/worldai_claw jleechanorg/mctrl_test jleechanorg/jleechanclaw jleechanorg/ai_universe_living_blog jleechanorg/agent-orchestrator jleechanorg/dark-factory jleechanorg/ez-gh-actions"
+DEFAULT_QUEUE_REPOS="jleechanorg/worldarchitect.ai jleechanorg/ai_universe jleechanorg/worldai_claw jleechanorg/mctrl_test jleechanorg/jleechanclaw jleechanorg/ai_universe_living_blog jleechanorg/agent-orchestrator jleechanorg/dark-factory jleechanorg/ez-gh-actions jleechanorg/user_scope"
 QUEUE_REPOS="${QUEUE_REPOS:-${QUEUE_REPO:-$DEFAULT_QUEUE_REPOS}}"
 STALE_HOURS="${STALE_HOURS:-8}"
 FRESH_TAIL_MIN="${FRESH_TAIL_MIN:-45}"
@@ -95,6 +97,8 @@ dry = os.environ.get("DRY_RUN") == "1"
 do_zombies = os.environ.get("DO_ZOMBIES") == "1"
 do_superseded = os.environ.get("DO_SUPERSEDED") == "1"
 do_tail = os.environ.get("DO_TAIL") == "1"
+do_unschedulable = os.environ.get("DO_UNSCHEDULABLE", "1") == "1"
+unsched_min = float(os.environ.get("UNSCHED_MIN_AGE_MIN", "15"))
 verify_wait_s = float(os.environ.get("CANCEL_VERIFY_WAIT_S", "20"))
 
 # Rate-limit resilience (bead jleechan-me9): GitHub applies a SECONDARY
@@ -211,6 +215,175 @@ print(
 )
 print("safety: only status=queued runs are candidates; in_progress runs are ignored")
 print(f"safety: deploy workflows excluded from all cancel levers; protected_deploy_queued={protected_deploy_count}")
+
+# ── UNSCHEDULABLE detection (bead jleechan-user-scope-arm64-dead-label) ─────
+# A queued job whose required label SET no live runner advertises can never be
+# picked up, so every age-based lever above is blind to it: it is neither a
+# zombie (>STALE_HOURS artifacts only) nor superseded (no newer run on the
+# branch) nor a "tail" (the tail lever is opt-in and keyed on age). Measured
+# 2026-11-07: jleechanorg/user_scope held 8 such jobs for 18.6h, all requiring
+# [self-hosted, self-hosted-mikey, self-hosted-macos] when zero runners carried
+# that label, and the queue reaper reported a clean "queued_total=0" scan for
+# that repo because it was not even in DEFAULT_QUEUE_REPOS.
+#
+# Reporting only: this lever NEVER cancels. Cancelling an unschedulable run is a
+# judgement call (the workflow may be mid-fix), so the signal is "here is a job
+# that cannot ever start", which is what a human or an alert needs to know.
+ORG = os.environ.get("ORG") or repo.split("/", 1)[0]
+UNSCHED_LABEL_CACHE = {}
+
+def fleet_label_pool(org):
+    """Label (lowercased) -> count of ONLINE org runners advertising it.
+
+    Follows every page: the endpoint paginates at 100 and a matching runner on
+    page 2 would otherwise produce a false UNSCHEDULABLE verdict. Label names
+    are compared case-insensitively because that is how GitHub routes work;
+    original spelling is preserved by callers for output.
+    """
+    if org in UNSCHED_LABEL_CACHE:
+        return UNSCHED_LABEL_CACHE[org]
+    pool = {}
+    page = 1
+    try:
+        while page <= 20:
+            raw = subprocess.check_output(
+                ["gh", "api", f"orgs/{org}/actions/runners?per_page=100&page={page}"],
+                stderr=subprocess.STDOUT,
+            )
+            batch = json.loads(raw).get("runners", [])
+            for r in batch:
+                if r.get("status") != "online":
+                    continue
+                for lbl in r.get("labels", []):
+                    name = lbl.get("name")
+                    if name:
+                        key = name.lower()
+                        pool[key] = pool.get(key, 0) + 1
+            if len(batch) < 100:
+                break
+            page += 1
+    except subprocess.CalledProcessError as e:
+        # This probe is an OPTIONAL extra signal, so it must never break a reaper
+        # tick. A rate limit, a 403, a missing scope or any other API error just
+        # means "label pool UNKNOWN this tick", which the caller already treats as
+        # "not asserted" rather than a verdict. (Regression: raising here broke
+        # tests whose gh stub rejects unknown invocations, and would have broken
+        # the reaper the same way in production.)
+        reason = "rate-limited" if is_rate_limited(e) else "API error"
+        print(f"unschedulable probe: runner list {reason} for org {org} — label pool UNKNOWN this tick")
+        # A PARTIAL census is not a census: returning the pages collected so far
+        # let the caller treat incomplete data as complete and emit definitive
+        # UNSCHEDULABLE verdicts from it (found in review: page 1 populated,
+        # page 2 HTTP 403, still produced UNSCHEDULABLE ... 0 unverified).
+        # Discard everything and report UNKNOWN.
+        pool = {}
+    except (ValueError, KeyError) as e:
+        print(f"unschedulable probe: runner list unparseable for org {org} ({e}) — label pool UNKNOWN this tick")
+        pool = {}
+    else:
+        if page > 20:
+            # Pagination cap reached with every page full: completeness is
+            # unproven, so this is UNKNOWN too, not a full census.
+            print(f"unschedulable probe: runner list exceeded the {20}-page cap for org {org} — label pool UNKNOWN this tick")
+            pool = {}
+    UNSCHED_LABEL_CACHE[org] = pool
+    return pool
+
+# Sentinel distinguishing "lookup failed" from "no queued jobs": a failed read
+# must never be reported as a definitive zero. Returning None for both made an
+# API 403 produce "unschedulable: 0 ... (0 failed)" -- the exact silent-clean
+# diagnostic this lever exists to remove (found in review).
+LOOKUP_FAILED = object()
+
+def job_labels(rid):
+    """Queued label sets for a run, or LOOKUP_FAILED if the read did not succeed."""
+    collected = []
+    page = 1
+    try:
+        while page <= 20:
+            raw = subprocess.check_output(
+                ["gh", "api",
+                 f"repos/{repo}/actions/runs/{rid}/jobs?per_page=100&page={page}"],
+                stderr=subprocess.STDOUT,
+            )
+            batch = json.loads(raw).get("jobs", [])
+            for j in batch:
+                if j.get("status") == "queued":
+                    collected.append(j.get("labels") or [])
+            if len(batch) < 100:
+                break
+            page += 1
+        else:
+            # Cap reached with every page full: completeness is unproven, so this
+            # must NOT read as "no unschedulable jobs found" (P1 from review).
+            return LOOKUP_FAILED
+    except (subprocess.CalledProcessError, ValueError):
+        return LOOKUP_FAILED
+    return collected
+
+# GitHub-HOSTED runner families. These are provided by GitHub, not by the org's
+# self-hosted fleet, so their absence from the self-hosted census proves nothing
+# about schedulability. Reporting them as UNSCHEDULABLE produced a false verdict
+# on this repository's own `ubuntu-latest` CI (P0 from review). A job is only
+# diagnosable from the census when EVERY label it requires is self-hosted; if it
+# names a hosted family, the census cannot answer for it.
+HOSTED_RUNNER_PREFIXES = (
+    "ubuntu-", "windows-", "macos-", "ubuntu-latest", "windows-latest",
+    "macos-latest", "macos-latest-large", "ubuntu-slim",
+)
+
+def targets_hosted_runners(labels):
+    for lbl in labels:
+        low = (lbl or "").lower()
+        if low in HOSTED_RUNNER_PREFIXES or low.startswith(("ubuntu-", "windows-", "macos-")):
+            return True
+    return False
+
+if runs and do_unschedulable:
+    pool = fleet_label_pool(ORG)
+    if pool:
+        unschedulable = []
+        unknown = []
+        aged = [((now - created_at(x)).total_seconds() / 60, x) for x in runs]
+        aged.sort(key=lambda pair: pair[0], reverse=True)
+        for age_m, r in aged:
+            if age_m < unsched_min:
+                continue
+            labelsets = job_labels(r["id"])
+            if labelsets is LOOKUP_FAILED:
+                # Unknown is NOT zero: name it so a partial scan cannot read clean.
+                unknown.append((age_m, r))
+                continue
+            for labels in labelsets:
+                if not labels:
+                    continue
+                if targets_hosted_runners(labels):
+                    # Hosted-pool job: the self-hosted census cannot judge it.
+                    continue
+                missing = [lbl for lbl in labels if pool.get(lbl.lower(), 0) == 0]
+                if missing:
+                    unschedulable.append((age_m, r, labels, missing))
+                    break
+        for age_m, r, labels, missing in unschedulable[:20]:
+            print(
+                f"UNSCHEDULABLE {r['id']} ({workflow_name(r)}) branch '{branch(r)}' "
+                f"queued {age_m:.0f}m: requires {labels} but no ONLINE org runner advertises "
+                f"{missing} — {run_url(r)}"
+            )
+        for age_m, r in unknown[:20]:
+            print(
+                f"UNSCHEDULABLE-UNKNOWN {r['id']} ({workflow_name(r)}) branch '{branch(r)}' "
+                f"queued {age_m:.0f}m: job lookup FAILED — schedulability NOT verified "
+                f"— {run_url(r)}"
+            )
+        qualifier = " (INCOMPLETE: job lookups failed — see UNSCHEDULABLE-UNKNOWN)" if unknown else ""
+        print(
+            f"unschedulable: {len(unschedulable)} queued run(s) require a label no online "
+            f"runner advertises; {len(unknown)} unverified due to lookup failure{qualifier} "
+            f"(report-only; never cancelled)"
+        )
+    else:
+        print("unschedulable: label pool unavailable this tick — NOT asserted")
 
 def run_status(rid):
     out = subprocess.check_output([

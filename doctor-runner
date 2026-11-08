@@ -285,6 +285,18 @@ count_assignments_section() {
 if [ "$LOCAL_DISABLED" -eq 1 ]; then
   section "1-6. host lifecycle (parked host)"
   ok "$PLATFORM host intentionally DISABLED (operator opt-out) — 0 slot(s) expected, no service/daemon/colima/registrations required, and nothing contributed to the fleet contract; unset the opt-out to require proof"
+  # AGENTS.md requires every suspension to carry a start date and a restore
+  # condition so the opt-out cannot quietly become a permanent capacity
+  # reduction. Nothing surfaced a MISSING record before this: the Mac leg sat
+  # parked from 2026-10-29 with no written owner record anywhere, found by the
+  # 2026-11-07 audit. A suspension declaration is expected to name where the
+  # record lives; print it so a reviewer sees the pointer (or its absence).
+  SUSPENSION_RECORD="${EZGHA_SUSPENSION_RECORD-jleechan-hxz0}"
+  if [ -n "$SUSPENSION_RECORD" ] && [ "$SUSPENSION_RECORD" != "none" ]; then
+    info "suspension record: $SUSPENSION_RECORD — it MUST carry the start date and the restore condition (AGENTS.md); verify with: br show $SUSPENSION_RECORD"
+  else
+    warn "no suspension record declared — AGENTS.md requires the start date, restore condition and prerequisites in the owning bead/roadmap note; set EZGHA_SUSPENSION_RECORD=<bead-id> when declaring a parked leg"
+  fi
 else
 section "1. ezgha service"
 SERVICE_STATE=$(probe_service_state)
@@ -1443,6 +1455,16 @@ if [ "$REMOTE_DISABLED" -eq 1 ]; then
   REMOTE_COUNT=0
   REMOTE_PREFIX="${REMOTE_PREFIX:-<disabled>}"
   ok "$REMOTE_LABEL intentionally DISABLED (operator opt-out) — 0 slot(s) expected, excluded from the fleet contract; unset the opt-out to require proof"
+  # The suspension record pointer must appear for a REMOTE parked leg too, not
+  # just when this host is the parked one (found in review: a Linux doctor
+  # checking a parked Mac printed neither the pointer nor the missing-record
+  # warning, contradicting the "every parked run" promise in AGENTS.md).
+  REMOTE_SUSPENSION_RECORD="${EZGHA_SUSPENSION_RECORD-jleechan-hxz0}"
+  if [ -n "$REMOTE_SUSPENSION_RECORD" ] && [ "$REMOTE_SUSPENSION_RECORD" != "none" ]; then
+    info "suspension record: $REMOTE_SUSPENSION_RECORD — it MUST carry the start date and the restore condition (AGENTS.md); verify with: br show $REMOTE_SUSPENSION_RECORD"
+  else
+    warn "no suspension record declared for the parked $REMOTE_LABEL leg — AGENTS.md requires the start date, restore condition and prerequisites in the owning bead/roadmap note; set EZGHA_SUSPENSION_RECORD=<bead-id>"
+  fi
   REMOTE_EXECUTING_SLOTS=()
   REMOTE_IDLE_SLOTS=()
   REMOTE_CYCLING_SLOTS=()
