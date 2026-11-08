@@ -708,6 +708,28 @@ _early_remote_cfg_get() {  # $1 = grep pattern
 # 10 skip its authoritative lookup, which changed contract/underprovisioned
 # behaviour tested elsewhere. So the early value lives in its own variable and
 # REMOTE_PREFIX is left exactly as this script found it.
+
+# Known runner-name FAMILIES per platform, used to exclude a parked leg even when
+# its configured prefix has drifted, could not be read, or predates a rename.
+# This file already documents the historical Linux spellings (`ez-org-runner`,
+# `ez-runner-b` from PR #8143) and the Mac family (`ez-mac-runner`), so the
+# family must cover them -- matching only the current prefix let a historical
+# `ez-runner-b-7` satisfy proof for a parked Linux leg, and a historical
+# `ez-mac-runner-g-4` slip past the canary (two review P0s).
+# Shaped as a case pattern so both proof paths share ONE definition.
+_parked_family_match() {  # $1 = runner name, $2 = family ("local"|"remote")
+  local _rn="$1" _which="$2" _fam
+  if [ "$_which" = "local" ]; then
+    if [ "$PLATFORM" = "macos" ]; then _fam="mac"; else _fam="linux"; fi
+  else
+    if [ "$PLATFORM" = "macos" ]; then _fam="linux"; else _fam="mac"; fi
+  fi
+  case "$_fam" in
+    mac)   case "$_rn" in ez-mac-runner*) return 0 ;; esac ;;
+    linux) case "$_rn" in ez-runner-c*|ez-runner-b*|ez-org-runner*) return 0 ;; esac ;;
+  esac
+  return 1
+}
 EARLY_REMOTE_PREFIX="${REMOTE_PREFIX:-${EXPLICIT_REMOTE_PREFIX:-}}"
 if [ -z "$EARLY_REMOTE_PREFIX" ]; then EARLY_REMOTE_PREFIX="$(_early_remote_cfg_get '^name_prefix')"; fi
 if [ -z "$EARLY_REMOTE_PREFIX" ]; then
@@ -767,16 +789,9 @@ while read -r rid; do
   # its family is excluded wholesale -- which covers historical and custom
   # spellings the config no longer names.
   if [ "$_is_fleet" -eq 0 ] && [[ "$rn" == "ez-"* ]]; then
-    # This host's own families: macOS -> ez-mac-runner-*, Linux -> ez-runner-c-*.
-    # The OTHER family is the remote leg's.
-    if [ "$PLATFORM" = "macos" ]; then
-      _local_fam="ez-mac-runner"; _remote_fam="ez-runner-c"
-    else
-      _local_fam="ez-runner-c";   _remote_fam="ez-mac-runner"
-    fi
     _fam_parked=0
-    if [ "$PARKED_LOCAL" -eq 1 ] && [[ "$rn" == "${_local_fam}"* ]]; then _fam_parked=1; fi
-    if [ "$PARKED_REMOTE" -eq 1 ] && [[ "$rn" == "${_remote_fam}"* ]]; then _fam_parked=1; fi
+    if [ "$PARKED_LOCAL" -eq 1 ] && _parked_family_match "$rn" local; then _fam_parked=1; fi
+    if [ "$PARKED_REMOTE" -eq 1 ] && _parked_family_match "$rn" remote; then _fam_parked=1; fi
     if [ "$_fam_parked" -eq 0 ]; then _is_fleet=1; fi
   fi
   _parked_leg=0
@@ -843,6 +858,12 @@ if [ "$PROVE" = "1" ]; then
     # Same widening as section 7: the default spelling of a parked leg is excluded
     # even when the configured prefix has drifted or could not be read.
     if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${DEFAULT_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${DEFAULT_REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
+    # Same FAMILY rule as section 7 so both proof paths agree: a parked leg is
+    # excluded by family, covering historical/custom spellings the prefix match
+    # cannot see (review P0: the canary accepted ez-mac-runner-g-4 here while
+    # section 7 correctly rejected it).
+    if [ "$PARKED_LOCAL" -eq 1 ] && _parked_family_match "$rn" local; then _cn_parked=1; fi
+    if [ "$PARKED_REMOTE" -eq 1 ] && _parked_family_match "$rn" remote; then _cn_parked=1; fi
     if [ "$_cn_parked" -eq 1 ]; then
       bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
     elif { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then

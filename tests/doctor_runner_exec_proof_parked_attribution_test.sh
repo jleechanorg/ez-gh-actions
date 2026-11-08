@@ -77,6 +77,10 @@ classify() { # rn conc parked_local parked_remote local_prefix remote_prefix
     echo "PARKED_LOCAL=$pl; PARKED_REMOTE=$pr"
     echo "RUNNER_NAME_PREFIX=$(printf '%q' "$lp"); REMOTE_PREFIX=$(printf '%q' "$rp")"
     echo '_LP="${RUNNER_NAME_PREFIX:-}"; _RP="${REMOTE_PREFIX:-}"'
+    # The classifier calls the shared family helper; emit the REAL one into the
+    # harness. It must be part of this generated stream (not appended after the
+    # redirect), otherwise the `{ ... } > file` truncates it away.
+    awk '/^_parked_family_match\(\)/,/^}/' "$D"
     echo 'REAL_ON_FLEET=0'
     echo 'ok()   { echo "OK:$*"; }'
     echo 'warn() { echo "WARN:$*"; }'
@@ -186,5 +190,32 @@ grep -q 'EARLY_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
 grep -q 'DEFAULT_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
   || fail "the canary must also exclude the default spelling"
 pass "the canary consults the early-resolved and default prefixes"
+
+# 13. Historical Linux prefix (ez-runner-b / ez-org-runner) must be treated as
+#     the Linux family, so a parked Linux leg cannot prove the enabled Mac fleet.
+OUT13="$(CLASSIFY_PLATFORM=macos DEFAULT_REMOTE_PREFIX=ez-runner-c classify ez-runner-b-7 success 0 1 ez-mac-runner-h ez-runner-c)"
+grep -q 'COUNT=0' <<<"$OUT13" \
+  || { sed -n '1,12p' <<<"$OUT13" >&2; fail "historical ez-runner-b must not prove the enabled Mac fleet while Linux is parked"; }
+pass "historical ez-runner-b is excluded from a parked Linux leg"
+
+OUT13b="$(CLASSIFY_PLATFORM=macos DEFAULT_REMOTE_PREFIX=ez-runner-c classify ez-org-runner-3 success 0 1 ez-mac-runner-h ez-runner-c)"
+grep -q 'COUNT=0' <<<"$OUT13b" \
+  || fail "legacy ez-org-runner must not prove the enabled Mac fleet while Linux is parked"
+pass "legacy ez-org-runner is excluded from a parked Linux leg"
+
+# 14. Enabled-mac control: a Mac-leg success still counts on a mac doctor with
+#     Linux parked (no over-block from the family rule).
+OUT14="$(CLASSIFY_PLATFORM=macos DEFAULT_REMOTE_PREFIX=ez-runner-c classify ez-mac-runner-h-2 success 0 1 ez-mac-runner-h ez-runner-c)"
+grep -q 'COUNT=1' <<<"$OUT14" \
+  || { sed -n '1,12p' <<<"$OUT14" >&2; fail "the enabled Mac leg's own success must still count"; }
+pass "enabled Mac leg success still counts"
+
+# 15. Both proof paths must use the SAME family helper (review P0: the canary
+#     accepted ez-mac-runner-g-4 while section 7 rejected it).
+SEC7_FAM=$(awk '/^  _is_fleet=0$/{f=1} f{print} f&&/^  fi$/{exit}' "$D" | grep -c '_parked_family_match')
+CANARY_FAM=$(awk '/_cn_parked=0/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D" | grep -c '_parked_family_match')
+[ "$SEC7_FAM" -ge 1 ] || fail "section 7 must use the shared family rule"
+[ "$CANARY_FAM" -ge 1 ] || fail "the canary must use the SAME shared family rule as section 7"
+pass "both proof paths share the family rule"
 
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
