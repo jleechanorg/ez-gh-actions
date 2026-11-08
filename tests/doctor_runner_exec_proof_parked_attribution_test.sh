@@ -82,7 +82,7 @@ classify() { # rn conc parked_local parked_remote local_prefix remote_prefix
     # The classifier calls the shared family helper; emit the REAL one into the
     # harness. It must be part of this generated stream (not appended after the
     # redirect), otherwise the `{ ... } > file` truncates it away.
-    awk '/^_parked_family_match\(\)/,/^}/' "$D"
+    awk '/^_runner_matches_prefix\(\)/,/^}/' "$D"
     echo 'REAL_ON_FLEET=0'
     echo 'ok()   { echo "OK:$*"; }'
     echo 'warn() { echo "WARN:$*"; }'
@@ -185,12 +185,12 @@ pass "mac-host orientation excludes the parked Linux family"
 #     leg slipped through and set CANARY_OK=1).
 # Anchor on the assignment, not a comment: the section-7 comment shares its
 # opening words, so a comment-anchored range ended before the real block.
-CANARY_BLOCK="$(awk '/_cn_parked=0/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D")"
+CANARY_BLOCK="$(awk '/Same EXACT attribution as section 7/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D")"
 [ -n "$CANARY_BLOCK" ] || fail "could not extract the canary exclusion block"
 grep -q 'EARLY_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
   || fail "the canary must consult EARLY_REMOTE_PREFIX, not only REMOTE_PREFIX"
-grep -q 'DEFAULT_REMOTE_PREFIX' <<<"$CANARY_BLOCK" \
-  || fail "the canary must also exclude the default spelling"
+grep -q '_runner_matches_prefix' <<<"$CANARY_BLOCK" \
+  || fail "the canary must use the exact prefix rule"
 pass "the canary consults the early-resolved and default prefixes"
 
 # 13. Historical Linux prefix (ez-runner-b / ez-org-runner) must be treated as
@@ -214,10 +214,10 @@ pass "enabled Mac leg success still counts"
 
 # 15. Both proof paths must use the SAME family helper (review P0: the canary
 #     accepted ez-mac-runner-g-4 while section 7 rejected it).
-SEC7_FAM=$(awk '/^  _is_fleet=0$/{f=1} f{print} f&&/^  fi$/{exit}' "$D" | grep -c '_parked_family_match')
-CANARY_FAM=$(awk '/_cn_parked=0/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D" | grep -c '_parked_family_match')
+SEC7_FAM=$(awk '/# ATTRIBUTION/{f=1} f{print} f&&/^  fi$/{exit}' "$D" | grep -c '_runner_matches_prefix')
+CANARY_FAM=$(awk '/Same EXACT attribution/{f=1} f{print} f&&/cannot prove the enabled fleet/{exit}' "$D" | grep -c '_runner_matches_prefix')
 [ "$SEC7_FAM" -ge 1 ] || fail "section 7 must use the shared family rule"
-[ "$CANARY_FAM" -ge 1 ] || fail "the canary must use the SAME shared family rule as section 7"
+[ "$CANARY_FAM" -ge 1 ] || fail "the canary must use the SAME exact rule as section 7"
 pass "both proof paths share the family rule"
 
 # 16. REVIEW P0: unreadable config + a CUSTOM parked prefix (ez-custom-mac).
@@ -249,5 +249,37 @@ if grep -q 'REAL_ON_FLEET:-0}" -lt 1 \] && \[ "$LOCAL_DISABLED" -ne 1 \]' <<<"$G
   fail "the gate must not exempt merely because THIS host is parked"
 fi
 pass "the execution gate is enforced whenever an enabled leg exists"
+
+# 20. REVIEW P0 (fifth round): OPERATOR-VISIBLE prefix overlap.
+#     `ez-runner-c` is a strict prefix of `ez-runner-custom-mac`, so a partial
+#     match let the parked Mac's `ez-runner-custom-mac-4` prove the enabled
+#     Linux leg. The repo's own `prefix-<digits>` rule rejects it.
+OUT20="$(DEFAULT_REMOTE_PREFIX=ez-runner-custom-mac classify ez-runner-custom-mac-4 success 0 1 ez-runner-c ez-runner-custom-mac)"
+grep -q 'COUNT=0' <<<"$OUT20" \
+  || { sed -n '1,12p' <<<"$OUT20" >&2; fail "overlapping prefix: parked ez-runner-custom-mac-4 must not prove enabled ez-runner-c"; }
+pass "overlapping parked prefix is not mistaken for the enabled leg"
+
+# 21. Reverse overlap: a parked `ez-runner-c` must not steal the enabled
+#     `ez-runner-ci-1` (the old hardcoded family rule did exactly this).
+OUT21="$(CLASSIFY_PLATFORM=macos DEFAULT_REMOTE_PREFIX=ez-runner-c classify ez-runner-ci-1 success 0 1 ez-runner-ci ez-runner-c)"
+grep -q 'COUNT=1' <<<"$OUT21" \
+  || { sed -n '1,12p' <<<"$OUT21" >&2; fail "reverse overlap: enabled ez-runner-ci-1 must count despite a parked ez-runner-c"; }
+pass "reverse overlap does not let a parked prefix steal the enabled leg"
+
+# 22. The exact rule rejects a NON-numeric suffix as a slot name. Asserted with a
+#     leg parked: with nothing parked the historical ez-* breadth intentionally
+#     still accepts it, so the parked case is the one that proves the rule.
+OUT22="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-runner-c-abc success 0 1 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=0' <<<"$OUT22" \
+  || { sed -n '1,12p' <<<"$OUT22" >&2; fail "a non-numeric suffix is not a slot name (parked case)"; }
+grep -qi 'INCONCLUSIVE\|not attributable' <<<"$OUT22" \
+  || fail "an unattributable name must be reported as INCONCLUSIVE"
+pass "non-numeric suffix is not treated as a slot name"
+
+# 23. A configured NON-ez enabled prefix still counts (no hardcoded ez assumption).
+OUT23="$(classify ci-linux-1 success 0 1 ci-linux ez-mac-runner-h)"
+grep -q 'COUNT=1' <<<"$OUT23" \
+  || { sed -n '1,12p' <<<"$OUT23" >&2; fail "an enabled custom non-ez prefix must count"; }
+pass "configured non-ez enabled prefix counts"
 
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
