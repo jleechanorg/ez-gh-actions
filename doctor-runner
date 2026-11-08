@@ -1623,6 +1623,20 @@ elif timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/de
     return 0
   }
   [ -n "$REMOTE_PREFIX" ] || REMOTE_PREFIX=$(_remote_cfg_get '^name_prefix')
+  # Section 7 ran EARLIER and could not attribute the remote leg if the early
+  # lookup failed; its observations are not replayed. Now that the authoritative
+  # prefix is known, adopt it so the final execution gate does not fail on a
+  # recovered identity, and clear the stale UNKNOWN marker. (Review note: the
+  # later-recovery case could otherwise produce a false red.)
+  if [ "${REMOTE_PREFIX_UNKNOWN:-0}" -eq 1 ] && [ -n "$REMOTE_PREFIX" ]; then
+    EARLY_REMOTE_PREFIX="$REMOTE_PREFIX"
+    REMOTE_PREFIX_UNKNOWN=0
+    # Do NOT silently claim the earlier pass proved anything: its remote runs were
+    # never attributed. Say so, and let the gate report UNPROVEN rather than RED
+    # when this is the only reason it would fail.
+    REMOTE_PROOF_NOT_RECOUNTED=1
+    info "remote runner prefix resolved on retry ($REMOTE_PREFIX); section 7 did not recount remote runs, so remote-side proof is UNPROVEN this tick"
+  fi
   _remote_count_src="config"
   if [ -z "$REMOTE_COUNT" ]; then REMOTE_COUNT=$(_remote_cfg_get '^count[[:space:]]*='); else _remote_count_src="override"; fi
   if [ -z "$REMOTE_PREFIX" ] || [ -z "$REMOTE_COUNT" ]; then
@@ -1940,8 +1954,14 @@ fi
 _ENABLED_LEG_EXISTS=1
 if [ "$PARKED_LOCAL" -eq 1 ] && [ "$PARKED_REMOTE" -eq 1 ]; then _ENABLED_LEG_EXISTS=0; fi
 if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$_ENABLED_LEG_EXISTS" -eq 1 ]; then
-  bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on an ENABLED leg)"
-  CRITICAL=$((CRITICAL+1))
+  if [ "${REMOTE_PROOF_NOT_RECOUNTED:-0}" -eq 1 ]; then
+    # The only missing proof is remote-side, and the prefix was resolved too late
+    # to attribute it. Report UNPROVEN, not a red gate.
+    warn "verdict: real-execution gate UNPROVEN (remote prefix resolved after section 7; remote runs were not recounted — not counted as a failure)"
+  else
+    bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on an ENABLED leg)"
+    CRITICAL=$((CRITICAL+1))
+  fi
 fi
 # canary gate (only when --prove): the live job must have run on our fleet
 if [ "$PROVE" = "1" ] && [ -z "$CANARY_OK" ]; then

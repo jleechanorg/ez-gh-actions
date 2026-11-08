@@ -279,4 +279,14 @@ grep -q 'COUNT=1' <<<"$OUT23" \
   || { sed -n '1,12p' <<<"$OUT23" >&2; fail "an enabled custom non-ez prefix must count"; }
 pass "configured non-ez enabled prefix counts"
 
+# 24. Review note: a remote prefix resolved AFTER section 7 must not turn the
+#     gate red. The observations are not recounted, so the honest verdict is
+#     UNPROVEN, not FAILED.
+grep -q 'REMOTE_PROOF_NOT_RECOUNTED' "$D" \
+  || fail "the late-resolved prefix must set REMOTE_PROOF_NOT_RECOUNTED"
+GATE2="$(grep -A22 'real-execution gate: at least one recent job' "$D")"
+grep -q 'UNPROVEN' <<<"$GATE2" \
+  || fail "the gate must report UNPROVEN for the not-recounted case"
+pass "a late-resolved remote prefix reports UNPROVEN, not a false red"
+
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
