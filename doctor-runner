@@ -657,6 +657,31 @@ fi
 # jobs API and confirming the runner_name that handled it belongs to our
 # fleet. A completed run whose runner_name does not match RUNNER_NAME_PREFIX
 # means the job went to a retired fleet / GitHub-hosted / somewhere else.
+# Which leg is PARKED, decided here rather than in section 10.
+# Section 7 (execution proof) and the --prove canary both attribute runs to a
+# leg and must exclude a known-parked one. The authoritative assignment lives in
+# section 10, which runs AFTER both -- reading it there was the ordering defect
+# behind bead jleechan-p9uq. Only the DECLARATION moves here; the per-slot remote
+# inventory (and its SSH config read) stays in section 10.
+#
+# Explicit `if` blocks, never `[ .. ] && VAR=1`: a false test returns 1 and under
+# `set -o errexit` that can abort the whole script.
+PARKED_LOCAL=0
+PARKED_REMOTE=0
+if [ "${LOCAL_DISABLED:-0}" -eq 1 ]; then PARKED_LOCAL=1; fi
+if [ "$PLATFORM" = "macos" ]; then
+  if [ "${REMOTE_LINUX_DISABLED:-0}" = "1" ]; then PARKED_REMOTE=1; fi
+else
+  if [ "${MAC_RUNNER_DISABLED:-0}" = "1" ]; then PARKED_REMOTE=1; fi
+fi
+# Best-effort remote prefix so a run can be attributed to a leg before section
+# 10's SSH read. An explicit override still wins there.
+if [ -z "${REMOTE_PREFIX:-}" ]; then
+  if [ "$PLATFORM" = "macos" ]; then REMOTE_PREFIX="${REMOTE_LINUX_PREFIX:-ez-runner-c}"
+  else REMOTE_PREFIX="${MAC_RUNNER_NAME_PREFIX:-ez-mac-runner-h}"; fi
+fi
+export REMOTE_PREFIX
+
 section "7. real job-execution proof (last ${ROUTING_N:-6} ezgha-selftest runs)"
 ROUTING_N="${ROUTING_N:-6}"
 REAL_ON_FLEET=0
@@ -667,15 +692,40 @@ if [ "$LOCAL_DISABLED" -eq 1 ]; then
   # is the same defect as requiring it from a DOWN slot: state the truth instead.
   ok "real job-execution proof NOT REQUIRED — $PLATFORM leg intentionally DISABLED (operator opt-out), so it has no runners to execute on; unset the opt-out to require proof"
 else
+# The loop runs even when a leg is parked: it covers BOTH fleets, so it is the
+# proof for whichever leg is still ENABLED. Skipping it entirely would report a
+# parked Mac as fine while Linux had no successful selftest at all.
+_LP="${RUNNER_NAME_PREFIX:-}"
+_RP="${REMOTE_PREFIX:-}"
 while read -r rid; do
   [ -z "$rid" ] && continue
   REAL_TOTAL=$((REAL_TOTAL+1))
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  if [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; then
+  # A success counts as execution proof only when it did NOT come from a leg we
+  # POSITIVELY know is parked. The rule is negative on purpose: the authoritative
+  # remote variables are resolved over SSH in section 10 (after this), so this
+  # must never REQUIRE them to be populated -- an earlier attempt did, and on a
+  # parked-local host it rejected the enabled remote leg's successful jobs.
+  #
+  # The old wildcard `[[ "$rn" == "ez-"* ]]` accepted ANY fleet runner, so one
+  # historical success on a parked leg satisfied proof for the enabled one
+  # (bead jleechan-p9uq).
+  _is_fleet=0
+  if [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _is_fleet=1; fi
+  if [ -n "$_RP" ] && [[ "$rn" == "${_RP}"* ]]; then _is_fleet=1; fi
+  # Fallback breadth: keep accepting other ez-* fleet runners, which is right for
+  # an enabled leg and harmless for a parked one (the exclusion below wins).
+  if [ "$_is_fleet" -eq 0 ] && [[ "$rn" == "ez-"* ]]; then _is_fleet=1; fi
+  _parked_leg=0
+  if [ "$PARKED_LOCAL" -eq 1 ] && [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _parked_leg=1; fi
+  if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "$_RP" ] && [[ "$rn" == "${_RP}"* ]]; then _parked_leg=1; fi
+  if [ "$_is_fleet" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
+  elif [ "$_parked_leg" -eq 1 ]; then
+    warn "run $rid: $conc on $rn (fleet member, but that leg is parked — NOT execution proof)"
   else
     warn "run $rid: $conc on $rn (NOT ${RUNNER_NAME_PREFIX}-* / ez-*)"
   fi
@@ -711,7 +761,15 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    if { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
+    # Same parked-leg exclusion as section 7: accepting any ez-* here would let a
+    # canary that landed on a DISABLED leg report "fleet is handling real jobs
+    # NOW" for capacity that is intentionally not running (bead jleechan-p9uq).
+    _cn_parked=0
+    if [ "$PARKED_LOCAL" -eq 1 ] && [ -n "${RUNNER_NAME_PREFIX:-}" ] && [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]]; then _cn_parked=1; fi
+    if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${REMOTE_PREFIX:-}" ] && [[ "$rn" == "${REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
+    if [ "$_cn_parked" -eq 1 ]; then
+      bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
+    elif { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
     else
