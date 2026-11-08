@@ -763,46 +763,53 @@ while read -r rid; do
   jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$rid/jobs" 2>/dev/null)
   rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"' 2>/dev/null)
   conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"' 2>/dev/null)
-  # A success counts as execution proof only when it did NOT come from a leg we
-  # POSITIVELY know is parked. The rule is negative on purpose: the authoritative
-  # remote variables are resolved over SSH in section 10 (after this), so this
-  # must never REQUIRE them to be populated -- an earlier attempt did, and on a
-  # parked-local host it rejected the enabled remote leg's successful jobs.
+  # ATTRIBUTION POLARITY: when ANY leg is parked, a success must be POSITIVELY
+  # attributable to an ENABLED leg to count. It is not enough to be "not
+  # obviously parked".
   #
-  # The old wildcard `[[ "$rn" == "ez-"* ]]` accepted ANY fleet runner, so one
-  # historical success on a parked leg satisfied proof for the enabled one
-  # (bead jleechan-p9uq).
+  # Earlier revisions got this backwards: they accepted any `ez-*` runner and
+  # then subtracted parked families, which is an unbounded denylist. Four review
+  # rounds each found another spelling that slipped through -- a drifted prefix,
+  # an unreadable config, a historical ez-runner-b, a custom ez-custom-mac. Each
+  # fix widened the deny list and left the next hole open.
+  #
+  # Requiring positive membership inverts that: an unattributable name is
+  # INCONCLUSIVE, never proof. That is the honest reading when a leg is parked
+  # and the config cannot vouch for a name.
+  #
+  # When NO leg is parked the historical breadth is kept (any ez-* counts),
+  # because there is nothing to leak proof to.
+  _any_parked=0
+  if [ "$PARKED_LOCAL" -eq 1 ] || [ "$PARKED_REMOTE" -eq 1 ]; then _any_parked=1; fi
+
   _is_fleet=0
   if [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _is_fleet=1; fi
   if [ -n "$_RP" ] && [[ "$rn" == "${_RP}"* ]]; then _is_fleet=1; fi
-  # Fallback breadth for an enabled leg, made SAFE against a parked one.
-  #
-  # A bare `ez-*` fallback admitted a parked leg whose configured prefix could
-  # not be read (config lookup failure) or had drifted: `ez-mac-runner-g-4`
-  # matched `ez-*`, missed every explicit exclusion, and counted as proof
-  # (review P0). So the fallback now refuses any name belonging to a KNOWN
-  # parked LEG FAMILY, determined from the platform rather than from the
-  # possibly-unreadable config.
-  #
-  # Families are structural, not prefix-guessed: the Mac fleet is
-  # `ez-mac-runner-*` and the Linux fleet `ez-runner-c-*`. When a leg is parked,
-  # its family is excluded wholesale -- which covers historical and custom
-  # spellings the config no longer names.
-  if [ "$_is_fleet" -eq 0 ] && [[ "$rn" == "ez-"* ]]; then
-    _fam_parked=0
-    if [ "$PARKED_LOCAL" -eq 1 ] && _parked_family_match "$rn" local; then _fam_parked=1; fi
-    if [ "$PARKED_REMOTE" -eq 1 ] && _parked_family_match "$rn" remote; then _fam_parked=1; fi
-    if [ "$_fam_parked" -eq 0 ]; then _is_fleet=1; fi
-  fi
+
   _parked_leg=0
   if [ "$PARKED_LOCAL" -eq 1 ] && [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _parked_leg=1; fi
-  # A known-parked REMOTE leg is excluded under BOTH its configured prefix and
-  # the default spelling. A single-source match let a host whose prefix had
-  # drifted (or could not be read) fall through to the broad ez-* fallback and
-  # still count as proof (review P0). Matching both spurs is strictly wider, so
-  # it cannot admit a parked run.
   if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "$_RP" ] && [[ "$rn" == "${_RP}"* ]]; then _parked_leg=1; fi
   if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${DEFAULT_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${DEFAULT_REMOTE_PREFIX}"* ]]; then _parked_leg=1; fi
+  # Known PARKED families, derived from the platform (not the unreadable config).
+  if [ "$PARKED_LOCAL" -eq 1 ] && _parked_family_match "$rn" local; then _parked_leg=1; fi
+  if [ "$PARKED_REMOTE" -eq 1 ] && _parked_family_match "$rn" remote; then _parked_leg=1; fi
+
+  if [ "$_any_parked" -eq 1 ]; then
+    # Positive attribution only: the name must belong to an ENABLED leg.
+    _enabled_leg=0
+    if [ "$PARKED_LOCAL" -eq 0 ] && [ -n "$_LP" ] && [[ "$rn" == "${_LP}"* ]]; then _enabled_leg=1; fi
+    if [ "$PARKED_REMOTE" -eq 0 ] && [ -n "$_RP" ] && [[ "$rn" == "${_RP}"* ]]; then _enabled_leg=1; fi
+    if [ "$_enabled_leg" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
+      _is_fleet=1
+    else
+      _is_fleet=0
+      _unattributed=1
+    fi
+  else
+    # Nothing parked: keep the historical breadth.
+    if [ -z "$_LP" ] && [ -z "$_RP" ] && [[ "$rn" == "ez-"* ]]; then _is_fleet=1; fi
+    if [ "$_is_fleet" -eq 0 ] && [[ "$rn" == "ez-"* ]]; then _is_fleet=1; fi
+  fi
   if [ "$_is_fleet" -eq 1 ] && [ "$_parked_leg" -eq 0 ]; then
     ok "run $rid: $conc on $rn (our fleet)"
     [ "$conc" = "success" ] && REAL_ON_FLEET=$((REAL_ON_FLEET+1))
@@ -844,28 +851,29 @@ if [ "$PROVE" = "1" ]; then
     jobs=$($(command -v gh) api "repos/$EZGHA_REPO/actions/runs/$cid/jobs" 2>/dev/null)
     rn=$(echo "$jobs" | jq -r '.jobs[0].runner_name // "?"')
     conc=$(echo "$jobs" | jq -r '.jobs[0].conclusion // "?"')
-    # Same parked-leg exclusion as section 7: accepting any ez-* here would let a
-    # canary that landed on a DISABLED leg report "fleet is handling real jobs
-    # NOW" for capacity that is intentionally not running (bead jleechan-p9uq).
-    # Use the SAME early-resolved prefix as section 7. REMOTE_PREFIX is only
-    # populated later (section 10), so reading it here left the canary blind to a
-    # parked leg whose prefix had drifted -- it accepted ez-mac-runner-g-4 and set
-    # CANARY_OK=1 (review P0).
+    # Same ATTRIBUTION POLARITY as section 7: when any leg is parked, the canary
+    # only counts if the runner is POSITIVELY attributable to an enabled leg. An
+    # unattributable name is inconclusive, never "fleet is handling real jobs
+    # NOW". Both paths share _parked_family_match and this rule, so they cannot
+    # disagree (four review rounds found the canary lagging section 7).
     _cn_parked=0
     if [ "$PARKED_LOCAL" -eq 1 ] && [ -n "${RUNNER_NAME_PREFIX:-}" ] && [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]]; then _cn_parked=1; fi
     if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${EARLY_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${EARLY_REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
     if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${REMOTE_PREFIX:-}" ] && [[ "$rn" == "${REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
-    # Same widening as section 7: the default spelling of a parked leg is excluded
-    # even when the configured prefix has drifted or could not be read.
     if [ "$PARKED_REMOTE" -eq 1 ] && [ -n "${DEFAULT_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${DEFAULT_REMOTE_PREFIX}"* ]]; then _cn_parked=1; fi
-    # Same FAMILY rule as section 7 so both proof paths agree: a parked leg is
-    # excluded by family, covering historical/custom spellings the prefix match
-    # cannot see (review P0: the canary accepted ez-mac-runner-g-4 here while
-    # section 7 correctly rejected it).
     if [ "$PARKED_LOCAL" -eq 1 ] && _parked_family_match "$rn" local; then _cn_parked=1; fi
     if [ "$PARKED_REMOTE" -eq 1 ] && _parked_family_match "$rn" remote; then _cn_parked=1; fi
+
+    _cn_any_parked=0
+    if [ "$PARKED_LOCAL" -eq 1 ] || [ "$PARKED_REMOTE" -eq 1 ]; then _cn_any_parked=1; fi
+    _cn_enabled=0
+    if [ "$PARKED_LOCAL" -eq 0 ] && [ -n "${RUNNER_NAME_PREFIX:-}" ] && [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]]; then _cn_enabled=1; fi
+    if [ "$PARKED_REMOTE" -eq 0 ] && [ -n "${EARLY_REMOTE_PREFIX:-}" ] && [[ "$rn" == "${EARLY_REMOTE_PREFIX}"* ]]; then _cn_enabled=1; fi
+
     if [ "$_cn_parked" -eq 1 ]; then
       bad "canary run $cid: $conc on $rn — that leg is intentionally DISABLED, so it cannot prove the enabled fleet is handling jobs"
+    elif [ "$_cn_any_parked" -eq 1 ] && [ "$_cn_enabled" -eq 0 ]; then
+      bad "canary run $cid: $conc on $rn — not attributable to an ENABLED leg, so it cannot prove the enabled fleet is handling jobs"
     elif { [[ "$rn" == "${RUNNER_NAME_PREFIX}"* ]] || [[ "$rn" == "${RUNNER_NAME_PREFIX}-"* ]] || [[ "$rn" == "${REMOTE_PREFIX:-ez}"* ]] || [[ "$rn" == "ez-"* ]]; } && [ "$conc" = "success" ]; then
       ok "canary run $cid: success on $rn — fleet is handling real jobs NOW"
       CANARY_OK=1
@@ -1947,9 +1955,24 @@ if [ "$LOOP_FAILS" -gt 3 ]; then
     warn "ensure_count failed $LOOP_FAILS times in last ${LOOP_WINDOW}m (transient reconcile miss; $HEALTHY_RUNNERS healthy runners online)"
   fi
 fi
-# real-execution gate: at least one recent job must have succeeded on our fleet
-if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$LOCAL_DISABLED" -ne 1 ]; then
-  bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on our fleet)"
+# real-execution gate: at least one recent job must have succeeded on our fleet.
+#
+# The exemption is for a ZERO-LEG contract only. Exempting merely because THIS
+# host is parked let a parked Mac pass with twenty enabled-but-idle Linux slots
+# and zero successful selftests: "fleet healthy: 20/20 healthy: 0 executing ...
+# 20 idle-ok" (review P0). Section 7 now attributes per leg, so when any leg is
+# ENABLED this gate must be enforced -- the parked leg simply cannot supply the
+# success, which is exactly what the gate is meant to detect.
+# Use the EARLY parked flags, not REMOTE_DISABLED: that variable is assigned in
+# section 10, long after this gate.
+_ENABLED_LEG_EXISTS=1
+if [ "$PARKED_LOCAL" -eq 1 ] && [ "$PARKED_REMOTE" -eq 1 ]; then _ENABLED_LEG_EXISTS=0; fi
+if [ "$PARKED_LOCAL" -eq 1 ] && [ "$PARKED_REMOTE" -eq 0 ] && [ "${REMOTE_COUNT:-0}" -eq 0 ] && [ -z "${EARLY_REMOTE_PREFIX:-}" ]; then
+  # A parked local leg with no remote leg in the contract has nothing enabled.
+  _ENABLED_LEG_EXISTS=0
+fi
+if [ "${REAL_ON_FLEET:-0}" -lt 1 ] && [ "$_ENABLED_LEG_EXISTS" -eq 1 ]; then
+  bad "verdict: real-execution gate FAILED (observed REAL_ON_FLEET=${REAL_ON_FLEET:-0} of REAL_TOTAL=${REAL_TOTAL:-0} recent runs, expected>=1 successful run on an ENABLED leg)"
   CRITICAL=$((CRITICAL+1))
 fi
 # canary gate (only when --prove): the live job must have run on our fleet

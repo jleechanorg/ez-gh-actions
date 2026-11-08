@@ -54,11 +54,13 @@ extract_classifier() {
   # at the `fi` that closes the final `if [ "$_is_fleet" -eq 1 ] ...` statement.
   # Anchor on that decision line rather than the first plain `fi`, so adding
   # nested branches above cannot silently truncate the extraction.
+  # Anchor on the ATTRIBUTION POLARITY marker (the classifier's real start) and
+  # stop at the closing `fi` of the fleet/parked decision statement.
   awk '
-    /^  _is_fleet=0$/                      {inside=1}
+    /# ATTRIBUTION POLARITY:/                  {inside=1}
     inside && /if \[ "\$_is_fleet" -eq 1 \]/ {fleet=1}
-    inside                                {print}
-    inside && fleet && /^  fi$/           {exit}
+    inside                                     {print}
+    inside && fleet && /^  fi$/                 {exit}
   ' "$D"
 }
 
@@ -217,5 +219,35 @@ CANARY_FAM=$(awk '/_cn_parked=0/{f=1} f{print} f&&/cannot prove the enabled flee
 [ "$SEC7_FAM" -ge 1 ] || fail "section 7 must use the shared family rule"
 [ "$CANARY_FAM" -ge 1 ] || fail "the canary must use the SAME shared family rule as section 7"
 pass "both proof paths share the family rule"
+
+# 16. REVIEW P0: unreadable config + a CUSTOM parked prefix (ez-custom-mac).
+#     A denylist can never enumerate this. Positive attribution is what rejects
+#     it: an unattributable name is inconclusive, not proof.
+OUT16="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-custom-mac-4 success 0 1 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=0' <<<"$OUT16" \
+  || { sed -n '1,12p' <<<"$OUT16" >&2; fail "an unattributable custom parked name must not be proof"; }
+pass "unreadable config + custom parked prefix is inconclusive, not proof"
+
+# 17. ...and an enabled-leg name is still attributable in that same state.
+OUT17="$(DEFAULT_REMOTE_PREFIX=ez-mac-runner-h classify ez-runner-c-4 success 0 1 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=1' <<<"$OUT17" \
+  || { sed -n '1,12p' <<<"$OUT17" >&2; fail "the enabled leg must still be attributable when a leg is parked"; }
+pass "enabled leg remains attributable under the same conditions"
+
+# 18. With NOTHING parked, historical breadth is retained (no over-restriction).
+OUT18="$(classify ez-custom-thing-9 success 0 0 ez-runner-c ez-mac-runner-h)"
+grep -q 'COUNT=1' <<<"$OUT18" \
+  || { sed -n '1,12p' <<<"$OUT18" >&2; fail "with nothing parked, an ez-* fleet runner must still count"; }
+pass "with nothing parked, historical ez-* breadth is retained"
+
+# 19. The final verdict gate must be enforced whenever an ENABLED leg exists
+#     (review P0: a parked Mac with 20 idle Linux slots passed with 0 proof).
+GATE="$(grep -A14 'real-execution gate: at least one recent job' "$D")"
+grep -q '_ENABLED_LEG_EXISTS' <<<"$GATE" \
+  || fail "the real-execution gate must consult _ENABLED_LEG_EXISTS"
+if grep -q 'REAL_ON_FLEET:-0}" -lt 1 \] && \[ "$LOCAL_DISABLED" -ne 1 \]' <<<"$GATE"; then
+  fail "the gate must not exempt merely because THIS host is parked"
+fi
+pass "the execution gate is enforced whenever an enabled leg exists"
 
 echo "ALL PASS: execution proof is attributed to a leg and excludes parked legs"
