@@ -1536,8 +1536,9 @@ fn release_stale_slots_from_with_containers_for(
         live_runners,
         runner_prefix,
         local_container_names,
-        local_runner_activity,
-        |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
+        (local_runner_activity, |assignments, slot| {
+            slot_in_grace_window(assignments, slot, ctx.wall_secs)
+        }),
         ctx,
     )
 }
@@ -1557,8 +1558,9 @@ fn release_stale_slots_from_with_containers_and_activity(
         live_runners,
         runner_prefix,
         local_container_names,
-        activity_probe,
-        |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
+        (activity_probe, |assignments, slot| {
+            slot_in_grace_window(assignments, slot, ctx.wall_secs)
+        }),
         &ctx,
     )
 }
@@ -1579,8 +1581,7 @@ fn release_stale_slots_from_with_containers_and_activity_with_grace(
         live_runners,
         runner_prefix,
         local_container_names,
-        activity_probe,
-        grace_check,
+        (activity_probe, grace_check),
         &ctx,
     )
 }
@@ -1591,10 +1592,13 @@ fn release_stale_slots_from_with_containers_and_activity_for(
     live_runners: &[github::RunnerInfo],
     runner_prefix: &str,
     local_container_names: Option<&HashSet<String>>,
-    mut activity_probe: impl FnMut(&str) -> LocalRunnerActivity,
-    mut grace_check: impl FnMut(&SlotAssignments, &str) -> bool,
+    probes: (
+        impl FnMut(&str) -> LocalRunnerActivity,
+        impl FnMut(&SlotAssignments, &str) -> bool,
+    ),
     ctx: &ReclaimContext,
 ) -> Result<usize> {
+    let (mut activity_probe, mut grace_check) = probes;
     if assignments.assignments.is_empty() {
         return Ok(0);
     }
@@ -14361,14 +14365,16 @@ esac
             &[],
             &cfg.runner.name_prefix,
             Some(&local_names),
-            |name| {
-                if name.ends_with("-1") {
-                    LocalRunnerActivity::Idle
-                } else {
-                    LocalRunnerActivity::Absent
-                }
-            },
-            |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
+            (
+                |name| {
+                    if name.ends_with("-1") {
+                        LocalRunnerActivity::Idle
+                    } else {
+                        LocalRunnerActivity::Absent
+                    }
+                },
+                |assignments, slot| slot_in_grace_window(assignments, slot, ctx.wall_secs),
+            ),
             &ctx,
         )
         .unwrap();
