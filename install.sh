@@ -756,6 +756,21 @@ if [ -d "${UNIT_DIR}" ]; then
     plist_record_of() {
       local f="$1"
       [ -f "${f}" ] || { printf ''; return 0; }
+      # Prefer python3 plistlib (portable); PlistBuddy is the macOS fallback.
+      # NOTE: the python body must run BEFORE any `return`, otherwise the
+      # heredoc-produced value is discarded and preservation silently no-ops.
+      if command -v python3 >/dev/null 2>&1; then
+        python3 - "${f}" <<'PYPLIST' 2>/dev/null
+import plistlib, sys
+try:
+    d = plistlib.load(open(sys.argv[1], "rb"))
+except Exception:
+    raise SystemExit
+env = d.get("EnvironmentVariables") or {}
+sys.stdout.write(env.get("EZGHA_SUSPENSION_RECORD", ""))
+PYPLIST
+        return 0
+      fi
       /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${f}" 2>/dev/null || printf ''
     }
 

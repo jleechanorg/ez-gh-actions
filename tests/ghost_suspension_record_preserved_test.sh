@@ -47,8 +47,19 @@ P
 }
 
 read_record() { # prints the record, or <ABSENT>
-  /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "$1" 2>/dev/null \
-    || printf '<ABSENT>'
+  # PORTABLE: /usr/libexec/PlistBuddy is macOS-only, but this test is wired into
+  # `ubuntu-latest` CI. Use python3 plistlib (stdlib, cross-platform) instead.
+  python3 - "$1" <<'PYEOF'
+import plistlib, sys
+try:
+    with open(sys.argv[1], 'rb') as fh:
+        d = plistlib.load(fh)
+except Exception:
+    print('<ABSENT>')
+    raise SystemExit
+env = d.get('EnvironmentVariables') or {}
+print(env['EZGHA_SUSPENSION_RECORD'] if 'EZGHA_SUSPENSION_RECORD' in env else '<ABSENT>')
+PYEOF
 }
 
 # ---- extract the real block + helper from install.sh ----------------------
@@ -60,10 +71,21 @@ start = src.index('      local env_xml=""')
 end   = src.index('\n      fi\n      cat >> "${plist}" <<PLIST\n  <key>StartInterval</key>', start)
 block = src[start:end + len('\n      fi')]
 open(sys.argv[2], "w").write("\n".join(l[4:] if l.startswith("    ") else l for l in block.splitlines()) + "\n")
-# the plist_record_of helper
+# the plist_record_of helper. NOTE: de-indent by 4 ONLY lines that start with
+# 4+ spaces; a python heredoc body inside it is indented differently and must be
+# preserved verbatim, or the extracted helper is syntactically broken.
 hs = src.index('    plist_record_of() {')
 he = src.index('\n    }\n', hs) + len('\n    }\n')
-open(sys.argv[3], "w").write("\n".join(l[4:] if l.startswith("    ") else l for l in src[hs:he].splitlines()) + "\n")
+lines = src[hs:he].splitlines()
+out, in_py = [], False
+for l in lines:
+    if "<<'PYPLIST'" in l: in_py = True
+    if in_py:
+        out.append(l[4:] if l.startswith("    " * 2) else l)
+    else:
+        out.append(l[4:] if l.startswith("    ") else l)
+    if l.strip() == "PYPLIST": in_py = False
+open(sys.argv[3], "w").write("\n".join(out) + "\n")
 PY
 # shellcheck disable=SC1090
 source "$WORK/helpers.sh"

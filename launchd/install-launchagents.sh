@@ -283,7 +283,19 @@ case "$action" in
       #   3. otherwise empty (fail-closed, the safe default)
       GHOST_REC="${EZGHA_SUSPENSION_RECORD-__UNSET__}"
       if [[ "${GHOST_REC}" == "__UNSET__" ]]; then
-        if [[ -f "${dest}" ]] && /usr/libexec/PlistBuddy -c \
+        # python3 plistlib is portable; PlistBuddy is the macOS fallback.
+        if [[ -f "${dest}" ]] && command -v python3 >/dev/null 2>&1; then
+          GHOST_REC="$(python3 - "${dest}" <<'PYPLIST' 2>/dev/null || true
+import plistlib, sys
+try:
+    d = plistlib.load(open(sys.argv[1], "rb"))
+except Exception:
+    raise SystemExit
+env = d.get("EnvironmentVariables") or {}
+sys.stdout.write(env.get("EZGHA_SUSPENSION_RECORD", ""))
+PYPLIST
+)"
+        elif [[ -f "${dest}" ]] && /usr/libexec/PlistBuddy -c \
              "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${dest}" >/dev/null 2>&1; then
           GHOST_REC="$(/usr/libexec/PlistBuddy -c \
              "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${dest}" 2>/dev/null || true)"
