@@ -5,7 +5,7 @@
   org.jleechanorg.ezgha-queue-reaper
 
   Purpose:
-    Runs scripts/cleanup-stuck-runs.sh --apply every 6 hours to remove queued
+    Runs scripts/cleanup-stuck-runs.sh (apply mode) every 6 hours to remove queued
     GitHub Actions run artifacts that nothing else clears:
       - zombies   : status=queued for longer than STALE_HOURS (8h)
       - superseded: an older queued run for the same branch+workflow
@@ -22,7 +22,7 @@
     - only status=queued runs are candidates; in-progress runs are ignored
     - deploy workflows (deploy-production, auto-deploy-dev) are never touched
     - ghost runs (queued with ZERO jobs that refuse every transition,
-      cli/cli#15053) are counted, not failed -- unless undeclared
+      cli/cli#15053) are counted, not failed, unless undeclared
 -->
 <dict>
     <key>Label</key>
