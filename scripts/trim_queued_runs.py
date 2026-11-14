@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -28,6 +29,50 @@ def gh_json(args):
 def is_rate_limited(err):
     out = (err.output or b"").lower()
     return b"rate limit" in out or b"secondary rate limit" in out or b"403" in out
+
+# ── Ghost-run classification (cli/cli#15053) ────────────────────────────────
+# A "ghost" is a server-held queued run with ZERO jobs that refuses every
+# transition (cancel => 409 "has not been queued yet", delete => 403,
+# rerun => 403). It cannot be cleared by any API, so it must be a COUNTED,
+# non-fatal class instead of a permanent hard failure.
+GHOST_CANCEL_MARKERS = ("has not been queued yet",)
+GHOST_ID_CAP = 20
+GHOST_ESCALATE_DAYS = int(os.environ.get("GHOST_ESCALATE_DAYS", "14"))
+GHOST_ESCALATE_COUNT = int(os.environ.get("GHOST_ESCALATE_COUNT", "200"))
+GHOST_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)\s*$")
+
+def ghost_http_status(err):
+    """The ACTUAL status gh reported, or None when we cannot identify it.
+
+    Anchored on gh's trailing "(HTTP NNN)" token. Substring-searching for
+    "409" would misread 'request_id=409123 (HTTP 503)' as a ghost."""
+    out = (err.output or b"").decode(errors="replace").strip()
+    tail = out.splitlines()[-1] if out else ""
+    m = GHOST_STATUS_RE.search(tail)
+    return int(m.group(1)) if m else None
+
+def is_ghost_rejection(err):
+    """True ONLY for HTTP 409 carrying the ghost message. Any other status, or
+    a status we cannot positively identify, fails closed (NOT a ghost)."""
+    if ghost_http_status(err) != 409:
+        return False
+    return any(m in (err.output or b"").decode(errors="replace")
+               for m in GHOST_CANCEL_MARKERS)
+
+_jobs_cache = {}
+
+def jobs_total(rid):
+    """0 => confirmed zero-job ghost. -1 => unknown, treat as NOT a ghost."""
+    if rid in _jobs_cache:
+        return _jobs_cache[rid]
+    try:
+        txt = gh_cmd(["api", f"repos/{repo}/actions/runs/{rid}/jobs",
+                      "--jq", ".total_count"]).decode().strip()
+        n = int(txt) if txt else -1      # empty => unknown, never 0
+    except Exception:
+        n = -1
+    _jobs_cache[rid] = n
+    return n
 
 def list_queued_runs():
     runs = []
@@ -210,6 +255,10 @@ print(f"candidates_identified: {len(candidates)}")
 cancelled = 0
 failed = 0
 skipped_non_queued = 0
+ghost = 0
+ghost_ids = []          # capped display list
+ghost_id_set = set()    # DISTINCT ids drive the escalation bound
+ghost_ages = []
 
 for r, reason in candidates:
     rid = r["id"]
@@ -241,10 +290,42 @@ for r, reason in candidates:
         except Exception as e:
             print(f"verify/force-cancel notice for {rid}: {e}")
     except subprocess.CalledProcessError as e:
-        failed += 1
-        print(f"FAIL cancel {rid}: {(e.output or b'').decode()[:120]}")
+        if is_ghost_rejection(e) and jobs_total(rid) == 0:
+            ghost += 1
+            ghost_id_set.add(rid)
+            if len(ghost_ids) < GHOST_ID_CAP:
+                ghost_ids.append(rid)
+            c = datetime.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+            ghost_ages.append((datetime.datetime.now(datetime.timezone.utc) - c).total_seconds() / 60)
+            print(f"ghost {rid}: server-held zero-job queued run; every cancel/delete "
+                  f"path refuses it (cli/cli#15053)")
+        elif is_ghost_rejection(e):
+            failed += 1
+            print(f"WARN 409-with-jobs for {rid}: jobs exist, so this is a real "
+                  f"failure masquerading as a ghost")
+        else:
+            failed += 1
+            print(f"FAIL cancel {rid}: {(e.output or b'').decode()[:120]}")
     time.sleep(0.35)
 
-print(f"summary: candidates={len(candidates)} cancelled={cancelled} failed={failed} skipped_non_queued={skipped_non_queued} dry_run={dry}")
+print(f"summary: candidates={len(candidates)} cancelled={cancelled} failed={failed} ghost={ghost} skipped_non_queued={skipped_non_queued} dry_run={dry}")
+if ghost:
+    rec = os.environ.get("EZGHA_SUSPENSION_RECORD", "")
+    print(f"note: {ghost} ghost run(s) cannot be cleared by API "
+          f"(ids: {', '.join(map(str, ghost_ids))}); remediation: GitHub Support or "
+          f"branch deletion")
+    print(f"suspension record: {rec or 'UNSET'}")
+    if not rec:
+        # Fail closed: an UNDECLARED ghost set must never read green.
+        print(f"FAIL ghosts are unacknowledged (EZGHA_SUSPENSION_RECORD unset): "
+              f"{ghost} run(s) counted as failure so this cannot read green")
+        failed += 1
+    oldest_days = max(ghost_ages, default=0) / 1440
+    if oldest_days >= GHOST_ESCALATE_DAYS or len(ghost_id_set) >= GHOST_ESCALATE_COUNT:
+        print(f"ESCALATION: ghost set exceeds bounds (oldest={oldest_days:.1f}d "
+              f"limit={GHOST_ESCALATE_DAYS}d, distinct={len(ghost_id_set)} "
+              f"limit={GHOST_ESCALATE_COUNT}) — decide: GitHub Support ticket or "
+              f"branch deletion")
+        failed += 1
 if failed:
     sys.exit(1)
