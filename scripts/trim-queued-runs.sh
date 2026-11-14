@@ -175,7 +175,7 @@ for repo in $QUEUE_REPOS; do
     echo "[$repo] WARN: neither timeout nor gtimeout found; repo pass is unbounded" >&2
   fi
 
-  QUEUE_REPO="$repo" ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} python3 -u "$PY_BODY" 2>&1 | sed "s#^#[${repo}] #" || repo_rc=$?
+  QUEUE_REPO="$repo" ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} python3 -u "$PY_BODY" 2>&1 | sed -u "s#^#[${repo}] #" || repo_rc=$?
 
   if [[ "$repo_rc" -ne 0 ]]; then
     # 124/137 = timeout expired / killed after --kill-after. Name it explicitly:
