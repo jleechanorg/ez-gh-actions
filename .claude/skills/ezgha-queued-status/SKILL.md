@@ -72,7 +72,7 @@ outage.
 | Tool | Owns |
 |---|---|
 | `ezgha-queued-status` (this) | measuring the queue |
-| `ezgha-ghost-reap` | removing ghosts (cancel → force-cancel → delete) |
+| `ezgha-ghost-reap` | **classifying** zero-job ghosts (read-only; it no longer cancels or deletes — that path was removed because it cannot succeed on the wedged population and cannot be made safe) |
 | `scripts/cleanup-stuck-runs.sh` | the scheduled multi-repo reaper (`--apply`, 6h launchd) |
 | `scripts/ttv_zombie_reaper.py` | age-only zombie scan (never reads `jobs`) |
 

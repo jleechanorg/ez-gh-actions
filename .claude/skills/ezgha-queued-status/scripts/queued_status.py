@@ -115,7 +115,10 @@ def _is_parked_prefix(prefix):
     warning (review P1: reproduced both)."""
     for known, vars_ in PARKED_ENV.items():
         if prefix.startswith(known):
-            return any(os.environ.get(v, "").strip() == "1" for v in vars_)
+            # Exact match, NO .strip(): doctor-runner compares
+            # [ "${VAR:-0}" = "1" ], so " 1 " and "1\n" do NOT park a leg there.
+            # Stripping here would let those values suppress a real outage warning.
+            return any(os.environ.get(v, "") == "1" for v in vars_)
     return False
 
 

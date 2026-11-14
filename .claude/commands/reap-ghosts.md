@@ -20,8 +20,8 @@ Read `.claude/skills/ezgha-ghost-reap/SKILL.md` completely, then run:
 python3 .claude/skills/ezgha-ghost-reap/scripts/reap_ghosts.py $ARGUMENTS
 ```
 
-Forward `$ARGUMENTS` unchanged. **Dry run is the default** — `--apply` is required to
-mutate anything, and only pass it when the user has explicitly authorized reaping.
+Forward `$ARGUMENTS` unchanged. **This tool is read-only.** It classifies and reports;
+it never cancels or deletes. `--apply` is accepted for compatibility and is a no-op.
 
 Before promising a cleanup, check `gh api /rate_limit`: each run costs 2–4 core requests.
 Exit `3` means some runs were wedged or refused deletion — report the outcome histogram,

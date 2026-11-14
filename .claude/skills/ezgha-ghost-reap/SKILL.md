@@ -42,15 +42,19 @@ A run record with `status=queued`, `run_attempt=1`, `updated_at == created_at` (
 touched since creation), and `jobs.total_count == 0`. No job was ever created, so nothing
 is scheduled and the run never consumes a runner. Ghosts inflate every queued-run count.
 
-## The operation sequence, and why
+## Why there is no operation sequence any more
 
-`DELETE .../actions/runs/{id}` is documented with **no status precondition** but returns
-**403** while a run is still `queued`. The run must first leave queued:
+There used to be one (cancel → force-cancel → DELETE). It was **removed**, so this
+tool classifies and reports only. Two reasons:
 
-1. re-check it is still queued (race guard — a run can be picked up after days)
-2. `POST .../cancel` (expect 202)
-3. wait, re-check; if still queued → `POST .../force-cancel`
-4. re-check; only then `DELETE .../actions/runs/{id}` (expect 204)
+1. **It cannot succeed on this population.** 149/149 zero-job queued runs refused
+   cancel/force-cancel (HTTP 409 `has not been queued yet`) and DELETE (403) — 0
+   reaped. PR #227 measured 65/65 the same.
+2. **It cannot be made safe.** Deletion is GET-then-mutate and GitHub exposes no
+   conditional-write precondition, so a run can gain real jobs between the
+   eligibility read and the DELETE. Review demonstrated force-cancel and DELETE
+   firing on a run that had become `in_progress` with jobs. No client-side re-read
+   closes that window.
 
 Plain `cancel` returning **202 can silently no-op** on runs whose only job never started
 (`runner_id:0`, bead jleechan-uud) — the ghost profile exactly. Never trust the 202.
@@ -70,9 +74,10 @@ nothing can transition it and delete never becomes legal.
 
 **Measured 2026-11-14 on `jleechanorg/worldarchitect.ai`: 149 of 149 zero-job queued runs
 in that sample were in this state — 0 reaped.** (Dated observation, not a live count;
-re-measure before quoting it.) The script reports `wedged_unreapable` (cancel/force-cancel
-409) separately from `delete_403` (delete refused) so the two are not conflated. Do not
-retry these every cycle; they cost API budget and change nothing.
+re-measure before quoting it.) The script no longer attempts cancel/delete, so it
+reports no `wedged_unreapable` or `delete_403` outcomes; those were API observations
+from when the destructive path still existed. Do not retry them every cycle — they cost
+API budget and change nothing.
 
 Note the reaper's historical successes (`deleted zombie 39912506885` in
 `~/.local/state/ezgha/queue-reaper.log`) came from an **earlier** population that was not
@@ -91,16 +96,20 @@ python3 .claude/skills/ezgha-ghost-reap/scripts/reap_ghosts.py --apply --min-age
 python3 .claude/skills/ezgha-ghost-reap/scripts/reap_ghosts.py --apply --limit 5
 ```
 
-Options: `--repo`, `--apply`, `--min-age-min`, `--limit`, `--verify-wait`, `--json`.
+Options: `--repo`, `--min-age-min`, `--limit`, `--json`.
+`--apply` is accepted for compatibility and is a **no-op** (nothing mutates);
+`--verify-wait` is likewise ignored.
 
-Exit codes: `0` ok, `2` measurement/API failure, `3` partial (wedged/403/failed present),
-`4` rate-limited.
+Exit codes: `0` ok, `2` measurement/API failure, `3` partial (a `failed` classification
+present), `4` rate-limited.
 
 ## Mandatory safety invariants
 
-- **Dry run by default.** `--apply` is required for any mutation.
-- **Ghost proof.** Eligible only when `jobs.total_count == 0` **and** `status == queued`,
-  re-verified immediately before acting. Never act on a cached list.
+- **Read-only.** No mutation path exists; `--apply` is a compatibility no-op.
+- **Ghost proof.** A run is classified as a zero-job ghost only when
+  `jobs.total_count == 0` **and** `status == queued`, read at classification time.
+  "Unreapable" is NOT inferred from this: it is a historical API outcome, reported
+  separately.
 - **Deploy workflows are never touched** — matched on workflow `path`, not display name
   (`NEVER_CANCEL_PATHS`). A cancelled deploy is worse than a slow queue (FIXPLAN §5 risk #1).
 - **Race guard.** Re-check still-queued right before each destructive call.

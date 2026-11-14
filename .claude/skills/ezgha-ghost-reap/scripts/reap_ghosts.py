@@ -209,7 +209,7 @@ def reap_gate(repo, rid):
     return None
 
 
-def reap_one(repo, row, verify_wait_s, apply):
+def reap_one(repo, row, verify_wait_s=None, apply=None):
     """Classify ONE ghost. NEVER mutates.
 
     This used to cancel -> force-cancel -> delete. That path is removed, for two
@@ -243,7 +243,10 @@ def reap_one(repo, row, verify_wait_s, apply):
         return "unverified_jobs_unknown"
     if total != 0:
         return "now_has_jobs_real_work"
-    return "ghost_unreapable" if apply else "ghost"
+    # Classification must NOT depend on --apply: GET status/jobs establish that a
+    # run is a zero-job ghost, not that cancel/delete would fail. "unreapable" is
+    # a historical API outcome, reported separately from this classification.
+    return "ghost_zero_jobs"
 
 
 def main(argv=None):
