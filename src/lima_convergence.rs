@@ -47,10 +47,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const CANONICAL_LIMA_HOME_RELATIVE: &str = ".config/colima/_lima";
 const CANONICAL_INSTANCE_NAME: &str = "colima";
 
+/// Colima's own Lima home — `$COLIMA_HOME/_lima`, i.e. `~/.colima/_lima` with the
+/// default `COLIMA_HOME`. This is the layout on the Mac fleet, and it is NOT the
+/// XDG-style canonical path above; both are real Colima deployments, so a Lima
+/// state store has to be *resolved* rather than assumed.
+const COLIMA_LIMA_HOME_RELATIVE: &str = ".colima/_lima";
+
 /// Legacy Lima instance directory (older `~/.lima` layout — was the default
 /// before colima 0.6 moved under `~/.config/colima/_lima`). Detecting its
 /// presence is the "two Lima VMs" signal: ghd2.6 root cause.
 const LEGACY_LIMA_HOME_RELATIVE: &str = ".lima";
+
+/// Every Lima home this project knows about, most-preferred first. Anything that
+/// has to read or mutate one Lima state store resolves its home here instead of
+/// assuming `~/.lima` (limactl's own default), so the observation and the mutation
+/// can never land on different stores.
+pub const KNOWN_LIMA_HOMES: &[&str] = &[
+    CANONICAL_LIMA_HOME_RELATIVE,
+    COLIMA_LIMA_HOME_RELATIVE,
+    LEGACY_LIMA_HOME_RELATIVE,
+];
 
 /// Backup-marker filename written next to the Docker context metadata so the
 /// previous socket choice is recoverable after a converged migration. The
@@ -195,10 +211,50 @@ fn probe_lima_home(lima_home: &Path) -> Vec<LimaInstance> {
 /// Resolve `~` from `$HOME` for an in-process path join. Falls back to the
 /// literal `~` if HOME is unset (which will fail downstream — that is
 /// intentional, not a ZFC violation: a missing HOME is a real failure).
-fn home_dir() -> PathBuf {
+///
+/// Public because it is the root every known Lima home is resolved against.
+pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("~"))
+}
+
+/// Which Lima state store owns an instance — resolved exactly once, so a caller's
+/// guard evidence and its mutation come from the same store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimaHome {
+    /// The first known home whose `<home>/<instance>/` directory exists: this is
+    /// the store that owns the instance (and its data disks), so it is the
+    /// `LIMA_HOME` both a state probe and an unlock must use.
+    Owner(PathBuf),
+    /// At least one known home is readable and none contains the instance. `home`
+    /// is the first readable one: nothing live holds a disk there.
+    NoInstance(PathBuf),
+    /// No known home is readable — the instance's state cannot be confirmed, so a
+    /// caller must fail closed rather than guess.
+    Unreadable,
+}
+
+/// `home_root` is the user's home directory in production (`home_dir()`), and a temp
+/// directory in tests.
+pub fn resolve_lima_home_from(home_root: &Path, instance: &str) -> LimaHome {
+    let mut readable: Option<PathBuf> = None;
+    for relative in KNOWN_LIMA_HOMES {
+        let candidate = home_root.join(relative);
+        // A home we cannot list is not evidence of anything: skip it rather than
+        // let it stand in for the instance's state.
+        if fs::read_dir(&candidate).is_err() {
+            continue;
+        }
+        if candidate.join(instance).is_dir() {
+            return LimaHome::Owner(candidate);
+        }
+        readable.get_or_insert(candidate);
+    }
+    match readable {
+        Some(home) => LimaHome::NoInstance(home),
+        None => LimaHome::Unreadable,
+    }
 }
 
 /// Strip a Docker `unix://` endpoint scheme, if present, and return the bare
@@ -955,6 +1011,54 @@ mod tests {
         // The two lima_home values must differ -- this is exactly what the
         // pre-fix code (always `home_root`) could never produce.
         assert_ne!(canonical.lima_home, probe.legacy[0].lima_home);
+    }
+
+    #[test]
+    fn resolve_lima_home_prefers_the_home_that_contains_the_instance() {
+        // Review finding F1: the stale-lock guard resolved its probe against a different
+        // LIMA_HOME than the unlock, so on this host (colima home `~/.colima/_lima`) the
+        // probe looked in the empty `~/.lima` and the recovery never fired.
+        let home = fake_home();
+        plant_instance(&home, ".colima/_lima", "colima", true);
+        assert_eq!(
+            resolve_lima_home_from(&home, "colima"),
+            LimaHome::Owner(home.join(".colima/_lima")),
+            "the colima home that contains the instance is the store to observe and mutate"
+        );
+    }
+
+    #[test]
+    fn resolve_lima_home_prefers_the_colima_home_over_a_legacy_one() {
+        // Dual-Lima hosts (jeff-ubuntu) have `~/.lima/colima` AND a colima home. Probing
+        // the legacy instance would report Stopped for a VM that is not the live one, so
+        // the colima-managed home must win.
+        let home = fake_home();
+        plant_instance(&home, ".lima", "colima", true);
+        plant_instance(&home, ".colima/_lima", "colima", true);
+        let resolved = resolve_lima_home_from(&home, "colima");
+        assert_eq!(resolved, LimaHome::Owner(home.join(".colima/_lima")));
+        assert_ne!(resolved, LimaHome::Owner(home.join(".lima")));
+    }
+
+    #[test]
+    fn resolve_lima_home_reports_a_readable_home_without_the_instance() {
+        let home = fake_home();
+        std::fs::create_dir_all(home.join(".colima/_lima")).unwrap();
+        assert_eq!(
+            resolve_lima_home_from(&home, "colima"),
+            LimaHome::NoInstance(home.join(".colima/_lima")),
+            "a readable home with no instance directory means nothing live holds the disk"
+        );
+    }
+
+    #[test]
+    fn resolve_lima_home_fails_closed_when_no_known_home_is_readable() {
+        let home = fake_home();
+        assert_eq!(
+            resolve_lima_home_from(&home, "colima"),
+            LimaHome::Unreadable,
+            "an unknown state store must never be treated as safe to mutate"
+        );
     }
 
     #[test]
