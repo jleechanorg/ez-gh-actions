@@ -150,8 +150,10 @@ r="$(read_record "$PLIST")"
 TRICKY='a&b<c>d"e'
 export EZGHA_SUSPENSION_RECORD="$TRICKY"
 render "$PLIST"
-if plutil -lint "$PLIST" >/dev/null 2>&1; then
-  pass "5b plist with XML-special characters lints clean"
+# PORTABLE: plutil is macOS-only. On Linux, validate with python3 plistlib,
+# which is what actually detects the unescaped-& failure.
+if python3 -c "import plistlib,sys; plistlib.load(open(sys.argv[1],'rb'))" "$PLIST" 2>/dev/null; then
+  pass "5b plist with XML-special characters parses cleanly"
 else
   fail "5b plist with XML-special characters is INVALID (unescaped record)"
 fi
