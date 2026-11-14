@@ -61,18 +61,35 @@ chmod +x "$STUB_BIN/git"
 
 RUN=( env -u BASH_ENV PATH="$STUB_BIN:$PATH" QUEUE_REPOS="acme/one"
       bash "$REPO_ROOT/scripts/trim-queued-runs.sh" --dry-run )
-# setsid puts the whole pipeline in its OWN process group, so terminating the
-# group reaps the python/host bash descendants too. Killing only the wrapper
-# pid left children alive, and they could then exec a stub AFTER $STUB_BIN was
-# removed by the EXIT trap (code-standards review P1).
-if command -v setsid >/dev/null 2>&1; then
-  setsid "${RUN[@]}" </dev/null >"$LOG" 2>&1 &
-else
-  # macOS has no setsid; use a backgrounded subshell and kill its group via
-  # `kill -- -PGID` where PGID == the subshell's pid in this environment.
-  ( "${RUN[@]}" </dev/null >"$LOG" 2>&1 ) &
-fi
+# Launch WITHOUT relying on process-group semantics.
+#
+# macOS has no `setsid`, and a backgrounded subshell INHERITS the parent's
+# PGID (verified: child pgid == parent pgid), so `kill -- -$pid` would signal
+# this test's own shell rather than the pipeline. Instead: start the pipeline,
+# then walk the descendant tree explicitly and terminate it leaf-first. That is
+# portable and does not depend on group isolation at all (review P0).
+"${RUN[@]}" </dev/null >"$LOG" 2>&1 &
 pid=$!
+
+# Collect every live descendant of $1, parents before children.
+# bash 3.2 + `set -u` treats "${arr[@]}" on an EMPTY array as an unbound-variable
+# error, so never expand an array that may be empty; use a newline-separated
+# string instead.
+descendants() {
+  local frontier="$1" kids out=""
+  while [ -n "$frontier" ]; do
+    kids=""
+    for p in $frontier; do
+      for c in $(pgrep -P "$p" 2>/dev/null || true); do
+        kids="$kids $c"
+        out="$out $c"
+      done
+    done
+    frontier="$kids"
+  done
+  [ -n "$out" ] && printf '%s\n' $out
+  return 0
+}
 
 seen=0; alive=0
 for _ in $(seq 1 20); do
@@ -86,17 +103,35 @@ done
 
 # We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
 # `wait` under `set -e` would abort BEFORE the assertions below.
-# Terminate the GROUP first (reaps python + the wrapper), then the leader, and
-# wait for the group to be gone so no descendant can exec a stub after cleanup.
-kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+# Reap LEAF-FIRST using the explicit descendant list, then the leader, and wait
+# until nothing from that tree is left alive. This is what guarantees no orphan
+# can exec a stub after the EXIT trap removes $STUB_BIN.
+kids="$(descendants "$pid" || true)"
+# descendants() emits parents-first; kill in reverse (leaves first) so no parent
+# can respawn a child between signals.
+for k in $(printf '%s\n' "$kids" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
+  kill -TERM "$k" 2>/dev/null || true
+done
 kill -TERM "$pid" 2>/dev/null || true
-for _ in $(seq 1 10); do
-  kill -0 "$pid" 2>/dev/null || break
+
+for _ in $(seq 1 15); do
+  left=0
+  kill -0 "$pid" 2>/dev/null && left=1
+  for k in $kids; do kill -0 "$k" 2>/dev/null && left=1; done
+  [ "$left" -eq 0 ] && break
   sleep 0.2
 done
-kill -KILL -- "-$pid" 2>/dev/null || true
+
+# Backstop: SIGKILL anything still alive in the tree.
+for k in $kids; do kill -KILL "$k" 2>/dev/null || true; done
 kill -KILL "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
+
+# Prove the tree is gone, so a later exec cannot reach a removed stub dir.
+survivors=0
+for k in $kids; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
+[ "$survivors" -eq 0 ] && pass "cleanup: no descendants survived the pass" \
+                      || fail "cleanup: $survivors descendant(s) still alive after teardown"
 
 [ "$seen" = 1 ]  && pass "behavioural: scan: emitted during the pass" \
                  || fail "behavioural: no progress output during the pass"

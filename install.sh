@@ -750,6 +750,19 @@ if [ -d "${UNIT_DIR}" ]; then
 
   if [ "$(uname -s)" = "Darwin" ]; then
     # macOS: wrap each systemd-style unit into a launchd plist
+    # XML-escape a value before interpolating it into a plist <string>.
+    # Without this a record containing & or < produces an INVALID plist, and the
+    # installer unloads the prior agent before writing, so a bad value can leave
+    # a cleaner UNLOADED (review P0).
+    #
+    # NOTE: bash's ${var//pat/rep} expands & in the REPLACEMENT to the matched
+    # text, so "${s//</&lt;}" yields "<lt;" (verified on bash 5.3). Use sed with
+    # escaped ampersands instead — the same construction the launchd template
+    # installer already relies on. Escape & FIRST.
+    xml_esc() {
+      printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+    }
+
     # Read EZGHA_SUSPENSION_RECORD from an ALREADY INSTALLED plist so a
     # reinstall without the env var preserves the declaration. Empty when the
     # file or key is absent (=> fail-closed, which is the safe default).
@@ -823,9 +836,11 @@ PLIST
           #   3. otherwise, emit an explicit empty declaration
           local rec="${EZGHA_SUSPENSION_RECORD-__UNSET__}"
           if [ "${rec}" = "__UNSET__" ]; then
+            # prior_record was decoded by plistlib (entities resolved), so it is
+            # re-escaped on write below. That round-trip is intentional.
             rec="${prior_record}"      # captured before truncation
           fi
-          env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string>${rec}</string>"
+          env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string>$(xml_esc "${rec}")</string>"
           ;;
       esac
       if [ -n "${env_xml}" ]; then

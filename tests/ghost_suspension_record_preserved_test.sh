@@ -42,7 +42,7 @@ render() { # $1 = plist path ; env: EZGHA_SUSPENSION_RECORD (may be unset)
   <key>Label</key><string>probe</string>
 P
   ( name="queue-trimmer"; plist="$plist"; prior_record="$prior_record"; \
-    DOCKER_HOST_OVERRIDE=""; source "$WORK/block.sh" ) || true
+    DOCKER_HOST_OVERRIDE=""; source "$WORK/helpers.sh"; source "$WORK/block.sh" ) || true
   echo '</dict></plist>' >> "$plist"
 }
 
@@ -74,18 +74,37 @@ open(sys.argv[2], "w").write("\n".join(l[4:] if l.startswith("    ") else l for 
 # the plist_record_of helper. NOTE: de-indent by 4 ONLY lines that start with
 # 4+ spaces; a python heredoc body inside it is indented differently and must be
 # preserved verbatim, or the extracted helper is syntactically broken.
+# Extract helper functions by BRACE MATCHING, not by "first closing brace".
+# A naive `src.index("\n    }\n")` finds the wrong brace because xml_esc() is
+# itself a nested function inside the Darwin branch (review-driven fix).
+xs = src.index('    xml_esc() {')
+def _fn_end(s, open_idx):
+    depth = 0
+    for i in range(open_idx, len(s)):
+        if s[i] == '{':
+            depth += 1
+        elif s[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    raise AssertionError("unbalanced braces")
+xe = _fn_end(src, xs)
+xml_esc_src = "\n".join(l[4:] if l.startswith("    ") else l for l in src[xs:xe].splitlines()) + "\n"
+
 hs = src.index('    plist_record_of() {')
-he = src.index('\n    }\n', hs) + len('\n    }\n')
+he = _fn_end(src, hs)
 lines = src[hs:he].splitlines()
 out, in_py = [], False
 for l in lines:
-    if "<<'PYPLIST'" in l: in_py = True
+    if "<<'PYPLIST'" in l:
+        in_py = True
     if in_py:
         out.append(l[4:] if l.startswith("    " * 2) else l)
     else:
         out.append(l[4:] if l.startswith("    ") else l)
-    if l.strip() == "PYPLIST": in_py = False
-open(sys.argv[3], "w").write("\n".join(out) + "\n")
+    if l.strip() == "PYPLIST":
+        in_py = False
+open(sys.argv[3], "w").write(xml_esc_src + "\n".join(out) + "\n")
 PY
 # shellcheck disable=SC1090
 source "$WORK/helpers.sh"
@@ -124,6 +143,28 @@ render "$PLIST"
 r="$(read_record "$PLIST")"
 [ -z "$r" ] && pass "5 fresh install without prior state declares empty (not absent)" \
             || fail "5 expected explicit empty, got '$r'"
+
+# ---- 5b. XML-SPECIAL characters must survive round-trip (review P0) ------
+# An unescaped & or < produces an INVALID plist; install.sh unloads the prior
+# agent before writing, so a bad value can leave a cleaner UNLOADED.
+TRICKY='a&b<c>d"e'
+export EZGHA_SUSPENSION_RECORD="$TRICKY"
+render "$PLIST"
+if plutil -lint "$PLIST" >/dev/null 2>&1; then
+  pass "5b plist with XML-special characters lints clean"
+else
+  fail "5b plist with XML-special characters is INVALID (unescaped record)"
+fi
+r="$(read_record "$PLIST")"
+[ "$r" = "$TRICKY" ] && pass "5b XML-special value round-trips exactly" \
+                     || fail "5b round-trip changed the value (got '$r')"
+
+# ---- 5c. ...and preservation of that tricky value across a reinstall -----
+unset EZGHA_SUSPENSION_RECORD
+render "$PLIST"
+r="$(read_record "$PLIST")"
+[ "$r" = "$TRICKY" ] && pass "5c XML-special value PRESERVED across reinstall" \
+                     || fail "5c preservation mangled the XML-special value (got '$r')"
 
 # ---- 6. the template installer has the same precedence -------------------
 T="launchd/install-launchagents.sh"
