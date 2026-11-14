@@ -169,6 +169,27 @@ def job_total(repo, rid):
         return None
 
 
+def reap_gate(repo, rid):
+    """Re-confirm eligibility IMMEDIATELY before each mutating call.
+
+    Returns a skip-status string when the run must not be touched, else None.
+
+    A run that was a zero-job ghost when listed can gain jobs and become real CI
+    work at any point. Checking only once before the first cancel is not enough:
+    the default verify wait is 6s, and force-cancel/DELETE happen AFTER it, so a
+    run can transition in that window and still be destroyed (review P1). This
+    gate is therefore called before every mutation.
+    """
+    if not still_queued(repo, rid):
+        return "skipped_started"
+    total = job_total(repo, rid)
+    if total is None:
+        return "skipped_jobs_unknown"   # fail closed
+    if total != 0:
+        return "skipped_now_has_jobs"
+    return None
+
+
 def reap_one(repo, row, verify_wait_s, apply):
     """cancel -> verify -> force-cancel -> delete. Returns a status string."""
     rid = row["id"]
@@ -181,11 +202,9 @@ def reap_one(repo, row, verify_wait_s, apply):
     # zero-job ghost when listed can gain jobs and become REAL work; deleting it
     # would destroy a live CI run. Re-confirm zero jobs immediately before acting.
     # An unreadable count fails closed (skip) rather than destroying anything.
-    total = job_total(repo, rid)
-    if total is None:
-        return "skipped_jobs_unknown"
-    if total != 0:
-        return "skipped_now_has_jobs"
+    gate = reap_gate(repo, rid)
+    if gate:
+        return gate
     wedged = False
     try:
         gh(f"/repos/{repo}/actions/runs/{rid}/cancel", "POST")
@@ -197,6 +216,11 @@ def reap_one(repo, row, verify_wait_s, apply):
             wedged = True
     if verify_wait_s > 0:
         time.sleep(verify_wait_s)
+    if not still_queued(repo, rid):
+        return "skipped_started"
+    gate = reap_gate(repo, rid)          # re-check AFTER the verify wait
+    if gate:
+        return gate
     if still_queued(repo, rid):
         try:
             gh(f"/repos/{repo}/actions/runs/{rid}/force-cancel", "POST")
@@ -206,6 +230,9 @@ def reap_one(repo, row, verify_wait_s, apply):
                 return "skipped_gone"
             if exc.status == 409 and "not been queued" in str(exc):
                 wedged = True
+    gate = reap_gate(repo, rid)          # final gate before the destructive call
+    if gate:
+        return gate
     if still_queued(repo, rid):
         try:
             gh(f"/repos/{repo}/actions/runs/{rid}", "DELETE")
