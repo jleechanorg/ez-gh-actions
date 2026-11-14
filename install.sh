@@ -750,10 +750,25 @@ if [ -d "${UNIT_DIR}" ]; then
 
   if [ "$(uname -s)" = "Darwin" ]; then
     # macOS: wrap each systemd-style unit into a launchd plist
+    # Read EZGHA_SUSPENSION_RECORD from an ALREADY INSTALLED plist so a
+    # reinstall without the env var preserves the declaration. Empty when the
+    # file or key is absent (=> fail-closed, which is the safe default).
+    plist_record_of() {
+      local f="$1"
+      [ -f "${f}" ] || { printf ''; return 0; }
+      /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${f}" 2>/dev/null || printf ''
+    }
+
     install_macos_plist() {
       local name="$1" interval_sec="$2" exec_path="$3" exec_args="$4"
       local plist="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha-${name}.plist"
+      # Capture the EXISTING declaration BEFORE we truncate the file below.
+      # install.sh overwrites ${plist} with `cat >`, so a read taken after that
+      # point cannot preserve anything (this was a P0: a reinstall without the
+      # env var silently cleared an acknowledged ghost set).
+      local prior_record=""
       if [ -f "${plist}" ]; then
+        prior_record="$(plist_record_of "${plist}")"
         launchctl unload "${plist}" 2>/dev/null || true
       fi
       mkdir -p "${HOME_DIR}/.local/state/ezgha"
@@ -783,12 +798,19 @@ PLIST
       fi
       case "${name}" in
         queue-trimmer|queue-reaper)
-          if [ -n "${EZGHA_SUSPENSION_RECORD:-}" ]; then
-            env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string>${EZGHA_SUSPENSION_RECORD}</string>"
-          else
-            # Emit it EMPTY so the behaviour is explicit, not implied by absence.
-            env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string></string>"
+          # Preserve an EXISTING declaration across reinstalls. A routine
+          # ./install.sh (or a fresh-checkout reinstall) runs WITHOUT the
+          # variable exported; if we simply emitted empty we would silently
+          # revert an acknowledged ghost set to fail-closed and the cleaners
+          # would go permanently red again. Precedence:
+          #   1. EZGHA_SUSPENSION_RECORD explicitly set (incl. empty) -> declare it
+          #   2. otherwise, carry over the value already in the installed plist
+          #   3. otherwise, emit an explicit empty declaration
+          local rec="${EZGHA_SUSPENSION_RECORD-__UNSET__}"
+          if [ "${rec}" = "__UNSET__" ]; then
+            rec="${prior_record}"      # captured before truncation
           fi
+          env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string>${rec}</string>"
           ;;
       esac
       if [ -n "${env_xml}" ]; then

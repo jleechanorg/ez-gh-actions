@@ -275,10 +275,23 @@ case "$action" in
         DASHBOARD_PLIST_BACKUP="${backup}"
       fi
       # @GHOST_SUSPENSION_RECORD@ declares known, unmovable zero-job queued runs
-      # (AGENTS.md: a suspended state must be DECLARED, never inferred). Empty by
-      # default => fail-closed behaviour preserved. Override per-install with
-      # EZGHA_SUSPENSION_RECORD=<bead-id>.
-      GHOST_SUSPENSION_RECORD_SED="$(sed_escape "${EZGHA_SUSPENSION_RECORD:-}")"
+      # (AGENTS.md: a suspended state must be DECLARED, never inferred).
+      # PRECEDENCE — a reinstall without the env var must NOT silently clear an
+      # existing declaration, or the cleaners go permanently red again:
+      #   1. EZGHA_SUSPENSION_RECORD explicitly set (incl. empty) -> use it
+      #   2. otherwise carry over the value from the installed plist
+      #   3. otherwise empty (fail-closed, the safe default)
+      GHOST_REC="${EZGHA_SUSPENSION_RECORD-__UNSET__}"
+      if [[ "${GHOST_REC}" == "__UNSET__" ]]; then
+        if [[ -f "${dest}" ]] && /usr/libexec/PlistBuddy -c \
+             "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${dest}" >/dev/null 2>&1; then
+          GHOST_REC="$(/usr/libexec/PlistBuddy -c \
+             "Print :EnvironmentVariables:EZGHA_SUSPENSION_RECORD" "${dest}" 2>/dev/null || true)"
+        else
+          GHOST_REC=""
+        fi
+      fi
+      GHOST_SUSPENSION_RECORD_SED="$(sed_escape "${GHOST_REC}")"
       sed -e "s|@HOME@|${HOME_SED}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR_SED}|g" \
           -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_SED}|g" \
           -e "s|@GHOST_SUSPENSION_RECORD@|${GHOST_SUSPENSION_RECORD_SED}|g" "$tmpl" > "$candidate"
