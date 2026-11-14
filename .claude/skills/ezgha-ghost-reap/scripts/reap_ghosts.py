@@ -152,13 +152,27 @@ def classify(repo, min_age_min):
     return candidates, protected, too_young, not_ghost
 
 
-def still_queued(repo, rid):
+def run_status(repo, rid):
+    """Live status of a run, or None when it cannot be READ.
+
+    Returning None (rather than assuming "queued") is essential: the previous
+    version mapped any non-404 API error to queued=True, so a run whose status
+    reads all returned HTTP 503 was still cancelled, force-cancelled and DELETEd
+    (review P0, reproduced).
+    """
     try:
-        return gh(f"/repos/{repo}/actions/runs/{rid}").get("status") == "queued"
+        body = gh(f"/repos/{repo}/actions/runs/{rid}")
     except ApiError as exc:
         if exc.status == 404:
-            return False
-        return True  # unknown: let the caller's delete surface the real problem
+            return "gone"
+        return None                      # unreadable => fail closed
+    st = body.get("status") if isinstance(body, dict) else None
+    return st if isinstance(st, str) else None
+
+
+def still_queued(repo, rid):
+    """True only when the status is POSITIVELY read as queued."""
+    return run_status(repo, rid) == "queued"
 
 
 def job_total(repo, rid):
@@ -180,11 +194,16 @@ def reap_gate(repo, rid):
     run can transition in that window and still be destroyed (review P1). This
     gate is therefore called before every mutation.
     """
-    if not still_queued(repo, rid):
-        return "skipped_started"
+    st = run_status(repo, rid)
+    if st is None:
+        return "skipped_status_unknown"  # unreadable => never mutate
+    if st == "gone":
+        return "skipped_gone"
+    if st != "queued":
+        return "skipped_started"         # already running/completed
     total = job_total(repo, rid)
     if total is None:
-        return "skipped_jobs_unknown"   # fail closed
+        return "skipped_jobs_unknown"    # fail closed
     if total != 0:
         return "skipped_now_has_jobs"
     return None
@@ -230,27 +249,23 @@ def reap_one(repo, row, verify_wait_s, apply):
                 return "skipped_gone"
             if exc.status == 409 and "not been queued" in str(exc):
                 wedged = True
-    gate = reap_gate(repo, rid)          # final gate before the destructive call
+    # FINAL gate immediately before the destructive call. The previous shape
+    # re-read status here and, if it had become in_progress, fell through to the
+    # DELETE below anyway (review P0, reproduced). reap_gate now positively
+    # requires queued AND zero jobs, so this delete runs only on that proof.
+    gate = reap_gate(repo, rid)
     if gate:
         return gate
-    if still_queued(repo, rid):
-        try:
-            gh(f"/repos/{repo}/actions/runs/{rid}", "DELETE")
-            return "reaped"
-        except ApiError as exc:
-            if exc.status == 404:
-                return "skipped_gone"
-            if exc.status == 403:
-                # 403 delete + 409 cancel = wedged, not retryable.
-                return "wedged_unreapable" if wedged else "delete_403"
-            raise
     try:
         gh(f"/repos/{repo}/actions/runs/{rid}", "DELETE")
+        return "reaped"
     except ApiError as exc:
         if exc.status == 404:
             return "skipped_gone"
         if exc.status == 403:
-            return "delete_403"
+            # 403 delete + 409 cancel = wedged, not retryable.
+            return "wedged_unreapable" if wedged else "delete_403"
+        raise
         raise
     return "reaped"
 
