@@ -274,8 +274,14 @@ case "$action" in
         DASHBOARD_PLIST_CANDIDATE="${candidate}"
         DASHBOARD_PLIST_BACKUP="${backup}"
       fi
+      # @GHOST_SUSPENSION_RECORD@ declares known, unmovable zero-job queued runs
+      # (AGENTS.md: a suspended state must be DECLARED, never inferred). Empty by
+      # default => fail-closed behaviour preserved. Override per-install with
+      # EZGHA_SUSPENSION_RECORD=<bead-id>.
+      GHOST_SUSPENSION_RECORD_SED="$(sed_escape "${EZGHA_SUSPENSION_RECORD:-}")"
       sed -e "s|@HOME@|${HOME_SED}|g" -e "s|@SCRIPTS_DIR@|${SCRIPTS_DIR_SED}|g" \
-          -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_SED}|g" "$tmpl" > "$candidate"
+          -e "s|@SCRATCH_ROOT@|${SCRATCH_ROOT_SED}|g" \
+          -e "s|@GHOST_SUSPENSION_RECORD@|${GHOST_SUSPENSION_RECORD_SED}|g" "$tmpl" > "$candidate"
       if [[ "${label}" == "${DASHBOARD_LABEL}" && -n "${DOCKER_HOST_OVERRIDE:-}" ]]; then
         python3 - "$candidate" "$DOCKER_HOST_OVERRIDE" <<'PY'
 import plistlib
