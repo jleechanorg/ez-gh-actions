@@ -8,6 +8,12 @@ Marker: `EZGHA_GHOST_REAP_COMMAND_V1`
 
 Thin dispatcher — the workflow and safety invariants are owned by the skill.
 
+**MANUAL DIAGNOSTIC ONLY.** Ghost handling for the scheduled agents lives in
+`scripts/cleanup-stuck-runs.sh` (and ghost classification in PR #227, not yet
+merged/deployed). This command exists to measure and explain the population by
+hand; it is not a second agent and must not be scheduled. Dry-run is the default;
+`--apply` is required for any mutation.
+
 Read `.claude/skills/ezgha-ghost-reap/SKILL.md` completely, then run:
 
 ```bash

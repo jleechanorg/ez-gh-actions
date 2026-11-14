@@ -5,7 +5,26 @@ description: Reap ghost GitHub Actions workflow runs (status=queued with zero jo
 
 # ezgha ghost reap — cancel/delete zero-job queued runs
 
-Marker: `EZGHA_GHOST_REAP_SKILL_V1`
+Marker: `EZGHA_GHOST_REAP_SKILL_V2_MANUAL_ONLY`
+
+> [!IMPORTANT]
+> **MANUAL DIAGNOSTIC ONLY — this is not the automation.**
+>
+> The scheduled ghost handling is `scripts/cleanup-stuck-runs.sh` (launchd, every
+> 6h), which has the declaration gate (`EZGHA_SUSPENSION_RECORD`), distinct-id
+> escalation and full test coverage. Ghost classification for those live agents
+> lands in **PR #227**, which was still under review when this note was written —
+> do not describe it as deployed. Until it merges, the live agents still count
+> ghosts as hard failures.
+>
+> This script exists to *measure and explain* the population by hand. It is not a
+> second agent and must not be scheduled. Running it alongside the scheduled
+> reaper duplicates API budget for no benefit.
+>
+> **Mutation gating:** dry-run by default; real cancel/delete requires an explicit
+> `--apply`. Use it read-only unless the scheduled agent is unavailable. Every
+> cancel is re-verified immediately before acting, and deploy workflows are
+> protected by path.
 
 ## What a ghost is
 
@@ -40,7 +59,8 @@ The 409 text is the tell: GitHub does not consider the run to have reached the q
 nothing can transition it and delete never becomes legal.
 
 **Measured 2026-11-14 on `jleechanorg/worldarchitect.ai`: 149 of 149 zero-job queued runs
-are in this state — 0 reaped.** The script reports `wedged_unreapable` (cancel/force-cancel
+in that sample were in this state — 0 reaped.** (Dated observation, not a live count;
+re-measure before quoting it.) The script reports `wedged_unreapable` (cancel/force-cancel
 409) separately from `delete_403` (delete refused) so the two are not conflated. Do not
 retry these every cycle; they cost API budget and change nothing.
 
