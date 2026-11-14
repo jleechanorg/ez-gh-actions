@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
+import re
 import json
 import random
 import subprocess
@@ -96,6 +98,30 @@ def minutes_since(stamp, now):
     return (now - dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds() / 60
 
 
+# A leg can be intentionally suspended (AGENTS.md: "a deliberately parked platform
+# is DISABLED, not DOWN"). The fleet contract declares that via an explicit env
+# opt-out; a parked leg must never be reported as a host outage.
+PARKED_ENV = {
+    "ez-mac-runner": ("MAC_RUNNER_DISABLED",),
+    "ez-runner-c": ("REMOTE_LINUX_DISABLED",),
+}
+
+
+def _is_parked_prefix(prefix):
+    """True when this prefix's leg is explicitly opted out of the fleet contract.
+
+    Only the literal "1" opts out, matching doctor-runner's authoritative parsing.
+    Accepting any non-empty value would let "false" or "2" suppress a REAL outage
+    warning (review P1: reproduced both)."""
+    for known, vars_ in PARKED_ENV.items():
+        if prefix.startswith(known):
+            # Exact match, NO .strip(): doctor-runner compares
+            # [ "${VAR:-0}" = "1" ], so " 1 " and "1\n" do NOT park a leg there.
+            # Stripping here would let those values suppress a real outage warning.
+            return any(os.environ.get(v, "") == "1" for v in vars_)
+    return False
+
+
 def measure(repo, org=DEFAULT_ORG, verify=VERIFY_SAMPLE):
     now = dt.datetime.now(dt.timezone.utc)
     out = {"repo": repo, "sampled_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
@@ -104,6 +130,20 @@ def measure(repo, org=DEFAULT_ORG, verify=VERIFY_SAMPLE):
     runners = fleet.get("runners", [])
     online = [r for r in runners if r.get("status") == "online"]
     busy = [r for r in online if r.get("busy")]
+    # Per-prefix registration counts. A prefix that is 100% offline is the
+    # signal that a HOST or network link is down — the case that was previously
+    # inverted into "saturated: genuine capacity pressure" (observed 2026-11-14:
+    # every ez-runner-c-* offline while jeff-ubuntu was unreachable by ICMP, LAN
+    # SSH and tailscale). Prefix = runner name minus its trailing -<number>.
+    prefixes = {}
+    for r in runners:
+        name = r.get("name") or ""
+        pref = re.sub(r"-\d+$", "", name)
+        slot = prefixes.setdefault(pref, {"total": 0, "online": 0})
+        slot["total"] += 1
+        if r.get("status") == "online":
+            slot["online"] += 1
+
     out["fleet"] = {
         "total": len(runners),
         "online": len(online),
@@ -112,6 +152,23 @@ def measure(repo, org=DEFAULT_ORG, verify=VERIFY_SAMPLE):
         "offline": len(runners) - len(online),
         "utilization_pct": round(100 * len(busy) / len(online), 1) if online else 0.0,
         "offline_names": sorted(r["name"] for r in runners if r.get("status") != "online"),
+        "prefixes": prefixes,
+        # Prefixes where every registration is offline => suspected host outage.
+        # EXCLUSIONS (review): a deliberately parked leg is NOT an outage, and the
+        # fleet contract already models that as an explicit opt-out
+        # (MAC_RUNNER_DISABLED / REMOTE_LINUX_DISABLED). Without this, a healthy
+        # parked Mac leg would page "host outage" forever. Also require >=2
+        # registrations so a single broken runner is not called a host outage.
+        "parked_prefixes": sorted(
+            f"{k} ({v['total']}/{v['total']} offline)"
+            for k, v in prefixes.items()
+            if v["total"] >= 2 and v["online"] == 0 and _is_parked_prefix(k)
+        ),
+        "dead_prefixes": sorted(
+            f"{k} ({v['total']}/{v['total']} offline)"
+            for k, v in prefixes.items()
+            if v["total"] >= 2 and v["online"] == 0 and not _is_parked_prefix(k)
+        ),
     }
 
     out["run_status_totals"] = {
@@ -217,12 +274,28 @@ def render(r):
     lines = [
         f"## Queued status — {r['repo']} @ {r['sampled_at']}",
         "",
-        "### Runner fleet (org level)",
-        f"- online **{f['online']}** / total {f['total']} — busy {f['busy']}, "
-        f"idle **{f['idle']}**, offline {f['offline']} ({f['utilization_pct']}% utilized)",
+        "### Runner registrations (GitHub API only)",
+        "- These are **registrations**, not verified live capacity. AGENTS.md: the "
+        "GitHub API cannot be trusted for fleet state. Confirm locally with "
+        "`./doctor-runner` (per-slot `Runner.Worker` via `docker top`).",
+        f"- registered: **{f['total']}**, status=online {f['online']}, "
+        f"busy {f['busy']}, idle {f['idle']}, offline {f['offline']}",
     ]
+    if f.get("parked_prefixes"):
+        lines.append(
+            "- intentionally PARKED (operator opt-out, not an outage): "
+            + "; ".join(f["parked_prefixes"])
+        )
+    if f["dead_prefixes"]:
+        lines.append(
+            "- **WHOLE-PREFIX OFFLINE — possible host outage (unverified):** "
+            + "; ".join(f["dead_prefixes"])
+            + ". Every registration in that prefix reports offline, which points at "
+              "the host or its network link rather than at queue pressure. This is a "
+              "warning, not proof; confirm with `./doctor-runner`."
+        )
     if f["offline_names"]:
-        lines.append(f"- offline: {', '.join(f['offline_names'])}")
+        lines.append(f"- offline registrations: {', '.join(f['offline_names'])}")
     lines += [
         "",
         "### Queued workflow runs",
@@ -240,10 +313,21 @@ def render(r):
         f"- queued jobs: **{jq['queued_jobs']}** across {len(r['live_runs'])} live runs; "
         f"running {jq['running_jobs']}",
     ]
+    # NEVER conclude capacity from API data alone. Zero API-idle runners can mean
+    # every slot is busy OR that a whole prefix is offline; those need opposite
+    # responses. State the observation and send the reader to the local probe.
     if f["idle"] > 0 and jq["queued_jobs"] == 0:
-        lines.append("- healthy: idle runners exist and nothing is waiting")
+        lines.append(
+            "- API shows idle registrations and nothing waiting. Confirm with "
+            "`./doctor-runner` before calling the fleet healthy."
+        )
     elif f["idle"] == 0 and jq["queued_jobs"] > 0:
-        lines.append("- saturated: zero idle runners while jobs wait — genuine capacity pressure")
+        lines.append(
+            "- **capacity: UNKNOWN.** The API shows zero idle registrations while "
+            "jobs wait, but that shape is equally consistent with a whole prefix "
+            "being offline. Only `./doctor-runner` (local `docker top`, per-slot "
+            "`Runner.Worker`) can distinguish saturation from an outage."
+        )
     if jq["pickup_wait_median_min"] is not None:
         lines.append(
             f"- pickup wait (started_at − created_at): median **{jq['pickup_wait_median_min']}m**, "
@@ -285,7 +369,24 @@ def main(argv=None):
     except MeasureError as exc:
         print(f"MEASUREMENT FAILED: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(result, indent=2) if args.json else render(result))
+    if args.json:
+        # The human render carries the fleet-truth caveat; the machine-readable
+        # path must not silently drop it (review P0). Annotate the structured
+        # result so a JSON consumer cannot read utilization as verified capacity.
+        result["fleet_evidence"] = {
+            "source": "github_api_registrations_only",
+            "capacity_verdict": "UNKNOWN",
+            "not_verified": True,
+            "verify_locally_with": "./doctor-runner (per-slot Runner.Worker via docker top)",
+            "note": (
+                "registered counts are GitHub's view, not live capacity; a fully "
+                "offline prefix produces the same shape as saturation; parked legs "
+                "(MAC_RUNNER_DISABLED/REMOTE_LINUX_DISABLED=1) are DISABLED, not DOWN"
+            ),
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        print(render(result))
     return 0
 
 

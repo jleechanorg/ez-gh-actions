@@ -66,6 +66,10 @@ jobs:
           bash tests/cleanup_stuck_runs_race_skip_test.sh
           bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
           bash tests/cleanup_stuck_runs_unschedulable_test.sh
+      - name: Queued-status fleet-truth regressions
+        run: |
+          bash tests/queued_status_fleet_truth_test.sh
+          bash tests/ghost_reap_readonly_test.sh
       - name: Exit criteria CPU burst regressions
         run: |
           bash tests/verify_exit_gate2_docker_mode_test.sh
