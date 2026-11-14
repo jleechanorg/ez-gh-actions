@@ -75,12 +75,23 @@ pid=$!
 # bash 3.2 + `set -u` treats "${arr[@]}" on an EMPTY array as an unbound-variable
 # error, so never expand an array that may be empty; use a newline-separated
 # string instead.
+#
+# RETURNS NON-ZERO when process discovery itself fails, so the caller cannot
+# mistake "pgrep is broken/unavailable" for "there are no descendants".
 descendants() {
   local frontier="$1" kids out=""
+  command -v pgrep >/dev/null 2>&1 || return 3
   while [ -n "$frontier" ]; do
     kids=""
     for p in $frontier; do
-      for c in $(pgrep -P "$p" 2>/dev/null || true); do
+      local got
+      if ! got="$(pgrep -P "$p" 2>/dev/null)"; then
+        # pgrep exits 1 for "no children" (fine) but >1 means a real error.
+        local rc=$?
+        [ "$rc" -eq 1 ] || return 4
+        got=""
+      fi
+      for c in $got; do
         kids="$kids $c"
         out="$out $c"
       done
@@ -103,33 +114,58 @@ done
 
 # We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
 # `wait` under `set -e` would abort BEFORE the assertions below.
-# Reap LEAF-FIRST using the explicit descendant list, then the leader, and wait
-# until nothing from that tree is left alive. This is what guarantees no orphan
-# can exec a stub after the EXIT trap removes $STUB_BIN.
-kids="$(descendants "$pid" || true)"
-# descendants() emits parents-first; kill in reverse (leaves first) so no parent
-# can respawn a child between signals.
-for k in $(printf '%s\n' "$kids" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
-  kill -TERM "$k" 2>/dev/null || true
-done
-kill -TERM "$pid" 2>/dev/null || true
+#
+# TEARDOWN must survive a parent spawning a NEW child between our snapshot and
+# our signals (review finding: snapshot-then-kill is racy, and the new child is
+# not in the original list so a one-shot check misses it). Strategy: REPEATED
+# SWEEPS until two consecutive sweeps are empty, terminating the whole current
+# tree each round, with SIGKILL as the final backstop. Also fail loudly if
+# process discovery is unavailable or errors, so the assertion can never pass
+# vacuously.
+discovery_ok=1
+sweep() {
+  local found rc
+  found="$(descendants "$pid")"; rc=$?
+  if [ "$rc" -ne 0 ]; then discovery_ok=0; echo ""; return 0; fi
+  printf '%s\n' "$found"
+}
 
-for _ in $(seq 1 15); do
-  left=0
-  kill -0 "$pid" 2>/dev/null && left=1
-  for k in $kids; do kill -0 "$k" 2>/dev/null && left=1; done
-  [ "$left" -eq 0 ] && break
-  sleep 0.2
+kill_tree() { # TERM the whole current tree, leaves first
+  local found
+  found="$(sweep)"
+  for k in $(printf '%s\n' "$found" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
+    kill -TERM "$k" 2>/dev/null || true
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+empty_streak=0
+for _ in $(seq 1 40); do
+  # Keep the leader suppressed first so it cannot keep forking.
+  kill -STOP "$pid" 2>/dev/null || true
+  kill_tree
+  remaining="$(sweep)"
+  if [ -z "$remaining" ] && ! kill -0 "$pid" 2>/dev/null; then
+    empty_streak=$((empty_streak+1))
+    [ "$empty_streak" -ge 2 ] && break
+  else
+    empty_streak=0
+  fi
+  sleep 0.1
 done
 
-# Backstop: SIGKILL anything still alive in the tree.
-for k in $kids; do kill -KILL "$k" 2>/dev/null || true; done
+# Backstop: SIGKILL any survivor of the current tree, then the leader.
+for k in $(sweep); do kill -KILL "$k" 2>/dev/null || true; done
 kill -KILL "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
 
-# Prove the tree is gone, so a later exec cannot reach a removed stub dir.
+# Final accounting AFTER the leader is gone: no new child can appear now.
+final="$(sweep)"
 survivors=0
-for k in $kids; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
+for k in $final; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
+[ "$discovery_ok" -eq 1 ] \
+  && pass "cleanup: process discovery available (survivor check is meaningful)" \
+  || fail "cleanup: process discovery failed/unavailable — survivor check would pass vacuously"
 [ "$survivors" -eq 0 ] && pass "cleanup: no descendants survived the pass" \
                       || fail "cleanup: $survivors descendant(s) still alive after teardown"
 
