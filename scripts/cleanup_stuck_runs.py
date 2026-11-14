@@ -1,4 +1,4 @@
-import json, os, subprocess, datetime, time, sys
+import json, os, re, subprocess, datetime, time, sys
 from collections import defaultdict
 
 repo = os.environ["QUEUE_REPO"]
@@ -206,6 +206,62 @@ def fleet_label_pool(org):
 # diagnostic this lever exists to remove (found in review).
 LOOKUP_FAILED = object()
 
+# ── Ghost-run classification (cli/cli#15053) ────────────────────────────────
+# A ghost is a server-held queued run with ZERO jobs refusing every transition
+# (cancel => 409 "has not been queued yet", delete => 403, rerun => 403). It is
+# unmovable via API, so it must be a COUNTED non-fatal class -- unless the
+# suspension is undeclared or the set exceeds bounds.
+GHOST_CANCEL_MARKERS = ("has not been queued yet",)
+GHOST_ID_CAP = 20
+GHOST_ESCALATE_DAYS = int(os.environ.get("GHOST_ESCALATE_DAYS", "14"))
+GHOST_ESCALATE_COUNT = int(os.environ.get("GHOST_ESCALATE_COUNT", "200"))
+GHOST_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)\s*$")
+
+_ghost_ids = set()      # DISTINCT run ids; per-lever counters overlap
+_ghost_ages = []        # for the age bound
+_jobs_cache = {}
+
+def ghost_http_status(err):
+    """The ACTUAL status gh reported, or None if unknown. Anchored on gh's
+    trailing '(HTTP NNN)' -- substring "409" would match request_id=409123."""
+    out = (err.output or b"").decode(errors="replace").strip()
+    tail = out.splitlines()[-1] if out else ""
+    m = GHOST_STATUS_RE.search(tail)
+    return int(m.group(1)) if m else None
+
+def is_ghost_rejection(err):
+    """True ONLY for HTTP 409 with the ghost message; otherwise fail closed."""
+    if err is None or ghost_http_status(err) != 409:
+        return False
+    return any(m in (err.output or b"").decode(errors="replace")
+               for m in GHOST_CANCEL_MARKERS)
+
+def run_job_total(rid):
+    """total_count for a run. -1 => unknown => NOT a ghost.
+
+    Deliberately NOT job_labels(): that helper keeps only status=="queued"
+    jobs, so an all-completed run looks identical to a zero-job run."""
+    if rid in _jobs_cache:
+        return _jobs_cache[rid]
+    try:
+        txt = subprocess.check_output(
+            ["gh", "api", f"repos/{repo}/actions/runs/{rid}/jobs", "--jq", ".total_count"],
+            stderr=subprocess.STDOUT).decode().strip()
+        n = int(txt) if txt else -1
+    except Exception:
+        n = -1
+    _jobs_cache[rid] = n
+    return n
+
+def ghost_hit(rid, age_m=None):
+    """Record a ghost and return True when the run is a confirmed zero-job ghost."""
+    if run_job_total(rid) != 0:
+        return False
+    _ghost_ids.add(rid)
+    if age_m is not None:
+        _ghost_ages.append(age_m)
+    return True
+
 def job_labels(rid):
     """Queued label sets for a run, or LOOKUP_FAILED if the read did not succeed."""
     collected = []
@@ -353,17 +409,24 @@ def delete_run(rid):
     # meantime and was left alone instead of being force-cancelled.
     still, cur_status = recheck_still_queued(rid)
     if not still:
-        return False, cur_status
+        return False, cur_status, None           # 3-tuple: race path
+    cancel_err = None
     try:
         cancel_run(rid)
         time.sleep(2)
         if run_status(rid) == "queued":
             force_cancel_run(rid)
             time.sleep(2)
-    except subprocess.CalledProcessError:
-        pass
+    except subprocess.CalledProcessError as e:
+        cancel_err = e
+    # Ghost short-circuit: a zero-job run whose cancel returns the specific 409
+    # can never be DELETEd (GitHub 403s the generic way for any non-completed
+    # run), so classify it here and never reach the DELETE call. Classifying on
+    # that generic 403 would mask real failures.
+    if is_ghost_rejection(cancel_err):
+        return False, "queued", cancel_err
     subprocess.check_output(["gh", "run", "delete", str(rid), "-R", repo], stderr=subprocess.STDOUT)
-    return True, None
+    return True, None, cancel_err
 
 def verify_and_force_cancel(rid, label):
     """After a plain cancel_run(rid) call, wait ~verify_wait_s and check the
@@ -402,6 +465,8 @@ stats = {
     "superseded_cancelled": 0, "superseded_failed": 0, "superseded_force_cancelled": 0,
     "skipped_no_longer_queued": 0,
     "verify_inconclusive": 0,
+    "zombie_ghost": 0, "superseded_ghost": 0, "tail_ghost": 0,
+    "ghost_unacknowledged": 0, "escalate": 0,
 }
 
 if do_zombies:
@@ -412,7 +477,19 @@ if do_zombies:
             print(f"[dry-run] would delete zombie {rid} {age_m/60/24:.1f}d workflow={name!r} branch={b!r} url={url}")
             continue
         try:
-            deleted, cur_status = delete_run(rid)
+            deleted, cur_status, cancel_err = delete_run(rid)
+            if is_ghost_rejection(cancel_err):
+                # A ghost-shaped 409. Only a ZERO-job run is a ghost; if jobs
+                # exist the 409 is masking a real failure -> count it as one.
+                if ghost_hit(rid, age_m):
+                    stats["zombie_ghost"] += 1
+                    print(f"ghost zombie {rid}: zero-job queued run refuses every transition")
+                else:
+                    stats["zombie_failed"] += 1
+                    print(f"FAIL zombie {rid} url={url}: 409-with-jobs — real failure, "
+                          f"not a ghost")
+                time.sleep(0.35)
+                continue
             if deleted:
                 stats["zombie_deleted"] += 1
                 print(f"deleted zombie {rid} {age_m/60/24:.1f}d workflow={name!r} branch={b!r} url={url}")
@@ -454,8 +531,12 @@ if do_superseded:
                 stats["superseded_cancelled"] += 1
                 print(f"cancelled superseded queued {rid} {age_m:.0f}m workflow={name!r} branch={b!r} url={url}")
             except subprocess.CalledProcessError as e:
-                stats["superseded_failed"] += 1
-                print(f"FAIL superseded {rid} url={url}: {(e.output or b'').decode()[:160]}")
+                if is_ghost_rejection(e) and ghost_hit(rid, age_m):
+                    stats["superseded_ghost"] += 1
+                    print(f"ghost superseded {rid}: zero-job queued run refuses every transition")
+                else:
+                    stats["superseded_failed"] += 1
+                    print(f"FAIL superseded {rid} url={url}: {(e.output or b'').decode()[:160]}")
                 time.sleep(0.35)
                 continue
             try:
@@ -485,8 +566,12 @@ if do_tail:
             stats["tail_cancelled"] += 1
             print(f"cancelled tail {rid} {age_m:.0f}m workflow={name!r} branch={b!r} url={url}")
         except subprocess.CalledProcessError as e:
-            stats["tail_failed"] += 1
-            print(f"FAIL tail {rid} url={url}: {(e.output or b'').decode()[:160]}")
+            if is_ghost_rejection(e) and ghost_hit(rid, age_m):
+                stats["tail_ghost"] += 1
+                print(f"ghost tail {rid}: zero-job queued run refuses every transition")
+            else:
+                stats["tail_failed"] += 1
+                print(f"FAIL tail {rid} url={url}: {(e.output or b'').decode()[:160]}")
             time.sleep(0.35)
             continue
         try:
@@ -497,10 +582,30 @@ if do_tail:
             print(f"FAIL force-cancel tail {rid}: {(e.output or b'').decode()[:120]}")
         time.sleep(0.35)
 
+# Ghost reporting + fail-closed acknowledgement + bounded escalation.
+if _ghost_ids:
+    rec = os.environ.get("EZGHA_SUSPENSION_RECORD", "")
+    print(f"ghost: {len(_ghost_ids)} distinct zero-job queued run(s) refuse every transition "
+          f"(ids: {', '.join(str(i) for i in sorted(_ghost_ids)[:GHOST_ID_CAP])})")
+    print(f"suspension record: {rec or 'UNSET'}")
+    if not rec:
+        # Fail closed: an UNDECLARED ghost set must never read green.
+        stats["ghost_unacknowledged"] = 1
+        print(f"FAIL ghosts are unacknowledged (EZGHA_SUSPENSION_RECORD unset): "
+              f"{len(_ghost_ids)} run(s) counted as failure so this cannot read green")
+    oldest_days = max(_ghost_ages, default=0) / 1440
+    if oldest_days >= GHOST_ESCALATE_DAYS or len(_ghost_ids) >= GHOST_ESCALATE_COUNT:
+        stats["escalate"] = 1
+        print(f"ESCALATION: ghost set exceeds bounds (oldest={oldest_days:.1f}d "
+              f"limit={GHOST_ESCALATE_DAYS}d, distinct={len(_ghost_ids)} "
+              f"limit={GHOST_ESCALATE_COUNT}) — decide: GitHub Support ticket or branch deletion")
+
 print("summary:", stats)
 # verify_inconclusive (codex adversarial review 2026-07-10, P2): a
 # run_status() failure during post-cancel verification is NOT proof the
 # cancel succeeded — mirror the existing *_failed exit-nonzero policy so the
 # script can't exit 0 on unproven cancels.
-if stats["zombie_failed"] or stats["superseded_failed"] or stats["tail_failed"] or stats["verify_inconclusive"]:
+if (stats["zombie_failed"] or stats["superseded_failed"] or stats["tail_failed"]
+        or stats["verify_inconclusive"]
+        or stats["ghost_unacknowledged"] or stats["escalate"]):
     sys.exit(1)
