@@ -61,7 +61,17 @@ chmod +x "$STUB_BIN/git"
 
 RUN=( env -u BASH_ENV PATH="$STUB_BIN:$PATH" QUEUE_REPOS="acme/one"
       bash "$REPO_ROOT/scripts/trim-queued-runs.sh" --dry-run )
-( "${RUN[@]}" </dev/null >"$LOG" 2>&1 ) &
+# setsid puts the whole pipeline in its OWN process group, so terminating the
+# group reaps the python/host bash descendants too. Killing only the wrapper
+# pid left children alive, and they could then exec a stub AFTER $STUB_BIN was
+# removed by the EXIT trap (code-standards review P1).
+if command -v setsid >/dev/null 2>&1; then
+  setsid "${RUN[@]}" </dev/null >"$LOG" 2>&1 &
+else
+  # macOS has no setsid; use a backgrounded subshell and kill its group via
+  # `kill -- -PGID` where PGID == the subshell's pid in this environment.
+  ( "${RUN[@]}" </dev/null >"$LOG" 2>&1 ) &
+fi
 pid=$!
 
 seen=0; alive=0
@@ -76,7 +86,16 @@ done
 
 # We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
 # `wait` under `set -e` would abort BEFORE the assertions below.
-kill "$pid" 2>/dev/null
+# Terminate the GROUP first (reaps python + the wrapper), then the leader, and
+# wait for the group to be gone so no descendant can exec a stub after cleanup.
+kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+kill -TERM "$pid" 2>/dev/null || true
+for _ in $(seq 1 10); do
+  kill -0 "$pid" 2>/dev/null || break
+  sleep 0.2
+done
+kill -KILL -- "-$pid" 2>/dev/null || true
+kill -KILL "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
 
 [ "$seen" = 1 ]  && pass "behavioural: scan: emitted during the pass" \

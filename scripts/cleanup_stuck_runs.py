@@ -213,6 +213,9 @@ LOOKUP_FAILED = object()
 # suspension is undeclared or the set exceeds bounds.
 GHOST_CANCEL_MARKERS = ("has not been queued yet",)
 GHOST_ID_CAP = 20
+# NOTE: escalation is evaluated PER REPOSITORY — each repo pass is a separate
+# python process (the shell wrapper loops over QUEUE_REPOS), so GHOST_ESCALATE_*
+# bounds apply to one repo's distinct ghost set, not the fleet-wide total.
 GHOST_ESCALATE_DAYS = int(os.environ.get("GHOST_ESCALATE_DAYS", "14"))
 GHOST_ESCALATE_COUNT = int(os.environ.get("GHOST_ESCALATE_COUNT", "200"))
 GHOST_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)\s*$")

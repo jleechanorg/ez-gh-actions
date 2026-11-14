@@ -772,12 +772,30 @@ PLIST
       cat >> "${plist}" <<PLIST
   </array>
 PLIST
-      # EnvironmentVariables: DOCKER_HOST when detected.
+      # EnvironmentVariables: DOCKER_HOST when detected, and the ghost-run
+      # suspension declaration for the queue agents. Both the template path
+      # (launchd/install-launchagents.sh) and this path MUST emit the declaration,
+      # or a routine reinstall silently reverts an acknowledged ghost set to
+      # fail-closed and the cleaners go red again (code-standards review P0).
+      local env_xml=""
       if [ -n "${DOCKER_HOST_OVERRIDE}" ]; then
+        env_xml="    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>"
+      fi
+      case "${name}" in
+        queue-trimmer|queue-reaper)
+          if [ -n "${EZGHA_SUSPENSION_RECORD:-}" ]; then
+            env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string>${EZGHA_SUSPENSION_RECORD}</string>"
+          else
+            # Emit it EMPTY so the behaviour is explicit, not implied by absence.
+            env_xml="${env_xml}    <key>EZGHA_SUSPENSION_RECORD</key><string></string>"
+          fi
+          ;;
+      esac
+      if [ -n "${env_xml}" ]; then
         cat >> "${plist}" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
-    <key>DOCKER_HOST</key><string>${DOCKER_HOST_OVERRIDE}</string>
+${env_xml}
   </dict>
 PLIST
       fi
@@ -814,7 +832,9 @@ PLIST
     }
     install_macos_plist "token-refresh" "2700"  "${SCRIPTS_DIR}/refresh_gh_app_token.sh" ""
     install_macos_plist "queue-reaper"  "21600" "${SCRIPTS_DIR}/cleanup-stuck-runs.sh" "--apply"
-    install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 2"
+    # 1.5h matches the launchd template and the deployed job. A reinstall must
+    # NOT silently change which runs are eligible for cancellation.
+    install_macos_plist "queue-trimmer" "900"   "${SCRIPTS_DIR}/trim-queued-runs.sh" "--apply --min-pr-age-hours 1.5"
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
