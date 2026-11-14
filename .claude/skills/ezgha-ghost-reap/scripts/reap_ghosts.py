@@ -210,70 +210,50 @@ def reap_gate(repo, rid):
 
 
 def reap_one(repo, row, verify_wait_s, apply):
-    """cancel -> verify -> force-cancel -> delete. Returns a status string."""
+    """Classify ONE ghost. NEVER mutates.
+
+    This used to cancel -> force-cancel -> delete. That path is removed, for two
+    independent reasons:
+
+    1. IT CANNOT SUCCEED on the population this tool exists for. Measured
+       2026-11-14: 149/149 zero-job queued runs on worldarchitect.ai refused
+       cancel and force-cancel with HTTP 409 "has not been queued yet" and
+       refused DELETE with 403. PR #227 independently measured 65/65 the same,
+       0 removed. The reaper log's historical successes
+       ("deleted zombie 39912506885") came from an earlier, non-wedged
+       population.
+    2. IT CANNOT BE MADE SAFE. Deletion is GET-then-mutate with no conditional
+       write: GitHub exposes no "delete only if still zero-job" precondition
+       (https://docs.github.com/en/rest/actions/workflow-runs). A run can gain
+       real jobs between the eligibility read and the DELETE, and no amount of
+       client-side re-reading closes that window -- an adversarial review
+       demonstrated force-cancel and DELETE firing on a run that had become
+       in_progress with jobs. Removing mutations is the only sound fix.
+
+    Returns a classification string; mutates nothing.
+    """
     rid = row["id"]
-    if not apply:
-        return "would_reap"
-    # Single authoritative eligibility check before the first mutation. Doing a
-    # status-only check here and the full check later left a window where the
-    # status was still queued but jobs had appeared (review P0). reap_gate
-    # checks BOTH conditions in one place, so there is exactly one read that
-    # authorizes each mutation.
-    gate = reap_gate(repo, rid)
-    if gate:
-        return gate
-    wedged = False
-    try:
-        gh(f"/repos/{repo}/actions/runs/{rid}/cancel", "POST")
-    except ApiError as exc:
-        if exc.status == 404:
-            return "skipped_gone"
-        if exc.status == 409 and "not been queued" in str(exc):
-            # The dead-end signature: GitHub says the run never reached the queue.
-            wedged = True
-    if verify_wait_s > 0:
-        time.sleep(verify_wait_s)
-    # reap_gate is the FINAL read before force-cancel. It checks status AND
-    # zero-jobs in one place. A separate status-only read must NOT sit between
-    # the gate and the mutation: it re-opens a window where jobs have appeared
-    # but the status is still queued, and force-cancel would then destroy real
-    # work (review P0, reproduced).
-    gate = reap_gate(repo, rid)
-    if gate:
-        return gate
-    try:
-        gh(f"/repos/{repo}/actions/runs/{rid}/force-cancel", "POST")
-        time.sleep(2)
-    except ApiError as exc:
-        if exc.status == 404:
-            return "skipped_gone"
-        if exc.status == 409 and "not been queued" in str(exc):
-                wedged = True
-    # FINAL gate immediately before the destructive call. The previous shape
-    # re-read status here and, if it had become in_progress, fell through to the
-    # DELETE below anyway (review P0, reproduced). reap_gate now positively
-    # requires queued AND zero jobs, so this delete runs only on that proof.
-    gate = reap_gate(repo, rid)
-    if gate:
-        return gate
-    try:
-        gh(f"/repos/{repo}/actions/runs/{rid}", "DELETE")
-        return "reaped"
-    except ApiError as exc:
-        if exc.status == 404:
-            return "skipped_gone"
-        if exc.status == 403:
-            # 403 delete + 409 cancel = wedged, not retryable.
-            return "wedged_unreapable" if wedged else "delete_403"
-        raise
-        raise
-    return "reaped"
+    st = run_status(repo, rid)
+    if st is None:
+        return "unverified_status_unknown"
+    if st != "queued":
+        return f"unverified_left_queued_{st}"
+    total = job_total(repo, rid)
+    if total is None:
+        return "unverified_jobs_unknown"
+    if total != 0:
+        return "now_has_jobs_real_work"
+    return "ghost_unreapable" if apply else "ghost"
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Reap ghost workflow runs.")
     ap.add_argument("--repo", default=DEFAULT_REPO)
-    ap.add_argument("--apply", action="store_true", help="actually cancel+delete (default: dry run)")
+    ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="LEGACY NO-OP kept for compatibility: this tool no longer mutates anything",
+    )
     ap.add_argument("--min-age-min", type=float, default=60.0,
                     help="minimum run age in minutes (default 60; ghosts are hours old)")
     ap.add_argument("--limit", type=int, default=0, help="cap how many runs to process (0 = all)")
@@ -294,9 +274,8 @@ def main(argv=None):
     summary = {"scanned_queued": len(candidates) + len(protected) + len(too_young) + len(not_ghost),
                "eligible": len(candidates), "protected_deploy": len(protected),
                "too_young": len(too_young), "not_ghost": len(not_ghost)}
-    results = {"reaped": 0, "would_reap": 0, "skipped_started": 0, "skipped_gone": 0,
-               "skipped_now_has_jobs": 0, "skipped_jobs_unknown": 0,
-               "wedged_unreapable": 0, "stuck_queued": 0, "delete_403": 0, "failed": 0}
+    # No mutation outcomes exist any more; these are classifications.
+    results = {}
 
     for row in candidates:
         try:
@@ -309,21 +288,20 @@ def main(argv=None):
             verb = "would reap" if outcome == "would_reap" else outcome
             print(f"  {verb:16} {row['id']} {row['age_min']:>7.0f}m {row['name'][:30]:32} {row['branch'][:26]}")
         # Be gentle with the API: every run costs 2-4 calls.
-        if args.apply:
-            time.sleep(0.4)
-
-    report = {"repo": args.repo, "apply": args.apply, **summary, "results": results}
+    report = {"repo": args.repo, "apply": args.apply, "mutates": False,
+              "note": "classification only; this tool no longer cancels or deletes",
+              **summary, "results": results}
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         print()
-        print(f"{'APPLIED' if args.apply else 'DRY RUN'} — {args.repo}")
+        print(f"CLASSIFY ONLY (no mutation) — {args.repo}")
         print(f"  queued scanned: {summary['scanned_queued']}  eligible ghosts: {summary['eligible']}")
         print(f"  protected deploy runs skipped: {summary['protected_deploy']}")
         print(f"  too young (<{args.min_age_min:.0f}m): {summary['too_young']}   not ghosts: {summary['not_ghost']}")
         print(f"  results: {json.dumps(results)}")
 
-    if results["failed"] or results["delete_403"] or results["wedged_unreapable"]:
+    if results.get("failed"):
         return 3
     return 0
 

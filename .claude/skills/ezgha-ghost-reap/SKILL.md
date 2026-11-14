@@ -21,10 +21,20 @@ Marker: `EZGHA_GHOST_REAP_SKILL_V2_MANUAL_ONLY`
 > second agent and must not be scheduled. Running it alongside the scheduled
 > reaper duplicates API budget for no benefit.
 >
-> **Mutation gating:** dry-run by default; real cancel/delete requires an explicit
-> `--apply`. Use it read-only unless the scheduled agent is unavailable. Every
-> cancel is re-verified immediately before acting, and deploy workflows are
-> protected by path.
+> **READ-ONLY. This tool no longer cancels or deletes anything.** The destructive
+> path was removed for two independent reasons:
+>
+> 1. **It cannot succeed here.** Measured 2026-11-14: 149/149 zero-job queued runs
+>    refused cancel/force-cancel (HTTP 409) and DELETE (403) — 0 reaped. PR #227
+>    measured 65/65 the same.
+> 2. **It cannot be made safe.** Deletion is GET-then-mutate with no conditional
+>    write — GitHub exposes no "delete only if still zero-job" precondition — so a
+>    run can gain real jobs between the eligibility read and the DELETE. Review
+>    demonstrated force-cancel and DELETE firing on a run that had become
+>    in_progress with jobs. No client-side re-read closes that window.
+>
+> `--apply` is accepted for compatibility and is a no-op. Deploy workflows remain
+> excluded from classification output for path safety.
 
 ## What a ghost is
 
