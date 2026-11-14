@@ -214,13 +214,11 @@ def reap_one(repo, row, verify_wait_s, apply):
     rid = row["id"]
     if not apply:
         return "would_reap"
-    # Race guard: never destroy a run that started since we listed it.
-    if not still_queued(repo, rid):
-        return "skipped_started"
-    # Race guard (review P1): "still queued" is NOT enough. A run that was a
-    # zero-job ghost when listed can gain jobs and become REAL work; deleting it
-    # would destroy a live CI run. Re-confirm zero jobs immediately before acting.
-    # An unreadable count fails closed (skip) rather than destroying anything.
+    # Single authoritative eligibility check before the first mutation. Doing a
+    # status-only check here and the full check later left a window where the
+    # status was still queued but jobs had appeared (review P0). reap_gate
+    # checks BOTH conditions in one place, so there is exactly one read that
+    # authorizes each mutation.
     gate = reap_gate(repo, rid)
     if gate:
         return gate
@@ -235,19 +233,21 @@ def reap_one(repo, row, verify_wait_s, apply):
             wedged = True
     if verify_wait_s > 0:
         time.sleep(verify_wait_s)
-    if not still_queued(repo, rid):
-        return "skipped_started"
-    gate = reap_gate(repo, rid)          # re-check AFTER the verify wait
+    # reap_gate is the FINAL read before force-cancel. It checks status AND
+    # zero-jobs in one place. A separate status-only read must NOT sit between
+    # the gate and the mutation: it re-opens a window where jobs have appeared
+    # but the status is still queued, and force-cancel would then destroy real
+    # work (review P0, reproduced).
+    gate = reap_gate(repo, rid)
     if gate:
         return gate
-    if still_queued(repo, rid):
-        try:
-            gh(f"/repos/{repo}/actions/runs/{rid}/force-cancel", "POST")
-            time.sleep(2)
-        except ApiError as exc:
-            if exc.status == 404:
-                return "skipped_gone"
-            if exc.status == 409 and "not been queued" in str(exc):
+    try:
+        gh(f"/repos/{repo}/actions/runs/{rid}/force-cancel", "POST")
+        time.sleep(2)
+    except ApiError as exc:
+        if exc.status == 404:
+            return "skipped_gone"
+        if exc.status == 409 and "not been queued" in str(exc):
                 wedged = True
     # FINAL gate immediately before the destructive call. The previous shape
     # re-read status here and, if it had become in_progress, fell through to the
