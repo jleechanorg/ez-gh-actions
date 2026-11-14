@@ -131,6 +131,10 @@ sed "s|^PATH=.*$|PATH=\"$FBBIN:/usr/bin:/bin\"|" "$S" > "$FB/trim.sh"
 grep -q "^PATH=\"$FBBIN:/usr/bin:/bin\"$" "$FB/trim.sh" \
   || fail "fallback arm: could not pin PATH in the copied script"
 chmod +x "$FB/trim.sh"
+# The python body is a tracked sibling now (heredoc-writer fix), so the sandbox
+# must contain it next to the copied script or the FATAL: missing guard fires.
+cp "$(dirname "$S")/trim_queued_runs.py" "$FB/trim_queued_runs.py" \
+  || fail "fallback arm: could not copy trim_queued_runs.py sibling"
 
 cat > "$FBBIN/python3" <<'SH'
 #!/bin/bash
