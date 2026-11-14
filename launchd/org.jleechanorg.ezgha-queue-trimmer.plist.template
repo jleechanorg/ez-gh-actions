@@ -27,11 +27,13 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
+        <!-- Direct exec (matches the live job). Invoking /bin/bash instead would
+             switch the interpreter to system bash 3.2 and change heredoc/temp-file
+             behaviour relative to the deployed copy. -->
         <string>@SCRIPTS_DIR@/trim-queued-runs.sh</string>
         <string>--apply</string>
         <string>--min-pr-age-hours</string>
-        <string>2</string>
+        <string>1.5</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -44,7 +46,13 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
         <key>MIN_PR_AGE_HOURS</key>
-        <string>2</string>
+        <string>1.5</string>
+        <!-- Ghost-run suspension record (AGENTS.md: a parked/suspended state must be
+             DECLARED, never inferred). Set to the owning bead id so known, unmovable
+             zero-job queued runs are counted rather than failing the pass forever.
+             Leave EMPTY to keep fail-closed behaviour (an undeclared ghost set exits 1). -->
+        <key>EZGHA_SUSPENSION_RECORD</key>
+        <string>@GHOST_SUSPENSION_RECORD@</string>
     </dict>
 
     <key>StartInterval</key>

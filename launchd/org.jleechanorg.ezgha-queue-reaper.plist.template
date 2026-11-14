@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  org.jleechanorg.ezgha-queue-reaper
+
+  Purpose:
+    Runs scripts/cleanup-stuck-runs.sh --apply every 6 hours to remove queued
+    GitHub Actions run artifacts that nothing else clears:
+      - zombies   : status=queued for longer than STALE_HOURS (8h)
+      - superseded: an older queued run for the same branch+workflow
+      - tail      : still queued past FRESH_TAIL_MIN (opt-in)
+
+  Why this template exists:
+    The live reaper was previously installed BY HAND, so
+    `install-launchagents.sh install org.jleechanorg.ezgha-queue-reaper` failed
+    with "unknown launchd template label" (only the unrelated -stopgap template
+    existed). This file makes the documented install path work and keeps the
+    deployed interval/args reproducible.
+
+  Safety invariants (enforced by the script, not here):
+    - only status=queued runs are candidates; in-progress runs are ignored
+    - deploy workflows (deploy-production, auto-deploy-dev) are never touched
+    - ghost runs (queued with ZERO jobs that refuse every transition,
+      cli/cli#15053) are counted, not failed -- unless undeclared
+-->
+<dict>
+    <key>Label</key>
+    <string>org.jleechanorg.ezgha-queue-reaper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@SCRIPTS_DIR@/cleanup-stuck-runs.sh</string>
+        <string>--apply</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@HOME@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:@HOME@/.local/bin</string>
+        <!-- Ghost-run suspension record (AGENTS.md: a parked/suspended state must be
+             DECLARED, never inferred). Set to the owning bead id so known, unmovable
+             zero-job queued runs are counted rather than failing every pass.
+             Leave EMPTY to keep fail-closed behaviour. -->
+        <key>EZGHA_SUSPENSION_RECORD</key>
+        <string>@GHOST_SUSPENSION_RECORD@</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/.local/state/ezgha/queue-reaper.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/.local/state/ezgha/queue-reaper.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

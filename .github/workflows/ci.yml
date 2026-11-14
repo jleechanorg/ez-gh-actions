@@ -66,6 +66,11 @@ jobs:
           bash tests/cleanup_stuck_runs_race_skip_test.sh
           bash tests/cleanup_stuck_runs_verify_inconclusive_test.sh
           bash tests/cleanup_stuck_runs_unschedulable_test.sh
+          bash tests/cleanup_stuck_runs_ghost_test.sh
+          bash tests/trim_queued_runs_test.sh
+          bash tests/trim_queued_runs_bounded_pass_test.sh
+          bash tests/trim_queued_runs_ghost_test.sh
+          bash tests/trim_queued_runs_progress_test.sh
       - name: Exit criteria CPU burst regressions
         run: |
           bash tests/verify_exit_gate2_docker_mode_test.sh
