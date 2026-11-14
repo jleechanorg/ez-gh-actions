@@ -1,92 +1,102 @@
 #!/usr/bin/env bash
 # tests/trim_queued_runs_teardown_race_test.sh
 #
-# Regression for the teardown race found in review:
-#   A snapshot-then-kill teardown signals the children it saw. If a parent is
-#   still running it can FORK A NEW CHILD between the snapshot and the signal,
-#   and that child is not in the list — so a one-shot survivor check passes while
-#   an orphan lives on. A failed/unavailable pgrep makes the check vacuous too.
+# Exercises the REAL teardown implementation used by the progress test
+# (tests/lib/descendants.sh) — not a copy. A previous version duplicated the
+# logic here, so a green result proved nothing about the shipped code.
 #
-# This test drives a purpose-built forker that keeps spawning children while the
-# teardown runs, and asserts the teardown still ends with zero descendants AND
-# that discovery failures are reported rather than silently passing.
+# Cases (each maps to a finding reproduced in review):
+#   1. normal leaf with no children is NOT a discovery error
+#      (`if ! got=$(pgrep ...); then rc=$?` captures `!`'s status, 0, not pgrep's 1)
+#   2. discovery failure is observable in the CALLER
+#      (a flag set inside $( ) mutates a subshell copy and is lost)
+#   3. missing pgrep is a discovery failure, not an empty tree
+#   4. erroring pgrep is a discovery failure, not an empty tree
+#   5. a TERM-ignoring forker that keeps spawning during teardown leaves no
+#      survivors, by live re-walk AND by reparented-to-init orphans
+#   6. RED control: the OLD snapshot-then-kill logic DOES leave orphans under
+#      case 5's workload, so this test genuinely discriminates
 #
 # Usage: bash tests/trim_queued_runs_teardown_race_test.sh
 set -uo pipefail
 unset BASH_ENV || true
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+# shellcheck source=tests/lib/descendants.sh
+. "$ROOT/tests/lib/descendants.sh"
 
 FAILS=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; FAILS=$((FAILS+1)); }
 
 W="$(mktemp -d)"
-cleanup() { rm -rf "${W:?}"; }
+cleanup() { touch "$W/stop" 2>/dev/null; rm -rf "${W:?}"; }
 trap cleanup EXIT
 
-# --- the teardown logic under test (mirrors the progress test) --------------
-descendants() {
-  local frontier="$1" kids out=""
-  command -v pgrep >/dev/null 2>&1 || return 3
-  while [ -n "$frontier" ]; do
-    kids=""
-    for p in $frontier; do
-      local got rc
-      got="$(pgrep -P "$p" 2>/dev/null)"; rc=$?
-      if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then return 4; fi
-      for c in $got; do kids="$kids $c"; out="$out $c"; done
-    done
-    frontier="$kids"
-  done
-  [ -n "$out" ] && printf '%s\n' $out
-  return 0
-}
+# ---- 1. a normal leaf with no children is NOT a discovery error -----------
+sleep 30 &
+LEAF=$!
+descendants_checked "$LEAF"
+if [ "$DESCENDANTS_RC" -eq 0 ]; then
+  pass "1 leaf with no children => discovery ok (not a false error)"
+else
+  fail "1 leaf with no children was misreported as a discovery error (rc=$DESCENDANTS_RC)"
+fi
+[ -z "$DESCENDANTS_OUT" ] && pass "1b leaf has empty descendant list" \
+                          || fail "1b unexpected descendants for a leaf: $DESCENDANTS_OUT"
+kill "$LEAF" 2>/dev/null || true
+wait "$LEAF" 2>/dev/null || true
 
-teardown_tree() { # $1 = pid ; returns 0 ok, 1 = discovery failure
-  local pid="$1" discovery_ok=1 empty_streak=0 remaining found
-  sweep() {
-    local f rc
-    f="$(descendants "$pid")"; rc=$?
-    if [ "$rc" -ne 0 ]; then discovery_ok=0; echo ""; return 0; fi
-    printf '%s\n' "$f"
-  }
-  for _ in $(seq 1 40); do
-    kill -STOP "$pid" 2>/dev/null || true
-    found="$(sweep)"
-    for k in $(printf '%s\n' "$found" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
-      kill -TERM "$k" 2>/dev/null || true
-    done
-    kill -TERM "$pid" 2>/dev/null || true
-    remaining="$(sweep)"
-    if [ -z "$remaining" ] && ! kill -0 "$pid" 2>/dev/null; then
-      empty_streak=$((empty_streak+1)); [ "$empty_streak" -ge 2 ] && break
-    else
-      empty_streak=0
-    fi
-    sleep 0.1
-  done
-  for k in $(sweep); do kill -KILL "$k" 2>/dev/null || true; done
-  kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  [ "$discovery_ok" -eq 1 ] || return 1
-  return 0
-}
+# ---- 2/3/4. discovery failures must be observable in the CALLER ----------
+mkdir -p "$W/bin-missing" "$W/bin-error"
+printf '#!/usr/bin/env bash\nexit 9\n' > "$W/bin-error/pgrep"
+chmod +x "$W/bin-error/pgrep"
 
-# --- 1. a forker that keeps spawning during teardown ----------------------
-# It respawns a short-lived child every 20ms for a while, so any single
-# snapshot is stale almost immediately.
-# The forker must keep spawning for LONGER than any single teardown pass, and
-# must NOT be stoppable by a single TERM (it traps and keeps going until it sees
-# the marker file). Otherwise it simply stops before the snapshot and the race
-# never materialises (verified: it did not bite with a plain sleep-loop).
+# 3: pgrep absent entirely. Use /bin/bash explicitly because an empty PATH also
+#    hides bash itself, and BASH_ENV may otherwise re-add the real PATH.
+( PATH="$W/bin-missing" /bin/bash --noprofile --norc -c '
+  unset BASH_ENV
+  . "$1"
+  descendants_checked 1
+  echo "$DESCENDANTS_RC"' _ "$ROOT/tests/lib/descendants.sh" ) > "$W/rc_missing" 2>/dev/null
+rc_missing="$(tail -1 "$W/rc_missing" 2>/dev/null | tr -dc '0-9')"
+[ -n "$rc_missing" ] && [ "$rc_missing" -ne 0 ] \
+  && pass "3 missing pgrep reported via caller rc=$rc_missing" \
+  || fail "3 missing pgrep was NOT reported (rc='${rc_missing:-empty}' => vacuous pass)"
+
+# 4: pgrep present but erroring
+( PATH="$W/bin-error:$PATH" /bin/bash --noprofile --norc -c '
+  unset BASH_ENV
+  . "$1"
+  descendants_checked 1
+  echo "$DESCENDANTS_RC"' _ "$ROOT/tests/lib/descendants.sh" ) > "$W/rc_error" 2>/dev/null
+rc_error="$(tail -1 "$W/rc_error" 2>/dev/null | tr -dc '0-9')"
+[ -n "$rc_error" ] && [ "$rc_error" -ne 0 ] \
+  && pass "4 erroring pgrep reported via caller rc=$rc_error" \
+  || fail "4 erroring pgrep was NOT reported (rc='${rc_error:-empty}' => vacuous pass)"
+
+# 2: the flag must reach the caller (no subshell loss)
+# 2: the status must reach the CALLER of descendants_checked. Run it directly in
+# this shell (no command substitution around the call) against a pgrep stub that
+# errors, and confirm DESCENDANTS_RC is non-zero in THIS shell.
+saved_path="$PATH"
+PATH="$W/bin-error:$PATH"
+unset BASH_ENV
+descendants_checked 1
+rc_direct="$DESCENDANTS_RC"
+PATH="$saved_path"
+[ "${rc_direct:-0}" -ne 0 ] \
+  && pass "2 discovery status reaches the caller (rc=$rc_direct, no subshell loss)" \
+  || fail "2 discovery status was lost in a subshell (rc=$rc_direct)"
+
+# ---- 5. a TERM-ignoring forker leaves no survivors -----------------------
 cat > "$W/forker.sh" <<F
 #!/usr/bin/env bash
-# Keep forking until the stop marker exists; ignore TERM so a single signal
-# cannot conveniently end the race.
 trap '' TERM
 mkdir -p "$W/spawned"
 while [ ! -f "$W/stop" ]; do
   ( sleep 5 ) &
-  # Record a spawn so the test can prove spawning continued during teardown.
   : > "$W/spawned/\$\$-\$RANDOM"
   sleep 0.02
 done
@@ -95,86 +105,74 @@ chmod +x "$W/forker.sh"
 
 "$W/forker.sh" &
 FPID=$!
-sleep 1                        # let it have children in flight
+sleep 1
 spawns_before="$(ls "$W/spawned" 2>/dev/null | wc -l | tr -d ' ')"
-before="$(descendants "$FPID")"
-[ -n "$before" ] && pass "1 forker has live children before teardown" \
-                 || fail "1 forker had no children; test is not exercising the race"
+descendants_checked "$FPID"
+[ -n "$DESCENDANTS_OUT" ] && pass "5 forker has live children before teardown" \
+                          || fail "5 forker had no children; race not exercised"
 
-if teardown_tree "$FPID"; then
-  pass "2 teardown completed with discovery available"
-else
-  fail "2 teardown reported a discovery failure"
-fi
+teardown_rc=0
+teardown_tree "$FPID" || teardown_rc=$?
+[ "$teardown_rc" -ne 5 ] && pass "5b teardown completed with discovery available" \
+                         || fail "5b teardown reported a discovery failure"
 
-# Prove the forker really did keep spawning THROUGH the teardown: if spawning
-# had stopped first, this test would be vacuous.
 spawns_after="$(ls "$W/spawned" 2>/dev/null | wc -l | tr -d ' ')"
 [ "${spawns_after:-0}" -gt "${spawns_before:-0}" ] \
-  && pass "2b forker kept spawning DURING teardown (race was live)" \
-  || fail "2b forker stopped spawning before teardown — race not exercised"
+  && pass "5c forker kept spawning DURING teardown (race was live)" \
+  || fail "5c forker stopped spawning before teardown — race not exercised"
 
-# CRITICAL: assert against the LIVE tree AND against orphans that were
-# reparented to init. A stale-snapshot check is not evidence, because the forker
-# demonstrably spawns NEW children after any single snapshot (measured: 33
-# snapshot children survived TERM and 10+ new ones appeared afterwards).
-#
-# Give the tree a moment to settle, then re-walk live.
 sleep 0.5
-left="$(descendants "$FPID")"
+descendants_checked "$FPID"
+survivors=0
+for k in $DESCENDANTS_OUT; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
+orphans="$(orphan_sleeps || true)"
+[ "$survivors" -eq 0 ] && pass "5d no descendant survived a respawning teardown" \
+                       || fail "5d descendant(s) survived: $(printf '%s ' $DESCENDANTS_OUT)"
+[ -z "$orphans" ] && pass "5e no reparented orphans left behind" \
+                  || fail "5e orphaned process(es) reparented to init: $(printf '%s ' $orphans)"
 
-# Also catch reparented grandchildren: any of OUR marker-recorded spawns that is
-# still alive anywhere is a leak, regardless of who its parent is now.
-orphans=""
-for marker in "$W"/spawned/*; do
-  [ -e "$marker" ] || continue
-  # the marker name encodes the forker pid, not a child pid, so instead scan for
-  # live `sleep 5` processes that are children of init and were started while the
-  # forker was respawning. Only count ones whose start time is recent.
-  :
+# ---- 6. RED control -----------------------------------------------------
+# The OLD snapshot-then-kill logic must FAIL under the same workload, otherwise
+# this test would pass for a teardown that does not actually fix the race.
+cat > "$W/forker2.sh" <<F
+#!/usr/bin/env bash
+trap '' TERM
+mkdir -p "$W/spawned2"
+while [ ! -f "$W/stop2" ]; do
+  ( sleep 5 ) &
+  : > "$W/spawned2/\$RANDOM"
+  sleep 0.02
 done
-adopted="$(pgrep -f '^sleep 5$' 2>/dev/null || true)"
-for a in $adopted; do
-  ap="$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ')"
-  [ "$ap" = "1" ] && orphans="$orphans $a"
-done
-[ -z "$left" ] && pass "3 no descendant survived a respawning teardown (live re-walk)" \
-               || fail "3 descendant(s) survived: $(printf '%s ' $left)"
-[ -z "$orphans" ] && pass "3b no reparented orphans left behind" \
-                  || fail "3b orphaned process(es) reparented to init: $(printf '%s ' $orphans)"
+F
+chmod +x "$W/forker2.sh"
 
-# --- 2. discovery failure must NOT read as success ------------------------
-# Point the function at a pgrep stub that always errors.
-mkdir -p "$W/bin"
-printf '#!/usr/bin/env bash\nexit 9\n' > "$W/bin/pgrep"
-chmod +x "$W/bin/pgrep"
-sleep 30 &
-SPID=$!
-if PATH="$W/bin:$PATH" bash -c '
-  descendants() {
-    local frontier="$1" kids out=""
-    command -v pgrep >/dev/null 2>&1 || return 3
-    while [ -n "$frontier" ]; do
-      kids=""
-      for p in $frontier; do
-        local got rc
-        got="$(pgrep -P "$p" 2>/dev/null)"; rc=$?
-        if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then return 4; fi
-        for c in $got; do kids="$kids $c"; out="$out $c"; done
-      done
-      frontier="$kids"
-    done
-    [ -n "$out" ] && printf "%s\n" $out
-    return 0
-  }
-  if descendants "$1" >/dev/null 2>&1; then exit 0; else exit 7; fi
-' _ "$SPID"; then
-  fail "4 a failing pgrep was treated as an empty tree (vacuous pass)"
-else
-  pass "4 a failing pgrep is reported as a discovery error, not an empty tree"
-fi
-kill "$SPID" 2>/dev/null || true
-wait "$SPID" 2>/dev/null || true
+old_teardown() {  # the ORIGINAL racy implementation
+  local pid="$1" kids found
+  kids="$(descendants "$pid" || true)"
+  for k in $(printf '%s\n' "$kids" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
+    kill -TERM "$k" 2>/dev/null || true
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.2
+  for k in $kids; do kill -KILL "$k" 2>/dev/null || true; done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+orphans_before="$(orphan_sleeps | wc -l | tr -d ' ')"
+"$W/forker2.sh" &
+F2=$!
+sleep 1
+old_teardown "$F2"
+touch "$W/stop2"
+sleep 0.4
+orphans_after="$(orphan_sleeps | wc -l | tr -d ' ')"
+leaked=$(( ${orphans_after:-0} - ${orphans_before:-0} ))
+[ "$leaked" -gt 0 ] && pass "6 RED control: the OLD snapshot teardown leaks ($leaked orphan(s)), so this test discriminates" \
+                    || fail "6 RED control did not leak — the test may not be exercising the race"
+
+# tidy any orphans the RED control created
+for o in $(orphan_sleeps); do kill -KILL "$o" 2>/dev/null || true; done
 
 touch "$W/stop"
 echo

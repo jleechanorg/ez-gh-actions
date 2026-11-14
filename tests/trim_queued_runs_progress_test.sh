@@ -71,36 +71,11 @@ RUN=( env -u BASH_ENV PATH="$STUB_BIN:$PATH" QUEUE_REPOS="acme/one"
 "${RUN[@]}" </dev/null >"$LOG" 2>&1 &
 pid=$!
 
-# Collect every live descendant of $1, parents before children.
-# bash 3.2 + `set -u` treats "${arr[@]}" on an EMPTY array as an unbound-variable
-# error, so never expand an array that may be empty; use a newline-separated
-# string instead.
-#
-# RETURNS NON-ZERO when process discovery itself fails, so the caller cannot
-# mistake "pgrep is broken/unavailable" for "there are no descendants".
-descendants() {
-  local frontier="$1" kids out=""
-  command -v pgrep >/dev/null 2>&1 || return 3
-  while [ -n "$frontier" ]; do
-    kids=""
-    for p in $frontier; do
-      local got
-      if ! got="$(pgrep -P "$p" 2>/dev/null)"; then
-        # pgrep exits 1 for "no children" (fine) but >1 means a real error.
-        local rc=$?
-        [ "$rc" -eq 1 ] || return 4
-        got=""
-      fi
-      for c in $got; do
-        kids="$kids $c"
-        out="$out $c"
-      done
-    done
-    frontier="$kids"
-  done
-  [ -n "$out" ] && printf '%s\n' $out
-  return 0
-}
+# Single shared implementation (see tests/lib/descendants.sh for the bugs it
+# encodes: `! cmd` status capture, subshell flag mutation, stale snapshots).
+# shellcheck source=tests/lib/descendants.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/descendants.sh"
+
 
 seen=0; alive=0
 for _ in $(seq 1 20); do
@@ -114,60 +89,23 @@ done
 
 # We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
 # `wait` under `set -e` would abort BEFORE the assertions below.
-#
-# TEARDOWN must survive a parent spawning a NEW child between our snapshot and
-# our signals (review finding: snapshot-then-kill is racy, and the new child is
-# not in the original list so a one-shot check misses it). Strategy: REPEATED
-# SWEEPS until two consecutive sweeps are empty, terminating the whole current
-# tree each round, with SIGKILL as the final backstop. Also fail loudly if
-# process discovery is unavailable or errors, so the assertion can never pass
-# vacuously.
-discovery_ok=1
-sweep() {
-  local found rc
-  found="$(descendants "$pid")"; rc=$?
-  if [ "$rc" -ne 0 ]; then discovery_ok=0; echo ""; return 0; fi
-  printf '%s\n' "$found"
-}
+teardown_rc=0
+teardown_tree "$pid" || teardown_rc=$?
 
-kill_tree() { # TERM the whole current tree, leaves first
-  local found
-  found="$(sweep)"
-  for k in $(printf '%s\n' "$found" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
-    kill -TERM "$k" 2>/dev/null || true
-  done
-  kill -TERM "$pid" 2>/dev/null || true
-}
-
-empty_streak=0
-for _ in $(seq 1 40); do
-  # Keep the leader suppressed first so it cannot keep forking.
-  kill -STOP "$pid" 2>/dev/null || true
-  kill_tree
-  remaining="$(sweep)"
-  if [ -z "$remaining" ] && ! kill -0 "$pid" 2>/dev/null; then
-    empty_streak=$((empty_streak+1))
-    [ "$empty_streak" -ge 2 ] && break
-  else
-    empty_streak=0
-  fi
-  sleep 0.1
-done
-
-# Backstop: SIGKILL any survivor of the current tree, then the leader.
-for k in $(sweep); do kill -KILL "$k" 2>/dev/null || true; done
-kill -KILL "$pid" 2>/dev/null || true
-wait "$pid" 2>/dev/null || true
-
-# Final accounting AFTER the leader is gone: no new child can appear now.
-final="$(sweep)"
-survivors=0
-for k in $final; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
-[ "$discovery_ok" -eq 1 ] \
+# Discovery MUST have worked, otherwise the survivor check below is vacuous.
+[ "$teardown_rc" -ne 5 ] \
   && pass "cleanup: process discovery available (survivor check is meaningful)" \
   || fail "cleanup: process discovery failed/unavailable — survivor check would pass vacuously"
+
+# Final accounting AFTER the leader is gone: nothing can respawn now.
+descendants_checked "$pid"
+survivors=0
+for k in $DESCENDANTS_OUT; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
+orphans="$(orphan_sleeps || true)"
 [ "$survivors" -eq 0 ] && pass "cleanup: no descendants survived the pass" \
-                      || fail "cleanup: $survivors descendant(s) still alive after teardown"
+                       || fail "cleanup: $survivors descendant(s) still alive after teardown"
+[ -z "$orphans" ] && pass "cleanup: no reparented orphans left behind" \
+                  || fail "cleanup: orphaned process(es) reparented to init: $(printf '%s ' $orphans)"
 
 [ "$seen" = 1 ]  && pass "behavioural: scan: emitted during the pass" \
                  || fail "behavioural: no progress output during the pass"
