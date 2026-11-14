@@ -37,9 +37,19 @@ never a zero** — never report "queue empty" from a non-zero exit or from a bod
 1. **Ghost vs live split.** The backlog is `live`, never the raw total. State both.
 2. **Live queue depth.** Job-level queued count across live runs.
 3. **Pickup wait** — `started_at − created_at` per job. Median/p90/max, not one run's age.
-4. **Fleet idle/busy at org level** + utilisation.
-5. **Interpretation.** Idle runners + waiting jobs = no capacity problem. Zero idle +
-   waiting jobs = genuine saturation.
+4. **Fleet registrations at org level** — labelled as GitHub's view, never as live
+   capacity. Say explicitly that these are registrations.
+5. **Interpretation.** You may NOT conclude capacity from the API. Idle registrations +
+   waiting jobs is suggestive, not proof. Zero idle + waiting jobs is **not** saturation:
+   a fully-offline runner prefix produces the identical API shape (measured
+   2026-11-14 — every `ez-runner-c-*` offline read as "genuine capacity pressure").
+   Report **capacity: UNKNOWN** and direct the operator to `./doctor-runner` for
+   per-slot `Runner.Worker` truth, unless you have run that local probe yourself.
+
+**Never** present the API snapshot as confirmation of fleet health. `AGENTS.md`: the
+GitHub API cannot be trusted for fleet state. A parked leg is DISABLED, not DOWN — see
+`MAC_RUNNER_DISABLED` / `REMOTE_LINUX_DISABLED`; do not report a parked leg as an
+outage.
 
 ## Rules this encodes
 

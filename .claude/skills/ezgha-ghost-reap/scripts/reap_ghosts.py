@@ -161,6 +161,14 @@ def still_queued(repo, rid):
         return True  # unknown: let the caller's delete surface the real problem
 
 
+def job_total(repo, rid):
+    """Live jobs.total_count for a run, or None when it cannot be read."""
+    try:
+        return gh(f"/repos/{repo}/actions/runs/{rid}/jobs").get("total_count")
+    except (ApiError, KeyError, TypeError):
+        return None
+
+
 def reap_one(repo, row, verify_wait_s, apply):
     """cancel -> verify -> force-cancel -> delete. Returns a status string."""
     rid = row["id"]
@@ -169,6 +177,15 @@ def reap_one(repo, row, verify_wait_s, apply):
     # Race guard: never destroy a run that started since we listed it.
     if not still_queued(repo, rid):
         return "skipped_started"
+    # Race guard (review P1): "still queued" is NOT enough. A run that was a
+    # zero-job ghost when listed can gain jobs and become REAL work; deleting it
+    # would destroy a live CI run. Re-confirm zero jobs immediately before acting.
+    # An unreadable count fails closed (skip) rather than destroying anything.
+    total = job_total(repo, rid)
+    if total is None:
+        return "skipped_jobs_unknown"
+    if total != 0:
+        return "skipped_now_has_jobs"
     wedged = False
     try:
         gh(f"/repos/{repo}/actions/runs/{rid}/cancel", "POST")
@@ -236,6 +253,7 @@ def main(argv=None):
                "eligible": len(candidates), "protected_deploy": len(protected),
                "too_young": len(too_young), "not_ghost": len(not_ghost)}
     results = {"reaped": 0, "would_reap": 0, "skipped_started": 0, "skipped_gone": 0,
+               "skipped_now_has_jobs": 0, "skipped_jobs_unknown": 0,
                "wedged_unreapable": 0, "stuck_queued": 0, "delete_403": 0, "failed": 0}
 
     for row in candidates:

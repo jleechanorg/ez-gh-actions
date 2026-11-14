@@ -108,10 +108,14 @@ PARKED_ENV = {
 
 
 def _is_parked_prefix(prefix):
-    """True when this prefix's leg is explicitly opted out of the fleet contract."""
+    """True when this prefix's leg is explicitly opted out of the fleet contract.
+
+    Only the literal "1" opts out, matching doctor-runner's authoritative parsing.
+    Accepting any non-empty value would let "false" or "2" suppress a REAL outage
+    warning (review P1: reproduced both)."""
     for known, vars_ in PARKED_ENV.items():
         if prefix.startswith(known):
-            return any(os.environ.get(v, "").strip() not in ("", "0") for v in vars_)
+            return any(os.environ.get(v, "").strip() == "1" for v in vars_)
     return False
 
 
@@ -362,7 +366,24 @@ def main(argv=None):
     except MeasureError as exc:
         print(f"MEASUREMENT FAILED: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(result, indent=2) if args.json else render(result))
+    if args.json:
+        # The human render carries the fleet-truth caveat; the machine-readable
+        # path must not silently drop it (review P0). Annotate the structured
+        # result so a JSON consumer cannot read utilization as verified capacity.
+        result["fleet_evidence"] = {
+            "source": "github_api_registrations_only",
+            "capacity_verdict": "UNKNOWN",
+            "not_verified": True,
+            "verify_locally_with": "./doctor-runner (per-slot Runner.Worker via docker top)",
+            "note": (
+                "registered counts are GitHub's view, not live capacity; a fully "
+                "offline prefix produces the same shape as saturation; parked legs "
+                "(MAC_RUNNER_DISABLED/REMOTE_LINUX_DISABLED=1) are DISABLED, not DOWN"
+            ),
+        }
+        print(json.dumps(result, indent=2))
+    else:
+        print(render(result))
     return 0
 
 

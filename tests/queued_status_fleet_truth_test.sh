@@ -99,17 +99,27 @@ grep -qi "registration" <<<"$OUT" \
   && pass "1 fleet section is labelled as registrations" \
   || fail "1 fleet numbers are still presented as live capacity"
 
-# 2. no capacity verdict from API-only data
-if grep -qi "genuine capacity pressure" <<<"$OUT"; then
-  fail "2 still asserts 'genuine capacity pressure' from GitHub-API data"
+# 2. no capacity verdict from API-only data. Reject ANY affirmative capacity
+#    claim, not just the original phrase — the review showed that swapping
+#    "genuine capacity pressure" for another HEALTHY/saturation claim passed.
+if grep -qiE "genuine capacity pressure|genuine saturation|= *no capacity problem|capacity: *(healthy|saturated|ok)" <<<"$OUT"; then
+  fail "2 still asserts a capacity verdict from GitHub-API data: $(grep -oiE 'genuine capacity pressure|genuine saturation|= *no capacity problem|capacity: *(healthy|saturated|ok)' <<<"$OUT" | head -1)"
 else
   pass "2 no capacity verdict claimed from API-only data"
 fi
+grep -qi "capacity: \*\*UNKNOWN\*\*\|capacity: UNKNOWN" <<<"$OUT" \
+  && pass "2b capacity is explicitly reported UNKNOWN" \
+  || fail "2b capacity is not explicitly UNKNOWN"
 
 # 3. whole-prefix offline is surfaced
-grep -qiE "whole.prefix|prefix.*offline|host outage" <<<"$OUT" \
-  && pass "3 a fully-offline runner prefix is flagged (host-outage signal)" \
-  || fail "3 all-ez-runner-c-offline was NOT flagged as a possible host outage"
+# 3. Require the outage warning line AND the specific affected prefix. A loose
+#    regex matched the generic UNKNOWN explanation even with the warning removed.
+grep -qE "WHOLE-PREFIX OFFLINE" <<<"$OUT" \
+  && pass "3 the whole-prefix-offline warning line is present" \
+  || fail "3 the whole-prefix-offline warning line is missing"
+grep -qE "WHOLE-PREFIX OFFLINE.*ez-runner-c \(3/3 offline\)" <<<"$OUT" \
+  && pass "3b the warning names the affected prefix with its counts" \
+  || fail "3b the warning does not name ez-runner-c with counts"
 
 # 4. names doctor-runner as the local authority
 grep -q "doctor-runner" <<<"$OUT" \
@@ -169,6 +179,39 @@ fi
 grep -qi "MEASUREMENT FAILED" <<<"$OUTE" \
   && pass "6b API error is labelled MEASUREMENT FAILED" \
   || fail "6b API error was not labelled MEASUREMENT FAILED"
+
+# ---- 7. --json must carry the verification boundary -----------------------
+# The human render carries the caveat; --json serialised measure() directly and
+# dropped it, so a machine consumer kept reading utilization as verified capacity.
+set +e
+OUTJ="$(env -u BASH_ENV PATH="$W/bin:$PATH" python3 "$SCRIPT" --repo acme/one --json 2>&1)"
+RCJ=$?
+set -e
+[ "$RCJ" -eq 0 ] || fail "7 --json exited $RCJ"
+printf '%s' "$OUTJ" > "$W/out.json"
+if python3 - "$W/out.json" <<'PYJSON'
+import json, sys
+d = json.load(open(sys.argv[1]))
+fe = d.get("fleet_evidence") or {}
+assert fe.get("capacity_verdict") == "UNKNOWN", fe
+assert fe.get("not_verified") is True, fe
+assert "doctor-runner" in (fe.get("verify_locally_with") or ""), fe
+PYJSON
+then
+  pass "7 --json carries fleet_evidence (capacity UNKNOWN, not_verified)"
+else
+  fail "7 --json drops the fleet verification boundary"
+fi
+
+# ---- 8. opt-out parsing must match doctor-runner exactly ('1' only) -------
+# Accepting any non-empty value let "false" suppress a REAL outage warning.
+set +e
+OUTF="$(env -u BASH_ENV PATH="$W/bin:$PATH" REMOTE_LINUX_DISABLED=false \
+        python3 "$SCRIPT" --repo acme/one 2>&1)"
+set -e
+grep -qE "WHOLE-PREFIX OFFLINE.*ez-runner-c" <<<"$OUTF" \
+  && pass "8 REMOTE_LINUX_DISABLED=false does NOT suppress the outage warning" \
+  || fail "8 a non-'1' opt-out value suppressed a real outage warning"
 
 echo
 if [ "$FAILS" -ne 0 ]; then
