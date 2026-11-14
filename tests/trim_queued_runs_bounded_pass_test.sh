@@ -147,30 +147,43 @@ chmod +x "$FBBIN/python3"
 printf '#!/bin/bash\nexit 0\n' > "$FBBIN/gh"
 chmod +x "$FBBIN/gh"
 # Prove the fallback condition really holds in the copied environment.
-if PATH="$FBBIN:/usr/bin:/bin" command -v timeout >/dev/null 2>&1; then fail "fallback env still has timeout"; fi
-if PATH="$FBBIN:/usr/bin:/bin" command -v gtimeout >/dev/null 2>&1; then fail "fallback env still has gtimeout"; fi
+#
+# PORTABILITY: this arm requires that `timeout`/`gtimeout` are genuinely ABSENT
+# from "$FBBIN:/usr/bin:/bin". That is true on macOS (no coreutils on the default
+# PATH) but FALSE on ubuntu-latest CI, where /usr/bin/timeout exists. A
+# "non-executable decoy" earlier on PATH does NOT mask it (bash keeps searching
+# later PATH entries), and skipping only the assertion below leaves a real
+# timeout resolvable, so the script takes the bounded branch and never prints
+# the 'unbounded' warning the arm asserts. There is therefore exactly one correct
+# handling: skip the ENTIRE arm on hosts that can resolve a timeout, stating so.
+if PATH="$FBBIN:/usr/bin:/bin" command -v timeout >/dev/null 2>&1 \
+   || PATH="$FBBIN:/usr/bin:/bin" command -v gtimeout >/dev/null 2>&1; then
+  echo "SKIP: fallback arm not exercised — this host resolves timeout/gtimeout on" \
+       "\$FBBIN:/usr/bin:/bin (expected on Linux CI). The bash-3.2 empty-array" \
+       "regression this arm guards is still covered by the macOS run of this test."
+else
+  NT_LOG="$WORK/notimeout.log"
+  set +e
+  # /bin/bash is 3.2 on macOS -- the version where the empty-array bug appears.
+  env -u BASH_ENV \
+    PATH="$FBBIN:/usr/bin:/bin" \
+    QUEUE_REPOS="acme/one acme/two" \
+    DRY_RUN=1 \
+    /bin/bash "$FB/trim.sh" >"$NT_LOG" 2>&1
+  NT_RC=$?
+  set -e
 
-NT_LOG="$WORK/notimeout.log"
-set +e
-# /bin/bash is 3.2 on macOS -- the version where the empty-array bug appears.
-env -u BASH_ENV \
-  PATH="$FBBIN:/usr/bin:/bin" \
-  QUEUE_REPOS="acme/one acme/two" \
-  DRY_RUN=1 \
-  /bin/bash "$FB/trim.sh" >"$NT_LOG" 2>&1
-NT_RC=$?
-set -e
+  grep -q 'unbound variable' "$NT_LOG" \
+    && { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: empty-array unbound-variable abort is back (bash 3.2 + set -u)"; }
 
-grep -q 'unbound variable' "$NT_LOG" \
-  && { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: empty-array unbound-variable abort is back (bash 3.2 + set -u)"; }
-
-grep -q 'EXECUTED repo=acme/one' "$NT_LOG" \
-  || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: first repo never executed without a timeout binary"; }
-grep -q 'EXECUTED repo=acme/two' "$NT_LOG" \
-  || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: second repo never executed without a timeout binary"; }
-[ "$NT_RC" -eq 0 ] || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: clean run must exit 0, got $NT_RC"; }
-grep -q 'unbounded' "$NT_LOG" \
-  || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: must warn that the pass is unbounded"; }
-pass "fallback: with no timeout binary, every repo still executes (bash 3.2 safe)"
+  grep -q 'EXECUTED repo=acme/one' "$NT_LOG" \
+    || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: first repo never executed without a timeout binary"; }
+  grep -q 'EXECUTED repo=acme/two' "$NT_LOG" \
+    || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: second repo never executed without a timeout binary"; }
+  [ "$NT_RC" -eq 0 ] || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: clean run must exit 0, got $NT_RC"; }
+  grep -q 'unbounded' "$NT_LOG" \
+    || { sed -n '1,40p' "$NT_LOG" >&2; fail "fallback arm: must warn that the pass is unbounded"; }
+  pass "fallback: with no timeout binary, every repo still executes (bash 3.2 safe)"
+fi
 
 echo "ALL PASS: trim-queued-runs per-repo pass is bounded and cannot deadlock on a heredoc"
