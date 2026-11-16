@@ -226,6 +226,39 @@ the image's mirror-then-sync tar wrapper for every extraction under
 on a native-Docker VM the virtiofs symlink bug it guards against cannot occur — so on
 cloud VMs the bind is worth having for the disk behaviour, not for the wrapper.
 
+### Restarting the daemon: use the systemd unit
+
+Bootstrap installs ezgha as a **systemd user service** (`ezgha.service`, enabled, with
+linger). Restart it through systemd:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+systemctl --user restart ezgha.service
+systemctl --user is-active ezgha.service
+```
+
+`XDG_RUNTIME_DIR` matters over SSH/`exec`: without it `systemctl --user` fails with
+`No medium found` rather than a useful error.
+
+**Never restart it with `kill` + `setsid nohup ezgha serve`.** systemd sees its unit die,
+leaves it `inactive (dead)`, and does not respawn it; the fleet then drains with no
+running daemon. Observed on 2026-11-16 across all five VM hosts, which went inactive and
+dropped to 0-1 containers each. The ad-hoc daemon also loses the log destination
+(`~/.local/state/ezgha/serve.out` does not exist on hosts where systemd always caught
+stdout), so the restart appears to succeed while producing no logs at all. Recovery:
+
+```bash
+systemctl --user reset-failed ezgha.service && systemctl --user start ezgha.service
+```
+
+Also note the daemon holds `~/.config/ezgha/serve.lock`; a killed daemon can leave a stale
+lock that makes the next start exit with `acquire serve.lock`. Remove it only when
+`ps -eo comm` shows no `ezgha` process.
+
+Finally, do not `pkill -f "ezgha.*serve"` from inside `cmux cloud exec`: the pattern
+matches the exec shell's own command line, so the shell kills itself (exit 143) before
+finishing. Match on `ps -eo pid,comm` and match the executable name instead.
+
 ### `dockerd` caches NCPU
 
 `docker info --format '{{.NCPU}}'` is fixed at daemon start. A VM created small and
