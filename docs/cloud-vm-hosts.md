@@ -199,32 +199,44 @@ Two ways to get this wrong, both observed on 2026-11-16:
   exists and nothing is dangling, because an idle runner image is untagged from the
   prune's point of view. It was deleted twice in one session and had to be rebuilt
   (~12 min). `docker builder prune` is safe; `docker image prune` is not.
-- Lowering `limits.min_free_disk_gb` to stop admission pausing treats the symptom.
-  The churn comes from job workspaces accumulating in container overlays; see the next
+- Lowering `limits.min_free_disk_gb` to stop admission pausing treats the symptom. The
+  churn comes from job workspaces accumulating in container overlays; see the next
   section.
 
-### Bind the job workspace, don't just lower the floor
+### Do not enable `workspace_host_path` without PR #206's ownership fix
 
-`runner.workspace_host_path` is what actually stops the drift. With it, each job's
-checkout and build scratch live in `{workspace_host_path}/{runner_name}` on the host,
-wiped before every container start (`remove_dir_all` in
-`src/docker_backend.rs`), instead of growing the container's writable layer.
+`runner.workspace_host_path` does stop the overlay drift: each job's checkout and build
+scratch live in `{workspace_host_path}/{runner_name}` on the host instead of growing the
+container's writable layer. On a 32 GB / 4 vCPU / 5-runner VM the writable layers reached
+**7.1 GB across 5 containers** and free space swung **3-10 GB** per job churn.
 
-Without it, measured on a 32 GB / 4 vCPU / 5-runner VM on 2026-11-16: container writable
-layers reached **7.1 GB across 5 containers**, free space swung **3-10 GB** as jobs
-started and finished, and admission paused and resumed repeatedly even after the floor
-was lowered from 10 GB to 8 GB. `docker ps -s` shows the per-container layer size.
+**But enabling it today breaks every job.** The daemon runs as the host user (uid 1000)
+and creates `{workspace_host_path}/{runner_name}` owned `1000:1000`, mode 755. The runner
+container runs as `uid=1001(runner)`, so it cannot create `/home/runner/_work/_temp` and
+every job fails in 3-4 seconds before step 1:
 
-The value **must be an absolute path**: the daemon evaluates
-`std::path::Path::new(v).is_dir()` and expands nothing, so `~/...` or a relative path
-silently evaluates to false and the bind is skipped with no error. Bootstrap creates the
-directory and writes the absolute path.
+```
+System.UnauthorizedAccessException: Access to the path '/home/runner/_work/_temp' is denied.
+```
 
-Note the coupling: setting this also sets `EZGHA_VIRTIOFS_WORKSPACE=1`, which activates
-the image's mirror-then-sync tar wrapper for every extraction under
-`/home/runner/_work`. That is correct on any filesystem but slower than a plain tar, and
-on a native-Docker VM the virtiofs symlink bug it guards against cannot occur — so on
-cloud VMs the bind is worth having for the disk behaviour, not for the wrapper.
+The registrations still read `online` and `idle`, so a fleet-health check that counts
+containers reports the pool as healthy while 100% of jobs fail. This happened on all five
+cmux VM hosts on 2026-11-16 and took out the deploy pipeline until the config was
+reverted.
+
+**The fix is [PR #206](https://github.com/jleechanorg/ez-gh-actions/pull/206)**, which
+sets the host workspace to mode `2770` (setgid) and passes the workspace's GID through
+`--group-add`, so the container's `runner` user is in the owning group without a
+recursive chown. Do not enable this config key by hand before that lands: a one-off
+`chown` does not survive, because `src/docker_backend.rs` deletes and recreates the
+directory on every container start.
+
+If you need to roll back: restore `~/.config/ezgha/config.toml` from the
+`config.toml.bak-*` backup, `systemctl --user restart ezgha.service`, and remove any
+running container that still carries the bind (`docker inspect` shows a
+`/home/cmux/.cache/ezgha-workspace/...` source) so it respawns unbound. Verify with
+`docker exec <c> touch /home/runner/_work/_temp/x` and confirm `/home/runner/_work` is
+owned by `runner:runner`.
 
 ### Restarting the daemon: use the systemd unit
 
@@ -258,6 +270,7 @@ lock that makes the next start exit with `acquire serve.lock`. Remove it only wh
 Finally, do not `pkill -f "ezgha.*serve"` from inside `cmux cloud exec`: the pattern
 matches the exec shell's own command line, so the shell kills itself (exit 143) before
 finishing. Match on `ps -eo pid,comm` and match the executable name instead.
+
 
 ### `dockerd` caches NCPU
 

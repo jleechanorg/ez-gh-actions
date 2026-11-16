@@ -32,31 +32,6 @@ guest_reserve_mb = 512
 # (runner_floor_mb = 3072, guest_reserve_mb = 4096) a 16 GiB host caps at 3 runners.
 # Keep this in step with docs/cloud-vm-hosts.md.
 runner_floor_mb = 1400
-# Per-job workspace bind: job checkouts and build scratch land in this host
-# directory (wiped before every container start) instead of accumulating in the
-# container's writable overlay layer.
-#
-# Why this is not optional on a cloud VM: without it every concurrent job writes
-# its checkout + node_modules/build output into the container overlay, so a
-# 4-5 runner host on a 32 GB volume drifts 3-10 GB of free space per job churn and
-# admission (min_free_disk_gb) pauses and resumes repeatedly. Measured 2026-11-16 on
-# a 32 GB / 4 vCPU / 5-runner cmux VM: container writable layers reached 7.1 GB
-# across 5 containers with no workspace bind.
-#
-# Cost, stated plainly: setting this also sets EZGHA_VIRTIOFS_WORKSPACE=1 on the
-# container (see src/docker_backend.rs), which makes the image's tar wrapper guard
-# every extraction under /home/runner/_work via mirror-then-sync. That path is
-# correct on any filesystem, but it mirrors the pre-existing destination tree per
-# extraction, so it is slower than a plain tar. On native-Docker VMs (no virtiofs)
-# the symlink-corruption bug it guards against does not exist, so the bind is
-# purely a disk-churn win; keep it for the disk behaviour, not for the wrapper.
-#
-# MUST be an absolute path. The daemon uses std::path::Path::new().is_dir()
-# directly, which does NOT expand `~`, `$HOME`, or environment variables — a
-# relative or tilde path silently evaluates to not-a-directory and the bind is
-# skipped without error. Bootstrap creates this directory and rewrites the value
-# for the actual host user (scripts/cloud/bootstrap-cloud-vm-host.sh).
-workspace_host_path = "/home/cmux/.cache/ezgha-workspace"
 
 [limits]
 memory_mb = 1400
