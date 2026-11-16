@@ -96,12 +96,24 @@ Re-running the script **overwrites** `~/.config/ezgha/config.toml` from
 hand edit — added labels, a different reserve, changed limits — is lost. Put host-specific
 values in the example before running, or reapply them after.
 
-`RUNNER_COUNT` must not exceed the host's **memory** ceiling (disk is not checked by the
-script — see below). The script checks that before
-restarting the daemon and fails with the arithmetic instead of a restart loop. It also
-installs the 45-minute GitHub App token-refresh timer — without it the one-hour
-installation token expires, every `gh` call returns `Bad credentials (HTTP 401)`, and the
-fleet silently shrinks.
+`RUNNER_COUNT` is capped by **two** ceilings, and the script refuses a count that exceeds
+either one before it touches the daemon — so a mis-sized host fails with arithmetic
+instead of a restart loop:
+
+- **memory**: `(MemTotal - guest_reserve_mb) / runner_floor_mb`;
+- **disk**: `(volume_GB - ~7 base OS - ~4 runner image - min_free_disk_gb) / ~3 per runner`.
+
+The disk ceiling is not optional bookkeeping. A 32 GB / 8 GB host passes the memory check
+at 5 runners and then never settles: measured on three such cmux hosts on 2026-11-16, free
+space oscillated between 3 GB and 10 GB against a 10 GB floor, admission paused and
+resumed continuously, and one host idled at 3 of its 5 configured runners indefinitely.
+Lowering `min_free_disk_gb` only moves the collision; the durable answers are fewer
+runners or a bigger volume (`cmux vm resize <id> --disk <N>G`). Configuring more than the
+volume holds does not create capacity, it creates thrash.
+
+The script also installs the 45-minute GitHub App token-refresh timer — without it the
+one-hour installation token expires, every `gh` call returns `Bad credentials (HTTP 401)`,
+and the fleet silently shrinks.
 
 ## Capacity: how many runners fit
 

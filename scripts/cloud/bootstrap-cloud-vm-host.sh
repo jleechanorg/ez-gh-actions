@@ -151,6 +151,32 @@ print(f"budget={budget}MB (mem {mem} - reserve {reserve}), floor={floor}MB, ceil
 if count > ceiling:
     sys.exit(f"count {count} exceeds the {ceiling}-runner ceiling: "
              f"{count} x {floor} = {count * floor} MB > {budget} MB budget")
+
+# Disk ceiling. The memory check above is necessary but NOT sufficient: a 32 GB host
+# with 8 GB of RAM passes the memory check at 5 runners and then flaps forever, because
+# each job's workspace grows the container's writable overlay by ~2-3 GB while the runner
+# image (~4 GB) and the base OS (~7 GB) are already resident. Measured 2026-11-16 on
+# three 32 GB / 8 GB cmux hosts configured for 5 runners: free space oscillated 3-10 GB
+# against a 10 GB floor, spawning and pausing admission continuously, and in one case
+# idling at 3 of the 5 configured runners indefinitely.
+#
+# The fix is NOT a lower floor (that only delays the collision) and not a bind-mounted
+# workspace alone (see the workspace_host_path warning: it needs PR #206's ownership
+# fix). It is running the number of runners the volume can actually hold.
+import os, shutil
+total_gb = shutil.disk_usage('/').total // (1024**3)
+free_gb = shutil.disk_usage('/').free // (1024**3)
+min_floor_gb = int(val('min_free_disk_gb', '10'))
+BASE_OS_GB, IMAGE_GB, PER_RUNNER_GB = 7, 4, 3
+disk_ceiling = (total_gb - BASE_OS_GB - IMAGE_GB - min_floor_gb) // PER_RUNNER_GB
+print(f"disk total={total_gb}G free={free_gb}G floor={min_floor_gb}G -> disk ceiling={disk_ceiling}")
+if count > disk_ceiling:
+    sys.exit(
+        f"count {count} exceeds the {disk_ceiling}-runner DISK ceiling on a {total_gb}G volume "
+        f"({total_gb}G - {BASE_OS_GB}G base OS - {IMAGE_GB}G runner image - {min_floor_gb}G floor "
+        f") / {PER_RUNNER_GB}G per runner. Lower RUNNER_COUNT to {disk_ceiling} or grow the volume "
+        f"with `cmux vm resize <id> --disk <N>G`. Configuring more than the volume holds makes "
+        f"admission pause and resume continuously instead of running the extra runners.")
 PYCHK
 
 step "7. GitHub App installation token (mint + 45-minute refresh timer)"
