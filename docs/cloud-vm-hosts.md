@@ -272,6 +272,43 @@ matches the exec shell's own command line, so the shell kills itself (exit 143) 
 finishing. Match on `ps -eo pid,comm` and match the executable name instead.
 
 
+### DNS: one resolver and a 1-second timeout
+
+The cmux VM hosts ship `/etc/resolv.conf` with a **single** nameserver (the freestyle
+forwarding resolver, `10.32.0.28`) and `options timeout:1 attempts:2`. One dropped
+response is therefore an immediate `EAI_AGAIN` with no fallback, and a 1s timeout is tight
+for a cold lookup (measured 382 ms cold, 11 ms warm).
+
+Observed 2026-11-16: `actions/upload-artifact@v4` exhausted all five of its own retries in
+~37 s and failed a deploy job whose build had already succeeded:
+
+```
+Attempt 1 of 5 failed with error: getaddrinfo EAI_AGAIN
+results-receiver.actions.githubusercontent.com. Retrying request in 3000 ms...
+...
+##[error]Failed to CreateArtifact: Failed to make request after 5 attempts
+```
+
+It is transient — a re-run passed, and 100 concurrent lookups from a container resolved
+cleanly afterwards — which is exactly what makes it expensive: it looks like an
+intermittent action failure rather than a host network defect.
+
+Fix: add two fallback resolvers and relax the timeout. Public resolvers are reachable from
+these VMs (`8.8.8.8`, `1.1.1.1`, `9.9.9.9` all accept TCP/53), and they are only consulted
+when the local forwarder fails:
+
+```
+nameserver 10.32.0.28
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+options timeout:2 attempts:3
+```
+
+Two caveats. Docker copies the host `resolv.conf` at container **start**, so existing
+containers keep the old single-nameserver file until they respawn. And the freestyle/DHCP
+path rewrites `/etc/resolv.conf` on some boots, so re-check after a VM restart — treat this
+as hardening, not a permanent guarantee.
+
 ### `dockerd` caches NCPU
 
 `docker info --format '{{.NCPU}}'` is fixed at daemon start. A VM created small and
