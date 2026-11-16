@@ -304,10 +304,25 @@ nameserver 8.8.8.8
 options timeout:2 attempts:3
 ```
 
-Two caveats. Docker copies the host `resolv.conf` at container **start**, so existing
-containers keep the old single-nameserver file until they respawn. And the freestyle/DHCP
-path rewrites `/etc/resolv.conf` on some boots, so re-check after a VM restart — treat this
-as hardening, not a permanent guarantee.
+Docker copies the host `resolv.conf` at container **start**, so existing containers keep
+the old single-nameserver file until they respawn.
+
+**Editing the file is not enough.** The `freestyle-vms-agent` process (pid 1216 on these
+hosts) rewrites `/etc/resolv.conf` back to the single-nameserver form — measured at under
+10 seconds after the edit (`sed` in place, `mtime` advancing without any agent action).
+A plain `sed` therefore appears to work and then silently reverts. Pin it with
+
+```bash
+sudo sed -i "/^nameserver 10.32.0.28$/a nameserver 1.1.1.1\nnameserver 8.8.8.8" /etc/resolv.conf
+sudo sed -i "s/^options timeout:1 attempts:2$/options timeout:2 attempts:3/" /etc/resolv.conf
+sudo chattr +i /etc/resolv.conf      # immutable; verify with lsattr
+```
+
+and verify with `lsattr` that the `i` attribute is set. Two consequences of `+i` worth
+knowing before you use it: the agent can no longer manage that file (which is why the
+value now has to be maintained deliberately rather than by DHCP), and any operation that
+tries to rewrite it will fail while the flag is set. Remove the flag with
+`chattr -i` if the host's own networking needs to take the file back.
 
 ### `dockerd` caches NCPU
 
