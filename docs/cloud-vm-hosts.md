@@ -193,6 +193,39 @@ builder-cache and stopped-container/log cleanup, or grow the volume
 (`cmux vm resize <id> --disk <N>G`; disk is per-machine and is not part of the vCPU or
 memory pool; the CLI takes 4-256 GiB in 4 GiB steps and cannot shrink).
 
+Two ways to get this wrong, both observed on 2026-11-16:
+
+- `docker image prune -af` deletes `ezgha-runner:latest` even when only one image
+  exists and nothing is dangling, because an idle runner image is untagged from the
+  prune's point of view. It was deleted twice in one session and had to be rebuilt
+  (~12 min). `docker builder prune` is safe; `docker image prune` is not.
+- Lowering `limits.min_free_disk_gb` to stop admission pausing treats the symptom.
+  The churn comes from job workspaces accumulating in container overlays; see the next
+  section.
+
+### Bind the job workspace, don't just lower the floor
+
+`runner.workspace_host_path` is what actually stops the drift. With it, each job's
+checkout and build scratch live in `{workspace_host_path}/{runner_name}` on the host,
+wiped before every container start (`remove_dir_all` in
+`src/docker_backend.rs`), instead of growing the container's writable layer.
+
+Without it, measured on a 32 GB / 4 vCPU / 5-runner VM on 2026-11-16: container writable
+layers reached **7.1 GB across 5 containers**, free space swung **3-10 GB** as jobs
+started and finished, and admission paused and resumed repeatedly even after the floor
+was lowered from 10 GB to 8 GB. `docker ps -s` shows the per-container layer size.
+
+The value **must be an absolute path**: the daemon evaluates
+`std::path::Path::new(v).is_dir()` and expands nothing, so `~/...` or a relative path
+silently evaluates to false and the bind is skipped with no error. Bootstrap creates the
+directory and writes the absolute path.
+
+Note the coupling: setting this also sets `EZGHA_VIRTIOFS_WORKSPACE=1`, which activates
+the image's mirror-then-sync tar wrapper for every extraction under
+`/home/runner/_work`. That is correct on any filesystem but slower than a plain tar, and
+on a native-Docker VM the virtiofs symlink bug it guards against cannot occur — so on
+cloud VMs the bind is worth having for the disk behaviour, not for the wrapper.
+
 ### `dockerd` caches NCPU
 
 `docker info --format '{{.NCPU}}'` is fixed at daemon start. A VM created small and

@@ -84,21 +84,38 @@ mkdir -p "$HOME/.config/ezgha"
 chmod 700 "$HOME/.config/ezgha"
 [ -f "$KEY_PATH" ] || { echo "MISSING GitHub App private key at $KEY_PATH"; exit 1; }
 chmod 600 "$KEY_PATH"
+# Per-job workspace bind. Without it, job checkouts and build scratch accumulate
+# in each container's writable overlay, so a 4-5 runner VM on a small volume drifts
+# several GB per job and admission thrashes. The daemon does NOT expand `~` in this
+# value (std::path::Path::new().is_dir()), so always write an absolute path.
+WS_ROOT="$HOME/.cache/ezgha-workspace"
+mkdir -p "$WS_ROOT"
+chmod 755 "$WS_ROOT"
+
 cp "$REPO_DIR/config/config.toml.cloud-vm.example" "$HOME/.config/ezgha/config.toml"
-python3 - "$HOME/.config/ezgha/config.toml" "$RUNNER_COUNT" "$NAME_PREFIX" <<'PY'
+python3 - "$HOME/.config/ezgha/config.toml" "$RUNNER_COUNT" "$NAME_PREFIX" "$WS_ROOT" <<'PY'
 import sys
-path, count, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+path, count, prefix, ws_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 out = []
 for line in open(path):
     if line.startswith("count = "):
         out.append(f"count = {count}\n")
     elif line.startswith("name_prefix = "):
         out.append(f'name_prefix = "{prefix}"\n')
+    elif line.startswith("workspace_host_path = "):
+        out.append(f'workspace_host_path = "{ws_root}"\n')
     else:
         out.append(line)
 open(path, "w").writelines(out)
 PY
-grep -E '^(count|name_prefix) =|host_containment' "$HOME/.config/ezgha/config.toml"
+grep -E '^(count|name_prefix|workspace_host_path) =|host_containment' "$HOME/.config/ezgha/config.toml"
+# Fail loud if the workspace path the daemon will read is not a real directory:
+# a tilde/relative value silently disables the bind instead of erroring.
+WS_CFG="$(sed -n 's/^workspace_host_path = "\(.*\)"$/\1/p' "$HOME/.config/ezgha/config.toml")"
+[ -n "$WS_CFG" ] || { echo "workspace_host_path missing from rendered config"; exit 1; }
+case "$WS_CFG" in /*) ;; *) echo "workspace_host_path must be absolute (got: $WS_CFG)"; exit 1 ;; esac
+[ -d "$WS_CFG" ] || { echo "workspace_host_path is not a directory: $WS_CFG"; exit 1; }
+echo "workspace bind ok: $WS_CFG"
 
 step "6b. refuse a count the memory budget cannot hold"
 # `serve` would refuse to start anyway; fail here with the arithmetic instead of a
