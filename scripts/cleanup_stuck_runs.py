@@ -601,7 +601,8 @@ if _ghost_ids:
         stats["escalate"] = 1
         print(f"ESCALATION: ghost set exceeds bounds (oldest={oldest_days:.1f}d "
               f"limit={GHOST_ESCALATE_DAYS}d, distinct={len(_ghost_ids)} "
-              f"limit={GHOST_ESCALATE_COUNT}) — decide: GitHub Support ticket or branch deletion")
+              f"limit={GHOST_ESCALATE_COUNT}) — manual options: GitHub Support "
+              f"or retain the explicitly acknowledged cohort")
 
 print("summary:", stats)
 # verify_inconclusive (codex adversarial review 2026-07-10, P2): a

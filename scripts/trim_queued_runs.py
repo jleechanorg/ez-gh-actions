@@ -315,8 +315,8 @@ print(f"summary: candidates={len(candidates)} cancelled={cancelled} failed={fail
 if ghost:
     rec = os.environ.get("EZGHA_SUSPENSION_RECORD", "")
     print(f"note: {ghost} ghost run(s) cannot be cleared by API "
-          f"(ids: {', '.join(map(str, ghost_ids))}); remediation: GitHub Support or "
-          f"branch deletion")
+          f"(ids: {', '.join(map(str, ghost_ids))}); manual options: GitHub Support "
+          f"or retain the explicitly acknowledged cohort")
     print(f"suspension record: {rec or 'UNSET'}")
     if not rec:
         # Fail closed: an UNDECLARED ghost set must never read green.
@@ -327,8 +327,8 @@ if ghost:
     if oldest_days >= GHOST_ESCALATE_DAYS or len(ghost_id_set) >= GHOST_ESCALATE_COUNT:
         print(f"ESCALATION: ghost set exceeds bounds (oldest={oldest_days:.1f}d "
               f"limit={GHOST_ESCALATE_DAYS}d, distinct={len(ghost_id_set)} "
-              f"limit={GHOST_ESCALATE_COUNT}) — decide: GitHub Support ticket or "
-              f"branch deletion")
+              f"limit={GHOST_ESCALATE_COUNT}) — manual options: GitHub Support "
+              f"or retain the explicitly acknowledged cohort")
         failed += 1
 if failed:
     sys.exit(1)

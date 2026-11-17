@@ -100,9 +100,11 @@ Merge commits and `git commit --no-verify` bypass the gate.
 4. If slot file is wedged: `rm ~/.config/ezgha/slot_assignments.toml` then `systemctl --user restart ezgha.service`
 
 ### Queued ghost workflow runs
-The scheduled queue trimmer and reaper are the automatic callers. A ghost is a queued run that GitHub refuses to transition and whose `/jobs` endpoint confirms zero jobs; unknown or unreadable job state remains a cleaner failure. When the cleaner reports unacknowledged ghosts, do not loop cancellation, force-cancellation, deletion, or rerun attempts: GitHub rejects those transitions for this artifact class.
+This is a manual operator-recovery recipe; the scheduled queue trimmer and reaper remain the automatic callers. Within each apply pass, classify a ghost only after a fresh cancellation attempt gets HTTP 409 and a fresh `/jobs` query confirms zero jobs. A 409 by itself, a run with jobs, or unreadable job state is a cleaner failure. After that run is confirmed as a ghost, do not try other mutation endpoints for it during that pass.
 
-Track the acknowledged cohort, start date, and restore condition in its owning Bead. Set `EZGHA_SUSPENSION_RECORD` only when that record exists; an unset value keeps the cleaner fail-closed. A cohort older than 14 days or larger than 200 distinct run IDs per repository escalates. The supported choices are a GitHub Support request or retaining the explicitly acknowledged cohort. Deleting its source branch does not remove the ghost runs; this was verified for bead jleechan-b4pg.
+The cleaner does not persist a ghost skip across passes. A later scheduled pass reevaluates a still-queued run through the same cancellation-and-job-probe path. Do not create a cross-pass suppression, retry ledger, or cache to stop that reevaluation. For a confirmed zero-job ghost, the available manual choices are a GitHub Support request or retaining the cohort as explicitly acknowledged. Do not recommend deleting its source branch: the linked Bead jleechan-b4pg records that this did not remove the runs.
+
+Track the acknowledged cohort, start date, and restore condition in its owning Bead. Set `EZGHA_SUSPENSION_RECORD` only when that record exists; unset keeps the cleaner fail-closed. Escalation occurs when the oldest ghost reaches 14 days or the distinct per-repository count reaches 200.
 
 Restore after every recorded ghost run ID is no longer queued; a repository-wide queue total of zero is not required. Close the Bead, remove the suspension record from both launchd templates, and reinstall both agents so the installed plists reflect the restored state.
 
