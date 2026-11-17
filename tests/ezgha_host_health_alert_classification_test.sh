@@ -173,6 +173,18 @@ run critdisk 100 18 HEALTH_ALERT_ALERTS_FILE="$AL_DISK"
 grep -q '"cause":"disk"' "$W/log-critdisk" || fail "daemon host_disk_floor escalation must route to cause=disk"
 pass "recent daemon host_disk_floor routes to cause=disk"
 
+# ── 12c. The emitted entry must be JSON-shaped, matching the alert policy filters ─
+# Both [CRITICAL] ezgha policies match on jsonPayload.cause. `gcloud logging write`
+# defaults to --payload-type=text, which stores the same bytes in textPayload and
+# leaves jsonPayload null, so the filters never match and the alert cannot fire.
+# Every dispatch therefore has to declare --payload-type=json explicitly.
+state_dir payload; json_log OK 0 > "$W/state-payload/host-health-alert-testhost.json"
+run payload 25 18
+[ -s "$W/log-payload" ] || fail "a disk-floor breach must dispatch an entry"
+grep -q -- '--payload-type=json' "$W/log-payload" || fail "dispatch must pass --payload-type=json so the policy jsonPayload filters can match"
+grep -q -- '--payload-type=text' "$W/log-payload" && fail "dispatch must never request a text payload"
+pass "dispatch declares --payload-type=json, matching the policy filters"
+
 # ── 13. A verdict is a successful probe: exit 0, so launchd/cron stays green ─
 state_dir ex; json_log OK 0 > "$W/state-ex/host-health-alert-testhost.json"
 set +e
