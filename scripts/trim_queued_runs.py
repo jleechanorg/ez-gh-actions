@@ -239,7 +239,7 @@ for r in eligible_runs:
     # Reason 3: PR not modified in last MIN_PR_AGE_HOURS
     pr_updated_str = pr.get("updatedAt", "")
     pr_updated_dt = datetime.datetime.fromisoformat(pr_updated_str.replace("Z", "+00:00")) if pr_updated_str else None
-    
+
     # Check commit committer date
     if run_sha not in commit_dates:
         commit_dates[run_sha] = get_commit_date(run_sha)
