@@ -29,14 +29,54 @@ Usage:
 import argparse
 import datetime
 import json
+import os
 import subprocess
 import sys
 
 RATE_LIMIT_MARKERS = ("rate limit", "403", "429")
 
 
+def gh_env():
+    """Environment for gh subprocesses.
+
+    gh picks up GH_TOKEN, but a launchd job inherits almost no environment, so the
+    probe must locate a token itself or every scheduled publish reports the queue as
+    unavailable. Prefer an explicit GH_TOKEN, then the App token file the rest of this
+    repo already uses. Only the PATH is passed through otherwise -- the token is read
+    here, never logged.
+    """
+    # launchd's PATH omits ~/.local/bin, which is where this host's gh wrapper lives,
+    # so include the usual user bin directories and the Homebrew prefixes ahead of the
+    # system defaults. Nothing here grants access; it only makes `gh` findable.
+    default_path = ":".join(
+        [
+            os.path.expanduser("~/.local/bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+    )
+    env = {"PATH": os.environ.get("PATH") or default_path}
+    if "/.local/bin" not in env["PATH"]:
+        env["PATH"] = f"{os.path.expanduser('~/.local/bin')}:{default_path}"
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        candidate = os.path.expanduser("~/.config/ezgha/gh_token")
+        try:
+            with open(candidate, encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except OSError:
+            token = ""
+    if token:
+        env["GH_TOKEN"] = token
+    return env
+
+
 def gh_json(args):
-    result = subprocess.run(["gh", *args], capture_output=True)
+    result = subprocess.run(["gh", *args], capture_output=True, env=gh_env())
     if result.returncode != 0:
         raise RuntimeError((result.stderr or b"").decode()[:300])
     return json.loads(result.stdout.decode() or "null")
