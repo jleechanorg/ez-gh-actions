@@ -8,8 +8,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 16,
-        "idle": 4,
+        "executing": 18,
+        "idle": 2,
         "reserved": 20
       },
       "sources": {
@@ -45,8 +45,8 @@
         "configured": 4,
         "cycling": 0,
         "down": 0,
-        "executing": 2,
-        "idle": 2,
+        "executing": 4,
+        "idle": 0,
         "reserved": 4
       },
       "sources": {
@@ -75,17 +75,17 @@
       }
     }
   },
-  "observed_at": "2026-11-17T07:25:57Z",
-  "published_at": "2026-11-17T07:26:30Z",
+  "observed_at": "2026-11-17T07:38:07Z",
+  "published_at": "2026-11-17T07:38:11Z",
   "queue": {
-    "fresh": 0,
-    "ghosts": 164,
+    "fresh": 3,
+    "ghosts": 111,
     "ok": true,
-    "oldest_fresh_wait_minutes": null,
+    "oldest_fresh_wait_minutes": 54,
     "repos": [
       {
-        "fresh": 0,
-        "ghosts": 149,
+        "fresh": 3,
+        "ghosts": 96,
         "repo": "jleechanorg/worldarchitect.ai"
       },
       {
