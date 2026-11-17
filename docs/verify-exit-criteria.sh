@@ -697,7 +697,7 @@ verify_fresh_canary() {
     fi
     local canary_name_prefix canary_out canary_run_id canary_runner canary_tts
     canary_name_prefix=$(CONFIG_FILE="$canary_config" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
-    if ! canary_out=$("$ezgha_bin" --config "$canary_config" canary-once --timeout-seconds "$canary_timeout_seconds" 2>&1); then
+    if ! canary_out=$("$ezgha_bin" --config "$canary_config" canary-once --timeout-seconds "$canary_timeout_seconds"); then
         echo "$canary_out"
         fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${canary_name_prefix}-* using $canary_config"
     fi
