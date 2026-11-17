@@ -2,31 +2,31 @@
   "fleets": {
     "linux": {
       "disk": {
-        "status": "unknown"
+        "status": "healthy"
       },
       "fleet": {
-        "configured": null,
-        "cycling": null,
-        "down": null,
-        "executing": null,
-        "idle": null,
-        "reserved": null
+        "configured": 20,
+        "cycling": 0,
+        "down": 0,
+        "executing": 0,
+        "idle": 20,
+        "reserved": 20
       },
       "sources": {
         "config": {
-          "ok": false
+          "ok": true
         },
         "disk": {
-          "ok": false
+          "ok": true
         },
         "docker": {
-          "ok": false
+          "ok": true
         },
         "process_probe": {
-          "ok": false
+          "ok": true
         },
         "service": {
-          "ok": false
+          "ok": true
         },
         "watchdog_state": {
           "ok": false
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-17T14:07:22Z",
-  "published_at": "2026-11-17T14:07:28Z",
+  "observed_at": "2026-11-17T14:18:53Z",
+  "published_at": "2026-11-17T14:18:55Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
@@ -98,7 +98,7 @@
   "schema_version": 1,
   "sources": {
     "linux_host": {
-      "ok": false
+      "ok": true
     },
     "mac_host": {
       "ok": true
