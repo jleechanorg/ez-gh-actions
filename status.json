@@ -8,8 +8,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 6,
-        "idle": 14,
+        "executing": 1,
+        "idle": 19,
         "reserved": 20
       },
       "sources": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-17T13:09:56Z",
-  "published_at": "2026-11-17T13:09:59Z",
+  "observed_at": "2026-11-17T13:21:30Z",
+  "published_at": "2026-11-17T13:21:32Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
