@@ -187,3 +187,83 @@ if [ "$FAILS" -ne 0 ]; then
   exit 1
 fi
 echo "ALL TESTS PASSED!"
+
+# ---- 7. the actual launchd installer preserves/clears both queue agents --
+# This exercises launchd/install-launchagents.sh itself in an isolated HOME.
+# launchctl is a PATH-first fake, so no host service state is read or changed.
+FAKE_HOME="$WORK/fake-home"
+FAKE_BIN="$WORK/fake-bin"
+LAUNCHCTL_LOG="$WORK/fake-launchctl.log"
+mkdir -p "$FAKE_HOME/Library/LaunchAgents" "$FAKE_BIN"
+cat > "$FAKE_BIN/launchctl" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "${LAUNCHCTL_LOG:?}"
+exit 0
+SH
+chmod 0755 "$FAKE_BIN/launchctl"
+INSTALL_PATH="$FAKE_BIN:$PATH"
+TRIM_LABEL="org.jleechanorg.ezgha-queue-trimmer"
+REAPER_LABEL="org.jleechanorg.ezgha-queue-reaper"
+INSTALL_SCRIPT="$REPO_ROOT/launchd/install-launchagents.sh"
+
+run_launchagent_install() { # label, mode, value
+  local label="$1" mode="$2" value="${3:-}"
+  local target="$FAKE_HOME/Library/LaunchAgents/${label}.plist"
+  local log="$WORK/install-${label}-${mode}.log"
+  local rc
+  if [[ "$mode" == "unset" ]]; then
+    if env -u BASH_ENV -u EZGHA_SUSPENSION_RECORD HOME="$FAKE_HOME" BASH_ENV=/dev/null \
+        PATH="$INSTALL_PATH" LAUNCHCTL_LOG="$LAUNCHCTL_LOG" \
+        bash "$INSTALL_SCRIPT" install "$label" > "$log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  else
+    if env -u BASH_ENV HOME="$FAKE_HOME" PATH="$INSTALL_PATH" BASH_ENV=/dev/null \
+        LAUNCHCTL_LOG="$LAUNCHCTL_LOG" EZGHA_SUSPENSION_RECORD="$value" \
+        bash "$INSTALL_SCRIPT" install "$label" > "$log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    fail "7 installer exited $rc for $label ($mode): $(tail -n 1 "$log")"
+    return 1
+  fi
+  local observed
+  observed="$(read_record "$target")"
+  if [[ "$mode" == "unset" ]]; then
+    [[ "$observed" == "bead-${label##*.ezgha-queue-}" ]] && \
+      pass "7 $label reinstall without env var PRESERVES declaration" || \
+      fail "7 $label unset reinstall expected preserved record, got '$observed'"
+  elif [[ "$mode" == "empty" ]]; then
+    [[ -z "$observed" ]] && pass "7 $label explicit empty CLEARS declaration" || \
+      fail "7 $label explicit empty left '$observed'"
+  else
+    [[ "$observed" == "$value" ]] && pass "7 $label install declares record" || \
+      fail "7 $label install expected '$value', got '$observed'"
+  fi
+  if ! grep -qF "$label" "$LAUNCHCTL_LOG"; then
+    fail "7 $label did not reach the fake launchctl"
+  fi
+}
+
+for label in "$TRIM_LABEL" "$REAPER_LABEL"; do
+  run_launchagent_install "$label" set "bead-${label##*.ezgha-queue-}"
+  run_launchagent_install "$label" unset
+  run_launchagent_install "$label" empty ""
+done
+
+if [[ -s "$LAUNCHCTL_LOG" ]]; then
+  pass "7 both actual installer paths used the fake launchctl"
+else
+  fail "7 fake launchctl was never invoked"
+fi
+
+if [ "$FAILS" -ne 0 ]; then
+  echo "FAILED: $FAILS assertion(s)" >&2
+  exit 1
+fi
+echo "ALL TESTS PASSED!"
