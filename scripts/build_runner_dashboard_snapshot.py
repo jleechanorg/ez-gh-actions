@@ -157,7 +157,10 @@ def build_snapshot(*, mac_payload, linux_payload, observed_at, published_at,
     # degrades only the queue block and never invalidates host capacity. Folding it
     # into `sources` would make a queue outage fail the entire snapshot.
     return {
-        "schema_version": 2,
+        # Kept at 1: the queue block is purely additive and old consumers ignore
+        # unknown keys, so bumping would churn a published contract for no gain.
+        # The renderer accepts 1 or 2 so a bumped snapshot would still work.
+        "schema_version": 1,
         "observed_at": observed_at,
         "published_at": published_at,
         "sources": {

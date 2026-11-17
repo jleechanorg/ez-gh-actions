@@ -288,8 +288,20 @@
   // GitHub refuses to transition -- they can never start. They are shown, greyed,
   // and explicitly excluded from the number that reads as backlog.
   function renderQueue(queue) {
-    const repos = document.getElementById('queue-repos');
-    if (repos) repos.replaceChildren();
+    // Defensive: the published page always has these nodes, but keeping DOM access
+    // optional means the queue block can never throw and blank out the capacity view
+    // (and keeps the renderer usable against minimal DOM stubs in tests).
+    const byId = (id) => {
+      try {
+        return document.getElementById(id) || null;
+      } catch (_error) {
+        return null;
+      }
+    };
+    const repos = byId('queue-repos');
+    if (repos && typeof repos.replaceChildren === 'function') {
+      repos.replaceChildren();
+    }
 
     const valid =
       queue &&
@@ -305,13 +317,13 @@
         'queue-summary',
         'Queue breakdown unavailable this snapshot — treat waiting work as unknown, not zero.',
       );
-      document.getElementById('queue-fresh')?.classList.add('is-unknown');
-      document.getElementById('queue-ghosts')?.classList.add('is-unknown');
+      byId('queue-fresh')?.classList?.add?.('is-unknown');
+      byId('queue-ghosts')?.classList?.add?.('is-unknown');
       return;
     }
 
-    document.getElementById('queue-fresh')?.classList.remove('is-unknown');
-    document.getElementById('queue-ghosts')?.classList.remove('is-unknown');
+    byId('queue-fresh')?.classList?.remove?.('is-unknown');
+    byId('queue-ghosts')?.classList?.remove?.('is-unknown');
     setText('queue-fresh', String(queue.fresh));
     setText('queue-ghosts', String(queue.ghosts));
     setText(
@@ -330,7 +342,7 @@
           `${queue.ghosts} are ghosts GitHub will not release.`,
     );
 
-    if (!repos) return;
+    if (!repos || typeof repos.appendChild !== 'function') return;
     for (const entry of queue.repos || []) {
       if (!entry || typeof entry.repo !== 'string') continue;
       const row = document.createElement('p');
