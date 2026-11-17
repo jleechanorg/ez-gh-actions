@@ -6,10 +6,10 @@
       },
       "fleet": {
         "configured": 20,
-        "cycling": 0,
+        "cycling": 1,
         "down": 0,
-        "executing": 9,
-        "idle": 11,
+        "executing": 12,
+        "idle": 7,
         "reserved": 20
       },
       "sources": {
@@ -45,8 +45,8 @@
         "configured": 4,
         "cycling": 0,
         "down": 0,
-        "executing": 0,
-        "idle": 4,
+        "executing": 2,
+        "idle": 2,
         "reserved": 4
       },
       "sources": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-17T15:50:50Z",
-  "published_at": "2026-11-17T15:50:52Z",
+  "observed_at": "2026-11-17T16:02:42Z",
+  "published_at": "2026-11-17T16:03:27Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
