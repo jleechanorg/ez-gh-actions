@@ -1,0 +1,107 @@
+{
+  "fleets": {
+    "linux": {
+      "disk": {
+        "status": "healthy"
+      },
+      "fleet": {
+        "configured": 20,
+        "cycling": 0,
+        "down": 0,
+        "executing": 9,
+        "idle": 11,
+        "reserved": 20
+      },
+      "sources": {
+        "config": {
+          "ok": true
+        },
+        "disk": {
+          "ok": true
+        },
+        "docker": {
+          "ok": true
+        },
+        "process_probe": {
+          "ok": true
+        },
+        "service": {
+          "ok": true
+        },
+        "watchdog_state": {
+          "ok": false
+        }
+      },
+      "watchdog": {
+        "consecutive_misses": null,
+        "restart_after": null
+      }
+    },
+    "mac": {
+      "disk": {
+        "status": "unknown"
+      },
+      "fleet": {
+        "configured": 4,
+        "cycling": 0,
+        "down": 4,
+        "executing": 0,
+        "idle": 0,
+        "reserved": 4
+      },
+      "sources": {
+        "config": {
+          "ok": true
+        },
+        "disk": {
+          "ok": false
+        },
+        "docker": {
+          "ok": true
+        },
+        "process_probe": {
+          "ok": true
+        },
+        "service": {
+          "ok": false
+        },
+        "watchdog_state": {
+          "ok": false
+        }
+      },
+      "watchdog": {
+        "consecutive_misses": null,
+        "restart_after": null
+      }
+    }
+  },
+  "observed_at": "2026-11-17T01:46:26Z",
+  "published_at": "2026-11-17T01:47:06Z",
+  "queue": {
+    "fresh": null,
+    "ghosts": null,
+    "ok": false,
+    "oldest_fresh_wait_minutes": null,
+    "repos": [
+      {
+        "fresh": null,
+        "ghosts": null,
+        "repo": "jleechanorg/worldarchitect.ai"
+      },
+      {
+        "fresh": null,
+        "ghosts": null,
+        "repo": "jleechanorg/worldai_frontend"
+      }
+    ]
+  },
+  "schema_version": 1,
+  "sources": {
+    "linux_host": {
+      "ok": true
+    },
+    "mac_host": {
+      "ok": false
+    }
+  }
+}
