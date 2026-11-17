@@ -8,9 +8,9 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 14,
-        "idle": 6,
-        "reserved": 19
+        "executing": 12,
+        "idle": 8,
+        "reserved": 20
       },
       "sources": {
         "config": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-17T21:54:54Z",
-  "published_at": "2026-11-17T21:55:58Z",
+  "observed_at": "2026-11-17T22:07:32Z",
+  "published_at": "2026-11-17T22:07:35Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
