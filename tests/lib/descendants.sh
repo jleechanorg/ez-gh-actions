@@ -51,23 +51,97 @@ descendants_checked() {
   return 0
 }
 
-# teardown_tree PID
+# process_identity PID
+#   Returns the locale-stable process start time for a currently live PID.
+process_identity() {
+  local pid="$1" identity rc
+  kill -0 "$pid" 2>/dev/null || return 1
+  identity="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)"
+  rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  identity="$(printf '%s' "$identity" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+  [ -n "$identity" ] || return 1
+  printf '%s\n' "$identity"
+}
+
+# identity_matches PID EXPECTED_IDENTITY
+identity_matches() {
+  local expected="$2" actual
+  [ -n "$expected" ] || return 1
+  actual="$(process_identity "$1")" || return 1
+  [ "$actual" = "$expected" ]
+}
+
+# identity_status PID EXPECTED_IDENTITY
+#   0 = same process, 1 = gone or known different identity, 2 = identity unknown
+identity_status() {
+  local pid="$1" expected="$2" actual
+  [ -n "$expected" ] || return 2
+  actual="$(process_identity "$pid")" || {
+    kill -0 "$pid" 2>/dev/null && return 2
+    return 1
+  }
+  [ "$actual" = "$expected" ] && return 0
+  return 1
+}
+
+# signal_owned_pid SIGNAL PID EXPECTED_IDENTITY
+#   Fail closed when the identity is missing, expired, or mismatched.
+signal_owned_pid() {
+  local signal="$1" pid="$2" expected="$3"
+  [ -n "$expected" ] || return 1
+  identity_matches "$pid" "$expected" || return 1
+  pid_is_running "$pid" || return 1
+  kill "-$signal" "$pid" 2>/dev/null
+}
+
+# owned_pid_is_running PID EXPECTED_IDENTITY
+#   Unknown process state fails closed; a gone or replaced PID is not the
+#   recorded fixture process, and an explicit zombie state is already exited.
+owned_pid_is_running() {
+  local pid="$1" expected="$2" state
+  identity_status "$pid" "$expected"
+  state=$?
+  case "$state" in
+    0) pid_is_running "$pid" ;;
+    1) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# teardown_tree PID EXPECTED_IDENTITY
 #   Race-free: STOP the leader so it cannot fork, then repeatedly sweep and TERM
 #   the whole CURRENT tree, requiring two consecutive empty sweeps; SIGKILL
-#   backstop; final re-walk after the leader is gone.
-#   Returns 0 on success, 5 if process discovery was unavailable/erroring.
+#   backstop; final re-walk only while the expected leader identity still holds.
+#   Returns 0 on success, 5 if discovery failed, 6 if leader identity is absent
+#   or no longer matches. Never signal a PID without a verified identity.
 teardown_tree() {
-  local pid="$1" discovery_ok=1 empty_streak=0 found k i
+  local pid="$1" leader_identity="$2" discovery_ok=1 empty_streak=0 found k i child_identity leader_state
+  [ -n "$leader_identity" ] || return 6
+  identity_status "$pid" "$leader_identity"
+  case "$?" in 0) ;; 1) return 0 ;; *) return 6 ;; esac
   for i in $(seq 1 40); do
-    kill -STOP "$pid" 2>/dev/null || true
+    if ! signal_owned_pid STOP "$pid" "$leader_identity"; then
+      identity_status "$pid" "$leader_identity"
+      leader_state=$?
+      [ "$leader_state" -eq 2 ] && discovery_ok=0
+      break
+    fi
+    identity_status "$pid" "$leader_identity"
+    leader_state=$?
+    [ "$leader_state" -eq 0 ] || { [ "$leader_state" -eq 2 ] && discovery_ok=0; break; }
     descendants_checked "$pid"
     if [ "$DESCENDANTS_RC" -ne 0 ]; then discovery_ok=0; break; fi
     found="$DESCENDANTS_OUT"
     for k in $(printf '%s\n' "$found" | awk '{a[NR]=$0} END{for(j=NR;j>=1;j--) print a[j]}'); do
-      kill -TERM "$k" 2>/dev/null || true
+      child_identity="$(process_identity "$k")" || continue
+      signal_owned_pid TERM "$k" "$child_identity" || true
     done
-    kill -TERM "$pid" 2>/dev/null || true
+    signal_owned_pid TERM "$pid" "$leader_identity" || true
 
+    identity_status "$pid" "$leader_identity"
+    leader_state=$?
+    [ "$leader_state" -eq 0 ] || { [ "$leader_state" -eq 2 ] && discovery_ok=0; break; }
     descendants_checked "$pid"
     [ "$DESCENDANTS_RC" -ne 0 ] && { discovery_ok=0; break; }
     if [ -z "$DESCENDANTS_OUT" ] && ! kill -0 "$pid" 2>/dev/null; then
@@ -79,10 +153,25 @@ teardown_tree() {
     sleep 0.1
   done
 
-  descendants_checked "$pid"
-  [ "$DESCENDANTS_RC" -eq 0 ] || discovery_ok=0
-  for k in $DESCENDANTS_OUT; do kill -KILL "$k" 2>/dev/null || true; done
-  kill -KILL "$pid" 2>/dev/null || true
+  identity_status "$pid" "$leader_identity"
+  leader_state=$?
+  if [ "$leader_state" -eq 0 ]; then
+    descendants_checked "$pid"
+    [ "$DESCENDANTS_RC" -eq 0 ] || discovery_ok=0
+    identity_status "$pid" "$leader_identity"
+    leader_state=$?
+    if [ "$leader_state" -eq 0 ] && [ "$DESCENDANTS_RC" -eq 0 ]; then
+      for k in $DESCENDANTS_OUT; do
+        child_identity="$(process_identity "$k")" || continue
+        signal_owned_pid KILL "$k" "$child_identity" || true
+      done
+    elif [ "$leader_state" -eq 2 ]; then
+      discovery_ok=0
+    fi
+  elif [ "$leader_state" -eq 2 ]; then
+    discovery_ok=0
+  fi
+  signal_owned_pid KILL "$pid" "$leader_identity" || true
   wait "$pid" 2>/dev/null || true
 
   [ "$discovery_ok" -eq 1 ] || return 5

@@ -34,9 +34,21 @@ WORK="$(mktemp -d "$SCRATCH/trim-queued-progress.XXXXXX")" || exit 1
   exit 1
 }
 export WORK
-pid=""
+RUNPID=""; RUNPID_ID=""
+progress_sleep_pid=""; progress_sleep_identity=""
+stop_fixture_pids() {
+  local pid identity
+  if [ -n "$progress_sleep_pid" ] && [ -n "$progress_sleep_identity" ]; then
+    signal_owned_pid KILL "$progress_sleep_pid" "$progress_sleep_identity" || true
+  fi
+}
 cleanup() {
-  if [ -n "$pid" ]; then teardown_tree "$pid" || true; fi
+  if [ -n "$RUNPID" ] && [ -n "$RUNPID_ID" ]; then
+    teardown_tree "$RUNPID" "$RUNPID_ID" || true
+    wait "$RUNPID" 2>/dev/null || true
+    RUNPID=""; RUNPID_ID=""
+  fi
+  stop_fixture_pids
   rm -rf "${WORK:?}"
 }
 trap cleanup EXIT
@@ -45,6 +57,8 @@ STUB_BIN="$WORK/bin"; mkdir -p "$STUB_BIN"
 FAILS=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; FAILS=$((FAILS+1)); }
+# shellcheck source=tests/lib/descendants.sh
+. "$REPO_ROOT/tests/lib/descendants.sh"
 
 # ---- A) structural: no heredoc writer remains ------------------------------
 for f in scripts/trim-queued-runs.sh scripts/cleanup-stuck-runs.sh; do
@@ -96,18 +110,14 @@ RUN=( env -u BASH_ENV PATH="$STUB_BIN:$PATH" QUEUE_REPOS="acme/one"
 # then walk the descendant tree explicitly and terminate it leaf-first. That is
 # portable and does not depend on group isolation at all (review P0).
 "${RUN[@]}" </dev/null >"$LOG" 2>&1 &
-pid=$!
-
-# Single shared implementation (see tests/lib/descendants.sh for the bugs it
-# encodes: `! cmd` status capture, subshell flag mutation, stale snapshots).
-# shellcheck source=tests/lib/descendants.sh
-. "$(dirname "${BASH_SOURCE[0]}")/lib/descendants.sh"
+RUNPID=$!
+RUNPID_ID="$(process_identity "$RUNPID")" || fail "cleanup: worker identity could not be captured"
 
 seen=0; alive=0
 for _ in $(seq 1 20); do
   if grep -q "\[acme/one\] scan:" "$LOG" 2>/dev/null; then
     seen=1
-    kill -0 "$pid" 2>/dev/null && alive=1
+    pid_is_running "$RUNPID" && alive=1
     break
   fi
   sleep 1
@@ -121,32 +131,43 @@ for _ in $(seq 1 50); do
 done
 [ -s "$WORK/progress-sleep-pid" ] \
   || fail "fixture: blocking sleep 20 did not start after scan output"
-descendants_checked "$pid"
-printf '%s\n' "$DESCENDANTS_OUT" > "$WORK/descendant-pids"
+descendants_checked "$RUNPID"
 progress_sleep_pid="$(cat "$WORK/progress-sleep-pid" 2>/dev/null || true)"
+progress_sleep_identity="$(process_identity "$progress_sleep_pid")" \
+  || fail "fixture: blocking sleep 20 identity could not be captured"
+printf '%s|%s\n' "$progress_sleep_pid" "$progress_sleep_identity" > "$WORK/descendant-identities"
+for k in $DESCENDANTS_OUT; do
+  [ "$k" = "$progress_sleep_pid" ] && continue
+  child_identity="$(process_identity "$k")" || continue
+  printf '%s|%s\n' "$k" "$child_identity" >> "$WORK/descendant-identities"
+done
 if printf '%s\n' "$DESCENDANTS_OUT" | grep -Fxq "$progress_sleep_pid"; then
   pass "fixture: blocking sleep 20 is in the captured worker tree"
 else
-  fail "fixture: blocking sleep 20 pid=$progress_sleep_pid was not captured under worker pid=$pid (descendants=$DESCENDANTS_OUT)"
+  fail "fixture: blocking sleep 20 pid=$progress_sleep_pid was not captured under worker pid=$RUNPID (descendants=$DESCENDANTS_OUT)"
 fi
 
 # We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
 # `wait` under `set -e` would abort BEFORE the assertions below.
 teardown_rc=0
-teardown_tree "$pid" || teardown_rc=$?
+teardown_tree "$RUNPID" "$RUNPID_ID" || teardown_rc=$?
+wait "$RUNPID" 2>/dev/null || true
+RUNPID=""; RUNPID_ID=""
 
 # Discovery MUST have worked, otherwise the survivor check below is vacuous.
-[ "$teardown_rc" -ne 5 ] \
+[ "$teardown_rc" -eq 0 ] \
   && pass "cleanup: process discovery available (survivor check is meaningful)" \
-  || fail "cleanup: process discovery failed/unavailable — survivor check would pass vacuously"
+      || fail "cleanup: teardown failed (rc=$teardown_rc); survivor check would be inconclusive"
 
 # Final accounting AFTER the leader is gone: nothing can respawn now.
-descendants_checked "$pid"
 survivors=0
-for k in $(cat "$WORK/descendant-pids"); do pid_is_running "$k" && survivors=$((survivors+1)); done
+while IFS='|' read -r k identity; do
+  [ -n "$k" ] && [ -n "$identity" ] && owned_pid_is_running "$k" "$identity" \
+    && survivors=$((survivors+1))
+done < "$WORK/descendant-identities"
 [ "$survivors" -eq 0 ] && pass "cleanup: no descendants survived the pass" \
                        || fail "cleanup: $survivors descendant(s) still alive after teardown"
-pid_is_running "$progress_sleep_pid" \
+owned_pid_is_running "$progress_sleep_pid" "$progress_sleep_identity" \
   && fail "cleanup: fixture sleep 20 survived teardown (pid=$progress_sleep_pid)" \
   || pass "cleanup: fixture sleep 20 stopped"
 
