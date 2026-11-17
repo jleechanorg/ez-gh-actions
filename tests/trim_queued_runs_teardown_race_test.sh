@@ -30,8 +30,21 @@ FAILS=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; FAILS=$((FAILS+1)); }
 
-SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh ezgha-tests)"
-W="$(mktemp -d "$SCRATCH/trim-queued-race.XXXXXX")"
+SCRATCH_HELPER="$HOME/.claude/skills/scratch-space/scripts/scratch-dir.sh"
+if [ -x "$SCRATCH_HELPER" ]; then
+  SCRATCH="$("$SCRATCH_HELPER" ezgha-tests)" || exit 1
+else
+  SCRATCH="${TMPDIR:-/tmp}"
+fi
+[ -n "$SCRATCH" ] && [ "$SCRATCH" != / ] || {
+  echo "FAIL: unsafe or empty scratch directory" >&2
+  exit 1
+}
+W="$(mktemp -d "$SCRATCH/trim-queued-race.XXXXXX")" || exit 1
+[ -n "$W" ] && [ -d "$W" ] && [ "$W" != / ] || {
+  echo "FAIL: unable to create safe teardown fixture directory" >&2
+  exit 1
+}
 FPID=""; F2=""; SENTINEL=""; LEAF=""
 stop_fixture_pids() {
   local pid

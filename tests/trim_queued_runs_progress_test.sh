@@ -18,8 +18,21 @@ unset BASH_ENV || true
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh ezgha-tests)"
-WORK="$(mktemp -d "$SCRATCH/trim-queued-progress.XXXXXX")"
+SCRATCH_HELPER="$HOME/.claude/skills/scratch-space/scripts/scratch-dir.sh"
+if [ -x "$SCRATCH_HELPER" ]; then
+  SCRATCH="$("$SCRATCH_HELPER" ezgha-tests)" || exit 1
+else
+  SCRATCH="${TMPDIR:-/tmp}"
+fi
+[ -n "$SCRATCH" ] && [ "$SCRATCH" != / ] || {
+  echo "FAIL: unsafe or empty scratch directory" >&2
+  exit 1
+}
+WORK="$(mktemp -d "$SCRATCH/trim-queued-progress.XXXXXX")" || exit 1
+[ -n "$WORK" ] && [ -d "$WORK" ] && [ "$WORK" != / ] || {
+  echo "FAIL: unable to create safe progress fixture directory" >&2
+  exit 1
+}
 export WORK
 pid=""
 cleanup() {
