@@ -45,8 +45,8 @@
         "configured": 4,
         "cycling": 0,
         "down": 0,
-        "executing": 3,
-        "idle": 1,
+        "executing": 2,
+        "idle": 2,
         "reserved": 4
       },
       "sources": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-17T07:14:05Z",
-  "published_at": "2026-11-17T07:14:09Z",
+  "observed_at": "2026-11-17T07:25:57Z",
+  "published_at": "2026-11-17T07:26:30Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
