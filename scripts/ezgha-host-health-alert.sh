@@ -449,7 +449,7 @@ save_state() { # status last_sent_fleet last_sent_disk disk_since
 emit() { # severity payload-json
   local severity="$1" payload="$2"
   if [ -n "$GCLOUD" ] && [ "$DRY_RUN" -eq 0 ]; then
-    "$GCLOUD" logging write "$LOG_NAME" "$payload" \
+    "$GCLOUD" logging write "$LOG_NAME" "$payload" --payload-type=json \
       --severity="$severity" --project="$GCP_PROJECT" --account="$GCP_ACCOUNT" >/dev/null 2>&1 || true
     echo "[$NOW_ISO] Dispatched ${severity} entry to Cloud Logging (${LOG_NAME})"
   else
