@@ -136,6 +136,31 @@ PATH="$saved_path"
   && pass "7 final discovery error is returned as teardown failure" \
   || fail "7 final discovery error was lost (teardown rc=${rc_final:-0})"
 
+# 8: unknown ps output must fail closed for a live owned PID; a confirmed Z
+#    state is treated as exited even while kill -0 still sees the zombie.
+mkdir -p "$W/bin-ps-error" "$W/bin-ps-zombie"
+printf '#!/usr/bin/env bash\nexit 9\n' > "$W/bin-ps-error/ps"
+printf '#!/usr/bin/env bash\nprintf Z\\n\n' > "$W/bin-ps-zombie/ps"
+chmod +x "$W/bin-ps-error/ps" "$W/bin-ps-zombie/ps"
+sleep 30 &
+PS_PROBE_PID=$!
+saved_path="$PATH"
+PATH="$W/bin-ps-error:$PATH"
+if pid_is_running "$PS_PROBE_PID"; then
+  pass "8 failed ps keeps a live fixture PID classified as running"
+else
+  fail "8 failed ps misclassified a live fixture PID as stopped"
+fi
+PATH="$W/bin-ps-zombie:$PATH"
+if pid_is_running "$PS_PROBE_PID"; then
+  fail "8 explicit Z state was classified as running"
+else
+  pass "8 explicit Z state is classified as exited"
+fi
+PATH="$saved_path"
+kill -TERM "$PS_PROBE_PID" 2>/dev/null || true
+wait "$PS_PROBE_PID" 2>/dev/null || true
+
 # ---- 5. a TERM-ignoring forker leaves no survivors -----------------------
 cat > "$W/forker.sh" <<F
 #!/usr/bin/env bash

@@ -90,11 +90,18 @@ teardown_tree() {
 }
 
 # pid_is_running PID
-#   kill -0 detects an existing process; ps excludes an exited zombie, which
-#   otherwise remains visible to kill -0 until its parent reaps it.
+#   kill -0 detects an existing process; ps can exclude an exited zombie, which
+#   otherwise remains visible to kill -0 until its parent reaps it. An unknown
+#   ps result is treated as running unless a second kill -0 sees it gone.
 pid_is_running() {
-  local state
+  local state ps_rc
   kill -0 "$1" 2>/dev/null || return 1
-  state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')"
-  [ -n "$state" ] && [ "${state#Z}" = "$state" ]
+  state="$(ps -o stat= -p "$1" 2>/dev/null)"
+  ps_rc=$?
+  state="$(printf '%s' "$state" | tr -d ' ')"
+  if [ "$ps_rc" -eq 0 ] && [ -n "$state" ]; then
+    [ "${state#Z}" = "$state" ]
+    return $?
+  fi
+  kill -0 "$1" 2>/dev/null
 }
