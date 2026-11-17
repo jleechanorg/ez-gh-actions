@@ -290,17 +290,40 @@ late_child_identity=""
 if [ -f "$W/late-child-identity" ]; then
   late_child_identity="$(tr -s ' ' < "$W/late-child-identity" | sed 's/^ *//;s/ *$//')"
 fi
-[ -n "$late_child_pid" ] && [ -n "$late_child_identity" ] \
-  && printf '%s|%s\n' "$late_child_pid" "$late_child_identity" >> "$W/spawned-pids"
+if [ -n "$late_child_pid" ]; then
+  printf 'LATE_CHILD_CAPTURE pid=%s start=%s\n' "$late_child_pid" "${late_child_identity:-missing}"
+else
+  fail "5c late child PID capture is missing"
+fi
+[ -n "$late_child_identity" ] || fail "5c late child start-time identity capture is missing"
+if [ -n "$late_child_pid" ] && [ -n "$late_child_identity" ]; then
+  printf '%s|%s\n' "$late_child_pid" "$late_child_identity" >> "$W/spawned-pids"
+else
+  fail "5c late child PID/start-time pair is incomplete"
+fi
 cp "$W/spawned-pids" "$W/finished-pids"
 [ -s "$W/finished-pids" ] \
   && pass "5d teardown assertions use the complete finished PID log" \
   || fail "5d complete fixture PID log is empty"
+late_child_pair="$late_child_pid|$late_child_identity"
+if [ -n "$late_child_pid" ] && [ -n "$late_child_identity" ] \
+  && grep -Fxq "$late_child_pair" "$W/finished-pids"; then
+  pass "5d late child PID/start-time pair appears in the completed teardown log"
+else
+  fail "5d late child PID/start-time pair is absent from the completed teardown log"
+fi
 survivors=0
+checked=0
 while IFS='|' read -r k identity; do
-  [ -n "$k" ] && [ -n "$identity" ] && owned_pid_is_running "$k" "$identity" \
-    && survivors=$((survivors+1))
+  if [ -n "$k" ] && [ -n "$identity" ]; then
+    checked=$((checked+1))
+    owned_pid_is_running "$k" "$identity" && survivors=$((survivors+1))
+  fi
 done < "$W/finished-pids"
+finished_count="$(wc -l < "$W/finished-pids" | tr -d ' ')"
+printf 'PID_IDENTITY_CHECKS count=%s checked=%s survivors=%s teardown_rc=%s late_pair_present=%s\n' \
+  "$finished_count" "$checked" "$survivors" "$teardown_rc" \
+  "$(grep -Fxq "$late_child_pair" "$W/finished-pids" && echo yes || echo no)"
 [ "$survivors" -eq 0 ] && pass "5e no identity-recorded fixture process survived teardown" \
                        || fail "5e $survivors recorded fixture process(es) survived teardown"
 
