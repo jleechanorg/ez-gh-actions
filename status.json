@@ -75,21 +75,21 @@
       }
     }
   },
-  "observed_at": "2026-11-17T03:51:00Z",
-  "published_at": "2026-11-17T03:51:34Z",
+  "observed_at": "2026-11-17T04:03:42Z",
+  "published_at": "2026-11-17T04:04:48Z",
   "queue": {
-    "fresh": 29,
+    "fresh": 39,
     "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 63,
+    "oldest_fresh_wait_minutes": 247,
     "repos": [
       {
-        "fresh": 24,
+        "fresh": 39,
         "ghosts": 149,
         "repo": "jleechanorg/worldarchitect.ai"
       },
       {
-        "fresh": 5,
+        "fresh": 0,
         "ghosts": 15,
         "repo": "jleechanorg/worldai_frontend"
       }
