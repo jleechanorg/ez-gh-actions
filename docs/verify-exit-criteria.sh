@@ -168,12 +168,16 @@ container_state_is_running() {
 # A stopped Lima/Colima VM matters only when Docker is using that VM's
 # endpoint. Native host Docker must not be coupled to an unrelated VM.
 verify_vm_state_for_docker_mode() {
-  local platform="$1" containment_mode="$2" lima_status
+  local platform="$1" containment_mode="$2" lima_status colima_status
   [ "$containment_mode" = "vm-backed" ] || return 0
 
   if [ "$platform" = "macos" ] && command -v colima >/dev/null 2>&1; then
-    colima status 2>&1 | grep -qi "is running" \
-      || { echo "Colima VM is not running (run: colima start)" >&2; return 1; }
+    if ! colima_status=$(colima status 2>&1); then
+      echo "Colima status probe failed: $colima_status" >&2
+      return 1
+    fi
+    grep -qi "is running" <<<"$colima_status" \
+      || { echo "Colima VM is not running" >&2; return 1; }
   elif command -v limactl >/dev/null 2>&1; then
     lima_status=$(limactl list 2>/dev/null | awk 'NR==2 {print $2}')
     [ "$lima_status" = "Running" ] \
@@ -693,7 +697,7 @@ verify_fresh_canary() {
     fi
     local canary_name_prefix canary_out canary_run_id canary_runner canary_tts
     canary_name_prefix=$(CONFIG_FILE="$canary_config" toml_get_runner name_prefix ez-org-runner 2>/dev/null || echo 'ez-org-runner')
-    if ! canary_out=$("$ezgha_bin" --config "$canary_config" canary-once --timeout-seconds "$canary_timeout_seconds" 2>&1); then
+    if ! canary_out=$("$ezgha_bin" --config "$canary_config" canary-once --timeout-seconds "$canary_timeout_seconds"); then
         echo "$canary_out"
         fail "Gate 4: fresh nonce-tracked canary did not complete successfully on ${canary_name_prefix}-* using $canary_config"
     fi
