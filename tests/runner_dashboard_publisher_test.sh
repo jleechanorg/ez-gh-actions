@@ -42,8 +42,11 @@ echo '{"schema_version":1,"host_class":"$host_class","sources":{"config":{"ok":t
 EOF
   chmod +x "$path"
 }
-write_probe "$PROBES/mac.sh" mac 6 5
-write_probe "$PROBES/linux.sh" linux 10 9
+# Real fleet shapes (2026-11-17): 4 Mac, 20 Linux. The snapshot fails closed when a
+# host's configured count disagrees with EXPECTED_CONFIGURED, so these fixtures must
+# track the live fleet or a healthy probe renders as UNKNOWN.
+write_probe "$PROBES/mac.sh" mac 4 3   # 3 executing + 1 idle = 4
+write_probe "$PROBES/linux.sh" linux 20 19   # 19 executing + 1 idle = 20
 
 SITE="$WORK/site"
 EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \

@@ -28,6 +28,7 @@ DASHBOARD_SCRIPTS=(
   publish_runner_dashboard.sh
   runner_dashboard_host_probe.sh
   build_runner_dashboard_snapshot.py
+  queue_probe.py
 )
 DASHBOARD_ASSETS=(index.html style.css dashboard.js)
 DASHBOARD_TRANSACTION_ACTIVE=false

@@ -9,8 +9,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # EZGHA_DASHBOARD_ASSET_DIR explicitly, which is why this broken default shipped in
 # PR #81 and was never exercised -- the first real --collect-only run failed with
 # "scripts/dashboard/index.html: No such file or directory".
-REPO_ROOT_FOR_ASSETS="$(cd "$SCRIPT_DIR/.." && pwd)"
-DASHBOARD_DIR="${EZGHA_DASHBOARD_ASSET_DIR:-$REPO_ROOT_FOR_ASSETS/dashboard}"
+# The assets live in two different relative places depending on layout:
+#   checkout:   <repo>/scripts/publish_runner_dashboard.sh + <repo>/dashboard/
+#   installed:  ~/.local/libexec/ezgha/publish_runner_dashboard.sh
+#               + ~/.local/libexec/ezgha/dashboard/  (installer copies assets alongside)
+# Try the sibling directory first (installed layout, and also a checkout if someone
+# builds assets there), then the repo root. Whichever actually contains index.html wins;
+# surface a clear error rather than installing from a missing path.
+if [[ -z "${EZGHA_DASHBOARD_ASSET_DIR:-}" ]]; then
+  for candidate in "$SCRIPT_DIR/dashboard" "$SCRIPT_DIR/../dashboard"; do
+    if [[ -f "$candidate/index.html" ]]; then
+      EZGHA_DASHBOARD_ASSET_DIR="$(cd "$candidate" && pwd)"
+      break
+    fi
+  done
+fi
+DASHBOARD_DIR="${EZGHA_DASHBOARD_ASSET_DIR:-$SCRIPT_DIR/dashboard}"
 SNAPSHOT_BUILDER="$SCRIPT_DIR/build_runner_dashboard_snapshot.py"
 HOST_PROBE="$SCRIPT_DIR/runner_dashboard_host_probe.sh"
 PROBE_DIR="${EZGHA_DASHBOARD_PROBE_DIR:-}"
@@ -228,9 +242,15 @@ build_site() {
     # EZGHA_DASHBOARD_QUEUE_PROBE_CMD overrides the probe executable so tests can
     # inject a fixture. Stubbing `gh` on PATH is not sufficient here: this host
     # ships a gh wrapper at ~/.local/bin/gh that re-execs the real binary.
-    QUEUE_PROBE_CMD="${EZGHA_DASHBOARD_QUEUE_PROBE_CMD:-python3 "$SCRIPT_DIR/queue_probe.py"}"
+    # Array, not a word-split string: an override may contain spaces (a fixture path
+    # under a temp dir, for instance) and must not be split on them.
+    if [[ -n "${EZGHA_DASHBOARD_QUEUE_PROBE_CMD:-}" ]]; then
+      read -r -a QUEUE_PROBE_CMD <<< "$EZGHA_DASHBOARD_QUEUE_PROBE_CMD"
+    else
+      QUEUE_PROBE_CMD=(python3 "$SCRIPT_DIR/queue_probe.py")
+    fi
     if ! timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
-        $QUEUE_PROBE_CMD \
+        "${QUEUE_PROBE_CMD[@]}" \
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
         --output "$WORK_DIR/queue.json"; then
