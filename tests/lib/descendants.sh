@@ -13,9 +13,9 @@
 #      copy, so the parent's flag never changes and a failure is reported as
 #      success. Fix: discovery status is returned via the function's EXIT CODE
 #      and consumed by the caller without command substitution swallowing it.
-#   3. A one-shot snapshot misses children a parent forks afterwards (measured:
-#      33 survivors and 10+ new children after the snapshot). Fix: repeated
-#      sweeps with the leader STOPped, requiring consecutive empty sweeps.
+#   3. A one-shot snapshot misses children a parent forks afterwards. Fix:
+#      repeated sweeps with the leader STOPped, requiring consecutive empty
+#      sweeps.
 
 # descendants PID
 #   stdout: one pid per line, parents before children
@@ -80,6 +80,7 @@ teardown_tree() {
   done
 
   descendants_checked "$pid"
+  [ "$DESCENDANTS_RC" -eq 0 ] || discovery_ok=0
   for k in $DESCENDANTS_OUT; do kill -KILL "$k" 2>/dev/null || true; done
   kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -88,14 +89,12 @@ teardown_tree() {
   return 0
 }
 
-# orphan_sleeps
-#   Pids of `sleep 5` processes reparented to init (ppid 1). These are the
-#   grandchildren a (buggy) teardown leaks once their parent is killed.
-orphan_sleeps() {
-  local a ap
-  for a in $(pgrep -f '^sleep 5$' 2>/dev/null || true); do
-    ap="$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ')"
-    [ "$ap" = "1" ] && printf '%s\n' "$a"
-  done
-  return 0
+# pid_is_running PID
+#   kill -0 detects an existing process; ps excludes an exited zombie, which
+#   otherwise remains visible to kill -0 until its parent reaps it.
+pid_is_running() {
+  local state
+  kill -0 "$1" 2>/dev/null || return 1
+  state="$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')"
+  [ -n "$state" ] && [ "${state#Z}" = "$state" ]
 }

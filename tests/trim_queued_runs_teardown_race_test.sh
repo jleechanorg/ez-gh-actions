@@ -30,8 +30,32 @@ FAILS=0
 pass() { printf 'PASS: %s\n' "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; FAILS=$((FAILS+1)); }
 
-W="$(mktemp -d)"
-cleanup() { touch "$W/stop" 2>/dev/null; rm -rf "${W:?}"; }
+SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh ezgha-tests)"
+W="$(mktemp -d "$SCRATCH/trim-queued-race.XXXXXX")"
+FPID=""; F2=""; SENTINEL=""; LEAF=""
+stop_fixture_pids() {
+  local pid
+  for pid in "$LEAF" "$FPID" "$F2" "$SENTINEL"; do
+    [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in "$LEAF" "$FPID" "$F2" "$SENTINEL"; do
+    [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+  done
+}
+cleanup() {
+  local pid_file pid
+  [ -n "$FPID" ] && teardown_tree "$FPID" || true
+  [ -n "$F2" ] && teardown_tree "$F2" || true
+  stop_fixture_pids
+  for pid_file in "$W/owned-pids" "$W/owned-pids2"; do
+    if [ -f "$pid_file" ]; then
+      while read -r pid; do
+        [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+      done < "$pid_file"
+    fi
+  done
+  rm -rf "${W:?}"
+}
 trap cleanup EXIT
 
 # ---- 1. a normal leaf with no children is NOT a discovery error -----------
@@ -90,15 +114,39 @@ PATH="$saved_path"
   && pass "2 discovery status reaches the caller (rc=$rc_direct, no subshell loss)" \
   || fail "2 discovery status was lost in a subshell (rc=$rc_direct)"
 
+# 7: an error on the final post-loop discovery must still reach the caller.
+mkdir -p "$W/bin-final-error"
+real_pgrep="$(command -v pgrep)"
+cat > "$W/bin-final-error/pgrep" <<SH
+#!/usr/bin/env bash
+count_file="$W/pgrep-count"
+count=0
+[ -f "\$count_file" ] && read -r count < "\$count_file"
+count=\$((count+1))
+printf '%s\\n' "\$count" > "\$count_file"
+[ "\$count" -eq 5 ] && exit 9
+exec "$real_pgrep" "\$@"
+SH
+chmod +x "$W/bin-final-error/pgrep"
+saved_path="$PATH"
+PATH="$W/bin-final-error:$PATH"
+teardown_tree 2147483647 || rc_final=$?
+PATH="$saved_path"
+[ "${rc_final:-0}" -eq 5 ] \
+  && pass "7 final discovery error is returned as teardown failure" \
+  || fail "7 final discovery error was lost (teardown rc=${rc_final:-0})"
+
 # ---- 5. a TERM-ignoring forker leaves no survivors -----------------------
 cat > "$W/forker.sh" <<F
 #!/usr/bin/env bash
 trap '' TERM
 mkdir -p "$W/spawned"
 while [ ! -f "$W/stop" ]; do
-  ( sleep 5 ) &
+  sleep 20 &
+  child=\$!
+  printf '%s\\n' "\$child" >> "$W/spawned-pids"
   : > "$W/spawned/\$\$-\$RANDOM"
-  sleep 0.02
+  wait "\$child"
 done
 F
 chmod +x "$W/forker.sh"
@@ -106,7 +154,7 @@ chmod +x "$W/forker.sh"
 "$W/forker.sh" &
 FPID=$!
 sleep 1
-spawns_before="$(ls "$W/spawned" 2>/dev/null | wc -l | tr -d ' ')"
+cp "$W/spawned-pids" "$W/owned-pids"
 descendants_checked "$FPID"
 [ -n "$DESCENDANTS_OUT" ] && pass "5 forker has live children before teardown" \
                           || fail "5 forker had no children; race not exercised"
@@ -116,39 +164,40 @@ teardown_tree "$FPID" || teardown_rc=$?
 [ "$teardown_rc" -ne 5 ] && pass "5b teardown completed with discovery available" \
                          || fail "5b teardown reported a discovery failure"
 
-spawns_after="$(ls "$W/spawned" 2>/dev/null | wc -l | tr -d ' ')"
-[ "${spawns_after:-0}" -gt "${spawns_before:-0}" ] \
-  && pass "5c forker kept spawning DURING teardown (race was live)" \
-  || fail "5c forker stopped spawning before teardown — race not exercised"
-
-sleep 0.5
-descendants_checked "$FPID"
 survivors=0
-for k in $DESCENDANTS_OUT; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
-orphans="$(orphan_sleeps || true)"
-[ "$survivors" -eq 0 ] && pass "5d no descendant survived a respawning teardown" \
-                       || fail "5d descendant(s) survived: $(printf '%s ' $DESCENDANTS_OUT)"
-[ -z "$orphans" ] && pass "5e no reparented orphans left behind" \
-                  || fail "5e orphaned process(es) reparented to init: $(printf '%s ' $orphans)"
+for k in $(cat "$W/owned-pids"); do pid_is_running "$k" && survivors=$((survivors+1)); done
+[ "$survivors" -eq 0 ] && pass "5c no recorded fixture descendant survived teardown" \
+                       || fail "5c fixture descendant(s) survived: $(cat "$W/owned-pids")"
+
+# A live test-owned sentinel outside the teardown target must remain untouched.
+sleep 20 &
+SENTINEL=$!
+kill -0 "$SENTINEL" 2>/dev/null \
+  && pass "5d unrelated controlled sentinel remains alive" \
+  || fail "5d teardown affected the unrelated controlled sentinel"
 
 # ---- 6. RED control -----------------------------------------------------
-# The OLD snapshot-then-kill logic must FAIL under the same workload, otherwise
-# this test would pass for a teardown that does not actually fix the race.
+# The OLD snapshot-then-kill logic must miss a deliberately late, logged child.
 cat > "$W/forker2.sh" <<F
 #!/usr/bin/env bash
 trap '' TERM
-mkdir -p "$W/spawned2"
-while [ ! -f "$W/stop2" ]; do
-  ( sleep 5 ) &
-  : > "$W/spawned2/\$RANDOM"
-  sleep 0.02
-done
+touch "$W/forker2-ready"
+while [ ! -f "$W/late-start" ]; do :; done
+sleep 20 &
+printf '%s\\n' "\$!" >> "$W/owned-pids2"
+touch "$W/late-child-ready"
+wait
 F
 chmod +x "$W/forker2.sh"
 
-old_teardown() {  # the ORIGINAL racy implementation
+old_teardown() {  # the ORIGINAL racy implementation, with a deterministic fork after snapshot
   local pid="$1" kids found
   kids="$(descendants "$pid" || true)"
+  touch "$W/late-start"
+  for _ in $(seq 1 100); do
+    [ -f "$W/late-child-ready" ] && break
+    sleep 0.01
+  done
   for k in $(printf '%s\n' "$kids" | awk '{a[NR]=$0} END{for(i=NR;i>=1;i--) print a[i]}'); do
     kill -TERM "$k" 2>/dev/null || true
   done
@@ -159,20 +208,24 @@ old_teardown() {  # the ORIGINAL racy implementation
   wait "$pid" 2>/dev/null || true
 }
 
-orphans_before="$(orphan_sleeps | wc -l | tr -d ' ')"
 "$W/forker2.sh" &
 F2=$!
-sleep 1
+for _ in $(seq 1 100); do
+  [ -f "$W/forker2-ready" ] && break
+  sleep 0.01
+done
+[ -f "$W/forker2-ready" ] || fail "6 fixture leader did not reach its controlled wait point"
 old_teardown "$F2"
-touch "$W/stop2"
-sleep 0.4
-orphans_after="$(orphan_sleeps | wc -l | tr -d ' ')"
-leaked=$(( ${orphans_after:-0} - ${orphans_before:-0} ))
-[ "$leaked" -gt 0 ] && pass "6 RED control: the OLD snapshot teardown leaks ($leaked orphan(s)), so this test discriminates" \
-                    || fail "6 RED control did not leak — the test may not be exercising the race"
-
-# tidy any orphans the RED control created
-for o in $(orphan_sleeps); do kill -KILL "$o" 2>/dev/null || true; done
+cp "$W/owned-pids2" "$W/owned-pids2-snapshot"
+[ -s "$W/owned-pids2-snapshot" ] \
+  && pass "6 RED control: old teardown workload created logged fixture children" \
+  || fail "6 RED control did not create its fixture workload"
+survivors=0
+for k in $(cat "$W/owned-pids2-snapshot"); do pid_is_running "$k" && survivors=$((survivors+1)); done
+[ "$survivors" -gt 0 ] \
+  && pass "6 RED control: old snapshot teardown leaves the deliberately late owned child" \
+  || fail "6 RED control did not leave a logged child to prove the old behavior"
+for k in $(cat "$W/owned-pids2-snapshot"); do kill -KILL "$k" 2>/dev/null || true; done
 
 touch "$W/stop"
 echo

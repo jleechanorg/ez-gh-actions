@@ -18,8 +18,14 @@ unset BASH_ENV || true
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-WORK="$(mktemp -d)"
-cleanup() { rm -rf "$WORK"; }
+SCRATCH="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh ezgha-tests)"
+WORK="$(mktemp -d "$SCRATCH/trim-queued-progress.XXXXXX")"
+export WORK
+pid=""
+cleanup() {
+  if [ -n "$pid" ]; then teardown_tree "$pid" || true; fi
+  rm -rf "${WORK:?}"
+}
 trap cleanup EXIT
 LOG="$WORK/progress.log"
 STUB_BIN="$WORK/bin"; mkdir -p "$STUB_BIN"
@@ -54,7 +60,15 @@ chmod +x "$STUB_BIN/gh"
 # git blocks ~20s in ls-remote so the pass stays running while we poll.
 cat > "$STUB_BIN/git" <<'SH'
 #!/usr/bin/env bash
-case "$*" in *ls-remote*) sleep 20; printf 'bbb\trefs/heads/feature/x\n'; exit 0 ;; esac
+case "$*" in
+  *ls-remote*)
+    sleep 20 &
+    sleep_pid=$!
+    printf '%s\n' "$sleep_pid" > "$WORK/progress-sleep-pid"
+    wait "$sleep_pid"
+    printf 'bbb\trefs/heads/feature/x\n'
+    exit 0 ;;
+esac
 exit 0
 SH
 chmod +x "$STUB_BIN/git"
@@ -76,7 +90,6 @@ pid=$!
 # shellcheck source=tests/lib/descendants.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/descendants.sh"
 
-
 seen=0; alive=0
 for _ in $(seq 1 20); do
   if grep -q "\[acme/one\] scan:" "$LOG" 2>/dev/null; then
@@ -86,6 +99,23 @@ for _ in $(seq 1 20); do
   fi
   sleep 1
 done
+
+# Snapshot exact fixture descendants after the stub has started its blocking
+# sleep. The later checks include this named process and never scan host PIDs.
+for _ in $(seq 1 50); do
+  [ -s "$WORK/progress-sleep-pid" ] && break
+  sleep 0.1
+done
+[ -s "$WORK/progress-sleep-pid" ] \
+  || fail "fixture: blocking sleep 20 did not start after scan output"
+descendants_checked "$pid"
+printf '%s\n' "$DESCENDANTS_OUT" > "$WORK/descendant-pids"
+progress_sleep_pid="$(cat "$WORK/progress-sleep-pid" 2>/dev/null || true)"
+if printf '%s\n' "$DESCENDANTS_OUT" | grep -Fxq "$progress_sleep_pid"; then
+  pass "fixture: blocking sleep 20 is in the captured worker tree"
+else
+  fail "fixture: blocking sleep 20 pid=$progress_sleep_pid was not captured under worker pid=$pid (descendants=$DESCENDANTS_OUT)"
+fi
 
 # We terminate the worker deliberately, so `wait` returns non-zero; an unguarded
 # `wait` under `set -e` would abort BEFORE the assertions below.
@@ -100,12 +130,12 @@ teardown_tree "$pid" || teardown_rc=$?
 # Final accounting AFTER the leader is gone: nothing can respawn now.
 descendants_checked "$pid"
 survivors=0
-for k in $DESCENDANTS_OUT; do kill -0 "$k" 2>/dev/null && survivors=$((survivors+1)); done
-orphans="$(orphan_sleeps || true)"
+for k in $(cat "$WORK/descendant-pids"); do pid_is_running "$k" && survivors=$((survivors+1)); done
 [ "$survivors" -eq 0 ] && pass "cleanup: no descendants survived the pass" \
                        || fail "cleanup: $survivors descendant(s) still alive after teardown"
-[ -z "$orphans" ] && pass "cleanup: no reparented orphans left behind" \
-                  || fail "cleanup: orphaned process(es) reparented to init: $(printf '%s ' $orphans)"
+pid_is_running "$progress_sleep_pid" \
+  && fail "cleanup: fixture sleep 20 survived teardown (pid=$progress_sleep_pid)" \
+  || pass "cleanup: fixture sleep 20 stopped"
 
 [ "$seen" = 1 ]  && pass "behavioural: scan: emitted during the pass" \
                  || fail "behavioural: no progress output during the pass"
