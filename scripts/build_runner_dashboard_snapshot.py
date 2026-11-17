@@ -9,7 +9,12 @@ from pathlib import Path
 
 SOURCE_KEYS = ("config", "service", "docker", "process_probe", "disk", "watchdog_state")
 FLEET_KEYS = ("configured", "executing", "idle", "cycling", "down", "reserved")
-EXPECTED_CONFIGURED = {"mac": 6, "linux": 10}
+# Must match the real fleet shapes. Stale values here make a healthy fleet render as
+# STALE/UNKNOWN, which is exactly the failure the snapshot test documents as the
+# EXPECTED_CONFIGURED["linux"] drift regression (16 vs the real 10).
+# Current truth (2026-11-17): the Mac host config states "centralized to 4 Mac + 20
+# Linux per user direction", and jeff-ubuntu runs count = 20.
+EXPECTED_CONFIGURED = {"mac": 4, "linux": 20}
 
 
 def _load_object(path):

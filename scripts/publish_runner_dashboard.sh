@@ -3,7 +3,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DASHBOARD_DIR="${EZGHA_DASHBOARD_ASSET_DIR:-$SCRIPT_DIR/dashboard}"
+# Static assets live in the repository's dashboard/ directory (repo root), NOT next to
+# this script. Resolve via the repo root so the default works when invoked from the
+# installed layout (~/.local/libexec/ezgha/) as well as from a checkout. Every test set
+# EZGHA_DASHBOARD_ASSET_DIR explicitly, which is why this broken default shipped in
+# PR #81 and was never exercised -- the first real --collect-only run failed with
+# "scripts/dashboard/index.html: No such file or directory".
+REPO_ROOT_FOR_ASSETS="$(cd "$SCRIPT_DIR/.." && pwd)"
+DASHBOARD_DIR="${EZGHA_DASHBOARD_ASSET_DIR:-$REPO_ROOT_FOR_ASSETS/dashboard}"
 SNAPSHOT_BUILDER="$SCRIPT_DIR/build_runner_dashboard_snapshot.py"
 HOST_PROBE="$SCRIPT_DIR/runner_dashboard_host_probe.sh"
 PROBE_DIR="${EZGHA_DASHBOARD_PROBE_DIR:-}"
