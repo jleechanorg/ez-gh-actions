@@ -48,7 +48,7 @@
   function sourceContract(snapshot) {
     const keys = Object.keys(snapshot.sources || {}).sort();
     return (
-      snapshot.schema_version === 1 &&
+      (snapshot.schema_version === 1 || snapshot.schema_version === 2) &&
       keys.length === SOURCE_KEYS.length &&
       SOURCE_KEYS.every((key, index) => key === keys[index]) &&
       keys.every((key) => typeof snapshot.sources[key]?.ok === 'boolean')
@@ -280,6 +280,66 @@
         snapshot.fleets?.linux?.watchdog?.restart_after,
       )}`,
     );
+    renderQueue(snapshot.queue);
+  }
+
+  // The queue block exists so a human never has to guess whether a backlog number
+  // is real work or GitHub ghost runs. Ghosts are queued runs with zero jobs that
+  // GitHub refuses to transition -- they can never start. They are shown, greyed,
+  // and explicitly excluded from the number that reads as backlog.
+  function renderQueue(queue) {
+    const repos = document.getElementById('queue-repos');
+    if (repos) repos.replaceChildren();
+
+    const valid =
+      queue &&
+      queue.ok === true &&
+      isCount(queue.fresh) &&
+      isCount(queue.ghosts);
+
+    if (!valid) {
+      setText('queue-fresh', '—');
+      setText('queue-ghosts', '—');
+      setText('queue-oldest', '—');
+      setText(
+        'queue-summary',
+        'Queue breakdown unavailable this snapshot — treat waiting work as unknown, not zero.',
+      );
+      document.getElementById('queue-fresh')?.classList.add('is-unknown');
+      document.getElementById('queue-ghosts')?.classList.add('is-unknown');
+      return;
+    }
+
+    document.getElementById('queue-fresh')?.classList.remove('is-unknown');
+    document.getElementById('queue-ghosts')?.classList.remove('is-unknown');
+    setText('queue-fresh', String(queue.fresh));
+    setText('queue-ghosts', String(queue.ghosts));
+    setText(
+      'queue-oldest',
+      isCount(queue.oldest_fresh_wait_minutes)
+        ? `${queue.oldest_fresh_wait_minutes} min`
+        : '—',
+    );
+
+    const total = queue.fresh + queue.ghosts;
+    setText(
+      'queue-summary',
+      total === 0
+        ? 'Nothing queued: no waiting work and no ghosts.'
+        : `${queue.fresh} of ${total} queued runs are real waiting work; ` +
+          `${queue.ghosts} are ghosts GitHub will not release.`,
+    );
+
+    if (!repos) return;
+    for (const entry of queue.repos || []) {
+      if (!entry || typeof entry.repo !== 'string') continue;
+      const row = document.createElement('p');
+      row.className = 'queue-repo-row';
+      const fresh = isCount(entry.fresh) ? entry.fresh : '—';
+      const ghosts = isCount(entry.ghosts) ? entry.ghosts : '—';
+      row.textContent = `${entry.repo} — fresh ${fresh}, ghosts ${ghosts}`;
+      repos.appendChild(row);
+    }
   }
 
   async function loadStatus() {
@@ -300,6 +360,7 @@
     classifyFreshness,
     classifySnapshot,
     render,
+    renderQueue,
   };
   if (typeof document !== 'undefined') {
     window.addEventListener('DOMContentLoaded', () => {

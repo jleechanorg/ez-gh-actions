@@ -101,11 +101,63 @@ def _public_host(payload, expected_class):
     }, valid
 
 
-def build_snapshot(*, mac_payload, linux_payload, observed_at, published_at):
+def _public_queue(payload):
+    """Reduce a queue probe payload to the aggregate-only public shape.
+
+    The whole point of this section is to keep zero-job ghosts OUT of the number a
+    human reads as backlog. A ghost is a queued run that owns no jobs and that GitHub
+    refuses to transition (409 on cancel/force-cancel, 403 on delete), so it can never
+    start and can never be cleaned up from our side. Counting it as queue depth makes
+    the backlog look several times larger than the work actually waiting.
+
+    Only aggregate counts are emitted -- no run ids, branch names, or actor names --
+    because this snapshot is published to a public Pages site.
+    """
+    # The queue probe emits its fields at the top level; accept either that shape or
+    # a nested {"queue": {...}} so a caller wrapping the payload still works.
+    raw = payload.get("queue") if isinstance(payload.get("queue"), dict) else payload
+    if not isinstance(raw, dict):
+        return {"ok": False, "fresh": None, "ghosts": None,
+                "oldest_fresh_wait_minutes": None, "repos": []}
+
+    def num(key):
+        value = raw.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    repos = []
+    for entry in raw.get("repos") or []:
+        if not isinstance(entry, dict):
+            continue
+        repos.append({
+            "repo": entry.get("repo") if isinstance(entry.get("repo"), str) else None,
+            "fresh": num_in(entry, "fresh"),
+            "ghosts": num_in(entry, "ghosts"),
+        })
+    return {
+        "ok": raw.get("ok") is True,
+        "fresh": num("fresh"),
+        "ghosts": num("ghosts"),
+        "oldest_fresh_wait_minutes": num("oldest_fresh_wait_minutes"),
+        "repos": repos,
+    }
+
+
+def num_in(mapping, key):
+    value = mapping.get(key)
+    return value if type(value) is int and value >= 0 else None
+
+
+def build_snapshot(*, mac_payload, linux_payload, observed_at, published_at,
+                   queue_payload=None):
     mac, mac_ok = _public_host(mac_payload, "mac")
     linux, linux_ok = _public_host(linux_payload, "linux")
+    queue = _public_queue(queue_payload or {})
+    # NOTE: `sources` deliberately stays the two-host trust contract. The queue is a
+    # separate, publicly-visible signal with its own `ok`, so a queue probe failure
+    # degrades only the queue block and never invalidates host capacity. Folding it
+    # into `sources` would make a queue outage fail the entire snapshot.
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "observed_at": observed_at,
         "published_at": published_at,
         "sources": {
@@ -113,6 +165,7 @@ def build_snapshot(*, mac_payload, linux_payload, observed_at, published_at):
             "linux_host": {"ok": linux_ok},
         },
         "fleets": {"mac": mac, "linux": linux},
+        "queue": queue,
     }
 
 
@@ -122,6 +175,8 @@ def main():
     parser.add_argument("--linux-host", required=True)
     parser.add_argument("--observed-at", required=True)
     parser.add_argument("--published-at", required=True)
+    parser.add_argument("--queue", default=None,
+                        help="Optional queue probe payload; omit to publish queue as unavailable")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
 
@@ -130,6 +185,7 @@ def main():
         linux_payload=_load_object(args.linux_host),
         observed_at=args.observed_at,
         published_at=args.published_at,
+        queue_payload=_load_object(args.queue) if args.queue else None,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

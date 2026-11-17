@@ -210,9 +210,32 @@ build_site() {
   install -m 0644 "$DASHBOARD_DIR/dashboard.js" "$output_dir/dashboard.js"
   : > "$output_dir/.nojekyll"
   published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Queue probe is best-effort and additive. It splits queued runs into real waiting
+  # work vs zero-job ghosts GitHub refuses to transition. If it fails, the snapshot is
+  # still published with the queue marked unavailable -- a queue outage must never
+  # blank out the capacity view, and unknown is never rendered as zero.
+  # Opt-out via EZGHA_DASHBOARD_QUEUE_PROBE=0 (default on). The probe needs gh auth;
+  # where it is absent (tests, an unauthenticated host) the capacity view must still
+  # publish, so failure here is never fatal.
+  if [[ "${EZGHA_DASHBOARD_QUEUE_PROBE:-1}" != "0" ]]; then
+    # EZGHA_DASHBOARD_QUEUE_PROBE_CMD overrides the probe executable so tests can
+    # inject a fixture. Stubbing `gh` on PATH is not sufficient here: this host
+    # ships a gh wrapper at ~/.local/bin/gh that re-execs the real binary.
+    QUEUE_PROBE_CMD="${EZGHA_DASHBOARD_QUEUE_PROBE_CMD:-python3 "$SCRIPT_DIR/queue_probe.py"}"
+    if ! timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
+        $QUEUE_PROBE_CMD \
+        --repo jleechanorg/worldarchitect.ai \
+        --repo jleechanorg/worldai_frontend \
+        --output "$WORK_DIR/queue.json"; then
+      echo "queue probe failed; publishing capacity with queue unavailable" >&2
+    fi
+  fi
+  queue_args=()
+  [[ -s "$WORK_DIR/queue.json" ]] && queue_args=(--queue "$WORK_DIR/queue.json")
   python3 "$SNAPSHOT_BUILDER" \
     --mac-host "$WORK_DIR/mac.json" \
     --linux-host "$WORK_DIR/linux.json" \
+    "${queue_args[@]}" \
     --observed-at "$observed_at" \
     --published-at "$published_at" \
     --output "$output_dir/status.json"
