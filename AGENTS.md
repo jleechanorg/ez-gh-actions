@@ -99,6 +99,13 @@ Merge commits and `git commit --no-verify` bypass the gate.
    - Daemon has built-in failsafe since commit `c6defc7` that runs `docker rm -f` before each `docker run`
 4. If slot file is wedged: `rm ~/.config/ezgha/slot_assignments.toml` then `systemctl --user restart ezgha.service`
 
+### Queued ghost workflow runs
+The scheduled queue trimmer and reaper are the automatic callers. A ghost is a queued run that GitHub refuses to transition and whose `/jobs` endpoint confirms zero jobs; unknown or unreadable job state remains a cleaner failure. When the cleaner reports unacknowledged ghosts, do not loop cancellation, force-cancellation, deletion, or rerun attempts: GitHub rejects those transitions for this artifact class.
+
+Track the acknowledged cohort, start date, and restore condition in its owning Bead. Set `EZGHA_SUSPENSION_RECORD` only when that record exists; an unset value keeps the cleaner fail-closed. A cohort older than 14 days or larger than 200 distinct run IDs per repository escalates. The supported choices are a GitHub Support request or retaining the explicitly acknowledged cohort. Deleting its source branch does not remove the ghost runs; this was verified for bead jleechan-b4pg.
+
+Restore after every recorded ghost run ID is no longer queued; a repository-wide queue total of zero is not required. Close the Bead, remove the suspension record from both launchd templates, and reinstall both agents so the installed plists reflect the restored state.
+
 ### Service down
 ```bash
 systemctl --user restart ezgha.service
