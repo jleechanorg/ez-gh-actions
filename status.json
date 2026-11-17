@@ -8,8 +8,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 4,
-        "idle": 16,
+        "executing": 1,
+        "idle": 19,
         "reserved": 20
       },
       "sources": {
@@ -26,7 +26,7 @@
           "ok": true
         },
         "service": {
-          "ok": true
+          "ok": false
         },
         "watchdog_state": {
           "ok": false
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-17T22:31:41Z",
-  "published_at": "2026-11-17T22:31:44Z",
+  "observed_at": "2026-11-17T22:43:21Z",
+  "published_at": "2026-11-17T22:43:24Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
@@ -98,7 +98,7 @@
   "schema_version": 1,
   "sources": {
     "linux_host": {
-      "ok": true
+      "ok": false
     },
     "mac_host": {
       "ok": true
