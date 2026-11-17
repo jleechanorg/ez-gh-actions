@@ -47,7 +47,7 @@ cleanup() {
   [ -n "$FPID" ] && teardown_tree "$FPID" || true
   [ -n "$F2" ] && teardown_tree "$F2" || true
   stop_fixture_pids
-  for pid_file in "$W/owned-pids" "$W/owned-pids2"; do
+  for pid_file in "$W/spawned-pids" "$W/owned-pids" "$W/owned-pids2"; do
     if [ -f "$pid_file" ]; then
       while read -r pid; do
         [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
