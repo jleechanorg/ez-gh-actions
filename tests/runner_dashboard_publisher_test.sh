@@ -8,6 +8,32 @@ trap 'rm -rf "$WORK"' EXIT
 PROBES="$WORK/probes"
 mkdir -p "$PROBES"
 
+# The queue probe shells out to `gh`. Stub it so this test stays hermetic: it must
+# exercise the publisher's DEFAULT path (queue probe enabled) without reaching the
+# network. An empty queue payload is a valid probe result.
+# The queue probe needs gh, and this host ships a gh wrapper that re-execs the real
+# binary, so stubbing `gh` on PATH does not take effect. Inject a fixture probe
+# instead, which exercises the publisher's DEFAULT (probe-enabled) path hermetically.
+QUEUE_FIXTURE="$WORK/queue-fixture.py"
+cat > "$QUEUE_FIXTURE" <<'FIXTURE'
+#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+out = args[args.index("--output") + 1] if "--output" in args else None
+payload = {"schema_version": 1, "ok": True, "fresh": 0, "ghosts": 0,
+           "oldest_fresh_wait_minutes": None,
+           "repos": [{"repo": "jleechanorg/worldarchitect.ai", "ok": True,
+                      "fresh": 0, "ghosts": 0,
+                      "oldest_fresh_wait_minutes": None, "error": None}]}
+encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+if out:
+    open(out, "w").write(encoded)
+else:
+    sys.stdout.write(encoded)
+FIXTURE
+chmod +x "$QUEUE_FIXTURE"
+export EZGHA_DASHBOARD_QUEUE_PROBE_CMD="python3 $QUEUE_FIXTURE"
+
 write_probe() {
   local path="$1" host_class="$2" configured="$3" executing="$4"
   sed -n '1,$p' > "$path" <<EOF
@@ -16,8 +42,11 @@ echo '{"schema_version":1,"host_class":"$host_class","sources":{"config":{"ok":t
 EOF
   chmod +x "$path"
 }
-write_probe "$PROBES/mac.sh" mac 6 5
-write_probe "$PROBES/linux.sh" linux 10 9
+# Real fleet shapes (2026-11-17): 4 Mac, 20 Linux. The snapshot fails closed when a
+# host's configured count disagrees with EXPECTED_CONFIGURED, so these fixtures must
+# track the live fleet or a healthy probe renders as UNKNOWN.
+write_probe "$PROBES/mac.sh" mac 4 3   # 3 executing + 1 idle = 4
+write_probe "$PROBES/linux.sh" linux 20 19   # 19 executing + 1 idle = 20
 
 SITE="$WORK/site"
 EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
@@ -40,6 +69,9 @@ assert payload["sources"] == {
 serialized = json.dumps(payload)
 assert "must-not-publish" not in serialized
 assert "secret-host" not in serialized
+# The queue block is present in the default publish path and carries its own ok.
+assert payload["queue"]["ok"] is True, payload["queue"]
+assert payload["queue"]["fresh"] == 0 and payload["queue"]["ghosts"] == 0
 PY
 
 DEFAULT_HOME="$WORK/default-home"

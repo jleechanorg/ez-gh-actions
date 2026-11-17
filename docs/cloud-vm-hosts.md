@@ -96,12 +96,24 @@ Re-running the script **overwrites** `~/.config/ezgha/config.toml` from
 hand edit — added labels, a different reserve, changed limits — is lost. Put host-specific
 values in the example before running, or reapply them after.
 
-`RUNNER_COUNT` must not exceed the host's **memory** ceiling (disk is not checked by the
-script — see below). The script checks that before
-restarting the daemon and fails with the arithmetic instead of a restart loop. It also
-installs the 45-minute GitHub App token-refresh timer — without it the one-hour
-installation token expires, every `gh` call returns `Bad credentials (HTTP 401)`, and the
-fleet silently shrinks.
+`RUNNER_COUNT` is capped by **two** ceilings, and the script refuses a count that exceeds
+either one before it touches the daemon — so a mis-sized host fails with arithmetic
+instead of a restart loop:
+
+- **memory**: `(MemTotal - guest_reserve_mb) / runner_floor_mb`;
+- **disk**: `(volume_GB - ~7 base OS - ~4 runner image - min_free_disk_gb) / ~3 per runner`.
+
+The disk ceiling is not optional bookkeeping. A 32 GB / 8 GB host passes the memory check
+at 5 runners and then never settles: measured on three such cmux hosts on 2026-11-16, free
+space oscillated between 3 GB and 10 GB against a 10 GB floor, admission paused and
+resumed continuously, and one host idled at 3 of its 5 configured runners indefinitely.
+Lowering `min_free_disk_gb` only moves the collision; the durable answers are fewer
+runners or a bigger volume (`cmux vm resize <id> --disk <N>G`). Configuring more than the
+volume holds does not create capacity, it creates thrash.
+
+The script also installs the 45-minute GitHub App token-refresh timer — without it the
+one-hour installation token expires, every `gh` call returns `Bad credentials (HTTP 401)`,
+and the fleet silently shrinks.
 
 ## Capacity: how many runners fit
 
@@ -192,6 +204,137 @@ Recovering from a pause: **do not prune Docker images** — that deletes
 builder-cache and stopped-container/log cleanup, or grow the volume
 (`cmux vm resize <id> --disk <N>G`; disk is per-machine and is not part of the vCPU or
 memory pool; the CLI takes 4-256 GiB in 4 GiB steps and cannot shrink).
+
+Two ways to get this wrong, both observed on 2026-11-16:
+
+- `docker image prune -af` deletes `ezgha-runner:latest` even when only one image
+  exists and nothing is dangling, because an idle runner image is untagged from the
+  prune's point of view. It was deleted twice in one session and had to be rebuilt
+  (~12 min). `docker builder prune` is safe; `docker image prune` is not.
+- Lowering `limits.min_free_disk_gb` to stop admission pausing treats the symptom. The
+  churn comes from job workspaces accumulating in container overlays; see the next
+  section.
+
+### Do not enable `workspace_host_path` without PR #206's ownership fix
+
+`runner.workspace_host_path` does stop the overlay drift: each job's checkout and build
+scratch live in `{workspace_host_path}/{runner_name}` on the host instead of growing the
+container's writable layer. On a 32 GB / 4 vCPU / 5-runner VM the writable layers reached
+**7.1 GB across 5 containers** and free space swung **3-10 GB** per job churn.
+
+**But enabling it today breaks every job.** The daemon runs as the host user (uid 1000)
+and creates `{workspace_host_path}/{runner_name}` owned `1000:1000`, mode 755. The runner
+container runs as `uid=1001(runner)`, so it cannot create `/home/runner/_work/_temp` and
+every job fails in 3-4 seconds before step 1:
+
+```
+System.UnauthorizedAccessException: Access to the path '/home/runner/_work/_temp' is denied.
+```
+
+The registrations still read `online` and `idle`, so a fleet-health check that counts
+containers reports the pool as healthy while 100% of jobs fail. This happened on all five
+cmux VM hosts on 2026-11-16 and took out the deploy pipeline until the config was
+reverted.
+
+**The fix is [PR #206](https://github.com/jleechanorg/ez-gh-actions/pull/206)**, which
+sets the host workspace to mode `2770` (setgid) and passes the workspace's GID through
+`--group-add`, so the container's `runner` user is in the owning group without a
+recursive chown. Do not enable this config key by hand before that lands: a one-off
+`chown` does not survive, because `src/docker_backend.rs` deletes and recreates the
+directory on every container start.
+
+If you need to roll back: restore `~/.config/ezgha/config.toml` from the
+`config.toml.bak-*` backup, `systemctl --user restart ezgha.service`, and remove any
+running container that still carries the bind (`docker inspect` shows a
+`/home/cmux/.cache/ezgha-workspace/...` source) so it respawns unbound. Verify with
+`docker exec <c> touch /home/runner/_work/_temp/x` and confirm `/home/runner/_work` is
+owned by `runner:runner`.
+
+### Restarting the daemon: use the systemd unit
+
+Bootstrap installs ezgha as a **systemd user service** (`ezgha.service`, enabled, with
+linger). Restart it through systemd:
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+systemctl --user restart ezgha.service
+systemctl --user is-active ezgha.service
+```
+
+`XDG_RUNTIME_DIR` matters over SSH/`exec`: without it `systemctl --user` fails with
+`No medium found` rather than a useful error.
+
+**Never restart it with `kill` + `setsid nohup ezgha serve`.** systemd sees its unit die,
+leaves it `inactive (dead)`, and does not respawn it; the fleet then drains with no
+running daemon. Observed on 2026-11-16 across all five VM hosts, which went inactive and
+dropped to 0-1 containers each. The ad-hoc daemon also loses the log destination
+(`~/.local/state/ezgha/serve.out` does not exist on hosts where systemd always caught
+stdout), so the restart appears to succeed while producing no logs at all. Recovery:
+
+```bash
+systemctl --user reset-failed ezgha.service && systemctl --user start ezgha.service
+```
+
+Also note the daemon holds `~/.config/ezgha/serve.lock`; a killed daemon can leave a stale
+lock that makes the next start exit with `acquire serve.lock`. Remove it only when
+`ps -eo comm` shows no `ezgha` process.
+
+Finally, do not `pkill -f "ezgha.*serve"` from inside `cmux cloud exec`: the pattern
+matches the exec shell's own command line, so the shell kills itself (exit 143) before
+finishing. Match on `ps -eo pid,comm` and match the executable name instead.
+
+
+### DNS: one resolver and a 1-second timeout
+
+The cmux VM hosts ship `/etc/resolv.conf` with a **single** nameserver (the freestyle
+forwarding resolver, `10.32.0.28`) and `options timeout:1 attempts:2`. One dropped
+response is therefore an immediate `EAI_AGAIN` with no fallback, and a 1s timeout is tight
+for a cold lookup (measured 382 ms cold, 11 ms warm).
+
+Observed 2026-11-16: `actions/upload-artifact@v4` exhausted all five of its own retries in
+~37 s and failed a deploy job whose build had already succeeded:
+
+```
+Attempt 1 of 5 failed with error: getaddrinfo EAI_AGAIN
+results-receiver.actions.githubusercontent.com. Retrying request in 3000 ms...
+...
+##[error]Failed to CreateArtifact: Failed to make request after 5 attempts
+```
+
+It is transient — a re-run passed, and 100 concurrent lookups from a container resolved
+cleanly afterwards — which is exactly what makes it expensive: it looks like an
+intermittent action failure rather than a host network defect.
+
+Fix: add two fallback resolvers and relax the timeout. Public resolvers are reachable from
+these VMs (`8.8.8.8`, `1.1.1.1`, `9.9.9.9` all accept TCP/53), and they are only consulted
+when the local forwarder fails:
+
+```
+nameserver 10.32.0.28
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+options timeout:2 attempts:3
+```
+
+Docker copies the host `resolv.conf` at container **start**, so existing containers keep
+the old single-nameserver file until they respawn.
+
+**Editing the file is not enough.** The `freestyle-vms-agent` process (pid 1216 on these
+hosts) rewrites `/etc/resolv.conf` back to the single-nameserver form — measured at under
+10 seconds after the edit (`sed` in place, `mtime` advancing without any agent action).
+A plain `sed` therefore appears to work and then silently reverts. Pin it with
+
+```bash
+sudo sed -i "/^nameserver 10.32.0.28$/a nameserver 1.1.1.1\nnameserver 8.8.8.8" /etc/resolv.conf
+sudo sed -i "s/^options timeout:1 attempts:2$/options timeout:2 attempts:3/" /etc/resolv.conf
+sudo chattr +i /etc/resolv.conf      # immutable; verify with lsattr
+```
+
+and verify with `lsattr` that the `i` attribute is set. Two consequences of `+i` worth
+knowing before you use it: the agent can no longer manage that file (which is why the
+value now has to be maintained deliberately rather than by DHCP), and any operation that
+tries to rewrite it will fail while the flag is set. Remove the flag with
+`chattr -i` if the host's own networking needs to take the file back.
 
 ### `dockerd` caches NCPU
 

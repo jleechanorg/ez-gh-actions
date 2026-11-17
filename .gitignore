@@ -9,3 +9,6 @@ __pycache__/
 *.py[cod]
 # br doctor per-run artifacts
 .doctor/
+
+# Raw agent transcripts (PII: local user paths; publication risk) - keep out of git
+docs/adversarial-review/transcripts/**/*.jsonl

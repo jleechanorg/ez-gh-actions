@@ -15,9 +15,14 @@ Everything needed to audit — or re-run — the review is committed here:
 | [`workflows/2-er-audit.workflow.js`](workflows/2-er-audit.workflow.js) | Workflow script: /er audit — 4 auditors → refuters → judge (15 agents) |
 | [`workflows/3-er-reverdict.workflow.js`](workflows/3-er-reverdict.workflow.js) | Workflow script: post-fix re-verdict (3 agents) |
 | [`results/*.result.json`](results/) | Full structured result of each workflow (confirmed/refuted findings, verdicts, per-agent progress + token counts) |
-| [`transcripts/<workflow>/journal.jsonl`](transcripts/) | Per-workflow journal: one record per completed `agent()` call with its exact return value |
-| [`transcripts/<workflow>/agent-*.jsonl`](transcripts/) | **Full per-subagent conversation transcripts** — every prompt, tool call, tool result, and final structured output (50 subagents) |
-| [`transcripts/<workflow>/agent-*.meta.json`](transcripts/) | Per-subagent metadata (model, timing) |
+| `transcripts/<workflow>/agent-*.meta.json` | Per-subagent metadata (model, timing) |
+
+> **Raw transcripts removed (2026-11-16):** the per-subagent `agent-*.jsonl` conversation
+> transcripts and per-workflow `journal.jsonl` files were removed from the branch tip and
+> are gitignored going forward. They remain in git history; the structured findings in
+> [`results/`](results/) are unchanged. Sanitization status at removal: no API keys,
+> tokens, or credentials were ever present (verified by pattern scan of every history
+> blob); content was local machine paths and workflow chatter only.
 | [`REPRODUCE.md`](REPRODUCE.md) | How to re-run the same adversarial review on this repo |
 | [`checksums.sha256`](checksums.sha256) | Integrity manifest over every artifact in this directory |
 

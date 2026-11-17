@@ -3,6 +3,27 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Static assets live in the repository's dashboard/ directory (repo root), NOT next to
+# this script. Resolve via the repo root so the default works when invoked from the
+# installed layout (~/.local/libexec/ezgha/) as well as from a checkout. Every test set
+# EZGHA_DASHBOARD_ASSET_DIR explicitly, which is why this broken default shipped in
+# PR #81 and was never exercised -- the first real --collect-only run failed with
+# "scripts/dashboard/index.html: No such file or directory".
+# The assets live in two different relative places depending on layout:
+#   checkout:   <repo>/scripts/publish_runner_dashboard.sh + <repo>/dashboard/
+#   installed:  ~/.local/libexec/ezgha/publish_runner_dashboard.sh
+#               + ~/.local/libexec/ezgha/dashboard/  (installer copies assets alongside)
+# Try the sibling directory first (installed layout, and also a checkout if someone
+# builds assets there), then the repo root. Whichever actually contains index.html wins;
+# surface a clear error rather than installing from a missing path.
+if [[ -z "${EZGHA_DASHBOARD_ASSET_DIR:-}" ]]; then
+  for candidate in "$SCRIPT_DIR/dashboard" "$SCRIPT_DIR/../dashboard"; do
+    if [[ -f "$candidate/index.html" ]]; then
+      EZGHA_DASHBOARD_ASSET_DIR="$(cd "$candidate" && pwd)"
+      break
+    fi
+  done
+fi
 DASHBOARD_DIR="${EZGHA_DASHBOARD_ASSET_DIR:-$SCRIPT_DIR/dashboard}"
 SNAPSHOT_BUILDER="$SCRIPT_DIR/build_runner_dashboard_snapshot.py"
 HOST_PROBE="$SCRIPT_DIR/runner_dashboard_host_probe.sh"
@@ -210,9 +231,38 @@ build_site() {
   install -m 0644 "$DASHBOARD_DIR/dashboard.js" "$output_dir/dashboard.js"
   : > "$output_dir/.nojekyll"
   published_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Queue probe is best-effort and additive. It splits queued runs into real waiting
+  # work vs zero-job ghosts GitHub refuses to transition. If it fails, the snapshot is
+  # still published with the queue marked unavailable -- a queue outage must never
+  # blank out the capacity view, and unknown is never rendered as zero.
+  # Opt-out via EZGHA_DASHBOARD_QUEUE_PROBE=0 (default on). The probe needs gh auth;
+  # where it is absent (tests, an unauthenticated host) the capacity view must still
+  # publish, so failure here is never fatal.
+  if [[ "${EZGHA_DASHBOARD_QUEUE_PROBE:-1}" != "0" ]]; then
+    # EZGHA_DASHBOARD_QUEUE_PROBE_CMD overrides the probe executable so tests can
+    # inject a fixture. Stubbing `gh` on PATH is not sufficient here: this host
+    # ships a gh wrapper at ~/.local/bin/gh that re-execs the real binary.
+    # Array, not a word-split string: an override may contain spaces (a fixture path
+    # under a temp dir, for instance) and must not be split on them.
+    if [[ -n "${EZGHA_DASHBOARD_QUEUE_PROBE_CMD:-}" ]]; then
+      read -r -a QUEUE_PROBE_CMD <<< "$EZGHA_DASHBOARD_QUEUE_PROBE_CMD"
+    else
+      QUEUE_PROBE_CMD=(python3 "$SCRIPT_DIR/queue_probe.py")
+    fi
+    if ! timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
+        "${QUEUE_PROBE_CMD[@]}" \
+        --repo jleechanorg/worldarchitect.ai \
+        --repo jleechanorg/worldai_frontend \
+        --output "$WORK_DIR/queue.json"; then
+      echo "queue probe failed; publishing capacity with queue unavailable" >&2
+    fi
+  fi
+  queue_args=()
+  [[ -s "$WORK_DIR/queue.json" ]] && queue_args=(--queue "$WORK_DIR/queue.json")
   python3 "$SNAPSHOT_BUILDER" \
     --mac-host "$WORK_DIR/mac.json" \
     --linux-host "$WORK_DIR/linux.json" \
+    "${queue_args[@]}" \
     --observed-at "$observed_at" \
     --published-at "$published_at" \
     --output "$output_dir/status.json"

@@ -158,13 +158,45 @@
           </div>
         </dl>
       </section>
+      <section class="systems-panel queue-panel" aria-labelledby="queue-heading">
+        <header>
+          <p class="panel-code">WORK QUEUE</p>
+          <h2 id="queue-heading">Waiting work vs GitHub ghosts</h2>
+        </header>
+        <p id="queue-summary" class="queue-summary">
+          Queue breakdown unavailable this snapshot.
+        </p>
+        <div class="queue-grid">
+          <div class="queue-card queue-fresh">
+            <p class="queue-kicker">FRESH — ACTUALLY WAITING</p>
+            <p id="queue-fresh" class="queue-value">—</p>
+            <p class="queue-note">Queued runs that own at least one job.</p>
+          </div>
+          <div class="queue-card queue-ghost">
+            <p class="queue-kicker">GHOSTS — INERT</p>
+            <p id="queue-ghosts" class="queue-value">—</p>
+            <p class="queue-note">
+              Queued runs with zero jobs. GitHub refuses every transition, so
+              these can never start and cannot be cleaned up. Never counted as
+              backlog.
+            </p>
+          </div>
+          <div class="queue-card">
+            <p class="queue-kicker">OLDEST FRESH WAIT</p>
+            <p id="queue-oldest" class="queue-value">—</p>
+            <p class="queue-note">Age of the longest-waiting run that has real work.</p>
+          </div>
+        </div>
+        <div id="queue-repos" class="queue-repos"></div>
+      </section>
     </main>
 
     <footer>
       <p>
-        This dashboard reports local capacity only; it does not assert queue
-        health or job pickup latency. Snapshots refresh every ten minutes, and
-        unknown values are never treated as zero.
+        Local capacity comes from each host. The queue block separates runs that are
+        genuinely waiting from zero-job ghosts GitHub will not release; it does not
+        assert queue health or job pickup latency. Snapshots refresh every ten
+        minutes, and unknown values are never treated as zero.
       </p>
     </footer>
   </body>

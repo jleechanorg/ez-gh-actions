@@ -39,6 +39,37 @@ step() { printf '\n[%s] ==== %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 export XDG_RUNTIME_DIR="/run/user/$(id -u)"
 export PATH="$HOME/.cargo/bin:/usr/local/bin:$PATH"
 
+step "0. resolver fallback + timeout"
+# These VM images ship a SINGLE nameserver with `options timeout:1 attempts:2`, so one
+# dropped UDP response is an immediate EAI_AGAIN with no fallback. That surfaced as
+# actions/upload-artifact@v4 burning all five of its retries (~37s) and failing a deploy
+# job whose build had already succeeded:
+#   getaddrinfo EAI_AGAIN results-receiver.actions.githubusercontent.com
+# A 1s timeout is also tight for a cold lookup (measured 382ms cold, 11ms warm).
+#
+# Two fallbacks plus a relaxed timeout, applied only when the file still has the known
+# single-forwarder shape. Public resolvers are reachable on TCP/53 from these VMs and are
+# consulted only when the local forwarder fails.
+#
+# The pin matters: freestyle-vms-agent rewrites /etc/resolv.conf back within ~10s, so a
+# plain sed silently reverts. `chattr +i` is what makes the value stick. Consequence: the
+# agent can no longer manage this file, so treat the value as deliberately maintained and
+# use `chattr -i` if the host's networking must take the file back.
+RESOLV=/etc/resolv.conf
+if [ "$(grep -c '^nameserver' "$RESOLV" 2>/dev/null || echo 0)" -eq 1 ] \
+   && grep -q '^nameserver 10\.32\.0\.28$' "$RESOLV" 2>/dev/null; then
+  sudo -n cp "$RESOLV" "$RESOLV.bak-ezgha-bootstrap"
+  sudo -n sed -i "/^nameserver 10\.32\.0\.28$/a nameserver 1.1.1.1\nnameserver 8.8.8.8" "$RESOLV"
+  sudo -n sed -i 's/^options timeout:1 attempts:2$/options timeout:2 attempts:3/' "$RESOLV"
+  sudo -n chattr +i "$RESOLV" 2>/dev/null || true
+  echo "resolvers: $(grep -c '^nameserver' "$RESOLV") pinned=$(lsattr "$RESOLV" 2>/dev/null | grep -c '^----i')"
+  getent hosts results-receiver.actions.githubusercontent.com >/dev/null 2>&1 \
+    || echo "WARNING: results-receiver.actions.githubusercontent.com does not resolve"
+else
+  echo "resolv.conf is not the known single-forwarder shape; leaving it alone"
+  grep -E '^(nameserver|options)' "$RESOLV" 2>/dev/null || true
+fi
+
 step "1. systemd user manager + linger (needed for --user units over SSH/exec)"
 sudo -n loginctl enable-linger "$(id -un)"
 sudo -n systemctl start "user@$(id -u).service" 2>/dev/null || true
@@ -120,6 +151,32 @@ print(f"budget={budget}MB (mem {mem} - reserve {reserve}), floor={floor}MB, ceil
 if count > ceiling:
     sys.exit(f"count {count} exceeds the {ceiling}-runner ceiling: "
              f"{count} x {floor} = {count * floor} MB > {budget} MB budget")
+
+# Disk ceiling. The memory check above is necessary but NOT sufficient: a 32 GB host
+# with 8 GB of RAM passes the memory check at 5 runners and then flaps forever, because
+# each job's workspace grows the container's writable overlay by ~2-3 GB while the runner
+# image (~4 GB) and the base OS (~7 GB) are already resident. Measured 2026-11-16 on
+# three 32 GB / 8 GB cmux hosts configured for 5 runners: free space oscillated 3-10 GB
+# against a 10 GB floor, spawning and pausing admission continuously, and in one case
+# idling at 3 of the 5 configured runners indefinitely.
+#
+# The fix is NOT a lower floor (that only delays the collision) and not a bind-mounted
+# workspace alone (see the workspace_host_path warning: it needs PR #206's ownership
+# fix). It is running the number of runners the volume can actually hold.
+import os, shutil
+total_gb = shutil.disk_usage('/').total // (1024**3)
+free_gb = shutil.disk_usage('/').free // (1024**3)
+min_floor_gb = int(val('min_free_disk_gb', '10'))
+BASE_OS_GB, IMAGE_GB, PER_RUNNER_GB = 7, 4, 3
+disk_ceiling = (total_gb - BASE_OS_GB - IMAGE_GB - min_floor_gb) // PER_RUNNER_GB
+print(f"disk total={total_gb}G free={free_gb}G floor={min_floor_gb}G -> disk ceiling={disk_ceiling}")
+if count > disk_ceiling:
+    sys.exit(
+        f"count {count} exceeds the {disk_ceiling}-runner DISK ceiling on a {total_gb}G volume "
+        f"({total_gb}G - {BASE_OS_GB}G base OS - {IMAGE_GB}G runner image - {min_floor_gb}G floor "
+        f") / {PER_RUNNER_GB}G per runner. Lower RUNNER_COUNT to {disk_ceiling} or grow the volume "
+        f"with `cmux vm resize <id> --disk <N>G`. Configuring more than the volume holds makes "
+        f"admission pause and resume continuously instead of running the extra runners.")
 PYCHK
 
 step "7. GitHub App installation token (mint + 45-minute refresh timer)"
