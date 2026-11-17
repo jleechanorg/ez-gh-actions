@@ -213,6 +213,32 @@ def run_status(rid):
     out = gh_cmd(["api", f"repos/{repo}/actions/runs/{rid}", "--jq", ".status"]).decode().strip()
     return out
 
+def run_job_count(rid):
+    """Total jobs attached to a run. 0 means the run never queued any work."""
+    out = gh_cmd(["api", f"repos/{repo}/actions/runs/{rid}/jobs", "--jq", ".total_count"])
+    try:
+        return int(out.decode().strip())
+    except (TypeError, ValueError):
+        return None
+
+def is_ghost_run(rid):
+    """A ghost is a queued run that owns ZERO jobs.
+
+    GitHub will not transition these at all: cancel and force-cancel both return
+    409 "Cannot cancel a workflow run that has not been queued yet", and DELETE
+    returns 403 "Could not delete the workflow run". Retrying is pure API burn --
+    measured 2026-11-16: 105 such runs, every endpoint refusing, five days old.
+
+    Job count is the ONLY reliable discriminator. Two signals that look useful are
+    not: `created_at == updated_at` is also true for a run created and still queued
+    in the same second (verified on fresh legit runs), and `pull_requests == []`
+    fails because some ghosts do carry a PR association.
+
+    Returns True when jobs==0, else False. Unknown (None) is deliberately False so
+    a failed probe never suppresses a real cancellation.
+    """
+    return run_job_count(rid) == 0
+
 def cancel_run(rid):
     gh_cmd(["api", "-X", "POST", f"repos/{repo}/actions/runs/{rid}/cancel"])
 
@@ -337,13 +363,31 @@ print(f"candidates_identified: {len(candidates)}")
 
 cancelled = 0
 failed = 0
+ghost = 0
 skipped_non_queued = 0
+ghost_ids = []
 
 for r, reason in candidates:
     rid = r["id"]
     name = r.get("name") or f"id={rid}"
     b = r.get("head_branch")
     url = r.get("html_url") or f"https://github.com/{repo}/actions/runs/{rid}"
+
+    # Classify ghosts BEFORE any transition, in BOTH modes. These runs own zero jobs
+    # and refuse cancel/force-cancel (409) and delete (403); retrying them every pass is
+    # what drove this job to a permanent exit=1 while moving nothing. Counting them in
+    # dry-run too is the point: a queue total that mixes ghosts with real work is what
+    # made the backlog unreadable in the first place.
+    try:
+        if is_ghost_run(rid):
+            ghost += 1
+            if len(ghost_ids) < 200:
+                ghost_ids.append(rid)
+            print(f"ghost {rid} ({name}) on branch '{b}': zero jobs, GitHub will not transition it — skipping")
+            continue
+    except subprocess.CalledProcessError as e:
+        # A probe failure must not silently suppress a real cancel.
+        print(f"note: ghost probe failed for {rid}, treating as non-ghost: {(e.output or b'').decode()[:80]}")
 
     if dry:
         print(f"[dry-run] would cancel {rid} ({name}) on branch '{b}': {reason} — {url}")
@@ -369,11 +413,21 @@ for r, reason in candidates:
         except Exception as e:
             print(f"verify/force-cancel notice for {rid}: {e}")
     except subprocess.CalledProcessError as e:
+        err = (e.output or b"").decode()
+        if "has not been queued yet" in err:
+            # The 409 ghost signature. Reached when the zero-job probe could not run
+            # (e.g. jobs endpoint rate-limited) but the transition still refuses.
+            ghost += 1
+            ghost_ids.append(rid)
+            print(f"ghost {rid} ({name}): 409 not-queued — GitHub artifact, skipping")
+            continue
         failed += 1
-        print(f"FAIL cancel {rid}: {(e.output or b'').decode()[:120]}")
+        print(f"FAIL cancel {rid}: {err[:120]}")
     time.sleep(0.35)
 
-print(f"summary: candidates={len(candidates)} cancelled={cancelled} failed={failed} skipped_non_queued={skipped_non_queued} dry_run={dry}")
+print(f"summary: candidates={len(candidates)} cancelled={cancelled} failed={failed} ghost={ghost} skipped_non_queued={skipped_non_queued} dry_run={dry}")
+if ghost_ids:
+    print(f"ghost_ids: {' '.join(str(i) for i in ghost_ids)}")
 if failed:
     sys.exit(1)
 PY
