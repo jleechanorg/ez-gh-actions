@@ -173,17 +173,32 @@ run critdisk 100 18 HEALTH_ALERT_ALERTS_FILE="$AL_DISK"
 grep -q '"cause":"disk"' "$W/log-critdisk" || fail "daemon host_disk_floor escalation must route to cause=disk"
 pass "recent daemon host_disk_floor routes to cause=disk"
 
-# ── 12c. The emitted entry must be JSON-shaped, matching the alert policy filters ─
+# ── 12c. Emitted entries must be JSON-shaped, matching the policy filters ─────
 # Both [CRITICAL] ezgha policies match on jsonPayload.cause. `gcloud logging write`
 # defaults to --payload-type=text, which stores the same bytes in textPayload and
 # leaves jsonPayload null, so the filters never match and the alert cannot fire.
-# Every dispatch therefore has to declare --payload-type=json explicitly.
-state_dir payload; json_log OK 0 > "$W/state-payload/host-health-alert-testhost.json"
-run payload 25 18
-[ -s "$W/log-payload" ] || fail "a disk-floor breach must dispatch an entry"
-grep -q -- '--payload-type=json' "$W/log-payload" || fail "dispatch must pass --payload-type=json so the policy jsonPayload filters can match"
-grep -q -- '--payload-type=text' "$W/log-payload" && fail "dispatch must never request a text payload"
-pass "dispatch declares --payload-type=json, matching the policy filters"
+# Asserting the flag alone is not enough: emit() swallows write failures, so an
+# invalid JSON payload would be dropped silently. Check the bytes too, for both
+# causes, because the fleet and disk policies each read a different value.
+capture_payload() { # case -> $W/payload-<case>
+  printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_LOG"\nif [ "$1" = logging ] && [ "$2" = write ]; then printf %%s "$4" > "$STUB_PAYLOAD"; fi\n' > "$W/gcloud-capture"
+  chmod +x "$W/gcloud-capture"
+}
+assert_json_payload() { # case expected-cause free containers
+  local case="$1" cause="$2" free="$3" cnt="$4"
+  state_dir "$case"; json_log OK 0 > "$W/state-$case/host-health-alert-testhost.json"
+  capture_payload "$case"
+  run "$case" "$free" "$cnt" GCLOUD_BIN="$W/gcloud-capture" STUB_PAYLOAD="$W/payload-$case"
+  [ -s "$W/log-$case" ] || fail "$case: expected a Cloud Logging entry"
+  grep -q -- '--payload-type=json' "$W/log-$case" || fail "$case: must pass --payload-type=json so the jsonPayload filters can match"
+  grep -q -- '--payload-type=text' "$W/log-$case" && fail "$case: must never request a text payload"
+  [ -s "$W/payload-$case" ] || fail "$case: stub captured no payload argument"
+  jq -e . "$W/payload-$case" >/dev/null || fail "$case: payload must be valid JSON, or gcloud rejects it and emit() hides the loss"
+  jq -e --arg c "$cause" '.cause == $c' "$W/payload-$case" >/dev/null || fail "$case: payload must carry cause=$cause for that policy's filter"
+}
+assert_json_payload payloaddisk disk 25 18
+assert_json_payload payloadfleet fleet 100 0
+pass "disk and fleet entries declare --payload-type=json with valid JSON carrying the policy cause"
 
 # ── 13. A verdict is a successful probe: exit 0, so launchd/cron stays green ─
 state_dir ex; json_log OK 0 > "$W/state-ex/host-health-alert-testhost.json"
