@@ -1083,6 +1083,91 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("at most 3", proc.stderr)
 
+    def test_corrupt_schema_empty_objects_single_file_permission_and_shared_repo_basename(self):
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            list_hosts = tmp / "list_hosts.json"
+            list_hosts.write_text(json.dumps({"hosts": [1]}), encoding="utf-8")
+            empty_json = tmp / "empty.json"
+            empty_json.write_text("{}", encoding="utf-8")
+
+            # {"hosts": [1]} + {} in all 4 fixtures must never 500 or look complete.
+            srv_bad = mod.create_server(
+                port=0,
+                hosts_json=list_hosts,
+                cmux_json=empty_json,
+                github_json=empty_json,
+                latency_json=empty_json,
+            )
+            try:
+                import threading
+                import urllib.request
+                port = srv_bad.server_address[1]
+                t = threading.Thread(target=srv_bad.serve_forever, daemon=True)
+                t.start()
+                self.assertIn("AUDIT SNAPSHOT", urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode("utf-8"))
+                api = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5).read().decode("utf-8"))
+                self.assertTrue(api["reconciliation"]["hosts_partial"])
+                self.assertTrue(api["reconciliation"]["active_runs_partial"])
+                self.assertTrue(api["reconciliation"]["queue_partial"])
+                self.assertFalse(api["latency"]["ok"])
+                self.assertTrue(api["reconciliation"]["gh_errors"])
+                self.assertTrue(api["reconciliation"]["fixture_errors"])
+                self.assertIn("hosts fixture", api["reconciliation"]["scope_note"])
+            finally:
+                srv_bad.shutdown()
+                srv_bad.server_close()
+
+            # Single-file hosts PermissionError must flag hosts_partial + fixture_errors.
+            fixture_audit_dir(tmp)
+            orig_is_file = mod.Path.is_file
+
+            def deny_hosts_only(self_path):
+                if self_path.name == "ubuntu_mac_slots.json":
+                    raise PermissionError("denied hosts only")
+                return orig_is_file(self_path)
+
+            with mock.patch.object(mod.Path, "is_file", autospec=True, side_effect=deny_hosts_only):
+                single_state = mod.build_operator_state(audit_dir=tmp)
+            self.assertTrue(single_state["reconciliation"]["hosts_partial"])
+            self.assertTrue(single_state["reconciliation"]["fixture_errors"])
+            self.assertIn("hosts fixture", single_state["reconciliation"]["scope_note"])
+
+        # Same repo basename across two orgs (alpha/shared vs beta/shared) must NOT overwrite counts.
+        def fake_gh(args, timeout=20):
+            joined = " ".join(args)
+            if "/jobs" in joined:
+                return {"total_count": 1, "jobs": [{"id": 10, "status": "in_progress", "name": "job", "runner_name": "r1"}]}
+            if "alpha/shared" in joined and "status=in_progress" in joined:
+                return {"total_count": 2, "workflow_runs": [{"id": 1, "name": "CI"}, {"id": 2, "name": "CI"}]}
+            if "beta/shared" in joined and "status=in_progress" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 3, "name": "CI"}]}
+            raise AssertionError(args)
+
+        def fake_q(repo, *, max_job_checks=None):
+            cnt = 2 if repo == "alpha/shared" else 1
+            return {
+                "repo": repo, "ok": True, "fresh": cnt, "ghosts": 0,
+                "oldest_fresh_wait_minutes": 1, "in_progress_runs": cnt,
+                "queued_total": cnt, "sample_capped": False,
+                "sampled_fresh": cnt, "sampled_ghosts": 0, "partial": False,
+                "unverified_runs": 0, "error": None,
+            }
+
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
+             mock.patch.object(mod.queue_probe, "probe_repo", side_effect=fake_q):
+            snap = mod._collect_live_github_snapshot(repos=["alpha/shared", "beta/shared"])
+        rec = mod._normalize_reconciliation([], None, snap)
+        self.assertEqual(rec["active_workflow_runs"], 3)
+        self.assertEqual(rec["queued_runs_total"], 3)
+        self.assertEqual(rec["fresh_queued_runs"], 3)
+        self.assertEqual(rec["repos_covered"], "2/2")
+        self.assertFalse(rec["active_runs_partial"])
+        self.assertFalse(rec["queue_partial"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

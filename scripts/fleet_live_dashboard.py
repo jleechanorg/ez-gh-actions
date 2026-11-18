@@ -49,7 +49,7 @@ def _cap_live_repos(repos):
     )
 
 
-def _load_json_checked(path):
+def _load_json_checked(path, *, validator=None, invalid_reason="invalid fixture schema"):
     if not path:
         return None, None
     p = Path(path)
@@ -59,9 +59,39 @@ def _load_json_checked(path):
         data = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return None, f"expected JSON object in {p}"
+        if validator is not None and not validator(data):
+            return None, f"{invalid_reason} in {p}"
         return data, None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         return None, f"{type(exc).__name__} reading {p}"
+
+
+def _is_valid_hosts_payload(data):
+    return isinstance(data.get("hosts"), dict)
+
+
+def _is_valid_cmux_payload(data):
+    return (
+        isinstance(data.get("cmux_vms"), list)
+        or isinstance(data.get("vms"), list)
+        or data.get("ok") is False
+    )
+
+
+def _is_valid_gh_payload(data):
+    return isinstance(data.get("summary"), dict) or isinstance(data.get("all_in_progress_jobs"), list)
+
+
+def _is_valid_latency_payload(data):
+    return (
+        ("overall" in data and "workflows" in data)
+        or data.get("ok") is False
+        or any(
+            isinstance(v, dict)
+            and any(k in v for k in ("recent_contiguous_runs", "recent_runs", "job_level_audit"))
+            for v in data.values()
+        )
+    )
 
 
 def _load_json(path):
@@ -251,17 +281,20 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
     hosts = []
     seen_slot_names = set()
 
-    raw_hosts = (hosts_data or {}).get("hosts") or {}
+    raw_hosts = (hosts_data or {}).get("hosts")
+    if not isinstance(raw_hosts, dict):
+        raw_hosts = {}
     for host_key, ju in raw_hosts.items():
         if host_key == "mac" or not isinstance(ju, dict):
             continue
-        disk = ju.get("disk") or {}
-        mem = ju.get("memory") or {}
-        load = ju.get("load_average") or []
+        disk = ju.get("disk") if isinstance(ju.get("disk"), dict) else {}
+        mem = ju.get("memory") if isinstance(ju.get("memory"), dict) else {}
+        load = ju.get("load_average") if isinstance(ju.get("load_average"), list) else []
         paused = "PAUSED" in str(ju.get("admission_status") or "").upper()
         slots = [
             _enrich_slot(s, gh_by_runner, gh_by_run_job, host_disk_paused=paused)
             for s in (ju.get("slots") or [])
+            if isinstance(s, dict)
         ]
         for s in slots:
             seen_slot_names.add(s["name"])
@@ -283,7 +316,11 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
 
     if isinstance(cmux_data, dict):
         vms = cmux_data.get("cmux_vms") or cmux_data.get("vms") or []
+        if not isinstance(vms, list):
+            vms = []
         for vm in vms:
+            if not isinstance(vm, dict):
+                continue
             short = vm.get("short") or vm.get("slug") or vm.get("id")
             cfg = vm.get("ezgha_config") or vm.get("config") or {}
             disk = vm.get("disk") or {}
@@ -429,7 +466,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
     return hosts
 
 
-def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
+def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None):
     state_counts = {
         "EXECUTING": 0,
         "CYCLING": 0,
@@ -512,12 +549,14 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
         "active_workflow_runs": total_ip_runs,
         "active_github_jobs": total_ip_jobs,
         "active_runs_partial": ip_partial,
+        "hosts_partial": bool(hosts_partial),
         "repos_covered": repos_covered,
         "queue_partial": q_partial,
         "q_repos_covered": q_repos_covered,
         "q_unverified_runs": q_unverified_runs,
         "fresh_queued_scope": fresh_scope,
         "scope_note": scope_note,
+        "fixture_errors": list(fixture_errors or []),
         "queued_runs_total": total_q_runs,
         "queued_jobs_total": total_q_jobs,
         "fresh_queued_runs": fresh_q,
@@ -844,7 +883,7 @@ def _collect_live_github_snapshot(repos=None):
             ip = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=in_progress&per_page=50"], timeout=20)
             ip_runs = (ip or {}).get("workflow_runs") or []
             ip_count = (ip or {}).get("total_count") if isinstance((ip or {}).get("total_count"), int) else len(ip_runs)
-            ip_runs_by_repo[short] = ip_count
+            ip_runs_by_repo[repo] = ip_count
             if ip_count > len(ip_runs):
                 ip_capped = True
                 errors.append(f"{repo}: in-progress runs truncated ({len(ip_runs)} of {ip_count} returned)")
@@ -873,7 +912,7 @@ def _collect_live_github_snapshot(repos=None):
                             "runner_name": j.get("runner_name"),
                             "html_url": j.get("html_url"),
                         })
-            ip_jobs_by_repo[short] = job_cnt
+            ip_jobs_by_repo[repo] = job_cnt
         except Exception as exc:
             ip_failed_repos.add(repo)
             errors.append(f"{repo}: in_progress probe failed: {str(exc)[:120]}")
@@ -887,7 +926,7 @@ def _collect_live_github_snapshot(repos=None):
                     errors.append(f"{repo}: {q_probe['error']}")
             else:
                 if q_probe.get("queued_total") is not None:
-                    q_runs_by_repo[short] = q_probe["queued_total"]
+                    q_runs_by_repo[repo] = q_probe["queued_total"]
                 q_unverified_runs += q_probe.get("unverified_runs") or 0
                 if q_probe.get("unverified_runs"):
                     sample_notes.append(
@@ -1064,15 +1103,27 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
                          latency_json=None, repos=None, linux_host=None, cmux_cmd=None):
     base = Path(audit_dir) if audit_dir else None
     hosts_path = hosts_json or (base / "ubuntu_mac_slots.json" if base else None)
-    hosts_data, hosts_err = _load_json_checked(hosts_path)
+    hosts_data, hosts_err = _load_json_checked(
+        hosts_path, validator=_is_valid_hosts_payload, invalid_reason="hosts fixture missing hosts dict"
+    )
 
     cmux_err = None
     if cmux_json is not None:
-        cmux_data, cmux_err = _load_json_checked(cmux_json)
+        cmux_data, cmux_err = _load_json_checked(
+            cmux_json, validator=_is_valid_cmux_payload, invalid_reason="cmux fixture missing vms list"
+        )
     elif base is not None:
-        cmux_data, cmux_err = _load_json_checked(base / "cmux_and_github_reconciliation.json")
+        cmux_data, cmux_err = _load_json_checked(
+            base / "cmux_and_github_reconciliation.json",
+            validator=_is_valid_cmux_payload,
+            invalid_reason="cmux fixture missing vms list",
+        )
         if cmux_data is None:
-            alt_data, alt_err = _load_json_checked(base / "cmux_parsed.json")
+            alt_data, alt_err = _load_json_checked(
+                base / "cmux_parsed.json",
+                validator=_is_valid_cmux_payload,
+                invalid_reason="cmux fixture missing vms list",
+            )
             if alt_data is not None:
                 cmux_data, cmux_err = alt_data, None
             elif cmux_err and cmux_err.startswith("missing or non-file:") and alt_err and alt_err.startswith("missing or non-file:"):
@@ -1082,15 +1133,22 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         cmux_data = None
 
     gh_path = github_json or (base / "github_live_snapshot.json" if base else None)
-    gh_data, gh_err = _load_json_checked(gh_path)
+    gh_data, gh_err = _load_json_checked(
+        gh_path, validator=_is_valid_gh_payload, invalid_reason="github fixture missing summary dict"
+    )
     lat_path = latency_json or (base / "ci_latency_percentiles.json" if base else None)
-    latency_raw, lat_err = _load_json_checked(lat_path)
+    latency_raw, lat_err = _load_json_checked(
+        lat_path, validator=_is_valid_latency_payload, invalid_reason="latency fixture missing cohorts/workflows"
+    )
 
     fixture_errors = []
+    hosts_partial = False
     if (hosts_json is not None or base is not None) and hosts_data is None:
+        hosts_partial = True
         fixture_errors.append(f"hosts fixture missing or unreadable ({hosts_err or hosts_path})")
         hosts_data = {"hosts": {}}
     if (cmux_json is not None and cmux_data is None) or (base is not None and cmux_data is None and cmux_err is not None):
+        hosts_partial = True
         fixture_errors.append(f"cmux fixture missing or unreadable ({cmux_err or cmux_json})")
         cmux_data = {"ok": False, "error": f"cmux fixture missing or unreadable: {cmux_err or cmux_json}"}
     if (github_json is not None or base is not None) and gh_data is None:
@@ -1143,7 +1201,14 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         scope_note = f"{scope_note} | {fixture_note}" if scope_note else fixture_note
 
     hosts = _normalize_hosts(hosts_data, cmux_data, gh_data)
-    reconciliation = _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=scope_note)
+    reconciliation = _normalize_reconciliation(
+        hosts,
+        cmux_data,
+        gh_data,
+        scope_note=scope_note,
+        hosts_partial=hosts_partial,
+        fixture_errors=fixture_errors,
+    )
     latency = _normalize_latency(latency_raw)
     source_timestamps = {
         "hosts": (hosts_data or {}).get("generated_at_utc"),
