@@ -1168,6 +1168,51 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertFalse(rec["active_runs_partial"])
         self.assertFalse(rec["queue_partial"])
 
+    def test_malformed_nested_fixture_rows_return_200_and_report_partial(self):
+        mod = load_module()
+        cases = [
+            ("mac_container_slots", {"hosts": {"mac": {"container_slots": [1]}}}, {"vms": []}, {"summary": {}}, {"ok": True, "overall": {}, "cohorts": {}, "workflows": []}, "hosts_partial"),
+            ("mac_native_runners", {"hosts": {"mac": {"native_runners": [1]}}}, {"vms": []}, {"summary": {}}, {"ok": True, "overall": {}, "cohorts": {}, "workflows": []}, "hosts_partial"),
+            ("mac_disk_scalar", {"hosts": {"mac": {"disk": "x"}}}, {"vms": []}, {"summary": {}}, {"ok": True, "overall": {}, "cohorts": {}, "workflows": []}, "hosts_partial"),
+            ("cmux_vm_slots", {"hosts": {}}, {"vms": [{"id": "vm1", "slots": [1]}]}, {"summary": {}}, {"ok": True, "overall": {}, "cohorts": {}, "workflows": []}, "hosts_partial"),
+            ("special_runners", {"hosts": {}}, {"vms": [], "fleet_summary": {"special_runners": [1]}}, {"summary": {}}, {"ok": True, "overall": {}, "cohorts": {}, "workflows": []}, "hosts_partial"),
+            ("github_nested_bad_jobs", {"hosts": {}}, {"vms": []}, {"summary": {}, "all_in_progress_jobs": [1]}, {"ok": True, "overall": {}, "cohorts": {}, "workflows": []}, "gh_partial"),
+            ("latency_nested_bad_workflows", {"hosts": {}}, {"vms": []}, {"summary": {}}, {"overall": {}, "cohorts": {}, "workflows": [1]}, "lat_bad"),
+            ("latency_audit_bad_cohorts", {"hosts": {}}, {"vms": []}, {"summary": {}}, {"repo": {"recent_contiguous_runs": {"cohorts": "x"}}}, "lat_bad"),
+        ]
+        for label, hosts_payload, cmux_payload, gh_payload, lat_payload, expect_kind in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                (tmp_path / "ubuntu_mac_slots.json").write_text(json.dumps(hosts_payload), encoding="utf-8")
+                (tmp_path / "cmux_and_github_reconciliation.json").write_text(json.dumps(cmux_payload), encoding="utf-8")
+                (tmp_path / "github_live_snapshot.json").write_text(json.dumps(gh_payload), encoding="utf-8")
+                (tmp_path / "ci_latency_percentiles.json").write_text(json.dumps(lat_payload), encoding="utf-8")
+                srv = mod.create_server(port=0, audit_dir=tmp_path)
+                t = threading.Thread(target=srv.serve_forever, daemon=True)
+                t.start()
+                try:
+                    port = srv.server_address[1]
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp_html:
+                        self.assertEqual(resp_html.status, 200)
+                        body_html = resp_html.read().decode("utf-8")
+                    self.assertIn("Fixture error:", body_html)
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp_api:
+                        self.assertEqual(resp_api.status, 200)
+                        api_state = json.loads(resp_api.read().decode("utf-8"))
+                    self.assertTrue(api_state["reconciliation"]["fixture_errors"])
+                    self.assertIn("Fixture error:", api_state["reconciliation"]["scope_note"])
+                    if expect_kind == "hosts_partial":
+                        self.assertTrue(api_state["reconciliation"]["hosts_partial"])
+                    elif expect_kind == "gh_partial":
+                        self.assertTrue(api_state["reconciliation"]["active_runs_partial"])
+                        self.assertTrue(api_state["reconciliation"]["queue_partial"])
+                        self.assertTrue(api_state["reconciliation"]["gh_errors"])
+                    elif expect_kind == "lat_bad":
+                        self.assertFalse(api_state["latency"]["ok"])
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
