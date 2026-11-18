@@ -305,36 +305,54 @@ It is transient — a re-run passed, and 100 concurrent lookups from a container
 cleanly afterwards — which is exactly what makes it expensive: it looks like an
 intermittent action failure rather than a host network defect.
 
-Fix: add two fallback resolvers and relax the timeout. Public resolvers are reachable from
-these VMs (`8.8.8.8`, `1.1.1.1`, `9.9.9.9` all accept TCP/53), and they are only consulted
-when the local forwarder fails:
+Fix (durable, 2026-11-18 — issue #229): two layers, because a host-file edit alone is not
+durable and a container inherits `resolv.conf` only at start.
 
-```
-nameserver 10.32.0.28
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-options timeout:2 attempts:3
-```
+1. **Host** — `scripts/cloud/bootstrap-cloud-vm-host.sh` step 0 is now an idempotent
+   assert-healthy-then-repair. The resolver is healthy only when the file has at least
+   three nameservers including `1.1.1.1` and `8.8.8.8`, `options timeout:2 attempts:3`,
+   **and** the immutable bit; anything else is rewritten (the existing forwarder first,
+   public resolvers after it, any `search`/`domain` line preserved) and re-pinned. A
+   failed `chattr +i` is now a hard bootstrap failure. It used to be `|| true`, and the
+   repair only matched the pristine single-forwarder shape — so a host that had been
+   repaired once and then reverted to a different shape was reported as fine and never
+   re-fixed.
+2. **Container** — `[runner] dns` / `dns_opts` in `config.toml` are emitted on
+   `docker run` as `--dns <ip>` / `--dns-opt <opt>`. Unset = inherit the host file
+   exactly as before, so hosts that do not opt in are unchanged. The bootstrap writes
+   `dns = ["<host forwarder>", "1.1.1.1", "8.8.8.8"]` and
+   `dns_opts = ["timeout:2", "attempts:3"]`, pinning the container's resolver list
+   instead of depending on whatever the host file says at spawn time.
 
-Docker copies the host `resolv.conf` at container **start**, so existing containers keep
-the old single-nameserver file until they respawn.
+Docker copies the host `resolv.conf` at container **start**, so already-running
+containers keep the old single-nameserver file until they respawn — and until the daemon
+running on the host is a build that emits `--dns`.
 
-**Editing the file is not enough.** The `freestyle-vms-agent` process (pid 1216 on these
-hosts) rewrites `/etc/resolv.conf` back to the single-nameserver form — measured at under
-10 seconds after the edit (`sed` in place, `mtime` advancing without any agent action).
-A plain `sed` therefore appears to work and then silently reverts. Pin it with
+**Editing the file by hand is not enough.** The `freestyle-vms-agent` process (pid 1216
+on these hosts) rewrites `/etc/resolv.conf` back to the single-nameserver form — measured
+at under 10 seconds after the edit (`sed` in place, `mtime` advancing without any agent
+action). A plain `sed` therefore appears to work and then silently reverts; the immutable
+bit is what makes the value stick. Prefer re-running bootstrap step 0 over hand-editing:
+it verifies the pinned shape instead of assuming the `sed` matched. If you do repair by
+hand, follow it with `sudo chattr +i /etc/resolv.conf` and verify with `lsattr` that the
+`i` attribute is set — and do not swallow a failure of that `chattr`.
 
-```bash
-sudo sed -i "/^nameserver 10.32.0.28$/a nameserver 1.1.1.1\nnameserver 8.8.8.8" /etc/resolv.conf
-sudo sed -i "s/^options timeout:1 attempts:2$/options timeout:2 attempts:3/" /etc/resolv.conf
-sudo chattr +i /etc/resolv.conf      # immutable; verify with lsattr
-```
+Two consequences of `+i` worth knowing before you use it: the agent can no longer manage
+that file (which is why the value now has to be maintained deliberately rather than by
+DHCP), and any operation that tries to rewrite it will fail while the flag is set. Remove
+the flag with `chattr -i` if the host's own networking needs to take the file back.
 
-and verify with `lsattr` that the `i` attribute is set. Two consequences of `+i` worth
-knowing before you use it: the agent can no longer manage that file (which is why the
-value now has to be maintained deliberately rather than by DHCP), and any operation that
-tries to rewrite it will fail while the flag is set. Remove the flag with
-`chattr -i` if the host's own networking needs to take the file back.
+Evidence, 2026-11-17: four `worldarchitect.ai` jobs stalled for ~5 minutes and were
+cancelled — `ez-runner-c-9`, `ez-runner-c-20` (hung on `Download action repository
+'jleechanorg/worldai_frontend@…'`), `ez-runner-c-17` (hung in `git fetch --depth=1`) and
+`ez-runner-c-11` (fetch took 4 m 49 s, then completed). Those runners are the
+**jeff-ubuntu** fleet, not these VMs, and that host's containers get a single
+`nameserver 192.168.254.254` with no fallback (`docker inspect … HostConfig.Dns` = null).
+Current probes there are healthy (20-way concurrent lookups 113–264 ms; a
+`codeload.github.com` tarball in 12.3 s, HTTP 200), so the Nov-17 stalls are **not yet
+attributed** to this resolver defect: treat them as an open, separate signature until
+job-log timing or egress probes prove otherwise, and apply the same
+`dns`/`dns_opts` opt-in there if they do.
 
 ### `dockerd` caches NCPU
 
