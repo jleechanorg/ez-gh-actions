@@ -869,6 +869,22 @@ impl Config {
             anyhow::bail!("canary.poll_interval_seconds must be <= canary.poll_timeout_seconds");
         }
         require_non_empty_path("canary.history_path", &self.canary.history_path)?;
+        require_non_empty_path(
+            "runner.git_mirror_host_path",
+            &self.runner.git_mirror_host_path,
+        )?;
+        if let Some(path) = &self.runner.git_mirror_host_path {
+            let raw = path.to_string_lossy();
+            if raw.trim().is_empty() {
+                anyhow::bail!("runner.git_mirror_host_path must not be empty when configured");
+            }
+            if raw.as_ref() != raw.trim() || !path.is_absolute() {
+                anyhow::bail!(
+                    "runner.git_mirror_host_path must be an absolute path without leading '~' (got {:?})",
+                    path
+                );
+            }
+        }
         // A FUSE-backed runner workspace breaks every job before it starts; see
         // `validate_workspace_filesystem` for the 2026-10-28 incident.
         if let Some(workspace_host_path) = &self.runner.workspace_host_path {
@@ -2073,5 +2089,24 @@ slack_channel = "C0AJ3SD5C79"
             .expect_err("a blank workspace path must be rejected")
             .to_string();
         assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[test]
+    fn config_validate_enforces_absolute_git_mirror_host_path() {
+        for bad in ["", "   ", "~/.cache/ezgha/git-mirrors", "relative/mirrors"] {
+            let mut cfg = valid_config();
+            cfg.runner.git_mirror_host_path = Some(PathBuf::from(bad));
+            let err = cfg
+                .validate()
+                .expect_err(&format!("git_mirror_host_path={bad:?} must be rejected"))
+                .to_string();
+            assert!(err.contains("runner.git_mirror_host_path"), "{err}");
+        }
+
+        let mut ok_cfg = valid_config();
+        ok_cfg.runner.git_mirror_host_path = Some(PathBuf::from("/var/cache/ezgha/git-mirrors"));
+        ok_cfg
+            .validate()
+            .expect("absolute git_mirror_host_path must be accepted");
     }
 }

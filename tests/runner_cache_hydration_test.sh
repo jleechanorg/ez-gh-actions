@@ -225,11 +225,19 @@ FAILOPEN_OUT=$(docker run --rm \
     git init -b main /tmp/fo2 >/dev/null
     git -C /tmp/fo2 remote add origin "https://github.com/jleechanorg/unmatched.git"
     EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors git -C /tmp/fo2 fetch origin main >/dev/null 2>&1 && echo "FO_UNMATCHED_RC=0"
+    # Case 3: matching origin, but fetching an explicit non-origin remote passes straight through
+    git init -b main /tmp/fo3 >/dev/null
+    git -C /tmp/fo3 remote add origin "https://github.com/jleechanorg/testrepo.git"
+    git -C /tmp/fo3 remote add upstream "file:///upstream.git"
+    EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors git -C /tmp/fo3 fetch --depth 1 upstream main >/dev/null 2>&1 && echo "FO_NONORIGIN_RC=0"
+    [ -e /tmp/fo3/.git/ezgha-hydrated ] && echo "FO_NONORIGIN_HYDRATED=PRESENT" || echo "FO_NONORIGIN_HYDRATED=ABSENT"
   ' 2>&1)
 echo "${FAILOPEN_OUT}" | sed 's/^/    /'
 if printf '%s\n' "${FAILOPEN_OUT}" | grep -q "^FO_MISSING_RC=0$" \
-  && printf '%s\n' "${FAILOPEN_OUT}" | grep -q "^FO_UNMATCHED_RC=0$"; then
-  ok "(d) fail-open invariant verified for missing mirror dir and non-matching repo"
+  && printf '%s\n' "${FAILOPEN_OUT}" | grep -q "^FO_UNMATCHED_RC=0$" \
+  && printf '%s\n' "${FAILOPEN_OUT}" | grep -q "^FO_NONORIGIN_RC=0$" \
+  && printf '%s\n' "${FAILOPEN_OUT}" | grep -q "^FO_NONORIGIN_HYDRATED=ABSENT$"; then
+  ok "(d) fail-open invariant verified for missing mirror dir, non-matching repo, and non-origin remote"
 else
   bad "(d) fail-open invariant failed"
 fi
@@ -367,6 +375,49 @@ if printf '%s\n' "${TWOSTEP_OUT}" | grep -q "^STEP1_HYDRATED=PRESENT$" \
   ok "(h) two-step --depth=1 -> --unshallow advertised have <SEED_SHA>, transferred_objects=${TWOSTEP_TRANSFERRED} <= 15, clean refs and fsck"
 else
   bad "(h) two-step --depth=1 -> --unshallow failed (transferred_objects=${TWOSTEP_TRANSFERRED:-unknown})"
+fi
+
+# ── (10) Concurrent-borrower rollback guard ──
+echo "=== (10) Failed initial hydrating fetch preserves alternates when concurrent borrower active ==="
+BORROWER_OUT=$(docker run --rm \
+  -v "${UPSTREAM_GIT}:/upstream.git:ro" \
+  -v "${MIRROR_ROOT}:/opt/ezgha-git-mirrors:ro" \
+  -e EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors \
+  -e SEED_SHA="${SEED_SHA}" \
+  "${IMAGE}" bash -lc '
+    set -euo pipefail
+    ORIGIN_URL="https://github.com/jleechanorg/testrepo.git"
+    git config --global "url.file:///upstream.git.insteadOf" "${ORIGIN_URL}"
+    git init -b main /tmp/cb >/dev/null
+    git -C /tmp/cb remote add origin "${ORIGIN_URL}"
+    cat > /tmp/cb-upload-pack.sh <<EOF
+#!/usr/bin/env bash
+# Simulate a concurrent borrower attaching while this initial fetch is in flight.
+/usr/bin/git -C /tmp/cb update-ref refs/ezgha-seed/pid-concurrent-borrower "${SEED_SHA}" ""
+exit 1
+EOF
+    chmod +x /tmp/cb-upload-pack.sh
+    set +e
+    git -C /tmp/cb fetch --upload-pack /tmp/cb-upload-pack.sh origin refs/heads/nonexistent-branch >/dev/null 2>&1
+    rc=$?
+    set -e
+    echo "CB_FETCH_RC=${rc}"
+    [ -e /tmp/cb/.git/ezgha-hydrated ] && echo "CB_HYDRATED=PRESENT" || echo "CB_HYDRATED=ABSENT"
+    [ -f /tmp/cb/.git/objects/info/alternates ] && echo "CB_ALTERNATES=PRESENT" || echo "CB_ALTERNATES=ABSENT"
+    seed_refs="$(/usr/bin/git -C /tmp/cb for-each-ref --format="%(refname)" refs/ezgha-seed)"
+    echo "CB_SEED_REFS=${seed_refs}"
+    obj_type="$(/usr/bin/git -C /tmp/cb cat-file -t "${SEED_SHA}" 2>/dev/null || echo missing)"
+    echo "CB_SEED_OBJ_TYPE=${obj_type}"
+  ' 2>&1)
+echo "${BORROWER_OUT}" | sed 's/^/    /'
+if printf '%s\n' "${BORROWER_OUT}" | grep -Eq "^CB_FETCH_RC=[1-9][0-9]*$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_HYDRATED=PRESENT$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_ALTERNATES=PRESENT$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_SEED_REFS=refs/ezgha-seed/pid-concurrent-borrower$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_SEED_OBJ_TYPE=commit$"; then
+  ok "(10) failed initial fetch deleted only its own SEED_REF and preserved alternates/ezgha-hydrated for concurrent borrower"
+else
+  bad "(10) concurrent-borrower rollback guard failed"
 fi
 
 echo

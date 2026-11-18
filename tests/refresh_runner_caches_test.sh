@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Regression tests for scripts/refresh_runner_caches.sh,
-# scripts/verify_live_cache_savings.sh, and install.sh cache-warm wiring.
+# Regression tests for scripts/refresh_runner_caches.sh, sibling Python modules,
+# scripts/verify_live_cache_savings.sh, and cache-warm installer behavior.
 set -euo pipefail
+
+export BASH_ENV=/dev/null
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REFRESH_SCRIPT="${REPO_ROOT}/scripts/refresh_runner_caches.sh"
 VERIFY_SCRIPT="${REPO_ROOT}/scripts/verify_live_cache_savings.sh"
 INSTALL_SCRIPT="${REPO_ROOT}/install.sh"
 
-# Resolve Scratch space and verify git object creation works (handles fuse2fs fallback).
 SCRATCH_CANDIDATE="$("${HOME}/.claude/skills/scratch-space/scripts/scratch-dir.sh" cache-test 2>/dev/null || true)"
 WORK=""
 for base in "${SCRATCH_CANDIDATE}" "${TMPDIR:-/tmp}"; do
@@ -26,33 +27,30 @@ for base in "${SCRATCH_CANDIDATE}" "${TMPDIR:-/tmp}"; do
   fi
   rm -rf "${probe}"
 done
-
-if [ -z "${WORK}" ] || [ "${WORK}" = "/" ]; then
-  echo "FAIL: unable to allocate git-capable temp workspace" >&2
-  exit 1
-fi
+[ -n "${WORK}" ] && [ "${WORK}" != "/" ] || { echo "FAIL: unable to allocate git-capable temp workspace" >&2; exit 1; }
 
 # shellcheck disable=SC2329  # Invoked by EXIT trap.
-cleanup() {
-  if [ -n "${WORK}" ] && [ "${WORK}" != "/" ]; then
-    rm -rf "${WORK}"
-  fi
-}
+cleanup() { if [ -n "${WORK}" ] && [ "${WORK}" != "/" ]; then rm -rf "${WORK}"; fi; }
 trap cleanup EXIT
 
-fail() {
-  echo "FAIL: $*" >&2
-  exit 1
-}
-
-pass() {
-  echo "PASS: $*"
-}
+fail() { echo "FAIL: $*" >&2; exit 1; }
+pass() { echo "PASS: $*"; }
 
 [ -x "${REFRESH_SCRIPT}" ] || fail "missing executable ${REFRESH_SCRIPT}"
 [ -x "${VERIFY_SCRIPT}" ] || fail "missing executable ${VERIFY_SCRIPT}"
 
-# ── (a) Disk-floor refusal ───────────────────────────────────────────────────
+POISON_BIN="${WORK}/poison_bin"
+POISON_LOG="${WORK}/poison_docker.log"
+mkdir -p "${POISON_BIN}"
+cat > "${POISON_BIN}/docker" <<EOF
+#!/usr/bin/env bash
+printf 'POISON_DOCKER:%s\n' "\$*" >> "${POISON_LOG}"
+exit 99
+EOF
+chmod +x "${POISON_BIN}/docker"
+: > "${POISON_LOG}"
+
+# ── (a) Disk-floor refusal (100% hermetic with poison docker stub) ───────────
 HOME_A="${WORK}/home_a"
 MIRRORS_A="${WORK}/mirrors_a"
 WHEELHOUSE_A="${WORK}/wheelhouse_a"
@@ -61,31 +59,28 @@ mkdir -p "${HOME_A}" "${MIRRORS_A}" "${WHEELHOUSE_A}"
 CFG_A="${WORK}/cfg_a.toml"
 cat > "${CFG_A}" <<EOF
 version = 1
-
 [runner]
 image = "ezgha-runner:latest"
 git_mirror_host_path = "${MIRRORS_A}"
 wheelhouse_host_path = "${WHEELHOUSE_A}"
-
 [limits]
 min_free_disk_gb = 30
 EOF
 
 OUT_A="${WORK}/out_a.log"
-HOME="${HOME_A}" EZGHA_CACHE_TEST_FREE_GB=20 \
+PATH="${POISON_BIN}:/usr/local/bin:/usr/bin:/bin" \
+  HOME="${HOME_A}" \
+  EZGHA_CACHE_TEST_FREE_GB=20 \
   bash "${REFRESH_SCRIPT}" --config "${CFG_A}" > "${OUT_A}" 2>&1 \
-  || fail "disk-floor refusal exited non-zero"
+  || fail "disk-floor refusal exited non-zero: $(cat "${OUT_A}")"
 
-grep -qiE 'warn|skip|below|disk|free' "${OUT_A}" \
-  || fail "disk-floor refusal did not emit warning message: $(cat "${OUT_A}")"
-
+[ ! -s "${POISON_LOG}" ] || fail "disk-floor refusal touched docker daemon: $(cat "${POISON_LOG}")"
+grep -qiE 'warn|skip|below|disk|free' "${OUT_A}" || fail "disk-floor refusal did not emit warning: $(cat "${OUT_A}")"
 if [ -d "${MIRRORS_A}/generations" ] && [ -n "$(ls -A "${MIRRORS_A}/generations" 2>/dev/null || true)" ]; then
   fail "disk-floor refusal created mirror generations"
 fi
-if [ -n "$(find "${WHEELHOUSE_A}" -name '*.whl' 2>/dev/null || true)" ]; then
-  fail "disk-floor refusal created wheelhouse files"
-fi
-pass "(a) disk-floor refusal exited 0 with warning and created no artifacts"
+[ -z "$(find "${WHEELHOUSE_A}" -name '*.whl' 2>/dev/null || true)" ] || fail "disk-floor refusal created wheelhouse files"
+pass "(a) disk-floor refusal exited 0 hermetically (poison docker untouched) and created no artifacts"
 
 # ── (b) Git mirror generation publish & safe reaping ─────────────────────────
 HOME_B="${WORK}/home_b"
@@ -95,7 +90,6 @@ WORK_CLONE="${WORK}/work_clone"
 mkdir -p "${HOME_B}" "${UPSTREAM_ROOT}/jleechanorg" "${MIRRORS_B}"
 
 export HERMES_SKIP_EXAMPLE_COM_GUARD=1
-# Create bare upstream repo on `main`
 git init --bare -q "${UPSTREAM_ROOT}/jleechanorg/testrepo.git"
 git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" symbolic-ref HEAD refs/heads/main
 git clone -q "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${WORK_CLONE}/testrepo"
@@ -107,9 +101,8 @@ git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=jleechan2015@use
 git -C "${WORK_CLONE}/testrepo" push -q origin main
 SHA_1="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads/main)"
 
-# Create bare upstream repo with ONLY `master` (and broken HEAD -> refs/heads/main) to test fallback
 git init --bare -q "${UPSTREAM_ROOT}/jleechanorg/masteronly.git"
-git clone -q "${UPSTREAM_ROOT}/masteronly.git" "${WORK_CLONE}/masteronly" 2>/dev/null || git clone -q "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" "${WORK_CLONE}/masteronly"
+git clone -q "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" "${WORK_CLONE}/masteronly"
 git -C "${WORK_CLONE}/masteronly" config core.hooksPath /dev/null
 git -C "${WORK_CLONE}/masteronly" checkout -q -B master
 printf 'master only\n' > "${WORK_CLONE}/masteronly/README.md"
@@ -122,25 +115,19 @@ MASTER_SHA="$(git -C "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" rev-parse ref
 CFG_B="${WORK}/cfg_b.toml"
 cat > "${CFG_B}" <<EOF
 version = 1
-
 [runner]
 image = "ezgha-runner:latest"
 git_mirror_host_path = "${MIRRORS_B}"
-
 [limits]
 min_free_disk_gb = 30
 EOF
 
-# Populate a shallow ~/projects/testrepo donor + unshallow ~/testrepo donor in HOME_B
-# to prove find_local_donor skips shallow donors and resolves unshallow git-common-dir.
 mkdir -p "${HOME_B}/projects"
 git clone -q --depth=1 "file://${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${HOME_B}/projects/testrepo"
 git clone -q "file://${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${HOME_B}/testrepo"
 
 OUT_B1="${WORK}/out_b1.log"
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
+HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo jleechanorg/masteronly" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -153,126 +140,65 @@ python3 - "${MIRRORS_B}" "${SHA_1}" "${MASTER_SHA}" <<'PY'
 import os, re, stat, sys
 
 mirror_root, sha1, master_sha = sys.argv[1], sys.argv[2], sys.argv[3]
-
 for slug, expected_sha in [("jleechanorg__testrepo", sha1), ("jleechanorg__masteronly", master_sha)]:
     active_link = os.path.join(mirror_root, "active", slug)
-    assert os.path.islink(active_link), f"missing symlink: {active_link}"
-    target = os.readlink(active_link)
-    assert re.match(rf"^\.\./generations/{re.escape(slug)}\.[0-9]+$", target), (
-        f"unexpected relative symlink target for {slug}: {target}"
-    )
+    assert os.path.islink(active_link) and re.match(rf"^\.\./generations/{re.escape(slug)}\.[0-9]+$", os.readlink(active_link))
     gen_dir = os.path.realpath(active_link)
-    assert os.path.isdir(gen_dir), f"missing resolved generation dir: {gen_dir}"
-
-    seed_path = os.path.join(gen_dir, "SEED_SHA")
-    main_path = os.path.join(gen_dir, "MAIN_SHA")
-    assert os.path.isfile(seed_path), f"missing SEED_SHA: {seed_path}"
-    assert os.path.isfile(main_path), f"missing MAIN_SHA: {main_path}"
-    seed_val = open(seed_path).read().strip()
-    main_val = open(main_path).read().strip()
-    assert re.match(r"^[0-9a-f]{40}$", seed_val), f"invalid SEED_SHA: {seed_val}"
-    assert re.match(r"^[0-9a-f]{40}$", main_val), f"invalid MAIN_SHA: {main_val}"
-    assert seed_val == expected_sha, f"{slug} SEED_SHA mismatch: {seed_val} != {expected_sha}"
-    assert main_val == expected_sha, f"{slug} MAIN_SHA mismatch: {main_val} != {expected_sha}"
-
-    cg = os.path.join(gen_dir, "objects", "info", "commit-graph")
-    cgs = os.path.join(gen_dir, "objects", "info", "commit-graphs")
-    assert not os.path.exists(cg), f"commit-graph must not exist: {cg}"
-    assert not os.path.exists(cgs), f"commit-graphs must not exist: {cgs}"
-
-    for root, dirs, files in os.walk(gen_dir):
-        mode = stat.S_IMODE(os.stat(root).st_mode)
-        assert (mode & 0o005) == 0o005, f"dir not world r+x ({oct(mode)}): {root}"
+    assert os.path.isdir(gen_dir)
+    for marker in ("SEED_SHA", "MAIN_SHA"):
+        assert open(os.path.join(gen_dir, marker), encoding="utf-8").read().strip() == expected_sha
+    for cg in ("commit-graph", "commit-graphs"):
+        assert not os.path.exists(os.path.join(gen_dir, "objects", "info", cg))
+    for root, _dirs, files in os.walk(gen_dir):
+        assert (stat.S_IMODE(os.stat(root).st_mode) & 0o005) == 0o005, root
         for f in files:
-            fp = os.path.join(root, f)
             if f in ("SEED_SHA", "MAIN_SHA") or f.endswith((".pack", ".idx")):
-                fmode = stat.S_IMODE(os.stat(fp).st_mode)
-                assert (fmode & 0o004) == 0o004, f"file not world readable ({oct(fmode)}): {fp}"
+                assert (stat.S_IMODE(os.stat(os.path.join(root, f)).st_mode) & 0o004) == 0o004
 PY
 pass "(b1) mirror symlink, SEED_SHA/MAIN_SHA, master fallback, commit-graph removal, permissions"
 
-# P1 Active generation protection: backdate mtime to 10h ago, re-run with NO upstream change
+run_b() {
+  HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
+    EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
+    EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+    "$@" bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
+}
+
+# (b2) Active generation protection when mtime > retention
 GEN1="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
-python3 - "${GEN1}" <<'PY'
-import os, sys, time
-gen = sys.argv[1]
-old = time.time() - 36000
-os.utime(gen, (old, old))
-PY
-
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  EZGHA_MIRROR_RETENTION_MIN=240 \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-
-[ -d "${GEN1}" ] || fail "active generation was deleted despite no upstream change: ${GEN1}"
-GEN1_AFTER="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
-[ "${GEN1_AFTER}" = "${GEN1}" ] || fail "active symlink changed unexpectedly when upstream was unchanged"
+python3 -c 'import os,sys,time; old=time.time()-36000; os.utime(sys.argv[1], (old, old))' "${GEN1}"
+EZGHA_MIRROR_RETENTION_MIN=240 run_b
+[ -d "${GEN1}" ] || fail "active generation deleted despite no upstream change"
+[ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")" = "${GEN1}" ] \
+  || fail "active symlink changed unexpectedly"
 pass "(b2) active generation protected from reaping even when mtime > retention"
 
-# Advance upstream main by 1 commit, re-run:
-# Even though GEN1 was published 10h ago, its post-retirement retention window
-# starts NOW (at retirement), so GEN1 MUST remain on disk immediately after
-# retirement while GEN2 becomes active.
+# (b3) Upstream advance publishes GEN2 and preserves just-retired GEN1
 printf 'second commit\n' >> "${WORK_CLONE}/testrepo/README.md"
 git -C "${WORK_CLONE}/testrepo" add README.md
 git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=test@example.com commit -qm "second main"
 git -C "${WORK_CLONE}/testrepo" push -q origin main
 SHA_2="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads/main)"
-
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  EZGHA_MIRROR_RETENTION_MIN=240 \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-
+EZGHA_MIRROR_RETENTION_MIN=240 run_b
 GEN2="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
-[ "${GEN2}" != "${GEN1}" ] || fail "new generation did not replace active symlink after upstream advance"
-[ -d "${GEN2}" ] || fail "new active generation missing: ${GEN2}"
-[ -d "${GEN1}" ] || fail "just-retired generation was prematurely deleted despite 0m post-retirement age: ${GEN1}"
-[ -f "${GEN1}/RETIRED_AT" ] || fail "missing RETIRED_AT marker on retired generation: ${GEN1}"
-SEED_2="$(tr -d '[:space:]' < "${GEN2}/SEED_SHA")"
-[ "${SEED_2}" = "${SHA_2}" ] || fail "new SEED_SHA mismatch: ${SEED_2} != ${SHA_2}"
-pass "(b3) upstream advance published new generation and preserved just-retired generation for post-retirement window"
+[ "${GEN2}" != "${GEN1}" ] && [ -d "${GEN2}" ] && [ -d "${GEN1}" ] && [ -f "${GEN1}/RETIRED_AT" ] || fail "GEN1/GEN2 post-retirement check failed"
+[ "$(tr -d '[:space:]' < "${GEN2}/SEED_SHA")" = "${SHA_2}" ] || fail "new SEED_SHA mismatch"
+pass "(b3) upstream advance published new generation and preserved just-retired generation"
 
-# Backdate GEN1's RETIRED_AT beyond retention (5h > 240m) and re-run: GEN1 is now safely reaped
-python3 - "${GEN1}" <<'PY'
-import os, sys, time
-gen = sys.argv[1]
-expired = int(time.time()) - 18000
-with open(os.path.join(gen, "RETIRED_AT"), "w", encoding="utf-8") as fh:
-    fh.write(f"{expired}\n")
-os.utime(gen, (expired, expired))
-PY
-
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  EZGHA_MIRROR_RETENTION_MIN=240 \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-
-[ ! -e "${GEN1}" ] || fail "expired retired generation (>240m post-retirement) was NOT reaped: ${GEN1}"
-[ -d "${GEN2}" ] || fail "active generation GEN2 missing after reaping GEN1: ${GEN2}"
+# (b4) Backdate GEN1 RETIRED_AT beyond retention -> reaped
+python3 -c 'import os,sys,time; t=int(time.time())-18000; open(os.path.join(sys.argv[1],"RETIRED_AT"),"w").write(f"{t}\n"); os.utime(sys.argv[1],(t,t))' "${GEN1}"
+EZGHA_MIRROR_RETENTION_MIN=240 run_b
+[ ! -e "${GEN1}" ] && [ -d "${GEN2}" ] || fail "expired retired generation was NOT reaped cleanly"
 pass "(b4) retired generation reaped once RETIRED_AT exceeds retention window"
 
-# Per-repo error isolation: a broken first repo does not prevent refreshing a healthy second repo
+# (b5) Per-repo error isolation
 printf 'third commit\n' >> "${WORK_CLONE}/testrepo/README.md"
 git -C "${WORK_CLONE}/testrepo" add README.md
 git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=test@example.com commit -qm "third main"
 git -C "${WORK_CLONE}/testrepo" push -q origin main
 SHA_3="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads/main)"
-
 set +e
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
+HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/missing_broken_repo jleechanorg/testrepo" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -281,289 +207,226 @@ ISO_RC=$?
 set -e
 [ "${ISO_RC}" -ne 0 ] || fail "expected non-zero exit when one mirror repo fails"
 GEN3="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
-SEED_3="$(tr -d '[:space:]' < "${GEN3}/SEED_SHA")"
-[ "${SEED_3}" = "${SHA_3}" ] || fail "healthy second repo was blocked by broken first repo (${SEED_3} != ${SHA_3})"
+[ "$(tr -d '[:space:]' < "${GEN3}/SEED_SHA")" = "${SHA_3}" ] || fail "healthy second repo blocked by broken first repo"
 pass "(b5) per-repo error isolation refreshes healthy repos even when an earlier repo fails"
 
-# Dot-suffixed sibling repo protection (P1): refreshing jleechanorg/testrepo must never reap jleechanorg/testrepo.ai
+# (b6) Dot-suffixed sibling repo protection
 FAKE_SIBLING_GEN="${MIRRORS_B}/generations/jleechanorg__testrepo.ai.1000000000"
 mkdir -p "${FAKE_SIBLING_GEN}"
-python3 - "${FAKE_SIBLING_GEN}" <<'PY'
-import os, sys, time
-old = time.time() - 36000
-os.utime(sys.argv[1], (old, old))
-PY
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  EZGHA_MIRROR_RETENTION_MIN=240 \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ -d "${FAKE_SIBLING_GEN}" ] || fail "reap_old_generations deleted sibling dot-repo generation: ${FAKE_SIBLING_GEN}"
+ln -s "../generations/jleechanorg__testrepo.ai.1000000000" "${MIRRORS_B}/active/jleechanorg__testrepo.ai"
+printf '1000\n' > "${FAKE_SIBLING_GEN}/RETIRED_AT"
+EZGHA_MIRROR_RETENTION_MIN=240 run_b
+[ -d "${FAKE_SIBLING_GEN}" ] || fail "reap_old_generations deleted sibling dot-repo generation"
 pass "(b6) dot-suffixed sibling repo generation protected from prefix collision"
 
-# ── (b7) Default 480m retention preserves 5h-retired gen, reaps 9h-retired gen ──
+# (b7) Default 480m retention preserves 5h-retired gen, reaps 9h-retired gen
 GEN_B7="${MIRRORS_B}/generations/jleechanorg__testrepo.1000000001"
 mkdir -p "${GEN_B7}"
-python3 - "${GEN_B7}" <<'PY'
-import os, sys, time
-t = int(time.time()) - 18000  # 5h ago (>240m, <480m)
-with open(os.path.join(sys.argv[1], "RETIRED_AT"), "w", encoding="utf-8") as fh:
-    fh.write(f"{t}\n")
-PY
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ -d "${GEN_B7}" ] || fail "5h-retired generation was reaped under default 480m retention: ${GEN_B7}"
-
-python3 - "${GEN_B7}" <<'PY'
-import os, sys, time
-t = int(time.time()) - 32400  # 9h ago (>480m)
-with open(os.path.join(sys.argv[1], "RETIRED_AT"), "w", encoding="utf-8") as fh:
-    fh.write(f"{t}\n")
-PY
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ ! -e "${GEN_B7}" ] || fail "9h-retired generation was not reaped under default 480m retention: ${GEN_B7}"
+python3 -c 'import os,sys,time; open(os.path.join(sys.argv[1],"RETIRED_AT"),"w").write(f"{int(time.time())-18000}\n")' "${GEN_B7}"
+run_b
+[ -d "${GEN_B7}" ] || fail "5h-retired generation was reaped under default 480m retention"
+python3 -c 'import os,sys,time; open(os.path.join(sys.argv[1],"RETIRED_AT"),"w").write(f"{int(time.time())-32400}\n")' "${GEN_B7}"
+run_b
+[ ! -e "${GEN_B7}" ] || fail "9h-retired generation was not reaped under default 480m retention"
 pass "(b7) default 480m retention preserves 5h-retired and reaps 9h-retired generation"
 
-# ── (b8) Live container pinning + fail-closed error handling ─────────────────
+# (b8) Live container pinning + fail-closed error handling
 GEN_B8="${MIRRORS_B}/generations/jleechanorg__testrepo.1000000002"
 mkdir -p "${GEN_B8}"
 RETIRED_B8="$(python3 -c 'import time; print(int(time.time()) - 32400)')"
 printf '%s\n' "${RETIRED_B8}" > "${GEN_B8}/RETIRED_AT"
 
-OLD_CONTAINER_EPOCH=$((RETIRED_B8 - 3600))
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH="${OLD_CONTAINER_EPOCH}" \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH="$((RETIRED_B8 - 3600))" \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ -d "${GEN_B8}" ] || fail "retired generation was reaped while pre-retirement container is still running"
+[ -d "${GEN_B8}" ] || fail "retired generation reaped while pre-retirement container still running"
 
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=error \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=error \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ -d "${GEN_B8}" ] || fail "retired generation was reaped despite docker error (expected fail-closed)"
+[ -d "${GEN_B8}" ] || fail "retired generation reaped despite docker error"
 
-NEW_CONTAINER_EPOCH=$((RETIRED_B8 + 120))
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH="${NEW_CONTAINER_EPOCH}" \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH="$((RETIRED_B8 + 120))" \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ ! -e "${GEN_B8}" ] || fail "retired generation was not reaped after oldest container advanced past RETIRED_AT+60"
+[ ! -e "${GEN_B8}" ] || fail "retired generation not reaped after oldest container advanced past RETIRED_AT+60"
 pass "(b8) container pinning preserves pre-retirement gens, fails closed on error, reaps once past RETIRED_AT+60"
 
-# ── (b9) Unstamped retired generation gets RETIRED_AT stamped on first observation
+# (b9) Unstamped retired generation stamped on first observation
 GEN_B9="${MIRRORS_B}/generations/jleechanorg__testrepo.1000000003"
 mkdir -p "${GEN_B9}"
-python3 - "${GEN_B9}" <<'PY'
-import os, sys, time
-old = time.time() - 36000
-os.utime(sys.argv[1], (old, old))
-PY
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
-[ -d "${GEN_B9}" ] || fail "unstamped retired generation was deleted immediately instead of being stamped"
-[ -f "${GEN_B9}/RETIRED_AT" ] || fail "unstamped retired generation did not receive RETIRED_AT marker"
+python3 -c 'import os,sys,time; old=time.time()-36000; os.utime(sys.argv[1], (old, old))' "${GEN_B9}"
+run_b
+[ -d "${GEN_B9}" ] && [ -f "${GEN_B9}/RETIRED_AT" ] || fail "unstamped retired generation was not stamped"
 pass "(b9) unstamped retired generation stamped with RETIRED_AT on first observation"
 
-# ── (b10) GIT_DIR=/bogus/gitdir in caller env does not break git operations ──
+# (b10) GIT_DIR=/bogus/gitdir sanitized
 printf 'fourth commit\n' >> "${WORK_CLONE}/testrepo/README.md"
 git -C "${WORK_CLONE}/testrepo" add README.md
 git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=test@example.com commit -qm "fourth main"
 git -C "${WORK_CLONE}/testrepo" push -q origin main
 SHA_4="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads/main)"
-
-HOME="${HOME_B}" \
-  GIT_DIR=/bogus/gitdir \
-  GIT_WORK_TREE=/bogus/wt \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
+GIT_DIR=/bogus/gitdir GIT_WORK_TREE=/bogus/wt run_b
 GEN4="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
-SEED_4="$(tr -d '[:space:]' < "${GEN4}/SEED_SHA")"
-[ "${SEED_4}" = "${SHA_4}" ] || fail "caller GIT_DIR broke refresh: ${SEED_4} != ${SHA_4}"
+[ "$(tr -d '[:space:]' < "${GEN4}/SEED_SHA")" = "${SHA_4}" ] || fail "caller GIT_DIR broke refresh"
 pass "(b10) GIT_DIR=/bogus/gitdir in caller environment sanitized cleanly"
 
-# ── (b11) Default min_free_disk_gb=10 + buffer=5 & low-disk mode still reaps ──
+# (b11) Default min_free_disk_gb=10 + buffer=5 & low-disk mode reaps retired gens
 CFG_LOW="${WORK}/cfg_low.toml"
 MIRRORS_LOW="${WORK}/mirrors_low"
 mkdir -p "${MIRRORS_LOW}/generations" "${MIRRORS_LOW}/active"
-cat > "${CFG_LOW}" <<EOF
-version = 1
-
-[runner]
-image = "ezgha-runner:latest"
-git_mirror_host_path = "${MIRRORS_LOW}"
-EOF
-
+printf 'version = 1\n[runner]\nimage = "ezgha-runner:latest"\ngit_mirror_host_path = "%s"\n' "${MIRRORS_LOW}" > "${CFG_LOW}"
 STALE_LOW="${MIRRORS_LOW}/generations/jleechanorg__testrepo.1000"
 mkdir -p "${STALE_LOW}"
 printf '1000\n' > "${STALE_LOW}/RETIRED_AT"
 
 OUT_LOW="${WORK}/out_low.log"
-HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=14 \
-  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_LOW}" --skip-wheels > "${OUT_LOW}" 2>&1 \
-  || fail "low-disk mode exited non-zero"
-grep -q "below safety floor+5 (15 GiB)" "${OUT_LOW}" \
-  || fail "expected default floor+5 (15 GiB) warning, got: $(cat "${OUT_LOW}")"
-[ ! -e "${STALE_LOW}" ] || fail "low-disk mode failed to reap retired generation ${STALE_LOW}"
-[ ! -e "${MIRRORS_LOW}/active/jleechanorg__testrepo" ] || fail "low-disk mode should not clone/publish new active mirror"
+HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=14 EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_LOW}" --skip-wheels > "${OUT_LOW}" 2>&1 || fail "low-disk mode exited non-zero"
+grep -q "below safety floor+5 (15 GiB)" "${OUT_LOW}" || fail "expected floor+5 (15 GiB) warning: $(cat "${OUT_LOW}")"
+[ ! -e "${STALE_LOW}" ] && [ ! -e "${MIRRORS_LOW}/active/jleechanorg__testrepo" ] || fail "low-disk mirror reap check failed"
 pass "(b11) default floor=10 + buffer=5 enforces 15 GiB and low-disk mode reaps retired generations"
 
-# ── (b12) Missing docker CLI fails closed (0.0) and preserves expired retired gen ──
+# (b12) Missing docker CLI fails closed (0.0) and preserves expired retired gen
 GEN_B12="${MIRRORS_B}/generations/jleechanorg__testrepo.1000000004"
 mkdir -p "${GEN_B12}"
 printf '1000\n' > "${GEN_B12}/RETIRED_AT"
-
 MIN_BIN_B12="${WORK}/min_bin_b12"
 mkdir -p "${MIN_BIN_B12}"
-PYTHON3_REAL="$(command -v python3)"
-GIT_REAL="$(which -a git | grep -v '/\.local/bin/' | head -n1 || command -v git)"
-BASH_REAL="$(command -v bash)"
-ln -s "${PYTHON3_REAL}" "${MIN_BIN_B12}/python3"
-ln -s "${GIT_REAL}" "${MIN_BIN_B12}/git"
-
+ln -s "$(command -v python3)" "${MIN_BIN_B12}/python3"
+ln -s "$(which -a git | grep -v '/\.local/bin/' | head -n1 || command -v git)" "${MIN_BIN_B12}/git"
 OUT_B12="${WORK}/out_b12.log"
-env -u EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH \
-  PATH="${MIN_BIN_B12}" \
-  HOME="${HOME_B}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
-  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
-  "${BASH_REAL}" "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels > "${OUT_B12}" 2>&1 \
+env -u EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH BASH_ENV=/dev/null PATH="${MIN_BIN_B12}" HOME="${HOME_B}" \
+  EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+  "$(command -v bash)" "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels > "${OUT_B12}" 2>&1 \
   || fail "missing docker CLI fail-closed test exited non-zero: $(cat "${OUT_B12}")"
-[ -d "${GEN_B12}" ] || fail "expired retired generation was deleted when docker CLI was missing: ${GEN_B12}"
-grep -q "docker CLI not found; failing closed to preserve retired generations" "${OUT_B12}" \
-  || fail "expected missing docker CLI fail-closed warning, got: $(cat "${OUT_B12}")"
+[ -d "${GEN_B12}" ] || fail "expired retired generation deleted when docker CLI missing"
+grep -q "docker CLI not found; failing closed to preserve retired generations" "${OUT_B12}" || fail "missing docker CLI warning absent"
 pass "(b12) missing docker CLI fails closed (0.0) and preserves expired retired generation"
+
+# ── (b13) Wheelhouse pruning (normal + reap_only) + deconfigured-slug reaping ──
+DECFG_GEN="${MIRRORS_B}/generations/jleechanorg__deconfigured_repo.999"
+mkdir -p "${DECFG_GEN}"
+printf '1000\n' > "${DECFG_GEN}/RETIRED_AT"
+run_b
+[ ! -e "${DECFG_GEN}" ] || fail "normal mode failed to reap expired generation of deconfigured repo"
+
+WH_PRUNE_NORMAL="${WORK}/wh_prune_normal"
+WH_PRUNE_LOW="${WORK}/wh_prune_low"
+mkdir -p "${WH_PRUNE_NORMAL}" "${WH_PRUNE_LOW}"
+python3 - "${REPO_ROOT}/scripts" "${WH_PRUNE_NORMAL}" "${WH_PRUNE_LOW}" <<'PY'
+import os, sys
+
+scripts_dir, wh_normal, wh_low = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, scripts_dir)
+import ezgha_wheelhouse  # noqa: E402
+
+def seed_wheels(wh):
+    for fn in (
+        "alpha_pkg-1.2.0-py3-none-any.whl",
+        "alpha_pkg-1.9.0-py3-none-any.whl",
+        "alpha_pkg-1.10.0-py3-none-any.whl",
+        "alpha_pkg-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+    ):
+        open(os.path.join(wh, fn), "w", encoding="utf-8").write("whl")
+    os.symlink("alpha_pkg-1.2.0-py3-none-any.whl", os.path.join(wh, "alpha_pkg-1.2.0-999999ezgha-py3-none-any.whl"))
+    os.symlink("orphan-0.1.0-py3-none-any.whl", os.path.join(wh, "orphan-0.1.0-999999ezgha-py3-none-any.whl"))
+    os.symlink("wrong-target.whl", os.path.join(wh, "alpha_pkg-1.10.0-999999ezgha-py3-none-any.whl"))
+
+seed_wheels(wh_normal)
+assert ezgha_wheelhouse.prune_old_wheels(wh_normal, keep_versions=2) == 1
+assert not os.path.exists(os.path.join(wh_normal, "alpha_pkg-1.2.0-py3-none-any.whl"))
+assert not os.path.lexists(os.path.join(wh_normal, "alpha_pkg-1.2.0-999999ezgha-py3-none-any.whl"))
+assert not os.path.lexists(os.path.join(wh_normal, "orphan-0.1.0-999999ezgha-py3-none-any.whl"))
+assert os.path.isfile(os.path.join(wh_normal, "alpha_pkg-1.9.0-py3-none-any.whl"))
+assert os.path.isfile(os.path.join(wh_normal, "alpha_pkg-1.10.0-py3-none-any.whl"))
+assert os.path.isfile(os.path.join(wh_normal, "alpha_pkg-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl"))
+newest_alias = os.path.join(wh_normal, "alpha_pkg-1.10.0-999999ezgha-py3-none-any.whl")
+assert os.path.islink(newest_alias) and os.readlink(newest_alias) == "alpha_pkg-1.10.0-py3-none-any.whl"
+seed_wheels(wh_low)
+PY
+
+CFG_WH_LOW="${WORK}/cfg_wh_low.toml"
+printf 'version = 1\n[runner]\nimage = "ezgha-runner:latest"\nwheelhouse_host_path = "%s"\n[limits]\nmin_free_disk_gb = 10\n' "${WH_PRUNE_LOW}" > "${CFG_WH_LOW}"
+: > "${POISON_LOG}"
+PATH="${POISON_BIN}:/usr/local/bin:/usr/bin:/bin" HOME="${HOME_B}" EZGHA_CACHE_TEST_FREE_GB=14 \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_WH_LOW}" --skip-git >/dev/null 2>&1 \
+  || fail "low-disk wheelhouse reap_only exited non-zero"
+[ ! -s "${POISON_LOG}" ] || fail "low-disk wheelhouse reap_only invoked docker"
+[ ! -e "${WH_PRUNE_LOW}/alpha_pkg-1.2.0-py3-none-any.whl" ] || fail "low-disk reap_only did not prune 1.2.0"
+[ ! -L "${WH_PRUNE_LOW}/orphan-0.1.0-999999ezgha-py3-none-any.whl" ] || fail "low-disk reap_only left dangling symlink"
+[ "$(readlink "${WH_PRUNE_LOW}/alpha_pkg-1.10.0-999999ezgha-py3-none-any.whl")" = "alpha_pkg-1.10.0-py3-none-any.whl" ] \
+  || fail "low-disk reap_only did not refresh newest -999999ezgha- symlink"
+pass "(b13) prune_old_wheels (normal + reap_only low-disk) and deconfigured-slug reaping verified"
 
 # ── (d) Wheelhouse relative -r base.txt closure, manifest SHA, separate pip solve ──
 HOME_D="${WORK}/home_d"
 WH_D="${WORK}/wheelhouse_d"
 REQ_DIR="${WORK}/reqs_d"
 FAKE_BIN="${WORK}/fake_bin"
+FAKE_PYLIB="${WORK}/fake_pylib"
 DOCKER_LOG="${WORK}/fake_docker.log"
-mkdir -p "${HOME_D}" "${WH_D}" "${REQ_DIR}" "${FAKE_BIN}"
+mkdir -p "${HOME_D}" "${WH_D}" "${REQ_DIR}/sub" "${FAKE_BIN}" "${FAKE_PYLIB}/pip"
 
 printf 'requests==2.31.0\n' > "${REQ_DIR}/base.txt"
-mkdir -p "${REQ_DIR}/sub"
 printf -- '-r ../base.txt\npytest-mock==3.12.0\n' > "${REQ_DIR}/sub/requirements-test.txt"
+: > "${FAKE_PYLIB}/pip/__init__.py"
+cat > "${FAKE_PYLIB}/pip/__main__.py" <<'PY'
+import json, os, sys
+argv = sys.argv[1:]
+open(os.environ["FAKE_PIP_LOG"], "a", encoding="utf-8").write(json.dumps(argv) + "\n")
+dest = argv[argv.index("--dest") + 1]
+for i in range(12):
+    open(os.path.join(dest, f"pkg{i}-1.0.0-py3-none-any.whl"), "w", encoding="utf-8").write("whl")
+PY
 
 cat > "${FAKE_BIN}/docker" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 sub="${1:-}"
-if [ "${sub}" = "info" ]; then
-  exit 0
-elif [ "${sub}" = "image" ] && [ "${2:-}" = "inspect" ]; then
-  echo "sha256:fakeimageid"
-  exit 0
-elif [ "${sub}" = "run" ]; then
-  if echo "$*" | grep -q "PLAYWRIGHT_VERSION"; then
-    echo "1.65.2"
-    exit 0
-  fi
+if [ "${sub}" = "info" ]; then exit 0; fi
+if [ "${sub}" = "image" ] && [ "${2:-}" = "inspect" ]; then echo "sha256:fakeimageid"; exit 0; fi
+if [ "${sub}" = "run" ]; then
+  if echo "$*" | grep -q "PLAYWRIGHT_VERSION"; then echo "1.65.2"; exit 0; fi
   printf 'ARGS:%s\n' "$*" >> "${FAKE_DOCKER_LOG}"
   payload="$(cat)"
   printf 'PAYLOAD:%s\n' "${payload}" >> "${FAKE_DOCKER_LOG}"
-  if [ "${FAKE_DOCKER_FAIL:-0}" = "1" ]; then
-    exit 1
-  fi
-  # Verify no /req_mounts bind, staged_files layout under /tmp/ezgha-reqs, wheel staging, and live symlink preservation
-  python3 - "${payload}" "${FAKE_WH_HOST}" "${FAKE_EXPECT_SYMLINK:-0}" "$@" <<'PY'
-import io, json, os, subprocess, sys, tempfile
+  [ "${FAKE_DOCKER_FAIL:-0}" != "1" ] || exit 1
+  python3 - "${payload}" "${FAKE_WH_HOST}" "${FAKE_PYLIB}" "${FAKE_EXPECT_SYMLINK:-0}" "$@" <<'PY'
+import json, os, subprocess, sys, tempfile
 
-payload_raw = sys.argv[1]
+payload_raw, wh_host, fake_pylib, expect_sym = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+args = sys.argv[5:]
 payload = json.loads(payload_raw)
-wh_host = sys.argv[2]
-expect_symlink = sys.argv[3] == "1"
-args = sys.argv[4:]
-
-assert not any(":/req_mounts/" in a for a in args), f"unexpected /req_mounts bind in {args}"
-binds = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
-assert binds == [f"{wh_host}:/wheelhouse"], f"expected only /wheelhouse bind, got {binds}"
-
-if expect_symlink:
-    live_link = os.path.join(wh_host, "pkg0-1.0.0-999999ezgha-py3-none-any.whl")
-    assert os.path.islink(live_link), f"expected build-tag symlink to stay live during docker run: {live_link}"
-
+assert not any(":/req_mounts/" in a for a in args)
+assert [args[i + 1] for i, a in enumerate(args) if a == "-v"] == [f"{wh_host}:/wheelhouse"]
+if expect_sym:
+    assert os.path.islink(os.path.join(wh_host, "pkg0-1.0.0-999999ezgha-py3-none-any.whl"))
 staged = dict(payload["staged_files"])
-assert "0/base.txt" in staged and "requests==" in staged["0/base.txt"], staged
-assert "0/sub/requirements-test.txt" in staged and "-r ../base.txt" in staged["0/sub/requirements-test.txt"], staged
-assert payload["req_paths"] == ["/tmp/ezgha-reqs/0/sub/requirements-test.txt"], payload
+assert "0/base.txt" in staged and "0/sub/requirements-test.txt" in staged
+assert payload["req_paths"] == ["/tmp/ezgha-reqs/0/sub/requirements-test.txt"]
 
-container_script = args[-1]
-assert "stage_root = '/tmp/ezgha-reqs'" in container_script, container_script
-assert "wheel_stage = '/tmp/ezgha-wheel-stage'" in container_script, container_script
-
-pip_calls = []
-orig_run = subprocess.run
-orig_stdin = sys.stdin
-with tempfile.TemporaryDirectory() as stage_tmp, tempfile.TemporaryDirectory() as wheel_stage_tmp:
-    def fake_run(cmd, **kwargs):
-        pip_calls.append((list(cmd), bool(kwargs.get("check"))))
-        for i in range(12):
-            fn = f"pkg{i}-1.0.0-py3-none-any.whl"
-            with open(os.path.join(wheel_stage_tmp, fn), "w", encoding="utf-8") as fh:
-                fh.write("whl")
-        return subprocess.CompletedProcess(cmd, 0)
-
-    patched_script = (
-        container_script
-        .replace("stage_root = '/tmp/ezgha-reqs'", f"stage_root = {json.dumps(stage_tmp)}", 1)
-        .replace("wheel_stage = '/tmp/ezgha-wheel-stage'", f"wheel_stage = {json.dumps(wheel_stage_tmp)}", 1)
-        .replace("'/wheelhouse'", json.dumps(wh_host))
-    )
-    try:
-        sys.stdin = io.StringIO(payload_raw)
-        subprocess.run = fake_run
-        exec(compile(patched_script, "<container_script>", "exec"), {"__name__": "__main__"})
-    finally:
-        subprocess.run = orig_run
-        sys.stdin = orig_stdin
-
+with tempfile.TemporaryDirectory() as stage_tmp, tempfile.TemporaryDirectory() as wheel_stage_tmp, tempfile.TemporaryDirectory() as baked_tmp:
+    pip_log = os.path.join(stage_tmp, "pip_calls.jsonl")
+    env = os.environ.copy()
+    env.update({
+        "PYTHONPATH": fake_pylib + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
+        "FAKE_PIP_LOG": pip_log,
+        "EZGHA_WHEELHOUSE_MOUNT": wh_host,
+        "EZGHA_BAKED_WHEELS_DIR": baked_tmp,
+        "EZGHA_WHEEL_STAGE": wheel_stage_tmp,
+        "EZGHA_STAGE_ROOT": stage_tmp,
+    })
+    subprocess.run([sys.executable, "-c", args[-1]], input=payload_raw, text=True, env=env, check=True)
     staged_base = os.path.join(stage_tmp, "0", "base.txt")
     staged_req = os.path.join(stage_tmp, "0", "sub", "requirements-test.txt")
-    assert os.path.isfile(staged_base), f"missing staged base: {staged_base}"
-    assert os.path.isfile(staged_req), f"missing staged req: {staged_req}"
-    resolved_inc = os.path.realpath(os.path.join(os.path.dirname(staged_req), "../base.txt"))
-    assert resolved_inc == os.path.realpath(staged_base), (resolved_inc, staged_base)
-    if expect_symlink:
-        assert not os.path.exists(os.path.join(wheel_stage_tmp, "pkg0-1.0.0-999999ezgha-py3-none-any.whl")), (
-            "symlinks must not be copied into /tmp/ezgha-wheel-stage"
-        )
-
-expected_base = [sys.executable, "-m", "pip", "download", "--dest", wheel_stage_tmp, "--find-links", wheel_stage_tmp]
-assert len(pip_calls) == 2, f"expected 2 separate pip calls (core + reqs), got {pip_calls}"
-assert pip_calls[0][0] == expected_base + payload["core"] and pip_calls[0][1] is True, pip_calls[0]
-assert "-r" not in pip_calls[0][0], pip_calls[0]
-assert pip_calls[1][0] == expected_base + ["-r", "/tmp/ezgha-reqs/0/sub/requirements-test.txt"] and pip_calls[1][1] is True, pip_calls[1]
+    assert os.path.realpath(os.path.join(os.path.dirname(staged_req), "../base.txt")) == os.path.realpath(staged_base)
+    if expect_sym:
+        assert not os.path.exists(os.path.join(wheel_stage_tmp, "pkg0-1.0.0-999999ezgha-py3-none-any.whl"))
+    pip_calls = [json.loads(ln) for ln in open(pip_log, encoding="utf-8").read().splitlines() if ln.strip()]
+    expected_base = ["download", "--dest", wheel_stage_tmp, "--find-links", wheel_stage_tmp]
+    assert pip_calls == [expected_base + payload["core"], expected_base + ["-r", "/tmp/ezgha-reqs/0/sub/requirements-test.txt"]]
 PY
   exit 0
 fi
@@ -572,128 +435,125 @@ SH
 chmod +x "${FAKE_BIN}/docker"
 
 CFG_D="${WORK}/cfg_d.toml"
-cat > "${CFG_D}" <<EOF
-version = 1
+printf 'version = 1\n[runner]\nimage = "ezgha-runner:latest"\nwheelhouse_host_path = "%s"\n[limits]\nmin_free_disk_gb = 10\n' "${WH_D}" > "${CFG_D}"
 
-[runner]
-image = "ezgha-runner:latest"
-wheelhouse_host_path = "${WH_D}"
+run_d() {
+  PATH="${FAKE_BIN}:${PATH}" HOME="${HOME_D}" FAKE_DOCKER_LOG="${DOCKER_LOG}" FAKE_WH_HOST="${WH_D}" \
+    FAKE_PYLIB="${FAKE_PYLIB}" EZGHA_CACHE_TEST_FREE_GB=100 \
+    EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
+    "$@" bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
+}
 
-[limits]
-min_free_disk_gb = 10
-EOF
-
-PATH="${FAKE_BIN}:${PATH}" \
-  HOME="${HOME_D}" \
-  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
-  FAKE_WH_HOST="${WH_D}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" \
-  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
-
-[ -f "${WH_D}/.manifest.sha256" ] || fail "wheelhouse manifest missing"
-[ -L "${WH_D}/pkg0-1.0.0-999999ezgha-py3-none-any.whl" ] || fail "missing build-tag symlink after first wheelhouse refresh"
+EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" run_d
+[ -f "${WH_D}/.manifest.sha256" ] && [ -L "${WH_D}/pkg0-1.0.0-999999ezgha-py3-none-any.whl" ] || fail "initial wheelhouse check failed"
 SHA_WH1="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
-grep -q '"core":' "${DOCKER_LOG}" || fail "missing core payload in docker run"
-grep -q 'requirements-test.txt' "${DOCKER_LOG}" || fail "missing requirements-test.txt in payload"
 
-# Modify included base.txt and re-run -> manifest SHA must change, and existing symlinks stay live during docker run!
 printf 'requests==2.32.3\n' > "${REQ_DIR}/base.txt"
-PATH="${FAKE_BIN}:${PATH}" \
-  HOME="${HOME_D}" \
-  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
-  FAKE_WH_HOST="${WH_D}" \
-  FAKE_EXPECT_SYMLINK=1 \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" \
-  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
+FAKE_EXPECT_SYMLINK=1 EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" run_d
 SHA_WH2="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
-[ "${SHA_WH1}" != "${SHA_WH2}" ] || fail "manifest SHA did not change when included base.txt changed (${SHA_WH1})"
+[ "${SHA_WH1}" != "${SHA_WH2}" ] || fail "manifest SHA did not change when base.txt changed"
 
-# Same date bucket -> cache hit (no docker run)
 DOCKER_LINES_BEFORE="$(wc -l < "${DOCKER_LOG}")"
-PATH="${FAKE_BIN}:${PATH}" \
-  HOME="${HOME_D}" \
-  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
-  FAKE_WH_HOST="${WH_D}" \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" \
-  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
-DOCKER_LINES_AFTER="$(wc -l < "${DOCKER_LOG}")"
-[ "${DOCKER_LINES_BEFORE}" = "${DOCKER_LINES_AFTER}" ] || fail "expected wheelhouse cache hit for unchanged date bucket"
+EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" run_d
+[ "$(wc -l < "${DOCKER_LOG}")" = "${DOCKER_LINES_BEFORE}" ] || fail "expected wheelhouse cache hit"
 
-# Changed date bucket -> manifest SHA invalidates and refreshes; failed docker run still preserves symlinks via try..finally
 set +e
-PATH="${FAKE_BIN}:${PATH}" \
-  HOME="${HOME_D}" \
-  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
-  FAKE_WH_HOST="${WH_D}" \
-  FAKE_DOCKER_FAIL=1 \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" \
-  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git >/dev/null 2>&1
+FAKE_DOCKER_FAIL=1 EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" run_d >/dev/null 2>&1
 FAIL_RC=$?
 set -e
 [ "${FAIL_RC}" -ne 0 ] || fail "expected non-zero exit on simulated wheelhouse docker failure"
-[ -L "${WH_D}/pkg0-1.0.0-999999ezgha-py3-none-any.whl" ] || fail "build-tag symlink lost after failed wheelhouse docker run"
-SHA_WH_AFTER_FAIL="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
-[ "${SHA_WH_AFTER_FAIL}" = "${SHA_WH2}" ] || fail "manifest should not advance on failed wheelhouse run"
+[ -L "${WH_D}/pkg0-1.0.0-999999ezgha-py3-none-any.whl" ] || fail "build-tag symlink lost after failure"
+[ "$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")" = "${SHA_WH2}" ] || fail "manifest advanced on failed run"
 
-PATH="${FAKE_BIN}:${PATH}" \
-  HOME="${HOME_D}" \
-  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
-  FAKE_WH_HOST="${WH_D}" \
-  FAKE_EXPECT_SYMLINK=1 \
-  EZGHA_CACHE_TEST_FREE_GB=100 \
-  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" \
-  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
+FAKE_EXPECT_SYMLINK=1 EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" run_d
 SHA_WH3="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
-[ "${SHA_WH2}" != "${SHA_WH3}" ] || fail "manifest SHA did not change when UTC date bucket changed (${SHA_WH2})"
+[ "${SHA_WH2}" != "${SHA_WH3}" ] || fail "manifest SHA did not change when date bucket changed"
 
-# Verify collect_req_closure skips -r/-c includes whose commonpath with rf_real is "/"
-python3 - "${REFRESH_SCRIPT}" "${REQ_DIR}" <<'PY'
+python3 - "${REPO_ROOT}/scripts" "${REQ_DIR}" "${WORK}" <<'PY'
 import os, sys
 
-script_path, req_dir = sys.argv[1], sys.argv[2]
-text = open(script_path, "r", encoding="utf-8").read()
-py_src = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-ns = {"__name__": "refresh_runner_caches_test"}
-exec(compile(py_src, script_path, "exec"), ns)
+scripts_dir, req_dir, work_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, scripts_dir)
+import ezgha_git_mirrors  # noqa: E402
+import ezgha_wheelhouse  # noqa: E402
+import refresh_runner_caches  # noqa: E402
 
-rf_path = os.path.join(req_dir, "cross_root.txt")
-outside_file = "/etc/hosts"
+assert ezgha_git_mirrors.slugs_for(["o/r"]) == ["o__r"]
+rf_path, outside_file = os.path.join(req_dir, "cross_root.txt"), "/etc/hosts"
 if os.path.commonpath([os.path.dirname(os.path.realpath(rf_path)), os.path.dirname(os.path.realpath(outside_file))]) == "/" and os.path.isfile(outside_file):
-    with open(rf_path, "w", encoding="utf-8") as fh:
-        fh.write(f"-r {outside_file}\n-r base.txt\n")
-    entries, all_files = ns["collect_req_closure"]([rf_path])
-    assert len(entries) == 1, entries
-    rf_real, common_dir, closure = entries[0]
-    assert os.path.realpath(outside_file) not in closure and os.path.realpath(outside_file) not in all_files, (closure, all_files)
-    assert os.path.realpath(os.path.join(req_dir, "base.txt")) in closure, closure
-    assert common_dir != "/", common_dir
+    open(rf_path, "w", encoding="utf-8").write(f"-r {outside_file}\n-r base.txt\n")
+    entries, all_files = ezgha_wheelhouse.collect_req_closure([rf_path])
+    assert len(entries) == 1 and os.path.realpath(outside_file) not in all_files and entries[0][1] != "/"
+
+for idx, bad_path in enumerate(["", "   ", "~/.cache/ezgha", "relative/path"]):
+    for field in ("git_mirror_host_path", "wheelhouse_host_path"):
+        bad_cfg = os.path.join(work_dir, f"bad_{field}_{idx}.toml")
+        open(bad_cfg, "w", encoding="utf-8").write(f'version = 1\n[runner]\n{field} = "{bad_path}"\n')
+        try:
+            refresh_runner_caches.load_config(bad_cfg)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"load_config accepted invalid {field}={bad_path!r}")
 PY
+pass "(d) relative -r base.txt closure, atomic manifest SHA, direct module imports, and path validation parity verified"
 
-pass "(d) relative -r base.txt closure, manifest SHA invalidation, stdin-staged /tmp/ezgha-reqs, and separate core/req pip runs verified"
+# ── (e) Hermetic stubbed test of scripts/verify_live_cache_savings.sh ─────────
+VERIFY_WORK="${WORK}/verify_e"
+VERIFY_BIN="${VERIFY_WORK}/bin"
+VERIFY_WH="${VERIFY_WORK}/wh"
+VERIFY_GM="${VERIFY_WORK}/gm"
+mkdir -p "${VERIFY_BIN}" "${VERIFY_WH}" "${VERIFY_GM}/active/jleechanorg__testrepo"
+for i in $(seq 1 10); do printf 'whl' > "${VERIFY_WH}/pkg${i}-1.0.0-py3-none-any.whl"; done
+printf '0123456789abcdef0123456789abcdef01234567\n' > "${VERIFY_GM}/active/jleechanorg__testrepo/SEED_SHA"
 
-# ── (c) Syntax & install.sh wiring ───────────────────────────────────────────
+cat > "${VERIFY_BIN}/gh" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = "auth" ] && [ "${2:-}" = "token" ] && { echo "ghs_stubtoken"; exit 0; }
+exit 1
+SH
+cat > "${VERIFY_BIN}/docker" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = "info" ]; then echo "27.0.0"; exit 0; fi
+if [ "${1:-}" = "run" ]; then
+  printf 'RX_BEFORE=1000\nRX_AFTER=%s\n' "$((1000 + ${STUB_RX_DELTA:-4096}))"
+  exit 0
+fi
+exit 1
+SH
+chmod +x "${VERIFY_BIN}/gh" "${VERIFY_BIN}/docker"
+
+CFG_E_OK="${VERIFY_WORK}/cfg_ok.toml"
+printf 'version = 1\n[runner]\nimage = "ezgha-runner:latest"\nwheelhouse_host_path = "%s"\ngit_mirror_host_path = "%s"\n' "${VERIFY_WH}" "${VERIFY_GM}" > "${CFG_E_OK}"
+
+OUT_E_PASS="${VERIFY_WORK}/pass.log"
+PATH="${VERIFY_BIN}:/usr/local/bin:/usr/bin:/bin" STUB_RX_DELTA=4096 \
+  bash "${VERIFY_SCRIPT}" --host local --config "${CFG_E_OK}" --repo jleechanorg/testrepo > "${OUT_E_PASS}" 2>&1 \
+  || fail "verify_live_cache_savings.sh failed on <25 MiB delta: $(cat "${OUT_E_PASS}")"
+grep -q '^LIVE_CACHE_RX_BYTES=4096$' "${OUT_E_PASS}" || fail "missing LIVE_CACHE_RX_BYTES=4096"
+
+if PATH="${VERIFY_BIN}:/usr/local/bin:/usr/bin:/bin" STUB_RX_DELTA=30000000 \
+   bash "${VERIFY_SCRIPT}" --host local --config "${CFG_E_OK}" --repo jleechanorg/testrepo >/dev/null 2>&1; then
+  fail "verify_live_cache_savings.sh unexpectedly succeeded on >=25 MiB delta"
+fi
+
+CFG_E_TILDE="${VERIFY_WORK}/cfg_tilde.toml"
+printf 'version = 1\n[runner]\nimage = "ezgha-runner:latest"\nwheelhouse_host_path = "~/.cache/ezgha-wheelhouse"\ngit_mirror_host_path = "/var/cache/ezgha-git-mirrors"\n' > "${CFG_E_TILDE}"
+OUT_E_TILDE="${VERIFY_WORK}/tilde.log"
+if PATH="${VERIFY_BIN}:/usr/local/bin:/usr/bin:/bin" \
+   bash "${VERIFY_SCRIPT}" --host local --config "${CFG_E_TILDE}" --repo jleechanorg/testrepo > "${OUT_E_TILDE}" 2>&1; then
+  fail "verify_live_cache_savings.sh accepted tilde wheelhouse_host_path"
+fi
+grep -q "must be an absolute path without leading '~'" "${OUT_E_TILDE}" || fail "unexpected tilde error: $(cat "${OUT_E_TILDE}")"
+pass "(e) verify_live_cache_savings.sh hermetic <25 MiB PASS, >=25 MiB FAIL, and tilde path rejection verified"
+
+# ── (c) Syntax & behavioral cache-warm installer execution ───────────────────
 bash -n "${INSTALL_SCRIPT}"
 bash -n "${REFRESH_SCRIPT}"
 bash -n "${VERIFY_SCRIPT}"
-
-grep -E '^  AUX_NAMES=.*cache-warm' "${INSTALL_SCRIPT}" \
-  || fail "install.sh AUX_NAMES missing cache-warm"
-grep -q 'install_macos_plist "cache-warm"' "${INSTALL_SCRIPT}" \
-  || fail "install.sh missing install_macos_plist \"cache-warm\""
-grep -E 'for timer in .*ezgha-cache-warm\.timer' "${INSTALL_SCRIPT}" \
-  || fail "install.sh Linux timer enable loop missing ezgha-cache-warm.timer"
-
 [ -f "${REPO_ROOT}/systemd/ezgha-cache-warm.service" ] || fail "missing systemd/ezgha-cache-warm.service"
 [ -f "${REPO_ROOT}/systemd/ezgha-cache-warm.timer" ] || fail "missing systemd/ezgha-cache-warm.timer"
-pass "(c) syntax checks and install.sh wiring verified"
+bash "${REPO_ROOT}/tests/install_cache_warm_agent_test.sh" >/dev/null
+pass "(c) syntax checks and behavioral install_cache_warm_agent_test.sh verified"
 
 echo "ALL CACHE TESTS PASS"

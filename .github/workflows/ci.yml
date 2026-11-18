@@ -57,6 +57,7 @@ jobs:
           bash tests/ezgha_host_health_alert_classification_test.sh
           bash tests/ezgha_host_health_parked_optout_test.sh
           bash tests/install_colima_trim_agent_test.sh
+          bash tests/install_cache_warm_agent_test.sh
           bash tests/cleanup_ios_release_scratch_test.sh
           bash tests/testflight_workflow_alert_test.sh
           bash tests/testflight_workflow_alert_install_test.sh
@@ -149,3 +150,34 @@ jobs:
         run: DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:ci-hydration .
       - name: Run runner cache hydration integration test
         run: EZGHA_TEST_IMAGE=ezgha-runner:ci-hydration bash tests/runner_cache_hydration_test.sh
+      - name: Verify live cache RX byte budget end-to-end
+        run: |
+          set -euo pipefail
+          tmp_root="$(mktemp -d)"
+          trap 'rm -rf "$tmp_root"' EXIT
+          mirror_dir="${tmp_root}/mirrors"
+          gen_dir="${mirror_dir}/generations/jleechanorg__ez-gh-actions.1000"
+          wh_dir="${tmp_root}/wheelhouse"
+          cfg_file="${tmp_root}/config.toml"
+          mkdir -p "${mirror_dir}/generations" "${mirror_dir}/active" "${wh_dir}"
+          git clone --bare "${GITHUB_WORKSPACE}" "${gen_dir}"
+          git -C "${gen_dir}" fetch --unshallow https://github.com/jleechanorg/ez-gh-actions.git +refs/heads/main:refs/heads/main 2>/dev/null \
+            || git -C "${gen_dir}" fetch https://github.com/jleechanorg/ez-gh-actions.git +refs/heads/main:refs/heads/main
+          git -C "${gen_dir}" rev-parse refs/heads/main > "${gen_dir}/SEED_SHA"
+          rm -rf "${gen_dir}/objects/info/commit-graph"*
+          ln -s "../generations/jleechanorg__ez-gh-actions.1000" "${mirror_dir}/active/jleechanorg__ez-gh-actions"
+          docker run --rm --user "$(id -u):$(id -g)" -v "${wh_dir}:/out" ezgha-runner:ci-hydration bash -lc 'cp /opt/baked-wheels/*.whl /out/'
+          python3 -c 'import sys; sys.path.insert(0, "scripts"); import ezgha_wheelhouse; ezgha_wheelhouse.prune_old_wheels(sys.argv[1])' "${wh_dir}"
+          chmod -R a+rX "${mirror_dir}" "${wh_dir}"
+          cat > "${cfg_file}" <<EOF
+          version = 1
+          [runner]
+          image = "ezgha-runner:ci-hydration"
+          wheelhouse_host_path = "${wh_dir}"
+          git_mirror_host_path = "${mirror_dir}"
+          EOF
+          EZGHA_VERIFY_REPO=jleechanorg/ez-gh-actions \
+            EZGHA_VERIFY_REQUIRE_TOKEN=0 \
+            EZGHA_VERIFY_MIN_WHEELS=1 \
+            EZGHA_VERIFY_PACKAGES="playwright==1.65.2" \
+            bash scripts/verify_live_cache_savings.sh --config "${cfg_file}"

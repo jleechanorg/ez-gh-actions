@@ -11,8 +11,10 @@ for _dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.local/bin"; do
 done
 export PATH
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_MODE=""
 CFG_OVERRIDE=""
+REPO_OVERRIDE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -26,8 +28,13 @@ while [ $# -gt 0 ]; do
       CFG_OVERRIDE="$2"
       shift 2
       ;;
+    --repo)
+      [ $# -ge 2 ] || { echo "FAIL: --repo requires owner/repo" >&2; exit 1; }
+      REPO_OVERRIDE="$2"
+      shift 2
+      ;;
     -h|--help)
-      echo "Usage: $0 [--host local|mac] [--config <path>]"
+      echo "Usage: $0 [--host local|mac] [--config <path>] [--repo <owner/repo>]"
       exit 0
       ;;
     *)
@@ -45,23 +52,33 @@ if [ -z "${HOST_MODE}" ]; then
   fi
 fi
 
-if [ "${HOST_MODE}" = "mac" ]; then
-  if [ -z "${DOCKER_HOST:-}" ]; then
-    LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/org.jleechanorg.ezgha.plist"
-    if [ -f "${LAUNCHD_PLIST}" ] && command -v plutil >/dev/null 2>&1; then
-      PLIST_DOCKER_HOST="$(plutil -extract EnvironmentVariables.DOCKER_HOST raw -o - "${LAUNCHD_PLIST}" 2>/dev/null || true)"
-      if [ -n "${PLIST_DOCKER_HOST}" ]; then
-        export DOCKER_HOST="${PLIST_DOCKER_HOST}"
-        unset DOCKER_CONTEXT || true
-      fi
-    fi
-  fi
-  if [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/docker.sock ] && [ -S "${HOME}/.colima/default/docker.sock" ]; then
-    export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
-    unset DOCKER_CONTEXT || true
-  fi
-elif [ "${HOST_MODE}" != "local" ]; then
-  echo "FAIL: unsupported --host '${HOST_MODE}' (expected local or mac)" >&2
+case "${HOST_MODE}" in
+  mac)   PLATFORM="macos" ;;
+  local) PLATFORM="linux" ;;
+  *)
+    echo "FAIL: unsupported --host '${HOST_MODE}' (expected local or mac)" >&2
+    exit 1
+    ;;
+esac
+
+VERIFY_REPO="${REPO_OVERRIDE:-${EZGHA_VERIFY_REPO:-jleechanorg/worldarchitect.ai}}"
+if [[ ! "${VERIFY_REPO}" =~ ^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)$ ]] \
+   || [ "${BASH_REMATCH[1]}" = "." ] || [ "${BASH_REMATCH[1]}" = ".." ] \
+   || [ "${BASH_REMATCH[2]}" = "." ] || [ "${BASH_REMATCH[2]}" = ".." ]; then
+  echo "FAIL: invalid target repository '${VERIFY_REPO}' (expected owner/repo)" >&2
+  exit 1
+fi
+REPO_SLUG="${VERIFY_REPO/\//__}"
+
+MIN_WHEELS="${EZGHA_VERIFY_MIN_WHEELS:-10}"
+if [[ ! "${MIN_WHEELS}" =~ ^[0-9]+$ ]]; then
+  echo "FAIL: EZGHA_VERIFY_MIN_WHEELS must be a non-negative integer (got '${MIN_WHEELS}')" >&2
+  exit 1
+fi
+
+REQUIRE_TOKEN="${EZGHA_VERIFY_REQUIRE_TOKEN:-1}"
+if [ "${REQUIRE_TOKEN}" != "0" ] && [ "${REQUIRE_TOKEN}" != "1" ]; then
+  echo "FAIL: EZGHA_VERIFY_REQUIRE_TOKEN must be 0 or 1 (got '${REQUIRE_TOKEN}')" >&2
   exit 1
 fi
 
@@ -78,35 +95,32 @@ fi
 [ -f "${CONFIG_PATH}" ] || { echo "FAIL: config.toml not found at ${CONFIG_PATH}" >&2; exit 1; }
 
 PARSED_INFO="$(python3 - "${CONFIG_PATH}" <<'PY'
-import os, re, sys
+import os
+import sys
+import tomllib
 
 path = sys.argv[1]
-try:
-    import tomllib
-    with open(path, "rb") as fh:
-        data = tomllib.load(fh)
-except ImportError:
-    data = {}
-    sec = None
-    for raw in open(path, "r", encoding="utf-8"):
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            sec = data.setdefault(line[1:-1].strip(), {})
-        elif "=" in line:
-            k, v = [x.strip() for x in line.split("=", 1)]
-            if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                v = v[1:-1]
-            (sec if sec is not None else data)[k] = v
+with open(path, "rb") as fh:
+    data = tomllib.load(fh)
 
 runner = data.get("runner", {})
-wh = os.path.expanduser(str(runner.get("wheelhouse_host_path", "") or ""))
-gm = os.path.expanduser(str(runner.get("git_mirror_host_path", "") or ""))
-img = str(runner.get("image", "") or "ezgha-runner:latest")
-print(wh)
-print(gm)
-print(img)
+if not isinstance(runner, dict):
+    raise SystemExit(f"FAIL: [runner] must be a TOML table in {path}")
+
+for field in ("wheelhouse_host_path", "git_mirror_host_path"):
+    val = runner.get(field)
+    if val is None:
+        raise SystemExit(f"FAIL: runner.{field} is not configured in {path}")
+    if not isinstance(val, str) or not val.strip():
+        raise SystemExit(f"FAIL: runner.{field} must not be empty in {path}")
+    if val != val.strip() or val.startswith("~") or not os.path.isabs(val):
+        raise SystemExit(
+            f"FAIL: runner.{field} must be an absolute path without leading '~' (got {val!r})"
+        )
+
+print(runner["wheelhouse_host_path"])
+print(runner["git_mirror_host_path"])
+print(str(runner.get("image") or "ezgha-runner:latest").strip() or "ezgha-runner:latest")
 PY
 )"
 
@@ -118,18 +132,31 @@ RUNNER_IMAGE="$(printf '%s\n' "${PARSED_INFO}" | sed -n '3p')"
 [ -n "${WHEELHOUSE_PATH}" ] && [ -d "${WHEELHOUSE_PATH}" ] \
   || { echo "FAIL: wheelhouse_host_path missing or not a directory: ${WHEELHOUSE_PATH:-<unset>}" >&2; exit 1; }
 WHL_COUNT="$(find "${WHEELHOUSE_PATH}" -maxdepth 1 -type f -name '*.whl' 2>/dev/null | wc -l | tr -d '[:space:]')"
-[ "${WHL_COUNT}" -ge 10 ] \
-  || { echo "FAIL: expected >= 10 .whl files in ${WHEELHOUSE_PATH}, found ${WHL_COUNT}" >&2; exit 1; }
+[ "${WHL_COUNT}" -ge "${MIN_WHEELS}" ] \
+  || { echo "FAIL: expected >= ${MIN_WHEELS} .whl files in ${WHEELHOUSE_PATH}, found ${WHL_COUNT}" >&2; exit 1; }
 
-SEED_FILE="${GIT_MIRROR_PATH}/active/jleechanorg__worldarchitect.ai/SEED_SHA"
+SEED_FILE="${GIT_MIRROR_PATH}/active/${REPO_SLUG}/SEED_SHA"
 [ -n "${GIT_MIRROR_PATH}" ] && [ -f "${SEED_FILE}" ] \
   || { echo "FAIL: missing mirror SEED_SHA at ${SEED_FILE}" >&2; exit 1; }
 
-if [ -z "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
-  GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+if [ "${REQUIRE_TOKEN}" = "1" ]; then
+  if [ -z "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+  fi
+  [ -n "${GH_TOKEN:-}" ] || { echo "FAIL: unable to obtain transient GH_TOKEN from gh auth token" >&2; exit 1; }
+  export GH_TOKEN
+else
+  export GH_TOKEN="${GH_TOKEN:-}"
 fi
-[ -n "${GH_TOKEN:-}" ] || { echo "FAIL: unable to obtain transient GH_TOKEN from gh auth token" >&2; exit 1; }
-export GH_TOKEN
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/launchd-service-docker-endpoint.sh"
+use_launchd_service_docker_endpoint "$PLATFORM"
+if [ "${PLATFORM}" = "macos" ] && [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/docker.sock ] && [ -S "${HOME}/.colima/default/docker.sock" ]; then
+  export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
+  unset DOCKER_CONTEXT || true
+fi
+docker info --format '{{.ServerVersion}}' >/dev/null || { echo "FAIL: docker daemon unreachable" >&2; exit 1; }
 
 CONTAINER_OUTPUT="$(
   docker run --rm \
@@ -137,6 +164,8 @@ CONTAINER_OUTPUT="$(
     -v "${GIT_MIRROR_PATH}:/opt/ezgha-git-mirrors:ro" \
     -e PIP_FIND_LINKS=/opt/wheelhouse \
     -e EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors \
+    -e VERIFY_REPO="${VERIFY_REPO}" \
+    -e EZGHA_VERIFY_PACKAGES="${EZGHA_VERIFY_PACKAGES:-}" \
     -e GH_TOKEN \
     "${RUNNER_IMAGE}" \
     bash -lc '
@@ -152,12 +181,21 @@ for line in open(\"/proc/net/dev\"):
 "
       }
       PW_VER="$(cat /ms-playwright/PLAYWRIGHT_VERSION 2>/dev/null || echo 1.65.2)"
+      if [ -n "${EZGHA_VERIFY_PACKAGES:-}" ]; then
+        read -r -a PKGS <<< "${EZGHA_VERIFY_PACKAGES}"
+      else
+        PKGS=(pytest pydantic coverage "playwright==${PW_VER}")
+      fi
       RX_BEFORE="$(read_rx)"
       git init -q /tmp/wa
-      git -C /tmp/wa remote add origin "https://github.com/jleechanorg/worldarchitect.ai.git"
-      git -C /tmp/wa -c "credential.helper=!f() { echo username=x-access-token; echo password=\${GH_TOKEN}; }; f" fetch --depth=1 origin main
+      git -C /tmp/wa remote add origin "https://github.com/${VERIFY_REPO}.git"
+      if [ -n "${GH_TOKEN:-}" ]; then
+        git -C /tmp/wa -c "credential.helper=!f() { echo username=x-access-token; echo password=\${GH_TOKEN}; }; f" fetch --depth=1 origin main
+      else
+        GIT_TERMINAL_PROMPT=0 git -C /tmp/wa fetch --depth=1 origin main
+      fi
       python3 -m venv /tmp/v
-      /tmp/v/bin/pip install --quiet pytest pydantic coverage "playwright==${PW_VER}"
+      /tmp/v/bin/pip install --quiet "${PKGS[@]}"
       /tmp/v/bin/python -m playwright install chromium
       RX_AFTER="$(read_rx)"
       echo "RX_BEFORE=${RX_BEFORE}"
