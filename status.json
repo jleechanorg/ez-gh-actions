@@ -10,7 +10,7 @@
         "down": 0,
         "executing": 0,
         "idle": 20,
-        "reserved": 19
+        "reserved": 20
       },
       "sources": {
         "config": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-18T13:00:20Z",
-  "published_at": "2026-11-18T13:00:53Z",
+  "observed_at": "2026-11-18T13:12:19Z",
+  "published_at": "2026-11-18T13:12:21Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
