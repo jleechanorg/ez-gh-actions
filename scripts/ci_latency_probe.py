@@ -32,22 +32,15 @@ SKIPPED_CONCLUSIONS = frozenset({"skipped", "neutral"})
 
 DEFAULT_GH_TIMEOUT_S = 20
 
+_AUDIT_REPO_ALIASES = {
+    "worldarchitect_ai": "jleechanorg/worldarchitect.ai",
+    "worldai_frontend": "jleechanorg/worldai_frontend",
+}
+
 
 def gh_json(args, timeout=DEFAULT_GH_TIMEOUT_S):
-    """Bounded GitHub CLI JSON call with prompt/pager disabled."""
-    env = dict(queue_probe.gh_env())
-    env.update({
-        "GH_PROMPT_DISABLED": "1",
-        "GH_NO_UPDATE_NOTIFIER": "1",
-        "GH_PAGER": "",
-    })
-    try:
-        result = subprocess.run(["gh", *args], capture_output=True, env=env, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"gh timed out after {timeout}s") from exc
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or b"").decode()[:300])
-    return json.loads(result.stdout.decode() or "null")
+    """Bounded GitHub CLI JSON call delegating to queue_probe.gh_json."""
+    return queue_probe.gh_json(args, timeout=timeout)
 
 
 def _parse_iso(stamp):
@@ -343,10 +336,23 @@ def _pick_stat_block(block):
     }
 
 
+def iter_audit_repo_blocks(raw):
+    """Yield (repo_slug, block_dict) entries from a pre-collected audit JSON."""
+    if not isinstance(raw, dict):
+        return
+    for key, val in raw.items():
+        if not isinstance(val, dict):
+            continue
+        if any(k in val for k in ("recent_contiguous_runs", "recent_runs", "job_level_audit")):
+            slug = val.get("repo") or _AUDIT_REPO_ALIASES.get(key) or key
+            yield slug, val
+
+
 def from_audit_json(path):
     """Normalize a pre-collected ci_latency_percentiles.json into public probe shape."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    primary = raw.get("worldarchitect_ai") or raw.get("worldai_frontend") or {}
+    repo_blocks = list(iter_audit_repo_blocks(raw))
+    primary = repo_blocks[0][1] if repo_blocks else {}
     recent = primary.get("recent_contiguous_runs") or primary.get("recent_runs") or {}
     cohorts = recent.get("cohorts") or {}
     job_audit = primary.get("job_level_audit") or {}
@@ -363,17 +369,8 @@ def from_audit_json(path):
         else 0.0
     )
 
-    run_wf_map = {}
-    for wf in recent.get("by_workflow") or []:
-        if isinstance(wf, dict) and isinstance(wf.get("workflow"), str):
-            run_wf_map[wf["workflow"]] = wf.get("success") or wf.get("all_non_skipped") or {}
-
     workflows = []
-    for repo_key, repo_slug in (
-        ("worldarchitect_ai", "jleechanorg/worldarchitect.ai"),
-        ("worldai_frontend", "jleechanorg/worldai_frontend"),
-    ):
-        repo_block = raw.get(repo_key) or {}
+    for repo_slug, repo_block in repo_blocks:
         r_recent = repo_block.get("recent_contiguous_runs") or repo_block.get("recent_runs") or {}
         r_wf_map = {
             wf["workflow"]: wf.get("success") or wf.get("all_non_skipped") or {}

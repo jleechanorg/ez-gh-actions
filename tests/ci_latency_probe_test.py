@@ -210,6 +210,47 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertEqual(normalized["overall"]["e2e"]["p50_s"], 453.0)
         self.assertEqual(normalized["workflows"][0]["workflow"], "Presubmit Checks")
 
+    def test_from_audit_json_supports_custom_sanitized_repo_keys(self):
+        mod = load_module()
+        audit_sample = {
+            "generated_at_utc": "2026-11-18T00:00:00Z",
+            "app_backend": {
+                "repo": "org/app-backend",
+                "recent_contiguous_runs": {
+                    "skipped_or_neutral_runs": 1,
+                    "cohorts": {
+                        "success": {"n": 3, "avg_s": 120.0, "p50_s": 100.0, "p90_s": 200.0, "p99_s": 240.0, "max_s": 250.0},
+                        "all_non_skipped": {"n": 4, "avg_s": 130.0, "p50_s": 110.0, "p90_s": 210.0, "p99_s": 250.0, "max_s": 260.0},
+                    },
+                    "by_workflow": [{"workflow": "CI", "success": {"n": 3, "avg_s": 120.0, "p50_s": 100.0, "p90_s": 200.0, "p99_s": 240.0, "max_s": 250.0}}],
+                },
+                "job_level_audit": {
+                    "job_cohorts": {
+                        "success": {
+                            "queue_wait": {"n": 3, "avg_s": 5.0, "p50_s": 4.0, "p90_s": 8.0, "p99_s": 9.0, "max_s": 10.0},
+                            "execution": {"n": 3, "avg_s": 90.0, "p50_s": 85.0, "p90_s": 150.0, "p99_s": 180.0, "max_s": 190.0},
+                        }
+                    },
+                    "by_workflow": [
+                        {
+                            "workflow": "CI",
+                            "success": {
+                                "queue_wait": {"n": 3, "avg_s": 5.0, "p50_s": 4.0, "p90_s": 8.0, "p99_s": 9.0, "max_s": 10.0},
+                                "execution": {"n": 3, "avg_s": 90.0, "p50_s": 85.0, "p90_s": 150.0, "p99_s": 180.0, "max_s": 190.0},
+                            },
+                        }
+                    ],
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "sanitized_audit.json"
+            p.write_text(json.dumps(audit_sample), encoding="utf-8")
+            normalized = mod.from_audit_json(p)
+        self.assertTrue(normalized["ok"])
+        self.assertEqual(normalized["workflows"][0]["repo"], "org/app-backend")
+        self.assertEqual(normalized["overall"]["execution"]["p50_s"], 85.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

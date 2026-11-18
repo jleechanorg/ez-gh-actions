@@ -238,8 +238,9 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
     seen_slot_names = set()
 
     raw_hosts = (hosts_data or {}).get("hosts") or {}
-    if isinstance(raw_hosts.get("jeff-ubuntu"), dict):
-        ju = raw_hosts["jeff-ubuntu"]
+    for host_key, ju in raw_hosts.items():
+        if host_key == "mac" or not isinstance(ju, dict):
+            continue
         disk = ju.get("disk") or {}
         mem = ju.get("memory") or {}
         load = ju.get("load_average") or []
@@ -251,9 +252,9 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
         for s in slots:
             seen_slot_names.add(s["name"])
         hosts.append({
-            "id": "jeff-ubuntu",
-            "title": "jeff-ubuntu (Bare-Metal Linux X64)",
-            "group": "jeff-ubuntu",
+            "id": host_key,
+            "title": ju.get("display_name") or f"{host_key} (Bare-Metal Linux X64)",
+            "group": ju.get("group") or "jeff-ubuntu",
             "status": ju.get("admission_status") or ju.get("ezgha_service_status") or "active",
             "alert_message": ju.get("admission_message"),
             "contributors": ju.get("disk_pressure_contributors") or [],
@@ -433,7 +434,8 @@ def _normalize_latency(latency_raw):
     if "overall" in latency_raw and "workflows" in latency_raw:
         return latency_raw
 
-    primary = latency_raw.get("worldarchitect_ai") or latency_raw.get("worldai_frontend") or {}
+    repo_blocks = list(ci_latency_probe.iter_audit_repo_blocks(latency_raw))
+    primary = repo_blocks[0][1] if repo_blocks else {}
     recent = primary.get("recent_contiguous_runs") or primary.get("recent_runs") or {}
     run_cohorts = recent.get("cohorts") or {}
     job_audit = primary.get("job_level_audit") or {}
@@ -451,11 +453,8 @@ def _normalize_latency(latency_raw):
         }
 
     workflows = []
-    for repo_key, repo_slug in (
-        ("worldarchitect_ai", "worldarchitect.ai"),
-        ("worldai_frontend", "worldai_frontend"),
-    ):
-        repo_block = latency_raw.get(repo_key) or {}
+    for repo_slug_full, repo_block in repo_blocks:
+        repo_slug = _short_repo(repo_slug_full) or repo_slug_full
         r_recent = repo_block.get("recent_contiguous_runs") or repo_block.get("recent_runs") or {}
         r_wf_map = {
             wf["workflow"]: wf
@@ -506,7 +505,7 @@ def _normalize_latency(latency_raw):
 
 def _collect_live_github_snapshot():
     """Fallback bounded live GitHub query when no audit-dir is supplied."""
-    repos = ["jleechanorg/worldarchitect.ai", "jleechanorg/worldai_frontend", "jleechanorg/ez-gh-actions"]
+    repos = [*ci_latency_probe.DEFAULT_REPOS, "jleechanorg/ez-gh-actions"]
     all_ip_jobs = []
     ip_runs_by_repo = {}
     ip_jobs_by_repo = {}

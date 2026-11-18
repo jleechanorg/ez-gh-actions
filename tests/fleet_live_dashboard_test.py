@@ -307,6 +307,26 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     server.shutdown()
                     server.server_close()
 
+    def test_custom_sanitized_host_and_latency_repo_keys(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            hosts = json.loads((tmp / "ubuntu_mac_slots.json").read_text())
+            hosts["hosts"]["linux-host-1"] = hosts["hosts"].pop("jeff-ubuntu")
+            hosts["hosts"]["linux-host-1"]["display_name"] = "linux-host-1 (Linux X64)"
+            (tmp / "ubuntu_mac_slots.json").write_text(json.dumps(hosts), encoding="utf-8")
+
+            lat = json.loads((tmp / "ci_latency_percentiles.json").read_text())
+            lat["app_backend"] = lat.pop("worldarchitect_ai")
+            lat["app_backend"]["repo"] = "org/app-backend"
+            (tmp / "ci_latency_percentiles.json").write_text(json.dumps(lat), encoding="utf-8")
+
+            state = mod.build_operator_state(audit_dir=tmp)
+        host_ids = [h["id"] for h in state["hosts"]]
+        self.assertIn("linux-host-1", host_ids)
+        self.assertEqual(state["latency"]["workflows"][0]["repo"], "app-backend")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

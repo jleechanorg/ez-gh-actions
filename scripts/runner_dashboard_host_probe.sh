@@ -292,15 +292,15 @@ elif [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker i
       PROCESS_OK=false
       break
     fi
-    slot_states[$slot]="$state"
-    slot_elapsed[$slot]=""
-    slot_phase[$slot]=""
+    slot_states[slot]="$state"
+    slot_elapsed[slot]=""
+    slot_phase[slot]=""
     case "$state" in
       EXECUTING)
         EXECUTING=$((EXECUTING + 1))
         meta="$(slot_phase_and_elapsed "$name" "EXECUTING" 2>/dev/null || true)"
-        slot_elapsed[$slot]="${meta%%$'\t'*}"
-        slot_phase[$slot]="${meta#*$'\t'}"
+        slot_elapsed[slot]="${meta%%$'\t'*}"
+        slot_phase[slot]="${meta#*$'\t'}"
         ;;
       IDLE) IDLE=$((IDLE + 1)) ;;
       DOWN) down_candidates+=("$slot:$name") ;;
@@ -316,20 +316,20 @@ elif [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker i
         PROCESS_OK=false
         break
       fi
-      slot_states[$slot]="$state"
+      slot_states[slot]="$state"
       case "$state" in
         EXECUTING)
           EXECUTING=$((EXECUTING + 1))
           meta="$(slot_phase_and_elapsed "$name" "EXECUTING" 2>/dev/null || true)"
-          slot_elapsed[$slot]="${meta%%$'\t'*}"
-          slot_phase[$slot]="${meta#*$'\t'}"
+          slot_elapsed[slot]="${meta%%$'\t'*}"
+          slot_phase[slot]="${meta#*$'\t'}"
           ;;
         IDLE) IDLE=$((IDLE + 1)) ;;
         DOWN)
           if recent_respawn_evidence "$name"; then
             CYCLING=$((CYCLING + 1))
-            slot_states[$slot]="CYCLING"
-            slot_phase[$slot]="respawning"
+            slot_states[slot]="CYCLING"
+            slot_phase[slot]="respawning"
           else
             DOWN=$((DOWN + 1))
           fi

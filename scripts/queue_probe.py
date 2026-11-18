@@ -72,11 +72,21 @@ def gh_env():
             token = ""
     if token:
         env["GH_TOKEN"] = token
+    env.update({
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_PAGER": "",
+    })
     return env
 
 
-def gh_json(args):
-    result = subprocess.run(["gh", *args], capture_output=True, env=gh_env())
+def gh_json(args, timeout=None):
+    try:
+        result = subprocess.run(
+            ["gh", *args], capture_output=True, env=gh_env(), timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gh timed out after {timeout}s") from exc
     if result.returncode != 0:
         raise RuntimeError((result.stderr or b"").decode()[:300])
     return json.loads(result.stdout.decode() or "null")
