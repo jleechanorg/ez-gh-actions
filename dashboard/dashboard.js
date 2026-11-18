@@ -568,6 +568,20 @@
       repos.replaceChildren();
     }
 
+    const isPartial = Boolean(queue && queue.partial === true);
+    setText(
+      'queue-fresh-note',
+      isPartial
+        ? 'Upper-bound waiting count: includes queued runs whose jobs lookup failed or timed out.'
+        : 'Queued runs that own at least one job.',
+    );
+    setText(
+      'queue-oldest-note',
+      isPartial
+        ? 'Age of the longest-waiting counted run (includes unverified runs when jobs lookups fail).'
+        : 'Age of the longest-waiting run that has real work.',
+    );
+
     const valid =
       queue &&
       queue.ok === true &&

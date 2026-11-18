@@ -417,6 +417,8 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   assert.match(elements.get('queue-summary').textContent, /counted as waiting/);
   assert.doesNotMatch(elements.get('queue-summary').textContent, /real waiting work/);
   assert.match(elements.get('queue-summary').textContent, /partial: 2 unverified/);
+  assert.match(elements.get('queue-fresh-note').textContent, /Upper-bound waiting count/);
+  assert.match(elements.get('queue-oldest-note').textContent, /includes unverified runs/);
   assert.match(elements.get('latency-summary').textContent, /partial sample/);
 
   const truncatedQueueSnap = structuredClone(snapshot);
@@ -434,6 +436,12 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   assert.equal(elements.get('queue-fresh').textContent, '—');
   assert.equal(elements.get('queue-ghosts').textContent, '—');
   assert.match(elements.get('queue-summary').textContent, /100 unverified/);
+  assert.match(elements.get('queue-fresh-note').textContent, /Upper-bound waiting count/);
+  assert.match(elements.get('queue-oldest-note').textContent, /includes unverified runs/);
+
+  render(snapshot, NOW);
+  assert.equal(elements.get('queue-fresh-note').textContent, 'Queued runs that own at least one job.');
+  assert.equal(elements.get('queue-oldest-note').textContent, 'Age of the longest-waiting run that has real work.');
 
   // Honest skipped-probe provenance on parked host still classifies as degraded (parked), never stale,
   // and an unavailable host displays UNAVAILABLE badge rather than ONLINE.

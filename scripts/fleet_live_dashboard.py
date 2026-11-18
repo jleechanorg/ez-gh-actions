@@ -1028,6 +1028,16 @@ def _collect_live_cmux(cmux_cmd):
     return None
 
 
+def _uses_live_github(*, audit_dir=None, github_json=None, latency_json=None):
+    return audit_dir is None and (github_json is None or latency_json is None)
+
+
+def _is_fully_file_backed(*, audit_dir=None, hosts_json=None, github_json=None, latency_json=None):
+    return audit_dir is not None or (
+        hosts_json is not None and github_json is not None and latency_json is not None
+    )
+
+
 def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, github_json=None,
                          latency_json=None, repos=None, linux_host=None, cmux_cmd=None):
     base = Path(audit_dir) if audit_dir else None
@@ -1039,13 +1049,30 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     gh_data = _load_json(github_json or (base / "github_live_snapshot.json" if base else None))
     latency_raw = _load_json(latency_json or (base / "ci_latency_percentiles.json" if base else None))
 
-    uses_live_github = base is None and (gh_data is None or latency_raw is None)
-    is_fully_file_backed = (
-        base is not None
-        or (hosts_data is not None and gh_data is not None and latency_raw is not None)
+    fixture_errors = []
+    if hosts_json is not None and hosts_data is None:
+        fixture_errors.append(f"hosts fixture missing or unreadable: {hosts_json}")
+        hosts_data = {"hosts": {}}
+    if cmux_json is not None and cmux_data is None:
+        fixture_errors.append(f"cmux fixture missing or unreadable: {cmux_json}")
+        cmux_data = {"ok": False, "error": f"cmux fixture missing or unreadable: {cmux_json}"}
+    if github_json is not None and gh_data is None:
+        err = f"github fixture missing or unreadable: {github_json}"
+        fixture_errors.append(err)
+        gh_data = {"errors": [err], "summary": {"ip_partial": True, "q_partial": True}}
+    if latency_json is not None and latency_raw is None:
+        err = f"latency fixture missing or unreadable: {latency_json}"
+        fixture_errors.append(err)
+        latency_raw = {"ok": False, "error": err, "overall": {}, "cohorts": {}, "workflows": []}
+
+    is_fully_file_backed = _is_fully_file_backed(
+        audit_dir=base,
+        hosts_json=hosts_json,
+        github_json=github_json,
+        latency_json=latency_json,
     )
     scope_note = None
-    if base is None and hosts_data is None:
+    if base is None and hosts_json is None and hosts_data is None:
         hosts_data = _collect_local_host_slots()
         eff_linux = linux_host or os.environ.get("EZGHA_OPERATOR_LINUX_HOST")
         eff_cmux = cmux_cmd or os.environ.get("EZGHA_DASHBOARD_CMUX_PROBE_CMD")
@@ -1058,11 +1085,11 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
                 missing_pools.append(f"remote-linux ({eff_linux} unreachable)")
         else:
             missing_pools.append("remote-linux")
-        if eff_cmux and cmux_data is None:
+        if eff_cmux and cmux_json is None and cmux_data is None:
             cmux_data = _collect_live_cmux(eff_cmux)
             if cmux_data is None:
                 missing_pools.append("cmux-cloud (probe failed)")
-        elif cmux_data is None:
+        elif cmux_json is None and cmux_data is None:
             missing_pools.append("cmux-cloud")
         if missing_pools:
             scope_note = (
@@ -1070,10 +1097,13 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
                 + ", ".join(missing_pools)
                 + " unprobed (pass --linux-host / --cmux-cmd or --audit-dir for full multi-host fleet)."
             )
-    if base is None and gh_data is None:
+    if base is None and github_json is None and gh_data is None:
         gh_data = _collect_live_github_snapshot(repos=repos)
-    if base is None and latency_raw is None:
+    if base is None and latency_json is None and latency_raw is None:
         latency_raw = _cached_live_latency(repos)
+    if fixture_errors:
+        fixture_note = "Fixture error: " + "; ".join(fixture_errors)
+        scope_note = f"{scope_note} | {fixture_note}" if scope_note else fixture_note
 
     hosts = _normalize_hosts(hosts_data, cmux_data, gh_data)
     reconciliation = _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=scope_note)
@@ -1682,7 +1712,11 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("Refusing to bind operator dashboard outside loopback")
 
-    uses_live_github = audit_dir is None and (github_json is None or latency_json is None)
+    uses_live_github = _uses_live_github(
+        audit_dir=audit_dir,
+        github_json=github_json,
+        latency_json=latency_json,
+    )
     effective_refresh_ms = refresh_ms if refresh_ms is not None else (120000 if uses_live_github else 15000)
     effective_ttl_s = cache_ttl_s if cache_ttl_s is not None else (120.0 if uses_live_github else 15.0)
 

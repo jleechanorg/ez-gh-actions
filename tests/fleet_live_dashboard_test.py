@@ -920,6 +920,55 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 srv_full.shutdown()
                 srv_full.server_close()
 
+    def test_missing_or_malformed_explicit_fixtures_fail_closed_without_live_fallback(self):
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            missing_hosts = tmp / "missing_hosts.json"
+            bad_gh = tmp / "bad_github.json"
+            bad_gh.write_text("{not valid json", encoding="utf-8")
+            missing_lat = tmp / "missing_latency.json"
+
+            with mock.patch.object(mod, "_collect_local_host_slots", side_effect=AssertionError("must not probe local host")), \
+                 mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("must not poll GH")), \
+                 mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("must not poll latency")):
+                state = mod.build_operator_state(
+                    hosts_json=missing_hosts,
+                    github_json=bad_gh,
+                    latency_json=missing_lat,
+                )
+
+            self.assertEqual(state["source_mode"], "AUDIT SNAPSHOT")
+            self.assertTrue(state["reconciliation"]["active_runs_partial"])
+            self.assertTrue(state["reconciliation"]["queue_partial"])
+            self.assertFalse(state["latency"]["ok"])
+            self.assertIn("github fixture missing or unreadable", " ".join(state["reconciliation"]["gh_errors"]))
+            self.assertIn("hosts fixture missing or unreadable", state["reconciliation"]["scope_note"])
+
+            srv = mod.create_server(
+                port=0,
+                hosts_json=missing_hosts,
+                github_json=bad_gh,
+                latency_json=missing_lat,
+            )
+            try:
+                import threading
+                import urllib.request
+                with mock.patch.object(mod, "_collect_local_host_slots", side_effect=AssertionError("must not probe local host")), \
+                     mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("must not poll GH")), \
+                     mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("must not poll latency")):
+                    port = srv.server_address[1]
+                    t = threading.Thread(target=srv.serve_forever, daemon=True)
+                    t.start()
+                    body = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode("utf-8")
+                    self.assertIn("const AUTO_REFRESH_MS = 15000;", body)
+                    self.assertIn("AUDIT SNAPSHOT", body)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
