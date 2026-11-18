@@ -34,6 +34,33 @@ FIXTURE
 chmod +x "$QUEUE_FIXTURE"
 export EZGHA_DASHBOARD_QUEUE_PROBE_CMD="python3 $QUEUE_FIXTURE"
 
+LATENCY_FIXTURE="$WORK/latency-fixture.py"
+cat > "$LATENCY_FIXTURE" <<'FIXTURE'
+#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+out = args[args.index("--output") + 1] if "--output" in args else None
+payload = {
+    "schema_version": 1,
+    "ok": True,
+    "generated_at": "2026-11-18T09:11:59Z",
+    "overall": {
+        "queue_wait": {"n": 10, "avg_s": 120.0, "p50_s": 90.0, "p90_s": 240.0, "p99_s": 300.0},
+        "execution": {"n": 10, "avg_s": 60.0, "p50_s": 45.0, "p90_s": 120.0, "p99_s": 180.0},
+        "e2e": {"n": 10, "avg_s": 180.0, "p50_s": 135.0, "p90_s": 360.0, "p99_s": 480.0},
+    },
+    "cancellation": {"cancelled_runs": 1, "total_non_skipped_runs": 10, "cancelled_rate_pct": 10.0},
+    "workflows": [],
+}
+encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+if out:
+    open(out, "w").write(encoded)
+else:
+    sys.stdout.write(encoded)
+FIXTURE
+chmod +x "$LATENCY_FIXTURE"
+export EZGHA_DASHBOARD_LATENCY_PROBE_CMD="python3 $LATENCY_FIXTURE"
+
 write_probe() {
   local path="$1" host_class="$2" configured="$3" executing="$4"
   sed -n '1,$p' > "$path" <<EOF
@@ -72,6 +99,9 @@ assert "secret-host" not in serialized
 # The queue block is present in the default publish path and carries its own ok.
 assert payload["queue"]["ok"] is True, payload["queue"]
 assert payload["queue"]["fresh"] == 0 and payload["queue"]["ghosts"] == 0
+assert payload["latency"]["ok"] is True, payload["latency"]
+assert payload["latency"]["overall"]["queue_wait"]["p50_s"] == 90.0
+assert payload["reconciliation"]["active_job_slots_occupied"] == 22
 PY
 
 DEFAULT_HOME="$WORK/default-home"

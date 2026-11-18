@@ -233,3 +233,170 @@ test('repeated refresh does not re-announce unchanged state', () => {
   assert.equal(elements.get('linux-target').textContent, '10');
   delete globalThis.document;
 });
+
+test('real 4-mac parked and 20-linux fleet classifies cleanly without false critical', () => {
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.fleet = {
+    configured: 4,
+    executing: 0,
+    idle: 0,
+    cycling: 0,
+    down: 0,
+    reserved: 0,
+  };
+  snapshot.fleets.mac.parked = true;
+  snapshot.fleets.mac.parked_slots = 4;
+  snapshot.fleets.mac.parked_reason = 'operator_disabled';
+  snapshot.fleets.linux.fleet = {
+    configured: 20,
+    executing: 20,
+    idle: 0,
+    cycling: 0,
+    down: 0,
+    reserved: 20,
+  };
+  const status = classifySnapshot(snapshot, NOW);
+  assert.notEqual(status.state, 'stale');
+  assert.notEqual(status.state, 'critical');
+  assert.match(status.detail, /parked/i);
+});
+
+test('renders reconciliation banner, slot chips, cmux pool, and latency panel', () => {
+  const created = [];
+  const elements = new Map();
+  globalThis.document = {
+    createElement(tag) {
+      const node = {
+        tagName: tag.toUpperCase(),
+        className: '',
+        textContent: '',
+        dataset: {},
+        children: [],
+        appendChild(child) {
+          this.children.push(child);
+        },
+        replaceChildren(...args) {
+          this.children = args;
+        },
+      };
+      created.push(node);
+      return node;
+    },
+    getElementById(id) {
+      if (!elements.has(id)) {
+        elements.set(id, {
+          dataset: {},
+          textContent: '',
+          children: [],
+          classList: { add() {}, remove() {} },
+          appendChild(child) {
+            this.children.push(child);
+          },
+          replaceChildren(...args) {
+            this.children = args;
+          },
+        });
+      }
+      return elements.get(id);
+    },
+  };
+
+  const snapshot = structuredClone(HEALTHY);
+  snapshot.fleets.mac.fleet = {
+    configured: 4,
+    executing: 0,
+    idle: 0,
+    cycling: 0,
+    down: 0,
+    reserved: 0,
+  };
+  snapshot.fleets.mac.parked = true;
+  snapshot.fleets.mac.parked_slots = 4;
+  snapshot.fleets.mac.slots = [
+    { slot_id: 'mac-1', state: 'PARKED', phase_badge: 'operator_disabled' },
+  ];
+  snapshot.fleets.linux.fleet = {
+    configured: 20,
+    executing: 13,
+    idle: 0,
+    cycling: 0,
+    down: 7,
+    reserved: 20,
+  };
+  snapshot.fleets.linux.disk = { status: 'critical', free_gb: 25.0, floor_gb: 30 };
+  snapshot.fleets.linux.pause_reason = 'disk_floor_paused';
+  snapshot.fleets.linux.slots = [
+    {
+      slot_id: 'linux-1',
+      state: 'EXECUTING',
+      elapsed_minutes: 33.3,
+      repo_short: 'worldarchitect.ai',
+      phase_badge: 'playwright',
+    },
+    {
+      slot_id: 'linux-6',
+      state: 'DOWN',
+      phase_badge: 'disk_floor_paused',
+    },
+  ];
+  snapshot.cmux = {
+    ok: true,
+    configured: 25,
+    executing: 21,
+    idle: 0,
+    cycling: 4,
+    down: 0,
+    vms: [
+      {
+        vm_id: 'cmux-dreamy',
+        configured: 3,
+        executing: 2,
+        idle: 0,
+        cycling: 1,
+        down: 0,
+        disk_free_gb: 12.0,
+        disk_floor_gb: 10,
+        slots: [{ slot_id: 'cmux-dreamy-2', state: 'EXECUTING', elapsed_minutes: 28, phase_badge: 'jest' }],
+      },
+    ],
+  };
+  snapshot.reconciliation = {
+    active_workflow_runs: 15,
+    active_job_slots_occupied: 34,
+    idle_slots: 0,
+    cycling_slots: 4,
+    down_slots: 7,
+    parked_slots: 4,
+    fresh_queued_runs: 50,
+    inert_ghosts: 149,
+    explanation: '15 active workflow runs fan out across 34 occupied job slots.',
+  };
+  snapshot.latency = {
+    ok: true,
+    overall: {
+      queue_wait: { n: 186, avg_s: 416, p50_s: 339.5, p90_s: 874.5, p99_s: 1502.4 },
+      execution: { n: 186, avg_s: 197, p50_s: 47, p90_s: 505, p99_s: 1849.7 },
+      e2e: { n: 174, avg_s: 697, p50_s: 453, p90_s: 1561.2, p99_s: 4198.2 },
+    },
+    cancellation: { cancelled_runs: 183, total_non_skipped_runs: 381, cancelled_rate_pct: 48.0 },
+    workflows: [
+      {
+        workflow: 'Self-Hosted MVP Shards',
+        queue_wait: { n: 32, p50_s: 323, p90_s: 637 },
+        execution: { n: 32, avg_s: 413, p50_s: 32.5, p90_s: 1639, p99_s: 2050 },
+        e2e: { n: 32, p50_s: 500, p90_s: 1900 },
+      },
+    ],
+  };
+
+  render(snapshot, NOW);
+  assert.equal(elements.get('reconcile-runs').textContent, '15');
+  assert.equal(elements.get('reconcile-slots').textContent, '34');
+  assert.equal(elements.get('cmux-target').textContent, '25');
+  assert.equal(elements.get('latency-queue-p50').textContent, '5m 40s');
+  assert.equal(elements.get('latency-exec-p50').textContent, '47s');
+  assert.ok(elements.get('linux-slots').children.length >= 2);
+  assert.ok(elements.get('cmux-slots').children.length >= 1);
+  assert.ok(elements.get('latency-workflows').children.length >= 1);
+  delete globalThis.document;
+});

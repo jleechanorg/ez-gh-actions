@@ -3,7 +3,7 @@
 
   const STALE_AFTER_MS = 20 * 60 * 1000;
   const SOURCE_KEYS = ['linux_host', 'mac_host'];
-  const EXPECTED_CONFIGURED = { mac: 6, linux: 10 };
+  const EXPECTED_CONFIGURED = { mac: [4, 6], linux: [10, 20] };
   const FLEET_KEYS = [
     'configured',
     'executing',
@@ -12,6 +12,14 @@
     'down',
     'reserved',
   ];
+
+  function byId(id) {
+    try {
+      return typeof document !== 'undefined' ? document.getElementById(id) || null : null;
+    } catch (_error) {
+      return null;
+    }
+  }
 
   function classifyFreshness(timestamp, nowMs = Date.now()) {
     const observedMs = Date.parse(timestamp);
@@ -31,7 +39,7 @@
   }
 
   function setText(id, value) {
-    const element = document.getElementById(id);
+    const element = byId(id);
     const nextValue = value ?? 'UNKNOWN';
     if (element && element.textContent !== nextValue)
       element.textContent = nextValue;
@@ -43,6 +51,17 @@
 
   function count(value) {
     return isCount(value) ? String(value) : '—';
+  }
+
+  function formatDurationSeconds(seconds) {
+    if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) {
+      return '—';
+    }
+    const rounded = Math.round(seconds);
+    if (rounded < 60) return `${rounded}s`;
+    const mins = Math.floor(rounded / 60);
+    const rem = rounded % 60;
+    return rem === 0 ? `${mins}m` : `${mins}m ${rem}s`;
   }
 
   function sourceContract(snapshot) {
@@ -70,7 +89,14 @@
       (key) => key !== 'watchdog_state',
     );
     const watchdogAvailable = sources.watchdog_state?.ok === true;
+    const isParked = host?.parked === true;
+    const parkedSlots = isParked
+      ? isCount(host?.parked_slots)
+        ? host.parked_slots
+        : fleet.configured
+      : 0;
     const allDown =
+      !isParked &&
       fleet.configured > 0 &&
       fleet.down === fleet.configured &&
       fleet.executing === 0 &&
@@ -82,6 +108,7 @@
       (allDown &&
         sources.disk?.ok === false &&
         host?.disk?.status === 'unknown');
+    const allowedConfigured = EXPECTED_CONFIGURED[fleetName] || [];
     return (
       Object.keys(sources).sort().join(',') === sourceKeys.join(',') &&
       requiredSourceKeys
@@ -90,8 +117,8 @@
       diskValid &&
       typeof sources.watchdog_state?.ok === 'boolean' &&
       FLEET_KEYS.every((key) => isCount(fleet[key])) &&
-      fleet.configured === EXPECTED_CONFIGURED[fleetName] &&
-      fleet.executing + fleet.idle + fleet.cycling + fleet.down ===
+      allowedConfigured.includes(fleet.configured) &&
+      fleet.executing + fleet.idle + fleet.cycling + fleet.down + parkedSlots ===
         fleet.configured &&
       fleet.reserved <= fleet.configured &&
       ((watchdogAvailable &&
@@ -113,6 +140,7 @@
       const host = snapshot.fleets?.[key] || {};
       const fleet = host.fleet || {};
       if (
+        host.parked !== true &&
         isCount(fleet.down) &&
         fleet.down === fleet.configured &&
         fleet.configured > 0
@@ -138,6 +166,13 @@
     ]) {
       const host = snapshot.fleets[key];
       const fleet = host.fleet;
+      if (host.parked === true) {
+        const parkedCount = isCount(host.parked_slots)
+          ? host.parked_slots
+          : fleet.configured;
+        reasons.push(`${name} fleet intentionally parked (${parkedCount} slot(s))`);
+        continue;
+      }
       if (fleet.down > 0)
         reasons.push(`${name} has ${fleet.down} down slot(s)`);
       if (fleet.cycling > 0)
@@ -211,11 +246,13 @@
         detail: `${degraded.join('; ')}.`,
       };
     }
+    const macTarget = snapshot.fleets.mac.fleet.configured;
+    const linuxTarget = snapshot.fleets.linux.fleet.configured;
     return {
       state: 'live',
       kicker: 'LOCAL CAPACITY SNAPSHOT',
       detail:
-        'Local capacity probes report 6 Mac and 10 Linux slots executing. Queue health is not measured by this dashboard.',
+        `Local capacity probes report ${macTarget} Mac and ${linuxTarget} Linux slots executing. Queue health is not measured by this dashboard.`,
     };
   }
 
@@ -230,7 +267,8 @@
   }
 
   function renderFailure(reason) {
-    document.getElementById('status-banner').dataset.state = 'stale';
+    const banner = byId('status-banner');
+    if (banner) banner.dataset.state = 'stale';
     setText('status-kicker', 'STALE / UNKNOWN');
     setText('status-detail', reason);
     setText('last-observed', 'unavailable');
@@ -238,9 +276,201 @@
     announceStatus('stale');
   }
 
+  function renderSlotChips(containerId, slots) {
+    const container = byId(containerId);
+    if (!container || typeof document?.createElement !== 'function') return;
+    if (typeof container.replaceChildren === 'function') {
+      container.replaceChildren();
+    }
+    if (!Array.isArray(slots) || slots.length === 0) return;
+    for (const slot of slots) {
+      if (!slot || typeof slot !== 'object') continue;
+      const chip = document.createElement('div');
+      const state = String(slot.state || 'DOWN').toUpperCase();
+      chip.className = `slot-chip slot-chip--${state.toLowerCase()}`;
+      const title = document.createElement('span');
+      title.className = 'slot-chip-id';
+      title.textContent = slot.slot_id || `slot-${slot.slot || '?'}`;
+      const meta = document.createElement('span');
+      meta.className = 'slot-chip-meta';
+      const parts = [state];
+      if (typeof slot.elapsed_minutes === 'number') {
+        parts.push(`${slot.elapsed_minutes}m`);
+      }
+      if (slot.repo_short) parts.push(slot.repo_short);
+      if (slot.phase_badge) parts.push(slot.phase_badge);
+      meta.textContent = parts.join(' · ');
+      chip.appendChild(title);
+      chip.appendChild(meta);
+      container.appendChild(chip);
+    }
+  }
+
+  function renderReconciliation(reconcile, snapshot) {
+    const data = reconcile || {};
+    const macFleet = snapshot.fleets?.mac?.fleet || {};
+    const linuxFleet = snapshot.fleets?.linux?.fleet || {};
+    const cmux = snapshot.cmux?.ok ? snapshot.cmux : null;
+    const occupied = isCount(data.active_job_slots_occupied)
+      ? data.active_job_slots_occupied
+      : (macFleet.executing || 0) + (linuxFleet.executing || 0) + (cmux?.executing || 0);
+    const idle = isCount(data.idle_slots)
+      ? data.idle_slots
+      : (macFleet.idle || 0) + (linuxFleet.idle || 0) + (cmux?.idle || 0);
+    const down = isCount(data.down_slots)
+      ? data.down_slots
+      : (macFleet.down || 0) + (linuxFleet.down || 0) + (cmux?.down || 0);
+    const parked = isCount(data.parked_slots)
+      ? data.parked_slots
+      : (snapshot.fleets?.mac?.parked_slots || 0) + (snapshot.fleets?.linux?.parked_slots || 0);
+    const cycling = isCount(data.cycling_slots)
+      ? data.cycling_slots
+      : (macFleet.cycling || 0) + (linuxFleet.cycling || 0) + (cmux?.cycling || 0);
+
+    setText('reconcile-runs', count(data.active_workflow_runs));
+    setText('reconcile-slots', count(occupied));
+    setText('reconcile-idle', count(idle));
+    setText('reconcile-unavailable', `${down}D / ${parked}P / ${cycling}C`);
+    setText('reconcile-fresh', count(data.fresh_queued_runs ?? snapshot.queue?.fresh));
+    setText('reconcile-ghosts', count(data.inert_ghosts ?? snapshot.queue?.ghosts));
+    setText(
+      'reconcile-summary',
+      data.explanation ||
+        `${occupied} occupied runner slots across configured pools (${down} down, ${parked} parked, ${cycling} cycling).`,
+    );
+  }
+
+  function renderCmux(cmux) {
+    const valid = cmux && cmux.ok === true;
+    const badge = byId('cmux-state-badge');
+    if (!valid) {
+      setText('cmux-state-badge', 'UNAVAILABLE');
+      if (badge) badge.dataset.state = 'stale';
+      setText('cmux-summary', 'cmux Cloud VM pool telemetry unavailable this snapshot.');
+      for (const metric of ['target', 'executing', 'idle', 'cycling', 'down']) {
+        setText(`cmux-${metric}`, '—');
+      }
+      renderSlotChips('cmux-slots', []);
+      return;
+    }
+    setText('cmux-state-badge', `${count(cmux.executing)}/${count(cmux.configured)} EXEC`);
+    if (badge) badge.dataset.state = cmux.down > 0 ? 'degraded' : 'live';
+    setText('cmux-target', count(cmux.configured));
+    setText('cmux-executing', count(cmux.executing));
+    setText('cmux-idle', count(cmux.idle));
+    setText('cmux-cycling', count(cmux.cycling));
+    setText('cmux-down', count(cmux.down));
+    const vms = Array.isArray(cmux.vms) ? cmux.vms : [];
+    setText(
+      'cmux-summary',
+      `${vms.length} active cmux Cloud VM(s) providing ${count(cmux.configured)} Linux X64 slots (${count(cmux.executing)} executing, ${count(cmux.cycling)} cycling).`,
+    );
+    const container = byId('cmux-slots');
+    if (!container || typeof document?.createElement !== 'function') return;
+    if (typeof container.replaceChildren === 'function') {
+      container.replaceChildren();
+    }
+    for (const vm of vms) {
+      if (!vm || typeof vm !== 'object') continue;
+      const card = document.createElement('div');
+      card.className = 'cmux-vm-card';
+      const head = document.createElement('p');
+      head.className = 'cmux-vm-title';
+      const diskTxt =
+        typeof vm.disk_free_gb === 'number'
+          ? ` · disk ${vm.disk_free_gb}G free (floor ${vm.disk_floor_gb ?? '?'}G)`
+          : '';
+      head.textContent = `${vm.vm_id || 'cmux-vm'} — ${count(vm.executing)}/${count(vm.configured)} exec${diskTxt}`;
+      card.appendChild(head);
+      const grid = document.createElement('div');
+      grid.className = 'slot-grid';
+      for (const slot of vm.slots || []) {
+        const chip = document.createElement('div');
+        const state = String(slot.state || 'DOWN').toUpperCase();
+        chip.className = `slot-chip slot-chip--${state.toLowerCase()}`;
+        const title = document.createElement('span');
+        title.className = 'slot-chip-id';
+        title.textContent = slot.slot_id || 'cmux-slot';
+        const meta = document.createElement('span');
+        meta.className = 'slot-chip-meta';
+        const parts = [state];
+        if (typeof slot.elapsed_minutes === 'number') parts.push(`${slot.elapsed_minutes}m`);
+        if (slot.repo_short) parts.push(slot.repo_short);
+        if (slot.phase_badge) parts.push(slot.phase_badge);
+        meta.textContent = parts.join(' · ');
+        chip.appendChild(title);
+        chip.appendChild(meta);
+        grid.appendChild(chip);
+      }
+      card.appendChild(grid);
+      container.appendChild(card);
+    }
+  }
+
+  function renderLatency(latency) {
+    const valid = latency && latency.ok === true;
+    const workflowsEl = byId('latency-workflows');
+    if (workflowsEl && typeof workflowsEl.replaceChildren === 'function') {
+      workflowsEl.replaceChildren();
+    }
+    if (!valid) {
+      setText('latency-summary', 'CI latency percentiles unavailable this snapshot.');
+      setText('latency-cancel-rate', 'CANCELLED: —');
+      for (const clock of ['queue', 'exec', 'e2e']) {
+        for (const stat of ['avg', 'p50', 'p90', 'p99']) {
+          setText(`latency-${clock}-${stat}`, '—');
+        }
+      }
+      return;
+    }
+
+    const overall = latency.overall || {};
+    const map = [
+      ['queue', overall.queue_wait || {}],
+      ['exec', overall.execution || {}],
+      ['e2e', overall.e2e || {}],
+    ];
+    for (const [prefix, block] of map) {
+      setText(`latency-${prefix}-avg`, formatDurationSeconds(block.avg_s));
+      setText(`latency-${prefix}-p50`, formatDurationSeconds(block.p50_s));
+      setText(`latency-${prefix}-p90`, formatDurationSeconds(block.p90_s));
+      setText(`latency-${prefix}-p99`, formatDurationSeconds(block.p99_s));
+    }
+
+    const cancel = latency.cancellation || {};
+    const cancelPct =
+      typeof cancel.cancelled_rate_pct === 'number'
+        ? `${cancel.cancelled_rate_pct}% (${count(cancel.cancelled_runs)}/${count(cancel.total_non_skipped_runs)})`
+        : '—';
+    setText('latency-cancel-rate', `CANCELLED: ${cancelPct}`);
+    setText(
+      'latency-summary',
+      `Recent completed non-skipped runs: Queue Wait p50 ${formatDurationSeconds(overall.queue_wait?.p50_s)} vs Job Exec p50 ${formatDurationSeconds(overall.execution?.p50_s)}.`,
+    );
+
+    if (!workflowsEl || typeof document?.createElement !== 'function') return;
+    for (const wf of latency.workflows || []) {
+      if (!wf || typeof wf.workflow !== 'string') continue;
+      const row = document.createElement('div');
+      row.className = 'latency-wf-row';
+      const name = document.createElement('span');
+      name.className = 'latency-wf-name';
+      name.textContent = wf.repo ? `${wf.repo} // ${wf.workflow}` : wf.workflow;
+      const metrics = document.createElement('span');
+      metrics.className = 'latency-wf-metrics';
+      metrics.textContent =
+        `Q p50 ${formatDurationSeconds(wf.queue_wait?.p50_s)} / p90 ${formatDurationSeconds(wf.queue_wait?.p90_s)} | ` +
+        `E avg ${formatDurationSeconds(wf.execution?.avg_s)} / p50 ${formatDurationSeconds(wf.execution?.p50_s)} / p90 ${formatDurationSeconds(wf.execution?.p90_s)} / p99 ${formatDurationSeconds(wf.execution?.p99_s)}`;
+      row.appendChild(name);
+      row.appendChild(metrics);
+      workflowsEl.appendChild(row);
+    }
+  }
+
   function render(snapshot, nowMs = Date.now()) {
     const status = classifySnapshot(snapshot, nowMs);
-    document.getElementById('status-banner').dataset.state = status.state;
+    const banner = byId('status-banner');
+    if (banner) banner.dataset.state = status.state;
     setText('status-kicker', status.kicker);
     setText('status-detail', status.detail);
     setText('last-observed', new Date(snapshot.observed_at).toLocaleString());
@@ -260,9 +490,32 @@
       ]) {
         setText(`${fleetName}-${metric}`, count(fleet[metric]));
       }
+      if (fleetName === 'mac') {
+        setText('mac-parked', count(host.parked_slots ?? 0));
+      }
+      const badge = byId(`${fleetName}-state-badge`);
+      if (host.parked === true) {
+        setText(`${fleetName}-state-badge`, 'PARKED');
+        if (badge) badge.dataset.state = 'parked';
+      } else if (fleet.down > 0) {
+        setText(`${fleetName}-state-badge`, `${fleet.down} DOWN`);
+        if (badge) badge.dataset.state = 'critical';
+      } else {
+        setText(`${fleetName}-state-badge`, 'ONLINE');
+        if (badge) badge.dataset.state = 'live';
+      }
       setText(
         `${fleetName}-disk`,
         String(host.disk?.status || 'unknown').toUpperCase(),
+      );
+      const freeText =
+        typeof host.disk_free_gb === 'number'
+          ? `${host.disk_free_gb}G free (floor ${host.disk_floor_gb ?? '?'}G)`
+          : '—';
+      const pauseText = host.pause_reason || host.parked_reason || null;
+      setText(
+        `${fleetName}-pause-reason`,
+        pauseText ? `${freeText} · ${pauseText}` : freeText,
       );
       setText(
         `${fleetName}-watchdog`,
@@ -273,6 +526,7 @@
         `${fleetName}-source`,
         snapshot.sources?.[sourceKey]?.ok === true ? 'VERIFIED' : 'UNKNOWN',
       );
+      renderSlotChips(`${fleetName}-slots`, host.slots || []);
     }
     setText(
       'watchdog-trip',
@@ -280,6 +534,9 @@
         snapshot.fleets?.linux?.watchdog?.restart_after,
       )}`,
     );
+    renderReconciliation(snapshot.reconciliation, snapshot);
+    renderCmux(snapshot.cmux);
+    renderLatency(snapshot.latency);
     renderQueue(snapshot.queue);
   }
 
@@ -288,16 +545,6 @@
   // GitHub refuses to transition -- they can never start. They are shown, greyed,
   // and explicitly excluded from the number that reads as backlog.
   function renderQueue(queue) {
-    // Defensive: the published page always has these nodes, but keeping DOM access
-    // optional means the queue block can never throw and blank out the capacity view
-    // (and keeps the renderer usable against minimal DOM stubs in tests).
-    const byId = (id) => {
-      try {
-        return document.getElementById(id) || null;
-      } catch (_error) {
-        return null;
-      }
-    };
     const repos = byId('queue-repos');
     if (repos && typeof repos.replaceChildren === 'function') {
       repos.replaceChildren();

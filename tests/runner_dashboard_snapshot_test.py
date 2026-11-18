@@ -170,6 +170,132 @@ class SnapshotTest(unittest.TestCase):
             subprocess.run(args, check=True)
             self.assertEqual(json.loads(output.read_text())["schema_version"], 1)
 
+    def test_parked_mac_and_multi_host_slots_and_redaction(self):
+        mac = host_payload("mac", 4)
+        mac["fleet"].update(executing=0, idle=0, cycling=0, down=0, reserved=0)
+        mac["parked"] = True
+        mac["parked_slots"] = 4
+        mac["parked_reason"] = "operator_disabled"
+        mac["disk"] = {"status": "healthy", "free_gb": 29.0, "floor_gb": 30}
+        mac["slots"] = [
+            {
+                "slot_id": f"mac-{i}",
+                "slot": i,
+                "state": "PARKED",
+                "elapsed_minutes": None,
+                "branch": "secret-branch-must-redact",
+                "pr_title": "secret-pr-title",
+                "actor": "secret-actor",
+                "token": "ghp_secret",
+            }
+            for i in range(1, 5)
+        ]
+
+        linux = host_payload("linux", 20)
+        linux["disk"] = {"status": "critical", "free_gb": 25.0, "floor_gb": 30}
+        linux["pause_reason"] = "disk_floor_paused"
+        linux["fleet"].update(executing=13, idle=0, cycling=0, down=7, reserved=20)
+        linux["slots"] = [
+            {
+                "slot_id": f"linux-{i}",
+                "slot": i,
+                "state": "EXECUTING" if i <= 13 else "DOWN",
+                "elapsed_minutes": 12.5 if i <= 13 else None,
+                "repo_short": "worldarchitect.ai" if i <= 13 else None,
+                "workflow_category": "tests" if i <= 13 else None,
+                "phase_badge": "pytest" if i <= 13 else "disk_floor_paused",
+                "head_branch": "private-branch-xyz",
+            }
+            for i in range(1, 21)
+        ]
+
+        cmux_payload = {
+            "ok": True,
+            "configured": 25,
+            "executing": 21,
+            "idle": 0,
+            "cycling": 4,
+            "down": 0,
+            "vms": [
+                {
+                    "vm_id": "cmux-dreamy",
+                    "configured": 3,
+                    "executing": 2,
+                    "idle": 0,
+                    "cycling": 1,
+                    "down": 0,
+                    "disk_free_gb": 12.0,
+                    "disk_floor_gb": 10,
+                    "slots": [
+                        {"slot_id": "cmux-dreamy-1", "state": "CYCLING", "phase_badge": "respawning"},
+                        {"slot_id": "cmux-dreamy-2", "state": "EXECUTING", "elapsed_minutes": 28.0, "repo_short": "worldai_frontend", "phase_badge": "jest"},
+                        {"slot_id": "cmux-dreamy-3", "state": "EXECUTING", "elapsed_minutes": 12.2, "repo_short": "worldai_frontend", "phase_badge": "jest"},
+                    ],
+                }
+            ],
+        }
+        latency_payload = {
+            "ok": True,
+            "generated_at": "2026-11-18T09:11:59Z",
+            "overall": {
+                "queue_wait": {"n": 186, "avg_s": 416.0, "p50_s": 339.5, "p90_s": 874.5, "p99_s": 1502.4, "max_s": 1562.0},
+                "execution": {"n": 186, "avg_s": 197.0, "p50_s": 47.0, "p90_s": 505.0, "p99_s": 1849.7, "max_s": 2078.0},
+                "e2e": {"n": 174, "avg_s": 697.0, "p50_s": 453.0, "p90_s": 1561.2, "p99_s": 4198.2, "max_s": 6792.0},
+            },
+            "cancellation": {"cancelled_runs": 183, "total_non_skipped_runs": 381, "cancelled_rate_pct": 48.0},
+            "workflows": [
+                {
+                    "workflow": "Self-Hosted MVP Shards",
+                    "queue_wait": {"n": 32, "avg_s": 339.0, "p50_s": 323.0, "p90_s": 637.0, "p99_s": 900.0},
+                    "execution": {"n": 32, "avg_s": 413.0, "p50_s": 32.5, "p90_s": 1639.0, "p99_s": 2050.0},
+                    "e2e": {"n": 32, "avg_s": 752.0, "p50_s": 500.0, "p90_s": 1900.0, "p99_s": 2500.0},
+                }
+            ],
+            "head_branch": "secret-latency-branch",
+        }
+        queue_payload = {
+            "ok": True,
+            "fresh": 50,
+            "ghosts": 149,
+            "oldest_fresh_wait_minutes": 42,
+            "in_progress_runs": 15,
+            "repos": [{"repo": "jleechanorg/worldarchitect.ai", "fresh": 50, "ghosts": 149}],
+        }
+
+        snapshot = MODULE.build_snapshot(
+            mac_payload=mac,
+            linux_payload=linux,
+            observed_at="2026-11-18T09:15:00Z",
+            published_at="2026-11-18T09:15:05Z",
+            queue_payload=queue_payload,
+            cmux_payload=cmux_payload,
+            latency_payload=latency_payload,
+        )
+        self.assertTrue(snapshot["sources"]["mac_host"]["ok"])
+        self.assertTrue(snapshot["sources"]["linux_host"]["ok"])
+        self.assertTrue(snapshot["fleets"]["mac"]["parked"])
+        self.assertEqual(snapshot["fleets"]["mac"]["parked_slots"], 4)
+        self.assertEqual(snapshot["fleets"]["linux"]["pause_reason"], "disk_floor_paused")
+        self.assertEqual(len(snapshot["fleets"]["linux"]["slots"]), 20)
+        self.assertEqual(snapshot["cmux"]["configured"], 25)
+        self.assertTrue(snapshot["latency"]["ok"])
+        self.assertEqual(snapshot["latency"]["overall"]["queue_wait"]["p50_s"], 339.5)
+        self.assertEqual(snapshot["reconciliation"]["active_job_slots_occupied"], 34)
+        self.assertEqual(snapshot["reconciliation"]["parked_slots"], 4)
+        self.assertEqual(snapshot["reconciliation"]["down_slots"], 7)
+        self.assertEqual(snapshot["reconciliation"]["active_workflow_runs"], 15)
+
+        serialized = json.dumps(snapshot)
+        for secret in (
+            "secret-branch-must-redact",
+            "secret-pr-title",
+            "secret-actor",
+            "ghp_secret",
+            "private-branch-xyz",
+            "secret-latency-branch",
+        ):
+            self.assertNotIn(secret, serialized)
+
 
 if __name__ == "__main__":
     unittest.main()

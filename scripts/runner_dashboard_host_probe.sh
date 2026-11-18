@@ -4,6 +4,7 @@ set -uo pipefail
 
 HOST_CLASS=""
 SERVICE_STATE_ONLY=false
+FORCE_PARKED=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host-class)
@@ -14,8 +15,12 @@ while [[ $# -gt 0 ]]; do
       SERVICE_STATE_ONLY=true
       shift
       ;;
+    --parked)
+      FORCE_PARKED=true
+      shift
+      ;;
     -h|--help)
-      echo "usage: $0 --host-class mac|linux | --service-state"
+      echo "usage: $0 --host-class mac|linux [--parked] | --service-state"
       exit 0
       ;;
     *)
@@ -186,6 +191,17 @@ if [[ "$(printf '%s\n' "$config_output" | awk 'NF { count++ } END { print count 
   CONFIG_OK=true
 fi
 
+PARKED=false
+PARKED_REASON=""
+PARKED_SLOTS=0
+if [[ "$FORCE_PARKED" == true ]]; then
+  PARKED=true
+elif [[ "$HOST_CLASS" == "mac" && "${MAC_RUNNER_DISABLED:-0}" == "1" ]]; then
+  PARKED=true
+elif [[ "$HOST_CLASS" == "linux" && "${REMOTE_LINUX_DISABLED:-0}" == "1" ]]; then
+  PARKED=true
+fi
+
 SERVICE_OK=false
 [[ "$(probe_service_state)" == "active" ]] && SERVICE_OK=true
 
@@ -196,7 +212,67 @@ IDLE=""
 CYCLING=""
 DOWN=""
 RESERVED=""
-if [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+SLOTS_META=""
+
+slot_phase_and_elapsed() {
+  local name="$1" state="$2" detail_table=""
+  if [[ "$state" != "EXECUTING" ]]; then
+    printf '\t\n'
+    return 0
+  fi
+  detail_table="$(docker top "$name" -eo pid,etimes,comm,args 2>/dev/null || true)"
+  python3 - "$detail_table" <<'PY'
+import re
+import sys
+
+table = sys.argv[1]
+elapsed_s = None
+phase = ""
+phase_rules = (
+    ("playwright", r"playwright"),
+    ("jest", r"\bjest\b"),
+    ("pytest", r"\bpytest\b"),
+    ("git index-pack", r"git\s+index-pack"),
+    ("git fetch", r"git\b.*\bfetch\b"),
+    ("gh api tarball", r"gh\s+api.*tarball"),
+    ("npm ci", r"\bnpm\s+ci\b"),
+    ("pip", r"\bpip3?\s+install\b"),
+    ("cargo", r"\bcargo\b"),
+    ("gcloud", r"\bgcloud\b"),
+    ("mypy", r"\bmypy\b"),
+    ("setup-python", r"setup-python"),
+)
+for line in table.splitlines()[1:]:
+    parts = line.strip().split(None, 3)
+    if len(parts) < 3:
+        continue
+    if "Runner.Worker" in line and parts[1].isdigit():
+        elapsed_s = int(parts[1])
+    rest = parts[3] if len(parts) == 4 else parts[2]
+    for label, pat in phase_rules:
+        if re.search(pat, rest, re.IGNORECASE):
+            phase = label
+            break
+elapsed_min = round(elapsed_s / 60.0, 1) if elapsed_s is not None else ""
+print(f"{elapsed_min}\t{phase}")
+PY
+}
+
+if [[ "$PARKED" == true && "$CONFIG_OK" == true ]]; then
+  PARKED_REASON="operator_disabled"
+  PARKED_SLOTS="$TARGET"
+  SERVICE_OK=true
+  DOCKER_OK=true
+  PROCESS_OK=true
+  EXECUTING=0
+  IDLE=0
+  CYCLING=0
+  DOWN=0
+  RESERVED=0
+  for ((slot=1; slot<=TARGET; slot++)); do
+    SLOTS_META+="${slot}|PARKED||operator_disabled"$'\n'
+  done
+elif [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   DOCKER_OK=true
   PROCESS_OK=true
   EXECUTING=0
@@ -207,37 +283,64 @@ if [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker inf
   [[ "$RESERVED" =~ ^[0-9]+$ ]] || RESERVED=""
 
   down_candidates=()
+  declare -a slot_states=()
+  declare -a slot_elapsed=()
+  declare -a slot_phase=()
   for ((slot=1; slot<=TARGET; slot++)); do
     name="${PREFIX}-${slot}"
     if ! state="$(classify_slot "$name")"; then
       PROCESS_OK=false
       break
     fi
+    slot_states[$slot]="$state"
+    slot_elapsed[$slot]=""
+    slot_phase[$slot]=""
     case "$state" in
-      EXECUTING) EXECUTING=$((EXECUTING + 1)) ;;
+      EXECUTING)
+        EXECUTING=$((EXECUTING + 1))
+        meta="$(slot_phase_and_elapsed "$name" "EXECUTING" 2>/dev/null || true)"
+        slot_elapsed[$slot]="${meta%%$'\t'*}"
+        slot_phase[$slot]="${meta#*$'\t'}"
+        ;;
       IDLE) IDLE=$((IDLE + 1)) ;;
-      DOWN) down_candidates+=("$name") ;;
+      DOWN) down_candidates+=("$slot:$name") ;;
     esac
   done
 
   if [[ "$PROCESS_OK" == true && "${#down_candidates[@]}" -gt 0 ]]; then
     sleep "$DOWN_WAIT_SECONDS"
-    for name in "${down_candidates[@]}"; do
+    for entry in "${down_candidates[@]}"; do
+      slot="${entry%%:*}"
+      name="${entry#*:}"
       if ! state="$(classify_slot "$name")"; then
         PROCESS_OK=false
         break
       fi
+      slot_states[$slot]="$state"
       case "$state" in
-        EXECUTING) EXECUTING=$((EXECUTING + 1)) ;;
+        EXECUTING)
+          EXECUTING=$((EXECUTING + 1))
+          meta="$(slot_phase_and_elapsed "$name" "EXECUTING" 2>/dev/null || true)"
+          slot_elapsed[$slot]="${meta%%$'\t'*}"
+          slot_phase[$slot]="${meta#*$'\t'}"
+          ;;
         IDLE) IDLE=$((IDLE + 1)) ;;
         DOWN)
           if recent_respawn_evidence "$name"; then
             CYCLING=$((CYCLING + 1))
+            slot_states[$slot]="CYCLING"
+            slot_phase[$slot]="respawning"
           else
             DOWN=$((DOWN + 1))
           fi
           ;;
       esac
+    done
+  fi
+
+  if [[ "$PROCESS_OK" == true ]]; then
+    for ((slot=1; slot<=TARGET; slot++)); do
+      SLOTS_META+="${slot}|${slot_states[$slot]}|${slot_elapsed[$slot]}|${slot_phase[$slot]}"$'\n'
     done
   fi
 fi
@@ -247,10 +350,12 @@ if [[ "$PROCESS_OK" != true ]]; then
   IDLE=""
   CYCLING=""
   DOWN=""
+  SLOTS_META=""
 fi
 
 DISK_OK=false
 DISK_STATUS="unknown"
+DISK_FREE_GB=""
 if [[ "$CONFIG_OK" == true ]]; then
   DISK_OUTPUT=""
   HOST_DISK_OUTPUT=""
@@ -268,7 +373,7 @@ if [[ "$CONFIG_OK" == true ]]; then
     # not gate admission and this dashboard does not need to mirror.
   fi
   DAEMON_DISK_CONTAINER=""
-  if [[ "$DOCKER_OK" == true ]]; then
+  if [[ "$DOCKER_OK" == true && "$PARKED" != true ]]; then
     for ((slot=1; slot<=TARGET; slot++)); do
       candidate="${PREFIX}-${slot}"
       if [[ "$(docker inspect -f '{{.State.Running}}' "$candidate" 2>/dev/null || true)" == "true" ]]; then
@@ -290,13 +395,31 @@ if [[ "$CONFIG_OK" == true ]]; then
   fi
   if [[ "$DAEMON_FREE_KB" =~ ^[0-9]+$ && "$HOST_FREE_KB" =~ ^[0-9]+$ ]]; then
     DISK_OK=true
+    MIN_FREE_KB="$DAEMON_FREE_KB"
+    (( HOST_FREE_KB < MIN_FREE_KB )) && MIN_FREE_KB="$HOST_FREE_KB"
+    DISK_FREE_GB="$(awk -v kb="$MIN_FREE_KB" 'BEGIN { printf "%.1f", kb / 1048576 }')"
     if (( DAEMON_FREE_KB >= DISK_FLOOR_GB * 1024 * 1024 &&
       HOST_FREE_KB >= HOST_DISK_FLOOR_GB * 1024 * 1024 )); then
       DISK_STATUS="healthy"
     else
       DISK_STATUS="critical"
     fi
+  elif [[ "$PARKED" == true && "$HOST_FREE_KB" =~ ^[0-9]+$ ]]; then
+    DISK_OK=true
+    DISK_FREE_GB="$(awk -v kb="$HOST_FREE_KB" 'BEGIN { printf "%.1f", kb / 1048576 }')"
+    if (( HOST_FREE_KB >= HOST_DISK_FLOOR_GB * 1024 * 1024 )); then
+      DISK_STATUS="healthy"
+    else
+      DISK_STATUS="critical"
+    fi
   fi
+fi
+
+PAUSE_REASON=""
+if [[ "$PARKED" == true ]]; then
+  PAUSE_REASON="operator_disabled"
+elif [[ "$DISK_STATUS" == "critical" && "${DOWN:-0}" =~ ^[0-9]+$ && "${DOWN:-0}" -gt 0 ]]; then
+  PAUSE_REASON="disk_floor_paused"
 fi
 
 WATCHDOG_OK=false
@@ -323,6 +446,9 @@ fi
 
 HOST_CLASS="$HOST_CLASS" TARGET="$TARGET" EXECUTING="$EXECUTING" IDLE="$IDLE" \
 CYCLING="$CYCLING" DOWN="$DOWN" RESERVED="$RESERVED" DISK_STATUS="$DISK_STATUS" \
+DISK_FREE_GB="$DISK_FREE_GB" DISK_FLOOR_GB="$DISK_FLOOR_GB" \
+PARKED="$PARKED" PARKED_SLOTS="$PARKED_SLOTS" PARKED_REASON="$PARKED_REASON" \
+PAUSE_REASON="$PAUSE_REASON" SLOTS_META="$SLOTS_META" \
 WATCHDOG_MISSES="$WATCHDOG_MISSES" WATCHDOG_THRESHOLD="$WATCHDOG_THRESHOLD" \
 CONFIG_OK="$CONFIG_OK" SERVICE_OK="$SERVICE_OK" \
 DOCKER_OK="$DOCKER_OK" PROCESS_OK="$PROCESS_OK" DISK_OK="$DISK_OK" WATCHDOG_OK="$WATCHDOG_OK" \
@@ -334,9 +460,44 @@ def count(name):
     value = os.environ.get(name, "")
     return int(value) if value.isdigit() else None
 
+def opt_float(name):
+    value = os.environ.get(name, "")
+    try:
+        return float(value) if value else None
+    except ValueError:
+        return None
+
+host_class = os.environ["HOST_CLASS"]
+pause_reason = os.environ.get("PAUSE_REASON") or None
+slots = []
+for raw in os.environ.get("SLOTS_META", "").splitlines():
+    if not raw.strip():
+        continue
+    parts = raw.split("|")
+    if len(parts) < 4:
+        continue
+    slot_num = int(parts[0])
+    state = parts[1]
+    elapsed = float(parts[2]) if parts[2] else None
+    phase = parts[3] or ("disk_floor_paused" if state == "DOWN" and pause_reason == "disk_floor_paused" else None)
+    slots.append({
+        "slot_id": f"{host_class}-{slot_num}",
+        "slot": slot_num,
+        "state": state,
+        "elapsed_minutes": elapsed,
+        "phase_badge": phase,
+    })
+
+free_gb = opt_float("DISK_FREE_GB")
+floor_gb = count("DISK_FLOOR_GB")
+
 payload = {
     "schema_version": 1,
-    "host_class": os.environ["HOST_CLASS"],
+    "host_class": host_class,
+    "parked": os.environ["PARKED"] == "true",
+    "parked_slots": count("PARKED_SLOTS") or 0,
+    "parked_reason": os.environ.get("PARKED_REASON") or None,
+    "pause_reason": pause_reason,
     "sources": {
         "config": {"ok": os.environ["CONFIG_OK"] == "true"},
         "service": {"ok": os.environ["SERVICE_OK"] == "true"},
@@ -354,10 +515,13 @@ payload = {
         "reserved": count("RESERVED"),
     },
     "disk": {"status": os.environ["DISK_STATUS"]},
+    "disk_free_gb": free_gb,
+    "disk_floor_gb": floor_gb,
     "watchdog": {
         "consecutive_misses": count("WATCHDOG_MISSES"),
         "restart_after": count("WATCHDOG_THRESHOLD"),
     },
+    "slots": slots,
 }
 print(json.dumps(payload, sort_keys=True))
 PY
