@@ -383,6 +383,13 @@ pub struct RunnerConfig {
     /// correctness-required dependency. Default `None`.
     #[serde(default)]
     pub pip_cache_host_path: Option<std::path::PathBuf>,
+    /// Optional host-side directory of read-only bare git mirror generations,
+    /// bind-mounted read-only into each container at `/opt/ezgha-git-mirrors`
+    /// with `EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors` so the container git
+    /// wrapper can hydrate checkouts from local objects. Fail-open: missing
+    /// directory is silently skipped. Default `None`.
+    #[serde(default)]
+    pub git_mirror_host_path: Option<std::path::PathBuf>,
     /// Host-side parent directory for per-runner job workspaces
     /// (`{workspace_host_path}/{runner_name}`), bind-mounted read-write into
     /// each container at `/home/runner/_work` -- the actions/runner default
@@ -674,6 +681,7 @@ impl Config {
                 runner_floor_mb: default_runner_floor_mb(),
                 wheelhouse_host_path: None,
                 pip_cache_host_path: None,
+                git_mirror_host_path: None,
                 workspace_host_path: None,
             },
             limits: Limits {
@@ -1167,6 +1175,51 @@ minimum_isolation = "container"
     }
 
     #[test]
+    fn config_parses_git_mirror_host_path() {
+        let with_path = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "ezgha-runner:latest"
+git_mirror_host_path = "/tmp/mirrors"
+[limits]
+memory_mb = 4096
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let parsed: Config = toml::from_str(with_path).expect("config with git_mirror_host_path parses");
+        assert_eq!(
+            parsed.runner.git_mirror_host_path,
+            Some(std::path::PathBuf::from("/tmp/mirrors"))
+        );
+
+        let without_path = r#"
+version = 1
+[github]
+scope = "org"
+target = "jleechanorg"
+[runner]
+labels = ["self-hosted"]
+count = 1
+image = "ezgha-runner:latest"
+[limits]
+memory_mb = 4096
+cpus = 2.0
+pids = 512
+[policy]
+minimum_isolation = "container"
+"#;
+        let omitted: Config = toml::from_str(without_path).expect("config without git_mirror_host_path parses");
+        assert_eq!(omitted.runner.git_mirror_host_path, None);
+    }
+
+    #[test]
     fn serve_tick_honors_configured_value_and_clamps_floor() {
         let mut cfg_runner = RunnerConfig {
             labels: vec!["self-hosted".into()],
@@ -1180,6 +1233,7 @@ minimum_isolation = "container"
             runner_floor_mb: default_runner_floor_mb(),
             wheelhouse_host_path: None,
             pip_cache_host_path: None,
+            git_mirror_host_path: None,
             workspace_host_path: None,
         };
         assert_eq!(cfg_runner.serve_tick(), std::time::Duration::from_secs(20));
