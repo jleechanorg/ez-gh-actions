@@ -83,6 +83,85 @@ RESERVED_TF_OP="$(canonical_path "/Users/jleechan/actions-runner")"
 RESERVED_SMTP_OP="$(canonical_path "/Users/jleechan/actions-runner-smtp-egress")"
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
+STATE_LOCK_TIMEOUT_SEC="${SETUP_LOCK_TIMEOUT_SEC:-30}"
+SETUP_LOCK_DIR=""
+STAGE_DIR=""
+TMP_TGZ=""
+BACKUP_DIR=""
+CANDIDATE_PLIST=""
+
+release_setup_lock() {
+  if [ -n "${SETUP_LOCK_DIR:-}" ] && [ -d "$SETUP_LOCK_DIR" ]; then
+    local rel_dir="${SETUP_LOCK_DIR}.release.$$"
+    if mv "$SETUP_LOCK_DIR" "$rel_dir" 2>/dev/null; then
+      rm -rf "$rel_dir" 2>/dev/null || true
+    else
+      rm -f "${SETUP_LOCK_DIR}/pid" 2>/dev/null || true
+      rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
+    fi
+    SETUP_LOCK_DIR=""
+  fi
+}
+
+cleanup_setup() {
+  [ -z "${STAGE_DIR:-}" ] || rm -rf "$STAGE_DIR"
+  [ -z "${TMP_TGZ:-}" ] || rm -f "$TMP_TGZ"
+  [ -z "${CANDIDATE_PLIST:-}" ] || rm -f "$CANDIDATE_PLIST"
+  release_setup_lock
+}
+trap cleanup_setup EXIT
+
+acquire_setup_lock() {
+  local state_dir="${HOME}/.local/state/ezgha"
+  local safe_label lockdir pidfile deadline
+  local owner_pid="" owner_pid2="" missing_pid_polls=0
+  safe_label="$(printf '%s' "$PLIST_LABEL" | tr -cd 'A-Za-z0-9_.-')"
+  lockdir="${state_dir}/setup-native-macos-runner.${safe_label}.lock"
+  pidfile="${lockdir}/pid"
+  deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
+  mkdir -p "$state_dir"
+  while true; do
+    if mkdir "$lockdir" 2>/dev/null; then
+      printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
+      SETUP_LOCK_DIR="$lockdir"
+      return 0
+    fi
+    if [ -f "$pidfile" ]; then
+      owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+        missing_pid_polls=0
+        if ! kill -0 "$owner_pid" 2>/dev/null; then
+          owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+          if [ "$owner_pid2" = "$owner_pid" ] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
+            rm -rf "${lockdir}.reclaim.$$"
+          fi
+          continue
+        fi
+      else
+        missing_pid_polls=$((missing_pid_polls + 1))
+      fi
+    else
+      missing_pid_polls=$((missing_pid_polls + 1))
+    fi
+    if [ "$missing_pid_polls" -ge 10 ]; then
+      owner_pid2=""
+      if [ -f "$pidfile" ]; then
+        owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      fi
+      if ! [[ "$owner_pid2" =~ ^[0-9]+$ ]] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
+        rm -rf "${lockdir}.reclaim.$$"
+        missing_pid_polls=0
+        continue
+      fi
+      missing_pid_polls=0
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "ERROR: timed out waiting for setup lock $lockdir" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
 
 stop_launchagent() {
   local uid gui_target
@@ -108,6 +187,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     echo "[dry-run] would unload and remove $PLIST_PATH"
     exit 0
   fi
+  acquire_setup_lock || exit 1
   if ! stop_launchagent; then
     echo "ERROR: launchd job ${PLIST_LABEL} is still loaded; retaining ${PLIST_PATH}" >&2
     exit 1
@@ -124,9 +204,10 @@ fi
 # Fail-closed guard: never touch $HOME, /, or TestFlight/SMTP-egress runner directories (including case-insensitive APFS aliases and parents).
 is_reserved_runner_dir() {
   local target="$1"
+  shift
   [ -n "$target" ] || return 0
   [ "$target" != "/" ] || return 0
-  python3 - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" <<'PY'
+  python3 - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" "$@" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -288,8 +369,8 @@ resolve_work_dir() {
 }
 
 WORK_DIR="$(resolve_work_dir)" || exit 1
-if is_reserved_runner_dir "$WORK_DIR"; then
-  echo "ERROR: refusing unsafe or reserved work dir: '$WORK_DIR'" >&2
+if is_reserved_runner_dir "$WORK_DIR" "$RUNNER_DIR"; then
+  echo "ERROR: refusing unsafe, reserved, or overlapping work dir: '$WORK_DIR' (runner dir: '$RUNNER_DIR')" >&2
   exit 2
 fi
 
@@ -402,6 +483,9 @@ expected_runs = {
 if not isinstance(prog, list) or len(prog) < 2 or prog[0] != "/bin/bash" or not isinstance(prog[1], str) or os.path.realpath(prog[1]) not in expected_runs:
     print(f"FAIL: {plist_path} ProgramArguments={prog!r} must target ['/bin/bash', '{runner_dir}/run.sh'] or ['/bin/bash', '{runner_dir}/runsvc.sh']", file=sys.stderr)
     sys.exit(1)
+if not os.path.isfile(prog[1]) or not os.access(prog[1], os.R_OK):
+    print(f"FAIL: {plist_path} ProgramArguments script missing or unreadable: {prog[1]}", file=sys.stderr)
+    sys.exit(1)
 PY
   actual_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner")"
   actual_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner")"
@@ -454,18 +538,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   exit 0
 fi
 
+acquire_setup_lock || exit 1
 mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
-
-STAGE_DIR=""
-TMP_TGZ=""
-BACKUP_DIR=""
-CANDIDATE_PLIST=""
-cleanup_setup() {
-  [ -z "$STAGE_DIR" ] || rm -rf "$STAGE_DIR"
-  [ -z "$TMP_TGZ" ] || rm -f "$TMP_TGZ"
-  [ -z "$CANDIDATE_PLIST" ] || rm -f "$CANDIDATE_PLIST"
-}
-trap cleanup_setup EXIT
 
 if ! runner_binaries_ready "$RUNNER_DIR"; then
   STAGE_DIR="$(mktemp -d "${RUNNER_DIR}.stage.XXXXXX")"
@@ -533,13 +607,13 @@ if [ "$needs_config" -eq 1 ]; then
   BACKUP_DIR="${RUNNER_DIR}/.backup-pre-reconfigure.$$"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
-  for f in .runner .credentials .credentials_rsaparams .ezgha-labels; do
+  for f in .runner .credentials .credentials_rsaparams .runner_migrated .credentials_migrated .ezgha-labels; do
     if [ -f "${RUNNER_DIR}/${f}" ]; then
       cp -p "${RUNNER_DIR}/${f}" "${BACKUP_DIR}/${f}"
     fi
   done
 
-  rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams"
+  rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams" "${RUNNER_DIR}/.runner_migrated" "${RUNNER_DIR}/.credentials_migrated"
   config_rc=0
   (
     cd "$RUNNER_DIR"
@@ -554,7 +628,7 @@ if [ "$needs_config" -eq 1 ]; then
   ) || config_rc=$?
 
   if [ "$config_rc" -ne 0 ]; then
-    rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams"
+    rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams" "${RUNNER_DIR}/.runner_migrated" "${RUNNER_DIR}/.credentials_migrated"
     echo "ERROR: config.sh failed (rc=${config_rc}); service ${PLIST_LABEL} remains stopped and old credentials were not restored. Backup preserved at ${BACKUP_DIR}; re-run --reconfigure after resolving the registration failure." >&2
     exit 4
   fi

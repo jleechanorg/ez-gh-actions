@@ -22,7 +22,7 @@
 #     10,400/hr App installation quota). Prioritizes org repos by `pushed`
 #     without excluding stale-push repos, includes `in_progress` and recently
 #     updated runs across `>= YESTERDAY_UTC`, paginates `/jobs?filter=all&per_page=100`
-#     within budget, prices `macos-*`, `ubuntu-*`, and `windows-*` gross-only
+#     within budget, prices standard macos/ubuntu/windows runners gross-only
 #     (`net_usd=null`, `mtd_gross=null`, `mtd_net=null`), fires `ERROR COST_SPIKE`
 #     immediately on observed spikes, marks `app_token_fallback_partial` on any
 #     scan/pricing gap, and NEVER resets `api_failures` (only full authoritative
@@ -267,6 +267,8 @@ fi
 
 tmp="$(mktemp)"
 STATE_LOCK_DIR=""
+STATE_STAGE_TMP=""
+STATE_NEXT_TMP=""
 release_state_lock() {
   if [ -n "${STATE_LOCK_DIR:-}" ] && [ -d "$STATE_LOCK_DIR" ]; then
     local rel_dir="${STATE_LOCK_DIR}.release.$$"
@@ -280,7 +282,9 @@ release_state_lock() {
   fi
 }
 cleanup() {
-  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.state" "$tmp.snapshot" "$tmp.next" "$tmp.repos" "$tmp.runs" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"
+  [ -z "${STATE_STAGE_TMP:-}" ] || rm -f "$STATE_STAGE_TMP"
+  [ -z "${STATE_NEXT_TMP:-}" ] || rm -f "$STATE_NEXT_TMP"
+  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.snapshot" "$tmp.repos" "$tmp.runs" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"
   release_state_lock
 }
 trap cleanup EXIT
@@ -341,15 +345,20 @@ if [ "$DRY_RUN" -eq 1 ]; then
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$tmp.snapshot"
   fi
   STATE_FILE="$tmp.snapshot"
+  STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
+  STATE_NEXT_TMP="${STATE_FILE}.next.$$"
 else
   acquire_state_lock || exit 4
+  STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
+  STATE_NEXT_TMP="${STATE_FILE}.next.$$"
   if [ ! -f "$STATE_FILE" ]; then
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_FILE"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
+    mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
   jq --argjson cutoff "$((NOW - 3024000))" \
     '.sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
-    "$STATE_FILE" > "$tmp.next"
-  mv "$tmp.next" "$STATE_FILE"
+    "$STATE_FILE" > "$STATE_NEXT_TMP"
+  mv -f "$STATE_NEXT_TMP" "$STATE_FILE"
 fi
 
 FAILURES_NOW=0
@@ -363,8 +372,8 @@ increment_api_failure() {
   failures="$(jq -r '.api_failures // 0' "$STATE_FILE")"
   failures=$((failures + 1))
   last_blind="$(jq -r '.last_blind // 0' "$STATE_FILE")"
-  jq --argjson failures "$failures" '.api_failures = $failures' "$STATE_FILE" > "$tmp.state"
-  mv "$tmp.state" "$STATE_FILE"
+  jq --argjson failures "$failures" '.api_failures = $failures' "$STATE_FILE" > "$STATE_STAGE_TMP"
+  mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   FAILURES_NOW="$failures"
   BLIND_DUE=0
   if [ "$failures" -ge "$MAX_API_FAILURES" ] && [ $((NOW - last_blind)) -ge "$COOLDOWN_SEC" ]; then
@@ -378,8 +387,8 @@ emit_blind_if_due() {
     emit WARNING BLIND "$TODAY_UTC" \
       "GitHub Actions cost monitor cannot query authoritative billing usage for $ALERT_ORG after $FAILURES_NOW consecutive failures ($reason)" \
       0 null 0 "" "$mode" null null
-    jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$tmp.state"
-    mv "$tmp.state" "$STATE_FILE"
+    jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
+    mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
   echo "[$NOW_ISO] WARN: $reason ($FAILURES_NOW consecutive); authoritative billing state unverified" >&2
 }
@@ -471,18 +480,18 @@ run_app_token_fallback() {
               (((.completed_at // $now_iso) | fromdateiso8601) - (.started_at | fromdateiso8601)) as $secs
               | if $secs > 0 then (($secs / 60) | ceil) else 0 end
             end;
-          def is_hosted_macos:
-            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
-          def is_hosted_ubuntu:
-            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("ubuntu-"));
-          def is_hosted_windows:
-            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("windows-"));
+          def is_standard_macos:
+            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
+          def is_standard_ubuntu:
+            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^ubuntu-(latest|[0-9]{2}\\.[0-9]{2})(-arm)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core|-arm$)")) | not));
+          def is_standard_windows:
+            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^windows-(latest|[0-9]{4})$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           (.jobs // [])[] | . as $j | job_mins as $m |
           (((.started_at // $run_day) | tostring)[:10]) as $jday |
           select($jday == $yesterday or $jday == $today) |
-          (if ($j | is_hosted_macos) then {macos_min: $m, gross: ($m * 0.062), unpriced: false}
-           elif ($j | is_hosted_ubuntu) then {macos_min: 0, gross: ($m * 0.006), unpriced: false}
-           elif ($j | is_hosted_windows) then {macos_min: 0, gross: ($m * 0.010), unpriced: false}
+          (if ($j | is_standard_macos) then {macos_min: $m, gross: ($m * 0.062), unpriced: false}
+           elif ($j | is_standard_ubuntu) then {macos_min: 0, gross: ($m * 0.006), unpriced: false}
+           elif ($j | is_standard_windows) then {macos_min: 0, gross: ($m * 0.010), unpriced: false}
            elif (($j | is_self_hosted | not) and $m > 0) then {macos_min: 0, gross: 0, unpriced: true}
            else {macos_min: 0, gross: 0, unpriced: false}
            end)
@@ -629,8 +638,8 @@ if [ -z "$fallback_reason" ]; then
   ' "$tmp" > "$tmp.summary" 2>"$tmp.err"; then
     fallback_reason="gh api billing usage summary parse failed"
   elif [ "$rollover_yest_failed" -eq 0 ]; then
-    jq '.api_failures = 0' "$STATE_FILE" > "$tmp.state"
-    mv "$tmp.state" "$STATE_FILE"
+    jq '.api_failures = 0' "$STATE_FILE" > "$STATE_STAGE_TMP"
+    mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
 fi
 
@@ -673,8 +682,8 @@ should_emit() {
 
 mark_emitted() {
   local key="$1"
-  jq --arg k "$key" --argjson now "$NOW" '.sent[$k] = $now | .last_sent = $now' "$STATE_FILE" > "$tmp.state"
-  mv "$tmp.state" "$STATE_FILE"
+  jq --arg k "$key" --argjson now "$NOW" '.sent[$k] = $now | .last_sent = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
+  mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
 }
 
 append_blind_context() {
@@ -693,8 +702,8 @@ emit_and_record() { # key severity status day msg gross net macos_min top_repo
   if emit "$severity" "$status" "$day" "$final_msg" "$gross" "$net" "$macos_min" "$top_repo" "$run_mode" "$mtd_gross" "$mtd_net"; then
     mark_emitted "$key"
     if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
-      jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$tmp.state"
-      mv "$tmp.state" "$STATE_FILE"
+      jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
+      mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
       BLIND_COMBINED=1
     fi
     alerted=$((alerted + 1))

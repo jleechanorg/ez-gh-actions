@@ -223,15 +223,69 @@ jq -e '
   and .notificationChannels == ["projects/worldarchitecture-ai/notificationChannels/14071650426226468737"]
   and .enabled == true
   and .severity == "CRITICAL"
-  and (.conditions[0].conditionMatchedLog.filter | contains("jsonPayload.source=\"gh-actions-cost-alert\"") and contains("severity>=ERROR") and (contains("cause=\"fleet\"") | not))
+  and (.conditions[0].conditionMatchedLog.filter | contains("jsonPayload.source=\"gh-actions-cost-alert\"") and contains("severity>=ERROR") and contains("jsonPayload.status=\"BLIND\"") and contains("severity>=WARNING") and (contains("cause=\"fleet\"") | not))
 ' <<<"$policy_json" >/dev/null || fail "--ensure-gcp-policy --dry-run emitted invalid or fleet-coupled policy JSON"
+POLICY_JSON="$policy_json" python3 - <<'PY' || fail "--ensure-gcp-policy filter semantics failed"
+import json, os, re
+
+flt = json.loads(os.environ["POLICY_JSON"])["conditions"][0]["conditionMatchedLog"]["filter"]
+SEV = {"DEBUG": 100, "INFO": 200, "NOTICE": 300, "WARNING": 400, "ERROR": 500, "CRITICAL": 600}
+tokens = re.findall(r'\(|\)|AND|OR|[A-Za-z0-9_.]+(?:>=|=)"[^"]*"|[A-Za-z0-9_.]+>=[A-Z]+', flt)
+
+def parse_expr(pos=0):
+    lhs, pos = parse_and(pos)
+    while pos < len(tokens) and tokens[pos] == "OR":
+        rhs, pos = parse_and(pos + 1)
+        lhs = ("OR", lhs, rhs)
+    return lhs, pos
+
+def parse_and(pos):
+    lhs, pos = parse_atom(pos)
+    while pos < len(tokens) and tokens[pos] == "AND":
+        rhs, pos = parse_atom(pos + 1)
+        lhs = ("AND", lhs, rhs)
+    return lhs, pos
+
+def parse_atom(pos):
+    tok = tokens[pos]
+    if tok == "(":
+        node, pos = parse_expr(pos + 1)
+        assert tokens[pos] == ")", f"expected ), got {tokens[pos]}"
+        return node, pos + 1
+    return ("PRED", tok), pos + 1
+
+def eval_ast(node, rec):
+    op = node[0]
+    if op == "OR":
+        return eval_ast(node[1], rec) or eval_ast(node[2], rec)
+    if op == "AND":
+        return eval_ast(node[1], rec) and eval_ast(node[2], rec)
+    pred = node[1]
+    if pred.startswith("severity>="):
+        return SEV[rec["severity"]] >= SEV[pred.split(">=", 1)[1]]
+    field, val = pred.split("=", 1)
+    val = val.strip('"')
+    return rec.get(field) == val
+
+ast, end_pos = parse_expr(0)
+assert end_pos == len(tokens), f"unparsed filter tokens: {tokens[end_pos:]}"
+
+log_name = "projects/worldarchitecture-ai/logs/ezgha-runner-alerts"
+assert eval_ast(ast, {"logName": log_name, "jsonPayload.source": "gh-actions-cost-alert", "jsonPayload.status": "COST_SPIKE", "severity": "ERROR"})
+assert eval_ast(ast, {"logName": log_name, "jsonPayload.source": "gh-actions-cost-alert", "jsonPayload.status": "BLIND", "severity": "WARNING"})
+assert not eval_ast(ast, {"logName": log_name, "jsonPayload.source": "other", "jsonPayload.status": "BLIND", "severity": "WARNING"})
+assert not eval_ast(ast, {"logName": log_name, "jsonPayload.source": "gh-actions-cost-alert", "jsonPayload.status": "OK", "severity": "WARNING"})
+assert not eval_ast(ast, {"logName": log_name, "jsonPayload.source": "other", "jsonPayload.status": "COST_SPIKE", "severity": "ERROR"})
+PY
 pass "--ensure-gcp-policy --dry-run outputs valid Slack-only policy JSON isolated from cause=fleet"
 
 # 6. Auth isolation: ignores ~/.config/ezgha/gh_token and pre-existing GH_TOKEN unless GH_BILLING_TOKEN is set.
 : > "$TMP/gh-auth.log"
 GH_TOKEN="wrong-app-token" GITHUB_TOKEN="wrong-env-token" \
   run_alert "$TMP/state-auth.json" "$TMP/gcloud-auth.log" "$TMP/gh-auth.log" >/dev/null
-grep -q '|GH_TOKEN=<unset>|GITHUB_TOKEN=<unset>' "$TMP/gh-auth.log" || fail "script must unset GH_TOKEN/GITHUB_TOKEN when GH_BILLING_TOKEN is unset"
+billing_call_line="$(grep '/settings/billing/usage' "$TMP/gh-auth.log" || true)"
+[ -n "$billing_call_line" ] || fail "expected /settings/billing/usage call in gh-auth.log"
+grep -q '|GH_TOKEN=<unset>|GITHUB_TOKEN=<unset>' <<<"$billing_call_line" || fail "billing usage request must unset GH_TOKEN and GITHUB_TOKEN (got: $billing_call_line)"
 ! grep -q 'wrong-app-token\|app-installation-token-must-not-be-used' "$TMP/gh-auth.log" || fail "script must never pass App/ambient GH_TOKEN"
 
 : > "$TMP/gh-auth2.log"
@@ -538,7 +592,26 @@ unpriced_out="$(
   run_alert "$TMP/state-unpriced.json" "$TMP/gcloud-unpriced.log" "$TMP/gh-unpriced.log"
 )"
 grep -q 'mode=app_token_fallback_partial' <<<"$unpriced_out" || fail "unpriced hosted runner label must mark mode=app_token_fallback_partial"
-pass "fallback prices windows-* jobs and marks unpriced hosted runners partial"
+
+# Larger/ARM hosted labels must NOT match baseline standard rates and must mark mode=app_token_fallback_partial.
+cat > "$TMP/jobs/9301.json" <<'JSON'
+{
+  "total_count": 4,
+  "jobs": [
+    {"id":32,"labels":["ubuntu-24.04-16core"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T03:00:00Z"},
+    {"id":33,"labels":["ubuntu-24.04-arm"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T02:00:00Z"},
+    {"id":34,"labels":["macos-15-large"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T03:00:00Z"},
+    {"id":35,"labels":["windows-2022-8core"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T03:00:00Z"}
+  ]
+}
+JSON
+larger_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-win.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-larger.json" "$TMP/gcloud-larger.log" "$TMP/gh-larger.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$larger_out" || fail "larger/ARM hosted labels like ubuntu-24.04-16core must mark mode=app_token_fallback_partial"
+[ "$(error_count "$TMP/gcloud-larger.log")" = 0 ] || fail "larger unpriced labels must not be priced at baseline rates"
+pass "fallback prices standard windows/macos/ubuntu jobs and marks larger/custom unpriced hosted runners partial"
 
 # 15. Wall-clock timeout bounds stalled primary gh api calls (even without timeout/gtimeout binaries).
 mkdir -p "$TMP/nobin"
@@ -640,9 +713,23 @@ pid1=$!
 sleep 0.2
 BILLING_FIXTURE="$TMP/billing-lock2.json" run_alert "$TMP/state-lock.json" "$TMP/gcloud-lock2.log" "$TMP/gh-lock2.log" >/dev/null &
 pid2=$!
-wait "$pid1" "$pid2"
+rc1=0
+wait "$pid1" || rc1=$?
+rc2=0
+wait "$pid2" || rc2=$?
+[ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] || fail "concurrent runs must both exit 0 (rc1=$rc1 rc2=$rc2)"
 [ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 1 sent key was lost"
 [ "$(jq -r '.sent["2026-11-18:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 2 sent key was lost"
+
+# Verify same-filesystem state staging succeeds with separate TMPDIR and leaves no staging temp files behind.
+mkdir -p "$TMP/separate-tmpdir" "$TMP/state-dir"
+TMPDIR="$TMP/separate-tmpdir" BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-dir/state.json" "$TMP/gcloud-staged.log" "$TMP/gh-staged.log" >/dev/null
+[ -f "$TMP/state-dir/state.json" ] || fail "state file must exist after staged write"
+shopt -s nullglob
+leftover_stage=("$TMP/state-dir"/state.json.tmp.* "$TMP/state-dir"/state.json.next.*)
+shopt -u nullglob
+[ "${#leftover_stage[@]}" -eq 0 ] || fail "leftover state staging files found: ${leftover_stage[*]}"
 
 # Abandoned empty (ownerless) lockdir and stale dead-PID lockdir must both be reclaimed cleanly.
 mkdir -p "$TMP/state-ownerless.json.lock"

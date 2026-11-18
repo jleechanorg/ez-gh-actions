@@ -250,12 +250,13 @@ to the dedicated Slack-only policy `[CRITICAL] GitHub Actions cost or hosted mac
 `~/.config/ezgha/gh_token` to `/settings/billing/usage`, because GitHub App `4245332` lacks
 `organization_administration=read`). All `gh`/`gcloud` calls are bounded by wall-clock timeouts (`GH_CALL_TIMEOUT_SEC=30`), and `STATE_FILE` updates are serialized via a `mkdir` lockdir. When personal `core.remaining < 50` or `/settings/billing/usage`
 fails/403, a bounded gross-only App-token fallback (`APP_TOKEN_FILE=~/.config/ezgha/gh_token`,
-`MAX_APP_API_CALLS=60`) prioritizes org repos by `pushed` without excluding stale-push repos, includes `in_progress` and recently updated runs (`>= YESTERDAY_UTC`), paginates `/jobs?filter=all&per_page=100` within budget, and prices `macos-*` (`$0.062/min`), `ubuntu-*` (`$0.006/min`), and `windows-*` (`$0.010/min`). It fires `ERROR COST_SPIKE` immediately on
+`MAX_APP_API_CALLS=60`) prioritizes org repos by `pushed` without excluding stale-push repos, includes `in_progress` and recently updated runs (`>= YESTERDAY_UTC`), paginates `/jobs?filter=all&per_page=100` within budget, and prices standard `macos-latest`/`macos-13..15*` (`$0.062/min`), `ubuntu-latest`/`ubuntu-20.04..24.04` (`$0.006/min`), and `windows-latest`/`windows-2019..2025` (`$0.010/min`) runners at baseline rates while larger/custom hosted labels are marked unpriced (`partial`). It fires `ERROR COST_SPIKE` immediately on
 observed gross/macOS spikes (`mode=app_token_fallback` or `app_token_fallback_partial`, `net_usd=null`,
 `mtd_gross=null`, `mtd_net=null`) and folds any simultaneous `BLIND` condition into that notification so the 300s policy rate limit cannot drop `BLIND`. Only a full authoritative `/organizations/.../settings/billing/usage`
 read + parse resets `api_failures=0`; any skip, partial rollover, or failure persists `api_failures` before alert writes and emits `WARNING BLIND`
 at `MAX_API_FAILURES=3` even if partial App fallback ran.
 - **Recovery / setup (OPERATOR-ONLY):**
+  - Provision `~/.config/ezgha/gh_token` beforehand via the GitHub App token refresher (see `docs/gh-app-token.md`) so the App-token fallback is available if primary billing auth returns 403; the targeted `install org.jleechanorg.ezgha-gh-actions-cost-alert` step does not create `~/.config/ezgha/gh_token`.
   - `OPERATOR-ONLY: ./scripts/gh-actions-cost-alert.sh --ensure-gcp-policy` (creates/updates the dedicated Slack policy)
   - `OPERATOR-ONLY: ./launchd/install-launchagents.sh install org.jleechanorg.ezgha-gh-actions-cost-alert`
   - Inspect `/tmp/ezgha-gh-actions-cost-alert.log` and `~/.local/state/ezgha/gh-actions-cost-alert.json` if `BLIND` fires (check `gh auth status` and `gh api rate_limit`).

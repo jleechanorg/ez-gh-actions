@@ -430,7 +430,19 @@ for bad_work in "$TMP/home" "$TMP/home/actions-runner" "$TMP/home/actions-runner
     fail "must reject unsafe/reserved WORK_DIR: $bad_work"
   fi
 done
-pass "required label and HOME/filesystem-identity reserved dir guards hold for RUNNER_DIR and WORK_DIR"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run --work-dir "$TMP/overlap-x" --runner-dir "$TMP/overlap-x/sub" >/dev/null 2>&1; then
+  fail "must reject nested RUNNER_DIR inside WORK_DIR"
+fi
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run --work-dir "$TMP/overlap-x/sub" --runner-dir "$TMP/overlap-x" >/dev/null 2>&1; then
+  fail "must reject nested WORK_DIR inside RUNNER_DIR"
+fi
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run --work-dir "$TMP/overlap-x" --runner-dir "$TMP/overlap-x" >/dev/null 2>&1; then
+  fail "must reject identical WORK_DIR and RUNNER_DIR"
+fi
+pass "required label and HOME/filesystem-identity/overlap reserved dir guards hold for RUNNER_DIR and WORK_DIR"
 
 # 8. --verify enforces GH_BIN without --offline, [ -d "$WORK_DIR" ], and LaunchAgent WorkingDirectory/ProgramArguments.
 cp "$TMP/plist.ok" "$PLIST_T"
@@ -463,6 +475,8 @@ if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/disk
 fi
 
 cp "$TMP/plist.ok" "$PLIST_T"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER_DIR_T/runsvc.sh"
+chmod +x "$RUNNER_DIR_T/runsvc.sh"
 python3 - "$PLIST_T" "$RUNNER_DIR_T/runsvc.sh" <<'PY'
 import plistlib, sys
 from pathlib import Path
@@ -472,7 +486,13 @@ d["ProgramArguments"] = ["/bin/bash", sys.argv[2]]
 p.write_bytes(plistlib.dumps(d))
 PY
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify must accept runsvc.sh in ProgramArguments"
+  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify must accept readable runsvc.sh in ProgramArguments"
+
+rm -f "$RUNNER_DIR_T/runsvc.sh"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
+  fail "--verify must reject missing runsvc.sh referenced by plist ProgramArguments"
+fi
 
 cp "$TMP/plist.ok" "$PLIST_T"
 python3 - "$PLIST_T" "$TMP/other-runner/run.sh" <<'PY'
@@ -492,6 +512,12 @@ pass "--verify enforces GH_BIN, WORK_DIR existence, and plist target paths"
 
 # 9. Interrupted binary provisioning (Runner.Listener present, config.sh missing) repairs cleanly on retry,
 #    stopping the LaunchAgent before promoting staged binaries and reloading afterward.
+cat > "$TMP/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+echo "curl must not be invoked during hermetic binary repair: $*" >&2
+exit 99
+STUB
+chmod +x "$TMP/bin/curl"
 mkdir -p "$TMP/home/actions-runner/bin"
 cp "$RUNNER_DIR_T/bin/Runner.Listener" "$TMP/home/actions-runner/bin/Runner.Listener"
 cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
@@ -500,7 +526,7 @@ rm -f "$RUNNER_DIR_T/config.sh" "$RUNNER_DIR_T/run.sh"
 : > "$TMP/launchctl.log"
 : > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" >/dev/null
+  EXISTING_RUNNER_DIR="$TMP/home/actions-runner" "$SETUP_SCRIPT" >/dev/null
 [ -x "$RUNNER_DIR_T/config.sh" ] && [ -x "$RUNNER_DIR_T/run.sh" ] || fail "incomplete provisioning must repair config.sh and run.sh on retry"
 grep -q "launchctl unload $PLIST_T" "$TMP/launchctl.log" || fail "binary repair must stop LaunchAgent before promoting staged binaries"
 [ -f "$TMP/launchctl.loaded" ] || fail "binary repair must reload LaunchAgent after repairing binaries"
@@ -531,6 +557,8 @@ chmod +x "$RUNNER_DIR_T/config.sh"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 printf 'preserved-creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'preserved-rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
+printf 'preserved-migrated-runner\n' > "$RUNNER_DIR_T/.runner_migrated"
+printf 'preserved-migrated-creds\n' > "$RUNNER_DIR_T/.credentials_migrated"
 : > "$TMP/launchctl.loaded"
 : > "$TMP/launchctl.log"
 reconfig_rc=0
@@ -541,13 +569,45 @@ reconfig_err="$(
 [ "$reconfig_rc" -eq 4 ] || fail "failed config.sh must exit 4 fail-closed (got $reconfig_rc)"
 grep -q 'ERROR:.*\.backup-pre-reconfigure\.' <<<"$reconfig_err" || fail "failed config.sh must print ERROR naming preserved backup directory (got: $reconfig_err)"
 grep -q -- '--reconfigure' <<<"$reconfig_err" || fail "failed config.sh error must instruct operator to re-run --reconfigure"
-[ ! -e "$RUNNER_DIR_T/.runner" ] && [ ! -e "$RUNNER_DIR_T/.credentials" ] && [ ! -e "$RUNNER_DIR_T/.credentials_rsaparams" ] || \
-  fail "failed config.sh must fail closed and NOT restore old .runner/.credentials*"
+[ ! -e "$RUNNER_DIR_T/.runner" ] && [ ! -e "$RUNNER_DIR_T/.credentials" ] && [ ! -e "$RUNNER_DIR_T/.credentials_rsaparams" ] && \
+  [ ! -e "$RUNNER_DIR_T/.runner_migrated" ] && [ ! -e "$RUNNER_DIR_T/.credentials_migrated" ] || \
+  fail "failed config.sh must fail closed and NOT restore old .runner/.credentials*/migrated files"
 [ ! -e "$TMP/launchctl.loaded" ] || fail "failed config.sh must leave LaunchAgent stopped (not reloaded)"
 ! grep -q 'launchctl load' "$TMP/launchctl.log" || fail "failed config.sh must never call launchctl load"
 backup_dirs=("$RUNNER_DIR_T"/.backup-pre-reconfigure.*)
 [ "${#backup_dirs[@]}" -eq 1 ] && [ -d "${backup_dirs[0]}" ] || fail "failed config.sh must preserve .backup-pre-reconfigure.<pid> directory"
 [ "$(cat "${backup_dirs[0]}/.credentials")" = "preserved-creds" ] || fail "preserved backup must retain .credentials"
 [ "$(cat "${backup_dirs[0]}/.credentials_rsaparams")" = "preserved-rsa" ] || fail "preserved backup must retain .credentials_rsaparams"
+[ "$(cat "${backup_dirs[0]}/.runner_migrated")" = "preserved-migrated-runner" ] || fail "preserved backup must retain .runner_migrated"
+[ "$(cat "${backup_dirs[0]}/.credentials_migrated")" = "preserved-migrated-creds" ] || fail "preserved backup must retain .credentials_migrated"
 [ -f "${backup_dirs[0]}/.runner" ] || fail "preserved backup must retain .runner"
 pass "idempotent rerun skips reload, stop failure protects creds, and failed reconfigure fails closed with preserved backup"
+
+# 11. Lifecycle lock blocks concurrent mutating operations, ignores --dry-run/--verify, and reclaims stale dead-PID locks.
+LOCK_DIR_T="$TMP/home/.local/state/ezgha/setup-native-macos-runner.org.jleechanorg.ezgha-native-macos-runner.lock"
+mkdir -p "$LOCK_DIR_T"
+sleep 30 &
+holder_pid=$!
+printf '%s\n' "$holder_pid" > "$LOCK_DIR_T/pid"
+
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --dry-run >/dev/null || fail "--dry-run must not block on lifecycle lock"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+: > "$TMP/launchctl.loaded"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify must not block on lifecycle lock"
+
+if SETUP_LOCK_TIMEOUT_SEC=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+    "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  fail "mutating --uninstall must fail when lifecycle lock is held by a live PID"
+fi
+kill "$holder_pid" 2>/dev/null || true
+wait "$holder_pid" 2>/dev/null || true
+
+printf '%s\n' "$holder_pid" > "$LOCK_DIR_T/pid"
+SETUP_LOCK_TIMEOUT_SEC=5 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null || fail "mutating --uninstall must reclaim stale dead-PID lifecycle lock"
+[ ! -d "$LOCK_DIR_T" ] || fail "lifecycle lockdir must be released on exit"
+pass "lifecycle lock serializes mutating operations, skips --dry-run/--verify, and reclaims stale locks"
