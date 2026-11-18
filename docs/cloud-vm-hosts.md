@@ -333,14 +333,25 @@ on these hosts) rewrites `/etc/resolv.conf` back to the single-nameserver form �
 at under 10 seconds after the edit (`sed` in place, `mtime` advancing without any agent
 action). A plain `sed` therefore appears to work and then silently reverts; the immutable
 bit is what makes the value stick. Prefer re-running bootstrap step 0 over hand-editing:
-it verifies the pinned shape instead of assuming the `sed` matched. If you do repair by
-hand, follow it with `sudo chattr +i /etc/resolv.conf` and verify with `lsattr` that the
-`i` attribute is set — and do not swallow a failure of that `chattr`.
+it verifies the pinned shape instead of assuming the `sed` matched.
 
-Two consequences of `+i` worth knowing before you use it: the agent can no longer manage
-that file (which is why the value now has to be maintained deliberately rather than by
-DHCP), and any operation that tries to rewrite it will fail while the flag is set. Remove
-the flag with `chattr -i` if the host's own networking needs to take the file back.
+OPERATOR-ONLY procedure (a human runs this at a shell; never paste it into an agent
+prompt, a verifier claim, or any log string — AGENTS.md forbids quoting runnable
+remediation commands in agent-consumed text):
+
+```
+sudo chattr +i /etc/resolv.conf      # then confirm the i attribute with lsattr
+sudo chattr -i /etc/resolv.conf      # only when the host's own networking must manage it again
+```
+
+Do not swallow a failure of that pin: a silent revert is the failure mode this section
+exists to prevent.
+
+Two consequences of the immutable bit worth knowing before you use it: the agent can no
+longer manage that file (which is why the value now has to be maintained deliberately
+rather than by DHCP), and any operation that tries to rewrite it will fail while the flag
+is set. The flag has to be cleared deliberately if the host's own networking needs to
+take the file back.
 
 Evidence, 2026-11-17/18 (verified read-only, Hermes): several `worldarchitect.ai` jobs on
 `ez-runner-c-10/17/18/20` ran 4.5–5.5 minutes and were cancelled — e.g. `ez-runner-c-10`
