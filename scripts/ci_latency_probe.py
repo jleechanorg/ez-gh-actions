@@ -74,7 +74,11 @@ def _command_head_string(command_text):
             break
     head_tokens = []
     skip_next = False
-    value_flags = {"-c", "-C", "-k", "-o", "-f", "-t", "--config", "--cwd", "--grep", "--output", "--filter"}
+    value_flags = {
+        "-c", "-C", "-k", "-o", "-f", "-t", "-r", "-e",
+        "--config", "--cwd", "--grep", "--output", "--filter",
+        "--loader", "--import", "--require", "--eval",
+    }
     for tok in tokens:
         if skip_next:
             skip_next = False
@@ -89,11 +93,13 @@ def _command_head_string(command_text):
         if "tarball" in low and head_tokens[:2] == ["gh", "api"]:
             head_tokens.append("tarball")
             break
-        if "setup-python" in low:
-            head_tokens.append("setup-python")
-            continue
         if "/" in low and head_tokens:
-            # Positional file/directory path argument (e.g. `cat /tmp/playwright.log`)
+            # Allow action runtime paths (/_actions/actions/setup-python/...) but ignore data/log files
+            if "/_actions/" in low and "setup-python" in low:
+                head_tokens.append("setup-python")
+            continue
+        if "setup-python" in low and not head_tokens:
+            head_tokens.append("setup-python")
             continue
         head_tokens.append(base)
         if len(head_tokens) >= 3:
@@ -504,7 +510,7 @@ def from_audit_data(raw):
     cancelled_pct = (
         round((cancelled_n / total_non_skipped) * 100.0, 1)
         if total_non_skipped > 0
-        else 0.0
+        else None
     )
 
     workflows = []

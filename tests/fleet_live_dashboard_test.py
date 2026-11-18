@@ -486,6 +486,103 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertEqual(rec["fresh_queued_runs"], 3)
         self.assertEqual(rec["inert_ghosts"], 2)
 
+    def test_partial_repo_failure_sets_partial_flag_and_renders_scope_note(self):
+        from unittest import mock
+
+        mod = load_module()
+
+        def fake_gh(args, timeout=20):
+            joined = " ".join(args)
+            if "org/good" in joined and "status=in_progress" in joined:
+                return {"total_count": 3, "workflow_runs": []}
+            raise RuntimeError("API error for org/bad")
+
+        def fake_q(repo, *, max_job_checks=None):
+            if repo == "org/good":
+                return {
+                    "repo": repo, "ok": True, "fresh": 2, "ghosts": 3,
+                    "oldest_fresh_wait_minutes": 1, "in_progress_runs": 3,
+                    "queued_total": 5, "sample_capped": False,
+                    "sampled_fresh": 2, "sampled_ghosts": 3, "error": None,
+                }
+            return {
+                "repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                "queued_total": None, "sample_capped": False,
+                "sampled_fresh": None, "sampled_ghosts": None, "error": "rate limited",
+            }
+
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
+             mock.patch.object(mod.queue_probe, "probe_repo", side_effect=fake_q):
+            snap = mod._collect_live_github_snapshot(repos=["org/good", "org/bad"])
+        rec = mod._normalize_reconciliation([], None, snap, scope_note="Live single-host scope: remote-linux unprobed")
+        self.assertTrue(rec["active_runs_partial"])
+        self.assertEqual(rec["repos_covered"], "1/2")
+        html = mod.render_html({"generated_at_utc": "2026-11-18T10:00:00Z", "hosts": [], "reconciliation": rec, "latency": {"ok": False, "cohorts": {}, "workflows": []}})
+        self.assertIn("active_runs_partial", html)
+        self.assertIn("remote-linux unprobed", html)
+
+    def test_slow_probe_cold_504_and_warm_stale_while_revalidate(self):
+        import time
+        import urllib.error
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            orig_build = mod.build_operator_state
+            calls = {"n": 0}
+            gate = threading.Event()
+
+            def controlled_build(**kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    gate.wait(timeout=2.0)
+                elif calls["n"] == 2:
+                    time.sleep(0.5)
+                return orig_build(**kwargs)
+
+            with mock.patch.object(mod, "build_operator_state", side_effect=controlled_build):
+                server = mod.create_server(host="127.0.0.1", port=0, audit_dir=tmp, cache_ttl_s=0.01, wait_timeout_s=0.1)
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    # Cold slow request times out cleanly at wait_timeout_s (504)
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5)
+                    self.assertEqual(ctx.exception.code, 504)
+                    gate.set()
+                    time.sleep(0.15)
+                    # Warm request returns immediately even when cache expired during slow refresh
+                    t0 = time.monotonic()
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                        self.assertEqual(resp.status, 200)
+                    time.sleep(0.05)
+                    t1 = time.monotonic()
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                        self.assertEqual(resp.status, 200)
+                    self.assertLess(time.monotonic() - t1, 0.25)
+                finally:
+                    gate.set()
+                    server.shutdown()
+                    server.server_close()
+
+    def test_disabled_launchd_string_without_parked_flag_is_not_parked(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            hosts = json.loads((tmp / "ubuntu_mac_slots.json").read_text())
+            hosts["hosts"]["mac"]["ezgha_launchd_status"] = "disabled"
+            hosts["hosts"]["mac"]["container_slots"] = [{"slot": 1, "name": "ez-mac-runner-h-1", "state": "DOWN"}]
+            (tmp / "ubuntu_mac_slots.json").write_text(json.dumps(hosts), encoding="utf-8")
+            state = mod.build_operator_state(audit_dir=tmp)
+            mac_host = next(h for h in state["hosts"] if h["id"] == "mac")
+            self.assertNotIn("PARKED", mac_host["status"])
+            self.assertIn("DOWN", mac_host["status"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

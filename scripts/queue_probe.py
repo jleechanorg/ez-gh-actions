@@ -102,19 +102,28 @@ def in_progress_run_count(repo):
     return payload if type(payload) is int and payload >= 0 else None
 
 
-def list_queued(repo):
-    """Every queued run for a repo, following pagination."""
+def list_queued_with_total(repo, *, max_pages=None):
+    """Fetch queued runs up to max_pages (all pages when None), returning (runs, total_count)."""
     runs, page = [], 1
+    reported_total = None
     while True:
         batch = gh_json([
             "api",
             f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}",
         ])
+        if reported_total is None and isinstance((batch or {}).get("total_count"), int):
+            reported_total = batch["total_count"]
         chunk = (batch or {}).get("workflow_runs") or []
         runs.extend(chunk)
-        if len(chunk) < 100:
-            return runs
+        if len(chunk) < 100 or (max_pages is not None and page >= max_pages):
+            return runs, (reported_total if reported_total is not None else len(runs))
         page += 1
+
+
+def list_queued(repo):
+    """Every queued run for a repo, following pagination."""
+    runs, _total = list_queued_with_total(repo)
+    return runs
 
 
 def job_count(repo, run_id):
@@ -135,7 +144,11 @@ def minutes_since(stamp):
 
 def probe_repo(repo, *, max_job_checks=None):
     try:
-        queued = list_queued(repo)
+        if max_job_checks is not None:
+            queued, queued_total = list_queued_with_total(repo, max_pages=1)
+        else:
+            queued = list_queued(repo)
+            queued_total = len(queued)
     except RuntimeError as exc:
         return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
@@ -150,13 +163,13 @@ def probe_repo(repo, *, max_job_checks=None):
         if any(marker in message for marker in RATE_LIMIT_MARKERS):
             return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                     "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
-                    "queued_total": len(queued), "sample_capped": False,
+                    "queued_total": queued_total, "sample_capped": False,
                     "sampled_fresh": None, "sampled_ghosts": None,
                     "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
         ip_runs = None
 
-    sample_capped = max_job_checks is not None and len(queued) > max_job_checks
-    to_check = queued[:max_job_checks] if sample_capped else queued
+    sample_capped = max_job_checks is not None and (queued_total > max_job_checks or len(queued) > max_job_checks)
+    to_check = queued[:max_job_checks] if (max_job_checks is not None and len(queued) > max_job_checks) else queued
     fresh = ghosts = 0
     oldest = None
     for run in to_check:
@@ -171,7 +184,7 @@ def probe_repo(repo, *, max_job_checks=None):
                 # Do not report a rate-limited pass as a clean queue.
                 return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                         "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
-                        "queued_total": len(queued), "sample_capped": False,
+                        "queued_total": queued_total, "sample_capped": False,
                         "sampled_fresh": None, "sampled_ghosts": None,
                         "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
@@ -190,7 +203,7 @@ def probe_repo(repo, *, max_job_checks=None):
             "fresh": None if sample_capped else fresh,
             "ghosts": None if sample_capped else ghosts,
             "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
-            "queued_total": len(queued), "sample_capped": sample_capped,
+            "queued_total": queued_total, "sample_capped": sample_capped,
             "sampled_fresh": fresh, "sampled_ghosts": ghosts,
             "error": None}
 

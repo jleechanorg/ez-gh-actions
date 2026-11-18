@@ -171,6 +171,37 @@ class OldestFreshWait(unittest.TestCase):
         self.assertFalse(bad["ok"])
         self.assertIsNone(bad["in_progress_runs"])
 
+    def test_max_job_checks_caps_queued_pagination_to_one_page(self):
+        calls = []
+
+        def fake_gh(args):
+            calls.append(list(args))
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                self.assertIn("page=1", joined)
+                return {
+                    "total_count": 301,
+                    "workflow_runs": [queued_run(i) for i in range(1, 101)],
+                }
+            if "status=in_progress" in joined:
+                return 4
+            if "/jobs" in joined:
+                return 1
+            raise AssertionError(f"unexpected call: {args}")
+
+        original = queue_probe.gh_json
+        queue_probe.gh_json = fake_gh
+        try:
+            result = queue_probe.probe_repo("org/repo", max_job_checks=10)
+        finally:
+            queue_probe.gh_json = original
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["sample_capped"])
+        self.assertEqual(result["queued_total"], 301)
+        self.assertIsNone(result["fresh"])
+        self.assertEqual(result["sampled_fresh"], 10)
+        self.assertLessEqual(len(calls), 12)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

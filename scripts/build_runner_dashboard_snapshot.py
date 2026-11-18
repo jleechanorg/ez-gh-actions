@@ -250,7 +250,8 @@ def _public_cmux(payload):
             "vms": [],
         }
     vms = []
-    for idx, vm in enumerate(payload.get("vms") or [], start=1):
+    raw_vms = payload.get("vms")
+    for idx, vm in enumerate(raw_vms if isinstance(raw_vms, list) else [], start=1):
         if not isinstance(vm, dict):
             continue
         anon_vm_id = f"cloud-vm-{idx}"
@@ -337,7 +338,8 @@ def _public_latency(payload, repo_map):
     )
     wf_map = {}
     workflows = []
-    for wf in payload.get("workflows") or []:
+    raw_workflows = payload.get("workflows")
+    for wf in (raw_workflows if isinstance(raw_workflows, list) else []):
         if not isinstance(wf, dict) or not isinstance(wf.get("workflow"), str):
             continue
         anon_repo = _anon_label(wf.get("repo"), repo_map, "repo")

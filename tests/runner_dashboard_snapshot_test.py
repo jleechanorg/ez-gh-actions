@@ -371,6 +371,17 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["reconciliation"]["available_pools"], 3)
         self.assertEqual(snapshot["reconciliation"]["configured_slots"], 26)
 
+        bad_types = MODULE.build_snapshot(
+            mac_payload=mac,
+            linux_payload=linux,
+            observed_at="2026-11-18T09:15:00Z",
+            published_at="2026-11-18T09:15:05Z",
+            cmux_payload={"ok": True, "configured": 1, "executing": 0, "idle": 1, "cycling": 0, "down": 0, "vms": 5},
+            latency_payload={"ok": True, "generated_at": "2026-11-18T09:15:00Z", "workflows": 5},
+        )
+        self.assertEqual(bad_types["cmux"]["vms"], [])
+        self.assertEqual(bad_types["latency"]["workflows"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

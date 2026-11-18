@@ -298,9 +298,14 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertEqual(mod.classify_phase("pytest --junitxml=/tmp/playwright/report.xml"), "pytest")
         self.assertEqual(mod.classify_phase("python3 -m pytest -k playwright tests/"), "pytest")
         self.assertIsNone(mod.classify_phase("cat /tmp/playwright/trace.zip"))
+        self.assertIsNone(mod.classify_phase("cat ./setup-python.log"))
+        self.assertIsNone(mod.classify_phase("node --loader jest some-script.js"))
         self.assertEqual(mod.classify_phase("npx playwright install chromium"), "playwright install")
         self.assertEqual(mod.classify_phase("npx playwright test --grep jest"), "playwright")
         self.assertEqual(mod.classify_phase("gh api repos/org/repo/tarball/main"), "gh api tarball")
+
+        empty_audit = mod.from_audit_data({"generated_at_utc": "2026-11-18T00:00:00Z", "app_backend": {"repo": "org/r", "recent_contiguous_runs": {}, "job_level_audit": {}}})
+        self.assertIsNone(empty_audit["cancellation"]["cancelled_rate_pct"])
 
         orig = mod.gh_json
         mod.gh_json = lambda args, timeout=20: {"workflow_runs": []}

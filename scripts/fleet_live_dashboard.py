@@ -327,7 +327,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
         has_active_containers = any(s["state"] in ("EXECUTING", "IDLE", "CYCLING") for s in c_slots)
         explicit_parked = (
             mac.get("parked") is True
-            or launchd_state in ("disabled", "parked")
+            or launchd_state == "parked"
             or (bool(c_slots) and all(s["state"] == "PARKED" for s in c_slots))
         )
         mac_parked = not has_active_containers and explicit_parked
@@ -408,7 +408,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
     return hosts
 
 
-def _normalize_reconciliation(hosts, cmux_data, gh_data):
+def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
     state_counts = {
         "EXECUTING": 0,
         "CYCLING": 0,
@@ -451,11 +451,24 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data):
     if ghost_q is None:
         ghost_q = gh_summary.get("inert_ghosts")
 
+    gh_errors = (gh_data or {}).get("errors") or []
+    expected_repos = gh_summary.get("expected_repos")
+    succeeded_repos = gh_summary.get("succeeded_repos")
+    gh_partial = bool(gh_summary.get("partial") or gh_errors)
+    repos_covered = (
+        f"{succeeded_repos}/{expected_repos}"
+        if isinstance(expected_repos, int) and isinstance(succeeded_repos, int)
+        else None
+    )
+
     return {
         "total_slots": total_slots,
         "state_counts": state_counts,
         "active_workflow_runs": total_ip_runs,
         "active_github_jobs": total_ip_jobs,
+        "active_runs_partial": gh_partial,
+        "repos_covered": repos_covered,
+        "scope_note": scope_note,
         "queued_runs_total": total_q_runs,
         "queued_jobs_total": total_q_jobs,
         "fresh_queued_runs": fresh_q,
@@ -468,7 +481,7 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data):
         "headline_points": headlines,
         "api_runners_count": rec.get("github_org_runners_api_count") or (gh_data or {}).get("org_runners_api_count"),
         "api_blindspot_note": rec.get("github_api_blindspot_note"),
-        "gh_errors": (gh_data or {}).get("errors") or [],
+        "gh_errors": gh_errors,
     }
 
 
@@ -528,6 +541,38 @@ def _probe_local_service_status(is_mac):
         return proc.stdout.strip() or ("active" if proc.returncode == 0 else "inactive")
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
+
+
+def _collect_local_native_runners():
+    """Discover non-Docker native GitHub Actions runner processes running on macOS."""
+    native = []
+    try:
+        proc = subprocess.run(["ps", "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=5)
+        if proc.returncode != 0:
+            return native
+        by_dir = {}
+        for line in proc.stdout.splitlines()[1:]:
+            if "Runner.Listener" not in line and "Runner.Worker" not in line:
+                continue
+            parts = line.strip().split(None, 3)
+            if len(parts) < 4:
+                continue
+            cmd = parts[3]
+            if "/home/runner/" in cmd:
+                continue
+            m = re.search(r"(/[^\s]+?)/bin/Runner\.(?:Listener|Worker)", cmd)
+            root_dir = m.group(1) if m else "native-runner"
+            name = Path(root_dir).name or "mac-native-runner"
+            entry = by_dir.setdefault(name, {"name": name, "state": "IDLE", "elapsed_minutes": None, "active_child_commands": []})
+            if "Runner.Worker" in line:
+                entry["state"] = "EXECUTING"
+                if parts[1].isdigit():
+                    entry["elapsed_minutes"] = round(int(parts[1]) / 60.0, 1)
+            entry["active_child_commands"].append(cmd[:160])
+        native = list(by_dir.values())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return native
 
 
 def _collect_local_host_slots():
@@ -660,6 +705,7 @@ def _collect_local_host_slots():
     configured_count = cfg["count"] if cfg["count"] is not None else len(slots)
     if is_mac:
         effective_launchd = "disabled" if mac_disabled else service_status
+        native_runners = _collect_local_native_runners()
         return {
             "generated_at_utc": now_utc,
             "hosts": {
@@ -673,7 +719,7 @@ def _collect_local_host_slots():
                     "configured_slots": configured_count,
                     "configured_container_slots": configured_count,
                     "container_slots": slots,
-                    "native_runners": [],
+                    "native_runners": native_runners,
                 }
             },
         }
@@ -707,6 +753,7 @@ def _collect_live_github_snapshot(repos=None):
     total_fresh = 0
     total_ghosts = 0
     fresh_complete = True
+    failed_repos = set()
     sample_notes = []
     errors = []
     for repo in target_repos:
@@ -740,6 +787,7 @@ def _collect_live_github_snapshot(repos=None):
             q_probe = queue_probe.probe_repo(repo, max_job_checks=10)
             if not q_probe.get("ok"):
                 fresh_complete = False
+                failed_repos.add(repo)
                 if q_probe.get("error"):
                     errors.append(f"{repo}: {q_probe['error']}")
             else:
@@ -755,6 +803,7 @@ def _collect_live_github_snapshot(repos=None):
                     total_ghosts += q_probe.get("ghosts") or 0
         except Exception as exc:
             fresh_complete = False
+            failed_repos.add(repo)
             errors.append(f"{repo}: {str(exc)[:120]}")
             continue
     return {
@@ -762,6 +811,9 @@ def _collect_live_github_snapshot(repos=None):
         "all_in_progress_jobs": all_ip_jobs,
         "errors": errors,
         "summary": {
+            "partial": bool(errors or failed_repos),
+            "expected_repos": len(target_repos),
+            "succeeded_repos": len(target_repos) - len(failed_repos),
             "total_in_progress_runs_by_repo": ip_runs_by_repo,
             "in_progress_jobs_by_repo": ip_jobs_by_repo,
             "total_queued_runs_by_repo": q_runs_by_repo,
@@ -787,7 +839,54 @@ def _cached_live_latency(repos):
     return data
 
 
-def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, github_json=None, latency_json=None, repos=None):
+def _collect_remote_linux_slot_payload(ssh_host):
+    if not ssh_host:
+        return None
+    try:
+        proc = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_host,
+             "python3", "-", ],
+            input=(
+                "import json, subprocess; "
+                "p = subprocess.run(['docker', 'ps', '-a', '--filter', 'label=ezgha=managed', '--format', '{{.Names}}\\t{{.Status}}'], capture_output=True, text=True); "
+                "slots = [{'slot': i, 'name': l.split('\\t')[0], 'state': 'UP_UNKNOWN' if 'up' in l.lower() else 'DOWN'} for i, l in enumerate(p.stdout.splitlines(), 1) if l.strip()]; "
+                "print(json.dumps({'slots': slots, 'ok': p.returncode == 0}))"
+            ),
+            capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            raw = json.loads(proc.stdout)
+            if raw.get("ok"):
+                return {
+                    "display_name": f"{ssh_host} (Remote Linux Host)",
+                    "group": "jeff-ubuntu",
+                    "admission_status": "ssh_probed",
+                    "configured_slots": len(raw.get("slots") or []),
+                    "slots": [
+                        {**s, "state": "UNKNOWN" if s.get("state") == "UP_UNKNOWN" else s.get("state")}
+                        for s in (raw.get("slots") or [])
+                    ],
+                }
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _collect_live_cmux(cmux_cmd):
+    if not cmux_cmd:
+        return None
+    try:
+        proc = subprocess.run(cmux_cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            return data if isinstance(data, dict) else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        pass
+    return None
+
+
+def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, github_json=None,
+                         latency_json=None, repos=None, linux_host=None, cmux_cmd=None):
     base = Path(audit_dir) if audit_dir else None
     hosts_data = _load_json(hosts_json or (base / "ubuntu_mac_slots.json" if base else None))
     cmux_data = _load_json(
@@ -798,15 +897,39 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     latency_raw = _load_json(latency_json or (base / "ci_latency_percentiles.json" if base else None))
 
     is_fixture = base is not None or hosts_json is not None
+    scope_note = None
     if base is None and hosts_data is None:
         hosts_data = _collect_local_host_slots()
+        eff_linux = linux_host or os.environ.get("EZGHA_OPERATOR_LINUX_HOST")
+        eff_cmux = cmux_cmd or os.environ.get("EZGHA_DASHBOARD_CMUX_PROBE_CMD")
+        missing_pools = []
+        if eff_linux:
+            remote_linux = _collect_remote_linux_slot_payload(eff_linux)
+            if remote_linux:
+                hosts_data.setdefault("hosts", {})[eff_linux] = remote_linux
+            else:
+                missing_pools.append(f"remote-linux ({eff_linux} unreachable)")
+        else:
+            missing_pools.append("remote-linux")
+        if eff_cmux and cmux_data is None:
+            cmux_data = _collect_live_cmux(eff_cmux)
+            if cmux_data is None:
+                missing_pools.append("cmux-cloud (probe failed)")
+        elif cmux_data is None:
+            missing_pools.append("cmux-cloud")
+        if missing_pools:
+            scope_note = (
+                "Live single-host scope: showing local host slots + GitHub state; "
+                + ", ".join(missing_pools)
+                + " unprobed (pass --linux-host / --cmux-cmd or --audit-dir for full multi-host fleet)."
+            )
     if base is None and gh_data is None:
         gh_data = _collect_live_github_snapshot(repos=repos)
     if base is None and latency_raw is None:
         latency_raw = _cached_live_latency(repos)
 
     hosts = _normalize_hosts(hosts_data, cmux_data, gh_data)
-    reconciliation = _normalize_reconciliation(hosts, cmux_data, gh_data)
+    reconciliation = _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=scope_note)
     latency = _normalize_latency(latency_raw)
     source_timestamps = {
         "hosts": (hosts_data or {}).get("generated_at_utc"),
@@ -1099,9 +1222,16 @@ def render_html(state, *, auto_refresh_ms=0):
       const qVal = rec.fresh_queued_runs !== null && rec.fresh_queued_runs !== undefined
         ? rec.fresh_queued_runs + ' / ' + (rec.inert_ghosts ?? '—')
         : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined ? rec.queued_runs_total + ' runs (sample only)' : '— / —');
+      const partialTag = rec.active_runs_partial ? ' (partial' + (rec.repos_covered ? ': ' + rec.repos_covered + ' repos' : '') + ')' : '';
+      const activeRunsVal = rec.active_workflow_runs !== null && rec.active_workflow_runs !== undefined
+        ? rec.active_workflow_runs + (rec.active_runs_partial ? '*' : '')
+        : '—';
+      const activeJobsVal = rec.active_github_jobs !== null && rec.active_github_jobs !== undefined
+        ? rec.active_github_jobs + (rec.active_runs_partial ? '*' : '')
+        : '—';
       const cards = [
-        ['Active GH Runs', rec.active_workflow_runs ?? '—', 'Workflow rows showing in_progress'],
-        ['Active GH Jobs', rec.active_github_jobs ?? '—', 'Observed in_progress jobs'],
+        ['Active GH Runs' + (rec.active_runs_partial ? ' (Partial)' : ''), activeRunsVal, rec.active_runs_partial ? 'Partial' + partialTag + ' — see error banner' : 'Workflow rows showing in_progress'],
+        ['Active GH Jobs' + (rec.active_runs_partial ? ' (Partial)' : ''), activeJobsVal, rec.active_runs_partial ? 'Partial' + partialTag + ' — see error banner' : 'Observed in_progress jobs'],
         ['Executing Slots', sc.EXECUTING || 0, 'Docker + native + special executing'],
         ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I', idleSub],
         ['Down / Offline / Unknown', (sc.DOWN || 0) + 'D / ' + (sc.OFFLINE || 0) + 'O / ' + (sc.UNKNOWN || 0) + 'U', downSub],
@@ -1113,6 +1243,9 @@ def render_html(state, *, auto_refresh_ms=0):
       ).join('');
 
       const alerts = [];
+      if (rec.scope_note) {{
+        alerts.push(`<div class="alert-box warn"><strong>Fleet Scope:</strong> ${{esc(rec.scope_note)}}</div>`);
+      }}
       for (const h of state.hosts || []) {{
         if (h.alert_message) {{
           const isWarn = h.group === 'mac';
@@ -1358,7 +1491,8 @@ def _is_loopback_host_header(host_header):
 
 def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=None,
                   cmux_json=None, github_json=None, latency_json=None, repos=None,
-                  refresh_ms=None, cache_ttl_s=None):
+                  linux_host=None, cmux_cmd=None, refresh_ms=None, cache_ttl_s=None,
+                  wait_timeout_s=10.0):
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("Refusing to bind operator dashboard outside loopback")
 
@@ -1367,28 +1501,14 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
     effective_ttl_s = cache_ttl_s if cache_ttl_s is not None else (15.0 if is_fixture else 120.0)
 
     cache_lock = threading.Lock()
-    cache_state = {"ts": 0.0, "data": None, "building": None}
+    cache_state = {"ts": 0.0, "data": None, "building": None, "last_error": None}
 
-    def load_state():
-        while True:
-            wait_event = None
-            is_leader = False
-            with cache_lock:
-                now = time.monotonic()
-                if cache_state["data"] is not None and (now - cache_state["ts"]) < effective_ttl_s:
-                    return cache_state["data"]
-                if cache_state["building"] is None:
-                    cache_state["building"] = threading.Event()
-                    is_leader = True
-                else:
-                    wait_event = cache_state["building"]
-            if not is_leader:
-                if not wait_event.wait(timeout=10.0):
-                    with cache_lock:
-                        if cache_state["data"] is not None:
-                            return cache_state["data"]
-                    raise TimeoutError("Timed out waiting for operator state refresh")
-                continue
+    def _spawn_refresh_locked():
+        ev = threading.Event()
+        cache_state["building"] = ev
+        cache_state["last_error"] = None
+
+        def _worker():
             try:
                 fresh = build_operator_state(
                     audit_dir=audit_dir,
@@ -1397,21 +1517,39 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                     github_json=github_json,
                     latency_json=latency_json,
                     repos=repos,
+                    linux_host=linux_host,
+                    cmux_cmd=cmux_cmd,
                 )
                 with cache_lock:
                     cache_state["data"] = fresh
                     cache_state["ts"] = time.monotonic()
-                    ev = cache_state["building"]
+                    cache_state["last_error"] = None
                     cache_state["building"] = None
                     ev.set()
-                return fresh
-            except Exception:
+            except Exception as exc:
                 with cache_lock:
-                    ev = cache_state["building"]
+                    cache_state["last_error"] = exc
                     cache_state["building"] = None
-                    if ev:
-                        ev.set()
-                raise
+                    ev.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return ev
+
+    def load_state():
+        with cache_lock:
+            now = time.monotonic()
+            cached = cache_state["data"]
+            if cached is not None:
+                if (now - cache_state["ts"]) >= effective_ttl_s and cache_state["building"] is None:
+                    _spawn_refresh_locked()
+                return cached
+            ev = cache_state["building"] or _spawn_refresh_locked()
+        if not ev.wait(timeout=wait_timeout_s):
+            raise TimeoutError("Timed out waiting for initial operator state")
+        with cache_lock:
+            if cache_state["last_error"] is not None:
+                raise cache_state["last_error"]
+            return cache_state["data"]
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -1430,6 +1568,10 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                     self.send_response(504)
                     self.end_headers()
                     return
+                except Exception:
+                    self.send_response(500)
+                    self.end_headers()
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -1441,6 +1583,10 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                     body = render_html(load_state(), auto_refresh_ms=effective_refresh_ms).encode("utf-8")
                 except TimeoutError:
                     self.send_response(504)
+                    self.end_headers()
+                    return
+                except Exception:
+                    self.send_response(500)
                     self.end_headers()
                     return
                 self.send_response(200)
@@ -1466,6 +1612,8 @@ def main():
     parser.add_argument("--cmux-json", default=None)
     parser.add_argument("--github-json", default=None)
     parser.add_argument("--latency-json", default=None)
+    parser.add_argument("--linux-host", default=None, help="Optional remote Linux SSH host for live mode")
+    parser.add_argument("--cmux-cmd", default=None, help="Optional cmux probe command for live mode")
     parser.add_argument("--repo", action="append", default=None, help="org/repo to query in live mode")
     parser.add_argument("--out-html", default=None, help="Write standalone static HTML snapshot")
     parser.add_argument("--serve", action="store_true", help="Run localhost live operator server")
@@ -1480,6 +1628,8 @@ def main():
             github_json=args.github_json,
             latency_json=args.latency_json,
             repos=args.repo,
+            linux_host=args.linux_host,
+            cmux_cmd=args.cmux_cmd,
         )
         out = Path(args.out_html)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1498,6 +1648,8 @@ def main():
             github_json=args.github_json,
             latency_json=args.latency_json,
             repos=args.repo,
+            linux_host=args.linux_host,
+            cmux_cmd=args.cmux_cmd,
         )
         print(f"Serving operator live dashboard on http://127.0.0.1:{server.server_address[1]}/")
         try:
