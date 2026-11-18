@@ -321,6 +321,54 @@ else
   bad "(g) failed git fetch that updated a ref dropped alternates or broke repo"
 fi
 
+# ── (h) Two-step shallow then --unshallow keeps SEED_REF advertisement ──
+echo "=== (h) Two-step wrapped fetch (--depth=1 then --unshallow) preserves SEED_REF ==="
+TWOSTEP_OUT=$(docker run --rm \
+  -v "${UPSTREAM_GIT}:/upstream.git:ro" \
+  -v "${MIRROR_ROOT}:/opt/ezgha-git-mirrors:ro" \
+  -e EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors \
+  -e SEED_SHA="${SEED_SHA}" \
+  "${IMAGE}" bash -lc '
+    set -euo pipefail
+    ORIGIN_URL="https://github.com/jleechanorg/testrepo.git"
+    git config --global "url.file:///upstream.git.insteadOf" "${ORIGIN_URL}"
+    git init -b main /tmp/twostep >/dev/null
+    git -C /tmp/twostep remote add origin "${ORIGIN_URL}"
+    git -C /tmp/twostep fetch --depth=1 origin main >/tmp/step1.log 2>&1
+    [ -e /tmp/twostep/.git/ezgha-hydrated ] && echo "STEP1_HYDRATED=PRESENT" || echo "STEP1_HYDRATED=ABSENT"
+    before_loose="$(git -C /tmp/twostep count-objects -v | awk "/^count:/ {print \$2}")"
+    before_pack="$(git -C /tmp/twostep count-objects -v | awk "/^in-pack:/ {print \$2}")"
+    before_objs=$((before_loose + before_pack))
+    set +e
+    GIT_TRACE_PACKET=1 git -C /tmp/twostep fetch --unshallow origin main --progress >/tmp/step2.log 2>&1
+    rc=$?
+    set -e
+    cat /tmp/step2.log
+    echo "STEP2_FETCH_RC=${rc}"
+    if git -C /tmp/twostep show-ref | grep -q "refs/ezgha-seed/"; then
+      echo "RESIDUE_CHECK=FOUND"
+    else
+      echo "RESIDUE_CHECK=CLEAN"
+    fi
+    git -C /tmp/twostep fsck --full >/tmp/step2-fsck.log 2>&1 && echo "FSCK_RC=0" || { cat /tmp/step2-fsck.log; echo "FSCK_RC=1"; }
+    loose_count="$(git -C /tmp/twostep count-objects -v | awk "/^count:/ {print \$2}")"
+    pack_count="$(git -C /tmp/twostep count-objects -v | awk "/^in-pack:/ {print \$2}")"
+    after_objs=$((loose_count + pack_count))
+    echo "TRANSFERRED_OBJECTS=$((after_objs - before_objs))"
+  ' 2>&1)
+echo "${TWOSTEP_OUT}" | sed 's/^/    /'
+TWOSTEP_TRANSFERRED="$(printf '%s\n' "${TWOSTEP_OUT}" | awk -F= '/^TRANSFERRED_OBJECTS=/{print $2}' | tail -n1)"
+if printf '%s\n' "${TWOSTEP_OUT}" | grep -q "^STEP1_HYDRATED=PRESENT$" \
+  && printf '%s\n' "${TWOSTEP_OUT}" | grep -q "^STEP2_FETCH_RC=0$" \
+  && printf '%s\n' "${TWOSTEP_OUT}" | grep -q "have ${SEED_SHA}" \
+  && printf '%s\n' "${TWOSTEP_OUT}" | grep -q "^RESIDUE_CHECK=CLEAN$" \
+  && printf '%s\n' "${TWOSTEP_OUT}" | grep -q "^FSCK_RC=0$" \
+  && [ -n "${TWOSTEP_TRANSFERRED}" ] && [ "${TWOSTEP_TRANSFERRED}" -le 15 ]; then
+  ok "(h) two-step --depth=1 -> --unshallow advertised have <SEED_SHA>, transferred_objects=${TWOSTEP_TRANSFERRED} <= 15, clean refs and fsck"
+else
+  bad "(h) two-step --depth=1 -> --unshallow failed (transferred_objects=${TWOSTEP_TRANSFERRED:-unknown})"
+fi
+
 echo
 echo "=== Summary: ${PASS} passed, ${FAIL} failed ==="
 if [ "${FAIL}" -gt 0 ]; then

@@ -140,6 +140,7 @@ git clone -q "file://${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${HOME_B}/testr
 OUT_B1="${WORK}/out_b1.log"
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo jleechanorg/masteronly" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -201,6 +202,7 @@ PY
 
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -223,6 +225,7 @@ SHA_2="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads
 
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -249,6 +252,7 @@ PY
 
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -268,6 +272,7 @@ SHA_3="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads
 set +e
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/missing_broken_repo jleechanorg/testrepo" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -290,6 +295,7 @@ os.utime(sys.argv[1], (old, old))
 PY
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=none \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
@@ -430,7 +436,34 @@ grep -q "below safety floor+5 (15 GiB)" "${OUT_LOW}" \
 [ ! -e "${MIRRORS_LOW}/active/jleechanorg__testrepo" ] || fail "low-disk mode should not clone/publish new active mirror"
 pass "(b11) default floor=10 + buffer=5 enforces 15 GiB and low-disk mode reaps retired generations"
 
-# ── (d) Wheelhouse relative -r base.txt closure, manifest SHA, separate pip solve
+# ── (b12) Missing docker CLI fails closed (0.0) and preserves expired retired gen ──
+GEN_B12="${MIRRORS_B}/generations/jleechanorg__testrepo.1000000004"
+mkdir -p "${GEN_B12}"
+printf '1000\n' > "${GEN_B12}/RETIRED_AT"
+
+MIN_BIN_B12="${WORK}/min_bin_b12"
+mkdir -p "${MIN_BIN_B12}"
+PYTHON3_REAL="$(command -v python3)"
+GIT_REAL="$(which -a git | grep -v '/\.local/bin/' | head -n1 || command -v git)"
+BASH_REAL="$(command -v bash)"
+ln -s "${PYTHON3_REAL}" "${MIN_BIN_B12}/python3"
+ln -s "${GIT_REAL}" "${MIN_BIN_B12}/git"
+
+OUT_B12="${WORK}/out_b12.log"
+env -u EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH \
+  PATH="${MIN_BIN_B12}" \
+  HOME="${HOME_B}" \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
+  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+  "${BASH_REAL}" "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels > "${OUT_B12}" 2>&1 \
+  || fail "missing docker CLI fail-closed test exited non-zero: $(cat "${OUT_B12}")"
+[ -d "${GEN_B12}" ] || fail "expired retired generation was deleted when docker CLI was missing: ${GEN_B12}"
+grep -q "docker CLI not found; failing closed to preserve retired generations" "${OUT_B12}" \
+  || fail "expected missing docker CLI fail-closed warning, got: $(cat "${OUT_B12}")"
+pass "(b12) missing docker CLI fails closed (0.0) and preserves expired retired generation"
+
+# ── (d) Wheelhouse relative -r base.txt closure, manifest SHA, separate pip solve ──
 HOME_D="${WORK}/home_d"
 WH_D="${WORK}/wheelhouse_d"
 REQ_DIR="${WORK}/reqs_d"
@@ -459,18 +492,26 @@ elif [ "${sub}" = "run" ]; then
   printf 'ARGS:%s\n' "$*" >> "${FAKE_DOCKER_LOG}"
   payload="$(cat)"
   printf 'PAYLOAD:%s\n' "${payload}" >> "${FAKE_DOCKER_LOG}"
-  # Verify no /req_mounts bind, staged_files layout under /tmp/ezgha-reqs, and separate core vs req_paths pip runs
-  python3 - "${payload}" "${FAKE_WH_HOST}" "$@" <<'PY'
+  if [ "${FAKE_DOCKER_FAIL:-0}" = "1" ]; then
+    exit 1
+  fi
+  # Verify no /req_mounts bind, staged_files layout under /tmp/ezgha-reqs, wheel staging, and live symlink preservation
+  python3 - "${payload}" "${FAKE_WH_HOST}" "${FAKE_EXPECT_SYMLINK:-0}" "$@" <<'PY'
 import io, json, os, subprocess, sys, tempfile
 
 payload_raw = sys.argv[1]
 payload = json.loads(payload_raw)
 wh_host = sys.argv[2]
-args = sys.argv[3:]
+expect_symlink = sys.argv[3] == "1"
+args = sys.argv[4:]
 
 assert not any(":/req_mounts/" in a for a in args), f"unexpected /req_mounts bind in {args}"
 binds = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
 assert binds == [f"{wh_host}:/wheelhouse"], f"expected only /wheelhouse bind, got {binds}"
+
+if expect_symlink:
+    live_link = os.path.join(wh_host, "pkg0-1.0.0-999999ezgha-py3-none-any.whl")
+    assert os.path.islink(live_link), f"expected build-tag symlink to stay live during docker run: {live_link}"
 
 staged = dict(payload["staged_files"])
 assert "0/base.txt" in staged and "requests==" in staged["0/base.txt"], staged
@@ -479,19 +520,25 @@ assert payload["req_paths"] == ["/tmp/ezgha-reqs/0/sub/requirements-test.txt"], 
 
 container_script = args[-1]
 assert "stage_root = '/tmp/ezgha-reqs'" in container_script, container_script
+assert "wheel_stage = '/tmp/ezgha-wheel-stage'" in container_script, container_script
 
 pip_calls = []
 orig_run = subprocess.run
 orig_stdin = sys.stdin
-with tempfile.TemporaryDirectory() as stage_tmp:
+with tempfile.TemporaryDirectory() as stage_tmp, tempfile.TemporaryDirectory() as wheel_stage_tmp:
     def fake_run(cmd, **kwargs):
         pip_calls.append((list(cmd), bool(kwargs.get("check"))))
+        for i in range(12):
+            fn = f"pkg{i}-1.0.0-py3-none-any.whl"
+            with open(os.path.join(wheel_stage_tmp, fn), "w", encoding="utf-8") as fh:
+                fh.write("whl")
         return subprocess.CompletedProcess(cmd, 0)
 
-    patched_script = container_script.replace(
-        "stage_root = '/tmp/ezgha-reqs'",
-        f"stage_root = {json.dumps(stage_tmp)}",
-        1,
+    patched_script = (
+        container_script
+        .replace("stage_root = '/tmp/ezgha-reqs'", f"stage_root = {json.dumps(stage_tmp)}", 1)
+        .replace("wheel_stage = '/tmp/ezgha-wheel-stage'", f"wheel_stage = {json.dumps(wheel_stage_tmp)}", 1)
+        .replace("'/wheelhouse'", json.dumps(wh_host))
     )
     try:
         sys.stdin = io.StringIO(payload_raw)
@@ -507,16 +554,16 @@ with tempfile.TemporaryDirectory() as stage_tmp:
     assert os.path.isfile(staged_req), f"missing staged req: {staged_req}"
     resolved_inc = os.path.realpath(os.path.join(os.path.dirname(staged_req), "../base.txt"))
     assert resolved_inc == os.path.realpath(staged_base), (resolved_inc, staged_base)
+    if expect_symlink:
+        assert not os.path.exists(os.path.join(wheel_stage_tmp, "pkg0-1.0.0-999999ezgha-py3-none-any.whl")), (
+            "symlinks must not be copied into /tmp/ezgha-wheel-stage"
+        )
 
-expected_base = [sys.executable, "-m", "pip", "download", "--dest", "/wheelhouse", "--find-links", "/wheelhouse"]
+expected_base = [sys.executable, "-m", "pip", "download", "--dest", wheel_stage_tmp, "--find-links", wheel_stage_tmp]
 assert len(pip_calls) == 2, f"expected 2 separate pip calls (core + reqs), got {pip_calls}"
 assert pip_calls[0][0] == expected_base + payload["core"] and pip_calls[0][1] is True, pip_calls[0]
 assert "-r" not in pip_calls[0][0], pip_calls[0]
 assert pip_calls[1][0] == expected_base + ["-r", "/tmp/ezgha-reqs/0/sub/requirements-test.txt"] and pip_calls[1][1] is True, pip_calls[1]
-
-for i in range(12):
-    fn = f"pkg{i}-1.0.0-py3-none-any.whl"
-    open(os.path.join(wh_host, fn), "w").write("whl")
 PY
   exit 0
 fi
@@ -541,25 +588,72 @@ PATH="${FAKE_BIN}:${PATH}" \
   FAKE_DOCKER_LOG="${DOCKER_LOG}" \
   FAKE_WH_HOST="${WH_D}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" \
   EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
   bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
 
 [ -f "${WH_D}/.manifest.sha256" ] || fail "wheelhouse manifest missing"
+[ -L "${WH_D}/pkg0-1.0.0-999999ezgha-py3-none-any.whl" ] || fail "missing build-tag symlink after first wheelhouse refresh"
 SHA_WH1="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
 grep -q '"core":' "${DOCKER_LOG}" || fail "missing core payload in docker run"
 grep -q 'requirements-test.txt' "${DOCKER_LOG}" || fail "missing requirements-test.txt in payload"
 
-# Modify included base.txt and re-run -> manifest SHA must change!
+# Modify included base.txt and re-run -> manifest SHA must change, and existing symlinks stay live during docker run!
 printf 'requests==2.32.3\n' > "${REQ_DIR}/base.txt"
 PATH="${FAKE_BIN}:${PATH}" \
   HOME="${HOME_D}" \
   FAKE_DOCKER_LOG="${DOCKER_LOG}" \
   FAKE_WH_HOST="${WH_D}" \
+  FAKE_EXPECT_SYMLINK=1 \
   EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" \
   EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
   bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
 SHA_WH2="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
 [ "${SHA_WH1}" != "${SHA_WH2}" ] || fail "manifest SHA did not change when included base.txt changed (${SHA_WH1})"
+
+# Same date bucket -> cache hit (no docker run)
+DOCKER_LINES_BEFORE="$(wc -l < "${DOCKER_LOG}")"
+PATH="${FAKE_BIN}:${PATH}" \
+  HOME="${HOME_D}" \
+  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
+  FAKE_WH_HOST="${WH_D}" \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-18" \
+  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
+DOCKER_LINES_AFTER="$(wc -l < "${DOCKER_LOG}")"
+[ "${DOCKER_LINES_BEFORE}" = "${DOCKER_LINES_AFTER}" ] || fail "expected wheelhouse cache hit for unchanged date bucket"
+
+# Changed date bucket -> manifest SHA invalidates and refreshes; failed docker run still preserves symlinks via try..finally
+set +e
+PATH="${FAKE_BIN}:${PATH}" \
+  HOME="${HOME_D}" \
+  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
+  FAKE_WH_HOST="${WH_D}" \
+  FAKE_DOCKER_FAIL=1 \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" \
+  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git >/dev/null 2>&1
+FAIL_RC=$?
+set -e
+[ "${FAIL_RC}" -ne 0 ] || fail "expected non-zero exit on simulated wheelhouse docker failure"
+[ -L "${WH_D}/pkg0-1.0.0-999999ezgha-py3-none-any.whl" ] || fail "build-tag symlink lost after failed wheelhouse docker run"
+SHA_WH_AFTER_FAIL="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
+[ "${SHA_WH_AFTER_FAIL}" = "${SHA_WH2}" ] || fail "manifest should not advance on failed wheelhouse run"
+
+PATH="${FAKE_BIN}:${PATH}" \
+  HOME="${HOME_D}" \
+  FAKE_DOCKER_LOG="${DOCKER_LOG}" \
+  FAKE_WH_HOST="${WH_D}" \
+  FAKE_EXPECT_SYMLINK=1 \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" \
+  EZGHA_WHEELHOUSE_REQ_FILES="${REQ_DIR}/sub/requirements-test.txt" \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_D}" --skip-git
+SHA_WH3="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
+[ "${SHA_WH2}" != "${SHA_WH3}" ] || fail "manifest SHA did not change when UTC date bucket changed (${SHA_WH2})"
 
 # Verify collect_req_closure skips -r/-c includes whose commonpath with rf_real is "/"
 python3 - "${REFRESH_SCRIPT}" "${REQ_DIR}" <<'PY'

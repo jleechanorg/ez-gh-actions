@@ -342,7 +342,8 @@ def oldest_running_runner_start_epoch(docker_env):
             return 0.0
 
     if not shutil.which("docker"):
-        return None
+        warn("docker CLI not found; failing closed to preserve retired generations")
+        return 0.0
 
     docker_proc_env = merge_env(docker_env)
     try:
@@ -878,9 +879,12 @@ def refresh_wheelhouse(wheelhouse_path, image):
     req_entries, all_req_files = collect_req_closure(req_files)
     core_pkgs = DEFAULT_CORE_PACKAGES + [f"playwright=={pw_ver}"]
 
+    date_bucket = os.environ.get("EZGHA_WHEELHOUSE_DATE_BUCKET") or time.strftime("%Y-%m-%d", time.gmtime())
+
     hasher = hashlib.sha256()
     hasher.update(f"image={image_id}\n".encode("utf-8"))
     hasher.update(f"playwright={pw_ver}\n".encode("utf-8"))
+    hasher.update(f"date_bucket={date_bucket}\n".encode("utf-8"))
     hasher.update(("core=" + " ".join(core_pkgs) + "\n").encode("utf-8"))
     for fp in all_req_files:
         with open(fp, "rb") as fh:
@@ -903,8 +907,6 @@ def refresh_wheelhouse(wheelhouse_path, image):
             log(f"wheelhouse up-to-date ({whl_count} wheels, manifest {manifest_sha[:12]})")
             return
 
-    sync_wheelhouse_build_tag_symlinks(wheelhouse_path, clear_only=True)
-
     staged_files = []
     req_container_paths = []
     for idx, (req_real, common_dir, closure_files) in enumerate(req_entries):
@@ -925,10 +927,18 @@ def refresh_wheelhouse(wheelhouse_path, image):
     container_script = (
         "import glob, json, os, shutil, subprocess, sys\n"
         "data = json.load(sys.stdin)\n"
-        "for whl in glob.glob('/opt/baked-wheels/*.whl'):\n"
-        "    dst = os.path.join('/wheelhouse', os.path.basename(whl))\n"
-        "    if not os.path.exists(dst):\n"
-        "        shutil.copy2(whl, dst)\n"
+        "wheel_stage = '/tmp/ezgha-wheel-stage'\n"
+        "os.makedirs(wheel_stage, exist_ok=True)\n"
+        "for src_dir in ('/wheelhouse', '/opt/baked-wheels'):\n"
+        "    for whl in glob.glob(os.path.join(src_dir, '*.whl')):\n"
+        "        if os.path.islink(whl) or not os.path.isfile(whl):\n"
+        "            continue\n"
+        "        dst = os.path.join(wheel_stage, os.path.basename(whl))\n"
+        "        if not os.path.exists(dst):\n"
+        "            try:\n"
+        "                os.link(whl, dst)\n"
+        "            except OSError:\n"
+        "                shutil.copy2(whl, dst)\n"
         "stage_root = '/tmp/ezgha-reqs'\n"
         "for rel, content in data.get('staged_files', []):\n"
         "    dst = os.path.normpath(os.path.join(stage_root, rel))\n"
@@ -937,13 +947,21 @@ def refresh_wheelhouse(wheelhouse_path, image):
         "    os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
         "    with open(dst, 'w', encoding='utf-8') as fh:\n"
         "        fh.write(content)\n"
-        "base_cmd = [sys.executable, '-m', 'pip', 'download', '--dest', '/wheelhouse', '--find-links', '/wheelhouse']\n"
+        "base_cmd = [sys.executable, '-m', 'pip', 'download', '--dest', wheel_stage, '--find-links', wheel_stage]\n"
         "subprocess.run(base_cmd + data['core'], check=True)\n"
         "if data['req_paths']:\n"
         "    req_cmd = list(base_cmd)\n"
         "    for p in data['req_paths']:\n"
         "        req_cmd.extend(['-r', p])\n"
         "    subprocess.run(req_cmd, check=True)\n"
+        "for whl in glob.glob(os.path.join(wheel_stage, '*.whl')):\n"
+        "    if os.path.islink(whl) or not os.path.isfile(whl):\n"
+        "        continue\n"
+        "    dst = os.path.join('/wheelhouse', os.path.basename(whl))\n"
+        "    if not os.path.exists(dst):\n"
+        "        dst_tmp = dst + f'.tmp.{os.getpid()}'\n"
+        "        shutil.copy2(whl, dst_tmp)\n"
+        "        os.replace(dst_tmp, dst)\n"
     )
     docker_cmd = ["docker", "run", "--rm", "-i", "-v", f"{wheelhouse_path}:/wheelhouse"]
     if platform.system() == "Linux":
@@ -951,10 +969,11 @@ def refresh_wheelhouse(wheelhouse_path, image):
     docker_cmd.extend([image, "python3", "-c", container_script])
 
     log(f"refreshing wheelhouse via {image} (playwright=={pw_ver}, {len(req_files)} req files)")
-    run_cmd(docker_cmd, timeout=900, env=docker_env, input_text=payload)
-
-    chmod_a_rx(wheelhouse_path)
-    sync_wheelhouse_build_tag_symlinks(wheelhouse_path)
+    try:
+        run_cmd(docker_cmd, timeout=900, env=docker_env, input_text=payload)
+    finally:
+        chmod_a_rx(wheelhouse_path)
+        sync_wheelhouse_build_tag_symlinks(wheelhouse_path)
     with open(manifest_file, "w", encoding="utf-8") as fh:
         fh.write(f"{manifest_sha}\n")
     os.chmod(manifest_file, 0o644)

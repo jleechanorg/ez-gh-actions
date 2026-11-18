@@ -72,7 +72,7 @@ if [ "$subcommand" != "fetch" ]; then
 fi
 
 GIT_DIR="$("$REAL_GIT" "${git_dir_args[@]}" rev-parse --absolute-git-dir 2>/dev/null || true)"
-if [ -z "$GIT_DIR" ] || [ ! -d "$GIT_DIR" ] || [ -e "$GIT_DIR/ezgha-hydrated" ]; then
+if [ -z "$GIT_DIR" ] || [ ! -d "$GIT_DIR" ]; then
   exec "$REAL_GIT" "$@"
 fi
 COMMON_DIR="$("$REAL_GIT" "${git_dir_args[@]}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
@@ -94,6 +94,64 @@ if [ -z "$OWNER" ] || [ -z "$REPO" ] || [ "$OWNER" = "." ] || [ "$OWNER" = ".." 
 fi
 
 ACTIVE_LINK="$EZGHA_GIT_MIRRORS/active/${OWNER}__${REPO}"
+ALT_FILE="$COMMON_DIR/objects/info/alternates"
+SEED_REF="refs/ezgha-seed/pid-$$-${RANDOM:-0}-$(date +%s 2>/dev/null || echo 0)"
+
+if [ -e "$GIT_DIR/ezgha-hydrated" ]; then
+  SEED_SHA=""
+  SEED_CREATED=0
+  if [ -f "$ALT_FILE" ]; then
+    while IFS= read -r alt_line || [ -n "$alt_line" ]; do
+      alt_line="${alt_line%$'\r'}"
+      case "$alt_line" in
+        /opt/*/objects|"${EZGHA_GIT_MIRRORS%/}"/*/objects)
+          alt_gen="${alt_line%/objects}"
+          cand_sha=""
+          if [ -f "$alt_gen/SEED_SHA" ]; then
+            IFS= read -r cand_sha < "$alt_gen/SEED_SHA" || true
+          elif [ -f "$alt_gen/MAIN_SHA" ]; then
+            IFS= read -r cand_sha < "$alt_gen/MAIN_SHA" || true
+          fi
+          cand_sha="${cand_sha//[[:space:]]/}"
+          if [[ "$cand_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            SEED_SHA="$cand_sha"
+          fi
+          break
+          ;;
+      esac
+    done < "$ALT_FILE"
+
+    if [ -z "$SEED_SHA" ] && [ -e "$ACTIVE_LINK" ]; then
+      REAL_GEN="$(cd "$ACTIVE_LINK" 2>/dev/null && pwd -P || true)"
+      if [ -n "$REAL_GEN" ] && [ -d "$REAL_GEN/objects" ] && grep -Fxq -- "$REAL_GEN/objects" "$ALT_FILE" 2>/dev/null; then
+        cand_sha=""
+        if [ -f "$ACTIVE_LINK/SEED_SHA" ]; then
+          IFS= read -r cand_sha < "$ACTIVE_LINK/SEED_SHA" || true
+        elif [ -f "$ACTIVE_LINK/MAIN_SHA" ]; then
+          IFS= read -r cand_sha < "$ACTIVE_LINK/MAIN_SHA" || true
+        fi
+        cand_sha="${cand_sha//[[:space:]]/}"
+        if [[ "$cand_sha" =~ ^[0-9a-f]{40}$ ]]; then
+          SEED_SHA="$cand_sha"
+        fi
+      fi
+    fi
+  fi
+
+  if [[ "$SEED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    if "$REAL_GIT" "${git_dir_args[@]}" update-ref "$SEED_REF" "$SEED_SHA" "" >/dev/null 2>&1; then
+      SEED_CREATED=1
+    fi
+  fi
+
+  "$REAL_GIT" -c core.commitGraph=false "$@"
+  rc=$?
+  if [ "$SEED_CREATED" -eq 1 ]; then
+    "$REAL_GIT" "${git_dir_args[@]}" update-ref -d "$SEED_REF" "$SEED_SHA" >/dev/null 2>&1 || true
+  fi
+  exit "$rc"
+fi
+
 if [ ! -e "$ACTIVE_LINK" ]; then
   exec "$REAL_GIT" "$@"
 fi
@@ -120,10 +178,8 @@ HYDRATED_NOW=0
 ALT_ADDED=0
 SEED_CREATED=0
 PRE_REFS=""
-ALT_FILE="$COMMON_DIR/objects/info/alternates"
 ALT_ENTRY="$REAL_GEN/objects"
 LOCK_FILE="$COMMON_DIR/ezgha-hydrate.lock"
-SEED_REF="refs/ezgha-seed/pid-$$-${RANDOM:-0}-$(date +%s 2>/dev/null || echo 0)"
 HAS_FLOCK=0
 if command -v flock >/dev/null 2>&1; then
   HAS_FLOCK=1

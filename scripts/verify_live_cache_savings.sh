@@ -117,7 +117,7 @@ RUNNER_IMAGE="$(printf '%s\n' "${PARSED_INFO}" | sed -n '3p')"
 
 [ -n "${WHEELHOUSE_PATH}" ] && [ -d "${WHEELHOUSE_PATH}" ] \
   || { echo "FAIL: wheelhouse_host_path missing or not a directory: ${WHEELHOUSE_PATH:-<unset>}" >&2; exit 1; }
-WHL_COUNT="$(find "${WHEELHOUSE_PATH}" -maxdepth 1 -name '*.whl' 2>/dev/null | wc -l | tr -d '[:space:]')"
+WHL_COUNT="$(find "${WHEELHOUSE_PATH}" -maxdepth 1 -type f -name '*.whl' 2>/dev/null | wc -l | tr -d '[:space:]')"
 [ "${WHL_COUNT}" -ge 10 ] \
   || { echo "FAIL: expected >= 10 .whl files in ${WHEELHOUSE_PATH}, found ${WHL_COUNT}" >&2; exit 1; }
 
