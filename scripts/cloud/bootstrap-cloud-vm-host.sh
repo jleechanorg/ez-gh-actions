@@ -83,24 +83,37 @@ resolver_is_healthy() {
   esac
 }
 
-# The ONE pre-existing forwarder, if any: the first `nameserver` that is not a
-# public resolver and not systemd-resolved's loopback stub. This keeps the VM's
-# own private resolver first in the list (it is the only one that can answer for
-# VM-local names) and adds the public resolvers purely as fallbacks.
+# Detect the host's own (private) resolver. NEVER invent one: a guessed address
+# would be pinned here AND handed to runner containers as `--dns`, so VM-local
+# lookups would break while the pin holds the wrong value. Search the live file
+# first, then systemd-resolved's upstream file, and fail when neither has one.
 detect_resolv_forwarder() {
-  local addr
-  addr="$(awk '/^nameserver[[:space:]]+/ {
-      a = $2
-      if (a != "1.1.1.1" && a != "8.8.8.8" && a != "127.0.0.53") { print a; exit }
-    }' "$RESOLV" 2>/dev/null || true)"
-  printf '%s' "${addr:-10.32.0.28}"
+  local f addr
+  for f in "$RESOLV" /run/systemd/resolve/resolv.conf; do
+    [ -r "$f" ] || continue
+    addr="$(awk '/^nameserver[[:space:]]+/ {
+        a = $2
+        if (a != "1.1.1.1" && a != "8.8.8.8" && a != "9.9.9.9" && a !~ /^127\./) { print a; exit }
+      }' "$f" 2>/dev/null || true)"
+    if [ -n "$addr" ]; then
+      printf '%s' "$addr"
+      return 0
+    fi
+  done
+  return 1
 }
 
-if resolver_is_healthy; then
-  echo "resolv.conf already healthy (>=3 nameservers, public fallbacks, timeout:2 attempts:3, immutable)"
-else
-  FORWARDER="$(detect_resolv_forwarder)"
-  echo "repairing /etc/resolv.conf: forwarder=$FORWARDER fallbacks=1.1.1.1,8.8.8.8"
+# Rewrite + pin. Returns non-zero (without deciding the outcome) so the caller can
+# retry a bounded number of times and then stop loudly.
+repair_resolver() {
+  local forwarder search_lines
+  if ! forwarder="$(detect_resolv_forwarder)"; then
+    echo "FATAL: no private resolver found in $RESOLV or /run/systemd/resolve/resolv.conf." >&2
+    echo "       Refusing to invent one and pin it: a guessed address would also reach" >&2
+    echo "       runner containers as --dns and break VM-local lookups." >&2
+    return 1
+  fi
+  echo "repairing /etc/resolv.conf: forwarder=$forwarder fallbacks=1.1.1.1,8.8.8.8"
   # Release the pin if a previous run set it; failure just means it was not pinned.
   sudo -n chattr -i "$RESOLV" 2>/dev/null || true
   # Back up the ORIGINAL exactly once — never overwrite a good backup with an
@@ -111,24 +124,51 @@ else
   # Preserve any search/domain directive: dropping it silently changes how
   # VM-local short names resolve, which is a different failure mode than the
   # one this step exists to prevent.
-  SEARCH_LINES="$(grep -E '^(search|domain)[[:space:]]' "$RESOLV" 2>/dev/null || true)"
+  search_lines="$(grep -E '^(search|domain)[[:space:]]' "$RESOLV" 2>/dev/null || true)"
   {
-    printf 'nameserver %s\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' "$FORWARDER"
-    if [ -n "$SEARCH_LINES" ]; then
-      printf '%s\n' "$SEARCH_LINES"
+    printf 'nameserver %s\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n' "$forwarder"
+    if [ -n "$search_lines" ]; then
+      printf '%s\n' "$search_lines"
     fi
     printf 'options timeout:2 attempts:3\n'
   } | sudo -n tee "$RESOLV" >/dev/null
-  # FAIL CLOSED on the pin. Without the immutable bit freestyle-vms-agent rewrites
-  # this file back within ~10s and every EAI_AGAIN/stall this step exists to
-  # prevent silently returns — a bootstrap that reports success while the fix has
-  # already reverted is worse than one that stops here.
+  # FAIL CLOSED on the pin. Without the immutable bit the VM agent rewrites this
+  # file back within ~10s and every EAI_AGAIN/stall this step exists to prevent
+  # silently returns.
   if ! sudo -n chattr +i "$RESOLV"; then
-    echo "FATAL: could not pin $RESOLV immutable; refusing to report a repaired resolver." >&2
-    echo "       Without the immutable bit the VM agent rewrites resolv.conf within" >&2
-    echo "       seconds and the single-forwarder EAI_AGAIN failure mode returns." >&2
-    echo "       Recovery is an operator action; see the resolver-pinning section of" >&2
-    echo "       docs/cloud-vm-hosts.md (OPERATOR-ONLY procedure, not run from here)." >&2
+    echo "could not pin $RESOLV immutable; without the bit the VM agent rewrites it" >&2
+    echo "within seconds and the single-forwarder EAI_AGAIN failure mode returns." >&2
+    return 1
+  fi
+  # Verify AFTER pinning: the agent can restore the old content between the write
+  # and the chattr, and the pin would then hold the WRONG file. Never report a
+  # repaired resolver that does not read back healthy.
+  if ! resolver_is_healthy; then
+    echo "resolver content did not read back healthy after pinning; the agent likely" >&2
+    echo "rewrote it mid-repair." >&2
+    return 1
+  fi
+  return 0
+}
+
+if resolver_is_healthy; then
+  echo "resolv.conf already healthy (>=3 nameservers, public fallbacks, timeout:2 attempts:3, immutable)"
+else
+  attempt=1
+  repaired=0
+  while [ "$attempt" -le 3 ]; do
+    if repair_resolver; then
+      repaired=1
+      break
+    fi
+    echo "resolver repair attempt $attempt did not verify; retrying in 2s" >&2
+    sleep 2
+    attempt=$((attempt + 1))
+  done
+  if [ "$repaired" -ne 1 ]; then
+    echo "FATAL: could not put $RESOLV into the pinned fallback shape after 3 attempts;" >&2
+    echo "       refusing to report a repaired resolver. Recovery is an operator action;" >&2
+    echo "       see the resolver-pinning section of docs/cloud-vm-hosts.md." >&2
     exit 1
   fi
 fi
@@ -191,16 +231,25 @@ path, count, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
 
 # Issue 229: pin the container's resolver list to the host's real forwarder plus
 # two public fallbacks. Detected at write time so a host whose forwarder is not
-# 10.32.0.28 still gets the entry that can answer VM-local names first.
-forwarder = "10.32.0.28"
-try:
-    for line in open("/etc/resolv.conf"):
-        m = re.match(r"^nameserver\s+(\S+)", line)
-        if m and m.group(1) not in ("1.1.1.1", "8.8.8.8", "127.0.0.53"):
-            forwarder = m.group(1)
-            break
-except OSError:
-    pass
+# 10.32.0.28 still gets the entry that can answer VM-local names first. If the
+# host exposes no private resolver, stop here instead of writing a guessed
+# address: `--dns` would then send every container lookup to the wrong server.
+forwarder = None
+for resolv_path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+    try:
+        for line in open(resolv_path):
+            m = re.match(r"^nameserver\s+(\S+)", line)
+            if m and m.group(1) not in ("1.1.1.1", "8.8.8.8", "9.9.9.9") \
+                    and not m.group(1).startswith("127."):
+                forwarder = m.group(1)
+                break
+    except OSError:
+        pass
+    if forwarder:
+        break
+if not forwarder:
+    sys.exit("FATAL: no private resolver found; refusing to write a guessed dns "
+             "entry into [runner] (issue 229)")
 
 dns_lines = [
     f'dns = ["{forwarder}", "1.1.1.1", "8.8.8.8"]\n',
