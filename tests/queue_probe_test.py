@@ -255,6 +255,31 @@ class OldestFreshWait(unittest.TestCase):
         self.assertEqual(result["sampled_fresh"], 10)
         self.assertLessEqual(len(calls), 12)
 
+    def test_queued_row_without_id_counts_toward_upper_bound_fresh_and_unverified(self):
+        def fake_gh(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {
+                    "total_count": 1,
+                    "workflow_runs": [{"created_at": "2020-01-01T00:00:00Z"}],
+                }
+            if "status=in_progress" in joined:
+                return 0
+            raise AssertionError(f"unexpected call: {args}")
+
+        original = queue_probe.gh_json
+        queue_probe.gh_json = fake_gh
+        try:
+            result = queue_probe.probe_repo("org/repo")
+        finally:
+            queue_probe.gh_json = original
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["fresh"], 1)
+        self.assertEqual(result["ghosts"], 0)
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["unverified_runs"], 1)
+        self.assertIsNotNone(result["oldest_fresh_wait_minutes"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

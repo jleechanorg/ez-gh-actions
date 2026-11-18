@@ -43,8 +43,9 @@ def _load_json(path):
     if not p.is_file():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 

@@ -927,15 +927,21 @@ class FleetLiveDashboardTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             tmp = Path(directory)
             missing_hosts = tmp / "missing_hosts.json"
+            bad_utf8_hosts = tmp / "bad_utf8_hosts.bin"
+            bad_utf8_hosts.write_bytes(b"\xff\xfe\x00\x81")
+            non_dict_cmux = tmp / "non_dict_cmux.json"
+            non_dict_cmux.write_text("[]", encoding="utf-8")
             bad_gh = tmp / "bad_github.json"
             bad_gh.write_text("{not valid json", encoding="utf-8")
             missing_lat = tmp / "missing_latency.json"
 
             with mock.patch.object(mod, "_collect_local_host_slots", side_effect=AssertionError("must not probe local host")), \
+                 mock.patch.object(mod, "_collect_live_cmux", side_effect=AssertionError("must not probe cmux")), \
                  mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("must not poll GH")), \
                  mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("must not poll latency")):
                 state = mod.build_operator_state(
                     hosts_json=missing_hosts,
+                    cmux_json=non_dict_cmux,
                     github_json=bad_gh,
                     latency_json=missing_lat,
                 )
@@ -946,10 +952,12 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertFalse(state["latency"]["ok"])
             self.assertIn("github fixture missing or unreadable", " ".join(state["reconciliation"]["gh_errors"]))
             self.assertIn("hosts fixture missing or unreadable", state["reconciliation"]["scope_note"])
+            self.assertIn("cmux fixture missing or unreadable", state["reconciliation"]["scope_note"])
 
             srv = mod.create_server(
                 port=0,
-                hosts_json=missing_hosts,
+                hosts_json=bad_utf8_hosts,
+                cmux_json=non_dict_cmux,
                 github_json=bad_gh,
                 latency_json=missing_lat,
             )
@@ -957,6 +965,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 import threading
                 import urllib.request
                 with mock.patch.object(mod, "_collect_local_host_slots", side_effect=AssertionError("must not probe local host")), \
+                     mock.patch.object(mod, "_collect_live_cmux", side_effect=AssertionError("must not probe cmux")), \
                      mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("must not poll GH")), \
                      mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("must not poll latency")):
                     port = srv.server_address[1]
@@ -965,6 +974,9 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     body = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).read().decode("utf-8")
                     self.assertIn("const AUTO_REFRESH_MS = 15000;", body)
                     self.assertIn("AUDIT SNAPSHOT", body)
+                    api_payload = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertIn("hosts fixture missing or unreadable", api_payload["reconciliation"]["scope_note"])
+                    self.assertIn("cmux fixture missing or unreadable", api_payload["reconciliation"]["scope_note"])
             finally:
                 srv.shutdown()
                 srv.server_close()

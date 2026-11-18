@@ -177,21 +177,21 @@ def probe_repo(repo, *, max_job_checks=None):
     for run in to_check:
         run_id = run.get("id")
         if run_id is None:
-            unreadable_jobs += 1
-            continue
-        try:
-            count = job_count(repo, run_id)
-        except RuntimeError as exc:
-            message = str(exc).lower()
-            if any(marker in message for marker in RATE_LIMIT_MARKERS):
-                # Do not report a rate-limited pass as a clean queue.
-                return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
-                        "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
-                        "queued_total": queued_total, "sample_capped": False,
-                        "sampled_fresh": None, "sampled_ghosts": None,
-                        "partial": False, "unverified_runs": 0,
-                        "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
+        else:
+            try:
+                count = job_count(repo, run_id)
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in RATE_LIMIT_MARKERS):
+                    # Do not report a rate-limited pass as a clean queue.
+                    return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                            "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                            "queued_total": queued_total, "sample_capped": False,
+                            "sampled_fresh": None, "sampled_ghosts": None,
+                            "partial": False, "unverified_runs": 0,
+                            "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
+                count = None
 
         if count is None:
             unreadable_jobs += 1
