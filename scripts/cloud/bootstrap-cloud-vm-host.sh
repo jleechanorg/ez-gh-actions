@@ -124,10 +124,11 @@ else
   # prevent silently returns — a bootstrap that reports success while the fix has
   # already reverted is worse than one that stops here.
   if ! sudo -n chattr +i "$RESOLV"; then
-    echo "FATAL: 'chattr +i $RESOLV' failed; refusing to report a repaired resolver." >&2
-    echo "       Without the immutable bit the VM agent rewrites resolv.conf and the" >&2
-    echo "       single-forwarder EAI_AGAIN failure mode returns. Revert risk: the host's" >&2
-    echo "       networking can no longer manage $RESOLV until 'chattr -i' runs." >&2
+    echo "FATAL: could not pin $RESOLV immutable; refusing to report a repaired resolver." >&2
+    echo "       Without the immutable bit the VM agent rewrites resolv.conf within" >&2
+    echo "       seconds and the single-forwarder EAI_AGAIN failure mode returns." >&2
+    echo "       Recovery is an operator action; see the resolver-pinning section of" >&2
+    echo "       docs/cloud-vm-hosts.md (OPERATOR-ONLY procedure, not run from here)." >&2
     exit 1
   fi
 fi
