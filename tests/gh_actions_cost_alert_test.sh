@@ -20,13 +20,39 @@ printf 'args=%s|GH_TOKEN=%s|GITHUB_TOKEN=%s\n' "$*" "${GH_TOKEN-<unset>}" "${GIT
 if [ -n "${GH_STUB_FAIL:-}" ]; then
   exit 1
 fi
+is_app_token=0
+if [ "${GH_TOKEN:-}" = "app-installation-token-must-not-be-used" ] || [ "${GH_TOKEN:-}" = "app-fallback-token" ]; then
+  is_app_token=1
+fi
 case "$*" in
   *"api rate_limit"*)
-    remaining="${RATE_LIMIT_REMAINING:-4500}"
+    if [ "$is_app_token" -eq 1 ]; then
+      remaining="${APP_RATE_LIMIT_REMAINING:-10200}"
+    else
+      remaining="${RATE_LIMIT_REMAINING:-4500}"
+    fi
     printf '{"resources":{"core":{"remaining":%s}}}\n' "$remaining" | jq -r '.resources.core.remaining // empty'
     ;;
   *"settings/billing/usage"*)
+    if [ -n "${BILLING_STUB_FAIL:-}" ]; then
+      echo "gh: HTTP 403: Resource not accessible" >&2
+      exit 1
+    fi
     cat "${BILLING_FIXTURE:?}"
+    ;;
+  *"orgs/"*"/repos"*)
+    cat "${REPOS_FIXTURE:?}"
+    ;;
+  *"/actions/runs/"*"/jobs"*)
+    run_id="$(printf '%s' "$*" | sed -E 's#.*/actions/runs/([0-9]+)/jobs.*#\1#')"
+    if [ -n "${JOBS_FIXTURE_DIR:-}" ] && [ -f "${JOBS_FIXTURE_DIR}/${run_id}.json" ]; then
+      cat "${JOBS_FIXTURE_DIR}/${run_id}.json"
+    else
+      printf '{"jobs":[]}\n'
+    fi
+    ;;
+  *"/actions/runs"*)
+    cat "${RUNS_FIXTURE:?}"
     ;;
   *)
     echo "unexpected gh call: $*" >&2
@@ -174,13 +200,13 @@ GH_BILLING_TOKEN="explicit-billing-pat" GH_TOKEN="wrong-app-token" \
 grep -q '|GH_TOKEN=explicit-billing-pat|' "$TMP/gh-auth2.log" || fail "GH_BILLING_TOKEN must be exported as GH_TOKEN when provided"
 pass "auth isolation avoids App token and honors GH_BILLING_TOKEN"
 
-# 7. Rate-limit guard: core.remaining < 50 skips billing API and counts toward BLIND.
+# 7. Rate-limit guard: core.remaining < 50 skips billing API and counts toward BLIND when no App fallback exists.
 : > "$TMP/gh-rl.log"
 for _ in 1 2 3; do
-  RATE_LIMIT_REMAINING=12 run_alert "$TMP/state-rl.json" "$TMP/gcloud-rl.log" "$TMP/gh-rl.log" >/dev/null 2>&1 || true
+  APP_TOKEN_FILE="$TMP/no-app-token" RATE_LIMIT_REMAINING=12 run_alert "$TMP/state-rl.json" "$TMP/gcloud-rl.log" "$TMP/gh-rl.log" >/dev/null 2>&1 || true
 done
 ! grep -q 'settings/billing/usage' "$TMP/gh-rl.log" || fail "low core rate limit (<50) must skip /settings/billing/usage"
-grep -q '"status":"BLIND"' "$TMP/gcloud-rl.log" || fail "repeated low rate-limit skips must emit BLIND WARNING"
+grep -q '"status":"BLIND"' "$TMP/gcloud-rl.log" || fail "repeated low rate-limit skips without fallback must emit BLIND WARNING"
 pass "rate_limit < 50 skips billing query and triggers BLIND after 3 cycles"
 
 # 8. --dry-run must not mutate persistent state or invoke gcloud.
@@ -190,3 +216,53 @@ after_sha="$(shasum -a 256 "$TMP/state-spike.json")"
 [ "$before_sha" = "$after_sha" ] || fail "--dry-run must not modify existing STATE_FILE"
 [ ! -e "$TMP/gcloud-dryrun.log" ] || fail "--dry-run must not call gcloud"
 pass "--dry-run preserves STATE_FILE and does not invoke gcloud"
+
+# 9. Bounded App-token fallback when personal rate_limit=0 (or billing returns 403):
+#    must NOT go BLIND, must use APP_TOKEN_FILE to scan pushed repos -> runs -> jobs,
+#    compute hosted macos-* ($0.062/min) + ubuntu-* ($0.006/min), ignore self-hosted jobs,
+#    respect MAX_APP_API_CALLS cap, and fire ERROR COST_SPIKE on >= 60 min macos-15.
+mkdir -p "$TMP/jobs"
+cat > "$TMP/repos.json" <<'JSON'
+[
+  {"name":"disk_magician","full_name":"jleechanorg/disk_magician","private":false,"pushed_at":"2026-11-18T00:30:00Z"}
+]
+JSON
+cat > "$TMP/runs.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9001,"status":"completed","conclusion":"success","created_at":"2026-11-18T00:10:00Z"},
+    {"id":9002,"status":"completed","conclusion":"skipped","created_at":"2026-11-18T00:20:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9001.json" <<'JSON'
+{
+  "jobs": [
+    {"id":1,"labels":["macos-15"],"started_at":"2026-11-18T00:00:00Z","completed_at":"2026-11-18T01:15:00Z"},
+    {"id":2,"labels":["ubuntu-latest"],"started_at":"2026-11-18T00:00:00Z","completed_at":"2026-11-18T00:10:00Z"},
+    {"id":3,"labels":["self-hosted-native-macos"],"started_at":"2026-11-18T00:00:00Z","completed_at":"2026-11-18T02:00:00Z"}
+  ]
+}
+JSON
+: > "$TMP/gh-fallback.log"
+RATE_LIMIT_REMAINING=0 APP_RATE_LIMIT_REMAINING=10200 \
+  REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-fallback.json" "$TMP/gcloud-fallback.log" "$TMP/gh-fallback.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-fallback.log")" = 1 ] || fail "App-token fallback with 75m macos-15 must emit COST_SPIKE ERROR"
+! grep -q '"status":"BLIND"' "$TMP/gcloud-fallback.log" || fail "App-token fallback must not emit BLIND"
+grep -q '"status":"COST_SPIKE"' "$TMP/gcloud-fallback.log" || fail "App-token fallback must emit status=COST_SPIKE"
+grep -q 'disk_magician' "$TMP/gcloud-fallback.log" || fail "App-token fallback alert must cite disk_magician"
+grep -q '75' "$TMP/gcloud-fallback.log" || fail "App-token fallback alert must cite 75 macOS min (excluding self-hosted)"
+grep -q 'orgs/jleechanorg/repos?sort=pushed&per_page=15|GH_TOKEN=app-installation-token-must-not-be-used' "$TMP/gh-fallback.log" || fail "App-token fallback must query org repos using APP_TOKEN_FILE"
+grep -q 'repos/jleechanorg/disk_magician/actions/runs?created=2026-11-18&per_page=50|GH_TOKEN=app-installation-token-must-not-be-used' "$TMP/gh-fallback.log" || fail "App-token fallback must query repo runs using APP_TOKEN_FILE"
+grep -q 'repos/jleechanorg/disk_magician/actions/runs/9001/jobs|GH_TOKEN=app-installation-token-must-not-be-used' "$TMP/gh-fallback.log" || fail "App-token fallback must query job details using APP_TOKEN_FILE"
+! grep -q 'runs/9002/jobs' "$TMP/gh-fallback.log" || fail "skipped runs must not consume job API calls"
+
+# Also verify fallback triggers when /settings/billing/usage fails (e.g. HTTP 403) and respects MAX_APP_API_CALLS cap.
+: > "$TMP/gh-fallback-403.log"
+BILLING_STUB_FAIL=1 RATE_LIMIT_REMAINING=4500 APP_RATE_LIMIT_REMAINING=10200 MAX_APP_API_CALLS=2 \
+  REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-fallback403.json" "$TMP/gcloud-fallback403.log" "$TMP/gh-fallback-403.log" >/dev/null
+app_calls="$(grep -c '|GH_TOKEN=app-installation-token-must-not-be-used|' "$TMP/gh-fallback-403.log" || true)"
+[ "$app_calls" -le 3 ] || fail "MAX_APP_API_CALLS=2 cap (plus 1 rate_limit check) exceeded: got $app_calls calls"
+pass "bounded App-token fallback detects hosted macOS spikes when personal quota=0 or billing 403"
