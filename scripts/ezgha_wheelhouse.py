@@ -132,6 +132,13 @@ def _sync_aliases(wheelhouse_path, desired_aliases):
             os.symlink(target_fn, alias_path)
 
 
+def _build_key(build):
+    if not build:
+        return (0, 0, "")
+    m = re.match(r"^([0-9]+)(.*)$", build)
+    return (1, int(m.group(1)), m.group(2)) if m else (1, 0, build)
+
+
 def _scan_real_wheels(wheelhouse_path):
     entries = []
     for fn in os.listdir(wheelhouse_path):
@@ -141,12 +148,12 @@ def _scan_real_wheels(wheelhouse_path):
         parsed = parse_wheel_filename(fn)
         if parsed is None:
             continue
-        dist_key, version, _build, py_tag, abi_tag, plat_tag = parsed
+        dist_key, version, build, py_tag, abi_tag, plat_tag = parsed
         try:
             mtime_ns = os.stat(full).st_mtime_ns
         except OSError:
             continue
-        entries.append(((version_key(version), mtime_ns, fn), dist_key, version, py_tag, abi_tag, plat_tag, fn))
+        entries.append(((version_key(version), _build_key(build), mtime_ns, fn), dist_key, version, py_tag, abi_tag, plat_tag, fn))
     return entries
 
 
@@ -167,7 +174,7 @@ def sync_wheelhouse_build_tag_symlinks(wheelhouse_path, clear_only=False):
 
 
 def prune_old_wheels(wheelhouse_path, keep_versions=None):
-    """Keep newest `keep_versions` wheels per (dist, py, abi, plat) group and sync symlinks."""
+    """Keep newest `keep_versions` distinct versions per (dist, py, abi, plat) group and sync symlinks."""
     if not os.path.isdir(wheelhouse_path):
         return 0
     if keep_versions is None:
@@ -190,16 +197,23 @@ def prune_old_wheels(wheelhouse_path, keep_versions=None):
     desired_aliases = {}
     for _gkey, items in sorted(groups.items()):
         items.sort(key=lambda it: it[0])
-        to_prune = items[:-keep_versions] if len(items) > keep_versions else []
-        for item in to_prune:
-            old_fn = item[-1]
-            try:
-                os.unlink(os.path.join(wheelhouse_path, old_fn))
-                pruned += 1
-            except OSError as exc:
-                warn(f"could not prune old wheel {old_fn}: {exc}")
-        for _skey, d, v, py, abi, pl, fn in items[-keep_versions:]:
-            desired_aliases[f"{d}-{v}-{BUILD_TAG_MARKER}-{py}-{abi}-{pl}.whl"] = fn
+        ordered_versions = []
+        seen_versions = set()
+        for item in items:
+            v = item[2]
+            if v not in seen_versions:
+                seen_versions.add(v)
+                ordered_versions.append(v)
+        kept_versions = set(ordered_versions[-keep_versions:])
+        for _skey, d, v, py, abi, pl, fn in items:
+            if v not in kept_versions:
+                try:
+                    os.unlink(os.path.join(wheelhouse_path, fn))
+                    pruned += 1
+                except OSError as exc:
+                    warn(f"could not prune old wheel {fn}: {exc}")
+            else:
+                desired_aliases[f"{d}-{v}-{BUILD_TAG_MARKER}-{py}-{abi}-{pl}.whl"] = fn
 
     _sync_aliases(wheelhouse_path, desired_aliases)
     if pruned:

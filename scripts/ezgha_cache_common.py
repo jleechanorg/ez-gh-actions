@@ -97,6 +97,7 @@ def resolve_docker_env():
             except (subprocess.TimeoutExpired, OSError) as exc:
                 warn(f"plutil failed reading DOCKER_HOST from {plist}: {exc}")
         if os.environ.get("DOCKER_HOST", "").strip():
+            env["DOCKER_CONTEXT"] = None
             return env
         if not os.path.exists("/var/run/docker.sock"):
             colima_sock = os.path.expanduser("~/.colima/default/docker.sock")

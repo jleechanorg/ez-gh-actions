@@ -108,10 +108,10 @@ jobs:
       - name: Flag a non-executing SKIP loudly (do not let it hide silently)
         if: always()
         run: |
-          if grep -q '^SKIP:' /tmp/virtiofs-canary.log; then
-            echo "::warning::regression test(s) SKIPped (no nested docker daemon in this runner container) -- this run did NOT exercise the virtiofs/hydration assertions. See the workflow file header for the tracked follow-up."
-          elif grep -qE '^FAIL:|\[FAIL\]' /tmp/virtiofs-canary.log; then
+          if grep -qE '^FAIL:|\[FAIL\]' /tmp/virtiofs-canary.log; then
             echo "::error::virtiofs/hydration regression test(s) reported one or more [FAIL] assertions -- see the job log above."
+          elif grep -q '^SKIP:' /tmp/virtiofs-canary.log; then
+            echo "::warning::regression test(s) SKIPped (no nested docker daemon in this runner container) -- this run did NOT exercise the virtiofs/hydration assertions. See the workflow file header for the tracked follow-up."
           else
             echo "virtiofs/hydration regression tests ran their real assertions (no SKIP) -- see [OK]/[FAIL] counts above."
           fi

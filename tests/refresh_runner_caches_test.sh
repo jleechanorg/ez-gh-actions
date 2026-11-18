@@ -39,6 +39,15 @@ pass() { echo "PASS: $*"; }
 [ -x "${REFRESH_SCRIPT}" ] || fail "missing executable ${REFRESH_SCRIPT}"
 [ -x "${VERIFY_SCRIPT}" ] || fail "missing executable ${VERIFY_SCRIPT}"
 
+PYTHON_BIN=""
+for _py in python3 python3.14 python3.13 python3.12 python3.11 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+  if command -v "${_py}" >/dev/null 2>&1 && "${_py}" -c 'import tomllib' >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v "${_py}")"
+    break
+  fi
+done
+[ -n "${PYTHON_BIN}" ] || fail "Python 3.11+ with stdlib tomllib is required to run refresh_runner_caches_test.sh"
+
 POISON_BIN="${WORK}/poison_bin"
 POISON_LOG="${WORK}/poison_docker.log"
 mkdir -p "${POISON_BIN}"
@@ -294,10 +303,10 @@ mkdir -p "${GEN_B12}"
 printf '1000\n' > "${GEN_B12}/RETIRED_AT"
 MIN_BIN_B12="${WORK}/min_bin_b12"
 mkdir -p "${MIN_BIN_B12}"
-ln -s "$(command -v python3)" "${MIN_BIN_B12}/python3"
+ln -s "${PYTHON_BIN}" "${MIN_BIN_B12}/python3"
 ln -s "$(which -a git | grep -v '/\.local/bin/' | head -n1 || command -v git)" "${MIN_BIN_B12}/git"
 OUT_B12="${WORK}/out_b12.log"
-env -u EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH BASH_ENV=/dev/null PATH="${MIN_BIN_B12}" HOME="${HOME_B}" \
+env -u EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH BASH_ENV=/dev/null EZGHA_STRICT_PATH=1 PATH="${MIN_BIN_B12}" HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
   "$(command -v bash)" "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels > "${OUT_B12}" 2>&1 \
   || fail "missing docker CLI fail-closed test exited non-zero: $(cat "${OUT_B12}")"
@@ -305,7 +314,7 @@ env -u EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH BASH_ENV=/dev/null PATH="${MIN_BI
 grep -q "docker CLI not found; failing closed to preserve retired generations" "${OUT_B12}" || fail "missing docker CLI warning absent"
 pass "(b12) missing docker CLI fails closed (0.0) and preserves expired retired generation"
 
-# ── (b13) Wheelhouse pruning (normal + reap_only) + deconfigured-slug reaping ──
+# ── (b13) Wheelhouse pruning (normal + reap_only + distinct-version build tags) + deconfigured-slug reaping ──
 DECFG_GEN="${MIRRORS_B}/generations/jleechanorg__deconfigured_repo.999"
 mkdir -p "${DECFG_GEN}"
 printf '1000\n' > "${DECFG_GEN}/RETIRED_AT"
@@ -314,11 +323,12 @@ run_b
 
 WH_PRUNE_NORMAL="${WORK}/wh_prune_normal"
 WH_PRUNE_LOW="${WORK}/wh_prune_low"
-mkdir -p "${WH_PRUNE_NORMAL}" "${WH_PRUNE_LOW}"
-python3 - "${REPO_ROOT}/scripts" "${WH_PRUNE_NORMAL}" "${WH_PRUNE_LOW}" <<'PY'
+WH_PRUNE_BUILDTAGS="${WORK}/wh_prune_buildtags"
+mkdir -p "${WH_PRUNE_NORMAL}" "${WH_PRUNE_LOW}" "${WH_PRUNE_BUILDTAGS}"
+"${PYTHON_BIN}" - "${REPO_ROOT}/scripts" "${WH_PRUNE_NORMAL}" "${WH_PRUNE_LOW}" "${WH_PRUNE_BUILDTAGS}" <<'PY'
 import os, sys
 
-scripts_dir, wh_normal, wh_low = sys.argv[1], sys.argv[2], sys.argv[3]
+scripts_dir, wh_normal, wh_low, wh_btags = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sys.path.insert(0, scripts_dir)
 import ezgha_wheelhouse  # noqa: E402
 
@@ -344,6 +354,19 @@ assert os.path.isfile(os.path.join(wh_normal, "alpha_pkg-1.10.0-py3-none-any.whl
 assert os.path.isfile(os.path.join(wh_normal, "alpha_pkg-1.0.0-cp311-cp311-manylinux_2_17_x86_64.whl"))
 newest_alias = os.path.join(wh_normal, "alpha_pkg-1.10.0-999999ezgha-py3-none-any.whl")
 assert os.path.islink(newest_alias) and os.readlink(newest_alias) == "alpha_pkg-1.10.0-py3-none-any.whl"
+
+for fn in (
+    "beta_pkg-1.0.0-py3-none-any.whl",
+    "beta_pkg-2.0.0-1-py3-none-any.whl",
+    "beta_pkg-2.0.0-2-py3-none-any.whl",
+):
+    open(os.path.join(wh_btags, fn), "w", encoding="utf-8").write("whl")
+assert ezgha_wheelhouse.prune_old_wheels(wh_btags, keep_versions=2) == 0
+assert os.path.isfile(os.path.join(wh_btags, "beta_pkg-1.0.0-py3-none-any.whl"))
+assert os.path.isfile(os.path.join(wh_btags, "beta_pkg-2.0.0-2-py3-none-any.whl"))
+btag_alias = os.path.join(wh_btags, "beta_pkg-2.0.0-999999ezgha-py3-none-any.whl")
+assert os.path.islink(btag_alias) and os.readlink(btag_alias) == "beta_pkg-2.0.0-2-py3-none-any.whl"
+
 seed_wheels(wh_low)
 PY
 
@@ -433,6 +456,7 @@ fi
 exit 1
 SH
 chmod +x "${FAKE_BIN}/docker"
+ln -sf "${PYTHON_BIN}" "${FAKE_BIN}/python3"
 
 CFG_D="${WORK}/cfg_d.toml"
 printf 'version = 1\n[runner]\nimage = "ezgha-runner:latest"\nwheelhouse_host_path = "%s"\n[limits]\nmin_free_disk_gb = 10\n' "${WH_D}" > "${CFG_D}"
@@ -469,16 +493,37 @@ FAKE_EXPECT_SYMLINK=1 EZGHA_WHEELHOUSE_DATE_BUCKET="2026-11-19" run_d
 SHA_WH3="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
 [ "${SHA_WH2}" != "${SHA_WH3}" ] || fail "manifest SHA did not change when date bucket changed"
 
-python3 - "${REPO_ROOT}/scripts" "${REQ_DIR}" "${WORK}" <<'PY'
+"${PYTHON_BIN}" - "${REPO_ROOT}/scripts" "${REQ_DIR}" "${WORK}" <<'PY'
 import os, sys
+from unittest import mock
 
 scripts_dir, req_dir, work_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, scripts_dir)
+import ezgha_cache_common  # noqa: E402
 import ezgha_git_mirrors  # noqa: E402
 import ezgha_wheelhouse  # noqa: E402
 import refresh_runner_caches  # noqa: E402
 
 assert ezgha_git_mirrors.slugs_for(["o/r"]) == ["o__r"]
+assert ezgha_git_mirrors.parse_mirror_repos("jleechanorg/ok ../escape ./dot a//b bare a/..") == ["jleechanorg/ok"]
+
+empty_darwin_home = os.path.join(work_dir, "empty_darwin_home")
+os.makedirs(empty_darwin_home, exist_ok=True)
+with mock.patch("platform.system", return_value="Darwin"), mock.patch.dict(
+    os.environ,
+    {
+        "HOME": empty_darwin_home,
+        "DOCKER_HOST": "unix:///intended.sock",
+        "DOCKER_CONTEXT": "wrong-ctx",
+    },
+    clear=True,
+):
+    raw_env = ezgha_cache_common.resolve_docker_env()
+    assert "DOCKER_CONTEXT" in raw_env and raw_env["DOCKER_CONTEXT"] is None, raw_env
+    merged_env = ezgha_cache_common.merge_env(raw_env)
+    assert merged_env.get("DOCKER_HOST") == "unix:///intended.sock", merged_env
+    assert merged_env.get("DOCKER_CONTEXT") is None and "DOCKER_CONTEXT" not in merged_env, merged_env
+
 rf_path, outside_file = os.path.join(req_dir, "cross_root.txt"), "/etc/hosts"
 if os.path.commonpath([os.path.dirname(os.path.realpath(rf_path)), os.path.dirname(os.path.realpath(outside_file))]) == "/" and os.path.isfile(outside_file):
     open(rf_path, "w", encoding="utf-8").write(f"-r {outside_file}\n-r base.txt\n")

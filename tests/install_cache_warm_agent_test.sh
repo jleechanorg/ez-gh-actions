@@ -58,6 +58,19 @@ HOME="${HOME_T}" bash "${REPO_ROOT}/launchd/install-launchagents.sh" remove >/de
 [[ ! -e "${PLIST}" ]] || { echo "FAIL: cache-warm plist survived removal" >&2; exit 1; }
 [[ ! -d "${HOME_T}/.local/libexec/ezgha" ]] || { echo "FAIL: stable scripts survived removal" >&2; exit 1; }
 
+# Label-scoped repair must install all 5 cache-warm modules without clobbering unrelated monitors.
+mkdir -p "${HOME_T}/.local/libexec/ezgha"
+printf '#!/usr/bin/env bash\n# sentinel-deployed-revision\n' > "${HOME_T}/.local/libexec/ezgha/trim-queued-runs.sh"
+chmod 0755 "${HOME_T}/.local/libexec/ezgha/trim-queued-runs.sh"
+HOME="${HOME_T}" bash "${REPO_ROOT}/launchd/install-launchagents.sh" install org.jleechanorg.ezgha-cache-warm >/dev/null
+[[ -f "${PLIST}" ]] || { echo "FAIL: label-scoped install did not render cache-warm plist" >&2; exit 1; }
+for mod in refresh_runner_caches.sh refresh_runner_caches.py ezgha_cache_common.py ezgha_git_mirrors.py ezgha_wheelhouse.py; do
+  [[ -x "${HOME_T}/.local/libexec/ezgha/${mod}" ]] || { echo "FAIL: label-scoped install missing ${mod}" >&2; exit 1; }
+done
+grep -Fq '# sentinel-deployed-revision' "${HOME_T}/.local/libexec/ezgha/trim-queued-runs.sh" \
+  || { echo "FAIL: label-scoped install clobbered trim-queued-runs.sh sentinel" >&2; exit 1; }
+HOME="${HOME_T}" bash "${REPO_ROOT}/launchd/install-launchagents.sh" remove >/dev/null
+
 if HOME="${HOME_T}" FAIL_LAUNCHCTL_LABEL="cache-warm" bash "${REPO_ROOT}/launchd/install-launchagents.sh" install >/dev/null 2>&1; then
   echo "FAIL: launchd load failure was swallowed" >&2
   exit 1

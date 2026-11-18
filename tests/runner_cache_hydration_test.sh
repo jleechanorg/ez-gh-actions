@@ -377,7 +377,7 @@ else
   bad "(h) two-step --depth=1 -> --unshallow failed (transferred_objects=${TWOSTEP_TRANSFERRED:-unknown})"
 fi
 
-# ── (10) Concurrent-borrower rollback guard ──
+# ── (10) Concurrent-borrower rollback guard (deterministic + real 2-process wrapper race) ──
 echo "=== (10) Failed initial hydrating fetch preserves alternates when concurrent borrower active ==="
 BORROWER_OUT=$(docker run --rm \
   -v "${UPSTREAM_GIT}:/upstream.git:ro" \
@@ -408,14 +408,80 @@ EOF
     echo "CB_SEED_REFS=${seed_refs}"
     obj_type="$(/usr/bin/git -C /tmp/cb cat-file -t "${SEED_SHA}" 2>/dev/null || echo missing)"
     echo "CB_SEED_OBJ_TYPE=${obj_type}"
+
+    # Part B: Real two-process concurrent /usr/local/bin/git wrapper test.
+    # Process 1 is the initial hydrator (HYDRATED_NOW=1) and fails while Process 2
+    # (a real /usr/local/bin/git fetch borrower) is actively in flight.
+    git init -b main /tmp/cb2 >/dev/null
+    git -C /tmp/cb2 remote add origin "${ORIGIN_URL}"
+    cat > /tmp/p1-up.sh <<'\''EOF'\''
+#!/usr/bin/env bash
+touch /tmp/p1-in-up >/dev/null 2>&1
+for _ in $(seq 1 100); do
+  [ -f /tmp/p2-in-up ] && break
+  sleep 0.05
+done
+exit 1
+EOF
+    cat > /tmp/p2-up.sh <<'\''EOF'\''
+#!/usr/bin/env bash
+touch /tmp/p2-in-up >/dev/null 2>&1
+for _ in $(seq 1 100); do
+  [ -f /tmp/p1-inspected ] && break
+  sleep 0.05
+done
+exec /usr/bin/git-upload-pack "$@"
+EOF
+    chmod +x /tmp/p1-up.sh /tmp/p2-up.sh
+
+    /usr/local/bin/git -C /tmp/cb2 fetch --upload-pack /tmp/p1-up.sh origin refs/heads/nonexistent-branch >/dev/null 2>&1 &
+    p1_pid=$!
+    for _ in $(seq 1 100); do
+      [ -f /tmp/p1-in-up ] && break
+      sleep 0.05
+    done
+    [ -f /tmp/p1-in-up ] || { echo "CB2_BARRIER_FAIL=p1"; exit 1; }
+
+    /usr/local/bin/git -C /tmp/cb2 fetch --upload-pack /tmp/p2-up.sh origin main >/dev/null 2>&1 &
+    p2_pid=$!
+
+    set +e
+    wait "${p1_pid}"
+    p1_rc=$?
+    set -e
+    echo "CB2_P1_RC=${p1_rc}"
+    [ -e /tmp/cb2/.git/ezgha-hydrated ] && echo "CB2_MID_HYDRATED=PRESENT" || echo "CB2_MID_HYDRATED=ABSENT"
+    [ -f /tmp/cb2/.git/objects/info/alternates ] && echo "CB2_MID_ALTERNATES=PRESENT" || echo "CB2_MID_ALTERNATES=ABSENT"
+    mid_refs="$(/usr/bin/git -C /tmp/cb2 for-each-ref --format="%(refname)" refs/ezgha-seed)"
+    mid_count="$(printf "%s\n" "${mid_refs}" | sed "/^$/d" | wc -l | tr -d "[:space:]")"
+    echo "CB2_MID_BORROWER_COUNT=${mid_count}"
+
+    touch /tmp/p1-inspected
+    set +e
+    wait "${p2_pid}"
+    p2_rc=$?
+    set -e
+    echo "CB2_P2_RC=${p2_rc}"
+    final_refs="$(/usr/bin/git -C /tmp/cb2 for-each-ref --format="%(refname)" refs/ezgha-seed)"
+    [ -z "${final_refs}" ] && echo "CB2_FINAL_REFS=CLEAN" || echo "CB2_FINAL_REFS=${final_refs}"
+    [ -f /tmp/cb2/.git/objects/info/alternates ] && echo "CB2_FINAL_ALTERNATES=PRESENT" || echo "CB2_FINAL_ALTERNATES=ABSENT"
+    /usr/bin/git -C /tmp/cb2 fsck --full >/dev/null 2>&1 && echo "CB2_FSCK=0" || echo "CB2_FSCK=1"
   ' 2>&1)
 echo "${BORROWER_OUT}" | sed 's/^/    /'
 if printf '%s\n' "${BORROWER_OUT}" | grep -Eq "^CB_FETCH_RC=[1-9][0-9]*$" \
   && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_HYDRATED=PRESENT$" \
   && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_ALTERNATES=PRESENT$" \
   && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_SEED_REFS=refs/ezgha-seed/pid-concurrent-borrower$" \
-  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_SEED_OBJ_TYPE=commit$"; then
-  ok "(10) failed initial fetch deleted only its own SEED_REF and preserved alternates/ezgha-hydrated for concurrent borrower"
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB_SEED_OBJ_TYPE=commit$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -Eq "^CB2_P1_RC=[1-9][0-9]*$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_MID_HYDRATED=PRESENT$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_MID_ALTERNATES=PRESENT$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_MID_BORROWER_COUNT=1$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_P2_RC=0$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_FINAL_REFS=CLEAN$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_FINAL_ALTERNATES=PRESENT$" \
+  && printf '%s\n' "${BORROWER_OUT}" | grep -q "^CB2_FSCK=0$"; then
+  ok "(10) deterministic and real two-process concurrent borrower rollback preserved alternates and completed cleanly"
 else
   bad "(10) concurrent-borrower rollback guard failed"
 fi

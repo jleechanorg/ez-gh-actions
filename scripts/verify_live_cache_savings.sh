@@ -4,12 +4,27 @@
 # Portable across Linux (bash + GNU) and macOS (bash 3.2+ + BSD).
 set -euo pipefail
 
-for _dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.local/bin"; do
-  if [ -d "${_dir}" ] && [[ ":${PATH}:" != *":${_dir}:"* ]]; then
-    PATH="${_dir}:${PATH}"
+if [ "${EZGHA_STRICT_PATH:-0}" != "1" ]; then
+  for _dir in /opt/homebrew/bin /usr/local/bin "${HOME}/.local/bin"; do
+    if [ -d "${_dir}" ] && [[ ":${PATH:-}:" != *":${_dir}:"* ]]; then
+      PATH="${PATH:+${PATH}:}${_dir}"
+    fi
+  done
+  export PATH
+fi
+
+_py_list="python3 python3.14 python3.13 python3.12 python3.11"
+if [ "${EZGHA_STRICT_PATH:-0}" != "1" ]; then
+  _py_list="${_py_list} /opt/homebrew/bin/python3 /usr/local/bin/python3"
+fi
+PYTHON_BIN=""
+for _py in ${_py_list}; do
+  if command -v "${_py}" >/dev/null 2>&1 && "${_py}" -c 'import tomllib' >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v "${_py}")"
+    break
   fi
 done
-export PATH
+[ -n "${PYTHON_BIN}" ] || { echo "FAIL: Python 3.11+ with stdlib tomllib is required" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_MODE=""
@@ -94,7 +109,7 @@ fi
 
 [ -f "${CONFIG_PATH}" ] || { echo "FAIL: config.toml not found at ${CONFIG_PATH}" >&2; exit 1; }
 
-PARSED_INFO="$(python3 - "${CONFIG_PATH}" <<'PY'
+PARSED_INFO="$("${PYTHON_BIN}" - "${CONFIG_PATH}" <<'PY'
 import os
 import sys
 import tomllib

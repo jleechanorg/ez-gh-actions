@@ -222,6 +222,26 @@ def reap_old_generations(generations_dir, active_dir, slug, retention_min, oldes
             shutil.rmtree(entry_real, ignore_errors=True)
 
 
+_REPO_PART_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def parse_mirror_repos(raw):
+    valid = []
+    for entry in raw.strip().split():
+        parts = entry.split("/")
+        if (
+            len(parts) != 2
+            or not _REPO_PART_RE.fullmatch(parts[0])
+            or not _REPO_PART_RE.fullmatch(parts[1])
+            or parts[0] in (".", "..")
+            or parts[1] in (".", "..")
+        ):
+            warn(f"skipping invalid EZGHA_MIRROR_REPOS entry {entry!r} (expected owner/repo)")
+            continue
+        valid.append(entry)
+    return valid
+
+
 def slugs_for(repos):
     return [r.replace("/", "__") for r in repos]
 
@@ -334,7 +354,7 @@ def refresh_git_mirrors(mirror_root, reap_only=False):
     if reap_only and not os.path.isdir(generations_dir):
         return
 
-    repos = [r for r in os.environ.get("EZGHA_MIRROR_REPOS", DEFAULT_MIRROR_REPOS).strip().split() if r]
+    repos = parse_mirror_repos(os.environ.get("EZGHA_MIRROR_REPOS", DEFAULT_MIRROR_REPOS))
     url_tmpl = os.environ.get("EZGHA_MIRROR_URL_TEMPLATE", "https://github.com/%s.git")
     # Default 480 min (8h): GitHub Actions' max job timeout is 360m + 120m safety margin.
     retention_min = int(os.environ.get("EZGHA_MIRROR_RETENTION_MIN", "480"))
