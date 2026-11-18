@@ -2,15 +2,15 @@
   "fleets": {
     "linux": {
       "disk": {
-        "status": "critical"
+        "status": "healthy"
       },
       "fleet": {
         "configured": 20,
         "cycling": 0,
-        "down": 8,
-        "executing": 12,
-        "idle": 0,
-        "reserved": 12
+        "down": 0,
+        "executing": 1,
+        "idle": 19,
+        "reserved": 20
       },
       "sources": {
         "config": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-18T23:06:30Z",
-  "published_at": "2026-11-18T23:07:03Z",
+  "observed_at": "2026-11-18T23:18:32Z",
+  "published_at": "2026-11-18T23:18:35Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
