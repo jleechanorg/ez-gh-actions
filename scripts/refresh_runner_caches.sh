@@ -214,7 +214,15 @@ def find_local_donor(repo):
             candidates.append(os.path.join(home, base, sub, ".git"))
     for cand in candidates:
         if os.path.exists(cand):
-            return os.path.dirname(cand)
+            cand_dir = os.path.dirname(cand)
+            proc = subprocess.run(
+                ["git", "-C", cand_dir, "rev-parse", "--is-shallow-repository"],
+                text=True,
+                capture_output=True,
+            )
+            if proc.returncode == 0 and proc.stdout.strip() == "false":
+                return cand_dir
+            log(f"skipping shallow or unreadable local donor {cand_dir}")
     return None
 
 
@@ -562,11 +570,16 @@ def main():
             log("cache-warm lock already held; exiting")
             return 0
 
-        required_gb = min_free_gb + 5
+        has_existing = (
+            bool(git_mirror_path and os.path.isdir(os.path.join(os.path.expanduser(git_mirror_path), "active")))
+            or bool(wheelhouse_path and os.path.isfile(os.path.join(os.path.expanduser(wheelhouse_path), ".manifest.sha256")))
+        )
+        buffer_gb = int(os.environ.get("EZGHA_CACHE_MIN_FREE_BUFFER_GB", "0" if has_existing else "1"))
+        required_gb = min_free_gb + buffer_gb
         free_gb = get_free_gb([git_mirror_path, wheelhouse_path])
         if free_gb < required_gb:
             warn(
-                f"free disk {free_gb:.1f} GiB below safety floor+5 ({required_gb} GiB); skipping cache refresh"
+                f"free disk {free_gb:.1f} GiB below safety floor+{buffer_gb} ({required_gb} GiB); skipping cache refresh"
             )
             return 0
 

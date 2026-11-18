@@ -39,9 +39,18 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
 # actual fix (verified via `playwright install-deps chromium webkit` + a real
 # chromium/webkit launch probe against this exact base image, both as root and as
 # the non-root runner user).
-RUN apt-get update && python3 -m venv /opt/playwright-deps-venv \
-    && /opt/playwright-deps-venv/bin/pip install --quiet playwright \
-    && /opt/playwright-deps-venv/bin/python -m playwright install-deps chromium webkit \
+ARG PLAYWRIGHT_VERSION=1.65.2
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+RUN apt-get update && mkdir -p /ms-playwright /opt/baked-wheels \
+    && python3 -m venv /opt/playwright-deps-venv \
+    && /opt/playwright-deps-venv/bin/pip download --quiet --dest /opt/baked-wheels "playwright==${PLAYWRIGHT_VERSION}" \
+    && /opt/playwright-deps-venv/bin/pip install --quiet --no-index --find-links=/opt/baked-wheels "playwright==${PLAYWRIGHT_VERSION}" \
+    && /opt/playwright-deps-venv/bin/python -m playwright install --with-deps chromium \
+    && /opt/playwright-deps-venv/bin/python -m playwright install-deps webkit \
+    && printf '%s\n' "${PLAYWRIGHT_VERSION}" > /ms-playwright/PLAYWRIGHT_VERSION \
+    && chown -R runner:runner /ms-playwright \
+    && chmod -R a+rX /ms-playwright /opt/baked-wheels \
     && rm -rf /opt/playwright-deps-venv /var/lib/apt/lists/*
 
 # Wrap `tar` (bead jleechan-93cf follow-up): /usr/local/bin resolves ahead
@@ -52,6 +61,11 @@ RUN apt-get update && python3 -m venv /opt/playwright-deps-venv \
 # tests/workspace_mount_symlink_extraction_test.sh for the regression test.
 COPY docker/tar-workspace-wrapper.sh /usr/local/bin/tar
 RUN chmod 0755 /usr/local/bin/tar
+
+# Wrap `git` to hydrate fresh repo fetches from a read-only host mirror when
+# EZGHA_GIT_MIRRORS is mounted; /usr/bin/git remains untouched.
+COPY docker/git-mirror-wrapper.sh /usr/local/bin/git
+RUN chmod 0755 /usr/local/bin/git
 
 # Run after action post steps/cache saves, while the ephemeral runner still
 # owns its workspace. Never wait for the replacement runner to reclaim it.
