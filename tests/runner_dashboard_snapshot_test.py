@@ -259,7 +259,7 @@ class SnapshotTest(unittest.TestCase):
             "ghosts": 149,
             "oldest_fresh_wait_minutes": 42,
             "in_progress_runs": 15,
-            "repos": [{"repo": "jleechanorg/worldarchitect.ai", "fresh": 50, "ghosts": 149}],
+            "repos": [{"repo": "org/public-queue-repo", "fresh": 50, "ghosts": 149}],
         }
 
         snapshot = MODULE.build_snapshot(
@@ -278,6 +278,8 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["fleets"]["linux"]["pause_reason"], "disk_floor_paused")
         self.assertEqual(len(snapshot["fleets"]["linux"]["slots"]), 20)
         self.assertEqual(snapshot["cmux"]["configured"], 25)
+        self.assertEqual(snapshot["cmux"]["vms"][0]["vm_id"], "cloud-vm-1")
+        self.assertEqual(snapshot["cmux"]["vms"][0]["slots"][0]["slot_id"], "cloud-vm-1-1")
         self.assertTrue(snapshot["latency"]["ok"])
         self.assertEqual(snapshot["latency"]["overall"]["queue_wait"]["p50_s"], 339.5)
         self.assertEqual(snapshot["reconciliation"]["active_job_slots_occupied"], 34)
@@ -293,6 +295,9 @@ class SnapshotTest(unittest.TestCase):
             "ghp_secret",
             "private-branch-xyz",
             "secret-latency-branch",
+            "cmux-dreamy",
+            "worldarchitect",
+            "worldai_frontend",
         ):
             self.assertNotIn(secret, serialized)
 

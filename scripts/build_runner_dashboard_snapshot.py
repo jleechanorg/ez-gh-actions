@@ -45,7 +45,7 @@ def _opt_str(value, max_len=64):
     return None
 
 
-def _sanitize_slots(raw_slots):
+def _sanitize_slots(raw_slots, *, slot_prefix=None):
     if not isinstance(raw_slots, list):
         return []
     slots = []
@@ -56,16 +56,12 @@ def _sanitize_slots(raw_slots):
         if state not in ALLOWED_SLOT_STATES:
             state = "DOWN"
         slot_num = _count(entry.get("slot")) or idx
-        slot_id = _opt_str(entry.get("slot_id"), 48) or f"slot-{slot_num}"
-        repo_short = _opt_str(entry.get("repo_short"), 64)
-        if repo_short and "/" in repo_short:
-            repo_short = repo_short.rsplit("/", 1)[-1]
+        slot_id = f"{slot_prefix}-{slot_num}" if slot_prefix else (_opt_str(entry.get("slot_id"), 48) or f"slot-{slot_num}")
         slots.append({
             "slot_id": slot_id,
             "slot": slot_num,
             "state": state,
             "elapsed_minutes": _opt_float(entry.get("elapsed_minutes")),
-            "repo_short": repo_short,
             "workflow_category": _opt_str(entry.get("workflow_category"), 48),
             "phase_badge": _opt_str(entry.get("phase_badge"), 48),
         })
@@ -221,11 +217,12 @@ def _public_cmux(payload):
             "vms": [],
         }
     vms = []
-    for vm in payload.get("vms") or []:
+    for idx, vm in enumerate(payload.get("vms") or [], start=1):
         if not isinstance(vm, dict):
             continue
+        anon_vm_id = f"cloud-vm-{idx}"
         vms.append({
-            "vm_id": _opt_str(vm.get("vm_id") or vm.get("short"), 48),
+            "vm_id": anon_vm_id,
             "configured": _count(vm.get("configured")),
             "executing": _count(vm.get("executing")),
             "idle": _count(vm.get("idle")),
@@ -233,7 +230,7 @@ def _public_cmux(payload):
             "down": _count(vm.get("down")),
             "disk_free_gb": _opt_float(vm.get("disk_free_gb")),
             "disk_floor_gb": _count(vm.get("disk_floor_gb")),
-            "slots": _sanitize_slots(vm.get("slots")),
+            "slots": _sanitize_slots(vm.get("slots"), slot_prefix=anon_vm_id),
         })
     return {
         "ok": True,
