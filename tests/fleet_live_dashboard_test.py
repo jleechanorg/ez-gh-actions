@@ -1015,10 +1015,73 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     self.assertIn("AUDIT SNAPSHOT", html_ap)
                     api_ap = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port_ap}/api/state", timeout=5).read().decode("utf-8"))
                     self.assertEqual(api_ap["source_mode"], "AUDIT SNAPSHOT")
+                    self.assertTrue(api_ap["reconciliation"]["active_runs_partial"])
+                    self.assertTrue(api_ap["reconciliation"]["queue_partial"])
+                    self.assertTrue(api_ap["reconciliation"]["gh_errors"])
+                    self.assertIn("hosts fixture missing or unreadable", api_ap["reconciliation"]["scope_note"])
+                    self.assertIn("cmux fixture missing or unreadable", api_ap["reconciliation"]["scope_note"])
                     self.assertFalse(api_ap["latency"]["ok"])
             finally:
                 srv_audit_perm.shutdown()
                 srv_audit_perm.server_close()
+
+    def test_live_repos_capped_at_three_to_preserve_rest_budget(self):
+        import subprocess
+        import sys
+        from unittest import mock
+
+        mod = load_module()
+        seven_repos = [f"org/r{i}" for i in range(1, 8)]
+        seen_gh_repos = []
+        seen_lat_repos = []
+
+        def fake_gh(args, timeout=20):
+            joined = " ".join(args)
+            for repo in seven_repos:
+                if repo in joined and "status=in_progress" in joined:
+                    seen_gh_repos.append(repo)
+                    return {"total_count": 0, "workflow_runs": []}
+            raise AssertionError(args)
+
+        def fake_q(repo, *, max_job_checks=None):
+            return {
+                "repo": repo, "ok": True, "fresh": 0, "ghosts": 0,
+                "oldest_fresh_wait_minutes": None, "in_progress_runs": 0,
+                "queued_total": 0, "sample_capped": False,
+                "sampled_fresh": 0, "sampled_ghosts": 0, "partial": False,
+                "unverified_runs": 0, "error": None,
+            }
+
+        def fake_probe_latency(repos, limit=15, job_run_limit=8):
+            seen_lat_repos.extend(repos)
+            return {"ok": True, "cohorts": {}, "workflows": []}
+
+        mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "data": None})
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
+             mock.patch.object(mod.queue_probe, "probe_repo", side_effect=fake_q), \
+             mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=fake_probe_latency):
+            snap = mod._collect_live_github_snapshot(repos=seven_repos)
+            lat = mod._cached_live_latency(seven_repos)
+        self.assertTrue(lat["ok"])
+        self.assertEqual(seen_gh_repos, seven_repos[:3])
+        self.assertEqual(seen_lat_repos, seven_repos[:3])
+        self.assertTrue(snap["summary"]["ip_partial"])
+        self.assertIn("capped at 3 of 7", " ".join(snap["errors"]))
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "--out-html",
+                "/dev/null",
+                *[arg for r in seven_repos for arg in ("--repo", r)],
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("at most 3", proc.stderr)
 
 
 if __name__ == "__main__":

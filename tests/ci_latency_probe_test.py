@@ -385,6 +385,8 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertTrue(payload["partial"])
         self.assertEqual(payload["truncated_job_fetches"], 1)
         self.assertEqual(payload["overall"]["execution"]["n"], 1)
+        self.assertEqual(payload["overall"]["job_total"]["p50_s"], 120.0)
+        self.assertEqual(payload["cohorts"]["success"]["job_total"]["p50_s"], 120.0)
 
 
 if __name__ == "__main__":

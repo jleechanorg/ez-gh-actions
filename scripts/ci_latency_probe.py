@@ -260,6 +260,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
     run_e2e_by_cohort = {"success": [], "failure": [], "cancelled": [], "all_non_skipped": []}
     job_queue_by_cohort = {"success": [], "failure": [], "cancelled": [], "all_non_skipped": []}
     job_exec_by_cohort = {"success": [], "failure": [], "cancelled": [], "all_non_skipped": []}
+    job_total_by_cohort = {"success": [], "failure": [], "cancelled": [], "all_non_skipped": []}
     wf_buckets = {}
     runner_class_buckets = {}
     repo_summaries = []
@@ -367,6 +368,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                     continue
                 q_s = _seconds_between(job.get("created_at"), job.get("started_at"))
                 e_s = _seconds_between(job.get("started_at"), job.get("completed_at"))
+                t_s = _seconds_between(job.get("created_at"), job.get("completed_at"))
                 if q_s is not None:
                     job_queue_by_cohort["all_non_skipped"].append(q_s)
                     wf_entry["cohorts"]["all_non_skipped"]["queue_wait"].append(q_s)
@@ -381,6 +383,10 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                         job_exec_by_cohort[j_conc].append(e_s)
                     if j_conc in wf_entry["cohorts"]:
                         wf_entry["cohorts"][j_conc]["execution"].append(e_s)
+                if t_s is not None:
+                    job_total_by_cohort["all_non_skipped"].append(t_s)
+                    if j_conc in job_total_by_cohort:
+                        job_total_by_cohort[j_conc].append(t_s)
                 r_cls = _classify_runner_class(job.get("runner_name"))
                 cls_bucket = runner_class_buckets.setdefault(
                     r_cls,
@@ -472,12 +478,14 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             "cohort": headline_cohort,
             "queue_wait": compute_stats(job_queue_by_cohort[headline_cohort]),
             "execution": compute_stats(job_exec_by_cohort[headline_cohort]),
+            "job_total": compute_stats(job_total_by_cohort[headline_cohort]),
             "e2e": compute_stats(run_e2e_by_cohort[headline_cohort]),
         },
         "cohorts": {
             cohort: {
                 "queue_wait": compute_stats(job_queue_by_cohort[cohort]),
                 "execution": compute_stats(job_exec_by_cohort[cohort]),
+                "job_total": compute_stats(job_total_by_cohort[cohort]),
                 "e2e": compute_stats(run_e2e_by_cohort[cohort]),
             }
             for cohort in COHORT_NAMES

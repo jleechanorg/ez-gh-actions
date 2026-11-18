@@ -34,19 +34,39 @@ import queue_probe  # noqa: E402
 
 _LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "data": None}
 _LIVE_LATENCY_TTL_S = 300.0
+MAX_LIVE_REPOS = 3
 
 
-def _load_json(path):
+def _cap_live_repos(repos):
+    raw = list(repos or [*ci_latency_probe.DEFAULT_REPOS, "jleechanorg/ez-gh-actions"])
+    dedup = list(dict.fromkeys(r for r in raw if isinstance(r, str) and r.strip()))
+    if len(dedup) <= MAX_LIVE_REPOS:
+        return dedup, None
+    dropped = dedup[MAX_LIVE_REPOS:]
+    return dedup[:MAX_LIVE_REPOS], (
+        f"Live GitHub scope capped at {MAX_LIVE_REPOS} of {len(dedup)} requested repos "
+        f"(omitted: {', '.join(dropped)}) to stay within REST rate limits."
+    )
+
+
+def _load_json_checked(path):
     if not path:
-        return None
+        return None, None
     p = Path(path)
     try:
         if not p.is_file():
-            return None
+            return None, f"missing or non-file: {p}"
         data = json.loads(p.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        if not isinstance(data, dict):
+            return None, f"expected JSON object in {p}"
+        return data, None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"{type(exc).__name__} reading {p}"
+
+
+def _load_json(path):
+    data, _ = _load_json_checked(path)
+    return data
 
 
 def _full_repo(repo):
@@ -804,7 +824,7 @@ def _collect_local_host_slots():
 
 def _collect_live_github_snapshot(repos=None):
     """Fallback bounded live GitHub query when no audit-dir is supplied."""
-    target_repos = list(repos or [*ci_latency_probe.DEFAULT_REPOS, "jleechanorg/ez-gh-actions"])
+    target_repos, cap_note = _cap_live_repos(repos)
     all_ip_jobs = []
     ip_runs_by_repo = {}
     ip_jobs_by_repo = {}
@@ -813,11 +833,11 @@ def _collect_live_github_snapshot(repos=None):
     total_ghosts = 0
     fresh_complete = True
     ip_failed_repos = set()
-    ip_capped = False
+    ip_capped = bool(cap_note)
     q_failed_repos = set()
     q_unverified_runs = 0
     sample_notes = []
-    errors = []
+    errors = [cap_note] if cap_note else []
     for repo in target_repos:
         short = _short_repo(repo)
         try:
@@ -912,7 +932,8 @@ def _collect_live_github_snapshot(repos=None):
 
 
 def _cached_live_latency(repos):
-    target = tuple(repos or ci_latency_probe.DEFAULT_REPOS)
+    capped, _ = _cap_live_repos(repos or ci_latency_probe.DEFAULT_REPOS)
+    target = tuple(capped)
     now = time.monotonic()
     if (
         _LIVE_LATENCY_CACHE["data"] is not None
@@ -1042,32 +1063,42 @@ def _is_fully_file_backed(*, audit_dir=None, hosts_json=None, github_json=None, 
 def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, github_json=None,
                          latency_json=None, repos=None, linux_host=None, cmux_cmd=None):
     base = Path(audit_dir) if audit_dir else None
-    hosts_data = _load_json(hosts_json or (base / "ubuntu_mac_slots.json" if base else None))
-    cmux_data = (
-        _load_json(cmux_json)
-        if cmux_json is not None
-        else (
-            (_load_json(base / "cmux_and_github_reconciliation.json") or _load_json(base / "cmux_parsed.json"))
-            if base
-            else None
-        )
-    )
-    gh_data = _load_json(github_json or (base / "github_live_snapshot.json" if base else None))
-    latency_raw = _load_json(latency_json or (base / "ci_latency_percentiles.json" if base else None))
+    hosts_path = hosts_json or (base / "ubuntu_mac_slots.json" if base else None)
+    hosts_data, hosts_err = _load_json_checked(hosts_path)
+
+    cmux_err = None
+    if cmux_json is not None:
+        cmux_data, cmux_err = _load_json_checked(cmux_json)
+    elif base is not None:
+        cmux_data, cmux_err = _load_json_checked(base / "cmux_and_github_reconciliation.json")
+        if cmux_data is None:
+            alt_data, alt_err = _load_json_checked(base / "cmux_parsed.json")
+            if alt_data is not None:
+                cmux_data, cmux_err = alt_data, None
+            elif cmux_err and cmux_err.startswith("missing or non-file:") and alt_err and alt_err.startswith("missing or non-file:"):
+                # Optional cmux feed omitted in audit_dir is fine; PermissionError/corrupt JSON is not.
+                cmux_err = None
+    else:
+        cmux_data = None
+
+    gh_path = github_json or (base / "github_live_snapshot.json" if base else None)
+    gh_data, gh_err = _load_json_checked(gh_path)
+    lat_path = latency_json or (base / "ci_latency_percentiles.json" if base else None)
+    latency_raw, lat_err = _load_json_checked(lat_path)
 
     fixture_errors = []
-    if hosts_json is not None and hosts_data is None:
-        fixture_errors.append(f"hosts fixture missing or unreadable: {hosts_json}")
+    if (hosts_json is not None or base is not None) and hosts_data is None:
+        fixture_errors.append(f"hosts fixture missing or unreadable ({hosts_err or hosts_path})")
         hosts_data = {"hosts": {}}
-    if cmux_json is not None and cmux_data is None:
-        fixture_errors.append(f"cmux fixture missing or unreadable: {cmux_json}")
-        cmux_data = {"ok": False, "error": f"cmux fixture missing or unreadable: {cmux_json}"}
-    if github_json is not None and gh_data is None:
-        err = f"github fixture missing or unreadable: {github_json}"
+    if (cmux_json is not None and cmux_data is None) or (base is not None and cmux_data is None and cmux_err is not None):
+        fixture_errors.append(f"cmux fixture missing or unreadable ({cmux_err or cmux_json})")
+        cmux_data = {"ok": False, "error": f"cmux fixture missing or unreadable: {cmux_err or cmux_json}"}
+    if (github_json is not None or base is not None) and gh_data is None:
+        err = f"github fixture missing or unreadable: {gh_err or gh_path}"
         fixture_errors.append(err)
         gh_data = {"errors": [err], "summary": {"ip_partial": True, "q_partial": True}}
-    if latency_json is not None and latency_raw is None:
-        err = f"latency fixture missing or unreadable: {latency_json}"
+    if (latency_json is not None or base is not None) and latency_raw is None:
+        err = f"latency fixture missing or unreadable: {lat_err or lat_path}"
         fixture_errors.append(err)
         latency_raw = {"ok": False, "error": err, "overall": {}, "cohorts": {}, "workflows": []}
 
@@ -1845,6 +1876,14 @@ def main():
     parser.add_argument("--serve", action="store_true", help="Run localhost live operator server")
     parser.add_argument("--port", type=int, default=8790)
     args = parser.parse_args()
+    if args.repo and _uses_live_github(
+        audit_dir=args.audit_dir,
+        github_json=args.github_json,
+        latency_json=args.latency_json,
+    ):
+        unique_repos = list(dict.fromkeys(r for r in args.repo if r and r.strip()))
+        if len(unique_repos) > MAX_LIVE_REPOS:
+            parser.error(f"--repo accepts at most {MAX_LIVE_REPOS} repositories in live mode to preserve GitHub REST headroom")
 
     if args.out_html:
         state = build_operator_state(
