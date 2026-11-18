@@ -3879,6 +3879,20 @@ fn start_one_with_generate_at_slot(
         bail!(CPUS_REQUIRE_CPU_CONTROLLER_ERR);
     }
     cmd.args(["--cpus", &format!("{:.2}", cpus)]);
+    // Explicit container DNS (issue 229): the cloud-VM fleet ships a single
+    // forwarding resolver with `timeout:1 attempts:2` and no fallback, which
+    // surfaces as EAI_AGAIN / multi-minute download stalls under burst. Opt-in:
+    // unset keeps today's behavior (inherit the host's /etc/resolv.conf).
+    if let Some(dns) = &cfg.runner.dns {
+        for server in dns {
+            cmd.args(["--dns", server.as_str()]);
+        }
+    }
+    if let Some(dns_opts) = &cfg.runner.dns_opts {
+        for opt in dns_opts {
+            cmd.args(["--dns-opt", opt.as_str()]);
+        }
+    }
     cmd.args(["--pids-limit", &format!("{}", cfg.limits.pids)]);
     cmd.args(["--security-opt", "no-new-privileges"]);
     if let Some(parent) = &cfg.limits.cgroup_parent {
@@ -9920,6 +9934,87 @@ esac
         assert!(
             run_line.contains("PIP_FIND_LINKS=/opt/wheelhouse"),
             "run args should set PIP_FIND_LINKS; got: {run_line}"
+        );
+    }
+
+    /// Issue 229: an explicitly configured resolver list must reach `docker run`
+    /// as `--dns`/`--dns-opt`, in the configured order (host forwarder first,
+    /// public fallbacks after it).
+    #[test]
+    fn dns_args_emitted_when_configured() {
+        let _env = TestEnv::new("dns_args_configured");
+        cpu_probe_overrides::set(Some(true));
+        let mut cfg = cfg_with(2, "ez-org-runner");
+        cfg.runner.dns = Some(vec![
+            "10.32.0.28".into(),
+            "1.1.1.1".into(),
+            "8.8.8.8".into(),
+        ]);
+        cfg.runner.dns_opts = Some(vec!["timeout:2".into(), "attempts:3".into()]);
+        let temp_dir = env::temp_dir().join(format!("ezgha-dns-args-test-{}", std::process::id()));
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 2222))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            run_line.contains("--dns 10.32.0.28"),
+            "run args should carry the host forwarder first; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("--dns 1.1.1.1"),
+            "run args should carry the first public fallback; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("--dns 8.8.8.8"),
+            "run args should carry the second public fallback; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("--dns-opt timeout:2"),
+            "run args should carry the relaxed resolver timeout; got: {run_line}"
+        );
+        assert!(
+            run_line.contains("--dns-opt attempts:3"),
+            "run args should carry the raised resolver attempt count; got: {run_line}"
+        );
+    }
+
+    /// Issue 229 opt-in contract: with `dns`/`dns_opts` unset the container must
+    /// keep inheriting the host's `/etc/resolv.conf` — zero behavior change.
+    #[test]
+    fn dns_args_absent_when_unset() {
+        let _env = TestEnv::new("dns_args_unset");
+        cpu_probe_overrides::set(Some(true));
+        let cfg = cfg_with(2, "ez-org-runner");
+        let temp_dir = env::temp_dir().join(format!("ezgha-dns-unset-test-{}", std::process::id()));
+
+        let capture = temp_dir.join("docker-args.log");
+        let script = fake_docker_capturing_args(&temp_dir, &capture);
+        *TEST_DOCKER_BIN.lock().unwrap() = Some(script.to_string_lossy().into_owned());
+
+        start_one_with_generate(&cfg, Backend::Docker, |_gh, _name, _labels, _owned| {
+            Ok(("jit".into(), 3333))
+        })
+        .expect("start_one should succeed");
+
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        let run_line = logged
+            .lines()
+            .find(|l| l.contains("run "))
+            .expect("a docker run invocation should have been logged");
+        assert!(
+            !run_line.contains("--dns"),
+            "no --dns/--dns-opt flag may be emitted when both fields are unset; got: {run_line}"
         );
     }
 
