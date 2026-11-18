@@ -367,15 +367,19 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                         job_exec_by_cohort[j_conc].append(e_s)
                     if j_conc in wf_entry["cohorts"]:
                         wf_entry["cohorts"][j_conc]["execution"].append(e_s)
-                if j_conc == "success":
-                    r_cls = _classify_runner_class(job.get("runner_name"))
-                    cls_bucket = runner_class_buckets.setdefault(
-                        r_cls, {"queue_wait": [], "execution": []}
-                    )
-                    if q_s is not None:
-                        cls_bucket["queue_wait"].append(q_s)
-                    if e_s is not None:
-                        cls_bucket["execution"].append(e_s)
+                r_cls = _classify_runner_class(job.get("runner_name"))
+                cls_bucket = runner_class_buckets.setdefault(
+                    r_cls,
+                    {c: {"queue_wait": [], "execution": []} for c in COHORT_NAMES},
+                )
+                if q_s is not None:
+                    cls_bucket["all_non_skipped"]["queue_wait"].append(q_s)
+                    if j_conc in cls_bucket:
+                        cls_bucket[j_conc]["queue_wait"].append(q_s)
+                if e_s is not None:
+                    cls_bucket["all_non_skipped"]["execution"].append(e_s)
+                    if j_conc in cls_bucket:
+                        cls_bucket[j_conc]["execution"].append(e_s)
 
         repo_summaries.append({
             "repo": repo,
@@ -424,13 +428,21 @@ def probe_latency(repos, limit=40, job_run_limit=20):
         else None
     )
 
-    runner_classes = {
-        cls: {
-            "queue_wait": compute_stats(vals["queue_wait"]),
-            "execution": compute_stats(vals["execution"]),
+    runner_classes = {}
+    for cls, vals in sorted(runner_class_buckets.items()):
+        cohorts_blk = {
+            c: {
+                "queue_wait": compute_stats(vals[c]["queue_wait"]),
+                "execution": compute_stats(vals[c]["execution"]),
+            }
+            for c in COHORT_NAMES
         }
-        for cls, vals in sorted(runner_class_buckets.items())
-    }
+        pref = cohorts_blk[headline_cohort] if cohorts_blk[headline_cohort]["execution"]["n"] > 0 else cohorts_blk["all_non_skipped"]
+        runner_classes[cls] = {
+            "queue_wait": pref["queue_wait"],
+            "execution": pref["execution"],
+            "cohorts": cohorts_blk,
+        }
 
     return {
         "schema_version": 1,
@@ -585,10 +597,22 @@ def from_audit_data(raw):
     for cls, cls_data in (job_audit.get("by_runner_class") or {}).items():
         if not isinstance(cls, str) or not isinstance(cls_data, dict):
             continue
-        c_succ = cls_data.get("success") or cls_data.get("all_non_skipped") or {}
+        cohorts_blk = {}
+        for c in COHORT_NAMES:
+            c_raw = cls_data.get(c) or {}
+            cohorts_blk[c] = {
+                "queue_wait": _pick_stat_block(c_raw.get("queue_wait")),
+                "execution": _pick_stat_block(c_raw.get("execution")),
+            }
+        pref = (
+            cohorts_blk[headline_cohort]
+            if cohorts_blk[headline_cohort]["execution"]["n"] > 0
+            else cohorts_blk["all_non_skipped"]
+        )
         runner_classes[cls] = {
-            "queue_wait": _pick_stat_block(c_succ.get("queue_wait")),
-            "execution": _pick_stat_block(c_succ.get("execution")),
+            "queue_wait": pref["queue_wait"],
+            "execution": pref["execution"],
+            "cohorts": cohorts_blk,
         }
 
     return {

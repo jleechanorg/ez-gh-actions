@@ -134,6 +134,50 @@ class UnknownHandling(unittest.TestCase):
         self.assertFalse(result["partial"])
         self.assertEqual(result["unverified_runs"], 0)
 
+    def test_null_job_count_and_short_listing_preserve_partial_uncertainty(self):
+        orig = queue_probe.gh_json
+        try:
+            # 1) job_count returning null without raising still marks partial + unverified_runs=1.
+            def null_job_gh(args):
+                joined = " ".join(args)
+                if "status=queued" in joined:
+                    return {"total_count": 1, "workflow_runs": [queued_run(70)]}
+                if "status=in_progress" in joined:
+                    return 0
+                if "/jobs" in joined:
+                    return None
+                raise AssertionError(args)
+
+            queue_probe.gh_json = null_job_gh
+            res_null = queue_probe.probe_repo("org/repo")
+            self.assertTrue(res_null["ok"])
+            self.assertEqual(res_null["fresh"], 1)
+            self.assertTrue(res_null["partial"])
+            self.assertEqual(res_null["unverified_runs"], 1)
+
+            # 2) Scheduled path (max_job_checks=None) receiving total_count=101 with 1 returned run
+            #    preserves uncertainty instead of reporting a complete 1-run queue.
+            def short_list_gh(args):
+                joined = " ".join(args)
+                if "status=queued" in joined:
+                    return {"total_count": 101, "workflow_runs": [queued_run(71)]}
+                if "status=in_progress" in joined:
+                    return 2
+                if "/jobs" in joined:
+                    return 1
+                raise AssertionError(args)
+
+            queue_probe.gh_json = short_list_gh
+            res_short = queue_probe.probe_repo("org/repo")
+            self.assertTrue(res_short["ok"])
+            self.assertEqual(res_short["queued_total"], 101)
+            self.assertTrue(res_short["partial"])
+            self.assertEqual(res_short["unverified_runs"], 100)
+            self.assertIsNone(res_short["fresh"])
+            self.assertIsNone(res_short["ghosts"])
+        finally:
+            queue_probe.gh_json = orig
+
     def test_rate_limited_pass_reports_not_ok(self):
         fake = FakeGH([queued_run(21)], {}, fail_jobs_for=(21,))
         result = run_against(fake)

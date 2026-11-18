@@ -126,6 +126,10 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertEqual(payload["cancellation"]["total_non_skipped_runs"], 2)
         self.assertAlmostEqual(payload["cancellation"]["cancelled_rate_pct"], 50.0, places=1)
         self.assertTrue(any(w["workflow"] == "Self-Hosted MVP Shards" for w in payload["workflows"]))
+        self.assertTrue(payload["runner_classes"])
+        first_cls = next(iter(payload["runner_classes"].values()))
+        self.assertEqual(first_cls["cohorts"]["all_non_skipped"]["execution"]["n"], 2)
+        self.assertEqual(first_cls["cohorts"]["cancelled"]["execution"]["n"], 1)
 
         serialized = json.dumps(payload)
         for forbidden in ("secret-private-branch-name", "SECRET PR TITLE DO NOT LEAK", "secret-actor"):
@@ -192,6 +196,18 @@ class ProbeAndRedactionTest(unittest.TestCase):
                             },
                         }
                     ],
+                    "by_runner_class": {
+                        "cmux-pool": {
+                            "success": {
+                                "queue_wait": {"n": 20, "avg_s": 100.0, "p50_s": 90.0, "p90_s": 180.0, "p99_s": 210.0, "max_s": 220.0},
+                                "execution": {"n": 20, "avg_s": 200.0, "p50_s": 150.0, "p90_s": 400.0, "p99_s": 450.0, "max_s": 460.0},
+                            },
+                            "all_non_skipped": {
+                                "queue_wait": {"n": 35, "avg_s": 120.0, "p50_s": 100.0, "p90_s": 220.0, "p99_s": 260.0, "max_s": 270.0},
+                                "execution": {"n": 35, "avg_s": 250.0, "p50_s": 190.0, "p90_s": 480.0, "p99_s": 510.0, "max_s": 520.0},
+                            },
+                        }
+                    },
                     "p90_slow_success_job_step_breakdown": {
                         "category_summaries_s": {
                             "checkout_hydrate": {"n": 20, "avg_s": 178.5, "p50_s": 76.5, "p90_s": 526.5, "p99_s": 747.1, "max_s": 764.0},
@@ -209,6 +225,8 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertEqual(normalized["overall"]["execution"]["p50_s"], 47.0)
         self.assertEqual(normalized["overall"]["e2e"]["p50_s"], 453.0)
         self.assertEqual(normalized["workflows"][0]["workflow"], "Presubmit Checks")
+        self.assertEqual(normalized["runner_classes"]["cmux-pool"]["execution"]["n"], 20)
+        self.assertEqual(normalized["runner_classes"]["cmux-pool"]["cohorts"]["all_non_skipped"]["execution"]["n"], 35)
 
     def test_from_audit_json_supports_custom_sanitized_repo_keys(self):
         mod = load_module()

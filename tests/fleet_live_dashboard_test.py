@@ -740,6 +740,16 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertTrue(rec["queue_partial"])
         self.assertEqual(rec["q_unverified_runs"], 2)
 
+        # Also verify full avg/p50/p90/p99 workflow table columns across Q, Exec, and Run + cohort runner_classes rendering.
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            state = mod.build_operator_state(audit_dir=tmp)
+            rendered = mod.render_html(state)
+            for col in ("q_avg", "q_p50", "q_p90", "q_p99", "e_avg", "e_p50", "e_p90", "e_p99", "e2e_avg", "e2e_p50", "e2e_p90", "e2e_p99"):
+                self.assertIn(f'data-sort="{col}"', rendered)
+            self.assertIn("data.cohorts[currentCohort]", rendered)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

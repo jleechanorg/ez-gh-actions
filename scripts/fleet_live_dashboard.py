@@ -863,19 +863,24 @@ def _collect_live_github_snapshot(repos=None):
                     sample_notes.append(
                         f"{short}: {q_probe['unverified_runs']} queued run(s) had unreadable jobs"
                     )
-                if q_probe.get("sample_capped"):
+                if q_probe.get("sample_capped") or q_probe.get("fresh") is None or q_probe.get("ghosts") is None:
                     fresh_complete = False
-                    sample_notes.append(
-                        f"{short}: sampled {q_probe['sampled_fresh']} fresh / {q_probe['sampled_ghosts']} ghosts of {q_probe['queued_total']} (>10 cap)"
-                    )
+                    if q_probe.get("sample_capped"):
+                        sample_notes.append(
+                            f"{short}: sampled {q_probe['sampled_fresh']} fresh / {q_probe['sampled_ghosts']} ghosts of {q_probe['queued_total']} (>10 cap)"
+                        )
+                    elif q_probe.get("unverified_runs"):
+                        sample_notes.append(
+                            f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
+                        )
                 else:
-                    total_fresh += q_probe.get("fresh") or 0
-                    total_ghosts += q_probe.get("ghosts") or 0
+                    total_fresh += q_probe["fresh"]
+                    total_ghosts += q_probe["ghosts"]
         except Exception as exc:
             fresh_complete = False
             q_failed_repos.add(repo)
             errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
-    q_partial = bool(q_failed_repos or q_unverified_runs > 0)
+    q_partial = bool(q_failed_repos or q_unverified_runs > 0 or not fresh_complete)
     return {
         "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "all_in_progress_jobs": all_ip_jobs,
@@ -1265,13 +1270,18 @@ def render_html(state, *, auto_refresh_ms=0):
             <th class="sortable" data-sort="repo">Repo</th>
             <th class="sortable" data-sort="workflow">Workflow</th>
             <th class="sortable" data-sort="n">N</th>
+            <th class="sortable" data-sort="q_avg">Q avg</th>
             <th class="sortable" data-sort="q_p50">Q p50</th>
             <th class="sortable" data-sort="q_p90">Q p90</th>
+            <th class="sortable" data-sort="q_p99">Q p99</th>
             <th class="sortable" data-sort="e_avg">Exec avg</th>
             <th class="sortable" data-sort="e_p50">Exec p50</th>
             <th class="sortable" data-sort="e_p90">Exec p90</th>
             <th class="sortable" data-sort="e_p99">Exec p99</th>
+            <th class="sortable" data-sort="e2e_avg">Run avg</th>
+            <th class="sortable" data-sort="e2e_p50">Run p50</th>
             <th class="sortable" data-sort="e2e_p90">Run p90</th>
+            <th class="sortable" data-sort="e2e_p99">Run p99</th>
           </tr>
         </thead>
         <tbody id="latency-tbody"></tbody>
@@ -1423,7 +1433,7 @@ def render_html(state, *, auto_refresh_ms=0):
 
       const extraCards = [];
       for (const [cls, data] of Object.entries(lat.runner_classes || {{}})) {{
-        const cs = (data.queue_wait || data.execution) ? (currentCohort === 'success' ? data : {{}}) : (data[currentCohort] || {{}});
+        const cs = (data.cohorts && data.cohorts[currentCohort]) || data[currentCohort] || ((data.queue_wait || data.execution) ? (currentCohort === 'success' ? data : {{}}) : {{}});
         const cq = cs.queue_wait || {{}}, ce = cs.execution || {{}};
         extraCards.push([`Runner: ${{cls}}`, `Q ${{fmtSec(cq.p50_s)}} | E ${{fmtSec(ce.p50_s)}}`, `E p90 ${{fmtSec(ce.p90_s)}} · E avg ${{fmtSec(ce.avg_s)}} (n=${{ce.n ?? 0}})`]);
       }}
@@ -1454,13 +1464,18 @@ def render_html(state, *, auto_refresh_ms=0):
           repo: wf.repo || '—',
           workflow: wf.workflow || '—',
           n: ex.n ?? qw.n ?? 0,
+          q_avg: qw.avg_s ?? -1,
           q_p50: qw.p50_s ?? -1,
           q_p90: qw.p90_s ?? -1,
+          q_p99: qw.p99_s ?? -1,
           e_avg: ex.avg_s ?? -1,
           e_p50: ex.p50_s ?? -1,
           e_p90: ex.p90_s ?? -1,
           e_p99: ex.p99_s ?? -1,
+          e2e_avg: e2.avg_s ?? -1,
+          e2e_p50: e2.p50_s ?? -1,
           e2e_p90: e2.p90_s ?? -1,
+          e2e_p99: e2.p99_s ?? -1,
         }};
       }});
       rows.sort((a, b) => {{
@@ -1473,13 +1488,18 @@ def render_html(state, *, auto_refresh_ms=0):
           <td>${{esc(r.repo)}}</td>
           <td><strong>${{esc(r.workflow)}}</strong></td>
           <td>${{esc(r.n)}}</td>
+          <td>${{fmtSec(r.q_avg)}}</td>
           <td>${{fmtSec(r.q_p50)}}</td>
           <td>${{fmtSec(r.q_p90)}}</td>
+          <td>${{fmtSec(r.q_p99)}}</td>
           <td>${{fmtSec(r.e_avg)}}</td>
           <td>${{fmtSec(r.e_p50)}}</td>
           <td><strong>${{fmtSec(r.e_p90)}}</strong></td>
           <td>${{fmtSec(r.e_p99)}}</td>
+          <td>${{fmtSec(r.e2e_avg)}}</td>
+          <td>${{fmtSec(r.e2e_p50)}}</td>
           <td>${{fmtSec(r.e2e_p90)}}</td>
+          <td>${{fmtSec(r.e2e_p99)}}</td>
         </tr>
       `).join('');
     }}

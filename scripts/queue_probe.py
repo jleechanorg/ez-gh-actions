@@ -144,11 +144,10 @@ def minutes_since(stamp):
 
 def probe_repo(repo, *, max_job_checks=None):
     try:
-        if max_job_checks is not None:
-            queued, queued_total = list_queued_with_total(repo, max_pages=1)
-        else:
-            queued = list_queued(repo)
-            queued_total = len(queued)
+        queued, queued_total = list_queued_with_total(
+            repo,
+            max_pages=1 if max_job_checks is not None else None,
+        )
     except RuntimeError as exc:
         return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
@@ -170,6 +169,7 @@ def probe_repo(repo, *, max_job_checks=None):
                     "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
         ip_runs = None
 
+    truncated = max_job_checks is None and queued_total > len(queued)
     sample_capped = max_job_checks is not None and (queued_total > max_job_checks or len(queued) > max_job_checks)
     to_check = queued[:max_job_checks] if (max_job_checks is not None and len(queued) > max_job_checks) else queued
     fresh = ghosts = unreadable_jobs = 0
@@ -177,6 +177,7 @@ def probe_repo(repo, *, max_job_checks=None):
     for run in to_check:
         run_id = run.get("id")
         if run_id is None:
+            unreadable_jobs += 1
             continue
         try:
             count = job_count(repo, run_id)
@@ -191,6 +192,8 @@ def probe_repo(repo, *, max_job_checks=None):
                         "partial": False, "unverified_runs": 0,
                         "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
+
+        if count is None:
             unreadable_jobs += 1
 
         if count == 0:
@@ -203,13 +206,14 @@ def probe_repo(repo, *, max_job_checks=None):
         if wait is not None and (oldest is None or wait > oldest):
             oldest = wait
 
+    unverified_runs = unreadable_jobs + (max(0, queued_total - len(queued)) if truncated else 0)
     return {"repo": repo, "ok": True,
-            "fresh": None if sample_capped else fresh,
-            "ghosts": None if sample_capped else ghosts,
+            "fresh": None if (sample_capped or truncated) else fresh,
+            "ghosts": None if (sample_capped or truncated) else ghosts,
             "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
             "queued_total": queued_total, "sample_capped": sample_capped,
             "sampled_fresh": fresh, "sampled_ghosts": ghosts,
-            "partial": unreadable_jobs > 0, "unverified_runs": unreadable_jobs,
+            "partial": bool(unverified_runs > 0 or truncated), "unverified_runs": unverified_runs,
             "error": None}
 
 
@@ -222,8 +226,9 @@ def main():
 
     repos = [probe_repo(repo) for repo in args.repo]
     ok = all(entry["ok"] for entry in repos)
-    fresh = sum(entry["fresh"] for entry in repos if entry["ok"]) if ok else None
-    ghosts = sum(entry["ghosts"] for entry in repos if entry["ok"]) if ok else None
+    complete_counts = ok and all(type(entry.get("fresh")) is int and type(entry.get("ghosts")) is int for entry in repos)
+    fresh = sum(entry["fresh"] for entry in repos) if complete_counts else None
+    ghosts = sum(entry["ghosts"] for entry in repos) if complete_counts else None
     ip_vals = [entry["in_progress_runs"] for entry in repos
                if entry["ok"] and type(entry.get("in_progress_runs")) is int]
     in_progress_total = (
@@ -241,7 +246,7 @@ def main():
         "ghosts": ghosts,
         "oldest_fresh_wait_minutes": max(waits) if waits else None,
         "in_progress_runs": in_progress_total,
-        "partial": any(entry.get("partial") for entry in repos),
+        "partial": any(entry.get("partial") or entry.get("sample_capped") for entry in repos),
         "unverified_runs": sum(entry.get("unverified_runs") or 0 for entry in repos),
         "repos": repos,
     }
