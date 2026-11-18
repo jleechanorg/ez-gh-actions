@@ -35,7 +35,7 @@ chmod +x "$TMP/bin/plutil"
 source "$HELPER"
 
 reset_ambient() {
-  export HOME="$TMP/home" PATH="$TMP/bin:$PATH"
+  export BASH_ENV=/dev/null HOME="$TMP/home" PATH="$TMP/bin:/usr/bin:/bin"
   export DOCKER_HOST="$AMBIENT_HOST" DOCKER_CONTEXT="interactive-context"
   unset PLUTIL_MODE
 }
@@ -99,3 +99,4 @@ check_consumer() {
 
 check_consumer "$ROOT/doctor-runner" '^if DOCKER_INFO=.*docker info'
 check_consumer "$ROOT/docs/verify-exit-criteria.sh" '^docker info --format'
+check_consumer "$ROOT/scripts/verify_live_cache_savings.sh" '^docker info --format'

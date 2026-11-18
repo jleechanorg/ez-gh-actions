@@ -151,6 +151,20 @@ lock. Tracked by bead jleechan-9p0g.
   owns the configured Pages branch and resolve that ownership before retrying;
   never auto-create the marker, delete existing content, or overwrite the branch.
 
+### Runner cache warmer & read-only mirror/wheelhouse recovery
+- **Low-disk `reap_only` pruning:** when free disk drops below
+  `limits.min_free_disk_gb + 5` GiB, the scheduled warmer
+  (`ezgha-cache-warm.timer` on Linux / `org.jleechanorg.ezgha-cache-warm` on
+  macOS) automatically skips new git mirror clones and wheel downloads while
+  still reaping expired retired mirror generations and pruning older `.whl`
+  versions (`EZGHA_WHEELHOUSE_KEEP_VERSIONS`, default `2`).
+- **Stale or missing warmer unit:** inspect
+  `~/.local/state/ezgha/cache-warm-launchd.log` (macOS) or the
+  `ezgha-cache-warm.service` user journal (Linux). Reinstall or trigger a warm
+  pass via `OPERATOR-ONLY: bash launchd/install-launchagents.sh install org.jleechanorg.ezgha-cache-warm`
+  on macOS or `OPERATOR-ONLY: systemctl --user restart ezgha-cache-warm.service`
+  on Linux. Containers mount both caches read-only and fail open when absent.
+
 ## /doctor-ezactions command
 Running `/doctor-ezactions` in this repo executes (bare `/doctor` is a deprecated alias):
 1. `./doctor-runner` — fleet health check (4-state per-slot activity truth)

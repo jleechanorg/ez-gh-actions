@@ -161,6 +161,13 @@ install_scripts() {
     echo "GH Actions cost alert payload installed: ${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
     return
   fi
+  if [[ "$label_filter" == "org.jleechanorg.ezgha-cache-warm" ]]; then
+    for name in refresh_runner_caches.sh refresh_runner_caches.py ezgha_cache_common.py ezgha_git_mirrors.py ezgha_wheelhouse.py; do
+      install -m 0755 "${REPO_PATH}/scripts/${name}" "${SCRIPTS_DIR}/${name}"
+    done
+    echo "cache-warm payload installed: ${SCRIPTS_DIR}"
+    return
+  fi
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.

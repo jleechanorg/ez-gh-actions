@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh ezgha runner git mirrors and pip wheelhouse caches
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@SCRIPTS_DIR@/refresh_runner_caches.sh
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:@HOME@/.cargo/bin:@HOME@/.local/bin
