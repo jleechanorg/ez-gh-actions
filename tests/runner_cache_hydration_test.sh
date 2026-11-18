@@ -27,10 +27,26 @@ if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
   exit 1
 fi
 
-SCRATCH_BASE="$(~/.claude/skills/scratch-space/scripts/scratch-dir.sh hydration-test 2>/dev/null || echo /tmp)"
-WORKDIR="${SCRATCH_BASE}/run-$$"
-mkdir -p "${WORKDIR}"
-trap 'rm -rf "${WORKDIR}"' EXIT
+SCRATCH_CANDIDATE="$("${HOME}/.claude/skills/scratch-space/scripts/scratch-dir.sh" hydration-test 2>/dev/null || true)"
+WORKDIR=""
+for base in "${SCRATCH_CANDIDATE}" "${TMPDIR:-/tmp}"; do
+  [ -n "${base}" ] || continue
+  mkdir -p "${base}" 2>/dev/null || continue
+  probe="$(mktemp -d "${base}/ezgha-hydration-probe.XXXXXX" 2>/dev/null || true)"
+  [ -n "${probe}" ] || continue
+  if git init -q "${probe}/r" 2>/dev/null \
+     && printf 'ok\n' | git -C "${probe}/r" hash-object -w --stdin >/dev/null 2>&1; then
+    rm -rf "${probe}"
+    WORKDIR="$(mktemp -d "${base}/ezgha-hydration-run.XXXXXX")"
+    break
+  fi
+  rm -rf "${probe}"
+done
+if [ -z "${WORKDIR}" ] || [ "${WORKDIR}" = "/" ]; then
+  echo "FAIL: unable to allocate git-capable temp workspace" >&2
+  exit 1
+fi
+trap 'if [ -n "${WORKDIR:-}" ] && [ "${WORKDIR}" != "/" ]; then rm -rf "${WORKDIR}"; fi' EXIT
 
 info "Using IMAGE=${IMAGE}, WORKDIR=${WORKDIR}"
 
@@ -42,34 +58,34 @@ GEN_DIR="${MIRROR_ROOT}/generations/jleechanorg__testrepo.1000"
 ACTIVE_DIR="${MIRROR_ROOT}/active"
 
 export HERMES_SKIP_EXAMPLE_COM_GUARD=1
-git init --bare -b main "${UPSTREAM_GIT}" >/dev/null
-git clone "${UPSTREAM_GIT}" "${SEED_WORK}" >/dev/null 2>&1
-git -C "${SEED_WORK}" config core.hooksPath /dev/null
-git -C "${SEED_WORK}" config user.email "jleechan2015@users.noreply.github.com"
-git -C "${SEED_WORK}" config user.name "ezgha-test"
+git init --bare -b main "${UPSTREAM_GIT}" >/dev/null || { echo "FAIL: git init bare failed" >&2; exit 1; }
+git clone "${UPSTREAM_GIT}" "${SEED_WORK}" >/dev/null 2>&1 || { echo "FAIL: git clone fixture failed" >&2; exit 1; }
+git -C "${SEED_WORK}" config core.hooksPath /dev/null || { echo "FAIL: git config core.hooksPath failed" >&2; exit 1; }
+git -C "${SEED_WORK}" config user.email "jleechan2015@users.noreply.github.com" || { echo "FAIL: git config email failed" >&2; exit 1; }
+git -C "${SEED_WORK}" config user.name "ezgha-test" || { echo "FAIL: git config name failed" >&2; exit 1; }
 
 for i in $(seq 1 55); do
   printf 'seed-blob-%03d-%s\n' "${i}" "$(printf 'x%.0s' {1..128})" > "${SEED_WORK}/file_${i}.txt"
-  git -C "${SEED_WORK}" add "file_${i}.txt"
-  git -C "${SEED_WORK}" commit -q -m "seed commit ${i}"
+  git -C "${SEED_WORK}" add "file_${i}.txt" || { echo "FAIL: git add failed" >&2; exit 1; }
+  git -C "${SEED_WORK}" commit -q -m "seed commit ${i}" || { echo "FAIL: git commit failed" >&2; exit 1; }
 done
-git -C "${SEED_WORK}" push -q origin main
+git -C "${SEED_WORK}" push -q origin main || { echo "FAIL: git push initial failed" >&2; exit 1; }
 
-mkdir -p "${MIRROR_ROOT}/generations" "${ACTIVE_DIR}"
-git clone --bare "${UPSTREAM_GIT}" "${GEN_DIR}" >/dev/null 2>&1
-SEED_SHA="$(git -C "${GEN_DIR}" rev-parse refs/heads/main)"
+mkdir -p "${MIRROR_ROOT}/generations" "${ACTIVE_DIR}" || { echo "FAIL: mkdir mirror dirs failed" >&2; exit 1; }
+git clone --bare "${UPSTREAM_GIT}" "${GEN_DIR}" >/dev/null 2>&1 || { echo "FAIL: git clone --bare generation failed" >&2; exit 1; }
+SEED_SHA="$(git -C "${GEN_DIR}" rev-parse refs/heads/main)" || { echo "FAIL: rev-parse SEED_SHA failed" >&2; exit 1; }
 printf '%s\n' "${SEED_SHA}" > "${GEN_DIR}/SEED_SHA"
 rm -rf "${GEN_DIR}/objects/info/commit-graph"*
-ln -s "../generations/jleechanorg__testrepo.1000" "${ACTIVE_DIR}/jleechanorg__testrepo"
+ln -s "../generations/jleechanorg__testrepo.1000" "${ACTIVE_DIR}/jleechanorg__testrepo" || { echo "FAIL: symlink active failed" >&2; exit 1; }
 
 for i in 56 57; do
   printf 'delta-blob-%03d-%s\n' "${i}" "$(printf 'y%.0s' {1..128})" > "${SEED_WORK}/file_${i}.txt"
-  git -C "${SEED_WORK}" add "file_${i}.txt"
-  git -C "${SEED_WORK}" commit -q -m "delta commit ${i}"
+  git -C "${SEED_WORK}" add "file_${i}.txt" || { echo "FAIL: git add delta failed" >&2; exit 1; }
+  git -C "${SEED_WORK}" commit -q -m "delta commit ${i}" || { echo "FAIL: git commit delta failed" >&2; exit 1; }
 done
-git -C "${SEED_WORK}" push -q origin main
+git -C "${SEED_WORK}" push -q origin main || { echo "FAIL: git push delta failed" >&2; exit 1; }
 
-chmod -R a+rX "${UPSTREAM_GIT}" "${MIRROR_ROOT}"
+chmod -R a+rX "${UPSTREAM_GIT}" "${MIRROR_ROOT}" || { echo "FAIL: chmod fixture failed" >&2; exit 1; }
 info "Created upstream (>55+2 commits) and generation SEED_SHA=${SEED_SHA}"
 
 # ── (a) Unshallow git fetch with standard URL and tokenized URL ──
@@ -264,6 +280,45 @@ if printf '%s\n' "${ROLLBACK_OUT}" | grep -Eq "^FAILED_FETCH_RC=[1-9][0-9]*$" \
   ok "(f) failed git fetch rolls back ezgha-hydrated, alternates, and refs/ezgha-seed/*"
 else
   bad "(f) failed git fetch did not cleanly roll back hydration state"
+fi
+
+# ── (g) Partial failed git fetch (ref advanced) preserves alternates ──
+echo "=== (g) Partial failed git fetch that updated a ref preserves alternates ==="
+PARTIAL_OUT=$(docker run --rm \
+  -v "${UPSTREAM_GIT}:/upstream.git:ro" \
+  -v "${MIRROR_ROOT}:/opt/ezgha-git-mirrors:ro" \
+  -e EZGHA_GIT_MIRRORS=/opt/ezgha-git-mirrors \
+  "${IMAGE}" bash -lc '
+    set -euo pipefail
+    ORIGIN_URL="https://github.com/jleechanorg/testrepo.git"
+    git config --global "url.file:///upstream.git.insteadOf" "${ORIGIN_URL}"
+    git init -b main /tmp/rb2 >/dev/null
+    git -C /tmp/rb2 remote add origin "${ORIGIN_URL}"
+    empty_tree="$(git -C /tmp/rb2 mktree </dev/null)"
+    blk_commit="$(git -C /tmp/rb2 -c user.name=ezgha-test -c user.email=jleechan2015@users.noreply.github.com commit-tree "${empty_tree}" -m blocker)"
+    git -C /tmp/rb2 update-ref refs/heads/blocker "${blk_commit}"
+    set +e
+    git -C /tmp/rb2 fetch origin refs/heads/main:refs/heads/advanced refs/heads/main:refs/heads/blocker/sub >/tmp/rb2.log 2>&1
+    rc=$?
+    set -e
+    cat /tmp/rb2.log
+    echo "PARTIAL_FETCH_RC=${rc}"
+    [ -e /tmp/rb2/.git/ezgha-hydrated ] && echo "HYDRATED_MARKER=PRESENT" || echo "HYDRATED_MARKER=ABSENT"
+    [ -f /tmp/rb2/.git/objects/info/alternates ] && echo "ALTERNATES=PRESENT" || echo "ALTERNATES=ABSENT"
+    git -C /tmp/rb2 show-ref | grep -q "refs/heads/advanced" && echo "ADVANCED_REF=PRESENT" || echo "ADVANCED_REF=ABSENT"
+    git -C /tmp/rb2 show-ref | grep -q "refs/ezgha-seed/" && echo "RESIDUE=FOUND" || echo "RESIDUE=CLEAN"
+    git -C /tmp/rb2 fsck --full >/tmp/rb2-fsck.log 2>&1 && echo "FSCK_RC=0" || { cat /tmp/rb2-fsck.log; echo "FSCK_RC=1"; }
+  ' 2>&1)
+echo "${PARTIAL_OUT}" | sed 's/^/    /'
+if printf '%s\n' "${PARTIAL_OUT}" | grep -Eq "^PARTIAL_FETCH_RC=[1-9][0-9]*$" \
+  && printf '%s\n' "${PARTIAL_OUT}" | grep -q "^HYDRATED_MARKER=PRESENT$" \
+  && printf '%s\n' "${PARTIAL_OUT}" | grep -q "^ALTERNATES=PRESENT$" \
+  && printf '%s\n' "${PARTIAL_OUT}" | grep -q "^ADVANCED_REF=PRESENT$" \
+  && printf '%s\n' "${PARTIAL_OUT}" | grep -q "^RESIDUE=CLEAN$" \
+  && printf '%s\n' "${PARTIAL_OUT}" | grep -q "^FSCK_RC=0$"; then
+  ok "(g) failed git fetch that updated a ref preserves alternates and passes fsck"
+else
+  bad "(g) failed git fetch that updated a ref dropped alternates or broke repo"
 fi
 
 echo

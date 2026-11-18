@@ -16,17 +16,33 @@ export PATH
 
 exec python3 - "$@" <<'PY'
 import argparse
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import time
+
+
+GIT_REPO_ENV_RESET = {
+    k: None
+    for k in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+    )
+}
+GIT_SANITARY_ENV = {**GIT_REPO_ENV_RESET, "GIT_TERMINAL_PROMPT": "0"}
 
 
 DEFAULT_MIRROR_REPOS = "jleechanorg/worldarchitect.ai jleechanorg/ez-gh-actions"
@@ -138,7 +154,9 @@ def load_toml(path):
 def chmod_a_rx(root_path):
     """Apply portable chmod -R a+rX semantics without spawning external tools."""
     def _chmod_dir(d):
-        st = os.stat(d, follow_symlinks=False)
+        st = os.lstat(d)
+        if stat.S_ISLNK(st.st_mode):
+            return
         os.chmod(d, stat.S_IMODE(st.st_mode) | 0o555)
 
     def _chmod_file(f):
@@ -228,6 +246,7 @@ def find_local_donor(repo):
             candidates.append(os.path.join(wt_root, name, ".git"))
 
     seen_common = set()
+    sanitary_env = merge_env(GIT_SANITARY_ENV)
     for cand in candidates:
         if not os.path.exists(cand):
             continue
@@ -242,6 +261,7 @@ def find_local_donor(repo):
                 "--git-common-dir",
                 "--is-shallow-repository",
             ],
+            env=sanitary_env,
             text=True,
             capture_output=True,
         )
@@ -261,9 +281,11 @@ def find_local_donor(repo):
 
 
 def resolve_seed_sha(repo_dir):
+    sanitary_env = merge_env(GIT_SANITARY_ENV)
     for ref in ("refs/heads/main", "HEAD", "refs/heads/master"):
         proc = subprocess.run(
             ["git", "-C", repo_dir, "rev-parse", "--verify", "--quiet", ref],
+            env=sanitary_env,
             text=True,
             capture_output=True,
         )
@@ -288,17 +310,109 @@ def next_generation_epoch(generations_dir, slug):
     return max(now, max_existing + 1)
 
 
-def reap_old_generations(generations_dir, active_dir, slug, retention_min):
+def _parse_docker_iso_timestamp(ts_raw):
+    ts = ts_raw.strip()
+    if not ts:
+        raise ValueError("empty timestamp")
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    ts = re.sub(
+        r"\.([0-9]+)",
+        lambda m: "." + (m.group(1) + "000000")[:6],
+        ts,
+    )
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def oldest_running_runner_start_epoch(docker_env):
+    override = os.environ.get("EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH", "").strip()
+    if override:
+        if override.lower() == "error":
+            warn("simulated docker failure via EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=error; failing closed on reap")
+            return 0.0
+        if override.lower() == "none":
+            return None
+        try:
+            return float(override)
+        except ValueError:
+            warn(f"invalid EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH={override!r}; failing closed on reap")
+            return 0.0
+
+    if not shutil.which("docker"):
+        return None
+
+    docker_proc_env = merge_env(docker_env)
+    try:
+        ps_proc = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "label=ezgha=managed"],
+            env=docker_proc_env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        warn(f"docker ps failed ({exc}); failing closed to preserve retired generations")
+        return 0.0
+
+    if ps_proc.returncode != 0:
+        warn(f"docker ps exited {ps_proc.returncode}; failing closed to preserve retired generations")
+        return 0.0
+
+    ids = [ln.strip() for ln in ps_proc.stdout.splitlines() if ln.strip()]
+    if not ids:
+        return None
+
+    try:
+        inspect_proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.StartedAt}}", *ids],
+            env=docker_proc_env,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        warn(f"docker inspect failed ({exc}); failing closed to preserve retired generations")
+        return 0.0
+
+    if inspect_proc.returncode != 0:
+        warn(f"docker inspect exited {inspect_proc.returncode}; failing closed to preserve retired generations")
+        return 0.0
+
+    epochs = []
+    for line in inspect_proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            epochs.append(_parse_docker_iso_timestamp(line))
+        except ValueError as exc:
+            warn(f"unparseable container StartedAt {line!r} ({exc}); failing closed to preserve retired generations")
+            return 0.0
+
+    if not epochs:
+        warn("docker inspect returned no StartedAt timestamps; failing closed to preserve retired generations")
+        return 0.0
+    return min(epochs)
+
+
+def reap_old_generations(generations_dir, active_dir, slug, retention_min, oldest_runner_epoch=None):
     if not os.path.isdir(generations_dir):
         return
     gens_real = os.path.realpath(generations_dir)
     active_link = os.path.join(active_dir, slug)
     active_real = os.path.realpath(active_link) if os.path.lexists(active_link) else None
-    cutoff = time.time() - (retention_min * 60.0)
+    now = time.time()
+    cutoff = now - (retention_min * 60.0)
+    if oldest_runner_epoch is not None:
+        cutoff = min(cutoff, oldest_runner_epoch - 60.0)
     prefix = f"{slug}."
     tmp_prefix = f".{slug}."
 
     for name in os.listdir(generations_dir):
+        is_tmp = False
         if name.startswith(prefix):
             suffix = name[len(prefix):]
             if not suffix.isdigit():
@@ -307,6 +421,7 @@ def reap_old_generations(generations_dir, active_dir, slug, retention_min):
             suffix = name[len(tmp_prefix):]
             if not re.fullmatch(r"[0-9]+\.tmp\.[0-9]+", suffix):
                 continue
+            is_tmp = True
         else:
             continue
         entry_path = os.path.join(generations_dir, name)
@@ -322,37 +437,78 @@ def reap_old_generations(generations_dir, active_dir, slug, retention_min):
             st = os.stat(entry_real)
         except OSError:
             continue
-        retired_ts = st.st_mtime
-        retired_marker = os.path.join(entry_real, "RETIRED_AT")
-        if os.path.isfile(retired_marker):
+        if is_tmp:
+            retired_ts = st.st_mtime
+        else:
+            retired_marker = os.path.join(entry_real, "RETIRED_AT")
+            if not os.path.isfile(retired_marker):
+                try:
+                    with open(retired_marker, "w", encoding="utf-8") as fh:
+                        fh.write(f"{int(now)}\n")
+                    os.chmod(retired_marker, 0o644)
+                except OSError as exc:
+                    warn(f"could not stamp RETIRED_AT on unstamped retired generation {entry_real}: {exc}")
+                continue
             try:
                 with open(retired_marker, "r", encoding="utf-8") as fh:
                     retired_ts = float(fh.read().strip())
-            except (OSError, ValueError):
-                retired_ts = st.st_mtime
+            except (OSError, ValueError) as exc:
+                warn(f"could not read RETIRED_AT on {entry_real}: {exc}")
+                continue
         if retired_ts < cutoff:
             log(f"reaping retired mirror generation: {entry_real}")
             shutil.rmtree(entry_real, ignore_errors=True)
 
 
-def refresh_git_mirrors(mirror_root):
+def discover_generation_slugs(generations_dir, repos):
+    slugs = {r.replace("/", "__") for r in repos}
+    if os.path.isdir(generations_dir):
+        for name in os.listdir(generations_dir):
+            if not name.startswith("."):
+                m = re.fullmatch(r"(.+)\.[0-9]+", name)
+                if m:
+                    slugs.add(m.group(1))
+                    continue
+            m_tmp = re.fullmatch(r"\.(.+)\.[0-9]+\.tmp\.[0-9]+", name)
+            if m_tmp:
+                slugs.add(m_tmp.group(1))
+    return sorted(slugs)
+
+
+def refresh_git_mirrors(mirror_root, reap_only=False):
     mirror_root = os.path.abspath(os.path.expanduser(mirror_root))
     staging_root = os.path.join(mirror_root, ".staging")
     generations_dir = os.path.join(mirror_root, "generations")
     active_dir = os.path.join(mirror_root, "active")
-    gens_real = os.path.realpath(generations_dir) if os.path.isdir(generations_dir) else None
-    for d in (mirror_root, staging_root, generations_dir, active_dir):
-        os.makedirs(d, exist_ok=True)
-    gens_real = os.path.realpath(generations_dir)
-    for d in (mirror_root, generations_dir, active_dir):
-        st = os.stat(d)
-        os.chmod(d, stat.S_IMODE(st.st_mode) | 0o555)
 
     repos_raw = os.environ.get("EZGHA_MIRROR_REPOS", DEFAULT_MIRROR_REPOS).strip()
     repos = [r for r in repos_raw.split() if r]
     url_tmpl = os.environ.get("EZGHA_MIRROR_URL_TEMPLATE", "https://github.com/%s.git")
-    retention_min = int(os.environ.get("EZGHA_MIRROR_RETENTION_MIN", "240"))
-    git_env = {"GIT_TERMINAL_PROMPT": "0"}
+    # Default 480 min (8h): GitHub Actions' max workflow job timeout is 360 min
+    # (normal peak <= 360m), plus a +120 min safety margin.
+    retention_min = int(os.environ.get("EZGHA_MIRROR_RETENTION_MIN", "480"))
+    oldest_runner_epoch = oldest_running_runner_start_epoch(resolve_docker_env())
+
+    if reap_only:
+        if os.path.isdir(generations_dir):
+            for slug in discover_generation_slugs(generations_dir, repos):
+                reap_old_generations(
+                    generations_dir,
+                    active_dir,
+                    slug,
+                    retention_min,
+                    oldest_runner_epoch=oldest_runner_epoch,
+                )
+        return
+
+    for d in (mirror_root, staging_root, generations_dir, active_dir):
+        os.makedirs(d, exist_ok=True)
+    gens_real = os.path.realpath(generations_dir)
+    for d in (mirror_root, generations_dir, active_dir):
+        st = os.lstat(d)
+        if not stat.S_ISLNK(st.st_mode):
+            os.chmod(d, stat.S_IMODE(st.st_mode) | 0o555)
+
     repo_errors = []
 
     for repo in repos:
@@ -373,10 +529,10 @@ def refresh_git_mirrors(mirror_root):
                 else:
                     log(f"initializing staging mirror for {repo} from {url}")
                 clone_cmd.extend([url, staging_dir])
-                run_cmd(clone_cmd, timeout=600, env=git_env)
+                run_cmd(clone_cmd, timeout=600, env=GIT_SANITARY_ENV)
 
-            run_cmd(["git", "-C", staging_dir, "config", "core.commitGraph", "false"], timeout=30)
-            run_cmd(["git", "-C", staging_dir, "config", "gc.auto", "0"], timeout=30)
+            run_cmd(["git", "-C", staging_dir, "config", "core.commitGraph", "false"], timeout=30, env=GIT_SANITARY_ENV)
+            run_cmd(["git", "-C", staging_dir, "config", "gc.auto", "0"], timeout=30, env=GIT_SANITARY_ENV)
             run_cmd(
                 [
                     "git",
@@ -390,7 +546,7 @@ def refresh_git_mirrors(mirror_root):
                     "+refs/tags/*:refs/tags/*",
                 ],
                 timeout=300,
-                env=git_env,
+                env=GIT_SANITARY_ENV,
             )
 
             seed_sha = resolve_seed_sha(staging_dir)
@@ -418,7 +574,7 @@ def refresh_git_mirrors(mirror_root):
                 run_cmd(
                     ["git", "clone", "--bare", "--local", staging_dir, gen_tmp],
                     timeout=300,
-                    env=git_env,
+                    env=GIT_SANITARY_ENV,
                 )
 
                 info_dir = os.path.join(gen_tmp, "objects", "info")
@@ -462,7 +618,13 @@ def refresh_git_mirrors(mirror_root):
 
                 log(f"published mirror {repo} -> {slug}.{epoch} ({seed_sha})")
 
-            reap_old_generations(generations_dir, active_dir, slug, retention_min)
+            reap_old_generations(
+                generations_dir,
+                active_dir,
+                slug,
+                retention_min,
+                oldest_runner_epoch=oldest_runner_epoch,
+            )
         except Exception as exc:
             warn(f"failed refreshing mirror for {repo}: {exc}")
             repo_errors.append(repo)
@@ -476,23 +638,49 @@ def resolve_docker_env():
     if os.environ.get("DOCKER_HOST", "").strip():
         env["DOCKER_CONTEXT"] = None
         return env
-    if platform.system() == "Darwin":
+    sysname = platform.system()
+    if sysname == "Darwin":
         plist = os.path.expanduser("~/Library/LaunchAgents/org.jleechanorg.ezgha.plist")
         if os.path.isfile(plist) and shutil.which("plutil"):
-            proc = subprocess.run(
-                ["plutil", "-extract", "EnvironmentVariables.DOCKER_HOST", "raw", "-o", "-", plist],
-                text=True,
-                capture_output=True,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                env["DOCKER_HOST"] = proc.stdout.strip()
-                env["DOCKER_CONTEXT"] = None
-                return env
+            try:
+                proc = subprocess.run(
+                    ["plutil", "-extract", "EnvironmentVariables.DOCKER_HOST", "raw", "-o", "-", plist],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    env["DOCKER_HOST"] = proc.stdout.strip()
+                    env["DOCKER_CONTEXT"] = None
+                    return env
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                warn(f"plutil failed reading DOCKER_HOST from {plist}: {exc}")
         if not os.path.exists("/var/run/docker.sock"):
             colima_sock = os.path.expanduser("~/.colima/default/docker.sock")
             if os.path.exists(colima_sock):
                 env["DOCKER_HOST"] = f"unix://{colima_sock}"
                 env["DOCKER_CONTEXT"] = None
+    elif sysname == "Linux":
+        unit_path = os.path.expanduser("~/.config/systemd/user/ezgha.service")
+        if os.path.isfile(unit_path):
+            try:
+                with open(unit_path, "r", encoding="utf-8") as fh:
+                    for raw_line in fh:
+                        line = raw_line.strip()
+                        if not line or line.startswith(("#", ";")):
+                            continue
+                        if not line.startswith("Environment="):
+                            continue
+                        rhs = line.split("=", 1)[1].strip()
+                        for token in shlex.split(rhs):
+                            if token.startswith("DOCKER_HOST="):
+                                val = token.split("=", 1)[1].strip()
+                                if val:
+                                    env["DOCKER_HOST"] = val
+                                    env["DOCKER_CONTEXT"] = None
+                                    return env
+            except (OSError, ValueError) as exc:
+                warn(f"could not parse DOCKER_HOST from {unit_path}: {exc}")
     return env
 
 
@@ -552,6 +740,80 @@ def sync_wheelhouse_build_tag_symlinks(wheelhouse_path, clear_only=False):
             os.symlink(fn, alias_path)
 
 
+def _iter_logical_req_lines(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        buf = ""
+        for raw_line in fh:
+            stripped = raw_line.rstrip("\r\n")
+            if stripped.endswith("\\"):
+                buf += stripped[:-1] + " "
+                continue
+            buf += stripped
+            yield buf
+            buf = ""
+        if buf:
+            yield buf
+
+
+def collect_req_closure(req_files):
+    """Resolve top-level requirement files and recursive -r/-c local includes."""
+    entries = []
+    all_files = set()
+
+    for rf in req_files:
+        rf_real = os.path.realpath(rf)
+        closure = set()
+        queue = [rf_real]
+        while queue:
+            cur = queue.pop(0)
+            if cur in closure or not os.path.isfile(cur):
+                continue
+            closure.add(cur)
+            all_files.add(cur)
+            cur_dir = os.path.dirname(cur)
+            try:
+                for line in _iter_logical_req_lines(cur):
+                    clean = re.sub(r"(^|\s)#.*$", "", line).strip()
+                    if not clean:
+                        continue
+                    try:
+                        tokens = shlex.split(clean)
+                    except ValueError:
+                        tokens = clean.split()
+                    i = 0
+                    while i < len(tokens):
+                        tok = tokens[i]
+                        ref = None
+                        if tok in ("-r", "--requirement", "-c", "--constraint") and i + 1 < len(tokens):
+                            ref = tokens[i + 1]
+                            i += 2
+                        elif tok.startswith(("--requirement=", "--constraint=")):
+                            ref = tok.split("=", 1)[1]
+                            i += 1
+                        elif (tok.startswith("-r") or tok.startswith("-c")) and len(tok) > 2:
+                            ref = tok[2:]
+                            i += 1
+                        else:
+                            i += 1
+                            continue
+                        if ref and "://" not in ref:
+                            cand = os.path.realpath(os.path.join(cur_dir, ref))
+                            if os.path.commonpath([os.path.dirname(rf_real), os.path.dirname(cand)]) == "/":
+                                if os.path.isfile(cand):
+                                    warn(f"skipping requirement include {cand} outside root of {rf_real}")
+                                continue
+                            if os.path.isfile(cand) and cand not in closure:
+                                queue.append(cand)
+            except OSError:
+                continue
+
+        if closure:
+            common_dir = os.path.commonpath([os.path.dirname(p) for p in closure])
+            entries.append((rf_real, common_dir, sorted(closure)))
+
+    return entries, sorted(all_files)
+
+
 def refresh_wheelhouse(wheelhouse_path, image):
     wheelhouse_path = os.path.abspath(os.path.expanduser(wheelhouse_path))
     os.makedirs(wheelhouse_path, exist_ok=True)
@@ -563,53 +825,68 @@ def refresh_wheelhouse(wheelhouse_path, image):
 
     docker_env = resolve_docker_env()
     docker_proc_env = merge_env(docker_env)
-    if subprocess.run(["docker", "info"], env=docker_proc_env, capture_output=True).returncode != 0:
+    try:
+        info_proc = subprocess.run(
+            ["docker", "info"], env=docker_proc_env, capture_output=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        warn("docker info timed out after 30s; skipping wheelhouse refresh")
+        return
+    if info_proc.returncode != 0:
         warn("docker daemon unreachable; skipping wheelhouse refresh")
         return
 
-    inspect_proc = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-        env=docker_proc_env,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        inspect_proc = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            env=docker_proc_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        warn(f"docker image inspect timed out after 30s for {image}; skipping wheelhouse refresh")
+        return
     if inspect_proc.returncode != 0:
         warn(f"runner image {image} not present locally; skipping wheelhouse refresh")
         return
     image_id = inspect_proc.stdout.strip()
 
-    pw_proc = subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--entrypoint",
-            "bash",
-            image,
-            "-lc",
-            "cat /ms-playwright/PLAYWRIGHT_VERSION 2>/dev/null || echo 1.65.2",
-        ],
-        env=docker_proc_env,
-        text=True,
-        capture_output=True,
-        timeout=60,
-    )
-    pw_ver = pw_proc.stdout.strip() if pw_proc.returncode == 0 and pw_proc.stdout.strip() else "1.65.2"
+    try:
+        pw_proc = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "bash",
+                image,
+                "-lc",
+                "cat /ms-playwright/PLAYWRIGHT_VERSION 2>/dev/null || echo 1.65.2",
+            ],
+            env=docker_proc_env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        pw_ver = pw_proc.stdout.strip() if pw_proc.returncode == 0 and pw_proc.stdout.strip() else "1.65.2"
+    except subprocess.TimeoutExpired:
+        warn(f"timed out querying PLAYWRIGHT_VERSION from {image}; skipping wheelhouse refresh")
+        return
 
     req_files = gather_req_files()
+    req_entries, all_req_files = collect_req_closure(req_files)
     core_pkgs = DEFAULT_CORE_PACKAGES + [f"playwright=={pw_ver}"]
 
     hasher = hashlib.sha256()
     hasher.update(f"image={image_id}\n".encode("utf-8"))
     hasher.update(f"playwright={pw_ver}\n".encode("utf-8"))
     hasher.update(("core=" + " ".join(core_pkgs) + "\n").encode("utf-8"))
-    req_payload = []
-    for idx, rf in enumerate(req_files):
-        with open(rf, "rb") as fh:
+    for fp in all_req_files:
+        with open(fp, "rb") as fh:
             raw = fh.read()
-        hasher.update(f"file={os.path.basename(rf)}\n".encode("utf-8"))
+        hasher.update(f"file={fp}\n".encode("utf-8"))
         hasher.update(raw)
-        req_payload.append((f"req_{idx}_{os.path.basename(rf)}", raw.decode("utf-8")))
     manifest_sha = hasher.hexdigest()
 
     manifest_file = os.path.join(wheelhouse_path, ".manifest.sha256")
@@ -627,23 +904,46 @@ def refresh_wheelhouse(wheelhouse_path, image):
             return
 
     sync_wheelhouse_build_tag_symlinks(wheelhouse_path, clear_only=True)
-    payload = json.dumps({"core": core_pkgs, "reqs": req_payload})
+
+    staged_files = []
+    req_container_paths = []
+    for idx, (req_real, common_dir, closure_files) in enumerate(req_entries):
+        for fp in closure_files:
+            rel_fp = os.path.relpath(fp, common_dir).replace(os.sep, "/")
+            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                staged_files.append((f"{idx}/{rel_fp}", fh.read()))
+        rel_req = os.path.relpath(req_real, common_dir).replace(os.sep, "/")
+        req_container_paths.append(f"/tmp/ezgha-reqs/{idx}/{rel_req}")
+
+    payload = json.dumps(
+        {
+            "core": core_pkgs,
+            "staged_files": staged_files,
+            "req_paths": req_container_paths,
+        }
+    )
     container_script = (
         "import glob, json, os, shutil, subprocess, sys\n"
         "data = json.load(sys.stdin)\n"
-        "os.makedirs('/tmp/ezgha-reqs', exist_ok=True)\n"
         "for whl in glob.glob('/opt/baked-wheels/*.whl'):\n"
         "    dst = os.path.join('/wheelhouse', os.path.basename(whl))\n"
         "    if not os.path.exists(dst):\n"
         "        shutil.copy2(whl, dst)\n"
-        "cmd = [sys.executable, '-m', 'pip', 'download', '--dest', '/wheelhouse', '--find-links', '/wheelhouse']\n"
-        "cmd.extend(data['core'])\n"
-        "for name, content in data['reqs']:\n"
-        "    p = os.path.join('/tmp/ezgha-reqs', name)\n"
-        "    with open(p, 'w', encoding='utf-8') as fh:\n"
+        "stage_root = '/tmp/ezgha-reqs'\n"
+        "for rel, content in data.get('staged_files', []):\n"
+        "    dst = os.path.normpath(os.path.join(stage_root, rel))\n"
+        "    if not dst.startswith(stage_root + '/'):\n"
+        "        raise ValueError(f'unsafe staged path: {rel}')\n"
+        "    os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
+        "    with open(dst, 'w', encoding='utf-8') as fh:\n"
         "        fh.write(content)\n"
-        "    cmd.extend(['-r', p])\n"
-        "subprocess.run(cmd, check=True)\n"
+        "base_cmd = [sys.executable, '-m', 'pip', 'download', '--dest', '/wheelhouse', '--find-links', '/wheelhouse']\n"
+        "subprocess.run(base_cmd + data['core'], check=True)\n"
+        "if data['req_paths']:\n"
+        "    req_cmd = list(base_cmd)\n"
+        "    for p in data['req_paths']:\n"
+        "        req_cmd.extend(['-r', p])\n"
+        "    subprocess.run(req_cmd, check=True)\n"
     )
     docker_cmd = ["docker", "run", "--rm", "-i", "-v", f"{wheelhouse_path}:/wheelhouse"]
     if platform.system() == "Linux":
@@ -688,7 +988,7 @@ def main():
     git_mirror_path = (runner_cfg.get("git_mirror_host_path") or "").strip()
     wheelhouse_path = (runner_cfg.get("wheelhouse_host_path") or "").strip()
     image = (runner_cfg.get("image") or "ezgha-runner:latest").strip()
-    min_free_gb = int(limits_cfg.get("min_free_disk_gb", 30))
+    min_free_gb = int(limits_cfg.get("min_free_disk_gb", 10))
 
     if not git_mirror_path and not wheelhouse_path:
         log("neither runner.git_mirror_host_path nor runner.wheelhouse_host_path configured; exiting")
@@ -707,33 +1007,40 @@ def main():
             log("cache-warm lock already held; exiting")
             return 0
 
-        has_existing = (
-            bool(git_mirror_path and os.path.isdir(os.path.join(os.path.expanduser(git_mirror_path), "active")))
-            or bool(wheelhouse_path and os.path.isfile(os.path.join(os.path.expanduser(wheelhouse_path), ".manifest.sha256")))
-        )
-        buffer_gb = int(os.environ.get("EZGHA_CACHE_MIN_FREE_BUFFER_GB", "0" if has_existing else "1"))
+        buffer_gb = int(os.environ.get("EZGHA_CACHE_MIN_FREE_BUFFER_GB", "5"))
         required_gb = min_free_gb + buffer_gb
-        free_gb = get_free_gb([git_mirror_path, wheelhouse_path])
-        if free_gb < required_gb:
-            warn(
-                f"free disk {free_gb:.1f} GiB below safety floor+{buffer_gb} ({required_gb} GiB); skipping cache refresh"
-            )
-            return 0
 
         stage_errors = []
         if git_mirror_path and not args.skip_git:
-            try:
-                refresh_git_mirrors(git_mirror_path)
-            except Exception as exc:
-                warn(f"git mirror stage encountered error: {exc}")
-                stage_errors.append("git")
+            git_free_gb = get_free_gb([git_mirror_path])
+            if git_free_gb < required_gb:
+                warn(
+                    f"free disk {git_free_gb:.1f} GiB below safety floor+{buffer_gb} ({required_gb} GiB); skipping new git mirror clones and reaping retired generations only"
+                )
+                try:
+                    refresh_git_mirrors(git_mirror_path, reap_only=True)
+                except Exception as exc:
+                    warn(f"git mirror reap-only stage encountered error: {exc}")
+                    stage_errors.append("git")
+            else:
+                try:
+                    refresh_git_mirrors(git_mirror_path, reap_only=False)
+                except Exception as exc:
+                    warn(f"git mirror stage encountered error: {exc}")
+                    stage_errors.append("git")
 
         if wheelhouse_path and not args.skip_wheels:
-            try:
-                refresh_wheelhouse(wheelhouse_path, image)
-            except Exception as exc:
-                warn(f"wheelhouse stage encountered error: {exc}")
-                stage_errors.append("wheelhouse")
+            wheel_free_gb = get_free_gb([wheelhouse_path])
+            if wheel_free_gb < required_gb:
+                warn(
+                    f"free disk {wheel_free_gb:.1f} GiB below safety floor+{buffer_gb} ({required_gb} GiB); skipping wheelhouse refresh"
+                )
+            else:
+                try:
+                    refresh_wheelhouse(wheelhouse_path, image)
+                except Exception as exc:
+                    warn(f"wheelhouse stage encountered error: {exc}")
+                    stage_errors.append("wheelhouse")
 
         if stage_errors:
             return 1

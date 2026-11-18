@@ -118,10 +118,27 @@ fi
 # Hydrate safely (fail-open on any write failure).
 HYDRATED_NOW=0
 ALT_ADDED=0
+SEED_CREATED=0
+PRE_REFS=""
 ALT_FILE="$COMMON_DIR/objects/info/alternates"
 ALT_ENTRY="$REAL_GEN/objects"
+LOCK_FILE="$COMMON_DIR/ezgha-hydrate.lock"
+SEED_REF="refs/ezgha-seed/pid-$$-${RANDOM:-0}-$(date +%s 2>/dev/null || echo 0)"
+HAS_FLOCK=0
+if command -v flock >/dev/null 2>&1; then
+  HAS_FLOCK=1
+fi
 
-if mkdir -p "$COMMON_DIR/objects/info" 2>/dev/null; then
+LOCK_HELD=0
+if [ "$HAS_FLOCK" -eq 1 ] && { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+  if flock -x 9 2>/dev/null; then
+    LOCK_HELD=1
+  else
+    exec 9>&-
+  fi
+fi
+
+if [ ! -e "$GIT_DIR/ezgha-hydrated" ] && mkdir -p "$COMMON_DIR/objects/info" 2>/dev/null; then
   ALT_OK=0
   if [ -f "$ALT_FILE" ] && grep -Fxq -- "$ALT_ENTRY" "$ALT_FILE" 2>/dev/null; then
     ALT_OK=1
@@ -131,33 +148,59 @@ if mkdir -p "$COMMON_DIR/objects/info" 2>/dev/null; then
   fi
   if [ "$ALT_OK" = "1" ] && touch "$GIT_DIR/ezgha-hydrated" 2>/dev/null; then
     HYDRATED_NOW=1
-    "$REAL_GIT" "${git_dir_args[@]}" update-ref refs/ezgha-seed/default "$SEED_SHA" >/dev/null 2>&1 || true
+    PRE_REFS="$("$REAL_GIT" "${git_dir_args[@]}" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null | grep -v '^refs/ezgha-seed/' || true)"
+    if "$REAL_GIT" "${git_dir_args[@]}" update-ref "$SEED_REF" "$SEED_SHA" "" >/dev/null 2>&1; then
+      SEED_CREATED=1
+    fi
   fi
+fi
+
+if [ "$LOCK_HELD" -eq 1 ]; then
+  exec 9>&-
+  LOCK_HELD=0
 fi
 
 "$REAL_GIT" -c core.commitGraph=false "$@"
 rc=$?
 
-"$REAL_GIT" "${git_dir_args[@]}" update-ref -d refs/ezgha-seed/default >/dev/null 2>&1 || true
+if [ "$SEED_CREATED" -eq 1 ]; then
+  "$REAL_GIT" "${git_dir_args[@]}" update-ref -d "$SEED_REF" "$SEED_SHA" >/dev/null 2>&1 || true
+fi
 
 if [ "$rc" -ne 0 ] && [ "$HYDRATED_NOW" -eq 1 ]; then
-  rm -f "$GIT_DIR/ezgha-hydrated" >/dev/null 2>&1 || true
-  if [ "$ALT_ADDED" -eq 1 ] && [ -f "$ALT_FILE" ]; then
-    tmp_alt="${ALT_FILE}.ezgha-tmp.$$"
-    set +e
-    grep -Fvx -- "$ALT_ENTRY" "$ALT_FILE" > "$tmp_alt" 2>/dev/null
-    grep_rc=$?
-    if [ "$grep_rc" -eq 0 ]; then
-      if [ -s "$tmp_alt" ]; then
-        mv -f "$tmp_alt" "$ALT_FILE" 2>/dev/null || rm -f "$tmp_alt" >/dev/null 2>&1 || true
-      else
-        rm -f "$tmp_alt" "$ALT_FILE" >/dev/null 2>&1 || true
-      fi
-    elif [ "$grep_rc" -eq 1 ]; then
-      rm -f "$tmp_alt" "$ALT_FILE" >/dev/null 2>&1 || true
+  if [ "$HAS_FLOCK" -eq 1 ] && { exec 9>"$LOCK_FILE"; } 2>/dev/null; then
+    if flock -x 9 2>/dev/null; then
+      LOCK_HELD=1
     else
-      rm -f "$tmp_alt" >/dev/null 2>&1 || true
+      exec 9>&-
     fi
+  fi
+
+  POST_REFS="$("$REAL_GIT" "${git_dir_args[@]}" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null | grep -v '^refs/ezgha-seed/' || true)"
+  if [ "$POST_REFS" = "$PRE_REFS" ]; then
+    rm -f "$GIT_DIR/ezgha-hydrated" >/dev/null 2>&1 || true
+    if [ "$ALT_ADDED" -eq 1 ] && [ -f "$ALT_FILE" ]; then
+      tmp_alt="${ALT_FILE}.ezgha-tmp.$$"
+      set +e
+      grep -Fvx -- "$ALT_ENTRY" "$ALT_FILE" > "$tmp_alt" 2>/dev/null
+      grep_rc=$?
+      if [ "$grep_rc" -eq 0 ]; then
+        if [ -s "$tmp_alt" ]; then
+          mv -f "$tmp_alt" "$ALT_FILE" 2>/dev/null || rm -f "$tmp_alt" >/dev/null 2>&1 || true
+        else
+          rm -f "$tmp_alt" "$ALT_FILE" >/dev/null 2>&1 || true
+        fi
+      elif [ "$grep_rc" -eq 1 ]; then
+        rm -f "$tmp_alt" "$ALT_FILE" >/dev/null 2>&1 || true
+      else
+        rm -f "$tmp_alt" >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  if [ "$LOCK_HELD" -eq 1 ]; then
+    exec 9>&-
+    LOCK_HELD=0
   fi
 fi
 

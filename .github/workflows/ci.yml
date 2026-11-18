@@ -48,6 +48,7 @@ jobs:
           bash tests/install_watchdog_gate_test.sh
           bash tests/install_uninstall_aux_units_test.sh
           bash tests/systemd_units_install_guard_test.sh
+          bash tests/refresh_runner_caches_test.sh
       - name: Mac trim guard shell regressions
         run: |
           bash tests/colima_trim_guard_test.sh
@@ -136,3 +137,15 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Format
         run: cargo fmt --check
+
+  runner-cache-hydration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Build runner image
+        run: DOCKER_BUILDKIT=0 docker build -f Dockerfile.runner -t ezgha-runner:ci-hydration .
+      - name: Run runner cache hydration integration test
+        run: EZGHA_TEST_IMAGE=ezgha-runner:ci-hydration bash tests/runner_cache_hydration_test.sh
