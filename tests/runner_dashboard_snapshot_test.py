@@ -410,6 +410,39 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(partial_snap["latency"]["partial"])
         self.assertIn("(partial: 2 unverified)", partial_snap["reconciliation"]["explanation"])
 
+    def test_invalid_utf8_optional_cmux_feed_degrades_gracefully(self):
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            mac_p = tmp / "mac.json"
+            linux_p = tmp / "linux.json"
+            cmux_p = tmp / "cmux_bad.bin"
+            out_p = tmp / "status.json"
+            mac_p.write_text(json.dumps(host_payload("mac", 4)), encoding="utf-8")
+            linux_p.write_text(json.dumps(host_payload("linux", 20)), encoding="utf-8")
+            cmux_p.write_bytes(b"\xff\xfe\x00\x81")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--mac-host", str(mac_p),
+                    "--linux-host", str(linux_p),
+                    "--observed-at", "2026-11-18T09:15:00Z",
+                    "--published-at", "2026-11-18T09:15:05Z",
+                    "--cmux", str(cmux_p),
+                    "--output", str(out_p),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            out = json.loads(out_p.read_text(encoding="utf-8"))
+            self.assertFalse(out["cmux"]["ok"])
+            self.assertEqual(out["fleets"]["linux"]["fleet"]["configured"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,7 +45,7 @@ EXPECTED_CONFIGURED = {"mac": 4, "linux": 20}
 def _load_object(path):
     try:
         value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
 

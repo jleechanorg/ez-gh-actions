@@ -981,6 +981,21 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+            with mock.patch.object(mod.Path, "is_file", side_effect=PermissionError("denied")), \
+                 mock.patch.object(mod, "_collect_local_host_slots", side_effect=AssertionError("must not probe local host")), \
+                 mock.patch.object(mod, "_collect_live_cmux", side_effect=AssertionError("must not probe cmux")), \
+                 mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("must not poll GH")), \
+                 mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("must not poll latency")):
+                perm_state = mod.build_operator_state(
+                    hosts_json=bad_utf8_hosts,
+                    cmux_json=non_dict_cmux,
+                    github_json=bad_gh,
+                    latency_json=missing_lat,
+                )
+            self.assertIn("hosts fixture missing or unreadable", perm_state["reconciliation"]["scope_note"])
+            self.assertIn("github fixture missing or unreadable", " ".join(perm_state["reconciliation"]["gh_errors"]))
+            self.assertFalse(perm_state["latency"]["ok"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
