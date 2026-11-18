@@ -702,11 +702,12 @@ def _collect_local_host_slots():
                             tparts = tline.strip().split(None, 3)
                             if len(tparts) < 3:
                                 continue
-                            if "Runner.Worker" in tline:
+                            proc_name = tparts[2].rsplit("/", 1)[-1]
+                            if proc_name == "Runner.Worker":
                                 has_worker = True
                                 if tparts[1].isdigit():
                                     elapsed_min = round(int(tparts[1]) / 60.0, 1)
-                            elif "Runner.Listener" in tline:
+                            elif proc_name == "Runner.Listener":
                                 has_listener = True
                             rest = tparts[3] if len(tparts) == 4 else tparts[2]
                             cmds.append(rest)
@@ -962,10 +963,11 @@ for line in ps.stdout.splitlines():
                 for tl in top.stdout.splitlines()[1:]:
                     tp = tl.strip().split(None, 3)
                     if len(tp) < 3: continue
-                    if "Runner.Worker" in tl:
+                    proc_name = tp[2].rsplit("/", 1)[-1]
+                    if proc_name == "Runner.Worker":
                         hw = True
                         if tp[1].isdigit(): el = round(int(tp[1]) / 60.0, 1)
-                    elif "Runner.Listener" in tl:
+                    elif proc_name == "Runner.Listener":
                         hl = True
                     cmds.append(tp[3] if len(tp) == 4 else tp[2])
                 st = "EXECUTING" if hw else ("IDLE" if hl else "CYCLING")

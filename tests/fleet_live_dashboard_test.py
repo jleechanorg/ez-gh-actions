@@ -721,7 +721,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_docker.chmod(0o755)
-            probe_script = mod._REMOTE_PROBE_PY.replace("timeout=10", "timeout=0.3")
+            probe_script = mod._REMOTE_PROBE_PY.replace('pid,etimes,comm,args"], capture_output=True, text=True, timeout=10', 'pid,etimes,comm,args"], capture_output=True, text=True, timeout=0.5')
+            self.assertIn("timeout=0.5", probe_script)
             env = dict(os.environ, HOME=str(tmp), PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
             proc = subprocess.run(
                 ["python3", "-c", probe_script],
@@ -812,6 +813,61 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertTrue(gh_ip_jobs["summary"]["ip_partial"])
         self.assertEqual(mod._normalize_reconciliation([], {}, gh_ip_jobs)["active_runs_partial"], True)
         self.assertTrue(any("1 of 120 returned" in e for e in gh_ip_jobs["errors"]))
+
+    def test_unrelated_args_mentioning_runner_worker_stay_idle_in_local_and_ssh_probes(self):
+        import os
+        import subprocess
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            cfg_dir = tmp / ".config" / "ezgha"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.toml").write_text('[runner]\ncount = 2\nname_prefix = "ez-runner-c"\n', encoding="utf-8")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "args = sys.argv[1:]\n"
+                "if args[:1] == ['ps']:\n"
+                "    print('ez-runner-c-1\\tUp 5 minutes')\n"
+                "    print('ez-runner-c-2\\tUp 5 minutes')\n"
+                "elif args[:1] == ['top']:\n"
+                "    print('PID ELAPSED COMMAND')\n"
+                "    if args[1] == 'ez-runner-c-1':\n"
+                "        print('101 120 Runner.Listener /home/runner/bin/Runner.Listener')\n"
+                "        print('102 30 grep grep Runner.Worker /var/log/runner.log')\n"
+                "    elif args[1] == 'ez-runner-c-2':\n"
+                "        print('201 90 Runner.Worker /home/runner/bin/Runner.Worker')\n"
+                "elif args[:1] == ['inspect']:\n"
+                "    print('2026-11-18T10:00:00Z')\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+            env = dict(os.environ, HOME=str(tmp), PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+            proc = subprocess.run(
+                ["python3", "-c", mod._REMOTE_PROBE_PY],
+                capture_output=True, text=True, check=True, env=env,
+            )
+            remote_payload = json.loads(proc.stdout)
+            self.assertEqual([s["state"] for s in remote_payload["slots"]], ["IDLE", "EXECUTING"])
+
+            orig_path = os.environ.get("PATH", "")
+            orig_home = os.environ.get("HOME", "")
+            os.environ["PATH"] = f"{bin_dir}:{orig_path}"
+            os.environ["HOME"] = str(tmp)
+            try:
+                with mock.patch.object(mod.platform, "system", return_value="Linux"), \
+                     mock.patch.object(mod, "_probe_local_service_status", return_value="active"):
+                    local_payload = mod._collect_local_host_slots()
+            finally:
+                os.environ["PATH"] = orig_path
+                os.environ["HOME"] = orig_home
+            host_entry = next(iter(local_payload["hosts"].values()))
+            self.assertEqual([s["state"] for s in host_entry["slots"]], ["IDLE", "EXECUTING"])
 
 
 if __name__ == "__main__":
