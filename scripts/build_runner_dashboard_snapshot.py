@@ -2,6 +2,7 @@
 """Build the public, aggregate-only ezgha runner dashboard snapshot."""
 
 import argparse
+import datetime
 import json
 import os
 import tempfile
@@ -9,7 +10,7 @@ from pathlib import Path
 
 SOURCE_KEYS = ("config", "service", "docker", "process_probe", "disk", "watchdog_state")
 FLEET_KEYS = ("configured", "executing", "idle", "cycling", "down", "reserved")
-ALLOWED_SLOT_STATES = frozenset({"EXECUTING", "IDLE", "CYCLING", "DOWN", "PARKED", "OFFLINE"})
+ALLOWED_SLOT_STATES = frozenset({"EXECUTING", "IDLE", "CYCLING", "DOWN", "PARKED", "OFFLINE", "UNKNOWN"})
 ALLOWED_PUBLIC_PHASES = frozenset({
     "playwright",
     "playwright install",
@@ -28,10 +29,11 @@ ALLOWED_PUBLIC_PHASES = frozenset({
     "respawning",
     "operator_disabled",
     "disk_floor_paused",
+    "disk_critical_with_down",
     "ci-check",
 })
 ALLOWED_PUBLIC_CATEGORIES = frozenset({"ci-check", "tests", "build", "deploy", "lint"})
-ALLOWED_PAUSE_REASONS = frozenset({"disk_floor_paused", "disk_floor_pause"})
+ALLOWED_PAUSE_REASONS = frozenset({"disk_floor_paused", "disk_floor_pause", "disk_critical_with_down"})
 # Must match the real fleet shapes. Stale values here make a healthy fleet render as
 # STALE/UNKNOWN, which is exactly the failure the snapshot test documents as the
 # EXPECTED_CONFIGURED["linux"] drift regression (16 vs the real 10).
@@ -83,9 +85,10 @@ def _sanitize_slots(raw_slots, *, slot_prefix="slot"):
     for idx, entry in enumerate(raw_slots, start=1):
         if not isinstance(entry, dict):
             continue
-        state = str(entry.get("state") or "").upper()
+        raw_state = entry.get("state")
+        state = raw_state.strip().upper() if isinstance(raw_state, str) else ""
         if state not in ALLOWED_SLOT_STATES:
-            state = "DOWN"
+            state = "UNKNOWN"
         slot_num = _count(entry.get("slot")) or idx
         slots.append({
             "slot_id": f"{slot_prefix}-{slot_num}",
@@ -186,7 +189,7 @@ def _public_host(payload, expected_class):
         )
     )
     raw_pause = _allowlisted_str(payload.get("pause_reason"), ALLOWED_PAUSE_REASONS)
-    pause_reason = "disk_floor_paused" if raw_pause else None
+    pause_reason = "disk_floor_paused" if raw_pause == "disk_floor_pause" else raw_pause
     host_out = {
         "sources": sources,
         "fleet": fleet,
@@ -253,7 +256,12 @@ def _public_cmux(payload):
         anon_vm_id = f"cloud-vm-{idx}"
         free_gb = _opt_float(vm.get("disk_free_gb"))
         floor_gb = _count(vm.get("disk_floor_gb"))
-        disk_status = vm.get("disk_status") if vm.get("disk_status") in {"healthy", "critical"} else "unknown"
+        raw_disk_status = vm.get("disk_status")
+        disk_status = (
+            raw_disk_status
+            if isinstance(raw_disk_status, str) and raw_disk_status in {"healthy", "critical"}
+            else "unknown"
+        )
         if disk_status == "unknown" and free_gb is not None and floor_gb is not None:
             disk_status = "critical" if free_gb < floor_gb else "healthy"
         vms.append({
@@ -290,6 +298,21 @@ def _sanitize_stat_block(block):
     }
 
 
+def _parse_iso_utc(raw):
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or ("T" not in text and " " not in text):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _public_latency(payload, repo_map):
     """Sanitize CI latency telemetry payload (avg / p50 / p90 / p99 only)."""
     if not isinstance(payload, dict) or payload.get("ok") is not True:
@@ -306,9 +329,12 @@ def _public_latency(payload, repo_map):
         "total_non_skipped_runs": _count(raw_cancel.get("total_non_skipped_runs")),
         "cancelled_rate_pct": _opt_float(raw_cancel.get("cancelled_rate_pct")),
     }
-    cohort = payload.get("cohort") or raw_overall.get("cohort")
-    if cohort not in {"success", "all_non_skipped", "failure", "cancelled"}:
-        cohort = None
+    raw_cohort = payload.get("cohort") or raw_overall.get("cohort")
+    cohort = (
+        raw_cohort
+        if isinstance(raw_cohort, str) and raw_cohort in {"success", "all_non_skipped", "failure", "cancelled"}
+        else None
+    )
     wf_map = {}
     workflows = []
     for wf in payload.get("workflows") or []:
@@ -323,10 +349,9 @@ def _public_latency(payload, repo_map):
             "execution": _sanitize_stat_block(wf.get("execution")),
             "e2e": _sanitize_stat_block(wf.get("e2e")),
         })
-    gen_at = payload.get("generated_at")
     return {
         "ok": True,
-        "generated_at": gen_at.strip()[:48] if isinstance(gen_at, str) and gen_at.strip() else None,
+        "generated_at": _parse_iso_utc(payload.get("generated_at")),
         "cohort": cohort,
         "overall": overall,
         "cancellation": cancellation,
@@ -376,6 +401,8 @@ def _build_reconciliation(mac, mac_ok, linux, linux_ok, cmux, queue):
         parts.append(f"{fresh} fresh queued / {ghosts} inert ghosts")
 
     return {
+        "available_pools": len(pools),
+        "configured_slots": total_of("configured"),
         "active_workflow_runs": active_runs,
         "active_job_slots_occupied": occupied,
         "idle_slots": idle,

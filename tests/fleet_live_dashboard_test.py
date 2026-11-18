@@ -402,6 +402,90 @@ class FleetLiveDashboardTest(unittest.TestCase):
         self.assertEqual(live_state["source_mode"], "LIVE PROBE")
         self.assertEqual(live_state["hosts"][0]["slots"][0]["name"], "local-slot-1")
 
+    def test_inactive_mac_without_opt_out_is_unhealthy_and_missing_slots_are_down_and_top_fail_is_unknown(self):
+        import os
+        import subprocess
+        from unittest import mock
+
+        mod = load_module()
+        # 1) Inactive Mac without explicit opt-out must NEVER report PARKED
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            hosts = json.loads((tmp / "ubuntu_mac_slots.json").read_text())
+            hosts["hosts"]["mac"]["ezgha_launchd_status"] = "inactive"
+            hosts["hosts"]["mac"]["container_slots"] = [{"slot": 1, "name": "ez-mac-runner-h-1", "state": "DOWN"}]
+            (tmp / "ubuntu_mac_slots.json").write_text(json.dumps(hosts), encoding="utf-8")
+            state = mod.build_operator_state(audit_dir=tmp)
+            mac_host = next(h for h in state["hosts"] if h["id"] == "mac")
+            self.assertNotIn("PARKED", mac_host["status"])
+            self.assertIn("DOWN", mac_host["status"])
+            self.assertIn("MAC_RUNNER_DISABLED", mac_host["alert_message"])
+
+        # 2) Local collection synthesizes missing configured slots as DOWN and docker-top failure as UNKNOWN
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["docker", "ps"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="ez-runner-c-1\tUp 5 minutes\n", stderr="")
+            if cmd[:2] == ["docker", "top"]:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="top failed")
+            if cmd[:2] == ["systemctl", "--user"] or cmd[:2] == ["launchctl", "list"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with mock.patch.object(mod.platform, "system", return_value="Linux"), \
+             mock.patch.object(mod, "_read_local_ezgha_config", return_value={"count": 2, "name_prefix": "ez-runner-c", "min_free_disk_gb": 25}), \
+             mock.patch.object(mod.subprocess, "run", side_effect=fake_run):
+            local = mod._collect_local_host_slots()
+        host = next(iter(local["hosts"].values()))
+        self.assertEqual([s["name"] for s in host["slots"]], ["ez-runner-c-1", "ez-runner-c-2"])
+        self.assertEqual(host["slots"][0]["state"], "UNKNOWN")
+        self.assertEqual(host["slots"][1]["state"], "DOWN")
+        self.assertEqual(host["slots"][1]["reason"], "container missing")
+
+        # 3) Live Mac unreachable Docker without MAC_RUNNER_DISABLED must not emit parked=True
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(mod.platform, "system", return_value="Darwin"), \
+             mock.patch.object(mod, "_read_local_ezgha_config", return_value={"count": 2, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 15}), \
+             mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["docker"], 1, stdout="", stderr="unreachable")):
+            os.environ.pop("MAC_RUNNER_DISABLED", None)
+            os.environ.pop("EZGHA_DASHBOARD_MAC_DISABLED", None)
+            mac_local = mod._collect_local_host_slots()
+        self.assertFalse(mac_local["hosts"]["mac"]["parked"])
+        self.assertEqual([s["state"] for s in mac_local["hosts"]["mac"]["container_slots"]], ["DOWN", "DOWN"])
+
+    def test_live_github_snapshot_populates_fresh_and_ghosts_via_queue_probe(self):
+        from unittest import mock
+
+        mod = load_module()
+
+        def fake_gh(args, timeout=20):
+            joined = " ".join(args)
+            if "status=in_progress" in joined:
+                return {"total_count": 0, "workflow_runs": []}
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        fake_q = {
+            "repo": "org/r1",
+            "ok": True,
+            "fresh": 3,
+            "ghosts": 2,
+            "oldest_fresh_wait_minutes": 4,
+            "in_progress_runs": 0,
+            "queued_total": 5,
+            "sample_capped": False,
+            "sampled_fresh": 3,
+            "sampled_ghosts": 2,
+            "error": None,
+        }
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
+             mock.patch.object(mod.queue_probe, "probe_repo", return_value=fake_q):
+            snap = mod._collect_live_github_snapshot(repos=["org/r1"])
+        self.assertEqual(snap["summary"]["fresh_queued_runs"], 3)
+        self.assertEqual(snap["summary"]["inert_ghosts"], 2)
+        rec = mod._normalize_reconciliation([], None, snap)
+        self.assertEqual(rec["fresh_queued_runs"], 3)
+        self.assertEqual(rec["inert_ghosts"], 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

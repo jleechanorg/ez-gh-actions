@@ -332,6 +332,10 @@ footer {
   border-left-color: var(--parked);
 }
 
+.slot-chip--unknown {
+  border-left-color: var(--muted);
+}
+
 .slot-chip-id {
   font-weight: 800;
   color: var(--ink);

@@ -56,6 +56,10 @@ sed -n '1,$p' > "$BIN/uname" <<'SH'
 #!/usr/bin/env bash
 echo "${STUB_UNAME:-Linux}"
 SH
+sed -n '1,$p' > "$BIN/journalctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${STUB_JOURNALCTL_LINES:-}"
+SH
 sed -n '1,$p' > "$BIN/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "${STUB_SYSTEMCTL_STATE:-active}"
@@ -75,11 +79,22 @@ case "$1" in
     echo "/dev/test 99999999 1 ${STUB_DAEMON_FREE_KB:-99999998} 1% /"
     ;;
   inspect)
-    [[ "${STUB_ALL_DOWN:-0}" != 1 ]] || { echo false; exit 0; }
+    if [[ "${STUB_ALL_DOWN:-0}" == 1 ]]; then echo false; exit 0; fi
+    if [[ "${STUB_ONE_DOWN:-0}" == 1 && "$*" == *-2* ]]; then echo false; exit 0; fi
     echo true
     ;;
   top)
     if [[ "${STUB_TOP_FAIL:-0}" == 1 ]]; then exit 1; fi
+    if [[ "$*" == *"-eo pid,etimes,comm,args"* ]]; then
+      echo 'PID ELAPSED COMMAND'
+      case "$2" in
+        *-1)
+          echo '10 420 Runner.Worker /home/runner/bin/Runner.Worker'
+          echo '25 180 python3 python3 -m pytest tests/'
+          ;;
+      esac
+      exit 0
+    fi
     echo 'PID COMMAND'
     case "$2" in
       *-1) echo '10 Runner.Worker' ;;
@@ -135,6 +150,8 @@ assert payload["parked"] is False
 assert isinstance(payload["slots"], list) and len(payload["slots"]) == 2
 assert payload["slots"][0]["slot_id"] == "linux-1"
 assert payload["slots"][0]["state"] == "EXECUTING"
+assert payload["slots"][0]["elapsed_minutes"] == 7.0
+assert payload["slots"][0]["phase_badge"] == "pytest"
 assert payload["slots"][1]["slot_id"] == "linux-2"
 assert payload["slots"][1]["state"] == "IDLE"
 serialized = json.dumps(payload)
@@ -342,5 +359,24 @@ set -e
 test "$DOCTOR_STATUS" -eq 2
 [[ "$DOCTOR_OUTPUT" == *"unsupported"* ]]
 grep -Fq 'runner_dashboard_host_probe.sh" --service-state' "$ROOT/doctor-runner"
+
+STUB_UNAME=Linux STUB_ONE_DOWN=1 STUB_HOST_FREE_KB=1 \
+  STUB_JOURNALCTL_LINES='other message' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/critical-down-no-log.json"
+STUB_UNAME=Linux STUB_ONE_DOWN=1 STUB_HOST_FREE_KB=1 \
+  STUB_JOURNALCTL_LINES='only 0.5 GB free — refusing to spawn runners' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/critical-down-paused-log.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+no_log = json.loads((Path(os.environ["WORK"]) / "critical-down-no-log.json").read_text())
+assert no_log["pause_reason"] == "disk_critical_with_down", no_log
+with_log = json.loads((Path(os.environ["WORK"]) / "critical-down-paused-log.json").read_text())
+assert with_log["pause_reason"] == "disk_floor_paused", with_log
+PY
 
 echo "runner dashboard host probe tests passed"

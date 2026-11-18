@@ -254,6 +254,7 @@ build_site() {
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
         --output "$WORK_DIR/queue.json"; then
+      rm -f "$WORK_DIR/queue.json"
       echo "queue probe failed; publishing capacity with queue unavailable" >&2
     fi
   fi
@@ -270,6 +271,7 @@ build_site() {
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
         --output "$WORK_DIR/latency.json"; then
+      rm -f "$WORK_DIR/latency.json"
       echo "latency probe failed; publishing capacity with latency unavailable" >&2
     fi
   fi
@@ -280,6 +282,7 @@ build_site() {
     read -r -a CMUX_PROBE_CMD <<< "$EZGHA_DASHBOARD_CMUX_PROBE_CMD"
     if ! timeout "${EZGHA_DASHBOARD_CMUX_TIMEOUT:-60}" \
         "${CMUX_PROBE_CMD[@]}" > "$WORK_DIR/cmux.json"; then
+      rm -f "$WORK_DIR/cmux.json"
       echo "cmux probe failed; publishing capacity without cmux pool" >&2
     fi
     [[ -s "$WORK_DIR/cmux.json" ]] && cmux_args=(--cmux "$WORK_DIR/cmux.json")
@@ -287,9 +290,9 @@ build_site() {
   python3 "$SNAPSHOT_BUILDER" \
     --mac-host "$WORK_DIR/mac.json" \
     --linux-host "$WORK_DIR/linux.json" \
-    "${queue_args[@]}" \
-    "${latency_args[@]}" \
-    "${cmux_args[@]}" \
+    ${queue_args[@]+"${queue_args[@]}"} \
+    ${latency_args[@]+"${latency_args[@]}"} \
+    ${cmux_args[@]+"${cmux_args[@]}"} \
     --observed-at "$observed_at" \
     --published-at "$published_at" \
     --output "$output_dir/status.json"

@@ -133,12 +133,14 @@ def minutes_since(stamp):
     return max(0, int(delta.total_seconds() // 60))
 
 
-def probe_repo(repo):
+def probe_repo(repo, *, max_job_checks=None):
     try:
         queued = list_queued(repo)
     except RuntimeError as exc:
         return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                "queued_total": None, "sample_capped": False,
+                "sampled_fresh": None, "sampled_ghosts": None,
                 "error": str(exc)[:200]}
 
     try:
@@ -148,12 +150,16 @@ def probe_repo(repo):
         if any(marker in message for marker in RATE_LIMIT_MARKERS):
             return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                     "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                    "queued_total": len(queued), "sample_capped": False,
+                    "sampled_fresh": None, "sampled_ghosts": None,
                     "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
         ip_runs = None
 
+    sample_capped = max_job_checks is not None and len(queued) > max_job_checks
+    to_check = queued[:max_job_checks] if sample_capped else queued
     fresh = ghosts = 0
     oldest = None
-    for run in queued:
+    for run in to_check:
         run_id = run.get("id")
         if run_id is None:
             continue
@@ -165,6 +171,8 @@ def probe_repo(repo):
                 # Do not report a rate-limited pass as a clean queue.
                 return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
                         "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                        "queued_total": len(queued), "sample_capped": False,
+                        "sampled_fresh": None, "sampled_ghosts": None,
                         "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
 
@@ -178,8 +186,12 @@ def probe_repo(repo):
         if wait is not None and (oldest is None or wait > oldest):
             oldest = wait
 
-    return {"repo": repo, "ok": True, "fresh": fresh, "ghosts": ghosts,
+    return {"repo": repo, "ok": True,
+            "fresh": None if sample_capped else fresh,
+            "ghosts": None if sample_capped else ghosts,
             "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
+            "queued_total": len(queued), "sample_capped": sample_capped,
+            "sampled_fresh": fresh, "sampled_ghosts": ghosts,
             "error": None}
 
 

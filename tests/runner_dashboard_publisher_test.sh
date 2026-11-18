@@ -214,4 +214,41 @@ if kill -0 "$CHILD_PID" 2>/dev/null; then
   exit 1
 fi
 
+FAILING_LATENCY_PROBE="$WORK/failing_latency_probe.sh"
+cat > "$FAILING_LATENCY_PROBE" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then
+    out="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+[[ -n "$out" ]] && printf '{partial' > "$out"
+exit 1
+SH
+chmod +x "$FAILING_LATENCY_PROBE"
+
+/bin/bash -c '
+  EZGHA_DASHBOARD_QUEUE_PROBE=0 \
+  EZGHA_DASHBOARD_LATENCY_PROBE=1 \
+  EZGHA_DASHBOARD_LATENCY_PROBE_CMD="$1" \
+  EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+  EZGHA_DASHBOARD_PROBE_DIR="$2" \
+  EZGHA_DASHBOARD_ASSET_DIR="$3" \
+  EZGHA_DASHBOARD_LOCK_DIR="$4" \
+  /bin/bash "$5" --collect-only "$6"
+' _ "$FAILING_LATENCY_PROBE" "$PROBES" "$ROOT/dashboard" "$WORK/bash32.lock" "$PUBLISHER" "$WORK/bash32-site"
+test -s "$WORK/bash32-site/status.json"
+python3 - "$WORK/bash32-site/status.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    doc = json.load(fh)
+assert doc["latency"]["ok"] is False, doc["latency"]
+assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["cmux"]["ok"] is False, doc["cmux"]
+PY
+
 echo "runner dashboard publisher tests passed"

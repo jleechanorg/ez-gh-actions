@@ -16,6 +16,7 @@ import datetime
 import json
 import math
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -49,12 +50,66 @@ PHASE_RULES = (
 )
 
 
+def _command_head_string(command_text):
+    """Extract executable/subcommand tokens, ignoring flags, paths, and shell wrappers."""
+    try:
+        tokens = shlex.split(command_text)
+    except ValueError:
+        tokens = command_text.split()
+    while tokens:
+        head = Path(tokens[0]).name.lower()
+        if "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens = tokens[1:]
+        elif head == "env":
+            tokens = tokens[1:]
+        elif head == "timeout" and len(tokens) >= 3:
+            tokens = tokens[2:]
+        elif head in {"bash", "sh", "zsh"} and len(tokens) >= 3 and tokens[1] in {"-c", "-lc"}:
+            inner = tokens[2]
+            try:
+                tokens = shlex.split(inner)
+            except ValueError:
+                tokens = inner.split()
+        else:
+            break
+    head_tokens = []
+    skip_next = False
+    value_flags = {"-c", "-C", "-k", "-o", "-f", "-t", "--config", "--cwd", "--grep", "--output", "--filter"}
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in value_flags:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        low = tok.lower()
+        base = Path(low).name if "/" in low else low
+        if "tarball" in low and head_tokens[:2] == ["gh", "api"]:
+            head_tokens.append("tarball")
+            break
+        if "setup-python" in low:
+            head_tokens.append("setup-python")
+            continue
+        if "/" in low and head_tokens:
+            # Positional file/directory path argument (e.g. `cat /tmp/playwright.log`)
+            continue
+        head_tokens.append(base)
+        if len(head_tokens) >= 3:
+            break
+    return " ".join(head_tokens)
+
+
 def classify_phase(command_text):
     """Return canonical execution phase tag from OS process command line, or None."""
-    if not isinstance(command_text, str) or not command_text:
+    if not isinstance(command_text, str) or not command_text.strip():
+        return None
+    head = _command_head_string(command_text)
+    if not head:
         return None
     for label, pattern in PHASE_RULES:
-        if re.search(pattern, command_text, re.IGNORECASE):
+        if re.search(pattern, head, re.IGNORECASE):
             return label
     return None
 
@@ -341,8 +396,16 @@ def probe_latency(repos, limit=40, job_run_limit=20):
     cancelled_pct = (
         round((cancelled_runs / total_non_skipped_runs) * 100.0, 1)
         if total_non_skipped_runs > 0
-        else 0.0
+        else None
     )
+
+    runner_classes = {
+        cls: {
+            "queue_wait": compute_stats(vals["queue_wait"]),
+            "execution": compute_stats(vals["execution"]),
+        }
+        for cls, vals in sorted(runner_class_buckets.items())
+    }
 
     return {
         "schema_version": 1,
@@ -372,13 +435,8 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             "total_non_skipped_runs": total_non_skipped_runs,
             "cancelled_rate_pct": cancelled_pct,
         },
-        "by_runner_class": {
-            cls: {
-                "queue_wait": compute_stats(vals["queue_wait"]),
-                "execution": compute_stats(vals["execution"]),
-            }
-            for cls, vals in sorted(runner_class_buckets.items())
-        },
+        "runner_classes": runner_classes,
+        "by_runner_class": runner_classes,
         "workflows": workflows,
         "repos": repo_summaries,
     }

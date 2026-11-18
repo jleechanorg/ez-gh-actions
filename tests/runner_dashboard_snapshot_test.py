@@ -319,6 +319,58 @@ class SnapshotTest(unittest.TestCase):
         ):
             self.assertNotIn(secret, serialized)
 
+    def test_sanitize_rejects_non_iso_generated_at_malformed_types_and_preserves_unknown(self):
+        mac = host_payload("mac", 4)
+        linux = host_payload("linux", 20)
+        linux["fleet"].update(configured=20, executing=19, idle=1, cycling=0, down=0, reserved=20)
+        linux["slots"] = [
+            {"slot": 1, "state": "BOGUS_UNKNOWN_STATE", "elapsed_minutes": 1.0},
+            {"slot": 2, "state": "EXECUTING", "elapsed_minutes": 3.0},
+        ]
+        cmux_payload = {
+            "ok": True,
+            "configured": 2,
+            "executing": 1,
+            "idle": 1,
+            "cycling": 0,
+            "down": 0,
+            "vms": [
+                {
+                    "vm_id": "cmux-bad",
+                    "configured": 2,
+                    "executing": 1,
+                    "idle": 1,
+                    "cycling": 0,
+                    "down": 0,
+                    "disk_status": ["unhashable"],
+                    "slots": [{"slot": 1, "state": 123}],
+                }
+            ],
+        }
+        latency_payload = {
+            "ok": True,
+            "generated_at": "NOT_AN_ISO_TIMESTAMP secret-mac",
+            "cohort": ["unhashable"],
+            "overall": {},
+            "cancellation": {},
+            "workflows": [],
+        }
+        snapshot = MODULE.build_snapshot(
+            mac_payload=mac,
+            linux_payload=linux,
+            observed_at="2026-11-18T09:15:00Z",
+            published_at="2026-11-18T09:15:05Z",
+            cmux_payload=cmux_payload,
+            latency_payload=latency_payload,
+        )
+        self.assertEqual(snapshot["fleets"]["linux"]["slots"][0]["state"], "UNKNOWN")
+        self.assertEqual(snapshot["cmux"]["vms"][0]["disk_status"], "unknown")
+        self.assertEqual(snapshot["cmux"]["vms"][0]["slots"][0]["state"], "UNKNOWN")
+        self.assertIsNone(snapshot["latency"]["generated_at"])
+        self.assertIsNone(snapshot["latency"]["cohort"])
+        self.assertEqual(snapshot["reconciliation"]["available_pools"], 3)
+        self.assertEqual(snapshot["reconciliation"]["configured_slots"], 26)
+
 
 if __name__ == "__main__":
     unittest.main()

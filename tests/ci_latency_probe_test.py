@@ -293,6 +293,25 @@ class ProbeAndRedactionTest(unittest.TestCase):
         repos = {w["repo"] for w in payload["workflows"]}
         self.assertEqual(repos, {"org/repo-a", "org/repo-b"})
 
+    def test_classify_phase_ignores_flag_paths_and_zero_runs_returns_none_cancel_rate(self):
+        mod = load_module()
+        self.assertEqual(mod.classify_phase("pytest --junitxml=/tmp/playwright/report.xml"), "pytest")
+        self.assertEqual(mod.classify_phase("python3 -m pytest -k playwright tests/"), "pytest")
+        self.assertIsNone(mod.classify_phase("cat /tmp/playwright/trace.zip"))
+        self.assertEqual(mod.classify_phase("npx playwright install chromium"), "playwright install")
+        self.assertEqual(mod.classify_phase("npx playwright test --grep jest"), "playwright")
+        self.assertEqual(mod.classify_phase("gh api repos/org/repo/tarball/main"), "gh api tarball")
+
+        orig = mod.gh_json
+        mod.gh_json = lambda args, timeout=20: {"workflow_runs": []}
+        try:
+            payload = mod.probe_latency(["org/repo"], limit=5)
+        finally:
+            mod.gh_json = orig
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["cancellation"]["cancelled_rate_pct"])
+        self.assertIn("runner_classes", payload)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

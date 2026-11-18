@@ -344,7 +344,6 @@ fi
 
 DISK_OK=false
 DISK_STATUS="unknown"
-DISK_FREE_GB=""
 if [[ "$CONFIG_OK" == true ]]; then
   DISK_OUTPUT=""
   HOST_DISK_OUTPUT=""
@@ -384,9 +383,6 @@ if [[ "$CONFIG_OK" == true ]]; then
   fi
   if [[ "$DAEMON_FREE_KB" =~ ^[0-9]+$ && "$HOST_FREE_KB" =~ ^[0-9]+$ ]]; then
     DISK_OK=true
-    MIN_FREE_KB="$DAEMON_FREE_KB"
-    (( HOST_FREE_KB < MIN_FREE_KB )) && MIN_FREE_KB="$HOST_FREE_KB"
-    DISK_FREE_GB="$(awk -v kb="$MIN_FREE_KB" 'BEGIN { printf "%.1f", kb / 1048576 }')"
     if (( DAEMON_FREE_KB >= DISK_FLOOR_GB * 1024 * 1024 &&
       HOST_FREE_KB >= HOST_DISK_FLOOR_GB * 1024 * 1024 )); then
       DISK_STATUS="healthy"
@@ -395,7 +391,6 @@ if [[ "$CONFIG_OK" == true ]]; then
     fi
   elif [[ "$PARKED" == true && "$HOST_FREE_KB" =~ ^[0-9]+$ ]]; then
     DISK_OK=true
-    DISK_FREE_GB="$(awk -v kb="$HOST_FREE_KB" 'BEGIN { printf "%.1f", kb / 1048576 }')"
     if (( HOST_FREE_KB >= HOST_DISK_FLOOR_GB * 1024 * 1024 )); then
       DISK_STATUS="healthy"
     else
@@ -406,7 +401,13 @@ fi
 
 PAUSE_REASON=""
 if [[ "$PARKED" != true && "$DISK_STATUS" == "critical" && "${DOWN:-0}" =~ ^[0-9]+$ && "${DOWN:-0}" -gt 0 ]]; then
-  PAUSE_REASON="disk_floor_paused"
+  if [[ "$(uname -s)" == "Linux" ]] && \
+      journalctl --user -u ezgha.service --since "$RESPAWN_EVIDENCE_WINDOW_MIN minutes ago" --no-pager 2>/dev/null \
+        | grep -q "refusing to spawn runners"; then
+    PAUSE_REASON="disk_floor_paused"
+  else
+    PAUSE_REASON="disk_critical_with_down"
+  fi
 fi
 
 WATCHDOG_OK=false
@@ -433,7 +434,6 @@ fi
 
 HOST_CLASS="$HOST_CLASS" TARGET="$TARGET" EXECUTING="$EXECUTING" IDLE="$IDLE" \
 CYCLING="$CYCLING" DOWN="$DOWN" RESERVED="$RESERVED" DISK_STATUS="$DISK_STATUS" \
-DISK_FREE_GB="$DISK_FREE_GB" DISK_FLOOR_GB="$DISK_FLOOR_GB" \
 PARKED="$PARKED" PARKED_SLOTS="$PARKED_SLOTS" PARKED_REASON="$PARKED_REASON" \
 PAUSE_REASON="$PAUSE_REASON" SLOTS_META="$SLOTS_META" \
 WATCHDOG_MISSES="$WATCHDOG_MISSES" WATCHDOG_THRESHOLD="$WATCHDOG_THRESHOLD" \
@@ -447,13 +447,6 @@ def count(name):
     value = os.environ.get(name, "")
     return int(value) if value.isdigit() else None
 
-def opt_float(name):
-    value = os.environ.get(name, "")
-    try:
-        return float(value) if value else None
-    except ValueError:
-        return None
-
 host_class = os.environ["HOST_CLASS"]
 pause_reason = os.environ.get("PAUSE_REASON") or None
 slots = []
@@ -466,7 +459,7 @@ for raw in os.environ.get("SLOTS_META", "").splitlines():
     slot_num = int(parts[0])
     state = parts[1]
     elapsed = float(parts[2]) if parts[2] else None
-    phase = parts[3] or ("disk_floor_paused" if state == "DOWN" and pause_reason == "disk_floor_paused" else None)
+    phase = parts[3] or (pause_reason if state == "DOWN" and pause_reason else None)
     slots.append({
         "slot_id": f"{host_class}-{slot_num}",
         "slot": slot_num,
@@ -474,9 +467,6 @@ for raw in os.environ.get("SLOTS_META", "").splitlines():
         "elapsed_minutes": elapsed,
         "phase_badge": phase,
     })
-
-free_gb = opt_float("DISK_FREE_GB")
-floor_gb = count("DISK_FLOOR_GB")
 
 payload = {
     "schema_version": 1,
