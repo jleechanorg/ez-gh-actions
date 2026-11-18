@@ -41,9 +41,11 @@ MIRROR_ROOT="${WORKDIR}/mirrors"
 GEN_DIR="${MIRROR_ROOT}/generations/jleechanorg__testrepo.1000"
 ACTIVE_DIR="${MIRROR_ROOT}/active"
 
+export HERMES_SKIP_EXAMPLE_COM_GUARD=1
 git init --bare -b main "${UPSTREAM_GIT}" >/dev/null
 git clone "${UPSTREAM_GIT}" "${SEED_WORK}" >/dev/null 2>&1
-git -C "${SEED_WORK}" config user.email "ezgha-test@example.com"
+git -C "${SEED_WORK}" config core.hooksPath /dev/null
+git -C "${SEED_WORK}" config user.email "jleechan2015@users.noreply.github.com"
 git -C "${SEED_WORK}" config user.name "ezgha-test"
 
 for i in $(seq 1 55); do

@@ -299,7 +299,15 @@ def reap_old_generations(generations_dir, active_dir, slug, retention_min):
     tmp_prefix = f".{slug}."
 
     for name in os.listdir(generations_dir):
-        if not (name.startswith(prefix) or name.startswith(tmp_prefix)):
+        if name.startswith(prefix):
+            suffix = name[len(prefix):]
+            if not suffix.isdigit():
+                continue
+        elif name.startswith(tmp_prefix):
+            suffix = name[len(tmp_prefix):]
+            if not re.fullmatch(r"[0-9]+\.tmp\.[0-9]+", suffix):
+                continue
+        else:
             continue
         entry_path = os.path.join(generations_dir, name)
         if os.path.islink(entry_path):
@@ -501,6 +509,49 @@ def gather_req_files():
     return [p for p in candidates if os.path.isfile(p)]
 
 
+BUILD_TAG_MARKER = "999999ezgha"
+
+
+def sync_wheelhouse_build_tag_symlinks(wheelhouse_path, clear_only=False):
+    """Ensure relative PEP 427 build-tag symlinks exist for every real wheel.
+
+    Upstream pip's resolvelib Factory._iter_found_candidates reverses
+    sorted([file_candidates, page_candidates], key=_sort_key), which flips
+    tie-break precedence to PyPI when version, wheel tags, and build_tag tie.
+    Adding a relative `{dist}-{ver}-999999ezgha-{py}-{abi}-{plat}.whl -> {fn}`
+    symlink keeps `candidate.version` identical while setting
+    `build_tag = (999999, 'ezgha') > ()`, so pip strictly selects the local
+    wheel over equal-version PyPI wheels while still allowing newer PyPI
+    versions when unpinned.
+    """
+    for fn in list(os.listdir(wheelhouse_path)):
+        full = os.path.join(wheelhouse_path, fn)
+        if os.path.islink(full) and (f"-{BUILD_TAG_MARKER}-" in fn or not os.path.exists(full)):
+            if clear_only or not os.path.exists(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+    if clear_only:
+        return
+    for fn in sorted(os.listdir(wheelhouse_path)):
+        if not fn.endswith(".whl"):
+            continue
+        full = os.path.join(wheelhouse_path, fn)
+        if os.path.islink(full) or not os.path.isfile(full):
+            continue
+        parts = fn[:-4].rsplit("-", 3)
+        if len(parts) != 4:
+            continue
+        dv = parts[0].split("-")
+        if len(dv) != 2:
+            continue
+        alias = f"{dv[0]}-{dv[1]}-{BUILD_TAG_MARKER}-{parts[1]}-{parts[2]}-{parts[3]}.whl"
+        alias_path = os.path.join(wheelhouse_path, alias)
+        if not os.path.lexists(alias_path):
+            os.symlink(fn, alias_path)
+
+
 def refresh_wheelhouse(wheelhouse_path, image):
     wheelhouse_path = os.path.abspath(os.path.expanduser(wheelhouse_path))
     os.makedirs(wheelhouse_path, exist_ok=True)
@@ -562,14 +613,20 @@ def refresh_wheelhouse(wheelhouse_path, image):
     manifest_sha = hasher.hexdigest()
 
     manifest_file = os.path.join(wheelhouse_path, ".manifest.sha256")
-    whl_count = sum(1 for fn in os.listdir(wheelhouse_path) if fn.endswith(".whl"))
+    whl_count = sum(
+        1
+        for fn in os.listdir(wheelhouse_path)
+        if fn.endswith(".whl") and not os.path.islink(os.path.join(wheelhouse_path, fn))
+    )
     if os.path.isfile(manifest_file):
         with open(manifest_file, "r", encoding="utf-8") as fh:
             prev_sha = fh.read().strip()
         if prev_sha == manifest_sha and whl_count >= 10:
+            sync_wheelhouse_build_tag_symlinks(wheelhouse_path)
             log(f"wheelhouse up-to-date ({whl_count} wheels, manifest {manifest_sha[:12]})")
             return
 
+    sync_wheelhouse_build_tag_symlinks(wheelhouse_path, clear_only=True)
     payload = json.dumps({"core": core_pkgs, "reqs": req_payload})
     container_script = (
         "import glob, json, os, shutil, subprocess, sys\n"
@@ -597,10 +654,15 @@ def refresh_wheelhouse(wheelhouse_path, image):
     run_cmd(docker_cmd, timeout=900, env=docker_env, input_text=payload)
 
     chmod_a_rx(wheelhouse_path)
+    sync_wheelhouse_build_tag_symlinks(wheelhouse_path)
     with open(manifest_file, "w", encoding="utf-8") as fh:
         fh.write(f"{manifest_sha}\n")
     os.chmod(manifest_file, 0o644)
-    new_count = sum(1 for fn in os.listdir(wheelhouse_path) if fn.endswith(".whl"))
+    new_count = sum(
+        1
+        for fn in os.listdir(wheelhouse_path)
+        if fn.endswith(".whl") and not os.path.islink(os.path.join(wheelhouse_path, fn))
+    )
     log(f"wheelhouse refreshed ({new_count} wheels, manifest {manifest_sha[:12]})")
 
 

@@ -94,24 +94,27 @@ MIRRORS_B="${WORK}/mirrors_b"
 WORK_CLONE="${WORK}/work_clone"
 mkdir -p "${HOME_B}" "${UPSTREAM_ROOT}/jleechanorg" "${MIRRORS_B}"
 
+export HERMES_SKIP_EXAMPLE_COM_GUARD=1
 # Create bare upstream repo on `main`
 git init --bare -q "${UPSTREAM_ROOT}/jleechanorg/testrepo.git"
 git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" symbolic-ref HEAD refs/heads/main
 git clone -q "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${WORK_CLONE}/testrepo"
+git -C "${WORK_CLONE}/testrepo" config core.hooksPath /dev/null
 git -C "${WORK_CLONE}/testrepo" checkout -q -B main
 printf 'hello\n' > "${WORK_CLONE}/testrepo/README.md"
 git -C "${WORK_CLONE}/testrepo" add README.md
-git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=test@example.com commit -qm "initial main"
+git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=jleechan2015@users.noreply.github.com commit -qm "initial main"
 git -C "${WORK_CLONE}/testrepo" push -q origin main
 SHA_1="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads/main)"
 
 # Create bare upstream repo with ONLY `master` (and broken HEAD -> refs/heads/main) to test fallback
 git init --bare -q "${UPSTREAM_ROOT}/jleechanorg/masteronly.git"
-git clone -q "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" "${WORK_CLONE}/masteronly"
+git clone -q "${UPSTREAM_ROOT}/masteronly.git" "${WORK_CLONE}/masteronly" 2>/dev/null || git clone -q "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" "${WORK_CLONE}/masteronly"
+git -C "${WORK_CLONE}/masteronly" config core.hooksPath /dev/null
 git -C "${WORK_CLONE}/masteronly" checkout -q -B master
 printf 'master only\n' > "${WORK_CLONE}/masteronly/README.md"
 git -C "${WORK_CLONE}/masteronly" add README.md
-git -C "${WORK_CLONE}/masteronly" -c user.name=test -c user.email=test@example.com commit -qm "initial master"
+git -C "${WORK_CLONE}/masteronly" -c user.name=test -c user.email=jleechan2015@users.noreply.github.com commit -qm "initial master"
 git -C "${WORK_CLONE}/masteronly" push -q origin master
 git -C "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" symbolic-ref HEAD refs/heads/main
 MASTER_SHA="$(git -C "${UPSTREAM_ROOT}/jleechanorg/masteronly.git" rev-parse refs/heads/master)"
@@ -276,6 +279,23 @@ GEN3="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRR
 SEED_3="$(tr -d '[:space:]' < "${GEN3}/SEED_SHA")"
 [ "${SEED_3}" = "${SHA_3}" ] || fail "healthy second repo was blocked by broken first repo (${SEED_3} != ${SHA_3})"
 pass "(b5) per-repo error isolation refreshes healthy repos even when an earlier repo fails"
+
+# Dot-suffixed sibling repo protection (P1): refreshing jleechanorg/testrepo must never reap jleechanorg/testrepo.ai
+FAKE_SIBLING_GEN="${MIRRORS_B}/generations/jleechanorg__testrepo.ai.1000000000"
+mkdir -p "${FAKE_SIBLING_GEN}"
+python3 - "${FAKE_SIBLING_GEN}" <<'PY'
+import os, sys, time
+old = time.time() - 36000
+os.utime(sys.argv[1], (old, old))
+PY
+HOME="${HOME_B}" \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
+  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+  EZGHA_MIRROR_RETENTION_MIN=240 \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
+[ -d "${FAKE_SIBLING_GEN}" ] || fail "reap_old_generations deleted sibling dot-repo generation: ${FAKE_SIBLING_GEN}"
+pass "(b6) dot-suffixed sibling repo generation protected from prefix collision"
 
 # ── (c) Syntax & install.sh wiring ───────────────────────────────────────────
 bash -n "${INSTALL_SCRIPT}"
