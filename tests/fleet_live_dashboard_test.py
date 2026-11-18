@@ -749,6 +749,30 @@ class FleetLiveDashboardTest(unittest.TestCase):
             for col in ("q_avg", "q_p50", "q_p90", "q_p99", "e_avg", "e_p50", "e_p90", "e_p99", "e2e_avg", "e2e_p50", "e2e_p90", "e2e_p99"):
                 self.assertIn(f'data-sort="{col}"', rendered)
             self.assertIn("data.cohorts[currentCohort]", rendered)
+            self.assertIn("Latency Probe Unavailable:", rendered)
+            self.assertIn("Partial Latency Sample:", rendered)
+
+        # Real queue_probe logic through _collect_live_github_snapshot for short listings (total=8/1 row and total=101/1 row).
+        for reported_total, expected_unverified in ((8, 7), (101, 100)):
+            def fake_gh(args, timeout=20, _total=reported_total):
+                joined = " ".join(args)
+                if "status=in_progress" in joined and "per_page=50" in joined:
+                    return {"total_count": 0, "workflow_runs": []}
+                if "status=in_progress" in joined and "per_page=1" in joined:
+                    return 0
+                if "status=queued" in joined:
+                    return {"total_count": _total, "workflow_runs": [{"id": 9001, "created_at": "2026-11-18T10:00:00Z"}]}
+                if "/jobs" in joined:
+                    return 1
+                raise AssertionError(args)
+
+            with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
+                 mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_gh):
+                gh_snap = mod._collect_live_github_snapshot(repos=["org/repo"])
+            self.assertTrue(gh_snap["summary"]["q_partial"])
+            self.assertEqual(gh_snap["summary"]["q_unverified_runs"], expected_unverified)
+            self.assertIsNone(gh_snap["summary"]["fresh_queued_runs"])
+            self.assertIn(f"{expected_unverified} of {reported_total} queued run(s) unverified", gh_snap["summary"]["queued_sample_note"] or "")
 
 
 if __name__ == "__main__":

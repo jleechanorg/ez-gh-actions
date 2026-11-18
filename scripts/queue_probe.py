@@ -169,7 +169,7 @@ def probe_repo(repo, *, max_job_checks=None):
                     "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
         ip_runs = None
 
-    truncated = max_job_checks is None and queued_total > len(queued)
+    short_listing = queued_total > len(queued) and (max_job_checks is None or len(queued) < 100)
     sample_capped = max_job_checks is not None and (queued_total > max_job_checks or len(queued) > max_job_checks)
     to_check = queued[:max_job_checks] if (max_job_checks is not None and len(queued) > max_job_checks) else queued
     fresh = ghosts = unreadable_jobs = 0
@@ -206,14 +206,14 @@ def probe_repo(repo, *, max_job_checks=None):
         if wait is not None and (oldest is None or wait > oldest):
             oldest = wait
 
-    unverified_runs = unreadable_jobs + (max(0, queued_total - len(queued)) if truncated else 0)
+    unverified_runs = unreadable_jobs + (max(0, queued_total - len(queued)) if short_listing else 0)
     return {"repo": repo, "ok": True,
-            "fresh": None if (sample_capped or truncated) else fresh,
-            "ghosts": None if (sample_capped or truncated) else ghosts,
+            "fresh": None if (sample_capped or short_listing) else fresh,
+            "ghosts": None if (sample_capped or short_listing) else ghosts,
             "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
             "queued_total": queued_total, "sample_capped": sample_capped,
             "sampled_fresh": fresh, "sampled_ghosts": ghosts,
-            "partial": bool(unverified_runs > 0 or truncated), "unverified_runs": unverified_runs,
+            "partial": bool(unverified_runs > 0 or short_listing), "unverified_runs": unverified_runs,
             "error": None}
 
 

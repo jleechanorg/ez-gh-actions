@@ -578,9 +578,19 @@
       setText('queue-fresh', '—');
       setText('queue-ghosts', '—');
       setText('queue-oldest', '—');
+      const unverifiedSuffix =
+        queue &&
+        queue.ok === true &&
+        queue.partial === true &&
+        isCount(queue.unverified_runs) &&
+        queue.unverified_runs > 0
+          ? ` (${queue.unverified_runs} unverified)`
+          : '';
       setText(
         'queue-summary',
-        'Queue breakdown unavailable this snapshot — treat waiting work as unknown, not zero.',
+        queue && queue.ok === true && queue.partial === true
+          ? `Queue breakdown partial — treat waiting work as unknown${unverifiedSuffix}.`
+          : 'Queue breakdown unavailable this snapshot — treat waiting work as unknown, not zero.',
       );
       byId('queue-fresh')?.classList?.add?.('is-unknown');
       byId('queue-ghosts')?.classList?.add?.('is-unknown');

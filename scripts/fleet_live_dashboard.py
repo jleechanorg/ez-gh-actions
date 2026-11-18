@@ -863,15 +863,15 @@ def _collect_live_github_snapshot(repos=None):
                     sample_notes.append(
                         f"{short}: {q_probe['unverified_runs']} queued run(s) had unreadable jobs"
                     )
+                if q_probe.get("unverified_runs"):
+                    sample_notes.append(
+                        f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
+                    )
                 if q_probe.get("sample_capped") or q_probe.get("fresh") is None or q_probe.get("ghosts") is None:
                     fresh_complete = False
                     if q_probe.get("sample_capped"):
                         sample_notes.append(
                             f"{short}: sampled {q_probe['sampled_fresh']} fresh / {q_probe['sampled_ghosts']} ghosts of {q_probe['queued_total']} (>10 cap)"
-                        )
-                    elif q_probe.get("unverified_runs"):
-                        sample_notes.append(
-                            f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
                         )
                 else:
                     total_fresh += q_probe["fresh"]
@@ -1254,6 +1254,7 @@ def render_html(state, *, auto_refresh_ms=0):
         <button data-cohort="cancelled">Cancelled</button>
       </div>
     </div>
+    <div id="latency-alerts" style="margin-bottom:0.65rem;"></div>
     <div class="kpi-grid" id="latency-kpis"></div>
     <div class="kpi-grid" id="latency-extra-kpis" style="margin-top:0.65rem;"></div>
     <div class="controls" style="margin-top:0.85rem;">
@@ -1412,6 +1413,17 @@ def render_html(state, *, auto_refresh_ms=0):
 
     function renderLatency() {{
       const lat = state.latency || {{}};
+      const latAlerts = [];
+      if (lat.ok !== true) {{
+        latAlerts.push(`<div class="alert-box"><strong>Latency Probe Unavailable:</strong> ${{esc(lat.error || 'latency telemetry probe failed or returned no samples')}}</div>`);
+      }} else if (lat.partial === true) {{
+        const parts = [];
+        if (lat.timed_out_runs) parts.push(`${{lat.timed_out_runs}} timed-out run(s)`);
+        if (lat.failed_job_fetches) parts.push(`${{lat.failed_job_fetches}} failed job fetch(es)`);
+        const detail = lat.error || (parts.length ? `${{parts.join(', ')}} — showing remaining samples only` : 'partial latency sample — some runs/jobs failed to fetch');
+        latAlerts.push(`<div class="alert-box warn"><strong>Partial Latency Sample:</strong> ${{esc(detail)}}</div>`);
+      }}
+      document.getElementById('latency-alerts').innerHTML = latAlerts.join('');
       const cohorts = lat.cohorts || {{}};
       const cData = cohorts[currentCohort] || {{}};
       const q = cData.queue_wait || {{}};
