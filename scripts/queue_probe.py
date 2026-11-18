@@ -154,6 +154,7 @@ def probe_repo(repo, *, max_job_checks=None):
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                 "queued_total": None, "sample_capped": False,
                 "sampled_fresh": None, "sampled_ghosts": None,
+                "partial": False, "unverified_runs": 0,
                 "error": str(exc)[:200]}
 
     try:
@@ -165,12 +166,13 @@ def probe_repo(repo, *, max_job_checks=None):
                     "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                     "queued_total": queued_total, "sample_capped": False,
                     "sampled_fresh": None, "sampled_ghosts": None,
+                    "partial": False, "unverified_runs": 0,
                     "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
         ip_runs = None
 
     sample_capped = max_job_checks is not None and (queued_total > max_job_checks or len(queued) > max_job_checks)
     to_check = queued[:max_job_checks] if (max_job_checks is not None and len(queued) > max_job_checks) else queued
-    fresh = ghosts = 0
+    fresh = ghosts = unreadable_jobs = 0
     oldest = None
     for run in to_check:
         run_id = run.get("id")
@@ -186,8 +188,10 @@ def probe_repo(repo, *, max_job_checks=None):
                         "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                         "queued_total": queued_total, "sample_capped": False,
                         "sampled_fresh": None, "sampled_ghosts": None,
+                        "partial": False, "unverified_runs": 0,
                         "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
+            unreadable_jobs += 1
 
         if count == 0:
             ghosts += 1
@@ -205,6 +209,7 @@ def probe_repo(repo, *, max_job_checks=None):
             "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
             "queued_total": queued_total, "sample_capped": sample_capped,
             "sampled_fresh": fresh, "sampled_ghosts": ghosts,
+            "partial": unreadable_jobs > 0, "unverified_runs": unreadable_jobs,
             "error": None}
 
 
@@ -236,6 +241,8 @@ def main():
         "ghosts": ghosts,
         "oldest_fresh_wait_minutes": max(waits) if waits else None,
         "in_progress_runs": in_progress_total,
+        "partial": any(entry.get("partial") for entry in repos),
+        "unverified_runs": sum(entry.get("unverified_runs") or 0 for entry in repos),
         "repos": repos,
     }
 

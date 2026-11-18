@@ -229,6 +229,8 @@ def _public_queue(payload, repo_map):
         })
     return {
         "ok": raw.get("ok") is True,
+        "partial": raw.get("partial") is True,
+        "unverified_runs": num("unverified_runs"),
         "fresh": num("fresh"),
         "ghosts": num("ghosts"),
         "oldest_fresh_wait_minutes": num("oldest_fresh_wait_minutes"),
@@ -353,6 +355,7 @@ def _public_latency(payload, repo_map):
         })
     return {
         "ok": True,
+        "partial": payload.get("partial") is True,
         "generated_at": _parse_iso_utc(payload.get("generated_at")),
         "cohort": cohort,
         "overall": overall,

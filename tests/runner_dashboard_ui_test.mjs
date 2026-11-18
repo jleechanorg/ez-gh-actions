@@ -400,7 +400,22 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   assert.ok(elements.get('latency-workflows').children.length >= 1);
   const wfMetricsText = elements.get('latency-workflows').children[0].children[1].textContent;
   assert.match(wfMetricsText, /Q avg 5m 39s.*p99 15m/);
+  assert.match(wfMetricsText, /E avg 6m 53s.*p99 34m 10s/);
   assert.match(wfMetricsText, /E2E avg 12m 32s.*p99 41m 40s/);
+
+  const partialSnap = structuredClone(snapshot);
+  partialSnap.queue = {
+    ...(partialSnap.queue || {}),
+    ok: true,
+    fresh: 3,
+    ghosts: 0,
+    partial: true,
+    unverified_runs: 2,
+  };
+  partialSnap.latency.partial = true;
+  render(partialSnap, NOW);
+  assert.match(elements.get('queue-summary').textContent, /partial: 2 unverified/);
+  assert.match(elements.get('latency-summary').textContent, /partial sample/);
 
   // Honest skipped-probe provenance on parked host still classifies as degraded (parked), never stale,
   // and an unavailable host displays UNAVAILABLE badge rather than ONLINE.

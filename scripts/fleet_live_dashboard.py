@@ -79,10 +79,6 @@ def _infer_phase_badge(cmds, state, reason=None):
         matched = ci_latency_probe.classify_phase(str(cmd))
         if matched:
             return matched
-    joined = " ".join(str(c) for c in (cmds or []))
-    matched = ci_latency_probe.classify_phase(joined)
-    if matched:
-        return matched
     st = (state or "").upper()
     if st == "PARKED":
         return "operator_disabled"
@@ -483,7 +479,8 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
         if isinstance(ip_exp, int) and isinstance(ip_succ, int)
         else None
     )
-    q_partial = bool(gh_summary.get("q_partial"))
+    q_unverified_runs = gh_summary.get("q_unverified_runs") or 0
+    q_partial = bool(gh_summary.get("q_partial") or q_unverified_runs > 0)
     q_exp = gh_summary.get("q_expected_repos")
     q_succ = gh_summary.get("q_succeeded_repos")
     q_repos_covered = f"{q_succ}/{q_exp}" if isinstance(q_exp, int) and isinstance(q_succ, int) else None
@@ -497,6 +494,7 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
         "repos_covered": repos_covered,
         "queue_partial": q_partial,
         "q_repos_covered": q_repos_covered,
+        "q_unverified_runs": q_unverified_runs,
         "fresh_queued_scope": fresh_scope,
         "scope_note": scope_note,
         "queued_runs_total": total_q_runs,
@@ -618,7 +616,7 @@ def _collect_local_native_runners():
             elapsed_raw, argv_str = parts[1], parts[2]
             if "/home/runner/" in argv_str:
                 continue
-            m = re.search(r"(/[^\s]+?)/bin/Runner\.(?:Listener|Worker)", argv_str)
+            m = re.search(r"(/[^\s]+?)/bin(?:\.[\d.]+)?/Runner\.(?:Listener|Worker)", argv_str)
             root_dir = m.group(1) if m else "native-runner"
             name = Path(root_dir).name or "mac-native-runner"
             entry = by_dir.setdefault(name, {"name": name, "state": "IDLE", "elapsed_minutes": None, "active_child_commands": []})
@@ -815,6 +813,7 @@ def _collect_live_github_snapshot(repos=None):
     ip_failed_repos = set()
     ip_capped = False
     q_failed_repos = set()
+    q_unverified_runs = 0
     sample_notes = []
     errors = []
     for repo in target_repos:
@@ -859,6 +858,11 @@ def _collect_live_github_snapshot(repos=None):
             else:
                 if q_probe.get("queued_total") is not None:
                     q_runs_by_repo[short] = q_probe["queued_total"]
+                q_unverified_runs += q_probe.get("unverified_runs") or 0
+                if q_probe.get("unverified_runs"):
+                    sample_notes.append(
+                        f"{short}: {q_probe['unverified_runs']} queued run(s) had unreadable jobs"
+                    )
                 if q_probe.get("sample_capped"):
                     fresh_complete = False
                     sample_notes.append(
@@ -871,16 +875,18 @@ def _collect_live_github_snapshot(repos=None):
             fresh_complete = False
             q_failed_repos.add(repo)
             errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
+    q_partial = bool(q_failed_repos or q_unverified_runs > 0)
     return {
         "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "all_in_progress_jobs": all_ip_jobs,
         "errors": errors,
         "summary": {
-            "partial": bool(errors or ip_failed_repos or q_failed_repos),
+            "partial": bool(errors or ip_failed_repos or q_partial),
             "ip_partial": bool(ip_failed_repos or ip_capped),
             "ip_expected_repos": len(target_repos),
             "ip_succeeded_repos": len(target_repos) - len(ip_failed_repos),
-            "q_partial": bool(q_failed_repos),
+            "q_partial": q_partial,
+            "q_unverified_runs": q_unverified_runs,
             "q_expected_repos": len(target_repos),
             "q_succeeded_repos": len(target_repos) - len(q_failed_repos),
             "total_in_progress_runs_by_repo": ip_runs_by_repo,
@@ -936,21 +942,26 @@ for line in ps.stdout.splitlines():
     cstatus = parts[1].strip() if len(parts) > 1 else ""
     st = "DOWN"; cmds = []; el = None; reason = None
     if cstatus.lower().startswith("up"):
-        top = subprocess.run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=10)
-        if top.returncode == 0:
-            hw = hl = False
-            for tl in top.stdout.splitlines()[1:]:
-                tp = tl.strip().split(None, 3)
-                if len(tp) < 3: continue
-                if "Runner.Worker" in tl:
-                    hw = True
-                    if tp[1].isdigit(): el = round(int(tp[1]) / 60.0, 1)
-                elif "Runner.Listener" in tl:
-                    hl = True
-                cmds.append(tp[3] if len(tp) == 4 else tp[2])
-            st = "EXECUTING" if hw else ("IDLE" if hl else "CYCLING")
-        else:
-            st = "UNKNOWN"; reason = "docker top probe failed"
+        try:
+            top = subprocess.run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            top = None
+            st = "UNKNOWN"; reason = "docker top timeout"
+        if top is not None:
+            if top.returncode == 0:
+                hw = hl = False
+                for tl in top.stdout.splitlines()[1:]:
+                    tp = tl.strip().split(None, 3)
+                    if len(tp) < 3: continue
+                    if "Runner.Worker" in tl:
+                        hw = True
+                        if tp[1].isdigit(): el = round(int(tp[1]) / 60.0, 1)
+                    elif "Runner.Listener" in tl:
+                        hl = True
+                    cmds.append(tp[3] if len(tp) == 4 else tp[2])
+                st = "EXECUTING" if hw else ("IDLE" if hl else "CYCLING")
+            else:
+                st = "UNKNOWN"; reason = "docker top probe failed"
     else:
         reason = cstatus or "container not running"
     order.append(cname)
@@ -1338,7 +1349,9 @@ def render_html(state, *, auto_refresh_ms=0):
       const qSub = rec.queued_sample_note
         ? rec.queued_sample_note
         : (rec.queue_partial
-            ? 'Partial queue coverage (' + (rec.q_repos_covered || 'some repos failed') + ')'
+            ? 'Partial queue coverage (' + (rec.q_repos_covered || 'some repos failed')
+              + (rec.q_unverified_runs > 0 ? ', ' + rec.q_unverified_runs + ' unverified job check(s)' : '')
+              + ')'
             : (rec.fresh_queued_scope
                 ? 'Scope: ' + rec.fresh_queued_scope
                 : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined

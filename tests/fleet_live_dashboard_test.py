@@ -549,15 +549,18 @@ class FleetLiveDashboardTest(unittest.TestCase):
         bsd_ps = (
             " 1234    12:34 /Users/op/actions-runner/bin/Runner.Worker\n"
             " 5678 1-02:03:04 /Users/op/actions-runner-macos-ci/bin/Runner.Listener\n"
+            " 9012    03:15 /Users/op/actions-runner-macos-ci/bin.2.338.2/Runner.Worker\n"
         )
         with mock.patch.object(mod.platform, "system", return_value="Darwin"), \
              mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ps"], 0, stdout=bsd_ps, stderr="")) as mrun:
             native = mod._collect_local_native_runners()
         self.assertIn("etime=", " ".join(mrun.call_args[0][0]))
+        self.assertEqual(len(native), 2)
         by_name = {n["name"]: n for n in native}
         self.assertEqual(by_name["actions-runner"]["state"], "EXECUTING")
         self.assertEqual(by_name["actions-runner"]["elapsed_minutes"], 12.6)
-        self.assertEqual(by_name["actions-runner-macos-ci"]["state"], "IDLE")
+        self.assertEqual(by_name["actions-runner-macos-ci"]["state"], "EXECUTING")
+        self.assertEqual(by_name["actions-runner-macos-ci"]["elapsed_minutes"], 3.2)
 
         remote_payload = {
             "ok": True,
@@ -683,6 +686,59 @@ class FleetLiveDashboardTest(unittest.TestCase):
             mac_host = next(h for h in state["hosts"] if h["id"] == "mac")
             self.assertNotIn("PARKED", mac_host["status"])
             self.assertIn("DOWN", mac_host["status"])
+
+    def test_remote_probe_py_docker_top_timeout_marks_unknown_and_q_unverified_propagates(self):
+        import os
+        import subprocess
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            cfg_dir = tmp / ".config" / "ezgha"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.toml").write_text('[runner]\ncount = 3\nname_prefix = "ez-runner-c"\n', encoding="utf-8")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            fake_docker = bin_dir / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys, time\n"
+                "args = sys.argv[1:]\n"
+                "if args[:1] == ['ps']:\n"
+                "    print('ez-runner-c-1\\tUp 5 minutes')\n"
+                "    print('ez-runner-c-2\\tUp 5 minutes')\n"
+                "elif args[:1] == ['top']:\n"
+                "    name = args[1]\n"
+                "    if name == 'ez-runner-c-1':\n"
+                "        print('PID ELAPSED COMMAND')\n"
+                "        print('101 120 Runner.Worker /home/runner/bin/Runner.Worker')\n"
+                "        print('102 65 python3 pytest tests/x.py')\n"
+                "    elif name == 'ez-runner-c-2':\n"
+                "        time.sleep(2)\n"
+                "elif args[:1] == ['inspect']:\n"
+                "    print('2026-11-18T10:00:00Z')\n",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+            probe_script = mod._REMOTE_PROBE_PY.replace("timeout=10", "timeout=0.3")
+            env = dict(os.environ, HOME=str(tmp), PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+            proc = subprocess.run(
+                ["python3", "-c", probe_script],
+                capture_output=True, text=True, check=True, env=env,
+            )
+            payload = json.loads(proc.stdout)
+        self.assertEqual([s["state"] for s in payload["slots"]], ["EXECUTING", "UNKNOWN", "DOWN"])
+        self.assertEqual(payload["slots"][1]["reason"], "docker top timeout")
+
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", return_value={"total_count": 1, "workflow_runs": [{"id": 1, "name": "CI", "html_url": "https://github.com/o/r/actions/runs/1", "head_branch": "main"}]}), \
+             mock.patch.object(mod.queue_probe, "probe_repo", return_value={"repo": "org/repo", "ok": True, "fresh": 2, "ghosts": 0, "oldest_fresh_wait_minutes": 3, "in_progress_runs": 1, "queued_total": 2, "sample_capped": False, "sampled_fresh": 2, "sampled_ghosts": 0, "partial": True, "unverified_runs": 2, "error": None}):
+            gh_data = mod._collect_live_github_snapshot(repos=["org/repo"])
+        self.assertTrue(gh_data["summary"]["q_partial"])
+        self.assertEqual(gh_data["summary"]["q_unverified_runs"], 2)
+        rec = mod._normalize_reconciliation([], {}, gh_data)
+        self.assertTrue(rec["queue_partial"])
+        self.assertEqual(rec["q_unverified_runs"], 2)
 
 
 if __name__ == "__main__":

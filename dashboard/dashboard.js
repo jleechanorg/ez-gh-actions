@@ -463,10 +463,11 @@
         : latency.cohort === 'all_non_skipped'
           ? 'non-skipped runs'
           : 'recent completed runs';
+    const partialSuffix = latency.partial === true ? ' (partial sample)' : '';
     setText('latency-cancel-rate', `CANCELLED: ${cancelPct}`);
     setText(
       'latency-summary',
-      `Recent ${cohortLabel}: Queue Wait p50 ${formatDurationSeconds(overall.queue_wait?.p50_s)} · Job Exec p50 ${formatDurationSeconds(overall.execution?.p50_s)} · E2E p50 ${formatDurationSeconds(overall.e2e?.p50_s)}.`,
+      `Recent ${cohortLabel}: Queue Wait p50 ${formatDurationSeconds(overall.queue_wait?.p50_s)} · Job Exec p50 ${formatDurationSeconds(overall.execution?.p50_s)} · E2E p50 ${formatDurationSeconds(overall.e2e?.p50_s)}.${partialSuffix}`,
     );
 
     if (!workflowsEl || typeof document?.createElement !== 'function') return;
@@ -598,12 +599,16 @@
     );
 
     const total = queue.fresh + queue.ghosts;
+    const queuePartialSuffix =
+      queue.partial === true
+        ? ` (partial${isCount(queue.unverified_runs) && queue.unverified_runs > 0 ? `: ${queue.unverified_runs} unverified` : ''})`
+        : '';
     setText(
       'queue-summary',
       total === 0
-        ? 'Nothing queued: no waiting work and no ghosts.'
+        ? `Nothing queued: no waiting work and no ghosts.${queuePartialSuffix}`
         : `${queue.fresh} of ${total} queued runs are real waiting work; ` +
-          `${queue.ghosts} are ghosts GitHub will not release.`,
+          `${queue.ghosts} are ghosts GitHub will not release.${queuePartialSuffix}`,
     );
 
     if (!repos || typeof repos.appendChild !== 'function') return;

@@ -52,10 +52,11 @@ PHASE_RULES = (
 
 def _command_head_string(command_text):
     """Extract executable/subcommand tokens, ignoring flags, paths, and shell wrappers."""
+    cleaned = re.sub(r"^\S+\s+\(\d+s\):\s*", "", command_text.strip())
     try:
-        tokens = shlex.split(command_text)
+        tokens = shlex.split(cleaned)
     except ValueError:
-        tokens = command_text.split()
+        tokens = cleaned.split()
     while tokens:
         head = Path(tokens[0]).name.lower()
         if "=" in tokens[0] and not tokens[0].startswith("-"):
@@ -109,7 +110,10 @@ def _command_head_string(command_text):
                 head_tokens.append("setup-python")
                 continue
             if head_tokens[0] in interpreters:
-                head_tokens.append(base)
+                if "@playwright/" in low:
+                    head_tokens.append("playwright")
+                else:
+                    head_tokens.append(base)
                 if len(head_tokens) >= 3:
                     break
             continue

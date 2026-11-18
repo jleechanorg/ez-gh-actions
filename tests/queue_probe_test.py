@@ -124,6 +124,15 @@ class UnknownHandling(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["fresh"], 1)
         self.assertEqual(result["ghosts"], 0)
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["unverified_runs"], 1)
+
+    def test_readable_job_counts_set_partial_false_and_zero_unverified(self):
+        fake = FakeGH([queued_run(22), queued_run(23)], {22: 1, 23: 0})
+        result = run_against(fake)
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["unverified_runs"], 0)
 
     def test_rate_limited_pass_reports_not_ok(self):
         fake = FakeGH([queued_run(21)], {}, fail_jobs_for=(21,))

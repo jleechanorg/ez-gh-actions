@@ -382,6 +382,33 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(bad_types["cmux"]["vms"], [])
         self.assertEqual(bad_types["latency"]["workflows"], [])
 
+        partial_snap = MODULE.build_snapshot(
+            mac_payload=mac,
+            linux_payload=linux,
+            observed_at="2026-11-18T09:15:00Z",
+            published_at="2026-11-18T09:15:05Z",
+            queue_payload={
+                "ok": True,
+                "fresh": 3,
+                "ghosts": 1,
+                "oldest_fresh_wait_minutes": 4,
+                "in_progress_runs": 2,
+                "partial": True,
+                "unverified_runs": 2,
+            },
+            latency_payload={
+                "ok": True,
+                "generated_at": "2026-11-18T09:15:00Z",
+                "partial": True,
+                "overall": {},
+                "cancellation": {},
+                "workflows": [],
+            },
+        )
+        self.assertTrue(partial_snap["queue"]["partial"])
+        self.assertEqual(partial_snap["queue"]["unverified_runs"], 2)
+        self.assertTrue(partial_snap["latency"]["partial"])
+
 
 if __name__ == "__main__":
     unittest.main()
