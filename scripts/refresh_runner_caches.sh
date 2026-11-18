@@ -190,14 +190,22 @@ def git_auth_args(url):
     return []
 
 
-def run_cmd(cmd, timeout=None, env=None, capture=False, input_text=None):
+def merge_env(extra_env):
     merged_env = os.environ.copy()
-    if env:
-        merged_env.update(env)
+    if extra_env:
+        for k, v in extra_env.items():
+            if v is None:
+                merged_env.pop(k, None)
+            else:
+                merged_env[k] = v
+    return merged_env
+
+
+def run_cmd(cmd, timeout=None, env=None, capture=False, input_text=None):
     return subprocess.run(
         cmd,
         timeout=timeout,
-        env=merged_env,
+        env=merge_env(env),
         check=True,
         text=True,
         input=input_text,
@@ -206,23 +214,49 @@ def run_cmd(cmd, timeout=None, env=None, capture=False, input_text=None):
 
 
 def find_local_donor(repo):
+    if os.environ.get("EZGHA_DISABLE_LOCAL_DONOR", "").strip() == "1":
+        return None
     home = os.path.expanduser("~")
     short = repo.split("/")[-1]
-    candidates = []
+    candidates = [os.path.join(home, short, ".git")]
     for base in ("projects", "projects_other"):
         for sub in (repo, short):
             candidates.append(os.path.join(home, base, sub, ".git"))
+    wt_root = os.path.join(home, ".worktrees", short)
+    if os.path.isdir(wt_root):
+        for name in sorted(os.listdir(wt_root))[:32]:
+            candidates.append(os.path.join(wt_root, name, ".git"))
+
+    seen_common = set()
     for cand in candidates:
-        if os.path.exists(cand):
-            cand_dir = os.path.dirname(cand)
-            proc = subprocess.run(
-                ["git", "-C", cand_dir, "rev-parse", "--is-shallow-repository"],
-                text=True,
-                capture_output=True,
-            )
-            if proc.returncode == 0 and proc.stdout.strip() == "false":
-                return cand_dir
-            log(f"skipping shallow or unreadable local donor {cand_dir}")
+        if not os.path.exists(cand):
+            continue
+        cand_dir = os.path.dirname(cand)
+        proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                cand_dir,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--is-shallow-repository",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            continue
+        lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        common_dir, is_shallow = lines[0], lines[1]
+        if common_dir in seen_common:
+            continue
+        seen_common.add(common_dir)
+        if is_shallow == "false" and os.path.isdir(os.path.join(common_dir, "objects")):
+            return common_dir
+        log(f"skipping shallow or unreadable local donor {common_dir}")
     return None
 
 
@@ -280,7 +314,15 @@ def reap_old_generations(generations_dir, active_dir, slug, retention_min):
             st = os.stat(entry_real)
         except OSError:
             continue
-        if st.st_mtime < cutoff:
+        retired_ts = st.st_mtime
+        retired_marker = os.path.join(entry_real, "RETIRED_AT")
+        if os.path.isfile(retired_marker):
+            try:
+                with open(retired_marker, "r", encoding="utf-8") as fh:
+                    retired_ts = float(fh.read().strip())
+            except (OSError, ValueError):
+                retired_ts = st.st_mtime
+        if retired_ts < cutoff:
             log(f"reaping retired mirror generation: {entry_real}")
             shutil.rmtree(entry_real, ignore_errors=True)
 
@@ -290,8 +332,10 @@ def refresh_git_mirrors(mirror_root):
     staging_root = os.path.join(mirror_root, ".staging")
     generations_dir = os.path.join(mirror_root, "generations")
     active_dir = os.path.join(mirror_root, "active")
+    gens_real = os.path.realpath(generations_dir) if os.path.isdir(generations_dir) else None
     for d in (mirror_root, staging_root, generations_dir, active_dir):
         os.makedirs(d, exist_ok=True)
+    gens_real = os.path.realpath(generations_dir)
     for d in (mirror_root, generations_dir, active_dir):
         st = os.stat(d)
         os.chmod(d, stat.S_IMODE(st.st_mode) | 0o555)
@@ -301,6 +345,7 @@ def refresh_git_mirrors(mirror_root):
     url_tmpl = os.environ.get("EZGHA_MIRROR_URL_TEMPLATE", "https://github.com/%s.git")
     retention_min = int(os.environ.get("EZGHA_MIRROR_RETENTION_MIN", "240"))
     git_env = {"GIT_TERMINAL_PROMPT": "0"}
+    repo_errors = []
 
     for repo in repos:
         slug = repo.replace("/", "__")
@@ -308,93 +353,120 @@ def refresh_git_mirrors(mirror_root):
         staging_dir = os.path.join(staging_root, f"{slug}.git")
         auth_args = git_auth_args(url)
 
-        if not os.path.isdir(os.path.join(staging_dir, "objects")):
-            if os.path.exists(staging_dir):
-                shutil.rmtree(staging_dir, ignore_errors=True)
-            donor = find_local_donor(repo)
-            clone_cmd = ["git", *auth_args, "clone", "--bare"]
-            if donor:
-                log(f"initializing staging mirror for {repo} with local donor {donor}")
-                clone_cmd.extend(["--reference", donor, "--dissociate"])
-            else:
-                log(f"initializing staging mirror for {repo} from {url}")
-            clone_cmd.extend([url, staging_dir])
-            run_cmd(clone_cmd, timeout=600, env=git_env)
+        try:
+            if not os.path.isdir(os.path.join(staging_dir, "objects")) or not resolve_seed_sha(staging_dir):
+                if os.path.exists(staging_dir):
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                donor = find_local_donor(repo)
+                clone_cmd = ["git", *auth_args, "clone", "--bare"]
+                if donor:
+                    log(f"initializing staging mirror for {repo} with local donor {donor}")
+                    clone_cmd.extend(["--reference", donor, "--dissociate"])
+                else:
+                    log(f"initializing staging mirror for {repo} from {url}")
+                clone_cmd.extend([url, staging_dir])
+                run_cmd(clone_cmd, timeout=600, env=git_env)
 
-        run_cmd(["git", "-C", staging_dir, "config", "core.commitGraph", "false"], timeout=30)
-        run_cmd(["git", "-C", staging_dir, "config", "gc.auto", "0"], timeout=30)
-        run_cmd(
-            [
-                "git",
-                *auth_args,
-                "-C",
-                staging_dir,
-                "fetch",
-                "--prune",
-                url,
-                "+refs/heads/*:refs/heads/*",
-                "+refs/tags/*:refs/tags/*",
-            ],
-            timeout=300,
-            env=git_env,
-        )
-
-        seed_sha = resolve_seed_sha(staging_dir)
-        if not seed_sha:
-            warn(f"could not resolve SEED_SHA for {repo}; skipping generation publish")
-            continue
-
-        active_link = os.path.join(active_dir, slug)
-        active_seed_file = os.path.join(active_link, "SEED_SHA")
-        current_seed = ""
-        if os.path.isfile(active_seed_file):
-            with open(active_seed_file, "r", encoding="utf-8") as fh:
-                current_seed = fh.read().strip()
-
-        if current_seed == seed_sha:
-            log(f"mirror {repo} unchanged at {seed_sha}")
-        else:
-            epoch = next_generation_epoch(generations_dir, slug)
-            gen_tmp = os.path.join(generations_dir, f".{slug}.{epoch}.tmp.{os.getpid()}")
-            gen_final = os.path.join(generations_dir, f"{slug}.{epoch}")
-            if os.path.exists(gen_tmp):
-                shutil.rmtree(gen_tmp, ignore_errors=True)
-
+            run_cmd(["git", "-C", staging_dir, "config", "core.commitGraph", "false"], timeout=30)
+            run_cmd(["git", "-C", staging_dir, "config", "gc.auto", "0"], timeout=30)
             run_cmd(
-                ["git", "clone", "--bare", "--local", staging_dir, gen_tmp],
+                [
+                    "git",
+                    *auth_args,
+                    "-C",
+                    staging_dir,
+                    "fetch",
+                    "--prune",
+                    url,
+                    "+refs/heads/*:refs/heads/*",
+                    "+refs/tags/*:refs/tags/*",
+                ],
                 timeout=300,
                 env=git_env,
             )
 
-            info_dir = os.path.join(gen_tmp, "objects", "info")
-            for cg_name in ("commit-graph", "commit-graphs"):
-                cg_path = os.path.join(info_dir, cg_name)
-                if os.path.isdir(cg_path) and not os.path.islink(cg_path):
-                    shutil.rmtree(cg_path)
-                elif os.path.lexists(cg_path):
-                    os.unlink(cg_path)
+            seed_sha = resolve_seed_sha(staging_dir)
+            if not seed_sha:
+                warn(f"could not resolve SEED_SHA for {repo}; skipping generation publish")
+                continue
 
-            for marker_name in ("SEED_SHA", "MAIN_SHA"):
-                marker_path = os.path.join(gen_tmp, marker_name)
-                with open(marker_path, "w", encoding="utf-8") as fh:
-                    fh.write(f"{seed_sha}\n")
+            active_link = os.path.join(active_dir, slug)
+            prev_active_real = os.path.realpath(active_link) if os.path.lexists(active_link) else None
+            active_seed_file = os.path.join(active_link, "SEED_SHA")
+            current_seed = ""
+            if os.path.isfile(active_seed_file):
+                with open(active_seed_file, "r", encoding="utf-8") as fh:
+                    current_seed = fh.read().strip()
 
-            chmod_a_rx(gen_tmp)
-            os.replace(gen_tmp, gen_final)
+            if current_seed == seed_sha:
+                log(f"mirror {repo} unchanged at {seed_sha}")
+            else:
+                epoch = next_generation_epoch(generations_dir, slug)
+                gen_tmp = os.path.join(generations_dir, f".{slug}.{epoch}.tmp.{os.getpid()}")
+                gen_final = os.path.join(generations_dir, f"{slug}.{epoch}")
+                if os.path.exists(gen_tmp):
+                    shutil.rmtree(gen_tmp, ignore_errors=True)
 
-            tmp_link = os.path.join(active_dir, f".{slug}.link.{os.getpid()}")
-            if os.path.lexists(tmp_link):
-                os.unlink(tmp_link)
-            os.symlink(f"../generations/{slug}.{epoch}", tmp_link)
-            os.replace(tmp_link, active_link)
-            log(f"published mirror {repo} -> {slug}.{epoch} ({seed_sha})")
+                run_cmd(
+                    ["git", "clone", "--bare", "--local", staging_dir, gen_tmp],
+                    timeout=300,
+                    env=git_env,
+                )
 
-        reap_old_generations(generations_dir, active_dir, slug, retention_min)
+                info_dir = os.path.join(gen_tmp, "objects", "info")
+                for cg_name in ("commit-graph", "commit-graphs"):
+                    cg_path = os.path.join(info_dir, cg_name)
+                    if os.path.isdir(cg_path) and not os.path.islink(cg_path):
+                        shutil.rmtree(cg_path)
+                    elif os.path.lexists(cg_path):
+                        os.unlink(cg_path)
+
+                for marker_name in ("SEED_SHA", "MAIN_SHA"):
+                    marker_path = os.path.join(gen_tmp, marker_name)
+                    with open(marker_path, "w", encoding="utf-8") as fh:
+                        fh.write(f"{seed_sha}\n")
+
+                chmod_a_rx(gen_tmp)
+                os.replace(gen_tmp, gen_final)
+                gen_final_real = os.path.realpath(gen_final)
+
+                tmp_link = os.path.join(active_dir, f".{slug}.link.{os.getpid()}")
+                if os.path.lexists(tmp_link):
+                    os.unlink(tmp_link)
+                os.symlink(f"../generations/{slug}.{epoch}", tmp_link)
+                os.replace(tmp_link, active_link)
+
+                if (
+                    prev_active_real
+                    and prev_active_real != gen_final_real
+                    and os.path.isdir(prev_active_real)
+                    and prev_active_real.startswith(gens_real + os.sep)
+                ):
+                    retired_at = int(time.time())
+                    retired_marker = os.path.join(prev_active_real, "RETIRED_AT")
+                    try:
+                        with open(retired_marker, "w", encoding="utf-8") as fh:
+                            fh.write(f"{retired_at}\n")
+                        os.chmod(retired_marker, 0o644)
+                        os.utime(prev_active_real, None)
+                    except OSError as exc:
+                        warn(f"could not stamp RETIRED_AT on {prev_active_real}: {exc}")
+
+                log(f"published mirror {repo} -> {slug}.{epoch} ({seed_sha})")
+
+            reap_old_generations(generations_dir, active_dir, slug, retention_min)
+        except Exception as exc:
+            warn(f"failed refreshing mirror for {repo}: {exc}")
+            repo_errors.append(repo)
+
+    if repo_errors:
+        raise RuntimeError(f"mirror refresh failed for: {', '.join(repo_errors)}")
 
 
 def resolve_docker_env():
     env = {}
     if os.environ.get("DOCKER_HOST", "").strip():
+        env["DOCKER_CONTEXT"] = None
         return env
     if platform.system() == "Darwin":
         plist = os.path.expanduser("~/Library/LaunchAgents/org.jleechanorg.ezgha.plist")
@@ -406,11 +478,13 @@ def resolve_docker_env():
             )
             if proc.returncode == 0 and proc.stdout.strip():
                 env["DOCKER_HOST"] = proc.stdout.strip()
+                env["DOCKER_CONTEXT"] = None
                 return env
         if not os.path.exists("/var/run/docker.sock"):
             colima_sock = os.path.expanduser("~/.colima/default/docker.sock")
             if os.path.exists(colima_sock):
                 env["DOCKER_HOST"] = f"unix://{colima_sock}"
+                env["DOCKER_CONTEXT"] = None
     return env
 
 
@@ -437,13 +511,14 @@ def refresh_wheelhouse(wheelhouse_path, image):
         return
 
     docker_env = resolve_docker_env()
-    if subprocess.run(["docker", "info"], env={**os.environ, **docker_env}, capture_output=True).returncode != 0:
+    docker_proc_env = merge_env(docker_env)
+    if subprocess.run(["docker", "info"], env=docker_proc_env, capture_output=True).returncode != 0:
         warn("docker daemon unreachable; skipping wheelhouse refresh")
         return
 
     inspect_proc = subprocess.run(
         ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-        env={**os.environ, **docker_env},
+        env=docker_proc_env,
         text=True,
         capture_output=True,
     )
@@ -463,7 +538,7 @@ def refresh_wheelhouse(wheelhouse_path, image):
             "-lc",
             "cat /ms-playwright/PLAYWRIGHT_VERSION 2>/dev/null || echo 1.65.2",
         ],
-        env={**os.environ, **docker_env},
+        env=docker_proc_env,
         text=True,
         capture_output=True,
         timeout=60,
@@ -583,11 +658,23 @@ def main():
             )
             return 0
 
+        stage_errors = []
         if git_mirror_path and not args.skip_git:
-            refresh_git_mirrors(git_mirror_path)
+            try:
+                refresh_git_mirrors(git_mirror_path)
+            except Exception as exc:
+                warn(f"git mirror stage encountered error: {exc}")
+                stage_errors.append("git")
 
         if wheelhouse_path and not args.skip_wheels:
-            refresh_wheelhouse(wheelhouse_path, image)
+            try:
+                refresh_wheelhouse(wheelhouse_path, image)
+            except Exception as exc:
+                warn(f"wheelhouse stage encountered error: {exc}")
+                stage_errors.append("wheelhouse")
+
+        if stage_errors:
+            return 1
     finally:
         lock_fh.close()
 

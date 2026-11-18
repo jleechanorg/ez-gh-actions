@@ -1193,7 +1193,8 @@ pids = 512
 [policy]
 minimum_isolation = "container"
 "#;
-        let parsed: Config = toml::from_str(with_path).expect("config with git_mirror_host_path parses");
+        let parsed: Config =
+            toml::from_str(with_path).expect("config with git_mirror_host_path parses");
         assert_eq!(
             parsed.runner.git_mirror_host_path,
             Some(std::path::PathBuf::from("/tmp/mirrors"))
@@ -1215,7 +1216,8 @@ pids = 512
 [policy]
 minimum_isolation = "container"
 "#;
-        let omitted: Config = toml::from_str(without_path).expect("config without git_mirror_host_path parses");
+        let omitted: Config =
+            toml::from_str(without_path).expect("config without git_mirror_host_path parses");
         assert_eq!(omitted.runner.git_mirror_host_path, None);
     }
 

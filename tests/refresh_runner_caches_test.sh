@@ -128,12 +128,22 @@ git_mirror_host_path = "${MIRRORS_B}"
 min_free_disk_gb = 30
 EOF
 
+# Populate a shallow ~/projects/testrepo donor + unshallow ~/testrepo donor in HOME_B
+# to prove find_local_donor skips shallow donors and resolves unshallow git-common-dir.
+mkdir -p "${HOME_B}/projects"
+git clone -q --depth=1 "file://${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${HOME_B}/projects/testrepo"
+git clone -q "file://${UPSTREAM_ROOT}/jleechanorg/testrepo.git" "${HOME_B}/testrepo"
+
+OUT_B1="${WORK}/out_b1.log"
 HOME="${HOME_B}" \
   EZGHA_CACHE_TEST_FREE_GB=100 \
   EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
   EZGHA_MIRROR_REPOS="jleechanorg/testrepo jleechanorg/masteronly" \
   EZGHA_MIRROR_RETENTION_MIN=240 \
-  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
+  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels > "${OUT_B1}" 2>&1
+
+grep -q "initializing staging mirror for jleechanorg/testrepo with local donor" "${OUT_B1}" \
+  || fail "expected unshallow local donor to be used: $(cat "${OUT_B1}")"
 
 python3 - "${MIRRORS_B}" "${SHA_1}" "${MASTER_SHA}" <<'PY'
 import os, re, stat, sys
@@ -198,7 +208,10 @@ GEN1_AFTER="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "
 [ "${GEN1_AFTER}" = "${GEN1}" ] || fail "active symlink changed unexpectedly when upstream was unchanged"
 pass "(b2) active generation protected from reaping even when mtime > retention"
 
-# Advance upstream main by 1 commit, re-run: new generation becomes active AND 10h-old retired generation is reaped
+# Advance upstream main by 1 commit, re-run:
+# Even though GEN1 was published 10h ago, its post-retirement retention window
+# starts NOW (at retirement), so GEN1 MUST remain on disk immediately after
+# retirement while GEN2 becomes active.
 printf 'second commit\n' >> "${WORK_CLONE}/testrepo/README.md"
 git -C "${WORK_CLONE}/testrepo" add README.md
 git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=test@example.com commit -qm "second main"
@@ -215,10 +228,54 @@ HOME="${HOME_B}" \
 GEN2="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
 [ "${GEN2}" != "${GEN1}" ] || fail "new generation did not replace active symlink after upstream advance"
 [ -d "${GEN2}" ] || fail "new active generation missing: ${GEN2}"
-[ ! -e "${GEN1}" ] || fail "10h-old retired generation was NOT reaped: ${GEN1}"
+[ -d "${GEN1}" ] || fail "just-retired generation was prematurely deleted despite 0m post-retirement age: ${GEN1}"
+[ -f "${GEN1}/RETIRED_AT" ] || fail "missing RETIRED_AT marker on retired generation: ${GEN1}"
 SEED_2="$(tr -d '[:space:]' < "${GEN2}/SEED_SHA")"
 [ "${SEED_2}" = "${SHA_2}" ] || fail "new SEED_SHA mismatch: ${SEED_2} != ${SHA_2}"
-pass "(b3) upstream advance published new generation and safely reaped retired 10h-old generation"
+pass "(b3) upstream advance published new generation and preserved just-retired generation for post-retirement window"
+
+# Backdate GEN1's RETIRED_AT beyond retention (5h > 240m) and re-run: GEN1 is now safely reaped
+python3 - "${GEN1}" <<'PY'
+import os, sys, time
+gen = sys.argv[1]
+expired = int(time.time()) - 18000
+with open(os.path.join(gen, "RETIRED_AT"), "w", encoding="utf-8") as fh:
+    fh.write(f"{expired}\n")
+os.utime(gen, (expired, expired))
+PY
+
+HOME="${HOME_B}" \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
+  EZGHA_MIRROR_REPOS="jleechanorg/testrepo" \
+  EZGHA_MIRROR_RETENTION_MIN=240 \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels
+
+[ ! -e "${GEN1}" ] || fail "expired retired generation (>240m post-retirement) was NOT reaped: ${GEN1}"
+[ -d "${GEN2}" ] || fail "active generation GEN2 missing after reaping GEN1: ${GEN2}"
+pass "(b4) retired generation reaped once RETIRED_AT exceeds retention window"
+
+# Per-repo error isolation: a broken first repo does not prevent refreshing a healthy second repo
+printf 'third commit\n' >> "${WORK_CLONE}/testrepo/README.md"
+git -C "${WORK_CLONE}/testrepo" add README.md
+git -C "${WORK_CLONE}/testrepo" -c user.name=test -c user.email=test@example.com commit -qm "third main"
+git -C "${WORK_CLONE}/testrepo" push -q origin main
+SHA_3="$(git -C "${UPSTREAM_ROOT}/jleechanorg/testrepo.git" rev-parse refs/heads/main)"
+
+set +e
+HOME="${HOME_B}" \
+  EZGHA_CACHE_TEST_FREE_GB=100 \
+  EZGHA_MIRROR_URL_TEMPLATE="file://${UPSTREAM_ROOT}/%s.git" \
+  EZGHA_MIRROR_REPOS="jleechanorg/missing_broken_repo jleechanorg/testrepo" \
+  EZGHA_MIRROR_RETENTION_MIN=240 \
+  bash "${REFRESH_SCRIPT}" --config "${CFG_B}" --skip-wheels >/dev/null 2>&1
+ISO_RC=$?
+set -e
+[ "${ISO_RC}" -ne 0 ] || fail "expected non-zero exit when one mirror repo fails"
+GEN3="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${MIRRORS_B}/active/jleechanorg__testrepo")"
+SEED_3="$(tr -d '[:space:]' < "${GEN3}/SEED_SHA")"
+[ "${SEED_3}" = "${SHA_3}" ] || fail "healthy second repo was blocked by broken first repo (${SEED_3} != ${SHA_3})"
+pass "(b5) per-repo error isolation refreshes healthy repos even when an earlier repo fails"
 
 # ── (c) Syntax & install.sh wiring ───────────────────────────────────────────
 bash -n "${INSTALL_SCRIPT}"

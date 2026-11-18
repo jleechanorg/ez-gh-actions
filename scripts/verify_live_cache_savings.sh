@@ -58,6 +58,7 @@ if [ "${HOST_MODE}" = "mac" ]; then
   fi
   if [ -z "${DOCKER_HOST:-}" ] && [ ! -S /var/run/docker.sock ] && [ -S "${HOME}/.colima/default/docker.sock" ]; then
     export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
+    unset DOCKER_CONTEXT || true
   fi
 elif [ "${HOST_MODE}" != "local" ]; then
   echo "FAIL: unsupported --host '${HOST_MODE}' (expected local or mac)" >&2
@@ -124,10 +125,10 @@ SEED_FILE="${GIT_MIRROR_PATH}/active/jleechanorg__worldarchitect.ai/SEED_SHA"
 [ -n "${GIT_MIRROR_PATH}" ] && [ -f "${SEED_FILE}" ] \
   || { echo "FAIL: missing mirror SEED_SHA at ${SEED_FILE}" >&2; exit 1; }
 
-if [ -z "${GH_TOKEN:-}" ]; then
-  GH_TOKEN="$(gh auth token)"
+if [ -z "${GH_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
+  GH_TOKEN="$(gh auth token 2>/dev/null || true)"
 fi
-[ -n "${GH_TOKEN}" ] || { echo "FAIL: unable to obtain transient GH_TOKEN from gh auth token" >&2; exit 1; }
+[ -n "${GH_TOKEN:-}" ] || { echo "FAIL: unable to obtain transient GH_TOKEN from gh auth token" >&2; exit 1; }
 export GH_TOKEN
 
 CONTAINER_OUTPUT="$(
@@ -150,12 +151,13 @@ for line in open(\"/proc/net/dev\"):
             break
 "
       }
+      PW_VER="$(cat /ms-playwright/PLAYWRIGHT_VERSION 2>/dev/null || echo 1.65.2)"
       RX_BEFORE="$(read_rx)"
       git init -q /tmp/wa
-      git -C /tmp/wa remote add origin "https://x-access-token:${GH_TOKEN}@github.com/jleechanorg/worldarchitect.ai.git"
-      git -C /tmp/wa fetch --depth=1 origin main
+      git -C /tmp/wa remote add origin "https://github.com/jleechanorg/worldarchitect.ai.git"
+      git -C /tmp/wa -c "credential.helper=!f() { echo username=x-access-token; echo password=\${GH_TOKEN}; }; f" fetch --depth=1 origin main
       python3 -m venv /tmp/v
-      /tmp/v/bin/pip install --quiet pytest pydantic coverage playwright
+      /tmp/v/bin/pip install --quiet pytest pydantic coverage "playwright==${PW_VER}"
       /tmp/v/bin/python -m playwright install chromium
       RX_AFTER="$(read_rx)"
       echo "RX_BEFORE=${RX_BEFORE}"

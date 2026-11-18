@@ -16,7 +16,6 @@ fi
 # -C / --git-dir / --bare options for rev-parse / config / update-ref.
 git_dir_args=()
 subcommand=""
-i=1
 argc=$#
 args=("$@")
 idx=0
@@ -76,6 +75,10 @@ GIT_DIR="$("$REAL_GIT" "${git_dir_args[@]}" rev-parse --absolute-git-dir 2>/dev/
 if [ -z "$GIT_DIR" ] || [ ! -d "$GIT_DIR" ] || [ -e "$GIT_DIR/ezgha-hydrated" ]; then
   exec "$REAL_GIT" "$@"
 fi
+COMMON_DIR="$("$REAL_GIT" "${git_dir_args[@]}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+if [ -z "$COMMON_DIR" ] || [ ! -d "$COMMON_DIR" ]; then
+  COMMON_DIR="$GIT_DIR"
+fi
 
 ORIGIN_URL="$("$REAL_GIT" "${git_dir_args[@]}" config --get remote.origin.url 2>/dev/null || true)"
 if [[ ! "$ORIGIN_URL" =~ ^https://([^/@]+@)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(\.git)?/?$ ]]; then
@@ -115,10 +118,10 @@ fi
 # Hydrate safely (fail-open on any write failure).
 HYDRATED_NOW=0
 ALT_ADDED=0
-ALT_FILE="$GIT_DIR/objects/info/alternates"
+ALT_FILE="$COMMON_DIR/objects/info/alternates"
 ALT_ENTRY="$REAL_GEN/objects"
 
-if mkdir -p "$GIT_DIR/objects/info" 2>/dev/null; then
+if mkdir -p "$COMMON_DIR/objects/info" 2>/dev/null; then
   ALT_OK=0
   if [ -f "$ALT_FILE" ] && grep -Fxq -- "$ALT_ENTRY" "$ALT_FILE" 2>/dev/null; then
     ALT_OK=1
