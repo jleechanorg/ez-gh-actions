@@ -91,7 +91,7 @@ uninstall() {
   # unloads each before removing ~/.local/libexec/ezgha, so an omitted name leaves
   # a loaded hourly job pointing at a deleted script (the dead-path class this
   # file already documents above).
-  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup ios-release-cleanup"
+  AUX_NAMES="token-refresh queue-reaper queue-trimmer watchdog runner-dashboard colima-trim mission-output-cleanup ios-release-cleanup cache-warm"
   if command -v systemctl >/dev/null 2>&1; then
     for aux in ${AUX_NAMES}; do
       systemctl --user disable --now "ezgha-${aux}.timer" 2>/dev/null || true
@@ -818,6 +818,7 @@ PLIST
     install_macos_plist "mission-output-cleanup" "3600" "${SCRIPTS_DIR}/cleanup-mission-output.sh" "--apply"
     info "runner dashboard activation deferred — install explicitly after enabling Pages (issue #82)"
     install_macos_plist "colima-trim"   "60"    "${SCRIPTS_DIR}/colima-trim-guard.sh" ""
+    install_macos_plist "cache-warm"    "1800"  "${SCRIPTS_DIR}/refresh_runner_caches.sh" ""
 
     # Reclaims stale per-run iOS TestFlight release scratch
     # (`<scratch>/worldai-ios-release-<run>-<attempt>`) for another repository's
@@ -1063,7 +1064,7 @@ EOF
       bad "lima-vm-cpu-ceiling.service not enabled"
       exit 1
     fi
-    for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer; do
+    for timer in ezgha-token-refresh.timer ezgha-mission-output-cleanup.timer ezgha-cache-warm.timer; do
       if systemctl --user enable --now "${timer}" 2>/dev/null; then
         ok "systemd --user timer enabled: ${timer}"
       else

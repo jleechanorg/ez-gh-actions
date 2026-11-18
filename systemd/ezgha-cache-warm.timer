@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh ezgha runner git mirrors and pip wheelhouse caches periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=ezgha-cache-warm.service
+
+[Install]
+WantedBy=timers.target
