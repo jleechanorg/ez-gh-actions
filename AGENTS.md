@@ -227,19 +227,19 @@ documented in the script header.
 ### GitHub Actions cost & hosted-macOS alert (`org.jleechanorg.ezgha-gh-actions-cost-alert`)
 `scripts/gh-actions-cost-alert.sh` runs hourly (`StartInterval=3600`) via
 `launchd/org.jleechanorg.ezgha-gh-actions-cost-alert.plist.template`, querying
-`/organizations/${ALERT_ORG}/settings/billing/usage?year=YYYY&month=MM` (plus `year=YEST_YEAR&month=YEST_MONTH&day=YEST_DAY` on day-1 month rollover so `YESTERDAY_UTC` is never dropped) across both yesterday UTC and
+`/organizations/${ALERT_ORG}/settings/billing/usage?year=YYYY&month=MM` (plus `year=YEST_YEAR&month=YEST_MONTH&day=YEST_DAY` on day-1 month rollover so `YESTERDAY_UTC` is never dropped; if the rollover lookup fails, today/MTD current-month data is still evaluated in `billing_api_partial` mode with `api_failures` incremented) across both yesterday UTC and
 today UTC for `product=="actions"`. It evaluates gross spend (`DAILY_GROSS_WARN_USD=25`,
 `MTD_GROSS_WARN_USD=250`), hosted macOS minutes (`DAILY_MACOS_MIN_WARN=60`), and net billed spend
 (`DAILY_NET_WARN_USD=10`, `MTD_NET_WARN_USD=40`), routing `jsonPayload.source="gh-actions-cost-alert"`
 to the dedicated Slack-only policy `[CRITICAL] GitHub Actions cost or hosted macOS spike` (never
 `cause=fleet`). Primary billing calls use `GH_BILLING_TOKEN` or user `gh` keyring auth (never passing
 `~/.config/ezgha/gh_token` to `/settings/billing/usage`, because GitHub App `4245332` lacks
-`organization_administration=read`). When personal `core.remaining < 50` or `/settings/billing/usage`
+`organization_administration=read`). All `gh`/`gcloud` calls are bounded by wall-clock timeouts (`GH_CALL_TIMEOUT_SEC=30`), and `STATE_FILE` updates are serialized via a `mkdir` lockdir. When personal `core.remaining < 50` or `/settings/billing/usage`
 fails/403, a bounded gross-only App-token fallback (`APP_TOKEN_FILE=~/.config/ezgha/gh_token`,
-`MAX_APP_API_CALLS=60`, `YESTERDAY_UTC..TODAY_UTC`) still fires `ERROR COST_SPIKE` immediately on
+`MAX_APP_API_CALLS=60`) prioritizes org repos by `pushed` without excluding stale-push repos, includes `in_progress` and recently updated runs (`>= YESTERDAY_UTC`), paginates `/jobs?filter=all&per_page=100` within budget, and prices `macos-*` (`$0.062/min`), `ubuntu-*` (`$0.006/min`), and `windows-*` (`$0.010/min`). It fires `ERROR COST_SPIKE` immediately on
 observed gross/macOS spikes (`mode=app_token_fallback` or `app_token_fallback_partial`, `net_usd=null`,
-`mtd_gross=null`, `mtd_net=null`). Only a successful authoritative `/organizations/.../settings/billing/usage`
-read resets `api_failures=0`; any skip or failure increments `api_failures` and emits `WARNING BLIND`
+`mtd_gross=null`, `mtd_net=null`) and folds any simultaneous `BLIND` condition into that notification so the 300s policy rate limit cannot drop `BLIND`. Only a full authoritative `/organizations/.../settings/billing/usage`
+read + parse resets `api_failures=0`; any skip, partial rollover, or failure persists `api_failures` before alert writes and emits `WARNING BLIND`
 at `MAX_API_FAILURES=3` even if partial App fallback ran.
 - **Recovery / setup (OPERATOR-ONLY):**
   - `OPERATOR-ONLY: ./scripts/gh-actions-cost-alert.sh --ensure-gcp-policy` (creates/updates the dedicated Slack policy)
@@ -249,14 +249,14 @@ at `MAX_API_FAILURES=3` even if partial App fallback ran.
 ### Native macOS CI runner (`mac-native-ci-1`, label `self-hosted-native-macos`)
 `scripts/setup-native-macos-runner.sh` idempotently provisions an org-scoped native Darwin ARM64
 runner (`mac-native-ci-1`) at `/Users/jleechan/actions-runner-macos-ci` with work directory on
-Scratch (`native-macos-ci-work`, failing closed if Scratch is unavailable), `--no-default-labels --labels self-hosted-native-macos` (forbidding
-bare `self-hosted` and `worldai-testflight-native-mac`, and canonically refusing `~/actions-runner` and `~/actions-runner-smtp-egress`), and LaunchAgent
+Scratch (`native-macos-ci-work`, failing closed if Scratch is unavailable), `--no-default-labels --labels self-hosted-native-macos` (requiring `self-hosted-native-macos`, forbidding
+bare `self-hosted` and `worldai-testflight-native-mac`, and canonically refusing `$HOME`, `/`, and filesystem-identical/ancestor/descendant paths of `~/actions-runner` and `~/actions-runner-smtp-egress` for both `--runner-dir` and `--work-dir`), and LaunchAgent
 `org.jleechanorg.ezgha-native-macos-runner.plist` (with `<key>SessionCreate</key><true/>`, placing
 `mac-native-ci-1` into a separate security session detached from `worldai-testflight-native-mac`'s
-`SessionCreate=false` GUI signing session at `/Users/jleechan/actions-runner`).
+`SessionCreate=false` GUI signing session at `/Users/jleechan/actions-runner`). Binary provisioning stages and validates `Runner.Listener`/`config.sh`/`run.sh` so interrupted installs repair on retry; reconfiguration verifies launchd unload before removing credentials and preserves backups until `--replace` succeeds; no-change reruns leave an already-loaded LaunchAgent untouched; and `--uninstall` executes before Scratch resolution while confirming the GUI-domain job is unloaded before removing the plist.
 - **Recovery / setup (OPERATOR-ONLY):**
   - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh` (install/re-register + load LaunchAgent; pass `--reconfigure` to force unload and re-registration)
-  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh --verify` (check `.runner`, `.ezgha-labels`, live GitHub labels, `SessionCreate=true`, work dir, and launchd state)
+  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh --verify` (check binaries, `WORK_DIR`, `.runner`, `.ezgha-labels`, `GH_BIN` live GitHub labels unless `--offline`, `SessionCreate=true`, plist `WorkingDirectory`/`ProgramArguments`, and launchd state)
 
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**:

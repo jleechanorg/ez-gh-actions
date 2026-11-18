@@ -19,11 +19,14 @@
 #     `/settings/billing/usage` fails/403): uses `APP_TOKEN_FILE`
 #     (`~/.config/ezgha/gh_token`) when its `core.remaining >= 200`, hard-capped
 #     at `MAX_APP_API_CALLS=60` App-token API calls/hour (= 0.58% of the
-#     10,400/hr App installation quota). Scans `YESTERDAY_UTC..TODAY_UTC`
-#     gross-only (`net_usd=null`, `mtd_gross=null`, `mtd_net=null`), fires
-#     `ERROR COST_SPIKE` immediately on observed gross/macOS spikes, and
-#     NEVER resets `api_failures` (only an authoritative `/settings/billing/usage`
-#     success resets `api_failures=0`, preserving `WARNING BLIND` reporting).
+#     10,400/hr App installation quota). Prioritizes org repos by `pushed`
+#     without excluding stale-push repos, includes `in_progress` and recently
+#     updated runs across `>= YESTERDAY_UTC`, paginates `/jobs?filter=all&per_page=100`
+#     within budget, prices `macos-*`, `ubuntu-*`, and `windows-*` gross-only
+#     (`net_usd=null`, `mtd_gross=null`, `mtd_net=null`), fires `ERROR COST_SPIKE`
+#     immediately on observed spikes, marks `app_token_fallback_partial` on any
+#     scan/pricing gap, and NEVER resets `api_failures` (only full authoritative
+#     `/settings/billing/usage` success resets `api_failures=0`).
 #   - Alert isolation: emits `jsonPayload.source="gh-actions-cost-alert"` into
 #     a dedicated Cloud Monitoring policy (`[CRITICAL] GitHub Actions cost or
 #     hosted macOS spike`, Slack-only) with `COOLDOWN_SEC=21600` (6h) and
@@ -45,6 +48,12 @@ MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
 MIN_RATE_LIMIT_REMAINING="${MIN_RATE_LIMIT_REMAINING:-50}"
 MIN_APP_RATE_LIMIT_REMAINING="${MIN_APP_RATE_LIMIT_REMAINING:-200}"
 MAX_APP_API_CALLS="${MAX_APP_API_CALLS:-60}"
+FALLBACK_REPOS_PER_PAGE="${FALLBACK_REPOS_PER_PAGE:-100}"
+FALLBACK_RUNS_PER_PAGE="${FALLBACK_RUNS_PER_PAGE:-100}"
+FALLBACK_JOBS_PER_PAGE="${FALLBACK_JOBS_PER_PAGE:-100}"
+GH_CALL_TIMEOUT_SEC="${GH_CALL_TIMEOUT_SEC:-30}"
+GCLOUD_CALL_TIMEOUT_SEC="${GCLOUD_CALL_TIMEOUT_SEC:-30}"
+STATE_LOCK_TIMEOUT_SEC="${STATE_LOCK_TIMEOUT_SEC:-30}"
 APP_TOKEN_FILE="${APP_TOKEN_FILE:-$HOME/.config/ezgha/gh_token}"
 STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/gh-actions-cost-alert.json}"
 GH_BIN="${GH_BIN:-gh}"
@@ -59,7 +68,9 @@ NOW="$(date +%s)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 TODAY_UTC="${TARGET_DATE_UTC:-$(date -u +%Y-%m-%d)}"
 YESTERDAY_UTC="$(date -u -j -v-1d -f '%Y-%m-%d' "$TODAY_UTC" +%Y-%m-%d 2>/dev/null || date -u -d "$TODAY_UTC - 1 day" +%Y-%m-%d)"
+DAY_BEFORE_YESTERDAY_UTC="$(date -u -j -v-2d -f '%Y-%m-%d' "$TODAY_UTC" +%Y-%m-%d 2>/dev/null || date -u -d "$TODAY_UTC - 2 days" +%Y-%m-%d)"
 [[ "$YESTERDAY_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "FATAL: invalid YESTERDAY_UTC='$YESTERDAY_UTC'" >&2; exit 2; }
+[[ "$DAY_BEFORE_YESTERDAY_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "FATAL: invalid DAY_BEFORE_YESTERDAY_UTC='$DAY_BEFORE_YESTERDAY_UTC'" >&2; exit 2; }
 YEAR="${TODAY_UTC:0:4}"
 MONTH="$((10#${TODAY_UTC:5:2}))"
 YEAR_MONTH="${TODAY_UTC:0:7}"
@@ -142,6 +153,43 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   exit 0
 fi
 
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+  local timeout_bin="" rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  fi
+  if [ -n "$timeout_bin" ]; then
+    "$timeout_bin" -k 5 "$timeout_sec" "$@" || rc=$?
+    return "$rc"
+  fi
+  # Capture stdout via a temp file so any orphaned child (e.g. sleep inside a stub/subshell)
+  # cannot keep a command-substitution pipe open after the main child is killed on timeout.
+  local out_tmp
+  out_tmp="$(mktemp)"
+  "$@" > "$out_tmp" &
+  local pid=$!
+  local deadline=$((SECONDS + timeout_sec))
+  while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$out_tmp"
+    return 124
+  fi
+  wait "$pid" || rc=$?
+  cat "$out_tmp"
+  rm -f "$out_tmp"
+  return "$rc"
+}
+
 emit() { # severity status day message gross_usd net_usd macos_min top_repo [mode] [mtd_gross] [mtd_net]
   local severity="$1" status="$2" day="$3" message="$4" gross_usd="$5" net_usd="$6" macos_min="$7" top_repo="$8"
   local mode="${9:-billing_api}" mtd_gross="${10:-null}" mtd_net="${11:-null}"
@@ -180,7 +228,7 @@ emit() { # severity status day message gross_usd net_usd macos_min top_repo [mod
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "[$NOW_ISO] [dry-run] $payload"
   else
-    "$GCLOUD_BIN" logging write "$LOG_NAME" "$payload" --payload-type=json \
+    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" logging write "$LOG_NAME" "$payload" --payload-type=json \
       --severity="$severity" --project="$GCP_PROJECT" --account="$GCP_ACCOUNT" >/dev/null
   fi
 }
@@ -203,7 +251,47 @@ else
 fi
 
 tmp="$(mktemp)"
-trap 'rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.state" "$tmp.snapshot" "$tmp.next" "$tmp.repos" "$tmp.runs" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"' EXIT
+STATE_LOCK_DIR=""
+release_state_lock() {
+  if [ -n "${STATE_LOCK_DIR:-}" ] && [ -d "$STATE_LOCK_DIR" ]; then
+    rm -f "${STATE_LOCK_DIR}/pid" 2>/dev/null || true
+    rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+    STATE_LOCK_DIR=""
+  fi
+}
+cleanup() {
+  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.state" "$tmp.snapshot" "$tmp.next" "$tmp.repos" "$tmp.runs" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"
+  release_state_lock
+}
+trap cleanup EXIT
+
+acquire_state_lock() {
+  local lockdir="${STATE_FILE}.lock"
+  local pidfile="${lockdir}/pid"
+  local deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
+  local owner_pid=""
+  mkdir -p "$(dirname "$STATE_FILE")"
+  while true; do
+    if mkdir "$lockdir" 2>/dev/null; then
+      printf '%s\n' "$$" > "$pidfile"
+      STATE_LOCK_DIR="$lockdir"
+      return 0
+    fi
+    if [ -f "$pidfile" ]; then
+      owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+        rm -f "$pidfile" 2>/dev/null || true
+        rmdir "$lockdir" 2>/dev/null || true
+        continue
+      fi
+    fi
+    if (( SECONDS >= deadline )); then
+      echo "FATAL: timed out waiting for state lock $lockdir" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+}
 
 if [ "$DRY_RUN" -eq 1 ]; then
   if [ -r "$STATE_FILE" ]; then
@@ -213,7 +301,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   fi
   STATE_FILE="$tmp.snapshot"
 else
-  mkdir -p "$(dirname "$STATE_FILE")"
+  acquire_state_lock || exit 4
   if [ ! -f "$STATE_FILE" ]; then
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_FILE"
   fi
@@ -223,22 +311,36 @@ else
   mv "$tmp.next" "$STATE_FILE"
 fi
 
-record_blind_failure() {
-  local reason="$1" mode="${2:-blind}"
+FAILURES_NOW=0
+BLIND_DUE=0
+BLIND_COMBINED=0
+BLIND_REASON=""
+PRIMARY_FAILED=0
+
+increment_api_failure() {
   local failures last_blind
   failures="$(jq -r '.api_failures // 0' "$STATE_FILE")"
   failures=$((failures + 1))
   last_blind="$(jq -r '.last_blind // 0' "$STATE_FILE")"
   jq --argjson failures "$failures" '.api_failures = $failures' "$STATE_FILE" > "$tmp.state"
-  if [ "$failures" -ge "$MAX_API_FAILURES" ] && [ $((NOW - last_blind)) -ge "$COOLDOWN_SEC" ]; then
-    emit WARNING BLIND "$TODAY_UTC" \
-      "GitHub Actions cost monitor cannot query authoritative billing usage for $ALERT_ORG after $failures consecutive failures ($reason)" \
-      0 null 0 "" "$mode" null null
-    jq --argjson now "$NOW" '.last_blind = $now' "$tmp.state" > "$tmp.next"
-    mv "$tmp.next" "$tmp.state"
-  fi
   mv "$tmp.state" "$STATE_FILE"
-  echo "[$NOW_ISO] WARN: $reason ($failures consecutive); authoritative billing state unverified" >&2
+  FAILURES_NOW="$failures"
+  BLIND_DUE=0
+  if [ "$failures" -ge "$MAX_API_FAILURES" ] && [ $((NOW - last_blind)) -ge "$COOLDOWN_SEC" ]; then
+    BLIND_DUE=1
+  fi
+}
+
+emit_blind_if_due() {
+  local reason="$1" mode="${2:-blind}"
+  if [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+    emit WARNING BLIND "$TODAY_UTC" \
+      "GitHub Actions cost monitor cannot query authoritative billing usage for $ALERT_ORG after $FAILURES_NOW consecutive failures ($reason)" \
+      0 null 0 "" "$mode" null null
+    jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$tmp.state"
+    mv "$tmp.state" "$STATE_FILE"
+  fi
+  echo "[$NOW_ISO] WARN: $reason ($FAILURES_NOW consecutive); authoritative billing state unverified" >&2
 }
 
 FALLBACK_INCOMPLETE=0
@@ -247,7 +349,7 @@ FALLBACK_MODE="app_token_fallback"
 
 run_app_token_fallback() {
   local reason="$1"
-  local app_token app_rem calls_used=0 repo_count last_pushed runs_count
+  local app_token app_rem calls_used=0 repo_count runs_count oldest_run_date
   FALLBACK_INCOMPLETE=0
   FALLBACK_CAP_HIT=0
   FALLBACK_MODE="app_token_fallback"
@@ -259,7 +361,7 @@ run_app_token_fallback() {
   if [ "$MAX_APP_API_CALLS" -lt 2 ]; then
     return 1
   fi
-  if ! app_rem="$(GH_TOKEN="$app_token" "$GH_BIN" api rate_limit --jq '.resources.core.remaining // empty' 2>"$tmp.err")"; then
+  if ! app_rem="$(run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api rate_limit --jq '.resources.core.remaining // empty' 2>"$tmp.err")"; then
     return 1
   fi
   calls_used=1
@@ -270,19 +372,19 @@ run_app_token_fallback() {
   if [ "$calls_used" -ge "$MAX_APP_API_CALLS" ]; then
     return 1
   fi
-  if ! GH_TOKEN="$app_token" "$GH_BIN" api "orgs/${ALERT_ORG}/repos?sort=pushed&per_page=15" > "$tmp.repos" 2>"$tmp.err"; then
+  if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api "orgs/${ALERT_ORG}/repos?sort=pushed&per_page=${FALLBACK_REPOS_PER_PAGE}" > "$tmp.repos" 2>"$tmp.err"; then
     return 1
   fi
   calls_used=$((calls_used + 1))
 
   repo_count="$(jq 'length' "$tmp.repos" 2>/dev/null || echo 0)"
-  last_pushed="$(jq -r 'if length > 0 then ((.[-1].pushed_at // "")[:10]) else "" end' "$tmp.repos" 2>/dev/null || true)"
-  if [ "$repo_count" -ge 15 ] && [ -n "$last_pushed" ] && [[ ! "$last_pushed" < "$YESTERDAY_UTC" ]]; then
+  if [ "$repo_count" -ge "$FALLBACK_REPOS_PER_PAGE" ]; then
     FALLBACK_INCOMPLETE=1
   fi
 
   : > "$tmp.fallback_items"
   local repo_name full_name run_id run_day
+  local job_page fetched_jobs page_jobs_count total_jobs
   while IFS=$'\t' read -r repo_name full_name; do
     [ -n "$full_name" ] || continue
     if [ "$calls_used" -ge "$MAX_APP_API_CALLS" ]; then
@@ -290,7 +392,7 @@ run_app_token_fallback() {
       FALLBACK_CAP_HIT=1
       break
     fi
-    if ! GH_TOKEN="$app_token" "$GH_BIN" api "repos/${full_name}/actions/runs?created=${YESTERDAY_UTC}..${TODAY_UTC}&per_page=50" > "$tmp.runs" 2>"$tmp.err"; then
+    if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api "repos/${full_name}/actions/runs?per_page=${FALLBACK_RUNS_PER_PAGE}" > "$tmp.runs" 2>"$tmp.err"; then
       FALLBACK_INCOMPLETE=1
       calls_used=$((calls_used + 1))
       continue
@@ -298,54 +400,97 @@ run_app_token_fallback() {
     calls_used=$((calls_used + 1))
 
     runs_count="$(jq '(.workflow_runs // []) | length' "$tmp.runs" 2>/dev/null || echo 0)"
-    if [ "$runs_count" -ge 50 ]; then
-      FALLBACK_INCOMPLETE=1
+    if [ "$runs_count" -ge "$FALLBACK_RUNS_PER_PAGE" ]; then
+      oldest_run_date="$(jq -r '(.workflow_runs // []) | if length > 0 then ((.[-1].updated_at // .[-1].created_at // "")[:10]) else "" end' "$tmp.runs" 2>/dev/null || true)"
+      if [ -z "$oldest_run_date" ] || [[ ! "$oldest_run_date" < "$DAY_BEFORE_YESTERDAY_UTC" ]]; then
+        FALLBACK_INCOMPLETE=1
+      fi
     fi
 
     while IFS=$'\t' read -r run_id run_day; do
       [ -n "$run_id" ] || continue
-      if [ "$calls_used" -ge "$MAX_APP_API_CALLS" ]; then
-        FALLBACK_INCOMPLETE=1
-        FALLBACK_CAP_HIT=1
+      job_page=1
+      fetched_jobs=0
+      while true; do
+        if [ "$calls_used" -ge "$MAX_APP_API_CALLS" ]; then
+          FALLBACK_INCOMPLETE=1
+          FALLBACK_CAP_HIT=1
+          break
+        fi
+        if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api "repos/${full_name}/actions/runs/${run_id}/jobs?filter=all&per_page=${FALLBACK_JOBS_PER_PAGE}&page=${job_page}" > "$tmp.jobs" 2>"$tmp.err"; then
+          FALLBACK_INCOMPLETE=1
+          calls_used=$((calls_used + 1))
+          break
+        fi
+        calls_used=$((calls_used + 1))
+
+        jq -c --arg run_day "${run_day:-$TODAY_UTC}" --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
+          def is_self_hosted:
+            any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac"));
+          def job_mins:
+            if (.started_at // null) == null then 0
+            else
+              (((.completed_at // $now_iso) | fromdateiso8601) - (.started_at | fromdateiso8601)) as $secs
+              | if $secs > 0 then (($secs / 60) | ceil) else 0 end
+            end;
+          def is_hosted_macos:
+            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
+          def is_hosted_ubuntu:
+            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("ubuntu-"));
+          def is_hosted_windows:
+            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("windows-"));
+          (.jobs // [])[] | . as $j | job_mins as $m |
+          (((.started_at // $run_day) | tostring)[:10]) as $jday |
+          select($jday == $yesterday or $jday == $today) |
+          (if ($j | is_hosted_macos) then {macos_min: $m, gross: ($m * 0.062), unpriced: false}
+           elif ($j | is_hosted_ubuntu) then {macos_min: 0, gross: ($m * 0.006), unpriced: false}
+           elif ($j | is_hosted_windows) then {macos_min: 0, gross: ($m * 0.010), unpriced: false}
+           elif (($j | is_self_hosted | not) and $m > 0) then {macos_min: 0, gross: 0, unpriced: true}
+           else {macos_min: 0, gross: 0, unpriced: false}
+           end)
+          | {
+              day: $jday,
+              repo: $repo,
+              macos_min: .macos_min,
+              gross_usd: .gross,
+              unpriced_hosted: .unpriced
+            }
+        ' "$tmp.jobs" >> "$tmp.fallback_items"
+
+        page_jobs_count="$(jq '(.jobs // []) | length' "$tmp.jobs" 2>/dev/null || echo 0)"
+        total_jobs="$(jq '(.total_count // -1)' "$tmp.jobs" 2>/dev/null || echo -1)"
+        fetched_jobs=$((fetched_jobs + page_jobs_count))
+        if [ "$page_jobs_count" -eq 0 ]; then
+          break
+        fi
+        if [ "$total_jobs" -ge 0 ]; then
+          if [ "$fetched_jobs" -ge "$total_jobs" ]; then
+            break
+          fi
+        elif [ "$page_jobs_count" -lt "$FALLBACK_JOBS_PER_PAGE" ]; then
+          break
+        fi
+        job_page=$((job_page + 1))
+      done
+      if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
         break
       fi
-      if ! GH_TOKEN="$app_token" "$GH_BIN" api "repos/${full_name}/actions/runs/${run_id}/jobs" > "$tmp.jobs" 2>"$tmp.err"; then
-        FALLBACK_INCOMPLETE=1
-        calls_used=$((calls_used + 1))
-        continue
-      fi
-      calls_used=$((calls_used + 1))
-
-      jq -c --arg run_day "${run_day:-$TODAY_UTC}" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
-        def is_self_hosted:
-          any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac"));
-        def job_mins:
-          if (.started_at // null) == null then 0
-          else
-            (((.completed_at // $now_iso) | fromdateiso8601) - (.started_at | fromdateiso8601)) as $secs
-            | if $secs > 0 then (($secs / 60) | ceil) else 0 end
-          end;
-        def is_hosted_macos:
-          (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
-        def is_hosted_ubuntu:
-          (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("ubuntu-"));
-        (.jobs // [])[] | . as $j | job_mins as $m |
-        (((.started_at // $run_day) | tostring)[:10]) as $jday |
-        (if ($j | is_hosted_macos) then {macos_min: $m, gross: ($m * 0.062)}
-         elif ($j | is_hosted_ubuntu) then {macos_min: 0, gross: ($m * 0.006)}
-         else {macos_min: 0, gross: 0}
-         end)
-        | {
-            day: $jday,
-            repo: $repo,
-            macos_min: .macos_min,
-            gross_usd: .gross
-          }
-      ' "$tmp.jobs" >> "$tmp.fallback_items"
-    done < <(jq -r '(.workflow_runs // [])[] | select((.conclusion // "") != "skipped") | [(.id // empty), ((.created_at // "")[:10])] | @tsv' "$tmp.runs" 2>/dev/null || true)
-  done < <(jq -r --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" '
-    (.[]? | select(((.pushed_at // $today)[:10]) >= $yesterday) | [(.name // ""), (.full_name // "")] | @tsv)
+    done < <(jq -r --arg yesterday "$YESTERDAY_UTC" '
+      (.workflow_runs // [])[]
+      | select((.conclusion // "") != "skipped" and ((((.updated_at // .created_at // "")[:10]) >= $yesterday) or ((.status // "") == "in_progress") or ((.status // "") == "queued")))
+      | [(.id // empty), ((.created_at // "")[:10])]
+      | @tsv
+    ' "$tmp.runs" 2>/dev/null || true)
+    if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
+      break
+    fi
+  done < <(jq -r '
+    (.[]? | [(.name // ""), (.full_name // "")] | @tsv)
   ' "$tmp.repos" 2>/dev/null || true)
+
+  if [ -s "$tmp.fallback_items" ] && jq -se 'any(.[]; .unpriced_hosted == true)' "$tmp.fallback_items" >/dev/null 2>&1; then
+    FALLBACK_INCOMPLETE=1
+  fi
 
   jq -sc --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" '
     def sum_gross: (map(.gross_usd // 0) | add // 0);
@@ -385,19 +530,23 @@ run_app_token_fallback() {
 }
 
 used_fallback=0
+rollover_yest_failed=0
+rollover_fail_reason=""
 run_mode="billing_api"
 fallback_reason=""
-if ! remaining="$("$GH_BIN" api rate_limit --jq '.resources.core.remaining // empty' 2>"$tmp.err")"; then
+if ! remaining="$(run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api rate_limit --jq '.resources.core.remaining // empty' 2>"$tmp.err")"; then
   fallback_reason="gh api rate_limit failed"
 elif [[ "$remaining" =~ ^[0-9]+$ ]] && [ "$remaining" -lt "$MIN_RATE_LIMIT_REMAINING" ]; then
   fallback_reason="GitHub core rate limit remaining=$remaining (< $MIN_RATE_LIMIT_REMAINING)"
-elif ! "$GH_BIN" api "/organizations/${ALERT_ORG}/settings/billing/usage?year=${YEAR}&month=${MONTH}" > "$tmp" 2>"$tmp.err" || \
+elif ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "/organizations/${ALERT_ORG}/settings/billing/usage?year=${YEAR}&month=${MONTH}" > "$tmp" 2>"$tmp.err" || \
      ! jq -e '.usageItems | type == "array"' "$tmp" >/dev/null 2>&1; then
   fallback_reason="gh api billing usage failed"
 elif [ "$YEST_YEAR_MONTH" != "$YEAR_MONTH" ]; then
-  if ! "$GH_BIN" api "/organizations/${ALERT_ORG}/settings/billing/usage?year=${YEST_YEAR}&month=${YEST_MONTH}&day=${YEST_DAY}" > "$tmp.yest" 2>"$tmp.err" || \
+  if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "/organizations/${ALERT_ORG}/settings/billing/usage?year=${YEST_YEAR}&month=${YEST_MONTH}&day=${YEST_DAY}" > "$tmp.yest" 2>"$tmp.err" || \
      ! jq -e '.usageItems | type == "array"' "$tmp.yest" >/dev/null 2>&1; then
-    fallback_reason="gh api billing usage (previous month ${YEST_YEAR_MONTH}) failed"
+    rollover_yest_failed=1
+    rollover_fail_reason="gh api billing usage (previous month ${YEST_YEAR_MONTH}) failed"
+    run_mode="billing_api_partial"
   else
     jq -sc '{usageItems: ((.[0].usageItems // []) + (.[1].usageItems // []))}' "$tmp" "$tmp.yest" > "$tmp.merged"
     mv "$tmp.merged" "$tmp"
@@ -409,16 +558,14 @@ if [ -n "$fallback_reason" ]; then
     used_fallback=1
     run_mode="$FALLBACK_MODE"
   else
-    record_blind_failure "$fallback_reason" "blind"
+    increment_api_failure
+    emit_blind_if_due "$fallback_reason" "blind"
     exit 2
   fi
 fi
 
 if [ "$used_fallback" -eq 0 ]; then
-  jq '.api_failures = 0' "$STATE_FILE" > "$tmp.state"
-  mv "$tmp.state" "$STATE_FILE"
-
-  jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" '
+  jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
     def is_macos_min: (((.sku // "") | test("macos"; "i")) and (((.unitType // "") | ascii_downcase) == "minutes"));
     def sum_gross: (map(.grossAmount // 0) | add // 0);
     def sum_net: (map(.netAmount // 0) | add // 0);
@@ -443,15 +590,36 @@ if [ "$used_fallback" -eq 0 ]; then
         };
     [(.usageItems // [])[] | select(((.product // "") | ascii_downcase) == "actions")] as $all_actions
     | [$all_actions[] | select(((.date // "")[:7]) == $year_month)] as $mtd_actions
+    | (if $include_yest == 1 then [$yesterday, $today] else [$today] end) as $target_days
     | {
         mtd: {
           gross_usd: ($mtd_actions | sum_gross),
           net_usd: ($mtd_actions | sum_net),
           macos_min: ($mtd_actions | sum_macos_min)
         },
-        days: ([$yesterday, $today] | unique | map(day_summary(.; $all_actions)))
+        days: ($target_days | unique | map(day_summary(.; $all_actions)))
       }
   ' "$tmp" > "$tmp.summary"
+  if [ "$rollover_yest_failed" -eq 0 ]; then
+    jq '.api_failures = 0' "$STATE_FILE" > "$tmp.state"
+    mv "$tmp.state" "$STATE_FILE"
+  fi
+fi
+
+if [ "$used_fallback" -eq 1 ]; then
+  PRIMARY_FAILED=1
+  if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
+    BLIND_REASON="${fallback_reason}; App fallback ran (${run_mode}, hit MAX_APP_API_CALLS=${MAX_APP_API_CALLS})"
+  elif [ "$FALLBACK_INCOMPLETE" -eq 1 ]; then
+    BLIND_REASON="${fallback_reason}; partial App fallback ran (${run_mode})"
+  else
+    BLIND_REASON="${fallback_reason}; gross-only App fallback ran (${run_mode})"
+  fi
+  increment_api_failure
+elif [ "$rollover_yest_failed" -eq 1 ]; then
+  PRIMARY_FAILED=1
+  BLIND_REASON="$rollover_fail_reason"
+  increment_api_failure
 fi
 
 fmt_usd() { awk -v v="$1" 'BEGIN{printf "%.2f", v + 0}'; }
@@ -468,6 +636,33 @@ mark_emitted() {
   local key="$1"
   jq --arg k "$key" --argjson now "$NOW" '.sent[$k] = $now | .last_sent = $now' "$STATE_FILE" > "$tmp.state"
   mv "$tmp.state" "$STATE_FILE"
+}
+
+append_blind_context() {
+  local base="$1"
+  if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+    printf '%s; ALSO BLIND: authoritative billing usage failed %s consecutive times (%s)' "$base" "$FAILURES_NOW" "$BLIND_REASON"
+  else
+    printf '%s' "$base"
+  fi
+}
+
+emit_and_record() { # key severity status day msg gross net macos_min top_repo
+  local key="$1" severity="$2" status="$3" day="$4" msg="$5" gross="$6" net="$7" macos_min="$8" top_repo="$9"
+  local final_msg
+  final_msg="$(append_blind_context "$msg")"
+  if emit "$severity" "$status" "$day" "$final_msg" "$gross" "$net" "$macos_min" "$top_repo" "$run_mode" "$mtd_gross" "$mtd_net"; then
+    mark_emitted "$key"
+    if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+      jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$tmp.state"
+      mv "$tmp.state" "$STATE_FILE"
+      BLIND_COMBINED=1
+    fi
+    alerted=$((alerted + 1))
+  else
+    echo "ERROR: alert sink failed for $key" >&2
+    exit 3
+  fi
 }
 
 mtd_gross="$(jq -r '.mtd.gross_usd // "null"' "$tmp.summary")"
@@ -512,12 +707,7 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top
       else
         msg="GitHub Actions cost/macOS spike in $ALERT_ORG on $day: \$${d_gross_fmt} gross, ${d_macos_fmt} macOS min (\$${d_net_fmt} net); top repo $top_repo (${top_macos_fmt} macOS min, \$${top_gross_fmt} gross); MTD \$${mtd_gross_fmt} gross / \$${mtd_net_fmt} net"
       fi
-      if emit ERROR COST_SPIKE "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo" "$run_mode" "$mtd_gross" "$mtd_net"; then
-        mark_emitted "$key"
-        alerted=$((alerted + 1))
-      else
-        echo "ERROR: alert sink failed for $key" >&2; exit 3
-      fi
+      emit_and_record "$key" ERROR COST_SPIKE "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
     fi
   fi
 
@@ -525,12 +715,7 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top
     key="${day}:NET_SPEND_BREACH"
     if should_emit "$key"; then
       msg="GitHub Actions daily NET spend breach in $ALERT_ORG on $day: \$${d_net_fmt} net (>= \$${DAILY_NET_WARN_USD}; \$${d_gross_fmt} gross, ${d_macos_fmt} macOS min); top repo $top_repo (\$${top_net_fmt} net, \$${top_gross_fmt} gross); MTD \$${mtd_net_fmt} net"
-      if emit ERROR NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo" "$run_mode" "$mtd_gross" "$mtd_net"; then
-        mark_emitted "$key"
-        alerted=$((alerted + 1))
-      else
-        echo "ERROR: alert sink failed for $key" >&2; exit 3
-      fi
+      emit_and_record "$key" ERROR NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
     fi
   fi
 done < <(jq -r '.days[] | [.day, .gross_usd, (.net_usd // "null"), .macos_min, .top_repo, .top_repo_gross_usd, (.top_repo_net_usd // "null"), .top_repo_macos_min] | @tsv' "$tmp.summary")
@@ -539,12 +724,7 @@ if [ "$used_fallback" -eq 0 ] && [ "$mtd_net" != "null" ] && ge_num "$mtd_net" "
   key="${YEAR_MONTH}:MTD_NET_BREACH"
   if should_emit "$key"; then
     msg="GitHub Actions MTD NET spend breach in $ALERT_ORG (${YEAR_MONTH}): \$${mtd_net_fmt} net (>= \$${MTD_NET_WARN_USD}; \$${mtd_gross_fmt} gross, ${mtd_macos_fmt} macOS min)"
-    if emit ERROR MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" "" "$run_mode" "$mtd_gross" "$mtd_net"; then
-      mark_emitted "$key"
-      alerted=$((alerted + 1))
-    else
-      echo "ERROR: alert sink failed for $key" >&2; exit 3
-    fi
+    emit_and_record "$key" ERROR MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
   fi
 fi
 
@@ -552,26 +732,13 @@ if [ "$used_fallback" -eq 0 ] && [ "$mtd_gross" != "null" ] && ge_num "$mtd_gros
   key="${YEAR_MONTH}:MTD_GROSS_BREACH"
   if should_emit "$key"; then
     msg="GitHub Actions MTD GROSS usage breach in $ALERT_ORG (${YEAR_MONTH}): \$${mtd_gross_fmt} gross (>= \$${MTD_GROSS_WARN_USD}; \$${mtd_net_fmt} net, ${mtd_macos_fmt} macOS min)"
-    if emit ERROR MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" "" "$run_mode" "$mtd_gross" "$mtd_net"; then
-      mark_emitted "$key"
-      alerted=$((alerted + 1))
-    else
-      echo "ERROR: alert sink failed for $key" >&2; exit 3
-    fi
+    emit_and_record "$key" ERROR MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
   fi
 fi
 
-if [ "$used_fallback" -eq 1 ]; then
-  if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
-    blind_detail="${fallback_reason}; App fallback ran (${run_mode}, hit MAX_APP_API_CALLS=${MAX_APP_API_CALLS})"
-  elif [ "$FALLBACK_INCOMPLETE" -eq 1 ]; then
-    blind_detail="${fallback_reason}; partial App fallback ran (${run_mode})"
-  else
-    blind_detail="${fallback_reason}; gross-only App fallback ran (${run_mode})"
-  fi
-  record_blind_failure "$blind_detail" "$run_mode"
-  failures_now="$(jq -r '.api_failures // 0' "$STATE_FILE")"
-  echo "[$NOW_ISO] DEGRADED: org=$ALERT_ORG mode=$run_mode mtd_gross=null mtd_net=null mtd_macos_min=null api_failures=$failures_now fallback_incomplete=$FALLBACK_INCOMPLETE alerts_emitted=${alerted}"
+if [ "$PRIMARY_FAILED" -eq 1 ]; then
+  emit_blind_if_due "$BLIND_REASON" "$run_mode"
+  echo "[$NOW_ISO] DEGRADED: org=$ALERT_ORG mode=$run_mode mtd_gross=${mtd_gross_fmt} mtd_net=${mtd_net_fmt} mtd_macos_min=${mtd_macos_fmt} api_failures=${FAILURES_NOW} fallback_incomplete=$FALLBACK_INCOMPLETE alerts_emitted=${alerted}"
 else
   echo "[$NOW_ISO] OK: org=$ALERT_ORG mode=$run_mode mtd_gross=\$${mtd_gross_fmt} mtd_net=\$${mtd_net_fmt} mtd_macos_min=${mtd_macos_fmt} alerts_emitted=${alerted}"
 fi

@@ -187,6 +187,22 @@ chmod +x "$RUNNER_DIR_T/run.sh"
 cat > "$TMP/bin/launchctl-track" <<STUB
 #!/usr/bin/env bash
 printf 'launchctl %s\n' "\$*" >> "$TMP/launchctl.log"
+state_file="$TMP/launchctl.loaded"
+case "\${1:-}" in
+  load|bootstrap)
+    : > "\$state_file"
+    ;;
+  unload|bootout)
+    if [ -n "\${LAUNCHCTL_REFUSE_STOP:-}" ]; then
+      exit 1
+    fi
+    rm -f "\$state_file"
+    ;;
+  print)
+    [ -f "\$state_file" ]
+    exit \$?
+    ;;
+esac
 exit 0
 STUB
 chmod +x "$TMP/bin/launchctl-track"
@@ -200,7 +216,7 @@ case "$*" in
     printf 'stub-reg-token\n'
     ;;
   *"actions/runners"*)
-    default_live='{"runners":[{"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}'
+    default_live='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}'
     printf '%s\n' "${LIVE_RUNNERS_JSON:-$default_live}"
     ;;
   *)
@@ -212,12 +228,13 @@ STUB
 chmod +x "$TMP/bin/gh-runner"
 
 # Pre-populate existing installation with old labels and existing plist to test reconfiguration.
-printf '{"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 printf 'old-creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'old-rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
 printf 'old-label\n' > "$RUNNER_DIR_T/.ezgha-labels"
 PLIST_T="$TMP/home/Library/LaunchAgents/org.jleechanorg.ezgha-native-macos-runner.plist"
 printf '<plist version="1.0"><dict><key>Label</key><string>org.jleechanorg.ezgha-native-macos-runner</string></dict></plist>\n' > "$PLIST_T"
+: > "$TMP/launchctl.loaded"
 : > "$TMP/launchctl.log"
 : > "$TMP/config.log"
 
@@ -365,3 +382,150 @@ assert "@" not in serialized
 assert "worktree" not in serialized.lower()
 PY
 pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents and renders valid plist"
+
+# 6. --uninstall runs before resolve_work_dir, unloads even without plist, and retains plist if still loaded.
+: > "$TMP/launchctl.loaded"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-missing" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-fail.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null || fail "--uninstall must succeed even when Scratch cannot be resolved"
+[ ! -e "$PLIST_T" ] || fail "--uninstall must remove plist after service is unloaded"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "--uninstall must unload launchd job"
+
+# Missing plist but still-loaded service must still run bootout and clear loaded state.
+: > "$TMP/launchctl.loaded"
+: > "$TMP/launchctl.log"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-missing" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-fail.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null
+grep -q 'launchctl bootout gui/' "$TMP/launchctl.log" || fail "--uninstall must attempt bootout even when plist is missing"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "--uninstall must unload still-loaded service when plist is missing"
+
+# Refusing to unload must exit non-zero and retain plist.
+cp "$TMP/plist.ok" "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+if LAUNCHCTL_REFUSE_STOP=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-missing" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-fail.sh" \
+    "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
+  fail "--uninstall must fail when service remains loaded"
+fi
+[ -f "$PLIST_T" ] || fail "--uninstall must retain plist when service remains loaded"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null
+
+# 7. Required self-hosted-native-macos label & filesystem-identity/HOME checks on RUNNER_DIR and WORK_DIR.
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run --labels "ci-extra" >/dev/null 2>&1; then
+  fail "--labels without self-hosted-native-macos must be rejected"
+fi
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --dry-run --labels "self-hosted-native-macos,ci-extra" >/dev/null || \
+  fail "--labels with self-hosted-native-macos plus safe extra label must succeed"
+
+for bad_runner in "$TMP/home" "$TMP/home/Actions-Runner" "$TMP/home/Actions-Runner/sub"; do
+  if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+      "$SETUP_SCRIPT" --dry-run --runner-dir "$bad_runner" >/dev/null 2>&1; then
+    fail "must reject unsafe/case-alias RUNNER_DIR: $bad_runner"
+  fi
+done
+for bad_work in "$TMP/home" "$TMP/home/actions-runner" "$TMP/home/actions-runner/work" "$TMP/home/Actions-Runner/work"; do
+  if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+      "$SETUP_SCRIPT" --dry-run --work-dir "$bad_work" >/dev/null 2>&1; then
+    fail "must reject unsafe/reserved WORK_DIR: $bad_work"
+  fi
+done
+pass "required label and HOME/filesystem-identity reserved dir guards hold for RUNNER_DIR and WORK_DIR"
+
+# 8. --verify enforces GH_BIN without --offline, [ -d "$WORK_DIR" ], and LaunchAgent WorkingDirectory/ProgramArguments.
+cp "$TMP/plist.ok" "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/no-such-gh" \
+    "$SETUP_SCRIPT" --verify >/dev/null 2>&1; then
+  fail "--verify without --offline must fail when GH_BIN is missing"
+fi
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/no-such-gh" \
+  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify --offline should succeed without GH_BIN"
+
+rmdir "$TMP/scratch/native-macos-ci-work"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
+  fail "--verify must fail when WORK_DIR does not exist"
+fi
+mkdir -p "$TMP/scratch/native-macos-ci-work"
+
+python3 - "$PLIST_T" "$TMP/other-runner" <<'PY'
+import plistlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = plistlib.loads(p.read_bytes())
+d["WorkingDirectory"] = sys.argv[2]
+p.write_bytes(plistlib.dumps(d))
+PY
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
+  fail "--verify must fail when plist WorkingDirectory mismatches RUNNER_DIR"
+fi
+
+cp "$TMP/plist.ok" "$PLIST_T"
+python3 - "$PLIST_T" "$TMP/other-runner/run.sh" <<'PY'
+import plistlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = plistlib.loads(p.read_bytes())
+d["ProgramArguments"] = ["/bin/bash", sys.argv[2]]
+p.write_bytes(plistlib.dumps(d))
+PY
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
+  fail "--verify must fail when plist ProgramArguments mismatches RUNNER_DIR/run.sh"
+fi
+cp "$TMP/plist.ok" "$PLIST_T"
+pass "--verify enforces GH_BIN, WORK_DIR existence, and plist target paths"
+
+# 9. Interrupted binary provisioning (Runner.Listener present, config.sh missing) repairs cleanly on retry.
+mkdir -p "$TMP/home/actions-runner/bin"
+cp "$RUNNER_DIR_T/bin/Runner.Listener" "$TMP/home/actions-runner/bin/Runner.Listener"
+cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
+cp "$RUNNER_DIR_T/run.sh" "$TMP/home/actions-runner/run.sh"
+rm -f "$RUNNER_DIR_T/config.sh" "$RUNNER_DIR_T/run.sh"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" >/dev/null
+[ -x "$RUNNER_DIR_T/config.sh" ] && [ -x "$RUNNER_DIR_T/run.sh" ] || fail "incomplete provisioning must repair config.sh and run.sh on retry"
+pass "incomplete runner provisioning repairs missing config.sh and run.sh"
+
+# 10. No-change rerun leaves loaded LaunchAgent running; failed stop aborts before deleting creds;
+#     failed config.sh restores old creds when remote registration is unchanged.
+: > "$TMP/launchctl.log"
+: > "$TMP/launchctl.loaded"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" >/dev/null
+if grep -Eq 'launchctl (unload|bootout|load)' "$TMP/launchctl.log"; then
+  fail "idempotent no-change rerun must not unload or reload an already-loaded LaunchAgent"
+fi
+
+if LAUNCHCTL_REFUSE_STOP=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1; then
+  fail "--reconfigure must abort if LaunchAgent refuses to stop"
+fi
+[ -f "$RUNNER_DIR_T/.credentials" ] || fail "failed stop must abort before removing .credentials"
+
+cat > "$RUNNER_DIR_T/config.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "simulated config.sh failure" >&2
+exit 1
+STUB
+chmod +x "$RUNNER_DIR_T/config.sh"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf 'preserved-creds\n' > "$RUNNER_DIR_T/.credentials"
+printf 'preserved-rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
+: > "$TMP/launchctl.loaded"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1; then
+  fail "failed config.sh must fail setup"
+fi
+[ "$(cat "$RUNNER_DIR_T/.credentials")" = "preserved-creds" ] || fail "failed config.sh with unchanged remote registration must restore .credentials"
+[ -f "$TMP/launchctl.loaded" ] || fail "failed config.sh with unchanged remote registration must restart prior service"
+
+if LIVE_RUNNERS_JSON='{"runners":[{"id":202,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1; then
+  fail "failed config.sh must fail setup even when remote changed"
+fi
+[ ! -e "$RUNNER_DIR_T/.credentials" ] || fail "failed config.sh with changed remote registration must NOT restore stale .credentials"
+pass "idempotent rerun skips reload, stop failure protects creds, and failed reconfigure handles unchanged vs changed registration"

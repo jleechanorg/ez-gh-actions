@@ -78,18 +78,98 @@ RESERVED_TF_HOME="$(canonical_path "$HOME/actions-runner")"
 RESERVED_SMTP_HOME="$(canonical_path "$HOME/actions-runner-smtp-egress")"
 RESERVED_TF_OP="$(canonical_path "/Users/jleechan/actions-runner")"
 RESERVED_SMTP_OP="$(canonical_path "/Users/jleechan/actions-runner-smtp-egress")"
+PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
+LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
 
-# Fail-closed guard: never touch the TestFlight signing or SMTP-egress runner directories.
+stop_launchagent() {
+  local uid gui_target
+  uid="$(id -u)"
+  gui_target="gui/${uid}/${PLIST_LABEL}"
+  if [ -f "$PLIST_PATH" ]; then
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  fi
+  if launchctl print "$gui_target" >/dev/null 2>&1; then
+    launchctl bootout "$gui_target" 2>/dev/null || true
+  fi
+  local _attempt
+  for _attempt in 1 2 3 4 5; do
+    launchctl print "$gui_target" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  launchctl print "$gui_target" >/dev/null 2>&1 || return 0
+  return 1
+}
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] would unload and remove $PLIST_PATH"
+    exit 0
+  fi
+  if ! stop_launchagent; then
+    echo "ERROR: launchd job ${PLIST_LABEL} is still loaded; retaining ${PLIST_PATH}" >&2
+    exit 1
+  fi
+  if [ -f "$PLIST_PATH" ]; then
+    rm -f "$PLIST_PATH"
+    echo "removed: $PLIST_PATH"
+  else
+    echo "already absent: $PLIST_PATH"
+  fi
+  exit 0
+fi
+
+# Fail-closed guard: never touch $HOME, /, or TestFlight/SMTP-egress runner directories (including case-insensitive APFS aliases and parents).
 is_reserved_runner_dir() {
-  local target="$1" reserved
+  local target="$1"
   [ -n "$target" ] || return 0
   [ "$target" != "/" ] || return 0
-  for reserved in "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP"; do
-    case "$target" in
-      "$reserved"|"$reserved"/*) return 0 ;;
-    esac
-  done
-  return 1
+  python3 - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+target_raw = sys.argv[1]
+home_raw = sys.argv[2]
+reserved_raws = sys.argv[3:]
+
+def existing_ancestors(p: Path):
+    cur = p
+    while True:
+        if cur.exists():
+            yield cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+
+def same_fs(a: Path, b: Path) -> bool:
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+target_real = Path(os.path.realpath(target_raw))
+target_abs = Path(os.path.abspath(target_raw))
+home_real = Path(os.path.realpath(home_raw))
+
+if str(target_real) == "/" or target_real == home_real or same_fs(target_real, home_real) or same_fs(target_abs, home_real):
+    sys.exit(0)
+
+for res_raw in reserved_raws:
+    if not res_raw:
+        continue
+    res_real = Path(os.path.realpath(res_raw))
+    if target_real == res_real or res_real in target_real.parents or target_real in res_real.parents:
+        sys.exit(0)
+    for anc in list(existing_ancestors(target_abs)) + list(existing_ancestors(target_real)):
+        if same_fs(anc, res_real):
+            sys.exit(0)
+    if target_real.exists():
+        for res_anc in existing_ancestors(res_real):
+            if same_fs(target_real, res_anc):
+                sys.exit(0)
+
+sys.exit(1)
+PY
 }
 
 if is_reserved_runner_dir "$RUNNER_DIR"; then
@@ -108,9 +188,9 @@ normalize_labels() {
   printf '%s' "$out"
 }
 
-# Fail-closed guard: reject labels that cause Linux CI spillover or TestFlight collision.
+# Fail-closed guard: require self-hosted-native-macos and reject labels that cause Linux CI spillover or TestFlight collision.
 validate_labels() {
-  local raw="$1" item trimmed lower
+  local raw="$1" item trimmed lower has_native=0
   [ -n "$raw" ] || { echo "ERROR: --labels must not be empty" >&2; exit 2; }
   local IFS=','
   for item in $raw; do
@@ -129,8 +209,15 @@ validate_labels() {
         echo "ERROR: 'worldai-testflight-native-mac' label is reserved for TestFlight signing runner" >&2
         exit 2
         ;;
+      self-hosted-native-macos)
+        has_native=1
+        ;;
     esac
   done
+  if [ "$has_native" -ne 1 ]; then
+    echo "ERROR: --labels must include 'self-hosted-native-macos'" >&2
+    exit 2
+  fi
 }
 
 validate_labels "$LABELS"
@@ -181,8 +268,10 @@ resolve_work_dir() {
 }
 
 WORK_DIR="$(resolve_work_dir)" || exit 1
-PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
-LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
+if is_reserved_runner_dir "$WORK_DIR"; then
+  echo "ERROR: refusing unsafe or reserved work dir: '$WORK_DIR'" >&2
+  exit 2
+fi
 
 if [ -n "$RUNNER_REPO" ]; then
   RUNNER_URL="https://github.com/${RUNNER_REPO}"
@@ -248,33 +337,47 @@ render_plist() {
 PLIST
 }
 
-if [ "$UNINSTALL" -eq 1 ]; then
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would unload and remove $PLIST_PATH"
-    exit 0
-  fi
-  if [ -f "$PLIST_PATH" ]; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
-    rm -f "$PLIST_PATH"
-    echo "removed: $PLIST_PATH"
-  else
-    echo "already absent: $PLIST_PATH"
-  fi
-  exit 0
-fi
+runner_binaries_ready() {
+  local dir="$1"
+  [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ]
+}
 
 if [ "$VERIFY" -eq 1 ]; then
   [ -x "${RUNNER_DIR}/bin/Runner.Listener" ] || { echo "FAIL: missing ${RUNNER_DIR}/bin/Runner.Listener" >&2; exit 1; }
+  [ -x "${RUNNER_DIR}/config.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/config.sh" >&2; exit 1; }
+  [ -x "${RUNNER_DIR}/run.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/run.sh" >&2; exit 1; }
+  [ -d "$WORK_DIR" ] || { echo "FAIL: missing work dir ${WORK_DIR}" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.runner" ] || { echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.ezgha-labels" ] || { echo "FAIL: missing ${RUNNER_DIR}/.ezgha-labels" >&2; exit 1; }
   [ -f "$PLIST_PATH" ] || { echo "FAIL: missing $PLIST_PATH" >&2; exit 1; }
-  if command -v plutil >/dev/null 2>&1; then
-    session_create="$(plutil -extract SessionCreate raw -o - "$PLIST_PATH" 2>/dev/null || true)"
-  else
-    session_create="$(python3 -c 'import plistlib,sys; v=plistlib.loads(open(sys.argv[1],"rb").read()).get("SessionCreate"); print("true" if v is True else ("false" if v is False else ""))' "$PLIST_PATH" 2>/dev/null || true)"
-  fi
-  [ "$session_create" = "true" ] || { echo "FAIL: $PLIST_PATH must set SessionCreate=true (got '${session_create:-missing}')" >&2; exit 1; }
+  python3 - "$PLIST_PATH" "$PLIST_LABEL" "$RUNNER_DIR" <<'PY' || exit 1
+import os
+import plistlib
+import sys
+from pathlib import Path
+
+plist_path, expected_label, runner_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+data = plistlib.loads(Path(plist_path).read_bytes())
+
+if data.get("Label") != expected_label:
+    print(f"FAIL: {plist_path} Label={data.get('Label')!r} != {expected_label!r}", file=sys.stderr)
+    sys.exit(1)
+if data.get("SessionCreate") is not True:
+    print(f"FAIL: {plist_path} must set SessionCreate=true (got {data.get('SessionCreate')!r})", file=sys.stderr)
+    sys.exit(1)
+
+runner_real = os.path.realpath(runner_dir)
+wd = data.get("WorkingDirectory") or ""
+if os.path.realpath(wd) != runner_real:
+    print(f"FAIL: {plist_path} WorkingDirectory={wd!r} != {runner_dir!r}", file=sys.stderr)
+    sys.exit(1)
+
+prog = data.get("ProgramArguments")
+expected_run = os.path.realpath(os.path.join(runner_real, "run.sh"))
+if not isinstance(prog, list) or len(prog) < 2 or prog[0] != "/bin/bash" or os.path.realpath(prog[1]) != expected_run:
+    print(f"FAIL: {plist_path} ProgramArguments={prog!r} must target ['/bin/bash', '{runner_dir}/run.sh']", file=sys.stderr)
+    sys.exit(1)
+PY
   actual_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner")"
   actual_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner")"
   actual_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner")"
@@ -283,7 +386,12 @@ if [ "$VERIFY" -eq 1 ]; then
   [ "$actual_work" = "$WORK_DIR" ] || { echo "FAIL: .runner workFolder='$actual_work' != '$WORK_DIR'" >&2; exit 1; }
   [ -z "$actual_url" ] || [ "$actual_url" = "$RUNNER_URL" ] || { echo "FAIL: .runner gitHubUrl='$actual_url' != '$RUNNER_URL'" >&2; exit 1; }
   [ "$actual_labels" = "$RUNNER_LABELS" ] || { echo "FAIL: .ezgha-labels='$actual_labels' != '$RUNNER_LABELS'" >&2; exit 1; }
-  if [ "$OFFLINE" -eq 0 ] && command -v "$GH_BIN" >/dev/null 2>&1; then
+  if ! printf '%s\n' "$actual_labels" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | grep -qx 'self-hosted-native-macos'; then
+    echo "FAIL: .ezgha-labels must include self-hosted-native-macos (got '$actual_labels')" >&2
+    exit 1
+  fi
+  if [ "$OFFLINE" -eq 0 ]; then
+    command -v "$GH_BIN" >/dev/null 2>&1 || { echo "FAIL: gh binary '$GH_BIN' not found (pass --offline to skip live GitHub check)" >&2; exit 1; }
     runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API")"
     runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name)] | .[0] // empty')"
     [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' not found in live $RUNNERS_API" >&2; exit 1; }
@@ -291,6 +399,10 @@ if [ "$VERIFY" -eq 1 ]; then
     expected_sorted_csv="$(printf '%s' "$RUNNER_LABELS" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd, -)"
     if printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qxE 'self-hosted|worldai-testflight-native-mac'; then
       echo "FAIL: live runner '$RUNNER_NAME' carries forbidden label in '$live_labels_csv'" >&2
+      exit 1
+    fi
+    if ! printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qx 'self-hosted-native-macos'; then
+      echo "FAIL: live runner '$RUNNER_NAME' missing required label self-hosted-native-macos in '$live_labels_csv'" >&2
       exit 1
     fi
     [ "$live_labels_csv" = "$expected_sorted_csv" ] || { echo "FAIL: live labels '$live_labels_csv' != expected '$expected_sorted_csv'" >&2; exit 1; }
@@ -307,7 +419,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "RUNNER_URL=${RUNNER_URL}"
   echo "LABELS=${LABELS}"
   echo "PLIST_PATH=${PLIST_PATH}"
-  if [ -x "${EXISTING_RUNNER_DIR}/bin/Runner.Listener" ] && [ -f "${EXISTING_RUNNER_DIR}/config.sh" ]; then
+  if runner_binaries_ready "$EXISTING_RUNNER_DIR"; then
     echo "BINARY_SOURCE=apfs-clone:${EXISTING_RUNNER_DIR}"
   else
     echo "BINARY_SOURCE=download:v${RUNNER_VERSION}"
@@ -319,9 +431,25 @@ fi
 
 mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
 
-if [ ! -x "${RUNNER_DIR}/bin/Runner.Listener" ]; then
-  if [ -x "${EXISTING_RUNNER_DIR}/bin/Runner.Listener" ] && [ -f "${EXISTING_RUNNER_DIR}/config.sh" ]; then
-    echo "Provisioning runner binaries via clone from ${EXISTING_RUNNER_DIR}..."
+STAGE_DIR=""
+TMP_TGZ=""
+BACKUP_DIR=""
+KEEP_BACKUP=0
+CANDIDATE_PLIST=""
+cleanup_setup() {
+  [ -z "$STAGE_DIR" ] || rm -rf "$STAGE_DIR"
+  [ -z "$TMP_TGZ" ] || rm -f "$TMP_TGZ"
+  [ -z "$CANDIDATE_PLIST" ] || rm -f "$CANDIDATE_PLIST"
+  if [ "$KEEP_BACKUP" -eq 0 ] && [ -n "$BACKUP_DIR" ]; then
+    rm -rf "$BACKUP_DIR"
+  fi
+}
+trap cleanup_setup EXIT
+
+if ! runner_binaries_ready "$RUNNER_DIR"; then
+  STAGE_DIR="$(mktemp -d "${RUNNER_DIR}.stage.XXXXXX")"
+  if runner_binaries_ready "$EXISTING_RUNNER_DIR"; then
+    echo "Provisioning runner binaries via staged clone from ${EXISTING_RUNNER_DIR}..."
     shopt -s nullglob
     for item in "${EXISTING_RUNNER_DIR}"/bin* "${EXISTING_RUNNER_DIR}"/externals* \
                 "${EXISTING_RUNNER_DIR}/config.sh" "${EXISTING_RUNNER_DIR}/run.sh" \
@@ -329,19 +457,32 @@ if [ ! -x "${RUNNER_DIR}/bin/Runner.Listener" ]; then
                 "${EXISTING_RUNNER_DIR}/safe_sleep.sh"; do
       [ -e "$item" ] || continue
       base="$(basename "$item")"
-      cp -Rc "$item" "${RUNNER_DIR}/${base}" 2>/dev/null || cp -a "$item" "${RUNNER_DIR}/${base}"
+      cp -Rc "$item" "${STAGE_DIR}/${base}" 2>/dev/null || cp -a "$item" "${STAGE_DIR}/${base}"
     done
     shopt -u nullglob
   else
     echo "Downloading actions-runner v${RUNNER_VERSION} (osx-arm64)..."
-    tmp_tgz="$(mktemp)"
-    trap 'rm -f "${tmp_tgz:?}"' EXIT
+    TMP_TGZ="$(mktemp)"
     tarball_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
-    curl -fsSL "$tarball_url" -o "$tmp_tgz"
-    tar -xzf "$tmp_tgz" -C "$RUNNER_DIR"
-    rm -f "$tmp_tgz"
-    trap - EXIT
+    curl -fsSL "$tarball_url" -o "$TMP_TGZ"
+    tar -xzf "$TMP_TGZ" -C "$STAGE_DIR"
+    rm -f "$TMP_TGZ"
+    TMP_TGZ=""
   fi
+  if ! runner_binaries_ready "$STAGE_DIR"; then
+    echo "ERROR: staged runner binaries incomplete in ${STAGE_DIR}" >&2
+    exit 1
+  fi
+  shopt -s nullglob
+  for item in "${STAGE_DIR}"/*; do
+    [ -e "$item" ] || continue
+    base="$(basename "$item")"
+    rm -rf "${RUNNER_DIR:?}/${base}"
+    mv "$item" "${RUNNER_DIR}/${base}"
+  done
+  shopt -u nullglob
+  rm -rf "$STAGE_DIR"
+  STAGE_DIR=""
 fi
 
 # Register or refresh configuration when .runner/.ezgha-labels is missing, differs, or --reconfigure is passed.
@@ -357,12 +498,31 @@ if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_
 fi
 
 if [ "$needs_config" -eq 1 ]; then
+  was_loaded=0
+  if launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1; then
+    was_loaded=1
+  fi
   reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token')"
   [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
-  if [ -f "$PLIST_PATH" ]; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+  if ! stop_launchagent; then
+    echo "ERROR: failed to stop ${PLIST_LABEL}; aborting before removing existing credentials" >&2
+    exit 1
   fi
+
+  BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ezgha-runner-backup.XXXXXX")"
+  chmod 700 "$BACKUP_DIR"
+  old_agent_id=""
+  if [ -f "${RUNNER_DIR}/.runner" ]; then
+    old_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  fi
+  for f in .runner .credentials .credentials_rsaparams .ezgha-labels; do
+    if [ -f "${RUNNER_DIR}/${f}" ]; then
+      cp -p "${RUNNER_DIR}/${f}" "${BACKUP_DIR}/${f}"
+    fi
+  done
+
   rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams"
+  config_rc=0
   (
     cd "$RUNNER_DIR"
     ./config.sh --unattended \
@@ -373,18 +533,75 @@ if [ "$needs_config" -eq 1 ]; then
       --labels "$RUNNER_LABELS" \
       --no-default-labels \
       --replace
-  )
+  ) || config_rc=$?
+
+  if [ "$config_rc" -ne 0 ]; then
+    remote_unchanged=0
+    if [ -n "$old_agent_id" ] && runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 2>/dev/null)"; then
+      if printf '%s\n' "$runners_pages" | jq -se --arg id "$old_agent_id" '[.[].runners[]? | select((.id | tostring) == $id)] | length > 0' >/dev/null 2>&1; then
+        remote_unchanged=1
+      fi
+    elif [ -z "$old_agent_id" ] && [ -f "${BACKUP_DIR}/.credentials" ]; then
+      remote_unchanged=1
+    fi
+
+    if [ "$remote_unchanged" -eq 1 ]; then
+      echo "WARN: config.sh failed (rc=$config_rc); remote registration unchanged, restoring prior runner configuration" >&2
+      for f in .runner .credentials .credentials_rsaparams .ezgha-labels; do
+        if [ -f "${BACKUP_DIR}/${f}" ]; then
+          cp -p "${BACKUP_DIR}/${f}" "${RUNNER_DIR}/${f}"
+        fi
+      done
+      if [ "$was_loaded" -eq 1 ] && [ -f "$PLIST_PATH" ]; then
+        launchctl load -w "$PLIST_PATH" 2>/dev/null || true
+      fi
+    else
+      echo "ERROR: config.sh failed (rc=$config_rc) and remote registration may have changed; not restoring stale credentials" >&2
+      rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams"
+      if [ -f "${BACKUP_DIR}/.runner" ]; then
+        KEEP_BACKUP=1
+        echo "WARN: prior configuration backup preserved at ${BACKUP_DIR}" >&2
+      fi
+    fi
+    exit "$config_rc"
+  fi
+
+  rm -rf "$BACKUP_DIR"
+  BACKUP_DIR=""
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"
 fi
 
 printf 'LANG=en_US.UTF-8\n' > "${RUNNER_DIR}/.env"
 
-candidate="${PLIST_PATH}.candidate.$$"
-render_plist > "$candidate"
-if [ -f "$PLIST_PATH" ]; then
-  launchctl unload "$PLIST_PATH" 2>/dev/null || true
+CANDIDATE_PLIST="${PLIST_PATH}.candidate.$$"
+render_plist > "$CANDIDATE_PLIST"
+plist_matches=0
+if [ -f "$PLIST_PATH" ] && cmp -s "$CANDIDATE_PLIST" "$PLIST_PATH"; then
+  plist_matches=1
 fi
-mv "$candidate" "$PLIST_PATH"
-launchctl load -w "$PLIST_PATH"
-launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null
-echo "OK: ${RUNNER_NAME} installed and loaded (${PLIST_LABEL})"
+is_loaded=0
+if launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1; then
+  is_loaded=1
+fi
+
+if [ "$needs_config" -eq 0 ] && [ "$RECONFIGURE" -eq 0 ] && [ "$plist_matches" -eq 1 ]; then
+  rm -f "$CANDIDATE_PLIST"
+  CANDIDATE_PLIST=""
+  if [ "$is_loaded" -eq 1 ]; then
+    echo "OK: ${RUNNER_NAME} unchanged; leaving loaded (${PLIST_LABEL})"
+  else
+    launchctl load -w "$PLIST_PATH"
+    launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null
+    echo "OK: ${RUNNER_NAME} loaded (${PLIST_LABEL})"
+  fi
+else
+  if ! stop_launchagent; then
+    echo "ERROR: failed to stop ${PLIST_LABEL} before updating ${PLIST_PATH}" >&2
+    exit 1
+  fi
+  mv "$CANDIDATE_PLIST" "$PLIST_PATH"
+  CANDIDATE_PLIST=""
+  launchctl load -w "$PLIST_PATH"
+  launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null
+  echo "OK: ${RUNNER_NAME} installed and loaded (${PLIST_LABEL})"
+fi
