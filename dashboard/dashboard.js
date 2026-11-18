@@ -617,8 +617,11 @@
       'queue-summary',
       total === 0
         ? `Nothing queued: no waiting work and no ghosts.${queuePartialSuffix}`
-        : `${queue.fresh} of ${total} queued runs are real waiting work; ` +
-          `${queue.ghosts} are ghosts GitHub will not release.${queuePartialSuffix}`,
+        : queue.partial === true
+          ? `${queue.fresh} of ${total} queued runs are counted as waiting (including any unreadable/unverified runs); ` +
+            `${queue.ghosts} are ghosts GitHub will not release.${queuePartialSuffix}`
+          : `${queue.fresh} of ${total} queued runs are real waiting work; ` +
+            `${queue.ghosts} are ghosts GitHub will not release.${queuePartialSuffix}`,
     );
 
     if (!repos || typeof repos.appendChild !== 'function') return;

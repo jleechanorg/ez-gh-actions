@@ -549,18 +549,21 @@ class FleetLiveDashboardTest(unittest.TestCase):
         bsd_ps = (
             " 1234    12:34 /Users/op/actions-runner/bin/Runner.Worker\n"
             " 5678 1-02:03:04 /Users/op/actions-runner-macos-ci/bin/Runner.Listener\n"
+            " 8888    00:12 grep Runner.Worker /Users/op/actions-runner-idle/bin/Runner.Listener\n"
+            " 8889    05:00 /Users/op/actions-runner-idle/bin/Runner.Listener\n"
             " 9012    03:15 /Users/op/actions-runner-macos-ci/bin.2.338.2/Runner.Worker\n"
         )
         with mock.patch.object(mod.platform, "system", return_value="Darwin"), \
              mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ps"], 0, stdout=bsd_ps, stderr="")) as mrun:
             native = mod._collect_local_native_runners()
         self.assertIn("etime=", " ".join(mrun.call_args[0][0]))
-        self.assertEqual(len(native), 2)
+        self.assertEqual(len(native), 3)
         by_name = {n["name"]: n for n in native}
         self.assertEqual(by_name["actions-runner"]["state"], "EXECUTING")
         self.assertEqual(by_name["actions-runner"]["elapsed_minutes"], 12.6)
         self.assertEqual(by_name["actions-runner-macos-ci"]["state"], "EXECUTING")
         self.assertEqual(by_name["actions-runner-macos-ci"]["elapsed_minutes"], 3.2)
+        self.assertEqual(by_name["actions-runner-idle"]["state"], "IDLE")
 
         remote_payload = {
             "ok": True,
@@ -868,6 +871,54 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 os.environ["HOME"] = orig_home
             host_entry = next(iter(local_payload["hosts"].values()))
             self.assertEqual([s["state"] for s in host_entry["slots"]], ["IDLE", "EXECUTING"])
+
+    def test_partial_hosts_json_uses_live_120s_cadence_and_full_fixtures_use_15s_zero_gh_calls(self):
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            hosts_only = tmp / "ubuntu_mac_slots.json"
+            with mock.patch.object(mod, "_collect_live_github_snapshot", return_value={"captured_at": "2026-11-18T10:00:00Z", "all_in_progress_jobs": [], "errors": [], "summary": {}}) as m_gh, \
+                 mock.patch.object(mod, "_cached_live_latency", return_value={"ok": True, "cohorts": {}, "workflows": []}) as m_lat:
+                partial_state = mod.build_operator_state(hosts_json=hosts_only)
+            self.assertEqual(partial_state["source_mode"], "LIVE PROBE")
+            self.assertEqual(m_gh.call_count, 1)
+            self.assertEqual(m_lat.call_count, 1)
+
+            with mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("should not poll GH")), \
+                 mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("should not poll latency")):
+                audit_state = mod.build_operator_state(audit_dir=tmp)
+            self.assertEqual(audit_state["source_mode"], "AUDIT SNAPSHOT")
+
+            srv_partial = mod.create_server(port=0, hosts_json=hosts_only)
+            try:
+                with mock.patch.object(mod, "build_operator_state", return_value=partial_state):
+                    # Verify server picked 120000ms refresh when --hosts-json is used without GH/latency fixtures.
+                    import threading
+                    import urllib.request
+                    port_p = srv_partial.server_address[1]
+                    t = threading.Thread(target=srv_partial.serve_forever, daemon=True)
+                    t.start()
+                    body = urllib.request.urlopen(f"http://127.0.0.1:{port_p}/", timeout=5).read().decode("utf-8")
+                    self.assertIn("const AUTO_REFRESH_MS = 120000;", body)
+            finally:
+                srv_partial.shutdown()
+                srv_partial.server_close()
+
+            srv_full = mod.create_server(port=0, audit_dir=tmp)
+            try:
+                import threading
+                import urllib.request
+                port_f = srv_full.server_address[1]
+                t2 = threading.Thread(target=srv_full.serve_forever, daemon=True)
+                t2.start()
+                body_full = urllib.request.urlopen(f"http://127.0.0.1:{port_f}/", timeout=5).read().decode("utf-8")
+                self.assertIn("const AUTO_REFRESH_MS = 15000;", body_full)
+            finally:
+                srv_full.shutdown()
+                srv_full.server_close()
 
 
 if __name__ == "__main__":

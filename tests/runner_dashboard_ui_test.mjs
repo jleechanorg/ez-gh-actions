@@ -414,6 +414,8 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   };
   partialSnap.latency.partial = true;
   render(partialSnap, NOW);
+  assert.match(elements.get('queue-summary').textContent, /counted as waiting/);
+  assert.doesNotMatch(elements.get('queue-summary').textContent, /real waiting work/);
   assert.match(elements.get('queue-summary').textContent, /partial: 2 unverified/);
   assert.match(elements.get('latency-summary').textContent, /partial sample/);
 

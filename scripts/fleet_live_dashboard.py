@@ -608,19 +608,19 @@ def _collect_local_native_runners():
             return native
         by_dir = {}
         for line in proc.stdout.splitlines():
-            if "Runner.Listener" not in line and "Runner.Worker" not in line:
-                continue
             parts = line.strip().split(None, 2)
             if len(parts) < 3:
                 continue
             elapsed_raw, argv_str = parts[1], parts[2]
             if "/home/runner/" in argv_str:
                 continue
-            m = re.search(r"(/[^\s]+?)/bin(?:\.[\d.]+)?/Runner\.(?:Listener|Worker)", argv_str)
-            root_dir = m.group(1) if m else "native-runner"
+            m = re.match(r"(/[^\s]+?)/bin(?:\.[\d.]+)?/(Runner\.(?:Listener|Worker))(?:\s|$)", argv_str.strip())
+            if not m:
+                continue
+            root_dir, runner_proc = m.group(1), m.group(2)
             name = Path(root_dir).name or "mac-native-runner"
             entry = by_dir.setdefault(name, {"name": name, "state": "IDLE", "elapsed_minutes": None, "active_child_commands": []})
-            if "Runner.Worker" in line:
+            if runner_proc == "Runner.Worker":
                 entry["state"] = "EXECUTING"
                 parsed_min = _parse_ps_etime_minutes(elapsed_raw)
                 if parsed_min is not None:
@@ -1039,7 +1039,11 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     gh_data = _load_json(github_json or (base / "github_live_snapshot.json" if base else None))
     latency_raw = _load_json(latency_json or (base / "ci_latency_percentiles.json" if base else None))
 
-    is_fixture = base is not None or hosts_json is not None
+    uses_live_github = base is None and (gh_data is None or latency_raw is None)
+    is_fully_file_backed = (
+        base is not None
+        or (hosts_data is not None and gh_data is not None and latency_raw is not None)
+    )
     scope_note = None
     if base is None and hosts_data is None:
         hosts_data = _collect_local_host_slots()
@@ -1083,7 +1087,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
 
     return {
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source_mode": "AUDIT SNAPSHOT" if is_fixture else "LIVE PROBE",
+        "source_mode": "AUDIT SNAPSHOT" if is_fully_file_backed else "LIVE PROBE",
         "source_timestamps": source_timestamps,
         "hosts": hosts,
         "reconciliation": reconciliation,
@@ -1331,6 +1335,7 @@ def render_html(state, *, auto_refresh_ms=0):
     let currentCohort = 'success';
     let sortKey = 'e_p90';
     let sortAsc = false;
+    let refreshCount = 0;
 
     function esc(v) {{
       return String(v ?? '').replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
@@ -1585,7 +1590,8 @@ def render_html(state, *, auto_refresh_ms=0):
 
     function renderAll() {{
       const mode = state.source_mode || 'LIVE PROBE';
-      document.getElementById('live-stamp').textContent = mode + ' · RENDERED ' + (state.generated_at_utc || '');
+      const refreshTag = refreshCount > 0 ? ' (refresh #' + refreshCount + ')' : '';
+      document.getElementById('live-stamp').textContent = mode + ' · RENDERED ' + (state.generated_at_utc || '') + refreshTag;
       const stamps = Object.entries(state.source_timestamps || {{}})
         .filter(([, v]) => v)
         .map(([k, v]) => `<span><strong>${{esc(k)}}:</strong> ${{esc(v)}}</span>`);
@@ -1623,7 +1629,7 @@ def render_html(state, *, auto_refresh_ms=0):
         opts.signal = AbortSignal.timeout(15000);
       }}
       const r = await fetch('/api/state?ts=' + Date.now(), opts);
-      if (r.ok) {{ state = await r.json(); renderAll(); }}
+      if (r.ok) {{ refreshCount += 1; state = await r.json(); renderAll(); }}
     }}
     const manualBtn = document.getElementById('manual-refresh-btn');
     if (manualBtn) {{
@@ -1676,9 +1682,9 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("Refusing to bind operator dashboard outside loopback")
 
-    is_fixture = audit_dir is not None or hosts_json is not None or github_json is not None
-    effective_refresh_ms = refresh_ms if refresh_ms is not None else (15000 if is_fixture else 120000)
-    effective_ttl_s = cache_ttl_s if cache_ttl_s is not None else (15.0 if is_fixture else 120.0)
+    uses_live_github = audit_dir is None and (github_json is None or latency_json is None)
+    effective_refresh_ms = refresh_ms if refresh_ms is not None else (120000 if uses_live_github else 15000)
+    effective_ttl_s = cache_ttl_s if cache_ttl_s is not None else (120.0 if uses_live_github else 15.0)
 
     cache_lock = threading.Lock()
     cache_state = {"ts": 0.0, "data": None, "building": None}
