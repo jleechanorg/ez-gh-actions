@@ -823,13 +823,21 @@ def _collect_live_github_snapshot(repos=None):
             ip_runs = (ip or {}).get("workflow_runs") or []
             ip_count = (ip or {}).get("total_count") if isinstance((ip or {}).get("total_count"), int) else len(ip_runs)
             ip_runs_by_repo[short] = ip_count
+            if ip_count > len(ip_runs):
+                ip_capped = True
+                errors.append(f"{repo}: in-progress runs truncated ({len(ip_runs)} of {ip_count} returned)")
             if len(ip_runs) > 10:
                 ip_capped = True
                 errors.append(f"{repo}: in-progress job attribution capped at 10 of {len(ip_runs)} runs")
             job_cnt = 0
             for run in ip_runs[:10]:
                 jdata = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"], timeout=20)
-                for j in (jdata or {}).get("jobs") or []:
+                j_list = (jdata or {}).get("jobs") or []
+                j_total = (jdata or {}).get("total_count")
+                if isinstance(j_total, int) and j_total > len(j_list):
+                    ip_capped = True
+                    errors.append(f"{repo}: run {run['id']} jobs truncated ({len(j_list)} of {j_total} returned)")
+                for j in j_list:
                     if j.get("status") == "in_progress":
                         job_cnt += 1
                         all_ip_jobs.append({
@@ -859,10 +867,6 @@ def _collect_live_github_snapshot(repos=None):
                 if q_probe.get("queued_total") is not None:
                     q_runs_by_repo[short] = q_probe["queued_total"]
                 q_unverified_runs += q_probe.get("unverified_runs") or 0
-                if q_probe.get("unverified_runs"):
-                    sample_notes.append(
-                        f"{short}: {q_probe['unverified_runs']} queued run(s) had unreadable jobs"
-                    )
                 if q_probe.get("unverified_runs"):
                     sample_notes.append(
                         f"{short}: {q_probe['unverified_runs']} of {q_probe.get('queued_total')} queued run(s) unverified"
@@ -1420,6 +1424,8 @@ def render_html(state, *, auto_refresh_ms=0):
         const parts = [];
         if (lat.timed_out_runs) parts.push(`${{lat.timed_out_runs}} timed-out run(s)`);
         if (lat.failed_job_fetches) parts.push(`${{lat.failed_job_fetches}} failed job fetch(es)`);
+        if (lat.truncated_job_fetches) parts.push(`${{lat.truncated_job_fetches}} run(s) with truncated jobs`);
+        if (lat.truncated_run_lists) parts.push(`${{lat.truncated_run_lists}} repo(s) with truncated runs`);
         const detail = lat.error || (parts.length ? `${{parts.join(', ')}} — showing remaining samples only` : 'partial latency sample — some runs/jobs failed to fetch');
         latAlerts.push(`<div class="alert-box warn"><strong>Partial Latency Sample:</strong> ${{esc(detail)}}</div>`);
       }}

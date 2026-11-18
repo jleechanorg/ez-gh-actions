@@ -495,7 +495,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
         def fake_gh_ok(args, timeout=20):
             joined = " ".join(args)
             if "status=in_progress" in joined:
-                return {"total_count": 5, "workflow_runs": []}
+                return {"total_count": 0, "workflow_runs": []}
             raise RuntimeError("unexpected")
 
         def fake_q_fail(repo, *, max_job_checks=None):
@@ -773,6 +773,45 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertEqual(gh_snap["summary"]["q_unverified_runs"], expected_unverified)
             self.assertIsNone(gh_snap["summary"]["fresh_queued_runs"])
             self.assertIn(f"{expected_unverified} of {reported_total} queued run(s) unverified", gh_snap["summary"]["queued_sample_note"] or "")
+
+        # Active in-progress short run listing (8 reported, 1 returned) and truncated job listing (120 reported, 1 returned) must both mark ip_partial=True.
+        def fake_ip_short_runs(args, timeout=20):
+            joined = " ".join(args)
+            if "status=in_progress" in joined and "per_page=50" in joined:
+                return {"total_count": 8, "workflow_runs": [{"id": 701, "name": "CI", "html_url": "https://github.com/o/r/actions/runs/701", "head_branch": "main"}]}
+            if "status=in_progress" in joined and "per_page=1" in joined:
+                return 8
+            if "/jobs?per_page=100" in joined:
+                return {"total_count": 1, "jobs": [{"id": 801, "status": "in_progress", "name": "j1", "runner_name": "ez-runner-c-1", "html_url": "https://github.com/o/r/actions/runs/701/job/801"}]}
+            if "status=queued" in joined:
+                return {"total_count": 0, "workflow_runs": []}
+            raise AssertionError(args)
+
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_ip_short_runs), \
+             mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_ip_short_runs):
+            gh_ip_runs = mod._collect_live_github_snapshot(repos=["org/repo"])
+        self.assertTrue(gh_ip_runs["summary"]["ip_partial"])
+        self.assertEqual(mod._normalize_reconciliation([], {}, gh_ip_runs)["active_runs_partial"], True)
+        self.assertTrue(any("1 of 8 returned" in e for e in gh_ip_runs["errors"]))
+
+        def fake_ip_short_jobs(args, timeout=20):
+            joined = " ".join(args)
+            if "status=in_progress" in joined and "per_page=50" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 702, "name": "CI", "html_url": "https://github.com/o/r/actions/runs/702", "head_branch": "main"}]}
+            if "status=in_progress" in joined and "per_page=1" in joined:
+                return 1
+            if "/jobs?per_page=100" in joined:
+                return {"total_count": 120, "jobs": [{"id": 802, "status": "in_progress", "name": "j1", "runner_name": "ez-runner-c-1", "html_url": "https://github.com/o/r/actions/runs/702/job/802"}]}
+            if "status=queued" in joined:
+                return {"total_count": 0, "workflow_runs": []}
+            raise AssertionError(args)
+
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_ip_short_jobs), \
+             mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_ip_short_jobs):
+            gh_ip_jobs = mod._collect_live_github_snapshot(repos=["org/repo"])
+        self.assertTrue(gh_ip_jobs["summary"]["ip_partial"])
+        self.assertEqual(mod._normalize_reconciliation([], {}, gh_ip_jobs)["active_runs_partial"], True)
+        self.assertTrue(any("1 of 120 returned" in e for e in gh_ip_jobs["errors"]))
 
 
 if __name__ == "__main__":

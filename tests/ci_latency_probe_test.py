@@ -342,6 +342,50 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertIsNone(payload["cancellation"]["cancelled_rate_pct"])
         self.assertIn("runner_classes", payload)
 
+    def test_truncated_job_listing_sets_partial_and_truncated_job_fetches(self):
+        mod = load_module()
+
+        def fake_gh(args, timeout=20):
+            joined = " ".join(args)
+            if "/jobs" in joined:
+                return {
+                    "total_count": 120,
+                    "jobs": [
+                        {
+                            "conclusion": "success",
+                            "created_at": "2026-11-18T00:00:00Z",
+                            "started_at": "2026-11-18T00:01:00Z",
+                            "completed_at": "2026-11-18T00:02:00Z",
+                            "runner_name": "ez-runner-c-1",
+                        }
+                    ],
+                }
+            if "/actions/runs" in joined:
+                return {
+                    "total_count": 1,
+                    "workflow_runs": [
+                        {
+                            "id": 501,
+                            "name": "CI",
+                            "conclusion": "success",
+                            "created_at": "2026-11-18T00:00:00Z",
+                            "updated_at": "2026-11-18T00:02:00Z",
+                        }
+                    ],
+                }
+            raise AssertionError(args)
+
+        orig = mod.gh_json
+        mod.gh_json = fake_gh
+        try:
+            payload = mod.probe_latency(["org/repo"], limit=5)
+        finally:
+            mod.gh_json = orig
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["truncated_job_fetches"], 1)
+        self.assertEqual(payload["overall"]["execution"]["n"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -408,6 +408,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(partial_snap["queue"]["partial"])
         self.assertEqual(partial_snap["queue"]["unverified_runs"], 2)
         self.assertTrue(partial_snap["latency"]["partial"])
+        self.assertIn("(partial: 2 unverified)", partial_snap["reconciliation"]["explanation"])
 
 
 if __name__ == "__main__":

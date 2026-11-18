@@ -219,26 +219,34 @@ def _classify_runner_class(runner_name):
     return "other"
 
 
-def _fetch_completed_runs(repo, limit):
+def _fetch_completed_runs_with_truncation(repo, limit):
     runs = []
     page = 1
     per_page = min(100, max(1, limit))
+    reported_total = None
+    truncated = False
     while len(runs) < limit:
         batch = gh_json([
             "api",
             f"repos/{repo}/actions/runs?status=completed&per_page={per_page}&page={page}",
         ])
+        if reported_total is None and isinstance((batch or {}).get("total_count"), int):
+            reported_total = batch["total_count"]
         chunk = (batch or {}).get("workflow_runs") or []
         runs.extend(chunk)
         if len(chunk) < per_page:
+            if reported_total is not None and len(runs) < min(limit, reported_total):
+                truncated = True
             break
         page += 1
-    return runs[:limit]
+    return runs[:limit], truncated
 
 
 def _fetch_run_jobs(repo, run_id):
     payload = gh_json(["api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"])
-    return (payload or {}).get("jobs") or []
+    jobs = (payload or {}).get("jobs") or []
+    total = (payload or {}).get("total_count")
+    return jobs, (total if isinstance(total, int) else len(jobs))
 
 
 def _is_rate_limit_error(message):
@@ -260,6 +268,8 @@ def probe_latency(repos, limit=40, job_run_limit=20):
     cancelled_runs = 0
     timed_out_runs = 0
     failed_job_fetches = 0
+    truncated_job_fetches = 0
+    truncated_run_lists = 0
 
     def empty_wf_bucket():
         return {
@@ -272,7 +282,9 @@ def probe_latency(repos, limit=40, job_run_limit=20):
 
     for repo in repos:
         try:
-            runs = _fetch_completed_runs(repo, limit)
+            runs, run_list_truncated = _fetch_completed_runs_with_truncation(repo, limit)
+            if run_list_truncated:
+                truncated_run_lists += 1
         except RuntimeError as exc:
             return {
                 "schema_version": 1,
@@ -325,7 +337,9 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             if run_id is None:
                 continue
             try:
-                jobs = _fetch_run_jobs(repo, run_id)
+                jobs, jobs_total = _fetch_run_jobs(repo, run_id)
+                if jobs_total > len(jobs):
+                    truncated_job_fetches += 1
             except RuntimeError as exc:
                 if _is_rate_limit_error(str(exc)):
                     return {
@@ -447,9 +461,11 @@ def probe_latency(repos, limit=40, job_run_limit=20):
     return {
         "schema_version": 1,
         "ok": True,
-        "partial": bool(timed_out_runs or failed_job_fetches),
+        "partial": bool(timed_out_runs or failed_job_fetches or truncated_job_fetches or truncated_run_lists),
         "timed_out_runs": timed_out_runs,
         "failed_job_fetches": failed_job_fetches,
+        "truncated_job_fetches": truncated_job_fetches,
+        "truncated_run_lists": truncated_run_lists,
         "cohort": headline_cohort,
         "generated_at": generated_at,
         "overall": {

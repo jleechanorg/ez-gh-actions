@@ -390,6 +390,8 @@ def _build_reconciliation(mac, mac_ok, linux, linux_ok, cmux, queue):
     active_runs = queue.get("in_progress_runs")
     fresh = queue.get("fresh")
     ghosts = queue.get("ghosts")
+    unverified = queue.get("unverified_runs")
+    q_partial = queue.get("partial") is True
 
     parts = []
     if isinstance(active_runs, int) and isinstance(occupied, int):
@@ -402,8 +404,16 @@ def _build_reconciliation(mac, mac_ok, linux, linux_ok, cmux, queue):
         parts.append(f"{parked} parked")
     if isinstance(cycling, int) and cycling > 0:
         parts.append(f"{cycling} cycling")
+    unverified_note = (
+        f"partial: {unverified} unverified"
+        if isinstance(unverified, int) and unverified > 0
+        else "partial"
+    )
     if isinstance(fresh, int) and isinstance(ghosts, int):
-        parts.append(f"{fresh} fresh queued / {ghosts} inert ghosts")
+        suffix = f" ({unverified_note})" if q_partial else ""
+        parts.append(f"{fresh} fresh queued / {ghosts} inert ghosts{suffix}")
+    elif q_partial:
+        parts.append(f"queue {unverified_note}")
 
     return {
         "available_pools": len(pools),
