@@ -5,6 +5,7 @@ set -uo pipefail
 HOST_CLASS=""
 SERVICE_STATE_ONLY=false
 FORCE_PARKED=false
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host-class)
@@ -196,7 +197,7 @@ PARKED_REASON=""
 PARKED_SLOTS=0
 if [[ "$FORCE_PARKED" == true ]]; then
   PARKED=true
-elif [[ "$HOST_CLASS" == "mac" && "${MAC_RUNNER_DISABLED:-0}" == "1" ]]; then
+elif [[ "$HOST_CLASS" == "mac" && ( "${MAC_RUNNER_DISABLED:-0}" == "1" || "${EZGHA_DASHBOARD_MAC_DISABLED:-0}" == "1" ) ]]; then
   PARKED=true
 elif [[ "$HOST_CLASS" == "linux" && "${REMOTE_LINUX_DISABLED:-0}" == "1" ]]; then
   PARKED=true
@@ -221,27 +222,15 @@ slot_phase_and_elapsed() {
     return 0
   fi
   detail_table="$(docker top "$name" -eo pid,etimes,comm,args 2>/dev/null || true)"
-  python3 - "$detail_table" <<'PY'
-import re
+  python3 - "$detail_table" "$SCRIPT_DIR" <<'PY'
 import sys
 
 table = sys.argv[1]
+sys.path.insert(0, sys.argv[2])
+import ci_latency_probe
+
 elapsed_s = None
 phase = ""
-phase_rules = (
-    ("playwright", r"playwright"),
-    ("jest", r"\bjest\b"),
-    ("pytest", r"\bpytest\b"),
-    ("git index-pack", r"git\s+index-pack"),
-    ("git fetch", r"git\b.*\bfetch\b"),
-    ("gh api tarball", r"gh\s+api.*tarball"),
-    ("npm ci", r"\bnpm\s+ci\b"),
-    ("pip", r"\bpip3?\s+install\b"),
-    ("cargo", r"\bcargo\b"),
-    ("gcloud", r"\bgcloud\b"),
-    ("mypy", r"\bmypy\b"),
-    ("setup-python", r"setup-python"),
-)
 for line in table.splitlines()[1:]:
     parts = line.strip().split(None, 3)
     if len(parts) < 3:
@@ -249,10 +238,9 @@ for line in table.splitlines()[1:]:
     if "Runner.Worker" in line and parts[1].isdigit():
         elapsed_s = int(parts[1])
     rest = parts[3] if len(parts) == 4 else parts[2]
-    for label, pat in phase_rules:
-        if re.search(pat, rest, re.IGNORECASE):
-            phase = label
-            break
+    matched = ci_latency_probe.classify_phase(rest)
+    if matched:
+        phase = matched
 elapsed_min = round(elapsed_s / 60.0, 1) if elapsed_s is not None else ""
 print(f"{elapsed_min}\t{phase}")
 PY
@@ -261,9 +249,10 @@ PY
 if [[ "$PARKED" == true && "$CONFIG_OK" == true ]]; then
   PARKED_REASON="operator_disabled"
   PARKED_SLOTS="$TARGET"
-  SERVICE_OK=true
-  DOCKER_OK=true
-  PROCESS_OK=true
+  # Keep service/docker/process probes truthful: do not mark unexecuted checks ok.
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    DOCKER_OK=true
+  fi
   EXECUTING=0
   IDLE=0
   CYCLING=0
@@ -345,7 +334,7 @@ elif [[ "$CONFIG_OK" == true ]] && command -v docker >/dev/null 2>&1 && docker i
   fi
 fi
 
-if [[ "$PROCESS_OK" != true ]]; then
+if [[ "$PARKED" != true && "$PROCESS_OK" != true ]]; then
   EXECUTING=""
   IDLE=""
   CYCLING=""
@@ -416,9 +405,7 @@ if [[ "$CONFIG_OK" == true ]]; then
 fi
 
 PAUSE_REASON=""
-if [[ "$PARKED" == true ]]; then
-  PAUSE_REASON="operator_disabled"
-elif [[ "$DISK_STATUS" == "critical" && "${DOWN:-0}" =~ ^[0-9]+$ && "${DOWN:-0}" -gt 0 ]]; then
+if [[ "$PARKED" != true && "$DISK_STATUS" == "critical" && "${DOWN:-0}" =~ ^[0-9]+$ && "${DOWN:-0}" -gt 0 ]]; then
   PAUSE_REASON="disk_floor_paused"
 fi
 
@@ -515,8 +502,6 @@ payload = {
         "reserved": count("RESERVED"),
     },
     "disk": {"status": os.environ["DISK_STATUS"]},
-    "disk_free_gb": free_gb,
-    "disk_floor_gb": floor_gb,
     "watchdog": {
         "consecutive_misses": count("WATCHDOG_MISSES"),
         "restart_after": count("WATCHDOG_THRESHOLD"),

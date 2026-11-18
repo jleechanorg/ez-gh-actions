@@ -250,6 +250,48 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertTrue(normalized["ok"])
         self.assertEqual(normalized["workflows"][0]["repo"], "org/app-backend")
         self.assertEqual(normalized["overall"]["execution"]["p50_s"], 85.0)
+        self.assertEqual(normalized["workflows"][0]["cohorts"]["failure"]["execution"]["n"], 0)
+
+    def test_same_workflow_name_across_repos_does_not_collide_and_timeout_sets_partial(self):
+        mod = load_module()
+
+        def fake_gh(args, timeout=20):
+            joined = " ".join(args)
+            if "/jobs" in joined:
+                rid = int(joined.split("/actions/runs/")[1].split("/")[0])
+                if rid == 2:
+                    raise RuntimeError("gh timed out after 20s")
+                return {
+                    "jobs": [{
+                        "id": rid * 10,
+                        "conclusion": "success",
+                        "created_at": "2026-11-18T08:00:00Z",
+                        "started_at": "2026-11-18T08:01:00Z",
+                        "completed_at": "2026-11-18T08:02:00Z",
+                    }]
+                }
+            if "repo-a" in joined:
+                return {"workflow_runs": [{
+                    "id": 1, "name": "CI", "conclusion": "success",
+                    "created_at": "2026-11-18T08:00:00Z", "updated_at": "2026-11-18T08:03:00Z",
+                }]}
+            return {"workflow_runs": [{
+                "id": 2, "name": "CI", "conclusion": "success",
+                "created_at": "2026-11-18T08:00:00Z", "updated_at": "2026-11-18T08:04:00Z",
+            }]}
+
+        orig = mod.gh_json
+        mod.gh_json = fake_gh
+        try:
+            payload = mod.probe_latency(["org/repo-a", "org/repo-b"], limit=10)
+        finally:
+            mod.gh_json = orig
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["timed_out_runs"], 1)
+        repos = {w["repo"] for w in payload["workflows"]}
+        self.assertEqual(repos, {"org/repo-a", "org/repo-b"})
 
 
 if __name__ == "__main__":

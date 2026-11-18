@@ -28,13 +28,15 @@ spec.loader.exec_module(queue_probe)
 class FakeGH:
     """Replacement for gh_json that serves scripted responses."""
 
-    def __init__(self, runs, job_counts, fail_jobs_for=(), fail_message=None):
+    def __init__(self, runs, job_counts, fail_jobs_for=(), fail_message=None, in_progress_count=0, fail_in_progress=False):
         self.runs = list(runs)
         self.job_counts = dict(job_counts)
         self.fail_jobs_for = set(fail_jobs_for)
         # None means "use the rate-limit message", which is the branch that must
         # mark the whole pass unavailable rather than guess.
         self.fail_message = fail_message
+        self.in_progress_count = in_progress_count
+        self.fail_in_progress = fail_in_progress
         self.calls = []
 
     def __call__(self, args):
@@ -49,6 +51,10 @@ class FakeGH:
             return self.job_counts.get(run_id, 0)
         if "status=queued" in joined:
             return {"workflow_runs": self.runs}
+        if "status=in_progress" in joined:
+            if self.fail_in_progress:
+                raise RuntimeError(self.fail_message or "HTTP 403: API rate limit exceeded")
+            return self.in_progress_count
         raise AssertionError(f"unexpected gh call: {args}")
 
 
@@ -153,6 +159,17 @@ class OldestFreshWait(unittest.TestCase):
         # The only fresh run is 31, so oldest must reflect that, not the ghost.
         self.assertIsNotNone(result["oldest_fresh_wait_minutes"])
         self.assertGreater(result["oldest_fresh_wait_minutes"], 1000)
+
+    def test_in_progress_runs_emitted_and_rate_limit_fails_closed(self):
+        fake = FakeGH([queued_run(40)], {40: 1}, in_progress_count=12)
+        result = run_against(fake)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["in_progress_runs"], 12)
+
+        rate_limited = FakeGH([queued_run(40)], {40: 1}, fail_in_progress=True)
+        bad = run_against(rate_limited)
+        self.assertFalse(bad["ok"])
+        self.assertIsNone(bad["in_progress_runs"])
 
 
 if __name__ == "__main__":

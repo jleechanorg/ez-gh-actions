@@ -13,8 +13,13 @@ import datetime
 import html as html_lib
 import http.server
 import json
+import os
+import platform
 import re
+import shutil
+import socket
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -25,23 +30,6 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import ci_latency_probe  # noqa: E402
-
-PHASE_RULES = (
-    ("playwright install", r"playwright\s+install"),
-    ("playwright", r"playwright"),
-    ("jest", r"\bjest\b"),
-    ("pytest", r"\bpytest\b"),
-    ("git index-pack", r"git\s+index-pack|index-pack"),
-    ("git fetch", r"git\b.*\bfetch\b|git-remote-http"),
-    ("gh api tarball", r"gh\s+api.*tarball"),
-    ("npm ci", r"\bnpm\s+ci\b"),
-    ("pip", r"\bpip3?\s+install\b"),
-    ("cargo", r"\bcargo\b"),
-    ("gcloud", r"\bgcloud\b"),
-    ("mypy", r"\bmypy\b"),
-    ("shellcheck", r"\bshellcheck\b"),
-    ("setup-python", r"setup-python"),
-)
 
 
 def _load_json(path):
@@ -59,8 +47,7 @@ def _load_json(path):
 def _full_repo(repo):
     if not isinstance(repo, str) or not repo.strip():
         return None
-    r = repo.strip()
-    return r if "/" in r else f"jleechanorg/{r}"
+    return repo.strip()
 
 
 def _short_repo(repo):
@@ -71,7 +58,7 @@ def _short_repo(repo):
 
 def _extract_pr_info(repo, ref, branch=None):
     full = _full_repo(repo)
-    if not full:
+    if not full or "/" not in full:
         return None, None
     for candidate in (ref, branch):
         if not isinstance(candidate, str):
@@ -85,9 +72,9 @@ def _extract_pr_info(repo, ref, branch=None):
 
 def _infer_phase_badge(cmds, state, reason=None):
     joined = " ".join(str(c) for c in (cmds or []))
-    for label, pattern in PHASE_RULES:
-        if re.search(pattern, joined, re.IGNORECASE):
-            return label
+    matched = ci_latency_probe.classify_phase(joined)
+    if matched:
+        return matched
     st = (state or "").upper()
     if st == "PARKED":
         return "operator_disabled"
@@ -202,7 +189,7 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
     phase_badge = _infer_phase_badge(cmds, state, reason)
 
     alert_level = "ok"
-    if state in ("DOWN", "OFFLINE") or (state == "DOWN" and host_disk_paused):
+    if state in ("DOWN", "OFFLINE"):
         alert_level = "critical"
     elif state in ("CYCLING", "IDLE"):
         alert_level = "warn"
@@ -330,12 +317,36 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data):
         all_mac_slots = c_slots + n_slots
         for s in all_mac_slots:
             seen_slot_names.add(s["name"])
+        launchd_state = str(mac.get("ezgha_launchd_status") or "").lower()
+        has_active_containers = any(s["state"] in ("EXECUTING", "IDLE", "CYCLING") for s in c_slots)
+        mac_parked = (
+            not has_active_containers
+            and (
+                launchd_state in ("disabled", "parked", "stopped", "inactive")
+                or (c_slots and all(s["state"] == "PARKED" for s in c_slots))
+            )
+        )
+        mac_title = (
+            "macOS (Containers PARKED + Native Runners)"
+            if mac_parked
+            else "macOS (Containers Active + Native Runners)"
+        )
+        mac_status = (
+            f"containers {mac.get('ezgha_launchd_status', 'disabled')} (PARKED)"
+            if mac_parked
+            else f"containers {mac.get('ezgha_launchd_status', 'active')}"
+        )
+        mac_alert = (
+            mac.get("parked_note") or "ezgha launchd container service disabled; native runners remain active."
+            if mac_parked
+            else None
+        )
         hosts.append({
             "id": "mac",
-            "title": "macOS (Containers PARKED + Native Runners)",
+            "title": mac_title,
             "group": "mac",
-            "status": f"containers {mac.get('ezgha_launchd_status', 'disabled')} (PARKED)",
-            "alert_message": "ezgha launchd container service disabled since Oct 29; native runners remain active.",
+            "status": mac_status,
+            "alert_message": mac_alert,
             "contributors": [],
             "vitals": {
                 "load": ", ".join(str(x) for x in load) if load else None,
@@ -423,100 +434,142 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data):
         "headline_points": headlines,
         "api_runners_count": rec.get("github_org_runners_api_count") or (gh_data or {}).get("org_runners_api_count"),
         "api_blindspot_note": rec.get("github_api_blindspot_note"),
+        "gh_errors": (gh_data or {}).get("errors") or [],
     }
 
 
 def _normalize_latency(latency_raw):
     if not isinstance(latency_raw, dict):
         return {"ok": False, "cohorts": {}, "workflows": [], "runner_classes": {}, "step_categories": {}}
-
-    # Support either pre-normalized ci_latency_probe.py output OR raw ci_latency_percentiles.json
     if "overall" in latency_raw and "workflows" in latency_raw:
         return latency_raw
+    return ci_latency_probe.from_audit_data(latency_raw)
 
-    repo_blocks = list(ci_latency_probe.iter_audit_repo_blocks(latency_raw))
-    primary = repo_blocks[0][1] if repo_blocks else {}
-    recent = primary.get("recent_contiguous_runs") or primary.get("recent_runs") or {}
-    run_cohorts = recent.get("cohorts") or {}
-    job_audit = primary.get("job_level_audit") or {}
-    job_cohorts = job_audit.get("job_cohorts") or {}
 
-    cohorts_out = {}
-    for cohort in ("success", "all_non_skipped", "failure", "cancelled"):
-        jc = job_cohorts.get(cohort) or {}
-        rc = run_cohorts.get(cohort) or {}
-        cohorts_out[cohort] = {
-            "queue_wait": jc.get("queue_wait") or {},
-            "execution": jc.get("execution") or {},
-            "job_total": jc.get("total") or {},
-            "e2e": rc,
+def _collect_local_host_slots():
+    """Collect real local ezgha runner slots via docker ps/top when no audit-dir is supplied."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hostname = socket.gethostname()
+    is_mac = platform.system().lower() == "darwin"
+    host_key = "mac" if is_mac else hostname
+
+    disk_info = {}
+    try:
+        usage = shutil.disk_usage("/")
+        free_gb = round(usage.free / (1024 ** 3), 1)
+        total_gb = round(usage.total / (1024 ** 3), 1)
+        use_pct = f"{round((usage.used / usage.total) * 100)}%" if usage.total else "?"
+        disk_info = {"avail": f"{free_gb}G", "total": f"{total_gb}G", "use_pct": use_pct, "min_free_disk_gb_floor": 30}
+        if is_mac:
+            disk_info["root_avail"] = f"{free_gb}G"
+    except OSError:
+        pass
+
+    load_vals = []
+    try:
+        load_vals = [round(x, 2) for x in os.getloadavg()]
+    except OSError:
+        pass
+
+    slots = []
+    docker_ok = True
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "-a", "--filter", "label=ezgha=managed", "--format", "{{.Names}}\t{{.Status}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            for idx, line in enumerate(proc.stdout.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                parts = line.split("\t", 1)
+                cname = parts[0].strip()
+                cstatus = parts[1].strip() if len(parts) > 1 else ""
+                state = "DOWN"
+                cmds = []
+                elapsed_min = None
+                if cstatus.lower().startswith("up"):
+                    top = subprocess.run(
+                        ["docker", "top", cname, "-eo", "pid,etimes,comm,args"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if top.returncode == 0:
+                        has_worker = False
+                        has_listener = False
+                        for tline in top.stdout.splitlines()[1:]:
+                            tparts = tline.strip().split(None, 3)
+                            if len(tparts) < 3:
+                                continue
+                            if "Runner.Worker" in tline:
+                                has_worker = True
+                                if tparts[1].isdigit():
+                                    elapsed_min = round(int(tparts[1]) / 60.0, 1)
+                            elif "Runner.Listener" in tline:
+                                has_listener = True
+                            rest = tparts[3] if len(tparts) == 4 else tparts[2]
+                            cmds.append(rest)
+                        state = "EXECUTING" if has_worker else ("IDLE" if has_listener else "CYCLING")
+                    else:
+                        state = "IDLE"
+                slots.append({
+                    "slot": idx,
+                    "name": cname,
+                    "state": state,
+                    "elapsed_minutes": elapsed_min,
+                    "active_child_commands": cmds,
+                })
+        else:
+            docker_ok = False
+    except (OSError, subprocess.TimeoutExpired):
+        docker_ok = False
+
+    if is_mac:
+        return {
+            "generated_at_utc": now_utc,
+            "hosts": {
+                "mac": {
+                    "hostname": hostname,
+                    "ezgha_launchd_status": "active" if slots else ("disabled" if os.environ.get("MAC_RUNNER_DISABLED") == "1" else "inactive"),
+                    "colima_status": "running" if docker_ok else "unreachable",
+                    "disk": disk_info,
+                    "load_average": load_vals,
+                    "configured_slots": len(slots),
+                    "configured_container_slots": len(slots),
+                    "container_slots": slots,
+                    "native_runners": [],
+                }
+            },
         }
-
-    workflows = []
-    for repo_slug_full, repo_block in repo_blocks:
-        repo_slug = _short_repo(repo_slug_full) or repo_slug_full
-        r_recent = repo_block.get("recent_contiguous_runs") or repo_block.get("recent_runs") or {}
-        r_wf_map = {
-            wf["workflow"]: wf
-            for wf in (r_recent.get("by_workflow") or [])
-            if isinstance(wf, dict) and isinstance(wf.get("workflow"), str)
-        }
-        for wf in (repo_block.get("job_level_audit") or {}).get("by_workflow") or []:
-            if not isinstance(wf, dict) or not isinstance(wf.get("workflow"), str):
-                continue
-            r_match = r_wf_map.get(wf["workflow"], {})
-            succ = wf.get("success") or {}
-            all_ns = wf.get("all_non_skipped") or {}
-            workflows.append({
-                "repo": repo_slug,
-                "workflow": wf["workflow"],
-                "success": {
-                    "queue_wait": succ.get("queue_wait") or {},
-                    "execution": succ.get("execution") or {},
-                    "total": succ.get("total") or {},
-                    "e2e": r_match.get("success") or {},
-                },
-                "all_non_skipped": {
-                    "queue_wait": all_ns.get("queue_wait") or {},
-                    "execution": all_ns.get("execution") or {},
-                    "total": all_ns.get("total") or {},
-                    "e2e": r_match.get("all_non_skipped") or {},
-                },
-            })
-
-    cancelled_n = (run_cohorts.get("cancelled") or {}).get("n") or 0
-    non_skipped_n = (run_cohorts.get("all_non_skipped") or {}).get("n") or 0
     return {
-        "ok": True,
-        "generated_at": latency_raw.get("generated_at_utc"),
-        "cohorts": cohorts_out,
-        "pr_critical_path": recent.get("pr_critical_path_turnaround") or {},
-        "cancellation": {
-            "cancelled_runs": cancelled_n,
-            "skipped_runs": recent.get("skipped_or_neutral_runs") or 0,
-            "total_non_skipped_runs": non_skipped_n,
-            "cancelled_rate_pct": round((cancelled_n / non_skipped_n) * 100.0, 1) if non_skipped_n else 0.0,
+        "generated_at_utc": now_utc,
+        "hosts": {
+            host_key: {
+                "display_name": f"{host_key} (Local Linux Host)",
+                "group": "jeff-ubuntu",
+                "admission_status": "active" if docker_ok else "docker_unreachable",
+                "disk": disk_info,
+                "load_average": load_vals,
+                "configured_slots": len(slots),
+                "slots": slots,
+            }
         },
-        "runner_classes": job_audit.get("by_runner_class") or {},
-        "step_categories": (job_audit.get("p90_slow_success_job_step_breakdown") or {}).get("category_summaries_s") or {},
-        "workflows": workflows,
     }
 
 
-def _collect_live_github_snapshot():
+def _collect_live_github_snapshot(repos=None):
     """Fallback bounded live GitHub query when no audit-dir is supplied."""
-    repos = [*ci_latency_probe.DEFAULT_REPOS, "jleechanorg/ez-gh-actions"]
+    target_repos = list(repos or [*ci_latency_probe.DEFAULT_REPOS, "jleechanorg/ez-gh-actions"])
     all_ip_jobs = []
     ip_runs_by_repo = {}
     ip_jobs_by_repo = {}
     q_runs_by_repo = {}
-    q_jobs_by_repo = {}
-    for repo in repos:
+    errors = []
+    for repo in target_repos:
         short = _short_repo(repo)
         try:
             ip = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=in_progress&per_page=50"], timeout=20)
             ip_runs = (ip or {}).get("workflow_runs") or []
-            ip_runs_by_repo[short] = len(ip_runs)
+            ip_runs_by_repo[short] = (ip or {}).get("total_count") if isinstance((ip or {}).get("total_count"), int) else len(ip_runs)
             job_cnt = 0
             for run in ip_runs[:15]:
                 jdata = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"], timeout=20)
@@ -524,7 +577,7 @@ def _collect_live_github_snapshot():
                     if j.get("status") == "in_progress":
                         job_cnt += 1
                         all_ip_jobs.append({
-                            "repo": short,
+                            "repo": repo,
                             "run_id": run["id"],
                             "run_name": run.get("name"),
                             "run_html_url": run.get("html_url"),
@@ -537,23 +590,24 @@ def _collect_live_github_snapshot():
             ip_jobs_by_repo[short] = job_cnt
             q_data = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=queued&per_page=50"], timeout=20)
             q_runs = (q_data or {}).get("workflow_runs") or []
-            q_runs_by_repo[short] = len(q_runs)
-            q_jobs_by_repo[short] = len(q_runs)
-        except Exception:
+            q_runs_by_repo[short] = (q_data or {}).get("total_count") if isinstance((q_data or {}).get("total_count"), int) else len(q_runs)
+        except Exception as exc:
+            errors.append(f"{repo}: {str(exc)[:120]}")
             continue
     return {
-        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "all_in_progress_jobs": all_ip_jobs,
+        "errors": errors,
         "summary": {
             "total_in_progress_runs_by_repo": ip_runs_by_repo,
             "in_progress_jobs_by_repo": ip_jobs_by_repo,
             "total_queued_runs_by_repo": q_runs_by_repo,
-            "queued_jobs_by_repo": q_jobs_by_repo,
+            "queued_jobs_by_repo": {},
         },
     }
 
 
-def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, github_json=None, latency_json=None):
+def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, github_json=None, latency_json=None, repos=None):
     base = Path(audit_dir) if audit_dir else None
     hosts_data = _load_json(hosts_json or (base / "ubuntu_mac_slots.json" if base else None))
     cmux_data = _load_json(
@@ -563,11 +617,14 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     gh_data = _load_json(github_json or (base / "github_live_snapshot.json" if base else None))
     latency_raw = _load_json(latency_json or (base / "ci_latency_percentiles.json" if base else None))
 
+    is_fixture = base is not None or hosts_json is not None
+    if base is None and hosts_data is None:
+        hosts_data = _collect_local_host_slots()
     if base is None and gh_data is None:
-        gh_data = _collect_live_github_snapshot()
+        gh_data = _collect_live_github_snapshot(repos=repos)
     if base is None and latency_raw is None:
         latency_raw = ci_latency_probe.probe_latency(
-            ["jleechanorg/worldarchitect.ai", "jleechanorg/worldai_frontend"],
+            list(repos or ci_latency_probe.DEFAULT_REPOS),
             limit=30,
             job_run_limit=15,
         )
@@ -575,15 +632,17 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     hosts = _normalize_hosts(hosts_data, cmux_data, gh_data)
     reconciliation = _normalize_reconciliation(hosts, cmux_data, gh_data)
     latency = _normalize_latency(latency_raw)
+    source_timestamps = {
+        "hosts": (hosts_data or {}).get("generated_at_utc"),
+        "cmux": (cmux_data or {}).get("captured_at_utc"),
+        "github": (gh_data or {}).get("captured_at"),
+        "latency": latency.get("generated_at"),
+    }
 
     return {
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source_timestamps": {
-            "hosts": (hosts_data or {}).get("generated_at_utc"),
-            "cmux": (cmux_data or {}).get("captured_at_utc"),
-            "github": (gh_data or {}).get("captured_at"),
-            "latency": latency.get("generated_at"),
-        },
+        "source_mode": "AUDIT SNAPSHOT" if is_fixture else "LIVE PROBE",
+        "source_timestamps": source_timestamps,
         "hosts": hosts,
         "reconciliation": reconciliation,
         "latency": latency,
@@ -733,6 +792,7 @@ def render_html(state, *, auto_refresh_ms=0):
     </div>
     <div>
       <span class="badge badge-EXECUTING" id="live-stamp">UPDATED {generated_at}</span>
+      <div class="vitals" id="source-stamps" style="margin-top:0.35rem; justify-content:flex-end;"></div>
     </div>
   </header>
 
@@ -802,8 +862,8 @@ def render_html(state, *, auto_refresh_ms=0):
         </select>
         <select id="slot-group-filter">
           <option value="ALL">All Hosts</option>
-          <option value="jeff-ubuntu">jeff-ubuntu</option>
-          <option value="cmux">cmux Cloud VMs</option>
+          <option value="jeff-ubuntu">Linux Host</option>
+          <option value="cmux">Cloud VMs</option>
           <option value="mac">macOS</option>
           <option value="special">Special</option>
         </select>
@@ -849,14 +909,23 @@ def render_html(state, *, auto_refresh_ms=0):
       const rec = state.reconciliation || {{}};
       const sc = rec.state_counts || {{}};
       document.getElementById('slot-total-badge').textContent = (rec.total_slots || 0) + ' TOTAL SLOTS';
+      const downHosts = (state.hosts || []).filter((h) => (h.slots || []).some((s) => s.state === 'DOWN')).map((h) => h.id);
+      const downSub = downHosts.length ? downHosts.join(', ') + ' down/paused slots' : 'No DOWN slots';
+      const idleSub = (sc.IDLE || 0) + ' idle slot(s) across hosts';
+      const qSub = rec.queued_runs_total !== null && rec.queued_runs_total !== undefined
+        ? 'Total queued runs: ' + rec.queued_runs_total
+        : 'Queue breakdown unavailable';
+      const qVal = rec.fresh_queued_runs !== null && rec.fresh_queued_runs !== undefined
+        ? rec.fresh_queued_runs + ' / ' + (rec.inert_ghosts ?? '—')
+        : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined ? rec.queued_runs_total + ' runs (jobs —)' : '— / —');
       const cards = [
         ['Active GH Runs', rec.active_workflow_runs ?? '—', 'Workflow rows showing in_progress'],
-        ['Active GH Jobs', rec.active_github_jobs ?? '—', 'Multi-shard fan-out across runs'],
+        ['Active GH Jobs', rec.active_github_jobs ?? '—', 'Observed in_progress jobs'],
         ['Executing Slots', sc.EXECUTING || 0, 'Local docker top + native'],
-        ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I', '0 general Linux idle'],
-        ['Down / Offline', (sc.DOWN || 0) + 'D / ' + (sc.OFFLINE || 0) + 'O', 'jeff-ubuntu disk-floor pause'],
+        ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I', idleSub],
+        ['Down / Offline', (sc.DOWN || 0) + 'D / ' + (sc.OFFLINE || 0) + 'O', downSub],
         ['Parked (Mac)', sc.PARKED || 0, 'Intentionally disabled'],
-        ['Queued (Fresh / Ghosts)', (rec.fresh_queued_runs ?? rec.queued_jobs_total ?? '—') + ' / ' + (rec.inert_ghosts ?? '—'), 'Total queued runs: ' + (rec.queued_runs_total ?? '—')],
+        ['Queued (Fresh / Ghosts)', qVal, qSub],
       ];
       document.getElementById('reconcile-kpis').innerHTML = cards.map(([k, v, sub]) =>
         `<div class="kpi"><div class="kpi-label">${{esc(k)}}</div><div class="kpi-val">${{esc(v)}}</div><div class="kpi-sub">${{esc(sub)}}</div></div>`
@@ -869,6 +938,9 @@ def render_html(state, *, auto_refresh_ms=0):
           alerts.push(`<div class="alert-box ${{isWarn ? 'warn' : ''}}"><strong>${{esc(h.id)}} (${{esc(h.status)}}):</strong> ${{esc(h.alert_message)}}</div>`);
         }}
       }}
+      for (const err of rec.gh_errors || []) {{
+        alerts.push(`<div class="alert-box warn"><strong>GitHub API partial/error:</strong> ${{esc(err)}}</div>`);
+      }}
       document.getElementById('reconcile-alerts').innerHTML = alerts.join('');
       const hl = rec.headline_points || [];
       document.getElementById('reconcile-headlines').innerHTML = hl.map((p) => `<li>${{esc(p)}}</li>`).join('');
@@ -877,7 +949,7 @@ def render_html(state, *, auto_refresh_ms=0):
     function renderLatency() {{
       const lat = state.latency || {{}};
       const cohorts = lat.cohorts || {{}};
-      const cData = cohorts[currentCohort] || cohorts.success || lat.overall || {{}};
+      const cData = cohorts[currentCohort] || {{}};
       const q = cData.queue_wait || {{}};
       const e = cData.execution || {{}};
       const jt = cData.job_total || {{}};
@@ -897,7 +969,7 @@ def render_html(state, *, auto_refresh_ms=0):
 
       const extraCards = [];
       for (const [cls, data] of Object.entries(lat.runner_classes || {{}})) {{
-        const cs = data[currentCohort] || data.success || data;
+        const cs = (data.queue_wait || data.execution) ? (currentCohort === 'success' ? data : {{}}) : (data[currentCohort] || {{}});
         const cq = cs.queue_wait || {{}}, ce = cs.execution || {{}};
         extraCards.push([`Runner: ${{cls}}`, `Q ${{fmtSec(cq.p50_s)}} | E ${{fmtSec(ce.p50_s)}}`, `E p90 ${{fmtSec(ce.p90_s)}} · E avg ${{fmtSec(ce.avg_s)}} (n=${{ce.n ?? 0}})`]);
       }}
@@ -922,7 +994,7 @@ def render_html(state, *, auto_refresh_ms=0):
       const repoFilter = repoSelect.value;
 
       const rows = (lat.workflows || []).filter((wf) => repoFilter === 'ALL' || wf.repo === repoFilter).map((wf) => {{
-        const block = wf[currentCohort] || wf.success || wf;
+        const block = (wf.cohorts && wf.cohorts[currentCohort]) || wf[currentCohort] || {{}};
         const qw = block.queue_wait || {{}}, ex = block.execution || {{}}, e2 = block.e2e || {{}};
         return {{
           repo: wf.repo || '—',
@@ -1018,7 +1090,12 @@ def render_html(state, *, auto_refresh_ms=0):
     }}
 
     function renderAll() {{
-      document.getElementById('live-stamp').textContent = 'UPDATED ' + (state.generated_at_utc || '');
+      const mode = state.source_mode || 'LIVE PROBE';
+      document.getElementById('live-stamp').textContent = mode + ' · RENDERED ' + (state.generated_at_utc || '');
+      const stamps = Object.entries(state.source_timestamps || {{}})
+        .filter(([, v]) => v)
+        .map(([k, v]) => `<span><strong>${{esc(k)}}:</strong> ${{esc(v)}}</span>`);
+      document.getElementById('source-stamps').innerHTML = stamps.join('') || '<span>No source timestamps</span>';
       renderReconciliation();
       renderLatency();
       renderHosts();
@@ -1048,12 +1125,16 @@ def render_html(state, *, auto_refresh_ms=0):
 
     renderAll();
     if (AUTO_REFRESH_MS > 0) {{
-      window.setInterval(async () => {{
-        try {{
-          const r = await fetch('/api/state?ts=' + Date.now(), {{ cache: 'no-store' }});
-          if (r.ok) {{ state = await r.json(); renderAll(); }}
-        }} catch (_e) {{}}
-      }}, AUTO_REFRESH_MS);
+      const schedulePoll = () => {{
+        window.setTimeout(async () => {{
+          try {{
+            const r = await fetch('/api/state?ts=' + Date.now(), {{ cache: 'no-store' }});
+            if (r.ok) {{ state = await r.json(); renderAll(); }}
+          }} catch (_e) {{}}
+          schedulePoll();
+        }}, AUTO_REFRESH_MS);
+      }};
+      schedulePoll();
     }}
   }})();
   </script>
@@ -1062,36 +1143,84 @@ def render_html(state, *, auto_refresh_ms=0):
 """
 
 
+def _is_loopback_host_header(host_header):
+    if not isinstance(host_header, str) or not host_header.strip():
+        return False
+    raw = host_header.strip().lower()
+    if raw.startswith("["):
+        if "]" not in raw:
+            return False
+        host_part, rest = raw[1:].split("]", 1)
+        if rest and not re.match(r"^:\d+$", rest):
+            return False
+        return host_part == "::1"
+    if ":" in raw:
+        host_part, port_part = raw.rsplit(":", 1)
+        if not port_part.isdigit():
+            return False
+    else:
+        host_part = raw
+    return host_part in ("127.0.0.1", "localhost")
+
+
 def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=None,
-                  cmux_json=None, github_json=None, latency_json=None,
+                  cmux_json=None, github_json=None, latency_json=None, repos=None,
                   refresh_ms=15000, cache_ttl_s=15.0):
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("Refusing to bind operator dashboard outside loopback")
 
     cache_lock = threading.Lock()
-    cache_state = {"ts": 0.0, "data": None}
+    cache_state = {"ts": 0.0, "data": None, "building": None}
 
     def load_state():
-        with cache_lock:
-            now = time.monotonic()
-            if cache_state["data"] is not None and (now - cache_state["ts"]) < cache_ttl_s:
-                return cache_state["data"]
-            fresh = build_operator_state(
-                audit_dir=audit_dir,
-                hosts_json=hosts_json,
-                cmux_json=cmux_json,
-                github_json=github_json,
-                latency_json=latency_json,
-            )
-            cache_state["data"] = fresh
-            cache_state["ts"] = time.monotonic()
-            return fresh
+        while True:
+            wait_event = None
+            is_leader = False
+            with cache_lock:
+                now = time.monotonic()
+                if cache_state["data"] is not None and (now - cache_state["ts"]) < cache_ttl_s:
+                    return cache_state["data"]
+                if cache_state["building"] is None:
+                    cache_state["building"] = threading.Event()
+                    is_leader = True
+                else:
+                    wait_event = cache_state["building"]
+            if not is_leader:
+                wait_event.wait(timeout=30.0)
+                continue
+            try:
+                fresh = build_operator_state(
+                    audit_dir=audit_dir,
+                    hosts_json=hosts_json,
+                    cmux_json=cmux_json,
+                    github_json=github_json,
+                    latency_json=latency_json,
+                    repos=repos,
+                )
+                with cache_lock:
+                    cache_state["data"] = fresh
+                    cache_state["ts"] = time.monotonic()
+                    ev = cache_state["building"]
+                    cache_state["building"] = None
+                    ev.set()
+                return fresh
+            except Exception:
+                with cache_lock:
+                    ev = cache_state["building"]
+                    cache_state["building"] = None
+                    if ev:
+                        ev.set()
+                raise
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             return
 
         def do_GET(self):
+            if not _is_loopback_host_header(self.headers.get("Host")):
+                self.send_response(403)
+                self.end_headers()
+                return
             path = self.path.split("?", 1)[0]
             if path == "/api/state":
                 payload = json.dumps(load_state()).encode("utf-8")
@@ -1125,6 +1254,7 @@ def main():
     parser.add_argument("--cmux-json", default=None)
     parser.add_argument("--github-json", default=None)
     parser.add_argument("--latency-json", default=None)
+    parser.add_argument("--repo", action="append", default=None, help="org/repo to query in live mode")
     parser.add_argument("--out-html", default=None, help="Write standalone static HTML snapshot")
     parser.add_argument("--serve", action="store_true", help="Run localhost live operator server")
     parser.add_argument("--port", type=int, default=8790)
@@ -1137,6 +1267,7 @@ def main():
             cmux_json=args.cmux_json,
             github_json=args.github_json,
             latency_json=args.latency_json,
+            repos=args.repo,
         )
         out = Path(args.out_html)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -1154,6 +1285,7 @@ def main():
             cmux_json=args.cmux_json,
             github_json=args.github_json,
             latency_json=args.latency_json,
+            repos=args.repo,
         )
         print(f"Serving operator live dashboard on http://127.0.0.1:{server.server_address[1]}/")
         try:

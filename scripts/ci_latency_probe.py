@@ -15,6 +15,7 @@ import argparse
 import datetime
 import json
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,34 @@ import queue_probe  # noqa: E402
 RATE_LIMIT_MARKERS = queue_probe.RATE_LIMIT_MARKERS
 DEFAULT_REPOS = ("jleechanorg/worldarchitect.ai", "jleechanorg/worldai_frontend")
 SKIPPED_CONCLUSIONS = frozenset({"skipped", "neutral"})
+COHORT_NAMES = ("success", "failure", "cancelled", "all_non_skipped")
+
+PHASE_RULES = (
+    ("playwright install", r"playwright\s+install"),
+    ("playwright", r"playwright"),
+    ("jest", r"\bjest\b"),
+    ("pytest", r"\bpytest\b"),
+    ("git index-pack", r"git\s+index-pack|index-pack"),
+    ("git fetch", r"git\b.*\bfetch\b|git-remote-http"),
+    ("gh api tarball", r"gh\s+api.*tarball"),
+    ("npm ci", r"\bnpm\s+ci\b"),
+    ("pip", r"\bpip3?\s+install\b"),
+    ("cargo", r"\bcargo\b"),
+    ("gcloud", r"\bgcloud\b"),
+    ("mypy", r"\bmypy\b"),
+    ("shellcheck", r"\bshellcheck\b"),
+    ("setup-python", r"setup-python"),
+)
+
+
+def classify_phase(command_text):
+    """Return canonical execution phase tag from OS process command line, or None."""
+    if not isinstance(command_text, str) or not command_text:
+        return None
+    for label, pattern in PHASE_RULES:
+        if re.search(pattern, command_text, re.IGNORECASE):
+            return label
+    return None
 
 
 DEFAULT_GH_TIMEOUT_S = 20
@@ -149,6 +178,17 @@ def probe_latency(repos, limit=40, job_run_limit=20):
     skipped_runs = 0
     total_non_skipped_runs = 0
     cancelled_runs = 0
+    timed_out_runs = 0
+    failed_job_fetches = 0
+
+    def empty_wf_bucket():
+        return {
+            "n_runs": 0,
+            "cohorts": {
+                c: {"queue_wait": [], "execution": [], "e2e": []}
+                for c in COHORT_NAMES
+            },
+        }
 
     for repo in repos:
         try:
@@ -157,6 +197,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             return {
                 "schema_version": 1,
                 "ok": False,
+                "partial": True,
                 "generated_at": generated_at,
                 "error": str(exc)[:200],
                 "overall": {},
@@ -190,12 +231,12 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                     repo_e2e_success.append(e2e_s)
 
             wf_name = str(run.get("name") or "unknown")
-            wf_entry = wf_buckets.setdefault(
-                wf_name, {"queue_wait": [], "execution": [], "e2e": [], "n_runs": 0}
-            )
+            wf_entry = wf_buckets.setdefault((repo, wf_name), empty_wf_bucket())
             wf_entry["n_runs"] += 1
-            if e2e_s is not None and conclusion == "success":
-                wf_entry["e2e"].append(e2e_s)
+            if e2e_s is not None:
+                wf_entry["cohorts"]["all_non_skipped"]["e2e"].append(e2e_s)
+                if conclusion in wf_entry["cohorts"]:
+                    wf_entry["cohorts"][conclusion]["e2e"].append(e2e_s)
 
             non_skipped_runs.append(run)
 
@@ -210,6 +251,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                     return {
                         "schema_version": 1,
                         "ok": False,
+                        "partial": True,
                         "generated_at": generated_at,
                         "error": f"rate limited while reading jobs: {str(exc)[:150]}",
                         "overall": {},
@@ -217,12 +259,14 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                         "workflows": [],
                         "repos": [],
                     }
+                if "timed out" in str(exc).lower():
+                    timed_out_runs += 1
+                else:
+                    failed_job_fetches += 1
                 continue
 
             wf_name = str(run.get("name") or "unknown")
-            wf_entry = wf_buckets.setdefault(
-                wf_name, {"queue_wait": [], "execution": [], "e2e": [], "n_runs": 0}
-            )
+            wf_entry = wf_buckets.setdefault((repo, wf_name), empty_wf_bucket())
             for job in jobs:
                 j_conc = (job.get("conclusion") or "").lower()
                 if j_conc in SKIPPED_CONCLUSIONS:
@@ -231,16 +275,18 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                 e_s = _seconds_between(job.get("started_at"), job.get("completed_at"))
                 if q_s is not None:
                     job_queue_by_cohort["all_non_skipped"].append(q_s)
+                    wf_entry["cohorts"]["all_non_skipped"]["queue_wait"].append(q_s)
                     if j_conc in job_queue_by_cohort:
                         job_queue_by_cohort[j_conc].append(q_s)
-                    if j_conc == "success":
-                        wf_entry["queue_wait"].append(q_s)
+                    if j_conc in wf_entry["cohorts"]:
+                        wf_entry["cohorts"][j_conc]["queue_wait"].append(q_s)
                 if e_s is not None:
                     job_exec_by_cohort["all_non_skipped"].append(e_s)
+                    wf_entry["cohorts"]["all_non_skipped"]["execution"].append(e_s)
                     if j_conc in job_exec_by_cohort:
                         job_exec_by_cohort[j_conc].append(e_s)
-                    if j_conc == "success":
-                        wf_entry["execution"].append(e_s)
+                    if j_conc in wf_entry["cohorts"]:
+                        wf_entry["cohorts"][j_conc]["execution"].append(e_s)
                 if j_conc == "success":
                     r_cls = _classify_runner_class(job.get("runner_name"))
                     cls_bucket = runner_class_buckets.setdefault(
@@ -258,24 +304,34 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             "e2e_success": compute_stats(repo_e2e_success),
         })
 
-    # Prefer success cohort for headline queue/exec/e2e; fall back to all_non_skipped if empty.
-    headline_q = job_queue_by_cohort["success"] or job_queue_by_cohort["all_non_skipped"]
-    headline_e = job_exec_by_cohort["success"] or job_exec_by_cohort["all_non_skipped"]
-    headline_e2e = run_e2e_by_cohort["success"] or run_e2e_by_cohort["all_non_skipped"]
+    # Choose a single consistent cohort for headline clocks rather than mixing cohorts.
+    has_success_cohort = bool(
+        job_queue_by_cohort["success"] and job_exec_by_cohort["success"] and run_e2e_by_cohort["success"]
+    )
+    headline_cohort = "success" if has_success_cohort else "all_non_skipped"
 
     workflows = []
-    for wf_name, bucket in wf_buckets.items():
-        q_stats = compute_stats(bucket["queue_wait"])
-        e_stats = compute_stats(bucket["execution"])
-        e2e_stats = compute_stats(bucket["e2e"])
-        if q_stats["n"] == 0 and e_stats["n"] == 0 and e2e_stats["n"] == 0:
+    for (repo, wf_name), bucket in wf_buckets.items():
+        wf_cohorts = {
+            c: {
+                "queue_wait": compute_stats(bucket["cohorts"][c]["queue_wait"]),
+                "execution": compute_stats(bucket["cohorts"][c]["execution"]),
+                "e2e": compute_stats(bucket["cohorts"][c]["e2e"]),
+            }
+            for c in COHORT_NAMES
+        }
+        primary = wf_cohorts["success"] if wf_cohorts["success"]["execution"]["n"] > 0 else wf_cohorts["all_non_skipped"]
+        if primary["queue_wait"]["n"] == 0 and primary["execution"]["n"] == 0 and primary["e2e"]["n"] == 0:
             continue
         workflows.append({
+            "repo": repo,
             "workflow": wf_name,
             "n_runs": bucket["n_runs"],
-            "queue_wait": q_stats,
-            "execution": e_stats,
-            "e2e": e2e_stats,
+            "cohort": "success" if wf_cohorts["success"]["execution"]["n"] > 0 else "all_non_skipped",
+            "queue_wait": primary["queue_wait"],
+            "execution": primary["execution"],
+            "e2e": primary["e2e"],
+            "cohorts": wf_cohorts,
         })
     workflows.sort(
         key=lambda item: (item["execution"]["p90_s"] or item["e2e"]["p90_s"] or 0.0, item["n_runs"]),
@@ -291,11 +347,16 @@ def probe_latency(repos, limit=40, job_run_limit=20):
     return {
         "schema_version": 1,
         "ok": True,
+        "partial": bool(timed_out_runs or failed_job_fetches),
+        "timed_out_runs": timed_out_runs,
+        "failed_job_fetches": failed_job_fetches,
+        "cohort": headline_cohort,
         "generated_at": generated_at,
         "overall": {
-            "queue_wait": compute_stats(headline_q),
-            "execution": compute_stats(headline_e),
-            "e2e": compute_stats(headline_e2e),
+            "cohort": headline_cohort,
+            "queue_wait": compute_stats(job_queue_by_cohort[headline_cohort]),
+            "execution": compute_stats(job_exec_by_cohort[headline_cohort]),
+            "e2e": compute_stats(run_e2e_by_cohort[headline_cohort]),
         },
         "cohorts": {
             cohort: {
@@ -303,7 +364,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                 "execution": compute_stats(job_exec_by_cohort[cohort]),
                 "e2e": compute_stats(run_e2e_by_cohort[cohort]),
             }
-            for cohort in ("success", "failure", "cancelled", "all_non_skipped")
+            for cohort in COHORT_NAMES
         },
         "cancellation": {
             "cancelled_runs": cancelled_runs,
@@ -318,7 +379,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             }
             for cls, vals in sorted(runner_class_buckets.items())
         },
-        "workflows": workflows[:15],
+        "workflows": workflows,
         "repos": repo_summaries,
     }
 
@@ -348,21 +409,40 @@ def iter_audit_repo_blocks(raw):
             yield slug, val
 
 
-def from_audit_json(path):
-    """Normalize a pre-collected ci_latency_percentiles.json into public probe shape."""
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+def from_audit_data(raw):
+    """Normalize a pre-collected ci_latency_percentiles dict into canonical probe shape."""
+    if not isinstance(raw, dict):
+        return {"schema_version": 1, "ok": False, "overall": {}, "cohorts": {}, "cancellation": {}, "workflows": []}
     repo_blocks = list(iter_audit_repo_blocks(raw))
-    primary = repo_blocks[0][1] if repo_blocks else {}
+    primary_slug, primary = repo_blocks[0] if repo_blocks else (None, {})
     recent = primary.get("recent_contiguous_runs") or primary.get("recent_runs") or {}
     cohorts = recent.get("cohorts") or {}
     job_audit = primary.get("job_level_audit") or {}
     job_cohorts = job_audit.get("job_cohorts") or {}
 
-    success_jobs = job_cohorts.get("success") or job_cohorts.get("all_non_skipped") or {}
-    success_runs = cohorts.get("success") or cohorts.get("all_non_skipped") or {}
+    cohorts_out = {}
+    for c in COHORT_NAMES:
+        jc = job_cohorts.get(c) or {}
+        rc = cohorts.get(c) or {}
+        cohorts_out[c] = {
+            "queue_wait": _pick_stat_block(jc.get("queue_wait")),
+            "execution": _pick_stat_block(jc.get("execution")),
+            "job_total": _pick_stat_block(jc.get("total")),
+            "e2e": _pick_stat_block(rc),
+        }
 
-    cancelled_n = (cohorts.get("cancelled") or {}).get("n") or 0
-    total_non_skipped = (cohorts.get("all_non_skipped") or {}).get("n") or 0
+    headline_cohort = "success" if cohorts_out["success"]["execution"]["n"] > 0 else "all_non_skipped"
+
+    # Aggregate cancellation across all audited repo blocks rather than dropping repos after [0]
+    cancelled_n = 0
+    skipped_n = 0
+    total_non_skipped = 0
+    for _slug, block in repo_blocks:
+        r_rec = block.get("recent_contiguous_runs") or block.get("recent_runs") or {}
+        r_coh = r_rec.get("cohorts") or {}
+        cancelled_n += (r_coh.get("cancelled") or {}).get("n") or 0
+        skipped_n += r_rec.get("skipped_or_neutral_runs") or 0
+        total_non_skipped += (r_coh.get("all_non_skipped") or {}).get("n") or 0
     cancelled_pct = (
         round((cancelled_n / total_non_skipped) * 100.0, 1)
         if total_non_skipped > 0
@@ -373,7 +453,7 @@ def from_audit_json(path):
     for repo_slug, repo_block in repo_blocks:
         r_recent = repo_block.get("recent_contiguous_runs") or repo_block.get("recent_runs") or {}
         r_wf_map = {
-            wf["workflow"]: wf.get("success") or wf.get("all_non_skipped") or {}
+            wf["workflow"]: wf
             for wf in (r_recent.get("by_workflow") or [])
             if isinstance(wf, dict) and isinstance(wf.get("workflow"), str)
         }
@@ -381,18 +461,28 @@ def from_audit_json(path):
         for wf in r_jobs.get("by_workflow") or []:
             if not isinstance(wf, dict) or not isinstance(wf.get("workflow"), str):
                 continue
-            cohort_data = wf.get("success") or wf.get("all_non_skipped") or {}
-            qw = _pick_stat_block(cohort_data.get("queue_wait"))
-            ex = _pick_stat_block(cohort_data.get("execution"))
-            e2 = _pick_stat_block(r_wf_map.get(wf["workflow"]) or cohort_data.get("total"))
-            if qw["n"] == 0 and ex["n"] == 0 and e2["n"] == 0:
+            r_match = r_wf_map.get(wf["workflow"]) or {}
+            wf_cohorts = {}
+            for c in COHORT_NAMES:
+                c_data = wf.get(c) or {}
+                wf_cohorts[c] = {
+                    "queue_wait": _pick_stat_block(c_data.get("queue_wait")),
+                    "execution": _pick_stat_block(c_data.get("execution")),
+                    "job_total": _pick_stat_block(c_data.get("total")),
+                    # Never substitute job wall time for run-level E2E wall time
+                    "e2e": _pick_stat_block(r_match.get(c)),
+                }
+            pref = wf_cohorts["success"] if wf_cohorts["success"]["execution"]["n"] > 0 else wf_cohorts["all_non_skipped"]
+            if pref["queue_wait"]["n"] == 0 and pref["execution"]["n"] == 0 and pref["e2e"]["n"] == 0:
                 continue
             workflows.append({
                 "repo": repo_slug,
                 "workflow": wf["workflow"],
-                "queue_wait": qw,
-                "execution": ex,
-                "e2e": e2,
+                "cohort": "success" if wf_cohorts["success"]["execution"]["n"] > 0 else "all_non_skipped",
+                "queue_wait": pref["queue_wait"],
+                "execution": pref["execution"],
+                "e2e": pref["e2e"],
+                "cohorts": wf_cohorts,
             })
     workflows.sort(
         key=lambda item: (item["execution"]["p90_s"] or item["e2e"]["p90_s"] or 0.0),
@@ -420,33 +510,54 @@ def from_audit_json(path):
 
     return {
         "schema_version": 1,
-        "ok": bool(success_jobs or success_runs),
+        "ok": bool(cohorts_out["success"]["execution"]["n"] or cohorts_out["success"]["e2e"]["n"] or workflows),
+        "partial": False,
+        "cohort": headline_cohort,
+        "overall_scope": primary_slug,
         "generated_at": raw.get("generated_at_utc"),
         "overall": {
-            "queue_wait": _pick_stat_block(success_jobs.get("queue_wait")),
-            "execution": _pick_stat_block(success_jobs.get("execution")),
-            "e2e": _pick_stat_block(success_runs),
+            "cohort": headline_cohort,
+            "scope_repo": primary_slug,
+            "queue_wait": cohorts_out[headline_cohort]["queue_wait"],
+            "execution": cohorts_out[headline_cohort]["execution"],
+            "e2e": cohorts_out[headline_cohort]["e2e"],
         },
+        "cohorts": cohorts_out,
+        "pr_critical_path": recent.get("pr_critical_path_turnaround") or {},
         "cancellation": {
             "cancelled_runs": cancelled_n,
-            "skipped_runs": recent.get("skipped_or_neutral_runs") or 0,
+            "skipped_runs": skipped_n,
             "total_non_skipped_runs": total_non_skipped,
             "cancelled_rate_pct": cancelled_pct,
         },
+        "runner_classes": runner_classes,
         "by_runner_class": runner_classes,
         "step_categories": step_cats,
-        "workflows": workflows[:15],
+        "workflows": workflows,
     }
+
+
+def from_audit_json(path):
+    """Normalize a pre-collected ci_latency_percentiles.json into canonical probe shape."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return from_audit_data(raw)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", action="append", default=None, help="org/repo to probe")
     parser.add_argument("--from-audit-json", default=None, help="Normalize pre-collected audit JSON")
+    parser.add_argument("--classify-phase", default=None, help="Classify process command string and print phase tag")
     parser.add_argument("--limit", type=int, default=40)
     parser.add_argument("--job-run-limit", type=int, default=20)
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
+
+    if args.classify_phase is not None:
+        tag = classify_phase(args.classify_phase)
+        if tag:
+            sys.stdout.write(tag + "\n")
+        return 0
 
     if args.from_audit_json:
         payload = from_audit_json(args.from_audit_json)

@@ -441,6 +441,17 @@ footer {
     grid-template-columns: 1fr;
   }
 
+  .fleet-panel > header,
+  .systems-panel > header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+  }
+
+  .host-badge {
+    align-self: flex-start;
+  }
+
   .timestamps {
     width: 100%;
   }

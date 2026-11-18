@@ -175,11 +175,14 @@ class SnapshotTest(unittest.TestCase):
         mac["fleet"].update(executing=0, idle=0, cycling=0, down=0, reserved=0)
         mac["parked"] = True
         mac["parked_slots"] = 4
-        mac["parked_reason"] = "operator_disabled"
+        mac["parked_reason"] = "secret-suspension-bead-123"
+        mac["sources"]["service"]["ok"] = False
+        mac["sources"]["docker"]["ok"] = False
+        mac["sources"]["process_probe"]["ok"] = False
         mac["disk"] = {"status": "healthy", "free_gb": 29.0, "floor_gb": 30}
         mac["slots"] = [
             {
-                "slot_id": f"mac-{i}",
+                "slot_id": f"secret-mac-host-{i}",
                 "slot": i,
                 "state": "PARKED",
                 "elapsed_minutes": None,
@@ -187,6 +190,7 @@ class SnapshotTest(unittest.TestCase):
                 "pr_title": "secret-pr-title",
                 "actor": "secret-actor",
                 "token": "ghp_secret",
+                "phase_badge": "secret-freeform-phase",
             }
             for i in range(1, 5)
         ]
@@ -197,7 +201,7 @@ class SnapshotTest(unittest.TestCase):
         linux["fleet"].update(executing=13, idle=0, cycling=0, down=7, reserved=20)
         linux["slots"] = [
             {
-                "slot_id": f"linux-{i}",
+                "slot_id": f"jeff-ubuntu-slot-{i}",
                 "slot": i,
                 "state": "EXECUTING" if i <= 13 else "DOWN",
                 "elapsed_minutes": 12.5 if i <= 13 else None,
@@ -245,7 +249,8 @@ class SnapshotTest(unittest.TestCase):
             "cancellation": {"cancelled_runs": 183, "total_non_skipped_runs": 381, "cancelled_rate_pct": 48.0},
             "workflows": [
                 {
-                    "workflow": "Self-Hosted MVP Shards",
+                    "repo": "jleechanorg/worldarchitect.ai",
+                    "workflow": "Secret Project Tests",
                     "queue_wait": {"n": 32, "avg_s": 339.0, "p50_s": 323.0, "p90_s": 637.0, "p99_s": 900.0},
                     "execution": {"n": 32, "avg_s": 413.0, "p50_s": 32.5, "p90_s": 1639.0, "p99_s": 2050.0},
                     "e2e": {"n": 32, "avg_s": 752.0, "p50_s": 500.0, "p90_s": 1900.0, "p99_s": 2500.0},
@@ -259,7 +264,7 @@ class SnapshotTest(unittest.TestCase):
             "ghosts": 149,
             "oldest_fresh_wait_minutes": 42,
             "in_progress_runs": 15,
-            "repos": [{"repo": "org/public-queue-repo", "fresh": 50, "ghosts": 149}],
+            "repos": [{"repo": "jleechanorg/worldai_frontend", "fresh": 50, "ghosts": 149}],
         }
 
         snapshot = MODULE.build_snapshot(
@@ -275,13 +280,19 @@ class SnapshotTest(unittest.TestCase):
         self.assertTrue(snapshot["sources"]["linux_host"]["ok"])
         self.assertTrue(snapshot["fleets"]["mac"]["parked"])
         self.assertEqual(snapshot["fleets"]["mac"]["parked_slots"], 4)
+        self.assertEqual(snapshot["fleets"]["mac"]["parked_reason"], "operator_disabled")
         self.assertEqual(snapshot["fleets"]["linux"]["pause_reason"], "disk_floor_paused")
+        self.assertNotIn("disk_free_gb", snapshot["fleets"]["linux"])
+        self.assertNotIn("disk_free_gb", snapshot["cmux"]["vms"][0])
+        self.assertEqual(snapshot["fleets"]["mac"]["slots"][0]["slot_id"], "mac-1")
+        self.assertEqual(snapshot["fleets"]["linux"]["slots"][0]["slot_id"], "linux-1")
         self.assertEqual(len(snapshot["fleets"]["linux"]["slots"]), 20)
         self.assertEqual(snapshot["cmux"]["configured"], 25)
         self.assertEqual(snapshot["cmux"]["vms"][0]["vm_id"], "cloud-vm-1")
         self.assertEqual(snapshot["cmux"]["vms"][0]["slots"][0]["slot_id"], "cloud-vm-1-1")
         self.assertTrue(snapshot["latency"]["ok"])
         self.assertEqual(snapshot["latency"]["overall"]["queue_wait"]["p50_s"], 339.5)
+        self.assertEqual(snapshot["latency"]["workflows"][0]["workflow"], "workflow-1")
         self.assertEqual(snapshot["reconciliation"]["active_job_slots_occupied"], 34)
         self.assertEqual(snapshot["reconciliation"]["parked_slots"], 4)
         self.assertEqual(snapshot["reconciliation"]["down_slots"], 7)
@@ -295,9 +306,16 @@ class SnapshotTest(unittest.TestCase):
             "ghp_secret",
             "private-branch-xyz",
             "secret-latency-branch",
+            "secret-suspension-bead-123",
+            "secret-mac-host",
+            "secret-freeform-phase",
+            "jeff-ubuntu",
+            "Secret Project Tests",
             "cmux-dreamy",
             "worldarchitect",
             "worldai_frontend",
+            "disk_free_gb",
+            "disk_floor_gb",
         ):
             self.assertNotIn(secret, serialized)
 

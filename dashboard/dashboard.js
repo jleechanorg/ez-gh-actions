@@ -3,6 +3,8 @@
 
   const STALE_AFTER_MS = 20 * 60 * 1000;
   const SOURCE_KEYS = ['linux_host', 'mac_host'];
+  // Retained [4, 6] and [10, 20] for historical UI unit-fixture compatibility;
+  // build_runner_dashboard_snapshot.py enforces the live {4, 20} fleet counts.
   const EXPECTED_CONFIGURED = { mac: [4, 6], linux: [10, 20] };
   const FLEET_KEYS = [
     'configured',
@@ -102,18 +104,29 @@
       fleet.executing === 0 &&
       fleet.idle === 0 &&
       fleet.cycling === 0;
+    const allowedConfigured = EXPECTED_CONFIGURED[fleetName] || [];
+    const parkedValid =
+      isParked &&
+      sources.config?.ok === true &&
+      fleet.down === 0 &&
+      fleet.executing === 0 &&
+      fleet.idle === 0 &&
+      fleet.cycling === 0 &&
+      parkedSlots === fleet.configured;
     const diskValid =
       (sources.disk?.ok === true &&
         ['healthy', 'critical'].includes(host?.disk?.status)) ||
       (allDown &&
         sources.disk?.ok === false &&
-        host?.disk?.status === 'unknown');
-    const allowedConfigured = EXPECTED_CONFIGURED[fleetName] || [];
-    return (
-      Object.keys(sources).sort().join(',') === sourceKeys.join(',') &&
+        host?.disk?.status === 'unknown') ||
+      parkedValid;
+    const probesValid =
       requiredSourceKeys
         .filter((key) => key !== 'disk')
-        .every((key) => sources[key]?.ok === true) &&
+        .every((key) => sources[key]?.ok === true) || parkedValid;
+    return (
+      Object.keys(sources).sort().join(',') === sourceKeys.join(',') &&
+      probesValid &&
       diskValid &&
       typeof sources.watchdog_state?.ok === 'boolean' &&
       FLEET_KEYS.every((key) => isCount(fleet[key])) &&
@@ -276,7 +289,27 @@
     announceStatus('stale');
   }
 
-  function renderSlotChips(containerId, slots) {
+  function buildSlotChip(slot, fallbackPrefix = 'slot') {
+    const chip = document.createElement('div');
+    const state = String(slot.state || 'DOWN').toUpperCase();
+    chip.className = `slot-chip slot-chip--${state.toLowerCase()}`;
+    const title = document.createElement('span');
+    title.className = 'slot-chip-id';
+    title.textContent = slot.slot_id || `${fallbackPrefix}-${slot.slot || '?'}`;
+    const meta = document.createElement('span');
+    meta.className = 'slot-chip-meta';
+    const parts = [state];
+    if (typeof slot.elapsed_minutes === 'number') {
+      parts.push(`${slot.elapsed_minutes}m`);
+    }
+    if (slot.phase_badge) parts.push(slot.phase_badge);
+    meta.textContent = parts.join(' · ');
+    chip.appendChild(title);
+    chip.appendChild(meta);
+    return chip;
+  }
+
+  function renderSlotChips(containerId, slots, fallbackPrefix = 'slot') {
     const container = byId(containerId);
     if (!container || typeof document?.createElement !== 'function') return;
     if (typeof container.replaceChildren === 'function') {
@@ -285,58 +318,54 @@
     if (!Array.isArray(slots) || slots.length === 0) return;
     for (const slot of slots) {
       if (!slot || typeof slot !== 'object') continue;
-      const chip = document.createElement('div');
-      const state = String(slot.state || 'DOWN').toUpperCase();
-      chip.className = `slot-chip slot-chip--${state.toLowerCase()}`;
-      const title = document.createElement('span');
-      title.className = 'slot-chip-id';
-      title.textContent = slot.slot_id || `slot-${slot.slot || '?'}`;
-      const meta = document.createElement('span');
-      meta.className = 'slot-chip-meta';
-      const parts = [state];
-      if (typeof slot.elapsed_minutes === 'number') {
-        parts.push(`${slot.elapsed_minutes}m`);
-      }
-      if (slot.repo_short) parts.push(slot.repo_short);
-      if (slot.phase_badge) parts.push(slot.phase_badge);
-      meta.textContent = parts.join(' · ');
-      chip.appendChild(title);
-      chip.appendChild(meta);
-      container.appendChild(chip);
+      container.appendChild(buildSlotChip(slot, fallbackPrefix));
     }
   }
 
   function renderReconciliation(reconcile, snapshot) {
     const data = reconcile || {};
-    const macFleet = snapshot.fleets?.mac?.fleet || {};
-    const linuxFleet = snapshot.fleets?.linux?.fleet || {};
+    const macValid = snapshot.sources?.mac_host?.ok === true;
+    const linuxValid = snapshot.sources?.linux_host?.ok === true;
     const cmux = snapshot.cmux?.ok ? snapshot.cmux : null;
+    const validPools = [
+      ...(macValid ? [snapshot.fleets?.mac?.fleet || {}] : []),
+      ...(linuxValid ? [snapshot.fleets?.linux?.fleet || {}] : []),
+      ...(cmux ? [cmux] : []),
+    ];
+    const sumPools = (key) => {
+      if (validPools.length === 0) return null;
+      const vals = validPools.map((p) => p[key]).filter(isCount);
+      return vals.length === validPools.length ? vals.reduce((a, b) => a + b, 0) : null;
+    };
+
     const occupied = isCount(data.active_job_slots_occupied)
       ? data.active_job_slots_occupied
-      : (macFleet.executing || 0) + (linuxFleet.executing || 0) + (cmux?.executing || 0);
-    const idle = isCount(data.idle_slots)
-      ? data.idle_slots
-      : (macFleet.idle || 0) + (linuxFleet.idle || 0) + (cmux?.idle || 0);
-    const down = isCount(data.down_slots)
-      ? data.down_slots
-      : (macFleet.down || 0) + (linuxFleet.down || 0) + (cmux?.down || 0);
+      : sumPools('executing');
+    const idle = isCount(data.idle_slots) ? data.idle_slots : sumPools('idle');
+    const down = isCount(data.down_slots) ? data.down_slots : sumPools('down');
+    const cycling = isCount(data.cycling_slots) ? data.cycling_slots : sumPools('cycling');
     const parked = isCount(data.parked_slots)
       ? data.parked_slots
-      : (snapshot.fleets?.mac?.parked_slots || 0) + (snapshot.fleets?.linux?.parked_slots || 0);
-    const cycling = isCount(data.cycling_slots)
-      ? data.cycling_slots
-      : (macFleet.cycling || 0) + (linuxFleet.cycling || 0) + (cmux?.cycling || 0);
+      : macValid || linuxValid
+        ? (macValid ? snapshot.fleets?.mac?.parked_slots || 0 : 0) +
+          (linuxValid ? snapshot.fleets?.linux?.parked_slots || 0 : 0)
+        : null;
 
     setText('reconcile-runs', count(data.active_workflow_runs));
     setText('reconcile-slots', count(occupied));
     setText('reconcile-idle', count(idle));
-    setText('reconcile-unavailable', `${down}D / ${parked}P / ${cycling}C`);
+    setText(
+      'reconcile-unavailable',
+      `${count(down)}D / ${count(parked)}P / ${count(cycling)}C`,
+    );
     setText('reconcile-fresh', count(data.fresh_queued_runs ?? snapshot.queue?.fresh));
     setText('reconcile-ghosts', count(data.inert_ghosts ?? snapshot.queue?.ghosts));
     setText(
       'reconcile-summary',
       data.explanation ||
-        `${occupied} occupied runner slots across configured pools (${down} down, ${parked} parked, ${cycling} cycling).`,
+        (occupied !== null
+          ? `${occupied} occupied local runner slots across verified pools (${count(down)} down, ${count(parked)} parked, ${count(cycling)} cycling).`
+          : 'Run-vs-slot reconciliation unavailable for unverified hosts.'),
     );
   }
 
@@ -377,30 +406,16 @@
       const head = document.createElement('p');
       head.className = 'cmux-vm-title';
       const diskTxt =
-        typeof vm.disk_free_gb === 'number'
-          ? ` · disk ${vm.disk_free_gb}G free (floor ${vm.disk_floor_gb ?? '?'}G)`
+        vm.disk_status && vm.disk_status !== 'unknown'
+          ? ` · disk ${String(vm.disk_status).toUpperCase()}`
           : '';
-      head.textContent = `${vm.vm_id || 'cmux-vm'} — ${count(vm.executing)}/${count(vm.configured)} exec${diskTxt}`;
+      head.textContent = `${vm.vm_id || 'cloud-vm'} — ${count(vm.executing)}/${count(vm.configured)} exec${diskTxt}`;
       card.appendChild(head);
       const grid = document.createElement('div');
       grid.className = 'slot-grid';
       for (const slot of vm.slots || []) {
-        const chip = document.createElement('div');
-        const state = String(slot.state || 'DOWN').toUpperCase();
-        chip.className = `slot-chip slot-chip--${state.toLowerCase()}`;
-        const title = document.createElement('span');
-        title.className = 'slot-chip-id';
-        title.textContent = slot.slot_id || 'cmux-slot';
-        const meta = document.createElement('span');
-        meta.className = 'slot-chip-meta';
-        const parts = [state];
-        if (typeof slot.elapsed_minutes === 'number') parts.push(`${slot.elapsed_minutes}m`);
-        if (slot.repo_short) parts.push(slot.repo_short);
-        if (slot.phase_badge) parts.push(slot.phase_badge);
-        meta.textContent = parts.join(' · ');
-        chip.appendChild(title);
-        chip.appendChild(meta);
-        grid.appendChild(chip);
+        if (!slot || typeof slot !== 'object') continue;
+        grid.appendChild(buildSlotChip(slot, vm.vm_id || 'cloud-slot'));
       }
       card.appendChild(grid);
       container.appendChild(card);
@@ -442,10 +457,16 @@
       typeof cancel.cancelled_rate_pct === 'number'
         ? `${cancel.cancelled_rate_pct}% (${count(cancel.cancelled_runs)}/${count(cancel.total_non_skipped_runs)})`
         : '—';
+    const cohortLabel =
+      latency.cohort === 'success'
+        ? 'successful runs'
+        : latency.cohort === 'all_non_skipped'
+          ? 'non-skipped runs'
+          : 'recent completed runs';
     setText('latency-cancel-rate', `CANCELLED: ${cancelPct}`);
     setText(
       'latency-summary',
-      `Recent completed non-skipped runs: Queue Wait p50 ${formatDurationSeconds(overall.queue_wait?.p50_s)} vs Job Exec p50 ${formatDurationSeconds(overall.execution?.p50_s)}.`,
+      `Recent ${cohortLabel}: Queue Wait p50 ${formatDurationSeconds(overall.queue_wait?.p50_s)} · Job Exec p50 ${formatDurationSeconds(overall.execution?.p50_s)} · E2E p50 ${formatDurationSeconds(overall.e2e?.p50_s)}.`,
     );
 
     if (!workflowsEl || typeof document?.createElement !== 'function') return;
@@ -460,7 +481,8 @@
       metrics.className = 'latency-wf-metrics';
       metrics.textContent =
         `Q p50 ${formatDurationSeconds(wf.queue_wait?.p50_s)} / p90 ${formatDurationSeconds(wf.queue_wait?.p90_s)} | ` +
-        `E avg ${formatDurationSeconds(wf.execution?.avg_s)} / p50 ${formatDurationSeconds(wf.execution?.p50_s)} / p90 ${formatDurationSeconds(wf.execution?.p90_s)} / p99 ${formatDurationSeconds(wf.execution?.p99_s)}`;
+        `E avg ${formatDurationSeconds(wf.execution?.avg_s)} / p50 ${formatDurationSeconds(wf.execution?.p50_s)} / p90 ${formatDurationSeconds(wf.execution?.p90_s)} / p99 ${formatDurationSeconds(wf.execution?.p99_s)} | ` +
+        `E2E p50 ${formatDurationSeconds(wf.e2e?.p50_s)} / p90 ${formatDurationSeconds(wf.e2e?.p90_s)}`;
       row.appendChild(name);
       row.appendChild(metrics);
       workflowsEl.appendChild(row);
@@ -480,6 +502,7 @@
     for (const fleetName of ['mac', 'linux']) {
       const host = snapshot.fleets?.[fleetName] || {};
       const fleet = host.fleet || {};
+      const sourceOk = snapshot.sources?.[`${fleetName}_host`]?.ok === true;
       setText(`${fleetName}-target`, count(fleet.configured));
       for (const metric of [
         'executing',
@@ -494,7 +517,10 @@
         setText('mac-parked', count(host.parked_slots ?? 0));
       }
       const badge = byId(`${fleetName}-state-badge`);
-      if (host.parked === true) {
+      if (!sourceOk) {
+        setText(`${fleetName}-state-badge`, 'UNAVAILABLE');
+        if (badge) badge.dataset.state = 'stale';
+      } else if (host.parked === true) {
         setText(`${fleetName}-state-badge`, 'PARKED');
         if (badge) badge.dataset.state = 'parked';
       } else if (fleet.down > 0) {
@@ -504,19 +530,10 @@
         setText(`${fleetName}-state-badge`, 'ONLINE');
         if (badge) badge.dataset.state = 'live';
       }
-      setText(
-        `${fleetName}-disk`,
-        String(host.disk?.status || 'unknown').toUpperCase(),
-      );
-      const freeText =
-        typeof host.disk_free_gb === 'number'
-          ? `${host.disk_free_gb}G free (floor ${host.disk_floor_gb ?? '?'}G)`
-          : '—';
+      const diskLabel = String(host.disk?.status || 'unknown').toUpperCase();
+      setText(`${fleetName}-disk`, diskLabel);
       const pauseText = host.pause_reason || host.parked_reason || null;
-      setText(
-        `${fleetName}-pause-reason`,
-        pauseText ? `${freeText} · ${pauseText}` : freeText,
-      );
+      setText(`${fleetName}-pause-reason`, pauseText || diskLabel);
       setText(
         `${fleetName}-watchdog`,
         count(host.watchdog?.consecutive_misses),

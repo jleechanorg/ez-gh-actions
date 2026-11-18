@@ -80,7 +80,7 @@ def gh_env():
     return env
 
 
-def gh_json(args, timeout=None):
+def gh_json(args, timeout=20):
     try:
         result = subprocess.run(
             ["gh", *args], capture_output=True, env=gh_env(), timeout=timeout
@@ -90,6 +90,16 @@ def gh_json(args, timeout=None):
     if result.returncode != 0:
         raise RuntimeError((result.stderr or b"").decode()[:300])
     return json.loads(result.stdout.decode() or "null")
+
+
+def in_progress_run_count(repo):
+    payload = gh_json([
+        "api",
+        f"repos/{repo}/actions/runs?status=in_progress&per_page=1",
+        "--jq",
+        ".total_count",
+    ])
+    return payload if type(payload) is int and payload >= 0 else None
 
 
 def list_queued(repo):
@@ -128,7 +138,18 @@ def probe_repo(repo):
         queued = list_queued(repo)
     except RuntimeError as exc:
         return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
-                "oldest_fresh_wait_minutes": None, "error": str(exc)[:200]}
+                "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                "error": str(exc)[:200]}
+
+    try:
+        ip_runs = in_progress_run_count(repo)
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if any(marker in message for marker in RATE_LIMIT_MARKERS):
+            return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                    "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                    "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
+        ip_runs = None
 
     fresh = ghosts = 0
     oldest = None
@@ -143,7 +164,7 @@ def probe_repo(repo):
             if any(marker in message for marker in RATE_LIMIT_MARKERS):
                 # Do not report a rate-limited pass as a clean queue.
                 return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
-                        "oldest_fresh_wait_minutes": None,
+                        "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                         "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
 
@@ -158,7 +179,8 @@ def probe_repo(repo):
             oldest = wait
 
     return {"repo": repo, "ok": True, "fresh": fresh, "ghosts": ghosts,
-            "oldest_fresh_wait_minutes": oldest, "error": None}
+            "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
+            "error": None}
 
 
 def main():
@@ -172,6 +194,13 @@ def main():
     ok = all(entry["ok"] for entry in repos)
     fresh = sum(entry["fresh"] for entry in repos if entry["ok"]) if ok else None
     ghosts = sum(entry["ghosts"] for entry in repos if entry["ok"]) if ok else None
+    ip_vals = [entry["in_progress_runs"] for entry in repos
+               if entry["ok"] and type(entry.get("in_progress_runs")) is int]
+    in_progress_total = (
+        sum(ip_vals)
+        if ok and len(ip_vals) == len(repos)
+        else None
+    )
     waits = [entry["oldest_fresh_wait_minutes"] for entry in repos
              if entry["ok"] and entry["oldest_fresh_wait_minutes"] is not None]
 
@@ -181,6 +210,7 @@ def main():
         "fresh": fresh,
         "ghosts": ghosts,
         "oldest_fresh_wait_minutes": max(waits) if waits else None,
+        "in_progress_runs": in_progress_total,
         "repos": repos,
     }
 

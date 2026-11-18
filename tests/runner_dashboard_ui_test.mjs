@@ -398,5 +398,21 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   assert.ok(elements.get('linux-slots').children.length >= 2);
   assert.ok(elements.get('cmux-slots').children.length >= 1);
   assert.ok(elements.get('latency-workflows').children.length >= 1);
+
+  // Honest skipped-probe provenance on parked host still classifies as degraded (parked), never stale,
+  // and an unavailable host displays UNAVAILABLE badge rather than ONLINE.
+  const parkedTruth = structuredClone(snapshot);
+  parkedTruth.fleets.linux.disk = { status: 'healthy' };
+  parkedTruth.fleets.mac.sources.service.ok = false;
+  parkedTruth.fleets.mac.sources.docker.ok = false;
+  parkedTruth.fleets.mac.sources.process_probe.ok = false;
+  assert.equal(classifySnapshot(parkedTruth, NOW).state, 'degraded');
+
+  const unavail = structuredClone(snapshot);
+  unavail.sources.linux_host.ok = false;
+  unavail.reconciliation = {};
+  unavail.cmux = { ok: false };
+  render(unavail, NOW);
+  assert.equal(elements.get('linux-state-badge').textContent, 'UNAVAILABLE');
   delete globalThis.document;
 });

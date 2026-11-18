@@ -325,7 +325,82 @@ class FleetLiveDashboardTest(unittest.TestCase):
             state = mod.build_operator_state(audit_dir=tmp)
         host_ids = [h["id"] for h in state["hosts"]]
         self.assertIn("linux-host-1", host_ids)
-        self.assertEqual(state["latency"]["workflows"][0]["repo"], "app-backend")
+        self.assertEqual(state["latency"]["workflows"][0]["repo"], "org/app-backend")
+
+    def test_rejects_non_loopback_host_header_and_concurrent_cache(self):
+        import time
+        import urllib.error
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            calls = {"n": 0}
+            orig_build = mod.build_operator_state
+
+            def slow_build(**kwargs):
+                calls["n"] += 1
+                time.sleep(0.15)
+                return orig_build(**kwargs)
+
+            with mock.patch.object(mod, "build_operator_state", side_effect=slow_build):
+                server = mod.create_server(host="127.0.0.1", port=0, audit_dir=tmp, cache_ttl_s=15.0)
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    # Non-loopback Host header (DNS rebinding attempt) must be rejected 403
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/state",
+                        headers={"Host": "evil.example:8790"},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(req, timeout=5)
+                    self.assertEqual(ctx.exception.code, 403)
+
+                    # Concurrent /api/state requests share single-flight build (calls == 1)
+                    results = []
+                    def fetch_state():
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                            results.append(resp.status)
+                    workers = [threading.Thread(target=fetch_state) for _ in range(4)]
+                    for w in workers:
+                        w.start()
+                    for w in workers:
+                        w.join(timeout=5)
+                    self.assertEqual(results, [200, 200, 200, 200])
+                    self.assertEqual(calls["n"], 1)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+
+    def test_active_mac_not_mislabeled_parked_and_default_local_collect(self):
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            hosts = json.loads((tmp / "ubuntu_mac_slots.json").read_text())
+            hosts["hosts"]["mac"]["ezgha_launchd_status"] = "active"
+            hosts["hosts"]["mac"]["container_slots"] = [{"slot": 1, "name": "ez-mac-runner-h-1", "state": "EXECUTING"}]
+            (tmp / "ubuntu_mac_slots.json").write_text(json.dumps(hosts), encoding="utf-8")
+
+            state = mod.build_operator_state(audit_dir=tmp)
+            mac_host = next(h for h in state["hosts"] if h["id"] == "mac")
+            self.assertNotIn("PARKED", mac_host["status"])
+            self.assertIsNone(mac_host["alert_message"])
+
+        # Default live path without --audit-dir collects local hosts
+        with mock.patch.object(mod, "_collect_local_host_slots", return_value={
+            "generated_at_utc": "2026-11-18T10:00:00Z",
+            "hosts": {"local-test": {"slots": [{"slot": 1, "name": "local-slot-1", "state": "IDLE"}]}},
+        }), mock.patch.object(mod, "_collect_live_github_snapshot", return_value={"captured_at": "2026-11-18T10:00:00Z", "summary": {}}), \
+           mock.patch.object(mod.ci_latency_probe, "probe_latency", return_value={"ok": False, "overall": {}, "workflows": []}):
+            live_state = mod.build_operator_state()
+        self.assertEqual(live_state["source_mode"], "LIVE PROBE")
+        self.assertEqual(live_state["hosts"][0]["slots"][0]["name"], "local-slot-1")
 
 
 if __name__ == "__main__":

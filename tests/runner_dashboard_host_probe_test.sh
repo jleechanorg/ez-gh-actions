@@ -142,26 +142,32 @@ for forbidden in ("secret-prefix", "secret-org", "secret-label", "secret-image")
     assert forbidden not in serialized
 PY
 
-# Explicit PARKED opt-out (MAC_RUNNER_DISABLED=1) reports parked=true without down=2
+# Explicit PARKED opt-out (MAC_RUNNER_DISABLED=1 / EZGHA_DASHBOARD_MAC_DISABLED=1)
+# reports parked=true without down=2 while keeping skipped probe sources honest.
 STUB_UNAME=Darwin STUB_ALL_DOWN=1 MAC_RUNNER_DISABLED=1 \
   STUB_LAUNCHCTL_LIST='' \
   PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
   bash "$PROBE" --host-class mac > "$WORK/mac-parked.json"
+STUB_UNAME=Darwin STUB_ALL_DOWN=1 EZGHA_DASHBOARD_MAC_DISABLED=1 \
+  STUB_LAUNCHCTL_LIST='' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-parked-ezgha-env.json"
 WORK="$WORK" python3 - <<'PY'
 import json
 import os
 from pathlib import Path
 
-payload = json.loads((Path(os.environ["WORK"]) / "mac-parked.json").read_text())
-assert payload["parked"] is True
-assert payload["parked_slots"] == 2
-assert payload["parked_reason"] == "operator_disabled"
-assert payload["fleet"]["down"] == 0
-assert payload["sources"]["service"]["ok"] is True
-assert payload["sources"]["docker"]["ok"] is True
-assert payload["sources"]["process_probe"]["ok"] is True
-assert all(s["state"] == "PARKED" for s in payload["slots"])
-assert "secret-prefix" not in json.dumps(payload)
+for name in ("mac-parked.json", "mac-parked-ezgha-env.json"):
+    payload = json.loads((Path(os.environ["WORK"]) / name).read_text())
+    assert payload["parked"] is True
+    assert payload["parked_slots"] == 2
+    assert payload["parked_reason"] == "operator_disabled"
+    assert payload["fleet"]["down"] == 0
+    assert payload["sources"]["service"]["ok"] is False
+    assert payload["sources"]["process_probe"]["ok"] is False
+    assert "disk_free_gb" not in payload
+    assert all(s["state"] == "PARKED" for s in payload["slots"])
+    assert "secret-prefix" not in json.dumps(payload)
 PY
 
 printf '%s\n' \

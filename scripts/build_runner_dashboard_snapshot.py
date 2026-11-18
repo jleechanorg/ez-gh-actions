@@ -10,6 +10,28 @@ from pathlib import Path
 SOURCE_KEYS = ("config", "service", "docker", "process_probe", "disk", "watchdog_state")
 FLEET_KEYS = ("configured", "executing", "idle", "cycling", "down", "reserved")
 ALLOWED_SLOT_STATES = frozenset({"EXECUTING", "IDLE", "CYCLING", "DOWN", "PARKED", "OFFLINE"})
+ALLOWED_PUBLIC_PHASES = frozenset({
+    "playwright",
+    "playwright install",
+    "jest",
+    "pytest",
+    "git index-pack",
+    "git fetch",
+    "gh api tarball",
+    "npm ci",
+    "pip",
+    "cargo",
+    "gcloud",
+    "mypy",
+    "shellcheck",
+    "setup-python",
+    "respawning",
+    "operator_disabled",
+    "disk_floor_paused",
+    "ci-check",
+})
+ALLOWED_PUBLIC_CATEGORIES = frozenset({"ci-check", "tests", "build", "deploy", "lint"})
+ALLOWED_PAUSE_REASONS = frozenset({"disk_floor_paused", "disk_floor_pause"})
 # Must match the real fleet shapes. Stale values here make a healthy fleet render as
 # STALE/UNKNOWN, which is exactly the failure the snapshot test documents as the
 # EXPECTED_CONFIGURED["linux"] drift regression (16 vs the real 10).
@@ -38,14 +60,23 @@ def _opt_float(value):
     return None
 
 
-def _opt_str(value, max_len=64):
+def _allowlisted_str(value, allowed):
     if isinstance(value, str):
-        cleaned = value.strip()
-        return cleaned[:max_len] if cleaned else None
+        cleaned = value.strip().lower()
+        return cleaned if cleaned in allowed else None
     return None
 
 
-def _sanitize_slots(raw_slots, *, slot_prefix=None):
+def _anon_label(raw_value, mapping, prefix):
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    key = raw_value.strip()
+    if key not in mapping:
+        mapping[key] = f"{prefix}-{len(mapping) + 1}"
+    return mapping[key]
+
+
+def _sanitize_slots(raw_slots, *, slot_prefix="slot"):
     if not isinstance(raw_slots, list):
         return []
     slots = []
@@ -56,14 +87,13 @@ def _sanitize_slots(raw_slots, *, slot_prefix=None):
         if state not in ALLOWED_SLOT_STATES:
             state = "DOWN"
         slot_num = _count(entry.get("slot")) or idx
-        slot_id = f"{slot_prefix}-{slot_num}" if slot_prefix else (_opt_str(entry.get("slot_id"), 48) or f"slot-{slot_num}")
         slots.append({
-            "slot_id": slot_id,
+            "slot_id": f"{slot_prefix}-{slot_num}",
             "slot": slot_num,
             "state": state,
             "elapsed_minutes": _opt_float(entry.get("elapsed_minutes")),
-            "workflow_category": _opt_str(entry.get("workflow_category"), 48),
-            "phase_badge": _opt_str(entry.get("phase_badge"), 48),
+            "workflow_category": _allowlisted_str(entry.get("workflow_category"), ALLOWED_PUBLIC_CATEGORIES),
+            "phase_badge": _allowlisted_str(entry.get("phase_badge"), ALLOWED_PUBLIC_PHASES),
         })
     return slots
 
@@ -86,8 +116,6 @@ def _public_host(payload, expected_class):
     disk_status = disk_raw.get("status")
     if disk_status not in {"healthy", "critical"}:
         disk_status = "unknown"
-    disk_free_gb = _opt_float(payload.get("disk_free_gb") if payload.get("disk_free_gb") is not None else disk_raw.get("free_gb"))
-    disk_floor_gb = _count(payload.get("disk_floor_gb") if payload.get("disk_floor_gb") is not None else disk_raw.get("floor_gb"))
 
     consecutive = _count(payload.get("watchdog", {}).get("consecutive_misses"))
     restart_after = _count(payload.get("watchdog", {}).get("restart_after"))
@@ -115,20 +143,32 @@ def _public_host(payload, expected_class):
         and fleet["down"] == fleet["configured"]
         and all(fleet[key] == 0 for key in ("executing", "idle", "cycling"))
     )
+    parked_ok = (
+        parked
+        and valid_counts
+        and parked_slots == fleet["configured"]
+        and fleet["down"] == 0
+        and all(fleet[key] == 0 for key in ("executing", "idle", "cycling"))
+    )
     disk_valid = (
         sources["disk"]["ok"] and disk_status != "unknown"
     ) or (
         all_down and not sources["disk"]["ok"] and disk_status == "unknown"
+    ) or (
+        parked_ok
+    )
+    probes_ok = all(
+        sources[key]["ok"]
+        for key in SOURCE_KEYS
+        if key not in {"disk", "watchdog_state"}
+    ) or (
+        parked_ok and sources["config"]["ok"]
     )
     valid = (
         payload.get("schema_version") == 1
         and payload.get("host_class") == expected_class
         and set(sources) == set(SOURCE_KEYS)
-        and all(
-            sources[key]["ok"]
-            for key in SOURCE_KEYS
-            if key not in {"disk", "watchdog_state"}
-        )
+        and probes_ok
         and valid_counts
         and disk_valid
         and (
@@ -145,6 +185,8 @@ def _public_host(payload, expected_class):
             )
         )
     )
+    raw_pause = _allowlisted_str(payload.get("pause_reason"), ALLOWED_PAUSE_REASONS)
+    pause_reason = "disk_floor_paused" if raw_pause else None
     host_out = {
         "sources": sources,
         "fleet": fleet,
@@ -155,27 +197,15 @@ def _public_host(payload, expected_class):
         },
         "parked": parked,
         "parked_slots": parked_slots,
-        "parked_reason": _opt_str(payload.get("parked_reason"), 48) if parked else None,
-        "pause_reason": _opt_str(payload.get("pause_reason"), 48),
-        "disk_free_gb": disk_free_gb,
-        "disk_floor_gb": disk_floor_gb,
-        "slots": _sanitize_slots(payload.get("slots")),
+        "parked_reason": "operator_disabled" if parked else None,
+        "pause_reason": pause_reason,
+        "slots": _sanitize_slots(payload.get("slots"), slot_prefix=expected_class),
     }
     return host_out, valid
 
 
-def _public_queue(payload):
-    """Reduce a queue probe payload to the aggregate-only public shape.
-
-    The whole point of this section is to keep zero-job ghosts OUT of the number a
-    human reads as backlog. A ghost is a queued run that owns no jobs and that GitHub
-    refuses to transition (409 on cancel/force-cancel, 403 on delete), so it can never
-    start and can never be cleaned up from our side. Counting them as queue depth makes
-    the backlog look several times larger than the work actually waiting.
-
-    Only aggregate counts are emitted -- no run ids, branch names, or actor names --
-    because this snapshot is published to a public Pages site.
-    """
+def _public_queue(payload, repo_map):
+    """Reduce a queue probe payload to the anonymized aggregate-only public shape."""
     raw = payload.get("queue") if isinstance(payload.get("queue"), dict) else payload
     if not isinstance(raw, dict):
         return {"ok": False, "fresh": None, "ghosts": None,
@@ -190,7 +220,7 @@ def _public_queue(payload):
         if not isinstance(entry, dict):
             continue
         repos.append({
-            "repo": entry.get("repo") if isinstance(entry.get("repo"), str) else None,
+            "repo": _anon_label(entry.get("repo"), repo_map, "repo"),
             "fresh": num_in(entry, "fresh"),
             "ghosts": num_in(entry, "ghosts"),
         })
@@ -221,6 +251,11 @@ def _public_cmux(payload):
         if not isinstance(vm, dict):
             continue
         anon_vm_id = f"cloud-vm-{idx}"
+        free_gb = _opt_float(vm.get("disk_free_gb"))
+        floor_gb = _count(vm.get("disk_floor_gb"))
+        disk_status = vm.get("disk_status") if vm.get("disk_status") in {"healthy", "critical"} else "unknown"
+        if disk_status == "unknown" and free_gb is not None and floor_gb is not None:
+            disk_status = "critical" if free_gb < floor_gb else "healthy"
         vms.append({
             "vm_id": anon_vm_id,
             "configured": _count(vm.get("configured")),
@@ -228,8 +263,7 @@ def _public_cmux(payload):
             "idle": _count(vm.get("idle")),
             "cycling": _count(vm.get("cycling")),
             "down": _count(vm.get("down")),
-            "disk_free_gb": _opt_float(vm.get("disk_free_gb")),
-            "disk_floor_gb": _count(vm.get("disk_floor_gb")),
+            "disk_status": disk_status,
             "slots": _sanitize_slots(vm.get("slots"), slot_prefix=anon_vm_id),
         })
     return {
@@ -256,10 +290,10 @@ def _sanitize_stat_block(block):
     }
 
 
-def _public_latency(payload):
+def _public_latency(payload, repo_map):
     """Sanitize CI latency telemetry payload (avg / p50 / p90 / p99 only)."""
     if not isinstance(payload, dict) or payload.get("ok") is not True:
-        return {"ok": False, "generated_at": None, "overall": {}, "cancellation": {}, "workflows": []}
+        return {"ok": False, "generated_at": None, "cohort": None, "overall": {}, "cancellation": {}, "workflows": []}
 
     raw_overall = payload.get("overall") if isinstance(payload.get("overall"), dict) else {}
     overall = {
@@ -272,57 +306,69 @@ def _public_latency(payload):
         "total_non_skipped_runs": _count(raw_cancel.get("total_non_skipped_runs")),
         "cancelled_rate_pct": _opt_float(raw_cancel.get("cancelled_rate_pct")),
     }
+    cohort = payload.get("cohort") or raw_overall.get("cohort")
+    if cohort not in {"success", "all_non_skipped", "failure", "cancelled"}:
+        cohort = None
+    wf_map = {}
     workflows = []
     for wf in payload.get("workflows") or []:
         if not isinstance(wf, dict) or not isinstance(wf.get("workflow"), str):
             continue
+        anon_repo = _anon_label(wf.get("repo"), repo_map, "repo")
+        anon_wf = _anon_label(f"{anon_repo or ''}//{wf.get('workflow')}", wf_map, "workflow")
         workflows.append({
-            "repo": _opt_str(wf.get("repo"), 64),
-            "workflow": _opt_str(wf.get("workflow"), 80),
+            "repo": anon_repo,
+            "workflow": anon_wf,
             "queue_wait": _sanitize_stat_block(wf.get("queue_wait")),
             "execution": _sanitize_stat_block(wf.get("execution")),
             "e2e": _sanitize_stat_block(wf.get("e2e")),
         })
+    gen_at = payload.get("generated_at")
     return {
         "ok": True,
-        "generated_at": _opt_str(payload.get("generated_at"), 48),
+        "generated_at": gen_at.strip()[:48] if isinstance(gen_at, str) and gen_at.strip() else None,
+        "cohort": cohort,
         "overall": overall,
         "cancellation": cancellation,
         "workflows": workflows[:15],
     }
 
 
-def _build_reconciliation(mac, linux, cmux, queue):
-    pools = [mac["fleet"], linux["fleet"]]
+def _build_reconciliation(mac, mac_ok, linux, linux_ok, cmux, queue):
+    pools = []
+    if mac_ok:
+        pools.append(mac["fleet"])
+    if linux_ok:
+        pools.append(linux["fleet"])
     if cmux.get("ok"):
         pools.append(cmux)
 
     def total_of(key):
         vals = [p.get(key) for p in pools if type(p.get(key)) is int]
-        return sum(vals) if vals else None
+        return sum(vals) if vals and len(vals) == len(pools) else None
 
     occupied = total_of("executing")
     idle = total_of("idle")
     cycling = total_of("cycling")
     down = total_of("down")
-    parked = (mac.get("parked_slots") or 0) + (linux.get("parked_slots") or 0)
+    parked = (
+        ((mac.get("parked_slots") or 0) if mac_ok else 0)
+        + ((linux.get("parked_slots") or 0) if linux_ok else 0)
+        if (mac_ok or linux_ok)
+        else None
+    )
     active_runs = queue.get("in_progress_runs")
     fresh = queue.get("fresh")
     ghosts = queue.get("ghosts")
-    fanout = (
-        round(occupied / active_runs, 2)
-        if isinstance(occupied, int) and isinstance(active_runs, int) and active_runs > 0
-        else None
-    )
 
     parts = []
     if isinstance(active_runs, int) and isinstance(occupied, int):
-        parts.append(f"{active_runs} active workflow runs fan out across {occupied} occupied job slots")
+        parts.append(f"{active_runs} active GitHub workflow runs | {occupied} occupied local runner slots")
     elif isinstance(occupied, int):
-        parts.append(f"{occupied} job slots actively executing")
+        parts.append(f"{occupied} local runner slots actively executing")
     if isinstance(down, int) and down > 0:
         parts.append(f"{down} down")
-    if parked > 0:
+    if isinstance(parked, int) and parked > 0:
         parts.append(f"{parked} parked")
     if isinstance(cycling, int) and cycling > 0:
         parts.append(f"{cycling} cycling")
@@ -338,7 +384,6 @@ def _build_reconciliation(mac, linux, cmux, queue):
         "parked_slots": parked,
         "fresh_queued_runs": fresh,
         "inert_ghosts": ghosts,
-        "fanout_ratio": fanout,
         "explanation": "; ".join(parts) + "." if parts else "Reconciliation unavailable.",
     }
 
@@ -350,12 +395,13 @@ def num_in(mapping, key):
 
 def build_snapshot(*, mac_payload, linux_payload, observed_at, published_at,
                    queue_payload=None, cmux_payload=None, latency_payload=None):
+    repo_map = {}
     mac, mac_ok = _public_host(mac_payload, "mac")
     linux, linux_ok = _public_host(linux_payload, "linux")
-    queue = _public_queue(queue_payload or {})
+    queue = _public_queue(queue_payload or {}, repo_map)
     cmux = _public_cmux(cmux_payload or {})
-    latency = _public_latency(latency_payload or {})
-    reconciliation = _build_reconciliation(mac, linux, cmux, queue)
+    latency = _public_latency(latency_payload or {}, repo_map)
+    reconciliation = _build_reconciliation(mac, mac_ok, linux, linux_ok, cmux, queue)
     # NOTE: `sources` deliberately stays the two-host trust contract. Queue, cmux, and
     # latency carry their own `ok` so an outage in one additive probe never blanks out
     # local host capacity.
