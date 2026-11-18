@@ -480,9 +480,9 @@
       const metrics = document.createElement('span');
       metrics.className = 'latency-wf-metrics';
       metrics.textContent =
-        `Q p50 ${formatDurationSeconds(wf.queue_wait?.p50_s)} / p90 ${formatDurationSeconds(wf.queue_wait?.p90_s)} | ` +
+        `Q avg ${formatDurationSeconds(wf.queue_wait?.avg_s)} / p50 ${formatDurationSeconds(wf.queue_wait?.p50_s)} / p90 ${formatDurationSeconds(wf.queue_wait?.p90_s)} / p99 ${formatDurationSeconds(wf.queue_wait?.p99_s)} | ` +
         `E avg ${formatDurationSeconds(wf.execution?.avg_s)} / p50 ${formatDurationSeconds(wf.execution?.p50_s)} / p90 ${formatDurationSeconds(wf.execution?.p90_s)} / p99 ${formatDurationSeconds(wf.execution?.p99_s)} | ` +
-        `E2E p50 ${formatDurationSeconds(wf.e2e?.p50_s)} / p90 ${formatDurationSeconds(wf.e2e?.p90_s)}`;
+        `E2E avg ${formatDurationSeconds(wf.e2e?.avg_s)} / p50 ${formatDurationSeconds(wf.e2e?.p50_s)} / p90 ${formatDurationSeconds(wf.e2e?.p90_s)} / p99 ${formatDurationSeconds(wf.e2e?.p99_s)}`;
       row.appendChild(name);
       row.appendChild(metrics);
       workflowsEl.appendChild(row);

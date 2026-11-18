@@ -491,6 +491,30 @@ class FleetLiveDashboardTest(unittest.TestCase):
 
         mod = load_module()
 
+        # Queue-only failure must NOT mislabel complete active_runs as partial
+        def fake_gh_ok(args, timeout=20):
+            joined = " ".join(args)
+            if "status=in_progress" in joined:
+                return {"total_count": 5, "workflow_runs": []}
+            raise RuntimeError("unexpected")
+
+        def fake_q_fail(repo, *, max_job_checks=None):
+            return {
+                "repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                "queued_total": None, "sample_capped": False,
+                "sampled_fresh": None, "sampled_ghosts": None, "error": "rate limited",
+            }
+
+        with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh_ok), \
+             mock.patch.object(mod.queue_probe, "probe_repo", side_effect=fake_q_fail):
+            q_only_snap = mod._collect_live_github_snapshot(repos=["org/only"])
+        q_only_rec = mod._normalize_reconciliation([], None, q_only_snap)
+        self.assertFalse(q_only_rec["active_runs_partial"])
+        self.assertTrue(q_only_rec["queue_partial"])
+        self.assertEqual(q_only_rec["repos_covered"], "1/1")
+        self.assertEqual(q_only_rec["q_repos_covered"], "0/1")
+
         def fake_gh(args, timeout=20):
             joined = " ".join(args)
             if "org/good" in joined and "status=in_progress" in joined:
@@ -505,12 +529,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     "queued_total": 5, "sample_capped": False,
                     "sampled_fresh": 2, "sampled_ghosts": 3, "error": None,
                 }
-            return {
-                "repo": repo, "ok": False, "fresh": None, "ghosts": None,
-                "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
-                "queued_total": None, "sample_capped": False,
-                "sampled_fresh": None, "sampled_ghosts": None, "error": "rate limited",
-            }
+            return fake_q_fail(repo)
 
         with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
              mock.patch.object(mod.queue_probe, "probe_repo", side_effect=fake_q):
@@ -521,6 +540,88 @@ class FleetLiveDashboardTest(unittest.TestCase):
         html = mod.render_html({"generated_at_utc": "2026-11-18T10:00:00Z", "hosts": [], "reconciliation": rec, "latency": {"ok": False, "cohorts": {}, "workflows": []}})
         self.assertIn("active_runs_partial", html)
         self.assertIn("remote-linux unprobed", html)
+
+    def test_macos_bsd_ps_native_runners_and_remote_linux_ssh_probe(self):
+        import subprocess
+        from unittest import mock
+
+        mod = load_module()
+        bsd_ps = (
+            " 1234    12:34 /Users/op/actions-runner/bin/Runner.Worker\n"
+            " 5678 1-02:03:04 /Users/op/actions-runner-macos-ci/bin/Runner.Listener\n"
+        )
+        with mock.patch.object(mod.platform, "system", return_value="Darwin"), \
+             mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ps"], 0, stdout=bsd_ps, stderr="")) as mrun:
+            native = mod._collect_local_native_runners()
+        self.assertIn("etime=", " ".join(mrun.call_args[0][0]))
+        by_name = {n["name"]: n for n in native}
+        self.assertEqual(by_name["actions-runner"]["state"], "EXECUTING")
+        self.assertEqual(by_name["actions-runner"]["elapsed_minutes"], 12.6)
+        self.assertEqual(by_name["actions-runner-macos-ci"]["state"], "IDLE")
+
+        remote_payload = {
+            "ok": True,
+            "configured_slots": 3,
+            "slots": [
+                {"slot": 1, "name": "ez-runner-c-1", "state": "EXECUTING", "elapsed_minutes": 4.5, "active_child_commands": ["pytest"]},
+                {"slot": 2, "name": "ez-runner-c-2", "state": "IDLE", "elapsed_minutes": None, "active_child_commands": []},
+                {"slot": 3, "name": "ez-runner-c-3", "state": "DOWN", "elapsed_minutes": None, "active_child_commands": [], "reason": "container missing"},
+            ],
+        }
+        with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 0, stdout=json.dumps(remote_payload), stderr="")):
+            remote = mod._collect_remote_linux_slot_payload("jeff-ubuntu")
+        self.assertEqual(remote["configured_slots"], 3)
+        self.assertEqual([s["state"] for s in remote["slots"]], ["EXECUTING", "IDLE", "DOWN"])
+
+    def test_concurrent_cold_error_does_not_return_200_null(self):
+        import time
+        import urllib.error
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            orig_build = mod.build_operator_state
+            calls = {"n": 0}
+            err_gate = threading.Event()
+
+            def flaky_build(**kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    err_gate.wait(timeout=2.0)
+                    raise RuntimeError("boom on cold #1")
+                time.sleep(0.25)
+                return orig_build(**kwargs)
+
+            with mock.patch.object(mod, "build_operator_state", side_effect=flaky_build):
+                server = mod.create_server(host="127.0.0.1", port=0, audit_dir=tmp, wait_timeout_s=2.0)
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    statuses = []
+                    def hit_first():
+                        try:
+                            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                                statuses.append((resp.status, resp.read().decode()))
+                        except urllib.error.HTTPError as e:
+                            statuses.append((e.code, None))
+                    t1 = threading.Thread(target=hit_first)
+                    t1.start()
+                    time.sleep(0.05)
+                    err_gate.set()
+                    t1.join(timeout=5)
+                    self.assertEqual(statuses, [(500, None)])
+                    # Subsequent retry succeeds with valid JSON object (never null)
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                        self.assertEqual(resp.status, 200)
+                        body = json.loads(resp.read().decode())
+                        self.assertIsInstance(body, dict)
+                finally:
+                    err_gate.set()
+                    server.shutdown()
+                    server.server_close()
 
     def test_slow_probe_cold_504_and_warm_stale_while_revalidate(self):
         import time

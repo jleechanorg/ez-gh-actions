@@ -75,6 +75,10 @@ def _extract_pr_info(repo, ref, branch=None):
 
 
 def _infer_phase_badge(cmds, state, reason=None):
+    for cmd in cmds or []:
+        matched = ci_latency_probe.classify_phase(str(cmd))
+        if matched:
+            return matched
     joined = " ".join(str(c) for c in (cmds or []))
     matched = ci_latency_probe.classify_phase(joined)
     if matched:
@@ -432,7 +436,10 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
     ip_jobs_by_repo = rec.get("in_progress_jobs_by_repo") or gh_summary.get("in_progress_jobs_by_repo") or {}
     q_runs_by_repo = rec.get("queued_runs_by_repo") or gh_summary.get("total_queued_runs_by_repo") or {}
     q_jobs_by_repo = rec.get("queued_jobs_by_repo") or gh_summary.get("queued_jobs_by_repo") or {}
-    wa_q = rec.get("worldarchitect_queued_breakdown") or {}
+    wa_q = rec.get("worldarchitect_queued_breakdown") or next(
+        (v for k, v in rec.items() if isinstance(k, str) and k.endswith("_queued_breakdown") and isinstance(v, dict)),
+        {},
+    )
 
     def _sum_ints(mapping):
         vals = [v for v in mapping.values() if isinstance(v, int) and not isinstance(v, bool)]
@@ -442,7 +449,14 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
     total_ip_jobs = _sum_ints(ip_jobs_by_repo) if ip_jobs_by_repo else gh_summary.get("total_in_progress_jobs_across_org")
     total_q_runs = _sum_ints(q_runs_by_repo) if q_runs_by_repo else None
     total_q_jobs = _sum_ints(q_jobs_by_repo) if q_jobs_by_repo else gh_summary.get("total_queued_jobs_across_org")
-    headlines = ((cmux_data or {}).get("why_worldarchitect_shows_few_in_progress_runs") or {}).get("headline_points") or []
+    headlines = next(
+        (
+            v.get("headline_points")
+            for k, v in (cmux_data or {}).items()
+            if isinstance(k, str) and k.endswith("_in_progress_runs") and isinstance(v, dict) and isinstance(v.get("headline_points"), list)
+        ),
+        None,
+    ) or ((cmux_data or {}).get("why_worldarchitect_shows_few_in_progress_runs") or {}).get("headline_points") or []
 
     fresh_q = wa_q.get("queued_runs_with_jobs")
     if fresh_q is None:
@@ -451,23 +465,39 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None):
     if ghost_q is None:
         ghost_q = gh_summary.get("inert_ghosts")
 
+    fresh_scope = None
+    if wa_q and isinstance(wa_q.get("total_queued_runs_api"), int) and isinstance(total_q_runs, int) and wa_q["total_queued_runs_api"] < total_q_runs:
+        fresh_scope = f"subset ({wa_q['total_queued_runs_api']} of {total_q_runs} queued runs)"
+
     gh_errors = (gh_data or {}).get("errors") or []
-    expected_repos = gh_summary.get("expected_repos")
-    succeeded_repos = gh_summary.get("succeeded_repos")
-    gh_partial = bool(gh_summary.get("partial") or gh_errors)
+    if "ip_partial" in gh_summary:
+        ip_partial = bool(gh_summary.get("ip_partial"))
+        ip_exp = gh_summary.get("ip_expected_repos")
+        ip_succ = gh_summary.get("ip_succeeded_repos")
+    else:
+        ip_exp = gh_summary.get("expected_repos")
+        ip_succ = gh_summary.get("succeeded_repos")
+        ip_partial = bool(gh_summary.get("partial") or gh_errors)
     repos_covered = (
-        f"{succeeded_repos}/{expected_repos}"
-        if isinstance(expected_repos, int) and isinstance(succeeded_repos, int)
+        f"{ip_succ}/{ip_exp}"
+        if isinstance(ip_exp, int) and isinstance(ip_succ, int)
         else None
     )
+    q_partial = bool(gh_summary.get("q_partial"))
+    q_exp = gh_summary.get("q_expected_repos")
+    q_succ = gh_summary.get("q_succeeded_repos")
+    q_repos_covered = f"{q_succ}/{q_exp}" if isinstance(q_exp, int) and isinstance(q_succ, int) else None
 
     return {
         "total_slots": total_slots,
         "state_counts": state_counts,
         "active_workflow_runs": total_ip_runs,
         "active_github_jobs": total_ip_jobs,
-        "active_runs_partial": gh_partial,
+        "active_runs_partial": ip_partial,
         "repos_covered": repos_covered,
+        "queue_partial": q_partial,
+        "q_repos_covered": q_repos_covered,
+        "fresh_queued_scope": fresh_scope,
         "scope_note": scope_note,
         "queued_runs_total": total_q_runs,
         "queued_jobs_total": total_q_jobs,
@@ -543,32 +573,61 @@ def _probe_local_service_status(is_mac):
         return "unknown"
 
 
+def _parse_ps_etime_minutes(raw):
+    """Parse BSD/POSIX `ps -o etime` (`[[dd-]hh:]mm:ss`) or integer seconds into minutes."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return round(int(text) / 60.0, 1)
+    days = 0
+    if "-" in text:
+        d_part, text = text.split("-", 1)
+        if not d_part.isdigit():
+            return None
+        days = int(d_part)
+    parts = text.split(":")
+    if not all(p.isdigit() for p in parts):
+        return None
+    if len(parts) == 2:
+        hours, mins, secs = 0, int(parts[0]), int(parts[1])
+    elif len(parts) == 3:
+        hours, mins, secs = int(parts[0]), int(parts[1]), int(parts[2])
+    else:
+        return None
+    total_s = (((days * 24) + hours) * 60 + mins) * 60 + secs
+    return round(total_s / 60.0, 1)
+
+
 def _collect_local_native_runners():
-    """Discover non-Docker native GitHub Actions runner processes running on macOS."""
+    """Discover non-Docker native GitHub Actions runner processes running on macOS/Linux."""
     native = []
+    is_mac = platform.system().lower() == "darwin"
+    cmd = ["ps", "-axo", "pid=,etime=,args="] if is_mac else ["ps", "-eo", "pid=,etimes=,args="]
     try:
-        proc = subprocess.run(["ps", "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=5)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
         if proc.returncode != 0:
             return native
         by_dir = {}
-        for line in proc.stdout.splitlines()[1:]:
+        for line in proc.stdout.splitlines():
             if "Runner.Listener" not in line and "Runner.Worker" not in line:
                 continue
-            parts = line.strip().split(None, 3)
-            if len(parts) < 4:
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
                 continue
-            cmd = parts[3]
-            if "/home/runner/" in cmd:
+            elapsed_raw, argv_str = parts[1], parts[2]
+            if "/home/runner/" in argv_str:
                 continue
-            m = re.search(r"(/[^\s]+?)/bin/Runner\.(?:Listener|Worker)", cmd)
+            m = re.search(r"(/[^\s]+?)/bin/Runner\.(?:Listener|Worker)", argv_str)
             root_dir = m.group(1) if m else "native-runner"
             name = Path(root_dir).name or "mac-native-runner"
             entry = by_dir.setdefault(name, {"name": name, "state": "IDLE", "elapsed_minutes": None, "active_child_commands": []})
             if "Runner.Worker" in line:
                 entry["state"] = "EXECUTING"
-                if parts[1].isdigit():
-                    entry["elapsed_minutes"] = round(int(parts[1]) / 60.0, 1)
-            entry["active_child_commands"].append(cmd[:160])
+                parsed_min = _parse_ps_etime_minutes(elapsed_raw)
+                if parsed_min is not None:
+                    entry["elapsed_minutes"] = parsed_min
+            entry["active_child_commands"].append(argv_str[:160])
         native = list(by_dir.values())
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -753,7 +812,9 @@ def _collect_live_github_snapshot(repos=None):
     total_fresh = 0
     total_ghosts = 0
     fresh_complete = True
-    failed_repos = set()
+    ip_failed_repos = set()
+    ip_capped = False
+    q_failed_repos = set()
     sample_notes = []
     errors = []
     for repo in target_repos:
@@ -764,6 +825,7 @@ def _collect_live_github_snapshot(repos=None):
             ip_count = (ip or {}).get("total_count") if isinstance((ip or {}).get("total_count"), int) else len(ip_runs)
             ip_runs_by_repo[short] = ip_count
             if len(ip_runs) > 10:
+                ip_capped = True
                 errors.append(f"{repo}: in-progress job attribution capped at 10 of {len(ip_runs)} runs")
             job_cnt = 0
             for run in ip_runs[:10]:
@@ -783,11 +845,15 @@ def _collect_live_github_snapshot(repos=None):
                             "html_url": j.get("html_url"),
                         })
             ip_jobs_by_repo[short] = job_cnt
+        except Exception as exc:
+            ip_failed_repos.add(repo)
+            errors.append(f"{repo}: in_progress probe failed: {str(exc)[:120]}")
 
+        try:
             q_probe = queue_probe.probe_repo(repo, max_job_checks=10)
             if not q_probe.get("ok"):
                 fresh_complete = False
-                failed_repos.add(repo)
+                q_failed_repos.add(repo)
                 if q_probe.get("error"):
                     errors.append(f"{repo}: {q_probe['error']}")
             else:
@@ -803,17 +869,20 @@ def _collect_live_github_snapshot(repos=None):
                     total_ghosts += q_probe.get("ghosts") or 0
         except Exception as exc:
             fresh_complete = False
-            failed_repos.add(repo)
-            errors.append(f"{repo}: {str(exc)[:120]}")
-            continue
+            q_failed_repos.add(repo)
+            errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
     return {
         "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "all_in_progress_jobs": all_ip_jobs,
         "errors": errors,
         "summary": {
-            "partial": bool(errors or failed_repos),
-            "expected_repos": len(target_repos),
-            "succeeded_repos": len(target_repos) - len(failed_repos),
+            "partial": bool(errors or ip_failed_repos or q_failed_repos),
+            "ip_partial": bool(ip_failed_repos or ip_capped),
+            "ip_expected_repos": len(target_repos),
+            "ip_succeeded_repos": len(target_repos) - len(ip_failed_repos),
+            "q_partial": bool(q_failed_repos),
+            "q_expected_repos": len(target_repos),
+            "q_succeeded_repos": len(target_repos) - len(q_failed_repos),
             "total_in_progress_runs_by_repo": ip_runs_by_repo,
             "in_progress_jobs_by_repo": ip_jobs_by_repo,
             "total_queued_runs_by_repo": q_runs_by_repo,
@@ -839,33 +908,85 @@ def _cached_live_latency(repos):
     return data
 
 
+_REMOTE_PROBE_PY = r"""
+import json, pathlib, subprocess
+cfg_path = pathlib.Path.home() / ".config" / "ezgha" / "config.toml"
+count = None
+prefix = None
+if cfg_path.is_file():
+    sec = None
+    for raw in cfg_path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line: continue
+        if line.startswith("[") and line.endswith("]"): sec = line[1:-1].strip(); continue
+        if "=" not in line: continue
+        k, v = [x.strip() for x in line.split("=", 1)]
+        if sec == "runner" and k == "count" and v.isdigit(): count = int(v)
+        elif sec == "runner" and k == "name_prefix": prefix = v.strip().strip('"').strip("'")
+ps = subprocess.run(["docker", "ps", "-a", "--filter", "label=ezgha=managed", "--format", "{{.Names}}\t{{.Status}}"], capture_output=True, text=True, timeout=10)
+if ps.returncode != 0:
+    print(json.dumps({"ok": False}))
+    raise SystemExit(0)
+obs = {}
+order = []
+for line in ps.stdout.splitlines():
+    if not line.strip(): continue
+    parts = line.split("\t", 1)
+    cname = parts[0].strip()
+    cstatus = parts[1].strip() if len(parts) > 1 else ""
+    st = "DOWN"; cmds = []; el = None; reason = None
+    if cstatus.lower().startswith("up"):
+        top = subprocess.run(["docker", "top", cname, "-eo", "pid,etimes,comm,args"], capture_output=True, text=True, timeout=10)
+        if top.returncode == 0:
+            hw = hl = False
+            for tl in top.stdout.splitlines()[1:]:
+                tp = tl.strip().split(None, 3)
+                if len(tp) < 3: continue
+                if "Runner.Worker" in tl:
+                    hw = True
+                    if tp[1].isdigit(): el = round(int(tp[1]) / 60.0, 1)
+                elif "Runner.Listener" in tl:
+                    hl = True
+                cmds.append(tp[3] if len(tp) == 4 else tp[2])
+            st = "EXECUTING" if hw else ("IDLE" if hl else "CYCLING")
+        else:
+            st = "UNKNOWN"; reason = "docker top probe failed"
+    else:
+        reason = cstatus or "container not running"
+    order.append(cname)
+    obs[cname] = {"name": cname, "state": st, "elapsed_minutes": el, "active_child_commands": cmds, "reason": reason}
+slots = []
+if count and prefix:
+    exp = [f"{prefix}-{i}" for i in range(1, count + 1)]
+    for i, cname in enumerate(exp, 1):
+        slots.append({"slot": i, **(obs[cname] if cname in obs else {"name": cname, "state": "DOWN", "elapsed_minutes": None, "active_child_commands": [], "reason": "container missing"})})
+    for cname in order:
+        if cname not in exp: slots.append({"slot": len(slots) + 1, **obs[cname]})
+else:
+    for i, cname in enumerate(order, 1): slots.append({"slot": i, **obs[cname]})
+print(json.dumps({"ok": True, "configured_slots": count if count is not None else len(slots), "slots": slots}))
+"""
+
+
 def _collect_remote_linux_slot_payload(ssh_host):
     if not ssh_host:
         return None
     try:
         proc = subprocess.run(
-            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_host,
-             "python3", "-", ],
-            input=(
-                "import json, subprocess; "
-                "p = subprocess.run(['docker', 'ps', '-a', '--filter', 'label=ezgha=managed', '--format', '{{.Names}}\\t{{.Status}}'], capture_output=True, text=True); "
-                "slots = [{'slot': i, 'name': l.split('\\t')[0], 'state': 'UP_UNKNOWN' if 'up' in l.lower() else 'DOWN'} for i, l in enumerate(p.stdout.splitlines(), 1) if l.strip()]; "
-                "print(json.dumps({'slots': slots, 'ok': p.returncode == 0}))"
-            ),
-            capture_output=True, text=True, timeout=15,
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", ssh_host, "python3", "-"],
+            input=_REMOTE_PROBE_PY,
+            capture_output=True, text=True, timeout=25,
         )
         if proc.returncode == 0:
             raw = json.loads(proc.stdout)
             if raw.get("ok"):
+                slots = raw.get("slots") or []
                 return {
                     "display_name": f"{ssh_host} (Remote Linux Host)",
                     "group": "jeff-ubuntu",
                     "admission_status": "ssh_probed",
-                    "configured_slots": len(raw.get("slots") or []),
-                    "slots": [
-                        {**s, "state": "UNKNOWN" if s.get("state") == "UP_UNKNOWN" else s.get("state")}
-                        for s in (raw.get("slots") or [])
-                    ],
+                    "configured_slots": raw.get("configured_slots") or len(slots),
+                    "slots": slots,
                 }
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
         pass
@@ -1216,12 +1337,18 @@ def render_html(state, *, auto_refresh_ms=0):
       const idleSub = (sc.IDLE || 0) + ' idle slot(s) across hosts';
       const qSub = rec.queued_sample_note
         ? rec.queued_sample_note
-        : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined
-            ? 'Total queued runs: ' + rec.queued_runs_total
-            : 'Queue breakdown unavailable');
+        : (rec.queue_partial
+            ? 'Partial queue coverage (' + (rec.q_repos_covered || 'some repos failed') + ')'
+            : (rec.fresh_queued_scope
+                ? 'Scope: ' + rec.fresh_queued_scope
+                : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined
+                    ? 'Total queued runs: ' + rec.queued_runs_total
+                    : 'Queue breakdown unavailable')));
       const qVal = rec.fresh_queued_runs !== null && rec.fresh_queued_runs !== undefined
         ? rec.fresh_queued_runs + ' / ' + (rec.inert_ghosts ?? '—')
-        : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined ? rec.queued_runs_total + ' runs (sample only)' : '— / —');
+        : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined
+            ? rec.queued_runs_total + (rec.queued_sample_note ? ' runs (sample only)' : ' runs (no ghost split)')
+            : '— / —');
       const partialTag = rec.active_runs_partial ? ' (partial' + (rec.repos_covered ? ': ' + rec.repos_covered + ' repos' : '') + ')' : '';
       const activeRunsVal = rec.active_workflow_runs !== null && rec.active_workflow_runs !== undefined
         ? rec.active_workflow_runs + (rec.active_runs_partial ? '*' : '')
@@ -1236,7 +1363,7 @@ def render_html(state, *, auto_refresh_ms=0):
         ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I', idleSub],
         ['Down / Offline / Unknown', (sc.DOWN || 0) + 'D / ' + (sc.OFFLINE || 0) + 'O / ' + (sc.UNKNOWN || 0) + 'U', downSub],
         ['Parked (Mac)', sc.PARKED || 0, 'Intentionally disabled'],
-        ['Queued (Fresh / Ghosts)', qVal, qSub],
+        ['Queued (Fresh / Ghosts)' + (rec.queue_partial ? ' (Partial)' : ''), qVal, qSub],
       ];
       document.getElementById('reconcile-kpis').innerHTML = cards.map(([k, v, sub]) =>
         `<div class="kpi"><div class="kpi-label">${{esc(k)}}</div><div class="kpi-val">${{esc(v)}}</div><div class="kpi-sub">${{esc(sub)}}</div></div>`
@@ -1275,7 +1402,7 @@ def render_html(state, *, auto_refresh_ms=0):
         ['Job Execution (' + currentCohort + ')', `p50 ${{fmtSec(e.p50_s)}} | p90 ${{fmtSec(e.p90_s)}}`, `avg ${{fmtSec(e.avg_s)}} · p99 ${{fmtSec(e.p99_s)}} · n=${{e.n ?? 0}}`],
         ['Total Job Wall', `p50 ${{fmtSec(jt.p50_s)}} | p90 ${{fmtSec(jt.p90_s)}}`, `avg ${{fmtSec(jt.avg_s)}} · p99 ${{fmtSec(jt.p99_s)}}`],
         ['E2E Run Wall', `p50 ${{fmtSec(e2e.p50_s)}} | p90 ${{fmtSec(e2e.p90_s)}}`, `avg ${{fmtSec(e2e.avg_s)}} · p99 ${{fmtSec(e2e.p99_s)}} · n=${{e2e.n ?? 0}}`],
-        ['Cancelled Waste', `${{cancel.cancelled_rate_pct ?? '—'}}%`, `${{cancel.cancelled_runs ?? 0}} / ${{cancel.total_non_skipped_runs ?? 0}} non-skipped runs`],
+        ['Cancelled Waste', cancel.cancelled_rate_pct !== null && cancel.cancelled_rate_pct !== undefined ? `${{cancel.cancelled_rate_pct}}%` : '—', `${{cancel.cancelled_runs ?? 0}} / ${{cancel.total_non_skipped_runs ?? 0}} non-skipped runs`],
       ];
       document.getElementById('latency-kpis').innerHTML = cards.map(([k, v, sub]) =>
         `<div class="kpi"><div class="kpi-label">${{esc(k)}}</div><div class="kpi-val" style="font-size:1.15rem">${{esc(v)}}</div><div class="kpi-sub">${{esc(sub)}}</div></div>`
@@ -1501,12 +1628,11 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
     effective_ttl_s = cache_ttl_s if cache_ttl_s is not None else (15.0 if is_fixture else 120.0)
 
     cache_lock = threading.Lock()
-    cache_state = {"ts": 0.0, "data": None, "building": None, "last_error": None}
+    cache_state = {"ts": 0.0, "data": None, "building": None}
 
     def _spawn_refresh_locked():
-        ev = threading.Event()
-        cache_state["building"] = ev
-        cache_state["last_error"] = None
+        box = {"event": threading.Event(), "data": None, "error": None}
+        cache_state["building"] = box
 
         def _worker():
             try:
@@ -1520,20 +1646,22 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                     linux_host=linux_host,
                     cmux_cmd=cmux_cmd,
                 )
+                box["data"] = fresh
                 with cache_lock:
                     cache_state["data"] = fresh
                     cache_state["ts"] = time.monotonic()
-                    cache_state["last_error"] = None
-                    cache_state["building"] = None
-                    ev.set()
+                    if cache_state["building"] is box:
+                        cache_state["building"] = None
             except Exception as exc:
+                box["error"] = exc
                 with cache_lock:
-                    cache_state["last_error"] = exc
-                    cache_state["building"] = None
-                    ev.set()
+                    if cache_state["building"] is box:
+                        cache_state["building"] = None
+            finally:
+                box["event"].set()
 
         threading.Thread(target=_worker, daemon=True).start()
-        return ev
+        return box
 
     def load_state():
         with cache_lock:
@@ -1543,13 +1671,12 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                 if (now - cache_state["ts"]) >= effective_ttl_s and cache_state["building"] is None:
                     _spawn_refresh_locked()
                 return cached
-            ev = cache_state["building"] or _spawn_refresh_locked()
-        if not ev.wait(timeout=wait_timeout_s):
+            box = cache_state["building"] or _spawn_refresh_locked()
+        if not box["event"].wait(timeout=wait_timeout_s):
             raise TimeoutError("Timed out waiting for initial operator state")
-        with cache_lock:
-            if cache_state["last_error"] is not None:
-                raise cache_state["last_error"]
-            return cache_state["data"]
+        if box["error"] is not None:
+            raise box["error"]
+        return box["data"]
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):

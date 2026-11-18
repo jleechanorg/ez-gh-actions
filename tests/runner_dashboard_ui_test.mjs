@@ -382,9 +382,9 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
     workflows: [
       {
         workflow: 'Self-Hosted MVP Shards',
-        queue_wait: { n: 32, p50_s: 323, p90_s: 637 },
+        queue_wait: { n: 32, avg_s: 339, p50_s: 323, p90_s: 637, p99_s: 900 },
         execution: { n: 32, avg_s: 413, p50_s: 32.5, p90_s: 1639, p99_s: 2050 },
-        e2e: { n: 32, p50_s: 500, p90_s: 1900 },
+        e2e: { n: 32, avg_s: 752, p50_s: 500, p90_s: 1900, p99_s: 2500 },
       },
     ],
   };
@@ -398,6 +398,9 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   assert.ok(elements.get('linux-slots').children.length >= 2);
   assert.ok(elements.get('cmux-slots').children.length >= 1);
   assert.ok(elements.get('latency-workflows').children.length >= 1);
+  const wfMetricsText = elements.get('latency-workflows').children[0].children[1].textContent;
+  assert.match(wfMetricsText, /Q avg 5m 39s.*p99 15m/);
+  assert.match(wfMetricsText, /E2E avg 12m 32s.*p99 41m 40s/);
 
   // Honest skipped-probe provenance on parked host still classifies as degraded (parked), never stale,
   // and an unavailable host displays UNAVAILABLE badge rather than ONLINE.

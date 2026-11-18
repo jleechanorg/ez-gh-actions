@@ -79,6 +79,13 @@ def _command_head_string(command_text):
         "--config", "--cwd", "--grep", "--output", "--filter",
         "--loader", "--import", "--require", "--eval",
     }
+    non_phase_commands = {
+        "cat", "less", "more", "head", "tail", "vim", "vi", "nano",
+        "grep", "rg", "ls", "stat", "wc", "rm", "cp", "mv", "echo",
+        "printf", "touch", "mkdir",
+    }
+    interpreters = {"node", "nodejs", "npx", "python", "python3", "python2", "uv"}
+    ignored_exts = (".log", ".txt", ".json", ".xml", ".zip", ".md", ".ini", ".cfg", ".yml", ".yaml")
     for tok in tokens:
         if skip_next:
             skip_next = False
@@ -90,13 +97,21 @@ def _command_head_string(command_text):
             continue
         low = tok.lower()
         base = Path(low).name if "/" in low else low
+        if not head_tokens and base in non_phase_commands:
+            return ""
         if "tarball" in low and head_tokens[:2] == ["gh", "api"]:
             head_tokens.append("tarball")
             break
+        if base.endswith(ignored_exts) or base.endswith(".config.js"):
+            continue
         if "/" in low and head_tokens:
-            # Allow action runtime paths (/_actions/actions/setup-python/...) but ignore data/log files
             if "/_actions/" in low and "setup-python" in low:
                 head_tokens.append("setup-python")
+                continue
+            if head_tokens[0] in interpreters:
+                head_tokens.append(base)
+                if len(head_tokens) >= 3:
+                    break
             continue
         if "setup-python" in low and not head_tokens:
             head_tokens.append("setup-python")
