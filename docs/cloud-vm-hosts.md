@@ -342,17 +342,18 @@ that file (which is why the value now has to be maintained deliberately rather t
 DHCP), and any operation that tries to rewrite it will fail while the flag is set. Remove
 the flag with `chattr -i` if the host's own networking needs to take the file back.
 
-Evidence, 2026-11-17: four `worldarchitect.ai` jobs stalled for ~5 minutes and were
-cancelled — `ez-runner-c-9`, `ez-runner-c-20` (hung on `Download action repository
-'jleechanorg/worldai_frontend@…'`), `ez-runner-c-17` (hung in `git fetch --depth=1`) and
-`ez-runner-c-11` (fetch took 4 m 49 s, then completed). Those runners are the
-**jeff-ubuntu** fleet, not these VMs, and that host's containers get a single
-`nameserver 192.168.254.254` with no fallback (`docker inspect … HostConfig.Dns` = null).
-Current probes there are healthy (20-way concurrent lookups 113–264 ms; a
-`codeload.github.com` tarball in 12.3 s, HTTP 200), so the Nov-17 stalls are **not yet
-attributed** to this resolver defect: treat them as an open, separate signature until
-job-log timing or egress probes prove otherwise, and apply the same
-`dns`/`dns_opts` opt-in there if they do.
+Evidence, 2026-11-17/18 (verified read-only, Hermes): several `worldarchitect.ai` jobs on
+`ez-runner-c-10/17/18/20` ran 4.5–5.5 minutes and were cancelled — e.g. `ez-runner-c-10`
+`import-validation` 23:33:47Z→23:39:04Z, `ez-runner-c-17` `import-validation`
+23:27:11Z→23:31:54Z, `ez-runner-c-18` `Directory tests (core-tests)` 23:27:11Z→23:31:46Z.
+Those runners are the **jeff-ubuntu** leg, not these VMs, and that host's containers get a
+single `nameserver 192.168.254.254` plus a `search` line with no fallback (verified:
+`docker exec … cat /etc/resolv.conf`; `docker inspect … HostConfig.Dns` unset).
+Attribution is **not proven**: probes from inside `ez-runner-c-1` at 2026-11-18T02:00Z were
+healthy — 20-way concurrent lookups 657–838 ms (wall 842 ms) and a
+`codeload.github.com` tarball at 4.5 s and 11.8 s on two samples, both HTTP 200. Treat the
+Nov-17 stalls as an open, separate signature until job-log timing or egress probes prove
+otherwise, and apply the same `dns`/`dns_opts` opt-in there if they do.
 
 ### `dockerd` caches NCPU
 
