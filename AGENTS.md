@@ -220,9 +220,36 @@ for installer compatibility. SMS remains restricted to the separately governed s
 the TestFlight monitor's three-consecutive-automatic-push-failure exception. Do not add an SMS
 channel to fleet, disk, queue, TEST, or API-blind operational diagnostics.
 
-Apply the policies (idempotent) with `./scripts/ezgha-host-health-alert.sh --ensure-policies`.
+Apply the policies (idempotent) with `OPERATOR-ONLY: ./scripts/ezgha-host-health-alert.sh --ensure-policies`.
 Audit a verdict without touching GCP using `--dry-run` plus the `HEALTH_ALERT_*` env overrides
 documented in the script header.
+
+### GitHub Actions cost & hosted-macOS alert (`org.jleechanorg.ezgha-gh-actions-cost-alert`)
+`scripts/gh-actions-cost-alert.sh` runs hourly (`StartInterval=3600`) via
+`launchd/org.jleechanorg.ezgha-gh-actions-cost-alert.plist.template`, querying
+`orgs/${ALERT_ORG}/settings/billing/usage?year=YYYY&month=MM` across both yesterday UTC and
+today UTC for `product=="actions"`. It evaluates gross spend (`DAILY_GROSS_WARN_USD=25`,
+`MTD_GROSS_WARN_USD=250`), hosted macOS minutes (`DAILY_MACOS_MIN_WARN=60`), and net billed spend
+(`DAILY_NET_WARN_USD=10`, `MTD_NET_WARN_USD=40`), routing `jsonPayload.source="gh-actions-cost-alert"`
+to the dedicated Slack-only policy `[CRITICAL] GitHub Actions cost or hosted macOS spike` (never
+`cause=fleet`). It intentionally ignores `~/.config/ezgha/gh_token` (GitHub App `4245332` lacks
+`organization_administration=read`) and uses `GH_BILLING_TOKEN` or user `gh` keyring auth, with a
+`rate_limit` pre-check (`< 50` remaining skips and counts toward `BLIND`).
+- **Recovery / setup (OPERATOR-ONLY):**
+  - `OPERATOR-ONLY: ./scripts/gh-actions-cost-alert.sh --ensure-gcp-policy` (creates/updates the dedicated Slack policy)
+  - `OPERATOR-ONLY: ./launchd/install-launchagents.sh install org.jleechanorg.ezgha-gh-actions-cost-alert`
+  - Inspect `/tmp/ezgha-gh-actions-cost-alert.log` and `~/.local/state/ezgha/gh-actions-cost-alert.json` if `BLIND` fires (check `gh auth status` and `gh api rate_limit`).
+
+### Native macOS CI runner (`mac-native-ci-1`, label `self-hosted-native-macos`)
+`scripts/setup-native-macos-runner.sh` idempotently provisions an org-scoped native Darwin ARM64
+runner (`mac-native-ci-1`) at `/Users/jleechan/actions-runner-macos-ci` with work directory on
+Scratch (`native-macos-ci-work`), `--no-default-labels --labels self-hosted-native-macos` (forbidding
+bare `self-hosted` and `worldai-testflight-native-mac`), and LaunchAgent
+`org.jleechanorg.ezgha-native-macos-runner.plist` (without `SessionCreate=false`, keeping it isolated
+from the TestFlight signing keychain at `/Users/jleechan/actions-runner`).
+- **Recovery / setup (OPERATOR-ONLY):**
+  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh` (install/re-register + load LaunchAgent)
+  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh --verify` (check `.runner`, work dir, and launchd state)
 
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**:

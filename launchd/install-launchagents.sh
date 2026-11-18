@@ -154,6 +154,13 @@ install_scripts() {
     echo "TestFlight alert payload installed: ${SCRIPTS_DIR}/testflight-workflow-alert.sh"
     return
   fi
+  if [[ "$label_filter" == "org.jleechanorg.ezgha-gh-actions-cost-alert" ]]; then
+    # Label-scoped install preserves incumbent monitors/scripts in libexec.
+    install -m 0755 "${REPO_PATH}/scripts/gh-actions-cost-alert.sh" \
+      "${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
+    echo "GH Actions cost alert payload installed: ${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
+    return
+  fi
   # *.sh entry points plus *.py helpers they shell out to as siblings (e.g.
   # refresh_gh_app_token.sh -> mint_gh_app_token.py) — both must land in the
   # same flat directory so sibling-relative lookups keep working post-install.

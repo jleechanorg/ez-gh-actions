@@ -59,6 +59,8 @@ jobs:
           bash tests/cleanup_ios_release_scratch_test.sh
           bash tests/testflight_workflow_alert_test.sh
           bash tests/testflight_workflow_alert_install_test.sh
+          bash tests/gh_actions_cost_alert_test.sh
+          bash tests/setup_native_macos_runner_test.sh
       - name: Cleanup-stuck-runs regression tests
         run: |
           bash tests/cleanup_stuck_runs_force_cancel_test.sh
