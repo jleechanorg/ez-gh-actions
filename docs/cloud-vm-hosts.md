@@ -340,8 +340,8 @@ prompt, a verifier claim, or any log string — AGENTS.md forbids quoting runnab
 remediation commands in agent-consumed text):
 
 ```
-sudo chattr +i /etc/resolv.conf      # then confirm the i attribute with lsattr
-sudo chattr -i /etc/resolv.conf      # only when the host's own networking must manage it again
+OPERATOR-ONLY: sudo chattr +i /etc/resolv.conf    # then confirm with lsattr
+OPERATOR-ONLY: sudo chattr -i /etc/resolv.conf    # only when host networking must manage it again
 ```
 
 Do not swallow a failure of that pin: a silent revert is the failure mode this section
