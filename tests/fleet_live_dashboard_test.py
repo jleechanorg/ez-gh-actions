@@ -996,6 +996,30 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertIn("github fixture missing or unreadable", " ".join(perm_state["reconciliation"]["gh_errors"]))
             self.assertFalse(perm_state["latency"]["ok"])
 
+            audit_dir_perm = tmp / "audit_perm"
+            audit_dir_perm.mkdir()
+            fixture_audit_dir(audit_dir_perm)
+            srv_audit_perm = mod.create_server(port=0, audit_dir=audit_dir_perm)
+            try:
+                import threading
+                import urllib.request
+                port_ap = srv_audit_perm.server_address[1]
+                t_ap = threading.Thread(target=srv_audit_perm.serve_forever, daemon=True)
+                t_ap.start()
+                with mock.patch.object(mod.Path, "is_file", side_effect=PermissionError("denied")), \
+                     mock.patch.object(mod, "_collect_local_host_slots", side_effect=AssertionError("must not probe local host")), \
+                     mock.patch.object(mod, "_collect_live_cmux", side_effect=AssertionError("must not probe cmux")), \
+                     mock.patch.object(mod, "_collect_live_github_snapshot", side_effect=AssertionError("must not poll GH")), \
+                     mock.patch.object(mod, "_cached_live_latency", side_effect=AssertionError("must not poll latency")):
+                    html_ap = urllib.request.urlopen(f"http://127.0.0.1:{port_ap}/", timeout=5).read().decode("utf-8")
+                    self.assertIn("AUDIT SNAPSHOT", html_ap)
+                    api_ap = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port_ap}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertEqual(api_ap["source_mode"], "AUDIT SNAPSHOT")
+                    self.assertFalse(api_ap["latency"]["ok"])
+            finally:
+                srv_audit_perm.shutdown()
+                srv_audit_perm.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

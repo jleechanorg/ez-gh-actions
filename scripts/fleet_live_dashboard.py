@@ -1043,9 +1043,14 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
                          latency_json=None, repos=None, linux_host=None, cmux_cmd=None):
     base = Path(audit_dir) if audit_dir else None
     hosts_data = _load_json(hosts_json or (base / "ubuntu_mac_slots.json" if base else None))
-    cmux_data = _load_json(
-        cmux_json
-        or (base / "cmux_and_github_reconciliation.json" if base and (base / "cmux_and_github_reconciliation.json").is_file() else (base / "cmux_parsed.json" if base else None))
+    cmux_data = (
+        _load_json(cmux_json)
+        if cmux_json is not None
+        else (
+            (_load_json(base / "cmux_and_github_reconciliation.json") or _load_json(base / "cmux_parsed.json"))
+            if base
+            else None
+        )
     )
     gh_data = _load_json(github_json or (base / "github_live_snapshot.json" if base else None))
     latency_raw = _load_json(latency_json or (base / "ci_latency_percentiles.json" if base else None))
