@@ -13,7 +13,7 @@ set -euo pipefail
 RUNNER_ORG="${RUNNER_ORG:-${GITHUB_ORG:-jleechanorg}}"
 GITHUB_ORG="$RUNNER_ORG"
 RUNNER_REPO="${RUNNER_REPO:-}"
-RUNNER_NAME="${RUNNER_NAME:-mac-native-ci-1}"
+RUNNER_NAME="${NATIVE_MACOS_RUNNER_NAME:-mac-native-ci-1}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner-macos-ci}"
 EXISTING_RUNNER_DIR="${EXISTING_RUNNER_DIR:-$HOME/actions-runner}"
 LABELS="${LABELS:-${RUNNER_LABELS:-self-hosted-native-macos}}"

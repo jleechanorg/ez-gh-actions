@@ -275,7 +275,63 @@ if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/disk
     "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
   fail "--verify must reject missing SessionCreate"
 fi
+cp "$TMP/plist.ok" "$PLIST_T"
 pass "reconfiguration, .ezgha-labels, live gh label verification, and SessionCreate=true enforcement pass"
+
+# 4b. Ambient GitHub Actions RUNNER_NAME must NOT override default mac-native-ci-1 in --dry-run or --verify,
+#     while NATIVE_MACOS_RUNNER_NAME and --name DO override it.
+ambient_dry_out="$(
+  GITHUB_ACTIONS=true \
+  RUNNER_NAME="GitHub Actions 1000690174" \
+  HOME="$TMP/home" \
+  PATH="$TMP/bin:$PATH" \
+  DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" \
+  SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --dry-run
+)"
+grep -q '^RUNNER_NAME=mac-native-ci-1$' <<<"$ambient_dry_out" || \
+  fail "ambient RUNNER_NAME must not override default mac-native-ci-1 in --dry-run"
+grep -q -- '--name mac-native-ci-1' <<<"$ambient_dry_out" || \
+  fail "ambient RUNNER_NAME must not override --name mac-native-ci-1 in CONFIG_CMD"
+
+GITHUB_ACTIONS=true RUNNER_NAME="GitHub Actions 1000690174" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --verify --offline >/dev/null || \
+  fail "ambient RUNNER_NAME must not break --verify for mac-native-ci-1"
+
+env_override_dry_out="$(
+  GITHUB_ACTIONS=true \
+  RUNNER_NAME="GitHub Actions 1000690174" \
+  NATIVE_MACOS_RUNNER_NAME="custom-mac-1" \
+  HOME="$TMP/home" \
+  PATH="$TMP/bin:$PATH" \
+  DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" \
+  SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --dry-run
+)"
+grep -q '^RUNNER_NAME=custom-mac-1$' <<<"$env_override_dry_out" || \
+  fail "NATIVE_MACOS_RUNNER_NAME must override default runner name in --dry-run"
+grep -q -- '--name custom-mac-1' <<<"$env_override_dry_out" || \
+  fail "NATIVE_MACOS_RUNNER_NAME must override --name in CONFIG_CMD"
+
+cli_override_dry_out="$(
+  GITHUB_ACTIONS=true \
+  RUNNER_NAME="GitHub Actions 1000690174" \
+  NATIVE_MACOS_RUNNER_NAME="custom-mac-1" \
+  HOME="$TMP/home" \
+  PATH="$TMP/bin:$PATH" \
+  DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" \
+  SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --dry-run --name custom-mac-2
+)"
+grep -q '^RUNNER_NAME=custom-mac-2$' <<<"$cli_override_dry_out" || \
+  fail "--name must override NATIVE_MACOS_RUNNER_NAME and default in --dry-run"
+grep -q -- '--name custom-mac-2' <<<"$cli_override_dry_out" || \
+  fail "--name must override --name in CONFIG_CMD"
+pass "ambient GitHub Actions RUNNER_NAME is ignored while NATIVE_MACOS_RUNNER_NAME and --name override cleanly"
 
 # 5. Label-scoped launchd install of org.jleechanorg.ezgha-gh-actions-cost-alert in isolated temp HOME
 #    must preserve incumbent scripts and render a valid hourly plist.
