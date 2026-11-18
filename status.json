@@ -7,10 +7,10 @@
       "fleet": {
         "configured": 20,
         "cycling": 0,
-        "down": 8,
-        "executing": 7,
-        "idle": 5,
-        "reserved": 7
+        "down": 0,
+        "executing": 1,
+        "idle": 19,
+        "reserved": 20
       },
       "sources": {
         "config": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-18T18:47:14Z",
-  "published_at": "2026-11-18T18:48:18Z",
+  "observed_at": "2026-11-18T19:00:20Z",
+  "published_at": "2026-11-18T19:00:53Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
