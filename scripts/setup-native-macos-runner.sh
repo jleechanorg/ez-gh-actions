@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # setup-native-macos-runner.sh — Idempotent setup & verifier for a general-CI
-# native macOS GitHub Actions runner (`mac-native-ci-1`) isolated from the
-# TestFlight signing runner (`/Users/jleechan/actions-runner`) and from Linux
-# `self-hosted` jobs.
+# native macOS GitHub Actions runner (`mac-native-ci-1`). Isolates job labels
+# (`self-hosted-native-macos`), runner/Scratch `_work` directories, and launchd
+# security audit session (`SessionCreate=true`) from the TestFlight signing
+# runner (`/Users/jleechan/actions-runner`) and Linux `self-hosted` jobs, while
+# sharing the operator's macOS user account (`$HOME`); public-repo workflows
+# targeting `self-hosted-native-macos` must gate out untrusted fork PRs.
 #
 # Usage:
 #   setup-native-macos-runner.sh [--dry-run] [--verify] [--uninstall]
@@ -154,12 +157,29 @@ home_real = Path(os.path.realpath(home_raw))
 if str(target_real) == "/" or target_real == home_real or same_fs(target_real, home_real) or same_fs(target_abs, home_real):
     sys.exit(0)
 
+t_cf = os.path.normpath(str(target_abs)).casefold()
+tr_cf = os.path.normpath(str(target_real)).casefold()
+home_cf = os.path.normpath(str(home_real)).casefold()
+home_abs_cf = os.path.normpath(os.path.abspath(home_raw)).casefold()
+
+for x in (t_cf, tr_cf):
+    if x == "/" or x == home_cf or x == home_abs_cf:
+        sys.exit(0)
+
 for res_raw in reserved_raws:
     if not res_raw:
         continue
     res_real = Path(os.path.realpath(res_raw))
     if target_real == res_real or res_real in target_real.parents or target_real in res_real.parents:
         sys.exit(0)
+    res_cf = os.path.normpath(str(res_real)).casefold()
+    res_abs_cf = os.path.normpath(os.path.abspath(res_raw)).casefold()
+    for x in (t_cf, tr_cf):
+        for r in (res_cf, res_abs_cf):
+            if not r or r == "/":
+                continue
+            if x == r or x.startswith(r + "/") or r.startswith(x + "/"):
+                sys.exit(0)
     for anc in list(existing_ancestors(target_abs)) + list(existing_ancestors(target_real)):
         if same_fs(anc, res_real):
             sys.exit(0)
@@ -294,7 +314,9 @@ render_plist() {
   home_xml="$(xml_escape "$HOME")"
   path_xml="$(xml_escape "${HOME}/.local/bin:${HOME}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
   # SessionCreate=true spawns a new security audit session detached from the
-  # GUI login keychain session used by worldai-testflight-native-mac.
+  # GUI login keychain session used by worldai-testflight-native-mac, while
+  # still sharing the operator's macOS user account ($HOME); public-repo
+  # workflows targeting self-hosted-native-macos must gate out untrusted fork PRs.
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -373,9 +395,12 @@ if os.path.realpath(wd) != runner_real:
     sys.exit(1)
 
 prog = data.get("ProgramArguments")
-expected_run = os.path.realpath(os.path.join(runner_real, "run.sh"))
-if not isinstance(prog, list) or len(prog) < 2 or prog[0] != "/bin/bash" or os.path.realpath(prog[1]) != expected_run:
-    print(f"FAIL: {plist_path} ProgramArguments={prog!r} must target ['/bin/bash', '{runner_dir}/run.sh']", file=sys.stderr)
+expected_runs = {
+    os.path.realpath(os.path.join(runner_real, "run.sh")),
+    os.path.realpath(os.path.join(runner_real, "runsvc.sh")),
+}
+if not isinstance(prog, list) or len(prog) < 2 or prog[0] != "/bin/bash" or not isinstance(prog[1], str) or os.path.realpath(prog[1]) not in expected_runs:
+    print(f"FAIL: {plist_path} ProgramArguments={prog!r} must target ['/bin/bash', '{runner_dir}/run.sh'] or ['/bin/bash', '{runner_dir}/runsvc.sh']", file=sys.stderr)
     sys.exit(1)
 PY
   actual_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner")"

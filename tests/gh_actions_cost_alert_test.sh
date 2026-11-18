@@ -100,6 +100,10 @@ if [ -n "${GCLOUD_WRITE_FAIL:-}" ] && [[ "$*" == *"logging write"* ]]; then
   echo "gcloud: transient logging write failure" >&2
   exit 1
 fi
+if [ -n "${GCLOUD_POLICY_FAIL:-}" ] && [[ "$*" == *"alpha monitoring policies"* ]]; then
+  echo "gcloud: policy API permission denied" >&2
+  exit 1
+fi
 for arg in "$@"; do
   case "$arg" in
     --policy-from-file=*)
@@ -356,10 +360,17 @@ import json, sys
 runs = {"workflow_runs": [{"id": 8000 + i, "status": "completed", "conclusion": "skipped", "created_at": "2026-11-18T00:00:00Z"} for i in range(50)]}
 open(sys.argv[1], "w").write(json.dumps(runs))
 PY
+python3 - "$TMP/runs50-old.json" <<'PY'
+import json, sys
+runs = {"workflow_runs": [{"id": 8500 + i, "status": "completed", "conclusion": "skipped", "created_at": "2026-10-01T00:00:00Z"} for i in range(50)]}
+open(sys.argv[1], "w").write(json.dumps(runs))
+PY
 partial_repos15="$(FALLBACK_REPOS_PER_PAGE=15 BILLING_STUB_FAIL=1 MAX_APP_API_CALLS=60 REPOS_FIXTURE="$TMP/repos15.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" run_alert "$TMP/state-r15.json" "$TMP/gcloud-r15.log" "$TMP/gh-r15.log")"
 grep -q 'mode=app_token_fallback_partial' <<<"$partial_repos15" || fail "repo page saturation must mark mode=app_token_fallback_partial"
 partial_runs50="$(FALLBACK_RUNS_PER_PAGE=50 BILLING_STUB_FAIL=1 MAX_APP_API_CALLS=60 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs50.json" JOBS_FIXTURE_DIR="$TMP/jobs" run_alert "$TMP/state-r50.json" "$TMP/gcloud-r50.log" "$TMP/gh-r50.log")"
 grep -q 'mode=app_token_fallback_partial' <<<"$partial_runs50" || fail "run page saturation must mark mode=app_token_fallback_partial"
+partial_runs50_old="$(FALLBACK_RUNS_PER_PAGE=50 BILLING_STUB_FAIL=1 MAX_APP_API_CALLS=60 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs50-old.json" JOBS_FIXTURE_DIR="$TMP/jobs" run_alert "$TMP/state-r50old.json" "$TMP/gcloud-r50old.log" "$TMP/gh-r50old.log")"
+grep -q 'mode=app_token_fallback_partial' <<<"$partial_runs50_old" || fail "run page saturation must mark mode=app_token_fallback_partial regardless of oldest created_at"
 partial_err="$(BILLING_STUB_FAIL=1 RUNS_STUB_FAIL=1 MAX_APP_API_CALLS=60 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" run_alert "$TMP/state-rerr.json" "$TMP/gcloud-rerr.log" "$TMP/gh-rerr.log")"
 grep -q 'mode=app_token_fallback_partial' <<<"$partial_err" || fail "mid-loop gh api failure must mark mode=app_token_fallback_partial"
 pass "incomplete/truncated fallback marks app_token_fallback_partial and preserves BLIND alerting"
@@ -483,14 +494,6 @@ cat > "$TMP/runs-win.json" <<'JSON'
 JSON
 cat > "$TMP/jobs/9301.json" <<'JSON'
 {
-  "total_count": 1,
-  "jobs": [
-    {"id":21,"labels":["windows-latest"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T51:00:00Z"}
-  ]
-}
-JSON
-cat > "$TMP/jobs/9301.json" <<'JSON'
-{
   "total_count": 10,
   "jobs": [
     {"id":21,"labels":["windows-latest"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T06:00:00Z"},
@@ -579,12 +582,13 @@ cat > "$TMP/billing-badjson.json" <<'JSON'
 {"usageItems":[{"date":"2026-11-18T00:00:00Z","product":"actions","grossAmount":"not-a-number"}]}
 JSON
 printf '{"sent":{},"last_sent":0,"api_failures":2,"last_blind":0}\n' > "$TMP/state-badparse.json"
-HOME="$TMP/home" GH_BIN="$TMP/bin/gh" GCLOUD_BIN="$TMP/bin/gcloud" \
+APP_TOKEN_FILE="$TMP/no-app-token" HOME="$TMP/home" GH_BIN="$TMP/bin/gh" GCLOUD_BIN="$TMP/bin/gcloud" \
   STATE_FILE="$TMP/state-badparse.json" BILLING_FIXTURE="$TMP/billing-badjson.json" \
   GCLOUD_LOG="$TMP/gcloud-badparse.log" GH_CALL_LOG="$TMP/gh-badparse.log" \
   POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" \
   TARGET_DATE_UTC=2026-11-18 "$SCRIPT" >/dev/null 2>&1 || true
-[ "$(jq -r '.api_failures' "$TMP/state-badparse.json")" = 2 ] || fail "jq summary failure must not reset api_failures=0"
+[ "$(jq -r '.api_failures' "$TMP/state-badparse.json")" = 3 ] || fail "jq summary failure must increment api_failures"
+grep -q '"status":"BLIND"' "$TMP/gcloud-badparse.log" || fail "3rd failure via jq summary parse error must emit BLIND"
 pass "day-1 rollover failure preserves current-month spikes and api_failures resets only after jq parse"
 
 # 17. Fallback sink failure still persists api_failures; 3rd failure + spike sends single combined notification.
@@ -629,3 +633,22 @@ wait "$pid1" "$pid2"
 [ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 1 sent key was lost"
 [ "$(jq -r '.sent["2026-11-18:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 2 sent key was lost"
 pass "concurrent runs serialize STATE_FILE updates via lockdir"
+
+# 19. --ensure-gcp-policy creates/updates with timeout bounds and surfaces gcloud stderr on failure.
+run_alert "$TMP/state-pol-create.json" "$TMP/gcloud-pol-create.log" "$TMP/gh-pol-create.log" --ensure-gcp-policy >/dev/null
+grep -q 'alpha monitoring policies create' "$TMP/gcloud-pol-create.log" || fail "--ensure-gcp-policy must create policy when none exists"
+
+STUB_EXISTING_POLICY="projects/worldarchitecture-ai/alertPolicies/123" \
+  run_alert "$TMP/state-pol-update.json" "$TMP/gcloud-pol-update.log" "$TMP/gh-pol-update.log" --ensure-gcp-policy >/dev/null
+grep -q 'alpha monitoring policies update projects/worldarchitecture-ai/alertPolicies/123' "$TMP/gcloud-pol-update.log" || fail "--ensure-gcp-policy must update existing policy"
+
+pol_err_out="$(GCLOUD_POLICY_FAIL=1 run_alert "$TMP/state-pol-err.json" "$TMP/gcloud-pol-err.log" "$TMP/gh-pol-err.log" --ensure-gcp-policy 2>&1 || true)"
+grep -q 'gcloud: policy API permission denied' <<<"$pol_err_out" || fail "--ensure-gcp-policy must surface gcloud stderr on failure"
+
+start_ts="$(date +%s)"
+GCLOUD_STUB_SLEEP=6 GCLOUD_CALL_TIMEOUT_SEC=1 \
+  run_alert "$TMP/state-pol-timeout.json" "$TMP/gcloud-pol-timeout.log" "$TMP/gh-pol-timeout.log" --ensure-gcp-policy >/dev/null 2>&1 || true
+end_ts="$(date +%s)"
+elapsed=$((end_ts - start_ts))
+[ "$elapsed" -lt 5 ] || fail "stalled --ensure-gcp-policy gcloud call must be killed by GCLOUD_CALL_TIMEOUT_SEC=1 (took ${elapsed}s)"
+pass "--ensure-gcp-policy creates/updates with timeout bounds and surfaces stderr on failure"

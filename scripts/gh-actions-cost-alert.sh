@@ -68,9 +68,7 @@ NOW="$(date +%s)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 TODAY_UTC="${TARGET_DATE_UTC:-$(date -u +%Y-%m-%d)}"
 YESTERDAY_UTC="$(date -u -j -v-1d -f '%Y-%m-%d' "$TODAY_UTC" +%Y-%m-%d 2>/dev/null || date -u -d "$TODAY_UTC - 1 day" +%Y-%m-%d)"
-DAY_BEFORE_YESTERDAY_UTC="$(date -u -j -v-2d -f '%Y-%m-%d' "$TODAY_UTC" +%Y-%m-%d 2>/dev/null || date -u -d "$TODAY_UTC - 2 days" +%Y-%m-%d)"
 [[ "$YESTERDAY_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "FATAL: invalid YESTERDAY_UTC='$YESTERDAY_UTC'" >&2; exit 2; }
-[[ "$DAY_BEFORE_YESTERDAY_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "FATAL: invalid DAY_BEFORE_YESTERDAY_UTC='$DAY_BEFORE_YESTERDAY_UTC'" >&2; exit 2; }
 YEAR="${TODAY_UTC:0:4}"
 MONTH="$((10#${TODAY_UTC:5:2}))"
 YEAR_MONTH="${TODAY_UTC:0:7}"
@@ -96,9 +94,47 @@ if [ "$DRY_RUN" -eq 0 ] && [ -z "$GCLOUD_BIN" ]; then
   exit 3
 fi
 
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+  local timeout_bin="" rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  fi
+  if [ -n "$timeout_bin" ]; then
+    "$timeout_bin" -k 5 "$timeout_sec" "$@" || rc=$?
+    return "$rc"
+  fi
+  # Capture stdout via a temp file so any orphaned child (e.g. sleep inside a stub/subshell)
+  # cannot keep a command-substitution pipe open after the main child is killed on timeout.
+  local out_tmp
+  out_tmp="$(mktemp)"
+  "$@" > "$out_tmp" &
+  local pid=$!
+  local deadline=$((SECONDS + timeout_sec))
+  while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$out_tmp"
+    return 124
+  fi
+  wait "$pid" || rc=$?
+  cat "$out_tmp"
+  rm -f "$out_tmp"
+  return "$rc"
+}
+
 if [ "$ENSURE_POLICY" -eq 1 ]; then
   POLICY_FILE="$(mktemp)"
-  trap 'rm -f "${POLICY_FILE:?}"' EXIT
+  POLICY_ERR="${POLICY_FILE}.err"
+  trap 'rm -f "${POLICY_FILE:?}" "${POLICY_ERR:?}"' EXIT
   jq -n \
     --arg source "$SOURCE" \
     --arg log "$LOG_NAME" \
@@ -141,54 +177,30 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
 
   [ -n "$GCLOUD_BIN" ] || { echo "FATAL: gcloud not found" >&2; exit 3; }
   GCP_ARGS=(--project="$GCP_PROJECT" --account="$GCP_ACCOUNT")
-  existing="$("$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
-    --filter="displayName=\"$POLICY_DISPLAY_NAME\"" --format='value(name)' 2>/dev/null | head -1)"
+  if ! existing_raw="$(run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
+      --filter="displayName=\"$POLICY_DISPLAY_NAME\"" --format='value(name)' 2>"$POLICY_ERR")"; then
+    rc=$?
+    cat "$POLICY_ERR" >&2
+    exit "$rc"
+  fi
+  existing="$(printf '%s\n' "$existing_raw" | head -1)"
   if [ -n "$existing" ]; then
-    "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null
+    if ! run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR"; then
+      rc=$?
+      cat "$POLICY_ERR" >&2
+      exit "$rc"
+    fi
     echo "[$NOW_ISO] updated policy '$POLICY_DISPLAY_NAME'"
   else
-    "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null
+    if ! run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR"; then
+      rc=$?
+      cat "$POLICY_ERR" >&2
+      exit "$rc"
+    fi
     echo "[$NOW_ISO] created policy '$POLICY_DISPLAY_NAME'"
   fi
   exit 0
 fi
-
-run_with_timeout() {
-  local timeout_sec="$1"
-  shift
-  local timeout_bin="" rc=0
-  if command -v timeout >/dev/null 2>&1; then
-    timeout_bin="timeout"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    timeout_bin="gtimeout"
-  fi
-  if [ -n "$timeout_bin" ]; then
-    "$timeout_bin" -k 5 "$timeout_sec" "$@" || rc=$?
-    return "$rc"
-  fi
-  # Capture stdout via a temp file so any orphaned child (e.g. sleep inside a stub/subshell)
-  # cannot keep a command-substitution pipe open after the main child is killed on timeout.
-  local out_tmp
-  out_tmp="$(mktemp)"
-  "$@" > "$out_tmp" &
-  local pid=$!
-  local deadline=$((SECONDS + timeout_sec))
-  while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
-    sleep 0.5
-  done
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
-    sleep 0.2
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    rm -f "$out_tmp"
-    return 124
-  fi
-  wait "$pid" || rc=$?
-  cat "$out_tmp"
-  rm -f "$out_tmp"
-  return "$rc"
-}
 
 emit() { # severity status day message gross_usd net_usd macos_min top_repo [mode] [mtd_gross] [mtd_net]
   local severity="$1" status="$2" day="$3" message="$4" gross_usd="$5" net_usd="$6" macos_min="$7" top_repo="$8"
@@ -349,7 +361,7 @@ FALLBACK_MODE="app_token_fallback"
 
 run_app_token_fallback() {
   local reason="$1"
-  local app_token app_rem calls_used=0 repo_count runs_count oldest_run_date
+  local app_token app_rem calls_used=0 repo_count runs_count
   FALLBACK_INCOMPLETE=0
   FALLBACK_CAP_HIT=0
   FALLBACK_MODE="app_token_fallback"
@@ -401,10 +413,7 @@ run_app_token_fallback() {
 
     runs_count="$(jq '(.workflow_runs // []) | length' "$tmp.runs" 2>/dev/null || echo 0)"
     if [ "$runs_count" -ge "$FALLBACK_RUNS_PER_PAGE" ]; then
-      oldest_run_date="$(jq -r '(.workflow_runs // []) | if length > 0 then ((.[-1].updated_at // .[-1].created_at // "")[:10]) else "" end' "$tmp.runs" 2>/dev/null || true)"
-      if [ -z "$oldest_run_date" ] || [[ ! "$oldest_run_date" < "$DAY_BEFORE_YESTERDAY_UTC" ]]; then
-        FALLBACK_INCOMPLETE=1
-      fi
+      FALLBACK_INCOMPLETE=1
     fi
 
     while IFS=$'\t' read -r run_id run_day; do
@@ -553,19 +562,8 @@ elif [ "$YEST_YEAR_MONTH" != "$YEAR_MONTH" ]; then
   fi
 fi
 
-if [ -n "$fallback_reason" ]; then
-  if run_app_token_fallback "$fallback_reason"; then
-    used_fallback=1
-    run_mode="$FALLBACK_MODE"
-  else
-    increment_api_failure
-    emit_blind_if_due "$fallback_reason" "blind"
-    exit 2
-  fi
-fi
-
-if [ "$used_fallback" -eq 0 ]; then
-  jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
+if [ -z "$fallback_reason" ]; then
+  if ! jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
     def is_macos_min: (((.sku // "") | test("macos"; "i")) and (((.unitType // "") | ascii_downcase) == "minutes"));
     def sum_gross: (map(.grossAmount // 0) | add // 0);
     def sum_net: (map(.netAmount // 0) | add // 0);
@@ -599,10 +597,22 @@ if [ "$used_fallback" -eq 0 ]; then
         },
         days: ($target_days | unique | map(day_summary(.; $all_actions)))
       }
-  ' "$tmp" > "$tmp.summary"
-  if [ "$rollover_yest_failed" -eq 0 ]; then
+  ' "$tmp" > "$tmp.summary" 2>"$tmp.err"; then
+    fallback_reason="gh api billing usage summary parse failed"
+  elif [ "$rollover_yest_failed" -eq 0 ]; then
     jq '.api_failures = 0' "$STATE_FILE" > "$tmp.state"
     mv "$tmp.state" "$STATE_FILE"
+  fi
+fi
+
+if [ -n "$fallback_reason" ]; then
+  if run_app_token_fallback "$fallback_reason"; then
+    used_fallback=1
+    run_mode="$FALLBACK_MODE"
+  else
+    increment_api_failure
+    emit_blind_if_due "$fallback_reason" "blind"
+    exit 2
   fi
 fi
 

@@ -463,6 +463,18 @@ if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/disk
 fi
 
 cp "$TMP/plist.ok" "$PLIST_T"
+python3 - "$PLIST_T" "$RUNNER_DIR_T/runsvc.sh" <<'PY'
+import plistlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+d = plistlib.loads(p.read_bytes())
+d["ProgramArguments"] = ["/bin/bash", sys.argv[2]]
+p.write_bytes(plistlib.dumps(d))
+PY
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify must accept runsvc.sh in ProgramArguments"
+
+cp "$TMP/plist.ok" "$PLIST_T"
 python3 - "$PLIST_T" "$TMP/other-runner/run.sh" <<'PY'
 import plistlib, sys
 from pathlib import Path
@@ -473,7 +485,7 @@ p.write_bytes(plistlib.dumps(d))
 PY
 if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
     "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
-  fail "--verify must fail when plist ProgramArguments mismatches RUNNER_DIR/run.sh"
+  fail "--verify must fail when plist ProgramArguments mismatches RUNNER_DIR/run.sh or runsvc.sh"
 fi
 cp "$TMP/plist.ok" "$PLIST_T"
 pass "--verify enforces GH_BIN, WORK_DIR existence, and plist target paths"
