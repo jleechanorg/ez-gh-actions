@@ -250,6 +250,63 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_sanitizes_javascript_urls_and_escapes_script_json(self):
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            hosts = json.loads((tmp / "ubuntu_mac_slots.json").read_text())
+            hosts["hosts"]["jeff-ubuntu"]["slots"][0]["run_url"] = "javascript:alert(1)"
+            hosts["hosts"]["jeff-ubuntu"]["slots"][0]["workflow"] = "</script><img onerror=1>"
+            hosts["hosts"]["jeff-ubuntu"]["slots"][0]["job_display_name"] = "<!--<script>bad()"
+            (tmp / "ubuntu_mac_slots.json").write_text(json.dumps(hosts), encoding="utf-8")
+
+            gh = json.loads((tmp / "github_live_snapshot.json").read_text())
+            gh["all_in_progress_jobs"][0]["run_html_url"] = "javascript:alert(2)"
+            gh["all_in_progress_jobs"][0]["html_url"] = "data:text/html,<script>alert(3)</script>"
+            (tmp / "github_live_snapshot.json").write_text(json.dumps(gh), encoding="utf-8")
+
+            state = mod.build_operator_state(audit_dir=tmp)
+            html = mod.render_html(state)
+
+        self.assertNotIn("javascript:alert", html)
+        self.assertNotIn("data:text/html", html)
+        self.assertNotIn("</script><img", html)
+        self.assertNotIn("<!--<script>", html)
+        self.assertIn("\\u003c/script\\u003e\\u003cimg onerror=1\\u003e", html)
+        self.assertIn("\\u003c!--\\u003cscript\\u003ebad()", html)
+
+    def test_non_loopback_host_rejected_and_serve_ttl_cache(self):
+        from unittest import mock
+
+        mod = load_module()
+        with self.assertRaises(ValueError):
+            mod.create_server(host="0.0.0.0", port=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            fixture_audit_dir(tmp)
+            calls = {"n": 0}
+            orig_build = mod.build_operator_state
+
+            def counting_build(**kwargs):
+                calls["n"] += 1
+                return orig_build(**kwargs)
+
+            with mock.patch.object(mod, "build_operator_state", side_effect=counting_build):
+                server = mod.create_server(host="127.0.0.1", port=0, audit_dir=tmp, cache_ttl_s=15.0)
+                port = server.server_address[1]
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    for _ in range(3):
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                            self.assertEqual(resp.status, 200)
+                    self.assertEqual(calls["n"], 1)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

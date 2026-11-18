@@ -16,6 +16,8 @@ import json
 import re
 import socketserver
 import sys
+import threading
+import time
 from pathlib import Path
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -23,7 +25,6 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import ci_latency_probe  # noqa: E402
-import queue_probe  # noqa: E402
 
 PHASE_RULES = (
     ("playwright install", r"playwright\s+install"),
@@ -103,6 +104,17 @@ def _infer_phase_badge(cmds, state, reason=None):
     return "running" if st == "EXECUTING" else None
 
 
+def _safe_http_url(url):
+    if not isinstance(url, str):
+        return None
+    cleaned = url.strip()
+    if not cleaned or any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+        return None
+    if re.match(r"^https?://", cleaned, re.IGNORECASE):
+        return cleaned
+    return None
+
+
 def _build_gh_job_index(github_data):
     by_runner = {}
     by_run_job = {}
@@ -150,24 +162,25 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
         or (gh_match or {}).get("run_name")
         or (gh_live or {}).get("run_name")
     )
-    run_url = (
+    run_url = _safe_http_url(
         slot_raw.get("run_url")
         or (gh_match or {}).get("run_html_url")
         or (gh_live or {}).get("run_html_url")
     )
     if not run_url and full_repo and run_id:
-        run_url = f"https://github.com/{full_repo}/actions/runs/{run_id}"
+        run_url = _safe_http_url(f"https://github.com/{full_repo}/actions/runs/{run_id}")
 
-    job_url = (
+    job_url = _safe_http_url(
         (gh_match or {}).get("html_url")
         or (gh_live or {}).get("html_url")
     )
     if not job_url and full_repo and run_id and (gh_live or {}).get("job_id"):
-        job_url = f"https://github.com/{full_repo}/actions/runs/{run_id}/job/{gh_live['job_id']}"
+        job_url = _safe_http_url(f"https://github.com/{full_repo}/actions/runs/{run_id}/job/{gh_live['job_id']}")
 
     ref = slot_raw.get("ref") or slot_raw.get("head_ref")
     head_branch = (gh_live or {}).get("head_branch") or slot_raw.get("head_ref")
     pr_label, pr_url = _extract_pr_info(full_repo, ref, head_branch)
+    pr_url = _safe_http_url(pr_url)
 
     elapsed_min = slot_raw.get("elapsed_minutes")
     if elapsed_min is None and isinstance(slot_raw.get("worker_etimes_sec"), (int, float)):
@@ -492,7 +505,7 @@ def _normalize_latency(latency_raw):
 
 
 def _collect_live_github_snapshot():
-    """Fallback live GitHub query when no audit-dir is supplied."""
+    """Fallback bounded live GitHub query when no audit-dir is supplied."""
     repos = ["jleechanorg/worldarchitect.ai", "jleechanorg/worldai_frontend", "jleechanorg/ez-gh-actions"]
     all_ip_jobs = []
     ip_runs_by_repo = {}
@@ -502,12 +515,12 @@ def _collect_live_github_snapshot():
     for repo in repos:
         short = _short_repo(repo)
         try:
-            ip = queue_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=in_progress&per_page=50"])
+            ip = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=in_progress&per_page=50"], timeout=20)
             ip_runs = (ip or {}).get("workflow_runs") or []
             ip_runs_by_repo[short] = len(ip_runs)
             job_cnt = 0
             for run in ip_runs[:15]:
-                jdata = queue_probe.gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"])
+                jdata = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100"], timeout=20)
                 for j in (jdata or {}).get("jobs") or []:
                     if j.get("status") == "in_progress":
                         job_cnt += 1
@@ -523,9 +536,10 @@ def _collect_live_github_snapshot():
                             "html_url": j.get("html_url"),
                         })
             ip_jobs_by_repo[short] = job_cnt
-            qp = queue_probe.probe_repo(repo)
-            q_runs_by_repo[short] = (qp.get("fresh") or 0) + (qp.get("ghosts") or 0)
-            q_jobs_by_repo[short] = qp.get("fresh") or 0
+            q_data = ci_latency_probe.gh_json(["api", f"repos/{repo}/actions/runs?status=queued&per_page=50"], timeout=20)
+            q_runs = (q_data or {}).get("workflow_runs") or []
+            q_runs_by_repo[short] = len(q_runs)
+            q_jobs_by_repo[short] = len(q_runs)
         except Exception:
             continue
     return {
@@ -577,9 +591,21 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     }
 
 
+def _escape_embedded_json(state):
+    """Escape HTML/script-significant characters inside embedded JSON."""
+    raw = json.dumps(state, ensure_ascii=False)
+    return (
+        raw.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def render_html(state, *, auto_refresh_ms=0):
     """Render a standalone, self-contained HTML dashboard with embedded state JSON."""
-    safe_json = json.dumps(state, ensure_ascii=False).replace("</", "<\\/")
+    safe_json = _escape_embedded_json(state)
     generated_at = html_lib.escape(str(state.get("generated_at_utc") or ""))
     refresh_attr = str(int(auto_refresh_ms))
     return f"""<!doctype html>
@@ -800,6 +826,18 @@ def render_html(state, *, auto_refresh_ms=0):
       return String(v ?? '').replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
     }}
 
+    function safeHttpUrl(u) {{
+      if (typeof u !== 'string') return null;
+      const trimmed = u.trim();
+      if (!trimmed || /\\s/.test(trimmed)) return null;
+      try {{
+        const parsed = new URL(trimmed);
+        return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? trimmed : null;
+      }} catch (_e) {{
+        return null;
+      }}
+    }}
+
     function fmtSec(s) {{
       if (typeof s !== 'number' || !Number.isFinite(s) || s < 0) return '—';
       const r = Math.round(s);
@@ -938,9 +976,12 @@ def render_html(state, *, auto_refresh_ms=0):
         const rowsHtml = slots.map((s) => {{
           const rowClass = s.alert_level === 'critical' ? 'row-critical' : s.alert_level === 'warn' ? 'row-warn' : s.alert_level === 'parked' ? 'row-parked' : '';
           const links = [];
-          if (s.run_url) links.push(`<a href="${{esc(s.run_url)}}" target="_blank" rel="noopener">Run ${{esc(s.run_id || '')}}</a>`);
-          if (s.job_url) links.push(`<a href="${{esc(s.job_url)}}" target="_blank" rel="noopener">Job</a>`);
-          if (s.pr_url) links.push(`<a href="${{esc(s.pr_url)}}" target="_blank" rel="noopener">${{esc(s.pr_label)}}</a>`);
+          const runUrl = safeHttpUrl(s.run_url);
+          const jobUrl = safeHttpUrl(s.job_url);
+          const prUrl = safeHttpUrl(s.pr_url);
+          if (runUrl) links.push(`<a href="${{esc(runUrl)}}" target="_blank" rel="noopener">Run ${{esc(s.run_id || '')}}</a>`);
+          if (jobUrl) links.push(`<a href="${{esc(jobUrl)}}" target="_blank" rel="noopener">Job</a>`);
+          if (prUrl) links.push(`<a href="${{esc(prUrl)}}" target="_blank" rel="noopener">${{esc(s.pr_label)}}</a>`);
           const detail = s.reason ? esc(s.reason) : (s.commands || []).map((c) => `<div class="cmd-line" title="${{esc(c)}}">${{esc(c)}}</div>`).join('');
           return `
             <tr class="${{rowClass}}">
@@ -1023,18 +1064,29 @@ def render_html(state, *, auto_refresh_ms=0):
 
 
 def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=None,
-                  cmux_json=None, github_json=None, latency_json=None, refresh_ms=15000):
+                  cmux_json=None, github_json=None, latency_json=None,
+                  refresh_ms=15000, cache_ttl_s=15.0):
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("Refusing to bind operator dashboard outside loopback")
 
+    cache_lock = threading.Lock()
+    cache_state = {"ts": 0.0, "data": None}
+
     def load_state():
-        return build_operator_state(
-            audit_dir=audit_dir,
-            hosts_json=hosts_json,
-            cmux_json=cmux_json,
-            github_json=github_json,
-            latency_json=latency_json,
-        )
+        with cache_lock:
+            now = time.monotonic()
+            if cache_state["data"] is not None and (now - cache_state["ts"]) < cache_ttl_s:
+                return cache_state["data"]
+            fresh = build_operator_state(
+                audit_dir=audit_dir,
+                hosts_json=hosts_json,
+                cmux_json=cmux_json,
+                github_json=github_json,
+                latency_json=latency_json,
+            )
+            cache_state["data"] = fresh
+            cache_state["ts"] = time.monotonic()
+            return fresh
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format, *args):

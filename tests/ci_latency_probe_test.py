@@ -147,6 +147,19 @@ class ProbeAndRedactionTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("rate limit", payload["error"])
 
+    def test_subprocess_timeout_degrades_gracefully(self):
+        import subprocess
+        from unittest import mock
+
+        mod = load_module()
+        with mock.patch.object(
+            subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=20)
+        ):
+            payload = mod.probe_latency(["jleechanorg/worldarchitect.ai"], limit=5)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("timed out", payload["error"])
+
     def test_from_audit_json_normalizes_real_schema(self):
         mod = load_module()
         audit_sample = {

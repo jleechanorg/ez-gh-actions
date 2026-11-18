@@ -15,6 +15,7 @@ import argparse
 import datetime
 import json
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -29,9 +30,24 @@ DEFAULT_REPOS = ("jleechanorg/worldarchitect.ai", "jleechanorg/worldai_frontend"
 SKIPPED_CONCLUSIONS = frozenset({"skipped", "neutral"})
 
 
-def gh_json(args):
-    """Indirection so tests can stub GitHub CLI calls cleanly."""
-    return queue_probe.gh_json(args)
+DEFAULT_GH_TIMEOUT_S = 20
+
+
+def gh_json(args, timeout=DEFAULT_GH_TIMEOUT_S):
+    """Bounded GitHub CLI JSON call with prompt/pager disabled."""
+    env = dict(queue_probe.gh_env())
+    env.update({
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_PAGER": "",
+    })
+    try:
+        result = subprocess.run(["gh", *args], capture_output=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gh timed out after {timeout}s") from exc
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or b"").decode()[:300])
+    return json.loads(result.stdout.decode() or "null")
 
 
 def _parse_iso(stamp):
