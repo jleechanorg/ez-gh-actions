@@ -490,19 +490,24 @@ fi
 cp "$TMP/plist.ok" "$PLIST_T"
 pass "--verify enforces GH_BIN, WORK_DIR existence, and plist target paths"
 
-# 9. Interrupted binary provisioning (Runner.Listener present, config.sh missing) repairs cleanly on retry.
+# 9. Interrupted binary provisioning (Runner.Listener present, config.sh missing) repairs cleanly on retry,
+#    stopping the LaunchAgent before promoting staged binaries and reloading afterward.
 mkdir -p "$TMP/home/actions-runner/bin"
 cp "$RUNNER_DIR_T/bin/Runner.Listener" "$TMP/home/actions-runner/bin/Runner.Listener"
 cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
 cp "$RUNNER_DIR_T/run.sh" "$TMP/home/actions-runner/run.sh"
 rm -f "$RUNNER_DIR_T/config.sh" "$RUNNER_DIR_T/run.sh"
+: > "$TMP/launchctl.log"
+: > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" >/dev/null
 [ -x "$RUNNER_DIR_T/config.sh" ] && [ -x "$RUNNER_DIR_T/run.sh" ] || fail "incomplete provisioning must repair config.sh and run.sh on retry"
-pass "incomplete runner provisioning repairs missing config.sh and run.sh"
+grep -q "launchctl unload $PLIST_T" "$TMP/launchctl.log" || fail "binary repair must stop LaunchAgent before promoting staged binaries"
+[ -f "$TMP/launchctl.loaded" ] || fail "binary repair must reload LaunchAgent after repairing binaries"
+pass "incomplete runner provisioning stops LaunchAgent, repairs missing binaries, and reloads"
 
 # 10. No-change rerun leaves loaded LaunchAgent running; failed stop aborts before deleting creds;
-#     failed config.sh restores old creds when remote registration is unchanged.
+#     failed config.sh fails closed (exit 4), preserves .backup-pre-reconfigure.*, does NOT restore creds, and leaves service stopped.
 : > "$TMP/launchctl.log"
 : > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
@@ -527,17 +532,22 @@ printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUr
 printf 'preserved-creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'preserved-rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
 : > "$TMP/launchctl.loaded"
-if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-    "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1; then
-  fail "failed config.sh must fail setup"
-fi
-[ "$(cat "$RUNNER_DIR_T/.credentials")" = "preserved-creds" ] || fail "failed config.sh with unchanged remote registration must restore .credentials"
-[ -f "$TMP/launchctl.loaded" ] || fail "failed config.sh with unchanged remote registration must restart prior service"
-
-if LIVE_RUNNERS_JSON='{"runners":[{"id":202,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
-    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-    "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1; then
-  fail "failed config.sh must fail setup even when remote changed"
-fi
-[ ! -e "$RUNNER_DIR_T/.credentials" ] || fail "failed config.sh with changed remote registration must NOT restore stale .credentials"
-pass "idempotent rerun skips reload, stop failure protects creds, and failed reconfigure handles unchanged vs changed registration"
+: > "$TMP/launchctl.log"
+reconfig_rc=0
+reconfig_err="$(
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --reconfigure 2>&1 >/dev/null
+)" || reconfig_rc=$?
+[ "$reconfig_rc" -eq 4 ] || fail "failed config.sh must exit 4 fail-closed (got $reconfig_rc)"
+grep -q 'ERROR:.*\.backup-pre-reconfigure\.' <<<"$reconfig_err" || fail "failed config.sh must print ERROR naming preserved backup directory (got: $reconfig_err)"
+grep -q -- '--reconfigure' <<<"$reconfig_err" || fail "failed config.sh error must instruct operator to re-run --reconfigure"
+[ ! -e "$RUNNER_DIR_T/.runner" ] && [ ! -e "$RUNNER_DIR_T/.credentials" ] && [ ! -e "$RUNNER_DIR_T/.credentials_rsaparams" ] || \
+  fail "failed config.sh must fail closed and NOT restore old .runner/.credentials*"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "failed config.sh must leave LaunchAgent stopped (not reloaded)"
+! grep -q 'launchctl load' "$TMP/launchctl.log" || fail "failed config.sh must never call launchctl load"
+backup_dirs=("$RUNNER_DIR_T"/.backup-pre-reconfigure.*)
+[ "${#backup_dirs[@]}" -eq 1 ] && [ -d "${backup_dirs[0]}" ] || fail "failed config.sh must preserve .backup-pre-reconfigure.<pid> directory"
+[ "$(cat "${backup_dirs[0]}/.credentials")" = "preserved-creds" ] || fail "preserved backup must retain .credentials"
+[ "$(cat "${backup_dirs[0]}/.credentials_rsaparams")" = "preserved-rsa" ] || fail "preserved backup must retain .credentials_rsaparams"
+[ -f "${backup_dirs[0]}/.runner" ] || fail "preserved backup must retain .runner"
+pass "idempotent rerun skips reload, stop failure protects creds, and failed reconfigure fails closed with preserved backup"

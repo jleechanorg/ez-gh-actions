@@ -64,8 +64,8 @@ LOG_NAME="${LOG_NAME:-ezgha-runner-alerts}"
 SLACK_CHANNEL="${SLACK_CHANNEL:-projects/worldarchitecture-ai/notificationChannels/14071650426226468737}"
 POLICY_DISPLAY_NAME="${POLICY_DISPLAY_NAME:-[CRITICAL] GitHub Actions cost or hosted macOS spike}"
 SOURCE="gh-actions-cost-alert"
-NOW="$(date +%s)"
-NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+NOW="${NOW_EPOCH:-$(date +%s)}"
+NOW_ISO="${NOW_ISO:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 TODAY_UTC="${TARGET_DATE_UTC:-$(date -u +%Y-%m-%d)}"
 YESTERDAY_UTC="$(date -u -j -v-1d -f '%Y-%m-%d' "$TODAY_UTC" +%Y-%m-%d 2>/dev/null || date -u -d "$TODAY_UTC - 1 day" +%Y-%m-%d)"
 [[ "$YESTERDAY_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "FATAL: invalid YESTERDAY_UTC='$YESTERDAY_UTC'" >&2; exit 2; }
@@ -177,23 +177,26 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
 
   [ -n "$GCLOUD_BIN" ] || { echo "FATAL: gcloud not found" >&2; exit 3; }
   GCP_ARGS=(--project="$GCP_PROJECT" --account="$GCP_ACCOUNT")
-  if ! existing_raw="$(run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
-      --filter="displayName=\"$POLICY_DISPLAY_NAME\"" --format='value(name)' 2>"$POLICY_ERR")"; then
-    rc=$?
+  rc=0
+  existing_raw="$(run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
+      --filter="displayName=\"$POLICY_DISPLAY_NAME\"" --format='value(name)' 2>"$POLICY_ERR")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
     cat "$POLICY_ERR" >&2
     exit "$rc"
   fi
   existing="$(printf '%s\n' "$existing_raw" | head -1)"
   if [ -n "$existing" ]; then
-    if ! run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR"; then
-      rc=$?
+    rc=0
+    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR" || rc=$?
+    if [ "$rc" -ne 0 ]; then
       cat "$POLICY_ERR" >&2
       exit "$rc"
     fi
     echo "[$NOW_ISO] updated policy '$POLICY_DISPLAY_NAME'"
   else
-    if ! run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR"; then
-      rc=$?
+    rc=0
+    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR" || rc=$?
+    if [ "$rc" -ne 0 ]; then
       cat "$POLICY_ERR" >&2
       exit "$rc"
     fi
@@ -266,8 +269,13 @@ tmp="$(mktemp)"
 STATE_LOCK_DIR=""
 release_state_lock() {
   if [ -n "${STATE_LOCK_DIR:-}" ] && [ -d "$STATE_LOCK_DIR" ]; then
-    rm -f "${STATE_LOCK_DIR}/pid" 2>/dev/null || true
-    rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+    local rel_dir="${STATE_LOCK_DIR}.release.$$"
+    if mv "$STATE_LOCK_DIR" "$rel_dir" 2>/dev/null; then
+      rm -rf "$rel_dir" 2>/dev/null || true
+    else
+      rm -f "${STATE_LOCK_DIR}/pid" 2>/dev/null || true
+      rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+    fi
     STATE_LOCK_DIR=""
   fi
 }
@@ -281,21 +289,42 @@ acquire_state_lock() {
   local lockdir="${STATE_FILE}.lock"
   local pidfile="${lockdir}/pid"
   local deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
-  local owner_pid=""
+  local owner_pid="" owner_pid2="" missing_pid_polls=0
   mkdir -p "$(dirname "$STATE_FILE")"
   while true; do
     if mkdir "$lockdir" 2>/dev/null; then
-      printf '%s\n' "$$" > "$pidfile"
+      printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
       STATE_LOCK_DIR="$lockdir"
       return 0
     fi
     if [ -f "$pidfile" ]; then
       owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-      if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
-        rm -f "$pidfile" 2>/dev/null || true
-        rmdir "$lockdir" 2>/dev/null || true
+      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+        missing_pid_polls=0
+        if ! kill -0 "$owner_pid" 2>/dev/null; then
+          owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+          if [ "$owner_pid2" = "$owner_pid" ] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
+            rm -rf "${lockdir}.reclaim.$$"
+          fi
+          continue
+        fi
+      else
+        missing_pid_polls=$((missing_pid_polls + 1))
+      fi
+    else
+      missing_pid_polls=$((missing_pid_polls + 1))
+    fi
+    if [ "$missing_pid_polls" -ge 10 ]; then
+      owner_pid2=""
+      if [ -f "$pidfile" ]; then
+        owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      fi
+      if ! [[ "$owner_pid2" =~ ^[0-9]+$ ]] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
+        rm -rf "${lockdir}.reclaim.$$"
+        missing_pid_polls=0
         continue
       fi
+      missing_pid_polls=0
     fi
     if (( SECONDS >= deadline )); then
       echo "FATAL: timed out waiting for state lock $lockdir" >&2
@@ -373,7 +402,7 @@ run_app_token_fallback() {
   if [ "$MAX_APP_API_CALLS" -lt 2 ]; then
     return 1
   fi
-  if ! app_rem="$(run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api rate_limit --jq '.resources.core.remaining // empty' 2>"$tmp.err")"; then
+  if ! app_rem="$(GH_TOKEN="$app_token" run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api rate_limit --jq '.resources.core.remaining // empty' 2>"$tmp.err")"; then
     return 1
   fi
   calls_used=1
@@ -384,7 +413,7 @@ run_app_token_fallback() {
   if [ "$calls_used" -ge "$MAX_APP_API_CALLS" ]; then
     return 1
   fi
-  if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api "orgs/${ALERT_ORG}/repos?sort=pushed&per_page=${FALLBACK_REPOS_PER_PAGE}" > "$tmp.repos" 2>"$tmp.err"; then
+  if ! GH_TOKEN="$app_token" run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "orgs/${ALERT_ORG}/repos?sort=pushed&per_page=${FALLBACK_REPOS_PER_PAGE}" > "$tmp.repos" 2>"$tmp.err"; then
     return 1
   fi
   calls_used=$((calls_used + 1))
@@ -404,7 +433,7 @@ run_app_token_fallback() {
       FALLBACK_CAP_HIT=1
       break
     fi
-    if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api "repos/${full_name}/actions/runs?per_page=${FALLBACK_RUNS_PER_PAGE}" > "$tmp.runs" 2>"$tmp.err"; then
+    if ! GH_TOKEN="$app_token" run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "repos/${full_name}/actions/runs?per_page=${FALLBACK_RUNS_PER_PAGE}" > "$tmp.runs" 2>"$tmp.err"; then
       FALLBACK_INCOMPLETE=1
       calls_used=$((calls_used + 1))
       continue
@@ -426,7 +455,7 @@ run_app_token_fallback() {
           FALLBACK_CAP_HIT=1
           break
         fi
-        if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" env GH_TOKEN="$app_token" "$GH_BIN" api "repos/${full_name}/actions/runs/${run_id}/jobs?filter=all&per_page=${FALLBACK_JOBS_PER_PAGE}&page=${job_page}" > "$tmp.jobs" 2>"$tmp.err"; then
+        if ! GH_TOKEN="$app_token" run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "repos/${full_name}/actions/runs/${run_id}/jobs?filter=all&per_page=${FALLBACK_JOBS_PER_PAGE}&page=${job_page}" > "$tmp.jobs" 2>"$tmp.err"; then
           FALLBACK_INCOMPLETE=1
           calls_used=$((calls_used + 1))
           break

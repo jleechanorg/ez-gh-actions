@@ -132,6 +132,7 @@ run_alert() {
   GH_CALL_LOG="$gh_log" \
   POLICY_CAPTURE="$TMP/policy.json" \
   POLICY_HISTORY="$TMP/policy-history.jsonl" \
+  NOW_ISO="${NOW_ISO:-2026-11-18T12:00:00Z}" \
   TARGET_DATE_UTC="${TARGET_DATE_UTC:-2026-11-18}" \
   "$SCRIPT" "$@"
 }
@@ -440,6 +441,16 @@ BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos-oldpush.json" RUNS_FIXTURE="$TMP/r
 [ "$(error_count "$TMP/gcloud-oldpush.log")" = 1 ] || fail "fallback must scan old pushed_at repos and cross-midnight runs"
 grep -q '"day":"2026-11-17"' "$TMP/gcloud-oldpush.log" || fail "cross-midnight job starting 2026-11-17 must alert on 2026-11-17"
 grep -q 'runs/9102/jobs' "$TMP/gh-oldpush.log" || fail "in_progress run must be inspected even with older timestamps"
+
+# Pinned-clock regression check: year-2027 NOW_EPOCH with pinned NOW_ISO keeps in_progress run 9102 deterministic.
+: > "$TMP/gh-oldpush-2027.log"
+NOW_EPOCH=1800000000 NOW_ISO="2026-11-18T12:00:00Z" \
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos-oldpush.json" RUNS_FIXTURE="$TMP/runs-cross.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-oldpush-2027.json" "$TMP/gcloud-oldpush-2027.log" "$TMP/gh-oldpush-2027.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-oldpush-2027.log")" = 1 ] || fail "year-2027 NOW_EPOCH with pinned NOW_ISO must not spuriously spike in_progress job"
+grep -q '"day":"2026-11-17"' "$TMP/gcloud-oldpush-2027.log" || fail "pinned-clock fallback run must alert on 2026-11-17"
+grep -q '"ts":"2026-11-18T12:00:00Z"' "$TMP/gcloud-oldpush-2027.log" || fail "NOW_ISO override must propagate to emitted payload ts"
+grep -q 'runs/9102/jobs' "$TMP/gh-oldpush-2027.log" || fail "pinned-clock fallback run must inspect in_progress run 9102"
 pass "fallback scans independent of pushed_at and captures cross-midnight and in_progress runs"
 
 # 13. Fallback paginates jobs (?filter=all&per_page=100&page=N) and marks partial if budget prevents page 2.
@@ -632,9 +643,29 @@ pid2=$!
 wait "$pid1" "$pid2"
 [ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 1 sent key was lost"
 [ "$(jq -r '.sent["2026-11-18:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 2 sent key was lost"
-pass "concurrent runs serialize STATE_FILE updates via lockdir"
 
-# 19. --ensure-gcp-policy creates/updates with timeout bounds and surfaces gcloud stderr on failure.
+# Abandoned empty (ownerless) lockdir and stale dead-PID lockdir must both be reclaimed cleanly.
+mkdir -p "$TMP/state-ownerless.json.lock"
+ownerless_err="$(
+  STATE_LOCK_TIMEOUT_SEC=8 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+    run_alert "$TMP/state-ownerless.json" "$TMP/gcloud-ownerless.log" "$TMP/gh-ownerless.log" 2>&1 >/dev/null
+)"
+! grep -q 'No such file or directory' <<<"$ownerless_err" || fail "ownerless lock recovery must not emit stderr noise: $ownerless_err"
+[ ! -d "$TMP/state-ownerless.json.lock" ] || fail "abandoned ownerless lockdir must be reclaimed and released"
+[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-ownerless.json")" != 0 ] || fail "ownerless lock recovery must allow alert state update"
+
+mkdir -p "$TMP/state-stalepid.json.lock"
+true &
+dead_pid=$!
+wait "$dead_pid"
+printf '%s\n' "$dead_pid" > "$TMP/state-stalepid.json.lock/pid"
+STATE_LOCK_TIMEOUT_SEC=5 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-stalepid.json" "$TMP/gcloud-stalepid.log" "$TMP/gh-stalepid.log" >/dev/null
+[ ! -d "$TMP/state-stalepid.json.lock" ] || fail "stale dead-PID lockdir must be reclaimed and released"
+! grep -q 'env GH_TOKEN=' "$SCRIPT" || fail "GH_TOKEN must not be passed in env/timeout argv"
+pass "concurrent runs serialize STATE_FILE updates and reclaim stale/ownerless lockdirs"
+
+# 19. --ensure-gcp-policy creates/updates with timeout bounds, exits non-zero, and surfaces gcloud stderr on failure.
 run_alert "$TMP/state-pol-create.json" "$TMP/gcloud-pol-create.log" "$TMP/gh-pol-create.log" --ensure-gcp-policy >/dev/null
 grep -q 'alpha monitoring policies create' "$TMP/gcloud-pol-create.log" || fail "--ensure-gcp-policy must create policy when none exists"
 
@@ -642,13 +673,17 @@ STUB_EXISTING_POLICY="projects/worldarchitecture-ai/alertPolicies/123" \
   run_alert "$TMP/state-pol-update.json" "$TMP/gcloud-pol-update.log" "$TMP/gh-pol-update.log" --ensure-gcp-policy >/dev/null
 grep -q 'alpha monitoring policies update projects/worldarchitecture-ai/alertPolicies/123' "$TMP/gcloud-pol-update.log" || fail "--ensure-gcp-policy must update existing policy"
 
-pol_err_out="$(GCLOUD_POLICY_FAIL=1 run_alert "$TMP/state-pol-err.json" "$TMP/gcloud-pol-err.log" "$TMP/gh-pol-err.log" --ensure-gcp-policy 2>&1 || true)"
+pol_err_rc=0
+pol_err_out="$(GCLOUD_POLICY_FAIL=1 run_alert "$TMP/state-pol-err.json" "$TMP/gcloud-pol-err.log" "$TMP/gh-pol-err.log" --ensure-gcp-policy 2>&1)" || pol_err_rc=$?
+[ "$pol_err_rc" -ne 0 ] || fail "--ensure-gcp-policy must exit non-zero when gcloud fails"
 grep -q 'gcloud: policy API permission denied' <<<"$pol_err_out" || fail "--ensure-gcp-policy must surface gcloud stderr on failure"
 
 start_ts="$(date +%s)"
+pol_to_rc=0
 GCLOUD_STUB_SLEEP=6 GCLOUD_CALL_TIMEOUT_SEC=1 \
-  run_alert "$TMP/state-pol-timeout.json" "$TMP/gcloud-pol-timeout.log" "$TMP/gh-pol-timeout.log" --ensure-gcp-policy >/dev/null 2>&1 || true
+  run_alert "$TMP/state-pol-timeout.json" "$TMP/gcloud-pol-timeout.log" "$TMP/gh-pol-timeout.log" --ensure-gcp-policy >/dev/null 2>&1 || pol_to_rc=$?
 end_ts="$(date +%s)"
 elapsed=$((end_ts - start_ts))
+[ "$pol_to_rc" -ne 0 ] || fail "--ensure-gcp-policy must exit non-zero when gcloud times out"
 [ "$elapsed" -lt 5 ] || fail "stalled --ensure-gcp-policy gcloud call must be killed by GCLOUD_CALL_TIMEOUT_SEC=1 (took ${elapsed}s)"
-pass "--ensure-gcp-policy creates/updates with timeout bounds and surfaces stderr on failure"
+pass "--ensure-gcp-policy creates/updates with timeout bounds, exits non-zero, and surfaces stderr on failure"

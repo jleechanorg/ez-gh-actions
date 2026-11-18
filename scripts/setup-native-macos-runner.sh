@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # setup-native-macos-runner.sh — Idempotent setup & verifier for a general-CI
-# native macOS GitHub Actions runner (`mac-native-ci-1`). Isolates job labels
-# (`self-hosted-native-macos`), runner/Scratch `_work` directories, and launchd
-# security audit session (`SessionCreate=true`) from the TestFlight signing
-# runner (`/Users/jleechan/actions-runner`) and Linux `self-hosted` jobs, while
-# sharing the operator's macOS user account (`$HOME`); public-repo workflows
-# targeting `self-hosted-native-macos` must gate out untrusted fork PRs.
+# native macOS GitHub Actions runner (`mac-native-ci-1`). Uses separate
+# runner/Scratch `_work` paths and `--no-default-labels --labels self-hosted-native-macos`
+# (`SessionCreate=true`) from the TestFlight signing runner
+# (`/Users/jleechan/actions-runner`) and Linux `self-hosted` jobs, while sharing
+# the operator's macOS UID/`$HOME` (not a user-account sandbox); public-repo
+# workflows targeting `self-hosted-native-macos` must gate out untrusted fork PRs.
 #
 # Usage:
 #   setup-native-macos-runner.sh [--dry-run] [--verify] [--uninstall]
@@ -459,15 +459,11 @@ mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
 STAGE_DIR=""
 TMP_TGZ=""
 BACKUP_DIR=""
-KEEP_BACKUP=0
 CANDIDATE_PLIST=""
 cleanup_setup() {
   [ -z "$STAGE_DIR" ] || rm -rf "$STAGE_DIR"
   [ -z "$TMP_TGZ" ] || rm -f "$TMP_TGZ"
   [ -z "$CANDIDATE_PLIST" ] || rm -f "$CANDIDATE_PLIST"
-  if [ "$KEEP_BACKUP" -eq 0 ] && [ -n "$BACKUP_DIR" ]; then
-    rm -rf "$BACKUP_DIR"
-  fi
 }
 trap cleanup_setup EXIT
 
@@ -498,6 +494,10 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
     echo "ERROR: staged runner binaries incomplete in ${STAGE_DIR}" >&2
     exit 1
   fi
+  if ! stop_launchagent; then
+    echo "ERROR: failed to stop ${PLIST_LABEL} before promoting staged runner binaries" >&2
+    exit 1
+  fi
   shopt -s nullglob
   for item in "${STAGE_DIR}"/*; do
     [ -e "$item" ] || continue
@@ -523,10 +523,6 @@ if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_
 fi
 
 if [ "$needs_config" -eq 1 ]; then
-  was_loaded=0
-  if launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1; then
-    was_loaded=1
-  fi
   reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token')"
   [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
   if ! stop_launchagent; then
@@ -534,12 +530,9 @@ if [ "$needs_config" -eq 1 ]; then
     exit 1
   fi
 
-  BACKUP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ezgha-runner-backup.XXXXXX")"
+  BACKUP_DIR="${RUNNER_DIR}/.backup-pre-reconfigure.$$"
+  mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
-  old_agent_id=""
-  if [ -f "${RUNNER_DIR}/.runner" ]; then
-    old_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-  fi
   for f in .runner .credentials .credentials_rsaparams .ezgha-labels; do
     if [ -f "${RUNNER_DIR}/${f}" ]; then
       cp -p "${RUNNER_DIR}/${f}" "${BACKUP_DIR}/${f}"
@@ -561,34 +554,9 @@ if [ "$needs_config" -eq 1 ]; then
   ) || config_rc=$?
 
   if [ "$config_rc" -ne 0 ]; then
-    remote_unchanged=0
-    if [ -n "$old_agent_id" ] && runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 2>/dev/null)"; then
-      if printf '%s\n' "$runners_pages" | jq -se --arg id "$old_agent_id" '[.[].runners[]? | select((.id | tostring) == $id)] | length > 0' >/dev/null 2>&1; then
-        remote_unchanged=1
-      fi
-    elif [ -z "$old_agent_id" ] && [ -f "${BACKUP_DIR}/.credentials" ]; then
-      remote_unchanged=1
-    fi
-
-    if [ "$remote_unchanged" -eq 1 ]; then
-      echo "WARN: config.sh failed (rc=$config_rc); remote registration unchanged, restoring prior runner configuration" >&2
-      for f in .runner .credentials .credentials_rsaparams .ezgha-labels; do
-        if [ -f "${BACKUP_DIR}/${f}" ]; then
-          cp -p "${BACKUP_DIR}/${f}" "${RUNNER_DIR}/${f}"
-        fi
-      done
-      if [ "$was_loaded" -eq 1 ] && [ -f "$PLIST_PATH" ]; then
-        launchctl load -w "$PLIST_PATH" 2>/dev/null || true
-      fi
-    else
-      echo "ERROR: config.sh failed (rc=$config_rc) and remote registration may have changed; not restoring stale credentials" >&2
-      rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams"
-      if [ -f "${BACKUP_DIR}/.runner" ]; then
-        KEEP_BACKUP=1
-        echo "WARN: prior configuration backup preserved at ${BACKUP_DIR}" >&2
-      fi
-    fi
-    exit "$config_rc"
+    rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams"
+    echo "ERROR: config.sh failed (rc=${config_rc}); service ${PLIST_LABEL} remains stopped and old credentials were not restored. Backup preserved at ${BACKUP_DIR}; re-run --reconfigure after resolving the registration failure." >&2
+    exit 4
   fi
 
   rm -rf "$BACKUP_DIR"

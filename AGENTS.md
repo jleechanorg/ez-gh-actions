@@ -252,11 +252,11 @@ runner (`mac-native-ci-1`) at `/Users/jleechan/actions-runner-macos-ci` with wor
 Scratch (`native-macos-ci-work`, failing closed if Scratch is unavailable), `--no-default-labels --labels self-hosted-native-macos` (requiring `self-hosted-native-macos`, forbidding
 bare `self-hosted` and `worldai-testflight-native-mac`, and canonically refusing `$HOME`, `/`, and filesystem-identical/case-alias/ancestor/descendant paths of `~/actions-runner` and `~/actions-runner-smtp-egress` for both `--runner-dir` and `--work-dir`), and LaunchAgent
 `org.jleechanorg.ezgha-native-macos-runner.plist` (with `<key>SessionCreate</key><true/>`). This
-isolates job labels, runner/Scratch `_work` directories, and the launchd security audit session
-from `worldai-testflight-native-mac`'s `SessionCreate=false` GUI signing session at
+uses separate runner/Scratch `_work` paths and `--no-default-labels --labels self-hosted-native-macos`
+(`SessionCreate=true`) from `worldai-testflight-native-mac`'s `SessionCreate=false` GUI signing session at
 `/Users/jleechan/actions-runner` and from Linux `self-hosted` jobs, while sharing the operator's
-macOS user account (`$HOME`), so public-repo workflows targeting `self-hosted-native-macos` must
-gate out untrusted fork PRs. Binary provisioning stages and validates `Runner.Listener`/`config.sh`/`run.sh` so interrupted installs repair on retry; reconfiguration verifies launchd unload before removing credentials and preserves backups until `--replace` succeeds; no-change reruns leave an already-loaded LaunchAgent untouched; and `--uninstall` executes before Scratch resolution while confirming the GUI-domain job is unloaded before removing the plist.
+macOS UID/`$HOME` (not a user-account sandbox), so public-repo workflows targeting `self-hosted-native-macos` must
+gate out untrusted fork PRs. Binary provisioning stages and validates `Runner.Listener`/`config.sh`/`run.sh` so interrupted installs repair on retry; reconfiguration verifies launchd unload before removing credentials, preserves `.backup-pre-reconfigure.<pid>` on failure, and exits non-zero (`4`) fail-closed without restoring old credentials or restarting the service; no-change reruns leave an already-loaded LaunchAgent untouched; and `--uninstall` executes before Scratch resolution while confirming the GUI-domain job is unloaded before removing the plist.
 - **Recovery / setup (OPERATOR-ONLY):**
   - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh` (install/re-register + load LaunchAgent; pass `--reconfigure` to force unload and re-registration)
   - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh --verify` (check binaries, `WORK_DIR`, `.runner`, `.ezgha-labels`, `GH_BIN` live GitHub labels unless `--offline`, `SessionCreate=true`, plist `WorkingDirectory`/`ProgramArguments`, and launchd state)
