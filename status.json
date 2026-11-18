@@ -2,15 +2,15 @@
   "fleets": {
     "linux": {
       "disk": {
-        "status": "healthy"
+        "status": "critical"
       },
       "fleet": {
         "configured": 20,
         "cycling": 0,
-        "down": 11,
-        "executing": 9,
-        "idle": 0,
-        "reserved": 10
+        "down": 3,
+        "executing": 16,
+        "idle": 1,
+        "reserved": 16
       },
       "sources": {
         "config": {
@@ -39,22 +39,22 @@
     },
     "mac": {
       "disk": {
-        "status": "healthy"
+        "status": "unknown"
       },
       "fleet": {
         "configured": 4,
         "cycling": 0,
-        "down": 2,
-        "executing": 2,
+        "down": 4,
+        "executing": 0,
         "idle": 0,
-        "reserved": 2
+        "reserved": 0
       },
       "sources": {
         "config": {
           "ok": true
         },
         "disk": {
-          "ok": true
+          "ok": false
         },
         "docker": {
           "ok": true
@@ -75,17 +75,17 @@
       }
     }
   },
-  "observed_at": "2026-11-18T17:28:27Z",
-  "published_at": "2026-11-18T17:29:32Z",
+  "observed_at": "2026-11-18T17:42:12Z",
+  "published_at": "2026-11-18T17:43:26Z",
   "queue": {
-    "fresh": 13,
-    "ghosts": 165,
+    "fresh": 1,
+    "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 18,
+    "oldest_fresh_wait_minutes": 1,
     "repos": [
       {
-        "fresh": 13,
-        "ghosts": 150,
+        "fresh": 1,
+        "ghosts": 149,
         "repo": "jleechanorg/worldarchitect.ai"
       },
       {
