@@ -549,9 +549,14 @@ if [ "\${1:-}" = "unload" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; 
   exit 0
 fi
 if [ "\${1:-}" = "print" ] && [[ "\${2:-}" == *gh-actions-cost-alert ]]; then
+  if [ -n "\${COST_PRINT_ERR_RC:-}" ]; then
+    echo "\${COST_PRINT_ERR_MSG:-launchctl: lookup error}" >&2
+    exit "\${COST_PRINT_ERR_RC}"
+  fi
   if [ -f "$COST_FAIL_HOME/loaded" ]; then
     exit 0
   fi
+  echo "Could not find service \"\${2:-}\" in domain" >&2
   exit 113
 fi
 if [ "\${1:-}" = "load" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; then
@@ -586,9 +591,10 @@ if compgen -G "$COST_FAIL_HOME/.local/state/ezgha/.gh-actions-cost-alert.sh.back
   fail "failed cost-alert load must clean up temporary script backup"
 fi
 
-# Refusing to unload org.jleechanorg.ezgha-gh-actions-cost-alert must restore gh-actions-cost-alert.sh and exit non-zero BEFORE overwriting plist.
+# Refusing to unload org.jleechanorg.ezgha-gh-actions-cost-alert must abort BEFORE overwriting live gh-actions-cost-alert.sh or plist.
 : > "$COST_FAIL_HOME/loaded"
 printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+prior_inode="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")"
 cost_refuse_rc=0
 COST_REFUSE_UNLOAD=1 BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
   bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || cost_refuse_rc=$?
@@ -597,10 +603,49 @@ COST_REFUSE_UNLOAD=1 BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_
 [ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
   fail "cost-alert upgrade when unload fails must keep prior plist untouched"
 [ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
-  fail "cost-alert upgrade when unload fails must restore prior gh-actions-cost-alert.sh"
+  fail "cost-alert upgrade when unload fails must keep prior gh-actions-cost-alert.sh"
+after_refuse_inode="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")"
+[ "$after_refuse_inode" = "$prior_inode" ] || \
+  fail "cost-alert upgrade when unload fails must NEVER overwrite live gh-actions-cost-alert.sh (inode changed $prior_inode -> $after_refuse_inode)"
+if compgen -G "$COST_FAIL_HOME/.local/libexec/ezgha/.gh-actions-cost-alert.sh.staged.*" >/dev/null; then
+  fail "refused cost-alert unload must clean up staged script"
+fi
 if compgen -G "$COST_FAIL_HOME/.local/state/ezgha/.gh-actions-cost-alert.sh.backup.*" >/dev/null; then
   fail "refused cost-alert unload must clean up temporary script backup"
 fi
+
+# Indeterminate launchctl print lookup error (rc=2) must fail closed BEFORE overwriting live gh-actions-cost-alert.sh or plist.
+printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+cost_lookup_rc=0
+COST_PRINT_ERR_RC=2 BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || cost_lookup_rc=$?
+[ "$cost_lookup_rc" -ne 0 ] || fail "cost-alert upgrade with indeterminate launchctl print error must fail closed"
+[ "$(cat "$COST_FAIL_HOME/load-count.txt")" = "0" ] || fail "indeterminate launchctl print error must abort before calling launchctl load"
+[ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
+  fail "indeterminate launchctl print error must keep prior plist untouched"
+[ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
+  fail "indeterminate launchctl print error must keep prior gh-actions-cost-alert.sh untouched"
+after_lookup_inode="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_ino)' "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")"
+[ "$after_lookup_inode" = "$prior_inode" ] || \
+  fail "indeterminate launchctl print error must NEVER overwrite live gh-actions-cost-alert.sh"
+if compgen -G "$COST_FAIL_HOME/.local/libexec/ezgha/.gh-actions-cost-alert.sh.staged.*" >/dev/null; then
+  fail "indeterminate launchctl print error must clean up staged script"
+fi
+
+# Failed upgrade when prior plist existed on disk but incumbent was NOT loaded must restore files WITHOUT loading the stopped job.
+rm -f "$COST_FAIL_HOME/loaded"
+printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+cost_unloaded_fail_rc=0
+BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || cost_unloaded_fail_rc=$?
+[ "$cost_unloaded_fail_rc" -eq 42 ] || fail "failed cost-alert upgrade from unloaded state must exit 42 (got $cost_unloaded_fail_rc)"
+[ "$(cat "$COST_FAIL_HOME/load-count.txt")" = "1" ] || \
+  fail "failed cost-alert upgrade from unloaded state must NOT reload stopped job on rollback (load-count=$(cat "$COST_FAIL_HOME/load-count.txt"))"
+[ ! -e "$COST_FAIL_HOME/loaded" ] || fail "failed cost-alert upgrade from unloaded state must leave job unloaded"
+[ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
+  fail "failed cost-alert upgrade from unloaded state must restore prior plist"
+[ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
+  fail "failed cost-alert upgrade from unloaded state must restore prior gh-actions-cost-alert.sh"
 
 # Unrelated targeted install (e.g. token-refresh) must NOT overwrite or copy gh-actions-cost-alert.sh.
 UNREL_HOME="$TMP/unrelated-install-home"
@@ -1250,7 +1295,8 @@ grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must reconfigure wh
 
 : > "$TMP/config.log"
 bad_post_rc=0
-RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+POST_CONFIG_VERIFY_ATTEMPTS=3 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   GROUP_RUNNERS_JSON='{"total_count":0,"runners":[]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null 2>&1 || bad_post_rc=$?
@@ -1687,3 +1733,52 @@ HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-v
   "$SETUP_SCRIPT" --dry-run --runner-dir "$TMP/eloop/a/sub" >/dev/null 2>&1 || eloop_rc=$?
 [ "$eloop_rc" -eq 2 ] || fail "is_reserved_runner_dir must fail closed (exit 2) on ELOOP symlink loop (got $eloop_rc)"
 pass "Round-19 fixes: P0 staging/token/ownership order, post-launch + idempotent online readback, and strict ENOENT-only reserved check hold"
+
+# 26. Round-20 P0 #1 regression: destination-only escaping symlink (externals.9.99.0 -> /outside, absent in staging)
+#     must fail --verify initially, be removed during promote_staged_binaries, and pass both setup and subsequent --verify.
+ESC_RUNNER="$TMP/home/escaping-stale-runner"
+mkdir -p "$ESC_RUNNER/bin" "$ESC_RUNNER/externals"
+cp "$EXISTING_SYM/bin.2.338.2/Runner.Listener" "$ESC_RUNNER/bin/Runner.Listener"
+cp "$EXISTING_SYM/config.sh" "$ESC_RUNNER/config.sh"
+cp "$EXISTING_SYM/run.sh" "$ESC_RUNNER/run.sh"
+: > "$ESC_RUNNER/run-helper.sh.template"
+: > "$ESC_RUNNER/env.sh"
+ln -sfn /outside "$ESC_RUNNER/externals.9.99.0"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$ESC_RUNNER/.runner"
+printf 'creds\n' > "$ESC_RUNNER/.credentials"
+printf 'rsa\n' > "$ESC_RUNNER/.credentials_rsaparams"
+printf 'self-hosted-native-macos\n' > "$ESC_RUNNER/.ezgha-labels"
+printf 'macos-restricted\n' > "$ESC_RUNNER/.ezgha-group"
+python3 - "$TMP/plist.ok" "$PLIST_T" "$ESC_RUNNER" <<'PY'
+import plistlib, sys
+from pathlib import Path
+d = plistlib.loads(Path(sys.argv[1]).read_bytes())
+r = sys.argv[3]
+d["WorkingDirectory"] = r
+d["ProgramArguments"] = ["/bin/bash", f"{r}/run.sh"]
+Path(sys.argv[2]).write_bytes(plistlib.dumps(d))
+PY
+: > "$TMP/launchctl.loaded"
+
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify --offline must fail when destination-only externals.9.99.0 symlinks to /outside"
+fi
+
+POST_CONFIG_VERIFY_ATTEMPTS=3 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null || \
+  fail "setup repair must succeed after removing destination-only escaping externals.9.99.0 symlink"
+
+[ ! -e "$ESC_RUNNER/externals.9.99.0" ] && [ ! -L "$ESC_RUNNER/externals.9.99.0" ] || \
+  fail "promote_staged_binaries must remove destination-only stale externals.9.99.0 symlink"
+
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null || \
+  fail "subsequent --verify must pass after promote_staged_binaries removes stale externals.9.99.0"
+pass "Round-20 P0 #1 regression: destination-only escaping externals.9.99.0 symlink is removed during promotion and passes setup + --verify"

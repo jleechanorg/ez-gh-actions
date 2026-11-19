@@ -34,8 +34,9 @@ if [ -n "$RUNNER_GROUP" ]; then
 fi
 ALLOW_PUBLIC_FORK_EXPOSURE="${ALLOW_PUBLIC_FORK_EXPOSURE:-0}"
 FORCE_REPLACE_NAME="${FORCE_REPLACE_NAME:-0}"
-POST_CONFIG_VERIFY_ATTEMPTS="${POST_CONFIG_VERIFY_ATTEMPTS:-3}"
-POST_CONFIG_VERIFY_SLEEP_SEC="${POST_CONFIG_VERIFY_SLEEP_SEC:-1}"
+POST_CONFIG_VERIFY_ATTEMPTS="${POST_CONFIG_VERIFY_ATTEMPTS:-15}"
+POST_CONFIG_VERIFY_SLEEP_SEC="${POST_CONFIG_VERIFY_SLEEP_SEC:-2}"
+GH_CALL_TIMEOUT_SEC="${GH_CALL_TIMEOUT_SEC:-30}"
 RUNNER_NAME="${NATIVE_MACOS_RUNNER_NAME:-mac-native-ci-1}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner-macos-ci}"
 EXISTING_RUNNER_DIR="${EXISTING_RUNNER_DIR:-$HOME/actions-runner}"
@@ -97,7 +98,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# Authority: defensive operational guards/bounds (SETUP_LOCK_TIMEOUT_SEC=30, POST_CONFIG_VERIFY_ATTEMPTS=3, --offline scope, --repo/--runner-group exclusion) per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257-258 (self-outage prevention; unrequested defaults disclosed in PR #238).
+# Authority: defensive operational guards/bounds (SETUP_LOCK_TIMEOUT_SEC=30, POST_CONFIG_VERIFY_ATTEMPTS=15, POST_CONFIG_VERIFY_SLEEP_SEC=2, GH_CALL_TIMEOUT_SEC=30, --offline scope, --repo/--runner-group exclusion) per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257-258 (self-outage prevention; unrequested defaults disclosed in PR #238).
 mode_count=$((VERIFY + UNINSTALL + RECONFIGURE + DRY_RUN))
 if [ "$mode_count" -gt 1 ]; then
   echo "ERROR: conflicting action flags (--verify, --uninstall, --reconfigure, --dry-run are mutually exclusive)" >&2
@@ -136,6 +137,14 @@ case "$POST_CONFIG_VERIFY_SLEEP_SEC" in
   ''|*[!0-9]*) echo "ERROR: invalid POST_CONFIG_VERIFY_SLEEP_SEC='$POST_CONFIG_VERIFY_SLEEP_SEC' (expected non-negative integer)" >&2; exit 2 ;;
 esac
 
+case "$GH_CALL_TIMEOUT_SEC" in
+  ''|*[!0-9]*) echo "ERROR: invalid GH_CALL_TIMEOUT_SEC='$GH_CALL_TIMEOUT_SEC' (expected positive integer)" >&2; exit 2 ;;
+esac
+if [ "$GH_CALL_TIMEOUT_SEC" -lt 1 ]; then
+  echo "ERROR: invalid GH_CALL_TIMEOUT_SEC='$GH_CALL_TIMEOUT_SEC' (expected >= 1)" >&2
+  exit 2
+fi
+
 # Ponytail standalone-libexec rationale: resolve_python3 and fcntl.flock remain inline so setup-native-macos-runner.sh runs standalone without sibling helper dependencies (matching launchd/install-launchagents.sh).
 resolve_python3() {
   local cand=""
@@ -161,6 +170,48 @@ canonical_path() {
   local py_bin
   py_bin="$(resolve_python3)" || { echo "ERROR: python3 not found" >&2; return 1; }
   "$py_bin" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+run_with_timeout() {
+  local timeout_sec="$1"
+  shift
+  local timeout_bin="" rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_bin="timeout"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    timeout_bin="gtimeout"
+  fi
+  if [ -n "$timeout_bin" ]; then
+    "$timeout_bin" -k 5 "$timeout_sec" "$@" 9>&- || rc=$?
+    return "$rc"
+  fi
+  local out_tmp
+  out_tmp="$(mktemp)"
+  (
+    exec 9>&-
+    exec "$@"
+  ) > "$out_tmp" &
+  local pid=$!
+  local deadline=$((SECONDS + timeout_sec))
+  while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.5
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    rm -f "$out_tmp"
+    return 124
+  fi
+  wait "$pid" || rc=$?
+  cat "$out_tmp"
+  rm -f "$out_tmp"
+  return "$rc"
+}
+
+run_gh_api() {
+  run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" "$@"
 }
 
 EXISTING_RUNNER_DIR_RAW="${EXISTING_RUNNER_DIR%/}"
@@ -720,7 +771,7 @@ verify_server_fork_protection() {
   VERIFIED_RUNNER_GROUP_ID=""
   local is_priv="" groups_json="" group_json="" allows_pub="" restricted_wf="" selected_wf_count=""
   if [ -n "$RUNNER_REPO" ]; then
-    if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private' 9>&-)"; then
+    if ! is_priv="$(run_gh_api api "repos/${RUNNER_REPO}" --jq '.private')"; then
       echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
       exit 5
     fi
@@ -733,7 +784,7 @@ verify_server_fork_protection() {
       fi
     fi
   else
-    if ! groups_json="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups" 9>&-)"; then
+    if ! groups_json="$(run_gh_api api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups")"; then
       echo "ERROR: failed to query runner groups for org '${RUNNER_ORG}'" >&2
       exit 5
     fi
@@ -766,7 +817,7 @@ verify_live_runner_state_once() {
   local runners_pages="" runner_json="" live_status=""
   local group_runners_pages="" in_group=0 live_labels_csv="" expected_sorted_csv=""
 
-  if ! runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+  if ! runners_pages="$(run_gh_api api --paginate "$RUNNERS_API")"; then
     echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
     return 2
   fi
@@ -804,7 +855,7 @@ verify_live_runner_state_once() {
       echo "FAIL: missing verified runner group id for '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
       return 1
     fi
-    if ! group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners" 9>&-)"; then
+    if ! group_runners_pages="$(run_gh_api api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners")"; then
       echo "ERROR: failed to query runners for org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
       return 2
     fi
@@ -874,7 +925,7 @@ verify_runner_online() {
 
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     live_status=""
-    if runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+    if runners_pages="$(run_gh_api api --paginate "$RUNNERS_API")"; then
       runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
       if [ -n "$runner_json" ]; then
         live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
@@ -1018,7 +1069,7 @@ verify_server_fork_protection
 resolve_replace_collision_policy() {
   local prev_id="${1:-}" pre_runners_pages="" colliding_ids=""
   use_replace=0
-  if ! pre_runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+  if ! pre_runners_pages="$(run_gh_api api --paginate "$RUNNERS_API")"; then
     echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
     exit 1
   fi
@@ -1201,8 +1252,11 @@ promote_staged_binaries() {
     exit 1
   }
   mkdir -p "$RUNNER_DIR"
-  local item base
+  local item base old
   shopt -s nullglob
+  for old in "${RUNNER_DIR:?}"/bin "${RUNNER_DIR:?}"/bin.* "${RUNNER_DIR:?}"/externals "${RUNNER_DIR:?}"/externals.* "${RUNNER_DIR:?}"/run.sh "${RUNNER_DIR:?}"/runsvc.sh "${RUNNER_DIR:?}"/config.sh "${RUNNER_DIR:?}"/env.sh "${RUNNER_DIR:?}"/run-helper.sh.template "${RUNNER_DIR:?}"/safe_sleep.sh; do
+    rm -rf "${old:?}"
+  done
   for item in "${STAGE_TMP}"/*; do
     [ -e "$item" ] || [ -L "$item" ] || continue
     base="$(basename "$item")"
@@ -1212,6 +1266,10 @@ promote_staged_binaries() {
   shopt -u nullglob
   rm -rf "${STAGE_TMP:?}"
   STAGE_TMP=""
+  if ! runner_binaries_ready "$RUNNER_DIR"; then
+    echo "ERROR: promoted runner binaries incomplete or contain escaping symlinks in ${RUNNER_DIR}" >&2
+    exit 1
+  fi
 }
 
 binaries_staged=0
@@ -1222,7 +1280,7 @@ fi
 
 reg_token=""
 if [ "$needs_config" -eq 1 ]; then
-  if ! reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)" || [ -z "$reg_token" ]; then
+  if ! reg_token="$(run_gh_api api -X POST "$TOKEN_API" --jq '.token')" || [ -z "$reg_token" ]; then
     echo "ERROR: failed to mint registration token from $TOKEN_API" >&2
     exit 3
   fi

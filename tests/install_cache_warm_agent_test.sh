@@ -7,13 +7,40 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 HOME_T="${WORK}/home"
 STUB_BIN="${WORK}/bin"
-mkdir -p "${HOME_T}/Library/LaunchAgents" "${STUB_BIN}"
+mkdir -p "${HOME_T}/Library/LaunchAgents" "${STUB_BIN}" "${WORK}/launchctl-state"
 
-cat > "${STUB_BIN}/launchctl" <<'EOF'
+cat > "${STUB_BIN}/launchctl" <<EOF
 #!/usr/bin/env bash
-printf '%s\n' "$*" >> "${LAUNCHCTL_LOG:?}"
-if [[ "$1" == load && "$*" == *"${FAIL_LAUNCHCTL_LABEL:-__never__}"* ]]; then exit 1; fi
-if [[ "$1" == print && "$*" == *"${FAIL_LAUNCHCTL_PRINT_LABEL:-__never__}"* ]]; then exit 1; fi
+state_dir="${WORK}/launchctl-state"
+mkdir -p "\$state_dir"
+printf '%s\n' "\$*" >> "\${LAUNCHCTL_LOG:?}"
+if [[ "\$1" == load && "\$*" == *"\${FAIL_LAUNCHCTL_LABEL:-__never__}"* ]]; then exit 1; fi
+if [[ "\$1" == print && "\$*" == *"\${FAIL_LAUNCHCTL_PRINT_LABEL:-__never__}"* ]]; then
+  echo "Could not find service \"\${2:-}\" in domain" >&2
+  exit 113
+fi
+case "\${1:-}" in
+  load)
+    lbl="\$(basename "\${2:-}" .plist)"
+    : > "\$state_dir/\$lbl"
+    ;;
+  unload)
+    lbl="\$(basename "\${2:-}" .plist)"
+    rm -f "\$state_dir/\$lbl"
+    ;;
+  bootout)
+    lbl="\${2##*/}"
+    rm -f "\$state_dir/\$lbl"
+    ;;
+  print)
+    lbl="\${2##*/}"
+    if [[ -f "\$state_dir/\$lbl" ]]; then
+      exit 0
+    fi
+    echo "Could not find service \"\${2:-}\" in domain" >&2
+    exit 113
+    ;;
+esac
 exit 0
 EOF
 cat > "${STUB_BIN}/uname" <<'EOF'

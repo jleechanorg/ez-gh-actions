@@ -546,6 +546,17 @@ run_app_token_fallback() {
   if [ "$repo_count" -ge "$FALLBACK_REPOS_PER_PAGE" ]; then
     FALLBACK_INCOMPLETE=1
   fi
+  if jq -e 'type == "array" and any(.[]; (type != "object") or ((.full_name | type) != "string") or ((.full_name | length) == 0))' "$tmp.repos" >/dev/null 2>&1; then
+    FALLBACK_INCOMPLETE=1
+  fi
+  if ! jq -r '
+    if type == "array" then
+      (.[] | select((type == "object") and ((.full_name | type) == "string") and ((.full_name | length) > 0)) | [(if ((.name | type) == "string") and ((.name | length) > 0) then .name else "(unknown)" end), .full_name] | @tsv)
+    else empty end
+  ' "$tmp.repos" > "$tmp.repo_list" 2>"$tmp.err"; then
+    FALLBACK_INCOMPLETE=1
+    : > "$tmp.repo_list"
+  fi
 
   : > "$tmp.fallback_items"
   local repo_name full_name run_id
@@ -570,6 +581,20 @@ run_app_token_fallback() {
     fi
     if [ "$runs_count" -ge "$FALLBACK_RUNS_PER_PAGE" ]; then
       FALLBACK_INCOMPLETE=1
+    fi
+    if jq -e 'if (type == "object") and ((.workflow_runs | type) == "array") then any(.workflow_runs[]; (type != "object") or ((.id | type) != "number") or (.id != (.id | floor))) else true end' "$tmp.runs" >/dev/null 2>&1; then
+      FALLBACK_INCOMPLETE=1
+    fi
+    if ! jq -r --arg yesterday "$YESTERDAY_UTC" '
+      if (type == "object") and ((.workflow_runs | type) == "array") then
+        .workflow_runs[]
+        | select((type == "object") and ((.id | type) == "number") and (.id == (.id | floor)))
+        | select(((.conclusion // "") | tostring) != "skipped" and (((((.updated_at // .created_at // "") | tostring)[:10]) >= $yesterday) or (((.status // "") | tostring) == "in_progress") or (((.status // "") | tostring) == "queued")))
+        | .id
+      else empty end
+    ' "$tmp.runs" > "$tmp.run_ids" 2>"$tmp.err"; then
+      FALLBACK_INCOMPLETE=1
+      : > "$tmp.run_ids"
     fi
 
     while IFS= read -r run_id; do
@@ -676,19 +701,11 @@ run_app_token_fallback() {
       if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
         break
       fi
-    done < <(jq -r --arg yesterday "$YESTERDAY_UTC" '
-      if (type == "object") and ((.workflow_runs | type) == "array") then
-        .workflow_runs[]
-        | select((.conclusion // "") != "skipped" and ((((.updated_at // .created_at // "")[:10]) >= $yesterday) or ((.status // "") == "in_progress") or ((.status // "") == "queued")))
-        | (.id // empty)
-      else empty end
-    ' "$tmp.runs" 2>/dev/null || true)
+    done < "$tmp.run_ids"
     if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
       break
     fi
-  done < <(jq -r '
-    if type == "array" then (.[] | [(if (.name // "") == "" then "(unknown)" else .name end), (.full_name // "")] | @tsv) else empty end
-  ' "$tmp.repos" 2>/dev/null || true)
+  done < "$tmp.repo_list"
 
   if [ -s "$tmp.fallback_items" ] && jq -se 'any(.[]; .unpriced_hosted == true)' "$tmp.fallback_items" >/dev/null 2>&1; then
     FALLBACK_INCOMPLETE=1
@@ -762,11 +779,19 @@ if [ -z "$fallback_reason" ]; then
   if ! jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
     def norm_repo: if (. // "") == "" then "(org-level)" else . end;
     def is_macos_min: (((.sku // "") | test("macos"; "i")) and (((.unitType // "") | ascii_downcase) == "minutes"));
-    def sum_gross: (map(.grossAmount // 0) | add // 0);
-    def sum_net: (map(.netAmount // 0) | add // 0);
-    def sum_macos_min: (map(if is_macos_min then (.quantity // 0) else 0 end) | add // 0);
+    def is_valid_action_item:
+      (type == "object")
+      and ((.grossAmount | type) == "number")
+      and ((.netAmount | type) == "number")
+      and ((.quantity | type) == "number")
+      and ((.date | type) == "string")
+      and (((.date[:10]) | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
+      and ((try (((.date[:10]) + "T00:00:00Z") | fromdateiso8601) catch null) != null);
+    def sum_gross: (map(.grossAmount) | add // 0);
+    def sum_net: (map(.netAmount) | add // 0);
+    def sum_macos_min: (map(if is_macos_min then .quantity else 0 end) | add // 0);
     def day_summary($d; $all_actions):
-      ($all_actions | map(select(((.date // "")[:10]) == $d))) as $items
+      ($all_actions | map(select((.date[:10]) == $d))) as $items
       | ($items | group_by(.repositoryName | norm_repo) | map({
           repo: (.[0].repositoryName | norm_repo),
           gross_usd: sum_gross,
@@ -787,8 +812,11 @@ if [ -z "$fallback_reason" ]; then
           top_net_repo_net_usd: ($net_repos[0].net_usd // 0),
           top_net_repo_gross_usd: ($net_repos[0].gross_usd // 0)
         };
-    [(.usageItems // [])[] | select(((.product // "") | ascii_downcase) == "actions")] as $all_actions
-    | [$all_actions[] | select(((.date // "")[:7]) == $year_month)] as $mtd_actions
+    (.usageItems // []) as $raw_items
+    | (if all($raw_items[]; type == "object") then . else error("usageItems entries must be objects") end)
+    | [$raw_items[] | select(((.product // "") | type) == "string" and (((.product // "") | ascii_downcase) == "actions"))] as $all_actions
+    | (if all($all_actions[]; is_valid_action_item) then . else error("invalid Actions usageItem fields") end)
+    | [$all_actions[] | select((.date[:7]) == $year_month)] as $mtd_actions
     | (if $include_yest == 1 then [$yesterday, $today] else [$today] end) as $target_days
     | {
         mtd: {

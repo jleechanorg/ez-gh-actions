@@ -1234,3 +1234,71 @@ grep -q '"gross_usd":30' "$TMP/gcloud-emptyrepo.log" || fail "normalized (org-le
 grep -q '"net_usd":15' "$TMP/gcloud-emptyrepo.log" || fail "normalized (org-level) row must preserve net_usd=15"
 grep -q '"macos_minutes":120' "$TMP/gcloud-emptyrepo.log" || fail "normalized (org-level) row must preserve macos_minutes=120"
 pass "Round-19 fixes: durable pending_corrupt_reset, fallback shape validation, and empty repositoryName TSV normalization hold"
+
+# 25. Round-20 fixes:
+#     a) Primary billing Actions row missing grossAmount or date fails primary parse, increments api_failures, and runs fallback
+#     b) Fallback marks mode=app_token_fallback_partial when a repo lacks non-empty string full_name or a run lacks integer id
+cat > "$TMP/billing-missing-gross.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-11-18T00:15:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":120.0,"unitType":"Minutes","netAmount":0.0,"repositoryName":"worldarchitect.ai"}
+  ]
+}
+JSON
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}\n' > "$TMP/state-missing-gross.json"
+missing_gross_out="$(
+  BILLING_FIXTURE="$TMP/billing-missing-gross.json" \
+  REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-missing-gross.json" "$TMP/gcloud-missing-gross.log" "$TMP/gh-missing-gross.log"
+)"
+grep -q 'mode=app_token_fallback' <<<"$missing_gross_out" || \
+  fail "Actions billing row missing grossAmount must fail primary parse and invoke App-token fallback (got: $missing_gross_out)"
+[ "$(jq -r '.api_failures' "$TMP/state-missing-gross.json")" = 1 ] || \
+  fail "Actions billing row missing grossAmount must increment api_failures=1 instead of clearing it"
+
+cat > "$TMP/billing-bad-date.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"not-a-date","product":"Actions","sku":"Actions macOS 3-core","quantity":120.0,"unitType":"Minutes","grossAmount":7.44,"netAmount":0.0,"repositoryName":"worldarchitect.ai"}
+  ]
+}
+JSON
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}\n' > "$TMP/state-bad-date.json"
+bad_date_out="$(
+  BILLING_FIXTURE="$TMP/billing-bad-date.json" \
+  REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-bad-date.json" "$TMP/gcloud-bad-date.log" "$TMP/gh-bad-date.log"
+)"
+grep -q 'mode=app_token_fallback' <<<"$bad_date_out" || \
+  fail "Actions billing row with invalid date must fail primary parse and invoke App-token fallback (got: $bad_date_out)"
+[ "$(jq -r '.api_failures' "$TMP/state-bad-date.json")" = 1 ] || \
+  fail "Actions billing row with invalid date must increment api_failures=1"
+
+cat > "$TMP/repos-missing-fullname.json" <<'JSON'
+[
+  {"name":"ok-repo","full_name":"jleechanorg/worldarchitect.ai"},
+  {"name":"broken-repo","full_name":""}
+]
+JSON
+missing_fullname_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos-missing-fullname.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-missing-fullname.json" "$TMP/gcloud-missing-fullname.log" "$TMP/gh-missing-fullname.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$missing_fullname_out" || \
+  fail "repo missing non-empty full_name must mark mode=app_token_fallback_partial (got: $missing_fullname_out)"
+
+cat > "$TMP/runs-missing-id.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9404,"status":"completed","conclusion":"success","created_at":"2026-11-18T02:00:00Z","updated_at":"2026-11-18T04:00:00Z"},
+    {"id":"not-an-int","status":"completed","conclusion":"success","created_at":"2026-11-18T02:00:00Z","updated_at":"2026-11-18T04:00:00Z"}
+  ]
+}
+JSON
+missing_id_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-missing-id.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-missing-id.json" "$TMP/gcloud-missing-id.log" "$TMP/gh-missing-id.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$missing_id_out" || \
+  fail "workflow_run lacking integer id must mark mode=app_token_fallback_partial (got: $missing_id_out)"
+pass "Round-20 fixes: primary Actions row schema validation and fallback repo/run ID partial detection hold"
