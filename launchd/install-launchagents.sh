@@ -39,6 +39,10 @@ DASHBOARD_PLIST_BACKUP=""
 DASHBOARD_HAD_PRIOR=0
 DASHBOARD_PRIOR_UNLOADED=false
 DASHBOARD_REPLACEMENT_INSTALLED=false
+COST_ALERT_LABEL="org.jleechanorg.ezgha-gh-actions-cost-alert"
+COST_ALERT_TRANSACTION_ACTIVE=false
+COST_ALERT_SCRIPT_BACKUP=""
+COST_ALERT_HAD_PRIOR_SCRIPT=0
 
 action="${1:-status}"
 label_filter="${2:-}"
@@ -214,7 +218,37 @@ restore_dashboard_payload() {
   done
 }
 
-rollback_dashboard_install() {
+backup_cost_alert_script() {
+  mkdir -p "${SCRIPTS_DIR}" "${STATE_DIR}"
+  chmod 0700 "${STATE_DIR}"
+  if [[ -f "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" ]]; then
+    COST_ALERT_SCRIPT_BACKUP="$(
+      mktemp "${STATE_DIR}/.gh-actions-cost-alert.sh.backup.XXXXXX"
+    )"
+    cp -p "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" "${COST_ALERT_SCRIPT_BACKUP}"
+    COST_ALERT_HAD_PRIOR_SCRIPT=1
+  fi
+  COST_ALERT_TRANSACTION_ACTIVE=true
+}
+
+restore_cost_alert_script() {
+  if [[ "${COST_ALERT_HAD_PRIOR_SCRIPT}" -eq 1 && -f "${COST_ALERT_SCRIPT_BACKUP}" ]]; then
+    cp -p "${COST_ALERT_SCRIPT_BACKUP}" "${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
+  else
+    rm -f "${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
+  fi
+  [[ -z "${COST_ALERT_SCRIPT_BACKUP}" ]] || rm -f "${COST_ALERT_SCRIPT_BACKUP}"
+  COST_ALERT_SCRIPT_BACKUP=""
+  COST_ALERT_TRANSACTION_ACTIVE=false
+}
+
+commit_cost_alert_install() {
+  [[ -z "${COST_ALERT_SCRIPT_BACKUP}" ]] || rm -f "${COST_ALERT_SCRIPT_BACKUP}"
+  COST_ALERT_SCRIPT_BACKUP=""
+  COST_ALERT_TRANSACTION_ACTIVE=false
+}
+
+rollback_on_exit() {
   local rc=$?
   trap - EXIT
   if [[ "${DASHBOARD_TRANSACTION_ACTIVE}" == true ]]; then
@@ -231,26 +265,37 @@ rollback_dashboard_install() {
       fi
     fi
     [[ -z "${DASHBOARD_PLIST_BACKUP}" ]] || rm -f "${DASHBOARD_PLIST_BACKUP}"
-    rm -rf "${DASHBOARD_PAYLOAD_BACKUP}"
+    rm -rf "${DASHBOARD_PAYLOAD_BACKUP:?}"
+  fi
+  if [[ "${COST_ALERT_TRANSACTION_ACTIVE}" == true ]]; then
+    restore_cost_alert_script
   fi
   exit "${rc}"
 }
 
 commit_dashboard_install() {
   rm -f "${DASHBOARD_PLIST_BACKUP}"
-  rm -rf "${DASHBOARD_PAYLOAD_BACKUP}"
+  rm -rf "${DASHBOARD_PAYLOAD_BACKUP:?}"
   DASHBOARD_TRANSACTION_ACTIVE=false
 }
 
 case "$action" in
   install)
+    need_exit_trap=false
     for tmpl in "${templates[@]}"; do
-      if [[ "$(basename "$tmpl" .plist.template)" == "${DASHBOARD_LABEL}" ]]; then
+      [[ -f "$tmpl" ]] || continue
+      tmpl_label="$(basename "$tmpl" .plist.template)"
+      if [[ "$tmpl_label" == "${DASHBOARD_LABEL}" ]]; then
         backup_dashboard_payload
-        trap rollback_dashboard_install EXIT
-        break
+        need_exit_trap=true
+      elif [[ "$tmpl_label" == "${COST_ALERT_LABEL}" ]]; then
+        backup_cost_alert_script
+        need_exit_trap=true
       fi
     done
+    if [[ "$need_exit_trap" == true ]]; then
+      trap rollback_on_exit EXIT
+    fi
     install_scripts
     for tmpl in "${templates[@]}"; do
       [[ -f "$tmpl" ]] || continue
@@ -350,6 +395,8 @@ PY
       rm -f "$backup"
       if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
         commit_dashboard_install
+      elif [[ "${label}" == "${COST_ALERT_LABEL}" ]]; then
+        commit_cost_alert_install
       fi
       echo "loaded: $label"
     done

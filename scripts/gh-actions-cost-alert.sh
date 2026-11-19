@@ -366,7 +366,15 @@ if [ "$DRY_RUN" -eq 1 ]; then
   STATE_FILE="$tmp.snapshot"
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
-  if [ ! -s "$STATE_FILE" ] || ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_FILE" >/dev/null 2>&1; then
+  if [ ! -s "$STATE_FILE" ] || ! jq -se '
+    length == 1 and (.[0] |
+      type == "object"
+      and ((has("sent") | not) or .sent == null or (.sent | type == "object" and (to_entries | all(.value | type == "number"))))
+      and ((has("last_sent") | not) or .last_sent == null or (.last_sent | type == "number" and . >= 0 and . == floor))
+      and ((has("api_failures") | not) or .api_failures == null or (.api_failures | type == "number" and . >= 0 and . == floor))
+      and ((has("last_blind") | not) or .last_blind == null or (.last_blind | type == "number" and . >= 0 and . == floor))
+    )
+  ' "$STATE_FILE" >/dev/null 2>&1; then
     echo "[$NOW_ISO] WARN: corrupt or empty state snapshot; resetting for dry-run" >&2
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
@@ -385,7 +393,15 @@ else
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
   if [ ! -s "$STATE_FILE" ] || \
-     ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_FILE" >/dev/null 2>&1 || \
+     ! jq -se '
+       length == 1 and (.[0] |
+         type == "object"
+         and ((has("sent") | not) or .sent == null or (.sent | type == "object" and (to_entries | all(.value | type == "number"))))
+         and ((has("last_sent") | not) or .last_sent == null or (.last_sent | type == "number" and . >= 0 and . == floor))
+         and ((has("api_failures") | not) or .api_failures == null or (.api_failures | type == "number" and . >= 0 and . == floor))
+         and ((has("last_blind") | not) or .last_blind == null or (.last_blind | type == "number" and . >= 0 and . == floor))
+       )
+     ' "$STATE_FILE" >/dev/null 2>&1 || \
      ! jq --argjson cutoff "$((NOW - 3024000))" \
        'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
        "$STATE_FILE" > "$STATE_NEXT_TMP" 2>"$tmp.err" || \
@@ -520,6 +536,7 @@ run_app_token_fallback() {
 
         if ! jq -c --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
           def is_self_hosted:
+            (((.runner_group_name // "") != "") and (.runner_group_name != "GitHub Actions")) or
             any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac"));
           def is_standard_macos:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15|26)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));

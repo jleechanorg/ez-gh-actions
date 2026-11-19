@@ -10,6 +10,7 @@
 #   `pull_request` YAML `if:` guards execute from the fork's head commit and are
 #   NOT a security boundary against modified fork workflows; server-side
 #   protection (`allows_public_repositories=false`, private `--repo`, or
+#   `restricted_to_workflows=true` with non-empty `selected_workflows` plus
 #   `approval_policy=all_external_contributors`) is required and enforced
 #   fail-closed by `setup-native-macos-runner.sh` (unless
 #   `--allow-public-fork-exposure` is explicitly passed).
@@ -181,7 +182,7 @@ release_setup_lock() {
 }
 
 cleanup_setup() {
-  [ -z "${STAGE_DIR:-}" ] || rm -rf "$STAGE_DIR"
+  [ -z "${STAGE_DIR:-}" ] || rm -rf "${STAGE_DIR:?}"
   [ -z "${TMP_TGZ:-}" ] || rm -f "$TMP_TGZ"
   [ -z "${CANDIDATE_PLIST:-}" ] || rm -f "$CANDIDATE_PLIST"
   release_setup_lock
@@ -490,8 +491,9 @@ render_plist() {
   # still sharing the operator's macOS user account ($HOME).
   # NOTE: pull_request YAML `if:` guards execute from the fork's head commit and
   # are NOT a security boundary against modified fork workflows; server-side
-  # protection (allows_public_repositories=false, private --repo, or
-  # approval_policy=all_external_contributors) is required and enforced fail-closed.
+  # protection (`allows_public_repositories=false`, private `--repo`, or
+  # `restricted_to_workflows=true` with non-empty `selected_workflows` plus
+  # `approval_policy=all_external_contributors`) is required and enforced fail-closed.
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -562,6 +564,10 @@ for rel in ("run-helper.sh.template", "env.sh"):
     if not (os.path.isfile(p) and is_inside(p)):
         sys.exit(1)
 
+runsvc = os.path.join(root, "runsvc.sh")
+if os.path.lexists(runsvc) and not (os.path.isfile(runsvc) and is_inside(runsvc)):
+    sys.exit(1)
+
 has_externals = False
 try:
     entries = list(os.scandir(root))
@@ -575,7 +581,7 @@ for entry in entries:
 if not has_externals:
     sys.exit(1)
 
-top_scripts = {"config.sh", "run.sh", "run-helper.sh.template", "env.sh", "safe_sleep.sh"}
+top_scripts = {"config.sh", "run.sh", "runsvc.sh", "run-helper.sh.template", "env.sh", "safe_sleep.sh"}
 walk_roots = []
 for entry in entries:
     if entry.name.startswith("bin") or entry.name.startswith("externals") or entry.name in top_scripts:
@@ -614,22 +620,16 @@ verify_server_fork_protection() {
     exit 5
   }
   VERIFIED_RUNNER_GROUP_ID=""
-  local is_priv="" pol="" groups_json="" group_json="" allows_pub="" group_vis=""
+  local is_priv="" pol="" groups_json="" group_json="" allows_pub="" group_vis="" wf_restricted_ok=""
   local pub_repos_pages="" pub_repos="" repo_name="" repo_enabled="" repo_pol=""
   if [ -n "$RUNNER_REPO" ]; then
     if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private' 9>&-)"; then
       echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
       exit 5
     fi
-    if [ "$is_priv" != "true" ]; then
-      if ! pol="$("$GH_BIN" api "repos/${RUNNER_REPO}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
-        echo "ERROR: failed to query fork PR contributor approval policy for repo '${RUNNER_REPO}'" >&2
-        exit 5
-      fi
-      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
-        echo "ERROR: public repo '${RUNNER_REPO}' fork PR approval policy is '${pol}' (expected 'all_external_contributors'); pass --allow-public-fork-exposure to override" >&2
-        exit 5
-      fi
+    if [ "$is_priv" != "true" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
+      echo "ERROR: public repo '${RUNNER_REPO}' cannot enforce server-side runner-group workflow restrictions against pull_request_target; use a private repo, an org runner group with restricted_to_workflows=true, or pass --allow-public-fork-exposure" >&2
+      exit 5
     fi
   else
     if ! groups_json="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups" 9>&-)"; then
@@ -650,6 +650,11 @@ verify_server_fork_protection() {
     group_vis="$(printf '%s\n' "$group_json" | jq -r '.visibility // "all"')"
     if [ "$allows_pub" = "true" ]; then
       if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
+        wf_restricted_ok="$(printf '%s\n' "$group_json" | jq -r '((.restricted_to_workflows == true) and (((.selected_workflows // []) | length) > 0))')"
+        if [ "$wf_restricted_ok" != "true" ]; then
+          echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories without restricted_to_workflows=true and non-empty selected_workflows (pull_request_target bypasses fork approval); restrict the runner group or pass --allow-public-fork-exposure" >&2
+          exit 5
+        fi
         if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
           echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
           exit 5
@@ -825,12 +830,14 @@ if os.path.realpath(wd) != runner_real:
     sys.exit(1)
 
 prog = data.get("ProgramArguments")
+runner_prefix = runner_real.rstrip("/") + "/"
 expected_runs = {
     os.path.realpath(os.path.join(runner_real, "run.sh")),
     os.path.realpath(os.path.join(runner_real, "runsvc.sh")),
 }
-if not isinstance(prog, list) or len(prog) < 2 or prog[0] != "/bin/bash" or not isinstance(prog[1], str) or os.path.realpath(prog[1]) not in expected_runs:
-    print(f"FAIL: {plist_path} ProgramArguments={prog!r} must target ['/bin/bash', '{runner_dir}/run.sh'] or ['/bin/bash', '{runner_dir}/runsvc.sh']", file=sys.stderr)
+prog_real = os.path.realpath(prog[1]) if isinstance(prog, list) and len(prog) >= 2 and isinstance(prog[1], str) else ""
+if not isinstance(prog, list) or len(prog) < 2 or prog[0] != "/bin/bash" or not isinstance(prog[1], str) or not prog_real.startswith(runner_prefix) or prog_real not in expected_runs:
+    print(f"FAIL: {plist_path} ProgramArguments={prog!r} must target ['/bin/bash', '{runner_dir}/run.sh'] or ['/bin/bash', '{runner_dir}/runsvc.sh'] inside {runner_dir}", file=sys.stderr)
     sys.exit(1)
 if not os.path.isfile(prog[1]) or not os.access(prog[1], os.R_OK):
     print(f"FAIL: {plist_path} ProgramArguments script missing or unreadable: {prog[1]}", file=sys.stderr)
@@ -897,6 +904,81 @@ fi
 
 acquire_setup_lock || exit 1
 verify_server_fork_protection
+
+# Register or refresh configuration when .runner/.ezgha-labels/.ezgha-group is missing, differs, live GitHub state drifted, or --reconfigure is passed.
+# Run this determination and the live name-collision precheck BEFORE staging binaries or stopping the incumbent LaunchAgent.
+needs_config=1
+if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_DIR}/.ezgha-labels" ] && [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
+  existing_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  existing_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  existing_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  existing_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  existing_labels="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-labels" 2>/dev/null || true)"
+  existing_group="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-group" 2>/dev/null || true)"
+  if [[ "$existing_agent_id" =~ ^[0-9]+$ ]] && [ "$existing_agent_id" -gt 0 ] && \
+     [ "$existing_name" = "$RUNNER_NAME" ] && [ "$existing_work" = "$WORK_DIR" ] && \
+     [ "$existing_url" = "$RUNNER_URL" ] && [ "$existing_labels" = "$RUNNER_LABELS" ] && \
+     [ "$existing_group" = "$RUNNER_GROUP" ]; then
+    needs_config=0
+  fi
+fi
+
+if [ "$needs_config" -eq 0 ]; then
+  if ! verify_live_runner_state setup; then
+    echo "Live GitHub runner state drifted or missing; scheduling reconfiguration..." >&2
+    needs_config=1
+  fi
+fi
+
+use_replace=0
+if [ "$needs_config" -eq 1 ]; then
+  prev_agent_id=""
+  if [ -f "${RUNNER_DIR}/.runner" ]; then
+    raw_prev_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+    if [[ "$raw_prev_agent_id" =~ ^[0-9]+$ ]] && [ "$raw_prev_agent_id" -gt 0 ]; then
+      prev_agent_id="$raw_prev_agent_id"
+    fi
+  elif [ -d "$RUNNER_DIR" ]; then
+    shopt -s nullglob
+    backup_runner_files=("${RUNNER_DIR}"/.backup-pre-reconfigure.*/.runner)
+    shopt -u nullglob
+    if [ "${#backup_runner_files[@]}" -gt 0 ]; then
+      backup_ids=""
+      for bf in "${backup_runner_files[@]}"; do
+        [ -f "$bf" ] || continue
+        cand_id="$(jq -r '.agentId // empty' "$bf" 2>/dev/null || true)"
+        if [ -n "$cand_id" ]; then
+          backup_ids="${backup_ids:+${backup_ids}$'\n'}${cand_id}"
+        fi
+      done
+      if [ -n "$backup_ids" ]; then
+        unique_backup_ids="$(printf '%s\n' "$backup_ids" | sort -u)"
+        if [ "$(printf '%s\n' "$unique_backup_ids" | wc -l | tr -d '[:space:]')" -eq 1 ] && \
+           [[ "$unique_backup_ids" =~ ^[0-9]+$ ]] && [ "$unique_backup_ids" -gt 0 ]; then
+          prev_agent_id="$unique_backup_ids"
+        fi
+      fi
+    fi
+  fi
+
+  # Authority: safe --replace collision guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack another host's runner registration).
+  if ! pre_runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+    echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
+    exit 1
+  fi
+  colliding_ids="$(printf '%s\n' "$pre_runners_pages" | jq -sr --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | (.id | tostring)] | unique | join(",")')"
+  if [ -n "$colliding_ids" ]; then
+    if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
+      use_replace=1
+    elif [ -n "$prev_agent_id" ] && [ "$colliding_ids" = "$prev_agent_id" ]; then
+      use_replace=1
+    else
+      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_ids}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_agent_id:-<none>}'; refusing --replace to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
+      exit 6
+    fi
+  fi
+fi
+
 mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
 
 if ! runner_binaries_ready "$RUNNER_DIR"; then
@@ -907,6 +989,7 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
     shopt -s nullglob
     for item in "${EXISTING_RUNNER_DIR}"/bin* "${EXISTING_RUNNER_DIR}"/externals* \
                 "${EXISTING_RUNNER_DIR}/config.sh" "${EXISTING_RUNNER_DIR}/run.sh" \
+                "${EXISTING_RUNNER_DIR}/runsvc.sh" \
                 "${EXISTING_RUNNER_DIR}/run-helper.sh.template" "${EXISTING_RUNNER_DIR}/env.sh" \
                 "${EXISTING_RUNNER_DIR}/safe_sleep.sh"; do
       [ -e "$item" ] || continue
@@ -1008,61 +1091,11 @@ PY
     mv "$item" "${RUNNER_DIR}/${base}"
   done
   shopt -u nullglob
-  rm -rf "$STAGE_DIR"
+  rm -rf "${STAGE_DIR:?}"
   STAGE_DIR=""
 fi
 
-# Register or refresh configuration when .runner/.ezgha-labels/.ezgha-group is missing, differs, live GitHub state drifted, or --reconfigure is passed.
-needs_config=1
-if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_DIR}/.ezgha-labels" ] && [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
-  existing_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-  existing_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-  existing_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-  existing_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-  existing_labels="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-labels" 2>/dev/null || true)"
-  existing_group="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-group" 2>/dev/null || true)"
-  if [[ "$existing_agent_id" =~ ^[0-9]+$ ]] && [ "$existing_agent_id" -gt 0 ] && \
-     [ "$existing_name" = "$RUNNER_NAME" ] && [ "$existing_work" = "$WORK_DIR" ] && \
-     [ "$existing_url" = "$RUNNER_URL" ] && [ "$existing_labels" = "$RUNNER_LABELS" ] && \
-     [ "$existing_group" = "$RUNNER_GROUP" ]; then
-    needs_config=0
-  fi
-fi
-
-if [ "$needs_config" -eq 0 ]; then
-  if ! verify_live_runner_state setup; then
-    echo "Live GitHub runner state drifted or missing; scheduling reconfiguration..." >&2
-    needs_config=1
-  fi
-fi
-
 if [ "$needs_config" -eq 1 ]; then
-  prev_agent_id=""
-  if [ -f "${RUNNER_DIR}/.runner" ]; then
-    raw_prev_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-    if [[ "$raw_prev_agent_id" =~ ^[0-9]+$ ]] && [ "$raw_prev_agent_id" -gt 0 ]; then
-      prev_agent_id="$raw_prev_agent_id"
-    fi
-  fi
-
-  # Authority: safe --replace collision guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack another host's runner registration).
-  if ! pre_runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
-    echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
-    exit 1
-  fi
-  colliding_ids="$(printf '%s\n' "$pre_runners_pages" | jq -sr --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | (.id | tostring)] | unique | join(",")')"
-  use_replace=0
-  if [ -n "$colliding_ids" ]; then
-    if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
-      use_replace=1
-    elif [ -n "$prev_agent_id" ] && [ "$colliding_ids" = "$prev_agent_id" ]; then
-      use_replace=1
-    else
-      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_ids}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_agent_id:-<none>}'; refusing --replace to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
-      exit 6
-    fi
-  fi
-
   reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)"
   [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
   if ! stop_launchagent; then
@@ -1117,8 +1150,13 @@ if [ "$needs_config" -eq 1 ]; then
     echo "ERROR: newly configured runner '${RUNNER_NAME}' (agentId=${post_agent_id}) failed live GitHub state/group/label verification; service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
     exit 4
   fi
-  rm -rf "$BACKUP_DIR"
+  rm -rf "${BACKUP_DIR:?}"
   BACKUP_DIR=""
+  shopt -s nullglob
+  for b in "${RUNNER_DIR:?}"/.backup-pre-reconfigure.*; do
+    rm -rf "${b:?}"
+  done
+  shopt -u nullglob
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"
   printf '%s\n' "$RUNNER_GROUP" > "${RUNNER_DIR}/.ezgha-group"
 fi

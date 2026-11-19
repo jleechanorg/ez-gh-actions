@@ -1043,3 +1043,55 @@ short_mid_out="$(
 )"
 grep -q 'alerts_emitted=1' <<<"$short_mid_out" || fail "20s midnight-straddling job must allocate 1 total min across days (total 119m => only 1 day reaches 60m, got: $short_mid_out)"
 pass "zero-byte/multi-object state recovery, netAmount top-repo ranking, and midnight split minute cap hold"
+
+# 22. Invalid counter types in STATE_FILE trigger corrupt_state_file_reset + BLIND, and custom --no-default-labels
+#     self-hosted jobs with non-"GitHub Actions" runner_group_name classify as $0 self-hosted (non-partial) in fallback.
+printf '{"sent":{},"api_failures":"bad"}\n' > "$TMP/state-badtype.json"
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-badtype.json" "$TMP/gcloud-badtype.log" "$TMP/gh-badtype.log" >/dev/null 2>"$TMP/badtype.err"
+grep -q 'severity=WARNING' "$TMP/gcloud-badtype.log" || fail "invalid counter type in STATE_FILE must emit WARNING"
+grep -q '"status":"BLIND"' "$TMP/gcloud-badtype.log" || fail "invalid counter type in STATE_FILE must emit status=BLIND"
+grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-badtype.log" || fail "invalid counter type in STATE_FILE must emit mode=corrupt_state_file_reset"
+jq -e 'type == "object" and .api_failures == 0 and (.last_blind > 0)' "$TMP/state-badtype.json" >/dev/null || \
+  fail "invalid counter type STATE_FILE must reset to valid numeric state"
+
+cat > "$TMP/runs-custom-sh.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9404,"status":"completed","conclusion":"success","created_at":"2026-11-18T02:00:00Z","updated_at":"2026-11-18T04:00:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9404.json" <<'JSON'
+{
+  "total_count": 1,
+  "jobs": [
+    {"id":46,"runner_group_name":"macos-restricted","labels":["custom-ci-box"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T04:00:00Z"}
+  ]
+}
+JSON
+custom_sh_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-sh.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-custom-sh.json" "$TMP/gcloud-custom-sh.log" "$TMP/gh-custom-sh.log"
+)"
+grep -q 'mode=app_token_fallback ' <<<"$custom_sh_out" || fail "custom --no-default-labels self-hosted job with runner_group_name!=GitHub Actions must NOT be marked partial (got: $custom_sh_out)"
+grep -q 'fallback_incomplete=0' <<<"$custom_sh_out" || fail "custom self-hosted job must have fallback_incomplete=0 (got: $custom_sh_out)"
+grep -q 'alerts_emitted=0' <<<"$custom_sh_out" || fail "120m custom self-hosted job must be \$0 / 0 macOS min and emit 0 alerts (got: $custom_sh_out)"
+
+cat > "$TMP/jobs/9404.json" <<'JSON'
+{
+  "total_count": 2,
+  "jobs": [
+    {"id":46,"runner_group_name":"macos-restricted","labels":["custom-ci-box"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T04:00:00Z"},
+    {"id":47,"runner_group_name":"GitHub Actions","labels":["macos-15"],"started_at":"2026-11-18T04:00:00Z","completed_at":"2026-11-18T05:00:00Z"}
+  ]
+}
+JSON
+custom_sh_paired_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-sh.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-custom-sh-paired.json" "$TMP/gcloud-custom-sh-paired.log" "$TMP/gh-custom-sh-paired.log"
+)"
+grep -q 'mode=app_token_fallback ' <<<"$custom_sh_paired_out" || fail "paired custom self-hosted + GitHub Actions macos-15 must report mode=app_token_fallback (got: $custom_sh_paired_out)"
+grep -q '"macos_minutes":60' "$TMP/gcloud-custom-sh-paired.log" || fail "custom self-hosted job must add 0 macOS minutes (expected 60 total)"
+grep -q '~\$3\.72 gross' "$TMP/gcloud-custom-sh-paired.log" || fail "custom self-hosted job must add \$0 gross (expected \$3.72 total)"
+pass "invalid STATE_FILE counter types reset with BLIND and runner_group_name classifies custom self-hosted jobs as \$0 non-partial"
