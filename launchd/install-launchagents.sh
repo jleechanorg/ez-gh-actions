@@ -412,7 +412,7 @@ PY
         echo "removed: $dest"
       fi
     done
-    rm -rf "${SCRIPTS_DIR}"
+    rm -rf "${SCRIPTS_DIR:?}"
     echo "removed: ${SCRIPTS_DIR}"
     ;;
   status)
