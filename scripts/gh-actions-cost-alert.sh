@@ -7,6 +7,7 @@
 #   GitHub's org billing budget tracks only NET billed spend (~$0 when public
 #   repos receive a 100% discount) and ignores free-tier gross usage spikes
 #   such as Nov 17's 2,389 hosted macOS minutes ($148.12 gross).
+# Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing") and AGENTS.md § "GitHub Actions cost & hosted-macOS alert".
 #
 # Blast radius:
 #   - Normal peak (primary billing API): StartInterval=3600 (24 runs/day) -> at
@@ -37,6 +38,7 @@
 #   gh-actions-cost-alert.sh [--dry-run] [--ensure-gcp-policy] [--test-alert]
 set -euo pipefail
 
+# Authority: defensive operational bounds (MAX_APP_API_CALLS=60, MIN_RATE_LIMIT_REMAINING=50, COOLDOWN_SEC=21600, STATE_LOCK_TIMEOUT_SEC=30, MAX_API_FAILURES=3) per AGENTS.md § "Safety & Monitoring Principles" (self-outage prevention & blast-radius caps; unrequested defaults disclosed in PR #238).
 ALERT_ORG="${ALERT_ORG:-jleechanorg}"
 DAILY_GROSS_WARN_USD="${DAILY_GROSS_WARN_USD:-25}"
 DAILY_MACOS_MIN_WARN="${DAILY_MACOS_MIN_WARN:-60}"
@@ -94,6 +96,7 @@ if [ "$DRY_RUN" -eq 0 ] && [ -z "$GCLOUD_BIN" ]; then
   exit 3
 fi
 
+# Ponytail standalone-libexec rationale: resolve_python3 and fcntl.flock remain inline so launchd/install-launchagents.sh label-scoped single-file install into ~/.local/libexec/ezgha/ has zero sibling helper dependencies.
 resolve_python3() {
   local cand=""
   if [ -n "${PYTHON3_BIN:-}" ] && [ -x "${PYTHON3_BIN}" ]; then
@@ -132,7 +135,7 @@ run_with_timeout() {
   local out_tmp
   out_tmp="$(mktemp)"
   (
-    exec 9>&- 2>/dev/null || true
+    exec 9>&-
     exec "$@"
   ) > "$out_tmp" &
   local pid=$!
@@ -297,7 +300,7 @@ STATE_STAGE_TMP=""
 STATE_NEXT_TMP=""
 release_state_lock() {
   if [ "${STATE_LOCK_HELD:-0}" -eq 1 ]; then
-    exec 9>&- 2>/dev/null || true
+    exec 9>&-
     STATE_LOCK_HELD=0
   fi
 }
@@ -342,7 +345,7 @@ while True:
     time.sleep(0.1)
 PY
   if [ "$rc" -ne 0 ]; then
-    exec 9>&- 2>/dev/null || true
+    exec 9>&-
     if [ "$rc" -eq 1 ]; then
       echo "FATAL: timed out waiting for state lock $STATE_LOCK_FILE" >&2
     fi
@@ -361,6 +364,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   STATE_FILE="$tmp.snapshot"
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
+  if ! jq -e 'if type != "object" then error("state must be JSON object") else . end' "$STATE_FILE" >/dev/null 2>&1; then
+    echo "[$NOW_ISO] WARN: corrupt state snapshot; resetting for dry-run" >&2
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
+    mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
+  fi
 else
   if ! acquire_state_lock; then
     emit WARNING BLIND "$TODAY_UTC" \
@@ -374,10 +382,19 @@ else
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
-  jq --argjson cutoff "$((NOW - 3024000))" \
-    '.sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
-    "$STATE_FILE" > "$STATE_NEXT_TMP"
-  mv -f "$STATE_NEXT_TMP" "$STATE_FILE"
+  if ! jq --argjson cutoff "$((NOW - 3024000))" \
+    'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
+    "$STATE_FILE" > "$STATE_NEXT_TMP" 2>"$tmp.err"; then
+    rm -f "$STATE_NEXT_TMP"
+    echo "[$NOW_ISO] WARN: corrupt STATE_FILE '$STATE_FILE'; resetting and emitting WARNING BLIND (corrupt_state_file_reset)" >&2
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
+    mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
+    emit WARNING BLIND "$TODAY_UTC" \
+      "CORRUPT_STATE_FILE: reset corrupt state file $STATE_FILE for $ALERT_ORG; monitoring continues" \
+      0 null 0 "" "corrupt_state_file_reset" null null || true
+  else
+    mv -f "$STATE_NEXT_TMP" "$STATE_FILE"
+  fi
 fi
 
 FAILURES_NOW=0
@@ -416,6 +433,7 @@ FALLBACK_INCOMPLETE=0
 FALLBACK_CAP_HIT=0
 FALLBACK_MODE="app_token_fallback"
 
+# Authority: defensive gross-only fallback (bounded by MAX_APP_API_CALLS=60) per AGENTS.md § "GitHub Actions cost & hosted-macOS alert" when primary billing auth/quota is unavailable.
 run_app_token_fallback() {
   local reason="$1"
   local app_token app_rem calls_used=0 repo_count runs_count
@@ -455,7 +473,7 @@ run_app_token_fallback() {
   fi
 
   : > "$tmp.fallback_items"
-  local repo_name full_name run_id run_day
+  local repo_name full_name run_id
   local job_page fetched_jobs page_jobs_count total_jobs
   while IFS=$'\t' read -r repo_name full_name; do
     [ -n "$full_name" ] || continue
@@ -479,7 +497,7 @@ run_app_token_fallback() {
       FALLBACK_INCOMPLETE=1
     fi
 
-    while IFS=$'\t' read -r run_id run_day; do
+    while IFS= read -r run_id; do
       [ -n "$run_id" ] || continue
       job_page=1
       fetched_jobs=0
@@ -496,26 +514,34 @@ run_app_token_fallback() {
         fi
         calls_used=$((calls_used + 1))
 
-        if ! jq -c --arg run_day "${run_day:-$TODAY_UTC}" --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
+        if ! jq -c --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
           def is_self_hosted:
             any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac"));
-          def job_mins:
-            if (.started_at // null) == null then 0
-            else
-              (((.completed_at // $now_iso) | fromdateiso8601) - (.started_at | fromdateiso8601)) as $secs
-              | if $secs > 0 then (($secs / 60) | ceil) else 0 end
-            end;
           def is_standard_macos:
-            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
+            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15|26)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           def is_any_hosted_macos:
             (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
           def is_standard_ubuntu:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^ubuntu-(latest|[0-9]{2}\\.[0-9]{2})(-arm)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core|-arm$)")) | not));
           def is_standard_windows:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^windows-(latest|[0-9]{4})$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
-          (.jobs // [])[] | . as $j | job_mins as $m |
-          (((.started_at // $run_day) | tostring)[:10]) as $jday |
-          select($jday == $yesterday or $jday == $today) |
+          (($yesterday + "T00:00:00Z") | fromdateiso8601) as $yest_start |
+          (($today + "T00:00:00Z") | fromdateiso8601) as $today_start |
+          ($today_start + 86400) as $tomorrow_start |
+          (.jobs // [])[] | . as $j |
+          select((.started_at // null) != null) |
+          (.started_at | fromdateiso8601) as $j_start |
+          ((.completed_at // $now_iso) | fromdateiso8601) as $j_end |
+          select($j_end > $j_start) |
+          (
+            {day: $yesterday, w_start: $yest_start, w_end: $today_start},
+            {day: $today, w_start: $today_start, w_end: $tomorrow_start}
+          ) as $win |
+          ([$j_start, $win.w_start] | max) as $ov_start |
+          ([$j_end, $win.w_end] | min) as $ov_end |
+          ($ov_end - $ov_start) as $ov_secs |
+          select($ov_secs > 0) |
+          (($ov_secs / 60) | ceil) as $m |
           (if ($j | is_standard_macos) then {macos_min: $m, gross: ($m * 0.062), unpriced: false}
            elif ($j | is_any_hosted_macos) then {macos_min: $m, gross: 0, unpriced: ($m > 0)}
            elif ($j | is_standard_ubuntu) then {macos_min: 0, gross: ($m * 0.006), unpriced: false}
@@ -524,7 +550,7 @@ run_app_token_fallback() {
            else {macos_min: 0, gross: 0, unpriced: false}
            end)
           | {
-              day: $jday,
+              day: $win.day,
               repo: $repo,
               macos_min: .macos_min,
               gross_usd: .gross,
@@ -564,8 +590,7 @@ run_app_token_fallback() {
     done < <(jq -r --arg yesterday "$YESTERDAY_UTC" '
       (.workflow_runs // [])[]
       | select((.conclusion // "") != "skipped" and ((((.updated_at // .created_at // "")[:10]) >= $yesterday) or ((.status // "") == "in_progress") or ((.status // "") == "queued")))
-      | [(.id // empty), ((.created_at // "")[:10])]
-      | @tsv
+      | (.id // empty)
     ' "$tmp.runs" 2>/dev/null || true)
     if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
       break

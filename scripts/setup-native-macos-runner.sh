@@ -13,6 +13,7 @@
 #   `approval_policy=all_external_contributors`) is required and enforced
 #   fail-closed by `setup-native-macos-runner.sh` (unless
 #   `--allow-public-fork-exposure` is explicitly passed).
+# Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing") and AGENTS.md § "Native macOS CI runner".
 #
 # Usage:
 #   setup-native-macos-runner.sh [--dry-run] [--verify] [--uninstall]
@@ -25,6 +26,10 @@ RUNNER_ORG="${RUNNER_ORG:-${GITHUB_ORG:-jleechanorg}}"
 GITHUB_ORG="$RUNNER_ORG"
 RUNNER_REPO="${RUNNER_REPO:-}"
 RUNNER_GROUP="${RUNNER_GROUP:-}"
+RUNNER_GROUP_SET=0
+if [ -n "$RUNNER_GROUP" ]; then
+  RUNNER_GROUP_SET=1
+fi
 ALLOW_PUBLIC_FORK_EXPOSURE="${ALLOW_PUBLIC_FORK_EXPOSURE:-0}"
 RUNNER_NAME="${NATIVE_MACOS_RUNNER_NAME:-mac-native-ci-1}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner-macos-ci}"
@@ -73,7 +78,7 @@ while [ "$#" -gt 0 ]; do
     --uninstall) UNINSTALL=1; shift ;;
     --org) RUNNER_ORG="${2:?missing --org value}"; GITHUB_ORG="$RUNNER_ORG"; shift 2 ;;
     --repo) RUNNER_REPO="${2:?missing --repo value}"; shift 2 ;;
-    --runner-group) RUNNER_GROUP="${2:?missing --runner-group value}"; shift 2 ;;
+    --runner-group) RUNNER_GROUP="${2:?missing --runner-group value}"; RUNNER_GROUP_SET=1; shift 2 ;;
     --allow-public-fork-exposure) ALLOW_PUBLIC_FORK_EXPOSURE=1; shift ;;
     --name) RUNNER_NAME="${2:?missing --name value}"; shift 2 ;;
     --runner-dir) RUNNER_DIR="${2:?missing --runner-dir value}"; shift 2 ;;
@@ -85,6 +90,12 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Authority: defensive operational guards/bounds (SETUP_LOCK_TIMEOUT_SEC=30, --offline scope, --repo/--runner-group exclusion) per AGENTS.md § "Native macOS CI runner" & § "Safety & Monitoring Principles" (unrequested defaults disclosed in PR #238).
+if [ -n "$RUNNER_REPO" ] && [ "$RUNNER_GROUP_SET" -eq 1 ]; then
+  echo "ERROR: --runner-group cannot be combined with --repo (runner groups are org/enterprise-scoped)" >&2
+  exit 2
+fi
+
 if [ "$OFFLINE" -eq 1 ] && [ "$VERIFY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   echo "ERROR: --offline is only valid with --verify or --dry-run (mutating setup requires live server-side fork-protection check)" >&2
   exit 2
@@ -95,6 +106,7 @@ case "$ALLOW_PUBLIC_FORK_EXPOSURE" in
   *) echo "ERROR: invalid ALLOW_PUBLIC_FORK_EXPOSURE='$ALLOW_PUBLIC_FORK_EXPOSURE' (expected 0 or 1)" >&2; exit 2 ;;
 esac
 
+# Ponytail standalone-libexec rationale: resolve_python3 and fcntl.flock remain inline so setup-native-macos-runner.sh runs standalone without sibling helper dependencies (matching launchd/install-launchagents.sh).
 resolve_python3() {
   local cand=""
   if [ -n "${PYTHON3_BIN:-}" ] && [ -x "${PYTHON3_BIN}" ]; then
@@ -140,7 +152,7 @@ CANDIDATE_PLIST=""
 
 release_setup_lock() {
   if [ "${SETUP_LOCK_HELD:-0}" -eq 1 ]; then
-    exec 9>&- 2>/dev/null || true
+    exec 9>&-
     SETUP_LOCK_HELD=0
   fi
 }
@@ -189,7 +201,7 @@ while True:
     time.sleep(0.1)
 PY
   if [ "$rc" -ne 0 ]; then
-    exec 9>&- 2>/dev/null || true
+    exec 9>&-
     if [ "$rc" -eq 1 ]; then
       echo "ERROR: timed out waiting for setup lock $SETUP_LOCK_FILE" >&2
     fi
@@ -256,7 +268,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
   exit 0
 fi
 
-# Fail-closed guard: never touch $HOME, /, or TestFlight/SMTP-egress runner directories (including case-insensitive APFS aliases and parents).
+# Authority: fail-closed path-isolation guard per AGENTS.md § "Native macOS CI runner" (never touch $HOME, /, or TestFlight/SMTP-egress runner dirs, including case-insensitive APFS aliases and parents).
 is_reserved_runner_dir() {
   local target="$1" py_bin=""
   shift
@@ -345,7 +357,7 @@ normalize_labels() {
   printf '%s' "$out"
 }
 
-# Fail-closed guard: require self-hosted-native-macos and reject labels that cause Linux CI spillover or TestFlight collision.
+# Authority: fail-closed label-isolation guard per AGENTS.md § "Native macOS CI runner" (require self-hosted-native-macos; reject bare self-hosted and worldai-testflight-native-mac).
 validate_labels() {
   local raw="$1" item trimmed lower has_native=0
   [ -n "$raw" ] || { echo "ERROR: --labels must not be empty" >&2; exit 2; }
@@ -501,18 +513,20 @@ PLIST
 
 runner_binaries_ready() {
   local dir="$1"
-  [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ] && [ -f "${dir}/run-helper.sh.template" ]
+  [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ] && [ -f "${dir}/run-helper.sh.template" ] && [ -f "${dir}/env.sh" ] && { [ -d "${dir}/externals" ] || compgen -G "${dir}/externals.*" >/dev/null; }
 }
 
 VERIFIED_RUNNER_GROUP_ID=""
 
+# Authority: fail-closed server-side fork-PR protection per AGENTS.md § "Native macOS CI runner" (exit 5 before token minting/setup/verify).
 verify_server_fork_protection() {
   command -v "$GH_BIN" >/dev/null 2>&1 || {
     echo "ERROR: gh binary '$GH_BIN' not found (required for server-side fork-protection check)" >&2
     exit 5
   }
   VERIFIED_RUNNER_GROUP_ID=""
-  local is_priv="" pol="" groups_json="" group_json="" allows_pub=""
+  local is_priv="" pol="" groups_json="" group_json="" allows_pub="" group_vis=""
+  local pub_repos_pages="" pub_repos="" repo_name="" repo_enabled="" repo_pol=""
   if [ -n "$RUNNER_REPO" ]; then
     if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private' 9>&-)"; then
       echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
@@ -539,15 +553,59 @@ verify_server_fork_protection() {
       exit 5
     fi
     VERIFIED_RUNNER_GROUP_ID="$(printf '%s\n' "$group_json" | jq -r '.id // empty')"
+    [ -n "$VERIFIED_RUNNER_GROUP_ID" ] || {
+      echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' missing id in org '${RUNNER_ORG}'" >&2
+      exit 5
+    }
     allows_pub="$(printf '%s\n' "$group_json" | jq -r '.allows_public_repositories')"
+    group_vis="$(printf '%s\n' "$group_json" | jq -r '.visibility // "all"')"
     if [ "$allows_pub" = "true" ]; then
-      if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
-        echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
-        exit 5
-      fi
-      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
-        echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories and fork PR approval policy is '${pol}' (expected 'all_external_contributors'); restrict runner group or pass --allow-public-fork-exposure" >&2
-        exit 5
+      if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
+        if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
+          echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
+          exit 5
+        fi
+        if [ "$pol" != "all_external_contributors" ]; then
+          echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories and fork PR approval policy is '${pol}' (expected 'all_external_contributors'); restrict runner group or pass --allow-public-fork-exposure" >&2
+          exit 5
+        fi
+        if [ "$group_vis" = "selected" ]; then
+          if ! pub_repos_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/repositories?per_page=100" 9>&-)"; then
+            echo "ERROR: failed to query repositories for selected runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) in org '${RUNNER_ORG}'" >&2
+            exit 5
+          fi
+          if ! pub_repos="$(printf '%s\n' "$pub_repos_pages" | jq -sr '[.[].repositories[]? | select(((.private // false) == false) and ((.archived // false) == false)) | .name // empty] | unique[]')"; then
+            echo "ERROR: failed to parse repositories for runner group '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
+            exit 5
+          fi
+        else
+          if ! pub_repos_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/repos?type=public&per_page=100" 9>&-)"; then
+            echo "ERROR: failed to query public repositories for org '${RUNNER_ORG}'" >&2
+            exit 5
+          fi
+          if ! pub_repos="$(printf '%s\n' "$pub_repos_pages" | jq -sr '[.[] | .[]? | select(((.private // false) == false) and ((.archived // false) == false)) | .name // empty] | unique[]')"; then
+            echo "ERROR: failed to parse public repositories for org '${RUNNER_ORG}'" >&2
+            exit 5
+          fi
+        fi
+        while IFS= read -r repo_name; do
+          [ -n "$repo_name" ] || continue
+          if ! repo_enabled="$("$GH_BIN" api "repos/${RUNNER_ORG}/${repo_name}/actions/permissions" --jq 'if .enabled == false then "false" else "true" end' 9>&-)"; then
+            echo "ERROR: failed to query Actions permissions for public repo '${RUNNER_ORG}/${repo_name}'" >&2
+            exit 5
+          fi
+          if [ "$repo_enabled" = "false" ]; then
+            continue
+          fi
+          if ! repo_pol="$("$GH_BIN" api "repos/${RUNNER_ORG}/${repo_name}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
+            echo "ERROR: failed to query fork PR contributor approval policy for public repo '${RUNNER_ORG}/${repo_name}'" >&2
+            exit 5
+          fi
+          if [ "$repo_pol" != "all_external_contributors" ]; then
+            echo "ERROR: public repo '${RUNNER_ORG}/${repo_name}' overrides fork PR approval policy to '${repo_pol}' (expected 'all_external_contributors'); tighten repo policy, restrict runner group, or pass --allow-public-fork-exposure" >&2
+            exit 5
+          fi
+        done <<<"$pub_repos"
       fi
     elif [ "$allows_pub" != "false" ]; then
       echo "ERROR: unexpected allows_public_repositories='${allows_pub}' for runner group '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
@@ -556,11 +614,85 @@ verify_server_fork_protection() {
   fi
 }
 
+# Authority: live runner agentId/group/label binding per AGENTS.md § "Native macOS CI runner" (shared across setup and --verify).
+verify_live_runner_state() {
+  local mode="${1:?missing mode}"
+  local local_agent_id="" runners_pages="" runner_json=""
+  local group_runners_pages="" in_group=0 live_labels_csv="" expected_sorted_csv=""
+
+  if [ "$mode" = "verify" ] || { [ -z "$RUNNER_REPO" ] && [ -z "$VERIFIED_RUNNER_GROUP_ID" ]; }; then
+    verify_server_fork_protection
+  fi
+
+  if [ ! -f "${RUNNER_DIR}/.runner" ]; then
+    echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2
+    return 1
+  fi
+  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]] || [ "$local_agent_id" -le 0 ]; then
+    echo "FAIL: .runner missing valid positive numeric agentId (got '${local_agent_id}')" >&2
+    return 1
+  fi
+
+  if ! runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+    echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
+    [ "$mode" = "setup" ] && exit 1
+    return 1
+  fi
+  runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
+  if [ -z "$runner_json" ]; then
+    if [ "$mode" = "post_config" ]; then
+      echo "WARN: newly configured runner '$RUNNER_NAME' (agentId=$local_agent_id) not yet visible in $RUNNERS_API; skipping immediate live group/label check" >&2
+      return 0
+    fi
+    echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API" >&2
+    return 1
+  fi
+
+  live_labels_csv="$(printf '%s\n' "$runner_json" | jq -r '[.labels[]?.name // empty] | map(ascii_downcase) | unique | join(",")')"
+  expected_sorted_csv="$(printf '%s' "$RUNNER_LABELS" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd, -)"
+  if printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qxE 'self-hosted|worldai-testflight-native-mac'; then
+    echo "FAIL: live runner '$RUNNER_NAME' (agentId=$local_agent_id) carries forbidden label in '$live_labels_csv'" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qx 'self-hosted-native-macos'; then
+    echo "FAIL: live runner '$RUNNER_NAME' (agentId=$local_agent_id) missing required label self-hosted-native-macos in '$live_labels_csv'" >&2
+    return 1
+  fi
+  if [ "$live_labels_csv" != "$expected_sorted_csv" ]; then
+    echo "FAIL: live labels '$live_labels_csv' != expected '$expected_sorted_csv'" >&2
+    return 1
+  fi
+
+  if [ -z "$RUNNER_REPO" ]; then
+    if [ -z "$VERIFIED_RUNNER_GROUP_ID" ]; then
+      echo "FAIL: missing verified runner group id for '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
+      return 1
+    fi
+    if ! group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners" 9>&-)"; then
+      echo "ERROR: failed to query runners for org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
+      [ "$mode" = "setup" ] && exit 1
+      return 1
+    fi
+    in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$local_agent_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"
+    if [ "$in_group" -lt 1 ]; then
+      echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) is not a member of org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
 if [ "$VERIFY" -eq 1 ]; then
   [ -x "${RUNNER_DIR}/bin/Runner.Listener" ] || { echo "FAIL: missing ${RUNNER_DIR}/bin/Runner.Listener" >&2; exit 1; }
   [ -x "${RUNNER_DIR}/config.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/config.sh" >&2; exit 1; }
   [ -x "${RUNNER_DIR}/run.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/run.sh" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/run-helper.sh.template" ] || { echo "FAIL: missing ${RUNNER_DIR}/run-helper.sh.template" >&2; exit 1; }
+  [ -f "${RUNNER_DIR}/env.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/env.sh" >&2; exit 1; }
+  if [ ! -d "${RUNNER_DIR}/externals" ] && ! compgen -G "${RUNNER_DIR}/externals.*" >/dev/null; then
+    echo "FAIL: missing ${RUNNER_DIR}/externals" >&2
+    exit 1
+  fi
   [ -d "$WORK_DIR" ] || { echo "FAIL: missing work dir ${WORK_DIR}" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.runner" ] || { echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.ezgha-labels" ] || { echo "FAIL: missing ${RUNNER_DIR}/.ezgha-labels" >&2; exit 1; }
@@ -600,7 +732,11 @@ if not os.path.isfile(prog[1]) or not os.access(prog[1], os.R_OK):
     print(f"FAIL: {plist_path} ProgramArguments script missing or unreadable: {prog[1]}", file=sys.stderr)
     sys.exit(1)
 PY
-  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner")"
+  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]] || [ "$local_agent_id" -le 0 ]; then
+    echo "FAIL: .runner missing valid positive numeric agentId (got '${local_agent_id}')" >&2
+    exit 1
+  fi
   actual_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner")"
   actual_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner")"
   actual_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner")"
@@ -615,38 +751,7 @@ PY
   fi
   if [ "$OFFLINE" -eq 0 ]; then
     command -v "$GH_BIN" >/dev/null 2>&1 || { echo "FAIL: gh binary '$GH_BIN' not found (pass --offline to skip live GitHub check)" >&2; exit 1; }
-    verify_server_fork_protection
-    runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"
-    if [ -n "$local_agent_id" ]; then
-      if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]]; then
-        echo "FAIL: .runner agentId='$local_agent_id' is not numeric" >&2
-        exit 1
-      fi
-      runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
-      [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API" >&2; exit 1; }
-    else
-      runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name)] | .[0] // empty')"
-      [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' not found in live $RUNNERS_API" >&2; exit 1; }
-    fi
-    if [ -z "$RUNNER_REPO" ]; then
-      live_runner_id="$(printf '%s\n' "$runner_json" | jq -r '.id // empty')"
-      [ -n "$live_runner_id" ] || { echo "FAIL: live runner '$RUNNER_NAME' missing .id in $RUNNERS_API" >&2; exit 1; }
-      [ -n "$VERIFIED_RUNNER_GROUP_ID" ] || { echo "FAIL: missing runner group id for '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2; exit 1; }
-      group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners" 9>&-)"
-      in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$live_runner_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"
-      [ "$in_group" -ge 1 ] || { echo "FAIL: runner '$RUNNER_NAME' (id=$live_runner_id) is not a member of org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2; exit 1; }
-    fi
-    live_labels_csv="$(printf '%s\n' "$runner_json" | jq -r '[.labels[]?.name // empty] | map(ascii_downcase) | unique | join(",")')"
-    expected_sorted_csv="$(printf '%s' "$RUNNER_LABELS" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd, -)"
-    if printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qxE 'self-hosted|worldai-testflight-native-mac'; then
-      echo "FAIL: live runner '$RUNNER_NAME' carries forbidden label in '$live_labels_csv'" >&2
-      exit 1
-    fi
-    if ! printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qx 'self-hosted-native-macos'; then
-      echo "FAIL: live runner '$RUNNER_NAME' missing required label self-hosted-native-macos in '$live_labels_csv'" >&2
-      exit 1
-    fi
-    [ "$live_labels_csv" = "$expected_sorted_csv" ] || { echo "FAIL: live labels '$live_labels_csv' != expected '$expected_sorted_csv'" >&2; exit 1; }
+    verify_live_runner_state verify || exit 1
   fi
   if [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
     actual_group="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-group")"
@@ -755,16 +860,27 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
   STAGE_DIR=""
 fi
 
-# Register or refresh configuration when .runner/.ezgha-labels/.ezgha-group is missing, differs, or --reconfigure is passed.
+# Register or refresh configuration when .runner/.ezgha-labels/.ezgha-group is missing, differs, live GitHub state drifted, or --reconfigure is passed.
 needs_config=1
 if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_DIR}/.ezgha-labels" ] && [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
+  existing_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_labels="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-labels" 2>/dev/null || true)"
   existing_group="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-group" 2>/dev/null || true)"
-  if [ "$existing_name" = "$RUNNER_NAME" ] && [ "$existing_work" = "$WORK_DIR" ] && [ "$existing_url" = "$RUNNER_URL" ] && [ "$existing_labels" = "$RUNNER_LABELS" ] && [ "$existing_group" = "$RUNNER_GROUP" ]; then
+  if [[ "$existing_agent_id" =~ ^[0-9]+$ ]] && [ "$existing_agent_id" -gt 0 ] && \
+     [ "$existing_name" = "$RUNNER_NAME" ] && [ "$existing_work" = "$WORK_DIR" ] && \
+     [ "$existing_url" = "$RUNNER_URL" ] && [ "$existing_labels" = "$RUNNER_LABELS" ] && \
+     [ "$existing_group" = "$RUNNER_GROUP" ]; then
     needs_config=0
+  fi
+fi
+
+if [ "$needs_config" -eq 0 ]; then
+  if ! verify_live_runner_state setup; then
+    echo "Live GitHub runner state drifted or missing; scheduling reconfiguration..." >&2
+    needs_config=1
   fi
 fi
 
@@ -811,7 +927,17 @@ if [ "$needs_config" -eq 1 ]; then
     exit 4
   fi
 
+  post_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  if [[ ! "$post_agent_id" =~ ^[0-9]+$ ]] || [ "$post_agent_id" -le 0 ]; then
+    echo "ERROR: config.sh completed without a valid positive numeric .runner agentId (got '${post_agent_id}'); service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
+    exit 4
+  fi
+
   chmod 600 "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams" 2>/dev/null || true
+  if ! verify_live_runner_state post_config; then
+    echo "ERROR: newly configured runner '${RUNNER_NAME}' (agentId=${post_agent_id}) failed live GitHub state/group/label verification; service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
+    exit 4
+  fi
   rm -rf "$BACKUP_DIR"
   BACKUP_DIR=""
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"

@@ -157,7 +157,8 @@ pass "Scratch fallback uses diskm volume path scratch and fails closed without /
 
 # 4. Supported reconfiguration (--reconfigure / label change) & --verify (SessionCreate=true + .ezgha-labels + live gh check).
 RUNNER_DIR_T="$TMP/home/actions-runner-macos-ci"
-mkdir -p "$RUNNER_DIR_T/bin"
+mkdir -p "$RUNNER_DIR_T/bin" "$RUNNER_DIR_T/externals"
+: > "$RUNNER_DIR_T/env.sh"
 cat > "$RUNNER_DIR_T/bin/Runner.Listener" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -243,6 +244,17 @@ emit_json() {
     printf '%s\n' "$raw"
   fi
 }
+lookup_repo_map() {
+  local map="$1" target="$2" entry
+  local IFS=','
+  for entry in $map; do
+    if [ "${entry%%=*}" = "$target" ]; then
+      printf '%s' "${entry#*=}"
+      return 0
+    fi
+  done
+  return 1
+}
 case "$*" in
   *"actions/runners/registration-token"*)
     emit_json '{"token":"stub-reg-token"}'
@@ -251,9 +263,33 @@ case "$*" in
     default_group_runners='{"total_count":1,"runners":[{"id":101,"name":"mac-native-ci-1"}]}'
     emit_json "${GROUP_RUNNERS_JSON:-$default_group_runners}"
     ;;
+  *"actions/runner-groups/"*"/repositories"*)
+    default_group_repos='{"total_count":0,"repositories":[]}'
+    emit_json "${GROUP_REPOS_JSON:-$default_group_repos}"
+    ;;
   *"actions/runner-groups"*)
     default_groups='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":false}]}'
     emit_json "${RUNNER_GROUPS_JSON:-$default_groups}"
+    ;;
+  *"orgs/"*"/repos"*)
+    emit_json "${ORG_REPOS_JSON:-[]}"
+    ;;
+  *"repos/"*"/actions/permissions/fork-pr-contributor-approval"*)
+    repo_slug="$(printf '%s' "$*" | sed -E 's#.*repos/[^/]+/([^/]+)/actions/permissions/fork-pr-contributor-approval.*#\1#')"
+    default_policy='{"approval_policy":"first_time_contributors"}'
+    if [ -n "${REPO_FORK_APPROVAL_MAP:-}" ] && mapped_pol="$(lookup_repo_map "$REPO_FORK_APPROVAL_MAP" "$repo_slug")"; then
+      emit_json "{\"approval_policy\":\"${mapped_pol}\"}"
+    else
+      emit_json "${REPO_FORK_APPROVAL_JSON:-${FORK_APPROVAL_JSON:-$default_policy}}"
+    fi
+    ;;
+  *"repos/"*"/actions/permissions"*)
+    repo_slug="$(printf '%s' "$*" | sed -E 's#.*repos/[^/]+/([^/]+)/actions/permissions.*#\1#')"
+    if [ -n "${REPO_ACTIONS_PERMS_MAP:-}" ] && mapped_en="$(lookup_repo_map "$REPO_ACTIONS_PERMS_MAP" "$repo_slug")"; then
+      emit_json "{\"enabled\":${mapped_en}}"
+    else
+      emit_json "${REPO_ACTIONS_PERMS_JSON:-{\"enabled\":true}}"
+    fi
     ;;
   *"actions/permissions/fork-pr-contributor-approval"*)
     default_policy='{"approval_policy":"first_time_contributors"}'
@@ -429,7 +465,15 @@ serialized = str(payload)
 assert "@" not in serialized
 assert "worktree" not in serialized.lower()
 PY
-pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents and renders valid plist"
+
+# Fresh account without pre-existing ~/Library/LaunchAgents must still succeed.
+FRESH_HOME="$TMP/fresh-home"
+mkdir -p "$FRESH_HOME"
+BASH_ENV=/dev/null HOME="$FRESH_HOME" PATH="$TMP/bin:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null
+test -f "$FRESH_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist" || \
+  fail "fresh account without Library/LaunchAgents must succeed and render cost-alert plist"
+pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents, handles fresh account, and renders valid plist"
 
 # 6. --uninstall runs before resolve_work_dir, unloads even without plist, and retains plist if still loaded.
 : > "$TMP/launchctl.loaded"
@@ -566,17 +610,23 @@ echo "curl must not be invoked during hermetic binary repair: $*" >&2
 exit 99
 STUB
 chmod +x "$TMP/bin/curl"
-mkdir -p "$TMP/home/actions-runner/bin"
+mkdir -p "$TMP/home/actions-runner/bin" "$TMP/home/actions-runner/externals"
 cp "$RUNNER_DIR_T/bin/Runner.Listener" "$TMP/home/actions-runner/bin/Runner.Listener"
 cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
 cp "$RUNNER_DIR_T/run.sh" "$TMP/home/actions-runner/run.sh"
 cp "$RUNNER_DIR_T/run-helper.sh.template" "$TMP/home/actions-runner/run-helper.sh.template"
-rm -f "$RUNNER_DIR_T/config.sh" "$RUNNER_DIR_T/run.sh" "$RUNNER_DIR_T/run-helper.sh.template"
+cp "$RUNNER_DIR_T/env.sh" "$TMP/home/actions-runner/env.sh"
+rm -f "${RUNNER_DIR_T:?}/config.sh" "${RUNNER_DIR_T:?}/run.sh" "${RUNNER_DIR_T:?}/run-helper.sh.template" "${RUNNER_DIR_T:?}/env.sh"
+rm -rf "${RUNNER_DIR_T:?}/externals"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
+  fail "--verify must fail when env.sh or externals is missing"
+fi
 : > "$TMP/launchctl.log"
 : > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$TMP/home/actions-runner" "$SETUP_SCRIPT" >/dev/null
-[ -x "$RUNNER_DIR_T/config.sh" ] && [ -x "$RUNNER_DIR_T/run.sh" ] || fail "incomplete provisioning must repair config.sh and run.sh on retry"
+[ -x "$RUNNER_DIR_T/config.sh" ] && [ -x "$RUNNER_DIR_T/run.sh" ] && [ -f "$RUNNER_DIR_T/env.sh" ] && [ -d "$RUNNER_DIR_T/externals" ] || fail "incomplete provisioning must repair config.sh, run.sh, env.sh, and externals on retry"
 grep -q "launchctl unload $PLIST_T" "$TMP/launchctl.log" || fail "binary repair must stop LaunchAgent before promoting staged binaries"
 [ -f "$TMP/launchctl.loaded" ] || fail "binary repair must reload LaunchAgent after repairing binaries"
 pass "incomplete runner provisioning stops LaunchAgent, repairs missing binaries, and reloads"
@@ -657,12 +707,19 @@ printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUr
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
   "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify --offline must not block on lifecycle flock"
 
-if SETUP_LOCK_TIMEOUT_SEC=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
-    "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
+setup_lockto_rc=0
+SETUP_LOCK_TIMEOUT_SEC=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null 2>"$TMP/setup-lockto.err" || setup_lockto_rc=$?
+if [ "$setup_lockto_rc" -eq 0 ]; then
   kill -9 "$holder_pid" 2>/dev/null || true
   wait "$holder_pid" 2>/dev/null || true
   fail "mutating --uninstall must fail when lifecycle flock is held by a live process"
 fi
+grep -q 'ERROR: timed out waiting for setup lock' "$TMP/setup-lockto.err" || {
+  kill -9 "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  fail "setup lock timeout must print ERROR: timed out waiting for setup lock on stderr (got: $(cat "$TMP/setup-lockto.err"))"
+}
 
 # SIGKILL active flock holder -> next mutating --uninstall immediately acquires the kernel lock and succeeds.
 kill -9 "$holder_pid" 2>/dev/null || true
@@ -893,6 +950,7 @@ chmod +x "$EXISTING_SYM/config.sh"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$EXISTING_SYM/run.sh"
 chmod +x "$EXISTING_SYM/run.sh"
 : > "$EXISTING_SYM/run-helper.sh.template"
+: > "$EXISTING_SYM/env.sh"
 
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
@@ -919,3 +977,92 @@ for cred in (".credentials", ".credentials_rsaparams"):
     assert mode == 0o600, f"{cred} mode={oct(mode)}, expected 0o600"
 PY
 pass "cloned absolute symlinks resolve inside RUNNER_DIR as relative symlinks and credentials are chmod 600"
+
+# 18. --repo/--runner-group mutual exclusion, per-repo fork-approval override check, strict numeric agentId,
+#     and normal setup live GitHub drift detection + post-config verification.
+rg_repo_rc=0
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --dry-run --repo jleechanorg/pub --runner-group Default >/dev/null 2>&1 || rg_repo_rc=$?
+[ "$rg_repo_rc" -eq 2 ] || fail "--repo combined with --runner-group must exit 2 (got $rg_repo_rc)"
+
+rg_env_repo_rc=0
+RUNNER_GROUP="Default" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --dry-run --repo jleechanorg/pub >/dev/null 2>&1 || rg_env_repo_rc=$?
+[ "$rg_env_repo_rc" -eq 2 ] || fail "RUNNER_GROUP env var combined with --repo must exit 2 (got $rg_env_repo_rc)"
+
+# Per-repo fork-pr-contributor-approval override must fail closed (exit 5) even when org policy is all_external_contributors.
+cp "$TMP/plist.ok" "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf 'self-hosted-native-macos\n' > "$RUNNER_DIR_T/.ezgha-labels"
+printf '\n' > "$RUNNER_DIR_T/.ezgha-group"
+
+ORG_REPOS_OVERRIDE='[{"name":"pub-weak","private":false,"archived":false},{"name":"pub-disabled","private":false,"archived":false},{"name":"pub-arch","private":false,"archived":true}]'
+pub_override_rc=0
+pub_override_err="$(
+  RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" \
+  FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+  ORG_REPOS_JSON="$ORG_REPOS_OVERRIDE" \
+  REPO_ACTIONS_PERMS_MAP="pub-disabled=false,pub-weak=true" \
+  REPO_FORK_APPROVAL_MAP="pub-weak=first_time_contributors" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify 2>&1 >/dev/null
+)" || pub_override_rc=$?
+[ "$pub_override_rc" -eq 5 ] || fail "per-repo fork-approval override must exit 5 on --verify (got $pub_override_rc)"
+grep -q 'jleechanorg/pub-weak' <<<"$pub_override_err" || fail "per-repo failure must name offending repo jleechanorg/pub-weak (got: $pub_override_err)"
+
+RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" \
+FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+ORG_REPOS_JSON="$ORG_REPOS_OVERRIDE" \
+REPO_ACTIONS_PERMS_MAP="pub-disabled=false,pub-weak=true" \
+REPO_FORK_APPROVAL_MAP="pub-weak=all_external_contributors" \
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify >/dev/null || fail "--verify must pass when org and enabled public repos use all_external_contributors"
+
+# Selected-visibility runner group with allows_public_repositories=true checks group repositories endpoint.
+SEL_PUB_GROUPS='{"total_count":1,"runner_groups":[{"id":7,"name":"sel-pub","default":false,"visibility":"selected","allows_public_repositories":true}]}'
+GROUP_REPOS_SEL='{"total_count":1,"repositories":[{"name":"pub-weak","private":false,"archived":false}]}'
+printf 'sel-pub\n' > "$RUNNER_DIR_T/.ezgha-group"
+sel_override_rc=0
+RUNNER_GROUPS_JSON="$SEL_PUB_GROUPS" \
+GROUP_REPOS_JSON="$GROUP_REPOS_SEL" \
+FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+REPO_ACTIONS_PERMS_MAP="pub-weak=true" \
+REPO_FORK_APPROVAL_MAP="pub-weak=first_time_contributors" \
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-group sel-pub >/dev/null 2>&1 || sel_override_rc=$?
+[ "$sel_override_rc" -eq 5 ] || fail "selected-visibility group with weak public repo must exit 5 (got $sel_override_rc)"
+printf 'macos-restricted\n' > "$RUNNER_DIR_T/.ezgha-group"
+
+# Missing or non-numeric .runner agentId must fail closed (never fall back to name-only matching).
+printf '{"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+if RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must reject .runner without numeric agentId (no name-only fallback)"
+fi
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify --offline must reject .runner without numeric agentId"
+fi
+
+# Normal setup detects live GitHub drift (missing runner / wrong group / wrong labels) when local metadata matches,
+# triggers reconfiguration, and fails closed if post-config live state still mismatches.
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null
+grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must reconfigure when live runner is missing on GitHub"
+
+: > "$TMP/config.log"
+bad_post_rc=0
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  GROUP_RUNNERS_JSON='{"total_count":0,"runners":[]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null 2>&1 || bad_post_rc=$?
+[ "$bad_post_rc" -eq 4 ] || fail "normal setup must fail closed (exit 4) when runner remains outside target group after config.sh (got $bad_post_rc)"
+grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must detect out-of-group drift and invoke config.sh"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "failed post-config verification must leave LaunchAgent stopped"
+pass "--repo/--runner-group exclusion, per-repo fork-approval overrides, strict agentId, and normal-setup live drift checks pass"

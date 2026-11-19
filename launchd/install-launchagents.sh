@@ -281,6 +281,7 @@ case "$action" in
         echo "SKIPPED: ${label} — no resolvable Scratch root on this host" >&2
         continue
       fi
+      mkdir -p "$(dirname "$dest")"
       candidate="${dest}.candidate.$$"
       backup="${dest}.backup.$$"
       had_prior=0

@@ -626,7 +626,7 @@ unpriced_out="$(
 grep -q 'mode=app_token_fallback_partial' <<<"$unpriced_out" || fail "unpriced hosted runner label must mark mode=app_token_fallback_partial"
 
 # Larger/ARM hosted labels must NOT match baseline standard rates and must mark mode=app_token_fallback_partial,
-# while any non-self-hosted macos-* label (macos-15-large, macos-26) still counts macos_min toward DAILY_MACOS_MIN_WARN.
+# while macos-26 and macos-26-intel ARE priced at $0.062/min and any non-self-hosted macos-* label (macos-15-large, macos-15-xlarge) still counts macos_min toward DAILY_MACOS_MIN_WARN.
 cat > "$TMP/jobs/9301.json" <<'JSON'
 {
   "total_count": 4,
@@ -651,19 +651,37 @@ cat > "$TMP/jobs/9301.json" <<'JSON'
 {
   "total_count": 2,
   "jobs": [
-    {"id":36,"labels":["macos-26"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T02:15:00Z"},
+    {"id":36,"labels":["macos-15-xlarge"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T02:15:00Z"},
     {"id":37,"labels":["ubuntu-24.04-16core"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T01:30:00Z"}
   ]
 }
 JSON
-macos26_out="$(
+macos_xlarge_out="$(
   BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-win.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
-  run_alert "$TMP/state-macos26.json" "$TMP/gcloud-macos26.log" "$TMP/gh-macos26.log"
+  run_alert "$TMP/state-macos-xlarge.json" "$TMP/gcloud-macos-xlarge.log" "$TMP/gh-macos-xlarge.log"
 )"
-grep -q 'mode=app_token_fallback_partial' <<<"$macos26_out" || fail "macos-26 unpriced label must mark mode=app_token_fallback_partial"
-[ "$(error_count "$TMP/gcloud-macos26.log")" = 1 ] || fail "75m macos-26 must trip DAILY_MACOS_MIN_WARN COST_SPIKE"
-grep -q '"macos_minutes":75' "$TMP/gcloud-macos26.log" || fail "macos-26 must report macos_minutes=75"
-grep -q '"gross_usd":0' "$TMP/gcloud-macos26.log" || fail "macos-26 must keep gross_usd=0 when unpriced"
+grep -q 'mode=app_token_fallback_partial' <<<"$macos_xlarge_out" || fail "macos-15-xlarge unpriced label must mark mode=app_token_fallback_partial"
+[ "$(error_count "$TMP/gcloud-macos-xlarge.log")" = 1 ] || fail "75m macos-15-xlarge must trip DAILY_MACOS_MIN_WARN COST_SPIKE"
+grep -q '"macos_minutes":75' "$TMP/gcloud-macos-xlarge.log" || fail "macos-15-xlarge must report macos_minutes=75"
+grep -q '"gross_usd":0' "$TMP/gcloud-macos-xlarge.log" || fail "macos-15-xlarge must keep gross_usd=0 when unpriced"
+
+cat > "$TMP/jobs/9301.json" <<'JSON'
+{
+  "total_count": 2,
+  "jobs": [
+    {"id":360,"labels":["macos-26"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T09:20:00Z"},
+    {"id":361,"labels":["macos-26-intel"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T09:20:00Z"}
+  ]
+}
+JSON
+macos26_priced_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-win.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-macos26-priced.json" "$TMP/gcloud-macos26-priced.log" "$TMP/gh-macos26-priced.log"
+)"
+grep -q 'mode=app_token_fallback ' <<<"$macos26_priced_out" || fail "macos-26 and macos-26-intel must price cleanly without partial mode"
+[ "$(error_count "$TMP/gcloud-macos26-priced.log")" = 1 ] || fail "1000m macos-26 + macos-26-intel must emit COST_SPIKE"
+grep -q '"macos_minutes":1000' "$TMP/gcloud-macos26-priced.log" || fail "macos-26 + macos-26-intel must sum to 1000 macos_minutes"
+grep -q '"gross_usd":62' "$TMP/gcloud-macos26-priced.log" || fail "macos-26 + macos-26-intel must price 1000m at \$62.00"
 
 # Empty jobs page while total_count > fetched_jobs and jq job parse error must both mark partial.
 cat > "$TMP/jobs/9301.json" <<'JSON'
@@ -709,7 +727,23 @@ end_ts="$(date +%s)"
 elapsed=$((end_ts - start_ts))
 [ "$elapsed" -lt 5 ] || fail "stalled gh api call must be killed by GH_CALL_TIMEOUT_SEC=1 (took ${elapsed}s)"
 [ "$(jq -r '.api_failures' "$TMP/state-timeout.json")" = 1 ] || fail "timed-out gh api call must increment api_failures"
-pass "wall-clock timeout bounds stalled gh calls cleanly"
+
+# Without timeout/gtimeout binaries (PATH=$TMP/nobin), fallback subshell must NOT silence stderr (regression for exec 9>&- 2>/dev/null).
+cat > "$TMP/billing-nobin-err.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-11-18T00:15:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":120.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":30.00,"discountAmount":30.00,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"disk_magician"}
+  ]
+}
+JSON
+nobin_write_rc=0
+nobin_write_err="$(
+  PATH="$TMP/nobin" GCLOUD_WRITE_FAIL=1 BILLING_FIXTURE="$TMP/billing-nobin-err.json" \
+    run_alert "$TMP/state-nobin-err.json" "$TMP/gcloud-nobin-err.log" "$TMP/gh-nobin-err.log" 2>&1 >/dev/null
+)" || nobin_write_rc=$?
+[ "$nobin_write_rc" -ne 0 ] || fail "GCLOUD_WRITE_FAIL=1 with PATH=\$TMP/nobin must exit non-zero"
+grep -q 'gcloud: transient logging write failure' <<<"$nobin_write_err" || fail "PATH=\$TMP/nobin GCLOUD_WRITE_FAIL=1 must surface gcloud stderr (got: $nobin_write_err)"
+pass "wall-clock timeout bounds stalled gh calls cleanly and preserves stderr without timeout/gtimeout"
 
 # 16. Day-1 rollover failure preserves current-month spikes & api_failures=0 resets only after jq parse succeeds.
 cat > "$TMP/billing-dec.json" <<'JSON'
@@ -854,12 +888,13 @@ BILLING_FIXTURE="$TMP/billing-lock1.json" \
 
 lockto_rc=0
 STATE_LOCK_TIMEOUT_SEC=1 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-  run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockto.log" "$TMP/gh-lockto.log" >/dev/null 2>&1 || lockto_rc=$?
+  run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockto.log" "$TMP/gh-lockto.log" >/dev/null 2>"$TMP/lockto.err" || lockto_rc=$?
 [ "$lockto_rc" -eq 4 ] || {
   kill -9 "$blocker_pid" 2>/dev/null || true
   wait "$blocker_pid" 2>/dev/null || true
   fail "state flock timeout must exit 4 (got $lockto_rc)"
 }
+grep -q 'FATAL: timed out waiting for state lock' "$TMP/lockto.err" || fail "state flock timeout must print FATAL: timed out waiting for state lock on stderr (got: $(cat "$TMP/lockto.err"))"
 grep -q 'severity=WARNING' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit WARNING"
 grep -q '"status":"BLIND"' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit BLIND status"
 grep -q 'LOCK_TIMEOUT: state lock held > 1s' "$TMP/gcloud-lockto.log" || fail "state lock timeout must cite LOCK_TIMEOUT"
@@ -896,3 +931,51 @@ elapsed=$((end_ts - start_ts))
 [ "$pol_to_rc" -ne 0 ] || fail "--ensure-gcp-policy must exit non-zero when gcloud times out"
 [ "$elapsed" -lt 5 ] || fail "stalled --ensure-gcp-policy gcloud call must be killed by GCLOUD_CALL_TIMEOUT_SEC=1 (took ${elapsed}s)"
 pass "--ensure-gcp-policy creates/updates with timeout bounds, exits non-zero, and surfaces stderr on failure"
+
+# 20. Midnight-crossing job interval splitting across UTC days and corrupt STATE_FILE recovery.
+cat > "$TMP/runs-midnight.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9401,"status":"completed","conclusion":"success","created_at":"2026-11-16T23:30:00Z","updated_at":"2026-11-17T01:10:00Z"},
+    {"id":9402,"status":"completed","conclusion":"success","created_at":"2026-11-17T22:55:00Z","updated_at":"2026-11-18T01:15:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9401.json" <<'JSON'
+{
+  "total_count": 1,
+  "jobs": [
+    {"id":41,"labels":["macos-15"],"started_at":"2026-11-16T23:40:00Z","completed_at":"2026-11-17T01:10:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9402.json" <<'JSON'
+{
+  "total_count": 1,
+  "jobs": [
+    {"id":42,"labels":["macos-15"],"started_at":"2026-11-17T23:00:00Z","completed_at":"2026-11-18T01:15:00Z"}
+  ]
+}
+JSON
+BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-midnight.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-midnight.json" "$TMP/gcloud-midnight.log" "$TMP/gh-midnight.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-midnight.log")" = 1 ] || fail "midnight-crossing jobs must emit combined COST_SPIKE"
+grep -q '"breach_keys":\["2026-11-17:COST_SPIKE","2026-11-18:COST_SPIKE"\]' "$TMP/gcloud-midnight.log" || fail "midnight-crossing jobs must attribute overlap to both 2026-11-17 and 2026-11-18"
+grep -q 'on 2026-11-17 (app_token_fallback): ~\$8.06 gross, 130 macOS min' "$TMP/gcloud-midnight.log" || fail "2026-11-17 must receive 70m + 60m = 130 macOS min (\$8.06)"
+grep -q 'on 2026-11-18 (app_token_fallback): ~\$4.65 gross, 75 macOS min' "$TMP/gcloud-midnight.log" || fail "2026-11-18 must receive 75 macOS min (\$4.65)"
+
+printf '{corrupt json\n' > "$TMP/state-corrupt.json"
+cat > "$TMP/billing-corrupt-ok.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-11-18T00:15:00Z","product":"actions","sku":"Actions Linux","quantity":10.0,"unitType":"Minutes","pricePerUnit":0.006,"grossAmount":0.06,"discountAmount":0.06,"netAmount":0.0,"organizationName":"jleechanorg","repositoryName":"ez-gh-actions"}
+  ]
+}
+JSON
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-corrupt.json" "$TMP/gcloud-corrupt.log" "$TMP/gh-corrupt.log" >/dev/null 2>"$TMP/corrupt.err"
+grep -q 'severity=WARNING' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit WARNING BLIND"
+grep -q '"status":"BLIND"' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit status=BLIND"
+grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit mode=corrupt_state_file_reset"
+jq -e 'type == "object" and .api_failures == 0' "$TMP/state-corrupt.json" >/dev/null || fail "corrupt STATE_FILE must be reset to valid JSON and recover on healthy billing"
+pass "midnight-crossing jobs clip accurately across UTC days and corrupt STATE_FILE resets with WARNING BLIND"
