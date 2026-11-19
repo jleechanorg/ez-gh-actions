@@ -170,18 +170,24 @@ jq -e '.status == "DOWN" and .container_count == 0 and .container_count_known ==
   || { jq . "$(payload_of daemon_down)" >&2; fail "a dead daemon reports a known 0-container fleet"; }
 pass "daemon confirmed down still pages cause=fleet CRITICAL immediately"
 
-# ── 6. No independent signal: fail closed, exactly as before ───────────────
+# ── 6. No independent signal: fail closed AND honest about the count ───────
+# Review finding 4: this path must keep the fail-closed page but must not claim
+# an observed 0/known=true, because nothing observed the daemon.
 run no_signal 81 DOCKER_INFO_RC=1
 [ "$(errors no_signal)" = 1 ] || { cat "$(log_of no_signal)" >&2; fail "without a liveness signal the verdict must stay fail-closed"; }
 [ "$(fleet_entries no_signal)" = 1 ] || fail "no liveness signal must still page cause=fleet"
 [ "$(probe_entries no_signal)" = 0 ] || fail "no liveness signal must never produce cause=probe"
-pass "no independent liveness signal keeps the fail-closed cause=fleet page"
+jq -e '.container_count == -1 and .container_count_known == false' "$(payload_of no_signal)" > /dev/null \
+  || { jq . "$(payload_of no_signal)" >&2; fail "a no-signal page must report an UNKNOWN count (-1/false), never an observed 0"; }
+pass "no independent liveness signal keeps the fail-closed page with an unknown count"
 
 # ── 7. Darwin/colima keeps today's behaviour (no out-of-band source) ───────
 run darwin_timeout 81 HEALTH_ALERT_PLATFORM=Darwin DOCKER_INFO_RC=1
 [ "$(errors darwin_timeout)" = 1 ] || { cat "$(log_of darwin_timeout)" >&2; fail "Darwin must keep the historical fleet page"; }
 [ "$(probe_entries darwin_timeout)" = 0 ] || fail "Darwin has no independent signal, so cause=probe must not appear"
-pass "Darwin/colima probe timeout is unchanged (cause=fleet)"
+jq -e '.container_count == -1 and .container_count_known == false' "$(payload_of darwin_timeout)" > /dev/null \
+  || { jq . "$(payload_of darwin_timeout)" >&2; fail "Darwin has no out-of-band source, so its payload must report the count as unknown"; }
+pass "Darwin/colima probe timeout is unchanged except an honest unknown count"
 
 # ── 8. Inside the window: no new entry, and the verdict says it is a probe ──
 # (The WARNING is emitted on transition only, so a poll inside the window must
@@ -245,5 +251,73 @@ jq -e '.cause == "probe" and .container_count == -1 and .container_count_known =
 jq -e '[.failed_checks[] | select(test("container count timed out"))] | length == 1' "$(payload_of ps_timeout)" > /dev/null \
   || { jq . "$(payload_of ps_timeout)" >&2; fail "failed_checks must name the container-count probe"; }
 pass "a failing container-count probe reports cause=probe, never a live 0"
+
+# ── 15. PID reuse: a live PID in the pidfile is not a live daemon ───────────
+# Review finding 1: a stale pidfile naming an unrelated LIVE process used to be
+# accepted as "dockerd alive". It must not be. A fake procfs root (macOS has no
+# /proc) supplies the identity; the PID is genuinely live.
+mkdir -p "$W/proc/$$"
+echo "bash" > "$W/proc/$$/comm"
+echo "bash" > "$W/proc/$$/cmdline"
+echo "$$" > "$W/pidfile-foreign"
+run pid_reuse 81 DOCKER_INFO_RC=1 HEALTH_ALERT_DOCKER_PIDFILE="$W/pidfile-foreign" HEALTH_ALERT_PROC_ROOT="$W/proc"
+[ "$(probe_entries pid_reuse)" = 0 ] || { cat "$(log_of pid_reuse)" >&2; fail "a recycled PID must not be read as a live dockerd"; }
+[ "$(errors pid_reuse)" = 1 ] || { cat "$(log_of pid_reuse)" >&2; fail "with no valid liveness signal the verdict must stay fail-closed"; }
+jq -e '.container_count == -1 and .container_count_known == false' "$(payload_of pid_reuse)" > /dev/null \
+  || { jq . "$(payload_of pid_reuse)" >&2; fail "the fail-closed page must report an unknown count"; }
+pass "a recycled PID in the pidfile is not accepted as a live daemon"
+
+# ── 16. A pidfile that does name a docker daemon is still positive evidence ─
+mkdir -p "$W/proc/4242"
+echo "dockerd" > "$W/proc/4242/comm"
+printf 'dockerd\0--config-root=/var/lib/docker\0' > "$W/proc/4242/cmdline"
+echo "4242" > "$W/pidfile-dockerd"
+run pidfile_dockerd 81 DOCKER_INFO_RC=1 HEALTH_ALERT_DOCKER_PIDFILE="$W/pidfile-dockerd" HEALTH_ALERT_PROC_ROOT="$W/proc"
+[ "$(probe_entries pidfile_dockerd)" = 1 ] || { cat "$(log_of pidfile_dockerd)" "$W/err-pidfile_dockerd" >&2; fail "a pidfile naming dockerd must still be treated as alive"; }
+[ "$(errors pidfile_dockerd)" = 0 ] || fail "an identifiable live daemon must not page"
+pass "a pidfile naming an actual dockerd remains valid positive evidence"
+
+# ── 17. A stale disk_breach_since must not survive a disk-healthy poll ─────
+# Review finding 2: state seeded DEGRADED with an old timer survived the probe
+# branch, so a NEW breach after a healthy gap inherited the old window and paged
+# immediately. Two consecutive polls reproduce the real sequence.
+seed_state_disk() { # case status disk_breach_since probe_since
+  mkdir -p "$W/state-$1"
+  printf '{"status":"%s", "last_sent_fleet":0, "last_sent_disk":0, "disk_breach_since":%s, "probe_indeterminate_since":%s, "updated_at":"x"}\n' \
+    "$2" "$3" "$4" > "$(state_file "$1")"
+}
+seed_state_disk stale_disk_seq DEGRADED $(( NOW - 3600 )) 0
+# Poll 1: disk healthy, probe indeterminate -> the disk timer must reset.
+run stale_disk_seq 100 DOCKER_INFO_RC=1 HEALTH_ALERT_DOCKERD_ALIVE=1
+grep -q '"disk_breach_since":0' "$(state_file stale_disk_seq)" \
+  || { cat "$(state_file stale_disk_seq)" >&2; fail "a disk-healthy poll must clear the stale breach timer"; }
+# Poll 2: a NEW breach on the same host, inside the window -> WARNING, not a page.
+run stale_disk_seq 25 DOCKER_INFO_RC=0 DOCKER_PS_N=20
+[ "$(errors stale_disk_seq)" = 0 ] || { cat "$(log_of stale_disk_seq)" "$W/err-stale_disk_seq" >&2; fail "a NEW breach must start a fresh window, not inherit the stale timer"; }
+grep -q 'DISK DEGRADED 0m' "$W/err-stale_disk_seq" || { cat "$W/err-stale_disk_seq" >&2; fail "the new breach must report a fresh (0m) window"; }
+pass "a stale disk_breach_since is cleared by a disk-healthy poll"
+
+# ── 18. DOWN -> PROBE -> healthy still reports the fleet recovery ──────────
+# Review finding 3: persisting PROBE overwrote an outstanding DOWN and swallowed
+# its RECOVERED entry, so the fleet recovery was never reported.
+seed_state down_then_probe DOWN 0
+run down_then_probe 81 DOCKER_INFO_RC=1 HEALTH_ALERT_DOCKERD_ALIVE=1
+grep -q '"status":"RECOVERED", "cause":"fleet"' "$(log_of down_then_probe)" \
+  || { cat "$(log_of down_then_probe)" "$W/err-down_then_probe" >&2; fail "DOWN -> PROBE must emit the outstanding fleet RECOVERED entry"; }
+[ "$(errors down_then_probe)" = 0 ] || fail "the recovery of a fleet outage must not page"
+# And the healed probe still reports its own recovery, without duplicating fleet.
+run down_then_probe 81 DOCKER_INFO_RC=0 DOCKER_PS_N=20
+grep -q '"status":"RECOVERED", "cause":"probe"' "$(log_of down_then_probe)" \
+  || { cat "$(log_of down_then_probe)" >&2; fail "PROBE -> healthy must still emit RECOVERED cause=probe"; }
+[ "$(grep -c '\"status\":\"RECOVERED\", \"cause\":\"fleet\"' "$(log_of down_then_probe)")" = 1 ] \
+  || { cat "$(log_of down_then_probe)" >&2; fail "the fleet recovery must be emitted exactly once"; }
+pass "DOWN -> PROBE -> healthy reports both recoveries exactly once"
+
+# ── 19. Liveness calls are bounded (static) ────────────────────────────────
+# Review finding 5: an unbounded pgrep/systemctl would stall the script under
+# pressure and suppress the escalation. Static check of the liveness function.
+UNBOUNDED=$(sed -n '/^dockerd_probe_state()/,/^}/p' "$S" | grep -E '(^|[[:space:]])(pgrep|systemctl)[[:space:]]' | grep -v 'timeout' | grep -v 'command -v' || true)
+[ -z "$UNBOUNDED" ] || { printf '%s\n' "$UNBOUNDED" >&2; fail "every pgrep/systemctl liveness call must be wrapped in a timeout"; }
+pass "the dockerd liveness calls are bounded by timeout"
 
 echo "ALL PASS: a docker probe timeout with a live daemon no longer pages as fleet down"

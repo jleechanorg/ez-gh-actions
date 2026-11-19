@@ -62,6 +62,8 @@
 #   HEALTH_ALERT_PROBE_PAGE_AFTER_MIN (15)   HEALTH_ALERT_PROBE_ATTEMPTS (3)
 #   HEALTH_ALERT_PROBE_BACKOFF_SEC (2)       HEALTH_ALERT_DOCKERD_ALIVE (1|0; "" = probe)
 #   HEALTH_ALERT_DOCKER_PIDFILE (/var/run/docker.pid)
+#   HEALTH_ALERT_LIVENESS_TIMEOUT_SEC (3; per pgrep/systemctl call)
+#   HEALTH_ALERT_PROC_ROOT (/proc; tests only)
 #   HEALTH_ALERT_COOLDOWN_SEC (1800)         GCLOUD_BIN, DOCKER_BIN
 #
 set -euo pipefail
@@ -120,7 +122,18 @@ DISK_PAGE_AFTER_MIN="${HEALTH_ALERT_DISK_PAGE_AFTER_MIN:-15}"
 # fail-closed escalation window (see "Probe-indeterminate escalation" below).
 PROBE_ATTEMPTS="${HEALTH_ALERT_PROBE_ATTEMPTS:-3}"
 PROBE_BACKOFF_SEC="${HEALTH_ALERT_PROBE_BACKOFF_SEC:-2}"
+# Persisted CONTINUOUS-OBSERVATION threshold, not a wall-clock delivery cap: real
+# time-to-page also includes the probe retries and backoff, the poll cadence,
+# sink latency, and state-file clock conditions. Do not tune it before those are
+# grounded (review finding 6) - the default stays 15.
 PROBE_PAGE_AFTER_MIN="${HEALTH_ALERT_PROBE_PAGE_AFTER_MIN:-15}"
+# Wall-clock budget for each out-of-band liveness call (pgrep/systemctl). These
+# must never outlive the poll interval, or a hung call suppresses the escalation
+# window the probe verdict depends on.
+LIVENESS_TIMEOUT_SEC="${HEALTH_ALERT_LIVENESS_TIMEOUT_SEC:-3}"
+# procfs root: only ever re-pointed by hermetic tests (macOS has no /proc), so a
+# pidfile identity check can be exercised on any host.
+PROC_ROOT="${HEALTH_ALERT_PROC_ROOT:-/proc}"
 COOLDOWN_SEC="${HEALTH_ALERT_COOLDOWN_SEC:-1800}"
 
 # Daemon CRITICAL follow-up. The daemon writes Slack alerts to alerts.jsonl;
@@ -252,6 +265,23 @@ PROBE_NOTE=""
 # Out-of-band dockerd liveness. Prints alive|down|unknown.
 # Only Linux has an independent source; Darwin/colima keeps its historical
 # behaviour (an unreachable socket is a real fleet fault, never cause=probe).
+# A live PID in the pidfile is not evidence of a live daemon: PIDs are recycled,
+# so the file can name an unrelated process that happens to exist (review
+# finding 1 - an unchecked /proc/<pid> is PID-reuse, not liveness). Require the
+# process identity to be dockerd before the pidfile counts as positive evidence.
+dockerd_pid_is_dockerd() { # pid
+  local p="$1" comm=""
+  [ -r "$PROC_ROOT/$p/comm" ] || return 1
+  read -r comm < "$PROC_ROOT/$p/comm" 2>/dev/null || return 1
+  case "$comm" in
+    dockerd|docker|dockerd-current) return 0 ;;
+  esac
+  # A daemon started from a renamed/execed path still carries `dockerd` in
+  # argv[0], so fall back to the command line before giving up.
+  [ -r "$PROC_ROOT/$p/cmdline" ] || return 1
+  tr '\0' ' ' < "$PROC_ROOT/$p/cmdline" 2>/dev/null | grep -q 'dockerd'
+}
+
 dockerd_probe_state() {
   case "${HEALTH_ALERT_DOCKERD_ALIVE:-}" in
     1) echo alive; return 0 ;;
@@ -264,17 +294,21 @@ dockerd_probe_state() {
   if [ -r "$pidfile" ]; then
     pid=$(tr -dc '0-9' < "$pidfile" 2>/dev/null || true)
   fi
-  if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then echo alive; return 0; fi
-  if pgrep -x dockerd >/dev/null 2>&1; then echo alive; return 0; fi
+  if [ -n "$pid" ] && [ -d "$PROC_ROOT/$pid" ] && dockerd_pid_is_dockerd "$pid"; then echo alive; return 0; fi
+  # Every out-of-band liveness call is bounded: an unbounded `pgrep`/`systemctl`
+  # on a starved host would stall this script and suppress the very escalation
+  # this change adds (review finding 5).
+  if timeout "$LIVENESS_TIMEOUT_SEC" pgrep -x dockerd >/dev/null 2>&1; then echo alive; return 0; fi
   if command -v systemctl >/dev/null 2>&1; then
-    if systemctl is-active --quiet docker 2>/dev/null; then echo alive; return 0; fi
-    unit=$(systemctl is-active docker 2>/dev/null || true)
+    if timeout "$LIVENESS_TIMEOUT_SEC" systemctl is-active --quiet docker 2>/dev/null; then echo alive; return 0; fi
+    unit=$(timeout "$LIVENESS_TIMEOUT_SEC" systemctl is-active docker 2>/dev/null || true)
     case "$unit" in
       inactive|failed) echo down; return 0 ;;
     esac
   fi
   # No source answered (no systemd bus, no pid, nothing): unknown. The caller
-  # then keeps the historical fail-closed classification instead of guessing.
+  # then keeps the historical fail-closed classification instead of guessing,
+  # and reports the container count as unknown rather than an observed 0.
   echo unknown
 }
 
@@ -314,15 +348,26 @@ if [ -z "$CONTAINER_COUNT" ]; then
         CONTAINER_COUNT_KNOWN=false
         PROBE_NOTE="local: docker CLI probe timed out (daemon active) after ${PROBE_TRIES} attempt(s) - probe indeterminate, container count unknown"
         ;;
-      *)
-        # Daemon confirmed down, or no independent signal available: unchanged
-        # fail-closed fleet failure. A parked host has no docker BY
-        # CONSTRUCTION, so an unreachable daemon is the decision (bead
-        # jleechan-hxz0), not a defect.
+      down)
+        # Daemon confirmed down: unchanged fail-closed fleet failure. A parked
+        # host has no docker BY CONSTRUCTION, so an unreachable daemon is the
+        # decision (bead jleechan-hxz0), not a defect.
         if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
           FLEET_FAILS+=("local: docker daemon unreachable or timed out")
         fi
         CONTAINER_COUNT=0
+        ;;
+      *)
+        # No independent liveness source (always Darwin/colima, or a Linux host
+        # with no pidfile and no systemd bus). Keep the historical fail-closed
+        # page - never hide a dead daemon - but the count is UNKNOWN, not an
+        # observed 0 (review finding 4), so the payload must not claim
+        # container_count=0 with container_count_known=true.
+        if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
+          FLEET_FAILS+=("local: docker daemon unreachable or timed out (dockerd liveness unknown - no independent signal)")
+        fi
+        CONTAINER_COUNT=-1
+        CONTAINER_COUNT_KNOWN=false
         ;;
     esac
   fi
@@ -592,6 +637,12 @@ FLEET_COUNT=${#FLEET_FAILS[@]}
 DISK_COUNT=${#DISK_FAILS[@]}
 PEER_COUNT=${#PEER_FAILS[@]}
 DISK_SINCE=$PREV_DISK_SINCE
+# A sustained-breach timer only survives while the breach is observed. Carrying
+# it across a poll that measured a healthy disk let a NEW breach inherit an old
+# window and page immediately instead of starting a fresh one (review finding 2:
+# a DEGRADED state seeded with a stale disk_breach_since survived the probe
+# branch, because only the OK/NOTE paths reset it).
+if [ "$DISK_COUNT" -eq 0 ]; then DISK_SINCE=0; fi
 NOW_LAST_FLEET=$PREV_LAST_SENT_FLEET
 NOW_LAST_DISK=$PREV_LAST_SENT_DISK
 EXIT_CODE=0
@@ -728,6 +779,28 @@ if [ "$PROBE_INDETERMINATE" -eq 1 ]; then
   echo "[$NOW_ISO] PROBE INDETERMINATE ${PROBE_MIN}m on $HOST (dockerd active, container count unknown, ${FREE_GB}GB free): $PROBE_NOTE — WARNING cause=probe, not a fleet outage" >&2
   PROBE_CHECKS=("$PROBE_NOTE")
   if [ -n "${OPERATIONAL_NOTE:-}" ]; then PROBE_CHECKS+=("$OPERATIONAL_NOTE"); fi
+  # Outstanding recovery obligation. This poll saw no fleet/disk/peer failure, so
+  # a previously paged state has ENDED even though the docker probe is still
+  # indeterminate. Persisting PROBE used to overwrite an outstanding DOWN without
+  # emitting its RECOVERED entry, so DOWN -> PROBE -> healthy reported only
+  # cause=probe and the fleet recovery was lost (review finding 3). Emit the
+  # outstanding recoveries before recording PROBE; the next poll has
+  # PREV_STATUS=PROBE, so this cannot duplicate.
+  OUTSTANDING_RECOVERY=()
+  case "$PREV_STATUS" in
+    DOWN|FAIL) OUTSTANDING_RECOVERY+=("fleet") ;;
+  esac
+  case "$PREV_STATUS" in
+    DISK|DEGRADED|FAIL) OUTSTANDING_RECOVERY+=("disk") ;;
+  esac
+  case "$PREV_STATUS" in
+    PEER) OUTSTANDING_RECOVERY+=("peer") ;;
+  esac
+  for cause in ${OUTSTANDING_RECOVERY[@]+"${OUTSTANDING_RECOVERY[@]}"}; do
+    REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    emit INFO "$REC_PAYLOAD"
+  done
   if [ "$PREV_STATUS" != "PROBE" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"probe", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "container_count_known":false, "probe_indeterminate_min":%d, "probe_page_after_min":%d, "free_gb":%d, "ts":"%s"}' \
       "$HOST" "$PLATFORM" "$(json_checks "${PROBE_CHECKS[@]}")" "$CONTAINER_COUNT" "$PROBE_MIN" "$PROBE_PAGE_AFTER_MIN" "$FREE_GB" "$NOW_ISO")
