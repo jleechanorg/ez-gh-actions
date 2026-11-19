@@ -162,6 +162,10 @@ install_scripts() {
     [[ -f "$script" ]] || continue
     install -m 0755 "$script" "${SCRIPTS_DIR}/$(basename "$script")"
   done
+  if [[ -f "${REPO_PATH}/scripts/fleet_live_dashboard_template.html" ]]; then
+    install -m 0644 "${REPO_PATH}/scripts/fleet_live_dashboard_template.html" \
+      "${SCRIPTS_DIR}/fleet_live_dashboard_template.html"
+  fi
   for asset in index.html style.css dashboard.js; do
     install -m 0644 "${REPO_PATH}/dashboard/${asset}" "${DASHBOARD_DIR}/${asset}"
   done

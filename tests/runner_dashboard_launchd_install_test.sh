@@ -35,6 +35,9 @@ done
 for script in publish_runner_dashboard.sh runner_dashboard_host_probe.sh build_runner_dashboard_snapshot.py; do
   test -x "$HOME_T/.local/libexec/ezgha/$script"
 done
+test -f "$HOME_T/.local/libexec/ezgha/fleet_live_dashboard_template.html"
+test -x "$HOME_T/.local/libexec/ezgha/fleet_live_dashboard.py"
+grep -q 'fleet_live_dashboard_template.html' "$ROOT/install.sh"
 
 PLIST="$HOME_T/Library/LaunchAgents/org.jleechanorg.ezgha-runner-dashboard.plist"
 test -f "$PLIST"

@@ -249,11 +249,17 @@ build_site() {
     else
       QUEUE_PROBE_CMD=(python3 "$SCRIPT_DIR/queue_probe.py")
     fi
+    QUEUE_MAX_REQUESTS="${EZGHA_DASHBOARD_QUEUE_MAX_REQUESTS:-80}"
+    if ! [[ "$QUEUE_MAX_REQUESTS" =~ ^[0-9]+$ ]] || (( QUEUE_MAX_REQUESTS > 80 )); then
+      QUEUE_MAX_REQUESTS=80
+    elif (( QUEUE_MAX_REQUESTS < 1 )); then
+      QUEUE_MAX_REQUESTS=1
+    fi
     if ! timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
         "${QUEUE_PROBE_CMD[@]}" \
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
-        --max-requests "${EZGHA_DASHBOARD_QUEUE_MAX_REQUESTS:-80}" \
+        --max-requests "$QUEUE_MAX_REQUESTS" \
         --output "$WORK_DIR/queue.json"; then
       rm -f "$WORK_DIR/queue.json"
       echo "queue probe failed; publishing capacity with queue unavailable" >&2

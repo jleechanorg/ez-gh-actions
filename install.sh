@@ -746,6 +746,10 @@ if [ -d "${UNIT_DIR}" ]; then
     fi
     install -m 0755 "${script}" "${SCRIPTS_DIR}/$(basename "${script}")"
   done
+  if [ -f "${SCRIPT_DIR}/scripts/fleet_live_dashboard_template.html" ]; then
+    install -m 0644 "${SCRIPT_DIR}/scripts/fleet_live_dashboard_template.html" \
+      "${SCRIPTS_DIR}/fleet_live_dashboard_template.html"
+  fi
   ok "scripts installed to stable path: ${SCRIPTS_DIR}"
 
   if [ "$(uname -s)" = "Darwin" ]; then

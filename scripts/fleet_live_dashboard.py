@@ -432,6 +432,7 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
         "commands": [str(c)[:180] for c in cmds[:4]],
         "reason": reason,
         "labels": slot_raw.get("labels") if isinstance(slot_raw.get("labels"), list) else [],
+        "managed_pool": bool(slot_raw.get("managed_pool", False)),
         "kind": slot_raw.get("kind") if isinstance(slot_raw.get("kind"), str) and slot_raw.get("kind").strip() else None,
         "scope": slot_raw.get("scope") if isinstance(slot_raw.get("scope"), str) and slot_raw.get("scope").strip() else None,
     }
@@ -497,7 +498,12 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
             slots = []
             for s in _as_dict_list(ju.get("slots"), f"hosts.{host_key}.slots", errors):
                 enriched = _safe_enrich_slot(
-                    s, gh_by_runner, gh_by_run_job, host_disk_paused=paused, label=f"hosts.{host_key}.slots", errors=errors
+                    {**s, "managed_pool": True, "kind": s.get("kind") or "container"},
+                    gh_by_runner,
+                    gh_by_run_job,
+                    host_disk_paused=paused,
+                    label=f"hosts.{host_key}.slots",
+                    errors=errors,
                 )
                 if enriched is not None:
                     slots.append(enriched)
@@ -550,7 +556,12 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                 slots = []
                 for s in _as_dict_list(vm.get("slots"), "cmux.vm.slots", errors):
                     enriched = _safe_enrich_slot(
-                        s, gh_by_runner, gh_by_run_job, host_disk_paused=False, label="cmux.vm.slots", errors=errors
+                        {**s, "managed_pool": True, "kind": s.get("kind") or "container"},
+                        gh_by_runner,
+                        gh_by_run_job,
+                        host_disk_paused=False,
+                        label="cmux.vm.slots",
+                        errors=errors,
                     )
                     if enriched is not None:
                         slots.append(enriched)
@@ -595,7 +606,13 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                 enriched
                 for s in _as_dict_list(mac.get("container_slots"), "hosts.mac.container_slots", errors)
                 for enriched in [
-                    _safe_enrich_slot(s, gh_by_runner, gh_by_run_job, label="hosts.mac.container_slots", errors=errors)
+                    _safe_enrich_slot(
+                        {**s, "managed_pool": True, "kind": s.get("kind") or "container"},
+                        gh_by_runner,
+                        gh_by_run_job,
+                        label="hosts.mac.container_slots",
+                        errors=errors,
+                    )
                 ]
                 if enriched is not None
             ]
@@ -607,7 +624,8 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                         {
                             **s,
                             "slot": s.get("name"),
-                            "kind": s.get("kind") or "native",
+                            "managed_pool": False,
+                            "kind": "native",
                             "down_reason": s.get("idle_note") or s.get("last_job"),
                         },
                         gh_by_runner,
@@ -693,6 +711,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                 "job_display_name": sp.get("job"),
                 "reason": sp.get("reason") or sp.get("scope"),
                 "scope": sp.get("scope"),
+                "managed_pool": False,
                 "kind": sp.get("kind") or "special",
             },
             gh_by_runner,
@@ -754,8 +773,10 @@ def _opt_nonneg_number(value, label, errors):
 
 def _is_general_purpose_managed_slot(slot):
     """Return True only for general-purpose managed fleet container slots eligible for IDLE-STARVED."""
-    kind = (slot.get("kind") or "").strip().lower()
-    if kind in ("special", "native"):
+    if slot.get("managed_pool") is not True:
+        return False
+    kind = (slot.get("kind") or "container").strip().lower()
+    if kind != "container":
         return False
     scope = (slot.get("scope") or "").strip().lower()
     return scope in ("", "org")
@@ -1060,7 +1081,7 @@ def _detect_native_runner_scope(root_dir):
     """Read local `.runner` metadata to distinguish org-wide vs repo-scoped/unknown native runners."""
     runner_meta = Path(root_dir) / ".runner"
     try:
-        data = json.loads(runner_meta.read_text(encoding="utf-8", errors="replace"))
+        data = json.loads(runner_meta.read_text(encoding="utf-8-sig", errors="replace"))
     except (OSError, json.JSONDecodeError, ValueError):
         return "unknown"
     if not isinstance(data, dict):
@@ -1486,8 +1507,11 @@ def _cached_live_latency(repos):
         and (now - _LIVE_LATENCY_CACHE["ts"]) < _LIVE_LATENCY_TTL_S
     ):
         return _LIVE_LATENCY_CACHE["data"]
-    data = ci_latency_probe.probe_latency(list(target), limit=15, job_run_limit=8)
-    _LIVE_LATENCY_CACHE.update({"key": target, "ts": now, "data": data})
+    try:
+        data = ci_latency_probe.probe_latency(list(target), limit=15, job_run_limit=8)
+    finally:
+        _LIVE_LATENCY_CACHE.update({"key": target, "ts": time.monotonic()})
+    _LIVE_LATENCY_CACHE["data"] = data
     return data
 
 
@@ -1627,6 +1651,12 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         fixture_errors.append(cmux_err_msg)
         cmux_fixture_errors.append(cmux_err_msg)
         cmux_data = {"ok": False, "error": f"cmux fixture missing or unreadable: {cmux_err or cmux_json}"}
+    elif isinstance(cmux_data, dict) and cmux_data.get("ok") is False:
+        hosts_partial = True
+        err_detail = str(cmux_data.get("error") or "ok=false").strip()
+        cmux_err_msg = f"cmux fixture probe failed ({err_detail})"
+        fixture_errors.append(cmux_err_msg)
+        cmux_fixture_errors.append(cmux_err_msg)
     if (github_json is not None or base is not None) and gh_data is None:
         err = f"github fixture missing or unreadable: {gh_err or gh_path}"
         fixture_errors.append(err)
@@ -1811,10 +1841,11 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
     effective_ttl_s = cache_ttl_s if cache_ttl_s is not None else (120.0 if uses_live_github else 15.0)
 
     cache_lock = threading.Lock()
-    cache_state = {"ts": 0.0, "data": None, "building": None}
+    cache_state = {"ts": 0.0, "attempt_ts": 0.0, "data": None, "last_error": None, "building": None}
 
     def _spawn_refresh_locked():
         box = {"event": threading.Event(), "data": None, "error": None}
+        cache_state["attempt_ts"] = time.monotonic()
         cache_state["building"] = box
 
         def _worker():
@@ -1831,13 +1862,21 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                 )
                 box["data"] = fresh
                 with cache_lock:
+                    now_done = time.monotonic()
                     cache_state["data"] = fresh
-                    cache_state["ts"] = time.monotonic()
+                    cache_state["last_error"] = None
+                    cache_state["ts"] = now_done
+                    cache_state["attempt_ts"] = now_done
                     if cache_state["building"] is box:
                         cache_state["building"] = None
             except Exception as exc:
                 box["error"] = exc
                 with cache_lock:
+                    now_fail = time.monotonic()
+                    cache_state["last_error"] = exc
+                    cache_state["attempt_ts"] = now_fail
+                    if cache_state["data"] is not None or uses_live_github:
+                        cache_state["ts"] = now_fail
                     if cache_state["building"] is box:
                         cache_state["building"] = None
             finally:
@@ -1851,9 +1890,16 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
             now = time.monotonic()
             cached = cache_state["data"]
             if cached is not None:
-                if (now - cache_state["ts"]) >= effective_ttl_s and cache_state["building"] is None:
+                if (now - cache_state["attempt_ts"]) >= effective_ttl_s and cache_state["building"] is None:
                     _spawn_refresh_locked()
                 return cached
+            if (
+                uses_live_github
+                and cache_state["last_error"] is not None
+                and (now - cache_state["attempt_ts"]) < effective_ttl_s
+                and cache_state["building"] is None
+            ):
+                raise cache_state["last_error"]
             box = cache_state["building"] or _spawn_refresh_locked()
         if not box["event"].wait(timeout=wait_timeout_s):
             raise TimeoutError("Timed out waiting for initial operator state")

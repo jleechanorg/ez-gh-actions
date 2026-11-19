@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import sys
 import tempfile
 import threading
 import unittest
@@ -1554,6 +1555,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 '{"ok": true, "vms": [1]}',
                 '{"ok": true, "vms": [{}]}',
                 '{"ok": true, "vms": [{"name": "cmux-a"}]}',
+                '{"ok": false, "error": "cmux cli exit 1"}',
             ):
                 cmux_f = tmp / "cmux_bad.json"
                 cmux_f.write_text(bad_cmux_fixture, encoding="utf-8")
@@ -1624,7 +1626,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
             for free_b, expect_paused in ((10 * gib - 1, True), (10 * gib, False), (10 * gib + 1, False)):
                 remote_script = mod._REMOTE_PROBE_PY.replace(
                     "print(json.dumps(_probe_docker_host_core(is_mac=False)))",
-                    f"print(json.dumps(_probe_docker_host_core(is_mac=False, disk_usage_fn=lambda _p: type('U', (), {{'total': 200*{gib}, 'used': 200*{gib}-{free_b}, 'free': {free_b}}})())))",
+                    f"print(json.dumps(_probe_docker_host_core(is_mac=False, disk_usage_fn=lambda _p: type('U', (), {{'total': 200*{gib}, 'used': 200*{gib}-{free_b}, 'free': {free_b}}})(), loadavg_fn=lambda: (1.0, 1.0, 1.0))))",
                 )
                 proc = subprocess.run(["python3", "-c", remote_script], capture_output=True, text=True, check=True, env=env)
                 with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ssh"], 0, stdout=proc.stdout, stderr="")):
@@ -1666,20 +1668,25 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     "special_runners": [
                         {"name": "repo-special-1", "host": "special-host", "state": "IDLE", "scope": "repo:org/other"},
                         {"name": "unscoped-special-2", "host": "special-host", "state": "IDLE"},
+                        {"name": "egress-special-3", "host": "special-host", "state": "IDLE", "kind": "egress"},
                     ]
                 },
             }), encoding="utf-8")
             lat_f.write_text(json.dumps({"ok": True, "overall": {}, "workflows": []}), encoding="utf-8")
 
-            # Live native runner discovery must attach kind="native" + scope from .runner (or "unknown")
+            # Live native runner discovery must attach kind="native" + scope from .runner (including UTF-8 BOM) or "unknown"
             native_root_unknown = tmp / "native-unknown"
             native_root_repo = tmp / "native-repo"
+            native_root_bom = tmp / "native-bom"
             native_root_unknown.mkdir()
             native_root_repo.mkdir()
+            native_root_bom.mkdir()
             (native_root_repo / ".runner").write_text(json.dumps({"gitHubUrl": "https://github.com/org/private-repo"}), encoding="utf-8")
+            (native_root_bom / ".runner").write_bytes(b"\xef\xbb\xbf" + json.dumps({"gitHubUrl": "https://github.com/org/bom-repo"}).encode("utf-8"))
             ps_out = (
                 f"101 05:00 {native_root_unknown}/bin/Runner.Listener run\n"
                 f"102 04:00 {native_root_repo}/bin/Runner.Listener run\n"
+                f"103 03:00 {native_root_bom}/bin/Runner.Listener run\n"
             )
             with mock.patch.object(mod.platform, "system", return_value="Darwin"), \
                  mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(["ps"], 0, stdout=ps_out, stderr="")):
@@ -1688,6 +1695,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertEqual(live_natives[0]["scope"], "unknown")
             self.assertEqual(live_natives[1]["kind"], "native")
             self.assertEqual(live_natives[1]["scope"], "repo:org/private-repo")
+            self.assertEqual(live_natives[2]["kind"], "native")
+            self.assertEqual(live_natives[2]["scope"], "repo:org/bom-repo")
 
             for gh_summary, expect_starved in (
                 ({"fresh_queued_runs": 0, "inert_ghosts": 2, "oldest_fresh_wait_minutes": 10, "q_partial": False, "q_unverified_runs": 0}, False),
@@ -1705,8 +1714,9 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 mac_native = next(h for h in st["hosts"] if h["id"] == "mac")["slots"][0]
                 special_slots = next(h for h in st["hosts"] if h["id"] == "special-runners")["slots"]
                 self.assertEqual(mac_native["state"], "IDLE")
-                self.assertEqual([sp["state"] for sp in special_slots], ["IDLE", "IDLE"])
+                self.assertEqual([sp["state"] for sp in special_slots], ["IDLE", "IDLE", "IDLE"])
                 self.assertEqual(special_slots[0]["scope"], "repo:org/other")
+                self.assertEqual(special_slots[2]["kind"], "egress")
                 if expect_starved:
                     self.assertEqual(linux_slot["state"], "IDLE-STARVED")
                     self.assertEqual(linux_slot["phase_badge"], "idle_starved")
@@ -1727,7 +1737,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 {"summary": {"fresh_queued_runs": 3, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 10.0, "q_partial": False, "q_unverified_runs": 0}},
             )
             self.assertEqual(rec_live["state_counts"]["IDLE-STARVED"], 0)
-            self.assertEqual([s["state"] for s in norm_hosts_live[0]["slots"]], ["IDLE", "IDLE"])
+            self.assertEqual([s["state"] for s in norm_hosts_live[0]["slots"]], ["IDLE", "IDLE", "IDLE"])
 
             # _read_local_ezgha_config parses TOML underscore ints (e.g. 3_0) via tomllib
             toml_cfg = tmp / "ezgha_underscore.toml"
@@ -1735,6 +1745,51 @@ class FleetLiveDashboardTest(unittest.TestCase):
             parsed_cfg = mod._read_local_ezgha_config(toml_cfg)
             self.assertEqual(parsed_cfg["count"], 20)
             self.assertEqual(parsed_cfg["min_free_disk_gb"], 30)
+
+            # Live-mode refresh failures respect cache_ttl_s cooldown without hammering GitHub
+            import urllib.error
+            fail_calls = {"n": 0}
+
+            def failing_live_build(**kwargs):
+                fail_calls["n"] += 1
+                raise RuntimeError("transient live failure")
+
+            with mock.patch.object(mod, "build_operator_state", side_effect=failing_live_build):
+                srv_cd = mod.create_server(port=0, repos=["org/repo"], cache_ttl_s=60.0)
+                t_cd = threading.Thread(target=srv_cd.serve_forever, daemon=True)
+                t_cd.start()
+                try:
+                    p_cd = srv_cd.server_address[1]
+                    for _ in range(2):
+                        with self.assertRaises(urllib.error.HTTPError) as ctx:
+                            urllib.request.urlopen(f"http://127.0.0.1:{p_cd}/api/state", timeout=5)
+                        self.assertEqual(ctx.exception.code, 500)
+                    self.assertEqual(fail_calls["n"], 1)
+                finally:
+                    srv_cd.shutdown()
+                    srv_cd.server_close()
+
+            # Installed libexec layout (sibling script + template + dependencies) renders --out-html cleanly
+            import shutil as py_shutil
+            libexec_dir = tmp / "libexec_ezgha"
+            libexec_dir.mkdir()
+            for fname in ("fleet_live_dashboard.py", "fleet_live_dashboard_template.html", "ci_latency_probe.py", "queue_probe.py"):
+                py_shutil.copy2(ROOT / "scripts" / fname, libexec_dir / fname)
+            out_html = tmp / "installed_out.html"
+            subprocess.run(
+                [
+                    sys.executable, str(libexec_dir / "fleet_live_dashboard.py"),
+                    "--hosts-json", str(hosts_f),
+                    "--cmux-json", str(cmux_f),
+                    "--github-json", str(tmp / "gh.json"),
+                    "--latency-json", str(lat_f),
+                    "--out-html", str(out_html),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertIn("Fleet + Queue + CI Latency Inspector", out_html.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
