@@ -316,11 +316,12 @@ grep -q '|GH_TOKEN=<set:billing-override>|' "$TMP/gh-auth2.log" || fail "GH_BILL
 
 # Ambient/explicit secret must never appear in gh call log, stdout, or stderr (even on failure).
 : > "$TMP/gh-redact.log"
-GH_BILLING_TOKEN="ghp_SimulatedAmbientSecret999" GH_STUB_FAIL=1 APP_TOKEN_FILE="$TMP/no-app-token" \
+probe_marker="dummy-dummy-marker"
+GH_BILLING_TOKEN="$probe_marker" GH_STUB_FAIL=1 APP_TOKEN_FILE="$TMP/no-app-token" \
   run_alert "$TMP/state-redact.json" "$TMP/gcloud-redact.log" "$TMP/gh-redact.log" \
   >"$TMP/redact.out" 2>"$TMP/redact.err" || true
 for f in "$TMP/gh-redact.log" "$TMP/redact.out" "$TMP/redact.err"; do
-  ! grep -q 'ghp_SimulatedAmbientSecret999' "$f" || fail "raw token leaked into $f"
+  ! grep -qF "$probe_marker" "$f" || fail "raw token leaked into $f"
 done
 grep -q '|GH_TOKEN=<set:redacted>|' "$TMP/gh-redact.log" || fail "fake gh stub must log <set:redacted> for arbitrary GH_BILLING_TOKEN"
 pass "auth isolation avoids App token, honors GH_BILLING_TOKEN, and redacts raw tokens from logs/output"
