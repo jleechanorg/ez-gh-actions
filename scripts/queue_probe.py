@@ -197,7 +197,11 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
         truncated = count is not None and len(raw_jobs) < count
         details_valid = not truncated
         for job in raw_jobs:
-            if not isinstance(job, dict) or job.get("status") != "queued":
+            if not isinstance(job, dict):
+                # A malformed row could be the queued job we cannot see; never call this complete.
+                details_valid = False
+                continue
+            if job.get("status") != "queued":
                 continue
             raw_labels = job.get("labels")
             if (

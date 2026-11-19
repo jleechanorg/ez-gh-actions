@@ -416,6 +416,7 @@ import json, sys
 doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
 assert doc["sources"]["mac_host"]["ok"] is True
 assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
 PY
 
 EXIT0_NULL_QUEUE="$WORK/exit0_null_queue_probe.sh"
@@ -442,6 +443,57 @@ import json, sys
 doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
 assert doc["sources"]["mac_host"]["ok"] is True
 assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
+PY
+
+# schema_version:true must be rejected even when Python strips asserts (-O), keeping partial uncertainty.
+BOOL_SCHEMA_QUEUE="$WORK/bool_schema_queue_probe.sh"
+cat > "$BOOL_SCHEMA_QUEUE" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+printf '{"schema_version":true,"ok":true,"fresh":3,"ghosts":0,"repos":[{"repo":"org/a","ok":true,"fresh":3,"ghosts":0}]}\n' > "$out"
+exit 0
+SH
+chmod +x "$BOOL_SCHEMA_QUEUE"
+PYTHONOPTIMIZE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$BOOL_SCHEMA_QUEUE" \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/bool-schema-q.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/bool-schema-q-site"
+python3 - "$WORK/bool-schema-q-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
+assert doc["queue"]["fresh"] is None, doc["queue"]
+PY
+
+# A failed probe with no output still publishes capacity with an unavailable, partial queue.
+NO_OUTPUT_QUEUE="$WORK/no_output_queue_probe.sh"
+printf '#!/usr/bin/env bash\nexit 3\n' > "$NO_OUTPUT_QUEUE"
+chmod +x "$NO_OUTPUT_QUEUE"
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$NO_OUTPUT_QUEUE" \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/no-output-q.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/no-output-q-site"
+python3 - "$WORK/no-output-q-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
 PY
 
 echo "runner dashboard publisher tests passed"

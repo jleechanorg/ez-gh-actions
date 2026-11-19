@@ -196,6 +196,30 @@ class UnknownHandling(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIsNone(result["fresh"])
 
+    def test_malformed_job_row_marks_details_incomplete(self):
+        # total_count matches len(jobs), but a null row may hide a queued job: never "complete".
+        def fake_gh(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 702, "created_at": "2026-11-18T00:00:00Z"}]}
+            if "status=in_progress" in joined:
+                return 0
+            if "/actions/runs/702/jobs" in joined:
+                return {"total_count": 2, "jobs": [
+                    {"id": 1, "status": "queued", "created_at": "2026-11-18T00:00:00Z", "labels": ["self-hosted"]},
+                    None,
+                ]}
+            raise AssertionError(f"unexpected call: {args}")
+
+        original = queue_probe.gh_json
+        queue_probe.gh_json = fake_gh
+        try:
+            result = queue_probe.probe_repo("org/repo")
+        finally:
+            queue_probe.gh_json = original
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["job_details_complete"])
+
 
 class OldestFreshWait(unittest.TestCase):
     def test_ghost_age_does_not_drive_oldest_wait(self):

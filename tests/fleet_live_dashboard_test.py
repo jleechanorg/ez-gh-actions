@@ -534,7 +534,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 return {"total_count": 0, "workflow_runs": []}
             raise RuntimeError("unexpected")
 
-        def fake_q_fail(repo, *, max_job_checks=None):
+        def fake_q_fail(repo, *, max_job_checks=None, _budget=None):
             return {
                 "repo": repo, "ok": False, "fresh": None, "ghosts": None,
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
@@ -557,7 +557,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 return {"total_count": 3, "workflow_runs": []}
             raise RuntimeError("API error for org/bad")
 
-        def fake_q(repo, *, max_job_checks=None):
+        def fake_q(repo, *, max_job_checks=None, _budget=None):
             if repo == "org/good":
                 return {
                     "repo": repo, "ok": True, "fresh": 2, "ghosts": 3,
@@ -1104,7 +1104,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     return {"total_count": 0, "workflow_runs": []}
             raise AssertionError(args)
 
-        def fake_q(repo, *, max_job_checks=None):
+        def fake_q(repo, *, max_job_checks=None, _budget=None):
             return {
                 "repo": repo, "ok": True, "fresh": 0, "ghosts": 0,
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": 0,
@@ -1208,7 +1208,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 return {"total_count": 1, "workflow_runs": [{"id": 3, "name": "CI"}]}
             raise AssertionError(args)
 
-        def fake_q(repo, *, max_job_checks=None):
+        def fake_q(repo, *, max_job_checks=None, _budget=None):
             cnt = 2 if repo == "alpha/shared" else 1
             return {
                 "repo": repo, "ok": True, "fresh": cnt, "ghosts": 0,
@@ -2211,6 +2211,29 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertIn("fail-closed", " ".join(ro_gh["errors"]))
             self.assertFalse(ro_lat["ok"])
             self.assertIn("fail-closed", ro_lat["error"])
+
+            # A late 429 on the tenth /jobs call charges every attempt made: 1 in-progress + 1 list + 1 count + 10 jobs = 13
+            self._reset_shared_cache()
+            late_calls = {"n": 0}
+
+            def late_429(args, timeout=20):
+                late_calls["n"] += 1
+                joined = " ".join(args)
+                if "status=queued" in joined:
+                    return {"total_count": 10, "workflow_runs": [{"id": 800 + i, "created_at": "2026-11-18T00:00:00Z"} for i in range(10)]}
+                if "status=in_progress" in joined:
+                    return 0
+                if "/runs/809/jobs" in joined:
+                    raise RuntimeError("HTTP 429: rate limit exceeded")
+                return {"total_count": 1, "jobs": [{"status": "queued", "created_at": "2026-11-18T00:00:00Z", "labels": ["self-hosted"]}]}
+
+            with mock.patch.object(mod.ci_latency_probe, "gh_json", return_value={"total_count": 0, "workflow_runs": []}), \
+                 mock.patch.object(mod.queue_probe, "gh_json", side_effect=late_429):
+                late = mod._collect_live_github_snapshot(repos=["org/late-429"])
+            self.assertEqual(late_calls["n"], 12)
+            self.assertTrue(late["summary"]["q_partial"])
+            charged = sum(int(ev[1]) for ev in json.loads(cache_file.read_text(encoding="utf-8"))["budget_events"])
+            self.assertEqual(charged, 13)
 
             # Warm refresh failure sets last_refresh_error / stale_refresh_error on /api/state instead of hiding failure
             warm_calls = {"n": 0}

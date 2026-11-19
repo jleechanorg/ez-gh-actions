@@ -1912,13 +1912,11 @@ def _collect_live_github_snapshot(repos=None):
                     ip_failed_repos.add(repo)
                     errors.append(f"{repo}: in_progress probe failed: {str(exc)[:120]}")
 
+                # Count every queue REST attempt at the _call_gh boundary (1 list + 1 count + 10 jobs),
+                # so early returns and exceptions never refund calls already spent.
+                q_budget = {"limit": 12, "used": 0}
                 try:
-                    q_probe = queue_probe.probe_repo(repo, max_job_checks=10)
-                    calls_made += (
-                        q_probe.get("requests_used")
-                        if isinstance(q_probe.get("requests_used"), int)
-                        else (2 + min(10, (q_probe.get("sampled_fresh") or 0) + (q_probe.get("sampled_ghosts") or 0)))
-                    )
+                    q_probe = queue_probe.probe_repo(repo, max_job_checks=10, _budget=q_budget)
                     if not q_probe.get("ok"):
                         fresh_complete = False
                         job_details_complete = False
@@ -1951,11 +1949,12 @@ def _collect_live_github_snapshot(repos=None):
                             if ow_val is not None:
                                 oldest_fresh_wait_min = ow_val if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow_val)
                 except Exception as exc:
-                    calls_made += 1
                     fresh_complete = False
                     job_details_complete = False
                     q_failed_repos.add(repo)
                     errors.append(f"{repo}: queue probe failed: {str(exc)[:120]}")
+                finally:
+                    calls_made += q_budget["used"]
             q_partial = bool(q_failed_repos or q_unverified_runs > 0 or not fresh_complete)
             snap = {
                 "captured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

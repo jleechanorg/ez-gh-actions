@@ -272,19 +272,25 @@ build_site() {
     if [[ -s "$WORK_DIR/queue.json" ]] && python3 - "$WORK_DIR/queue.json" >/dev/null 2>&1 <<'PY'
 import json, sys
 from pathlib import Path
-doc = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert isinstance(doc, dict) and doc.get("schema_version") == 1
+try:
+    doc = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    sys.exit(1)
+if not isinstance(doc, dict) or type(doc.get("schema_version")) is not int or doc["schema_version"] != 1:
+    sys.exit(1)
 raw = doc.get("queue") if isinstance(doc.get("queue"), dict) else doc
 repos = raw.get("repos")
-assert isinstance(repos, list) and all(isinstance(item, dict) for item in repos)
+if not isinstance(repos, list) or not all(isinstance(item, dict) for item in repos):
+    sys.exit(1)
 PY
     then
       if (( queue_rc != 0 )); then
         echo "queue probe exited non-zero with partial payload; preserving diagnostics" >&2
       fi
     elif [[ -e "$WORK_DIR/queue.json" ]] || (( queue_rc != 0 )); then
-      rm -f "$WORK_DIR/queue.json"
-      echo "queue probe invalid or failed; publishing capacity with queue unavailable" >&2
+      # Keep the uncertainty: the builder maps repos:null to queue.ok=false, partial=true.
+      printf '{"schema_version":1,"ok":false,"partial":true,"repos":null}\n' > "$WORK_DIR/queue.json"
+      echo "queue probe invalid or failed; publishing capacity with queue unavailable (partial)" >&2
     fi
   fi
   queue_args=()
