@@ -54,6 +54,7 @@ FALLBACK_JOBS_PER_PAGE="${FALLBACK_JOBS_PER_PAGE:-100}"
 GH_CALL_TIMEOUT_SEC="${GH_CALL_TIMEOUT_SEC:-30}"
 GCLOUD_CALL_TIMEOUT_SEC="${GCLOUD_CALL_TIMEOUT_SEC:-30}"
 STATE_LOCK_TIMEOUT_SEC="${STATE_LOCK_TIMEOUT_SEC:-30}"
+STATE_LOCK_MAX_AGE_SEC="${STATE_LOCK_MAX_AGE_SEC:-900}"
 APP_TOKEN_FILE="${APP_TOKEN_FILE:-$HOME/.config/ezgha/gh_token}"
 STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/gh-actions-cost-alert.json}"
 GH_BIN="${GH_BIN:-gh}"
@@ -205,9 +206,9 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   exit 0
 fi
 
-emit() { # severity status day message gross_usd net_usd macos_min top_repo [mode] [mtd_gross] [mtd_net]
+emit() { # severity status day message gross_usd net_usd macos_min top_repo [mode] [mtd_gross] [mtd_net] [breach_keys_json]
   local severity="$1" status="$2" day="$3" message="$4" gross_usd="$5" net_usd="$6" macos_min="$7" top_repo="$8"
-  local mode="${9:-billing_api}" mtd_gross="${10:-null}" mtd_net="${11:-null}"
+  local mode="${9:-billing_api}" mtd_gross="${10:-null}" mtd_net="${11:-null}" breach_keys_json="${12:-[]}"
   local payload
   payload="$(jq -nc \
     --arg source "$SOURCE" \
@@ -224,6 +225,7 @@ emit() { # severity status day message gross_usd net_usd macos_min top_repo [mod
     --argjson macos_min "${macos_min:-0}" \
     --argjson mtd_gross "${mtd_gross:-null}" \
     --argjson mtd_net "${mtd_net:-null}" \
+    --argjson breach_keys "${breach_keys_json:-[]}" \
     '{
       source: $source,
       status: $status,
@@ -237,6 +239,7 @@ emit() { # severity status day message gross_usd net_usd macos_min top_repo [mod
       mtd_gross: $mtd_gross,
       mtd_net: $mtd_net,
       macos_minutes: $macos_min,
+      breach_keys: $breach_keys,
       message: $message,
       ts: $ts
     }')"
@@ -267,18 +270,30 @@ fi
 
 tmp="$(mktemp)"
 STATE_LOCK_DIR=""
+STATE_LOCK_RECLAIM_DIR=""
 STATE_STAGE_TMP=""
 STATE_NEXT_TMP=""
+current_epoch() {
+  if [ -n "${NOW_EPOCH:-}" ]; then
+    printf '%s' "$NOW_EPOCH"
+  else
+    date +%s
+  fi
+}
 release_state_lock() {
   if [ -n "${STATE_LOCK_DIR:-}" ] && [ -d "$STATE_LOCK_DIR" ]; then
     local rel_dir="${STATE_LOCK_DIR}.release.$$"
     if mv "$STATE_LOCK_DIR" "$rel_dir" 2>/dev/null; then
       rm -rf "$rel_dir" 2>/dev/null || true
     else
-      rm -f "${STATE_LOCK_DIR}/pid" 2>/dev/null || true
+      rm -f "${STATE_LOCK_DIR}/pid" "${STATE_LOCK_DIR}/ts" 2>/dev/null || true
       rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
     fi
     STATE_LOCK_DIR=""
+  fi
+  if [ -n "${STATE_LOCK_RECLAIM_DIR:-}" ] && [ -d "$STATE_LOCK_RECLAIM_DIR" ]; then
+    rmdir "$STATE_LOCK_RECLAIM_DIR" 2>/dev/null || rm -rf "$STATE_LOCK_RECLAIM_DIR" 2>/dev/null || true
+    STATE_LOCK_RECLAIM_DIR=""
   fi
 }
 cleanup() {
@@ -291,44 +306,74 @@ trap cleanup EXIT
 
 acquire_state_lock() {
   local lockdir="${STATE_FILE}.lock"
+  local reclaim_dir="${lockdir}.reclaim"
   local pidfile="${lockdir}/pid"
+  local tsfile="${lockdir}/ts"
   local deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
-  local owner_pid="" owner_pid2="" missing_pid_polls=0
+  local owner_pid="" lock_ts="" now_ts="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
   mkdir -p "$(dirname "$STATE_FILE")"
   while true; do
     if mkdir "$lockdir" 2>/dev/null; then
+      now_ts="$(current_epoch)"
       printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
+      printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
       STATE_LOCK_DIR="$lockdir"
       return 0
     fi
-    if [ -f "$pidfile" ]; then
-      owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+    if mkdir "$reclaim_dir" 2>/dev/null; then
+      STATE_LOCK_RECLAIM_DIR="$reclaim_dir"
+      if [ ! -d "$lockdir" ]; then
+        missing_pid_polls=0
+        rmdir "$reclaim_dir" 2>/dev/null || true
+        STATE_LOCK_RECLAIM_DIR=""
+        continue
+      fi
+      owner_pid=""
+      if [ -f "$pidfile" ]; then
+        owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      fi
+      lock_ts=""
+      if [ -f "$tsfile" ]; then
+        lock_ts="$(tr -d '[:space:]' < "$tsfile" 2>/dev/null || true)"
+      fi
+      now_ts="$(current_epoch)"
+      should_reclaim=0
+      if [[ "$lock_ts" =~ ^[0-9]+$ ]] && (( now_ts - lock_ts > STATE_LOCK_MAX_AGE_SEC )); then
+        should_reclaim=1
+        missing_pid_polls=0
+      elif [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
         missing_pid_polls=0
         if ! kill -0 "$owner_pid" 2>/dev/null; then
-          owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-          if [ "$owner_pid2" = "$owner_pid" ] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
-            rm -rf "${lockdir}.reclaim.$$"
-          fi
-          continue
+          should_reclaim=1
         fi
       else
         missing_pid_polls=$((missing_pid_polls + 1))
+        if [ "$missing_pid_polls" -ge 10 ]; then
+          should_reclaim=1
+          missing_pid_polls=0
+        fi
       fi
-    else
-      missing_pid_polls=$((missing_pid_polls + 1))
-    fi
-    if [ "$missing_pid_polls" -ge 10 ]; then
-      owner_pid2=""
-      if [ -f "$pidfile" ]; then
-        owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      reclaimed=0
+      if [ "$should_reclaim" -eq 1 ]; then
+        if mv "$lockdir" "${lockdir}.stale.$$" 2>/dev/null; then
+          rm -rf "${lockdir}.stale.$$" 2>/dev/null || true
+          if mkdir "$lockdir" 2>/dev/null; then
+            now_ts="$(current_epoch)"
+            printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
+            printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
+            STATE_LOCK_DIR="$lockdir"
+            rmdir "$reclaim_dir" 2>/dev/null || true
+            STATE_LOCK_RECLAIM_DIR=""
+            return 0
+          fi
+          reclaimed=1
+        fi
       fi
-      if ! [[ "$owner_pid2" =~ ^[0-9]+$ ]] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
-        rm -rf "${lockdir}.reclaim.$$"
-        missing_pid_polls=0
+      rmdir "$reclaim_dir" 2>/dev/null || true
+      STATE_LOCK_RECLAIM_DIR=""
+      if [ "$reclaimed" -eq 1 ]; then
         continue
       fi
-      missing_pid_polls=0
     fi
     if (( SECONDS >= deadline )); then
       echo "FATAL: timed out waiting for state lock $lockdir" >&2
@@ -348,7 +393,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
 else
-  acquire_state_lock || exit 4
+  if ! acquire_state_lock; then
+    emit WARNING BLIND "$TODAY_UTC" \
+      "LOCK_TIMEOUT: state lock held > ${STATE_LOCK_TIMEOUT_SEC}s for $ALERT_ORG; monitoring blocked" \
+      0 null 0 "" "lock_timeout" null null || true
+    exit 4
+  fi
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
   if [ ! -f "$STATE_FILE" ]; then
@@ -427,7 +477,10 @@ run_app_token_fallback() {
   fi
   calls_used=$((calls_used + 1))
 
-  repo_count="$(jq 'length' "$tmp.repos" 2>/dev/null || echo 0)"
+  if ! repo_count="$(jq 'length' "$tmp.repos" 2>"$tmp.err")"; then
+    FALLBACK_INCOMPLETE=1
+    repo_count=0
+  fi
   if [ "$repo_count" -ge "$FALLBACK_REPOS_PER_PAGE" ]; then
     FALLBACK_INCOMPLETE=1
   fi
@@ -449,7 +502,10 @@ run_app_token_fallback() {
     fi
     calls_used=$((calls_used + 1))
 
-    runs_count="$(jq '(.workflow_runs // []) | length' "$tmp.runs" 2>/dev/null || echo 0)"
+    if ! runs_count="$(jq '(.workflow_runs // []) | length' "$tmp.runs" 2>"$tmp.err")"; then
+      FALLBACK_INCOMPLETE=1
+      runs_count=0
+    fi
     if [ "$runs_count" -ge "$FALLBACK_RUNS_PER_PAGE" ]; then
       FALLBACK_INCOMPLETE=1
     fi
@@ -471,7 +527,7 @@ run_app_token_fallback() {
         fi
         calls_used=$((calls_used + 1))
 
-        jq -c --arg run_day "${run_day:-$TODAY_UTC}" --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
+        if ! jq -c --arg run_day "${run_day:-$TODAY_UTC}" --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
           def is_self_hosted:
             any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac"));
           def job_mins:
@@ -482,6 +538,8 @@ run_app_token_fallback() {
             end;
           def is_standard_macos:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
+          def is_any_hosted_macos:
+            (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
           def is_standard_ubuntu:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^ubuntu-(latest|[0-9]{2}\\.[0-9]{2})(-arm)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core|-arm$)")) | not));
           def is_standard_windows:
@@ -490,6 +548,7 @@ run_app_token_fallback() {
           (((.started_at // $run_day) | tostring)[:10]) as $jday |
           select($jday == $yesterday or $jday == $today) |
           (if ($j | is_standard_macos) then {macos_min: $m, gross: ($m * 0.062), unpriced: false}
+           elif ($j | is_any_hosted_macos) then {macos_min: $m, gross: 0, unpriced: ($m > 0)}
            elif ($j | is_standard_ubuntu) then {macos_min: 0, gross: ($m * 0.006), unpriced: false}
            elif ($j | is_standard_windows) then {macos_min: 0, gross: ($m * 0.010), unpriced: false}
            elif (($j | is_self_hosted | not) and $m > 0) then {macos_min: 0, gross: 0, unpriced: true}
@@ -502,12 +561,23 @@ run_app_token_fallback() {
               gross_usd: .gross,
               unpriced_hosted: .unpriced
             }
-        ' "$tmp.jobs" >> "$tmp.fallback_items"
+        ' "$tmp.jobs" >> "$tmp.fallback_items" 2>"$tmp.err"; then
+          FALLBACK_INCOMPLETE=1
+        fi
 
-        page_jobs_count="$(jq '(.jobs // []) | length' "$tmp.jobs" 2>/dev/null || echo 0)"
-        total_jobs="$(jq '(.total_count // -1)' "$tmp.jobs" 2>/dev/null || echo -1)"
+        if ! page_jobs_count="$(jq '(.jobs // []) | length' "$tmp.jobs" 2>"$tmp.err")"; then
+          FALLBACK_INCOMPLETE=1
+          page_jobs_count=0
+        fi
+        if ! total_jobs="$(jq '(.total_count // -1)' "$tmp.jobs" 2>"$tmp.err")"; then
+          FALLBACK_INCOMPLETE=1
+          total_jobs=-1
+        fi
         fetched_jobs=$((fetched_jobs + page_jobs_count))
         if [ "$page_jobs_count" -eq 0 ]; then
+          if [ "$total_jobs" -gt "$fetched_jobs" ]; then
+            FALLBACK_INCOMPLETE=1
+          fi
           break
         fi
         if [ "$total_jobs" -ge 0 ]; then
@@ -680,12 +750,6 @@ should_emit() {
   [ $((NOW - prev)) -ge "$COOLDOWN_SEC" ]
 }
 
-mark_emitted() {
-  local key="$1"
-  jq --arg k "$key" --argjson now "$NOW" '.sent[$k] = $now | .last_sent = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
-  mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
-}
-
 append_blind_context() {
   local base="$1"
   if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
@@ -695,22 +759,24 @@ append_blind_context() {
   fi
 }
 
-emit_and_record() { # key severity status day msg gross net macos_min top_repo
-  local key="$1" severity="$2" status="$3" day="$4" msg="$5" gross="$6" net="$7" macos_min="$8" top_repo="$9"
-  local final_msg
-  final_msg="$(append_blind_context "$msg")"
-  if emit "$severity" "$status" "$day" "$final_msg" "$gross" "$net" "$macos_min" "$top_repo" "$run_mode" "$mtd_gross" "$mtd_net"; then
-    mark_emitted "$key"
-    if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
-      jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
-      mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
-      BLIND_COMBINED=1
-    fi
-    alerted=$((alerted + 1))
-  else
-    echo "ERROR: alert sink failed for $key" >&2
-    exit 3
-  fi
+DUE_KEYS=()
+DUE_STATUSES=()
+DUE_DAYS=()
+DUE_MSGS=()
+DUE_GROSS=()
+DUE_NET=()
+DUE_MACOS=()
+DUE_REPO=()
+
+queue_due_breach() { # key status day msg gross net macos_min top_repo
+  DUE_KEYS+=("$1")
+  DUE_STATUSES+=("$2")
+  DUE_DAYS+=("$3")
+  DUE_MSGS+=("$4")
+  DUE_GROSS+=("$5")
+  DUE_NET+=("$6")
+  DUE_MACOS+=("$7")
+  DUE_REPO+=("$8")
 }
 
 mtd_gross="$(jq -r '.mtd.gross_usd // "null"' "$tmp.summary")"
@@ -755,7 +821,7 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top
       else
         msg="GitHub Actions cost/macOS spike in $ALERT_ORG on $day: \$${d_gross_fmt} gross, ${d_macos_fmt} macOS min (\$${d_net_fmt} net); top repo $top_repo (${top_macos_fmt} macOS min, \$${top_gross_fmt} gross); MTD \$${mtd_gross_fmt} gross / \$${mtd_net_fmt} net"
       fi
-      emit_and_record "$key" ERROR COST_SPIKE "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
+      queue_due_breach "$key" COST_SPIKE "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
     fi
   fi
 
@@ -763,7 +829,7 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_net top
     key="${day}:NET_SPEND_BREACH"
     if should_emit "$key"; then
       msg="GitHub Actions daily NET spend breach in $ALERT_ORG on $day: \$${d_net_fmt} net (>= \$${DAILY_NET_WARN_USD}; \$${d_gross_fmt} gross, ${d_macos_fmt} macOS min); top repo $top_repo (\$${top_net_fmt} net, \$${top_gross_fmt} gross); MTD \$${mtd_net_fmt} net"
-      emit_and_record "$key" ERROR NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
+      queue_due_breach "$key" NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_repo"
     fi
   fi
 done < <(jq -r '.days[] | [.day, .gross_usd, (.net_usd // "null"), .macos_min, .top_repo, .top_repo_gross_usd, (.top_repo_net_usd // "null"), .top_repo_macos_min] | @tsv' "$tmp.summary")
@@ -772,7 +838,7 @@ if [ "$used_fallback" -eq 0 ] && [ "$mtd_net" != "null" ] && ge_num "$mtd_net" "
   key="${YEAR_MONTH}:MTD_NET_BREACH"
   if should_emit "$key"; then
     msg="GitHub Actions MTD NET spend breach in $ALERT_ORG (${YEAR_MONTH}): \$${mtd_net_fmt} net (>= \$${MTD_NET_WARN_USD}; \$${mtd_gross_fmt} gross, ${mtd_macos_fmt} macOS min)"
-    emit_and_record "$key" ERROR MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
+    queue_due_breach "$key" MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
   fi
 fi
 
@@ -780,7 +846,42 @@ if [ "$used_fallback" -eq 0 ] && [ "$mtd_gross" != "null" ] && ge_num "$mtd_gros
   key="${YEAR_MONTH}:MTD_GROSS_BREACH"
   if should_emit "$key"; then
     msg="GitHub Actions MTD GROSS usage breach in $ALERT_ORG (${YEAR_MONTH}): \$${mtd_gross_fmt} gross (>= \$${MTD_GROSS_WARN_USD}; \$${mtd_net_fmt} net, ${mtd_macos_fmt} macOS min)"
-    emit_and_record "$key" ERROR MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
+    queue_due_breach "$key" MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
+  fi
+fi
+
+if [ "${#DUE_KEYS[@]}" -gt 0 ]; then
+  combined_status="${DUE_STATUSES[0]}"
+  for _s in "${DUE_STATUSES[@]}"; do
+    if [ "$_s" != "$combined_status" ]; then
+      combined_status="MULTI_BREACH"
+      break
+    fi
+  done
+  combined_msg="${DUE_MSGS[0]}"
+  for ((_i = 1; _i < ${#DUE_MSGS[@]}; _i++)); do
+    combined_msg="${combined_msg} | ${DUE_MSGS[$_i]}"
+  done
+  combined_msg="$(append_blind_context "$combined_msg")"
+  breach_keys_json="$(printf '%s\n' "${DUE_KEYS[@]}" | jq -R . | jq -sc .)"
+  if emit ERROR "$combined_status" "${DUE_DAYS[0]}" "$combined_msg" \
+       "${DUE_GROSS[0]}" "${DUE_NET[0]}" "${DUE_MACOS[0]}" "${DUE_REPO[0]}" \
+       "$run_mode" "$mtd_gross" "$mtd_net" "$breach_keys_json"; then
+    mark_blind=0
+    if [ "$PRIMARY_FAILED" -eq 1 ] && [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+      mark_blind=1
+      BLIND_COMBINED=1
+    fi
+    jq --argjson keys "$breach_keys_json" --argjson now "$NOW" --argjson mark_blind "$mark_blind" '
+      reduce $keys[] as $k (.; .sent[$k] = $now)
+      | .last_sent = $now
+      | if $mark_blind == 1 then .last_blind = $now else . end
+    ' "$STATE_FILE" > "$STATE_STAGE_TMP"
+    mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
+    alerted="${#DUE_KEYS[@]}"
+  else
+    echo "ERROR: alert sink failed for ${DUE_KEYS[*]}" >&2
+    exit 3
   fi
 fi
 

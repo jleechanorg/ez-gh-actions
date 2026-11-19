@@ -183,6 +183,7 @@ cat > "$RUNNER_DIR_T/run.sh" <<'STUB'
 exit 0
 STUB
 chmod +x "$RUNNER_DIR_T/run.sh"
+: > "$RUNNER_DIR_T/run-helper.sh.template"
 
 cat > "$TMP/bin/launchctl-track" <<STUB
 #!/usr/bin/env bash
@@ -199,8 +200,21 @@ case "\${1:-}" in
     rm -f "\$state_file"
     ;;
   print)
-    [ -f "\$state_file" ]
-    exit \$?
+    if [ -n "\${LAUNCHCTL_RACE_TAG:-}" ] && [ ! -f "$TMP/race_seen_\${LAUNCHCTL_RACE_TAG}" ]; then
+      : > "$TMP/race_seen_\${LAUNCHCTL_RACE_TAG}"
+      printf 'ENTER %s\n' "\${LAUNCHCTL_RACE_TAG}" >> "\${LAUNCHCTL_TRACE_FILE:?}"
+      sleep "\${LAUNCHCTL_TRACE_SLEEP:-0.5}"
+      printf 'EXIT %s\n' "\${LAUNCHCTL_RACE_TAG}" >> "\${LAUNCHCTL_TRACE_FILE:?}"
+    fi
+    if [ -n "\${LAUNCHCTL_PRINT_ERR_RC:-}" ]; then
+      echo "\${LAUNCHCTL_PRINT_ERR_MSG:-launchctl: lookup error}" >&2
+      exit "\${LAUNCHCTL_PRINT_ERR_RC}"
+    fi
+    if [ -f "\$state_file" ]; then
+      exit 0
+    fi
+    echo "Could not find service \"\${2:-}\" in domain" >&2
+    exit 113
     ;;
 esac
 exit 0
@@ -211,13 +225,43 @@ cp "$TMP/bin/launchctl-track" "$TMP/bin/launchctl"
 cat > "$TMP/bin/gh-runner" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${GH_RUNNER_CALL_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$GH_RUNNER_CALL_LOG"
+fi
+jq_expr=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[$i]}" = "--jq" ] && (( i + 1 < ${#args[@]} )); then
+    jq_expr="${args[$((i + 1))]}"
+  fi
+done
+emit_json() {
+  local raw="$1"
+  if [ -n "$jq_expr" ]; then
+    printf '%s\n' "$raw" | jq -r "$jq_expr"
+  else
+    printf '%s\n' "$raw"
+  fi
+}
 case "$*" in
   *"actions/runners/registration-token"*)
-    printf 'stub-reg-token\n'
+    emit_json '{"token":"stub-reg-token"}'
+    ;;
+  *"actions/runner-groups"*)
+    default_groups='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":false}]}'
+    emit_json "${RUNNER_GROUPS_JSON:-$default_groups}"
+    ;;
+  *"actions/permissions/fork-pr-contributor-approval"*)
+    default_policy='{"approval_policy":"first_time_contributors"}'
+    emit_json "${FORK_APPROVAL_JSON:-$default_policy}"
     ;;
   *"actions/runners"*)
     default_live='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}'
-    printf '%s\n' "${LIVE_RUNNERS_JSON:-$default_live}"
+    emit_json "${LIVE_RUNNERS_JSON:-$default_live}"
+    ;;
+  *"repos/"*)
+    default_repo='{"private":true}'
+    emit_json "${REPO_META_JSON:-$default_repo}"
     ;;
   *)
     echo "unexpected gh call: $*" >&2
@@ -522,7 +566,8 @@ mkdir -p "$TMP/home/actions-runner/bin"
 cp "$RUNNER_DIR_T/bin/Runner.Listener" "$TMP/home/actions-runner/bin/Runner.Listener"
 cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
 cp "$RUNNER_DIR_T/run.sh" "$TMP/home/actions-runner/run.sh"
-rm -f "$RUNNER_DIR_T/config.sh" "$RUNNER_DIR_T/run.sh"
+cp "$RUNNER_DIR_T/run-helper.sh.template" "$TMP/home/actions-runner/run-helper.sh.template"
+rm -f "$RUNNER_DIR_T/config.sh" "$RUNNER_DIR_T/run.sh" "$RUNNER_DIR_T/run-helper.sh.template"
 : > "$TMP/launchctl.log"
 : > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
@@ -611,3 +656,127 @@ SETUP_LOCK_TIMEOUT_SEC=5 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DI
   "$SETUP_SCRIPT" --uninstall >/dev/null || fail "mutating --uninstall must reclaim stale dead-PID lifecycle lock"
 [ ! -d "$LOCK_DIR_T" ] || fail "lifecycle lockdir must be released on exit"
 pass "lifecycle lock serializes mutating operations, skips --dry-run/--verify, and reclaims stale locks"
+
+# 12. run-helper.sh.template readiness + .env preservation.
+rm -f "$RUNNER_DIR_T/run-helper.sh.template"
+cp "$TMP/plist.ok" "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline >/dev/null 2>&1; then
+  fail "--verify must fail when run-helper.sh.template is missing"
+fi
+cat > "$RUNNER_DIR_T/config.sh" <<STUB
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'config.sh %s\n' "\$*" >> "$TMP/config.log"
+printf '{"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
+printf 'rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
+STUB
+chmod +x "$RUNNER_DIR_T/config.sh"
+cp "$RUNNER_DIR_T/config.sh" "$TMP/home/actions-runner/config.sh"
+printf 'JAVA_HOME=/opt/java\n' > "$RUNNER_DIR_T/.env"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$TMP/home/actions-runner" "$SETUP_SCRIPT" >/dev/null
+[ -f "$RUNNER_DIR_T/run-helper.sh.template" ] || fail "setup must repair missing run-helper.sh.template"
+grep -q '^JAVA_HOME=/opt/java$' "$RUNNER_DIR_T/.env" || fail "setup must preserve existing .env instead of truncating it"
+pass "run-helper.sh.template readiness and existing .env preservation hold"
+
+# 13. Fail-closed launchctl print lookup error (rc=2) preserves plist and credentials.
+cp "$TMP/plist.ok" "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+printf 'keep-creds\n' > "$RUNNER_DIR_T/.credentials"
+if LAUNCHCTL_PRINT_ERR_RC=2 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+    "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
+  fail "--uninstall must fail closed on launchctl print error rc=2"
+fi
+[ -f "$PLIST_T" ] || fail "--uninstall must preserve plist when launchctl print returns error rc=2"
+if LAUNCHCTL_PRINT_ERR_RC=2 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1; then
+  fail "--reconfigure must fail closed on launchctl print error rc=2"
+fi
+[ -f "$RUNNER_DIR_T/.credentials" ] && [ "$(cat "$RUNNER_DIR_T/.credentials")" = "keep-creds" ] || fail "--reconfigure must preserve credentials when launchctl print returns error rc=2"
+pass "launchctl print lookup errors fail closed and preserve plist and credentials"
+
+# 14. Fork PR exposure protection, --runner-group, --allow-public-fork-exposure, and --repo.
+rg_dry_out="$(
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run --runner-group macos-restricted
+)"
+grep -q '^RUNNER_GROUP=macos-restricted$' <<<"$rg_dry_out" || fail "--dry-run must echo RUNNER_GROUP="
+grep -q -- '--runnergroup macos-restricted' <<<"$rg_dry_out" || fail "--dry-run CONFIG_CMD must include --runnergroup"
+
+PUB_OPEN_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true}]}'
+MIXED_GROUPS='{"total_count":2,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true},{"id":2,"name":"macos-restricted","default":false,"allows_public_repositories":false}]}'
+: > "$TMP/gh-fork.log"
+fork_rc=0
+GH_RUNNER_CALL_LOG="$TMP/gh-fork.log" RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --reconfigure >/dev/null 2>&1 || fork_rc=$?
+[ "$fork_rc" -eq 5 ] || fail "setup with allows_public_repositories=true + first_time_contributors must exit 5 (got $fork_rc)"
+! grep -q 'registration-token' "$TMP/gh-fork.log" || fail "fork-protection failure must abort BEFORE minting registration-token"
+
+vfork_rc=0
+: > "$TMP/launchctl.loaded"
+RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify >/dev/null 2>&1 || vfork_rc=$?
+[ "$vfork_rc" -eq 5 ] || fail "--verify with allows_public_repositories=true + first_time_contributors must exit 5 (got $vfork_rc)"
+
+RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify >/dev/null || fail "--verify must pass with all_external_contributors"
+
+RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --allow-public-fork-exposure >/dev/null || fail "--verify must pass with --allow-public-fork-exposure"
+
+missing_rg_rc=0
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-group no-such-group >/dev/null 2>&1 || missing_rg_rc=$?
+[ "$missing_rg_rc" -eq 5 ] || fail "missing --runner-group must exit 5 (got $missing_rg_rc)"
+
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --reconfigure --runner-group macos-restricted >/dev/null || fail "restricted runner group with allows_public_repositories=false must pass"
+grep -q -- '--runnergroup macos-restricted' "$TMP/config.log" || fail "reconfigure with --runner-group must pass --runnergroup to config.sh"
+
+# Repo-scoped fork protection checks.
+pub_repo_rc=0
+REPO_META_JSON='{"private":false}' FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --reconfigure --repo jleechanorg/pub >/dev/null 2>&1 || pub_repo_rc=$?
+[ "$pub_repo_rc" -eq 5 ] || fail "public --repo with first_time_contributors must exit 5 (got $pub_repo_rc)"
+pass "server-side fork protection, --runner-group, --allow-public-fork-exposure, and --repo checks hold"
+
+# 15. Two-contender concurrent stale-lock recovery proves mutual exclusion across critical section.
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null
+mkdir -p "$LOCK_DIR_T"
+printf '%s\n' "$holder_pid" > "$LOCK_DIR_T/pid"
+date +%s > "$LOCK_DIR_T/ts"
+: > "$TMP/setup-race.trace"
+LAUNCHCTL_RACE_TAG=1 LAUNCHCTL_TRACE_FILE="$TMP/setup-race.trace" LAUNCHCTL_TRACE_SLEEP=0.5 \
+  SETUP_LOCK_TIMEOUT_SEC=10 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null &
+spid1=$!
+LAUNCHCTL_RACE_TAG=2 LAUNCHCTL_TRACE_FILE="$TMP/setup-race.trace" LAUNCHCTL_TRACE_SLEEP=0.5 \
+  SETUP_LOCK_TIMEOUT_SEC=10 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null &
+spid2=$!
+src1=0; wait "$spid1" || src1=$?
+src2=0; wait "$spid2" || src2=$?
+[ "$src1" -eq 0 ] && [ "$src2" -eq 0 ] || fail "two-contender setup lock recovery must succeed for both contenders (rc1=$src1 rc2=$src2)"
+[ ! -d "$LOCK_DIR_T" ] && [ ! -d "${LOCK_DIR_T}.reclaim" ] || fail "setup lockdir and reclaim mutex must both be released"
+TRACE_FILE="$TMP/setup-race.trace" python3 - <<'PY' || fail "two-contender setup lock allowed concurrent entry"
+import os
+from pathlib import Path
+lines = [l.strip() for l in Path(os.environ["TRACE_FILE"]).read_text().splitlines() if l.strip()]
+assert len(lines) == 4, f"expected 4 trace lines, got {lines!r}"
+assert lines[0].startswith("ENTER ") and lines[1] == "EXIT " + lines[0].split()[1], f"overlap detected: {lines!r}"
+assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[1], f"overlap detected: {lines!r}"
+assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
+PY
+pass "two-contender setup stale-lock recovery enforces mutual exclusion"

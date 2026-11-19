@@ -4,18 +4,28 @@
 # runner/Scratch `_work` paths and `--no-default-labels --labels self-hosted-native-macos`
 # (`SessionCreate=true`) from the TestFlight signing runner
 # (`/Users/jleechan/actions-runner`) and Linux `self-hosted` jobs, while sharing
-# the operator's macOS UID/`$HOME` (not a user-account sandbox); public-repo
-# workflows targeting `self-hosted-native-macos` must gate out untrusted fork PRs.
+# the operator's macOS UID/`$HOME` (not a user-account sandbox).
+#
+# Security model:
+#   `pull_request` YAML `if:` guards execute from the fork's head commit and are
+#   NOT a security boundary against modified fork workflows; server-side
+#   protection (`allows_public_repositories=false`, private `--repo`, or
+#   `approval_policy=all_external_contributors`) is required and enforced
+#   fail-closed by `setup-native-macos-runner.sh` (unless
+#   `--allow-public-fork-exposure` is explicitly passed).
 #
 # Usage:
 #   setup-native-macos-runner.sh [--dry-run] [--verify] [--uninstall]
-#     [--org ORG] [--repo OWNER/REPO] [--name RUNNER_NAME]
+#     [--org ORG] [--repo OWNER/REPO] [--runner-group GROUP]
+#     [--allow-public-fork-exposure] [--name RUNNER_NAME]
 #     [--runner-dir DIR] [--labels CSV] [--work-dir DIR] [--version VER]
 set -euo pipefail
 
 RUNNER_ORG="${RUNNER_ORG:-${GITHUB_ORG:-jleechanorg}}"
 GITHUB_ORG="$RUNNER_ORG"
 RUNNER_REPO="${RUNNER_REPO:-}"
+RUNNER_GROUP="${RUNNER_GROUP:-}"
+ALLOW_PUBLIC_FORK_EXPOSURE="${ALLOW_PUBLIC_FORK_EXPOSURE:-0}"
 RUNNER_NAME="${NATIVE_MACOS_RUNNER_NAME:-mac-native-ci-1}"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner-macos-ci}"
 EXISTING_RUNNER_DIR="${EXISTING_RUNNER_DIR:-$HOME/actions-runner}"
@@ -36,19 +46,21 @@ OFFLINE=0
 usage() {
   cat <<'USAGE'
 Usage: setup-native-macos-runner.sh [OPTIONS]
-  --dry-run            Print planned setup, config.sh command, and LaunchAgent plist without mutating host
-  --verify             Verify existing runner dir, .runner, .ezgha-labels, live GitHub labels, work dir, and LaunchAgent
-  --reconfigure        Force unload, removal of local .runner/.credentials*, and fresh ./config.sh --replace
-  --offline            Skip live GitHub API label verification during --verify
-  --uninstall          Unload and remove org.jleechanorg.ezgha-native-macos-runner LaunchAgent
-  --org ORG            GitHub org scope (default: jleechanorg)
-  --repo OWNER/REPO    Optional repo scope (overrides --org)
-  --name NAME          Runner name (default: mac-native-ci-1)
-  --runner-dir DIR     Install directory (default: $HOME/actions-runner-macos-ci)
-  --labels CSV         Comma-separated labels (default: self-hosted-native-macos)
-  --work-dir DIR       Work directory (default: Scratch native-macos-ci-work)
-  --version VER        Actions runner version fallback download (default: 2.338.2)
-  -h, --help           Show help
+  --dry-run                       Print planned setup, config.sh command, and LaunchAgent plist without mutating host
+  --verify                        Verify existing runner dir, .runner, .ezgha-labels, live GitHub labels, fork protection, work dir, and LaunchAgent
+  --reconfigure                   Force unload, removal of local .runner/.credentials*, and fresh ./config.sh --replace
+  --offline                       Skip live GitHub API verification during --verify or setup
+  --uninstall                     Unload and remove org.jleechanorg.ezgha-native-macos-runner LaunchAgent
+  --org ORG                       GitHub org scope (default: jleechanorg)
+  --repo OWNER/REPO               Optional repo scope (overrides --org)
+  --runner-group GROUP            Optional GitHub org runner group name (passed as --runnergroup to config.sh)
+  --allow-public-fork-exposure    Explicitly allow setup/verify even when public fork PRs lack all_external_contributors approval
+  --name NAME                     Runner name (default: mac-native-ci-1)
+  --runner-dir DIR                Install directory (default: $HOME/actions-runner-macos-ci)
+  --labels CSV                    Comma-separated labels (default: self-hosted-native-macos)
+  --work-dir DIR                  Work directory (default: Scratch native-macos-ci-work)
+  --version VER                   Actions runner version fallback download (default: 2.338.2)
+  -h, --help                      Show help
 USAGE
 }
 
@@ -61,6 +73,8 @@ while [ "$#" -gt 0 ]; do
     --uninstall) UNINSTALL=1; shift ;;
     --org) RUNNER_ORG="${2:?missing --org value}"; GITHUB_ORG="$RUNNER_ORG"; shift 2 ;;
     --repo) RUNNER_REPO="${2:?missing --repo value}"; shift 2 ;;
+    --runner-group) RUNNER_GROUP="${2:?missing --runner-group value}"; shift 2 ;;
+    --allow-public-fork-exposure) ALLOW_PUBLIC_FORK_EXPOSURE=1; shift ;;
     --name) RUNNER_NAME="${2:?missing --name value}"; shift 2 ;;
     --runner-dir) RUNNER_DIR="${2:?missing --runner-dir value}"; shift 2 ;;
     --labels) LABELS="${2:?missing --labels value}"; RUNNER_LABELS="$LABELS"; shift 2 ;;
@@ -84,7 +98,9 @@ RESERVED_SMTP_OP="$(canonical_path "/Users/jleechan/actions-runner-smtp-egress")
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
 STATE_LOCK_TIMEOUT_SEC="${SETUP_LOCK_TIMEOUT_SEC:-30}"
+SETUP_LOCK_MAX_AGE_SEC="${SETUP_LOCK_MAX_AGE_SEC:-900}"
 SETUP_LOCK_DIR=""
+SETUP_LOCK_RECLAIM_DIR=""
 STAGE_DIR=""
 TMP_TGZ=""
 BACKUP_DIR=""
@@ -96,10 +112,14 @@ release_setup_lock() {
     if mv "$SETUP_LOCK_DIR" "$rel_dir" 2>/dev/null; then
       rm -rf "$rel_dir" 2>/dev/null || true
     else
-      rm -f "${SETUP_LOCK_DIR}/pid" 2>/dev/null || true
+      rm -f "${SETUP_LOCK_DIR}/pid" "${SETUP_LOCK_DIR}/ts" 2>/dev/null || true
       rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
     fi
     SETUP_LOCK_DIR=""
+  fi
+  if [ -n "${SETUP_LOCK_RECLAIM_DIR:-}" ] && [ -d "$SETUP_LOCK_RECLAIM_DIR" ]; then
+    rmdir "$SETUP_LOCK_RECLAIM_DIR" 2>/dev/null || rm -rf "$SETUP_LOCK_RECLAIM_DIR" 2>/dev/null || true
+    SETUP_LOCK_RECLAIM_DIR=""
   fi
 }
 
@@ -113,47 +133,77 @@ trap cleanup_setup EXIT
 
 acquire_setup_lock() {
   local state_dir="${HOME}/.local/state/ezgha"
-  local safe_label lockdir pidfile deadline
-  local owner_pid="" owner_pid2="" missing_pid_polls=0
+  local safe_label lockdir reclaim_dir pidfile tsfile deadline
+  local owner_pid="" lock_ts="" now_ts="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
   safe_label="$(printf '%s' "$PLIST_LABEL" | tr -cd 'A-Za-z0-9_.-')"
   lockdir="${state_dir}/setup-native-macos-runner.${safe_label}.lock"
+  reclaim_dir="${lockdir}.reclaim"
   pidfile="${lockdir}/pid"
+  tsfile="${lockdir}/ts"
   deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
   mkdir -p "$state_dir"
   while true; do
     if mkdir "$lockdir" 2>/dev/null; then
+      now_ts="${NOW:-$(date +%s)}"
       printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
+      printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
       SETUP_LOCK_DIR="$lockdir"
       return 0
     fi
-    if [ -f "$pidfile" ]; then
-      owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+    if mkdir "$reclaim_dir" 2>/dev/null; then
+      SETUP_LOCK_RECLAIM_DIR="$reclaim_dir"
+      if [ ! -d "$lockdir" ]; then
+        missing_pid_polls=0
+        rmdir "$reclaim_dir" 2>/dev/null || true
+        SETUP_LOCK_RECLAIM_DIR=""
+        continue
+      fi
+      owner_pid=""
+      if [ -f "$pidfile" ]; then
+        owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      fi
+      lock_ts=""
+      if [ -f "$tsfile" ]; then
+        lock_ts="$(tr -d '[:space:]' < "$tsfile" 2>/dev/null || true)"
+      fi
+      now_ts="${NOW:-$(date +%s)}"
+      should_reclaim=0
+      if [[ "$lock_ts" =~ ^[0-9]+$ ]] && (( now_ts - lock_ts > SETUP_LOCK_MAX_AGE_SEC )); then
+        should_reclaim=1
+        missing_pid_polls=0
+      elif [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
         missing_pid_polls=0
         if ! kill -0 "$owner_pid" 2>/dev/null; then
-          owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-          if [ "$owner_pid2" = "$owner_pid" ] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
-            rm -rf "${lockdir}.reclaim.$$"
-          fi
-          continue
+          should_reclaim=1
         fi
       else
         missing_pid_polls=$((missing_pid_polls + 1))
+        if [ "$missing_pid_polls" -ge 10 ]; then
+          should_reclaim=1
+          missing_pid_polls=0
+        fi
       fi
-    else
-      missing_pid_polls=$((missing_pid_polls + 1))
-    fi
-    if [ "$missing_pid_polls" -ge 10 ]; then
-      owner_pid2=""
-      if [ -f "$pidfile" ]; then
-        owner_pid2="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
+      reclaimed=0
+      if [ "$should_reclaim" -eq 1 ]; then
+        if mv "$lockdir" "${lockdir}.stale.$$" 2>/dev/null; then
+          rm -rf "${lockdir}.stale.$$" 2>/dev/null || true
+          if mkdir "$lockdir" 2>/dev/null; then
+            now_ts="${NOW:-$(date +%s)}"
+            printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
+            printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
+            SETUP_LOCK_DIR="$lockdir"
+            rmdir "$reclaim_dir" 2>/dev/null || true
+            SETUP_LOCK_RECLAIM_DIR=""
+            return 0
+          fi
+          reclaimed=1
+        fi
       fi
-      if ! [[ "$owner_pid2" =~ ^[0-9]+$ ]] && mv "$lockdir" "${lockdir}.reclaim.$$" 2>/dev/null; then
-        rm -rf "${lockdir}.reclaim.$$"
-        missing_pid_polls=0
+      rmdir "$reclaim_dir" 2>/dev/null || true
+      SETUP_LOCK_RECLAIM_DIR=""
+      if [ "$reclaimed" -eq 1 ]; then
         continue
       fi
-      missing_pid_polls=0
     fi
     if (( SECONDS >= deadline )); then
       echo "ERROR: timed out waiting for setup lock $lockdir" >&2
@@ -161,6 +211,21 @@ acquire_setup_lock() {
     fi
     sleep 0.2
   done
+}
+
+launchagent_confirmed_unloaded() {
+  local gui_target="$1" out="" rc=0
+  out="$(launchctl print "$gui_target" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    return 1
+  fi
+  if [ "$rc" -eq 113 ]; then
+    return 0
+  fi
+  if printf '%s' "$out" | grep -qiE 'could not find service|service .* not found|unknown service'; then
+    return 0
+  fi
+  return 1
 }
 
 stop_launchagent() {
@@ -175,10 +240,14 @@ stop_launchagent() {
   fi
   local _attempt
   for _attempt in 1 2 3 4 5; do
-    launchctl print "$gui_target" >/dev/null 2>&1 || return 0
+    if launchagent_confirmed_unloaded "$gui_target"; then
+      return 0
+    fi
     sleep 1
   done
-  launchctl print "$gui_target" >/dev/null 2>&1 || return 0
+  if launchagent_confirmed_unloaded "$gui_target"; then
+    return 0
+  fi
   return 1
 }
 
@@ -396,8 +465,11 @@ render_plist() {
   path_xml="$(xml_escape "${HOME}/.local/bin:${HOME}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
   # SessionCreate=true spawns a new security audit session detached from the
   # GUI login keychain session used by worldai-testflight-native-mac, while
-  # still sharing the operator's macOS user account ($HOME); public-repo
-  # workflows targeting self-hosted-native-macos must gate out untrusted fork PRs.
+  # still sharing the operator's macOS user account ($HOME).
+  # NOTE: pull_request YAML `if:` guards execute from the fork's head commit and
+  # are NOT a security boundary against modified fork workflows; server-side
+  # protection (allows_public_repositories=false, private --repo, or
+  # approval_policy=all_external_contributors) is required and enforced fail-closed.
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -442,13 +514,62 @@ PLIST
 
 runner_binaries_ready() {
   local dir="$1"
-  [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ]
+  [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ] && [ -f "${dir}/run-helper.sh.template" ]
+}
+
+verify_server_fork_protection() {
+  command -v "$GH_BIN" >/dev/null 2>&1 || {
+    echo "ERROR: gh binary '$GH_BIN' not found (required for server-side fork-protection check)" >&2
+    exit 5
+  }
+  local is_priv="" pol="" groups_json="" group_json="" allows_pub=""
+  if [ -n "$RUNNER_REPO" ]; then
+    if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private')"; then
+      echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
+      exit 5
+    fi
+    if [ "$is_priv" != "true" ]; then
+      if ! pol="$("$GH_BIN" api "repos/${RUNNER_REPO}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""')"; then
+        echo "ERROR: failed to query fork PR contributor approval policy for repo '${RUNNER_REPO}'" >&2
+        exit 5
+      fi
+      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" -ne 1 ]; then
+        echo "ERROR: public repo '${RUNNER_REPO}' fork PR approval policy is '${pol}' (expected 'all_external_contributors'); pass --allow-public-fork-exposure to override" >&2
+        exit 5
+      fi
+    fi
+  else
+    if ! groups_json="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups")"; then
+      echo "ERROR: failed to query runner groups for org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
+    group_json="$(printf '%s\n' "$groups_json" | jq -sc --arg g "$RUNNER_GROUP" '[.[].runner_groups[]? | (if $g != "" then select(.name == $g) else select(.default == true) end)] | .[0] // empty')"
+    if [ -z "$group_json" ]; then
+      echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' not found in org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
+    allows_pub="$(printf '%s\n' "$group_json" | jq -r '.allows_public_repositories')"
+    if [ "$allows_pub" = "true" ]; then
+      if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""')"; then
+        echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
+        exit 5
+      fi
+      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" -ne 1 ]; then
+        echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories and fork PR approval policy is '${pol}' (expected 'all_external_contributors'); restrict runner group or pass --allow-public-fork-exposure" >&2
+        exit 5
+      fi
+    elif [ "$allows_pub" != "false" ]; then
+      echo "ERROR: unexpected allows_public_repositories='${allows_pub}' for runner group '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
+  fi
 }
 
 if [ "$VERIFY" -eq 1 ]; then
   [ -x "${RUNNER_DIR}/bin/Runner.Listener" ] || { echo "FAIL: missing ${RUNNER_DIR}/bin/Runner.Listener" >&2; exit 1; }
   [ -x "${RUNNER_DIR}/config.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/config.sh" >&2; exit 1; }
   [ -x "${RUNNER_DIR}/run.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/run.sh" >&2; exit 1; }
+  [ -f "${RUNNER_DIR}/run-helper.sh.template" ] || { echo "FAIL: missing ${RUNNER_DIR}/run-helper.sh.template" >&2; exit 1; }
   [ -d "$WORK_DIR" ] || { echo "FAIL: missing work dir ${WORK_DIR}" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.runner" ] || { echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.ezgha-labels" ] || { echo "FAIL: missing ${RUNNER_DIR}/.ezgha-labels" >&2; exit 1; }
@@ -501,6 +622,7 @@ PY
   fi
   if [ "$OFFLINE" -eq 0 ]; then
     command -v "$GH_BIN" >/dev/null 2>&1 || { echo "FAIL: gh binary '$GH_BIN' not found (pass --offline to skip live GitHub check)" >&2; exit 1; }
+    verify_server_fork_protection
     runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API")"
     runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name)] | .[0] // empty')"
     [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' not found in live $RUNNERS_API" >&2; exit 1; }
@@ -526,6 +648,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "RUNNER_DIR=${RUNNER_DIR}"
   echo "WORK_DIR=${WORK_DIR}"
   echo "RUNNER_URL=${RUNNER_URL}"
+  echo "RUNNER_GROUP=${RUNNER_GROUP}"
+  echo "ALLOW_PUBLIC_FORK_EXPOSURE=${ALLOW_PUBLIC_FORK_EXPOSURE}"
   echo "LABELS=${LABELS}"
   echo "PLIST_PATH=${PLIST_PATH}"
   if runner_binaries_ready "$EXISTING_RUNNER_DIR"; then
@@ -533,12 +657,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
   else
     echo "BINARY_SOURCE=download:v${RUNNER_VERSION}"
   fi
-  echo "CONFIG_CMD=${RUNNER_DIR}/config.sh --unattended --url ${RUNNER_URL} --token <redacted-token> --name ${RUNNER_NAME} --work ${WORK_DIR} --labels ${LABELS} --no-default-labels --replace"
+  dry_config_cmd="${RUNNER_DIR}/config.sh --unattended --url ${RUNNER_URL} --token <redacted-token> --name ${RUNNER_NAME} --work ${WORK_DIR} --labels ${LABELS} --no-default-labels --replace"
+  if [ -n "$RUNNER_GROUP" ]; then
+    dry_config_cmd+=" --runnergroup ${RUNNER_GROUP}"
+  fi
+  echo "CONFIG_CMD=${dry_config_cmd}"
   render_plist
   exit 0
 fi
 
 acquire_setup_lock || exit 1
+if [ "$OFFLINE" -eq 0 ]; then
+  verify_server_fork_protection
+fi
 mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
 
 if ! runner_binaries_ready "$RUNNER_DIR"; then
@@ -617,14 +748,20 @@ if [ "$needs_config" -eq 1 ]; then
   config_rc=0
   (
     cd "$RUNNER_DIR"
-    ./config.sh --unattended \
-      --url "$RUNNER_URL" \
-      --token "$reg_token" \
-      --name "$RUNNER_NAME" \
-      --work "$WORK_DIR" \
-      --labels "$RUNNER_LABELS" \
-      --no-default-labels \
+    config_args=(
+      --unattended
+      --url "$RUNNER_URL"
+      --token "$reg_token"
+      --name "$RUNNER_NAME"
+      --work "$WORK_DIR"
+      --labels "$RUNNER_LABELS"
+      --no-default-labels
       --replace
+    )
+    if [ -n "$RUNNER_GROUP" ]; then
+      config_args+=(--runnergroup "$RUNNER_GROUP")
+    fi
+    ./config.sh "${config_args[@]}"
   ) || config_rc=$?
 
   if [ "$config_rc" -ne 0 ]; then
@@ -638,7 +775,9 @@ if [ "$needs_config" -eq 1 ]; then
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"
 fi
 
-printf 'LANG=en_US.UTF-8\n' > "${RUNNER_DIR}/.env"
+if [ ! -f "${RUNNER_DIR}/.env" ]; then
+  printf 'LANG=en_US.UTF-8\n' > "${RUNNER_DIR}/.env"
+fi
 
 CANDIDATE_PLIST="${PLIST_PATH}.candidate.$$"
 render_plist > "$CANDIDATE_PLIST"

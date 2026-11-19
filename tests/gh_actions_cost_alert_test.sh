@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Hermetic tests for GitHub Actions cost & hosted-macOS usage spike monitoring.
 set -euo pipefail
+unset GH_BILLING_TOKEN GH_TOKEN GITHUB_TOKEN
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT/scripts/gh-actions-cost-alert.sh"
@@ -16,7 +17,24 @@ printf 'app-installation-token-must-not-be-used\n' > "$TMP/home/.config/ezgha/gh
 cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'args=%s|GH_TOKEN=%s|GITHUB_TOKEN=%s\n' "$*" "${GH_TOKEN-<unset>}" "${GITHUB_TOKEN-<unset>}" >> "${GH_CALL_LOG:?}"
+describe_env_token() {
+  local var_name="$1"
+  if [ "${!var_name+set}" != "set" ]; then
+    printf '<unset>'
+  elif [ -z "${!var_name}" ]; then
+    printf '<empty>'
+  elif [ "${!var_name}" = "billing-override-token" ]; then
+    printf '<set:billing-override>'
+  elif [ "${!var_name}" = "app-installation-token-must-not-be-used" ] || [ "${!var_name}" = "app-fallback-token" ]; then
+    printf '<set:app-token>'
+  else
+    printf '<set:redacted>'
+  fi
+}
+printf 'args=%s|GH_TOKEN=%s|GITHUB_TOKEN=%s\n' "$*" "$(describe_env_token GH_TOKEN)" "$(describe_env_token GITHUB_TOKEN)" >> "${GH_CALL_LOG:?}"
+if [ -n "${GH_RACE_TAG:-}" ] && [[ "$*" == *"api rate_limit"* ]]; then
+  printf 'ENTER %s\n' "${GH_RACE_TAG}" >> "${GH_RACE_TRACE_FILE:?}"
+fi
 if [ -n "${GH_STUB_SLEEP:-}" ]; then
   sleep "${GH_STUB_SLEEP}"
 fi
@@ -95,6 +113,9 @@ set -euo pipefail
 printf '%s\n' "$*" >> "${GCLOUD_LOG:?}"
 if [ -n "${GCLOUD_STUB_SLEEP:-}" ]; then
   sleep "${GCLOUD_STUB_SLEEP}"
+fi
+if [ -n "${GH_RACE_TAG:-}" ] && [[ "$*" == *"logging write"* ]]; then
+  printf 'EXIT %s\n' "${GH_RACE_TAG}" >> "${GH_RACE_TRACE_FILE:?}"
 fi
 if [ -n "${GCLOUD_WRITE_FAIL:-}" ] && [[ "$*" == *"logging write"* ]]; then
   echo "gcloud: transient logging write failure" >&2
@@ -289,10 +310,20 @@ grep -q '|GH_TOKEN=<unset>|GITHUB_TOKEN=<unset>' <<<"$billing_call_line" || fail
 ! grep -q 'wrong-app-token\|app-installation-token-must-not-be-used' "$TMP/gh-auth.log" || fail "script must never pass App/ambient GH_TOKEN"
 
 : > "$TMP/gh-auth2.log"
-GH_BILLING_TOKEN="explicit-billing-pat" GH_TOKEN="wrong-app-token" \
+GH_BILLING_TOKEN="billing-override-token" GH_TOKEN="wrong-app-token" \
   run_alert "$TMP/state-auth2.json" "$TMP/gcloud-auth2.log" "$TMP/gh-auth2.log" >/dev/null
-grep -q '|GH_TOKEN=explicit-billing-pat|' "$TMP/gh-auth2.log" || fail "GH_BILLING_TOKEN must be exported as GH_TOKEN when provided"
-pass "auth isolation avoids App token and honors GH_BILLING_TOKEN"
+grep -q '|GH_TOKEN=<set:billing-override>|' "$TMP/gh-auth2.log" || fail "GH_BILLING_TOKEN must be exported as GH_TOKEN when provided"
+
+# Ambient/explicit secret must never appear in gh call log, stdout, or stderr (even on failure).
+: > "$TMP/gh-redact.log"
+GH_BILLING_TOKEN="ghp_SimulatedAmbientSecret999" GH_STUB_FAIL=1 APP_TOKEN_FILE="$TMP/no-app-token" \
+  run_alert "$TMP/state-redact.json" "$TMP/gcloud-redact.log" "$TMP/gh-redact.log" \
+  >"$TMP/redact.out" 2>"$TMP/redact.err" || true
+for f in "$TMP/gh-redact.log" "$TMP/redact.out" "$TMP/redact.err"; do
+  ! grep -q 'ghp_SimulatedAmbientSecret999' "$f" || fail "raw token leaked into $f"
+done
+grep -q '|GH_TOKEN=<set:redacted>|' "$TMP/gh-redact.log" || fail "fake gh stub must log <set:redacted> for arbitrary GH_BILLING_TOKEN"
+pass "auth isolation avoids App token, honors GH_BILLING_TOKEN, and redacts raw tokens from logs/output"
 
 # 7. Rate-limit guard: core.remaining < 50 skips billing API and counts toward BLIND when no App fallback exists.
 : > "$TMP/gh-rl.log"
@@ -358,9 +389,9 @@ grep -q '"macos_minutes":75' "$TMP/gcloud-fallback.log" || fail "App-token fallb
 grep -q 'mode=app_token_fallback' <<<"$fallback_stdout" || fail "fallback stdout must label mode=app_token_fallback"
 grep -q 'mtd_gross=null' <<<"$fallback_stdout" || fail "fallback stdout must label mtd_gross=null"
 grep -q 'mtd_net=null' <<<"$fallback_stdout" || fail "fallback stdout must label mtd_net=null"
-grep -q 'orgs/jleechanorg/repos?sort=pushed&per_page=100|GH_TOKEN=app-installation-token-must-not-be-used' "$TMP/gh-fallback.log" || fail "App-token fallback must query org repos with per_page=100 using APP_TOKEN_FILE"
-grep -q 'repos/jleechanorg/disk_magician/actions/runs?per_page=100|GH_TOKEN=app-installation-token-must-not-be-used' "$TMP/gh-fallback.log" || fail "App-token fallback must query actions/runs?per_page=100 without created-only filter"
-grep -q 'repos/jleechanorg/disk_magician/actions/runs/9001/jobs?filter=all&per_page=100&page=1|GH_TOKEN=app-installation-token-must-not-be-used' "$TMP/gh-fallback.log" || fail "App-token fallback must query job details with filter=all&per_page=100&page=1 using APP_TOKEN_FILE"
+grep -q 'orgs/jleechanorg/repos?sort=pushed&per_page=100|GH_TOKEN=<set:app-token>' "$TMP/gh-fallback.log" || fail "App-token fallback must query org repos with per_page=100 using APP_TOKEN_FILE"
+grep -q 'repos/jleechanorg/disk_magician/actions/runs?per_page=100|GH_TOKEN=<set:app-token>' "$TMP/gh-fallback.log" || fail "App-token fallback must query actions/runs?per_page=100 without created-only filter"
+grep -q 'repos/jleechanorg/disk_magician/actions/runs/9001/jobs?filter=all&per_page=100&page=1|GH_TOKEN=<set:app-token>' "$TMP/gh-fallback.log" || fail "App-token fallback must query job details with filter=all&per_page=100&page=1 using APP_TOKEN_FILE"
 ! grep -q 'runs/9002/jobs' "$TMP/gh-fallback.log" || fail "skipped runs must not consume job API calls"
 [ "$(jq -r '.api_failures' "$TMP/state-fallback.json")" = 1 ] || fail "fallback must increment api_failures instead of resetting to 0"
 
@@ -397,7 +428,7 @@ for cycle in 1 2 3; do
   grep -q 'mtd_gross=null' <<<"$partial_out" || fail "truncated fallback stdout must set mtd_gross=null"
   grep -q 'mtd_net=null' <<<"$partial_out" || fail "truncated fallback stdout must set mtd_net=null"
   if [ "$cycle" -eq 1 ]; then
-    app_calls="$(grep -c '|GH_TOKEN=app-installation-token-must-not-be-used|' "$TMP/gh-fallback-403.log" || true)"
+    app_calls="$(grep -c '|GH_TOKEN=<set:app-token>|' "$TMP/gh-fallback-403.log" || true)"
     [ "$app_calls" -le 2 ] || fail "MAX_APP_API_CALLS=2 cap exceeded: got $app_calls calls"
   fi
 done
@@ -593,7 +624,8 @@ unpriced_out="$(
 )"
 grep -q 'mode=app_token_fallback_partial' <<<"$unpriced_out" || fail "unpriced hosted runner label must mark mode=app_token_fallback_partial"
 
-# Larger/ARM hosted labels must NOT match baseline standard rates and must mark mode=app_token_fallback_partial.
+# Larger/ARM hosted labels must NOT match baseline standard rates and must mark mode=app_token_fallback_partial,
+# while any non-self-hosted macos-* label (macos-15-large, macos-26) still counts macos_min toward DAILY_MACOS_MIN_WARN.
 cat > "$TMP/jobs/9301.json" <<'JSON'
 {
   "total_count": 4,
@@ -610,8 +642,47 @@ larger_out="$(
   run_alert "$TMP/state-larger.json" "$TMP/gcloud-larger.log" "$TMP/gh-larger.log"
 )"
 grep -q 'mode=app_token_fallback_partial' <<<"$larger_out" || fail "larger/ARM hosted labels like ubuntu-24.04-16core must mark mode=app_token_fallback_partial"
-[ "$(error_count "$TMP/gcloud-larger.log")" = 0 ] || fail "larger unpriced labels must not be priced at baseline rates"
-pass "fallback prices standard windows/macos/ubuntu jobs and marks larger/custom unpriced hosted runners partial"
+[ "$(error_count "$TMP/gcloud-larger.log")" = 1 ] || fail "120m macos-15-large must still trip DAILY_MACOS_MIN_WARN COST_SPIKE"
+grep -q '"macos_minutes":120' "$TMP/gcloud-larger.log" || fail "120m macos-15-large must report macos_minutes=120"
+grep -q '"gross_usd":0' "$TMP/gcloud-larger.log" || fail "larger unpriced labels must not be priced at baseline rates (gross_usd must be 0)"
+
+cat > "$TMP/jobs/9301.json" <<'JSON'
+{
+  "total_count": 2,
+  "jobs": [
+    {"id":36,"labels":["macos-26"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T02:15:00Z"},
+    {"id":37,"labels":["ubuntu-24.04-16core"],"started_at":"2026-11-18T01:00:00Z","completed_at":"2026-11-18T01:30:00Z"}
+  ]
+}
+JSON
+macos26_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-win.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-macos26.json" "$TMP/gcloud-macos26.log" "$TMP/gh-macos26.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$macos26_out" || fail "macos-26 unpriced label must mark mode=app_token_fallback_partial"
+[ "$(error_count "$TMP/gcloud-macos26.log")" = 1 ] || fail "75m macos-26 must trip DAILY_MACOS_MIN_WARN COST_SPIKE"
+grep -q '"macos_minutes":75' "$TMP/gcloud-macos26.log" || fail "macos-26 must report macos_minutes=75"
+grep -q '"gross_usd":0' "$TMP/gcloud-macos26.log" || fail "macos-26 must keep gross_usd=0 when unpriced"
+
+# Empty jobs page while total_count > fetched_jobs and jq job parse error must both mark partial.
+cat > "$TMP/jobs/9301.json" <<'JSON'
+{"total_count": 5, "jobs": []}
+JSON
+empty_page_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-win.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-emptypage.json" "$TMP/gcloud-emptypage.log" "$TMP/gh-emptypage.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$empty_page_out" || fail "empty jobs page with total_count=5 must mark mode=app_token_fallback_partial"
+
+cat > "$TMP/jobs/9301.json" <<'JSON'
+{"total_count": 1, "jobs": [{"id": 38, "labels": ["macos-15"], "started_at": "bad-date"}]}
+JSON
+bad_job_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-win.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-badjob.json" "$TMP/gcloud-badjob.log" "$TMP/gh-badjob.log" 2>/dev/null
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$bad_job_out" || fail "jq parse error on jobs payload must mark mode=app_token_fallback_partial"
+pass "fallback prices standard windows/macos/ubuntu jobs, counts all hosted macos-* minutes, and marks partial on unpriced/empty/parse-error pages"
 
 # 15. Wall-clock timeout bounds stalled primary gh api calls (even without timeout/gtimeout binaries).
 mkdir -p "$TMP/nobin"
@@ -656,9 +727,16 @@ rollover_fail_out="$(
   GH_CALL_LOG="$TMP/gh-rollover-fail.log" POLICY_CAPTURE="$TMP/policy.json" POLICY_HISTORY="$TMP/policy-history.jsonl" \
   "$SCRIPT"
 )"
-grep -q '"status":"COST_SPIKE"' "$TMP/gcloud-rollover-fail.log" || fail "day-1 rollover failure must still emit current-month COST_SPIKE"
-grep -q '"status":"NET_SPEND_BREACH"' "$TMP/gcloud-rollover-fail.log" || fail "day-1 rollover failure must still emit current-month NET_SPEND_BREACH"
-grep -q '"status":"MTD_SPEND_BREACH"' "$TMP/gcloud-rollover-fail.log" || fail "day-1 rollover failure must still emit current-month MTD_SPEND_BREACH"
+[ "$(error_count "$TMP/gcloud-rollover-fail.log")" = 1 ] || fail "simultaneous breaches must emit exactly 1 combined ERROR log (avoiding 300s rate-limit drop)"
+grep -q '"status":"MULTI_BREACH"' "$TMP/gcloud-rollover-fail.log" || fail "combined simultaneous breaches must set status=MULTI_BREACH"
+grep -q 'cost/macOS spike' "$TMP/gcloud-rollover-fail.log" || fail "combined alert must include COST_SPIKE text"
+grep -q 'daily NET spend breach' "$TMP/gcloud-rollover-fail.log" || fail "combined alert must include NET_SPEND_BREACH text"
+grep -q 'MTD NET spend breach' "$TMP/gcloud-rollover-fail.log" || fail "combined alert must include MTD_SPEND_BREACH text"
+grep -q '"breach_keys":\["2026-12-01:COST_SPIKE","2026-12-01:NET_SPEND_BREACH","2026-12:MTD_NET_BREACH"\]' "$TMP/gcloud-rollover-fail.log" || fail "combined alert must include all breach_keys"
+[ "$(jq -r '.sent["2026-12-01:COST_SPIKE"] // 0' "$TMP/state-rollover-fail.json")" != 0 ] || fail "combined alert must mark 2026-12-01:COST_SPIKE in .sent"
+[ "$(jq -r '.sent["2026-12-01:NET_SPEND_BREACH"] // 0' "$TMP/state-rollover-fail.json")" != 0 ] || fail "combined alert must mark 2026-12-01:NET_SPEND_BREACH in .sent"
+[ "$(jq -r '.sent["2026-12:MTD_NET_BREACH"] // 0' "$TMP/state-rollover-fail.json")" != 0 ] || fail "combined alert must mark 2026-12:MTD_NET_BREACH in .sent"
+grep -q 'alerts_emitted=3' <<<"$rollover_fail_out" || fail "combined alert must report alerts_emitted=3"
 grep -q 'mode=billing_api_partial' <<<"$rollover_fail_out" || fail "day-1 rollover failure must report mode=billing_api_partial"
 [ "$(jq -r '.api_failures' "$TMP/state-rollover-fail.json")" = 1 ] || fail "day-1 rollover failure must increment api_failures instead of resetting to 0"
 
@@ -750,7 +828,66 @@ STATE_LOCK_TIMEOUT_SEC=5 BILLING_FIXTURE="$TMP/billing-lock1.json" \
   run_alert "$TMP/state-stalepid.json" "$TMP/gcloud-stalepid.log" "$TMP/gh-stalepid.log" >/dev/null
 [ ! -d "$TMP/state-stalepid.json.lock" ] || fail "stale dead-PID lockdir must be reclaimed and released"
 ! grep -q 'env GH_TOKEN=' "$SCRIPT" || fail "GH_TOKEN must not be passed in env/timeout argv"
-pass "concurrent runs serialize STATE_FILE updates and reclaim stale/ownerless lockdirs"
+
+# Two-contender concurrent stale-lock recovery proves mutual exclusion across the critical section.
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-race.json"
+mkdir -p "$TMP/state-race.json.lock"
+printf '%s\n' "$dead_pid" > "$TMP/state-race.json.lock/pid"
+date +%s > "$TMP/state-race.json.lock/ts"
+: > "$TMP/cost-race.trace"
+GH_RACE_TAG=1 GH_RACE_TRACE_FILE="$TMP/cost-race.trace" GCLOUD_STUB_SLEEP=0.5 \
+  STATE_LOCK_TIMEOUT_SEC=10 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-race.json" "$TMP/gcloud-race1.log" "$TMP/gh-race1.log" >/dev/null &
+rpid1=$!
+GH_RACE_TAG=2 GH_RACE_TRACE_FILE="$TMP/cost-race.trace" GCLOUD_STUB_SLEEP=0.5 \
+  STATE_LOCK_TIMEOUT_SEC=10 BILLING_FIXTURE="$TMP/billing-lock2.json" \
+  run_alert "$TMP/state-race.json" "$TMP/gcloud-race2.log" "$TMP/gh-race2.log" >/dev/null &
+rpid2=$!
+rrc1=0; wait "$rpid1" || rrc1=$?
+rrc2=0; wait "$rpid2" || rrc2=$?
+[ "$rrc1" -eq 0 ] && [ "$rrc2" -eq 0 ] || fail "two-contender stale-lock recovery must succeed for both contenders (rc1=$rrc1 rc2=$rrc2)"
+[ ! -d "$TMP/state-race.json.lock" ] && [ ! -d "$TMP/state-race.json.lock.reclaim" ] || fail "state lockdir and reclaim mutex must be released"
+[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-race.json")" != 0 ] || fail "two-contender run 1 sent key was lost"
+[ "$(jq -r '.sent["2026-11-18:COST_SPIKE"] // 0' "$TMP/state-race.json")" != 0 ] || fail "two-contender run 2 sent key was lost"
+TRACE_FILE="$TMP/cost-race.trace" python3 - <<'PY' || fail "two-contender state lock allowed concurrent entry"
+import os
+from pathlib import Path
+lines = [l.strip() for l in Path(os.environ["TRACE_FILE"]).read_text().splitlines() if l.strip()]
+assert len(lines) == 4, f"expected 4 trace lines, got {lines!r}"
+assert lines[0].startswith("ENTER ") and lines[1] == "EXIT " + lines[0].split()[1], f"overlap detected: {lines!r}"
+assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[1], f"overlap detected: {lines!r}"
+assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
+PY
+
+# Lock age expiry reclaims even when PID is live, and lock timeout emits WARNING BLIND before exit 4.
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-age.json"
+mkdir -p "$TMP/state-age.json.lock"
+sleep 30 &
+live_pid=$!
+printf '%s\n' "$live_pid" > "$TMP/state-age.json.lock/pid"
+printf '1000\n' > "$TMP/state-age.json.lock/ts"
+STATE_LOCK_TIMEOUT_SEC=5 STATE_LOCK_MAX_AGE_SEC=60 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-age.json" "$TMP/gcloud-age.log" "$TMP/gh-age.log" >/dev/null
+kill "$live_pid" 2>/dev/null || true
+wait "$live_pid" 2>/dev/null || true
+[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-age.json")" != 0 ] || fail "expired lock age must reclaim even with live PID"
+
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-lockto.json"
+mkdir -p "$TMP/state-lockto.json.lock"
+sleep 30 &
+blocker_pid=$!
+printf '%s\n' "$blocker_pid" > "$TMP/state-lockto.json.lock/pid"
+date +%s > "$TMP/state-lockto.json.lock/ts"
+lockto_rc=0
+STATE_LOCK_TIMEOUT_SEC=1 STATE_LOCK_MAX_AGE_SEC=900 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockto.log" "$TMP/gh-lockto.log" >/dev/null 2>&1 || lockto_rc=$?
+kill "$blocker_pid" 2>/dev/null || true
+wait "$blocker_pid" 2>/dev/null || true
+[ "$lockto_rc" -eq 4 ] || fail "state lock timeout must exit 4 (got $lockto_rc)"
+grep -q 'severity=WARNING' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit WARNING"
+grep -q '"status":"BLIND"' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit BLIND status"
+grep -q 'LOCK_TIMEOUT: state lock held > 1s' "$TMP/gcloud-lockto.log" || fail "state lock timeout must cite LOCK_TIMEOUT"
+pass "concurrent runs serialize STATE_FILE updates, reclaim stale/expired locks race-free, and emit BLIND on lock timeout"
 
 # 19. --ensure-gcp-policy creates/updates with timeout bounds, exits non-zero, and surfaces gcloud stderr on failure.
 run_alert "$TMP/state-pol-create.json" "$TMP/gcloud-pol-create.log" "$TMP/gh-pol-create.log" --ensure-gcp-policy >/dev/null

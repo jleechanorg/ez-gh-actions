@@ -248,11 +248,9 @@ today UTC for `product=="actions"`. It evaluates gross spend (`DAILY_GROSS_WARN_
 to the dedicated Slack-only policy `[CRITICAL] GitHub Actions cost or hosted macOS spike` (never
 `cause=fleet`). Primary billing calls use `GH_BILLING_TOKEN` or user `gh` keyring auth (never passing
 `~/.config/ezgha/gh_token` to `/settings/billing/usage`, because GitHub App `4245332` lacks
-`organization_administration=read`). All `gh`/`gcloud` calls are bounded by wall-clock timeouts (`GH_CALL_TIMEOUT_SEC=30`), and `STATE_FILE` updates are serialized via a `mkdir` lockdir. When personal `core.remaining < 50` or `/settings/billing/usage`
+`organization_administration=read`). All `gh`/`gcloud` calls are bounded by wall-clock timeouts (`GH_CALL_TIMEOUT_SEC=30`), and `STATE_FILE` updates are serialized via a `mkdir` lockdir with `pid`/`ts` metadata and a `.reclaim` mutex (emitting `WARNING BLIND` on `LOCK_TIMEOUT` before exiting `4`). When personal `core.remaining < 50` or `/settings/billing/usage`
 fails/403, a bounded gross-only App-token fallback (`APP_TOKEN_FILE=~/.config/ezgha/gh_token`,
-`MAX_APP_API_CALLS=60`) prioritizes org repos by `pushed` without excluding stale-push repos, includes `in_progress` and recently updated runs (`>= YESTERDAY_UTC`), paginates `/jobs?filter=all&per_page=100` within budget, and prices standard `macos-latest`/`macos-13..15*` (`$0.062/min`), `ubuntu-latest`/`ubuntu-20.04..24.04` (`$0.006/min`), and `windows-latest`/`windows-2019..2025` (`$0.010/min`) runners at baseline rates while larger/custom hosted labels are marked unpriced (`partial`). It fires `ERROR COST_SPIKE` immediately on
-observed gross/macOS spikes (`mode=app_token_fallback` or `app_token_fallback_partial`, `net_usd=null`,
-`mtd_gross=null`, `mtd_net=null`) and folds any simultaneous `BLIND` condition into that notification so the 300s policy rate limit cannot drop `BLIND`. Only a full authoritative `/organizations/.../settings/billing/usage`
+`MAX_APP_API_CALLS=60`) prioritizes org repos by `pushed` without excluding stale-push repos, includes `in_progress` and recently updated runs (`>= YESTERDAY_UTC`), paginates `/jobs?filter=all&per_page=100` within budget, and prices standard `macos-latest`/`macos-13..15*` (`$0.062/min`), `ubuntu-latest`/`ubuntu-20.04..24.04` (`$0.006/min`), and `windows-latest`/`windows-2019..2025` (`$0.010/min`) runners at baseline rates while larger/custom hosted labels are marked unpriced (`partial`) and any non-self-hosted `macos-*` label still counts toward `DAILY_MACOS_MIN_WARN`. It collects all due breaches per run into one combined `ERROR` notification (`breach_keys`, using `MULTI_BREACH` when multiple breach statuses fire together and folding any simultaneous `BLIND` condition into that single alert so the 300s policy rate limit cannot drop simultaneous breaches or `BLIND`) and marks `.sent` keys atomically only after `gcloud logging write` succeeds. Only a full authoritative `/organizations/.../settings/billing/usage`
 read + parse resets `api_failures=0`; any skip, partial rollover, or failure persists `api_failures` before alert writes and emits `WARNING BLIND`
 at `MAX_API_FAILURES=3` even if partial App fallback ran.
 - **Recovery / setup (OPERATOR-ONLY):**
@@ -262,19 +260,30 @@ at `MAX_API_FAILURES=3` even if partial App fallback ran.
   - Inspect `/tmp/ezgha-gh-actions-cost-alert.log` and `~/.local/state/ezgha/gh-actions-cost-alert.json` if `BLIND` fires (check `gh auth status` and `gh api rate_limit`).
 
 ### Native macOS CI runner (`mac-native-ci-1`, label `self-hosted-native-macos`)
-`scripts/setup-native-macos-runner.sh` idempotently provisions an org-scoped native Darwin ARM64
+`scripts/setup-native-macos-runner.sh` idempotently provisions an org- or repo-scoped native Darwin ARM64
 runner (`mac-native-ci-1`) at `/Users/jleechan/actions-runner-macos-ci` with work directory on
 Scratch (`native-macos-ci-work`, failing closed if Scratch is unavailable), `--no-default-labels --labels self-hosted-native-macos` (requiring `self-hosted-native-macos`, forbidding
-bare `self-hosted` and `worldai-testflight-native-mac`, and canonically refusing `$HOME`, `/`, and filesystem-identical/case-alias/ancestor/descendant paths of `~/actions-runner` and `~/actions-runner-smtp-egress` for both `--runner-dir` and `--work-dir`), and LaunchAgent
+bare `self-hosted` and `worldai-testflight-native-mac`, and canonically refusing `$HOME`, `/`, and filesystem-identical/case-alias/ancestor/descendant paths of `~/actions-runner` and `~/actions-runner-smtp-egress` for both `--runner-dir` and `--work-dir`), optional `--runner-group GROUP`, and LaunchAgent
 `org.jleechanorg.ezgha-native-macos-runner.plist` (with `<key>SessionCreate</key><true/>`). This
 uses separate runner/Scratch `_work` paths and `--no-default-labels --labels self-hosted-native-macos`
 (`SessionCreate=true`) from `worldai-testflight-native-mac`'s `SessionCreate=false` GUI signing session at
 `/Users/jleechan/actions-runner` and from Linux `self-hosted` jobs, while sharing the operator's
-macOS UID/`$HOME` (not a user-account sandbox), so public-repo workflows targeting `self-hosted-native-macos` must
-gate out untrusted fork PRs. Binary provisioning stages and validates `Runner.Listener`/`config.sh`/`run.sh` so interrupted installs repair on retry; reconfiguration verifies launchd unload before removing credentials, preserves `.backup-pre-reconfigure.<pid>` on failure, and exits non-zero (`4`) fail-closed without restoring old credentials or restarting the service; no-change reruns leave an already-loaded LaunchAgent untouched; and `--uninstall` executes before Scratch resolution while confirming the GUI-domain job is unloaded before removing the plist.
+macOS UID/`$HOME` (not a user-account sandbox). **Security boundary:** `pull_request` YAML `if:` guards
+execute from the fork's head commit and are NOT a security boundary against modified fork workflows;
+server-side protection (`allows_public_repositories=false` on the runner group, private `--repo`, or
+`approval_policy=all_external_contributors`) is required and enforced fail-closed by
+`setup-native-macos-runner.sh` (exit `5` before minting a registration token or completing setup/verify,
+unless `--allow-public-fork-exposure` is explicitly passed). Binary provisioning stages and validates
+`Runner.Listener`/`config.sh`/`run.sh`/`run-helper.sh.template` so interrupted installs repair on retry,
+and preserves an existing `${RUNNER_DIR}/.env` rather than truncating it; reconfiguration confirms launchd
+unload (`rc=113` or service-not-found, failing closed on lookup/permission errors) before removing
+credentials, preserves `.backup-pre-reconfigure.<pid>` on failure, and exits non-zero (`4`) fail-closed
+without restoring old credentials or restarting the service; no-change reruns leave an already-loaded
+LaunchAgent untouched; and `--uninstall` executes before Scratch resolution while confirming the
+GUI-domain job is unloaded before removing the plist.
 - **Recovery / setup (OPERATOR-ONLY):**
-  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh` (install/re-register + load LaunchAgent; pass `--reconfigure` to force unload and re-registration)
-  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh --verify` (check binaries, `WORK_DIR`, `.runner`, `.ezgha-labels`, `GH_BIN` live GitHub labels unless `--offline`, `SessionCreate=true`, plist `WorkingDirectory`/`ProgramArguments`, and launchd state)
+  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh` (install/re-register + load LaunchAgent; pass `--reconfigure` to force unload and re-registration, or `--runner-group GROUP` to target a restricted runner group)
+  - `OPERATOR-ONLY: ./scripts/setup-native-macos-runner.sh --verify` (check binaries including `run-helper.sh.template`, `WORK_DIR`, `.runner`, `.ezgha-labels`, server-side fork-protection policy and `GH_BIN` live GitHub labels unless `--offline`, `SessionCreate=true`, plist `WorkingDirectory`/`ProgramArguments`, and launchd state)
 
 ## Safety & Monitoring Principles
 - **Canonical Prohibition on Physical-Host Reboot Primitives & Watchdog-Driven Restarts**:
