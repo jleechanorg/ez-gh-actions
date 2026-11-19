@@ -1047,8 +1047,8 @@ short_mid_out="$(
 grep -q 'alerts_emitted=1' <<<"$short_mid_out" || fail "20s midnight-straddling job must allocate 1 total min across days (total 119m => only 1 day reaches 60m, got: $short_mid_out)"
 pass "zero-byte/multi-object state recovery, netAmount top-repo ranking, and midnight split minute cap hold"
 
-# 22. Invalid counter types in STATE_FILE trigger corrupt_state_file_reset + BLIND, and custom --no-default-labels
-#     self-hosted jobs with non-"GitHub Actions" runner_group_name classify as $0 self-hosted (non-partial) in fallback.
+# 22. Invalid counter types in STATE_FILE trigger corrupt_state_file_reset + BLIND, and fallback self-hosted
+#     classification requires explicit "self-hosted" or "self-hosted-native-macos" label (custom groups without it mark partial).
 printf '{"sent":{},"api_failures":"bad"}\n' > "$TMP/state-badtype.json"
 BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
   run_alert "$TMP/state-badtype.json" "$TMP/gcloud-badtype.log" "$TMP/gh-badtype.log" >/dev/null 2>"$TMP/badtype.err"
@@ -1077,15 +1077,30 @@ custom_sh_out="$(
   BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-sh.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
   run_alert "$TMP/state-custom-sh.json" "$TMP/gcloud-custom-sh.log" "$TMP/gh-custom-sh.log"
 )"
-grep -q 'mode=app_token_fallback ' <<<"$custom_sh_out" || fail "custom --no-default-labels self-hosted job with runner_group_name!=GitHub Actions must NOT be marked partial (got: $custom_sh_out)"
-grep -q 'fallback_incomplete=0' <<<"$custom_sh_out" || fail "custom self-hosted job must have fallback_incomplete=0 (got: $custom_sh_out)"
-grep -q 'alerts_emitted=0' <<<"$custom_sh_out" || fail "120m custom self-hosted job must be \$0 / 0 macOS min and emit 0 alerts (got: $custom_sh_out)"
+grep -q 'mode=app_token_fallback_partial' <<<"$custom_sh_out" || fail "job without self-hosted/self-hosted-native-macos or standard hosted label must mark mode=app_token_fallback_partial (got: $custom_sh_out)"
+grep -q 'fallback_incomplete=1' <<<"$custom_sh_out" || fail "ambiguous custom-group job must have fallback_incomplete=1 (got: $custom_sh_out)"
+grep -q 'alerts_emitted=0' <<<"$custom_sh_out" || fail "unpriced non-macos job must emit 0 alerts (got: $custom_sh_out)"
+
+cat > "$TMP/jobs/9404.json" <<'JSON'
+{
+  "total_count": 1,
+  "jobs": [
+    {"id":460,"runner_group_name":"mac-builds","labels":["macos-build"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T03:30:00Z"}
+  ]
+}
+JSON
+custom_mac_build_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-sh.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-custom-macbuild.json" "$TMP/gcloud-custom-macbuild.log" "$TMP/gh-custom-macbuild.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$custom_mac_build_out" || fail "macos-build in custom group mac-builds must mark mode=app_token_fallback_partial (got: $custom_mac_build_out)"
+grep -q '"macos_minutes":90' "$TMP/gcloud-custom-macbuild.log" || fail "90m macos-build in custom group must count 90 macos_minutes (never \$0 self-hosted)"
 
 cat > "$TMP/jobs/9404.json" <<'JSON'
 {
   "total_count": 2,
   "jobs": [
-    {"id":46,"runner_group_name":"macos-restricted","labels":["custom-ci-box"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T04:00:00Z"},
+    {"id":461,"runner_group_name":"macos-restricted","labels":["self-hosted-native-macos"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T04:00:00Z"},
     {"id":47,"runner_group_name":"GitHub Actions","labels":["macos-15"],"started_at":"2026-11-18T04:00:00Z","completed_at":"2026-11-18T05:00:00Z"}
   ]
 }
@@ -1094,10 +1109,10 @@ custom_sh_paired_out="$(
   BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-sh.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
   run_alert "$TMP/state-custom-sh-paired.json" "$TMP/gcloud-custom-sh-paired.log" "$TMP/gh-custom-sh-paired.log"
 )"
-grep -q 'mode=app_token_fallback ' <<<"$custom_sh_paired_out" || fail "paired custom self-hosted + GitHub Actions macos-15 must report mode=app_token_fallback (got: $custom_sh_paired_out)"
-grep -q '"macos_minutes":60' "$TMP/gcloud-custom-sh-paired.log" || fail "custom self-hosted job must add 0 macOS minutes (expected 60 total)"
-grep -q '~\$3\.72 gross' "$TMP/gcloud-custom-sh-paired.log" || fail "custom self-hosted job must add \$0 gross (expected \$3.72 total)"
-pass "invalid STATE_FILE counter types reset with BLIND and runner_group_name classifies custom self-hosted jobs as \$0 non-partial"
+grep -q 'mode=app_token_fallback ' <<<"$custom_sh_paired_out" || fail "paired self-hosted-native-macos + GitHub Actions macos-15 must report mode=app_token_fallback (got: $custom_sh_paired_out)"
+grep -q '"macos_minutes":60' "$TMP/gcloud-custom-sh-paired.log" || fail "self-hosted-native-macos job must add 0 macOS minutes (expected 60 total)"
+grep -q '~\$3\.72 gross' "$TMP/gcloud-custom-sh-paired.log" || fail "self-hosted-native-macos job must add \$0 gross (expected \$3.72 total)"
+pass "invalid STATE_FILE counter types reset with BLIND and strict self-hosted label classification avoids misclassifying custom hosted groups"
 
 # 23. Round-18 fixes: hosted larger/ARM runners in custom org runner groups are NOT misclassified as $0 self-hosted,
 #     fractional/bool .sent timestamps trigger corrupt_state_file_reset, and corrupt reset with < MAX_API_FAILURES
@@ -1160,3 +1175,62 @@ grep -q '; ALSO STATE_FILE was corrupt and reset' "$TMP/gcloud-bool-sent.log" ||
 ! grep -q 'consecutive' "$TMP/gcloud-bool-sent.log" || fail "corrupt .sent + 1/3 billing failure must NOT claim consecutive failures"
 [ "$(jq -r '.api_failures' "$TMP/state-bool-sent.json")" = 1 ] || fail "corrupt reset + 1 primary failure must persist api_failures=1 (not 4)"
 pass "hosted larger/ARM custom groups stay partial, fractional/bool .sent resets cleanly, and corrupt-state wording is separated from billing failures"
+
+# 24. Round-19 fixes:
+#     a) Durable pending_corrupt_reset survives failed gcloud logging write and clears only after emit succeeds
+#     b) Fallback enumeration shape validation marks partial when workflow_runs or repos payload is malformed
+#     c) Empty "" repositoryName normalizes to (org-level) without shifting TSV columns
+printf '{corrupt\n' > "$TMP/state-pending-reset.json"
+if GCLOUD_WRITE_FAIL=1 BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+    run_alert "$TMP/state-pending-reset.json" "$TMP/gcloud-pending-reset.log" "$TMP/gh-pending-reset.log" >/dev/null 2>&1; then
+  fail "corrupt reset with GCLOUD_WRITE_FAIL=1 must exit non-zero"
+fi
+[ "$(jq -r '.pending_corrupt_reset' "$TMP/state-pending-reset.json")" = "true" ] || \
+  fail "failed gcloud emit after corrupt reset must persist pending_corrupt_reset=true"
+
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-pending-reset.json" "$TMP/gcloud-pending-retry.log" "$TMP/gh-pending-retry.log" >/dev/null 2>"$TMP/pending-retry.err"
+grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-pending-retry.log" || \
+  fail "next healthy run with pending_corrupt_reset=true must emit WARNING BLIND corrupt_state_file_reset"
+[ "$(jq -r '.pending_corrupt_reset' "$TMP/state-pending-reset.json")" = "false" ] || \
+  fail "successful emit must clear pending_corrupt_reset=false"
+
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-pending-reset.json" "$TMP/gcloud-pending-after.log" "$TMP/gh-pending-after.log" >/dev/null
+[ ! -e "$TMP/gcloud-pending-after.log" ] || fail "subsequent healthy run after pending_corrupt_reset cleared must emit zero logs"
+
+cat > "$TMP/runs-badshape.json" <<'JSON'
+{"workflow_runs": {"not": "a list"}}
+JSON
+bad_runs_shape_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-badshape.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-badshape.json" "$TMP/gcloud-badshape.log" "$TMP/gh-badshape.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$bad_runs_shape_out" || \
+  fail "non-list workflow_runs must mark mode=app_token_fallback_partial (got: $bad_runs_shape_out)"
+
+cat > "$TMP/repos-badshape.json" <<'JSON'
+{"message": "not a repo list"}
+JSON
+bad_repos_shape_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos-badshape.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-badrepos.json" "$TMP/gcloud-badrepos.log" "$TMP/gh-badrepos.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$bad_repos_shape_out" || \
+  fail "non-array repos response must mark mode=app_token_fallback_partial (got: $bad_repos_shape_out)"
+
+cat > "$TMP/billing-empty-repo.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-11-18T00:15:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":120.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":30.00,"discountAmount":15.00,"netAmount":15.00,"organizationName":"jleechanorg","repositoryName":""}
+  ]
+}
+JSON
+BILLING_FIXTURE="$TMP/billing-empty-repo.json" \
+  run_alert "$TMP/state-emptyrepo.json" "$TMP/gcloud-emptyrepo.log" "$TMP/gh-emptyrepo.log" >/dev/null
+grep -q '"top_repo":"(org-level)"' "$TMP/gcloud-emptyrepo.log" || \
+  fail "empty repositoryName must normalize to (org-level) without shifting TSV fields"
+grep -q '"gross_usd":30' "$TMP/gcloud-emptyrepo.log" || fail "normalized (org-level) row must preserve gross_usd=30"
+grep -q '"net_usd":15' "$TMP/gcloud-emptyrepo.log" || fail "normalized (org-level) row must preserve net_usd=15"
+grep -q '"macos_minutes":120' "$TMP/gcloud-emptyrepo.log" || fail "normalized (org-level) row must preserve macos_minutes=120"
+pass "Round-19 fixes: durable pending_corrupt_reset, fallback shape validation, and empty repositoryName TSV normalization hold"

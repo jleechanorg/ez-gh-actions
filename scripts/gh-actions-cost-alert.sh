@@ -13,7 +13,7 @@
 #   - Normal peak (primary billing API): StartInterval=3600 (24 runs/day) -> at
 #     most 24 `rate_limit` + 24 `/organizations/<org>/settings/billing/usage`
 #     `gh api` calls/day (48 calls/day, ~0.04% of the 5,000/hr personal REST
-#     quota; plus at most 1 extra previous-month day call on day-1 rollover).
+#     quota; plus up to 24 previous-month day calls = 72 primary REST calls on UTC day 1).
 #     0 calls against the GitHub App token unless personal quota < 50 or
 #     `/settings/billing/usage` fails/403.
 #   - Bounded App-token fallback (only when personal `core.remaining < 50` or
@@ -316,12 +316,12 @@ acquire_state_lock() {
   local py_bin="" rc=0
   if ! py_bin="$(resolve_python3)"; then
     echo "FATAL: python3 not found; cannot acquire state lock $STATE_LOCK_FILE" >&2
-    return 1
+    return 2
   fi
   mkdir -p "$(dirname "$STATE_LOCK_FILE")"
   if ! exec 9>>"$STATE_LOCK_FILE"; then
     echo "FATAL: failed to open state lock $STATE_LOCK_FILE" >&2
-    return 1
+    return 2
   fi
   chmod 600 "$STATE_LOCK_FILE" 2>/dev/null || true
   "$py_bin" - "$STATE_LOCK_TIMEOUT_SEC" <<'PY' || rc=$?
@@ -348,8 +348,9 @@ PY
     exec 9>&-
     if [ "$rc" -eq 1 ]; then
       echo "FATAL: timed out waiting for state lock $STATE_LOCK_FILE" >&2
+      return 1
     fi
-    return 1
+    return 2
   fi
   STATE_LOCK_HELD=1
   return 0
@@ -387,6 +388,10 @@ for key in ("last_sent", "api_failures", "last_blind"):
     if val is not None and not is_nonneg_int(val):
         sys.exit(1)
 
+pending_reset = data.get("pending_corrupt_reset")
+if pending_reset is not None and not isinstance(pending_reset, bool):
+    sys.exit(1)
+
 sys.exit(0)
 PY
     return $?
@@ -399,6 +404,7 @@ PY
       and ((has("last_sent") | not) or .last_sent == null or (.last_sent | is_nonneg_int))
       and ((has("api_failures") | not) or .api_failures == null or (.api_failures | is_nonneg_int))
       and ((has("last_blind") | not) or .last_blind == null or (.last_blind | is_nonneg_int))
+      and ((has("pending_corrupt_reset") | not) or .pending_corrupt_reset == null or (.pending_corrupt_reset | type == "boolean"))
     )
   ' "$path" >/dev/null 2>&1
 }
@@ -407,42 +413,53 @@ if [ "$DRY_RUN" -eq 1 ]; then
   if [ -r "$STATE_FILE" ]; then
     cp "$STATE_FILE" "$tmp.snapshot"
   else
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$tmp.snapshot"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}' > "$tmp.snapshot"
   fi
   STATE_FILE="$tmp.snapshot"
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
   if ! validate_state_file "$STATE_FILE"; then
     echo "[$NOW_ISO] WARN: corrupt or empty state snapshot; resetting for dry-run" >&2
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
 else
-  if ! acquire_state_lock; then
-    emit WARNING BLIND "$TODAY_UTC" \
-      "LOCK_TIMEOUT: state lock held > ${STATE_LOCK_TIMEOUT_SEC}s for $ALERT_ORG; monitoring blocked" \
-      0 null 0 "" "lock_timeout" null null || true
+  lock_rc=0
+  acquire_state_lock || lock_rc=$?
+  if [ "$lock_rc" -ne 0 ]; then
+    if [ "$lock_rc" -eq 1 ]; then
+      emit WARNING BLIND "$TODAY_UTC" \
+        "LOCK_TIMEOUT: state lock held > ${STATE_LOCK_TIMEOUT_SEC}s for $ALERT_ORG; monitoring blocked" \
+        0 null 0 "" "lock_timeout" null null || true
+    else
+      emit WARNING BLIND "$TODAY_UTC" \
+        "LOCK_ERROR: unable to acquire state lock $STATE_LOCK_FILE for $ALERT_ORG; monitoring blocked" \
+        0 null 0 "" "lock_error" null null || true
+    fi
     exit 4
   fi
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
   if [ ! -f "$STATE_FILE" ]; then
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
   if ! validate_state_file "$STATE_FILE" || \
      ! jq --argjson cutoff "$((NOW - 3024000))" \
-       'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
+       'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0) | .pending_corrupt_reset = (.pending_corrupt_reset // false)' \
        "$STATE_FILE" > "$STATE_NEXT_TMP" 2>"$tmp.err" || \
      [ ! -s "$STATE_NEXT_TMP" ] || \
      ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_NEXT_TMP" >/dev/null 2>&1; then
     rm -f "$STATE_NEXT_TMP"
     echo "[$NOW_ISO] WARN: corrupt or empty STATE_FILE '$STATE_FILE'; resetting and scheduling BLIND (corrupt_state_file_reset)" >&2
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":true}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
     STATE_CORRUPT_RESET=1
   else
     mv -f "$STATE_NEXT_TMP" "$STATE_FILE"
+    if [ "$(jq -r '.pending_corrupt_reset // false' "$STATE_FILE")" = "true" ]; then
+      STATE_CORRUPT_RESET=1
+    fi
   fi
 fi
 
@@ -481,7 +498,7 @@ emit_blind_if_due() {
     emit WARNING BLIND "$TODAY_UTC" \
       "$msg" \
       0 null 0 "" "$mode" null null
-    jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
+    jq --argjson now "$NOW" '.last_blind = $now | .pending_corrupt_reset = false' "$STATE_FILE" > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
   echo "[$NOW_ISO] WARN: $reason ($FAILURES_NOW consecutive); authoritative billing state unverified" >&2
@@ -522,7 +539,7 @@ run_app_token_fallback() {
   fi
   calls_used=$((calls_used + 1))
 
-  if ! repo_count="$(jq 'length' "$tmp.repos" 2>"$tmp.err")"; then
+  if ! repo_count="$(jq -e 'if type == "array" then length else error("repos must be array") end' "$tmp.repos" 2>"$tmp.err")"; then
     FALLBACK_INCOMPLETE=1
     repo_count=0
   fi
@@ -547,9 +564,9 @@ run_app_token_fallback() {
     fi
     calls_used=$((calls_used + 1))
 
-    if ! runs_count="$(jq '(.workflow_runs // []) | length' "$tmp.runs" 2>"$tmp.err")"; then
+    if ! runs_count="$(jq -e 'if (type == "object") and ((.workflow_runs | type) == "array") then (.workflow_runs | length) else error("workflow_runs must be array") end' "$tmp.runs" 2>"$tmp.err")"; then
       FALLBACK_INCOMPLETE=1
-      runs_count=0
+      continue
     fi
     if [ "$runs_count" -ge "$FALLBACK_RUNS_PER_PAGE" ]; then
       FALLBACK_INCOMPLETE=1
@@ -574,8 +591,7 @@ run_app_token_fallback() {
 
         if ! jq -c --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
           def is_self_hosted:
-            any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac")) or
-            (((.runner_group_name // "") != "") and (.runner_group_name != "GitHub Actions") and (any((.labels // [])[]; ascii_downcase | test("^(ubuntu|macos|windows)-([0-9]|latest)")) | not));
+            any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or $l == "self-hosted-native-macos"));
           def is_standard_macos:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15|26)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           def is_any_hosted_macos:
@@ -633,7 +649,7 @@ run_app_token_fallback() {
           FALLBACK_INCOMPLETE=1
         fi
 
-        if ! page_jobs_count="$(jq '(.jobs // []) | length' "$tmp.jobs" 2>"$tmp.err")"; then
+        if ! page_jobs_count="$(jq -e 'if (type == "object") and ((.jobs | type) == "array") then (.jobs | length) else error("jobs must be array") end' "$tmp.jobs" 2>"$tmp.err")"; then
           FALLBACK_INCOMPLETE=1
           page_jobs_count=0
         fi
@@ -661,15 +677,17 @@ run_app_token_fallback() {
         break
       fi
     done < <(jq -r --arg yesterday "$YESTERDAY_UTC" '
-      (.workflow_runs // [])[]
-      | select((.conclusion // "") != "skipped" and ((((.updated_at // .created_at // "")[:10]) >= $yesterday) or ((.status // "") == "in_progress") or ((.status // "") == "queued")))
-      | (.id // empty)
+      if (type == "object") and ((.workflow_runs | type) == "array") then
+        .workflow_runs[]
+        | select((.conclusion // "") != "skipped" and ((((.updated_at // .created_at // "")[:10]) >= $yesterday) or ((.status // "") == "in_progress") or ((.status // "") == "queued")))
+        | (.id // empty)
+      else empty end
     ' "$tmp.runs" 2>/dev/null || true)
     if [ "$FALLBACK_CAP_HIT" -eq 1 ]; then
       break
     fi
   done < <(jq -r '
-    (.[]? | [(.name // ""), (.full_name // "")] | @tsv)
+    if type == "array" then (.[] | [(if (.name // "") == "" then "(unknown)" else .name end), (.full_name // "")] | @tsv) else empty end
   ' "$tmp.repos" 2>/dev/null || true)
 
   if [ -s "$tmp.fallback_items" ] && jq -se 'any(.[]; .unpriced_hosted == true)' "$tmp.fallback_items" >/dev/null 2>&1; then
@@ -742,14 +760,15 @@ fi
 
 if [ -z "$fallback_reason" ]; then
   if ! jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
+    def norm_repo: if (. // "") == "" then "(org-level)" else . end;
     def is_macos_min: (((.sku // "") | test("macos"; "i")) and (((.unitType // "") | ascii_downcase) == "minutes"));
     def sum_gross: (map(.grossAmount // 0) | add // 0);
     def sum_net: (map(.netAmount // 0) | add // 0);
     def sum_macos_min: (map(if is_macos_min then (.quantity // 0) else 0 end) | add // 0);
     def day_summary($d; $all_actions):
       ($all_actions | map(select(((.date // "")[:10]) == $d))) as $items
-      | ($items | group_by(.repositoryName // "(org-level)") | map({
-          repo: (.[0].repositoryName // "(org-level)"),
+      | ($items | group_by(.repositoryName | norm_repo) | map({
+          repo: (.[0].repositoryName | norm_repo),
           gross_usd: sum_gross,
           net_usd: sum_net,
           macos_min: sum_macos_min
@@ -928,7 +947,14 @@ while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_macos t
       queue_due_breach "$key" NET_SPEND_BREACH "$day" "$msg" "$d_gross" "$d_net" "$d_macos" "$top_net_repo"
     fi
   fi
-done < <(jq -r '.days[] | [.day, .gross_usd, (.net_usd // "null"), .macos_min, .top_repo, .top_repo_gross_usd, .top_repo_macos_min, (.top_net_repo // .top_repo), (.top_net_repo_net_usd // .top_repo_net_usd // "null"), (.top_net_repo_gross_usd // .top_repo_gross_usd // "null")] | @tsv' "$tmp.summary")
+done < <(jq -r '
+  def non_empty($fallback): if (. // "") == "" then $fallback else . end;
+  .days[]
+  | (.top_repo | non_empty("(none)")) as $top_repo
+  | (.top_net_repo | non_empty($top_repo)) as $top_net_repo
+  | [.day, .gross_usd, (.net_usd // "null"), .macos_min, $top_repo, .top_repo_gross_usd, .top_repo_macos_min, $top_net_repo, (.top_net_repo_net_usd // .top_repo_net_usd // "null"), (.top_net_repo_gross_usd // .top_repo_gross_usd // "null")]
+  | @tsv
+' "$tmp.summary")
 
 if [ "$used_fallback" -eq 0 ] && [ "$mtd_net" != "null" ] && ge_num "$mtd_net" "$MTD_NET_WARN_USD"; then
   key="${YEAR_MONTH}:MTD_NET_BREACH"
@@ -971,7 +997,7 @@ if [ "${#DUE_KEYS[@]}" -gt 0 ]; then
     jq --argjson keys "$breach_keys_json" --argjson now "$NOW" --argjson mark_blind "$mark_blind" '
       reduce $keys[] as $k (.; .sent[$k] = $now)
       | .last_sent = $now
-      | if $mark_blind == 1 then .last_blind = $now else . end
+      | if $mark_blind == 1 then .last_blind = $now | .pending_corrupt_reset = false else . end
     ' "$STATE_FILE" > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
     alerted="${#DUE_KEYS[@]}"

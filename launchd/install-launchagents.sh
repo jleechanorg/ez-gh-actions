@@ -40,6 +40,7 @@ DASHBOARD_HAD_PRIOR=0
 DASHBOARD_PRIOR_UNLOADED=false
 DASHBOARD_REPLACEMENT_INSTALLED=false
 COST_ALERT_LABEL="org.jleechanorg.ezgha-gh-actions-cost-alert"
+INSTALLING_COST_ALERT=false
 COST_ALERT_TRANSACTION_ACTIVE=false
 COST_ALERT_SCRIPT_BACKUP=""
 COST_ALERT_HAD_PRIOR_SCRIPT=0
@@ -177,7 +178,11 @@ install_scripts() {
   # same flat directory so sibling-relative lookups keep working post-install.
   for script in "${REPO_PATH}"/scripts/*.sh "${REPO_PATH}"/scripts/*.py; do
     [[ -f "$script" ]] || continue
-    install -m 0755 "$script" "${SCRIPTS_DIR}/$(basename "$script")"
+    script_name="$(basename "$script")"
+    if [[ "$script_name" == "gh-actions-cost-alert.sh" && "${INSTALLING_COST_ALERT}" != true ]]; then
+      continue
+    fi
+    install -m 0755 "$script" "${SCRIPTS_DIR}/${script_name}"
   done
   for asset in index.html style.css dashboard.js; do
     install -m 0644 "${REPO_PATH}/dashboard/${asset}" "${DASHBOARD_DIR}/${asset}"
@@ -289,6 +294,7 @@ case "$action" in
         backup_dashboard_payload
         need_exit_trap=true
       elif [[ "$tmpl_label" == "${COST_ALERT_LABEL}" ]]; then
+        INSTALLING_COST_ALERT=true
         backup_cost_alert_script
         need_exit_trap=true
       fi
@@ -355,8 +361,20 @@ PY
       if [[ -f "$dest" ]]; then
         cp -p "$dest" "$backup"
         had_prior=1
+        was_loaded=0
+        if [[ "${label}" == "${COST_ALERT_LABEL}" ]] && launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+          was_loaded=1
+        fi
         if launchctl unload "$dest" 2>/dev/null; then
           [[ "${label}" != "${DASHBOARD_LABEL}" ]] || DASHBOARD_PRIOR_UNLOADED=true
+        fi
+        if [[ "${label}" == "${COST_ALERT_LABEL}" && "$was_loaded" -eq 1 ]]; then
+          if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+            echo "ERROR: ${label} is still loaded after unload; restoring script and retaining ${dest}" >&2
+            rm -f "$candidate" "$backup"
+            restore_cost_alert_script
+            exit 1
+          fi
         fi
       fi
       if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then

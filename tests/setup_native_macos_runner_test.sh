@@ -272,6 +272,10 @@ lookup_repo_map() {
 }
 case "$*" in
   *"actions/runners/registration-token"*)
+    if [ -n "${GH_FAIL_REG_TOKEN:-}" ]; then
+      echo "gh: HTTP 500: registration-token error" >&2
+      exit 1
+    fi
     if [ -n "${GH_TOKEN_MINTED_MARKER:-}" ]; then
       : > "$GH_TOKEN_MINTED_MARKER"
     fi
@@ -327,6 +331,18 @@ case "$*" in
     ;;
   *"actions/runners"*)
     default_live='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}'
+    if [ -n "${GH_RUNNERS_CALL_COUNT_FILE:-}" ]; then
+      rcnt=0
+      if [ -f "$GH_RUNNERS_CALL_COUNT_FILE" ]; then
+        rcnt="$(cat "$GH_RUNNERS_CALL_COUNT_FILE")"
+      fi
+      rcnt=$((rcnt + 1))
+      printf '%s\n' "$rcnt" > "$GH_RUNNERS_CALL_COUNT_FILE"
+      if [ "$rcnt" -ge "${GH_RUNNERS_ONLINE_AT_CALL:-999}" ] && [ -n "${LIVE_RUNNERS_AFTER_ATTEMPT_JSON:-}" ]; then
+        emit_json "$LIVE_RUNNERS_AFTER_ATTEMPT_JSON"
+        exit 0
+      fi
+    fi
     if [ -n "${LIVE_RUNNERS_POST_CONFIG_JSON:-}" ] && [ -n "${CONFIG_RAN_MARKER:-}" ] && [ -f "$CONFIG_RAN_MARKER" ]; then
       emit_json "$LIVE_RUNNERS_POST_CONFIG_JSON"
     elif [ -n "${LIVE_RUNNERS_AFTER_TOKEN_JSON:-}" ] && [ -n "${GH_TOKEN_MINTED_MARKER:-}" ] && [ -f "$GH_TOKEN_MINTED_MARKER" ]; then
@@ -522,8 +538,22 @@ printf 'prior-cost-plist\n' > "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechan
 printf 'prior-cost-script\n' > "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
 chmod +x "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
 printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+: > "$COST_FAIL_HOME/loaded"
 cat > "$COST_FAIL_BIN/launchctl" <<STUB
 #!/usr/bin/env bash
+if [ "\${1:-}" = "unload" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; then
+  if [ -n "\${COST_REFUSE_UNLOAD:-}" ]; then
+    exit 1
+  fi
+  rm -f "$COST_FAIL_HOME/loaded"
+  exit 0
+fi
+if [ "\${1:-}" = "print" ] && [[ "\${2:-}" == *gh-actions-cost-alert ]]; then
+  if [ -f "$COST_FAIL_HOME/loaded" ]; then
+    exit 0
+  fi
+  exit 113
+fi
 if [ "\${1:-}" = "load" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; then
   count="\$(cat "$COST_FAIL_HOME/load-count.txt")"
   count=\$((count + 1))
@@ -531,6 +561,7 @@ if [ "\${1:-}" = "load" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; th
   if [ "\$count" -eq 1 ]; then
     exit 42
   fi
+  : > "$COST_FAIL_HOME/loaded"
   cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh" > "$COST_FAIL_HOME/script-at-reload.txt"
   cat "\$2" > "$COST_FAIL_HOME/plist-at-reload.txt"
   exit 0
@@ -554,7 +585,32 @@ BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
 if compgen -G "$COST_FAIL_HOME/.local/state/ezgha/.gh-actions-cost-alert.sh.backup.*" >/dev/null; then
   fail "failed cost-alert load must clean up temporary script backup"
 fi
-pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents, rolls back script BEFORE backup plist reload, handles fresh account, and renders valid plist"
+
+# Refusing to unload org.jleechanorg.ezgha-gh-actions-cost-alert must restore gh-actions-cost-alert.sh and exit non-zero BEFORE overwriting plist.
+: > "$COST_FAIL_HOME/loaded"
+printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+cost_refuse_rc=0
+COST_REFUSE_UNLOAD=1 BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || cost_refuse_rc=$?
+[ "$cost_refuse_rc" -ne 0 ] || fail "cost-alert upgrade when incumbent refuses to unload must exit non-zero"
+[ "$(cat "$COST_FAIL_HOME/load-count.txt")" = "0" ] || fail "cost-alert upgrade when unload fails must abort before calling launchctl load"
+[ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
+  fail "cost-alert upgrade when unload fails must keep prior plist untouched"
+[ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
+  fail "cost-alert upgrade when unload fails must restore prior gh-actions-cost-alert.sh"
+if compgen -G "$COST_FAIL_HOME/.local/state/ezgha/.gh-actions-cost-alert.sh.backup.*" >/dev/null; then
+  fail "refused cost-alert unload must clean up temporary script backup"
+fi
+
+# Unrelated targeted install (e.g. token-refresh) must NOT overwrite or copy gh-actions-cost-alert.sh.
+UNREL_HOME="$TMP/unrelated-install-home"
+mkdir -p "$UNREL_HOME/Library/LaunchAgents" "$UNREL_HOME/.local/libexec/ezgha"
+printf 'sentinel-cost-alert\n' > "$UNREL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
+BASH_ENV=/dev/null HOME="$UNREL_HOME" PATH="$TMP/bin:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-token-refresh >/dev/null
+[ "$(cat "$UNREL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "sentinel-cost-alert" ] || \
+  fail "unrelated targeted install must not overwrite gh-actions-cost-alert.sh"
+pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents, rolls back script BEFORE backup plist reload and on unload failure, handles fresh account, and renders valid plist"
 
 # 6. --uninstall runs before resolve_work_dir, unloads even without plist, and retains plist if still loaded.
 : > "$TMP/launchctl.loaded"
@@ -1103,7 +1159,7 @@ chmod +x "$EXISTING_SYM/run.sh"
 rm -f "$TMP/config-ran-17"
 CONFIG_RAN_MARKER="$TMP/config-ran-17" \
   LIVE_RUNNERS_JSON='{"runners":[]}' \
-  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" "$SETUP_SCRIPT" --runner-dir "$ISOLATED_SYM" --runner-group macos-restricted >/dev/null
@@ -1186,7 +1242,7 @@ rm -f "$TMP/config-ran-18"
 CONFIG_RAN_MARKER="$TMP/config-ran-18" \
   RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   LIVE_RUNNERS_JSON='{"runners":[]}' \
-  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null
 grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must reconfigure when live runner is missing on GitHub"
@@ -1248,7 +1304,7 @@ rm -f "$TMP/config-ran-20"
 CONFIG_RAN_MARKER="$TMP/config-ran-20" \
   RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   LIVE_RUNNERS_JSON='{"runners":[]}' \
-  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" \
   "$SETUP_SCRIPT" --runner-dir "$FRESH_COLLIDE" --runner-group macos-restricted >/dev/null
@@ -1258,7 +1314,7 @@ grep -q 'config.sh ' "$TMP/config.log" || fail "fresh setup without live collisi
 
 : > "$TMP/config.log"
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
-  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" \
   "$SETUP_SCRIPT" --runner-dir "$FRESH_COLLIDE" --reconfigure --runner-group macos-restricted >/dev/null
@@ -1296,7 +1352,7 @@ if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/disk
 fi
 
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
-  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" \
   "$SETUP_SCRIPT" --runner-dir "$LEAK_RUNNER" --runner-group macos-restricted >/dev/null
@@ -1359,7 +1415,7 @@ printf 'macos-restricted\n' > "$RETRY_RUNNER/.ezgha-group"
 : > "$TMP/launchctl.log"
 retry_fail_rc=0
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
-  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --runner-dir "$RETRY_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || retry_fail_rc=$?
 [ "$retry_fail_rc" -eq 4 ] || fail "initial failed --reconfigure must exit 4 (got $retry_fail_rc)"
@@ -1371,7 +1427,7 @@ cp "$EXISTING_SYM/config.sh" "$RETRY_RUNNER/config.sh"
 : > "$TMP/config.log"
 rm -f "$TMP/launchctl.loaded"
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
-  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --runner-dir "$RETRY_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null
 grep -q -- '--replace' "$TMP/config.log" || fail "retry --reconfigure without --force-replace-name must derive prev_agent_id=101 from backup and pass --replace"
@@ -1539,3 +1595,95 @@ if PYTHON3_BIN="$TMP/bin/py-fail.sh" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK
   fail "is_reserved_runner_dir must fail closed when python check exits non-1 (e.g. rc=2)"
 fi
 pass "Round-18 P1 hardening: conflicting flags, .credentials, live online status, full post_config retry, TOCTOU --replace recheck, temp WORK_DIR rejection, and fail-closed reserved check hold"
+
+# 25. Round-19 fixes:
+#     a) P0: Staging + loaded incumbent LaunchAgent + post-token collision OR token mint failure NEVER stops incumbent or mutates destination
+#     b) Online readback: post-launch retries across POST_CONFIG_VERIFY_ATTEMPTS, fails closed if offline, and idempotent offline rerun fails closed without config.sh
+#     c) Strict ENOENT-only ignore in is_reserved_runner_dir (ELOOP fails closed)
+: > "$TMP/launchctl.loaded"
+: > "$TMP/launchctl.log"
+: > "$TMP/config.log"
+rm -f "$TMP/token-minted-25"
+STAGING_COLLIDE_DIR="$TMP/home/staging-collide-runner"
+r19_collide_rc=0
+GH_TOKEN_MINTED_MARKER="$TMP/token-minted-25" \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_AFTER_TOKEN_JSON='{"runners":[{"id":999,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$STAGING_COLLIDE_DIR" --runner-group macos-restricted >/dev/null 2>&1 || r19_collide_rc=$?
+[ "$r19_collide_rc" -eq 6 ] || fail "P0: staging + post-token collision must exit 6 (got $r19_collide_rc)"
+[ -f "$TMP/launchctl.loaded" ] || fail "P0: staging + post-token collision must leave incumbent LaunchAgent loaded"
+! grep -Eq 'launchctl (unload|bootout)' "$TMP/launchctl.log" || fail "P0: staging + post-token collision must NEVER stop/bootout incumbent LaunchAgent"
+[ ! -e "$STAGING_COLLIDE_DIR" ] || fail "P0: staging + post-token collision must not populate destination runner dir"
+shopt -s nullglob
+leftover_staging=("${STAGING_COLLIDE_DIR}.staging."*)
+shopt -u nullglob
+[ "${#leftover_staging[@]}" -eq 0 ] || fail "P0: unpromoted staging dir must be cleaned up on collision exit"
+
+: > "$TMP/launchctl.loaded"
+: > "$TMP/launchctl.log"
+r19_token_fail_rc=0
+GH_FAIL_REG_TOKEN=1 \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" \
+  "$SETUP_SCRIPT" --runner-dir "$STAGING_COLLIDE_DIR" --runner-group macos-restricted >/dev/null 2>&1 || r19_token_fail_rc=$?
+[ "$r19_token_fail_rc" -eq 3 ] || fail "P0: staging + token mint failure must exit 3 (got $r19_token_fail_rc)"
+[ -f "$TMP/launchctl.loaded" ] || fail "P0: staging + token mint failure must leave incumbent LaunchAgent loaded"
+! grep -Eq 'launchctl (unload|bootout)' "$TMP/launchctl.log" || fail "P0: staging + token mint failure must NEVER stop/bootout incumbent LaunchAgent"
+[ ! -e "$STAGING_COLLIDE_DIR" ] || fail "P0: staging + token mint failure must not populate destination runner dir"
+
+# Online readback: post-launch retry succeeds when attempt 2 goes online; fails closed when permanently offline.
+rm -f "$TMP/runners-attempts-25.txt" "$TMP/config-ran-25"
+CONFIG_RAN_MARKER="$TMP/config-ran-25" \
+  POST_CONFIG_VERIFY_ATTEMPTS=2 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  GH_RUNNERS_CALL_COUNT_FILE="$TMP/runners-attempts-25.txt" \
+  GH_RUNNERS_ONLINE_AT_CALL=5 \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  LIVE_RUNNERS_AFTER_ATTEMPT_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null || \
+  fail "post-launch online readback must retry across POST_CONFIG_VERIFY_ATTEMPTS and succeed when online"
+[ -f "$TMP/launchctl.loaded" ] || fail "post-launch online retry success must leave LaunchAgent loaded"
+
+rm -f "$TMP/config-ran-25-off"
+offline_post_rc=0
+CONFIG_RAN_MARKER="$TMP/config-ran-25-off" \
+  POST_CONFIG_VERIFY_ATTEMPTS=2 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || offline_post_rc=$?
+[ "$offline_post_rc" -eq 4 ] || fail "post-launch offline runner after POST_CONFIG_VERIFY_ATTEMPTS must exit 4 fail-closed (got $offline_post_rc)"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "failed post-launch online readback must stop LaunchAgent"
+
+# Idempotent already-configured rerun when LaunchAgent is loaded and GitHub reports status="offline" must fail closed WITHOUT invoking config.sh.
+: > "$TMP/launchctl.loaded"
+: > "$TMP/config.log"
+: > "$TMP/launchctl.log"
+offline_idem_rc=0
+offline_idem_err="$(
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --runner-group macos-restricted 2>&1 >/dev/null
+)" || offline_idem_rc=$?
+[ "$offline_idem_rc" -ne 0 ] || fail "idempotent setup rerun with offline runner must fail closed"
+[ ! -s "$TMP/config.log" ] || fail "idempotent setup rerun with offline runner must NOT invoke config.sh"
+grep -q "status='offline'" <<<"$offline_idem_err" || fail "idempotent offline rerun must report offline status (got: $offline_idem_err)"
+
+# Strict ENOENT-only ignore in is_reserved_runner_dir: ELOOP symlink loop must fail closed (exit 2).
+mkdir -p "$TMP/eloop"
+ln -s "$TMP/eloop/b" "$TMP/eloop/a"
+ln -s "$TMP/eloop/a" "$TMP/eloop/b"
+eloop_rc=0
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+  "$SETUP_SCRIPT" --dry-run --runner-dir "$TMP/eloop/a/sub" >/dev/null 2>&1 || eloop_rc=$?
+[ "$eloop_rc" -eq 2 ] || fail "is_reserved_runner_dir must fail closed (exit 2) on ELOOP symlink loop (got $eloop_rc)"
+pass "Round-19 fixes: P0 staging/token/ownership order, post-launch + idempotent online readback, and strict ENOENT-only reserved check hold"

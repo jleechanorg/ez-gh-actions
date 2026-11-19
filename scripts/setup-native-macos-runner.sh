@@ -175,7 +175,7 @@ LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
 STATE_LOCK_TIMEOUT_SEC="${SETUP_LOCK_TIMEOUT_SEC:-30}"
 SETUP_LOCK_FILE=""
 SETUP_LOCK_HELD=0
-STAGE_DIR=""
+STAGE_TMP=""
 TMP_TGZ=""
 BACKUP_DIR=""
 CANDIDATE_PLIST=""
@@ -188,7 +188,7 @@ release_setup_lock() {
 }
 
 cleanup_setup() {
-  [ -z "${STAGE_DIR:-}" ] || rm -rf "${STAGE_DIR:?}"
+  [ -z "${STAGE_TMP:-}" ] || rm -rf "${STAGE_TMP:?}"
   [ -z "${TMP_TGZ:-}" ] || rm -f "$TMP_TGZ"
   [ -z "${CANDIDATE_PLIST:-}" ] || rm -f "$CANDIDATE_PLIST"
   release_setup_lock
@@ -315,9 +315,9 @@ try:
         cur = p
         while True:
             try:
-                if cur.exists():
-                    yield cur
-            except OSError:
+                os.stat(cur)
+                yield cur
+            except FileNotFoundError:
                 pass
             if cur.parent == cur:
                 break
@@ -325,8 +325,8 @@ try:
 
     def same_fs(a: Path, b: Path) -> bool:
         try:
-            return a.exists() and b.exists() and os.path.samefile(a, b)
-        except OSError:
+            return os.path.samefile(a, b)
+        except FileNotFoundError:
             return False
 
     target_real = Path(os.path.realpath(target_raw))
@@ -362,7 +362,12 @@ try:
         for anc in list(existing_ancestors(target_abs)) + list(existing_ancestors(target_real)):
             if same_fs(anc, res_real):
                 sys.exit(0)
-        if target_real.exists():
+        target_exists = True
+        try:
+            os.stat(target_real)
+        except FileNotFoundError:
+            target_exists = False
+        if target_exists:
             for res_anc in existing_ancestors(res_real):
                 if same_fs(target_real, res_anc):
                     sys.exit(0)
@@ -370,6 +375,9 @@ try:
     sys.exit(1)
 except SystemExit:
     raise
+except OSError as exc:
+    print(f"ERROR: reserved-dir check failed closed: {exc}", file=sys.stderr)
+    sys.exit(0)
 except Exception as exc:
     print(f"ERROR: reserved-dir check failed closed: {exc}", file=sys.stderr)
     sys.exit(2)
@@ -850,6 +858,45 @@ verify_live_runner_state() {
   return 1
 }
 
+verify_runner_online() {
+  local max_attempts="${1:-1}"
+  local local_agent_id="" attempt=1 runners_pages="" runner_json="" live_status=""
+
+  if ! runner_configured "$RUNNER_DIR"; then
+    echo "FAIL: missing ${RUNNER_DIR}/.runner or ${RUNNER_DIR}/.credentials" >&2
+    return 1
+  fi
+  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]] || [ "$local_agent_id" -le 0 ]; then
+    echo "FAIL: .runner missing valid positive numeric agentId (got '${local_agent_id}')" >&2
+    return 1
+  fi
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    live_status=""
+    if runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+      runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
+      if [ -n "$runner_json" ]; then
+        live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
+        if [ "$live_status" = "online" ]; then
+          return 0
+        fi
+        echo "INFO: runner '$RUNNER_NAME' (agentId=$local_agent_id) status is '${live_status:-<unset>}' (attempt ${attempt}/${max_attempts})" >&2
+      else
+        echo "INFO: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API (attempt ${attempt}/${max_attempts})" >&2
+      fi
+    else
+      echo "WARNING: failed to query live runners from $RUNNERS_API (attempt ${attempt}/${max_attempts})" >&2
+    fi
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      sleep "$POST_CONFIG_VERIFY_SLEEP_SEC"
+    fi
+  done
+
+  echo "ERROR: runner '$RUNNER_NAME' (agentId=$local_agent_id) is not online on GitHub (last status='${live_status:-<unset>}'; inspect ${LOG_DIR} or pass --reconfigure if registration is invalid)" >&2
+  return 1
+}
+
 if [ "$VERIFY" -eq 1 ]; then
   [ -x "${RUNNER_DIR}/bin/Runner.Listener" ] || { echo "FAIL: missing ${RUNNER_DIR}/bin/Runner.Listener" >&2; exit 1; }
   [ -x "${RUNNER_DIR}/config.sh" ] || { echo "FAIL: missing ${RUNNER_DIR}/config.sh" >&2; exit 1; }
@@ -1047,10 +1094,9 @@ if [ "$needs_config" -eq 1 ]; then
   resolve_replace_collision_policy "$prev_agent_id"
 fi
 
-mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
-
-if ! runner_binaries_ready "$RUNNER_DIR"; then
-  STAGE_DIR="$(mktemp -d "${RUNNER_DIR}.stage.XXXXXX")"
+prepare_staged_binaries() {
+  mkdir -p "$(dirname "$RUNNER_DIR")"
+  STAGE_TMP="$(mktemp -d "${RUNNER_DIR%/}.staging.XXXXXX")"
   if runner_binaries_ready "$EXISTING_RUNNER_DIR"; then
     echo "Provisioning runner binaries via staged clone from ${EXISTING_RUNNER_DIR}..."
     existing_canon="$(canonical_path "$EXISTING_RUNNER_DIR")"
@@ -1065,7 +1111,7 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
       if [ -L "$item" ]; then
         link_target="$(readlink "$item")"
         if [[ "$link_target" != /* && "$link_target" != *..* ]]; then
-          ln -sfn "$link_target" "${STAGE_DIR}/${base}"
+          ln -sfn "$link_target" "${STAGE_TMP}/${base}"
         else
           rel_target=""
           if [[ "$link_target" == "${EXISTING_RUNNER_DIR_RAW}/"* ]]; then
@@ -1079,18 +1125,18 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
             fi
           fi
           if [ -n "$rel_target" ] && [[ "$rel_target" != /* && "$rel_target" != *..* ]]; then
-            ln -sfn "$rel_target" "${STAGE_DIR}/${base}"
+            ln -sfn "$rel_target" "${STAGE_TMP}/${base}"
           else
-            cp -RL "$item" "${STAGE_DIR}/${base}"
+            cp -RL "$item" "${STAGE_TMP}/${base}"
           fi
         fi
       else
-        cp -Rc "$item" "${STAGE_DIR}/${base}" 2>/dev/null || cp -a "$item" "${STAGE_DIR}/${base}"
+        cp -Rc "$item" "${STAGE_TMP}/${base}" 2>/dev/null || cp -a "$item" "${STAGE_TMP}/${base}"
       fi
     done
     shopt -u nullglob
     py_bin="$(resolve_python3)" || { echo "ERROR: python3 not found" >&2; exit 1; }
-    "$py_bin" - "$STAGE_DIR" "$EXISTING_RUNNER_DIR_RAW" "$existing_canon" <<'PY'
+    "$py_bin" - "$STAGE_TMP" "$EXISTING_RUNNER_DIR_RAW" "$existing_canon" <<'PY'
 import os
 import shutil
 import sys
@@ -1139,39 +1185,66 @@ PY
     TMP_TGZ="$(mktemp)"
     tarball_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
     curl -fsSL "$tarball_url" -o "$TMP_TGZ" 9>&-
-    tar -xzf "$TMP_TGZ" -C "$STAGE_DIR"
+    tar -xzf "$TMP_TGZ" -C "$STAGE_TMP"
     rm -f "$TMP_TGZ"
     TMP_TGZ=""
   fi
-  if ! runner_binaries_ready "$STAGE_DIR"; then
-    echo "ERROR: staged runner binaries incomplete in ${STAGE_DIR}" >&2
+  if ! runner_binaries_ready "$STAGE_TMP"; then
+    echo "ERROR: staged runner binaries incomplete in ${STAGE_TMP}" >&2
     exit 1
   fi
-  if ! stop_launchagent; then
-    echo "ERROR: failed to stop ${PLIST_LABEL} before promoting staged runner binaries" >&2
+}
+
+promote_staged_binaries() {
+  [ -n "${STAGE_TMP:-}" ] && [ -d "${STAGE_TMP:-}" ] || {
+    echo "ERROR: staged binaries directory missing" >&2
     exit 1
-  fi
+  }
+  mkdir -p "$RUNNER_DIR"
+  local item base
   shopt -s nullglob
-  for item in "${STAGE_DIR}"/*; do
+  for item in "${STAGE_TMP}"/*; do
     [ -e "$item" ] || [ -L "$item" ] || continue
     base="$(basename "$item")"
     rm -rf "${RUNNER_DIR:?}/${base}"
     mv "$item" "${RUNNER_DIR}/${base}"
   done
   shopt -u nullglob
-  rm -rf "${STAGE_DIR:?}"
-  STAGE_DIR=""
+  rm -rf "${STAGE_TMP:?}"
+  STAGE_TMP=""
+}
+
+binaries_staged=0
+if ! runner_binaries_ready "$RUNNER_DIR"; then
+  prepare_staged_binaries
+  binaries_staged=1
+fi
+
+reg_token=""
+if [ "$needs_config" -eq 1 ]; then
+  if ! reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)" || [ -z "$reg_token" ]; then
+    echo "ERROR: failed to mint registration token from $TOKEN_API" >&2
+    exit 3
+  fi
+  resolve_replace_collision_policy "$prev_agent_id"
+fi
+
+mkdir -p "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
+
+if [ "$binaries_staged" -eq 1 ] || [ "$needs_config" -eq 1 ]; then
+  if ! stop_launchagent; then
+    echo "ERROR: failed to stop ${PLIST_LABEL}; aborting before modifying runner installation" >&2
+    exit 1
+  fi
+fi
+
+if [ "$binaries_staged" -eq 1 ]; then
+  promote_staged_binaries
+else
+  mkdir -p "$RUNNER_DIR"
 fi
 
 if [ "$needs_config" -eq 1 ]; then
-  reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)"
-  [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
-  resolve_replace_collision_policy "$prev_agent_id"
-  if ! stop_launchagent; then
-    echo "ERROR: failed to stop ${PLIST_LABEL}; aborting before removing existing credentials" >&2
-    exit 1
-  fi
-
   BACKUP_DIR="${RUNNER_DIR}/.backup-pre-reconfigure.$$"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
@@ -1182,9 +1255,13 @@ if [ "$needs_config" -eq 1 ]; then
   done
 
   rm -f "${RUNNER_DIR}/.runner" "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams" "${RUNNER_DIR}/.runner_migrated" "${RUNNER_DIR}/.credentials_migrated"
+  if [ ! -d "$RUNNER_DIR" ] || [ ! -x "${RUNNER_DIR}/config.sh" ]; then
+    echo "ERROR: missing executable ${RUNNER_DIR}/config.sh; service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
+    exit 4
+  fi
   config_rc=0
   (
-    cd "$RUNNER_DIR"
+    cd "$RUNNER_DIR" || exit 97
     config_args=(
       --unattended
       --url "$RUNNER_URL"
@@ -1199,7 +1276,7 @@ if [ "$needs_config" -eq 1 ]; then
     if [ -n "$RUNNER_GROUP" ]; then
       config_args+=(--runnergroup "$RUNNER_GROUP")
     fi
-    ACTIONS_RUNNER_INPUT_TOKEN="$reg_token" ./config.sh "${config_args[@]}" 9>&-
+    ACTIONS_RUNNER_INPUT_TOKEN="$reg_token" "${RUNNER_DIR}/config.sh" "${config_args[@]}" 9>&-
   ) || config_rc=$?
 
   if [ "$config_rc" -ne 0 ]; then
@@ -1249,10 +1326,12 @@ if [ "$needs_config" -eq 0 ] && [ "$RECONFIGURE" -eq 0 ] && [ "$plist_matches" -
   rm -f "$CANDIDATE_PLIST"
   CANDIDATE_PLIST=""
   if [ "$is_loaded" -eq 1 ]; then
+    verify_runner_online 1 || exit 1
     echo "OK: ${RUNNER_NAME} unchanged; leaving loaded (${PLIST_LABEL})"
   else
     launchctl load -w "$PLIST_PATH" 9>&-
     launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-
+    verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS" || exit 1
     echo "OK: ${RUNNER_NAME} loaded (${PLIST_LABEL})"
   fi
 else
@@ -1264,5 +1343,12 @@ else
   CANDIDATE_PLIST=""
   launchctl load -w "$PLIST_PATH" 9>&-
   launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-
+  if ! verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS"; then
+    if [ "$needs_config" -eq 1 ]; then
+      stop_launchagent || true
+      exit 4
+    fi
+    exit 1
+  fi
   echo "OK: ${RUNNER_NAME} installed and loaded (${PLIST_LABEL})"
 fi
