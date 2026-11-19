@@ -632,34 +632,46 @@ backup_dirs=("$RUNNER_DIR_T"/.backup-pre-reconfigure.*)
 [ -f "${backup_dirs[0]}/.runner" ] || fail "preserved backup must retain .runner"
 pass "idempotent rerun skips reload, stop failure protects creds, and failed reconfigure fails closed with preserved backup"
 
-# 11. Lifecycle lock blocks concurrent mutating operations, ignores --dry-run/--verify, and reclaims stale dead-PID locks.
-LOCK_DIR_T="$TMP/home/.local/state/ezgha/setup-native-macos-runner.org.jleechanorg.ezgha-native-macos-runner.lock"
-mkdir -p "$LOCK_DIR_T"
-sleep 30 &
+# 11. Kernel flock serializes mutating operations, ignores --dry-run/--verify, and releases immediately on SIGKILL.
+LOCK_FILE_T="$TMP/home/.local/state/ezgha/setup-native-macos-runner.org.jleechanorg.ezgha-native-macos-runner.flock"
+rm -f "$TMP/setup-flock.ready"
+python3 - "$LOCK_FILE_T" "$TMP/setup-flock.ready" <<'PY' &
+import fcntl, sys, time
+from pathlib import Path
+
+lock_path = Path(sys.argv[1])
+ready_path = Path(sys.argv[2])
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+f = open(lock_path, "a+")
+fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+ready_path.write_text("locked\n")
+time.sleep(30)
+PY
 holder_pid=$!
-printf '%s\n' "$holder_pid" > "$LOCK_DIR_T/pid"
+while [ ! -f "$TMP/setup-flock.ready" ]; do sleep 0.05; done
 
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
-  "$SETUP_SCRIPT" --dry-run >/dev/null || fail "--dry-run must not block on lifecycle lock"
+  "$SETUP_SCRIPT" --dry-run >/dev/null || fail "--dry-run must not block on lifecycle flock"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 : > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
-  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify must not block on lifecycle lock"
+  "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify --offline must not block on lifecycle flock"
 
 if SETUP_LOCK_TIMEOUT_SEC=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
     "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
-  kill "$holder_pid" 2>/dev/null || true
+  kill -9 "$holder_pid" 2>/dev/null || true
   wait "$holder_pid" 2>/dev/null || true
-  fail "mutating --uninstall must fail when lifecycle lock is held by a live PID"
+  fail "mutating --uninstall must fail when lifecycle flock is held by a live process"
 fi
-kill "$holder_pid" 2>/dev/null || true
-wait "$holder_pid" 2>/dev/null || true
 
-printf '%s\n' "$holder_pid" > "$LOCK_DIR_T/pid"
+# SIGKILL active flock holder -> next mutating --uninstall immediately acquires the kernel lock and succeeds.
+kill -9 "$holder_pid" 2>/dev/null || true
+wait "$holder_pid" 2>/dev/null || true
 SETUP_LOCK_TIMEOUT_SEC=5 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
-  "$SETUP_SCRIPT" --uninstall >/dev/null || fail "mutating --uninstall must reclaim stale dead-PID lifecycle lock"
-[ ! -d "$LOCK_DIR_T" ] || fail "lifecycle lockdir must be released on exit"
-pass "lifecycle lock serializes mutating operations, skips --dry-run/--verify, and reclaims stale locks"
+  "$SETUP_SCRIPT" --uninstall >/dev/null || fail "mutating --uninstall must immediately acquire kernel flock after SIGKILL of holder"
+[ -f "$LOCK_FILE_T" ] || fail "flock inode must remain intact after release"
+[ ! -d "${LOCK_FILE_T%.flock}.lock" ] || fail "legacy .lock directory must not exist"
+pass "kernel flock serializes mutating operations, skips --dry-run/--verify, and releases immediately on SIGKILL"
 
 # 12. run-helper.sh.template readiness + .env preservation.
 rm -f "$RUNNER_DIR_T/run-helper.sh.template"
@@ -755,12 +767,9 @@ REPO_META_JSON='{"private":false}' FORK_APPROVAL_JSON='{"approval_policy":"first
 [ "$pub_repo_rc" -eq 5 ] || fail "public --repo with first_time_contributors must exit 5 (got $pub_repo_rc)"
 pass "server-side fork protection, --runner-group, --allow-public-fork-exposure, and --repo checks hold"
 
-# 15. Two-contender concurrent stale-lock recovery proves mutual exclusion across critical section.
+# 15. Two-contender concurrent mutating runs prove kernel flock mutual exclusion across critical section.
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
   "$SETUP_SCRIPT" --uninstall >/dev/null
-mkdir -p "$LOCK_DIR_T"
-printf '%s\n' "$holder_pid" > "$LOCK_DIR_T/pid"
-date +%s > "$LOCK_DIR_T/ts"
 : > "$TMP/setup-race.trace"
 LAUNCHCTL_RACE_TAG=1 LAUNCHCTL_TRACE_FILE="$TMP/setup-race.trace" LAUNCHCTL_TRACE_SLEEP=0.5 \
   SETUP_LOCK_TIMEOUT_SEC=10 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
@@ -772,9 +781,9 @@ LAUNCHCTL_RACE_TAG=2 LAUNCHCTL_TRACE_FILE="$TMP/setup-race.trace" LAUNCHCTL_TRAC
 spid2=$!
 src1=0; wait "$spid1" || src1=$?
 src2=0; wait "$spid2" || src2=$?
-[ "$src1" -eq 0 ] && [ "$src2" -eq 0 ] || fail "two-contender setup lock recovery must succeed for both contenders (rc1=$src1 rc2=$src2)"
-[ ! -d "$LOCK_DIR_T" ] && [ ! -d "${LOCK_DIR_T}.reclaim" ] || fail "setup lockdir and reclaim mutex must both be released"
-TRACE_FILE="$TMP/setup-race.trace" python3 - <<'PY' || fail "two-contender setup lock allowed concurrent entry"
+[ "$src1" -eq 0 ] && [ "$src2" -eq 0 ] || fail "two-contender setup flock must succeed for both contenders (rc1=$src1 rc2=$src2)"
+[ -f "$LOCK_FILE_T" ] && [ ! -d "${LOCK_FILE_T%.flock}.lock" ] && [ ! -d "${LOCK_FILE_T%.flock}.lock.reclaim" ] || fail "setup flock must leave no legacy lockdir"
+TRACE_FILE="$TMP/setup-race.trace" python3 - <<'PY' || fail "two-contender setup flock allowed concurrent entry"
 import os
 from pathlib import Path
 lines = [l.strip() for l in Path(os.environ["TRACE_FILE"]).read_text().splitlines() if l.strip()]
@@ -783,7 +792,7 @@ assert lines[0].startswith("ENTER ") and lines[1] == "EXIT " + lines[0].split()[
 assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[1], f"overlap detected: {lines!r}"
 assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
 PY
-pass "two-contender setup stale-lock recovery enforces mutual exclusion"
+pass "two-contender setup kernel flock enforces mutual exclusion"
 
 # 16. Round-11 P0 hardening: --offline mutating rejection, ALLOW_PUBLIC_FORK_EXPOSURE validation,
 #     .ezgha-group + agentId + live group membership binding, and lstart-based live lock protection.
@@ -859,35 +868,54 @@ if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/disk
   fail "--verify must fail closed when .ezgha-group is missing for --runner-group"
 fi
 printf 'macos-restricted\n' > "$RUNNER_DIR_T/.ezgha-group"
+pass "flag validation and runner-group/agentId binding hold"
 
-# Live lock with matching lstart + old ts (>900s) must NOT be evicted; mismatched lstart (PID reuse) IS reclaimed.
-mkdir -p "$LOCK_DIR_T"
-sleep 30 &
-live_setup_pid=$!
-live_setup_lstart="$(ps -p "$live_setup_pid" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-printf '%s\n' "$live_setup_lstart" > "$LOCK_DIR_T/lstart"
-printf '%s\n' "$live_setup_pid" > "$LOCK_DIR_T/pid"
-printf '1000\n' > "$LOCK_DIR_T/ts"
-if SETUP_LOCK_TIMEOUT_SEC=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
-    "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
-  kill "$live_setup_pid" 2>/dev/null || true
-  wait "$live_setup_pid" 2>/dev/null || true
-  fail "live setup lock with matching pid+lstart must NOT be evicted regardless of age"
-fi
-[ -d "$LOCK_DIR_T" ] && [ "$(tr -d '[:space:]' < "$LOCK_DIR_T/pid")" = "$live_setup_pid" ] || {
-  kill "$live_setup_pid" 2>/dev/null || true
-  wait "$live_setup_pid" 2>/dev/null || true
-  fail "timed-out contender must leave live owner lock untouched"
-}
+# 17. Isolating top-level symlinks from EXISTING_RUNNER_DIR (e.g., bin -> $EXISTING_RUNNER_DIR/bin.2.338.2)
+#     and enforcing chmod 600 on .credentials / .credentials_rsaparams after config.sh.
+EXISTING_SYM="$TMP/existing-sym-runner"
+ISOLATED_SYM="$TMP/home/isolated-sym-runner"
+mkdir -p "$EXISTING_SYM/bin.2.338.2" "$EXISTING_SYM/externals.2.338.2/node20/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$EXISTING_SYM/bin.2.338.2/Runner.Listener"
+chmod +x "$EXISTING_SYM/bin.2.338.2/Runner.Listener"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$EXISTING_SYM/externals.2.338.2/node20/bin/node"
+chmod +x "$EXISTING_SYM/externals.2.338.2/node20/bin/node"
+ln -sfn "$EXISTING_SYM/bin.2.338.2" "$EXISTING_SYM/bin"
+ln -sfn "$EXISTING_SYM/externals.2.338.2" "$EXISTING_SYM/externals"
+cat > "$EXISTING_SYM/config.sh" <<STUB
+#!/usr/bin/env bash
+set -euo pipefail
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "\$(pwd)/.runner"
+umask 022
+printf 'creds\n' > "\$(pwd)/.credentials"
+printf 'rsa\n' > "\$(pwd)/.credentials_rsaparams"
+STUB
+chmod +x "$EXISTING_SYM/config.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$EXISTING_SYM/run.sh"
+chmod +x "$EXISTING_SYM/run.sh"
+: > "$EXISTING_SYM/run-helper.sh.template"
 
-printf 'Thu Jan 01 00:00:00 1970\n' > "$LOCK_DIR_T/lstart"
-SETUP_LOCK_TIMEOUT_SEC=5 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
-  "$SETUP_SCRIPT" --uninstall >/dev/null || {
-  kill "$live_setup_pid" 2>/dev/null || true
-  wait "$live_setup_pid" 2>/dev/null || true
-  fail "setup lock with mismatched lstart (PID reuse) must be reclaimed"
-}
-kill "$live_setup_pid" 2>/dev/null || true
-wait "$live_setup_pid" 2>/dev/null || true
-[ ! -d "$LOCK_DIR_T" ] || fail "setup lockdir must be released after PID-reuse reclaim"
-pass "flag validation, runner-group/agentId binding, and lstart live-lock protection hold"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  EXISTING_RUNNER_DIR="$EXISTING_SYM" "$SETUP_SCRIPT" --runner-dir "$ISOLATED_SYM" --runner-group macos-restricted >/dev/null
+
+[ -L "$ISOLATED_SYM/bin" ] || fail "cloned bin must be a symlink"
+[ "$(readlink "$ISOLATED_SYM/bin")" = "bin.2.338.2" ] || fail "cloned bin symlink must be relative bin.2.338.2 (got: $(readlink "$ISOLATED_SYM/bin"))"
+[ -L "$ISOLATED_SYM/externals" ] || fail "cloned externals must be a symlink"
+[ "$(readlink "$ISOLATED_SYM/externals")" = "externals.2.338.2" ] || fail "cloned externals symlink must be relative externals.2.338.2 (got: $(readlink "$ISOLATED_SYM/externals"))"
+ISOLATED_SYM="$ISOLATED_SYM" EXISTING_SYM="$EXISTING_SYM" python3 - <<'PY' || fail "cloned symlink resolution or credential permissions check failed"
+import os
+from pathlib import Path
+
+isolated = Path(os.environ["ISOLATED_SYM"]).resolve()
+existing = Path(os.environ["EXISTING_SYM"]).resolve()
+bin_real = (isolated / "bin").resolve()
+ext_real = (isolated / "externals").resolve()
+assert bin_real == isolated / "bin.2.338.2", f"bin resolved to {bin_real}, expected {isolated / 'bin.2.338.2'}"
+assert ext_real == isolated / "externals.2.338.2", f"externals resolved to {ext_real}, expected {isolated / 'externals.2.338.2'}"
+assert existing not in bin_real.parents and bin_real != existing, f"bin leaked into existing runner dir: {bin_real}"
+assert existing not in ext_real.parents and ext_real != existing, f"externals leaked into existing runner dir: {ext_real}"
+for cred in (".credentials", ".credentials_rsaparams"):
+    mode = os.stat(isolated / cred).st_mode & 0o777
+    assert mode == 0o600, f"{cred} mode={oct(mode)}, expected 0o600"
+PY
+pass "cloned absolute symlinks resolve inside RUNNER_DIR as relative symlinks and credentials are chmod 600"

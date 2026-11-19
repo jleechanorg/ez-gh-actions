@@ -95,10 +95,33 @@ case "$ALLOW_PUBLIC_FORK_EXPOSURE" in
   *) echo "ERROR: invalid ALLOW_PUBLIC_FORK_EXPOSURE='$ALLOW_PUBLIC_FORK_EXPOSURE' (expected 0 or 1)" >&2; exit 2 ;;
 esac
 
-canonical_path() {
-  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+resolve_python3() {
+  local cand=""
+  if [ -n "${PYTHON3_BIN:-}" ] && [ -x "${PYTHON3_BIN}" ]; then
+    printf '%s' "$PYTHON3_BIN"
+    return 0
+  fi
+  cand="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$cand" ] && [ -x "$cand" ]; then
+    printf '%s' "$cand"
+    return 0
+  fi
+  for cand in /usr/bin/python3 /opt/homebrew/bin/python3; do
+    if [ -x "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
 }
 
+canonical_path() {
+  local py_bin
+  py_bin="$(resolve_python3)" || { echo "ERROR: python3 not found" >&2; return 1; }
+  "$py_bin" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
+EXISTING_RUNNER_DIR_RAW="${EXISTING_RUNNER_DIR%/}"
 RUNNER_DIR="$(canonical_path "$RUNNER_DIR")"
 EXISTING_RUNNER_DIR="$(canonical_path "$EXISTING_RUNNER_DIR")"
 RESERVED_TF_HOME="$(canonical_path "$HOME/actions-runner")"
@@ -108,34 +131,17 @@ RESERVED_SMTP_OP="$(canonical_path "/Users/jleechan/actions-runner-smtp-egress")
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
 STATE_LOCK_TIMEOUT_SEC="${SETUP_LOCK_TIMEOUT_SEC:-30}"
-SETUP_LOCK_DIR=""
-SETUP_LOCK_LSTART=""
-SETUP_LOCK_RECLAIM_DIR=""
+SETUP_LOCK_FILE=""
+SETUP_LOCK_HELD=0
 STAGE_DIR=""
 TMP_TGZ=""
 BACKUP_DIR=""
 CANDIDATE_PLIST=""
 
 release_setup_lock() {
-  if [ -n "${SETUP_LOCK_DIR:-}" ] && [ -d "$SETUP_LOCK_DIR" ]; then
-    local lock_owner_pid="" lock_owner_lstart=""
-    lock_owner_pid="$(tr -d '[:space:]' < "${SETUP_LOCK_DIR}/pid" 2>/dev/null || true)"
-    lock_owner_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "${SETUP_LOCK_DIR}/lstart" 2>/dev/null | tr -d '\r\n' || true)"
-    if [ "$lock_owner_pid" = "$$" ] && { [ -z "${SETUP_LOCK_LSTART:-}" ] || [ "$lock_owner_lstart" = "$SETUP_LOCK_LSTART" ]; }; then
-      local rel_dir="${SETUP_LOCK_DIR}.release.$$"
-      if mv "$SETUP_LOCK_DIR" "$rel_dir" 2>/dev/null; then
-        rm -rf "$rel_dir" 2>/dev/null || true
-      else
-        rm -f "${SETUP_LOCK_DIR}/pid" "${SETUP_LOCK_DIR}/lstart" 2>/dev/null || true
-        rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
-      fi
-    fi
-    SETUP_LOCK_DIR=""
-    SETUP_LOCK_LSTART=""
-  fi
-  if [ -n "${SETUP_LOCK_RECLAIM_DIR:-}" ] && [ -d "$SETUP_LOCK_RECLAIM_DIR" ]; then
-    rmdir "$SETUP_LOCK_RECLAIM_DIR" 2>/dev/null || rm -rf "$SETUP_LOCK_RECLAIM_DIR" 2>/dev/null || true
-    SETUP_LOCK_RECLAIM_DIR=""
+  if [ "${SETUP_LOCK_HELD:-0}" -eq 1 ]; then
+    exec 9>&- 2>/dev/null || true
+    SETUP_LOCK_HELD=0
   fi
 }
 
@@ -149,92 +155,53 @@ trap cleanup_setup EXIT
 
 acquire_setup_lock() {
   local state_dir="${HOME}/.local/state/ezgha"
-  local safe_label lockdir reclaim_dir pidfile lstartfile deadline
-  local owner_pid="" saved_lstart="" cur_lstart="" self_lstart="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
+  local safe_label py_bin="" rc=0
   safe_label="$(printf '%s' "$PLIST_LABEL" | tr -cd 'A-Za-z0-9_.-')"
-  lockdir="${state_dir}/setup-native-macos-runner.${safe_label}.lock"
-  reclaim_dir="${lockdir}.reclaim"
-  pidfile="${lockdir}/pid"
-  lstartfile="${lockdir}/lstart"
-  deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
-  mkdir -p "$state_dir"
-  while true; do
-    if mkdir "$lockdir" 2>/dev/null; then
-      self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-      printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
-      printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-      SETUP_LOCK_DIR="$lockdir"
-      SETUP_LOCK_LSTART="$self_lstart"
-      return 0
+  SETUP_LOCK_FILE="${state_dir}/setup-native-macos-runner.${safe_label}.flock"
+  if ! py_bin="$(resolve_python3)"; then
+    echo "ERROR: python3 not found; cannot acquire setup lock $SETUP_LOCK_FILE" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$SETUP_LOCK_FILE")"
+  if ! exec 9>>"$SETUP_LOCK_FILE"; then
+    echo "ERROR: failed to open setup lock $SETUP_LOCK_FILE" >&2
+    return 1
+  fi
+  chmod 600 "$SETUP_LOCK_FILE" 2>/dev/null || true
+  "$py_bin" - "$STATE_LOCK_TIMEOUT_SEC" <<'PY' || rc=$?
+import errno
+import fcntl
+import sys
+import time
+
+timeout = max(0.0, float(sys.argv[1]))
+deadline = time.monotonic() + timeout
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            print(f"ERROR: flock failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+PY
+  if [ "$rc" -ne 0 ]; then
+    exec 9>&- 2>/dev/null || true
+    if [ "$rc" -eq 1 ]; then
+      echo "ERROR: timed out waiting for setup lock $SETUP_LOCK_FILE" >&2
     fi
-    if mkdir "$reclaim_dir" 2>/dev/null; then
-      SETUP_LOCK_RECLAIM_DIR="$reclaim_dir"
-      if [ ! -d "$lockdir" ]; then
-        missing_pid_polls=0
-        rmdir "$reclaim_dir" 2>/dev/null || true
-        SETUP_LOCK_RECLAIM_DIR=""
-        continue
-      fi
-      owner_pid=""
-      if [ -f "$pidfile" ]; then
-        owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-      fi
-      saved_lstart=""
-      if [ -f "$lstartfile" ]; then
-        saved_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$lstartfile" 2>/dev/null | tr -d '\r\n' || true)"
-      fi
-      should_reclaim=0
-      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
-        missing_pid_polls=0
-        if ! kill -0 "$owner_pid" 2>/dev/null; then
-          should_reclaim=1
-        else
-          cur_lstart="$(ps -p "$owner_pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-          if [ -n "$saved_lstart" ] && [ -n "$cur_lstart" ] && [ "$cur_lstart" != "$saved_lstart" ]; then
-            should_reclaim=1
-          fi
-        fi
-      else
-        missing_pid_polls=$((missing_pid_polls + 1))
-        if [ "$missing_pid_polls" -ge 10 ]; then
-          should_reclaim=1
-          missing_pid_polls=0
-        fi
-      fi
-      reclaimed=0
-      if [ "$should_reclaim" -eq 1 ]; then
-        if mv "$lockdir" "${lockdir}.stale.$$" 2>/dev/null; then
-          rm -rf "${lockdir}.stale.$$" 2>/dev/null || true
-          if mkdir "$lockdir" 2>/dev/null; then
-            self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-            printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
-            printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-            SETUP_LOCK_DIR="$lockdir"
-            SETUP_LOCK_LSTART="$self_lstart"
-            rmdir "$reclaim_dir" 2>/dev/null || true
-            SETUP_LOCK_RECLAIM_DIR=""
-            return 0
-          fi
-          reclaimed=1
-        fi
-      fi
-      rmdir "$reclaim_dir" 2>/dev/null || true
-      SETUP_LOCK_RECLAIM_DIR=""
-      if [ "$reclaimed" -eq 1 ]; then
-        continue
-      fi
-    fi
-    if (( SECONDS >= deadline )); then
-      echo "ERROR: timed out waiting for setup lock $lockdir" >&2
-      return 1
-    fi
-    sleep 0.2
-  done
+    return 1
+  fi
+  SETUP_LOCK_HELD=1
+  return 0
 }
 
 launchagent_confirmed_unloaded() {
   local gui_target="$1" out="" rc=0
-  out="$(launchctl print "$gui_target" 2>&1)" || rc=$?
+  out="$(launchctl print "$gui_target" 2>&1 9>&-)" || rc=$?
   if [ "$rc" -eq 0 ]; then
     return 1
   fi
@@ -252,10 +219,10 @@ stop_launchagent() {
   uid="$(id -u)"
   gui_target="gui/${uid}/${PLIST_LABEL}"
   if [ -f "$PLIST_PATH" ]; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    launchctl unload "$PLIST_PATH" 2>/dev/null 9>&- || true
   fi
-  if launchctl print "$gui_target" >/dev/null 2>&1; then
-    launchctl bootout "$gui_target" 2>/dev/null || true
+  if launchctl print "$gui_target" >/dev/null 2>&1 9>&-; then
+    launchctl bootout "$gui_target" 2>/dev/null 9>&- || true
   fi
   local _attempt
   for _attempt in 1 2 3 4 5; do
@@ -291,11 +258,12 @@ fi
 
 # Fail-closed guard: never touch $HOME, /, or TestFlight/SMTP-egress runner directories (including case-insensitive APFS aliases and parents).
 is_reserved_runner_dir() {
-  local target="$1"
+  local target="$1" py_bin=""
   shift
   [ -n "$target" ] || return 0
   [ "$target" != "/" ] || return 0
-  python3 - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" "$@" <<'PY'
+  py_bin="$(resolve_python3)" || return 0
+  "$py_bin" - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" "$@" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -546,12 +514,12 @@ verify_server_fork_protection() {
   VERIFIED_RUNNER_GROUP_ID=""
   local is_priv="" pol="" groups_json="" group_json="" allows_pub=""
   if [ -n "$RUNNER_REPO" ]; then
-    if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private')"; then
+    if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private' 9>&-)"; then
       echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
       exit 5
     fi
     if [ "$is_priv" != "true" ]; then
-      if ! pol="$("$GH_BIN" api "repos/${RUNNER_REPO}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""')"; then
+      if ! pol="$("$GH_BIN" api "repos/${RUNNER_REPO}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
         echo "ERROR: failed to query fork PR contributor approval policy for repo '${RUNNER_REPO}'" >&2
         exit 5
       fi
@@ -561,7 +529,7 @@ verify_server_fork_protection() {
       fi
     fi
   else
-    if ! groups_json="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups")"; then
+    if ! groups_json="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups" 9>&-)"; then
       echo "ERROR: failed to query runner groups for org '${RUNNER_ORG}'" >&2
       exit 5
     fi
@@ -573,7 +541,7 @@ verify_server_fork_protection() {
     VERIFIED_RUNNER_GROUP_ID="$(printf '%s\n' "$group_json" | jq -r '.id // empty')"
     allows_pub="$(printf '%s\n' "$group_json" | jq -r '.allows_public_repositories')"
     if [ "$allows_pub" = "true" ]; then
-      if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""')"; then
+      if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
         echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
         exit 5
       fi
@@ -597,7 +565,8 @@ if [ "$VERIFY" -eq 1 ]; then
   [ -f "${RUNNER_DIR}/.runner" ] || { echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.ezgha-labels" ] || { echo "FAIL: missing ${RUNNER_DIR}/.ezgha-labels" >&2; exit 1; }
   [ -f "$PLIST_PATH" ] || { echo "FAIL: missing $PLIST_PATH" >&2; exit 1; }
-  python3 - "$PLIST_PATH" "$PLIST_LABEL" "$RUNNER_DIR" <<'PY' || exit 1
+  py_bin="$(resolve_python3)" || { echo "FAIL: python3 not found" >&2; exit 1; }
+  "$py_bin" - "$PLIST_PATH" "$PLIST_LABEL" "$RUNNER_DIR" <<'PY' || exit 1
 import os
 import plistlib
 import sys
@@ -647,7 +616,7 @@ PY
   if [ "$OFFLINE" -eq 0 ]; then
     command -v "$GH_BIN" >/dev/null 2>&1 || { echo "FAIL: gh binary '$GH_BIN' not found (pass --offline to skip live GitHub check)" >&2; exit 1; }
     verify_server_fork_protection
-    runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API")"
+    runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"
     if [ -n "$local_agent_id" ]; then
       if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]]; then
         echo "FAIL: .runner agentId='$local_agent_id' is not numeric" >&2
@@ -663,7 +632,7 @@ PY
       live_runner_id="$(printf '%s\n' "$runner_json" | jq -r '.id // empty')"
       [ -n "$live_runner_id" ] || { echo "FAIL: live runner '$RUNNER_NAME' missing .id in $RUNNERS_API" >&2; exit 1; }
       [ -n "$VERIFIED_RUNNER_GROUP_ID" ] || { echo "FAIL: missing runner group id for '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2; exit 1; }
-      group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners")"
+      group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners" 9>&-)"
       in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$live_runner_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"
       [ "$in_group" -ge 1 ] || { echo "FAIL: runner '$RUNNER_NAME' (id=$live_runner_id) is not a member of org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2; exit 1; }
     fi
@@ -686,7 +655,7 @@ PY
     echo "FAIL: missing .ezgha-group for --runner-group '$RUNNER_GROUP'" >&2
     exit 1
   fi
-  launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null || { echo "FAIL: launchd job ${PLIST_LABEL} not loaded" >&2; exit 1; }
+  launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&- || { echo "FAIL: launchd job ${PLIST_LABEL} not loaded" >&2; exit 1; }
   echo "OK: ${RUNNER_NAME} verified at ${RUNNER_DIR} (work=${WORK_DIR}, labels=${RUNNER_LABELS})"
   exit 0
 fi
@@ -722,6 +691,7 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
   STAGE_DIR="$(mktemp -d "${RUNNER_DIR}.stage.XXXXXX")"
   if runner_binaries_ready "$EXISTING_RUNNER_DIR"; then
     echo "Provisioning runner binaries via staged clone from ${EXISTING_RUNNER_DIR}..."
+    existing_canon="$(canonical_path "$EXISTING_RUNNER_DIR")"
     shopt -s nullglob
     for item in "${EXISTING_RUNNER_DIR}"/bin* "${EXISTING_RUNNER_DIR}"/externals* \
                 "${EXISTING_RUNNER_DIR}/config.sh" "${EXISTING_RUNNER_DIR}/run.sh" \
@@ -729,14 +699,38 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
                 "${EXISTING_RUNNER_DIR}/safe_sleep.sh"; do
       [ -e "$item" ] || continue
       base="$(basename "$item")"
-      cp -Rc "$item" "${STAGE_DIR}/${base}" 2>/dev/null || cp -a "$item" "${STAGE_DIR}/${base}"
+      if [ -L "$item" ]; then
+        link_target="$(readlink "$item")"
+        if [[ "$link_target" != /* && "$link_target" != *..* ]]; then
+          ln -sfn "$link_target" "${STAGE_DIR}/${base}"
+        else
+          rel_target=""
+          if [[ "$link_target" == "${EXISTING_RUNNER_DIR_RAW}/"* ]]; then
+            rel_target="${link_target#"${EXISTING_RUNNER_DIR_RAW}/"}"
+          elif [[ "$link_target" == "${existing_canon}/"* ]]; then
+            rel_target="${link_target#"${existing_canon}/"}"
+          else
+            target_canon="$(canonical_path "$link_target" 2>/dev/null || true)"
+            if [[ "$target_canon" == "${existing_canon}/"* ]]; then
+              rel_target="${target_canon#"${existing_canon}/"}"
+            fi
+          fi
+          if [ -n "$rel_target" ] && [[ "$rel_target" != /* && "$rel_target" != *..* ]]; then
+            ln -sfn "$rel_target" "${STAGE_DIR}/${base}"
+          else
+            cp -RL "$item" "${STAGE_DIR}/${base}"
+          fi
+        fi
+      else
+        cp -Rc "$item" "${STAGE_DIR}/${base}" 2>/dev/null || cp -a "$item" "${STAGE_DIR}/${base}"
+      fi
     done
     shopt -u nullglob
   else
     echo "Downloading actions-runner v${RUNNER_VERSION} (osx-arm64)..."
     TMP_TGZ="$(mktemp)"
     tarball_url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
-    curl -fsSL "$tarball_url" -o "$TMP_TGZ"
+    curl -fsSL "$tarball_url" -o "$TMP_TGZ" 9>&-
     tar -xzf "$TMP_TGZ" -C "$STAGE_DIR"
     rm -f "$TMP_TGZ"
     TMP_TGZ=""
@@ -751,7 +745,7 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
   fi
   shopt -s nullglob
   for item in "${STAGE_DIR}"/*; do
-    [ -e "$item" ] || continue
+    [ -e "$item" ] || [ -L "$item" ] || continue
     base="$(basename "$item")"
     rm -rf "${RUNNER_DIR:?}/${base}"
     mv "$item" "${RUNNER_DIR}/${base}"
@@ -775,7 +769,7 @@ if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_
 fi
 
 if [ "$needs_config" -eq 1 ]; then
-  reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token')"
+  reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)"
   [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
   if ! stop_launchagent; then
     echo "ERROR: failed to stop ${PLIST_LABEL}; aborting before removing existing credentials" >&2
@@ -808,7 +802,7 @@ if [ "$needs_config" -eq 1 ]; then
     if [ -n "$RUNNER_GROUP" ]; then
       config_args+=(--runnergroup "$RUNNER_GROUP")
     fi
-    ./config.sh "${config_args[@]}"
+    ./config.sh "${config_args[@]}" 9>&-
   ) || config_rc=$?
 
   if [ "$config_rc" -ne 0 ]; then
@@ -817,6 +811,7 @@ if [ "$needs_config" -eq 1 ]; then
     exit 4
   fi
 
+  chmod 600 "${RUNNER_DIR}/.credentials" "${RUNNER_DIR}/.credentials_rsaparams" 2>/dev/null || true
   rm -rf "$BACKUP_DIR"
   BACKUP_DIR=""
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"
@@ -834,7 +829,7 @@ if [ -f "$PLIST_PATH" ] && cmp -s "$CANDIDATE_PLIST" "$PLIST_PATH"; then
   plist_matches=1
 fi
 is_loaded=0
-if launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1; then
+if launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1 9>&-; then
   is_loaded=1
 fi
 
@@ -844,8 +839,8 @@ if [ "$needs_config" -eq 0 ] && [ "$RECONFIGURE" -eq 0 ] && [ "$plist_matches" -
   if [ "$is_loaded" -eq 1 ]; then
     echo "OK: ${RUNNER_NAME} unchanged; leaving loaded (${PLIST_LABEL})"
   else
-    launchctl load -w "$PLIST_PATH"
-    launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null
+    launchctl load -w "$PLIST_PATH" 9>&-
+    launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-
     echo "OK: ${RUNNER_NAME} loaded (${PLIST_LABEL})"
   fi
 else
@@ -855,7 +850,7 @@ else
   fi
   mv "$CANDIDATE_PLIST" "$PLIST_PATH"
   CANDIDATE_PLIST=""
-  launchctl load -w "$PLIST_PATH"
-  launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null
+  launchctl load -w "$PLIST_PATH" 9>&-
+  launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-
   echo "OK: ${RUNNER_NAME} installed and loaded (${PLIST_LABEL})"
 fi

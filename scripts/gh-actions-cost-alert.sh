@@ -94,6 +94,26 @@ if [ "$DRY_RUN" -eq 0 ] && [ -z "$GCLOUD_BIN" ]; then
   exit 3
 fi
 
+resolve_python3() {
+  local cand=""
+  if [ -n "${PYTHON3_BIN:-}" ] && [ -x "${PYTHON3_BIN}" ]; then
+    printf '%s' "$PYTHON3_BIN"
+    return 0
+  fi
+  cand="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$cand" ] && [ -x "$cand" ]; then
+    printf '%s' "$cand"
+    return 0
+  fi
+  for cand in /usr/bin/python3 /opt/homebrew/bin/python3; do
+    if [ -x "$cand" ]; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 run_with_timeout() {
   local timeout_sec="$1"
   shift
@@ -104,14 +124,17 @@ run_with_timeout() {
     timeout_bin="gtimeout"
   fi
   if [ -n "$timeout_bin" ]; then
-    "$timeout_bin" -k 5 "$timeout_sec" "$@" || rc=$?
+    "$timeout_bin" -k 5 "$timeout_sec" "$@" 9>&- || rc=$?
     return "$rc"
   fi
   # Capture stdout via a temp file so any orphaned child (e.g. sleep inside a stub/subshell)
   # cannot keep a command-substitution pipe open after the main child is killed on timeout.
   local out_tmp
   out_tmp="$(mktemp)"
-  "$@" > "$out_tmp" &
+  (
+    exec 9>&- 2>/dev/null || true
+    exec "$@"
+  ) > "$out_tmp" &
   local pid=$!
   local deadline=$((SECONDS + timeout_sec))
   while kill -0 "$pid" 2>/dev/null && (( SECONDS < deadline )); do
@@ -179,7 +202,7 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   GCP_ARGS=(--project="$GCP_PROJECT" --account="$GCP_ACCOUNT")
   rc=0
   existing_raw="$(run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies list "${GCP_ARGS[@]}" \
-      --filter="displayName=\"$POLICY_DISPLAY_NAME\"" --format='value(name)' 2>"$POLICY_ERR")" || rc=$?
+      --filter="displayName=\"$POLICY_DISPLAY_NAME\"" --format='value(name)' 2>"$POLICY_ERR" 9>&-)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     cat "$POLICY_ERR" >&2
     exit "$rc"
@@ -187,7 +210,7 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
   existing="$(printf '%s\n' "$existing_raw" | head -1)"
   if [ -n "$existing" ]; then
     rc=0
-    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR" || rc=$?
+    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies update "$existing" --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR" 9>&- || rc=$?
     if [ "$rc" -ne 0 ]; then
       cat "$POLICY_ERR" >&2
       exit "$rc"
@@ -195,7 +218,7 @@ if [ "$ENSURE_POLICY" -eq 1 ]; then
     echo "[$NOW_ISO] updated policy '$POLICY_DISPLAY_NAME'"
   else
     rc=0
-    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR" || rc=$?
+    run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" alpha monitoring policies create --policy-from-file="$POLICY_FILE" "${GCP_ARGS[@]}" >/dev/null 2>"$POLICY_ERR" 9>&- || rc=$?
     if [ "$rc" -ne 0 ]; then
       cat "$POLICY_ERR" >&2
       exit "$rc"
@@ -246,7 +269,7 @@ emit() { # severity status day message gross_usd net_usd macos_min top_repo [mod
     echo "[$NOW_ISO] [dry-run] $payload"
   else
     run_with_timeout "$GCLOUD_CALL_TIMEOUT_SEC" "$GCLOUD_BIN" logging write "$LOG_NAME" "$payload" --payload-type=json \
-      --severity="$severity" --project="$GCP_PROJECT" --account="$GCP_ACCOUNT" >/dev/null
+      --severity="$severity" --project="$GCP_PROJECT" --account="$GCP_ACCOUNT" >/dev/null 9>&-
   fi
 }
 
@@ -268,31 +291,14 @@ else
 fi
 
 tmp="$(mktemp)"
-STATE_LOCK_DIR=""
-STATE_LOCK_LSTART=""
-STATE_LOCK_RECLAIM_DIR=""
+STATE_LOCK_FILE="${STATE_FILE}.flock"
+STATE_LOCK_HELD=0
 STATE_STAGE_TMP=""
 STATE_NEXT_TMP=""
 release_state_lock() {
-  if [ -n "${STATE_LOCK_DIR:-}" ] && [ -d "$STATE_LOCK_DIR" ]; then
-    local lock_owner_pid="" lock_owner_lstart=""
-    lock_owner_pid="$(tr -d '[:space:]' < "${STATE_LOCK_DIR}/pid" 2>/dev/null || true)"
-    lock_owner_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "${STATE_LOCK_DIR}/lstart" 2>/dev/null | tr -d '\r\n' || true)"
-    if [ "$lock_owner_pid" = "$$" ] && { [ -z "${STATE_LOCK_LSTART:-}" ] || [ "$lock_owner_lstart" = "$STATE_LOCK_LSTART" ]; }; then
-      local rel_dir="${STATE_LOCK_DIR}.release.$$"
-      if mv "$STATE_LOCK_DIR" "$rel_dir" 2>/dev/null; then
-        rm -rf "$rel_dir" 2>/dev/null || true
-      else
-        rm -f "${STATE_LOCK_DIR}/pid" "${STATE_LOCK_DIR}/lstart" 2>/dev/null || true
-        rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
-      fi
-    fi
-    STATE_LOCK_DIR=""
-    STATE_LOCK_LSTART=""
-  fi
-  if [ -n "${STATE_LOCK_RECLAIM_DIR:-}" ] && [ -d "$STATE_LOCK_RECLAIM_DIR" ]; then
-    rmdir "$STATE_LOCK_RECLAIM_DIR" 2>/dev/null || rm -rf "$STATE_LOCK_RECLAIM_DIR" 2>/dev/null || true
-    STATE_LOCK_RECLAIM_DIR=""
+  if [ "${STATE_LOCK_HELD:-0}" -eq 1 ]; then
+    exec 9>&- 2>/dev/null || true
+    STATE_LOCK_HELD=0
   fi
 }
 cleanup() {
@@ -304,85 +310,46 @@ cleanup() {
 trap cleanup EXIT
 
 acquire_state_lock() {
-  local lockdir="${STATE_FILE}.lock"
-  local reclaim_dir="${lockdir}.reclaim"
-  local pidfile="${lockdir}/pid"
-  local lstartfile="${lockdir}/lstart"
-  local deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
-  local owner_pid="" saved_lstart="" cur_lstart="" self_lstart="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
-  mkdir -p "$(dirname "$STATE_FILE")"
-  while true; do
-    if mkdir "$lockdir" 2>/dev/null; then
-      self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-      printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
-      printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-      STATE_LOCK_DIR="$lockdir"
-      STATE_LOCK_LSTART="$self_lstart"
-      return 0
+  local py_bin="" rc=0
+  if ! py_bin="$(resolve_python3)"; then
+    echo "FATAL: python3 not found; cannot acquire state lock $STATE_LOCK_FILE" >&2
+    return 1
+  fi
+  mkdir -p "$(dirname "$STATE_LOCK_FILE")"
+  if ! exec 9>>"$STATE_LOCK_FILE"; then
+    echo "FATAL: failed to open state lock $STATE_LOCK_FILE" >&2
+    return 1
+  fi
+  chmod 600 "$STATE_LOCK_FILE" 2>/dev/null || true
+  "$py_bin" - "$STATE_LOCK_TIMEOUT_SEC" <<'PY' || rc=$?
+import errno
+import fcntl
+import sys
+import time
+
+timeout = max(0.0, float(sys.argv[1]))
+deadline = time.monotonic() + timeout
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            print(f"FATAL: flock failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.1)
+PY
+  if [ "$rc" -ne 0 ]; then
+    exec 9>&- 2>/dev/null || true
+    if [ "$rc" -eq 1 ]; then
+      echo "FATAL: timed out waiting for state lock $STATE_LOCK_FILE" >&2
     fi
-    if mkdir "$reclaim_dir" 2>/dev/null; then
-      STATE_LOCK_RECLAIM_DIR="$reclaim_dir"
-      if [ ! -d "$lockdir" ]; then
-        missing_pid_polls=0
-        rmdir "$reclaim_dir" 2>/dev/null || true
-        STATE_LOCK_RECLAIM_DIR=""
-        continue
-      fi
-      owner_pid=""
-      if [ -f "$pidfile" ]; then
-        owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
-      fi
-      saved_lstart=""
-      if [ -f "$lstartfile" ]; then
-        saved_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$lstartfile" 2>/dev/null | tr -d '\r\n' || true)"
-      fi
-      should_reclaim=0
-      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
-        missing_pid_polls=0
-        if ! kill -0 "$owner_pid" 2>/dev/null; then
-          should_reclaim=1
-        else
-          cur_lstart="$(ps -p "$owner_pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-          if [ -n "$saved_lstart" ] && [ -n "$cur_lstart" ] && [ "$cur_lstart" != "$saved_lstart" ]; then
-            should_reclaim=1
-          fi
-        fi
-      else
-        missing_pid_polls=$((missing_pid_polls + 1))
-        if [ "$missing_pid_polls" -ge 10 ]; then
-          should_reclaim=1
-          missing_pid_polls=0
-        fi
-      fi
-      reclaimed=0
-      if [ "$should_reclaim" -eq 1 ]; then
-        if mv "$lockdir" "${lockdir}.stale.$$" 2>/dev/null; then
-          rm -rf "${lockdir}.stale.$$" 2>/dev/null || true
-          if mkdir "$lockdir" 2>/dev/null; then
-            self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-            printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
-            printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-            STATE_LOCK_DIR="$lockdir"
-            STATE_LOCK_LSTART="$self_lstart"
-            rmdir "$reclaim_dir" 2>/dev/null || true
-            STATE_LOCK_RECLAIM_DIR=""
-            return 0
-          fi
-          reclaimed=1
-        fi
-      fi
-      rmdir "$reclaim_dir" 2>/dev/null || true
-      STATE_LOCK_RECLAIM_DIR=""
-      if [ "$reclaimed" -eq 1 ]; then
-        continue
-      fi
-    fi
-    if (( SECONDS >= deadline )); then
-      echo "FATAL: timed out waiting for state lock $lockdir" >&2
-      return 1
-    fi
-    sleep 0.2
-  done
+    return 1
+  fi
+  STATE_LOCK_HELD=1
+  return 0
 }
 
 if [ "$DRY_RUN" -eq 1 ]; then

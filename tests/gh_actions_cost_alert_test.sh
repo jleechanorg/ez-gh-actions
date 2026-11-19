@@ -771,7 +771,8 @@ grep -q 'ALSO BLIND' "$TMP/gcloud-sinkrecover.log" || fail "single COST_SPIKE no
 [ "$(jq -r '.last_blind // 0' "$TMP/state-sinkfail.json")" != 0 ] || fail "combined notification must update last_blind"
 pass "fallback sink failure preserves api_failures and combines simultaneous COST_SPIKE + BLIND into one notification"
 
-# 18. Concurrent runs sharing STATE_FILE serialize via lockdir without losing state updates.
+# 18. Concurrent runs sharing STATE_FILE serialize via kernel flock without losing state updates,
+#     respect live flock timeout (WARNING BLIND + rc=4), and recover immediately after SIGKILL.
 printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-lock.json"
 cat > "$TMP/billing-lock1.json" <<'JSON'
 {
@@ -787,18 +788,32 @@ cat > "$TMP/billing-lock2.json" <<'JSON'
   ]
 }
 JSON
-GCLOUD_STUB_SLEEP=1 BILLING_FIXTURE="$TMP/billing-lock1.json" run_alert "$TMP/state-lock.json" "$TMP/gcloud-lock1.log" "$TMP/gh-lock1.log" >/dev/null &
+: > "$TMP/cost-race.trace"
+GH_RACE_TAG=1 GH_RACE_TRACE_FILE="$TMP/cost-race.trace" GCLOUD_STUB_SLEEP=0.8 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-lock.json" "$TMP/gcloud-lock1.log" "$TMP/gh-lock1.log" >/dev/null &
 pid1=$!
 sleep 0.2
-BILLING_FIXTURE="$TMP/billing-lock2.json" run_alert "$TMP/state-lock.json" "$TMP/gcloud-lock2.log" "$TMP/gh-lock2.log" >/dev/null &
+GH_RACE_TAG=2 GH_RACE_TRACE_FILE="$TMP/cost-race.trace" GCLOUD_STUB_SLEEP=0.4 BILLING_FIXTURE="$TMP/billing-lock2.json" \
+  run_alert "$TMP/state-lock.json" "$TMP/gcloud-lock2.log" "$TMP/gh-lock2.log" >/dev/null &
 pid2=$!
 rc1=0
 wait "$pid1" || rc1=$?
 rc2=0
 wait "$pid2" || rc2=$?
 [ "$rc1" -eq 0 ] && [ "$rc2" -eq 0 ] || fail "concurrent runs must both exit 0 (rc1=$rc1 rc2=$rc2)"
+[ -f "$TMP/state-lock.json.flock" ] || fail "kernel flock file must exist after runs"
+[ ! -d "$TMP/state-lock.json.lock" ] || fail "legacy .lock directory must not be created"
 [ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 1 sent key was lost"
 [ "$(jq -r '.sent["2026-11-18:COST_SPIKE"] // 0' "$TMP/state-lock.json")" != 0 ] || fail "concurrent run 2 sent key was lost"
+TRACE_FILE="$TMP/cost-race.trace" python3 - <<'PY' || fail "concurrent kernel flock allowed overlapping execution"
+import os
+from pathlib import Path
+lines = [l.strip() for l in Path(os.environ["TRACE_FILE"]).read_text().splitlines() if l.strip()]
+assert len(lines) == 4, f"expected 4 trace lines, got {lines!r}"
+assert lines[0].startswith("ENTER ") and lines[1] == "EXIT " + lines[0].split()[1], f"overlap detected: {lines!r}"
+assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[1], f"overlap detected: {lines!r}"
+assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
+PY
 
 # Verify same-filesystem state staging succeeds with separate TMPDIR and leaves no staging temp files behind.
 mkdir -p "$TMP/separate-tmpdir" "$TMP/state-dir"
@@ -809,110 +824,55 @@ shopt -s nullglob
 leftover_stage=("$TMP/state-dir"/state.json.tmp.* "$TMP/state-dir"/state.json.next.*)
 shopt -u nullglob
 [ "${#leftover_stage[@]}" -eq 0 ] || fail "leftover state staging files found: ${leftover_stage[*]}"
-
-# Abandoned empty (ownerless) lockdir and stale dead-PID lockdir must both be reclaimed cleanly.
-mkdir -p "$TMP/state-ownerless.json.lock"
-ownerless_err="$(
-  STATE_LOCK_TIMEOUT_SEC=8 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-    run_alert "$TMP/state-ownerless.json" "$TMP/gcloud-ownerless.log" "$TMP/gh-ownerless.log" 2>&1 >/dev/null
-)"
-! grep -q 'No such file or directory' <<<"$ownerless_err" || fail "ownerless lock recovery must not emit stderr noise: $ownerless_err"
-[ ! -d "$TMP/state-ownerless.json.lock" ] || fail "abandoned ownerless lockdir must be reclaimed and released"
-[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-ownerless.json")" != 0 ] || fail "ownerless lock recovery must allow alert state update"
-
-mkdir -p "$TMP/state-stalepid.json.lock"
-true &
-dead_pid=$!
-wait "$dead_pid"
-printf '%s\n' "$dead_pid" > "$TMP/state-stalepid.json.lock/pid"
-STATE_LOCK_TIMEOUT_SEC=5 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-  run_alert "$TMP/state-stalepid.json" "$TMP/gcloud-stalepid.log" "$TMP/gh-stalepid.log" >/dev/null
-[ ! -d "$TMP/state-stalepid.json.lock" ] || fail "stale dead-PID lockdir must be reclaimed and released"
 ! grep -q 'env GH_TOKEN=' "$SCRIPT" || fail "GH_TOKEN must not be passed in env/timeout argv"
 
-# Two-contender concurrent stale-lock recovery proves mutual exclusion across the critical section.
-printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-race.json"
-mkdir -p "$TMP/state-race.json.lock"
-printf '%s\n' "$dead_pid" > "$TMP/state-race.json.lock/pid"
-date +%s > "$TMP/state-race.json.lock/ts"
-: > "$TMP/cost-race.trace"
-GH_RACE_TAG=1 GH_RACE_TRACE_FILE="$TMP/cost-race.trace" GCLOUD_STUB_SLEEP=0.5 \
-  STATE_LOCK_TIMEOUT_SEC=10 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-  run_alert "$TMP/state-race.json" "$TMP/gcloud-race1.log" "$TMP/gh-race1.log" >/dev/null &
-rpid1=$!
-GH_RACE_TAG=2 GH_RACE_TRACE_FILE="$TMP/cost-race.trace" GCLOUD_STUB_SLEEP=0.5 \
-  STATE_LOCK_TIMEOUT_SEC=10 BILLING_FIXTURE="$TMP/billing-lock2.json" \
-  run_alert "$TMP/state-race.json" "$TMP/gcloud-race2.log" "$TMP/gh-race2.log" >/dev/null &
-rpid2=$!
-rrc1=0; wait "$rpid1" || rrc1=$?
-rrc2=0; wait "$rpid2" || rrc2=$?
-[ "$rrc1" -eq 0 ] && [ "$rrc2" -eq 0 ] || fail "two-contender stale-lock recovery must succeed for both contenders (rc1=$rrc1 rc2=$rrc2)"
-[ ! -d "$TMP/state-race.json.lock" ] && [ ! -d "$TMP/state-race.json.lock.reclaim" ] || fail "state lockdir and reclaim mutex must be released"
-[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-race.json")" != 0 ] || fail "two-contender run 1 sent key was lost"
-[ "$(jq -r '.sent["2026-11-18:COST_SPIKE"] // 0' "$TMP/state-race.json")" != 0 ] || fail "two-contender run 2 sent key was lost"
-TRACE_FILE="$TMP/cost-race.trace" python3 - <<'PY' || fail "two-contender state lock allowed concurrent entry"
-import os
-from pathlib import Path
-lines = [l.strip() for l in Path(os.environ["TRACE_FILE"]).read_text().splitlines() if l.strip()]
-assert len(lines) == 4, f"expected 4 trace lines, got {lines!r}"
-assert lines[0].startswith("ENTER ") and lines[1] == "EXIT " + lines[0].split()[1], f"overlap detected: {lines!r}"
-assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[1], f"overlap detected: {lines!r}"
-assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
-PY
-
-# Live lock with matching pid+lstart must NOT be evicted regardless of age (even with old ts), whereas mismatched lstart (PID reuse) IS reclaimed,
-# and lock timeout emits WARNING BLIND before exit 4 without removing the live owner's lock.
-printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-age.json"
-mkdir -p "$TMP/state-age.json.lock"
-sleep 30 &
-live_pid=$!
-live_lstart="$(ps -p "$live_pid" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-printf '%s\n' "$live_lstart" > "$TMP/state-age.json.lock/lstart"
-printf '%s\n' "$live_pid" > "$TMP/state-age.json.lock/pid"
-printf '1000\n' > "$TMP/state-age.json.lock/ts"
-live_rc=0
-STATE_LOCK_TIMEOUT_SEC=1 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-  run_alert "$TMP/state-age.json" "$TMP/gcloud-age.log" "$TMP/gh-age.log" >/dev/null 2>&1 || live_rc=$?
-[ "$live_rc" -eq 4 ] || {
-  kill "$live_pid" 2>/dev/null || true
-  wait "$live_pid" 2>/dev/null || true
-  fail "live state lock with matching pid+lstart must NOT be evicted regardless of age (expected rc=4, got $live_rc)"
-}
-[ -d "$TMP/state-age.json.lock" ] && [ "$(tr -d '[:space:]' < "$TMP/state-age.json.lock/pid")" = "$live_pid" ] || {
-  kill "$live_pid" 2>/dev/null || true
-  wait "$live_pid" 2>/dev/null || true
-  fail "timed-out contender must leave live owner lock untouched"
-}
-
-printf 'Thu Jan 01 00:00:00 1970\n' > "$TMP/state-age.json.lock/lstart"
-STATE_LOCK_TIMEOUT_SEC=5 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-  run_alert "$TMP/state-age.json" "$TMP/gcloud-age.log" "$TMP/gh-age.log" >/dev/null || {
-  kill "$live_pid" 2>/dev/null || true
-  wait "$live_pid" 2>/dev/null || true
-  fail "state lock with mismatched lstart (PID reuse) must be reclaimed"
-}
-kill "$live_pid" 2>/dev/null || true
-wait "$live_pid" 2>/dev/null || true
-[ ! -d "$TMP/state-age.json.lock" ] || fail "state lockdir must be released after PID-reuse reclaim"
-[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-age.json")" != 0 ] || fail "reclaimed PID-reuse lock must allow alert state update"
-
+# Live flock holder blocks contender until timeout (rc=4 + WARNING BLIND), while --dry-run does not block;
+# SIGKILL (kill -9) on holder immediately releases the kernel lock so the next run acquires and succeeds cleanly.
 printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-lockto.json"
-mkdir -p "$TMP/state-lockto.json.lock"
-sleep 30 &
+rm -f "$TMP/cost-flock.ready"
+python3 - "$TMP/state-lockto.json.flock" "$TMP/cost-flock.ready" <<'PY' &
+import fcntl, sys, time
+from pathlib import Path
+
+lock_path = Path(sys.argv[1])
+ready_path = Path(sys.argv[2])
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+f = open(lock_path, "a+")
+fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+ready_path.write_text("locked\n")
+time.sleep(30)
+PY
 blocker_pid=$!
-blocker_lstart="$(ps -p "$blocker_pid" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-printf '%s\n' "$blocker_lstart" > "$TMP/state-lockto.json.lock/lstart"
-printf '%s\n' "$blocker_pid" > "$TMP/state-lockto.json.lock/pid"
+while [ ! -f "$TMP/cost-flock.ready" ]; do sleep 0.05; done
+
+BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockto-dry.log" "$TMP/gh-lockto-dry.log" --dry-run >/dev/null || {
+  kill -9 "$blocker_pid" 2>/dev/null || true
+  wait "$blocker_pid" 2>/dev/null || true
+  fail "--dry-run must not block on state flock"
+}
+
 lockto_rc=0
 STATE_LOCK_TIMEOUT_SEC=1 BILLING_FIXTURE="$TMP/billing-lock1.json" \
   run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockto.log" "$TMP/gh-lockto.log" >/dev/null 2>&1 || lockto_rc=$?
-kill "$blocker_pid" 2>/dev/null || true
-wait "$blocker_pid" 2>/dev/null || true
-[ "$lockto_rc" -eq 4 ] || fail "state lock timeout must exit 4 (got $lockto_rc)"
+[ "$lockto_rc" -eq 4 ] || {
+  kill -9 "$blocker_pid" 2>/dev/null || true
+  wait "$blocker_pid" 2>/dev/null || true
+  fail "state flock timeout must exit 4 (got $lockto_rc)"
+}
 grep -q 'severity=WARNING' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit WARNING"
 grep -q '"status":"BLIND"' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit BLIND status"
 grep -q 'LOCK_TIMEOUT: state lock held > 1s' "$TMP/gcloud-lockto.log" || fail "state lock timeout must cite LOCK_TIMEOUT"
-pass "concurrent runs serialize STATE_FILE updates, reclaim stale/PID-reuse locks race-free, protect live locks, and emit BLIND on lock timeout"
+
+# SIGKILL active flock holder -> next run must immediately acquire kernel lock and update state cleanly.
+kill -9 "$blocker_pid" 2>/dev/null || true
+wait "$blocker_pid" 2>/dev/null || true
+STATE_LOCK_TIMEOUT_SEC=2 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockrecover.log" "$TMP/gh-lockrecover.log" >/dev/null || \
+  fail "run after SIGKILL of flock holder must immediately acquire kernel lock and succeed"
+[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-lockto.json")" != 0 ] || \
+  fail "post-SIGKILL flock acquisition must update state file"
+pass "kernel flock serializes concurrent runs, emits BLIND on timeout, skips --dry-run, and releases immediately on SIGKILL"
 
 # 19. --ensure-gcp-policy creates/updates with timeout bounds, exits non-zero, and surfaces gcloud stderr on failure.
 run_alert "$TMP/state-pol-create.json" "$TMP/gcloud-pol-create.log" "$TMP/gh-pol-create.log" --ensure-gcp-policy >/dev/null
