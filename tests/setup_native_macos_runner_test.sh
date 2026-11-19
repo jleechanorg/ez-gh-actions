@@ -563,7 +563,7 @@ if [ "\${1:-}" = "load" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; th
   count="\$(cat "$COST_FAIL_HOME/load-count.txt")"
   count=\$((count + 1))
   printf '%s\n' "\$count" > "$COST_FAIL_HOME/load-count.txt"
-  if [ "\$count" -eq 1 ]; then
+  if [ "\${COST_FAIL_FIRST_LOAD:-1}" = "1" ] && [ "\$count" -eq 1 ]; then
     exit 42
   fi
   : > "$COST_FAIL_HOME/loaded"
@@ -655,6 +655,123 @@ BASH_ENV=/dev/null HOME="$UNREL_HOME" PATH="$TMP/bin:$PATH" \
   bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-token-refresh >/dev/null
 [ "$(cat "$UNREL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "sentinel-cost-alert" ] || \
   fail "unrelated targeted install must not overwrite gh-actions-cost-alert.sh"
+
+# Bulk install skips org-singleton cost-alert when plist does not exist, installs with EZGHA_INSTALL_COST_ALERT_BULK=1, and upgrades in place when plist already exists.
+BULK_SKIP_HOME="$TMP/bulk-skip-home"
+mkdir -p "$BULK_SKIP_HOME/Library/LaunchAgents"
+BULK_SKIP_OUT="$(
+  BASH_ENV=/dev/null HOME="$BULK_SKIP_HOME" PATH="$TMP/bin:$PATH" \
+    bash "$INSTALL_LAUNCHAGENTS" install 2>&1 >/dev/null
+)"
+grep -q "SKIPPED: org.jleechanorg.ezgha-gh-actions-cost-alert" <<<"$BULK_SKIP_OUT" || \
+  fail "bulk install without existing cost-alert plist must print SKIPPED (got: $BULK_SKIP_OUT)"
+[ ! -e "$BULK_SKIP_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist" ] || \
+  fail "bulk install must not create cost-alert plist on fresh host"
+[ ! -e "$BULK_SKIP_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh" ] || \
+  fail "bulk install must not install gh-actions-cost-alert.sh when cost-alert is skipped"
+
+BASH_ENV=/dev/null EZGHA_INSTALL_COST_ALERT_BULK=1 HOME="$BULK_SKIP_HOME" PATH="$TMP/bin:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install >/dev/null 2>&1
+[ -f "$BULK_SKIP_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist" ] || \
+  fail "bulk install with EZGHA_INSTALL_COST_ALERT_BULK=1 must install cost-alert plist"
+[ -x "$BULK_SKIP_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh" ] || \
+  fail "bulk install with EZGHA_INSTALL_COST_ALERT_BULK=1 must install gh-actions-cost-alert.sh"
+
+printf 'stale-cost-script\n' > "$BULK_SKIP_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
+BASH_ENV=/dev/null HOME="$BULK_SKIP_HOME" PATH="$TMP/bin:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install >/dev/null 2>&1
+! cmp -s "$BULK_SKIP_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh" <(printf 'stale-cost-script\n') || \
+  fail "bulk install when cost-alert plist already exists must upgrade gh-actions-cost-alert.sh in place"
+
+# Injected mktemp, cp backup, mv promotion, and post-unload indeterminate launchctl print failures
+# during cost-alert upgrade must preserve incumbent script, plist, and loaded state.
+: > "$COST_FAIL_HOME/loaded"
+printf 'prior-cost-plist\n' > "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist"
+printf 'prior-cost-script\n' > "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
+chmod +x "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
+REAL_MKTEMP="$(command -v mktemp)"
+REAL_CP="$(command -v cp)"
+REAL_MV="$(command -v mv)"
+cat > "$COST_FAIL_BIN/mktemp" <<STUB
+#!/usr/bin/env bash
+if [ "\${INJECT_MKTEMP_FAIL:-0}" = "1" ] && [[ "\$*" == *"gh-actions-cost-alert"* ]]; then
+  exit 1
+fi
+exec "$REAL_MKTEMP" "\$@"
+STUB
+cat > "$COST_FAIL_BIN/cp" <<STUB
+#!/usr/bin/env bash
+if [ "\${INJECT_CP_SCRIPT_FAIL:-0}" = "1" ] && [[ "\$*" == *".gh-actions-cost-alert.sh.backup."* ]]; then
+  exit 1
+fi
+if [ "\${INJECT_CP_PLIST_FAIL:-0}" = "1" ] && [[ "\$*" == *"org.jleechanorg.ezgha-gh-actions-cost-alert.plist.backup."* ]]; then
+  exit 1
+fi
+exec "$REAL_CP" "\$@"
+STUB
+cat > "$COST_FAIL_BIN/mv" <<STUB
+#!/usr/bin/env bash
+if [ "\${INJECT_MV_PROMOTE_FAIL:-0}" = "1" ] && [[ "\$*" == *".gh-actions-cost-alert.sh.staged."* ]]; then
+  exit 1
+fi
+exec "$REAL_MV" "\$@"
+STUB
+chmod +x "$COST_FAIL_BIN/mktemp" "$COST_FAIL_BIN/cp" "$COST_FAIL_BIN/mv"
+
+for fail_env in "INJECT_MKTEMP_FAIL=1" "INJECT_CP_SCRIPT_FAIL=1" "INJECT_CP_PLIST_FAIL=1" "INJECT_MV_PROMOTE_FAIL=1"; do
+  : > "$COST_FAIL_HOME/loaded"
+  printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+  inj_rc=0
+  env "$fail_env" COST_FAIL_FIRST_LOAD=0 BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
+    bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || inj_rc=$?
+  [ "$inj_rc" -ne 0 ] || fail "$fail_env during cost-alert upgrade must fail closed"
+  [ -f "$COST_FAIL_HOME/loaded" ] || fail "$fail_env must keep incumbent cost-alert job loaded"
+  [ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
+    fail "$fail_env must preserve prior plist"
+  [ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
+    fail "$fail_env must preserve prior gh-actions-cost-alert.sh"
+  if compgen -G "$COST_FAIL_HOME/.local/libexec/ezgha/.gh-actions-cost-alert.sh.staged.*" >/dev/null; then
+    fail "$fail_env must clean up staged cost-alert script"
+  fi
+  if compgen -G "$COST_FAIL_HOME/.local/state/ezgha/.gh-actions-cost-alert.sh.backup.*" >/dev/null; then
+    fail "$fail_env must clean up temporary script backup"
+  fi
+  if compgen -G "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist.backup.*" >/dev/null; then
+    fail "$fail_env must clean up temporary plist backup"
+  fi
+done
+
+# Post-unload indeterminate launchctl print error when incumbent was loaded must attempt reload of prior plist.
+cat > "$COST_FAIL_BIN/launchctl" <<STUB
+#!/usr/bin/env bash
+if [ "\${1:-}" = "unload" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; then
+  rm -f "$COST_FAIL_HOME/loaded"
+  exit 0
+fi
+if [ "\${1:-}" = "print" ] && [[ "\${2:-}" == *gh-actions-cost-alert ]]; then
+  if [ -f "$COST_FAIL_HOME/loaded" ]; then
+    exit 0
+  fi
+  echo "launchctl: post-unload indeterminate error" >&2
+  exit 2
+fi
+if [ "\${1:-}" = "load" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; then
+  : > "$COST_FAIL_HOME/loaded"
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$COST_FAIL_BIN/launchctl"
+: > "$COST_FAIL_HOME/loaded"
+post_indet_rc=0
+BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
+  bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || post_indet_rc=$?
+[ "$post_indet_rc" -ne 0 ] || fail "post-unload indeterminate launchctl print error must fail closed"
+[ -f "$COST_FAIL_HOME/loaded" ] || fail "post-unload indeterminate launchctl print error must reload incumbent plist when previously loaded"
+[ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
+  fail "post-unload indeterminate launchctl print error must keep prior plist intact"
+[ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
+  fail "post-unload indeterminate launchctl print error must keep prior script intact"
 pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents, rolls back script BEFORE backup plist reload and on unload failure, handles fresh account, and renders valid plist"
 
 # 6. --uninstall runs before resolve_work_dir, unloads even without plist, and retains plist if still loaded.
@@ -1698,6 +1815,11 @@ CONFIG_RAN_MARKER="$TMP/config-ran-25" \
 [ -f "$TMP/launchctl.loaded" ] || fail "post-launch online retry success must leave LaunchAgent loaded"
 
 rm -f "$TMP/config-ran-25-off"
+shopt -s nullglob
+for old_b in "$CRED_RUNNER"/.backup-pre-reconfigure.*; do
+  rm -rf "${old_b:?}"
+done
+shopt -u nullglob
 offline_post_rc=0
 CONFIG_RAN_MARKER="$TMP/config-ran-25-off" \
   POST_CONFIG_VERIFY_ATTEMPTS=2 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
@@ -1708,6 +1830,14 @@ CONFIG_RAN_MARKER="$TMP/config-ran-25-off" \
   "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || offline_post_rc=$?
 [ "$offline_post_rc" -eq 4 ] || fail "post-launch offline runner after POST_CONFIG_VERIFY_ATTEMPTS must exit 4 fail-closed (got $offline_post_rc)"
 [ ! -e "$TMP/launchctl.loaded" ] || fail "failed post-launch online readback must stop LaunchAgent"
+shopt -s nullglob
+post_offline_backups=("$CRED_RUNNER"/.backup-pre-reconfigure.*)
+shopt -u nullglob
+[ "${#post_offline_backups[@]}" -ge 1 ] && [ -f "${post_offline_backups[0]}/.runner" ] && [ -f "${post_offline_backups[0]}/.credentials" ] || \
+  fail "failed post-launch verify_runner_online must preserve .backup-pre-reconfigure.* with .runner and .credentials"
+for old_b in "${post_offline_backups[@]}"; do
+  rm -rf "${old_b:?}"
+done
 
 # Idempotent already-configured rerun when LaunchAgent is loaded and GitHub reports status="offline" must fail closed WITHOUT invoking config.sh.
 : > "$TMP/launchctl.loaded"
@@ -1744,6 +1874,8 @@ cp "$EXISTING_SYM/run.sh" "$ESC_RUNNER/run.sh"
 : > "$ESC_RUNNER/run-helper.sh.template"
 : > "$ESC_RUNNER/env.sh"
 ln -sfn /outside "$ESC_RUNNER/externals.9.99.0"
+ln -sfn /outside "$ESC_RUNNER/externals-old"
+ln -sfn /outside "$ESC_RUNNER/bin-old"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$ESC_RUNNER/.runner"
 printf 'creds\n' > "$ESC_RUNNER/.credentials"
 printf 'rsa\n' > "$ESC_RUNNER/.credentials_rsaparams"
@@ -1762,7 +1894,7 @@ PY
 
 if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
     "$SETUP_SCRIPT" --verify --offline --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
-  fail "--verify --offline must fail when destination-only externals.9.99.0 symlinks to /outside"
+  fail "--verify --offline must fail when destination-only externals.9.99.0/externals-old/bin-old symlink to /outside"
 fi
 
 POST_CONFIG_VERIFY_ATTEMPTS=3 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
@@ -1771,14 +1903,117 @@ POST_CONFIG_VERIFY_ATTEMPTS=3 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   EXISTING_RUNNER_DIR="$EXISTING_SYM" \
   "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null || \
-  fail "setup repair must succeed after removing destination-only escaping externals.9.99.0 symlink"
+  fail "setup repair must succeed after removing destination-only escaping symlinks"
 
 [ ! -e "$ESC_RUNNER/externals.9.99.0" ] && [ ! -L "$ESC_RUNNER/externals.9.99.0" ] || \
   fail "promote_staged_binaries must remove destination-only stale externals.9.99.0 symlink"
+[ ! -e "$ESC_RUNNER/externals-old" ] && [ ! -L "$ESC_RUNNER/externals-old" ] || \
+  fail "promote_staged_binaries must remove destination-only stale externals-old symlink"
+[ ! -e "$ESC_RUNNER/bin-old" ] && [ ! -L "$ESC_RUNNER/bin-old" ] || \
+  fail "promote_staged_binaries must remove destination-only stale bin-old symlink"
 
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --verify --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null || \
-  fail "subsequent --verify must pass after promote_staged_binaries removes stale externals.9.99.0"
-pass "Round-20 P0 #1 regression: destination-only escaping externals.9.99.0 symlink is removed during promotion and passes setup + --verify"
+  fail "subsequent --verify must pass after promote_staged_binaries removes stale externals*/bin* symlinks"
+pass "Round-20 P0 #1 regression: destination-only escaping externals*/bin* symlinks are removed during promotion and pass setup + --verify"
+
+# 27. Round-21 regressions:
+#     a) P0 #1: Malformed runner-groups/<id>/runners JSON fails verify_live_runner_state closed (both --verify and setup)
+#     b) P0 #2: Failed launchctl load during --reconfigure preserves .backup-pre-reconfigure.* with .runner + .credentials
+#     c) P1 #1: Unloaded or plist-replaced runner that fails verify_runner_online unloads LaunchAgent (needs_config == 0)
+if GROUP_RUNNERS_JSON='{malformed-json' \
+    RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+    LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail closed on malformed /actions/runner-groups/<id>/runners JSON"
+fi
+
+# Ensure malformed group JSON also triggers needs_config=1 (does NOT pass verify_live_runner_state setup with rc=0).
+: > "$TMP/config.log"
+malformed_setup_rc=0
+GROUP_RUNNERS_JSON='{malformed-json' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1 || malformed_setup_rc=$?
+[ "$malformed_setup_rc" -ne 0 ] || fail "setup must fail closed when /actions/runner-groups/<id>/runners JSON is malformed"
+
+# P0 #2: Failed launchctl load during --reconfigure preserves .backup-pre-reconfigure.* with .runner and .credentials.
+FAIL_LOAD_BIN="$TMP/fail-load-bin"
+mkdir -p "$FAIL_LOAD_BIN"
+cat > "$FAIL_LOAD_BIN/launchctl" <<STUB
+#!/usr/bin/env bash
+if [ "\${1:-}" = "load" ]; then
+  exit 17
+fi
+exec "$TMP/bin/launchctl" "\$@"
+STUB
+chmod +x "$FAIL_LOAD_BIN/launchctl"
+shopt -s nullglob
+for old_b in "$CRED_RUNNER"/.backup-pre-reconfigure.*; do
+  rm -rf "${old_b:?}"
+done
+shopt -u nullglob
+fail_load_rc=0
+POST_CONFIG_VERIFY_ATTEMPTS=2 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_POST_CONFIG_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$FAIL_LOAD_BIN:$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || fail_load_rc=$?
+[ "$fail_load_rc" -ne 0 ] || fail "failed launchctl load during --reconfigure must fail closed"
+shopt -s nullglob
+failed_load_backups=("$CRED_RUNNER"/.backup-pre-reconfigure.*)
+shopt -u nullglob
+[ "${#failed_load_backups[@]}" -ge 1 ] && [ -f "${failed_load_backups[0]}/.runner" ] && [ -f "${failed_load_backups[0]}/.credentials" ] || \
+  fail "failed launchctl load during --reconfigure must preserve .backup-pre-reconfigure.* with .runner and .credentials"
+for old_b in "${failed_load_backups[@]}"; do
+  rm -rf "${old_b:?}"
+done
+
+# P1 #1: needs_config == 0 from unloaded state + offline post-launch -> must stop LaunchAgent.
+python3 - "$TMP/plist.ok" "$PLIST_T" "$ESC_RUNNER" <<'PY'
+import plistlib, sys
+from pathlib import Path
+d = plistlib.loads(Path(sys.argv[1]).read_bytes())
+r = sys.argv[3]
+d["WorkingDirectory"] = r
+d["ProgramArguments"] = ["/bin/bash", f"{r}/run.sh"]
+Path(sys.argv[2]).write_bytes(plistlib.dumps(d))
+PY
+# Render exact plist first by running a quick online pass, then unload and run an offline pass.
+POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null
+
+rm -f "$TMP/launchctl.loaded"
+: > "$TMP/launchctl.log"
+unloaded_offline_rc=0
+POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1 || unloaded_offline_rc=$?
+[ "$unloaded_offline_rc" -ne 0 ] || fail "unloaded runner failing verify_runner_online must fail closed"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "unloaded runner failing post-launch verify_runner_online must stop LaunchAgent"
+grep -q "launchctl unload" "$TMP/launchctl.log" || fail "unloaded runner failing post-launch verify_runner_online must call stop_launchagent"
+
+# P1 #1 (plist-replaced branch with needs_config == 0): changed plist + offline post-launch -> must stop LaunchAgent.
+printf 'stale-plist\n' > "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+: > "$TMP/launchctl.log"
+plist_offline_rc=0
+POST_CONFIG_VERIFY_ATTEMPTS=1 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$ESC_RUNNER" --runner-group macos-restricted >/dev/null 2>&1 || plist_offline_rc=$?
+[ "$plist_offline_rc" -ne 0 ] || fail "plist-replaced runner failing verify_runner_online must fail closed"
+[ ! -e "$TMP/launchctl.loaded" ] || fail "plist-replaced runner failing post-launch verify_runner_online must stop LaunchAgent"
+pass "Round-21 regressions: malformed group JSON fails closed, backups survive until online, post-launch offline unloads service, and bin*/externals* symlinks clean cleanly"

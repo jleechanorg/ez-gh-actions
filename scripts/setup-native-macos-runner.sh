@@ -186,7 +186,7 @@ run_with_timeout() {
     return "$rc"
   fi
   local out_tmp
-  out_tmp="$(mktemp)"
+  out_tmp="$(mktemp)" || return 1
   (
     exec 9>&-
     exec "$@"
@@ -255,7 +255,7 @@ acquire_setup_lock() {
     echo "ERROR: python3 not found; cannot acquire setup lock $SETUP_LOCK_FILE" >&2
     return 1
   fi
-  mkdir -p "$(dirname "$SETUP_LOCK_FILE")"
+  mkdir -p "$(dirname "$SETUP_LOCK_FILE")" || return 1
   if ! exec 9>>"$SETUP_LOCK_FILE"; then
     echo "ERROR: failed to open setup lock $SETUP_LOCK_FILE" >&2
     return 1
@@ -309,7 +309,7 @@ launchagent_confirmed_unloaded() {
 
 stop_launchagent() {
   local uid gui_target
-  uid="$(id -u)"
+  uid="$(id -u)" || return 1
   gui_target="gui/${uid}/${PLIST_LABEL}"
   if [ -f "$PLIST_PATH" ]; then
     launchctl unload "$PLIST_PATH" 2>/dev/null 9>&- || true
@@ -788,19 +788,28 @@ verify_server_fork_protection() {
       echo "ERROR: failed to query runner groups for org '${RUNNER_ORG}'" >&2
       exit 5
     fi
-    group_json="$(printf '%s\n' "$groups_json" | jq -sc --arg g "$RUNNER_GROUP" '[.[].runner_groups[]? | (if $g != "" then select(.name == $g) else select(.default == true) end)] | .[0] // empty')"
+    if ! group_json="$(printf '%s\n' "$groups_json" | jq -sc --arg g "$RUNNER_GROUP" '[.[].runner_groups[]? | (if $g != "" then select(.name == $g) else select(.default == true) end)] | .[0] // empty')"; then
+      echo "ERROR: failed to parse runner groups JSON for org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
     if [ -z "$group_json" ]; then
       echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' not found in org '${RUNNER_ORG}'" >&2
       exit 5
     fi
-    VERIFIED_RUNNER_GROUP_ID="$(printf '%s\n' "$group_json" | jq -r '.id // empty')"
+    if ! VERIFIED_RUNNER_GROUP_ID="$(printf '%s\n' "$group_json" | jq -r '.id // empty')"; then
+      echo "ERROR: failed to parse runner group id in org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
     [ -n "$VERIFIED_RUNNER_GROUP_ID" ] || {
       echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' missing id in org '${RUNNER_ORG}'" >&2
       exit 5
     }
-    allows_pub="$(printf '%s\n' "$group_json" | jq -r 'if has("allows_public_repositories") then (.allows_public_repositories | tostring) else "" end')"
-    restricted_wf="$(printf '%s\n' "$group_json" | jq -r 'if has("restricted_to_workflows") then (.restricted_to_workflows | tostring) else "unknown" end')"
-    selected_wf_count="$(printf '%s\n' "$group_json" | jq -r '(.selected_workflows // []) | length')"
+    if ! allows_pub="$(printf '%s\n' "$group_json" | jq -r 'if has("allows_public_repositories") then (.allows_public_repositories | tostring) else "" end')" || \
+       ! restricted_wf="$(printf '%s\n' "$group_json" | jq -r 'if has("restricted_to_workflows") then (.restricted_to_workflows | tostring) else "unknown" end')" || \
+       ! selected_wf_count="$(printf '%s\n' "$group_json" | jq -r '(.selected_workflows // []) | length')"; then
+      echo "ERROR: failed to parse runner group policy fields in org '${RUNNER_ORG}'" >&2
+      exit 5
+    fi
     if [ "$allows_pub" != "false" ]; then
       if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
         echo "WARNING: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}, allows_public_repositories=${allows_pub:-<unset>}, restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}) allowed via --allow-public-fork-exposure; pull_request_target bypasses GitHub fork-approval settings, so public access requires explicit operator workflow review" >&2
@@ -821,22 +830,34 @@ verify_live_runner_state_once() {
     echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
     return 2
   fi
-  runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
+  if ! runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"; then
+    echo "ERROR: failed to parse live runners JSON from $RUNNERS_API" >&2
+    return 2
+  fi
   if [ -z "$runner_json" ]; then
     echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API" >&2
     return 1
   fi
 
   if [ "$mode" = "verify" ]; then
-    live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
+    if ! live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"; then
+      echo "ERROR: failed to parse live runner status for '$RUNNER_NAME' (agentId=$local_agent_id)" >&2
+      return 2
+    fi
     if [ "$live_status" != "online" ]; then
       echo "FAIL: live runner '$RUNNER_NAME' (agentId=$local_agent_id) status is '${live_status:-<unset>}' (expected 'online')" >&2
       return 1
     fi
   fi
 
-  live_labels_csv="$(printf '%s\n' "$runner_json" | jq -r '[.labels[]?.name // empty] | map(ascii_downcase) | unique | join(",")')"
-  expected_sorted_csv="$(printf '%s' "$RUNNER_LABELS" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd, -)"
+  if ! live_labels_csv="$(printf '%s\n' "$runner_json" | jq -r '[.labels[]?.name // empty] | map(ascii_downcase) | unique | join(",")')"; then
+    echo "ERROR: failed to parse live labels for runner '$RUNNER_NAME' (agentId=$local_agent_id)" >&2
+    return 2
+  fi
+  if ! expected_sorted_csv="$(printf '%s' "$RUNNER_LABELS" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd, -)"; then
+    echo "ERROR: failed to normalize expected labels '$RUNNER_LABELS'" >&2
+    return 2
+  fi
   if printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qxE 'self-hosted|worldai-testflight-native-mac'; then
     echo "FAIL: live runner '$RUNNER_NAME' (agentId=$local_agent_id) carries forbidden label in '$live_labels_csv'" >&2
     return 1
@@ -859,8 +880,11 @@ verify_live_runner_state_once() {
       echo "ERROR: failed to query runners for org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
       return 2
     fi
-    in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$local_agent_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"
-    if [ "$in_group" -lt 1 ]; then
+    if ! in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$local_agent_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"; then
+      echo "ERROR: failed to parse runners JSON for org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
+      return 2
+    fi
+    if [[ ! "$in_group" =~ ^[0-9]+$ ]] || [ "$in_group" -lt 1 ]; then
       echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) is not a member of org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
       return 1
     fi
@@ -926,15 +950,20 @@ verify_runner_online() {
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     live_status=""
     if runners_pages="$(run_gh_api api --paginate "$RUNNERS_API")"; then
-      runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
-      if [ -n "$runner_json" ]; then
-        live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
-        if [ "$live_status" = "online" ]; then
-          return 0
+      if runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"; then
+        if [ -n "$runner_json" ]; then
+          if ! live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"; then
+            live_status=""
+          fi
+          if [ "$live_status" = "online" ]; then
+            return 0
+          fi
+          echo "INFO: runner '$RUNNER_NAME' (agentId=$local_agent_id) status is '${live_status:-<unset>}' (attempt ${attempt}/${max_attempts})" >&2
+        else
+          echo "INFO: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API (attempt ${attempt}/${max_attempts})" >&2
         fi
-        echo "INFO: runner '$RUNNER_NAME' (agentId=$local_agent_id) status is '${live_status:-<unset>}' (attempt ${attempt}/${max_attempts})" >&2
       else
-        echo "INFO: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API (attempt ${attempt}/${max_attempts})" >&2
+        echo "WARNING: failed to parse live runners JSON from $RUNNERS_API (attempt ${attempt}/${max_attempts})" >&2
       fi
     else
       echo "WARNING: failed to query live runners from $RUNNERS_API (attempt ${attempt}/${max_attempts})" >&2
@@ -1254,7 +1283,7 @@ promote_staged_binaries() {
   mkdir -p "$RUNNER_DIR"
   local item base old
   shopt -s nullglob
-  for old in "${RUNNER_DIR:?}"/bin "${RUNNER_DIR:?}"/bin.* "${RUNNER_DIR:?}"/externals "${RUNNER_DIR:?}"/externals.* "${RUNNER_DIR:?}"/run.sh "${RUNNER_DIR:?}"/runsvc.sh "${RUNNER_DIR:?}"/config.sh "${RUNNER_DIR:?}"/env.sh "${RUNNER_DIR:?}"/run-helper.sh.template "${RUNNER_DIR:?}"/safe_sleep.sh; do
+  for old in "${RUNNER_DIR:?}"/bin* "${RUNNER_DIR:?}"/externals* "${RUNNER_DIR:?}"/run.sh "${RUNNER_DIR:?}"/runsvc.sh "${RUNNER_DIR:?}"/config.sh "${RUNNER_DIR:?}"/env.sh "${RUNNER_DIR:?}"/run-helper.sh.template "${RUNNER_DIR:?}"/safe_sleep.sh; do
     rm -rf "${old:?}"
   done
   for item in "${STAGE_TMP}"/*; do
@@ -1354,13 +1383,6 @@ if [ "$needs_config" -eq 1 ]; then
     echo "ERROR: newly configured runner '${RUNNER_NAME}' (agentId=${post_agent_id}) failed live GitHub state/group/label verification; service ${PLIST_LABEL} remains stopped. Backup preserved at ${BACKUP_DIR}." >&2
     exit 4
   fi
-  rm -rf "${BACKUP_DIR:?}"
-  BACKUP_DIR=""
-  shopt -s nullglob
-  for b in "${RUNNER_DIR:?}"/.backup-pre-reconfigure.*; do
-    rm -rf "${b:?}"
-  done
-  shopt -u nullglob
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"
   printf '%s\n' "$RUNNER_GROUP" > "${RUNNER_DIR}/.ezgha-group"
 fi
@@ -1380,6 +1402,7 @@ if launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1 9>&-; then
   is_loaded=1
 fi
 
+service_started_by_setup=0
 if [ "$needs_config" -eq 0 ] && [ "$RECONFIGURE" -eq 0 ] && [ "$plist_matches" -eq 1 ]; then
   rm -f "$CANDIDATE_PLIST"
   CANDIDATE_PLIST=""
@@ -1387,9 +1410,22 @@ if [ "$needs_config" -eq 0 ] && [ "$RECONFIGURE" -eq 0 ] && [ "$plist_matches" -
     verify_runner_online 1 || exit 1
     echo "OK: ${RUNNER_NAME} unchanged; leaving loaded (${PLIST_LABEL})"
   else
-    launchctl load -w "$PLIST_PATH" 9>&-
-    launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-
-    verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS" || exit 1
+    if ! launchctl load -w "$PLIST_PATH" 9>&-; then
+      echo "ERROR: failed to load ${PLIST_LABEL} from ${PLIST_PATH}" >&2
+      exit 1
+    fi
+    service_started_by_setup=1
+    if ! launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-; then
+      echo "ERROR: launchd did not register ${PLIST_LABEL}" >&2
+      stop_launchagent || true
+      exit 1
+    fi
+    if ! verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS"; then
+      if [ "$needs_config" -eq 1 ] || [ "$service_started_by_setup" -eq 1 ]; then
+        stop_launchagent || true
+      fi
+      exit 1
+    fi
     echo "OK: ${RUNNER_NAME} loaded (${PLIST_LABEL})"
   fi
 else
@@ -1399,14 +1435,42 @@ else
   fi
   mv "$CANDIDATE_PLIST" "$PLIST_PATH"
   CANDIDATE_PLIST=""
-  launchctl load -w "$PLIST_PATH" 9>&-
-  launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-
-  if ! verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS"; then
+  if ! launchctl load -w "$PLIST_PATH" 9>&-; then
+    echo "ERROR: failed to load ${PLIST_LABEL} from ${PLIST_PATH}${BACKUP_DIR:+ (backup preserved at ${BACKUP_DIR})}" >&2
     if [ "$needs_config" -eq 1 ]; then
+      exit 4
+    fi
+    exit 1
+  fi
+  service_started_by_setup=1
+  if ! launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 9>&-; then
+    echo "ERROR: launchd did not register ${PLIST_LABEL}${BACKUP_DIR:+ (backup preserved at ${BACKUP_DIR})}" >&2
+    stop_launchagent || true
+    if [ "$needs_config" -eq 1 ]; then
+      exit 4
+    fi
+    exit 1
+  fi
+  if ! verify_runner_online "$POST_CONFIG_VERIFY_ATTEMPTS"; then
+    if [ "$needs_config" -eq 1 ] || [ "$service_started_by_setup" -eq 1 ]; then
       stop_launchagent || true
+    fi
+    if [ "$needs_config" -eq 1 ]; then
       exit 4
     fi
     exit 1
   fi
   echo "OK: ${RUNNER_NAME} installed and loaded (${PLIST_LABEL})"
+fi
+
+if [ -n "${BACKUP_DIR:-}" ]; then
+  rm -rf "${BACKUP_DIR:?}"
+  BACKUP_DIR=""
+fi
+if [ -d "${RUNNER_DIR:-}" ]; then
+  shopt -s nullglob
+  for b in "${RUNNER_DIR:?}"/.backup-pre-reconfigure.*; do
+    rm -rf "${b:?}"
+  done
+  shopt -u nullglob
 fi

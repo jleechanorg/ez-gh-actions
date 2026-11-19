@@ -1302,3 +1302,50 @@ missing_id_out="$(
 grep -q 'mode=app_token_fallback_partial' <<<"$missing_id_out" || \
   fail "workflow_run lacking integer id must mark mode=app_token_fallback_partial (got: $missing_id_out)"
 pass "Round-20 fixes: primary Actions row schema validation and fallback repo/run ID partial detection hold"
+
+# 26. Round-21 fixes:
+#     a) Day-1 month rollover with malformed Actions row in prior-month response stays in billing_api_partial
+#        and preserves valid current-month daily + MTD metrics (does NOT discard into gross-only fallback).
+#     b) App-token fallback leaves zero temporary files (including .repo_list / .run_ids) in TMPDIR.
+cat > "$TMP/billing-dec-valid.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"2026-12-01T00:15:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":20.0,"unitType":"Minutes","pricePerUnit":0.062,"grossAmount":60.00,"discountAmount":10.00,"netAmount":50.00,"organizationName":"jleechanorg","repositoryName":"worldai_frontend"}
+  ]
+}
+JSON
+cat > "$TMP/billing-prev-badrow.json" <<'JSON'
+{
+  "usageItems": [
+    {"date":"not-a-date","product":"Actions","sku":"Actions macOS 3-core","quantity":10.0,"unitType":"Minutes","grossAmount":99.00,"netAmount":99.00,"repositoryName":"worldarchitect.ai"}
+  ]
+}
+JSON
+printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0,"pending_corrupt_reset":false}\n' > "$TMP/state-prev-badrow.json"
+prev_badrow_out="$(
+  TARGET_DATE_UTC=2026-12-01 \
+  BILLING_FIXTURE="$TMP/billing-dec-valid.json" \
+  BILLING_PREV_FIXTURE="$TMP/billing-prev-badrow.json" \
+  REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-prev-badrow.json" "$TMP/gcloud-prev-badrow.log" "$TMP/gh-prev-badrow.log"
+)"
+grep -q 'mode=billing_api_partial' <<<"$prev_badrow_out" || \
+  fail "malformed prior-month Actions row on rollover must stay mode=billing_api_partial (got: $prev_badrow_out)"
+! grep -q 'app_token_fallback' <<<"$prev_badrow_out" || \
+  fail "malformed prior-month Actions row must NOT discard valid current-month data into fallback (got: $prev_badrow_out)"
+grep -q 'mtd_gross=60.00 mtd_net=50.00' <<<"$prev_badrow_out" || \
+  fail "malformed prior-month Actions row must preserve current-month MTD gross/net (got: $prev_badrow_out)"
+grep -q '"net_usd":50' "$TMP/gcloud-prev-badrow.log" || \
+  fail "malformed prior-month Actions row must preserve current-month daily net_usd=50 alert"
+[ "$(jq -r '.api_failures' "$TMP/state-prev-badrow.json")" = 1 ] || \
+  fail "malformed prior-month Actions row must increment api_failures=1"
+
+ISOLATED_TMPDIR="$TMP/fallback-clean-tmpdir"
+mkdir -p "$ISOLATED_TMPDIR"
+TMPDIR="$ISOLATED_TMPDIR" \
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-tmpclean.json" "$TMP/gcloud-tmpclean.log" "$TMP/gh-tmpclean.log" >/dev/null
+leftover_tmp_files="$(find "$ISOLATED_TMPDIR" -mindepth 1)"
+[ -z "$leftover_tmp_files" ] || \
+  fail "App-token fallback must leave zero temp files in TMPDIR (found: $leftover_tmp_files)"
+pass "Round-21 fixes: prior-month rollover schema isolation and fallback temp-file cleanup hold"

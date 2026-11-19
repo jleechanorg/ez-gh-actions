@@ -45,7 +45,12 @@ COST_ALERT_STAGED_SCRIPT=""
 COST_ALERT_TRANSACTION_ACTIVE=false
 COST_ALERT_SCRIPT_BACKUP=""
 COST_ALERT_HAD_PRIOR_SCRIPT=0
+COST_ALERT_HAD_PRIOR_PLIST=0
 COST_ALERT_PRIOR_LOADED=0
+
+should_install_cost_alert() {
+  [[ -n "$label_filter" ]] || [[ "${EZGHA_INSTALL_COST_ALERT_BULK:-0}" == "1" ]] || [[ -f "${TARGET_DIR}/${COST_ALERT_LABEL}.plist" ]]
+}
 
 action="${1:-status}"
 label_filter="${2:-}"
@@ -234,16 +239,38 @@ restore_dashboard_payload() {
 }
 
 backup_cost_alert_script() {
-  mkdir -p "${SCRIPTS_DIR}" "${STATE_DIR}"
-  chmod 0700 "${STATE_DIR}"
+  COST_ALERT_HAD_PRIOR_SCRIPT=0
+  COST_ALERT_SCRIPT_BACKUP=""
+  mkdir -p "${SCRIPTS_DIR}" "${STATE_DIR}" || return 1
+  chmod 0700 "${STATE_DIR}" || return 1
   if [[ -f "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" ]]; then
     COST_ALERT_SCRIPT_BACKUP="$(
       mktemp "${STATE_DIR}/.gh-actions-cost-alert.sh.backup.XXXXXX"
-    )"
-    cp -p "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" "${COST_ALERT_SCRIPT_BACKUP}"
+    )" || return 1
+    [[ -n "${COST_ALERT_SCRIPT_BACKUP}" && -f "${COST_ALERT_SCRIPT_BACKUP}" ]] || return 1
+    cp -p "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" "${COST_ALERT_SCRIPT_BACKUP}" || {
+      rm -f "${COST_ALERT_SCRIPT_BACKUP}"
+      COST_ALERT_SCRIPT_BACKUP=""
+      return 1
+    }
+    if [[ -s "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" ]]; then
+      [[ -s "${COST_ALERT_SCRIPT_BACKUP}" ]] || {
+        rm -f "${COST_ALERT_SCRIPT_BACKUP}"
+        COST_ALERT_SCRIPT_BACKUP=""
+        return 1
+      }
+    fi
     COST_ALERT_HAD_PRIOR_SCRIPT=1
   fi
   COST_ALERT_TRANSACTION_ACTIVE=true
+  return 0
+}
+
+discard_cost_alert_backup() {
+  [[ -z "${COST_ALERT_SCRIPT_BACKUP}" ]] || rm -f "${COST_ALERT_SCRIPT_BACKUP}"
+  COST_ALERT_SCRIPT_BACKUP=""
+  COST_ALERT_HAD_PRIOR_SCRIPT=0
+  COST_ALERT_TRANSACTION_ACTIVE=false
 }
 
 restore_cost_alert_script() {
@@ -252,15 +279,11 @@ restore_cost_alert_script() {
   else
     rm -f "${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
   fi
-  [[ -z "${COST_ALERT_SCRIPT_BACKUP}" ]] || rm -f "${COST_ALERT_SCRIPT_BACKUP}"
-  COST_ALERT_SCRIPT_BACKUP=""
-  COST_ALERT_TRANSACTION_ACTIVE=false
+  discard_cost_alert_backup
 }
 
 commit_cost_alert_install() {
-  [[ -z "${COST_ALERT_SCRIPT_BACKUP}" ]] || rm -f "${COST_ALERT_SCRIPT_BACKUP}"
-  COST_ALERT_SCRIPT_BACKUP=""
-  COST_ALERT_TRANSACTION_ACTIVE=false
+  discard_cost_alert_backup
 }
 
 rollback_on_exit() {
@@ -293,11 +316,43 @@ rollback_on_exit() {
 }
 
 prepare_cost_alert_upgrade() {
-  local label="$1" dest="$2" candidate="$3"
+  local label="$1" dest="$2" candidate="$3" backup="$4"
   local print_out="" print_rc=0 after_out="" after_rc=0 gui_target=""
   gui_target="gui/$(id -u)/${label}"
 
   COST_ALERT_PRIOR_LOADED=0
+  COST_ALERT_HAD_PRIOR_PLIST=0
+
+  if [[ -z "${COST_ALERT_STAGED_SCRIPT}" || ! -s "${COST_ALERT_STAGED_SCRIPT}" ]]; then
+    echo "ERROR: staged cost-alert script missing or empty: ${COST_ALERT_STAGED_SCRIPT:-<unset>}" >&2
+    rm -f "$candidate" "$backup"
+    return 1
+  fi
+
+  backup_cost_alert_script || {
+    echo "ERROR: failed to back up incumbent cost-alert script before upgrade" >&2
+    rm -f "$candidate" "$backup"
+    return 1
+  }
+
+  if [[ -f "$dest" ]]; then
+    cp -p "$dest" "$backup" || {
+      echo "ERROR: failed to back up incumbent plist ${dest} before upgrade" >&2
+      rm -f "$candidate" "$backup"
+      discard_cost_alert_backup
+      return 1
+    }
+    if [[ -s "$dest" ]]; then
+      [[ -s "$backup" ]] || {
+        echo "ERROR: plist backup ${backup} is empty after copy" >&2
+        rm -f "$candidate" "$backup"
+        discard_cost_alert_backup
+        return 1
+      }
+    fi
+    COST_ALERT_HAD_PRIOR_PLIST=1
+  fi
+
   print_out="$(launchctl print "${gui_target}" 2>&1)" || print_rc=$?
   if [[ "$print_rc" -eq 0 ]]; then
     COST_ALERT_PRIOR_LOADED=1
@@ -309,31 +364,51 @@ prepare_cost_alert_upgrade() {
     after_out="$(launchctl print "${gui_target}" 2>&1)" || after_rc=$?
     if [[ "$after_rc" -eq 0 ]]; then
       echo "ERROR: ${label} is still loaded after unload; leaving live script and ${dest} untouched" >&2
-      rm -f "$candidate"
+      rm -f "$candidate" "$backup"
+      discard_cost_alert_backup
       return 1
     fi
     if ! is_launchd_service_absent_msg "$after_out"; then
       echo "ERROR: ${label} post-unload launchctl print returned indeterminate state (rc=${after_rc}): ${after_out}" >&2
-      rm -f "$candidate"
+      if [[ -f "$dest" ]]; then
+        launchctl load "$dest" 2>/dev/null || \
+          echo "ERROR: could not reload ${dest} after indeterminate post-unload state" >&2
+      fi
+      rm -f "$candidate" "$backup"
+      discard_cost_alert_backup
       return 1
     fi
   else
     if ! is_launchd_service_absent_msg "$print_out"; then
       echo "ERROR: ${label} launchctl print returned indeterminate state (rc=${print_rc}): ${print_out}" >&2
-      rm -f "$candidate"
+      rm -f "$candidate" "$backup"
+      discard_cost_alert_backup
       return 1
     fi
     COST_ALERT_PRIOR_LOADED=0
   fi
 
-  backup_cost_alert_script
-  if [[ -z "${COST_ALERT_STAGED_SCRIPT}" || ! -f "${COST_ALERT_STAGED_SCRIPT}" ]]; then
-    echo "ERROR: staged cost-alert script missing: ${COST_ALERT_STAGED_SCRIPT:-<unset>}" >&2
-    rm -f "$candidate"
+  mv -f "${COST_ALERT_STAGED_SCRIPT}" "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" || {
+    echo "ERROR: failed to promote staged cost-alert script to ${SCRIPTS_DIR}/gh-actions-cost-alert.sh" >&2
+    rm -f "$candidate" "$backup"
+    restore_cost_alert_script
+    if [[ "${COST_ALERT_PRIOR_LOADED}" -eq 1 && -f "$dest" ]]; then
+      launchctl load "$dest" 2>/dev/null || \
+        echo "ERROR: restored prior script but could not reload it: $dest" >&2
+    fi
     return 1
-  fi
-  mv -f "${COST_ALERT_STAGED_SCRIPT}" "${SCRIPTS_DIR}/gh-actions-cost-alert.sh"
+  }
   COST_ALERT_STAGED_SCRIPT=""
+  [[ -s "${SCRIPTS_DIR}/gh-actions-cost-alert.sh" ]] || {
+    echo "ERROR: promoted cost-alert script missing or empty: ${SCRIPTS_DIR}/gh-actions-cost-alert.sh" >&2
+    rm -f "$candidate" "$backup"
+    restore_cost_alert_script
+    if [[ "${COST_ALERT_PRIOR_LOADED}" -eq 1 && -f "$dest" ]]; then
+      launchctl load "$dest" 2>/dev/null || \
+        echo "ERROR: restored prior script but could not reload it: $dest" >&2
+    fi
+    return 1
+  }
   return 0
 }
 
@@ -353,8 +428,10 @@ case "$action" in
         backup_dashboard_payload
         need_exit_trap=true
       elif [[ "$tmpl_label" == "${COST_ALERT_LABEL}" ]]; then
-        INSTALLING_COST_ALERT=true
-        need_exit_trap=true
+        if should_install_cost_alert; then
+          INSTALLING_COST_ALERT=true
+          need_exit_trap=true
+        fi
       fi
     done
     if [[ "$need_exit_trap" == true ]]; then
@@ -365,6 +442,10 @@ case "$action" in
       [[ -f "$tmpl" ]] || continue
       label="$(basename "$tmpl" .plist.template)"
       dest="${TARGET_DIR}/${label}.plist"
+      if [[ "${label}" == "${COST_ALERT_LABEL}" ]] && ! should_install_cost_alert; then
+        echo "SKIPPED: ${label} — org-singleton monitor; install explicitly with '$0 install ${label}'" >&2
+        continue
+      fi
       if grep -q '@SCRATCH_ROOT@' "$tmpl" && [[ -z "${SCRATCH_ROOT_RESOLVED}" ]]; then
         # A previously installed copy must not survive this state: it would keep
         # firing hourly at a target this host can no longer resolve.
@@ -416,18 +497,15 @@ PY
       fi
       verify_rendered_plist "$candidate" || { rm -f "$candidate"; exit 1; }
       if [[ "${label}" == "${COST_ALERT_LABEL}" ]]; then
-        prepare_cost_alert_upgrade "$label" "$dest" "$candidate" || exit 1
+        prepare_cost_alert_upgrade "$label" "$dest" "$candidate" "$backup" || exit 1
+        had_prior="${COST_ALERT_HAD_PRIOR_PLIST}"
         if ! verify_scripts_exist "$candidate"; then
-          rm -f "$candidate"
+          rm -f "$candidate" "$backup"
           restore_cost_alert_script
           if [[ "${COST_ALERT_PRIOR_LOADED}" -eq 1 && -f "$dest" ]]; then
             launchctl load "$dest" || echo "ERROR: restored prior script but could not reload it: $dest" >&2
           fi
           exit 1
-        fi
-        if [[ -f "$dest" ]]; then
-          cp -p "$dest" "$backup"
-          had_prior=1
         fi
       else
         verify_scripts_exist "$candidate" || { rm -f "$candidate"; exit 1; }
@@ -442,7 +520,28 @@ PY
       if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
         DASHBOARD_HAD_PRIOR="${had_prior}"
       fi
-      mv "$candidate" "$dest"
+      mv "$candidate" "$dest" || {
+        rc=$?
+        rm -f "$candidate"
+        if [[ "${label}" == "${DASHBOARD_LABEL}" ]]; then
+          exit "$rc"
+        fi
+        if [[ "${label}" == "${COST_ALERT_LABEL}" ]]; then
+          restore_cost_alert_script
+          if [[ "$had_prior" -eq 1 && -f "$backup" ]]; then
+            mv "$backup" "$dest" || true
+          fi
+          if [[ "${COST_ALERT_PRIOR_LOADED}" -eq 1 && -f "$dest" ]]; then
+            launchctl load "$dest" || \
+              echo "ERROR: restored prior plist but could not reload it: $dest" >&2
+          fi
+        elif [[ "$had_prior" -eq 1 && -f "$backup" ]]; then
+          mv "$backup" "$dest" || true
+          launchctl load "$dest" 2>/dev/null || true
+        fi
+        rm -f "$backup"
+        exit "$rc"
+      }
       [[ "${label}" != "${DASHBOARD_LABEL}" ]] || DASHBOARD_REPLACEMENT_INSTALLED=true
       echo "installed: $dest"
       launchctl load "$dest" || {

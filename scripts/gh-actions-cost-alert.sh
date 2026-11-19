@@ -307,7 +307,7 @@ release_state_lock() {
 cleanup() {
   [ -z "${STATE_STAGE_TMP:-}" ] || rm -f "$STATE_STAGE_TMP"
   [ -z "${STATE_NEXT_TMP:-}" ] || rm -f "$STATE_NEXT_TMP"
-  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.snapshot" "$tmp.repos" "$tmp.runs" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"
+  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.snapshot" "$tmp.repos" "$tmp.repo_list" "$tmp.runs" "$tmp.run_ids" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"
   release_state_lock
 }
 trap cleanup EXIT
@@ -764,10 +764,25 @@ elif ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "/organizations/${A
      ! jq -e '.usageItems | type == "array"' "$tmp" >/dev/null 2>&1; then
   fallback_reason="gh api billing usage failed"
 elif [ "$YEST_YEAR_MONTH" != "$YEAR_MONTH" ]; then
-  if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "/organizations/${ALERT_ORG}/settings/billing/usage?year=${YEST_YEAR}&month=${YEST_MONTH}&day=${YEST_DAY}" > "$tmp.yest" 2>"$tmp.err" || \
-     ! jq -e '.usageItems | type == "array"' "$tmp.yest" >/dev/null 2>&1; then
+  if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "/organizations/${ALERT_ORG}/settings/billing/usage?year=${YEST_YEAR}&month=${YEST_MONTH}&day=${YEST_DAY}" > "$tmp.yest" 2>"$tmp.err"; then
     rollover_yest_failed=1
     rollover_fail_reason="gh api billing usage (previous month ${YEST_YEAR_MONTH}) failed"
+    run_mode="billing_api_partial"
+  elif ! jq -e '
+    def is_valid_action_item:
+      (type == "object")
+      and ((.grossAmount | type) == "number")
+      and ((.netAmount | type) == "number")
+      and ((.quantity | type) == "number")
+      and ((.date | type) == "string")
+      and (((.date[:10]) | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
+      and ((try (((.date[:10]) + "T00:00:00Z") | fromdateiso8601) catch null) != null);
+    (.usageItems | type) == "array"
+    and ((.usageItems // []) | all(type == "object"))
+    and ([(.usageItems // [])[] | select(((.product // "") | type) == "string" and (((.product // "") | ascii_downcase) == "actions"))] | all(is_valid_action_item))
+  ' "$tmp.yest" >/dev/null 2>&1; then
+    rollover_yest_failed=1
+    rollover_fail_reason="gh api billing usage (previous month ${YEST_YEAR_MONTH}) malformed (prev_month_partial)"
     run_mode="billing_api_partial"
   else
     jq -sc '{usageItems: ((.[0].usageItems // []) + (.[1].usageItems // []))}' "$tmp" "$tmp.yest" > "$tmp.merged"
