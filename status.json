@@ -2,43 +2,6 @@
   "fleets": {
     "linux": {
       "disk": {
-        "status": "healthy"
-      },
-      "fleet": {
-        "configured": 20,
-        "cycling": 2,
-        "down": 1,
-        "executing": 17,
-        "idle": 0,
-        "reserved": 17
-      },
-      "sources": {
-        "config": {
-          "ok": true
-        },
-        "disk": {
-          "ok": true
-        },
-        "docker": {
-          "ok": true
-        },
-        "process_probe": {
-          "ok": true
-        },
-        "service": {
-          "ok": false
-        },
-        "watchdog_state": {
-          "ok": false
-        }
-      },
-      "watchdog": {
-        "consecutive_misses": null,
-        "restart_after": null
-      }
-    },
-    "mac": {
-      "disk": {
         "status": "unknown"
       },
       "fleet": {
@@ -73,23 +36,60 @@
         "consecutive_misses": null,
         "restart_after": null
       }
+    },
+    "mac": {
+      "disk": {
+        "status": "unknown"
+      },
+      "fleet": {
+        "configured": 4,
+        "cycling": null,
+        "down": null,
+        "executing": null,
+        "idle": null,
+        "reserved": null
+      },
+      "sources": {
+        "config": {
+          "ok": true
+        },
+        "disk": {
+          "ok": false
+        },
+        "docker": {
+          "ok": false
+        },
+        "process_probe": {
+          "ok": false
+        },
+        "service": {
+          "ok": false
+        },
+        "watchdog_state": {
+          "ok": false
+        }
+      },
+      "watchdog": {
+        "consecutive_misses": null,
+        "restart_after": null
+      }
     }
   },
-  "observed_at": "2026-11-19T06:39:56Z",
-  "published_at": "2026-11-19T06:41:19Z",
+  "observed_at": "2026-11-19T06:53:17Z",
+  "published_at": "2026-11-19T06:54:03Z",
   "queue": {
     "fresh": 11,
     "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 72,
+    "oldest_fresh_wait_minutes": 34,
     "repos": [
       {
-        "fresh": 6,
+        "fresh": 10,
         "ghosts": 149,
         "repo": "jleechanorg/worldarchitect.ai"
       },
       {
-        "fresh": 5,
+        "fresh": 1,
         "ghosts": 15,
         "repo": "jleechanorg/worldai_frontend"
       }
