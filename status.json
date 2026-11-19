@@ -8,8 +8,8 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 14,
-        "idle": 6,
+        "executing": 5,
+        "idle": 15,
         "reserved": 20
       },
       "sources": {
@@ -45,8 +45,8 @@
         "configured": 4,
         "cycling": 0,
         "down": 0,
-        "executing": 3,
-        "idle": 1,
+        "executing": 0,
+        "idle": 4,
         "reserved": 4
       },
       "sources": {
@@ -75,8 +75,8 @@
       }
     }
   },
-  "observed_at": "2026-11-19T04:52:34Z",
-  "published_at": "2026-11-19T04:53:07Z",
+  "observed_at": "2026-11-19T05:04:51Z",
+  "published_at": "2026-11-19T05:04:54Z",
   "queue": {
     "fresh": 0,
     "ghosts": 164,
