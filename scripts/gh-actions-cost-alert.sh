@@ -14,6 +14,8 @@
 #     most 24 `rate_limit` + 24 `/organizations/<org>/settings/billing/usage`
 #     `gh api` calls/day (48 calls/day, ~0.04% of the 5,000/hr personal REST
 #     quota; plus up to 24 previous-month day calls = 72 primary REST calls on UTC day 1).
+#     Public-repo classification adds at most 5 bounded pages/run (120/day),
+#     using the same primary credential. Unknown repos are never exempted.
 #     0 calls against the GitHub App token unless personal quota < 50 or
 #     `/settings/billing/usage` fails/403.
 #   - Bounded App-token fallback (only when personal `core.remaining < 50` or
@@ -320,7 +322,7 @@ release_state_lock() {
 cleanup() {
   [ -z "${STATE_STAGE_TMP:-}" ] || rm -f "$STATE_STAGE_TMP"
   [ -z "${STATE_NEXT_TMP:-}" ] || rm -f "$STATE_NEXT_TMP"
-  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.snapshot" "$tmp.repos" "$tmp.repo_list" "$tmp.runs" "$tmp.run_ids" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged"
+  rm -f "${tmp:?}" "$tmp.summary" "$tmp.err" "$tmp.snapshot" "$tmp.repos" "$tmp.repo_list" "$tmp.runs" "$tmp.run_ids" "$tmp.jobs" "$tmp.fallback_items" "$tmp.yest" "$tmp.merged" "$tmp.public_repos" "$tmp.public_page" "$tmp.public_next"
   release_state_lock
 }
 trap cleanup EXIT
@@ -806,8 +808,25 @@ elif [ "$YEST_YEAR_MONTH" != "$YEAR_MONTH" ]; then
   fi
 fi
 
+# Only exempt confirmed public, standard runner minutes with authoritative zero net.
+# Never infer public visibility from discounts: private included quota can also net zero.
+# Bound discovery to five pages (500 repos); missing/failed pages stay non-exempt.
+printf '[]\n' > "$tmp.public_repos"
 if [ -z "$fallback_reason" ]; then
-  if ! jq -c --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
+  for public_page in 1 2 3 4 5; do
+    if ! run_with_timeout "$GH_CALL_TIMEOUT_SEC" "$GH_BIN" api "/orgs/${ALERT_ORG}/repos?type=public&per_page=100&page=${public_page}" > "$tmp.public_page" 2>"$tmp.err" || \
+       ! jq -e --arg org "$ALERT_ORG" 'type == "array" and all(.[]; type == "object" and .private == false and .visibility == "public" and (.name | type == "string") and .owner.login == $org)' "$tmp.public_page" >/dev/null 2>&1; then
+      echo "[$NOW_ISO] WARN: public-repo classification incomplete; unverified repos retain gross/macOS alerts" >&2
+      break
+    fi
+    jq -s '.[0] + [.[1][].name] | unique' "$tmp.public_repos" "$tmp.public_page" > "$tmp.public_next"
+    mv "$tmp.public_next" "$tmp.public_repos"
+    [ "$(jq length "$tmp.public_page")" -ge 100 ] || break
+  done
+fi
+
+if [ -z "$fallback_reason" ]; then
+  if ! jq -c --slurpfile public_repos "$tmp.public_repos" --arg today "$TODAY_UTC" --arg yesterday "$YESTERDAY_UTC" --arg year_month "$YEAR_MONTH" --argjson include_yest "$((1 - rollover_yest_failed))" '
     def norm_repo: if (. // "") == "" then "(org-level)" else . end;
     def is_macos_min: (((.sku // "") | test("macos"; "i")) and (((.unitType // "") | ascii_downcase) == "minutes"));
     def is_valid_action_item:
@@ -821,6 +840,12 @@ if [ -z "$fallback_reason" ]; then
       and ((.date | type) == "string")
       and (((.date[:10]) | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
       and ((try (((.date[:10]) + "T00:00:00Z") | fromdateiso8601) catch null) != null);
+    def is_free_public_standard:
+      . as $item
+      | (.netAmount == 0)
+        and (.unitType == "Minutes")
+        and (["Actions macOS 3-core", "Actions Linux", "Actions Windows"] | index($item.sku) != null)
+        and ($public_repos[0] | index($item.repositoryName) != null);
     def sum_gross: (map(.grossAmount) | add // 0);
     def sum_net: (map(.netAmount) | add // 0);
     def sum_macos_min: (map(if is_macos_min then .quantity else 0 end) | add // 0);
@@ -851,14 +876,20 @@ if [ -z "$fallback_reason" ]; then
     | [$raw_items[] | select(((.product // "") | type) == "string" and (((.product // "") | ascii_downcase) == "actions"))] as $all_actions
     | (if all($all_actions[]; is_valid_action_item) then . else error("invalid Actions usageItem fields") end)
     | [$all_actions[] | select((.date[:7]) == $year_month)] as $mtd_actions
+    | [$all_actions[] | select(is_free_public_standard | not)] as $nonexempt_actions
+    | [$nonexempt_actions[] | select((.date[:7]) == $year_month)] as $mtd_nonexempt
+    | [$mtd_actions[] | select(is_free_public_standard)] as $free_public
     | (if $include_yest == 1 then [$yesterday, $today] else [$today] end) as $target_days
     | {
         mtd: {
           gross_usd: ($mtd_actions | sum_gross),
+          alert_gross_usd: ($mtd_nonexempt | sum_gross),
+          free_public_gross_usd: ($free_public | sum_gross),
+          free_public_macos_min: ($free_public | sum_macos_min),
           net_usd: ($mtd_actions | sum_net),
           macos_min: ($mtd_actions | sum_macos_min)
         },
-        days: ($target_days | unique | map(day_summary(.; $all_actions)))
+        days: ($target_days | unique | map(day_summary(.; $nonexempt_actions)))
       }
   ' "$tmp" > "$tmp.summary" 2>"$tmp.err"; then
     fallback_reason="gh api billing usage summary parse failed"
@@ -973,6 +1004,16 @@ else
   mtd_macos_fmt="null"
 fi
 
+free_public_gross="$(jq -r '.mtd.free_public_gross_usd // 0' "$tmp.summary")"
+if [ "$used_fallback" -eq 0 ] && ge_num "$free_public_gross" 0.000001; then
+  free_public_macos="$(jq -r '.mtd.free_public_macos_min // 0' "$tmp.summary")"
+  if ! emit INFO FREE_PUBLIC_USAGE "$TODAY_UTC" \
+    "Informational only: verified public standard runners have zero net usage charges; MTD free public gross \$$(fmt_usd "$free_public_gross") (not a bill), ${free_public_macos} macOS min. Storage, larger runners, private/unknown repos and nonzero net remain alertable." \
+    "$free_public_gross" 0 "$free_public_macos" "" "$run_mode" "$mtd_gross" "$mtd_net"; then
+    echo "[$NOW_ISO] WARN: free-public informational log failed; continuing charge checks" >&2
+  fi
+fi
+
 alerted=0
 while IFS=$'\t' read -r day d_gross d_net d_macos top_repo top_gross top_macos top_net_repo top_net_repo_net top_net_repo_gross; do
   [ -n "$day" ] || continue
@@ -1026,10 +1067,13 @@ if [ "$used_fallback" -eq 0 ] && [ "$mtd_net" != "null" ] && ge_num "$mtd_net" "
   fi
 fi
 
-if [ "$used_fallback" -eq 0 ] && [ "$mtd_gross" != "null" ] && ge_num "$mtd_gross" "$MTD_GROSS_WARN_USD"; then
+# The gross gate excludes only verified free public standard runner usage.
+# Net gates still evaluate every billable row, including storage and larger runners.
+mtd_alert_gross="$(jq -r '.mtd.alert_gross_usd // .mtd.gross_usd // "null"' "$tmp.summary")"
+if [ "$used_fallback" -eq 0 ] && [ "$mtd_alert_gross" != "null" ] && ge_num "$mtd_alert_gross" "$MTD_GROSS_WARN_USD"; then
   key="${YEAR_MONTH}:MTD_GROSS_BREACH"
   if should_emit "$key"; then
-    msg="GitHub Actions MTD GROSS usage breach in $ALERT_ORG (${YEAR_MONTH}): \$${mtd_gross_fmt} gross (>= \$${MTD_GROSS_WARN_USD}; \$${mtd_net_fmt} net, ${mtd_macos_fmt} macOS min)"
+    msg="GitHub Actions MTD GROSS usage breach in $ALERT_ORG (${YEAR_MONTH}): \$$(fmt_usd "$mtd_alert_gross") non-exempt gross (>= \$${MTD_GROSS_WARN_USD}; total \$${mtd_gross_fmt} gross / \$${mtd_net_fmt} net)"
     queue_due_breach "$key" MTD_SPEND_BREACH "$TODAY_UTC" "$msg" "$mtd_gross" "$mtd_net" "$mtd_macos" ""
   fi
 fi

@@ -71,6 +71,10 @@ case "$*" in
     fi
     cat "${BILLING_FIXTURE:?}"
     ;;
+  *"/orgs/"*"/repos?type=public"*)
+    if [ -n "${PUBLIC_REPOS_FAIL:-}" ]; then exit 1; fi
+    if [ -n "${PUBLIC_REPOS_FIXTURE:-}" ]; then cat "$PUBLIC_REPOS_FIXTURE"; else printf '[]\n'; fi
+    ;;
   *"orgs/"*"/repos"*)
     cat "${REPOS_FIXTURE:?}"
     ;;
@@ -1491,3 +1495,58 @@ grep -q 'MTD GROSS usage breach' "$TMP/gcloud-cal-mtd-breach.log" || \
 grep -q '"status":"MULTI_BREACH"' "$TMP/gcloud-cal-mtd-breach.log" || \
   fail "simultaneous COST_SPIKE + MTD gross breach must report status=MULTI_BREACH"
 pass "shipped defaults still page on MTD gross runaway (\$1550) as a combined MULTI_BREACH"
+
+# 29. Free public standard usage is informational, not a cash-spend emergency.
+# Private, unknown visibility/SKU, larger runners, net/storage and BLIND stay alertable.
+cat > "$TMP/public-repos.json" <<'JSON'
+[{"name":"disk_magician","private":false,"visibility":"public","owner":{"login":"jleechanorg"}}]
+JSON
+cat > "$TMP/free-public-billing.json" <<'JSON'
+{"usageItems":[
+ {"date":"2026-11-17T00:00:00Z","product":"actions","sku":"Actions macOS 3-core","quantity":13020,"unitType":"Minutes","grossAmount":807.24,"netAmount":0,"repositoryName":"disk_magician"},
+ {"date":"2026-11-18T00:00:00Z","product":"actions","sku":"Actions storage","quantity":2000,"unitType":"GigabyteHours","grossAmount":0.7,"netAmount":0.7,"repositoryName":"disk_magician"}
+]}
+JSON
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/free-public-billing.json" \
+ run_alert "$TMP/state-free-public.json" "$TMP/gcloud-free-public.log" "$TMP/gh-free-public.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-free-public.log")" = 0 ] || fail "free public standard minutes plus sub-threshold storage must not emit ERROR"
+grep -q 'severity=INFO' "$TMP/gcloud-free-public.log" || fail "free usage must stay visible as INFO"
+grep -q 'FREE_PUBLIC_USAGE' "$TMP/gcloud-free-public.log" || fail "free public usage must be labelled informational"
+# Passing six-hour cooldown cannot turn unchanged allowed free usage back into a page.
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/free-public-billing.json" NOW_EPOCH=1999999999 \
+ run_alert "$TMP/state-free-public.json" "$TMP/gcloud-free-public.log" "$TMP/gh-free-public.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-free-public.log")" = 0 ] || fail "historical free usage must not page after cooldown"
+# New free public usage is permitted too; this is not just a historical suppression.
+jq '.usageItems[0].date="2026-11-18T12:00:00Z" | .usageItems[0].quantity=14000 | .usageItems[0].grossAmount=868' "$TMP/free-public-billing.json" > "$TMP/new-free-billing.json"
+PUBLIC_REPOS_FIXTURE="$TMP/public-repos.json" BILLING_FIXTURE="$TMP/new-free-billing.json" \
+ run_alert "$TMP/state-new-free.json" "$TMP/gcloud-new-free.log" "$TMP/gh-new-free.log" >/dev/null
+[ "$(error_count "$TMP/gcloud-new-free.log")" = 0 ] || fail "new allowed free standard public usage must not page"
+# No metadata proof, lookup failure, private object, and wrong-owner data all fail closed.
+for case_name in unknown failed private wrong-owner larger paid storage; do
+  cp "$TMP/free-public-billing.json" "$TMP/case-billing.json"
+  cp "$TMP/public-repos.json" "$TMP/case-public.json"
+  lookup_fail=""
+  case "$case_name" in
+    unknown) printf '[]\n' > "$TMP/case-public.json" ;;
+    failed) lookup_fail=1 ;;
+    private) jq '.[0].private=true | .[0].visibility="private"' "$TMP/public-repos.json" > "$TMP/case-public.json" ;;
+    wrong-owner) jq '.[0].owner.login="other-org"' "$TMP/public-repos.json" > "$TMP/case-public.json" ;;
+    larger) jq '.usageItems[0].sku="Actions macOS 12-core"' "$TMP/free-public-billing.json" > "$TMP/case-billing.json" ;;
+    paid) jq '.usageItems[0].netAmount=15' "$TMP/free-public-billing.json" > "$TMP/case-billing.json" ;;
+    storage) jq '.usageItems[1].grossAmount=45 | .usageItems[1].netAmount=45' "$TMP/free-public-billing.json" > "$TMP/case-billing.json" ;;
+  esac
+  PUBLIC_REPOS_FIXTURE="$TMP/case-public.json" PUBLIC_REPOS_FAIL="$lookup_fail" BILLING_FIXTURE="$TMP/case-billing.json" \
+   run_alert "$TMP/state-case-$case_name.json" "$TMP/gcloud-case-$case_name.log" "$TMP/gh-case-$case_name.log" >/dev/null
+  [ "$(error_count "$TMP/gcloud-case-$case_name.log")" = 1 ] || fail "$case_name must retain one combined charge/unknown-risk ERROR"
+done
+# Only validated public rows may lower severity. Exhausting the five-page bound is safe.
+python3 - "$TMP/public-repos.json" "$TMP/public-100.json" <<'PYREPOS'
+import json,sys
+row=json.load(open(sys.argv[1]))[0]
+json.dump([dict(row,name="public-repo-"+str(i)) for i in range(100)],open(sys.argv[2],"w"))
+PYREPOS
+PUBLIC_REPOS_FIXTURE="$TMP/public-100.json" BILLING_FIXTURE="$TMP/free-public-billing.json" \
+ run_alert "$TMP/state-public-cap.json" "$TMP/gcloud-public-cap.log" "$TMP/gh-public-cap.log" >/dev/null
+[ "$(grep -c '/repos?type=public' "$TMP/gh-public-cap.log")" = 5 ] || fail "public lookup must be capped at five pages"
+[ "$(error_count "$TMP/gcloud-public-cap.log")" = 1 ] || fail "unseen repo after page cap must remain alertable"
+pass "free public standard usage stays INFO across cooldown/new usage; private, unknown, larger, paid and storage stay ERROR; visibility lookup bounded"
