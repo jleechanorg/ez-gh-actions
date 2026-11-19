@@ -528,21 +528,54 @@ def iter_audit_repo_blocks(raw):
             yield slug, val
 
 
+def _expect_dict(val, label):
+    if val is None:
+        return {}
+    if not isinstance(val, dict):
+        raise ValueError(f"{label} must be dict, got {type(val).__name__}")
+    return val
+
+
+def _expect_list(val, label):
+    if val is None:
+        return []
+    if not isinstance(val, list):
+        raise ValueError(f"{label} must be list, got {type(val).__name__}")
+    return val
+
+
+def _expect_int(val, label):
+    if val is None:
+        return 0
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"{label} must be int, got {type(val).__name__}")
+    return val
+
+
 def from_audit_data(raw):
     """Normalize a pre-collected ci_latency_percentiles dict into canonical probe shape."""
     if not isinstance(raw, dict):
         return {"schema_version": 1, "ok": False, "overall": {}, "cohorts": {}, "cancellation": {}, "workflows": []}
     repo_blocks = list(iter_audit_repo_blocks(raw))
     primary_slug, primary = repo_blocks[0] if repo_blocks else (None, {})
-    recent = primary.get("recent_contiguous_runs") or primary.get("recent_runs") or {}
-    cohorts = recent.get("cohorts") or {}
-    job_audit = primary.get("job_level_audit") or {}
-    job_cohorts = job_audit.get("job_cohorts") or {}
+    recent = _expect_dict(
+        primary.get("recent_contiguous_runs") if primary.get("recent_contiguous_runs") is not None else primary.get("recent_runs"),
+        "recent_runs",
+    )
+    cohorts = _expect_dict(recent.get("cohorts"), "recent.cohorts")
+    job_audit = _expect_dict(primary.get("job_level_audit"), "job_level_audit")
+    job_cohorts = _expect_dict(job_audit.get("job_cohorts"), "job_level_audit.job_cohorts")
 
     cohorts_out = {}
     for c in COHORT_NAMES:
-        jc = job_cohorts.get(c) or {}
-        rc = cohorts.get(c) or {}
+        jc = _expect_dict(job_cohorts.get(c), f"job_cohorts.{c}")
+        rc = cohorts.get(c)
+        if rc is not None and not isinstance(rc, dict):
+            raise ValueError(f"cohorts.{c} must be dict, got {type(rc).__name__}")
+        for stat_key in ("queue_wait", "execution", "total"):
+            blk = jc.get(stat_key)
+            if blk is not None and not isinstance(blk, dict):
+                raise ValueError(f"job_cohorts.{c}.{stat_key} must be dict, got {type(blk).__name__}")
         cohorts_out[c] = {
             "queue_wait": _pick_stat_block(jc.get("queue_wait")),
             "execution": _pick_stat_block(jc.get("execution")),
@@ -557,11 +590,16 @@ def from_audit_data(raw):
     skipped_n = 0
     total_non_skipped = 0
     for _slug, block in repo_blocks:
-        r_rec = block.get("recent_contiguous_runs") or block.get("recent_runs") or {}
-        r_coh = r_rec.get("cohorts") or {}
-        cancelled_n += (r_coh.get("cancelled") or {}).get("n") or 0
-        skipped_n += r_rec.get("skipped_or_neutral_runs") or 0
-        total_non_skipped += (r_coh.get("all_non_skipped") or {}).get("n") or 0
+        r_rec = _expect_dict(
+            block.get("recent_contiguous_runs") if block.get("recent_contiguous_runs") is not None else block.get("recent_runs"),
+            "repo_block.recent_runs",
+        )
+        r_coh = _expect_dict(r_rec.get("cohorts"), "repo_block.cohorts")
+        cancelled_blk = _expect_dict(r_coh.get("cancelled"), "repo_block.cohorts.cancelled")
+        all_blk = _expect_dict(r_coh.get("all_non_skipped"), "repo_block.cohorts.all_non_skipped")
+        cancelled_n += _expect_int(cancelled_blk.get("n"), "cancelled.n")
+        skipped_n += _expect_int(r_rec.get("skipped_or_neutral_runs"), "skipped_or_neutral_runs")
+        total_non_skipped += _expect_int(all_blk.get("n"), "all_non_skipped.n")
     cancelled_pct = (
         round((cancelled_n / total_non_skipped) * 100.0, 1)
         if total_non_skipped > 0
@@ -570,20 +608,26 @@ def from_audit_data(raw):
 
     workflows = []
     for repo_slug, repo_block in repo_blocks:
-        r_recent = repo_block.get("recent_contiguous_runs") or repo_block.get("recent_runs") or {}
-        r_wf_map = {
-            wf["workflow"]: wf
-            for wf in (r_recent.get("by_workflow") or [])
-            if isinstance(wf, dict) and isinstance(wf.get("workflow"), str)
-        }
-        r_jobs = repo_block.get("job_level_audit") or {}
-        for wf in r_jobs.get("by_workflow") or []:
-            if not isinstance(wf, dict) or not isinstance(wf.get("workflow"), str):
+        r_recent = _expect_dict(
+            repo_block.get("recent_contiguous_runs") if repo_block.get("recent_contiguous_runs") is not None else repo_block.get("recent_runs"),
+            "repo_block.recent_runs",
+        )
+        r_wf_map = {}
+        for wf in _expect_list(r_recent.get("by_workflow"), "recent.by_workflow"):
+            if not isinstance(wf, dict):
+                raise ValueError(f"recent.by_workflow row must be dict, got {type(wf).__name__}")
+            if isinstance(wf.get("workflow"), str):
+                r_wf_map[wf["workflow"]] = wf
+        r_jobs = _expect_dict(repo_block.get("job_level_audit"), "repo_block.job_level_audit")
+        for wf in _expect_list(r_jobs.get("by_workflow"), "job_level_audit.by_workflow"):
+            if not isinstance(wf, dict):
+                raise ValueError(f"job_level_audit.by_workflow row must be dict, got {type(wf).__name__}")
+            if not isinstance(wf.get("workflow"), str):
                 continue
             r_match = r_wf_map.get(wf["workflow"]) or {}
             wf_cohorts = {}
             for c in COHORT_NAMES:
-                c_data = wf.get(c) or {}
+                c_data = _expect_dict(wf.get(c), f"by_workflow.{c}")
                 wf_cohorts[c] = {
                     "queue_wait": _pick_stat_block(c_data.get("queue_wait")),
                     "execution": _pick_stat_block(c_data.get("execution")),
@@ -609,21 +653,20 @@ def from_audit_data(raw):
     )
 
     step_cats = {}
-    raw_steps = (
-        (job_audit.get("p90_slow_success_job_step_breakdown") or {}).get("category_summaries_s")
-        or {}
-    )
+    step_breakdown = _expect_dict(job_audit.get("p90_slow_success_job_step_breakdown"), "p90_slow_success_job_step_breakdown")
+    raw_steps = _expect_dict(step_breakdown.get("category_summaries_s"), "category_summaries_s")
     for cat, stats in raw_steps.items():
         if isinstance(cat, str) and isinstance(stats, dict):
             step_cats[cat] = _pick_stat_block(stats)
 
     runner_classes = {}
-    for cls, cls_data in (job_audit.get("by_runner_class") or {}).items():
+    raw_runner_classes = _expect_dict(job_audit.get("by_runner_class"), "by_runner_class")
+    for cls, cls_data in raw_runner_classes.items():
         if not isinstance(cls, str) or not isinstance(cls_data, dict):
             continue
         cohorts_blk = {}
         for c in COHORT_NAMES:
-            c_raw = cls_data.get(c) or {}
+            c_raw = _expect_dict(cls_data.get(c), f"by_runner_class.{cls}.{c}")
             cohorts_blk[c] = {
                 "queue_wait": _pick_stat_block(c_raw.get("queue_wait")),
                 "execution": _pick_stat_block(c_raw.get("execution")),

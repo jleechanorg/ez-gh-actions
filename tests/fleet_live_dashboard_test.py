@@ -1213,6 +1213,139 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     srv.shutdown()
                     srv.server_close()
 
+    def test_generated_malformed_nested_mutations_never_crash(self):
+        import copy
+
+        mod = load_module()
+        base_hosts = {
+            "hosts": {
+                "linux-1": {
+                    "disk": {"avail": "25G", "use_pct": "98%", "min_free_disk_gb_floor": 30},
+                    "memory": {"used": "4G", "total": "16G", "swap_used": "0G"},
+                    "load_average": [1.0, 2.0, 3.0],
+                    "disk_pressure_contributors": ["log"],
+                    "configured_slots": 1,
+                    "slots": [{"name": "r-1", "slot": 1, "state": "EXECUTING", "worker_etimes_sec": 60, "active_child_commands": ["pytest"]}],
+                },
+                "mac": {
+                    "disk": {"root_avail": "40G", "min_free_disk_gb_floor": 20},
+                    "load_average": [1.0],
+                    "configured_container_slots": 1,
+                    "container_slots": [{"name": "m-1", "state": "IDLE"}],
+                    "native_runners": [{"name": "n-1", "state": "IDLE"}],
+                },
+            }
+        }
+        base_cmux = {
+            "vms": [{
+                "short": "vm1",
+                "ezgha_config": {"count": 1, "min_free_disk_gb": 10},
+                "disk": {"avail_gb": 20, "total_gb": 40, "use_pct": "50%"},
+                "memory": {"used_mb": 1024, "total_mb": 4096},
+                "memory_mb": 4096,
+                "vcpus": 2,
+                "slots": [{"name": "c-1", "state": "IDLE"}],
+            }],
+            "fleet_summary": {"special_runners": [{"name": "sp-1", "state": "OFFLINE"}]},
+            "github_reconciliation": {
+                "in_progress_runs_by_repo": {"a/x": 1},
+                "queued_runs_by_repo": {"a/x": 1},
+                "worldarchitect_queued_breakdown": {"total_queued_runs_api": 1, "queued_runs_with_jobs": 1, "queued_runs_zero_jobs": 0},
+            },
+        }
+        base_gh = {
+            "summary": {
+                "total_in_progress_runs_by_repo": {"a/x": 1},
+                "q_unverified_runs": 0,
+                "expected_repos": 1,
+                "succeeded_repos": 1,
+            },
+            "all_in_progress_jobs": [{"runner_name": "r-1", "run_id": 10, "job_name": "j1"}],
+        }
+        base_lat = {
+            "wa": {
+                "repo": "a/x",
+                "recent_contiguous_runs": {
+                    "cohorts": {"success": {"n": 1, "p50_s": 3}, "cancelled": {"n": 0}, "all_non_skipped": {"n": 1}},
+                    "skipped_or_neutral_runs": 0,
+                    "by_workflow": [{"workflow": "w", "success": {"n": 1, "p50_s": 3}}],
+                },
+                "job_level_audit": {
+                    "job_cohorts": {"success": {"queue_wait": {"n": 1, "p50_s": 1}, "execution": {"n": 1, "p50_s": 2}, "total": {"n": 1, "p50_s": 3}}},
+                    "by_workflow": [{"workflow": "w", "success": {"queue_wait": {"n": 1}, "execution": {"n": 1}, "total": {"n": 1}}}],
+                    "by_runner_class": {"linux": {"success": {"queue_wait": {"n": 1}, "execution": {"n": 1}}}},
+                    "p90_slow_success_job_step_breakdown": {"category_summaries_s": {"test": {"n": 1, "p50_s": 2}}},
+                },
+            }
+        }
+
+        def iter_paths(obj, prefix=()):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    yield prefix + (k,), v
+                    yield from iter_paths(v, prefix + (k,))
+            elif isinstance(obj, list):
+                for idx, v in enumerate(obj):
+                    yield prefix + (idx,), v
+                    yield from iter_paths(v, prefix + (idx,))
+
+        def set_path(root, path, val):
+            cur = root
+            for step in path[:-1]:
+                cur = cur[step]
+            cur[path[-1]] = val
+
+        bad_values = (None, "x", [1], {"bad": 1}, True, -1)
+        bases = [("hosts", base_hosts), ("cmux", base_cmux), ("gh", base_gh), ("lat", base_lat)]
+        mutated_count = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for fname, bdict in bases:
+                for path, _orig in iter_paths(bdict):
+                    for bad in bad_values:
+                        mutated = copy.deepcopy(bdict)
+                        set_path(mutated, path, bad)
+                        payloads = {
+                            "ubuntu_mac_slots.json": mutated if fname == "hosts" else base_hosts,
+                            "cmux_and_github_reconciliation.json": mutated if fname == "cmux" else base_cmux,
+                            "github_live_snapshot.json": mutated if fname == "gh" else base_gh,
+                            "ci_latency_percentiles.json": mutated if fname == "lat" else base_lat,
+                        }
+                        for p_name, p_obj in payloads.items():
+                            (tmp_path / p_name).write_text(json.dumps(p_obj), encoding="utf-8")
+                        st = mod.build_operator_state(audit_dir=tmp_path)
+                        html_out = mod.render_html(st)
+                        self.assertIn("Fleet + Queue + CI Latency Inspector", html_out)
+                        mutated_count += 1
+            self.assertGreater(mutated_count, 300)
+
+            # Also verify live HTTP routes / and /api/state stay 200 on representative deep mutations.
+            rep = copy.deepcopy(base_hosts)
+            rep["hosts"]["mac"]["container_slots"] = [{"name": {"a": 1}, "state": 5}]
+            (tmp_path / "ubuntu_mac_slots.json").write_text(json.dumps(rep), encoding="utf-8")
+            (tmp_path / "cmux_and_github_reconciliation.json").write_text(json.dumps(base_cmux), encoding="utf-8")
+            bad_gh = copy.deepcopy(base_gh)
+            bad_gh["summary"]["q_unverified_runs"] = "x"
+            (tmp_path / "github_live_snapshot.json").write_text(json.dumps(bad_gh), encoding="utf-8")
+            bad_lat = copy.deepcopy(base_lat)
+            bad_lat["wa"]["job_level_audit"]["by_runner_class"] = [1]
+            (tmp_path / "ci_latency_percentiles.json").write_text(json.dumps(bad_lat), encoding="utf-8")
+            srv = mod.create_server(port=0, audit_dir=tmp_path)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                port = srv.server_address[1]
+                self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5).status, 200)
+                api = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5).read().decode("utf-8"))
+                self.assertTrue(api["reconciliation"]["hosts_partial"])
+                self.assertTrue(api["reconciliation"]["active_runs_partial"])
+                self.assertTrue(api["reconciliation"]["queue_partial"])
+                self.assertFalse(api["latency"]["ok"])
+                self.assertGreaterEqual(len(api["reconciliation"]["fixture_errors"]), 3)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

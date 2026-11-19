@@ -91,7 +91,28 @@ def _is_valid_gh_payload(data):
             "total_queued_runs_by_repo",
             "queued_jobs_by_repo",
         ):
-            if summary.get(key) is not None and not isinstance(summary.get(key), dict):
+            val = summary.get(key)
+            if val is not None:
+                if not isinstance(val, dict) or not all(
+                    isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool)
+                    for k, v in val.items()
+                ):
+                    return False
+        for key in (
+            "q_unverified_runs",
+            "expected_repos",
+            "succeeded_repos",
+            "ip_expected_repos",
+            "ip_succeeded_repos",
+            "q_expected_repos",
+            "q_succeeded_repos",
+            "fresh_queued_runs",
+            "inert_ghosts",
+            "total_in_progress_jobs_across_org",
+            "total_queued_jobs_across_org",
+        ):
+            val = summary.get(key)
+            if val is not None and (isinstance(val, bool) or not isinstance(val, int)):
                 return False
     if "all_in_progress_jobs" in data and jobs is not None:
         if not isinstance(jobs, list) or not all(isinstance(j, dict) for j in jobs):
@@ -206,7 +227,10 @@ def _build_gh_job_index(github_data):
     by_run_job = {}
     if not isinstance(github_data, dict):
         return by_runner, by_run_job
-    for job in github_data.get("all_in_progress_jobs") or []:
+    jobs = github_data.get("all_in_progress_jobs")
+    if not isinstance(jobs, list):
+        return by_runner, by_run_job
+    for job in jobs:
         if not isinstance(job, dict):
             continue
         rname = job.get("runner_name")
@@ -214,14 +238,25 @@ def _build_gh_job_index(github_data):
             by_runner[rname] = job
         rid = job.get("run_id")
         jname = job.get("job_name")
-        if rid and jname:
-            by_run_job[(str(rid), str(jname))] = job
+        if isinstance(rid, (int, str)) and not isinstance(rid, bool) and rid and isinstance(jname, str) and jname:
+            by_run_job[(str(rid), jname)] = job
     return by_runner, by_run_job
 
 
 def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
-    name = slot_raw.get("name") or f"slot-{slot_raw.get('slot', '?')}"
-    state = str(slot_raw.get("state") or "DOWN").upper()
+    if not isinstance(slot_raw, dict):
+        raise ValueError(f"slot row must be object, got {type(slot_raw).__name__}")
+    raw_name = slot_raw.get("name")
+    if raw_name is not None and not isinstance(raw_name, str):
+        raise ValueError(f"slot name must be string, got {type(raw_name).__name__}")
+    raw_slot = slot_raw.get("slot")
+    if raw_slot is not None and not isinstance(raw_slot, (str, int)):
+        raise ValueError(f"slot identifier must be string/int, got {type(raw_slot).__name__}")
+    name = raw_name if (isinstance(raw_name, str) and raw_name) else f"slot-{raw_slot if raw_slot is not None else '?'}"
+    raw_state = slot_raw.get("state")
+    if raw_state is not None and not isinstance(raw_state, str):
+        raise ValueError(f"slot state must be string, got {type(raw_state).__name__}")
+    state = (raw_state or "DOWN").upper()
     if state == "STARTING_OR_CYCLING":
         state = "CYCLING"
     gh_match = slot_raw.get("github_match") if isinstance(slot_raw.get("github_match"), dict) else None
@@ -234,20 +269,24 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
         or (gh_live or {}).get("repo")
     )
     full_repo = _full_repo(repo)
-    run_id = slot_raw.get("run_id") or (gh_live or {}).get("run_id")
-    job_display = (
+    raw_run_id = slot_raw.get("run_id") or (gh_live or {}).get("run_id")
+    run_id = raw_run_id if isinstance(raw_run_id, (int, str)) and not isinstance(raw_run_id, bool) else None
+    raw_job_display = (
         slot_raw.get("job_display_name")
         or (gh_match or {}).get("job_name")
         or (gh_live or {}).get("job_name")
     )
+    job_display = raw_job_display if isinstance(raw_job_display, str) else None
     if not gh_live and run_id and job_display:
-        gh_live = gh_by_run_job.get((str(run_id), str(job_display)))
+        gh_live = gh_by_run_job.get((str(run_id), job_display))
 
     workflow = (
         slot_raw.get("workflow")
         or (gh_match or {}).get("run_name")
         or (gh_live or {}).get("run_name")
     )
+    if workflow is not None and not isinstance(workflow, str):
+        workflow = str(workflow)
     run_url = _safe_http_url(
         slot_raw.get("run_url")
         or (gh_match or {}).get("run_html_url")
@@ -260,7 +299,7 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
         (gh_match or {}).get("html_url")
         or (gh_live or {}).get("html_url")
     )
-    if not job_url and full_repo and run_id and (gh_live or {}).get("job_id"):
+    if not job_url and full_repo and run_id and isinstance((gh_live or {}).get("job_id"), (int, str)):
         job_url = _safe_http_url(f"https://github.com/{full_repo}/actions/runs/{run_id}/job/{gh_live['job_id']}")
 
     ref = slot_raw.get("ref") or slot_raw.get("head_ref")
@@ -268,9 +307,19 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
     pr_label, pr_url = _extract_pr_info(full_repo, ref, head_branch)
     pr_url = _safe_http_url(pr_url)
 
-    elapsed_min = slot_raw.get("elapsed_minutes")
-    if elapsed_min is None and isinstance(slot_raw.get("worker_etimes_sec"), (int, float)):
-        elapsed_min = round(slot_raw["worker_etimes_sec"] / 60.0, 1)
+    raw_elapsed = slot_raw.get("elapsed_minutes")
+    if raw_elapsed is not None:
+        if isinstance(raw_elapsed, bool) or not isinstance(raw_elapsed, (int, float)):
+            raise ValueError(f"slot elapsed_minutes must be numeric, got {type(raw_elapsed).__name__}")
+        elapsed_min = raw_elapsed
+    else:
+        raw_etimes = slot_raw.get("worker_etimes_sec")
+        if raw_etimes is not None:
+            if isinstance(raw_etimes, bool) or not isinstance(raw_etimes, (int, float)):
+                raise ValueError(f"slot worker_etimes_sec must be numeric, got {type(raw_etimes).__name__}")
+            elapsed_min = round(raw_etimes / 60.0, 1)
+        else:
+            elapsed_min = None
 
     raw_cmds = (
         slot_raw.get("active_child_commands")
@@ -351,6 +400,14 @@ def _as_dict_list(val, label, errors):
     return valid
 
 
+def _safe_enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, *, host_disk_paused=False, label="slot", errors=None):
+    try:
+        return _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=host_disk_paused)
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        _record_norm_error(errors, f"{label}: {exc}")
+        return None
+
+
 def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
     gh_by_runner, gh_by_run_job = _build_gh_job_index(gh_data)
     hosts = []
@@ -363,163 +420,186 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
         if not isinstance(ju, dict):
             _record_norm_error(errors, f"hosts.{host_key}: expected object, got {type(ju).__name__}")
             continue
-        disk = _as_dict(ju.get("disk"), f"hosts.{host_key}.disk", errors)
-        mem = _as_dict(ju.get("memory"), f"hosts.{host_key}.memory", errors)
-        load = _as_list(ju.get("load_average"), f"hosts.{host_key}.load_average", errors)
-        contributors = _as_list(ju.get("disk_pressure_contributors"), f"hosts.{host_key}.disk_pressure_contributors", errors)
-        paused = "PAUSED" in str(ju.get("admission_status") or "").upper()
-        slots = [
-            _enrich_slot(s, gh_by_runner, gh_by_run_job, host_disk_paused=paused)
-            for s in _as_dict_list(ju.get("slots"), f"hosts.{host_key}.slots", errors)
-        ]
-        for s in slots:
-            seen_slot_names.add(s["name"])
-        cfg_slots = ju.get("configured_slots")
-        if not isinstance(cfg_slots, int) or isinstance(cfg_slots, bool):
-            cfg_slots = len(slots)
-        hosts.append({
-            "id": host_key,
-            "title": ju.get("display_name") or f"{host_key} (Bare-Metal Linux X64)",
-            "group": ju.get("group") or "jeff-ubuntu",
-            "status": ju.get("admission_status") or ju.get("ezgha_service_status") or "active",
-            "alert_message": ju.get("admission_message"),
-            "contributors": contributors,
-            "vitals": {
-                "load": ", ".join(str(x) for x in load) if load else None,
-                "mem": f"{mem.get('used', '?')}/{mem.get('total', '?')} (swap {mem.get('swap_used', '?')})" if mem else None,
-                "disk": f"{disk.get('avail', '?')} free ({disk.get('use_pct', '?')} used, floor {disk.get('min_free_disk_gb_floor', '?')}G)" if disk else None,
-            },
-            "configured": cfg_slots,
-            "slots": slots,
-        })
+        try:
+            disk = _as_dict(ju.get("disk"), f"hosts.{host_key}.disk", errors)
+            mem = _as_dict(ju.get("memory"), f"hosts.{host_key}.memory", errors)
+            load = _as_list(ju.get("load_average"), f"hosts.{host_key}.load_average", errors)
+            contributors = _as_list(ju.get("disk_pressure_contributors"), f"hosts.{host_key}.disk_pressure_contributors", errors)
+            paused = "PAUSED" in str(ju.get("admission_status") or "").upper()
+            slots = []
+            for s in _as_dict_list(ju.get("slots"), f"hosts.{host_key}.slots", errors):
+                enriched = _safe_enrich_slot(
+                    s, gh_by_runner, gh_by_run_job, host_disk_paused=paused, label=f"hosts.{host_key}.slots", errors=errors
+                )
+                if enriched is not None:
+                    slots.append(enriched)
+                    seen_slot_names.add(enriched["name"])
+            cfg_slots = ju.get("configured_slots")
+            if not isinstance(cfg_slots, int) or isinstance(cfg_slots, bool):
+                cfg_slots = len(slots)
+            hosts.append({
+                "id": str(host_key),
+                "title": ju.get("display_name") or f"{host_key} (Bare-Metal Linux X64)",
+                "group": ju.get("group") or "jeff-ubuntu",
+                "status": ju.get("admission_status") or ju.get("ezgha_service_status") or "active",
+                "alert_message": ju.get("admission_message"),
+                "contributors": contributors,
+                "vitals": {
+                    "load": ", ".join(str(x) for x in load) if load else None,
+                    "mem": f"{mem.get('used', '?')}/{mem.get('total', '?')} (swap {mem.get('swap_used', '?')})" if mem else None,
+                    "disk": f"{disk.get('avail', '?')} free ({disk.get('use_pct', '?')} used, floor {disk.get('min_free_disk_gb_floor', '?')}G)" if disk else None,
+                },
+                "configured": cfg_slots,
+                "slots": slots,
+            })
+        except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+            _record_norm_error(errors, f"hosts.{host_key}: {exc}")
 
     if isinstance(cmux_data, dict):
         vms_raw = cmux_data.get("cmux_vms") if cmux_data.get("cmux_vms") is not None else cmux_data.get("vms")
         vms = _as_dict_list(vms_raw, "cmux.vms", errors)
         for vm in vms:
-            short = vm.get("short") or vm.get("slug") or vm.get("id")
-            cfg_raw = vm.get("ezgha_config") if vm.get("ezgha_config") is not None else vm.get("config")
-            cfg = _as_dict(cfg_raw, "cmux.vm.config", errors)
-            disk = _as_dict(vm.get("disk"), "cmux.vm.disk", errors)
-            mem = _as_dict(vm.get("memory"), "cmux.vm.memory", errors)
-            disk_str = (
-                f"{disk.get('avail_gb', '?')}G/{disk.get('total_gb', '?')}G free ({disk.get('use_pct', '?')}, floor {cfg.get('min_free_disk_gb', '?')}G)"
-                if disk
-                else vm.get("df_root") or None
-            )
-            mem_str = (
-                f"{mem.get('used_mb', '?')}/{mem.get('total_mb', '?')} MiB"
-                if mem
-                else vm.get("mem") or None
-            )
-            slots = [
-                _enrich_slot(s, gh_by_runner, gh_by_run_job, host_disk_paused=False)
-                for s in _as_dict_list(vm.get("slots"), "cmux.vm.slots", errors)
-            ]
-            for s in slots:
-                seen_slot_names.add(s["name"])
-            raw_mem_mb = vm.get("memory_mb")
-            mem_gib = (
-                round(raw_mem_mb / 1024, 1)
-                if isinstance(raw_mem_mb, (int, float)) and not isinstance(raw_mem_mb, bool)
-                else "?"
-            )
-            cfg_count = cfg.get("count")
-            if not isinstance(cfg_count, int) or isinstance(cfg_count, bool):
-                cfg_count = len(slots)
-            hosts.append({
-                "id": short,
-                "title": f"{short} ({vm.get('display_name') or vm.get('slug') or vm.get('id')})",
-                "group": "cmux",
-                "status": vm.get("status") or "running",
-                "alert_message": None,
-                "contributors": [],
-                "vitals": {
-                    "load": vm.get("load_avg") or vm.get("uptime"),
-                    "mem": mem_str,
-                    "disk": disk_str,
-                    "spec": f"{vm.get('vcpus', '?')} vCPU / {mem_gib} GiB",
-                },
-                "configured": cfg_count,
-                "slots": slots,
-            })
+            try:
+                short = vm.get("short") or vm.get("slug") or vm.get("id")
+                cfg_raw = vm.get("ezgha_config") if vm.get("ezgha_config") is not None else vm.get("config")
+                cfg = _as_dict(cfg_raw, "cmux.vm.config", errors)
+                disk = _as_dict(vm.get("disk"), "cmux.vm.disk", errors)
+                mem = _as_dict(vm.get("memory"), "cmux.vm.memory", errors)
+                disk_str = (
+                    f"{disk.get('avail_gb', '?')}G/{disk.get('total_gb', '?')}G free ({disk.get('use_pct', '?')}, floor {cfg.get('min_free_disk_gb', '?')}G)"
+                    if disk
+                    else vm.get("df_root") or None
+                )
+                mem_str = (
+                    f"{mem.get('used_mb', '?')}/{mem.get('total_mb', '?')} MiB"
+                    if mem
+                    else vm.get("mem") or None
+                )
+                slots = []
+                for s in _as_dict_list(vm.get("slots"), "cmux.vm.slots", errors):
+                    enriched = _safe_enrich_slot(
+                        s, gh_by_runner, gh_by_run_job, host_disk_paused=False, label="cmux.vm.slots", errors=errors
+                    )
+                    if enriched is not None:
+                        slots.append(enriched)
+                        seen_slot_names.add(enriched["name"])
+                raw_mem_mb = vm.get("memory_mb")
+                mem_gib = (
+                    round(raw_mem_mb / 1024, 1)
+                    if isinstance(raw_mem_mb, (int, float)) and not isinstance(raw_mem_mb, bool)
+                    else "?"
+                )
+                cfg_count = cfg.get("count")
+                if not isinstance(cfg_count, int) or isinstance(cfg_count, bool):
+                    cfg_count = len(slots)
+                hosts.append({
+                    "id": short if isinstance(short, (str, int)) else str(short),
+                    "title": f"{short} ({vm.get('display_name') or vm.get('slug') or vm.get('id')})",
+                    "group": "cmux",
+                    "status": vm.get("status") or "running",
+                    "alert_message": None,
+                    "contributors": [],
+                    "vitals": {
+                        "load": vm.get("load_avg") or vm.get("uptime"),
+                        "mem": mem_str,
+                        "disk": disk_str,
+                        "spec": f"{vm.get('vcpus', '?')} vCPU / {mem_gib} GiB",
+                    },
+                    "configured": cfg_count,
+                    "slots": slots,
+                })
+            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+                _record_norm_error(errors, f"cmux.vm: {exc}")
 
     mac_raw = raw_hosts.get("mac")
     if mac_raw is not None and not isinstance(mac_raw, dict):
         _record_norm_error(errors, f"hosts.mac: expected object, got {type(mac_raw).__name__}")
     elif isinstance(mac_raw, dict):
-        mac = mac_raw
-        disk = _as_dict(mac.get("disk"), "hosts.mac.disk", errors)
-        load = _as_list(mac.get("load_average"), "hosts.mac.load_average", errors)
-        c_slots = [
-            _enrich_slot(s, gh_by_runner, gh_by_run_job)
-            for s in _as_dict_list(mac.get("container_slots"), "hosts.mac.container_slots", errors)
-        ]
-        n_slots = [
-            _enrich_slot(
-                {
-                    **s,
-                    "slot": s.get("name"),
-                    "down_reason": s.get("idle_note") or s.get("last_job"),
+        try:
+            mac = mac_raw
+            disk = _as_dict(mac.get("disk"), "hosts.mac.disk", errors)
+            load = _as_list(mac.get("load_average"), "hosts.mac.load_average", errors)
+            c_slots = [
+                enriched
+                for s in _as_dict_list(mac.get("container_slots"), "hosts.mac.container_slots", errors)
+                for enriched in [
+                    _safe_enrich_slot(s, gh_by_runner, gh_by_run_job, label="hosts.mac.container_slots", errors=errors)
+                ]
+                if enriched is not None
+            ]
+            n_slots = [
+                enriched
+                for s in _as_dict_list(mac.get("native_runners"), "hosts.mac.native_runners", errors)
+                for enriched in [
+                    _safe_enrich_slot(
+                        {
+                            **s,
+                            "slot": s.get("name"),
+                            "down_reason": s.get("idle_note") or s.get("last_job"),
+                        },
+                        gh_by_runner,
+                        gh_by_run_job,
+                        label="hosts.mac.native_runners",
+                        errors=errors,
+                    )
+                ]
+                if enriched is not None
+            ]
+            all_mac_slots = c_slots + n_slots
+            for s in all_mac_slots:
+                seen_slot_names.add(s["name"])
+            launchd_state = str(mac.get("ezgha_launchd_status") or "").lower()
+            has_active_containers = any(s["state"] in ("EXECUTING", "IDLE", "CYCLING") for s in c_slots)
+            explicit_parked = (
+                mac.get("parked") is True
+                or launchd_state == "parked"
+                or (bool(c_slots) and all(s["state"] == "PARKED" for s in c_slots))
+            )
+            mac_parked = not has_active_containers and explicit_parked
+            mac_unhealthy = not has_active_containers and not mac_parked
+            mac_title = (
+                "macOS (Containers PARKED + Native Runners)"
+                if mac_parked
+                else ("macOS (Containers DOWN / Unreachable + Native Runners)" if mac_unhealthy else "macOS (Containers Active + Native Runners)")
+            )
+            mac_status = (
+                f"containers {mac.get('ezgha_launchd_status', 'disabled')} (PARKED)"
+                if mac_parked
+                else (
+                    f"containers {mac.get('ezgha_launchd_status', 'inactive')} (UNHEALTHY/DOWN)"
+                    if mac_unhealthy
+                    else f"containers {mac.get('ezgha_launchd_status', 'active')}"
+                )
+            )
+            mac_alert = (
+                mac.get("parked_note") or "ezgha launchd container service disabled; native runners remain active."
+                if mac_parked
+                else (
+                    "Mac container runners are inactive/down with MAC_RUNNER_DISABLED unset (unintended outage or Colima unreachable)."
+                    if mac_unhealthy
+                    else None
+                )
+            )
+            cfg_mac_c = mac.get("configured_container_slots")
+            if not isinstance(cfg_mac_c, int) or isinstance(cfg_mac_c, bool):
+                cfg_mac_c = len(c_slots)
+            hosts.append({
+                "id": "mac",
+                "title": mac_title,
+                "group": "mac",
+                "status": mac_status,
+                "alert_message": mac_alert,
+                "contributors": [],
+                "vitals": {
+                    "load": ", ".join(str(x) for x in load) if load else None,
+                    "disk": f"{disk.get('root_avail', '?')} free (floor {disk.get('min_free_disk_gb_floor', '?')}G)" if disk else None,
+                    "colima": mac.get("colima_status"),
                 },
-                gh_by_runner,
-                gh_by_run_job,
-            )
-            for s in _as_dict_list(mac.get("native_runners"), "hosts.mac.native_runners", errors)
-        ]
-        all_mac_slots = c_slots + n_slots
-        for s in all_mac_slots:
-            seen_slot_names.add(s["name"])
-        launchd_state = str(mac.get("ezgha_launchd_status") or "").lower()
-        has_active_containers = any(s["state"] in ("EXECUTING", "IDLE", "CYCLING") for s in c_slots)
-        explicit_parked = (
-            mac.get("parked") is True
-            or launchd_state == "parked"
-            or (bool(c_slots) and all(s["state"] == "PARKED" for s in c_slots))
-        )
-        mac_parked = not has_active_containers and explicit_parked
-        mac_unhealthy = not has_active_containers and not mac_parked
-        mac_title = (
-            "macOS (Containers PARKED + Native Runners)"
-            if mac_parked
-            else ("macOS (Containers DOWN / Unreachable + Native Runners)" if mac_unhealthy else "macOS (Containers Active + Native Runners)")
-        )
-        mac_status = (
-            f"containers {mac.get('ezgha_launchd_status', 'disabled')} (PARKED)"
-            if mac_parked
-            else (
-                f"containers {mac.get('ezgha_launchd_status', 'inactive')} (UNHEALTHY/DOWN)"
-                if mac_unhealthy
-                else f"containers {mac.get('ezgha_launchd_status', 'active')}"
-            )
-        )
-        mac_alert = (
-            mac.get("parked_note") or "ezgha launchd container service disabled; native runners remain active."
-            if mac_parked
-            else (
-                "Mac container runners are inactive/down with MAC_RUNNER_DISABLED unset (unintended outage or Colima unreachable)."
-                if mac_unhealthy
-                else None
-            )
-        )
-        cfg_mac_c = mac.get("configured_container_slots")
-        if not isinstance(cfg_mac_c, int) or isinstance(cfg_mac_c, bool):
-            cfg_mac_c = len(c_slots)
-        hosts.append({
-            "id": "mac",
-            "title": mac_title,
-            "group": "mac",
-            "status": mac_status,
-            "alert_message": mac_alert,
-            "contributors": [],
-            "vitals": {
-                "load": ", ".join(str(x) for x in load) if load else None,
-                "disk": f"{disk.get('root_avail', '?')} free (floor {disk.get('min_free_disk_gb_floor', '?')}G)" if disk else None,
-                "colima": mac.get("colima_status"),
-            },
-            "configured": cfg_mac_c + len(n_slots),
-            "slots": all_mac_slots,
-        })
+                "configured": cfg_mac_c + len(n_slots),
+                "slots": all_mac_slots,
+            })
+        except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+            _record_norm_error(errors, f"hosts.mac: {exc}")
 
     # Include any special org runners (e.g. jeff-ubuntu-smtp-egress, mac-smtp-egress) not already listed
     fleet_summary = _as_dict((cmux_data or {}).get("fleet_summary") if isinstance(cmux_data, dict) else None, "cmux.fleet_summary", errors)
@@ -527,22 +607,27 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
     extra_slots = []
     for sp in special:
         name = sp.get("name")
-        if not isinstance(name, str) or not name or name in seen_slot_names:
+        if not isinstance(name, str) or not name:
+            _record_norm_error(errors, "cmux.fleet_summary.special_runners: invalid runner name")
             continue
-        seen_slot_names.add(name)
-        extra_slots.append(
-            _enrich_slot(
-                {
-                    "name": name,
-                    "slot": sp.get("host") or "special",
-                    "state": sp.get("state") or "OFFLINE",
-                    "job_display_name": sp.get("job"),
-                    "reason": sp.get("reason") or sp.get("scope"),
-                },
-                gh_by_runner,
-                gh_by_run_job,
-            )
+        if name in seen_slot_names:
+            continue
+        enriched = _safe_enrich_slot(
+            {
+                "name": name,
+                "slot": sp.get("host") or "special",
+                "state": sp.get("state") or "OFFLINE",
+                "job_display_name": sp.get("job"),
+                "reason": sp.get("reason") or sp.get("scope"),
+            },
+            gh_by_runner,
+            gh_by_run_job,
+            label="cmux.fleet_summary.special_runners",
+            errors=errors,
         )
+        if enriched is not None:
+            seen_slot_names.add(name)
+            extra_slots.append(enriched)
     if extra_slots:
         hosts.append({
             "id": "special-runners",
@@ -559,7 +644,31 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
     return hosts
 
 
-def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None):
+def _opt_int(val, label, errors):
+    if val is None:
+        return None
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    _record_norm_error(errors, f"{label}: expected int, got {type(val).__name__}")
+    return None
+
+
+def _clean_int_map(mapping, label, errors):
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, dict):
+        _record_norm_error(errors, f"{label}: expected object, got {type(mapping).__name__}")
+        return {}
+    cleaned = {}
+    for k, v in mapping.items():
+        if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool):
+            cleaned[k] = v
+        else:
+            _record_norm_error(errors, f"{label}.{k}: expected int count, got {type(v).__name__}")
+    return cleaned
+
+
+def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None, errors=None):
     state_counts = {
         "EXECUTING": 0,
         "CYCLING": 0,
@@ -576,77 +685,87 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
             st = s["state"]
             state_counts[st] = state_counts.get(st, 0) + 1
 
-    rec = (cmux_data or {}).get("github_reconciliation")
-    rec = rec if isinstance(rec, dict) else {}
-    gh_summary = (gh_data or {}).get("summary")
-    gh_summary = gh_summary if isinstance(gh_summary, dict) else {}
+    rec_raw = (cmux_data or {}).get("github_reconciliation") if isinstance(cmux_data, dict) else None
+    rec = _as_dict(rec_raw, "cmux.github_reconciliation", errors)
+    gh_summary_raw = (gh_data or {}).get("summary") if isinstance(gh_data, dict) else None
+    gh_summary = _as_dict(gh_summary_raw, "github.summary", errors)
 
-    def _pick_dict(*candidates):
-        for cand in candidates:
-            if isinstance(cand, dict) and cand:
-                return cand
+    def _pick_int_map(rec_key, gh_key):
+        if rec.get(rec_key) is not None:
+            cleaned = _clean_int_map(rec.get(rec_key), f"cmux.github_reconciliation.{rec_key}", errors)
+            if cleaned:
+                return cleaned
+        if gh_summary.get(gh_key) is not None:
+            return _clean_int_map(gh_summary.get(gh_key), f"github.summary.{gh_key}", errors)
         return {}
 
-    ip_runs_by_repo = _pick_dict(rec.get("in_progress_runs_by_repo"), gh_summary.get("total_in_progress_runs_by_repo"))
-    ip_jobs_by_repo = _pick_dict(rec.get("in_progress_jobs_by_repo"), gh_summary.get("in_progress_jobs_by_repo"))
-    q_runs_by_repo = _pick_dict(rec.get("queued_runs_by_repo"), gh_summary.get("total_queued_runs_by_repo"))
-    q_jobs_by_repo = _pick_dict(rec.get("queued_jobs_by_repo"), gh_summary.get("queued_jobs_by_repo"))
-    wa_q = rec.get("worldarchitect_queued_breakdown")
-    if not isinstance(wa_q, dict):
+    ip_runs_by_repo = _pick_int_map("in_progress_runs_by_repo", "total_in_progress_runs_by_repo")
+    ip_jobs_by_repo = _pick_int_map("in_progress_jobs_by_repo", "in_progress_jobs_by_repo")
+    q_runs_by_repo = _pick_int_map("queued_runs_by_repo", "total_queued_runs_by_repo")
+    q_jobs_by_repo = _pick_int_map("queued_jobs_by_repo", "queued_jobs_by_repo")
+    wa_q_raw = rec.get("worldarchitect_queued_breakdown")
+    if wa_q_raw is None:
         wa_q = next(
             (v for k, v in rec.items() if isinstance(k, str) and k.endswith("_queued_breakdown") and isinstance(v, dict)),
             {},
         )
+    else:
+        wa_q = _as_dict(wa_q_raw, "cmux.github_reconciliation.queued_breakdown", errors)
 
     def _sum_ints(mapping):
         vals = [v for v in mapping.values() if isinstance(v, int) and not isinstance(v, bool)]
         return sum(vals) if vals else None
 
     total_ip_runs = _sum_ints(ip_runs_by_repo) if ip_runs_by_repo else None
-    total_ip_jobs = _sum_ints(ip_jobs_by_repo) if ip_jobs_by_repo else gh_summary.get("total_in_progress_jobs_across_org")
+    total_ip_jobs = _sum_ints(ip_jobs_by_repo) if ip_jobs_by_repo else _opt_int(gh_summary.get("total_in_progress_jobs_across_org"), "github.summary.total_in_progress_jobs_across_org", errors)
     total_q_runs = _sum_ints(q_runs_by_repo) if q_runs_by_repo else None
-    total_q_jobs = _sum_ints(q_jobs_by_repo) if q_jobs_by_repo else gh_summary.get("total_queued_jobs_across_org")
-    why_few = (cmux_data or {}).get("why_worldarchitect_shows_few_in_progress_runs")
+    total_q_jobs = _sum_ints(q_jobs_by_repo) if q_jobs_by_repo else _opt_int(gh_summary.get("total_queued_jobs_across_org"), "github.summary.total_queued_jobs_across_org", errors)
+    why_few = (cmux_data or {}).get("why_worldarchitect_shows_few_in_progress_runs") if isinstance(cmux_data, dict) else None
     fallback_headlines = why_few.get("headline_points") if isinstance(why_few, dict) and isinstance(why_few.get("headline_points"), list) else []
     headlines = next(
         (
             v.get("headline_points")
-            for k, v in (cmux_data or {}).items()
+            for k, v in (cmux_data.items() if isinstance(cmux_data, dict) else ())
             if isinstance(k, str) and k.endswith("_in_progress_runs") and isinstance(v, dict) and isinstance(v.get("headline_points"), list)
         ),
         None,
     ) or fallback_headlines
 
-    fresh_q = wa_q.get("queued_runs_with_jobs")
+    fresh_q = _opt_int(wa_q.get("queued_runs_with_jobs"), "queued_breakdown.queued_runs_with_jobs", errors)
     if fresh_q is None:
-        fresh_q = gh_summary.get("fresh_queued_runs")
-    ghost_q = wa_q.get("queued_runs_zero_jobs")
+        fresh_q = _opt_int(gh_summary.get("fresh_queued_runs"), "github.summary.fresh_queued_runs", errors)
+    ghost_q = _opt_int(wa_q.get("queued_runs_zero_jobs"), "queued_breakdown.queued_runs_zero_jobs", errors)
     if ghost_q is None:
-        ghost_q = gh_summary.get("inert_ghosts")
+        ghost_q = _opt_int(gh_summary.get("inert_ghosts"), "github.summary.inert_ghosts", errors)
 
     fresh_scope = None
-    if wa_q and isinstance(wa_q.get("total_queued_runs_api"), int) and isinstance(total_q_runs, int) and wa_q["total_queued_runs_api"] < total_q_runs:
-        fresh_scope = f"subset ({wa_q['total_queued_runs_api']} of {total_q_runs} queued runs)"
+    total_q_api = _opt_int(wa_q.get("total_queued_runs_api"), "queued_breakdown.total_queued_runs_api", errors)
+    if total_q_api is not None and isinstance(total_q_runs, int) and total_q_api < total_q_runs:
+        fresh_scope = f"subset ({total_q_api} of {total_q_runs} queued runs)"
 
-    raw_gh_errors = (gh_data or {}).get("errors")
-    gh_errors = raw_gh_errors if isinstance(raw_gh_errors, list) else []
+    raw_gh_errors = (gh_data or {}).get("errors") if isinstance(gh_data, dict) else None
+    gh_errors = list(raw_gh_errors) if isinstance(raw_gh_errors, list) else []
+    if errors:
+        gh_errors.extend(errors)
     if "ip_partial" in gh_summary:
         ip_partial = bool(gh_summary.get("ip_partial"))
-        ip_exp = gh_summary.get("ip_expected_repos")
-        ip_succ = gh_summary.get("ip_succeeded_repos")
+        ip_exp = _opt_int(gh_summary.get("ip_expected_repos"), "github.summary.ip_expected_repos", errors)
+        ip_succ = _opt_int(gh_summary.get("ip_succeeded_repos"), "github.summary.ip_succeeded_repos", errors)
     else:
-        ip_exp = gh_summary.get("expected_repos")
-        ip_succ = gh_summary.get("succeeded_repos")
+        ip_exp = _opt_int(gh_summary.get("expected_repos"), "github.summary.expected_repos", errors)
+        ip_succ = _opt_int(gh_summary.get("succeeded_repos"), "github.summary.succeeded_repos", errors)
         ip_partial = bool(gh_summary.get("partial") or gh_errors)
+    if errors:
+        ip_partial = True
     repos_covered = (
         f"{ip_succ}/{ip_exp}"
         if isinstance(ip_exp, int) and isinstance(ip_succ, int)
         else None
     )
-    q_unverified_runs = gh_summary.get("q_unverified_runs") or 0
-    q_partial = bool(gh_summary.get("q_partial") or q_unverified_runs > 0)
-    q_exp = gh_summary.get("q_expected_repos")
-    q_succ = gh_summary.get("q_succeeded_repos")
+    q_unverified_runs = _opt_int(gh_summary.get("q_unverified_runs"), "github.summary.q_unverified_runs", errors) or 0
+    q_partial = bool(gh_summary.get("q_partial") or q_unverified_runs > 0 or errors)
+    q_exp = _opt_int(gh_summary.get("q_expected_repos"), "github.summary.q_expected_repos", errors)
+    q_succ = _opt_int(gh_summary.get("q_succeeded_repos"), "github.summary.q_succeeded_repos", errors)
     q_repos_covered = f"{q_succ}/{q_exp}" if isinstance(q_exp, int) and isinstance(q_succ, int) else None
 
     return {
@@ -679,12 +798,40 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     }
 
 
-def _normalize_latency(latency_raw):
+def _normalize_latency(latency_raw, errors=None):
+    empty_err = lambda msg: {
+        "schema_version": 1,
+        "ok": False,
+        "error": msg,
+        "overall": {},
+        "cohorts": {},
+        "workflows": [],
+        "runner_classes": {},
+        "step_categories": {},
+    }
     if not isinstance(latency_raw, dict):
-        return {"ok": False, "cohorts": {}, "workflows": [], "runner_classes": {}, "step_categories": {}}
-    if "overall" in latency_raw and "workflows" in latency_raw:
-        return latency_raw
-    return ci_latency_probe.from_audit_data(latency_raw)
+        msg = f"latency fixture expected object, got {type(latency_raw).__name__}"
+        _record_norm_error(errors, msg)
+        return empty_err(msg)
+    try:
+        if "overall" in latency_raw and "workflows" in latency_raw:
+            out = latency_raw
+        else:
+            out = ci_latency_probe.from_audit_data(latency_raw)
+        if not isinstance(out, dict):
+            raise ValueError(f"latency normalizer returned {type(out).__name__}")
+        for dict_k in ("overall", "cohorts", "runner_classes", "step_categories"):
+            val = out.get(dict_k)
+            if val is not None and not isinstance(val, dict):
+                raise ValueError(f"latency.{dict_k} must be dict, got {type(val).__name__}")
+        wfs = out.get("workflows")
+        if wfs is not None and (not isinstance(wfs, list) or not all(isinstance(w, dict) for w in wfs)):
+            raise ValueError("latency.workflows must be list of objects")
+        return out
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        msg = f"latency fixture invalid schema: {exc}"
+        _record_norm_error(errors, msg)
+        return empty_err(msg)
 
 
 def _read_local_ezgha_config(config_path=None):
@@ -1308,9 +1455,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     if norm_errors:
         hosts_partial = True
         fixture_errors.extend(norm_errors)
-    if fixture_errors:
-        fixture_note = "Fixture error: " + "; ".join(fixture_errors)
-        scope_note = f"{scope_note} | {fixture_note}" if scope_note else fixture_note
+    rec_errors = []
     reconciliation = _normalize_reconciliation(
         hosts,
         cmux_data,
@@ -1318,8 +1463,18 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         scope_note=scope_note,
         hosts_partial=hosts_partial,
         fixture_errors=fixture_errors,
+        errors=rec_errors,
     )
-    latency = _normalize_latency(latency_raw)
+    lat_errors = []
+    latency = _normalize_latency(latency_raw, errors=lat_errors)
+    extra_errors = rec_errors + lat_errors
+    if extra_errors:
+        fixture_errors.extend(extra_errors)
+        reconciliation["fixture_errors"] = list(fixture_errors)
+    if fixture_errors:
+        fixture_note = "Fixture error: " + "; ".join(fixture_errors)
+        scope_note = f"{scope_note} | {fixture_note}" if scope_note else fixture_note
+        reconciliation["scope_note"] = scope_note
     source_timestamps = {
         "hosts": (hosts_data or {}).get("generated_at_utc"),
         "cmux": (cmux_data or {}).get("captured_at_utc"),
