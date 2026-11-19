@@ -34,6 +34,34 @@ import subprocess
 import sys
 
 RATE_LIMIT_MARKERS = ("rate limit", "403", "429")
+DEFAULT_MAX_REQUESTS = 100
+
+
+class RequestBudgetExhausted(RuntimeError):
+    """Raised when queue_probe hits its per-run GitHub API request cap."""
+
+
+def _resolve_max_requests(cli_value=None):
+    if cli_value is not None:
+        return max(1, int(cli_value))
+    raw = os.environ.get("EZGHA_QUEUE_PROBE_MAX_REQUESTS", "").strip()
+    if not raw:
+        return DEFAULT_MAX_REQUESTS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_REQUESTS
+    return max(1, parsed)
+
+
+def _call_gh(args, *, budget=None, reserve=0):
+    if budget is not None:
+        limit = budget.get("limit")
+        used = budget.get("used", 0)
+        if limit is not None and used + reserve >= limit:
+            raise RequestBudgetExhausted(f"request budget exhausted ({limit} requests)")
+        budget["used"] = used + 1
+    return gh_json(args)
 
 
 def gh_env():
@@ -72,34 +100,134 @@ def gh_env():
             token = ""
     if token:
         env["GH_TOKEN"] = token
+    env.update({
+        "GH_PROMPT_DISABLED": "1",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_PAGER": "",
+    })
     return env
 
 
-def gh_json(args):
-    result = subprocess.run(["gh", *args], capture_output=True, env=gh_env())
+def gh_json(args, timeout=20):
+    try:
+        result = subprocess.run(
+            ["gh", *args], capture_output=True, env=gh_env(), timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gh timed out after {timeout}s") from exc
     if result.returncode != 0:
         raise RuntimeError((result.stderr or b"").decode()[:300])
     return json.loads(result.stdout.decode() or "null")
 
 
-def list_queued(repo):
-    """Every queued run for a repo, following pagination."""
+def in_progress_run_count(repo, *, budget=None, reserve=0):
+    payload = _call_gh([
+        "api",
+        f"repos/{repo}/actions/runs?status=in_progress&per_page=1",
+        "--jq",
+        ".total_count",
+    ], budget=budget, reserve=reserve)
+    return payload if type(payload) is int and payload >= 0 else None
+
+
+def _list_queued_budget(repo, *, max_pages=None, budget=None, reserve=0):
     runs, page = [], 1
+    reported_total = None
+    budget_error = None
     while True:
-        batch = gh_json([
-            "api",
-            f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}",
-        ])
+        page_reserve = 0 if page == 1 else reserve
+        try:
+            batch = _call_gh([
+                "api",
+                f"repos/{repo}/actions/runs?status=queued&per_page=100&page={page}",
+            ], budget=budget, reserve=page_reserve)
+        except RequestBudgetExhausted as exc:
+            if page == 1:
+                raise
+            budget_error = str(exc)
+            break
+        if reported_total is None and isinstance((batch or {}).get("total_count"), int):
+            reported_total = batch["total_count"]
         chunk = (batch or {}).get("workflow_runs") or []
         runs.extend(chunk)
-        if len(chunk) < 100:
-            return runs
+        if len(chunk) < 100 or (max_pages is not None and page >= max_pages):
+            break
         page += 1
+    total = reported_total if reported_total is not None else len(runs)
+    return runs, total, budget_error
 
 
-def job_count(repo, run_id):
-    payload = gh_json(["api", f"repos/{repo}/actions/runs/{run_id}/jobs", "--jq", ".total_count"])
+def list_queued_with_total(repo, *, max_pages=None):
+    """Fetch queued runs up to max_pages (all pages when None), returning (runs, total_count)."""
+    runs, total, _budget_error = _list_queued_budget(repo, max_pages=max_pages)
+    return runs, total
+
+
+def list_queued(repo):
+    """Every queued run for a repo, following pagination."""
+    runs, _total = list_queued_with_total(repo)
+    return runs
+
+
+def job_count(repo, run_id, *, budget=None, reserve=0):
+    payload = _call_gh(
+        ["api", f"repos/{repo}/actions/runs/{run_id}/jobs", "--jq", ".total_count"],
+        budget=budget,
+        reserve=reserve,
+    )
     return payload if type(payload) is int else None
+
+
+def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
+    """Fetch a run's jobs page once and return (total_count, queued_jobs, has_job_details)."""
+    payload = _call_gh(
+        ["api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"],
+        budget=budget,
+        reserve=reserve,
+    )
+    if type(payload) is int:
+        return payload, [], False
+    if not isinstance(payload, dict):
+        return None, [], False
+    total = payload.get("total_count")
+    count = total if type(total) is int else None
+    raw_jobs = payload.get("jobs")
+    if "jobs" in payload and not isinstance(raw_jobs, list):
+        # Non-list jobs (e.g. {"total_count": 0, "jobs": {"id": 123}}) is malformed/unverified.
+        return None, [], False
+    if isinstance(raw_jobs, list):
+        if count is not None and len(raw_jobs) > count:
+            # Contradictory payload (e.g. total_count=0 with [null], or total_count=1 with 2 rows) is unverified.
+            return None, [], False
+        queued_jobs = []
+        truncated = count is not None and len(raw_jobs) < count
+        details_valid = not truncated
+        for job in raw_jobs:
+            if not isinstance(job, dict) or not isinstance(job.get("status"), str) or not job["status"].strip():
+                # A malformed row or missing status makes the entire run's job count unverified.
+                return None, [], False
+            if job.get("status") != "queued":
+                continue
+            raw_labels = job.get("labels")
+            if (
+                not isinstance(raw_labels, list)
+                or not raw_labels
+                or any(not isinstance(lb, str) or not lb.strip() for lb in raw_labels)
+            ):
+                labels = []
+                details_valid = False
+            else:
+                labels = [lb.strip().lower() for lb in raw_labels]
+            created_at = job.get("created_at")
+            if not labels or not isinstance(created_at, str) or not created_at.strip():
+                details_valid = False
+            queued_jobs.append({
+                "repo": repo,
+                "created_at": created_at,
+                "labels": labels,
+            })
+        return count, queued_jobs, details_valid
+    return count, [], False
 
 
 def minutes_since(stamp):
@@ -113,29 +241,93 @@ def minutes_since(stamp):
     return max(0, int(delta.total_seconds() // 60))
 
 
-def probe_repo(repo):
+def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _reserve=0):
+    budget = _budget
+    if budget is None and max_requests is not None:
+        budget = {"limit": max(1, int(max_requests)), "used": 0}
     try:
-        queued = list_queued(repo)
+        queued, queued_total, budget_error = _list_queued_budget(
+            repo,
+            max_pages=1 if max_job_checks is not None else None,
+            budget=budget,
+            reserve=_reserve,
+        )
+    except RequestBudgetExhausted as exc:
+        return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                "queued_total": None, "sample_capped": False,
+                "sampled_fresh": None, "sampled_ghosts": None,
+                "partial": True, "unverified_runs": 0,
+                "error": str(exc)[:200]}
     except RuntimeError as exc:
         return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
-                "oldest_fresh_wait_minutes": None, "error": str(exc)[:200]}
+                "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                "queued_total": None, "sample_capped": False,
+                "sampled_fresh": None, "sampled_ghosts": None,
+                "partial": True, "unverified_runs": 0,
+                "error": str(exc)[:200]}
 
-    fresh = ghosts = 0
+    try:
+        ip_runs = in_progress_run_count(repo, budget=budget, reserve=0)
+    except RequestBudgetExhausted as exc:
+        budget_error = budget_error or str(exc)
+        ip_runs = None
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if any(marker in message for marker in RATE_LIMIT_MARKERS):
+            return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                    "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                    "queued_total": queued_total, "sample_capped": False,
+                    "sampled_fresh": None, "sampled_ghosts": None,
+                    "partial": True, "unverified_runs": 0,
+                    "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
+        ip_runs = None
+
+    short_listing = queued_total > len(queued) and (max_job_checks is None or len(queued) < 100)
+    sample_capped = max_job_checks is not None and (queued_total > max_job_checks or len(queued) > max_job_checks)
+    to_check = queued[:max_job_checks] if (max_job_checks is not None and len(queued) > max_job_checks) else queued
+    fresh = ghosts = unreadable_jobs = checked_runs = 0
     oldest = None
-    for run in queued:
+    budget_capped_jobs = False
+    queued_jobs_out = []
+    job_details_complete = True
+    for run in to_check:
         run_id = run.get("id")
         if run_id is None:
-            continue
-        try:
-            count = job_count(repo, run_id)
-        except RuntimeError as exc:
-            message = str(exc).lower()
-            if any(marker in message for marker in RATE_LIMIT_MARKERS):
-                # Do not report a rate-limited pass as a clean queue.
-                return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
-                        "oldest_fresh_wait_minutes": None,
-                        "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
             count = None
+            run_queued_jobs = []
+            has_job_details = False
+            job_details_complete = False
+        else:
+            try:
+                count, run_queued_jobs, has_job_details = inspect_run_jobs(
+                    repo, run_id, budget=budget, reserve=_reserve
+                )
+            except RequestBudgetExhausted as exc:
+                budget_error = budget_error or str(exc)
+                budget_capped_jobs = True
+                job_details_complete = False
+                break
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                if any(marker in message for marker in RATE_LIMIT_MARKERS):
+                    # Do not report a rate-limited pass as a clean queue.
+                    return {"repo": repo, "ok": False, "fresh": None, "ghosts": None,
+                            "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
+                            "queued_total": queued_total, "sample_capped": False,
+                            "sampled_fresh": None, "sampled_ghosts": None,
+                            "partial": True, "unverified_runs": 0,
+                            "queued_jobs": [], "job_details_complete": False,
+                            "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
+                count = None
+                run_queued_jobs = []
+                has_job_details = False
+                job_details_complete = False
+
+        checked_runs += 1
+        if count is None:
+            unreadable_jobs += 1
+            job_details_complete = False
 
         if count == 0:
             ghosts += 1
@@ -143,27 +335,74 @@ def probe_repo(repo):
 
         # count >= 1, or unreadable: both count as real waiting work.
         fresh += 1
-        wait = minutes_since(run.get("created_at"))
-        if wait is not None and (oldest is None or wait > oldest):
-            oldest = wait
+        if has_job_details:
+            queued_jobs_out.extend(run_queued_jobs)
+            for qj in run_queued_jobs:
+                wait = minutes_since(qj.get("created_at"))
+                if wait is not None and (oldest is None or wait > oldest):
+                    oldest = wait
+        else:
+            job_details_complete = False
+            wait = minutes_since(run.get("created_at"))
+            if wait is not None and (oldest is None or wait > oldest):
+                oldest = wait
 
-    return {"repo": repo, "ok": True, "fresh": fresh, "ghosts": ghosts,
-            "oldest_fresh_wait_minutes": oldest, "error": None}
+    budget_exhausted = budget_error is not None or budget_capped_jobs
+    remaining_unchecked = max(0, max(queued_total, len(queued)) - checked_runs)
+    unverified_runs = unreadable_jobs + remaining_unchecked
+    incomplete = bool(sample_capped or short_listing or budget_exhausted)
+    return {"repo": repo, "ok": True,
+            "fresh": None if incomplete else fresh,
+            "ghosts": None if incomplete else ghosts,
+            "oldest_fresh_wait_minutes": oldest, "in_progress_runs": ip_runs,
+            "queued_total": queued_total, "sample_capped": bool(sample_capped or budget_exhausted),
+            "sampled_fresh": fresh, "sampled_ghosts": ghosts,
+            "partial": bool(unverified_runs > 0 or incomplete), "unverified_runs": unverified_runs,
+            "queued_jobs": queued_jobs_out,
+            "job_details_complete": bool(job_details_complete and not incomplete and unreadable_jobs == 0),
+            "requests_used": budget["used"] if isinstance(budget, dict) else (2 + checked_runs),
+            "error": budget_error[:200] if budget_error else None}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", action="append", required=True,
                         help="org/repo to probe; repeatable")
+    parser.add_argument("--max-requests", type=int, default=None,
+                        help=f"hard cap on total GitHub API requests (default: {DEFAULT_MAX_REQUESTS})")
+    parser.add_argument("--max-job-checks", type=int, default=None,
+                        help="optional cap on per-run /jobs lookups per repo")
     parser.add_argument("--output", default=None)
     args = parser.parse_args()
 
-    repos = [probe_repo(repo) for repo in args.repo]
+    max_requests = _resolve_max_requests(args.max_requests)
+    budget = {"limit": max_requests, "used": 0}
+    total_repos = len(args.repo)
+    repos = []
+    for idx, repo in enumerate(args.repo):
+        reserve_for_later = 2 * (total_repos - 1 - idx)
+        repos.append(
+            probe_repo(
+                repo,
+                max_job_checks=args.max_job_checks,
+                _budget=budget,
+                _reserve=reserve_for_later,
+            )
+        )
     ok = all(entry["ok"] for entry in repos)
-    fresh = sum(entry["fresh"] for entry in repos if entry["ok"]) if ok else None
-    ghosts = sum(entry["ghosts"] for entry in repos if entry["ok"]) if ok else None
+    complete_counts = ok and all(type(entry.get("fresh")) is int and type(entry.get("ghosts")) is int for entry in repos)
+    fresh = sum(entry["fresh"] for entry in repos) if complete_counts else None
+    ghosts = sum(entry["ghosts"] for entry in repos) if complete_counts else None
+    ip_vals = [entry["in_progress_runs"] for entry in repos
+               if entry["ok"] and type(entry.get("in_progress_runs")) is int]
+    in_progress_total = (
+        sum(ip_vals)
+        if ok and len(ip_vals) == len(repos)
+        else None
+    )
     waits = [entry["oldest_fresh_wait_minutes"] for entry in repos
              if entry["ok"] and entry["oldest_fresh_wait_minutes"] is not None]
+    errors = [entry["error"] for entry in repos if entry.get("error")]
 
     payload = {
         "schema_version": 1,
@@ -171,6 +410,10 @@ def main():
         "fresh": fresh,
         "ghosts": ghosts,
         "oldest_fresh_wait_minutes": max(waits) if waits else None,
+        "in_progress_runs": in_progress_total,
+        "partial": any(entry.get("partial") or entry.get("sample_capped") for entry in repos),
+        "unverified_runs": sum(entry.get("unverified_runs") or 0 for entry in repos),
+        "errors": errors,
         "repos": repos,
     }
 

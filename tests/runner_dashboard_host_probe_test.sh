@@ -4,19 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROBE="$ROOT/scripts/runner_dashboard_host_probe.sh"
 WORK="$(mktemp -d)"
-MAC_LOG="/tmp/ezgha-launchd-stdout.log"
-MAC_LOG_BACKUP="$WORK/mac-launchd.log.backup"
-MAC_LOG_EXISTED=0
-if [[ -e "$MAC_LOG" ]]; then
-  cp -p "$MAC_LOG" "$MAC_LOG_BACKUP"
-  MAC_LOG_EXISTED=1
-fi
 cleanup() {
-  if [[ "$MAC_LOG_EXISTED" -eq 1 ]]; then
-    cp -p "$MAC_LOG_BACKUP" "$MAC_LOG"
-  else
-    rm -f "$MAC_LOG"
-  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -56,6 +44,10 @@ sed -n '1,$p' > "$BIN/uname" <<'SH'
 #!/usr/bin/env bash
 echo "${STUB_UNAME:-Linux}"
 SH
+sed -n '1,$p' > "$BIN/journalctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${STUB_JOURNALCTL_LINES:-}"
+SH
 sed -n '1,$p' > "$BIN/systemctl" <<'SH'
 #!/usr/bin/env bash
 echo "${STUB_SYSTEMCTL_STATE:-active}"
@@ -75,11 +67,22 @@ case "$1" in
     echo "/dev/test 99999999 1 ${STUB_DAEMON_FREE_KB:-99999998} 1% /"
     ;;
   inspect)
-    [[ "${STUB_ALL_DOWN:-0}" != 1 ]] || { echo false; exit 0; }
+    if [[ "${STUB_ALL_DOWN:-0}" == 1 ]]; then echo false; exit 0; fi
+    if [[ "${STUB_ONE_DOWN:-0}" == 1 && "$*" == *-2* ]]; then echo false; exit 0; fi
     echo true
     ;;
   top)
     if [[ "${STUB_TOP_FAIL:-0}" == 1 ]]; then exit 1; fi
+    if [[ "$*" == *"-eo pid,etimes,comm,args"* ]]; then
+      echo 'PID ELAPSED COMMAND'
+      case "$2" in
+        *-1)
+          echo '10 420 Runner.Worker /home/runner/bin/Runner.Worker'
+          echo '25 180 python3 python3 -m pytest tests/'
+          ;;
+      esac
+      exit 0
+    fi
     echo 'PID COMMAND'
     case "$2" in
       *-1) echo '10 Runner.Worker' ;;
@@ -131,14 +134,47 @@ assert payload["fleet"] == {
 }
 assert payload["disk"] == {"status": "healthy"}
 assert payload["watchdog"] == {"consecutive_misses": 0, "restart_after": 5}
+assert payload["parked"] is False
+assert isinstance(payload["slots"], list) and len(payload["slots"]) == 2
+assert payload["slots"][0]["slot_id"] == "linux-1"
+assert payload["slots"][0]["state"] == "EXECUTING"
+assert payload["slots"][0]["elapsed_minutes"] == 7.0
+assert payload["slots"][0]["phase_badge"] == "pytest"
+assert payload["slots"][1]["slot_id"] == "linux-2"
+assert payload["slots"][1]["state"] == "IDLE"
 serialized = json.dumps(payload)
 for forbidden in ("secret-prefix", "secret-org", "secret-label", "secret-image"):
     assert forbidden not in serialized
 PY
 
-printf '%s\n' \
-  'respawned ephemeral runner secret-prefix-1' \
-  'respawned ephemeral runner secret-prefix-2' > "$MAC_LOG"
+# Explicit PARKED opt-out (MAC_RUNNER_DISABLED=1 / EZGHA_DASHBOARD_MAC_DISABLED=1)
+# reports parked=true without down=2 while keeping skipped probe sources honest.
+STUB_UNAME=Darwin STUB_ALL_DOWN=1 MAC_RUNNER_DISABLED=1 \
+  STUB_LAUNCHCTL_LIST='' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-parked.json"
+STUB_UNAME=Darwin STUB_ALL_DOWN=1 EZGHA_DASHBOARD_MAC_DISABLED=1 \
+  STUB_LAUNCHCTL_LIST='' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-parked-ezgha-env.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+for name in ("mac-parked.json", "mac-parked-ezgha-env.json"):
+    payload = json.loads((Path(os.environ["WORK"]) / name).read_text())
+    assert payload["parked"] is True
+    assert payload["parked_slots"] == 2
+    assert payload["parked_reason"] == "operator_disabled"
+    assert payload["fleet"]["down"] == 0
+    assert payload["sources"]["service"]["ok"] is False
+    assert payload["sources"]["process_probe"]["ok"] is False
+    assert "disk_free_gb" not in payload
+    assert all(s["state"] == "PARKED" for s in payload["slots"])
+    assert "secret-prefix" not in json.dumps(payload)
+PY
+
 printf '0\n' > "$HOME_T/.local/state/ezgha/watchdog/mac.miss_count"
 printf '5\n' > "$HOME_T/.local/state/ezgha/watchdog/mac.miss_threshold"
 STUB_UNAME=Darwin STUB_ALL_DOWN=1 \
@@ -308,5 +344,45 @@ set -e
 test "$DOCTOR_STATUS" -eq 2
 [[ "$DOCTOR_OUTPUT" == *"unsupported"* ]]
 grep -Fq 'runner_dashboard_host_probe.sh" --service-state' "$ROOT/doctor-runner"
+
+STUB_UNAME=Linux STUB_ONE_DOWN=1 STUB_HOST_FREE_KB=1 \
+  STUB_JOURNALCTL_LINES='other message' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/critical-down-no-log.json"
+STUB_UNAME=Linux STUB_ONE_DOWN=1 STUB_HOST_FREE_KB=1 \
+  STUB_JOURNALCTL_LINES='only 0.5 GB free — refusing to spawn runners' \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class linux > "$WORK/critical-down-paused-log.json"
+WORK="$WORK" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+no_log = json.loads((Path(os.environ["WORK"]) / "critical-down-no-log.json").read_text())
+assert no_log["pause_reason"] == "disk_critical_with_down", no_log
+with_log = json.loads((Path(os.environ["WORK"]) / "critical-down-paused-log.json").read_text())
+assert with_log["pause_reason"] == "disk_floor_paused", with_log
+PY
+
+# Checked-in PR #240 mac example config (runner.count = 0) must validate cleanly when MAC_RUNNER_DISABLED=1
+# and still fail config validation when NOT parked.
+STUB_UNAME=Darwin MAC_RUNNER_DISABLED=1 EZGHA_CONFIG_FILE="$ROOT/config/config.toml.mac.example" \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-example-parked.json"
+STUB_UNAME=Darwin MAC_RUNNER_DISABLED=0 EZGHA_CONFIG_FILE="$ROOT/config/config.toml.mac.example" \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-example-unparked.json"
+WORK="$WORK" python3 - <<'PY'
+import json, os
+from pathlib import Path
+parked = json.loads((Path(os.environ["WORK"]) / "mac-example-parked.json").read_text())
+assert parked["parked"] is True, parked
+assert parked["sources"]["config"]["ok"] is True, parked
+assert parked["fleet"]["configured"] == 0, parked
+assert parked["parked_slots"] == 0, parked
+unparked = json.loads((Path(os.environ["WORK"]) / "mac-example-unparked.json").read_text())
+assert unparked["parked"] is False, unparked
+assert unparked["sources"]["config"]["ok"] is False, unparked
+PY
 
 echo "runner dashboard host probe tests passed"
