@@ -13,6 +13,7 @@ import datetime
 import html as html_lib
 import http.server
 import json
+import math
 import os
 import platform
 import re
@@ -53,6 +54,13 @@ def _reject_non_finite(token):
     raise ValueError(f"non-finite JSON constant: {token}")
 
 
+def _parse_finite_float(token):
+    val = float(token)
+    if not math.isfinite(val):
+        raise ValueError(f"non-finite JSON float: {token}")
+    return val
+
+
 def _load_json_checked(path, *, validator=None, invalid_reason="invalid fixture schema"):
     if not path:
         return None, None
@@ -60,7 +68,11 @@ def _load_json_checked(path, *, validator=None, invalid_reason="invalid fixture 
     try:
         if not p.is_file():
             return None, f"missing or non-file: {p}"
-        data = json.loads(p.read_text(encoding="utf-8"), parse_constant=_reject_non_finite)
+        data = json.loads(
+            p.read_text(encoding="utf-8"),
+            parse_constant=_reject_non_finite,
+            parse_float=_parse_finite_float,
+        )
         if not isinstance(data, dict):
             return None, f"expected JSON object in {p}"
         if validator is not None and not validator(data):

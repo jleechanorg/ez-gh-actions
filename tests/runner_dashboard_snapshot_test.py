@@ -443,6 +443,30 @@ class SnapshotTest(unittest.TestCase):
             self.assertFalse(out["cmux"]["ok"])
             self.assertEqual(out["fleets"]["linux"]["fleet"]["configured"], 20)
 
+            # Non-finite 1e999 float overflow in optional feed or _opt_float must degrade cleanly with valid JSON.
+            self.assertIsNone(MODULE._opt_float(float("inf")))
+            inf_cmux = tmp / "cmux_inf.json"
+            inf_cmux.write_text('{"ok": true, "vms": [{"disk_free_gb": 1e999}]}', encoding="utf-8")
+            out_inf = tmp / "status_inf.json"
+            proc_inf = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--mac-host", str(mac_p),
+                    "--linux-host", str(linux_p),
+                    "--observed-at", "2026-11-18T09:15:00Z",
+                    "--published-at", "2026-11-18T09:15:05Z",
+                    "--cmux", str(inf_cmux),
+                    "--output", str(out_inf),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_inf.returncode, 0, msg=proc_inf.stderr)
+            parsed_inf = json.loads(out_inf.read_text(encoding="utf-8"))
+            self.assertFalse(parsed_inf["cmux"]["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

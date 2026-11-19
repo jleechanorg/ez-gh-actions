@@ -4,6 +4,7 @@
 import argparse
 import datetime
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -42,10 +43,25 @@ ALLOWED_PAUSE_REASONS = frozenset({"disk_floor_paused", "disk_floor_pause", "dis
 EXPECTED_CONFIGURED = {"mac": 4, "linux": 20}
 
 
+def _reject_non_finite(token):
+    raise ValueError(f"non-finite JSON constant: {token}")
+
+
+def _parse_finite_float(token):
+    val = float(token)
+    if not math.isfinite(val):
+        raise ValueError(f"non-finite JSON float: {token}")
+    return val
+
+
 def _load_object(path):
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        value = json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            parse_constant=_reject_non_finite,
+            parse_float=_parse_finite_float,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
 
@@ -57,7 +73,7 @@ def _count(value):
 def _opt_float(value):
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)) and value >= 0:
+    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
         return round(float(value), 2)
     return None
 
@@ -490,7 +506,7 @@ def main():
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", dir=output.parent, delete=False) as handle:
-        json.dump(snapshot, handle, indent=2, sort_keys=True)
+        json.dump(snapshot, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
         temporary = handle.name
     os.replace(temporary, output)

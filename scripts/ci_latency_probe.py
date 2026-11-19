@@ -606,6 +606,8 @@ def from_audit_data(raw):
             if total_non_skipped > 0
             else None
         )
+        if cancelled_pct is not None and not math.isfinite(cancelled_pct):
+            raise ValueError("cancellation rate overflow to non-finite float")
     except ArithmeticError as exc:
         raise ValueError(f"cancellation rate arithmetic error: {exc}") from exc
 

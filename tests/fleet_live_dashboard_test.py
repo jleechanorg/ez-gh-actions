@@ -1362,7 +1362,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
             (tmp_path / "github_live_snapshot.json").write_text(json.dumps(base_gh), encoding="utf-8")
             for tag, is_norm, mutate_fn in (
                 ("recent_wf_bad", False, lambda d: d["wa"]["recent_contiguous_runs"]["by_workflow"][0].__setitem__("success", "x")),
-                ("cancel_overflow", False, lambda d: d["wa"]["recent_contiguous_runs"]["cohorts"]["cancelled"].__setitem__("n", 10**309)),
+                ("cancel_overflow_denom1", False, lambda d: d["wa"]["recent_contiguous_runs"]["cohorts"]["cancelled"].__setitem__("n", 10**309)),
+                ("cancel_overflow_denom471", False, lambda d: (d["wa"]["recent_contiguous_runs"]["cohorts"]["cancelled"].__setitem__("n", 10**309), d["wa"]["recent_contiguous_runs"]["cohorts"]["all_non_skipped"].__setitem__("n", 471))),
                 ("norm_runner_class_null", True, lambda d: d["runner_classes"].__setitem__("linux", None)),
                 ("norm_step_cat_null", True, lambda d: d["step_categories"].__setitem__("test", None)),
             ):
@@ -1384,21 +1385,40 @@ class FleetLiveDashboardTest(unittest.TestCase):
                         srv2.shutdown()
                         srv2.server_close()
 
-            # Non-finite NaN in JSON must be rejected at _load_json_checked rather than emitting invalid JS JSON.
-            (tmp_path / "ci_latency_percentiles.json").write_text(json.dumps(base_lat), encoding="utf-8")
-            (tmp_path / "ubuntu_mac_slots.json").write_text('{"hosts": {"linux-1": {"slots": [{"name": "r-1", "elapsed_minutes": NaN}]}}}', encoding="utf-8")
-            srv_nan = mod.create_server(port=0, audit_dir=tmp_path)
-            t_nan = threading.Thread(target=srv_nan.serve_forever, daemon=True)
-            t_nan.start()
+            # Non-finite NaN & 1e999 float overflow in JSON must be rejected at _load_json_checked rather than emitting invalid JS JSON.
+            for raw_hosts_txt, expect_hosts_partial in (
+                ('{"hosts": {"linux-1": {"slots": [{"name": "r-1", "elapsed_minutes": NaN}]}}}', True),
+                ('{"hosts": {"linux-1": {"slots": [{"name": "r-1", "elapsed_minutes": 1e999}]}}}', True),
+            ):
+                (tmp_path / "ci_latency_percentiles.json").write_text(json.dumps(base_lat), encoding="utf-8")
+                (tmp_path / "ubuntu_mac_slots.json").write_text(raw_hosts_txt, encoding="utf-8")
+                srv_nan = mod.create_server(port=0, audit_dir=tmp_path)
+                t_nan = threading.Thread(target=srv_nan.serve_forever, daemon=True)
+                t_nan.start()
+                try:
+                    pn = srv_nan.server_address[1]
+                    self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{pn}/", timeout=5).status, 200)
+                    api_nan = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{pn}/api/state", timeout=5).read().decode("utf-8"))
+                    self.assertEqual(api_nan["reconciliation"]["hosts_partial"], expect_hosts_partial)
+                    self.assertTrue(api_nan["reconciliation"]["fixture_errors"])
+                finally:
+                    srv_nan.shutdown()
+                    srv_nan.server_close()
+
+            (tmp_path / "ubuntu_mac_slots.json").write_text(json.dumps(base_hosts), encoding="utf-8")
+            (tmp_path / "ci_latency_percentiles.json").write_text('{"ok": true, "overall": {"p50_s": 1e309}, "workflows": []}', encoding="utf-8")
+            srv_inf = mod.create_server(port=0, audit_dir=tmp_path)
+            t_inf = threading.Thread(target=srv_inf.serve_forever, daemon=True)
+            t_inf.start()
             try:
-                pn = srv_nan.server_address[1]
-                self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{pn}/", timeout=5).status, 200)
-                api_nan = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{pn}/api/state", timeout=5).read().decode("utf-8"))
-                self.assertTrue(api_nan["reconciliation"]["hosts_partial"])
-                self.assertTrue(api_nan["reconciliation"]["fixture_errors"])
+                pi = srv_inf.server_address[1]
+                self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{pi}/", timeout=5).status, 200)
+                api_inf = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{pi}/api/state", timeout=5).read().decode("utf-8"))
+                self.assertFalse(api_inf["latency"]["ok"])
+                self.assertTrue(api_inf["reconciliation"]["fixture_errors"])
             finally:
-                srv_nan.shutdown()
-                srv_nan.server_close()
+                srv_inf.shutdown()
+                srv_inf.server_close()
 
 
 if __name__ == "__main__":
