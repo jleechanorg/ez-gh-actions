@@ -6,11 +6,11 @@
       },
       "fleet": {
         "configured": 20,
-        "cycling": 0,
-        "down": 4,
-        "executing": 14,
-        "idle": 2,
-        "reserved": 19
+        "cycling": 2,
+        "down": 1,
+        "executing": 17,
+        "idle": 0,
+        "reserved": 17
       },
       "sources": {
         "config": {
@@ -39,31 +39,31 @@
     },
     "mac": {
       "disk": {
-        "status": "healthy"
+        "status": "unknown"
       },
       "fleet": {
-        "configured": 4,
-        "cycling": 0,
-        "down": 0,
-        "executing": 4,
-        "idle": 0,
-        "reserved": 4
+        "configured": null,
+        "cycling": null,
+        "down": null,
+        "executing": null,
+        "idle": null,
+        "reserved": null
       },
       "sources": {
         "config": {
-          "ok": true
+          "ok": false
         },
         "disk": {
-          "ok": true
+          "ok": false
         },
         "docker": {
-          "ok": true
+          "ok": false
         },
         "process_probe": {
-          "ok": true
+          "ok": false
         },
         "service": {
-          "ok": true
+          "ok": false
         },
         "watchdog_state": {
           "ok": false
@@ -75,21 +75,21 @@
       }
     }
   },
-  "observed_at": "2026-11-19T06:25:11Z",
-  "published_at": "2026-11-19T06:25:52Z",
+  "observed_at": "2026-11-19T06:39:56Z",
+  "published_at": "2026-11-19T06:41:19Z",
   "queue": {
-    "fresh": 5,
+    "fresh": 11,
     "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 0,
+    "oldest_fresh_wait_minutes": 72,
     "repos": [
       {
-        "fresh": 5,
+        "fresh": 6,
         "ghosts": 149,
         "repo": "jleechanorg/worldarchitect.ai"
       },
       {
-        "fresh": 0,
+        "fresh": 5,
         "ghosts": 15,
         "repo": "jleechanorg/worldai_frontend"
       }
@@ -101,7 +101,7 @@
       "ok": false
     },
     "mac_host": {
-      "ok": true
+      "ok": false
     }
   }
 }
