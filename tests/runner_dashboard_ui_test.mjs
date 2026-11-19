@@ -436,7 +436,7 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   render(truncatedQueueSnap, NOW);
   assert.equal(elements.get('queue-fresh').textContent, '—');
   assert.equal(elements.get('queue-ghosts').textContent, '—');
-  assert.equal(elements.get('queue-fresh-label').textContent, 'FRESH — ACTUALLY WAITING');
+  assert.equal(elements.get('queue-fresh-label').textContent, 'FRESH — WAITING (UPPER BOUND)');
   assert.match(elements.get('queue-summary').textContent, /100 unverified/);
   assert.match(elements.get('queue-fresh-note').textContent, /Upper-bound waiting count/);
   assert.match(elements.get('queue-oldest-note').textContent, /includes unverified runs/);

@@ -443,8 +443,9 @@ class SnapshotTest(unittest.TestCase):
             self.assertFalse(out["cmux"]["ok"])
             self.assertEqual(out["fleets"]["linux"]["fleet"]["configured"], 20)
 
-            # Non-finite 1e999 float overflow in optional feed or _opt_float must degrade cleanly with valid JSON.
+            # Non-finite 1e999 float and 10**309 huge-int overflow in optional feed or _opt_float must degrade cleanly with valid JSON.
             self.assertIsNone(MODULE._opt_float(float("inf")))
+            self.assertIsNone(MODULE._opt_float(10**309))
             inf_cmux = tmp / "cmux_inf.json"
             inf_cmux.write_text('{"ok": true, "vms": [{"disk_free_gb": 1e999}]}', encoding="utf-8")
             out_inf = tmp / "status_inf.json"
@@ -466,6 +467,34 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(proc_inf.returncode, 0, msg=proc_inf.stderr)
             parsed_inf = json.loads(out_inf.read_text(encoding="utf-8"))
             self.assertFalse(parsed_inf["cmux"]["ok"])
+
+            huge_int_cmux = tmp / "cmux_huge_int.json"
+            huge_int_cmux.write_text(f'{{"ok": true, "vms": [{{"disk_free_gb": {10**309}}}]}}', encoding="utf-8")
+            out_huge = tmp / "status_huge.json"
+            proc_huge = subprocess.run(
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--mac-host", str(mac_p),
+                    "--linux-host", str(linux_p),
+                    "--observed-at", "2026-11-18T09:15:00Z",
+                    "--published-at", "2026-11-18T09:15:05Z",
+                    "--cmux", str(huge_int_cmux),
+                    "--output", str(out_huge),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_huge.returncode, 0, msg=proc_huge.stderr)
+            parsed_huge = json.loads(out_huge.read_text(encoding="utf-8"))
+            self.assertTrue(parsed_huge["cmux"]["ok"])
+            self.assertEqual(parsed_huge["cmux"]["vms"][0]["disk_status"], "unknown")
+            from unittest import mock
+            with mock.patch.object(MODULE, "_opt_float", side_effect=TypeError("bad cmux shape")):
+                degraded_cmux = MODULE._public_cmux({"ok": True, "vms": [{"disk_free_gb": 10}]})
+            self.assertFalse(degraded_cmux["ok"])
+            self.assertEqual(degraded_cmux["vms"], [])
 
 
 if __name__ == "__main__":

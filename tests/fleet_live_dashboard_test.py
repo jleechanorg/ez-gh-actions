@@ -1420,6 +1420,60 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 srv_inf.shutdown()
                 srv_inf.server_close()
 
+    def test_lone_surrogate_and_parked_exited_mac_container(self):
+        import os
+        import subprocess
+        from unittest import mock
+
+        mod = load_module()
+        with tempfile.TemporaryDirectory() as directory:
+            tmp_path = Path(directory)
+            fixture_audit_dir(tmp_path)
+            # Escaped lone surrogate in fixture must fail closed cleanly and never 500 on / or --out-html.
+            (tmp_path / "ubuntu_mac_slots.json").write_text(
+                '{"hosts": {"linux-1": {"slots": [{"name": "r-1", "reason": "\\ud800"}]}}}',
+                encoding="utf-8",
+            )
+            srv = mod.create_server(port=0, audit_dir=tmp_path)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            try:
+                p = srv.server_address[1]
+                self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{p}/", timeout=5).status, 200)
+                api = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p}/api/state", timeout=5).read().decode("utf-8"))
+                self.assertTrue(api["reconciliation"]["hosts_partial"])
+                self.assertTrue(api["reconciliation"]["fixture_errors"])
+                self.assertIn("Fixture error:", api["reconciliation"]["scope_note"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+            out_html = tmp_path / "surrogate.html"
+            rendered = mod.render_html({"generated_at_utc": "2026-11-18T00:00:00Z", "raw": "\ud800"})
+            self.assertIn("\\ud800", rendered)
+            out_html.write_text(rendered, encoding="utf-8", errors="replace")
+            self.assertTrue(out_html.is_file())
+
+        # Stopped/exited Mac containers under MAC_RUNNER_DISABLED=1 must report PARKED, not DOWN.
+        def fake_run_exited(cmd, **kwargs):
+            if cmd[:2] == ["docker", "ps"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout="ez-mac-runner-h-1\tExited (0) 2 hours ago\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="inactive\n", stderr="")
+
+        with mock.patch.dict(os.environ, {"MAC_RUNNER_DISABLED": "1"}, clear=False), \
+             mock.patch.object(mod.platform, "system", return_value="Darwin"), \
+             mock.patch.object(mod, "_read_local_ezgha_config", return_value={"count": 2, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 15}), \
+             mock.patch.object(mod.subprocess, "run", side_effect=fake_run_exited):
+            mac_local = mod._collect_local_host_slots()
+        mac_slots = mac_local["hosts"]["mac"]["container_slots"]
+        self.assertEqual([s["state"] for s in mac_slots], ["PARKED", "PARKED"])
+        self.assertIn("MAC_RUNNER_DISABLED=1", mac_slots[0]["reason"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -73,12 +73,14 @@ def _load_json_checked(path, *, validator=None, invalid_reason="invalid fixture 
             parse_constant=_reject_non_finite,
             parse_float=_parse_finite_float,
         )
+        # Reject escaped lone surrogates (e.g. "\ud800") up front so UTF-8 responses fail closed.
+        json.dumps(data, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if not isinstance(data, dict):
             return None, f"expected JSON object in {p}"
         if validator is not None and not validator(data):
             return None, f"{invalid_reason} in {p}"
         return data, None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         return None, f"{type(exc).__name__} reading {p}"
 
 
@@ -1084,7 +1086,15 @@ def _collect_local_host_slots():
                         state = "UNKNOWN"
                         reason = "docker top probe failed"
                 else:
-                    reason = cstatus or "container not running"
+                    if mac_disabled:
+                        state = "PARKED"
+                        reason = (
+                            f"operator disabled (MAC_RUNNER_DISABLED=1; {cstatus})"
+                            if cstatus
+                            else "operator disabled (MAC_RUNNER_DISABLED=1)"
+                        )
+                    else:
+                        reason = cstatus or "container not running"
                 ordered_names.append(cname)
                 observed_by_name[cname] = {
                     "name": cname,
@@ -1549,7 +1559,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
 
 def _escape_embedded_json(state):
     """Escape HTML/script-significant characters inside embedded JSON."""
-    raw = json.dumps(state, ensure_ascii=False, allow_nan=False)
+    raw = json.dumps(state, ensure_ascii=True, allow_nan=False)
     return (
         raw.replace("&", "\\u0026")
         .replace("<", "\\u003c")
@@ -2234,7 +2244,9 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
                 return
             if path in ("/", "/index.html"):
                 try:
-                    body = render_html(load_state(), auto_refresh_ms=effective_refresh_ms).encode("utf-8")
+                    body = render_html(load_state(), auto_refresh_ms=effective_refresh_ms).encode(
+                        "utf-8", errors="replace"
+                    )
                 except TimeoutError:
                     self.send_response(504)
                     self.end_headers()
@@ -2295,7 +2307,7 @@ def main():
         )
         out = Path(args.out_html)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_html(state, auto_refresh_ms=0), encoding="utf-8")
+        out.write_text(render_html(state, auto_refresh_ms=0), encoding="utf-8", errors="replace")
         print(f"Wrote operator dashboard: {out}")
         if not args.serve:
             return 0

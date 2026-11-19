@@ -73,8 +73,13 @@ def _count(value):
 def _opt_float(value):
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0:
-        return round(float(value), 2)
+    if isinstance(value, (int, float)):
+        try:
+            finite = math.isfinite(value)
+        except OverflowError:
+            return None
+        if finite and value >= 0:
+            return round(float(value), 2)
     return None
 
 
@@ -255,53 +260,60 @@ def _public_queue(payload, repo_map):
     }
 
 
+def _empty_cmux():
+    return {
+        "ok": False,
+        "configured": None,
+        "executing": None,
+        "idle": None,
+        "cycling": None,
+        "down": None,
+        "vms": [],
+    }
+
+
 def _public_cmux(payload):
     """Sanitize optional cmux Cloud VM pool payload (multi-host slots)."""
     if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return _empty_cmux()
+    try:
+        vms = []
+        raw_vms = payload.get("vms")
+        for idx, vm in enumerate(raw_vms if isinstance(raw_vms, list) else [], start=1):
+            if not isinstance(vm, dict):
+                continue
+            anon_vm_id = f"cloud-vm-{idx}"
+            free_gb = _opt_float(vm.get("disk_free_gb"))
+            floor_gb = _count(vm.get("disk_floor_gb"))
+            raw_disk_status = vm.get("disk_status")
+            disk_status = (
+                raw_disk_status
+                if isinstance(raw_disk_status, str) and raw_disk_status in {"healthy", "critical"}
+                else "unknown"
+            )
+            if disk_status == "unknown" and free_gb is not None and floor_gb is not None:
+                disk_status = "critical" if free_gb < floor_gb else "healthy"
+            vms.append({
+                "vm_id": anon_vm_id,
+                "configured": _count(vm.get("configured")),
+                "executing": _count(vm.get("executing")),
+                "idle": _count(vm.get("idle")),
+                "cycling": _count(vm.get("cycling")),
+                "down": _count(vm.get("down")),
+                "disk_status": disk_status,
+                "slots": _sanitize_slots(vm.get("slots"), slot_prefix=anon_vm_id),
+            })
         return {
-            "ok": False,
-            "configured": None,
-            "executing": None,
-            "idle": None,
-            "cycling": None,
-            "down": None,
-            "vms": [],
+            "ok": True,
+            "configured": _count(payload.get("configured")),
+            "executing": _count(payload.get("executing")),
+            "idle": _count(payload.get("idle")),
+            "cycling": _count(payload.get("cycling")),
+            "down": _count(payload.get("down")),
+            "vms": vms,
         }
-    vms = []
-    raw_vms = payload.get("vms")
-    for idx, vm in enumerate(raw_vms if isinstance(raw_vms, list) else [], start=1):
-        if not isinstance(vm, dict):
-            continue
-        anon_vm_id = f"cloud-vm-{idx}"
-        free_gb = _opt_float(vm.get("disk_free_gb"))
-        floor_gb = _count(vm.get("disk_floor_gb"))
-        raw_disk_status = vm.get("disk_status")
-        disk_status = (
-            raw_disk_status
-            if isinstance(raw_disk_status, str) and raw_disk_status in {"healthy", "critical"}
-            else "unknown"
-        )
-        if disk_status == "unknown" and free_gb is not None and floor_gb is not None:
-            disk_status = "critical" if free_gb < floor_gb else "healthy"
-        vms.append({
-            "vm_id": anon_vm_id,
-            "configured": _count(vm.get("configured")),
-            "executing": _count(vm.get("executing")),
-            "idle": _count(vm.get("idle")),
-            "cycling": _count(vm.get("cycling")),
-            "down": _count(vm.get("down")),
-            "disk_status": disk_status,
-            "slots": _sanitize_slots(vm.get("slots"), slot_prefix=anon_vm_id),
-        })
-    return {
-        "ok": True,
-        "configured": _count(payload.get("configured")),
-        "executing": _count(payload.get("executing")),
-        "idle": _count(payload.get("idle")),
-        "cycling": _count(payload.get("cycling")),
-        "down": _count(payload.get("down")),
-        "vms": vms,
-    }
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError, OverflowError, ArithmeticError):
+        return _empty_cmux()
 
 
 def _sanitize_stat_block(block):

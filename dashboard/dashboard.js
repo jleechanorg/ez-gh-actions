@@ -588,11 +588,17 @@
       isCount(queue.fresh) &&
       isCount(queue.ghosts);
 
+    setText(
+      'queue-fresh-label',
+      queue && queue.ok === true && queue.partial === true
+        ? 'FRESH — WAITING (UPPER BOUND)'
+        : 'FRESH — ACTUALLY WAITING',
+    );
+
     if (!valid) {
       setText('queue-fresh', '—');
       setText('queue-ghosts', '—');
       setText('queue-oldest', '—');
-      setText('queue-fresh-label', 'FRESH — ACTUALLY WAITING');
       const unverifiedSuffix =
         queue &&
         queue.ok === true &&
@@ -614,12 +620,6 @@
 
     byId('queue-fresh')?.classList?.remove?.('is-unknown');
     byId('queue-ghosts')?.classList?.remove?.('is-unknown');
-    setText(
-      'queue-fresh-label',
-      queue.partial === true
-        ? 'FRESH — WAITING (UPPER BOUND)'
-        : 'FRESH — ACTUALLY WAITING',
-    );
     setText('queue-fresh', String(queue.fresh));
     setText('queue-ghosts', String(queue.ghosts));
     setText(
