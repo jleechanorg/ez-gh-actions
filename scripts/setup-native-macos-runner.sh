@@ -8,12 +8,12 @@
 #
 # Security model:
 #   `pull_request` YAML `if:` guards execute from the fork's head commit and are
-#   NOT a security boundary against modified fork workflows; server-side
-#   protection (`allows_public_repositories=false`, private `--repo`, or
-#   `restricted_to_workflows=true` with non-empty `selected_workflows` plus
-#   `approval_policy=all_external_contributors`) is required and enforced
-#   fail-closed by `setup-native-macos-runner.sh` (unless
-#   `--allow-public-fork-exposure` is explicitly passed).
+#   NOT a security boundary against modified fork workflows, and GitHub's
+#   `fork-pr-contributor-approval` setting does NOT gate `pull_request_target`
+#   workflows; therefore `allows_public_repositories=false` on the target runner
+#   group (or `private=true` with `--repo`) is required and enforced fail-closed
+#   by `setup-native-macos-runner.sh` (unless `--allow-public-fork-exposure` is
+#   explicitly passed after operator workflow review).
 # Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing") and origin/main:AGENTS.md:241-250,257-258 (Safety & Monitoring Principles & /code-standards gates).
 #
 # Usage:
@@ -64,7 +64,7 @@ Usage: setup-native-macos-runner.sh [OPTIONS]
   --org ORG                       GitHub org scope (default: jleechanorg)
   --repo OWNER/REPO               Optional repo scope (overrides --org)
   --runner-group GROUP            Optional GitHub org runner group name (passed as --runnergroup to config.sh)
-  --allow-public-fork-exposure    Explicitly allow setup/verify even when public fork PRs lack all_external_contributors approval
+  --allow-public-fork-exposure    Explicitly allow setup/verify on a public-capable runner group or public --repo after operator workflow review
   --force-replace-name            Allow --replace even when a live runner with the same name exists without matching local .runner agentId
   --name NAME                     Runner name (default: mac-native-ci-1)
   --runner-dir DIR                Install directory (default: $HOME/actions-runner-macos-ci)
@@ -98,13 +98,19 @@ while [ "$#" -gt 0 ]; do
 done
 
 # Authority: defensive operational guards/bounds (SETUP_LOCK_TIMEOUT_SEC=30, POST_CONFIG_VERIFY_ATTEMPTS=3, --offline scope, --repo/--runner-group exclusion) per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257-258 (self-outage prevention; unrequested defaults disclosed in PR #238).
+mode_count=$((VERIFY + UNINSTALL + RECONFIGURE + DRY_RUN))
+if [ "$mode_count" -gt 1 ]; then
+  echo "ERROR: conflicting action flags (--verify, --uninstall, --reconfigure, --dry-run are mutually exclusive)" >&2
+  exit 2
+fi
+
 if [ -n "$RUNNER_REPO" ] && [ "$RUNNER_GROUP_SET" -eq 1 ]; then
   echo "ERROR: --runner-group cannot be combined with --repo (runner groups are org/enterprise-scoped)" >&2
   exit 2
 fi
 
-if [ "$OFFLINE" -eq 1 ] && [ "$VERIFY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
-  echo "ERROR: --offline is only valid with --verify or --dry-run (mutating setup requires live server-side fork-protection check)" >&2
+if [ "$OFFLINE" -eq 1 ] && [ "$VERIFY" -eq 0 ]; then
+  echo "ERROR: --offline is only valid with --verify (mutating setup requires live server-side fork-protection check)" >&2
   exit 2
 fi
 
@@ -274,10 +280,6 @@ stop_launchagent() {
 }
 
 if [ "$UNINSTALL" -eq 1 ]; then
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[dry-run] would unload and remove $PLIST_PATH"
-    exit 0
-  fi
   acquire_setup_lock || exit 1
   if ! stop_launchagent; then
     echo "ERROR: launchd job ${PLIST_LABEL} is still loaded; retaining ${PLIST_PATH}" >&2
@@ -294,75 +296,88 @@ fi
 
 # Authority: fail-closed path-isolation guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never touch $HOME, /, or TestFlight/SMTP-egress runner dirs, including case-insensitive APFS aliases and parents).
 is_reserved_runner_dir() {
-  local target="$1" py_bin=""
+  local target="$1" py_bin="" rc=0
   shift
   [ -n "$target" ] || return 0
   [ "$target" != "/" ] || return 0
   py_bin="$(resolve_python3)" || return 0
-  "$py_bin" - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" "$@" <<'PY'
+  "$py_bin" - "$target" "$HOME" "$RESERVED_TF_HOME" "$RESERVED_SMTP_HOME" "$RESERVED_TF_OP" "$RESERVED_SMTP_OP" "$@" <<'PY' || rc=$?
 import os
 import sys
 from pathlib import Path
 
-target_raw = sys.argv[1]
-home_raw = sys.argv[2]
-reserved_raws = sys.argv[3:]
+try:
+    target_raw = sys.argv[1]
+    home_raw = sys.argv[2]
+    reserved_raws = sys.argv[3:]
 
-def existing_ancestors(p: Path):
-    cur = p
-    while True:
-        if cur.exists():
-            yield cur
-        if cur.parent == cur:
-            break
-        cur = cur.parent
+    def existing_ancestors(p: Path):
+        cur = p
+        while True:
+            try:
+                if cur.exists():
+                    yield cur
+            except OSError:
+                pass
+            if cur.parent == cur:
+                break
+            cur = cur.parent
 
-def same_fs(a: Path, b: Path) -> bool:
-    try:
-        return a.exists() and b.exists() and os.path.samefile(a, b)
-    except OSError:
-        return False
+    def same_fs(a: Path, b: Path) -> bool:
+        try:
+            return a.exists() and b.exists() and os.path.samefile(a, b)
+        except OSError:
+            return False
 
-target_real = Path(os.path.realpath(target_raw))
-target_abs = Path(os.path.abspath(target_raw))
-home_real = Path(os.path.realpath(home_raw))
+    target_real = Path(os.path.realpath(target_raw))
+    target_abs = Path(os.path.abspath(target_raw))
+    home_real = Path(os.path.realpath(home_raw))
 
-if str(target_real) == "/" or target_real == home_real or same_fs(target_real, home_real) or same_fs(target_abs, home_real):
-    sys.exit(0)
-
-t_cf = os.path.normpath(str(target_abs)).casefold()
-tr_cf = os.path.normpath(str(target_real)).casefold()
-home_cf = os.path.normpath(str(home_real)).casefold()
-home_abs_cf = os.path.normpath(os.path.abspath(home_raw)).casefold()
-
-for x in (t_cf, tr_cf):
-    if x == "/" or x == home_cf or x == home_abs_cf:
+    if str(target_real) == "/" or target_real == home_real or same_fs(target_real, home_real) or same_fs(target_abs, home_real):
         sys.exit(0)
 
-for res_raw in reserved_raws:
-    if not res_raw:
-        continue
-    res_real = Path(os.path.realpath(res_raw))
-    if target_real == res_real or res_real in target_real.parents or target_real in res_real.parents:
-        sys.exit(0)
-    res_cf = os.path.normpath(str(res_real)).casefold()
-    res_abs_cf = os.path.normpath(os.path.abspath(res_raw)).casefold()
+    t_cf = os.path.normpath(str(target_abs)).casefold()
+    tr_cf = os.path.normpath(str(target_real)).casefold()
+    home_cf = os.path.normpath(str(home_real)).casefold()
+    home_abs_cf = os.path.normpath(os.path.abspath(home_raw)).casefold()
+
     for x in (t_cf, tr_cf):
-        for r in (res_cf, res_abs_cf):
-            if not r or r == "/":
-                continue
-            if x == r or x.startswith(r + "/") or r.startswith(x + "/"):
-                sys.exit(0)
-    for anc in list(existing_ancestors(target_abs)) + list(existing_ancestors(target_real)):
-        if same_fs(anc, res_real):
+        if x == "/" or x == home_cf or x == home_abs_cf:
             sys.exit(0)
-    if target_real.exists():
-        for res_anc in existing_ancestors(res_real):
-            if same_fs(target_real, res_anc):
-                sys.exit(0)
 
-sys.exit(1)
+    for res_raw in reserved_raws:
+        if not res_raw:
+            continue
+        res_real = Path(os.path.realpath(res_raw))
+        if target_real == res_real or res_real in target_real.parents or target_real in res_real.parents:
+            sys.exit(0)
+        res_cf = os.path.normpath(str(res_real)).casefold()
+        res_abs_cf = os.path.normpath(os.path.abspath(res_raw)).casefold()
+        for x in (t_cf, tr_cf):
+            for r in (res_cf, res_abs_cf):
+                if not r or r == "/":
+                    continue
+                if x == r or x.startswith(r + "/") or r.startswith(x + "/"):
+                    sys.exit(0)
+        for anc in list(existing_ancestors(target_abs)) + list(existing_ancestors(target_real)):
+            if same_fs(anc, res_real):
+                sys.exit(0)
+        if target_real.exists():
+            for res_anc in existing_ancestors(res_real):
+                if same_fs(target_real, res_anc):
+                    sys.exit(0)
+
+    sys.exit(1)
+except SystemExit:
+    raise
+except Exception as exc:
+    print(f"ERROR: reserved-dir check failed closed: {exc}", file=sys.stderr)
+    sys.exit(2)
 PY
+  if [ "$rc" -eq 1 ]; then
+    return 1
+  fi
+  return 0
 }
 
 if is_reserved_runner_dir "$RUNNER_DIR"; then
@@ -417,11 +432,81 @@ validate_labels "$LABELS"
 LABELS="$(normalize_labels "$LABELS")"
 RUNNER_LABELS="$LABELS"
 
+is_temp_work_dir() {
+  local target="$1" py_bin="" rc=0
+  [ -n "$target" ] || return 0
+  py_bin="$(resolve_python3)" || return 0
+  "$py_bin" - "$target" "${TMPDIR:-}" <<'PY' || rc=$?
+import os
+import sys
+
+try:
+    target_raw = sys.argv[1]
+    tmpdir_raw = sys.argv[2]
+
+    def resolve_nearest_real(p: str) -> str:
+        abs_p = os.path.abspath(p)
+        cur = abs_p
+        tail = []
+        while not os.path.exists(cur):
+            parent, name = os.path.split(cur)
+            if parent == cur:
+                break
+            tail.append(name)
+            cur = parent
+        base_real = os.path.realpath(cur)
+        if tail:
+            return os.path.normpath(os.path.join(base_real, *reversed(tail)))
+        return os.path.normpath(base_real)
+
+    cand_paths = {
+        os.path.normpath(os.path.abspath(target_raw)).casefold(),
+        os.path.normpath(os.path.realpath(target_raw)).casefold(),
+        resolve_nearest_real(target_raw).casefold(),
+    }
+
+    banned_raw = ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders"]
+    if tmpdir_raw:
+        banned_raw.append(tmpdir_raw)
+
+    banned_roots = set()
+    for root in banned_raw:
+        if not root:
+            continue
+        for candidate in (os.path.abspath(root), os.path.realpath(root), resolve_nearest_real(root)):
+            norm = os.path.normpath(candidate).casefold()
+            if norm and norm != "/":
+                banned_roots.add(norm)
+
+    for cand in cand_paths:
+        if cand == "/":
+            sys.exit(0)
+        for root in banned_roots:
+            if cand == root or cand.startswith(root + "/"):
+                sys.exit(0)
+
+    sys.exit(1)
+except SystemExit:
+    raise
+except Exception as exc:
+    print(f"ERROR: temp-dir check failed closed: {exc}", file=sys.stderr)
+    sys.exit(2)
+PY
+  if [ "$rc" -eq 1 ]; then
+    return 1
+  fi
+  return 0
+}
+
 resolve_work_dir() {
   if [ -n "$WORK_DIR" ]; then
     local explicit="${WORK_DIR%/}"
     if [[ "$explicit" != /* ]] || [ "$explicit" = "/" ]; then
       echo "ERROR: --work-dir must be a non-root absolute path (got '$WORK_DIR')" >&2
+      exit 1
+    fi
+    if is_temp_work_dir "$explicit"; then
+      echo "ERROR: refusing temporary directory for --work-dir: '$explicit' (must not resolve under /tmp, /private/tmp, /var/folders, or \$TMPDIR)" >&2
       exit 1
     fi
     printf '%s' "$explicit"
@@ -434,7 +519,7 @@ resolve_work_dir() {
     resolved="${resolved%/}"
     if [[ "$resolved" == /* ]] && [ "$resolved" != "/" ]; then
       parent="$(dirname "$resolved")"
-      if [ "$parent" != "/tmp" ] && { [ -d "$resolved" ] || [ -d "$parent" ]; }; then
+      if ! is_temp_work_dir "$resolved" && { [ -d "$resolved" ] || [ -d "$parent" ]; }; then
         printf '%s' "$resolved"
         return 0
       fi
@@ -450,7 +535,7 @@ resolve_work_dir() {
   if [ -n "$diskm_bin" ]; then
     scratch_root="$("$diskm_bin" volume path scratch 2>/dev/null || true)"
     scratch_root="${scratch_root%/}"
-    if [[ "$scratch_root" == /* ]] && [ "$scratch_root" != "/" ] && [ "$scratch_root" != "/tmp" ] && [ -d "$scratch_root" ]; then
+    if [[ "$scratch_root" == /* ]] && [ "$scratch_root" != "/" ] && ! is_temp_work_dir "$scratch_root" && [ -d "$scratch_root" ]; then
       printf '%s' "${scratch_root}/native-macos-ci-work"
       return 0
     fi
@@ -461,8 +546,8 @@ resolve_work_dir() {
 }
 
 WORK_DIR="$(resolve_work_dir)" || exit 1
-if is_reserved_runner_dir "$WORK_DIR" "$RUNNER_DIR"; then
-  echo "ERROR: refusing unsafe, reserved, or overlapping work dir: '$WORK_DIR' (runner dir: '$RUNNER_DIR')" >&2
+if is_temp_work_dir "$WORK_DIR" || is_reserved_runner_dir "$WORK_DIR" "$RUNNER_DIR"; then
+  echo "ERROR: refusing unsafe, temporary, reserved, or overlapping work dir: '$WORK_DIR' (runner dir: '$RUNNER_DIR')" >&2
   exit 2
 fi
 
@@ -490,10 +575,10 @@ render_plist() {
   # GUI login keychain session used by worldai-testflight-native-mac, while
   # still sharing the operator's macOS user account ($HOME).
   # NOTE: pull_request YAML `if:` guards execute from the fork's head commit and
-  # are NOT a security boundary against modified fork workflows; server-side
-  # protection (`allows_public_repositories=false`, private `--repo`, or
-  # `restricted_to_workflows=true` with non-empty `selected_workflows` plus
-  # `approval_policy=all_external_contributors`) is required and enforced fail-closed.
+  # are NOT a security boundary against modified fork workflows, and GitHub's
+  # fork-pr-contributor-approval setting does NOT gate pull_request_target;
+  # allows_public_repositories=false on the runner group or private --repo is
+  # required and enforced fail-closed (unless --allow-public-fork-exposure).
   cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -613,6 +698,11 @@ PY
 
 VERIFIED_RUNNER_GROUP_ID=""
 
+runner_configured() {
+  local dir="${1:-$RUNNER_DIR}"
+  [ -f "${dir}/.runner" ] && [ -f "${dir}/.credentials" ]
+}
+
 # Authority: fail-closed server-side fork-PR protection per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (exit 5 before token minting/setup/verify).
 verify_server_fork_protection() {
   command -v "$GH_BIN" >/dev/null 2>&1 || {
@@ -620,16 +710,19 @@ verify_server_fork_protection() {
     exit 5
   }
   VERIFIED_RUNNER_GROUP_ID=""
-  local is_priv="" pol="" groups_json="" group_json="" allows_pub="" group_vis="" wf_restricted_ok=""
-  local pub_repos_pages="" pub_repos="" repo_name="" repo_enabled="" repo_pol=""
+  local is_priv="" groups_json="" group_json="" allows_pub="" restricted_wf="" selected_wf_count=""
   if [ -n "$RUNNER_REPO" ]; then
     if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private' 9>&-)"; then
       echo "ERROR: failed to query visibility for repo '${RUNNER_REPO}'" >&2
       exit 5
     fi
-    if [ "$is_priv" != "true" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
-      echo "ERROR: public repo '${RUNNER_REPO}' cannot enforce server-side runner-group workflow restrictions against pull_request_target; use a private repo, an org runner group with restricted_to_workflows=true, or pass --allow-public-fork-exposure" >&2
-      exit 5
+    if [ "$is_priv" != "true" ]; then
+      if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
+        echo "WARNING: non-private repo '${RUNNER_REPO}' (private=${is_priv:-<unset>}) allowed via --allow-public-fork-exposure; pull_request_target bypasses GitHub fork-approval settings, so public access requires explicit operator workflow review" >&2
+      else
+        echo "ERROR: repo '${RUNNER_REPO}' has private='${is_priv:-<unset>}' (non-private); pull_request_target bypasses GitHub fork-approval settings so public access requires explicit operator workflow review + --allow-public-fork-exposure (or moving the runner to a private-only repo/runner group)" >&2
+        exit 5
+      fi
     fi
   else
     if ! groups_json="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups" 9>&-)"; then
@@ -646,112 +739,41 @@ verify_server_fork_protection() {
       echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' missing id in org '${RUNNER_ORG}'" >&2
       exit 5
     }
-    allows_pub="$(printf '%s\n' "$group_json" | jq -r '.allows_public_repositories')"
-    group_vis="$(printf '%s\n' "$group_json" | jq -r '.visibility // "all"')"
-    if [ "$allows_pub" = "true" ]; then
-      if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
-        wf_restricted_ok="$(printf '%s\n' "$group_json" | jq -r '((.restricted_to_workflows == true) and (((.selected_workflows // []) | length) > 0))')"
-        if [ "$wf_restricted_ok" != "true" ]; then
-          echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories without restricted_to_workflows=true and non-empty selected_workflows (pull_request_target bypasses fork approval); restrict the runner group or pass --allow-public-fork-exposure" >&2
-          exit 5
-        fi
-        if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
-          echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
-          exit 5
-        fi
-        if [ "$pol" != "all_external_contributors" ]; then
-          echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories and fork PR approval policy is '${pol}' (expected 'all_external_contributors'); restrict runner group or pass --allow-public-fork-exposure" >&2
-          exit 5
-        fi
-        if [ "$group_vis" = "selected" ]; then
-          if ! pub_repos_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/repositories?per_page=100" 9>&-)"; then
-            echo "ERROR: failed to query repositories for selected runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) in org '${RUNNER_ORG}'" >&2
-            exit 5
-          fi
-          if ! pub_repos="$(printf '%s\n' "$pub_repos_pages" | jq -sr '[.[].repositories[]? | select(((.private // false) == false) and ((.archived // false) == false)) | .name // empty] | unique[]')"; then
-            echo "ERROR: failed to parse repositories for runner group '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
-            exit 5
-          fi
-        else
-          if ! pub_repos_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/repos?type=public&per_page=100" 9>&-)"; then
-            echo "ERROR: failed to query public repositories for org '${RUNNER_ORG}'" >&2
-            exit 5
-          fi
-          if ! pub_repos="$(printf '%s\n' "$pub_repos_pages" | jq -sr '[.[] | .[]? | select(((.private // false) == false) and ((.archived // false) == false)) | .name // empty] | unique[]')"; then
-            echo "ERROR: failed to parse public repositories for org '${RUNNER_ORG}'" >&2
-            exit 5
-          fi
-        fi
-        while IFS= read -r repo_name; do
-          [ -n "$repo_name" ] || continue
-          if ! repo_enabled="$("$GH_BIN" api "repos/${RUNNER_ORG}/${repo_name}/actions/permissions" --jq 'if .enabled == false then "false" else "true" end' 9>&-)"; then
-            echo "ERROR: failed to query Actions permissions for public repo '${RUNNER_ORG}/${repo_name}'" >&2
-            exit 5
-          fi
-          if [ "$repo_enabled" = "false" ]; then
-            continue
-          fi
-          if ! repo_pol="$("$GH_BIN" api "repos/${RUNNER_ORG}/${repo_name}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""' 9>&-)"; then
-            echo "ERROR: failed to query fork PR contributor approval policy for public repo '${RUNNER_ORG}/${repo_name}'" >&2
-            exit 5
-          fi
-          if [ "$repo_pol" != "all_external_contributors" ]; then
-            echo "ERROR: public repo '${RUNNER_ORG}/${repo_name}' overrides fork PR approval policy to '${repo_pol}' (expected 'all_external_contributors'); tighten repo policy, restrict runner group, or pass --allow-public-fork-exposure" >&2
-            exit 5
-          fi
-        done <<<"$pub_repos"
+    allows_pub="$(printf '%s\n' "$group_json" | jq -r 'if has("allows_public_repositories") then (.allows_public_repositories | tostring) else "" end')"
+    restricted_wf="$(printf '%s\n' "$group_json" | jq -r 'if has("restricted_to_workflows") then (.restricted_to_workflows | tostring) else "unknown" end')"
+    selected_wf_count="$(printf '%s\n' "$group_json" | jq -r '(.selected_workflows // []) | length')"
+    if [ "$allows_pub" != "false" ]; then
+      if [ "$ALLOW_PUBLIC_FORK_EXPOSURE" = "1" ]; then
+        echo "WARNING: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}, allows_public_repositories=${allows_pub:-<unset>}, restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}) allowed via --allow-public-fork-exposure; pull_request_target bypasses GitHub fork-approval settings, so public access requires explicit operator workflow review" >&2
+      else
+        echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID}) has allows_public_repositories='${allows_pub:-<unset>}' (restricted_to_workflows=${restricted_wf}, selected_workflows=${selected_wf_count}); pull_request_target bypasses GitHub fork-approval settings so public access requires explicit operator workflow review + --allow-public-fork-exposure (or moving the runner to a private-only runner group with allows_public_repositories=false)" >&2
+        exit 5
       fi
-    elif [ "$allows_pub" != "false" ]; then
-      echo "ERROR: unexpected allows_public_repositories='${allows_pub}' for runner group '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2
-      exit 5
     fi
   fi
 }
 
-# Authority: live runner agentId/group/label binding per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (shared across setup, post_config, and --verify).
-verify_live_runner_state() {
-  local mode="${1:?missing mode}"
-  local local_agent_id="" runners_pages="" runner_json=""
+verify_live_runner_state_once() {
+  local mode="$1" local_agent_id="$2"
+  local runners_pages="" runner_json="" live_status=""
   local group_runners_pages="" in_group=0 live_labels_csv="" expected_sorted_csv=""
-  local max_attempts=1 attempt=1
 
-  if [ "$mode" = "verify" ] || { [ -z "$RUNNER_REPO" ] && [ -z "$VERIFIED_RUNNER_GROUP_ID" ]; }; then
-    verify_server_fork_protection
+  if ! runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+    echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
+    return 2
   fi
-
-  if [ ! -f "${RUNNER_DIR}/.runner" ]; then
-    echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2
-    return 1
-  fi
-  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
-  if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]] || [ "$local_agent_id" -le 0 ]; then
-    echo "FAIL: .runner missing valid positive numeric agentId (got '${local_agent_id}')" >&2
-    return 1
-  fi
-
-  if [ "$mode" = "post_config" ]; then
-    max_attempts="$POST_CONFIG_VERIFY_ATTEMPTS"
-  fi
-
-  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
-    if ! runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
-      echo "ERROR: failed to query live runners from $RUNNERS_API" >&2
-      [ "$mode" = "setup" ] && exit 1
-      return 1
-    fi
-    runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
-    if [ -n "$runner_json" ]; then
-      break
-    fi
-    if [ "$attempt" -lt "$max_attempts" ]; then
-      echo "INFO: newly configured runner '$RUNNER_NAME' (agentId=$local_agent_id) not yet visible in $RUNNERS_API (attempt ${attempt}/${max_attempts}); retrying in ${POST_CONFIG_VERIFY_SLEEP_SEC}s..." >&2
-      sleep "$POST_CONFIG_VERIFY_SLEEP_SEC"
-    fi
-  done
-
+  runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
   if [ -z "$runner_json" ]; then
     echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API" >&2
     return 1
+  fi
+
+  if [ "$mode" = "verify" ]; then
+    live_status="$(printf '%s\n' "$runner_json" | jq -r '.status // empty' | tr '[:upper:]' '[:lower:]')"
+    if [ "$live_status" != "online" ]; then
+      echo "FAIL: live runner '$RUNNER_NAME' (agentId=$local_agent_id) status is '${live_status:-<unset>}' (expected 'online')" >&2
+      return 1
+    fi
   fi
 
   live_labels_csv="$(printf '%s\n' "$runner_json" | jq -r '[.labels[]?.name // empty] | map(ascii_downcase) | unique | join(",")')"
@@ -776,8 +798,7 @@ verify_live_runner_state() {
     fi
     if ! group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners" 9>&-)"; then
       echo "ERROR: failed to query runners for org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2
-      [ "$mode" = "setup" ] && exit 1
-      return 1
+      return 2
     fi
     in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$local_agent_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"
     if [ "$in_group" -lt 1 ]; then
@@ -786,6 +807,47 @@ verify_live_runner_state() {
     fi
   fi
   return 0
+}
+
+# Authority: live runner agentId/group/label binding per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247,257 (shared across setup, post_config, and --verify).
+verify_live_runner_state() {
+  local mode="${1:?missing mode}"
+  local local_agent_id="" max_attempts=1 attempt=1 once_rc=0
+
+  if [ "$mode" = "verify" ] || { [ -z "$RUNNER_REPO" ] && [ -z "$VERIFIED_RUNNER_GROUP_ID" ]; }; then
+    verify_server_fork_protection
+  fi
+
+  if ! runner_configured "$RUNNER_DIR"; then
+    echo "FAIL: missing ${RUNNER_DIR}/.runner or ${RUNNER_DIR}/.credentials" >&2
+    return 1
+  fi
+  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
+  if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]] || [ "$local_agent_id" -le 0 ]; then
+    echo "FAIL: .runner missing valid positive numeric agentId (got '${local_agent_id}')" >&2
+    return 1
+  fi
+
+  if [ "$mode" = "post_config" ]; then
+    max_attempts="$POST_CONFIG_VERIFY_ATTEMPTS"
+  fi
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    once_rc=0
+    verify_live_runner_state_once "$mode" "$local_agent_id" || once_rc=$?
+    if [ "$once_rc" -eq 0 ]; then
+      return 0
+    fi
+    if [ "$mode" = "setup" ] && [ "$once_rc" -eq 2 ]; then
+      exit 1
+    fi
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      echo "INFO: post-config live runner verification for '$RUNNER_NAME' (agentId=$local_agent_id) incomplete (attempt ${attempt}/${max_attempts}); retrying in ${POST_CONFIG_VERIFY_SLEEP_SEC}s..." >&2
+      sleep "$POST_CONFIG_VERIFY_SLEEP_SEC"
+    fi
+  done
+
+  return 1
 }
 
 if [ "$VERIFY" -eq 1 ]; then
@@ -803,7 +865,7 @@ if [ "$VERIFY" -eq 1 ]; then
     exit 1
   fi
   [ -d "$WORK_DIR" ] || { echo "FAIL: missing work dir ${WORK_DIR}" >&2; exit 1; }
-  [ -f "${RUNNER_DIR}/.runner" ] || { echo "FAIL: missing ${RUNNER_DIR}/.runner" >&2; exit 1; }
+  runner_configured "$RUNNER_DIR" || { echo "FAIL: missing ${RUNNER_DIR}/.runner or ${RUNNER_DIR}/.credentials" >&2; exit 1; }
   [ -f "${RUNNER_DIR}/.ezgha-labels" ] || { echo "FAIL: missing ${RUNNER_DIR}/.ezgha-labels" >&2; exit 1; }
   [ -f "$PLIST_PATH" ] || { echo "FAIL: missing $PLIST_PATH" >&2; exit 1; }
   py_bin="$(resolve_python3)" || { echo "FAIL: python3 not found" >&2; exit 1; }
@@ -905,10 +967,31 @@ fi
 acquire_setup_lock || exit 1
 verify_server_fork_protection
 
-# Register or refresh configuration when .runner/.ezgha-labels/.ezgha-group is missing, differs, live GitHub state drifted, or --reconfigure is passed.
+# Authority: safe --replace collision guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack another host's runner registration).
+resolve_replace_collision_policy() {
+  local prev_id="${1:-}" pre_runners_pages="" colliding_ids=""
+  use_replace=0
+  if ! pre_runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
+    echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
+    exit 1
+  fi
+  colliding_ids="$(printf '%s\n' "$pre_runners_pages" | jq -sr --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | (.id | tostring)] | unique | join(",")')"
+  if [ -n "$colliding_ids" ]; then
+    if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
+      use_replace=1
+    elif [ -n "$prev_id" ] && [ "$colliding_ids" = "$prev_id" ]; then
+      use_replace=1
+    else
+      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_ids}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_id:-<none>}'; refusing --replace to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
+      exit 6
+    fi
+  fi
+}
+
+# Register or refresh configuration when .runner/.credentials/.ezgha-labels/.ezgha-group is missing, differs, live GitHub state drifted, or --reconfigure is passed.
 # Run this determination and the live name-collision precheck BEFORE staging binaries or stopping the incumbent LaunchAgent.
 needs_config=1
-if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_DIR}/.ezgha-labels" ] && [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
+if [ "$RECONFIGURE" -eq 0 ] && runner_configured "$RUNNER_DIR" && [ -f "${RUNNER_DIR}/.ezgha-labels" ] && [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
   existing_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
@@ -931,8 +1014,8 @@ if [ "$needs_config" -eq 0 ]; then
 fi
 
 use_replace=0
+prev_agent_id=""
 if [ "$needs_config" -eq 1 ]; then
-  prev_agent_id=""
   if [ -f "${RUNNER_DIR}/.runner" ]; then
     raw_prev_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
     if [[ "$raw_prev_agent_id" =~ ^[0-9]+$ ]] && [ "$raw_prev_agent_id" -gt 0 ]; then
@@ -961,22 +1044,7 @@ if [ "$needs_config" -eq 1 ]; then
     fi
   fi
 
-  # Authority: safe --replace collision guard per operator ask (2026-11-18, #L16) and origin/main:AGENTS.md:246-247 (self-outage prevention: never hijack another host's runner registration).
-  if ! pre_runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API" 9>&-)"; then
-    echo "ERROR: failed to query live runners from $RUNNERS_API before configuration" >&2
-    exit 1
-  fi
-  colliding_ids="$(printf '%s\n' "$pre_runners_pages" | jq -sr --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name) | (.id | tostring)] | unique | join(",")')"
-  if [ -n "$colliding_ids" ]; then
-    if [ "$FORCE_REPLACE_NAME" -eq 1 ]; then
-      use_replace=1
-    elif [ -n "$prev_agent_id" ] && [ "$colliding_ids" = "$prev_agent_id" ]; then
-      use_replace=1
-    else
-      echo "ERROR: live runner '${RUNNER_NAME}' (id=${colliding_ids}) already exists on GitHub (${RUNNERS_API}) while local .runner agentId is '${prev_agent_id:-<none>}'; refusing --replace to avoid colliding with another host's runner (pass --force-replace-name to override)" >&2
-      exit 6
-    fi
-  fi
+  resolve_replace_collision_policy "$prev_agent_id"
 fi
 
 mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
@@ -1098,6 +1166,7 @@ fi
 if [ "$needs_config" -eq 1 ]; then
   reg_token="$("$GH_BIN" api -X POST "$TOKEN_API" --jq '.token' 9>&-)"
   [ -n "$reg_token" ] || { echo "ERROR: failed to mint registration token from $TOKEN_API" >&2; exit 3; }
+  resolve_replace_collision_policy "$prev_agent_id"
   if ! stop_launchagent; then
     echo "ERROR: failed to stop ${PLIST_LABEL}; aborting before removing existing credentials" >&2
     exit 1

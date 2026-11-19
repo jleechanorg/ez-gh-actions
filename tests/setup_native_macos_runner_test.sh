@@ -5,7 +5,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SETUP_SCRIPT="$ROOT/scripts/setup-native-macos-runner.sh"
 INSTALL_LAUNCHAGENTS="$ROOT/launchd/install-launchagents.sh"
-TMP="$(mktemp -d)"
+if [ -d /var/tmp ] && [ -w /var/tmp ]; then
+  TMP="$(mktemp -d /var/tmp/ezgha-setup-test.XXXXXX)"
+else
+  TMP="$(mktemp -d)"
+fi
+export TMPDIR="$TMP/env-tmpdir"
+mkdir -p "$TMPDIR"
 trap 'rm -rf "${TMP:?}"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -266,10 +272,25 @@ lookup_repo_map() {
 }
 case "$*" in
   *"actions/runners/registration-token"*)
+    if [ -n "${GH_TOKEN_MINTED_MARKER:-}" ]; then
+      : > "$GH_TOKEN_MINTED_MARKER"
+    fi
     emit_json '{"token":"stub-reg-token"}'
     ;;
   *"actions/runner-groups/"*"/runners"*)
     default_group_runners='{"total_count":1,"runners":[{"id":101,"name":"mac-native-ci-1"}]}'
+    if [ -n "${GH_GROUP_CALL_COUNT_FILE:-}" ]; then
+      cnt=0
+      if [ -f "$GH_GROUP_CALL_COUNT_FILE" ]; then
+        cnt="$(cat "$GH_GROUP_CALL_COUNT_FILE")"
+      fi
+      cnt=$((cnt + 1))
+      printf '%s\n' "$cnt" > "$GH_GROUP_CALL_COUNT_FILE"
+      if [ "$cnt" -ge 2 ] && [ -n "${GROUP_RUNNERS_AFTER_ATTEMPT_JSON:-}" ]; then
+        emit_json "$GROUP_RUNNERS_AFTER_ATTEMPT_JSON"
+        exit 0
+      fi
+    fi
     emit_json "${GROUP_RUNNERS_JSON:-$default_group_runners}"
     ;;
   *"actions/runner-groups/"*"/repositories"*)
@@ -305,9 +326,11 @@ case "$*" in
     emit_json "${FORK_APPROVAL_JSON:-$default_policy}"
     ;;
   *"actions/runners"*)
-    default_live='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}'
+    default_live='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"online","labels":[{"name":"self-hosted-native-macos"}]}]}'
     if [ -n "${LIVE_RUNNERS_POST_CONFIG_JSON:-}" ] && [ -n "${CONFIG_RAN_MARKER:-}" ] && [ -f "$CONFIG_RAN_MARKER" ]; then
       emit_json "$LIVE_RUNNERS_POST_CONFIG_JSON"
+    elif [ -n "${LIVE_RUNNERS_AFTER_TOKEN_JSON:-}" ] && [ -n "${GH_TOKEN_MINTED_MARKER:-}" ] && [ -f "$GH_TOKEN_MINTED_MARKER" ]; then
+      emit_json "$LIVE_RUNNERS_AFTER_TOKEN_JSON"
     else
       emit_json "${LIVE_RUNNERS_JSON:-$default_live}"
     fi
@@ -491,17 +514,26 @@ if compgen -G "$TMP/home/.local/state/ezgha/.gh-actions-cost-alert.sh.backup.*" 
   fail "successful cost-alert install must remove script backup"
 fi
 
-# Failed launchctl load for org.jleechanorg.ezgha-gh-actions-cost-alert must roll back BOTH plist and libexec script.
+# Failed launchctl load for org.jleechanorg.ezgha-gh-actions-cost-alert must restore prior libexec script BEFORE reloading backup plist.
 COST_FAIL_HOME="$TMP/cost-fail-home"
 COST_FAIL_BIN="$TMP/cost-fail-bin"
 mkdir -p "$COST_FAIL_HOME/Library/LaunchAgents" "$COST_FAIL_HOME/.local/libexec/ezgha" "$COST_FAIL_BIN"
 printf 'prior-cost-plist\n' > "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist"
 printf 'prior-cost-script\n' > "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
 chmod +x "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh"
-cat > "$COST_FAIL_BIN/launchctl" <<'STUB'
+printf '0\n' > "$COST_FAIL_HOME/load-count.txt"
+cat > "$COST_FAIL_BIN/launchctl" <<STUB
 #!/usr/bin/env bash
-if [ "${1:-}" = "load" ] && [[ "${2:-}" == *gh-actions-cost-alert.plist ]]; then
-  exit 42
+if [ "\${1:-}" = "load" ] && [[ "\${2:-}" == *gh-actions-cost-alert.plist ]]; then
+  count="\$(cat "$COST_FAIL_HOME/load-count.txt")"
+  count=\$((count + 1))
+  printf '%s\n' "\$count" > "$COST_FAIL_HOME/load-count.txt"
+  if [ "\$count" -eq 1 ]; then
+    exit 42
+  fi
+  cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh" > "$COST_FAIL_HOME/script-at-reload.txt"
+  cat "\$2" > "$COST_FAIL_HOME/plist-at-reload.txt"
+  exit 0
 fi
 exit 0
 STUB
@@ -510,6 +542,11 @@ cost_fail_rc=0
 BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
   bash "$INSTALL_LAUNCHAGENTS" install org.jleechanorg.ezgha-gh-actions-cost-alert >/dev/null 2>&1 || cost_fail_rc=$?
 [ "$cost_fail_rc" -eq 42 ] || fail "failed cost-alert load must exit 42 (got $cost_fail_rc)"
+[ "$(cat "$COST_FAIL_HOME/load-count.txt")" = "2" ] || fail "failed cost-alert upgrade must attempt backup plist reload (got $(cat "$COST_FAIL_HOME/load-count.txt"))"
+[ "$(cat "$COST_FAIL_HOME/script-at-reload.txt")" = "prior-cost-script" ] || \
+  fail "backup plist reload must see prior-cost-script ALREADY restored before launchctl load (got: $(cat "$COST_FAIL_HOME/script-at-reload.txt"))"
+[ "$(cat "$COST_FAIL_HOME/plist-at-reload.txt")" = "prior-cost-plist" ] || \
+  fail "backup plist reload must receive prior-cost-plist (got: $(cat "$COST_FAIL_HOME/plist-at-reload.txt"))"
 [ "$(cat "$COST_FAIL_HOME/Library/LaunchAgents/org.jleechanorg.ezgha-gh-actions-cost-alert.plist")" = "prior-cost-plist" ] || \
   fail "failed cost-alert load must restore prior plist"
 [ "$(cat "$COST_FAIL_HOME/.local/libexec/ezgha/gh-actions-cost-alert.sh")" = "prior-cost-script" ] || \
@@ -517,7 +554,7 @@ BASH_ENV=/dev/null HOME="$COST_FAIL_HOME" PATH="$COST_FAIL_BIN:$PATH" \
 if compgen -G "$COST_FAIL_HOME/.local/state/ezgha/.gh-actions-cost-alert.sh.backup.*" >/dev/null; then
   fail "failed cost-alert load must clean up temporary script backup"
 fi
-pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents, rolls back script+plist on load failure, handles fresh account, and renders valid plist"
+pass "label-scoped install of org.jleechanorg.ezgha-gh-actions-cost-alert preserves incumbents, rolls back script BEFORE backup plist reload, handles fresh account, and renders valid plist"
 
 # 6. --uninstall runs before resolve_work_dir, unloads even without plist, and retains plist if still loaded.
 : > "$TMP/launchctl.loaded"
@@ -756,6 +793,7 @@ while [ ! -f "$TMP/setup-flock.ready" ]; do sleep 0.05; done
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
   "$SETUP_SCRIPT" --dry-run >/dev/null || fail "--dry-run must not block on lifecycle flock"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
 : > "$TMP/launchctl.loaded"
 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
   "$SETUP_SCRIPT" --verify --offline >/dev/null || fail "--verify --offline must not block on lifecycle flock"
@@ -842,6 +880,7 @@ grep -q -- '--runnergroup macos-restricted' <<<"$rg_dry_out" || fail "--dry-run 
 PUB_OPEN_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true,"restricted_to_workflows":false,"selected_workflows":[]}]}'
 PUB_WF_EMPTY_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true,"restricted_to_workflows":true,"selected_workflows":[]}]}'
 PUB_WF_RESTRICTED_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/disk_magician/.github/workflows/ci.yml@refs/heads/main"]}]}'
+PUB_UNKNOWN_GROUPS='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/disk_magician/.github/workflows/ci.yml@refs/heads/main"]}]}'
 MIXED_GROUPS='{"total_count":2,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":true},{"id":2,"name":"macos-restricted","default":false,"allows_public_repositories":false}]}'
 : > "$TMP/gh-fork.log"
 fork_rc=0
@@ -864,13 +903,32 @@ RUNNER_GROUPS_JSON="$PUB_WF_EMPTY_GROUPS" FORK_APPROVAL_JSON='{"approval_policy"
   "$SETUP_SCRIPT" --verify >/dev/null 2>&1 || vfork_empty_rc=$?
 [ "$vfork_empty_rc" -eq 5 ] || fail "--verify with allows_public_repositories=true + empty selected_workflows must exit 5 (got $vfork_empty_rc)"
 
-RUNNER_GROUPS_JSON="$PUB_WF_RESTRICTED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
-  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" --verify >/dev/null || fail "--verify must pass with restricted_to_workflows=true + selected_workflows + all_external_contributors"
+vfork_restricted_rc=0
+vfork_restricted_err="$(
+  RUNNER_GROUPS_JSON="$PUB_WF_RESTRICTED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify 2>&1 >/dev/null
+)" || vfork_restricted_rc=$?
+[ "$vfork_restricted_rc" -eq 5 ] || fail "--verify with allows_public_repositories=true must exit 5 even with restricted_to_workflows=true + selected_workflows + all_external_contributors (got $vfork_restricted_rc)"
+grep -q "allows_public_repositories='true'" <<<"$vfork_restricted_err" || fail "public group error must cite allows_public_repositories='true' (got: $vfork_restricted_err)"
+grep -q 'restricted_to_workflows=true' <<<"$vfork_restricted_err" || fail "public group error must cite restricted_to_workflows=true (got: $vfork_restricted_err)"
+grep -q 'pull_request_target' <<<"$vfork_restricted_err" || fail "public group error must explain pull_request_target bypass (got: $vfork_restricted_err)"
 
-RUNNER_GROUPS_JSON="$PUB_OPEN_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+vfork_unknown_rc=0
+RUNNER_GROUPS_JSON="$PUB_UNKNOWN_GROUPS" \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" --verify --allow-public-fork-exposure >/dev/null || fail "--verify must pass with --allow-public-fork-exposure"
+  "$SETUP_SCRIPT" --verify >/dev/null 2>&1 || vfork_unknown_rc=$?
+[ "$vfork_unknown_rc" -eq 5 ] || fail "--verify when allows_public_repositories cannot be confirmed false must exit 5 (got $vfork_unknown_rc)"
+
+allow_warn_err="$(
+  RUNNER_GROUPS_JSON="$PUB_WF_RESTRICTED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --allow-public-fork-exposure 2>&1 >/dev/null
+)" || fail "--verify must pass with --allow-public-fork-exposure"
+grep -q 'WARNING:' <<<"$allow_warn_err" || fail "--allow-public-fork-exposure must emit WARNING (got: $allow_warn_err)"
+grep -q 'allows_public_repositories=true' <<<"$allow_warn_err" || fail "--allow-public-fork-exposure warning must cite allows_public_repositories=true"
+grep -q 'restricted_to_workflows=true' <<<"$allow_warn_err" || fail "--allow-public-fork-exposure warning must cite restricted_to_workflows=true"
+grep -q 'pull_request_target' <<<"$allow_warn_err" || fail "--allow-public-fork-exposure warning must cite pull_request_target"
 
 missing_rg_rc=0
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
@@ -891,9 +949,16 @@ REPO_META_JSON='{"private":false}' FORK_APPROVAL_JSON='{"approval_policy":"all_e
   "$SETUP_SCRIPT" --reconfigure --repo jleechanorg/pub >/dev/null 2>&1 || pub_repo_rc=$?
 [ "$pub_repo_rc" -eq 5 ] || fail "public --repo must exit 5 without --allow-public-fork-exposure even when all_external_contributors is set (got $pub_repo_rc)"
 
-REPO_META_JSON='{"private":false}' FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+REPO_META_JSON='{"private":true}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" --reconfigure --repo jleechanorg/pub --allow-public-fork-exposure >/dev/null || fail "public --repo with --allow-public-fork-exposure must succeed"
+  "$SETUP_SCRIPT" --reconfigure --repo jleechanorg/priv >/dev/null || fail "private --repo must pass without --allow-public-fork-exposure"
+
+pub_repo_warn_err="$(
+  REPO_META_JSON='{"private":false}' FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --reconfigure --repo jleechanorg/pub --allow-public-fork-exposure 2>&1 >/dev/null
+)" || fail "public --repo with --allow-public-fork-exposure must succeed"
+grep -q 'WARNING:.*pull_request_target' <<<"$pub_repo_warn_err" || fail "public --repo with --allow-public-fork-exposure must emit WARNING mentioning pull_request_target"
 RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
   HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
   "$SETUP_SCRIPT" --reconfigure --runner-group macos-restricted >/dev/null || fail "restoring restricted runner group after --repo check must pass"
@@ -1077,48 +1142,28 @@ RUNNER_GROUP="Default" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISK
   "$SETUP_SCRIPT" --dry-run --repo jleechanorg/pub >/dev/null 2>&1 || rg_env_repo_rc=$?
 [ "$rg_env_repo_rc" -eq 2 ] || fail "RUNNER_GROUP env var combined with --repo must exit 2 (got $rg_env_repo_rc)"
 
-# Per-repo fork-pr-contributor-approval override must fail closed (exit 5) even when org policy is all_external_contributors.
+# Public-capable runner groups (including selected-visibility and workflow-restricted) always fail closed (exit 5) without --allow-public-fork-exposure.
 cp "$TMP/plist.ok" "$PLIST_T"
 : > "$TMP/launchctl.loaded"
 printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'self-hosted-native-macos\n' > "$RUNNER_DIR_T/.ezgha-labels"
 printf '\n' > "$RUNNER_DIR_T/.ezgha-group"
 
-ORG_REPOS_OVERRIDE='[{"name":"pub-weak","private":false,"archived":false},{"name":"pub-disabled","private":false,"archived":false},{"name":"pub-arch","private":false,"archived":true}]'
-pub_override_rc=0
-pub_override_err="$(
-  RUNNER_GROUPS_JSON="$PUB_WF_RESTRICTED_GROUPS" \
-  FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
-  ORG_REPOS_JSON="$ORG_REPOS_OVERRIDE" \
-  REPO_ACTIONS_PERMS_MAP="pub-disabled=false,pub-weak=true" \
-  REPO_FORK_APPROVAL_MAP="pub-weak=first_time_contributors" \
-  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-    "$SETUP_SCRIPT" --verify 2>&1 >/dev/null
-)" || pub_override_rc=$?
-[ "$pub_override_rc" -eq 5 ] || fail "per-repo fork-approval override must exit 5 on --verify (got $pub_override_rc)"
-grep -q 'jleechanorg/pub-weak' <<<"$pub_override_err" || fail "per-repo failure must name offending repo jleechanorg/pub-weak (got: $pub_override_err)"
-
-RUNNER_GROUPS_JSON="$PUB_WF_RESTRICTED_GROUPS" \
-FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
-ORG_REPOS_JSON="$ORG_REPOS_OVERRIDE" \
-REPO_ACTIONS_PERMS_MAP="pub-disabled=false,pub-weak=true" \
-REPO_FORK_APPROVAL_MAP="pub-weak=all_external_contributors" \
-HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" --verify >/dev/null || fail "--verify must pass when org and enabled public repos use all_external_contributors"
-
-# Selected-visibility runner group with allows_public_repositories=true checks group repositories endpoint.
 SEL_PUB_GROUPS='{"total_count":1,"runner_groups":[{"id":7,"name":"sel-pub","default":false,"visibility":"selected","allows_public_repositories":true,"restricted_to_workflows":true,"selected_workflows":["jleechanorg/pub-weak/.github/workflows/ci.yml@refs/heads/main"]}]}'
-GROUP_REPOS_SEL='{"total_count":1,"repositories":[{"name":"pub-weak","private":false,"archived":false}]}'
 printf 'sel-pub\n' > "$RUNNER_DIR_T/.ezgha-group"
 sel_override_rc=0
+sel_override_err="$(
+  RUNNER_GROUPS_JSON="$SEL_PUB_GROUPS" \
+  FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-group sel-pub 2>&1 >/dev/null
+)" || sel_override_rc=$?
+[ "$sel_override_rc" -eq 5 ] || fail "selected-visibility group with allows_public_repositories=true must exit 5 without --allow-public-fork-exposure (got $sel_override_rc)"
+grep -q "allows_public_repositories='true'" <<<"$sel_override_err" || fail "selected-visibility public group error must cite allows_public_repositories='true'"
 RUNNER_GROUPS_JSON="$SEL_PUB_GROUPS" \
-GROUP_REPOS_JSON="$GROUP_REPOS_SEL" \
-FORK_APPROVAL_JSON='{"approval_policy":"all_external_contributors"}' \
-REPO_ACTIONS_PERMS_MAP="pub-weak=true" \
-REPO_FORK_APPROVAL_MAP="pub-weak=first_time_contributors" \
-HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
-  "$SETUP_SCRIPT" --verify --runner-group sel-pub >/dev/null 2>&1 || sel_override_rc=$?
-[ "$sel_override_rc" -eq 5 ] || fail "selected-visibility group with weak public repo must exit 5 (got $sel_override_rc)"
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-group sel-pub --allow-public-fork-exposure >/dev/null 2>&1 || fail "selected-visibility group with --allow-public-fork-exposure must pass"
 printf 'macos-restricted\n' > "$RUNNER_DIR_T/.ezgha-group"
 
 # Missing or non-numeric .runner agentId must fail closed (never fall back to name-only matching).
@@ -1336,3 +1381,161 @@ leftover_retry_backups=("$RETRY_RUNNER"/.backup-pre-reconfigure.*)
 shopt -u nullglob
 [ "${#leftover_retry_backups[@]}" -eq 0 ] || fail "successful retry --reconfigure must remove all .backup-pre-reconfigure.* directories (found: ${leftover_retry_backups[*]})"
 pass "failed --reconfigure preserves agentId ownership proof in backup .runner for --replace retry and cleans all backups on success"
+
+# 24. Round-18 P1 hardening:
+#     a) conflicting action flags & --offline --dry-run fail closed (exit 2) before executing any branch
+#     b) missing .credentials fails --verify (online & --offline) and triggers setup reconfiguration
+#     c) --verify requires live runner status == "online"
+#     d) post_config retries full verify_live_runner_state across POST_CONFIG_VERIFY_ATTEMPTS
+#     e) immediate pre-config.sh --replace recheck catches TOCTOU foreign collision after token fetch
+#     f) canonical /tmp / /private/tmp / /var/folders / $TMPDIR WORK_DIR rejection & fail-closed is_reserved_runner_dir
+: > "$TMP/launchctl.loaded"
+cp "$TMP/plist.ok" "$PLIST_T"
+for bad_combo in "--verify --uninstall" "--dry-run --verify" "--verify --reconfigure" "--uninstall --dry-run" "--reconfigure --dry-run" "--offline --dry-run"; do
+  combo_rc=0
+  : > "$TMP/gh-combo.log"
+  : > "$TMP/launchctl.log"
+  # shellcheck disable=SC2086
+  GH_RUNNER_CALL_LOG="$TMP/gh-combo.log" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" $bad_combo >/dev/null 2>&1 || combo_rc=$?
+  [ "$combo_rc" -eq 2 ] || fail "conflicting flag combo '$bad_combo' must exit 2 (got $combo_rc)"
+  [ ! -s "$TMP/gh-combo.log" ] || fail "conflicting flag combo '$bad_combo' must abort before calling gh"
+  [ ! -s "$TMP/launchctl.log" ] || fail "conflicting flag combo '$bad_combo' must abort before calling launchctl"
+  [ -f "$PLIST_T" ] || fail "conflicting flag combo '$bad_combo' must not remove plist"
+done
+
+# Missing .credentials fails --verify (--offline & online) and triggers normal setup reconfiguration.
+CRED_RUNNER="$TMP/home/cred-check-runner"
+mkdir -p "$CRED_RUNNER/bin" "$CRED_RUNNER/externals"
+cp "$EXISTING_SYM/bin.2.338.2/Runner.Listener" "$CRED_RUNNER/bin/Runner.Listener"
+cp "$EXISTING_SYM/config.sh" "$CRED_RUNNER/config.sh"
+cp "$EXISTING_SYM/run.sh" "$CRED_RUNNER/run.sh"
+: > "$CRED_RUNNER/run-helper.sh.template"
+: > "$CRED_RUNNER/env.sh"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$CRED_RUNNER/.runner"
+printf 'self-hosted-native-macos\n' > "$CRED_RUNNER/.ezgha-labels"
+printf 'macos-restricted\n' > "$CRED_RUNNER/.ezgha-group"
+python3 - "$TMP/plist.ok" "$PLIST_T" "$CRED_RUNNER" <<'PY'
+import plistlib, sys
+from pathlib import Path
+d = plistlib.loads(Path(sys.argv[1]).read_bytes())
+r = sys.argv[3]
+d["WorkingDirectory"] = r
+d["ProgramArguments"] = ["/bin/bash", f"{r}/run.sh"]
+Path(sys.argv[2]).write_bytes(plistlib.dumps(d))
+PY
+: > "$TMP/launchctl.loaded"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline --runner-dir "$CRED_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify --offline must fail when .credentials is missing"
+fi
+if RUNNER_GROUPS_JSON="$MIXED_GROUPS" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-dir "$CRED_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail when .credentials is missing"
+fi
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --runner-group macos-restricted >/dev/null
+grep -q 'config.sh ' "$TMP/config.log" || fail "normal setup must reconfigure when .credentials is missing"
+[ -f "$CRED_RUNNER/.credentials" ] || fail "setup must restore .credentials via config.sh"
+
+# --verify requires live status == "online".
+if LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","status":"offline","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+    RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-dir "$CRED_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail when live runner status is offline"
+fi
+if LIVE_RUNNERS_JSON='{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+    RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-dir "$CRED_RUNNER" --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail when live runner status is missing"
+fi
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-dir "$CRED_RUNNER" --runner-group macos-restricted >/dev/null || \
+  fail "--verify must pass when .credentials exists and live runner status is online"
+
+# Full post_config retry across POST_CONFIG_VERIFY_ATTEMPTS (attempt 1 missing group membership -> attempt 2 succeeds).
+rm -f "$TMP/group-attempts.txt"
+POST_CONFIG_VERIFY_ATTEMPTS=2 POST_CONFIG_VERIFY_SLEEP_SEC=0 \
+  GH_GROUP_CALL_COUNT_FILE="$TMP/group-attempts.txt" \
+  GROUP_RUNNERS_JSON='{"total_count":0,"runners":[]}' \
+  GROUP_RUNNERS_AFTER_ATTEMPT_JSON='{"total_count":1,"runners":[{"id":101,"name":"mac-native-ci-1"}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null || \
+  fail "post_config must retry full verify_live_runner_state across POST_CONFIG_VERIFY_ATTEMPTS when group membership lags on attempt 1"
+[ "$(cat "$TMP/group-attempts.txt")" = "2" ] || fail "expected 2 group-membership attempts on retry (got $(cat "$TMP/group-attempts.txt"))"
+
+# Immediate pre-config.sh --replace collision recheck catches TOCTOU collision appearing after registration-token mint.
+rm -f "$TMP/token-minted-24"
+: > "$TMP/config.log"
+: > "$TMP/launchctl.log"
+: > "$TMP/launchctl.loaded"
+toctou_rc=0
+GH_TOKEN_MINTED_MARKER="$TMP/token-minted-24" \
+  LIVE_RUNNERS_JSON='{"runners":[]}' \
+  LIVE_RUNNERS_AFTER_TOKEN_JSON='{"runners":[{"id":999,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+  RUNNER_GROUPS_JSON="$MIXED_GROUPS" \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-dir "$CRED_RUNNER" --reconfigure --runner-group macos-restricted >/dev/null 2>&1 || toctou_rc=$?
+[ "$toctou_rc" -eq 6 ] || fail "TOCTOU foreign runner appearing after token mint must exit 6 (got $toctou_rc)"
+[ ! -s "$TMP/config.log" ] || fail "TOCTOU collision recheck must abort BEFORE invoking config.sh"
+[ -f "$TMP/launchctl.loaded" ] || fail "TOCTOU collision recheck must leave incumbent LaunchAgent loaded"
+! grep -Eq 'launchctl (unload|bootout)' "$TMP/launchctl.log" || fail "TOCTOU collision recheck must abort BEFORE stopping LaunchAgent"
+
+# Canonical /tmp / /private/tmp / /var/folders / $TMPDIR rejection & fail-closed is_reserved_runner_dir.
+cat > "$TMP/bin/scratch-dir-tmp-sub.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '/tmp/%s\n' "${1:-work}"
+STUB
+chmod +x "$TMP/bin/scratch-dir-tmp-sub.sh"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-missing" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-tmp-sub.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run >/dev/null 2>&1; then
+  fail "/tmp fallback from scratch-dir.sh must fail closed"
+fi
+
+cat > "$TMP/bin/scratch-dir-private-tmp.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '/private/tmp/%s\n' "${1:-work}"
+STUB
+chmod +x "$TMP/bin/scratch-dir-private-tmp.sh"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-missing" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-private-tmp.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run >/dev/null 2>&1; then
+  fail "/private/tmp fallback from scratch-dir.sh must fail closed"
+fi
+
+cat > "$TMP/bin/scratch-dir-tmpdir.sh" <<STUB
+#!/usr/bin/env bash
+printf '%s/%s\n' "$TMPDIR" "\${1:-work}"
+STUB
+chmod +x "$TMP/bin/scratch-dir-tmpdir.sh"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-missing" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-tmpdir.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run >/dev/null 2>&1; then
+  fail "\$TMPDIR fallback from scratch-dir.sh must fail closed"
+fi
+
+for bad_temp_work in "/tmp/work-x" "/private/tmp/work-x" "/var/folders/ab/cd/T/work-x" "$TMPDIR/work-x"; do
+  if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+      "$SETUP_SCRIPT" --dry-run --work-dir "$bad_temp_work" >/dev/null 2>&1; then
+    fail "--work-dir under temp space must fail closed: $bad_temp_work"
+  fi
+done
+
+cat > "$TMP/bin/py-fail.sh" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *"-c import os,sys; print(os.path.realpath"* ]]; then
+  /usr/bin/python3 "$@" 2>/dev/null || python3 "$@"
+  exit $?
+fi
+exit 2
+STUB
+chmod +x "$TMP/bin/py-fail.sh"
+if PYTHON3_BIN="$TMP/bin/py-fail.sh" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh" \
+    "$SETUP_SCRIPT" --dry-run >/dev/null 2>&1; then
+  fail "is_reserved_runner_dir must fail closed when python check exits non-1 (e.g. rc=2)"
+fi
+pass "Round-18 P1 hardening: conflicting flags, .credentials, live online status, full post_config retry, TOCTOU --replace recheck, temp WORK_DIR rejection, and fail-closed reserved check hold"

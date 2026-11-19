@@ -357,6 +357,52 @@ PY
 
 STATE_CORRUPT_RESET=0
 
+validate_state_file() {
+  local path="$1" py_bin=""
+  [ -s "$path" ] || return 1
+  if py_bin="$(resolve_python3 2>/dev/null)"; then
+    "$py_bin" - "$path" <<'PY' >/dev/null 2>&1
+import json
+import sys
+from pathlib import Path
+
+def is_nonneg_int(val):
+    return isinstance(val, int) and not isinstance(val, bool) and val >= 0
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    sys.exit(1)
+
+sent = data.get("sent")
+if sent is not None:
+    if not isinstance(sent, dict) or not all(isinstance(k, str) and is_nonneg_int(v) for k, v in sent.items()):
+        sys.exit(1)
+
+for key in ("last_sent", "api_failures", "last_blind"):
+    val = data.get(key)
+    if val is not None and not is_nonneg_int(val):
+        sys.exit(1)
+
+sys.exit(0)
+PY
+    return $?
+  fi
+  jq -se '
+    def is_nonneg_int: type == "number" and . >= 0 and . == floor and (tostring | test("^[0-9]+$"));
+    length == 1 and (.[0] |
+      type == "object"
+      and ((has("sent") | not) or .sent == null or (.sent | type == "object" and (to_entries | all(.value | is_nonneg_int))))
+      and ((has("last_sent") | not) or .last_sent == null or (.last_sent | is_nonneg_int))
+      and ((has("api_failures") | not) or .api_failures == null or (.api_failures | is_nonneg_int))
+      and ((has("last_blind") | not) or .last_blind == null or (.last_blind | is_nonneg_int))
+    )
+  ' "$path" >/dev/null 2>&1
+}
+
 if [ "$DRY_RUN" -eq 1 ]; then
   if [ -r "$STATE_FILE" ]; then
     cp "$STATE_FILE" "$tmp.snapshot"
@@ -366,17 +412,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
   STATE_FILE="$tmp.snapshot"
   STATE_STAGE_TMP="${STATE_FILE}.tmp.$$"
   STATE_NEXT_TMP="${STATE_FILE}.next.$$"
-  if [ ! -s "$STATE_FILE" ] || ! jq -se '
-    length == 1 and (.[0] |
-      type == "object"
-      and ((has("sent") | not) or .sent == null or (.sent | type == "object" and (to_entries | all(.value | type == "number"))))
-      and ((has("last_sent") | not) or .last_sent == null or (.last_sent | type == "number" and . >= 0 and . == floor))
-      and ((has("api_failures") | not) or .api_failures == null or (.api_failures | type == "number" and . >= 0 and . == floor))
-      and ((has("last_blind") | not) or .last_blind == null or (.last_blind | type == "number" and . >= 0 and . == floor))
-    )
-  ' "$STATE_FILE" >/dev/null 2>&1; then
+  if ! validate_state_file "$STATE_FILE"; then
     echo "[$NOW_ISO] WARN: corrupt or empty state snapshot; resetting for dry-run" >&2
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
 else
@@ -392,16 +430,7 @@ else
     printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
   fi
-  if [ ! -s "$STATE_FILE" ] || \
-     ! jq -se '
-       length == 1 and (.[0] |
-         type == "object"
-         and ((has("sent") | not) or .sent == null or (.sent | type == "object" and (to_entries | all(.value | type == "number"))))
-         and ((has("last_sent") | not) or .last_sent == null or (.last_sent | type == "number" and . >= 0 and . == floor))
-         and ((has("api_failures") | not) or .api_failures == null or (.api_failures | type == "number" and . >= 0 and . == floor))
-         and ((has("last_blind") | not) or .last_blind == null or (.last_blind | type == "number" and . >= 0 and . == floor))
-       )
-     ' "$STATE_FILE" >/dev/null 2>&1 || \
+  if ! validate_state_file "$STATE_FILE" || \
      ! jq --argjson cutoff "$((NOW - 3024000))" \
        'if type != "object" then error("state must be JSON object") else . end | .sent = ((.sent // {}) | with_entries(select(.value > $cutoff))) | .last_sent = (.last_sent // 0) | .api_failures = (.api_failures // 0) | .last_blind = (.last_blind // 0)' \
        "$STATE_FILE" > "$STATE_NEXT_TMP" 2>"$tmp.err" || \
@@ -409,7 +438,7 @@ else
      ! jq -se 'length == 1 and (.[0] | type == "object")' "$STATE_NEXT_TMP" >/dev/null 2>&1; then
     rm -f "$STATE_NEXT_TMP"
     echo "[$NOW_ISO] WARN: corrupt or empty STATE_FILE '$STATE_FILE'; resetting and scheduling BLIND (corrupt_state_file_reset)" >&2
-    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":3,"last_blind":0}' > "$STATE_STAGE_TMP"
+    printf '%s\n' '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}' > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
     STATE_CORRUPT_RESET=1
   else
@@ -438,10 +467,19 @@ increment_api_failure() {
 }
 
 emit_blind_if_due() {
-  local reason="$1" mode="${2:-blind}"
+  local reason="$1" mode="${2:-blind}" msg=""
   if [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
+    if [ "$STATE_CORRUPT_RESET" -eq 1 ] && [ "$FAILURES_NOW" -lt "$MAX_API_FAILURES" ]; then
+      if [ "$FAILURES_NOW" -eq 0 ]; then
+        msg="STATE_FILE was corrupt and reset for $ALERT_ORG ($reason)"
+      else
+        msg="STATE_FILE was corrupt and reset for $ALERT_ORG (billing collection failed ${FAILURES_NOW}/${MAX_API_FAILURES} runs; $reason)"
+      fi
+    else
+      msg="GitHub Actions cost monitor cannot query authoritative billing usage for $ALERT_ORG after $FAILURES_NOW consecutive failures ($reason)"
+    fi
     emit WARNING BLIND "$TODAY_UTC" \
-      "GitHub Actions cost monitor cannot query authoritative billing usage for $ALERT_ORG after $FAILURES_NOW consecutive failures ($reason)" \
+      "$msg" \
       0 null 0 "" "$mode" null null
     jq --argjson now "$NOW" '.last_blind = $now' "$STATE_FILE" > "$STATE_STAGE_TMP"
     mv -f "$STATE_STAGE_TMP" "$STATE_FILE"
@@ -536,14 +574,14 @@ run_app_token_fallback() {
 
         if ! jq -c --arg yesterday "$YESTERDAY_UTC" --arg today "$TODAY_UTC" --arg repo "$repo_name" --arg now_iso "$NOW_ISO" '
           def is_self_hosted:
-            (((.runner_group_name // "") != "") and (.runner_group_name != "GitHub Actions")) or
-            any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac"));
+            any((.labels // [])[]; ascii_downcase as $l | ($l == "self-hosted" or ($l | startswith("self-hosted-")) or $l == "worldai-testflight-native-mac")) or
+            (((.runner_group_name // "") != "") and (.runner_group_name != "GitHub Actions") and (any((.labels // [])[]; ascii_downcase | test("^(ubuntu|macos|windows)-([0-9]|latest)")) | not));
           def is_standard_macos:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^macos-(latest|13|14|15|26)(-intel|-arm64)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           def is_any_hosted_macos:
             (is_self_hosted | not) and any((.labels // [])[]; ascii_downcase | startswith("macos-"));
           def is_standard_ubuntu:
-            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^ubuntu-(latest|[0-9]{2}\\.[0-9]{2})(-arm)?$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core|-arm$)")) | not));
+            (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^ubuntu-(latest|[0-9]{2}\\.[0-9]{2})$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           def is_standard_windows:
             (is_self_hosted | not) and (any((.labels // [])[]; ascii_downcase | test("^windows-(latest|[0-9]{4})$")) and (any((.labels // [])[]; ascii_downcase | test("(large|xlarge|[0-9]+-?core)")) | not));
           (($yesterday + "T00:00:00Z") | fromdateiso8601) as $yest_start |
@@ -758,6 +796,7 @@ if [ -n "$fallback_reason" ]; then
     blind_exit_reason="$fallback_reason"
     blind_exit_mode="blind"
     if [ "$STATE_CORRUPT_RESET" -eq 1 ]; then
+      BLIND_DUE=1
       blind_exit_reason="corrupt_state_file_reset; ${fallback_reason}"
       blind_exit_mode="corrupt_state_file_reset"
     fi
@@ -784,9 +823,6 @@ fi
 
 if [ "$STATE_CORRUPT_RESET" -eq 1 ]; then
   BLIND_DUE=1
-  if [ "$FAILURES_NOW" -eq 0 ]; then
-    FAILURES_NOW=3
-  fi
   BLIND_REASON="corrupt_state_file_reset${BLIND_REASON:+; $BLIND_REASON}"
 fi
 
@@ -803,7 +839,15 @@ should_emit() {
 append_blind_context() {
   local base="$1"
   if [ "$BLIND_DUE" -eq 1 ] && [ "$BLIND_COMBINED" -eq 0 ]; then
-    printf '%s; ALSO BLIND: authoritative billing usage failed %s consecutive times (%s)' "$base" "$FAILURES_NOW" "$BLIND_REASON"
+    if [ "$STATE_CORRUPT_RESET" -eq 1 ] && [ "$FAILURES_NOW" -lt "$MAX_API_FAILURES" ]; then
+      if [ "$FAILURES_NOW" -eq 0 ]; then
+        printf '%s; ALSO STATE_FILE was corrupt and reset (%s)' "$base" "$BLIND_REASON"
+      else
+        printf '%s; ALSO STATE_FILE was corrupt and reset (billing collection failed %s/%s runs; %s)' "$base" "$FAILURES_NOW" "$MAX_API_FAILURES" "$BLIND_REASON"
+      fi
+    else
+      printf '%s; ALSO BLIND: authoritative billing usage failed %s consecutive times (%s)' "$base" "$FAILURES_NOW" "$BLIND_REASON"
+    fi
   else
     printf '%s' "$base"
   fi

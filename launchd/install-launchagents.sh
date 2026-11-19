@@ -371,6 +371,9 @@ PY
           exit "$rc"
         fi
         rm -f "$dest"
+        if [[ "${label}" == "${COST_ALERT_LABEL}" ]]; then
+          restore_cost_alert_script
+        fi
         if [[ "$had_prior" -eq 1 ]]; then
           mv "$backup" "$dest"
           launchctl load "$dest" || \
@@ -385,6 +388,9 @@ PY
         fi
         launchctl unload "$dest" 2>/dev/null || true
         rm -f "$dest"
+        if [[ "${label}" == "${COST_ALERT_LABEL}" ]]; then
+          restore_cost_alert_script
+        fi
         if [[ "$had_prior" -eq 1 ]]; then
           mv "$backup" "$dest"
           launchctl load "$dest" || \

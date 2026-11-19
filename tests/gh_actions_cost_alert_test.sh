@@ -977,6 +977,8 @@ BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
 grep -q 'severity=WARNING' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit WARNING BLIND"
 grep -q '"status":"BLIND"' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit status=BLIND"
 grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE must emit mode=corrupt_state_file_reset"
+grep -q 'STATE_FILE was corrupt and reset' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE with healthy billing must report STATE_FILE was corrupt and reset"
+! grep -q 'consecutive' "$TMP/gcloud-corrupt.log" || fail "corrupt STATE_FILE with healthy billing must NOT claim consecutive billing failures"
 jq -e 'type == "object" and .api_failures == 0' "$TMP/state-corrupt.json" >/dev/null || fail "corrupt STATE_FILE must be reset to valid JSON and recover on healthy billing"
 pass "midnight-crossing jobs clip accurately across UTC days and corrupt STATE_FILE resets with WARNING BLIND"
 
@@ -987,7 +989,8 @@ BILLING_FIXTURE="$TMP/billing-nobin-err.json" \
   run_alert "$TMP/state-empty-spike.json" "$TMP/gcloud-empty-spike.log" "$TMP/gh-empty-spike.log" >/dev/null 2>"$TMP/empty-spike.err"
 [ "$(error_count "$TMP/gcloud-empty-spike.log")" = 1 ] || fail "0-byte STATE_FILE + COST_SPIKE must emit exactly 1 ERROR log"
 ! grep -q '"status":"BLIND"' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must fold BLIND into ERROR rather than emitting separate WARNING BLIND"
-grep -q '; ALSO BLIND' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must include '; ALSO BLIND'"
+grep -q '; ALSO STATE_FILE was corrupt and reset' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must include '; ALSO STATE_FILE was corrupt and reset'"
+! grep -q 'consecutive' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + healthy billing must NOT claim consecutive billing failures"
 grep -q 'corrupt_state_file_reset' "$TMP/gcloud-empty-spike.log" || fail "0-byte STATE_FILE + COST_SPIKE must cite corrupt_state_file_reset"
 jq -e 'type == "object" and .api_failures == 0 and (.last_blind > 0) and (.sent["2026-11-18:COST_SPIKE"] > 0)' "$TMP/state-empty-spike.json" >/dev/null || \
   fail "0-byte STATE_FILE + COST_SPIKE must recover valid JSON state and record .sent + .last_blind"
@@ -1095,3 +1098,65 @@ grep -q 'mode=app_token_fallback ' <<<"$custom_sh_paired_out" || fail "paired cu
 grep -q '"macos_minutes":60' "$TMP/gcloud-custom-sh-paired.log" || fail "custom self-hosted job must add 0 macOS minutes (expected 60 total)"
 grep -q '~\$3\.72 gross' "$TMP/gcloud-custom-sh-paired.log" || fail "custom self-hosted job must add \$0 gross (expected \$3.72 total)"
 pass "invalid STATE_FILE counter types reset with BLIND and runner_group_name classifies custom self-hosted jobs as \$0 non-partial"
+
+# 23. Round-18 fixes: hosted larger/ARM runners in custom org runner groups are NOT misclassified as $0 self-hosted,
+#     fractional/bool .sent timestamps trigger corrupt_state_file_reset, and corrupt reset with < MAX_API_FAILURES
+#     never falsely claims consecutive billing failures.
+cat > "$TMP/runs-custom-hosted.json" <<'JSON'
+{
+  "workflow_runs": [
+    {"id":9405,"status":"completed","conclusion":"success","created_at":"2026-11-18T02:00:00Z","updated_at":"2026-11-18T04:00:00Z"}
+  ]
+}
+JSON
+cat > "$TMP/jobs/9405.json" <<'JSON'
+{
+  "total_count": 2,
+  "jobs": [
+    {"id":48,"runner_group_name":"custom-org-larger","labels":["macos-15-large"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T03:15:00Z"},
+    {"id":49,"runner_group_name":"custom-org-larger","labels":["ubuntu-24.04-arm"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T03:00:00Z"}
+  ]
+}
+JSON
+custom_hosted_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-hosted.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-custom-hosted.json" "$TMP/gcloud-custom-hosted.log" "$TMP/gh-custom-hosted.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$custom_hosted_out" || fail "hosted larger/ARM labels in custom runner group must mark mode=app_token_fallback_partial (got: $custom_hosted_out)"
+grep -q 'fallback_incomplete=1' <<<"$custom_hosted_out" || fail "hosted larger/ARM labels in custom runner group must mark fallback_incomplete=1"
+[ "$(error_count "$TMP/gcloud-custom-hosted.log")" = 1 ] || fail "75m macos-15-large in custom runner group must emit COST_SPIKE"
+grep -q '"macos_minutes":75' "$TMP/gcloud-custom-hosted.log" || fail "macos-15-large in custom runner group must count 75 macos_minutes"
+grep -q '"gross_usd":0' "$TMP/gcloud-custom-hosted.log" || fail "unpriced larger/ARM hosted labels in custom runner group must keep gross_usd=0"
+
+cat > "$TMP/jobs/9405.json" <<'JSON'
+{
+  "total_count": 1,
+  "jobs": [
+    {"id":50,"runner_group_name":"custom-org-larger","labels":["ubuntu-24.04-arm"],"started_at":"2026-11-18T02:00:00Z","completed_at":"2026-11-18T03:00:00Z"}
+  ]
+}
+JSON
+ubuntu_arm_out="$(
+  BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs-custom-hosted.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-ubuntu-arm.json" "$TMP/gcloud-ubuntu-arm.log" "$TMP/gh-ubuntu-arm.log"
+)"
+grep -q 'mode=app_token_fallback_partial' <<<"$ubuntu_arm_out" || fail "ubuntu-24.04-arm in custom runner group must mark mode=app_token_fallback_partial (got: $ubuntu_arm_out)"
+grep -q 'fallback_incomplete=1' <<<"$ubuntu_arm_out" || fail "ubuntu-24.04-arm in custom runner group must mark fallback_incomplete=1"
+
+printf '{"sent":{"2026-11-18:COST_SPIKE":123.45},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-float-sent.json"
+BILLING_FIXTURE="$TMP/billing-corrupt-ok.json" \
+  run_alert "$TMP/state-float-sent.json" "$TMP/gcloud-float-sent.log" "$TMP/gh-float-sent.log" >/dev/null 2>"$TMP/float-sent.err"
+grep -q 'severity=WARNING' "$TMP/gcloud-float-sent.log" || fail "fractional .sent timestamp must emit WARNING BLIND"
+grep -q '"mode":"corrupt_state_file_reset"' "$TMP/gcloud-float-sent.log" || fail "fractional .sent timestamp must trigger corrupt_state_file_reset"
+grep -q 'STATE_FILE was corrupt and reset' "$TMP/gcloud-float-sent.log" || fail "fractional .sent reset with healthy billing must report STATE_FILE was corrupt and reset"
+! grep -q 'consecutive' "$TMP/gcloud-float-sent.log" || fail "fractional .sent reset with healthy billing must NOT claim consecutive billing failures"
+jq -e '.sent == {} and .api_failures == 0 and (.last_blind > 0)' "$TMP/state-float-sent.json" >/dev/null || fail "fractional .sent state must reset cleanly"
+
+printf '{"sent":{"2026-11-18:COST_SPIKE":true},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-bool-sent.json"
+BILLING_STUB_FAIL=1 REPOS_FIXTURE="$TMP/repos.json" RUNS_FIXTURE="$TMP/runs.json" JOBS_FIXTURE_DIR="$TMP/jobs" \
+  run_alert "$TMP/state-bool-sent.json" "$TMP/gcloud-bool-sent.log" "$TMP/gh-bool-sent.log" >/dev/null 2>"$TMP/bool-sent.err"
+[ "$(error_count "$TMP/gcloud-bool-sent.log")" = 1 ] || fail "corrupt boolean .sent + fallback spike must emit COST_SPIKE ERROR"
+grep -q '; ALSO STATE_FILE was corrupt and reset' "$TMP/gcloud-bool-sent.log" || fail "corrupt .sent + 1/3 billing failure + spike must include '; ALSO STATE_FILE was corrupt and reset'"
+! grep -q 'consecutive' "$TMP/gcloud-bool-sent.log" || fail "corrupt .sent + 1/3 billing failure must NOT claim consecutive failures"
+[ "$(jq -r '.api_failures' "$TMP/state-bool-sent.json")" = 1 ] || fail "corrupt reset + 1 primary failure must persist api_failures=1 (not 4)"
+pass "hosted larger/ARM custom groups stay partial, fractional/bool .sent resets cleanly, and corrupt-state wording is separated from billing failures"
