@@ -600,11 +600,14 @@ def from_audit_data(raw):
         cancelled_n += _expect_int(cancelled_blk.get("n"), "cancelled.n")
         skipped_n += _expect_int(r_rec.get("skipped_or_neutral_runs"), "skipped_or_neutral_runs")
         total_non_skipped += _expect_int(all_blk.get("n"), "all_non_skipped.n")
-    cancelled_pct = (
-        round((cancelled_n / total_non_skipped) * 100.0, 1)
-        if total_non_skipped > 0
-        else None
-    )
+    try:
+        cancelled_pct = (
+            round((cancelled_n / total_non_skipped) * 100.0, 1)
+            if total_non_skipped > 0
+            else None
+        )
+    except ArithmeticError as exc:
+        raise ValueError(f"cancellation rate arithmetic error: {exc}") from exc
 
     workflows = []
     for repo_slug, repo_block in repo_blocks:
@@ -616,6 +619,8 @@ def from_audit_data(raw):
         for wf in _expect_list(r_recent.get("by_workflow"), "recent.by_workflow"):
             if not isinstance(wf, dict):
                 raise ValueError(f"recent.by_workflow row must be dict, got {type(wf).__name__}")
+            for c in COHORT_NAMES:
+                _expect_dict(wf.get(c), f"recent.by_workflow.{c}")
             if isinstance(wf.get("workflow"), str):
                 r_wf_map[wf["workflow"]] = wf
         r_jobs = _expect_dict(repo_block.get("job_level_audit"), "repo_block.job_level_audit")
@@ -628,12 +633,16 @@ def from_audit_data(raw):
             wf_cohorts = {}
             for c in COHORT_NAMES:
                 c_data = _expect_dict(wf.get(c), f"by_workflow.{c}")
+                qw_blk = _expect_dict(c_data.get("queue_wait"), f"by_workflow.{c}.queue_wait")
+                ex_blk = _expect_dict(c_data.get("execution"), f"by_workflow.{c}.execution")
+                tot_blk = _expect_dict(c_data.get("total"), f"by_workflow.{c}.total")
+                e2e_blk = _expect_dict(r_match.get(c), f"recent.by_workflow.{c}")
                 wf_cohorts[c] = {
-                    "queue_wait": _pick_stat_block(c_data.get("queue_wait")),
-                    "execution": _pick_stat_block(c_data.get("execution")),
-                    "job_total": _pick_stat_block(c_data.get("total")),
+                    "queue_wait": _pick_stat_block(qw_blk),
+                    "execution": _pick_stat_block(ex_blk),
+                    "job_total": _pick_stat_block(tot_blk),
                     # Never substitute job wall time for run-level E2E wall time
-                    "e2e": _pick_stat_block(r_match.get(c)),
+                    "e2e": _pick_stat_block(e2e_blk),
                 }
             pref = wf_cohorts["success"] if wf_cohorts["success"]["execution"]["n"] > 0 else wf_cohorts["all_non_skipped"]
             if pref["queue_wait"]["n"] == 0 and pref["execution"]["n"] == 0 and pref["e2e"]["n"] == 0:

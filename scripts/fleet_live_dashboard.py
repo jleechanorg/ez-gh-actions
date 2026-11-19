@@ -49,6 +49,10 @@ def _cap_live_repos(repos):
     )
 
 
+def _reject_non_finite(token):
+    raise ValueError(f"non-finite JSON constant: {token}")
+
+
 def _load_json_checked(path, *, validator=None, invalid_reason="invalid fixture schema"):
     if not path:
         return None, None
@@ -56,13 +60,13 @@ def _load_json_checked(path, *, validator=None, invalid_reason="invalid fixture 
     try:
         if not p.is_file():
             return None, f"missing or non-file: {p}"
-        data = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"), parse_constant=_reject_non_finite)
         if not isinstance(data, dict):
             return None, f"expected JSON object in {p}"
         if validator is not None and not validator(data):
             return None, f"{invalid_reason} in {p}"
         return data, None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         return None, f"{type(exc).__name__} reading {p}"
 
 
@@ -122,18 +126,53 @@ def _is_valid_gh_payload(data):
     return isinstance(summary, dict) or isinstance(jobs, list)
 
 
+def _validate_normalized_latency_shape(data):
+    if not isinstance(data.get("overall"), dict) or not isinstance(data.get("workflows"), list):
+        return False
+    for stat_k in ("queue_wait", "execution", "job_total", "e2e"):
+        if data["overall"].get(stat_k) is not None and not isinstance(data["overall"].get(stat_k), dict):
+            return False
+    for dict_key in ("cohorts", "runner_classes", "step_categories", "cancellation", "pr_critical_path"):
+        sec = data.get(dict_key)
+        if sec is not None and not isinstance(sec, dict):
+            return False
+    cohorts = data.get("cohorts")
+    if isinstance(cohorts, dict):
+        for cv in cohorts.values():
+            if not isinstance(cv, dict):
+                return False
+            for stat_k in ("queue_wait", "execution", "job_total", "e2e"):
+                if cv.get(stat_k) is not None and not isinstance(cv.get(stat_k), dict):
+                    return False
+    runner_classes = data.get("runner_classes")
+    if isinstance(runner_classes, dict):
+        for rv in runner_classes.values():
+            if not isinstance(rv, dict):
+                return False
+            rc = rv.get("cohorts")
+            if rc is not None and (not isinstance(rc, dict) or not all(isinstance(v, dict) for v in rc.values())):
+                return False
+    step_categories = data.get("step_categories")
+    if isinstance(step_categories, dict):
+        if not all(isinstance(sv, dict) for sv in step_categories.values()):
+            return False
+    for wf in data["workflows"]:
+        if not isinstance(wf, dict):
+            return False
+        w_coh = wf.get("cohorts")
+        if w_coh is not None and (not isinstance(w_coh, dict) or not all(isinstance(v, dict) for v in w_coh.values())):
+            return False
+        for ck in ("queue_wait", "execution", "e2e", "success", "all_non_skipped", "failure", "cancelled"):
+            if wf.get(ck) is not None and not isinstance(wf.get(ck), dict):
+                return False
+    return True
+
+
 def _is_valid_latency_payload(data):
     if data.get("ok") is False:
         return True
     if "overall" in data and "workflows" in data:
-        if not isinstance(data["overall"], dict) or not isinstance(data["workflows"], list):
-            return False
-        if not all(isinstance(w, dict) for w in data["workflows"]):
-            return False
-        for key in ("cohorts", "runner_classes", "step_categories"):
-            if data.get(key) is not None and not isinstance(data.get(key), dict):
-                return False
-        return True
+        return _validate_normalized_latency_shape(data)
     audit_blocks = [
         v for v in data.values()
         if isinstance(v, dict) and any(k in v for k in ("recent_contiguous_runs", "recent_runs", "job_level_audit"))
@@ -403,7 +442,7 @@ def _as_dict_list(val, label, errors):
 def _safe_enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, *, host_disk_paused=False, label="slot", errors=None):
     try:
         return _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=host_disk_paused)
-    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError, ArithmeticError) as exc:
         _record_norm_error(errors, f"{label}: {exc}")
         return None
 
@@ -452,7 +491,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                 "configured": cfg_slots,
                 "slots": slots,
             })
-        except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        except (TypeError, ValueError, KeyError, AttributeError, IndexError, ArithmeticError) as exc:
             _record_norm_error(errors, f"hosts.{host_key}: {exc}")
 
     if isinstance(cmux_data, dict):
@@ -508,7 +547,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                     "configured": cfg_count,
                     "slots": slots,
                 })
-            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+            except (TypeError, ValueError, KeyError, AttributeError, IndexError, ArithmeticError) as exc:
                 _record_norm_error(errors, f"cmux.vm: {exc}")
 
     mac_raw = raw_hosts.get("mac")
@@ -598,7 +637,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                 "configured": cfg_mac_c + len(n_slots),
                 "slots": all_mac_slots,
             })
-        except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        except (TypeError, ValueError, KeyError, AttributeError, IndexError, ArithmeticError) as exc:
             _record_norm_error(errors, f"hosts.mac: {exc}")
 
     # Include any special org runners (e.g. jeff-ubuntu-smtp-egress, mac-smtp-egress) not already listed
@@ -815,20 +854,24 @@ def _normalize_latency(latency_raw, errors=None):
         return empty_err(msg)
     try:
         if "overall" in latency_raw and "workflows" in latency_raw:
+            if not _validate_normalized_latency_shape(latency_raw):
+                raise ValueError("normalized latency payload failed nested schema validation")
             out = latency_raw
         else:
             out = ci_latency_probe.from_audit_data(latency_raw)
         if not isinstance(out, dict):
             raise ValueError(f"latency normalizer returned {type(out).__name__}")
-        for dict_k in ("overall", "cohorts", "runner_classes", "step_categories"):
+        if out.get("overall") is not None and not isinstance(out.get("overall"), dict):
+            raise ValueError(f"latency.overall must be dict, got {type(out.get('overall')).__name__}")
+        for dict_k in ("cohorts", "runner_classes", "step_categories"):
             val = out.get(dict_k)
-            if val is not None and not isinstance(val, dict):
-                raise ValueError(f"latency.{dict_k} must be dict, got {type(val).__name__}")
+            if val is not None and (not isinstance(val, dict) or not all(isinstance(v, dict) for v in val.values())):
+                raise ValueError(f"latency.{dict_k} entries must be objects")
         wfs = out.get("workflows")
         if wfs is not None and (not isinstance(wfs, list) or not all(isinstance(w, dict) for w in wfs)):
             raise ValueError("latency.workflows must be list of objects")
         return out
-    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError, ArithmeticError) as exc:
         msg = f"latency fixture invalid schema: {exc}"
         _record_norm_error(errors, msg)
         return empty_err(msg)
@@ -1494,7 +1537,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
 
 def _escape_embedded_json(state):
     """Escape HTML/script-significant characters inside embedded JSON."""
-    raw = json.dumps(state, ensure_ascii=False)
+    raw = json.dumps(state, ensure_ascii=False, allow_nan=False)
     return (
         raw.replace("&", "\\u0026")
         .replace("<", "\\u003c")
@@ -1834,13 +1877,13 @@ def render_html(state, *, auto_refresh_ms=0):
         latAlerts.push(`<div class="alert-box warn"><strong>Partial Latency Sample:</strong> ${{esc(detail)}}</div>`);
       }}
       document.getElementById('latency-alerts').innerHTML = latAlerts.join('');
-      const cohorts = lat.cohorts || {{}};
-      const cData = cohorts[currentCohort] || {{}};
-      const q = cData.queue_wait || {{}};
-      const e = cData.execution || {{}};
-      const jt = cData.job_total || {{}};
-      const e2e = cData.e2e || {{}};
-      const cancel = lat.cancellation || {{}};
+      const cohorts = (lat.cohorts && typeof lat.cohorts === 'object') ? lat.cohorts : {{}};
+      const cData = (cohorts[currentCohort] && typeof cohorts[currentCohort] === 'object') ? cohorts[currentCohort] : {{}};
+      const q = (cData.queue_wait && typeof cData.queue_wait === 'object') ? cData.queue_wait : {{}};
+      const e = (cData.execution && typeof cData.execution === 'object') ? cData.execution : {{}};
+      const jt = (cData.job_total && typeof cData.job_total === 'object') ? cData.job_total : {{}};
+      const e2e = (cData.e2e && typeof cData.e2e === 'object') ? cData.e2e : {{}};
+      const cancel = (lat.cancellation && typeof lat.cancellation === 'object') ? lat.cancellation : {{}};
 
       const cards = [
         ['Queue Wait (' + currentCohort + ')', `p50 ${{fmtSec(q.p50_s)}} | p90 ${{fmtSec(q.p90_s)}}`, `avg ${{fmtSec(q.avg_s)}} · p99 ${{fmtSec(q.p99_s)}} · n=${{q.n ?? 0}}`],
@@ -1854,12 +1897,18 @@ def render_html(state, *, auto_refresh_ms=0):
       ).join('');
 
       const extraCards = [];
-      for (const [cls, data] of Object.entries(lat.runner_classes || {{}})) {{
-        const cs = (data.cohorts && data.cohorts[currentCohort]) || data[currentCohort] || ((data.queue_wait || data.execution) ? (currentCohort === 'success' ? data : {{}}) : {{}});
-        const cq = cs.queue_wait || {{}}, ce = cs.execution || {{}};
+      for (const [cls, rawData] of Object.entries((lat.runner_classes && typeof lat.runner_classes === 'object') ? lat.runner_classes : {{}})) {{
+        const data = (rawData && typeof rawData === 'object') ? rawData : {{}};
+        const dc = (data.cohorts && typeof data.cohorts === 'object') ? data.cohorts : {{}};
+        const cs = (dc[currentCohort] && typeof dc[currentCohort] === 'object' ? dc[currentCohort] : null)
+          || (data[currentCohort] && typeof data[currentCohort] === 'object' ? data[currentCohort] : null)
+          || ((data.queue_wait || data.execution) ? (currentCohort === 'success' ? data : {{}}) : {{}});
+        const cq = (cs.queue_wait && typeof cs.queue_wait === 'object') ? cs.queue_wait : {{}};
+        const ce = (cs.execution && typeof cs.execution === 'object') ? cs.execution : {{}};
         extraCards.push([`Runner: ${{cls}}`, `Q ${{fmtSec(cq.p50_s)}} | E ${{fmtSec(ce.p50_s)}}`, `E p90 ${{fmtSec(ce.p90_s)}} · E avg ${{fmtSec(ce.avg_s)}} (n=${{ce.n ?? 0}})`]);
       }}
-      for (const [cat, st] of Object.entries(lat.step_categories || {{}})) {{
+      for (const [cat, rawSt] of Object.entries((lat.step_categories && typeof lat.step_categories === 'object') ? lat.step_categories : {{}})) {{
+        const st = (rawSt && typeof rawSt === 'object') ? rawSt : {{}};
         extraCards.push([`Step: ${{cat}}`, `p50 ${{fmtSec(st.p50_s)}} | p90 ${{fmtSec(st.p90_s)}}`, `avg ${{fmtSec(st.avg_s)}} · max ${{fmtSec(st.max_s)}}`]);
       }}
       document.getElementById('latency-extra-kpis').innerHTML = extraCards.map(([k, v, sub]) =>
@@ -1867,8 +1916,9 @@ def render_html(state, *, auto_refresh_ms=0):
       ).join('');
 
       const repoSelect = document.getElementById('latency-repo-filter');
+      const wfList = Array.isArray(lat.workflows) ? lat.workflows.filter((wf) => wf && typeof wf === 'object') : [];
       const existingRepos = new Set(Array.from(repoSelect.options).map((o) => o.value));
-      for (const wf of lat.workflows || []) {{
+      for (const wf of wfList) {{
         if (wf.repo && !existingRepos.has(wf.repo)) {{
           existingRepos.add(wf.repo);
           const opt = document.createElement('option');
@@ -1879,9 +1929,14 @@ def render_html(state, *, auto_refresh_ms=0):
       }}
       const repoFilter = repoSelect.value;
 
-      const rows = (lat.workflows || []).filter((wf) => repoFilter === 'ALL' || wf.repo === repoFilter).map((wf) => {{
-        const block = (wf.cohorts && wf.cohorts[currentCohort]) || wf[currentCohort] || {{}};
-        const qw = block.queue_wait || {{}}, ex = block.execution || {{}}, e2 = block.e2e || {{}};
+      const rows = wfList.filter((wf) => repoFilter === 'ALL' || wf.repo === repoFilter).map((wf) => {{
+        const wc = (wf.cohorts && typeof wf.cohorts === 'object') ? wf.cohorts : {{}};
+        const block = (wc[currentCohort] && typeof wc[currentCohort] === 'object' ? wc[currentCohort] : null)
+          || (wf[currentCohort] && typeof wf[currentCohort] === 'object' ? wf[currentCohort] : null)
+          || {{}};
+        const qw = (block.queue_wait && typeof block.queue_wait === 'object') ? block.queue_wait : {{}};
+        const ex = (block.execution && typeof block.execution === 'object') ? block.execution : {{}};
+        const e2 = (block.e2e && typeof block.e2e === 'object') ? block.e2e : {{}};
         return {{
           repo: wf.repo || '—',
           workflow: wf.workflow || '—',
@@ -1993,9 +2048,9 @@ def render_html(state, *, auto_refresh_ms=0):
         .filter(([, v]) => v)
         .map(([k, v]) => `<span><strong>${{esc(k)}}:</strong> ${{esc(v)}}</span>`);
       document.getElementById('source-stamps').innerHTML = stamps.join('') || '<span>No source timestamps</span>';
-      renderReconciliation();
-      renderLatency();
-      renderHosts();
+      try {{ renderReconciliation(); }} catch (_e) {{}}
+      try {{ renderLatency(); }} catch (_e) {{}}
+      try {{ renderHosts(); }} catch (_e) {{}}
     }}
 
     document.querySelectorAll('#cohort-controls button').forEach((btn) => {{
@@ -2150,7 +2205,7 @@ def create_server(*, host="127.0.0.1", port=8790, audit_dir=None, hosts_json=Non
             path = self.path.split("?", 1)[0]
             if path == "/api/state":
                 try:
-                    payload = json.dumps(load_state()).encode("utf-8")
+                    payload = json.dumps(load_state(), allow_nan=False).encode("utf-8")
                 except TimeoutError:
                     self.send_response(504)
                     self.end_headers()

@@ -752,7 +752,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
             rendered = mod.render_html(state)
             for col in ("q_avg", "q_p50", "q_p90", "q_p99", "e_avg", "e_p50", "e_p90", "e_p99", "e2e_avg", "e2e_p50", "e2e_p90", "e2e_p99"):
                 self.assertIn(f'data-sort="{col}"', rendered)
-            self.assertIn("data.cohorts[currentCohort]", rendered)
+            self.assertIn("data.cohorts", rendered)
+            self.assertIn("dc[currentCohort]", rendered)
             self.assertIn("Latency Probe Unavailable:", rendered)
             self.assertIn("Partial Latency Sample:", rendered)
 
@@ -1279,6 +1280,16 @@ class FleetLiveDashboardTest(unittest.TestCase):
             }
         }
 
+        base_lat_norm = {
+            "ok": True,
+            "overall": {"queue_wait": {"n": 1, "p50_s": 1}, "execution": {"n": 1, "p50_s": 2}, "job_total": {"n": 1, "p50_s": 3}, "e2e": {"n": 1, "p50_s": 3}},
+            "cohorts": {"success": {"queue_wait": {"n": 1, "p50_s": 1}, "execution": {"n": 1, "p50_s": 2}, "job_total": {"n": 1, "p50_s": 3}, "e2e": {"n": 1, "p50_s": 3}}},
+            "cancellation": {"cancelled_runs": 0, "total_non_skipped_runs": 1, "cancelled_rate_pct": 0.0},
+            "runner_classes": {"linux": {"cohorts": {"success": {"queue_wait": {"n": 1}, "execution": {"n": 1}}}}},
+            "step_categories": {"test": {"n": 1, "p50_s": 2}},
+            "workflows": [{"repo": "a/x", "workflow": "w", "cohorts": {"success": {"queue_wait": {"n": 1}, "execution": {"n": 1}, "e2e": {"n": 1}}}}],
+        }
+
         def iter_paths(obj, prefix=()):
             if isinstance(obj, dict):
                 for k, v in obj.items():
@@ -1295,8 +1306,8 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 cur = cur[step]
             cur[path[-1]] = val
 
-        bad_values = (None, "x", [1], {"bad": 1}, True, -1)
-        bases = [("hosts", base_hosts), ("cmux", base_cmux), ("gh", base_gh), ("lat", base_lat)]
+        bad_values = (None, "x", [1], {"bad": 1}, True, -1, 10**309)
+        bases = [("hosts", base_hosts), ("cmux", base_cmux), ("gh", base_gh), ("lat", base_lat), ("lat_norm", base_lat_norm)]
         mutated_count = 0
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1309,7 +1320,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                             "ubuntu_mac_slots.json": mutated if fname == "hosts" else base_hosts,
                             "cmux_and_github_reconciliation.json": mutated if fname == "cmux" else base_cmux,
                             "github_live_snapshot.json": mutated if fname == "gh" else base_gh,
-                            "ci_latency_percentiles.json": mutated if fname == "lat" else base_lat,
+                            "ci_latency_percentiles.json": mutated if fname in ("lat", "lat_norm") else base_lat,
                         }
                         for p_name, p_obj in payloads.items():
                             (tmp_path / p_name).write_text(json.dumps(p_obj), encoding="utf-8")
@@ -1317,7 +1328,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                         html_out = mod.render_html(st)
                         self.assertIn("Fleet + Queue + CI Latency Inspector", html_out)
                         mutated_count += 1
-            self.assertGreater(mutated_count, 300)
+            self.assertGreater(mutated_count, 600)
 
             # Also verify live HTTP routes / and /api/state stay 200 on representative deep mutations.
             rep = copy.deepcopy(base_hosts)
@@ -1345,6 +1356,49 @@ class FleetLiveDashboardTest(unittest.TestCase):
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+            # Verify run-level workflow bad stat block, 10**309 overflow, normalized null sections, & NaN JSON fail closed over HTTP.
+            (tmp_path / "ubuntu_mac_slots.json").write_text(json.dumps(base_hosts), encoding="utf-8")
+            (tmp_path / "github_live_snapshot.json").write_text(json.dumps(base_gh), encoding="utf-8")
+            for tag, is_norm, mutate_fn in (
+                ("recent_wf_bad", False, lambda d: d["wa"]["recent_contiguous_runs"]["by_workflow"][0].__setitem__("success", "x")),
+                ("cancel_overflow", False, lambda d: d["wa"]["recent_contiguous_runs"]["cohorts"]["cancelled"].__setitem__("n", 10**309)),
+                ("norm_runner_class_null", True, lambda d: d["runner_classes"].__setitem__("linux", None)),
+                ("norm_step_cat_null", True, lambda d: d["step_categories"].__setitem__("test", None)),
+            ):
+                with self.subTest(tag=tag):
+                    bad_lat = copy.deepcopy(base_lat_norm if is_norm else base_lat)
+                    mutate_fn(bad_lat)
+                    (tmp_path / "ci_latency_percentiles.json").write_text(json.dumps(bad_lat), encoding="utf-8")
+                    srv2 = mod.create_server(port=0, audit_dir=tmp_path)
+                    t2 = threading.Thread(target=srv2.serve_forever, daemon=True)
+                    t2.start()
+                    try:
+                        p2 = srv2.server_address[1]
+                        self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{p2}/", timeout=5).status, 200)
+                        api2 = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p2}/api/state", timeout=5).read().decode("utf-8"))
+                        self.assertFalse(api2["latency"]["ok"])
+                        self.assertTrue(api2["reconciliation"]["fixture_errors"])
+                        self.assertIn("Fixture error:", api2["reconciliation"]["scope_note"])
+                    finally:
+                        srv2.shutdown()
+                        srv2.server_close()
+
+            # Non-finite NaN in JSON must be rejected at _load_json_checked rather than emitting invalid JS JSON.
+            (tmp_path / "ci_latency_percentiles.json").write_text(json.dumps(base_lat), encoding="utf-8")
+            (tmp_path / "ubuntu_mac_slots.json").write_text('{"hosts": {"linux-1": {"slots": [{"name": "r-1", "elapsed_minutes": NaN}]}}}', encoding="utf-8")
+            srv_nan = mod.create_server(port=0, audit_dir=tmp_path)
+            t_nan = threading.Thread(target=srv_nan.serve_forever, daemon=True)
+            t_nan.start()
+            try:
+                pn = srv_nan.server_address[1]
+                self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{pn}/", timeout=5).status, 200)
+                api_nan = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{pn}/api/state", timeout=5).read().decode("utf-8"))
+                self.assertTrue(api_nan["reconciliation"]["hosts_partial"])
+                self.assertTrue(api_nan["reconciliation"]["fixture_errors"])
+            finally:
+                srv_nan.shutdown()
+                srv_nan.server_close()
 
 
 if __name__ == "__main__":
