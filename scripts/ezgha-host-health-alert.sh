@@ -482,7 +482,13 @@ else
   if [ "$MEASUREMENT_MIN" -ge "$DISK_MEASUREMENT_PAGE_AFTER_MIN" ] ||
      { [ "$CONTAINER_COUNT" -eq 0 ] && [ "$DOCKER_UNREACHABLE" -eq 0 ]; }; then
     FLEET_FAILS+=("$DISK_MEASUREMENT_ALERT")
-    DISK_MEASUREMENT_RECOVERY_PENDING=0
+    # jleechan-hqx0 (review r4635147366): carry the pending operational recovery
+    # through the escalation. If an earlier poll already announced this condition
+    # at WARNING/cause=operational, that cause still owes a RECOVERED entry — the
+    # fleet page supersedes the warning but does not close it. Clearing the flag
+    # here left the announced operational cause open forever. It stays untouched
+    # (0) when the page is the first observation, e.g. an immediate 0-container
+    # escalation, so no recovery is emitted for a cause never announced.
   elif [ "$CONTAINER_COUNT" -gt 0 ]; then
     echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $DISK_MEASUREMENT_ALERT" >&2
     MEASUREMENT_CHECKS=("$DISK_MEASUREMENT_ALERT")

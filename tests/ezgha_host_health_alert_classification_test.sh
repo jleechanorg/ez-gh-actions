@@ -263,6 +263,59 @@ assert_json_payload payloaddisk disk 25 18
 assert_json_payload payloadfleet fleet 100 0
 pass "disk and fleet entries declare --payload-type=json with valid JSON carrying the policy cause"
 
+# ── 12d. A warning that escalates into a page must still close both causes ────
+# Review finding on PR #245 (discussion_r4635147366): the 30-minute escalation
+# cleared the operational recovery flag, so the WARNING that preceded the fleet
+# page was never closed by any RECOVERED entry. The fixtures above separate
+# warning->healthy from threshold escalation, so nothing covered the sequence.
+state_dir combined
+ALC="$W/alerts-combined.jsonl"
+crit_key() { # path ts_unix
+  printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"paused","ts_unix":%s}\n' "$2" > "$1"
+}
+crit_key "$ALC" "$(( NOW - 120 ))"
+run combined 100 18 HEALTH_ALERT_ALERTS_FILE="$ALC"
+[ "$(warnings combined)" = 1 ] && [ "$(errors combined)" = 0 ] \
+  || fail "combined: a young failure must warn, not page"
+COMBINED_STATE="$W/state-combined/host-health-alert-testhost.json"
+jq -e '.disk_measurement_recovery_pending == 1' "$COMBINED_STATE" >/dev/null \
+  || fail "combined: the operational WARNING must leave its recovery pending"
+# Age the persisted first observation past the escalation window, keeping the
+# pending flag exactly as the previous poll wrote it.
+AGED="$(jq --argjson since "$(( NOW - 31 * 60 ))" '.disk_measurement_since = $since' "$COMBINED_STATE")"
+printf '%s\n' "$AGED" > "$COMBINED_STATE"
+run combined 100 18 HEALTH_ALERT_ALERTS_FILE="$ALC"
+[ "$(errors combined)" = 1 ] || fail "combined: the sustained failure must page cause=fleet"
+grep -q '"status":"DOWN", "cause":"fleet"' "$W/log-combined" || fail "combined: escalation must page cause=fleet"
+: > "$ALC"   # the measurement clears
+run combined 100 18 HEALTH_ALERT_ALERTS_FILE="$ALC"
+grep -q '"status":"RECOVERED", "cause":"fleet"' "$W/log-combined" \
+  || fail "combined: the fleet page must recover on the first healthy poll"
+grep -q '"status":"RECOVERED", "cause":"operational"' "$W/log-combined" \
+  || fail "combined: the operational WARNING that preceded the page must still be closed"
+[ "$(infos combined)" = 2 ] \
+  || fail "combined: the first healthy poll must emit exactly one fleet and one operational recovery (got $(infos combined))"
+run combined 100 18
+[ "$(infos combined)" = 2 ] \
+  || fail "combined: a second healthy poll must emit neither recovery again (got $(infos combined))"
+pass "combined warning->escalation episode closes the fleet and operational causes exactly once"
+
+# Control: an immediate zero-container page never opened an operational cause, so
+# only the fleet recovery may follow. Guards against closing a cause that was
+# never announced.
+state_dir control0
+AL0="$W/alerts-control0.jsonl"
+crit_key "$AL0" "$(( NOW - 120 ))"
+run control0 100 0 HEALTH_ALERT_ALERTS_FILE="$AL0"
+[ "$(errors control0)" = 1 ] || fail "control0: an observed empty fleet must page immediately"
+: > "$AL0"
+run control0 100 18 HEALTH_ALERT_ALERTS_FILE="$AL0"
+grep -q '"status":"RECOVERED", "cause":"fleet"' "$W/log-control0" \
+  || fail "control0: the immediate fleet page must recover"
+! grep -q '"status":"RECOVERED", "cause":"operational"' "$W/log-control0" \
+  || fail "control0: no operational WARNING was ever opened, so none may be recovered"
+pass "immediate zero-container escalation recovers only the fleet cause"
+
 # ── 13. A verdict is a successful probe: exit 0, so launchd/cron stays green ─
 state_dir ex; json_log OK 0 > "$W/state-ex/host-health-alert-testhost.json"
 set +e
