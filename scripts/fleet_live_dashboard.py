@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
@@ -431,6 +432,7 @@ def _enrich_slot(slot_raw, gh_by_runner, gh_by_run_job, host_disk_paused=False):
         "commands": [str(c)[:180] for c in cmds[:4]],
         "reason": reason,
         "labels": slot_raw.get("labels") if isinstance(slot_raw.get("labels"), list) else [],
+        "kind": slot_raw.get("kind") if isinstance(slot_raw.get("kind"), str) and slot_raw.get("kind").strip() else None,
         "scope": slot_raw.get("scope") if isinstance(slot_raw.get("scope"), str) and slot_raw.get("scope").strip() else None,
     }
 
@@ -605,6 +607,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                         {
                             **s,
                             "slot": s.get("name"),
+                            "kind": s.get("kind") or "native",
                             "down_reason": s.get("idle_note") or s.get("last_job"),
                         },
                         gh_by_runner,
@@ -689,6 +692,8 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                 "state": sp.get("state") or "OFFLINE",
                 "job_display_name": sp.get("job"),
                 "reason": sp.get("reason") or sp.get("scope"),
+                "scope": sp.get("scope"),
+                "kind": sp.get("kind") or "special",
             },
             gh_by_runner,
             gh_by_run_job,
@@ -745,6 +750,15 @@ def _opt_nonneg_number(value, label, errors):
         _record_norm_error(errors, f"{label}: expected non-negative number, got {type(value).__name__}")
         return None
     return float(value)
+
+
+def _is_general_purpose_managed_slot(slot):
+    """Return True only for general-purpose managed fleet container slots eligible for IDLE-STARVED."""
+    kind = (slot.get("kind") or "").strip().lower()
+    if kind in ("special", "native"):
+        return False
+    scope = (slot.get("scope") or "").strip().lower()
+    return scope in ("", "org")
 
 
 def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None, errors=None):
@@ -856,7 +870,7 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     total_slots = 0
     for h in hosts:
         for s in h["slots"]:
-            if idle_starved_active and s.get("state") == "IDLE" and not s.get("scope"):
+            if idle_starved_active and s.get("state") == "IDLE" and _is_general_purpose_managed_slot(s):
                 s["state"] = "IDLE-STARVED"
                 s["alert_level"] = "critical"
                 s["phase_badge"] = "idle_starved"
@@ -946,6 +960,29 @@ def _read_local_ezgha_config(config_path=None):
     out = {"count": None, "name_prefix": None, "min_free_disk_gb": DEFAULT_MIN_FREE_DISK_GB}
     if not path.is_file():
         return out
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None
+    if tomllib is not None:
+        try:
+            with path.open("rb") as handle:
+                cfg = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            return out
+        if isinstance(cfg, dict):
+            runner = cfg.get("runner") if isinstance(cfg.get("runner"), dict) else {}
+            limits = cfg.get("limits") if isinstance(cfg.get("limits"), dict) else {}
+            cnt = runner.get("count")
+            if type(cnt) is int and cnt > 0:
+                out["count"] = cnt
+            prefix = runner.get("name_prefix")
+            if isinstance(prefix, str) and prefix:
+                out["name_prefix"] = prefix
+            floor = limits.get("min_free_disk_gb")
+            if type(floor) is int and floor >= 0:
+                out["min_free_disk_gb"] = floor
+        return out
     section = None
     try:
         for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -958,12 +995,13 @@ def _read_local_ezgha_config(config_path=None):
             if "=" not in line:
                 continue
             key, val = [part.strip() for part in line.split("=", 1)]
-            if section == "runner" and key == "count" and val.isdigit():
-                out["count"] = int(val)
+            clean_int = val.replace("_", "")
+            if section == "runner" and key == "count" and clean_int.isdigit():
+                out["count"] = int(clean_int)
             elif section == "runner" and key == "name_prefix":
                 out["name_prefix"] = val.strip().strip('"').strip("'")
-            elif section == "limits" and key == "min_free_disk_gb" and val.isdigit():
-                out["min_free_disk_gb"] = int(val)
+            elif section == "limits" and key == "min_free_disk_gb" and clean_int.isdigit():
+                out["min_free_disk_gb"] = int(clean_int)
     except OSError:
         pass
     return out
@@ -1018,6 +1056,26 @@ def _parse_ps_etime_minutes(raw):
     return round(total_s / 60.0, 1)
 
 
+def _detect_native_runner_scope(root_dir):
+    """Read local `.runner` metadata to distinguish org-wide vs repo-scoped/unknown native runners."""
+    runner_meta = Path(root_dir) / ".runner"
+    try:
+        data = json.loads(runner_meta.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return "unknown"
+    if not isinstance(data, dict):
+        return "unknown"
+    gh_url = data.get("gitHubUrl") or data.get("githubUrl")
+    if not isinstance(gh_url, str) or not gh_url.strip():
+        return "unknown"
+    parts = [seg for seg in urllib.parse.urlparse(gh_url.strip()).path.split("/") if seg]
+    if len(parts) >= 2:
+        return f"repo:{parts[0]}/{parts[1]}"
+    if len(parts) == 1:
+        return "org"
+    return "unknown"
+
+
 def _collect_local_native_runners():
     """Discover non-Docker native GitHub Actions runner processes running on macOS/Linux."""
     native = []
@@ -1040,7 +1098,17 @@ def _collect_local_native_runners():
                 continue
             root_dir, runner_proc = m.group(1), m.group(2)
             name = Path(root_dir).name or "mac-native-runner"
-            entry = by_dir.setdefault(name, {"name": name, "state": "IDLE", "elapsed_minutes": None, "active_child_commands": []})
+            entry = by_dir.setdefault(
+                name,
+                {
+                    "name": name,
+                    "kind": "native",
+                    "scope": _detect_native_runner_scope(root_dir),
+                    "state": "IDLE",
+                    "elapsed_minutes": None,
+                    "active_child_commands": [],
+                },
+            )
             if runner_proc == "Runner.Worker":
                 entry["state"] = "EXECUTING"
                 parsed_min = _parse_ps_etime_minutes(elapsed_raw)
@@ -1547,6 +1615,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     )
 
     fixture_errors = []
+    cmux_fixture_errors = []
     hosts_partial = False
     if (hosts_json is not None or base is not None) and hosts_data is None:
         hosts_partial = True
@@ -1554,7 +1623,9 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         hosts_data = {"hosts": {}}
     if (cmux_json is not None and cmux_data is None) or (base is not None and cmux_data is None and cmux_err is not None):
         hosts_partial = True
-        fixture_errors.append(f"cmux fixture missing or unreadable ({cmux_err or cmux_json})")
+        cmux_err_msg = f"cmux fixture missing or unreadable ({cmux_err or cmux_json})"
+        fixture_errors.append(cmux_err_msg)
+        cmux_fixture_errors.append(cmux_err_msg)
         cmux_data = {"ok": False, "error": f"cmux fixture missing or unreadable: {cmux_err or cmux_json}"}
     if (github_json is not None or base is not None) and gh_data is None:
         err = f"github fixture missing or unreadable: {gh_err or gh_path}"
@@ -1639,8 +1710,13 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     )
     lat_errors = []
     latency = _normalize_latency(latency_raw, errors=lat_errors)
-    if norm_errors:
-        reconciliation["gh_errors"] = list(reconciliation.get("gh_errors") or []) + list(norm_errors)
+    extra_gh_errors = list(cmux_fixture_errors) + list(norm_errors)
+    if extra_gh_errors:
+        existing_gh_errs = list(reconciliation.get("gh_errors") or [])
+        for msg in extra_gh_errors:
+            if msg not in existing_gh_errs:
+                existing_gh_errs.append(msg)
+        reconciliation["gh_errors"] = existing_gh_errs
     extra_errors = rec_errors + lat_errors
     if extra_errors:
         fixture_errors.extend(extra_errors)
@@ -1678,572 +1754,26 @@ def _escape_embedded_json(state):
     )
 
 
+_TEMPLATE_PATH = Path(__file__).resolve().parent / "fleet_live_dashboard_template.html"
+_TEMPLATE_TOKEN_RE = re.compile(r"__(GENERATED_AT|AUTO_REFRESH_MS|STATE_JSON)__")
+_HTML_TEMPLATE_CACHE = None
+
+
+def _load_html_template():
+    global _HTML_TEMPLATE_CACHE
+    if _HTML_TEMPLATE_CACHE is None:
+        _HTML_TEMPLATE_CACHE = _TEMPLATE_PATH.read_text(encoding="utf-8")
+    return _HTML_TEMPLATE_CACHE
+
+
 def render_html(state, *, auto_refresh_ms=0):
     """Render a standalone, self-contained HTML dashboard with embedded state JSON."""
-    safe_json = _escape_embedded_json(state)
-    generated_at = html_lib.escape(str(state.get("generated_at_utc") or ""))
-    refresh_attr = str(int(auto_refresh_ms))
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="color-scheme" content="dark" />
-  <title>ezgha Operator Live Fleet + CI Latency Inspector</title>
-  <style>
-    :root {{
-      color-scheme: dark;
-      --bg: #0c0f0e;
-      --panel: #151917;
-      --panel-2: #1b211e;
-      --line: #2e3732;
-      --ink: #f3f1ea;
-      --muted: #9da8a1;
-      --green: #69e27d;
-      --amber: #f4c95d;
-      --red: #ff6b57;
-      --blue: #7ab3ef;
-      --mono: 'SFMono-Regular', 'Cascadia Mono', 'Liberation Mono', monospace;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0 auto;
-      max-width: 96rem;
-      padding: clamp(0.75rem, 2vw, 1.75rem);
-      background: var(--bg);
-      color: var(--ink);
-      font-family: var(--mono);
-      font-size: 13px;
-      line-height: 1.45;
-    }}
-    a {{ color: var(--blue); text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    h1, h2, h3, p {{ margin: 0; }}
-    .topbar {{
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end;
-      gap: 0.75rem; padding-bottom: 1rem; border-bottom: 1px solid var(--line);
-    }}
-    .eyebrow {{ color: var(--amber); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }}
-    h1 {{ font-size: clamp(1.5rem, 3vw, 2.3rem); letter-spacing: -0.04em; }}
-    .badge {{
-      display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 11px;
-      font-weight: 700; text-transform: uppercase; border: 1px solid var(--line);
-    }}
-    .badge-EXECUTING {{ color: var(--green); border-color: var(--green); background: rgb(105 226 125 / 0.1); }}
-    .badge-DOWN, .badge-OFFLINE, .badge-CRITICAL, .badge-IDLE-STARVED {{ color: var(--red); border-color: var(--red); background: rgb(255 107 87 / 0.14); }}
-    .badge-CYCLING, .badge-IDLE, .badge-WARN {{ color: var(--amber); border-color: var(--amber); background: rgb(244 201 93 / 0.12); }}
-    .badge-PARKED {{ color: var(--blue); border-color: var(--blue); background: rgb(122 179 239 / 0.12); }}
-    .badge-UNKNOWN {{ color: var(--muted); border-color: var(--muted); background: rgb(157 168 161 / 0.12); }}
-    .phase-pill {{
-      display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px;
-      background: #242b27; color: #d5ded8; border: 1px solid var(--line);
-    }}
-    .section {{
-      margin-top: 1rem; padding: 1rem; background: var(--panel); border: 1px solid var(--line);
-    }}
-    .section-head {{
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-      gap: 0.75rem; padding-bottom: 0.7rem; margin-bottom: 0.75rem; border-bottom: 1px solid var(--line);
-    }}
-    .kpi-grid {{
-      display: grid; gap: 0.65rem;
-      grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
-    }}
-    .kpi {{
-      padding: 0.7rem; background: var(--panel-2); border: 1px solid var(--line);
-    }}
-    .kpi-label {{ color: var(--muted); font-size: 11px; text-transform: uppercase; }}
-    .kpi-val {{ font-size: 1.55rem; font-weight: 800; margin-top: 0.2rem; font-variant-numeric: tabular-nums; }}
-    .kpi-sub {{ color: var(--muted); font-size: 11px; margin-top: 0.2rem; }}
-    .alert-box {{
-      margin-top: 0.75rem; padding: 0.75rem; border-left: 4px solid var(--red);
-      background: rgb(255 107 87 / 0.08);
-    }}
-    .alert-box.warn {{ border-left-color: var(--amber); background: rgb(244 201 93 / 0.08); }}
-    .controls {{
-      display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem;
-    }}
-    .controls input, .controls select, .controls button {{
-      background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
-      padding: 0.35rem 0.6rem; font-family: var(--mono); font-size: 12px; cursor: pointer;
-    }}
-    .controls button.active {{ border-color: var(--green); color: var(--green); }}
-    .host-card {{ margin-top: 0.9rem; border: 1px solid var(--line); background: var(--panel-2); }}
-    .host-header {{
-      display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem;
-      padding: 0.65rem 0.85rem; border-bottom: 1px solid var(--line); background: #19201d;
-    }}
-    .vitals {{ color: var(--muted); font-size: 11px; display: flex; flex-wrap: wrap; gap: 0.85rem; }}
-    .table-wrap {{ overflow-x: auto; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
-    th, td {{
-      padding: 0.48rem 0.6rem; border-bottom: 1px solid #242c28; text-align: left; vertical-align: top;
-    }}
-    th {{ color: var(--muted); font-size: 11px; text-transform: uppercase; user-select: none; }}
-    th.sortable {{ cursor: pointer; }}
-    th.sortable:hover {{ color: var(--ink); }}
-    tr.row-critical {{ background: rgb(255 107 87 / 0.09); }}
-    tr.row-warn {{ background: rgb(244 201 93 / 0.06); }}
-    tr.row-parked {{ background: rgb(122 179 239 / 0.05); }}
-    td.col-slot {{ white-space: nowrap; }}
-    .cmd-line {{
-      color: var(--muted); font-size: 11px; max-width: 34rem;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }}
-    .links {{ display: flex; flex-wrap: wrap; gap: 0.45rem; }}
-    .links a {{
-      padding: 1px 5px; border: 1px solid #2c4763; border-radius: 3px; font-size: 11px;
-      background: rgb(122 179 239 / 0.08);
-    }}
-    .headline-list {{ margin: 0.6rem 0 0; padding-left: 1.2rem; color: var(--muted); }}
-    .headline-list li {{ margin-bottom: 0.3rem; }}
-    @media (max-width: 48rem) {{
-      .kpi-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-    }}
-  </style>
-</head>
-<body>
-  <header class="topbar">
-    <div>
-      <p class="eyebrow">EZ GH ACTIONS // UNREDACTED OPERATOR LIVE VIEW</p>
-      <h1>Fleet + Queue + CI Latency Inspector</h1>
-    </div>
-    <div>
-      <span class="badge badge-EXECUTING" id="live-stamp">UPDATED {generated_at}</span>
-      <button type="button" id="manual-refresh-btn" style="margin-left:0.5rem; background:var(--panel-2); color:var(--ink); border:1px solid var(--line); padding:2px 8px; font-family:var(--mono); font-size:11px; cursor:pointer;">Refresh Now</button>
-      <div class="vitals" id="source-stamps" style="margin-top:0.35rem; justify-content:flex-end;"></div>
-    </div>
-  </header>
-
-  <section class="section" id="reconcile-section">
-    <div class="section-head">
-      <h2>Why Does GitHub Show N Runs In Progress? — Run-vs-Slot Reconciliation</h2>
-      <span class="badge" id="slot-total-badge">— SLOTS</span>
-    </div>
-    <div class="kpi-grid" id="reconcile-kpis"></div>
-    <div id="reconcile-alerts"></div>
-    <ul class="headline-list" id="reconcile-headlines"></ul>
-  </section>
-
-  <section class="section" id="latency-section">
-    <div class="section-head">
-      <h2>CI Latency Telemetry (avg / p50 / p90 / p99)</h2>
-      <div class="controls" id="cohort-controls">
-        <button data-cohort="success" class="active">Success</button>
-        <button data-cohort="all_non_skipped">All Non-Skipped</button>
-        <button data-cohort="failure">Failure</button>
-        <button data-cohort="cancelled">Cancelled</button>
-      </div>
-    </div>
-    <div id="latency-alerts" style="margin-bottom:0.65rem;"></div>
-    <div class="kpi-grid" id="latency-kpis"></div>
-    <div class="kpi-grid" id="latency-extra-kpis" style="margin-top:0.65rem;"></div>
-    <div class="controls" style="margin-top:0.85rem;">
-      <label>Repo:
-        <select id="latency-repo-filter">
-          <option value="ALL">All Repos</option>
-        </select>
-      </label>
-    </div>
-    <div class="table-wrap">
-      <table id="latency-table">
-        <thead>
-          <tr>
-            <th class="sortable" data-sort="repo">Repo</th>
-            <th class="sortable" data-sort="workflow">Workflow</th>
-            <th class="sortable" data-sort="n">N</th>
-            <th class="sortable" data-sort="q_avg">Q avg</th>
-            <th class="sortable" data-sort="q_p50">Q p50</th>
-            <th class="sortable" data-sort="q_p90">Q p90</th>
-            <th class="sortable" data-sort="q_p99">Q p99</th>
-            <th class="sortable" data-sort="e_avg">Exec avg</th>
-            <th class="sortable" data-sort="e_p50">Exec p50</th>
-            <th class="sortable" data-sort="e_p90">Exec p90</th>
-            <th class="sortable" data-sort="e_p99">Exec p99</th>
-            <th class="sortable" data-sort="e2e_avg">Run avg</th>
-            <th class="sortable" data-sort="e2e_p50">Run p50</th>
-            <th class="sortable" data-sort="e2e_p90">Run p90</th>
-            <th class="sortable" data-sort="e2e_p99">Run p99</th>
-          </tr>
-        </thead>
-        <tbody id="latency-tbody"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="section" id="fleet-section">
-    <div class="section-head">
-      <h2>Per-Host &amp; Per-Runner-Slot Live Truth</h2>
-      <div class="controls">
-        <input type="search" id="slot-search" placeholder="Filter slot, repo, PR, job, cmd…" />
-        <select id="slot-state-filter">
-          <option value="ALL">All States</option>
-          <option value="EXECUTING">EXECUTING</option>
-          <option value="DOWN">DOWN</option>
-          <option value="CYCLING">CYCLING</option>
-          <option value="IDLE-STARVED">IDLE-STARVED</option>
-          <option value="IDLE">IDLE</option>
-          <option value="PARKED">PARKED</option>
-          <option value="OFFLINE">OFFLINE</option>
-          <option value="UNKNOWN">UNKNOWN</option>
-        </select>
-        <select id="slot-group-filter">
-          <option value="ALL">All Hosts</option>
-          <option value="jeff-ubuntu">Linux Host</option>
-          <option value="cmux">Cloud VMs</option>
-          <option value="mac">macOS</option>
-          <option value="special">Special</option>
-        </select>
-      </div>
-    </div>
-    <div id="hosts-container"></div>
-  </section>
-
-  <script id="initial-state" type="application/json">{safe_json}</script>
-  <script>
-  (function () {{
-    const AUTO_REFRESH_MS = {refresh_attr};
-    let state = JSON.parse(document.getElementById('initial-state').textContent);
-    let currentCohort = 'success';
-    let sortKey = 'e_p90';
-    let sortAsc = false;
-    let refreshCount = 0;
-
-    function esc(v) {{
-      return String(v ?? '').replace(/[&<>"']/g, (c) => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
-    }}
-
-    function safeHttpUrl(u) {{
-      if (typeof u !== 'string') return null;
-      const trimmed = u.trim();
-      if (!trimmed || /\\s/.test(trimmed)) return null;
-      try {{
-        const parsed = new URL(trimmed);
-        return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? trimmed : null;
-      }} catch (_e) {{
-        return null;
-      }}
-    }}
-
-    function fmtSec(s) {{
-      if (typeof s !== 'number' || !Number.isFinite(s) || s < 0) return '—';
-      const r = Math.round(s);
-      if (r < 60) return r + 's';
-      const m = Math.floor(r / 60), rem = r % 60;
-      return rem === 0 ? m + 'm' : m + 'm ' + rem + 's';
-    }}
-
-    function renderReconciliation() {{
-      const rec = state.reconciliation || {{}};
-      const sc = rec.state_counts || {{}};
-      document.getElementById('slot-total-badge').textContent = (rec.total_slots || 0) + ' TOTAL SLOTS';
-      const downHosts = (state.hosts || []).filter((h) => (h.slots || []).some((s) => s.state === 'DOWN')).map((h) => h.id);
-      const downSub = downHosts.length ? downHosts.join(', ') + ' down/paused slots' : 'No DOWN slots';
-      const starvedCount = sc['IDLE-STARVED'] || 0;
-      const idleSub = starvedCount > 0
-        ? starvedCount + ' IDLE-STARVED slot(s) (>=5m verified queue), ' + (sc.IDLE || 0) + ' IDLE-OK'
-        : (sc.IDLE || 0) + ' idle slot(s) across hosts';
-      const qSub = rec.queued_sample_note
-        ? rec.queued_sample_note
-        : (rec.queue_partial
-            ? 'Partial queue coverage (' + (rec.q_repos_covered || 'some repos failed')
-              + (rec.q_unverified_runs > 0 ? ', ' + rec.q_unverified_runs + ' unverified job check(s)' : '')
-              + ')'
-            : (rec.fresh_queued_scope
-                ? 'Scope: ' + rec.fresh_queued_scope
-                : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined
-                    ? 'Total queued runs: ' + rec.queued_runs_total
-                    : 'Queue breakdown unavailable')));
-      const qVal = rec.fresh_queued_runs !== null && rec.fresh_queued_runs !== undefined
-        ? rec.fresh_queued_runs + ' / ' + (rec.inert_ghosts ?? '—')
-        : (rec.queued_runs_total !== null && rec.queued_runs_total !== undefined
-            ? rec.queued_runs_total + (rec.queued_sample_note ? ' runs (sample only)' : ' runs (no ghost split)')
-            : '— / —');
-      const partialTag = rec.active_runs_partial ? ' (partial' + (rec.repos_covered ? ': ' + rec.repos_covered + ' repos' : '') + ')' : '';
-      const activeRunsVal = rec.active_workflow_runs !== null && rec.active_workflow_runs !== undefined
-        ? rec.active_workflow_runs + (rec.active_runs_partial ? '*' : '')
-        : '—';
-      const activeJobsVal = rec.active_github_jobs !== null && rec.active_github_jobs !== undefined
-        ? rec.active_github_jobs + (rec.active_runs_partial ? '*' : '')
-        : '—';
-      const cards = [
-        ['Active GH Runs' + (rec.active_runs_partial ? ' (Partial)' : ''), activeRunsVal, rec.active_runs_partial ? 'Partial' + partialTag + ' — see error banner' : 'Workflow rows showing in_progress'],
-        ['Active GH Jobs' + (rec.active_runs_partial ? ' (Partial)' : ''), activeJobsVal, rec.active_runs_partial ? 'Partial' + partialTag + ' — see error banner' : 'Observed in_progress jobs'],
-        ['Executing Slots', sc.EXECUTING || 0, 'Docker + native + special executing'],
-        ['Cycling / Idle', (sc.CYCLING || 0) + 'C / ' + (sc.IDLE || 0) + 'I' + (starvedCount > 0 ? ' / ' + starvedCount + 'S' : ''), idleSub],
-        ['Down / Offline / Unknown', (sc.DOWN || 0) + 'D / ' + (sc.OFFLINE || 0) + 'O / ' + (sc.UNKNOWN || 0) + 'U', downSub],
-        ['Parked (Mac)', sc.PARKED || 0, 'Intentionally disabled'],
-        ['Queued (Fresh / Ghosts)' + (rec.queue_partial ? ' (Partial)' : ''), qVal, qSub],
-      ];
-      document.getElementById('reconcile-kpis').innerHTML = cards.map(([k, v, sub]) =>
-        `<div class="kpi"><div class="kpi-label">${{esc(k)}}</div><div class="kpi-val">${{esc(v)}}</div><div class="kpi-sub">${{esc(sub)}}</div></div>`
-      ).join('');
-
-      const alerts = [];
-      if (starvedCount > 0) {{
-        alerts.push(`<div class="alert-box"><strong>IDLE-STARVED:</strong> ${{esc(starvedCount)}} idle slot(s) while ${{esc(rec.fresh_queued_runs)}} verified fresh run(s) waited >=5m (${{esc(rec.oldest_fresh_wait_minutes)}}m).</div>`);
-      }}
-      if (rec.scope_note) {{
-        alerts.push(`<div class="alert-box warn"><strong>Fleet Scope:</strong> ${{esc(rec.scope_note)}}</div>`);
-      }}
-      for (const h of state.hosts || []) {{
-        if (h.alert_message) {{
-          const isWarn = h.group === 'mac';
-          alerts.push(`<div class="alert-box ${{isWarn ? 'warn' : ''}}"><strong>${{esc(h.id)}} (${{esc(h.status)}}):</strong> ${{esc(h.alert_message)}}</div>`);
-        }}
-      }}
-      for (const err of rec.gh_errors || []) {{
-        alerts.push(`<div class="alert-box warn"><strong>GitHub API partial/error:</strong> ${{esc(err)}}</div>`);
-      }}
-      document.getElementById('reconcile-alerts').innerHTML = alerts.join('');
-      const hl = rec.headline_points || [];
-      document.getElementById('reconcile-headlines').innerHTML = hl.map((p) => `<li>${{esc(p)}}</li>`).join('');
-    }}
-
-    function renderLatency() {{
-      const lat = state.latency || {{}};
-      const latAlerts = [];
-      if (lat.ok !== true) {{
-        latAlerts.push(`<div class="alert-box"><strong>Latency Probe Unavailable:</strong> ${{esc(lat.error || 'latency telemetry probe failed or returned no samples')}}</div>`);
-      }} else if (lat.partial === true) {{
-        const parts = [];
-        if (lat.timed_out_runs) parts.push(`${{lat.timed_out_runs}} timed-out run(s)`);
-        if (lat.failed_job_fetches) parts.push(`${{lat.failed_job_fetches}} failed job fetch(es)`);
-        if (lat.truncated_job_fetches) parts.push(`${{lat.truncated_job_fetches}} run(s) with truncated jobs`);
-        if (lat.truncated_run_lists) parts.push(`${{lat.truncated_run_lists}} repo(s) with truncated runs`);
-        const detail = lat.error || (parts.length ? `${{parts.join(', ')}} — showing remaining samples only` : 'partial latency sample — some runs/jobs failed to fetch');
-        latAlerts.push(`<div class="alert-box warn"><strong>Partial Latency Sample:</strong> ${{esc(detail)}}</div>`);
-      }}
-      document.getElementById('latency-alerts').innerHTML = latAlerts.join('');
-      const cohorts = (lat.cohorts && typeof lat.cohorts === 'object') ? lat.cohorts : {{}};
-      const cData = (cohorts[currentCohort] && typeof cohorts[currentCohort] === 'object') ? cohorts[currentCohort] : {{}};
-      const q = (cData.queue_wait && typeof cData.queue_wait === 'object') ? cData.queue_wait : {{}};
-      const e = (cData.execution && typeof cData.execution === 'object') ? cData.execution : {{}};
-      const jt = (cData.job_total && typeof cData.job_total === 'object') ? cData.job_total : {{}};
-      const e2e = (cData.e2e && typeof cData.e2e === 'object') ? cData.e2e : {{}};
-      const cancel = (lat.cancellation && typeof lat.cancellation === 'object') ? lat.cancellation : {{}};
-
-      const cards = [
-        ['Queue Wait (' + currentCohort + ')', `p50 ${{fmtSec(q.p50_s)}} | p90 ${{fmtSec(q.p90_s)}}`, `avg ${{fmtSec(q.avg_s)}} · p99 ${{fmtSec(q.p99_s)}} · n=${{q.n ?? 0}}`],
-        ['Job Execution (' + currentCohort + ')', `p50 ${{fmtSec(e.p50_s)}} | p90 ${{fmtSec(e.p90_s)}}`, `avg ${{fmtSec(e.avg_s)}} · p99 ${{fmtSec(e.p99_s)}} · n=${{e.n ?? 0}}`],
-        ['Total Job Wall', `p50 ${{fmtSec(jt.p50_s)}} | p90 ${{fmtSec(jt.p90_s)}}`, `avg ${{fmtSec(jt.avg_s)}} · p99 ${{fmtSec(jt.p99_s)}}`],
-        ['E2E Run Wall', `p50 ${{fmtSec(e2e.p50_s)}} | p90 ${{fmtSec(e2e.p90_s)}}`, `avg ${{fmtSec(e2e.avg_s)}} · p99 ${{fmtSec(e2e.p99_s)}} · n=${{e2e.n ?? 0}}`],
-        ['Cancelled Waste', cancel.cancelled_rate_pct !== null && cancel.cancelled_rate_pct !== undefined ? `${{cancel.cancelled_rate_pct}}%` : '—', `${{cancel.cancelled_runs ?? 0}} / ${{cancel.total_non_skipped_runs ?? 0}} non-skipped runs`],
-      ];
-      document.getElementById('latency-kpis').innerHTML = cards.map(([k, v, sub]) =>
-        `<div class="kpi"><div class="kpi-label">${{esc(k)}}</div><div class="kpi-val" style="font-size:1.15rem">${{esc(v)}}</div><div class="kpi-sub">${{esc(sub)}}</div></div>`
-      ).join('');
-
-      const extraCards = [];
-      for (const [cls, rawData] of Object.entries((lat.runner_classes && typeof lat.runner_classes === 'object') ? lat.runner_classes : {{}})) {{
-        const data = (rawData && typeof rawData === 'object') ? rawData : {{}};
-        const dc = (data.cohorts && typeof data.cohorts === 'object') ? data.cohorts : {{}};
-        const cs = (dc[currentCohort] && typeof dc[currentCohort] === 'object' ? dc[currentCohort] : null)
-          || (data[currentCohort] && typeof data[currentCohort] === 'object' ? data[currentCohort] : null)
-          || ((data.queue_wait || data.execution) ? (currentCohort === 'success' ? data : {{}}) : {{}});
-        const cq = (cs.queue_wait && typeof cs.queue_wait === 'object') ? cs.queue_wait : {{}};
-        const ce = (cs.execution && typeof cs.execution === 'object') ? cs.execution : {{}};
-        extraCards.push([`Runner: ${{cls}}`, `Q ${{fmtSec(cq.p50_s)}} | E ${{fmtSec(ce.p50_s)}}`, `E p90 ${{fmtSec(ce.p90_s)}} · E avg ${{fmtSec(ce.avg_s)}} (n=${{ce.n ?? 0}})`]);
-      }}
-      for (const [cat, rawSt] of Object.entries((lat.step_categories && typeof lat.step_categories === 'object') ? lat.step_categories : {{}})) {{
-        const st = (rawSt && typeof rawSt === 'object') ? rawSt : {{}};
-        extraCards.push([`Step: ${{cat}}`, `p50 ${{fmtSec(st.p50_s)}} | p90 ${{fmtSec(st.p90_s)}}`, `avg ${{fmtSec(st.avg_s)}} · max ${{fmtSec(st.max_s)}}`]);
-      }}
-      document.getElementById('latency-extra-kpis').innerHTML = extraCards.map(([k, v, sub]) =>
-        `<div class="kpi"><div class="kpi-label">${{esc(k)}}</div><div class="kpi-val" style="font-size:1.05rem">${{esc(v)}}</div><div class="kpi-sub">${{esc(sub)}}</div></div>`
-      ).join('');
-
-      const repoSelect = document.getElementById('latency-repo-filter');
-      const wfList = Array.isArray(lat.workflows) ? lat.workflows.filter((wf) => wf && typeof wf === 'object') : [];
-      const existingRepos = new Set(Array.from(repoSelect.options).map((o) => o.value));
-      for (const wf of wfList) {{
-        if (wf.repo && !existingRepos.has(wf.repo)) {{
-          existingRepos.add(wf.repo);
-          const opt = document.createElement('option');
-          opt.value = wf.repo;
-          opt.textContent = wf.repo;
-          repoSelect.appendChild(opt);
-        }}
-      }}
-      const repoFilter = repoSelect.value;
-
-      const rows = wfList.filter((wf) => repoFilter === 'ALL' || wf.repo === repoFilter).map((wf) => {{
-        const wc = (wf.cohorts && typeof wf.cohorts === 'object') ? wf.cohorts : {{}};
-        const block = (wc[currentCohort] && typeof wc[currentCohort] === 'object' ? wc[currentCohort] : null)
-          || (wf[currentCohort] && typeof wf[currentCohort] === 'object' ? wf[currentCohort] : null)
-          || {{}};
-        const qw = (block.queue_wait && typeof block.queue_wait === 'object') ? block.queue_wait : {{}};
-        const ex = (block.execution && typeof block.execution === 'object') ? block.execution : {{}};
-        const e2 = (block.e2e && typeof block.e2e === 'object') ? block.e2e : {{}};
-        return {{
-          repo: wf.repo || '—',
-          workflow: wf.workflow || '—',
-          n: ex.n ?? qw.n ?? 0,
-          q_avg: qw.avg_s ?? -1,
-          q_p50: qw.p50_s ?? -1,
-          q_p90: qw.p90_s ?? -1,
-          q_p99: qw.p99_s ?? -1,
-          e_avg: ex.avg_s ?? -1,
-          e_p50: ex.p50_s ?? -1,
-          e_p90: ex.p90_s ?? -1,
-          e_p99: ex.p99_s ?? -1,
-          e2e_avg: e2.avg_s ?? -1,
-          e2e_p50: e2.p50_s ?? -1,
-          e2e_p90: e2.p90_s ?? -1,
-          e2e_p99: e2.p99_s ?? -1,
-        }};
-      }});
-      rows.sort((a, b) => {{
-        const va = a[sortKey], vb = b[sortKey];
-        if (typeof va === 'string') return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
-        return sortAsc ? va - vb : vb - va;
-      }});
-      document.getElementById('latency-tbody').innerHTML = rows.map((r) => `
-        <tr>
-          <td>${{esc(r.repo)}}</td>
-          <td><strong>${{esc(r.workflow)}}</strong></td>
-          <td>${{esc(r.n)}}</td>
-          <td>${{fmtSec(r.q_avg)}}</td>
-          <td>${{fmtSec(r.q_p50)}}</td>
-          <td>${{fmtSec(r.q_p90)}}</td>
-          <td>${{fmtSec(r.q_p99)}}</td>
-          <td>${{fmtSec(r.e_avg)}}</td>
-          <td>${{fmtSec(r.e_p50)}}</td>
-          <td><strong>${{fmtSec(r.e_p90)}}</strong></td>
-          <td>${{fmtSec(r.e_p99)}}</td>
-          <td>${{fmtSec(r.e2e_avg)}}</td>
-          <td>${{fmtSec(r.e2e_p50)}}</td>
-          <td>${{fmtSec(r.e2e_p90)}}</td>
-          <td>${{fmtSec(r.e2e_p99)}}</td>
-        </tr>
-      `).join('');
-    }}
-
-    function renderHosts() {{
-      const q = (document.getElementById('slot-search').value || '').trim().toLowerCase();
-      const stateFilter = document.getElementById('slot-state-filter').value;
-      const groupFilter = document.getElementById('slot-group-filter').value;
-
-      const html = (state.hosts || []).filter((h) => groupFilter === 'ALL' || h.group === groupFilter).map((h) => {{
-        const slots = (h.slots || []).filter((s) => {{
-          if (stateFilter !== 'ALL' && s.state !== stateFilter) return false;
-          if (!q) return true;
-          const hay = [s.name, s.state, s.repo, s.workflow, s.job_name, s.pr_label, s.ref, s.reason, s.phase_badge, ...(s.commands || [])].join(' ').toLowerCase();
-          return hay.includes(q);
-        }});
-        if (slots.length === 0 && (q || stateFilter !== 'ALL')) return '';
-        const vitals = Object.entries(h.vitals || {{}}).filter(([, v]) => v).map(([k, v]) => `<span><strong>${{esc(k)}}:</strong> ${{esc(v)}}</span>`).join('');
-        const rowsHtml = slots.map((s) => {{
-          const rowClass = s.alert_level === 'critical' ? 'row-critical' : s.alert_level === 'warn' ? 'row-warn' : s.alert_level === 'parked' ? 'row-parked' : '';
-          const links = [];
-          const runUrl = safeHttpUrl(s.run_url);
-          const jobUrl = safeHttpUrl(s.job_url);
-          const prUrl = safeHttpUrl(s.pr_url);
-          if (runUrl) links.push(`<a href="${{esc(runUrl)}}" target="_blank" rel="noopener">Run ${{esc(s.run_id || '')}}</a>`);
-          if (jobUrl) links.push(`<a href="${{esc(jobUrl)}}" target="_blank" rel="noopener">Job</a>`);
-          if (prUrl) links.push(`<a href="${{esc(prUrl)}}" target="_blank" rel="noopener">${{esc(s.pr_label)}}</a>`);
-          const detail = s.reason ? esc(s.reason) : (s.commands || []).map((c) => `<div class="cmd-line" title="${{esc(c)}}">${{esc(c)}}</div>`).join('');
-          return `
-            <tr class="${{rowClass}}">
-              <td class="col-slot"><strong>${{esc(s.name)}}</strong></td>
-              <td><span class="badge badge-${{esc(s.state)}}">${{esc(s.state)}}</span></td>
-              <td>${{s.phase_badge ? `<span class="phase-pill">${{esc(s.phase_badge)}}</span>` : '—'}}</td>
-              <td>${{typeof s.elapsed_minutes === 'number' ? esc(s.elapsed_minutes) + 'm' : '—'}}</td>
-              <td>${{esc(s.repo_short || s.repo || '—')}}${{s.ref ? `<div class="cmd-line">${{esc(s.ref)}}</div>` : ''}}</td>
-              <td><strong>${{esc(s.workflow || '—')}}</strong><div>${{esc(s.job_name || '')}}</div></td>
-              <td><div class="links">${{links.join('') || '—'}}</div></td>
-              <td>${{detail || '—'}}</td>
-            </tr>
-          `;
-        }}).join('');
-        return `
-          <div class="host-card">
-            <div class="host-header">
-              <div><strong>${{esc(h.title)}}</strong> <span class="badge">${{esc(h.status)}}</span></div>
-              <div class="vitals">${{vitals}}</div>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Slot</th><th>State</th><th>Phase</th><th>Elapsed</th><th>Repo / Ref</th><th>Workflow / Job</th><th>Links</th><th>Active Process / Reason</th>
-                  </tr>
-                </thead>
-                <tbody>${{rowsHtml}}</tbody>
-              </table>
-            </div>
-          </div>
-        `;
-      }}).join('');
-      document.getElementById('hosts-container').innerHTML = html || '<p class="kpi-sub">No matching runner slots.</p>';
-    }}
-
-    function renderAll() {{
-      const mode = state.source_mode || 'LIVE PROBE';
-      const refreshTag = refreshCount > 0 ? ' (refresh #' + refreshCount + ')' : '';
-      document.getElementById('live-stamp').textContent = mode + ' · RENDERED ' + (state.generated_at_utc || '') + refreshTag;
-      const stamps = Object.entries(state.source_timestamps || {{}})
-        .filter(([, v]) => v)
-        .map(([k, v]) => `<span><strong>${{esc(k)}}:</strong> ${{esc(v)}}</span>`);
-      document.getElementById('source-stamps').innerHTML = stamps.join('') || '<span>No source timestamps</span>';
-      try {{ renderReconciliation(); }} catch (_e) {{}}
-      try {{ renderLatency(); }} catch (_e) {{}}
-      try {{ renderHosts(); }} catch (_e) {{}}
-    }}
-
-    document.querySelectorAll('#cohort-controls button').forEach((btn) => {{
-      btn.addEventListener('click', () => {{
-        document.querySelectorAll('#cohort-controls button').forEach((b) => b.classList.remove('active'));
-        btn.classList.add('active');
-        currentCohort = btn.dataset.cohort;
-        renderLatency();
-      }});
-    }});
-    document.querySelectorAll('#latency-table th.sortable').forEach((th) => {{
-      th.addEventListener('click', () => {{
-        const key = th.dataset.sort;
-        if (sortKey === key) sortAsc = !sortAsc;
-        else {{ sortKey = key; sortAsc = false; }}
-        renderLatency();
-      }});
-    }});
-    ['slot-search', 'slot-state-filter', 'slot-group-filter'].forEach((id) => {{
-      document.getElementById(id).addEventListener('input', renderHosts);
-      document.getElementById(id).addEventListener('change', renderHosts);
-    }});
-    document.getElementById('latency-repo-filter').addEventListener('change', renderLatency);
-
-    async function refreshNow() {{
-      const opts = {{ cache: 'no-store' }};
-      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {{
-        opts.signal = AbortSignal.timeout(15000);
-      }}
-      const r = await fetch('/api/state?ts=' + Date.now(), opts);
-      if (r.ok) {{ refreshCount += 1; state = await r.json(); renderAll(); }}
-    }}
-    const manualBtn = document.getElementById('manual-refresh-btn');
-    if (manualBtn) {{
-      manualBtn.addEventListener('click', async () => {{
-        manualBtn.disabled = true;
-        try {{ await refreshNow(); }} catch (_e) {{}} finally {{ manualBtn.disabled = false; }}
-      }});
-    }}
-    renderAll();
-    if (AUTO_REFRESH_MS > 0) {{
-      const schedulePoll = () => {{
-        window.setTimeout(async () => {{
-          try {{ await refreshNow(); }} catch (_e) {{}}
-          schedulePoll();
-        }}, AUTO_REFRESH_MS);
-      }};
-      schedulePoll();
-    }}
-  }})();
-  </script>
-</body>
-</html>
-"""
-
+    replacements = {
+        "GENERATED_AT": html_lib.escape(str(state.get("generated_at_utc") or "")),
+        "AUTO_REFRESH_MS": str(int(auto_refresh_ms)),
+        "STATE_JSON": _escape_embedded_json(state),
+    }
+    return _TEMPLATE_TOKEN_RE.sub(lambda match: replacements[match.group(1)], _load_html_template())
 
 def _is_loopback_host_header(host_header):
     if not isinstance(host_header, str) or not host_header.strip():

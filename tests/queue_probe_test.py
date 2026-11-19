@@ -280,6 +280,69 @@ class OldestFreshWait(unittest.TestCase):
         self.assertEqual(result["unverified_runs"], 1)
         self.assertIsNotNone(result["oldest_fresh_wait_minutes"])
 
+    def test_max_requests_budget_exhaustion_marks_partial_and_unverified_runs(self):
+        import io
+        import json
+        import sys
+        from unittest import mock
+
+        calls = []
+
+        def fake_gh(args):
+            calls.append(list(args))
+            joined = " ".join(args)
+            repo_name = joined.split("repos/", 1)[1].split("/actions", 1)[0]
+            if "status=queued" in joined:
+                if "org/repo1" in repo_name:
+                    return {
+                        "total_count": 10,
+                        "workflow_runs": [queued_run(i) for i in range(1, 11)],
+                    }
+                return {
+                    "total_count": 5,
+                    "workflow_runs": [queued_run(100 + i) for i in range(1, 6)],
+                }
+            if "status=in_progress" in joined:
+                return 2
+            if "/jobs" in joined:
+                return 1
+            raise AssertionError(f"unexpected call: {args}")
+
+        original = queue_probe.gh_json
+        queue_probe.gh_json = fake_gh
+        try:
+            # 1) Single-repo budget: 5 requests -> 1 queued page + 1 in_progress + 3 /jobs = 5; 7 left unverified
+            res = queue_probe.probe_repo("org/repo1", max_requests=5)
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["partial"])
+            self.assertTrue(res["sample_capped"])
+            self.assertIsNone(res["fresh"])
+            self.assertIsNone(res["ghosts"])
+            self.assertEqual(res["unverified_runs"], 7)
+            self.assertIn("request budget exhausted", res["error"])
+            self.assertEqual(len(calls), 5)
+
+            # 2) Multi-repo CLI --max-requests 6 -> <= 6 calls total, BOTH repos keep queued_total & in_progress_runs
+            calls.clear()
+            buf = io.StringIO()
+            with mock.patch.object(sys, "argv", [
+                "queue_probe.py", "--repo", "org/repo1", "--repo", "org/repo2", "--max-requests", "6"
+            ]), mock.patch.object(sys, "stdout", buf):
+                rc = queue_probe.main()
+            self.assertEqual(rc, 0)
+            self.assertLessEqual(len(calls), 6)
+            payload = json.loads(buf.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["partial"])
+            self.assertIsNone(payload["fresh"])
+            self.assertIsNone(payload["ghosts"])
+            self.assertEqual(payload["in_progress_runs"], 4)
+            # 2 discovery calls per repo = 4, leaving 2 /jobs calls on repo1 -> 8 + 5 = 13 unverified
+            self.assertEqual(payload["unverified_runs"], 13)
+            self.assertTrue(any("request budget exhausted" in e for e in payload["errors"]))
+        finally:
+            queue_probe.gh_json = original
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

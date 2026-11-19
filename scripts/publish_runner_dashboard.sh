@@ -253,6 +253,7 @@ build_site() {
         "${QUEUE_PROBE_CMD[@]}" \
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
+        --max-requests "${EZGHA_DASHBOARD_QUEUE_MAX_REQUESTS:-80}" \
         --output "$WORK_DIR/queue.json"; then
       rm -f "$WORK_DIR/queue.json"
       echo "queue probe failed; publishing capacity with queue unavailable" >&2
