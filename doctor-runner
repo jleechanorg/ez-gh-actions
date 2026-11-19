@@ -1151,6 +1151,9 @@ remote_docker_env() {
     if [ -f ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist ]; then
       plutil -extract EnvironmentVariables.DOCKER_HOST raw ~/Library/LaunchAgents/org.jleechanorg.ezgha.plist 2>/dev/null || exit 1
     elif command -v systemctl >/dev/null 2>&1; then
+      user_uid=$(id -u) || exit 1
+      export XDG_RUNTIME_DIR="/run/user/$user_uid"
+      export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
       unit_load_state=$(systemctl --user show ezgha.service -p LoadState --value 2>/dev/null) || exit 1
       [ "$unit_load_state" = loaded ] || exit 1
       service_env=$(systemctl --user show ezgha.service -p Environment --value 2>/dev/null) || exit 1
@@ -1177,8 +1180,8 @@ remote_docker_env() {
 }
 
 probe_slot_state() {
-  # Echoes DOWN | IDLE | EXECUTING for container "$2" on host "$1".
-  # Return status 2 distinguishes an unresolved endpoint from a missing container.
+  # Echoes UNVERIFIED | DOWN | IDLE | EXECUTING for container "$2" on host "$1".
+  # Return status 2 distinguishes an unresolved endpoint from an observed state.
   # (localhost = local docker, anything else = ssh against the remote
   # DAEMON's docker endpoint — see remote_docker_env).
   local host="$1" name="$2" running work denv
@@ -1186,8 +1189,8 @@ probe_slot_state() {
     running=$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)
   else
     if ! denv=$(remote_docker_env "$host"); then
-      bad "$host Docker endpoint unresolved — slot $name counted DOWN without a Docker probe" >&2
-      echo "DOWN"
+      warn "$host Docker endpoint unresolved — slot $name UNVERIFIED; no Docker probe issued" >&2
+      echo "UNVERIFIED"
       return 2
     fi
     running=$(ssh -o ConnectTimeout=4 "$host" "${denv}docker inspect -f '{{.State.Running}}' '$name' 2>/dev/null || echo false")
@@ -1241,7 +1244,7 @@ list_slot_work() {
   else
     for i in $(seq 1 "$count" 2>/dev/null); do
       [ "$count" -gt 0 ] || break
-      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
+      slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_ENDPOINT"
       [ "${slot_state[i]}" = "DOWN" ] && has_down=1
       [ "${slot_state[i]}" = "IDLE" ] && has_idle=1
     done
@@ -1253,7 +1256,7 @@ list_slot_work() {
         case "${slot_state[i]}" in
           DOWN)
             if ! second_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
-              slot_state[i]="UNRESOLVED_DOWN"
+              slot_state[i]="UNRESOLVED_ENDPOINT"
               continue
             fi
             case "$second_state" in
@@ -1264,7 +1267,7 @@ list_slot_work() {
           IDLE)
             # Re-sampled state wins: EXECUTING clears, IDLE stays, absent
             # follows the DOWN path (journal cross-check below).
-            slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_DOWN"
+          slot_state[i]=$(probe_slot_state "$host" "${prefix}-${i}") || slot_state[i]="UNRESOLVED_ENDPOINT"
             if [ "${slot_state[i]}" = "DOWN" ]; then
               has_down=1; idle_to_down=1
               slot_state[i]="IDLE_DOWN"          # one absent sample so far
@@ -1281,7 +1284,7 @@ list_slot_work() {
       [ "$count" -gt 0 ] || break
         [ "${slot_state[i]}" != "IDLE_DOWN" ] && continue
         if ! third_state=$(probe_slot_state "$host" "${prefix}-${i}"); then
-          slot_state[i]="UNRESOLVED_DOWN"
+          slot_state[i]="UNRESOLVED_ENDPOINT"
           continue
         fi
         case "$third_state" in
@@ -1323,7 +1326,8 @@ list_slot_work() {
   LAST_IDLE_SLOTS=()
   LAST_CYCLING_SLOTS=()
   LAST_DOWN_SLOTS=()
-  local exec_n=0 idl=0 dn=0 cyc=0
+  LAST_UNVERIFIED_SLOTS=()
+  local exec_n=0 idl=0 dn=0 cyc=0 unverified=0
   printf "    %-22s %-13s %s\n" "SLOT" "STATE" "EVIDENCE"
   for i in $(seq 1 "$count" 2>/dev/null); do
     [ "$count" -gt 0 ] || break
@@ -1368,14 +1372,14 @@ list_slot_work() {
         [ "${_respawn_fetch_failed:-0}" -eq 1 ] && _down_evidence="${_down_evidence} (respawn-log fetch failed)"
         printf "    %-22s %-13s %s\n" "$name" "DOWN" "$_down_evidence"
         ;;
-      UNRESOLVED_DOWN)
-        dn=$((dn+1))
-        LAST_DOWN_SLOTS+=("$name")
-        printf "    %-22s %-13s %s\n" "$name" "DOWN" "remote Docker endpoint unresolved; no Docker probe issued"
+      UNVERIFIED|UNRESOLVED_ENDPOINT)
+        unverified=$((unverified+1))
+        LAST_UNVERIFIED_SLOTS+=("$name")
+        printf "    %-22s %-13s %s\n" "$name" "UNVERIFIED" "remote Docker endpoint unresolved; no Docker probe issued"
         ;;
     esac
   done
-  printf "  %s totals: %d executing, %d idle, %d cycling, %d down  (of %d configured)\n" "$label" "$exec_n" "$idl" "$cyc" "$dn" "$count"
+  printf "  %s totals: %d executing, %d idle, %d cycling, %d down, %d UNVERIFIED (of %d configured)\n" "$label" "$exec_n" "$idl" "$cyc" "$dn" "$unverified" "$count"
 }
 
 # Local fleet — whichever host this script is actually running on (was
@@ -1412,6 +1416,7 @@ REMOTE_EXECUTING_SLOTS=()
 REMOTE_IDLE_SLOTS=()
 REMOTE_CYCLING_SLOTS=()
 REMOTE_DOWN_SLOTS=()
+REMOTE_UNVERIFIED_SLOTS=()
 # REMOTE_UNREACHABLE is a sticky failure flag set in the SSH-failure branch
 # below. The previous code left REMOTE_*_SLOTS empty on SSH failure and
 # printed only a warn() — `configured` then collapsed to the local-only
@@ -1426,6 +1431,7 @@ REMOTE_DOWN_SLOTS=()
 # ok() line cannot survive an unreachable half of the fleet).
 REMOTE_UNREACHABLE=0
 REMOTE_CONFIG_UNPROVEN=0
+REMOTE_ENDPOINT_UNVERIFIED=0
 if [ "$PLATFORM" = "macos" ]; then DEFAULT_REMOTE_COUNT="$DEFAULT_LINUX_RUNNER_COUNT"; else DEFAULT_REMOTE_COUNT="$DEFAULT_MAC_RUNNER_COUNT"; fi
 # INTENTIONAL REMOTE OPT-OUT (bead jleechan-hxz0). A deliberately parked
 # platform is a DECISION, not an outage, and the two must never render the
@@ -1515,7 +1521,12 @@ elif timeout 5 ssh -o ConnectTimeout=4 -o BatchMode=yes "$REMOTE_HOST" true >/de
   REMOTE_IDLE_SLOTS=("${LAST_IDLE_SLOTS[@]}")
   REMOTE_CYCLING_SLOTS=("${LAST_CYCLING_SLOTS[@]}")
   REMOTE_DOWN_SLOTS=("${LAST_DOWN_SLOTS[@]}")
-  info "$REMOTE_LABEL slots (remote proof via ssh, single sample reused by verdict below): ${#REMOTE_EXECUTING_SLOTS[@]} executing, ${#REMOTE_IDLE_SLOTS[@]} idle, ${#REMOTE_CYCLING_SLOTS[@]} cycling, ${#REMOTE_DOWN_SLOTS[@]} down (of $REMOTE_COUNT configured)"
+  REMOTE_UNVERIFIED_SLOTS=("${LAST_UNVERIFIED_SLOTS[@]}")
+  info "$REMOTE_LABEL slots (remote proof via ssh, single sample reused by verdict below): ${#REMOTE_EXECUTING_SLOTS[@]} executing, ${#REMOTE_IDLE_SLOTS[@]} idle, ${#REMOTE_CYCLING_SLOTS[@]} cycling, ${#REMOTE_DOWN_SLOTS[@]} down, ${#REMOTE_UNVERIFIED_SLOTS[@]} UNVERIFIED (of $REMOTE_COUNT configured)"
+  if [ "${#REMOTE_UNVERIFIED_SLOTS[@]}" -gt 0 ]; then
+    REMOTE_ENDPOINT_UNVERIFIED=1
+    warn "$REMOTE_LABEL Docker state UNVERIFIED for ${#REMOTE_UNVERIFIED_SLOTS[@]} slot(s): ${REMOTE_UNVERIFIED_SLOTS[*]} — endpoint lookup failed; these are not observed DOWN"
+  fi
   if [ "${#REMOTE_DOWN_SLOTS[@]}" -gt 0 ]; then
     bad "$REMOTE_LABEL DOWN (no container) — ${#REMOTE_DOWN_SLOTS[@]} slot(s): ${REMOTE_DOWN_SLOTS[*]}"
     SLOT_PROOF_CRITICAL=$((SLOT_PROOF_CRITICAL + ${#REMOTE_DOWN_SLOTS[@]}))
@@ -1901,8 +1912,8 @@ read -r VERDICT_TOTAL VERDICT_CONFIGURED VERDICT_EXECUTING VERDICT_IDLE_OK VERDI
 # above passed, but if the queue could not be measured we cannot claim the fleet
 # is healthy -- say so and exit non-zero so callers/CI cannot read a quota wall
 # as a green fleet (codex P0 on PR #214; measured live at 0/5000 quota).
-if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ]; then
-  warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT queue/API evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, API_UNVERIFIED=${API_UNVERIFIED:-0}) — NOT a healthy verdict; re-run when GitHub API quota recovers"
+if [ "${QUEUE_TAIL_UNPROVEN:-0}" -eq 1 ] || [ "${API_UNVERIFIED:-0}" -gt 0 ] || [ "${REMOTE_ENDPOINT_UNVERIFIED:-0}" -eq 1 ]; then
+  warn "fleet INCONCLUSIVE: all measurable gates passed ($VERDICT_EXECUTING executing, $VERDICT_IDLE_OK idle-ok, $VERDICT_DOWN down of $VERDICT_CONFIGURED) BUT some evidence is UNPROVEN (QUEUE_TAIL_UNPROVEN=${QUEUE_TAIL_UNPROVEN:-0}, API_UNVERIFIED=${API_UNVERIFIED:-0}, REMOTE_ENDPOINT_UNVERIFIED=${REMOTE_ENDPOINT_UNVERIFIED:-0}) — NOT a healthy verdict; re-run when the unavailable proof source recovers"
   info "fleet (API count, may truncate under rate limit): $ONLINE/$TOTAL runners online, $BUSY busy, $CONTAINER_COUNT containers up (local only), $LOOP_FAILS loop errors"
   exit 3
 fi

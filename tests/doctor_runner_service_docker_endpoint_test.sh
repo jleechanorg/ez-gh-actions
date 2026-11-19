@@ -13,10 +13,18 @@ cat > "$TMP/bin/systemctl" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
   '--user show ezgha.service -p LoadState --value')
+    [ "${XDG_RUNTIME_DIR:-}" = /run/user/1000 ] && [ "${DBUS_SESSION_BUS_ADDRESS:-}" = unix:path=/run/user/1000/bus ] || {
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    }
     [ "${SYSTEMCTL_FAIL:-0}" = 1 ] && exit 1
     printf '%s\n' "${UNIT_LOAD_STATE:-loaded}"
     ;;
   '--user show ezgha.service -p Environment --value')
+    [ "${XDG_RUNTIME_DIR:-}" = /run/user/1000 ] && [ "${DBUS_SESSION_BUS_ADDRESS:-}" = unix:path=/run/user/1000/bus ] || {
+      echo 'Failed to connect to bus: No medium found' >&2
+      exit 1
+    }
     [ "${SYSTEMCTL_FAIL:-0}" = 1 ] && exit 1
     printf '%s\n' "${UNIT_ENV:-}"
     ;;
@@ -32,6 +40,11 @@ case "$1" in
   top) printf 'PID COMMAND\n1 Runner.Worker\n' ;;
   *) exit 2 ;;
 esac
+SH
+
+cat > "$TMP/bin/id" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = -u ] && printf '1000\n'
 SH
 
 cat > "$TMP/bin/ssh" <<'SH'
@@ -66,6 +79,7 @@ run_case() (
   export UNIT_ENV="$unit_env" SYSTEMCTL_FAIL="$systemctl_fail" UNIT_LOAD_STATE="$unit_load_state"
   REMOTE_DOCKER_HOST_CACHE="" REMOTE_DOCKER_HOST_CACHED_FOR=""
   bad() { printf '  [BAD] %s\n' "$*"; }
+  warn() { printf '  [WARN] %s\n' "$*"; }
   eval "$FUNCTIONS"
   probe_slot_state "$host" case-slot || [ "$?" -eq 2 ]
 )
@@ -92,19 +106,19 @@ assert_endpoint quoted-assignment '"DOCKER_HOST_OVERRIDE=unix:///run/whole assig
 assert_endpoint stale-host-only 'DOCKER_HOST=tcp://stale-colima:2375 DOCKER_CONTEXT=stale' 'unix:///var/run/docker.sock'
 assert_endpoint empty-unit-env '' 'unix:///var/run/docker.sock'
 
-# A failed systemctl lookup is unresolved, counted DOWN, and must not result in
-# any remote docker probe. Verify the diagnostic is explicit as well.
+# If the owning user bus cannot be read, endpoint status is UNVERIFIED rather
+# than observed DOWN, and no remote Docker probe is issued.
 set +e
 failed_state="$(run_case '' 1 linux-host 2>"$TMP/systemctl-failed.err")"
 failed_rc=$?
 set -e
 [ "$failed_rc" -eq 0 ] || { echo "FAIL: failed endpoint lookup aborted probe (rc=$failed_rc)"; exit 1; }
-[ "$failed_state" = DOWN ] || { echo "FAIL: failed endpoint lookup should count as DOWN, got $failed_state"; exit 1; }
+[ "$failed_state" = UNVERIFIED ] || { echo "FAIL: failed endpoint lookup should be UNVERIFIED, got $failed_state"; exit 1; }
 [ ! -s "$DOCKER_CALLS" ] || { echo 'FAIL: Docker was probed after endpoint lookup failed'; cat "$DOCKER_CALLS"; exit 1; }
 grep -qi 'endpoint.*unresolved\|unresolved.*endpoint' "$TMP/systemctl-failed.err" || {
   echo 'FAIL: missing explicit unresolved-endpoint diagnostic'; cat "$TMP/systemctl-failed.err"; exit 1;
 }
-echo 'PASS: failed systemctl lookup is unresolved/DOWN and issues no docker probe'
+echo 'PASS: failed systemctl lookup is UNVERIFIED and issues no docker probe'
 
 # systemctl show may succeed for a missing unit and return an empty
 # Environment. That must not be mistaken for the loaded unit's native socket.
@@ -113,21 +127,21 @@ missing_unit_state="$(run_case '' 0 linux-host not-found 2>"$TMP/systemd-unit-mi
 missing_unit_rc=$?
 set -e
 [ "$missing_unit_rc" -eq 0 ] || { echo "FAIL: missing unit lookup aborted probe (rc=$missing_unit_rc)"; exit 1; }
-[ "$missing_unit_state" = DOWN ] || { echo "FAIL: missing systemd unit should count as DOWN, got $missing_unit_state"; exit 1; }
+[ "$missing_unit_state" = UNVERIFIED ] || { echo "FAIL: missing systemd unit should be UNVERIFIED, got $missing_unit_state"; exit 1; }
 [ ! -s "$DOCKER_CALLS" ] || { echo 'FAIL: Docker was probed when systemd unit was not loaded'; cat "$DOCKER_CALLS"; exit 1; }
 grep -qi 'endpoint.*unresolved\|unresolved.*endpoint' "$TMP/systemd-unit-missing.err" || {
   echo 'FAIL: missing unit lacked explicit unresolved-endpoint diagnostic'; cat "$TMP/systemd-unit-missing.err"; exit 1;
 }
-echo 'PASS: systemd LoadState=not-found is unresolved/DOWN and issues no docker probe'
+echo 'PASS: systemd LoadState=not-found is UNVERIFIED and issues no docker probe'
 
 : > "$DOCKER_CALLS"
 malformed_state="$(run_case 'DOCKER_HOST_OVERRIDE="unterminated' 0 linux-host 2>"$TMP/malformed.err")"
-[ "$malformed_state" = DOWN ] || { echo "FAIL: malformed unit Environment should be unresolved, got $malformed_state"; exit 1; }
+[ "$malformed_state" = UNVERIFIED ] || { echo "FAIL: malformed unit Environment should be UNVERIFIED, got $malformed_state"; exit 1; }
 [ ! -s "$DOCKER_CALLS" ] || { echo 'FAIL: malformed unit Environment issued Docker probe'; cat "$DOCKER_CALLS"; exit 1; }
 grep -qi 'endpoint.*unresolved\|unresolved.*endpoint' "$TMP/malformed.err" || { echo 'FAIL: malformed unit Environment lacked unresolved diagnostic'; exit 1; }
-echo 'PASS: malformed quoted Environment fails closed without Docker probe'
+echo 'PASS: malformed quoted Environment is UNVERIFIED without Docker probe'
 
-# Full caller regression: unresolved endpoint must stay DOWN even when a
+# Full caller regression: unresolved endpoint must stay UNVERIFIED even when a
 # recent journal line would ordinarily mean a resolved, containerless slot is
 # cycling. Exercise both systemctl failure and successful LoadState=not-found.
 for caller_case in failed not-found; do
@@ -136,20 +150,33 @@ for caller_case in failed not-found; do
     PATH="$TMP/bin:$PATH"; export PATH
     eval "$FUNCTIONS"
     eval "$(sed -n '/^journal_has_respawn_evidence() {/ ,/^}/p' "$ROOT/doctor-runner")"
-    bad() { :; }; info() { :; }; sleep() { :; }
+    bad() { :; }; warn() { :; }; info() { :; }; sleep() { :; }
     fetch_respawn_log_window() { printf '%s\n' 'respawned ephemeral runner case-1'; }
     RESPAWN_EVIDENCE_WINDOW_MIN=5 SECTION10_DOWN_RESAMPLE_SECONDS=0
     RUNNER_JOB_INDEX_FILE=/dev/null STARVED_PRESENT=0 STARVE_QUEUED_COUNT=0
     if [ "$caller_case" = failed ]; then SYSTEMCTL_FAIL=1 UNIT_LOAD_STATE=loaded; else SYSTEMCTL_FAIL=0 UNIT_LOAD_STATE=not-found; fi
     export SYSTEMCTL_FAIL UNIT_LOAD_STATE
     list_slot_work case 1 linux-host linux > "$TMP/caller.out"
-    declare -p LAST_DOWN_SLOTS
+    declare -p LAST_UNVERIFIED_SLOTS
     cat "$TMP/caller.out"
   ) 2>"$TMP/caller-$caller_case.err")
-  grep -Fq 'LAST_DOWN_SLOTS=([0]="case-1")' <<<"$caller_out" || { echo "FAIL: caller $caller_case did not preserve DOWN"; echo "$caller_out"; exit 1; }
+  grep -Fq 'LAST_UNVERIFIED_SLOTS=([0]="case-1")' <<<"$caller_out" || { echo "FAIL: caller $caller_case did not preserve UNVERIFIED"; echo "$caller_out"; exit 1; }
+  grep -Eq 'case-1 +UNVERIFIED' <<<"$caller_out" || { echo "FAIL: caller $caller_case did not print UNVERIFIED state"; echo "$caller_out"; exit 1; }
+  ! grep -Eq 'case-1 +DOWN' <<<"$caller_out" || { echo "FAIL: caller $caller_case described unknown endpoint as DOWN"; echo "$caller_out"; exit 1; }
   [ ! -s "$DOCKER_CALLS" ] || { echo "FAIL: caller $caller_case issued Docker probe"; cat "$DOCKER_CALLS"; exit 1; }
-  echo "PASS: full caller preserves $caller_case unresolved slot as DOWN despite journal evidence"
+  echo "PASS: full caller preserves $caller_case unresolved slot as UNVERIFIED despite journal evidence"
 done
+
+grep -Fq 'REMOTE_ENDPOINT_UNVERIFIED=1' "$ROOT/doctor-runner" || {
+  echo 'FAIL: remote UNVERIFIED slots do not mark endpoint proof unavailable'; exit 1;
+}
+grep -Fq '|| [ "${REMOTE_ENDPOINT_UNVERIFIED:-0}" -eq 1 ]; then' "$ROOT/doctor-runner" || {
+  echo 'FAIL: unresolved remote endpoint does not force the fleet verdict inconclusive'; exit 1;
+}
+grep -Fq 'fleet INCONCLUSIVE:' "$ROOT/doctor-runner" || {
+  echo 'FAIL: unresolved remote endpoint lacks an explicit inconclusive verdict'; exit 1;
+}
+echo 'PASS: unresolved remote endpoint forces an explicit inconclusive fleet verdict'
 
 # A loaded unit with a known endpoint and no container can still be cycling
 # when the daemon has recent evidence for this exact slot.

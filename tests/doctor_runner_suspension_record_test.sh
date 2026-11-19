@@ -94,7 +94,11 @@ pass "behavioral: unset defaults to the owning bead"
 # P1 from review: the reporting was inside the LOCAL_DISABLED branch only, so a
 # Linux doctor checking a parked Mac printed neither the pointer nor the warning,
 # contradicting the "every parked run" promise in AGENTS.md.
-REMOTE_BLOCK="$(sed -n '1452,1471p' "$D")"
+REMOTE_RECORD_START=$(grep -n '^  REMOTE_SUSPENSION_RECORD=' "$D" | head -1 | cut -d: -f1 || true)
+[ -n "$REMOTE_RECORD_START" ] || fail "could not locate the remote suspension-record block"
+REMOTE_RECORD_END=$(awk -v s="$REMOTE_RECORD_START" 'NR>s && /^  fi$/ {print NR; exit}' "$D")
+[ -n "$REMOTE_RECORD_END" ] || fail "could not locate the end of the remote suspension-record block"
+REMOTE_BLOCK="$(sed -n "${REMOTE_RECORD_START},${REMOTE_RECORD_END}p" "$D")"
 grep -q 'suspension record' <<<"$REMOTE_BLOCK" \
   || fail "the REMOTE parked-leg branch does not report the suspension record"
 grep -q 'no suspension record declared for the parked' <<<"$REMOTE_BLOCK" \
@@ -113,9 +117,10 @@ remote_harness() { # value | "unset"
     echo 'warn() { echo "WARN:$*"; }'
     echo 'REMOTE_DISABLED=1'
     echo 'REMOTE_LABEL="macos(macbook)"'
-    # Strip the leading `if [ "$REMOTE_DISABLED" -eq 1 ]; then` guard and the
-    # trailing `fi`/elif so the branch body runs standalone.
-    sed -n '1452,1471p' "$D"
+    # Execute the actual remote suspension-record code, bounded by its
+    # content markers rather than line numbers so earlier doctor edits cannot
+    # shift this regression fixture.
+    sed -n "${REMOTE_RECORD_START},${REMOTE_RECORD_END}p" "$D"
   } > "$WORK/remote.sh"
   bash "$WORK/remote.sh"
 }
