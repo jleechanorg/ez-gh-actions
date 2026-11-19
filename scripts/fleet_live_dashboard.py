@@ -58,13 +58,11 @@ def _get_shared_cache_path():
 
 
 def _ensure_private_dir(parent):
-    existed = parent.exists()
     parent.mkdir(parents=True, exist_ok=True)
-    if not existed:
-        try:
-            os.chmod(parent, 0o700)
-        except OSError:
-            pass
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
 
 
 def _open_private(path, flags):
@@ -2336,11 +2334,36 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
     return {
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source_mode": "AUDIT SNAPSHOT" if is_fully_file_backed else "LIVE PROBE",
+        "git_short_sha": _detect_git_short_sha(),
         "source_timestamps": source_timestamps,
         "hosts": hosts,
         "reconciliation": reconciliation,
         "latency": latency,
     }
+
+
+_GIT_SHORT_SHA_CACHE = {}
+
+
+def _detect_git_short_sha():
+    if "sha" not in _GIT_SHORT_SHA_CACHE:
+        repo_root = Path(__file__).resolve().parent.parent
+        sha = None
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--short=7", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res.returncode == 0:
+                cand = res.stdout.strip()
+                if re.fullmatch(r"[0-9a-f]{7,40}", cand):
+                    sha = cand[:7]
+        except Exception:
+            sha = None
+        _GIT_SHORT_SHA_CACHE["sha"] = sha
+    return _GIT_SHORT_SHA_CACHE["sha"]
 
 
 def _escape_embedded_json(state):

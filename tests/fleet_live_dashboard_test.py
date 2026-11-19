@@ -1780,6 +1780,43 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     self.assertEqual(st["reconciliation"]["state_counts"]["IDLE-STARVED"], 0)
                     self.assertFalse(st["reconciliation"]["idle_starved"])
 
+            # End-to-end probe_repo + reconciliation: one contradictory {"total_count":0,"jobs":[None]}
+            # alongside a valid old queued job must keep the eligible slot IDLE, never IDLE-STARVED.
+            self._reset_shared_cache()
+            old_iso = (mod.datetime.datetime.now(mod.datetime.timezone.utc) - mod.datetime.timedelta(minutes=25)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            def bad_zero_gh(args, timeout=20):
+                joined = " ".join(args)
+                if "status=queued" in joined:
+                    return {
+                        "total_count": 2,
+                        "workflow_runs": [
+                            {"id": 901, "created_at": old_iso},
+                            {"id": 902, "created_at": old_iso},
+                        ],
+                    }
+                if "status=in_progress" in joined:
+                    return 0
+                if "/runs/901/jobs" in joined:
+                    return {"total_count": 0, "jobs": [None]}
+                if "/runs/902/jobs" in joined:
+                    return {
+                        "total_count": 1,
+                        "jobs": [{"id": 1, "status": "queued", "created_at": old_iso, "labels": ["self-hosted", "linux", "x64"]}],
+                    }
+                raise AssertionError(f"unexpected call: {args}")
+
+            with mock.patch.object(mod.ci_latency_probe, "gh_json", return_value={"total_count": 0, "workflow_runs": []}), \
+                 mock.patch.object(mod.queue_probe, "gh_json", side_effect=bad_zero_gh):
+                snap_bad_zero = mod._collect_live_github_snapshot(repos=["org/repo"])
+            self.assertFalse(snap_bad_zero["summary"]["job_details_complete"])
+            self.assertTrue(snap_bad_zero["summary"]["q_partial"])
+            norm_hosts = mod._normalize_hosts(json.loads(hosts_f.read_text(encoding="utf-8")), None, snap_bad_zero)
+            rec_bad_zero = mod._normalize_reconciliation(norm_hosts, None, snap_bad_zero)
+            self.assertEqual(next(h for h in norm_hosts if h["id"] == "jeff-ubuntu")["slots"][0]["state"], "IDLE")
+            self.assertEqual(rec_bad_zero["state_counts"]["IDLE-STARVED"], 0)
+            self.assertFalse(rec_bad_zero["idle_starved"])
+
             # Repo-scoped managed slot stays IDLE on queued jobs for another repo, and missing/bare scope/labels stays IDLE
             scoped_hosts = {
                 "hosts": {
@@ -2077,8 +2114,10 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 ssh_payload = json.loads(ssh_proc.stdout)
                 self.assertEqual(ssh_payload["slots"][0]["state"], "EXECUTING")
 
-            # Cross-process simultaneous cold requests serialize via flock (single probe) + private 0o700/0o600 cache + second --repo blocked within cooldown
+            # Cross-process simultaneous cold requests serialize via flock (single probe) + private 0o700/0o600 cache (tightening pre-existing dirs too) + second --repo blocked within cooldown
             self._reset_shared_cache()
+            self._shared_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._shared_cache_path.parent.chmod(0o755)
             race_bin = tmp / "race_gh_bin"
             race_bin.mkdir()
             gh_call_log = tmp / "gh_calls.log"

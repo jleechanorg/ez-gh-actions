@@ -193,6 +193,9 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
     count = total if type(total) is int else None
     raw_jobs = payload.get("jobs")
     if isinstance(raw_jobs, list):
+        if count == 0 and len(raw_jobs) > 0:
+            # Contradictory payload (total_count=0 alongside non-empty jobs list like [null]) is unverified.
+            return None, [], False
         queued_jobs = []
         truncated = count is not None and len(raw_jobs) < count
         details_valid = not truncated

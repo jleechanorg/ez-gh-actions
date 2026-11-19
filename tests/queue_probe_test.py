@@ -220,6 +220,30 @@ class UnknownHandling(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertFalse(result["job_details_complete"])
 
+    def test_contradictory_zero_count_with_null_job_row_stays_unverified(self):
+        # total_count=0 with jobs=[null] is contradictory and must not look like a clean ghost.
+        def fake_gh(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 703, "created_at": "2026-11-18T00:00:00Z"}]}
+            if "status=in_progress" in joined:
+                return 0
+            if "/actions/runs/703/jobs" in joined:
+                return {"total_count": 0, "jobs": [None]}
+            raise AssertionError(f"unexpected call: {args}")
+
+        original = queue_probe.gh_json
+        queue_probe.gh_json = fake_gh
+        try:
+            result = queue_probe.probe_repo("org/repo")
+        finally:
+            queue_probe.gh_json = original
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["unverified_runs"], 1)
+        self.assertEqual(result["ghosts"], 0)
+        self.assertFalse(result["job_details_complete"])
+
 
 class OldestFreshWait(unittest.TestCase):
     def test_ghost_age_does_not_drive_oldest_wait(self):

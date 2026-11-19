@@ -528,7 +528,11 @@ def main():
         linux_payload=_load_object(args.linux_host),
         observed_at=args.observed_at,
         published_at=args.published_at,
-        queue_payload=_load_object(args.queue) if args.queue else None,
+        queue_payload=(
+            (_load_object(args.queue) or {"ok": False, "partial": True, "repos": None})
+            if args.queue
+            else None
+        ),
         cmux_payload=_load_object(args.cmux) if args.cmux else None,
         latency_payload=_load_object(args.latency) if args.latency else None,
     )

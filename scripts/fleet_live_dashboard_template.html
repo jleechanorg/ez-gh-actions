@@ -499,7 +499,12 @@
       const refreshTag = refreshErr
         ? ' (STALE - refresh failed: ' + refreshErr + ')'
         : (refreshCount > 0 ? ' (refresh #' + refreshCount + ')' : '');
-      document.getElementById('live-stamp').textContent = mode + ' · RENDERED ' + (state.generated_at_utc || '') + refreshTag;
+      const routeTag = (typeof location !== 'undefined' && location.host && /^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/i.test(location.host))
+        ? (' · ' + location.host)
+        : '';
+      const shaTag = state.git_short_sha ? (' · ' + state.git_short_sha) : '';
+      document.getElementById('live-stamp').textContent =
+        mode + ' · RENDERED ' + (state.generated_at_utc || '') + routeTag + shaTag + refreshTag;
       const stamps = Object.entries(state.source_timestamps || {})
         .filter(([, v]) => v)
         .map(([k, v]) => `<span><strong>${esc(k)}:</strong> ${esc(v)}</span>`);

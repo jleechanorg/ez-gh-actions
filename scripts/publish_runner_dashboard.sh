@@ -270,11 +270,22 @@ build_site() {
         --max-requests "$QUEUE_MAX_REQUESTS" \
         --output "$WORK_DIR/queue.json" || queue_rc=$?
     if [[ -s "$WORK_DIR/queue.json" ]] && python3 - "$WORK_DIR/queue.json" >/dev/null 2>&1 <<'PY'
-import json, sys
+import json, math, sys
 from pathlib import Path
+def _reject(token):
+    raise ValueError(token)
+def _finite_float(s):
+    v = float(s)
+    if not math.isfinite(v):
+        raise ValueError(s)
+    return v
 try:
-    doc = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-except (OSError, ValueError):
+    doc = json.loads(
+        Path(sys.argv[1]).read_text(encoding="utf-8"),
+        parse_constant=_reject,
+        parse_float=_finite_float,
+    )
+except (OSError, UnicodeDecodeError, ValueError):
     sys.exit(1)
 if not isinstance(doc, dict) or type(doc.get("schema_version")) is not int or doc["schema_version"] != 1:
     sys.exit(1)

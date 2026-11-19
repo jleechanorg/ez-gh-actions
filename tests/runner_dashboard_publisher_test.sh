@@ -496,4 +496,34 @@ assert doc["queue"]["ok"] is False, doc["queue"]
 assert doc["queue"]["partial"] is True, doc["queue"]
 PY
 
+# Non-finite JSON tokens (NaN, 1e999) must be rejected cleanly so queue stays partial:true.
+for bad_tok in NaN 1e999; do
+  NONFINITE_QUEUE="$WORK/nonfinite_${bad_tok}_queue_probe.sh"
+  cat > "$NONFINITE_QUEUE" <<SH
+#!/usr/bin/env bash
+out=""
+while [[ \$# -gt 0 ]]; do
+  if [[ "\$1" == "--output" ]]; then out="\$2"; shift 2; else shift; fi
+done
+printf '{"schema_version":1,"ok":true,"fresh":1,"ghosts":0,"repos":[{"repo":"org/a","ok":true,"fresh":${bad_tok},"ghosts":0}]}\n' > "\$out"
+exit 0
+SH
+  chmod +x "$NONFINITE_QUEUE"
+  EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+  EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$NONFINITE_QUEUE" \
+  EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+  EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+  EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+  EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+  EZGHA_DASHBOARD_LOCK_DIR="$WORK/nonfinite-${bad_tok}.lock" \
+    /bin/bash "$PUBLISHER" --collect-only "$WORK/nonfinite-${bad_tok}-site"
+  python3 - "$WORK/nonfinite-${bad_tok}-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
+PY
+done
+
 echo "runner dashboard publisher tests passed"
