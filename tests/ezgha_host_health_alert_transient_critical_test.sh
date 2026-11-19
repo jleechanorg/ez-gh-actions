@@ -22,7 +22,7 @@ set -euo pipefail
 unset BASH_ENV || true
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-S="$ROOT/scripts/ezgha-host-health-alert.sh"
+S="${EZGHA_HEALTH_ALERT_TEST_SCRIPT:-$ROOT/scripts/ezgha-host-health-alert.sh}"
 W="$(mktemp -d)"
 # shellcheck disable=SC2329
 cleanup() { rm -rf "${W:?}"; }
@@ -36,7 +36,11 @@ cat > "$W/gcloud" <<'STUB'
 echo "$*" >> "$STUB_LOG"
 exit 0
 STUB
-chmod +x "$W/gcloud"
+for bin in docker systemctl pgrep timeout ssh; do
+  printf '#!/usr/bin/env bash\nexit 99\n' > "$W/$bin"
+done
+chmod +x "$W"/{gcloud,docker,systemctl,pgrep,timeout,ssh}
+export PATH="$W:$PATH" DOCKER_BIN="$W/docker"
 
 NOW=$(date +%s)
 state_dir() { mkdir -p "$W/state-$1"; }
@@ -85,10 +89,10 @@ pass "the transient CRITICAL is still recorded (WARNING, cause=operational, key 
 # probe forces paging on its own, so the assertion would pass even if the key
 # classification were broken (found in review). Positive containers isolate the
 # key-classification behaviour under test.
-crit_file "$W/alerts-cap.jsonl" "runner_pool.disk_measurement_unavailable"
+crit_file "$W/alerts-cap.jsonl" "runner_pool.some_future_capacity_key"
 run cap 100 18 HEALTH_ALERT_ALERTS_FILE="$W/alerts-cap.jsonl"
 [ "$(fleet_cause cap)" = 1 ] \
-  || { cat "$(log_of cap)" >&2; fail "a capacity CRITICAL with 0 containers must still page cause=fleet"; }
+  || { cat "$(log_of cap)" >&2; fail "a capacity CRITICAL with 18 containers must still page cause=fleet"; }
 [ "$(errors cap)" = 1 ] || fail "a capacity CRITICAL must page at ERROR"
 pass "genuine capacity CRITICAL still pages cause=fleet (no over-suppression)"
 
@@ -114,14 +118,14 @@ pass "0-container truth still pages even with a transient CRITICAL present"
 # the fleet page vanished. The daemon fires some capacity alerts once per
 # episode, so this would have suppressed it for the whole window.
 MIXED="$W/alerts-mixed.jsonl"
-printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"cap","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$MIXED"
+printf '{"body":"x","event_key":"runner_pool.some_future_capacity_key","severity":"CRITICAL","subject":"cap","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$MIXED"
 printf '{"body":"x","event_key":"runner_pool.memory_pressure","severity":"CRITICAL","subject":"mem","ts_unix":%s}\n' "$(( NOW - 60 ))" >> "$MIXED"
 run mixed 100 18 HEALTH_ALERT_ALERTS_FILE="$MIXED"
 [ "$(errors mixed)" -ge 1 ] \
   || { cat "$(log_of mixed)" >&2; fail "a later transient CRITICAL must not mask an earlier capacity CRITICAL"; }
 grep -q '"cause":"fleet"' "$(log_of mixed)" \
   || { cat "$(log_of mixed)" >&2; fail "the capacity CRITICAL must still page as cause=fleet"; }
-grep -q 'disk_measurement_unavailable' "$(log_of mixed)" \
+grep -q 'some_future_capacity_key' "$(log_of mixed)" \
   || fail "the page must name the capacity key that triggered it"
 pass "a later transient CRITICAL does not mask an earlier capacity CRITICAL"
 

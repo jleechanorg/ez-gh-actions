@@ -51,6 +51,7 @@
 #   HEALTH_ALERT_PEER_SERVICE (active)
 #   HEALTH_ALERT_DISK_FLOOR_GB (Linux 30, Darwin 20)
 #   HEALTH_ALERT_DISK_EMERGENCY_GB (15)      HEALTH_ALERT_DISK_PAGE_AFTER_MIN (15)
+#   HEALTH_ALERT_DISK_MEASUREMENT_PAGE_AFTER_MIN (30)
 #   HEALTH_ALERT_COOLDOWN_SEC (1800)         GCLOUD_BIN, DOCKER_BIN
 #
 set -euo pipefail
@@ -105,14 +106,15 @@ fi
 PEER_DISK_FLOOR_GB="${HEALTH_ALERT_PEER_DISK_FLOOR_GB:-30}"
 DISK_EMERGENCY_GB="${HEALTH_ALERT_DISK_EMERGENCY_GB:-15}"
 DISK_PAGE_AFTER_MIN="${HEALTH_ALERT_DISK_PAGE_AFTER_MIN:-15}"
+DISK_MEASUREMENT_PAGE_AFTER_MIN="${HEALTH_ALERT_DISK_MEASUREMENT_PAGE_AFTER_MIN:-30}"
 COOLDOWN_SEC="${HEALTH_ALERT_COOLDOWN_SEC:-1800}"
 
 # Daemon CRITICAL follow-up. The daemon writes Slack alerts to alerts.jsonl;
 # a CRITICAL entry means the daemon itself decided something is badly wrong
 # (admission paused, refill stuck, queue starvation). Keep this operational
 # signal available through Slack, but do not let it broaden SMS eligibility.
-# Promote a recent daemon CRITICAL into cause=fleet so the Slack policy captures
-# it. Window and file are overridable for hermetic tests.
+# Classify recent daemon CRITICALs for the cause-scoped Slack policies.
+# Window and file are overridable for hermetic tests.
 ALERTS_JSONL="${HEALTH_ALERT_ALERTS_FILE:-$HOME/.local/state/ezgha/alerts.jsonl}"
 SLACK_CRITICAL_WINDOW_MIN="${HEALTH_ALERT_SLACK_CRITICAL_WINDOW_MIN:-15}"
 SLACK_ESCALATE="${HEALTH_ALERT_SLACK_ESCALATE:-1}"
@@ -226,7 +228,8 @@ if [ -z "$CONTAINER_COUNT" ]; then
   if [ "$PLATFORM" = "Darwin" ] && [ -S "$HOME/.colima/default/docker.sock" ] && [ -z "${DOCKER_HOST:-}" ]; then
     export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   fi
-  if ! timeout 10 "$DOCKER_BIN" info >/dev/null 2>&1; then
+  if ! timeout 10 "$DOCKER_BIN" info >/dev/null 2>&1 ||
+     ! CONTAINER_COUNT=$(timeout 10 "$DOCKER_BIN" ps --filter label=ezgha=managed -q 2>/dev/null | wc -l); then
     # A parked host has no docker running BY CONSTRUCTION, so an unreachable
     # daemon is the decision, not a defect (bead jleechan-hxz0).
     if [ "$LOCAL_LEG_PARKED" -ne 1 ]; then
@@ -234,8 +237,6 @@ if [ -z "$CONTAINER_COUNT" ]; then
     fi
     DOCKER_UNREACHABLE=1
     CONTAINER_COUNT=0
-  else
-    CONTAINER_COUNT=$(timeout 10 "$DOCKER_BIN" ps --filter label=ezgha=managed -q 2>/dev/null | wc -l || echo 0)
   fi
 fi
 CONTAINER_COUNT=$(printf '%d' "$CONTAINER_COUNT" 2>/dev/null || echo 0)
@@ -357,6 +358,7 @@ fi
 # The promotion is therefore keyed on what the daemon CRITICAL actually means:
 #   - disk keys            -> cause=disk (unchanged; separate policy)
 #   - transient admission  -> OPERATIONAL note at WARNING, never a page
+#   - Docker disk measurement failure -> WARNING until sustained or fleet empty
 #   - any other CRITICAL   -> cause=fleet (unchanged fail-closed behaviour)
 #
 # Only keys PROVEN to be transient belong in TRANSIENT_CRIT_KEYS. An unknown or
@@ -370,6 +372,7 @@ fi
 # had 15-20 Runner.Workers executing during all three false "FLEET DOWN"s).
 TRANSIENT_CRIT_KEYS=" runner_pool.memory_pressure "
 OPERATIONAL_NOTE=""
+DISK_MEASUREMENT_ALERT=""
 if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
   # Classify EVERY qualifying recent CRITICAL, not just the newest one.
   # Selecting only the newest record let a later transient event MASK a genuine
@@ -382,9 +385,7 @@ if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
   # remove a transient key's own claim, never another key's.
   #
   # The window is the same; keys are classified independently:
-  #   disk keys      -> cause=disk
-  #   transient keys -> at most one operational note (deduped)
-  #   any other key  -> cause=fleet (fail-closed, unchanged)
+  # Collect disk measurement failures for the stateful decision below.
   FIFO_CRITS="$STATE_DIR/.crits.$$"
   tail -400 "$ALERTS_JSONL" 2>/dev/null \
     | grep '"severity":"CRITICAL"' > "$FIFO_CRITS" 2>/dev/null || true
@@ -399,6 +400,8 @@ if [ "$SLACK_ESCALATE" = "1" ] && [ -f "$ALERTS_JSONL" ]; then
       fi
       if [ "$CRIT_KEY" = "runner_pool.host_disk_floor" ] || [ "$CRIT_KEY" = "runner_pool.disk_floor" ]; then
         DISK_FAILS+=("local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY})")
+      elif [ "$CRIT_KEY" = "runner_pool.disk_measurement_unavailable" ]; then
+        DISK_MEASUREMENT_ALERT="local: daemon CRITICAL alert ${CRIT_AGE_MIN}m ago (${CRIT_KEY})"
       elif printf '%s' "$TRANSIENT_CRIT_KEYS" | grep -qF " ${CRIT_KEY} "; then
         # Transient admission deferral: existing slots keep executing and it
         # self-clears. Recorded once, never a fleet-down claim (2026-11-07 page).
@@ -418,6 +421,8 @@ PREV_STATUS="OK"
 PREV_LAST_SENT_FLEET=0
 PREV_LAST_SENT_DISK=0
 PREV_DISK_SINCE=0
+DISK_MEASUREMENT_SINCE=0
+DISK_MEASUREMENT_RECOVERY_PENDING=0
 read_state() { # file
   local f="$1"
   [ -f "$f" ] || return 0
@@ -425,10 +430,14 @@ read_state() { # file
   PREV_LAST_SENT_FLEET=$(sed -n 's/.*"last_sent_fleet":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_LAST_SENT_DISK=$(sed -n 's/.*"last_sent_disk":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_DISK_SINCE=$(sed -n 's/.*"disk_breach_since":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  DISK_MEASUREMENT_SINCE=$(sed -n 's/.*"disk_measurement_since":[[:space:]]*\([0-9]*\).*/\1/p' "$f" 2>/dev/null | head -1)
+  DISK_MEASUREMENT_RECOVERY_PENDING=$(sed -n 's/.*"disk_measurement_recovery_pending":[[:space:]]*\([01]\).*/\1/p' "$f" 2>/dev/null | head -1)
   PREV_STATUS="${PREV_STATUS:-OK}"
   PREV_LAST_SENT_FLEET="${PREV_LAST_SENT_FLEET:-0}"
   PREV_LAST_SENT_DISK="${PREV_LAST_SENT_DISK:-0}"
   PREV_DISK_SINCE="${PREV_DISK_SINCE:-0}"
+  DISK_MEASUREMENT_SINCE="${DISK_MEASUREMENT_SINCE:-0}"
+  DISK_MEASUREMENT_RECOVERY_PENDING="${DISK_MEASUREMENT_RECOVERY_PENDING:-0}"
 }
 read_state "$STATE_FILE"
 if [ ! -f "$STATE_FILE" ]; then
@@ -442,8 +451,8 @@ if [ ! -f "$STATE_FILE" ]; then
 fi
 
 save_state() { # status last_sent_fleet last_sent_disk disk_since
-  printf '{"status":"%s", "last_sent_fleet":%s, "last_sent_disk":%s, "disk_breach_since":%s, "updated_at":"%s"}\n' \
-    "$1" "$2" "$3" "$4" "$NOW_ISO" > "$STATE_FILE"
+  printf '{"status":"%s", "last_sent_fleet":%s, "last_sent_disk":%s, "disk_breach_since":%s, "disk_measurement_since":%s, "disk_measurement_recovery_pending":%s, "updated_at":"%s"}\n' \
+    "$1" "$2" "$3" "$4" "$DISK_MEASUREMENT_SINCE" "$DISK_MEASUREMENT_RECOVERY_PENDING" "$NOW_ISO" > "$STATE_FILE"
 }
 
 emit() { # severity payload-json
@@ -461,6 +470,30 @@ emit() { # severity payload-json
 }
 
 json_checks() { printf '%s\n' "$@" | jq -R . | jq -s .; }
+
+DISK_MEASUREMENT_DEGRADED=0
+# jleechan-hqx0: time continuous observations in the CRITICAL window. An
+# independently observed empty fleet bypasses the admission warning window.
+if [ -z "$DISK_MEASUREMENT_ALERT" ] || [ "$LOCAL_LEG_PARKED" -eq 1 ]; then
+  DISK_MEASUREMENT_SINCE=0
+else
+  if [ "$DISK_MEASUREMENT_SINCE" -eq 0 ]; then DISK_MEASUREMENT_SINCE=$NOW_EPOCH; fi
+  MEASUREMENT_MIN=$(( (NOW_EPOCH - DISK_MEASUREMENT_SINCE) / 60 ))
+  if [ "$MEASUREMENT_MIN" -ge "$DISK_MEASUREMENT_PAGE_AFTER_MIN" ] ||
+     { [ "$CONTAINER_COUNT" -eq 0 ] && [ "$DOCKER_UNREACHABLE" -eq 0 ]; }; then
+    FLEET_FAILS+=("$DISK_MEASUREMENT_ALERT")
+    DISK_MEASUREMENT_RECOVERY_PENDING=0
+  elif [ "$CONTAINER_COUNT" -gt 0 ]; then
+    echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $DISK_MEASUREMENT_ALERT" >&2
+    MEASUREMENT_CHECKS=("$DISK_MEASUREMENT_ALERT")
+    if [ -n "$OPERATIONAL_NOTE" ]; then MEASUREMENT_CHECKS+=("$OPERATIONAL_NOTE"); fi
+    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"operational", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+      "$HOST" "$PLATFORM" "$(json_checks "${MEASUREMENT_CHECKS[@]}")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+    emit WARNING "$PAYLOAD"
+    DISK_MEASUREMENT_DEGRADED=1
+    DISK_MEASUREMENT_RECOVERY_PENDING=1
+  fi
+fi
 
 FLEET_COUNT=${#FLEET_FAILS[@]}
 DISK_COUNT=${#DISK_FAILS[@]}
@@ -583,6 +616,38 @@ if [ "$DISK_COUNT" -gt 0 ]; then
 fi
 
 # ── Healthy ─────────────────────────────────────────────────────────────────
+# The fleet, peer, disk and parked verdicts return above. Preserve the
+# operational recovery across them until the measurement clears on a healthy poll.
+RECOVERED_CAUSES=()
+case "$PREV_STATUS" in
+  DOWN|FAIL) RECOVERED_CAUSES+=("fleet") ;;
+esac
+case "$PREV_STATUS" in
+  DISK|FAIL) RECOVERED_CAUSES+=("disk") ;;
+  DEGRADED)
+    if [ "$PREV_DISK_SINCE" -gt 0 ] || [ "$DISK_MEASUREMENT_RECOVERY_PENDING" -eq 0 ]; then
+      RECOVERED_CAUSES+=("disk")
+    fi
+    ;;
+esac
+case "$PREV_STATUS" in
+  PEER) RECOVERED_CAUSES+=("peer") ;;
+esac
+if [ -z "$DISK_MEASUREMENT_ALERT" ] && [ "$DISK_MEASUREMENT_RECOVERY_PENDING" -eq 1 ]; then
+  RECOVERED_CAUSES+=("operational")
+  DISK_MEASUREMENT_RECOVERY_PENDING=0
+fi
+for cause in ${RECOVERED_CAUSES[@]+"${RECOVERED_CAUSES[@]}"}; do
+  PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
+    "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
+  emit INFO "$PAYLOAD"
+done
+
+if [ "$DISK_MEASUREMENT_DEGRADED" -eq 1 ]; then
+  save_state "DEGRADED" 0 0 0
+  exit 0
+fi
+
 echo "[$NOW_ISO] MUTUAL HEALTH CHECK OK on $HOST (Local: $CONTAINER_COUNT containers, ${FREE_GB}GB free; Peer healthy)"
 
 # A transient daemon CRITICAL with no other failure must still be recorded, just
@@ -590,24 +655,6 @@ echo "[$NOW_ISO] MUTUAL HEALTH CHECK OK on $HOST (Local: $CONTAINER_COUNT contai
 # on transition only so it does not write an entry every poll interval.
 if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   echo "[$NOW_ISO] OPERATIONAL NOTE on $HOST: $OPERATIONAL_NOTE" >&2
-  # A note must not DISCARD a pending recovery obligation. Reproduced in review:
-  # DOWN -> NOTE -> OK emitted no RECOVERED for either transition, so an outage
-  # that cleared while a note was showing was never reported as recovered.
-  # Emit the outstanding recovery first, then record the note state.
-  case "$PREV_STATUS" in
-    DOWN|FAIL|DISK|DEGRADED|PEER)
-      echo "[$NOW_ISO] Host $HOST recovered (while noting an operational transient); emitting recovery log to GCP..."
-      RECOVERY_CAUSES=()
-      case "$PREV_STATUS" in DOWN|FAIL) RECOVERY_CAUSES+=("fleet") ;; esac
-      case "$PREV_STATUS" in DISK|DEGRADED|FAIL) RECOVERY_CAUSES+=("disk") ;; esac
-      case "$PREV_STATUS" in PEER) RECOVERY_CAUSES+=("peer") ;; esac
-      for cause in ${RECOVERY_CAUSES[@]+"${RECOVERY_CAUSES[@]}"}; do
-        REC_PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-          "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-        emit INFO "$REC_PAYLOAD"
-      done
-      ;;
-  esac
   if [ "$PREV_STATUS" != "NOTE" ]; then
     PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"DEGRADED", "cause":"operational", "severity":"WARNING", "failed_checks":%s, "container_count":%d, "free_gb":%d, "ts":"%s"}' \
       "$HOST" "$PLATFORM" "$(json_checks "$OPERATIONAL_NOTE")" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
@@ -615,25 +662,6 @@ if [ -n "${OPERATIONAL_NOTE:-}" ]; then
   fi
   save_state "NOTE" 0 0 0
   exit 0
-fi
-
-if [ "$PREV_STATUS" = "DOWN" ] || [ "$PREV_STATUS" = "FAIL" ] || [ "$PREV_STATUS" = "DISK" ] || [ "$PREV_STATUS" = "DEGRADED" ] || [ "$PREV_STATUS" = "PEER" ]; then
-  echo "[$NOW_ISO] Host $HOST and peer have recovered! Emitting recovery log to GCP..."
-  RECOVERED_CAUSES=()
-  case "$PREV_STATUS" in
-    DOWN|FAIL) RECOVERED_CAUSES+=("fleet") ;;
-  esac
-  case "$PREV_STATUS" in
-    DISK|DEGRADED|FAIL) RECOVERED_CAUSES+=("disk") ;;
-  esac
-  case "$PREV_STATUS" in
-    PEER) RECOVERED_CAUSES+=("peer") ;;
-  esac
-  for cause in "${RECOVERED_CAUSES[@]}"; do
-    PAYLOAD=$(printf '{"host":"%s", "platform":"%s", "status":"RECOVERED", "cause":"%s", "container_count":%d, "free_gb":%d, "ts":"%s"}' \
-      "$HOST" "$PLATFORM" "$cause" "$CONTAINER_COUNT" "$FREE_GB" "$NOW_ISO")
-    emit INFO "$PAYLOAD"
-  done
 fi
 
 save_state "OK" 0 0 0

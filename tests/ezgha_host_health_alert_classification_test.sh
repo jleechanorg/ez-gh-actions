@@ -7,7 +7,7 @@
 # CLI arguments, which is how the emitted severity and payload are asserted.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-S="$ROOT/scripts/ezgha-host-health-alert.sh"
+S="${EZGHA_HEALTH_ALERT_TEST_SCRIPT:-$ROOT/scripts/ezgha-host-health-alert.sh}"
 W="$(mktemp -d)"
 trap 'rm -rf "${W:?}"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }; pass() { echo "PASS: $*"; }
@@ -27,7 +27,20 @@ case "$*" in
     ;;
 esac
 STUB
-chmod +x "$W/gcloud"
+cat > "$W/docker" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  info) exit 0 ;;
+  ps) printf 'partial-container-id\n'; exit 124 ;;
+  *) exit 99 ;;
+esac
+STUB
+printf '#!/usr/bin/env bash\nshift\nexec "$@"\n' > "$W/timeout"
+for bin in systemctl pgrep ssh; do
+  printf '#!/usr/bin/env bash\nexit 99\n' > "$W/$bin"
+done
+chmod +x "$W"/{gcloud,docker,timeout,systemctl,pgrep,ssh}
+export PATH="$W:$PATH" DOCKER_BIN="$W/docker"
 
 NOW=$(date +%s)
 json_log() { printf '{"status":"%s", "last_sent_fleet":0, "last_sent_disk":0, "disk_breach_since":%s, "updated_at":"x"}\n' "$1" "$2"; }
@@ -44,7 +57,7 @@ run() { # case free_gb containers [extra env...]
     HEALTH_ALERT_PEER_FREE_GB=100 HEALTH_ALERT_PEER_CONTAINERS=4 HEALTH_ALERT_PEER_SERVICE=active \
     HEALTH_ALERT_FREE_GB="$free" HEALTH_ALERT_CONTAINER_COUNT="$cnt" \
     HEALTH_ALERT_ALERTS_FILE="$W/alerts-none.jsonl" \
-    "$@" "$S" >"$W/out-$case" 2>"$W/err-$case" || true
+    "$@" "$S" >"$W/out-$case" 2>"$W/err-$case" || { cat "$W/err-$case" >&2; fail "$case: alert script exited nonzero"; }
 }
 errors() { if [ -f "$W/log-$1" ]; then grep -c -- "--severity=ERROR" "$W/log-$1" || true; else echo 0; fi; }
 warnings() { if [ -f "$W/log-$1" ]; then grep -c -- "--severity=WARNING" "$W/log-$1" || true; else echo 0; fi; }
@@ -150,28 +163,78 @@ grep -q '"cause":"peer"' "$W/log-peerdown" || fail "peer verdict must carry caus
 grep -q '"status":"DEGRADED"' "$W/log-peerdown" || fail "peer verdict must be DEGRADED, not DOWN"
 pass "peer-only failure reports cause=peer at WARNING, never a fleet page"
 
-# ── 12. A recent daemon CRITICAL stays on the operational Slack path ───────
+# ── 12. A disk measurement failure degrades, recovers, or pages ───────────
 AL="$W/alerts.jsonl"
 printf '{"body":"x","event_key":"runner_pool.disk_measurement_unavailable","severity":"CRITICAL","subject":"paused","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$AL"
 run crit 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
-[ "$(errors crit)" = 1 ] || fail "a recent daemon CRITICAL must remain a critical operational notification"
-grep -q '"cause":"fleet"' "$W/log-crit" || fail "escalation must use cause=fleet so the Slack policy matches"
-grep -q 'daemon CRITICAL alert' "$W/log-crit" || fail "escalation payload must name the daemon alert"
-pass "recent Slack CRITICAL remains in the cause=fleet operational path"
+[ "$(errors crit)" = 0 ] || fail "a young disk_measurement_unavailable CRITICAL with live containers must not page at ERROR"
+[ "$(warnings crit)" = 1 ] || fail "a young disk measurement failure must emit one WARNING"
+grep -q '"status":"DEGRADED", "cause":"operational"' "$W/log-crit" && grep -q 'runner_pool.disk_measurement_unavailable' "$W/log-crit" \
+  || fail "the WARNING must name the key and report DEGRADED with cause=operational"
+! grep -q '"cause":"fleet"' "$W/log-crit" || fail "a young disk measurement failure must not emit cause=fleet"
+CRIT_STATE="$W/state-crit/host-health-alert-testhost.json"
+FIRST_SEEN=$(jq -er 'select(.status == "DEGRADED") | .disk_measurement_since | select(. > 0)' "$CRIT_STATE") \
+  || fail "state must record DEGRADED and persist the first observed timestamp"
+run crit 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
+[ "$(warnings crit)" = 2 ] || fail "a second young poll must still report the operational WARNING"
+[ "$(jq -r .disk_measurement_since "$CRIT_STATE")" = "$FIRST_SEEN" ] || fail "consecutive polls must preserve the first observed timestamp"
+pass "young disk measurement failure logs WARNING, persists DEGRADED and retains the first observation"
+
+run crit 100 18
+grep -q '"status":"RECOVERED", "cause":"operational"' "$W/log-crit" || fail "a healthy poll must recover the operational cause"
+jq -e '.status == "OK" and .disk_measurement_since == 0' "$CRIT_STATE" >/dev/null || fail "absence must reset the persistence timer"
+run crit 100 18
+[ "$(infos crit)" = 1 ] || fail "repeated healthy polls must emit exactly one RECOVERED entry"
+run crit 100 18 HEALTH_ALERT_ALERTS_FILE="$AL" HEALTH_ALERT_DISK_MEASUREMENT_PAGE_AFTER_MIN=1
+[ "$(errors crit)" = 0 ] || fail "a new episode must start a new timer even if its daemon record is already a minute old"
+pass "cleared disk measurement failure recovers once and resets the timer for a new episode"
+
+state_dir persist-29
+printf '{"status":"DEGRADED","disk_measurement_since":%s}\n' "$(( NOW - 29 * 60 ))" > "$W/state-persist-29/host-health-alert-testhost.json"
+run persist-29 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
+[ "$(errors persist-29)" = 0 ] && [ "$(warnings persist-29)" = 1 ] || fail "29 minutes must still be inside the default warning window"
+for minutes in 30 5; do
+  case_name="persist-$minutes"
+  state_dir "$case_name"
+  printf '{"status":"DEGRADED","disk_measurement_since":%s}\n' "$(( NOW - minutes * 60 ))" > "$W/state-$case_name/host-health-alert-testhost.json"
+  if [ "$minutes" = 5 ]; then
+    run "$case_name" 100 18 HEALTH_ALERT_ALERTS_FILE="$AL" HEALTH_ALERT_DISK_MEASUREMENT_PAGE_AFTER_MIN=5
+  else
+    run "$case_name" 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
+  fi
+  [ "$(errors "$case_name")" = 1 ] || fail "persistence at the $minutes-minute threshold must page at ERROR"
+  grep -q '"cause":"fleet"' "$W/log-$case_name" && grep -q 'runner_pool.disk_measurement_unavailable' "$W/log-$case_name" \
+    || fail "the persistence page must use cause=fleet and name the key"
+done
+pass "continued disk measurement failure pages at 30 minutes and honors the threshold override"
+
+run critzero 100 0 HEALTH_ALERT_ALERTS_FILE="$AL"
+[ "$(errors critzero)" = 1 ] && grep -q '"cause":"fleet"' "$W/log-critzero" || fail "an observed empty fleet must page immediately"
+pass "zero containers pages fleet immediately during a young disk measurement failure"
+
+run critblind 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
+run critblind 100 ''
+[ "$(infos critblind)" = 0 ] || fail "a failed docker ps must not emit RECOVERED even with partial output"
+jq -e '.disk_measurement_since == 0' "$W/state-critblind/host-health-alert-testhost.json" >/dev/null || fail "absence must reset the timer even on a blind poll"
+run critblind 100 18
+grep -q '"status":"RECOVERED", "cause":"operational"' "$W/log-critblind" || fail "an unobservable poll must preserve pending operational recovery"
+pass "failed container listing defers recovery until a healthy observed poll"
 
 printf '{"body":"x","event_key":"old","severity":"CRITICAL","subject":"old","ts_unix":%s}\n' "$(( NOW - 7200 ))" > "$AL"
 run critold 100 18 HEALTH_ALERT_ALERTS_FILE="$AL"
 [ "$(errors critold)" = 0 ] || fail "a CRITICAL older than the window must not page"
 pass "stale daemon CRITICAL stays silent"
 
-# ── 12b. Daemon CRITICAL for host_disk_floor routes to cause=disk, never fleet ─
+# ── 12b. Both disk-floor CRITICAL keys route to cause=disk ──────────────────
 AL_DISK="$W/alerts-disk.jsonl"
-printf '{"body":"x","event_key":"runner_pool.host_disk_floor","severity":"CRITICAL","subject":"disk floor","ts_unix":%s}\n' "$(( NOW - 120 ))" > "$AL_DISK"
-run critdisk 100 18 HEALTH_ALERT_ALERTS_FILE="$AL_DISK"
-[ "$(errors critdisk)" = 0 ] || fail "fresh daemon host_disk_floor alert must not page as fleet outage"
-[ "$(warnings critdisk)" = 1 ] || fail "fresh daemon host_disk_floor alert must be recorded at WARNING"
-grep -q '"cause":"disk"' "$W/log-critdisk" || fail "daemon host_disk_floor escalation must route to cause=disk"
-pass "recent daemon host_disk_floor routes to cause=disk"
+for key in host_disk_floor disk_floor; do
+  printf '{"body":"x","event_key":"runner_pool.%s","severity":"CRITICAL","subject":"disk floor","ts_unix":%s}\n' "$key" "$(( NOW - 120 ))" > "$AL_DISK"
+  run "$key" 100 18 HEALTH_ALERT_ALERTS_FILE="$AL_DISK"
+  [ "$(errors "$key")" = 0 ] || fail "fresh daemon $key alert must not page as fleet outage"
+  [ "$(warnings "$key")" = 1 ] || fail "fresh daemon $key alert must be recorded at WARNING"
+  grep -q '"cause":"disk"' "$W/log-$key" || fail "daemon $key must route to cause=disk"
+  pass "recent daemon $key routes to cause=disk"
+done
 
 # ── 12c. Emitted entries must be JSON-shaped, matching the policy filters ─────
 # Both [CRITICAL] ezgha policies match on jsonPayload.cause. `gcloud logging write`
