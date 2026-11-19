@@ -303,4 +303,40 @@ for line in l_lines:
     assert "--limit 30 --job-run-limit 20" in line, line
 PY
 
+PARTIAL_QUEUE_PROBE="$WORK/partial_queue_probe.sh"
+cat > "$PARTIAL_QUEUE_PROBE" <<'SH'
+#!/usr/bin/env bash
+out=""
+max_req=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    --max-requests) max_req="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cat > "$out" <<JSON
+{"schema_version":1,"ok":false,"partial":true,"unverified_runs":5,"fresh":null,"ghosts":null,"oldest_fresh_wait_minutes":null,"in_progress_runs":null,"errors":["budget exhausted at ${max_req}"],"repos":[{"repo":"org/r1","ok":true,"fresh":2,"ghosts":1,"partial":false},{"repo":"org/r2","ok":false,"fresh":null,"ghosts":null,"partial":true,"unverified_runs":5}]}
+JSON
+exit 1
+SH
+chmod +x "$PARTIAL_QUEUE_PROBE"
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$PARTIAL_QUEUE_PROBE" \
+EZGHA_DASHBOARD_QUEUE_MAX_REQUESTS=1 \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/partial-exhaust.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/partial-exhaust-site"
+python3 - "$WORK/partial-exhaust-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
+assert doc["queue"]["unverified_runs"] == 5, doc["queue"]
+assert len(doc["queue"]["repos"]) == 2, doc["queue"]
+PY
+
 echo "runner dashboard publisher tests passed"

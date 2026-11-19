@@ -268,8 +268,18 @@ build_site() {
         --repo jleechanorg/worldai_frontend \
         --max-requests "$QUEUE_MAX_REQUESTS" \
         --output "$WORK_DIR/queue.json"; then
-      rm -f "$WORK_DIR/queue.json"
-      echo "queue probe failed; publishing capacity with queue unavailable" >&2
+      if [[ -s "$WORK_DIR/queue.json" ]] && python3 - "$WORK_DIR/queue.json" >/dev/null 2>&1 <<'PY'
+import json, sys
+from pathlib import Path
+doc = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert isinstance(doc, dict) and doc.get("schema_version") == 1 and isinstance(doc.get("repos"), list)
+PY
+      then
+        echo "queue probe exited non-zero with partial payload; preserving diagnostics" >&2
+      else
+        rm -f "$WORK_DIR/queue.json"
+        echo "queue probe failed; publishing capacity with queue unavailable" >&2
+      fi
     fi
   fi
   queue_args=()

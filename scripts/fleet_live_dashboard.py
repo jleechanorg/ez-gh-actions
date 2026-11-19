@@ -529,7 +529,7 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
         except (TypeError, ValueError, KeyError, AttributeError, IndexError, ArithmeticError) as exc:
             _record_norm_error(errors, f"hosts.{host_key}: {exc}")
 
-    if isinstance(cmux_data, dict):
+    if isinstance(cmux_data, dict) and cmux_data.get("ok") is not False:
         vms_raw = cmux_data.get("cmux_vms") if cmux_data.get("cmux_vms") is not None else cmux_data.get("vms")
         vms = _as_dict_list(vms_raw, "cmux.vms", errors)
         for vm in vms:
@@ -567,11 +567,8 @@ def _normalize_hosts(hosts_data, cmux_data, gh_data, errors=None):
                         slots.append(enriched)
                         seen_slot_names.add(enriched["name"])
                 raw_mem_mb = vm.get("memory_mb")
-                mem_gib = (
-                    round(raw_mem_mb / 1024, 1)
-                    if isinstance(raw_mem_mb, (int, float)) and not isinstance(raw_mem_mb, bool)
-                    else "?"
-                )
+                mem_mb_val = _opt_nonneg_number(raw_mem_mb, "cmux.vm.memory_mb", errors)
+                mem_gib = round(mem_mb_val / 1024, 1) if mem_mb_val is not None else "?"
                 cfg_count = cfg.get("count")
                 if not isinstance(cfg_count, int) or isinstance(cfg_count, bool):
                     cfg_count = len(slots)
@@ -765,10 +762,18 @@ def _clean_int_map(mapping, label, errors):
 def _opt_nonneg_number(value, label, errors):
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         _record_norm_error(errors, f"{label}: expected non-negative number, got {type(value).__name__}")
         return None
-    return float(value)
+    try:
+        fval = float(value)
+    except (OverflowError, TypeError, ValueError):
+        _record_norm_error(errors, f"{label}: numeric value out of range")
+        return None
+    if not math.isfinite(fval) or fval < 0:
+        _record_norm_error(errors, f"{label}: expected finite non-negative number, got {value!r}")
+        return None
+    return fval
 
 
 def _is_general_purpose_managed_slot(slot):
@@ -783,7 +788,8 @@ def _is_general_purpose_managed_slot(slot):
 
 
 def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_partial=False, fixture_errors=None, errors=None):
-    rec_raw = (cmux_data or {}).get("github_reconciliation") if isinstance(cmux_data, dict) else None
+    cmux_ok = isinstance(cmux_data, dict) and cmux_data.get("ok") is not False
+    rec_raw = cmux_data.get("github_reconciliation") if cmux_ok else None
     rec = _as_dict(rec_raw, "cmux.github_reconciliation", errors)
     gh_summary_raw = (gh_data or {}).get("summary") if isinstance(gh_data, dict) else None
     gh_summary = _as_dict(gh_summary_raw, "github.summary", errors)
@@ -818,12 +824,12 @@ def _normalize_reconciliation(hosts, cmux_data, gh_data, scope_note=None, hosts_
     total_ip_jobs = _sum_ints(ip_jobs_by_repo) if ip_jobs_by_repo else _opt_int(gh_summary.get("total_in_progress_jobs_across_org"), "github.summary.total_in_progress_jobs_across_org", errors)
     total_q_runs = _sum_ints(q_runs_by_repo) if q_runs_by_repo else None
     total_q_jobs = _sum_ints(q_jobs_by_repo) if q_jobs_by_repo else _opt_int(gh_summary.get("total_queued_jobs_across_org"), "github.summary.total_queued_jobs_across_org", errors)
-    why_few = (cmux_data or {}).get("why_worldarchitect_shows_few_in_progress_runs") if isinstance(cmux_data, dict) else None
+    why_few = cmux_data.get("why_worldarchitect_shows_few_in_progress_runs") if cmux_ok else None
     fallback_headlines = why_few.get("headline_points") if isinstance(why_few, dict) and isinstance(why_few.get("headline_points"), list) else []
     headlines = next(
         (
             v.get("headline_points")
-            for k, v in (cmux_data.items() if isinstance(cmux_data, dict) else ())
+            for k, v in (cmux_data.items() if cmux_ok else ())
             if isinstance(k, str) and k.endswith("_in_progress_runs") and isinstance(v, dict) and isinstance(v.get("headline_points"), list)
         ),
         None,
@@ -1464,9 +1470,9 @@ def _collect_live_github_snapshot(repos=None):
                 else:
                     total_fresh += q_probe["fresh"]
                     total_ghosts += q_probe["ghosts"]
-                    ow = q_probe.get("oldest_fresh_wait_minutes")
-                    if isinstance(ow, (int, float)) and not isinstance(ow, bool) and math.isfinite(ow) and ow >= 0:
-                        oldest_fresh_wait_min = ow if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow)
+                    ow_val = _opt_nonneg_number(q_probe.get("oldest_fresh_wait_minutes"), f"{repo}: oldest_fresh_wait_minutes", errors)
+                    if ow_val is not None:
+                        oldest_fresh_wait_min = ow_val if oldest_fresh_wait_min is None else max(oldest_fresh_wait_min, ow_val)
         except Exception as exc:
             fresh_complete = False
             q_failed_repos.add(repo)
@@ -1680,6 +1686,7 @@ def build_operator_state(*, audit_dir=None, hosts_json=None, cmux_json=None, git
         cmux_err_msg = f"cmux fixture probe failed ({err_detail})"
         fixture_errors.append(cmux_err_msg)
         cmux_fixture_errors.append(cmux_err_msg)
+        cmux_data = {"ok": False, "error": err_detail}
     if (github_json is not None or base is not None) and gh_data is None:
         err = f"github fixture missing or unreadable: {gh_err or gh_path}"
         fixture_errors.append(err)

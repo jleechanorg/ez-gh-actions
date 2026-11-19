@@ -1791,18 +1791,72 @@ class FleetLiveDashboardTest(unittest.TestCase):
             )
             self.assertIn("Fleet + Queue + CI Latency Inspector", out_html.read_text(encoding="utf-8"))
 
-            # --audit-dir cmux {"ok": false} propagates into hosts_partial, fixture_errors, scope_note, gh_errors
+            # --audit-dir & --cmux-json cmux {"ok": false} propagate error into hosts_partial, fixture_errors, scope_note, gh_errors
+            # while strictly ignoring any stale vms or github_reconciliation carried in the failed cmux payload.
+            cmux_err_payload = {
+                "ok": False,
+                "error": "audit cmux unreachable",
+                "vms": [{"name": "ghost-cmux-vm", "slots": [{"slot": 1, "state": "EXECUTING"}]}],
+                "github_reconciliation": {
+                    "in_progress_runs_by_repo": {"evil/repo": 99},
+                    "queued_runs_by_repo": {"evil/repo": 88},
+                    "worldarchitect_queued_breakdown": {"queued_runs_with_jobs": 77, "queued_runs_zero_jobs": 66},
+                },
+            }
             cmux_err_dir = tmp / "audit_cmux_err"
             cmux_err_dir.mkdir(parents=True, exist_ok=True)
             fixture_audit_dir(cmux_err_dir)
             (cmux_err_dir / "cmux_and_github_reconciliation.json").write_text(
-                json.dumps({"ok": False, "error": "audit cmux unreachable"}), encoding="utf-8"
+                json.dumps(cmux_err_payload), encoding="utf-8"
             )
             cmux_err_audit_state = mod.build_operator_state(audit_dir=cmux_err_dir)
             self.assertTrue(cmux_err_audit_state["reconciliation"]["hosts_partial"])
             self.assertIn("audit cmux unreachable", " ".join(cmux_err_audit_state["reconciliation"]["fixture_errors"]))
             self.assertIn("audit cmux unreachable", cmux_err_audit_state["reconciliation"]["scope_note"])
             self.assertIn("audit cmux unreachable", " ".join(cmux_err_audit_state["reconciliation"]["gh_errors"]))
+            self.assertFalse(any(h["id"] == "ghost-cmux-vm" for h in cmux_err_audit_state["hosts"]))
+            self.assertNotEqual(cmux_err_audit_state["reconciliation"]["queued_runs_total"], 88)
+            self.assertNotEqual(cmux_err_audit_state["reconciliation"]["fresh_queued_runs"], 77)
+
+            cmux_err_file = tmp / "cmux_err_with_data.json"
+            cmux_err_file.write_text(json.dumps(cmux_err_payload), encoding="utf-8")
+            cmux_err_explicit = mod.build_operator_state(
+                hosts_json=cmux_err_dir / "ubuntu_mac_slots.json",
+                cmux_json=cmux_err_file,
+                github_json=cmux_err_dir / "github_live_snapshot.json",
+                latency_json=cmux_err_dir / "ci_latency_percentiles.json",
+            )
+            self.assertTrue(cmux_err_explicit["reconciliation"]["hosts_partial"])
+            self.assertIn("audit cmux unreachable", " ".join(cmux_err_explicit["reconciliation"]["fixture_errors"]))
+            self.assertIn("audit cmux unreachable", cmux_err_explicit["reconciliation"]["scope_note"])
+            self.assertIn("audit cmux unreachable", " ".join(cmux_err_explicit["reconciliation"]["gh_errors"]))
+            self.assertFalse(any(h["id"] == "ghost-cmux-vm" for h in cmux_err_explicit["hosts"]))
+            self.assertNotEqual(cmux_err_explicit["reconciliation"]["queued_runs_total"], 88)
+            self.assertNotEqual(cmux_err_explicit["reconciliation"]["fresh_queued_runs"], 77)
+
+            # 10**309 on oldest_fresh_wait_minutes & memory_mb fails closed without OverflowError
+            huge_dir = tmp / "audit_huge_age"
+            huge_dir.mkdir(parents=True, exist_ok=True)
+            fixture_audit_dir(huge_dir)
+            huge_gh = json.loads((huge_dir / "github_live_snapshot.json").read_text(encoding="utf-8"))
+            huge_gh.setdefault("summary", {})["oldest_fresh_wait_minutes"] = 10**309
+            (huge_dir / "github_live_snapshot.json").write_text(json.dumps(huge_gh), encoding="utf-8")
+            huge_cmux = json.loads((huge_dir / "cmux_and_github_reconciliation.json").read_text(encoding="utf-8"))
+            huge_cmux.setdefault("github_reconciliation", {}).setdefault("worldarchitect_queued_breakdown", {})["oldest_fresh_wait_minutes"] = 10**309
+            vm_list = huge_cmux.get("cmux_vms") if "cmux_vms" in huge_cmux else huge_cmux["vms"]
+            vm_list[0]["memory_mb"] = 10**309
+            (huge_dir / "cmux_and_github_reconciliation.json").write_text(json.dumps(huge_cmux), encoding="utf-8")
+            huge_state = mod.build_operator_state(audit_dir=huge_dir)
+            self.assertTrue(huge_state["reconciliation"]["queue_partial"])
+            self.assertIn("numeric value out of range", " ".join(huge_state["reconciliation"]["fixture_errors"]))
+            huge_explicit = mod.build_operator_state(
+                hosts_json=huge_dir / "ubuntu_mac_slots.json",
+                cmux_json=huge_dir / "cmux_and_github_reconciliation.json",
+                github_json=huge_dir / "github_live_snapshot.json",
+                latency_json=huge_dir / "ci_latency_percentiles.json",
+            )
+            self.assertTrue(huge_explicit["reconciliation"]["queue_partial"])
+            self.assertIn("numeric value out of range", " ".join(huge_explicit["reconciliation"]["fixture_errors"]))
 
             # Cold _cached_live_latency failure enforces 300s cooldown without re-probing
             lat_calls = {"n": 0}
