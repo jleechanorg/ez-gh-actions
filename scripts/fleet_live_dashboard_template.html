@@ -296,7 +296,7 @@
 
       const alerts = [];
       if (starvedCount > 0) {
-        alerts.push(`<div class="alert-box"><strong>IDLE-STARVED:</strong> ${esc(starvedCount)} idle slot(s) while ${esc(rec.fresh_queued_runs)} verified fresh run(s) waited >=5m (${esc(rec.oldest_fresh_wait_minutes)}m).</div>`);
+        alerts.push(`<div class="alert-box"><strong>IDLE-STARVED:</strong> ${esc(starvedCount)} eligible idle slot(s) matched queued job(s) waiting &gt;=5m.</div>`);
       }
       if (rec.scope_note) {
         alerts.push(`<div class="alert-box warn"><strong>Fleet Scope:</strong> ${esc(rec.scope_note)}</div>`);

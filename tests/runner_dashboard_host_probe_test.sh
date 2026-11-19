@@ -4,19 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROBE="$ROOT/scripts/runner_dashboard_host_probe.sh"
 WORK="$(mktemp -d)"
-MAC_LOG="/tmp/ezgha-launchd-stdout.log"
-MAC_LOG_BACKUP="$WORK/mac-launchd.log.backup"
-MAC_LOG_EXISTED=0
-if [[ -e "$MAC_LOG" ]]; then
-  cp -p "$MAC_LOG" "$MAC_LOG_BACKUP"
-  MAC_LOG_EXISTED=1
-fi
 cleanup() {
-  if [[ "$MAC_LOG_EXISTED" -eq 1 ]]; then
-    cp -p "$MAC_LOG_BACKUP" "$MAC_LOG"
-  else
-    rm -f "$MAC_LOG"
-  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -187,9 +175,6 @@ for name in ("mac-parked.json", "mac-parked-ezgha-env.json"):
     assert "secret-prefix" not in json.dumps(payload)
 PY
 
-printf '%s\n' \
-  'respawned ephemeral runner secret-prefix-1' \
-  'respawned ephemeral runner secret-prefix-2' > "$MAC_LOG"
 printf '0\n' > "$HOME_T/.local/state/ezgha/watchdog/mac.miss_count"
 printf '5\n' > "$HOME_T/.local/state/ezgha/watchdog/mac.miss_threshold"
 STUB_UNAME=Darwin STUB_ALL_DOWN=1 \

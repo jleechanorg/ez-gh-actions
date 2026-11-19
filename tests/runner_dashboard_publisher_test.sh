@@ -365,4 +365,56 @@ assert doc["sources"]["mac_host"]["ok"] is True
 assert doc["queue"]["ok"] is False, doc["queue"]
 PY
 
+EXIT0_NONLIST_QUEUE="$WORK/exit0_nonlist_queue_probe.sh"
+cat > "$EXIT0_NONLIST_QUEUE" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+printf '{"schema_version":1,"ok":true,"repos":"invalid"}\n' > "$out"
+exit 0
+SH
+chmod +x "$EXIT0_NONLIST_QUEUE"
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$EXIT0_NONLIST_QUEUE" \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/exit0-nonlist-q.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/exit0-nonlist-q-site"
+python3 - "$WORK/exit0-nonlist-q-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+PY
+
+EXIT0_MIXED_QUEUE="$WORK/exit0_mixed_queue_probe.sh"
+cat > "$EXIT0_MIXED_QUEUE" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+printf '{"schema_version":1,"ok":true,"repos":[{"repo":"org/a","ok":true,"fresh":1,"ghosts":0},"bad"]}\n' > "$out"
+exit 0
+SH
+chmod +x "$EXIT0_MIXED_QUEUE"
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$EXIT0_MIXED_QUEUE" \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/exit0-mixed-q.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/exit0-mixed-q-site"
+python3 - "$WORK/exit0-mixed-q-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+PY
+
 echo "runner dashboard publisher tests passed"

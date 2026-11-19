@@ -404,6 +404,41 @@ class OldestFreshWait(unittest.TestCase):
             ],
         )
 
+        # Truncated /jobs listing (total_count > len(jobs)) or queued job without valid labels marks job_details_complete=False
+        def fake_truncated(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 702, "created_at": old_run_created}]}
+            if "status=in_progress" in joined:
+                return 0
+            if "/actions/runs/702/jobs" in joined:
+                return {
+                    "total_count": 150,
+                    "jobs": [{"id": 3, "status": "queued", "created_at": recent_job_created, "labels": ["self-hosted"]}],
+                }
+            raise AssertionError(args)
+
+        def fake_missing_labels(args):
+            joined = " ".join(args)
+            if "status=queued" in joined:
+                return {"total_count": 1, "workflow_runs": [{"id": 703, "created_at": old_run_created}]}
+            if "status=in_progress" in joined:
+                return 0
+            if "/actions/runs/703/jobs" in joined:
+                return {
+                    "total_count": 1,
+                    "jobs": [{"id": 4, "status": "queued", "created_at": recent_job_created}],
+                }
+            raise AssertionError(args)
+
+        for stub in (fake_truncated, fake_missing_labels):
+            queue_probe.gh_json = stub
+            try:
+                sub = queue_probe.probe_repo("org/repo")
+            finally:
+                queue_probe.gh_json = original
+            self.assertFalse(sub["job_details_complete"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -262,13 +262,14 @@ build_site() {
     else
       QUEUE_MAX_REQUESTS=80
     fi
-    if ! timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
+    queue_rc=0
+    timeout "${EZGHA_DASHBOARD_QUEUE_TIMEOUT:-240}" \
         "${QUEUE_PROBE_CMD[@]}" \
         --repo jleechanorg/worldarchitect.ai \
         --repo jleechanorg/worldai_frontend \
         --max-requests "$QUEUE_MAX_REQUESTS" \
-        --output "$WORK_DIR/queue.json"; then
-      if [[ -s "$WORK_DIR/queue.json" ]] && python3 - "$WORK_DIR/queue.json" >/dev/null 2>&1 <<'PY'
+        --output "$WORK_DIR/queue.json" || queue_rc=$?
+    if [[ -s "$WORK_DIR/queue.json" ]] && python3 - "$WORK_DIR/queue.json" >/dev/null 2>&1 <<'PY'
 import json, sys
 from pathlib import Path
 doc = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
@@ -277,12 +278,13 @@ raw = doc.get("queue") if isinstance(doc.get("queue"), dict) else doc
 repos = raw.get("repos")
 assert isinstance(repos, list) and all(isinstance(item, dict) for item in repos)
 PY
-      then
+    then
+      if (( queue_rc != 0 )); then
         echo "queue probe exited non-zero with partial payload; preserving diagnostics" >&2
-      else
-        rm -f "$WORK_DIR/queue.json"
-        echo "queue probe failed; publishing capacity with queue unavailable" >&2
       fi
+    elif [[ -e "$WORK_DIR/queue.json" ]] || (( queue_rc != 0 )); then
+      rm -f "$WORK_DIR/queue.json"
+      echo "queue probe invalid or failed; publishing capacity with queue unavailable" >&2
     fi
   fi
   queue_args=()

@@ -534,6 +534,24 @@ class SnapshotTest(unittest.TestCase):
                     self.assertEqual(parsed_bad_vms["reconciliation"]["available_pools"], 2)
                     self.assertEqual(parsed_bad_vms["reconciliation"]["configured_slots"], 24)
 
+            for q_label, bad_queue in (
+                ("non_list_repos", {"ok": True, "fresh": 1, "ghosts": 0, "repos": "invalid"}),
+                ("mixed_list_repos", {"ok": True, "fresh": 1, "ghosts": 0, "repos": [{"repo": "org/a", "fresh": 1, "ghosts": 0}, "bad"]}),
+            ):
+                with self.subTest(bad_queue=q_label):
+                    bad_q_snap = MODULE.build_snapshot(
+                        mac_payload=json.loads(mac_p.read_text(encoding="utf-8")),
+                        linux_payload=json.loads(linux_p.read_text(encoding="utf-8")),
+                        queue_payload=bad_queue,
+                        observed_at="2026-11-18T09:15:00Z",
+                        published_at="2026-11-18T09:15:05Z",
+                    )
+                    self.assertFalse(bad_q_snap["queue"]["ok"])
+                    self.assertTrue(bad_q_snap["queue"]["partial"])
+                    self.assertEqual(bad_q_snap["queue"]["repos"], [])
+                    self.assertTrue(bad_q_snap["sources"]["linux_host"]["ok"])
+                    self.assertEqual(bad_q_snap["reconciliation"]["configured_slots"], 24)
+
 
 if __name__ == "__main__":
     unittest.main()

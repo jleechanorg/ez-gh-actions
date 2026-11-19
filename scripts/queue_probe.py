@@ -194,20 +194,26 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
     raw_jobs = payload.get("jobs")
     if isinstance(raw_jobs, list):
         queued_jobs = []
+        truncated = count is not None and len(raw_jobs) < count
+        details_valid = not truncated
         for job in raw_jobs:
             if not isinstance(job, dict) or job.get("status") != "queued":
                 continue
-            labels = [
-                lb.strip().lower()
-                for lb in (job.get("labels") or [])
-                if isinstance(lb, str) and lb.strip()
-            ]
+            raw_labels = job.get("labels")
+            labels = (
+                [lb.strip().lower() for lb in raw_labels if isinstance(lb, str) and lb.strip()]
+                if isinstance(raw_labels, list)
+                else []
+            )
+            created_at = job.get("created_at")
+            if not labels or not isinstance(created_at, str) or not created_at.strip():
+                details_valid = False
             queued_jobs.append({
                 "repo": repo,
-                "created_at": job.get("created_at"),
+                "created_at": created_at,
                 "labels": labels,
             })
-        return count, queued_jobs, True
+        return count, queued_jobs, details_valid
     return count, [], False
 
 

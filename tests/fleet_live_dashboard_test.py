@@ -204,13 +204,24 @@ class FleetLiveDashboardTest(unittest.TestCase):
     def setUp(self):
         self._shared_cache_tmp = tempfile.TemporaryDirectory()
         self._orig_shared_cache = os.environ.get("EZGHA_OPERATOR_SHARED_CACHE_PATH")
-        os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"] = str(Path(self._shared_cache_tmp.name) / "shared_cache.json")
+        self._orig_linux_host = os.environ.pop("EZGHA_OPERATOR_LINUX_HOST", None)
+        self._shared_cache_path = Path(self._shared_cache_tmp.name) / "state" / "shared_cache.json"
+        os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"] = str(self._shared_cache_path)
+
+    def _reset_shared_cache(self):
+        for suffix in ("", ".lock", ".probe.lock"):
+            p = self._shared_cache_path if not suffix else self._shared_cache_path.with_suffix(suffix)
+            p.unlink(missing_ok=True)
 
     def tearDown(self):
         if self._orig_shared_cache is None:
             os.environ.pop("EZGHA_OPERATOR_SHARED_CACHE_PATH", None)
         else:
             os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"] = self._orig_shared_cache
+        if self._orig_linux_host is not None:
+            os.environ["EZGHA_OPERATOR_LINUX_HOST"] = self._orig_linux_host
+        else:
+            os.environ.pop("EZGHA_OPERATOR_LINUX_HOST", None)
         self._shared_cache_tmp.cleanup()
 
     def test_build_state_and_render_html_with_clickable_links(self):
@@ -551,6 +562,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 }
             return fake_q_fail(repo)
 
+        self._reset_shared_cache()
         with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
              mock.patch.object(mod.queue_probe, "probe_repo", side_effect=fake_q):
             snap = mod._collect_live_github_snapshot(repos=["org/good", "org/bad"])
@@ -801,6 +813,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     return 1
                 raise AssertionError(args)
 
+            self._reset_shared_cache()
             with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_gh), \
                  mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_gh):
                 gh_snap = mod._collect_live_github_snapshot(repos=[f"org/repo-q-{reported_total}"])
@@ -822,6 +835,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 return {"total_count": 0, "workflow_runs": []}
             raise AssertionError(args)
 
+        self._reset_shared_cache()
         with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_ip_short_runs), \
              mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_ip_short_runs):
             gh_ip_runs = mod._collect_live_github_snapshot(repos=["org/repo-ip-runs"])
@@ -841,6 +855,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 return {"total_count": 0, "workflow_runs": []}
             raise AssertionError(args)
 
+        self._reset_shared_cache()
         with mock.patch.object(mod.ci_latency_probe, "gh_json", side_effect=fake_ip_short_jobs), \
              mock.patch.object(mod.queue_probe, "gh_json", side_effect=fake_ip_short_jobs):
             gh_ip_jobs = mod._collect_live_github_snapshot(repos=["org/repo-ip-jobs"])
@@ -1665,7 +1680,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 "hosts": {
                     "jeff-ubuntu": {
                         "configured_slots": 1,
-                        "scope": "org",
+                        "scope": "org:org",
                         "labels": ["self-hosted", "linux", "x64"],
                         "slots": [{"slot": 1, "name": "ez-runner-c-1", "state": "IDLE"}],
                     },
@@ -1714,12 +1729,19 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertEqual(live_natives[2]["scope"], "repo:org/bom-repo")
 
             old_job = {"repo": "org/app", "age_minutes": 6.0, "labels": ["self-hosted", "linux"]}
+            cross_org_job = {"repo": "other-org/app", "age_minutes": 15.0, "labels": ["self-hosted", "linux"]}
+            missing_labels_job = {"repo": "org/app", "age_minutes": 15.0}
+            malformed_labels_job = {"repo": "org/app", "age_minutes": 15.0, "labels": "self-hosted"}
             young_job = {"repo": "org/app", "age_minutes": 4.9, "labels": ["self-hosted", "linux"]}
             incompatible_os_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["ubuntu-latest"]}
             incompatible_label_job = {"repo": "org/app", "age_minutes": 15.0, "labels": ["self-hosted", "gpu"]}
             for gh_summary, expect_starved in (
                 ({"fresh_queued_runs": 0, "inert_ghosts": 2, "oldest_fresh_wait_minutes": 10, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": []}, False),
                 ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": []}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [cross_org_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [missing_labels_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [malformed_labels_job]}, False),
+                ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "job_details_complete": False, "queued_jobs": [old_job]}, False),
                 ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 33.4, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [young_job]}, False),
                 ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [incompatible_os_job]}, False),
                 ({"fresh_queued_runs": 2, "inert_ghosts": 0, "oldest_fresh_wait_minutes": 15.0, "q_partial": False, "q_unverified_runs": 0, "queued_jobs": [incompatible_label_job]}, False),
@@ -1750,14 +1772,15 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     self.assertEqual(st["reconciliation"]["state_counts"]["IDLE-STARVED"], 0)
                     self.assertFalse(st["reconciliation"]["idle_starved"])
 
-            # Repo-scoped managed slot stays IDLE on queued jobs for another repo, and missing scope/labels stays IDLE
+            # Repo-scoped managed slot stays IDLE on queued jobs for another repo, and missing/bare scope/labels stays IDLE
             scoped_hosts = {
                 "hosts": {
                     "scoped-host": {
-                        "configured_slots": 2,
+                        "configured_slots": 3,
                         "slots": [
                             {"slot": 1, "name": "scoped-1", "state": "IDLE", "scope": "repo:org/allowed", "labels": ["self-hosted", "linux"]},
                             {"slot": 2, "name": "unscoped-2", "state": "IDLE", "labels": ["self-hosted", "linux"]},
+                            {"slot": 3, "name": "bare-org-3", "state": "IDLE", "scope": "org", "labels": ["self-hosted", "linux"]},
                         ],
                     }
                 }
@@ -1769,7 +1792,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 {"summary": {"q_partial": False, "q_unverified_runs": 0, "queued_jobs": [{"repo": "org/other", "age_minutes": 12.0, "labels": ["self-hosted", "linux"]}]}},
             )
             self.assertEqual(rec_scoped["state_counts"]["IDLE-STARVED"], 0)
-            self.assertEqual([s["state"] for s in norm_scoped[0]["slots"]], ["IDLE", "IDLE"])
+            self.assertEqual([s["state"] for s in norm_scoped[0]["slots"]], ["IDLE", "IDLE", "IDLE"])
 
             # Live native runner with unknown/omitted scope must NEVER become IDLE-STARVED when normalized
             hosts_live_native = {"hosts": {"mac": {"parked": True, "configured_container_slots": 0, "container_slots": [], "native_runners": live_natives}}}
@@ -1793,7 +1816,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
             parsed_cfg = mod._read_local_ezgha_config(toml_cfg)
             self.assertEqual(parsed_cfg["count"], 20)
             self.assertEqual(parsed_cfg["min_free_disk_gb"], 30)
-            self.assertEqual(parsed_cfg["scope"], "org")
+            self.assertEqual(parsed_cfg["scope"], "org:jleechanorg")
             self.assertEqual(parsed_cfg["labels"], ["self-hosted", "linux", "x64"])
 
             # Live-mode refresh failures respect cache_ttl_s cooldown without hammering GitHub
@@ -1911,11 +1934,12 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertIn("oldest_fresh_wait_minutes: numeric value out of range", " ".join(huge_explicit["reconciliation"]["fixture_errors"]))
 
             # Huge/negative elapsed_minutes in slot fails closed cleanly instead of rendering Infinitym
-            self.assertIsNone(
-                mod._safe_enrich_slot({"name": "s1", "state": "EXECUTING", "elapsed_minutes": 10**309}, {}, {}, label="slot-elapsed", errors=[])
-            )
+            for bad_elapsed in (10**309, -5.0):
+                self.assertIsNone(
+                    mod._safe_enrich_slot({"name": "s1", "state": "EXECUTING", "elapsed_minutes": bad_elapsed}, {}, {}, label="slot-elapsed", errors=[])
+                )
 
-            # Cold _cached_live_latency failure enforces 300s cooldown without re-probing
+            # Cold _cached_live_latency failure enforces 300s cooldown without re-probing (180s still throttled, 301s retries)
             lat_calls = {"n": 0}
             clock = {"now": 100.0}
 
@@ -1929,7 +1953,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 r1 = mod._cached_live_latency(["org/repo"])
                 self.assertFalse(r1["ok"])
                 self.assertEqual(lat_calls["n"], 1)
-                clock["now"] = 220.0
+                clock["now"] = 280.0
                 r2 = mod._cached_live_latency(["org/repo"])
                 self.assertFalse(r2["ok"])
                 self.assertEqual(lat_calls["n"], 1)
@@ -1938,10 +1962,12 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 self.assertFalse(r3["ok"])
                 self.assertEqual(lat_calls["n"], 2)
 
-            # Daemon Docker endpoint resolution overrides conflicting shell DOCKER_HOST / DOCKER_CONTEXT
+            # Daemon Docker endpoint resolution overrides conflicting shell DOCKER_HOST / DOCKER_CONTEXT and never inherits them on None
             import plistlib
             mac_plist = tmp / "org.jleechanorg.ezgha.plist"
             mac_plist.write_bytes(plistlib.dumps({"EnvironmentVariables": {"DOCKER_HOST": "unix:///daemon/mac.sock"}}))
+            mac_plist_no_dh = tmp / "org.jleechanorg.ezgha.nodh.plist"
+            mac_plist_no_dh.write_bytes(plistlib.dumps({"EnvironmentVariables": {"HOME": "/tmp"}}))
             seen_envs = []
 
             def fake_daemon_docker(cmd, **kwargs):
@@ -1959,13 +1985,24 @@ class FleetLiveDashboardTest(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"DOCKER_HOST": "unix:///wrong/shell.sock", "DOCKER_CONTEXT": "wrong-ctx"}):
                 mac_probed = mod._probe_docker_host_core(
-                    is_mac=True, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org", "labels": ["macos"]},
+                    is_mac=True, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org:org", "labels": ["macos"]},
                     service_status="active", run_fn=fake_daemon_docker, plist_path=mac_plist,
                     disk_usage_fn=lambda _: SimpleNamespace(free=50 * 1024**3, used=10 * 1024**3, total=60 * 1024**3),
                     loadavg_fn=lambda: (1.0, 1.0, 1.0),
                 )
                 self.assertEqual(mac_probed["slots"][0]["state"], "EXECUTING")
                 self.assertEqual(seen_envs[0][1].get("DOCKER_HOST"), "unix:///daemon/mac.sock")
+                self.assertNotIn("DOCKER_CONTEXT", seen_envs[0][1])
+
+                seen_envs.clear()
+                mac_probed_nodh = mod._probe_docker_host_core(
+                    is_mac=True, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org:org", "labels": ["macos"]},
+                    service_status="active", run_fn=fake_daemon_docker, plist_path=mac_plist_no_dh,
+                    disk_usage_fn=lambda _: SimpleNamespace(free=50 * 1024**3, used=10 * 1024**3, total=60 * 1024**3),
+                    loadavg_fn=lambda: (1.0, 1.0, 1.0),
+                )
+                self.assertEqual(mac_probed_nodh["slots"][0]["state"], "EXECUTING")
+                self.assertNotIn("DOCKER_HOST", seen_envs[0][1])
                 self.assertNotIn("DOCKER_CONTEXT", seen_envs[0][1])
 
                 seen_linux_envs = []
@@ -1975,7 +2012,7 @@ class FleetLiveDashboardTest(unittest.TestCase):
                     return fake_daemon_docker(cmd, **kwargs)
 
                 lin_probed = mod._probe_docker_host_core(
-                    is_mac=False, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org", "labels": ["linux"]},
+                    is_mac=False, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org:org", "labels": ["linux"]},
                     service_status="active", run_fn=fake_linux_docker,
                     disk_usage_fn=lambda _: SimpleNamespace(free=50 * 1024**3, used=10 * 1024**3, total=60 * 1024**3),
                     loadavg_fn=lambda: (1.0, 1.0, 1.0),
@@ -1984,13 +2021,111 @@ class FleetLiveDashboardTest(unittest.TestCase):
                 self.assertEqual(seen_linux_envs[0].get("DOCKER_HOST"), "unix:///daemon/linux.sock")
                 self.assertNotIn("DOCKER_CONTEXT", seen_linux_envs[0])
 
-            # Concurrent two-server shared live cache enforces single token probe across servers
+                seen_linux_envs.clear()
+                def fake_linux_fail_systemctl(cmd, **kwargs):
+                    if cmd[:3] == ["systemctl", "--user", "show"]:
+                        return SimpleNamespace(returncode=1, stdout="", stderr="dbus down")
+                    if cmd[:2] in (["docker", "ps"], ["docker", "top"]):
+                        seen_linux_envs.append(dict(kwargs.get("env") or {}))
+                    return fake_daemon_docker(cmd, **kwargs)
+
+                lin_fail_probed = mod._probe_docker_host_core(
+                    is_mac=False, cfg={"count": 1, "name_prefix": "ez-mac-runner-h", "min_free_disk_gb": 10, "scope": "org:org", "labels": ["linux"]},
+                    service_status="inactive", run_fn=fake_linux_fail_systemctl,
+                    disk_usage_fn=lambda _: SimpleNamespace(free=50 * 1024**3, used=10 * 1024**3, total=60 * 1024**3),
+                    loadavg_fn=lambda: (1.0, 1.0, 1.0),
+                )
+                self.assertEqual(lin_fail_probed["slots"][0]["state"], "EXECUTING")
+                self.assertEqual(seen_linux_envs[0].get("DOCKER_HOST"), "unix:///var/run/docker.sock")
+                self.assertNotIn("DOCKER_CONTEXT", seen_linux_envs[0])
+
+                # SSH _REMOTE_PROBE_PY with loaded systemd unit & no DOCKER_HOST_OVERRIDE falls back to unix:///var/run/docker.sock
+                ssh_bin = tmp / "ssh_probe_bin"
+                ssh_bin.mkdir()
+                (ssh_bin / "systemctl").write_text(
+                    "#!/usr/bin/env python3\nimport sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if 'LoadState' in args:\n    print('loaded')\n"
+                    "elif 'Environment' in args:\n    print('FOO=bar')\n"
+                    "else:\n    print('active')\n",
+                    encoding="utf-8",
+                )
+                (ssh_bin / "docker").write_text(
+                    "#!/usr/bin/env python3\nimport json, os, sys\n"
+                    "if os.environ.get('DOCKER_HOST') != 'unix:///var/run/docker.sock' or 'DOCKER_CONTEXT' in os.environ:\n"
+                    "    sys.exit(99)\n"
+                    "if sys.argv[1] == 'ps':\n    print('ez-runner-c-1\\tUp 2 minutes')\n"
+                    "elif sys.argv[1] == 'top':\n    print('PID ELAPSED COMMAND ARGS\\n101 120 Runner.Worker Runner.Worker')\n",
+                    encoding="utf-8",
+                )
+                (ssh_bin / "systemctl").chmod(0o755)
+                (ssh_bin / "docker").chmod(0o755)
+                ssh_script = mod._REMOTE_PROBE_PY.replace(
+                    "print(json.dumps(_probe_docker_host_core(is_mac=False)))",
+                    "print(json.dumps(_probe_docker_host_core(is_mac=False, disk_usage_fn=lambda _p: type('U', (), {'total': 200*(1024**3), 'used': 120*(1024**3), 'free': 80*(1024**3)})(), loadavg_fn=lambda: (1.0, 1.0, 1.0))))",
+                )
+                ssh_env = dict(os.environ, HOME=str(tmp), PATH=f"{ssh_bin}:{os.environ.get('PATH', '')}", DOCKER_HOST="unix:///wrong/ssh.sock", DOCKER_CONTEXT="bad")
+                ssh_proc = subprocess.run(["python3", "-c", ssh_script], capture_output=True, text=True, check=True, env=ssh_env)
+                ssh_payload = json.loads(ssh_proc.stdout)
+                self.assertEqual(ssh_payload["slots"][0]["state"], "EXECUTING")
+
+            # Cross-process simultaneous cold requests serialize via flock (single probe) + private 0o700/0o600 cache + second --repo blocked within cooldown
+            self._reset_shared_cache()
+            race_bin = tmp / "race_gh_bin"
+            race_bin.mkdir()
+            gh_call_log = tmp / "gh_calls.log"
+            (race_bin / "gh").write_text(
+                "#!/usr/bin/env python3\nimport json, sys, time\n"
+                f"with open({str(gh_call_log)!r}, 'a', encoding='utf-8') as f:\n    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+                "time.sleep(0.05)\n"
+                "joined = ' '.join(sys.argv[1:])\n"
+                "if 'status=in_progress' in joined and 'per_page=1' in joined:\n    print('0')\n"
+                "elif 'status=in_progress' in joined:\n    print(json.dumps({'total_count': 0, 'workflow_runs': []}))\n"
+                "elif 'status=queued' in joined:\n    print(json.dumps({'total_count': 0, 'workflow_runs': []}))\n"
+                "else:\n    print(json.dumps({'total_count': 0, 'workflow_runs': []}))\n",
+                encoding="utf-8",
+            )
+            (race_bin / "gh").chmod(0o755)
+            race_worker = (
+                "import json, os, sys, time\n"
+                f"sys.path.insert(0, {str(MODULE_PATH.parent)!r})\n"
+                "import fleet_live_dashboard as mod\n"
+                "go = os.environ['RACE_GO_FILE']\n"
+                "open(os.environ['RACE_READY_FILE'], 'w').close()\n"
+                "while not os.path.exists(go): time.sleep(0.01)\n"
+                "gh = mod._collect_live_github_snapshot(repos=['org/race-a'])\n"
+                "lat = mod._cached_live_latency(['org/race-a'])\n"
+                "print(json.dumps({'gh_err': gh['errors'], 'lat_ok': lat['ok']}))\n"
+            )
+            ready1, ready2, go_file = tmp / "r1", tmp / "r2", tmp / "go"
+            race_path = f"{race_bin}:{os.path.expanduser('~/.local/bin')}:{os.environ.get('PATH', '')}"
+            race_env_base = dict(os.environ, PATH=race_path, RACE_GO_FILE=str(go_file), GH_TOKEN="dummy-token")
+            p1 = subprocess.Popen(["python3", "-c", race_worker], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={**race_env_base, "RACE_READY_FILE": str(ready1)})
+            p2 = subprocess.Popen(["python3", "-c", race_worker], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env={**race_env_base, "RACE_READY_FILE": str(ready2)})
+            import time as py_time
+            deadline = py_time.monotonic() + 5.0
+            while not (ready1.exists() and ready2.exists()) and py_time.monotonic() < deadline:
+                py_time.sleep(0.01)
+            go_file.write_text("go", encoding="utf-8")
+            o1, e1 = p1.communicate(timeout=15)
+            o2, e2 = p2.communicate(timeout=15)
+            self.assertEqual(p1.returncode, 0, msg=e1)
+            self.assertEqual(p2.returncode, 0, msg=e2)
+            gh_lines = [ln for ln in gh_call_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            # Exactly 1 process probed GitHub+latency (3 queue/ip gh calls + 1 latency run-list gh call = 4 total, NOT 8!)
+            self.assertEqual(len(gh_lines), 4, msg=gh_lines)
+            cache_file = Path(os.environ["EZGHA_OPERATOR_SHARED_CACHE_PATH"])
+            self.assertEqual(cache_file.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(cache_file.stat().st_mode & 0o777, 0o600)
+
+            # Concurrent two-server threads (simultaneous barrier) + second --repo scope within global cooldown share single ceiling
+            self._reset_shared_cache()
             gh_shared_calls = {"n": 0}
             lat_shared_calls = {"n": 0}
             def fake_shared_gh(args, timeout=20):
                 gh_shared_calls["n"] += 1
                 joined = " ".join(args)
-                if "status=in_progress" in joined:
+                if "status=in_progress" in joined and "per_page=50" in joined:
                     return {"total_count": 0, "workflow_runs": []}
                 if "status=queued" in joined:
                     return {"total_count": 0, "workflow_runs": []}
@@ -2007,23 +2142,39 @@ class FleetLiveDashboardTest(unittest.TestCase):
                  mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=fake_shared_lat):
                 srv1 = mod.create_server(port=0, repos=["org/shared-a"])
                 srv2 = mod.create_server(port=0, repos=["org/shared-a"])
+                srv3_diff = mod.create_server(port=0, repos=["org/shared-b"])
                 t1 = threading.Thread(target=srv1.serve_forever, daemon=True)
                 t2 = threading.Thread(target=srv2.serve_forever, daemon=True)
-                t1.start(); t2.start()
+                t3 = threading.Thread(target=srv3_diff.serve_forever, daemon=True)
+                t1.start(); t2.start(); t3.start()
                 try:
-                    p1, p2 = srv1.server_address[1], srv2.server_address[1]
-                    b1 = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p1}/api/state", timeout=5).read().decode("utf-8"))
-                    calls_after_srv1 = gh_shared_calls["n"]
+                    p1_port, p2_port, p3_port = srv1.server_address[1], srv2.server_address[1], srv3_diff.server_address[1]
+                    barrier = threading.Barrier(2)
+                    results_box = {}
+                    def hit_srv(idx, port_num):
+                        barrier.wait(timeout=5)
+                        results_box[idx] = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port_num}/api/state", timeout=10).read().decode("utf-8"))
+                    c1 = threading.Thread(target=hit_srv, args=(1, p1_port))
+                    c2 = threading.Thread(target=hit_srv, args=(2, p2_port))
+                    c1.start(); c2.start()
+                    c1.join(timeout=10); c2.join(timeout=10)
+                    self.assertEqual(results_box[1]["source_mode"], "LIVE PROBE")
+                    self.assertEqual(results_box[2]["source_mode"], "LIVE PROBE")
+                    self.assertEqual(gh_shared_calls["n"], 3)
+                    self.assertEqual(lat_shared_calls["n"], 1)
+
+                    # Second --repo scope within global cooldown is blocked without calling GitHub or latency probes
                     mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "wall_ts": 0.0, "data": None, "error": None})
-                    b2 = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p2}/api/state", timeout=5).read().decode("utf-8"))
-                    self.assertEqual(b1["source_mode"], "LIVE PROBE")
-                    self.assertEqual(b2["source_mode"], "LIVE PROBE")
-                    self.assertEqual(calls_after_srv1, 3)
-                    self.assertEqual(gh_shared_calls["n"], calls_after_srv1)
+                    b3 = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{p3_port}/api/state", timeout=10).read().decode("utf-8"))
+                    self.assertIn("cooldown active", " ".join(b3["reconciliation"]["gh_errors"]))
+                    self.assertFalse(b3["latency"]["ok"])
+                    self.assertIn("cooldown active", b3["latency"]["error"])
+                    self.assertEqual(gh_shared_calls["n"], 3)
                     self.assertEqual(lat_shared_calls["n"], 1)
                 finally:
                     srv1.shutdown(); srv1.server_close()
                     srv2.shutdown(); srv2.server_close()
+                    srv3_diff.shutdown(); srv3_diff.server_close()
 
             # Warm refresh failure sets last_refresh_error / stale_refresh_error on /api/state instead of hiding failure
             warm_calls = {"n": 0}

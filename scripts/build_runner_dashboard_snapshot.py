@@ -241,9 +241,18 @@ def _public_queue(payload, repo_map):
 
     repos = []
     raw_repos = raw.get("repos")
+    if raw_repos is not None and (not isinstance(raw_repos, list) or any(not isinstance(entry, dict) for entry in raw_repos)):
+        return {
+            "ok": False,
+            "partial": True,
+            "unverified_runs": num("unverified_runs"),
+            "fresh": None,
+            "ghosts": None,
+            "oldest_fresh_wait_minutes": None,
+            "in_progress_runs": num("in_progress_runs"),
+            "repos": [],
+        }
     for entry in (raw_repos if isinstance(raw_repos, list) else []):
-        if not isinstance(entry, dict):
-            continue
         repos.append({
             "repo": _anon_label(entry.get("repo"), repo_map, "repo"),
             "fresh": num_in(entry, "fresh"),
