@@ -10,7 +10,12 @@ target = "jleechanorg"
 
 [runner]
 labels = ["self-hosted", "self-hosted-mikey", "ezgha", "macOS", "ARM64"]
-count = 4
+# DISABLED 2026-11-18: Mac docker fleet suspended by operator instruction - the four
+# runner containers were consuming ~200% CPU on the host (Colima VM at 233%, load avg 546,
+# 20k threads) while competing with active cmux agent lanes. Suspension record: bead
+# jleechan-hxz0 (the DISABLED-not-DOWN declaration) - set count = 4 and re-declare with
+# EZGHA_SUSPENSION_RECORD to restore. Do NOT infer this opt-out from live docker state.
+count = 0
 image = "ezgha-runner:latest"
 name_prefix = "ez-mac-runner-h"
 guest_reserve_mb = 2048
@@ -34,6 +39,17 @@ guest_reserve_mb = 2048
 # "configured" while doing nothing. Use a subdirectory of ~/.cache, not an
 # arbitrary path like ~/.ezgha/wheelhouse.
 # wheelhouse_host_path = "/Users/jleechan/.cache/ezgha-wheelhouse"
+
+# Opt-in host-side bare git mirrors: mounted read-only into every runner
+# container at /opt/ezgha-git-mirrors with EZGHA_GIT_MIRRORS pointed at it,
+# so shallow git fetches hydrate objects locally instead of downloading full
+# packfiles over the network every job (fail-open if absent). Warmed on a
+# schedule by scripts/refresh_runner_caches.sh (org.jleechanorg.ezgha-cache-warm).
+#
+# CRITICAL on Colima/Mac: same virtiofs-allowlist requirement as
+# wheelhouse_host_path above -- use a subdirectory of ~/.cache, not an
+# arbitrary path.
+# git_mirror_host_path = "/Users/jleechan/.cache/ezgha-git-mirrors"
 
 # Opt-in per-runner job workspace (bead jleechan-93cf): mounted read-write
 # into each container at /home/runner/_work (the actions/runner default

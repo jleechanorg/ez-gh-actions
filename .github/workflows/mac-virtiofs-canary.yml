@@ -53,6 +53,7 @@ on:
       - "Dockerfile.runner"
       - "docker/**"
       - "tests/workspace_mount_symlink_extraction_test.sh"
+      - "tests/runner_cache_hydration_test.sh"
       - ".github/workflows/mac-virtiofs-canary.yml"
   workflow_dispatch:
 
@@ -91,23 +92,26 @@ jobs:
             echo "nested docker daemon: UNREACHABLE (script will SKIP -- known gap, see workflow header comment)"
           fi
 
-      - name: Run virtiofs symlink-extraction regression test
+      - name: Run virtiofs symlink-extraction and cache-hydration regression tests
         id: virtiofs_test
         run: |
           # Explicit -e so a nonzero test exit fails this step even if the
           # runner's default shell flags ever change; the trailing echo must
           # never mask a real failure.
           set -eo pipefail
-          bash tests/workspace_mount_symlink_extraction_test.sh 2>&1 | tee /tmp/virtiofs-canary.log
+          {
+            bash tests/workspace_mount_symlink_extraction_test.sh
+            bash tests/runner_cache_hydration_test.sh
+          } 2>&1 | tee /tmp/virtiofs-canary.log
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       - name: Flag a non-executing SKIP loudly (do not let it hide silently)
         if: always()
         run: |
-          if grep -q '^SKIP:' /tmp/virtiofs-canary.log; then
-            echo "::warning::workspace_mount_symlink_extraction_test.sh SKIPped (no nested docker daemon in this runner container) -- this run did NOT exercise the virtiofs symlink-corruption assertions. See the workflow file header for the tracked follow-up."
-          elif grep -q '\[FAIL\]' /tmp/virtiofs-canary.log; then
-            echo "::error::workspace_mount_symlink_extraction_test.sh reported one or more [FAIL] assertions -- see the job log above."
+          if grep -qE '^FAIL:|\[FAIL\]' /tmp/virtiofs-canary.log; then
+            echo "::error::virtiofs/hydration regression test(s) reported one or more [FAIL] assertions -- see the job log above."
+          elif grep -q '^SKIP:' /tmp/virtiofs-canary.log; then
+            echo "::warning::regression test(s) SKIPped (no nested docker daemon in this runner container) -- this run did NOT exercise the virtiofs/hydration assertions. See the workflow file header for the tracked follow-up."
           else
-            echo "workspace_mount_symlink_extraction_test.sh ran its real assertions (no SKIP) -- see [OK]/[FAIL] counts above."
+            echo "virtiofs/hydration regression tests ran their real assertions (no SKIP) -- see [OK]/[FAIL] counts above."
           fi

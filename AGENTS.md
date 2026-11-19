@@ -5,6 +5,8 @@
 
 ## Fleet capacity standard — no excuses, prove per-slot execution
 The fleet MUST run its full configured capacity: **20 Linux** (ez-runner-c-1..20 on jeff-ubuntu) + **4 Mac** (ez-mac-runner-h-1..4) = **24 runners**, and **EVERY one must be proven EXECUTING a real GitHub Actions job** — a `Runner.Worker` process, verified via `docker top <container>`. Anything less than 24/24 executing is **BROKEN**: root-cause and fix it. Do NOT explain a shortfall away as "churn", "normal ephemeral cycling", "counting artifacts", or "the API is just lying". Assume the capacity SHOULD be full and PROVE it per-slot.
+
+> **Mac docker fleet is DISABLED as of 2026-11-18** — `count = 0` in the live `~/.config`-side config and in `config/config.toml.mac.example`. The contract above therefore reads **20 Linux / 20 total** until it is restored; a 20/20 Linux fleet is the correct full state, not a Mac shortfall. Reason: the four containers held ~200% CPU on the host (Colima VM at 233%, load avg 546, 20k threads) and starved the active cmux agent lanes. Declare it with `MAC_RUNNER_DISABLED=1 ./doctor-runner` and `EZGHA_SUSPENSION_RECORD=jleechan-hxz0` so the parked leg prints as intentionally DISABLED rather than a host outage. To restore: set `count = 4` in both files, re-enable the `org.jleechanorg.ezgha` launchd job, and start Colima. Never infer this opt-out from live docker state.
 - **The GitHub API CANNOT be trusted for fleet state.** Under the secondary rate limit it returned TRUNCATED/partial data — during the prior 22-runner contract, the same fleet was reported as 7 / 11 / 16 / 19 / 22 across calls minutes apart. Use LOCAL `docker top` / `docker ps` for `Runner.Worker`-per-slot as the source of truth, never API counts.
 - **`./doctor-runner` is authoritative** (`./doctor.sh` is LEGACY/BROKEN on docker 27+ — see bead ez-gh-actions-91r — kept only as a back-reference). It enforces per-slot activity truth with a 4-state model: EXECUTING (job+repo+run URL+elapsed evidence) / IDLE-OK (nothing queued, or queued for less than `IDLE_STARVED_THRESHOLD_MIN`=5min — healthy) / IDLE-STARVED (queued >=5min — defect) / DOWN (no container — defect). A busy fleet must never measure as dead — the motivating defect this replaced was a tail-grep on "Listening for Jobs" that read a fully-busy fleet as 0/16 healthy. Run it; fix any DOWN or IDLE-STARVED slot before declaring the fleet healthy.
 - **A deliberately parked platform is DISABLED, not DOWN** (bead jleechan-hxz0). One leg can be intentionally suspended (e.g. the Mac fleet is off while work runs on Linux + cmux Cloud). That is a decision, not an outage, and the two must never render the same way — otherwise a healthy 20/20 Linux fleet reads RED forever and nothing can tell a deliberate suspension from a crashed host. Declare it explicitly: `MAC_RUNNER_DISABLED=1 ./doctor-runner` (from a Linux/macOS doctor) or `REMOTE_LINUX_DISABLED=1` (from a macOS doctor). The opted-out leg prints `intentionally DISABLED (operator opt-out)`, contributes 0 slots to the contract, and adds 0 criticals. It is **never** inferred from live launchd/docker state — a daemon that died on its own also reads as "not running" — so an unset opt-out keeps today's fail-closed behavior. Record each suspension with its start date and restore condition in the bead or roadmap note that owns it, so the opt-out cannot quietly become a permanent capacity reduction. Name that record when you declare the opt-out (`EZGHA_SUSPENSION_RECORD=<bead-id>`); `./doctor-runner` prints the pointer on every parked run and **warns when it is missing** (`EZGHA_SUSPENSION_RECORD=none`), because the Mac leg sat parked from 2026-10-29 with no written record anywhere until a 2026-11-07 audit found it.
@@ -150,6 +152,20 @@ lock. Tracked by bead jleechan-9p0g.
 - **Ownership-marker refusal:** keep the failure closed. Manually inspect who
   owns the configured Pages branch and resolve that ownership before retrying;
   never auto-create the marker, delete existing content, or overwrite the branch.
+
+### Runner cache warmer & read-only mirror/wheelhouse recovery
+- **Low-disk `reap_only` pruning:** when free disk drops below
+  `limits.min_free_disk_gb + 5` GiB, the scheduled warmer
+  (`ezgha-cache-warm.timer` on Linux / `org.jleechanorg.ezgha-cache-warm` on
+  macOS) automatically skips new git mirror clones and wheel downloads while
+  still reaping expired retired mirror generations and pruning older `.whl`
+  versions (`EZGHA_WHEELHOUSE_KEEP_VERSIONS`, default `2`).
+- **Stale or missing warmer unit:** inspect
+  `~/.local/state/ezgha/cache-warm-launchd.log` (macOS) or the
+  `ezgha-cache-warm.service` user journal (Linux). Reinstall or trigger a warm
+  pass via `OPERATOR-ONLY: bash launchd/install-launchagents.sh install org.jleechanorg.ezgha-cache-warm`
+  on macOS or `OPERATOR-ONLY: systemctl --user restart ezgha-cache-warm.service`
+  on Linux. Containers mount both caches read-only and fail open when absent.
 
 ## /doctor-ezactions command
 Running `/doctor-ezactions` in this repo executes (bare `/doctor` is a deprecated alias):
