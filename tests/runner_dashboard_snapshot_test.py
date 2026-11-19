@@ -553,6 +553,30 @@ class SnapshotTest(unittest.TestCase):
                     self.assertTrue(bad_q_snap["sources"]["linux_host"]["ok"])
                     self.assertEqual(bad_q_snap["reconciliation"]["configured_slots"], 24)
 
+            # Parked mac with PR #240 count=0 is valid; unparked mac with count=0 is invalid.
+            mac_zero_parked = json.loads(mac_p.read_text(encoding="utf-8"))
+            mac_zero_parked.update({"parked": True, "parked_slots": 0, "slots": []})
+            mac_zero_parked["fleet"] = {"configured": 0, "executing": 0, "idle": 0, "cycling": 0, "down": 0, "reserved": 0}
+            snap_zero_parked = MODULE.build_snapshot(
+                mac_payload=mac_zero_parked,
+                linux_payload=json.loads(linux_p.read_text(encoding="utf-8")),
+                observed_at="2026-11-18T09:15:00Z",
+                published_at="2026-11-18T09:15:05Z",
+            )
+            self.assertTrue(snap_zero_parked["sources"]["mac_host"]["ok"])
+            self.assertTrue(snap_zero_parked["fleets"]["mac"]["parked"])
+            self.assertEqual(snap_zero_parked["fleets"]["mac"]["fleet"]["configured"], 0)
+
+            mac_zero_unparked = json.loads(json.dumps(mac_zero_parked))
+            mac_zero_unparked["parked"] = False
+            snap_zero_unparked = MODULE.build_snapshot(
+                mac_payload=mac_zero_unparked,
+                linux_payload=json.loads(linux_p.read_text(encoding="utf-8")),
+                observed_at="2026-11-18T09:15:00Z",
+                published_at="2026-11-18T09:15:05Z",
+            )
+            self.assertFalse(snap_zero_unparked["sources"]["mac_host"]["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -296,6 +296,18 @@ if not isinstance(repos, list) or not all(isinstance(item, dict) for item in rep
 PY
     then
       if (( queue_rc != 0 )); then
+        python3 - "$WORK_DIR/queue.json" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+doc = json.loads(p.read_text(encoding="utf-8"))
+doc["ok"] = False
+doc["partial"] = True
+if isinstance(doc.get("queue"), dict):
+    doc["queue"]["ok"] = False
+    doc["queue"]["partial"] = True
+p.write_text(json.dumps(doc), encoding="utf-8")
+PY
         echo "queue probe exited non-zero with partial payload; preserving diagnostics" >&2
       fi
     elif [[ -e "$WORK_DIR/queue.json" ]] || (( queue_rc != 0 )); then

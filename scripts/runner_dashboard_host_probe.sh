@@ -43,7 +43,7 @@ STATE_STALE_SECONDS="${EZGHA_WATCHDOG_STATE_STALE_SECONDS:-480}"
 RESPAWN_EVIDENCE_WINDOW_MIN="${EZGHA_DASHBOARD_RESPAWN_WINDOW_MIN:-3}"
 
 read_config() {
-  python3 - "$CONFIG_FILE" <<'PY'
+  python3 - "$CONFIG_FILE" "${1:-0}" <<'PY'
 import sys
 try:
     import tomllib
@@ -53,7 +53,9 @@ try:
     prefix = config["runner"]["name_prefix"]
     image = config["runner"]["image"]
     disk_floor = config["limits"]["min_free_disk_gb"]
-    if type(count) is not int or count <= 0:
+    allow_zero = len(sys.argv) > 2 and sys.argv[2] == "1"
+    min_count = 0 if allow_zero else 1
+    if type(count) is not int or count < min_count:
         raise ValueError("invalid runner.count")
     if not isinstance(prefix, str) or not prefix:
         raise ValueError("invalid runner.name_prefix")
@@ -180,18 +182,6 @@ recent_respawn_evidence() {
   grep -q "respawned ephemeral runner $name$" <<<"$logs"
 }
 
-CONFIG_OK=false
-TARGET=""
-PREFIX=""
-DISK_FLOOR_GB=""
-config_output="$(read_config 2>/dev/null || true)"
-if [[ "$(printf '%s\n' "$config_output" | awk 'NF { count++ } END { print count + 0 }')" -eq 3 ]]; then
-  TARGET="$(printf '%s\n' "$config_output" | sed -n '1p')"
-  PREFIX="$(printf '%s\n' "$config_output" | sed -n '2p')"
-  DISK_FLOOR_GB="$(printf '%s\n' "$config_output" | sed -n '3p')"
-  CONFIG_OK=true
-fi
-
 PARKED=false
 PARKED_REASON=""
 PARKED_SLOTS=0
@@ -201,6 +191,23 @@ elif [[ "$HOST_CLASS" == "mac" && ( "${MAC_RUNNER_DISABLED:-0}" == "1" || "${EZG
   PARKED=true
 elif [[ "$HOST_CLASS" == "linux" && "${REMOTE_LINUX_DISABLED:-0}" == "1" ]]; then
   PARKED=true
+fi
+
+ALLOW_ZERO_COUNT=0
+if [[ "$PARKED" == true && "$HOST_CLASS" == "mac" ]]; then
+  ALLOW_ZERO_COUNT=1
+fi
+
+CONFIG_OK=false
+TARGET=""
+PREFIX=""
+DISK_FLOOR_GB=""
+config_output="$(read_config "$ALLOW_ZERO_COUNT" 2>/dev/null || true)"
+if [[ "$(printf '%s\n' "$config_output" | awk 'NF { count++ } END { print count + 0 }')" -eq 3 ]]; then
+  TARGET="$(printf '%s\n' "$config_output" | sed -n '1p')"
+  PREFIX="$(printf '%s\n' "$config_output" | sed -n '2p')"
+  DISK_FLOOR_GB="$(printf '%s\n' "$config_output" | sed -n '3p')"
+  CONFIG_OK=true
 fi
 
 SERVICE_OK=false

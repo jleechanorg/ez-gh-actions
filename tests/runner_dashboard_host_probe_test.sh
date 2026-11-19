@@ -364,4 +364,25 @@ with_log = json.loads((Path(os.environ["WORK"]) / "critical-down-paused-log.json
 assert with_log["pause_reason"] == "disk_floor_paused", with_log
 PY
 
+# Checked-in PR #240 mac example config (runner.count = 0) must validate cleanly when MAC_RUNNER_DISABLED=1
+# and still fail config validation when NOT parked.
+STUB_UNAME=Darwin MAC_RUNNER_DISABLED=1 EZGHA_CONFIG_FILE="$ROOT/config/config.toml.mac.example" \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-example-parked.json"
+STUB_UNAME=Darwin MAC_RUNNER_DISABLED=0 EZGHA_CONFIG_FILE="$ROOT/config/config.toml.mac.example" \
+  PATH="$BIN:$PATH" HOME="$HOME_T" EZGHA_DASHBOARD_DOWN_WAIT_SECONDS=0 \
+  bash "$PROBE" --host-class mac > "$WORK/mac-example-unparked.json"
+WORK="$WORK" python3 - <<'PY'
+import json, os
+from pathlib import Path
+parked = json.loads((Path(os.environ["WORK"]) / "mac-example-parked.json").read_text())
+assert parked["parked"] is True, parked
+assert parked["sources"]["config"]["ok"] is True, parked
+assert parked["fleet"]["configured"] == 0, parked
+assert parked["parked_slots"] == 0, parked
+unparked = json.loads((Path(os.environ["WORK"]) / "mac-example-unparked.json").read_text())
+assert unparked["parked"] is False, unparked
+assert unparked["sources"]["config"]["ok"] is False, unparked
+PY
+
 echo "runner dashboard host probe tests passed"

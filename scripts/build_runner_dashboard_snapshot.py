@@ -156,8 +156,9 @@ def _public_host(payload, expected_class):
         classified = sum(
             fleet[key] for key in ("executing", "idle", "cycling", "down")
         ) + (parked_slots if parked else 0)
+        allowed_configured = (0, EXPECTED_CONFIGURED[expected_class]) if (expected_class == "mac" and parked) else (EXPECTED_CONFIGURED[expected_class],)
         valid_counts = (
-            fleet["configured"] == EXPECTED_CONFIGURED[expected_class]
+            fleet["configured"] in allowed_configured
             and classified == fleet["configured"]
             and fleet["reserved"] <= fleet["configured"]
         )

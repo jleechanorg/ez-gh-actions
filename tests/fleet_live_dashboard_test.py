@@ -1817,6 +1817,43 @@ class FleetLiveDashboardTest(unittest.TestCase):
             self.assertEqual(rec_bad_zero["state_counts"]["IDLE-STARVED"], 0)
             self.assertFalse(rec_bad_zero["idle_starved"])
 
+            # Malformed /jobs with empty job dict ([{}]) or non-list jobs ({"id": 123}) must also block IDLE-STARVED.
+            for bad_label, bad_payload in (
+                ("empty_job_dict", {"total_count": 1, "jobs": [{}]}),
+                ("non_list_jobs_dict", {"total_count": 0, "jobs": {"id": 123}}),
+            ):
+                with self.subTest(bad_jobs=bad_label):
+                    self._reset_shared_cache()
+                    def bad_jobs_gh(args, timeout=20, p=bad_payload):
+                        joined = " ".join(args)
+                        if "status=queued" in joined:
+                            return {
+                                "total_count": 2,
+                                "workflow_runs": [
+                                    {"id": 901, "created_at": old_iso},
+                                    {"id": 902, "created_at": old_iso},
+                                ],
+                            }
+                        if "status=in_progress" in joined:
+                            return 0
+                        if "/runs/901/jobs" in joined:
+                            return p
+                        if "/runs/902/jobs" in joined:
+                            return {
+                                "total_count": 1,
+                                "jobs": [{"id": 1, "status": "queued", "created_at": old_iso, "labels": ["self-hosted", "linux", "x64"]}],
+                            }
+                        raise AssertionError(f"unexpected call: {args}")
+
+                    with mock.patch.object(mod.ci_latency_probe, "gh_json", return_value={"total_count": 0, "workflow_runs": []}), \
+                         mock.patch.object(mod.queue_probe, "gh_json", side_effect=bad_jobs_gh):
+                        snap_m = mod._collect_live_github_snapshot(repos=["org/repo"])
+                    self.assertFalse(snap_m["summary"]["job_details_complete"])
+                    norm_m = mod._normalize_hosts(json.loads(hosts_f.read_text(encoding="utf-8")), None, snap_m)
+                    rec_m = mod._normalize_reconciliation(norm_m, None, snap_m)
+                    self.assertEqual(next(h for h in norm_m if h["id"] == "jeff-ubuntu")["slots"][0]["state"], "IDLE")
+                    self.assertEqual(rec_m["state_counts"]["IDLE-STARVED"], 0)
+
             # Repo-scoped managed slot stays IDLE on queued jobs for another repo, and missing/bare scope/labels stays IDLE
             scoped_hosts = {
                 "hosts": {

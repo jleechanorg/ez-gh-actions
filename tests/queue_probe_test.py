@@ -244,6 +244,35 @@ class UnknownHandling(unittest.TestCase):
         self.assertEqual(result["ghosts"], 0)
         self.assertFalse(result["job_details_complete"])
 
+    def test_empty_job_dict_and_non_list_jobs_mark_details_incomplete(self):
+        for payload in (
+            {"total_count": 1, "jobs": [{}]},
+            {"total_count": 0, "jobs": {"id": 123}},
+        ):
+            with self.subTest(payload=payload):
+                def fake_gh(args, p=payload):
+                    joined = " ".join(args)
+                    if "status=queued" in joined:
+                        return {"total_count": 1, "workflow_runs": [{"id": 704, "created_at": "2026-11-18T00:00:00Z"}]}
+                    if "status=in_progress" in joined:
+                        return 0
+                    if "/actions/runs/704/jobs" in joined:
+                        return p
+                    raise AssertionError(f"unexpected call: {args}")
+
+                original = queue_probe.gh_json
+                queue_probe.gh_json = fake_gh
+                try:
+                    result = queue_probe.probe_repo("org/repo")
+                finally:
+                    queue_probe.gh_json = original
+                self.assertTrue(result["ok"])
+                self.assertFalse(result["job_details_complete"])
+                if payload["total_count"] == 0:
+                    self.assertTrue(result["partial"])
+                    self.assertEqual(result["unverified_runs"], 1)
+                    self.assertEqual(result["ghosts"], 0)
+
 
 class OldestFreshWait(unittest.TestCase):
     def test_ghost_age_does_not_drive_oldest_wait(self):

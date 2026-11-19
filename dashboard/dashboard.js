@@ -104,7 +104,9 @@
       fleet.executing === 0 &&
       fleet.idle === 0 &&
       fleet.cycling === 0;
-    const allowedConfigured = EXPECTED_CONFIGURED[fleetName] || [];
+    const baseAllowed = EXPECTED_CONFIGURED[fleetName] || [];
+    const allowedConfigured =
+      isParked && fleetName === 'mac' ? [0, ...baseAllowed] : baseAllowed;
     const parkedValid =
       isParked &&
       sources.config?.ok === true &&

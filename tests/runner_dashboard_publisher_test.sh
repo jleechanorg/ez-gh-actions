@@ -526,4 +526,32 @@ assert doc["queue"]["partial"] is True, doc["queue"]
 PY
 done
 
+# A queue probe that exits non-zero even with schema-valid partial:false JSON must force ok=false, partial=true.
+EXIT1_CLAIMED_OK_QUEUE="$WORK/exit1_claimed_ok_queue_probe.sh"
+cat > "$EXIT1_CLAIMED_OK_QUEUE" <<'SH'
+#!/usr/bin/env bash
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+printf '{"schema_version":1,"ok":true,"partial":false,"repos":[{"repo":"org/a","ok":true,"fresh":1,"ghosts":0}]}\n' > "$out"
+exit 1
+SH
+chmod +x "$EXIT1_CLAIMED_OK_QUEUE"
+EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$EXIT1_CLAIMED_OK_QUEUE" \
+EZGHA_DASHBOARD_LATENCY_PROBE=0 \
+EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+EZGHA_DASHBOARD_LOCK_DIR="$WORK/exit1-claimed-ok.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/exit1-claimed-ok-site"
+python3 - "$WORK/exit1-claimed-ok-site/status.json" <<'PY'
+import json, sys
+doc = json.loads(open(sys.argv[1], encoding="utf-8").read())
+assert doc["sources"]["mac_host"]["ok"] is True
+assert doc["queue"]["ok"] is False, doc["queue"]
+assert doc["queue"]["partial"] is True, doc["queue"]
+PY
+
 echo "runner dashboard publisher tests passed"

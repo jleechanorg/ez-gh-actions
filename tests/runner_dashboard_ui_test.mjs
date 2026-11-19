@@ -455,6 +455,17 @@ test('renders reconciliation banner, slot chips, cmux pool, and latency panel', 
   parkedTruth.fleets.mac.sources.process_probe.ok = false;
   assert.equal(classifySnapshot(parkedTruth, NOW).state, 'degraded');
 
+  // Parked Mac with PR #240 runner.count=0 must still validate as degraded (parked), while unparked count=0 is stale.
+  const parkedZeroMac = structuredClone(parkedTruth);
+  parkedZeroMac.fleets.mac.parked_slots = 0;
+  parkedZeroMac.fleets.mac.fleet = {
+    configured: 0, executing: 0, idle: 0, cycling: 0, down: 0, reserved: 0,
+  };
+  assert.equal(classifySnapshot(parkedZeroMac, NOW).state, 'degraded');
+  const unparkedZeroMac = structuredClone(parkedZeroMac);
+  unparkedZeroMac.fleets.mac.parked = false;
+  assert.equal(classifySnapshot(unparkedZeroMac, NOW).state, 'stale');
+
   const unavail = structuredClone(snapshot);
   unavail.sources.linux_host.ok = false;
   unavail.reconciliation = {};

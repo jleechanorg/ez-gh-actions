@@ -192,6 +192,9 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
     total = payload.get("total_count")
     count = total if type(total) is int else None
     raw_jobs = payload.get("jobs")
+    if "jobs" in payload and not isinstance(raw_jobs, list):
+        # Non-list jobs (e.g. {"total_count": 0, "jobs": {"id": 123}}) is malformed/unverified.
+        return None, [], False
     if isinstance(raw_jobs, list):
         if count == 0 and len(raw_jobs) > 0:
             # Contradictory payload (total_count=0 alongside non-empty jobs list like [null]) is unverified.
@@ -200,8 +203,8 @@ def inspect_run_jobs(repo, run_id, *, budget=None, reserve=0):
         truncated = count is not None and len(raw_jobs) < count
         details_valid = not truncated
         for job in raw_jobs:
-            if not isinstance(job, dict):
-                # A malformed row could be the queued job we cannot see; never call this complete.
+            if not isinstance(job, dict) or not isinstance(job.get("status"), str) or not job["status"].strip():
+                # A malformed row or missing status could hide a queued job; never call this complete.
                 details_valid = False
                 continue
             if job.get("status") != "queued":
@@ -262,7 +265,7 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
                 "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                 "queued_total": None, "sample_capped": False,
                 "sampled_fresh": None, "sampled_ghosts": None,
-                "partial": False, "unverified_runs": 0,
+                "partial": True, "unverified_runs": 0,
                 "error": str(exc)[:200]}
 
     try:
@@ -277,7 +280,7 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
                     "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                     "queued_total": queued_total, "sample_capped": False,
                     "sampled_fresh": None, "sampled_ghosts": None,
-                    "partial": False, "unverified_runs": 0,
+                    "partial": True, "unverified_runs": 0,
                     "error": f"rate limited while reading in_progress runs: {str(exc)[:150]}"}
         ip_runs = None
 
@@ -314,7 +317,7 @@ def probe_repo(repo, *, max_job_checks=None, max_requests=None, _budget=None, _r
                             "oldest_fresh_wait_minutes": None, "in_progress_runs": None,
                             "queued_total": queued_total, "sample_capped": False,
                             "sampled_fresh": None, "sampled_ghosts": None,
-                            "partial": False, "unverified_runs": 0,
+                            "partial": True, "unverified_runs": 0,
                             "queued_jobs": [], "job_details_complete": False,
                             "error": f"rate limited while reading jobs: {str(exc)[:150]}"}
                 count = None
