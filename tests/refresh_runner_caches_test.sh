@@ -63,7 +63,8 @@ chmod +x "${POISON_BIN}/docker"
 HOME_A="${WORK}/home_a"
 MIRRORS_A="${WORK}/mirrors_a"
 WHEELHOUSE_A="${WORK}/wheelhouse_a"
-mkdir -p "${HOME_A}" "${MIRRORS_A}" "${WHEELHOUSE_A}"
+NPM_CACHE_A="${WORK}/npm_cache_a"
+mkdir -p "${HOME_A}" "${MIRRORS_A}" "${WHEELHOUSE_A}" "${NPM_CACHE_A}"
 
 CFG_A="${WORK}/cfg_a.toml"
 cat > "${CFG_A}" <<EOF
@@ -72,6 +73,7 @@ version = 1
 image = "ezgha-runner:latest"
 git_mirror_host_path = "${MIRRORS_A}"
 wheelhouse_host_path = "${WHEELHOUSE_A}"
+npm_cache_host_path = "${NPM_CACHE_A}"
 [limits]
 min_free_disk_gb = 30
 EOF
@@ -89,6 +91,7 @@ if [ -d "${MIRRORS_A}/generations" ] && [ -n "$(ls -A "${MIRRORS_A}/generations"
   fail "disk-floor refusal created mirror generations"
 fi
 [ -z "$(find "${WHEELHOUSE_A}" -name '*.whl' 2>/dev/null || true)" ] || fail "disk-floor refusal created wheelhouse files"
+[ ! -d "${NPM_CACHE_A}/_cacache" ] || fail "disk-floor refusal created npm _cacache directory"
 pass "(a) disk-floor refusal exited 0 hermetically (poison docker untouched) and created no artifacts"
 
 # ── (b) Git mirror generation publish & safe reaping ─────────────────────────
@@ -494,18 +497,20 @@ SHA_WH3="$(tr -d '[:space:]' < "${WH_D}/.manifest.sha256")"
 [ "${SHA_WH2}" != "${SHA_WH3}" ] || fail "manifest SHA did not change when date bucket changed"
 
 "${PYTHON_BIN}" - "${REPO_ROOT}/scripts" "${REQ_DIR}" "${WORK}" <<'PY'
-import os, sys
+import base64, hashlib, json, os, sys, time
 from unittest import mock
 
 scripts_dir, req_dir, work_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 sys.path.insert(0, scripts_dir)
 import ezgha_cache_common  # noqa: E402
 import ezgha_git_mirrors  # noqa: E402
+import ezgha_npm_cache  # noqa: E402
 import ezgha_wheelhouse  # noqa: E402
 import refresh_runner_caches  # noqa: E402
 
 assert ezgha_git_mirrors.slugs_for(["o/r"]) == ["o__r"]
 assert ezgha_git_mirrors.parse_mirror_repos("jleechanorg/ok ../escape ./dot a//b bare a/..") == ["jleechanorg/ok"]
+assert "jleechanorg/worldai_frontend" in ezgha_git_mirrors.parse_mirror_repos(ezgha_git_mirrors.DEFAULT_MIRROR_REPOS)
 
 empty_darwin_home = os.path.join(work_dir, "empty_darwin_home")
 os.makedirs(empty_darwin_home, exist_ok=True)
@@ -531,7 +536,7 @@ if os.path.commonpath([os.path.dirname(os.path.realpath(rf_path)), os.path.dirna
     assert len(entries) == 1 and os.path.realpath(outside_file) not in all_files and entries[0][1] != "/"
 
 for idx, bad_path in enumerate(["", "   ", "~/.cache/ezgha", "relative/path"]):
-    for field in ("git_mirror_host_path", "wheelhouse_host_path"):
+    for field in ("git_mirror_host_path", "wheelhouse_host_path", "npm_cache_host_path"):
         bad_cfg = os.path.join(work_dir, f"bad_{field}_{idx}.toml")
         open(bad_cfg, "w", encoding="utf-8").write(f'version = 1\n[runner]\n{field} = "{bad_path}"\n')
         try:
@@ -540,8 +545,88 @@ for idx, bad_path in enumerate(["", "   ", "~/.cache/ezgha", "relative/path"]):
             pass
         else:
             raise AssertionError(f"load_config accepted invalid {field}={bad_path!r}")
+
+# Unit tests for ezgha_npm_cache._synthesize_or_read_pkg_json and prune_old_npm_cache
+lock_sample = json.dumps({
+    "name": "unused-top",
+    "lockfileVersion": 3,
+    "packages": {
+        "": {
+            "name": "frontend-app",
+            "version": "2.3.4",
+            "dependencies": {"react": "^18.0.0"},
+            "devDependencies": {"vitest": "^1.0.0"},
+        }
+    },
+})
+synth_pkg = json.loads(ezgha_npm_cache._synthesize_or_read_pkg_json(None, lock_sample))
+assert synth_pkg["name"] == "frontend-app" and synth_pkg["version"] == "2.3.4"
+assert synth_pkg["dependencies"] == {"react": "^18.0.0"} and synth_pkg["devDependencies"] == {"vitest": "^1.0.0"}
+assert synth_pkg["optionalDependencies"] == {} and synth_pkg["peerDependencies"] == {}
+assert ezgha_npm_cache._synthesize_or_read_pkg_json('{"name":"real"}', lock_sample) == '{"name":"real"}'
+
+npm_dir = os.path.join(work_dir, "npm_prune_unit")
+ref_digest = hashlib.sha512(b"referenced-blob").digest()
+ref_b64 = base64.b64encode(ref_digest).decode("ascii")
+ref_hex = ref_digest.hex()
+unref_hex = hashlib.sha512(b"unreferenced-blob").hexdigest()
+
+ref_blob = os.path.join(npm_dir, "_cacache", "content-v2", "sha512", ref_hex[:2], ref_hex[2:4], ref_hex[4:])
+unref_blob = os.path.join(npm_dir, "_cacache", "content-v2", "sha512", unref_hex[:2], unref_hex[2:4], unref_hex[4:])
+stale_tmp = os.path.join(npm_dir, "_cacache", "content-v2", "sha512", "ab", "cd", "ef.tmp.999")
+idx_file = os.path.join(npm_dir, "_cacache", "index-v5", "11", "22", "3344")
+for p in (ref_blob, unref_blob, stale_tmp, idx_file):
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+open(ref_blob, "wb").write(b"referenced-blob")
+open(unref_blob, "wb").write(b"unreferenced-blob")
+open(stale_tmp, "wb").write(b"leftover")
+old_mtime = time.time() - 40000
+os.utime(stale_tmp, (old_mtime, old_mtime))
+idx_entry = json.dumps({"key": "pacote:pkg@1.0.0", "integrity": f"sha1-deadbeef sha512-{ref_b64}"})
+open(idx_file, "w", encoding="utf-8").write(f"0123456789abcdef\t{idx_entry}\n")
+
+# Pass 1: stamps unreferenced blob without deleting it, keeps referenced blob, removes stale .tmp.
+assert ezgha_npm_cache.prune_old_npm_cache(npm_dir, retention_min=480, oldest_runner_epoch=None) == 0
+assert os.path.isfile(ref_blob) and os.path.isfile(unref_blob) and not os.path.exists(stale_tmp)
+unref_rel = f"sha512/{unref_hex[:2]}/{unref_hex[2:4]}/{unref_hex[4:]}"
+unref_map = json.load(open(os.path.join(npm_dir, ".unreferenced.json"), encoding="utf-8"))
+assert unref_rel in unref_map
+
+# Backdate unreferenced timestamp past 480m retention
+old_unref_ts = time.time() - 32400
+open(os.path.join(npm_dir, ".unreferenced.json"), "w", encoding="utf-8").write(json.dumps({unref_rel: old_unref_ts}))
+
+# Pass 2: fail-closed when oldest_runner_epoch == 0.0
+assert ezgha_npm_cache.prune_old_npm_cache(npm_dir, retention_min=480, oldest_runner_epoch=0.0) == 0
+assert os.path.isfile(unref_blob)
+
+# Pass 3: pinned by older running container
+assert ezgha_npm_cache.prune_old_npm_cache(npm_dir, retention_min=480, oldest_runner_epoch=old_unref_ts - 600) == 0
+assert os.path.isfile(unref_blob)
+
+# Pass 4: fail-closed on index-v5 OSError
+orig_open = open
+def _fail_idx_open(path, *args, **kwargs):
+    if path == idx_file:
+        raise OSError("simulated read error")
+    return orig_open(path, *args, **kwargs)
+with mock.patch("builtins.open", side_effect=_fail_idx_open):
+    assert ezgha_npm_cache.prune_old_npm_cache(npm_dir, retention_min=480, oldest_runner_epoch=None) == 0
+assert os.path.isfile(unref_blob)
+
+# Pass 5: expired unreferenced blob is pruned, referenced blob preserved, tracker cleaned
+assert ezgha_npm_cache.prune_old_npm_cache(npm_dir, retention_min=480, oldest_runner_epoch=None) == 1
+assert os.path.isfile(ref_blob) and not os.path.exists(unref_blob)
+unref_after = json.load(open(os.path.join(npm_dir, ".unreferenced.json"), encoding="utf-8"))
+assert unref_rel not in unref_after
+
+# Test refresh_npm_cache reap_only=True when _cacache absent does NOT invoke docker
+empty_npm = os.path.join(work_dir, "empty_npm_reap")
+os.makedirs(empty_npm, exist_ok=True)
+with mock.patch("ezgha_npm_cache.oldest_running_runner_start_epoch", side_effect=AssertionError("should not call docker")):
+    ezgha_npm_cache.refresh_npm_cache(empty_npm, "ezgha-runner:latest", reap_only=True)
 PY
-pass "(d) relative -r base.txt closure, atomic manifest SHA, direct module imports, and path validation parity verified"
+pass "(d) relative -r base.txt closure, atomic manifest SHA, direct module imports, npm cache unit tests, and path validation parity verified"
 
 # ── (e) Hermetic stubbed test of scripts/verify_live_cache_savings.sh ─────────
 VERIFY_WORK="${WORK}/verify_e"

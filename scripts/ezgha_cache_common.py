@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Shared stdlib helpers for ezgha runner cache warming."""
 
+from datetime import datetime, timezone
 import os
 import platform
+import re
 import shlex
 import shutil
 import stat
@@ -132,3 +134,78 @@ def resolve_docker_env():
             except (OSError, ValueError) as exc:
                 warn(f"could not parse DOCKER_HOST from {unit_path}: {exc}")
     return env
+
+
+def _parse_docker_iso_timestamp(ts_raw):
+    ts = ts_raw.strip()
+    if not ts:
+        raise ValueError("empty timestamp")
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    ts = re.sub(r"\.([0-9]+)", lambda m: "." + (m.group(1) + "000000")[:6], ts)
+    dt = datetime.fromisoformat(ts)
+    return (dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)).timestamp()
+
+
+def oldest_running_runner_start_epoch(docker_env):
+    """Return earliest StartedAt epoch of running ezgha containers, None if none, or 0.0 on error."""
+    override = os.environ.get("EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH", "").strip()
+    if override:
+        if override.lower() == "error":
+            warn("simulated docker failure via EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH=error; failing closed on reap")
+            return 0.0
+        if override.lower() == "none":
+            return None
+        try:
+            return float(override)
+        except ValueError:
+            warn(f"invalid EZGHA_CACHE_TEST_OLDEST_CONTAINER_EPOCH={override!r}; failing closed on reap")
+            return 0.0
+
+    if not shutil.which("docker"):
+        warn("docker CLI not found; failing closed to preserve retired generations")
+        return 0.0
+
+    docker_proc_env = merge_env(docker_env)
+    try:
+        ps_proc = subprocess.run(
+            ["docker", "ps", "-q", "--filter", "label=ezgha=managed"],
+            env=docker_proc_env, text=True, capture_output=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        warn(f"docker ps failed ({exc}); failing closed to preserve retired generations")
+        return 0.0
+    if ps_proc.returncode != 0:
+        warn(f"docker ps exited {ps_proc.returncode}; failing closed to preserve retired generations")
+        return 0.0
+
+    ids = [ln.strip() for ln in ps_proc.stdout.splitlines() if ln.strip()]
+    if not ids:
+        return None
+
+    try:
+        inspect_proc = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.StartedAt}}", *ids],
+            env=docker_proc_env, text=True, capture_output=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        warn(f"docker inspect failed ({exc}); failing closed to preserve retired generations")
+        return 0.0
+    if inspect_proc.returncode != 0:
+        warn(f"docker inspect exited {inspect_proc.returncode}; failing closed to preserve retired generations")
+        return 0.0
+
+    epochs = []
+    for line in inspect_proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            epochs.append(_parse_docker_iso_timestamp(line))
+        except ValueError as exc:
+            warn(f"unparseable container StartedAt {line!r} ({exc}); failing closed to preserve retired generations")
+            return 0.0
+    if not epochs:
+        warn("docker inspect returned no StartedAt timestamps; failing closed to preserve retired generations")
+        return 0.0
+    return min(epochs)

@@ -14,6 +14,7 @@ if _SCRIPT_DIR not in sys.path:
 
 from ezgha_cache_common import log, resolve_docker_env, warn  # noqa: E402
 from ezgha_git_mirrors import refresh_git_mirrors  # noqa: E402
+from ezgha_npm_cache import refresh_npm_cache  # noqa: E402
 from ezgha_wheelhouse import refresh_wheelhouse  # noqa: E402
 
 __all__ = [
@@ -71,6 +72,9 @@ def load_config(path):
     wheelhouse_path = validate_configured_host_path(
         "runner.wheelhouse_host_path", runner_cfg.get("wheelhouse_host_path")
     )
+    npm_cache_path = validate_configured_host_path(
+        "runner.npm_cache_host_path", runner_cfg.get("npm_cache_host_path")
+    )
     raw_image = runner_cfg.get("image")
     image = str(raw_image).strip() if raw_image is not None else ""
     if not image:
@@ -86,6 +90,7 @@ def load_config(path):
     return {
         "git_mirror_host_path": git_mirror_path,
         "wheelhouse_host_path": wheelhouse_path,
+        "npm_cache_host_path": npm_cache_path,
         "image": image,
         "min_free_disk_gb": min_free_gb,
     }
@@ -119,9 +124,10 @@ def get_free_gb(paths):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Refresh ezgha runner git mirrors and wheelhouse.")
+    parser = argparse.ArgumentParser(description="Refresh ezgha runner git mirrors, npm cache, and wheelhouse.")
     parser.add_argument("--config", help="Path to ezgha config.toml")
     parser.add_argument("--skip-git", action="store_true", help="Skip git mirror refresh")
+    parser.add_argument("--skip-npm", action="store_true", help="Skip npm cache refresh")
     parser.add_argument("--skip-wheels", action="store_true", help="Skip wheelhouse refresh")
     args = parser.parse_args(argv)
 
@@ -141,11 +147,12 @@ def main(argv=None):
 
     git_mirror_path = parsed_cfg["git_mirror_host_path"]
     wheelhouse_path = parsed_cfg["wheelhouse_host_path"]
+    npm_cache_path = parsed_cfg["npm_cache_host_path"]
     image = parsed_cfg["image"]
     min_free_gb = parsed_cfg["min_free_disk_gb"]
 
-    if not git_mirror_path and not wheelhouse_path:
-        log("neither runner.git_mirror_host_path nor runner.wheelhouse_host_path configured; exiting")
+    if not git_mirror_path and not wheelhouse_path and not npm_cache_path:
+        log("none of runner.git_mirror_host_path, runner.wheelhouse_host_path, or runner.npm_cache_host_path configured; exiting")
         return 0
 
     state_dir = os.environ.get("EZGHA_CACHE_STATE_DIR") or os.path.join(
@@ -178,6 +185,22 @@ def main(argv=None):
             except Exception as exc:
                 warn(f"git mirror {'reap-only ' if reap_only_git else ''}stage encountered error: {exc}")
                 stage_errors.append("git")
+
+        if npm_cache_path and not args.skip_npm:
+            npm_free_gb = get_free_gb([npm_cache_path])
+            reap_only_npm = npm_free_gb < required_gb
+            if reap_only_npm:
+                warn(
+                    f"free disk {npm_free_gb:.1f} GiB below safety floor+{buffer_gb:g} ({required_gb:g} GiB); "
+                    "skipping npm cache downloads and pruning unreferenced blobs only"
+                )
+            try:
+                refresh_npm_cache(
+                    npm_cache_path, image, git_mirror_path=git_mirror_path, reap_only=reap_only_npm
+                )
+            except Exception as exc:
+                warn(f"npm cache {'reap-only ' if reap_only_npm else ''}stage encountered error: {exc}")
+                stage_errors.append("npm")
 
         if wheelhouse_path and not args.skip_wheels:
             wheel_free_gb = get_free_gb([wheelhouse_path])
