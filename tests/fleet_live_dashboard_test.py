@@ -1791,6 +1791,42 @@ class FleetLiveDashboardTest(unittest.TestCase):
             )
             self.assertIn("Fleet + Queue + CI Latency Inspector", out_html.read_text(encoding="utf-8"))
 
+            # --audit-dir cmux {"ok": false} propagates into hosts_partial, fixture_errors, scope_note, gh_errors
+            cmux_err_dir = tmp / "audit_cmux_err"
+            cmux_err_dir.mkdir(parents=True, exist_ok=True)
+            fixture_audit_dir(cmux_err_dir)
+            (cmux_err_dir / "cmux_and_github_reconciliation.json").write_text(
+                json.dumps({"ok": False, "error": "audit cmux unreachable"}), encoding="utf-8"
+            )
+            cmux_err_audit_state = mod.build_operator_state(audit_dir=cmux_err_dir)
+            self.assertTrue(cmux_err_audit_state["reconciliation"]["hosts_partial"])
+            self.assertIn("audit cmux unreachable", " ".join(cmux_err_audit_state["reconciliation"]["fixture_errors"]))
+            self.assertIn("audit cmux unreachable", cmux_err_audit_state["reconciliation"]["scope_note"])
+            self.assertIn("audit cmux unreachable", " ".join(cmux_err_audit_state["reconciliation"]["gh_errors"]))
+
+            # Cold _cached_live_latency failure enforces 300s cooldown without re-probing
+            lat_calls = {"n": 0}
+            clock = {"now": 100.0}
+
+            def bad_json_probe(*args, **kwargs):
+                lat_calls["n"] += 1
+                raise json.JSONDecodeError("bad gh output", "{", 1)
+
+            mod._LIVE_LATENCY_CACHE.update({"key": None, "ts": 0.0, "attempt_ts": None, "data": None, "error": None})
+            with mock.patch.object(mod.ci_latency_probe, "probe_latency", side_effect=bad_json_probe), \
+                 mock.patch.object(mod.time, "monotonic", side_effect=lambda: clock["now"]):
+                r1 = mod._cached_live_latency(["org/repo"])
+                self.assertFalse(r1["ok"])
+                self.assertEqual(lat_calls["n"], 1)
+                clock["now"] = 220.0
+                r2 = mod._cached_live_latency(["org/repo"])
+                self.assertFalse(r2["ok"])
+                self.assertEqual(lat_calls["n"], 1)
+                clock["now"] = 401.0
+                r3 = mod._cached_live_latency(["org/repo"])
+                self.assertFalse(r3["ok"])
+                self.assertEqual(lat_calls["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

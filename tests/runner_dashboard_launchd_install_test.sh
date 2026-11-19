@@ -36,8 +36,15 @@ for script in publish_runner_dashboard.sh runner_dashboard_host_probe.sh build_r
   test -x "$HOME_T/.local/libexec/ezgha/$script"
 done
 test -f "$HOME_T/.local/libexec/ezgha/fleet_live_dashboard_template.html"
+python3 - "$HOME_T/.local/libexec/ezgha/fleet_live_dashboard_template.html" "$ROOT/install.sh" <<'PY'
+import os, re, stat, sys
+from pathlib import Path
+mode = stat.S_IMODE(os.stat(sys.argv[1]).st_mode)
+assert mode == 0o644, f"expected template mode 0644, got {oct(mode)}"
+install_text = Path(sys.argv[2]).read_text(encoding="utf-8")
+assert re.search(r"install\s+-m\s+0644\s+.*fleet_live_dashboard_template\.html", install_text), "install.sh must install template 0644"
+PY
 test -x "$HOME_T/.local/libexec/ezgha/fleet_live_dashboard.py"
-grep -q 'fleet_live_dashboard_template.html' "$ROOT/install.sh"
 
 PLIST="$HOME_T/Library/LaunchAgents/org.jleechanorg.ezgha-runner-dashboard.plist"
 test -f "$PLIST"

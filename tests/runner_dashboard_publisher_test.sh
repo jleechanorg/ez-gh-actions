@@ -251,4 +251,56 @@ assert doc["queue"]["ok"] is False, doc["queue"]
 assert doc["cmux"]["ok"] is False, doc["cmux"]
 PY
 
+ARGS_QUEUE_PROBE="$WORK/args_queue_probe.sh"
+ARGS_LATENCY_PROBE="$WORK/args_latency_probe.sh"
+QUEUE_ARGS_LOG="$WORK/queue_args.log"
+LATENCY_ARGS_LOG="$WORK/latency_args.log"
+cat > "$ARGS_QUEUE_PROBE" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${QUEUE_ARGS_LOG:?}"
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+[[ -n "$out" ]] && printf '{"ok":true,"repos":[]}\n' > "$out"
+SH
+cat > "$ARGS_LATENCY_PROBE" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${LATENCY_ARGS_LOG:?}"
+out=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--output" ]]; then out="$2"; shift 2; else shift; fi
+done
+[[ -n "$out" ]] && printf '{"ok":true,"overall":{},"workflows":[]}\n' > "$out"
+SH
+chmod +x "$ARGS_QUEUE_PROBE" "$ARGS_LATENCY_PROBE"
+
+for qmax in 0100 0999 08 0 abc -5; do
+  QUEUE_ARGS_LOG="$QUEUE_ARGS_LOG" LATENCY_ARGS_LOG="$LATENCY_ARGS_LOG" \
+  EZGHA_DASHBOARD_QUEUE_PROBE=1 \
+  EZGHA_DASHBOARD_QUEUE_PROBE_CMD="$ARGS_QUEUE_PROBE" \
+  EZGHA_DASHBOARD_QUEUE_MAX_REQUESTS="$qmax" \
+  EZGHA_DASHBOARD_LATENCY_PROBE=1 \
+  EZGHA_DASHBOARD_LATENCY_PROBE_CMD="$ARGS_LATENCY_PROBE" \
+  EZGHA_DASHBOARD_CMUX_PROBE_CMD="" \
+  EZGHA_DASHBOARD_PROBE_DIR="$PROBES" \
+  EZGHA_DASHBOARD_ASSET_DIR="$ROOT/dashboard" \
+  EZGHA_DASHBOARD_LOCK_DIR="$WORK/clamp-${qmax}.lock" \
+  /bin/bash "$PUBLISHER" --collect-only "$WORK/clamp-${qmax}-site"
+done
+python3 - "$QUEUE_ARGS_LOG" "$LATENCY_ARGS_LOG" <<'PY'
+import re, sys
+from pathlib import Path
+q_lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+expected = ["80", "80", "8", "1", "80", "80"]
+assert len(q_lines) == len(expected), q_lines
+for line, want in zip(q_lines, expected):
+    m = re.search(r"--max-requests\s+(\S+)", line)
+    assert m and m.group(1) == want, f"expected --max-requests {want}, got {line}"
+l_lines = Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
+assert len(l_lines) == len(expected)
+for line in l_lines:
+    assert "--limit 30 --job-run-limit 20" in line, line
+PY
+
 echo "runner dashboard publisher tests passed"

@@ -35,7 +35,7 @@ if SCRIPT_DIR not in sys.path:
 import ci_latency_probe  # noqa: E402
 import queue_probe  # noqa: E402
 
-_LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "data": None}
+_LIVE_LATENCY_CACHE = {"key": None, "ts": 0.0, "attempt_ts": None, "data": None, "error": None}
 _LIVE_LATENCY_TTL_S = 300.0
 MAX_LIVE_REPOS = 3
 DEFAULT_MIN_FREE_DISK_GB = 10
@@ -1501,18 +1501,41 @@ def _cached_live_latency(repos):
     capped, _ = _cap_live_repos(repos or ci_latency_probe.DEFAULT_REPOS)
     target = tuple(capped)
     now = time.monotonic()
+    attempt_ts = _LIVE_LATENCY_CACHE.get("attempt_ts")
     if (
-        _LIVE_LATENCY_CACHE["data"] is not None
-        and _LIVE_LATENCY_CACHE["key"] == target
-        and (now - _LIVE_LATENCY_CACHE["ts"]) < _LIVE_LATENCY_TTL_S
+        _LIVE_LATENCY_CACHE["key"] == target
+        and attempt_ts is not None
+        and (now - attempt_ts) < _LIVE_LATENCY_TTL_S
     ):
-        return _LIVE_LATENCY_CACHE["data"]
+        if _LIVE_LATENCY_CACHE["data"] is not None:
+            return _LIVE_LATENCY_CACHE["data"]
+        if _LIVE_LATENCY_CACHE.get("error") is not None:
+            return _LIVE_LATENCY_CACHE["error"]
+    data = None
+    err_payload = None
     try:
         data = ci_latency_probe.probe_latency(list(target), limit=15, job_run_limit=8)
+    except Exception as exc:
+        err_payload = {
+            "schema_version": 1,
+            "ok": False,
+            "partial": True,
+            "error": f"live latency probe failed: {type(exc).__name__}: {str(exc)[:160]}",
+            "overall": {},
+            "cancellation": {},
+            "workflows": [],
+            "repos": [],
+        }
     finally:
-        _LIVE_LATENCY_CACHE.update({"key": target, "ts": time.monotonic()})
-    _LIVE_LATENCY_CACHE["data"] = data
-    return data
+        done_ts = time.monotonic()
+        _LIVE_LATENCY_CACHE.update({
+            "key": target,
+            "ts": done_ts,
+            "attempt_ts": done_ts,
+            "data": data,
+            "error": err_payload,
+        })
+    return data if data is not None else err_payload
 
 
 _REMOTE_PROBE_PY = "\n".join([

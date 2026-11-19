@@ -286,7 +286,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
             runs, run_list_truncated = _fetch_completed_runs_with_truncation(repo, limit)
             if run_list_truncated:
                 truncated_run_lists += 1
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
             return {
                 "schema_version": 1,
                 "ok": False,
@@ -341,7 +341,7 @@ def probe_latency(repos, limit=40, job_run_limit=20):
                 jobs, jobs_total = _fetch_run_jobs(repo, run_id)
                 if jobs_total > len(jobs):
                     truncated_job_fetches += 1
-            except RuntimeError as exc:
+            except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
                 if _is_rate_limit_error(str(exc)):
                     return {
                         "schema_version": 1,
