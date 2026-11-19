@@ -8,9 +8,9 @@
         "configured": 20,
         "cycling": 0,
         "down": 0,
-        "executing": 6,
-        "idle": 14,
-        "reserved": 19
+        "executing": 10,
+        "idle": 10,
+        "reserved": 20
       },
       "sources": {
         "config": {
@@ -75,13 +75,13 @@
       }
     }
   },
-  "observed_at": "2026-11-19T04:05:30Z",
-  "published_at": "2026-11-19T04:06:34Z",
+  "observed_at": "2026-11-19T04:17:57Z",
+  "published_at": "2026-11-19T04:18:00Z",
   "queue": {
     "fresh": 1,
     "ghosts": 164,
     "ok": true,
-    "oldest_fresh_wait_minutes": 43,
+    "oldest_fresh_wait_minutes": 0,
     "repos": [
       {
         "fresh": 1,
