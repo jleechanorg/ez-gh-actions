@@ -12,7 +12,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from ezgha_cache_common import log, resolve_docker_env, warn  # noqa: E402
+from ezgha_cache_common import log, resolve_docker_env, validate_configured_host_path, warn  # noqa: E402
 from ezgha_git_mirrors import refresh_git_mirrors  # noqa: E402
 from ezgha_npm_cache import refresh_npm_cache  # noqa: E402
 from ezgha_wheelhouse import refresh_wheelhouse  # noqa: E402
@@ -41,19 +41,6 @@ def resolve_config_path(explicit_path):
         if os.path.isfile(mac_cfg):
             return mac_cfg, False
     return os.path.join(home, ".config", "ezgha", "config.toml"), False
-
-
-def validate_configured_host_path(field, raw_val):
-    """Match Rust Config::validate(): explicit host paths must be non-empty and absolute without '~'."""
-    if raw_val is None:
-        return None
-    if not isinstance(raw_val, str) or not raw_val.strip():
-        raise ValueError(f"{field} must not be empty when configured")
-    if raw_val != raw_val.strip() or raw_val.startswith("~") or not os.path.isabs(raw_val):
-        raise ValueError(
-            f"{field} must be an absolute path without leading '~' (got {raw_val!r})"
-        )
-    return raw_val
 
 
 def load_config(path):

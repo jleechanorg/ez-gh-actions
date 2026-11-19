@@ -264,7 +264,7 @@ install_scripts() {
     return
   fi
   if [[ "$label_filter" == "org.jleechanorg.ezgha-cache-warm" ]]; then
-    for name in refresh_runner_caches.sh refresh_runner_caches.py ezgha_cache_common.py ezgha_git_mirrors.py ezgha_wheelhouse.py; do
+    for name in refresh_runner_caches.sh refresh_runner_caches.py ezgha_cache_common.py ezgha_git_mirrors.py ezgha_npm_cache.py ezgha_wheelhouse.py; do
       install -m 0755 "${REPO_PATH}/scripts/${name}" "${SCRIPTS_DIR}/${name}"
     done
     echo "cache-warm payload installed: ${SCRIPTS_DIR}"

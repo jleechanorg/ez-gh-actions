@@ -209,3 +209,48 @@ def oldest_running_runner_start_epoch(docker_env):
         warn("docker inspect returned no StartedAt timestamps; failing closed to preserve retired generations")
         return 0.0
     return min(epochs)
+
+
+def validate_configured_host_path(field, raw_val):
+    """Match Rust Config::validate(): explicit host paths must be non-empty and absolute without '~'."""
+    if raw_val is None:
+        return None
+    if not isinstance(raw_val, str) or not raw_val.strip():
+        raise ValueError(f"{field} must not be empty when configured")
+    if raw_val != raw_val.strip() or raw_val.startswith("~") or not os.path.isabs(raw_val):
+        raise ValueError(f"{field} must be an absolute path without leading '~' (got {raw_val!r})")
+    return raw_val
+
+
+def atomic_write_text(path, text, mode=0o644):
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+
+
+def inspect_docker_image_id(image, docker_proc_env, stage_label):
+    if not shutil.which("docker"):
+        warn(f"docker CLI not found; skipping {stage_label} refresh")
+        return None
+    try:
+        info_proc = subprocess.run(["docker", "info"], env=docker_proc_env, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        warn(f"docker info timed out after 30s; skipping {stage_label} refresh")
+        return None
+    if info_proc.returncode != 0:
+        warn(f"docker daemon unreachable; skipping {stage_label} refresh")
+        return None
+    try:
+        inspect_proc = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
+            env=docker_proc_env, text=True, capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        warn(f"docker image inspect timed out after 30s for {image}; skipping {stage_label} refresh")
+        return None
+    if inspect_proc.returncode != 0:
+        warn(f"runner image {image} not present locally; skipping {stage_label} refresh")
+        return None
+    return inspect_proc.stdout.strip()

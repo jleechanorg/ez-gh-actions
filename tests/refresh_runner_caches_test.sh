@@ -625,6 +625,68 @@ empty_npm = os.path.join(work_dir, "empty_npm_reap")
 os.makedirs(empty_npm, exist_ok=True)
 with mock.patch("ezgha_npm_cache.oldest_running_runner_start_epoch", side_effect=AssertionError("should not call docker")):
     ezgha_npm_cache.refresh_npm_cache(empty_npm, "ezgha-runner:latest", reap_only=True)
+
+# Test gather_npm_lock_sources (EZGHA_NPM_LOCKFILES + bare mirror SEED_SHA) and stubbed refresh_npm_cache + --skip-npm
+lock_dir = os.path.join(work_dir, "npm_lock_src")
+os.makedirs(lock_dir, exist_ok=True)
+lock_file_p = os.path.join(lock_dir, "package-lock.json")
+open(lock_file_p, "w", encoding="utf-8").write(lock_sample)
+with mock.patch.dict(os.environ, {"EZGHA_NPM_LOCKFILES": lock_file_p}, clear=False):
+    gathered = ezgha_npm_cache.gather_npm_lock_sources()
+    assert len(gathered) == 1 and gathered[0][0] == lock_file_p and json.loads(gathered[0][1])["name"] == "frontend-app"
+
+# Bare mirror with master-only branch resolved via resolve_seed_sha (HEAD points to missing main)
+import subprocess
+npm_mirror_root = os.path.join(work_dir, "npm_mirror_src")
+npm_mirror_gen = os.path.join(npm_mirror_root, "generations", "jleechanorg__npmrepo.1")
+npm_mirror_act = os.path.join(npm_mirror_root, "active")
+npm_work_repo = os.path.join(work_dir, "npm_work_repo")
+os.makedirs(npm_mirror_act, exist_ok=True)
+subprocess.run(["git", "init", "--bare", "-q", npm_mirror_gen], check=True)
+subprocess.run(["git", "clone", "-q", npm_mirror_gen, npm_work_repo], check=True)
+subprocess.run(["git", "-C", npm_work_repo, "config", "core.hooksPath", "/dev/null"], check=True)
+subprocess.run(["git", "-C", npm_work_repo, "checkout", "-q", "-B", "master"], check=True)
+open(os.path.join(npm_work_repo, "package-lock.json"), "w", encoding="utf-8").write(lock_sample)
+subprocess.run(["git", "-C", npm_work_repo, "add", "package-lock.json"], check=True)
+subprocess.run(["git", "-C", npm_work_repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "lock"], check=True)
+subprocess.run(["git", "-C", npm_work_repo, "push", "-q", "origin", "master"], check=True)
+subprocess.run(["git", "-C", npm_mirror_gen, "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+os.symlink("../generations/jleechanorg__npmrepo.1", os.path.join(npm_mirror_act, "jleechanorg__npmrepo"))
+with mock.patch.dict(os.environ, {"EZGHA_NPM_LOCKFILES": "", "EZGHA_NPM_REPOS": "jleechanorg/npmrepo"}, clear=False):
+    mir_gathered = ezgha_npm_cache.gather_npm_lock_sources(git_mirror_path=npm_mirror_root)
+    assert len(mir_gathered) == 1 and mir_gathered[0][0] == "mirror:jleechanorg/npmrepo"
+
+# Stubbed refresh_npm_cache: first run invokes run_cmd + writes .manifest.sha256; second run short-circuits; reap_only prunes _cacache
+npm_refresh_dir = os.path.join(work_dir, "npm_refresh_stub")
+run_calls = []
+def _fake_npm_run_cmd(cmd, timeout=None, env=None, capture=False, input_text=None):
+    run_calls.append((cmd, json.loads(input_text)))
+    b_path = os.path.join(npm_refresh_dir, "_cacache", "content-v2", "sha512", ref_hex[:2], ref_hex[2:4], ref_hex[4:])
+    i_path = os.path.join(npm_refresh_dir, "_cacache", "index-v5", "11", "22", "3344")
+    for p in (b_path, i_path):
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(b_path, "wb").write(b"referenced-blob")
+    open(i_path, "w", encoding="utf-8").write(f"0123456789abcdef\t{idx_entry}\n")
+
+with mock.patch.dict(os.environ, {"EZGHA_NPM_LOCKFILES": lock_file_p}, clear=False), \
+     mock.patch("ezgha_npm_cache.inspect_docker_image_id", return_value="sha256:fakeimg123"), \
+     mock.patch("ezgha_npm_cache.oldest_running_runner_start_epoch", return_value=None), \
+     mock.patch("ezgha_npm_cache.run_cmd", side_effect=_fake_npm_run_cmd):
+    ezgha_npm_cache.refresh_npm_cache(npm_refresh_dir, "ezgha-runner:latest")
+    assert len(run_calls) == 1 and os.path.isfile(os.path.join(npm_refresh_dir, ".manifest.sha256"))
+    ezgha_npm_cache.refresh_npm_cache(npm_refresh_dir, "ezgha-runner:latest")
+    assert len(run_calls) == 1, "manifest hit should skip second container run"
+
+reap_epochs = []
+with mock.patch("ezgha_npm_cache.oldest_running_runner_start_epoch", side_effect=lambda _e: reap_epochs.append(1) or None):
+    ezgha_npm_cache.refresh_npm_cache(npm_refresh_dir, "ezgha-runner:latest", reap_only=True)
+    assert len(reap_epochs) == 1
+
+cfg_skip_npm = os.path.join(work_dir, "cfg_skip_npm.toml")
+open(cfg_skip_npm, "w", encoding="utf-8").write(f'version = 1\n[runner]\nnpm_cache_host_path = "{npm_refresh_dir}"\n[limits]\nmin_free_disk_gb = 1\n')
+with mock.patch.dict(os.environ, {"EZGHA_CACHE_STATE_DIR": work_dir, "EZGHA_CACHE_TEST_FREE_GB": "100"}, clear=False), \
+     mock.patch("refresh_runner_caches.refresh_npm_cache", side_effect=AssertionError("--skip-npm must bypass refresh_npm_cache")):
+    assert refresh_runner_caches.main(["--config", cfg_skip_npm, "--skip-npm"]) == 0
 PY
 pass "(d) relative -r base.txt closure, atomic manifest SHA, direct module imports, npm cache unit tests, and path validation parity verified"
 

@@ -8,25 +8,32 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import time
 
 from ezgha_cache_common import (
-    chmod_a_rx, log, merge_env, oldest_running_runner_start_epoch, resolve_docker_env, run_cmd, warn,
+    atomic_write_text,
+    chmod_a_rx,
+    inspect_docker_image_id,
+    log,
+    merge_env,
+    oldest_running_runner_start_epoch,
+    resolve_docker_env,
+    run_cmd,
+    validate_configured_host_path,
+    warn,
 )
 from ezgha_git_mirrors import GIT_SANITARY_ENV, find_local_donor, parse_mirror_repos, resolve_seed_sha
 
 CONTAINER_NPM_STAGE_SCRIPT = """\
-import json, os, platform, shutil, subprocess, sys
+import glob, json, os, platform, shutil, subprocess, sys
 data = json.load(sys.stdin)
 stage_root = "/tmp/ezgha-npm-stage"
 stage_cc, mount_cc = os.path.join(stage_root, "_cacache"), "/npm-cache/_cacache"
 os.makedirs(stage_cc, exist_ok=True)
 env = {**os.environ, "NPM_CONFIG_UPDATE_NOTIFIER": "false", "NPM_CONFIG_LOGS_DIR": "/tmp/npm-logs"}
 arch = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x64"
-for ver in ("20.20.2", "22.22.0"):
-    nb = f"/opt/hostedtoolcache/node/{ver}/{arch}/bin"
+for nb in sorted(glob.glob(f"/opt/hostedtoolcache/node/*/{arch}/bin")):
     if os.path.isdir(nb):
         env["PATH"] = nb + os.pathsep + env.get("PATH", "")
 
@@ -75,20 +82,6 @@ def publish_tree(subpath, overwrite):
 publish_tree("content-v2", overwrite=False)
 publish_tree("index-v5", overwrite=True)
 """
-
-
-def _validate_npm_cache_path(npm_cache_path):
-    if not npm_cache_path or not isinstance(npm_cache_path, str) or npm_cache_path != npm_cache_path.strip() or npm_cache_path.startswith("~") or not os.path.isabs(npm_cache_path):
-        raise ValueError(f"npm_cache_path must be an absolute path without leading '~' (got {npm_cache_path!r})")
-    return os.path.abspath(npm_cache_path)
-
-
-def _atomic_write_text(path, text, mode=0o644):
-    tmp_path = f"{path}.tmp.{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.chmod(tmp_path, mode)
-    os.replace(tmp_path, path)
 
 
 def _scan_referenced_blobs(index_dir):
@@ -201,7 +194,7 @@ def prune_old_npm_cache(npm_cache_path, retention_min=None, oldest_runner_epoch=
             seen_blobs.add(rel)
 
     unreferenced = {k: v for k, v in unreferenced.items() if k in seen_blobs}
-    _atomic_write_text(unref_path, json.dumps(unreferenced, sort_keys=True) + "\n")
+    atomic_write_text(unref_path, json.dumps(unreferenced, sort_keys=True) + "\n")
     if pruned:
         log(f"pruned {pruned} unreferenced npm blob(s) from {npm_cache_path}")
     return pruned
@@ -288,30 +281,11 @@ def _has_any_sha512_blob(npm_cache_path):
     )
 
 
-def _inspect_docker_image_id(image, docker_proc_env):
-    if not shutil.which("docker"):
-        warn("docker CLI not found; skipping npm cache refresh")
-        return None
-    try:
-        if subprocess.run(["docker", "info"], env=docker_proc_env, capture_output=True, timeout=30).returncode != 0:
-            warn("docker daemon unreachable; skipping npm cache refresh")
-            return None
-        proc = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-            env=docker_proc_env, text=True, capture_output=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        warn(f"docker check timed out after 30s for {image}; skipping npm cache refresh")
-        return None
-    if proc.returncode != 0:
-        warn(f"runner image {image} not present locally; skipping npm cache refresh")
-        return None
-    return proc.stdout.strip()
-
-
 def refresh_npm_cache(npm_cache_path, image, git_mirror_path=None, reap_only=False):
     """Warm and prune the host-side npm _cacache directory via a disposable container."""
-    npm_cache_path = _validate_npm_cache_path(npm_cache_path)
+    if validate_configured_host_path("npm_cache_path", npm_cache_path) is None:
+        raise ValueError(f"npm_cache_path must be an absolute path without leading '~' (got {npm_cache_path!r})")
+    npm_cache_path = os.path.abspath(npm_cache_path)
     cacache_dir = os.path.join(npm_cache_path, "_cacache")
     if reap_only:
         if os.path.isdir(cacache_dir):
@@ -328,7 +302,7 @@ def refresh_npm_cache(npm_cache_path, image, git_mirror_path=None, reap_only=Fal
         return
 
     docker_env = resolve_docker_env()
-    image_id = _inspect_docker_image_id(image, merge_env(docker_env))
+    image_id = inspect_docker_image_id(image, merge_env(docker_env), "npm cache")
     if not image_id:
         return
 
@@ -357,5 +331,5 @@ def refresh_npm_cache(npm_cache_path, image, git_mirror_path=None, reap_only=Fal
         prune_old_npm_cache(npm_cache_path, oldest_runner_epoch=oldest_running_runner_start_epoch(docker_env))
         chmod_a_rx(npm_cache_path)
 
-    _atomic_write_text(manifest_file, f"{manifest_sha}\n")
+    atomic_write_text(manifest_file, f"{manifest_sha}\n")
     log(f"npm cache refreshed (manifest {manifest_sha[:12]})")

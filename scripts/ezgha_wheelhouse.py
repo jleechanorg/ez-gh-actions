@@ -7,11 +7,20 @@ import os
 import platform
 import re
 import shlex
-import shutil
 import subprocess
 import time
 
-from ezgha_cache_common import chmod_a_rx, log, merge_env, resolve_docker_env, run_cmd, warn
+from ezgha_cache_common import (
+    atomic_write_text,
+    chmod_a_rx,
+    inspect_docker_image_id,
+    log,
+    merge_env,
+    resolve_docker_env,
+    run_cmd,
+    validate_configured_host_path,
+    warn,
+)
 
 BUILD_TAG_MARKER = "999999ezgha"
 DEFAULT_CORE_PACKAGES = [
@@ -303,7 +312,7 @@ def _count_real_wheels(wheelhouse_path):
 
 
 def refresh_wheelhouse(wheelhouse_path, image, reap_only=False):
-    if not wheelhouse_path or wheelhouse_path.startswith("~") or not os.path.isabs(wheelhouse_path):
+    if validate_configured_host_path("wheelhouse_path", wheelhouse_path) is None:
         raise ValueError(f"wheelhouse_path must be an absolute path without leading '~' (got {wheelhouse_path!r})")
     wheelhouse_path = os.path.abspath(wheelhouse_path)
     if reap_only:
@@ -313,33 +322,11 @@ def refresh_wheelhouse(wheelhouse_path, image, reap_only=False):
 
     os.makedirs(wheelhouse_path, exist_ok=True)
     chmod_a_rx(wheelhouse_path)
-    if not shutil.which("docker"):
-        warn("docker CLI not found; skipping wheelhouse refresh")
-        return
-
     docker_env = resolve_docker_env()
     docker_proc_env = merge_env(docker_env)
-    try:
-        info_proc = subprocess.run(["docker", "info"], env=docker_proc_env, capture_output=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        warn("docker info timed out after 30s; skipping wheelhouse refresh")
+    image_id = inspect_docker_image_id(image, docker_proc_env, "wheelhouse")
+    if not image_id:
         return
-    if info_proc.returncode != 0:
-        warn("docker daemon unreachable; skipping wheelhouse refresh")
-        return
-
-    try:
-        inspect_proc = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", image],
-            env=docker_proc_env, text=True, capture_output=True, timeout=30,
-        )
-    except subprocess.TimeoutExpired:
-        warn(f"docker image inspect timed out after 30s for {image}; skipping wheelhouse refresh")
-        return
-    if inspect_proc.returncode != 0:
-        warn(f"runner image {image} not present locally; skipping wheelhouse refresh")
-        return
-    image_id = inspect_proc.stdout.strip()
 
     try:
         pw_proc = subprocess.run(
@@ -395,9 +382,5 @@ def refresh_wheelhouse(wheelhouse_path, image, reap_only=False):
         prune_old_wheels(wheelhouse_path)
         chmod_a_rx(wheelhouse_path)
 
-    manifest_tmp = f"{manifest_file}.tmp.{os.getpid()}"
-    with open(manifest_tmp, "w", encoding="utf-8") as fh:
-        fh.write(f"{manifest_sha}\n")
-    os.chmod(manifest_tmp, 0o644)
-    os.replace(manifest_tmp, manifest_file)
+    atomic_write_text(manifest_file, f"{manifest_sha}\n")
     log(f"wheelhouse refreshed ({_count_real_wheels(wheelhouse_path)} wheels, manifest {manifest_sha[:12]})")
