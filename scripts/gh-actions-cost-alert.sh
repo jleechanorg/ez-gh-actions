@@ -3,10 +3,11 @@
 # net billed spend, or hosted macOS minute spikes via ezgha's Cloud Logging ->
 # Cloud Monitoring -> Slack pipeline.
 #
-# Why this exists:
-#   GitHub's org billing budget tracks only NET billed spend (~$0 when public
-#   repos receive a 100% discount) and ignores free-tier gross usage spikes
-#   such as Nov 17's 2,389 hosted macOS minutes ($148.12 gross).
+# Policy:
+#   Free standard hosted runners in confirmed public repos are permitted.
+#   Authoritative zero-net standard usage stays informational, not critical.
+#   Private/unknown repos, larger/unknown SKUs, real net charges and billing
+#   blindness remain alertable. Gross list price is not a cash bill.
 # Authority: operator ask (2026-11-18: "fix this we accidentally using gh macOS actions instead of running it on thi machine ... also wes hould have gh actions cost alerts they seemed to not be firing"), origin/main:AGENTS.md:211-239 (Slack-only ezgha-runner-alerts isolation & $HOME/.local/state/ezgha state), and origin/main:AGENTS.md:241-250 (Safety & Monitoring Principles).
 #
 # Blast radius:
