@@ -860,27 +860,51 @@ assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[
 assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
 PY
 
-# Lock age expiry reclaims even when PID is live, and lock timeout emits WARNING BLIND before exit 4.
+# Live lock with matching pid+lstart must NOT be evicted regardless of age (even with old ts), whereas mismatched lstart (PID reuse) IS reclaimed,
+# and lock timeout emits WARNING BLIND before exit 4 without removing the live owner's lock.
 printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-age.json"
 mkdir -p "$TMP/state-age.json.lock"
 sleep 30 &
 live_pid=$!
+live_lstart="$(ps -p "$live_pid" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+printf '%s\n' "$live_lstart" > "$TMP/state-age.json.lock/lstart"
 printf '%s\n' "$live_pid" > "$TMP/state-age.json.lock/pid"
 printf '1000\n' > "$TMP/state-age.json.lock/ts"
-STATE_LOCK_TIMEOUT_SEC=5 STATE_LOCK_MAX_AGE_SEC=60 BILLING_FIXTURE="$TMP/billing-lock1.json" \
-  run_alert "$TMP/state-age.json" "$TMP/gcloud-age.log" "$TMP/gh-age.log" >/dev/null
+live_rc=0
+STATE_LOCK_TIMEOUT_SEC=1 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-age.json" "$TMP/gcloud-age.log" "$TMP/gh-age.log" >/dev/null 2>&1 || live_rc=$?
+[ "$live_rc" -eq 4 ] || {
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  fail "live state lock with matching pid+lstart must NOT be evicted regardless of age (expected rc=4, got $live_rc)"
+}
+[ -d "$TMP/state-age.json.lock" ] && [ "$(tr -d '[:space:]' < "$TMP/state-age.json.lock/pid")" = "$live_pid" ] || {
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  fail "timed-out contender must leave live owner lock untouched"
+}
+
+printf 'Thu Jan 01 00:00:00 1970\n' > "$TMP/state-age.json.lock/lstart"
+STATE_LOCK_TIMEOUT_SEC=5 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+  run_alert "$TMP/state-age.json" "$TMP/gcloud-age.log" "$TMP/gh-age.log" >/dev/null || {
+  kill "$live_pid" 2>/dev/null || true
+  wait "$live_pid" 2>/dev/null || true
+  fail "state lock with mismatched lstart (PID reuse) must be reclaimed"
+}
 kill "$live_pid" 2>/dev/null || true
 wait "$live_pid" 2>/dev/null || true
-[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-age.json")" != 0 ] || fail "expired lock age must reclaim even with live PID"
+[ ! -d "$TMP/state-age.json.lock" ] || fail "state lockdir must be released after PID-reuse reclaim"
+[ "$(jq -r '.sent["2026-11-17:COST_SPIKE"] // 0' "$TMP/state-age.json")" != 0 ] || fail "reclaimed PID-reuse lock must allow alert state update"
 
 printf '{"sent":{},"last_sent":0,"api_failures":0,"last_blind":0}\n' > "$TMP/state-lockto.json"
 mkdir -p "$TMP/state-lockto.json.lock"
 sleep 30 &
 blocker_pid=$!
+blocker_lstart="$(ps -p "$blocker_pid" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+printf '%s\n' "$blocker_lstart" > "$TMP/state-lockto.json.lock/lstart"
 printf '%s\n' "$blocker_pid" > "$TMP/state-lockto.json.lock/pid"
-date +%s > "$TMP/state-lockto.json.lock/ts"
 lockto_rc=0
-STATE_LOCK_TIMEOUT_SEC=1 STATE_LOCK_MAX_AGE_SEC=900 BILLING_FIXTURE="$TMP/billing-lock1.json" \
+STATE_LOCK_TIMEOUT_SEC=1 BILLING_FIXTURE="$TMP/billing-lock1.json" \
   run_alert "$TMP/state-lockto.json" "$TMP/gcloud-lockto.log" "$TMP/gh-lockto.log" >/dev/null 2>&1 || lockto_rc=$?
 kill "$blocker_pid" 2>/dev/null || true
 wait "$blocker_pid" 2>/dev/null || true
@@ -888,7 +912,7 @@ wait "$blocker_pid" 2>/dev/null || true
 grep -q 'severity=WARNING' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit WARNING"
 grep -q '"status":"BLIND"' "$TMP/gcloud-lockto.log" || fail "state lock timeout must emit BLIND status"
 grep -q 'LOCK_TIMEOUT: state lock held > 1s' "$TMP/gcloud-lockto.log" || fail "state lock timeout must cite LOCK_TIMEOUT"
-pass "concurrent runs serialize STATE_FILE updates, reclaim stale/expired locks race-free, and emit BLIND on lock timeout"
+pass "concurrent runs serialize STATE_FILE updates, reclaim stale/PID-reuse locks race-free, protect live locks, and emit BLIND on lock timeout"
 
 # 19. --ensure-gcp-policy creates/updates with timeout bounds, exits non-zero, and surfaces gcloud stderr on failure.
 run_alert "$TMP/state-pol-create.json" "$TMP/gcloud-pol-create.log" "$TMP/gh-pol-create.log" --ensure-gcp-policy >/dev/null

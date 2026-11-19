@@ -172,7 +172,7 @@ if [ -e "$RUNNER_DIR_T/.runner" ] || [ -e "$RUNNER_DIR_T/.credentials" ] || [ -e
   exit 1
 fi
 printf 'config.sh %s\n' "\$*" >> "$TMP/config.log"
-printf '{"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
 STUB
@@ -247,6 +247,10 @@ case "$*" in
   *"actions/runners/registration-token"*)
     emit_json '{"token":"stub-reg-token"}'
     ;;
+  *"actions/runner-groups/"*"/runners"*)
+    default_group_runners='{"total_count":1,"runners":[{"id":101,"name":"mac-native-ci-1"}]}'
+    emit_json "${GROUP_RUNNERS_JSON:-$default_group_runners}"
+    ;;
   *"actions/runner-groups"*)
     default_groups='{"total_count":1,"runner_groups":[{"id":1,"name":"Default","default":true,"allows_public_repositories":false}]}'
     emit_json "${RUNNER_GROUPS_JSON:-$default_groups}"
@@ -296,9 +300,9 @@ HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-v
 
 # --verify fails if live GitHub runner has forbidden 'self-hosted' or 'worldai-testflight-native-mac' or mismatched labels.
 for bad_live in \
-  '{"runners":[{"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"},{"name":"self-hosted"}]}]}' \
-  '{"runners":[{"name":"mac-native-ci-1","labels":[{"name":"worldai-testflight-native-mac"}]}]}' \
-  '{"runners":[{"name":"mac-native-ci-1","labels":[{"name":"other-label"}]}]}'; do
+  '{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"},{"name":"self-hosted"}]}]}' \
+  '{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"worldai-testflight-native-mac"}]}]}' \
+  '{"runners":[{"id":101,"name":"mac-native-ci-1","labels":[{"name":"other-label"}]}]}'; do
   if LIVE_RUNNERS_JSON="$bad_live" HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
       "$SETUP_SCRIPT" --verify >/dev/null 2>&1; then
     fail "--verify must fail when live GitHub labels mismatch or include forbidden label: $bad_live"
@@ -669,7 +673,7 @@ cat > "$RUNNER_DIR_T/config.sh" <<STUB
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'config.sh %s\n' "\$*" >> "$TMP/config.log"
-printf '{"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
+printf '{"agentId":101,"agentName":"mac-native-ci-1","workFolder":"%s","gitHubUrl":"https://github.com/jleechanorg"}\n' "$TMP/scratch/native-macos-ci-work" > "$RUNNER_DIR_T/.runner"
 printf 'creds\n' > "$RUNNER_DIR_T/.credentials"
 printf 'rsa\n' > "$RUNNER_DIR_T/.credentials_rsaparams"
 STUB
@@ -780,3 +784,110 @@ assert lines[2].startswith("ENTER ") and lines[3] == "EXIT " + lines[2].split()[
 assert lines[0].split()[1] != lines[2].split()[1], f"expected two distinct contenders: {lines!r}"
 PY
 pass "two-contender setup stale-lock recovery enforces mutual exclusion"
+
+# 16. Round-11 P0 hardening: --offline mutating rejection, ALLOW_PUBLIC_FORK_EXPOSURE validation,
+#     .ezgha-group + agentId + live group membership binding, and lstart-based live lock protection.
+offline_rc=0
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --offline >/dev/null 2>&1 || offline_rc=$?
+[ "$offline_rc" -eq 2 ] || fail "--offline without --verify/--dry-run must exit 2 (got $offline_rc)"
+
+offline_reconfig_rc=0
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --offline --reconfigure >/dev/null 2>&1 || offline_reconfig_rc=$?
+[ "$offline_reconfig_rc" -eq 2 ] || fail "--offline --reconfigure must exit 2 (got $offline_reconfig_rc)"
+
+bad_exposure_rc=0
+ALLOW_PUBLIC_FORK_EXPOSURE=true HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --dry-run >/dev/null 2>&1 || bad_exposure_rc=$?
+[ "$bad_exposure_rc" -eq 2 ] || fail "ALLOW_PUBLIC_FORK_EXPOSURE=true must exit 2 (got $bad_exposure_rc)"
+
+# Changing --runner-group triggers reconfiguration and --verify enforces .ezgha-group, agentId, and live group membership.
+cp "$TMP/plist.ok" "$PLIST_T"
+: > "$TMP/launchctl.loaded"
+[ "$(tr -d '\r\n' < "$RUNNER_DIR_T/.ezgha-group")" = "macos-restricted" ] || fail ".ezgha-group must persist configured group from test 14"
+
+# Same group again is idempotent (no config.sh rerun).
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null
+[ ! -s "$TMP/config.log" ] || fail "matching --runner-group must not re-run config.sh"
+
+# Switching from macos-restricted to default triggers reconfiguration, and switching back to macos-restricted triggers --runnergroup.
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --allow-public-fork-exposure >/dev/null
+grep -q 'config.sh ' "$TMP/config.log" || fail "changing from --runner-group macos-restricted to default must trigger reconfiguration"
+[ "$(tr -d '\r\n' < "$RUNNER_DIR_T/.ezgha-group")" = "" ] || fail ".ezgha-group must be updated on reconfiguration to default"
+
+: > "$TMP/config.log"
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --runner-group macos-restricted >/dev/null
+grep -q -- '--runnergroup macos-restricted' "$TMP/config.log" || fail "changing from default to --runner-group macos-restricted must trigger reconfiguration"
+[ "$(tr -d '\r\n' < "$RUNNER_DIR_T/.ezgha-group")" = "macos-restricted" ] || fail ".ezgha-group must persist configured group"
+
+RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+  HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+  "$SETUP_SCRIPT" --verify --runner-group macos-restricted >/dev/null || fail "--verify with matching --runner-group and group membership must pass"
+
+if RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+    GROUP_RUNNERS_JSON='{"total_count":0,"runners":[]}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail when live runner is not a member of org runner group"
+fi
+
+if RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+    LIVE_RUNNERS_JSON='{"runners":[{"id":999,"name":"mac-native-ci-1","labels":[{"name":"self-hosted-native-macos"}]}]}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail when local .runner agentId mismatches live runner id"
+fi
+
+if RUNNER_GROUPS_JSON="$MIXED_GROUPS" FORK_APPROVAL_JSON='{"approval_policy":"first_time_contributors"}' \
+    HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify >/dev/null 2>&1; then
+  fail "--verify must fail when .ezgha-group mismatches requested default group"
+fi
+
+rm -f "$RUNNER_DIR_T/.ezgha-group"
+if HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" GH_BIN="$TMP/bin/gh-runner" \
+    "$SETUP_SCRIPT" --verify --offline --runner-group macos-restricted >/dev/null 2>&1; then
+  fail "--verify must fail closed when .ezgha-group is missing for --runner-group"
+fi
+printf 'macos-restricted\n' > "$RUNNER_DIR_T/.ezgha-group"
+
+# Live lock with matching lstart + old ts (>900s) must NOT be evicted; mismatched lstart (PID reuse) IS reclaimed.
+mkdir -p "$LOCK_DIR_T"
+sleep 30 &
+live_setup_pid=$!
+live_setup_lstart="$(ps -p "$live_setup_pid" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+printf '%s\n' "$live_setup_lstart" > "$LOCK_DIR_T/lstart"
+printf '%s\n' "$live_setup_pid" > "$LOCK_DIR_T/pid"
+printf '1000\n' > "$LOCK_DIR_T/ts"
+if SETUP_LOCK_TIMEOUT_SEC=1 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+    "$SETUP_SCRIPT" --uninstall >/dev/null 2>&1; then
+  kill "$live_setup_pid" 2>/dev/null || true
+  wait "$live_setup_pid" 2>/dev/null || true
+  fail "live setup lock with matching pid+lstart must NOT be evicted regardless of age"
+fi
+[ -d "$LOCK_DIR_T" ] && [ "$(tr -d '[:space:]' < "$LOCK_DIR_T/pid")" = "$live_setup_pid" ] || {
+  kill "$live_setup_pid" 2>/dev/null || true
+  wait "$live_setup_pid" 2>/dev/null || true
+  fail "timed-out contender must leave live owner lock untouched"
+}
+
+printf 'Thu Jan 01 00:00:00 1970\n' > "$LOCK_DIR_T/lstart"
+SETUP_LOCK_TIMEOUT_SEC=5 HOME="$TMP/home" PATH="$TMP/bin:$PATH" DISK_MAGICIAN_DISKM_BIN="$TMP/bin/diskm-vol" SCRATCH_DIR_HELPER="$TMP/bin/scratch-dir-ok.sh" \
+  "$SETUP_SCRIPT" --uninstall >/dev/null || {
+  kill "$live_setup_pid" 2>/dev/null || true
+  wait "$live_setup_pid" 2>/dev/null || true
+  fail "setup lock with mismatched lstart (PID reuse) must be reclaimed"
+}
+kill "$live_setup_pid" 2>/dev/null || true
+wait "$live_setup_pid" 2>/dev/null || true
+[ ! -d "$LOCK_DIR_T" ] || fail "setup lockdir must be released after PID-reuse reclaim"
+pass "flag validation, runner-group/agentId binding, and lstart live-lock protection hold"

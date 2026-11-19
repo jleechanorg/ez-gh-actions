@@ -49,7 +49,7 @@ Usage: setup-native-macos-runner.sh [OPTIONS]
   --dry-run                       Print planned setup, config.sh command, and LaunchAgent plist without mutating host
   --verify                        Verify existing runner dir, .runner, .ezgha-labels, live GitHub labels, fork protection, work dir, and LaunchAgent
   --reconfigure                   Force unload, removal of local .runner/.credentials*, and fresh ./config.sh --replace
-  --offline                       Skip live GitHub API verification during --verify or setup
+  --offline                       Skip live GitHub API verification during --verify or --dry-run
   --uninstall                     Unload and remove org.jleechanorg.ezgha-native-macos-runner LaunchAgent
   --org ORG                       GitHub org scope (default: jleechanorg)
   --repo OWNER/REPO               Optional repo scope (overrides --org)
@@ -85,6 +85,16 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$OFFLINE" -eq 1 ] && [ "$VERIFY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+  echo "ERROR: --offline is only valid with --verify or --dry-run (mutating setup requires live server-side fork-protection check)" >&2
+  exit 2
+fi
+
+case "$ALLOW_PUBLIC_FORK_EXPOSURE" in
+  0|1) ;;
+  *) echo "ERROR: invalid ALLOW_PUBLIC_FORK_EXPOSURE='$ALLOW_PUBLIC_FORK_EXPOSURE' (expected 0 or 1)" >&2; exit 2 ;;
+esac
+
 canonical_path() {
   python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
@@ -98,8 +108,8 @@ RESERVED_SMTP_OP="$(canonical_path "/Users/jleechan/actions-runner-smtp-egress")
 PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 LOG_DIR="${HOME}/Library/Logs/${PLIST_LABEL}"
 STATE_LOCK_TIMEOUT_SEC="${SETUP_LOCK_TIMEOUT_SEC:-30}"
-SETUP_LOCK_MAX_AGE_SEC="${SETUP_LOCK_MAX_AGE_SEC:-900}"
 SETUP_LOCK_DIR=""
+SETUP_LOCK_LSTART=""
 SETUP_LOCK_RECLAIM_DIR=""
 STAGE_DIR=""
 TMP_TGZ=""
@@ -108,14 +118,20 @@ CANDIDATE_PLIST=""
 
 release_setup_lock() {
   if [ -n "${SETUP_LOCK_DIR:-}" ] && [ -d "$SETUP_LOCK_DIR" ]; then
-    local rel_dir="${SETUP_LOCK_DIR}.release.$$"
-    if mv "$SETUP_LOCK_DIR" "$rel_dir" 2>/dev/null; then
-      rm -rf "$rel_dir" 2>/dev/null || true
-    else
-      rm -f "${SETUP_LOCK_DIR}/pid" "${SETUP_LOCK_DIR}/ts" 2>/dev/null || true
-      rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
+    local lock_owner_pid="" lock_owner_lstart=""
+    lock_owner_pid="$(tr -d '[:space:]' < "${SETUP_LOCK_DIR}/pid" 2>/dev/null || true)"
+    lock_owner_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "${SETUP_LOCK_DIR}/lstart" 2>/dev/null | tr -d '\r\n' || true)"
+    if [ "$lock_owner_pid" = "$$" ] && { [ -z "${SETUP_LOCK_LSTART:-}" ] || [ "$lock_owner_lstart" = "$SETUP_LOCK_LSTART" ]; }; then
+      local rel_dir="${SETUP_LOCK_DIR}.release.$$"
+      if mv "$SETUP_LOCK_DIR" "$rel_dir" 2>/dev/null; then
+        rm -rf "$rel_dir" 2>/dev/null || true
+      else
+        rm -f "${SETUP_LOCK_DIR}/pid" "${SETUP_LOCK_DIR}/lstart" 2>/dev/null || true
+        rmdir "$SETUP_LOCK_DIR" 2>/dev/null || true
+      fi
     fi
     SETUP_LOCK_DIR=""
+    SETUP_LOCK_LSTART=""
   fi
   if [ -n "${SETUP_LOCK_RECLAIM_DIR:-}" ] && [ -d "$SETUP_LOCK_RECLAIM_DIR" ]; then
     rmdir "$SETUP_LOCK_RECLAIM_DIR" 2>/dev/null || rm -rf "$SETUP_LOCK_RECLAIM_DIR" 2>/dev/null || true
@@ -133,21 +149,22 @@ trap cleanup_setup EXIT
 
 acquire_setup_lock() {
   local state_dir="${HOME}/.local/state/ezgha"
-  local safe_label lockdir reclaim_dir pidfile tsfile deadline
-  local owner_pid="" lock_ts="" now_ts="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
+  local safe_label lockdir reclaim_dir pidfile lstartfile deadline
+  local owner_pid="" saved_lstart="" cur_lstart="" self_lstart="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
   safe_label="$(printf '%s' "$PLIST_LABEL" | tr -cd 'A-Za-z0-9_.-')"
   lockdir="${state_dir}/setup-native-macos-runner.${safe_label}.lock"
   reclaim_dir="${lockdir}.reclaim"
   pidfile="${lockdir}/pid"
-  tsfile="${lockdir}/ts"
+  lstartfile="${lockdir}/lstart"
   deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
   mkdir -p "$state_dir"
   while true; do
     if mkdir "$lockdir" 2>/dev/null; then
-      now_ts="${NOW:-$(date +%s)}"
+      self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+      printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
       printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-      printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
       SETUP_LOCK_DIR="$lockdir"
+      SETUP_LOCK_LSTART="$self_lstart"
       return 0
     fi
     if mkdir "$reclaim_dir" 2>/dev/null; then
@@ -162,19 +179,20 @@ acquire_setup_lock() {
       if [ -f "$pidfile" ]; then
         owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
       fi
-      lock_ts=""
-      if [ -f "$tsfile" ]; then
-        lock_ts="$(tr -d '[:space:]' < "$tsfile" 2>/dev/null || true)"
+      saved_lstart=""
+      if [ -f "$lstartfile" ]; then
+        saved_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$lstartfile" 2>/dev/null | tr -d '\r\n' || true)"
       fi
-      now_ts="${NOW:-$(date +%s)}"
       should_reclaim=0
-      if [[ "$lock_ts" =~ ^[0-9]+$ ]] && (( now_ts - lock_ts > SETUP_LOCK_MAX_AGE_SEC )); then
-        should_reclaim=1
-        missing_pid_polls=0
-      elif [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
         missing_pid_polls=0
         if ! kill -0 "$owner_pid" 2>/dev/null; then
           should_reclaim=1
+        else
+          cur_lstart="$(ps -p "$owner_pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+          if [ -n "$saved_lstart" ] && [ -n "$cur_lstart" ] && [ "$cur_lstart" != "$saved_lstart" ]; then
+            should_reclaim=1
+          fi
         fi
       else
         missing_pid_polls=$((missing_pid_polls + 1))
@@ -188,10 +206,11 @@ acquire_setup_lock() {
         if mv "$lockdir" "${lockdir}.stale.$$" 2>/dev/null; then
           rm -rf "${lockdir}.stale.$$" 2>/dev/null || true
           if mkdir "$lockdir" 2>/dev/null; then
-            now_ts="${NOW:-$(date +%s)}"
+            self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+            printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
             printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-            printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
             SETUP_LOCK_DIR="$lockdir"
+            SETUP_LOCK_LSTART="$self_lstart"
             rmdir "$reclaim_dir" 2>/dev/null || true
             SETUP_LOCK_RECLAIM_DIR=""
             return 0
@@ -517,11 +536,14 @@ runner_binaries_ready() {
   [ -x "${dir}/bin/Runner.Listener" ] && [ -x "${dir}/config.sh" ] && [ -x "${dir}/run.sh" ] && [ -f "${dir}/run-helper.sh.template" ]
 }
 
+VERIFIED_RUNNER_GROUP_ID=""
+
 verify_server_fork_protection() {
   command -v "$GH_BIN" >/dev/null 2>&1 || {
     echo "ERROR: gh binary '$GH_BIN' not found (required for server-side fork-protection check)" >&2
     exit 5
   }
+  VERIFIED_RUNNER_GROUP_ID=""
   local is_priv="" pol="" groups_json="" group_json="" allows_pub=""
   if [ -n "$RUNNER_REPO" ]; then
     if ! is_priv="$("$GH_BIN" api "repos/${RUNNER_REPO}" --jq '.private')"; then
@@ -533,7 +555,7 @@ verify_server_fork_protection() {
         echo "ERROR: failed to query fork PR contributor approval policy for repo '${RUNNER_REPO}'" >&2
         exit 5
       fi
-      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" -ne 1 ]; then
+      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
         echo "ERROR: public repo '${RUNNER_REPO}' fork PR approval policy is '${pol}' (expected 'all_external_contributors'); pass --allow-public-fork-exposure to override" >&2
         exit 5
       fi
@@ -548,13 +570,14 @@ verify_server_fork_protection() {
       echo "ERROR: runner group '${RUNNER_GROUP:-<default>}' not found in org '${RUNNER_ORG}'" >&2
       exit 5
     fi
+    VERIFIED_RUNNER_GROUP_ID="$(printf '%s\n' "$group_json" | jq -r '.id // empty')"
     allows_pub="$(printf '%s\n' "$group_json" | jq -r '.allows_public_repositories')"
     if [ "$allows_pub" = "true" ]; then
       if ! pol="$("$GH_BIN" api "orgs/${RUNNER_ORG}/actions/permissions/fork-pr-contributor-approval" --jq '.approval_policy // ""')"; then
         echo "ERROR: failed to query fork PR contributor approval policy for org '${RUNNER_ORG}'" >&2
         exit 5
       fi
-      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" -ne 1 ]; then
+      if [ "$pol" != "all_external_contributors" ] && [ "$ALLOW_PUBLIC_FORK_EXPOSURE" != "1" ]; then
         echo "ERROR: org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' allows public repositories and fork PR approval policy is '${pol}' (expected 'all_external_contributors'); restrict runner group or pass --allow-public-fork-exposure" >&2
         exit 5
       fi
@@ -608,6 +631,7 @@ if not os.path.isfile(prog[1]) or not os.access(prog[1], os.R_OK):
     print(f"FAIL: {plist_path} ProgramArguments script missing or unreadable: {prog[1]}", file=sys.stderr)
     sys.exit(1)
 PY
+  local_agent_id="$(jq -r '.agentId // empty' "${RUNNER_DIR}/.runner")"
   actual_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner")"
   actual_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner")"
   actual_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner")"
@@ -624,8 +648,25 @@ PY
     command -v "$GH_BIN" >/dev/null 2>&1 || { echo "FAIL: gh binary '$GH_BIN' not found (pass --offline to skip live GitHub check)" >&2; exit 1; }
     verify_server_fork_protection
     runners_pages="$("$GH_BIN" api --paginate "$RUNNERS_API")"
-    runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name)] | .[0] // empty')"
-    [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' not found in live $RUNNERS_API" >&2; exit 1; }
+    if [ -n "$local_agent_id" ]; then
+      if [[ ! "$local_agent_id" =~ ^[0-9]+$ ]]; then
+        echo "FAIL: .runner agentId='$local_agent_id' is not numeric" >&2
+        exit 1
+      fi
+      runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" --arg id "$local_agent_id" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | .[0] // empty')"
+      [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' (agentId=$local_agent_id) not found in live $RUNNERS_API" >&2; exit 1; }
+    else
+      runner_json="$(printf '%s\n' "$runners_pages" | jq -sc --arg name "$RUNNER_NAME" '[.[].runners[]? | select(.name == $name)] | .[0] // empty')"
+      [ -n "$runner_json" ] || { echo "FAIL: runner '$RUNNER_NAME' not found in live $RUNNERS_API" >&2; exit 1; }
+    fi
+    if [ -z "$RUNNER_REPO" ]; then
+      live_runner_id="$(printf '%s\n' "$runner_json" | jq -r '.id // empty')"
+      [ -n "$live_runner_id" ] || { echo "FAIL: live runner '$RUNNER_NAME' missing .id in $RUNNERS_API" >&2; exit 1; }
+      [ -n "$VERIFIED_RUNNER_GROUP_ID" ] || { echo "FAIL: missing runner group id for '${RUNNER_GROUP:-<default>}' in org '${RUNNER_ORG}'" >&2; exit 1; }
+      group_runners_pages="$("$GH_BIN" api --paginate "orgs/${RUNNER_ORG}/actions/runner-groups/${VERIFIED_RUNNER_GROUP_ID}/runners")"
+      in_group="$(printf '%s\n' "$group_runners_pages" | jq -sc --arg id "$live_runner_id" --arg name "$RUNNER_NAME" '[.[].runners[]? | select(((.id | tostring) == $id) and (.name == $name))] | length')"
+      [ "$in_group" -ge 1 ] || { echo "FAIL: runner '$RUNNER_NAME' (id=$live_runner_id) is not a member of org '${RUNNER_ORG}' runner group '${RUNNER_GROUP:-<default>}' (id=${VERIFIED_RUNNER_GROUP_ID})" >&2; exit 1; }
+    fi
     live_labels_csv="$(printf '%s\n' "$runner_json" | jq -r '[.labels[]?.name // empty] | map(ascii_downcase) | unique | join(",")')"
     expected_sorted_csv="$(printf '%s' "$RUNNER_LABELS" | tr ',' '\n' | tr '[:upper:]' '[:lower:]' | sort -u | paste -sd, -)"
     if printf '%s\n' "$live_labels_csv" | tr ',' '\n' | grep -qxE 'self-hosted|worldai-testflight-native-mac'; then
@@ -637,6 +678,13 @@ PY
       exit 1
     fi
     [ "$live_labels_csv" = "$expected_sorted_csv" ] || { echo "FAIL: live labels '$live_labels_csv' != expected '$expected_sorted_csv'" >&2; exit 1; }
+  fi
+  if [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
+    actual_group="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-group")"
+    [ "$actual_group" = "$RUNNER_GROUP" ] || { echo "FAIL: .ezgha-group='$actual_group' != '$RUNNER_GROUP'" >&2; exit 1; }
+  elif [ -n "$RUNNER_GROUP" ]; then
+    echo "FAIL: missing .ezgha-group for --runner-group '$RUNNER_GROUP'" >&2
+    exit 1
   fi
   launchctl print "gui/$(id -u)/${PLIST_LABEL}" >/dev/null || { echo "FAIL: launchd job ${PLIST_LABEL} not loaded" >&2; exit 1; }
   echo "OK: ${RUNNER_NAME} verified at ${RUNNER_DIR} (work=${WORK_DIR}, labels=${RUNNER_LABELS})"
@@ -667,9 +715,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 acquire_setup_lock || exit 1
-if [ "$OFFLINE" -eq 0 ]; then
-  verify_server_fork_protection
-fi
+verify_server_fork_protection
 mkdir -p "$RUNNER_DIR" "$WORK_DIR" "${HOME}/Library/LaunchAgents" "$LOG_DIR"
 
 if ! runner_binaries_ready "$RUNNER_DIR"; then
@@ -715,14 +761,15 @@ if ! runner_binaries_ready "$RUNNER_DIR"; then
   STAGE_DIR=""
 fi
 
-# Register or refresh configuration when .runner/.ezgha-labels is missing, differs, or --reconfigure is passed.
+# Register or refresh configuration when .runner/.ezgha-labels/.ezgha-group is missing, differs, or --reconfigure is passed.
 needs_config=1
-if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_DIR}/.ezgha-labels" ]; then
+if [ "$RECONFIGURE" -eq 0 ] && [ -f "${RUNNER_DIR}/.runner" ] && [ -f "${RUNNER_DIR}/.ezgha-labels" ] && [ -f "${RUNNER_DIR}/.ezgha-group" ]; then
   existing_name="$(jq -r '.agentName // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_work="$(jq -r '.workFolder // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_url="$(jq -r '.gitHubUrl // ""' "${RUNNER_DIR}/.runner" 2>/dev/null || true)"
   existing_labels="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-labels" 2>/dev/null || true)"
-  if [ "$existing_name" = "$RUNNER_NAME" ] && [ "$existing_work" = "$WORK_DIR" ] && [ "$existing_url" = "$RUNNER_URL" ] && [ "$existing_labels" = "$RUNNER_LABELS" ]; then
+  existing_group="$(tr -d '\r\n' < "${RUNNER_DIR}/.ezgha-group" 2>/dev/null || true)"
+  if [ "$existing_name" = "$RUNNER_NAME" ] && [ "$existing_work" = "$WORK_DIR" ] && [ "$existing_url" = "$RUNNER_URL" ] && [ "$existing_labels" = "$RUNNER_LABELS" ] && [ "$existing_group" = "$RUNNER_GROUP" ]; then
     needs_config=0
   fi
 fi
@@ -738,7 +785,7 @@ if [ "$needs_config" -eq 1 ]; then
   BACKUP_DIR="${RUNNER_DIR}/.backup-pre-reconfigure.$$"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
-  for f in .runner .credentials .credentials_rsaparams .runner_migrated .credentials_migrated .ezgha-labels; do
+  for f in .runner .credentials .credentials_rsaparams .runner_migrated .credentials_migrated .ezgha-labels .ezgha-group; do
     if [ -f "${RUNNER_DIR}/${f}" ]; then
       cp -p "${RUNNER_DIR}/${f}" "${BACKUP_DIR}/${f}"
     fi
@@ -773,6 +820,7 @@ if [ "$needs_config" -eq 1 ]; then
   rm -rf "$BACKUP_DIR"
   BACKUP_DIR=""
   printf '%s\n' "$RUNNER_LABELS" > "${RUNNER_DIR}/.ezgha-labels"
+  printf '%s\n' "$RUNNER_GROUP" > "${RUNNER_DIR}/.ezgha-group"
 fi
 
 if [ ! -f "${RUNNER_DIR}/.env" ]; then

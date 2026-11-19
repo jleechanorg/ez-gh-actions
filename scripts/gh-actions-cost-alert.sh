@@ -54,7 +54,6 @@ FALLBACK_JOBS_PER_PAGE="${FALLBACK_JOBS_PER_PAGE:-100}"
 GH_CALL_TIMEOUT_SEC="${GH_CALL_TIMEOUT_SEC:-30}"
 GCLOUD_CALL_TIMEOUT_SEC="${GCLOUD_CALL_TIMEOUT_SEC:-30}"
 STATE_LOCK_TIMEOUT_SEC="${STATE_LOCK_TIMEOUT_SEC:-30}"
-STATE_LOCK_MAX_AGE_SEC="${STATE_LOCK_MAX_AGE_SEC:-900}"
 APP_TOKEN_FILE="${APP_TOKEN_FILE:-$HOME/.config/ezgha/gh_token}"
 STATE_FILE="${STATE_FILE:-$HOME/.local/state/ezgha/gh-actions-cost-alert.json}"
 GH_BIN="${GH_BIN:-gh}"
@@ -270,26 +269,26 @@ fi
 
 tmp="$(mktemp)"
 STATE_LOCK_DIR=""
+STATE_LOCK_LSTART=""
 STATE_LOCK_RECLAIM_DIR=""
 STATE_STAGE_TMP=""
 STATE_NEXT_TMP=""
-current_epoch() {
-  if [ -n "${NOW_EPOCH:-}" ]; then
-    printf '%s' "$NOW_EPOCH"
-  else
-    date +%s
-  fi
-}
 release_state_lock() {
   if [ -n "${STATE_LOCK_DIR:-}" ] && [ -d "$STATE_LOCK_DIR" ]; then
-    local rel_dir="${STATE_LOCK_DIR}.release.$$"
-    if mv "$STATE_LOCK_DIR" "$rel_dir" 2>/dev/null; then
-      rm -rf "$rel_dir" 2>/dev/null || true
-    else
-      rm -f "${STATE_LOCK_DIR}/pid" "${STATE_LOCK_DIR}/ts" 2>/dev/null || true
-      rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+    local lock_owner_pid="" lock_owner_lstart=""
+    lock_owner_pid="$(tr -d '[:space:]' < "${STATE_LOCK_DIR}/pid" 2>/dev/null || true)"
+    lock_owner_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "${STATE_LOCK_DIR}/lstart" 2>/dev/null | tr -d '\r\n' || true)"
+    if [ "$lock_owner_pid" = "$$" ] && { [ -z "${STATE_LOCK_LSTART:-}" ] || [ "$lock_owner_lstart" = "$STATE_LOCK_LSTART" ]; }; then
+      local rel_dir="${STATE_LOCK_DIR}.release.$$"
+      if mv "$STATE_LOCK_DIR" "$rel_dir" 2>/dev/null; then
+        rm -rf "$rel_dir" 2>/dev/null || true
+      else
+        rm -f "${STATE_LOCK_DIR}/pid" "${STATE_LOCK_DIR}/lstart" 2>/dev/null || true
+        rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+      fi
     fi
     STATE_LOCK_DIR=""
+    STATE_LOCK_LSTART=""
   fi
   if [ -n "${STATE_LOCK_RECLAIM_DIR:-}" ] && [ -d "$STATE_LOCK_RECLAIM_DIR" ]; then
     rmdir "$STATE_LOCK_RECLAIM_DIR" 2>/dev/null || rm -rf "$STATE_LOCK_RECLAIM_DIR" 2>/dev/null || true
@@ -308,16 +307,17 @@ acquire_state_lock() {
   local lockdir="${STATE_FILE}.lock"
   local reclaim_dir="${lockdir}.reclaim"
   local pidfile="${lockdir}/pid"
-  local tsfile="${lockdir}/ts"
+  local lstartfile="${lockdir}/lstart"
   local deadline=$((SECONDS + STATE_LOCK_TIMEOUT_SEC))
-  local owner_pid="" lock_ts="" now_ts="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
+  local owner_pid="" saved_lstart="" cur_lstart="" self_lstart="" missing_pid_polls=0 should_reclaim=0 reclaimed=0
   mkdir -p "$(dirname "$STATE_FILE")"
   while true; do
     if mkdir "$lockdir" 2>/dev/null; then
-      now_ts="$(current_epoch)"
+      self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+      printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
       printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-      printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
       STATE_LOCK_DIR="$lockdir"
+      STATE_LOCK_LSTART="$self_lstart"
       return 0
     fi
     if mkdir "$reclaim_dir" 2>/dev/null; then
@@ -332,19 +332,20 @@ acquire_state_lock() {
       if [ -f "$pidfile" ]; then
         owner_pid="$(tr -d '[:space:]' < "$pidfile" 2>/dev/null || true)"
       fi
-      lock_ts=""
-      if [ -f "$tsfile" ]; then
-        lock_ts="$(tr -d '[:space:]' < "$tsfile" 2>/dev/null || true)"
+      saved_lstart=""
+      if [ -f "$lstartfile" ]; then
+        saved_lstart="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$lstartfile" 2>/dev/null | tr -d '\r\n' || true)"
       fi
-      now_ts="$(current_epoch)"
       should_reclaim=0
-      if [[ "$lock_ts" =~ ^[0-9]+$ ]] && (( now_ts - lock_ts > STATE_LOCK_MAX_AGE_SEC )); then
-        should_reclaim=1
-        missing_pid_polls=0
-      elif [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
+      if [[ "$owner_pid" =~ ^[0-9]+$ ]]; then
         missing_pid_polls=0
         if ! kill -0 "$owner_pid" 2>/dev/null; then
           should_reclaim=1
+        else
+          cur_lstart="$(ps -p "$owner_pid" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+          if [ -n "$saved_lstart" ] && [ -n "$cur_lstart" ] && [ "$cur_lstart" != "$saved_lstart" ]; then
+            should_reclaim=1
+          fi
         fi
       else
         missing_pid_polls=$((missing_pid_polls + 1))
@@ -358,10 +359,11 @@ acquire_state_lock() {
         if mv "$lockdir" "${lockdir}.stale.$$" 2>/dev/null; then
           rm -rf "${lockdir}.stale.$$" 2>/dev/null || true
           if mkdir "$lockdir" 2>/dev/null; then
-            now_ts="$(current_epoch)"
+            self_lstart="$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+            printf '%s\n' "$self_lstart" > "${lstartfile}.tmp.$$" && mv -f "${lstartfile}.tmp.$$" "$lstartfile"
             printf '%s\n' "$$" > "${pidfile}.tmp.$$" && mv -f "${pidfile}.tmp.$$" "$pidfile"
-            printf '%s\n' "$now_ts" > "${tsfile}.tmp.$$" && mv -f "${tsfile}.tmp.$$" "$tsfile"
             STATE_LOCK_DIR="$lockdir"
+            STATE_LOCK_LSTART="$self_lstart"
             rmdir "$reclaim_dir" 2>/dev/null || true
             STATE_LOCK_RECLAIM_DIR=""
             return 0
